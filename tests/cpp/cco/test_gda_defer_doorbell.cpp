@@ -38,10 +38,15 @@
 //             must ring for them itself or it deadlocks.
 //   counter   deferred puts drained by counter() instead of flush.
 //   get       deferred gets, then flush.
-//   async     thread-scope deferred puts, each lane to its own peer, released
-//             by that lane's flushAsync and drained by its own wait.
-//   ctx       thread-scope puts to one peer with the context alternating per
-//             lane, so lanes of a warp post on two QPs of the same peer.
+//   async     thread-scope deferred puts, the lanes of a warp spread over the
+//             peers, released by each lane's flushAsync and drained by its wait.
+//   ctx       thread-scope puts with the context alternating across lanes, so
+//             lanes of a warp post on two QPs of the same peer.
+//   split     one warp per peer: 3/4 of the lanes release their deferred puts,
+//             the rest release theirs later, then all wait at thread scope on
+//             one QP with two different targets.
+//   sigthr    every lane signals each peer at thread scope, so many lanes of a
+//             wave post to one QP at once.
 //
 // The cases run on a FULL devcomm with the WORLD team and, when the ranks span
 // nodes, again on a RAIL devcomm with the GDA team (peer = node index).
@@ -63,8 +68,9 @@ static constexpr int kPieceElems = kChunkElems / kMixedPieces;
 // Per-source region of the receive buffer; overflow wraps around it.
 static constexpr size_t kRegionElems = 16384;
 static_assert(kChunks * kChunkElems <= kRegionElems, "region too small");
-static constexpr int kContexts = 2;     // ctx case: lanes alternate between two QPs
-static constexpr int kTimeoutSec = 30;  // per case; a doorbell nobody rings never completes
+static constexpr int kContexts = 2;      // ctx case: lanes alternate between two QPs
+static constexpr int kTimeoutSec = 30;   // per case; a doorbell nobody rings never completes
+static constexpr int kSigThreads = 512;  // sigthr grid: signals each source adds per peer
 
 enum Case : int {
   kProbe,
@@ -76,10 +82,14 @@ enum Case : int {
   kGet,
   kAsync,
   kCtx,
+  kSplit,
+  kSigThr,
   kNumCases
 };
-static const char* kCaseNames[] = {"probe",   "flush", "signal", "mixed", "overflow",
-                                   "counter", "get",   "async",  "ctx"};
+static const char* kCaseNames[] = {"probe", "flush", "signal", "mixed", "overflow", "counter",
+                                   "get",   "async", "ctx",    "split", "sigthr"};
+// sigthr: each source adds into this element of its region on the receiver.
+static constexpr size_t kSigElem = kRegionElems - 1;
 
 __host__ __device__ inline uint64_t Value(int src, int dst, int chunk, int i) {
   return (static_cast<uint64_t>(src) << 48) | (static_cast<uint64_t>(dst) << 40) |
@@ -275,13 +285,13 @@ __global__ void AsyncKernel(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, 
   gda.wait(req, ccoCoopThread{});
 }
 
-// ctx: one lane per (peer, chunk) item, lane parity picks the context, so lanes
-// with the same peer use two QPs. Lane pairs alternate deferring, so both
-// contexts meet in every post. One flush per context.
+// ctx: one lane per (peer, chunk) item; every n-1 lanes (one per peer) switch
+// context, so lanes with the same peer use two QPs. Deferring switches every
+// 2(n-1) lanes, so both contexts meet in every post. One flush per context.
 template <mori::core::ProviderType P, ccoTeamMode TM>
 __global__ void CtxKernel(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, ccoDevComm dc) {
-  ccoGda<P> gda{dc, static_cast<int>(threadIdx.x & 1)};
   const int n = TeamSize<TM>(dc.worldSize, dc.lsaSize);
+  ccoGda<P> gda{dc, static_cast<int>((threadIdx.x / (n - 1)) & 1)};
   const int me = TeamRank<TM>(dc.rank, dc.lsaSize), meW = dc.rank;
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   const int nthreads = gridDim.x * blockDim.x;
@@ -294,7 +304,7 @@ __global__ void CtxKernel(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, cc
     const size_t dstOff = (meW * kRegionElems + c * kChunkElems) * sizeof(uint64_t);
     const size_t srcOff = (peerW * kRegionElems + c * kChunkElems) * sizeof(uint64_t);
     const size_t bytes = kChunkElems * sizeof(uint64_t);
-    if ((threadIdx.x >> 1) & 1) {
+    if ((threadIdx.x / (2 * (n - 1))) & 1) {
       gda.template put<TM, ccoGdaThreadIndependent, ccoGda_NoSignal, ccoCoopThread, kDefer>(
           peer, recv, dstOff, send, srcOff, bytes);
     } else {
@@ -303,6 +313,59 @@ __global__ void CtxKernel(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, cc
   }
   __syncthreads();
   for (int ctx = 0; ctx < kContexts; ctx++) ccoGda<P>{dc, ctx}.flush(ccoCoopWarp{});
+}
+
+// split: warp w owns peer (me + 1 + w). The first 3/4 of its lanes post most
+// chunks deferred and flushAsync; after a pause, so their completions are in,
+// the rest post one chunk each and flushAsync. Every lane then waits at thread
+// scope: the early lanes on the lower target, the late ones on fewer completions
+// than there are early lanes.
+template <mori::core::ProviderType P, ccoTeamMode TM>
+__global__ void SplitKernel(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, ccoDevComm dc) {
+  ccoGda<P> gda{dc, 0};
+  const int n = TeamSize<TM>(dc.worldSize, dc.lsaSize);
+  const int me = TeamRank<TM>(dc.rank, dc.lsaSize), meW = dc.rank;
+  const int w = threadIdx.x / warpSize, lane = threadIdx.x % warpSize;
+  if (w >= n - 1) return;
+  const int peer = (me + 1 + w) % n;
+  const int peerW = ToWorld<TM>(peer, dc.lsaSize, dc.lsaRank);
+  const int early = warpSize * 3 / 4, late = warpSize - early;
+  auto send = reinterpret_cast<ccoWindow_t>(sendWin);
+  auto recv = reinterpret_cast<ccoWindow_t>(recvWin);
+  auto post = [&](int c) {
+    gda.template put<TM, ccoGdaThreadIndependent, ccoGda_NoSignal, ccoCoopThread, kDefer>(
+        peer, recv, (meW * kRegionElems + c * kChunkElems) * sizeof(uint64_t), send,
+        (peerW * kRegionElems + c * kChunkElems) * sizeof(uint64_t),
+        kChunkElems * sizeof(uint64_t));
+  };
+  ccoGdaRequest_t req;
+  if (lane < early) {
+    for (int c = late + lane; c < kChunks; c += early) post(c);
+    gda.template flushAsync<TM>(peer, &req, ccoCoopThread{});
+  }
+  for (int i = 0; i < 16; i++) __builtin_amdgcn_s_sleep(127);
+  if (lane >= early) {
+    post(lane - early);
+    gda.template flushAsync<TM>(peer, &req, ccoCoopThread{});
+  }
+  gda.wait(req, ccoCoopThread{});
+}
+
+// sigthr: every lane adds 1 into its region's kSigElem on each peer at thread
+// scope, then the warps drain.
+template <mori::core::ProviderType P, ccoTeamMode TM>
+__global__ void SigThrKernel(ccoWindowDevice* recvWin, ccoDevComm dc) {
+  ccoGda<P> gda{dc, 0};
+  const int n = TeamSize<TM>(dc.worldSize, dc.lsaSize);
+  const int me = TeamRank<TM>(dc.rank, dc.lsaSize), meW = dc.rank;
+  auto recv = reinterpret_cast<ccoWindow_t>(recvWin);
+  for (int k = 1; k < n; k++) {
+    gda.template signal<TM>(
+        (me + k) % n,
+        ccoGda_WindowSignalAdd{recv, (meW * kRegionElems + kSigElem) * sizeof(uint64_t), 1},
+        ccoCoopThread{});
+  }
+  gda.flush(ccoCoopWarp{});
 }
 
 // A doorbell nobody rings shows up as a kernel that never finishes: fail it.
@@ -372,6 +435,10 @@ static bool RunCases(ccoComm* comm, const ccoDevComm& devComm, ccoWindowDevice* 
   bool allOk = true;
   for (int c = 0; c < kNumCases; c++) {
     HIP_CHECK(hipMemset(recvBuf, 0xff, bufBytes));
+    if (c == kSigThr)
+      for (int src : srcs)
+        HIP_CHECK(hipMemset(static_cast<uint64_t*>(recvBuf) + src * kRegionElems + kSigElem, 0,
+                            sizeof(uint64_t)));
     HIP_CHECK(hipDeviceSynchronize());
     ccoBarrierAll(comm);
     switch (c) {
@@ -404,6 +471,12 @@ static bool RunCases(ccoComm* comm, const ccoDevComm& devComm, ccoWindowDevice* 
         break;
       case kCtx:
         CCO_GDA_DISPATCH(CtxKernel<P, TM><<<4, 256, 0, stream>>>(sw, rw, devComm));
+        break;
+      case kSplit:
+        CCO_GDA_DISPATCH(SplitKernel<P, TM><<<1, 64 * (n - 1), 0, stream>>>(sw, rw, devComm));
+        break;
+      case kSigThr:
+        CCO_GDA_DISPATCH(SigThrKernel<P, TM><<<2, kSigThreads / 2, 0, stream>>>(rw, devComm));
         break;
     }
     HIP_CHECK(hipGetLastError());
@@ -442,7 +515,18 @@ static bool RunCases(ccoComm* comm, const ccoDevComm& devComm, ccoWindowDevice* 
                 rank, team, p[0], overflowPuts, ep.wqHandle.sqWqeNum);
         ok = false;
       }
-      ok = Verify(c, team, rank, srcs, hostRecv, overflowPuts) && ok;
+      if (c == kSigThr) {
+        for (int src : srcs) {
+          const uint64_t got = hostRecv[src * kRegionElems + kSigElem];
+          if (got != kSigThreads) {
+            fprintf(stderr, "[rank %d] %s/sigthr: src %d added %lu, want %d\n", rank, team, src,
+                    got, kSigThreads);
+            ok = false;
+          }
+        }
+      } else {
+        ok = Verify(c, team, rank, srcs, hostRecv, overflowPuts) && ok;
+      }
     }
     printf("[rank %d] %-5s %-8s %s\n", rank, team, kCaseNames[c], ok ? "PASS" : "FAIL");
     allOk = allOk && ok;

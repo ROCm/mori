@@ -96,6 +96,9 @@ enum ccoGdaOptFlags : uint32_t {
   // Write the WQEs and mark them ready, but do not ring the doorbell. A later
   // non-deferred post, signal, flush, flushAsync or counter on the same QP rings
   // for them. Until one of those runs, the NIC has not been told about them.
+  // Pays when one warp posts many WQEs to a QP and releases them once; for one
+  // or two per release, or many warps on one QP, plain posts cost the same and
+  // start the transfer sooner.
   ccoGdaOptFlagsDeferDoorbell = (1 << 1),
 };
 inline constexpr uint32_t kCcoGdaSupportedOptFlags = ccoGdaOptFlagsDeferDoorbell;
@@ -361,10 +364,18 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
       const uint32_t myLogicalLaneId = core::GetActiveLaneNum(activeMask);
       uint32_t wqeCounter;
 
-      while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
+      // The poll needs every group lane until the end, so wait for the group's
+      // furthest target (thread-scope wait passes one per lane).
+      uint32_t target = __shfl(targetIdx, lead);
+      for (uint64_t rest = activeMask; rest != 0; rest &= rest - 1) {
+        uint32_t t = __shfl(targetIdx, __ffsll(static_cast<unsigned long long>(rest)) - 1);
+        if (static_cast<int32_t>(t - target) > 0) target = t;
+      }
+
+      while ((wq->doneIdx - target) & PENDING_WORK_MASK) {
         if (!core::spin_lock_try_acquire_shared(&cq->pollCqLock, activeMask)) continue;
         uint32_t greedRemaining = MAX_GREED;
-        while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
+        while ((wq->doneIdx - target) & PENDING_WORK_MASK) {
           const uint64_t oldDoneIdx = wq->doneIdx;
           const uint32_t curConsIdx = cq->cq_consumer;
           uint32_t myCqPos = curConsIdx + myLogicalLaneId;
@@ -402,7 +413,7 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
               }
             }
           }
-          if (!((wq->doneIdx - targetIdx) & PENDING_WORK_MASK)) {
+          if (!((wq->doneIdx - target) & PENDING_WORK_MASK)) {
             if (wq->doneIdx == oldDoneIdx) break;
             if (greedRemaining == 0) break;
             --greedRemaining;
@@ -563,10 +574,10 @@ __device__ inline static uint32_t warpAggregateBnxtPsn(core::WorkQueueHandle* wq
 // only crosses a slot whose mark carries that slot's own index, so it never rings
 // for a WQE that is reserved but not yet written -- the bug that removed the old
 // deferred doorbell (#625). Every post rewrites the tag at its first slot -- its
-// mark, or count 0 on the fast path -- so where a post starts the tag is at most
-// a lap old and carries an index sqWqeNum lower; a never-written one has count 0.
-// Neither matches. (Without the fast-path write, a mark could outlive 2^32 WQEs
-// of fast-path posts and match its index again.)
+// mark, or count 0 on the fast path -- so a stale tag carries the index of the
+// last post that started there, and a never-written one has count 0. A stale tag
+// matches only if no post started at that slot for exactly a multiple of 2^32
+// WQEs. (Without the fast-path write, any run of 2^32 fast-path posts would do.)
 
 __device__ inline static uint64_t readyTag(uint32_t base, uint32_t count) {
   return (static_cast<uint64_t>(base) << 32) | count;
@@ -743,6 +754,7 @@ template <core::ProviderType PrvdType, bool DeferDoorbell>
 __device__ inline static void submitWqes(core::RdmaEndpointDevice* ep, uint32_t base,
                                          uint32_t count, uint64_t dbrVal) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
+  bool rang = false;
   if constexpr (!DeferDoorbell) {
     if (__hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == base) {
       // Retire this slot's old mark (see "Doorbell coalescing"); count 0 never matches.
@@ -750,11 +762,17 @@ __device__ inline static void submitWqes(core::RdmaEndpointDevice* ep, uint32_t 
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       __threadfence_system();  // our WQEs, before the doorbell
       ringAndPublish<PrvdType>(ep, base, base + count, dbrVal);
-      return;
+      rang = true;
     }
   }
-  markWqesReady(wq, base, count, dbrVal);
-  if constexpr (!DeferDoorbell) ringUntil<PrvdType>(ep, base + count);
+  if (!rang) markWqesReady(wq, base, count, dbrVal);
+  // Lanes of one wave can post to one QP (thread-scope signal): all of them ring
+  // or mark before any spins. Convergent, so -O2 cannot fold this back into an
+  // if/else that runs the spin while the ringing lane is masked off.
+  __builtin_amdgcn_wave_barrier();
+  if constexpr (!DeferDoorbell) {
+    if (!rang) ringUntil<PrvdType>(ep, base + count);
+  }
 }
 
 // Wait until the SQ has room for the WQEs up to `end`. Each pass first rings for
@@ -820,7 +838,7 @@ __device__ inline static uint32_t getAtomicWqeCount(core::atomicType amo_op, uin
 }
 
 // putImpl - post one warp-aggregated put for the active lanes (all targeting this
-// ep/qpn; the facade groups by peer). Each lane posts its data WQE into a contiguous
+// ep/qpn; the facade groups by QP). Each lane posts its data WQE into a contiguous
 // reservation; the leader posts the shared signal WQE and rings one doorbell.
 template <core::ProviderType PrvdType, bool DeferDoorbell = false>
 __device__ inline static void putImpl(
@@ -894,7 +912,7 @@ __device__ inline static void putImpl(
 }
 
 // putValueImpl - Inline write for small values. One group per call (the facade
-// groups lanes by peer); same warp-aggregate posting as putImpl.
+// groups lanes by QP); same warp-aggregate posting as putImpl.
 template <core::ProviderType PrvdType, typename T, bool DeferDoorbell = false>
 __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                            uintptr_t remoteAddr, uint32_t remoteKey, T value,
@@ -958,7 +976,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
   }
 }
 
-// getImpl - RDMA read. One group per call (the facade groups lanes by peer):
+// getImpl - RDMA read. One group per call (the facade groups lanes by QP):
 // each active lane posts its read WQE into a contiguous reservation, the leader
 // rings one doorbell.
 template <core::ProviderType PrvdType, bool DeferDoorbell = false>
@@ -1523,7 +1541,7 @@ __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* o
 template <core::ProviderType PrvdType>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request, Coop coop) {
-  // ccoCoopThread: each lane waits on its own request (quietUntil groups lanes by CQ).
+  // ccoCoopThread: each lane passes its own request; lanes on one CQ wait for the furthest.
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
