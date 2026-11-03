@@ -185,6 +185,21 @@ __device__ __forceinline__ void PostPayloadAndNotify(
   }
 }
 
+// Copy a short field one 4 B word per lane, falling back to one byte per lane
+// unless the length and both ends are 4 B aligned. At the shapes in use they are
+// (hidden and scale rows are multiples of 4), but the record stride is the sum
+// of every field, so an odd scale row would misalign every record after it.
+__device__ __forceinline__ void LaneCopyWords(uint8_t* dst, const uint8_t* src, size_t bytes) {
+  const int lane = threadIdx.x & (warpSize - 1);
+  if (((bytes | reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src)) & 3) == 0) {
+    for (size_t b = static_cast<size_t>(lane) * 4; b < bytes;
+         b += static_cast<size_t>(warpSize) * 4)
+      *reinterpret_cast<uint32_t*>(dst + b) = *reinterpret_cast<const uint32_t*>(src + b);
+  } else {
+    for (size_t b = lane; b < bytes; b += warpSize) dst[b] = src[b];
+  }
+}
+
 }  // namespace asyncll
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -193,52 +208,99 @@ __device__ __forceinline__ void PostPayloadAndNotify(
 // Routing only: no payload moves here. Groups of numExpertPerToken lanes inside a
 // warp cooperate on one token, each lane holding its own expert's destination, so
 // the deduplication is a register shuffle rather than a reload.
+//
+// Slots are claimed per BLOCK, not per entry. Every surviving entry needs the
+// next slot of its destination PE, and there are only worldSize counters: one
+// atomicAdd per entry put ~18k atomics on 8 addresses at EP8, top-6, 4096 tokens
+// and the pass took ~58 us for a few hundred KB of routing. Here each warp claims
+// its run inside the block (one LDS atomic per destination PE it touches), then
+// one thread per PE claims the block's whole run from the global counter: ~6.5 us
+// at that shape. The block walks the tokens in lockstep so every __syncthreads
+// is reached by all of its threads.
+//
+// Which slot an entry gets was never deterministic (it was atomic order before),
+// and nothing downstream depends on it: RecvCopy compacts each PE's slots in slot
+// order and records where each token came from.
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLSlotAssign_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
+  static_assert(kConfig.worldSize <= 64,
+                "slot claims are tracked in one 64-entry LDS array per destination PE");
   constexpr int numEpt = kConfig.numExpertPerToken;
   const int tokensPerWarp = warpSize / numEpt;
+  const int tokensPerBlock = warpNum * tokensPerWarp;
   const int expertIdx = laneId % numEpt;
   const int inWarpTokIdx = laneId / numEpt;
   const int baseLane = inWarpTokIdx * numEpt;
+  const unsigned long long lanesBelow = (1ull << laneId) - 1ull;
 
-  for (int warpTokBase = globalWarpId * tokensPerWarp; warpTokBase < args.curRankNumToken;
-       warpTokBase += globalWarpNum * tokensPerWarp) {
-    const int tokenId = warpTokBase + inWarpTokIdx;
+  __shared__ index_t blockClaims[64];
+  __shared__ index_t blockBase[64];
+
+  for (int blockTokBase = blockId * tokensPerBlock; blockTokBase < args.curRankNumToken;
+       blockTokBase += blockNum * tokensPerBlock) {
+    if (threadIdx.x < kConfig.worldSize) blockClaims[threadIdx.x] = 0;
+    __syncthreads();
+
+    const int tokenId = blockTokBase + warpId * tokensPerWarp + inWarpTokIdx;
     // warpSize need not be a multiple of numEpt (64 % 6 == 4 at top-k 6): the
     // trailing lanes alias the next warp's first token, so one entry would get two
     // slots and the orphan -- never written by SendCopy -- is read as a token by
     // the receiver. The test at top-k 6/9/10/12 exists for this.
     //
-    // Dropping a whole group keeps the shuffle below warp-coherent: inWarpTokIdx
-    // is group-uniform, so a group is either entirely in or entirely out.
-    if ((inWarpTokIdx >= tokensPerWarp) || (tokenId >= args.curRankNumToken)) continue;
-
+    // Those lanes and the ones past the last token stay in the loop as inactive
+    // rather than continuing: the ballots and shuffles below, and the block
+    // barriers, need every lane.
+    const bool active = (inWarpTokIdx < tokensPerWarp) && (tokenId < args.curRankNumToken);
     const int i = tokenId * numEpt + expertIdx;
-    const index_t destExpert = args.tokenIndices[i];
     // A negative expert id is the caller's "drop this slot" sentinel.
+    const index_t destExpert = active ? args.tokenIndices[i] : static_cast<index_t>(-1);
     const bool dropped = (destExpert < 0);
     const index_t destPe = dropped ? 0 : (destExpert / config.numExpertPerRank);
 
     // Deduplicate by shuffling the earlier lanes' destinations out of their
-    // registers. Every lane runs the same trip count so __shfl stays uniform --
-    // an early exit here is what makes it read an inactive lane.
+    // registers. inWarpTokIdx is group-uniform, so a group is entirely active or
+    // entirely not, and an inactive group's result is discarded. The mask keeps
+    // the trailing lanes' source lane inside the wave.
     bool isDuplicate = false;
     for (int j = 0; j < numEpt - 1; ++j) {
-      const index_t prevPe = __shfl(destPe, baseLane + j);
-      const bool prevDropped = __shfl(static_cast<int>(dropped), baseLane + j) != 0;
+      const int src = (baseLane + j) & (warpSize - 1);
+      const index_t prevPe = __shfl(destPe, src);
+      const bool prevDropped = __shfl(static_cast<int>(dropped), src) != 0;
       if ((j < expertIdx) && !prevDropped) isDuplicate = isDuplicate || (prevPe == destPe);
     }
 
     // An out-of-range expert id (an EPLB physical id past worldSize*numExpertPerRank)
     // would index destPeTokenCounter and SendBufSlotOffset out of bounds. Folded
-    // into the same null branch as the duplicate rather than skipped early, again
-    // to keep the shuffle above coherent.
+    // into the same null result as the duplicate rather than skipped early, again
+    // to keep the shuffles coherent.
     const bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
-    if (dropped || isDuplicate || peOutOfRange) {
-      args.dispDestTokIdMap[i] = NullSendBufSlotOffset(config);
-    } else {
-      const index_t destTokId = atomicAdd(args.destPeTokenCounter + destPe, 1);
+    const bool claims = active && !dropped && !isDuplicate && !peOutOfRange;
+
+    // This lane's offset within the block's run for its PE.
+    index_t inBlockTokId = 0;
+#pragma unroll
+    for (int pe = 0; pe < kConfig.worldSize; ++pe) {
+      const unsigned long long lanes = __ballot(claims && (destPe == pe));
+      if (lanes) {
+        const int leader = __ffsll(static_cast<long long>(lanes)) - 1;
+        index_t warpBase = 0;
+        if (laneId == leader)
+          warpBase = atomicAdd(&blockClaims[pe], static_cast<index_t>(__popcll(lanes)));
+        warpBase = __shfl(warpBase, leader);
+        if (claims && (destPe == pe))
+          inBlockTokId = warpBase + static_cast<index_t>(__popcll(lanes & lanesBelow));
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < kConfig.worldSize) {
+      const index_t n = blockClaims[threadIdx.x];
+      blockBase[threadIdx.x] = n ? atomicAdd(args.destPeTokenCounter + threadIdx.x, n) : 0;
+    }
+    __syncthreads();
+
+    if (active) {
+      const index_t destTokId = claims ? blockBase[destPe] + inBlockTokId : 0;
       // The counter is cleared by RecvCopy, one per round, so a SECOND
       // dispatch_send with no recv between it and the first keeps climbing from
       // where the first left off. Unbounded, SendBufSlotOffset then encodes a
@@ -251,10 +313,12 @@ __device__ void EpDispatchAsyncLLSlotAssign_body(EpDispatchCombineArgs args) {
       // right -- it is the host's call-order check that stops it being reachable
       // (dispatch_combine_op.py) -- but wrong-and-in-bounds beats corrupting a
       // peer's buffer, which is the one thing this kernel can still choose.
-      args.dispDestTokIdMap[i] = (destTokId < config.MaxNumTokensToSendPerRank())
+      args.dispDestTokIdMap[i] = (claims && destTokId < config.MaxNumTokensToSendPerRank())
                                      ? SendBufSlotOffset(config, destPe, destTokId)
                                      : NullSendBufSlotOffset(config);
     }
+    // blockClaims is reset at the top of the next round.
+    __syncthreads();
   }
 }
 
@@ -614,6 +678,12 @@ __device__ void EpDispatchAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
 // Unpack what arrived into the dispatch output, and build the two maps combine
 // needs. Per-PE output offsets come from a warp prefix sum rather than an atomic,
 // so every block derives the same layout independently.
+//
+// The whole grid walks the concatenated output rather than giving each source PE
+// a fixed 1/worldSize of the blocks: with a static split the PE that sent the
+// most sets the kernel's length while the other groups sit idle, and the PEs a
+// rank receives from are rarely even. The owning PE of output row r is the last
+// one whose exclusive offset is <= r, read off the prefix sum with one ballot.
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
@@ -624,11 +694,6 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
   // which does know it. This catches only a worldSize no wave could hold.
   static_assert(kConfig.worldSize <= 64,
                 "the per-PE offset prefix sum is one wavefront wide; worldSize must fit it");
-
-  const int blocksPerPe = blockNum / npes;
-  if (blocksPerPe <= 0) return;
-  const int destPe = blockId / blocksPerPe;
-  if (destPe >= npes) return;
 
   const uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<const uint8_t*>();
 
@@ -644,56 +709,63 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
   }
   uint64_t peExclusive = __shfl_up(inclusive, 1);
   if (laneId == 0) peExclusive = 0;
-
-  const uint64_t peOffset = __shfl(peExclusive, destPe);
-  const uint64_t recvTokenNum = __shfl(myPeTokens, destPe);
   const uint64_t totalTokens = __shfl(inclusive, npes - 1);
 
-  const uint8_t* stagingPtr = (destPe != myPe)
-                                  ? args.reg(args.offDispatchInp)->template GetAs<const uint8_t*>()
-                                  : args.reg(args.offStaging)->template GetAs<const uint8_t*>();
-  stagingPtr += static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * xferBytes;
+  const uint8_t* peerBase = args.reg(args.offDispatchInp)->template GetAs<const uint8_t*>();
+  // This rank's own tokens were never transferred; they are still in staging.
+  const uint8_t* selfBase = args.reg(args.offStaging)->template GetAs<const uint8_t*>();
+  uint8_t* outTokens = args.reg(args.offDispatchOut)->template GetAs<uint8_t*>();
+  uint8_t* outIndices = args.reg(args.offOutIndices)->template GetAs<uint8_t*>();
+  uint8_t* outWeights = args.reg(args.offDispatchOutWeights)->template GetAs<uint8_t*>();
+  uint8_t* outScales = args.reg(args.offOutScales)->template GetAs<uint8_t*>();
 
-  const int peWarps = blocksPerPe * warpNum;
-  const int localWarpId = (blockId % blocksPerPe) * warpNum + warpId;
   const index_t warpsPerToken =
-      (recvTokenNum > 0) ? static_cast<index_t>((peWarps + recvTokenNum - 1) / recvTokenNum) : 1;
+      (totalTokens > 0) ? static_cast<index_t>((globalWarpNum + totalTokens - 1) / totalTokens) : 1;
   const size_t hiddenBytesPerWarp =
       ((hiddenBytes + warpsPerToken - 1) / warpsPerToken + 15) & ~static_cast<size_t>(15);
 
-  for (int i = localWarpId; i < static_cast<int>(recvTokenNum) * warpsPerToken; i += peWarps) {
-    const index_t tokenId = i / warpsPerToken;
+  for (int i = globalWarpId; i < static_cast<int>(totalTokens) * warpsPerToken;
+       i += globalWarpNum) {
+    const index_t destTokId = i / warpsPerToken;
     const index_t inTokenPartId = i % warpsPerToken;
-    const index_t destTokId = static_cast<index_t>(peOffset) + tokenId;
+    // Lane 0 always qualifies (its exclusive offset is 0), so the mask is never
+    // empty; a PE that sent nothing shares its offset with the next and is
+    // skipped by taking the highest qualifying lane.
+    const unsigned long long owners =
+        __ballot((laneId < npes) && (peExclusive <= static_cast<uint64_t>(destTokId)));
+    const int srcPe = 63 - __clzll(static_cast<long long>(owners));
+    const index_t tokenId = destTokId - static_cast<index_t>(__shfl(peExclusive, srcPe));
+    const uint8_t* record =
+        ((srcPe != myPe) ? peerBase : selfBase) +
+        (static_cast<size_t>(SendBufSlotOffset(config, srcPe, 0)) + tokenId) * xferBytes;
 
+    // Four 16 B loads in flight per lane: the source is what SDMA just wrote, so
+    // it comes from HBM, not cache, and one load per lane left it latency-bound.
     const size_t hiddenOffset = inTokenPartId * hiddenBytesPerWarp;
     if (hiddenOffset < hiddenBytes) {
       const size_t len = min(hiddenBytesPerWarp, hiddenBytes - hiddenOffset);
-      core::WarpCopy<uint8_t, 1>(args.reg(args.offDispatchOut)->template GetAs<uint8_t*>() +
-                                     destTokId * hiddenBytes + hiddenOffset,
-                                 stagingPtr + tokenId * xferBytes + hiddenOffset, len);
+      core::WarpCopy<uint8_t, 4>(outTokens + destTokId * hiddenBytes + hiddenOffset,
+                                 record + hiddenOffset, len);
     }
 
     if (inTokenPartId == 0) {
-      core::WarpCopy<uint8_t, 1>(
-          args.reg(args.offOutIndices)->template GetAs<uint8_t*>() + destTokId * indexBytes,
-          stagingPtr + tokenId * xferBytes + hiddenBytes, indexBytes);
+      // The metadata fields are a few dozen bytes each, below WarpCopy's vector
+      // width, which sent them through its byte-at-a-time tail; copy them a word
+      // per lane instead.
+      const uint8_t* meta = record + hiddenBytes;
+      asyncll::LaneCopyWords(outIndices + destTokId * indexBytes, meta, indexBytes);
       if (args.weightsBuf)
-        core::WarpCopy<uint8_t, 1>(
-            args.reg(args.offDispatchOutWeights)->template GetAs<uint8_t*>() +
-                destTokId * weightBytes,
-            stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes, weightBytes);
+        asyncll::LaneCopyWords(outWeights + destTokId * weightBytes, meta + indexBytes,
+                               weightBytes);
       if (scaleBytes > 0)
-        core::WarpCopy<uint8_t, 1>(
-            args.reg(args.offOutScales)->template GetAs<uint8_t*>() + destTokId * scaleBytes,
-            stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
+        asyncll::LaneCopyWords(outScales + destTokId * scaleBytes, meta + indexBytes + weightBytes,
+                               scaleBytes);
       if (laneId == 0) {
         // Where this token came from, so combine's send leg can put the result
         // back in the slot it arrived in.
-        args.dispReceiverIdxMap[destTokId] = SendBufSlotOffset(config, destPe, tokenId);
+        args.dispReceiverIdxMap[destTokId] = SendBufSlotOffset(config, srcPe, tokenId);
         args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>()[destTokId] =
-            reinterpret_cast<const index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes +
-                                             indexBytes + weightBytes + scaleBytes)[0];
+            reinterpret_cast<const index_t*>(meta + indexBytes + weightBytes + scaleBytes)[0];
       }
     }
   }
