@@ -109,6 +109,15 @@ add_executable(sdma_self_copy_test sdma/sdma_self_copy_test.cpp)
 target_link_libraries(sdma_self_copy_test mori_collective mori_shmem hip::host
                       hip::device)
 
+# Unified runtime-configurable benchmark for all XLA collectives (reduce_scatter,
+# all_reduce, all_gather, all_to_all, collective_permute). Links the CCO-backed
+# facade (no shmem dependency). Selects collective/dtype/op/mode/logS at runtime.
+add_executable(collectives_benchmark collective/XLA/collectives_benchmark.cpp)
+target_link_libraries(collectives_benchmark mori_cco hip::host hip::device)
+# Print per-kernel resource usage (VGPRs / SGPRs / LDS / spills / occupancy) as
+# compiler remarks during the normal build of this TU.
+target_compile_options(collectives_benchmark PRIVATE -Rpass-analysis=kernel-resource-usage)
+
 # Find MPI package (required by intra-node examples)
 find_package(MPI REQUIRED)
 
