@@ -967,7 +967,6 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         // signaled WR on a FAILED/flush CQE (no-op if none was started for it).
         mori::io::MoriRoctxTransferStop(ep.ledger ? ep.ledger.get() : nullptr, wc[i].wr_id);
         if (meta) {
-          (void)meta->finishedBatchSize.fetch_add(mergedBatchSize);
           if (isFlush) {
             meta->diagnostics.MarkFlushCascade();
           } else {
@@ -976,11 +975,9 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
           LogAsyncTransferFailureIfNeeded(&meta->diagnostics,
                                           static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
                                           failureAdvice.ComposeStatusMessage());
-          TransferStatus* statusPtr = meta->status.exchange(nullptr, std::memory_order_acq_rel);
-          if (statusPtr != nullptr) {
-            meta->ReportData(statusPtr, StatusCode::ERR_RDMA_OP,
-                             failureAdvice.ComposeStatusMessage());
-          }
+          // The transfer fails, but reports only once its WRs on other QPs are done too.
+          meta->Account(mergedBatchSize, StatusCode::ERR_RDMA_OP,
+                        failureAdvice.ComposeStatusMessage(), /*rootCause=*/!isFlush);
           // A closed ledger means a fatal async event already retired this
           // endpoint, so its degraded flag is terminal rather than the
           // partial-post kind this path recovers from.
@@ -1079,17 +1076,10 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         mori::io::MoriRoctxTransferStop(ep.ledger ? ep.ledger.get() : nullptr, recordId);
         if (meta) {
           NotifySqStateChanged(ep);
-          uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
-          if ((finishedBefore + mergedBatchSize) == meta->totalBatchSize) {
-            // Claim before updating so a concurrent async-event failure cannot
-            // then overwrite a transfer that actually completed.
-            TransferStatus* statusPtr = meta->status.exchange(nullptr, std::memory_order_acq_rel);
-            if (statusPtr != nullptr) {
-              meta->ReportData(statusPtr, StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
-            }
-          }
           MORI_IO_TRACE("ProcessOneCqe: batch CQE for task {} total={} finished={} cur={}",
-                        meta->id, meta->totalBatchSize, finishedBefore, mergedBatchSize);
+                        meta->id, meta->totalBatchSize, meta->finishedBatchSize.load(),
+                        mergedBatchSize);
+          meta->Account(mergedBatchSize, StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
         } else {
           MORI_IO_WARN(
               "ProcessOneCqe: no ledger record for wr_id {} (recordId {}); sqDepth may be stale",
@@ -1578,9 +1568,15 @@ static void FinishSubmission(const EpPairVec& eps, const std::shared_ptr<CqCallb
                              TransferStatus* status, TransferUniqueId id, RdmaOpRet ret,
                              bool notify) {
   assert(!ret.Init());
-  if (ret.Failed() || ret.Succeeded()) {
-    // Nothing was posted, or the post gave up: no CQE ends this transfer, and the CQE
-    // of a WR posted before the failure must not report it a second time.
+  if (ret.Failed()) {
+    // The post gave up. What it never posted is accounted here; what it did post is still
+    // on the wire and is accounted by its completions, so the transfer fails only once
+    // none of its WRs can still move data.
+    meta->Account(
+        std::max(0, meta->totalBatchSize - meta->postedCredits.load(std::memory_order_acquire)),
+        ret.code, ret.message);
+  } else if (ret.Succeeded()) {
+    // Nothing was posted, so no CQE ends this transfer.
     if (TransferStatus* s = meta->status.exchange(nullptr, std::memory_order_acq_rel)) {
       meta->ReportData(s, ret.code, ret.message);
     }

@@ -248,6 +248,56 @@ void CaseSubmissionLedgerFailAll() {
   Require(statusA.Code() == StatusCode::ERR_RDMA_OP, "status must stay failed");
 }
 
+// A transfer striped over two QPs: one QP dies while the other still has its WRs on the
+// wire. The transfer must not report failed until the live QP's WRs finish, or a caller
+// freeing its buffers on that failure would let them keep moving data.
+void CaseTransferFailureWaitsForEveryQp() {
+  constexpr uint32_t kNotifPerQp = 16;
+  SubmissionLedger dead(kNotifPerQp);
+  SubmissionLedger live(kNotifPerQp);
+  std::atomic<int> sqDepthDead{2};
+  std::atomic<int> sqDepthLive{2};
+  TransferStatus status;
+  status.SetCode(StatusCode::IN_PROGRESS);
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 701, 4);
+  dead.Insert(2, true, meta, 2);
+  const uint64_t liveId = live.Insert(2, true, meta, 2);
+
+  Require(dead.FailAll(StatusCode::ERR_RDMA_OP, "qp died", &sqDepthDead) == 1,
+          "FailAll should count the transfer it failed");
+  Require(status.InProgress(), "a failure must wait for the transfer's WRs on the live QP");
+
+  int credits = 0;
+  auto released = live.ReleaseByCqe(liveId, &sqDepthLive, &credits);
+  Require(released != nullptr, "the live QP's record should still be there");
+  released->Account(credits, StatusCode::SUCCESS, "success");
+  Require(status.Failed(), "once every WR is done, the transfer reports its failure");
+  Require(status.Message() == "qp died", "the failure, not the later success, is reported");
+
+  // A flush cascade is reported only when no root cause was seen.
+  TransferStatus cascaded;
+  cascaded.SetCode(StatusCode::IN_PROGRESS);
+  auto meta2 = std::make_shared<CqCallbackMeta>(&cascaded, 702, 3);
+  meta2->Account(1, StatusCode::ERR_RDMA_OP, "flushed", /*rootCause=*/false);
+  meta2->Account(1, StatusCode::ERR_RDMA_OP, "retry exceeded");
+  meta2->Account(1, StatusCode::ERR_RDMA_OP, "flushed", /*rootCause=*/false);
+  Require(cascaded.Failed() && cascaded.Message() == "retry exceeded",
+          "the root cause should win over flushes on either side of it");
+
+  // A submission that gave up after posting part of the transfer: the unposted credits
+  // are accounted at once, the posted ones only by their completion.
+  TransferStatus partial;
+  partial.SetCode(StatusCode::IN_PROGRESS);
+  auto meta3 = std::make_shared<CqCallbackMeta>(&partial, 703, 5);
+  meta3->postedCredits.store(3);
+  meta3->Account(meta3->totalBatchSize - meta3->postedCredits.load(), StatusCode::ERR_RDMA_OP,
+                 "post failed");
+  Require(partial.InProgress(), "posted WRs keep the transfer in progress");
+  meta3->Account(3, StatusCode::SUCCESS, "success");
+  Require(partial.Failed() && partial.Message() == "post failed",
+          "the post failure is reported once the posted WRs complete");
+}
+
 void CaseSubmissionLedgerClosedAfterFailAll() {
   constexpr uint32_t kNotifPerQp = 16;
   SubmissionLedger ledger(kNotifPerQp);
@@ -2230,6 +2280,7 @@ int main(int argc, char* argv[]) {
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"submission_ledger_fail_all", CaseSubmissionLedgerFailAll},
+      {"transfer_failure_waits_for_every_qp", CaseTransferFailureWaitsForEveryQp},
       {"submission_ledger_closed_after_fail_all", CaseSubmissionLedgerClosedAfterFailAll},
       {"submission_ledger_notif_disabled", CaseSubmissionLedgerNotifDisabled},
       {"submission_ledger_post_commit_race", CaseSubmissionLedgerPostCommitRace},
