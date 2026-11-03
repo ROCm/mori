@@ -231,6 +231,17 @@ jobs:
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_a2a.py \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_a2a_op.py"
 
+      - name: Run CCO A2A+GEMM numerics, band counting and the op (8 ranks)
+        run: |
+          # From /tmp for the same packaging reason as above. test_a2a_gemm.py
+          # is the layout on the CPU, every mode through the benchmark, and the
+          # signal-counter wrap; test_a2a_gemm_op.py runs the wrapper on 8 ranks.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.a2a_gemm as g; print(g.A2aGemmOp)' && \
+            timeout 1800 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_a2a_gemm.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_a2a_gemm_op.py"
+
       - name: Run CCO GEMM+AR benchmark (8 ranks, accuracy-gated)
         run: |
           # Accuracy is a gate (validated + rel_l2); absolute timings are only
