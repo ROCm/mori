@@ -208,6 +208,12 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
                     &dist.ranged_scratch_hugepage_size, error)) {
     return false;
   }
+  // Every GPU on the node shares this server's arenas.
+  dist.ranged_scratch_numa_layout = true;
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA", &dist.ranged_scratch_numa_layout,
+                    error)) {
+    return false;
+  }
   if (!ParseIntEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS", &dist.ssd_staging_buffer_slots,
                    error)) {
     return false;
@@ -314,8 +320,10 @@ int main(int argc, char** argv) {
   // the background, would slow each queue creation here to about a second.
   // 8 covers the peak number of concurrent gathers per GPU under TP8 serving;
   // 0 turns the prewarm off.
-  mori::umbp::HbmCopyEngine::Prewarm(
-      mori::umbp::GetEnvUint32("UMBP_HBM_GATHER_PREWARM_STREAMS", 8));
+  if (!config.sim.enabled) {
+    mori::umbp::HbmCopyEngine::Prewarm(
+        mori::umbp::GetEnvUint32("UMBP_HBM_GATHER_PREWARM_STREAMS", 8));
+  }
 
   std::unique_ptr<mori::umbp::standalone::StandaloneServer> server;
   try {

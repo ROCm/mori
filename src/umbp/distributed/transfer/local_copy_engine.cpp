@@ -310,18 +310,22 @@ class CopyPool {
 //
 // Below the byte floor the threads cost more than they save, so a small batch
 // stays on the calling thread and pays nothing.
-int CopyThreads(size_t total_bytes, size_t copy_count) {
+}  // namespace
+
+int LocalCopyThreadLimit(const char* env_name) {
+  int n = 4;
+  if (const char* raw = std::getenv(env_name)) {
+    const int v = std::atoi(raw);
+    if (v >= 1) n = v;
+  }
+  const unsigned hc = std::thread::hardware_concurrency();
+  if (hc > 0 && n > static_cast<int>(hc)) n = static_cast<int>(hc);
+  return std::max(n, 1);
+}
+
+int LocalCopyThreads(size_t total_bytes, size_t copy_count) {
   if (ThreadBackgroundFlag()) return 1;
-  static const int kMax = [] {
-    int n = 4;
-    if (const char* raw = std::getenv("UMBP_DRAM_COPY_THREADS")) {
-      const int v = std::atoi(raw);
-      if (v >= 1) n = v;
-    }
-    const unsigned hc = std::thread::hardware_concurrency();
-    if (hc > 0 && n > static_cast<int>(hc)) n = static_cast<int>(hc);
-    return n < 1 ? 1 : n;
-  }();
+  static const int kMax = LocalCopyThreadLimit("UMBP_DRAM_COPY_THREADS");
   static const size_t kMinBytes = [] {
     if (const char* raw = std::getenv("UMBP_DRAM_COPY_THREADS_MIN_BYTES")) {
       char* end = nullptr;
@@ -333,8 +337,6 @@ int CopyThreads(size_t total_bytes, size_t copy_count) {
   if (kMax <= 1 || copy_count < 2 || total_bytes < kMinBytes) return 1;
   return std::min(kMax, static_cast<int>(copy_count));
 }
-
-}  // namespace
 
 // Set on a worker thread at start-up; read by CopyThreads above.
 void MarkThreadBackgroundCopies() { ThreadBackgroundFlag() = true; }
@@ -391,7 +393,7 @@ std::unique_ptr<TransferHandle> LocalCopyEngine::Submit(std::vector<TransferPlan
     }
   }
 
-  const int threads = CopyThreads(total_bytes, copies.size());
+  const int threads = LocalCopyThreads(total_bytes, copies.size());
   if (threads <= 1) {
     for (const Copy& c : copies) HostCopyBlock(c.dst, c.src, c.size);
   } else {
