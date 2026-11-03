@@ -585,6 +585,32 @@ std::vector<bool> SsdBackend::BatchAbort(const std::vector<uint64_t>& slot_ids) 
   return results;
 }
 
+bool SsdBackend::SharedStage::Finish(ResolveOutcome outcome, StagingSpan staged,
+                                     uint64_t object_size, ObjectExtent staged_window,
+                                     const std::shared_ptr<const void>& reader_hold) {
+  done = true;
+  span = staged;
+  size = object_size;
+  window = staged_window;
+  for (ResolvedEntry* joiner : joiners) {
+    joiner->outcome = outcome;
+    joiner->hold = reader_hold;
+  }
+  joiners.clear();
+  cv.notify_all();
+  // Whole objects go to read leases; only a held extent stays joinable.
+  if (outcome != ResolveOutcome::kFound || window.length == 0) return false;
+  hold = reader_hold;
+  return true;
+}
+
+bool SsdBackend::SharedStage::Wait(std::unique_lock<std::mutex>& lock, ResolvedEntry* entry) {
+  if (cv.wait_for(lock, kJoinWait, [this] { return done; })) return true;
+  joiners.erase(std::remove(joiners.begin(), joiners.end(), entry), joiners.end());
+  entry->outcome = ResolveOutcome::kBusy;
+  return false;
+}
+
 std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::string>& keys,
                                                     bool include_descs, bool allow_file_refs,
                                                     ResolveReader reader,
@@ -810,26 +836,10 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // Phase 3 (ONE lock): install a lease per key that landed, hand back the pages
   // of the ones that did not.
   std::unique_lock<std::mutex> lock(mutex_);
-  // Hands each joiner the outcome and its own hold, so the span outlives this
-  // call's readers; a held extent stays joinable afterwards.
+  // A stage nobody can join any more leaves the map, unless a newer one replaced it.
   auto finish_stage = [&](const Read& read, ResolveOutcome outcome, StagingSpan span, uint64_t size,
                           const std::shared_ptr<const void>& hold) {
-    if (read.stage == nullptr) return;
-    SharedStage& stage = *read.stage;
-    stage.done = true;
-    stage.span = span;
-    stage.size = size;
-    stage.window = read.window;
-    for (ResolvedEntry* joiner : stage.joiners) {
-      joiner->outcome = outcome;
-      joiner->hold = hold;
-    }
-    stage.joiners.clear();
-    stage.cv.notify_all();
-    if (outcome == ResolveOutcome::kFound && stage.window.length != 0) {
-      stage.hold = hold;
-      return;
-    }
+    if (read.stage == nullptr || read.stage->Finish(outcome, span, size, read.window, hold)) return;
     auto it = shared_stages_.find(read.stage_key);
     if (it != shared_stages_.end() && it->second == read.stage) shared_stages_.erase(it);
   };
@@ -875,13 +885,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // Phase 4: wait for the stages joined in Phase 1.  Only after this call's own
   // stages are done, so two calls joining each other cannot deadlock.
   for (auto& [i, stage] : joined) {
-    if (!stage->cv.wait_for(lock, kJoinWait, [&stage] { return stage->done; })) {
-      auto& joiners = stage->joiners;
-      joiners.erase(std::remove(joiners.begin(), joiners.end(), &results[i]), joiners.end());
-      results[i].outcome = ResolveOutcome::kBusy;
-      continue;
-    }
-    if (results[i].outcome == ResolveOutcome::kFound) {
+    if (stage->Wait(lock, &results[i]) && results[i].outcome == ResolveOutcome::kFound) {
       publish_span(results[i], stage->span, stage->size, results[i].hold, stage->window);
     }
   }
