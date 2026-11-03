@@ -31,8 +31,8 @@
 #include "mori/io/engine.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/config.h"
+#include "umbp/common/nic_limits.h"
 #include "umbp/distributed/config.h"
-#include "umbp/distributed/transfer/mori_io_engine.h"
 
 namespace mori::umbp {
 

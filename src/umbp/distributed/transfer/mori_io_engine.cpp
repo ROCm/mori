@@ -24,19 +24,14 @@
 #include <algorithm>
 #include <cstring>
 #include <exception>
-#include <filesystem>
 #include <functional>
 #include <iterator>
 #include <limits>
 #include <msgpack.hpp>
-#include <optional>
-#include <set>
-#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/io/backend.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/transfer/plan_builder.h"
@@ -636,64 +631,6 @@ std::unique_ptr<TransferHandle> MoriIoEngine::Submit(std::vector<TransferPlan> p
 
   if (!any) return nullptr;
   return handle;
-}
-
-// ---------------------------------------------------------------------------
-//  NIC memory-region limit
-// ---------------------------------------------------------------------------
-
-namespace {
-
-constexpr uint64_t kNicRegionPages = uint64_t{1} << 18;
-constexpr application::IonicFwVersion kFixedFirmware{1, 117, 5, 190};
-
-std::string FirmwareName(const std::optional<application::IonicFwVersion>& v) {
-  if (!v) return "unknown";
-  const auto& [major, minor, patch, build] = *v;
-  return std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch) + "-a-" +
-         std::to_string(build);
-}
-
-// The firmware of this host's AINICs, the RDMA devices the ionic driver binds;
-// nullopt for one whose version cannot be read.  Read once.
-const std::vector<std::optional<application::IonicFwVersion>>& AinicFirmware() {
-  static const auto versions = [] {
-    std::vector<std::optional<application::IonicFwVersion>> found;
-    std::error_code ec;
-    for (const auto& dev : std::filesystem::directory_iterator("/sys/class/infiniband", ec)) {
-      std::error_code link_ec;
-      const auto driver = std::filesystem::read_symlink(dev.path() / "device" / "driver", link_ec);
-      if (link_ec || driver.filename() != "ionic") continue;
-      found.push_back(application::ReadIonicFwVersion(dev.path().filename().c_str()));
-    }
-    return found;
-  }();
-  return versions;
-}
-
-}  // namespace
-
-void WarnIfNicRegionExceedsAinicLimit(std::string_view what, uint64_t bytes, uint64_t page_size,
-                                      std::string_view remedy) {
-  if (page_size == 0) return;
-  const uint64_t entries = (bytes + page_size - 1) / page_size;
-  if (entries <= kNicRegionPages) return;
-  // Quiet with no AINIC here, or with every one at or past the fix.
-  const auto& firmware = AinicFirmware();
-  if (std::all_of(firmware.begin(), firmware.end(),
-                  [](const auto& v) { return v && *v >= kFixedFirmware; })) {
-    return;
-  }
-  std::set<std::string> names;
-  for (const auto& v : firmware) names.insert(FirmwareName(v));
-  std::string versions;
-  for (const auto& name : names) versions += (versions.empty() ? "" : ", ") + name;
-  MORI_UMBP_WARN(
-      "[UMBP] {} of {} MiB on {} KiB pages is {} NIC page entries; AINIC firmware before {} "
-      "translates only the first {} of a memory region and silently aliases the rest "
-      "(this host's AINICs: {}). {}",
-      what, bytes >> 20, page_size >> 10, entries, FirmwareName(kFixedFirmware), kNicRegionPages,
-      versions, remedy);
 }
 
 }  // namespace mori::umbp

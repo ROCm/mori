@@ -39,9 +39,9 @@
 #endif
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/nic_limits.h"
 #include "umbp/common/numa_config.h"
 #include "umbp/common/parallel_for.h"
-#include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 
 namespace mori::umbp {
