@@ -226,13 +226,8 @@ class EpDispatchCombineConfig:
     # shared queue drains the first-posted op first, while two queues split the
     # link between both ops and finish both later.
     #
-    # Measured on 8x MI355X, EP8, hidden 7168, early notify: two ops, one stream,
-    # with compute between the phases: -10 to -15% per iteration; two streams:
-    # +13 to +14%. DeepSeek-V4-Pro EP8 prefill with two-batch overlap: one stream
-    # 70.6k -> 79.6k tok/s; two streams 78.7k -> 80.2k.
-    #
     # Set it on both ops of a single-stream two-batch overlap; leave it off when
-    # the micro-batches run on their own streams.
+    # the micro-batches run on their own streams, where it is clearly slower.
     async_ll_own_sdma_queue: bool = False
 
     def __post_init__(self):
