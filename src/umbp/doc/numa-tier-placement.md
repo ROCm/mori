@@ -35,6 +35,12 @@ claim strict placement on a system that cannot bind memory. A successful BIND
 still restricts physical pages to the selected node even when STRICT is zero;
 STRICT controls error handling, not whether that policy can spill on a fault.
 
+In a container, `mbind` needs `CAP_SYS_NICE`: under Docker's default seccomp
+profile it fails with `EPERM`. Run with `--cap-add SYS_NICE`, `--security-opt
+seccomp=unconfined` or `--privileged`. Without one of them a DRAM tier handles
+the failure as the table above says, and the standalone server's ranged
+scratch, which requires its binding, falls back to one arena per direction.
+
 With `UMBP_DRAM_USE_HUGEPAGES=1`, reserve huge pages per node, not only in
 total. The hugetlb reservation made at `mmap` time is global, but a fault under
 BIND takes pages only from the bound node, so a node whose own pool is short
@@ -110,6 +116,22 @@ tier on one node keeps its order.
 Each side of an RDMA transfer picks its NICs from the node of its own memory, so
 the object then travels between NICs on the same node at both ends when the
 reader is the GPU that wrote it.
+
+## Ranged I/O
+
+A remote ranged GET or PUT stages through a host arena, and every GPU on a node
+shares the standalone server's. In one piece, the arena sits on whichever node
+first touch placed it, so its NUMA node picks the NICs of every rank's RDMA leg
+and half the GPUs copy across sockets. The standalone server therefore lays each
+arena out by NUMA node (`UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA`): the configured
+bytes are split evenly over the nodes that have GPUs, each part is bound to its
+node and registered on its own, and is cut into one shard per GPU on it unless
+`UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS` sets the arena's total. A call stages
+through a shard on its caller buffer's node, or that node's whole part when it
+needs more than a shard. Memory is the same as one arena per direction. Each
+part is one NIC memory region, so on 4 KiB pages keep a part within 1 GiB, the
+AINIC limit above, or back the arenas with hugepages
+(`UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES`).
 
 ## Measured effect
 
