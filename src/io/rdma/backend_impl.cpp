@@ -656,7 +656,10 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
             local,
             remote,
             std::make_shared<std::atomic<int>>(0),
-            static_cast<int>(epConfig.maxMsgsNum),
+            // Admission stops short of the send queue's size; completion markers use the rest.
+            static_cast<int>(epConfig.maxMsgsNum) > 2 * kCompletionMarkerSlots
+                ? static_cast<int>(epConfig.maxMsgsNum) - kCompletionMarkerSlots
+                : static_cast<int>(epConfig.maxMsgsNum),
             std::make_shared<std::atomic<bool>>(false),
             std::make_shared<SubmissionLedger>(config.notifPerQp),
             std::make_shared<SqAdmissionEvent>()};
@@ -1566,9 +1569,22 @@ RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
 // transfer by itself, then posts the notification when notifications are on.
 static void FinishSubmission(const EpPairVec& eps, const std::shared_ptr<CqCallbackMeta>& meta,
                              TransferStatus* status, TransferUniqueId id, RdmaOpRet ret,
-                             bool notify) {
+                             bool notify, RdmaManager* rdma) {
   assert(!ret.Init());
   if (ret.Failed()) {
+    // A QP the submission had to cut to bound its WRs is dead: mark it, so the next
+    // transfer replaces it instead of posting into it.
+    if (rdma != nullptr) {
+      for (const auto& ep : eps) {
+        ibv_qp_attr attr{};
+        ibv_qp_init_attr init{};
+        ibv_qp* qp = ep.local.ibvHandle.qp;
+        if (qp != nullptr && ibv_query_qp(qp, &attr, IBV_QP_STATE, &init) == 0 &&
+            attr.qp_state == IBV_QPS_ERR) {
+          rdma->RecordQpFailed(ep);
+        }
+      }
+    }
     // The post gave up. What it never posted is accounted here; what it did post is still
     // on the wire and is accounted by its completions, so the transfer fails only once
     // none of its WRs can still move data.
@@ -1600,7 +1616,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
                                      {remoteOffset}, {size}, callbackMeta, id, isRead, 1,
                                      config.enableTransferChunking ? config.chunkBytes : 0,
                                      config.maxChunksPerTransfer, config.enableTransferChunking);
-  FinishSubmission(eps, callbackMeta, status, id, ret, config.enableNotification);
+  FinishSubmission(eps, callbackMeta, status, id, ret, config.enableNotification, rdma_);
 }
 
 void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
@@ -1692,7 +1708,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, localOffsets, remoteOffsets, sizes,
                              callbackMeta, id, isRead, config.postBatchSize, control);
   }
-  FinishSubmission(eps, callbackMeta, status, id, ret, config.enableNotification);
+  FinishSubmission(eps, callbackMeta, status, id, ret, config.enableNotification, rdma_);
 }
 
 bool RdmaBackendSession::Alive() const {

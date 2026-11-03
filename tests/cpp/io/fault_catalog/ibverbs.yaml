@@ -80,6 +80,15 @@
   transfer: large_then_small
   env: MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
 
+# Every post after the eighth fails, the completion markers included: the QPs holding
+# pending unsignaled WRs are cut instead, so the transfer still ends, and the next one
+# gets new QPs.
+- id: post_send_fail.unsignaled_pending.no_marker
+  real_world: a post fails partway and the QP refuses the completion marker too
+  rule: post_send_fail:skip=8:count=0
+  transfer: large_then_small
+  env: MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
+
 - id: post_send_fail.notify
   real_world: data posted, then the notification post fails
   rule: post_send_fail:skip=1

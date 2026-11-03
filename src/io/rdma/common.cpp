@@ -417,8 +417,15 @@ static void ReleaseSqDepth(const EpPair& ep, int wrCount) {
 static bool PostCompletionMarker(const EpPair& ep, const application::RdmaMemoryRegion& remoteMr,
                                  bool isRead, int pendingWrs, int pendingCredits,
                                  const std::shared_ptr<CqCallbackMeta>& callbackMeta) {
-  if (!ep.ledger || (ep.degraded && ep.degraded->load(kSqAdmissionOrder))) return false;
-  if (!TryReserveSqDepthOnce(ep, 1)) return false;
+  if (!ep.ledger) return false;
+  // The marker may use the slots normal admission holds back (kCompletionMarkerSlots).
+  if (ep.sqDepth) {
+    int observed = ep.sqDepth->load(kSqAdmissionOrder);
+    do {
+      if (std::max(observed, 0) >= ep.maxSqDepth + kCompletionMarkerSlots) return false;
+    } while (!ep.sqDepth->compare_exchange_weak(observed, std::max(observed, 0) + 1,
+                                                kSqAdmissionOrder, kSqAdmissionOrder));
+  }
   SubmissionLedger::PostGuard guard =
       ep.ledger->InsertForPost(pendingWrs + 1, callbackMeta, pendingCredits);
   if (!guard) {
@@ -443,11 +450,23 @@ static bool PostCompletionMarker(const EpPair& ep, const application::RdmaMemory
   return true;
 }
 
+// Moves `ep`'s QP to Error: each WR on it has then either completed or is flushed without
+// running, as when a fatal event kills a QP.
+static bool CutQp(const EpPair& ep) {
+  ibv_qp* qp = ep.local.ibvHandle.qp;
+  if (qp == nullptr) return false;
+  ibv_qp_attr attr{};
+  attr.qp_state = IBV_QPS_ERR;
+  return ibv_modify_qp(qp, &attr, IBV_QP_STATE) == 0;
+}
+
 // When a post gives up partway, the WRs it already posted on an EP since that EP's last
 // signaled one have nothing behind them to report their completion. Put a completion
-// marker behind them. Where that cannot be posted, park them as orphaned and mark the EP
-// degraded so the recovery path can reclaim them. On a closed ledger the QP is dead, so
-// they are left uncounted as posted and the caller accounts them as never sent.
+// marker behind them. Where that cannot be posted, cut the QP so they cannot run any
+// longer and account them now; the caller marks the QP failed, so the next transfer
+// replaces it. Only a QP that cannot be cut has them parked as orphaned and the EP
+// degraded, for the recovery path. On a closed ledger the QP is dead, so they are left
+// uncounted as posted and the caller accounts them as never sent.
 // `skipEpId` is an EP the caller has already settled, or -1.
 static void SettlePendingWrs(const EpPairVec& eps,
                              const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
@@ -465,6 +484,17 @@ static void SettlePendingWrs(const EpPairVec& eps,
                              callbackMeta)) {
       MORI_IO_DEBUG("{}: posted a completion marker behind {} pending unsignaled WRs on ep {}",
                     reason, pendingWrs, epId);
+      continue;
+    }
+    if (eps[epId].ledger && !eps[epId].ledger->Closed() && CutQp(eps[epId])) {
+      MORI_IO_WARN(
+          "{}: no completion marker could be posted on ep {}; moved its QP to error so its {} "
+          "pending unsignaled WRs cannot run any longer",
+          reason, epId, pendingWrs);
+      ReleaseSqDepth(eps[epId], pendingWrs);
+      callbackMeta->postedCredits.fetch_add(pendingCredits, std::memory_order_acq_rel);
+      callbackMeta->Account(pendingCredits, StatusCode::ERR_RDMA_OP,
+                            "the QP was cut after a submission gave up", /*rootCause=*/false);
       continue;
     }
     MORI_IO_WARN(

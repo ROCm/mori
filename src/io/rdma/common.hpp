@@ -434,6 +434,11 @@ using QpErrorHandler = std::function<void(const QpErrorEvent&)>;
 
 inline constexpr std::memory_order kSqAdmissionOrder = std::memory_order_seq_cst;
 
+// Send-queue slots held back from normal admission for completion markers (see
+// SettlePendingWrs), so a full send queue cannot stop a submission that gives up from
+// making the WRs it already posted observable.
+inline constexpr int kCompletionMarkerSlots = 4;
+
 struct SqAdmissionEvent {
   alignas(4) std::atomic<uint32_t> epoch{0};
   std::atomic<uint32_t> waiters{0};
