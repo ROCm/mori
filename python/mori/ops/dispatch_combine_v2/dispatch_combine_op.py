@@ -217,8 +217,8 @@ class EpDispatchCombineConfig:
     # Give this op its own SDMA queue per peer instead of the shared one (sdma
     # transport only). Set it when two ops interleave on one stream, e.g.
     # single-stream two-batch overlap: a recv then no longer waits for the other
-    # op's send. Leave it off when the ops run on separate streams; it is slower
-    # there.
+    # op's send. With the ops on separate streams, a two-op microbenchmark is
+    # slower but DeepSeek-V4 prefill was still faster, so measure that case.
     async_ll_own_sdma_queue: bool = False
 
     def __post_init__(self):

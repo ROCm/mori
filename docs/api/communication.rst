@@ -79,8 +79,10 @@ after the corresponding receive phase completes on the stream.
 SDMA queues are shared per GPU pair by all ops in a process. When two ops
 interleave on one stream (single-stream two-batch overlap), set
 ``async_ll_own_sdma_queue=True`` on both so a receive does not wait for the
-other op's send. Leave it off (the default) when the ops run on separate
-streams; it is slower there. Only the ``"sdma"`` transport uses it.
+other op's send. When the ops run on separate streams the option is not a
+clear win: a two-op microbenchmark gets slower, while DeepSeek-V4 prefill with
+two-stream two-batch overlap got faster. It is off by default; measure your
+workload before turning it on there. Only the ``"sdma"`` transport uses it.
 
 On a single gfx1250 node, the send phase now posts each payload followed by
 its ready notification on the same SDMA queue. The receive phase still waits
