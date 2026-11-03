@@ -111,6 +111,28 @@ RasConfig ConfigFromEnv(const GetEnvFn& getenv) {
     }
   }
 
+  v = get("MORI_RAS_TIMEOUT_FACTOR");
+  if (!v.empty()) {
+    errno = 0;
+    char* end = nullptr;
+    double f = std::strtod(v.c_str(), &end);
+    if (errno != 0 || *end != '\0' || !(f > 0.0) || f > 100.0) {
+      invalid("MORI_RAS_TIMEOUT_FACTOR", v, "1.0");
+    } else {
+      c.timeoutFactor = f;
+    }
+  }
+
+  v = get("MORI_RAS_HEARTBEAT_MS");
+  if (!v.empty()) {
+    uint64_t ms;
+    if (!ParseUnsigned(v, 600000, &ms) || ms < 10) {
+      invalid("MORI_RAS_HEARTBEAT_MS", v, "1000");
+    } else {
+      c.heartbeatMs = static_cast<uint32_t>(ms);
+    }
+  }
+
   v = get("MORI_RAS_CPU_AFFINITY");
   if (!v.empty() && !ParseCpuList(v, &c.cpuAffinity)) {
     c.cpuAffinity.clear();

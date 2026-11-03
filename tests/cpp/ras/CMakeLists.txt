@@ -16,16 +16,20 @@ function(mori_ras_test name)
   add_test(NAME ras_${name} COMMAND test_ras_${name})
 endfunction()
 
+mori_ras_test(protocol)
 mori_ras_test(bounded_queues)
 mori_ras_test(identity)
 mori_ras_test(config)
 mori_ras_test(runtime)
 mori_ras_test(fork)
+mori_ras_test(links)
 
-# RAS through MORI-IO: EngineDesc compatibility.
+# RAS through MORI-IO: EngineDesc compatibility, and two IOEngine processes linked by RAS.
 if(BUILD_IO)
   mori_ras_test(engine_desc_compat)
   target_link_libraries(test_ras_engine_desc_compat PRIVATE mori_io)
+  mori_ras_test(two_process)
+  target_link_libraries(test_ras_two_process PRIVATE mori_io)
 
   # MORI RAS beside RCCL RAS in one process. Built only where RCCL is installed.
   find_library(MORI_RAS_RCCL_LIBRARY rccl HINTS ${ROCM_PATH}/lib)
@@ -38,4 +42,19 @@ if(BUILD_IO)
   else()
     message(STATUS "RCCL not found: test_ras_rccl_coexistence is not built")
   endif()
+endif()
+
+# Coverage-guided fuzzing of the protocol decoder. Needs clang's libFuzzer, so it is opt-in;
+# test_ras_protocol replays its seed corpus with fixed mutations in every build.
+option(MORI_RAS_FUZZ "Build fuzz_ras_protocol, a libFuzzer target for the RAS decoder" OFF)
+if(MORI_RAS_FUZZ)
+  add_executable(fuzz_ras_protocol fuzz_protocol.cpp ${CMAKE_SOURCE_DIR}/src/ras/protocol.cpp)
+  target_include_directories(
+    fuzz_ras_protocol PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include
+                              ${CMAKE_SOURCE_DIR}/3rdparty/msgpack-c/include)
+  target_compile_definitions(fuzz_ras_protocol PRIVATE MSGPACK_NO_BOOST)
+  # Not UBSan too: with ROCm's clang, UBSan's source-location strings trip a false ASan ODR
+  # report.
+  target_compile_options(fuzz_ras_protocol PRIVATE -fsanitize=fuzzer,address)
+  target_link_options(fuzz_ras_protocol PRIVATE -fsanitize=fuzzer,address)
 endif()

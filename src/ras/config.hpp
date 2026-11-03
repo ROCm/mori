@@ -39,8 +39,19 @@ struct RasConfig {
   bool enable{false};            // MORI_RAS_ENABLE: off by default through P3
   std::string ifname;            // MORI_RAS_IFNAME: the interface for RAS links
   uint16_t port{0};              // MORI_RAS_PORT: the peer listener port; 0 picks one
+  double timeoutFactor{1.0};     // MORI_RAS_TIMEOUT_FACTOR: scales every timeout and backoff
+  uint32_t heartbeatMs{1000};    // MORI_RAS_HEARTBEAT_MS: the heartbeat period
   std::vector<int> cpuAffinity;  // MORI_RAS_CPU_AFFINITY: CPUs for the RAS thread, e.g. 0-3,8
   std::vector<std::string> warnings;
+
+  uint64_t HeartbeatNs() const { return uint64_t{heartbeatMs} * 1000000; }
+  // Connect plus HELLO, in either direction: RCCL's 5 s connect warning.
+  uint64_t HandshakeTimeoutNs() const { return ScaledMs(5000); }
+  uint64_t ReconnectBackoffInitialNs() const { return ScaledMs(1000); }
+  uint64_t ReconnectBackoffMaxNs() const { return ScaledMs(30000); }
+  uint64_t ScaledMs(uint64_t ms) const {
+    return static_cast<uint64_t>(static_cast<double>(ms) * timeoutFactor * 1e6);
+  }
 };
 
 using GetEnvFn = std::function<const char*(const char*)>;

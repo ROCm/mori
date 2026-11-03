@@ -30,6 +30,8 @@
 #include <cstdlib>
 #include <sstream>
 
+#include "src/ras/protocol.hpp"
+
 namespace mori {
 namespace ras {
 namespace {
@@ -71,6 +73,11 @@ bool ParseU64(const std::string& s, uint64_t* out) {
   if (errno != 0 || end == nullptr || *end != '\0') return false;
   *out = v;
   return true;
+}
+
+std::string Clip(std::string s) {
+  if (s.size() > proto::kMaxIdentityString) s.resize(proto::kMaxIdentityString);
+  return s;
 }
 
 void FillRandom(void* out, size_t n) {
@@ -140,7 +147,7 @@ ProcessFacts ReadProcessFacts(const std::string& procRoot, const std::string& pi
       ParseU64(target.substr(open + 1, close - open - 1), &f.pidNamespace);
     }
   }
-  f.bootId = ReadTrimmed(procRoot + "/sys/kernel/random/boot_id");
+  f.bootId = Clip(ReadTrimmed(procRoot + "/sys/kernel/random/boot_id"));
   return f;
 }
 
@@ -149,9 +156,9 @@ RasProcessId CollectIdentity(const std::string& nodeId, const std::string& hostn
                              const IdentitySources& src) {
   RasProcessId id;
   id.uuid = uuid;
-  id.nodeId = nodeId;
-  id.hostname = hostname;
-  id.host = host;
+  id.nodeId = Clip(nodeId);
+  id.hostname = Clip(hostname);
+  id.host = Clip(host);
   id.pid = pid;
   ProcessFacts facts = ReadProcessFacts(src.procRoot, "self");
   id.pidNamespace = facts.pidNamespace;

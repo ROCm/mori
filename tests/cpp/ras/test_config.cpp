@@ -51,8 +51,13 @@ TEST(RasConfig, DefaultsLeaveRasOff) {
   EXPECT_FALSE(c.enable);
   EXPECT_EQ(c.port, 0);
   EXPECT_EQ(c.ifname, "");
+  EXPECT_DOUBLE_EQ(c.timeoutFactor, 1.0);
+  EXPECT_EQ(c.heartbeatMs, 1000u);
   EXPECT_TRUE(c.cpuAffinity.empty());
   EXPECT_TRUE(c.warnings.empty());
+  EXPECT_EQ(c.HeartbeatNs(), 1000000000ull);
+  EXPECT_EQ(c.HandshakeTimeoutNs(), 5000000000ull);
+  EXPECT_EQ(c.ReconnectBackoffMaxNs(), 30000000000ull);
 }
 
 TEST(RasConfig, ParsesEnable) {
@@ -73,6 +78,28 @@ TEST(RasConfig, NeverUsesRcclRasPort) {
     RasConfig b = Parse({{"MORI_RAS_PORT", bad}});
     EXPECT_EQ(b.port, 0) << bad;
     EXPECT_TRUE(Warned(b, "MORI_RAS_PORT")) << bad;
+  }
+}
+
+TEST(RasConfig, TheTimeoutFactorScalesEveryTimeout) {
+  RasConfig c = Parse({{"MORI_RAS_TIMEOUT_FACTOR", "2.5"}, {"MORI_RAS_HEARTBEAT_MS", "100"}});
+  EXPECT_DOUBLE_EQ(c.timeoutFactor, 2.5);
+  EXPECT_EQ(c.HandshakeTimeoutNs(), 12500000000ull);
+  EXPECT_EQ(c.ReconnectBackoffInitialNs(), 2500000000ull);
+  EXPECT_EQ(c.ReconnectBackoffMaxNs(), 75000000000ull);
+  EXPECT_EQ(c.HeartbeatNs(), 100000000ull);  // the period is its own setting
+  for (const char* bad : {"0", "-2", "abc", "1e9"}) {
+    RasConfig b = Parse({{"MORI_RAS_TIMEOUT_FACTOR", bad}});
+    EXPECT_DOUBLE_EQ(b.timeoutFactor, 1.0) << bad;
+    EXPECT_TRUE(Warned(b, "MORI_RAS_TIMEOUT_FACTOR")) << bad;
+  }
+}
+
+TEST(RasConfig, BoundsTheHeartbeatPeriod) {
+  for (const char* bad : {"0", "5", "999999999", "fast"}) {
+    RasConfig b = Parse({{"MORI_RAS_HEARTBEAT_MS", bad}});
+    EXPECT_EQ(b.heartbeatMs, 1000u) << bad;
+    EXPECT_TRUE(Warned(b, "MORI_RAS_HEARTBEAT_MS")) << bad;
   }
 }
 

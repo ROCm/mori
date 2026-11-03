@@ -20,8 +20,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <dirent.h>
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sched.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -237,19 +239,74 @@ TEST(RasRuntime, EngineEventsReachTheRasThread) {
   EXPECT_EQ(core.Snapshot().events.dropped, 0u);
 }
 
+TEST(RasRuntime, PeerEventsReachTheRasThread) {
+  RasCore core(LocalCore());
+  ASSERT_TRUE(core.Start(nullptr));
+  PeerAdded noRas;
+  noRas.localEngine = "local";
+  noRas.remoteEngine = "remote-without-ras";
+  EXPECT_TRUE(core.Enqueue(std::move(noRas)));
+  PeerAdded self;
+  self.localEngine = "local";
+  self.remoteEngine = "local-twin";
+  self.endpoint = core.Endpoint();
+  EXPECT_TRUE(core.Enqueue(std::move(self)));
+  EXPECT_TRUE(WaitFor(
+      [&] {
+        RuntimeSnapshot s = core.Snapshot();
+        return s.peersWithoutRas == 1 && s.sameProcessPeers == 1;
+      },
+      2000));
+  RuntimeSnapshot s = core.Snapshot();
+  EXPECT_EQ(s.events.enqueued, 2u);
+  EXPECT_EQ(s.events.dropped, 0u);
+  EXPECT_TRUE(s.links.empty());
+}
+
 TEST(RasRuntime, StoppingClosesTheListenerAndRefusesLaterEvents) {
   RasCore core(LocalCore());
   ASSERT_TRUE(core.Start(nullptr));
   uint16_t port = core.Endpoint().port;
   ASSERT_TRUE(ras_test::CanConnect("127.0.0.1", port));
   auto start = std::chrono::steady_clock::now();
-  core.Stop();
+  core.Stop(true);
   EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
   int err = 0;
   EXPECT_LT(ras_test::ConnectTcp("127.0.0.1", port, &err), 0);
   EXPECT_EQ(err, ECONNREFUSED);
   EXPECT_FALSE(core.Enqueue(EngineRegistered{"late"}));
-  core.Stop();  // a second stop is harmless
+  core.Stop(true);  // a second stop is harmless
+}
+
+TEST(RasRuntime, ExitIsCleanWhileTheRasThreadIsLogging) {
+  // Every garbage connection makes the RAS thread log a protocol error, and a helper keeps
+  // sending them while the process exits, so the RAS thread logs as static destructors run.
+  // Run under ASan or TSan, this catches a logger destroyed under the RAS thread.
+  auto start = std::chrono::steady_clock::now();
+  EXPECT_EQ(RunInChild([] {
+              int devnull = open("/dev/null", O_WRONLY);
+              dup2(devnull, STDOUT_FILENO);
+              setenv("MORI_RAS_ENABLE", "1", 1);
+              setenv("MORI_RAS_LOG_LEVEL", "debug", 1);
+              RasRuntime* r = RasRuntime::EnsureStarted(Params());
+              CHILD_CHECK(r != nullptr);
+              uint16_t port = r->Endpoint().port;
+              std::thread([port] {
+                const std::string junk(64, 'x');
+                for (;;) {
+                  int fd = ras_test::ConnectTcp("127.0.0.1", port, nullptr);
+                  if (fd >= 0) {
+                    send(fd, junk.data(), junk.size(), MSG_NOSIGNAL);
+                    close(fd);
+                  }
+                }
+              }).detach();
+              CHILD_CHECK(WaitFor([&] { return r->Snapshot().protocolErrors >= 10; }, 2000));
+              std::exit(0);
+              return 1;
+            }),
+            0);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(5));
 }
 
 TEST(RasRuntime, ExitStopsTheRuntimeWithoutHangingOrLogging) {

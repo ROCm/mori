@@ -42,6 +42,7 @@
 #include "mori/io/engine.hpp"
 #include "mori/ras/ras.hpp"
 #include "src/ras/fd_registry.hpp"
+#include "src/ras/runtime.hpp"
 #include "tests/cpp/ras/ras_test_util.hpp"
 
 using namespace mori::io;
@@ -104,6 +105,7 @@ int Body() {
   setenv("NCCL_RAS_ENABLE", "1", 1);
   setenv("NCCL_RAS_ADDR", ("127.0.0.1:" + std::to_string(rcclPort)).c_str(), 1);
   setenv("MORI_RAS_ENABLE", "1", 1);
+  setenv("MORI_RAS_HEARTBEAT_MS", "100", 1);
 
   ncclComm_t comm;
   int dev = 0;
@@ -114,12 +116,35 @@ int Body() {
       5000));
   CHILD_CHECK(CountThreads("mori-ras") == 0);
 
-  // MORI RAS starts with the engine.
+  // MORI RAS starts with the engine; a second runtime in this process stands in for a peer.
   IOEngine engine("engine-a", IOEngineConfig{"127.0.0.1", 0});
   RasRuntime* rt = RasRuntime::Get();
   CHILD_CHECK(rt != nullptr);
-  CHILD_CHECK(engine.GetEngineDesc().ras.port == rt->Endpoint().port);
-  CHILD_CHECK(ras_test::WaitFor([] { return CountThreads("mori-ras") == 1; }, 2000));
+  CoreParams peerParams;
+  peerParams.config.enable = true;
+  peerParams.config.heartbeatMs = 100;
+  peerParams.host = "127.0.0.1";
+  peerParams.hostname = "peer";
+  RasCore peer(std::move(peerParams));
+  CHILD_CHECK(peer.Start(nullptr));
+  EngineDesc remote;
+  remote.key = "engine-peer";
+  remote.host = "127.0.0.1";
+  RasEndpoint pe = peer.Endpoint();
+  remote.ras = RasDesc{pe.host, pe.port, pe.token, pe.uuid.hi, pe.uuid.lo};
+  engine.RegisterRemoteEngine(remote);
+
+  CHILD_CHECK(ras_test::WaitFor(
+      [&] {
+        for (const LinkInfo& l : rt->Snapshot().links) {
+          if (l.peer == pe.uuid && l.state == LinkState::kConnected && l.acksReceived >= 3 &&
+              l.heartbeatsReceived >= 3) {
+            return true;
+          }
+        }
+        return false;
+      },
+      5000));
 
   // RCCL RAS still answers on its own port, and sees its communicator running.
   std::string status = QueryRcclRas(rcclPort, "STATUS\n");
@@ -128,7 +153,7 @@ int Body() {
   CHILD_CHECK(status.find("RUNNING") != std::string::npos);
 
   // Separate threads and ports: none of MORI's sockets uses RCCL's port or 28028.
-  CHILD_CHECK(CountThreads("mori-ras") == 1);
+  CHILD_CHECK(CountThreads("mori-ras") == 2);  // the engine's runtime and the stand-in peer
   RasEndpoint mine = rt->Endpoint();
   CHILD_CHECK(mine.port != rcclPort && mine.port != 28028);
   for (int fd : fdreg::Snapshot()) {

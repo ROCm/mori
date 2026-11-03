@@ -23,7 +23,7 @@
 
 // One RAS runtime: its identity, event queue, link manager, and thread. The process-wide
 // RasRuntime in include/mori/ras/ras.hpp wraps exactly one; tests build several in one
-// process.
+// process to link them to each other.
 
 #include <atomic>
 #include <condition_variable>
@@ -63,9 +63,9 @@ class RasCore {
   // Binds the listener and starts the RAS thread. On failure, *error says why and nothing is
   // left running.
   bool Start(std::string* error);
-  // Stops the thread. Waits at most 2 s; a thread that doesn't finish by then is abandoned
-  // rather than holding up exit.
-  void Stop();
+  // Stops the thread, which sends LEAVE on its links first if `sendLeave`. Waits at most 2 s;
+  // a thread that doesn't finish by then is abandoned rather than holding up exit.
+  void Stop(bool sendLeave);
 
   bool Enqueue(RasEvent&& ev);
   RasEndpoint Endpoint() const;
@@ -89,6 +89,7 @@ class RasCore {
   std::atomic<bool> running_{false};
   std::atomic<bool> stopped_{false};
   std::atomic<bool> orphaned_{false};
+  std::atomic<bool> sendLeave_{true};
   std::mutex doneMu_;
   std::condition_variable doneCv_;
   bool threadDone_{false};

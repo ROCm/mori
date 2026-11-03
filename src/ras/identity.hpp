@@ -53,7 +53,7 @@ RasProcessId CollectIdentity(const std::string& nodeId, const std::string& hostn
                              const std::string& host, int32_t pid, RuntimeUuid uuid,
                              const IdentitySources& src);
 
-// A random version-4 UUID.
+// A random version-4 UUID. Its variant bits keep `lo` nonzero, so it can be a header sender.
 RuntimeUuid NewRuntimeUuid();
 // 128 random bits as 32 hex digits.
 std::string NewToken();

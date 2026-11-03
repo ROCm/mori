@@ -39,13 +39,13 @@
 // - A runtime that fails to start, e.g. because MORI_RAS_PORT is taken, stays off for the
 //   life of the process: Status() reports kFailed with kDegradedInitFailed and why, and engines
 //   advertise no endpoint. A failure after start sets a degraded bit but keeps the listener
-//   open.
-// - At exit, an atexit handler stops the RAS thread. That path doesn't log: MORI_LOG caches
-//   loggers in function-local statics, which may already be destroyed. The runtime object is
-//   never freed, so a thread still calling in during exit reaches a stopped runtime, not freed
-//   memory.
+//   open, so peers learn of it from HELLO and heartbeats.
+// - At exit, an atexit handler stops the RAS thread, which sends LEAVE on every link first.
+//   That path doesn't log: MORI_LOG caches loggers in function-local statics, which may
+//   already be destroyed. The runtime object is never freed, so a thread still calling in
+//   during exit reaches a stopped runtime, not freed memory.
 // - In a forked child, a pthread_atfork handler closes every RAS fd the child inherited, so a
-//   killed parent's listener really closes, and leaves the child with no runtime.
+//   killed parent's listener and links really close, and leaves the child with no runtime.
 //   The child's first EnsureStarted() starts a fresh one under a new runtime UUID.
 //
 // Thread safety: every member may be called from any thread. Enqueue() never blocks.

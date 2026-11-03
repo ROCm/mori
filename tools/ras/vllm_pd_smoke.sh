@@ -2,14 +2,18 @@
 # MORI RAS end-to-end smoke test: vLLM prefill/decode (1P1D) on one node, with the MoRIIO
 # connector moving KV over xGMI and dummy weights, so it needs two GPUs and no checkpoint.
 #
-#   tools/ras/vllm_pd_smoke.sh [on] [off] [blocked]      (default: on)
+#   tools/ras/vllm_pd_smoke.sh [on] [kill] [off] [blocked]      (default: on)
 #
 # Each mode serves a few requests through vLLM's MoRIIO toy proxy and checks the RAS log lines:
-#   on       MORI_RAS_ENABLE=1: every engine process starts one RAS runtime.
+#   on       MORI_RAS_ENABLE=1: every engine process starts one RAS runtime, and prefill and
+#            decode link up. Prefill then stops on SIGTERM, and decode sees it leave.
+#   kill     As on, but decode is SIGKILLed. Prefill, which opened the link, sees it close
+#            and its reconnect refused (RAS_ENDPOINT_UNAVAILABLE: exit suspected).
 #   off      MORI_RAS_ENABLE=0: no RAS runtime starts.
 #   blocked  MORI_RAS_ENABLE=1 with MORI_RAS_PORT held by another process: RAS turns itself
 #            off, and serving is unaffected.
-# In every mode the requests must succeed and both servers must stop cleanly on SIGTERM.
+# In every mode the requests must succeed, and the servers not killed must stop cleanly on
+# SIGTERM.
 #
 # It starts a container from VLLM_IMAGE, copies this checkout into it, and pip-installs MORI
 # there, so the checkout gets no root-owned build files. Settings:
@@ -19,6 +23,7 @@
 #   RESULTS_DIR     logs and the summary  (./ras_vllm_pd_results)
 #   HF_HOME         Hugging Face cache, mounted into the container  (~/.cache/huggingface)
 #   NUM_REQUESTS    requests per mode  (8)
+#   RAS_LOG_LEVEL   MORI_RAS_LOG_LEVEL for the servers  (info)
 #   KEEP_CONTAINER  1 keeps the container, and its MORI install, for another run
 set -euo pipefail
 
@@ -100,16 +105,24 @@ check() {  # description, then a command that must succeed
 
 count() { grep -c -- "$1" "$2" || true; }
 
+wait_log() {  # pattern log seconds: true once the log matches
+  local deadline=$((SECONDS + $3))
+  until grep -qE -- "$1" "$2"; do
+    ((SECONDS < deadline)) || return 1
+    sleep 0.5
+  done
+}
+
 run_mode() {
   local mode=$1 dir="$RESULTS_DIR/$1"
   mkdir -p "$dir"
   : >"$dir/responses.jsonl"
   echo "== mode: $mode"
-  export MORI_RAS_LOG_LEVEL=info
+  export MORI_RAS_LOG_LEVEL=${RAS_LOG_LEVEL:-info}
   unset MORI_RAS_PORT
   local holder=""
   case $mode in
-    on) export MORI_RAS_ENABLE=1 ;;
+    on | kill) export MORI_RAS_ENABLE=1 ;;
     off) export MORI_RAS_ENABLE=0 ;;
     blocked)
       export MORI_RAS_ENABLE=1
@@ -174,14 +187,35 @@ EOF
     started=$(count "RAS runtime .* listening on" "$log")
     off=$(count "RAS is off for this process" "$log")
     case $mode in
-      on) check "$role: RAS runtime started ($started)" test "$started" -ge 1 ;;
+      on | kill)
+        check "$role: RAS runtime started ($started)" test "$started" -ge 1
+        check "$role: RAS link to its peer is up" grep -q "RAS link to runtime .* is up" "$log"
+        ;;
       off) check "$role: no RAS runtime" test "$((started + off))" -eq 0 ;;
       blocked) check "$role: RAS off, port in use ($off)" test "$started" -eq 0 -a "$off" -ge 1 ;;
     esac
   done
 
-  check "prefill stops on SIGTERM" stop_server "$PREFILL"
-  check "decode stops on SIGTERM" stop_server "$DECODE"
+  case $mode in
+    on)
+      # A clean exit sends LEAVE, unless vLLM kills its engine process before atexit runs;
+      # then decode sees the link close without one.
+      check "prefill stops on SIGTERM" stop_server "$PREFILL"
+      check "decode: prefill gone (LEAVE, or LINK_CLOSED without one)" \
+        wait_log "RAS peer .* left|LINK_CLOSED" "$dir/decode.log" 15
+      check "decode stops on SIGTERM" stop_server "$DECODE"
+      ;;
+    kill)
+      kill -KILL -- "-$DECODE"
+      check "prefill: killed decode seen (RAS_ENDPOINT_UNAVAILABLE)" \
+        wait_log "RAS_ENDPOINT_UNAVAILABLE" "$dir/prefill.log" 15
+      check "prefill stops on SIGTERM" stop_server "$PREFILL"
+      ;;
+    *)
+      check "prefill stops on SIGTERM" stop_server "$PREFILL"
+      check "decode stops on SIGTERM" stop_server "$DECODE"
+      ;;
+  esac
   stop_server "$proxy" || true
   [[ -n $holder ]] && kill "$holder" 2>/dev/null || true
   wait 2>/dev/null || true
@@ -232,7 +266,8 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
 fi
 rc=0
 docker exec -e MODEL="$MODEL" -e PREFILL_GPU="$PREFILL_GPU" -e DECODE_GPU="$DECODE_GPU" \
-  -e RESULTS_DIR=/results -e NUM_REQUESTS="$NUM_REQUESTS" "$CONTAINER" \
+  -e RESULTS_DIR=/results -e NUM_REQUESTS="$NUM_REQUESTS" -e RAS_LOG_LEVEL="${RAS_LOG_LEVEL:-info}" \
+  "$CONTAINER" \
   bash "$REPO/tools/ras/vllm_pd_smoke.sh" --inside "${MODES[@]}" | tee "$RESULTS_DIR/summary.txt" ||
   rc=$?
 docker exec "$CONTAINER" chown -R "$(id -u):$(id -g)" /results /root/.cache/huggingface \
