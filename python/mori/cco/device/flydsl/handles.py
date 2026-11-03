@@ -91,11 +91,12 @@ def _tc(coop, thread_mode):
         )
 
 
-def _gda_flags(team, defer_doorbell=False):
-    """GdaFlags for one op; both axes pick the instantiation, so both are constant."""
+def _gda_flags(team, defer_doorbell=False, posted_before_flush=False):
+    """GdaFlags for one op; every axis picks the instantiation, so all are constant."""
+    pbf = _const(posted_before_flush, "posted_before_flush")
+    defer = _const(defer_doorbell, "defer_doorbell")
     return gda_flags(
-        team=_const(team, "team"),
-        defer_doorbell=_const(defer_doorbell, "defer_doorbell"),
+        team=_const(team, "team"), defer_doorbell=defer, posted_before_flush=pbf
     )
 
 
@@ -206,6 +207,15 @@ class Gda:
     the WQEs without ringing the doorbell; the next non-deferred post, signal,
     flush, flush_async or counter on the same QP rings for them.
 
+    ``posted_before_flush=True`` is caller-ordered posting: with
+    ``defer_doorbell=True`` a put / put_value / get publishes no ready mark (no
+    system fence), and on flush_peer / flush_async the flush rings straight up
+    to its postIdx snapshot instead of sweeping marks. The caller guarantees
+    every post below that snapshot is fully written before the flush starts
+    (e.g. posters bump a counter after their post returns and the flusher waits
+    for it), every post to the QP uses the flag, and the posts between two
+    flushes fit in the SQ.
+
     Every op that posts to or flushes a QP also takes ``ctx``, the context for that one call,
     which may be a runtime ``Int32`` (e.g. to spread chunks over contexts). It
     defaults to the handle's own, which stays compile-time so the handle remains
@@ -235,6 +245,7 @@ class Gda:
         thread_mode=ThreadMode.INDEPENDENT,
         team=Team.WORLD,
         defer_doorbell=False,
+        posted_before_flush=False,
         ctx=None,
     ):
         sym = raw.PUT[
@@ -251,7 +262,7 @@ class Gda:
             nbytes,
             signal_id,
             signal_val,
-            _gda_flags(team, defer_doorbell),
+            _gda_flags(team, defer_doorbell, posted_before_flush),
         )
 
     def put_value(
@@ -268,6 +279,7 @@ class Gda:
         thread_mode=ThreadMode.INDEPENDENT,
         team=Team.WORLD,
         defer_doorbell=False,
+        posted_before_flush=False,
         ctx=None,
     ):
         sym = raw.PUT_VALUE[
@@ -282,7 +294,7 @@ class Gda:
             value,
             signal_id,
             signal_val,
-            _gda_flags(team, defer_doorbell),
+            _gda_flags(team, defer_doorbell, posted_before_flush),
         )
 
     def get(
@@ -298,6 +310,7 @@ class Gda:
         thread_mode=ThreadMode.INDEPENDENT,
         team=Team.WORLD,
         defer_doorbell=False,
+        posted_before_flush=False,
         ctx=None,
     ):
         raw.GET[_tc(coop, thread_mode)](
@@ -309,7 +322,7 @@ class Gda:
             _win(local_win),
             local_off,
             nbytes,
-            _gda_flags(team, defer_doorbell),
+            _gda_flags(team, defer_doorbell, posted_before_flush),
         )
 
     # ── signal ──
@@ -347,18 +360,40 @@ class Gda:
     def flush(self, *, coop=CoopScope.WARP, ctx=None):
         raw.FLUSH[_flush_tag(coop)](self.dev_comm, self._ctx(ctx))
 
-    def flush_peer(self, peer, *, coop=CoopScope.WARP, team=Team.WORLD, ctx=None):
+    def flush_peer(
+        self,
+        peer,
+        *,
+        coop=CoopScope.WARP,
+        team=Team.WORLD,
+        posted_before_flush=False,
+        ctx=None,
+    ):
         raw.FLUSH_PEER[_flush_tag(coop)](
-            self.dev_comm, self._ctx(ctx), peer, _gda_flags(team)
+            self.dev_comm,
+            self._ctx(ctx),
+            peer,
+            _gda_flags(team, posted_before_flush=posted_before_flush),
         )
 
-    def flush_async(self, peer, *, coop=CoopScope.THREAD, team=Team.WORLD, ctx=None):
+    def flush_async(
+        self,
+        peer,
+        *,
+        coop=CoopScope.THREAD,
+        team=Team.WORLD,
+        posted_before_flush=False,
+        ctx=None,
+    ):
         """Ring ``peer``'s QP up to its current reservation, deferred posts
         included, and return a request (a uint64) for :meth:`wait`. Work can go
         between the two. Every lane gets the request for THREAD and WARP; for
         BLOCK only thread 0 does, so wait with BLOCK too."""
         return raw.FLUSH_ASYNC[_COOP_TAG[_const(coop, "coop")]](
-            self.dev_comm, self._ctx(ctx), peer, _gda_flags(team)
+            self.dev_comm,
+            self._ctx(ctx),
+            peer,
+            _gda_flags(team, posted_before_flush=posted_before_flush),
         )
 
     def wait(self, request, *, coop=CoopScope.THREAD):

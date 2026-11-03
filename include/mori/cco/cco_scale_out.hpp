@@ -100,8 +100,23 @@ enum ccoGdaOptFlags : uint32_t {
   // or two per release, or many warps on one QP, plain posts cost the same and
   // start the transfer sooner.
   ccoGdaOptFlagsDeferDoorbell = (1 << 1),
+  // Caller-ordered posting. On a deferred put / putValue / get: write the WQEs
+  // and publish nothing (no ready mark, no system fence). On flush(peer) /
+  // flushAsync: ring once straight up to the postIdx snapshot instead of
+  // sweeping ready marks. The caller guarantees that (a) every WQE below a flush's
+  // snapshot has been completely written by the time the flush starts (e.g. each
+  // poster bumps a counter after its post returns and the flusher waits for it),
+  // (b) every post to the QP uses this flag, and (c) the WQEs posted between two
+  // flushes fit in the SQ (nothing rings for them, so a full SQ never drains).
+  // Concurrent posters are fine; concurrent flushers on one QP serialize on the
+  // doorbell lock. This is the pre-#625 deferred doorbell with the race moved to
+  // the caller's contract.
+  ccoGdaOptFlagsPostedBeforeFlush = (1 << 2),
 };
-inline constexpr uint32_t kCcoGdaSupportedOptFlags = ccoGdaOptFlagsDeferDoorbell;
+inline constexpr uint32_t kCcoGdaSupportedOptFlags =
+    ccoGdaOptFlagsDeferDoorbell | ccoGdaOptFlagsPostedBeforeFlush;
+// flush(peer) / flushAsync take only this one.
+inline constexpr uint32_t kCcoGdaSupportedFlushOptFlags = ccoGdaOptFlagsPostedBeforeFlush;
 
 typedef enum ccoGdaSignalOp_t {
   ccoGdaSignalInc = 0,
@@ -243,14 +258,16 @@ struct ccoGda {
   __device__ inline void flush(Coop coop = Coop{});
 
   // flush(peer): poll CQ for a single peer until its submitted WQEs complete.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp,
+            uint32_t OptFlags = ccoGdaOptFlagsDefault>
   __device__ inline void flush(int peer, Coop coop = Coop{});
 
   // flushAsync: snapshot this peer's QP progress and return a request handle
   // that wait() can later be used to wait on individually. It rings up to the
   // snapshot, so it may wait for posts on the QP still writing their WQEs; only
   // the CQ drain is left to wait(). The request is valid in the coop leader.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread,
+            uint32_t OptFlags = ccoGdaOptFlagsDefault>
   __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest, Coop coop = Coop{});
 
   // wait: block on a request handle previously returned by flushAsync, called
@@ -750,9 +767,12 @@ __device__ inline static void ringUntil(core::RdmaEndpointDevice* ep, uint32_t t
 // without a mark or the lock: one system fence before the doorbell, as when every
 // post rang its own. It does not look for ready posts behind it -- that read
 // costs as much as the doorbell -- they ring for themselves once it publishes.
-template <core::ProviderType PrvdType, bool DeferDoorbell>
+template <core::ProviderType PrvdType, bool DeferDoorbell, bool NoMark = false>
 __device__ inline static void submitWqes(core::RdmaEndpointDevice* ep, uint32_t base,
                                          uint32_t count, uint64_t dbrVal) {
+  static_assert(!NoMark || DeferDoorbell, "PostedBeforeFlush requires DeferDoorbell");
+  // PostedBeforeFlush: the caller orders this post before the flush that rings it.
+  if constexpr (NoMark) return;
   core::WorkQueueHandle* wq = &ep->wqHandle;
   bool rang = false;
   if constexpr (!DeferDoorbell) {
@@ -840,7 +860,7 @@ __device__ inline static uint32_t getAtomicWqeCount(core::atomicType amo_op, uin
 // putImpl - post one warp-aggregated put for the active lanes (all targeting this
 // ep/qpn; the facade groups by QP). Each lane posts its data WQE into a contiguous
 // reservation; the leader posts the shared signal WQE and rings one doorbell.
-template <core::ProviderType PrvdType, bool DeferDoorbell = false>
+template <core::ProviderType PrvdType, bool DeferDoorbell = false, bool NoMark = false>
 __device__ inline static void putImpl(
     // Hardware resources (already selected endpoint)
     core::RdmaEndpointDevice* ep, uint32_t qpn,
@@ -890,7 +910,7 @@ __device__ inline static void putImpl(
             *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
             signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
       }
-      submitWqes<PrvdType, DeferDoorbell>(ep, base, totalWqes, dbrVal);
+      submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
     }
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
@@ -906,14 +926,14 @@ __device__ inline static void putImpl(
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/,
             core::AMO_FETCH_ADD);
       }
-      submitWqes<PrvdType, DeferDoorbell>(ep, base, totalWqes, dbrVal);
+      submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
     }
   }
 }
 
 // putValueImpl - Inline write for small values. One group per call (the facade
 // groups lanes by QP); same warp-aggregate posting as putImpl.
-template <core::ProviderType PrvdType, typename T, bool DeferDoorbell = false>
+template <core::ProviderType PrvdType, typename T, bool DeferDoorbell = false, bool NoMark = false>
 __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                            uintptr_t remoteAddr, uint32_t remoteKey, T value,
                                            bool hasSignal, uintptr_t signalRemoteAddr,
@@ -956,7 +976,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
             *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
             signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
       }
-      submitWqes<PrvdType, DeferDoorbell>(ep, base, totalWqes, dbrVal);
+      submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
     }
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
@@ -971,7 +991,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
             *wq, signalSlot, signalSlot, signalSlot, true /*cqeSignal*/, qpn, atomicLaddr,
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
       }
-      submitWqes<PrvdType, DeferDoorbell>(ep, base, totalWqes, dbrVal);
+      submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
     }
   }
 }
@@ -979,7 +999,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
 // getImpl - RDMA read. One group per call (the facade groups lanes by QP):
 // each active lane posts its read WQE into a contiguous reservation, the leader
 // rings one doorbell.
-template <core::ProviderType PrvdType, bool DeferDoorbell = false>
+template <core::ProviderType PrvdType, bool DeferDoorbell = false, bool NoMark = false>
 __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                       uintptr_t localAddr, uint32_t localKey, uintptr_t remoteAddr,
                                       uint32_t remoteKey, size_t bytes) {
@@ -1007,14 +1027,14 @@ __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn
         core::PostRead<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/, qpn, localAddr,
                                  localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
-    if (isLeader) submitWqes<PrvdType, DeferDoorbell>(ep, base, totalWqes, dbrVal);
+    if (isLeader) submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
     waitSqSpace<PrvdType>(ep, base, totalWqes);
     uint64_t dbrVal = core::PostRead<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
                                                localAddr, localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
-    if (isLeader) submitWqes<PrvdType, DeferDoorbell>(ep, base, totalWqes, dbrVal);
+    if (isLeader) submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
   }
 }
 
@@ -1037,6 +1057,48 @@ __device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint3
   // caller treats the transfer as handed off.
   __threadfence_system();
   ringUntil<PrvdType>(ep, postIdx);
+}
+
+// The doorbell value that tells the NIC about every WQE below postIdx (the
+// pre-#625 flush computed it the same way).
+template <core::ProviderType PrvdType>
+__device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, uint32_t postIdx,
+                                                   uint32_t qpn) {
+  uint32_t lastWqeIdx = (postIdx - 1) & (wq->sqWqeNum - 1);
+  if constexpr (PrvdType == core::ProviderType::PSD) {
+    return wq->sq_dbval | (postIdx & (wq->sqWqeNum - 1));
+  } else if constexpr (PrvdType == core::ProviderType::MLX5) {
+    uintptr_t wqeAddr =
+        reinterpret_cast<uintptr_t>(wq->sqAddr) + (lastWqeIdx << core::MORI_MLX5_SEND_WQE_SHIFT);
+    return *reinterpret_cast<volatile uint64_t*>(wqeAddr);
+  } else {
+    uint8_t flags = (postIdx >> (__ffs(wq->sqWqeNum) - 1)) & 0x1;
+    uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
+    return core::bnxt_re_init_db_hdr(
+        ((postIdx & (wq->sqWqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch, 0, qpn,
+        BNXT_RE_QUE_TYPE_SQ);
+  }
+}
+
+// flushAsync under ccoGdaOptFlagsPostedBeforeFlush: every WQE below the snapshot
+// is written (caller's contract) and none is marked, so ring once straight up to
+// it under the doorbell lock, which orders us against another flusher.
+template <core::ProviderType PrvdType>
+__device__ inline static void flushAsyncPostedImpl(core::RdmaEndpointDevice* ep,
+                                                   uint32_t* outPostIdx) {
+  core::WorkQueueHandle* wq = &ep->wqHandle;
+  uint32_t postIdx = __hip_atomic_load(&wq->postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  *outPostIdx = postIdx;
+  __threadfence_system();  // the posters' WQEs (and our prior writes), before the doorbell
+  if (__hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == postIdx)
+    return;
+  while (!tryLockDoorbell(wq)) {
+  }
+  uint32_t from = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  if (static_cast<int32_t>(postIdx - from) > 0) {
+    ringAndPublish<PrvdType>(ep, from, postIdx, buildFlushDbrVal<PrvdType>(wq, postIdx, ep->qpn));
+  }
+  unlockDoorbell(wq);
 }
 
 template <core::ProviderType PrvdType>
@@ -1236,6 +1298,8 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
                                              RemoteAction remoteAction, Coop coop) {
   static_assert((OptFlags & ~kCcoGdaSupportedOptFlags) == 0, "unsupported ccoGdaOptFlags");
   constexpr bool kDefer = (OptFlags & ccoGdaOptFlagsDeferDoorbell) != 0;
+  constexpr bool kNoMark = (OptFlags & ccoGdaOptFlagsPostedBeforeFlush) != 0;
+  static_assert(!kNoMark || kDefer, "ccoGdaOptFlagsPostedBeforeFlush requires DeferDoorbell");
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1295,12 +1359,14 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
         int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
         if (qpIdx != __shfl(qpIdx, lead)) continue;
         needTurn = false;
-        impl::putImpl<PrvdType, kDefer>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey, bytes,
-                                        hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg);
+        impl::putImpl<PrvdType, kDefer, kNoMark>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey,
+                                                 bytes, hasSignal, signalRaddr, signalRkey,
+                                                 signalOp, signalOpArg);
       }
     } else {
-      impl::putImpl<PrvdType, kDefer>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey, bytes,
-                                      hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg);
+      impl::putImpl<PrvdType, kDefer, kNoMark>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey,
+                                               bytes, hasSignal, signalRaddr, signalRkey, signalOp,
+                                               signalOpArg);
     }
   }
   coop.sync();
@@ -1315,6 +1381,8 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
   static_assert((OptFlags & ~kCcoGdaSupportedOptFlags) == 0, "unsupported ccoGdaOptFlags");
   constexpr bool kDefer = (OptFlags & ccoGdaOptFlagsDeferDoorbell) != 0;
+  constexpr bool kNoMark = (OptFlags & ccoGdaOptFlagsPostedBeforeFlush) != 0;
+  static_assert(!kNoMark || kDefer, "ccoGdaOptFlagsPostedBeforeFlush requires DeferDoorbell");
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1367,12 +1435,14 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
         int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
         if (qpIdx != __shfl(qpIdx, lead)) continue;
         needTurn = false;
-        impl::putValueImpl<PrvdType, T, kDefer>(ep, qpn, remoteAddr, dstRkey, value, hasSignal,
-                                                signalRaddr, signalRkey, signalOp, signalOpArg);
+        impl::putValueImpl<PrvdType, T, kDefer, kNoMark>(ep, qpn, remoteAddr, dstRkey, value,
+                                                         hasSignal, signalRaddr, signalRkey,
+                                                         signalOp, signalOpArg);
       }
     } else {
-      impl::putValueImpl<PrvdType, T, kDefer>(ep, qpn, remoteAddr, dstRkey, value, hasSignal,
-                                              signalRaddr, signalRkey, signalOp, signalOpArg);
+      impl::putValueImpl<PrvdType, T, kDefer, kNoMark>(ep, qpn, remoteAddr, dstRkey, value,
+                                                       hasSignal, signalRaddr, signalRkey, signalOp,
+                                                       signalOpArg);
     }
   }
   coop.sync();
@@ -1386,6 +1456,8 @@ __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, si
                                              Coop coop) {
   static_assert((OptFlags & ~kCcoGdaSupportedOptFlags) == 0, "unsupported ccoGdaOptFlags");
   constexpr bool kDefer = (OptFlags & ccoGdaOptFlagsDeferDoorbell) != 0;
+  constexpr bool kNoMark = (OptFlags & ccoGdaOptFlagsPostedBeforeFlush) != 0;
+  static_assert(!kNoMark || kDefer, "ccoGdaOptFlagsPostedBeforeFlush requires DeferDoorbell");
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1416,11 +1488,12 @@ __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, si
         int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
         if (qpIdx != __shfl(qpIdx, lead)) continue;
         needTurn = false;
-        impl::getImpl<PrvdType, kDefer>(ep, qpn, localAddr, localLkey, remoteAddr, remoteRkey,
-                                        bytes);
+        impl::getImpl<PrvdType, kDefer, kNoMark>(ep, qpn, localAddr, localLkey, remoteAddr,
+                                                 remoteRkey, bytes);
       }
     } else {
-      impl::getImpl<PrvdType, kDefer>(ep, qpn, localAddr, localLkey, remoteAddr, remoteRkey, bytes);
+      impl::getImpl<PrvdType, kDefer, kNoMark>(ep, qpn, localAddr, localLkey, remoteAddr,
+                                               remoteRkey, bytes);
     }
   }
   coop.sync();
@@ -1496,8 +1569,9 @@ __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
 
 // flush single peer: snapshot the QP's postIdx, then poll CQ until it completes.
 template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, typename Coop>
+template <ccoTeamMode TeamMode, typename Coop, uint32_t OptFlags>
 __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
+  static_assert((OptFlags & ~kCcoGdaSupportedFlushOptFlags) == 0, "unsupported flush opt flag");
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush(peer) requires at least ccoCoopWarp. "
                 "With ccoCoopThread every thread runs the body, so two threads passing the "
@@ -1510,7 +1584,11 @@ __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
+    if constexpr ((OptFlags & ccoGdaOptFlagsPostedBeforeFlush) != 0) {
+      impl::flushAsyncPostedImpl<PrvdType>(ep, &postIdx);
+    } else {
+      impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
+    }
     impl::waitImpl<PrvdType>(ep, postIdx);
   }
   coop.sync();
@@ -1518,9 +1596,10 @@ __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
 
 // flushAsync: snapshot this peer's QP, return a request handle for wait().
 template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, typename Coop>
+template <ccoTeamMode TeamMode, typename Coop, uint32_t OptFlags>
 __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* outRequest,
                                                     Coop coop) {
+  static_assert((OptFlags & ~kCcoGdaSupportedFlushOptFlags) == 0, "unsupported flush opt flag");
   coop.sync();
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
@@ -1529,7 +1608,11 @@ __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* o
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
 
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
+    if constexpr ((OptFlags & ccoGdaOptFlagsPostedBeforeFlush) != 0) {
+      impl::flushAsyncPostedImpl<PrvdType>(ep, &postIdx);
+    } else {
+      impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
+    }
 
     outRequest->qpIdx = qpIdx;
     outRequest->postIdx = static_cast<uint64_t>(postIdx);

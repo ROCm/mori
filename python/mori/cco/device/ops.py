@@ -83,16 +83,24 @@ class GdaFlags:
     # the next non-deferred post, signal, flush, flush_async or counter on the
     # QP rings for them. put / put_value / get only.
     DEFER_DOORBELL = 1 << 1
+    # ccoGdaOptFlagsPostedBeforeFlush: caller-ordered posting. With DEFER_DOORBELL on
+    # put / put_value / get the post publishes nothing; on flush_peer / flush_async
+    # the flush rings straight up to its snapshot. The caller guarantees every
+    # post below the snapshot is written before the flush starts, every post to
+    # the QP uses the flag, and the posts between two flushes fit in the SQ.
+    POSTED_BEFORE_FLUSH = 1 << 2
     # peer is numbered in Team.GDA rather than Team.WORLD.
     TEAM_GDA = 1 << 8
 
 
-def gda_flags(*, team=Team.WORLD, defer_doorbell=False):
+def gda_flags(*, team=Team.WORLD, defer_doorbell=False, posted_before_flush=False):
     """:class:`GdaFlags` for one GDA op; the arguments are C++'s template ones."""
     if team not in (Team.WORLD, Team.GDA):
         raise ValueError("cco: GDA team must be Team.WORLD or Team.GDA")
-    return (GdaFlags.TEAM_GDA if team == Team.GDA else 0) | (
-        GdaFlags.DEFER_DOORBELL if defer_doorbell else 0
+    return (
+        (GdaFlags.TEAM_GDA if team == Team.GDA else 0)
+        | (GdaFlags.DEFER_DOORBELL if defer_doorbell else 0)
+        | (GdaFlags.POSTED_BEFORE_FLUSH if posted_before_flush else 0)
     )
 
 
