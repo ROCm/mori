@@ -576,11 +576,15 @@ void LinkManager::OnReadable(Conn* c, uint64_t now) {
   bool eof = false;
   int err = 0;
   uint64_t rxMono = 0;
+  int64_t rxWall = 0;
   uint8_t buf[16384];
   while (total < kMaxReadPerWakeup) {
     ssize_t n = recv(c->fd, buf, sizeof(buf), MSG_DONTWAIT);
     if (n > 0) {
-      if (rxMono == 0) rxMono = MonoNowNs();
+      if (rxMono == 0) {
+        rxMono = MonoNowNs();
+        rxWall = WallNowNs();
+      }
       if (c->phase != Phase::kClosing) c->in.insert(c->in.end(), buf, buf + n);
       total += static_cast<size_t>(n);
       continue;
@@ -599,7 +603,7 @@ void LinkManager::OnReadable(Conn* c, uint64_t now) {
     if (eof) CloseConn(c);
     return;
   }
-  if (rxMono != 0 && !ProcessFrames(c, rxMono)) return;
+  if (rxMono != 0 && !ProcessFrames(c, rxMono, rxWall)) return;
   if (!eof) return;
   Link* l = LinkOf(c);
   if (l == nullptr) {
@@ -612,7 +616,7 @@ void LinkManager::OnReadable(Conn* c, uint64_t now) {
            wasUp ? detail : detail + " before its HELLO", now, wasUp);
 }
 
-bool LinkManager::ProcessFrames(Conn* c, uint64_t rxMonoNs) {
+bool LinkManager::ProcessFrames(Conn* c, uint64_t rxMonoNs, int64_t rxWallNs) {
   for (;;) {
     size_t avail = c->in.size() - c->inStart;
     if (avail < proto::kHeaderSize) break;
@@ -683,7 +687,7 @@ bool LinkManager::ProcessFrames(Conn* c, uint64_t rxMonoNs) {
         } else if (h.sender != c->peer.lo) {
           ProtocolError(c, "the sender changed", now);
         } else {
-          alive = OnLinkMessage(c, *l, m, rxMonoNs);
+          alive = OnLinkMessage(c, *l, m, rxMonoNs, rxWallNs);
         }
         break;
       }
@@ -792,7 +796,8 @@ bool LinkManager::OnHelloReply(Conn* c, const proto::RasHeader& h, const proto::
   return true;
 }
 
-bool LinkManager::OnLinkMessage(Conn* c, Link& l, const proto::Message& m, uint64_t rxMonoNs) {
+bool LinkManager::OnLinkMessage(Conn* c, Link& l, const proto::Message& m, uint64_t rxMonoNs,
+                                int64_t rxWallNs) {
   l.lastRxNs = rxMonoNs;
   MarkDirty();
   return std::visit(
@@ -804,8 +809,16 @@ bool LinkManager::OnLinkMessage(Conn* c, Link& l, const proto::Message& m, uint6
             if (Send(c, MakeAck(hb, rxMonoNs, MonoNowNs(), WallNowNs()))) ++l.acksSent;
             return true;
           },
-          [&](const proto::HeartbeatAck&) {
+          [&](const proto::HeartbeatAck& ack) {
             ++l.acksReceived;
+            std::optional<TimingSample> s = l.heartbeat.OnAck(ack, rxMonoNs, rxWallNs);
+            if (s && !l.timingLogged) {
+              l.timingLogged = true;
+              RAS_LOG_INFO(
+                  "RAS link to runtime {} ({}): round trip {} us, clock offset {} us +- {} us",
+                  l.peer.ToString(), l.peerHostname, s->rttNs / 1000, s->offsetNs / 1000,
+                  s->errorBoundNs / 1000);
+            }
             return true;
           },
           [&](const proto::Leave& leave) {
@@ -1007,7 +1020,7 @@ void LinkManager::ScheduleConnect(Link& l, uint64_t now, bool immediate) {
 }
 
 void LinkManager::SendHeartbeat(Link& l, uint64_t now) {
-  proto::Heartbeat hb{now, Degraded() != 0 ? proto::kHeartbeatFlagDegraded : 0u};
+  proto::Heartbeat hb = l.heartbeat.Next(now, Degraded() != 0 ? proto::kHeartbeatFlagDegraded : 0);
   if (Send(l.conn, hb)) ++l.heartbeatsSent;
   l.nextHeartbeatNs = now + opts_.config.HeartbeatNs();
 }
@@ -1043,6 +1056,13 @@ LinkInfo LinkManager::Describe(const Link& l, uint64_t now) const {
   i.acksSent = l.acksSent;
   i.acksReceived = l.acksReceived;
   i.lastRxAgeMs = l.lastRxNs != 0 ? static_cast<int64_t>((now - l.lastRxNs) / kMs) : -1;
+  if (const TimingSample* last = l.heartbeat.Last()) {
+    const TimingSample* best = l.heartbeat.Best();
+    i.hasTiming = true;
+    i.rttNs = last->rttNs;
+    i.offsetNs = best->offsetNs;
+    i.offsetBoundNs = best->errorBoundNs;
+  }
   for (const Link::Transition& t : l.transitions) {
     i.transitions.push_back(
         LinkTransition{static_cast<int64_t>((now - t.atNs) / kMs), t.state, t.error});

@@ -154,6 +154,8 @@ class LinkManager {
     uint64_t backoffNs{0};
     uint64_t nextHeartbeatNs{0};
     uint64_t lastRxNs{0};
+    HeartbeatTracker heartbeat;
+    bool timingLogged{false};  // the first timing sample has been logged
     uint64_t connectAttempts{0};
     uint64_t connects{0};
     uint64_t disconnects{0};
@@ -193,10 +195,11 @@ class LinkManager {
 
   // Reading and the protocol.
   void OnReadable(Conn* c, uint64_t now);
-  bool ProcessFrames(Conn* c, uint64_t rxMonoNs);
+  bool ProcessFrames(Conn* c, uint64_t rxMonoNs, int64_t rxWallNs);
   bool OnHelloRequest(Conn* c, const proto::RasHeader& h, const proto::Hello& hello, uint64_t now);
   bool OnHelloReply(Conn* c, const proto::RasHeader& h, const proto::Hello& hello, uint64_t now);
-  bool OnLinkMessage(Conn* c, Link& l, const proto::Message& m, uint64_t rxMonoNs);
+  bool OnLinkMessage(Conn* c, Link& l, const proto::Message& m, uint64_t rxMonoNs,
+                     int64_t rxWallNs);
   void RejectHello(Conn* c, proto::HelloStatus status, uint64_t now);
   void ProtocolError(Conn* c, const std::string& detail, uint64_t now);
 

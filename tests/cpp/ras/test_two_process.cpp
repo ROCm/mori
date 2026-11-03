@@ -105,8 +105,8 @@ std::string CheckLink(const std::string& cond, const RuntimeUuid& peer) {
   if (l == nullptr) return "no link to the peer";
   std::string state = std::string(ToString(l->state)) + "/" + ToString(l->lastError);
   if (cond == "heartbeats") {
-    bool ok =
-        l->state == LinkState::kConnected && l->heartbeatsReceived >= 3 && l->acksReceived >= 3;
+    bool ok = l->state == LinkState::kConnected && l->heartbeatsReceived >= 3 &&
+              l->acksReceived >= 3 && l->hasTiming;
     return ok ? "" : "link " + state;
   }
   if (cond == "refused") {

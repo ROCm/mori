@@ -190,6 +190,8 @@ EOF
       on | kill)
         check "$role: RAS runtime started ($started)" test "$started" -ge 1
         check "$role: RAS link to its peer is up" grep -q "RAS link to runtime .* is up" "$log"
+        check "$role: link round trip and clock offset measured" \
+          grep -q "RAS link to runtime .*: round trip .* us, clock offset" "$log"
         ;;
       off) check "$role: no RAS runtime" test "$((started + off))" -eq 0 ;;
       blocked) check "$role: RAS off, port in use ($off)" test "$started" -eq 0 -a "$off" -ge 1 ;;

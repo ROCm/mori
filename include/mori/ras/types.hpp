@@ -206,7 +206,11 @@ struct LinkInfo {
   uint64_t heartbeatsReceived{0};
   uint64_t acksSent{0};
   uint64_t acksReceived{0};
-  int64_t lastRxAgeMs{-1};                  // since the last message from the peer; -1 if none
+  int64_t lastRxAgeMs{-1};  // since the last message from the peer; -1 if none
+  bool hasTiming{false};
+  int64_t rttNs{0};          // latest round-trip time
+  int64_t offsetNs{0};       // best clock-offset estimate: peer wall clock minus ours
+  int64_t offsetBoundNs{0};  // its error bound
   std::vector<LinkTransition> transitions;  // the last few state changes, oldest first
 };
 

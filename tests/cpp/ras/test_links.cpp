@@ -107,7 +107,7 @@ TEST(RasLinks, TwoRuntimesThatRegisterEachOtherShareOneLinkAndExchangeHeartbeats
   Register(*b, "engine-b", "engine-a", ea);
 
   auto flowing = [](const LinkInfo& l) {
-    return Connected(l) && l.heartbeatsReceived >= 3 && l.acksReceived >= 3;
+    return Connected(l) && l.heartbeatsReceived >= 3 && l.acksReceived >= 3 && l.hasTiming;
   };
   ASSERT_TRUE(WaitLink(*a, eb.uuid, flowing));
   ASSERT_TRUE(WaitLink(*b, ea.uuid, flowing));
@@ -121,6 +121,11 @@ TEST(RasLinks, TwoRuntimesThatRegisterEachOtherShareOneLinkAndExchangeHeartbeats
   EXPECT_EQ(la.peerHostname, "host-b");
   EXPECT_EQ(lb.peerHostname, "host-a");
   EXPECT_FALSE(la.peerDegraded);
+  // Same host, same clock: the estimate must contain an offset of zero.
+  EXPECT_GT(la.rttNs, 0);
+  EXPECT_LT(la.rttNs, 100000000);
+  EXPECT_LE(std::llabs(la.offsetNs), la.offsetBoundNs);
+  EXPECT_LE(std::llabs(lb.offsetNs), lb.offsetBoundNs);
   EXPECT_GE(la.lastRxAgeMs, 0);
   EXPECT_LT(la.lastRxAgeMs, 1000);
 }
@@ -410,7 +415,7 @@ TEST(RasLinks, HeartbeatsAreAnsweredAtOnceAndSentOnSchedule) {
       ASSERT_TRUE(f.has_value());
       if (std::holds_alternative<proto::Heartbeat>(f->message)) {
         ++heartbeatsFromCore;
-        // Answer the core's own heartbeats.
+        // Answer the core's own heartbeats, so it can measure the link too.
         ASSERT_TRUE(fake.Send(fd, seq++,
                               MakeAck(std::get<proto::Heartbeat>(f->message), MonoNowNs(),
                                       MonoNowNs(), WallNowNs())));
@@ -427,7 +432,6 @@ TEST(RasLinks, HeartbeatsAreAnsweredAtOnceAndSentOnSchedule) {
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
   }
   EXPECT_GE(heartbeatsFromCore, 3);  // every 50 ms
-  EXPECT_TRUE(WaitLink(*core, fake.identity.uuid, [](const LinkInfo& l) {
-    return l.acksReceived >= 3 && l.heartbeatsReceived >= 5;
-  }));
+  EXPECT_TRUE(WaitLink(*core, fake.identity.uuid,
+                       [](const LinkInfo& l) { return l.hasTiming && l.heartbeatsReceived >= 5; }));
 }
