@@ -136,9 +136,10 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
   // pages after another's got them.
   if (!dc.io_engine.host.empty()) {
     for (const auto& handle : ranged_scratch_handles_) {
-      WarnIfNicRegionAliases("Ranged scratch arena", handle.mapped_size, handle.actual_alignment,
-                             "Use UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES or a smaller "
-                             "UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES.");
+      WarnIfNicRegionExceedsAinicLimit(
+          "Ranged scratch arena", handle.mapped_size, handle.actual_alignment,
+          "Use UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES or a smaller "
+          "UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES.");
     }
   }
 

@@ -673,8 +673,8 @@ const std::vector<std::optional<application::IonicFwVersion>>& AinicFirmware() {
 
 }  // namespace
 
-void WarnIfNicRegionAliases(std::string_view what, uint64_t bytes, uint64_t page_size,
-                            std::string_view remedy) {
+void WarnIfNicRegionExceedsAinicLimit(std::string_view what, uint64_t bytes, uint64_t page_size,
+                                      std::string_view remedy) {
   if (page_size == 0) return;
   const uint64_t entries = (bytes + page_size - 1) / page_size;
   if (entries <= kNicRegionPages) return;

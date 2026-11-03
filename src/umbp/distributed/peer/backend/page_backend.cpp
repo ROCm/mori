@@ -283,7 +283,7 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
         TransferRef ref = registrar->RegisterMemory(base, size, loc, device);
         owned_refs_.push_back(ref);
         if (ref.HasMemoryDesc()) {
-          WarnIfNicRegionAliases(
+          WarnIfNicRegionExceedsAinicLimit(
               "DRAM buffer " + std::to_string(b) + " region at " + std::to_string(offset >> 20) +
                   " MiB",
               size, buffer.backing_page_size,

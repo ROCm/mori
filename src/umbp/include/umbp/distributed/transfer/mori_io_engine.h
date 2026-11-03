@@ -48,8 +48,8 @@ std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& loca
 // that and an AINIC here runs such firmware.  `page_size` is what actually
 // backs the region: a hugepage request that fell back to 4 KiB pages has 512
 // times the entries.  0 skips the check.
-void WarnIfNicRegionAliases(std::string_view what, uint64_t bytes, uint64_t page_size,
-                            std::string_view remedy);
+void WarnIfNicRegionExceedsAinicLimit(std::string_view what, uint64_t bytes, uint64_t page_size,
+                                      std::string_view remedy);
 
 // The mori-io (RDMA) implementation of TransferEngine, and the only place in
 // UMBP that names mori::io::IOEngine.
