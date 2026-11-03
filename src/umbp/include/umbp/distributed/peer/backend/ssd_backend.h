@@ -204,20 +204,25 @@ class SsdBackend : public MediumBackend {
   // One local staged read of a key (+ window) that other local resolves of the
   // same bytes join instead of staging their own copy: the TP ranks of a
   // replicated-KV model ask for identical extents at once.  Guarded by mutex_.
-  struct SharedStage {
+  class SharedStage {
+   public:
+    // `entry` must stay put until Wait returns.
+    void Join(ResolvedEntry* entry) { joiners_.push_back(entry); }
     // Hands every joiner the outcome and a hold; true if later resolves may still attach.
     bool Finish(ResolveOutcome outcome, StagingSpan staged, uint64_t object_size,
                 ObjectExtent staged_window, const std::shared_ptr<const void>& reader_hold);
     // False on timeout: `entry` gets kBusy and stops being a joiner.
     bool Wait(std::unique_lock<std::mutex>& lock, ResolvedEntry* entry);
 
-    std::condition_variable cv;
     bool done = false;
-    std::vector<ResolvedEntry*> joiners;  // handed the outcome and a hold when done
-    StagingSpan span;                     // a done extent's, for late joiners
+    StagingSpan span;  // a done extent's, for late joiners
     uint64_t size = 0;
     ObjectExtent window;
     std::weak_ptr<const void> hold;  // joinable while any reader still holds it
+
+   private:
+    std::condition_variable cv_;
+    std::vector<ResolvedEntry*> joiners_;  // in waiting calls' results
   };
   static constexpr std::chrono::seconds kJoinWait{30};
 

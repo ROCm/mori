@@ -592,12 +592,12 @@ bool SsdBackend::SharedStage::Finish(ResolveOutcome outcome, StagingSpan staged,
   span = staged;
   size = object_size;
   window = staged_window;
-  for (ResolvedEntry* joiner : joiners) {
+  for (ResolvedEntry* joiner : joiners_) {
     joiner->outcome = outcome;
     joiner->hold = reader_hold;
   }
-  joiners.clear();
-  cv.notify_all();
+  joiners_.clear();
+  cv_.notify_all();
   // Whole objects go to read leases; only a held extent stays joinable.
   if (outcome != ResolveOutcome::kFound || window.length == 0) return false;
   hold = reader_hold;
@@ -605,8 +605,8 @@ bool SsdBackend::SharedStage::Finish(ResolveOutcome outcome, StagingSpan staged,
 }
 
 bool SsdBackend::SharedStage::Wait(std::unique_lock<std::mutex>& lock, ResolvedEntry* entry) {
-  if (cv.wait_for(lock, kJoinWait, [this] { return done; })) return true;
-  joiners.erase(std::remove(joiners.begin(), joiners.end(), entry), joiners.end());
+  if (cv_.wait_for(lock, kJoinWait, [this] { return done; })) return true;
+  joiners_.erase(std::remove(joiners_.begin(), joiners_.end(), entry), joiners_.end());
   entry->outcome = ResolveOutcome::kBusy;
   return false;
 }
@@ -624,9 +624,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   const bool use_extents =
       extent_staging_ && extents != nullptr && extents->size() == keys.size() && local;
 
-  // Fills `out` from a lease the caller has already located.  Caller holds
-  // mutex_.  Factored out because the lease-hit and read-completed paths publish
-  // byte-identical results and drifting between them would be a silent bug.
+  // Every found result is filled here, so its paths cannot drift.  Caller holds mutex_.
   // `window` is the object bytes the span holds when it is not all of them.
   auto publish_span = [&](ResolvedEntry& out, StagingSpan span, uint64_t size,
                           const std::shared_ptr<const void>& hold, ObjectExtent window) {
@@ -649,11 +647,6 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
     publish_span(out, lease.span, lease.size, lease.hold, ObjectExtent{});
   };
 
-  // Phase 1 (ONE lock): serve every key that is already staged, size every
-  // unique remaining key, then reserve the spans.  A remote reader retries a
-  // partial resolve whole, so its leases would pin the subset while retries
-  // compete for the rest: it gets every span or, on transient pressure, kBusy
-  // with no new reservation kept.  A local reader copies its part first.
   // One device read and the input indices it serves; the first is the one that scheduled it.
   struct Read {
     std::vector<size_t> results;
@@ -670,6 +663,12 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // Before mutex_: one PeerSsdManager lock, not one per key under ours.  A key
   // evicted or rewritten meanwhile fails its read like any racing evict.
   const std::vector<uint64_t> sizes = ssd_->SizesOf(keys);
+
+  // Phase 1 (ONE lock): serve every key that is already staged, size every
+  // unique remaining key, then reserve the spans.  A remote reader retries a
+  // partial resolve whole, so its leases would pin the subset while retries
+  // compete for the rest: it gets every span or, on transient pressure, kBusy
+  // with no new reservation kept.  A local reader copies its part first.
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -735,7 +734,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
         if (shared != shared_stages_.end()) {
           SharedStage& stage = *shared->second;
           if (!stage.done) {
-            stage.joiners.push_back(&results[i]);
+            stage.Join(&results[i]);
             joined.emplace_back(i, shared->second);
             continue;
           }
@@ -851,7 +850,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
                                          ? ResolveOutcome::kMissing
                                          : ResolveOutcome::kFailed;
       for (size_t index : read.results) results[index].outcome = outcome;
-      finish_stage(read, outcome, read.span, 0, nullptr);
+      finish_stage(read, outcome, StagingSpan{}, 0, nullptr);
       continue;
     }
     if (read.window.length != 0) {
