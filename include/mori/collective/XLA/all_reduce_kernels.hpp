@@ -155,7 +155,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // Per-peer copy length = destination shard's length (shardLen(peer)); self
     // is skipped. The dst slot stride is the DESTINATION peer's length (its
     // staging slots are that size). 
-    StartSdmaScatter<sizeof(T)>(
+    StartSdmaScatter<sizeof(T), /*AlwaysGated=*/true>(
         devComm.sdma, npes, logS, pushGen,
         [=](int peer) {
           const int slot = (myPe < peer ? myPe : myPe - 1);   // my slot in peer's staging

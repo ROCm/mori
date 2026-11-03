@@ -385,7 +385,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
     // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a
     // bijection over the npes-1 non-self peers.
-    StartSdmaScatter<sizeof(T)>(
+    StartSdmaScatter<sizeof(T), /*AlwaysGated=*/true>(
         devComm.sdma, npes, logS, pushGen,
         [=](int peer) {
           const int slot = (myPe < peer ? myPe : myPe - 1);   // my slot in peer's staging
