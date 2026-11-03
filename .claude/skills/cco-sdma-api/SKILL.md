@@ -394,6 +394,12 @@ One COPY packet, two destinations; `peer`/`dstWin` is the first and selects the
 queue, `peer2` may be your own rank. `remoteSignal` bumps each distinct destination
 peer other than yourself once; `localSignal` is one atomic for the call.
 
+The two destination addresses must be congruent mod 32 (`(dst1 ^ dst2) & 31 == 0`),
+as in ROCr's broadcast packet. If not, the second destination receives the data
+shifted by the offset difference: the whole range is wrong and up to 31 bytes next
+to it are overwritten. Nothing checks this unless you build with
+`MORI_CCO_SDMA_DEBUG`, which traps.
+
 A signal slot counts per (source rank, `queueId`), not per physical queue. The
 broadcast is posted on queue `(peer, q)` but its remote signal bumps `peer2`'s
 `[you, q]` slot, which `put` only advances from queue `(peer2, q)`. A waiter that reads

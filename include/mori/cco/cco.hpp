@@ -2748,6 +2748,11 @@ struct ccoSdma {
   // landed" can therefore be released by a broadcast's signal while an earlier put
   // on (peer2, q) is still in flight; only the cumulative total is reliable. Use a
   // distinct queueId for broadcasts if you wait on per-queue completion.
+  // The two destination addresses must be congruent mod 32 (the packet's
+  // dst-alignment rule; ROCr rejects a mismatched pair). Otherwise the second
+  // destination receives the data shifted by the offset difference, the whole
+  // range is wrong, and up to 31 bytes next to it are overwritten. Nothing
+  // checks this unless MORI_CCO_SDMA_DEBUG is set, which traps.
   // Measured slower than two put()s when either destination is remote (one
   // engine cannot overlap the two writes); it only wins when both are local.
   template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
@@ -2764,6 +2769,10 @@ struct ccoSdma {
     void* dst1 = ccoGetLsaPeerPtr(dstWin, peer, dstOffset);
     void* dst2 = ccoGetLsaPeerPtr(dstWin2, peer2, dstOffset2);
     void* src = ccoGetLocalPtr(srcWin, srcOffset);
+    if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
+      if ((reinterpret_cast<uintptr_t>(dst1) ^ reinterpret_cast<uintptr_t>(dst2)) & 31)
+        __builtin_trap();  // putBroadcast: destinations must be congruent mod 32
+    }
     ccoSdmaDispatchBroadcast<Coop, localSignal, remoteSignal, optFlags>(
         s, peer, peer2, dst1, dst2, src, bytes, queueId, static_cast<uint32_t>(comm.lsaRank));
   }
