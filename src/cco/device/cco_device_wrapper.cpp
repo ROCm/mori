@@ -517,9 +517,24 @@ template <uint32_t OptMask, typename Fn>
 inline __device__ void GdaWithFlags(int flags, Fn&& fn) {
   if (flags & ~(kGdaFlagTeamGda | static_cast<int>(OptMask))) __builtin_trap();  // unknown flag
   auto withOpt = [&](auto team) {
+    if constexpr ((OptMask & ccoGdaOptFlagsDeferDoorbell) != 0 &&
+                  (OptMask & ccoGdaOptFlagsPostedBeforeFlush) != 0) {
+      constexpr uint32_t kBoth = ccoGdaOptFlagsDeferDoorbell | ccoGdaOptFlagsPostedBeforeFlush;
+      if ((flags & kBoth) == kBoth) {
+        fn(team, Const<uint32_t, kBoth>{});
+        return;
+      }
+      if (flags & ccoGdaOptFlagsPostedBeforeFlush) __builtin_trap();  // needs DeferDoorbell
+    }
     if constexpr ((OptMask & ccoGdaOptFlagsDeferDoorbell) != 0) {
       if (flags & ccoGdaOptFlagsDeferDoorbell) {
         fn(team, Const<uint32_t, ccoGdaOptFlagsDeferDoorbell>{});
+        return;
+      }
+    }
+    if constexpr (OptMask == ccoGdaOptFlagsPostedBeforeFlush) {
+      if (flags & ccoGdaOptFlagsPostedBeforeFlush) {
+        fn(team, Const<uint32_t, ccoGdaOptFlagsPostedBeforeFlush>{});
         return;
       }
     }
@@ -643,17 +658,18 @@ CCO_COOP_LIST(CCO_DEF_WAIT)
 
 // ── GDA completion (>= warp): cco_gda_flush__<coop> / cco_gda_flush_peer__<coop> ──
 // flush_peer's `flags` carries only the team.
-#define CCO_DEF_FLUSH(TAG, COOP)                                                          \
-  CCO_DEV int cco_gda_flush__##TAG(uint64_t dc, int ctx) {                                \
-    Gda gda{*AsDevComm(dc), ctx};                                                         \
-    gda.flush(COOP{});                                                                    \
-    return 0;                                                                             \
-  }                                                                                       \
-  CCO_DEV int cco_gda_flush_peer__##TAG(uint64_t dc, int ctx, int peer, int flags) {      \
-    Gda gda{*AsDevComm(dc), ctx};                                                         \
-    GdaWithFlags<ccoGdaOptFlagsDefault>(                                                  \
-        flags, [&](auto team, auto) { gda.flush<decltype(team)::value>(peer, COOP{}); }); \
-    return 0;                                                                             \
+#define CCO_DEF_FLUSH(TAG, COOP)                                                     \
+  CCO_DEV int cco_gda_flush__##TAG(uint64_t dc, int ctx) {                           \
+    Gda gda{*AsDevComm(dc), ctx};                                                    \
+    gda.flush(COOP{});                                                               \
+    return 0;                                                                        \
+  }                                                                                  \
+  CCO_DEV int cco_gda_flush_peer__##TAG(uint64_t dc, int ctx, int peer, int flags) { \
+    Gda gda{*AsDevComm(dc), ctx};                                                    \
+    GdaWithFlags<kCcoGdaSupportedFlushOptFlags>(flags, [&](auto team, auto opt) {    \
+      gda.flush<decltype(team)::value, COOP, decltype(opt)::value>(peer, COOP{});    \
+    });                                                                              \
+    return 0;                                                                        \
   }
 CCO_DEF_FLUSH(warp, ccoCoopWarp)
 CCO_DEF_FLUSH(block, ccoCoopBlock)
@@ -666,16 +682,16 @@ CCO_DEF_FLUSH(block, ccoCoopBlock)
 // and is only meaningful to wait() with the same dev_comm. Every lane holds it
 // for thread and warp scope; for block scope only thread 0 does, so wait with
 // block scope too.
-#define CCO_DEF_FLUSH_ASYNC(TAG, COOP)                                                     \
-  CCO_DEV uint64_t cco_gda_flush_async__##TAG(uint64_t dc, int ctx, int peer, int flags) { \
-    Gda gda{*AsDevComm(dc), ctx};                                                          \
-    ccoGdaRequest_t req{};                                                                 \
-    GdaWithFlags<ccoGdaOptFlagsDefault>(flags, [&](auto team, auto) {                      \
-      gda.flushAsync<decltype(team)::value>(peer, &req, COOP{});                           \
-    });                                                                                    \
-    uint64_t packed = PackRequest(req);                                                    \
-    if constexpr (std::is_same_v<COOP, ccoCoopWarp>) packed = __shfl(packed, 0);           \
-    return packed;                                                                         \
+#define CCO_DEF_FLUSH_ASYNC(TAG, COOP)                                                       \
+  CCO_DEV uint64_t cco_gda_flush_async__##TAG(uint64_t dc, int ctx, int peer, int flags) {   \
+    Gda gda{*AsDevComm(dc), ctx};                                                            \
+    ccoGdaRequest_t req{};                                                                   \
+    GdaWithFlags<kCcoGdaSupportedFlushOptFlags>(flags, [&](auto team, auto opt) {            \
+      gda.flushAsync<decltype(team)::value, COOP, decltype(opt)::value>(peer, &req, COOP{}); \
+    });                                                                                      \
+    uint64_t packed = PackRequest(req);                                                      \
+    if constexpr (std::is_same_v<COOP, ccoCoopWarp>) packed = __shfl(packed, 0);             \
+    return packed;                                                                           \
   }
 CCO_COOP_LIST(CCO_DEF_FLUSH_ASYNC)
 #undef CCO_DEF_FLUSH_ASYNC
