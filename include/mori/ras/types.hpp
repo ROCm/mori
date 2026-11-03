@@ -83,6 +83,21 @@ struct Topology {
 
 using Labels = std::map<std::string, std::string>;
 
+// A GPU that a local engine uses, and the NICs that the engine's RDMA sessions picked to reach
+// the fabric from it. One process can drive several GPUs, as in MORI's single-process
+// multi-thread (SPMT) mode, so there is one per engine and GPU. Communicators and ranks add
+// their own in P4-E.
+struct GpuAttachment {
+  std::string owner;                // the engine key
+  int32_t gpu{-1};                  // HIP device index in this process
+  std::string pciBusId;             // e.g. "0000:05:00.0"
+  std::vector<NicAttachment> nics;  // none before the engine's first RDMA session from the GPU
+
+  bool operator==(const GpuAttachment& o) const {
+    return owner == o.owner && gpu == o.gpu && pciBusId == o.pciBusId && nics == o.nics;
+  }
+};
+
 // Who a RAS runtime is. nodeId, hostname, host, and pid come from the EngineDesc of the engine
 // that started RAS; the PID namespace and start time let a peer on the same node confirm an
 // exit (P3) without trusting a reused PID.
@@ -97,11 +112,15 @@ struct RasProcessId {
   std::string bootId;          // /proc/sys/kernel/random/boot_id; scopes startTimeTicks
   Topology topology;
   Labels labels;  // process labels set by the framework
+  // Ordered by owner, then GPU. Local only: HELLO leaves them out, because they change while
+  // links are up, so a peer's copy would go stale.
+  std::vector<GpuAttachment> attachments;
 
   bool operator==(const RasProcessId& o) const {
     return uuid == o.uuid && nodeId == o.nodeId && hostname == o.hostname && host == o.host &&
            pid == o.pid && pidNamespace == o.pidNamespace && startTimeTicks == o.startTimeTicks &&
-           bootId == o.bootId && topology == o.topology && labels == o.labels;
+           bootId == o.bootId && topology == o.topology && labels == o.labels &&
+           attachments == o.attachments;
   }
 };
 

@@ -424,6 +424,18 @@ TEST(RasProtocol, HelloToleratesTrailingFieldsFromANewerPeer) {
   EXPECT_EQ(DecodeBytes(RawFrame(MessageType::kHeartbeat, hbPayload)), DecodeStatus::kBadPayload);
 }
 
+TEST(RasProtocol, HelloLeavesTheAttachmentsOut) {
+  Hello h = SampleHelloRequest();
+  std::vector<uint8_t> without = EncodeFrame(LinkHeader(1, kSender, 1), h);
+  h.identity.attachments.push_back(
+      GpuAttachment{"engine-a", 0, "0000:05:00.0", {h.identity.topology.nics[0]}});
+  std::vector<uint8_t> with = EncodeFrame(LinkHeader(1, kSender, 1), h);
+  EXPECT_EQ(with, without);
+  Frame f;
+  ASSERT_EQ(DecodeFrame(with.data(), with.size(), kV1, &f), DecodeStatus::kOk);
+  EXPECT_TRUE(std::get<Hello>(f.message).identity.attachments.empty());
+}
+
 TEST(RasProtocol, NegotiatesTheHighestCommonVersion) {
   EXPECT_EQ(NegotiateVersion({1, 1}, {1, 1}), std::optional<uint16_t>(1));
   EXPECT_EQ(NegotiateVersion({1, 3}, {2, 5}), std::optional<uint16_t>(3));

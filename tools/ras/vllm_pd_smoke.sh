@@ -6,8 +6,8 @@
 #
 # Each mode serves a few requests through vLLM's MoRIIO toy proxy and checks the RAS log lines:
 #   on       MORI_RAS_ENABLE=1: every engine process starts one RAS runtime, whose identity has
-#            the rack and leaf from a topology file, and prefill and decode link up. Prefill
-#            then stops on SIGTERM, and decode sees it leave.
+#            the rack and leaf from a topology file and the engine's GPU, and prefill and decode
+#            link up. Prefill then stops on SIGTERM, and decode sees it leave.
 #   kill     As on, but decode is SIGKILLed. Prefill, which opened the link, sees it close
 #            and its reconnect refused (RAS_ENDPOINT_UNAVAILABLE: exit suspected).
 #   off      MORI_RAS_ENABLE=0: no RAS runtime starts.
@@ -197,6 +197,8 @@ EOF
         check "$role: RAS runtime started ($started)" test "$started" -ge 1
         check "$role: identity has the topology file's rack and leaf" \
           grep -q "RAS identity: .*rack 'smoke-rack', leaf 'smoke-leaf'" "$log"
+        check "$role: engine's GPU attached, with its PCI bus ID" \
+          grep -qE "RAS engine .* uses GPU [0-9]+ \([0-9a-f]{4}:" "$log"
         check "$role: RAS link to its peer is up" grep -q "RAS link to runtime .* is up" "$log"
         ;;
       off) check "$role: no RAS runtime" test "$((started + off))" -eq 0 ;;

@@ -168,6 +168,8 @@ class IOEngine {
  private:
   std::atomic<uint32_t> nextTransferUid{0};
   std::atomic<uint32_t> nextMemUid{0};
+  // GPUs this engine has reported to RAS, a bit per device index.
+  std::atomic<uint64_t> rasGpusReported{0};
   std::unordered_map<MemoryUniqueId, MemoryDesc> memPool;
   std::unordered_map<BackendType, std::unique_ptr<Backend>> backends;
   mutable std::shared_mutex routeCacheMu;

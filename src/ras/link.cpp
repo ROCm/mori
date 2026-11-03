@@ -418,6 +418,7 @@ void LinkManager::HandleEvent(RasEvent& ev, uint64_t now) {
                  [&](EngineRegistered& e) { localEngines_.insert(e.engineKey); },
                  [&](EngineUnregistered& e) {
                    localEngines_.erase(e.engineKey);
+                   DetachOwner(e.engineKey, &self_);
                    std::vector<std::pair<std::string, std::string>> gone;
                    for (const auto& entry : relations_) {
                      if (entry.first.first == e.engineKey) gone.push_back(entry.first);
@@ -436,6 +437,20 @@ void LinkManager::HandleEvent(RasEvent& ev, uint64_t now) {
                    }
                  },
                  [&](PeerRemoved& e) { RemoveRelation(e.localEngine, e.remoteEngine, now); },
+                 [&](EngineGpuAttached& e) {
+                   AttachGpu(e.engineKey, e.gpu, e.pciBusId, e.nics, &self_);
+                   // Engines report each GPU, and each NIC they add, once.
+                   if (e.nics.empty()) {
+                     RAS_LOG_INFO("RAS engine {} uses GPU {} ({})", e.engineKey, e.gpu, e.pciBusId);
+                   } else {
+                     std::string nics;
+                     for (const NicAttachment& n : e.nics) {
+                       nics += (nics.empty() ? "" : ", ") + n.device + ":" + std::to_string(n.port);
+                     }
+                     RAS_LOG_INFO("RAS engine {} reaches the fabric from GPU {} through {}",
+                                  e.engineKey, e.gpu, nics);
+                   }
+                 },
              },
              ev);
   MarkDirty();

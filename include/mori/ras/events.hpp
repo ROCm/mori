@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "mori/ras/types.hpp"
 
@@ -79,13 +80,24 @@ struct PeerRemoved {
   std::string remoteEngine;
 };
 
-using RasEvent = std::variant<EngineRegistered, EngineUnregistered, PeerAdded, PeerRemoved>;
+// A local engine uses a GPU: it registered memory there (no NICs), or an RDMA session from that
+// memory picked NICs it hadn't reported yet. RAS merges these into one attachment per engine
+// and GPU, so a repeat is harmless.
+struct EngineGpuAttached {
+  std::string engineKey;
+  int32_t gpu{-1};
+  std::string pciBusId;
+  std::vector<NicAttachment> nics;  // device and port only; RAS fills in the rest
+};
+
+using RasEvent =
+    std::variant<EngineRegistered, EngineUnregistered, PeerAdded, PeerRemoved, EngineGpuAttached>;
 constexpr size_t kNumEventKinds = std::variant_size_v<RasEvent>;
 
 // "EngineRegistered" and so on, for an index of RasEvent.
 inline const char* EventKindName(size_t kind) {
   static constexpr const char* kNames[] = {"EngineRegistered", "EngineUnregistered", "PeerAdded",
-                                           "PeerRemoved"};
+                                           "PeerRemoved", "EngineGpuAttached"};
   static_assert(sizeof(kNames) / sizeof(kNames[0]) == kNumEventKinds, "one name per event");
   return kind < kNumEventKinds ? kNames[kind] : "Unknown";
 }
