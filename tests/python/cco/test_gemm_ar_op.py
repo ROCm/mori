@@ -741,8 +741,9 @@ def test_reduce_scatter_returns_my_band_of_the_sum(worker_results):
 
     Each rank gets ``[M/P, N]``, rows ``rank*M/P`` onward of the sum, at the fp8
     floor -- across two M values through one instance and fresh operands every
-    call. The comparison against the *next* rank's band has to fail, or the
-    floor check cannot tell a wrong band offset from a right one. Its self-test
+    call, on every rank (rank 0's band offset is 0, so it alone cannot catch a
+    wrong one). The comparison against the *next* rank's band has to fail, or
+    the floor check cannot tell a wrong band offset from a right one. Its self-test
     must pass and must catch a scatter that did not happen, like the
     all-reduce's.
     """
@@ -767,9 +768,19 @@ def test_reduce_scatter_survives_a_slow_reader(worker_results):
     reduce, a different one each call, which makes the others certainly a call
     ahead -- without the trailing barrier the held rank reduces the *next*
     call's bytes. Before the barrier this showed up only intermittently, as
-    relL2 0.71 on one call in an alternating-M run.
+    relL2 0.71 on one call in an alternating-M run. Every value is the worst
+    over all ranks.
     """
     r = _case(worker_results, "reduce_scatter")
     assert r["slow_peer_order"][-1] == "rs_barrier", r
+    # The hold has to have run, on the rank each call names, or every check
+    # below passes vacuously (it did: the plan was stored under a key the op
+    # no longer read).
+    world = len(r["holds"])
+    want = [sum(1 for i in range(4) if i % world == rank) for rank in range(world)]
+    assert r["holds"] == want, r
     for i in range(4):
         assert r[f"slow{i}"] < FP8_FLOOR, (i, r)
+    # Negative control: the same schedule without rs_barrier must corrupt a
+    # held rank's band.
+    assert max(r[f"unbarriered{i}"] for i in range(4)) > 0.5, r

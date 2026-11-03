@@ -312,6 +312,11 @@ def run(args) -> int:
             "--collective rs has no gather leg, so --gather-dtype fp8 would be "
             "silently ignored"
         )
+    if rs and args.fuse_reduce_push:
+        raise SystemExit(
+            "--collective rs always runs the plain reduce (reduce_push feeds a "
+            "gather), so --fuse-reduce-push would be silently ignored"
+        )
     if rs and args.scatter_dtype == "fp8":
         raise SystemExit(
             "--collective rs reduces a bf16 scatter only; GemmReduceScatterOp "
@@ -515,7 +520,8 @@ def run(args) -> int:
                 publish=args.publish,
             )
             if not args.raw_jit:
-                for phase in set(parts["order"]) | set(parts["fused_order"]):
+                orders = ("order", "fused_order", "rs_order", "fused_rs_order")
+                for phase in {name for o in orders for name in parts[o]}:
                     parts[phase] = _PinnedLaunch(parts[phase])
         if args.mode == "split-lsa":
             lsa_ar, _ = build_lsa_ar(cfg, rank)

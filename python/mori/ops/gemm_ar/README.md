@@ -231,6 +231,9 @@ leg, and it takes neither `scatter_dtype="fp8"` nor `schedule="wo_b"`: the
 scatter stays bf16 and `M` pads by the default rule, so the bands are even.
 
 ```python
+vmm = 2 * GemmReduceScatterOp.window_bytes_for(
+    world, m_max=M_MAX, n=N, k=K, quant="mxfp8"   # the constructor's settings
+) + (64 << 20)
 with GemmReduceScatterOp(comm, n=N, k=K, m_max=M_MAX, quant="mxfp8") as op:
     band = op(a_fp8, b_shuffled, a_scale, b_scale)   # [m_pad / world, N]
 ```
@@ -242,7 +245,9 @@ fill, and the next call's epilogue refills them, so without it a rank one call
 ahead overwrites a slower peer's slot mid-reduce. It was intermittent in the
 alternating-M test (relL2 0.71 on one call) and deterministic once one rank is
 held between drain and reduce (0.99 and 1.01; 2.4e-3 with the barrier) --
-which is what `test_reduce_scatter_survives_a_slow_reader` now does.
+which is what `test_reduce_scatter_survives_a_slow_reader` does. The test
+counts the holds, so it cannot pass without holding anyone, and reruns the
+same schedule without `rs_barrier` as a negative control that has to corrupt.
 
 **The padding decides the bands.** `M` has to be a multiple of
 `world_size * block_m` here as for the all-reduce, and the rows are split after
@@ -266,7 +271,9 @@ followed by `reduce_scatter_tensor`, i.e. what a serving stack runs today:
 Two separate effects. The copy engines alone beat RCCL by 5-14% (`split-sdma`
 against `split-rccl`); fusing then hides about 83 of the 175us of GEMM at
 M=16384. At M=2048 there are only two chunks per destination and fusing loses
-to the split path, so a caller should keep the split form there. The link is
+to `split-sdma`; that split has no public op, though, and against the split a
+caller actually has -- the GEMM then `reduce_scatter_tensor` -- the fused op is
+ahead at every M measured, 2048 included. The link is
 still the limit: the unfused transfer is ~740us at M=16384, about 170 GB/s per
 rank over TP4's three links.
 

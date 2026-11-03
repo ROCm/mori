@@ -1292,12 +1292,24 @@ class GemmReduceScatterOp(GemmAllReduceOp):
         *,
         m_max: int,
         n: int,
-        block_m: int = DEFAULT_BLOCK_M,
+        block_m: int | None = None,
         max_shapes: int | None = None,
+        k: int | None = None,
+        quant: str = "blockscale",
     ) -> int:
-        """Symmetric-window bytes an op for this shape will allocate."""
+        """Symmetric-window bytes an op for this shape will allocate.
+
+        Pass the constructor's ``quant`` (and ``block_m``, if it set one): the
+        tile, and so the padding, follows the quant when ``block_m`` is None.
+        """
         return GemmAllReduceOp.window_bytes_for(
-            world_size, m_max=m_max, n=n, block_m=block_m, max_shapes=max_shapes
+            world_size,
+            m_max=m_max,
+            n=n,
+            block_m=block_m,
+            max_shapes=max_shapes,
+            k=k,
+            quant=quant,
         )
 
     def _output_view(self, cfg: ArConfig, m: int) -> torch.Tensor:
@@ -1326,3 +1338,16 @@ class GemmReduceScatterOp(GemmAllReduceOp):
         the unpadded token count has to pad to this granule before it shards.
         """
         return super().__call__(a_fp8, b_preshuffled, a_scale, b_scale)
+
+    def _row_plan(self, m: int, logical_m: int | None = None) -> _RowPlan:
+        # The inherited message points at ``logical_m``, which this op's
+        # ``__call__`` does not take: here M itself has to be padded.
+        try:
+            return super()._row_plan(m, logical_m)
+        except ValueError as e:
+            if m > self.m_max or logical_m is not None:
+                raise
+            raise ValueError(
+                f"M={m} is not a multiple of world_size*block_m; pad the rows "
+                f"to padded_m({m})={self.padded_m(m)} before sharding them"
+            ) from e

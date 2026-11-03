@@ -111,6 +111,30 @@ def _rel_l2(got: torch.Tensor, ref: torch.Tensor) -> float:
     ).item()
 
 
+def _reduce_across_ranks(record: dict) -> dict:
+    """Every rank's verdicts folded into one record for rank 0 to print.
+
+    Errors take the worst rank and booleans the least favourable, except the
+    ``*_vs_other_band`` errors, which must be large everywhere and so take the
+    smallest. Integer counts go in per rank, as a list.
+    """
+    world = dist.get_world_size()
+    gathered = [None] * world
+    dist.all_gather_object(gathered, record)
+    out = {}
+    for key, value in record.items():
+        values = [g[key] for g in gathered]
+        if isinstance(value, bool):
+            out[key] = all(values)
+        elif isinstance(value, float):
+            out[key] = min(values) if key.endswith("_vs_other_band") else max(values)
+        elif isinstance(value, int):
+            out[key] = values
+        else:
+            out[key] = value
+    return out
+
+
 def _emit(rank: int, **record) -> None:
     if rank == 0:
         print("RESULT_JSON " + json.dumps(record, sort_keys=True), flush=True)
@@ -392,22 +416,42 @@ def case_reduce_scatter(comm, rank, world, n, k, m_small, m_large):
         plan = op._compiled(m)
         names = plan.parts["fused_rs_order"]
         out["slow_peer_order"] = list(names)
-        held = list(plan.tail)
-        held.insert(
-            names.index("reduce"),
-            lambda *_, stream: torch.cuda._sleep(SLOW_PEER_CYCLES),
-        )
-        fast = plan.tail
-        for i in range(4):
-            slow = i % world == rank
-            op._cache[m] = plan._replace(tail=tuple(held) if slow else fast)
-            a, b, sa, sb = _operands(rank, m, n, k, salt=10 + i)
-            got = op(a, preshuffle_b(b), sa, sb).clone()
-            ref = _reference(world, m, n, k, salt=10 + i)
-            band = m // world
-            out[f"slow{i}"] = _rel_l2(got, ref[rank * band : (rank + 1) * band])
-        op._cache[m] = plan
-    _emit(rank, case="reduce_scatter", **out)
+        # The plan cache is keyed by the row plan, not by M: a plan stored
+        # under M is never read, and the hold below would silently not run.
+        key = op._row_plan(m)
+        assert op._cache[key] is plan, "the plan cache key changed under the test"
+        holds = [0]
+
+        def hold(*_, stream):
+            holds[0] += 1
+            torch.cuda._sleep(SLOW_PEER_CYCLES)
+
+        def run_held(prefix, fast):
+            held = list(fast)
+            held.insert(names.index("reduce"), hold)
+            for i in range(4):
+                slow = i % world == rank
+                op._cache[key] = plan._replace(tail=tuple(held) if slow else fast)
+                a, b, sa, sb = _operands(rank, m, n, k, salt=10 + i)
+                got = op(a, preshuffle_b(b), sa, sb).clone()
+                ref = _reference(world, m, n, k, salt=10 + i)
+                band = m // world
+                out[f"{prefix}{i}"] = _rel_l2(got, ref[rank * band : (rank + 1) * band])
+            op._cache[key] = plan
+
+        run_held("slow", plan.tail)
+        # The rank held on call i is i % world; the test checks each rank's count.
+        out["holds"] = holds[0]
+        # Negative control, last because it leaves the instance's recv slots
+        # in an unknown state: the same schedule without the trailing barrier
+        # must corrupt a held rank's band, or the check above proves nothing.
+        bar = names.index("rs_barrier")
+        torch.cuda.synchronize()
+        comm.barrier()
+        run_held("unbarriered", plan.tail[:bar] + plan.tail[bar + 1 :])
+        torch.cuda.synchronize()
+        comm.barrier()
+    _emit(rank, case="reduce_scatter", **_reduce_across_ranks(out))
 
 
 def case_close_is_idempotent(comm, rank, n, k, m_max):
