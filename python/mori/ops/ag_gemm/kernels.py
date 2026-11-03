@@ -55,6 +55,9 @@ own tile the push time -- a local tile, which nothing waits on.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as _llvm_d
+from flydsl._mlir.dialects import scf
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int64
@@ -63,8 +66,10 @@ import mori.cco.device.flydsl as cco
 from mori.cco.device.flydsl import _bindings as raw_cco
 
 from ..gemm_ar._compat import (
+    i32_type,
     local_load_u32,
     local_store_u32,
+    signal_load_u32,
     signal_ptr,
     signal_store_u32,
 )
@@ -79,7 +84,6 @@ from ..gemm_ar._gemm_a8w8_8wave import (
     wait_barrier,
 )
 from ..gemm_ar.kernels_fused import _LaneTransposeStoreC, _SwappedMfma
-from ..gemm_ar.kernels_lsa import _spin_until
 from .layout import MAX_CHUNKS, MAX_WORLD
 
 BLOCK_K = 128
@@ -87,6 +91,29 @@ BLOCK_K = 128
 N_GRANULE = 16
 #: Wave width; the push kernel and the barrier use one wave, a lane per peer.
 PUSH_THREADS = 64
+
+
+def _spin_reach(rsrc, target):
+    """Block until the u32 at ``rsrc`` has reached ``target``.
+
+    Compared as ``(int32)(cur - target) < 0``, as ``a2a_gemm``'s is, so it holds
+    across the epoch's wrap at 2^32: ``gemm_ar``'s unsigned ``cur < target``,
+    used here before, passes at once on the call whose ``epoch + 1`` wraps to 0
+    while the flag still holds the previous call's value near 2^32.
+    """
+    i32 = i32_type()
+    first = signal_load_u32(rsrc)
+    first_v = first.ir_value() if hasattr(first, "ir_value") else first
+    loop = scf.WhileOp([i32], [first_v])
+    cond = ir.Block.create_at_start(loop.before, [i32])
+    body = ir.Block.create_at_start(loop.after, [i32])
+    with ir.InsertionPoint(cond):
+        cur = fx.Int32(cond.arguments[0])
+        behind = (cur - fx.Int32(target)) < fx.Int32(0)
+        scf.ConditionOp(behind.ir_value(), [cond.arguments[0]])
+    with ir.InsertionPoint(body):
+        nxt = signal_load_u32(rsrc)
+        scf.YieldOp([nxt.ir_value() if hasattr(nxt, "ir_value") else nxt])
 
 
 def _lsa(base, stride, peer, offset):
@@ -291,10 +318,14 @@ def compile_ag_gemm(
             ) * fx.Int64(4)
             if t >= fx.Int32(local_tiles):
                 if tid == fx.Int32(0):
-                    _spin_until(signal_ptr(flag_addr), ep)
+                    _spin_reach(signal_ptr(flag_addr), ep)
                     # Acquire: the rows were written by a peer's copy engine,
                     # and this CU may still hold the previous call's lines.
-                    raw_cco.cco_system_fence(fx.Int32(0))
+                    # Acquire only, as in a2a_gemm: cco_system_fence's release
+                    # half writes back L2, dirty with this kernel's own C
+                    # stores, which a reader of copy-engine data has no use
+                    # for -- 1.5-4.3% of a call at P=4/P=8 on the KDA shape.
+                    _llvm_d.fence(_llvm_d.AtomicOrdering.acquire)
             fgpu.barrier()
         else:
             block_m, block_n = split_row_major_2d(t, nb)
@@ -527,7 +558,7 @@ def build_phases(cfg, rank: int, *, sdma_queues: int = 1):
                     raw_cco.cco_system_fence(fx.Int32(0))
                     peer_slot = _lsa(wbase, wstride, tid, cfg.bar_slot_off(which, rank))
                     signal_store_u32(signal_ptr(peer_slot), ep)
-                    _spin_until(signal_ptr(my_bar + fx.Int64(tid) * fx.Int64(4)), ep)
+                    _spin_reach(signal_ptr(my_bar + fx.Int64(tid) * fx.Int64(4)), ep)
             fgpu.barrier()
             if const_expr(bump):
                 if tid == fx.Int32(0):

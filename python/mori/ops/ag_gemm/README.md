@@ -58,8 +58,11 @@ with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
   number of times, with the same M, in the same order: each call ends in a
   cross-rank barrier.
 - `mode="split"` runs push, barrier, the same GEMM: the baseline, and a
-  fallback. `chunks=` caps the row bands per peer (default 4, rounded down to
-  a divisor of the row tiles).
+  fallback. `chunks=` pins the row bands per peer (rounded down to a divisor
+  of the row tiles). By default the op takes the most bands, up to 4, that
+  still hold 20 output tiles each (`MIN_BAND_TILES`): at P=8 that is the best
+  count at every cell of the tables below -- c2 / c4 for KDA at global M 4096
+  / 8192, c1 / c2 / c4 for MLA at 4096 / 8192 / 16384.
 
 ## How it works
 
@@ -79,7 +82,9 @@ from a plain GEMM (`kernels.py`):
    The rest go (chunk, source, row tile, column tile), the source rotated by
    rank, so the first wave of remote tiles needs only each peer's band 0.
 3. **The wait.** A remote tile's thread 0 spins on its band's flag, then
-   fences, before the prologue issues a single A load.
+   takes an acquire fence, before the prologue issues a single A load. Acquire
+   only: a full system fence's release half writes back L2, dirty with this
+   kernel's own C stores, and cost 1.5-4.3% of a call on the KDA shape.
 
 A barrier-only kernel closes every call and advances the epoch the flags are
 compared against. It is load-bearing twice over: nothing is ever reset, so the

@@ -71,19 +71,28 @@ def test_supports_rejects_world_sizes_outside_a_node(world):
 
 
 @pytest.mark.parametrize(
-    "chunks,m,want",
+    "chunks,n,m,want",
     [
-        (None, 256, 1),
-        (None, 512, 2),
-        (None, 768, 3),  # three tiles: the largest divisor up to the cap
-        (None, 1024, 4),
-        (None, 4096, 4),
-        (8, 2048, 8),
-        (8, 1536, 6),  # rounded down to a divisor of six tiles
+        # Pinned: the largest divisor of the row tiles up to it.
+        (4, 1024, 768, 3),
+        (4, 1024, 1024, 4),
+        (8, 1024, 2048, 8),
+        (8, 1024, 1536, 6),
+        # Default, at every cell of the README's tables (P=8, m_local rows).
+        (None, 6400, 512, 2),  # KDA
+        (None, 6400, 1024, 4),
+        (None, 6400, 2048, 4),
+        (None, 6400, 4096, 4),
+        (None, 3840, 512, 1),  # MLA: c2 lost to c1 and to split here
+        (None, 3840, 1024, 2),
+        (None, 3840, 2048, 4),
+        (None, 3840, 4096, 4),
+        (None, 6288, 1024, 4),  # the unpadded KDA shard: same 25 column tiles
+        (None, 1024, 256, 1),  # too few tiles for any band to reach the floor
     ],
 )
-def test_chunks_are_a_divisor_of_the_row_tiles(chunks, m, want):
-    assert AgGemmOp.chunks_for(SimpleNamespace(chunks=chunks), m) == want
+def test_chunks_are_a_divisor_of_the_row_tiles(chunks, n, m, want):
+    assert AgGemmOp.chunks_for(SimpleNamespace(chunks=chunks, n=n), m) == want
 
 
 requires_gpus = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
@@ -147,11 +156,12 @@ def test_padded_token_count_is_correct_and_its_padding_zero(cases):
 
 
 @requires_gpus
-def test_one_instance_serves_two_m_values_in_any_order(cases):
+def test_one_instance_serves_changing_m_back_to_back(cases):
     """The receive slots are laid out for the current M, so switching M moves
-    them; the closing barrier is what makes that safe."""
+    them; the closing barrier is what makes that safe. Four M, no host sync,
+    a different rank held before each call."""
     r = cases["alternating_m"]
-    assert len(r) == 4, r
+    assert len(r) == 6, r
     for key, value in r.items():
         assert value < FP8_FLOOR, (key, r)
 
@@ -197,3 +207,13 @@ def test_a_partial_last_column_tile_is_masked_not_padded(cases):
     assert r["fused_rel_l2"] < FP8_FLOOR, r
     assert r["split_rel_l2"] < FP8_FLOOR, r
     assert r["equal"], r
+
+
+@requires_gpus
+def test_calls_across_the_epoch_wrap_stay_correct(cases):
+    """The band and barrier waits compare ``(int32)(cur - target)``, so the
+    call whose epoch wraps to 0 still waits for its flags."""
+    r = cases["epoch_wrap"]
+    assert len(r) == 8, r
+    for key, value in r.items():
+        assert value < FP8_FLOOR, (key, r)

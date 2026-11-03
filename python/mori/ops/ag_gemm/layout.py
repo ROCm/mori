@@ -169,10 +169,11 @@ class AgGemmConfig:
             raise ValueError(
                 f"world_size must be in [2, {MAX_WORLD}], got {self.world_size}"
             )
-        if self.block_m < 128 or self.block_m % 128:
-            raise ValueError(
-                f"block_m={self.block_m} must be a positive multiple of 128"
-            )
+        if self.block_m != 256:
+            # The 8-wave mainloop is served at 256 rows: 512 does not fit in
+            # LDS, and a tile with more A than B LDS steps (384) leaves the
+            # end-of-step wait one load short of covering a_next1 (#857).
+            raise ValueError(f"block_m={self.block_m} must be 256, the served tile")
         if not 1 <= self.chunks <= MAX_CHUNKS:
             raise ValueError(f"chunks must be in [1, {MAX_CHUNKS}], got {self.chunks}")
         if self.m_local < 1 or self.m_local % (self.block_m * self.chunks):

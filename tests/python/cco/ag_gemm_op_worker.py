@@ -142,15 +142,29 @@ def case_padded_rows(op, rank, world):
 
 
 def case_alternating_m(op, rank, world):
-    """Two M through one instance, fresh operands each call."""
+    """Changing M back to back, with no host sync and a different rank held
+    before each call, so its peers are certainly a call ahead and post the
+    next M's bands into slots laid out for it while the held rank's GEMM of
+    the previous M may still read them. Fresh operands each call."""
+    ms = (512, 1024, 768, 1024, 256, 1024)
     b, sb = weight(rank)
     bs = preshuffle_b(b)
-    out = {}
-    for i, m in enumerate((512, 1024, 512, 1024)):
-        a, sa = tokens(rank, m, salt=10 + i)
-        out[f"call{i}_m{m}"] = worst(
-            rel(op(a, bs, sa, sb), reference(world, rank, m, 10 + i))
-        )
+    staged = [tokens(rank, m, salt=10 + i) for i, m in enumerate(ms)]
+    outs = [torch.empty(world * m, N, device="cuda", dtype=torch.bfloat16) for m in ms]
+    for m in sorted(set(ms)):  # compile every plan outside the race
+        a, sa = tokens(rank, m, salt=0)
+        op(a, bs, sa, sb)
+    torch.cuda.synchronize()
+    op.comm.barrier()
+    for i in range(len(ms)):
+        if i % world == rank:
+            torch.cuda._sleep(HOLD_CYCLES)
+        op(staged[i][0], bs, staged[i][1], sb, out=outs[i])
+    torch.cuda.synchronize()
+    out = {
+        f"call{i}_m{m}": worst(rel(outs[i], reference(world, rank, m, 10 + i)))
+        for i, m in enumerate(ms)
+    }
     emit(rank, case="alternating_m", **out)
 
 
@@ -261,6 +275,37 @@ def case_ragged_n(comm, rank, world):
     )
 
 
+def case_epoch_wrap(comm, rank, world):
+    """Four calls across the epoch's wrap at 2^32, fused and split.
+
+    The whole control area -- epoch, band flags, barrier slots -- is preset to
+    the state 0xFFFFFFFE calls leave behind, so the second call's ``epoch + 1``
+    wraps to 0. An unsigned ``cur < target`` wait passed at once there and
+    returned the previous call's rows (relL2 1.23).
+    """
+    from mori.ops.ag_gemm import AgGemmConfig
+    from mori.tensor_utils import from_gpu_ptr
+
+    m = 512
+    b, sb = weight(rank)
+    bs = preshuffle_b(b)
+    out = {}
+    for mode in ("fused", "split"):
+        with AgGemmOp(comm, n=N, k=K, m_max=m, mode=mode, chunks=2) as op:
+            cfg = AgGemmConfig(world_size=world, m_local=m, k=K, block_m=256)
+            ctrl = from_gpu_ptr(op.mem.ptr, (cfg.control_bytes // 4,), torch.int32)
+            ctrl.fill_(-2)  # 0xFFFFFFFE
+            torch.cuda.synchronize()
+            comm.barrier()
+            for i in range(4):
+                a, sa = tokens(rank, m, salt=60 + i)
+                got = op(a, bs, sa, sb)
+                out[f"{mode}_call{i}"] = worst(
+                    rel(got, reference(world, rank, m, 60 + i))
+                )
+    emit(rank, case="epoch_wrap", **out)
+
+
 def case_close(comm, rank):
     op = AgGemmOp(comm, n=N, k=K, m_max=512)
     op.close()
@@ -277,7 +322,9 @@ def main() -> int:
     rank, world, uid = _setup()
     vmm = 4 * AgGemmOp.window_bytes_for(world, k=K, m_max=M_MAX) + (256 << 20)
     with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
-        with AgGemmOp(comm, n=N, k=K, m_max=M_MAX) as op:
+        # Four bands pinned: at this small N the default would cut one, and
+        # the band waits are what most of these cases exist to exercise.
+        with AgGemmOp(comm, n=N, k=K, m_max=M_MAX, chunks=4) as op:
             case_self_test(op, rank, world)
             case_padded_rows(op, rank, world)
             case_alternating_m(op, rank, world)
@@ -286,6 +333,7 @@ def main() -> int:
             case_operand_checks(op, rank)
             case_split_matches_fused(comm, op, rank, world)
         case_ragged_n(comm, rank, world)
+        case_epoch_wrap(comm, rank, world)
         case_close(comm, rank)
     dist.barrier()
     return 0

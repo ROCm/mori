@@ -67,11 +67,17 @@ BLOCK_M = 256
 BLOCK_N = 256
 #: ptpc only: its A scale is one fp32 per row and travels with the row band.
 QUANTS = ("ptpc",)
-#: Default cap on row bands per peer. Measured on Kimi-K3's TP8 projections: 4
-#: wins from M=1024 rows per rank up and 2 at 512, the most the tiles allow;
-#: one chunk barely beats the split path, because every remote tile then waits
-#: for a peer's whole slab. Above 4 was not measured.
+#: Default cap on row bands per peer. Above 4 was not measured.
 DEFAULT_CHUNKS = 4
+#: Smallest band the default cuts, in 256x256 output tiles (row tiles per band
+#: times column tiles). Fitted on Kimi-K3's TP8 projections at P=8 (README):
+#: the best count at all eight measured cells is the largest divisor up to 4
+#: whose band holds at least this many -- KDA (N=6400, 25 column tiles) takes
+#: one row tile per band, MLA (N=3840, 15) two, so c2 / c4 for KDA at 512 /
+#: 1024 rows per rank and c1 / c2 / c4 for MLA at 512 / 1024 / 2048. A
+#: 15-tile band lost (MLA c2 at 512 rows: +7.7% over c1, and behind split),
+#: a 25-tile one won; 20 sits between them.
+MIN_BAND_TILES = 20
 
 
 class _Plan(NamedTuple):
@@ -188,12 +194,25 @@ class AgGemmOp:
         return (m + BLOCK_M - 1) // BLOCK_M * BLOCK_M
 
     def chunks_for(self, m: int) -> int:
-        """Row bands each peer's rows are pushed in at this M (fused mode)."""
+        """Row bands each peer's rows are pushed in at this M (fused mode).
+
+        A divisor of the row tiles -- a band is a whole number of tiles, and a
+        remote tile waits on exactly one band. Pinned ``chunks``: the largest up
+        to it. Default: the largest up to ``DEFAULT_CHUNKS`` whose band still
+        holds ``MIN_BAND_TILES`` output tiles, since a thin band costs more in
+        per-band waits than the earlier start buys.
+        """
         tiles = m // BLOCK_M
-        cap = DEFAULT_CHUNKS if self.chunks is None else self.chunks
-        # The largest divisor of the row tiles up to the cap: a band is a whole
-        # number of tiles, and a remote tile waits on exactly one band.
-        return max(d for d in range(1, min(cap, tiles) + 1) if tiles % d == 0)
+        divisors = [d for d in range(1, tiles + 1) if tiles % d == 0]
+        if self.chunks is not None:
+            return max(d for d in divisors if d <= self.chunks)
+        n_tiles = -(-self.n // BLOCK_N)
+        fit = [
+            d
+            for d in divisors
+            if d <= DEFAULT_CHUNKS and (tiles // d) * n_tiles >= MIN_BAND_TILES
+        ]
+        return max(fit, default=1)
 
     def _check_m(self, m: int) -> None:
         if m % BLOCK_M:
@@ -403,15 +422,25 @@ class AgGemmOp:
         for p in ("push", "barrier0", "barrier1"):
             phases[p](self.dev_comm.ptr, self.win.handle, stream=stream)
         torch.cuda.current_stream().synchronize()
-        for src in range(self.world_size):
-            if src != self.rank and not bool((slots[src] == src + 1).all()):
-                raise RuntimeError(
-                    f"ag_gemm self-test failed: the slot from rank {src} holds "
-                    f"{int(slots[src].flatten()[0])}, expected {src + 1}. Check "
-                    f"that mori was built with BUILD_CCO_SDMA=ON and that "
-                    f"MORI_ENABLE_SDMA=1 is set: without either, every put "
-                    f"silently does nothing."
-                )
+        bad = [
+            (src, int(slots[src].flatten()[0]))
+            for src in range(self.world_size)
+            if src != self.rank and not bool((slots[src] == src + 1).all())
+        ]
+        # Every rank reads its slots before any returns: a rank that returned
+        # first could start its next call, whose poster refills the slots a
+        # slower rank is still checking -- a false failure on a healthy box.
+        # The barrier comes before raising so the ranks that pass are not left
+        # waiting in it for one that failed.
+        self.comm.barrier()
+        if bad:
+            src, got = bad[0]
+            raise RuntimeError(
+                f"ag_gemm self-test failed: the slot from rank {src} holds "
+                f"{got}, expected {src + 1}. Check that mori was built with "
+                f"BUILD_CCO_SDMA=ON and that MORI_ENABLE_SDMA=1 is set: "
+                f"without either, every put silently does nothing."
+            )
 
     def _check_open(self) -> None:
         if self.mem is None:
