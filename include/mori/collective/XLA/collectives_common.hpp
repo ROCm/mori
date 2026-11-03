@@ -439,6 +439,7 @@ inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceH
 // slice 0, in the same reservation and first doorbell, so the engine -- not the GPU --
 // holds the copies back until the peer has entered the launch. The compare is
 // equality on one dword, so the gate value must not be overtaken while polled.
+// With AlwaysGated every active peer has a gate, so it is not null-checked.
 //
 // The caller describes each peer's copy with peerOf(peer) -> ScatterPeer
 // (warp-uniform at peer granularity). dst and sigBase are peer addresses,
@@ -453,7 +454,7 @@ struct ScatterPeer {
   uint32_t gateValue = 0;          // released when *gate == gateValue
 };
 
-template <uint64_t ElemBytes = 1, class PeerFn>
+template <uint64_t ElemBytes = 1, bool AlwaysGated = false, class PeerFn>
 __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int npes, int logS,
                                                  uint64_t value, PeerFn peerOf) {
 
@@ -476,36 +477,35 @@ __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int n
             sliceBytes = sliceLen * ElemBytes,
             lastBytes = (chunkElems - (sliceLen << logS) + sliceLen) * ElemBytes;
 
+    // One reservation for [POLL][slice 0 .. S-1]; a gated peer's segment starts
+    // with its 64B POLL, so slice s sits at pollBytes + s*64.
+    const uint32_t pollBytes =
+        (AlwaysGated || p.gate != nullptr) ? kSDMACopySignalPkt : 0;
+    const uint64_t headBytes = pollBytes + kSDMACopySignalPkt,
+                   totalBytes = pollBytes + S * kSDMACopySignalPkt;
+
     SdmaCollectiveHandle handle;
     SdmaCollectiveHandle* shared = nullptr;
     uint32_t* queueBuf = nullptr;
-    uint64_t hint0 = 0;
+    uint64_t hint0 = 0, pktBase = 0;
     if (active && sub == 0) {
       shared = GetSharedHandle(sdma.deviceHandles + peer/* *sdma.sdmaNumQueue*/);
       handle = *cco::impl::global(shared);
       hint0 = handle.cachedHwReadIndex;
       queueBuf = handle.queueBuf;
-    }
-    queueBuf = BroadcastQuad(queueBuf);
-
-    // One reservation for [POLL][slice 0 .. S-1]; slice s sits at slot gated+s.
-    const uint64_t gated = (active && p.gate != nullptr) ? 1 : 0;
-    const uint64_t totalBytes = (gated + S) * kSDMACopySignalPkt,
-                   headBytes = (gated + 1) * kSDMACopySignalPkt;
-    uint64_t pktBase = 0;
-    if (active && sub == 0) {
       pktBase = handle.ReserveSingleProducer(totalBytes);
     }
+    queueBuf = BroadcastQuad(queueBuf);
     pktBase = BroadcastQuad(pktBase);
 
     // Doorbell 1: the POLL and slice 0 alone, so the engine fetches them (and
     // parks on the poll) while the remaining slices are still being written.
     if (active) {
-      if (gated) {
+      if (pollBytes) {
         WritePollPacket(sub, p.gate, p.gateValue,
             queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
       }
-      const uint64_t pos = pktBase + gated * kSDMACopySignalPkt;
+      const uint64_t pos = pktBase + pollBytes;
       const size_t sz = S == 1 ? lastBytes : sliceBytes;
       WriteFusedPacket(sub, p.src, p.dst, sz, p.sigBase, value,
         queueBuf + SdmaCollectiveHandle::WrapIntoRing(pos) / sizeof(uint32_t));
@@ -523,7 +523,7 @@ __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int n
         const auto *psrc = p.src + sliceBytes;
         auto *pdst = p.dst + sliceBytes;
         for (int s = 1; s < S; s++, psrc += sliceBytes, pdst += sliceBytes) {
-          const uint64_t pos = pktBase + (gated + s) * kSDMACopySignalPkt;
+          const uint64_t pos = pktBase + pollBytes + s * kSDMACopySignalPkt;
           const size_t sz = (s == S - 1) ? lastBytes : sliceBytes;
           WriteFusedPacket(sub, psrc, pdst, sz, p.sigBase + s, value,
             queueBuf + SdmaCollectiveHandle::WrapIntoRing(pos) / sizeof(uint32_t));
@@ -572,23 +572,20 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
     const int peer = i >> 2, sub = i & 3;
     const bool active = peer != myPe;
 
+    const uint64_t bytes = nSlots * kSDMACopySignalPkt;
+
     SdmaCollectiveHandle handle;
     SdmaCollectiveHandle* shared = nullptr;
     uint32_t* queueBuf = nullptr;
-    uint64_t hint0 = 0;
+    uint64_t hint0 = 0, pktBase = 0;
     if (active && sub == 0) {
       shared = GetSharedHandle(sdma.deviceHandles + peer/* *sdma.sdmaNumQueue*/);
       handle = *cco::impl::global(shared);
       hint0 = handle.cachedHwReadIndex;
       queueBuf = handle.queueBuf;
-    }
-    queueBuf = BroadcastQuad(queueBuf);
-
-    const uint64_t bytes = nSlots * kSDMACopySignalPkt;
-    uint64_t pktBase = 0;
-    if (active && sub == 0) {
       pktBase = handle.ReserveSingleProducer(bytes);
     }
+    queueBuf = BroadcastQuad(queueBuf);
     pktBase = BroadcastQuad(pktBase);
 
     if (active) writeFn(peer, sub, queueBuf, pktBase);
