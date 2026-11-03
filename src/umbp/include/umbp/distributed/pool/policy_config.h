@@ -63,11 +63,14 @@ struct PolicyBackendSpec {
   std::string path;
   // SSD only, optional: staging arena in pages; 0 = the preset (SsdStagingPages).
   int staging_slots = 0;
+  // SSD only, optional: smaller objects land here only if no other tier member takes them.
+  uint64_t min_object_bytes = 0;
 };
 
 struct LogicalTierBackendConfig {
   std::string backend_name;
   uint32_t weight = 0;
+  uint64_t min_object_bytes = 0;
 };
 
 struct LogicalTierConfig {
