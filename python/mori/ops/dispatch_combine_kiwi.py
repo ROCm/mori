@@ -19,7 +19,19 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""KIWI EP dispatch/combine with the same Python interface as EpDispatchCombineOp.
+"""Experimental KIWI EP dispatch/combine.
+
+This module is experimental and will be removed once KIWI is available as a
+kernel type of ``EpDispatchCombineOp``. It follows the ``EpDispatchCombineOp``
+calling convention but is not a drop-in replacement:
+
+- The dispatch and combine dtypes are fixed when the op is constructed;
+  ``combine()`` rejects input of any other dtype.
+- ``block_num``, ``rdma_block_num``, ``warp_per_block`` and
+  ``use_external_inp_buf`` are accepted for compatibility and ignored. KIWI
+  chooses its launch shape from the token count, or from ``num_blocks``.
+- ``combine()`` routes with the routing recorded by the preceding
+  ``dispatch()``. Its ``indices`` argument is only shape-checked.
 
 The kernels push RDMA work to CPU proxy threads through KIWI invoke queues; the
 proxies post it with ibverbs. Setup runs over a torch.distributed process
@@ -172,7 +184,9 @@ def _current_stream():
 
 
 class EpDispatchCombineKiwiOp:
-    """KIWI EP operator with the EpDispatchCombineOp calling convention.
+    """Experimental KIWI EP operator with the EpDispatchCombineOp calling convention.
+
+    See the module docstring for how it differs from ``EpDispatchCombineOp``.
 
     Args:
         config: ``EpDispatchCombineConfig`` or ``EpDispatchCombineKiwiConfig``.
@@ -435,8 +449,10 @@ class EpDispatchCombineKiwiOp:
 
         ``input`` holds the expert outputs in dispatch-output row order and
         ``indices`` is this rank's own [num_token, topk] routing passed to
-        ``dispatch()``. Returns ``(out, out_weights)``; ``out_weights`` is None
-        when ``weights`` is None.
+        ``dispatch()``. ``indices`` is only shape-checked: combine uses the
+        routing recorded by the preceding ``dispatch()``, so the two must match.
+        Returns ``(out, out_weights)``; ``out_weights`` is None when ``weights``
+        is None.
         """
         if routing is not None:
             raise NotImplementedError(
