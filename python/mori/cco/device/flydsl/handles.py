@@ -363,7 +363,7 @@ class Gda:
 
     def wait(self, request, *, coop=CoopScope.THREAD):
         """Poll the CQ until the request :meth:`flush_async` returned has
-        completed. THREAD: each lane waits on its own request."""
+        completed. THREAD: each lane passes its own request."""
         raw.WAIT[_COOP_TAG[_const(coop, "coop")]](self.dev_comm, self.ctx, request)
 
 

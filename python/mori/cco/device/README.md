@@ -72,10 +72,14 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   a `GdaFlags` word: `team` (`Team.WORLD`, or `Team.GDA` for a peer numbered in
   the GDA team, i.e. the node index on a RAIL connection) and, on put /
   put_value / get, `defer_doorbell` (post without ringing; the next
-  non-deferred post, signal, flush or flush_async on the QP rings for it).
+  non-deferred post, signal, flush or flush_async on the QP rings for it;
+  worth it when one warp posts many WQEs to a QP and releases them once).
   `flush_async` returns a request for `wait`, so work can go between them;
   call `wait` with the same coop (with `BLOCK` only thread 0 holds the request).
-  Per-call `ctx=` picks the QP context; with coop `THREAD` it may differ per lane.
+  Per-call `ctx=` picks the QP context. It may differ per lane only with coop
+  `THREAD` on signal, flush_async, wait, and put / put_value / get in
+  `ThreadMode.INDEPENDENT`; `AGGREGATE`, `flush` and `flush_peer` need one
+  `ctx` (and peer) across the warp.
   See examples 03/06.
 - **SDMA** (intra-node copy engine): `sdma.put / get` (window + offset) and
   `put_ptr / get_ptr` (resolved addresses) mirror `ccoSdma`'s, with its template

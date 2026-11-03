@@ -139,8 +139,11 @@ def _jit_compile(cov: int) -> str | None:
                 # Waiters take bc_path as soon as it exists, and opt creates its
                 # output before writing it: build aside, then rename into place.
                 tmp_bc = cache_dir / f".{_BC_FILENAME}.{os.getpid()}.tmp"
-                _strip_lifetime_intrinsics(cfg, raw, tmp_bc)
-                os.replace(tmp_bc, bc_path)
+                try:
+                    _strip_lifetime_intrinsics(cfg, raw, tmp_bc)
+                    os.replace(tmp_bc, bc_path)
+                finally:
+                    tmp_bc.unlink(missing_ok=True)
         return str(bc_path)
     except Exception:
         return None

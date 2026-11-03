@@ -715,7 +715,7 @@ def _gda_wait(
     coop: tl.constexpr = _COOP_THREAD,
 ):
     """Poll the CQ until a ``flush_async`` request has completed. THREAD: each
-    lane waits on its own request."""
+    lane passes its own request."""
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
         "GDA coop must be CoopScope.THREAD, WARP, or BLOCK",

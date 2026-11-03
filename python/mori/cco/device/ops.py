@@ -55,7 +55,8 @@ class ThreadMode:
 
     ``INDEPENDENT`` makes each participating thread issue its own transfer.
     ``AGGREGATE`` coalesces the warp's lanes into one transfer and is valid only
-    with ``CoopScope.THREAD``; every lane in the warp must enter the operation.
+    with ``CoopScope.THREAD``; every lane in the warp must enter the operation,
+    with the same peer and ctx.
     """
 
     INDEPENDENT = 0
