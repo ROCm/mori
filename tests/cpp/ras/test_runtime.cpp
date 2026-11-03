@@ -230,6 +230,21 @@ TEST(RasRuntime, TheRasThreadRunsAtLowPriorityWhereItIsPinned) {
             0);
 }
 
+TEST(RasRuntime, LabelsAreValidatedAndJoinTheIdentity) {
+  EXPECT_EQ(RunInChild([] {
+              setenv("MORI_RAS_ENABLE", "1", 1);
+              RasRuntime* r = RasRuntime::EnsureStarted(Params());
+              CHILD_CHECK(r != nullptr);
+              CHILD_CHECK(r->SetLabels({{"role", "decode"}, {"instance", "2"}}));
+              CHILD_CHECK(WaitFor([&] { return r->Snapshot().self.labels.size() == 2; }, 2000));
+              CHILD_CHECK(r->Snapshot().self.labels.at("role") == "decode");
+              CHILD_CHECK(!r->SetLabels({{"", "empty key"}}));
+              CHILD_CHECK(r->Snapshot().self.labels.size() == 2);
+              return 0;
+            }),
+            0);
+}
+
 TEST(RasRuntime, EngineEventsReachTheRasThread) {
   RasCore core(LocalCore());
   ASSERT_TRUE(core.Start(nullptr));

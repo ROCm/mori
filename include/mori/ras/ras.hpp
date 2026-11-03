@@ -98,6 +98,8 @@ class RasRuntime {
   bool Enqueue(RasEvent ev);
   // The RAS thread's latest published view, at most about 50 ms old.
   RuntimeSnapshot Snapshot() const;
+  // Process labels for later HELLOs. False, and nothing changes, if peers would reject them.
+  bool SetLabels(const Labels& labels);
 };
 
 #else  // RAS built out
@@ -110,6 +112,7 @@ class RasRuntime {
   RasEndpoint Endpoint() const { return RasEndpoint{}; }
   bool Enqueue(RasEvent) { return false; }
   RuntimeSnapshot Snapshot() const { return RuntimeSnapshot{}; }
+  bool SetLabels(const Labels&) { return false; }
 };
 
 #endif

@@ -40,6 +40,7 @@ int main() {
   // How subsystems call it: everything behind the null check.
   if (RasRuntime* r = RasRuntime::Get()) {
     r->Enqueue(EngineRegistered{});
+    r->SetLabels(Labels{{"role", "x"}});
     (void)r->Endpoint();
     (void)r->Snapshot();
     return 4;

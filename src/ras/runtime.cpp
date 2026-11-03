@@ -234,8 +234,16 @@ void RasCore::ThreadMain() {
   }
   pthread_setname_np(pthread_self(), "mori-ras");
 
-  links_->SetIdentity(CollectIdentity(params_.nodeId, params_.hostname, params_.host, params_.pid,
-                                      uuid_, params_.identity));
+  RasProcessId self = CollectIdentity(params_.nodeId, params_.hostname, params_.host, params_.pid,
+                                      uuid_, params_.identity);
+  const Topology& topo = self.topology;
+  RAS_LOG_INFO("RAS identity: {} RDMA port(s), rack '{}', leaf '{}', sources '{}'",
+               topo.nics.size(), topo.rack, topo.leaf, topo.source);
+  for (const NicAttachment& n : topo.nics) {
+    RAS_LOG_INFO("RAS RDMA port {}:{} ({} {}): rail '{}', switch '{}' port '{}'", n.device, n.port,
+                 n.netdev, n.address, n.rail, n.switchName, n.switchPort);
+  }
+  links_->SetIdentity(self);
   while (!links_->StopRequested()) links_->RunOnce(1000);
   links_->Shutdown(sendLeave_.load(std::memory_order_acquire));
   {
@@ -281,6 +289,10 @@ RasEndpoint RasCore::Endpoint() const {
 
 RuntimeSnapshot RasCore::Snapshot() const {
   return links_ ? links_->Snapshot() : RuntimeSnapshot{};
+}
+
+bool RasCore::SetLabels(const Labels& labels) {
+  return running_.load(std::memory_order_acquire) && links_->SetLabels(labels);
 }
 
 void RasCore::AddDegraded(uint32_t reasons) {
@@ -362,6 +374,11 @@ bool RasRuntime::Enqueue(RasEvent ev) {
 RuntimeSnapshot RasRuntime::Snapshot() const {
   RasCore* core = g_core.load(std::memory_order_acquire);
   return core != nullptr ? core->Snapshot() : RuntimeSnapshot{};
+}
+
+bool RasRuntime::SetLabels(const Labels& labels) {
+  RasCore* core = g_core.load(std::memory_order_acquire);
+  return core != nullptr && core->SetLabels(labels);
 }
 
 }  // namespace ras

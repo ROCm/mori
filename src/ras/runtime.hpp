@@ -70,6 +70,7 @@ class RasCore {
   bool Enqueue(RasEvent&& ev);
   RasEndpoint Endpoint() const;
   RuntimeSnapshot Snapshot() const;
+  bool SetLabels(const Labels& labels);
   void AddDegraded(uint32_t reasons);
 
   // In a forked child: the thread is gone and the fd registry has closed the fds, so the core

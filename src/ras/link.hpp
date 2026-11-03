@@ -102,6 +102,7 @@ class LinkManager {
   void RequestStop();
   bool StopRequested() const { return stop_.load(std::memory_order_acquire); }
   RuntimeSnapshot Snapshot() const;
+  bool SetLabels(const Labels& labels);
   void AddDegraded(uint32_t reasons);
   uint32_t Degraded() const { return degraded_.load(std::memory_order_acquire); }
   // In a forked child, whose copies of these fds the fork handler already closed.
@@ -240,6 +241,9 @@ class LinkManager {
 
   std::atomic<bool> stop_{false};
   std::atomic<uint32_t> degraded_{0};
+  mutable std::mutex labelsMu_;
+  Labels labels_;
+  std::atomic<bool> labelsChanged_{false};
   mutable std::mutex snapshotMu_;
   std::shared_ptr<const RuntimeSnapshot> published_;
 };
