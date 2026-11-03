@@ -148,13 +148,14 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 // each iteration (see all_reduce_kernels.hpp).
 //
 // Phase 1: block 0, four consecutive lanes per peer (nWork = npes*4). sub==0
-// snapshots that peer's queue handle, then for each slice s reserves 64B, the
-// four lanes write the fused copy+signal (slice 0 prefixed by the POLL_REGMEM
-// entry gate on that peer's arrival), and sub==0 rings that packet. One
-// leader per queue (peers map to distinct queues) so the commit chain cannot
-// deadlock; occupancy (rptr) is still checked, with cachedHwReadIndex kept local
-// across s and written back once if it moved. Wrap/NOP pad is gone: packets are
-// 64B and the ring is a 64B multiple.
+// snapshots that peer's queue handle and reserves all of its packets at once:
+// the POLL_REGMEM entry gate on that peer's arrival, then one fused copy+signal
+// per slice, each written by the four lanes. sub==0 rings the gate + slice 0
+// first, so the engine starts as early as possible, then slices 1..S-1 with a
+// second doorbell. One leader per queue (peers map to distinct queues) so the
+// commit chain cannot deadlock; occupancy (rptr) is still checked, with
+// cachedHwReadIndex kept local and written back once if it moved. Wrap/NOP pad
+// is gone: packets are 64B and the ring is a 64B multiple.
 //
 // input/staging/output MUST live in the symmetric static heap (ShmemMalloc) so
 // the address-based SDMA put can translate local->peer (offset from heapBaseAddr);

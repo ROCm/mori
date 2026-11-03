@@ -416,12 +416,15 @@ inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceH
 // Fused SDMA "push" scatter shared by the push collectives (reduce-scatter and
 // all-gather). Four consecutive lanes write one fused 64B copy+signal via
 // WriteFusedPacket (one b128 store each). nWork = npes*4; a peer never straddles
-// a warp (warpSize % 4 == 0). sub==0 snapshots the queue handle once, then for
-// each slice s: reserves 64B, the four lanes write, sub==0 rings that packet.
-// Same-lane sequential doorbells; distinct peers are distinct queues, so several
-// sub==0 lanes in one warp do not share a commit chain. No LDS / syncthreads.
-// Occupancy (rptr) stays; the local cachedHwReadIndex is reused across s and
-// written back once if it moved.
+// a warp (warpSize % 4 == 0). sub==0 snapshots the queue handle once and
+// reserves every packet of the peer at once ([POLL] + S slices, 64B each), then
+// rings two doorbells: the first covers [POLL] + slice 0 so the engine starts as
+// early as possible, the second slices 1..S-1 (none at S==1). Every packet is
+// 64B and the ring a 64B multiple, so the reservation may span the ring end but
+// no packet straddles it: each packet wraps its own offset. Same-lane sequential
+// doorbells; distinct peers are distinct queues, so several sub==0 lanes in one
+// warp do not share a commit chain. No LDS / syncthreads. Occupancy (rptr)
+// stays; the local cachedHwReadIndex is written back once if it moved.
 //
 // Each shard is split into S = 1<<logS slices. Slice s is an SDMA copy from
 // p.src + s*sliceBytes to p.dst + s*sliceBytes, followed by an atomic swap
@@ -433,7 +436,7 @@ inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceH
 // (WaitDelivered).
 //
 // A peer with a non-null `gate` gets a POLL_REGMEM (*gate == gateValue) ahead of
-// slice 0, in the same reservation and doorbell, so the engine -- not the GPU --
+// slice 0, in the same reservation and first doorbell, so the engine -- not the GPU --
 // holds the copies back until the peer has entered the launch. The compare is
 // equality on one dword, so the gate value must not be overtaken while polled.
 //
@@ -502,36 +505,49 @@ __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int n
     }
     queueBuf = BroadcastQuad(queueBuf);
 
-    for (int s = 0; s < S; s++) {
-      const bool gated = active && s == 0 && p.gate != nullptr;
-      const uint64_t bytes = gated ? 2 * kSDMACopySignalPkt : kSDMACopySignalPkt;
-      uint64_t pktBase = 0;
-      if (active && sub == 0) {
-        pktBase = handle.ReserveSingleProducer(bytes);
-      }
-      pktBase = BroadcastQuad(pktBase);
+    // One reservation for [POLL][slice 0 .. S-1]; slice s sits at slot gated+s.
+    const uint64_t gated = (active && p.gate != nullptr) ? 1 : 0;
+    const uint64_t totalBytes = (gated + S) * kSDMACopySignalPkt,
+                   headBytes = (gated + 1) * kSDMACopySignalPkt;
+    uint64_t pktBase = 0;
+    if (active && sub == 0) {
+      pktBase = handle.ReserveSingleProducer(totalBytes);
+    }
+    pktBase = BroadcastQuad(pktBase);
 
+    auto writeSlice = [&](int s) {
+      const uint64_t pos = pktBase + (gated + s) * kSDMACopySignalPkt;
+      const size_t sz = (s == S - 1) ? lastBytes : sliceBytes;
+      WriteFusedPacket(sub, p.src + s * sliceBytes, p.dst + s * sliceBytes, sz,
+                       p.sigBase + s, value,
+                       queueBuf + SdmaCollectiveHandle::WrapIntoRing(pos) / sizeof(uint32_t));
+    };
+
+    // Doorbell 1: the POLL and slice 0 alone, so the engine fetches them (and
+    // parks on the poll) while the remaining slices are still being written.
+    if (active) {
+      if (gated) {
+        WritePollPacket(sub, p.gate, p.gateValue,
+            queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
+      }
+      writeSlice(0);
+    }
+    cco::ccoSdmaPublishStores();
+    __builtin_amdgcn_wave_barrier();
+    if (active && sub == 0) {
+      handle.submitPacket(pktBase, pktBase + headBytes);
+    }
+
+    // Doorbell 2: slices 1..S-1. It starts where doorbell 1 ended and this lane
+    // is the queue's only producer, so the commit chain is already ours.
+    if (S > 1) {
       if (active) {
-        uint64_t pos = pktBase;
-        if (gated) {
-          WritePollPacket(sub, p.gate, p.gateValue,
-              queueBuf + SdmaCollectiveHandle::WrapIntoRing(pos) / sizeof(uint32_t));
-          pos += kSDMACopySignalPkt;
-        }
-        auto* srcp = p.src + s * sliceBytes;
-        auto* dstp = p.dst + s * sliceBytes;
-        const size_t sz = (s == S - 1) ? lastBytes : sliceBytes;
-        const uint64_t* sig = p.sigBase + s;
-        const uint64_t ringDw =
-            SdmaCollectiveHandle::WrapIntoRing(pos) / sizeof(uint32_t);
-        WriteFusedPacket(sub, srcp, dstp, sz, sig, value, queueBuf + ringDw);
+        for (int s = 1; s < S; s++) writeSlice(s);
       }
-
       cco::ccoSdmaPublishStores();
       __builtin_amdgcn_wave_barrier();
-
       if (active && sub == 0) {
-        handle.submitPacket(pktBase, pktBase + bytes);
+        handle.submitPacket(pktBase + headBytes, pktBase + totalBytes);
       }
     }
 
