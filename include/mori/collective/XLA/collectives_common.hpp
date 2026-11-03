@@ -52,6 +52,14 @@ static_assert(cco::CCO_SDMA_QUEUE_SIZE % kSDMACopySignalPkt == 0,
 static constexpr int kCCLMaxPeers = 16;
 static constexpr int kPushMaxSlices = 8;
 
+// Phases a push-collective launch runs: kAsyncStart issues the SDMA copies and
+// returns, kAsyncDone waits for them and advances the generation; kSync is both.
+enum PhaseFlags : int {
+  kAsyncStart = 1,
+  kAsyncDone = 2,
+  kSync = kAsyncStart | kAsyncDone,
+};
+
 // Completion slots: a symmetric-heap uint64 arrived[kCCLMaxPeers][kArrivedStride]
 // per communicator range (see kCommCtlWords; zeroed once, never reset). Row p of
 // my copy is written only by PE p's SDMA: each

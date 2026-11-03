@@ -323,7 +323,16 @@ hipError_t CollectivesFacade::RunAllReduce(const void* input, void* output, size
 }
 
 hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size_t chunkBytes,
-                                           hipStream_t stream) {
+                                           hipStream_t stream, bool isAsync) {
+  constexpr int kThreads = 64;
+  if (isAsync) {
+    // Start only: issue the SDMA scatter and exit; AsyncDone waits for it.
+    AllGatherPushKernel<kAsyncStart><<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output,
+                                     chunkBytes, devComm_, state_.heapWin, barrierCtr_, arrived_);
+    hipError_t err = hipGetLastError();
+    if (err == hipSuccess) pending_ = {AsyncOp::kAllGather};
+    return err;
+  }
   const size_t totalBytes = chunkBytes * nPes_;
   // Pull needs every peer slot (output + peer*chunkBytes) 16B-aligned, i.e.
   // chunkBytes and both bases 16B-aligned; otherwise fall through to push.
@@ -344,15 +353,39 @@ hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size
       return hipGetLastError();
     });
   }
-  constexpr int kThreads = 64;
   // Single block: SDMA pushes my shard to every peer's output[myPe] slot (+ self).
-  AllGatherPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output, chunkBytes,
+  AllGatherPushKernel<kSync><<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output, chunkBytes,
                                      devComm_, state_.heapWin, barrierCtr_, arrived_);
   return hipGetLastError();
 }
 
+hipError_t CollectivesFacade::AsyncDone(hipStream_t stream) {
+  const PendingAsync p = pending_;
+  pending_ = {};
+  constexpr int kThreads = 64;
+  // The done phase never reads the buffer / size arguments.
+  switch (p.op) {
+    case AsyncOp::kNone:
+      return hipSuccess;
+    case AsyncOp::kAllGather:
+      AllGatherPushKernel<kAsyncDone><<<1, kThreads, 0, stream>>>(myPe_, nPes_, nullptr,
+                       nullptr, 0, devComm_, state_.heapWin, barrierCtr_, arrived_);
+      break;
+    case AsyncOp::kAllToAll:
+      AllToAllPushKernel<kAsyncDone><<<1, kThreads, 0, stream>>>(myPe_, nPes_, nullptr, 0,
+                       devComm_, state_.heapWin, barrierCtr_, arrived_);
+      break;
+    case AsyncOp::kPermute:
+      CollectivePermutePushKernel<kAsyncDone><<<1, kThreads, 0, stream>>>(
+                       p.npes, p.dstPe, p.srcPe, nullptr, nullptr, 0, state_.devComm,
+                       state_.heapWin, state_.permuteCtr, state_.permuteNum);
+      break;
+  }
+  return hipGetLastError();
+}
+
 hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chunkBytes,
-                                          hipStream_t stream) {
+                                          hipStream_t stream, bool isAsync) {
   assert(static_cast<int>(addrs.size()) == nPes_ && "addrs size must equal npes");
   // Fill the preallocated pinned (host-visible, device-readable) AddressPair
   // buffer with a plain host write, then launch -- no per-call device copy.
@@ -365,6 +398,16 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
   for (int p = 0; p < nPes_; ++p) {
     bits |= reinterpret_cast<uintptr_t>(addrs[p].first) |
             reinterpret_cast<uintptr_t>(addrs[p].second);
+  }
+  constexpr int kThreads = 64;
+  if (isAsync) {
+    // Start only: issue the SDMA scatter and exit; AsyncDone waits for it.
+    AllToAllPushKernel<kAsyncStart><<<1, kThreads, 0, stream>>>(myPe_, nPes_,
+                      state_.pinnedPairs, chunkBytes, devComm_,
+                      state_.heapWin, barrierCtr_, arrived_);
+    hipError_t err = hipGetLastError();
+    if (err == hipSuccess) pending_ = {AsyncOp::kAllToAll};
+    return err;
   }
   // Pull needs every send/recv slot 16B-aligned; otherwise fall through to push.
   if (resolveCopyMode(totalBytes, kAutoPullMaxBytesA2a) == RsMode::kPull &&
@@ -382,9 +425,8 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
       return hipGetLastError();
     });
   }
-  constexpr int kThreads = 64;
   // Single block: SDMA pushes each send slot p to peer p's recv slot (+ self).
-  AllToAllPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, 
+  AllToAllPushKernel<kSync><<<1, kThreads, 0, stream>>>(myPe_, nPes_, 
                     state_.pinnedPairs, chunkBytes, devComm_,
                     state_.heapWin, barrierCtr_, arrived_);
   return hipGetLastError();
@@ -410,7 +452,7 @@ hipError_t CollectivesFacade::RunRecv(void* /*recvBuf*/, size_t /*numBytes*/,
 hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* recvBuf,
                                                    size_t numBytes, int srcPe,
                                                    const std::vector<int>& dstPes,
-                                                   hipStream_t stream) {
+                                                   hipStream_t stream, bool isAsync) {
   if (dstPes.size() > 1) {
     FACADE_PRINTF("CollectivePermute: unsupported dstPes.size()=%zu", dstPes.size());
     return hipErrorNotSupported;
@@ -430,6 +472,17 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
   if (dstPe >= 0) dstPe += peBase_;
   if (srcPe >= 0) srcPe += peBase_;
   const int npes = peBase_ + nPes_;
+  constexpr int kThreads = 64;
+  if (isAsync) {
+    // Start only: issue the SDMA copy and exit; AsyncDone waits for it.
+    CollectivePermutePushKernel<kAsyncStart><<<1, kThreads, 0, stream>>>(
+                npes, dstPe, srcPe, sendBuf, recvBuf,
+                numBytes, state_.devComm, state_.heapWin, state_.permuteCtr,
+                state_.permuteNum);
+    hipError_t err = hipGetLastError();
+    if (err == hipSuccess) pending_ = {AsyncOp::kPermute, npes, dstPe, srcPe};
+    return err;
+  }
   // Pull needs the buffer bases 16B-aligned; the kernel's byte tail covers a
   // non-16B numBytes, so the size is not part of the gate. Else fall to push.
   const uintptr_t bits =
@@ -446,8 +499,7 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
         state_.permuteNum, state_.groupCtr);
     return hipGetLastError();
   }
-  constexpr int kThreads = 64;
-  CollectivePermutePushKernel<<<1, kThreads, 0, stream>>>(
+  CollectivePermutePushKernel<kSync><<<1, kThreads, 0, stream>>>(
                 npes, dstPe, srcPe, sendBuf, recvBuf,
                 numBytes, state_.devComm, state_.heapWin, state_.permuteCtr,
                 state_.permuteNum);
@@ -480,10 +532,11 @@ hipError_t CollectivesFacade::RunAllReduce(const void*, void*, size_t, DataType,
                                            hipStream_t) {
   return hipErrorNotSupported;
 }
-hipError_t CollectivesFacade::RunAllGather(const void*, void*, size_t, hipStream_t) {
+hipError_t CollectivesFacade::RunAllGather(const void*, void*, size_t, hipStream_t, bool) {
   return hipErrorNotSupported;
 }
-hipError_t CollectivesFacade::RunAllToAll(const AddressVector&, size_t, hipStream_t) {
+hipError_t CollectivesFacade::AsyncDone(hipStream_t) { return hipErrorNotSupported; }
+hipError_t CollectivesFacade::RunAllToAll(const AddressVector&, size_t, hipStream_t, bool) {
   return hipErrorNotSupported;
 }
 hipError_t CollectivesFacade::RunBarrier(hipStream_t) { return hipErrorNotSupported; }
@@ -494,7 +547,7 @@ hipError_t CollectivesFacade::RunRecv(void*, size_t, int, hipStream_t) {
   return hipErrorNotSupported;
 }
 hipError_t CollectivesFacade::RunCollectivePermute(const void*, void*, size_t, int,
-                                                   const std::vector<int>&, hipStream_t) {
+                                                   const std::vector<int>&, hipStream_t, bool) {
   return hipErrorNotSupported;
 }
 hipError_t CollectivesFacade::RunQuiet(hipStream_t) { return hipErrorNotSupported; }
