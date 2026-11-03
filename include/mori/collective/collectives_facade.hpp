@@ -389,13 +389,25 @@ class CollectivesFacade {
   // irrelevant); `chunkBytes` is this PE's per-rank shard size in bytes (the
   // gathered output is npes*chunkBytes). SetReduceMode() selects push (SDMA, one
   // block) or pull (every PE reads the peers' shards over XGMI, multi-block).
-  hipError_t RunAllGather(const void* input, void* output, size_t chunkBytes, hipStream_t stream);
+  // isAsync always pushes and returns once the SDMA copies are issued: input
+  // must stay untouched and output unread until AsyncDone, and no other
+  // collective may run on this communicator in between.
+  hipError_t RunAllGather(const void* input, void* output, size_t chunkBytes, hipStream_t stream,
+                          bool isAsync = false);
+
+  // Completes the pending async collective (all-gather, all-to-all or
+  // collective-permute) on `stream`, waiting for its SDMA copies; a no-op if
+  // none is pending.
+  hipError_t AsyncDone(hipStream_t stream);
 
   // All-to-all: addrs[p] = {chunk sent to peer p, recv slot for sender p}, one
   // pair per peer (addrs.size() == npes). Pure byte movement, so chunkBytes is
   // the per-peer chunk byte count. Push needs the recv slots in the symmetric
   // heap at the same offset on every rank; pull needs the same of the send slots.
-  hipError_t RunAllToAll(const AddressVector& addrs, size_t chunkBytes, hipStream_t stream);
+  // isAsync: as for RunAllGather (send slots untouched, recv slots unread until
+  // AsyncDone).
+  hipError_t RunAllToAll(const AddressVector& addrs, size_t chunkBytes, hipStream_t stream,
+                         bool isAsync = false);
 
   // Device-wide barrier across all PEs on the given stream.
   hipError_t RunBarrier(hipStream_t stream);
@@ -409,9 +421,11 @@ class CollectivesFacade {
   // Collective-permute: send my buffer to each target PE, recv from srcPe
   // (srcPe < 0 means no source). v1: dstPes.size() <= 1. SetReduceMode() selects
   // push (SDMA) or pull (the receiver reads srcPe's sendBuf over XGMI).
+  // isAsync: as for RunAllGather (sendBuf untouched, recvBuf unread until
+  // AsyncDone).
   hipError_t RunCollectivePermute(const void* sendBuf, void* recvBuf, size_t numBytes,
                                   int srcPe, const std::vector<int>& dstPes,
-                                  hipStream_t stream);
+                                  hipStream_t stream, bool isAsync = false);
 
   // Drain outstanding operations on `stream`. Dummy no-op.
   hipError_t RunQuiet(hipStream_t stream);
@@ -539,6 +553,13 @@ private:
   cco::ccoDevComm devComm_;  // state_.devComm with the SDMA tables shifted by peBase_
   uint64_t* barrierCtr_;     // this range's control slot in state_.commCtl
   uint64_t* arrived_;        // barrierCtr_ + kCCLMaxPeers
+  // The async collective awaiting AsyncDone.
+  enum class AsyncOp { kNone, kAllGather, kAllToAll, kPermute };
+  struct PendingAsync {
+    AsyncOp op = AsyncOp::kNone;
+    int npes = 0, dstPe = -1, srcPe = -1;  // kPermute only: global PE ranks
+  };
+  PendingAsync pending_;
 };
 
 }  // namespace collective

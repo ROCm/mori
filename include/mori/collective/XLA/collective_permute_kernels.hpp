@@ -78,7 +78,16 @@ namespace collective {
 //
 // With dstPe == -1 no peer is active, so Phase 1 issues no packets.
 //
+// Flags = kSync runs every phase in one launch. Async splits them: a
+// kAsyncStart launch runs Phases 0-1 and exits with the SDMA copy in flight; a
+// later kAsyncDone launch with the same npes/dstPe/srcPe (sendBuf/recvBuf/
+// numBytes unused) reads back the counts the start took and runs Phase 2. In
+// between no other permute may run between the same PE pairs: that keeps the
+// equality poll on kReadyFlag valid. sendBuf must stay untouched and recvBuf
+// unread until the done launch completes.
+//
 // Launch <<<1, 64>>> with npes <= 8 (SDMA fast path).
+template <int Flags>
 __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
                                             const void* __restrict__ sendBuf,
                                             void* __restrict__ recvBuf, size_t numBytes,
@@ -106,17 +115,23 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   // dstPe posts k+1 for me only after my k-th copy lands, which needs the poll
   // to pass first.
   if (threadIdx.x == 0) {
-    if (srcPe >= 0) {
-      const uint64_t k = ++permuteNum[kCCLMaxPeers + srcPe];
-      recvK = k;
-      if (srcPe != myLsa) {
-        AtomicStore<ESystemScope>(
-            PeerPtr(permSlot(kReadyFlag, myLsa), srcPe, myLsa, stride4G),
-            k);
+    if constexpr (Flags & kAsyncStart) {
+      if (srcPe >= 0) {
+        const uint64_t k = ++permuteNum[kCCLMaxPeers + srcPe];
+        recvK = k;
+        if (srcPe != myLsa) {
+          AtomicStore<ESystemScope>(
+              PeerPtr(permSlot(kReadyFlag, myLsa), srcPe, myLsa, stride4G),
+              k);
+        }
       }
-    }
-    if (dstPe >= 0) {
-      sendK = ++permuteNum[dstPe];
+      if (dstPe >= 0) {
+        sendK = ++permuteNum[dstPe];
+      }
+    } else {
+      // kAsyncDone alone: the start already counted this permute, so just read it.
+      if (srcPe >= 0) recvK = permuteNum[kCCLMaxPeers + srcPe];
+      if (dstPe >= 0) sendK = permuteNum[dstPe];
     }
   }
   __syncthreads();
@@ -127,19 +142,22 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   // flat-VA rank delta (pe - lsaRank)*stride4G<<32 -- the same inline LSA
   // addressing the reduce-scatter/all-reduce push kernels use. winBase cancels
   // out, so this needs no ccoGetLocalPtr/ccoGetLsaPeerPtr round trip.
-  uint8_t* const localDst = reinterpret_cast<uint8_t*>(recvBuf);
-  StartSdmaScatter(
-      devComm.sdma, npes, /*logS=*/0, sendK,
-      [=](int peer) {
-        auto [dstP, sigP] = PeerPtrs(localDst, permSlot(kArrivedFlag, myLsa),
-                                     peer, myLsa, stride4G);
-        return ScatterPeer{
-            peer == dstPe, numBytes, reinterpret_cast<const uint8_t*>(sendBuf),
-            dstP, sigP,
-            sendsRemote ? reinterpret_cast<const uint32_t*>(permSlot(kReadyFlag, dstPe))
-                        : nullptr,
-            static_cast<uint32_t>(sendK)};
-      });
+  if constexpr (Flags & kAsyncStart) {
+    uint8_t* const localDst = reinterpret_cast<uint8_t*>(recvBuf);
+    StartSdmaScatter(
+        devComm.sdma, npes, /*logS=*/0, sendK,
+        [=](int peer) {
+          auto [dstP, sigP] = PeerPtrs(localDst, permSlot(kArrivedFlag, myLsa),
+                                       peer, myLsa, stride4G);
+          return ScatterPeer{
+              peer == dstPe, numBytes, reinterpret_cast<const uint8_t*>(sendBuf),
+              dstP, sigP,
+              sendsRemote ? reinterpret_cast<const uint32_t*>(permSlot(kReadyFlag, dstPe))
+                          : nullptr,
+              static_cast<uint32_t>(sendK)};
+        });
+  }
+  if constexpr ((Flags & kAsyncDone) == 0) return;
 
   if (srcPe >= 0) {
     if (threadIdx.x == 0) {
