@@ -620,6 +620,7 @@ def test_split_k_partials_and_changed_input_graph(bm, bn, splits, k):
         assert torch.equal(partials.cpu(), expected)
         assert torch.equal(partials.sum(dim=0).cpu(), ah @ bh.T)
 
+
 @pytest.mark.parametrize("mode", ["gemm-only", "split-rccl"])
 def test_the_benchmark_baselines_validate(mode):
     """The two baselines only the benchmark has -- the GEMM alone, and it
@@ -889,6 +890,7 @@ def test_model_detects_permissive_asymmetric_wait():
     errors = hazards(trace_pipeline(source, 256, 128, 4, "tuned"))
     assert any(e.startswith("RAW a") for e in errors), errors
 
+
 # --------------------------------------------------------------------------
 # SDMA phases: completion and credit order (no GPU)
 #
@@ -899,7 +901,9 @@ def test_model_detects_permissive_asymmetric_wait():
 # --------------------------------------------------------------------------
 
 
-SDMA_KERNEL = Path(__file__).resolve().parents[3] / "python/mori/ops/gemm_ag/kernels_sdma.py"
+SDMA_KERNEL = (
+    Path(__file__).resolve().parents[3] / "python/mori/ops/gemm_ag/kernels_sdma.py"
+)
 
 
 @lru_cache(maxsize=1)
@@ -990,6 +994,7 @@ def test_arrival_covers_all_submitted_queues_and_puts_wait_for_credit(
         )
         exec(drain_body(), env)  # noqa: S102 - execute trusted local kernel source
     assert published == set(range(world))
+
 
 # --------------------------------------------------------------------------
 # the benchmark's validation contract (no GPU)

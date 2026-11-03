@@ -144,7 +144,9 @@ class GemmAgOp:
         self._shape_slot: dict[int, int] = {}
         self._pad_in: torch.Tensor | None = None
 
-        why = shape_constraint(n, k, in_dtype=in_dtype, quant=quant, out_dtype=out_dtype)
+        why = shape_constraint(
+            n, k, in_dtype=in_dtype, quant=quant, out_dtype=out_dtype
+        )
         if why is not None:
             raise ValueError(f"unsupported configuration: {why}")
         if mode not in MODES:
@@ -351,7 +353,9 @@ class GemmAgOp:
             )
         else:
             # gemm-only's kernel with C pointed at this rank's slot.
-            gemm = compile_gemm_local(cfg, self.rank, K=self.k, quant=self.quant, **common)
+            gemm = compile_gemm_local(
+                cfg, self.rank, K=self.k, quant=self.quant, **common
+            )
         phases = build_sdma_phases(
             cfg, self.rank, queues=self.sdma_queues, war_credit=self.war_credit
         )
@@ -460,7 +464,9 @@ class GemmAgOp:
             if t.device.type != "cuda":
                 raise ValueError(f"{name} must be on a GPU, got {t.device}")
         if b_scale.numel() != sb_numel:
-            raise ValueError(f"b_scale must have {sb_numel} elements, got {b_scale.numel()}")
+            raise ValueError(
+                f"b_scale must have {sb_numel} elements, got {b_scale.numel()}"
+            )
         return (
             a.contiguous().view(torch.int8).view(-1),
             b.contiguous().view(torch.int8).view(-1),

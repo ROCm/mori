@@ -157,8 +157,14 @@ PRECISIONS = {
 def op_for(comm, prec_name, **kw):
     (in_dtype, quant), out_dtype = PRECISIONS[prec_name]
     return GemmAgOp(
-        comm, n=N, k=K, m_max=M, in_dtype=in_dtype, quant=quant,
-        out_dtype=out_dtype, **kw,
+        comm,
+        n=N,
+        k=K,
+        m_max=M,
+        in_dtype=in_dtype,
+        quant=quant,
+        out_dtype=out_dtype,
+        **kw,
     )
 
 
@@ -173,12 +179,18 @@ def case_self_test(comm, rank, world):
         # The teeth: the same check with the drain, which pushes nothing.
         cfg = op._cfg(op.m_max, slot=op._slot(op.m_max))
         phases = build_sdma_phases(cfg, rank, queues=op.sdma_queues)
-        recv = from_gpu_ptr(op.mem.ptr + cfg.recv_off, (world, op.m_max, N), torch.bfloat16)
+        recv = from_gpu_ptr(
+            op.mem.ptr + cfg.recv_off, (world, op.m_max, N), torch.bfloat16
+        )
         recv.zero_()
         recv[rank].fill_(float(rank + 1))
         torch.cuda.synchronize()
         comm.barrier()
-        phases["drain"](op.dev_comm.ptr, op.win.handle, stream=fx.Stream(torch.cuda.current_stream()))
+        phases["drain"](
+            op.dev_comm.ptr,
+            op.win.handle,
+            stream=fx.Stream(torch.cuda.current_stream()),
+        )
         torch.cuda.synchronize()
         missed = all(
             not bool((recv[s] == float(s + 1)).all()) for s in range(world) if s != rank
@@ -261,7 +273,9 @@ def _back_to_back(comm, rank, world, war_credit, mode="fused"):
             outs[i].copy_(c)
         torch.cuda.synchronize()
         comm.barrier()
-    return [worst(rel(outs[i], reference(world, M, prec, 40 + i))) for i in range(calls)]
+    return [
+        worst(rel(outs[i], reference(world, M, prec, 40 + i))) for i in range(calls)
+    ]
 
 
 def case_back_to_back(comm, rank, world):
@@ -348,7 +362,9 @@ def case_close(comm, rank):
 def main() -> int:
     rank, world, uid = _setup()
     # Every op here allocates a window; size the reservation for all of them.
-    vmm = 48 * GemmAgOp.window_bytes_for(world, n=N, m_max=M, out_dtype="fp32") + (1 << 30)
+    vmm = 48 * GemmAgOp.window_bytes_for(world, n=N, m_max=M, out_dtype="fp32") + (
+        1 << 30
+    )
     with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
         case_self_test(comm, rank, world)
         case_precisions_and_modes(comm, rank, world)
