@@ -135,13 +135,13 @@ ep_context_t::ep_context_t(const config_t& cfg,
   int hip_device = 0;
   HIP_CHECK_THROW(hipGetDevice(&hip_device));
   int max_compute_units = 0;
-  HIP_CHECK_THROW(hipDeviceGetAttribute(&max_compute_units, hipDeviceAttributeMultiprocessorCount,
-                                        hip_device));
+  HIP_CHECK_THROW(
+      hipDeviceGetAttribute(&max_compute_units, hipDeviceAttributeMultiprocessorCount, hip_device));
   if (provisioned_num_blocks > max_compute_units) {
-    throw std::invalid_argument(
-        "mori::kiwi::ep::ep_context_t: provisioned_num_blocks=" +
-        std::to_string(provisioned_num_blocks) + " exceeds device " + std::to_string(hip_device) +
-        " compute unit count " + std::to_string(max_compute_units));
+    throw std::invalid_argument("mori::kiwi::ep::ep_context_t: provisioned_num_blocks=" +
+                                std::to_string(provisioned_num_blocks) + " exceeds device " +
+                                std::to_string(hip_device) + " compute unit count " +
+                                std::to_string(max_compute_units));
   }
   rcomp_ipc_resources_provisioned_ = cfg_.rcomp_ipc_resources_required();
   // Each proxy thread owns exactly one RDMA device/CQ and polls its raw
