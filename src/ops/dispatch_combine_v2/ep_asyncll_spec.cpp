@@ -183,9 +183,10 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
   const int worldSize = cfg.kernelCfg.worldSize;
 
   switch (kind) {
-    // The copy passes fan out over the whole device. Aligned to worldSize because
-    // DispatchRecvCopy partitions its grid per source rank; the other two do not
-    // need it but share the number so a profile lines the three up.
+    // The copy passes fan out over the whole device. None of them needs the
+    // worldSize alignment any more -- DispatchRecvCopy used to split its grid per
+    // source rank and now walks all received tokens -- but they keep it so their
+    // launch shape, and a profile lining the passes up, stay as they were.
     case EpAsyncLLKernel::DispatchSlotAssign:
     case EpAsyncLLKernel::DispatchSendCopy:
     // The fused LSA copy belongs here and not with the transfers: it walks token
