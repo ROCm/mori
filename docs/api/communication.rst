@@ -76,6 +76,16 @@ between ``dispatch_send()`` and ``dispatch_recv()``, and between
 ``combine_send()`` and ``combine_recv()``. Receive data and counts are ready
 after the corresponding receive phase completes on the stream.
 
+SDMA queues are shared per GPU pair by every op in the process, and a receive
+phase drains the whole queue it sent on. When two ops' calls interleave on one
+stream, as two-batch overlap does with both micro-batches on the compute stream,
+set ``async_ll_own_sdma_queue=True`` on both ops: each then posts to its own
+queue, and a receive no longer waits for the other op's send. Leave it off
+(the default) when the ops run on separate streams; there the shared queue
+finishes the first-posted op first, while separate queues split the link and
+finish both later. Only the ``"sdma"`` transport takes a queue; an op returns
+it in ``close()``.
+
 On a single gfx1250 node, the send phase now posts each payload followed by
 its ready notification on the same SDMA queue. The receive phase still waits
 for outgoing copies before the source buffers can be reused. Zero-token peers
