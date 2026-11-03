@@ -54,9 +54,10 @@ class ThreadMode:
     """How participating lanes contribute to a GDA data-path operation.
 
     ``INDEPENDENT`` makes each participating thread issue its own transfer.
-    ``AGGREGATE`` coalesces the warp's lanes into one transfer and is valid only
-    with ``CoopScope.THREAD``; every lane in the warp must enter the operation,
-    with the same peer and ctx.
+    ``AGGREGATE`` gives the warp's lanes one reservation and one doorbell (each
+    lane still posts its own WQE; a signal fires once, with the last active
+    lane's signal_id / signal_val) and is valid only with ``CoopScope.THREAD``;
+    every lane in the warp must enter the operation, with the same peer and ctx.
     """
 
     INDEPENDENT = 0
@@ -74,20 +75,26 @@ class Team:
 
 class GdaDoorbell:
     """C++ ``ccoGdaDoorbellMode``, a GDA handle's compile-time mode
-    (``ccoGda<P, Mode>``); each mode has its own wrapper symbols."""
+    (``ccoGda<P, Mode>``); each mode has its own wrapper symbols.
+
+    The mode belongs to the handle, the doorbell state to the QP: one per (peer,
+    ctx % gda_context_count). Handles on one context, and per-call ``ctx=``
+    values that land on it, share its QPs whatever their mode."""
 
     # A post rings its own doorbell (coalesced with posts behind it).
     IMMEDIATE = 0
-    # A post writes its WQEs and a ready mark but does not ring; the next ring on
-    # the QP (an IMMEDIATE post, signal, flush, flush_peer, flush_async) releases it.
+    # A post writes its WQEs and a ready mark but does not ring; the next ring
+    # that reaches it (an IMMEDIATE post or signal after it, flush, flush_peer,
+    # flush_async, a full SQ) releases it. Mixes freely with IMMEDIATE on a QP.
     DEFERRED = 1
     # A post writes its WQEs only; only a CALLER_ORDERED flush releases it.
-    # Contract: no post on the QP is still writing when that flush starts (e.g.
-    # posters bump a counter after the post returns, the flusher waits for it);
-    # while any is pending, every post and flush on the QP is CALLER_ORDERED;
-    # fewer than the SQ depth between two flushes. flush() rings every peer's QP
-    # on the context, so the contract then covers all of them. No signal(): put
-    # with a signal_op instead.
+    # Contract, unchecked: every post on the QP has returned when that flush
+    # starts (e.g. posters bump a counter after the post returns, the flusher
+    # waits for it); while any is pending, only CALLER_ORDERED handles post to or
+    # flush the QP, so give such traffic its own contexts; fewer than the SQ
+    # depth in WQEs (one per posting lane, plus one per signal) between two
+    # flushes. flush() rings every peer's QP on the context, so the contract then
+    # covers all of them. No signal(): put with a signal_op instead.
     CALLER_ORDERED = 2
 
 

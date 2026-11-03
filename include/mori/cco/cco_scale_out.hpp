@@ -89,24 +89,28 @@ enum ccoGdaThreadMode : uint32_t {
 
 // How a ccoGda handle's posts reach the doorbell: its second template argument,
 // so the mode is fixed at compile time for every put / putValue / get on it.
+// The mode belongs to the handle, the doorbell state to the QP: one per (peer,
+// context % numQpPerPe), numQpPerPe being the devcomm's gdaContextCount (or the
+// communicator default). Handles on one context share its QPs whatever their mode.
 enum ccoGdaDoorbellMode : uint32_t {
   // Default: a post rings its own doorbell, coalesced with the posts behind it.
   ccoGdaDoorbellImmediate = 0,
-  // A post writes its WQEs and a ready mark but does not ring. Any later ring on
-  // the QP (an Immediate post, signal, flush, flushAsync, counter, SQ-space wait)
-  // releases it. Pays when one warp posts many WQEs to a QP and releases them once.
+  // A post writes its WQEs and a ready mark but does not ring. The next ring that
+  // reaches it releases it: an Immediate post or signal reserved after it, flush,
+  // flushAsync, counter, or an SQ-space wait. Pays when one warp posts many WQEs
+  // to a QP and releases them once. Mixes freely with Immediate on one QP.
   ccoGdaDoorbellDeferred = 1,
   // A post writes its WQEs only (no ready mark, no system fence) and returns once
   // its stores have completed. Only a CallerOrdered flush(peer) / flushAsync /
   // flush() / counter() releases it, ringing straight up to its postIdx snapshot.
-  // Contract: (a) when such a flush starts, no post on that QP (peer + context)
-  // is still writing -- order posts before the flush, e.g. posters bump a counter
-  // after the post returns and the flusher waits for it; (b) while CallerOrdered
-  // posts are pending on a QP, every post and flush on it goes through a
-  // CallerOrdered handle (others wait for ready marks that never come); (c) fewer
-  // than sqWqeNum WQEs between two flushes. flush() and counter() ring every
-  // peer's QP on the context, so (a) and (b) then cover all of them. No signal():
-  // it rings on its own.
+  // Contract, unchecked: (a) when such a flush starts, every post on that QP has
+  // returned -- e.g. posters bump a counter after the post returns and the
+  // flusher waits for it; (b) while CallerOrdered posts are pending on a QP, only
+  // CallerOrdered handles post to or flush it (other modes wait for ready marks
+  // that never come), so give such traffic its own contexts; (c) fewer than
+  // sqWqeNum WQEs (one per posting lane, plus one per signal) between two
+  // flushes. flush() and counter() ring every peer's QP on the context, so (a)
+  // and (b) then cover all of them. No signal(): it rings on its own.
   ccoGdaDoorbellCallerOrdered = 2,
 };
 
@@ -225,7 +229,7 @@ struct ccoGda {
   __device__ inline void resetSignal(ccoGdaSignal_t signalId);
 
   // ── counter ─────────────────────────────────────────────────────────────
-  // counter: poll CQ for all GDA-team peers (quietUntil), then increment
+  // counter: ring and drain every GDA-team peer's QP (as flush), then increment
   // counterBuf[localAction.counterId]. Requires ≥warp coop.
   template <typename LocalAction, typename Coop = ccoCoopWarp>
   __device__ inline void counter(LocalAction localAction, Coop coop = Coop{});
@@ -255,19 +259,22 @@ struct ccoGda {
   template <typename Coop = ccoCoopWarp>
   __device__ inline void flush(Coop coop = Coop{});
 
-  // flush(peer): poll CQ for a single peer until its submitted WQEs complete.
+  // flush(peer): ring this peer's QP up to a postIdx snapshot, then poll its CQ
+  // until those WQEs complete.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
   __device__ inline void flush(int peer, Coop coop = Coop{});
 
   // flushAsync: snapshot this peer's QP progress and return a request handle
   // that wait() can later be used to wait on individually. It rings up to the
-  // snapshot, so it may wait for posts on the QP still writing their WQEs; only
-  // the CQ drain is left to wait(). The request is valid in the coop leader.
+  // snapshot, so it may wait for posts on the QP still writing their WQEs (not on
+  // a CallerOrdered handle); only the CQ drain is left to wait(). The request is
+  // valid in the coop leader.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread>
   __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest, Coop coop = Coop{});
 
-  // wait: block on a request handle previously returned by flushAsync, called
-  // with the same coop (the leader's request is the one waited on).
+  // wait: block on a request handle previously returned by flushAsync. Pass
+  // flushAsync's Coop explicitly: the defaults differ (Thread vs Warp), and only
+  // the coop leader's request is waited on.
   template <typename Coop = ccoCoopWarp>
   __device__ inline void wait(ccoGdaRequest_t& request, Coop coop = Coop{});
 };
@@ -568,9 +575,9 @@ __device__ inline static uint32_t warpAggregateBnxtPsn(core::WorkQueueHandle* wq
 
 // ── Doorbell coalescing ──────────────────────────────────────────────────────
 //
-// A post reserves SQ slots (postIdx) and writes its WQEs. If it is first in line
-// (dbTouchIdx == its first slot) it rings for itself, as every post used to.
-// Otherwise it publishes a ready mark in wq->readyMarks at its first slot:
+// A post reserves SQ slots (postIdx) and writes its WQEs. An Immediate post first
+// in line (dbTouchIdx == its first slot) rings for itself. Otherwise it
+// publishes a ready mark in wq->readyMarks at its first slot:
 // tag = (first index << 32) | count, plus the doorbell value its last WQE
 // produced. Whoever holds the QP's doorbell lock (wq->postSendLock) walks the
 // marks forward from dbTouchIdx, rings ONCE for the whole contiguous ready run,
@@ -578,24 +585,22 @@ __device__ inline static uint32_t warpAggregateBnxtPsn(core::WorkQueueHandle* wq
 // its last WQE, whoever rang.
 //
 // So a post behind others does not wait for each of them to ring in turn, a
-// burst of posts on one QP shares doorbells, and a post may skip ringing
-// entirely (a ccoGdaDoorbellDeferred handle): the next post or flush to sweep
-// picks it up.
+// burst of posts on one QP shares doorbells, and a Deferred post skips ringing:
+// the next ring to sweep past it picks it up.
 //
 // dbTouchIdx keeps its meaning, "the NIC has been told about every WQE below
 // this", which quietUntil's MSN cap and the SQ space check rely on. The sweep
 // only crosses a slot whose mark carries that slot's own index, so it never rings
-// for a WQE that is reserved but not yet written -- the bug that removed the old
-// deferred doorbell (#625). Every post rewrites the tag at its first slot -- its
+// for a WQE that is reserved but not yet written (#625). Every post rewrites the
+// tag at its first slot -- its
 // mark, or count 0 on the fast path and for CallerOrdered posts -- so a stale tag
 // carries the index of the last post that started there, and a never-written one
 // has count 0. A stale tag matches only if no post started at that slot for
-// exactly a multiple of 2^32 WQEs. (Without the fast-path write, any run of 2^32
-// fast-path posts would do.)
+// exactly a multiple of 2^32 WQEs.
 //
 // A CallerOrdered post neither marks nor rings, and its flush rings straight up
-// to a postIdx snapshot without reading marks: the caller has ordered every post
-// below the snapshot before the flush, and no sweeper runs on such a QP.
+// to a postIdx snapshot without reading marks: by contract every post below the
+// snapshot has returned, and only CallerOrdered handles touch such a QP.
 
 __device__ inline static uint64_t readyTag(uint32_t base, uint32_t count) {
   return (static_cast<uint64_t>(base) << 32) | count;
@@ -689,7 +694,8 @@ __device__ inline static void unlockDoorbell(core::WorkQueueHandle* wq) {
 
 // The right to ring from dbTouchIdx: held by the doorbell lock, or by the post
 // whose first WQE is at dbTouchIdx and which has not marked it (nobody else can
-// move dbTouchIdx past an unmarked slot). With it, and the WQEs in [from, to)
+// move dbTouchIdx past an unmarked slot -- bar a CallerOrdered flush, which by
+// contract runs with no post in flight). With it, and the WQEs in [from, to)
 // written and visible to the NIC: ring once for them and publish `to`.
 template <core::ProviderType PrvdType>
 __device__ inline static void ringAndPublish(core::RdmaEndpointDevice* ep, uint32_t from,
@@ -760,9 +766,9 @@ __device__ inline static void ringReady(core::RdmaEndpointDevice* ep) {
   unlockDoorbell(wq);
 }
 
-// Ring until the NIC has been told about every WQE below `target`. Every slot
-// below a postIdx snapshot is eventually written and marked by its owner, so
-// this terminates whether or not those owners ring themselves.
+// Ring until the NIC has been told about every WQE below `target`. Each
+// non-CallerOrdered post below a postIdx snapshot eventually rings for itself or
+// marks, so this terminates; CallerOrdered posts never mark (contract (b)).
 template <core::ProviderType PrvdType>
 __device__ inline static void ringUntil(core::RdmaEndpointDevice* ep, uint32_t target) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
@@ -877,7 +883,7 @@ __device__ inline static uint32_t getAtomicWqeCount(core::atomicType amo_op, uin
 
 // putImpl - post one warp-aggregated put for the active lanes (all targeting this
 // ep/qpn; the facade groups by QP). Each lane posts its data WQE into a contiguous
-// reservation; the leader posts the shared signal WQE and rings one doorbell.
+// reservation; the leader posts the shared signal WQE and submits once (per mode).
 template <core::ProviderType PrvdType, bool DeferDoorbell = false, bool CallerOrdered = false>
 __device__ inline static void putImpl(
     // Hardware resources (already selected endpoint)
@@ -1017,7 +1023,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
 
 // getImpl - RDMA read. One group per call (the facade groups lanes by QP):
 // each active lane posts its read WQE into a contiguous reservation, the leader
-// rings one doorbell.
+// submits once (per mode).
 template <core::ProviderType PrvdType, bool DeferDoorbell = false, bool CallerOrdered = false>
 __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                       uintptr_t localAddr, uint32_t localKey, uintptr_t remoteAddr,
@@ -1062,9 +1068,7 @@ __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn
 // drain to it.
 //
 // postIdx is a *reservation* counter: a snapshot routinely covers slots whose
-// owner is still writing them. ringUntil never rings past a slot that is not
-// marked ready, so it just waits for those owners; every reserved slot does get
-// written, so it terminates.
+// owner is still writing them, and ringUntil waits for those owners.
 template <core::ProviderType PrvdType>
 __device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint32_t* outPostIdx) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
@@ -1099,9 +1103,10 @@ __device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, ui
   }
 }
 
-// flushAsync on a CallerOrdered handle: every WQE below the snapshot is written
-// (the caller's contract) and none is marked, so ring once straight up to it
-// under the doorbell lock, which orders us against another flusher. Lanes of one
+// flushAsync on a CallerOrdered handle: every post below the snapshot has
+// returned (the caller's contract), so ring once straight up to it without
+// reading marks, under the doorbell lock, which orders us against another
+// flusher. Lanes of one
 // wave may flush one QP: a loser retries in the loop rather than spinning on the
 // lock while the winner waits for it to reconverge.
 template <core::ProviderType PrvdType>
@@ -1807,13 +1812,14 @@ __device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda, ccoGdaBar
 }
 
 // Any other mode: reject with a readable error rather than a deduction failure.
-// A Deferred caller can sync through an Immediate handle on the same context.
+// A Deferred caller can sync through an Immediate handle on the same context; a
+// CallerOrdered one must flush first.
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell, typename Coop>
 __device__ inline void ccoGdaBarrier(Coop, ccoGda<PrvdType, Doorbell>&, ccoGdaBarrierHandle,
                                      uint32_t) {
   static_assert(Doorbell == ccoGdaDoorbellImmediate,
-                "ccoGdaBarrier takes an Immediate handle (ccoGda<P>); make one on the same "
-                "context to sync");
+                "ccoGdaBarrier takes an Immediate handle (ccoGda<P>): flush a CallerOrdered "
+                "handle first, then sync through an Immediate one on the same context");
 }
 
 #endif  // defined(__HIPCC__) || defined(__CUDACC__)

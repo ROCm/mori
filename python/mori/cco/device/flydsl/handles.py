@@ -35,13 +35,13 @@ control flow. Build once at kernel entry and reuse::
         gda.put(1, recv, 0, send, 0, n, signal_op=cco.SignalOp.INC, coop=cco.CoopScope.THREAD)
     gda.flush(coop=cco.CoopScope.BLOCK)          # same gda, across the dynamic if
 
-``coop`` / ``signal_op`` / ``thread_mode`` must be compile-time constants
-(``CoopScope`` / ``SignalOp`` / ``ThreadMode`` values), as is the handle's
+``coop`` / ``signal_op`` / ``thread_mode`` / ``team`` must be compile-time
+constants (``CoopScope`` / ``SignalOp`` / ``ThreadMode`` / ``Team`` values), as is the handle's
 doorbell mode (``dc.gda(ctx, doorbell=GdaDoorbell.DEFERRED)``): each method
 selects a fully-specialized wrapper symbol by name, so the kernel emits one
 direct call to one ``ccoGda<P, Mode>`` instantiation — no runtime dispatch.
-``ThreadMode.AGGREGATE`` is only valid with ``CoopScope.THREAD`` (cco coalesces
-the warp's lanes itself).
+``ThreadMode.AGGREGATE`` is only valid with ``CoopScope.THREAD`` (cco gives the
+warp's lanes one reservation and one doorbell).
 """
 
 try:
@@ -202,20 +202,23 @@ class Gda:
     ``ctx`` is a compile-time (Constexpr) field, so the handle carries a single
     IR value (dev_comm) and flows cleanly through scf.if / scf.for.
 
-    ``team`` says how ``peer`` is numbered: ``Team.WORLD`` (a world rank, the
-    default) or ``Team.GDA`` (an index in the GDA team -- the node index on a
-    RAIL connection).
+    Each op's ``team`` keyword says how ``peer`` is numbered: ``Team.WORLD`` (a
+    world rank, the default) or ``Team.GDA`` (an index in the GDA team -- the
+    node index on a RAIL connection).
 
     ``doorbell`` (Constexpr, a :class:`GdaDoorbell`) is the handle's mode, C++'s
     ``ccoGda<P, Mode>``: ``IMMEDIATE`` posts ring for themselves; ``DEFERRED``
-    put / put_value / get ring nothing and the next ring on the QP releases
-    them; ``CALLER_ORDERED`` ones also skip the ready mark and only this mode's
+    put / put_value / get ring nothing and the next ring that reaches them
+    releases them; ``CALLER_ORDERED`` ones also skip the ready mark and only this mode's
     flush / flush_peer / flush_async release them, under the contract on
     :class:`GdaDoorbell`. A CALLER_ORDERED handle has no signal(): put with a
-    ``signal_op`` instead.
+    ``signal_op`` instead. Handles on one context share its QPs whatever their
+    mode: while CALLER_ORDERED posts are pending on a QP, only CALLER_ORDERED
+    handles may post to or flush it (see :class:`GdaDoorbell`).
 
-    Every op that posts to or flushes a QP also takes ``ctx``, the context for that one call,
-    which may be a runtime ``Int32`` (e.g. to spread chunks over contexts). It
+    Every op that posts to or flushes a QP also takes ``ctx``, the context for
+    that one call, which may be a runtime ``Int32`` (e.g. to spread chunks over
+    contexts). It
     defaults to the handle's own, which stays compile-time so the handle remains
     a single IR value across scf.if / scf.for.
     """
@@ -357,7 +360,8 @@ class Gda:
             self.dev_comm, self.ctx, signal_id, least, bits
         )
 
-    # ── completion (>= warp; THREAD coop maps to warp) ──
+    # ── completion: flush / flush_peer need >= warp (THREAD maps to warp);
+    # flush_async / wait take any coop ──
     def flush(self, *, coop=CoopScope.WARP, ctx=None):
         raw.FLUSH[_flush_tag(coop) + self._db(flush=True)](
             self.dev_comm, self._ctx(ctx)
@@ -385,8 +389,8 @@ class Gda:
     ):
         """Ring ``peer``'s QP up to its current reservation, deferred posts
         included, and return a request (a uint64) for :meth:`wait`. Work can go
-        between the two. Every lane gets the request for THREAD and WARP; for
-        BLOCK only thread 0 does, so wait with BLOCK too."""
+        between the two. Wait with the same coop: every lane gets the request
+        for THREAD (one per lane) and WARP, only thread 0 for BLOCK."""
         coop = _COOP_TAG[_const(coop, "coop")]
         return raw.FLUSH_ASYNC[coop + self._db(flush=True)](
             self.dev_comm, self._ctx(ctx), peer, _gda_flags(team)
@@ -394,7 +398,8 @@ class Gda:
 
     def wait(self, request, *, coop=CoopScope.THREAD):
         """Poll the CQ until the request :meth:`flush_async` returned has
-        completed. THREAD: each lane passes its own request."""
+        completed; use flush_async's coop. THREAD: each lane passes its own
+        request. No ``ctx``: the request names the QP."""
         raw.WAIT[_COOP_TAG[_const(coop, "coop")]](self.dev_comm, self.ctx, request)
 
 
@@ -904,7 +909,8 @@ class DevComm:
 
     def gda(self, ctx=0, doorbell=GdaDoorbell.IMMEDIATE) -> Gda:
         """Build a GDA handle on this devComm for the given (compile-time)
-        context index and :class:`GdaDoorbell` mode."""
+        context index and :class:`GdaDoorbell` mode. Handles on one context
+        share its QPs, whatever their mode (see :class:`GdaDoorbell`)."""
         gda_doorbell_tag(_const(doorbell, "doorbell"))  # rejects an unknown mode
         return Gda(dev_comm=self.ptr, ctx=ctx, doorbell=doorbell)
 

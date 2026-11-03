@@ -68,7 +68,8 @@ _DOORBELL_CALLER_ORDERED = tl.constexpr(GdaDoorbell.CALLER_ORDERED)
 # compiles away. `ctx`, the QP context, may be a runtime value on every op that
 # posts to or flushes a QP. The doorbell mode is the namespace's (Gda,
 # GdaDeferred, GdaCallerOrdered): the _gda_* ops take it first and pick the
-# extern by it.
+# extern by it. Calls on one ctx share its QPs whatever the namespace, so keep
+# Gda / GdaDeferred calls off a QP while GdaCallerOrdered posts are pending.
 
 
 @triton.jit
@@ -745,9 +746,9 @@ def _gda_flush_async(
     team: tl.constexpr = _TEAM_WORLD,
 ):
     """Ring ``peer``'s QP up to its current reservation, deferred posts
-    included, and return a request (uint64) for ``wait``. Every lane gets the
-    request for THREAD and WARP; for BLOCK only thread 0 does, so wait with
-    BLOCK too."""
+    included, and return a request (uint64) for ``wait``. Wait with the same
+    coop: every lane gets the request for THREAD (one per lane) and WARP, only
+    thread 0 for BLOCK."""
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
         "GDA coop must be CoopScope.THREAD, WARP, or BLOCK",
@@ -778,8 +779,9 @@ def _gda_wait(
     ctx=0,
     coop: tl.constexpr = _COOP_THREAD,
 ):
-    """Poll the CQ until a ``flush_async`` request has completed. THREAD: each
-    lane passes its own request."""
+    """Poll the CQ until a ``flush_async`` request has completed; use
+    flush_async's coop. THREAD: each lane passes its own request. ``ctx`` is
+    unused: the request names the QP."""
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
         "GDA coop must be CoopScope.THREAD, WARP, or BLOCK",
@@ -1409,7 +1411,8 @@ class DevComm:
 
 class Gda:
     """Namespace matching the FlyDSL ``Gda`` method names, for a
-    ``GdaDoorbell.IMMEDIATE`` handle: every post rings for itself."""
+    ``GdaDoorbell.IMMEDIATE`` handle: every post rings for itself. In every
+    namespace, wait on a flush_async request with flush_async's coop."""
 
     put = staticmethod(_gda_put_immediate)
     put_value = staticmethod(_gda_put_value_immediate)
@@ -1426,8 +1429,8 @@ class Gda:
 
 class GdaDeferred(Gda):
     """``Gda`` for a ``GdaDoorbell.DEFERRED`` handle: put / put_value / get ring
-    nothing; the next ring on the QP (any Gda post, signal, or flush) releases
-    them."""
+    nothing; the next ring that reaches them (a ``Gda`` post or signal after
+    them, or a flush / flush_async) releases them."""
 
     put = staticmethod(_gda_put_deferred)
     put_value = staticmethod(_gda_put_value_deferred)
@@ -1438,7 +1441,9 @@ class GdaCallerOrdered:
     """``Gda`` for a ``GdaDoorbell.CALLER_ORDERED`` handle: put / put_value / get
     write their WQEs only, and only this namespace's flush / flush_peer /
     flush_async release them, under the contract on ``GdaDoorbell``. No
-    signal: put with a ``signal_op`` instead."""
+    signal: put with a ``signal_op`` instead. Its QPs are the ctx's, shared
+    with Gda / GdaDeferred calls on that ctx, which must stay off a QP while
+    its posts are pending."""
 
     put = staticmethod(_gda_put_caller_ordered)
     put_value = staticmethod(_gda_put_value_caller_ordered)

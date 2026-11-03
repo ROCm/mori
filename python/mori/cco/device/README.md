@@ -2,7 +2,7 @@
 
 Lets FlyDSL and Triton kernels call the CCO GDA/LSA/SDMA device API through
 extern-C wrappers compiled to bitcode and linked into the kernel. The C++
-device implementation (`ccoGda<P>` / `ccoSdma`) is reused unchanged.
+device implementation (`ccoGda<P, Mode>` / `ccoSdma`) is reused unchanged.
 
 ## The layers (top → bottom)
 
@@ -13,7 +13,7 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   └─ Triton: mori.ir.triton.cco.gda_put_iw_inc(...)
        └─ core.extern_elementwise(..., cov5 bitcode)
             └─ llvm.call @cco_gda_put__iw__inc
-                 └─ ccoGda<P>::put<...>() / ccoSdma::put<...>()
+                 └─ ccoGda<P, Mode>::put<...>() / ccoSdma::put<...>()
 ```
 
 ## What to look at where
@@ -24,7 +24,8 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
 | The shared ABI metadata | `python/mori/cco/device/ops.py` (`CCO_DEVICE_FUNCTIONS`) |
 | FlyDSL FFI objects | `python/mori/cco/device/flydsl/_bindings.py` |
 | Triton extern wrappers | `python/mori/ir/triton/cco/ops.py` |
-| OO API (`DevComm/Window/Gda`) + enums (`CoopScope/SignalOp/ThreadMode`) | `python/mori/cco/device/flydsl/handles.py` |
+| OO API (`DevComm/Window/Gda`) | `python/mori/cco/device/flydsl/handles.py` |
+| Enums (`CoopScope/SignalOp/ThreadMode/Team/GdaDoorbell/GdaFlags`) | `python/mori/cco/device/ops.py` |
 | `_ffi` factory + `cco_struct` (handle keeps methods across `if`/`for`) | `flydsl/_internal.py` |
 | Buffer load/store with a cache policy that holds on every FlyDSL version | `flydsl/buffer.py` |
 | u32 signal-slot accessors (peer flags, rank-private epochs) | `flydsl/signals.py` |
@@ -39,12 +40,13 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   `uint64` intptrs (`ccoDevComm*`, `ccoWindow_t`); signal id/value cross as
   `int32`/`uint64`. Struct layout lives only in C++.
 - **No dispatch overhead (monomorphization).** Each template axis
-  (`Coop` × `ThreadMode` × `RemoteAction`) is compiled into a *distinct*
-  `extern "C"` symbol, name-mangled with a tag (`cco_gda_put__iw__inc` = indep
-  warp + signal-inc). `coop`/`thread_mode`/`signal_op` are compile-time constants
-  (Python enums), so `handles.py` picks the symbol by name at trace time and the
-  kernel emits **one direct call to one instantiation** — no runtime branch, no
-  type erasure, nothing to constant-fold. Passing a runtime DSL value for any
+  (`Coop` × `ThreadMode` × `RemoteAction` × doorbell mode) is compiled into a
+  *distinct* `extern "C"` symbol, name-mangled with a tag
+  (`cco_gda_put__iw__inc__deferred` = indep warp + signal-inc on a DEFERRED
+  handle). These are compile-time constants (Python enums), so `handles.py`
+  picks the symbol by name at trace time and the kernel emits **one direct call
+  to one instantiation**. The team rides in a constant `GdaFlags` word that
+  folds once the wrapper is inlined. Passing a runtime DSL value for any
   axis is a `TypeError` (it can't select a symbol). `always_inline` (`CCO_DEV`)
   then inlines the thin forwarder into the kernel.
 - **ThreadMode is selectable** (`ThreadMode.INDEPENDENT` / `AGGREGATE`); the
@@ -55,7 +57,7 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   FlyDSL ignores it; Triton needs a concrete element return type for
   `extern_elementwise`, especially when an argument is a block value.
 - **Provider fixed at build time** via `CCO_GDA_BUILD_PROVIDER` (NIC macro) — one
-  `ccoGda<P>` specialization per NIC, same as the C++ kernels / shmem bitcode.
+  `ccoGda<P, Mode>` per NIC, same as the C++ kernels / shmem bitcode.
 - **OO handles** (`DevComm/Window/Gda`) are method-carrying `fx.struct`s
   (`cco_struct`): build once, reuse across control flow. `Gda.ctx` and
   `Gda.doorbell` are `Constexpr` so the handle carries a single IR value; an op
@@ -71,21 +73,30 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   `gda.put / put_value / get / signal / wait_signal / flush / flush_peer /
   flush_async / wait`. `team` (`Team.WORLD`, or `Team.GDA` for a peer numbered
   in the GDA team, i.e. the node index on a RAIL connection) rides in a
-  constant `GdaFlags` word. The doorbell mode belongs to the handle,
-  `dc.gda(ctx, doorbell=GdaDoorbell.X)`, and is part of the symbol name:
-  `IMMEDIATE` (default) posts ring for themselves; `DEFERRED` put / put_value /
-  get post without ringing and the next IMMEDIATE post, signal, flush or
-  flush_async on the QP rings for them (worth it when one warp posts many WQEs
-  to a QP and releases them once); `CALLER_ORDERED` posts also skip the ready
-  mark and only a CALLER_ORDERED flush releases them, for callers that already
-  order every post before the flush (see `GdaDoorbell` for the contract). A
-  CALLER_ORDERED handle has no `signal`; put with a `signal_op` instead.
-  `flush_async` returns a request for `wait`, so work can go between them;
-  call `wait` with the same coop (with `BLOCK` only thread 0 holds the request).
-  Per-call `ctx=` picks the QP context. It may differ per lane only with coop
-  `THREAD` on signal, flush_async, wait, and put / put_value / get in
-  `ThreadMode.INDEPENDENT`; `AGGREGATE`, `flush` and `flush_peer` need one
-  `ctx` (and peer) across the warp.
+  constant `GdaFlags` word.
+  - **Doorbell mode** belongs to the handle, `dc.gda(ctx,
+    doorbell=GdaDoorbell.X)`, and is part of the symbol name. `IMMEDIATE`
+    (default) posts ring for themselves. `DEFERRED` put / put_value / get post
+    without ringing; the next ring that reaches them (an IMMEDIATE post or
+    signal after them, a flush or flush_async) releases them. Worth it when one
+    warp posts many WQEs to a QP and releases them once. `CALLER_ORDERED` posts
+    also skip the ready mark, and only a CALLER_ORDERED flush releases them, for
+    callers that already order every post before the flush (contract on
+    `GdaDoorbell`); such a handle has no `signal`, so put with a `signal_op`.
+  - **QPs are shared** by every handle on one `ctx` (taken modulo
+    `gda_context_count`), whatever its mode. IMMEDIATE and DEFERRED mix freely;
+    while CALLER_ORDERED posts are pending on a QP, only CALLER_ORDERED handles
+    may post to or flush it. Nothing checks this, so give such traffic its own
+    contexts.
+  - **`flush_async` / `wait`**: `flush_async` returns a request for `wait`, so
+    work can go between them. Call `wait` with the same coop (with `BLOCK` only
+    thread 0 holds the request).
+  - **Per-call `ctx=`** picks the QP context (`wait` needs none: the request
+    names the QP). It may differ per lane only with coop `THREAD` on signal,
+    flush_async, and put / put_value / get in `ThreadMode.INDEPENDENT`;
+    `AGGREGATE`, `flush` and `flush_peer` need one `ctx` (and peer) across the
+    warp.
+
   See examples 03/06.
 - **SDMA** (intra-node copy engine): `sdma.put / get` (window + offset) and
   `put_ptr / get_ptr` (resolved addresses) mirror `ccoSdma`'s, with its template

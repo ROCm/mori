@@ -25,9 +25,9 @@
 """FlyDSL FFI prototypes for ``src/cco/device/cco_device_wrapper.cpp``.
 
 The wrapper MONOMORPHIZES each template axis into a distinct ``extern "C"``
-symbol (one per valid Coop / ThreadMode / RemoteAction combination), so there is
-no runtime dispatch: the OO handles in :mod:`.handles` pick the symbol by name
-from the (compile-time) coop/thread_mode/signal_op and emit one direct call.
+symbol (one per valid Coop / ThreadMode / RemoteAction / doorbell mode
+combination), so there is no runtime dispatch: the OO handles in :mod:`.handles`
+pick the symbol by name from the compile-time arguments and emit one direct call.
 
 All arguments are scalars (FlyDSL FFI is scalar-only): handles (``ccoDevComm*`` /
 ``ccoWindow_t``) are ``uint64`` intptrs; signal id/value are ``int32`` / ``uint64``.
@@ -36,7 +36,8 @@ Symbol tags (must match the wrapper):
   * data path (``put`` / ``put_value`` / ``get``): ``(ThreadMode, Coop)`` tag —
     ``it`` indep+thread, ``iw`` indep+warp, ``ib`` indep+block, ``at`` aggr+thread
     (aggregate is only valid with thread coop).
-  * ``signal`` / ``wait`` / ``flush``: coop-only tag ``thread`` / ``warp`` / ``block``.
+  * ``signal`` / ``wait_signal`` / ``flush_async`` / ``wait``: coop-only tag
+    ``thread`` / ``warp`` / ``block``; ``flush`` / ``flush_peer``: ``warp`` / ``block``.
   * ``put`` / ``put_value`` / ``signal`` also carry a signal-op tag
     ``none`` / ``inc`` / ``add`` (``signal`` has no ``none``).
   * the handle's doorbell mode ends the data-path tag (``__deferred`` /

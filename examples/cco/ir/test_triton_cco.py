@@ -586,12 +586,11 @@ def gda_defer_kernel(
     doorbell: tl.constexpr,
 ):
     # Deferred (or caller-ordered) puts ring nothing; that namespace's
-    # flush_async rings for all of them at once and wait drains the CQ. The
-    # signal is an ordinary post behind them on the QP.
+    # flush_async rings for all of them at once and wait drains the CQ. Then an
+    # Immediate signal on the same, now idle, QP tells the peer.
     chunk: tl.constexpr = nbytes // chunks
-    qp = tl.program_id(
-        0
-    )  # a runtime QP context, as a kernel spreading chunks would pick
+    # A runtime QP context, as a kernel spreading chunks would pick.
+    qp = tl.program_id(0)
     if doorbell == cco.GdaDoorbell.DEFERRED:
         for c in tl.static_range(chunks):
             cco.GdaDeferred.put(

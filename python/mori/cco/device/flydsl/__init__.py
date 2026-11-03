@@ -29,8 +29,9 @@ machinery):
 
   * :mod:`._bindings`  — 1:1 FFI prototypes for ``libmori_cco_device.bc``.
   * :mod:`._internal`  — the ``_ffi`` factory + ``cco_struct`` decorator.
-  * :mod:`.handles`    — OO handles ``DevComm`` / ``Window`` / ``Gda`` and the
-                         ``CoopScope`` / ``SignalOp`` / ``ThreadMode`` enums.
+  * :mod:`.handles`    — OO handles ``DevComm`` / ``Window`` / ``Gda``; the enums
+                         (``CoopScope`` / ``SignalOp`` / ``ThreadMode`` / ``Team``
+                         / ``GdaDoorbell``) come from :mod:`mori.cco.device.ops`.
 
 Example (inside ``@flyc.kernel``)::
 

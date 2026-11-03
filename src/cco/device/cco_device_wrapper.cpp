@@ -29,23 +29,23 @@
 // Design (device-IR binding layer adapted to a scalar-only DSL FFI):
 //   * Device objects cross the boundary as scalar handles (uint64 = intptr):
 //     ccoDevComm*, ccoWindow_t — reinterpreted back here.
-//   * Template axes (Coop / ThreadMode / RemoteAction) are MONOMORPHIZED: one
-//     extern "C" symbol per valid combination, name-mangled with a tag suffix
-//     (see the tables below). Each symbol body is a single fully-specialized
-//     facade call — no runtime branch, no type erasure. The Python bindings
-//     pick the symbol by name from the (compile-time) coop/thread_mode/signal_op
-//     the kernel author passes, so the kernel emits one direct llvm.call to one
-//     instantiation. This is how C++ templates cross a scalar FFI with zero
-//     dispatch overhead, and lets ThreadMode be selected freely.
+//   * Template axes (Coop / ThreadMode / RemoteAction / doorbell mode) are
+//     MONOMORPHIZED: one extern "C" symbol per valid combination, name-mangled
+//     with a tag suffix (see the tables below). The Python bindings pick the
+//     symbol by name from the compile-time arguments the kernel author passes,
+//     so the kernel emits one direct llvm.call. The remaining axes (team; SDMA
+//     flags) ride in a `flags` word that folds to one instantiation once the
+//     wrapper is inlined with a constant.
 //   * Provider is fixed at build time via CCO_GDA_BUILD_PROVIDER (NIC macro), so
-//     only one ccoGda<P> specialization is built (same model as the C++ kernels).
+//     only that provider's ccoGda<P, Mode> specializations are built.
 //
 // Symbol tags (registered in python/mori/cco/device/ops.py):
 //   GDA data path (put/put_value/get) — (ThreadMode,Coop) tag, since aggregate is
 //   only valid with thread coop (static_assert in cco_scale_out.hpp):
 //     it = independent+thread   iw = independent+warp
 //     ib = independent+block    at = aggregate+thread
-//   signal/wait/flush — coop-only tag: thread / warp / block.
+//   signal/wait_signal/flush_async/wait — coop-only tag: thread / warp / block;
+//   flush/flush_peer — warp / block.
 //   put/put_value/signal also carry a remote-action tag: none / inc / add.
 //   The handle's doorbell mode is a name suffix too: put/put_value/get take ""
 //   (Immediate) / __deferred / __caller_ordered; flush/flush_peer/flush_async ""
@@ -77,7 +77,7 @@ inline __device__ const ccoDevComm* AsDevComm(uint64_t h) {
 inline __device__ ccoWindow_t AsWindow(uint64_t h) { return reinterpret_cast<ccoWindow_t>(h); }
 inline __device__ ccoGdaSignal_t AsSig(int id) { return static_cast<ccoGdaSignal_t>(id); }
 
-// A template argument chosen at run time by the *WithFlags dispatchers below.
+// A template argument chosen from `flags` by GdaWithTeam / SdmaWithFlags below.
 template <typename T, T v>
 using Const = std::integral_constant<T, v>;
 }  // namespace
@@ -668,9 +668,9 @@ CCO_FLUSH_DOORBELL_LIST(CCO_DEF_FLUSH, block, ccoCoopBlock)
 // flush_async rings `peer`'s QP up to its current reservation (deferred posts
 // included) and returns a request; wait polls the CQ until that request has
 // completed. Work can go between them. The request is one uint64 (PackRequest)
-// and is only meaningful to wait() with the same dev_comm. Every lane holds it
-// for thread and warp scope; for block scope only thread 0 does, so wait with
-// block scope too.
+// and is only meaningful to wait() with the same dev_comm. Wait with the same
+// coop: every lane holds the request for thread and warp scope, only thread 0
+// for block scope, and a thread-scope request is one per lane.
 #define CCO_DEF_FLUSH_ASYNC(TAG, COOP, DB, MODE)                                               \
   CCO_DEV uint64_t cco_gda_flush_async__##TAG##DB(uint64_t dc, int ctx, int peer, int flags) { \
     GdaMode<MODE> gda{*AsDevComm(dc), ctx};                                                    \

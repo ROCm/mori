@@ -17,7 +17,7 @@ examples/cco/
 | `python/03_flydsl_put` | py | FlyDSL GDA put + signal/wait |
 | `python/04_flydsl_lsa_put` | py | FlyDSL LSA: direct peer-pointer store in the kernel |
 | `python/05_flydsl_lsa_allreduce` | py | FlyDSL LSA custom all-reduce (peer pointers + device signal barrier) |
-| `python/06_flydsl_gda_modes` | py | FlyDSL GDA template matrix: (thread_mode, coop) × signal |
+| `python/06_flydsl_gda_modes` | py | FlyDSL GDA template matrix: (thread_mode, coop) × signal, plus DEFERRED / CALLER_ORDERED handles with flush_async + wait |
 | `python/07_flydsl_sdma` | py | FlyDSL SDMA put/get over the copy engine |
 | `python/08_torch_symm_import` | py | import a `torch.symm_mem` tensor into the flat LSA space, no copy |
 | `python/09_torch_symm_lsa_all2all` | py | mori's own torch symm-mem backend + Triton `lsa_ptr` all-to-all |

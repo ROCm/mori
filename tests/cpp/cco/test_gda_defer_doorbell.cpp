@@ -24,9 +24,9 @@
 // and doorbell coalescing.
 //
 // A Deferred post writes its WQEs and marks them ready without ringing; the next
-// Immediate post, signal, flush or counter on the QP rings for them. A
-// CallerOrdered post writes its WQEs only; a CallerOrdered flush rings straight
-// up to its snapshot. Each case is one kernel, then a host barrier and a check of
+// ring that reaches them (an Immediate post or signal after them, flush, counter)
+// releases them. A CallerOrdered post writes its WQEs only; a CallerOrdered flush
+// rings straight up to its snapshot. Each case is one kernel, then a host barrier and a check of
 // what landed:
 //
 //   probe     one warp, one peer: deferred puts leave dbTouchIdx where it was

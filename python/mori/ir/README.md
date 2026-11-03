@@ -86,15 +86,19 @@ explicitly, for example `cco.Gda.put(dev_comm, peer, ...)`; the original flat
 functions remain available for ABI-level or generated code. `GdaDeferred` and
 `GdaCallerOrdered` are `Gda` for the `GdaDoorbell.DEFERRED` and
 `CALLER_ORDERED` handle modes (FlyDSL's `dc.gda(ctx, doorbell=...)`);
-`GdaCallerOrdered` has no `signal`.
+`GdaCallerOrdered` has no `signal`. Calls on one `ctx` share its QPs whatever
+the namespace, so keep `Gda` / `GdaDeferred` calls off a QP while
+`GdaCallerOrdered` posts are pending there (see `GdaDoorbell`).
 
 The flat CCO functions mirror the monomorphized C symbols. Examples:
 
 - `devcomm_rank`, `devcomm_lsa_rank`, `lsa_ptr`
 - `sdma_put_{thread,warp,block}` and `sdma_quiet_*`
-- `gda_put_{it,iw,ib,at}_{none,inc,add}[_deferred|_caller_ordered]`
-- `gda_get_{it,iw,ib,at}[_deferred|_caller_ordered]`, signal/wait/read/reset,
-  and flush variants (`[_caller_ordered]`)
+- `gda_put_{it,iw,ib,at}_{none,inc,add}[_deferred|_caller_ordered]` and
+  `gda_put_value_*` alike
+- `gda_get_{it,iw,ib,at}[_deferred|_caller_ordered]`, `gda_signal_*`,
+  `gda_wait_signal_*`, `gda_read_signal`, `gda_reset_signal`, and
+  `gda_flush[_peer]_{warp,block}[_caller_ordered]`
 - `gda_flush_async_{thread,warp,block}[_caller_ordered]` /
   `gda_wait_{thread,warp,block}`
 
