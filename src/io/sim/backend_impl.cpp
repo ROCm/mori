@@ -493,11 +493,7 @@ FenceResult SimBackend::FenceRemoteEngine(const EngineKey& remote) {
   if (!HasControlPlane()) {
     // As XgmiBackend: a same-node peer keeps a path this engine cannot cut.
     if (remote == self_.key || !IsSameNode(remote)) return FenceResult{};
-    FenceResult result;
-    result.supported = true;
-    result.endpointsFailed = 1;
-    result.message = "peer " + remote + " is on this node and can still write over XGMI";
-    return result;
+    return UncutPath(remote, "XGMI", "the IPC mapping of our memory it holds cannot be revoked");
   }
   FenceResult result;
   result.supported = true;

@@ -833,6 +833,51 @@ def test_restarted_peer_refused_until_unfenced():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_sessions_racing_a_fence_recover_after_unfence():
+    # A session built while a fence lands can be cached over the QPs the fence cut. Unless
+    # the fence marks them failed, nothing replaces it: with notifications off there are no
+    # receive WRs to flush, so every transfer on it fails for good, even after the unfence.
+    initiator, target = create_connected_engine_pair(
+        "fence_race",
+        qp_per_transfer=1,
+        post_batch_size=-1,
+        num_worker_threads=1,
+        enable_notification=False,
+    )
+    src_tensor = torch.full((64,), 0x2E, dtype=torch.uint8, device="cuda:1")
+    src_mem = target.register_torch_tensor(src_tensor)
+    initiator_key = initiator.get_engine_desc().key
+    regions = []
+
+    def write_each(mems):
+        for mem in mems:
+            try:
+                _write_and_wait(target, src_mem, mem)
+            except RuntimeError:
+                pass
+
+    # Each trial checks its regions before the next fence, which would purge a stuck
+    # session and hide it. A region's first write builds its session; the fence lands
+    # while those are being built.
+    for trial in range(100):
+        batch = [torch.zeros(64, dtype=torch.uint8, device="cuda:0") for _ in range(4)]
+        regions.extend(batch)
+        mems = [initiator.register_torch_tensor(t) for t in batch]
+        writer = threading.Thread(target=write_each, args=(mems,))
+        writer.start()
+        time.sleep(0.0003 * (trial % 4))
+        assert target.fence_remote_engine(initiator_key).ok
+        target.unfence_remote_engine(initiator_key)
+        writer.join()
+        stuck = [
+            i
+            for i, mem in enumerate(mems)
+            if not _write_eventually(target, src_mem, mem, budget_s=3.0)
+        ]
+        assert not stuck, f"trial {trial}: {len(stuck)} region(s) never recovered"
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
 def test_fence_while_another_thread_waits():
     # The connector shape: one thread waits on a stream of writes while another gives up
     # on the producer and fences it.

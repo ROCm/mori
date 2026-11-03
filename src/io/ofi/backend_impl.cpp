@@ -1019,6 +1019,11 @@ bool OfiBackend::PopInboundTransferStatus(EngineKey /*remote*/, TransferUniqueId
   return false;
 }
 
+FenceResult OfiBackend::FenceRemoteEngine(const EngineKey& remote) {
+  if (!cp_ || !cp_->HasEngine(remote)) return FenceResult{};
+  return UncutPath(remote, "OFI", "the OFI backend does not implement fencing");
+}
+
 bool OfiBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
   (void)local;
   // Only route to a peer that advertised OFI endpoints (seeded into the AVs) and

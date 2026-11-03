@@ -222,8 +222,8 @@ class Backend {
   virtual bool PopPeerFailure(PeerFailureEvent* /*out*/) { return false; }
 
   // Revokes `remote`'s ability to write into this engine, and fails local transfers
-  // that were using the same connections. Backends that cannot cut a peer off
-  // return the default, which reports the operation as unsupported.
+  // that were using the same connections. A backend with no path from the peer returns
+  // the default (unsupported); one with a path it cannot cut returns UncutPath().
   virtual FenceResult FenceRemoteEngine(const EngineKey& /*remote*/) { return FenceResult{}; }
   // Lets a fenced peer connect again. Returns whether it was fenced.
   virtual bool UnfenceRemoteEngine(const EngineKey& /*remote*/) { return false; }

@@ -85,11 +85,17 @@ class ProtocolError : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
-// A connection was refused because one side has fenced the other (IOEngine::FenceRemoteEngine).
-// That is deliberate and says nothing about the network path.
-class PeerFencedError : public ProtocolError {
+// The peer answered a handshake with Fenced: it has fenced this engine
+// (IOEngine::FenceRemoteEngine). That is deliberate and says nothing about the network path.
+class FencedByPeerError : public ProtocolError {
  public:
   using ProtocolError::ProtocolError;
+};
+
+// This engine has fenced the peer, so it refuses a connection with it.
+class PeerIsFencedError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
 };
 
 const char* MessageTypeName(MessageType type);

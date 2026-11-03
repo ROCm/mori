@@ -471,9 +471,8 @@ FenceResult IOEngine::FenceRemoteEngine(const EngineKey& remote) {
   for (auto& it : backends) {
     FenceResult part = it.second->FenceRemoteEngine(remote);
     if (!part.supported) {
-      // Skipped: it has no path to the peer, or does not implement fencing (OFI, fabric).
-      // XGMI, which has a path it cannot cut, reports it as a failed endpoint instead,
-      // which keeps the result not ok.
+      // Skipped: it has no path from the peer. One with a path it cannot cut (XGMI, OFI,
+      // fabric) reports it as a failed endpoint instead, which keeps the result not ok.
       continue;
     }
     total.supported = true;

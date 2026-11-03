@@ -90,6 +90,17 @@ struct FenceResult {
   bool Ok() const { return supported && endpointsFailed == 0; }
 };
 
+// Fence result for a backend that has a path from `remote` into this engine and no way
+// to cut it: reported as one failed endpoint, so the combined result is not ok.
+inline FenceResult UncutPath(const std::string& remote, const std::string& transport,
+                             const std::string& why) {
+  FenceResult result;
+  result.supported = true;
+  result.endpointsFailed = 1;
+  result.message = "peer " + remote + " can still write over " + transport + ": " + why;
+  return result;
+}
+
 // Which resource a failure invalidates; each covers a different set of sessions.
 enum class FailureScope : uint32_t {
   kQp = 0,

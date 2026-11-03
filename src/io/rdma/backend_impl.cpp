@@ -644,8 +644,8 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   // Checked under the same lock FenceRemoteEngine takes, so a handshake already in
   // flight cannot slip an endpoint in behind the fence.
   if (fencedPeers_.count(remoteKey) != 0) {
-    throw PeerFencedError("engine " + remoteKey +
-                          " is fenced; connections are refused until it is unfenced");
+    throw PeerIsFencedError("engine " + remoteKey +
+                            " is fenced; connections are refused until it is unfenced");
   }
 
   // Before the transition below, which can itself raise a fatal event.
@@ -850,6 +850,10 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
     } else {
       ++result.endpointsFenced;
     }
+    // A session built concurrently can still hold this QP; marking it failed gets that
+    // session replaced. Nothing else would: refused posts and, without notifications, an
+    // empty receive queue produce no completion to report the QP.
+    RecordQpFailed(ep);
 
     // Same treatment as a fatal async event: refuse new posts, close the ledger,
     // and fail whatever was in flight so no waiter hangs on a completion that the
@@ -1344,8 +1348,8 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   // Refuse before the handshake: the peer would otherwise build its half of a
   // connection that this side then has to throw away.
   if (rdma->IsPeerFenced(ekey)) {
-    throw std::runtime_error("BuildRdmaConn: engine " + ekey +
-                             " is fenced; connections are refused until it is unfenced");
+    throw PeerIsFencedError("BuildRdmaConn: engine " + ekey +
+                            " is fenced; connections are refused until it is unfenced");
   }
   application::TCPEndpointHandle tcph;
   {
@@ -1374,8 +1378,8 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank, devId});
   MessageHeader hdr = p.ReadMessageHeader();
   if (hdr.type == MessageType::Fenced) {
-    throw PeerFencedError("BuildRdmaConn: engine " + ekey +
-                          " has fenced this engine and refuses connections until it unfences it");
+    throw FencedByPeerError("BuildRdmaConn: engine " + ekey +
+                            " has fenced this engine and refuses connections until it unfences it");
   }
   ExpectMessage(hdr, MessageType::RegEndpoint, "BuildRdmaConn reply from " + ekey);
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
@@ -1514,7 +1518,7 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       EndpointId eid;
       try {
         eid = rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
-      } catch (const PeerFencedError&) {
+      } catch (const PeerIsFencedError&) {
         // Fenced after the check above; the guard destroys the endpoint.
         p.WriteMessageFenced();
         break;
@@ -2183,6 +2187,8 @@ FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
 
 bool RdmaBackend::UnfenceRemoteEngine(const EngineKey& remote) {
   if (!rdma || !rdma->UnfenceRemoteEngine(remote)) return false;
+  // Sessions of ours that raced the fence wait to be replaced; they may try again now.
+  ForgetQpReplacementBackoff(remote);
   // The peer's QPs died because of the fence, and it paces their replacement as if its path
   // were failing, up to a minute after repeated fences. Telling it lets it rebuild now.
   server->NotifyUnfenced(remote);
@@ -2227,7 +2233,9 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& loca
     CreateSession(local, remote, *newSess, /*paceQpReplacement=*/failed != nullptr);
   } catch (const std::exception& e) {
     if (failed == nullptr) throw;
-    const bool fenced = dynamic_cast<const PeerFencedError*>(&e) != nullptr;
+    // Only a refusal from the peer; this engine's own fence of the peer says nothing about
+    // how the peer will receive us.
+    const bool fenced = dynamic_cast<const FencedByPeerError*>(&e) != nullptr;
     if (fenced) {
       // The peer cut this engine off on purpose, which says nothing about the path. Forget
       // the replacement pacing, so getting back in once it unfences does not wait it out.

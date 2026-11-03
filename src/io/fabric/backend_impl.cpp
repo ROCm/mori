@@ -835,6 +835,19 @@ bool FabricBackend::PopInboundTransferStatus(EngineKey /*remote*/, TransferUniqu
   return false;
 }
 
+FenceResult FabricBackend::FenceRemoteEngine(const EngineKey& remote) {
+  // Without a fabric-capable device none of our memory is exported, so no peer can reach it.
+  const bool exports = std::any_of(deviceSupportsFabric.begin(), deviceSupportsFabric.end(),
+                                   [](char supported) { return supported != 0; });
+  if (!exports) return FenceResult{};
+  {
+    // vPODs are per device, so a registered peer is treated as reachable.
+    std::lock_guard<std::mutex> lock(remoteEnginesMu);
+    if (remoteEngines.count(remote) == 0) return FenceResult{};
+  }
+  return UncutPath(remote, "fabric", "its import of our fabric handle cannot be revoked");
+}
+
 bool FabricBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
   if (local.loc != MemoryLocationType::GPU || remote.loc != MemoryLocationType::GPU) {
     return false;
