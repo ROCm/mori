@@ -181,6 +181,12 @@ class RdmaManager {
   // Peers fenced and not yet unfenced; guarded by `mu`, like `remotes`, so the
   // fence and the check in ConnectEndpoint cannot interleave.
   std::unordered_set<EngineKey> fencedPeers_;
+  // Endpoints a fence took out of the route table but could not move to Error. They
+  // are no longer in rTable, so only this keeps a later fence from reporting the peer
+  // cut off; every fence retries them. Guarded by `mu`.
+  std::unordered_map<EngineKey, EpPairVec> uncutEndpoints_;
+  // Serializes fences, so a fence never returns while another one is still cutting.
+  std::mutex fenceMu_;
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};

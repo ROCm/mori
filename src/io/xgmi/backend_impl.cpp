@@ -775,14 +775,25 @@ bool XgmiBackend::IsSameNodeEngine(const EngineKey& engineKey) const {
 }
 
 FenceResult XgmiBackend::FenceRemoteEngine(const EngineKey& remote) {
-  // XGMI cannot reach a peer on another node, so it has nothing to report for one.
-  if (remote == myEngKey || !IsSameNodeEngine(remote)) return FenceResult{};
+  // Nothing reaches our memory over XGMI unless we exported some, and a peer known to sit on
+  // another node cannot. Any other peer is assumed to be on this node, including one we have
+  // no record of: it may have our memory descriptor from elsewhere, and deregistering it does
+  // not revoke a mapping it holds.
+  if (remote == myEngKey || !exportedMemory_.load(std::memory_order_acquire)) return FenceResult{};
+  {
+    std::lock_guard<std::mutex> lock(remoteEnginesMu);
+    auto it = peerOnThisNodeSeen_.find(remote);
+    if (it != peerOnThisNodeSeen_.end() && !it->second) return FenceResult{};
+  }
   return UncutPath(remote, "XGMI", "the IPC mapping of our memory it holds cannot be revoked");
 }
 
 void XgmiBackend::RegisterRemoteEngine(const EngineDesc& desc) {
   std::lock_guard<std::mutex> lock(remoteEnginesMu);
   remoteEngines[desc.key] = desc;
+  peerOnThisNodeSeen_[desc.key] = !myNodeId.empty() && !desc.nodeId.empty()
+                                      ? desc.nodeId == myNodeId
+                                      : desc.hostname == myHostname;
   MORI_IO_TRACE("XGMI: Registered remote engine {} hostname {}", desc.key, desc.hostname);
 }
 
@@ -842,6 +853,7 @@ void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
 
   std::unique_lock<std::shared_mutex> lock(ipcMutex);
   localIpcHandles[desc.id] = handle;
+  exportedMemory_.store(true, std::memory_order_release);
   MORI_IO_TRACE("XGMI: Registered memory id={}, addr={}, size={}, ipcOffset={}", desc.id, desc.data,
                 desc.size, desc.ipcOffset);
 }

@@ -814,6 +814,9 @@ int RdmaManager::FailInFlightTransfers(const QpErrorEvent& event) {
 }
 
 FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
+  // One fence at a time: a concurrent one would find the route table already emptied
+  // by this one and report the peer cut off before these QPs are.
+  std::lock_guard<std::mutex> fenceGuard(fenceMu_);
   // Detach the peer's endpoints under the lock so no new session can pick one up
   // from here on. The verbs calls below run without it: FailAll() can wait for an
   // in-flight post, and neither step needs the table.
@@ -821,6 +824,12 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
   {
     std::unique_lock<std::shared_mutex> lock(mu);
     fencedPeers_.insert(remoteKey);
+    // Retry what an earlier fence of this peer could not cut.
+    auto uncut = uncutEndpoints_.find(remoteKey);
+    if (uncut != uncutEndpoints_.end()) {
+      victims = std::move(uncut->second);
+      uncutEndpoints_.erase(uncut);
+    }
     auto it = remotes.find(remoteKey);
     if (it != remotes.end()) {
       for (auto& [topo, eps] : it->second.rTable) {
@@ -837,12 +846,14 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
   result.supported = true;
 
   const std::string message = "peer " + remoteKey + " was fenced; its connection was shut down";
+  EpPairVec stillUncut;
   for (const auto& ep : victims) {
     // Cut the peer off first. This is the step the caller relies on, so it must not
     // wait behind the local bookkeeping below.
     application::RdmaDeviceContext* devCtx = GetRdmaDeviceContext(ep.ldevId);
     if (devCtx == nullptr || !devCtx->ModifyEndpointToErrorNoThrow(ep.local)) {
       ++result.endpointsFailed;
+      stillUncut.push_back(ep);
       MORI_IO_ERROR("fence: could not move qpn={} (peer {}) to Error; peer may still write",
                     ep.local.handle.qpn, remoteKey);
       // Keep going: fencing the remaining QPs still narrows what the peer can do,
@@ -870,6 +881,9 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
     result.message = std::to_string(result.endpointsFailed) + " of " +
                      std::to_string(victims.size()) + " endpoint(s) of peer " + remoteKey +
                      " could not be fenced";
+    std::unique_lock<std::shared_mutex> lock(mu);
+    EpPairVec& uncut = uncutEndpoints_[remoteKey];
+    uncut.insert(uncut.end(), stillUncut.begin(), stillUncut.end());
   }
   return result;
 }
@@ -881,6 +895,8 @@ bool RdmaManager::IsPeerFenced(const EngineKey& remoteKey) const {
 
 bool RdmaManager::UnfenceRemoteEngine(const EngineKey& remoteKey) {
   std::unique_lock<std::shared_mutex> lock(mu);
+  // The caller lets the peer back in, so the QPs a fence could not cut no longer matter.
+  uncutEndpoints_.erase(remoteKey);
   return fencedPeers_.erase(remoteKey) != 0;
 }
 

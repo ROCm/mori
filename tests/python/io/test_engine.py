@@ -697,6 +697,36 @@ def test_fence_unknown_peer_is_ok_but_stays_fenced():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_xgmi_fence_reports_a_peer_it_cannot_place_as_not_cut(monkeypatch):
+    # A peer's XGMI mapping of our memory cannot be revoked, and dropping the peer from
+    # the address book does not revoke it either: only a peer known to sit on another
+    # node is sure to have no XGMI path into this engine.
+    monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "0")
+    config = IOEngineConfig(host="127.0.0.1", port=0)
+
+    def engine(key, node):
+        monkeypatch.setenv("MORI_NODE_ID", node)
+        e = IOEngine(key=key, config=config)
+        e.create_backend(BackendType.RDMA)
+        return e
+
+    receiver = engine("fence_xgmi_receiver", "node_a")
+    local_peer = engine("fence_xgmi_local", "node_a")
+    remote_peer = engine("fence_xgmi_remote", "node_b")
+    for peer in (local_peer, remote_peer):
+        receiver.register_remote_engine(peer.get_engine_desc())
+    receiver.register_torch_tensor(torch.zeros(1024, device="cuda:0"))
+    local_key = local_peer.get_engine_desc().key
+
+    assert not receiver.fence_remote_engine(local_key).ok
+    assert not receiver.fence_remote_engine("fence_xgmi_never_registered").ok
+    receiver.deregister_remote_engine(local_peer.get_engine_desc())
+    assert not receiver.fence_remote_engine(local_key).ok
+    result = receiver.fence_remote_engine(remote_peer.get_engine_desc().key)
+    assert result.ok, result.message
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
 def test_fence_blocks_writes_until_unfenced():
     initiator, target = create_connected_engine_pair(
         "fence_writer", qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1

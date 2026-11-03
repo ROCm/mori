@@ -322,6 +322,10 @@ def test_fence_cuts_peer_until_unfenced():
     uid, st = write(a, a_mem, b_mem, [64 * MiB])
     assert a.wait_all([st]) == StatusCode.ERR_RDMA_OP
     assert pop_inbound(b, a_key, uid, timeout_s=0.05) is None
+    # A retry reconnects and is refused, with an error status rather than for good.
+    uid, st = write(a, a_mem, b_mem, [MiB])
+    assert a.wait_all([st]) == StatusCode.ERR_RDMA_OP
+    assert "fenced" in st.Message()
     _, st = write(b, b_mem, a_mem, [MiB])
     assert st.Code() == StatusCode.ERR_RDMA_OP
     with pytest.raises(RuntimeError, match="fenced"):
@@ -331,6 +335,10 @@ def test_fence_cuts_peer_until_unfenced():
     assert not b.unfence_remote_engine(a_key)
     _, st = write(b, b_mem, a_mem, [MiB])
     assert b.wait_all([st]) == StatusCode.SUCCESS, st.Message()
+    # The fenced producer gets back in too.
+    uid, st = write(a, a_mem, b_mem, [MiB])
+    assert a.wait_all([st]) == StatusCode.SUCCESS, st.Message()
+    assert pop_inbound(b, a_key, uid) is not None
 
 
 def test_fence_unsupported_without_a_network_backend():
@@ -338,6 +346,21 @@ def test_fence_unsupported_without_a_network_backend():
     a = make_engine("pf", backend=BackendType.XGMI)
     result = a.fence_remote_engine("anyone")
     assert not result.supported and not result.ok
+
+
+def test_xgmi_fence_assumes_a_peer_it_cannot_place_is_on_this_node(sim_env):
+    sim_env.setenv("MORI_NODE_ID", "nodeA")
+    a = make_engine("pf", backend=BackendType.XGMI)
+    sim_env.setenv("MORI_NODE_ID", "nodeB")
+    remote = make_engine("dc", backend=BackendType.XGMI)
+    a.register_remote_engine(remote.get_engine_desc())
+    # Nothing exported yet: no peer can write into this engine over XGMI.
+    assert not a.fence_remote_engine("anyone").supported
+    gpu_mem(a, MiB)
+    # A peer known to be on another node has no path; any other peer may hold a mapping.
+    assert not a.fence_remote_engine(remote.get_engine_desc().key).supported
+    unknown = a.fence_remote_engine("anyone")
+    assert unknown.supported and unknown.endpoints_failed == 1 and not unknown.ok
 
 
 def use_catalog(sim_env, tmp_path, *texts):

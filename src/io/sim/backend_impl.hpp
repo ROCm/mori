@@ -166,6 +166,10 @@ class SimBackend : public Backend {
   void EnsurePeerReady(const std::shared_ptr<Peer>& peer, const MemoryDesc& remote);
   bool PeerSocketClosedLocked(Peer& peer);
   void MarkPeerDead(Peer& peer, const std::string& detail);
+  // The connection to `peer` broke (the peer closed it, or a write failed): report it and
+  // drop it, so the next transfer connects again. Only a peer nothing listens for is dead.
+  void DropPeerConnectionLocked(Peer& peer, const std::string& detail);
+  void ReportPeerUnreachable(const Peer& peer, const std::string& detail);
   std::chrono::steady_clock::time_point ReserveLink(bool isRead, size_t bytes, size_t segments);
 
   void TimerLoop();
@@ -185,6 +189,9 @@ class SimBackend : public Backend {
   mutable std::mutex peersMu_;
   std::unordered_map<EngineKey, std::shared_ptr<Peer>> peers_;
   std::unordered_set<EngineKey> fencedPeers_;  // guarded by peersMu_
+  // As XgmiBackend: never forgotten, since deregistering does not revoke an IPC mapping.
+  std::unordered_map<EngineKey, bool> peerOnThisNodeSeen_;  // guarded by peersMu_
+  std::atomic<bool> exportedMemory_{false};
 
   std::mutex memsMu_;
   std::unordered_map<MemoryUniqueId, MemoryDesc> mems_;
