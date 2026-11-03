@@ -404,7 +404,7 @@ AllocateResult PageBackend::Allocate(const std::string& key, uint64_t size) {
 }
 
 AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size,
-                                           int preferred_numa_node) {
+                                           int preferred_numa_node, bool local_lifetime) {
   auto fail = [&](AllocateOutcome outcome, const char* reason) {
     // A full tier fails every put and promotion; log a sample, not each key,
     // since this runs under the exclusive lock.
@@ -473,7 +473,8 @@ AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size
   slot.slot_id = next_slot_id_.fetch_add(1, std::memory_order_relaxed);
   slot.pages = std::move(*pages);
   slot.size = size;
-  slot.deadline = std::chrono::steady_clock::now() + pending_ttl_;
+  slot.deadline = local_lifetime ? std::chrono::steady_clock::time_point::max()
+                                 : std::chrono::steady_clock::now() + pending_ttl_;
   slot.generation = allocator_generation_;
   const uint64_t slot_id = slot.slot_id;
   const auto slot_pages = slot.pages;
@@ -495,7 +496,8 @@ std::vector<AllocateResult> PageBackend::BatchAllocate(
   if (entries.empty()) return out;
   std::unique_lock<std::shared_mutex> lock(mutex_);
   for (size_t i = 0; i < entries.size(); ++i) {
-    out[i] = AllocateLocked(entries[i].key, entries[i].size, entries[i].preferred_numa_node);
+    out[i] = AllocateLocked(entries[i].key, entries[i].size, entries[i].preferred_numa_node,
+                            entries[i].local_lifetime);
     if (out[i].outcome == AllocateOutcome::kSuccessAllocated) {
       out[i].descs = BuildBufferDescsLocked(out[i].pages);
     }

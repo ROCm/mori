@@ -48,6 +48,8 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
   if (!config.backend_policy_path.empty()) dc.backend_policy_path = config.backend_policy_path;
   if (config.page_size.has_value()) dc.dram_page_size = *config.page_size;
   local_only_ = dc.master_config.master_address.empty();
+  const char* direct_get = std::getenv("UMBP_DIRECT_POOL_GET");
+  direct_pool_get_ = dc.medium == UMBPMedium::DRAM && direct_get && std::string(direct_get) == "1";
 
   // All three ownership blocks are lowered unconditionally; dc.medium selects
   // the one PoolClient::Init actually builds a backend from (exactly one medium
@@ -102,12 +104,13 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
     scratch_opts.backing = HostBufferBacking::kAnonymousHugetlb;
     scratch_opts.hugepage_size = dc.ranged_scratch_hugepage_size;
   }
-  // Two separate arenas — GET and PUT — each of ranged_scratch_size, so the two
-  // directions never share a buffer or a lock and can run concurrently.
+  // PUT always has its own arena; direct pool GET does not need a GET arena.
   if (dc.ranged_scratch_size > 0) {
-    ranged_get_scratch_handle_ = platform_->AllocateHost(dc.ranged_scratch_size, scratch_opts);
+    if (!direct_pool_get_)
+      ranged_get_scratch_handle_ = platform_->AllocateHost(dc.ranged_scratch_size, scratch_opts);
     ranged_put_scratch_handle_ = platform_->AllocateHost(dc.ranged_scratch_size, scratch_opts);
-    if (!ranged_get_scratch_handle_.valid() || !ranged_put_scratch_handle_.valid()) {
+    if ((!direct_pool_get_ && !ranged_get_scratch_handle_.valid()) ||
+        !ranged_put_scratch_handle_.valid()) {
       // HostBufferHandle is not RAII and the destructor/Close() won't run when a
       // constructor throws, so free whatever did allocate before bailing out
       // (Free() is a no-op on an invalid handle).
@@ -116,12 +119,14 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
       throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
     }
     // Hugepages fall back to 4 KiB silently, so log what was actually mapped.
-    MORI_UMBP_INFO("[DistributedClient] ranged scratch: 2 arenas x {} MiB, {} KiB pages ({})",
-                   ranged_get_scratch_handle_.mapped_size >> 20,
-                   ranged_get_scratch_handle_.actual_alignment >> 10,
-                   ranged_get_scratch_handle_.actual_backing == HostBufferBacking::kAnonymousHugetlb
-                       ? "hugetlb"
-                       : "anonymous");
+    MORI_UMBP_INFO(
+        "[DistributedClient] ranged scratch: GET={} PUT={} MiB, direct_pool_get={}, "
+        "{} KiB pages ({})",
+        ranged_get_scratch_handle_.mapped_size >> 20, ranged_put_scratch_handle_.mapped_size >> 20,
+        direct_pool_get_, ranged_put_scratch_handle_.actual_alignment >> 10,
+        ranged_put_scratch_handle_.actual_backing == HostBufferBacking::kAnonymousHugetlb
+            ? "hugetlb"
+            : "anonymous");
     ranged_get_scratch_ = ranged_get_scratch_handle_.ptr;
     ranged_get_scratch_size_ = ranged_get_scratch_handle_.mapped_size;
     ranged_put_scratch_ = ranged_put_scratch_handle_.ptr;
@@ -135,6 +140,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
   pc_config.ranged_put_scratch_buffer = ranged_put_scratch_;
   pc_config.ranged_put_scratch_size = ranged_put_scratch_size_;
   pc_config.copy_pipeline = config_.copy_pipeline;
+  pc_config.direct_pool_get = direct_pool_get_;
 
   auto release_scratch = [this] {
     platform_->FreeHost(ranged_get_scratch_handle_);
@@ -462,10 +468,7 @@ void DistributedClient::Close() {
 bool DistributedClient::IsDistributed() const { return true; }
 
 bool DistributedClient::SupportsRangedIO() const {
-  // The scratch arenas are the whole opt-in.  They are purely a remote-path
-  // resource -- remote gets are staged in them, remote puts assembled in them --
-  // and they default to zero, so a deployment that never issues ranged I/O
-  // allocates and registers nothing.
+  // Remote ranged PUT needs an arena; GET uses its own arena or direct pool pages.
   //
   // Deliberately NOT gated on the medium.  SSD used to be excluded here on the
   // reasoning that its bytes are not addressable by the transfer layer, but
@@ -488,7 +491,7 @@ bool DistributedClient::SupportsRangedIO() const {
   // either report ranged I/O as unsupported or allocate two arenas it cannot
   // use.
   if (local_only_) return true;
-  return ranged_get_scratch_size_ != 0 && ranged_put_scratch_size_ != 0;
+  return (direct_pool_get_ || ranged_get_scratch_size_ != 0) && ranged_put_scratch_size_ != 0;
 }
 
 bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,
