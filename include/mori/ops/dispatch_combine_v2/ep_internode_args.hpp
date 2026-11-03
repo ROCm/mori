@@ -333,11 +333,8 @@ struct EpInterNodeArgs {
   // the binding computes.
   int32_t replayMode{0};
   int32_t curRankNumToken{0};
-  // AsyncLL/SDMA only: added to the destination PE when picking that peer's SDMA
-  // queue (asyncll::QueueForPe). Each op in a process gets its own value, so two
-  // ops whose calls interleave -- TBO's two micro-batches -- post to different
-  // queues, and a recv's local-completion drain waits only for its own op's
-  // copies. It takes the 4-byte alignment gap before the pointers: no field moves.
+  // AsyncLL/SDMA: per-op offset added to the destination PE when picking its SDMA
+  // queue (asyncll::QueueForPe). Fills the alignment gap, so no field moves.
   int32_t sdmaQueueOffset{0};
 
   ep_index_t* tokenIndices{nullptr};

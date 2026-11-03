@@ -563,22 +563,12 @@ def run_back_to_back(d, comm, rounds):
 
 
 def run_two_ops_interleaved(d, comm_a, comm_b, layers):
-    """Two ops whose calls interleave as TBO issues them on one stream.
+    """Two ops interleaved as single-stream TBO issues them, no host sync.
 
-    A two-batch overlap builds one op per micro-batch, each on its own
-    communicator, and enqueues every recv right behind the OTHER op's send:
-
-        A.dispatch_send, [B.combine_recv of the previous layer], B.dispatch_send,
-        A.dispatch_recv, A.combine_send, B.dispatch_recv, B.combine_send,
-        A.combine_recv, next layer ...
-
-    The SDMA queues behind both ops are the same process-wide ones, so both ops
-    ask for a queue of their own (async_ll_own_sdma_queue), and this checks that
-    they get different ones (otherwise each recv's drain also waits for the other
-    op's copies -- correct, but it serialises the overlap), that an op created and
-    closed before B, or one that keeps the shared queue, does not move B off the
-    queue A leaves free, that LSA takes no queue, and that the interleaving stays
-    correct with no host sync. The two capacities differ, as a TBO child's does.
+    Checks that two opted-in ops get different SDMA queues, that an op closed
+    before B or one on the shared queue does not move B off the free queue,
+    that LSA takes no queue, and that results stay correct. The capacities
+    differ, as a TBO child's does.
     """
     hidden, topk, epr = 4096, 6, 16
     caps = (64, 32)

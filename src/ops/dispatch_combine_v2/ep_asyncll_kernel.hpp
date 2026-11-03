@@ -149,16 +149,9 @@ __device__ __forceinline__ int SrcTokenIndex(const EpInterNodeDeviceCfg& config,
   return pe * config.MaxNumTokensToSendPerRank() + srcTokId;
 }
 
-// `offset` (args.sdmaQueueOffset) is per op. SDMA queues are process-global per
-// GPU pair, so without it every op in the process posts to the same queue for a
-// given peer, and RecvTransfer's quietQueue -- which drains the WHOLE queue --
-// then also waits for whatever another op posted there. Under TBO each recv is
-// enqueued right after the other micro-batch's send, so it waited for that
-// unrelated transfer to finish. The drain only has to cover this op's own
-// sources (staging and the count/epoch words), and with the offset it does.
-// All of one op's traffic to a peer still shares one queue, so the in-order
-// guarantees the protocol relies on (payload before its ready word, dispatch
-// before combine) are unchanged.
+// `offset` (args.sdmaQueueOffset) is per op, so ops that opt in post to their own
+// queue and a recv's drain no longer waits for another op's copies. One op's
+// traffic to a peer still shares one queue, so the protocol's ordering holds.
 __device__ __forceinline__ int QueueForPe(const ::mori::cco::ccoDevComm& comm, int destPe,
                                           int offset) {
   const uint32_t n = comm.sdma.sdmaNumQueue;

@@ -142,18 +142,15 @@ def _geometry_from_env(name):
 # would have held MI300X and MI325X, which have the full set, to three as well.
 _ASYNCLL_SDMA_QUEUE_CAP = {"mi308x": 3}
 
-# Live AsyncLL ops per SDMA queue offset (args.sdmaQueueOffset), per device.
-# See _take_sdma_queue_offset.
+# Per device: how many live AsyncLL ops use each SDMA queue offset.
 _ASYNCLL_QUEUE_OFFSET_USERS = collections.defaultdict(collections.Counter)
 
 
 def _take_sdma_queue_offset(device_index: int, num_queues: int) -> int:
-    """The least-used offset among live ops on the device, lowest on a tie.
+    """Least-used offset among live ops on the device, lowest on a tie.
 
-    Ops give theirs back in close(), so an op created and closed earlier does not
-    push later ones round the ring, and two live ops land on different queues
-    whenever the comm has two. With more live ops than queues they fold, which is
-    slower but still correct.
+    close() gives it back. More live ops than queues share one: slower, still
+    correct.
     """
     users = _ASYNCLL_QUEUE_OFFSET_USERS[device_index]
     offset = min(range(num_queues), key=lambda o: (users[o], o))
@@ -435,10 +432,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             if (cfg.is_internode or cfg.async_ll)
             else None
         )
-        # Which of each peer's SDMA queues this op posts to (QueueForPe adds this
-        # to the destination PE). 0 -- the queue every op shares -- unless the
-        # caller asked for a queue of its own (cfg.async_ll_own_sdma_queue says
-        # when that pays). LSA posts nothing to an SDMA queue, so it takes none.
+        # SDMA queue offset (QueueForPe adds it to the destination PE): 0, the
+        # shared queue, unless the caller opted in. LSA uses no SDMA queue.
         self._sdma_queue_offset = 0
         self._holds_sdma_queue_offset = False
         if (

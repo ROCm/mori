@@ -214,20 +214,11 @@ class EpDispatchCombineConfig:
     # Pick "lsa" for a small-batch, empty-seam call; keep "sdma" otherwise, when
     # the point is the overlap, or when this op will later run across nodes.
     async_ll_transport: str = "sdma"
-    # Give this op its own SDMA queue to each peer instead of the one every AsyncLL
-    # op in the process shares (async_ll with the "sdma" transport only; ignored
-    # otherwise).
-    #
-    # SDMA queues are process-wide per GPU pair, and a recv drains the whole queue
-    # it sent on. When two ops' calls interleave on ONE stream -- two-batch
-    # overlap issuing both micro-batches on the compute stream -- each recv is
-    # enqueued right behind the other op's send and waits for it too; a queue of
-    # its own removes that wait. When the two ops run on SEPARATE streams the
-    # shared queue drains the first-posted op first, while two queues split the
-    # link between both ops and finish both later.
-    #
-    # Set it on both ops of a single-stream two-batch overlap; leave it off when
-    # the micro-batches run on their own streams, where it is clearly slower.
+    # Give this op its own SDMA queue per peer instead of the shared one (sdma
+    # transport only). Set it when two ops interleave on one stream, e.g.
+    # single-stream two-batch overlap: a recv then no longer waits for the other
+    # op's send. Leave it off when the ops run on separate streams; it is slower
+    # there.
     async_ll_own_sdma_queue: bool = False
 
     def __post_init__(self):
