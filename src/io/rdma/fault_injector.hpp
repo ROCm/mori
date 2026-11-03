@@ -32,6 +32,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -82,6 +83,11 @@ class FaultInjector final : public VerbsOps {
   void Disarm() noexcept;
   uint64_t Fired() const { return fired_.load(std::memory_order_relaxed); }
   bool Failed() const { return failed_.load(std::memory_order_relaxed); }
+  // A signaled RDMA READ or WRITE posted since Arm() whose completion has not been polled
+  // although its QP can still run it (not in ERR, not on a dead CQ or device), described
+  // for a log; empty if there is none. A transfer that reports a failure while this is
+  // non-empty told its caller to free buffers its WRs may still move data into or out of.
+  std::string DataWrInFlight();
 
   int PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) override;
   int PostRecv(ibv_qp* qp, ibv_recv_wr* wr, ibv_recv_wr** bad) override;
@@ -142,6 +148,9 @@ class FaultInjector final : public VerbsOps {
   std::unordered_map<ibv_cq*, ibv_context*> deadCqs_;
   std::unordered_set<ibv_context*> deadDevices_;
   std::atomic<bool> hasDeadResources_{false};
+  // For DataWrInFlight(): from Arm() to Disarm(), independent of the rule running out.
+  std::atomic<bool> tracking_{false};
+  std::map<std::tuple<ibv_context*, uint32_t, uint64_t>, ibv_qp*> dataWrsInFlight_;
   std::map<PortKey, DownPort> downPorts_;
   std::condition_variable timerCv_;
   std::thread timer_;

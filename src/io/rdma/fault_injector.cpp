@@ -263,8 +263,10 @@ void FaultInjector::Arm(const FaultRule& rule) {
     triggered_ = 0;
     failed_.store(false, std::memory_order_relaxed);
     qps_.clear();
+    dataWrsInFlight_.clear();
   }
   fired_.store(0, std::memory_order_relaxed);
+  tracking_.store(true, std::memory_order_release);
   armed_.store(true, std::memory_order_release);
   MORI_IO_WARN("Fault injection armed: kind={} skip={} count={} value={} op={} qpn={}",
                FaultKindName(rule.kind), rule.skip, rule.count, rule.value, rule.wcOpcode,
@@ -274,6 +276,8 @@ void FaultInjector::Arm(const FaultRule& rule) {
 void FaultInjector::Disarm() noexcept try {
   std::lock_guard<std::mutex> lock(mu_);
   armed_.store(false, std::memory_order_release);
+  tracking_.store(false, std::memory_order_release);
+  dataWrsInFlight_.clear();
   // Rule exhaustion already stopped new triggers. Only port_down uses explicit
   // Disarm as recovery; a flap must finish its timed interval independently.
   for (auto it = downPorts_.begin(); it != downPorts_.end();) {
@@ -367,8 +371,33 @@ int FaultInjector::PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) {
     FailInjection("preparing send injection");
   }
   int ret = real_.PostSend(qp, wr, bad);
+  if (tracking_.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (ibv_send_wr* cur = wr; cur != nullptr && (ret == 0 || cur != *bad); cur = cur->next) {
+      const bool data = cur->opcode == IBV_WR_RDMA_WRITE ||
+                        cur->opcode == IBV_WR_RDMA_WRITE_WITH_IMM ||
+                        cur->opcode == IBV_WR_RDMA_READ;
+      if (data && (cur->send_flags & IBV_SEND_SIGNALED)) {
+        dataWrsInFlight_[{qp->context, qp->qp_num, cur->wr_id}] = qp;
+      }
+    }
+  }
   if (inject) PublishAsyncEvent(qp, SendOpcode(wr), event);
   return ret;
+}
+
+std::string FaultInjector::DataWrInFlight() {
+  std::lock_guard<std::mutex> lock(mu_);
+  for (const auto& [key, qp] : dataWrsInFlight_) {
+    if (deadDevices_.count(qp->context) || deadCqs_.count(qp->send_cq)) continue;
+    ibv_qp_attr attr{};
+    ibv_qp_init_attr init{};
+    if (ibv_query_qp(qp, &attr, IBV_QP_STATE, &init) == 0 && attr.qp_state == IBV_QPS_ERR) continue;
+    return "qpn=" + std::to_string(std::get<1>(key)) +
+           " wr_id=" + std::to_string(std::get<2>(key)) + " (QP state " +
+           std::to_string(attr.qp_state) + ")";
+  }
+  return "";
 }
 
 int FaultInjector::PostRecv(ibv_qp* qp, ibv_recv_wr* wr, ibv_recv_wr** bad) {
@@ -405,6 +434,10 @@ int FaultInjector::PollCq(ibv_cq* cq, int numEntries, ibv_wc* wc) try {
     if (deadCqs_.count(cq) || deadDevices_.count(cq->context)) return 0;
   }
   int n = real_.PollCq(cq, numEntries, wc);
+  if (n > 0 && tracking_.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (int i = 0; i < n; ++i) dataWrsInFlight_.erase({cq->context, wc[i].qp_num, wc[i].wr_id});
+  }
   // A fatal injection can race a poll already inside the provider.
   if (hasDeadResources_.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lock(mu_);
