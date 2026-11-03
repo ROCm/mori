@@ -788,13 +788,25 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         )
         self.assertEqual(source.tolist(), [0, 1, 0, 1, 2, 3])
         params = [
-            torch_fsdp.AllGatherParamMetadata([n], [torch.float32], [1], [], False)
+            torch_fsdp.AllGatherParamMetadata(
+                input_numels=[n],
+                input_dtypes=[torch.float32],
+                outer_sizes=[1],
+                outputs=[],
+                backend_owned=False,
+            )
             for n in [2, 4]
         ]
         output.copy_(source.repeat(2))
         with patch.object(torch.cuda, "current_stream"):
             result = comm.layout.finalize_outputs(
-                torch_fsdp.AllGatherFinalizeMetadata(output, params, 2, metadata, [])
+                torch_fsdp.AllGatherFinalizeMetadata(
+                    all_gather_output=output,
+                    param_metadata=params,
+                    world_size=2,
+                    output_metadata=metadata,
+                    buffers=[],
+                )
             )
         self.assertIsNone(pool._slots[0].owner)
         self.assertTrue(result.buffers)
@@ -1031,11 +1043,21 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         output = comm.allocate((4,), dtype=torch.float32, device=torch.device("cpu"))
         output.copy_(torch.arange(4.0))
         params = [
-            torch_fsdp.AllGatherParamMetadata([2], [torch.float32], [1], [output], True)
+            torch_fsdp.AllGatherParamMetadata(
+                input_numels=[2],
+                input_dtypes=[torch.float32],
+                outer_sizes=[1],
+                outputs=[output],
+                backend_owned=True,
+            )
         ]
         comm.layout.finalize_outputs(
             torch_fsdp.AllGatherFinalizeMetadata(
-                output, params, 2, torch_fsdp._POOLED_RANK_MAJOR, []
+                all_gather_output=output,
+                param_metadata=params,
+                world_size=2,
+                output_metadata=torch_fsdp._POOLED_RANK_MAJOR,
+                buffers=[],
             )
         )
         self.assertIs(pool._slots[0].owner, comm)
@@ -1067,14 +1089,25 @@ class TestMoriFsdpOwnedLayout(unittest.TestCase):
     def test_parameter_outputs_refill_in_place_and_release_staging(self):
         comm = MoriSdmaAllGather(fsdp_owned_output=True)
         params = [
-            torch_fsdp.AllGatherParamMetadata([n], [torch.float32], [1], [])
+            torch_fsdp.AllGatherParamMetadata(
+                input_numels=[n],
+                input_dtypes=[torch.float32],
+                outer_sizes=[1],
+                outputs=[],
+            )
             for n in (2, 4)
         ]
         selection = comm.layout.prepare_output(self._metadata())
         source = torch.arange(12.0)
         with patch.object(comm, "release_output") as release:
             result = comm.layout.finalize_outputs(
-                torch_fsdp.AllGatherFinalizeMetadata(source, params, 2, selection, [])
+                torch_fsdp.AllGatherFinalizeMetadata(
+                    all_gather_output=source,
+                    param_metadata=params,
+                    world_size=2,
+                    output_metadata=selection,
+                    buffers=[],
+                )
             )
             release.assert_called_once()
         self.assertEqual(len(result.buffers), 1)
@@ -1087,7 +1120,11 @@ class TestMoriFsdpOwnedLayout(unittest.TestCase):
         with patch.object(comm, "release_output") as release:
             refilled = comm.layout.finalize_outputs(
                 torch_fsdp.AllGatherFinalizeMetadata(
-                    source + 10, params, 2, selection, result.buffers
+                    all_gather_output=source + 10,
+                    param_metadata=params,
+                    world_size=2,
+                    output_metadata=selection,
+                    buffers=result.buffers,
                 )
             )
             release.assert_called_once()
@@ -1101,7 +1138,12 @@ class TestMoriFsdpOwnedLayout(unittest.TestCase):
             with self.subTest(rank_major_first=rank_major_first):
                 comm = MoriSdmaAllGather(fsdp_owned_output=True)
                 params = [
-                    torch_fsdp.AllGatherParamMetadata([n], [torch.float32], [1], [])
+                    torch_fsdp.AllGatherParamMetadata(
+                        input_numels=[n],
+                        input_dtypes=[torch.float32],
+                        outer_sizes=[1],
+                        outputs=[],
+                    )
                     for n in (2, 4)
                 ]
                 selection = comm.layout.prepare_output(self._metadata())
@@ -1110,7 +1152,11 @@ class TestMoriFsdpOwnedLayout(unittest.TestCase):
                 with patch.object(comm, "release_output") as release:
                     first = comm.layout.finalize_outputs(
                         torch_fsdp.AllGatherFinalizeMetadata(
-                            torch.arange(12.0), params, 2, selection, []
+                            all_gather_output=torch.arange(12.0),
+                            param_metadata=params,
+                            world_size=2,
+                            output_metadata=selection,
+                            buffers=[],
                         )
                     )
                     self.assertEqual(len(first.buffers), 2 if rank_major_first else 1)
@@ -1127,7 +1173,11 @@ class TestMoriFsdpOwnedLayout(unittest.TestCase):
                         selection = comm.layout.prepare_output(metadata)
                         refilled = comm.layout.finalize_outputs(
                             torch_fsdp.AllGatherFinalizeMetadata(
-                                source, params, 2, selection, first.buffers
+                                all_gather_output=source,
+                                param_metadata=params,
+                                world_size=2,
+                                output_metadata=selection,
+                                buffers=first.buffers,
                             )
                         )
                         self.assertIs(refilled.buffers, first.buffers)
@@ -1144,7 +1194,12 @@ class TestMoriFsdpOwnedLayout(unittest.TestCase):
 
     def test_multiple_payload_views(self):
         params = [
-            torch_fsdp.AllGatherParamMetadata([2, 4], [torch.float32] * 2, [1, 1], [])
+            torch_fsdp.AllGatherParamMetadata(
+                input_numels=[2, 4],
+                input_dtypes=[torch.float32] * 2,
+                outer_sizes=[1, 1],
+                outputs=[],
+            )
         ]
         views = torch_fsdp._param_contiguous_views(torch.arange(12.0), params, 2)
         self.assertEqual(len(views[0]), 2)

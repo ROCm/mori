@@ -368,7 +368,8 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
                     buffer = torch.empty_like(output)
                     buffer.copy_(output)
                     return AllGatherOutputs(
-                        _param_contiguous_views(buffer, params, world_size), [buffer]
+                        tensors=_param_contiguous_views(buffer, params, world_size),
+                        buffers=[buffer],
                     )
                 if (
                     len(metadata.buffers) == 1
@@ -382,7 +383,8 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
                         for target, source in zip(param.outputs, new_views):
                             target.narrow(0, 0, source.numel()).copy_(source)
                 return AllGatherOutputs(
-                    [param.outputs for param in params], metadata.buffers
+                    tensors=[param.outputs for param in params],
+                    buffers=metadata.buffers,
                 )
             finally:
                 self._comm.release_output()
@@ -395,7 +397,9 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
             self._comm._aliases_pool = any(
                 not param.outputs or param.backend_owned for param in params
             )
-        return AllGatherOutputs(_param_contiguous_views(output, params, world_size))
+        return AllGatherOutputs(
+            tensors=_param_contiguous_views(output, params, world_size), buffers=[]
+        )
 
 
 class _MoriBackendOwnedAllGatherLayout(
