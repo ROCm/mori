@@ -522,8 +522,7 @@ FenceResult SimBackend::FenceRemoteEngine(const EngineKey& remote) {
     peer->verifiedMems.clear();
   }
   MORI_IO_INFO("SimBackend({}) fenced engine {}: {} connection(s), {} transfer(s) in flight",
-               sim::BackendTypeName(type_), remote, result.endpointsFenced,
-               result.transfersFailed);
+               sim::BackendTypeName(type_), remote, result.endpointsFenced, result.transfersFailed);
   return result;
 }
 
@@ -735,8 +734,8 @@ void SimBackend::Complete(Completion& c) {
       c.peer->inFlight.fetch_sub(1);
       // Fenced after this transfer was submitted: its connection was cut, but the peer is fine.
       if (c.peer->fenceEpoch.load() != c.fenceEpoch) {
-        c.status->Update(StatusCode::ERR_RDMA_OP, "peer " + c.peer->desc.key +
-                                                      " was fenced; its connection was shut down");
+        c.status->Update(StatusCode::ERR_RDMA_OP,
+                         "peer " + c.peer->desc.key + " was fenced; its connection was shut down");
         return;
       }
       if (c.peer->dead.load()) {

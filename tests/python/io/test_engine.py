@@ -669,7 +669,10 @@ def _seconds_until_write_lands(initiator, initiator_mem, target_mem, budget_s=20
 
 
 def _write_eventually(initiator, initiator_mem, target_mem, budget_s=20.0):
-    return _seconds_until_write_lands(initiator, initiator_mem, target_mem, budget_s) is not None
+    return (
+        _seconds_until_write_lands(initiator, initiator_mem, target_mem, budget_s)
+        is not None
+    )
 
 
 # QP replacement after a failure is paced at 1 s or more (#831), so recovering faster than
@@ -750,7 +753,9 @@ def test_producer_retrying_while_fenced_gets_back_in_quickly():
     initiator, target = create_connected_engine_pair(
         "fence_retry", qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
     )
-    _, _, initiator_mem, target_mem = alloc_and_register_mem((initiator, target), (1, 64))
+    _, _, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, 64)
+    )
     assert _write_and_wait(initiator, initiator_mem, target_mem).Succeeded()
     initiator_key = initiator.get_engine_desc().key
 

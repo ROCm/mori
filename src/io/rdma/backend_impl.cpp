@@ -1407,9 +1407,10 @@ void ControlPlaneServer::NotifyUnfenced(const EngineKey& ekey) noexcept {
     TcpEndpointGuard tcpGuard(ctx.get(), tcph);
     Protocol(tcph).WriteMessageUnfenced({myEngKey});
   } catch (const std::exception& e) {
-    MORI_IO_WARN("Could not tell engine {} it was unfenced ({}); it reconnects once its QP "
-                 "replacement backoff expires",
-                 ekey, e.what());
+    MORI_IO_WARN(
+        "Could not tell engine {} it was unfenced ({}); it reconnects once its QP "
+        "replacement backoff expires",
+        ekey, e.what());
   } catch (...) {
   }
 }
@@ -1894,7 +1895,8 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
 
   server.reset(new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, config, rdma.get(),
                                       notif.get()));
-  server->SetUnfencedHandler([this](const EngineKey& remote) { ForgetQpReplacementBackoff(remote); });
+  server->SetUnfencedHandler(
+      [this](const EngineKey& remote) { ForgetQpReplacementBackoff(remote); });
   server->Start();
 
   if (config.qpPerTransfer == 1 && rdma->HasIonicDevice()) {

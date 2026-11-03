@@ -403,7 +403,8 @@ void TestRestartedPeerRefusedUntilUnfenced(Rig& rig) {
   Link(rig.producer.get(), rig.receiver.get());
 
   Buffer src(rig.producer.get(), 0xF6);
-  CHECK(WriteRefused(rig.producer.get(), src, dst), "a peer restarted while fenced must be refused");
+  CHECK(WriteRefused(rig.producer.get(), src, dst),
+        "a peer restarted while fenced must be refused");
   CHECK(dst.AllEqual(0x00), "a refused write must not land");
 
   CHECK(rig.receiver->UnfenceRemoteEngine(kProducer), "producer must have been fenced");
