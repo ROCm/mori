@@ -87,36 +87,28 @@ enum ccoGdaThreadMode : uint32_t {
   ccoGdaThreadAggregate = 1,
 };
 
-// Template argument of put / putValue / get (the last one), so an unused flag
-// costs nothing. A flag the implementation does not support is a compile error.
-enum ccoGdaOptFlags : uint32_t {
-  ccoGdaOptFlagsDefault = 0,
-  // Not implemented: the SQ space check always runs. Rejected at compile time.
-  ccoGdaOptFlagsMaySkipCreditCheck = (1 << 0),
-  // Write the WQEs and mark them ready, but do not ring the doorbell. A later
-  // non-deferred post, signal, flush, flushAsync or counter on the same QP rings
-  // for them. Until one of those runs, the NIC has not been told about them.
-  // Pays when one warp posts many WQEs to a QP and releases them once; for one
-  // or two per release, or many warps on one QP, plain posts cost the same and
-  // start the transfer sooner.
-  ccoGdaOptFlagsDeferDoorbell = (1 << 1),
-  // Caller-ordered posting. On a deferred put / putValue / get: write the WQEs
-  // and publish nothing (no ready mark, no system fence). On flush(peer) /
-  // flushAsync: ring once straight up to the postIdx snapshot instead of
-  // sweeping ready marks. The caller guarantees that (a) every WQE below a flush's
-  // snapshot has been completely written by the time the flush starts (e.g. each
-  // poster bumps a counter after its post returns and the flusher waits for it),
-  // (b) every post to the QP uses this flag, and (c) the WQEs posted between two
-  // flushes fit in the SQ (nothing rings for them, so a full SQ never drains).
-  // Concurrent posters are fine; concurrent flushers on one QP serialize on the
-  // doorbell lock. This is the pre-#625 deferred doorbell with the race moved to
-  // the caller's contract.
-  ccoGdaOptFlagsPostedBeforeFlush = (1 << 2),
+// How a ccoGda handle's posts reach the doorbell: its second template argument,
+// so the mode is fixed at compile time for every put / putValue / get on it.
+enum ccoGdaDoorbellMode : uint32_t {
+  // Default: a post rings its own doorbell, coalesced with the posts behind it.
+  ccoGdaDoorbellImmediate = 0,
+  // A post writes its WQEs and a ready mark but does not ring. Any later ring on
+  // the QP (an Immediate post, signal, flush, flushAsync, counter, SQ-space wait)
+  // releases it. Pays when one warp posts many WQEs to a QP and releases them once.
+  ccoGdaDoorbellDeferred = 1,
+  // A post writes its WQEs only (no ready mark, no system fence) and returns once
+  // its stores have completed. Only a CallerOrdered flush(peer) / flushAsync /
+  // flush() / counter() releases it, ringing straight up to its postIdx snapshot.
+  // Contract: (a) when such a flush starts, no post on that QP (peer + context)
+  // is still writing -- order posts before the flush, e.g. posters bump a counter
+  // after the post returns and the flusher waits for it; (b) while CallerOrdered
+  // posts are pending on a QP, every post and flush on it goes through a
+  // CallerOrdered handle (others wait for ready marks that never come); (c) fewer
+  // than sqWqeNum WQEs between two flushes. flush() and counter() ring every
+  // peer's QP on the context, so (a) and (b) then cover all of them. No signal():
+  // it rings on its own.
+  ccoGdaDoorbellCallerOrdered = 2,
 };
-inline constexpr uint32_t kCcoGdaSupportedOptFlags =
-    ccoGdaOptFlagsDeferDoorbell | ccoGdaOptFlagsPostedBeforeFlush;
-// flush(peer) / flushAsync take only this one.
-inline constexpr uint32_t kCcoGdaSupportedFlushOptFlags = ccoGdaOptFlagsPostedBeforeFlush;
 
 typedef enum ccoGdaSignalOp_t {
   ccoGdaSignalInc = 0,
@@ -169,8 +161,13 @@ struct ccoGdaCtx {
   int contextId;
 };
 
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell = ccoGdaDoorbellImmediate>
 struct ccoGda {
+  static_assert(Doorbell <= ccoGdaDoorbellCallerOrdered, "unknown ccoGdaDoorbellMode");
+  // The doorbell mode as the impl:: posting switches.
+  static constexpr bool kDeferDoorbell = Doorbell != ccoGdaDoorbellImmediate;
+  static constexpr bool kCallerOrdered = Doorbell == ccoGdaDoorbellCallerOrdered;
+
   ccoDevComm const& comm;
   int rank;    // my index in the GDA team [0, nRanks)
   int nRanks;  // GDA team size, derived from gdaConnType at construction
@@ -183,11 +180,12 @@ struct ccoGda {
   template <ccoTeamMode TeamMode>
   __device__ inline int resolveWorldPeer(int peer) const;
 
+  // put / putValue / get reach the doorbell as the handle's Doorbell mode says.
+
   // put: rdma write with optional remote signal.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
             ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent,
-            typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread,
-            uint32_t OptFlags = ccoGdaOptFlagsDefault>
+            typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes,
                              RemoteAction remoteAction = ccoGda_NoSignal{}, Coop coop = Coop{});
@@ -195,23 +193,22 @@ struct ccoGda {
   // putValue: write an immediate value (≤8 bytes) with optional remote signal.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
             ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename T,
-            typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread,
-            uint32_t OptFlags = ccoGdaOptFlagsDefault>
+            typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread>
   __device__ inline void putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
                                   RemoteAction remoteAction = ccoGda_NoSignal{},
                                   Coop coop = Coop{});
 
   // get: rdma read — pull peer's window content into our local window.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
-            ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename Coop = ccoCoopThread,
-            uint32_t OptFlags = ccoGdaOptFlagsDefault>
+            ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename Coop = ccoCoopThread>
   __device__ inline void get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
                              ccoWindow_t localWin, size_t localOffset, size_t bytes,
                              Coop coop = Coop{});
 
   // ── signal ──────────────────────────────────────────────────────────────
 
-  // signal: send a signal-only message to peer (no data payload).
+  // signal: send a signal-only message to peer (no data payload). Always rings,
+  // so not on a CallerOrdered handle.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename RemoteAction = ccoGda_NoSignal,
             typename Coop = ccoCoopThread>
   __device__ inline void signal(int peer, RemoteAction remoteAction, Coop coop = Coop{});
@@ -249,7 +246,8 @@ struct ccoGda {
   // flush = flushAsync + wait per peer.
   // flushAsync snapshots the reservation counter and rings the doorbell up to it,
   // which covers deferred posts; wait polls the CQ until the WQEs up to that
-  // snapshot complete.
+  // snapshot complete. On a CallerOrdered handle flush / flushAsync / counter
+  // ring straight up to the snapshot (see ccoGdaDoorbellCallerOrdered).
 
   // flush: poll CQ for every peer.
   // peers are distributed across the Coop group (default: warp).
@@ -258,16 +256,14 @@ struct ccoGda {
   __device__ inline void flush(Coop coop = Coop{});
 
   // flush(peer): poll CQ for a single peer until its submitted WQEs complete.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp,
-            uint32_t OptFlags = ccoGdaOptFlagsDefault>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
   __device__ inline void flush(int peer, Coop coop = Coop{});
 
   // flushAsync: snapshot this peer's QP progress and return a request handle
   // that wait() can later be used to wait on individually. It rings up to the
   // snapshot, so it may wait for posts on the QP still writing their WQEs; only
   // the CQ drain is left to wait(). The request is valid in the coop leader.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread,
-            uint32_t OptFlags = ccoGdaOptFlagsDefault>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread>
   __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest, Coop coop = Coop{});
 
   // wait: block on a request handle previously returned by flushAsync, called
@@ -583,21 +579,32 @@ __device__ inline static uint32_t warpAggregateBnxtPsn(core::WorkQueueHandle* wq
 //
 // So a post behind others does not wait for each of them to ring in turn, a
 // burst of posts on one QP shares doorbells, and a post may skip ringing
-// entirely (ccoGdaOptFlagsDeferDoorbell): the next post or flush to sweep picks
-// it up.
+// entirely (a ccoGdaDoorbellDeferred handle): the next post or flush to sweep
+// picks it up.
 //
 // dbTouchIdx keeps its meaning, "the NIC has been told about every WQE below
 // this", which quietUntil's MSN cap and the SQ space check rely on. The sweep
 // only crosses a slot whose mark carries that slot's own index, so it never rings
 // for a WQE that is reserved but not yet written -- the bug that removed the old
 // deferred doorbell (#625). Every post rewrites the tag at its first slot -- its
-// mark, or count 0 on the fast path -- so a stale tag carries the index of the
-// last post that started there, and a never-written one has count 0. A stale tag
-// matches only if no post started at that slot for exactly a multiple of 2^32
-// WQEs. (Without the fast-path write, any run of 2^32 fast-path posts would do.)
+// mark, or count 0 on the fast path and for CallerOrdered posts -- so a stale tag
+// carries the index of the last post that started there, and a never-written one
+// has count 0. A stale tag matches only if no post started at that slot for
+// exactly a multiple of 2^32 WQEs. (Without the fast-path write, any run of 2^32
+// fast-path posts would do.)
+//
+// A CallerOrdered post neither marks nor rings, and its flush rings straight up
+// to a postIdx snapshot without reading marks: the caller has ordered every post
+// below the snapshot before the flush, and no sweeper runs on such a QP.
 
 __device__ inline static uint64_t readyTag(uint32_t base, uint32_t count) {
   return (static_cast<uint64_t>(base) << 32) | count;
+}
+
+// Retire the old mark at a post's first slot: count 0 never matches.
+__device__ inline static void retireReadyTag(core::WorkQueueHandle* wq, uint32_t base) {
+  __hip_atomic_store(&wq->readyMarks[base & (wq->sqWqeNum - 1)].tag, readyTag(base, 0),
+                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 // Memory ordering here follows the rest of this file: relaxed agent-scope atomics
@@ -662,15 +669,21 @@ __device__ inline static bool tryLockDoorbell(core::WorkQueueHandle* wq) {
                                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-// The next holder must see the dbTouchIdx this one published. That store is a
-// coherent (agent-scope atomic) store, so waiting for it to complete is enough;
-// a release here would also write back L2.
-__device__ inline static void unlockDoorbell(core::WorkQueueHandle* wq) {
+// Wait until this wave's stores have completed: enough for coherent targets
+// (agent-scope atomics, the uncached SQ rings), with no L2 write-back.
+__device__ inline static void waitStoresComplete() {
 #if defined(__GFX12__)
   __asm__ volatile("s_wait_storecnt 0x0" ::: "memory");  // gfx12 has no s_waitcnt
 #else
   __builtin_amdgcn_s_waitcnt(0);
 #endif
+}
+
+// The next holder must see the dbTouchIdx this one published. That store is a
+// coherent (agent-scope atomic) store, so waiting for it to complete is enough;
+// a release here would also write back L2.
+__device__ inline static void unlockDoorbell(core::WorkQueueHandle* wq) {
+  waitStoresComplete();
   __hip_atomic_store(&wq->postSendLock, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
@@ -767,20 +780,25 @@ __device__ inline static void ringUntil(core::RdmaEndpointDevice* ep, uint32_t t
 // without a mark or the lock: one system fence before the doorbell, as when every
 // post rang its own. It does not look for ready posts behind it -- that read
 // costs as much as the doorbell -- they ring for themselves once it publishes.
-template <core::ProviderType PrvdType, bool DeferDoorbell, bool NoMark = false>
+//
+// CallerOrdered: no mark, no ring; retire the slot's old tag and return once the
+// stores have completed, so the caller can order this post before its flush.
+template <core::ProviderType PrvdType, bool DeferDoorbell, bool CallerOrdered = false>
 __device__ inline static void submitWqes(core::RdmaEndpointDevice* ep, uint32_t base,
                                          uint32_t count, uint64_t dbrVal) {
-  static_assert(!NoMark || DeferDoorbell, "PostedBeforeFlush requires DeferDoorbell");
-  // PostedBeforeFlush: the caller orders this post before the flush that rings it.
-  if constexpr (NoMark) return;
+  static_assert(!CallerOrdered || DeferDoorbell, "CallerOrdered posts are deferred");
+  if constexpr (CallerOrdered) {
+    retireReadyTag(&ep->wqHandle, base);
+    __asm__ volatile("" ::: "memory");  // keep the WQE stores above the wait
+    waitStoresComplete();
+    return;
+  }
   core::WorkQueueHandle* wq = &ep->wqHandle;
   bool rang = false;
   if constexpr (!DeferDoorbell) {
     if (__hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == base) {
-      // Retire this slot's old mark (see "Doorbell coalescing"); count 0 never matches.
-      __hip_atomic_store(&wq->readyMarks[base & (wq->sqWqeNum - 1)].tag, readyTag(base, 0),
-                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      __threadfence_system();  // our WQEs, before the doorbell
+      retireReadyTag(wq, base);  // see "Doorbell coalescing"
+      __threadfence_system();    // our WQEs, before the doorbell
       ringAndPublish<PrvdType>(ep, base, base + count, dbrVal);
       rang = true;
     }
@@ -860,7 +878,7 @@ __device__ inline static uint32_t getAtomicWqeCount(core::atomicType amo_op, uin
 // putImpl - post one warp-aggregated put for the active lanes (all targeting this
 // ep/qpn; the facade groups by QP). Each lane posts its data WQE into a contiguous
 // reservation; the leader posts the shared signal WQE and rings one doorbell.
-template <core::ProviderType PrvdType, bool DeferDoorbell = false, bool NoMark = false>
+template <core::ProviderType PrvdType, bool DeferDoorbell = false, bool CallerOrdered = false>
 __device__ inline static void putImpl(
     // Hardware resources (already selected endpoint)
     core::RdmaEndpointDevice* ep, uint32_t qpn,
@@ -910,7 +928,7 @@ __device__ inline static void putImpl(
             *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
             signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
       }
-      submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
+      submitWqes<PrvdType, DeferDoorbell, CallerOrdered>(ep, base, totalWqes, dbrVal);
     }
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
@@ -926,14 +944,15 @@ __device__ inline static void putImpl(
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/,
             core::AMO_FETCH_ADD);
       }
-      submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
+      submitWqes<PrvdType, DeferDoorbell, CallerOrdered>(ep, base, totalWqes, dbrVal);
     }
   }
 }
 
 // putValueImpl - Inline write for small values. One group per call (the facade
 // groups lanes by QP); same warp-aggregate posting as putImpl.
-template <core::ProviderType PrvdType, typename T, bool DeferDoorbell = false, bool NoMark = false>
+template <core::ProviderType PrvdType, typename T, bool DeferDoorbell = false,
+          bool CallerOrdered = false>
 __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                            uintptr_t remoteAddr, uint32_t remoteKey, T value,
                                            bool hasSignal, uintptr_t signalRemoteAddr,
@@ -976,7 +995,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
             *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
             signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
       }
-      submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
+      submitWqes<PrvdType, DeferDoorbell, CallerOrdered>(ep, base, totalWqes, dbrVal);
     }
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
@@ -991,7 +1010,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
             *wq, signalSlot, signalSlot, signalSlot, true /*cqeSignal*/, qpn, atomicLaddr,
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
       }
-      submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
+      submitWqes<PrvdType, DeferDoorbell, CallerOrdered>(ep, base, totalWqes, dbrVal);
     }
   }
 }
@@ -999,7 +1018,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
 // getImpl - RDMA read. One group per call (the facade groups lanes by QP):
 // each active lane posts its read WQE into a contiguous reservation, the leader
 // rings one doorbell.
-template <core::ProviderType PrvdType, bool DeferDoorbell = false, bool NoMark = false>
+template <core::ProviderType PrvdType, bool DeferDoorbell = false, bool CallerOrdered = false>
 __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                       uintptr_t localAddr, uint32_t localKey, uintptr_t remoteAddr,
                                       uint32_t remoteKey, size_t bytes) {
@@ -1027,14 +1046,14 @@ __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn
         core::PostRead<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/, qpn, localAddr,
                                  localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
-    if (isLeader) submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
+    if (isLeader) submitWqes<PrvdType, DeferDoorbell, CallerOrdered>(ep, base, totalWqes, dbrVal);
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
     waitSqSpace<PrvdType>(ep, base, totalWqes);
     uint64_t dbrVal = core::PostRead<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
                                                localAddr, localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
-    if (isLeader) submitWqes<PrvdType, DeferDoorbell, NoMark>(ep, base, totalWqes, dbrVal);
+    if (isLeader) submitWqes<PrvdType, DeferDoorbell, CallerOrdered>(ep, base, totalWqes, dbrVal);
   }
 }
 
@@ -1080,25 +1099,38 @@ __device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, ui
   }
 }
 
-// flushAsync under ccoGdaOptFlagsPostedBeforeFlush: every WQE below the snapshot
-// is written (caller's contract) and none is marked, so ring once straight up to
-// it under the doorbell lock, which orders us against another flusher.
+// flushAsync on a CallerOrdered handle: every WQE below the snapshot is written
+// (the caller's contract) and none is marked, so ring once straight up to it
+// under the doorbell lock, which orders us against another flusher. Lanes of one
+// wave may flush one QP: a loser retries in the loop rather than spinning on the
+// lock while the winner waits for it to reconverge.
 template <core::ProviderType PrvdType>
-__device__ inline static void flushAsyncPostedImpl(core::RdmaEndpointDevice* ep,
-                                                   uint32_t* outPostIdx) {
+__device__ inline static void flushAsyncOrderedImpl(core::RdmaEndpointDevice* ep,
+                                                    uint32_t* outPostIdx) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   uint32_t postIdx = __hip_atomic_load(&wq->postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   *outPostIdx = postIdx;
-  __threadfence_system();  // the posters' WQEs (and our prior writes), before the doorbell
-  if (__hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == postIdx)
-    return;
-  while (!tryLockDoorbell(wq)) {
+  __threadfence_system();  // our prior writes, before the doorbell; each post waited for its WQEs
+  while (static_cast<int32_t>(
+             __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) -
+             postIdx) < 0) {
+    if (!tryLockDoorbell(wq)) continue;
+    uint32_t from = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (static_cast<int32_t>(postIdx - from) > 0) {
+      ringAndPublish<PrvdType>(ep, from, postIdx, buildFlushDbrVal<PrvdType>(wq, postIdx, ep->qpn));
+    }
+    unlockDoorbell(wq);
   }
-  uint32_t from = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  if (static_cast<int32_t>(postIdx - from) > 0) {
-    ringAndPublish<PrvdType>(ep, from, postIdx, buildFlushDbrVal<PrvdType>(wq, postIdx, ep->qpn));
+}
+
+// flushAsync as a handle in this doorbell mode does it.
+template <core::ProviderType PrvdType, bool CallerOrdered>
+__device__ inline static void flushAsyncFor(core::RdmaEndpointDevice* ep, uint32_t* outPostIdx) {
+  if constexpr (CallerOrdered) {
+    flushAsyncOrderedImpl<PrvdType>(ep, outPostIdx);
+  } else {
+    flushAsyncImpl<PrvdType>(ep, outPostIdx);
   }
-  unlockDoorbell(wq);
 }
 
 template <core::ProviderType PrvdType>
@@ -1250,12 +1282,12 @@ __device__ inline int WorldPeerToGda(ccoDevComm const& comm, int globalPeer) {
 
 }  // namespace impl
 
-// ── ccoGda<PrvdType> method definitions ──
+// ── ccoGda<PrvdType, Doorbell> method definitions ──
 // Public facade: thin per-method wrappers that select the endpoint and dispatch
 // to the impl:: primitive layer above.
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <ccoTeamMode TeamMode>
-__device__ inline int ccoGda<PrvdType>::resolveWorldPeer(int peer) const {
+__device__ inline int ccoGda<PrvdType, Doorbell>::resolveWorldPeer(int peer) const {
   if constexpr (TeamMode == CCO_TEAM_WORLD) {
     return peer;
   } else {
@@ -1263,8 +1295,8 @@ __device__ inline int ccoGda<PrvdType>::resolveWorldPeer(int peer) const {
   }
 }
 
-template <core::ProviderType PrvdType>
-__device__ inline ccoGda<PrvdType>::ccoGda(ccoDevComm const& comm_, int contextIndex)
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
+__device__ inline ccoGda<PrvdType, Doorbell>::ccoGda(ccoDevComm const& comm_, int contextIndex)
     : comm(comm_), contextId(contextIndex) {
   this->_gdaHandle = (void*)&comm.ibgda;
   switch (comm.gdaConnType) {
@@ -1290,16 +1322,12 @@ __device__ inline ccoGda<PrvdType>::ccoGda(ccoDevComm const& comm_, int contextI
 }
 
 // put: RDMA write with optional signal
-template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename RemoteAction, typename Coop,
-          uint32_t OptFlags>
-__device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_t dstOffset,
-                                             ccoWindow_t srcWin, size_t srcOffset, size_t bytes,
-                                             RemoteAction remoteAction, Coop coop) {
-  static_assert((OptFlags & ~kCcoGdaSupportedOptFlags) == 0, "unsupported ccoGdaOptFlags");
-  constexpr bool kDefer = (OptFlags & ccoGdaOptFlagsDeferDoorbell) != 0;
-  constexpr bool kNoMark = (OptFlags & ccoGdaOptFlagsPostedBeforeFlush) != 0;
-  static_assert(!kNoMark || kDefer, "ccoGdaOptFlagsPostedBeforeFlush requires DeferDoorbell");
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
+template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename RemoteAction, typename Coop>
+__device__ inline void ccoGda<PrvdType, Doorbell>::put(int peer, ccoWindow_t dstWin,
+                                                       size_t dstOffset, ccoWindow_t srcWin,
+                                                       size_t srcOffset, size_t bytes,
+                                                       RemoteAction remoteAction, Coop coop) {
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1359,30 +1387,27 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
         int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
         if (qpIdx != __shfl(qpIdx, lead)) continue;
         needTurn = false;
-        impl::putImpl<PrvdType, kDefer, kNoMark>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey,
-                                                 bytes, hasSignal, signalRaddr, signalRkey,
-                                                 signalOp, signalOpArg);
+        impl::putImpl<PrvdType, kDeferDoorbell, kCallerOrdered>(
+            ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey, bytes, hasSignal, signalRaddr,
+            signalRkey, signalOp, signalOpArg);
       }
     } else {
-      impl::putImpl<PrvdType, kDefer, kNoMark>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey,
-                                               bytes, hasSignal, signalRaddr, signalRkey, signalOp,
-                                               signalOpArg);
+      impl::putImpl<PrvdType, kDeferDoorbell, kCallerOrdered>(
+          ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey, bytes, hasSignal, signalRaddr,
+          signalRkey, signalOp, signalOpArg);
     }
   }
   coop.sync();
 }
 
 // putValue: write immediate value (≤8 bytes)
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename T, typename RemoteAction,
-          typename Coop, uint32_t OptFlags>
-__device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, size_t dstOffset,
-                                                  T value, RemoteAction remoteAction, Coop coop) {
+          typename Coop>
+__device__ inline void ccoGda<PrvdType, Doorbell>::putValue(int peer, ccoWindow_t dstWin,
+                                                            size_t dstOffset, T value,
+                                                            RemoteAction remoteAction, Coop coop) {
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
-  static_assert((OptFlags & ~kCcoGdaSupportedOptFlags) == 0, "unsupported ccoGdaOptFlags");
-  constexpr bool kDefer = (OptFlags & ccoGdaOptFlagsDeferDoorbell) != 0;
-  constexpr bool kNoMark = (OptFlags & ccoGdaOptFlagsPostedBeforeFlush) != 0;
-  static_assert(!kNoMark || kDefer, "ccoGdaOptFlagsPostedBeforeFlush requires DeferDoorbell");
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1435,29 +1460,26 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
         int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
         if (qpIdx != __shfl(qpIdx, lead)) continue;
         needTurn = false;
-        impl::putValueImpl<PrvdType, T, kDefer, kNoMark>(ep, qpn, remoteAddr, dstRkey, value,
-                                                         hasSignal, signalRaddr, signalRkey,
-                                                         signalOp, signalOpArg);
+        impl::putValueImpl<PrvdType, T, kDeferDoorbell, kCallerOrdered>(
+            ep, qpn, remoteAddr, dstRkey, value, hasSignal, signalRaddr, signalRkey, signalOp,
+            signalOpArg);
       }
     } else {
-      impl::putValueImpl<PrvdType, T, kDefer, kNoMark>(ep, qpn, remoteAddr, dstRkey, value,
-                                                       hasSignal, signalRaddr, signalRkey, signalOp,
-                                                       signalOpArg);
+      impl::putValueImpl<PrvdType, T, kDeferDoorbell, kCallerOrdered>(
+          ep, qpn, remoteAddr, dstRkey, value, hasSignal, signalRaddr, signalRkey, signalOp,
+          signalOpArg);
     }
   }
   coop.sync();
 }
 
 // get: RDMA read
-template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename Coop, uint32_t OptFlags>
-__device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
-                                             ccoWindow_t localWin, size_t localOffset, size_t bytes,
-                                             Coop coop) {
-  static_assert((OptFlags & ~kCcoGdaSupportedOptFlags) == 0, "unsupported ccoGdaOptFlags");
-  constexpr bool kDefer = (OptFlags & ccoGdaOptFlagsDeferDoorbell) != 0;
-  constexpr bool kNoMark = (OptFlags & ccoGdaOptFlagsPostedBeforeFlush) != 0;
-  static_assert(!kNoMark || kDefer, "ccoGdaOptFlagsPostedBeforeFlush requires DeferDoorbell");
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
+template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename Coop>
+__device__ inline void ccoGda<PrvdType, Doorbell>::get(int peer, ccoWindow_t remoteWin,
+                                                       size_t remoteOffset, ccoWindow_t localWin,
+                                                       size_t localOffset, size_t bytes,
+                                                       Coop coop) {
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1488,21 +1510,26 @@ __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, si
         int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
         if (qpIdx != __shfl(qpIdx, lead)) continue;
         needTurn = false;
-        impl::getImpl<PrvdType, kDefer, kNoMark>(ep, qpn, localAddr, localLkey, remoteAddr,
-                                                 remoteRkey, bytes);
+        impl::getImpl<PrvdType, kDeferDoorbell, kCallerOrdered>(ep, qpn, localAddr, localLkey,
+                                                                remoteAddr, remoteRkey, bytes);
       }
     } else {
-      impl::getImpl<PrvdType, kDefer, kNoMark>(ep, qpn, localAddr, localLkey, remoteAddr,
-                                               remoteRkey, bytes);
+      impl::getImpl<PrvdType, kDeferDoorbell, kCallerOrdered>(ep, qpn, localAddr, localLkey,
+                                                              remoteAddr, remoteRkey, bytes);
     }
   }
   coop.sync();
 }
 
 // signal: send to remote peer
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <ccoTeamMode TeamMode, typename RemoteAction, typename Coop>
-__device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAction, Coop coop) {
+__device__ inline void ccoGda<PrvdType, Doorbell>::signal(int peer, RemoteAction remoteAction,
+                                                          Coop coop) {
+  static_assert(Doorbell != ccoGdaDoorbellCallerOrdered,
+                "signal() rings on its own, which a CallerOrdered QP does not allow: use put / "
+                "putValue with a RemoteAction signal, or flush this handle first and then "
+                "signal through an Immediate handle");
   coop.sync();
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
@@ -1544,9 +1571,9 @@ __device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAct
 
 // flush all peers: distribute peers across the Coop group (default: warp).
 // all threads in the group must call flush together.
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
-__device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
+__device__ inline void ccoGda<PrvdType, Doorbell>::flush(Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush() requires at least ccoCoopWarp. "
                 "ccoCoopThread reports size()==1, so every thread walks every peer and "
@@ -1561,17 +1588,16 @@ __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
+    impl::flushAsyncFor<PrvdType, kCallerOrdered>(ep, &postIdx);
     impl::waitImpl<PrvdType>(ep, postIdx);
   }
   coop.sync();
 }
 
 // flush single peer: snapshot the QP's postIdx, then poll CQ until it completes.
-template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, typename Coop, uint32_t OptFlags>
-__device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
-  static_assert((OptFlags & ~kCcoGdaSupportedFlushOptFlags) == 0, "unsupported flush opt flag");
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
+template <ccoTeamMode TeamMode, typename Coop>
+__device__ inline void ccoGda<PrvdType, Doorbell>::flush(int peer, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush(peer) requires at least ccoCoopWarp. "
                 "With ccoCoopThread every thread runs the body, so two threads passing the "
@@ -1584,22 +1610,17 @@ __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
-    if constexpr ((OptFlags & ccoGdaOptFlagsPostedBeforeFlush) != 0) {
-      impl::flushAsyncPostedImpl<PrvdType>(ep, &postIdx);
-    } else {
-      impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
-    }
+    impl::flushAsyncFor<PrvdType, kCallerOrdered>(ep, &postIdx);
     impl::waitImpl<PrvdType>(ep, postIdx);
   }
   coop.sync();
 }
 
 // flushAsync: snapshot this peer's QP, return a request handle for wait().
-template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, typename Coop, uint32_t OptFlags>
-__device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* outRequest,
-                                                    Coop coop) {
-  static_assert((OptFlags & ~kCcoGdaSupportedFlushOptFlags) == 0, "unsupported flush opt flag");
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
+template <ccoTeamMode TeamMode, typename Coop>
+__device__ inline void ccoGda<PrvdType, Doorbell>::flushAsync(int peer, ccoGdaRequest_t* outRequest,
+                                                              Coop coop) {
   coop.sync();
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
@@ -1608,11 +1629,7 @@ __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* o
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
 
     uint32_t postIdx = 0;
-    if constexpr ((OptFlags & ccoGdaOptFlagsPostedBeforeFlush) != 0) {
-      impl::flushAsyncPostedImpl<PrvdType>(ep, &postIdx);
-    } else {
-      impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
-    }
+    impl::flushAsyncFor<PrvdType, kCallerOrdered>(ep, &postIdx);
 
     outRequest->qpIdx = qpIdx;
     outRequest->postIdx = static_cast<uint64_t>(postIdx);
@@ -1621,9 +1638,9 @@ __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* o
 }
 
 // wait: poll CQ until the request returned by flushAsync completes.
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
-__device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request, Coop coop) {
+__device__ inline void ccoGda<PrvdType, Doorbell>::wait(ccoGdaRequest_t& request, Coop coop) {
   // ccoCoopThread: each lane passes its own request; lanes on one CQ wait for the furthest.
   coop.sync();
   if (coop.thread_rank() == 0) {
@@ -1635,9 +1652,9 @@ __device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request, Coop coo
 }
 
 // counter: poll CQ for all GDA-team peers, then software-increment counterBuf.
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename LocalAction, typename Coop>
-__device__ inline void ccoGda<PrvdType>::counter(LocalAction localAction, Coop coop) {
+__device__ inline void ccoGda<PrvdType, Doorbell>::counter(LocalAction localAction, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "counter() requires at least ccoCoopWarp. "
                 "ccoCoopThread reports size()==1 and makes thread_rank()==0 true for every "
@@ -1654,7 +1671,7 @@ __device__ inline void ccoGda<PrvdType>::counter(LocalAction localAction, Coop c
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);  // rings for deferred posts first
+    impl::flushAsyncFor<PrvdType, kCallerOrdered>(ep, &postIdx);  // rings for deferred posts first
     impl::waitImpl<PrvdType>(ep, postIdx);
   }
 
@@ -1670,17 +1687,18 @@ __device__ inline void ccoGda<PrvdType>::counter(LocalAction localAction, Coop c
 }
 
 // readSignal: read local signal value
-template <core::ProviderType PrvdType>
-__device__ inline uint64_t ccoGda<PrvdType>::readSignal(ccoGdaSignal_t signalId, int bits) {
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
+__device__ inline uint64_t ccoGda<PrvdType, Doorbell>::readSignal(ccoGdaSignal_t signalId,
+                                                                  int bits) {
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
   return impl::readSignalImpl<PrvdType>(ibgda->signalBuf, ibgda->signalShadows, signalId, bits);
 }
 
 // waitSignal: wait until local signal reaches specified value
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
-__device__ inline void ccoGda<PrvdType>::waitSignal(ccoGdaSignal_t signalId, uint64_t least,
-                                                    Coop coop, int bits) {
+__device__ inline void ccoGda<PrvdType, Doorbell>::waitSignal(ccoGdaSignal_t signalId,
+                                                              uint64_t least, Coop coop, int bits) {
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1690,24 +1708,26 @@ __device__ inline void ccoGda<PrvdType>::waitSignal(ccoGdaSignal_t signalId, uin
 }
 
 // resetSignal: reset local signal to zero
-template <core::ProviderType PrvdType>
-__device__ inline void ccoGda<PrvdType>::resetSignal(ccoGdaSignal_t signalId) {
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
+__device__ inline void ccoGda<PrvdType, Doorbell>::resetSignal(ccoGdaSignal_t signalId) {
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
   impl::resetSignalImpl<PrvdType>(ibgda->signalBuf, ibgda->signalShadows, signalId);
 }
 
 // readCounter: read local counter value
-template <core::ProviderType PrvdType>
-__device__ inline uint64_t ccoGda<PrvdType>::readCounter(ccoGdaCounter_t counterId, int bits) {
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
+__device__ inline uint64_t ccoGda<PrvdType, Doorbell>::readCounter(ccoGdaCounter_t counterId,
+                                                                   int bits) {
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
   return impl::readCounterImpl<PrvdType>(ibgda->counterBuf, counterId, bits);
 }
 
 // waitCounter: wait until local counter reaches specified value
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
-__device__ inline void ccoGda<PrvdType>::waitCounter(ccoGdaCounter_t counterId, uint64_t least,
-                                                     Coop coop, int bits) {
+__device__ inline void ccoGda<PrvdType, Doorbell>::waitCounter(ccoGdaCounter_t counterId,
+                                                               uint64_t least, Coop coop,
+                                                               int bits) {
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1717,8 +1737,8 @@ __device__ inline void ccoGda<PrvdType>::waitCounter(ccoGdaCounter_t counterId, 
 }
 
 // resetCounter: reset local counter to zero
-template <core::ProviderType PrvdType>
-__device__ inline void ccoGda<PrvdType>::resetCounter(ccoGdaCounter_t counterId) {
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
+__device__ inline void ccoGda<PrvdType, Doorbell>::resetCounter(ccoGdaCounter_t counterId) {
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
   impl::resetCounterImpl<PrvdType>(ibgda->counterBuf, counterId);
 }
@@ -1784,6 +1804,16 @@ __device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda, ccoGdaBar
                                      uint32_t index) {
   ccoGdaBarrierSession<PrvdType, Coop> session(coop, gda, handle, index);
   session.sync(coop);
+}
+
+// Any other mode: reject with a readable error rather than a deduction failure.
+// A Deferred caller can sync through an Immediate handle on the same context.
+template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell, typename Coop>
+__device__ inline void ccoGdaBarrier(Coop, ccoGda<PrvdType, Doorbell>&, ccoGdaBarrierHandle,
+                                     uint32_t) {
+  static_assert(Doorbell == ccoGdaDoorbellImmediate,
+                "ccoGdaBarrier takes an Immediate handle (ccoGda<P>); make one on the same "
+                "context to sync");
 }
 
 #endif  // defined(__HIPCC__) || defined(__CUDACC__)

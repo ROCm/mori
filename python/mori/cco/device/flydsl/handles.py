@@ -36,10 +36,12 @@ control flow. Build once at kernel entry and reuse::
     gda.flush(coop=cco.CoopScope.BLOCK)          # same gda, across the dynamic if
 
 ``coop`` / ``signal_op`` / ``thread_mode`` must be compile-time constants
-(``CoopScope`` / ``SignalOp`` / ``ThreadMode`` values): each method selects a
-fully-specialized wrapper symbol by name, so the kernel emits one direct call to
-one ``ccoGda<P>`` instantiation — no runtime dispatch. ``ThreadMode.AGGREGATE``
-is only valid with ``CoopScope.THREAD`` (cco coalesces the warp's lanes itself).
+(``CoopScope`` / ``SignalOp`` / ``ThreadMode`` values), as is the handle's
+doorbell mode (``dc.gda(ctx, doorbell=GdaDoorbell.DEFERRED)``): each method
+selects a fully-specialized wrapper symbol by name, so the kernel emits one
+direct call to one ``ccoGda<P, Mode>`` instantiation — no runtime dispatch.
+``ThreadMode.AGGREGATE`` is only valid with ``CoopScope.THREAD`` (cco coalesces
+the warp's lanes itself).
 """
 
 try:
@@ -54,10 +56,12 @@ from mori.cco.device.ops import (
     DATA_PATH_TAG as _TC_TAG,
     SIGNAL_TAG as _SIG_TAG,
     CoopScope,
+    GdaDoorbell,
     SdmaCmp,
     SignalOp,
     Team,
     ThreadMode,
+    gda_doorbell_tag,
     gda_flags,
     sdma_flags,
     sdma_signals,
@@ -71,8 +75,9 @@ def _const(value, name):
     """Require a compile-time constant (the axis selects a wrapper symbol)."""
     if not isinstance(value, int):
         raise TypeError(
-            f"cco: {name} must be a compile-time constant (a CoopScope / SignalOp / "
-            f"ThreadMode value), not a runtime DSL value — got {type(value).__name__}. "
+            f"cco: {name} must be a compile-time constant (e.g. a CoopScope / SignalOp / "
+            f"ThreadMode / GdaDoorbell value), not a runtime DSL value — got "
+            f"{type(value).__name__}. "
             "The axis picks a specialized wrapper symbol at trace time."
         )
     return value
@@ -91,13 +96,9 @@ def _tc(coop, thread_mode):
         )
 
 
-def _gda_flags(team, defer_doorbell=False, posted_before_flush=False):
-    """GdaFlags for one op; every axis picks the instantiation, so all are constant."""
-    pbf = _const(posted_before_flush, "posted_before_flush")
-    defer = _const(defer_doorbell, "defer_doorbell")
-    return gda_flags(
-        team=_const(team, "team"), defer_doorbell=defer, posted_before_flush=pbf
-    )
+def _gda_flags(team):
+    """GdaFlags for one op; team picks the instantiation, so it is constant."""
+    return gda_flags(team=_const(team, "team"))
 
 
 def _flush_tag(coop):
@@ -203,18 +204,15 @@ class Gda:
 
     ``team`` says how ``peer`` is numbered: ``Team.WORLD`` (a world rank, the
     default) or ``Team.GDA`` (an index in the GDA team -- the node index on a
-    RAIL connection). ``defer_doorbell=True`` on put / put_value / get writes
-    the WQEs without ringing the doorbell; the next non-deferred post, signal,
-    flush, flush_async or counter on the same QP rings for them.
+    RAIL connection).
 
-    ``posted_before_flush=True`` is caller-ordered posting: with
-    ``defer_doorbell=True`` a put / put_value / get publishes no ready mark (no
-    system fence), and on flush_peer / flush_async the flush rings straight up
-    to its postIdx snapshot instead of sweeping marks. The caller guarantees
-    every post below that snapshot is fully written before the flush starts
-    (e.g. posters bump a counter after their post returns and the flusher waits
-    for it), every post to the QP uses the flag, and the posts between two
-    flushes fit in the SQ.
+    ``doorbell`` (Constexpr, a :class:`GdaDoorbell`) is the handle's mode, C++'s
+    ``ccoGda<P, Mode>``: ``IMMEDIATE`` posts ring for themselves; ``DEFERRED``
+    put / put_value / get ring nothing and the next ring on the QP releases
+    them; ``CALLER_ORDERED`` ones also skip the ready mark and only this mode's
+    flush / flush_peer / flush_async release them, under the contract on
+    :class:`GdaDoorbell`. A CALLER_ORDERED handle has no signal(): put with a
+    ``signal_op`` instead.
 
     Every op that posts to or flushes a QP also takes ``ctx``, the context for that one call,
     which may be a runtime ``Int32`` (e.g. to spread chunks over contexts). It
@@ -224,9 +222,14 @@ class Gda:
 
     dev_comm: fx.Int64
     ctx: fx.Constexpr
+    doorbell: fx.Constexpr
 
     def _ctx(self, ctx):
         return self.ctx if ctx is None else ctx
+
+    def _db(self, *, flush=False):
+        """Symbol suffix of the handle's doorbell mode."""
+        return gda_doorbell_tag(self.doorbell, flush=flush)
 
     # ── data path ──
     def put(
@@ -244,13 +247,10 @@ class Gda:
         coop=CoopScope.THREAD,
         thread_mode=ThreadMode.INDEPENDENT,
         team=Team.WORLD,
-        defer_doorbell=False,
-        posted_before_flush=False,
         ctx=None,
     ):
-        sym = raw.PUT[
-            f"{_tc(coop, thread_mode)}__{_SIG_TAG[_const(signal_op, 'signal_op')]}"
-        ]
+        sig = _SIG_TAG[_const(signal_op, "signal_op")]
+        sym = raw.PUT[f"{_tc(coop, thread_mode)}__{sig}{self._db()}"]
         sym(
             self.dev_comm,
             self._ctx(ctx),
@@ -262,7 +262,7 @@ class Gda:
             nbytes,
             signal_id,
             signal_val,
-            _gda_flags(team, defer_doorbell, posted_before_flush),
+            _gda_flags(team),
         )
 
     def put_value(
@@ -278,13 +278,10 @@ class Gda:
         coop=CoopScope.THREAD,
         thread_mode=ThreadMode.INDEPENDENT,
         team=Team.WORLD,
-        defer_doorbell=False,
-        posted_before_flush=False,
         ctx=None,
     ):
-        sym = raw.PUT_VALUE[
-            f"{_tc(coop, thread_mode)}__{_SIG_TAG[_const(signal_op, 'signal_op')]}"
-        ]
+        sig = _SIG_TAG[_const(signal_op, "signal_op")]
+        sym = raw.PUT_VALUE[f"{_tc(coop, thread_mode)}__{sig}{self._db()}"]
         sym(
             self.dev_comm,
             self._ctx(ctx),
@@ -294,7 +291,7 @@ class Gda:
             value,
             signal_id,
             signal_val,
-            _gda_flags(team, defer_doorbell, posted_before_flush),
+            _gda_flags(team),
         )
 
     def get(
@@ -309,11 +306,9 @@ class Gda:
         coop=CoopScope.THREAD,
         thread_mode=ThreadMode.INDEPENDENT,
         team=Team.WORLD,
-        defer_doorbell=False,
-        posted_before_flush=False,
         ctx=None,
     ):
-        raw.GET[_tc(coop, thread_mode)](
+        raw.GET[f"{_tc(coop, thread_mode)}{self._db()}"](
             self.dev_comm,
             self._ctx(ctx),
             peer,
@@ -322,7 +317,7 @@ class Gda:
             _win(local_win),
             local_off,
             nbytes,
-            _gda_flags(team, defer_doorbell, posted_before_flush),
+            _gda_flags(team),
         )
 
     # ── signal ──
@@ -341,6 +336,12 @@ class Gda:
         _const(coop, "coop")
         if signal_op == SignalOp.NONE:
             raise ValueError("cco: signal() requires signal_op INC or ADD")
+        if self.doorbell == GdaDoorbell.CALLER_ORDERED:
+            raise ValueError(
+                "cco: a CALLER_ORDERED Gda has no signal(); put / put_value with a "
+                "signal_op, or flush this handle first and then signal through an "
+                "IMMEDIATE one"
+            )
         raw.SIGNAL[f"{_COOP_TAG[coop]}__{_SIG_TAG[signal_op]}"](
             self.dev_comm, self._ctx(ctx), peer, signal_id, signal_val, _gda_flags(team)
         )
@@ -358,7 +359,9 @@ class Gda:
 
     # ── completion (>= warp; THREAD coop maps to warp) ──
     def flush(self, *, coop=CoopScope.WARP, ctx=None):
-        raw.FLUSH[_flush_tag(coop)](self.dev_comm, self._ctx(ctx))
+        raw.FLUSH[_flush_tag(coop) + self._db(flush=True)](
+            self.dev_comm, self._ctx(ctx)
+        )
 
     def flush_peer(
         self,
@@ -366,14 +369,10 @@ class Gda:
         *,
         coop=CoopScope.WARP,
         team=Team.WORLD,
-        posted_before_flush=False,
         ctx=None,
     ):
-        raw.FLUSH_PEER[_flush_tag(coop)](
-            self.dev_comm,
-            self._ctx(ctx),
-            peer,
-            _gda_flags(team, posted_before_flush=posted_before_flush),
+        raw.FLUSH_PEER[_flush_tag(coop) + self._db(flush=True)](
+            self.dev_comm, self._ctx(ctx), peer, _gda_flags(team)
         )
 
     def flush_async(
@@ -382,18 +381,15 @@ class Gda:
         *,
         coop=CoopScope.THREAD,
         team=Team.WORLD,
-        posted_before_flush=False,
         ctx=None,
     ):
         """Ring ``peer``'s QP up to its current reservation, deferred posts
         included, and return a request (a uint64) for :meth:`wait`. Work can go
         between the two. Every lane gets the request for THREAD and WARP; for
         BLOCK only thread 0 does, so wait with BLOCK too."""
-        return raw.FLUSH_ASYNC[_COOP_TAG[_const(coop, "coop")]](
-            self.dev_comm,
-            self._ctx(ctx),
-            peer,
-            _gda_flags(team, posted_before_flush=posted_before_flush),
+        coop = _COOP_TAG[_const(coop, "coop")]
+        return raw.FLUSH_ASYNC[coop + self._db(flush=True)](
+            self.dev_comm, self._ctx(ctx), peer, _gda_flags(team)
         )
 
     def wait(self, request, *, coop=CoopScope.THREAD):
@@ -906,9 +902,11 @@ class DevComm:
     def lsa_size(self):
         return raw.cco_devcomm_lsa_size(self.ptr)
 
-    def gda(self, ctx=0) -> Gda:
-        """Build a GDA handle on this devComm for the given (compile-time) context index."""
-        return Gda(dev_comm=self.ptr, ctx=ctx)
+    def gda(self, ctx=0, doorbell=GdaDoorbell.IMMEDIATE) -> Gda:
+        """Build a GDA handle on this devComm for the given (compile-time)
+        context index and :class:`GdaDoorbell` mode."""
+        gda_doorbell_tag(_const(doorbell, "doorbell"))  # rejects an unknown mode
+        return Gda(dev_comm=self.ptr, ctx=ctx, doorbell=doorbell)
 
     def sdma(self) -> Sdma:
         """Build an SDMA handle on this devComm (LSA copy-engine put/get)."""

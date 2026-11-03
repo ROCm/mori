@@ -83,18 +83,23 @@ lsa_copy[(1,)](
 `DevComm`, `Window`, `Gda`, and `Sdma` are compile-time namespace facades with
 method names matching the FlyDSL handles. Triton still passes raw scalar handles
 explicitly, for example `cco.Gda.put(dev_comm, peer, ...)`; the original flat
-functions remain available for ABI-level or generated code.
+functions remain available for ABI-level or generated code. `GdaDeferred` and
+`GdaCallerOrdered` are `Gda` for the `GdaDoorbell.DEFERRED` and
+`CALLER_ORDERED` handle modes (FlyDSL's `dc.gda(ctx, doorbell=...)`);
+`GdaCallerOrdered` has no `signal`.
 
 The flat CCO functions mirror the monomorphized C symbols. Examples:
 
 - `devcomm_rank`, `devcomm_lsa_rank`, `lsa_ptr`
 - `sdma_put_{thread,warp,block}` and `sdma_quiet_*`
-- `gda_put_{it,iw,ib,at}_{none,inc,add}`
-- `gda_get_{it,iw,ib,at}`, signal/wait/read/reset, and flush variants
-- `gda_flush_async_{thread,warp,block}` / `gda_wait_{thread,warp,block}`
+- `gda_put_{it,iw,ib,at}_{none,inc,add}[_deferred|_caller_ordered]`
+- `gda_get_{it,iw,ib,at}[_deferred|_caller_ordered]`, signal/wait/read/reset,
+  and flush variants (`[_caller_ordered]`)
+- `gda_flush_async_{thread,warp,block}[_caller_ordered]` /
+  `gda_wait_{thread,warp,block}`
 
 GDA put / put_value / get / signal / flush_peer / flush_async take a trailing
-`GdaFlags` word (`TEAM_GDA`, and `DEFER_DOORBELL` on the data path).
+`GdaFlags` word (`TEAM_GDA` only).
 
 SDMA requires a MORI build with `BUILD_CCO_SDMA=ON` and runtime
 `MORI_ENABLE_SDMA=1`. GDA peers are world ranks, or GDA-team indices with

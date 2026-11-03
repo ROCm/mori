@@ -72,36 +72,62 @@ class Team:
     GDA = 2
 
 
-class GdaFlags:
-    """The trailing ``flags`` word of the GDA wrappers (put, put_value, get,
-    signal, flush_peer, flush_async): the template axes their symbol name does
-    not carry. Bits 0-7 are C++ ``ccoGdaOptFlags``. Pass a compile-time constant:
-    the wrapper is inlined and its dispatch on ``flags`` then folds to one
-    instantiation."""
+class GdaDoorbell:
+    """C++ ``ccoGdaDoorbellMode``, a GDA handle's compile-time mode
+    (``ccoGda<P, Mode>``); each mode has its own wrapper symbols."""
 
-    # ccoGdaOptFlagsDeferDoorbell: write the WQEs but do not ring the doorbell;
-    # the next non-deferred post, signal, flush, flush_async or counter on the
-    # QP rings for them. put / put_value / get only.
-    DEFER_DOORBELL = 1 << 1
-    # ccoGdaOptFlagsPostedBeforeFlush: caller-ordered posting. With DEFER_DOORBELL on
-    # put / put_value / get the post publishes nothing; on flush_peer / flush_async
-    # the flush rings straight up to its snapshot. The caller guarantees every
-    # post below the snapshot is written before the flush starts, every post to
-    # the QP uses the flag, and the posts between two flushes fit in the SQ.
-    POSTED_BEFORE_FLUSH = 1 << 2
+    # A post rings its own doorbell (coalesced with posts behind it).
+    IMMEDIATE = 0
+    # A post writes its WQEs and a ready mark but does not ring; the next ring on
+    # the QP (an IMMEDIATE post, signal, flush, flush_peer, flush_async) releases it.
+    DEFERRED = 1
+    # A post writes its WQEs only; only a CALLER_ORDERED flush releases it.
+    # Contract: no post on the QP is still writing when that flush starts (e.g.
+    # posters bump a counter after the post returns, the flusher waits for it);
+    # while any is pending, every post and flush on the QP is CALLER_ORDERED;
+    # fewer than the SQ depth between two flushes. flush() rings every peer's QP
+    # on the context, so the contract then covers all of them. No signal(): put
+    # with a signal_op instead.
+    CALLER_ORDERED = 2
+
+
+# Symbol suffix per mode: put / put_value / get have all three; a flush only
+# CALLER_ORDERED's, since any other flush releases deferred posts.
+GDA_DOORBELL_TAG = {
+    GdaDoorbell.IMMEDIATE: "",
+    GdaDoorbell.DEFERRED: "__deferred",
+    GdaDoorbell.CALLER_ORDERED: "__caller_ordered",
+}
+GDA_FLUSH_DOORBELL_TAG = {**GDA_DOORBELL_TAG, GdaDoorbell.DEFERRED: ""}
+
+
+def gda_doorbell_tag(doorbell, *, flush=False):
+    """Symbol suffix of ``doorbell`` for a data-path op, or a flush op."""
+    table = GDA_FLUSH_DOORBELL_TAG if flush else GDA_DOORBELL_TAG
+    # A bool is an int: True would read as DEFERRED.
+    if isinstance(doorbell, bool) or doorbell not in table:
+        raise ValueError(
+            "cco: GDA doorbell must be GdaDoorbell.IMMEDIATE, DEFERRED or "
+            f"CALLER_ORDERED, not {doorbell!r}"
+        )
+    return table[doorbell]
+
+
+class GdaFlags:
+    """The trailing ``flags`` word of the GDA wrappers that take a peer (put,
+    put_value, get, signal, flush_peer, flush_async). Pass a compile-time
+    constant: the wrapper is inlined and its dispatch on ``flags`` then folds
+    to one instantiation. Any other bit traps."""
+
     # peer is numbered in Team.GDA rather than Team.WORLD.
     TEAM_GDA = 1 << 8
 
 
-def gda_flags(*, team=Team.WORLD, defer_doorbell=False, posted_before_flush=False):
-    """:class:`GdaFlags` for one GDA op; the arguments are C++'s template ones."""
+def gda_flags(*, team=Team.WORLD):
+    """:class:`GdaFlags` for one GDA op; the argument is C++'s template one."""
     if team not in (Team.WORLD, Team.GDA):
         raise ValueError("cco: GDA team must be Team.WORLD or Team.GDA")
-    return (
-        (GdaFlags.TEAM_GDA if team == Team.GDA else 0)
-        | (GdaFlags.DEFER_DOORBELL if defer_doorbell else 0)
-        | (GdaFlags.POSTED_BEFORE_FLUSH if posted_before_flush else 0)
-    )
+    return GdaFlags.TEAM_GDA if team == Team.GDA else 0
 
 
 class SdmaOptFlags:
@@ -191,6 +217,8 @@ DATA_PATH_TAG = {
 GDA_DATA_TAGS = tuple(DATA_PATH_TAG.values())
 GDA_SIGNAL_TAGS = tuple(SIGNAL_TAG.values())
 COOP_TAGS = tuple(COOP_TAG.values())
+GDA_DOORBELL_TAGS = tuple(GDA_DOORBELL_TAG.values())
+GDA_FLUSH_DOORBELL_TAGS = tuple(dict.fromkeys(GDA_FLUSH_DOORBELL_TAG.values()))
 
 _U64 = "uint64"
 _I32 = "int32"
@@ -432,33 +460,36 @@ _gda_put_value_args = [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64, _I32]
 # (devComm, ctx, peer, remoteWin, remoteOff, localWin, localOff, nbytes, flags)
 _gda_get_args = [_U64, _I32, _I32, _U64, _U64, _U64, _U64, _U64, _I32]
 
-for _tc in GDA_DATA_TAGS:
-    for _sig in GDA_SIGNAL_TAGS:
-        _tag = f"{_tc}__{_sig}"
+# One symbol per doorbell mode; the friendly name ends in _deferred /
+# _caller_ordered like the symbol does in __deferred / __caller_ordered.
+for _db in GDA_DOORBELL_TAGS:
+    for _tc in GDA_DATA_TAGS:
+        for _sig in GDA_SIGNAL_TAGS:
+            _tag = f"{_tc}__{_sig}{_db}"
+            _add(
+                f"gda_put_{_tc}_{_sig}{_db[1:]}",
+                f"cco_gda_put__{_tag}",
+                _gda_put_args,
+                _I32,
+                family="gda_put",
+                tag=_tag,
+            )
+            _add(
+                f"gda_put_value_{_tc}_{_sig}{_db[1:]}",
+                f"cco_gda_put_value__{_tag}",
+                _gda_put_value_args,
+                _I32,
+                family="gda_put_value",
+                tag=_tag,
+            )
         _add(
-            f"gda_put_{_tc}_{_sig}",
-            f"cco_gda_put__{_tag}",
-            _gda_put_args,
+            f"gda_get_{_tc}{_db[1:]}",
+            f"cco_gda_get__{_tc}{_db}",
+            _gda_get_args,
             _I32,
-            family="gda_put",
-            tag=_tag,
+            family="gda_get",
+            tag=f"{_tc}{_db}",
         )
-        _add(
-            f"gda_put_value_{_tc}_{_sig}",
-            f"cco_gda_put_value__{_tag}",
-            _gda_put_value_args,
-            _I32,
-            family="gda_put_value",
-            tag=_tag,
-        )
-    _add(
-        f"gda_get_{_tc}",
-        f"cco_gda_get__{_tc}",
-        _gda_get_args,
-        _I32,
-        family="gda_get",
-        tag=_tc,
-    )
 
 for _coop in COOP_TAGS:
     for _sig in ("inc", "add"):
@@ -495,34 +526,36 @@ _add(
     family="gda_reset_signal",
 )
 
-for _coop in ("warp", "block"):
-    _add(
-        f"gda_flush_{_coop}",
-        f"cco_gda_flush__{_coop}",
-        [_U64, _I32],
-        _I32,
-        family="gda_flush",
-        tag=_coop,
-    )
-    _add(
-        f"gda_flush_peer_{_coop}",
-        f"cco_gda_flush_peer__{_coop}",
-        [_U64, _I32, _I32, _I32],
-        _I32,
-        family="gda_flush_peer",
-        tag=_coop,
-    )
+for _db in GDA_FLUSH_DOORBELL_TAGS:
+    for _coop in ("warp", "block"):
+        _add(
+            f"gda_flush_{_coop}{_db[1:]}",
+            f"cco_gda_flush__{_coop}{_db}",
+            [_U64, _I32],
+            _I32,
+            family="gda_flush",
+            tag=f"{_coop}{_db}",
+        )
+        _add(
+            f"gda_flush_peer_{_coop}{_db[1:]}",
+            f"cco_gda_flush_peer__{_coop}{_db}",
+            [_U64, _I32, _I32, _I32],
+            _I32,
+            family="gda_flush_peer",
+            tag=f"{_coop}{_db}",
+        )
+    # (devComm, ctx, peer, flags) -> request, for gda_wait_<coop>
+    for _coop in COOP_TAGS:
+        _add(
+            f"gda_flush_async_{_coop}{_db[1:]}",
+            f"cco_gda_flush_async__{_coop}{_db}",
+            [_U64, _I32, _I32, _I32],
+            _U64,
+            family="gda_flush_async",
+            tag=f"{_coop}{_db}",
+        )
 
-# (devComm, ctx, peer, flags) -> request, for gda_wait_<coop>
 for _coop in COOP_TAGS:
-    _add(
-        f"gda_flush_async_{_coop}",
-        f"cco_gda_flush_async__{_coop}",
-        [_U64, _I32, _I32, _I32],
-        _U64,
-        family="gda_flush_async",
-        tag=_coop,
-    )
     # (devComm, ctx, request) -> 0
     _add(
         f"gda_wait_{_coop}",
@@ -544,6 +577,10 @@ __all__ = [
     "SignalOp",
     "ThreadMode",
     "Team",
+    "GdaDoorbell",
+    "GDA_DOORBELL_TAG",
+    "GDA_FLUSH_DOORBELL_TAG",
+    "gda_doorbell_tag",
     "GdaFlags",
     "gda_flags",
     "SdmaOptFlags",
@@ -557,4 +594,6 @@ __all__ = [
     "GDA_DATA_TAGS",
     "GDA_SIGNAL_TAGS",
     "COOP_TAGS",
+    "GDA_DOORBELL_TAGS",
+    "GDA_FLUSH_DOORBELL_TAGS",
 ]

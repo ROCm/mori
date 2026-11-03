@@ -32,6 +32,7 @@ import triton.language as tl
 
 from mori.cco.device.ops import (
     CoopScope,
+    GdaDoorbell,
     GdaFlags,
     SdmaFlags,
     SdmaOptFlags,
@@ -57,17 +58,22 @@ _FLAG_REMOTE_SIGNAL = tl.constexpr(SdmaFlags.REMOTE_SIGNAL)
 _FLAG_SAME_QUEUE = tl.constexpr(SdmaFlags.SAME_QUEUE)
 _TEAM_WORLD = tl.constexpr(Team.WORLD)
 _TEAM_GDA = tl.constexpr(Team.GDA)
-_GDA_FLAG_DEFER_DOORBELL = tl.constexpr(GdaFlags.DEFER_DOORBELL)
 _GDA_FLAG_TEAM_GDA = tl.constexpr(GdaFlags.TEAM_GDA)
+_DOORBELL_IMMEDIATE = tl.constexpr(GdaDoorbell.IMMEDIATE)
+_DOORBELL_DEFERRED = tl.constexpr(GdaDoorbell.DEFERRED)
+_DOORBELL_CALLER_ORDERED = tl.constexpr(GdaDoorbell.CALLER_ORDERED)
 
-# GDA ops take `team` (how `peer` is numbered: Team.WORLD or Team.GDA) and, for
-# put / put_value / get, `defer_doorbell` -- both tl.constexpr, folded into a
-# constant GdaFlags word so the wrapper's dispatch compiles away. `ctx`, the QP
-# context, may be a runtime value on every op that posts to or flushes a QP.
+# GDA ops take `team` (how `peer` is numbered: Team.WORLD or Team.GDA), a
+# tl.constexpr folded into a constant GdaFlags word so the wrapper's dispatch
+# compiles away. `ctx`, the QP context, may be a runtime value on every op that
+# posts to or flushes a QP. The doorbell mode is the namespace's (Gda,
+# GdaDeferred, GdaCallerOrdered): the _gda_* ops take it first and pick the
+# extern by it.
 
 
 @triton.jit
 def _gda_put(
+    doorbell: tl.constexpr,
     dev_comm,
     peer,
     dst_win,
@@ -82,7 +88,6 @@ def _gda_put(
     coop: tl.constexpr = _COOP_THREAD,
     thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
     team: tl.constexpr = _TEAM_WORLD,
-    defer_doorbell: tl.constexpr = False,
 ):
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
@@ -106,12 +111,12 @@ def _gda_put(
         team == _TEAM_WORLD or team == _TEAM_GDA,
         "GDA team must be Team.WORLD or Team.GDA",
     )
-    flags: tl.constexpr = (_GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0) | (
-        _GDA_FLAG_DEFER_DOORBELL if defer_doorbell else 0
-    )
+    flags: tl.constexpr = _GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0
     if thread_mode == _THREAD_AGGREGATE:
         if signal_op == _SIGNAL_NONE:
-            raw.gda_put_at_none(
+            raw._with_doorbell(
+                "gda_put_at_none",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -125,7 +130,9 @@ def _gda_put(
                 flags,
             )
         elif signal_op == _SIGNAL_INC:
-            raw.gda_put_at_inc(
+            raw._with_doorbell(
+                "gda_put_at_inc",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -139,7 +146,9 @@ def _gda_put(
                 flags,
             )
         else:
-            raw.gda_put_at_add(
+            raw._with_doorbell(
+                "gda_put_at_add",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -154,7 +163,9 @@ def _gda_put(
             )
     elif coop == _COOP_THREAD:
         if signal_op == _SIGNAL_NONE:
-            raw.gda_put_it_none(
+            raw._with_doorbell(
+                "gda_put_it_none",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -168,7 +179,9 @@ def _gda_put(
                 flags,
             )
         elif signal_op == _SIGNAL_INC:
-            raw.gda_put_it_inc(
+            raw._with_doorbell(
+                "gda_put_it_inc",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -182,7 +195,9 @@ def _gda_put(
                 flags,
             )
         else:
-            raw.gda_put_it_add(
+            raw._with_doorbell(
+                "gda_put_it_add",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -197,7 +212,9 @@ def _gda_put(
             )
     elif coop == _COOP_WARP:
         if signal_op == _SIGNAL_NONE:
-            raw.gda_put_iw_none(
+            raw._with_doorbell(
+                "gda_put_iw_none",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -211,7 +228,9 @@ def _gda_put(
                 flags,
             )
         elif signal_op == _SIGNAL_INC:
-            raw.gda_put_iw_inc(
+            raw._with_doorbell(
+                "gda_put_iw_inc",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -225,7 +244,9 @@ def _gda_put(
                 flags,
             )
         else:
-            raw.gda_put_iw_add(
+            raw._with_doorbell(
+                "gda_put_iw_add",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -240,7 +261,9 @@ def _gda_put(
             )
     else:
         if signal_op == _SIGNAL_NONE:
-            raw.gda_put_ib_none(
+            raw._with_doorbell(
+                "gda_put_ib_none",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -254,7 +277,9 @@ def _gda_put(
                 flags,
             )
         elif signal_op == _SIGNAL_INC:
-            raw.gda_put_ib_inc(
+            raw._with_doorbell(
+                "gda_put_ib_inc",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -268,7 +293,9 @@ def _gda_put(
                 flags,
             )
         else:
-            raw.gda_put_ib_add(
+            raw._with_doorbell(
+                "gda_put_ib_add",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -285,6 +312,7 @@ def _gda_put(
 
 @triton.jit
 def _gda_put_value(
+    doorbell: tl.constexpr,
     dev_comm,
     peer,
     dst_win,
@@ -297,7 +325,6 @@ def _gda_put_value(
     coop: tl.constexpr = _COOP_THREAD,
     thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
     team: tl.constexpr = _TEAM_WORLD,
-    defer_doorbell: tl.constexpr = False,
 ):
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
@@ -321,12 +348,12 @@ def _gda_put_value(
         team == _TEAM_WORLD or team == _TEAM_GDA,
         "GDA team must be Team.WORLD or Team.GDA",
     )
-    flags: tl.constexpr = (_GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0) | (
-        _GDA_FLAG_DEFER_DOORBELL if defer_doorbell else 0
-    )
+    flags: tl.constexpr = _GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0
     if thread_mode == _THREAD_AGGREGATE:
         if signal_op == _SIGNAL_NONE:
-            raw.gda_put_value_at_none(
+            raw._with_doorbell(
+                "gda_put_value_at_none",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -338,7 +365,9 @@ def _gda_put_value(
                 flags,
             )
         elif signal_op == _SIGNAL_INC:
-            raw.gda_put_value_at_inc(
+            raw._with_doorbell(
+                "gda_put_value_at_inc",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -350,7 +379,9 @@ def _gda_put_value(
                 flags,
             )
         else:
-            raw.gda_put_value_at_add(
+            raw._with_doorbell(
+                "gda_put_value_at_add",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -363,7 +394,9 @@ def _gda_put_value(
             )
     elif coop == _COOP_THREAD:
         if signal_op == _SIGNAL_NONE:
-            raw.gda_put_value_it_none(
+            raw._with_doorbell(
+                "gda_put_value_it_none",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -375,7 +408,9 @@ def _gda_put_value(
                 flags,
             )
         elif signal_op == _SIGNAL_INC:
-            raw.gda_put_value_it_inc(
+            raw._with_doorbell(
+                "gda_put_value_it_inc",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -387,7 +422,9 @@ def _gda_put_value(
                 flags,
             )
         else:
-            raw.gda_put_value_it_add(
+            raw._with_doorbell(
+                "gda_put_value_it_add",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -400,7 +437,9 @@ def _gda_put_value(
             )
     elif coop == _COOP_WARP:
         if signal_op == _SIGNAL_NONE:
-            raw.gda_put_value_iw_none(
+            raw._with_doorbell(
+                "gda_put_value_iw_none",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -412,7 +451,9 @@ def _gda_put_value(
                 flags,
             )
         elif signal_op == _SIGNAL_INC:
-            raw.gda_put_value_iw_inc(
+            raw._with_doorbell(
+                "gda_put_value_iw_inc",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -424,7 +465,9 @@ def _gda_put_value(
                 flags,
             )
         else:
-            raw.gda_put_value_iw_add(
+            raw._with_doorbell(
+                "gda_put_value_iw_add",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -437,7 +480,9 @@ def _gda_put_value(
             )
     else:
         if signal_op == _SIGNAL_NONE:
-            raw.gda_put_value_ib_none(
+            raw._with_doorbell(
+                "gda_put_value_ib_none",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -449,7 +494,9 @@ def _gda_put_value(
                 flags,
             )
         elif signal_op == _SIGNAL_INC:
-            raw.gda_put_value_ib_inc(
+            raw._with_doorbell(
+                "gda_put_value_ib_inc",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -461,7 +508,9 @@ def _gda_put_value(
                 flags,
             )
         else:
-            raw.gda_put_value_ib_add(
+            raw._with_doorbell(
+                "gda_put_value_ib_add",
+                doorbell,
                 dev_comm,
                 ctx,
                 peer,
@@ -476,6 +525,7 @@ def _gda_put_value(
 
 @triton.jit
 def _gda_get(
+    doorbell: tl.constexpr,
     dev_comm,
     peer,
     remote_win,
@@ -487,7 +537,6 @@ def _gda_get(
     coop: tl.constexpr = _COOP_THREAD,
     thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
     team: tl.constexpr = _TEAM_WORLD,
-    defer_doorbell: tl.constexpr = False,
 ):
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
@@ -505,11 +554,11 @@ def _gda_get(
         team == _TEAM_WORLD or team == _TEAM_GDA,
         "GDA team must be Team.WORLD or Team.GDA",
     )
-    flags: tl.constexpr = (_GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0) | (
-        _GDA_FLAG_DEFER_DOORBELL if defer_doorbell else 0
-    )
+    flags: tl.constexpr = _GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0
     if thread_mode == _THREAD_AGGREGATE:
-        raw.gda_get_at(
+        raw._with_doorbell(
+            "gda_get_at",
+            doorbell,
             dev_comm,
             ctx,
             peer,
@@ -521,7 +570,9 @@ def _gda_get(
             flags,
         )
     elif coop == _COOP_THREAD:
-        raw.gda_get_it(
+        raw._with_doorbell(
+            "gda_get_it",
+            doorbell,
             dev_comm,
             ctx,
             peer,
@@ -533,7 +584,9 @@ def _gda_get(
             flags,
         )
     elif coop == _COOP_WARP:
-        raw.gda_get_iw(
+        raw._with_doorbell(
+            "gda_get_iw",
+            doorbell,
             dev_comm,
             ctx,
             peer,
@@ -545,7 +598,9 @@ def _gda_get(
             flags,
         )
     else:
-        raw.gda_get_ib(
+        raw._with_doorbell(
+            "gda_get_ib",
+            doorbell,
             dev_comm,
             ctx,
             peer,
@@ -641,6 +696,7 @@ def _gda_wait_signal(
 
 @triton.jit
 def _gda_flush(
+    doorbell: tl.constexpr,
     dev_comm,
     ctx=0,
     coop: tl.constexpr = _COOP_WARP,
@@ -650,13 +706,14 @@ def _gda_flush(
         "GDA coop must be CoopScope.THREAD, WARP, or BLOCK",
     )
     if coop == _COOP_BLOCK:
-        raw.gda_flush_block(dev_comm, ctx)
+        raw._with_doorbell("gda_flush_block", doorbell, dev_comm, ctx)
     else:
-        raw.gda_flush_warp(dev_comm, ctx)
+        raw._with_doorbell("gda_flush_warp", doorbell, dev_comm, ctx)
 
 
 @triton.jit
 def _gda_flush_peer(
+    doorbell: tl.constexpr,
     dev_comm,
     peer,
     ctx=0,
@@ -673,13 +730,14 @@ def _gda_flush_peer(
     )
     flags: tl.constexpr = _GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0
     if coop == _COOP_BLOCK:
-        raw.gda_flush_peer_block(dev_comm, ctx, peer, flags)
+        raw._with_doorbell("gda_flush_peer_block", doorbell, dev_comm, ctx, peer, flags)
     else:
-        raw.gda_flush_peer_warp(dev_comm, ctx, peer, flags)
+        raw._with_doorbell("gda_flush_peer_warp", doorbell, dev_comm, ctx, peer, flags)
 
 
 @triton.jit
 def _gda_flush_async(
+    doorbell: tl.constexpr,
     dev_comm,
     peer,
     ctx=0,
@@ -700,11 +758,17 @@ def _gda_flush_async(
     )
     flags: tl.constexpr = _GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0
     if coop == _COOP_THREAD:
-        return raw.gda_flush_async_thread(dev_comm, ctx, peer, flags)
+        return raw._with_doorbell(
+            "gda_flush_async_thread", doorbell, dev_comm, ctx, peer, flags
+        )
     elif coop == _COOP_WARP:
-        return raw.gda_flush_async_warp(dev_comm, ctx, peer, flags)
+        return raw._with_doorbell(
+            "gda_flush_async_warp", doorbell, dev_comm, ctx, peer, flags
+        )
     else:
-        return raw.gda_flush_async_block(dev_comm, ctx, peer, flags)
+        return raw._with_doorbell(
+            "gda_flush_async_block", doorbell, dev_comm, ctx, peer, flags
+        )
 
 
 @triton.jit
@@ -726,6 +790,357 @@ def _gda_wait(
         raw.gda_wait_warp(dev_comm, ctx, request)
     else:
         raw.gda_wait_block(dev_comm, ctx, request)
+
+
+# Each namespace's data path and flush, with its doorbell mode fixed.
+
+
+@triton.jit
+def _gda_put_immediate(
+    dev_comm,
+    peer,
+    dst_win,
+    dst_off,
+    src_win,
+    src_off,
+    nbytes,
+    ctx=0,
+    signal_op: tl.constexpr = _SIGNAL_NONE,
+    signal_id=0,
+    signal_val=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    _gda_put(
+        _DOORBELL_IMMEDIATE,
+        dev_comm,
+        peer,
+        dst_win,
+        dst_off,
+        src_win,
+        src_off,
+        nbytes,
+        ctx,
+        signal_op,
+        signal_id,
+        signal_val,
+        coop,
+        thread_mode,
+        team,
+    )
+
+
+@triton.jit
+def _gda_put_value_immediate(
+    dev_comm,
+    peer,
+    dst_win,
+    dst_off,
+    value,
+    ctx=0,
+    signal_op: tl.constexpr = _SIGNAL_NONE,
+    signal_id=0,
+    signal_val=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    _gda_put_value(
+        _DOORBELL_IMMEDIATE,
+        dev_comm,
+        peer,
+        dst_win,
+        dst_off,
+        value,
+        ctx,
+        signal_op,
+        signal_id,
+        signal_val,
+        coop,
+        thread_mode,
+        team,
+    )
+
+
+@triton.jit
+def _gda_get_immediate(
+    dev_comm,
+    peer,
+    remote_win,
+    remote_off,
+    local_win,
+    local_off,
+    nbytes,
+    ctx=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    _gda_get(
+        _DOORBELL_IMMEDIATE,
+        dev_comm,
+        peer,
+        remote_win,
+        remote_off,
+        local_win,
+        local_off,
+        nbytes,
+        ctx,
+        coop,
+        thread_mode,
+        team,
+    )
+
+
+@triton.jit
+def _gda_flush_immediate(dev_comm, ctx=0, coop: tl.constexpr = _COOP_WARP):
+    _gda_flush(_DOORBELL_IMMEDIATE, dev_comm, ctx, coop)
+
+
+@triton.jit
+def _gda_flush_peer_immediate(
+    dev_comm,
+    peer,
+    ctx=0,
+    coop: tl.constexpr = _COOP_WARP,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    _gda_flush_peer(_DOORBELL_IMMEDIATE, dev_comm, peer, ctx, coop, team)
+
+
+@triton.jit
+def _gda_flush_async_immediate(
+    dev_comm,
+    peer,
+    ctx=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    return _gda_flush_async(_DOORBELL_IMMEDIATE, dev_comm, peer, ctx, coop, team)
+
+
+@triton.jit
+def _gda_put_deferred(
+    dev_comm,
+    peer,
+    dst_win,
+    dst_off,
+    src_win,
+    src_off,
+    nbytes,
+    ctx=0,
+    signal_op: tl.constexpr = _SIGNAL_NONE,
+    signal_id=0,
+    signal_val=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    _gda_put(
+        _DOORBELL_DEFERRED,
+        dev_comm,
+        peer,
+        dst_win,
+        dst_off,
+        src_win,
+        src_off,
+        nbytes,
+        ctx,
+        signal_op,
+        signal_id,
+        signal_val,
+        coop,
+        thread_mode,
+        team,
+    )
+
+
+@triton.jit
+def _gda_put_value_deferred(
+    dev_comm,
+    peer,
+    dst_win,
+    dst_off,
+    value,
+    ctx=0,
+    signal_op: tl.constexpr = _SIGNAL_NONE,
+    signal_id=0,
+    signal_val=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    _gda_put_value(
+        _DOORBELL_DEFERRED,
+        dev_comm,
+        peer,
+        dst_win,
+        dst_off,
+        value,
+        ctx,
+        signal_op,
+        signal_id,
+        signal_val,
+        coop,
+        thread_mode,
+        team,
+    )
+
+
+@triton.jit
+def _gda_get_deferred(
+    dev_comm,
+    peer,
+    remote_win,
+    remote_off,
+    local_win,
+    local_off,
+    nbytes,
+    ctx=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    _gda_get(
+        _DOORBELL_DEFERRED,
+        dev_comm,
+        peer,
+        remote_win,
+        remote_off,
+        local_win,
+        local_off,
+        nbytes,
+        ctx,
+        coop,
+        thread_mode,
+        team,
+    )
+
+
+@triton.jit
+def _gda_put_caller_ordered(
+    dev_comm,
+    peer,
+    dst_win,
+    dst_off,
+    src_win,
+    src_off,
+    nbytes,
+    ctx=0,
+    signal_op: tl.constexpr = _SIGNAL_NONE,
+    signal_id=0,
+    signal_val=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    _gda_put(
+        _DOORBELL_CALLER_ORDERED,
+        dev_comm,
+        peer,
+        dst_win,
+        dst_off,
+        src_win,
+        src_off,
+        nbytes,
+        ctx,
+        signal_op,
+        signal_id,
+        signal_val,
+        coop,
+        thread_mode,
+        team,
+    )
+
+
+@triton.jit
+def _gda_put_value_caller_ordered(
+    dev_comm,
+    peer,
+    dst_win,
+    dst_off,
+    value,
+    ctx=0,
+    signal_op: tl.constexpr = _SIGNAL_NONE,
+    signal_id=0,
+    signal_val=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    _gda_put_value(
+        _DOORBELL_CALLER_ORDERED,
+        dev_comm,
+        peer,
+        dst_win,
+        dst_off,
+        value,
+        ctx,
+        signal_op,
+        signal_id,
+        signal_val,
+        coop,
+        thread_mode,
+        team,
+    )
+
+
+@triton.jit
+def _gda_get_caller_ordered(
+    dev_comm,
+    peer,
+    remote_win,
+    remote_off,
+    local_win,
+    local_off,
+    nbytes,
+    ctx=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    _gda_get(
+        _DOORBELL_CALLER_ORDERED,
+        dev_comm,
+        peer,
+        remote_win,
+        remote_off,
+        local_win,
+        local_off,
+        nbytes,
+        ctx,
+        coop,
+        thread_mode,
+        team,
+    )
+
+
+@triton.jit
+def _gda_flush_caller_ordered(dev_comm, ctx=0, coop: tl.constexpr = _COOP_WARP):
+    _gda_flush(_DOORBELL_CALLER_ORDERED, dev_comm, ctx, coop)
+
+
+@triton.jit
+def _gda_flush_peer_caller_ordered(
+    dev_comm,
+    peer,
+    ctx=0,
+    coop: tl.constexpr = _COOP_WARP,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    _gda_flush_peer(_DOORBELL_CALLER_ORDERED, dev_comm, peer, ctx, coop, team)
+
+
+@triton.jit
+def _gda_flush_async_caller_ordered(
+    dev_comm,
+    peer,
+    ctx=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    return _gda_flush_async(_DOORBELL_CALLER_ORDERED, dev_comm, peer, ctx, coop, team)
 
 
 # put / get / put_ptr / get_ptr mirror ccoSdma's, and their keywords its template
@@ -993,18 +1408,47 @@ class DevComm:
 
 
 class Gda:
-    """Namespace matching the FlyDSL ``Gda`` method names."""
+    """Namespace matching the FlyDSL ``Gda`` method names, for a
+    ``GdaDoorbell.IMMEDIATE`` handle: every post rings for itself."""
 
-    put = staticmethod(_gda_put)
-    put_value = staticmethod(_gda_put_value)
-    get = staticmethod(_gda_get)
+    put = staticmethod(_gda_put_immediate)
+    put_value = staticmethod(_gda_put_value_immediate)
+    get = staticmethod(_gda_get_immediate)
     signal = staticmethod(_gda_signal)
     read_signal = staticmethod(_gda_read_signal)
     reset_signal = staticmethod(_gda_reset_signal)
     wait_signal = staticmethod(_gda_wait_signal)
-    flush = staticmethod(_gda_flush)
-    flush_peer = staticmethod(_gda_flush_peer)
-    flush_async = staticmethod(_gda_flush_async)
+    flush = staticmethod(_gda_flush_immediate)
+    flush_peer = staticmethod(_gda_flush_peer_immediate)
+    flush_async = staticmethod(_gda_flush_async_immediate)
+    wait = staticmethod(_gda_wait)
+
+
+class GdaDeferred(Gda):
+    """``Gda`` for a ``GdaDoorbell.DEFERRED`` handle: put / put_value / get ring
+    nothing; the next ring on the QP (any Gda post, signal, or flush) releases
+    them."""
+
+    put = staticmethod(_gda_put_deferred)
+    put_value = staticmethod(_gda_put_value_deferred)
+    get = staticmethod(_gda_get_deferred)
+
+
+class GdaCallerOrdered:
+    """``Gda`` for a ``GdaDoorbell.CALLER_ORDERED`` handle: put / put_value / get
+    write their WQEs only, and only this namespace's flush / flush_peer /
+    flush_async release them, under the contract on ``GdaDoorbell``. No
+    signal: put with a ``signal_op`` instead."""
+
+    put = staticmethod(_gda_put_caller_ordered)
+    put_value = staticmethod(_gda_put_value_caller_ordered)
+    get = staticmethod(_gda_get_caller_ordered)
+    read_signal = staticmethod(_gda_read_signal)
+    reset_signal = staticmethod(_gda_reset_signal)
+    wait_signal = staticmethod(_gda_wait_signal)
+    flush = staticmethod(_gda_flush_caller_ordered)
+    flush_peer = staticmethod(_gda_flush_peer_caller_ordered)
+    flush_async = staticmethod(_gda_flush_async_caller_ordered)
     wait = staticmethod(_gda_wait)
 
 
@@ -1026,11 +1470,14 @@ __all__ = [
     "DevComm",
     "Window",
     "Gda",
+    "GdaDeferred",
+    "GdaCallerOrdered",
     "Sdma",
     "CoopScope",
     "SignalOp",
     "ThreadMode",
     "Team",
+    "GdaDoorbell",
     "GdaFlags",
     "SdmaOptFlags",
     "SdmaFlags",

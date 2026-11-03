@@ -76,6 +76,7 @@ GDA_RECV_OFF = SDMA_MATRIX_OFF + NBYTES
 GDA_GET_OFF = GDA_RECV_OFF + 2 * NBYTES
 GDA_VALUE_OFF = GDA_GET_OFF + NBYTES
 WINDOW_BYTES = GDA_VALUE_OFF + 8
+GDA_BATCH_DOORBELLS = (cco.GdaDoorbell.DEFERRED, cco.GdaDoorbell.CALLER_ORDERED)
 
 _H2D, _D2H = 1, 2
 _TRUE_VALUES = {"1", "on", "true", "yes"}
@@ -582,30 +583,50 @@ def gda_defer_kernel(
     chunks: tl.constexpr,
     team: tl.constexpr,
     signal_id: tl.constexpr,
+    doorbell: tl.constexpr,
 ):
-    # Deferred puts ring nothing; flush_async rings for all of them at once and
-    # wait drains the CQ. The signal is an ordinary post behind them on the QP.
+    # Deferred (or caller-ordered) puts ring nothing; that namespace's
+    # flush_async rings for all of them at once and wait drains the CQ. The
+    # signal is an ordinary post behind them on the QP.
     chunk: tl.constexpr = nbytes // chunks
     qp = tl.program_id(
         0
     )  # a runtime QP context, as a kernel spreading chunks would pick
-    for c in tl.static_range(chunks):
-        cco.Gda.put(
-            dev_comm,
-            peer,
-            window,
-            dst_off + c * chunk,
-            window,
-            src_off + c * chunk,
-            chunk,
-            ctx=qp,
-            coop=cco.CoopScope.BLOCK,
-            team=team,
-            defer_doorbell=True,
+    if doorbell == cco.GdaDoorbell.DEFERRED:
+        for c in tl.static_range(chunks):
+            cco.GdaDeferred.put(
+                dev_comm,
+                peer,
+                window,
+                dst_off + c * chunk,
+                window,
+                src_off + c * chunk,
+                chunk,
+                ctx=qp,
+                coop=cco.CoopScope.BLOCK,
+                team=team,
+            )
+        request = cco.GdaDeferred.flush_async(
+            dev_comm, peer, ctx=qp, coop=cco.CoopScope.BLOCK, team=team
         )
-    request = cco.Gda.flush_async(
-        dev_comm, peer, ctx=qp, coop=cco.CoopScope.BLOCK, team=team
-    )
+    else:
+        for c in tl.static_range(chunks):
+            cco.GdaCallerOrdered.put(
+                dev_comm,
+                peer,
+                window,
+                dst_off + c * chunk,
+                window,
+                src_off + c * chunk,
+                chunk,
+                ctx=qp,
+                coop=cco.CoopScope.BLOCK,
+                team=team,
+            )
+        # Thread 0 posted every chunk and flushes, so the posts precede the flush.
+        request = cco.GdaCallerOrdered.flush_async(
+            dev_comm, peer, ctx=qp, coop=cco.CoopScope.BLOCK, team=team
+        )
     cco.Gda.wait(dev_comm, request, coop=cco.CoopScope.BLOCK)
     cco.Gda.signal(
         dev_comm,
@@ -907,22 +928,25 @@ def test_gda(comm, dc, win, rank, world_size, extern_libs):
                 extern_libs=extern_libs,
                 num_warps=1,
             )
-    # Flagged put, flush_async and wait, and a runtime ctx, for both teams.
-    for team in (cco.Team.WORLD, cco.Team.GDA):
-        gda_defer_kernel.warmup(
-            dc.ptr,
-            win.handle,
-            peer=peer,
-            dst_off=dst_off,
-            src_off=SEND_OFF,
-            nbytes=NBYTES,
-            chunks=4,
-            team=team,
-            signal_id=1,
-            grid=(1,),
-            extern_libs=extern_libs,
-            num_warps=1,
-        )
+    # Deferred and caller-ordered puts, flush_async and wait, and a runtime ctx,
+    # for both teams.
+    for doorbell in GDA_BATCH_DOORBELLS:
+        for team in (cco.Team.WORLD, cco.Team.GDA):
+            gda_defer_kernel.warmup(
+                dc.ptr,
+                win.handle,
+                peer=peer,
+                dst_off=dst_off,
+                src_off=SEND_OFF,
+                nbytes=NBYTES,
+                chunks=4,
+                team=team,
+                signal_id=1,
+                doorbell=doorbell,
+                grid=(1,),
+                extern_libs=extern_libs,
+                num_warps=1,
+            )
 
     if _env_enabled("MORI_CCO_TRITON_GDA_COMPILE_ONLY"):
         print(f"[rank {rank}] GDA compile-only PASS", flush=True)
@@ -1026,29 +1050,35 @@ def test_gda(comm, dc, win, rank, world_size, extern_libs):
     comm.barrier()
     assert read_u64(win.local_ptr + GDA_VALUE_OFF) == source + 0xCC00
 
-    # Deferred doorbell + flush_async / wait, with peer numbered in each team. On
-    # a FULL connection the GDA team is the world, so both reach the same peer.
-    for team in (cco.Team.WORLD, cco.Team.GDA):
-        zero(win.local_ptr + GDA_RECV_OFF, 2 * NBYTES)
-        comm.barrier()
-        gda_defer_kernel[(1,)](
-            dc.ptr,
-            win.handle,
-            peer=peer,
-            dst_off=dst_off,
-            src_off=SEND_OFF,
-            nbytes=NBYTES,
-            chunks=4,
-            team=team,
-            signal_id=1,
-            extern_libs=extern_libs,
-            num_warps=1,
-        )
-        torch.cuda.synchronize()
-        comm.barrier()
-        check_payload(
-            win, GDA_RECV_OFF + source * NBYTES, source, f"GDA deferred put team={team}"
-        )
+    # Deferred and caller-ordered doorbells + flush_async / wait, with peer
+    # numbered in each team. On a FULL connection the GDA team is the world, so
+    # both reach the same peer.
+    for doorbell in GDA_BATCH_DOORBELLS:
+        for team in (cco.Team.WORLD, cco.Team.GDA):
+            zero(win.local_ptr + GDA_RECV_OFF, 2 * NBYTES)
+            comm.barrier()
+            gda_defer_kernel[(1,)](
+                dc.ptr,
+                win.handle,
+                peer=peer,
+                dst_off=dst_off,
+                src_off=SEND_OFF,
+                nbytes=NBYTES,
+                chunks=4,
+                team=team,
+                signal_id=1,
+                doorbell=doorbell,
+                extern_libs=extern_libs,
+                num_warps=1,
+            )
+            torch.cuda.synchronize()
+            comm.barrier()
+            check_payload(
+                win,
+                GDA_RECV_OFF + source * NBYTES,
+                source,
+                f"GDA batched put doorbell={doorbell} team={team}",
+            )
     print(f"[rank {rank}] GDA PASS", flush=True)
 
 

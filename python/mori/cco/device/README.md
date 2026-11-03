@@ -57,9 +57,10 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
 - **Provider fixed at build time** via `CCO_GDA_BUILD_PROVIDER` (NIC macro) — one
   `ccoGda<P>` specialization per NIC, same as the C++ kernels / shmem bitcode.
 - **OO handles** (`DevComm/Window/Gda`) are method-carrying `fx.struct`s
-  (`cco_struct`): build once, reuse across control flow. `Gda.ctx` is `Constexpr`
-  so the handle carries a single IR value; an op that posts to or flushes a QP
-  takes `ctx=` to use another context for that call, which may be a runtime value.
+  (`cco_struct`): build once, reuse across control flow. `Gda.ctx` and
+  `Gda.doorbell` are `Constexpr` so the handle carries a single IR value; an op
+  that posts to or flushes a QP takes `ctx=` to use another context for that
+  call, which may be a runtime value.
 
 ## LSA vs GDA — different models
 
@@ -68,12 +69,17 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   (`buffer_load`/`buffer_store`); cco does NOT move the data. See examples 04/05.
 - **GDA** (RDMA): opaque network ops, so they ARE exposed as device ops —
   `gda.put / put_value / get / signal / wait_signal / flush / flush_peer /
-  flush_async / wait`. Their compile-time keywords beyond the symbol tag ride in
-  a `GdaFlags` word: `team` (`Team.WORLD`, or `Team.GDA` for a peer numbered in
-  the GDA team, i.e. the node index on a RAIL connection) and, on put /
-  put_value / get, `defer_doorbell` (post without ringing; the next
-  non-deferred post, signal, flush or flush_async on the QP rings for it;
-  worth it when one warp posts many WQEs to a QP and releases them once).
+  flush_async / wait`. `team` (`Team.WORLD`, or `Team.GDA` for a peer numbered
+  in the GDA team, i.e. the node index on a RAIL connection) rides in a
+  constant `GdaFlags` word. The doorbell mode belongs to the handle,
+  `dc.gda(ctx, doorbell=GdaDoorbell.X)`, and is part of the symbol name:
+  `IMMEDIATE` (default) posts ring for themselves; `DEFERRED` put / put_value /
+  get post without ringing and the next IMMEDIATE post, signal, flush or
+  flush_async on the QP rings for them (worth it when one warp posts many WQEs
+  to a QP and releases them once); `CALLER_ORDERED` posts also skip the ready
+  mark and only a CALLER_ORDERED flush releases them, for callers that already
+  order every post before the flush (see `GdaDoorbell` for the contract). A
+  CALLER_ORDERED handle has no `signal`; put with a `signal_op` instead.
   `flush_async` returns a request for `wait`, so work can go between them;
   call `wait` with the same coop (with `BLOCK` only thread 0 holds the request).
   Per-call `ctx=` picks the QP context. It may differ per lane only with coop
@@ -140,10 +146,11 @@ torchrun --standalone --nproc_per_node=2 \
    public device API (`ccoGda` / `ccoSdma` / ...), not its internals. Template
    axes cross the scalar FFI one of two ways, both with no runtime cost:
    - a tag in the symbol name (`cco_<op>__<tag>`), one symbol per value: the GDA
-     ops via the `CCO_TC_LIST` / `CCO_COOP_LIST` X-macros, the SDMA coop scope;
+     ops via the `CCO_TC_LIST` / `CCO_COOP_LIST` X-macros and their doorbell
+     mode (`__deferred` / `__caller_ordered`), the SDMA coop scope;
    - a `flags` argument the wrapper dispatches on (`SdmaWithFlags` for
-     `cco_sdma_{put,get}_ptr__<coop>`, `GdaWithFlags` for the GDA ops that take
-     a peer). The wrapper is inlined, so a
+     `cco_sdma_{put,get}_ptr__<coop>`, `GdaWithTeam` for the team bit of the
+     GDA ops that take a peer). The wrapper is inlined, so a
      compile-time constant `flags` folds to one instantiation; the Python
      handles always pass one. Prefer this for an axis with many combinations.
    SDMA wrappers go inside `#if BUILD_CCO_SDMA`. JIT re-compiles automatically —
@@ -169,7 +176,7 @@ beyond the method names.
 | `03_flydsl_put` | GDA put + signal/wait (single-node FULL + 2-node CROSSNODE) |
 | `04_flydsl_lsa_put` | LSA direct peer-pointer store in the kernel |
 | `05_flydsl_lsa_allreduce` | LSA custom all-reduce: peer pointers + device signal barrier |
-| `06_flydsl_gda_modes` | GDA template matrix: (thread_mode,coop) {indep×thread/warp/block, aggr×thread} × signal {inc,add}; deferred puts + flush_async/wait per team |
+| `06_flydsl_gda_modes` | GDA template matrix: (thread_mode,coop) {indep×thread/warp/block, aggr×thread} × signal {inc,add}; deferred and caller-ordered puts + flush_async/wait per team |
 | `examples/cco/ir/test_triton_cco.py` | Triton DevComm queries plus LSA, SDMA, and GDA |
 
 ## FlyDSL kernel-author gotchas

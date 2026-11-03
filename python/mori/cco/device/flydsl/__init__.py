@@ -42,7 +42,14 @@ Example (inside ``@flyc.kernel``)::
 """
 
 from mori.cco.device.bitcode import find_cco_bitcode, get_bitcode_path
-from mori.cco.device.ops import GdaFlags, SdmaCmp, SdmaFlags, SdmaOptFlags, Team
+from mori.cco.device.ops import (
+    GdaDoorbell,
+    GdaFlags,
+    SdmaCmp,
+    SdmaFlags,
+    SdmaOptFlags,
+    Team,
+)
 from .handles import (
     DevComm,
     Window,
@@ -64,6 +71,7 @@ __all__ = [
     "SignalOp",
     "ThreadMode",
     "Team",
+    "GdaDoorbell",
     "GdaFlags",
     "SdmaOptFlags",
     "SdmaFlags",

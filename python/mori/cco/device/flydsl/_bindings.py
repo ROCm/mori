@@ -39,13 +39,14 @@ Symbol tags (must match the wrapper):
   * ``signal`` / ``wait`` / ``flush``: coop-only tag ``thread`` / ``warp`` / ``block``.
   * ``put`` / ``put_value`` / ``signal`` also carry a signal-op tag
     ``none`` / ``inc`` / ``add`` (``signal`` has no ``none``).
+  * the handle's doorbell mode ends the data-path tag (``__deferred`` /
+    ``__caller_ordered``) and the flush tag (``__caller_ordered``); see
+    ``GDA_DOORBELL_TAG``.
 """
 
 from mori.cco.device.ops import (
     CCO_DEVICE_FUNCTIONS,
     COOP_TAGS,
-    GDA_DATA_TAGS,
-    GDA_SIGNAL_TAGS,
 )
 
 from ._internal import _ffi
@@ -69,27 +70,27 @@ def _binding(name):
     return ALL[name]
 
 
+def _by_tag(family):
+    return {
+        meta["tag"]: ALL[name]
+        for name, meta in CCO_DEVICE_FUNCTIONS.items()
+        if meta["family"] == family
+    }
+
+
 # ── monomorphized op tables (keyed by tag) ──
-PUT = {
-    f"{tc}__{s}": _binding(f"gda_put_{tc}_{s}")
-    for tc in GDA_DATA_TAGS
-    for s in GDA_SIGNAL_TAGS
-}
-PUT_VALUE = {
-    f"{tc}__{s}": _binding(f"gda_put_value_{tc}_{s}")
-    for tc in GDA_DATA_TAGS
-    for s in GDA_SIGNAL_TAGS
-}
-GET = {tc: _binding(f"gda_get_{tc}") for tc in GDA_DATA_TAGS}
+PUT = _by_tag("gda_put")  # "<tc>__<sig><doorbell>"
+PUT_VALUE = _by_tag("gda_put_value")
+GET = _by_tag("gda_get")  # "<tc><doorbell>"
 SIGNAL = {
     f"{c}__{s}": _binding(f"gda_signal_{c}_{s}")
     for c in COOP_TAGS
     for s in ("inc", "add")
 }
 WAIT_SIGNAL = {c: _binding(f"gda_wait_signal_{c}") for c in COOP_TAGS}
-FLUSH = {c: _binding(f"gda_flush_{c}") for c in ("warp", "block")}
-FLUSH_PEER = {c: _binding(f"gda_flush_peer_{c}") for c in ("warp", "block")}
-FLUSH_ASYNC = {c: _binding(f"gda_flush_async_{c}") for c in COOP_TAGS}
+FLUSH = _by_tag("gda_flush")  # "<coop><flush doorbell>"
+FLUSH_PEER = _by_tag("gda_flush_peer")
+FLUSH_ASYNC = _by_tag("gda_flush_async")
 WAIT = {c: _binding(f"gda_wait_{c}") for c in COOP_TAGS}
 
 # ── SDMA ──
