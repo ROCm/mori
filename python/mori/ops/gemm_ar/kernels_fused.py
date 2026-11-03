@@ -1073,7 +1073,11 @@ def compile_fused_gemm_scatter(
         # mxfp8_raw reads its scales from LDS slots refilled every CHUNK steps;
         # reading a step ahead would cross a chunk before its copy has landed.
         raise ValueError("scale_prefetch is for global scale loads, not mxfp8_raw")
-    scale_prefetch = bool(scale_prefetch) and mxfp8
+    if scale_prefetch and not mxfp8:
+        raise ValueError(
+            f"scale_prefetch prefetches mxfp8 scale loads; quant={quant!r} "
+            f"has none, and the flag used to be dropped silently"
+        )
     if (blockscale or mxfp8) and not swap_ab:
         raise ValueError(
             f"--quant {quant} needs --swap-ab: the unswapped epilogue "
@@ -1604,11 +1608,22 @@ def compile_fused_gemm_scatter(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, scale_a=msa1, scale_b=msb0)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            # The original count. Lowering it to A+B-1 used to be the fix for
-            # the large-grid corruption, but it only made the peeled tail's
-            # tiles land sooner; the tail now drains them itself (below), and
-            # this count is clean on the shape that motivated the change.
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            # Covers a_next1: only B + A + B loads are issued after it, so the
+            # count may be at most A + 2B. The original 2A + B is that exactly
+            # at 256x256 (A = B = 2) and one too many at 256x128 (A=2, B=1),
+            # where a_next1's second load -- rows 64..127 of A1, read by the
+            # wave_m == 1 waves next step -- went uncovered. It used to be
+            # retired anyway by the wait for step k+1's own scales, issued
+            # after it; scale_prefetch issues those a step earlier, before
+            # a_next1, and that cover went with them. min() leaves 256x256's
+            # code as it was. (Lowering it to A+B-1 was once the fix for the
+            # large-grid corruption, but that only made the peeled tail's
+            # tiles land sooner; the tail now drains them itself, below.)
+            wait_barrier(
+                min(
+                    2 * N_LDS_STEPS_A + N_LDS_STEPS_B, N_LDS_STEPS_A + 2 * N_LDS_STEPS_B
+                )
+            )
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, scale_a=msa1, scale_b=msb1)
 

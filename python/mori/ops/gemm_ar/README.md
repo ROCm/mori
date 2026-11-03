@@ -520,9 +520,11 @@ half a step of latency hiding. Issued one step earlier, the wait becomes
 `vmcnt(17..20)` and stops blocking; loading them two steps earlier gains nothing
 more.
 
-It is not free: six more VGPRs are live, in a kernel already at 256. So
-`scale_prefetch` is on by default only for `quant="mxfp8"` at
-`K >= SCALE_PREFETCH_MIN_K` (4096). GEMM only, 256x256, MI355X, FlyDSL 0.4.0,
+It is not free at short K: six more VGPRs are live across a step, in a kernel
+already at 256, and at K=2048 the 256x256 kernel spills 18 registers against
+4 without it. At the K where it turns on the reverse holds -- at K=4096 and
+8192 spills go from 6 (28 B of scratch) to 0. So `scale_prefetch` is on by
+default only for `quant="mxfp8"` at `K >= SCALE_PREFETCH_MIN_K` (4096). GEMM only, 256x256, MI355X, FlyDSL 0.4.0,
 CUDA-graph timed with B rotated past the LLC, median of two to three
 interleaved rounds, relL2 1.66e-3 throughout:
 
@@ -551,10 +553,23 @@ This and `"mxfp8_raw"` below take the same `vmcnt` coupling apart two ways:
 prefetch keeps the scales in global memory and issues their loads a step
 earlier, `"mxfp8_raw"` moves them into LDS. They do not combine: a raw-mode
 read one step ahead could cross into an LDS chunk not yet staged, so
-`scale_prefetch=True` with `"mxfp8_raw"` is refused.
+`scale_prefetch=True` with `"mxfp8_raw"` is refused, and so is it with
+`ptpc` or `blockscale`, which have no mxfp8 scales to prefetch.
 
-**Row-major scales through LDS (`quant="mxfp8_raw"`) beat both, cold and at
-large M** (the table below has where they do not). The packed
+Moving the scale loads also moved the wait that had been retiring `a_next1`.
+The end-of-step `wait_barrier` was `2A + B` (A, B = A and B LDS steps), but
+only `A + 2B` loads are issued after `a_next1`: equal at 256x256, one too many
+on `Mxfp8GemmOp`'s 256x128 tile, where `a_next1`'s second load was covered
+only by the wait for the next step's scales -- issued after it without the
+prefetch, before it with. The wait is now `min(2A + B, A + 2B)`: `vmcnt(4)`
+at 256x128, the same code at 256x256. It was never seen to corrupt (12,800
+narrow-tile calls under a concurrent copy stream, all bit-identical); the
+tests now compare prefetch on against off bitwise on both tiles.
+
+**Row-major scales through LDS (`quant="mxfp8_raw"`) beat the packed and
+unpacked layouts read from global without the prefetch, cold and at large M**
+(the table below has where they do not; it was measured before the prefetch,
+and raw has not been compared against packed-with-prefetch at K >= 4096). The packed
 layout fixes the addresses but still reads from global once per K step, and that
 costs in two ways the counters above do not show. The MFMA that consumes a scale
 waits for it with `vmcnt`, which retires in issue order, so it also waits for
@@ -589,8 +604,9 @@ Cold is the number a forward pass sees. The two places it loses are where the
 staging is not amortised: K=640 is five K steps in two chunks, and hot at M=64
 copies 256 rows of A scale for 64 real ones. It also takes any M, since there is
 no packed group to pad to. `"mxfp8"` stays the default so that callers whose
-quantiser writes the packed layout keep working; new callers should take
-`"mxfp8_raw"`.
+quantiser writes the packed layout keep working; below K=4096 new callers
+should take `"mxfp8_raw"`. At K >= 4096, where `"mxfp8"` prefetches its
+scales, the two have not been compared.
 
 **Against the alternatives**, bf16 in and bf16 out, the whole pipeline including
 quantisation, M=16384:

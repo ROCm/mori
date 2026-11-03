@@ -544,6 +544,143 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k, quant, scale_prefetch):
     assert rel < 3e-3, f"{quant} relL2 {rel:.3e} against the fp32 reference"
 
 
+@pytest.mark.parametrize("block_n", [128, 256])
+@pytest.mark.parametrize("m,n,k", [(1024, 5120, 4096), (512, 1024, 8192)])
+def test_scale_prefetch_is_bitwise_identical_on_both_tiles(m, n, k, block_n):
+    """Prefetch on by default against forced off, on both N tiles.
+
+    Only the order of the scale loads changes, so the output may not change by
+    a bit; the floor check in ``test_mxfp8_lands_at_the_fp8_floor`` could not
+    see a stale A1 half that happened to be close. ``block_n=128`` is
+    ``Mxfp8GemmOp``'s narrow tile (no permlane), where the end-of-step wait
+    did not cover ``a_next1``'s second load once the prefetch moved the scale
+    loads -- and the wait for them -- ahead of it. Both K are past
+    ``SCALE_PREFETCH_MIN_K``, so ``None`` means on.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    pytest.importorskip("flydsl")
+    import flydsl.expr as fx
+    from mori.ops.gemm_ar import compile_fused_gemm_scatter, preshuffle_b
+
+    g = torch.Generator(device="cuda").manual_seed(13)
+    a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    ea = torch.randint(
+        120, 123, (m, k // 32), generator=g, device="cuda", dtype=torch.int32
+    )
+    eb = torch.randint(
+        120, 123, (n // 32, k // 32), generator=g, device="cuda", dtype=torch.int32
+    )
+    sa, sb = preshuffle_a_scale(ea), eb.t().reshape(-1).contiguous()
+    b_shuf = preshuffle_b(b).contiguous().view(torch.int8).view(-1)
+    cfg = layout.ArConfig(world_size=2, m=m, n=n)
+    wide = block_n == 256
+    outs = {}
+    for prefetch in (None, False):
+        gemm = compile_fused_gemm_scatter(
+            cfg,
+            0,
+            K=k,
+            BLOCK_M=256,
+            BLOCK_N=block_n,
+            b_preshuffled=True,
+            fuse=False,
+            swap_ab=True,
+            permlane=wide,
+            lane_transpose=wide,
+            quant="mxfp8",
+            scale_prefetch=prefetch,
+        )
+        out = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
+        # A few calls each: an ordering hole shows up as a call that differs.
+        for _ in range(4):
+            gemm(
+                a.contiguous().view(torch.int8).view(-1),
+                b_shuf,
+                out.view(-1),
+                sa,
+                sb,
+                m,
+                n,
+                0,
+                0,
+                stream=fx.Stream(torch.cuda.current_stream()),
+            )
+            torch.cuda.synchronize()
+            outs.setdefault(prefetch, []).append(out.clone())
+    ref = outs[False][0]
+    for prefetch, runs in outs.items():
+        for i, got in enumerate(runs):
+            assert torch.equal(got, ref), (prefetch, i)
+
+
+@pytest.mark.parametrize("k", [4096, 8192])
+def test_fused_kernel_compiles_with_the_default_scale_prefetch(k, monkeypatch):
+    """The fused all-reduce kernel at K past ``SCALE_PREFETCH_MIN_K``, built
+    the way ``GemmAllReduceOp`` builds it, so the prefetch is on by default.
+
+    Compile only (FlyDSL's ``COMPILE_ONLY``): the main loop is the one the
+    bitwise test above runs with ``fuse=False``, and what ``fuse=True`` adds
+    is the epilogue's puts, which need a communicator to execute but not to
+    compile. Off is compiled alongside as the control.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    pytest.importorskip("flydsl")
+    import flydsl.expr as fx
+    from mori.ops.gemm_ar import compile_fused_gemm_scatter
+
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    m, n = 512, 1024
+    cfg = layout.ArConfig(world_size=2, m=m, n=n)
+    a = torch.zeros(m * k, device="cuda", dtype=torch.int8)
+    b = torch.zeros(n * k, device="cuda", dtype=torch.int8)
+    c = torch.zeros(m * n, device="cuda", dtype=torch.bfloat16)
+    sa = torch.zeros(m * k // 128, device="cuda", dtype=torch.int32)
+    sb = torch.zeros(n * k // 32, device="cuda", dtype=torch.int32)
+    for prefetch in (None, False):
+        gemm = compile_fused_gemm_scatter(
+            cfg,
+            0,
+            K=k,
+            BLOCK_M=256,
+            BLOCK_N=256,
+            b_preshuffled=True,
+            fuse=True,
+            transport="sdma",
+            quant="mxfp8",
+            swap_ab=True,
+            permlane=True,
+            lane_transpose=True,
+            scale_prefetch=prefetch,
+        )
+        gemm(a, b, c, sa, sb, m, n, 0, 0, stream=fx.Stream(torch.cuda.current_stream()))
+
+
+@pytest.mark.parametrize("quant", ["ptpc", "blockscale"])
+def test_scale_prefetch_refuses_a_quant_without_mxfp8_scales(quant):
+    """An explicit ``scale_prefetch=True`` used to be dropped for these."""
+    pytest.importorskip("flydsl")
+    from mori.ops.gemm_ar import compile_fused_gemm_scatter
+
+    with pytest.raises(ValueError, match="scale_prefetch"):
+        compile_fused_gemm_scatter(
+            layout.ArConfig(world_size=2, m=512, n=512),
+            0,
+            K=4096,
+            BLOCK_M=256,
+            BLOCK_N=256,
+            b_preshuffled=True,
+            fuse=False,
+            swap_ab=True,
+            permlane=True,
+            lane_transpose=True,
+            quant=quant,
+            scale_prefetch=True,
+        )
+
+
 @pytest.mark.parametrize("m,n,k", [(512, 512, 256), (4096, 7168, 1024)])
 def test_swap_ab_is_bitwise_identical(m, n, k):
     """Exchanging the MFMA operands must not change a single bit.

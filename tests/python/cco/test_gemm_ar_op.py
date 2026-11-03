@@ -460,10 +460,15 @@ def _mxfp8_gemm_rel_l2(
 
 @requires_gpu
 @pytest.mark.parametrize("quant", ["mxfp8", "mxfp8_raw"])
-@pytest.mark.parametrize("n,k,label", [(8192, 1280, "wq_b"), (5120, 2048, "wo_b")])
+@pytest.mark.parametrize(
+    "n,k,label",
+    [(8192, 1280, "wq_b"), (5120, 2048, "wo_b"), (5120, 4096, "prefetch")],
+)
 @pytest.mark.parametrize("m", [64, 192, 1024, 4096])
 def test_standalone_mxfp8_gemm(n, k, label, m, quant):
-    """``Mxfp8GemmOp`` at DeepSeek-V4.1-Flash's two attention shapes.
+    """``Mxfp8GemmOp`` at DeepSeek-V4.1-Flash's two attention shapes, plus a
+    K past ``SCALE_PREFETCH_MIN_K`` so both of the op's tiles run with the
+    scale prefetch on by default.
 
     Single process on purpose: this op has no communicator and no symmetric
     window, which is the whole reason it exists -- a ColumnParallelLinear like
