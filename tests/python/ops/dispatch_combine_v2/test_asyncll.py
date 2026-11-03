@@ -572,11 +572,13 @@ def run_two_ops_interleaved(d, comm_a, comm_b, layers):
         A.dispatch_recv, A.combine_send, B.dispatch_recv, B.combine_send,
         A.combine_recv, next layer ...
 
-    The SDMA queues behind both ops are the same process-wide ones, so this
-    checks that the two ops post to different queues (otherwise each recv's
-    drain also waits for the other op's copies -- correct, but it serialises the
-    overlap), and that the interleaving stays correct with no host sync. The two
-    capacities differ, as a TBO child's does.
+    The SDMA queues behind both ops are the same process-wide ones, so both ops
+    ask for a queue of their own (async_ll_own_sdma_queue), and this checks that
+    they get different ones (otherwise each recv's drain also waits for the other
+    op's copies -- correct, but it serialises the overlap), that an op created and
+    closed before B, or one that keeps the shared queue, does not move B off the
+    queue A leaves free, that LSA takes no queue, and that the interleaving stays
+    correct with no host sync. The two capacities differ, as a TBO child's does.
     """
     hidden, topk, epr = 4096, 6, 16
     caps = (64, 32)
@@ -584,7 +586,7 @@ def run_two_ops_interleaved(d, comm_a, comm_b, layers):
     dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
     transport = os.environ.get("TRANSPORT", "sdma")
 
-    def config(m):
+    def config(m, own_queue=True):
         return EpDispatchCombineConfig(
             rank=rank,
             world_size=world,
@@ -596,6 +598,7 @@ def run_two_ops_interleaved(d, comm_a, comm_b, layers):
             kernel_backend="hip",
             async_ll=True,
             async_ll_transport=transport,
+            async_ll_own_sdma_queue=own_queue,
         )
 
     plans = []
@@ -615,23 +618,31 @@ def run_two_ops_interleaved(d, comm_a, comm_b, layers):
     dist.barrier()
 
     failures = 0
-    with (
-        EpDispatchCombineOp(config(caps[0]), comm_a) as op_a,
-        EpDispatchCombineOp(config(caps[1]), comm_b) as op_b,
-    ):
+    op_a = EpDispatchCombineOp(config(caps[0]), comm_a)
+    with EpDispatchCombineOp(config(caps[1]), comm_b) as gone:
+        gone_offset = gone._sdma_queue_offset
+    with EpDispatchCombineOp(config(caps[1], own_queue=False), comm_b) as shared:
+        shared_offset = shared._sdma_queue_offset
+    with op_a, EpDispatchCombineOp(config(caps[1]), comm_b) as op_b:
         ops = (op_a, op_b)
         num_queues = op_a._dev_comm.sdma_num_queue
         offsets = [op._sdma_queue_offset for op in ops]
-        if transport == "sdma" and num_queues > 1 and offsets[0] == offsets[1]:
+        if transport == "sdma" and num_queues > 1:
+            ok = offsets[0] != offsets[1] and offsets[1] == gone_offset
+        else:
+            ok = offsets == [0, 0]
+        if not ok or shared_offset != 0:
             print(
-                f"[rank {rank}] two ops share SDMA queue offset {offsets[0]} "
-                f"of {num_queues}",
+                f"[rank {rank}] SDMA queue offsets: A/B {offsets}, closed op "
+                f"{gone_offset}, shared-queue op {shared_offset}, of {num_queues} "
+                f"({transport})",
                 flush=True,
             )
             failures += 1
         if rank == 0:
             print(
-                f"# asyncll two ops: sdma queues {num_queues}, offsets {offsets}",
+                f"# asyncll two ops: sdma queues {num_queues}, offsets {offsets}, "
+                f"closed op {gone_offset}, shared-queue op {shared_offset}",
                 flush=True,
             )
 

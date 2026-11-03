@@ -214,6 +214,26 @@ class EpDispatchCombineConfig:
     # Pick "lsa" for a small-batch, empty-seam call; keep "sdma" otherwise, when
     # the point is the overlap, or when this op will later run across nodes.
     async_ll_transport: str = "sdma"
+    # Give this op its own SDMA queue to each peer instead of the one every AsyncLL
+    # op in the process shares (async_ll with the "sdma" transport only; ignored
+    # otherwise).
+    #
+    # SDMA queues are process-wide per GPU pair, and a recv drains the whole queue
+    # it sent on. When two ops' calls interleave on ONE stream -- two-batch
+    # overlap issuing both micro-batches on the compute stream -- each recv is
+    # enqueued right behind the other op's send and waits for it too; a queue of
+    # its own removes that wait. When the two ops run on SEPARATE streams the
+    # shared queue drains the first-posted op first, while two queues split the
+    # link between both ops and finish both later.
+    #
+    # Measured on 8x MI355X, EP8, hidden 7168, early notify: two ops, one stream,
+    # with compute between the phases: -10 to -15% per iteration; two streams:
+    # +13 to +14%. DeepSeek-V4-Pro EP8 prefill with two-batch overlap: one stream
+    # 70.6k -> 79.6k tok/s; two streams 78.7k -> 80.2k.
+    #
+    # Set it on both ops of a single-stream two-batch overlap; leave it off when
+    # the micro-batches run on their own streams.
+    async_ll_own_sdma_queue: bool = False
 
     def __post_init__(self):
         # Node grouping first: is_internode gates checks further down, and the
