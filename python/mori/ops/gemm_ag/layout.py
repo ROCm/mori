@@ -166,11 +166,6 @@ class AgConfig:
     #: control state when a single window serves several ``m``. 0 means "same as
     #: counter_chunks".
     counter_capacity: int = 0
-    #: Independent counter sets the region holds, and which one this config
-    #: uses. The election test is a residue on a counter that is never reset, so
-    #: two shapes sharing a set would elect on each other's leftovers.
-    counter_shape_slots: int = 1
-    counter_shape_index: int = 0
     #: Lay the payload region out for this ``m`` instead of for ``m``. Pinning
     #: it to the largest ``m`` an instance will serve makes every shape's map
     #: identical, so a region only ever aliases *itself*. Sizes stay ``m``-based:
@@ -258,7 +253,9 @@ class AgConfig:
 
     @property
     def counter_region_off(self) -> int:
-        """Monotonic tile counters for the fused GEMM, one per (chunk, lane)."""
+        """Tile counters for the fused GEMM, one per (chunk, lane). The tile
+        that completes a chunk puts its counter back to zero, so one set serves
+        every ``m`` and chunk count."""
         return _align_up(self.flag_off + self.max_blocks * 4, SIGNAL_ALIGN)
 
     @property
@@ -284,16 +281,12 @@ class AgConfig:
 
     @property
     def counter_off(self) -> int:
-        """This config's counter set. Sized by capacity, so it does not move."""
-        return (
-            self.counter_region_off + self.counter_shape_index * self.counter_set_bytes
-        )
+        """The counter set. Sized by capacity, so it does not move."""
+        return self.counter_region_off
 
     @property
     def counter_bytes(self) -> int:
-        return _align_up(
-            self.counter_set_bytes * self.counter_shape_slots, SIGNAL_ALIGN
-        )
+        return _align_up(self.counter_set_bytes, SIGNAL_ALIGN)
 
     @property
     def lock_off(self) -> int:
@@ -443,15 +436,6 @@ class AgConfig:
                 f"counter_capacity ({self.counter_capacity}) must be >= "
                 f"counter_chunks ({self.counter_chunks}); the region has to hold "
                 f"the set this config indexes into"
-            )
-        if self.counter_shape_slots < 1:
-            raise ValueError(
-                f"counter_shape_slots must be >= 1, got {self.counter_shape_slots}"
-            )
-        if not 0 <= self.counter_shape_index < self.counter_shape_slots:
-            raise ValueError(
-                f"counter_shape_index must be in [0, {self.counter_shape_slots}), "
-                f"got {self.counter_shape_index}"
             )
         if self.capacity_m and self.capacity_m < self.m:
             raise ValueError(

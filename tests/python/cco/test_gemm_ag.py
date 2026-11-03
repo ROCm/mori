@@ -359,19 +359,6 @@ def test_capacity_m_pins_the_offsets_so_two_shapes_cannot_alias():
     assert small.remote_bytes_per_rank == 7 * small.slab_bytes
 
 
-def test_counter_shape_slots_are_disjoint():
-    """Two shapes sharing a set would elect on each other's leftovers."""
-    offs = []
-    for i in range(3):
-        c = layout.ag_config(
-            **MODEL, counter_chunks=4, counter_shape_slots=3, counter_shape_index=i
-        )
-        offs.append((c.counter_off, c.counter_set_bytes))
-        assert c.counter_off + c.counter_set_bytes <= c.lock_off
-    for (ao, asz), (bo, _) in zip(offs, offs[1:]):
-        assert ao + asz <= bo
-
-
 @pytest.mark.parametrize(
     "m_tiles, requested, want",
     [(16, 8, 8), (16, 5, 4), (16, 32, 16), (12, 8, 6), (7, 4, 1), (16, 1, 1)],

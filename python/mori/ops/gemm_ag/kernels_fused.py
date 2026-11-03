@@ -798,11 +798,17 @@ def compile_fused_gemm_ag(
             # _compat's "monotonic": the election has to order
             # against the stores the fence above published.
             seq = fx.Int32(atomic_add_u32(ctr, 1, ordering="acq_rel")) + fx.Int32(1)
-            # Monotonic: the counters are never reset, so "last tile of this
-            # chunk, this epoch" is a modulo test rather than a compare --
-            # the same property that makes graph replay behave like a fresh
-            # launch.
-            if seq % fx.Int32(tiles_per_chunk) == fx.Int32(0):
+            # The tiles_per_chunk-th arrival is the chunk's last tile this
+            # call, and it puts the counter back to zero: every one of this
+            # call's increments has already landed, and the next call's cannot
+            # start before this kernel ends, so a graph replay still behaves
+            # like a fresh launch -- and one counter set serves every M, at any
+            # chunk count. (It used to run on and be tested modulo
+            # tiles_per_chunk, which needed a counter set per M and elects the
+            # wrong tile once it crosses 2^31, or 2^32 unless tiles_per_chunk
+            # is a power of two. gemm_a2a resets the same way.)
+            if seq == fx.Int32(tiles_per_chunk):
+                atomic_add_u32(ctr, fx.Int32(0) - fx.Int32(tiles_per_chunk))
                 if const_expr(fuse and emit_put):
                     if const_expr(post == "lanes"):
                         # world-1 packets issued at once instead of one

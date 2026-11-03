@@ -71,13 +71,15 @@ from ..gemm_ar._compat import (
 
 
 def _spin_until(rsrc, flag):
-    """Block until the u32 at ``rsrc`` reaches ``flag`` (unsigned compare).
+    """Block until the u32 at ``rsrc`` has reached ``flag``.
 
-    Unsigned so a wrapped counter still terminates; ``>=`` so an increment can
-    never be missed. Same construction as ``gemm_ar.kernels_lsa._spin_until``
-    and ``gemm_a2a``'s -- duplicated rather than imported because those modules
-    are other collectives and importing a private helper across ops to save nine
-    lines would tie this file's correctness to an unrelated one's refactors.
+    Compared as ``(int32)(cur - flag) < 0``, as ``a2a_gemm``'s ``_spin_reach``
+    does, so it holds across the epoch's wrap at 2^32: a plain unsigned
+    ``cur < flag`` passes at once on the call whose ``flag`` wraps to 0 while
+    ``cur`` still holds the previous epoch near 2^32. ``>=`` rather than ``==``
+    so an increment can never be missed. Duplicated rather than imported:
+    importing a private helper across ops to save nine lines would tie this
+    file's correctness to an unrelated one's refactors.
     """
     i32 = i32_type()
     first = signal_load_u32(rsrc)
@@ -87,7 +89,7 @@ def _spin_until(rsrc, flag):
     body = ir.Block.create_at_start(loop.after, [i32])
     with ir.InsertionPoint(cond):
         cur = fx.Int32(cond.arguments[0])
-        should_wait = fx.Uint32(cur) < fx.Uint32(flag)
+        should_wait = (cur - fx.Int32(flag)) < fx.Int32(0)
         scf.ConditionOp(should_wait.ir_value(), [cond.arguments[0]])
     with ir.InsertionPoint(body):
         nxt = signal_load_u32(rsrc)

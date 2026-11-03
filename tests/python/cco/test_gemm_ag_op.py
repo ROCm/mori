@@ -102,14 +102,41 @@ def test_rejects_world_sizes_outside_a_node(world):
     ],
 )
 def test_pinned_chunks_divide_the_row_tiles_within_the_cap(chunks, cap, m, tile, want):
-    op = SimpleNamespace(mode="fused", tile=tile, chunks=chunks, max_chunks=cap)
+    op = SimpleNamespace(tile=tile, chunks=chunks, max_chunks=cap)
+    op.fuses_at = lambda _m: True
     op.tile_for = lambda _m: tile
     assert GemmAgOp.chunks_for(op, m) == want
 
 
 def test_split_mode_pushes_in_one_piece():
-    op = SimpleNamespace(mode="split", tile=None, chunks=4, max_chunks=4)
+    op = SimpleNamespace(tile=None, chunks=4, max_chunks=4)
+    op.fuses_at = lambda _m: False
     assert GemmAgOp.chunks_for(op, 4096) == 1
+
+
+@pytest.mark.parametrize(
+    "n,m,cus,want",
+    [
+        # Every pair in the README's results table, at 256 CUs.
+        (2048, 2048, 256, False),
+        (2048, 4096, 256, False),
+        (2048, 8192, 256, True),
+        (2048, 16384, 256, True),
+        (1024, 2048, 256, False),
+        (1024, 16384, 256, True),
+        # The same shape on a part with more CUs needs a longer GEMM.
+        (2048, 8192, 304, False),
+    ],
+)
+def test_auto_fuses_where_the_measurements_say_fusion_pays(n, m, cus, want):
+    op = SimpleNamespace(mode="auto", n=n, cus=cus)
+    assert GemmAgOp.fuses_at(op, m) is want
+
+
+@pytest.mark.parametrize("mode,want", [("fused", True), ("split", False)])
+def test_explicit_modes_ignore_the_rule(mode, want):
+    op = SimpleNamespace(mode=mode, n=2048, cus=256)
+    assert GemmAgOp.fuses_at(op, 2048) is want and GemmAgOp.fuses_at(op, 16384) is want
 
 
 def _spawn(last=False):
@@ -204,11 +231,30 @@ def test_without_the_credit_a_held_reader_reads_the_next_call(cases):
     assert any(v > 0.1 for v in r["fused_no_credit"]), r
 
 
-def test_one_instance_serves_two_m_values_in_any_order(cases):
+def test_one_instance_serves_two_m_values_back_to_back(cases):
+    """Alternating M -- and with ``auto``, alternating fused and split -- with
+    no host sync and a held reader: recv is laid out per M, and only the
+    credit keeps a peer's next push off rows still being read."""
     r = cases["alternating_m"]
-    assert len(r) == 4, r
-    for key, value in r.items():
-        assert value < FLOOR, (key, r)
+    assert r["fused"] == [False, True], r
+    assert len(r["rels"]) == 8, r
+    assert all(v < FP32_FLOOR for v in r["rels"]), r
+
+
+def test_alternating_m_without_the_credit_reads_the_next_call(cases):
+    """The negative control for the test above."""
+    r = cases["alternating_m"]
+    assert any(v > 0.1 for v in r["no_credit"]), r
+
+
+def test_one_instance_serves_any_number_of_m(cases):
+    """Ten distinct M through one fused instance, then every election counter
+    back at zero -- which is what lets one counter set serve them all."""
+    r = cases["many_m"]
+    assert len(r["rels"]) == 10, r
+    assert all(v < FP32_FLOOR for v in r["rels"]), r
+    assert r["counters_left"] == 0, r
+    assert len(r["chunks"]) > 1, r
 
 
 def test_padded_token_count_is_correct_and_its_padding_zero(cases):

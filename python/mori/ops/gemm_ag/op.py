@@ -34,14 +34,17 @@ Two precisions, one interface:
     the quad-subtile bf16 GEMM, bf16 or fp32 out (``wkv_gate`` is fp32), with
     the tile picked per M from the measured table (``pick_tile``).
 
-Two modes, both over the copy engines:
+Two paths, both over the copy engines, and a mode that picks between them:
 
-``fused`` (default)
+``fused``
     The GEMM writes C into this rank's receive slot and its epilogue pushes each
     finished chunk of rows to every peer; a one-block kernel drains and barriers.
 ``split``
     The same GEMM into the slot, then one push per peer. The baseline, and a
     fallback.
+``auto`` (default)
+    ``fused`` at an M where the GEMM fills the machine, ``split`` below it
+    (``fuses_at``), per M on one instance.
 
 **Recv reuse.** The returned tensor is this op's receive buffer, and the next
 call refills it. A peer must not push into it while this rank still reads the
@@ -70,7 +73,12 @@ from ..gemm_ar.op import (
     _PinnedLaunch,
 )
 from ._gemm_a16w16_8wave import BLOCK_K as BF16_BLOCK_K
-from ._gemm_a16w16_8wave import compile_bf16_gemm_ag, pick_chunks, pick_tile
+from ._gemm_a16w16_8wave import (
+    compile_bf16_gemm_ag,
+    pick_chunks,
+    pick_tile,
+    tile_grid,
+)
 from .kernels_fused import compile_fused_gemm_ag, compile_gemm_local
 from .kernels_sdma import build_sdma_phases
 from .layout import (
@@ -84,9 +92,17 @@ from .layout import (
 IN_DTYPES = ("fp8", "bf16")
 QUANTS = ("ptpc", "blockscale", "mxfp8")
 OUT_DTYPES = ("bf16", "fp32")
-MODES = ("fused", "split")
-#: Rows are padded to this, so any tile either GEMM may pick divides them.
-M_GRANULE = 256
+MODES = ("fused", "split", "auto")
+FENCES = ("none", "leader", "all", "release")
+#: Rows are padded to a multiple of this by default: the smallest row tile
+#: either GEMM may pick, as ``pick_tile`` only picks tiles that divide M.
+#: mxfp8 and a pinned ``tile`` pad to their own BLOCK_M instead.
+M_GRANULE = 128
+#: ``mode="auto"`` fuses once this tile's grid covers the CUs (``fuses_at``).
+FUSE_FROM_TILE = (256, 256)
+#: What ``window_bytes_for`` pads ``m_max`` to: the largest granule, so the
+#: estimate covers every configuration.
+M_GRANULE_MAX = 256
 #: N for every tile either GEMM may pick.
 N_GRANULE = DEFAULT_BLOCK_N
 #: The fp8 GEMM's row tile; mxfp8 needs MXFP8_BLOCK_M for its packed A scale.
@@ -125,23 +141,25 @@ class GemmAgOp:
         in_dtype: str = "fp8",
         quant: str = "ptpc",
         out_dtype: str = "bf16",
-        mode: str = "fused",
+        mode: str = "auto",
         max_chunks: int = DEFAULT_MAX_CHUNKS,
-        max_shapes: int = 8,
         chunks: int | None = None,
         tile: tuple[int, int] | None = None,
+        fence: str = "release",
+        peer_uncached: bool = True,
         war_credit: bool = True,
     ):
         """``chunks`` pins the fused chunk count instead of picking it per M
         (rounded down to a divisor of the row tiles, and capped by
         ``max_chunks``). ``tile`` pins ``(BLOCK_M, BLOCK_N)`` for every M instead of picking
-        it per M; an illegal one is rejected here. ``war_credit=False`` drops
-        the recv-reuse credit, and exists only so the race test can show the
-        credit is what keeps it from failing."""
+        it per M; an illegal one is rejected here. ``fence`` and
+        ``peer_uncached`` are the fused epilogue's publication; the defaults
+        are the README's ``sc_release``, which every fused number there uses.
+        ``war_credit=False`` drops the recv-reuse credit, and exists only so the
+        race test can show the credit is what keeps it from failing."""
         self._closed = True  # a failed constructor leaves close() a no-op
         self.mem = self.win = self.dev_comm = None
         self._cache: dict[int, _Plan] = {}
-        self._shape_slot: dict[int, int] = {}
         self._pad_in: torch.Tensor | None = None
 
         why = shape_constraint(
@@ -151,12 +169,14 @@ class GemmAgOp:
             raise ValueError(f"unsupported configuration: {why}")
         if mode not in MODES:
             raise ValueError(f"mode={mode!r} is not one of {MODES}")
+        if fence not in FENCES:
+            raise ValueError(f"fence={fence!r} is not one of {FENCES}")
         if chunks is not None and chunks < 1:
             raise ValueError(f"chunks must be >= 1, got {chunks}")
-        if m_max < 1 or max_chunks < 1 or max_shapes < 1:
+        if m_max < 1 or max_chunks < 1:
             raise ValueError(
-                f"m_max, max_chunks and max_shapes must be >= 1; got m_max={m_max} "
-                f"max_chunks={max_chunks} max_shapes={max_shapes}"
+                f"m_max and max_chunks must be >= 1; got m_max={m_max} "
+                f"max_chunks={max_chunks}"
             )
         self.comm = comm
         self.rank = comm.rank
@@ -165,14 +185,25 @@ class GemmAgOp:
         self.in_dtype, self.quant, self.out_dtype = in_dtype, quant, out_dtype
         self.mode = mode
         self.max_chunks = max_chunks
-        self.max_shapes = max_shapes
+        self.fence, self.peer_uncached = fence, peer_uncached
         self.war_credit = war_credit
         self.tile = tuple(tile) if tile is not None else None
         self.chunks = chunks
         self.elem_bytes = 4 if out_dtype == "fp32" else 2
         self.out_torch = torch.float32 if out_dtype == "fp32" else torch.bfloat16
         #: One queue per chunk per peer on the fused path; one on the split one.
-        self.sdma_queues = max_chunks if mode == "fused" else 1
+        self.sdma_queues = 1 if mode == "split" else max_chunks
+        #: The tile and chunk rules count workgroup rounds, so they need this
+        #: part's CUs rather than the MI355X's 256 they were measured on.
+        self.cus = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        if tile is not None:
+            self.m_granule = tile[0]
+        elif in_dtype == "fp8" and quant == "mxfp8":
+            self.m_granule = MXFP8_BLOCK_M
+        else:
+            self.m_granule = M_GRANULE
         self.m_max = self.padded_m(m_max)
         if self.tile is not None:
             bm, bn = self.tile
@@ -186,7 +217,7 @@ class GemmAgOp:
                     f"BLOCK_M 128 or 256 (256 under mxfp8)"
                 )
         # Validates the tile against the layout before anything is allocated.
-        self.window_bytes = self._cfg(self.m_max, slot=0).window_bytes
+        self.window_bytes = self._cfg(self.m_max).window_bytes
         try:
             self.mem = comm.alloc_mem(self.window_bytes)
             self.win = comm.register_window(self.mem.ptr, self.mem.size)
@@ -231,66 +262,71 @@ class GemmAgOp:
         n: int,
         m_max: int,
         out_dtype: str = "bf16",
-        max_shapes: int = 8,
         max_chunks: int = DEFAULT_MAX_CHUNKS,
     ) -> int:
-        """Window bytes the constructor will allocate, for sizing the
+        """Window bytes the constructor will allocate at most, for sizing the
         communicator's VMM before the op exists."""
-        m = (m_max + M_GRANULE - 1) // M_GRANULE * M_GRANULE
+        m = (m_max + M_GRANULE_MAX - 1) // M_GRANULE_MAX * M_GRANULE_MAX
         return ag_config(
             world_size=world_size,
             m=m,
             n=n,
             elem_bytes=4 if out_dtype == "fp32" else 2,
-            block_m=M_GRANULE,
+            block_m=M_GRANULE_MAX,
             block_n=N_GRANULE,
             counter_capacity=max(8, max_chunks),
-            counter_shape_slots=max_shapes,
         ).window_bytes
 
     # --- shapes ------------------------------------------------------------
 
     def padded_m(self, m: int) -> int:
-        """Rows to pass for logical ``m``: a multiple of 256, which every tile
-        either GEMM may pick divides."""
+        """Rows to pass for logical ``m``: a multiple of ``m_granule`` (128, or
+        256 under mxfp8), which every tile the GEMM may pick at that M divides."""
         if m < 1:
             raise ValueError(f"m must be >= 1, got {m}")
-        return (m + M_GRANULE - 1) // M_GRANULE * M_GRANULE
+        g = self.m_granule
+        return (m + g - 1) // g * g
 
-    def tile_for(self, m: int) -> tuple[int, int]:
-        """``(BLOCK_M, BLOCK_N)`` at this M."""
+    def fuses_at(self, m: int) -> bool:
+        """Whether this M runs the fused path.
+
+        ``auto``: fused once even the largest tile, 256x256, fills the machine
+        -- ``ceil(M/256) * ceil(N/256) >= CUs``, i.e. a GEMM long enough for
+        the transfer to hide behind. Below it the fused epilogue's cost is all
+        that is left. Fitted on every pair in the README's results table, bf16
+        in / fp32 out at 256 CUs: Pro ``wkv_gate`` (N=2048) split wins at M=2048
+        and 4096 (32 and 128 such tiles) and fused from 8192 (256); Flash
+        (N=1024) ties at 2048 (32) and fuses at 16384 (256). Neither rule that
+        looks closer separates them: the split tile fills the machine at every
+        one of these M, and the fused tile runs two rounds at both Pro M=4096
+        and 8192.
+        """
+        if self.mode != "auto":
+            return self.mode == "fused"
+        return tile_grid(m, self.n, FUSE_FROM_TILE) >= self.cus
+
+    def _tile(self, m: int, *, fused: bool) -> tuple[int, int]:
         if self.tile is not None:
             return self.tile
         if self.in_dtype == "bf16":
-            return pick_tile(m, self.n, self.out_dtype, fused=self.mode == "fused")
+            return pick_tile(m, self.n, self.out_dtype, cus=self.cus, fused=fused)
         return (MXFP8_BLOCK_M if self.quant == "mxfp8" else FP8_BLOCK_M), N_GRANULE
+
+    def tile_for(self, m: int) -> tuple[int, int]:
+        """``(BLOCK_M, BLOCK_N)`` at this M, for the path it runs."""
+        return self._tile(m, fused=self.fuses_at(m))
 
     def chunks_for(self, m: int) -> int:
         """Chunks the fused epilogue pushes a call in at this M: one per
         workgroup round of the tile (pick_chunks), capped by ``max_chunks``."""
-        if self.mode != "fused":
+        if not self.fuses_at(m):
             return 1
         tile = self.tile_for(m)
         if self.chunks is not None:
             return counter_chunks(m // tile[0], min(self.chunks, self.max_chunks))
-        return pick_chunks(m, self.n, tile, max_chunks=self.max_chunks)
+        return pick_chunks(m, self.n, tile, cus=self.cus, max_chunks=self.max_chunks)
 
-    def _slot(self, m: int) -> int:
-        """This M's counter set, assigned on first sight. The election counters
-        are never reset, so two shapes sharing a set would elect on each
-        other's residue."""
-        slot = self._shape_slot.get(m)
-        if slot is None:
-            if len(self._shape_slot) >= self.max_shapes:
-                raise ValueError(
-                    f"this op already serves {self.max_shapes} distinct M values "
-                    f"{sorted(self._shape_slot)}; M={m} needs another counter set. "
-                    f"Raise max_shapes or pad to fewer distinct M."
-                )
-            slot = self._shape_slot[m] = len(self._shape_slot)
-        return slot
-
-    def _cfg(self, m: int, *, slot: int):
+    def _cfg(self, m: int):
         bm, bn = self.tile_for(m)
         return ag_config(
             world_size=self.world_size,
@@ -306,15 +342,13 @@ class GemmAgOp:
             # safe across shapes for the same reason consecutive calls are: the
             # credit holds every push until its owner has finished reading.
             counter_capacity=max(8, self.max_chunks),
-            counter_shape_slots=self.max_shapes,
-            counter_shape_index=slot,
         )
 
     def _check_m(self, m: int) -> None:
-        if m % M_GRANULE:
+        if m < 1 or m % self.m_granule:
             raise ValueError(
-                f"M={m} must be a multiple of {M_GRANULE}; use padded_m() and "
-                f"pad_rows()"
+                f"M={m} must be a positive multiple of {self.m_granule}; use "
+                f"padded_m() and pad_rows()"
             )
         if m > self.m_max:
             raise ValueError(f"M={m} exceeds the window's m_max={self.m_max}")
@@ -323,8 +357,9 @@ class GemmAgOp:
         hit = self._cache.get(m)
         if hit is not None:
             return hit
-        cfg = self._cfg(m, slot=self._slot(m))
-        fused = self.mode == "fused"
+        cfg = self._cfg(m)
+        fused = self.fuses_at(m)
+        publish = dict(fence=self.fence, peer_uncached=self.peer_uncached)
         bm, bn = cfg.block_m, cfg.block_n
         common = dict(BLOCK_M=bm, BLOCK_N=bn)
         if self.in_dtype == "bf16":
@@ -337,6 +372,7 @@ class GemmAgOp:
                 chunks=cfg.counter_chunks,
                 sdma_queues=self.sdma_queues,
                 war_credit=self.war_credit,
+                **(publish if fused else {}),
                 **common,
             )
         elif fused:
@@ -349,6 +385,7 @@ class GemmAgOp:
                 chunks=cfg.counter_chunks,
                 sdma_queues=self.sdma_queues,
                 war_credit=self.war_credit,
+                **publish,
                 **common,
             )
         else:
@@ -357,7 +394,10 @@ class GemmAgOp:
                 cfg, self.rank, K=self.k, quant=self.quant, **common
             )
         phases = build_sdma_phases(
-            cfg, self.rank, queues=self.sdma_queues, war_credit=self.war_credit
+            cfg,
+            self.rank,
+            queues=self.sdma_queues if fused else 1,
+            war_credit=self.war_credit,
         )
         recv = from_gpu_ptr(
             self.mem.ptr + cfg.recv_off, (self.world_size * m, self.n), self.out_torch
@@ -514,7 +554,7 @@ class GemmAgOp:
         """
         self._check_open()
         m = self.m_max
-        cfg = self._cfg(m, slot=self._slot(m))
+        cfg = self._cfg(m)
         phases = build_sdma_phases(
             cfg, self.rank, queues=self.sdma_queues, war_credit=self.war_credit
         )
@@ -602,6 +642,7 @@ def supports(n: int, k: int, world_size: int, **kwargs) -> bool:
 
 
 __all__ = [
+    "FENCES",
     "IN_DTYPES",
     "MODES",
     "OUT_DTYPES",

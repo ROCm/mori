@@ -177,7 +177,7 @@ def case_self_test(comm, rank, world):
     with op_for(comm, "fp8-ptpc") as op:  # fused: fixes the queue count first
         op.self_test()
         # The teeth: the same check with the drain, which pushes nothing.
-        cfg = op._cfg(op.m_max, slot=op._slot(op.m_max))
+        cfg = op._cfg(op.m_max)
         phases = build_sdma_phases(cfg, rank, queues=op.sdma_queues)
         recv = from_gpu_ptr(
             op.mem.ptr + cfg.recv_off, (world, op.m_max, N), torch.bfloat16
@@ -241,7 +241,7 @@ def case_chunk_counts(comm, rank, world):
     o = operands(rank, M, prec, salt=3)
     seen = {}
     for chunks in (1, 2, 4):
-        with op_for(comm, "fp8-ptpc", chunks=chunks) as op:
+        with op_for(comm, "fp8-ptpc", mode="fused", chunks=chunks) as op:
             seen[chunks] = call(op, o).clone()
             used = op.chunks_for(M)
         seen[chunks] = (seen[chunks], used)
@@ -288,16 +288,73 @@ def case_back_to_back(comm, rank, world):
     )
 
 
+def _alternating(comm, rank, world, war_credit):
+    """Two M through one ``auto`` instance, back to back with no host sync and
+    one rank's reader held per call, so a peer is certainly a call ahead.
+
+    recv is laid out for the current M, so a push for the next call lands on
+    rows the held rank has not read yet unless the credit holds it. ``cus`` is
+    lowered so that ``auto`` fuses M=1024 and splits M=512 at these sizes:
+    consecutive calls then also switch path, on one window and one credit.
+    """
+    prec, ms = ("bf16", "ptpc"), (512, 1024) * 4
+    staged = [operands(rank, m, prec, salt=50 + i) for i, m in enumerate(ms)]
+    outs = [torch.empty(world * m, N, device="cuda") for m in ms]
+    with op_for(comm, "bf16-fp32", mode="auto", war_credit=war_credit) as op:
+        op.cus = 16
+        fused = [op.fuses_at(m) for m in (512, 1024)]
+        for i in range(2):  # compile both plans outside the race
+            call(op, staged[i])
+        torch.cuda.synchronize()
+        comm.barrier()
+        for i in range(len(ms)):
+            c = call(op, staged[i])
+            if i % world == rank:
+                torch.cuda._sleep(HOLD_CYCLES)
+            outs[i].copy_(c)
+        torch.cuda.synchronize()
+        comm.barrier()
+    rels = [
+        worst(rel(outs[i], reference(world, m, prec, 50 + i))) for i, m in enumerate(ms)
+    ]
+    return rels, fused
+
+
 def case_alternating_m(comm, rank, world):
-    """Two M through one instance, fresh operands each call: recv is laid out
-    for the current M, which the credit makes safe across shapes."""
-    prec = ("fp8", "ptpc")
-    out = {}
-    with op_for(comm, "fp8-ptpc") as op:
-        for i, m in enumerate((512, 1024, 512, 1024)):
-            got = call(op, operands(rank, m, prec, salt=50 + i))
-            out[f"call{i}_m{m}"] = worst(rel(got, reference(world, m, prec, 50 + i)))
-    emit(rank, case="alternating_m", **out)
+    rels, fused = _alternating(comm, rank, world, True)
+    no_credit, _ = _alternating(comm, rank, world, False)
+    emit(rank, case="alternating_m", rels=rels, fused=fused, no_credit=no_credit)
+
+
+def case_many_m(comm, rank, world):
+    """One fused instance through ten distinct M, then every election counter
+    back at zero. The counters used to run on and be tested modulo the chunk's
+    tile count, which took a counter set per M and refused a ninth M."""
+    from mori.tensor_utils import from_gpu_ptr
+
+    prec, ms = ("bf16", "ptpc"), tuple(128 * i for i in range(1, 11))
+    rels = []
+    with GemmAgOp(
+        comm,
+        n=N,
+        k=K,
+        m_max=max(ms),
+        in_dtype="bf16",
+        out_dtype="fp32",
+        mode="fused",
+    ) as op:
+        op.cus = 16  # so the chunk count varies with M at these sizes
+        for i, m in enumerate(ms):
+            got = call(op, operands(rank, m, prec, salt=80 + i))
+            rels.append(worst(rel(got, reference(world, m, prec, 80 + i))))
+        torch.cuda.synchronize()
+        cfg = op._cfg(op.m_max)
+        ctr = from_gpu_ptr(
+            op.mem.ptr + cfg.counter_off, (cfg.counter_set_bytes // 4,), torch.int32
+        )
+        left = worst(int(ctr.count_nonzero()))
+        chunks = sorted({op.chunks_for(m) for m in ms})
+    emit(rank, case="many_m", rels=rels, counters_left=left, chunks=chunks)
 
 
 def case_padded_rows(comm, rank, world):
@@ -372,6 +429,7 @@ def main() -> int:
         case_chunk_counts(comm, rank, world)
         case_back_to_back(comm, rank, world)
         case_alternating_m(comm, rank, world)
+        case_many_m(comm, rank, world)
         case_padded_rows(comm, rank, world)
         case_operand_checks(comm, rank)
         case_close(comm, rank)

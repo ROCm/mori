@@ -1025,7 +1025,10 @@ def compile_bf16_gemm_ag(
                 slot = chunk * fx.Int32(ws) + j
                 ctr = signal_ptr(ctr_base + fx.Int64(slot) * fx.Int64(4))
                 seq = fx.Int32(atomic_add_u32(ctr, 1, ordering="acq_rel")) + fx.Int32(1)
-                if seq % fx.Int32(tiles_per_chunk) == fx.Int32(0):
+                # The chunk's last tile this call; it puts the counter back to
+                # zero, as in kernels_fused.py.
+                if seq == fx.Int32(tiles_per_chunk):
+                    atomic_add_u32(ctr, fx.Int32(0) - fx.Int32(tiles_per_chunk))
                     if const_expr(emit_put):
                         if const_expr(post == "lanes"):
                             d = (fx.Int32(rank + 1) + j) % fx.Int32(ws)

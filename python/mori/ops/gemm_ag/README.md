@@ -59,13 +59,32 @@ with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
   and `preshuffle_b(b)`, scales by `quant` exactly as
   `gemm_ar.GemmAllReduceOp` does (ptpc, blockscale, mxfp8), and returns bf16.
 - **Shapes.** `N` a multiple of 256; `K` a multiple of 128 (fp8, at least 256)
-  or 64 (bf16, at least 128); M the same on every rank and a multiple of 256,
-  through `padded_m()` / `pad_rows()`. One instance serves any such M up to
-  `m_max`, in any order, compiling each once; the bf16 tile and the fused chunk
-  count are picked per M from the measured tables (`pick_tile`, `pick_chunks`).
-- **Modes.** `mode="fused"` (default) or `"split"`. The fused path keeps two
-  chunks of one destination apart by SDMA queue, so it asks for `max_chunks`
-  queues per peer (default 4) and caps the chunk count there.
+  or 64 (bf16, at least 128); M the same on every rank and a multiple of 128
+  (256 under mxfp8), through `padded_m()` / `pad_rows()`. One instance serves
+  any number of such M up to `m_max`, in any order, compiling each once; the
+  bf16 tile and the fused chunk count are picked per M from the measured tables
+  (`pick_tile`, `pick_chunks`) against the device's CU count.
+- **Modes.** `mode="auto"` (default) fuses an M once even a 256x256 tile's grid
+  covers the CUs -- `ceil(M/256) * ceil(N/256) >= CUs`, M=8192 for Pro and
+  16384 for Flash on MI355X -- and splits below it, where the table below has
+  split ahead or level; one instance switches per M. `"fused"` and `"split"`
+  pin a path. The fused path keeps two chunks of one destination apart by SDMA
+  queue, so `"auto"` and `"fused"` ask for `max_chunks` queues per peer
+  (default 4) and cap the chunk count there. Fused calls publish with
+  `fence="release"` and `peer_uncached=True` (`sc_release` below) unless told
+  otherwise.
+
+  Through the op, Pro `wkv_gate` (bf16 in / fp32 out), graph-timed, maximum
+  over ranks, MI355X (us):
+
+  | P | M | `auto` | `fused` (sc_release) | `fused` (leader) | `split` |
+  |---:|---:|---:|---:|---:|---:|
+  | 8 | 2048 | **351.3** (split) | 362.8 | 361.0 | 351.3 |
+  | 8 | 4096 | **666.2** (split) | 685.5 | 687.6 | 666.1 |
+  | 8 | 8192 | **1239.2** (fused) | 1240.0 | 1240.9 | 1288.7 |
+  | 4 | 2048 | **349.1** (split) | 357.0 | 358.5 | 349.4 |
+  | 4 | 4096 | **662.0** (split) | 682.8 | 683.3 | 661.7 |
+  | 4 | 8192 | **1231.3** (fused) | 1231.3 | 1232.7 | 1282.2 |
 - **The result** is this op's receive buffer and the next call refills it.
   Whatever reads it must be ordered before this rank's next call -- the same
   stream, or an event the next call waits on; clone it to keep it longer. That
