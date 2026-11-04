@@ -198,12 +198,8 @@ Metrics are only comparable between rows measured under the same conditions.
   variants. A bucket took the new rules only where they were ≥1% faster (D+C
   summed over the dispatch dtypes) in every round of a whole-table A/B against
   the previous tables, and again in a confirming one. The FP4 dispatch and FP8
-  combine rows were added later on a second pair of nodes, geometry and active
-  QP count screened together against the defaults, with the same rounds and
-  gates. That pair has 10–15 minute windows in which every phase runs 2–3.5×
-  slow, evenly enough to pass the noise gate; a launch was repeated when the
-  phases no candidate changes (the FP8 cells' dispatch, the FP4 cells'
-  combine) read more than 10% slow at T ≤ 64.
+  combine rows were added later, geometry and active QP count screened
+  together against the defaults, with the same rounds and gates.
 - **MI355X EP16.** Re-tuned on 2026-11-02/03 on two MI355X nodes (ionic
   NICs, `MORI_DISABLE_IONIC_CCQE=1`) with the protocol above, on the kernel
   with the topk-9/16 combine gather and copy tail fixed. Per bucket: geometry

@@ -74,10 +74,10 @@ kernel 一列中，LL 指 V1 InterNodeV1LL 对 V2 InterNodeV2LL，普通指 V1 I
 
 - **硬件**：两台机器 × 8 张 MI300X，跨节点走 InfiniBand（ConnectX-7，每台 8 × 400 Gb/s）。
 - **V1**：同 MI308X，`MORI_EP_LAUNCH_CONFIG_MODE=AUTO`，SHMEM 后端，`num_qp_per_pe` 为默认的 1。MI300X 的 V1 调优表只有 InterNodeV1LL 在 H7168 的 FP8 dispatch 和 BF16 combine 规则，到 T64 为止；AUTO 实际用到的配置见说明。
-- **V2**：当前的 MI300X EP16 调优表（`qp_status.md` 第 13、14 节），HIP 后端，`num_qp_per_pe` 为默认的 8，每档按表里的 active QP 数发送。
+- **V2**：MI300X 的 EP16 调优表（`gfx942_mi300x_InterNodeV2_ep16.csv`、`gfx942_mi300x_InterNodeV2LL_ep16.csv`），HIP 后端，`num_qp_per_pe` 为默认的 8，每档按表里的 active QP 数发送。
 - **代码**：两边用同一版本的 kernel 源码（`d950bcc0`，含 `device_primitives.hpp` 的修复）。
-- **系统设置**：关闭了 NUMA 自动平衡（`kernel.numa_balancing=0`）。开着时，内核扫描进程内存会让 KFD 把进程在 GPU 上的队列整体驱逐约 17 ms，EP16 里任何一个 rank 被驱逐，所有 rank 都要等；这两台机器上约 1%–2% 的轮次因此卡住，V1 和 V2 都受影响，平均延迟被明显拉高。
-- **计时**：同 MI308X；每个 rank 绑到其 GPU 所在 NUMA 节点上的 4 个核。这次没有需要剔除的运行，每格 3 轮相差都在 3% 以内。
+- **系统设置**：关闭 NUMA 自动平衡（`kernel.numa_balancing=0`）。开着时，内核扫描进程内存会让 KFD 把进程在 GPU 上的队列整体驱逐约 17 ms，EP16 里任何一个 rank 被驱逐，所有 rank 都要等。V1 和 V2 都受影响，平均延迟会被明显拉高，表里可能出现"V2 更慢"的假象；带宽和中位数受影响小。
+- **计时**：同 MI308X；每个 rank 绑到其 GPU 所在 NUMA 节点上的 4 个核。
 
 ### 结果
 
@@ -114,7 +114,5 @@ kernel 一列中，LL 指 V1 InterNodeV1LL 对 V2 InterNodeV2LL，普通指 V1 I
   - LL 的 FP8 dispatch：T4–T64 用 MI300X 表里的规则（依次是 16/8/6、64/32/4、64/32/4、128/64/4、256/128/4），T128–T512 沿用 T64 那条（256/128/4）。
   - LL 的 BF16 dispatch：表里没有 BF16 规则，用 AUTO 默认值 256/128/8。
   - LL 的 combine：T4–T64 用 MI300X 表里的规则（依次是 304/76/4、304/76/4、128/32/8、64/42/8、128/85/4），T128–T512 沿用 T64 那条（128/85/4）。
-  - 普通 kernel（T1024–T4096）：MI300X 没有 InterNodeV1 表，AUTO 借用同为 gfx942 的 MI308X 的表。FP8 dispatch 依次是 32/16/8、64/32/4、32/16/8，combine 依次是 80/40/8、64/32/16、64/32/8；BF16 dispatch 没有规则，用默认值 96/64/8。MI308X 只有 80 个 CU，这些规则在 304 个 CU 的 MI300X 上偏小：FP8 T1024 的 V1 dispatch 是 537 µs，同一对机器上用默认几何 96/64/8 测得约 332 µs。所以 FP8 普通 kernel 的 dispatch 差距里有很大一部分来自这一点。
+  - 普通 kernel（T1024–T4096）：MI300X 没有 InterNodeV1 表，AUTO 借用同为 gfx942 的 MI308X 的表。FP8 dispatch 依次是 32/16/8、64/32/4、32/16/8，combine 依次是 80/40/8、64/32/16、64/32/8；BF16 dispatch 没有规则，用默认值 96/64/8。MI308X 只有 80 个 CU，这些规则在 304 个 CU 的 MI300X 上偏小：FP8 T1024 的 V1 dispatch 是 537 µs，用默认几何 96/64/8 时约 332 µs。所以 FP8 普通 kernel 的 dispatch 差距里有很大一部分来自这一点。
 - **V1 只用 1 个 QP**，同 MI308X；这里没有测 V1 用 2 个、4 个 QP 的情况。
-- **NUMA 自动平衡开着时测的数据不能用。** 关闭之前按同样的协议测了两遍：T512 以上不少格子的 V2 平均延迟被驱逐造成的卡顿拉高 1.3–2 倍（V1 也会碰到，只是那两遍里碰到得少），表里会出现"V2 更慢"的假象；带宽和中位数基本不受影响。
-- **原始数据**：19-29 上的 `~/epv2_mi300x/ep16_cmp/`，表在 `auto2c_report.md`。
