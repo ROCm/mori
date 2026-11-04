@@ -575,6 +575,7 @@ class Cluster {
     cfg.peer_service_port = NextPeerServicePort();
     cfg.dram_page_size = page_bytes_;
     cfg.staging_buffer_size = 1024;  // ranged remote must go through the arena
+    cfg.ranged_direct = false;
     cfg.dram.buffer_sizes = {dram_capacity};
     cfg.ranged_get_scratch = {{get_scratch.data(), get_scratch.size()}};
     cfg.ranged_put_scratch = {{put_scratch.data(), put_scratch.size()}};

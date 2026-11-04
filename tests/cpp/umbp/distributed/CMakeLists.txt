@@ -331,6 +331,20 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_pool_client_ranges COMMAND test_umbp_pool_client_ranges)
 
+# test_umbp_pool_client_ranges_direct — the same calls moving bytes straight
+# between NIC-registered caller memory, GPU memory included, and a peer's tier.
+# A process of its own: on ionic every client leaves NIC mappings behind until
+# exit, and one process running both suites runs the NICs out of contexts.
+add_executable(test_umbp_pool_client_ranges_direct test_pool_client_ranges_direct.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_pool_client_ranges_direct PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_pool_client_ranges_direct
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_pool_client_ranges_direct COMMAND test_umbp_pool_client_ranges_direct)
+
 # test_umbp_ssd_ranged_io — ranged multi-buffer I/O on an SSD-medium node
 # (doc/design-ssd-ranged-io.md, D0): the capability flag now turning on the
 # arena alone, plus local and remote ranged put/get against an SSD-only peer.

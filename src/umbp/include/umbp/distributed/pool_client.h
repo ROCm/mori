@@ -120,7 +120,8 @@ class PoolClient {
   // Record a caller-owned region.  The descriptor is cached and looked up by
   // (ptr, size) on the Put/Get hot paths; `loc`/`device` describe the caller's
   // allocation (CPU, or a GPU ordinal) so the transfer layer routes to
-  // HbmCopyEngine instead of assuming host memory.
+  // HbmCopyEngine instead of assuming host memory.  Device memory passed with
+  // the CPU default -- the two-argument form -- is registered as what it is.
   //
   // kPinned also hands the region to the IO engine for zero-copy RDMA.
   // kLocalCopyOnly skips that, for a region that is only ever a local copy
@@ -438,6 +439,16 @@ class PoolClient {
   // Exposed separately from FindRegisteredMemory so a batch can take the lock
   // once and then resolve every range under it.
   const RegisteredRegion* FindRegisteredRegionLocked(const void* ptr, size_t size) const;
+  // Whether there is at least one range and the NIC registered every one.
+  template <typename Ptr>
+  bool NicRegisteredLocked(const std::vector<Ptr>& ptrs, const std::vector<size_t>& sizes) const {
+    if (ptrs.empty()) return false;
+    for (size_t j = 0; j < ptrs.size(); ++j) {
+      const RegisteredRegion* reg = FindRegisteredRegionLocked(ptrs[j], sizes[j]);
+      if (reg == nullptr || !reg->ref.HasMemoryDesc()) return false;
+    }
+    return true;
+  }
 
   // The registered ref covering [ptr, ptr+size) plus the offset of ptr within
   // it, or nullopt when the region was never registered.
@@ -754,6 +765,9 @@ class PoolClient {
     // The writer's NUMA node when `src` is a staging copy; -1 lets the slot
     // request derive it from `src`.
     int numa_hint = -1;
+    // When set, the object is gathered from these caller ranges, each in a
+    // region the NIC registered, and `src` is null.
+    const std::vector<ObjectRange>* ranges = nullptr;
   };
   // One byte range of a stored object, named by the caller.
   struct ByteSpan {
@@ -780,6 +794,9 @@ class PoolClient {
     // and is the only user.
     const TransferRef* dst_ref = nullptr;
     uint64_t dst_ref_offset = 0;
+    // When set, span k lands at span_dsts[k], a caller buffer in a region the
+    // NIC registered, instead of packed at `dst`.
+    const std::vector<void*>* span_dsts = nullptr;
     RouteGetResult route;
 
     size_t DstBytes() const { return dst_bytes != 0 ? dst_bytes : size; }
@@ -813,12 +830,11 @@ class PoolClient {
 
   // Group a BatchPut's routes into a BatchPutPlan; master-side dedup and
   // zero-size skips are projected straight into *results.
-  BatchPutPlan PartitionBatchPutTargets(const std::vector<std::string>& keys,
-                                        const std::vector<const void*>& srcs,
-                                        const std::vector<size_t>& sizes,
-                                        const std::vector<std::optional<RoutePutResult>>& routes,
-                                        std::vector<PutEntryOutcome>* results,
-                                        const std::vector<int>* numa_hints = nullptr);
+  BatchPutPlan PartitionBatchPutTargets(
+      const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
+      const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
+      std::vector<PutEntryOutcome>* results, const std::vector<int>* numa_hints = nullptr,
+      const std::vector<std::vector<ObjectRange>>* ranges = nullptr);
   // Execute a BatchPutPlan.  Zero-copy submits all peers (not waited), runs the
   // deferred local puts in that window, then waits all + commits; staging runs
   // per peer serially.  Writes per-key outcomes into *results.
@@ -946,6 +962,31 @@ class PoolClient {
   std::vector<RangeFetchUnit> ServeWholeObjectUnitsFromMedium(
       const std::vector<std::string>& keys, std::vector<RangeFetchUnit> units,
       std::unordered_map<size_t, bool>* unit_ok, double* remote_bytes);
+
+  // The ranged calls' direct path (PoolClientConfig::ranged_direct).  Reads the
+  // keys among `routed` (indices into `missed` and `routes`) whose every
+  // destination sits in a region the NIC registered straight into those
+  // destinations, and returns the rest.
+  std::vector<size_t> ReadRangesDirect(const std::vector<std::string>& keys,
+                                       const std::vector<std::vector<void*>>& dsts,
+                                       const std::vector<std::vector<size_t>>& sizes,
+                                       const std::vector<std::vector<size_t>>& src_offsets,
+                                       const std::vector<size_t>& missed,
+                                       const std::vector<size_t>& routed,
+                                       const std::vector<std::optional<RouteGetResult>>& routes,
+                                       std::vector<bool>* results, double* remote_bytes);
+  // Writes the objects among `remote` (indices into `valid` and `routes`) whose
+  // every source sits in a region the NIC registered straight from those
+  // sources into their slots, and returns the rest.
+  std::vector<size_t> WriteRangesDirect(const std::vector<std::string>& keys,
+                                        const std::vector<size_t>& object_sizes,
+                                        const std::vector<std::vector<const void*>>& srcs,
+                                        const std::vector<std::vector<size_t>>& sizes,
+                                        const std::vector<std::vector<size_t>>& dst_offsets,
+                                        const std::vector<size_t>& valid,
+                                        const std::vector<size_t>& remote,
+                                        const std::vector<std::optional<RoutePutResult>>& routes,
+                                        std::vector<bool>* results, double* remote_bytes);
 
   // Remote-only sibling of PartitionBatchGetTargets for ranged reads.  Each key
   // contributes one item carrying its arena slice, its span list, and the span

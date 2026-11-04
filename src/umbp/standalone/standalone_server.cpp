@@ -24,7 +24,9 @@
 // MIT License
 #include "umbp/standalone/standalone_server.h"
 
+#include <dlfcn.h>
 #include <grpcpp/grpcpp.h>
+#include <infiniband/verbs.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -49,6 +51,7 @@
 #include <optional>
 #include <random>
 #include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -57,6 +60,7 @@
 #include <utility>
 #include <vector>
 
+#include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
 #include "umbp/common/grpc_limits.h"
@@ -71,6 +75,86 @@
 
 namespace mori::umbp::standalone {
 namespace {
+
+// The first device mori-io may use: MORI_RDMA_DEVICES names them in order, or
+// with a leading '^' the ones it skips.
+ibv_device* FirstMoriDevice(ibv_device** devices, int count) {
+  std::string list = std::getenv("MORI_RDMA_DEVICES") ? std::getenv("MORI_RDMA_DEVICES") : "";
+  const bool skip = !list.empty() && list[0] == '^';
+  if (skip) list.erase(0, 1);
+  std::vector<std::string> names;
+  std::stringstream stream(list);
+  for (std::string name; std::getline(stream, name, ',');) {
+    name.erase(0, name.find_first_not_of(" \t"));
+    name.erase(name.find_last_not_of(" \t") + 1);
+    if (!name.empty()) names.push_back(name);
+  }
+  if (!skip && !names.empty()) {
+    for (const std::string& name : names) {
+      for (int i = 0; i < count; ++i) {
+        if (name == devices[i]->name) return devices[i];
+      }
+    }
+    return nullptr;
+  }
+  for (int i = 0; i < count; ++i) {
+    if (std::find(names.begin(), names.end(), devices[i]->name) == names.end()) return devices[i];
+  }
+  return nullptr;
+}
+
+// Whether the NIC registers this GPU mapping by its address (amdgpu
+// PeerDirect), asked of the mapping the way mori-io registers it on first use.
+// When that fails mori falls back to a dmabuf export, or tries one first under
+// MORI_ENABLE_DMABUF_REG, and the export hangs on an IPC-imported mapping; so
+// such a mapping goes to the NIC only when this says the plain path takes it.
+// libibverbs is loaded here as mori loads it, rather than linked.
+bool NicRegistersGpuMapping(void* base, size_t size) {
+  struct Verbs {
+    ibv_mr* (*reg_mr)(ibv_pd*, void*, size_t, int) = nullptr;
+    int (*dereg_mr)(ibv_mr*) = nullptr;
+    ibv_pd* pd = nullptr;
+  };
+  // Opened once and kept: the library, a context and a protection domain.
+  static const Verbs verbs = [] {
+    Verbs v;
+    void* lib = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (lib == nullptr) return v;
+    const auto get_list =
+        reinterpret_cast<ibv_device** (*)(int*)>(dlsym(lib, "ibv_get_device_list"));
+    const auto free_list =
+        reinterpret_cast<void (*)(ibv_device**)>(dlsym(lib, "ibv_free_device_list"));
+    const auto open_device =
+        reinterpret_cast<ibv_context* (*)(ibv_device*)>(dlsym(lib, "ibv_open_device"));
+    const auto alloc_pd = reinterpret_cast<ibv_pd* (*)(ibv_context*)>(dlsym(lib, "ibv_alloc_pd"));
+    const auto reg_mr =
+        reinterpret_cast<ibv_mr* (*)(ibv_pd*, void*, size_t, int)>(dlsym(lib, "ibv_reg_mr"));
+    const auto dereg_mr = reinterpret_cast<int (*)(ibv_mr*)>(dlsym(lib, "ibv_dereg_mr"));
+    if (!get_list || !free_list || !open_device || !alloc_pd || !reg_mr || !dereg_mr) return v;
+    int count = 0;
+    ibv_device** devices = get_list(&count);
+    if (devices == nullptr) return v;
+    if (ibv_device* device = FirstMoriDevice(devices, count)) {
+      if (ibv_context* context = open_device(device)) {
+        v.pd = alloc_pd(context);
+        v.reg_mr = reg_mr;
+        v.dereg_mr = dereg_mr;
+      }
+    }
+    free_list(devices);
+    return v;
+  }();
+  if (verbs.pd == nullptr || mori::env::IsEnvVarEnabled("MORI_ENABLE_DMABUF_REG")) return false;
+  // The access mori-io registers with.
+  constexpr int kAccess = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                          IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC;
+  // Whether the NIC maps the memory belongs to the allocation, so its leading
+  // bytes answer for all of it without pinning all of it a second time.
+  ibv_mr* mr = verbs.reg_mr(verbs.pd, base, std::min<size_t>(size, 2 << 20), kAccess);
+  if (mr == nullptr) return false;
+  verbs.dereg_mr(mr);
+  return true;
+}
 
 std::chrono::seconds ShutdownDeadline() {
   const char* v = std::getenv("UMBP_STANDALONE_GRPC_SHUTDOWN_DEADLINE_SEC");
@@ -1484,35 +1568,45 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     entry.device_id = request.device_id();
     entry.alloc_base = request.alloc_base();
     entry.client_id = request.client_id();
-    // Both modes declare the imported mapping to the inner backend; only Local
-    // pins it. Ranged distributed I/O stages remote objects through a registered
-    // host arena, so an RDMA MR over this mapping buys nothing, and the dmabuf
-    // fallback is unsafe for IPC-imported ROCm mappings.
+    // The imported mapping is declared to the inner backend, for the NIC when
+    // ranged calls go direct and the NIC takes it: a remote ranged call then
+    // moves its bytes between the GPU and a peer's tier in one hop.  Otherwise
+    // it is declared for local copies only, and ranged I/O stages through the
+    // scratch arena.
     //
-    // Declaring it is not optional in either mode. Leaving it out is correct --
+    // Declaring it is not optional. Leaving it out is correct --
     // an unregistered device pointer is classified rather than assumed host, so
     // HbmCopyEngine still claims the pair -- but a range that misses the region
     // table is described by its own address instead of its region base, so it
     // becomes its own transfer plan instead of sharing one. Measured on
     // DSv4-Pro/TP8 at 256K, that is plan = 23.2% of a ranged call against 1.4%
     // once declared.
-    if (!RegisterBackendMemory(entry.base, static_cast<size_t>(entry.size),
-                               mori::io::MemoryLocationType::GPU, entry.device_id,
-                               mode == UMBPDeploymentMode::Local
-                                   ? MemoryRegistration::kPinned
-                                   : MemoryRegistration::kLocalCopyOnly)) {
+    const bool pin = RangedDirectFromEnv() &&
+                     NicRegistersGpuMapping(entry.base, static_cast<size_t>(entry.size));
+    if (!RegisterBackendMemory(
+            entry.base, static_cast<size_t>(entry.size), mori::io::MemoryLocationType::GPU,
+            entry.device_id,
+            pin ? MemoryRegistration::kPinned : MemoryRegistration::kLocalCopyOnly)) {
       ReleaseIpcMapping(key);
       SetBool(response, false, "inner backend RegisterMemory failed");
       return;
     }
 
     std::optional<RegisteredMemory> old_mem = InsertOrReplaceRegion(request.client_id(), entry);
-    if (old_mem.has_value()) ReleaseRegisteredMemory(*old_mem);
+    if (old_mem.has_value()) {
+      // The same mapping again: the inner backend kept the one registration
+      // both entries share, so only the old entry's hold on the mapping goes.
+      if (old_mem->kind == MemoryKind::kGpuIpc && old_mem->base == entry.base) {
+        ReleaseIpcMapping(IpcKey{old_mem->client_id, old_mem->device_id, old_mem->alloc_base});
+      } else {
+        ReleaseRegisteredMemory(*old_mem);
+      }
+    }
     MORI_UMBP_INFO(
         "[StandaloneServer] registered GPU IPC client_id={} worker_base=0x{:x} size={}MB "
-        "device={}",
+        "device={} nic={}",
         request.client_id(), request.worker_base(), request.size() / (1024 * 1024),
-        request.device_id());
+        request.device_id(), pin);
     SetBool(response, true);
   }
 
