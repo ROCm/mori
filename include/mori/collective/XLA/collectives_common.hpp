@@ -88,16 +88,18 @@ static constexpr size_t kCommCtlWords = kCCLMaxPeers + kCCLMaxPeers * kArrivedSt
 static constexpr size_t kCommCtlSlots = kCCLMaxPeers * kCCLMaxPeers;
 static constexpr size_t kCommCtlBytes = kCommCtlSlots * kCommCtlWords * sizeof(uint64_t);
 
-// groupCtr layout (local uint32 buffer): [0] grid-wide last-block arrival
-// counter (reduce-scatter's gen bump and the pull kernels' exit barrier elect the
-// tail block through it), then all-reduce's two broadcast release counters, then
-// all-reduce's per-launch b=1 release target (elects the tail owner).
+// groupCtr layout (local uint32 buffer, 8B-aligned base): [0, 2) all-reduce's
+// two broadcast release counters, read together as one uint64; then the
+// grid-wide last-block arrival counter (reduce-scatter's gen bump and the pull
+// kernels' exit barrier elect the tail block through it); then all-reduce's
+// per-launch b=1 release target (elects the tail owner).
 enum GroupCtrIdx {
-  kArrivalIdx = 0,
-  kBcastFlagIdx = kArrivalIdx + 1,
-  kBcastTargetIdx = kBcastFlagIdx + 2,
+  kBcastFlagIdx = 0,
+  kArrivalIdx = kBcastFlagIdx + 2,
+  kBcastTargetIdx = kArrivalIdx + 1,
   kGroupCtrTotal = kBcastTargetIdx + 1,
 };
+static_assert(kBcastFlagIdx % 2 == 0, "broadcast flags are read as one uint64");
 
 // Collective-permute pairwise handshake flags, consolidated into one
 // symmetric-heap uint64[kPermuteFlagSlots][kCCLMaxPeers] buffer (permuteCtr;
@@ -163,6 +165,14 @@ __device__ __forceinline__ void AtomicStore(T* p, T v) {
               Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM
                                     : __HIP_MEMORY_SCOPE_AGENT);
 }
+
+template <StreamScope Scope, class T>
+__device__ __forceinline__ T AtomicAdd(T* p, T v) {
+  return __hip_atomic_fetch_add(cco::impl::global(p), v, __ATOMIC_RELAXED,
+              Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM
+                                    : __HIP_MEMORY_SCOPE_AGENT);
+}
+
 
 template <StreamScope Scope, int Bytes = VecBytes>
 __device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p) {
@@ -395,12 +405,10 @@ struct SdmaCollectiveHandle : cco::ccoSdmaQueueDeviceHandle {
   // reuses it across packets so a refreshed rptr stays in the local copy;
   // write the hint back to `shared` once at the end if it moved. The hint only
   // moves forward to a value rptr actually had, so a later writer is harmless.
-  __device__ __forceinline__ uint64_t ReserveSingleProducer(const size_t size_in_bytes) {
+  __device__ __forceinline__ uint64_t ReserveSingleProducer(const size_t bytes) {
     constexpr uint64_t qSize = cco::CCO_SDMA_QUEUE_SIZE;
-    uint64_t base =
-        __hip_atomic_fetch_add(cco::impl::global(cachedWptr), size_in_bytes, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
-    const uint64_t end = base + size_in_bytes;
+    const uint64_t base = AtomicAdd<EAgentScope>(cachedWptr, bytes),
+                   end = base + bytes;
     if (end - cachedHwReadIndex > qSize) {
       int64_t retries = 0;
       do {
@@ -492,16 +500,15 @@ __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int n
     const uint64_t headBytes = pollBytes + kSDMACopySignalPkt,
                    totalBytes = pollBytes + S * kSDMACopySignalPkt;
 
-    SdmaCollectiveHandle handle;
-    SdmaCollectiveHandle* shared = nullptr;
+    SdmaCollectiveHandle h, *shared = nullptr;
     uint32_t* queueBuf = nullptr;
     uint64_t hint0 = 0, pktBase = 0;
     if (active && sub == 0) {
       shared = GetSharedHandle(sdma.deviceHandles + peer/* *sdma.sdmaNumQueue*/);
-      handle = *cco::impl::global(shared);
-      hint0 = handle.cachedHwReadIndex;
-      queueBuf = handle.queueBuf;
-      pktBase = handle.ReserveSingleProducer(totalBytes);
+      h = *cco::impl::global(shared);
+      hint0 = h.cachedHwReadIndex;
+      queueBuf = h.queueBuf;
+      pktBase = h.ReserveSingleProducer(totalBytes);
     }
     queueBuf = BroadcastQuad(queueBuf);
     pktBase = BroadcastQuad(pktBase);
@@ -511,17 +518,17 @@ __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int n
     if (active) {
       if (pollBytes) {
         WritePollPacket(sub, p.gate, p.gateValue,
-            queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
+            queueBuf + h.WrapIntoRing(pktBase) / sizeof(uint32_t));
       }
       const uint64_t pos = pktBase + pollBytes;
       const size_t sz = S == 1 ? lastBytes : sliceBytes;
       WriteFusedPacket(sub, p.src, p.dst, sz, p.sigBase, value,
-        queueBuf + SdmaCollectiveHandle::WrapIntoRing(pos) / sizeof(uint32_t));
+        queueBuf + h.WrapIntoRing(pos) / sizeof(uint32_t));
     }
     cco::ccoSdmaPublishStores();
     __builtin_amdgcn_wave_barrier();
     if (active && sub == 0) {
-      handle.submitPacket(pktBase, pktBase + headBytes);
+      h.submitPacket(pktBase, pktBase + headBytes);
     }
 
     // Doorbell 2: slices 1..S-1. It starts where doorbell 1 ended and this lane
@@ -534,79 +541,74 @@ __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int n
           const uint64_t pos = pktBase + pollBytes + s * kSDMACopySignalPkt;
           const size_t sz = (s == S - 1) ? lastBytes : sliceBytes;
           WriteFusedPacket(sub, psrc, pdst, sz, p.sigBase + s, value,
-            queueBuf + SdmaCollectiveHandle::WrapIntoRing(pos) / sizeof(uint32_t));
+            queueBuf + h.WrapIntoRing(pos) / sizeof(uint32_t));
         }
       }
       cco::ccoSdmaPublishStores();
       __builtin_amdgcn_wave_barrier();
       if (active && sub == 0) {
-        handle.submitPacket(pktBase + headBytes, pktBase + totalBytes);
+        h.submitPacket(pktBase + headBytes, pktBase + totalBytes);
       }
     }
 
-    if (active && sub == 0 && handle.cachedHwReadIndex != hint0) {
-      AtomicStore<EAgentScope>(&shared->cachedHwReadIndex, handle.cachedHwReadIndex);
+    if (active && sub == 0 && h.cachedHwReadIndex != hint0) {
+      AtomicStore<EAgentScope>(&shared->cachedHwReadIndex, h.cachedHwReadIndex);
     }
   }
 }
 
-// Writes one pre-posted broadcast into the two 64B ring slots starting at pktBase:
-// [POLL *flag == value][COPY src->dst + SWAP *slot = slotValue]. The copy reads
-// src only once its poll passes, so src need not be ready yet. Each slot wraps on its
-// own: the reservation may span the ring end, a 64B packet never does.
-__device__ __forceinline__ void WriteGatedBroadcast(int sub, uint32_t* queueBuf, uint64_t pktBase,
-                                                    const void* src, const void* dst, size_t bytes,
-                                                    const uint64_t* slot, uint64_t slotValue,
-                                                    const uint32_t* flag, uint32_t value) {
-  WritePollPacket(sub, flag, value,
-                  queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
-  WriteFusedPacket(sub, src, dst, bytes, slot, slotValue,
-                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase + kSDMACopySignalPkt) /
-                                  sizeof(uint32_t));
-}
-
-// Per peer queue 0: one reservation of nSlots*64B, filled by
-// writeFn(peer, sub, queueBuf, pktBase), then one publish and one doorbell.
 // Uses the same lane-to-peer mapping as StartSdmaScatter, so when called right
 // after it by the same block, each queue keeps a single producing lane and these
 // packets land behind that peer's scatter packets.
-template <class WriteFn>
-__device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int npes,
-                                                int myPe, int nSlots, WriteFn writeFn) {
+template <class PeerFn>
+__device__ __forceinline__ void StartSdmaGatedCopies(cco::ccoSdmaContext sdma, int npes,
+          uint64_t value, int S, size_t mid, size_t total, const uint32_t* gatePtr,
+          const uint32_t* gateValues, PeerFn peerOf) {
+  constexpr uint64_t kPartBytes = 2 * kSDMACopySignalPkt;
   const int tid = static_cast<int>(threadIdx.x), B = static_cast<int>(blockDim.x);
   const int nWork = npes << 2;
+  const uint64_t queuedBytes = kPartBytes + (S - 1) * kPartBytes;
 
   for (int i = tid; i < nWork; i += B) {
     const int peer = i >> 2, sub = i & 3;
-    const bool active = peer != myPe;
+    const ScatterPeer p = peerOf(peer);
 
-    const uint64_t bytes = nSlots * kSDMACopySignalPkt;
-
-    SdmaCollectiveHandle handle;
-    SdmaCollectiveHandle* shared = nullptr;
+    SdmaCollectiveHandle h, *shared = nullptr;
     uint32_t* queueBuf = nullptr;
     uint64_t hint0 = 0, pktBase = 0;
-    if (active && sub == 0) {
+    if (p.active && sub == 0) {
       shared = GetSharedHandle(sdma.deviceHandles + peer/* *sdma.sdmaNumQueue*/);
-      handle = *cco::impl::global(shared);
-      hint0 = handle.cachedHwReadIndex;
-      queueBuf = handle.queueBuf;
-      pktBase = handle.ReserveSingleProducer(bytes);
+      h = *cco::impl::global(shared);
+      hint0 = h.cachedHwReadIndex;
+      queueBuf = h.queueBuf;
+      pktBase = h.ReserveSingleProducer(queuedBytes);
     }
     queueBuf = BroadcastQuad(queueBuf);
     pktBase = BroadcastQuad(pktBase);
 
-    if (active) writeFn(peer, sub, queueBuf, pktBase);
+    if (p.active) {
+      uint64_t pos = pktBase;
+      if (S > 1) {
+        WritePollPacket(sub, gatePtr, gateValues[0],
+           queueBuf + h.WrapIntoRing(pos) / sizeof(uint32_t));
+        WriteFusedPacket(sub, p.src, p.dst, mid, p.sigBase, value,
+           queueBuf + h.WrapIntoRing(pos + kSDMACopySignalPkt) / sizeof(uint32_t));
+        pos += kPartBytes;
+      }
+      WritePollPacket(sub, gatePtr + 1, gateValues[1],
+          queueBuf + h.WrapIntoRing(pos) / sizeof(uint32_t));
+      WriteFusedPacket(sub, p.src + mid, p.dst + mid, total - mid, p.sigBase + 1, value,
+          queueBuf + h.WrapIntoRing(pos + kSDMACopySignalPkt) / sizeof(uint32_t));
+    }
 
     cco::ccoSdmaPublishStores();
     __builtin_amdgcn_wave_barrier();
 
-    if (active && sub == 0) {
-      handle.submitPacket(pktBase, pktBase + bytes);
-    }
-
-    if (active && sub == 0 && handle.cachedHwReadIndex != hint0) {
-      AtomicStore<EAgentScope>(&shared->cachedHwReadIndex, handle.cachedHwReadIndex);
+    if (p.active && sub == 0) {
+      h.submitPacket(pktBase, pktBase + queuedBytes);
+      if (h.cachedHwReadIndex != hint0) {
+        AtomicStore<EAgentScope>(&shared->cachedHwReadIndex, h.cachedHwReadIndex);
+      }
     }
   }
 }
