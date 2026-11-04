@@ -21,11 +21,11 @@
 # SOFTWARE.
 """Building blocks of the 8-wave quad-subtile BF16 GEMM, with a BF16 or FP32 C store.
 
-``kernels_fused_bf16.py`` builds gemm_ar's BF16 GEMM + all-reduce from these:
-layers a checkpoint keeps in BF16 (Kimi-K3's attention ``o_proj`` and shared
-experts) have no fp8 contract for ``kernels_fused.py`` to compile against. They
-are the pieces ``gemm_ag``'s BF16 GEMM (#807) is built from, copied here
-unchanged; only the kernel factories differ.
+Two kernel factories are built from these: ``kernels_fused_bf16.py`` here, the
+BF16 GEMM + all-reduce for layers a checkpoint keeps in BF16 (Kimi-K3's
+attention ``o_proj`` and shared experts), and ``gemm_ag``'s
+``compile_bf16_gemm_ag``, the BF16 GEMM + all-gather for DeepSeek-V4's
+``wkv_gate`` (bf16 in, fp32 out). Only the factories differ.
 
 ## What this is a port of
 
