@@ -138,8 +138,14 @@ class Arena:
 
     @property
     def max_routes(self):
-        """Expert-major rows a rank can receive, at most (one per (source token, k))."""
-        return self.n_rows * self.topk
+        """Expert-major rows a rank can receive, at most: one per (source token, k), plus the
+        padding that rounds each expert's section up to a multiple of the sort block (<= 128)."""
+        return self.n_rows * self.topk + self.experts_per_rank * 128
+
+    @property
+    def stage_routes(self):
+        """Routes one source can send me in one call, at most (every k of every token)."""
+        return self.cap * self.topk
 
     @property
     def off_rowmap(self):
@@ -171,8 +177,20 @@ class Arena:
         return self.off_need + _align128(self.npes * self.experts_per_rank * 4)
 
     @property
-    def total_bytes(self):
+    def off_stage(self):
+        """``recv_layout``: ``stage[s * stage_routes + j]``, 4 i32 per route j that source ``s``
+        sent me, in its own order: (local expert, rowmap value, weight bits, srcmap). The
+        receiver builds the expert-major layout from these itself (``build_layout``)."""
         return self.off_flags + _align128(self.npes * 4)
+
+    @property
+    def off_scount(self):
+        """``recv_layout``: ``scount[s]``: routes source ``s`` sent me this call."""
+        return self.off_stage + self.npes * self.stage_routes * 16
+
+    @property
+    def total_bytes(self):
+        return self.off_scount + _align128(self.npes * 4)
 
     def check(self):
         # The quant kernel addresses S through one 32-bit buffer-resource offset.
@@ -322,7 +340,7 @@ def post_rest_chunks(sdma, win, wave, lane, cnt, *, rank, arena, cco):
                 )
 
 
-def build_prepare(*, rank, arena, epr, quant_blocks, route_push, trace=False):
+def build_prepare(*, rank, arena, epr, quant_blocks, route_push, trace=False, recv_layout=False):
     """The new prepare, one resident kernel: plan, route push, quantise into ``S``, put.
 
     Workgroup 0 is the comm workgroup, the other ``quant_blocks`` quantise; every
@@ -377,7 +395,18 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push, trace=False):
 
     Counters ``hist`` and ``cursor`` start at zero and are left at zero; the barrier counters
     ``bar`` are never reset.
+
+    **recv_layout** (instead of ``route_push``; needs no plan of aiter's): every route ``(token,
+    k)`` of mine goes, in no particular order, to a staging area of its destination, partitioned
+    by source: ``stage[rank * stage_routes + j]`` = (local expert, rowmap value, weight bits,
+    srcmap). A destination's slots are reserved per block (LDS counts, one atomic per block on
+    ``cursor[dst]``). The last block to finish writes ``scount[rank]`` on every destination and
+    bumps its ``flags[rank]`` by ``epr`` (the running total ``Stage1SdmaPrepare.arm`` expects).
+    ``need`` is pushed as before. The receiver turns the staged routes into the expert-major
+    layout itself (``build_layout``), so no rank needs another rank's counts.
     """
+    if recv_layout and route_push:
+        raise ValueError("recv_layout replaces route_push")
     import mori.cco.device.flydsl as cco
 
     npes, cap, hidden, CR, topk = (
@@ -408,13 +437,13 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push, trace=False):
 
     # fmt: off
     @flyc.kernel(name=f"stage1_sdma_prepare_p{npes}_r{rank}_e{epr}_k{topk}_h{hidden}_c{cap}_cr{CR}"
-                      f"_q{quant_blocks}_rp{int(route_push)}_tr{int(trace)}", known_block_size=[PREP_BLOCK, 1, 1])
+                      f"_q{quant_blocks}_rp{int(route_push)}_tr{int(trace)}_rl{int(recv_layout)}", known_block_size=[PREP_BLOCK, 1, 1])
     def prepare(arg_ids: fx.Int64, arg_x: fx.Int64, arg_row_tok: fx.Int64, arg_rowpos: fx.Int64,
                 arg_cnt: fx.Int64, arg_cum: fx.Int64, arg_hist: fx.Int64,
                 arg_cursor: fx.Int64, arg_bar: fx.Int64, arg_s: fx.Int64, arg_dev_comm: fx.Int64,
                 arg_win: fx.Int64, arg_pair_order: fx.Int64, arg_pair_base: fx.Int64,
                 arg_local_hist: fx.Int64, arg_my_base: fx.Int64, arg_wts: fx.Int64,
-                arg_trace: fx.Int64, tokens: fx.Int32):
+                arg_trace: fx.Int64, arg_done: fx.Int64, tokens: fx.Int32):
     # fmt: on
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -634,6 +663,96 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push, trace=False):
                         comm_ops.fence_system_release()
                         comm_ops.atomic_add_system(flag, fx.Int32(1))
 
+            if const_expr(recv_layout):
+                weights = ptr_buf_tensor(arg_wts, fx.Float32)
+                w = cco.Window(arg_win)
+                qtid = (bid - fx.Int32(1)) * fx.Int32(PREP_BLOCK) + tid
+                qthreads = fx.Int32(quant_blocks * PREP_BLOCK)
+                n_routes = tokens * fx.Int32(topk)
+                # LDS (the plan's, free now): per destination this block's count | base | slot
+                l_cnt = lds_hist
+                l_base = lds_hist + fx.Int64(npes * 4)
+                l_slot = lds_hist + fx.Int64(2 * npes * 4)
+                if tid < fx.Int32(npes):
+                    comm_ops.store_i32_lds(l_cnt + fx.Int64(tid) * fx.Int64(4), fx.Int32(0))
+                    comm_ops.store_i32_lds(l_slot + fx.Int64(tid) * fx.Int64(4), fx.Int32(0))
+                fx.barrier()
+                for i in range(qtid, n_routes, qthreads):
+                    i = fx.Int32(i)
+                    g = ids[i]
+                    if g >= fx.Int32(0):
+                        comm_ops.atomic_add_lds(
+                            l_cnt + fx.Int64(g // fx.Int32(epr)) * fx.Int64(4), fx.Int32(1)
+                        )
+                fx.barrier()
+                # cursor[0..npes) is free after the plan (block 0 zeroed it before the third
+                # rendezvous): it numbers my routes per destination for this call.
+                if tid < fx.Int32(npes):
+                    v = fx.Int32(comm_ops.load_i32_lds(l_cnt + fx.Int64(tid) * fx.Int64(4)))
+                    taken = fx.Int32(comm_ops.atomic_add_agent(cursor_addr + fx.Int64(tid) * fx.Int64(4), v))
+                    comm_ops.store_i32_lds(l_base + fx.Int64(tid) * fx.Int64(4), taken)
+                fx.barrier()
+                for i in range(qtid, n_routes, qthreads):
+                    i = fx.Int32(i)
+                    g = ids[i]
+                    if g >= fx.Int32(0):
+                        dst = g // fx.Int32(epr)
+                        e_local = g - dst * fx.Int32(epr)
+                        token = i // fx.Int32(topk)
+                        k = i - token * fx.Int32(topk)
+                        slot = fx.Int32(comm_ops.atomic_add_lds(l_slot + fx.Int64(dst) * fx.Int64(4), fx.Int32(1)))
+                        pos = fx.Int32(comm_ops.load_i32_lds(l_base + fx.Int64(dst) * fx.Int64(4))) + slot
+                        # A row for myself is read from my own S, one for another rank from its R.
+                        landing = (dst == fx.Int32(rank)).select(
+                            fx.Int32(rank * cap), fx.Int32(arena.n_rows + rank * cap)
+                        )
+                        at = fx.Int64(w.lsa_ptr(dst, arena.off_stage)) + fx.Int64(
+                            fx.Int32(rank * arena.stage_routes) + pos
+                        ) * fx.Int64(16)
+                        weight_bits = fx.Vector.from_elements([weights[i]], fx.Float32).bitcast(fx.Int32)[0]
+                        comm_ops.store_i32_global_system_monotonic(at, e_local)
+                        comm_ops.store_i32_global_system_monotonic(
+                            at + fx.Int64(4), landing + rowpos[token * fx.Int32(npes) + dst]
+                        )
+                        comm_ops.store_i32_global_system_monotonic(at + fx.Int64(8), weight_bits)
+                        comm_ops.store_i32_global_system_monotonic(
+                            at + fx.Int64(12), (fx.Int32(rank * cap) + token) | (k << fx.Int32(24))
+                        )
+                # need[rank, e] on every destination, as before: one store per expert
+                for ge in range(bid - fx.Int32(1), fx.Int32(E), fx.Int32(quant_blocks)):
+                    ge = fx.Int32(ge)
+                    dst = ge // fx.Int32(epr)
+                    if tid == fx.Int32(0):
+                        chunks = (cum[ge] + fx.Int32(CR - 1)) // fx.Int32(CR)
+                        comm_ops.store_i32_global_system_monotonic(
+                            fx.Int64(w.lsa_ptr(dst, arena.off_need))
+                            + fx.Int64(rank * epr + (ge - dst * fx.Int32(epr))) * fx.Int64(4),
+                            chunks,
+                        )
+                # The last block out publishes the counts and the flags. Every block releases
+                # its own stores first; the counter never resets (a call adds quant_blocks).
+                rocdl.s_waitcnt(vmcnt=0)
+                fx.barrier()
+                if tid == fx.Int32(0):
+                    comm_ops.fence_system_release()
+                    old = fx.Int32(comm_ops.atomic_add_agent(fx.Int64(arg_done), fx.Int32(1)))
+                    if (old + fx.Int32(1)) % fx.Int32(quant_blocks) == fx.Int32(0):
+                        comm_ops.fence_agent_acquire()
+                        for d in range_constexpr(npes):
+                            routes_d = fx.Int32(
+                                comm_ops.atomic_add_agent(cursor_addr + fx.Int64(d * 4), fx.Int32(0))
+                            )
+                            comm_ops.store_i32_global_system_monotonic(
+                                fx.Int64(w.lsa_ptr(d, arena.off_scount)) + fx.Int64(rank * 4), routes_d
+                            )
+                            cursor[fx.Int32(d)] = fx.Int32(0)  # the next call's plan starts from zero
+                        comm_ops.fence_system_release()
+                        for d in range_constexpr(npes):
+                            comm_ops.atomic_add_system(
+                                fx.Int64(w.lsa_ptr(d, arena.off_flags)) + fx.Int64(rank * 4),
+                                fx.Int32(epr),
+                            )
+
             quant_pass(False)
 
         if const_expr(trace):
@@ -647,11 +766,11 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push, trace=False):
                arg_cursor: fx.Int64, arg_bar: fx.Int64, arg_s: fx.Int64, arg_dev_comm: fx.Int64,
                arg_win: fx.Int64, arg_pair_order: fx.Int64, arg_pair_base: fx.Int64,
                arg_local_hist: fx.Int64, arg_my_base: fx.Int64, arg_wts: fx.Int64,
-               arg_trace: fx.Int64, tokens: fx.Int32, stream: fx.Stream):
+               arg_trace: fx.Int64, arg_done: fx.Int64, tokens: fx.Int32, stream: fx.Stream):
     # fmt: on
         prepare(arg_ids, arg_x, arg_row_tok, arg_rowpos, arg_cnt, arg_cum, arg_hist,
                 arg_cursor, arg_bar, arg_s, arg_dev_comm, arg_win, arg_pair_order, arg_pair_base,
-                arg_local_hist, arg_my_base, arg_wts, arg_trace, tokens).launch(
+                arg_local_hist, arg_my_base, arg_wts, arg_trace, arg_done, tokens).launch(
             grid=(nblocks, 1, 1), block=(PREP_BLOCK, 1, 1), stream=stream
         )
 
@@ -719,6 +838,216 @@ def build_wait(*, rank, arena):
     return launch
 
 
+LAYOUT_BLOCKS = 64
+
+
+def build_layout(*, rank, arena, sbm, max_tok):
+    """``recv_layout``: the receiver builds its own expert-major layout from the staged routes.
+
+    One resident launch of ``LAYOUT_BLOCKS`` blocks, after the prepare and before GEMM1:
+
+    1. every block waits for every source's flag of this call (acquire), so ``scount`` and
+       the staged routes are visible;
+    2. count the staged routes per local expert (LDS, then one atomic per block on
+       ``hist[e]``);  rendezvous
+    3. every block computes the same section bases -- expert ``e``'s rows start at the sum of
+       the earlier experts' counts, each rounded up to ``sbm`` -- and reserves its share of
+       each expert with one atomic on ``cursor[e]``;
+    4. each route takes a slot of its block's share and writes ``rowmap`` (in the window, what
+       GEMM1 reads), ``srcmap`` and ``wts`` (aiter's tables, what stage2 reads);
+    5. block ``e % LAYOUT_BLOCKS`` pads expert ``e``'s section (``srcmap = npes * max_tok``:
+       past every valid token, so stage2 drops the row) and writes its tiles
+       (``sorted_expert_ids``, ``tile_row_base`` = ``tile_input_base`` = ``tile * sbm``,
+       ``expert_tile_end``); block 0 writes ``num_valid`` and ``max_expert_tiles``;
+       rendezvous, then block 0 zeroes ``hist`` and ``cursor`` for the next call.
+
+    The order of the rows inside an expert is the atomics' (not defined), as in aiter's own
+    plan: GEMM1 and GEMM2 are row-wise and stage2 scatters each row to its (token, k) slot, so
+    the final output does not depend on it. Runtime fanout pairs are not built: stage2 must
+    run with ``fanout_pair_config`` zero.
+    """
+    npes, epr, cap, SR = arena.npes, arena.experts_per_rank, arena.cap, arena.stage_routes
+    if cap != max_tok:
+        raise ValueError("srcmap encodes tokens with cap = max_tok")
+    # The window offsets as plain ints the kernel closes over: FlyDSL's cache key is the source
+    # plus the scalar closure values, so an offset read through ``arena`` would not be in it,
+    # and a kernel cached for another hidden size (same experts / top-k / cap) would be reused.
+    OFF_FLAGS, OFF_STAGE = arena.off_flags, arena.off_stage
+    OFF_SCOUNT, OFF_ROWMAP = arena.off_scount, arena.off_rowmap
+    nb = LAYOUT_BLOCKS
+    nthreads = nb * PREP_BLOCK
+    n_bar_groups = (nb + BAR_GROUP - 1) // BAR_GROUP
+    bar2_off = (n_bar_groups + 1) * BAR_STRIDE * 4
+    pad_src = npes * max_tok
+    # LDS words: per source n | prefix (npes + 1) | per expert: count, slot, base, section base,
+    # routes | total rows | max tiles
+    L_N, L_PREF = 0, npes
+    L_H = L_PREF + npes + 1
+    L_SLOT, L_BASE, L_EB, L_T = L_H + epr, L_H + 2 * epr, L_H + 3 * epr, L_H + 4 * epr
+    L_TOT = L_H + 5 * epr
+    L_MET = L_TOT + 1
+    lds_words = L_MET + 1
+
+    @fx.struct
+    class LayoutShared:
+        buf: fx.Array[Int8, lds_words * 4, 16]
+
+    # The window offsets are compile-time constants and depend on hidden: name them, or a
+    # cached kernel of another network with the same experts / top-k / cap is reused.
+    # fmt: off
+    @flyc.kernel(name=f"stage1_sdma_layout_p{npes}_r{rank}_e{epr}_k{arena.topk}_c{cap}_s{sbm}"
+                      f"_h{arena.hidden}_t{arena.total_bytes}",
+                 known_block_size=[PREP_BLOCK, 1, 1])
+    def layout(arg_win: fx.Int64, arg_expected: fx.Int64, arg_hist: fx.Int64, arg_cursor: fx.Int64,
+               arg_bar: fx.Int64, arg_srcmap: fx.Int64, arg_wts: fx.Int64, arg_eids: fx.Int64,
+               arg_trb: fx.Int64, arg_tib: fx.Int64, arg_nv: fx.Int64, arg_met: fx.Int64,
+               arg_ete: fx.Int64):
+    # fmt: on
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        gtid = bid * fx.Int32(PREP_BLOCK) + tid
+        win = fx.Int64(arg_win)
+        lds = fx.SharedAllocator().allocate(LayoutShared).peek()
+        L = fx.Int64(fx.ptrtoint(lds.buf.ptr))
+
+        def lw(i):
+            return L + fx.Int64(i) * fx.Int64(4)
+
+        def lld(i):
+            return fx.Int32(comm_ops.load_i32_lds(lw(i)))
+
+        def lst(i, v):
+            comm_ops.store_i32_lds(lw(i), v)
+
+        expected = ptr_buf_tensor(arg_expected, fx.Int32)
+        # 1. every source's routes of this call are here
+        if tid < fx.Int32(npes):
+            comm_ops.spin_until_ge_i32_system(
+                win + fx.Int64(OFF_FLAGS) + fx.Int64(tid) * fx.Int64(4),
+                expected[fx.Int32(npes) + tid],
+                acquire=True,
+            )
+        fx.barrier()
+        stage = ptr_buf_tensor(win + fx.Int64(OFF_STAGE), fx.Int32)
+        scount = ptr_buf_tensor(win + fx.Int64(OFF_SCOUNT), fx.Int32)
+        rowmap = ptr_buf_tensor(win + fx.Int64(OFF_ROWMAP), fx.Int32)
+        srcmap = ptr_buf_tensor(arg_srcmap, fx.Int32)
+        wts = ptr_buf_tensor(arg_wts, fx.Int32)
+        hist = ptr_buf_tensor(arg_hist, fx.Int32)
+        cursor_addr = fx.Int64(arg_cursor)
+        if tid == fx.Int32(0):
+            run = fx.Int32(0)
+            for s_ in range_constexpr(npes):
+                n_s = scount[fx.Int32(s_)]
+                lst(L_N + s_, n_s)
+                lst(L_PREF + s_, run)
+                run = run + n_s
+            lst(L_PREF + npes, run)
+        if tid < fx.Int32(epr):
+            lst(fx.Int32(L_H) + tid, fx.Int32(0))
+            lst(fx.Int32(L_SLOT) + tid, fx.Int32(0))
+        fx.barrier()
+        total = lld(L_PREF + npes)
+
+        def word_of(i):
+            """Staged route ``i`` (counted over the sources in turn) -> its first i32 index."""
+            src = fx.Int32(0)
+            for s_ in range_constexpr(1, npes):
+                src = (i >= lld(L_PREF + s_)).select(fx.Int32(s_), src)
+            j = i - lld(fx.Int32(L_PREF) + src)
+            return (src * fx.Int32(SR) + j) * fx.Int32(4)
+
+        # 2. count per expert
+        for i in range(gtid, total, fx.Int32(nthreads)):
+            e = stage[word_of(fx.Int32(i))]
+            comm_ops.atomic_add_lds(lw(fx.Int32(L_H) + e), fx.Int32(1))
+        fx.barrier()
+        if tid < fx.Int32(epr):
+            v = lld(fx.Int32(L_H) + tid)
+            if v > fx.Int32(0):
+                comm_ops.atomic_add_agent(fx.Int64(arg_hist) + fx.Int64(tid) * fx.Int64(4), v)
+        tree_barrier(fx.Int64(arg_bar), fx.Int32(nb), tid, bid)
+
+        # 3. section bases (every block the same), then this block's share of each expert
+        if tid == fx.Int32(0):
+            run = fx.Int32(0)
+            met = fx.Int32(0)
+            for e_ in range_constexpr(epr):
+                t_e = hist[fx.Int32(e_)]
+                lst(L_EB + e_, run)
+                lst(L_T + e_, t_e)
+                tiles = (t_e + fx.Int32(sbm - 1)) // fx.Int32(sbm)
+                met = (tiles > met).select(tiles, met)
+                run = run + tiles * fx.Int32(sbm)
+            lst(L_TOT, run)
+            lst(L_MET, met)
+        fx.barrier()
+        if tid < fx.Int32(epr):
+            v = lld(fx.Int32(L_H) + tid)
+            taken = fx.Int32(0)
+            if v > fx.Int32(0):
+                taken = fx.Int32(comm_ops.atomic_add_agent(cursor_addr + fx.Int64(tid) * fx.Int64(4), v))
+            lst(fx.Int32(L_BASE) + tid, lld(fx.Int32(L_EB) + tid) + taken)
+        fx.barrier()
+
+        # 4. place every route
+        for i in range(gtid, total, fx.Int32(nthreads)):
+            w0 = word_of(fx.Int32(i))
+            e = stage[w0]
+            slot = fx.Int32(comm_ops.atomic_add_lds(lw(fx.Int32(L_SLOT) + e), fx.Int32(1)))
+            r = lld(fx.Int32(L_BASE) + e) + slot
+            rowmap[r] = stage[w0 + fx.Int32(1)]
+            wts[r] = stage[w0 + fx.Int32(2)]
+            srcmap[r] = stage[w0 + fx.Int32(3)]
+
+        # 5. padding rows and the tile tables, one expert per block in turn
+        eids = ptr_buf_tensor(arg_eids, fx.Int32)
+        trb = ptr_buf_tensor(arg_trb, fx.Int32)
+        tib = ptr_buf_tensor(arg_tib, fx.Int32)
+        ete = ptr_buf_tensor(arg_ete, fx.Int32)
+        for e in range(bid, fx.Int32(epr), fx.Int32(nb)):
+            e = fx.Int32(e)
+            eb = lld(fx.Int32(L_EB) + e)
+            t_e = lld(fx.Int32(L_T) + e)
+            padded = (t_e + fx.Int32(sbm - 1)) // fx.Int32(sbm) * fx.Int32(sbm)
+            for r in range(eb + t_e + tid, eb + padded, fx.Int32(PREP_BLOCK)):
+                r = fx.Int32(r)
+                srcmap[r] = fx.Int32(pad_src)
+                wts[r] = fx.Int32(0)
+                rowmap[r] = fx.Int32(0)
+            t0 = eb // fx.Int32(sbm)
+            t1 = (eb + padded) // fx.Int32(sbm)
+            for tile in range(t0 + tid, t1, fx.Int32(PREP_BLOCK)):
+                tile = fx.Int32(tile)
+                eids[tile] = fx.Int32(rank * epr) + e
+                trb[tile] = tile * fx.Int32(sbm)
+                tib[tile] = tile * fx.Int32(sbm)
+            if tid == fx.Int32(0):
+                ete[e] = t1
+        if (bid == fx.Int32(0)) & (tid == fx.Int32(0)):
+            ptr_buf_tensor(arg_nv, fx.Int32)[fx.Int32(0)] = lld(L_TOT)
+            ptr_buf_tensor(arg_met, fx.Int32)[fx.Int32(0)] = lld(L_MET)
+        tree_barrier(fx.Int64(arg_bar) + fx.Int64(bar2_off), fx.Int32(nb), tid, bid)
+        if bid == fx.Int32(0):
+            for e in range(tid, fx.Int32(epr), fx.Int32(PREP_BLOCK)):
+                hist[fx.Int32(e)] = fx.Int32(0)
+                ptr_buf_tensor(arg_cursor, fx.Int32)[fx.Int32(e)] = fx.Int32(0)
+
+    # fmt: off
+    @flyc.jit
+    def launch(arg_win: fx.Int64, arg_expected: fx.Int64, arg_hist: fx.Int64, arg_cursor: fx.Int64,
+               arg_bar: fx.Int64, arg_srcmap: fx.Int64, arg_wts: fx.Int64, arg_eids: fx.Int64,
+               arg_trb: fx.Int64, arg_tib: fx.Int64, arg_nv: fx.Int64, arg_met: fx.Int64,
+               arg_ete: fx.Int64, stream: fx.Stream):
+    # fmt: on
+        layout(arg_win, arg_expected, arg_hist, arg_cursor, arg_bar, arg_srcmap, arg_wts, arg_eids,
+               arg_trb, arg_tib, arg_nv, arg_met, arg_ete).launch(
+            grid=(nb, 1, 1), block=(PREP_BLOCK, 1, 1), stream=stream
+        )
+
+    return launch
+
+
 class Stage1SdmaPrepare:
     """The new prepare for one rank: plan, route push, quantise into ``S``, put the first chunks of each run.
 
@@ -780,12 +1109,21 @@ class Stage1SdmaPrepare:
         self.quant_blocks = n_cu - 1 if quant_blocks is None else quant_blocks
         n_groups = (self.quant_blocks + 1 + BAR_GROUP - 1) // BAR_GROUP
         self.bar = torch.zeros(3 * (n_groups + 1) * BAR_STRIDE, **i32)
+        # recv_layout: the prepare's blocks-done counter (never reset), and the layout kernel's
+        # counters (left at zero by every call) and barrier counters (never reset).
+        self.done = torch.zeros(1, **i32)
+        self.lhist = torch.zeros(self.epr, **i32)
+        self.lcursor = torch.zeros(self.epr, **i32)
+        n_lgroups = (LAYOUT_BLOCKS + BAR_GROUP - 1) // BAR_GROUP
+        self.lbar = torch.zeros(2 * (n_lgroups + 1) * BAR_STRIDE, **i32)
+        self._layouts = {}
         # Running totals the wait kernel waits for: signals per source, then route flags.
         self.expected = torch.zeros(2 * self.npes, **i32)
         # The signal totals as they were before this call: its chunks count from here.
         self.sig_base = torch.zeros(self.npes, **i32)
         # Zero flags: peers bump them as soon as they run.
         from_gpu_ptr(self.mem.ptr + a.off_flags, (self.npes,), torch.int32).zero_()
+        from_gpu_ptr(self.mem.ptr + a.off_scount, (self.npes,), torch.int32).zero_()
         self.rowmap = from_gpu_ptr(
             self.mem.ptr + a.off_rowmap, (a.max_routes,), torch.int32
         )
@@ -807,7 +1145,7 @@ class Stage1SdmaPrepare:
         torch.cuda.synchronize()
         comm.barrier()
 
-    def run(self, x, ids, wts=None, plan=None, stream=None):
+    def run(self, x, ids, wts=None, plan=None, stream=None, recv_layout=False):
         """Plan, push the routes, quantise, and put the first ``early_chunks`` of every run, for ``x`` bf16
         ``[T, hidden]`` and ``ids`` int32 ``[T, topk]``. The other chunks follow from
         ``post_rest`` or the GEMM1 kernel.
@@ -823,22 +1161,26 @@ class Stage1SdmaPrepare:
         if tokens > self.max_tok:
             raise ValueError(f"tokens={tokens} > max_tok={self.max_tok}")
         route_push = plan is not None
-        if route_push and wts is None:
+        if (route_push or recv_layout) and wts is None:
             raise ValueError("the route table needs the routing weights")
-        if route_push not in self._prepares:
-            self._prepares[route_push] = build_prepare(
+        if route_push and recv_layout:
+            raise ValueError("recv_layout needs no plan")
+        key = (route_push, recv_layout)
+        if key not in self._prepares:
+            self._prepares[key] = build_prepare(
                 rank=self.rank,
                 arena=self.arena,
                 epr=self.epr,
                 quant_blocks=self.quant_blocks,
                 route_push=route_push,
                 trace=self.trace,
+                recv_layout=recv_layout,
             )
         s = fx.Stream((stream or torch.cuda.current_stream()).cuda_stream)
         a = self.arena
         tables = [t.data_ptr() for t in plan] if route_push else [0] * 4
         _run_compiled(
-            self._prepares[route_push],
+            self._prepares[key],
             fx.Int64(ids.data_ptr()),
             fx.Int64(x.data_ptr()),
             *(
@@ -857,9 +1199,44 @@ class Stage1SdmaPrepare:
             fx.Int64(self.dev_comm.ptr),
             fx.Int64(self.win.handle),
             *(fx.Int64(p) for p in tables),
-            fx.Int64(wts.data_ptr() if route_push else 0),
+            fx.Int64(wts.data_ptr() if (route_push or recv_layout) else 0),
             fx.Int64(self.trace_buf.data_ptr() if self.trace else 0),
+            fx.Int64(self.done.data_ptr()),
             fx.Int32(tokens),
+            s,
+        )
+
+    def layout(self, moe, sbm, stream=None):
+        """``recv_layout``: build this rank's expert-major layout from the staged routes, into
+        aiter's tables (``moe._s1_op`` / ``_s1_dispatch_workspace``) and ``rowmap``. Run after
+        ``run(..., recv_layout=True)`` and ``arm`` and before GEMM1. Also zeroes aiter's
+        ``fanout_pair_config``: the layout has no fanout pairs."""
+        import torch
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+        sbm = int(sbm)
+        if sbm not in self._layouts:
+            self._layouts[sbm] = build_layout(
+                rank=self.rank, arena=self.arena, sbm=sbm, max_tok=self.max_tok
+            )
+        op, ws = moe._s1_op, moe._s1_dispatch_workspace
+        ws["fanout_pair_config"].zero_()
+        s = fx.Stream((stream or torch.cuda.current_stream()).cuda_stream)
+        _run_compiled(
+            self._layouts[sbm],
+            fx.Int64(self.mem.ptr),
+            fx.Int64(self.expected.data_ptr()),
+            fx.Int64(self.lhist.data_ptr()),
+            fx.Int64(self.lcursor.data_ptr()),
+            fx.Int64(self.lbar.data_ptr()),
+            fx.Int64(op.srcmap_em.data_ptr()),
+            fx.Int64(op.wts_em.data_ptr()),
+            fx.Int64(op.sorted_expert_ids.data_ptr()),
+            fx.Int64(op.tile_row_base.data_ptr()),
+            fx.Int64(moe._s1_tile_input_base.data_ptr()),
+            fx.Int64(op.num_valid.data_ptr()),
+            fx.Int64(ws["max_expert_tiles"].data_ptr()),
+            fx.Int64(ws["expert_tile_end"].data_ptr()),
             s,
         )
 

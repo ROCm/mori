@@ -14,6 +14,7 @@ example 11 (stage2 + combine). The stage1 outputs are bit for bit aiter's.
 | `test_dispatch.py` | `R[rowmap[r]]`, weights and srcmap equal aiter's `rx_em`, `wts_em`, `srcmap_em` row by row |
 | `test_gemm1.py` | stage1 output and the final layer output equal aiter's; `--stress N` repeats a poisoned call; `--time-iters` times it; `--trace N` prints the clock stamps below; `--stall-test` runs GEMM1 twice after one prepare |
 | `baseline.py` | where aiter's own prepare / stage1 / stage2 time goes |
+| `test_recv_layout.py` | `recv_layout`: no plan of aiter's at all; the final layer output equals aiter's bit for bit (`--stress N` poisoned gated calls), and the whole chain is timed against aiter's prepare + stage1 |
 
 Design in short:
 
@@ -34,6 +35,45 @@ MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
   examples/cco/python/13_flydsl_mega_moe_stage1_sdma/test_gemm1.py --network v4_pro --bs 4096 \
   --chunk-rows 256 --early-chunks 2 --stress 50 --time-iters 30
 ```
+
+## `recv_layout`: no aiter plan at all
+
+The route push above writes each route to its final expert-major row on the destination, and
+the row numbers come from aiter's compact plan (`pair_order`, `pair_base`, `local_hist`,
+`my_base`): that plan has to run every call, ~0.10-0.15 ms whatever the batch, and
+`test_gemm1.py` does not time it (it reuses the tables of its reference call). With
+`Stage1SdmaPrepare.run(..., recv_layout=True)` nothing of aiter's plan is needed:
+
+* the sender puts every route of its, in no order, into a staging area of the destination
+  partitioned by source (`Arena.off_stage`, 16 B each: local expert, rowmap value, weight,
+  srcmap), then the counts (`off_scount`) and its flag, as before;
+* `Stage1SdmaPrepare.layout()` (`build_layout`, 64 blocks, between the prepare and GEMM1) waits
+  for every source, counts the staged routes per expert, pads each expert to the sort block and
+  writes `rowmap`, aiter's `srcmap_em` / `wts_em` / `sorted_expert_ids` / `tile_row_base` /
+  `tile_input_base` / `num_valid` / `expert_tile_end` / `max_expert_tiles`, so aiter's stage2
+  runs on them unchanged. The order of the rows inside an expert is the atomics', as in
+  aiter's own plan; stage2 scatters each row to its (token, k) slot, so the output does not
+  depend on it;
+* no runtime fanout pairs are built: `layout()` zeroes `fanout_pair_config`. aiter's own output
+  is the same with and without them (`test_recv_layout.py` checks it on every run).
+
+```bash
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/13_flydsl_mega_moe_stage1_sdma/test_recv_layout.py --network flash --bs 512
+```
+
+New prepare + layout + gated GEMM1 against aiter's compact prepare + fused stage1, eager, 8x
+MI355X, aiter 46cdc4c52, `--chunk-rows 256 --early-chunks 2`; every row bit-exact over 20
+poisoned calls. The layout kernel takes 0.025-0.044 ms.
+
+| tokens/rank | 256 | 512 | 1024 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|---|
+| GLM-5.2 | 1.20x | 1.18x | 1.19x | 1.10x | 1.05x | 1.00x |
+| V4-Pro | 1.11x | 1.07x | 1.08x | 1.04x | 1.01x | 0.97x |
+| V4.1-Flash | 1.31x | 1.24x | 1.07x | 1.01x | 0.98x | 0.98x |
+
+For comparison, the route-push path WITH the compact plan timed is 0.92-1.04x over 512-16384
+on the same node (`test_gemm1.py` reports 0.98-1.33x for it because it leaves the plan out).
 
 ## Status -- read before relying on it
 
