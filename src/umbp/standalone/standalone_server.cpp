@@ -129,14 +129,17 @@ UMBPMedium BackendMedium(const UMBPConfig& config) {
   return config.distributed.has_value() ? config.distributed->medium : UMBPMedium::DRAM;
 }
 
+bool EnvFlag(const char* name) {
+  const char* raw = std::getenv(name);
+  return raw != nullptr && raw[0] == '1';
+}
+
 // SSD reads were serialized for a manager that staged them through one arena.
 // SsdBackend locks its own metadata and stages through leased pages, so
 // UMBP_STANDALONE_SSD_CONCURRENT=1 runs an SSD server's data path like a DRAM
 // one's.
 bool SharedReads(const UMBPConfig& config) {
-  if (BackendMedium(config) != UMBPMedium::SSD) return true;
-  const char* raw = std::getenv("UMBP_STANDALONE_SSD_CONCURRENT");
-  return raw != nullptr && raw[0] == '1';
+  return BackendMedium(config) != UMBPMedium::SSD || EnvFlag("UMBP_STANDALONE_SSD_CONCURRENT");
 }
 
 ::umbp::StandaloneBackendMode BackendModeToProto(UMBPDeploymentMode mode) {
@@ -1434,7 +1437,12 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "GPU IPC registration requires a Distributed backend");
       return;
     }
-    if (BackendMedium(backend_config_) == UMBPMedium::SSD) {
+    // An SSD read lands in host staging pages and is copied out from there, to
+    // a GPU as readily as to host memory -- the path a backend policy's SSD
+    // tier already takes. UMBP_STANDALONE_SSD_GPU_IPC=1 admits GPU buffers on
+    // an SSD medium too.
+    if (BackendMedium(backend_config_) == UMBPMedium::SSD &&
+        !EnvFlag("UMBP_STANDALONE_SSD_GPU_IPC")) {
       SetBool(response, false,
               "GPU IPC registration is not supported on an SSD medium "
               "(run this server on the DRAM medium)");
