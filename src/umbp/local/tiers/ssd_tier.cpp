@@ -92,6 +92,14 @@ SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& s
         "SSDTier: io_uring backend requested but unavailable (kernel missing io_uring "
         "support or restricted by seccomp/capabilities); falling back to POSIX backend");
   }
+  if (!io_driver_->Capabilities().thread_safe && ssd_config_.io.read_rings > 1) {
+    for (size_t i = 0; i < ssd_config_.io.read_rings; ++i) {
+      auto ring = std::make_unique<ReadRing>();
+      ring->driver = CreateStorageIoDriver(ssd_config_.io.backend,
+                                           static_cast<uint32_t>(ssd_config_.io.queue_depth));
+      read_rings_.push_back(std::move(ring));
+    }
+  }
   writer_ = std::make_unique<segment::Writer>(*io_driver_, ssd_config_.verify_crc);
   fs::create_directories(dir_);
 
@@ -767,10 +775,10 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
 
   if (lookups.empty()) return results;
 
-  // Phase 2 (io_mu_ if needed): batch I/O.
-  const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
+  // Phase 2 (a read ring, or io_mu_ if needed): batch I/O.
   const bool use_batch = io_driver_->Capabilities().batch_read && lookups.size() > 1;
   const auto t_io = ssdperf::Now();
+  double io_wait_ms = 0.0;
 
   std::vector<bool> io_ok(lookups.size(), false);
 
@@ -781,13 +789,8 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
       ops.push_back({lk.fd, lk.io_dst, lk.io_size, lk.offset});
     }
 
-    IoStatus status;
-    if (needs_io_lock) {
-      std::lock_guard<std::mutex> io_lock(io_mu_);
-      status = io_driver_->ReadBatch(ops);
-    } else {
-      status = io_driver_->ReadBatch(ops);
-    }
+    IoStatus status =
+        BatchRead([&](StorageIoDriver& io) { return io.ReadBatch(ops); }, &io_wait_ms);
 
     if (status.ok()) {
       // All I/O succeeded; mark all as ok for CRC check.
@@ -796,13 +799,9 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
       // Batch failed — fall back to per-key reads.
       for (size_t j = 0; j < lookups.size(); ++j) {
         const auto& lk = lookups[j];
-        IoStatus s;
-        if (needs_io_lock) {
-          std::lock_guard<std::mutex> io_lock(io_mu_);
-          s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
-        } else {
-          s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
-        }
+        const IoStatus s = BatchRead(
+            [&](StorageIoDriver& io) { return io.ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset); },
+            &io_wait_ms);
         io_ok[j] = s.ok();
       }
     }
@@ -810,13 +809,9 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
     // Serial path (single key or no batch_read capability).
     for (size_t j = 0; j < lookups.size(); ++j) {
       const auto& lk = lookups[j];
-      IoStatus s;
-      if (needs_io_lock) {
-        std::lock_guard<std::mutex> io_lock(io_mu_);
-        s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
-      } else {
-        s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
-      }
+      const IoStatus s = BatchRead(
+          [&](StorageIoDriver& io) { return io.ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset); },
+          &io_wait_ms);
       io_ok[j] = s.ok();
     }
   }
@@ -857,11 +852,11 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
     const double total_ms = lock_ms + lookup_ms + io_ms + crc_ms;
     MORI_UMBP_INFO(
         "[SsdPerf/tier] GET dir={} keys={} served={} bytes={} total_ms={:.3f} GB_s={:.2f} | "
-        "mu_wait={:.3f}ms index={:.3f}ms ({:.0f}%) dev_read={:.3f}ms ({:.0f}%) crc={:.3f}ms "
-        "({:.0f}%) | dev_GB_s={:.2f} crc_GB_s={:.2f} batched={}",
+        "mu_wait={:.3f}ms index={:.3f}ms ({:.0f}%) dev_read={:.3f}ms ({:.0f}%) io_wait={:.3f}ms "
+        "crc={:.3f}ms ({:.0f}%) | dev_GB_s={:.2f} crc_GB_s={:.2f} batched={}",
         dir_, keys.size(), lookups.size(), verified_bytes, total_ms,
         ssdperf::GbPerSec(verified_bytes, total_ms), lock_ms, lookup_ms,
-        ssdperf::Pct(lookup_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), crc_ms,
+        ssdperf::Pct(lookup_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), io_wait_ms, crc_ms,
         ssdperf::Pct(crc_ms, total_ms), ssdperf::GbPerSec(verified_bytes, io_ms),
         ssdperf::GbPerSec(verified_bytes, crc_ms), use_batch);
   }
@@ -1066,21 +1061,19 @@ std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
 
   // Phase 3: issue every run as one batch, falling back per run if the driver
   // rejects the batch as a whole.
-  const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
   const bool use_batch = io_driver_->Capabilities().batch_read && runs.size() > 1;
   const auto t_io = ssdperf::Now();
   std::vector<char> run_ok(runs.size(), 0);
   uint64_t io_bytes = 0;
+  double io_wait_ms = 0.0;  // queued behind other batches for this drive's ring
 
   auto read_one = [&](size_t j) {
     const auto& run = runs[j];
-    IoStatus status;
-    if (needs_io_lock) {
-      std::lock_guard<std::mutex> io_lock(io_mu_);
-      status = io_driver_->ReadAt(run.fd, run.io_dst, run.io_size, run.io_offset);
-    } else {
-      status = io_driver_->ReadAt(run.fd, run.io_dst, run.io_size, run.io_offset);
-    }
+    const IoStatus status = BatchRead(
+        [&](StorageIoDriver& io) {
+          return io.ReadAt(run.fd, run.io_dst, run.io_size, run.io_offset);
+        },
+        &io_wait_ms);
     run_ok[j] = status.ok() ? 1 : 0;
   };
 
@@ -1089,13 +1082,8 @@ std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
     ops.reserve(runs.size());
     for (const auto& run : runs) ops.push_back({run.fd, run.io_dst, run.io_size, run.io_offset});
 
-    IoStatus status;
-    if (needs_io_lock) {
-      std::lock_guard<std::mutex> io_lock(io_mu_);
-      status = io_driver_->ReadBatch(ops);
-    } else {
-      status = io_driver_->ReadBatch(ops);
-    }
+    const IoStatus status =
+        BatchRead([&](StorageIoDriver& io) { return io.ReadBatch(ops); }, &io_wait_ms);
     if (status.ok()) {
       std::fill(run_ok.begin(), run_ok.end(), 1);
     } else {
@@ -1148,11 +1136,11 @@ std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
     MORI_UMBP_INFO(
         "[SsdPerf/tier] RANGED_GET dir={} keys={} located={} runs={} served_bytes={} "
         "read_bytes={} total_ms={:.3f} GB_s={:.2f} | mu_wait={:.3f}ms plan={:.3f}ms ({:.0f}%) "
-        "dev_read={:.3f}ms ({:.0f}%) bounce_copy={:.3f}ms ({:.0f}%) | dev_GB_s={:.2f} "
-        "amplification={:.2f}x batched={}",
+        "dev_read={:.3f}ms ({:.0f}%) io_wait={:.3f}ms bounce_copy={:.3f}ms ({:.0f}%) | "
+        "dev_GB_s={:.2f} amplification={:.2f}x batched={}",
         dir_, keys.size(), located.size(), runs.size(), served_bytes, io_bytes, total_ms,
         ssdperf::GbPerSec(served_bytes, total_ms), lock_ms, plan_ms,
-        ssdperf::Pct(plan_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), copy_ms,
+        ssdperf::Pct(plan_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), io_wait_ms, copy_ms,
         ssdperf::Pct(copy_ms, total_ms), ssdperf::GbPerSec(io_bytes, io_ms),
         served_bytes ? static_cast<double>(io_bytes) / static_cast<double>(served_bytes) : 0.0,
         use_batch);
@@ -1322,6 +1310,31 @@ std::optional<RecordLocation> SSDTier::LocateRecord(const std::string& key) {
   loc.value_size = meta->size;
   loc.direct_io = direct_io_;
   return loc;
+}
+
+IoStatus SSDTier::BatchRead(const std::function<IoStatus(StorageIoDriver&)>& read,
+                            double* wait_ms) const {
+  const auto t_wait = ssdperf::Now();
+  if (read_rings_.empty()) {
+    if (io_driver_->Capabilities().thread_safe) return read(*io_driver_);
+    std::lock_guard<std::mutex> lock(io_mu_);
+    *wait_ms += ssdperf::MsSince(t_wait);
+    return read(*io_driver_);
+  }
+  // A free ring if any, else queue on the round-robin pick.
+  const size_t first = next_read_ring_.fetch_add(1, std::memory_order_relaxed);
+  for (size_t k = 0; k < read_rings_.size(); ++k) {
+    ReadRing& ring = *read_rings_[(first + k) % read_rings_.size()];
+    std::unique_lock<std::mutex> lock(ring.mu, std::try_to_lock);
+    if (lock.owns_lock()) {
+      *wait_ms += ssdperf::MsSince(t_wait);
+      return read(*ring.driver);
+    }
+  }
+  ReadRing& ring = *read_rings_[first % read_rings_.size()];
+  std::lock_guard<std::mutex> lock(ring.mu);
+  *wait_ms += ssdperf::MsSince(t_wait);
+  return read(*ring.driver);
 }
 
 IoStatus SSDTier::WritePrepared(int fd, const segment::PreparedRecord& pr, bool sync) const {
