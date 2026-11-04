@@ -88,6 +88,9 @@ struct UMBPDramConfig {
 struct UMBPIoConfig {
   UMBPIoBackend backend = UMBPIoBackend::IoUring;
   size_t queue_depth = 4096;
+  // Rings for batch reads per drive, apart from the write ring, so concurrent
+  // batches overlap on the drive.  1 = reads share the write ring and its lock.
+  size_t read_rings = 4;
 };
 
 struct UMBPDurabilityConfig {
@@ -723,6 +726,7 @@ struct UMBPConfig {
     cfg.ssd.segment_size_bytes = getenv_size("UMBP_SSD_SEGMENT_SIZE", cfg.ssd.segment_size_bytes);
     cfg.ssd.shard_io_threads = getenv_int("UMBP_SSD_SHARD_IO_THREADS", cfg.ssd.shard_io_threads);
     cfg.ssd.tier_io_threads = getenv_int("UMBP_SSD_TIER_IO_THREADS", cfg.ssd.tier_io_threads);
+    cfg.ssd.io.read_rings = getenv_size("UMBP_SSD_READ_RINGS", cfg.ssd.io.read_rings);
     cfg.ssd.direct_io = getenv_int("UMBP_SSD_DIRECT_IO", cfg.ssd.direct_io ? 1 : 0) != 0;
     cfg.ssd.single_flight_reads =
         getenv_int("UMBP_SSD_SINGLE_FLIGHT", cfg.ssd.single_flight_reads ? 1 : 0) != 0;

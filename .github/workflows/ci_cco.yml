@@ -253,6 +253,34 @@ jobs:
             cd $GITHUB_WORKSPACE && \
             timeout 1800 pytest -v -s tests/python/cco/test_gemm_ar_bench.py"
 
+      # After the GEMM+AR steps on purpose. Each of these spawns 8-rank SDMA
+      # process groups, and their queues take seconds to come back; the gemm_ag
+      # tests settle and retry around that (anvil.cpp), the gemm_ar ones do not,
+      # so running gemm_ar right after this step fails in hsaKmtCreateQueueExt.
+      - name: Run CCO GEMM+AG op and kernel tests (up to 8 ranks)
+        run: |
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.gemm_ag as g; print(g.__file__)' && \
+            timeout 2400 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag_op.py"
+
+      # After the GEMM+AR steps for the same reason as the step above:
+      # test_ag_gemm.py settles and retries around slow-to-return SDMA queues
+      # (anvil.cpp); the gemm_ar tests do not.
+      - name: Run CCO AG+GEMM numerics, back to back (up to 8 ranks)
+        run: |
+          # From /tmp for the packaging reason above. test_ag_gemm.py drives the
+          # kernels through the benchmark: every mode against an fp32 reference
+          # for two operand sets, then calls back to back with a different rank
+          # held each time -- the race the closing barrier is for.
+          # test_ag_gemm_op.py is the public AgGemmOp, from one 8-rank spawn.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.ag_gemm as g; print(g.AgGemmOp)' && \
+            timeout 1500 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_ag_gemm.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_ag_gemm_op.py"
+
       - name: Validate CCO ROCm runtime import order
         run: |
           $CT exec $CONTAINER bash -c "\
