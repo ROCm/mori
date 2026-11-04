@@ -12,7 +12,7 @@ set(MORI_KIWI_SOURCES
 set_source_files_properties(${MORI_KIWI_SOURCES} PROPERTIES LANGUAGE HIP)
 
 add_library(mori_kiwi STATIC ${MORI_KIWI_SOURCES})
-target_include_directories(mori_kiwi PUBLIC ${CMAKE_SOURCE_DIR}/include
+target_include_directories(mori_kiwi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/queue)
 target_link_libraries(mori_kiwi PUBLIC hip::host hsa-runtime64::hsa-runtime64)
 set_target_properties(mori_kiwi PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_STANDARD 17
