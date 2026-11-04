@@ -137,6 +137,13 @@ one NIC memory region, so on 4 KiB pages keep a part within 1 GiB, the AINIC
 limit above, or back the arenas with hugepages
 (`UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES`).
 
+A caller buffer the NIC registered, a GPU's KV cache in particular, skips the
+arena altogether (`UMBP_DISTRIBUTED_RANGED_DIRECT`): the NIC on the GPU's own
+PCIe switch moves each range between the GPU and the peer's tier, so the leg
+stays on the GPU's socket by construction and no copy crosses the host. That
+NIC is one per GPU, and the peer has to answer on the NIC of the same rail
+(`MORI_IO_RAIL_AFFINITY=1`) or several of its NICs converge on that one.
+
 ## Measured effect
 
 One MI355X node (two sockets, eight GPUs), DeepSeek-V4-Pro at TP8, SGLang with
