@@ -103,7 +103,8 @@ These options are read once when an op is constructed:
      - ``0``. Set ``1`` to fold receive waits into the copy passes. One wave
        per CTA waits, then an acquire and CTA barrier release the copy waves.
    * - ``MORI_ASYNCLL_FUSED_RECV_CTAS``
-     - ``0``, meaning half the device's compute units. Grid ceiling for the
+     - ``0``, meaning half the compute units this process may use: the
+       device's, or its share under ``HSA_CU_MASK``. Grid ceiling for the
        fused receive copies; ignored unless ``MORI_ASYNCLL_FUSED_RECV=1``.
 
 The first three variables accept ``0`` or ``1``. Skipping the reset or fusing
@@ -124,9 +125,13 @@ its peers inside every CTA, so its whole grid stays resident for the wait. When
 two micro-batches overlap on two streams (two-batch overlap), that grid can
 crowd out the send pass the other stream must run before any peer's wait can
 end, and the ranks deadlock. The grid ceiling makes this unlikely but cannot
-rule it out if the other stream occupies most of the device. On MI355X, two
-streams gained nothing from fusion over early notification, so dual-stream
-callers should use early notification alone.
+rule it out: it is sized from the compute units the process may use, not from
+those another stream, kernel or process is occupying at the time.
+
+Do not combine receive fusion with micro-batches on two streams, especially
+when the device may be shared. On MI355X, two streams gained nothing from
+fusion over early notification, so dual-stream callers should use early
+notification alone, which is the gfx950 default.
 
 MORI Shmem (Symmetric Memory)
 -------------------------------

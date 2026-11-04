@@ -129,6 +129,47 @@ def _geometry_from_env(name):
 _ASYNCLL_SDMA_QUEUE_CAP = {"mi308x": 3}
 
 
+def _hsa_cu_mask_cus(device_index: int, mp_count: int):
+    """CUs HSA_CU_MASK leaves this process on `device_index`, or None if unrestricted.
+
+    ROCr's syntax is `<gpus>:<cus>[;<gpus>:<cus>...]`, each side a comma list of
+    decimal indices or `a-b` ranges, e.g. `0-7:0-63`. GPU indices are ROCr's
+    enumeration order, which is the HIP/torch order unless HIP_VISIBLE_DEVICES
+    reorders devices. A setting this cannot read returns None, so the ceiling
+    falls back to the whole device rather than failing the op.
+    """
+    raw = os.environ.get("HSA_CU_MASK", "").strip()
+    if not raw:
+        return None
+
+    def indices(text):
+        out = set()
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            lo, sep, hi = part.partition("-")
+            lo, hi = int(lo), int(hi) if sep else int(lo)
+            if lo < 0 or hi < lo:
+                raise ValueError(part)
+            out.update(range(lo, hi + 1))
+        return out
+
+    try:
+        for entry in raw.split(";"):
+            if not entry.strip():
+                continue
+            gpus, _, cus = entry.partition(":")
+            if device_index in indices(gpus):
+                found = indices(cus)
+                if mp_count > 0:
+                    found = {c for c in found if c < mp_count}
+                return len(found)
+    except ValueError:
+        return None
+    return None
+
+
 def _asyncll_sdma_queues(model, gpu_per_node: int) -> int:
     """How many SDMA queues per pair to ask cco for, 0 to leave the env default.
 
@@ -1383,10 +1424,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return (2 if fused else int(early)), skip_reset
 
     @staticmethod
-    def _asyncll_fused_recv_ctas(mode):
+    def _asyncll_fused_recv_ctas(mode, device_index=0, mp_count=0):
         # Grid ceiling for the fused receive copies; 0 lets the native factory
-        # pick half the device. Only a tuning override: the default exists so
-        # that fusion cannot starve another stream's sends into a deadlock.
+        # pick half the device. MORI_ASYNCLL_FUSED_RECV_CTAS is only a tuning
+        # override: the default exists so that fusion cannot starve another
+        # stream's sends into a deadlock.
         name = "MORI_ASYNCLL_FUSED_RECV_CTAS"
         value = os.environ.get(name, "0")
         try:
@@ -1395,7 +1437,19 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ctas = -1
         if ctas < 0:
             raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
-        return ctas if mode == 2 else 0
+        if mode != 2:
+            return 0
+        if ctas > 0:
+            return ctas
+        # "Half the device" has to mean half of what this process can use. The
+        # native default is mpCount / 2, and mpCount is the whole device even when
+        # HSA_CU_MASK leaves the process a fraction of it: at 64 of 256 CUs two
+        # 128-CTA fused grids fill every slot, and the ranks deadlock as if there
+        # were no ceiling at all.
+        usable = _hsa_cu_mask_cus(device_index, mp_count)
+        if usable is not None and 0 < usable < mp_count:
+            return max(usable // 2, 1)
+        return 0
 
     @classmethod
     def _asyncll_seq(cls, cfg, mode=0):
@@ -1454,7 +1508,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # KernelSet.self_resets_counters with it), and AsyncLL's RecvCopy
         # always assigned the count. Still parsed so existing settings validate.
         self._asyncll_mode, _ = self._asyncll_options(cfg, self._arch)
-        self._asyncll_fused_ctas = self._asyncll_fused_recv_ctas(self._asyncll_mode)
+        self._asyncll_fused_ctas = self._asyncll_fused_recv_ctas(
+            self._asyncll_mode, self._device_index, self._multi_processor_count
+        )
         sequences = self._asyncll_seq(cfg, self._asyncll_mode)
         for group, names in sequences.items():
             for name in names:

@@ -118,6 +118,26 @@ class AsyncLLOptionsTest(unittest.TestCase):
                 ):
                     resolve(2)
 
+    def test_fused_receive_ceiling_follows_the_cu_mask(self):
+        resolve = EpDispatchCombineOpHip._asyncll_fused_recv_ctas
+        for env, dev, expected in [
+            ({}, 0, 0),  # unrestricted: the native default, half the device
+            ({"HSA_CU_MASK": "0-7:0-63"}, 3, 32),
+            ({"HSA_CU_MASK": "1:0-15,32-47;0:0-127"}, 1, 16),
+            ({"HSA_CU_MASK": "1:0-15,32-47;0:0-127"}, 0, 64),
+            ({"HSA_CU_MASK": "1:0-63"}, 0, 0),  # mask names other GPUs only
+            ({"HSA_CU_MASK": "0:0-511"}, 0, 0),  # not a restriction
+            ({"HSA_CU_MASK": "0:0x0f"}, 0, 0),  # unreadable: whole device
+            ({"HSA_CU_MASK": "0-7:0-63", "MORI_ASYNCLL_FUSED_RECV_CTAS": "48"}, 0, 48),
+        ]:
+            with (
+                self.subTest(env=env, dev=dev),
+                patch.dict(os.environ, env, clear=True),
+            ):
+                self.assertEqual(resolve(2, dev, 256), expected)
+        with patch.dict(os.environ, {"HSA_CU_MASK": "0-7:0-63"}, clear=True):
+            self.assertEqual(resolve(1, 0, 256), 0)
+
     def test_reject_inconsistent_or_invalid_options(self):
         for option in ("MORI_ASYNCLL_FUSED_RECV", "MORI_ASYNCLL_SKIP_RESET"):
             with self.subTest(option=option), self.assertRaises(ValueError):
