@@ -601,7 +601,6 @@ class Sdma:
     # template arguments as compile-time keywords (coop, aggregate, and for the
     # broadcast local_signal / remote_signal). They post from ONE issuer: thread
     # scope serializes the active lanes, warp/block scope lets the leader post.
-    # They trap on gfx12.5, whose packet layouts are not validated.
 
     def post_wait_mem(
         self,

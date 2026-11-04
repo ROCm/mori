@@ -372,7 +372,6 @@ CCO_DEV uint64_t cco_sdma_signal_slot(uint64_t dc, int src, int qid) {
 // Aggregate opt flag (the broadcast also the two signals), so `flags` is the
 // SdmaFlags subset below; any other bit traps. A compile-time constant `flags`
 // folds to one instantiation once inlined, as for cco_sdma_put_ptr__<coop>.
-// On gfx12.5 these trap when reached (the packet layouts are not validated).
 namespace {
 template <typename Fn>
 inline __device__ void SdmaWaitWithFlags(int flags, Fn&& fn) {
