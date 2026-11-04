@@ -119,8 +119,6 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   // Every block reads the launch generation before counting in at Phase 4; only
   // the tail owner (the last b=1 count) advances it.
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
-  auto bcastFlag = [=](uint32_t b) { return &groupCtr[kBcastFlagIdx + b]; };
-
   constexpr int vecSize = VecBytes / sizeof(T);
   const uint32_t S = 1u << logS;
 
@@ -131,9 +129,11 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       // Read the counters BEFORE arriving: no block of this launch can count in
       // until peers scatter to me, which needs my arrival. The previous launch's
       // counts are visible across the kernel boundary.
-      for (uint32_t b = 0; b < 2; b++) {
-        flagEpoch[b] = AtomicLoad<ESystemScope>(bcastFlag(b)) + gridDim.x;
-      }
+      // Both counters in one 64-bit load: they are adjacent and 8B-aligned.
+      const auto flags = AtomicLoad<EAgentScope>(
+                 reinterpret_cast<const uint64_t*>(&groupCtr[kBcastFlagIdx]));
+      flagEpoch[0] = static_cast<uint32_t>(flags) + gridDim.x;
+      flagEpoch[1] = static_cast<uint32_t>(flags >> 32) + gridDim.x;
       // Blocks of this launch read the b=1 target only after their last slice
       // wait, which is causally behind the barrier below; the release fence
       // orders this store before my arrival.
@@ -167,32 +167,24 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
               dstP, sigP, BarrierGate(barrierCtr, peer), static_cast<uint32_t>(pushGen - 1)};
         });
 
-    // Pre-post both broadcasts behind the scatter, each parked on its counter
-    // until every block has counted in at Phase 4. b=0: slices [0, S-1); b=1: the last slice (the whole
-    // shard at S==1, where b=0 does not exist).
-    // Both broadcasts go out per peer as one reservation and one doorbell.
-    const uint32_t epoch0 = flagEpoch[0], epoch1 = flagEpoch[1];
-    SdmaPostPerPeer(devComm.sdma, npes, myPe, S > 1 ? 4 : 2,
-        [=](int peer, int sub, uint32_t* q, uint64_t base) {
-          const uint64_t* bcastSlot = PeerPtr(arrived + myPe * kArrivedStride + kBcastArrived,
-                                              peer, myPe, stride4G);
-          
-          // My reduced shard lives in output slot myPe (at the uniform stride offset).
-          T* __restrict__ myShard = output + myPe * strideElems;
-          const size_t myElems = shardLen(myPe),
-                       sliceLen = ((myElems >> logS) / vecSize) * vecSize,
-                       lastOfs = (S - 1) * sliceLen; 
-          auto* peerDst = PeerPtr(reinterpret_cast<uint8_t*>(myShard), peer, myPe, stride4G);
-          if (S > 1) {
-            WriteGatedBroadcast(sub, q, base, myShard, peerDst,
-                          lastOfs * sizeof(T), bcastSlot, pushGen,
-                          bcastFlag(0), epoch0);
-            base += 2 * kSDMACopySignalPkt;
-          }
-          WriteGatedBroadcast(sub, q, base, myShard + lastOfs,
-                              peerDst + lastOfs * sizeof(T),
-                             (myElems - lastOfs) * sizeof(T),
-                              bcastSlot + 1, pushGen, bcastFlag(1), epoch1);
+    // Pre-post both broadcasts of my reduced shard (output slot myPe) behind the
+    // scatter, each parked on its counter until every block has counted in at
+    // Phase 4. b=0: slices [0, S-1); b=1: the last slice (the whole shard at
+    // S==1, where b=0 does not exist). Both go out per peer as one reservation
+    // and one doorbell.
+    const size_t myElems = shardLen(myPe),
+          lastOfs = (S - 1) * (((myElems >> logS) / vecSize) * vecSize) * sizeof(T);
+    auto* myShard = reinterpret_cast<uint8_t*>(output + myPe * strideElems);
+
+    // One gated piece of every peer's copy: bytes [ofs, ofs+bytes) of src/dst,
+    // held back by a POLL_REGMEM until *gate == gateValue.
+    StartSdmaGatedCopies(devComm.sdma, npes, pushGen, S, lastOfs, myElems * sizeof(T), 
+        groupCtr + kBcastFlagIdx, flagEpoch,
+        [=](int peer) {
+          auto [dstP, sigP] = PeerPtrs(myShard, 
+                                arrived + myPe * kArrivedStride + kBcastArrived,
+                                peer, myPe, stride4G);
+          return ScatterPeer{peer != myPe, 0, myShard, dstP, sigP};
         });
   }
 
@@ -232,8 +224,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       // count releases the pre-posted copy with no further step. System scope:
       // the SDMA engine must observe the RMW.
       if (threadIdx.x == 0) {
-        uint32_t old = __hip_atomic_fetch_add(cco::impl::global(bcastFlag(b)), 1u,
-                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        uint32_t old = AtomicAdd<ESystemScope>(&groupCtr[kBcastFlagIdx + b], 1u);
         if (b == 1) {
           ownsTail = (old + 1 == AtomicLoad<EAgentScope>(&groupCtr[kBcastTargetIdx]));
         }
