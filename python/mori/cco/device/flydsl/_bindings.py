@@ -124,6 +124,7 @@ SDMA_POST_WAIT_SIGNAL = {
 SDMA_PUT_BROADCAST = {
     s: _binding(f"sdma_put_broadcast_{s}") for s in ("thread", "warp", "block")
 }
+cco_sdma_post_wait_mem_put_ptr_thread = _binding("sdma_post_wait_mem_put_ptr_thread")
 
 # ── axis-free symbols ──
 # cco_lsa_ptr(window, peerLsaRank, offset) -> peer's load/store-accessible VA.

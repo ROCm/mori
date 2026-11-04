@@ -81,6 +81,7 @@ Everything hangs off `ccoSdma sdma{devComm}`, constructed per kernel.
 | `putBroadcast(peer, dstWin, dstOff, peer2, dstWin2, dstOff2, srcWin, srcOff, bytes, queueId)` | one local source to two destinations in a single packet |
 | `postWaitMem(peer, queueId, win, off, value, cmp, mask)` | park a queue until a local flag holds — the engine polls, not a CU |
 | `postWaitSignal(peer, queueId, srcRank, sigQueueId, expected)` | `postWaitMem` on a signal slot |
+| `postWaitMemPutPtr<l, r>(peer, queueId, win, off, value, cmp, mask, dst, src, bytes)` | `postWaitMem` + `putPtr` in one reservation and one doorbell |
 
 `put`/`get` are non-blocking: they place a packet and (unless `Aggregate`) ring
 the doorbell. Nothing has happened when they return — you must drain.
@@ -363,6 +364,27 @@ Sharp edges: the queue is blocked until the condition holds, so anything else
 posted to it waits too, and a flag that never arrives parks it for good (retry is
 unbounded). A full ring spins the poster until the wait clears. Give a waiting queue
 its own `queueId`.
+
+### postWaitMemPutPtr
+
+```cpp
+// lane p: copy my block to peer p once p has stored this call's epoch in my ready[p];
+// the engine waits, the kernel exits right after posting
+sdma.postWaitMemPutPtr<false, true>(p, q, ctrlWin, READY_OFF + 4 * p, epoch, ccoSdmaCmpEq,
+                                    0xFFFFFFFFu, dstOnPeer, src, bytes);
+```
+
+`postWaitMem<Aggregate>` + `putPtr<Aggregate>` + `commit` in one reservation and
+one doorbell: cheaper to post, same flag-to-copy latency. Thread scope; lanes on
+distinct queues post in parallel. `dst` is the peer's memory as mapped here
+(`lsa_ptr`), `win`/`offset` the local flag; `bytes == 0` posts wait + signals,
+and nothing without a signal. Over `CCO_SDMA_MAX_COPY_BYTES` (~1 GiB) it posts
+wait + chunked put + commit, one lane at a time, so on a shared queue each lane's
+copy waits only for its own flag and those of lanes posted before it.
+Use it when the flag is usually not there yet; a wait that already holds still
+costs ~1.6 µs over a plain `put`, so check the flag on the CU first if it usually
+is: read it once, plain `put` if it already holds, this post if not (example 12). Use `Eq` on a per-call epoch: the engine compares unsigned, so `Ge` on a
+running total misbehaves across the u32 wrap. The postWaitMem caveats apply.
 
 ### putBroadcast
 

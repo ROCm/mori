@@ -639,6 +639,57 @@ class Sdma:
             sdma_flags(coop, aggregate=_const(aggregate, "aggregate")),
         )
 
+    def post_wait_mem_put_ptr(
+        self,
+        peer,
+        qid,
+        win,
+        offset,
+        value,
+        dst_ptr,
+        src_ptr,
+        nbytes,
+        *,
+        cmp=SdmaCmp.EQ,
+        mask=0xFFFFFFFF,
+        local_signal=False,
+        remote_signal=False,
+        aggregate=False,
+    ):
+        """``post_wait_mem`` + ``put_ptr`` on queue ``(peer, qid)`` in one
+        reservation and one doorbell. The copy of ``nbytes`` from ``src_ptr``
+        (ours) to ``dst_ptr`` (``peer``'s memory as mapped here, e.g.
+        ``Window.lsa_ptr``) and its signals run once ``(*flag & mask) <cmp>
+        value`` holds, ``flag`` being ``win[offset:]`` on THIS GPU; the kernel
+        may exit right after posting. Thread scope; ``nbytes == 0`` posts the
+        wait and signals only, and nothing at all without a signal;
+        ``aggregate=True`` leaves the doorbell to ``commit``. The queue is
+        blocked until the condition holds: give it its own ``qid``. Lanes on
+        distinct queues post in parallel, lanes on one queue in turn. A copy
+        over ``CCO_SDMA_MAX_COPY_BYTES`` (~1 GiB) is posted as wait + chunked
+        put + commit, one lane at a time. An engine wait that already holds
+        still costs more than a CU read: if the flag is often set, read it once
+        and ``put_ptr`` when it holds (example 12)."""
+        raw.cco_sdma_post_wait_mem_put_ptr_thread(
+            self.dev_comm,
+            peer,
+            qid,
+            _win(win),
+            offset,
+            value,
+            _const(cmp, "cmp"),
+            mask,
+            dst_ptr,
+            src_ptr,
+            nbytes,
+            sdma_flags(
+                CoopScope.THREAD,
+                local_signal=_const(local_signal, "local_signal"),
+                remote_signal=_const(remote_signal, "remote_signal"),
+                aggregate=_const(aggregate, "aggregate"),
+            ),
+        )
+
     def post_wait_signal(
         self,
         peer,

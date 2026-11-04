@@ -14,6 +14,10 @@
 # --------------------------------------------------------------------------
 
 find_library(_TEST_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
+add_executable(test_kv_indexer_reporter test_kv_indexer_reporter.cpp)
+target_link_libraries(test_kv_indexer_reporter PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_kv_indexer_reporter PRIVATE cxx_std_17)
+add_test(NAME umbp_kv_indexer_reporter COMMAND test_kv_indexer_reporter)
 # The flavor src/umbp/CMakeLists.txt picks: umbp_common brings that one in, and a
 # test linking the other as well would load two copies of gRPC. Its gRPC targets
 # are not visible from this directory, hence the second find_package.
@@ -686,3 +690,12 @@ endif()
 target_link_libraries(
   bench_umbp_gds_ssd_get
   PRIVATE umbp_core umbp_common hip::host ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})
+
+# Virtual storage and modeled transfers through the production control plane; no GPU needed.
+add_executable(test_umbp_sim test_sim.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_sim PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(test_umbp_sim PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
+                                           ${_TEST_GRPCPP_LIB} GTest::gtest_main)
+add_test(NAME umbp_sim COMMAND test_umbp_sim)

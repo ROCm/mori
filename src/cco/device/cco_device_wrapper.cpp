@@ -466,6 +466,27 @@ CCO_DEF_SDMA_PUT_BROADCAST(thread, ccoCoopThread)
 CCO_DEF_SDMA_PUT_BROADCAST(warp, ccoCoopWarp)
 CCO_DEF_SDMA_PUT_BROADCAST(block, ccoCoopBlock)
 #undef CCO_DEF_SDMA_PUT_BROADCAST
+
+// Fused wait + put: ccoSdma::postWaitMemPutPtr (POLL_REGMEM, COPY and its
+// signals in one reservation, one doorbell). Thread scope only. `flags`:
+// LOCAL_SIGNAL / REMOTE_SIGNAL / AGGREGATE; other bits trap, as does a bad cmp.
+CCO_DEV int cco_sdma_post_wait_mem_put_ptr__thread(uint64_t dc, int peer, int qid, uint64_t win,
+                                                   uint64_t off, uint64_t value, int cmp,
+                                                   uint64_t mask, uint64_t dst, uint64_t src,
+                                                   uint64_t n, int flags) {
+  Sdma sdma{*AsDevComm(dc)};
+  if (static_cast<uint32_t>(cmp) > static_cast<uint32_t>(ccoSdmaCmpGt)) __builtin_trap();
+  const auto w = AsWindow(win);
+  void* d = reinterpret_cast<void*>(dst);
+  void* s = reinterpret_cast<void*>(src);
+  const auto c = static_cast<ccoSdmaCmp>(cmp);
+  const auto v = static_cast<uint32_t>(value), m = static_cast<uint32_t>(mask);
+  SdmaBroadcastWithFlags(flags, [&](auto local, auto remote, auto opt) {
+    sdma.postWaitMemPutPtr<decltype(local)::value, decltype(remote)::value, decltype(opt)::value>(
+        peer, qid, w, off, v, c, m, d, s, n);
+  });
+  return 0;
+}
 #endif  // BUILD_CCO_SDMA
 
 // ── ccoDevComm field accessors ──

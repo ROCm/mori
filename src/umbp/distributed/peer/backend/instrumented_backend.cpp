@@ -162,6 +162,15 @@ std::vector<CommitResult> InstrumentedBackend::BatchCommit(const std::vector<Com
     }
   }
   if (bytes > 0) ops_[kCommit].bytes.fetch_add(bytes, std::memory_order_relaxed);
+  if (bytes > 0) {
+    auto callback = std::atomic_load(&change_hook_);
+    if (callback && *callback) {
+      std::vector<std::string> keys;
+      keys.reserve(reqs.size());
+      for (const auto& req : reqs) keys.push_back(req.key);
+      (*callback)(keys);
+    }
+  }
   return out;
 }
 
@@ -234,6 +243,7 @@ std::vector<EvictResult> InstrumentedBackend::Evict(const std::vector<std::strin
     }
   }
   if (bytes > 0) ops_[kEvict].bytes.fetch_add(bytes, std::memory_order_relaxed);
+  if (bytes > 0) NotifyChange(keys);
   return out;
 }
 

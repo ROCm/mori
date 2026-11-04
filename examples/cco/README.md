@@ -22,6 +22,9 @@ examples/cco/
 | `python/08_torch_symm_import` | py | import a `torch.symm_mem` tensor into the flat LSA space, no copy |
 | `python/09_torch_symm_lsa_all2all` | py | mori's own torch symm-mem backend + Triton `lsa_ptr` all-to-all |
 | `python/10_flydsl_sdma_allgather_async` | py | FlyDSL SDMA all-gather split into `start_async` / `wait_async`, overlapped with a GEMM |
+| `python/11_flydsl_mega_moe_sdma` | py | MegaMoE stage2 + combine (gfx950) with the transfer done by SDMA: GEMM2 writes a rank-sorted send buffer and comm waves (one per peer) inside the GEMM kernel `put` it; `mega_moe_gemm2_with_sdma.py` is the op and its kernels, `gemm2_8wave.py` an 8-wave persistent GEMM2 for it (`--gemm2 8wave`), `main.py` its test and benchmark against aiter (needs aiter) |
+| `python/11_flydsl_mega_moe_sdma/sdma_bandwidth.py` | py | what one cco SDMA channel moves, with no GEMM in the way |
+| `python/12_flydsl_sdma_allgather_engine_wait` | py | In-place all-gather over run-time regions; the recommended `post_wait_mem_put_ptr` use: read each peer's READY once, plain put if it is there, else the copy engine (not a CU) waits for it |
 | `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA device APIs |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (includes only `cco_scale_out.hpp`) |
@@ -88,6 +91,74 @@ Example 10 bootstraps with `torchrun` instead of MPI and needs SDMA:
 ```bash
 MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
   examples/cco/python/10_flydsl_sdma_allgather_async/main.py
+```
+
+Example 11 also uses `torchrun` and SDMA, and additionally needs aiter (it reuses
+`MegaMoEV2` for the reference and the GEMM2 mainloop) on a gfx950 node with 8 GPUs.
+`--gemm2` picks the GEMM2 kernel: `aiter` (aiter's GEMM2 main loop with comm
+workgroups in front) or `8wave` (an 8-wave 256x256 persistent GEMM2 whose
+workgroup 0 is the comm workgroup; fp8, `remote` signalling, one queue -- the
+defaults). Both share the plan, the window and the combine:
+
+```bash
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/11_flydsl_mega_moe_sdma/main.py test --network glm52 --bs 4096 --gemm2 8wave
+
+# latency vs aiter's MegaMoEV2 (mori.shmem P2P scatter), sweeping token counts
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/11_flydsl_mega_moe_sdma/main.py bench --network glm52 \
+  --bs-list 128,512,2048,4096,8192,16384 --no-aligned-pair --gemm2 aiter,8wave
+
+# what one SDMA channel actually moves, to size the above against the hardware
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/11_flydsl_mega_moe_sdma/sdma_bandwidth.py
+```
+
+It is worth it only at large per-rank batches. `stage2+combine` against aiter,
+eager, fp8 transport, `--chunk-tiles 16`, glm52 on 8x MI355, matching aiter's
+output exactly (relL2 0) at every size (`--no-aligned-pair` for 8192 and up):
+
+| tokens/rank | 128 | 512 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|---|
+| vs aiter | 0.71x | 0.78x | 1.01x | **1.12x** | **1.23x** | **1.35x** |
+
+Below ~2048 the fixed costs of the extra plan kernel and of the combine outweigh
+what the copy engine saves, and aiter's P2P scatter wins.
+
+The 8-wave GEMM2 against the default one, same harness (aiter `f0b96f49e`, mori
+`c7da62db`, eager, `--chunk-tiles 16`, `--no-aligned-pair`, bit-exact at every size):
+
+| tokens/rank | 512 | 2048 | 4096 | 8192 |
+|---|---|---|---|---|
+| v4_pro, `--gemm2 aiter` | 0.82x | 0.98x | 1.08x | 1.19x |
+| v4_pro, `--gemm2 8wave` | 0.71x | **1.28x** | **1.40x** | **1.59x** |
+| glm52, `--gemm2 aiter` | 0.75x | 1.00x | 1.26x | 1.37x |
+| glm52, `--gemm2 8wave` | 0.77x | **1.17x** | **1.40x** | **1.39x** |
+
+It helps most where GEMM2 is largest (v4_pro, `inter_dim` 3072); the same kernel
+is aiter's opt-in `MegaMoEV2(stage2_sdma=True)` path (ROCm/aiter#7196).
+
+The send/landing layout is exact: the plan kernel reads aiter's all-gathered
+route counts, so every rank's run starts and lands at its real offset and nothing
+is reserved per rank pair. The landing buffer holds at most a rank's own routes and
+never overflows; the send buffer is `--send-slack` (default 4) times the even
+share, capped by the 32-bit buffer-resource range. With fp8 transport a row past
+it is not dropped: the plan marks it and GEMM2 writes it into the origin rank's
+`comb_inp` in aiter's own P2P layout, so skewed routing stays exact. That path is
+slow, but only a rank receiving more than `--send-slack` times the average takes
+it: with `test --hot-bias 1.0` (v4_pro, bs=4096) stage2+combine is 5.3 ms
+(`--gemm2 aiter`) / 4.6 ms (`8wave`) against aiter's 4.35 ms, where a per-pair
+reservation took 15 ms. With bf16 transport (`--quant none`) such rows are still
+dropped and `test` fails.
+
+Example 12 also uses `torchrun` and SDMA. Its start kernel reads each peer's READY
+once and posts a plain put when it is already set, `post_wait_mem_put_ptr` (the
+copy engine waits) when it is not; `--mode cu` spins a CU on READY instead, and
+`--skew-us` makes the last rank late:
+
+```bash
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/12_flydsl_sdma_allgather_engine_wait/main.py --skew-us 200
 ```
 
 `MORI_CCO_GDA_CONN=full` is required for GDA (03, 06) when both ranks share one

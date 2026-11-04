@@ -39,6 +39,7 @@
 #endif
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/nic_limits.h"
 #include "umbp/common/numa_config.h"
 #include "umbp/common/parallel_for.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
@@ -128,23 +129,23 @@ PageBackend::PageBackend(TierType tier, uint64_t page_size, OwnershipConfig owne
                   std::make_unique<HostPageMemorySource>(HostPageMemorySource::Options{
                       ownership.use_hugepages, ownership.hugepage_size, ownership.numa_nodes,
                       ownership.prefault, ownership.numa_strict, ownership.prefault_threads}),
-                  ownership.buffer_sizes, pending_ttl, read_lease_ttl, reaper_interval) {
-  buffer_numa_nodes_ = NormalizeNumaNodes(std::move(ownership.numa_nodes));
-  max_mr_bytes_ = ownership.max_mr_bytes;
-}
+                  ownership.buffer_sizes, pending_ttl, read_lease_ttl, reaper_interval,
+                  ownership.max_mr_bytes, ownership.numa_nodes) {}
 
 PageBackend::PageBackend(TierType tier, uint64_t page_size,
                          std::unique_ptr<PageMemorySource> source,
                          std::vector<uint64_t> buffer_sizes, std::chrono::milliseconds pending_ttl,
                          std::chrono::milliseconds read_lease_ttl,
-                         std::chrono::milliseconds reaper_interval)
+                         std::chrono::milliseconds reaper_interval, uint64_t max_mr_bytes,
+                         std::vector<int> numa_nodes)
     : tier_(tier),
       page_size_(page_size),
       pending_ttl_(pending_ttl),
       read_lease_ttl_(read_lease_ttl),
       reaper_interval_(reaper_interval),
       source_(std::move(source)),
-      source_buffer_sizes_(std::move(buffer_sizes)) {
+      source_buffer_sizes_(std::move(buffer_sizes)),
+      max_mr_bytes_(max_mr_bytes) {
   if (page_size == 0) {
     throw std::invalid_argument("PageBackend: page_size must be > 0");
   }
@@ -155,6 +156,7 @@ PageBackend::PageBackend(TierType tier, uint64_t page_size,
   // runs for the TierConfig constructor too, where there is no source.
   buffer_loc_ = source_->LocationType();
   buffer_device_ = source_->Device();
+  buffer_numa_nodes_ = NormalizeNumaNodes(std::move(numa_nodes));
   // Not yet configured — allocator_ stays null until Init() self-allocates.
 }
 
@@ -281,6 +283,12 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
         TransferRef ref = registrar->RegisterMemory(base, size, loc, device);
         owned_refs_.push_back(ref);
         if (ref.HasMemoryDesc()) {
+          WarnIfNicRegionExceedsAinicLimit(
+              "DRAM buffer " + std::to_string(b) + " region at " + std::to_string(offset >> 20) +
+                  " MiB",
+              size, buffer.backing_page_size,
+              "Use UMBP_DRAM_USE_HUGEPAGES, or a UMBP_DRAM_MAX_MR_BYTES of at most 2^18 pages "
+              "(1 GiB of 4 KiB ones).");
           msgpack::sbuffer sbuf;
           msgpack::pack(sbuf, ref.mem);
           desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
