@@ -95,7 +95,8 @@ class WindowAScaleLoader(AScaleLoader):
                 if group < fx.Int32(groups_per_row):
                     lane = self._tx & fx.Int32(63)
                     packed = _load_row_map_subgroup(
-                        self._row_map_rsrc, tile_row_base_i32 + row, lane
+                        self._row_map_rsrc, tile_row_base_i32 + row, lane,
+                        padded_groups_per_row,
                     )
                     source_row = packed & fx.Int32(0xFFFFFF)
                     v = buf_copy_load(

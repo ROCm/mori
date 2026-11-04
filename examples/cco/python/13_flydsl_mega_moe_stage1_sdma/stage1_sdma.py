@@ -63,6 +63,12 @@ from aiter.ops.flydsl.kernels.mega_moe.quant import (
     GROUP,
 )
 
+# Same fallback as example 11: older aiter has no comm_ops.traced.
+if not hasattr(comm_ops, "traced"):
+    from flydsl.compiler.ast_rewriter import ASTRewriter
+
+    comm_ops.traced = ASTRewriter.transform
+
 PREP_BLOCK = 512
 PREP_WAVES = PREP_BLOCK // 64
 #: Row stores go through to memory (sc0|sc1), so retiring them is the release the copy
