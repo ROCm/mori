@@ -65,6 +65,7 @@ def main():
     )
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--time-iters", type=int, default=0)
+    ap.add_argument("--profile-prepare", type=int, default=0)
     args = ap.parse_args()
 
     rank, world, device = ex11._setup()
@@ -117,9 +118,22 @@ def main():
         torch.cuda.synchronize()
 
         # How many routes the ranks have for my experts: local_hist[ge] summed over sources.
-        hist_all = [torch.zeros(world * epr, dtype=torch.int32) for _ in range(world)]
-        dist.all_gather(hist_all, ws["local_hist"][: world * epr].cpu())
-        expect_rows = int(torch.stack(hist_all)[:, rank * epr : (rank + 1) * epr].sum())
+        segs = (
+            world * epr + world
+        )  # expert segments, then one fanout-group segment per destination
+        hist_all = [torch.zeros(segs, dtype=torch.int32) for _ in range(world)]
+        dist.all_gather(hist_all, ws["local_hist"][:segs].cpu())
+        hist_all = torch.stack(hist_all)
+        expect_rows = int(hist_all[:, rank * epr : (rank + 1) * epr].sum())
+        # The fanout-group segments: ``route_push`` does not cover them, so rows there would be
+        # silently missing from the comparison below (their srcmap stays -1).
+        group_rows = int(hist_all[:, world * epr + rank].sum())
+        if group_rows:
+            errors += 1
+            print(
+                f"[rank {rank}] {group_rows} rows sit in fanout-group segments, which the route push does not write",
+                flush=True,
+            )
 
         srcmap = prep.srcmap
         got = (srcmap != -1).nonzero().flatten()
@@ -170,6 +184,38 @@ def main():
                     flush=True,
                 )
             print(f"rank 0 received {got.numel()} expert-major rows", flush=True)
+        if args.profile_prepare:
+            from torch.profiler import ProfilerActivity, profile
+
+            chunks_from = [
+                -(-int(cnt_all[s][rank]) // args.chunk_rows) if s != rank else 0
+                for s in range(world)
+            ]
+
+            def one():
+                torch.cuda.synchronize()
+                dist.barrier()
+                prep.run(x, ids, wts, plan)
+                prep.post_rest()
+                prep.wait(chunks_from)
+
+            for _ in range(3):
+                one()
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                for _ in range(args.profile_prepare):
+                    one()
+            for e in prof.key_averages():
+                if "stage1_sdma_prepare" in e.key:
+                    us = torch.tensor(
+                        [e.device_time_total / e.count], dtype=torch.float64
+                    )
+                    dist.all_reduce(us)
+                    if rank == 0:
+                        print(
+                            f"prepare kernel GPU time bs={args.bs}: {float(us) / world:.1f} us (mean over ranks and {e.count} calls)",
+                            flush=True,
+                        )
+
         if args.time_iters:
             chunks_from = [
                 -(-int(cnt_all[s][rank]) // args.chunk_rows) if s != rank else 0

@@ -45,6 +45,7 @@ from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
@@ -64,14 +65,25 @@ from aiter.ops.flydsl.kernels.mega_moe.quant import (
 
 PREP_BLOCK = 512
 PREP_WAVES = PREP_BLOCK // 64
-#: i32 slots between two chunk-completion counters: one 128 B cache line each, because
-#: every quantised row of a chunk bumps its counter.
-CDONE_STRIDE = 32
 #: Row stores go through to memory (sc0|sc1), so retiring them is the release the copy
 #: engine needs; see ``gemm2_8wave.SEND_CM`` in example 11.
 SEND_CM = 1 | 16
 BAR_STRIDE = 32  # ints per tree_barrier counter: one 128 B cache line
 BAR_GROUP = 32  # blocks per tree_barrier group
+
+
+def memrealtime():
+    """The 100 MHz wall clock (``s_memrealtime``), read through inline asm with a side effect:
+    as an intrinsic two reads are one expression and get merged. For ``trace``."""
+    return fx.Int64(
+        _llvm.InlineAsmOp(
+            T.i64,
+            [],
+            "s_memrealtime $0\ns_waitcnt lgkmcnt(0)",
+            "=s",
+            has_side_effects=True,
+        ).res
+    )
 
 
 def _align16(n):
@@ -156,11 +168,6 @@ class Arena:
     def total_bytes(self):
         return self.off_flags + _align128(self.npes * 4)
 
-    @property
-    def cdone_words(self):
-        """i32 slots of the counters of the early chunks of ONE run (one cache line each)."""
-        return self.early_chunks * CDONE_STRIDE
-
     def check(self):
         # The quant kernel addresses S through one 32-bit buffer-resource offset.
         if self.n_rows * self.row_bytes >= 1 << 32:
@@ -212,11 +219,11 @@ def tree_barrier(bar_addr, nblocks, tid, bid):
     fx.barrier()
 
 
-def _quant_group(x_rsrc, in_dword, s_rsrc, out_byte, scale_byte):
-    """One 32-value group of a bf16 row -> 32 fp8 bytes and one e8m0 scale in ``S``.
+def _quantize_group(x_rsrc, in_dword):
+    """One 32-value group of a bf16 row -> its e8m0 scale and its 32 fp8 values (8 i32 words).
 
-    The numbers of ``quant.emit_per_1x32_mx_fp8_group``; only the stores differ: they
-    are written through (``SEND_CM``) at byte offsets of the send buffer.
+    The numbers of ``quant.emit_per_1x32_mx_fp8_group``. The row is quantised ONCE and then
+    stored to every rank that gets it (``_store_group``).
     """
     act = []
     local_max = fx.Float32(1e-10)
@@ -235,6 +242,24 @@ def _quant_group(x_rsrc, in_dword, s_rsrc, out_byte, scale_byte):
     biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
     e8m0 = (mantissa != fx.Int32(0)).select(biased_exp + fx.Int32(1), biased_exp)
     e8m0 = (e8m0 > fx.Int32(255)).select(fx.Int32(255), e8m0)
+    quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
+    scaled = [act[k] * quant_scale for k in range_constexpr(GROUP)]
+    words = []
+    for word in range_constexpr(8):
+        base = word * 4
+        packed = rocdl.cvt_pk_fp8_f32(
+            T.i32, scaled[base], scaled[base + 1], fx.Int32(0), 0
+        )
+        packed = rocdl.cvt_pk_fp8_f32(
+            T.i32, scaled[base + 2], scaled[base + 3], packed, 1
+        )
+        words.append(packed)
+    return e8m0, words
+
+
+def _store_group(s_rsrc, e8m0, words, out_byte, scale_byte):
+    """A quantised group into ``S`` at byte offsets of the send buffer, written through
+    (``SEND_CM``)."""
     buffer_store(
         e8m0.to(fx.Int8),
         s_rsrc,
@@ -242,21 +267,9 @@ def _quant_group(x_rsrc, in_dword, s_rsrc, out_byte, scale_byte):
         cache_modifier=SEND_CM,
         offset_is_bytes=True,
     )
-    quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
-    scaled = [act[k] * quant_scale for k in range_constexpr(GROUP)]
     for half in range_constexpr(2):
-        words = []
-        for word in range_constexpr(4):
-            base = (half * 4 + word) * 4
-            packed = rocdl.cvt_pk_fp8_f32(
-                T.i32, scaled[base], scaled[base + 1], fx.Int32(0), 0
-            )
-            packed = rocdl.cvt_pk_fp8_f32(
-                T.i32, scaled[base + 2], scaled[base + 3], packed, 1
-            )
-            words.append(packed)
         buffer_store(
-            fx.Vector.from_elements(words, fx.Int32),
+            fx.Vector.from_elements(words[half * 4 : half * 4 + 4], fx.Int32),
             s_rsrc,
             out_byte + fx.Int32(half * 16),
             cache_modifier=SEND_CM,
@@ -303,7 +316,7 @@ def post_rest_chunks(sdma, win, wave, lane, cnt, *, rank, arena, cco):
                 )
 
 
-def build_prepare(*, rank, arena, epr, quant_blocks, route_push):
+def build_prepare(*, rank, arena, epr, quant_blocks, route_push, trace=False):
     """The new prepare, one resident kernel: plan, route push, quantise into ``S``, put.
 
     Workgroup 0 is the comm workgroup, the other ``quant_blocks`` quantise; every
@@ -341,27 +354,23 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push):
     block bumps ``flags[rank]`` on ``dst``: a destination has all of mine once it has seen
     ``epr`` bumps per call.
 
-    **Quantise and put.** A quant WAVE takes one row at a time (its 64 lanes share the row's
-    ``hidden / 32`` groups). The rows are taken chunk-major over the peers -- chunk 0 of
-    every peer, then chunk 1 -- and the rows for this rank last, so the first chunks are the
-    first to be complete::
+    **Quantise and put.** A quant WAVE takes one TOKEN at a time (its 64 lanes share the row's
+    ``hidden / 32`` groups): the bf16 row is read and quantised once and the result stored to
+    its row in every run it is in (a token goes to ~4.6 ranks on average, so the bf16 is read
+    once instead of ~4.6 times). A first pass takes the tokens that have a row in an early chunk
+    of another rank's run, so those chunks are complete first; a second pass takes the rest.
 
-        item i < rounds * (npes - 1) * chunk_rows : (chunk c, peer rank+1+dd, row r)
-        item i >= that                            : row i - that of my own run
-
-    (Only the early chunks have to come first; the rest of the order does not matter.)
-
-    A row of one of the first ``early_chunks`` chunks, once its stores have retired (they are
-    written through), bumps the counter ``cdone[d, c]`` of its chunk. Comm wave ``p`` (one per
-    peer, ``npes <= 8``) waits for each early chunk of run ``p`` to be complete, zeroes its
-    counter for the next call, and posts its put with a remote signal (``put_chunk``).
+    A grid rendezvous after the first pass makes every early row visible, and comm wave ``p``
+    (one per peer, ``npes <= 8``) then posts the puts of run ``p``'s early chunks with a remote
+    signal (``put_chunk``), with nothing to check. The route push and the second quant pass run
+    after that rendezvous, so neither delays the first puts.
     **Those are the only puts prepare posts**: posting is not free (about 50 us of the kernel
     when it posted every chunk), and the other chunks are put by the GEMM1 kernel's comm
     workgroup (``post_rest_chunks``), off prepare's critical path. The put names a fixed place in the peer's ``R``; nothing is waited for on
     the receiver.
 
-    Counters ``hist``, ``cursor``, ``cdone`` start at zero and are left at zero; the barrier
-    counters ``bar`` are never reset.
+    Counters ``hist`` and ``cursor`` start at zero and are left at zero; the barrier counters
+    ``bar`` are never reset.
     """
     import mori.cco.device.flydsl as cco
 
@@ -377,7 +386,6 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push):
         raise ValueError(f"one comm wave per peer needs npes <= {PREP_WAVES}")
     rb = arena.row_bytes
     groups = hidden // GROUP
-    per_round = (npes - 1) * CR
     E = npes * epr
     nblocks = quant_blocks + 1
     nthreads = nblocks * PREP_BLOCK
@@ -385,6 +393,7 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push):
     bar2_off = (
         (n_bar_groups + 1) * BAR_STRIDE * 4
     )  # the second barrier's counters, in bytes
+    bar3_off = 2 * bar2_off
     lds_bytes = 3 * E * 4  # per-block counts | per-expert bases | per-block cursors
 
     @fx.struct
@@ -393,19 +402,29 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push):
 
     # fmt: off
     @flyc.kernel(name=f"stage1_sdma_prepare_p{npes}_r{rank}_e{epr}_k{topk}_h{hidden}_c{cap}_cr{CR}"
-                      f"_q{quant_blocks}_rp{int(route_push)}", known_block_size=[PREP_BLOCK, 1, 1])
+                      f"_q{quant_blocks}_rp{int(route_push)}_tr{int(trace)}", known_block_size=[PREP_BLOCK, 1, 1])
     def prepare(arg_ids: fx.Int64, arg_x: fx.Int64, arg_row_tok: fx.Int64, arg_rowpos: fx.Int64,
-                arg_cnt: fx.Int64, arg_cum: fx.Int64, arg_cdone: fx.Int64, arg_hist: fx.Int64,
+                arg_cnt: fx.Int64, arg_cum: fx.Int64, arg_hist: fx.Int64,
                 arg_cursor: fx.Int64, arg_bar: fx.Int64, arg_s: fx.Int64, arg_dev_comm: fx.Int64,
                 arg_win: fx.Int64, arg_pair_order: fx.Int64, arg_pair_base: fx.Int64,
                 arg_local_hist: fx.Int64, arg_my_base: fx.Int64, arg_wts: fx.Int64,
-                tokens: fx.Int32):
+                arg_trace: fx.Int64, tokens: fx.Int32):
     # fmt: on
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         wave = tid // fx.Int32(64)
         lane = tid % fx.Int32(64)
         gtid = bid * fx.Int32(PREP_BLOCK) + tid
+
+        trace_buf = ptr_buf_tensor(arg_trace, fx.Int64)
+
+        def stamp(buf, slot):
+            """``buf[slot]`` = the clock, written by thread 0 of the block."""
+            if const_expr(trace):
+                if tid == fx.Int32(0):
+                    buf[slot] = memrealtime()
+
+        stamp(trace_buf, bid * fx.Int32(4))
         ids = ptr_buf_tensor(arg_ids, fx.Int32)
         row_tok = ptr_buf_tensor(arg_row_tok, fx.Int32)
         rowpos = ptr_buf_tensor(arg_rowpos, fx.Int32)
@@ -413,7 +432,6 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push):
         cum = ptr_buf_tensor(arg_cum, fx.Int32)
         hist = ptr_buf_tensor(arg_hist, fx.Int32)
         cursor = ptr_buf_tensor(arg_cursor, fx.Int32)
-        cdone_addr = fx.Int64(arg_cdone)
         hist_addr = fx.Int64(arg_hist)
         cursor_addr = fx.Int64(arg_cursor)
         lds = fx.SharedAllocator().allocate(PrepShared).peek()
@@ -452,6 +470,7 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push):
             if v > fx.Int32(0):
                 comm_ops.atomic_add_agent(hist_addr + fx.Int64(g) * fx.Int64(4), v)
         tree_barrier(fx.Int64(arg_bar), fx.Int32(nblocks), tid, bid)
+        stamp(trace_buf, bid * fx.Int32(4) + fx.Int32(1))
 
         # ---- plan 2: bases (and, in block 0, cum and cnt)
         if tid < fx.Int32(npes):
@@ -489,14 +508,66 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push):
                     row_tok[fx.Int32(dd * cap) + pos] = t
                 rowpos[t * fx.Int32(npes) + fx.Int32(dd)] = pos
         tree_barrier(fx.Int64(arg_bar) + fx.Int64(bar2_off), fx.Int32(nblocks), tid, bid)
+        stamp(trace_buf, bid * fx.Int32(4) + fx.Int32(2))
         if bid == fx.Int32(0):
             # Nobody reads hist or cursor any more: leave them zero for the next call.
             for g in range(tid, fx.Int32(E), fx.Int32(PREP_BLOCK)):
                 hist[g] = fx.Int32(0)
                 cursor[g] = fx.Int32(0)
 
-        def cdone_slot(d, c):
-            return cdone_addr + fx.Int64((d * fx.Int32(arena.early_chunks) + c) * fx.Int32(CDONE_STRIDE * 4))
+        x_rsrc = create_buffer_resource_from_addr(fx.Int64(arg_x))
+        s_rsrc = create_buffer_resource_from_addr(
+            fx.Int64(arg_s), num_records_bytes=arena.n_rows * rb
+        )
+        waves = fx.Int32(quant_blocks * PREP_WAVES)
+        first = (bid - fx.Int32(1)) * fx.Int32(PREP_WAVES) + wave
+        early_rows = arena.early_chunks * CR
+        group_rounds = (groups + 63) // 64
+
+        def quant_pass(early_pass):
+            """A wave takes one TOKEN at a time: its bf16 row is read and quantised once and
+            stored to its row in every run it is in. ``early_pass`` takes only the tokens with a
+            row in an early chunk of another rank's run, so those chunks are complete as early as
+            possible; the pass after it takes the rest. Nothing is waited for per token: the
+            rendezvous below drains the early rows, and the later ones are read by the next
+            kernel's puts."""
+            for t in range(first, tokens, waves):
+                t = fx.Int32(t)
+                ps = [rowpos[t * fx.Int32(npes) + fx.Int32(dd)] for dd in range_constexpr(npes)]
+                n_rows = fx.Int32(0)
+                n_early = fx.Int32(0)
+                for dd in range_constexpr(npes):
+                    n_rows = n_rows + (ps[dd] >= fx.Int32(0)).select(fx.Int32(1), fx.Int32(0))
+                    if dd != rank:
+                        n_early = n_early + (
+                            (ps[dd] >= fx.Int32(0)) & (ps[dd] < fx.Int32(early_rows))
+                        ).select(fx.Int32(1), fx.Int32(0))
+                want = (n_early > fx.Int32(0)) if early_pass else (n_early == fx.Int32(0))
+                if (n_rows > fx.Int32(0)) & want:
+                    x_dword = t * fx.Int32(hidden // 2)
+                    q = []
+                    for k in range_constexpr(group_rounds):
+                        g = lane + fx.Int32(64 * k)
+                        # past the last group a lane reads group 0 and stores nothing
+                        gc = (g < fx.Int32(groups)).select(g, fx.Int32(0))
+                        q.append(_quantize_group(x_rsrc, x_dword + gc * fx.Int32(GROUP // 2)))
+                    for dd in range_constexpr(npes):
+                        if ps[dd] >= fx.Int32(0):
+                            s_row = (fx.Int32(dd * cap) + ps[dd]) * fx.Int32(rb)
+                            for k in range_constexpr(group_rounds):
+                                g = lane + fx.Int32(64 * k)
+                                if g < fx.Int32(groups):
+                                    _store_group(
+                                        s_rsrc, q[k][0], q[k][1],
+                                        s_row + g * fx.Int32(GROUP), s_row + fx.Int32(hidden) + g,
+                                    )
+
+        if bid != fx.Int32(0):
+            quant_pass(True)
+        # Every early row is written through and retired from here on (the rendezvous waits on
+        # the store counters), so the comm workgroup can put the early chunks with nothing else
+        # to check. The route push and the rest of the quant follow it, off that critical path.
+        tree_barrier(fx.Int64(arg_bar) + fx.Int64(bar3_off), fx.Int32(nblocks), tid, bid)
 
         if bid == fx.Int32(0):
             peer = wave
@@ -504,19 +575,14 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push):
                 n = cnt[peer]
                 n_chunks = (n + fx.Int32(CR - 1)) // fx.Int32(CR)
                 early = (n_chunks < fx.Int32(arena.early_chunks)).select(n_chunks, fx.Int32(arena.early_chunks))
-                for c in range(fx.Int32(0), early, fx.Int32(1)):
-                    c = fx.Int32(c)
-                    rows = (n - c * fx.Int32(CR) < fx.Int32(CR)).select(n - c * fx.Int32(CR), fx.Int32(CR))
-                    if lane == fx.Int32(0):
-                        comm_ops.spin_until_ge_i32_agent(cdone_slot(peer, c), rows)
-                        # Every row of the chunk has counted: leave the counter zero for the next call.
-                        comm_ops.store_i32_global_agent_release(cdone_slot(peer, c), fx.Int32(0))
-                    comm_ops.fence_agent_acquire()
-                    if lane == fx.Int32(0):
+                if lane == fx.Int32(0):
+                    for c in range(fx.Int32(0), early, fx.Int32(1)):
                         put_chunk(
-                            cco.DevComm(arg_dev_comm).sdma(), arg_win, peer, c, n,
+                            cco.DevComm(arg_dev_comm).sdma(), arg_win, peer, fx.Int32(c), n,
                             rank=rank, arena=arena, cco=cco,
                         )
+                    if const_expr(trace):
+                        trace_buf[fx.Int32(4 * nblocks) + peer] = memrealtime()
         else:
             if const_expr(route_push):
                 pair_order = ptr_buf_tensor(arg_pair_order, fx.Int32)
@@ -562,58 +628,24 @@ def build_prepare(*, rank, arena, epr, quant_blocks, route_push):
                         comm_ops.fence_system_release()
                         comm_ops.atomic_add_system(flag, fx.Int32(1))
 
-            x_rsrc = create_buffer_resource_from_addr(fx.Int64(arg_x))
-            s_rsrc = create_buffer_resource_from_addr(
-                fx.Int64(arg_s), num_records_bytes=arena.n_rows * rb
-            )
-            max_remote = fx.Int32(0)
-            for d in range_constexpr(npes):
-                if d != rank:
-                    max_remote = (cnt[fx.Int32(d)] > max_remote).select(cnt[fx.Int32(d)], max_remote)
-            rounds = (max_remote + fx.Int32(CR - 1)) // fx.Int32(CR)
-            remote_items = rounds * fx.Int32(per_round)
-            total = remote_items + cnt[fx.Int32(rank)]
-            waves = fx.Int32(quant_blocks * PREP_WAVES)
-            first = (bid - fx.Int32(1)) * fx.Int32(PREP_WAVES) + wave
+            quant_pass(False)
 
-            for i in range(first, total, waves):
-                i = fx.Int32(i)
-                is_local = i >= remote_items
-                c = i // fx.Int32(per_round)
-                rem = i - c * fx.Int32(per_round)
-                dd = rem // fx.Int32(CR)
-                d = is_local.select(fx.Int32(rank), (fx.Int32(rank + 1) + dd) % fx.Int32(npes))
-                row = is_local.select(i - remote_items, c * fx.Int32(CR) + (rem - dd * fx.Int32(CR)))
-                if row < cnt[d]:
-                    t = row_tok[d * fx.Int32(cap) + row]
-                    s_row = (d * fx.Int32(cap) + row) * fx.Int32(rb)
-                    for g in range(lane, fx.Int32(groups), fx.Int32(64)):
-                        g = fx.Int32(g)
-                        _quant_group(
-                            x_rsrc,
-                            t * fx.Int32(hidden // 2) + g * fx.Int32(GROUP // 2),
-                            s_rsrc,
-                            s_row + g * fx.Int32(GROUP),
-                            s_row + fx.Int32(hidden) + g,
-                        )
-                    # Written through: once every lane's stores have retired the row is in
-                    # memory, which is the release the copy engine needs.
-                    rocdl.s_waitcnt(vmcnt=0)
-                    if (lane == fx.Int32(0)) & (is_local == fx.Int32(0)) & (row < fx.Int32(arena.early_chunks * CR)):
-                        comm_ops.atomic_add_agent(cdone_slot(d, row // fx.Int32(CR)), fx.Int32(1))
+        if const_expr(trace):
+            fx.barrier()
+            stamp(trace_buf, bid * fx.Int32(4) + fx.Int32(3))
 
     # fmt: off
     @flyc.jit
     def launch(arg_ids: fx.Int64, arg_x: fx.Int64, arg_row_tok: fx.Int64, arg_rowpos: fx.Int64,
-               arg_cnt: fx.Int64, arg_cum: fx.Int64, arg_cdone: fx.Int64, arg_hist: fx.Int64,
+               arg_cnt: fx.Int64, arg_cum: fx.Int64, arg_hist: fx.Int64,
                arg_cursor: fx.Int64, arg_bar: fx.Int64, arg_s: fx.Int64, arg_dev_comm: fx.Int64,
                arg_win: fx.Int64, arg_pair_order: fx.Int64, arg_pair_base: fx.Int64,
                arg_local_hist: fx.Int64, arg_my_base: fx.Int64, arg_wts: fx.Int64,
-               tokens: fx.Int32, stream: fx.Stream):
+               arg_trace: fx.Int64, tokens: fx.Int32, stream: fx.Stream):
     # fmt: on
-        prepare(arg_ids, arg_x, arg_row_tok, arg_rowpos, arg_cnt, arg_cum, arg_cdone, arg_hist,
+        prepare(arg_ids, arg_x, arg_row_tok, arg_rowpos, arg_cnt, arg_cum, arg_hist,
                 arg_cursor, arg_bar, arg_s, arg_dev_comm, arg_win, arg_pair_order, arg_pair_base,
-                arg_local_hist, arg_my_base, arg_wts, tokens).launch(
+                arg_local_hist, arg_my_base, arg_wts, arg_trace, tokens).launch(
             grid=(nblocks, 1, 1), block=(PREP_BLOCK, 1, 1), stream=stream
         )
 
@@ -699,6 +731,7 @@ class Stage1SdmaPrepare:
         chunk_rows,
         early_chunks=1,
         quant_blocks=None,
+        trace=False,
     ):
         import torch
         from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements
@@ -732,16 +765,15 @@ class Stage1SdmaPrepare:
         self.row_tok = torch.empty(self.npes * max_tok, **i32)
         self.cnt = torch.empty(self.npes, **i32)
         self.cum = torch.empty(self.npes * self.epr, **i32)
-        # Left at zero by every call, so zero from the start: chunk counters, the plan's
-        # counters; and the grid barrier's, which are never reset.
-        self.cdone = torch.zeros(self.npes * a.cdone_words, **i32)
+        # Left at zero by every call, so zero from the start: the plan's counters; and the grid
+        # barriers', which are never reset.
         self.hist = torch.zeros(experts, **i32)
         self.cursor = torch.zeros(experts, **i32)
         # One block per CU for the quant waves, less the comm workgroup.
         n_cu = torch.cuda.get_device_properties(dev).multi_processor_count
         self.quant_blocks = n_cu - 1 if quant_blocks is None else quant_blocks
         n_groups = (self.quant_blocks + 1 + BAR_GROUP - 1) // BAR_GROUP
-        self.bar = torch.zeros(2 * (n_groups + 1) * BAR_STRIDE, **i32)
+        self.bar = torch.zeros(3 * (n_groups + 1) * BAR_STRIDE, **i32)
         # Running totals the wait kernel waits for: signals per source, then route flags.
         self.expected = torch.zeros(2 * self.npes, **i32)
         # The signal totals as they were before this call: its chunks count from here.
@@ -754,6 +786,14 @@ class Stage1SdmaPrepare:
         self.wts = from_gpu_ptr(self.mem.ptr + a.off_wts, (a.max_routes,), torch.int32)
         self.srcmap = from_gpu_ptr(
             self.mem.ptr + a.off_srcmap, (a.max_routes,), torch.int32
+        )
+        # ``trace``: per block [start, count done, plan done, end] of the last call, then the time
+        # each early put to peer p was posted, at ``4 * nblocks + p`` (the 100 MHz clock).
+        self.trace = trace
+        self.trace_buf = (
+            torch.zeros(4 * (self.quant_blocks + 1) + 32, dtype=torch.int64, device=dev)
+            if trace
+            else None
         )
         self._prepares = {}
         self._post_rest = build_post_rest(rank=self.rank, arena=a)
@@ -786,6 +826,7 @@ class Stage1SdmaPrepare:
                 epr=self.epr,
                 quant_blocks=self.quant_blocks,
                 route_push=route_push,
+                trace=self.trace,
             )
         s = fx.Stream((stream or torch.cuda.current_stream()).cuda_stream)
         a = self.arena
@@ -801,7 +842,6 @@ class Stage1SdmaPrepare:
                     self.rowpos,
                     self.cnt,
                     self.cum,
-                    self.cdone,
                     self.hist,
                     self.cursor,
                     self.bar,
@@ -812,6 +852,7 @@ class Stage1SdmaPrepare:
             fx.Int64(self.win.handle),
             *(fx.Int64(p) for p in tables),
             fx.Int64(wts.data_ptr() if route_push else 0),
+            fx.Int64(self.trace_buf.data_ptr() if self.trace else 0),
             fx.Int32(tokens),
             s,
         )

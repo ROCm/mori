@@ -59,7 +59,12 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_buf_tensor,
 )
 
-from stage1_sdma import Arena, post_rest_chunks
+from stage1_sdma import Arena, memrealtime, post_rest_chunks
+
+
+#: ``trace``: int64 slots per workgroup, and work items recorded per workgroup (8 + 3 * items).
+TRACE_STRIDE = 128
+TRACE_ITEMS = 40
 
 
 class WindowAScaleLoader(AScaleLoader):
@@ -128,7 +133,7 @@ def compile_gemm1_sdma(
     pipe_weights: bool = True, mfma_amajor: bool = True, swizzle_a: bool = True,
     async_a_copy: bool = True, use_tile_resource: bool = True, waves_per_eu_hint: int = 2,
     b_cache_modifier: int = 0, swiglu_limit: float = 0.0, num_cu: int = 256,
-    gate_arena: Arena | None = None, gate_rank: int = 0,
+    gate_arena: Arena | None = None, gate_rank: int = 0, trace: bool = False,
 ):
     # fmt: on
     """Persistent GEMM1, one workgroup per CU, flat (m tile, n tile) work item per step.
@@ -143,6 +148,11 @@ def compile_gemm1_sdma(
       (``need``, and the SDMA signal counters, which count from ``sig_base``). A tile whose
       chunks have landed starts at once, so the GEMM runs while later chunks are in flight.
       Beyond one cache invalidation at the start there is no fence: see the comment there.
+
+    ``trace`` (with ``gate_arena``): thread 0 of each workgroup writes the clock (100 MHz) to
+    ``trace[bid * TRACE_STRIDE + ...]``: ``[0]`` kernel start, ``[1]`` start gate passed (flags),
+    ``[2]`` end, ``[3]`` its number of work items, and from ``[8]`` per item ``(gate start, gate
+    passed, item done)``, up to ``TRACE_ITEMS`` items. Workgroup 0 (comm): start and end only.
     """
     gate_npes = gate_arena.npes if gate_arena else 0
     gate_epr = gate_arena.experts_per_rank if gate_arena else 0
@@ -169,14 +179,14 @@ def compile_gemm1_sdma(
         A_scale: fx.Array[fx.Int8, n_scale_bytes, 16]
 
     # fmt: off
-    @flyc.kernel(name=f"stage1_sdma_gemm1_t{sort_block_m}x{tile_n}_rb{row_bytes}_r{expert_offset}",
+    @flyc.kernel(name=f"stage1_sdma_gemm1_t{sort_block_m}x{tile_n}_rb{row_bytes}_r{expert_offset}_tr{int(trace)}",
                  known_block_size=[total_threads, 1, 1])
     def kernel(
         out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_w: fx.Tensor, tile_row_base: fx.Tensor,
         tile_input_base: fx.Tensor, expert_ids: fx.Tensor, num_valid_ids: fx.Tensor,
         out_scale: fx.Tensor, rowmap: fx.Tensor, nvm: fx.Int32, arg_dev_comm: fx.Int64,
         arg_win: fx.Int64, arg_sig_base: fx.Int64, arg_expected: fx.Int64, arg_win_handle: fx.Int64,
-        arg_cnt: fx.Int64,
+        arg_cnt: fx.Int64, arg_trace: fx.Int64,
     ):
     # fmt: on
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -226,6 +236,16 @@ def compile_gemm1_sdma(
         total_work = ((num_valid + fx.Int32(sort_block_m - 1)) // fx.Int32(sort_block_m)) * fx.Int32(n_tiles)
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
+
+        trace_buf = ptr_buf_tensor(arg_trace, fx.Int64)
+
+        def stamp(buf, slot):
+            """``buf[bid * TRACE_STRIDE + slot]`` = the clock, written by thread 0."""
+            if const_expr(trace and gate_npes):
+                if tid == fx.Int32(0):
+                    buf[bid * fx.Int32(TRACE_STRIDE) + slot] = memrealtime()
+
+        stamp(trace_buf, fx.Int32(0))
         if const_expr(gate_npes):
             import mori.cco.device.flydsl as cco
 
@@ -235,7 +255,11 @@ def compile_gemm1_sdma(
         def run_tile(flat):
             m_tile = flat // fx.Int32(n_tiles)
             n_tile = flat - m_tile * fx.Int32(n_tiles)
+            # item number of this work item in this workgroup (the loop below is a static stride)
+            item = (flat - (bid - fx.Int32(1))) // fx.Int32(num_cu - 1)
+            slot0 = (item < fx.Int32(TRACE_ITEMS)).select(fx.Int32(8) + item * fx.Int32(3), fx.Int32(TRACE_STRIDE - 3))
             if const_expr(gate_npes):
+                stamp(trace_buf, slot0)
                 e_local = sched.expert_of(m_tile)
                 if (tid < fx.Int32(gate_npes)) & (tid != fx.Int32(gate_rank)):
                     need = fx.Int32(
@@ -249,12 +273,15 @@ def compile_gemm1_sdma(
                         tid, 0, fx.Int64(sig_base[tid] + need)
                     )
                 fx.barrier()
+                stamp(trace_buf, slot0 + fx.Int32(1))
             do_tile(
                 m_tile, n_wave_base + n_tile * fx.Int32(tile_n), sched.expert_of(m_tile), sched,
                 a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf, a_scale_lds,
                 a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, pipe_weights,
                 mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, True, False,
             )
+            if const_expr(gate_npes):
+                stamp(trace_buf, slot0 + fx.Int32(2))
 
         if const_expr(gate_npes):
             if bid == fx.Int32(0):
@@ -263,6 +290,7 @@ def compile_gemm1_sdma(
                     tid % fx.Int32(64), ptr_buf_tensor(arg_cnt, fx.Int32),
                     rank=gate_rank, arena=gate_arena, cco=cco,
                 )
+                stamp(trace_buf, fx.Int32(2))
             else:
                 if tid < fx.Int32(gate_npes):
                     comm_ops.spin_until_ge_i32_system(
@@ -280,8 +308,14 @@ def compile_gemm1_sdma(
                 # by a neighbour's read. Measured: an acquire per tile, of any scope, cost
                 # ~90 us of 0.96 ms (it invalidates L2, with the weights in it).
                 comm_ops.fence_system_acquire()
+                stamp(trace_buf, fx.Int32(1))
                 for flat in range(bid - fx.Int32(1), total_work, fx.Int32(num_cu - 1)):
                     run_tile(flat)
+                stamp(trace_buf, fx.Int32(2))
+                if const_expr(trace):
+                    if tid == fx.Int32(0):
+                        n_items = (total_work - (bid - fx.Int32(1)) + fx.Int32(num_cu - 2)) // fx.Int32(num_cu - 1)
+                        trace_buf[bid * fx.Int32(TRACE_STRIDE) + fx.Int32(3)] = fx.Int64(n_items)
         else:
             for flat in range(bid, total_work, fx.Int32(num_cu)):
                 run_tile(flat)
@@ -293,11 +327,11 @@ def compile_gemm1_sdma(
                num_valid_ids: fx.Tensor, out_scale: fx.Tensor, rowmap: fx.Tensor, nvm: fx.Int32,
                arg_dev_comm: fx.Int64, arg_win: fx.Int64, arg_sig_base: fx.Int64,
                arg_expected: fx.Int64, arg_win_handle: fx.Int64, arg_cnt: fx.Int64,
-               stream: fx.Stream):
+               arg_trace: fx.Int64, stream: fx.Stream):
     # fmt: on
         kernel(out, x, w, scale_w, tile_row_base, tile_input_base, expert_ids, num_valid_ids,
                out_scale, rowmap, nvm, arg_dev_comm, arg_win, arg_sig_base, arg_expected,
-               arg_win_handle, arg_cnt,
+               arg_win_handle, arg_cnt, arg_trace,
                value_attrs={
                    "rocdl.waves_per_eu": waves_per_eu_hint,
                    "rocdl.flat_work_group_size": f"{total_threads},{total_threads}",
@@ -307,7 +341,7 @@ def compile_gemm1_sdma(
 
 
 def run_gemm1_sdma(out, window, w, scale_w, tile_row_base, tile_input_base, expert_ids,
-                   num_valid, out_scale, rowmap, nvm, stream, prep=None, **kwargs):
+                   num_valid, out_scale, rowmap, nvm, stream, prep=None, trace=None, **kwargs):
     """``window`` is ``[S | R]`` as fp8 ``[2 * n_rows, row_bytes]``; the others are the
     tensors of aiter's stage1 (``MegaMoEV2._s1_*`` and its dispatch op). With ``prep`` (a
     ``Stage1SdmaPrepare`` that has ``arm``-ed this call) the kernel waits for the data itself."""
@@ -318,10 +352,12 @@ def run_gemm1_sdma(out, window, w, scale_w, tile_row_base, tile_input_base, expe
         dev_comm, win, win_handle = prep.dev_comm.ptr, prep.mem.ptr, prep.win.handle
         sig_base, expected, cnt = prep.sig_base.data_ptr(), prep.expected.data_ptr(), prep.cnt.data_ptr()
     launch = compile_gemm1_sdma(
-        row_bytes=int(window.shape[1]), source_rows=int(window.shape[0]), **gate, **kwargs
+        row_bytes=int(window.shape[1]), source_rows=int(window.shape[0]), trace=trace is not None,
+        **gate, **kwargs,
     )
     _run_compiled(
         launch, out, window, w, scale_w, tile_row_base, tile_input_base, expert_ids, num_valid,
         out_scale, rowmap, fx.Int32(nvm), fx.Int64(dev_comm), fx.Int64(win), fx.Int64(sig_base),
-        fx.Int64(expected), fx.Int64(win_handle), fx.Int64(cnt), stream,
+        fx.Int64(expected), fx.Int64(win_handle), fx.Int64(cnt),
+        fx.Int64(trace.data_ptr() if trace is not None else 0), stream,
     )

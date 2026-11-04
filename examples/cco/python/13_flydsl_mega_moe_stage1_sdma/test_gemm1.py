@@ -46,7 +46,7 @@ import torch.distributed as dist  # noqa: E402
 from mori.cco import Communicator, UniqueId  # noqa: E402
 from mori.tensor_utils import from_gpu_ptr  # noqa: E402
 
-from gemm1_sdma import run_gemm1_sdma  # noqa: E402
+from gemm1_sdma import TRACE_ITEMS, TRACE_STRIDE, run_gemm1_sdma  # noqa: E402
 from stage1_sdma import Stage1SdmaPrepare  # noqa: E402
 
 
@@ -72,6 +72,49 @@ def gemm1_kwargs(moe, config):
     )
 
 
+def trace_metrics(pt, gt, nblocks, num_cu):
+    """One call's stamps (100 MHz ticks) -> microseconds. ``pt``: prepare's trace, ``gt``: GEMM1's.
+
+    Times are from the start of prepare on this GPU. The GEMM1 numbers are means over its
+    compute workgroups (all but workgroup 0)."""
+    us = 100.0
+    starts, ends = pt[0 : 4 * nblocks : 4], pt[3 : 4 * nblocks : 4]
+    plan_done = pt[2 : 4 * nblocks : 4]
+    p0 = starts.min()
+    puts = pt[4 * nblocks : 4 * nblocks + 8]
+    puts = puts[puts > 0]
+    g = gt.view(num_cu, TRACE_STRIDE)
+    cb = g[1:]
+    n_items = cb[:, 3].long()
+    items = cb[:, 8 : 8 + 3 * TRACE_ITEMS].view(num_cu - 1, TRACE_ITEMS, 3)
+    gate = (items[:, :, 1] - items[:, :, 0]).double() / us
+    comp = (items[:, :, 2] - items[:, :, 1]).double() / us
+    valid = torch.arange(TRACE_ITEMS).view(1, -1) < n_items.clamp(max=TRACE_ITEMS).view(
+        -1, 1
+    )
+    gate_sum = (gate * valid).sum(1)
+    comp_sum = (comp * valid).sum(1)
+    first_gate = gate[:, 0]
+    g_start = g[:, 0].min()
+    return dict(
+        plan_done=(plan_done.max() - p0).item() / us,
+        first_put=(puts.min() - p0).item() / us if len(puts) else float("nan"),
+        last_put=(puts.max() - p0).item() / us if len(puts) else float("nan"),
+        prep_end=(ends.max() - p0).item() / us,
+        gap=(g_start - ends.max()).item() / us,
+        comm_post=(g[0, 2] - g[0, 0]).item() / us,
+        start_wait=((cb[:, 1] - cb[:, 0]).double() / us).mean().item(),
+        start_wait_max=((cb[:, 1] - cb[:, 0]).double() / us).max().item(),
+        first_gate=first_gate.mean().item(),
+        gate_sum=gate_sum.mean().item(),
+        comp_sum=comp_sum.mean().item(),
+        items=n_items.double().mean().item(),
+        block_span=((cb[:, 2] - cb[:, 0]).double() / us).mean().item(),
+        gemm_span=((g[1:, 2].max() - g_start).item()) / us,
+        total=(g[1:, 2].max() - p0).item() / us,
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--network", choices=ex11.NETWORKS, default="glm52")
@@ -92,6 +135,12 @@ def main():
         help="repeat the poisoned gated call this many times",
     )
     ap.add_argument("--stall-test", action="store_true")
+    ap.add_argument(
+        "--trace",
+        type=int,
+        default=0,
+        help="trace this many calls: clock stamps inside prepare and GEMM1",
+    )
     ap.add_argument(
         "--skip-gemm1",
         action="store_true",
@@ -127,6 +176,7 @@ def main():
             max_tok=moe.mtpr,
             chunk_rows=args.chunk_rows,
             early_chunks=args.early_chunks,
+            trace=args.trace > 0,
         )
         a = prep.arena
         window = from_gpu_ptr(prep.mem.ptr, (2 * a.n_rows, a.row_bytes), torch.uint8)
@@ -227,6 +277,12 @@ def main():
                     flush=True,
                 )
 
+        gtrace = (
+            torch.zeros(moe._s1_num_cu * TRACE_STRIDE, dtype=torch.int64, device=device)
+            if args.trace
+            else None
+        )
+
         def call_gated():
             prep.run(x, ids, wts, plan)
             run_gemm1_sdma(
@@ -243,6 +299,7 @@ def main():
                 moe._s1_nvm,
                 stream,
                 prep=prep,
+                trace=gtrace,
                 **kwargs,
             )
 
@@ -344,6 +401,38 @@ def main():
             if rank == 0:
                 print(
                     f"stall test bs={args.bs}: GEMM1 with data arriving {float(m[0]) / world:.3f} ms, GEMM1 right after, all landed {float(m[1]) / world:.3f} ms",
+                    flush=True,
+                )
+
+        if args.trace:
+            nblocks = prep.quant_blocks + 1
+            rows = []
+            for it in range(args.trace + 2):
+                torch.cuda.synchronize()
+                dist.barrier()
+                prep.arm(chunks_from)
+                gtrace.zero_()
+                prep.trace_buf.zero_()
+                call_gated()
+                torch.cuda.synchronize()
+                if it >= 2:
+                    rows.append(
+                        trace_metrics(
+                            prep.trace_buf.cpu(), gtrace.cpu(), nblocks, moe._s1_num_cu
+                        )
+                    )
+            keys = list(rows[0])
+            med = torch.tensor(
+                [sorted(r[k] for r in rows)[len(rows) // 2] for k in keys],
+                dtype=torch.float64,
+            )
+            dist.all_reduce(med)
+            med /= world
+            if rank == 0:
+                m = dict(zip(keys, med.tolist()))
+                print(
+                    "TRACE bs=%d early=%d " % (args.bs, args.early_chunks)
+                    + " ".join(f"{k}={v:.1f}" for k, v in m.items()),
                     flush=True,
                 )
 
