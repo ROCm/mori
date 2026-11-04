@@ -75,7 +75,7 @@
 #include "mori/collective/collectives_facade.hpp"
 
 using namespace mori::cco;
-using namespace mori::collective;
+using namespace mori::ccl;
 using RsMode = CollectivesFacade::RsMode;
 
 // Headroom added on top of the facade heap when sizing the CCO comm's per-rank

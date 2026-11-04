@@ -43,7 +43,7 @@
 #include "mori/collective/XLA/reduce_ops.hpp"
 
 namespace mori {
-namespace collective {
+namespace ccl {
 
 namespace detail {
 
@@ -484,5 +484,5 @@ ReduceScatterPullKernel(int myPe, cco::ccoWindow_t heapWin,
   if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
 }
 
-} // namespace collective
+} // namespace ccl
 } // namespace mori

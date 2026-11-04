@@ -65,7 +65,7 @@
 #define FACADE_PRINTF(fmt, ...) \
       std::fprintf(stderr, "CollectivesFacade: " fmt "\n", ##__VA_ARGS__)
 namespace mori {
-namespace collective {
+namespace ccl {
 
 class CollectivesFacade {
 
@@ -562,7 +562,7 @@ private:
   PendingAsync pending_;
 };
 
-}  // namespace collective
+}  // namespace ccl
 }  // namespace mori
 
 #if defined(MORI_KERNELS_IMPL)

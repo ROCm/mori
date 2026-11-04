@@ -36,7 +36,7 @@
 #include "mori/collective/XLA/collectives_common.hpp"
 
 namespace mori {
-namespace collective {
+namespace ccl {
 
 namespace detail {
 
@@ -222,5 +222,5 @@ AllGatherPullKernel(int myPe, int npes, cco::ccoWindow_t heapWin,
   __syncthreads();
   if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, npes, stride4G);
 }
-} // namespace collective
+} // namespace ccl
 } // namespace mori

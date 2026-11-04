@@ -41,7 +41,7 @@
 #include "mori/collective/XLA/collectives_common.hpp"
 #include "mori/collective/XLA/all_gather_kernels.hpp" // for detail::PullCopyInterleaved
 namespace mori {
-namespace collective {
+namespace ccl {
 
 // Single-block, compute-free all-to-all.
 //   srcPtrs : npes local symmetric-heap pointers; srcPtrs[p] sent to peer p.
@@ -145,5 +145,5 @@ AllToAllPullKernel(int myPe, int npes, cco::ccoWindow_t heapWin,
   __syncthreads();
   if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, npes, stride4G);
 }
-} // namespace collective
+} // namespace ccl
 } // namespace mori

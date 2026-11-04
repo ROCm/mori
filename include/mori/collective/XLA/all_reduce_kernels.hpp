@@ -47,7 +47,7 @@
 #include "mori/collective/XLA/reduce_scatter_kernels.hpp"
 
 namespace mori {
-namespace collective {
+namespace ccl {
 // ---------------------------------------------------------------------------
 // Fused all-reduce kernel ("push").
 //
@@ -342,5 +342,5 @@ AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
   __syncthreads();
   if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
 }
-} // namespace collective
+} // namespace ccl
 } // namespace mori

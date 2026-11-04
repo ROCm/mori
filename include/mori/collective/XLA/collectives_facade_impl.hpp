@@ -62,7 +62,7 @@
 // ---------------------------------------------------------------------------
 
 namespace mori {
-namespace collective {
+namespace ccl {
 namespace detail {
 // Device-wide barrier: dummy no-op. The old shmem device barrier
 // (ShmemBarrierAllThread) assumed shmem init, which is incompatible with the
@@ -516,13 +516,13 @@ hipError_t CollectivesFacade::RunFence() {
   return hipSuccess;
 }
 
-}  // namespace collective
+}  // namespace ccl
 }  // namespace mori
 
 #else // !__HIP_DEVICE_COMPILE__ || __gfx942__ || __gfx950__ || __gfx1250__
 
 namespace mori {
-namespace collective {
+namespace ccl {
 
 hipError_t CollectivesFacade::RunReduceScatter(const void*, void*, size_t, DataType, ReduceOpKind,
                                                hipStream_t) {
@@ -553,7 +553,7 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void*, void*, size_t, i
 hipError_t CollectivesFacade::RunQuiet(hipStream_t) { return hipErrorNotSupported; }
 hipError_t CollectivesFacade::RunFence() { return hipErrorNotSupported; }
 
-}  // namespace collective
+}  // namespace ccl
 }  // namespace mori
 
 #endif // !__HIP_DEVICE_COMPILE__ || __gfx942__ || __gfx950__ || __gfx1250__
