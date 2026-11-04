@@ -314,10 +314,10 @@ def _store_split(pay, sca, e8m0, words, out_byte, scale_byte):
         )
 
 
-def _put_chunk(sdma, win, peer, dst_row, lo, hi, *, arena, cco, signal):
-    """Rows ``[lo, hi)`` of my run for ``peer`` -- payload and scales -- into the rows starting
-    at ``dst_row`` of its receive arrays. Only the last chunk of a call signals: a queue is a
-    FIFO its engine drains in order, so that one signal covers everything sent this call.
+def _put_payload(sdma, win, peer, dst_row, lo, hi, *, arena, cco):
+    """Rows ``[lo, hi)`` of my run for ``peer`` -- the fp8 payload -- into the rows starting at
+    ``dst_row`` of its receive array. No signal: a queue is a FIFO its engine drains in order,
+    so the signal on the last scale put of a call covers everything sent before it.
     """
     n = fx.Int64(hi - lo)
     sdma.put(
@@ -334,6 +334,12 @@ def _put_chunk(sdma, win, peer, dst_row, lo, hi, *, arena, cco, signal):
         local_signal=False,
         remote_signal=False,
     )
+
+
+def _put_scales(sdma, win, peer, dst_row, lo, hi, *, arena, cco, signal):
+    """The e8m0 scales of rows ``[lo, hi)``: a group of chunks at a time, since the scales are
+    ~3% of a chunk and a put per chunk costs more than the bytes it moves."""
+    n = fx.Int64(hi - lo)
     sdma.put(
         peer,
         win,
@@ -350,7 +356,7 @@ def _put_chunk(sdma, win, peer, dst_row, lo, hi, *, arena, cco, signal):
     )
 
 
-def build_dispatch(*, rank, arena, epr, quant_blocks):
+def build_dispatch(*, rank, arena, epr, quant_blocks, scale_every=4):
     """One resident kernel: plan, claim room at the destinations, quantise, put, and wait.
 
     **Plan** (every block). Block ``b`` owns the token slice ``[b*T/nb, (b+1)*T/nb)``, counts
@@ -395,13 +401,14 @@ def build_dispatch(*, rank, arena, epr, quant_blocks):
     bar2_off = (n_bar_groups + 1) * BAR_STRIDE * 4
     group_rounds = (groups + 63) // 64
     maxc = arena.max_chunks
+    SE = scale_every
 
     @fx.struct
     class Shared:
         buf: fx.Array[Int8, _align(npes * 4, 16), 16]
 
     # fmt: off
-    @flyc.kernel(name=f"sdma_dispatch_p{npes}_r{rank}_h{hidden}_k{topk}_c{cap}_cr{CR}_q{quant_blocks}",
+    @flyc.kernel(name=f"sdma_dispatch_p{npes}_r{rank}_h{hidden}_k{topk}_c{cap}_cr{CR}_q{quant_blocks}_se{SE}",
                  known_block_size=[PREP_BLOCK, 1, 1])
     def kernel(arg_x: fx.Int64, arg_ids: fx.Int64, arg_wts: fx.Int64, arg_pos: fx.Int64,
                arg_block_cnt: fx.Int64, arg_cnt: fx.Int64, arg_cdone: fx.Int64,
@@ -427,6 +434,15 @@ def build_dispatch(*, rank, arena, epr, quant_blocks):
         # reuses a counter this call has already zeroed.
         callno = ptr_buf_tensor(arg_parity, fx.Int32)[fx.Int32(0)] + fx.Int32(1)
         parity = callno & fx.Int32(1)
+
+        # Say I have started this call (so I am done reading the last one) before the plan, so
+        # the round trip to the peers is hidden under it. A sender waits for this before it
+        # writes anything of mine: writing into a destination that has not would land on
+        # rows it has not read.
+        if (bid == fx.Int32(0)) & (tid < fx.Int32(npes)):
+            comm_ops.store_i32_global_system_release(
+                fx.Int64(w.lsa_ptr(tid, arena.off_cons)) + fx.Int64(rank * 4), callno
+            )
 
         per = (tokens + fx.Int32(nblocks - 1)) // fx.Int32(nblocks)
         t0 = bid * per
@@ -467,12 +483,7 @@ def build_dispatch(*, rank, arena, epr, quant_blocks):
             comm_ops.store_i32_lds(lds_base + fx.Int64(tid) * fx.Int64(4), base)
             if bid == fx.Int32(0):
                 cnt[tid] = total
-                # Say I have started this call (so I am done reading the last one), then wait
-                # for every destination to say the same: writing into one that has not would
-                # land on rows it has not read.
-                comm_ops.store_i32_global_system_release(
-                    fx.Int64(w.lsa_ptr(tid, arena.off_cons)) + fx.Int64(rank * 4), callno
-                )
+                # Wait for every destination to say it has started this call too.
                 comm_ops.spin_until_ge_i32_system(
                     fx.Int64(w.lsa_ptr(rank, arena.off_cons)) + fx.Int64(tid) * fx.Int64(4),
                     callno,
@@ -525,15 +536,16 @@ def build_dispatch(*, rank, arena, epr, quant_blocks):
                     fx.Int64(w.lsa_ptr(peer, arena.off_r_src)),
                     num_records_bytes=arena.recv_rows * 4,
                 )
+                # The padding rows are one contiguous run in each array, so the lanes take
+                # consecutive words and a store instruction covers whole cache lines.
+                for i in range(n * fx.Int32(topk) + lane,
+                               n_chunks * fx.Int32(CR * topk), fx.Int32(64)):
+                    buffer_store(
+                        fx.Int32(-1), d_ids, (dst0 * fx.Int32(topk) + fx.Int32(i)) * fx.Int32(4),
+                        cache_modifier=SEND_CM, offset_is_bytes=True,
+                    )
                 for r in range(n + lane, n_chunks * fx.Int32(CR), fx.Int32(64)):
-                    r = fx.Int32(r)
-                    for j in range_constexpr(topk):
-                        buffer_store(
-                            fx.Int32(-1), d_ids,
-                            ((dst0 + r) * fx.Int32(topk) + fx.Int32(j)) * fx.Int32(4),
-                            cache_modifier=SEND_CM, offset_is_bytes=True,
-                        )
-                    buffer_store(fx.Int32(-1), d_src, (dst0 + r) * fx.Int32(4),
+                    buffer_store(fx.Int32(-1), d_src, (dst0 + fx.Int32(r)) * fx.Int32(4),
                                  cache_modifier=SEND_CM, offset_is_bytes=True)
                 # This wave's own stores have retired; the quant waves' have too, because
                 # each drains its own before it counts its row into the chunk below.
@@ -549,12 +561,18 @@ def build_dispatch(*, rank, arena, epr, quant_blocks):
                                 cdone_slot(peer, c), fx.Int32(0)
                             )
                             comm_ops.fence_agent_acquire()
+                            _put_payload(sdma, arg_win, peer, dst0 + lo, lo, hi,
+                                         arena=arena, cco=cco)
+                            # The scales of chunks [g, c] go out together once the group is
+                            # full, or with the signal at the last chunk.
+                            slo = (c // fx.Int32(SE)) * fx.Int32(SE * CR)
                             if c == n_chunks - fx.Int32(1):
-                                _put_chunk(sdma, arg_win, peer, dst0 + lo, lo, hi,
-                                           arena=arena, cco=cco, signal=True)
+                                _put_scales(sdma, arg_win, peer, dst0 + slo, slo, hi,
+                                            arena=arena, cco=cco, signal=True)
                             else:
-                                _put_chunk(sdma, arg_win, peer, dst0 + lo, lo, hi,
-                                           arena=arena, cco=cco, signal=False)
+                                if (c + fx.Int32(1)) % fx.Int32(SE) == fx.Int32(0):
+                                    _put_scales(sdma, arg_win, peer, dst0 + slo, slo, hi,
+                                                arena=arena, cco=cco, signal=False)
                         # Every row's routing is stored and retired by now (the last chunk's
                         # counter says so), so this atomic cannot reach the peer before them.
                         comm_ops.atomic_add_system(
@@ -628,61 +646,67 @@ def build_dispatch(*, rank, arena, epr, quant_blocks):
             ]
             waves = fx.Int32(quant_blocks * PREP_WAVES)
             first = (bid - fx.Int32(1)) * fx.Int32(PREP_WAVES) + wave
-            for t in range(first, tokens, waves):
-                t = fx.Int32(t)
+            # With fewer tokens than waves a token is shared by ``sp`` waves, each storing to
+            # its own share of the destinations: a wave spends its time issuing the stores of
+            # one token, and they are independent.
+            sp = waves // ((tokens > fx.Int32(0)).select(tokens, fx.Int32(1)))
+            sp = (sp > fx.Int32(npes)).select(fx.Int32(npes), sp)
+            sp = (sp < fx.Int32(1)).select(fx.Int32(1), sp)
+            for it in range(first, tokens * sp, waves):
+                it = fx.Int32(it)
+                t = it // sp
+                mine = it - t * sp
+                # the landing base of every destination, loaded together with the row
+                pb = [peer_base[fx.Int32(dd)] for dd in range_constexpr(npes)]
                 ps = [pos[t * fx.Int32(npes) + fx.Int32(dd)] for dd in range_constexpr(npes)]
-                any_row = fx.Int32(0) == fx.Int32(1)
-                for dd in range_constexpr(npes):
-                    any_row = any_row | (ps[dd] >= fx.Int32(0))
-                if any_row:
-                    q = []
-                    for k in range_constexpr(group_rounds):
-                        g = lane + fx.Int32(64 * k)
-                        gc = (g < fx.Int32(groups)).select(g, fx.Int32(0))
-                        q.append(
-                            _quantize_group(
-                                x_rsrc, t * fx.Int32(hidden // 2) + gc * fx.Int32(GROUP // 2)
-                            )
+                q = []
+                for k in range_constexpr(group_rounds):
+                    g = lane + fx.Int32(64 * k)
+                    gc = (g < fx.Int32(groups)).select(g, fx.Int32(0))
+                    q.append(
+                        _quantize_group(
+                            x_rsrc, t * fx.Int32(hidden // 2) + gc * fx.Int32(GROUP // 2)
                         )
-                    for dd in range_constexpr(npes):
-                        if ps[dd] >= fx.Int32(0):
-                            if const_expr(dd == rank):
-                                dst_p, dst_s = r_pay, r_sca
-                                row = peer_base[fx.Int32(rank)] + ps[dd]
-                            else:
-                                dst_p, dst_s = pay, sca
-                                row = fx.Int32(dd * cap) + ps[dd]
-                            for k in range_constexpr(group_rounds):
-                                g = lane + fx.Int32(64 * k)
-                                if g < fx.Int32(groups):
-                                    _store_split(
-                                        dst_p, dst_s, q[k][0], q[k][1],
-                                        row * fx.Int32(hidden) + g * fx.Int32(GROUP),
-                                        row * fx.Int32(sc_b) + g,
-                                    )
-                            # The routing, straight to the destination: it is ~1% of the
-                            # bytes and the atomic below is what orders it.
-                            mrow = peer_base[fx.Int32(dd)] + ps[dd]
-                            m_i, m_w, m_s = d_ids[dd], d_wts[dd], d_src[dd]
-                            # Written through like the payload: a copy engine reads memory,
-                            # so a cached store could leave it reading the last call's row.
-                            if lane < fx.Int32(topk):
-                                at = (mrow * fx.Int32(topk) + lane) * fx.Int32(4)
-                                buffer_store(ids[t * fx.Int32(topk) + lane], m_i, at,
-                                             cache_modifier=SEND_CM, offset_is_bytes=True)
-                                buffer_store(wts[t * fx.Int32(topk) + lane], m_w, at,
-                                             cache_modifier=SEND_CM, offset_is_bytes=True)
-                            if lane == fx.Int32(0):
-                                buffer_store(fx.Int32(rank * cap) + t, m_s,
-                                             mrow * fx.Int32(4),
-                                             cache_modifier=SEND_CM, offset_is_bytes=True)
-                    rocdl.s_waitcnt(vmcnt=0)
-                    if lane < fx.Int32(npes):
-                        p = pos[t * fx.Int32(npes) + lane]
-                        if (lane != fx.Int32(rank)) & (p >= fx.Int32(0)):
-                            comm_ops.atomic_add_agent(
-                                cdone_slot(lane, p // fx.Int32(CR)), fx.Int32(1)
-                            )
+                    )
+                for dd in range_constexpr(npes):
+                    if (ps[dd] >= fx.Int32(0)) & ((fx.Int32(dd) % sp) == mine):
+                        if const_expr(dd == rank):
+                            dst_p, dst_s = r_pay, r_sca
+                            row = pb[rank] + ps[dd]
+                        else:
+                            dst_p, dst_s = pay, sca
+                            row = fx.Int32(dd * cap) + ps[dd]
+                        for k in range_constexpr(group_rounds):
+                            g = lane + fx.Int32(64 * k)
+                            if g < fx.Int32(groups):
+                                _store_split(
+                                    dst_p, dst_s, q[k][0], q[k][1],
+                                    row * fx.Int32(hidden) + g * fx.Int32(GROUP),
+                                    row * fx.Int32(sc_b) + g,
+                                )
+                        # The routing, straight to the destination: it is ~1% of the
+                        # bytes and the atomic below is what orders it.
+                        mrow = pb[dd] + ps[dd]
+                        m_i, m_w, m_s = d_ids[dd], d_wts[dd], d_src[dd]
+                        # Written through like the payload: a copy engine reads memory,
+                        # so a cached store could leave it reading the last call's row.
+                        if lane < fx.Int32(topk):
+                            at = (mrow * fx.Int32(topk) + lane) * fx.Int32(4)
+                            buffer_store(ids[t * fx.Int32(topk) + lane], m_i, at,
+                                         cache_modifier=SEND_CM, offset_is_bytes=True)
+                            buffer_store(wts[t * fx.Int32(topk) + lane], m_w, at,
+                                         cache_modifier=SEND_CM, offset_is_bytes=True)
+                        if lane == fx.Int32(0):
+                            buffer_store(fx.Int32(rank * cap) + t, m_s,
+                                         mrow * fx.Int32(4),
+                                         cache_modifier=SEND_CM, offset_is_bytes=True)
+                rocdl.s_waitcnt(vmcnt=0)
+                if lane < fx.Int32(npes):
+                    p = pos[t * fx.Int32(npes) + lane]
+                    if (lane != fx.Int32(rank)) & (p >= fx.Int32(0)) & ((lane % sp) == mine):
+                        comm_ops.atomic_add_agent(
+                            cdone_slot(lane, p // fx.Int32(CR)), fx.Int32(1)
+                        )
 
     # fmt: off
     @flyc.jit
@@ -716,7 +740,16 @@ class SdmaDispatch:
     """
 
     def __init__(
-        self, comm, *, experts, topk, hidden, max_tok, chunk_rows, quant_blocks=None
+        self,
+        comm,
+        *,
+        experts,
+        topk,
+        hidden,
+        max_tok,
+        chunk_rows,
+        quant_blocks=None,
+        scale_every=4,
     ):
         import torch
         from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements
@@ -742,6 +775,12 @@ class SdmaDispatch:
         i32 = dict(dtype=torch.int32, device=dev)
         n_cu = torch.cuda.get_device_properties(dev).multi_processor_count
         self.quant_blocks = n_cu - 1 if quant_blocks is None else quant_blocks
+        # The kernel's grid barriers need every block resident at once.
+        if not 1 <= self.quant_blocks <= n_cu - 1:
+            raise ValueError(
+                f"quant_blocks={self.quant_blocks} must be in [1, {n_cu - 1}]: the grid "
+                f"(quant blocks + 1) has to fit on the {n_cu} CUs or its barriers hang"
+            )
         nb = self.quant_blocks + 1
         self.pos = torch.empty(max_tok * self.npes, **i32)
         self.block_cnt = torch.zeros(nb * self.npes, **i32)
@@ -771,7 +810,11 @@ class SdmaDispatch:
         self._src = from_gpu_ptr(self.mem.ptr + a.off_r_src, (rows,), torch.int32)
         self._nrecv = from_gpu_ptr(self.mem.ptr + a.off_nrecv, (1,), torch.int32)
         self._kernel = build_dispatch(
-            rank=self.rank, arena=a, epr=self.epr, quant_blocks=self.quant_blocks
+            rank=self.rank,
+            arena=a,
+            epr=self.epr,
+            quant_blocks=self.quant_blocks,
+            scale_every=scale_every,
         )
         torch.cuda.synchronize()
         comm.barrier()
