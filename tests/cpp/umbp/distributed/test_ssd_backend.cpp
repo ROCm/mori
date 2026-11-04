@@ -1055,6 +1055,30 @@ TEST_F(SsdBackendExtentTest, WindowsOfOneKeyShareAReadOnlyWhenIdentical) {
   EXPECT_EQ(PagesInUse(), 0u);
 }
 
+// Local readers of one window across calls (the TP ranks) share one staged copy.
+TEST_F(SsdBackendExtentTest, LocalReadersOfOneWindowShareOneStage) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  std::vector<std::vector<ResolvedEntry>> got(4);
+  std::vector<std::thread> readers;
+  for (auto& out : got) {
+    readers.emplace_back([this, &out] { out = ResolveExtents({"k"}, {ObjectExtent{0, 65536}}); });
+  }
+  for (auto& reader : readers) reader.join();
+  for (const auto& out : got) {
+    ASSERT_TRUE(out[0].found);
+    EXPECT_EQ(out[0].pages, got[0][0].pages);
+  }
+  EXPECT_EQ(DeviceReadBytes() - before, 65536u);
+  EXPECT_EQ(Staged(got[3][0], 65536), Slice(object, 0, 65536));
+  got.clear();
+  backend_->RunReaperOnceForTest();
+  EXPECT_EQ(PagesInUse(), 0u);
+}
+
 // A whole-object lease already staged covers any window: no second read.
 TEST_F(SsdBackendExtentTest, WholeObjectLeaseServesAnExtentWithoutReading) {
   Start(/*staging_pages=*/32, std::chrono::seconds{60});

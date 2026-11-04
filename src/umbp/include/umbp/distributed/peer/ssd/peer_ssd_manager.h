@@ -88,6 +88,8 @@ class PeerSsdManager {
   // to know how big the key is while it still only holds the key's name.
   // `owned_` has carried this all along; only the accessor was missing.
   uint64_t SizeOf(const std::string& key) const;
+  // SizeOf for a batch under one lock; 0 = not owned.
+  std::vector<uint64_t> SizesOf(const std::vector<std::string>& keys) const;
 
   // Hold a key against eviction across a peer-local migration.  Uses the same
   // refcount as active reads so eviction has one protection rule.

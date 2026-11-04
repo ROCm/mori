@@ -668,21 +668,23 @@ TEST_F(SimTest, SsdSingleFlightCopyFailureWakesWholeAndRangeFollowers) {
     auto slot = backend->BatchAllocate({AllocateRequest{"shared", 4 * kPage, -1, true}}).front();
     ASSERT_TRUE(slot.file_ref.IsFile());
     ASSERT_TRUE(backend->BatchCommit({{slot.slot_id, "shared"}}).front().success);
-    std::vector<ObjectExtent> extents{{kPage, kPage}};
-    auto read = [&] {
-      return backend
-          ->BatchResolve({"shared"}, false, false, ResolveReader::kLocal,
-                         ranged ? &extents : nullptr)
-          .front();
+    // Local readers of the same bytes share one stage, so the follower is a
+    // remote whole read or a narrower local window.
+    const std::vector<ObjectExtent> lead{{kPage, 2 * kPage}}, narrow{{kPage, kPage}};
+    auto read = [&](ResolveReader reader, const std::vector<ObjectExtent>* extents) {
+      return backend->BatchResolve({"shared"}, false, false, reader, extents).front();
     };
     auto metric = [&](const char* name) {
       for (const auto& sample : backend->SampleMetrics())
         if (sample.labels.front().second == name) return sample.value;
       return uint64_t{0};
     };
-    auto leader = std::async(std::launch::async, read);
+    auto leader =
+        std::async(std::launch::async, read, ResolveReader::kLocal, ranged ? &lead : nullptr);
     ASSERT_TRUE(Await([&] { return metric("single_flight_lead") != 0; }));
-    auto follower = std::async(std::launch::async, read);
+    auto follower = std::async(std::launch::async, read,
+                               ranged ? ResolveReader::kLocal : ResolveReader::kRemote,
+                               ranged ? &narrow : nullptr);
     ASSERT_TRUE(Await([&] { return metric("single_flight_merged") != 0; }));
     EXPECT_EQ(backend->Evict({"shared"}).front().bytes_freed, 0u);
     ASSERT_EQ(follower.wait_for(2s), std::future_status::ready);
