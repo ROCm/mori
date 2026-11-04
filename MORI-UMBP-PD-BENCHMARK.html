@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI UMBP PD Disaggregation Benchmark &mdash; MORI development (e7c16eda) documentation</title>
+  <title>MORI UMBP PD Disaggregation Benchmark &mdash; MORI development (431b572a) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=4c677d25"></script>
+      <script src="_static/documentation_options.js?v=0a75c327"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -190,6 +190,18 @@
 <li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#environment-variables">9. Environment Variables</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">MORI Fused GEMM + Collective Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#performance-at-a-glance">Performance at a glance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#what-every-operator-has-in-common">What every operator has in common</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#gemm-all-reduce-and-reduce-scatter">GEMM + all-reduce and reduce-scatter</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#gemm-all-to-all">GEMM + all-to-all</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#gemm-all-gather">GEMM + all-gather</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#all-gather-gemm">All-gather + GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#all-to-all-gemm">All-to-all + GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#running-the-tests-and-benchmarks">Running the tests and benchmarks</a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
@@ -303,19 +315,6 @@
 <li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
 </ul>
 </li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html">MORI GEMM + All-Reduce Benchmark</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#summary">Summary</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#running-the-benchmark">Running the benchmark</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#modes-and-quantisation">Modes and quantisation</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#the-fp8-wire-s-knobs">The fp8 wire’s knobs</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#the-gemm-on-its-own">The GEMM on its own</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#measurement-discipline">Measurement discipline</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#reproducing-the-end-to-end-numbers">Reproducing the end-to-end numbers</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
