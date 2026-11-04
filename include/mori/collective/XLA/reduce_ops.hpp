@@ -49,7 +49,7 @@
 #endif // __HIPCC__ || __HIP__
 
 namespace mori {
-namespace collective {
+namespace ccl {
 
 #define COLLECTIVE_DATA_TYPE_LIST(V) \
   V(F8E5M2, __hip_fp8_e5m2) \
@@ -329,5 +329,5 @@ struct MaxOp<F16Pack> {
 #endif // __HIPCC__ || __HIP__
 }  // namespace detail
 
-}  // namespace collective
+}  // namespace ccl
 }  // namespace mori

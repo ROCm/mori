@@ -36,7 +36,7 @@
 // warp-cooperative fused copy+signal SDMA put used by the push collectives.
 // ---------------------------------------------------------------------------
 namespace mori {
-namespace collective {
+namespace ccl {
 
 // Fused 64B packet: [NOP][COPY_LINEAR][ATOMIC SWAP64].
 static constexpr size_t kSDMACopySignalPkt = 64;
@@ -778,5 +778,5 @@ __device__ __forceinline__ bool LastBlockOut(uint32_t* groupCtr) {
 
 #endif  // __HIPCC__ || __HIP__
 
-}  // namespace collective
+}  // namespace ccl
 }  // namespace mori

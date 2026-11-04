@@ -39,7 +39,7 @@
 #include "mori/collective/XLA/collectives_common.hpp"
 
 namespace mori {
-namespace collective {
+namespace ccl {
 
 // Single-block, compute-free collective-permute (one destination).
 //   sendBuf  : raw symmetric-heap pointer, numBytes to send
@@ -304,5 +304,5 @@ CollectivePermutePullKernel(int npes, int dstPe, int srcPe, cco::ccoWindow_t hea
     if (recvs) permuteNum[kCCLMaxPeers + srcPe] = kRecv;
   }
 }
-} // namespace collective
+} // namespace ccl
 } // namespace mori
