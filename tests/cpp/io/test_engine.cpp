@@ -2213,6 +2213,42 @@ void CaseXgmiConcurrentWaitAndPollIsSafe() {
               ", msg='" + status.Message() + "'");
 }
 
+void CaseXgmiBoundedWaitReturnsOnCompletion() {
+  if (GetGpuCount() < 2) throw TestSkip("requires at least 2 GPUs");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_bounded_wait_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  constexpr size_t kSize = 64 * 1024 * 1024;
+  auto src = RegisterGpuMemory(&engine, kSize, 0);
+  auto dst = RegisterGpuMemory(&engine, kSize, 1);
+
+  // An XGMI status completes only when polled; a bounded wait must poll it rather than sleep to
+  // its deadline.
+  for (bool waitAll : {false, true}) {
+    TransferStatus status;
+    engine.Write(src.desc, 0, dst.desc, 0, kSize, &status, engine.AllocateTransferUniqueId());
+    auto start = std::chrono::steady_clock::now();
+    if (waitAll) {
+      engine.WaitAll({&status}, 10000);
+    } else {
+      status.WaitFor(10000);
+    }
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count();
+    const std::string how = waitAll ? "WaitAll(10000)" : "WaitFor(10000)";
+    Require(status.Succeeded(),
+            how + " transfer failed: code=" + std::to_string(status.CodeUint32()) + ", msg='" +
+                status.Message() + "'");
+    Require(ms < 2000, how + " returned after " + std::to_string(ms) + " ms for a 64 MiB copy");
+  }
+}
+
 struct TestCase {
   const char* name;
   std::function<void()> run;
@@ -2298,6 +2334,7 @@ int main(int argc, char* argv[]) {
       {"xgmi_hidden_device_importer_nonzero_device", CaseXgmiHiddenDeviceImporterNonZeroDevice},
       {"xgmi_inbound_notification_is_unsupported", CaseXgmiInboundNotificationIsUnsupported},
       {"xgmi_concurrent_wait_and_poll_is_safe", CaseXgmiConcurrentWaitAndPollIsSafe},
+      {"xgmi_bounded_wait_returns_on_completion", CaseXgmiBoundedWaitReturnsOnCompletion},
   };
 
   int passed = 0;
