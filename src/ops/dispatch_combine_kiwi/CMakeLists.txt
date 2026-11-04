@@ -1,5 +1,7 @@
 # KIWI EP dispatch/combine kernels and their Python module. The proxy transport
 # uses mori_application's RDMA layer, topology and bootstrap.
+set(CMAKE_HIP_ARCHITECTURES "${MORI_KIWI_HIP_ARCHITECTURES}")
+
 set(MORI_OPS_KIWI_SOURCES
     comm/context.hip.cpp
     comm/rdma.cpp

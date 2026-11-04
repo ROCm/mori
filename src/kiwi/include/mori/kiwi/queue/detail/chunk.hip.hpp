@@ -75,9 +75,9 @@
 #include "address_space.hpp"
 
 // Every device-to-host push is wavefront-collective over 64 lanes (one chunk
-// per lane). GFX9 (CDNA: gfx90a, gfx942, gfx950) runs only wave64.
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__GFX9__)
-#error "KIWI device-to-host queues require a wave64 GFX9 target"
+// per lane). The supported targets, gfx942 and gfx950, run only wave64.
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx942__) && !defined(__gfx950__)
+#error "KIWI device-to-host queues require a gfx942 or gfx950 target"
 #endif
 
 namespace mori::kiwi::queue {
