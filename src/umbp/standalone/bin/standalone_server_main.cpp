@@ -43,6 +43,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 #include "umbp/common/fd_limit.h"
+#include "umbp/distributed/config.h"
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/standalone/standalone_server.h"
@@ -290,6 +291,12 @@ int main(int argc, char** argv) {
   }
 
   mori::umbp::RaiseOpenFileLimit();
+  // A peer's direct ranged call moves a GPU's bytes over the one NIC beside
+  // that GPU.  Rail affinity has this server answer it on the NIC of the same
+  // rail; otherwise several of this node's NICs answer that one at once, and
+  // the incast costs more than half its throughput.  An explicit setting wins.
+  // Set before any thread can read the environment.
+  if (mori::umbp::RangedDirectFromEnv()) setenv("MORI_IO_RAIL_AFFINITY", "1", /*overwrite=*/0);
   mori::umbp::UMBPConfig config = mori::umbp::UMBPConfig::FromEnvironment();
   config.role = mori::umbp::UMBPRole::Standalone;
   config.follower_mode = false;
