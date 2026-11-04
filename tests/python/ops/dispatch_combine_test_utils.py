@@ -466,7 +466,7 @@ class EpDispatchCombineTestCase:
         dispatch_hidden_dim=None,
     ):
         self.config = config
-        self.device = torch.device("cuda", self.config.rank)
+        self.device = torch.device("cuda", self.config.rank % self.config.gpu_per_node)
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(123)
         # Cross-dtype support: dispatch and combine may transport different

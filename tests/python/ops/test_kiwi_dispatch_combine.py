@@ -91,7 +91,7 @@ def _test_dispatch_combine(
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 32, 128))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
-@pytest.mark.parametrize("rcomp_backend", ("rdma-only", "hybrid"))
+@pytest.mark.parametrize("rcomp_backend", ("rdma-only", "hybrid", "auto"))
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,
