@@ -129,6 +129,16 @@ UMBPMedium BackendMedium(const UMBPConfig& config) {
   return config.distributed.has_value() ? config.distributed->medium : UMBPMedium::DRAM;
 }
 
+// SSD reads were serialized for a manager that staged them through one arena.
+// SsdBackend locks its own metadata and stages through leased pages, so
+// UMBP_STANDALONE_SSD_CONCURRENT=1 runs an SSD server's data path like a DRAM
+// one's.
+bool SharedReads(const UMBPConfig& config) {
+  if (BackendMedium(config) != UMBPMedium::SSD) return true;
+  const char* raw = std::getenv("UMBP_STANDALONE_SSD_CONCURRENT");
+  return raw != nullptr && raw[0] == '1';
+}
+
 ::umbp::StandaloneBackendMode BackendModeToProto(UMBPDeploymentMode mode) {
   switch (mode) {
     case UMBPDeploymentMode::Distributed:
@@ -514,7 +524,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
         // ssd.enabled: that flag defaults to true and now describes a tier the
         // backend may not serve at all, so reading it here would serialize a
         // DRAM server for no reason.
-        shared_reads_(BackendMedium(backend_config_) != UMBPMedium::SSD),
+        shared_reads_(SharedReads(backend_config_)),
         concurrent_backend_(shared_reads_ && client_ != nullptr &&
                             client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed),
         address_(std::move(address)),
