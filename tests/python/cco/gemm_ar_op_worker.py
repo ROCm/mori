@@ -111,6 +111,32 @@ def _rel_l2(got: torch.Tensor, ref: torch.Tensor) -> float:
     ).item()
 
 
+def _bf16_operands(rank: int, m: int, n: int, k: int, salt: int = 0):
+    """BF16 A and the BF16 weight as the checkpoint keeps it, ``[N, K]``."""
+    g = torch.Generator(device="cuda").manual_seed(4321 + rank + 7919 * salt)
+    a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.bfloat16)
+    b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.bfloat16)
+    return a, b
+
+
+def _bf16_reference(world: int, m: int, n: int, k: int, salt: int = 0):
+    acc = torch.zeros(m, n, device="cuda", dtype=torch.float32)
+    for r in range(world):
+        a, b = _bf16_operands(r, m, n, k, salt)
+        acc += a.float() @ b.float().t()
+    return acc
+
+
+def _call(op, quant, rank, m, n, k, salt):
+    """One call with this rank's operands for ``quant``, and the fp32 sum."""
+    world = op.world_size
+    if quant == "bf16":
+        a, b = _bf16_operands(rank, m, n, k, salt)
+        return op(a, b).clone(), _bf16_reference(world, m, n, k, salt)
+    a, b, sa, sb = _operands(rank, m, n, k, salt=salt)
+    return op(a, preshuffle_b(b), sa, sb).clone(), _reference(world, m, n, k, salt)
+
+
 def _reduce_across_ranks(record: dict) -> dict:
     """Every rank's verdicts folded into one record for rank 0 to print.
 
@@ -355,7 +381,9 @@ def case_mxfp8(comm, rank, world, m, n, k, quant="mxfp8"):
     )
 
 
-def case_reduce_scatter(comm, rank, world, n, k, m_small, m_large):
+def case_reduce_scatter(
+    comm, rank, world, n, k, m_small, m_large, quant="blockscale", case=None
+):
     """``GemmReduceScatterOp``: my row band of the sum, and nothing else.
 
     Its own op because the window is shared with nothing: the all-reduce's
@@ -373,7 +401,7 @@ def case_reduce_scatter(comm, rank, world, n, k, m_small, m_large):
     from mori.tensor_utils import from_gpu_ptr
 
     out = {}
-    with GemmReduceScatterOp(comm, n=n, k=k, m_max=m_large) as op:
+    with GemmReduceScatterOp(comm, n=n, k=k, m_max=m_large, quant=quant) as op:
         op.self_test()
         out["self_test_passes"] = True
 
@@ -393,9 +421,7 @@ def case_reduce_scatter(comm, rank, world, n, k, m_small, m_large):
         )
 
         for i, m in enumerate((m_small, m_large, m_small, m_large)):
-            a, b, sa, sb = _operands(rank, m, n, k, salt=i)
-            got = op(a, preshuffle_b(b), sa, sb).clone()
-            ref = _reference(world, m, n, k, salt=i)
+            got, ref = _call(op, quant, rank, m, n, k, salt=i)
             band = m // world
             out[f"call{i}_m{m}_shape_ok"] = list(got.shape) == [band, n]
             out[f"call{i}_m{m}"] = _rel_l2(got, ref[rank * band : (rank + 1) * band])
@@ -432,9 +458,7 @@ def case_reduce_scatter(comm, rank, world, n, k, m_small, m_large):
             for i in range(4):
                 slow = i % world == rank
                 op._cache[key] = plan._replace(tail=tuple(held) if slow else fast)
-                a, b, sa, sb = _operands(rank, m, n, k, salt=10 + i)
-                got = op(a, preshuffle_b(b), sa, sb).clone()
-                ref = _reference(world, m, n, k, salt=10 + i)
+                got, ref = _call(op, quant, rank, m, n, k, salt=10 + i)
                 band = m // world
                 out[f"{prefix}{i}"] = _rel_l2(got, ref[rank * band : (rank + 1) * band])
             op._cache[key] = plan
@@ -451,7 +475,43 @@ def case_reduce_scatter(comm, rank, world, n, k, m_small, m_large):
         run_held("unbarriered", plan.tail[:bar] + plan.tail[bar + 1 :])
         torch.cuda.synchronize()
         comm.barrier()
-    _emit(rank, case="reduce_scatter", **_reduce_across_ranks(out))
+    _emit(rank, case=case or "reduce_scatter", **_reduce_across_ranks(out))
+
+
+def case_bf16_all_reduce(comm, rank, world, n, k, m_small, m_large):
+    """``quant="bf16"``: BF16 A, the checkpoint's row-major BF16 weight, no
+    scales. Two M through one instance with fresh operands each call, the fp8
+    gather over LSA, and the operand checks the BF16 path does instead of the
+    fp8 ones."""
+    out = {}
+    with GemmAllReduceOp(comm, n=n, k=k, m_max=m_large, quant="bf16") as op:
+        op.self_test()
+        for i, m in enumerate((m_small, m_large, m_small)):
+            got, ref = _call(op, "bf16", rank, m, n, k, salt=20 + i)
+            out[f"call{i}_m{m}"] = _rel_l2(got, ref)
+        a, b = _bf16_operands(rank, m_small, n, k)
+        for name, args in (
+            ("fp8_a", (a.to(torch.float8_e4m3fn), b)),
+            ("with_scale", (a, b, torch.ones(m_small, device="cuda"), None)),
+            ("wrong_n", (a, b[: n - 256])),
+        ):
+            try:
+                op(*args)
+                out[f"refuses_{name}"] = False
+            except ValueError:
+                out[f"refuses_{name}"] = True
+    with GemmAllReduceOp(
+        comm,
+        n=n,
+        k=k,
+        m_max=m_large,
+        quant="bf16",
+        gather_dtype="fp8",
+        gather_transport="lsa",
+    ) as op:
+        got, ref = _call(op, "bf16", rank, m_large, n, k, salt=30)
+        out["fp8_gather"] = _rel_l2(got, ref)
+    _emit(rank, case="bf16_all_reduce", **_reduce_across_ranks(out))
 
 
 def case_close_is_idempotent(comm, rank, n, k, m_max):
@@ -531,6 +591,10 @@ def run_all(comm, rank, world, n, k):
     case_mxfp8(comm, rank, world, world * 256, n, k)
     case_mxfp8(comm, rank, world, world * 256, n, k, quant="mxfp8_raw")
     case_reduce_scatter(comm, rank, world, n, k, 512, 1024)
+    case_bf16_all_reduce(comm, rank, world, n, k, 512, 1024)
+    case_reduce_scatter(
+        comm, rank, world, n, k, 512, 1024, quant="bf16", case="bf16_reduce_scatter"
+    )
     case_close_is_idempotent(comm, rank, n, k, 512)
 
 
