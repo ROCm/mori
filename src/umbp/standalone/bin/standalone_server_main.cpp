@@ -208,6 +208,12 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
                     &dist.ranged_scratch_hugepage_size, error)) {
     return false;
   }
+  // Every GPU on the node shares this server's arenas.
+  dist.ranged_scratch_numa_layout = true;
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA", &dist.ranged_scratch_numa_layout,
+                    error)) {
+    return false;
+  }
   if (!ParseIntEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS", &dist.ssd_staging_buffer_slots,
                    error)) {
     return false;

@@ -60,9 +60,10 @@ enum class UMBPDurabilityMode : int {
   Relaxed = 1,
 };
 
-// Default UMBP_DRAM_MAX_MR_BYTES.  AMD Pensando AINIC (ionic) translates only
-// the first 2^18 page entries of a memory region and silently aliases the rest,
-// which with 2 MiB pages is 512 GiB.  On 4 KiB pages the safe value is 1 GiB.
+// Default UMBP_DRAM_MAX_MR_BYTES.  AMD Pensando AINIC (ionic) firmware before
+// 1.117.5-a-190 translates only the first 2^18 page entries of a memory region
+// and silently aliases the rest, which with 2 MiB pages is 512 GiB.  On 4 KiB
+// pages the safe value is 1 GiB; PageBackend warns about a larger region.
 inline constexpr uint64_t kDefaultDramMaxMrBytes = 512ULL << 30;
 
 struct UMBPDramConfig {
@@ -352,6 +353,14 @@ struct UMBPDistributedConfig {
   // cap per region.  Falls back to 4 KiB pages when no hugetlb pages are free.
   bool ranged_scratch_use_hugepages = false;
   size_t ranged_scratch_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+
+  // Lay each ranged scratch arena out by NUMA node: its bytes split evenly over
+  // the nodes that have GPUs, each part bound to its node and cut into shards,
+  // one per GPU unless UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS sets the arena's
+  // total, so a remote ranged call stages on its GPU's node.  For a client that
+  // many GPUs share, as the standalone server's is; an in-process client serves
+  // one GPU and keeps one arena.
+  bool ranged_scratch_numa_layout = false;
 
   // SSD staging arena in pages (env UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS);
   // 0 = 4 GiB capped at the SSD tier.

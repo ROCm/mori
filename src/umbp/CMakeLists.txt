@@ -557,6 +557,11 @@ target_link_libraries(umbp_core PUBLIC mori_logging)
 target_sources(umbp_common
                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/umbp_client_factory.cpp)
 
+# NIC limits are common to every registrant, but checking the AINIC limit reads
+# the firmware with mori_application's ionic parser, which umbp_core (and so
+# spdk_proxy) does not link; umbp_common reaches it through mori_io.
+target_sources(umbp_common PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common/nic_limits.cpp)
+
 # ---------- Master executable -------------------------------------------------
 
 add_executable(umbp_master distributed/bin/master_main.cpp)

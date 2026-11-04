@@ -26,6 +26,8 @@
 #include <hsa/hsa_ext_amd.h>
 
 #include <mutex>
+#include <optional>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -39,6 +41,19 @@ namespace mori {
 namespace application {
 // BNXT UDP sport configuration constants
 static constexpr uint32_t IONIC_UDP_SPORT_ARRAY_SIZE = 4;
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                        Firmware Version                                        */
+/* ---------------------------------------------------------------------------------------------- */
+// An ionic (AINIC) firmware version: "1.117.5-a-58" is (1, 117, 5, 58), and
+// versions compare in that order.
+using IonicFwVersion = std::tuple<int, int, int, int>;
+
+// Parse "1.117.5-a-58" or "1.117.5-a58"; nullopt for anything else.
+std::optional<IonicFwVersion> ParseIonicFwVersion(const char* fw_ver);
+
+// The firmware version RDMA device `dev_name` reports in sysfs.
+std::optional<IonicFwVersion> ReadIonicFwVersion(const char* dev_name);
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
