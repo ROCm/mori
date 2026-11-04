@@ -54,11 +54,11 @@ dispatch at T ≤ 64. The dispatch also drains the completions its own bucket's
 combine left on QPs it did not send on, so a dispatch count below the combine's
 can be slower than either count alone: the two are chosen as a pair.
 MI308X inter-node rules set the count per bucket and phase (1, 2 or 4), except
-the FP8 combine rows. Every MI300X inter-node rule sets one
-(1, 2, 4 or 8). MI355X rules set one (1, 2 or 4) per bucket and phase where the
-whole-table A/B kept a change: 119 of the 233 InterNodeV2 rules and 42 of the
-233 InterNodeV2LL ones. The largest count in one MI355X op is 4, and 2 for
-InterNodeV2LL 272/9 and 896/16.
+the FP8 combine rows. Every MI300X inter-node rule sets one (1, 2 or 4). MI355X
+rules set one (1, 2 or 4) per bucket and phase where the whole-table A/B kept a
+change: 119 of the 233 InterNodeV2 rules and 42 of the 233 InterNodeV2LL ones.
+The largest count in one MI355X op is 4, and 2 for InterNodeV2LL 272/9 and
+896/16.
 
 `InterNodeV2` combine rules may set `combine_load_first` to 1 (empty means 0).
 That bucket's combine pass is then compiled with the load-first peer gather
@@ -80,8 +80,11 @@ other tables may not set it. Current settings:
   fixed: on for 272/9 bf16 H7168 at T4–256, T1024 and T2048, and for 896/16
   bf16 H3584 at T16, T32, T256 and T512.
   Off elsewhere.
-- MI300X: on for T64–128 in 256/8 bf16 H7168 and H6144 and 384/6 bf16 H7168.
-  Off elsewhere.
+- MI300X: chosen per bucket together with the active QP counts, and kept only
+  where a whole-table A/B against the previous tables confirmed it: on for
+  256/8 bf16 H7168 and H6144 and 384/6 bf16 H5120 at T4–256; 272/9 bf16 H7168
+  at T4–128; 256/6 and 384/6 bf16 H7168 at T64–256; 896/16 bf16 H3584 at T16,
+  T32 and T256. Off elsewhere.
 
 ## Lookup
 
@@ -109,46 +112,47 @@ other tables may not set it. Current settings:
 | --- | --- | --- | --- |
 | MI355X (gfx950, 256) | 256/8, 256/6, 384/6; 272/9, 896/16 inter | 7168; 6144 for inter 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3; fp4 for inter 256/8 |
 | MI308X (gfx942, 80) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168; 6144 for 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 |
-| MI300X (gfx942, 304) | 256/8, 384/6; 256/6, 264/9 intra | 7168; 6144 for 256/8; 5120 for intra 384/6 | bf16, fp8_e4m3_fnuz |
+| MI300X (gfx942, 304) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168; 6144 for 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 |
 
 Each GPU model has IntraNodeV2 (EP8), InterNodeV2 (EP16) and InterNodeV2LL
 (EP16) tables, and every shape in a table has both phases. Not every shape is
 in every table, and not every dtype appears in every shape; see the files.
-Token ceilings are 64–4096, plus 4–32 for MI308X and MI355X inter-node 256/8,
-272/9, 896/16 and 384/6 at hidden 5120.
+Token ceilings are 64–4096, plus 4–32 for MI308X, MI355X and MI300X
+inter-node 256/8, 272/9, 896/16 and 384/6 at hidden 5120.
 
 The model behind each shape:
 
 | Model | Experts / top-k | Hidden the dispatch carries | Tables |
 | --- | --- | --- | --- |
-| DeepSeek-V3/R1 | 256/8 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16; FP4 dispatch (stored as 3584, packed) on MI308X and MI355X EP16 |
-| DeepSeek-V3/R1, shared expert fused in | 264/9 at EP8, 272/9 at EP16 | 7168 | MI308X; MI355X: EP16; MI300X: EP8 |
+| DeepSeek-V3/R1 | 256/8 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16; FP4 dispatch (stored as 3584, packed) on MI308X, MI355X and MI300X EP16 |
+| DeepSeek-V3/R1, shared expert fused in | 264/9 at EP8, 272/9 at EP16 | 7168 | MI308X, MI300X; MI355X: EP16 |
 | GLM-5, GLM-5.3 | 256/8 | 6144 | MI308X, MI300X: EP8 and EP16; MI355X: EP16 |
 | DeepSeek-V4-Pro | 384/6 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16 |
-| DeepSeek-V4.1-Flash | 384/6 | 5120 | MI355X, MI308X: EP8 and EP16; MI300X: EP8 |
-| Kimi K3 | 896/16 | 3584 | MI308X, MI355X: EP16 |
-| none known | 256/6 | 7168 | MI355X, MI308X: EP8 and EP16; MI300X: EP8; bf16 dispatch only |
+| DeepSeek-V4.1-Flash | 384/6 | 5120 | MI355X, MI308X, MI300X: EP8 and EP16 |
+| Kimi K3 | 896/16 | 3584 | MI308X, MI355X, MI300X: EP16 |
+| none known | 256/6 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16; bf16 dispatch only |
 
 A shape without rows runs on the default geometry: for example DeepSeek-V4-Flash
 (256/6 at hidden 4096), the DSpark draft layers of DeepSeek-V4.1-Flash (128/3 at
 hidden 5120), GLM-5.3 with its shared expert fused in (264/9 and 272/9 at
 hidden 6144), and every shape on a GPU or EP size its table lacks.
 
-MI308X 264/9 and 272/9, MI355X 272/9 and MI300X 264/9 are DeepSeek-V3/R1 with the shared
-expert fused in as a routed one, laid out as ATOM's
+The 264/9 and 272/9 rows are DeepSeek-V3/R1 with the shared expert fused in
+as a routed one, laid out as ATOM's
 `SharedExpertMode.LOCAL_REPLICA` does: every rank holds its 256/EP routed
 experts plus one replica of the shared expert in its last slot, and each
 token's ninth expert is its own rank's replica. The expert count depends on the
 EP size, so 264/9 (33 a rank) is only in the EP8 table and 272/9 (17 a rank)
 only in the EP16 tables.
 
-MI308X and MI355X 896/16 are Kimi K3. Its routed experts run on a 3584-wide latent (the
+896/16 is Kimi K3. Its routed experts run on a 3584-wide latent (the
 model projects the 7168-wide hidden state down before the dispatch and back
 up after the combine), so 3584 is the width the dispatch carries.
 
 FP8 uses the arch's native encoding: `fp8_e4m3_fnuz` on gfx942 and
-`fp8_e4m3` (OCP) on gfx950. Combine rows are BF16, except MI308X and MI355X
-inter-node 256/8, which also have FP8 combine rows for symmetric FP8 runs.
+`fp8_e4m3` (OCP) on gfx950. Combine rows are BF16, except inter-node 256/8 on
+MI308X, MI355X and MI300X, which also has FP8 combine rows for symmetric FP8
+runs.
 
 ## Measurement conditions
 
@@ -158,16 +162,19 @@ Metrics are only comparable between rows measured under the same conditions.
   (`active_qps`, above) and on the allocation (`num_qp_per_pe`) on MI308X:
   QP64 adds about 270 µs per phase at T ≤ 512. MI308X inter-node rows were
   measured with an allocation of 8 and each rule's own count, except FP8
-  combine rows, which keep earlier two-QP measurements. MI355X inter-node rows
-  changed on 2026-11-02/03 were measured the same way; the ones it left
-  unchanged keep the earlier harness-sweep measurements (an allocation of 2,
-  `scale_dim` 32), whose metrics are not comparable.
+  combine rows, which keep earlier two-QP measurements. MI300X inter-node
+  rows likewise, FP8 combine rows included, with no count above 4. MI355X
+  inter-node rows changed on 2026-11-02/03 were measured the same way; the ones
+  it left unchanged keep the earlier harness-sweep measurements (an allocation
+  of 2, `scale_dim` 32), whose metrics are not comparable.
 - **Protocol.** Uniform routing, `scale_dim=0`, capacity equal to the token
   count, `quant_type="none"`. The 264/9 and 272/9 rows use replica routing
   (`--routing replica`): eight distinct routed experts drawn uniformly, plus
   the token's own rank's replica. FP8 and FP4 dispatch rows are measured with
-  the bucket's BF16 combine rule. For FP4 the combine reduces the decoded
-  payload, decoded between the two timed phases where FP8 is cast to BF16.
+  the bucket's BF16 combine rule; MI300X FP8 combine rows in a symmetric FP8
+  op, with the bucket's FP8 dispatch rule. For FP4 the combine reduces the
+  decoded payload, decoded between the two timed phases where FP8 is cast to
+  BF16.
   Timing uses 3 passes × (20 warmup + 30 timed rounds), dropping the first
   timed round of each pass. A measurement is accepted only after correctness
   checks, and only if each phase has
@@ -183,6 +190,20 @@ Metrics are only comparable between rows measured under the same conditions.
   a confirming one. The JIT cache must be warm before timing: a cell measured
   right after its kernels compile starts from idle-dropped clocks and reads up
   to 40% slow at T64.
+- **MI300X EP16.** Every rule was re-tuned and measured with the protocol
+  above on two MI300X nodes (ConnectX-7, 400 Gb/s a rail), ranks pinned as
+  for EP8. Geometry was screened per family and phase in two rounds against
+  the previous tables, or the defaults for a shape without rows; the active
+  QP counts and the V2 combine load-first then in one round of whole-table
+  variants. A bucket took the new rules only where they were ≥1% faster (D+C
+  summed over the dispatch dtypes) in every round of a whole-table A/B against
+  the previous tables, and again in a confirming one. The FP4 dispatch and FP8
+  combine rows were added later on a second pair of nodes, geometry and active
+  QP count screened together against the defaults, with the same rounds and
+  gates. That pair has 10–15 minute windows in which every phase runs 2–3.5×
+  slow, evenly enough to pass the noise gate; a launch was repeated when the
+  phases no candidate changes (the FP8 cells' dispatch, the FP4 cells'
+  combine) read more than 10% slow at T ≤ 64.
 - **MI355X EP16.** Re-tuned on 2026-11-02/03 on two MI355X nodes (ionic
   NICs, `MORI_DISABLE_IONIC_CCQE=1`) with the protocol above, on the kernel
   with the topk-9/16 combine gather and copy tail fixed. Per bucket: geometry
@@ -197,7 +218,7 @@ Metrics are only comparable between rows measured under the same conditions.
   of 54 runs; those geometries are excluded there, and its T2048 and T4096
   buckets keep the default until they are re-measured.
 - **Kernel.** The MI308X 264/9, 272/9 InterNodeV2, 896/16 and FP4 dispatch
-  rows, and every MI300X EP8 row, were re-tuned and measured on the kernel
+  rows, and every MI300X row, were re-tuned and measured on the kernel
   with the topk-9/16 combine gather and the 3584 B copy tail fixed
   (`device_primitives.hpp`). The 272/9 InterNodeV2LL rows predate the fix,
   which moves them by under 0.5%.
