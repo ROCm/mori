@@ -253,6 +253,9 @@ enum class PeerEvictionMode {
   kMaster,        // the master's EvictKey rounds (SSD still evicts locally)
 };
 
+// UMBP_DISTRIBUTED_RANGED_DIRECT, on unless it is 0, false, off or no.
+bool RangedDirectFromEnv();
+
 struct PoolClientConfig {
   UMBPSimConfig sim;
   UMBPMasterClientConfig master_config;
@@ -318,6 +321,18 @@ struct PoolClientConfig {
   // UMBPDistributedConfig::ranged_locality_prefetch for why it is not folded
   // into cache_remote_fetches.
   bool ranged_locality_prefetch = true;
+
+  // A remote ranged GET reads straight into, and a remote ranged PUT writes
+  // straight from, caller buffers in regions the NIC registered -- GPU memory
+  // included -- instead of staging through a scratch arena.  The NIC then moves
+  // the bytes between a GPU and a peer's tier in one hop.  Nothing lands in
+  // this node's medium on the way, so a key read this way is made local by the
+  // background pull ranged_locality_prefetch gates, never by an install.
+  //
+  // mori-io registers GPU memory with the NIC on its first transfer and aborts
+  // when the NIC can map it neither by address nor by dmabuf: turn this off on
+  // such a host.
+  bool ranged_direct = RangedDirectFromEnv();
 
   // Resolve on this node's own media before asking the master to route, and
   // skip the master entirely when the whole batch is local.  See

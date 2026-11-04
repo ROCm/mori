@@ -122,7 +122,7 @@ class PoolClientRangesTest : public ::testing::Test {
   std::unique_ptr<PoolClient> MakeClient(const std::string& node_id, size_t dram_capacity,
                                          std::vector<char>& get_scratch,
                                          std::vector<char>& put_scratch,
-                                         bool locality_prefetch = true) {
+                                         bool locality_prefetch = true, bool direct = false) {
     PoolClientConfig cfg;
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
@@ -147,6 +147,8 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.ranged_put_scratch = {{put_scratch.data(), put_scratch.size()}};
     cfg.cache_remote_fetches = false;
     cfg.ranged_locality_prefetch = locality_prefetch;
+    // Off unless a test asks: the arena tests read the arena as their evidence.
+    cfg.ranged_direct = direct;
     auto client = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(client->Init());
     EXPECT_TRUE(client->RegisterMemory(get_scratch.data(), get_scratch.size()));
@@ -175,6 +177,7 @@ class PoolClientRangesTest : public ::testing::Test {
       cfg.ranged_get_scratch.push_back({get_arenas[i].data(), get_arenas[i].size(), nodes[i]});
       cfg.ranged_put_scratch.push_back({put_arenas[i].data(), put_arenas[i].size(), nodes[i]});
     }
+    cfg.ranged_direct = false;
     cfg.cache_remote_fetches = false;
     cfg.ranged_locality_prefetch = false;
     auto client = std::make_unique<PoolClient>(std::move(cfg));
