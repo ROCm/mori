@@ -27,6 +27,9 @@ calling convention but is not a drop-in replacement:
 
 - The dispatch and combine dtypes are fixed when the op is constructed;
   ``combine()`` rejects input of any other dtype.
+- Combine supports only bfloat16. Construction raises ``ValueError`` for any
+  other combine dtype, including one chosen by the ``max_token_type_size``
+  default.
 - ``block_num``, ``rdma_block_num``, ``warp_per_block`` and
   ``use_external_inp_buf`` are accepted for compatibility and ignored. KIWI
   chooses its launch shape from the token count, or from ``num_blocks``.
@@ -192,9 +195,10 @@ class EpDispatchCombineKiwiOp:
         config: ``EpDispatchCombineConfig`` or ``EpDispatchCombineKiwiConfig``.
         group: torch.distributed process group used for setup. Defaults to the
             world group; a single-rank op needs no process group.
-        combine_dtype: combine input/output dtype. Defaults to MORI's rule:
-            ``data_type`` if ``max_token_type_size`` equals its element size,
-            else bfloat16 (2 bytes) or float32 (4 bytes).
+        combine_dtype: combine input/output dtype; only bfloat16 is supported.
+            Defaults to MORI's rule: ``data_type`` if ``max_token_type_size``
+            equals its element size, else bfloat16 (2 bytes) or float32
+            (4 bytes). Any result other than bfloat16 raises ``ValueError``.
         num_blocks: dispatch/combine grid size; 0 picks it per call from the
             token count.
         num_proxy_threads: CPU threads posting RDMA work (one QP set each).
@@ -222,13 +226,22 @@ class EpDispatchCombineKiwiOp:
             raise NotImplementedError(
                 f"EpDispatchCombineKiwiOp does not support quant_type={config.quant_type!r}"
             )
+        resolved_combine_dtype = (
+            combine_dtype if combine_dtype is not None else _combine_dtype(config)
+        )
+        # The combine reducer picks its decode path from the element size, so
+        # only bfloat16 is reduced correctly.
+        if resolved_combine_dtype != torch.bfloat16:
+            raise ValueError(
+                f"EpDispatchCombineKiwiOp supports only bfloat16 combine, got "
+                f"{resolved_combine_dtype}; pass combine_dtype=torch.bfloat16 or "
+                f"set max_token_type_size=2"
+            )
         ext = _load_ext()
         self.config = config
         self.device = torch.device("cuda", torch.cuda.current_device())
         self._dispatch_dtype = config.data_type
-        self._combine_dtype = (
-            combine_dtype if combine_dtype is not None else _combine_dtype(config)
-        )
+        self._combine_dtype = resolved_combine_dtype
 
         cfg = ext.KiwiEpOpConfig()
         cfg.rank = config.rank
