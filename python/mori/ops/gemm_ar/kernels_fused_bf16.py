@@ -116,7 +116,9 @@ def compile_fused_gemm_scatter_bf16(
     fused number, since a GEMM bug and a transport bug otherwise look the same.
     """
     if wait_policy not in ("tuned", "safe", "conservative"):
-        raise ValueError(f"wait_policy must be tuned, safe or conservative, got {wait_policy!r}")
+        raise ValueError(
+            f"wait_policy must be tuned, safe or conservative, got {wait_policy!r}"
+        )
     if atomic_order not in ("acq_rel", "acquire", "release", "monotonic"):
         raise ValueError(f"invalid atomic_order {atomic_order!r}")
     if K % BLOCK_K:
@@ -124,7 +126,9 @@ def compile_fused_gemm_scatter_bf16(
     if cfg.fp8_scatter or getattr(cfg, "compact_recv", False):
         raise ValueError("the BF16 fused GEMM supports only the plain BF16 scatter")
     if cfg.elem_bytes != 2:
-        raise ValueError(f"the BF16 GEMM stores BF16 C; cfg.elem_bytes={cfg.elem_bytes}")
+        raise ValueError(
+            f"the BF16 GEMM stores BF16 C; cfg.elem_bytes={cfg.elem_bytes}"
+        )
     ws = cfg.world_size
     M, N = cfg.m, cfg.n
     if N % BLOCK_N:
@@ -272,7 +276,9 @@ def compile_fused_gemm_scatter_bf16(
         b_s2r = S2RLoaderBf16(wave_n, N_TILES_B)
         # C is this rank's input region of the window (the host points it
         # there), which is what the elected put reads from.
-        store_c = AgStoreC(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, out_dtype="bf16")
+        store_c = AgStoreC(
+            C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, out_dtype="bf16"
+        )
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -400,10 +406,14 @@ def compile_fused_gemm_scatter_bf16(
             sdma = cco.DevComm(dev_comm).sdma()
             if fx.thread_idx.x == 0:
                 dest = block_m // fx.Int32(m_tiles_per_peer)
-                chunk = (block_m % fx.Int32(m_tiles_per_peer)) // fx.Int32(m_tiles_per_chunk)
+                chunk = (block_m % fx.Int32(m_tiles_per_peer)) // fx.Int32(
+                    m_tiles_per_chunk
+                )
                 slot = dest * fx.Int32(chunks) + chunk
                 ctr = signal_ptr(ctr_base + fx.Int64(slot) * fx.Int64(4))
-                seq = fx.Int32(atomic_add_u32(ctr, 1, ordering=atomic_order)) + fx.Int32(1)
+                seq = fx.Int32(
+                    atomic_add_u32(ctr, 1, ordering=atomic_order)
+                ) + fx.Int32(1)
                 # Counters are never reset: "last tile of this chunk, this
                 # epoch" is a modulo test, which keeps graph replay correct.
                 if seq % fx.Int32(tiles_per_chunk) == fx.Int32(0):
@@ -417,7 +427,9 @@ def compile_fused_gemm_scatter_bf16(
                             win,
                             fx.Int64(my_recv_slot) + off,
                             win,
-                            fx.Int64(in_off) + fx.Int64(dest) * fx.Int64(slice_bytes) + off,
+                            fx.Int64(in_off)
+                            + fx.Int64(dest) * fx.Int64(slice_bytes)
+                            + off,
                             fx.Int64(chunk_bytes),
                             dest % fx.Int32(sdma_queues),
                             coop=cco.CoopScope.THREAD,

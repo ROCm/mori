@@ -343,7 +343,9 @@ def run(args) -> int:
     if not args.block_m:
         args.block_m = 128 if args.quant == "blockscale" else 256
     if args.quant == "bf16" and args.mode == "fused-lsa":
-        raise ValueError("--quant bf16 supports gemm-only, split-sdma, fused-sdma, split-lsa")
+        raise ValueError(
+            "--quant bf16 supports gemm-only, split-sdma, fused-sdma, split-lsa"
+        )
     direct_lsa = args.mode == "fused-lsa"
     fused = args.mode in ("fused-sdma", "fused-lsa")
     # fused-lsa still uses the SDMA reduce/gather tail, so it wants queues too.
@@ -455,7 +457,9 @@ def run(args) -> int:
                 waves_per_eu=args.waves_per_eu,
                 xcd_swizzle=args.xcd_swizzle,
                 fuse=fused,
-                rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
+                rotated=(
+                    None if args.tile_order == "auto" else args.tile_order == "rotated"
+                ),
                 n_stripe=args.n_stripe or None,
                 emit_put=not args.no_put,
                 atomic_order=args.atomic,
@@ -481,7 +485,9 @@ def run(args) -> int:
                 hoist_scales=args.hoist_scales,
                 peer_uncached=args.peer_uncached,
                 direct_fence=args.direct_fence,
-                rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
+                rotated=(
+                    None if args.tile_order == "auto" else args.tile_order == "rotated"
+                ),
                 n_stripe=args.n_stripe or None,
                 emit_put=not args.no_put,
                 atomic_order=args.atomic,

@@ -112,51 +112,20 @@ cover 64 contiguous bytes of one row, which is the coalescing shape the bf16
 path reaches only after the shuffle.
 """
 
-# NOTE: no `from __future__ import annotations`, deliberately, for the reason
-# _gemm_a8w8_8wave.py states: `fx.struct` reads the `SharedStorage` field
-# annotations as live objects, and PEP 563 would hand it a string whose size
-# operands are locals of this factory.
-
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr import gpu as fgpu
-from flydsl.expr.typing import Int64
 from flydsl.expr.typing import Vector as Vec
 
-import mori.cco.device.flydsl as cco
-from mori.cco.device.flydsl import _bindings as raw_cco
+from ._compat import CM_CACHED, CM_SC0_SC1, buffer_store
 
-from ._compat import (
-    CM_CACHED,
-    CM_SC0_SC1,
-    atomic_add_u32,
-    atomic_store_u32,
-    buffer_store,
-    create_buffer_resource_from_addr,
-    signal_ptr,
-    wave_uniform_i64,
-)
-
-# The A/B swap is gemm_ar's and applies unchanged -- it is a property of the
-# MFMA's output layout, not of the operand precision. The kernel that uses this
-# module takes G2SLoader, wait_barrier, ceildiv, split_row_major_2d and
-# _xcd_swizzle_any from gemm_ar directly: all of them are byte-indexed or
-# shape-only, so none carries an fp8 assumption, and re-exporting them here
-# would only add a layer to trace through.
-from ._gemm_a8w8_8wave import (
-    G2SLoader,
-    _xcd_swizzle_any,
-    ceildiv,
-    split_row_major_2d,
-    wait_barrier,
-)
-from .kernels_fused import (
-    _acquire_peer_lock,
-    _permlane16_swap,
-    _SwappedMfma,
-)
+# The bf16 C store pairs two N-tiles with gemm_ar's permlane16 swap, a property
+# of the MFMA's output layout rather than of the operand precision. The kernel
+# factories built on this module (kernels_fused_bf16 here, gemm_ag's
+# compile_bf16_gemm_ag) take G2SLoader, wait_barrier, ceildiv,
+# split_row_major_2d, _xcd_swizzle_any and _SwappedMfma from gemm_ar directly:
+# all of them are byte-indexed or shape-only, so none carries an fp8 assumption.
+from .kernels_fused import _permlane16_swap
 
 #: The template's ``B_K``. Not a tuning knob: it sets ``E_K = B_K / W_K``, and
 #: the mainloop below issues exactly ``E_K`` MFMAs per accumulator per step.
