@@ -1507,7 +1507,15 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
 
     std::optional<RegisteredMemory> old_mem = InsertOrReplaceRegion(request.client_id(), entry);
-    if (old_mem.has_value()) ReleaseRegisteredMemory(*old_mem);
+    if (old_mem.has_value()) {
+      // The same mapping again: the inner backend kept the one registration
+      // both entries share, so only the old entry's hold on the mapping goes.
+      if (old_mem->kind == MemoryKind::kGpuIpc && old_mem->base == entry.base) {
+        ReleaseIpcMapping(IpcKey{old_mem->client_id, old_mem->device_id, old_mem->alloc_base});
+      } else {
+        ReleaseRegisteredMemory(*old_mem);
+      }
+    }
     MORI_UMBP_INFO(
         "[StandaloneServer] registered GPU IPC client_id={} worker_base=0x{:x} size={}MB "
         "device={}",
