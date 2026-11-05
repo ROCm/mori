@@ -50,6 +50,7 @@ FlyDSL is not installed.
 
 from __future__ import annotations
 
+import collections
 import functools
 import os
 
@@ -140,6 +141,28 @@ def _geometry_from_env(name):
 # MI308X out the same way (AnvilLib::isMi308x, DID 0x74A2). Capping all of gfx942
 # would have held MI300X and MI325X, which have the full set, to three as well.
 _ASYNCLL_SDMA_QUEUE_CAP = {"mi308x": 3}
+
+# Per device: how many live AsyncLL ops use each SDMA queue offset.
+_ASYNCLL_QUEUE_OFFSET_USERS = collections.defaultdict(collections.Counter)
+
+
+def _take_sdma_queue_offset(device_index: int, num_queues: int) -> int:
+    """Least-used offset among live ops on the device, lowest on a tie.
+
+    close() gives it back. More live ops than queues share one: slower, still
+    correct.
+    """
+    users = _ASYNCLL_QUEUE_OFFSET_USERS[device_index]
+    offset = min(range(num_queues), key=lambda o: (users[o], o))
+    users[offset] += 1
+    return offset
+
+
+def _give_back_sdma_queue_offset(device_index: int, offset: int) -> None:
+    users = _ASYNCLL_QUEUE_OFFSET_USERS[device_index]
+    users[offset] -= 1
+    if users[offset] <= 0:
+        del users[offset]
 
 
 def _asyncll_sdma_queues(model, gpu_per_node: int) -> int:
@@ -409,6 +432,21 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             if (cfg.is_internode or cfg.async_ll)
             else None
         )
+        # SDMA queue offset (QueueForPe adds it to the destination PE): 0, the
+        # shared queue, unless the caller opted in. LSA uses no SDMA queue.
+        self._sdma_queue_offset = 0
+        self._holds_sdma_queue_offset = False
+        if (
+            cfg.async_ll
+            and cfg.async_ll_transport == "sdma"
+            and cfg.async_ll_own_sdma_queue
+            and self._dev_comm is not None
+            and self._dev_comm.sdma_num_queue > 1
+        ):
+            self._sdma_queue_offset = _take_sdma_queue_offset(
+                self._device_index, self._dev_comm.sdma_num_queue
+            )
+            self._holds_sdma_queue_offset = True
 
         # gfx1250 dispatch staging: one dynamically-allocated buffer shared by
         # all dispatch schedule variants.  Must be set before _build_kernels
@@ -515,10 +553,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             requirements.gda_connection_type = _cco.GDA_CONNECTION_CROSSNODE
         if cfg.async_ll and cfg.async_ll_transport == "sdma":
             # One SDMA queue per peer. The transfer kernels run one issuing warp
-            # per destination and the queue is picked as destPe % sdmaNumQueue, so
-            # fewer queues than peers folds two warps onto one queue -- correct,
-            # but they then serialise on its in-order commit chain. Eight is the
-            # hardware cap; above it cco clamps with a warning.
+            # per destination and the queue is picked as (destPe + the op's
+            # sdmaQueueOffset) % sdmaNumQueue, so fewer queues than peers folds
+            # two warps onto one queue -- correct, but they then serialise on its
+            # in-order commit chain. Eight is the hardware cap; above it cco
+            # clamps with a warning.
             #
             # The count is a PERFORMANCE knob, not a correctness one, and asking
             # for more than a pair can hold is fatal rather than degrading:
@@ -1149,6 +1188,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ),
             rank=self.cfg.rank,
             lsaBase=self.lsa_base,
+            sdmaQueueOffset=self._sdma_queue_offset,
             dispDestTokIdMap=0,  # per-launch: the base passes token_dest_map or routing_dest_map
             interNodeDispDestTokIdMap=ptr(self.inter_disp_dest_tok_id_map),
             interNodeDispSendMap=ptr(self.inter_disp_send_map),
@@ -1836,6 +1876,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._dev_comm = None
             self._internode_static_cache = None
             dev_comm.close()
+        if getattr(self, "_holds_sdma_queue_offset", False):
+            self._holds_sdma_queue_offset = False
+            _give_back_sdma_queue_offset(self._device_index, self._sdma_queue_offset)
 
     # -- views (same contract as the FlyDSL backend) -----------------------
 
