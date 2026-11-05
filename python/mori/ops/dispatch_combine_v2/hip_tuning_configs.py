@@ -236,14 +236,14 @@ _DISPATCH_TABLE: dict = {
             "fp4": ((256, 32, 8), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
         },
     },
-    # Parts that can run gfx1250-strict (ASIC revision 0), either code target, EP4,
-    # hidden 7168. Dispatch and combine hold one block per CU (LDS) while a block waits
-    # for the whole grid, and these parts have fewer CUs than the 256-block gfx1250
-    # rows assume, so those would hang on them.
-    # Graph-timed, median of 3 rounds; within 3% the smaller geometry wins.
+    # Parts that can run gfx1250-strict (ASIC revision 0), either code target, EP4.
+    # Dispatch and combine hold one block per CU (LDS) while a block waits for the whole
+    # grid, and these parts have fewer CUs than the 256-block gfx1250 rows assume, so
+    # those would hang on them.
+    # Graph-timed, median of 3 rounds; within 3-5% the smaller geometry wins.
     "gfx1250-strict": {
         (4, 7168, 8, None): {
-            None: ((1024, 64, 16), (4096, 64, 8), (None, 64, 16)),
+            None: ((512, 64, 8), (1024, 64, 16), (None, 64, 8)),
             "fp8": ((256, 64, 8), (1024, 64, 16), (1536, 64, 24), (None, 64, 32)),
             "fp4": (
                 (256, 64, 8),
@@ -255,7 +255,7 @@ _DISPATCH_TABLE: dict = {
             ),
         },
         (4, 7168, 9, None): {
-            None: ((1024, 64, 16), (None, 128, 16)),
+            None: ((4096, 64, 8), (None, 64, 16)),
             "fp8": ((256, 64, 8), (1024, 64, 16), (1536, 64, 24), (None, 64, 32)),
             "fp4": (
                 (512, 64, 8),
@@ -266,7 +266,7 @@ _DISPATCH_TABLE: dict = {
             ),
         },
         (4, 7168, 6, None): {
-            None: ((64, 128, 16), (1024, 64, 16), (1536, 128, 16), (None, 64, 16)),
+            None: ((4096, 64, 8), (None, 64, 16)),
             "fp8": ((1024, 64, 8), (1536, 64, 24), (2048, 64, 16), (None, 64, 32)),
             "fp4": (
                 (512, 64, 8),
@@ -275,6 +275,11 @@ _DISPATCH_TABLE: dict = {
                 (8192, 64, 32),
                 (None, 128, 16),
             ),
+        },
+        # 16 warps from 512 tokens; the gfx1250 rows' 8-warp grids trail well behind here.
+        (4, 2048, 8, 64): {
+            "bf16": ((256, 32, 8), (512, 32, 16), (1024, 64, 16), (None, 128, 16)),
+            "fp4": ((256, 32, 8), (512, 32, 16), (1024, 64, 16), (None, 128, 16)),
         },
     },
 }
@@ -312,9 +317,9 @@ _COMBINE_TABLE: dict = {
     },
     # The gfx1250-strict parts, as their dispatch rows.
     "gfx1250-strict": {
-        (4, 7168, 8, None): ((64, 64, 4), (None, 64, 8)),
-        (4, 7168, 9, None): ((256, 64, 4), (4096, 64, 8), (None, 64, 4)),
-        (4, 7168, 6, None): ((256, 64, 4), (None, 64, 8)),
+        (4, 7168, 8, None): ((128, 64, 4), (512, 128, 8), (None, 64, 8)),
+        (4, 7168, 9, None): ((128, 64, 4), (256, 128, 8), (None, 64, 8)),
+        (4, 7168, 6, None): ((128, 64, 4), (256, 128, 8), (None, 64, 8)),
     },
 }
 
