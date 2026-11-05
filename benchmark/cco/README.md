@@ -109,12 +109,6 @@ it before comparing configurations:
 export MORI_SDMA_NUM_CHANNELS=8
 ```
 
-On MI308X, two of a GPU's xGMI links can fold onto the same SDMA engine, so the
-copies to those two peers share one engine. `MORI_SDMA_SPREAD_MI308X=1` moves
-such a link to the least-used xGMI engine (4 GPUs, 46 MB per rank to 3 peers:
-all-gather 0.73 -> 0.41 ms, reduce-scatter 0.72 -> 0.44 ms). It only affects
-single-engine peer links on MI308X.
-
 `-c` (grid) and `-T` (threads per block) select how many *issue units* split the
 transfer. A unit is a thread, a wavefront or a block, per `-s`. Queues are
 round-robined over the units, so only `min(units, MORI_SDMA_NUM_CHANNELS)` are
