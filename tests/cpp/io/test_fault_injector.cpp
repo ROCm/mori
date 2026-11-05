@@ -186,6 +186,29 @@ void MarkersDoNotConsumeRules() {
   injector.ForgetAsyncEndpoint(&ep.context, ep.qp.qp_num, &ep.cq);
 }
 
+void TrackingFreezeAndAdmissionFailure() {
+  Endpoint ep;
+  auto& injector = FaultInjector::Instance();
+  injector.Arm(ParseFaultRule("sq_reserve_fail:skip=1"));
+  Require(!injector.FailSqReservation(&ep.qp) && injector.FailSqReservation(&ep.qp),
+          "admission fault must fire at the configured reservation");
+  Require(injector.Fired() == 1, "admission fault counter");
+  injector.Disarm();
+  injector.Arm(ParseFaultRule("tracking_freeze:op=write"));
+  ep.context.ops.poll_cq = [](ibv_cq*, int, ibv_wc* wc) {
+    wc[0] = {};
+    wc[0].wr_id = kSqTag | 9;
+    wc[0].status = IBV_WC_SUCCESS;
+    wc[0].opcode = IBV_WC_RDMA_WRITE;
+    wc[0].qp_num = 17;
+    return 1;
+  };
+  ibv_wc wc{};
+  Require(injector.PollCq(&ep.cq, 1, &wc) == 1 && wc.wr_id == kSqTag && injector.Fired() == 1,
+          "explicit freeze injects an invalid SQ sequence without dropping the CQE");
+  injector.Disarm();
+}
+
 void NotificationStaging() {
   Endpoint ep;
   auto& injector = FaultInjector::Instance();
@@ -218,8 +241,10 @@ int main() {
     PortRecoveryOrder();
     ResourceRetirement();
     MarkersDoNotConsumeRules();
+    TrackingFreezeAndAdmissionFailure();
     NotificationStaging();
-    std::cout << "PASS: port recovery order, resource retirement, notification staging\n";
+    std::cout << "PASS: port recovery, retirement, markers, admission, tracking freeze, "
+                 "notification staging\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

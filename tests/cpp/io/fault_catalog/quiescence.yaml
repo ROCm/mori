@@ -1,0 +1,56 @@
+# Local completion evidence on healthy and failed QPs. No performance checks.
+# quiescence: quiesced (default), pending, or unprovable.
+# successor: issue B on the same immutable write source before waiting for A.
+# same_qp: the recovered transfer must reuse the original physical SQ ledger(s).
+# Unsafe old buffers are retained; recovery uses fresh registered buffers.
+
+- id: none.quiescence
+  real_world: success with local quiescence and no QP replacement
+  transfer: write
+  warmup: 1
+  same_qp: true
+
+- id: post_send_fail.batch.second_qp.unsignaled
+  real_world: a healthy sibling QP has an unsignaled tail when the second post fails
+  rule: post_send_fail:skip=1
+  transfer: batch
+  warmup: 1
+  env: MORI_IO_POST_BATCH_SIZE=1,MORI_IO_ENABLE_CHUNKING=1
+  same_qp: true
+
+- id: sq_reserve_fail.write.unsignaled
+  real_world: admission fails after a healthy QP accepted an unsignaled prefix
+  rule: sq_reserve_fail:skip=1
+  transfer: write
+  warmup: 1
+  env: MORI_IO_POST_BATCH_SIZE=1,MORI_IO_ENABLE_CHUNKING=1
+  same_qp: true
+
+- id: cqe_drop.successor
+  real_world: B covers A's lost signaled completion on the same QP
+  rule: cqe_drop:op=write
+  transfer: write
+  warmup: 1
+  successor: true
+  same_qp: true
+
+- id: tracking_freeze.write
+  real_world: an explicitly corrupted SQ sequence makes completion tracking untrusted
+  rule: tracking_freeze:op=write
+  transfer: write
+  warmup: 1
+  quiescence: unprovable
+
+- id: cq_err.quiescence
+  real_world: an unusable CQ provides no local completion evidence
+  rule: async_event:value=cq_err:op=write
+  transfer: write
+  warmup: 1
+  quiescence: unprovable
+  peer_failure: LOCAL_CQ_ERROR
+
+- id: qp_error.quiescence
+  real_world: real error and flush completions cover the data prefix
+  rule: qp_error
+  transfer: batch
+  warmup: 1

@@ -85,6 +85,7 @@
 - id: cq_err.write
   real_world: local CQ failure loses all completions; async handling must settle the transfer
   rule: async_event:value=cq_err:op=write
+  quiescence: unprovable
   transfer: write
   peer_failure: LOCAL_CQ_ERROR
   during: succeed
@@ -95,12 +96,14 @@
   transfer: write
   peer_failure: LOCAL_CQ_ERROR
   env: MORI_IO_FAIL_ON_ASYNC_EVENT=0
+  quiescence: pending
   known_bug: no-completion-deadline
   fails: ends
 
 - id: device_fatal.write
   real_world: local NIC fatal during a write
   rule: async_event:value=device_fatal:op=write
+  quiescence: unprovable
   transfer: write
   peer_failure: LOCAL_DEVICE_FATAL
   during: reject
@@ -110,6 +113,7 @@
 - id: device_fatal.batch
   real_world: local NIC fatal on the second QP post of a batch
   rule: async_event:value=device_fatal:op=write:skip=1
+  quiescence: unprovable
   transfer: batch
   peer_failure: LOCAL_DEVICE_FATAL
   during: reject
@@ -122,6 +126,7 @@
   transfer: write
   peer_failure: none
   env: MORI_IO_ENABLE_ASYNC_EVENTS=0
+  quiescence: pending
   known_bug: no-completion-deadline
   fails: ends, recovers
 

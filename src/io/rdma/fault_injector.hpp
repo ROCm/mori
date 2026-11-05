@@ -44,15 +44,17 @@ namespace io {
 // Each kind is one verbs-level symptom; real-world causes (link down, peer
 // frozen, NIC reset, ...) are expressed as one of these.
 enum class FaultKind : uint8_t {
-  PostSendFail,  // ibv_post_send returns `value` (errno), nothing posted
-  PostRecvFail,  // ibv_post_recv returns `value` (errno)
-  QpError,       // move the QP to IBV_QPS_ERR right before a send: real flush cascade
-  CqeError,      // rewrite a successful CQE's status to `value` (ibv_wc_status) and move
-                 // its QP to IBV_QPS_ERR, as the NIC does after any error completion
-  CqeDrop,       // swallow a successful CQE: the completion never arrives
-  AsyncEvent,    // synthesize a verbs async event after posting
-  PortDown,      // PORT_ERR until explicit Disarm(), then PORT_ACTIVE
-  PortFlap,      // PORT_ERR followed by PORT_ACTIVE after value milliseconds
+  PostSendFail,    // ibv_post_send returns `value` (errno), nothing posted
+  PostRecvFail,    // ibv_post_recv returns `value` (errno)
+  QpError,         // move the QP to IBV_QPS_ERR right before a send: real flush cascade
+  CqeError,        // rewrite a successful CQE's status to `value` (ibv_wc_status) and move
+                   // its QP to IBV_QPS_ERR, as the NIC does after any error completion
+  CqeDrop,         // swallow a successful CQE: the completion never arrives
+  TrackingFreeze,  // invalidate a SQ completion sequence, explicitly freezing tracking
+  SqReserveFail,   // fail SQ admission without changing the QP or touching a WR
+  AsyncEvent,      // synthesize a verbs async event after posting
+  PortDown,        // PORT_ERR until explicit Disarm(), then PORT_ACTIVE
+  PortFlap,        // PORT_ERR followed by PORT_ACTIVE after value milliseconds
 };
 
 struct FaultRule {
@@ -66,9 +68,9 @@ struct FaultRule {
 
 // Parses "kind[:key=value]...", e.g. "cqe_drop:op=write:skip=10:count=1" or
 // "cqe_error:value=retry_exc". Kinds: post_send_fail, post_recv_fail, qp_error,
-// cqe_error, cqe_drop, async_event, port_down, port_flap. Keys: skip, count,
-// value, op (write|read|send|recv|<int>),
-// qpn. Throws std::invalid_argument on a malformed spec.
+// cqe_error, cqe_drop, tracking_freeze, sq_reserve_fail, async_event, port_down, port_flap. Keys:
+// skip, count, value, op (write|read|send|recv|<int>), qpn. Throws std::invalid_argument on a
+// malformed spec.
 FaultRule ParseFaultRule(const std::string& spec);
 const char* FaultKindName(FaultKind kind);
 
@@ -81,6 +83,7 @@ class FaultInjector final : public VerbsOps {
   void Arm(const FaultRule& rule);
   void Disarm() noexcept;
   uint64_t Fired() const { return fired_.load(std::memory_order_relaxed); }
+  bool FailSqReservation(ibv_qp* qp);
   bool Failed() const { return failed_.load(std::memory_order_relaxed); }
 
   int PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) override;

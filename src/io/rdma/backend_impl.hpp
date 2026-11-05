@@ -308,6 +308,8 @@ class ControlPlaneServer {
 /*                                       RdmaBackendSession                                       */
 /* ---------------------------------------------------------------------------------------------- */
 class RdmaBackendSession : public BackendSession {
+  friend struct RdmaSessionTest;
+
  public:
   RdmaBackendSession() = default;
   RdmaBackendSession(const RdmaBackendConfig& config,

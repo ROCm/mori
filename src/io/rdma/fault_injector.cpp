@@ -53,6 +53,8 @@ constexpr NamedValue kKinds[] = {
     {"qp_error", static_cast<int>(FaultKind::QpError)},
     {"cqe_error", static_cast<int>(FaultKind::CqeError)},
     {"cqe_drop", static_cast<int>(FaultKind::CqeDrop)},
+    {"tracking_freeze", static_cast<int>(FaultKind::TrackingFreeze)},
+    {"sq_reserve_fail", static_cast<int>(FaultKind::SqReserveFail)},
     {"async_event", static_cast<int>(FaultKind::AsyncEvent)},
     {"port_down", static_cast<int>(FaultKind::PortDown)},
     {"port_flap", static_cast<int>(FaultKind::PortFlap)},
@@ -230,6 +232,10 @@ FaultRule ParseFaultRule(const std::string& spec) {
       throw std::invalid_argument("MORI_IO_FAULT: port_flap duration must be positive");
     }
   }
+  if (rule.kind == FaultKind::TrackingFreeze && rule.wcOpcode == IBV_WC_RECV)
+    throw std::invalid_argument("tracking_freeze requires a SQ completion");
+  if (rule.kind == FaultKind::SqReserveFail && rule.wcOpcode != -1)
+    throw std::invalid_argument("sq_reserve_fail takes no op filter");
   return rule;
 }
 
@@ -339,6 +345,14 @@ bool FaultInjector::MoveQpToError(ibv_qp* qp) {
   return ret == 0;
 }
 
+bool FaultInjector::FailSqReservation(ibv_qp* qp) {
+  if (!armed_.load(std::memory_order_relaxed)) return false;
+  int value = 0;
+  if (!ShouldFire(FaultKind::SqReserveFail, qp->qp_num, -1, &value)) return false;
+  RecordInjection(FaultKind::SqReserveFail, qp->qp_num, -1, value);
+  return true;
+}
+
 int FaultInjector::PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) {
   if (wr && wr->opcode == IBV_WR_RDMA_WRITE && wr->num_sge == 0 && wr->next == nullptr &&
       IsSqWrId(wr->wr_id)) {
@@ -444,6 +458,11 @@ int FaultInjector::PollCq(ibv_cq* cq, int numEntries, ibv_wc* wc) try {
       }
     }
     if (!marker && wc[i].status == IBV_WC_SUCCESS) {
+      if (IsSqWrId(wc[i].wr_id) &&
+          ShouldFire(FaultKind::TrackingFreeze, wc[i].qp_num, wc[i].opcode, &value)) {
+        RecordInjection(FaultKind::TrackingFreeze, wc[i].qp_num, wc[i].opcode, value);
+        wc[i].wr_id = kSqTag;  // seq zero is never a valid SQ publication.
+      }
       if (ShouldFire(FaultKind::CqeDrop, wc[i].qp_num, wc[i].opcode, &value)) {
         RecordInjection(FaultKind::CqeDrop, wc[i].qp_num, wc[i].opcode, value);
         continue;

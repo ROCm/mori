@@ -77,6 +77,21 @@
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/rdma/fault_injector.hpp"
 
+namespace mori::io {
+struct RdmaSessionTest {
+  struct Probe : IOEngineSession {
+    explicit Probe(const IOEngineSession& session) : IOEngineSession(session) {}
+    BackendSession* Native() const { return backendSess.get(); }
+  };
+  static std::vector<SubmissionLedger*> Ledgers(const IOEngineSession& session) {
+    auto* native = dynamic_cast<RdmaBackendSession*>(Probe(session).Native());
+    if (!native) throw std::runtime_error("expected RDMA session");
+    std::vector<SubmissionLedger*> result;
+    for (const auto& ep : native->eps) result.push_back(ep.ledger.get());
+    return result;
+  }
+};
+}  // namespace mori::io
 using namespace mori::io;
 
 namespace {
@@ -102,16 +117,19 @@ struct Entry {
   bool notify{false};
   int warmup{0};
   Side side{Side::Initiator};
-  std::string peerFailure;      // empty = unchecked, none = expect no event
-  std::string during;           // empty, reject, succeed
-  std::string env;              // KEY=VAL[,KEY=VAL]
+  std::string peerFailure;  // empty = unchecked, none = expect no event
+  std::string during;       // empty, reject, succeed
+  std::string env;          // KEY=VAL[,KEY=VAL]
+  std::string quiescence{"quiesced"};
+  bool successor{false};
+  bool sameQp{false};
   bool waits{false};            // the fault hits after the data WRs are posted
   std::string knownBug;         // empty = expected to pass every check
   std::set<std::string> fails;  // with knownBug: the checks expected to fail today
 };
 
-const std::set<std::string> kChecks = {"ends",     "honest", "recovers", "alive",
-                                       "reported", "during", "waits"};
+const std::set<std::string> kChecks = {"ends",   "honest", "recovers", "alive",  "reported",
+                                       "during", "waits",  "quiesces", "same_qp"};
 
 std::string CatalogPath() {
   const char* path = std::getenv("MORI_IO_FAULT_CATALOG");
@@ -122,9 +140,10 @@ std::string CatalogPath() {
 // Loads and validates a catalog; throws with the file and entry on any mistake,
 // so a typo never silently drops or weakens an entry.
 std::vector<Entry> LoadCatalog(const std::string& path) {
-  const std::set<std::string> kFields = {
-      "id",        "real_world", "rule",         "transfer", "notify", "warmup", "side",
-      "known_bug", "fails",      "peer_failure", "during",   "env",    "waits"};
+  const std::set<std::string> kFields = {"id",     "real_world",   "rule",      "transfer",
+                                         "notify", "warmup",       "side",      "known_bug",
+                                         "fails",  "peer_failure", "during",    "env",
+                                         "waits",  "quiescence",   "successor", "same_qp"};
   std::vector<Entry> entries;
   std::set<std::string> ids;
   for (const mori::yaml::FlatMap& raw : mori::yaml::LoadFlatList(path)) {
@@ -185,6 +204,13 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
         throw std::runtime_error(where + ": env requires KEY=VAL[,KEY=VAL]");
       }
     }
+    e.quiescence = mori::yaml::GetString(raw, "quiescence", "quiesced");
+    if (e.quiescence != "quiesced" && e.quiescence != "pending" && e.quiescence != "unprovable")
+      throw std::runtime_error(where + ": bad quiescence expectation");
+    e.successor = mori::yaml::GetBool(raw, "successor", false, where);
+    e.sameQp = mori::yaml::GetBool(raw, "same_qp", false, where);
+    if (e.successor && e.op != Op::Write)
+      throw std::runtime_error(where + ": successor shares an immutable write source");
     e.waits = mori::yaml::GetBool(raw, "waits", false, where);
     e.knownBug = mori::yaml::GetString(raw, "known_bug");
     std::istringstream fails(mori::yaml::GetString(raw, "fails"));
@@ -194,12 +220,12 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
       if (kChecks.count(check) == 0) {
         throw std::runtime_error(where + ": fails lists '" + check +
                                  "'; checks are ends, honest, recovers, alive, reported, during, "
-                                 "waits");
+                                 "waits, quiesces, same_qp");
       }
       e.fails.insert(check);
     }
     if ((e.fails.count("reported") && e.peerFailure.empty()) ||
-        (e.fails.count("during") && e.during.empty())) {
+        (e.fails.count("during") && e.during.empty()) || (e.fails.count("same_qp") && !e.sameQp)) {
       throw std::runtime_error(where + ": fails names an unchecked field");
     }
     if (e.knownBug.empty() != e.fails.empty()) {
@@ -443,8 +469,10 @@ int ServeTarget(const Entry& e, int fd) {
   const int gpu = TargetGpu();
   auto engine = MakeEngine(kTargetKey, e);
   GpuBuffer buf(engine.get(), gpu);
+  GpuBuffer* active = &buf;
+  std::vector<std::unique_ptr<GpuBuffer>> retained;
   std::string msg;
-  if (!SendMsg(fd, Pack(engine->GetEngineDesc())) || !SendMsg(fd, Pack(buf.desc)) ||
+  if (!SendMsg(fd, Pack(engine->GetEngineDesc())) || !SendMsg(fd, Pack(active->desc)) ||
       !RecvMsg(fd, &msg, kSetupMs)) {
     return kExitFail;
   }
@@ -456,14 +484,18 @@ int ServeTarget(const Entry& e, int fd) {
     std::string cmd;
     in >> cmd;
     std::string reply = "ok";
-    if (cmd == "fill") {
+    if (cmd == "rotate") {
+      retained.push_back(std::make_unique<GpuBuffer>(engine.get(), gpu));
+      active = retained.back().get();
+      reply = Pack(active->desc);
+    } else if (cmd == "fill") {
       int pattern = 0;
       in >> pattern;
-      buf.Fill(pattern);
+      active->Fill(pattern);
     } else if (cmd == "check") {
       int op = 0, pattern = 0;
       in >> op >> pattern;
-      reply = buf.Holds(static_cast<Op>(op), pattern) ? "ok" : "no";
+      reply = active->Holds(static_cast<Op>(op), pattern) ? "ok" : "no";
     } else if (cmd == "told") {
       TransferUniqueId id = 0;
       int ms = 0;
@@ -546,13 +578,15 @@ class PeerRig {
   }
 
   // Starts one transfer with a fresh data pattern in its source and zeros in its destination.
-  Transfer* Start(Op op) {
+  Transfer* Start(Op op, bool initialize = true) {
     transfers_.push_back(std::make_unique<Transfer>());
     Transfer* t = transfers_.back().get();
     t->op = op;
     t->id = engine_->AllocateTransferUniqueId();
     t->pattern = static_cast<int>(transfers_.size() % 250 + 1);
-    if (op == Op::Read) {
+    if (!initialize) {
+      t->pattern = transfers_[transfers_.size() - 2]->pattern;
+    } else if (op == Op::Read) {
       Ask("fill " + std::to_string(t->pattern));
       local_->Fill(0);
     } else {
@@ -604,6 +638,10 @@ class PeerRig {
       *why = std::string(CodeName(code)) + " " + t->status.Message();
       return false;
     }
+    if (!t->status.WaitQuiesced(kDeadlineMs)) {
+      *why = "successful result without quiescence";
+      return false;
+    }
     if (!DataLanded(*t)) {
       *why = "SUCCESS but data did not land";
       return false;
@@ -613,6 +651,22 @@ class PeerRig {
       return false;
     }
     return true;
+  }
+
+  bool FreshBuffers() {
+    auto remote = Ask("rotate");
+    if (!remote) return false;
+    retiredLocals_.push_back(std::move(local_));
+    local_ = std::make_unique<GpuBuffer>(engine_.get(), kInitiatorGpu);
+    remote_ = Unpack<MemoryDesc>(*remote);
+    session_.reset();
+    return true;
+  }
+
+  std::vector<SubmissionLedger*> SessionLedgers() {
+    auto session = engine_->CreateSession(local_->desc, remote_);
+    if (!session) throw std::runtime_error("could not create a probe session");
+    return RdmaSessionTest::Ledgers(*session);
   }
 
   void Arm(const std::string& rule) {
@@ -726,6 +780,7 @@ class PeerRig {
   std::unique_ptr<IOEngine> engine_;
   std::unique_ptr<GpuBuffer> local_;
   MemoryDesc remote_{};
+  std::vector<std::unique_ptr<GpuBuffer>> retiredLocals_;
   std::optional<IOEngineSession> session_;
   std::vector<std::unique_ptr<Transfer>> transfers_;  // MORI keeps pointers to their statuses
 };
@@ -734,7 +789,9 @@ class PeerRig {
 // each 1 (passed), 0 (failed) or -1 (the entry does not ask for the check).
 int RunEntry(const Entry& e) {
   ApplyEnv(e);
-  PeerRig rig(e);
+  // Keep statuses and registered buffers alive until RunRole calls _Exit, even
+  // when an entry ends without a completion proof. This also avoids faulted teardown.
+  PeerRig& rig = *new PeerRig(e);
   std::string why;
   for (int i = 0; i < e.warmup; ++i) {
     if (!rig.Completes(rig.Start(e.op), &why)) {
@@ -743,66 +800,69 @@ int RunEntry(const Entry& e) {
     }
   }
 
+  auto initialQps = e.sameQp ? rig.SessionLedgers() : std::vector<SubmissionLedger*>{};
   const bool faulted = !e.rule.empty();
   if (faulted) rig.Arm(e.rule);
 
   Transfer* t = rig.Start(e.op);
-  // Read right away: a 1 MiB transfer is still on the wire microseconds after the call.
   StatusCode atReturn = t->status.Code();
   int waits = e.waits ? atReturn == StatusCode::IN_PROGRESS : -1;
-  if (waits == 0) {
-    std::printf("    the call returned %s while its data WRs were still on the wire\n",
-                CodeName(atReturn));
-  }
+  // No source mutation or destination reset: B shares A's immutable write source.
+  Transfer* successor = e.successor ? rig.Start(e.op, false) : nullptr;
   StatusCode code = t->status.WaitFor(kDeadlineMs);
-  bool ends = code != StatusCode::IN_PROGRESS;
-  bool honest = true;
-  if (code == StatusCode::SUCCESS) {
-    honest = rig.DataLanded(*t) && rig.TargetTold(*t, kDeadlineMs);
-  }
-  std::printf("    faulted transfer: %s %s\n", CodeName(code), t->status.Message().c_str());
+  int ends = code != StatusCode::IN_PROGRESS;
+  auto proof = t->status.WaitQuiescence(kDeadlineMs);
+  auto expected = e.quiescence == "quiesced"  ? QuiescenceState::Quiesced
+                  : e.quiescence == "pending" ? QuiescenceState::Pending
+                                              : QuiescenceState::Unprovable;
+  int quiesces = proof == expected;
+  std::printf("    faulted transfer: %s %s; quiescence=%d expected=%s\n", CodeName(code),
+              t->status.Message().c_str(), static_cast<int>(proof), e.quiescence.c_str());
 
+  int honest = -1, recovers = -1, during = -1, sameQp = -1;
+  if (quiesces && proof == QuiescenceState::Quiesced) {
+    honest = code != StatusCode::SUCCESS || (rig.DataLanded(*t) && rig.TargetTold(*t, kDeadlineMs));
+    if (successor) honest = t->status.Failed() && rig.Completes(successor, &why);
+  }
   std::optional<uint64_t> fired = faulted ? rig.Fired() : std::optional<uint64_t>(0);
   int reported = e.peerFailure.empty() ? -1 : static_cast<int>(rig.Reported());
-  int during = -1;
-  if (!e.during.empty()) {
+  // A matched Pending/Unprovable expectation can still test recovery on fresh memory.
+  // Local quiescence does not certify the remote buffer after a fault.
+  bool needsFreshBuffers = faulted || proof != QuiescenceState::Quiesced;
+  bool canContinue = quiesces && (!needsFreshBuffers || rig.FreshBuffers());
+  if (canContinue && !e.during.empty()) {
     if (e.peerFailure.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     Transfer* next = rig.Start(e.op);
-    if (e.during == "reject") {
+    if (e.during == "reject")
       during = next->status.Code() == StatusCode::ERR_RDMA_OP;
-    } else if (e.during == "fail") {
+    else if (e.during == "fail") {
       next->status.WaitFor(kDeadlineMs);
       during = next->status.Failed();
-    } else {
+    } else
       during = rig.Completes(next, &why);
-    }
-    std::printf("    during fault: %s %s\n", CodeName(next->status.Code()),
-                next->status.Message().c_str());
+    if (faulted || !next->status.WaitQuiesced(kDeadlineMs)) canContinue = rig.FreshBuffers();
   }
   rig.Disarm();
-  if (faulted && rig.InjectionFailed()) {
-    std::printf("    the injection failed; this is a harness error, not a known bug\n");
-    return kExitFail;
-  }
-  if (faulted && fired && *fired == 0) {
-    std::printf("    the fault never fired: the entry does not exercise its rule\n");
-    return kExitFail;
-  }
-
-  if (e.peerFailure == "LOCAL_PORT_DOWN") rig.SessionAlive(true);
-  bool recovers = rig.Completes(rig.Start(e.op), &why) && rig.SessionAlive(false);
-  if (!recovers) std::printf("    after the fault cleared: %s\n", why.c_str());
-
   bool targetAlive = rig.TargetAlive(&why);
-  if (!targetAlive) std::printf("    target process: %s\n", why.c_str());
-
-  if (faulted && rig.InjectionFailed()) {
-    std::printf("    the injection failed; this is a harness error, not a known bug\n");
+  // Injection validation precedes RESULT so known-bug handling cannot hide a harness error.
+  if (faulted && (rig.InjectionFailed() || (fired && *fired == 0))) {
+    std::printf("    injection failed or never fired; target alive=%d\n", targetAlive);
     return kExitFail;
   }
-  std::printf("RESULT ends=%d honest=%d recovers=%d target=%d reported=%d during=%d waits=%d\n",
-              ends, honest, recovers, targetAlive, reported, during, waits);
-  return ends && honest && recovers && targetAlive && reported != 0 && during != 0 && waits != 0
+  if (canContinue) {
+    if (e.peerFailure == "LOCAL_PORT_DOWN") rig.SessionAlive(true);
+    recovers = rig.Completes(rig.Start(e.op), &why) && rig.SessionAlive(false);
+    if (e.sameQp) sameQp = initialQps == rig.SessionLedgers();
+  }
+  // Check again after recovery, even when quiescence prevented all further transfers.
+  targetAlive = rig.TargetAlive(&why);
+  if (faulted && rig.InjectionFailed()) return kExitFail;
+  std::printf(
+      "RESULT ends=%d honest=%d recovers=%d target=%d reported=%d during=%d waits=%d quiesces=%d "
+      "same_qp=%d\n",
+      ends, honest, recovers, targetAlive, reported, during, waits, quiesces, sameQp);
+  return ends != 0 && honest != 0 && recovers != 0 && targetAlive && reported != 0 && during != 0 &&
+                 waits != 0 && quiesces != 0 && sameQp != 0
              ? kExitPass
              : kExitFail;
 }
@@ -816,7 +876,8 @@ struct Outcome {
   bool skipped{false};
   bool hasResult{false};  // the initiator printed its RESULT line
   // 1 = passed, 0 = failed, -1 = not reached (a process died before reporting)
-  int ends{-1}, honest{-1}, recovers{-1}, target{-1}, reported{-1}, during{-1}, waits{-1};
+  int ends{-1}, honest{-1}, recovers{-1}, target{-1}, reported{-1}, during{-1}, waits{-1},
+      quiesces{-1}, sameQp{-1};
   bool alive{true};
   std::string note;      // how a process died, if one did
   std::string topology;  // "initiator GPU 0 ionic_0 -> target ... (cross-NIC)"
@@ -868,9 +929,9 @@ Outcome RunChild(const char* self, const Entry& e) {
       out.hasResult =
           std::sscanf(line.c_str(),
                       "RESULT ends=%d honest=%d recovers=%d target=%d reported=%d during=%d "
-                      "waits=%d",
+                      "waits=%d quiesces=%d same_qp=%d",
                       &out.ends, &out.honest, &out.recovers, &out.target, &out.reported,
-                      &out.during, &out.waits) == 7;
+                      &out.during, &out.waits, &out.quiesces, &out.sameQp) == 9;
     } else if (!line.empty()) {
       size_t topo = line.find("topology: ");
       if (topo != std::string::npos) out.topology = line.substr(topo + 10);
@@ -922,8 +983,9 @@ Verdict Judge(const Entry& e, const Outcome& o) {
   if (o.skipped) return {Verdict::Skip, ""};
   if (!o.hasResult && o.alive) return {Verdict::Fail, "no result; see the output above"};
   const std::pair<const char*, int> checks[] = {
-      {"ends", o.ends},         {"honest", o.honest}, {"recovers", o.recovers}, {"alive", o.alive},
-      {"reported", o.reported}, {"during", o.during}, {"waits", o.waits}};
+      {"ends", o.ends},   {"honest", o.honest},     {"recovers", o.recovers},
+      {"alive", o.alive}, {"reported", o.reported}, {"during", o.during},
+      {"waits", o.waits}, {"quiesces", o.quiesces}, {"same_qp", o.sameQp}};
   std::set<std::string> unexpected, fixed;
   for (const auto& [name, result] : checks) {
     bool expectedToFail = e.fails.count(name) > 0;
@@ -942,12 +1004,34 @@ Verdict Judge(const Entry& e, const Outcome& o) {
   return {Verdict::Pass, ""};
 }
 
+void CheckResultChecks() {
+  Entry entry;
+  Outcome out;
+  out.hasResult = true;
+  out.ends = 1;
+  out.quiesces = 0;
+  out.target = 1;
+  if (Judge(entry, out).kind != Verdict::Fail)
+    throw std::runtime_error("failed quiescence was hidden behind unexecuted checks");
+  out.quiesces = 1;
+  if (Judge(entry, out).kind != Verdict::Pass)
+    throw std::runtime_error("unexecuted checks must remain unchecked");
+  entry.knownBug = "no-completion-deadline";
+  entry.fails.insert("ends");
+  out.ends = 0;
+  out.alive = false;
+  out.target = 0;
+  if (Judge(entry, out).kind != Verdict::Fail)
+    throw std::runtime_error("target death was hidden by a known bug");
+}
+
 void CheckParser() {
   for (const char* bad :
        {"no_such_kind", "cqe_drop:skip", "cqe_drop:bogus=1", "qp_error:skip=x", "async_event",
         "async_event:value=typo", "async_event:value=999", "async_event:value=srq_err",
         "async_event:value=srq_limit_reached", "async_event:value=14", "async_event:value=15",
-        "port_down:count=0", "port_flap:count=2", "port_flap:value=0", "port_flap:value=-1"}) {
+        "tracking_freeze:op=recv", "sq_reserve_fail:op=write", "port_down:count=0",
+        "port_flap:count=2", "port_flap:value=0", "port_flap:value=-1"}) {
     bool threw = false;
     try {
       ParseFaultRule(bad);
@@ -1073,11 +1157,12 @@ int Report(const std::vector<std::pair<const Entry*, Outcome>>& results,
     const char* alive = o.skipped ? "-" : o.alive ? "ok" : "FAIL";
     std::printf("%-36s %-6s %-6s %-8s %-6s %-7s %s\n", e->id.c_str(), Mark(o.ends), Mark(o.honest),
                 Mark(o.recovers), alive, kVerdictNames[v.kind], v.why.c_str());
-    std::printf("    reported=%s during=%s waits=%s\n", Mark(o.reported), Mark(o.during),
-                Mark(o.waits));
+    std::printf("    reported=%s during=%s waits=%s quiesces=%s same_qp=%s\n", Mark(o.reported),
+                Mark(o.during), Mark(o.waits), Mark(o.quiesces), Mark(o.sameQp));
     rows += "| " + e->id + " | " + Mark(o.ends) + " | " + Mark(o.honest) + " | " +
             Mark(o.recovers) + " | " + alive + " | " + Mark(o.reported) + " | " + Mark(o.during) +
-            " | " + Mark(o.waits) + " | " + kVerdictNames[v.kind] + " | " + v.why + " |\n";
+            " | " + Mark(o.waits) + " | " + Mark(o.quiesces) + " | " + Mark(o.sameQp) + " | " +
+            kVerdictNames[v.kind] + " | " + v.why + " |\n";
     if (github && (v.kind == Verdict::Fail || v.kind == Verdict::XPass)) {
       std::printf("::error title=Fault catalog %s::%s %s\n", kVerdictNames[v.kind], e->id.c_str(),
                   v.why.c_str());
@@ -1108,9 +1193,10 @@ int Report(const std::vector<std::pair<const Entry*, Outcome>>& results,
        << "\n\n**" << summary << "**";
     if (!topology.empty()) md << "  \nTopology: " << topology;
     if (!bugs.empty()) md << "  \nKnown bugs: " << bugs;
-    md << "\n\n| entry | ends | honest | recovers | alive | reported | during | waits | verdict | "
+    md << "\n\n| entry | ends | honest | recovers | alive | reported | during | waits | quiesces | "
+          "same_qp | verdict | "
           "note |\n"
-       << "|---|---|---|---|---|---|---|---|---|---|\n"
+       << "|---|---|---|---|---|---|---|---|---|---|---|---|\n"
        << rows << "\n";
   }
   return counts[Verdict::Fail] + counts[Verdict::XPass] == 0 ? 0 : 1;
@@ -1154,6 +1240,7 @@ int main(int argc, char** argv) {
   const std::string filter = argc > 1 ? argv[1] : "";
   try {
     CheckParser();
+    CheckResultChecks();
     std::printf("[PASS] parser rejects malformed rules\n");
   } catch (const std::exception& ex) {
     std::printf("[FAIL] parser: %s\n", ex.what());

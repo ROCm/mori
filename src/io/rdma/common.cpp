@@ -33,6 +33,9 @@
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/verbs_ops.hpp"
+#ifdef MORI_IO_FAULT_INJECTION
+#include "src/io/rdma/fault_injector.hpp"
+#endif
 #include "src/io/roctx_mori.hpp"  // ADDITIVE: MORI_ROCTX-gated host-I/O markers
 
 namespace mori {
@@ -177,6 +180,13 @@ void NotifySqStateChanged(const EpPair& ep) { ep.ledger->NotifyAdmission(); }
 
 static bool TryReserveSqDepth(const EpPair& ep, int count, int epId, const char* op,
                               std::string* message, SqReserveFailureKind* failure = nullptr) {
+#ifdef MORI_IO_FAULT_INJECTION
+  if (FaultInjector::Instance().FailSqReservation(ep.local.ibvHandle.qp)) {
+    if (failure) *failure = SqReserveFailureKind::Timeout;
+    if (message) *message = "injected SQ admission failure";
+    return false;
+  }
+#endif
   return ep.ledger->Reserve(count, GetSqBackoffTimeoutUs(), message, failure);
 }
 

@@ -202,6 +202,8 @@ class VerbsOps;
 
 // One owner of SQ publication, physical credits, and completion evidence per QP.
 class SubmissionLedger {
+  friend struct SubmissionLedgerTest;
+
  public:
   enum class Kind : uint8_t { Data, DataTail, Notify, Marker };
   enum class ReserveFailure : uint8_t { None, Closed, Timeout, ExceedsCapacity };

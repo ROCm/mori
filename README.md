@@ -333,6 +333,10 @@ tools/run_internode_io_benchmark.sh --rank 0 --master-addr "10.194.129.65" --ifn
 # (run the same command on the second node with --rank 1)
 ```
 
+A failed IO result may still have local work in flight. Use
+`TransferStatus.WaitQuiesced(timeout_ms)` before recycling local buffers; see
+[local buffer quiescence](docs/MORI-IO-GUIDE.md#local-buffer-quiescence).
+
 See [docs/MORI-IO-BENCHMARK.md](docs/MORI-IO-BENCHMARK.md) for both engines and tuning.
 
 ### Test MORI-IR (Triton + shmem integration, [guide](python/mori/ir/README.md))

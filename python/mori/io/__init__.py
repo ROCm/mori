@@ -29,6 +29,7 @@ from .fabric_allocator import (
 from mori.cpp import (
     IOEngineConfig,
     StatusCode,
+    QuiescenceState,
     BackendType,
     EngineDesc,
     MemoryDesc,

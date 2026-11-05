@@ -48,6 +48,14 @@
 #include "src/io/rdma/common.hpp"
 #include "src/io/rdma/verbs_ops.hpp"
 
+namespace mori::io {
+struct SubmissionLedgerTest {
+  static void CorruptEntry(SubmissionLedger& ledger, uint64_t seq) {
+    ledger.ring_[seq & ledger.mask_].seq.store(0, std::memory_order_release);
+  }
+};
+}  // namespace mori::io
+
 using namespace mori::io;
 
 namespace {
@@ -425,6 +433,153 @@ void CaseOperationNotificationPublication() {
   Require(lost.WaitQuiescence(1) == QuiescenceState::Pending, "absolute wait deadline");
   ledger.reset();
   Require(lost.Quiescence() == QuiescenceState::Unprovable, "uncertified lost source");
+}
+
+void CaseFreezeAfterCqTakesMeta() {
+  SubmissionLedger ledger(8);
+  LedgerVerbs verbs;
+  TransferStatus lost, taken, remaining;
+  lost.SetCode(StatusCode::IN_PROGRESS);
+  taken.SetCode(StatusCode::IN_PROGRESS);
+  remaining.SetCode(StatusCode::IN_PROGRESS);
+  bool unpublishedAtFailAll = false;
+  auto first = std::shared_ptr<CqCallbackMeta>(new CqCallbackMeta(&lost, 1, 1), [&](auto* meta) {
+    // The lost-tail snapshot dies after its result, before the successor advances the prefix.
+    ledger.FailAll(StatusCode::ERR_RDMA_OP, "frozen during CQ processing", true);
+    unpublishedAtFailAll = taken.InProgress() && remaining.Failed();
+    delete meta;
+  });
+  auto second = std::make_shared<CqCallbackMeta>(&taken, 2, 1);
+  auto third = std::make_shared<CqCallbackMeta>(&remaining, 3, 1);
+  PostLedger(ledger, verbs, 1, first);
+  PostLedger(ledger, verbs, 1, second);
+  PostLedger(ledger, verbs, 1, third);
+  first.reset();
+  ledger.OnSqCompletion(kSqTag | 2, IBV_WC_SUCCESS, "taken before freeze");
+  Require(unpublishedAtFailAll, "empty ring meta means CQ owns publication, not that it finished");
+  Require(taken.Succeeded() && lost.Failed() && remaining.Failed(),
+          "taken CQ meta still publishes");
+  Require(ledger.Frozen() && ledger.Done() == 0 && ledger.Used() == 3, "frozen CAS never refunds");
+}
+
+void CaseLostNotificationCompletion() {
+  auto ledger = std::make_shared<SubmissionLedger>(8);
+  LedgerVerbs verbs;
+  TransferStatus status, next;
+  status.SetCode(StatusCode::IN_PROGRESS);
+  auto data = std::make_shared<CqCallbackMeta>(&status, 1, 1, true);
+  data->target.emplace_back(ledger, 1);
+  status.SetQuiescenceCallback([data](int slice) { return data->Quiescence(slice); });
+  PostLedger(*ledger, verbs, 1, data);
+  Require(ledger->Reserve(1, 0, nullptr), "notification credit");
+  ibv_send_wr notify{};
+  notify.opcode = IBV_WR_SEND;
+  ledger->PostToSq(nullptr, &notify, 1, SubmissionLedger::Kind::Notify, nullptr, 0, true, 1, 0,
+                   verbs);
+  data->ReportNotification(&status, StatusCode::SUCCESS, "posted");
+  data->Seal();
+  auto successor = std::make_shared<CqCallbackMeta>(&next, 2, 1);
+  PostLedger(*ledger, verbs, 1, successor);
+  ledger->OnSqCompletion(kSqTag | 3, IBV_WC_SUCCESS, "successor");
+  Require(status.Failed() && status.Quiesced() && next.Succeeded(),
+          "lost notify never reports twice");
+  Require(ledger->Used() == 0 && ledger->Done() == 3, "notify credits follow the prefix once");
+}
+
+void CaseScanMismatchFailsOutstanding() {
+  SubmissionLedger ledger(8);
+  LedgerVerbs verbs;
+  TransferStatus first, current;
+  auto a = std::make_shared<CqCallbackMeta>(&first, 1, 1);
+  auto b = std::make_shared<CqCallbackMeta>(&current, 2, 1);
+  PostLedger(ledger, verbs, 1, a);
+  PostLedger(ledger, verbs, 1, b);
+  SubmissionLedgerTest::CorruptEntry(ledger, 1);
+  ledger.OnSqCompletion(kSqTag | 2, IBV_WC_SUCCESS, "bad gap");
+  Require(first.Failed() && current.Succeeded() && ledger.Frozen(),
+          "scan freeze fails unclaimed results");
+  Require(ledger.Used() == 2 && ledger.Done() == 0, "untrusted gap has no credit evidence");
+}
+
+void CaseRdmaBatchClampsOrdinaryCapacity() {
+  EpPair ep{};
+  ep.ledger = std::make_shared<SubmissionLedger>(4);
+  ep.local.handle.maxSge = 1;
+  ep.local.maxMsgSize = 4096;
+  ibv_context context{};
+  ibv_qp qp{};
+  qp.context = &context;
+  std::vector<int> batches;
+  struct State {
+    SubmissionLedger* ledger;
+    std::vector<int>* batches;
+  } state{ep.ledger.get(), &batches};
+  qp.qp_context = &state;
+  context.ops.post_send = [](ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr**) {
+    auto& state = *static_cast<State*>(qp->qp_context);
+    int n = 0;
+    ibv_send_wr* tail = wr;
+    for (; tail->next; tail = tail->next) ++n;
+    state.batches->push_back(n + 1);
+    state.ledger->OnSqCompletion(tail->wr_id, IBV_WC_SUCCESS, "early batch completion");
+    return 0;
+  };
+  ep.local.ibvHandle.qp = &qp;
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 1, 7);
+  mori::application::RdmaMemoryRegion local{.addr = 0x10000, .lkey = 1, .length = 4096};
+  mori::application::RdmaMemoryRegion remote{.addr = 0x20000, .rkey = 2, .length = 4096};
+  SizeVec offsets{0, 64, 128, 192, 256, 320, 384}, sizes(7, 16);
+  RdmaTransferControl control{};
+  control.disableMerge = true;
+  auto result = RdmaBatchReadWrite({ep}, {local}, {remote}, offsets, offsets, sizes, meta, 1, false,
+                                   -1, control);
+  Require(!result.Failed() && batches == std::vector<int>({3, 3, 1}), "batch clamp uses N-1");
+  Require(status.Succeeded() && ep.ledger->Used() == 0, "clamped batches keep logical accounting");
+}
+
+void CaseRdmaEarlyReturnsSealOperation() {
+  EpPair ep{};
+  ep.ledger = std::make_shared<SubmissionLedger>(8);
+  ep.ledger->Close();
+  ep.local.handle.maxSge = 1;
+  ep.local.maxMsgSize = 4096;
+  mori::application::RdmaMemoryRegion local{.addr = 0x10000, .lkey = 1, .length = 4096};
+  mori::application::RdmaMemoryRegion remote{.addr = 0x20000, .rkey = 2, .length = 4096};
+  RdmaBackendConfig config{};
+  config.enableNotification = false;
+  RdmaBackendSession session(config, {local}, {remote}, {ep}, nullptr, nullptr);
+  TransferStatus status;
+  session.ReadWrite(4096, 0, 16, &status, 1, false);
+  Require(status.Failed() && status.Quiesced(), "preflight failure seals and publishes");
+  session.BatchReadWrite({}, {}, {}, &status, 2, false);
+  Require(status.Succeeded() && status.Quiesced(), "empty batch seals and publishes");
+  session.ReadWrite(0, 0, 16, &status, 3, false);
+  Require(
+      status.Failed() && status.Quiesced() && status.Message().find("closed") != std::string::npos,
+      "closed endpoint reports admission failure and remains quiesced");
+}
+
+void CaseOperationOwnershipHasNoCycle() {
+  std::weak_ptr<SubmissionLedger> ledgerWeak;
+  std::weak_ptr<CqCallbackMeta> metaWeak;
+  {
+    TransferStatus status;
+    auto ledger = std::make_shared<SubmissionLedger>(8);
+    ledgerWeak = ledger;
+    auto meta = std::make_shared<CqCallbackMeta>(&status, 1, 1);
+    metaWeak = meta;
+    meta->target.emplace_back(ledger, 1);
+    status.SetQuiescenceCallback([meta](int slice) { return meta->Quiescence(slice); });
+    LedgerVerbs verbs;
+    PostLedger(*ledger, verbs, 1, meta);
+    ledger->FailAll(StatusCode::ERR_RDMA_OP, "engine stopped", true);
+    meta->Seal();
+    ledger.reset();
+    Require(status.Quiescence() == QuiescenceState::Unprovable, "lost source remains unprovable");
+  }
+  Require(ledgerWeak.expired() && metaWeak.expired(),
+          "ledger and operation release without a cycle");
 }
 
 void CaseSubmissionLedgerBasic() {
@@ -2255,6 +2410,12 @@ int main(int argc, char* argv[]) {
       {"reusable_status_contention", CaseReusableStatusContention},
       {"operation_long_wait_slice", CaseOperationLongWaitSlice},
       {"operation_notification_publication", CaseOperationNotificationPublication},
+      {"freeze_after_cq_takes_meta", CaseFreezeAfterCqTakesMeta},
+      {"lost_notification_completion", CaseLostNotificationCompletion},
+      {"scan_mismatch_fails_outstanding", CaseScanMismatchFailsOutstanding},
+      {"rdma_batch_clamps_ordinary_capacity", CaseRdmaBatchClampsOrdinaryCapacity},
+      {"rdma_early_returns_seal_operation", CaseRdmaEarlyReturnsSealOperation},
+      {"operation_ownership_has_no_cycle", CaseOperationOwnershipHasNoCycle},
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"submission_ledger_shared_qp_signals", CaseSubmissionLedgerSharedQpSignals},
       {"submission_ledger_fail_all", CaseSubmissionLedgerFailAll},

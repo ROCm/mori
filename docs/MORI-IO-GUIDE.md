@@ -109,7 +109,79 @@ from mori.io import (
 | `Failed()` | Transfer failed |
 | `Code()` | Get status code |
 | `Message()` | Get status message |
-| `Wait()` | Block until transfer completes |
+| `Wait()` | Block until the result is terminal |
+| `WaitFor(timeout_ms)` | Wait for the result with a deadline; may return IN_PROGRESS |
+| `Quiescence()` | Nonblocking local buffer evidence: Pending, Quiesced, or Unprovable |
+| `WaitQuiescence(timeout_ms)` | Wait for Quiesced or Unprovable, or return Pending at the deadline |
+| `Quiesced()` / `WaitQuiesced(timeout_ms)` | Boolean wrappers around the evidence methods |
+
+## Local buffer quiescence
+
+A failed transfer can still have RDMA or GPU work in flight. `Wait()` and `WaitFor()`
+report the result; they do not authorize buffer reuse after an error. Keep local
+buffers and registrations alive until `WaitQuiesced(timeout_ms)` returns true.
+A timeout or `Unprovable` requires retaining the buffers, usually until process
+restart. This API certifies local accesses only, not the remote buffer's lifetime.
+
+```python
+from mori.io import QuiescenceState
+
+status.WaitFor(5000)
+proof = status.WaitQuiescence(5000)  # releases the Python GIL
+if proof == QuiescenceState.Quiesced:
+    # The local buffer can now be recycled, including when the result failed.
+    pass
+else:
+    # Retain/isolate it; neither a failure nor a timeout proves DMA has stopped.
+    pass
+```
+
+A status owns its current operation's evidence. Reusing an unquiesced status
+raises `RuntimeError` (`std::logic_error` in C++), preserving its old operation.
+`SetCode(INIT)` does not erase evidence. Public `SetCode` and `Update` calls do
+not manufacture backend completion evidence. A never-submitted status is quiesced.
+Keep the status alive while a result may still be published to it.
+
+RDMA uses one SQ sequence and completion prefix per QP. Data and notification
+posts share its ledger; ordinary posts can use N-1 of N physical credits (N must
+be at least 2). An unsignaled tail left by a failed submission is covered by a
+signaled zero-length WRITE using the reserved credit. Healthy QPs stay usable.
+A missing signaled CQE followed by a later completion fails the missing result and
+proves its local accesses have ended. A lost CQE with no successor can still
+remain Pending. Untrusted completion tracking or CQ/device failure freezes the
+prefix and fails outstanding results; uncovered targets become Unprovable.
+Destroying the engine freezes its RDMA ledgers. Already certified operations
+remain quiesced; uncertified operations lose their evidence source.
+
+XGMI failures publish their result first, then use a separate fence event (or a
+stream query if recording the fence fails). Unproven operations retain their
+events, internal metadata and pools until evidence permits recycling. If evidence
+never arrives, these resources stay alive until process exit and a warning is
+logged. Destroying an XGMI backend with unproven operations also retains its IPC
+mappings, modules and relevant pools. User buffers still belong to the caller.
+SIM never accesses payload buffers and certifies terminal results. OFI and Fabric
+certify success; their unaudited failure paths return Unprovable.
+
+CPU validation targets are `test_engine`, `test_transfer_wait`,
+`test_fault_injector`, `test_peer_failure`, and `test_xgmi_quiescence`. Build with
+`ENABLE_IO_FAULT_INJECTION=ON`; run ASan/LSan and UBSan in separate builds. The
+XGMI CPU target uses HIP stand-ins and initializes no GPU. To validate catalogs
+without hardware:
+
+```bash
+for catalog in ibverbs async_events quiescence; do
+  MORI_IO_FAULT_CATALOG=$catalog.yaml build/tests/cpp/test_fault_injection --check-catalog
+done
+```
+
+On an idle two-GPU node, run the same catalogs without `--check-catalog`
+with `HIP_VISIBLE_DEVICES=0,1`. `quiescence.yaml` covers unsignaled tails, admission
+failure, a lost CQE covered by a successor, and explicit tracking freeze. The
+runner verifies injection before RESULT, checks target liveness even after a
+failed evidence check, and retains statuses and old buffers to child-process exit
+when recovery needs new memory.
+Zero-length markers must be validated on each provider. In particular, Thor2 may
+leave posts made after QP ERR Pending rather than producing flush completions.
 
 ## Example: Basic Read/Write
 

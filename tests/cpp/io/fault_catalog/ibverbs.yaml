@@ -6,10 +6,11 @@
 #   honest    it reports SUCCESS only if the data landed and, with notify on,
 #             the target was told
 #   recovers  once the fault clears, a new transfer between the same engines succeeds
+#   quiesces  the local quiescence state matches quiescence (default quiesced)
 #   alive     the process neither exits nor crashes
 #   waits     (entries with waits: true) the call returns with the transfer still
 #             IN_PROGRESS: the fault hits after its data WRs are on the wire, and
-#             the caller may reuse its buffers once the transfer reports an error
+#             local buffers still require a separate quiescence proof
 # The checks describe the behavior we want, not today's: a failing entry is an
 # open bug for a follow-up fix. "alive" covers both processes below.
 #
@@ -159,6 +160,7 @@
   real_world: write completion lost
   rule: cqe_drop:op=write
   transfer: write
+  quiescence: pending
   known_bug: no-completion-deadline
   fails: ends
 
@@ -166,6 +168,7 @@
   real_world: read completion lost
   rule: cqe_drop:op=read
   transfer: read
+  quiescence: pending
   known_bug: no-completion-deadline
   fails: ends
 
@@ -173,6 +176,7 @@
   real_world: one QP's completion lost in a batch
   rule: cqe_drop:op=write
   transfer: batch
+  quiescence: pending
   known_bug: no-completion-deadline
   fails: ends
 
