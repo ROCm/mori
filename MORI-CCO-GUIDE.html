@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI CCO Guide &mdash; MORI development (8df645a2) documentation</title>
+  <title>MORI CCO Guide &mdash; MORI development (a66704c8) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=53135423"></script>
+      <script src="_static/documentation_options.js?v=9d0d2c19"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -722,14 +722,22 @@ load/store it in the kernel.</p>
 </div>
 </li>
 <li><p><strong>GDA (cross-node):</strong> GPU-initiated RDMA put/get with signalling, via the
-scale-out header. Provider dispatch is compile-time (per NIC).</p>
+scale-out header. Provider dispatch is compile-time (per NIC). A handle’s
+doorbell mode is compile-time too, <code class="docutils literal notranslate"><span class="pre">ccoGda&lt;P,</span> <span class="pre">ccoGdaDoorbellMode&gt;</span></code>:
+<code class="docutils literal notranslate"><span class="pre">Immediate</span></code> (default) posts ring for themselves, <code class="docutils literal notranslate"><span class="pre">Deferred</span></code> posts are released
+by the next ring that reaches them, and <code class="docutils literal notranslate"><span class="pre">CallerOrdered</span></code> posts are released
+only by that mode’s flush, for callers that order every post before it.
+Handles on one context share its QPs whatever their mode; see
+<code class="docutils literal notranslate"><span class="pre">ccoGdaDoorbellMode</span></code> for the rules.</p>
 <div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">"mori/cco/cco_scale_out.hpp"</span><span class="w">   </span><span class="c1">// pulls in cco.hpp + RDMA core</span>
 </pre></div>
 </div>
 </li>
-<li><p><strong>Barriers:</strong> the LSA barrier session (<code class="docutils literal notranslate"><span class="pre">ccoLsaBarrierSession</span></code>) and the GDA
-barrier session provide <code class="docutils literal notranslate"><span class="pre">arrive</span></code> / <code class="docutils literal notranslate"><span class="pre">wait</span></code> / <code class="docutils literal notranslate"><span class="pre">sync</span></code> at thread / warp / block
-granularity (<code class="docutils literal notranslate"><span class="pre">ccoCoopThread</span></code> / <code class="docutils literal notranslate"><span class="pre">ccoCoopWarp</span></code> / <code class="docutils literal notranslate"><span class="pre">ccoCoopBlock</span></code>).</p></li>
+<li><p><strong>Barriers:</strong> the LSA barrier session (<code class="docutils literal notranslate"><span class="pre">ccoLsaBarrierSession</span></code>) provides
+<code class="docutils literal notranslate"><span class="pre">arrive</span></code> / <code class="docutils literal notranslate"><span class="pre">wait</span></code> / <code class="docutils literal notranslate"><span class="pre">sync</span></code> at thread / warp / block granularity
+(<code class="docutils literal notranslate"><span class="pre">ccoCoopThread</span></code> / <code class="docutils literal notranslate"><span class="pre">ccoCoopWarp</span></code> / <code class="docutils literal notranslate"><span class="pre">ccoCoopBlock</span></code>); the GDA barrier session
+(<code class="docutils literal notranslate"><span class="pre">ccoGdaBarrierSession</span></code>) provides <code class="docutils literal notranslate"><span class="pre">sync</span></code> at warp or block granularity on an
+Immediate <code class="docutils literal notranslate"><span class="pre">ccoGda&lt;P&gt;</span></code> handle.</p></li>
 </ul>
 <p>FlyDSL kernels can drive the same device API — see the Python examples below.</p>
 </section>
@@ -766,7 +774,7 @@ granularity (<code class="docutils literal notranslate"><span class="pre">ccoCoo
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">python/06_flydsl_gda_modes</span></code></p></td>
 <td><p>py</p></td>
-<td><p>FlyDSL GDA (thread_mode, coop) × signal matrix</p></td>
+<td><p>FlyDSL GDA (thread_mode, coop) × signal matrix, plus DEFERRED / CALLER_ORDERED handles</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cpp/01_lsa_put.cpp</span></code></p></td>
 <td><p>c++</p></td>

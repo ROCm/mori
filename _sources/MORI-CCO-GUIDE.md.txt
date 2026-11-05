@@ -164,15 +164,23 @@ Device kernels include the CCO header directly and take the `ccoDevComm` by valu
   ```
 
 - **GDA (cross-node):** GPU-initiated RDMA put/get with signalling, via the
-  scale-out header. Provider dispatch is compile-time (per NIC).
+  scale-out header. Provider dispatch is compile-time (per NIC). A handle's
+  doorbell mode is compile-time too, `ccoGda<P, ccoGdaDoorbellMode>`:
+  `Immediate` (default) posts ring for themselves, `Deferred` posts are released
+  by the next ring that reaches them, and `CallerOrdered` posts are released
+  only by that mode's flush, for callers that order every post before it.
+  Handles on one context share its QPs whatever their mode; see
+  `ccoGdaDoorbellMode` for the rules.
 
   ```cpp
   #include "mori/cco/cco_scale_out.hpp"   // pulls in cco.hpp + RDMA core
   ```
 
-- **Barriers:** the LSA barrier session (`ccoLsaBarrierSession`) and the GDA
-  barrier session provide `arrive` / `wait` / `sync` at thread / warp / block
-  granularity (`ccoCoopThread` / `ccoCoopWarp` / `ccoCoopBlock`).
+- **Barriers:** the LSA barrier session (`ccoLsaBarrierSession`) provides
+  `arrive` / `wait` / `sync` at thread / warp / block granularity
+  (`ccoCoopThread` / `ccoCoopWarp` / `ccoCoopBlock`); the GDA barrier session
+  (`ccoGdaBarrierSession`) provides `sync` at warp or block granularity on an
+  Immediate `ccoGda<P>` handle.
 
 FlyDSL kernels can drive the same device API — see the Python examples below.
 
@@ -187,7 +195,7 @@ Runnable examples live in [`examples/cco/`](https://github.com/ROCm/mori/blob/ma
 | `python/03_flydsl_put` | py | FlyDSL GDA put + signal/wait |
 | `python/04_flydsl_lsa_put` | py | FlyDSL LSA direct peer-pointer store |
 | `python/05_flydsl_lsa_allreduce` | py | FlyDSL LSA custom all-reduce |
-| `python/06_flydsl_gda_modes` | py | FlyDSL GDA (thread_mode, coop) × signal matrix |
+| `python/06_flydsl_gda_modes` | py | FlyDSL GDA (thread_mode, coop) × signal matrix, plus DEFERRED / CALLER_ORDERED handles |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (`cco_scale_out.hpp`) |
 
