@@ -230,6 +230,44 @@ class EpDispatchCombineConfig:
     # op's send. With the ops on separate streams, a two-op microbenchmark is
     # slower but DeepSeek-V4 prefill was still faster, so measure that case.
     async_ll_own_sdma_queue: bool = False
+    # Receive layout of async_ll over "sdma" on one node: "compact" (default),
+    # "segmented" or "auto".
+    #
+    # "compact" rounds copy every source's rows into one dense prefix of the recv
+    # views ([0, total_recv)). An op built "segmented" can also run segmented
+    # rounds: a dispatch that passes segment_stride=S lands source s's rows at
+    # [s * S, s * S + n_s) and the recv views are the landing region itself,
+    # world_size * S rows, with no receive compaction. On the combine side the
+    # expert output is sent from the same layout, with no staging scatter. A
+    # dispatch without segment_stride runs a compact round on the same op, so one
+    # op serves both (e.g. compact under CUDA graphs).
+    #
+    # What a segmented round hands the consumer (the contract):
+    #   * every one of the world_size * S rows is an input row. Valid rows are
+    #     [s * S, s * S + n_s) per source, not a prefix. The rest (holes) carry
+    #     expert ids of the next rank's first expert with weight 0 and zeroed
+    #     scales, so a local expert_mask drops them; their hidden bytes are
+    #     stale, from an earlier round. Holes are typically a large share:
+    #     n_s counts only the tokens with an expert on this rank.
+    #   * total_recv reads world_size * S, the row count, so passing it as the
+    #     consumer's row bound (e.g. aiter fused_moe num_local_tokens) is right.
+    #     Do not truncate the views below that. segment_counts() has the n_s.
+    #   * the expert output must be written into combine_in_view() (also
+    #     world_size * S rows); combine copies any other tensor there first.
+    #   * S is the same on every rank in a round, at least every rank's token
+    #     count and at most effective_max_recv_per_rank. Whether a round is
+    #     segmented must also be the same on every rank; a round where ranks
+    #     disagree on either is detected and counted (segment_error_flags()).
+    #
+    # "segmented" requires a config that supports it (the op refuses otherwise);
+    # "auto" picks "segmented" exactly when the config supports it, with no
+    # error, and the op's cfg.async_ll_recv_layout then reads the outcome.
+    async_ll_recv_layout: str = "compact"
+
+    @property
+    def async_ll_segmented(self) -> bool:
+        """Whether this op can run segmented rounds (async_ll_recv_layout)."""
+        return self.async_ll_recv_layout == "segmented"
 
     def __post_init__(self):
         # Node grouping first: is_internode gates checks further down, and the
@@ -275,6 +313,15 @@ class EpDispatchCombineConfig:
                 raise ValueError(
                     "active_qp_counts is only supported by the internode path"
                 )
+        if self.async_ll_recv_layout not in ("compact", "segmented", "auto"):
+            raise ValueError(
+                "async_ll_recv_layout must be 'compact', 'segmented' or 'auto', "
+                f"got {self.async_ll_recv_layout!r}"
+            )
+        if self.async_ll_recv_layout == "auto" and not self.async_ll:
+            self.async_ll_recv_layout = "compact"
+        if self.async_ll_recv_layout == "segmented" and not self.async_ll:
+            raise ValueError("async_ll_recv_layout='segmented' needs async_ll=True")
 
         # all-or-none: setting only one silently defaults the other to data_type.
         if (self.dispatch_data_type is None) != (self.combine_data_type is None):
@@ -879,6 +926,25 @@ class EpDispatchCombineOp:
         """Reasons this backend cannot serve `cfg`. Empty = it can."""
         return ()
 
+    def _set_segment_stride(self, stride, num_tokens):
+        """Record this round's segment stride (None or 0 = compact). Only the
+        hip backend's AsyncLL has the segmented layout."""
+        if stride:
+            raise NotImplementedError(
+                f"the {self.backend_name} backend has no segmented dispatch"
+            )
+
+    # The segmented layout's introspection (see async_ll_recv_layout). Backends
+    # without it report nothing.
+    def segment_error_counts(self):
+        return (0, 0)
+
+    def segment_error_flags(self, clear=False):
+        return 0
+
+    def segment_counts(self):
+        return None
+
     def _region(self, name):
         """Arena region a shared view should read.
 
@@ -1020,6 +1086,7 @@ class EpDispatchCombineOp:
         routing=None,
         return_routing=False,
         snapshot=False,
+        segment_stride=None,
     ):
         """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
         scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32.
@@ -1045,6 +1112,11 @@ class EpDispatchCombineOp:
         total_recv is a DEVICE tensor. Reading it on the host is a full sync that
         costs more than the kernel and makes the op uncapturable, so neither
         backend does it.
+
+        segment_stride=S runs a segmented round on an op built with
+        async_ll_recv_layout="segmented"; the returned views then have
+        world_size * S rows and total_recv reads world_size * S. See
+        EpDispatchCombineConfig.async_ll_recv_layout for the contract.
         """
         with self._asyncll_call("dispatch"):
             return self._dispatch_impl(
@@ -1056,6 +1128,7 @@ class EpDispatchCombineOp:
                 return_routing=return_routing,
                 kernels=self._kernels.dispatch,
                 snapshot=snapshot,
+                segment_stride=segment_stride,
             )
 
     def _dispatch_impl(
@@ -1069,6 +1142,7 @@ class EpDispatchCombineOp:
         return_routing,
         kernels,
         snapshot=False,
+        segment_stride=None,
     ):
         """The body of dispatch(), parameterised by which kernel table runs.
 
@@ -1131,6 +1205,8 @@ class EpDispatchCombineOp:
             else:
                 dest_map = self.token_dest_map
 
+        # Last check before the launch, so a refused stride leaves no state behind.
+        self._set_segment_stride(segment_stride, n)
         kern(
             input=input,
             indices=indices,
@@ -1264,7 +1340,9 @@ class EpDispatchCombineOp:
     #
     # The send half returns the same tuple dispatch() does, but the output buffers
     # are NOT populated until the matching recv call has run. Reading them in the
-    # seam reads the previous round.
+    # seam reads stale data: the previous round's on a compact round, and on a
+    # segmented round (async_ll_recv_layout) bytes the engines are still writing,
+    # since those views are the landing region itself.
 
     # The AsyncLL protocol's call order, as a state machine. What each call is
     # allowed to see, and what it leaves behind:
@@ -1362,7 +1440,15 @@ class EpDispatchCombineOp:
         return table
 
     def dispatch_send(
-        self, input, weights, scales, indices, *, routing=None, return_routing=False
+        self,
+        input,
+        weights,
+        scales,
+        indices,
+        *,
+        routing=None,
+        return_routing=False,
+        segment_stride=None,
     ):
         """Enqueue the send half of a dispatch and return immediately.
 
@@ -1378,6 +1464,7 @@ class EpDispatchCombineOp:
                 routing=routing,
                 return_routing=return_routing,
                 kernels=self._async_half("dispatch_send"),
+                segment_stride=segment_stride,
             )
 
     def dispatch_recv(self):
