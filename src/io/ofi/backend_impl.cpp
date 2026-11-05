@@ -589,9 +589,9 @@ static void CompleteOp(OfiOpCtx* ctx, StatusCode code, const std::string& msg = 
 
   if (!batch) {
     if (code != StatusCode::SUCCESS) {
-      status->Update(code, msg);
+      status->UpdateResult(code, msg);
     } else if (!status->Failed()) {
-      status->SetCode(StatusCode::SUCCESS);
+      status->SetResultCode(StatusCode::SUCCESS);
     }
     delete ctx;
     return;
@@ -606,9 +606,9 @@ static void CompleteOp(OfiOpCtx* ctx, StatusCode code, const std::string& msg = 
   if (last) {
     if (batch->hasError.load(std::memory_order_acquire)) {
       std::lock_guard<std::mutex> lk(batch->errMu);
-      status->Update(batch->errCode, batch->errMsg);
+      status->UpdateResult(batch->errCode, batch->errMsg);
     } else if (!status->Failed()) {
-      status->SetCode(StatusCode::SUCCESS);
+      status->SetResultCode(StatusCode::SUCCESS);
     }
     delete batch;
   }
@@ -760,6 +760,7 @@ OfiBackendSession::~OfiBackendSession() {
 
 void OfiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                   TransferStatus* status, TransferUniqueId id, bool isRead) {
+  status->TrackResultQuiescence();
   status->SetCode(StatusCode::IN_PROGRESS);
 
   const uint32_t nic = localMr_.nicId;
@@ -775,13 +776,14 @@ void OfiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_
 void OfiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                        const SizeVec& sizes, TransferStatus* status,
                                        TransferUniqueId id, bool isRead) {
+  status->TrackResultQuiescence();
   const size_t n = sizes.size();
   if (localOffsets.size() != n || remoteOffsets.size() != n) {
-    status->Update(StatusCode::ERR_INVALID_ARGS, "OFI: batch offset/size count mismatch");
+    status->UpdateResult(StatusCode::ERR_INVALID_ARGS, "OFI: batch offset/size count mismatch");
     return;
   }
   if (n == 0) {
-    status->SetCode(StatusCode::SUCCESS);
+    status->SetResultCode(StatusCode::SUCCESS);
     return;
   }
 
@@ -929,6 +931,7 @@ OfiBackend::RemoteMrInfo OfiBackend::GetRemoteMrInfo(const MemoryDesc& remote) {
 void OfiBackend::ReadWrite(const MemoryDesc& local, size_t localOffset, const MemoryDesc& remote,
                            size_t remoteOffset, size_t size, TransferStatus* status,
                            TransferUniqueId id, bool isRead) {
+  status->TrackResultQuiescence();
   // Copy the local MR handle out under the lock; the transfer + CQ drain then
   // run without holding mrMu_ (matches the lock-free session path).
   OfiMemRegion lmr;
@@ -936,8 +939,8 @@ void OfiBackend::ReadWrite(const MemoryDesc& local, size_t localOffset, const Me
     std::lock_guard<std::mutex> lk(mrMu_);
     auto* p = GetLocalMr(local.id);
     if (!p) {
-      status->Update(StatusCode::ERR_NOT_FOUND,
-                     "OFI: local MR not found id=" + std::to_string(local.id));
+      status->UpdateResult(StatusCode::ERR_NOT_FOUND,
+                           "OFI: local MR not found id=" + std::to_string(local.id));
       return;
     }
     lmr = *p;
@@ -962,9 +965,10 @@ void OfiBackend::BatchReadWrite(const MemoryDesc& local, const SizeVec& localOff
                                 const MemoryDesc& remote, const SizeVec& remoteOffsets,
                                 const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
                                 bool isRead) {
+  status->TrackResultQuiescence();
   const size_t n = sizes.size();
   if (n == 0) {
-    status->SetCode(StatusCode::SUCCESS);
+    status->SetResultCode(StatusCode::SUCCESS);
     return;
   }
 
@@ -974,7 +978,7 @@ void OfiBackend::BatchReadWrite(const MemoryDesc& local, const SizeVec& localOff
     std::lock_guard<std::mutex> lk(mrMu_);
     auto* p = GetLocalMr(local.id);
     if (!p) {
-      status->Update(StatusCode::ERR_NOT_FOUND, "OFI: local MR not found");
+      status->UpdateResult(StatusCode::ERR_NOT_FOUND, "OFI: local MR not found");
       return;
     }
     lmr = *p;

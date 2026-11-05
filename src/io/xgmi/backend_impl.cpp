@@ -40,6 +40,7 @@
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "mori/utils/host_utils.hpp"
+#include "src/io/xgmi/transfer_completion.hpp"
 
 namespace mori {
 namespace io {
@@ -109,70 +110,6 @@ class ScopedHipDeviceGuard {
   bool valid_{true};
 };
 
-struct TransferCompletion {
-  TransferStatus* status{nullptr};
-  hipEvent_t event{nullptr};
-  int eventDevice{-1};
-  EventPool* eventPool{nullptr};
-  std::function<void()> cleanup;
-  std::once_flag completionOnce;
-  std::atomic<bool> completed{false};
-  std::mutex eventMu;
-
-  void FinalizeBlocking() {
-    std::lock_guard<std::mutex> lock(eventMu);
-    std::call_once(completionOnce, [this]() {
-      hipError_t err = hipEventSynchronize(event);
-      if (err == hipSuccess) {
-        status->SetCode(StatusCode::SUCCESS);
-      } else {
-        status->Update(StatusCode::ERR_GPU_OP,
-                       std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(err));
-      }
-      if (cleanup) cleanup();
-      eventPool->PutEvent(event, eventDevice);
-      completed.store(true, std::memory_order_release);
-    });
-  }
-
-  void FinalizeNonBlocking() {
-    std::lock_guard<std::mutex> lock(eventMu);
-    if (completed.load(std::memory_order_acquire)) {
-      return;
-    }
-
-    hipError_t err = hipEventQuery(event);
-    if (err == hipErrorNotReady) {
-      (void)hipGetLastError();
-      return;
-    }
-
-    std::call_once(completionOnce, [this, err]() {
-      if (err == hipSuccess) {
-        status->SetCode(StatusCode::SUCCESS);
-      } else {
-        status->Update(StatusCode::ERR_GPU_OP,
-                       std::string("XGMI: hipEventQuery failed: ") + hipGetErrorString(err));
-      }
-      if (cleanup) cleanup();
-      eventPool->PutEvent(event, eventDevice);
-      completed.store(true, std::memory_order_release);
-    });
-  }
-};
-
-void ArmTransferCompletion(TransferStatus* status, hipEvent_t event, int eventDevice,
-                           EventPool* eventPool, std::function<void()> cleanup = {}) {
-  auto completion = std::make_shared<TransferCompletion>();
-  completion->status = status;
-  completion->event = event;
-  completion->eventDevice = eventDevice;
-  completion->eventPool = eventPool;
-  completion->cleanup = std::move(cleanup);
-  status->SetWaitCallback([completion]() { completion->FinalizeBlocking(); });
-  status->SetProgressCallback([completion]() { completion->FinalizeNonBlocking(); });
-}
-
 }  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -182,7 +119,9 @@ void ArmTransferCompletion(TransferStatus* status, hipEvent_t event, int eventDe
 XgmiBackendSession::XgmiBackendSession(const XgmiBackendConfig& config, void* localAddr,
                                        void* remoteAddr, int localDevice, int remoteDevice,
                                        bool isIpcSession, XgmiBackend* backend,
-                                       StreamPool* streamPool, EventPool* eventPool)
+                                       std::shared_ptr<StreamPool> streamPool,
+                                       std::shared_ptr<EventPool> eventPool,
+                                       std::shared_ptr<std::atomic<size_t>> pendingTransfers)
     : config(config),
       localAddr(localAddr),
       remoteAddr(remoteAddr),
@@ -191,11 +130,14 @@ XgmiBackendSession::XgmiBackendSession(const XgmiBackendConfig& config, void* lo
       isIpcSession(isIpcSession),
       backend(backend),
       streamPool(streamPool),
-      eventPool(eventPool) {}
+      eventPool(std::move(eventPool)),
+      pendingTransfers(std::move(pendingTransfers)) {}
 
 void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   ScopedHipDeviceGuard deviceGuard;
+  XgmiSubmission submission(status, eventPool, streamPool, pendingTransfers);
+  auto& completion = *submission.completion;
   const int srcDevice = isRead ? remoteDevice : localDevice;
   const int dstDevice = isRead ? localDevice : remoteDevice;
 
@@ -208,11 +150,11 @@ void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
 
   hipStream_t stream = streamPool->GetNextStream(dstDevice);
   hipEvent_t event = eventPool->GetEvent(dstDevice);
+  completion.stream = stream;
+  completion.event = event;
+  completion.eventDevice = dstDevice;
   if (stream == nullptr || event == nullptr) {
     status->Update(StatusCode::ERR_BAD_STATE, "XGMI: Failed to get stream or event from pool");
-    if (event != nullptr) {
-      eventPool->PutEvent(event, dstDevice);
-    }
     return;
   }
 
@@ -226,7 +168,6 @@ void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
     if (err != hipSuccess) {
       status->Update(StatusCode::ERR_GPU_OP,
                      std::string("XGMI: hipMemcpyAsync failed: ") + hipGetErrorString(err));
-      eventPool->PutEvent(event, dstDevice);
       return;
     }
   } else {
@@ -234,21 +175,20 @@ void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
     if (err != hipSuccess) {
       status->Update(StatusCode::ERR_GPU_OP,
                      std::string("XGMI: hipMemcpyPeerAsync failed: ") + hipGetErrorString(err));
-      eventPool->PutEvent(event, dstDevice);
       return;
     }
   }
 
+  completion.submitted = true;
   err = hipEventRecord(event, stream);
   if (err != hipSuccess) {
     status->Update(StatusCode::ERR_GPU_OP,
                    std::string("XGMI: hipEventRecord failed: ") + hipGetErrorString(err));
-    eventPool->PutEvent(event, dstDevice);
     return;
   }
 
   status->SetCode(StatusCode::IN_PROGRESS);
-  ArmTransferCompletion(status, event, dstDevice, eventPool);
+  completion.eventRecorded = true;
   MORI_IO_TRACE("XGMI: Transfer issued, id={}, size={}, isRead={}", id, size, isRead);
 }
 
@@ -256,6 +196,8 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                                         const SizeVec& sizes, TransferStatus* status,
                                         TransferUniqueId id, bool isRead) {
   ScopedHipDeviceGuard deviceGuard;
+  XgmiSubmission submission(status, eventPool, streamPool, pendingTransfers);
+  auto& completion = *submission.completion;
   size_t batchSize = sizes.size();
   assert(batchSize == localOffsets.size());
   assert(batchSize == remoteOffsets.size());
@@ -283,11 +225,11 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 
   hipStream_t stream = streamPool->GetNextStream(kernelDevice);
   hipEvent_t event = eventPool->GetEvent(kernelDevice);
+  completion.stream = stream;
+  completion.event = event;
+  completion.eventDevice = kernelDevice;
   if (stream == nullptr || event == nullptr) {
     status->Update(StatusCode::ERR_BAD_STATE, "XGMI: Failed to get stream or event from pool");
-    if (event != nullptr) {
-      eventPool->PutEvent(event, kernelDevice);
-    }
     return;
   }
 
@@ -325,7 +267,6 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 
   if (segments.empty()) {
     status->SetCode(StatusCode::SUCCESS);
-    eventPool->PutEvent(event, kernelDevice);
     return;
   }
 
@@ -340,7 +281,8 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     size_t numSegs = segments.size();
     size_t metaBytes = numSegs * sizeof(size_t) * 3;
 
-    std::vector<size_t> hostMeta(numSegs * 3);
+    auto& hostMeta = completion.hostMeta;
+    hostMeta.resize(numSegs * 3);
     size_t* hSrcOff = hostMeta.data();
     size_t* hDstOff = hostMeta.data() + numSegs;
     size_t* hSizes = hostMeta.data() + numSegs * 2;
@@ -352,6 +294,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 
     size_t* dMeta = nullptr;
     err = hipMalloc(&dMeta, metaBytes);
+    completion.deviceMeta = dMeta;
     if (err != hipSuccess) {
       MORI_IO_WARN("XGMI: scatter/gather metadata alloc failed, falling back to hipMemcpy");
       useKernel = false;
@@ -361,12 +304,14 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
       err = hipMemcpyAsync(dMeta, hostMeta.data(), metaBytes, hipMemcpyHostToDevice, stream);
       if (err != hipSuccess) {
         (void)hipFree(dMeta);
+        completion.deviceMeta = nullptr;
         MORI_IO_WARN("XGMI: scatter/gather metadata upload failed, falling back to hipMemcpy");
         useKernel = false;
       }
     }
 
     if (useKernel) {
+      completion.submitted = true;
       size_t* dSrcOff = dMeta;
       size_t* dDstOff = dMeta + numSegs;
       size_t* dSizes = dMeta + numSegs * 2;
@@ -384,8 +329,6 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
         status->Update(
             StatusCode::ERR_GPU_OP,
             std::string("XGMI: scatter/gather kernel launch failed: ") + hipGetErrorString(err));
-        (void)hipFree(dMeta);
-        eventPool->PutEvent(event, kernelDevice);
         return;
       }
 
@@ -393,14 +336,11 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
       if (err != hipSuccess) {
         status->Update(StatusCode::ERR_GPU_OP,
                        std::string("XGMI: hipEventRecord failed: ") + hipGetErrorString(err));
-        (void)hipFree(dMeta);
-        eventPool->PutEvent(event, kernelDevice);
         return;
       }
 
       status->SetCode(StatusCode::IN_PROGRESS);
-      ArmTransferCompletion(status, event, kernelDevice, eventPool,
-                            [dMeta]() { (void)hipFree(dMeta); });
+      completion.eventRecorded = true;
       MORI_IO_TRACE("XGMI: Batch transfer via scatter/gather kernel, id={}, segments={}, isRead={}",
                     id, numSegs, isRead);
       return;
@@ -419,6 +359,9 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
       stream = memcpyStream;
       event = memcpyEvent;
       eventDevice = dstDevice;
+      completion.stream = stream;
+      completion.event = event;
+      completion.eventDevice = eventDevice;
     } else {
       // Cannot obtain dstDevice resources; stay on kernelDevice.
       (void)hipSetDevice(kernelDevice);
@@ -439,21 +382,20 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     if (err != hipSuccess) {
       status->Update(StatusCode::ERR_GPU_OP,
                      std::string("XGMI: memcpy failed: ") + hipGetErrorString(err));
-      eventPool->PutEvent(event, eventDevice);
       return;
     }
+    completion.submitted = true;
   }
 
   err = hipEventRecord(event, stream);
   if (err != hipSuccess) {
     status->Update(StatusCode::ERR_GPU_OP,
                    std::string("XGMI: hipEventRecord failed: ") + hipGetErrorString(err));
-    eventPool->PutEvent(event, eventDevice);
     return;
   }
 
   status->SetCode(StatusCode::IN_PROGRESS);
-  ArmTransferCompletion(status, event, eventDevice, eventPool);
+  completion.eventRecorded = true;
   MORI_IO_TRACE("XGMI: Batch transfer via hipMemcpy, id={}, segments={}, isRead={}", id,
                 segments.size(), isRead);
 }
@@ -472,8 +414,8 @@ XgmiBackend::XgmiBackend(EngineKey k, const IOEngineConfig& engConfig,
   myHostname = std::string(hostname);
   myNodeId = mori::ResolveNodeId(myHostname);
 
-  streamPool = std::make_unique<StreamPool>(config.numStreams);
-  eventPool = std::make_unique<EventPool>(config.numEvents);
+  streamPool = std::make_shared<StreamPool>(config.numStreams);
+  eventPool = std::make_shared<EventPool>(config.numEvents);
 
   InitializeP2PAccess();
 
@@ -484,6 +426,12 @@ XgmiBackend::XgmiBackend(EngineKey k, const IOEngineConfig& engConfig,
 }
 
 XgmiBackend::~XgmiBackend() {
+  if (pendingTransfers->load(std::memory_order_acquire)) {
+    MORI_IO_WARN(
+        "XGMI: backend destroyed with unproven transfers; retaining IPC mappings, modules and "
+        "pools until process exit");
+    return;
+  }
   std::unique_lock<std::shared_mutex> lock(ipcMutex);
   for (auto& entry : remoteIpcHandles) {
     if (entry.second.remappedAddr != nullptr) {
@@ -907,7 +855,8 @@ void XgmiBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                             TransferStatus* status, TransferUniqueId id, bool isRead) {
   XgmiBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
   if (sess == nullptr) {
-    status->Update(StatusCode::ERR_BAD_STATE, "XGMI: Failed to create session");
+    status->TrackResultQuiescence(true);
+    status->UpdateResult(StatusCode::ERR_BAD_STATE, "XGMI: Failed to create session");
     return;
   }
 
@@ -920,7 +869,8 @@ void XgmiBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
                                  bool isRead) {
   XgmiBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
   if (sess == nullptr) {
-    status->Update(StatusCode::ERR_BAD_STATE, "XGMI: Failed to create session");
+    status->TrackResultQuiescence(true);
+    status->UpdateResult(StatusCode::ERR_BAD_STATE, "XGMI: Failed to create session");
     return;
   }
 
@@ -948,7 +898,7 @@ BackendSession* XgmiBackend::CreateSession(const MemoryDesc& local, const Memory
     }
 
     return new XgmiBackendSession(config, localAddr, remoteAddr, localDevice, remoteDevice,
-                                  ipcSession, this, streamPool.get(), eventPool.get());
+                                  ipcSession, this, streamPool, eventPool, pendingTransfers);
   }
 
   // Hidden-device path: remote GPU is not visible, use IPC on localDevice
@@ -962,7 +912,7 @@ BackendSession* XgmiBackend::CreateSession(const MemoryDesc& local, const Memory
   MORI_IO_INFO("XGMI: Created hidden-device IPC session (local id={}, remote id={}, device={})",
                local.id, remote.id, localDevice);
   return new XgmiBackendSession(config, localAddr, remoteAddr, localDevice, localDevice, true, this,
-                                streamPool.get(), eventPool.get());
+                                streamPool, eventPool, pendingTransfers);
 }
 
 XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& local,
@@ -1003,9 +953,9 @@ XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& loca
     return nullptr;
   }
 
-  auto sess =
-      std::make_unique<XgmiBackendSession>(config, localAddr, remoteAddr, localDevice, remoteDevice,
-                                           ipcSession, this, streamPool.get(), eventPool.get());
+  auto sess = std::make_unique<XgmiBackendSession>(config, localAddr, remoteAddr, localDevice,
+                                                   remoteDevice, ipcSession, this, streamPool,
+                                                   eventPool, pendingTransfers);
 
   XgmiBackendSession* rawPtr = sess.get();
   sessionCache[key] = std::move(sess);

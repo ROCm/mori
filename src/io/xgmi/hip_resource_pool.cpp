@@ -150,6 +150,28 @@ hipEvent_t EventPool::GetEvent(int deviceId) {
   return event;
 }
 
+hipEvent_t EventPool::TryGetEvent(int deviceId) {
+  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+  if (!lock) return nullptr;
+  auto found = eventPools_.find(deviceId);
+  if (found == eventPools_.end()) return nullptr;
+  auto& pool = found->second;
+  if (pool.empty()) return CreateEventForDevice(deviceId);
+  auto event = pool.front();
+  pool.pop();
+  return event;
+}
+
+bool EventPool::TryPutEvents(hipEvent_t first, hipEvent_t second, int deviceId) {
+  if (!first && !second) return true;
+  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+  if (!lock) return false;
+  auto& pool = eventPools_[deviceId];
+  if (first) pool.push(first);
+  if (second) pool.push(second);
+  return true;
+}
+
 void EventPool::PutEvent(hipEvent_t event, int deviceId) {
   if (event == nullptr) {
     return;

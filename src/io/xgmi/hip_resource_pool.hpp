@@ -63,6 +63,8 @@ class EventPool {
   EventPool& operator=(EventPool&&) = delete;
 
   hipEvent_t GetEvent(int deviceId);
+  hipEvent_t TryGetEvent(int deviceId);
+  bool TryPutEvents(hipEvent_t first, hipEvent_t second, int deviceId);
   void PutEvent(hipEvent_t event, int deviceId);
 
  private:

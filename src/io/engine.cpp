@@ -583,15 +583,16 @@ std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) c
   return it->second;
 }
 
-#define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend)     \
-  backend = SelectBackend(local, remote);                                     \
-  if (backend == nullptr) {                                                   \
-    if (status != nullptr) {                                                  \
-      status->Update(StatusCode::ERR_BAD_STATE,                               \
-                     "No available backend found, create backend first");     \
-    }                                                                         \
-    MORI_IO_ERROR("No available backend found, please create backend first"); \
-    return;                                                                   \
+#define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend)       \
+  backend = SelectBackend(local, remote);                                       \
+  if (backend == nullptr) {                                                     \
+    if (status != nullptr) {                                                    \
+      status->TrackResultQuiescence(true);                                      \
+      status->UpdateResult(StatusCode::ERR_BAD_STATE,                           \
+                           "No available backend found, create backend first"); \
+    }                                                                           \
+    MORI_IO_ERROR("No available backend found, please create backend first");   \
+    return;                                                                     \
   }
 
 void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,

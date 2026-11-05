@@ -81,6 +81,15 @@ if(BUILD_IO)
   target_include_directories(bench_engine PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(bench_engine mori_application mori_io)
 
+  add_executable(test_xgmi_quiescence io/test_xgmi_quiescence.cpp
+                 ${CMAKE_SOURCE_DIR}/src/io/xgmi/transfer_completion.cpp
+                 ${CMAKE_SOURCE_DIR}/src/io/xgmi/hip_resource_pool.cpp)
+  target_include_directories(test_xgmi_quiescence PRIVATE ${CMAKE_SOURCE_DIR}
+                             ${CMAKE_SOURCE_DIR}/include
+                             ${CMAKE_SOURCE_DIR}/3rdparty/msgpack-c/include)
+  target_compile_definitions(test_xgmi_quiescence PRIVATE MSGPACK_NO_BOOST)
+  target_link_libraries(test_xgmi_quiescence mori_logging hip::host)
+
   add_executable(test_transfer_wait io/test_transfer_wait.cpp)
 
   target_include_directories(test_transfer_wait

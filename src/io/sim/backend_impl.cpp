@@ -472,7 +472,7 @@ bool SimBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
   if (engineIt == notifPool_.end()) return false;
   auto it = engineIt->second.find(id);
   if (it == engineIt->second.end() || it->second != 0) return false;
-  status->SetCode(StatusCode::SUCCESS);
+  status->SetResultCode(StatusCode::SUCCESS);
   return true;
 }
 
@@ -576,12 +576,13 @@ void SimBackend::Submit(const MemoryDesc& local, const SizeVec& localOffsets,
                         const MemoryDesc& remote, const SizeVec& remoteOffsets,
                         const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
                         bool isRead) {
+  status->TrackResultQuiescence(true);
   if (localOffsets.size() != sizes.size() || remoteOffsets.size() != sizes.size()) {
-    status->Update(StatusCode::ERR_INVALID_ARGS, "offset and size vectors differ in length");
+    status->UpdateResult(StatusCode::ERR_INVALID_ARGS, "offset and size vectors differ in length");
     return;
   }
   if (sizes.empty()) {
-    status->SetCode(StatusCode::SUCCESS);
+    status->SetResultCode(StatusCode::SUCCESS);
     return;
   }
 
@@ -594,7 +595,7 @@ void SimBackend::Submit(const MemoryDesc& local, const SizeVec& localOffsets,
       ss << "simulated transfer " << id << " segment " << i << " out of bounds: local "
          << localOffsets[i] << "+" << sizes[i] << "/" << local.size << ", remote "
          << remoteOffsets[i] << "+" << sizes[i] << "/" << remote.size;
-      status->Update(StatusCode::ERR_INVALID_ARGS, ss.str());
+      status->UpdateResult(StatusCode::ERR_INVALID_ARGS, ss.str());
       return;
     }
     bytes += sizes[i];
@@ -604,14 +605,14 @@ void SimBackend::Submit(const MemoryDesc& local, const SizeVec& localOffsets,
   if (HasControlPlane()) {
     peer = GetPeer(remote.engineKey);
     if (!peer) {
-      status->Update(StatusCode::ERR_BAD_STATE,
-                     "remote engine " + remote.engineKey + " is not registered");
+      status->UpdateResult(StatusCode::ERR_BAD_STATE,
+                           "remote engine " + remote.engineKey + " is not registered");
       return;
     }
     EnsurePeerReady(peer, remote);
     if (peer->dead.load()) {
-      status->Update(StatusCode::ERR_RDMA_OP,
-                     "simulated peer " + remote.engineKey + " is unreachable");
+      status->UpdateResult(StatusCode::ERR_RDMA_OP,
+                           "simulated peer " + remote.engineKey + " is unreachable");
       return;
     }
   }
@@ -682,12 +683,12 @@ void SimBackend::Complete(Completion& c) {
     }
     if (!err.empty()) {
       MarkPeerDead(*c.peer, err);
-      c.status->Update(StatusCode::ERR_RDMA_OP,
-                       "simulated transfer to " + c.peer->desc.key + " failed: " + err);
+      c.status->UpdateResult(StatusCode::ERR_RDMA_OP,
+                             "simulated transfer to " + c.peer->desc.key + " failed: " + err);
       return;
     }
   }
-  c.status->Update(StatusCode::SUCCESS, "");
+  c.status->UpdateResult(StatusCode::SUCCESS, "");
 }
 
 void SimBackend::ServerLoop() {

@@ -39,6 +39,7 @@
 #include "mori/application/transport/p2p/p2p.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/io/enum.hpp"
+#include "mori/io/logging.hpp"
 #include "mori/io/msgpack_adaptor.hpp"
 #include "mori/io/peer_failure.hpp"
 
@@ -235,8 +236,13 @@ struct TransferStatus {
     }
 
     if (timeoutMs < 0) {
-      if (waitCallback) {
-        waitCallback();
+      std::shared_ptr<std::function<void()>> wait;
+      {
+        std::lock_guard<std::mutex> lock(callbackMu_);
+        wait = waitCallback;
+      }
+      if (wait) {
+        (*wait)();
         return code.load(std::memory_order_acquire);
       }
 
@@ -306,14 +312,74 @@ struct TransferStatus {
     {
       std::lock_guard<std::mutex> lock(quiescenceMu_);
       CheckReusableLocked();
+      resultProofMode_.store(0, std::memory_order_relaxed);
+      std::atomic_store(&resultProof_, std::shared_ptr<std::atomic<QuiescenceState>>{});
       quiescenceCallback_.swap(next);
     }
   }
 
-  void SetWaitCallback(std::function<void()> cb) { waitCallback = std::move(cb); }
-  void SetProgressCallback(std::function<void()> cb) { progressCallback = std::move(cb); }
+  // Backend-only publication, after its completion evidence. Public status writes
+  // deliberately do not certify accesses to any buffer.
+  void UpdateResult(StatusCode code, const std::string& message) {
+    Update(code, message);
+    PublishResultProof(code);
+  }
+  void SetResultCode(StatusCode code) {
+    SetCode(code);
+    PublishResultProof(code);
+  }
+
+  // Result-only backends certify success at publication; unaudited failures stay unprovable.
+  void TrackResultQuiescence(bool failuresQuiesce = false) {
+    auto proof = std::make_shared<std::atomic<QuiescenceState>>(QuiescenceState::Pending);
+    SetQuiescenceCallback([this, proof](int slice) {
+      if (proof->load(std::memory_order_acquire) == QuiescenceState::Pending) {
+        PollProgress(false);
+        if (slice && proof->load(std::memory_order_acquire) == QuiescenceState::Pending) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+          PollProgress(false);
+        }
+      }
+      return proof->load(std::memory_order_acquire);
+    });
+    SetWaitCallback({});
+    SetProgressCallback({});
+    std::atomic_store(&resultProof_, proof);
+    resultProofMode_.store(failuresQuiesce ? 2 : 1, std::memory_order_relaxed);
+    SetCode(StatusCode::IN_PROGRESS);
+  }
+
+  void SetWaitCallback(std::function<void()> cb) {
+    auto next = cb ? std::make_shared<std::function<void()>>(std::move(cb)) : nullptr;
+    {
+      std::lock_guard<std::mutex> lock(callbackMu_);
+      waitCallback.swap(next);
+    }
+  }
+  void SetProgressCallback(std::function<void()> cb) {
+    auto next = cb ? std::make_shared<std::function<void()>>(std::move(cb)) : nullptr;
+    {
+      std::lock_guard<std::mutex> lock(callbackMu_);
+      progressCallback.swap(next);
+      hasProgress_.store(progressCallback != nullptr, std::memory_order_release);
+    }
+  }
 
  private:
+  void PublishResultProof(StatusCode code) {
+    int mode = resultProofMode_.load(std::memory_order_relaxed);
+    if (!mode || (code != StatusCode::SUCCESS && code <= StatusCode::ERR_BEGIN)) return;
+    auto proof = std::atomic_load(&resultProof_);
+    if (!proof) return;
+    auto result = code == StatusCode::SUCCESS || mode == 2 ? QuiescenceState::Quiesced
+                                                           : QuiescenceState::Unprovable;
+    auto pending = QuiescenceState::Pending;
+    if (proof->compare_exchange_strong(pending, result, std::memory_order_release) &&
+        result == QuiescenceState::Unprovable) {
+      MORI_IO_WARN("Backend failure quiescence unsupported; buffers cannot be reused");
+    }
+  }
+
   void CheckReusableLocked() const {
     if (quiescenceCallback_ && (*quiescenceCallback_)(0) != QuiescenceState::Quiesced)
       throw std::logic_error("transfer status still owns unquiesced buffers");
@@ -324,18 +390,27 @@ struct TransferStatus {
     return code.load(std::memory_order_acquire);
   }
 
-  void PollProgress() {
-    if (code.load(std::memory_order_acquire) != StatusCode::IN_PROGRESS) return;
-    if (progressCallback) progressCallback();
+  void PollProgress(bool activeOnly = true) {
+    if (activeOnly && code.load(std::memory_order_acquire) != StatusCode::IN_PROGRESS) return;
+    if (!hasProgress_.load(std::memory_order_acquire)) return;
+    std::unique_lock<std::mutex> lock(callbackMu_, std::try_to_lock);
+    if (!lock) return;
+    auto progress = progressCallback;
+    lock.unlock();
+    if (progress) (*progress)();
   }
 
+  std::atomic<int> resultProofMode_{0};
+  std::shared_ptr<std::atomic<QuiescenceState>> resultProof_;
   mutable std::mutex quiescenceMu_;
   std::shared_ptr<std::function<QuiescenceState(int)>> quiescenceCallback_;
   std::atomic<StatusCode> code{StatusCode::INIT};
   mutable std::mutex msgMu;
   std::string msg;
-  std::function<void()> waitCallback;
-  std::function<void()> progressCallback;
+  std::mutex callbackMu_;
+  std::atomic<bool> hasProgress_{false};
+  std::shared_ptr<std::function<void()>> waitCallback;
+  std::shared_ptr<std::function<void()>> progressCallback;
   std::condition_variable cv_;
 };
 

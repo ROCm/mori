@@ -65,7 +65,7 @@ class FabricBackendSession : public BackendSession {
   FabricBackendSession() = default;
   FabricBackendSession(const FabricBackendConfig& config, void* localAddr, void* remoteAddr,
                        int localDevice, FabricBackend* backend, StreamPool* streamPool,
-                       EventPool* eventPool);
+                       std::shared_ptr<EventPool> eventPool);
   ~FabricBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -88,7 +88,7 @@ class FabricBackendSession : public BackendSession {
   int localDevice{-1};        // device that drives the copy kernel
   FabricBackend* backend{nullptr};
   StreamPool* streamPool{nullptr};
-  EventPool* eventPool{nullptr};
+  std::shared_ptr<EventPool> eventPool;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -187,7 +187,7 @@ class FabricBackend : public Backend {
   int myPid{0};
 
   std::unique_ptr<StreamPool> streamPool;
-  std::unique_ptr<EventPool> eventPool;
+  std::shared_ptr<EventPool> eventPool;
 
   int numDevices{0};
   std::vector<char> deviceSupportsFabric;       // indexed by device id

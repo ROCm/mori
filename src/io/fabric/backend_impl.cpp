@@ -98,7 +98,7 @@ struct TransferCompletion {
   TransferStatus* status{nullptr};
   hipEvent_t event{nullptr};
   int eventDevice{-1};
-  EventPool* eventPool{nullptr};
+  std::shared_ptr<EventPool> eventPool;
   std::function<void()> cleanup;
   std::once_flag completionOnce;
   std::atomic<bool> completed{false};
@@ -109,19 +109,21 @@ struct TransferCompletion {
     std::call_once(completionOnce, [this]() {
       hipError_t err = hipEventSynchronize(event);
       if (err == hipSuccess) {
-        status->SetCode(StatusCode::SUCCESS);
+        status->SetResultCode(StatusCode::SUCCESS);
       } else {
-        status->Update(StatusCode::ERR_GPU_OP, std::string("FABRIC: hipEventSynchronize failed: ") +
-                                                   hipGetErrorString(err));
+        status->UpdateResult(
+            StatusCode::ERR_GPU_OP,
+            std::string("FABRIC: hipEventSynchronize failed: ") + hipGetErrorString(err));
       }
       if (cleanup) cleanup();
-      eventPool->PutEvent(event, eventDevice);
+      if (err == hipSuccess) eventPool->PutEvent(event, eventDevice);
       completed.store(true, std::memory_order_release);
     });
   }
 
   void FinalizeNonBlocking() {
-    std::lock_guard<std::mutex> lock(eventMu);
+    std::unique_lock<std::mutex> lock(eventMu, std::try_to_lock);
+    if (!lock) return;
     if (completed.load(std::memory_order_acquire)) return;
 
     hipError_t err = hipEventQuery(event);
@@ -131,20 +133,21 @@ struct TransferCompletion {
     }
     std::call_once(completionOnce, [this, err]() {
       if (err == hipSuccess) {
-        status->SetCode(StatusCode::SUCCESS);
+        status->SetResultCode(StatusCode::SUCCESS);
       } else {
-        status->Update(StatusCode::ERR_GPU_OP,
-                       std::string("FABRIC: hipEventQuery failed: ") + hipGetErrorString(err));
+        status->UpdateResult(StatusCode::ERR_GPU_OP, std::string("FABRIC: hipEventQuery failed: ") +
+                                                         hipGetErrorString(err));
       }
       if (cleanup) cleanup();
-      eventPool->PutEvent(event, eventDevice);
+      if (err == hipSuccess) eventPool->PutEvent(event, eventDevice);
       completed.store(true, std::memory_order_release);
     });
   }
 };
 
 void ArmTransferCompletion(TransferStatus* status, hipEvent_t event, int eventDevice,
-                           EventPool* eventPool, std::function<void()> cleanup = {}) {
+                           std::shared_ptr<EventPool> eventPool,
+                           std::function<void()> cleanup = {}) {
   auto completion = std::make_shared<TransferCompletion>();
   completion->status = status;
   completion->event = event;
@@ -261,7 +264,7 @@ void FabricFree(void* ptr) {
 FabricBackendSession::FabricBackendSession(const FabricBackendConfig& config, void* localAddr,
                                            void* remoteAddr, int localDevice,
                                            FabricBackend* backend, StreamPool* streamPool,
-                                           EventPool* eventPool)
+                                           std::shared_ptr<EventPool> eventPool)
     : config(config),
       localAddr(localAddr),
       remoteAddr(remoteAddr),
@@ -307,18 +310,20 @@ hipError_t FabricBackendSession::LaunchCopy(void* dst, const void* src, size_t s
 
 void FabricBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                      TransferStatus* status, TransferUniqueId id, bool isRead) {
+  status->TrackResultQuiescence();
   ScopedHipDeviceGuard deviceGuard;
   hipError_t err = hipSetDevice(localDevice);
   if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: Failed to set device: ") + hipGetErrorString(err));
+    status->UpdateResult(StatusCode::ERR_GPU_OP,
+                         std::string("FABRIC: Failed to set device: ") + hipGetErrorString(err));
     return;
   }
 
   hipStream_t stream = streamPool->GetNextStream(localDevice);
   hipEvent_t event = eventPool->GetEvent(localDevice);
   if (stream == nullptr || event == nullptr) {
-    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to get stream or event from pool");
+    status->UpdateResult(StatusCode::ERR_BAD_STATE,
+                         "FABRIC: Failed to get stream or event from pool");
     if (event != nullptr) eventPool->PutEvent(event, localDevice);
     return;
   }
@@ -330,16 +335,16 @@ void FabricBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, si
 
   err = LaunchCopy(dst, src, size, stream);
   if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: copy launch failed: ") + hipGetErrorString(err));
+    status->UpdateResult(StatusCode::ERR_GPU_OP,
+                         std::string("FABRIC: copy launch failed: ") + hipGetErrorString(err));
     eventPool->PutEvent(event, localDevice);
     return;
   }
 
   err = hipEventRecord(event, stream);
   if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: hipEventRecord failed: ") + hipGetErrorString(err));
+    status->UpdateResult(StatusCode::ERR_GPU_OP,
+                         std::string("FABRIC: hipEventRecord failed: ") + hipGetErrorString(err));
     eventPool->PutEvent(event, localDevice);
     return;
   }
@@ -352,27 +357,29 @@ void FabricBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, si
 void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                           const SizeVec& sizes, TransferStatus* status,
                                           TransferUniqueId id, bool isRead) {
+  status->TrackResultQuiescence();
   ScopedHipDeviceGuard deviceGuard;
   size_t batchSize = sizes.size();
   assert(batchSize == localOffsets.size());
   assert(batchSize == remoteOffsets.size());
 
   if (batchSize == 0) {
-    status->SetCode(StatusCode::SUCCESS);
+    status->SetResultCode(StatusCode::SUCCESS);
     return;
   }
 
   hipError_t err = hipSetDevice(localDevice);
   if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: Failed to set device: ") + hipGetErrorString(err));
+    status->UpdateResult(StatusCode::ERR_GPU_OP,
+                         std::string("FABRIC: Failed to set device: ") + hipGetErrorString(err));
     return;
   }
 
   hipStream_t stream = streamPool->GetNextStream(localDevice);
   hipEvent_t event = eventPool->GetEvent(localDevice);
   if (stream == nullptr || event == nullptr) {
-    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to get stream or event from pool");
+    status->UpdateResult(StatusCode::ERR_BAD_STATE,
+                         "FABRIC: Failed to get stream or event from pool");
     if (event != nullptr) eventPool->PutEvent(event, localDevice);
     return;
   }
@@ -409,7 +416,7 @@ void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const Siz
   }
 
   if (segments.empty()) {
-    status->SetCode(StatusCode::SUCCESS);
+    status->SetResultCode(StatusCode::SUCCESS);
     eventPool->PutEvent(event, localDevice);
     return;
   }
@@ -421,8 +428,9 @@ void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const Siz
                        : static_cast<char*>(remoteAddr) + seg.remoteOff;
     err = LaunchCopy(dst, src, seg.sz, stream);
     if (err != hipSuccess) {
-      status->Update(StatusCode::ERR_GPU_OP,
-                     std::string("FABRIC: batch copy launch failed: ") + hipGetErrorString(err));
+      status->UpdateResult(
+          StatusCode::ERR_GPU_OP,
+          std::string("FABRIC: batch copy launch failed: ") + hipGetErrorString(err));
       eventPool->PutEvent(event, localDevice);
       return;
     }
@@ -430,8 +438,8 @@ void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const Siz
 
   err = hipEventRecord(event, stream);
   if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: hipEventRecord failed: ") + hipGetErrorString(err));
+    status->UpdateResult(StatusCode::ERR_GPU_OP,
+                         std::string("FABRIC: hipEventRecord failed: ") + hipGetErrorString(err));
     eventPool->PutEvent(event, localDevice);
     return;
   }
@@ -456,7 +464,7 @@ FabricBackend::FabricBackend(EngineKey k, const IOEngineConfig& /*engConfig*/,
   myNodeId = mori::ResolveNodeId(myHostname);
 
   streamPool = std::make_unique<StreamPool>(config.numStreams);
-  eventPool = std::make_unique<EventPool>(config.numEvents);
+  eventPool = std::make_shared<EventPool>(config.numEvents);
 
   Initialize();
 
@@ -761,7 +769,8 @@ void FabricBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                               TransferStatus* status, TransferUniqueId id, bool isRead) {
   FabricBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
   if (sess == nullptr) {
-    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to create session");
+    status->TrackResultQuiescence();
+    status->UpdateResult(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to create session");
     return;
   }
   sess->ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
@@ -773,7 +782,8 @@ void FabricBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& l
                                    TransferUniqueId id, bool isRead) {
   FabricBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
   if (sess == nullptr) {
-    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to create session");
+    status->TrackResultQuiescence();
+    status->UpdateResult(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to create session");
     return;
   }
   sess->BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
@@ -789,7 +799,7 @@ BackendSession* FabricBackend::CreateSession(const MemoryDesc& local, const Memo
     return nullptr;
   }
   return new FabricBackendSession(config, localAddr, remoteAddr, localDevice, this,
-                                  streamPool.get(), eventPool.get());
+                                  streamPool.get(), eventPool);
 }
 
 FabricBackendSession* FabricBackend::GetOrCreateSessionCached(const MemoryDesc& local,
@@ -812,7 +822,7 @@ FabricBackendSession* FabricBackend::GetOrCreateSessionCached(const MemoryDesc& 
   }
 
   auto sess = std::make_unique<FabricBackendSession>(config, localAddr, remoteAddr, localDevice,
-                                                     this, streamPool.get(), eventPool.get());
+                                                     this, streamPool.get(), eventPool);
   FabricBackendSession* rawPtr = sess.get();
   sessionCache[key] = std::move(sess);
   MORI_IO_TRACE("FABRIC: Created session for local.id={}, remote.id={}", local.id, remote.id);

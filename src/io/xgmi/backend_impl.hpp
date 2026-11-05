@@ -47,7 +47,8 @@ class XgmiBackendSession : public BackendSession {
   XgmiBackendSession() = default;
   XgmiBackendSession(const XgmiBackendConfig& config, void* localAddr, void* remoteAddr,
                      int localDevice, int remoteDevice, bool isIpcSession, XgmiBackend* backend,
-                     StreamPool* streamPool, EventPool* eventPool);
+                     std::shared_ptr<StreamPool> streamPool, std::shared_ptr<EventPool> eventPool,
+                     std::shared_ptr<std::atomic<size_t>> pendingTransfers);
   ~XgmiBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -67,8 +68,9 @@ class XgmiBackendSession : public BackendSession {
   int remoteDevice{-1};
   bool isIpcSession{false};
   XgmiBackend* backend{nullptr};
-  StreamPool* streamPool{nullptr};
-  EventPool* eventPool{nullptr};
+  std::shared_ptr<StreamPool> streamPool;
+  std::shared_ptr<EventPool> eventPool;
+  std::shared_ptr<std::atomic<size_t>> pendingTransfers;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -140,8 +142,9 @@ class XgmiBackend : public Backend {
   std::string myHostname;
   XgmiBackendConfig config;
 
-  std::unique_ptr<StreamPool> streamPool;
-  std::unique_ptr<EventPool> eventPool;
+  std::shared_ptr<StreamPool> streamPool;
+  std::shared_ptr<EventPool> eventPool;
+  std::shared_ptr<std::atomic<size_t>> pendingTransfers = std::make_shared<std::atomic<size_t>>(0);
 
   int numDevices{0};
   std::vector<std::vector<bool>> p2pMatrix;
