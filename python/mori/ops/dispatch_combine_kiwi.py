@@ -201,11 +201,14 @@ class EpDispatchCombineKiwiOp:
             (4 bytes). Any result other than bfloat16 raises ``ValueError``.
         num_blocks: dispatch/combine grid size; 0 picks it per call from the
             token count.
-        num_proxy_threads: CPU threads posting RDMA work (one QP set each).
-        queue_capacity: invoke queue lines per queue (power of two).
-        rcomp_backend: "auto", "rdma-only", or "hybrid" (HIP IPC for peers on
+
+    Unstable args (KIWI's own transport; they may change or be removed when
+    KIWI moves to MORI's transport):
+        _num_proxy_threads: CPU threads posting RDMA work (one QP set each).
+        _queue_capacity: invoke queue lines per queue (power of two).
+        _rcomp_backend: "auto", "rdma-only", or "hybrid" (HIP IPC for peers on
             the same host).
-        device_name: RDMA device, e.g. "mlx5_0". Defaults to the NIC nearest
+        _device_name: RDMA device, e.g. "mlx5_0". Defaults to the NIC nearest
             the current GPU; ``MORI_KIWI_DEVICE_NAME`` overrides it.
     """
 
@@ -216,10 +219,10 @@ class EpDispatchCombineKiwiOp:
         *,
         combine_dtype: Optional[torch.dtype] = None,
         num_blocks: int = 0,
-        num_proxy_threads: int = 4,
-        queue_capacity: int = 2048,
-        rcomp_backend: str = "auto",
-        device_name: str = "",
+        _num_proxy_threads: int = 4,
+        _queue_capacity: int = 2048,
+        _rcomp_backend: str = "auto",
+        _device_name: str = "",
     ):
         quant_type = getattr(config, "quant_type", "none") or "none"
         if not str(getattr(quant_type, "name", quant_type)).lower().endswith("none"):
@@ -259,10 +262,10 @@ class EpDispatchCombineKiwiOp:
             config.scale_type_size if config.scale_dim > 0 else 0
         )
         cfg.num_blocks = num_blocks
-        cfg.num_proxy_threads = num_proxy_threads
-        cfg.queue_capacity = queue_capacity
-        cfg.rcomp_backend = rcomp_backend
-        cfg.device_name = device_name
+        cfg.num_proxy_threads = _num_proxy_threads
+        cfg.queue_capacity = _queue_capacity
+        cfg.rcomp_backend = _rcomp_backend
+        cfg.device_name = _device_name
 
         if config.world_size > 1:
             if not dist.is_initialized():

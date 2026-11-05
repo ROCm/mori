@@ -84,7 +84,7 @@ def _run_test(args, rank, world_size):
         max_token_type_size=2,
     )
     op = dispatch_combine_kiwi.EpDispatchCombineKiwiOp(
-        config, rcomp_backend=args.kernel_type
+        config, _rcomp_backend=args.kernel_type
     )
     test_case = EpDispatchCombineTestCase(
         config,

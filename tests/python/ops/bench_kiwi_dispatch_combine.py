@@ -302,10 +302,10 @@ def main():
     op = kiwi.EpDispatchCombineKiwiOp(
         config,
         num_blocks=args.num_blocks,
-        num_proxy_threads=args.num_proxy_threads,
-        queue_capacity=args.queue_capacity,
-        rcomp_backend=args.rcomp_backend,
-        device_name=args.device_name,
+        _num_proxy_threads=args.num_proxy_threads,
+        _queue_capacity=args.queue_capacity,
+        _rcomp_backend=args.rcomp_backend,
+        _device_name=args.device_name,
     )
 
     if rank == 0:

@@ -64,7 +64,7 @@ def _test_dispatch_combine(
         max_token_type_size=2,
     )
     op = dispatch_combine_kiwi.EpDispatchCombineKiwiOp(
-        config, rcomp_backend=rcomp_backend
+        config, _rcomp_backend=rcomp_backend
     )
     test_case = EpDispatchCombineTestCase(
         config,
@@ -150,7 +150,7 @@ def _test_dispatch_combine_unrouted_token(
         max_token_type_size=2,
     )
     op = dispatch_combine_kiwi.EpDispatchCombineKiwiOp(
-        config, rcomp_backend=rcomp_backend
+        config, _rcomp_backend=rcomp_backend
     )
     test_case = EpDispatchCombineTestCase(config)
     token_counts = [num_tokens] * world_size

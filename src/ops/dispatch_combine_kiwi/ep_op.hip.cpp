@@ -49,12 +49,9 @@ quant_format_t parse_quant_format(const std::string& name) {
 }
 
 rcomp_backend_t parse_rcomp_backend(const std::string& name) {
-  const std::string value = lower(name);
-  if (value.empty() || value == "auto") return rcomp_backend_t::AUTO;
-  if (value == "rdma-only" || value == "rdma_only" || value == "rdma") {
-    return rcomp_backend_t::RDMA_ONLY;
-  }
-  if (value == "hybrid") return rcomp_backend_t::HYBRID;
+  if (name.empty() || name == "auto") return rcomp_backend_t::AUTO;
+  if (name == "rdma-only") return rcomp_backend_t::RDMA_ONLY;
+  if (name == "hybrid") return rcomp_backend_t::HYBRID;
   throw std::invalid_argument("unsupported KIWI EP rcomp_backend '" + name +
                               "' (expected auto, rdma-only, or hybrid)");
 }
