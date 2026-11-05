@@ -49,7 +49,6 @@ struct CoreParams {
   std::string hostname;
   std::string host;
   int32_t pid{0};
-  IdentitySources identity{LiveIdentitySources()};
   size_t eventCapacity{1024};
 };
 

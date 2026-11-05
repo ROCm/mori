@@ -21,139 +21,66 @@
 // SOFTWARE.
 #include "src/ras/identity.hpp"
 
-#include <fcntl.h>
 #include <sys/random.h>
-#include <time.h>
 #include <unistd.h>
 
-#include <cerrno>
-#include <cstdlib>
+#include <cstdio>
+#include <fstream>
 #include <sstream>
 
 namespace mori {
 namespace ras {
 namespace {
 
-bool ReadFile(const std::string& path, std::string* out, size_t maxBytes) {
-  int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) return false;
-  std::string buf(maxBytes + 1, '\0');
-  size_t total = 0;
-  while (total < buf.size()) {
-    ssize_t n = read(fd, &buf[total], buf.size() - total);
-    if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) break;
-    total += static_cast<size_t>(n);
-  }
-  close(fd);
-  if (total > maxBytes) return false;
-  out->assign(buf.data(), total);
-  return true;
+std::string FirstLine(const std::string& path) {
+  std::ifstream in(path);
+  std::string line;
+  std::getline(in, line);
+  return line;
 }
 
-std::string Trim(const std::string& s) {
-  size_t b = s.find_first_not_of(" \t\r\n");
-  if (b == std::string::npos) return "";
-  size_t e = s.find_last_not_of(" \t\r\n");
-  return s.substr(b, e - b + 1);
-}
-
-std::string ReadTrimmed(const std::string& path) {
-  std::string s;
-  return ReadFile(path, &s, 4096) ? Trim(s) : "";
-}
-
-bool ParseU64(const std::string& s, uint64_t* out) {
-  if (s.empty() || s[0] < '0' || s[0] > '9') return false;
-  errno = 0;
-  char* end = nullptr;
-  unsigned long long v = std::strtoull(s.c_str(), &end, 10);
-  if (errno != 0 || end == nullptr || *end != '\0') return false;
-  *out = v;
-  return true;
-}
-
-void FillRandom(void* out, size_t n) {
-  uint8_t* p = static_cast<uint8_t*>(out);
-  size_t got = 0;
-  while (got < n) {
-    ssize_t r = getrandom(p + got, n - got, GRND_NONBLOCK);
-    if (r > 0) {
-      got += static_cast<size_t>(r);
-    } else if (r < 0 && errno == EINTR) {
-      continue;
-    } else {
-      break;
-    }
-  }
-  if (got == n) return;
-  int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-  if (fd >= 0) {
-    while (got < n) {
-      ssize_t r = read(fd, p + got, n - got);
-      if (r <= 0) break;
-      got += static_cast<size_t>(r);
-    }
-    close(fd);
-  }
-  if (got == n) return;
-  // No kernel randomness at all: still unique per process, though not unpredictable.
-  timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  uint64_t seed = static_cast<uint64_t>(ts.tv_nsec) ^ (static_cast<uint64_t>(ts.tv_sec) << 30) ^
-                  (static_cast<uint64_t>(getpid()) << 48) ^ reinterpret_cast<uintptr_t>(out);
-  for (; got < n; ++got) {
-    seed = seed * 6364136223846793005ull + 1442695040888963407ull;
-    p[got] = static_cast<uint8_t>(seed >> 56);
-  }
-}
+// Requests are at most 16 bytes, which getrandom returns in full once the kernel's pool is
+// seeded. It fails only where the syscall is missing or filtered out.
+bool FillRandom(void* out, size_t n) { return getrandom(out, n, 0) == static_cast<ssize_t>(n); }
 
 }  // namespace
 
-IdentitySources LiveIdentitySources() { return IdentitySources{}; }
+uint64_t StartTimeFromStat(const std::string& stat) {
+  // Field 2, the command name, is parenthesized and may hold spaces and parentheses.
+  size_t close = stat.rfind(')');
+  if (close == std::string::npos) return 0;
+  std::istringstream in(stat.substr(close + 1));
+  std::string skipped;
+  for (int field = 3; field < 22; ++field) in >> skipped;
+  uint64_t ticks = 0;
+  in >> ticks;
+  return ticks;
+}
 
-ProcessFacts ReadProcessFacts(const std::string& procRoot, const std::string& pid) {
+uint64_t InodeFromNsLink(const std::string& target) {
+  unsigned long long inode = 0;
+  return std::sscanf(target.c_str(), "pid:[%llu]", &inode) == 1 ? inode : 0;
+}
+
+ProcessFacts ReadProcessFacts() {
   ProcessFacts f;
-  std::string base = procRoot + "/" + pid;
-  std::string stat;
-  if (ReadFile(base + "/stat", &stat, 4096)) {
-    // Field 2, the command name, is parenthesized and may hold spaces and parentheses.
-    size_t close = stat.rfind(')');
-    if (close != std::string::npos) {
-      std::istringstream in(stat.substr(close + 1));
-      std::string field;
-      for (int index = 3; in >> field; ++index) {
-        if (index == 22) {
-          ParseU64(field, &f.startTimeTicks);
-          break;
-        }
-      }
-    }
-  }
+  f.startTimeTicks = StartTimeFromStat(FirstLine("/proc/self/stat"));
   char link[64];
-  ssize_t n = readlink((base + "/ns/pid").c_str(), link, sizeof(link) - 1);
-  if (n > 0) {
-    std::string target(link, static_cast<size_t>(n));
-    size_t open = target.find('[');
-    size_t close = target.find(']');
-    if (open != std::string::npos && close != std::string::npos && close > open) {
-      ParseU64(target.substr(open + 1, close - open - 1), &f.pidNamespace);
-    }
-  }
-  f.bootId = ReadTrimmed(procRoot + "/sys/kernel/random/boot_id");
+  ssize_t n = readlink("/proc/self/ns/pid", link, sizeof(link) - 1);
+  if (n > 0) f.pidNamespace = InodeFromNsLink(std::string(link, static_cast<size_t>(n)));
+  f.bootId = FirstLine("/proc/sys/kernel/random/boot_id");
   return f;
 }
 
 RasProcessId CollectIdentity(const std::string& nodeId, const std::string& hostname,
-                             const std::string& host, int32_t pid, RuntimeUuid uuid,
-                             const IdentitySources& src) {
+                             const std::string& host, int32_t pid, RuntimeUuid uuid) {
   RasProcessId id;
   id.uuid = uuid;
   id.nodeId = nodeId;
   id.hostname = hostname;
   id.host = host;
   id.pid = pid;
-  ProcessFacts facts = ReadProcessFacts(src.procRoot, "self");
+  ProcessFacts facts = ReadProcessFacts();
   id.pidNamespace = facts.pidNamespace;
   id.startTimeTicks = facts.startTimeTicks;
   id.bootId = facts.bootId;
@@ -162,8 +89,7 @@ RasProcessId CollectIdentity(const std::string& nodeId, const std::string& hostn
 
 RuntimeUuid NewRuntimeUuid() {
   RuntimeUuid u;
-  FillRandom(&u.hi, sizeof(u.hi));
-  FillRandom(&u.lo, sizeof(u.lo));
+  if (!FillRandom(&u.hi, sizeof(u.hi)) || !FillRandom(&u.lo, sizeof(u.lo))) return RuntimeUuid{};
   u.hi = (u.hi & ~0xf000ull) | 0x4000ull;        // version 4
   u.lo = (u.lo & ~(3ull << 62)) | (2ull << 62);  // RFC 4122 variant
   return u;
@@ -171,7 +97,7 @@ RuntimeUuid NewRuntimeUuid() {
 
 std::string NewToken() {
   uint8_t bytes[16];
-  FillRandom(bytes, sizeof(bytes));
+  if (!FillRandom(bytes, sizeof(bytes))) return "";
   static const char kHex[] = "0123456789abcdef";
   std::string token;
   for (uint8_t b : bytes) {

@@ -136,6 +136,10 @@ bool RasCore::Start(std::string* error) {
     *error = "the runtime was stopped";
     return false;
   }
+  if (uuid_.IsZero() || token_.empty()) {
+    *error = "getrandom gave no random bytes for the runtime UUID and token";
+    return false;
+  }
   std::string bindHost = params_.host;
   advertisedHost_ = params_.host;
   if (!params_.config.ifname.empty()) {
@@ -188,8 +192,8 @@ void RasCore::ThreadMain() {
   }
   pthread_setname_np(pthread_self(), "mori-ras");
 
-  links_->SetIdentity(CollectIdentity(params_.nodeId, params_.hostname, params_.host, params_.pid,
-                                      uuid_, params_.identity));
+  links_->SetIdentity(
+      CollectIdentity(params_.nodeId, params_.hostname, params_.host, params_.pid, uuid_));
   while (!links_->StopRequested()) links_->RunOnce(1000);
   links_->Shutdown();
   {

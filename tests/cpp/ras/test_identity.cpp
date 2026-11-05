@@ -21,10 +21,7 @@
 // SOFTWARE.
 #include <gtest/gtest.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
-#include <cstdlib>
-#include <fstream>
 #include <set>
 #include <string>
 
@@ -32,81 +29,42 @@
 
 using namespace mori::ras;
 
-namespace {
-
-// A scratch directory tree, removed when the fixture goes away.
-class FixtureTree {
- public:
-  FixtureTree() {
-    char tmpl[] = "/tmp/mori_ras_identity_XXXXXX";
-    root_ = mkdtemp(tmpl);
-  }
-  ~FixtureTree() { std::system(("rm -rf " + root_).c_str()); }
-  const std::string& Root() const { return root_; }
-
-  void Write(const std::string& rel, const std::string& content) {
-    std::string path = root_ + "/" + rel;
-    std::system(("mkdir -p $(dirname " + path + ")").c_str());
-    std::ofstream(path) << content;
-  }
-  void Symlink(const std::string& rel, const std::string& target) {
-    std::string path = root_ + "/" + rel;
-    std::system(("mkdir -p $(dirname " + path + ")").c_str());
-    ASSERT_EQ(symlink(target.c_str(), path.c_str()), 0);
-  }
-
- private:
-  std::string root_;
-};
-
-}  // namespace
-
-TEST(RasIdentity, ReadsProcessFactsFromAFixture) {
-  FixtureTree t;
+TEST(RasIdentity, ParsesTheStartTimeAfterTheLastParenthesis) {
   // The comm field holds spaces and parentheses; parsing must start after the last ')'.
   std::string stat = "4242 (my (odd) proc) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 3 0 ";
-  stat += "987654321 1000000 100 18446744073709551615 0 0 0 0 0 0 0 0 0 17 5 0 0 0 0 0\n";
-  t.Write("proc/4242/stat", stat);
-  t.Symlink("proc/4242/ns/pid", "pid:[4026532111]");
-  t.Write("proc/sys/kernel/random/boot_id", "1b6c9a52-3f0e-4c8e-9a31-5d2c7e8f9a01\n");
-  ProcessFacts f = ReadProcessFacts(t.Root() + "/proc", "4242");
-  EXPECT_EQ(f.startTimeTicks, 987654321u);
-  EXPECT_EQ(f.pidNamespace, 4026532111u);
-  EXPECT_EQ(f.bootId, "1b6c9a52-3f0e-4c8e-9a31-5d2c7e8f9a01");
+  stat += "987654321 1000000 100 18446744073709551615 0 0 0 0 0 0 0 0 0 17 5 0 0 0 0 0";
+  EXPECT_EQ(StartTimeFromStat(stat), 987654321u);
+  EXPECT_EQ(StartTimeFromStat("4242 (short) S 1 2 3"), 0u);
+  EXPECT_EQ(StartTimeFromStat(""), 0u);
+}
 
-  ProcessFacts missing = ReadProcessFacts(t.Root() + "/proc", "999");
-  EXPECT_EQ(missing.startTimeTicks, 0u);
-  EXPECT_EQ(missing.pidNamespace, 0u);
+TEST(RasIdentity, ParsesThePidNamespaceInode) {
+  EXPECT_EQ(InodeFromNsLink("pid:[4026532111]"), 4026532111u);
+  EXPECT_EQ(InodeFromNsLink("net:[4026532111]"), 0u);
+  EXPECT_EQ(InodeFromNsLink(""), 0u);
 }
 
 TEST(RasIdentity, ReadsTheLiveProcess) {
-  ProcessFacts self = ReadProcessFacts("/proc", "self");
-  EXPECT_NE(self.pidNamespace, 0u);
-  EXPECT_NE(self.startTimeTicks, 0u);
-  EXPECT_EQ(self.bootId.size(), 36u);
-  ProcessFacts byPid = ReadProcessFacts("/proc", std::to_string(getpid()));
-  EXPECT_EQ(byPid.startTimeTicks, self.startTimeTicks);
-  EXPECT_EQ(byPid.pidNamespace, self.pidNamespace);
+  ProcessFacts f = ReadProcessFacts();
+  struct stat ns{};
+  ASSERT_EQ(stat("/proc/self/ns/pid", &ns), 0);
+  EXPECT_EQ(f.pidNamespace, ns.st_ino);
+  EXPECT_NE(f.startTimeTicks, 0u);
+  EXPECT_EQ(f.bootId.size(), 36u);
 }
 
 TEST(RasIdentity, CollectsTheEngineFieldsAndProcessFacts) {
-  FixtureTree t;
-  t.Write("proc/self/stat", "77 (x) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 555 0 0\n");
-  t.Symlink("proc/self/ns/pid", "pid:[4026531836]");
-  t.Write("proc/sys/kernel/random/boot_id", "b00710d0-0000-4000-8000-000000000001\n");
-  IdentitySources s;
-  s.procRoot = t.Root() + "/proc";
-
   RuntimeUuid uuid{0x1234, 0x8000000000005678ull};
-  RasProcessId id = CollectIdentity("node-1", "host-1", "10.0.0.1", 77, uuid, s);
+  RasProcessId id = CollectIdentity("node-1", "host-1", "10.0.0.1", 77, uuid);
   EXPECT_EQ(id.uuid, uuid);
   EXPECT_EQ(id.nodeId, "node-1");
   EXPECT_EQ(id.hostname, "host-1");
   EXPECT_EQ(id.host, "10.0.0.1");
   EXPECT_EQ(id.pid, 77);
-  EXPECT_EQ(id.startTimeTicks, 555u);
-  EXPECT_EQ(id.pidNamespace, 4026531836u);
-  EXPECT_EQ(id.bootId, "b00710d0-0000-4000-8000-000000000001");
+  ProcessFacts f = ReadProcessFacts();
+  EXPECT_EQ(id.startTimeTicks, f.startTimeTicks);
+  EXPECT_EQ(id.pidNamespace, f.pidNamespace);
+  EXPECT_EQ(id.bootId, f.bootId);
 }
 
 TEST(RasIdentity, RuntimeUuidsAreRandomVersion4) {

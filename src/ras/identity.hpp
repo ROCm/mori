@@ -33,29 +33,25 @@
 namespace mori {
 namespace ras {
 
-// Where collection reads from. LiveIdentitySources() is the running system; tests point the
-// root at a fixture tree.
-struct IdentitySources {
-  std::string procRoot{"/proc"};
-};
-
-IdentitySources LiveIdentitySources();
-
 struct ProcessFacts {
   uint64_t pidNamespace{0};
   uint64_t startTimeTicks{0};
   std::string bootId;
 };
-// `pid` is "self" or a decimal PID. Missing facts stay 0 or empty.
-ProcessFacts ReadProcessFacts(const std::string& procRoot, const std::string& pid);
+// This process's facts. Missing ones stay 0 or empty.
+ProcessFacts ReadProcessFacts();
+
+// Field 22 of a /proc/<pid>/stat line, or 0.
+uint64_t StartTimeFromStat(const std::string& stat);
+// N from a namespace link target "pid:[N]", or 0.
+uint64_t InodeFromNsLink(const std::string& target);
 
 RasProcessId CollectIdentity(const std::string& nodeId, const std::string& hostname,
-                             const std::string& host, int32_t pid, RuntimeUuid uuid,
-                             const IdentitySources& src);
+                             const std::string& host, int32_t pid, RuntimeUuid uuid);
 
-// A random version-4 UUID.
+// A random version-4 UUID, or a zero one if the kernel gave no random bytes.
 RuntimeUuid NewRuntimeUuid();
-// 128 random bits as 32 hex digits.
+// 128 random bits as 32 hex digits, or empty if the kernel gave no random bytes.
 std::string NewToken();
 
 }  // namespace ras
