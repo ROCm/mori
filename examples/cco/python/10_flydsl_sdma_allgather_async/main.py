@@ -79,22 +79,20 @@ import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
 import torch
 import torch.distributed as dist
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int64
 from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator, UniqueId
 
 # Signal-slot accessors that behave the same on every FlyDSL mori supports.
 from mori.cco.device.flydsl.signals import (
-    i32_type,
-    local_load_u32,
     local_store_u32,
-    signal_load_u32,
     signal_ptr,
     signal_store_u32,
 )
 from mori.tensor_utils import from_gpu_ptr
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from cco_example_common import load_u32_system, next_epoch, spin_until  # noqa: E402
 
 WAVE = 64  # one wave: lane p serves peer p
 SDMA_QUEUE = 0  # one queue per (src, dst) pair is all a single issuer needs
@@ -105,52 +103,12 @@ EPOCH_OFF = 256  # [0] = start epoch, [1] = wait epoch; private to this rank
 CTRL_BYTES = 512
 
 
-def _load_u32_system(ptr):
-    """System-scope load, as ``waitSignal`` does for the engine-written counter."""
-    return llvm.load(
-        i32_type(),
-        ptr,
-        alignment=4,
-        ordering=llvm.AtomicOrdering.monotonic,
-        syncscope="",
-    )
-
-
-def _spin_until(ptr, flag, load=signal_load_u32):
-    """Block until the u32 at ``ptr`` has reached ``flag``.
-
-    The test is a signed difference, so a counter that wraps past 2**32 still
-    compares correctly, as long as the two stay less than 2**31 apart. A plain
-    unsigned ``<`` would let a wait pass at the wrap: 0xFFFFFFFF < 0 is false.
-    """
-    first = load(ptr)
-    first_v = first.ir_value() if hasattr(first, "ir_value") else first
-    i32 = i32_type()
-    loop = scf.WhileOp([i32], [first_v])
-    cond = ir.Block.create_at_start(loop.before, [i32])
-    body = ir.Block.create_at_start(loop.after, [i32])
-    with ir.InsertionPoint(cond):
-        cur = fx.Int32(cond.arguments[0])
-        scf.ConditionOp(
-            ((cur - fx.Int32(flag)) < fx.Int32(0)).ir_value(), [cond.arguments[0]]
-        )
-    with ir.InsertionPoint(body):
-        nxt = load(ptr)
-        scf.YieldOp([nxt.ir_value() if hasattr(nxt, "ir_value") else nxt])
-
-
-def _next_epoch(w, rank, slot):
-    """``epoch[slot] + 1`` and the pointer to store it back through."""
-    ptr = signal_ptr(fx.Int64(w.lsa_ptr(rank, EPOCH_OFF + 4 * slot)))
-    return fx.Int32(local_load_u32(ptr)) + fx.Int32(1), ptr
-
-
 def _handshake(w, rank, tid, epoch):
     """Tell peer ``tid`` my output is free, then wait for it to tell me the same."""
     peer_slot = fx.Int64(w.lsa_ptr(tid, READY_OFF)) + fx.Int64(rank * 4)
     signal_store_u32(signal_ptr(peer_slot), epoch)
     my_slot = fx.Int64(w.lsa_ptr(rank, READY_OFF)) + fx.Int64(tid) * fx.Int64(4)
-    _spin_until(signal_ptr(my_slot), epoch)
+    spin_until(signal_ptr(my_slot), epoch)
 
 
 def make_start_kernel(rank, world, nbytes, in_off, out_off):
@@ -161,7 +119,7 @@ def make_start_kernel(rank, world, nbytes, in_off, out_off):
         tid = fx.thread_idx.x
         w = cco.CachedWindow(win)
         sdma = cco.DevComm(dev_comm).sdma()
-        epoch, epoch_ptr = _next_epoch(w, rank, 0)
+        epoch, epoch_ptr = next_epoch(w, rank, EPOCH_OFF, 0)
         # Addresses are plain arithmetic, so build them before the branch: a
         # CachedWindow cannot be captured into a dynamic `if`.
         dst = fx.Int64(w.lsa_ptr(tid, my_slot_in_peer))
@@ -193,14 +151,14 @@ def make_wait_kernel(rank, world):
         tid = fx.thread_idx.x
         w = cco.CachedWindow(win)
         sdma = cco.DevComm(dev_comm).sdma()
-        epoch, epoch_ptr = _next_epoch(w, rank, 1)
+        epoch, epoch_ptr = next_epoch(w, rank, EPOCH_OFF, 1)
         if tid < world:
             if tid != rank:
                 # My pushes to this peer have left: ``input`` is reusable.
                 sdma.quiet_queue(tid, SDMA_QUEUE)
                 # The peer's push into my output: its put bumped this slot.
                 slot = signal_ptr(fx.Int64(sdma.signal_slot(tid, SDMA_QUEUE)))
-                _spin_until(slot, epoch, load=_load_u32_system)
+                spin_until(slot, epoch, load=load_u32_system)
         fgpu.barrier()
         if tid == 0:
             local_store_u32(epoch_ptr, epoch)

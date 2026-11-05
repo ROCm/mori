@@ -60,9 +60,10 @@ enum class UMBPDurabilityMode : int {
   Relaxed = 1,
 };
 
-// Default UMBP_DRAM_MAX_MR_BYTES.  AMD Pensando AINIC (ionic) translates only
-// the first 2^18 page entries of a memory region and silently aliases the rest,
-// which with 2 MiB pages is 512 GiB.  On 4 KiB pages the safe value is 1 GiB.
+// Default UMBP_DRAM_MAX_MR_BYTES.  AMD Pensando AINIC (ionic) firmware before
+// 1.117.5-a-190 translates only the first 2^18 page entries of a memory region
+// and silently aliases the rest, which with 2 MiB pages is 512 GiB.  On 4 KiB
+// pages the safe value is 1 GiB; PageBackend warns about a larger region.
 inline constexpr uint64_t kDefaultDramMaxMrBytes = 512ULL << 30;
 
 struct UMBPDramConfig {
@@ -87,6 +88,9 @@ struct UMBPDramConfig {
 struct UMBPIoConfig {
   UMBPIoBackend backend = UMBPIoBackend::IoUring;
   size_t queue_depth = 4096;
+  // Rings for batch reads per drive, apart from the write ring, so concurrent
+  // batches overlap on the drive.  1 = reads share the write ring and its lock.
+  size_t read_rings = 4;
 };
 
 struct UMBPDurabilityConfig {
@@ -353,6 +357,14 @@ struct UMBPDistributedConfig {
   bool ranged_scratch_use_hugepages = false;
   size_t ranged_scratch_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
 
+  // Lay each ranged scratch arena out by NUMA node: its bytes split evenly over
+  // the nodes that have GPUs, each part bound to its node and cut into shards,
+  // one per GPU unless UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS sets the arena's
+  // total, so a remote ranged call stages on its GPU's node.  For a client that
+  // many GPUs share, as the standalone server's is; an in-process client serves
+  // one GPU and keeps one arena.
+  bool ranged_scratch_numa_layout = false;
+
   // SSD staging arena in pages (env UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS);
   // 0 = 4 GiB capped at the SSD tier.
   int ssd_staging_buffer_slots = 0;
@@ -488,6 +500,12 @@ struct UMBPStandaloneProcessConfig {
   std::vector<std::string> tags;
 };
 
+struct UMBPSimConfig {
+  bool enabled = false;
+  std::string profile_path;
+  std::string trace_path;  // Optional JSONL output; empty uses the UMBP INFO logger.
+};
+
 struct KvBlockMetadata {
   int64_t hash = 0;
   std::optional<int64_t> parent;
@@ -543,8 +561,14 @@ struct UMBPConfig {
   // Unset values preserve the existing deployment-specific defaults.
   std::string backend_policy_path;
   std::optional<uint64_t> page_size;
+  UMBPSimConfig sim;
 
   bool ValidateStorageConfig(std::string* error_message = nullptr) const {
+    if (sim.enabled && sim.profile_path.empty() &&
+        (!standalone_process.has_value() || standalone_process->auto_start)) {
+      if (error_message) *error_message = "sim backend requires profile_path";
+      return false;
+    }
     if (page_size.has_value() && *page_size == 0) {
       if (error_message) *error_message = "page_size must be > 0 when supplied";
       return false;
@@ -691,6 +715,10 @@ struct UMBPConfig {
       return v ? std::atof(v) : def;
     };
 
+    cfg.sim.enabled = getenv_int("UMBP_SIM_ENABLE", 0) != 0;
+    cfg.sim.profile_path = getenv_str("UMBP_SIM_PROFILE", "");
+    cfg.sim.trace_path = getenv_str("UMBP_SIM_TRACE", "");
+
     cfg.dram.capacity_bytes = getenv_size("UMBP_DRAM_CAPACITY", cfg.dram.capacity_bytes);
     cfg.ssd.enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd.enabled ? 1 : 0) != 0;
     cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
@@ -698,6 +726,7 @@ struct UMBPConfig {
     cfg.ssd.segment_size_bytes = getenv_size("UMBP_SSD_SEGMENT_SIZE", cfg.ssd.segment_size_bytes);
     cfg.ssd.shard_io_threads = getenv_int("UMBP_SSD_SHARD_IO_THREADS", cfg.ssd.shard_io_threads);
     cfg.ssd.tier_io_threads = getenv_int("UMBP_SSD_TIER_IO_THREADS", cfg.ssd.tier_io_threads);
+    cfg.ssd.io.read_rings = getenv_size("UMBP_SSD_READ_RINGS", cfg.ssd.io.read_rings);
     cfg.ssd.direct_io = getenv_int("UMBP_SSD_DIRECT_IO", cfg.ssd.direct_io ? 1 : 0) != 0;
     cfg.ssd.single_flight_reads =
         getenv_int("UMBP_SSD_SINGLE_FLIGHT", cfg.ssd.single_flight_reads ? 1 : 0) != 0;

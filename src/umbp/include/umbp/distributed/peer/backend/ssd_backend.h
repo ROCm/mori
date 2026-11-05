@@ -80,6 +80,8 @@ class SsdBackend : public MediumBackend {
   };
 
   explicit SsdBackend(Config cfg);
+  SsdBackend(Config cfg, std::unique_ptr<PeerSsdManager> manager,
+             std::unique_ptr<PageMemorySource> staging_source);
   ~SsdBackend() override;
 
   SsdBackend(const SsdBackend&) = delete;
@@ -199,6 +201,20 @@ class SsdBackend : public MediumBackend {
   };
   static constexpr uint64_t kExtentAlign = 4096;  // the SSD record alignment
 
+  // One local staged read of a key (+ window) that other local resolves of the
+  // same bytes join instead of staging their own copy: the TP ranks of a
+  // replicated-KV model ask for identical extents at once.  Guarded by mutex_.
+  struct SharedStage {
+    std::condition_variable cv;
+    bool done = false;
+    std::vector<ResolvedEntry*> joiners;  // handed the outcome and a hold when done
+    StagingSpan span;                     // a done extent's, for late joiners
+    uint64_t size = 0;
+    ObjectExtent window;
+    std::weak_ptr<const void> hold;  // joinable while any reader still holds it
+  };
+  static constexpr std::chrono::seconds kJoinWait{30};
+
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
   // the requested size is currently available, even after reclaiming leases.
   StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
@@ -252,6 +268,8 @@ class SsdBackend : public MediumBackend {
   std::unordered_map<std::string, ReadLease> read_leases_;
   std::unordered_map<std::string, ReadLease> migration_reads_;
   std::vector<ExtentStage> extent_stages_;
+  // Key (+ window) -> its local staged read: in flight, or an extent still held.
+  std::unordered_map<std::string, std::shared_ptr<SharedStage>> shared_stages_;
   bool extent_staging_ = false;  // set at Init (UMBP_SSD_EXTENT_STAGING)
 
   // Opt-in switch (UMBP_ENABLE_GDS=1): route SSD reads of O_DIRECT records

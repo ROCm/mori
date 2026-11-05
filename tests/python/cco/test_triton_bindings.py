@@ -91,7 +91,7 @@ def test_sdma_constant_flags_fold_to_one_instantiation():
 
 
 def test_all_cco_device_symbols_are_exported_to_triton():
-    assert len(CCO_DEVICE_FUNCTIONS) == 101
+    assert len(CCO_DEVICE_FUNCTIONS) == 102
     assert set(CCO_DEVICE_FUNCTIONS).issubset(cco.__all__)
     for name in CCO_DEVICE_FUNCTIONS:
         assert callable(getattr(cco, name))

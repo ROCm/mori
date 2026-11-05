@@ -45,8 +45,10 @@
 #include "umbp/distributed/metrics/activity_summary.h"
 #include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/pool_platform.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
+#include "umbp/local/host_mem_allocator.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -57,7 +59,6 @@ class WorkloadTraceRecorder;
 
 class PeerServiceServer;
 class PeerPool;
-class HbmCopyEngine;
 class KvIndexerReporter;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
@@ -81,6 +82,10 @@ inline const char* OutcomeName(::umbp::AllocateSlotOutcome o) {
   }
 }
 
+// The NUMA node of each GPU this process sees, by device ordinal; a GPU with no
+// node is left out.
+std::unordered_map<int, int> GpuNumaNodes();
+
 // In the master-as-advisor design, PoolClient drives the Put/Get
 // pipeline: master gives a routing advisory, then the writer talks
 // directly to the peer (AllocateSlot → RDMA → CommitSlot or
@@ -88,7 +93,7 @@ inline const char* OutcomeName(::umbp::AllocateSlotOutcome o) {
 // allocator outbox is shipped to master via the heartbeat thread.
 class PoolClient {
  public:
-  explicit PoolClient(PoolClientConfig config);
+  explicit PoolClient(PoolClientConfig config, std::shared_ptr<PoolPlatform> platform = nullptr);
   ~PoolClient();
 
   PoolClient(const PoolClient&) = delete;
@@ -263,6 +268,7 @@ class PoolClient {
 
  private:
   PoolClientConfig config_;
+  std::shared_ptr<PoolPlatform> platform_;
   std::atomic<bool> initialized_{false};
 
   // Sample every instrumented component on this node — each registered storage
@@ -376,9 +382,6 @@ class PoolClient {
   // transport configured, in which case only local transfers are servicable.
   std::unique_ptr<TransferEngine> transfer_engine_;
   PeerDirectory* peer_directory_ = nullptr;
-  // Observer into transfer_engine_'s composite, used only to declare which
-  // host regions the gather kernel may dereference.  Not a second data path.
-  HbmCopyEngine* hbm_engine_ = nullptr;
 
   // Lazy peer connections (one per remote node).  Purely control plane since
   // Phase 6: the peer's engine desc and buffer descriptors moved into
@@ -408,6 +411,7 @@ class PoolClient {
   // offset triple, because whether a transfer needs staging is the transfer
   // layer's decision, not the client's.
   std::pair<TransferRef, uint64_t> UserBufferRef(void* ptr, size_t size) const;
+  TransferRef LocalUserBytes(void* ptr, size_t size) const;
   int PreferredNumaNodeFor(void* ptr, size_t size) const;
   // The NUMA node a write's source lives on: its GPU's, or the node its registered
   // host region was placed on; -1 when unknown.
@@ -663,8 +667,15 @@ class PoolClient {
   //   bytes == nullptr  -> pull the object from `route` first
   //                        (MaybePrefetchWholeObject)
   struct ReCacheJob {
+    struct BufferDeleter {
+      std::shared_ptr<PoolPlatform> platform;
+      HostBufferHandle buffer;
+      void operator()(char*) {
+        if (platform) platform->FreeHost(buffer);
+      }
+    };
     std::string key;
-    std::unique_ptr<char[]> bytes;
+    std::unique_ptr<char[], BufferDeleter> bytes{nullptr, BufferDeleter{}};
     size_t size = 0;
     std::optional<RouteGetResult> route;
   };
@@ -712,8 +723,12 @@ class PoolClient {
    public:
     // Non-owning: the buffer belongs to the caller (DistributedClient).  A shard
     // count of 0 or 1 keeps the original single-arena behaviour.
-    void Reset(void* base, size_t bytes, size_t shards);
+    void Reset(void* base, size_t bytes, size_t shards, int numa_node = -1);
     size_t ShardBytes() const { return shard_bytes_; }
+    char* Base() const { return base_; }
+    size_t Bytes() const { return bytes_; }
+    // The node the buffer was placed on; -1 when it was not placed by node.
+    int NumaNode() const { return numa_node_; }
 
     // Holds a shard for its lifetime and gives it back on destruction, so every
     // early exit out of an arena loop releases it.
@@ -783,10 +798,20 @@ class PoolClient {
     // the proxy-reference specialisation buys nothing at these sizes.
     std::vector<uint8_t> busy_;
     size_t shard_bytes_ = 0;
+    char* base_ = nullptr;
+    size_t bytes_ = 0;
+    int numa_node_ = -1;
   };
 
-  ScratchArena ranged_get_scratch_;
-  ScratchArena ranged_put_scratch_;
+  // PoolClientConfig::ranged_{get,put}_scratch, held by pointer because an
+  // arena owns a mutex.
+  std::vector<std::unique_ptr<ScratchArena>> ranged_get_scratch_;
+  std::vector<std::unique_ptr<ScratchArena>> ranged_put_scratch_;
+  // The arena a remote ranged call stages through, given its first caller
+  // buffer: the one on that buffer's NUMA node, else the first; null when the
+  // direction has none.  Its RDMA leg then uses that node's NICs, and the copy
+  // between the arena and a GPU stays on the GPU's socket.
+  ScratchArena* RangedArenaFor(bool get, const void* caller_buffer);
   std::condition_variable recache_cv_;
   std::thread recache_worker_;
   bool recache_stop_ = false;

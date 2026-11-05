@@ -410,6 +410,11 @@ add_library(
   distributed/peer/backend/hbm_backend.cpp
   distributed/peer/backend/ssd_backend.cpp
   distributed/peer/backend/instrumented_backend.cpp
+  sim/sim.cpp
+  sim/sim_pool_platform.cpp
+  sim/ssd.cpp
+  sim/peer.cpp
+  sim/trace.cpp
   distributed/transfer/transfer_engine.cpp
   distributed/transfer/mori_io_engine.cpp
   distributed/transfer/local_copy_engine.cpp
@@ -423,6 +428,7 @@ add_library(
   distributed/pool/peer_pool.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
+  distributed/pool_platform.cpp
   distributed/distributed_client.cpp
   standalone/external_kv_identity_client.cpp
   standalone/ipc.cpp
@@ -550,6 +556,11 @@ target_link_libraries(umbp_core PUBLIC mori_logging)
 # is decided at runtime in WithEmbeddedDefaults/CreateUMBPClient.
 target_sources(umbp_common
                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/umbp_client_factory.cpp)
+
+# NIC limits are common to every registrant, but checking the AINIC limit reads
+# the firmware with mori_application's ionic parser, which umbp_core (and so
+# spdk_proxy) does not link; umbp_common reaches it through mori_io.
+target_sources(umbp_common PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common/nic_limits.cpp)
 
 # ---------- Master executable -------------------------------------------------
 

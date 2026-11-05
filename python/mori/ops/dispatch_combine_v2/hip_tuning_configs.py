@@ -165,6 +165,7 @@ _DISPATCH_TABLE: dict = {
         #   5120   149.4         161.0
         (8, 7168, 6, None): {
             None: ((2048, 64, 16), (None, 128, 16)),
+            "bf16": ((None, 64, 16),),
             "fp4": (
                 (1024, 64, 16),
                 (1536, 64, 24),
@@ -174,12 +175,30 @@ _DISPATCH_TABLE: dict = {
         },
         # EP16 on four 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-11. 128x16 is the only geometry
         # that builds the pinned-destination dispatch (kDPin in ep_intranode_1250x.hpp). 128x16
-        # minus 64x16, dispatch us, graph, one M=16384 plan, 3 alternating rounds: 1024 tokens a
-        # rank -11.0..-11.8, 2048 +2.2..+3.3, 3072 -6.0..-6.8, 8192 -14.7..-15.3, 16384
-        # -80.9..-83.3. 2048 is the only point 64x16 wins; the edge between them is unswept.
         (16, 7168, 6, None): {
             None: ((None, 64, 16),),
-            "fp4": ((4095, 64, 16), (None, 128, 16)),
+            "fp4": ((512, 64, 16), (None, 128, 16)),
+        },
+        (32, 7168, 6, None): {
+            None: ((512, 64, 16), (2048, 64, 16), (None, 128, 16)),
+            "fp4": ((512, 64, 16), (1024, 64, 16), (None, 128, 16)),
+        },
+        # EP4, hidden 2048, topk 8, 64 experts a rank (Qwen3.5-35B-A3B at DP4 + EP4), 2026-10-30.
+        # bench_ep.py, graph, ITERS=200, mean of 3 alternating rounds (spread <= 1.3 us). The
+        # 64x16 default costs bf16 up to 9% to 512 tokens a rank and 19-46% past it; fp4 12-26% to
+        # 1024 and about 2x past it, and on 64x16 fp4 is slower than bf16 at 192-256 and 2048-4096
+        # tokens. bf16 and fp4 take the same schedule; fp8 and other expert counts are unswept.
+        # Dispatch us:
+        #   ct     32x8   64x8  64x16  128x8  256x8     (bf16 | fp4)
+        #   64     24.4   24.5   26.6   24.4   24.4  |  21.3   21.1   23.8   21.0   20.9
+        #   256    25.3   25.1   25.3   25.0   25.0  |  21.6   21.5   26.8   21.5   21.5
+        #   512    31.4   26.3   26.9   26.0   26.0  |  31.5   21.9   26.0   21.7   21.7
+        #   1024   41.2   32.5   34.7   29.1   28.8  |  41.0   31.8   26.6   22.9   22.7
+        #   2048   64.2   43.6   51.8   38.3   35.5  |  67.6   41.6   52.7   32.4   25.7
+        #   4096  112.6   68.4   64.9   54.5   50.9  | 119.4   68.9   68.3   43.1   34.5
+        (4, 2048, 8, 64): {
+            "bf16": ((256, 32, 8), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
+            "fp4": ((256, 32, 8), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
         },
     },
 }
@@ -211,6 +230,9 @@ _COMBINE_TABLE: dict = {
         # The single-shot default, listed so the EP8 and EP16 dispatch schedules have a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
         (16, 7168, 6, None): ((None, 64, 8),),
+        # The same for the EP4 hidden-2048 dispatch schedule (combine unswept there).
+        (4, 2048, 8, 64): ((None, 64, 8),),
+        (32, 7168, 6, None): ((None, 64, 8),),
     },
 }
 
@@ -259,6 +281,13 @@ _COMBINE_PUSH_TABLE: dict = {
                 (8192, 128, 16),
                 (None, 128, 24),
             ),
+            (32, 7168, 6, None): (
+                (512, 64, 8),
+                (2047, 64, 16),
+                (2048, 64, 24),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
         },
     },
     "fp4_blockwise_fp32": {
@@ -283,9 +312,93 @@ _COMBINE_PUSH_TABLE: dict = {
                 (16384, 128, 24),
                 (None, 64, 16),
             ),
+            (32, 7168, 6, None): (
+                (256, 64, 8),
+                (384, 128, 8),
+                (2048, 128, 16),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
         },
     },
 }
+
+_LL128_TABLE: dict = {
+    "fp4_blockwise": {
+        "gfx1250": {
+            (4, 7168, 6, None): {
+                "fp4": dict(max_tok=256, dispatch=(64, 16), combine=(64, 16))
+            },
+            (8, 7168, 6, None): {
+                "fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (16, 7168, 6, None): {
+                "fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (32, 7168, 6, None): {
+                "fp4": dict(max_tok=64, dispatch=(64, 16), combine=(64, 8))
+            },
+        },
+    },
+    "fp8_blockwise": {
+        "gfx1250": {
+            (4, 7168, 6, None): {
+                "fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))
+            },
+            (8, 7168, 6, None): {
+                "fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (16, 7168, 6, None): {
+                "fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (32, 7168, 6, None): {
+                "fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 8))
+            },
+        },
+    },
+    "none": {
+        "gfx1250": {
+            (4, 7168, 6, None): {
+                "bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16)),
+                "fp8": dict(max_tok=64, dispatch=(64, 8), combine=(64, 16)),
+            },
+            (8, 7168, 6, None): {
+                "bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16)),
+                "fp8": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16)),
+            },
+            (16, 7168, 6, None): {
+                "bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
+                "fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
+            },
+        },
+    },
+}
+
+
+def ll128(
+    world_size,
+    hidden_dim,
+    topk,
+    dtype,
+    max_tok,
+    experts_per_rank=None,
+    quant_type="none",
+):
+    per_shape = _LL128_TABLE.get(quant_type, {}).get(_device_key(), {})
+    entry = _bucket_key(per_shape, world_size, hidden_dim, topk, experts_per_rank)
+    plan = entry.get(dtype) if entry else None
+    if plan is None:
+        return None
+    if max_tok <= plan["max_tok"]:
+        return {"dispatch": plan["dispatch"], "combine": plan["combine"]}
+    if max_tok <= plan.get("combine_max_tok", 0):
+        return {"combine": plan["combine"]}
+    return {
+        "dispatch": plan["dispatch"],
+        "combine": plan["combine"],
+        "max_tok": plan["max_tok"],
+    }
+
 
 # THE ROUND RULE outranks every shape choice above: _tpi = warpSize/topk tokens are
 # consumed per warp-iteration, so one round covers block*warp*_tpi tokens and coming up
