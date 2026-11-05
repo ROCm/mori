@@ -36,6 +36,12 @@
 #include "mori/core/arch.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
 
+// The host sizes LDS and geometry for the TDM body by the "gfx125" arch prefix and says
+// so with MORI_HOST_GFX125X; fail here if the device-side family test disagrees.
+#if defined(__HIP_DEVICE_COMPILE__) && defined(MORI_HOST_GFX125X) && !defined(MORI_GFX125X)
+#error "intranode_entry.hpp: the host expects gfx125x but MORI_GFX125X is not defined"
+#endif
+
 // Not standalone: written against MAX_GPUS_PER_NODE and the barrier in intranode.hpp, hence the
 // include order here.
 #if defined(MORI_GFX125X)

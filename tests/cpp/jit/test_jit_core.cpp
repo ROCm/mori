@@ -830,6 +830,7 @@ TEST(Gfx1250Strict, RoutesLikeGfx1250) {
   EXPECT_NE(mori::ops::v2::EpDispatchSpec::EntryName(cfg).find("_tdm"), std::string::npos);
   EpCfg c;
   c.scaleBytes = 224;
+  c.aggReserve = true;
   EXPECT_EQ(ParseInfo(DescribePlan("ep_dispatch", {{"scaleBytes", 224}}))["stagingBytes"],
             std::to_string(EpStagingTotalBytes(c)));
   EXPECT_NO_THROW(DescribePlan("ep_combine", {{"combineFp4", 1}}));

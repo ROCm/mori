@@ -29,6 +29,7 @@ cannot separate MI300X from MI325X (both 304 CU) or MI350X from MI355X (both
 
 import functools
 import glob
+import logging
 
 # KFD `device_id` (PCI DID) -> model. MI300X/MI325X (both 304 CU) and
 # MI350X/MI355X (both 256 CU) are only separable here, not by CU count.
@@ -89,6 +90,34 @@ def asic_revision():
 
 def cu_count():
     return topology()[0]
+
+
+logger = logging.getLogger(__name__)
+
+
+def fit_blocks_to_cus(t: dict) -> dict:
+    """Cap a tuning entry's block counts (single-shot and schedule) at the CU count,
+    in place. A gfx125x EP kernel holds a CU per block and waits for its whole grid,
+    so a grid wider than the GPU never finishes."""
+    cu = cu_count()
+    blocks = [t["dispatch_block_num"], t["combine_block_num"]]
+    blocks += [max(b[1], b[3]) for b in t["schedule"] or ()]
+    if cu <= 0 or max(blocks) <= cu:
+        return t
+    _warn_capped(max(blocks), cu)
+    t["dispatch_block_num"] = min(t["dispatch_block_num"], cu)
+    t["combine_block_num"] = min(t["combine_block_num"], cu)
+    if t["schedule"]:
+        t["schedule"] = tuple(
+            (edge, min(db, cu), dw, min(cb, cu), cw)
+            for edge, db, dw, cb, cw in t["schedule"]
+        )
+    return t
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_capped(blocks: int, cu: int) -> None:
+    logger.warning("tuned EP grid of %d blocks capped at this GPU's %d CUs", blocks, cu)
 
 
 def detect_model():

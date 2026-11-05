@@ -91,22 +91,6 @@ def _device_keys():
     return (key,)
 
 
-def _fit_cus(t: dict) -> dict:
-    """Blocks capped at the CU count: a gfx125x EP kernel holds a CU per block and
-    waits for its whole grid, so a wider grid never finishes."""
-    cu = _gpu.cu_count()
-    if cu <= 0:
-        return t
-    t["dispatch_block_num"] = min(t["dispatch_block_num"], cu)
-    t["combine_block_num"] = min(t["combine_block_num"], cu)
-    if t["schedule"]:
-        t["schedule"] = tuple(
-            (edge, min(db, cu), dw, min(cb, cu), cw)
-            for edge, db, dw, cb, cw in t["schedule"]
-        )
-    return t
-
-
 def _first_bucket(table, devs, *shape):
     for dev in devs:
         found = _bucket_key(table.get(dev, {}), *shape)
@@ -593,10 +577,10 @@ def lookup(
     if comb is None:
         comb = _first_bucket(_COMBINE_TABLE, devs, *shape)
     if disp is None or comb is None:
-        return _fit_cus(base)  # half a schedule is not a schedule
+        return _gpu.fit_blocks_to_cus(base)  # half a schedule is not a schedule
     # None is the "every dtype measured the same" key; an exact dtype overrides it.
     disp = disp.get(_DISPATCH_DTYPE_ALIAS.get(dtype, dtype)) or disp.get(None)
     if disp is None:
-        return _fit_cus(base)
+        return _gpu.fit_blocks_to_cus(base)
     base["schedule"] = _merge(disp, comb)
-    return _fit_cus(base)
+    return _gpu.fit_blocks_to_cus(base)

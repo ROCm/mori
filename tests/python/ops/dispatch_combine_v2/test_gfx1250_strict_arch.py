@@ -23,6 +23,7 @@
 
 import os
 import re
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -138,9 +139,10 @@ class TuningKeyTest(unittest.TestCase):
         rev1 = self.lookup(self.REV1, {}, (4, 7168, 9), **kw)["schedule"]
         self.assertGreater(max(max(b[1], b[3]) for b in rev1), cap)
 
-    def test_every_rev0_lookup_fits_its_rows(self):
-        # A block holds a CU and waits for the whole grid, so no rev-0 lookup may grow
-        # past the rev-0 rows' widest grid, gfx1250 fallbacks included, before any clamp.
+    def test_every_rev0_lookup_fits_once_capped(self):
+        # A block holds a CU and waits for the whole grid. Shapes without a rev-0 row
+        # fall back to gfx1250 rows, some wider than these parts; every lookup path
+        # must cap them at the CU count.
         cap = self.rev0_widest_grid()
         shapes = set()
         for table in (tc._DISPATCH_TABLE, tc._COMBINE_TABLE):
@@ -157,6 +159,7 @@ class TuningKeyTest(unittest.TestCase):
                         self.REV0,
                         {},
                         (world, hidden, topk),
+                        cus=cap,
                         dtype=dtype,
                         experts_per_rank=epr,
                         quant_type=quant,
@@ -172,7 +175,7 @@ class TuningKeyTest(unittest.TestCase):
         self.assertLessEqual(max(max(b[1], b[3]) for b in t["schedule"]), 160)
         with (
             patch.object(flydsl_tc, "_device_key", return_value="gfx1250"),
-            patch.object(flydsl_tc, "_cu_count", return_value=160),
+            patch.object(flydsl_tc.gpu_utils, "cu_count", return_value=160),
         ):
             t = flydsl_tc.lookup(4, 7168, 6, dtype="bf16")
         self.assertIsNotNone(t["schedule"])
@@ -185,6 +188,23 @@ class DeviceMacroTest(unittest.TestCase):
     FAMILY = "#if defined(__gfx1250__) || defined(__gfx1251__) || defined(__gfx1250_strict__)"
     DEFINERS = {"include/mori/core/arch.hpp", "include/mori/cco/cco.hpp"}
     SUFFIXES = {".h", ".hpp", ".hip", ".cpp", ".cu", ".cuh", ".py"}
+
+    def test_both_definers_test_the_same_family(self):
+        for rel in sorted(self.DEFINERS):
+            lines = [s.strip() for s in (REPO / rel).read_text().splitlines()]
+            with self.subTest(rel=rel):
+                self.assertIn(self.FAMILY, lines)
+
+    def test_v1_jit_passes_the_hosts_family_decision(self):
+        from mori.jit import core
+
+        for arch, want in [
+            ("gfx1250", ["-DMORI_HOST_GFX125X=1"]),
+            ("gfx1250-strict", ["-DMORI_HOST_GFX125X=1"]),
+            ("gfx950", []),
+        ]:
+            with self.subTest(arch=arch):
+                self.assertEqual(core._arch_family_defines(arch), want)
 
     def test_no_per_target_gfx125x_macros(self):
         pat = re.compile(r"__gfx125[0-9]__|__gfx1250_strict__")
@@ -205,6 +225,50 @@ class DeviceMacroTest(unittest.TestCase):
                         continue
                     hits.append(f"{rel}:{n}: {s}")
         self.assertEqual(hits, [], "use MORI_GFX125X / CCO_GFX125X")
+
+
+class DeviceMacroCompileTest(unittest.TestCase):
+    """arch.hpp as the device compiler sees it, for each target it accepts."""
+
+    CASES = {"gfx950": "0 0", "gfx1250": "1 1", "gfx1250-strict": "1 1"}
+    PROBE = (
+        '#include "mori/core/arch.hpp"\n#if defined(MORI_GFX125X)\n1\n#else\n0\n#endif\n'
+        + "#if defined(MORI_WAVE32)\n1\n#else\n0\n#endif\n"
+    )
+
+    @staticmethod
+    def clang():
+        rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+        for rel in ("lib/llvm/bin/clang++", "llvm/bin/clang++"):
+            path = Path(rocm) / rel
+            if path.is_file():
+                return str(path)
+        return None
+
+    def test_family_macros(self):
+        clang = self.clang()
+        if clang is None:
+            self.skipTest("no ROCm clang")
+        for arch, want in self.CASES.items():
+            cmd = [
+                clang,
+                "-x",
+                "hip",
+                f"--offload-arch={arch}",
+                "--cuda-device-only",
+                "-nogpulib",
+                "-nogpuinc",
+                "-E",
+                "-P",
+                "-I",
+                str(REPO / "include"),
+                "-",
+            ]
+            r = subprocess.run(cmd, input=self.PROBE, capture_output=True, text=True)
+            with self.subTest(arch=arch):
+                if r.returncode != 0:
+                    self.skipTest(f"{arch}: {r.stderr.strip().splitlines()[-1:]}")
+                self.assertEqual(" ".join(r.stdout.split()), want)
 
 
 if __name__ == "__main__":
