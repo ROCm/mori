@@ -73,6 +73,15 @@ enum class EpAsyncLLKernel {
   DispatchRecvTransferLsa,
   CombineSendTransferLsa,
   CombineRecvTransferLsa,
+  // Segmented receive (args.segStride, see asyncll::SegStrideOf): the expert reads
+  // the per-source landing segments in place. SendCopySeg/SendTransferSeg replace the SDMA send
+  // pair, RecvFinalizeSeg replaces DispatchRecvCopy, and CombineSendTransferSeg +
+  // CombineRecvCopySeg send the segmented expert output in place.
+  DispatchSendCopySeg,
+  DispatchSendTransferSeg,
+  DispatchRecvFinalizeSeg,
+  CombineSendTransferSeg,
+  CombineRecvCopySeg,
 };
 
 // True for the passes that take the device communicator, i.e. the ones that
@@ -122,6 +131,14 @@ MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineSendTransferLsaSpec,
                              "ep_asyncll_combine_sendtransfer_lsa");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineRecvTransferLsaSpec,
                              "ep_asyncll_combine_recvtransfer_lsa");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchSendCopySegSpec, "ep_asyncll_dispatch_sendcopy_seg");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchSendTransferSegSpec,
+                             "ep_asyncll_dispatch_sendtransfer_seg");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchRecvFinalizeSegSpec,
+                             "ep_asyncll_dispatch_recvfinalize_seg");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineSendTransferSegSpec,
+                             "ep_asyncll_combine_sendtransfer_seg");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineRecvCopySegSpec, "ep_asyncll_combine_recvcopy_seg");
 
 #undef MORI_EP_ASYNCLL_DECLARE_SPEC
 

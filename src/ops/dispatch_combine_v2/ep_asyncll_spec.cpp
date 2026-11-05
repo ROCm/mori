@@ -71,6 +71,16 @@ AsyncLLDescriptor DescriptorFor(EpAsyncLLKernel kind) {
       return {"combine_sendtransfer_lsa", "EpCombineAsyncLLSendTransferLsa_body"};
     case EpAsyncLLKernel::CombineRecvTransferLsa:
       return {"combine_recvtransfer_lsa", "EpCombineAsyncLLRecvTransferLsa_body"};
+    case EpAsyncLLKernel::DispatchSendCopySeg:
+      return {"dispatch_sendcopy_seg", "EpDispatchAsyncLLSendCopySeg_body"};
+    case EpAsyncLLKernel::DispatchSendTransferSeg:
+      return {"dispatch_sendtransfer_seg", "EpDispatchAsyncLLSendTransferSeg_body"};
+    case EpAsyncLLKernel::DispatchRecvFinalizeSeg:
+      return {"dispatch_recvfinalize_seg", "EpDispatchAsyncLLRecvFinalizeSeg_body"};
+    case EpAsyncLLKernel::CombineSendTransferSeg:
+      return {"combine_sendtransfer_seg", "EpCombineAsyncLLSendTransferSeg_body"};
+    case EpAsyncLLKernel::CombineRecvCopySeg:
+      return {"combine_recvcopy_seg", "EpCombineAsyncLLRecvCopySeg_body"};
   }
   throw std::runtime_error("mori ep asyncll jit: unknown kernel");
 }
@@ -91,6 +101,8 @@ bool EpAsyncLLTakesComm(EpAsyncLLKernel kind) {
     case EpAsyncLLKernel::DispatchRecvTransfer:
     case EpAsyncLLKernel::CombineSendTransfer:
     case EpAsyncLLKernel::CombineRecvTransfer:
+    case EpAsyncLLKernel::DispatchSendTransferSeg:
+    case EpAsyncLLKernel::CombineSendTransferSeg:
       return true;
     // The LSA variants cross over the flat VA, so they take no communicator --
     // the window handle they already have is the whole addressing mechanism.
@@ -146,6 +158,9 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
                 kind == EpAsyncLLKernel::CombineSendTransferLsa ||
                 kind == EpAsyncLLKernel::CombineRecvTransferLsa))
     throw std::runtime_error("AsyncLL early notification requires the SDMA transport");
+  // The segmented passes pair with the separate RecvTransfer the fused receive drops.
+  if (fused && kind >= EpAsyncLLKernel::DispatchSendCopySeg)
+    throw std::runtime_error("AsyncLL segmented receive does not support the fused receive");
   const AsyncLLDescriptor descriptor = DescriptorFor(kind);
   const std::string entry = EpAsyncLLEntryName(cfg, kind);
 
@@ -195,6 +210,8 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
     case EpAsyncLLKernel::DispatchSendCopyLsa:
     case EpAsyncLLKernel::DispatchRecvCopy:
     case EpAsyncLLKernel::CombineSendCopy:
+    case EpAsyncLLKernel::DispatchSendCopySeg:
+    case EpAsyncLLKernel::DispatchRecvFinalizeSeg:
       geometry.gridX = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.mpCount, worldSize));
       geometry.sharedBytes = 0;
       break;
@@ -207,6 +224,8 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
     case EpAsyncLLKernel::DispatchRecvTransfer:
     case EpAsyncLLKernel::CombineSendTransfer:
     case EpAsyncLLKernel::CombineRecvTransfer:
+    case EpAsyncLLKernel::DispatchSendTransferSeg:
+    case EpAsyncLLKernel::CombineSendTransferSeg:
       geometry.gridX = static_cast<unsigned>(worldSize);
       geometry.blockX = static_cast<unsigned>(cfg.waveSize);
       geometry.sharedBytes = 0;
@@ -225,6 +244,7 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
       break;
 
     case EpAsyncLLKernel::CombineRecvCopy:
+    case EpAsyncLLKernel::CombineRecvCopySeg:
       geometry.gridX = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.mpCount, worldSize));
       // Reuses the internode formula, which sizes two pointer arrays per warp.
       // AsyncLL's combine uses only the first (it does not fold weights), so this
@@ -272,6 +292,11 @@ MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLDispatchSendTransferLsaSpec, DispatchSendTr
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLDispatchRecvTransferLsaSpec, DispatchRecvTransferLsa)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineSendTransferLsaSpec, CombineSendTransferLsa)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineRecvTransferLsaSpec, CombineRecvTransferLsa)
+MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLDispatchSendCopySegSpec, DispatchSendCopySeg)
+MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLDispatchSendTransferSegSpec, DispatchSendTransferSeg)
+MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLDispatchRecvFinalizeSegSpec, DispatchRecvFinalizeSeg)
+MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineSendTransferSegSpec, CombineSendTransferSeg)
+MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineRecvCopySegSpec, CombineRecvCopySeg)
 
 #undef MORI_EP_ASYNCLL_DEFINE_SPEC
 
@@ -333,3 +358,11 @@ MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_combine_sendtransfer_lsa,
                             EpAsyncLLCombineSendTransferLsaSpec)
 MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_combine_recvtransfer_lsa,
                             EpAsyncLLCombineRecvTransferLsaSpec)
+MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_dispatch_sendcopy_seg, EpAsyncLLDispatchSendCopySegSpec)
+MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_dispatch_sendtransfer_seg,
+                            EpAsyncLLDispatchSendTransferSegSpec)
+MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_dispatch_recvfinalize_seg,
+                            EpAsyncLLDispatchRecvFinalizeSegSpec)
+MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_combine_sendtransfer_seg,
+                            EpAsyncLLCombineSendTransferSegSpec)
+MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_combine_recvcopy_seg, EpAsyncLLCombineRecvCopySegSpec)
