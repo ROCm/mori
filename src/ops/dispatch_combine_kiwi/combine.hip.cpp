@@ -801,12 +801,4 @@ void combine_enqueue(ep_context_t& ctx, ep_gcontext_t& gctx, const void* d_exper
   HIP_CHECK(hipGetLastError());
 }
 
-void combine(ep_context_t& ctx, ep_gcontext_t& gctx, const void* d_expert_output,
-             const float* d_expert_weights, const void* d_expert_scales, const int32_t* d_topk_ids,
-             void* d_output, float* d_output_weights, int num_tokens, hipStream_t stream) {
-  combine_enqueue(ctx, gctx, d_expert_output, d_expert_weights, d_expert_scales, d_topk_ids,
-                  d_output, d_output_weights, num_tokens, stream);
-  ctx.stream_sync(stream);
-}
-
 }  // namespace mori::kiwi::ep

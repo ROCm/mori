@@ -470,27 +470,18 @@ struct config_t {
     return combine_recv_offset() + src_rank * combine_recv_region_size();
   }
 
-  // Per token-expert route metadata.  Keep the two concepts in separate
-  // arrays so combine cannot accidentally depend on a paired dispatch-side
-  // field layout.
+  // Per token-expert route metadata.
   //
   // token_to_producer_rank[token, k]:
   //   rank that produced this expert row; consumed by combine accumulation.
   //   Duplicate experts targeting an already-seen destination use an
   //   out-of-range producer_rank sentinel. Reset leaves unused entries at
-  //   producer_rank == -1.
-  //
-  // token_to_dispatch_recv_slot[token, k]:
-  //   destination rank's dispatch receive-slot metadata for dispatch/debug
-  //   tests only. Combine slot identity is instead
+  //   producer_rank == -1. Combine slot identity is
   //   combine_recv_slot(producer_rank, source_token_id).
   size_t route_metadata_entries() const {
     return static_cast<size_t>(max_num_inp_token_per_rank) * topk;
   }
   size_t token_to_producer_rank_size() const { return route_metadata_entries() * sizeof(int32_t); }
-  size_t token_to_dispatch_recv_slot_size() const {
-    return route_metadata_entries() * sizeof(int32_t);
-  }
 };
 
 }  // namespace mori::kiwi::ep

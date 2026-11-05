@@ -230,11 +230,6 @@ __host__ __device__ inline bool grid_barrier_phase_reached(uint32_t observed, ui
   return static_cast<int32_t>(observed - target) >= 0;
 }
 
-__host__ __device__ inline grid_barrier_ticket_t grid_barrier_advance_ticket(
-    grid_barrier_ticket_t ticket, uint32_t generations) {
-  return grid_barrier_ticket_t{static_cast<uint32_t>(ticket.phase + generations)};
-}
-
 // Reusable grid barrier encoded in one 64-bit word:
 //   low 32 bits  = arrivals in the current generation
 //   high 32 bits = generation/phase
@@ -276,13 +271,6 @@ __device__ inline void grid_barrier_wait(const uint64_t* grid_barrier,
     } while (!grid_barrier_phase_reached(observed_phase, ticket.phase));
   }
   __syncthreads();
-}
-
-__device__ inline grid_barrier_ticket_t grid_barrier_arrive_and_wait(
-    uint64_t* grid_barrier, uint32_t expected_participants) {
-  grid_barrier_ticket_t ticket = grid_barrier_arrive(grid_barrier, expected_participants);
-  grid_barrier_wait(grid_barrier, ticket);
-  return ticket;
 }
 
 __device__ inline void flat_to_rank_slot_direct(const ep_gcontext_t& gctx, int flat_idx,
@@ -328,14 +316,6 @@ class ep_context_t {
   int rank_me() const { return comm_ctx_->rank_me(); }
   application::BootstrapNetwork& bootstrap() const { return comm_ctx_->bootstrap(); }
   const internal::ep_heap_table_t& heap_table() const { return comm_ctx_->heap_table(); }
-  // Route-capability hook for native tests and diagnostics. A one denotes a
-  // provisioned HIP-IPC-capable payload route for that peer; zero means no
-  // IPC route was provisioned.
-  const std::vector<uint8_t>& rcomp_peer_is_ipc() const { return rcomp_peer_is_ipc_; }
-
-  // Exact-hostname locality used by hybrid setup.  Strict setup guarantees
-  // every local non-self peer also has a corresponding IPC route.
-  const std::vector<uint8_t>& rcomp_peer_is_local() const { return rcomp_peer_is_local_; }
 
   ep_device_workspace_t device_workspace() const {
     return ep_device_workspace_t{d_device_workspace_, device_workspace_layout_};
@@ -412,35 +392,13 @@ void dispatch_enqueue(ep_context_t& ctx, ep_gcontext_t& gctx, const void* d_toke
 // d_topk_ids: original topk expert IDs (same as dispatch input)
 // d_output: accumulated output buffer
 // num_tokens: number of original tokens on this rank (same as dispatch input)
-
-void combine(ep_context_t& ctx, ep_gcontext_t& gctx, const void* d_expert_output,
-             const float* d_expert_weights, const void* d_expert_scales, const int32_t* d_topk_ids,
-             void* d_output, float* d_output_weights, int num_tokens, hipStream_t stream = 0);
-
-// Enqueue the common async combine path without synchronizing. It keeps actual
-// puts offloaded through the always-running host proxy threads, while waits and
-// resets visible to eager execution or graph replay are stream-enqueued GPU work.
+//
+// The call enqueues without synchronizing. It keeps actual puts offloaded
+// through the always-running host proxy threads, while waits and resets
+// visible to eager execution or graph replay are stream-enqueued GPU work.
 void combine_enqueue(ep_context_t& ctx, ep_gcontext_t& gctx, const void* d_expert_output,
                      const float* d_expert_weights, const void* d_expert_scales,
                      const int32_t* d_topk_ids, void* d_output, float* d_output_weights,
                      int num_tokens, hipStream_t stream = 0);
-
-inline void combine(ep_context_t& ctx, ep_gcontext_t& gctx, const void* d_expert_output,
-                    const void* d_expert_scales, const int32_t* d_topk_ids, void* d_output,
-                    int num_tokens, hipStream_t stream = 0) {
-  combine(ctx, gctx, d_expert_output, nullptr, d_expert_scales, d_topk_ids, d_output, nullptr,
-          num_tokens, stream);
-}
-
-// ----- Convenience -----
-
-// Dispatch using the common enqueue path, then wait for receives and unpack.
-// After return, gctx.d_recv_hidden/indices/weights/scales/count are populated.
-inline void dispatch(ep_context_t& ctx, ep_gcontext_t& gctx, const void* d_tokens,
-                     const int32_t* d_expert_indices, const float* d_weights, const void* d_scales,
-                     int num_tokens, hipStream_t stream = 0) {
-  dispatch_enqueue(ctx, gctx, d_tokens, d_expert_indices, d_weights, d_scales, num_tokens, stream);
-  ctx.stream_sync(stream);
-}
 
 }  // namespace mori::kiwi::ep

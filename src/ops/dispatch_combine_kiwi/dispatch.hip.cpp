@@ -96,17 +96,14 @@ __device__ inline void route_topk_parallel_block(const ep_gcontext_t& gctx,
     const int unique_idx = __popcll(leader_mask & lower_mask);
 
     int32_t* producer_rank_ptr = gctx.token_to_producer_rank_ptr(token_idx, k);
-    int32_t* dispatch_recv_slot_ptr = gctx.token_to_dispatch_recv_slot_ptr(token_idx, k);
     if (first_for_dest) {
       const int recv_slot =
           __atomic_fetch_add(&device_workspace.dest_token_counts()[dest_rank], 1, __ATOMIC_RELAXED);
       s_unique_dests[unique_idx] = dest_rank;
       s_unique_recv_slots[unique_idx] = recv_slot;
       *producer_rank_ptr = dest_rank;
-      *dispatch_recv_slot_ptr = recv_slot;
     } else {
       *producer_rank_ptr = world_size;
-      *dispatch_recv_slot_ptr = 0;
     }
 
     if (lane == 0) {
@@ -213,8 +210,7 @@ __device__ inline void dispatch_prescan_unique_dest_counts(const ep_gcontext_t& 
 //   deduplication.  Tokens with remote destinations stage one reusable payload
 //   and submit one multicast descriptor covering all unique remote ranks.
 //   Additionally populates
-//   token_to_producer_rank for later combine accumulation and
-//   token_to_dispatch_recv_slot for dispatch metadata.
+//   token_to_producer_rank for later combine accumulation.
 //
 // Grid barrier: all blocks arrive after phase 1, then wait while block 0
 //   completes receive setup.  The reusable generation-counted barrier lets the

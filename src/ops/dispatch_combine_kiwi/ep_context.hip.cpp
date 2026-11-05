@@ -468,17 +468,12 @@ ep_gcontext_t ep_context_t::get_device_context() {
   gctx.world_size = cfg_.world_size;
   gctx.rank_me = comm_ctx_->rank_me();
   gctx.num_experts_per_rank = cfg_.num_experts_per_rank();
-  gctx.model_hidden_dim = cfg_.model_hidden_dim;
   gctx.dispatch_hidden_elems = cfg_.dispatch_hidden_elems_effective();
   gctx.combine_hidden_elems = cfg_.combine_hidden_elems_effective();
   gctx.topk = cfg_.topk;
-  gctx.max_slots = cfg_.max_slots();
   gctx.max_num_inp_token_per_rank = cfg_.max_num_inp_token_per_rank;
   gctx.dispatch_scale_dim = cfg_.dispatch_scale_dim;
   gctx.dispatch_scale_type_size = cfg_.dispatch_scale_type_size;
-  gctx.combine_scale_dim = cfg_.combine_scale_dim;
-  gctx.combine_scale_type_size = cfg_.combine_scale_type_size;
-  gctx.dispatch_quant_format = cfg_.dispatch_quant_format;
   gctx.combine_quant_format = cfg_.combine_quant_format;
   gctx.dispatch_layout = cfg_.dispatch_buffer_layout();
   gctx.combine_layout = cfg_.combine_buffer_layout();
@@ -525,8 +520,6 @@ void ep_context_t::reset(hipStream_t stream) {
                            sizeof(uint64_t), hipMemcpyDeviceToDevice, stream));
   HIP_CHECK(hipMemsetAsync(workspace.token_to_producer_rank(), 0xFF,
                            cfg_.token_to_producer_rank_size(), stream));
-  HIP_CHECK(hipMemsetAsync(workspace.token_to_dispatch_recv_slot(), 0xFF,
-                           cfg_.token_to_dispatch_recv_slot_size(), stream));
   HIP_CHECK(hipMemsetAsync(workspace.recv_src_rank_map(), 0xFF, cfg_.max_slots() * sizeof(int32_t),
                            stream));
   HIP_CHECK(hipMemsetAsync(workspace.recv_local_slot_map(), 0xFF,

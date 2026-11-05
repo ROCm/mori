@@ -43,7 +43,6 @@ struct ep_device_workspace_layout_t {
   size_t recv_local_slot_map_offset = 0;
   size_t recv_begin_offset = 0;
   size_t token_to_producer_rank_offset = 0;
-  size_t token_to_dispatch_recv_slot_offset = 0;
   size_t barrier_counter_offset = 0;
   size_t all2all_counts_recv_offset = 0;
   size_t num_bytes = 0;
@@ -73,8 +72,6 @@ struct ep_device_workspace_layout_t {
     recv_begin_offset =
         reserve(static_cast<size_t>(cfg.world_size + 1) * sizeof(int32_t), alignof(int32_t));
     token_to_producer_rank_offset = reserve(cfg.token_to_producer_rank_size(), alignof(int32_t));
-    token_to_dispatch_recv_slot_offset =
-        reserve(cfg.token_to_dispatch_recv_slot_size(), alignof(int32_t));
     barrier_counter_offset = reserve(sizeof(uint64_t), alignof(uint64_t));
     all2all_counts_recv_offset =
         reserve(static_cast<size_t>(cfg.world_size) * sizeof(uint64_t), alignof(uint64_t));
@@ -114,9 +111,6 @@ struct ep_device_workspace_t {
   __host__ __device__ int32_t* recv_count() const { return ptr<int32_t>(layout.recv_count_offset); }
   __host__ __device__ int32_t* token_to_producer_rank() const {
     return ptr<int32_t>(layout.token_to_producer_rank_offset);
-  }
-  __host__ __device__ int32_t* token_to_dispatch_recv_slot() const {
-    return ptr<int32_t>(layout.token_to_dispatch_recv_slot_offset);
   }
   __host__ __device__ uint64_t* grid_barrier() const {
     return ptr<uint64_t>(layout.grid_barrier_offset);
