@@ -334,7 +334,7 @@ def tile_table_to_lds(values, tab_lds, lane_id):
         p[fx.Int32(i * 64) + lane_id] = v
 
 
-# from aiter.ops.flydsl.kernels.mega_moe.g1_8w_parts
+# from aiter.ops.flydsl.kernels.mega_moe.g1_8w_parts (expert search reworked)
 def tile_find(tab_lds, j, lane_id, *, SBM, experts):
     """(row_base, expert, valid_rows) of 256-row tile ``j`` -- LDS and wave ops only."""
     p = lds_typed_ptr(tab_lds, T.i32)
@@ -342,18 +342,16 @@ def tile_find(tab_lds, j, lane_id, *, SBM, experts):
         fx.Int32(p[fx.Int32(i * 64) + lane_id]) for i in range(4)
     ]
     ok = lane_id < fx.Int32(experts)
-    before = _wave_reduce_max_i32(
-        (ok & (cum_l <= j)).select(lane_id + fx.Int32(1), fx.Int32(0)), lane_id
-    )
+    # The cumulative ends rise with the lane, so the experts that end at or before ``j``
+    # are a lane prefix: their count is the expert of ``j``. One ballot and a popcount,
+    # where a butterfly max takes six LDS permutes and six lane-address VGPRs (which the
+    # persistent loop hoisted and spilled, then reloaded one by one per item).
+    before = fx.Int32(fx.math.ctpop(fx.Int64(rocdl.ballot(T.i64, ok & (cum_l <= j)))))
     e = fx.Int32(rocdl.readfirstlane(T.i32, before))
     e = (e < fx.Int32(experts)).select(e, fx.Int32(experts - 1))
 
     def from_lane(v):
-        return fx.Int32(
-            rocdl.readfirstlane(
-                T.i32, fx.Int32(rocdl.ds_bpermute(T.i32, e * fx.Int32(4), v))
-            )
-        )
+        return fx.Int32(rocdl.readlane(T.i32, v, e))
 
     t_in = j - from_lane(cum_l - tiles_l)
     row_base = from_lane(prev_l * fx.Int32(SBM)) + t_in * fx.Int32(256)

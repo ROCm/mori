@@ -27,7 +27,7 @@
 ``test``: the layer output against a float reference (dequantised weights
 and bf16 activations), relative L2 over all ranks, for two inputs called alternately; and the same
 input twice must give the same bytes. ``bench``: CUDA Graph time of the layer (quant +
-kernel + combine), max over ranks.
+kernel + combine): per replay the max over ranks, then the median over replays.
 """
 
 import argparse
@@ -230,6 +230,10 @@ def run_test(args, rank, world, device):
 
 
 def _time_graph(fn, iters):
+    """Median over replays of the max-over-ranks time of one ``fn`` captured in a CUDA Graph.
+
+    One event pair per replay: the persistent kernel waits for every rank, so a host hiccup
+    on any rank stretches the replays it delays; the median ignores those."""
     torch.cuda.synchronize()
     ms.shmem_barrier_all()
     fn()
@@ -242,15 +246,17 @@ def _time_graph(fn, iters):
         graph.replay()
     torch.cuda.synchronize()
     ms.shmem_barrier_all()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-        enable_timing=True
-    )
-    start.record()
-    for _ in range(iters):
+    ev = [torch.cuda.Event(enable_timing=True) for _ in range(iters + 1)]
+    ev[0].record()
+    for i in range(iters):
         graph.replay()
-    end.record()
+        ev[i + 1].record()
     torch.cuda.synchronize()
-    return _all_max(start.elapsed_time(end) / iters)
+    t = torch.tensor(
+        [ev[i].elapsed_time(ev[i + 1]) for i in range(iters)], dtype=torch.float64
+    )
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return float(t.median())
 
 
 def run_bench(args, rank, world, device):
@@ -295,7 +301,7 @@ def main():
     t.add_argument("--bs", type=int, default=8192)
     b = sub.add_parser("bench", parents=[common])
     b.add_argument("--bs-list", default="2048,4096,8192")
-    b.add_argument("--iters", type=int, default=20)
+    b.add_argument("--iters", type=int, default=30)
     b.add_argument("--rounds", type=int, default=2)
     args = parser.parse_args()
     rank, world, device = _setup()

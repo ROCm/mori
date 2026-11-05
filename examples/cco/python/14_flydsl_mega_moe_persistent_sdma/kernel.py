@@ -323,17 +323,34 @@ def compile_mega_moe(
                 # TILE_EXPECTED for each of them.
                 st0 = row_base // fx.Int32(SBM)
                 if tid0:
-                    for i in range_constexpr(256 // SBM):
-                        if n_valid > fx.Int32(i * SBM):
-                            t_i = st0 + fx.Int32(i)
-                            exp_i = fx.Int32(
-                                global_typed_ptr(g1_tile_expected, T.i32)[t_i]
-                            )
-                            comm_ops.wait_i32_until_equals(
-                                g1_tile_ready + fx.Int64(t_i) * fx.Int64(4), exp_i
-                            )
+                    # Both sort tiles' counts in one round trip; spin only if one is short
+                    # (a second tile past n_valid repeats the first).
+                    t1 = (n_valid > fx.Int32(SBM)).select(st0 + fx.Int32(1), st0)
+                    exp_p = global_typed_ptr(g1_tile_expected, T.i32)
+                    exp0 = fx.Int32(exp_p[st0])
+                    exp1 = fx.Int32(exp_p[t1])
+                    rdy0 = fx.Int32(
+                        comm_ops.load_i32_acquire(
+                            g1_tile_ready + fx.Int64(st0) * fx.Int64(4)
+                        )
+                    )
+                    rdy1 = fx.Int32(
+                        comm_ops.load_i32_acquire(
+                            g1_tile_ready + fx.Int64(t1) * fx.Int64(4)
+                        )
+                    )
+                    if (rdy0 != exp0) | (rdy1 != exp1):
+                        comm_ops.wait_i32_until_equals(
+                            g1_tile_ready + fx.Int64(st0) * fx.Int64(4), exp0
+                        )
+                        comm_ops.wait_i32_until_equals(
+                            g1_tile_ready + fx.Int64(t1) * fx.Int64(4), exp1
+                        )
+                # No acquire per item (it invalidates the XCD's L2 under every other CU's
+                # GEMM): this call's payload is read only once its tile is complete, so no
+                # L2 holds a copy of it from this call; copies left from the last call were
+                # dropped by the one acquire before the GEMM1 loop.
                 fx.barrier()
-                comm_ops.fence_system_acquire()
                 tib_p = global_typed_ptr(tib, T.i32)
 
                 B0_gl_offset = (b_row_block * BLOCK_N) * (K // 2)
@@ -574,7 +591,9 @@ def compile_mega_moe(
 
                 def silu(x):
                     emu = (x * fx.Float32(-1.4426950408889634)).exp2()
-                    return x * (fx.Float32(1.0) / (fx.Float32(1.0) + emu))
+                    # v_rcp_f32 (1 ulp) for the sigmoid's 1 / (1 + e^-x): the IEEE division
+                    # is a ten-instruction sequence per element, and the result goes to fp8.
+                    return x * fx.Float32(rocdl.rcp(T.f32, fx.Float32(1.0) + emu))
 
                 if const_expr(swiglu_limit <= 0):
                     return silu(g) * u
@@ -1616,6 +1635,8 @@ def compile_mega_moe(
         g1_total = g1_ntiles * fx.Int32(G1_NB)
         # The last workgroup is the comm workgroup: no GEMM work.
         g1_active = ticket != fx.Int32(launch_grid_x - 1)
+        # The one acquire of the GEMM1 phase (see the item's payload wait).
+        comm_ops.fence_system_acquire()
         while g1_active:
             # Publish the previous unit's sort tiles once its stores have drained (pub_slot
             # holds st0 * 4 + count, -1 for none), then claim the next unit.
@@ -1712,22 +1733,44 @@ def compile_mega_moe(
                 g2_has = g2_u < g2_total
                 if g2_has:
                     g2_bm = g2_u // fx.Int32(G2_NB2)
+                    # A lane id the compiler cannot hoist out of the loop (opaque_i32).
                     g2_rb, g2_ex, g2_nv = tile_find(
-                        g1_tab, g2_bm, g1_lane, SBM=sort_block_m, experts=fz_epr
+                        g1_tab,
+                        g2_bm,
+                        opaque_i32(fx.thread_idx.x) % fx.Int32(64),
+                        SBM=sort_block_m,
+                        experts=fz_epr,
                     )
                     if tid == fx.Int32(0):
                         g2_st = g2_rb // fx.Int32(sort_block_m)
-                        comm_ops.wait_i32_until_greater_than(
-                            addr_mtile_ctr + fx.Int64(g2_st) * fx.Int64(4),
-                            fx.Int32(G1_PUB_TARGET - 1),
+                        g2_st1 = (g2_nv > fx.Int32(sort_block_m)).select(
+                            g2_st + fx.Int32(1), g2_st
                         )
-                        if g2_nv > fx.Int32(sort_block_m):
+                        # Both sort tiles' GEMM1 counts in one round trip; spin if short.
+                        g2_c0 = fx.Int32(
+                            comm_ops.load_i32_acquire(
+                                addr_mtile_ctr + fx.Int64(g2_st) * fx.Int64(4)
+                            )
+                        )
+                        g2_c1 = fx.Int32(
+                            comm_ops.load_i32_acquire(
+                                addr_mtile_ctr + fx.Int64(g2_st1) * fx.Int64(4)
+                            )
+                        )
+                        if (g2_c0 < fx.Int32(G1_PUB_TARGET)) | (
+                            g2_c1 < fx.Int32(G1_PUB_TARGET)
+                        ):
                             comm_ops.wait_i32_until_greater_than(
-                                addr_mtile_ctr
-                                + fx.Int64(g2_st + fx.Int32(1)) * fx.Int64(4),
+                                addr_mtile_ctr + fx.Int64(g2_st) * fx.Int64(4),
                                 fx.Int32(G1_PUB_TARGET - 1),
                             )
-                        comm_ops.fence_agent_acquire()
+                            comm_ops.wait_i32_until_greater_than(
+                                addr_mtile_ctr + fx.Int64(g2_st1) * fx.Int64(4),
+                                fx.Int32(G1_PUB_TARGET - 1),
+                            )
+                    # No acquire per item, as in GEMM1: the one after the plan flag above
+                    # dropped the last call's copies, and this call's GEMM1 rows are read
+                    # only once their sort tiles are complete.
                     fx.barrier()
                     g2_tile(g2_bm, g2_u % fx.Int32(G2_NB2), g1_tab)
                 g2_active = g2_has
