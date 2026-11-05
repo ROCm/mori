@@ -120,6 +120,18 @@ class TuningKeyTest(unittest.TestCase):
         schedule = self.lookup(self.REV0, row)["schedule"]
         self.assertEqual({(b[1], b[2]) for b in schedule}, {(32, 4)})
 
+    def test_rev0_takes_no_ll128_plans(self):
+        args = (4, 7168, 6, "fp4", 64)
+        for dev, want in (
+            (self.REV0, False),
+            (self.REV0_STRICT, False),
+            (self.REV1, True),
+        ):
+            a, b, c, d = self.patched(dev)
+            with a, b, c, d:
+                got = tc.ll128(*args, quant_type="fp4_blockwise")
+            self.assertEqual(got is not None, want, dev)
+
     @staticmethod
     def rev0_widest_grid():
         rows = [tc._COMBINE_TABLE["gfx1250-strict"]]

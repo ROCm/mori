@@ -492,6 +492,8 @@ def ll128(
     experts_per_rank=None,
     quant_type="none",
 ):
+    if _device_keys()[0] == "gfx1250-strict":
+        return None  # LL128's polls miss peer writes on these parts; use the schedule
     per_shape = _LL128_TABLE.get(quant_type, {}).get(_device_key(), {})
     entry = _bucket_key(per_shape, world_size, hidden_dim, topk, experts_per_rank)
     plan = entry.get(dtype) if entry else None
