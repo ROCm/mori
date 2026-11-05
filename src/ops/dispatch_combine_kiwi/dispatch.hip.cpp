@@ -434,12 +434,11 @@ __global__ void dispatch(ep_gcontext_t gctx, const void* __restrict__ d_tokens,
                                     route_owner, lane);
     }
 
-    if constexpr (UseHybridRcomp) {
-      // The RDMA staging payload is shared by all token waves. Drain
-      // each wave's stores and synchronize the block before the
-      // route-owner wave exposes that staging slot to the proxy.
-      __builtin_amdgcn_s_waitcnt(0);
-    }
+    // The RDMA staging payload is shared by all token waves. Drain each
+    // wave's stores before the block barrier, which does not wait for
+    // outstanding global stores, so the slot is complete when the
+    // route-owner wave exposes it to the proxy.
+    __builtin_amdgcn_s_waitcnt(0);
     __syncthreads();
 
     // Post the complete RDMA multicast before the independent direct-self
