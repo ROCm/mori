@@ -693,7 +693,7 @@ class CMakeBuild(build_ext):
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
         build_benchmark = os.environ.get("BUILD_BENCHMARK", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
-        build_ras = "ON" if _env_flag("BUILD_RAS", "ON") else "OFF"
+        build_ras = "ON" if _env_flag("BUILD_RAS", "OFF") else "OFF"
         build_umbp = "ON" if build_umbp_enabled else "OFF"
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")

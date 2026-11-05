@@ -64,9 +64,9 @@ option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_XLA_FFI_OPS "Whether to build mori xla ffi python bindings" OFF)
 option(BUILD_UMBP "Whether to build UMBP (Unified Memory/Bandwidth Pool)" OFF)
 option(BUILD_METRICS "Whether to build the Prometheus metrics server module" ON)
-# The runtime is built in but off until MORI_RAS_ENABLE=1. OFF builds it out: every RAS call in
-# the subsystems compiles to a no-op, and nothing links libmori_ras.
-option(BUILD_RAS "Whether to build the MORI RAS runtime" ON)
+# OFF builds RAS out: every RAS call in the subsystems compiles to a no-op, and nothing links
+# libmori_ras. ON builds the runtime in, still off until MORI_RAS_ENABLE=1.
+option(BUILD_RAS "Whether to build the MORI RAS runtime" OFF)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
 option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
