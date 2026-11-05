@@ -49,7 +49,11 @@ namespace {
 // from the rocm_sdk wheels, and a second copy loaded beside it binds part of its
 // state to the first one's symbols and then reports 0 sockets. amd_smi counts
 // init/shut_down references, so sharing the instance leaves the other user's
-// session alone.
+// session alone. A copy of another major version than the header mori was built
+// against may lay out its structs differently, so it is not reused. And a later
+// amdsmi_init only takes a reference and ignores its flags: the shared instance
+// sees GPUs only if its first user initialized it with AMDSMI_INIT_AMD_GPUS, as
+// torch does.
 void* LoadedAmdSmi() {
   std::string path;
   dl_iterate_phdr(
@@ -62,7 +66,21 @@ void* LoadedAmdSmi() {
         return 0;
       },
       &path);
-  return path.empty() ? nullptr : dlopen(path.c_str(), RTLD_NOW | RTLD_NOLOAD);
+  if (path.empty()) return nullptr;
+  void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_NOLOAD);
+  if (!handle) return nullptr;
+
+  auto getLibVersion = reinterpret_cast<decltype(&::amdsmi_get_lib_version)>(
+      dlsym(handle, "amdsmi_get_lib_version"));
+  amdsmi_version_t version = {};
+  if (getLibVersion && getLibVersion(&version) == AMDSMI_STATUS_SUCCESS &&
+      version.major == AMDSMI_LIB_VERSION_MAJOR) {
+    return handle;
+  }
+  fprintf(stderr, "[AMD-SMI] not reusing %s: its major version is %u, mori was built against %d\n",
+          path.c_str(), version.major, AMDSMI_LIB_VERSION_MAJOR);
+  dlclose(handle);
+  return nullptr;
 }
 
 void* OpenAmdSmi() {
