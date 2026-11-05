@@ -68,8 +68,10 @@ class PeerSsdManager {
  public:
   explicit PeerSsdManager(const PeerSsdConfig& cfg);
 
-  // Test-only: inject a fake backend.
-  explicit PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight = true);
+  // Inject storage and follower copies while retaining the ownership/read protocol.
+  using FanoutCopy = std::function<bool(void*, const void*, size_t)>;
+  explicit PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight = true,
+                          FanoutCopy fanout_copy = {});
 
   ~PeerSsdManager();
 
@@ -86,6 +88,8 @@ class PeerSsdManager {
   // to know how big the key is while it still only holds the key's name.
   // `owned_` has carried this all along; only the accessor was missing.
   uint64_t SizeOf(const std::string& key) const;
+  // SizeOf for a batch under one lock; 0 = not owned.
+  std::vector<uint64_t> SizesOf(const std::vector<std::string>& keys) const;
 
   // Hold a key against eviction across a peer-local migration.  Uses the same
   // refcount as active reads so eviction has one protection rule.
@@ -253,6 +257,8 @@ class PeerSsdManager {
 
   mutable std::mutex mutex_;
   std::unique_ptr<TierBackend> backend_;  // null when cfg.enabled == false
+  FanoutCopy fanout_copy_;
+  bool CopyFollower(void* dst, const void* src, size_t size) noexcept;
 
   // key -> {size, lru position}.  The authoritative owned-location map.
   std::unordered_map<std::string, OwnedEntry> owned_;

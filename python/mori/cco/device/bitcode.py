@@ -89,6 +89,7 @@ def _jit_compile(cov: int) -> str | None:
             _collect_include_dirs,
             _hipcc_device_bc,
             _strip_lifetime_intrinsics,
+            is_ccqe_enabled,
         )
 
         mori_root = get_mori_source_root()
@@ -109,7 +110,12 @@ def _jit_compile(cov: int) -> str | None:
             mori_root / "include" / "mori" / "cco",
             mori_root / "include" / "mori" / "core",
         ]
-        cache_dir = get_cache_dir(cfg.arch, source_paths, nic, cov=cov)
+        # _hipcc_device_bc adds -DIONIC_CCQE when the ionic CQs are collapsed, which
+        # changes the GDA CQ poll; a bitcode cached under the other mode would
+        # misread completions and hang. So the mode is part of the key.
+        cache_dir = get_cache_dir(
+            cfg.arch, source_paths, nic, cov=cov, ccqe=is_ccqe_enabled()
+        )
         if sdma_on:
             cache_dir = cache_dir / "sdma"
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -130,7 +136,14 @@ def _jit_compile(cov: int) -> str | None:
                 _hipcc_device_bc(
                     cfg, wrapper, include_dirs, raw, cov=cov, extra_defines=sdma_define
                 )
-                _strip_lifetime_intrinsics(cfg, raw, bc_path)
+                # Waiters take bc_path as soon as it exists, and opt creates its
+                # output before writing it: build aside, then rename into place.
+                tmp_bc = cache_dir / f".{_BC_FILENAME}.{os.getpid()}.tmp"
+                try:
+                    _strip_lifetime_intrinsics(cfg, raw, tmp_bc)
+                    os.replace(tmp_bc, bc_path)
+                finally:
+                    tmp_bc.unlink(missing_ok=True)
         return str(bc_path)
     except Exception:
         return None

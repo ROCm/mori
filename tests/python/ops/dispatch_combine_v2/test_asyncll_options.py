@@ -91,12 +91,59 @@ class AsyncLLOptionsTest(unittest.TestCase):
                     self.resolve(env, arch="gfx1250-strict"), self.resolve(env)
                 )
 
-    def test_other_architectures_require_explicit_opt_in(self):
-        self.assertEqual(self.resolve({}, arch="gfx950")[:2], (0, False))
+    def test_gfx950_defaults_to_early_notification(self):
+        self.assertEqual(self.resolve({}, arch="gfx950")[:2], (1, True))
         self.assertEqual(
-            self.resolve({"MORI_ASYNCLL_EARLY_NOTIFY": "1"}, arch="gfx950")[:2],
+            self.resolve({"MORI_ASYNCLL_EARLY_NOTIFY": "0"}, arch="gfx950")[:2],
+            (0, False),
+        )
+
+    def test_other_architectures_require_explicit_opt_in(self):
+        self.assertEqual(self.resolve({}, arch="gfx942")[:2], (0, False))
+        self.assertEqual(
+            self.resolve({"MORI_ASYNCLL_EARLY_NOTIFY": "1"}, arch="gfx942")[:2],
             (1, True),
         )
+
+    def test_fused_receive_grid_ceiling_reaches_only_the_fused_mode(self):
+        resolve = EpDispatchCombineOpHip._asyncll_fused_recv_ctas
+        for env, mode, expected in [
+            ({}, 2, 0),
+            ({"MORI_ASYNCLL_FUSED_RECV_CTAS": "64"}, 2, 64),
+            ({"MORI_ASYNCLL_FUSED_RECV_CTAS": "64"}, 1, 0),
+            ({"MORI_ASYNCLL_FUSED_RECV_CTAS": "64"}, 0, 0),
+        ]:
+            with (
+                self.subTest(env=env, mode=mode),
+                patch.dict(os.environ, env, clear=True),
+            ):
+                self.assertEqual(resolve(mode), expected)
+        for value in ("-1", "half"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                with patch.dict(
+                    os.environ, {"MORI_ASYNCLL_FUSED_RECV_CTAS": value}, clear=True
+                ):
+                    resolve(2)
+
+    def test_fused_receive_ceiling_follows_the_cu_mask(self):
+        resolve = EpDispatchCombineOpHip._asyncll_fused_recv_ctas
+        for env, dev, expected in [
+            ({}, 0, 0),  # unrestricted: the native default, half the device
+            ({"HSA_CU_MASK": "0-7:0-63"}, 3, 32),
+            ({"HSA_CU_MASK": "1:0-15,32-47;0:0-127"}, 1, 16),
+            ({"HSA_CU_MASK": "1:0-15,32-47;0:0-127"}, 0, 64),
+            ({"HSA_CU_MASK": "1:0-63"}, 0, 0),  # mask names other GPUs only
+            ({"HSA_CU_MASK": "0:0-511"}, 0, 0),  # not a restriction
+            ({"HSA_CU_MASK": "0:0x0f"}, 0, 0),  # unreadable: whole device
+            ({"HSA_CU_MASK": "0-7:0-63", "MORI_ASYNCLL_FUSED_RECV_CTAS": "48"}, 0, 48),
+        ]:
+            with (
+                self.subTest(env=env, dev=dev),
+                patch.dict(os.environ, env, clear=True),
+            ):
+                self.assertEqual(resolve(2, dev, 256), expected)
+        with patch.dict(os.environ, {"HSA_CU_MASK": "0-7:0-63"}, clear=True):
+            self.assertEqual(resolve(1, 0, 256), 0)
 
     def test_reject_inconsistent_or_invalid_options(self):
         for option in ("MORI_ASYNCLL_FUSED_RECV", "MORI_ASYNCLL_SKIP_RESET"):

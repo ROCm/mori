@@ -249,14 +249,21 @@ def _device_key():
     return None
 
 
+# Capacity of the per-block xdb flag array in intranode_kernels (xdb_flag_slots):
+# a combine block_num above it fails at op construction. Kept here because this
+# module must not import the kernels (flydsl); test_tuning_configs.py checks the
+# two stay equal.
+_MAX_COMBINE_BLOCKS = 256
+
+
 def _cu_scaled_default():
-    """Untuned fallback: ~1 block/CU for combine (<= CU count), many warps for
-    dispatch, few warps for combine, no per-token schedule (single-shot). Used
-    for devices without a measured table."""
+    """Untuned fallback: ~1 block/CU for combine (<= CU count, and <=
+    _MAX_COMBINE_BLOCKS), many warps for dispatch, few warps for combine, no
+    per-token schedule (single-shot). Used for devices without a measured table."""
     cu = _cu_count() or 80
     return dict(
         dispatch_block_num=cu,
-        combine_block_num=cu,
+        combine_block_num=min(cu, _MAX_COMBINE_BLOCKS),
         warp_num_per_block=16,
         combine_warp_num_per_block=4,
         schedule=None,

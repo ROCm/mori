@@ -630,6 +630,23 @@ TEST(PeerPool, WeightedPolicyFallsBackWhenPrimaryHasNoSpace) {
   EXPECT_EQ(result.backend_id, registry.BackendId(registry.Get("dram_b")));
 }
 
+TEST(TieredPlacementPolicy, SmallObjectsSkipMembersWithMinObjectSize) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("ssd", std::make_unique<MockBackend>(TierType::SSD)));
+  auto compiled = LogicalTierGraph::Compile(
+      {LogicalTierConfig{{{"dram", 1}, {"ssd", 1000, 64 << 10}}}}, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  const uint32_t dram = registry.BackendId(registry.Get("dram"));
+  const uint32_t ssd = registry.BackendId(registry.Get("ssd"));
+  for (int i = 0; i < 32; ++i) {
+    const std::string key = "small-" + std::to_string(i);
+    EXPECT_EQ(compiled.graph->PutOrder(key, 4096), (std::vector<uint32_t>{dram, ssd}));
+    // Large and unknown sizes keep the plain weighted order.
+    EXPECT_EQ(compiled.graph->PutOrder(key, 1 << 20), compiled.graph->PutOrder(key));
+  }
+}
+
 TEST(TieredPlacementPolicy, RejectsTierGraphWithoutTransferEngine) {
   BackendRegistry registry;
   ASSERT_TRUE(registry.Register("only", std::make_unique<MockBackend>(TierType::DRAM)));
@@ -1162,6 +1179,11 @@ TEST(PeerPool, ReadPromotesColdKeyWithoutDeletingSource) {
   BackendRegistry registry;
   RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2);
   RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2);
+  std::atomic<int> dram_changes{0};
+  registry.Get("hot")->SetChangeHook([&](const auto& keys) {
+    if (!keys.empty()) EXPECT_EQ(keys, (std::vector<std::string>{"promote"}));
+    ++dram_changes;
+  });
 
   auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
   tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;
@@ -1170,11 +1192,13 @@ TEST(PeerPool, ReadPromotesColdKeyWithoutDeletingSource) {
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
   CommitKey(&pool, "promote", {}, "cold");
+  EXPECT_EQ(dram_changes.load(), 0);
   ASSERT_TRUE(pool.BatchResolve({"promote"}, false).front().resolved.found);
 
   EXPECT_TRUE(WaitForKey(&registry, "hot", "promote"));
   EXPECT_TRUE(registry.Get("cold")->Contains("promote"));
-  pool.ClearLocal();  // drains the in-flight copy
+  EXPECT_EQ(dram_changes.load(), 1);  // Promotion wakes the DRAM Indexer reporter.
+  pool.ClearLocal();                  // drains the in-flight copy
   // Only the source is charged the read, not the target's post-write pin.
   const TierTransitionMetrics moves = pool.TransitionMetrics();
   EXPECT_EQ(moves.read_bytes, (std::map<std::string, uint64_t>{{"SSD", 64}}));
