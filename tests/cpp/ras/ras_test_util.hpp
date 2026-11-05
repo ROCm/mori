@@ -38,6 +38,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 // In a child body: report the failed condition and return its line as the exit status.
 #define CHILD_CHECK(cond)                                                                 \
@@ -111,6 +112,30 @@ inline uint16_t HoldPort(const std::string& host, int* fd) {
   socklen_t len = sizeof(addr);
   getsockname(*fd, reinterpret_cast<sockaddr*>(&addr), &len);
   return ntohs(addr.sin_port);
+}
+
+// Listening sockets on `count` consecutive ports of `host`, below the usual ephemeral range,
+// standing in for other processes that hold them. Returns the first port, or 0 if no run of
+// free ports was found; *fds keeps them held.
+inline uint16_t HoldPorts(const std::string& host, int count, std::vector<int>* fds) {
+  for (int first = 20000; first + count <= 32000; first += count) {
+    for (int port = first; port < first + count; ++port) {
+      int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(static_cast<uint16_t>(port));
+      inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+      if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(fd, 4) != 0) {
+        close(fd);
+        break;
+      }
+      fds->push_back(fd);
+    }
+    if (static_cast<int>(fds->size()) == count) return static_cast<uint16_t>(first);
+    for (int fd : *fds) close(fd);
+    fds->clear();
+  }
+  return 0;
 }
 
 // This process's sockets and anonymous-inode fds (epoll, eventfd): the kinds RAS opens.

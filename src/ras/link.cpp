@@ -90,9 +90,14 @@ bool LinkManager::Listen(const std::string& bindHost, std::string* error) {
     *error = "the RAS listener can't bind '" + bindHost + "': not an IP address";
     return false;
   }
-  const uint16_t want = opts_.config.port;
-  // An ephemeral pick can land on RCCL RAS's port if the host's range includes it.
-  for (int attempt = 0; attempt < 8; ++attempt) {
+  // MORI_RAS_PORT=P allows P to P + kRasPortSpan - 1, and 0 an ephemeral port. Neither ever
+  // takes RCCL RAS's port, which an ephemeral pick lands on if the host's range includes it.
+  const int first = opts_.config.port;
+  const int last = first == 0 ? 0 : std::min(first + kRasPortSpan - 1, 65535);
+  const int attempts = first == 0 ? 8 : last - first + 1;
+  for (int attempt = 0; attempt < attempts; ++attempt) {
+    const uint16_t want = static_cast<uint16_t>(first == 0 ? 0 : first + attempt);
+    if (want == kRcclRasPort) continue;
     int fd = socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) {
       *error = std::string("socket: ") + std::strerror(errno);
@@ -108,13 +113,17 @@ bool LinkManager::Listen(const std::string& bindHost, std::string* error) {
     if (bind(fd, reinterpret_cast<sockaddr*>(&addr), addrLen) != 0) {
       int err = errno;
       CloseFd(fd);
-      *error = err == EADDRINUSE ? "port " + std::to_string(want) + " on " + bindHost + " is in use"
-                                 : std::string("bind: ") + std::strerror(err);
+      if (err == EADDRINUSE && want != 0) continue;  // another process has it
+      *error = std::string("bind: ") + std::strerror(err);
       return false;
     }
     if (listen(fd, kListenBacklog) != 0) {
-      *error = std::string("listen: ") + std::strerror(errno);
+      int err = errno;
       CloseFd(fd);
+      // SO_REUSEADDR lets two sockets bind a port that neither listens on yet; the second
+      // listen() fails, and that process moves on to the next port.
+      if (err == EADDRINUSE && want != 0) continue;
+      *error = std::string("listen: ") + std::strerror(err);
       return false;
     }
     sockaddr_storage bound{};
@@ -123,7 +132,7 @@ bool LinkManager::Listen(const std::string& bindHost, std::string* error) {
     uint16_t port =
         ntohs(bound.ss_family == AF_INET ? reinterpret_cast<sockaddr_in*>(&bound)->sin_port
                                          : reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port);
-    if (want == 0 && port == kRcclRasPort) {
+    if (port == kRcclRasPort) {
       CloseFd(fd);
       continue;
     }
@@ -131,7 +140,15 @@ bool LinkManager::Listen(const std::string& bindHost, std::string* error) {
     port_ = port;
     return true;
   }
-  *error = "every ephemeral port picked was 28028";
+  const std::string where = bindHost.empty() ? "0.0.0.0" : bindHost;
+  if (first == 0) {
+    *error = "every ephemeral port picked was 28028";
+  } else if (first == last) {
+    *error = "port " + std::to_string(first) + " on " + where + " is in use";
+  } else {
+    *error = "ports " + std::to_string(first) + "-" + std::to_string(last) + " on " + where +
+             " are all in use";
+  }
   return false;
 }
 

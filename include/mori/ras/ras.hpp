@@ -36,10 +36,10 @@
 // - EnsureStarted() starts the runtime once per process, from the first IOEngine. It binds the
 //   peer listener before returning, so the engine can advertise it in EngineDesc. The RAS
 //   thread runs at nice 19 and on MORI_RAS_CPU_AFFINITY's CPUs, if set.
-// - A runtime that fails to start, e.g. because MORI_RAS_PORT is taken, stays off for the
-//   life of the process: Status() reports kFailed with kDegradedInitFailed and why, and engines
-//   advertise no endpoint. A failure after start sets a degraded bit but keeps the listener
-//   open.
+// - A runtime that fails to start, e.g. because every port MORI_RAS_PORT allows is taken,
+//   stays off for the life of the process: Status() reports kFailed with kDegradedInitFailed
+//   and why, and engines advertise no endpoint. A failure after start sets a degraded bit but
+//   keeps the listener open.
 // - At exit, an atexit handler stops the RAS thread. That path doesn't log: MORI_LOG caches
 //   loggers in function-local statics, which may already be destroyed. The runtime object is
 //   never freed, so a thread still calling in during exit reaches a stopped runtime, not freed

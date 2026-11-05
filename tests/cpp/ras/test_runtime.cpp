@@ -29,6 +29,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -196,10 +198,11 @@ TEST(RasRuntime, ThreadsThatStartAtOnceShareOneRuntime) {
   }
 }
 
-TEST(RasRuntime, ABlockedPortLeavesRasOffAndDegraded) {
+TEST(RasRuntime, TakenPortsLeaveRasOffAndDegraded) {
   EXPECT_EQ(RunInChild([] {
-              int holder = -1;
-              uint16_t port = ras_test::HoldPort("0.0.0.0", &holder);
+              std::vector<int> held;
+              uint16_t port = ras_test::HoldPorts("0.0.0.0", kRasPortSpan, &held);
+              CHILD_CHECK(port != 0);
               setenv("MORI_RAS_ENABLE", "1", 1);
               setenv("MORI_RAS_PORT", std::to_string(port).c_str(), 1);
               CHILD_CHECK(RasRuntime::EnsureStarted(Params()) == nullptr);
@@ -207,27 +210,65 @@ TEST(RasRuntime, ABlockedPortLeavesRasOffAndDegraded) {
               RuntimeStatus st = RasRuntime::Status();
               CHILD_CHECK(st.state == RunState::kFailed);
               CHILD_CHECK((st.degraded & kDegradedInitFailed) != 0);
-              CHILD_CHECK(st.detail.find("in use") != std::string::npos);
+              CHILD_CHECK(st.detail.find("are all in use") != std::string::npos);
               // The failure sticks: a later engine doesn't retry.
-              close(holder);
+              for (int fd : held) close(fd);
               CHILD_CHECK(RasRuntime::EnsureStarted(Params()) == nullptr);
               return 0;
             }),
             0);
 }
 
+// With TP>1, every engine process on a host reads the same MORI_RAS_PORT, and they start at
+// once. Each must still get a port of its own from the range, past any another process holds.
+TEST(RasRuntime, RuntimesSharingAMoriRasPortEachGetTheirOwn) {
+  std::vector<int> held;
+  uint16_t first = ras_test::HoldPorts("0.0.0.0", 1, &held);
+  ASSERT_NE(first, 0);
+  CoreParams p = LocalCore();
+  p.config.port = first;
+  constexpr int kCores = 8;
+  std::vector<std::unique_ptr<RasCore>> cores;
+  for (int i = 0; i < kCores; ++i) cores.push_back(std::make_unique<RasCore>(p));
+  std::vector<int> started(kCores, 0);
+  std::vector<std::string> errors(kCores);
+  std::atomic<bool> go{false};
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kCores; ++i) {
+    threads.emplace_back([&, i] {
+      while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+      started[i] = cores[i]->Start(&errors[i]);
+    });
+  }
+  go.store(true, std::memory_order_release);
+  for (std::thread& t : threads) t.join();
+  std::set<uint16_t> ports;
+  for (int i = 0; i < kCores; ++i) {
+    ASSERT_TRUE(started[i]) << "core " << i << ": " << errors[i];
+    uint16_t port = cores[i]->Endpoint().port;
+    EXPECT_GT(port, first);
+    EXPECT_LT(port, first + kRasPortSpan);
+    EXPECT_TRUE(ras_test::CanConnect("127.0.0.1", port));
+    ports.insert(port);
+  }
+  EXPECT_EQ(ports.size(), static_cast<size_t>(kCores));
+  for (int fd : held) close(fd);
+}
+
 // MORI shows only errors by default. Whoever set MORI_RAS_ENABLE must still see why RAS isn't
 // doing what they asked; everyone else must see nothing new.
 TEST(RasRuntime, ProblemsShowAtTheDefaultLogLevelOnlyWhenRasWasAskedFor) {
-  int holder = -1;
-  std::string held = std::to_string(ras_test::HoldPort("0.0.0.0", &holder));
+  std::vector<int> held;
+  uint16_t first = ras_test::HoldPorts("0.0.0.0", kRasPortSpan, &held);
+  ASSERT_NE(first, 0);
+  std::string taken = std::to_string(first);
   struct Case {
     const char* enable;  // MORI_RAS_ENABLE, or nullptr for unset
     const char* port;    // MORI_RAS_PORT, or nullptr for unset
     const char* shown;   // in the log, or nullptr for an empty log
   };
   const Case cases[] = {
-      {"1", held.c_str(), "RAS is off for this process: port "},
+      {"1", taken.c_str(), "RAS is off for this process: ports "},
       {"1", "http", "MORI_RAS_PORT=http is invalid"},
       {"maybe", nullptr, "MORI_RAS_ENABLE=maybe is invalid"},
       {nullptr, "http", nullptr},
@@ -253,7 +294,7 @@ TEST(RasRuntime, ProblemsShowAtTheDefaultLogLevelOnlyWhenRasWasAskedFor) {
         << "MORI_RAS_ENABLE=" << (c.enable ? c.enable : "(unset)")
         << " MORI_RAS_PORT=" << (c.port ? c.port : "(unset)");
   }
-  close(holder);
+  for (int fd : held) close(fd);
 }
 
 TEST(RasRuntime, TheRasThreadRunsAtLowPriorityWhereItIsPinned) {

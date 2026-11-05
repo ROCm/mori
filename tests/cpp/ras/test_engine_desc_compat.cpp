@@ -32,6 +32,7 @@
 
 #include "mori/io/engine.hpp"
 #include "mori/ras/ras.hpp"
+#include "src/ras/config.hpp"
 #include "tests/cpp/ras/ras_test_util.hpp"
 
 using namespace mori::io;
@@ -173,8 +174,9 @@ TEST(RasEngineDesc, AnEngineAdvertisesItsRuntimesEndpointOnlyWhenRasRuns) {
             }),
             0);
   EXPECT_EQ(ras_test::RunInChild([] {
-              int holder = -1;
-              uint16_t port = ras_test::HoldPort("0.0.0.0", &holder);
+              std::vector<int> held;
+              uint16_t port = ras_test::HoldPorts("0.0.0.0", mori::ras::kRasPortSpan, &held);
+              CHILD_CHECK(port != 0);
               setenv("MORI_RAS_ENABLE", "1", 1);
               setenv("MORI_RAS_PORT", std::to_string(port).c_str(), 1);
               IOEngine e("engine-blocked", IOEngineConfig{"127.0.0.1", 0});
