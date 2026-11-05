@@ -155,6 +155,9 @@ class AnvilLib {
   std::once_flag init_flag;
   std::mutex channels_mutex_;
   std::unordered_map<std::pair<int, int>, SdmaQueueVector, PairHash> sdma_channels_;
+  // Per source node: peer-link channels created on each SDMA engine id. Guarded by
+  // channels_mutex_; read by the MI308X engine spread in connect().
+  std::unordered_map<int, std::array<int, 32>> peer_engine_use_;
 };
 
 extern AnvilLib& anvil;

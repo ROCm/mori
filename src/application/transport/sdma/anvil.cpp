@@ -415,9 +415,26 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // eventually exhaust the per-engine queue slots.
   auto& channels = sdma_channels_[std::make_pair(srcNode, dstNode)];
   if (static_cast<int>(channels.size()) < numChannels) {
+    auto& engineUse = peer_engine_use_[srcNode];
+    // The fold above can put two single-engine peer links of one MI308X on the same
+    // engine (masks 0x40 and 0x80 both land on engine 6), serialising this GPU's
+    // copies to both peers. With MORI_SDMA_SPREAD_MI308X=1, a new peer link whose
+    // engine already serves another peer moves to the least-used xGMI engine
+    // (2, 4 or 6; engine 0 is the general one).
+    const char* spreadEnv = std::getenv("MORI_SDMA_SPREAD_MI308X");
+    const bool spread = spreadEnv && spreadEnv[0] == '1';
+    if (spread && isMi308x(srcNode) && srcNode != dstNode && numEngines == 1 && channels.empty() &&
+        engineUse[engines[0]] > 0) {
+      uint32_t best = engines[0];
+      for (uint32_t e : {2u, 4u, 6u}) {
+        if (engineUse[e] < engineUse[best]) best = e;
+      }
+      engines[0] = best;
+    }
     const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
     for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
       uint32_t engineId = engines[c % numEngines];
+      if (srcNode != dstNode) engineUse[engineId]++;
       channels.emplace_back(std::make_unique<SdmaQueue>(hsakmtNode, engineId));
     }
   }
