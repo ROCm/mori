@@ -56,7 +56,7 @@ can be slower than either count alone: the two are chosen as a pair.
 MI308X inter-node rules set the count per bucket and phase (1, 2 or 4), except
 the FP8 combine rows. Every MI300X inter-node rule sets one (1, 2 or 4). MI355X
 rules set one (1, 2 or 4) per bucket and phase where the whole-table A/B kept a
-change: 119 of the 233 InterNodeV2 rules and 42 of the 233 InterNodeV2LL ones.
+change: 121 of the 233 InterNodeV2 rules and 45 of the 233 InterNodeV2LL ones.
 The largest count in one MI355X op is 4, and 2 for InterNodeV2LL 272/9 and
 896/16.
 
@@ -110,7 +110,7 @@ other tables may not set it. Current settings:
 
 | GPU (arch, CUs) | Shapes (experts / top-k) | Hidden | Dispatch dtypes |
 | --- | --- | --- | --- |
-| MI355X (gfx950, 256) | 256/8, 256/6, 384/6; 272/9, 896/16 inter | 7168; 6144 for inter 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3; fp4 for inter 256/8 |
+| MI355X (gfx950, 256) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168; 6144 for 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3; fp4 for inter 256/8 |
 | MI308X (gfx942, 80) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168; 6144 for 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 |
 | MI300X (gfx942, 304) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168; 6144 for 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 |
 
@@ -125,8 +125,8 @@ The model behind each shape:
 | Model | Experts / top-k | Hidden the dispatch carries | Tables |
 | --- | --- | --- | --- |
 | DeepSeek-V3/R1 | 256/8 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16; FP4 dispatch (stored as 3584, packed) on MI308X, MI355X and MI300X EP16 |
-| DeepSeek-V3/R1, shared expert fused in | 264/9 at EP8, 272/9 at EP16 | 7168 | MI308X, MI300X; MI355X: EP16 |
-| GLM-5, GLM-5.3 | 256/8 | 6144 | MI308X, MI300X: EP8 and EP16; MI355X: EP16 |
+| DeepSeek-V3/R1, shared expert fused in | 264/9 at EP8, 272/9 at EP16 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16 |
+| GLM-5, GLM-5.3 | 256/8 | 6144 | MI355X, MI308X, MI300X: EP8 and EP16 |
 | DeepSeek-V4-Pro | 384/6 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16 |
 | DeepSeek-V4.1-Flash | 384/6 | 5120 | MI355X, MI308X, MI300X: EP8 and EP16 |
 | Kimi K3 | 896/16 | 3584 | MI308X, MI355X, MI300X: EP16 |
@@ -211,8 +211,24 @@ Metrics are only comparable between rows measured under the same conditions.
   before (the next bucket's rule or the default), so the new rules of its
   neighbours do not move it. On 896/16 InterNodeV2LL dispatch, 256 blocks ×
   16 warps (256/128/16, 256/170/16) gave wrong results on 1 rank in 16 in 4
-  of 54 runs; those geometries are excluded there, and its T2048 and T4096
-  buckets keep the default until they are re-measured.
+  of 54 runs; those geometries are excluded there. Its T2048 bf16 and T4096
+  fp8 rules, re-picked without them, are in the next item.
+- **MI355X EP8, and twelve later EP16 rows.** Measured on 2026-11-03/04 on
+  another cluster's MI355X nodes (amdgpu 6.16.6 and GPU firmware bundle
+  01.25.16.03; the EP16 item above ran on 6.14.14 and bundle 01.26.00.02),
+  with the protocol above. EP8 256/8 h6144, 264/9 and 384/6 h5120 were tuned
+  from scratch: geometry over 18 candidates per phase in two rounds, then a
+  whole-table A/B and a confirming one, the same ≥1%-in-every-round rule; 18
+  of 21 buckets took new rules, and their correctness pass (20 inputs a cell)
+  was clean on two nodes. In EP16, the FP4 dispatch rows at T4–T16 and the
+  FP8 combine rows at T4–T64 that changed were picked on top of the item
+  above and took over only where they beat its rules in a head-to-head
+  confirm A/B; the 896/16 InterNodeV2LL T2048 bf16 (256/170/4) and T4096 fp8
+  (256/170/8) dispatch rules took over the same way. That cluster gives
+  intermittent wrong results, on the old rules as often as on the new, in
+  0.3–8% of runs at T ≤ 512 (not seen on the first one); the twelve EP16
+  rows were picked with the checks recorded but not gating, so they are
+  timed, not verified.
 - **Kernel.** The MI308X 264/9, 272/9 InterNodeV2, 896/16 and FP4 dispatch
   rows, and every MI300X row, were re-tuned and measured on the kernel
   with the topk-9/16 combine gather and the 3584 B copy tail fixed
