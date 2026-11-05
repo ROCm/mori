@@ -105,7 +105,6 @@ from aiter.ops.flydsl.kernels.mega_moe.dispatch import (
     DispatchSlot,
     _load_fanout_pair,
     _wave_inclusive_scan_i32,
-    _wave_reduce_max_i32,
 )
 
 __all__ = ["compile_gemm1_8wave_sdma", "SCALE_MODES"]
@@ -397,18 +396,16 @@ def tile_find(tab_lds, j, lane_id, *, SBM, experts):
         fx.Int32(p[fx.Int32(i * 64) + lane_id]) for i in range(4)
     ]
     ok = lane_id < fx.Int32(experts)
-    before = _wave_reduce_max_i32(
-        (ok & (cum_l <= j)).select(lane_id + fx.Int32(1), fx.Int32(0)), lane_id
-    )
+    # The cumulative ends rise with the lane, so the experts that end at or before ``j``
+    # are a lane prefix: their count is the expert of ``j``. One ballot and a popcount
+    # instead of a butterfly max (six dependent LDS permutes per work item), and
+    # ``v_readlane`` instead of a permute to read the expert's row of the table.
+    before = fx.Int32(fx.math.ctpop(fx.Int64(rocdl.ballot(T.i64, ok & (cum_l <= j)))))
     e = fx.Int32(rocdl.readfirstlane(T.i32, before))
     e = (e < fx.Int32(experts)).select(e, fx.Int32(experts - 1))
 
     def from_lane(v):
-        return fx.Int32(
-            rocdl.readfirstlane(
-                T.i32, fx.Int32(rocdl.ds_bpermute(T.i32, e * fx.Int32(4), v))
-            )
-        )
+        return fx.Int32(rocdl.readlane(T.i32, v, e))
 
     t_in = j - from_lane(cum_l - tiles_l)
     row_base = from_lane(prev_l * fx.Int32(SBM)) + t_in * fx.Int32(256)
@@ -589,7 +586,38 @@ def compile_gemm1_8wave_sdma(
                 wave_id % fx.Int32(4),
             )
 
-        def process_tile(block_m, block_n, tab_lds):
+        def signal_slots():
+            """(address of peer 0's queue-0 signal count, stride to the next peer's), wave
+            uniform: the counts are one array indexed by the sender, so two lookups give
+            all of them, once per workgroup."""
+            import mori.cco.device.flydsl as cco
+
+            sd = cco.DevComm(dev_comm).sdma()
+            s0 = fx.Int64(
+                rocdl.readfirstlane(T.i64, fx.Int64(sd.signal_slot(0, 0)).ir_value())
+            )
+            s1 = fx.Int64(
+                rocdl.readfirstlane(T.i64, fx.Int64(sd.signal_slot(1, 0)).ir_value())
+            )
+            return s0, s1 - s0
+
+        def wait_signals(slot0, slot_stride, need):
+            """Every peer's queue-0 signal count reaches ``need``: all of them in one round
+            trip, then a spin only on a short one."""
+            addrs = [
+                slot0 + slot_stride * fx.Int64(src)
+                for src in range(npes)
+                if src != rank
+            ]
+            sigs = [fx.Int64(comm_ops.load_i64_acquire(a)) for a in addrs]
+            short = sigs[0] < need
+            for v in sigs[1:]:
+                short = short | (v < need)
+            if short:
+                for a in addrs:
+                    comm_ops.spin_until_ge_i64(a, need)
+
+        def process_tile(block_m, block_n, tab_lds, sig_slot0, sig_stride):
             _, lane_id, wave_id, wave_m, wave_n = lane_ids()
             a_cur0, a_cur1 = lds.A_lds_cur_0, lds.A_lds_cur_1
             a_next0, a_next1 = lds.A_lds_next_0, lds.A_lds_next_1
@@ -609,12 +637,19 @@ def compile_gemm1_8wave_sdma(
             )
             if const_expr(not ldsw):
                 # The shuffler blocks waited for the expert's data and wrote its scales into
-                # A_scale; ``shuf_flags`` holds their per-expert flags.
+                # A_scale; ``shuf_flags`` holds their per-expert flags. All flags in one round
+                # trip; spin only if one is short.
                 if tid0:
-                    for si in range_constexpr(N_SHUF):
-                        comm_ops.spin_until_ge_i64(
-                            fx.Int64(shuf_flags) + fx.Int64(8 * si), need
-                        )
+                    flag_addrs = [
+                        fx.Int64(shuf_flags) + fx.Int64(8 * si) for si in range(N_SHUF)
+                    ]
+                    flags = [fx.Int64(comm_ops.load_i64_acquire(a)) for a in flag_addrs]
+                    short = flags[0] < need
+                    for v in flags[1:]:
+                        short = short | (v < need)
+                    if short:
+                        for a in flag_addrs:
+                            comm_ops.spin_until_ge_i64(a, need)
                     # A short M-tile also reads the next expert's scale rows, which this
                     # CU's L1 may hold from before the shuffler wrote them: drop L1 (only).
                     _llvm.inline_asm(
@@ -626,15 +661,8 @@ def compile_gemm1_8wave_sdma(
                     )
                 fx.barrier()
             else:
-                import mori.cco.device.flydsl as cco
-
-                sd = cco.DevComm(dev_comm).sdma()
-                for src in range_constexpr(npes):
-                    if const_expr(src != rank):
-                        if tid0:
-                            comm_ops.spin_until_ge_i64(
-                                fx.Int64(sd.signal_slot(src, 0)), need
-                            )
+                if tid0:
+                    wait_signals(sig_slot0, sig_stride, need)
                 fx.barrier()
             tib_p = global_typed_ptr(tib, T.i32)
 
@@ -1032,9 +1060,12 @@ def compile_gemm1_8wave_sdma(
                 fx.barrier()
                 return v
 
+            g_slot0, g_stride = fx.Int64(0), fx.Int64(0)
+            if const_expr(ldsw):
+                g_slot0, g_stride = signal_slots()
             w = fetch()
             while w < n_tiles * n_blocks:
-                process_tile(w // n_blocks, w % n_blocks, tab_lds)
+                process_tile(w // n_blocks, w % n_blocks, tab_lds, g_slot0, g_stride)
                 fx.barrier()
                 w = fetch()
 
@@ -1132,11 +1163,8 @@ def compile_gemm1_8wave_sdma(
             the raw e8m0 rows, shuffle them into LDS, copy the chunk's contiguous ``shuffle_scale``
             bytes to ``A_scale`` (``shuf_scale``) at the sorted rows. Release, then raise flag
             ``shuf_flags[sid]`` to the expert's signal target."""
-            import mori.cco.device.flydsl as cco
-
             tid = fx.Int32(fx.thread_idx.x)
             tid0 = tid == fx.Int32(0)
-            sd = cco.DevComm(dev_comm).sdma()
             ends = global_typed_ptr(tile_end, T.i32)
             tib_s = global_typed_ptr(tib, T.i32)
             out_rsrc = create_buffer_resource_from_addr(
@@ -1148,14 +1176,11 @@ def compile_gemm1_8wave_sdma(
             )
             STEP = 256 // SBM
             CH_I32 = 256 * (K // 32) // 4
+            sh_slot0, sh_stride = signal_slots()
             for e in range(fx.Int32(0), fx.Int32(experts), fx.Int32(1)):
                 need_e = sig0 + fx.Int64(e + fx.Int32(2))
-                for src in range_constexpr(npes):
-                    if const_expr(src != rank):
-                        if tid0:
-                            comm_ops.spin_until_ge_i64(
-                                fx.Int64(sd.signal_slot(src, 0)), need_e
-                            )
+                if tid0:
+                    wait_signals(sh_slot0, sh_stride, need_e)
                 fx.barrier()
                 t_lo = fx.Int32(
                     rocdl.readfirstlane(

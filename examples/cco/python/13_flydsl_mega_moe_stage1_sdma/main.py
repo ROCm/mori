@@ -40,7 +40,7 @@ aiter's byte for byte.
     test    one token count: aiter's layer output, then 4 back-to-back calls through the
             SDMA Stage1 with two alternating inputs; every row must be identical
     bench   per token count: CUDA Graph time of Stage1 (including prepare) and of the
-            whole layer, aiter vs SDMA, max over ranks
+            whole layer, aiter vs SDMA: per replay the max over ranks, then the median
 
 Needs aiter (MegaMoEV2 with the compact prepare), FlyDSL, and mori built with SDMA
 (BUILD_CCO_SDMA=ON), on a gfx950 node with 8 GPUs:
@@ -221,7 +221,10 @@ def _check(moe, s1, net, bs, args, rank, device):
 
 
 def _time_graph(fn, iters):
-    """Max over ranks of the mean ms of one ``fn`` captured in a CUDA Graph."""
+    """Median over replays of the max-over-ranks ms of one ``fn`` captured in a CUDA Graph.
+
+    One event pair per replay: the kernels wait for every rank, so a host hiccup on any
+    rank stretches the replays it delays; the median ignores those."""
     _barrier()
     fn()
     _barrier()
@@ -231,15 +234,17 @@ def _time_graph(fn, iters):
     for _ in range(10):
         graph.replay()
     torch.cuda.synchronize()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-        enable_timing=True
-    )
-    start.record()
-    for _ in range(iters):
+    ev = [torch.cuda.Event(enable_timing=True) for _ in range(iters + 1)]
+    ev[0].record()
+    for i in range(iters):
         graph.replay()
-    end.record()
+        ev[i + 1].record()
     torch.cuda.synchronize()
-    return _over_ranks(start.elapsed_time(end) / iters, dist.ReduceOp.MAX)
+    t = torch.tensor(
+        [ev[i].elapsed_time(ev[i + 1]) for i in range(iters)], dtype=torch.float64
+    )
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return float(t.median())
 
 
 # --- test -----------------------------------------------------------------------------
@@ -352,7 +357,8 @@ def run_bench(args, rank, world, device):
 
     if rank == 0:
         print(
-            f"\nnetwork={args.network}, CUDA Graph, max over ranks, ms; Stage1 includes prepare"
+            f"\nnetwork={args.network}, CUDA Graph, median over replays of the max over ranks, "
+            "ms; Stage1 includes prepare"
         )
         print(
             "| bs | SBM | scale mode | Stage1 aiter | Stage1 SDMA | diff | layer aiter | layer SDMA | diff "
@@ -427,7 +433,7 @@ def _parse_args():
     )
     bench.add_argument("--bs-list", default="2048,4096,8192", help="tokens per rank")
     bench.add_argument(
-        "--iters", type=int, default=20, help="graph replays per measurement"
+        "--iters", type=int, default=30, help="graph replays per measurement"
     )
     return parser.parse_args()
 

@@ -55,6 +55,7 @@ from aiter.ops.flydsl.kernels.mega_moe.dispatch import DispatchSlot, _load_fanou
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_buf_tensor
 
 WAVES = 4
+PACK_B = 4  # rows per step of a wave
 
 
 def _u64(x):
@@ -68,6 +69,7 @@ def build_pack(*, K, npes, epr, topk, mtpr, rank):
     PER = (UNITS + 63) // 64
     SC_I32 = K // 128  # e8m0 dwords per row
     assert SC_I32 <= 64
+    assert UNITS % 64 == 0, "the row copy moves 16 bytes per lane, whole waves"
 
     @flyc.kernel(
         name=f"sdma_s1_pack_k{K}_p{npes}_e{epr}_k{topk}_m{mtpr}_r{rank}",
@@ -130,52 +132,29 @@ def build_pack(*, K, npes, epr, topk, mtpr, rank):
         idx_p = ptr_buf_tensor(ids, fx.Int32)  # top-k global expert ids [tokens, topk]
         srcmap_remote = ptr_buf_tensor(srcmap_table[dest], fx.Int32)
         weight_remote = ptr_buf_tensor(weight_table[dest], fx.Int32)
-        for row in range(wave, count, fx.Int32(WAVES)):
-            wk = fx.Int32(
-                rocdl.readfirstlane(T.i32, fx.Int32(pair_order[src_base + row]))
-            )
-            token = group.select(wk & fx.Int32(0xFFFFFF), wk // fx.Int32(topk))
-            out_row = own.select(dst_base + row, src_base + row)
-            vs = []
-            for i in range_constexpr(PER):
-                u = lane + fx.Int32(64 * i)
-                ok = u < fx.Int32(UNITS)
-                vs.append(
-                    buffer_load(
-                        rs_x,
-                        token * fx.Int32(K // 4)
-                        + ok.select(u, fx.Int32(0)) * fx.Int32(4),
-                        vec_width=4,
-                        dtype=T.i32,
-                    )
-                )
-            sc = fx.Int32(
-                buffer_load(
-                    rs_sc,
-                    token * fx.Int32(SC_I32)
-                    + (lane < fx.Int32(SC_I32)).select(lane, fx.Int32(0)),
-                    vec_width=1,
-                    dtype=T.i32,
-                )
-            )
-            for i in range_constexpr(PER):
-                u = lane + fx.Int32(64 * i)
-                if u < fx.Int32(UNITS):
-                    buffer_store(
-                        vs[i], out_x, out_row * fx.Int32(K // 4) + u * fx.Int32(4)
-                    )
-            if lane < fx.Int32(SC_I32):
-                buffer_store(sc, out_sc, out_row * fx.Int32(SC_I32) + lane)
+        # This wave's rows (wave + WAVES * i), 64 at a time: the route headers lane-parallel
+        # (lane i = row i), then PACK_B rows per step with every load of the step before its
+        # stores -- vmcnt retires loads and stores in order, so one store-ack wait (and the
+        # headers' remote acks) covers PACK_B rows instead of one. Steps past the last row
+        # repeat it (same bytes, same place).
+        n_wave = (count - wave + fx.Int32(WAVES - 1)) // fx.Int32(WAVES)
+        for g in range(fx.Int32(0), n_wave, fx.Int32(64)):
+            n_g = n_wave - g
+            n_g = (n_g < fx.Int32(64)).select(n_g, fx.Int32(64))
+            valid = lane < n_g
+            row_l = wave + (g + valid.select(lane, fx.Int32(0))) * fx.Int32(WAVES)
+            wk_l = fx.Int32(pair_order[src_base + row_l])
+            token_l = group.select(wk_l & fx.Int32(0xFFFFFF), wk_l // fx.Int32(topk))
             # Route headers at the destination, as the production producer writes them.
-            if lane == fx.Int32(0):
-                source_key = fx.Int32(rank * mtpr) + token
+            if valid:
+                source_key = fx.Int32(rank * mtpr) + token_l
                 if group:
-                    members = (wk >> fx.Int32(24)) & fx.Int32(0xFF)
+                    members = (wk_l >> fx.Int32(24)) & fx.Int32(0xFF)
                     for slot in range_constexpr(topk):
                         if ((members >> fx.Int32(slot)) & fx.Int32(1)) != fx.Int32(0):
-                            route = token * fx.Int32(topk) + fx.Int32(slot)
+                            route = token_l * fx.Int32(topk) + fx.Int32(slot)
                             member_ge = fx.Int32(idx_p[route])
-                            hdr_row = fx.Int32(group_base[member_ge]) + row
+                            hdr_row = fx.Int32(group_base[member_ge]) + row_l
                             srcmap_remote[hdr_row] = source_key | (
                                 fx.Int32(slot) << fx.Int32(24)
                             )
@@ -183,10 +162,64 @@ def build_pack(*, K, npes, epr, topk, mtpr, rank):
                                 fx.Int32
                             )
                 else:
-                    slot = wk % fx.Int32(topk)
-                    srcmap_remote[dst_base + row] = source_key | (slot << fx.Int32(24))
-                    weight_remote[dst_base + row] = fx.Float32(wts_p[wk]).bitcast(
+                    slot = wk_l % fx.Int32(topk)
+                    srcmap_remote[dst_base + row_l] = source_key | (
+                        slot << fx.Int32(24)
+                    )
+                    weight_remote[dst_base + row_l] = fx.Float32(wts_p[wk_l]).bitcast(
                         fx.Int32
+                    )
+            for b0 in range(fx.Int32(0), n_g, fx.Int32(PACK_B)):
+                toks = []
+                out_rows = []
+                for j in range_constexpr(PACK_B):
+                    idx = b0 + fx.Int32(j)
+                    idx = (idx < n_g).select(idx, n_g - fx.Int32(1))
+                    toks.append(fx.Int32(rocdl.readlane(T.i32, token_l, idx)))
+                    row = wave + (g + idx) * fx.Int32(WAVES)
+                    out_rows.append(own.select(dst_base + row, src_base + row))
+                vss = []
+                scs = []
+                for j in range_constexpr(PACK_B):
+                    vss.append(
+                        [
+                            buffer_load(
+                                rs_x,
+                                toks[j] * fx.Int32(K // 4)
+                                + (lane + fx.Int32(64 * i)) * fx.Int32(4),
+                                vec_width=4,
+                                dtype=T.i32,
+                            )
+                            for i in range_constexpr(PER)
+                        ]
+                    )
+                    scs.append(
+                        fx.Int32(
+                            buffer_load(
+                                rs_sc,
+                                toks[j] * fx.Int32(SC_I32)
+                                + (lane < fx.Int32(SC_I32)).select(
+                                    lane, fx.Int32(SC_I32 - 1)
+                                ),
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                    )
+                for j in range_constexpr(PACK_B):
+                    for i in range_constexpr(PER):
+                        buffer_store(
+                            vss[j][i],
+                            out_x,
+                            out_rows[j] * fx.Int32(K // 4)
+                            + (lane + fx.Int32(64 * i)) * fx.Int32(4),
+                        )
+                    # Lanes past the e8m0 row repeat its last dword.
+                    buffer_store(
+                        scs[j],
+                        out_sc,
+                        out_rows[j] * fx.Int32(SC_I32)
+                        + (lane < fx.Int32(SC_I32)).select(lane, fx.Int32(SC_I32 - 1)),
                     )
         comm_ops.fence_system_release()
 
