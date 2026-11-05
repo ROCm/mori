@@ -174,7 +174,12 @@ def _build_moe(args, rank, world, device):
 
 
 def _make_sdma(moe, args):
-    return MegaMoEStage1Sdma(moe, scale_mode=args.scale_mode, shufflers=args.shufflers)
+    return MegaMoEStage1Sdma(
+        moe,
+        scale_mode=args.scale_mode,
+        shufflers=args.shufflers,
+        fuse_quant=args.fuse_quant,
+    )
 
 
 # --- Correctness and timing -----------------------------------------------------------
@@ -398,6 +403,13 @@ def _parse_args():
         type=int,
         default=4,
         help="shuffler workgroups in the shuffler mode",
+    )
+
+    common.add_argument(
+        "--fuse-quant",
+        action="store_true",
+        help="quantise straight into the send rows (route + qpack) instead of aiter's "
+        "prepare quantising and pack copying the rows",
     )
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])

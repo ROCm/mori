@@ -35,6 +35,12 @@ engines move them, and GEMM1 starts on an expert as soon as its rows have landed
            contiguous GEMM's layout; the other blocks run the 8-wave GEMM1 + SwiGLU, an
            expert's M-tiles waiting for its rows
 
+``fuse_quant=True`` folds the copy into the quantisation instead (``quant_pack``): aiter's
+prepare then only plans (its quant workgroups are not launched), ``route`` records where each
+token's rows go and writes the route headers, and ``qpack`` quantises each bf16 row once,
+straight into its slab / landing rows -- the same bytes as aiter's quantisation, without
+pack's extra read and write of every routed row.
+
 aiter's compact prepare (routing plan, ``TILE_INPUT_BASE``), Stage2 and combine are used
 as they are; only the Stage1 launch is replaced. ``install()`` swaps ``moe._s1_mega`` and
 ``moe._s1_mega_bundle`` for this op (``uninstall()`` restores them, or use it as a context
@@ -75,6 +81,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from gemm1_8wave_sdma import SCALE_MODES, compile_gemm1_8wave_sdma
 from pack import build_pack
+from quant_pack import build_quant_pack, build_route
 
 
 def _view(ptr, nbytes, device):
@@ -101,9 +108,11 @@ class MegaMoEStage1Sdma:
     ``scale_mode``: "auto", "shuffler" or "ldsw"; ``shufflers``: shuffler blocks in the
     shuffler mode. At 8192 the fused kernel alone took 2.04 / 1.84 / 1.83 ms with 1 / 2 / 4
     of them; 2 and 4 are within run-to-run noise of each other end to end.
+    ``fuse_quant``: quantise straight into the send rows (``quant_pack``) instead of pack;
+    ``moe`` must then be called with bf16 input (``forward``), the prepare's quant input.
     """
 
-    def __init__(self, moe, scale_mode="auto", shufflers=4):
+    def __init__(self, moe, scale_mode="auto", shufflers=4, fuse_quant=False):
         from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator
 
         assert scale_mode == "auto" or scale_mode in SCALE_MODES, scale_mode
@@ -166,6 +175,22 @@ class MegaMoEStage1Sdma:
         )
         self.kernels = {}
         self._prod = None
+        self.fuse_quant = bool(fuse_quant)
+        self._x_bf16 = (
+            None  # fuse_quant: this call's bf16 input, taken from the prepare
+        )
+        if self.fuse_quant:
+            self.inv = torch.full(
+                (moe.mtpr * moe.topk,), -1, dtype=torch.int32, device=dev
+            )
+            self.route = build_route(
+                npes=moe.world_size,
+                epr=moe.epr,
+                topk=moe.topk,
+                mtpr=moe.mtpr,
+                rank=moe.rank,
+            )
+            self.qpacks = {}  # per token count: one block per token
         torch.cuda.synchronize()
         self.comm.barrier()
 
@@ -236,20 +261,50 @@ class MegaMoEStage1Sdma:
         self.sig_base.add_(moe.epr + 1)
         self.cursor.zero_()
         base = self.mem.ptr
-        _run_compiled(
-            self.pack,
-            addr_disp,
-            addr_in_tok,
-            addr_in_sc,
-            addr_in_wts,
-            addr_in_idx,
-            addr_parity,
-            fx.Int64(base + self.off_slab_x),
-            fx.Int64(base + self.off_slab_sc),
-            fx.Int64(base + self.off_land_x),
-            fx.Int64(base + self.off_land_sc),
-            stream,
-        )
+        if self.fuse_quant:
+            assert (
+                self._x_bf16 is not None
+            ), "fuse_quant: no bf16 input from the prepare"
+            xb = self._x_bf16
+            tokens_now = int(xb.shape[0])
+            if tokens_now not in self.qpacks:
+                self.qpacks[tokens_now] = build_quant_pack(
+                    K=self.K, topk=moe.topk, rank=moe.rank, tokens=tokens_now
+                )
+            _run_compiled(
+                self.route,
+                addr_disp,
+                addr_in_wts,
+                addr_in_idx,
+                addr_parity,
+                fx.Int64(self.inv.data_ptr()),
+                stream,
+            )
+            _run_compiled(
+                self.qpacks[tokens_now],
+                fx.Int64(xb.data_ptr()),
+                fx.Int64(self.inv.data_ptr()),
+                fx.Int64(base + self.off_slab_x),
+                fx.Int64(base + self.off_slab_sc),
+                fx.Int64(base + self.off_land_x),
+                fx.Int64(base + self.off_land_sc),
+                stream,
+            )
+        else:
+            _run_compiled(
+                self.pack,
+                addr_disp,
+                addr_in_tok,
+                addr_in_sc,
+                addr_in_wts,
+                addr_in_idx,
+                addr_parity,
+                fx.Int64(base + self.off_slab_x),
+                fx.Int64(base + self.off_slab_sc),
+                fx.Int64(base + self.off_land_x),
+                fx.Int64(base + self.off_land_sc),
+                stream,
+            )
         _run_compiled(
             launch,
             self.land_x,  # A: the landing rows (production payload row numbers)
@@ -291,6 +346,15 @@ class MegaMoEStage1Sdma:
         if self._prod is None:
             self._prod = (self.moe._s1_mega, self.moe._s1_mega_bundle)
             self.moe._s1_mega, self.moe._s1_mega_bundle = self, self.bundle
+            if self.fuse_quant:
+                prepare = self.moe._run_compact_prepare
+
+                def run_prepare(*args, quant_input=None, **kw):
+                    # The prepare only plans; qpack quantises the bf16 input.
+                    self._x_bf16 = quant_input
+                    return prepare(*args, **kw)
+
+                self.moe._run_compact_prepare = run_prepare
         return self
 
     def uninstall(self):
@@ -298,6 +362,7 @@ class MegaMoEStage1Sdma:
         if self._prod is not None:
             self.moe._s1_mega, self.moe._s1_mega_bundle = self._prod
             self._prod = None
+            self.moe.__dict__.pop("_run_compact_prepare", None)
 
     def __enter__(self):
         return self.install()
