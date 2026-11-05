@@ -61,7 +61,8 @@ struct EpRequest {
   bool ll128CombineOnly = false;
   bool cardDedup = false;    // EpCfg.cardDedup; dispatch only
   int cardPullBlocks = 0;    // EpCfg.cardPullBlocks; with cardDedup only
-  bool cardLandSrc = false;  // EpCfg.cardLandSrc; with cardDedup only
+  bool cardLandSrc = false;  // EpCfg.cardLandSrc; with cardDedup or cardCombine only
+  int cardCombine = 0;       // EpCfg.cardCombine; a dispatch needs cardDedup with it
 };
 
 template <typename Self, typename Visit>
@@ -88,10 +89,11 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(cardDedup);
   MORI_FIELD(cardPullBlocks);
   MORI_FIELD(cardLandSrc);
+  MORI_FIELD(cardCombine);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 21,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 22,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();

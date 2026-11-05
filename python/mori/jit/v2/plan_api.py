@@ -77,8 +77,11 @@ DTYPES = {"bf16": 0, "fp32": 1, "fp8": 2, "fp4x2": 3}
 # so both are folded through _camel_to_snake before being looked up here.
 _OPTIONAL_REGIONS = frozenset({"out_scales", "fwd_map"})
 
-# ... and the Request field that makes each of them mandatory again.
-_REGION_REQUIRED_WHEN = {"out_scales": "scaleBytes", "fwd_map": "cardDedup"}
+# ... and the Request fields any one of which makes each of them mandatory again.
+_REGION_REQUIRED_WHEN = {
+    "out_scales": ("scaleBytes",),
+    "fwd_map": ("cardDedup", "cardCombine"),
+}
 
 # The C ABI + the plan registry both live here; op-libraries register INTO it.
 _ABI_NAME = "libmori_jit.so"
@@ -595,12 +598,12 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                         # field that turns the feature on is set, the kernel will
                         # dereference the offset and a 0 would alias region 0.
                         # Mechanism, not a comment telling callers to be careful.
-                        enabler = _REGION_REQUIRED_WHEN.get(canon)
-                        if enabler and int(req.get(enabler) or 0):
-                            raise KeyError(
-                                f"{kernel}: arena has no region {name!r}, but "
-                                f"{enabler}={req[enabler]} turns it on"
-                            ) from None
+                        for enabler in _REGION_REQUIRED_WHEN.get(canon, ()):
+                            if int(req.get(enabler) or 0):
+                                raise KeyError(
+                                    f"{kernel}: arena has no region {name!r}, but "
+                                    f"{enabler}={req[enabler]} turns it on"
+                                ) from None
                         # Optional and genuinely off: the kernel's `if constexpr`
                         # is what keeps the 0 from being dereferenced.
                         self._defaults[wire] = 0

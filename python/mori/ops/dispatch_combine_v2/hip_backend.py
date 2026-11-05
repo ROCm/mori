@@ -108,6 +108,8 @@ _DISPATCH_DTYPES = {
 _COMBINE_DTYPES = {torch.bfloat16: 2, torch.float32: 4}
 # Must match EpScaleAlign in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _SCALE_ALIGN = 128
+# cfg.card_combine -> EpCfg.cardCombine.
+_CARD_COMBINE = {"off": 0, "pull": 1, "push": 2}
 
 # Which tuning-table dtype column a dispatch dtype reads.
 _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
@@ -781,6 +783,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append("enable_std_moe (not implemented on the internode path)")
         if cfg.card_dedup:
             bad.append("card_dedup (the intranode gfx125x dispatch only)")
+        if cfg.card_combine != "off":
+            bad.append("card_combine (the intranode gfx125x push combine only)")
         if cfg.quant_type != "none":
             bad.append(
                 f"quant_type={cfg.quant_type!r} (the internode combine is unquantised)"
@@ -962,6 +966,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append("enable_std_moe (not implemented on the AsyncLL path)")
         if cfg.card_dedup:
             bad.append("card_dedup (the ordinary intranode gfx125x dispatch only)")
+        if cfg.card_combine != "off":
+            bad.append("card_combine (the ordinary intranode gfx125x push combine only)")
         if cfg.quant_type != "none":
             bad.append(
                 f"quant_type={cfg.quant_type!r} (AsyncLL transports unquantized)"
@@ -1026,6 +1032,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             comb["combine_fp4_f32_scale"] = True
         if cfg.quant_type == "fp8_blockwise":
             comb["combine_fp8"] = True
+        # Both halves carry it: the dispatch records what folds, the combine folds it,
+        # under the same landing rule.
+        card = _CARD_COMBINE[cfg.card_combine] if cfg.card_dedup else 0
+        if card:
+            disp["card_combine"] = card
+            comb["card_combine"] = card
+            if cfg.card_land == "src":
+                comb["card_land_src"] = True
         geom = self._ll128_geom
         if geom is not None and "dispatch" in geom:
             disp.update(
@@ -1054,13 +1068,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 card_dedup=False,
                 card_pull_blocks=0,
                 card_land_src=False,
+                card_combine=0,
                 combine_fp4=comb.get("combine_fp4", False),
                 combine_fp8=comb.get("combine_fp8", False),
                 call_tok_max=n,
                 block_num=disp_b,
                 warp_per_block=disp_w,
             ),
-            dict(comb, **ll, block_num=comb_b, warp_per_block=comb_w),
+            # Nothing of the small calls folds: their dispatch records nothing.
+            dict(
+                comb,
+                **ll,
+                card_combine=0,
+                card_land_src=False,
+                block_num=comb_b,
+                warp_per_block=comb_w,
+            ),
         )
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
@@ -1143,6 +1166,31 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     bad.append(
                         f"card_pull_blocks={cfg.card_pull_blocks} on {top} dispatch "
                         f"blocks: past the {self._multi_processor_count} CUs"
+                    )
+        if cfg.card_combine != "off":
+            # The C++ side (EpCardCombineOk) has the last word; these are the
+            # mistakes worth a message before anything is built.
+            if not cfg.card_dedup:
+                bad.append(f"card_combine={cfg.card_combine!r} without card_dedup")
+            if not push:
+                bad.append(
+                    f"card_combine={cfg.card_combine!r} with quant_type={q!r} "
+                    f"(the push combine only: {_PUSH_QUANT_TYPES})"
+                )
+            if cfg.world_size < 8:
+                bad.append(
+                    f"card_combine with world_size={cfg.world_size} (8 and up, where "
+                    "the push combine takes the split send)"
+                )
+            if self._ll128_geom is not None and "dispatch" not in self._ll128_geom:
+                bad.append("card_combine on an op whose every combine is the ll128 kernel")
+            for b, w in self._specs_from(cfg)[1]:
+                if w and w not in (8, 16, 24):
+                    bad.append(f"card_combine with {w}-warp combine blocks (8, 16 or 24)")
+                if b and -(-cfg.effective_max_recv // b) > 2048:
+                    bad.append(
+                        f"card_combine with {b} combine blocks: more than 2048 received "
+                        "rows a block"
                     )
         return tuple(bad)
 

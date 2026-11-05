@@ -275,9 +275,18 @@ struct EpCfg {
   // run, each as soon as its source stores the forward entry, which it does only once the row is
   // in place; no second launch. The grid is blockNum + cardPullBlocks, all resident at once.
   int cardPullBlocks = 0;
-  // Cfg.cardDedup only. Which partition a row both partitions of a card need lands on: tok & 1,
-  // or with this set the source's own, rank & 1. Both move the same bytes per partition on average.
+  // Cfg.cardDedup or Cfg.cardCombine only. Which partition a row both partitions of a card need
+  // lands on: tok & 1, or with this set the source's own, rank & 1. Both move the same bytes per
+  // partition on average. The combine after such a dispatch must carry the same value.
   bool cardLandSrc = false;
+  // gfx125x push combine (combineFp4 / combineFp8) after a cardDedup dispatch with the same value:
+  // the row partition S returns for a token whose row it copied in-card is added into the row its
+  // sibling L returns for that token, so the card's two rows cross the switch once on the way back
+  // too. 1: L reads S's row from S's combine input; 2: S writes it into a staging area at L
+  // (EpCardStageOff). On the dispatch the source also records, at L, which slot of S copies each
+  // row (the reverse map), and the pull marks the forward entries it consumed instead of clearing
+  // them; the combine clears both. A combine Cfg carries this without cardDedup.
+  int cardCombine = 0;
 };
 
 template <typename Self, typename Visit>
@@ -305,10 +314,11 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(cardDedup);
   MORI_FIELD(cardPullBlocks);
   MORI_FIELD(cardLandSrc);
+  MORI_FIELD(cardCombine);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 22, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 23, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -587,8 +597,26 @@ constexpr size_t EpRegionOutScalesBytes(const EpCfg& c) {
   return (size_t)EpMaxRecv(c) * EpScaleStride(c);
 }
 // Under Cfg.cardPullBlocks two words follow the map: the flag the first arriver sets once every
-// source has signalled, and the count of pull blocks that have finished.
+// source has signalled, and the count of pull blocks that have finished. Under Cfg.cardCombine,
+// past the 64 B those words take either way: the reverse map, 1 + the sibling's slot for each
+// slot (EpCardRevOff); a u64 a slot that the sibling sets to the combine's epoch + 1 once the row
+// to add is ready (EpCardFlagOff); and for cardCombine == 2 that row, a bf16 token a slot
+// (EpCardStageOff). They depend on EpMaxRecv only, so the dispatch and the combine Cfg agree; the
+// staging is sized by the combine Cfg, whose token it holds.
+constexpr size_t EpCardRevOff(const EpCfg& c) {
+  return EpAlignUp128((size_t)EpMaxRecv(c) * 4 + 64);
+}
+constexpr size_t EpCardFlagOff(const EpCfg& c) {
+  return EpAlignUp128(EpCardRevOff(c) + (size_t)EpMaxRecv(c) * 4);
+}
+constexpr size_t EpCardStageOff(const EpCfg& c) {
+  return EpAlignUp128(EpCardFlagOff(c) + (size_t)EpMaxRecv(c) * 8);
+}
 constexpr size_t EpRegionFwdMapBytes(const EpCfg& c) {
+  if (c.cardCombine != 0)
+    return EpCardStageOff(c) + (c.cardCombine == 2 && !c.cardDedup
+                                    ? (size_t)EpMaxRecv(c) * EpTokenBytes(c)
+                                    : 0);
   return c.cardDedup ? (size_t)EpMaxRecv(c) * 4 + (c.cardPullBlocks > 0 ? 64 : 0) : 0;
 }
 
@@ -600,6 +628,21 @@ constexpr bool EpCardDedupOk(const EpCfg& c) {
   return c.dtype != EpDType::Fp4x2 && !c.ll128 && c.worldSize % 2 == 0 && c.worldSize < 32 &&
          c.warpPerBlock > 8 && c.worldSize <= c.warpPerBlock && c.cardPullBlocks >= 0 &&
          c.cardPullBlocks <= 64;
+}
+
+// Rows one block of a Cfg.cardCombine combine may own: its send sorts them in a u16 table of
+// this many entries (EpFp4PermMax), and there is no unsorted fallback.
+constexpr int EpCardCombineRowsMax = 2048;
+
+// Cfg.cardCombine on the combine Cfg. The rows fold in the push combine's split send only
+// (EpFp4CombineSend), which it takes at eight ranks and up with 8 or 16 warps a block, or 24 on
+// the overlapped path; and every block's rows must fit the sort table.
+constexpr bool EpCardCombineOk(const EpCfg& c) {
+  return EpCombinePush(c) && !c.ll128 && !c.ll128CombineOnly && c.worldSize >= 8 &&
+         c.worldSize % 2 == 0 && c.worldSize < 32 &&
+         (c.warpPerBlock == 8 || c.warpPerBlock == 16 ||
+          (c.warpPerBlock == 24 && EpCombinePushOvlAny(c))) &&
+         (EpMaxRecv(c) + c.blockNum - 1) / c.blockNum <= EpCardCombineRowsMax;
 }
 
 // Per-warp LDS slab. The metadata tile and the payload tile share it (same
@@ -664,7 +707,11 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          // arrived pack into the 12 bits above the 20-bit total of a count word.
          (!c.aggReserve || (c.worldSize <= c.waveSize && c.blockNum < 4096)) &&
          (!c.cardDedup || EpCardDedupOk(c)) &&
-         (c.cardDedup || (c.cardPullBlocks == 0 && !c.cardLandSrc));
+         (c.cardDedup || (c.cardPullBlocks == 0 && (c.cardCombine != 0 || !c.cardLandSrc))) &&
+         // A dispatch Cfg (cardDedup) only records what the combine folds; a combine Cfg
+         // (cardCombine without cardDedup) does the folding, so only it has a send to check.
+         c.cardCombine >= 0 && c.cardCombine <= 2 &&
+         (c.cardCombine == 0 || c.cardDedup || EpCardCombineOk(c));
 }
 
 }  // namespace v2

@@ -97,6 +97,11 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 "card_dedup is the hip backend's gfx125x dispatch; pass "
                 "kernel_backend='hip' (or unset MORI_EP_CARD_DEDUP)",
             )
+        if cfg.card_combine != "off":
+            return (
+                "card_combine is the hip backend's gfx125x push combine; pass "
+                "kernel_backend='hip' (or unset MORI_EP_CARD_COMBINE)",
+            )
         return ()
 
     def __init__(self, cfg: EpDispatchCombineConfig, comm):

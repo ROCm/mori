@@ -224,8 +224,9 @@ class EpDispatchCombineConfig:
     # a node whose cards are each split into two partitions (DPX) with ranks 2c and
     # 2c + 1 on card c. A token both partitions of another card need crosses the
     # switch once; the partition it did not land on copies the row in-card, in a
-    # second launch at the end of dispatch(). Combine is unchanged. Every rank must
-    # set it alike: it adds an arena region. None => MORI_EP_CARD_DEDUP=1 turns it on.
+    # second launch at the end of dispatch(). Combine is unchanged unless
+    # card_combine is set. Every rank must set it alike: it adds an arena region.
+    # None => MORI_EP_CARD_DEDUP=1 turns it on.
     card_dedup: bool = None
     # card_dedup only. > 0: that many extra blocks copy the rows in while the
     # dispatch is still sending, each as soon as its source has finished writing it,
@@ -236,6 +237,14 @@ class EpDispatchCombineConfig:
     # "tok" alternates by token number, "src" picks the sender's own partition. None
     # => MORI_EP_CARD_LAND ("tok").
     card_land: str = None
+    # card_dedup with the fp8 / fp4 push combine only. On the way back the partition
+    # that copied a row in-card adds its row of that token into the row of the
+    # partition the dispatch landed it on, so the card returns one row for the two.
+    # "pull": the landing partition reads the other's row from its combine input;
+    # "push": the other partition writes it into a staging area beside the landing
+    # partition (one bf16 token a received slot, in the same arena region). "off"
+    # keeps the combine as it is. None => MORI_EP_CARD_COMBINE ("off").
+    card_combine: str = None
 
     def __post_init__(self):
         if self.card_dedup is None:
@@ -246,6 +255,12 @@ class EpDispatchCombineConfig:
             self.card_land = os.environ.get("MORI_EP_CARD_LAND", "tok")
         if self.card_land not in ("tok", "src"):
             raise ValueError(f"card_land={self.card_land!r} (have 'tok', 'src')")
+        if self.card_combine is None:
+            self.card_combine = os.environ.get("MORI_EP_CARD_COMBINE", "off")
+        if self.card_combine not in ("off", "pull", "push"):
+            raise ValueError(
+                f"card_combine={self.card_combine!r} (have 'off', 'pull', 'push')"
+            )
         # Node grouping first: is_internode gates checks further down, and the
         # derived defaults below are cheaper to reason about once it is fixed.
         if self.gpu_per_node is None:

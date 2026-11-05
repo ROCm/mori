@@ -105,10 +105,15 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     }
     c.ll128CombineOnly = true;
   }
+  if (req.cardCombine < 0 || req.cardCombine > 2) {
+    throw std::runtime_error("mori v2 ep: cardCombine is 0 (off), 1 (pull) or 2 (push), not " +
+                             std::to_string(req.cardCombine));
+  }
   if (req.cardDedup && isDispatch) {
     c.cardDedup = true;
     c.cardPullBlocks = req.cardPullBlocks;
     c.cardLandSrc = req.cardLandSrc;
+    c.cardCombine = req.cardCombine;
     if (arch.rfind("gfx125", 0) != 0 || !EpCardDedupOk(c)) {
       throw std::runtime_error(
           "mori v2 ep: cardDedup needs gfx125x, a bf16 / fp8 / fp32 dispatch without ll128, an "
@@ -117,8 +122,24 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
           std::to_string(c.worldSize) + " warps=" + std::to_string(c.warpPerBlock) +
           " pullBlocks=" + std::to_string(c.cardPullBlocks) + ")");
     }
-  } else if (isDispatch && (req.cardPullBlocks != 0 || req.cardLandSrc)) {
-    throw std::runtime_error("mori v2 ep: cardPullBlocks and cardLandSrc need cardDedup");
+  } else if (isDispatch && (req.cardPullBlocks != 0 || req.cardLandSrc || req.cardCombine != 0)) {
+    throw std::runtime_error(
+        "mori v2 ep: cardPullBlocks, cardLandSrc and cardCombine need cardDedup");
+  } else if (!isDispatch && req.cardCombine != 0) {
+    // The combine half of a cardDedup pair: no cardDedup of its own, only the fold and the
+    // landing rule it has to agree with the dispatch on.
+    c.cardCombine = req.cardCombine;
+    c.cardLandSrc = req.cardLandSrc;
+    if (arch.rfind("gfx125", 0) != 0 || !EpCardCombineOk(c)) {
+      throw std::runtime_error(
+          "mori v2 ep: cardCombine needs gfx125x, the fp4 / fp8 push combine without ll128, an "
+          "even worldSize from 8 to 30, 8 or 16 warps a block (or 24 on the overlapped send), "
+          "and at most " +
+          std::to_string(EpCardCombineRowsMax) + " rows a block (world=" +
+          std::to_string(c.worldSize) + " warps=" + std::to_string(c.warpPerBlock) +
+          " blocks=" + std::to_string(c.blockNum) + " maxRecv=" + std::to_string(EpMaxRecv(c)) +
+          ")");
+    }
   }
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
@@ -240,7 +261,7 @@ std::string EpRegionInfo(const EpCfg& c, EpKernelKind kind) {
          EpKv("region.outTok", disp ? 0 : EpRegionOutTokBytes(c)) +
          EpKv("region.xdb", EpRegionXdbBytes(c)) +
          EpKv("region.outScales", disp ? EpRegionOutScalesBytes(c) : 0) +
-         EpKv("region.fwdMap", disp ? EpRegionFwdMapBytes(c) : 0);
+         EpKv("region.fwdMap", disp || c.cardCombine != 0 ? EpRegionFwdMapBytes(c) : 0);
 }
 
 }  // namespace

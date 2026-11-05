@@ -342,10 +342,59 @@ def test_card_pull_blocks_run_past_the_senders_and_add_two_words():
     assert (src["cardLandSrc"], src["gridX"], src["region.fwdMap"]) == (True, 64, 4096 * 4)
 
 
-@pytest.mark.parametrize("kw", [dict(card_pull_blocks=16), dict(card_land_src=True)])
+@pytest.mark.parametrize(
+    "kw", [dict(card_pull_blocks=16), dict(card_land_src=True), dict(card_combine=1)]
+)
 def test_card_dedup_knobs_need_card_dedup(kw):
     with pytest.raises(RuntimeError, match="need cardDedup"):
         cb.EpDispatchPlan.describe(**_CARD_KW, **kw)
+
+
+_CARD_COMB_KW = dict(_CARD_KW, warp_per_block=8, combine_fp8=True)
+
+
+def _up128(n):
+    return (n + 127) // 128 * 128
+
+
+def test_card_combine_lays_out_the_reverse_map_flags_and_staging():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_combine is gfx125x only")
+    rev = _up128(4096 * 4 + 64)
+    flags = _up128(rev + 4096 * 4)
+    stage = _up128(flags + 4096 * 8)
+    disp = cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True, card_combine=2)
+    assert (disp["cardCombine"], disp["region.fwdMap"]) == (2, stage)
+    # The combine carries the fold, not cardDedup; only push adds the bf16 staging.
+    pull = cb.EpCombinePlan.describe(**_CARD_COMB_KW, card_combine=1)
+    push = cb.EpCombinePlan.describe(**_CARD_COMB_KW, card_combine=2, card_land_src=True)
+    assert (pull["cardDedup"], pull["cardCombine"], pull["region.fwdMap"]) == (False, 1, stage)
+    assert (push["cardCombine"], push["cardLandSrc"]) == (2, True)
+    assert push["region.fwdMap"] == stage + 4096 * 7168 * 2
+    # A combine without it keeps its Cfg, and the landing rule alone does nothing.
+    plain = cb.EpCombinePlan.describe(**_CARD_COMB_KW, card_land_src=True)
+    assert (plain["cardCombine"], plain["cardLandSrc"], plain["region.fwdMap"]) == (0, False, 0)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(combine_fp8=False),  # the bf16 combine: no split send
+        dict(world_size=4),  # below eight ranks the push combine sends per warp
+        dict(warp_per_block=12),
+        dict(block_num=1),  # 4096 rows in one block, past the sort table
+    ],
+)
+def test_card_combine_rejects_a_combine_without_the_split_send(kw):
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_combine is gfx125x only")
+    with pytest.raises(RuntimeError, match="cardCombine needs"):
+        cb.EpCombinePlan.describe(**{**_CARD_COMB_KW, "card_combine": 1, **kw})
+
+
+def test_card_combine_is_off_pull_or_push():
+    with pytest.raises(RuntimeError, match="cardCombine is 0"):
+        cb.EpCombinePlan.describe(**_CARD_COMB_KW, card_combine=3)
 
 
 def _reference_regions(
