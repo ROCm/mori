@@ -44,6 +44,7 @@ from mori.jit.config import (
     get_mori_source_root,
     is_debuginfo_enabled,
     is_profiler_enabled,
+    is_resource_usage_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -486,7 +487,22 @@ def _hipcc_genco(
         cmd.extend(["-I", str(d)])
     cmd.extend([str(source), "-o", str(output)])
 
-    subprocess.check_call(cmd, stderr=subprocess.STDOUT)
+    if not is_resource_usage_enabled():
+        subprocess.check_call(cmd, stderr=subprocess.STDOUT)
+        return
+
+    # Captured and printed in one write so reports from kernels compiled in parallel by
+    # precompile() do not interleave.
+    cmd.append("-Rpass-analysis=kernel-resource-usage")
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    print(
+        f"[mori-jit] kernel resource usage: {source.name} ({cfg.arch})\n{result.stdout}",
+        end="",
+        flush=True,
+    )
+    result.check_returncode()
 
 
 _PARALLEL_KERNEL_GROUPS: dict[str, list[str]] = {
