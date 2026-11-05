@@ -75,10 +75,10 @@ DTYPES = {"bf16": 0, "fp32": 1, "fp8": 2, "fp4x2": 3}
 # Keyed by the snake_case region name: the region key comes from the C++ launch
 # argument (offOutScales -> "outScales") while an arena names it "out_scales",
 # so both are folded through _camel_to_snake before being looked up here.
-_OPTIONAL_REGIONS = frozenset({"out_scales"})
+_OPTIONAL_REGIONS = frozenset({"out_scales", "fwd_map"})
 
 # ... and the Request field that makes each of them mandatory again.
-_REGION_REQUIRED_WHEN = {"out_scales": "scaleBytes"}
+_REGION_REQUIRED_WHEN = {"out_scales": "scaleBytes", "fwd_map": "cardDedup"}
 
 # The C ABI + the plan registry both live here; op-libraries register INTO it.
 _ABI_NAME = "libmori_jit.so"

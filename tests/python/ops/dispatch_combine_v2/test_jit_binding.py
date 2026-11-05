@@ -290,6 +290,43 @@ def test_every_arena_region_is_reported_in_args_order():
         assert [k[len("region.") :] for k in info if k.startswith("region.")] == stems
 
 
+_CARD_KW = dict(world_size=8, max_tok_per_rank=512, max_recv=4096, warp_per_block=16)
+
+
+def _without_card_dedup(info):
+    return {k: v for k, v in info.items() if k not in ("cardDedup", "region.fwdMap")}
+
+
+def test_card_dedup_adds_a_forward_map_and_nothing_else():
+    off = cb.EpDispatchPlan.describe(**_CARD_KW)
+    if not off["sharedBytes"]:
+        with pytest.raises(RuntimeError, match="cardDedup needs gfx125x"):
+            cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True)
+        return
+    on = cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True)
+    assert (off["cardDedup"], off["region.fwdMap"]) == (False, 0)
+    assert (on["cardDedup"], on["region.fwdMap"]) == (True, 4096 * 4)
+    assert _without_card_dedup(on) == _without_card_dedup(off)
+    # Dispatch only: combine keeps its Cfg, and with it its cache entry.
+    comb = cb.EpCombinePlan.describe(**_CARD_KW, card_dedup=True)
+    assert (comb["cardDedup"], comb["region.fwdMap"]) == (False, 0)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(world_size=7),  # no partner for rank 6
+        dict(warp_per_block=8),  # the first payload goes out during the assignment
+        dict(hidden_dim=3584, dtype="fp4x2"),  # the packed fp4 payload paths
+    ],
+)
+def test_card_dedup_rejects_a_cfg_whose_payload_takes_another_path(kw):
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    with pytest.raises(RuntimeError, match="cardDedup needs"):
+        cb.EpDispatchPlan.describe(**dict(_CARD_KW, card_dedup=True, **kw))
+
+
 def _reference_regions(
     ws, hidden, max_tok, topk, disp_tok, comb_tok, scale, push, wave, gfx125x
 ):

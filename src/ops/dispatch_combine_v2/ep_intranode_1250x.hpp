@@ -742,6 +742,57 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
     __hip_atomic_store(_llSeq + blockIdx.x, seq, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
+// Cfg.cardDedup at the source: true when the row of token tok for destPe stays on destPe's sibling
+// partition, destPe ^ 1. That is when destPe is on another card, the sibling is a destination of
+// the token too, and destPe is not the partition the token lands on, tok & 1. Lane 0 then stores
+// destPe's forward entry, 1 + the sibling's slot, in place of the payload; the metadata goes to
+// destPe as to any destination. Uniform across the warp, as its arguments are.
+template <EpCfg kCfg>
+__device__ __forceinline__ bool EpCardSkip(const EpArgs& args, EpWinC win, int myPe, int tok,
+                                           index_t flatMe, index_t peMe, int validMe,
+                                           index_t destPe, index_t destTokId) {
+  if (((destPe ^ myPe) >> 1) == 0 || (destPe & 1) == (tok & 1)) return false;
+  const unsigned long long sib = __ballot(validMe && peMe == (destPe ^ 1));
+  if (sib == 0ull) return false;
+  const index_t sibFlat = __shfl(flatMe, __ffsll((long long)sib) - 1);
+  if ((threadIdx.x & (kCfg.waveSize - 1)) == 0)
+    EpPeer<index_t>(win, destPe, args.offFwdMap)[destTokId] =
+        EpLocalTokFromFlat<kCfg>(sibFlat) + 1;
+  return true;
+}
+
+// Cfg.cardDedup, the launch with EpArgs.cardPull set, after this rank's dispatch on the same
+// stream. Entry i of this rank's forward map is 0, or 1 + the slot at which the sibling partition
+// (rank ^ 1) holds the row of slot i (EpCardSkip). A warp a slot copies that row from the
+// sibling's dispOut to slot i through its tile, then clears the entry for the next call.
+// The rows are in place: a source signals this rank only once its stores to the sibling are
+// complete, and the dispatch returned only after every signal. The entries are clear before this
+// rank enters combine's cross-device barrier, and no source writes the next call's before that.
+template <EpCfg kCfg, typename T>
+__device__ void EpCardPull1250x(const EpArgs& args) {
+  constexpr int WS = kCfg.waveSize;
+  constexpr int kSlabBytes = EpDispatch1250xSlabBytes(kCfg);
+  const int warpId = threadIdx.x / WS;
+  const int aWarps = (int)gridDim.x * kCfg.warpPerBlock;
+  const EpWinC win{args.window};
+  extern __shared__ char _tdmBatchSmem[];
+  T* const tile = reinterpret_cast<T*>(_tdmBatchSmem + (size_t)warpId * kSlabBytes);
+  const gfx1250_TDM_GROUP1 g1 = TdmShape<T>(kCfg.hiddenDim);
+  index_t* const fwd = EpLocal<index_t>(win, args.offFwdMap);
+  const T* const sib = EpPeer<T>(win, args.rank ^ 1, args.offDispOut);
+  T* const out = EpLocal<T>(win, args.offDispOut);
+  const int n = *args.totalRecvTokenNum;
+  for (int i = (int)blockIdx.x * kCfg.warpPerBlock + warpId; i < n; i += aWarps) {
+    const index_t f = __builtin_amdgcn_readfirstlane(fwd[i]);
+    if (f == 0) continue;
+    TdmIssueLoad<T>(tile, sib + (size_t)(f - 1) * kCfg.hiddenDim, g1);
+    __builtin_amdgcn_s_wait_tensorcnt(0);
+    TdmIssueStore<T>(out + (size_t)i * kCfg.hiddenDim, tile, g1);
+    __builtin_amdgcn_s_wait_tensorcnt(0);
+    if ((threadIdx.x & (WS - 1)) == 0) fwd[i] = 0;
+  }
+}
+
 template <EpCfg kCfg, typename T>
 __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) {
   // The macro sizes the staging, the Cfg drives the copies. They come from the same
@@ -761,6 +812,12 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   if constexpr (kCfg.ll128) {
     EpDispatchLl1250x<kCfg, T>(args);
     return;
+  }
+  if constexpr (kCfg.cardDedup) {
+    if (args.cardPull) {
+      EpCardPull1250x<kCfg, T>(args);
+      return;
+    }
   }
 
   // Staging pointers from the dynamically-allocated base.  The EpStaging*Offset
@@ -1033,6 +1090,9 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
       (long long)npes * kRbPeerB <= (long long)(kCfg.warpPerBlock - kEpTokChunk) * kSlabBytes;
   const bool _ldsMeta = kLdsMeta && _tokChunk && _etpi == 1 && _preKOk && _dedupOk &&
                         args.tokenIndices && args.inpTokenBuf && (kEpScaleBytes == 0 || _scWave);
+  static_assert(!kCfg.cardDedup || (!kUnitGeom && !kDPin && !kPayFirst && !kScPayOn && !kLdsMeta),
+                "cardDedup skips the payload in the general loops only, so EpCardDedupOk must keep "
+                "every other payload path out of the build");
   [[maybe_unused]] index_t _ldsJ = -1;
   bool _mDirect = false;
   const bool _bdOk = (_etpi == 1);
@@ -2628,6 +2688,13 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                 index_t flat = __shfl(flatMe, l);
                 index_t destPe = EpPeFromFlat<kCfg>(flat);
                 index_t destTokId = EpLocalTokFromFlat<kCfg>(flat);
+                if constexpr (kCfg.cardDedup) {
+                  if (EpCardSkip<kCfg>(args, win, myPe, tok, flatMe, peMe, validMe, destPe,
+                                       destTokId)) {
+                    _mDirect = true;
+                    continue;
+                  }
+                }
                 if (!loadWaited) {
                   __builtin_amdgcn_s_wait_tensorcnt(0);
                   loadWaited = true;
@@ -2722,6 +2789,13 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
               index_t flat = __shfl(flatMe, l);
               index_t destPe = EpPeFromFlat<kCfg>(flat);
               index_t destTokId = EpLocalTokFromFlat<kCfg>(flat);
+              if constexpr (kCfg.cardDedup) {
+                if (EpCardSkip<kCfg>(args, win, myPe, tok, flatMe, peMe, validMe, destPe,
+                                     destTokId)) {
+                  _mDirect = true;
+                  continue;
+                }
+              }
               if (!loadWaited) {
                 if (!kPayFirst || !__builtin_amdgcn_readfirstlane((int)(_payPre && _mPend)))
                   __builtin_amdgcn_s_wait_tensorcnt(0);

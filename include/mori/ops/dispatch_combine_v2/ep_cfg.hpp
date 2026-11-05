@@ -157,6 +157,13 @@ struct EpArgs {
   int* recvIdx = nullptr;
 
   int numTokens = 0;  // tokens this rank contributes this call
+
+  // Cfg.cardDedup only, and last so that no other field moves. cardPull = 1: this launch only
+  // copies in the rows the forward map names (EpCardPull1250x); the dispatch proper passes 0.
+  int cardPull = 0;
+  // index_t[maxRecv]: 1 + the sibling partition's slot holding this slot's row, 0 = none. The
+  // arena carries the region only when Cfg.cardDedup is set; otherwise this stays 0, unread.
+  unsigned long long offFwdMap = 0;
 };
 
 // The wire schema, generated from the field list rather than kept parallel to it.
@@ -192,7 +199,9 @@ struct EpArgs {
   X(stagingBase, "p")          \
   X(recvToSrc, "p")            \
   X(recvIdx, "p")              \
-  X(numTokens, "i32")
+  X(numTokens, "i32")          \
+  X(cardPull, "i32")           \
+  X(offFwdMap, "u64")
 
 #define MORI_EP_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
 // Trailing comma: the binding skips empty items, and a separator rule that does
@@ -215,7 +224,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 28,
+static_assert(detail::kEpArgsFieldCount == 30,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),
@@ -256,6 +265,12 @@ struct EpCfg {
   int callTokMax = 0;
   bool ll128 = false;
   bool ll128CombineOnly = false;
+  // Dispatch only, gfx125x: card-level dedup for a node whose cards are split in two (DPX), ranks
+  // 2c and 2c + 1 being card c's partitions. A token both partitions of another card need crosses
+  // the switch once, to partition (token & 1); the other gets the metadata and a forward entry in
+  // place of the payload, and copies the row in-card in a second launch (EpArgs.cardPull). The
+  // pairing decides only how many bytes it saves, never what lands. Off is free, as scaleBytes is.
+  bool cardDedup = false;
 };
 
 template <typename Self, typename Visit>
@@ -280,10 +295,11 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
   MORI_FIELD(ll128CombineOnly);
+  MORI_FIELD(cardDedup);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 19, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 20, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -561,6 +577,18 @@ constexpr size_t EpRegionXdbBytes(const EpCfg& c) { return 8 * (size_t)c.worldSi
 constexpr size_t EpRegionOutScalesBytes(const EpCfg& c) {
   return (size_t)EpMaxRecv(c) * EpScaleStride(c);
 }
+constexpr size_t EpRegionFwdMapBytes(const EpCfg& c) {
+  return c.cardDedup ? (size_t)EpMaxRecv(c) * 4 : 0;
+}
+
+// Cfg.cardDedup skips the payload in the dispatch's general loops only, so no other payload path
+// may be built: no fp4 packing (the unit and pinned paths), more than kEpTokChunk = 8 warps a block
+// and at least one a rank (else the first payload is issued during the assignment), and fewer than
+// 32 ranks (else the scale rows ride with the payload). EpDispatch1250xBody asserts the same.
+constexpr bool EpCardDedupOk(const EpCfg& c) {
+  return c.dtype != EpDType::Fp4x2 && !c.ll128 && c.worldSize % 2 == 0 && c.worldSize < 32 &&
+         c.warpPerBlock > 8 && c.worldSize <= c.warpPerBlock;
+}
 
 // Per-warp LDS slab. The metadata tile and the payload tile share it (same
 // address, different phases), so its size bounds BOTH -- and the metadata batch
@@ -622,7 +650,8 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          c.scaleBytes >= 0 && (c.scaleBytes % 4) == 0 &&
          // aggReserve: lane p of warp 0 reserves destination p, and the blocks
          // arrived pack into the 12 bits above the 20-bit total of a count word.
-         (!c.aggReserve || (c.worldSize <= c.waveSize && c.blockNum < 4096));
+         (!c.aggReserve || (c.worldSize <= c.waveSize && c.blockNum < 4096)) &&
+         (!c.cardDedup || EpCardDedupOk(c));
 }
 
 }  // namespace v2

@@ -79,6 +79,7 @@ _REGIONS = {
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
+    "fwdMap": "fwd_map",  # only laid out when card_dedup is on; binds to 0 otherwise
 }
 
 _LL_REGIONS = dict(
@@ -778,6 +779,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append("combine_mode='scatter' (the internode kernels gather)")
         if cfg.enable_std_moe:
             bad.append("enable_std_moe (not implemented on the internode path)")
+        if cfg.card_dedup:
+            bad.append("card_dedup (the intranode gfx125x dispatch only)")
         if cfg.quant_type != "none":
             bad.append(
                 f"quant_type={cfg.quant_type!r} (the internode combine is unquantised)"
@@ -957,6 +960,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append("combine_mode='scatter' (the AsyncLL combine gathers)")
         if cfg.enable_std_moe:
             bad.append("enable_std_moe (not implemented on the AsyncLL path)")
+        if cfg.card_dedup:
+            bad.append("card_dedup (the ordinary intranode gfx125x dispatch only)")
         if cfg.quant_type != "none":
             bad.append(
                 f"quant_type={cfg.quant_type!r} (AsyncLL transports unquantized)"
@@ -1008,6 +1013,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # rejects a Cfg whose row is not a whole number of them.
             scale_bytes=self._scale_i32(cfg) * 4,
         )
+        if cfg.card_dedup:
+            disp["card_dedup"] = True
         comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
         if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
             comb["combine_fp4"] = True
@@ -1039,6 +1046,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dict(
                 disp,
                 **ll,
+                # The small calls' kernel; card_dedup is the ordinary dispatch's.
+                card_dedup=False,
                 combine_fp4=comb.get("combine_fp4", False),
                 combine_fp8=comb.get("combine_fp8", False),
                 call_tok_max=n,
@@ -1105,6 +1114,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 f"max_total_recv_tokens below the worst case "
                 f"({cfg.effective_max_recv} < {worst}); token dropping is not implemented"
             )
+        if cfg.card_dedup:
+            if not self._is1250:
+                bad.append("card_dedup (the gfx125x dispatch only)")
+            if cfg.is_fp4:
+                bad.append("card_dedup with an fp4 dispatch (bf16 / fp8 / fp32 only)")
+            if cfg.world_size % 2 or cfg.world_size >= 32:
+                bad.append(
+                    f"card_dedup with world_size={cfg.world_size}: ranks 2c and 2c + 1 "
+                    "are card c's partitions, so it needs an even count, below 32"
+                )
+            if self._ll128_geom is not None and "dispatch" in self._ll128_geom:
+                bad.append("card_dedup on an op whose every dispatch is the ll128 kernel")
         return tuple(bad)
 
     _INTERNODE_DTYPE = {
@@ -2099,6 +2120,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return sorted(caps)
 
     def _wrap_dispatch(self, sized, ll=False):
+        # card_dedup: the same plan launched again with card_pull=1, on the same
+        # stream, copies in the rows the sources left on this rank's sibling
+        # partition. Both launches pass the same argument names, which is what keeps
+        # the plan's cached argument struct (_launch_buf) from being rebuilt each time.
+        pull = self.cfg.card_dedup and not ll
+
         def run(
             *,
             input,
@@ -2115,8 +2142,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"call size {sized[-1][0]}"
                 )
             count = self._ll_recv if ll else self._recv
-            plan.launch(
-                stream=torch.cuda.current_stream().cuda_stream,
+            stream = torch.cuda.current_stream().cuda_stream
+            args = dict(
                 token_indices=indices,
                 inp_token_buf=input,
                 weights_buf=weights,
@@ -2127,6 +2154,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 grid_barrier=self.dispatch_barrier,
                 num_tokens=num_tokens,
             )
+            if pull:
+                plan.launch(stream=stream, card_pull=0, **args)
+                plan.launch(stream=stream, card_pull=1, **args)
+            else:
+                plan.launch(stream=stream, **args)
             self.total_recv = count
             self._ll_last = ll
 

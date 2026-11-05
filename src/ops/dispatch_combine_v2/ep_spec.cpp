@@ -105,6 +105,15 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     }
     c.ll128CombineOnly = true;
   }
+  if (req.cardDedup && isDispatch) {
+    c.cardDedup = true;
+    if (arch.rfind("gfx125", 0) != 0 || !EpCardDedupOk(c)) {
+      throw std::runtime_error(
+          "mori v2 ep: cardDedup needs gfx125x, a bf16 / fp8 / fp32 dispatch without ll128, an "
+          "even worldSize below 32, and more than 8 warps a block and at least one a rank (world=" +
+          std::to_string(c.worldSize) + " warps=" + std::to_string(c.warpPerBlock) + ")");
+    }
+  }
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
   // but combine sums across sources, so a byte type there would compile and
@@ -224,7 +233,8 @@ std::string EpRegionInfo(const EpCfg& c, EpKernelKind kind) {
          EpKv("region.dispOut", disp ? EpRegionDispOutBytes(c) : 0) +
          EpKv("region.outTok", disp ? 0 : EpRegionOutTokBytes(c)) +
          EpKv("region.xdb", EpRegionXdbBytes(c)) +
-         EpKv("region.outScales", disp ? EpRegionOutScalesBytes(c) : 0);
+         EpKv("region.outScales", disp ? EpRegionOutScalesBytes(c) : 0) +
+         EpKv("region.fwdMap", disp ? EpRegionFwdMapBytes(c) : 0);
 }
 
 }  // namespace

@@ -92,6 +92,11 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 "'hip' backend implements; pass kernel_backend='hip' (or set "
                 "MORI_V2_KERNEL_BACKEND=hip)",
             )
+        if cfg.card_dedup:
+            return (
+                "card_dedup is the hip backend's gfx125x dispatch; pass "
+                "kernel_backend='hip' (or unset MORI_EP_CARD_DEDUP)",
+            )
         return ()
 
     def __init__(self, cfg: EpDispatchCombineConfig, comm):

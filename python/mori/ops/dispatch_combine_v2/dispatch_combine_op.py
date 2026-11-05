@@ -220,8 +220,17 @@ class EpDispatchCombineConfig:
     # op's send. With the ops on separate streams, a two-op microbenchmark is
     # slower but DeepSeek-V4 prefill was still faster, so measure that case.
     async_ll_own_sdma_queue: bool = False
+    # Card-level dedup of the dispatch payload (hip backend, gfx125x, one node), for
+    # a node whose cards are each split into two partitions (DPX) with ranks 2c and
+    # 2c + 1 on card c. A token both partitions of another card need crosses the
+    # switch once; the partition it did not land on copies the row in-card, in a
+    # second launch at the end of dispatch(). Combine is unchanged. Every rank must
+    # set it alike: it adds an arena region. None => MORI_EP_CARD_DEDUP=1 turns it on.
+    card_dedup: bool = None
 
     def __post_init__(self):
+        if self.card_dedup is None:
+            self.card_dedup = os.environ.get("MORI_EP_CARD_DEDUP", "0") == "1"
         # Node grouping first: is_internode gates checks further down, and the
         # derived defaults below are cheaper to reason about once it is fixed.
         if self.gpu_per_node is None:
