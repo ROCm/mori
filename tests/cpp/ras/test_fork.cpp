@@ -45,6 +45,10 @@ TEST(RasFork, AForkedChildHasNoRuntimeAndLeavesTheParentsAlone) {
               RasRuntime* parent = RasRuntime::EnsureStarted(Params());
               CHILD_CHECK(parent != nullptr);
               RasEndpoint before = parent->Endpoint();
+              // Fork once the RAS thread is idle: LeakSanitizer in the child would report what
+              // that thread holds only on its stack, since the thread isn't in the child.
+              CHILD_CHECK(ras_test::WaitFor(
+                  [&] { return parent->Snapshot().self.uuid == before.uuid; }, 2000));
 
               auto forked = std::chrono::steady_clock::now();
               int rc = RunInChild([] {
