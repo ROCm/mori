@@ -63,12 +63,16 @@ _MODULE_NAME = "libmori_kiwi_ep_pybinds"
 _ext = None
 
 
+def _ext_path():
+    pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(pkg_dir, f"{_MODULE_NAME}.so")
+
+
 def _load_ext():
     global _ext
     if _ext is not None:
         return _ext
-    pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(pkg_dir, f"{_MODULE_NAME}.so")
+    path = _ext_path()
     if not os.path.exists(path):
         raise ImportError(
             f"{path} not found; build mori with BUILD_OPS_KIWI=ON to use the KIWI EP kernels"
@@ -81,12 +85,12 @@ def _load_ext():
 
 
 def is_available():
-    """Whether this mori build includes the KIWI EP kernels (BUILD_OPS_KIWI=ON)."""
-    try:
-        _load_ext()
-    except ImportError:
-        return False
-    return True
+    """Whether this mori build includes the KIWI EP kernels (BUILD_OPS_KIWI=ON).
+
+    A build that includes them but fails to load raises when the op is
+    constructed rather than reporting False.
+    """
+    return os.path.exists(_ext_path())
 
 
 @dataclass
