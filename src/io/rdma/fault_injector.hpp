@@ -142,6 +142,9 @@ class FaultInjector final : public VerbsOps {
   std::unordered_map<ibv_cq*, ibv_context*> deadCqs_;
   std::unordered_set<ibv_context*> deadDevices_;
   std::atomic<bool> hasDeadResources_{false};
+  std::atomic<bool> hasMarkers_{false};
+  std::unordered_map<ibv_context*, std::unordered_map<ibv_cq*, std::unordered_set<uint64_t>>>
+      markerIds_;
   std::map<PortKey, DownPort> downPorts_;
   std::condition_variable timerCv_;
   std::thread timer_;

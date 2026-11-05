@@ -217,6 +217,8 @@ class SubmissionLedger {
   void CancelReservation(int count);
   void NotifyAdmission();
   void WaitForChange(int timeoutMs);
+  QuiescenceState EnsureCovered(uint64_t seq);
+  void DrivePending();
   void Close(bool freeze = false);
   void FreezeForShutdown();
   bool Closed() const;
@@ -255,6 +257,7 @@ class SubmissionLedger {
   };
 
   bool TryReserve(int count, int limit);
+  bool DriveMarkerLocked();
   PostResult PostToSqLocked(ibv_qp* qp, ibv_send_wr* first, int count, Kind kind,
                             const std::shared_ptr<CqCallbackMeta>& meta, int batchSize,
                             bool finalBatch, TransferUniqueId transferId, size_t bytes,
@@ -272,8 +275,11 @@ class SubmissionLedger {
   std::atomic<uint64_t> state_{0};
   std::atomic<int> used_{0};
   SqAdmissionEvent admission_;
+  ibv_qp* qp_{nullptr};
+  VerbsOps* verbs_{nullptr};
+  bool markerRejected_{false};
   bool markerOutstanding_{false};
-  uint64_t pendingTarget_{0};
+  std::atomic<uint64_t> pendingTarget_{0};
 };
 
 // A verbs async event that means outstanding work can never complete. Scope says

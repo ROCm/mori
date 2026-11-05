@@ -378,6 +378,20 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                              TransferUniqueId id, bool isRead, int postBatchSize,
                              const RdmaTransferControl& control) {
   MORI_IO_FUNCTION_TIMER;
+  struct CoverOnFailure {
+    const EpPairVec& eps;
+    const std::shared_ptr<CqCallbackMeta>& meta;
+    size_t base;
+    bool succeeded{false};
+    ~CoverOnFailure() {
+      if (succeeded || meta->target.empty()) return;
+      for (size_t i = 0; i < eps.size(); ++i) {
+        auto seq = meta->target[base + i].second;
+        if (seq) eps[i].ledger->EnsureCovered(seq);
+      }
+    }
+  } coverage{eps, callbackMeta, control.targetBase};
+
   // ADDITIVE (MORI_ROCTX=1): brackets host submission for this generic RDMA I/O
   // batch; both reads and writes route here.
   // bytes= carries the whole-call payload (sum of the per-request sizes).
@@ -737,6 +751,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     }
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
+  coverage.succeeded = true;
   return {StatusCode::IN_PROGRESS, ""};
 }
 

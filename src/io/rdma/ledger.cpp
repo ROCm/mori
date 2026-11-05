@@ -118,7 +118,8 @@ QuiescenceState CqCallbackMeta::Quiescence(int waitMs) {
       auto ledger = weak.lock();
       if (!ledger) return QuiescenceState::Unprovable;
       if (ledger->Done() >= seq) continue;
-      if (ledger->Frozen()) return QuiescenceState::Unprovable;
+      if (ledger->EnsureCovered(seq) == QuiescenceState::Unprovable)
+        return QuiescenceState::Unprovable;
       pending = std::move(ledger);
     }
     if (!pending && parts == 0) {
@@ -241,6 +242,8 @@ SubmissionLedger::PostResult SubmissionLedger::PostToSq(ibv_qp* qp, ibv_send_wr*
   PostResult result;
   {
     std::lock_guard<std::mutex> lock(postMu_);
+    qp_ = qp;
+    verbs_ = &verbs;
     if (Closed()) {
       result.error = ECANCELED;
     } else {
@@ -303,6 +306,56 @@ SubmissionLedger::PostResult SubmissionLedger::PostToSqLocked(
   }
   if (trace && !result.signaledSeq) mori::io::MoriRoctxTransferStop(this, tail);
   return result;
+}
+
+QuiescenceState SubmissionLedger::EnsureCovered(uint64_t seq) {
+  if (Done() >= seq) return QuiescenceState::Quiesced;
+  auto pending = pendingTarget_.load(std::memory_order_relaxed);
+  while (pending < seq &&
+         !pendingTarget_.compare_exchange_weak(pending, seq, std::memory_order_relaxed)) {
+  }
+  std::unique_lock<std::mutex> lock(postMu_, std::try_to_lock);
+  if (!lock) return QuiescenceState::Pending;
+  if (Done() >= seq) return QuiescenceState::Quiesced;
+  if (Frozen() || markerRejected_) return QuiescenceState::Unprovable;
+  bool changed = DriveMarkerLocked();
+  auto rejected = markerRejected_;
+  lock.unlock();
+  if (changed) NotifyAdmission();
+  return rejected ? QuiescenceState::Unprovable : QuiescenceState::Pending;
+}
+
+void SubmissionLedger::DrivePending() {
+  if (pendingTarget_.load(std::memory_order_relaxed) <= Done()) return;
+  std::unique_lock<std::mutex> lock(postMu_, std::try_to_lock);
+  if (lock) {
+    bool changed = DriveMarkerLocked();
+    lock.unlock();
+    if (changed) NotifyAdmission();
+  }
+}
+
+bool SubmissionLedger::DriveMarkerLocked() {
+  // A weak ledger lock alone does not keep the native QP alive during engine teardown.
+  if (Frozen() || markerRejected_ || !pendingTarget_ || Done() >= pendingTarget_ ||
+      lastSignaledSeq_ >= pendingTarget_ || markerOutstanding_ || !verbs_)
+    return false;
+  if (!TryReserve(1, capacity_)) return false;
+  ibv_send_wr marker{};
+  marker.opcode = IBV_WR_RDMA_WRITE;
+  markerOutstanding_ = true;
+  auto result = PostToSqLocked(qp_, &marker, 1, Kind::Marker, nullptr, 0, true, 0, 0, *verbs_);
+  if (result.posted) return true;
+  markerOutstanding_ = false;
+  // Under postMu no waiters are woken here; the driver wakes them after unlocking.
+  int previous = used_.fetch_sub(1, kSqAdmissionOrder);
+  assert(previous > 0);
+  if (result.error != ENOMEM && result.error != EAGAIN && result.error != EINTR) {
+    markerRejected_ = true;
+    MORI_IO_ERROR("quiescence marker rejected: qp={} target={} error={}", static_cast<void*>(qp_),
+                  pendingTarget_.load(std::memory_order_relaxed), result.error);
+  }
+  return true;
 }
 
 SubmissionLedger::Kind SubmissionLedger::KindForCompletion(uint64_t id) const {
@@ -400,6 +453,7 @@ bool SubmissionLedger::OnSqCompletion(uint64_t id, ibv_wc_status status,
   if (trackingFailed) freezeTracking();
   // Taking the entry transfers publication responsibility even if freezing won.
   CompleteEntry(current, status, message);
+  DrivePending();
   return !Frozen();
 }
 

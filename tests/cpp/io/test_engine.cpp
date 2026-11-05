@@ -213,6 +213,115 @@ SubmissionLedger::PostResult PostLedger(SubmissionLedger& ledger, LedgerVerbs& v
                          credit ? credit : count, final, meta->id, 0, verbs);
 }
 
+void CaseQuiescenceBusyPostRecordsTarget() {
+  SubmissionLedger ledger(16);
+  LedgerVerbs verbs;
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 1, 10);
+  PostLedger(ledger, verbs, 1, meta, false);
+  std::promise<void> posting, release;
+  auto gate = release.get_future().share();
+  verbs.post = [&](ibv_send_wr*, ibv_send_wr**) {
+    posting.set_value();
+    gate.wait();
+    return 0;
+  };
+  std::thread poster([&] { PostLedger(ledger, verbs, 1, meta, false); });
+  posting.get_future().wait();
+  auto pending = ledger.EnsureCovered(1);
+  release.set_value();
+  poster.join();
+  Require(pending == QuiescenceState::Pending, "busy post remains nonblocking");
+  int markers = 0;
+  verbs.post = [&](ibv_send_wr*, ibv_send_wr**) {
+    ++markers;
+    return 0;
+  };
+  ledger.DrivePending();
+  Require(markers == 1, "busy-lock target survives without a caller waiting");
+  ledger.OnSqCompletion(kSqTag | 3, IBV_WC_SUCCESS, "marker");
+  Require(ledger.Used() == 0, "retry covers the unsignaled tail");
+}
+
+void CaseQuiescenceMarkers() {
+  SubmissionLedger ledger(8);
+  LedgerVerbs verbs;
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 1, 8);
+  PostLedger(ledger, verbs, 1, meta, false);
+  Require(ledger.Reserve(6, 0, nullptr), "all ordinary credits occupied");
+  std::vector<uint64_t> markers;
+  verbs.post = [&](ibv_send_wr* wr, ibv_send_wr**) {
+    Require(
+        wr->num_sge == 0 && wr->opcode == IBV_WR_RDMA_WRITE && (wr->send_flags & IBV_SEND_SIGNALED),
+        "zero-length signaled marker");
+    markers.push_back(SqSequence(wr->wr_id));
+    Require(ledger.EnsureCovered(1) == QuiescenceState::Pending, "query never self-locks");
+    return 0;
+  };
+  ledger.EnsureCovered(1);
+  Require(markers.size() == 1 && ledger.Used() == 8, "spare marker credit remains available");
+  ledger.EnsureCovered(1);
+  Require(markers.size() == 1, "one outstanding marker");
+  ledger.CancelReservation(6);
+  verbs.post = nullptr;
+  PostLedger(ledger, verbs, 1, meta, false);  // sequence 3, behind marker 2
+  verbs.post = [&](ibv_send_wr* wr, ibv_send_wr**) {
+    markers.push_back(SqSequence(wr->wr_id));
+    return 0;
+  };
+  ledger.EnsureCovered(3);
+  Require(markers.size() == 1, "new target merged while marker outstanding");
+  ledger.OnSqCompletion(kSqTag | 2, IBV_WC_SUCCESS, "first marker");
+  Require(markers.size() == 2 && markers.back() == 4, "CQ drives next merged marker");
+  ledger.OnSqCompletion(kSqTag | 4, IBV_WC_SUCCESS, "second marker");
+  Require(ledger.Done() == 4 && ledger.Used() == 0, "all physical credits retired once");
+}
+
+void CaseQuiescenceMarkerRetryAndFreeze() {
+  SubmissionLedger ledger(8);
+  LedgerVerbs verbs;
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 1, 8);
+  PostLedger(ledger, verbs, 1, meta, false);
+  int tries = 0;
+  verbs.post = [&](ibv_send_wr* wr, ibv_send_wr** bad) {
+    if (++tries == 1) {
+      *bad = wr;
+      return ENOMEM;
+    }
+    return 0;
+  };
+  Require(ledger.EnsureCovered(1) == QuiescenceState::Pending && ledger.Used() == 1,
+          "ENOMEM remains pending and refunds unposted marker");
+  ledger.DrivePending();
+  Require(tries == 2 && ledger.Used() == 2, "periodic retry without query");
+  // Losing the marker CQE and covering it later never refunds a separate credit.
+  verbs.post = nullptr;
+  auto next = PostLedger(ledger, verbs, 1, meta);
+  ledger.OnSqCompletion(kSqTag | next.dataSeq, IBV_WC_SUCCESS, "marker successor");
+  Require(ledger.Done() == 3 && ledger.Used() == 0, "lost marker prefix refund");
+  ledger.Close(true);
+  Require(ledger.EnsureCovered(4) == QuiescenceState::Unprovable, "freeze stops marker posts");
+  auto done = ledger.Done();
+  ledger.OnSqCompletion(kSqTag | 4, IBV_WC_SUCCESS, "untrusted");
+  Require(ledger.Done() == done, "frozen prefix never advances");
+}
+
+void CaseQuiescenceMarkerRejected() {
+  SubmissionLedger ledger(8);
+  LedgerVerbs verbs;
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 1, 8);
+  PostLedger(ledger, verbs, 1, meta, false);
+  verbs.post = [](ibv_send_wr* wr, ibv_send_wr** bad) {
+    *bad = wr;
+    return EINVAL;
+  };
+  Require(ledger.EnsureCovered(1) == QuiescenceState::Unprovable, "permanent marker rejection");
+  Require(!ledger.Closed() && ledger.Used() == 1, "marker rejection cannot kill healthy QP");
+}
+
 void CaseReusableStatusContention() {
   TransferStatus status;
   std::promise<void> entered, resume;
@@ -2138,6 +2247,10 @@ int main(int argc, char* argv[]) {
 
   SetLogLevel("info");
   std::vector<TestCase> cases = {
+      {"quiescence_markers", CaseQuiescenceMarkers},
+      {"quiescence_busy_post_records_target", CaseQuiescenceBusyPostRecordsTarget},
+      {"quiescence_marker_retry_and_freeze", CaseQuiescenceMarkerRetryAndFreeze},
+      {"quiescence_marker_rejected", CaseQuiescenceMarkerRejected},
       {"operation_quiescence", CaseOperationQuiescence},
       {"reusable_status_contention", CaseReusableStatusContention},
       {"operation_long_wait_slice", CaseOperationLongWaitSlice},

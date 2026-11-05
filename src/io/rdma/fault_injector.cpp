@@ -340,6 +340,21 @@ bool FaultInjector::MoveQpToError(ibv_qp* qp) {
 }
 
 int FaultInjector::PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) {
+  if (wr && wr->opcode == IBV_WR_RDMA_WRITE && wr->num_sge == 0 && wr->next == nullptr &&
+      IsSqWrId(wr->wr_id)) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      markerIds_[qp->context][qp->send_cq].insert(wr->wr_id);
+      hasMarkers_.store(true, std::memory_order_relaxed);
+    }
+    int ret = real_.PostSend(qp, wr, bad);
+    if (ret) {
+      std::lock_guard<std::mutex> lock(mu_);
+      markerIds_[qp->context][qp->send_cq].erase(wr->wr_id);
+    }
+    return ret;
+  }
+
   ibv_async_event event{};
   bool inject = false;
   try {
@@ -410,14 +425,25 @@ int FaultInjector::PollCq(ibv_cq* cq, int numEntries, ibv_wc* wc) try {
     std::lock_guard<std::mutex> lock(mu_);
     if (deadCqs_.count(cq) || deadDevices_.count(cq->context)) return 0;
   }
-  if (n <= 0 || !armed_.load(std::memory_order_relaxed)) return n;
+  if (n <= 0 ||
+      (!armed_.load(std::memory_order_relaxed) && !hasMarkers_.load(std::memory_order_relaxed)))
+    return n;
 
   // Only successful CQEs carry a valid opcode, and only they can be "lost" or
   // turned into errors; real error CQEs pass through untouched.
   int kept = 0;
   for (int i = 0; i < n; ++i) {
     int value = 0;
-    if (wc[i].status == IBV_WC_SUCCESS) {
+    bool marker = false;
+    if (hasMarkers_.load(std::memory_order_relaxed)) {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto context = markerIds_.find(cq->context);
+      if (context != markerIds_.end()) {
+        auto found = context->second.find(cq);
+        marker = found != context->second.end() && found->second.erase(wc[i].wr_id) != 0;
+      }
+    }
+    if (!marker && wc[i].status == IBV_WC_SUCCESS) {
       if (ShouldFire(FaultKind::CqeDrop, wc[i].qp_num, wc[i].opcode, &value)) {
         RecordInjection(FaultKind::CqeDrop, wc[i].qp_num, wc[i].opcode, value);
         continue;
@@ -625,6 +651,7 @@ void FaultInjector::ReleaseAsyncContext(ibv_context* ctx) noexcept try {
   UnwatchAsyncContext(ctx);
   std::lock_guard<std::mutex> lock(mu_);
   qps_.erase(ctx);
+  markerIds_.erase(ctx);
   deadDevices_.erase(ctx);
   for (auto it = deadCqs_.begin(); it != deadCqs_.end();) {
     if (it->second == ctx)
@@ -641,6 +668,8 @@ void FaultInjector::ReleaseAsyncContext(ibv_context* ctx) noexcept try {
 
 void FaultInjector::ForgetAsyncEndpoint(ibv_context* ctx, uint32_t qpn, ibv_cq* cq) noexcept try {
   std::lock_guard<std::mutex> lock(mu_);
+  auto markers = markerIds_.find(ctx);
+  if (markers != markerIds_.end()) markers->second.erase(cq);
   auto qps = qps_.find(ctx);
   if (qps != qps_.end()) qps->second.erase(qpn);
   deadCqs_.erase(cq);

@@ -162,6 +162,30 @@ void ResourceRetirement() {
   Require(!injector.Failed(), "resource retirement reported an injection error");
 }
 
+void MarkersDoNotConsumeRules() {
+  Endpoint ep;
+  auto& injector = FaultInjector::Instance();
+  injector.Arm(ParseFaultRule("post_send_fail:value=12:skip=0"));
+  ep.wr.wr_id = kSqTag | 1;
+  ep.wr.num_sge = 0;
+  Require(ep.Post() == 0 && injector.Fired() == 0, "marker consumed a post rule");
+  injector.Disarm();
+  injector.Arm(ParseFaultRule("cqe_drop:op=write"));
+  ep.context.ops.poll_cq = [](ibv_cq*, int, ibv_wc* wc) {
+    wc[0] = {};
+    wc[0].wr_id = kSqTag | 1;
+    wc[0].status = IBV_WC_SUCCESS;
+    wc[0].opcode = IBV_WC_RDMA_WRITE;
+    wc[0].qp_num = 17;
+    return 1;
+  };
+  ibv_wc wc{};
+  Require(injector.PollCq(&ep.cq, 1, &wc) == 1 && injector.Fired() == 0,
+          "marker consumed a CQ rule");
+  injector.Disarm();
+  injector.ForgetAsyncEndpoint(&ep.context, ep.qp.qp_num, &ep.cq);
+}
+
 void NotificationStaging() {
   Endpoint ep;
   auto& injector = FaultInjector::Instance();
@@ -193,6 +217,7 @@ int main() {
   try {
     PortRecoveryOrder();
     ResourceRetirement();
+    MarkersDoNotConsumeRules();
     NotificationStaging();
     std::cout << "PASS: port recovery order, resource retirement, notification staging\n";
     return 0;

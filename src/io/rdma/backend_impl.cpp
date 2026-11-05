@@ -1069,6 +1069,7 @@ void NotifManager::MainLoop() {
 
         handledCqEvent = true;
         roundStats.Merge(rt->id, ProcessOneCqe(rt));
+        rt->ep.ledger->DrivePending();
       }
       if (handledCqEvent) {
         EmitFlushSummaryIfNeeded(roundStats);
@@ -1095,6 +1096,7 @@ void NotifManager::MainLoop() {
       FlushRoundStats roundStats;
       for (auto& rt : snapshot) {
         roundStats.Merge(rt->id, ProcessOneCqe(rt));
+        rt->ep.ledger->DrivePending();
       }
       EmitFlushSummaryIfNeeded(roundStats);
     }
