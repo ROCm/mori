@@ -669,6 +669,7 @@ def emit_dispatch_payload(
     producers_per_destination,
     chunks_per_destination,
     payload_chunk_rows,
+    pack=None,
 ):
     # fmt: on
     """Produce independently publishable expert payloads from a compact plan.
@@ -710,6 +711,102 @@ def emit_dispatch_payload(
     r_chunk_done = AddrBuffer(a_chunk_done)
     row0 = warp
     row_stride = fx.Int32(num_waves)
+    PACK_B = (
+        4  # rows per step of the pack path: their loads all go out before their stores
+    )
+
+    def _pack_rows(
+        row_begin,
+        row_end,
+        source_base,
+        destination_base,
+        payload_base,
+        token_dst,
+        scale_dst,
+        wts_dst,
+        srcmap_dst,
+        cm,
+    ):
+        """Pack path: this wave's rows (row_begin + warp + 8 i) of the chunk, 64 at a time. The
+        route headers go lane-parallel (lane i = row i); then PACK_B rows per step, every load
+        of the step before its stores, so one store-ack wait covers PACK_B rows (vmcnt retires
+        loads and stores in order). Steps past the last row repeat it (same bytes, same place).
+        """
+        n_wave = (row_end - row_begin - warp + row_stride - fx.Int32(1)) // row_stride
+        scale_off = lane
+        if const_expr(fz_enable_scales):
+            scale_off = (lane < fx.Int32(fz_scale_n_i32 // 4)).select(
+                lane, fx.Int32(fz_scale_n_i32 // 4 - 1)
+            ) * fx.Int32(4)
+        for g in range(fx.Int32(0), n_wave, fx.Int32(64)):
+            n_g = n_wave - g
+            n_g = (n_g < fx.Int32(64)).select(n_g, fx.Int32(64))
+            valid = lane < n_g
+            row_l = (
+                row_begin + warp + (g + valid.select(lane, fx.Int32(0))) * row_stride
+            )
+            wk_l = load_at(r_pair, source_base + row_l, fx.Int32, 1)
+            tok_l = wk_l // fx.Int32(fz_k)
+            weight_l = load_at(r_wts, wk_l, fx.Float32, 1)
+            enc_l = (fx.Int32(fz_rank * fz_mtpr) + tok_l) | (
+                (wk_l % fx.Int32(fz_k)) << fx.Int32(24)
+            )
+            wbits_l = fx.Vector.from_elements([weight_l], fx.Float32).bitcast(fx.Int32)
+            wbits_l = wbits_l[0]
+            if valid:
+                store_at(wbits_l, wts_dst, destination_base + row_l)
+                store_at(enc_l, srcmap_dst, destination_base + row_l)
+            for b0 in range(fx.Int32(0), n_g, fx.Int32(PACK_B)):
+                toks = []
+                prows = []
+                for j in range_constexpr(PACK_B):
+                    idx = b0 + fx.Int32(j)
+                    idx = (idx < n_g).select(idx, n_g - fx.Int32(1))
+                    toks.append(fx.Int32(fx.rocdl.readlane(T.i32, tok_l, idx)))
+                    prows.append(
+                        payload_base + row_begin + warp + (g + idx) * row_stride
+                    )
+                svals = []
+                tvals = []
+                for j in range_constexpr(PACK_B):
+                    if const_expr(fz_enable_scales):
+                        svals.append(
+                            load_at(
+                                AddrBuffer(addr_in_sc),
+                                toks[j] * fx.Int32(fz_scale_n_i32) + scale_off,
+                                fx.Int32,
+                                4,
+                            )
+                        )
+                    src = AddrBuffer(
+                        addr_in_tok + fx.Int64(toks[j]) * fx.Int64(fz_nbytes)
+                    )
+                    tvals.append(
+                        [
+                            load_at(
+                                src, lane * fx.Int32(4) + fx.Int32(c * 256), fx.Int32, 4
+                            )
+                            for c in range_constexpr(fz_n_i32 // 256)
+                        ]
+                    )
+                for j in range_constexpr(PACK_B):
+                    if const_expr(fz_enable_scales):
+                        store_at(
+                            svals[j],
+                            scale_dst,
+                            prows[j] * fx.Int32(fz_scale_n_i32) + scale_off,
+                            cache_modifier=cm,
+                        )
+                    dst = AddrBuffer(
+                        token_dst + fx.Int64(prows[j]) * fx.Int64(fz_nbytes)
+                    )
+                    for c in range_constexpr(fz_n_i32 // 256):
+                        store_at(
+                            tvals[j][c],
+                            dst,
+                            lane * fx.Int32(4) + fx.Int32(c * 256),
+                            cache_modifier=cm,
+                        )
 
     def _publish_task(destination, local_expert, ge):
         comm_ops.fence_system_release()
@@ -790,94 +887,128 @@ def emit_dispatch_payload(
         srcmap_remote_rsrc = AddrBuffer(
             load_at(AddrBuffer(p_sm), destination, fx.Int64, 1)
         )
-        token_remote = load_at(AddrBuffer(p_rx), destination, fx.Int64, 1)
-        if const_expr(fz_enable_scales):
-            scale_remote_rsrc = AddrBuffer(
-                load_at(AddrBuffer(p_sc), destination, fx.Int64, 1)
+        if const_expr(pack is not None):
+            # SDMA dispatch: rows for a peer go to this rank's send slab at their pair row, this
+            # rank's own rows to its landing buffer at their sorted row, written through (the
+            # copy engine reads memory; other XCDs read the landing rows); the route headers
+            # still go to the destination over P2P.
+            p_slab_x, p_slab_sc, p_land_x, p_land_sc = pack
+            own = destination == fx.Int32(fz_rank)
+            _pack_rows(
+                row_begin,
+                row_end,
+                source_base,
+                destination_base,
+                own.select(destination_base, source_base),
+                own.select(fx.Int64(p_land_x), fx.Int64(p_slab_x)),
+                (
+                    AddrBuffer(own.select(fx.Int64(p_land_sc), fx.Int64(p_slab_sc)))
+                    if fz_enable_scales
+                    else None
+                ),
+                wts_remote_rsrc,
+                srcmap_remote_rsrc,
+                1 | 16,
             )
-        for row in range(row_begin + row0, row_end, row_stride):
-            wk_lane = fx.Int32(0)
-            if lane == fx.Int32(0):
-                wk_lane = load_at(r_pair, source_base + row, fx.Int32, 1)
-            wk = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_lane))
-            source_token = wk // fx.Int32(fz_k)
-            topk_slot = wk % fx.Int32(fz_k)
-            destination_row = destination_base + row
-
-            def _copy_route_header():
-                weight = load_at(r_wts, wk, fx.Float32, 1)
-                source_encoding = (fx.Int32(fz_rank * fz_mtpr) + source_token) | (
-                    topk_slot << fx.Int32(24)
-                )
-                weight_bits = fx.Vector.from_elements([weight], fx.Float32).bitcast(
-                    fx.Int32
-                )[0]
-                store_at(weight_bits, wts_remote_rsrc, destination_row)
-                store_at(source_encoding, srcmap_remote_rsrc, destination_row)
-
-            if lane == fx.Int32(0):
-                _copy_route_header()
-
+        else:
+            token_remote = load_at(AddrBuffer(p_rx), destination, fx.Int64, 1)
             if const_expr(fz_enable_scales):
-                scale_lane = lane
-                if const_expr(fz_scale_n_i32 % 4 == 0):
-                    scale_offset = scale_lane * fx.Int32(4)
-                    if scale_offset < fx.Int32(fz_scale_n_i32):
+                scale_remote_rsrc = AddrBuffer(
+                    load_at(AddrBuffer(p_sc), destination, fx.Int64, 1)
+                )
+            for row in range(row_begin + row0, row_end, row_stride):
+                wk_lane = fx.Int32(0)
+                if lane == fx.Int32(0):
+                    wk_lane = load_at(r_pair, source_base + row, fx.Int32, 1)
+                wk = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_lane))
+                source_token = wk // fx.Int32(fz_k)
+                topk_slot = wk % fx.Int32(fz_k)
+                destination_row = destination_base + row
+
+                def _copy_route_header():
+                    weight = load_at(r_wts, wk, fx.Float32, 1)
+                    source_encoding = (fx.Int32(fz_rank * fz_mtpr) + source_token) | (
+                        topk_slot << fx.Int32(24)
+                    )
+                    weight_bits = fx.Vector.from_elements([weight], fx.Float32).bitcast(
+                        fx.Int32
+                    )[0]
+                    store_at(weight_bits, wts_remote_rsrc, destination_row)
+                    store_at(source_encoding, srcmap_remote_rsrc, destination_row)
+
+                if lane == fx.Int32(0):
+                    _copy_route_header()
+
+                if const_expr(fz_enable_scales):
+                    scale_lane = lane
+                    if const_expr(fz_scale_n_i32 % 4 == 0):
+                        scale_offset = scale_lane * fx.Int32(4)
+                        if scale_offset < fx.Int32(fz_scale_n_i32):
+                            scale = load_at(
+                                AddrBuffer(addr_in_sc),
+                                source_token * fx.Int32(fz_scale_n_i32) + scale_offset,
+                                fx.Int32,
+                                4,
+                            )
+                            store_at(
+                                scale,
+                                scale_remote_rsrc,
+                                destination_row * fx.Int32(fz_scale_n_i32)
+                                + scale_offset,
+                            )
+                    elif scale_lane < fx.Int32(fz_scale_n_i32):
                         scale = load_at(
                             AddrBuffer(addr_in_sc),
-                            source_token * fx.Int32(fz_scale_n_i32) + scale_offset,
+                            source_token * fx.Int32(fz_scale_n_i32) + scale_lane,
                             fx.Int32,
-                            4,
+                            1,
                         )
                         store_at(
                             scale,
                             scale_remote_rsrc,
-                            destination_row * fx.Int32(fz_scale_n_i32) + scale_offset,
+                            destination_row * fx.Int32(fz_scale_n_i32) + scale_lane,
                         )
-                elif scale_lane < fx.Int32(fz_scale_n_i32):
-                    scale = load_at(
-                        AddrBuffer(addr_in_sc),
-                        source_token * fx.Int32(fz_scale_n_i32) + scale_lane,
-                        fx.Int32,
-                        1,
-                    )
-                    store_at(
-                        scale,
-                        scale_remote_rsrc,
-                        destination_row * fx.Int32(fz_scale_n_i32) + scale_lane,
-                    )
-            source_rsrc = AddrBuffer(
-                addr_in_tok + fx.Int64(source_token) * fx.Int64(fz_nbytes)
-            )
-            destination_rsrc = AddrBuffer(
-                token_remote + fx.Int64(destination_row) * fx.Int64(fz_nbytes)
-            )
-            _copy_token_row(
-                source_rsrc,
-                destination_rsrc,
-                lane,
-                fz_safe_end_i32=fz_safe_end_i32,
-                fz_n_i32=fz_n_i32,
-            )
+                source_rsrc = AddrBuffer(
+                    addr_in_tok + fx.Int64(source_token) * fx.Int64(fz_nbytes)
+                )
+                destination_rsrc = AddrBuffer(
+                    token_remote + fx.Int64(destination_row) * fx.Int64(fz_nbytes)
+                )
+                _copy_token_row(
+                    source_rsrc,
+                    destination_rsrc,
+                    lane,
+                    fz_safe_end_i32=fz_safe_end_i32,
+                    fz_n_i32=fz_n_i32,
+                )
 
         if chunk_active:
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             fx.barrier()
             if tid == fx.Int32(0):
-                _publish_tile_range(
-                    p_tile_ready,
-                    p_tile_expected,
-                    p_ready_queue,
-                    p_ready_epoch,
-                    p_ready_tail,
-                    destination,
-                    destination_base,
-                    row_begin,
-                    row_end,
-                    destination_ready_rows,
-                    payload_epoch,
-                )
-                _finish_task(destination, local_expert, ge, num_chunks)
+                if const_expr(pack is not None):
+                    # The chunk's rows are in memory (written through, retired): count it
+                    # toward its segment for the SDMA put (or, for this rank's own rows,
+                    # toward the GEMM1 items of the expert).
+                    comm_ops.fence_agent_release()
+                    comm_ops.atomic_add_agent(
+                        a_chunk_done + fx.Int64(ge) * fx.Int64(4), fx.Int32(1)
+                    )
+                else:
+                    _publish_tile_range(
+                        p_tile_ready,
+                        p_tile_expected,
+                        p_ready_queue,
+                        p_ready_epoch,
+                        p_ready_tail,
+                        destination,
+                        destination_base,
+                        row_begin,
+                        row_end,
+                        destination_ready_rows,
+                        payload_epoch,
+                    )
+                    _finish_task(destination, local_expert, ge, num_chunks)
             fx.barrier()
 
 

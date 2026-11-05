@@ -28,6 +28,8 @@
 and bf16 activations), relative L2 over all ranks, for two inputs called alternately; and the same
 input twice must give the same bytes. ``bench``: CUDA Graph time of the layer (quant +
 kernel + combine): per replay the max over ranks, then the median over replays.
+``--p2p-dispatch``: the producers store the payload rows to the peers over P2P instead of
+packing them for the SDMA puts.
 """
 
 import argparse
@@ -192,6 +194,7 @@ def _build(args, rank, world, device):
         w1_scale=w1_s,
         w2=w2,
         w2_scale=w2_s,
+        sdma_dispatch=not args.p2p_dispatch,
     )
     return moe, ref
 
@@ -294,6 +297,11 @@ def main():
     common.add_argument("--max-tok", type=int, default=8192, help="max tokens per rank")
     common.add_argument(
         "--rtol", type=float, default=0.08, help="max relative L2 vs the reference"
+    )
+    common.add_argument(
+        "--p2p-dispatch",
+        action="store_true",
+        help="producers store the payload rows over P2P (default: packed, SDMA puts)",
     )
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)

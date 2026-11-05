@@ -27,9 +27,13 @@ One workgroup per CU (``num_cu`` of them), 8 waves each. Every workgroup draws a
   the dispatch plan (``dispatch.emit_dispatch_plan``): per local expert the rows each source
   sends, the sorted row layout (``expert_tile_end``), and each source's base row there;
 * tickets 1..``dispatch_blocks``, the producers -- group this rank's routes per destination
-  expert, then copy the token rows to the destinations over P2P
-  (``emit_dispatch_group`` / ``emit_dispatch_payload``); a sort tile is ready once its rows
-  have all arrived (``TILE_READY`` reaches ``TILE_EXPECTED``);
+  expert, then copy the token rows (``emit_dispatch_group`` / ``emit_dispatch_payload``).
+  With ``sdma_dispatch`` (the default of ``mega_moe.MegaMoE``) they pack each (peer, expert)
+  segment into a send slab of the cco window and the comm workgroup puts it with SDMA as
+  soon as it is packed, in expert order; a GEMM1 unit of an expert waits until every peer's
+  signal count shows experts 0..expert landed. Otherwise they store the rows to the
+  destinations over P2P and a sort tile is ready once its rows have all arrived
+  (``TILE_READY`` reaches ``TILE_EXPECTED``);
 * every workgroup but the last then takes GEMM1 units (256 sorted rows x 256 of the
   ``2 * inter`` columns, 8-wave A8W4 + SwiGLU) off a shared counter. A unit waits for its
   sort tiles' payload; when done it counts once toward each of its sort tiles;
@@ -38,9 +42,10 @@ One workgroup per CU (``num_cu`` of them), 8 waves each. Every workgroup draws a
   GEMM2 overlaps the GEMM1 tail. Its rows go to a local send buffer ``S`` grouped by origin
   rank (``sdma_parts``), at ``sorted row + D[expert][origin]``: within an expert the rows are
   grouped by origin rank, so that offset table is the whole Stage2 plan;
-* the last workgroup builds that table (from the count matrix, after the dispatch plan) and
-  is then the comm workgroup: one wave per peer puts each finished chunk of sort tiles of its
-  run with one SDMA copy, the last one signalled.
+* the last workgroup first issues the SDMA dispatch puts (one wave per peer), then builds
+  that table (from the count matrix, after the dispatch plan) and is the comm workgroup: one
+  wave per peer puts each finished chunk of sort tiles of its run with one SDMA copy, the
+  last one signalled.
 
 The combine (``sdma_parts.build_combine``) is a separate kernel on the same stream.
 """
@@ -108,13 +113,37 @@ from sdma_parts import (
 __all__ = ["compile_mega_moe", "sdma_layout", "PTR_TABLE"]
 
 #: Slots of the kernel's int64 pointer table (``ptr_tab``).
-PTR_TABLE = ("win", "dev_comm", "send", "cdone", "plan")
+PTR_TABLE = ("win", "dev_comm", "send", "cdone", "plan", "dsig")
 #: Sort tiles per shipped chunk; ``S`` rows reserved per (source, destination) pair over the even share.
 CHUNK_TILES = 16
 ROW_SLACK = 2.0
 G1_OUT_CACHE = 17  # GEMM1 output stores: write-through, read by GEMM2 on any XCD
 _SC0_CACHE = 1
 LDS_LIMIT_BYTES = 160 * 1024
+
+
+@flyc.jit
+def spin_until_ge_i64(addr_i64, val):
+    """Spin until an i64 counter (an SDMA signal slot) reaches ``val``."""
+    p = comm_ops._to_ptr_global(addr_i64, fx.Int64, 8)
+    cur = fx.Int64(
+        fx.generic_load(
+            p,
+            volatile=True,
+            memory_order=fx.AtomicOrdering.Monotonic,
+            syncscope="one-as",
+        )
+    )
+    while cur < fx.Int64(val):
+        cur = fx.Int64(
+            fx.generic_load(
+                p,
+                volatile=True,
+                memory_order=fx.AtomicOrdering.Monotonic,
+                syncscope="one-as",
+            )
+        )
+    return cur
 
 
 def sdma_layout(*, npes, mtpr, topk, model_dim):
@@ -140,8 +169,15 @@ def compile_mega_moe(
     num_dispatch_cu=96,
     payload_chunk_rows=384,
     work_shards=4,
+    sdma_dispatch=None,
 ):
-    """Build the launcher of the persistent kernel for one rank (shapes are compile-time)."""
+    """Build the launcher of the persistent kernel for one rank (shapes are compile-time).
+
+    ``sdma_dispatch``: None (producers store the payload rows to the peers over P2P) or the
+    cco window offsets ``dict(slab_x, slab_sc, land_x, land_sc, spare)``: producers pack the rows
+    into the window's send slab, the comm workgroup puts each (peer, expert) segment with SDMA
+    (queue 1, the scale put signalled), and a GEMM1 item waits on the peers' signal counts.
+    """
     NUM_WAVES = 8
     TOTAL_THREADS = NUM_WAVES * 64
     assert sort_block_m == 128 and model_dim % 256 == 0 and inter_dim % 256 == 0
@@ -204,6 +240,12 @@ def compile_mega_moe(
         E_wts: fx.Array[fx.Float8E4M3FN, 256 * 4, 16]
 
     swiglu_suffix = f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
+    SD = sdma_dispatch
+    SD_Q = 1  # SDMA queue of the dispatch puts (queue 0 carries Stage2 and its signal)
+    if SD is not None:
+        # The pack path moves rows in 16-byte lanes, 256 int32 per wave instruction.
+        assert model_dim % 1024 == 0, "sdma_dispatch needs model_dim % 1024 == 0"
+        swiglu_suffix += "_sd"
     kernel_name = (
         f"mori_ex14_mega_moe_r{rank}p{fz_npes}e{fz_epr}k{fz_k}m{fz_mtpr}"
         f"_h{model_dim}i{inter_dim}_dcu{dispatch_blocks}_cu{launch_grid_x}{swiglu_suffix}"
@@ -240,6 +282,21 @@ def compile_mega_moe(
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         a_buf = lds.E_stage
+        if const_expr(SD is not None):
+            ptr_tab_rsrc = _make_buffer_from_addr(ptr_tab, fx.Int64)
+            sd_win = _wave_uniform_i64(
+                _buffer_load(ptr_tab_rsrc, fx.Int32(0), fx.Int64)
+            )
+            sd_dev = _wave_uniform_i64(
+                _buffer_load(ptr_tab_rsrc, fx.Int32(1), fx.Int64)
+            )
+            # The cco window's local base (its send area starts at offset 0).
+            sd_wbase = _wave_uniform_i64(
+                _buffer_load(ptr_tab_rsrc, fx.Int32(2), fx.Int64)
+            )
+            sd_sig = _wave_uniform_i64(
+                _buffer_load(ptr_tab_rsrc, fx.Int32(PTR_TABLE.index("dsig")), fx.Int64)
+            )
 
         def _g1_build(
             A,
@@ -253,6 +310,7 @@ def compile_mega_moe(
             g1_lds,
             g1_tile_ready,
             g1_tile_expected,
+            sd_args=None,
         ):
             """The 8-wave GEMM1 + SwiGLU item on the sorted payload: A = the payload rows, their raw
             e8m0 rows at ``g1_scale_raw``, sort tile bases ``tib`` (tile_row_base); output rows and
@@ -319,37 +377,66 @@ def compile_mega_moe(
                 )
                 b_row_block = expert * n_blocks + block_n
                 tid0 = fx.Int32(fx.thread_idx.x) == fx.Int32(0)
-                # The M-tile's sort tiles (SBM rows each) have landed once TILE_READY reaches
-                # TILE_EXPECTED for each of them.
                 st0 = row_base // fx.Int32(SBM)
-                if tid0:
-                    # Both sort tiles' counts in one round trip; spin only if one is short
-                    # (a second tile past n_valid repeats the first).
-                    t1 = (n_valid > fx.Int32(SBM)).select(st0 + fx.Int32(1), st0)
-                    exp_p = global_typed_ptr(g1_tile_expected, T.i32)
-                    exp0 = fx.Int32(exp_p[st0])
-                    exp1 = fx.Int32(exp_p[t1])
-                    rdy0 = fx.Int32(
-                        comm_ops.load_i32_acquire(
-                            g1_tile_ready + fx.Int64(st0) * fx.Int64(4)
+                if const_expr(sd_args is not None):
+                    # SDMA dispatch: every peer has put its segments of experts 0..expert
+                    # (its signal count from this call reached expert + 1), and this rank's
+                    # own chunks of the expert are written.
+                    sd_dev, sd_sig, sd_lh, sd_cd = sd_args
+                    if tid0:
+                        import mori.cco.device.flydsl as cco
+
+                        sd_h = cco.DevComm(sd_dev).sdma()
+                        need = (
+                            fx.Int64(global_typed_ptr(sd_sig, T.i64, align=8)[0])
+                            - fx.Int64(experts)
+                            + fx.Int64(expert + fx.Int32(1))
                         )
-                    )
-                    rdy1 = fx.Int32(
-                        comm_ops.load_i32_acquire(
-                            g1_tile_ready + fx.Int64(t1) * fx.Int64(4)
+                        for src in range_constexpr(fz_npes):
+                            if const_expr(src != fz_rank):
+                                spin_until_ge_i64(
+                                    fx.Int64(sd_h.signal_slot(src, SD_Q)), need
+                                )
+                        own_ge = fx.Int32(fz_rank * fz_epr) + expert
+                        own_cnt = fx.Int32(global_typed_ptr(sd_lh, T.i32)[own_ge])
+                        own_ch = (
+                            own_cnt + fx.Int32(payload_chunk_rows - 1)
+                        ) // fx.Int32(payload_chunk_rows)
+                        own_ch = (own_ch > fx.Int32(0)).select(own_ch, fx.Int32(1))
+                        comm_ops.spin_until_ge_i32_agent(
+                            sd_cd + fx.Int64(own_ge) * fx.Int64(4), own_ch
                         )
-                    )
-                    if (rdy0 != exp0) | (rdy1 != exp1):
-                        comm_ops.wait_i32_until_equals(
-                            g1_tile_ready + fx.Int64(st0) * fx.Int64(4), exp0
+                else:
+                    # The M-tile's sort tiles (SBM rows each) have landed once TILE_READY reaches
+                    # TILE_EXPECTED for each of them.
+                    if tid0:
+                        # Both sort tiles' counts in one round trip; spin only if one is short
+                        # (a second tile past n_valid repeats the first).
+                        t1 = (n_valid > fx.Int32(SBM)).select(st0 + fx.Int32(1), st0)
+                        exp_p = global_typed_ptr(g1_tile_expected, T.i32)
+                        exp0 = fx.Int32(exp_p[st0])
+                        exp1 = fx.Int32(exp_p[t1])
+                        rdy0 = fx.Int32(
+                            comm_ops.load_i32_acquire(
+                                g1_tile_ready + fx.Int64(st0) * fx.Int64(4)
+                            )
                         )
-                        comm_ops.wait_i32_until_equals(
-                            g1_tile_ready + fx.Int64(t1) * fx.Int64(4), exp1
+                        rdy1 = fx.Int32(
+                            comm_ops.load_i32_acquire(
+                                g1_tile_ready + fx.Int64(t1) * fx.Int64(4)
+                            )
                         )
-                # No acquire per item (it invalidates the XCD's L2 under every other CU's
-                # GEMM): this call's payload is read only once its tile is complete, so no
-                # L2 holds a copy of it from this call; copies left from the last call were
-                # dropped by the one acquire before the GEMM1 loop.
+                        if (rdy0 != exp0) | (rdy1 != exp1):
+                            comm_ops.wait_i32_until_equals(
+                                g1_tile_ready + fx.Int64(st0) * fx.Int64(4), exp0
+                            )
+                            comm_ops.wait_i32_until_equals(
+                                g1_tile_ready + fx.Int64(t1) * fx.Int64(4), exp1
+                            )
+                    # No acquire per item (it invalidates the XCD's L2 under every other CU's
+                    # GEMM): this call's payload is read only once its tile is complete, so no
+                    # L2 holds a copy of it from this call; copies left from the last call were
+                    # dropped by the one acquire before the GEMM1 loop.
                 fx.barrier()
                 tib_p = global_typed_ptr(tib, T.i32)
 
@@ -1467,6 +1554,22 @@ def compile_mega_moe(
                     _buffer_store(
                         g2_cd_rsrc, clr * fx.Int32(CDONE_STRIDE), fx.Int32(0), fx.Int32
                     )
+            if const_expr(SD is not None):
+                # Per-launch: the route counts (the producers count into them) and the chunk
+                # counters of the packed segments (the P2P path resets both as it publishes).
+                sd_lh_rsrc = _make_buffer_from_addr(
+                    _disp_ptr(DispatchSlot.LOCAL_HIST), fx.Int32
+                )
+                sd_cd_rsrc = _make_buffer_from_addr(
+                    _disp_ptr(DispatchSlot.PAYLOAD_CHUNK_DONE), fx.Int32
+                )
+                for _ci in range_constexpr(
+                    (fz_total_experts + TOTAL_THREADS - 1) // TOTAL_THREADS
+                ):
+                    clr = tid + fx.Int32(_ci * TOTAL_THREADS)
+                    if clr < fx.Int32(fz_total_experts):
+                        _buffer_store(sd_lh_rsrc, clr, fx.Int32(0), fx.Int32)
+                        _buffer_store(sd_cd_rsrc, clr, fx.Int32(0), fx.Int32)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             comm_ops.fence_system_release()
@@ -1565,6 +1668,16 @@ def compile_mega_moe(
                     producers_per_destination=producers_per_destination,
                     payload_chunk_rows=payload_chunk_rows,
                     chunks_per_destination=chunks_per_destination,
+                    pack=(
+                        None
+                        if SD is None
+                        else (
+                            sd_wbase + fx.Int64(SD["slab_x"]),
+                            sd_wbase + fx.Int64(SD["slab_sc"]),
+                            sd_wbase + fx.Int64(SD["land_x"]),
+                            sd_wbase + fx.Int64(SD["land_sc"]),
+                        )
+                    ),
                 )
         addr_tile_ready = _disp_ptr(DispatchSlot.TILE_READY)
         addr_tile_expected = _disp_ptr(DispatchSlot.TILE_EXPECTED)
@@ -1621,6 +1734,16 @@ def compile_mega_moe(
             g1_lds,
             addr_tile_ready,
             addr_tile_expected,
+            sd_args=(
+                None
+                if SD is None
+                else (
+                    sd_dev,
+                    sd_sig,
+                    _disp_ptr(DispatchSlot.LOCAL_HIST),
+                    _disp_ptr(DispatchSlot.PAYLOAD_CHUNK_DONE),
+                )
+            ),
         )
         g1_lane = fx.thread_idx.x % fx.Int32(64)
         g1_tab = fx.Int32(fx.ptrtoint(g1_lds.E_tab.ptr))
@@ -1687,10 +1810,99 @@ def compile_mega_moe(
         g2_cdone = _wave_uniform_i64(_buffer_load(g2_tab, fx.Int32(3), fx.Int64))
         g2_plan = _wave_uniform_i64(_buffer_load(g2_tab, fx.Int32(4), fx.Int64))
         g2_flag = g2_plan + fx.Int64(3 * G2_P * 4)
+
+        def _sd_dispatch_role():
+            """SDMA dispatch, one wave per peer (lane 0): once the peer's plan for this rank's
+            rows is here, put each (peer, expert) segment of the send slab to the peer's
+            landing rows in expert order as soon as its chunks are packed -- the payload put,
+            then the e8m0 put carrying the remote signal (queue SD_Q). An empty segment puts 4
+            bytes within the spare area, so a peer's signal count is "segments landed".
+            """
+            import mori.cco.device.flydsl as cco
+
+            lane = tid % fx.Int32(64)
+            peer = fx.Int32(fx.rocdl.readfirstlane(T.i32, tid // fx.Int32(64)))
+            lh = ptr_buf_tensor(_disp_ptr(DispatchSlot.LOCAL_HIST), fx.Int32)
+            pb = ptr_buf_tensor(_disp_ptr(DispatchSlot.PAIR_BASE), fx.Int32)
+            tb = ptr_buf_tensor(_disp_ptr(DispatchSlot.TASK_ROW_BASE), fx.Int32)
+            cd = _disp_ptr(DispatchSlot.PAYLOAD_CHUNK_DONE)
+            plan_ready = _disp_ptr(DispatchSlot.PLAN_READY)
+            if (
+                (peer < fx.Int32(fz_npes))
+                & (peer != fx.Int32(fz_rank))
+                & (lane == fx.Int32(0))
+            ):
+                comm_ops.wait_i32_until_equals(
+                    plan_ready
+                    + fx.Int64(payload_parity * fx.Int32(fz_npes) + peer) * fx.Int64(4),
+                    payload_expected,
+                )
+                comm_ops.fence_system_acquire()
+                sd = cco.DevComm(sd_dev).sdma()
+                q = fx.Int32(SD_Q)
+                spare = fx.Int64(SD["spare"])
+                SC = model_dim // 32
+                for e in range(fx.Int32(0), fx.Int32(fz_epr), fx.Int32(1)):
+                    ge = peer * fx.Int32(fz_epr) + fx.Int32(e)
+                    cnt = fx.Int32(lh[ge])
+                    nch = (cnt + fx.Int32(payload_chunk_rows - 1)) // fx.Int32(
+                        payload_chunk_rows
+                    )
+                    nch = (nch > fx.Int32(0)).select(nch, fx.Int32(1))
+                    comm_ops.spin_until_ge_i32_agent(
+                        cd + fx.Int64(ge) * fx.Int64(4), nch
+                    )
+                    comm_ops.fence_agent_acquire()
+                    src_row = fx.Int64(fx.Int32(pb[ge]))
+                    dst_row = fx.Int64(fx.Int32(tb[ge]))
+                    has = cnt > fx.Int32(0)
+                    nx = fx.Int64(has.select(cnt * fx.Int32(model_dim), fx.Int32(4)))
+                    nsc = fx.Int64(has.select(cnt * fx.Int32(SC), fx.Int32(4)))
+                    sx = has.select(
+                        fx.Int64(SD["slab_x"]) + src_row * fx.Int64(model_dim), spare
+                    )
+                    dx = has.select(
+                        fx.Int64(SD["land_x"]) + dst_row * fx.Int64(model_dim), spare
+                    )
+                    ss = has.select(
+                        fx.Int64(SD["slab_sc"]) + src_row * fx.Int64(SC), spare
+                    )
+                    ds = has.select(
+                        fx.Int64(SD["land_sc"]) + dst_row * fx.Int64(SC), spare
+                    )
+                    sd.put(
+                        peer,
+                        sd_win,
+                        dx,
+                        sd_win,
+                        sx,
+                        nx,
+                        q,
+                        coop=cco.CoopScope.THREAD,
+                        local_signal=False,
+                        remote_signal=False,
+                    )
+                    sd.put(
+                        peer,
+                        sd_win,
+                        ds,
+                        sd_win,
+                        ss,
+                        nsc,
+                        q,
+                        coop=cco.CoopScope.THREAD,
+                        local_signal=False,
+                        remote_signal=True,
+                    )
+                # Every put has read the slab before the next call's producers rewrite it.
+                sd.quiet_queue(peer, q)
+
         if ticket == fx.Int32(launch_grid_x - 1):
             g2_epoch = fx.Int32(0)
             if tid == fx.Int32(0):
                 g2_epoch = fx.Int32(fx.ptr_load(epoch_slot_ptr, result_type=T.i32))
+            if const_expr(SD is not None):
+                _sd_dispatch_role()
             _g2_plan_tables(g2_plan, g2_flag, g2_epoch)
             _g2_comm_role(g2_win, g2_dev_comm, g2_cdone, g2_plan, num_valid)
         else:

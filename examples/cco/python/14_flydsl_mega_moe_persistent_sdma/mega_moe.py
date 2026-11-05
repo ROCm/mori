@@ -95,6 +95,10 @@ class MegaMoE:
     ``w2``: [experts_per_rank, model_dim, inter / 2]; scales from
     ``weights.shuffle_scale_a16w4``. Needs torch.distributed and mori shmem initialised,
     ``MORI_ENABLE_SDMA=1`` and mori built with ``BUILD_CCO_SDMA=ON``.
+
+    ``sdma_dispatch``: the producers pack each (peer, expert) segment of the payload into a
+    send slab and the copy engine puts it (True), or they store the rows to the peers over
+    P2P themselves (False).
     """
 
     def __init__(
@@ -112,6 +116,7 @@ class MegaMoE:
         w1_scale,
         w2,
         w2_scale,
+        sdma_dispatch=True,
     ):
         import torch.distributed as dist
         from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator
@@ -133,10 +138,14 @@ class MegaMoE:
         nvm = self.nvm
         self.scale_n_i32 = (K // 32 + 3) // 4
         meta_blocks = (nvm + META_BLOCK_M - 1) // META_BLOCK_M
-        self.rx_em = _sym((nvm * K,), torch.int8)  # fp8 rows
+        # SDMA dispatch: the payload rows land in the cco window (set up below); the
+        # symmetric copies are then only placeholders for the P2P path's pointer tables.
+        self.sdma_dispatch = bool(sdma_dispatch)
+        pay_rows = 1 if self.sdma_dispatch else nvm
+        self.rx_em = _sym((pay_rows * K,), torch.int8)  # fp8 rows
         # As [rows, K]: a kernel tensor argument's extents are 32-bit.
-        self.rx_rows = self.rx_em.view(torch.float8_e4m3fn).view(nvm, K)
-        self.scale_em = _sym((nvm * self.scale_n_i32,), torch.int32)  # their e8m0
+        self.rx_rows = self.rx_em.view(torch.float8_e4m3fn).view(pay_rows, K)
+        self.scale_em = _sym((pay_rows * self.scale_n_i32,), torch.int32)  # their e8m0
         self.wts_em = _sym((nvm,), torch.float32)  # routing weight per sorted row
         self.srcmap_em = _sym((nvm,), torch.int32)  # source rank / token / top-k slot
         self.sorted_expert_ids = torch.zeros(meta_blocks, **i32)
@@ -278,10 +287,30 @@ class MegaMoE:
         self.w2 = w2.contiguous().view(torch.uint8).view(-1)
         self.w2_scale = w2_scale.contiguous().view(torch.uint8).view(-1)
 
-        # --- Stage2 SDMA: one cco window ------------------------------------------------------
+        # --- SDMA: one cco window -------------------------------------------------------------
         self.layout = lay = sdma_layout(
             npes=npes, mtpr=self.mtpr, topk=self.topk, model_dim=K
         )
+        win_bytes = lay.total_bytes
+        self.sd_off = None
+        if self.sdma_dispatch:
+            # [ Stage2 arena | send slab x | slab e8m0 | landing x | landing e8m0 | spare ]
+            sc_row = self.scale_n_i32 * 4
+
+            def take(nbytes):
+                nonlocal win_bytes
+                off = (win_bytes + 4095) // 4096 * 4096
+                win_bytes = off + nbytes
+                return off
+
+            s_rows = self.mtpr * self.topk
+            self.sd_off = {
+                "slab_x": take(s_rows * K),
+                "slab_sc": take(s_rows * sc_row),
+                "land_x": take(nvm * K),
+                "land_sc": take(nvm * sc_row),
+                "spare": take(4096),
+            }
         uid = [Communicator.get_unique_id() if self.rank == 0 else None]
         dist.broadcast_object_list(uid, src=0)
         self.comm = Communicator.init(
@@ -289,17 +318,27 @@ class MegaMoE:
             self.rank,
             uid[0],
             per_rank_vmm=max(
-                Communicator.DEFAULT_PER_RANK_VMM, lay.total_bytes + (256 << 20)
+                Communicator.DEFAULT_PER_RANK_VMM, win_bytes + (256 << 20)
             ),
         )
-        self.mem = self.comm.alloc_mem(lay.total_bytes)
+        self.mem = self.comm.alloc_mem(win_bytes)
         self.win = self.comm.register_window(self.mem.ptr, self.mem.size)
-        _view(self.mem.ptr, lay.total_bytes, torch.uint8).zero_()
+        _view(self.mem.ptr, win_bytes, torch.uint8).zero_()
+        self.scale_raw_ptr = self.scale_em.data_ptr()
+        if self.sdma_dispatch:
+            o = self.sd_off
+            self.rx_rows = _view(
+                self.mem.ptr + o["land_x"], nvm * K, torch.float8_e4m3fn
+            ).view(nvm, K)
+            self.scale_raw_ptr = self.mem.ptr + o["land_sc"]
+        # Dispatch signal target: advanced by one call's segments (epr) before each launch.
+        self.sd_sig = torch.zeros(1, dtype=torch.int64, device=dev)
         reqs = CCODevCommRequirements()
         reqs.gda_connection_type = GDA_CONNECTION_NONE
         reqs.gda_signal_count = 0
         reqs.gda_counter_count = 0
-        reqs.sdma_queue_count = 1  # one channel per peer
+        # Per peer: queue 0 Stage2 (its signal ends the call), queue 1 the dispatch puts.
+        reqs.sdma_queue_count = 2 if self.sdma_dispatch else 1
         self.dev_comm = self.comm.create_dev_comm(reqs)
         if getattr(self.dev_comm, "sdma_num_queue", 0) < 1:
             self.comm.close_all_resources()
@@ -319,6 +358,7 @@ class MegaMoE:
             "send": self.mem.ptr + lay.off_s,
             "cdone": self.cdone.data_ptr(),
             "plan": self.plan.data_ptr(),
+            "dsig": self.sd_sig.data_ptr(),
         }
         self.ptr_table = torch.tensor(
             [ptrs[k] for k in PTR_TABLE], dtype=torch.int64, device=dev
@@ -341,6 +381,7 @@ class MegaMoE:
             num_valid_max=nvm,
             num_cu=n_cu,
             swiglu_limit=self.swiglu_limit,
+            sdma_dispatch=self.sd_off,
         )
         torch.cuda.synchronize()
         self.comm.barrier()
@@ -359,6 +400,8 @@ class MegaMoE:
         stream = torch.cuda.current_stream()
         s = fx.Stream(stream.cuda_stream)
         x_q, x_scale = per_1x32_mx_quant(x, quant_mode="fp8")
+        if self.sdma_dispatch:
+            self.sd_sig.add_(self.epr)
         _run_compiled(
             self.kernel,
             self.rx_rows,  # GEMM1 A: the sorted payload rows
@@ -380,7 +423,7 @@ class MegaMoE:
             fx.Int64(self.mtile_ctr.data_ptr()),
             fx.Int64(self.s1_out.data_ptr()),
             fx.Int64(self.s1_scale.data_ptr()),
-            fx.Int64(self.scale_em.data_ptr()),  # raw e8m0 of the payload rows
+            fx.Int64(self.scale_raw_ptr),  # raw e8m0 of the payload rows
             fx.Int64(self.srcmap_em.data_ptr()),
             fx.Int64(self.wts_em.data_ptr()),
             fx.Int64(self.tile_row_base.data_ptr()),
