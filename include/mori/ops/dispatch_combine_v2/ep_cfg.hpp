@@ -271,6 +271,13 @@ struct EpCfg {
   // place of the payload, and copies the row in-card in a second launch (EpArgs.cardPull). The
   // pairing decides only how many bytes it saves, never what lands. Off is free, as scaleBytes is.
   bool cardDedup = false;
+  // Cfg.cardDedup only. > 0: that many blocks past blockNum copy the rows in while the senders
+  // run, each as soon as its source stores the forward entry, which it does only once the row is
+  // in place; no second launch. The grid is blockNum + cardPullBlocks, all resident at once.
+  int cardPullBlocks = 0;
+  // Cfg.cardDedup only. Which partition a row both partitions of a card need lands on: tok & 1,
+  // or with this set the source's own, rank & 1. Both move the same bytes per partition on average.
+  bool cardLandSrc = false;
 };
 
 template <typename Self, typename Visit>
@@ -296,10 +303,12 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(ll128);
   MORI_FIELD(ll128CombineOnly);
   MORI_FIELD(cardDedup);
+  MORI_FIELD(cardPullBlocks);
+  MORI_FIELD(cardLandSrc);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 20, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 22, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -577,8 +586,10 @@ constexpr size_t EpRegionXdbBytes(const EpCfg& c) { return 8 * (size_t)c.worldSi
 constexpr size_t EpRegionOutScalesBytes(const EpCfg& c) {
   return (size_t)EpMaxRecv(c) * EpScaleStride(c);
 }
+// Under Cfg.cardPullBlocks two words follow the map: the flag the first arriver sets once every
+// source has signalled, and the count of pull blocks that have finished.
 constexpr size_t EpRegionFwdMapBytes(const EpCfg& c) {
-  return c.cardDedup ? (size_t)EpMaxRecv(c) * 4 : 0;
+  return c.cardDedup ? (size_t)EpMaxRecv(c) * 4 + (c.cardPullBlocks > 0 ? 64 : 0) : 0;
 }
 
 // Cfg.cardDedup skips the payload in the dispatch's general loops only, so no other payload path
@@ -587,7 +598,8 @@ constexpr size_t EpRegionFwdMapBytes(const EpCfg& c) {
 // 32 ranks (else the scale rows ride with the payload). EpDispatch1250xBody asserts the same.
 constexpr bool EpCardDedupOk(const EpCfg& c) {
   return c.dtype != EpDType::Fp4x2 && !c.ll128 && c.worldSize % 2 == 0 && c.worldSize < 32 &&
-         c.warpPerBlock > 8 && c.worldSize <= c.warpPerBlock;
+         c.warpPerBlock > 8 && c.worldSize <= c.warpPerBlock && c.cardPullBlocks >= 0 &&
+         c.cardPullBlocks <= 64;
 }
 
 // Per-warp LDS slab. The metadata tile and the payload tile share it (same
@@ -651,7 +663,8 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          // aggReserve: lane p of warp 0 reserves destination p, and the blocks
          // arrived pack into the 12 bits above the 20-bit total of a count word.
          (!c.aggReserve || (c.worldSize <= c.waveSize && c.blockNum < 4096)) &&
-         (!c.cardDedup || EpCardDedupOk(c));
+         (!c.cardDedup || EpCardDedupOk(c)) &&
+         (c.cardDedup || (c.cardPullBlocks == 0 && !c.cardLandSrc));
 }
 
 }  // namespace v2

@@ -107,12 +107,18 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   }
   if (req.cardDedup && isDispatch) {
     c.cardDedup = true;
+    c.cardPullBlocks = req.cardPullBlocks;
+    c.cardLandSrc = req.cardLandSrc;
     if (arch.rfind("gfx125", 0) != 0 || !EpCardDedupOk(c)) {
       throw std::runtime_error(
           "mori v2 ep: cardDedup needs gfx125x, a bf16 / fp8 / fp32 dispatch without ll128, an "
-          "even worldSize below 32, and more than 8 warps a block and at least one a rank (world=" +
-          std::to_string(c.worldSize) + " warps=" + std::to_string(c.warpPerBlock) + ")");
+          "even worldSize below 32, more than 8 warps a block and at least one a rank, and 0 to "
+          "64 pull blocks (world=" +
+          std::to_string(c.worldSize) + " warps=" + std::to_string(c.warpPerBlock) +
+          " pullBlocks=" + std::to_string(c.cardPullBlocks) + ")");
     }
+  } else if (isDispatch && (req.cardPullBlocks != 0 || req.cardLandSrc)) {
+    throw std::runtime_error("mori v2 ep: cardPullBlocks and cardLandSrc need cardDedup");
   }
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
@@ -281,7 +287,7 @@ const std::vector<std::string>& EpCombineSpec::SourceDeps() { return EpSourceDep
 
 mori::jit::v2::LaunchGeometry EpDispatchSpec::Geometry(const Cfg& cfg) {
   mori::jit::v2::LaunchGeometry g;
-  g.gridX = static_cast<unsigned>(cfg.blockNum);
+  g.gridX = static_cast<unsigned>(cfg.blockNum + cfg.cardPullBlocks);
   g.blockX = static_cast<unsigned>(EpBlockThreads(cfg));
   // Portable dispatch keeps everything in registers; the gfx1250 TDM dispatch
   // stages one hidden-dim token tile per warp in dynamic LDS.

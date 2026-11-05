@@ -318,6 +318,7 @@ def test_card_dedup_adds_a_forward_map_and_nothing_else():
         dict(world_size=7),  # no partner for rank 6
         dict(warp_per_block=8),  # the first payload goes out during the assignment
         dict(hidden_dim=3584, dtype="fp4x2"),  # the packed fp4 payload paths
+        dict(card_pull_blocks=65),
     ],
 )
 def test_card_dedup_rejects_a_cfg_whose_payload_takes_another_path(kw):
@@ -325,6 +326,26 @@ def test_card_dedup_rejects_a_cfg_whose_payload_takes_another_path(kw):
         pytest.skip("card_dedup is gfx125x only")
     with pytest.raises(RuntimeError, match="cardDedup needs"):
         cb.EpDispatchPlan.describe(**dict(_CARD_KW, card_dedup=True, **kw))
+
+
+def test_card_pull_blocks_run_past_the_senders_and_add_two_words():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    kw = dict(_CARD_KW, card_dedup=True, block_num=64)
+    serial = cb.EpDispatchPlan.describe(**kw)
+    ovl = cb.EpDispatchPlan.describe(**kw, card_pull_blocks=16)
+    # The senders keep blockNum, and with it every path the dispatch picks by it.
+    assert (serial["blockNum"], serial["gridX"]) == (64, 64)
+    assert (ovl["blockNum"], ovl["gridX"]) == (64, 80)
+    assert ovl["region.fwdMap"] == serial["region.fwdMap"] + 64
+    src = cb.EpDispatchPlan.describe(**kw, card_land_src=True)
+    assert (src["cardLandSrc"], src["gridX"], src["region.fwdMap"]) == (True, 64, 4096 * 4)
+
+
+@pytest.mark.parametrize("kw", [dict(card_pull_blocks=16), dict(card_land_src=True)])
+def test_card_dedup_knobs_need_card_dedup(kw):
+    with pytest.raises(RuntimeError, match="need cardDedup"):
+        cb.EpDispatchPlan.describe(**_CARD_KW, **kw)
 
 
 def _reference_regions(

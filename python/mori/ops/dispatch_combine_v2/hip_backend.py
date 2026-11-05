@@ -1015,6 +1015,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
         if cfg.card_dedup:
             disp["card_dedup"] = True
+            if cfg.card_pull_blocks:
+                disp["card_pull_blocks"] = cfg.card_pull_blocks
+            if cfg.card_land == "src":
+                disp["card_land_src"] = True
         comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
         if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
             comb["combine_fp4"] = True
@@ -1048,6 +1052,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 **ll,
                 # The small calls' kernel; card_dedup is the ordinary dispatch's.
                 card_dedup=False,
+                card_pull_blocks=0,
+                card_land_src=False,
                 combine_fp4=comb.get("combine_fp4", False),
                 combine_fp8=comb.get("combine_fp8", False),
                 call_tok_max=n,
@@ -1126,6 +1132,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 )
             if self._ll128_geom is not None and "dispatch" in self._ll128_geom:
                 bad.append("card_dedup on an op whose every dispatch is the ll128 kernel")
+            # The pull blocks spin until every sender has finished, so a grid that
+            # does not fit at once (one block a CU: the dispatch slabs fill the LDS)
+            # would never finish.
+            if not 0 <= cfg.card_pull_blocks <= 64:
+                bad.append(f"card_pull_blocks={cfg.card_pull_blocks} (0 to 64)")
+            elif cfg.card_pull_blocks:
+                top = max(b for b, _ in self._specs_from(cfg)[0])
+                if top + cfg.card_pull_blocks > self._multi_processor_count:
+                    bad.append(
+                        f"card_pull_blocks={cfg.card_pull_blocks} on {top} dispatch "
+                        f"blocks: past the {self._multi_processor_count} CUs"
+                    )
         return tuple(bad)
 
     _INTERNODE_DTYPE = {
@@ -2124,7 +2142,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # stream, copies in the rows the sources left on this rank's sibling
         # partition. Both launches pass the same argument names, which is what keeps
         # the plan's cached argument struct (_launch_buf) from being rebuilt each time.
-        pull = self.cfg.card_dedup and not ll
+        # With card_pull_blocks the dispatch's own extra blocks do it instead.
+        pull = self.cfg.card_dedup and not ll and not self.cfg.card_pull_blocks
 
         def run(
             *,

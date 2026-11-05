@@ -227,10 +227,25 @@ class EpDispatchCombineConfig:
     # second launch at the end of dispatch(). Combine is unchanged. Every rank must
     # set it alike: it adds an arena region. None => MORI_EP_CARD_DEDUP=1 turns it on.
     card_dedup: bool = None
+    # card_dedup only. > 0: that many extra blocks copy the rows in while the
+    # dispatch is still sending, each as soon as its source has finished writing it,
+    # in place of the second launch. The dispatch grid grows by that many blocks and
+    # must still fit the CUs at one block each. None => MORI_EP_CARD_PULL_BLOCKS (0).
+    card_pull_blocks: int = None
+    # card_dedup only. Which partition a row both partitions of a card need lands on:
+    # "tok" alternates by token number, "src" picks the sender's own partition. None
+    # => MORI_EP_CARD_LAND ("tok").
+    card_land: str = None
 
     def __post_init__(self):
         if self.card_dedup is None:
             self.card_dedup = os.environ.get("MORI_EP_CARD_DEDUP", "0") == "1"
+        if self.card_pull_blocks is None:
+            self.card_pull_blocks = int(os.environ.get("MORI_EP_CARD_PULL_BLOCKS", "0"))
+        if self.card_land is None:
+            self.card_land = os.environ.get("MORI_EP_CARD_LAND", "tok")
+        if self.card_land not in ("tok", "src"):
+            raise ValueError(f"card_land={self.card_land!r} (have 'tok', 'src')")
         # Node grouping first: is_internode gates checks further down, and the
         # derived defaults below are cheaper to reason about once it is fixed.
         if self.gpu_per_node is None:
