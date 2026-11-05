@@ -24,7 +24,6 @@
 // Both runtimes must keep working, each on its own thread and port. RCCL's RAS client socket
 // is moved off 28028 with NCCL_RAS_ADDR, so the test doesn't collide with other jobs on the
 // host.
-#include <arpa/inet.h>
 #include <dirent.h>
 #include <gtest/gtest.h>
 #include <hip/hip_runtime_api.h>
@@ -41,7 +40,6 @@
 
 #include "mori/io/engine.hpp"
 #include "mori/ras/ras.hpp"
-#include "src/ras/fd_registry.hpp"
 #include "tests/cpp/ras/ras_test_util.hpp"
 
 using namespace mori::io;
@@ -82,15 +80,6 @@ int CountThreads(const std::string& name) {
   return count;
 }
 
-uint16_t LocalPort(int fd) {
-  sockaddr_storage a{};
-  socklen_t len = sizeof(a);
-  if (getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len) != 0) return 0;
-  if (a.ss_family == AF_INET) return ntohs(reinterpret_cast<sockaddr_in*>(&a)->sin_port);
-  if (a.ss_family == AF_INET6) return ntohs(reinterpret_cast<sockaddr_in6*>(&a)->sin6_port);
-  return 0;
-}
-
 // Outside CHILD_CHECK's 1-250, so it can't be mistaken for a failed check.
 constexpr int kNoGpu = 251;
 
@@ -127,14 +116,10 @@ int Body() {
   CHILD_CHECK(status.find("Job summary") != std::string::npos);
   CHILD_CHECK(status.find("RUNNING") != std::string::npos);
 
-  // Separate threads and ports: none of MORI's sockets uses RCCL's port or 28028.
+  // Separate threads and ports: MORI's listener uses neither RCCL's port nor 28028.
   CHILD_CHECK(CountThreads("mori-ras") == 1);
   RasEndpoint mine = rt->Endpoint();
   CHILD_CHECK(mine.port != rcclPort && mine.port != 28028);
-  for (int fd : fdreg::Snapshot()) {
-    uint16_t p = LocalPort(fd);
-    CHILD_CHECK(p != rcclPort && p != 28028);
-  }
 
   // RCCL itself still works while both runtimes run.
   float* buf = nullptr;

@@ -27,8 +27,6 @@
 #include <cerrno>
 #include <new>
 
-#include "src/ras/fd_registry.hpp"
-
 namespace mori {
 namespace ras {
 
@@ -53,14 +51,14 @@ EventQueue::EventQueue(size_t capacity) {
   cells_.reset(new Cell[cap]);
   mask_ = cap - 1;
   for (size_t i = 0; i < cap; ++i) cells_[i].seq.store(i, std::memory_order_relaxed);
-  wakeFd_ = fdreg::EventFd(0, EFD_NONBLOCK);
+  wakeFd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 }
 
 EventQueue::~EventQueue() {
   RasEvent ev;
   while (TryPop(&ev)) {
   }
-  fdreg::Close(wakeFd_);
+  if (wakeFd_ >= 0) close(wakeFd_);
 }
 
 bool EventQueue::TryPush(RasEvent&& ev) {

@@ -21,18 +21,13 @@
 // SOFTWARE.
 #include <fcntl.h>
 #include <gtest/gtest.h>
-#include <signal.h>
-#include <sys/prctl.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
-#include <atomic>
+#include <chrono>
 #include <cstdlib>
-#include <thread>
-#include <vector>
+#include <set>
 
 #include "mori/ras/ras.hpp"
-#include "src/ras/fd_registry.hpp"
 #include "tests/cpp/ras/ras_test_util.hpp"
 
 using namespace mori::ras;
@@ -42,155 +37,52 @@ namespace {
 
 StartParams Params() { return StartParams{"node-f", "host-f", "127.0.0.1", getpid()}; }
 
-bool IsOpen(int fd) { return fcntl(fd, F_GETFD) != -1; }
-
-bool ReadFull(int fd, void* buf, size_t n) {
-  auto* p = static_cast<char*>(buf);
-  while (n > 0) {
-    ssize_t r = read(fd, p, n);
-    if (r <= 0) return false;
-    p += r;
-    n -= static_cast<size_t>(r);
-  }
-  return true;
-}
-
 }  // namespace
 
-TEST(RasFork, AChildStartsAFreshRuntime) {
+TEST(RasFork, AForkedChildHasNoRuntimeAndLeavesTheParentsAlone) {
   EXPECT_EQ(RunInChild([] {
               setenv("MORI_RAS_ENABLE", "1", 1);
               RasRuntime* parent = RasRuntime::EnsureStarted(Params());
               CHILD_CHECK(parent != nullptr);
               RasEndpoint before = parent->Endpoint();
-              std::vector<int> rasFds = fdreg::Snapshot();
-              CHILD_CHECK(rasFds.size() >= 3);  // listener, epoll, eventfd
 
-              int rc = RunInChild([&] {
-                // Before anything else: no runtime, and none of the parent's RAS fds.
+              auto forked = std::chrono::steady_clock::now();
+              int rc = RunInChild([] {
                 CHILD_CHECK(RasRuntime::Get() == nullptr);
-                CHILD_CHECK(RasRuntime::Status().state == RunState::kNotStarted);
-                CHILD_CHECK(fdreg::Count() == 0);
-                for (int fd : rasFds) CHILD_CHECK(!IsOpen(fd));
-
-                RasRuntime* child = RasRuntime::EnsureStarted(
-                    StartParams{"node-f", "host-f", "127.0.0.1", static_cast<int32_t>(getpid())});
-                CHILD_CHECK(child != nullptr);
-                RasEndpoint after = child->Endpoint();
-                CHILD_CHECK(after.Valid());
-                CHILD_CHECK(after.uuid != before.uuid);
-                CHILD_CHECK(after.token != before.token);
-                CHILD_CHECK(after.port != before.port);
-                CHILD_CHECK(ras_test::CanConnect("127.0.0.1", after.port));
-                return 0;
+                CHILD_CHECK(RasRuntime::EnsureStarted(Params()) == nullptr);
+                CHILD_CHECK(RasRuntime::Status().state == RunState::kDisabled);
+                // Runs the atexit handler RAS registered. It must not wait up to 2 s for the
+                // parent's RAS thread, which isn't in this process.
+                std::exit(0);
               });
               CHILD_CHECK(rc == 0);
+              auto took = std::chrono::steady_clock::now() - forked;
+              // Under the 2 s Stop() waits. TSan alone adds 1 s to the exit.
+              CHILD_CHECK(took < std::chrono::milliseconds(1500));
 
-              // The parent's runtime is untouched by the fork: same runtime, every fd still open,
-              // and the listener still accepts.
               CHILD_CHECK(RasRuntime::Get() == parent);
+              CHILD_CHECK(RasRuntime::Status().state == RunState::kRunning);
               CHILD_CHECK(parent->Endpoint().uuid == before.uuid);
-              for (int fd : rasFds) CHILD_CHECK(IsOpen(fd));
               CHILD_CHECK(ras_test::CanConnect("127.0.0.1", before.port));
               return 0;
             }),
             0);
 }
 
-TEST(RasFork, AKilledParentsListenerRefusesConnectionsWhileItsChildLives) {
-  // The forked grandchild is reparented here when its parent dies, so it can be reaped.
-  ASSERT_EQ(prctl(PR_SET_CHILD_SUBREAPER, 1), 0);
-  int pipeFds[2];
-  ASSERT_EQ(pipe(pipeFds), 0);
-  int readyFds[2];
-  ASSERT_EQ(pipe(readyFds), 0);
-  pid_t parent = fork();
-  if (parent == 0) {
-    setpgid(0, 0);
-    close(pipeFds[0]);
-    close(readyFds[0]);
-    setenv("MORI_RAS_ENABLE", "1", 1);
-    RasRuntime* r = RasRuntime::EnsureStarted(Params());
-    uint16_t port = r != nullptr ? r->Endpoint().port : 0;
-    pid_t child = fork();
-    if (child == 0) {
-      // fork() returns here only after the child fork handlers ran, so the inherited RAS fds
-      // are closed by now. Say so, then outlive the parent, which is SIGKILLed without any
-      // chance to close its sockets.
-      char ready = 1;
-      if (write(readyFds[1], &ready, 1) != 1) _exit(1);
-      pause();
-      _exit(0);
-    }
-    close(readyFds[1]);  // only the grandchild holds it, so its death ends the test's wait
-    int32_t msg[2] = {port, child};
-    if (write(pipeFds[1], msg, sizeof(msg)) != sizeof(msg)) _exit(1);
-    pause();
-    _exit(0);
-  }
-  setpgid(parent, parent);
-  // However the test ends, nothing it forked outlives it.
-  struct Reaper {
-    pid_t group;
-    ~Reaper() {
-      kill(-group, SIGKILL);
-      while (waitpid(-group, nullptr, 0) > 0 || errno == EINTR) {
-      }
-      prctl(PR_SET_CHILD_SUBREAPER, 0);
-    }
-  } reaper{parent};
-
-  close(pipeFds[1]);
-  close(readyFds[1]);
-  int32_t msg[2] = {0, 0};
-  ASSERT_TRUE(ReadFull(pipeFds[0], msg, sizeof(msg)));
-  close(pipeFds[0]);
-  // Until the grandchild has run its fork handlers, it still holds the listener.
-  char ready = 0;
-  ASSERT_TRUE(ReadFull(readyFds[0], &ready, 1));
-  close(readyFds[0]);
-  uint16_t port = static_cast<uint16_t>(msg[0]);
-  pid_t child = msg[1];
-  ASSERT_NE(port, 0);
-  ASSERT_TRUE(ras_test::CanConnect("127.0.0.1", port));
-
-  kill(parent, SIGKILL);
-  waitpid(parent, nullptr, 0);
-  int err = 0;
-  EXPECT_LT(ras_test::ConnectTcp("127.0.0.1", port, &err), 0);
-  EXPECT_EQ(err, ECONNREFUSED) << "the child kept the killed parent's RAS listener";
-  EXPECT_EQ(kill(child, 0), 0) << "the child should still be alive";
-}
-
-TEST(RasFork, AForkNeverClosesAnFdThatIsNotRas) {
+TEST(RasFork, EveryRasFdIsCloseOnExec) {
   EXPECT_EQ(RunInChild([] {
+              std::set<int> before = ras_test::SocketLikeFds();
               setenv("MORI_RAS_ENABLE", "1", 1);
               CHILD_CHECK(RasRuntime::EnsureStarted(Params()) != nullptr);
-              // Churn RAS fds while the main thread forks, so forks land between RAS opens
-              // and closes and the fd numbers RAS frees get reused by the pipes below.
-              std::atomic<bool> stop{false};
-              std::thread churn([&] {
-                while (!stop.load()) {
-                  int fd = fdreg::Socket(AF_INET, SOCK_STREAM, 0);
-                  if (fd >= 0) fdreg::Close(fd);
-                }
-              });
-              int failures = 0;
-              for (int i = 0; i < 200; ++i) {
-                int p[2];
-                CHILD_CHECK(pipe(p) == 0);
-                int rc = RunInChild([&] {
-                  CHILD_CHECK(IsOpen(p[0]) && IsOpen(p[1]));
-                  CHILD_CHECK(fdreg::Count() == 0);
-                  return 0;
-                });
-                if (rc != 0) ++failures;
-                close(p[0]);
-                close(p[1]);
+              int checked = 0;
+              for (int fd : ras_test::SocketLikeFds()) {
+                if (before.count(fd) != 0) continue;
+                int flags = fcntl(fd, F_GETFD);
+                if (flags < 0) continue;  // a short-lived one, closed since
+                CHILD_CHECK(flags & FD_CLOEXEC);
+                ++checked;
               }
-              stop.store(true);
-              churn.join();
-              CHILD_CHECK(failures == 0);
+              CHILD_CHECK(checked >= 3);  // the listener, the epoll fd and the eventfd
               return 0;
             }),
             0);

@@ -76,8 +76,6 @@ class LinkManager {
   RuntimeSnapshot Snapshot() const;
   void AddDegraded(uint32_t reasons);
   uint32_t Degraded() const { return degraded_.load(std::memory_order_acquire); }
-  // In a forked child, whose copies of these fds the fork handler already closed.
-  void ForgetFds();
 
  private:
   void AcceptAll();

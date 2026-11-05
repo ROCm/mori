@@ -30,15 +30,12 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <vector>
 
 #include "mori/ras/ras.hpp"
 #include "mori/utils/mori_log.hpp"
-#include "src/ras/fd_registry.hpp"
 #include "src/ras/logging.hpp"
 
 namespace mori {
@@ -47,15 +44,7 @@ namespace {
 
 std::atomic<bool> g_logEnabled{true};
 
-// Every live core, so a forked child can orphan them. Heap-allocated and never freed, so no
-// static destructor runs while another thread may still use it at exit.
-std::mutex g_coresMu;
-std::vector<RasCore*>& Cores() {
-  static auto* cores = new std::vector<RasCore*>();
-  return *cores;
-}
-
-// The process-wide runtime. Its core is never freed either.
+// The process-wide runtime. Its core is never freed.
 std::mutex g_runtimeMu;
 std::atomic<RasCore*> g_core{nullptr};
 std::atomic<RasRuntime*> g_published{nullptr};
@@ -66,39 +55,18 @@ RuntimeStatus& StatusLocked() {
   return *status;
 }
 
-void RuntimePrepareFork() {
-  g_runtimeMu.lock();
-  g_coresMu.lock();
-}
-
-void RuntimeParentFork() {
-  g_coresMu.unlock();
-  g_runtimeMu.unlock();
-}
-
-// Runs after the fd registry's child handler has closed every RAS fd.
-void RuntimeChildFork() {
-  for (RasCore* core : Cores()) core->OrphanAfterFork();
-  Cores().clear();
-  g_core.store(nullptr, std::memory_order_release);
-  g_published.store(nullptr, std::memory_order_release);
-  StatusLocked() = RuntimeStatus{};
-  g_coresMu.unlock();
-  g_runtimeMu.unlock();
-}
-
-void InstallRuntimeForkHandlers() {
-  static std::once_flag once;
-  std::call_once(once, [] {
-    // The registry's handlers first: prepare handlers run in reverse order of registration and
-    // child handlers in order, so the locks nest the same way as in normal operation and the
-    // child closes the fds before orphaning the cores.
-    fdreg::InstallForkHandlers();
-    pthread_atfork(RuntimePrepareFork, RuntimeParentFork, RuntimeChildFork);
-  });
+// The process that first asked for the runtime. RAS doesn't follow a fork: in a child of that
+// process, the runtime is off. Checked before any lock, because a lock held at fork time stays
+// held in the child, which has no thread to release it.
+std::atomic<pid_t> g_ownerPid{0};
+bool InForkedChild() {
+  pid_t owner = g_ownerPid.load(std::memory_order_acquire);
+  return owner != 0 && owner != getpid();
 }
 
 void StopAtExit() {
+  // A forked child inherits this handler, but not the RAS thread it would stop.
+  if (InForkedChild()) return;
   DisableLoggingForExit();
   RasCore* core;
   {
@@ -147,26 +115,12 @@ spdlog::logger* RasLogger() {
 void DisableLoggingForExit() { g_logEnabled.store(false, std::memory_order_release); }
 
 RasCore::RasCore(CoreParams params) : params_(std::move(params)) {
-  InstallRuntimeForkHandlers();
   uuid_ = NewRuntimeUuid();
   token_ = NewToken();
-  std::lock_guard<std::mutex> lock(g_coresMu);
-  Cores().push_back(this);
 }
 
 RasCore::~RasCore() {
-  if (orphaned_.load(std::memory_order_acquire)) {
-    // A forked child's copy: nothing it points to may be touched, so leak it all.
-    (void)queue_.release();
-    (void)links_.release();
-    return;
-  }
   Stop();
-  {
-    std::lock_guard<std::mutex> lock(g_coresMu);
-    auto& cores = Cores();
-    cores.erase(std::remove(cores.begin(), cores.end(), this), cores.end());
-  }
   if (thread_ != nullptr) {
     // Abandoned by Stop: it may still be running, so it keeps the link manager and queue.
     (void)queue_.release();
@@ -178,7 +132,7 @@ bool RasCore::Start(std::string* error) {
   std::string scratch;
   if (error == nullptr) error = &scratch;
   if (running_.load()) return true;
-  if (stopped_.load() || orphaned_.load()) {
+  if (stopped_.load()) {
     *error = "the runtime was stopped";
     return false;
   }
@@ -246,7 +200,6 @@ void RasCore::ThreadMain() {
 }
 
 void RasCore::Stop() {
-  if (orphaned_.load()) return;
   bool expected = false;
   if (!stopped_.compare_exchange_strong(expected, true)) return;
   if (!running_.load()) return;
@@ -286,18 +239,17 @@ void RasCore::AddDegraded(uint32_t reasons) {
   if (links_) links_->AddDegraded(reasons);
 }
 
-void RasCore::OrphanAfterFork() {
-  orphaned_.store(true, std::memory_order_release);
-  running_.store(false, std::memory_order_release);
-  if (queue_) queue_->ForgetWakeFd();
-  if (links_) links_->ForgetFds();
+RasRuntime* RasRuntime::Get() {
+  if (InForkedChild()) return nullptr;
+  return g_published.load(std::memory_order_acquire);
 }
-
-RasRuntime* RasRuntime::Get() { return g_published.load(std::memory_order_acquire); }
 
 RasRuntime* RasRuntime::EnsureStarted(const StartParams& params) {
   if (RasRuntime* r = Get()) return r;
-  InstallRuntimeForkHandlers();
+  if (InForkedChild()) return nullptr;
+  // Set before taking the lock, so a child forked while this thread holds it sees RAS as off
+  // instead of waiting on it forever.
+  g_ownerPid.store(getpid(), std::memory_order_release);
   std::lock_guard<std::mutex> lock(g_runtimeMu);
   RuntimeStatus& status = StatusLocked();
   if (status.state == RunState::kRunning) return &g_facade;
@@ -340,6 +292,7 @@ RasRuntime* RasRuntime::EnsureStarted(const StartParams& params) {
 }
 
 RuntimeStatus RasRuntime::Status() {
+  if (InForkedChild()) return RuntimeStatus{RunState::kDisabled, 0, "RAS doesn't follow a fork"};
   std::lock_guard<std::mutex> lock(g_runtimeMu);
   RuntimeStatus status = StatusLocked();
   if (RasCore* core = g_core.load(std::memory_order_acquire)) {

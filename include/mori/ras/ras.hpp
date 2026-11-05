@@ -44,9 +44,10 @@
 //   loggers in function-local statics, which may already be destroyed. The runtime object is
 //   never freed, so a thread still calling in during exit reaches a stopped runtime, not freed
 //   memory.
-// - In a forked child, a pthread_atfork handler closes every RAS fd the child inherited, so a
-//   killed parent's listener really closes, and leaves the child with no runtime.
-//   The child's first EnsureStarted() starts a fresh one under a new runtime UUID.
+// - RAS doesn't follow a fork. In a child of a process that asked for RAS, Get() and
+//   EnsureStarted() return nullptr, so the child's engines advertise no endpoint, and the
+//   child's exit leaves the parent's runtime alone. RAS's sockets, epoll fd and eventfd are
+//   close-on-exec; a child that doesn't exec holds copies of them until it exits.
 //
 // Thread safety: every member may be called from any thread. Enqueue() never blocks.
 

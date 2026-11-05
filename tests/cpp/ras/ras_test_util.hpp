@@ -33,7 +33,9 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -109,6 +111,19 @@ inline uint16_t HoldPort(const std::string& host, int* fd) {
   socklen_t len = sizeof(addr);
   getsockname(*fd, reinterpret_cast<sockaddr*>(&addr), &len);
   return ntohs(addr.sin_port);
+}
+
+// This process's sockets and anonymous-inode fds (epoll, eventfd): the kinds RAS opens.
+inline std::set<int> SocketLikeFds() {
+  std::set<int> fds;
+  std::error_code ec;
+  for (const auto& e : std::filesystem::directory_iterator("/proc/self/fd", ec)) {
+    std::string target = std::filesystem::read_symlink(e.path(), ec).string();
+    if (target.rfind("socket:", 0) == 0 || target.rfind("anon_inode:", 0) == 0) {
+      fds.insert(std::stoi(e.path().filename().string()));
+    }
+  }
+  return fds;
 }
 
 }  // namespace ras_test

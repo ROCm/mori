@@ -34,7 +34,6 @@
 #include <vector>
 
 #include "mori/ras/ras.hpp"
-#include "src/ras/fd_registry.hpp"
 #include "src/ras/runtime.hpp"
 #include "tests/cpp/ras/ras_test_util.hpp"
 
@@ -135,14 +134,16 @@ TEST(RasRuntime, StartsOnceAndAdvertisesItsEndpoint) {
 // race. They must still make one runtime: one RAS thread, and the fds of one listener.
 TEST(RasRuntime, ThreadsThatStartAtOnceShareOneRuntime) {
   int fdsOfOneRuntime = RunInChild([] {
+    size_t before = ras_test::SocketLikeFds().size();
     setenv("MORI_RAS_ENABLE", "1", 1);
     if (RasRuntime::EnsureStarted(Params()) == nullptr) return 0;
-    return static_cast<int>(fdreg::Count());
+    return static_cast<int>(ras_test::SocketLikeFds().size() - before);
   });
   ASSERT_GT(fdsOfOneRuntime, 0);
 
   for (int round = 0; round < 20; ++round) {
     ASSERT_EQ(RunInChild([fdsOfOneRuntime] {
+                size_t before = ras_test::SocketLikeFds().size();
                 setenv("MORI_RAS_ENABLE", "1", 1);
                 constexpr int kThreads = 16;
                 std::atomic<int> waiting{0};
@@ -163,7 +164,8 @@ TEST(RasRuntime, ThreadsThatStartAtOnceShareOneRuntime) {
                 CHILD_CHECK(got[0] != nullptr);
                 for (RasRuntime* r : got) CHILD_CHECK(r == got[0]);
                 CHILD_CHECK(RasRuntime::Status().state == RunState::kRunning);
-                CHILD_CHECK(static_cast<int>(fdreg::Count()) == fdsOfOneRuntime);
+                CHILD_CHECK(static_cast<int>(ras_test::SocketLikeFds().size() - before) ==
+                            fdsOfOneRuntime);
                 // The thread names itself once it is configured, so give a second one time to.
                 CHILD_CHECK(WaitFor([] { return ThreadsNamed("mori-ras").size() == 1; }, 2000));
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));

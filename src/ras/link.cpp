@@ -32,7 +32,6 @@
 #include <cerrno>
 #include <cstring>
 
-#include "src/ras/fd_registry.hpp"
 #include "src/ras/logging.hpp"
 
 namespace mori {
@@ -52,6 +51,11 @@ struct Overloaded : Fs... {
 template <class... Fs>
 Overloaded(Fs...) -> Overloaded<Fs...>;
 
+void CloseFd(int& fd) {
+  if (fd >= 0) close(fd);
+  fd = -1;
+}
+
 }  // namespace
 
 uint64_t MonoNowNs() {
@@ -63,8 +67,8 @@ uint64_t MonoNowNs() {
 LinkManager::LinkManager(Options options) : opts_(std::move(options)) {}
 
 LinkManager::~LinkManager() {
-  fdreg::Close(listenFd_);
-  fdreg::Close(epollFd_);
+  CloseFd(listenFd_);
+  CloseFd(epollFd_);
 }
 
 bool LinkManager::Listen(const std::string& bindHost, std::string* error) {
@@ -89,7 +93,7 @@ bool LinkManager::Listen(const std::string& bindHost, std::string* error) {
   const uint16_t want = opts_.config.port;
   // An ephemeral pick can land on RCCL RAS's port if the host's range includes it.
   for (int attempt = 0; attempt < 8; ++attempt) {
-    int fd = fdreg::Socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int fd = socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) {
       *error = std::string("socket: ") + std::strerror(errno);
       return false;
@@ -103,14 +107,14 @@ bool LinkManager::Listen(const std::string& bindHost, std::string* error) {
     }
     if (bind(fd, reinterpret_cast<sockaddr*>(&addr), addrLen) != 0) {
       int err = errno;
-      fdreg::Close(fd);
+      CloseFd(fd);
       *error = err == EADDRINUSE ? "port " + std::to_string(want) + " on " + bindHost + " is in use"
                                  : std::string("bind: ") + std::strerror(err);
       return false;
     }
     if (listen(fd, kListenBacklog) != 0) {
       *error = std::string("listen: ") + std::strerror(errno);
-      fdreg::Close(fd);
+      CloseFd(fd);
       return false;
     }
     sockaddr_storage bound{};
@@ -120,7 +124,7 @@ bool LinkManager::Listen(const std::string& bindHost, std::string* error) {
         ntohs(bound.ss_family == AF_INET ? reinterpret_cast<sockaddr_in*>(&bound)->sin_port
                                          : reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port);
     if (want == 0 && port == kRcclRasPort) {
-      fdreg::Close(fd);
+      CloseFd(fd);
       continue;
     }
     listenFd_ = fd;
@@ -132,7 +136,7 @@ bool LinkManager::Listen(const std::string& bindHost, std::string* error) {
 }
 
 bool LinkManager::InitLoop(std::string* error) {
-  epollFd_ = fdreg::EpollCreate();
+  epollFd_ = epoll_create1(EPOLL_CLOEXEC);
   if (epollFd_ < 0) {
     *error = std::string("epoll_create1: ") + std::strerror(errno);
     return false;
@@ -194,10 +198,10 @@ void LinkManager::RunOnce(int maxWaitMs) {
 // The listener reserves the advertised endpoint; inbound connections are accepted and closed.
 void LinkManager::AcceptAll() {
   for (;;) {
-    int fd = fdreg::Accept(listenFd_, SOCK_NONBLOCK);
+    int fd = accept4(listenFd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0) return;
     ++inboundAccepted_;
-    fdreg::Close(fd);
+    CloseFd(fd);
     MarkDirty();
   }
 }
@@ -234,10 +238,8 @@ void LinkManager::Publish(uint64_t nowNs) {
 }
 
 void LinkManager::Shutdown() {
-  fdreg::Close(listenFd_);
-  listenFd_ = -1;
-  fdreg::Close(epollFd_);
-  epollFd_ = -1;
+  CloseFd(listenFd_);
+  CloseFd(epollFd_);
 }
 
 void LinkManager::RequestStop() {
@@ -260,11 +262,5 @@ void LinkManager::AddDegraded(uint32_t reasons) {
   degraded_.fetch_or(reasons, std::memory_order_acq_rel);
   if (opts_.events != nullptr) opts_.events->Wake();
 }
-
-void LinkManager::ForgetFds() {
-  listenFd_ = -1;
-  epollFd_ = -1;
-}
-
 }  // namespace ras
 }  // namespace mori

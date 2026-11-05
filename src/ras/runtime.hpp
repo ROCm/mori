@@ -72,10 +72,6 @@ class RasCore {
   RuntimeSnapshot Snapshot() const;
   void AddDegraded(uint32_t reasons);
 
-  // In a forked child: the thread is gone and the fd registry has closed the fds, so the core
-  // must never touch either again. It is leaked rather than destroyed.
-  void OrphanAfterFork();
-
  private:
   void ThreadMain();
 
@@ -85,10 +81,9 @@ class RasCore {
   std::string advertisedHost_;
   std::unique_ptr<EventQueue> queue_;
   std::unique_ptr<LinkManager> links_;
-  std::thread* thread_{nullptr};  // never deleted in a forked child, where it isn't running
+  std::thread* thread_{nullptr};
   std::atomic<bool> running_{false};
   std::atomic<bool> stopped_{false};
-  std::atomic<bool> orphaned_{false};
   std::mutex doneMu_;
   std::condition_variable doneCv_;
   bool threadDone_{false};

@@ -1,7 +1,6 @@
 set(MORI_RAS_SOURCES
     config.cpp
     event_queue.cpp
-    fd_registry.cpp
     identity.cpp
     link.cpp
     runtime.cpp)

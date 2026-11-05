@@ -65,8 +65,6 @@ class EventQueue {
   bool Enqueue(RasEvent&& ev);
   // Wakes the consumer without an event, e.g. to stop it.
   void Wake();
-  // In a forked child, whose copy of the eventfd the fork handler already closed.
-  void ForgetWakeFd() { wakeFd_ = -1; }
 
   // Consumer side, one thread only. Re-arms the wakeup; call it before Drain.
   void ConsumeWakeup();
