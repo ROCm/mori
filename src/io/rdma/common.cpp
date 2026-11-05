@@ -22,19 +22,12 @@
 #include "src/io/rdma/common.hpp"
 
 #include <infiniband/verbs.h>  // dereferences ibvHandle.qp (forward-declared in core)
-#include <linux/futex.h>
-#include <sys/syscall.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
-#include <climits>
 #include <cstdlib>
-#include <ctime>
 #include <limits>
 #include <numeric>
-#include <thread>
 #include <utility>
 
 #include "mori/io/env.hpp"
@@ -45,12 +38,7 @@
 namespace mori {
 namespace io {
 
-enum class SqReserveFailureKind : uint8_t {
-  None = 0,
-  Degraded,
-  ExceedsCapacity,
-  Timeout,
-};
+using SqReserveFailureKind = SubmissionLedger::ReserveFailure;
 
 enum class PostSendOpKind : uint8_t {
   BatchData = 0,
@@ -73,10 +61,6 @@ static int GetSqBackoffTimeoutUs() {
   return kBackoffTimeoutUs;
 }
 
-static void SetSqReserveFailureKind(SqReserveFailureKind* out, SqReserveFailureKind kind) {
-  if (out != nullptr) *out = kind;
-}
-
 static void AppendHint(std::string* message, const std::string& hint) {
   if (message == nullptr || hint.empty()) return;
   message->append(" Hint: ");
@@ -90,7 +74,7 @@ static std::string BuildNotifyHint() {
 
 static std::string BuildSqDepthHint(const EpPair& ep, size_t qpCount, int effectivePostBatchSize,
                                     PostSendOpKind opKind, SqReserveFailureKind failureKind) {
-  if (failureKind == SqReserveFailureKind::Degraded) return {};
+  if (failureKind == SqReserveFailureKind::Closed) return {};
 
   if (opKind == PostSendOpKind::Notification) {
     std::string hint;
@@ -126,7 +110,7 @@ static std::string BuildSqDepthHint(const EpPair& ep, size_t qpCount, int effect
     hint += ", or increasing RdmaBackendConfig::qpPerTransfer (current transfer uses " +
             std::to_string(qpCount) + " QP(s)) if additional QPs are available";
   }
-  hint += ". Current per-QP send WR limit is " + std::to_string(ep.maxSqDepth) + ".";
+  hint += ". Current per-QP send WR limit is " + std::to_string(ep.ledger->Capacity()) + ".";
   return hint;
 }
 
@@ -189,267 +173,14 @@ static std::string BuildPostSendFailureHint(int ret, const EpPair& ep, size_t qp
   return {};
 }
 
-uint64_t MakeNotifSendWrId(TransferUniqueId id) {
-  if ((id & kNotifSendWrIdTag) != 0) {
-    MORI_IO_ERROR("MakeNotifSendWrId: TransferUniqueId {} has bit 63 set; masking reserved tag",
-                  id);
-    id &= ~kNotifSendWrIdTag;
-  }
-  return kNotifSendWrIdTag | id;
+void NotifySqStateChanged(const EpPair& ep) { ep.ledger->NotifyAdmission(); }
+
+static bool TryReserveSqDepth(const EpPair& ep, int count, int epId, const char* op,
+                              std::string* message, SqReserveFailureKind* failure = nullptr) {
+  return ep.ledger->Reserve(count, GetSqBackoffTimeoutUs(), message, failure);
 }
 
-namespace {
-
-int* FutexAddr(std::atomic<uint32_t>* word) {
-  static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t));
-  static_assert(alignof(std::atomic<uint32_t>) >= alignof(uint32_t));
-  static_assert(std::atomic<uint32_t>::is_always_lock_free);
-  // Linux futex ABI requires an int* uaddr. Keep this cast local and pass the
-  // returned pointer only to the syscall; do not dereference it in C++.
-  return reinterpret_cast<int*>(word);
-}
-
-timespec ToTimespec(std::chrono::steady_clock::duration d) {
-  using namespace std::chrono;
-  if (d <= steady_clock::duration::zero()) return timespec{0, 0};
-  const auto ns = duration_cast<nanoseconds>(d);
-  timespec ts{};
-  ts.tv_sec = static_cast<time_t>(ns.count() / 1000000000LL);
-  ts.tv_nsec = static_cast<long>(ns.count() % 1000000000LL);
-  return ts;
-}
-
-enum class FutexWaitResult {
-  WokenOrChanged,
-  TimedOut,
-  Unavailable,
-};
-
-FutexWaitResult FutexWaitUntil(std::atomic<uint32_t>* word, uint32_t expected,
-                               std::chrono::steady_clock::time_point deadline) {
-  const auto now = std::chrono::steady_clock::now();
-  if (now >= deadline) return FutexWaitResult::TimedOut;
-
-  timespec timeout = ToTimespec(deadline - now);
-  const int rc = static_cast<int>(syscall(SYS_futex, FutexAddr(word), FUTEX_WAIT_PRIVATE,
-                                          static_cast<int>(expected), &timeout, nullptr, 0));
-  if (rc == 0) return FutexWaitResult::WokenOrChanged;
-
-  const int e = errno;
-  if (e == ETIMEDOUT) return FutexWaitResult::TimedOut;
-  if (e == EAGAIN || e == EINTR) return FutexWaitResult::WokenOrChanged;
-
-  static std::atomic<bool> loggedUnexpectedFutexWait{false};
-  if (!loggedUnexpectedFutexWait.exchange(true, std::memory_order_relaxed)) {
-    MORI_IO_WARN("FUTEX_WAIT_PRIVATE failed: errno={}", e);
-  }
-  return FutexWaitResult::Unavailable;
-}
-
-void FutexWakeAll(std::atomic<uint32_t>* word) {
-  const int rc = static_cast<int>(
-      syscall(SYS_futex, FutexAddr(word), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0));
-  if (rc < 0) {
-    MORI_IO_WARN("FUTEX_WAKE_PRIVATE failed: errno={}", errno);
-  }
-}
-
-}  // namespace
-
-void NotifySqStateChanged(const EpPair& ep) {
-  auto* event = ep.sqAdmission.get();
-  if (!event) return;
-
-  // Avoid an atomic RMW on the CQ hot path when no thread is waiting. A waiter
-  // that this load misses registers after the predicate update and re-checks
-  // sqDepth/degraded before sleeping, so it will not block on stale state.
-  if (event->waiters.load(kSqAdmissionOrder) == 0) return;
-
-  event->epoch.fetch_add(1, kSqAdmissionOrder);
-  FutexWakeAll(&event->epoch);
-}
-
-static bool TryReserveSqDepthOnce(const EpPair& ep, int wrCount) {
-  int observed = ep.sqDepth->load(kSqAdmissionOrder);
-  while (true) {
-    const int base = std::max(observed, 0);
-    if (base > ep.maxSqDepth - wrCount) return false;
-
-    const int desired = base + wrCount;
-    if (ep.sqDepth->compare_exchange_weak(observed, desired, kSqAdmissionOrder,
-                                          kSqAdmissionOrder)) {
-      return true;
-    }
-  }
-}
-
-static bool TryReserveSqDepthSpin(const EpPair& ep, int wrCount, int epId, const char* opTag,
-                                  std::string* errMsg,
-                                  SqReserveFailureKind* failureKind = nullptr) {
-  const int kBackoffTimeoutUs = GetSqBackoffTimeoutUs();
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
-  int backoff = 0;
-  while (true) {
-    if (ep.degraded && ep.degraded->load(kSqAdmissionOrder)) {
-      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
-      if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
-      return false;
-    }
-
-    if (TryReserveSqDepthOnce(ep, wrCount)) return true;
-
-    if (std::chrono::steady_clock::now() >= deadline) {
-      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
-      const int cur = ep.sqDepth->load(kSqAdmissionOrder);
-      MORI_IO_WARN(
-          "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})",
-          opTag, epId, cur, wrCount, ep.maxSqDepth, kBackoffTimeoutUs, backoff);
-      if (errMsg) {
-        *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
-                  " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
-                  " max=" + std::to_string(ep.maxSqDepth);
-      }
-      return false;
-    }
-
-    if (backoff < 16) {
-      std::this_thread::yield();
-    } else {
-      std::this_thread::sleep_for(std::chrono::microseconds(2));
-    }
-    backoff++;
-  }
-}
-
-static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const char* opTag,
-                              std::string* errMsg, SqReserveFailureKind* failureKind = nullptr) {
-  if (wrCount <= 0 || !ep.sqDepth) return true;
-  if (ep.degraded && ep.degraded->load(kSqAdmissionOrder)) {
-    SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
-    if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
-    return false;
-  }
-  if (wrCount > ep.maxSqDepth) {
-    SetSqReserveFailureKind(failureKind, SqReserveFailureKind::ExceedsCapacity);
-    MORI_IO_WARN("SQ request exceeds capacity ({}): ep={} requested={} max={}", opTag, epId,
-                 wrCount, ep.maxSqDepth);
-    if (errMsg) {
-      *errMsg = "SQ request exceeds capacity (" + std::string(opTag) +
-                "): ep=" + std::to_string(epId) + " requested=" + std::to_string(wrCount) +
-                " max=" + std::to_string(ep.maxSqDepth);
-    }
-    return false;
-  }
-
-  if (TryReserveSqDepthOnce(ep, wrCount)) return true;
-
-  auto* event = ep.sqAdmission.get();
-  if (!event) {
-    return TryReserveSqDepthSpin(ep, wrCount, epId, opTag, errMsg, failureKind);
-  }
-
-  const int timeoutUs = GetSqBackoffTimeoutUs();
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUs);
-  bool useFutex = true;
-  int futexFallbackBackoff = 0;
-
-  struct WaiterGuard {
-    explicit WaiterGuard(SqAdmissionEvent& ev_) : ev(ev_) {
-      ev.waiters.fetch_add(1, kSqAdmissionOrder);
-    }
-    ~WaiterGuard() { ev.waiters.fetch_sub(1, kSqAdmissionOrder); }
-    SqAdmissionEvent& ev;
-  } guard(*event);
-
-  while (true) {
-    const uint32_t observedEpoch = event->epoch.load(kSqAdmissionOrder);
-
-    if (ep.degraded && ep.degraded->load(kSqAdmissionOrder)) {
-      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
-      if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
-      return false;
-    }
-
-    if (TryReserveSqDepthOnce(ep, wrCount)) return true;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) {
-      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
-      const int cur = ep.sqDepth->load(kSqAdmissionOrder);
-      MORI_IO_WARN("SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us", opTag,
-                   epId, cur, wrCount, ep.maxSqDepth, timeoutUs);
-      if (errMsg) {
-        *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
-                  " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
-                  " max=" + std::to_string(ep.maxSqDepth);
-      }
-      return false;
-    }
-
-    if (useFutex) {
-      const FutexWaitResult waitResult = FutexWaitUntil(&event->epoch, observedEpoch, deadline);
-      if (waitResult != FutexWaitResult::Unavailable) {
-        continue;
-      }
-      useFutex = false;
-    }
-
-    if (futexFallbackBackoff < 16) {
-      std::this_thread::yield();
-    } else {
-      std::this_thread::sleep_for(std::chrono::microseconds(2));
-    }
-    futexFallbackBackoff++;
-  }
-}
-
-static void ReleaseSqDepth(const EpPair& ep, int wrCount) {
-  if (wrCount <= 0 || !ep.sqDepth) return;
-  ep.sqDepth->fetch_sub(wrCount, kSqAdmissionOrder);
-  NotifySqStateChanged(ep);
-}
-
-// When a multi-EP post gives up partway, the WRs already posted on the other EPs
-// have no signaled tail behind them, so no CQE will ever release their depth.
-// Park them as orphaned and mark those EPs degraded so the recovery path can
-// reclaim them.
-static void OrphanPendingWrsOnOtherEps(const EpPairVec& eps, int failedEpId, const char* reason,
-                                       const std::vector<int>& epWrsSinceSignal,
-                                       const std::vector<size_t>& epMergedSinceSignal,
-                                       const std::shared_ptr<CqCallbackMeta>& callbackMeta) {
-  for (size_t otherEpId = 0; otherEpId < eps.size(); ++otherEpId) {
-    if (static_cast<int>(otherEpId) == failedEpId) continue;
-    if (epWrsSinceSignal[otherEpId] <= 0) continue;
-    MORI_IO_WARN(
-        "{} on ep {}: moving pending unsignaled WRs on ep {} "
-        "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
-        reason, failedEpId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
-    if (eps[otherEpId].ledger) {
-      if (!eps[otherEpId].ledger->InsertOrphaned(
-              epWrsSinceSignal[otherEpId], callbackMeta,
-              static_cast<int>(epMergedSinceSignal[otherEpId]))) {
-        // A fatal event already closed this sibling. FailAll() cannot have
-        // released these WRs -- they were never in its ledger -- so the
-        // reservation is ours to give back, or the depth is lost for good.
-        MORI_IO_WARN(
-            "EP {} ledger is closed; reclaiming {} pending unsignaled WRs directly instead of "
-            "parking them as orphaned",
-            otherEpId, epWrsSinceSignal[otherEpId]);
-        ReleaseSqDepth(eps[otherEpId], epWrsSinceSignal[otherEpId]);
-      }
-    } else {
-      MORI_IO_WARN(
-          "EP {} has pending unsignaled WRs but no submission ledger; "
-          "sqDepth may remain stale until endpoint restart",
-          otherEpId);
-    }
-    if (eps[otherEpId].degraded) {
-      eps[otherEpId].degraded->store(true, kSqAdmissionOrder);
-    }
-    NotifySqStateChanged(eps[otherEpId]);
-  }
-}
+static void ReleaseSqDepth(const EpPair& ep, int count) { ep.ledger->CancelReservation(count); }
 
 namespace detail {
 
@@ -618,22 +349,20 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* dataStatus,
     sge.lkey = 0;
 
     struct ibv_send_wr wr{};
-    wr.wr_id = MakeNotifSendWrId(id);
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
     wr.sg_list = &sge;
     wr.num_sge = 1;
 
-    struct ibv_send_wr* bad_wr = nullptr;
-    int ret = Verbs().PostSend(ep.ibvHandle.qp, &wr, &bad_wr);
+    auto result = eps[i].ledger->PostToSq(ep.ibvHandle.qp, &wr, 1, SubmissionLedger::Kind::Notify,
+                                          nullptr, 0, true, id, 0, Verbs());
+    int ret = result.error;
     if (ret != 0) {
-      // WR i was reserved but failed to post if bad_wr points at this WR.
-      if (bad_wr == &wr) ReleaseSqDepth(eps[i], 1);
       // Any remaining endpoints are reserved but not posted yet.
       for (int j = i + 1; j < eps.size(); ++j) ReleaseSqDepth(eps[j], 1);
       std::string message =
           "ibv_post_send (notify) failed with " + std::to_string(ret) + ": " + strerror(ret);
-      AppendHint(&message, BuildPostSendFailureHint(ret, eps[i], eps.size(), -1, bad_wr,
+      AppendHint(&message, BuildPostSendFailureHint(ret, eps[i], eps.size(), -1, &wr,
                                                     PostSendOpKind::Notification));
       return {StatusCode::ERR_RDMA_OP, std::move(message)};
     }
@@ -706,7 +435,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   thread_local std::vector<MergedWorkRequest> tlMergedPool;
   thread_local std::vector<MergedWorkRequest> tlChunkedPool;
   thread_local std::vector<ChunkedSgeSegment> tlChunkPlan;
-  thread_local std::vector<int> tlEpWrsSinceSignal;
   thread_local std::vector<size_t> tlEpMergedSinceSignal;
   thread_local int reentryDepth = 0;
 
@@ -722,14 +450,12 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   std::vector<MergedWorkRequest> localMergedPool;
   std::vector<MergedWorkRequest> localChunkedPool;
   std::vector<ChunkedSgeSegment> localChunkPlan;
-  std::vector<int> localEpWrsSinceSignal;
   std::vector<size_t> localEpMergedSinceSignal;
 
   std::vector<size_t>& indices = usePool ? tlIndices : localIndices;
   std::vector<MergedWorkRequest>& mergedPool = usePool ? tlMergedPool : localMergedPool;
   std::vector<MergedWorkRequest>& chunkedPool = usePool ? tlChunkedPool : localChunkedPool;
   std::vector<ChunkedSgeSegment>& chunkPlan = usePool ? tlChunkPlan : localChunkPlan;
-  std::vector<int>& epWrsSinceSignal = usePool ? tlEpWrsSinceSignal : localEpWrsSinceSignal;
   std::vector<size_t>& epMergedSinceSignal =
       usePool ? tlEpMergedSinceSignal : localEpMergedSinceSignal;
 
@@ -925,9 +651,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   {
     int minMaxSqDepth = std::numeric_limits<int>::max();
     for (size_t epId = 0; epId < epNum; ++epId) {
-      if (eps[epId].sqDepth && eps[epId].maxSqDepth > 0) {
-        minMaxSqDepth = std::min(minMaxSqDepth, eps[epId].maxSqDepth);
-      }
+      minMaxSqDepth = std::min(minMaxSqDepth, eps[epId].ledger->OrdinaryLimit());
     }
     if (minMaxSqDepth != std::numeric_limits<int>::max() && postBatchSize > minMaxSqDepth)
       postBatchSize = minMaxSqDepth;
@@ -935,7 +659,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   if (postBatchSize <= 0) postBatchSize = 1;
   int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
 
-  epWrsSinceSignal.assign(epNum, 0);
   epMergedSinceSignal.assign(epNum, 0);
   const bool roctxTransferEnabled = mori::io::MoriRoctxTransferEnabled();
   // ADDITIVE (MORI_ROCTX_TRANSFER=1): payload bytes accumulated since the last
@@ -978,7 +701,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       mergedReqSize += mergedWr.mergedRequests;
     }
 
-    epWrsSinceSignal[epId] += batchWrNum;
     epMergedSinceSignal[epId] += mergedReqSize;
     if (roctxTransferEnabled) {
       size_t batchBytes = 0;
@@ -989,134 +711,24 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     }
 
     bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
-    bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
-    bool needSignal = isLastBatchForEp || sqNearFull;
-
-    struct ibv_send_wr& last = mergedWrs[end - 1].wr;
-    uint64_t recordId = 0;
-    // Keeps the record in Posting state across ibv_post_send below, so a fatal
-    // async event cannot retire it while the WR is still on its way to the wire.
-    SubmissionLedger::PostGuard postGuard;
-    if (needSignal) {
-      if (!eps[epId].ledger) {
-        ReleaseSqDepth(eps[epId], batchWrNum);
-        return {StatusCode::ERR_RDMA_OP,
-                "submission ledger is not initialized for signaled WR tracking"};
-      }
-      postGuard = eps[epId].ledger->InsertForPost(epWrsSinceSignal[epId], callbackMeta,
-                                                  static_cast<int>(epMergedSinceSignal[epId]));
-      recordId = postGuard.RecordId();
-      if (!postGuard) {
-        // A fatal async event retired this endpoint while we were mid-post. The
-        // signaled WR must not go out: its CQE is what would complete everything
-        // unsignaled behind it, and this QP/CQ can no longer produce one. Give
-        // back the depth held on this EP and park what the siblings already
-        // posted, so the caller sees a failure instead of waiting forever.
-        ReleaseSqDepth(eps[epId], epWrsSinceSignal[epId]);
-        epWrsSinceSignal[epId] = 0;
-        epMergedSinceSignal[epId] = 0;
-        OrphanPendingWrsOnOtherEps(eps, epId, "endpoint retired by a fatal async event",
-                                   epWrsSinceSignal, epMergedSinceSignal, callbackMeta);
-        return {StatusCode::ERR_RDMA_OP,
-                "endpoint was failed by a fatal verbs async event; submission rejected"};
-      }
-      last.wr_id = recordId;
-      last.send_flags = IBV_SEND_SIGNALED;
-      // ADDITIVE (MORI_ROCTX_TRANSFER=1): start an ASYNC post-to-completion range
-      // for this signaled WR, keyed by (ledger, recordId). It stops when the CQE
-      // is processed or, if this WR fails to post, in the cleanup below. The
-      // range includes submission/ibv_post_send, NIC/SQ queueing, transfer, CQ
-      // availability/polling, and software processing through marker stop.
-      if (roctxTransferEnabled) {
-        mori::io::MoriRoctxTransferStart(eps[epId].ledger.get(), recordId,
-                                         static_cast<uint64_t>(id), isRead,
-                                         static_cast<uint64_t>(epBytesSinceSignal[epId]));
-      }
+    auto result = eps[epId].ledger->PostToSq(
+        eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, batchWrNum, SubmissionLedger::Kind::Data,
+        callbackMeta, static_cast<int>(epMergedSinceSignal[epId]), isLastBatchForEp, id,
+        roctxTransferEnabled ? epBytesSinceSignal[epId] : 0, Verbs());
+    if (result.error == ECANCELED) {
+      return {StatusCode::ERR_RDMA_OP, "endpoint is closed; submission rejected"};
     }
-
-    struct ibv_send_wr* badWr = nullptr;
-    int ret = Verbs().PostSend(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
-    if (ret != 0) {
-      int postedCount = 0;
-      if (badWr != nullptr) {
-        struct ibv_send_wr* cur = &mergedWrs[st].wr;
-        while (cur != nullptr && cur != badWr && postedCount < batchWrNum) {
-          ++postedCount;
-          cur = cur->next;
-        }
-      }
-      postedCount = std::max(0, std::min(postedCount, batchWrNum));
-      const int unpostedCount = batchWrNum - postedCount;
-      if (unpostedCount > 0) {
-        ReleaseSqDepth(eps[epId], unpostedCount);
-        epWrsSinceSignal[epId] = std::max(0, epWrsSinceSignal[epId] - unpostedCount);
-
-        size_t mergedUnposted = 0;
-        for (int j = st + postedCount; j < end; ++j) {
-          mergedUnposted += mergedWrs[j].mergedRequests;
-        }
-        if (epMergedSinceSignal[epId] >= mergedUnposted) {
-          epMergedSinceSignal[epId] -= mergedUnposted;
-        } else {
-          epMergedSinceSignal[epId] = 0;
-        }
-      }
-
-      const bool lastWasPosted = (postedCount == batchWrNum);
-      if (needSignal && lastWasPosted) {
-        // Signaled WR was posted; CQ path (ledger->ReleaseByCqe) owns the release.
-        postGuard.MarkPosted();
-        postGuard.Commit();
-      } else if (needSignal) {
-        // The signaled WR never reached the wire, so no CQE will arrive for it.
-        // Committing un-posted drops the record before the orphan bookkeeping
-        // below re-accounts the same WRs.
-        postGuard.Commit();
-        if (roctxTransferEnabled) {
-          // The signaled WR never posted, so no CQE will arrive. Stop its async
-          // range here to avoid a leaked range.
-          mori::io::MoriRoctxTransferStop(eps[epId].ledger.get(), recordId);
-        }
-      }
-
-      if (postedCount > 0 && (!needSignal || !lastWasPosted)) {
-        MORI_IO_WARN(
-            "ibv_post_send partially posted {} / {} WRs without a posted signaled tail; "
-            "marking EP {} as degraded until recovery",
-            postedCount, batchWrNum, epId);
-        if (eps[epId].ledger) {
-          if (!eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
-                                                static_cast<int>(epMergedSinceSignal[epId]))) {
-            // Closed ledger: nothing will ever reclaim these through recovery,
-            // so release the reservation here and stop counting them.
-            ReleaseSqDepth(eps[epId], epWrsSinceSignal[epId]);
-            epWrsSinceSignal[epId] = 0;
-            epMergedSinceSignal[epId] = 0;
-          }
-        }
-        if (eps[epId].degraded) {
-          eps[epId].degraded->store(true, kSqAdmissionOrder);
-        }
-        NotifySqStateChanged(eps[epId]);
-      }
-
-      OrphanPendingWrsOnOtherEps(eps, epId, "ibv_post_send failed", epWrsSinceSignal,
-                                 epMergedSinceSignal, callbackMeta);
-
-      std::string message = "ibv_post_send failed with " + std::to_string(ret) + ": " +
-                            strerror(ret) + " (posted " + std::to_string(postedCount) + "/" +
-                            std::to_string(batchWrNum) + " WRs)";
-      AppendHint(&message, BuildPostSendFailureHint(ret, eps[epId], epNum, postBatchSize, badWr,
-                                                    PostSendOpKind::BatchData));
+    if (result.error) {
+      std::string message = "ibv_post_send failed with " + std::to_string(result.error) + ": " +
+                            strerror(result.error) + " (posted " + std::to_string(result.posted) +
+                            "/" + std::to_string(batchWrNum) + " WRs)";
+      const ibv_send_wr* bad =
+          result.posted < batchWrNum ? &mergedWrs[st + result.posted].wr : nullptr;
+      AppendHint(&message, BuildPostSendFailureHint(result.error, eps[epId], epNum, postBatchSize,
+                                                    bad, PostSendOpKind::BatchData));
       return {StatusCode::ERR_RDMA_OP, std::move(message)};
     }
-
-    if (needSignal) {
-      // The whole chain is on the wire; the CQE for this record now owns the
-      // sqDepth release. Releasing the guard lets a pending FailAll() proceed.
-      postGuard.MarkPosted();
-      postGuard.Commit();
-      epWrsSinceSignal[epId] = 0;
+    if (result.signaledSeq) {
       epMergedSinceSignal[epId] = 0;
       if (roctxTransferEnabled) epBytesSinceSignal[epId] = 0;
     }

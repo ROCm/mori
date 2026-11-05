@@ -177,23 +177,11 @@ class PendingEndpointGuard {
   bool armed_{false};
 };
 
-static void LogAsyncTransferFailureIfNeeded(internal::IoCallDiagnostics* diagnostics, uint32_t code,
-                                            const std::string& message) {
-  if (diagnostics == nullptr || diagnostics->Label() == nullptr) return;
-
-  internal::IoFailureKind failureKind = diagnostics->CurrentFailureKind();
-  if (failureKind != internal::IoFailureKind::FlushCascade ||
-      !diagnostics->TryMarkLogged(failureKind)) {
-    return;
-  }
-
-  MORI_IO_DEBUG("{} error {} message {}", diagnostics->Label(), code, message);
-}
-
-static CqeFailureOrigin ClassifyCqeFailureOrigin(uint64_t wrId, uint32_t notifPerQp) {
-  if (IsNotifSendWrId(wrId)) return CqeFailureOrigin::NotificationSend;
-  if (wrId < notifPerQp) return CqeFailureOrigin::NotificationRecv;
-  return CqeFailureOrigin::BatchTransfer;
+static CqeFailureOrigin ClassifyCqeFailureOrigin(uint64_t wrId, const EpPair& ep) {
+  if (!IsSqWrId(wrId)) return CqeFailureOrigin::NotificationRecv;
+  return ep.ledger->KindForCompletion(wrId) == SubmissionLedger::Kind::Notify
+             ? CqeFailureOrigin::NotificationSend
+             : CqeFailureOrigin::BatchTransfer;
 }
 
 static CqeFailureAdvice DescribeCqeFailure(ibv_wc_status status, CqeFailureOrigin origin,
@@ -319,6 +307,9 @@ RdmaManager::~RdmaManager() {
   // Join the monitor thread first: its handlers reach back into this object and
   // into endpoint ledgers, neither of which may be torn down under it.
   asyncEventMonitor_.reset();
+  SnapshotVector runtimes;
+  SnapshotEndpointRuntimes(runtimes);
+  for (const auto& rt : runtimes) rt->ep.ledger->FreezeForShutdown();
 
   for (const auto& [device, port] : availDevices) {
     Verbs().ReleaseAsyncContext(device->GetIbvContext());
@@ -575,6 +566,11 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
         "maxCqeNum ({}) is smaller than SQ+RQ depth ({}+{}={}); increasing maxCqeNum to {}",
         epConfig.maxCqeNum, epConfig.maxMsgsNum, epConfig.maxRecvWr, minRequiredCqe, newCqeNum);
     epConfig.maxCqeNum = newCqeNum;
+    if (newCqeNum < minRequiredCqe) {
+      MORI_IO_WARN(
+          "CQ capacity {} cannot hold SQ+RQ flushes {}; CQ_ERR makes quiescence unprovable",
+          newCqeNum, minRequiredCqe);
+    }
   }
   if (desiredMsgSge.has_value()) {
     if (*desiredMsgSge > maxSge) {
@@ -655,11 +651,7 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
             remoteKey,
             local,
             remote,
-            std::make_shared<std::atomic<int>>(0),
-            static_cast<int>(epConfig.maxMsgsNum),
-            std::make_shared<std::atomic<bool>>(false),
-            std::make_shared<SubmissionLedger>(config.notifPerQp),
-            std::make_shared<SqAdmissionEvent>()};
+            std::make_shared<SubmissionLedger>(epConfig.maxMsgsNum)};
   meta.rTable[topoKey].push_back(ep);
 
   EndpointId id = nextEndpointId_.fetch_add(1);
@@ -782,20 +774,14 @@ int RdmaManager::FailInFlightTransfers(const QpErrorEvent& event) {
     if (!EndpointAffectedByAsyncEvent(event, rt->ep)) continue;
 
     ++affectedEps;
-    // Close admission before failing the ledger, not after: the endpoint cannot
-    // carry traffic again without being rebuilt, and turning submitters away
-    // first keeps the window in which one can still reach the ledger as small as
-    // possible. FailAll() closes the ledger outright, which is what actually
-    // makes this airtight for a submitter already past the check.
-    if (rt->ep.degraded) rt->ep.degraded->store(true, kSqAdmissionOrder);
-    failed += rt->ep.ledger->FailAll(StatusCode::ERR_RDMA_OP, message, rt->ep.sqDepth.get());
-    NotifySqStateChanged(rt->ep);
+    failed += rt->ep.ledger->FailAll(StatusCode::ERR_RDMA_OP, message,
+                                     event.scope != QpErrorEvent::Scope::kQueuePair);
   }
 
   if (affectedEps > 0) {
     MORI_IO_ERROR(
-        "async event {}: failed {} in-flight transfer(s) across {} endpoint(s); endpoints marked "
-        "degraded and will reject new submissions until rebuilt",
+        "async event {}: failed {} in-flight transfer(s) across {} endpoint(s); endpoints closed "
+        " and will reject new submissions until rebuilt",
         event.eventName, failed, affectedEps);
   } else if (event.scope == QpErrorEvent::Scope::kQueuePair) {
     MORI_IO_WARN("async event {}: no live endpoint matched (qpn={}); nothing to fail",
@@ -921,8 +907,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
     for (int i = 0; i < n; ++i) {
       if (wc[i].status != IBV_WC_SUCCESS) {
         const bool isFlush = (wc[i].status == IBV_WC_WR_FLUSH_ERR);
-        const CqeFailureOrigin failureOrigin =
-            ClassifyCqeFailureOrigin(wc[i].wr_id, config.notifPerQp);
+        const CqeFailureOrigin failureOrigin = ClassifyCqeFailureOrigin(wc[i].wr_id, ep);
         const CqeFailureAdvice failureAdvice =
             isFlush ? CqeFailureAdvice{ibv_wc_status_str(wc[i].status), {}}
                     : DescribeCqeFailure(wc[i].status, failureOrigin, config);
@@ -959,62 +944,9 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
           rdma->RecordQpFailed(ep);
         }
 
-        int mergedBatchSize = 0;
-        auto meta = ep.ledger
-                        ? ep.ledger->ReleaseByCqe(wc[i].wr_id, ep.sqDepth.get(), &mergedBatchSize)
-                        : nullptr;
-        // ADDITIVE (MORI_ROCTX_TRANSFER=1): stop the post-to-completion range for this
-        // signaled WR on a FAILED/flush CQE (no-op if none was started for it).
-        mori::io::MoriRoctxTransferStop(ep.ledger ? ep.ledger.get() : nullptr, wc[i].wr_id);
-        if (meta) {
-          (void)meta->finishedBatchSize.fetch_add(mergedBatchSize);
-          if (isFlush) {
-            meta->diagnostics.MarkFlushCascade();
-          } else {
-            meta->diagnostics.MarkRootCause();
-          }
-          LogAsyncTransferFailureIfNeeded(&meta->diagnostics,
-                                          static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
-                                          failureAdvice.ComposeStatusMessage());
-          TransferStatus* statusPtr = meta->status.exchange(nullptr, std::memory_order_acq_rel);
-          if (statusPtr != nullptr) {
-            meta->ReportData(statusPtr, StatusCode::ERR_RDMA_OP,
-                             failureAdvice.ComposeStatusMessage());
-          }
-          // A closed ledger means a fatal async event already retired this
-          // endpoint, so its degraded flag is terminal rather than the
-          // partial-post kind this path recovers from.
-          if (ep.degraded && ep.degraded->load(kSqAdmissionOrder) && ep.ledger &&
-              !ep.ledger->Closed()) {
-            const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
-            ep.degraded->store(false, kSqAdmissionOrder);
-            MORI_IO_WARN(
-                "ProcessOneCqe: recovered degraded EP eid={} qpn={} by releasing {} orphaned WRs",
-                rt->id, ep.local.handle.qpn, orphanedReleased);
-          }
-          NotifySqStateChanged(ep);
-        } else if (IsNotifSendWrId(wc[i].wr_id)) {
-          if (ep.sqDepth) {
-            ep.sqDepth->fetch_sub(1, kSqAdmissionOrder);
-            NotifySqStateChanged(ep);
-          }
-          if (!isFlush) {
-            MORI_IO_WARN(
-                "ProcessOneCqe: failed notification SEND CQE, transfer_id={}, released 1 sqDepth",
-                ExtractTransferIdFromWrId(wc[i].wr_id));
-          }
-        } else if (wc[i].wr_id < config.notifPerQp) {
-          if (!isFlush) {
-            MORI_IO_WARN("ProcessOneCqe: failed notification RECV CQE, wr_id={} (recv_idx)",
-                         wc[i].wr_id);
-          }
-        } else {
-          if (!isFlush) {
-            MORI_IO_WARN(
-                "ProcessOneCqe: failed CQE wr_id={} in ledger range but no record found, "
-                "sqDepth may be stale",
-                wc[i].wr_id);
-          }
+        if (IsSqWrId(wc[i].wr_id)) {
+          ep.ledger->OnSqCompletion(wc[i].wr_id, wc[i].status,
+                                    failureAdvice.ComposeStatusMessage());
         }
         continue;
       }
@@ -1056,45 +988,11 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         wr.num_sge = 1;
         struct ibv_recv_wr* bad = nullptr;
         SYSCALL_RETURN_ZERO(Verbs().PostRecv(ep.local.ibvHandle.qp, &wr, &bad));
-      } else if (wc[i].opcode == IBV_WC_SEND) {
-        if (!IsNotifSendWrId(wc[i].wr_id)) {
-          MORI_IO_WARN(
-              "ProcessOneCqe: unexpected SEND completion with non-notification wr_id {}; "
-              "releasing 1 sqDepth under current SEND invariant",
-              wc[i].wr_id);
-        }
-        if (ep.sqDepth) {
-          ep.sqDepth->fetch_sub(1, kSqAdmissionOrder);
-          NotifySqStateChanged(ep);
-        }
-      } else {
-        // Batch path: wr_id carries a recordId from the SubmissionLedger.
-        uint64_t recordId = wc[i].wr_id;
-        int mergedBatchSize = 0;
-        auto meta = ep.ledger
-                        ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &mergedBatchSize)
-                        : nullptr;
-        // ADDITIVE (MORI_ROCTX_TRANSFER=1): stop the post-to-completion range after
-        // processing the signaled WR's successful CQE.
-        mori::io::MoriRoctxTransferStop(ep.ledger ? ep.ledger.get() : nullptr, recordId);
-        if (meta) {
-          NotifySqStateChanged(ep);
-          uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
-          if ((finishedBefore + mergedBatchSize) == meta->totalBatchSize) {
-            // Claim before updating so a concurrent async-event failure cannot
-            // then overwrite a transfer that actually completed.
-            TransferStatus* statusPtr = meta->status.exchange(nullptr, std::memory_order_acq_rel);
-            if (statusPtr != nullptr) {
-              meta->ReportData(statusPtr, StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
-            }
-          }
-          MORI_IO_TRACE("ProcessOneCqe: batch CQE for task {} total={} finished={} cur={}",
-                        meta->id, meta->totalBatchSize, finishedBefore, mergedBatchSize);
-        } else {
-          MORI_IO_WARN(
-              "ProcessOneCqe: no ledger record for wr_id {} (recordId {}); sqDepth may be stale",
-              wc[i].wr_id, recordId);
-        }
+      } else if (IsSqWrId(wc[i].wr_id)) {
+        if (!ep.ledger->OnSqCompletion(wc[i].wr_id, wc[i].status,
+                                       ibv_wc_status_str(wc[i].status)) &&
+            rdma != nullptr)
+          rdma->RecordQpFailed(ep);
       }
     }
   }

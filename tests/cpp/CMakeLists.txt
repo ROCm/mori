@@ -72,7 +72,8 @@ if(BUILD_IO)
 
   target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR}/include)
   target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR})
-  target_link_libraries(test_engine mori_application mori_io)
+  # RealVerbs can be instantiated here when fault injection is off.
+  target_link_libraries(test_engine mori_application mori_io mori_ibv_shim)
 
   add_executable(bench_engine io/bench_engine.cpp)
 

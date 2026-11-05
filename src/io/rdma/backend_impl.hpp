@@ -118,7 +118,7 @@ class RdmaManager {
   bool HasIonicDevice() const;
 
   // Fails every in-flight transfer on the endpoints implicated by a fatal verbs
-  // async event, and marks them degraded so later submissions fail fast instead
+  // async event, and closes their ledger so later submissions fail fast instead
   // of queueing onto a dead QP. Returns the number of transfers this call moved
   // to a failed state.
   int FailInFlightTransfers(const QpErrorEvent& event);
