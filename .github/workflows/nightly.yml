@@ -448,6 +448,14 @@ jobs:
             rdma_tc: 104
             ct: podman
             timeout_minutes: 45
+            # These hosts' amdgpu-dkms lacks 93aa919 ("drm/amdkfd: fix vram
+            # allocation failure for a special case"): hipMemCreate (VRAM with no VA
+            # yet) fails with EADDRINUSE, reported as out of memory, while any SVM
+            # range sits below its size, and libhsakmt registers every pageable
+            # buffer HIP pins for a copy as one. HSA_USE_SVM=0 registers them as
+            # userptr instead. Not in the image: with SVM off every pageable copy is
+            # pinned again. Drop it once the hosts' amdgpu-dkms carries the fix.
+            hsa_use_svm: 0
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC]
@@ -462,6 +470,7 @@ jobs:
             rdma_tc: 104
             ct: podman
             timeout_minutes: 45
+            hsa_use_svm: 0  # as the py3.10 entry
           # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
           # both only on the RoCE path. mlx5_8 is deliberately not in
           # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
@@ -508,6 +517,7 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
       # Perf dashboard capture on node1/rank0 (MI355X_AINIC only for now).
       MORI_PERF_OUT: ${{ matrix.platform == 'MI355X_AINIC' && format('{0}/_perf/perf.jsonl', github.workspace) || '' }}
       MORI_PERF_RUN_ID: ${{ github.run_id }}
@@ -551,6 +561,7 @@ jobs:
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            ${HSA_USE_SVM:+-e HSA_USE_SVM=$HSA_USE_SVM} \
             -e MORI_PERF_OUT=$MORI_PERF_OUT \
             -e MORI_PERF_RUN_ID=$MORI_PERF_RUN_ID \
             -e MORI_PERF_COMMIT=$MORI_PERF_COMMIT \
@@ -594,6 +605,7 @@ jobs:
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              ${HSA_USE_SVM:+-e HSA_USE_SVM=$HSA_USE_SVM} \
               -e MORI_IO_BENCH_ENGINE_BIN=$GITHUB_WORKSPACE/build_bench/tests/cpp/bench_engine \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
               -w $GITHUB_WORKSPACE \
@@ -1017,6 +1029,7 @@ jobs:
       MORI_RDMA_DEVICES: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7  # as ci_cco.yml
       MORI_RDMA_SL: 3
       MORI_RDMA_TC: 104
+      HSA_USE_SVM: 0  # the amdgpu-dkms workaround, see test-wheel-internode
       IMAGE: rocm/mori:ci-flydsl-${{ matrix.flydsl }}
       BASE_IMAGE: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.12.0
       CONTAINER: mori_flydsl_compat_${{ github.run_id }}_${{ strategy.job-index }}
@@ -1042,6 +1055,7 @@ jobs:
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -e HSA_USE_SVM=$HSA_USE_SVM \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity

@@ -769,6 +769,14 @@ jobs:
             rdma_tc: 104
             ct: podman
             timeout_minutes: 45
+            # These hosts' amdgpu-dkms lacks 93aa919 ("drm/amdkfd: fix vram
+            # allocation failure for a special case"): hipMemCreate (VRAM with no VA
+            # yet) fails with EADDRINUSE, reported as out of memory, while any SVM
+            # range sits below its size, and libhsakmt registers every pageable
+            # buffer HIP pins for a copy as one. HSA_USE_SVM=0 registers them as
+            # userptr instead. Not in the image: with SVM off every pageable copy is
+            # pinned again. Drop it once the hosts' amdgpu-dkms carries the fix.
+            hsa_use_svm: 0
           # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
           # both only on the RoCE path. mlx5_8 is deliberately not in
           # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
@@ -815,6 +823,7 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
       - name: Fix workspace permissions
@@ -859,6 +868,7 @@ jobs:
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
             ${MORI_RDMA_SL:+-e MORI_RDMA_SL=$MORI_RDMA_SL} \
             ${MORI_RDMA_TC:+-e MORI_RDMA_TC=$MORI_RDMA_TC} \
+            ${HSA_USE_SVM:+-e HSA_USE_SVM=$HSA_USE_SVM} \
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
@@ -901,6 +911,7 @@ jobs:
               -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
               ${MORI_RDMA_SL:+-e MORI_RDMA_SL=$MORI_RDMA_SL} \
               ${MORI_RDMA_TC:+-e MORI_RDMA_TC=$MORI_RDMA_TC} \
+              ${HSA_USE_SVM:+-e HSA_USE_SVM=$HSA_USE_SVM} \
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
