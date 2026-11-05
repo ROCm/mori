@@ -426,6 +426,9 @@ struct EndpointRuntime {
   // locking NotifManager::mu on every poll. Type-erased (void*) to avoid a header
   // dependency on the NotifManager-private struct; nullptr until registered.
   std::atomic<void*> notifCtx{nullptr};
+  // Set by the CQ poller at this endpoint's first error completion, so a QP whose first
+  // error is a flush, with no failed work request before it, is reported once, by name.
+  std::atomic<bool> firstErrorSeen{false};
 };
 
 using EpPairVec = std::vector<EpPair>;

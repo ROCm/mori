@@ -927,10 +927,25 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
             isFlush ? CqeFailureAdvice{ibv_wc_status_str(wc[i].status), {}}
                     : DescribeCqeFailure(wc[i].status, failureOrigin, config);
 
+        const bool firstErrorOnQp = !rt->firstErrorSeen.exchange(true, std::memory_order_relaxed);
         if (isFlush) {
           flushDrain.Record(wc[i].qp_num);
           MORI_IO_DEBUG("ProcessOneCqe: flush error #{}: wr_id={} qp_num={}", flushDrain.count,
                         wc[i].wr_id, wc[i].qp_num);
+          // The WR that fails completes with its own status before the rest flush, and a peer
+          // or path that stops answering fails one too (retry counter exceeded). A QP whose
+          // first error is a flush had none fail: it was put in the error state locally.
+          if (firstErrorOnQp) {
+            MORI_IO_ERROR(
+                "ProcessOneCqe: QP {} on {} port {} (eid={}, engine {}) entered the error state "
+                "with no failed work request. A peer or path that stops answering would have "
+                "failed one (retry counter exceeded), so the QP was moved there on this node: by "
+                "an RDMA async event (logged separately, e.g. for a request it rejected as the "
+                "responder), by this process, or by the NIC driver or firmware. Check this "
+                "node's dmesg",
+                wc[i].qp_num, rdma != nullptr ? rdma->DeviceName(ep.ldevId) : std::string("?"),
+                ep.local.handle.portId, rt->id, ep.remoteEngineKey);
+          }
         } else {
           // Non-flush error: this is the root cause — always log at ERROR.
           if (failureAdvice.HasHint()) {
@@ -1123,9 +1138,9 @@ void NotifManager::EmitFlushSummaryIfNeeded(const FlushRoundStats& roundStats) {
       MORI_IO_ERROR(
           "CQ poll round summary: {} flush errors across {} endpoint(s); "
           "representative eid={} qp_num={}. "
-          "Flush errors are cascaded from QP(s) entering Error State. "
-          "Check: (1) peer process alive, (2) PFC / network congestion, "
-          "(3) ibv_devinfo / dmesg for HW errors",
+          "Flush errors follow a QP entering the error state; each QP's first error is logged "
+          "on its own, as a [ROOT CAUSE] completion or as a QP that entered the error state "
+          "with no failed work request",
           roundStats.total, roundStats.endpointCount, roundStats.sampleEndpointId,
           roundStats.sampleQpNum);
     } else {
@@ -1133,9 +1148,9 @@ void NotifManager::EmitFlushSummaryIfNeeded(const FlushRoundStats& roundStats) {
           "CQ poll round summary: {} flush errors across {} endpoint(s); "
           "representative eid={} qp_num={}; in "
           "consecutive flush round #{} (rate-limited). "
-          "Flush errors are cascaded from QP(s) entering Error State. "
-          "Check: (1) peer process alive, (2) PFC / network congestion, "
-          "(3) ibv_devinfo / dmesg for HW errors",
+          "Flush errors follow a QP entering the error state; each QP's first error is logged "
+          "on its own, as a [ROOT CAUSE] completion or as a QP that entered the error state "
+          "with no failed work request",
           roundStats.total, roundStats.endpointCount, roundStats.sampleEndpointId,
           roundStats.sampleQpNum, flushSummaryStreak_);
     }
