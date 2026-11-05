@@ -59,12 +59,13 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_buf_tensor,
 )
 
-from stage1_sdma import Arena, memrealtime, post_rest_chunks
+from stage1_sdma import Arena, memrealtime, memtime, post_rest_chunks
 
 
 #: ``trace``: int64 slots per workgroup, and work items recorded per workgroup (8 + 3 * items).
-TRACE_STRIDE = 1024
-TRACE_ITEMS = 338
+TRACE_STRIDE = 2048
+TRACE_SLOTS = 5  # per item: gate start, gate passed, done (100 MHz); passed, done (s_memtime)
+TRACE_ITEMS = (TRACE_STRIDE - 8) // TRACE_SLOTS
 
 
 class WindowAScaleLoader(AScaleLoader):
@@ -250,6 +251,16 @@ def compile_gemm1_sdma(
                 if tid == fx.Int32(0):
                     buf[bid * fx.Int32(TRACE_STRIDE) + slot] = memrealtime()
 
+        def stamp_mt(buf, slot):
+            """``buf[bid * TRACE_STRIDE + slot]`` = the shader clock (thread 0)."""
+            if const_expr(trace and gate_npes):
+                if tid == fx.Int32(0):
+                    buf[bid * fx.Int32(TRACE_STRIDE) + slot] = memtime()
+
+        def stamp_at(buf, idx):
+            """``buf[idx]`` = the 100 MHz clock, by whichever lane runs this."""
+            buf[idx] = memrealtime()
+
         stamp(trace_buf, fx.Int32(0))
         if const_expr(gate_npes):
             import mori.cco.device.flydsl as cco
@@ -262,16 +273,21 @@ def compile_gemm1_sdma(
             n_tile = flat - m_tile * fx.Int32(n_tiles)
             # item number of this work item in this workgroup (the loop below is a static stride)
             item = (flat - (bid - fx.Int32(1))) // fx.Int32(num_cu - 1)
-            slot0 = (item < fx.Int32(TRACE_ITEMS)).select(fx.Int32(8) + item * fx.Int32(3), fx.Int32(TRACE_STRIDE - 3))
+            slot0 = (item < fx.Int32(TRACE_ITEMS)).select(fx.Int32(8) + item * fx.Int32(TRACE_SLOTS), fx.Int32(TRACE_STRIDE - TRACE_SLOTS))
             if const_expr(gate_npes):
                 stamp(trace_buf, slot0)
                 e_local = sched.expert_of(m_tile)
                 if (tid < fx.Int32(gate_npes)) & (tid != fx.Int32(gate_rank)):
+                    # RELAXED on purpose: an acquire load emits ``buffer_inv sc0 sc1`` -- a
+                    # whole-L2 invalidate -- and this runs once per TILE, with the weights in
+                    # that L2. ``need`` is published by the source before it bumps its flag,
+                    # and the kernel already did one system acquire after waiting for the
+                    # flags, so every ``need`` is visible by the time any tile runs. The load
+                    # itself is system-scope (``sc0 sc1``), so it does not hit a stale line.
                     need = fx.Int32(
                         comm_ops.load_i32_global_system(
                             fx.Int64(arg_win) + fx.Int64(gate_arena.off_need)
                             + fx.Int64(tid * fx.Int32(gate_epr) + e_local) * fx.Int64(4),
-                            acquire=True,
                         )
                     )
                     cco.DevComm(arg_dev_comm).sdma().wait_signal(
@@ -279,6 +295,7 @@ def compile_gemm1_sdma(
                     )
                 fx.barrier()
                 stamp(trace_buf, slot0 + fx.Int32(1))
+                stamp_mt(trace_buf, slot0 + fx.Int32(3))
             do_tile(
                 m_tile, n_wave_base + n_tile * fx.Int32(tile_n), sched.expert_of(m_tile), sched,
                 a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf, a_scale_lds,
@@ -287,6 +304,7 @@ def compile_gemm1_sdma(
             )
             if const_expr(gate_npes):
                 stamp(trace_buf, slot0 + fx.Int32(2))
+                stamp_mt(trace_buf, slot0 + fx.Int32(4))
 
         if const_expr(gate_npes):
             if bid == fx.Int32(0):
@@ -296,12 +314,20 @@ def compile_gemm1_sdma(
                     rank=gate_rank, arena=gate_arena, cco=cco,
                 )
                 stamp(trace_buf, fx.Int32(2))
+                if const_expr(trace):
+                    # trace only: when the last chunk from each peer has landed (WG0 is idle
+                    # here): ``trace[8 + peer]``
+                    if (tid < fx.Int32(gate_npes)) & (tid != fx.Int32(gate_rank)):
+                        cco.DevComm(arg_dev_comm).sdma().wait_signal(tid, 0, fx.Int64(expected[tid]))
+                        stamp_at(trace_buf, fx.Int32(8) + tid)
             else:
                 if tid < fx.Int32(gate_npes):
+                    # also relaxed: the poll is a system-scope load, and the single
+                    # ``fence_system_acquire`` below is what makes the data it guards visible.
+                    # With ``acquire=True`` every poll iteration invalidated the whole L2.
                     comm_ops.spin_until_ge_i32_system(
                         fx.Int64(arg_win) + fx.Int64(gate_arena.off_flags) + fx.Int64(tid) * fx.Int64(4),
                         expected[fx.Int32(gate_npes) + tid],
-                        acquire=True,
                     )
                 fx.barrier()
                 # The only cache invalidation of the kernel. A tile does none after it has seen

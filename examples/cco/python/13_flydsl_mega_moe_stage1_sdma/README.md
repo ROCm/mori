@@ -94,9 +94,45 @@ aiter's graph has rewritten the shared tables, are checked bit for bit against a
 four kernels (0.02-0.09 ms); aiter's two-kernel side barely moves.
 
 aiter's fixed-slot dispatch (no compact plan; 48 experts per rank only, i.e. V4-Pro and Flash,
-on by default up to mtpr 128, `AITER_MEGA_FIXED_SLOT_MAX_MTPR` extends it) is NOT in this
-comparison: every point here is mtpr >= 256, where aiter runs compact. GLM-5.2 (32 experts per
+on by default up to mtpr 128, `AITER_MEGA_FIXED_SLOT_MAX_MTPR` extends it) is NOT in the table
+above: every point there is mtpr >= 256, where aiter runs compact. GLM-5.2 (32 experts per
 rank) is always compact.
+
+### Against the faster of aiter's two modes (V4.1-Flash)
+
+Both aiter modes measured on the same node and run, with
+`AITER_MEGA_FIXED_SLOT_MAX_MTPR=16383` for the fixed-slot side, and the SDMA side with
+`--split 3 --stage-first`:
+
+| tokens/rank | aiter compact | aiter fixed-slot | SDMA | vs the faster one |
+|---|---|---|---|---|
+| 256 | 0.341 | **0.255** | **0.215** | 1.19x |
+| 512 | 0.380 | 0.383 | **0.271** | 1.40x |
+| 1024 | **0.466** | 0.611 | **0.388** | 1.20x |
+| 2048 | **0.674** | — | **0.592** | 1.14x |
+| 4096 | **0.933** | — | **0.842** | 1.11x |
+
+Milliseconds, CUDA graph, median of 30 replays, bit-exact. fixed-slot wins at 256, ties at
+512 and is 32% behind compact by 1024, so compact is taken as aiter's best at 2048/4096
+(fixed-slot was not measured there). The 1.40x at 256 in the first table is against compact
+alone; against fixed-slot the same point is 1.19x.
+
+### What the cache operations cost
+
+Most of the gain above came from counting `buffer_wbl2` (whole-L2 writeback) and `buffer_inv`
+(whole-L2 invalidate) in the ISA rather than from algorithmic tuning. On gfx950 every
+`fence_*_release` is a writeback and every acquire load is an invalidate:
+
+| kernel | `buffer_wbl2` | `buffer_inv` | what was removed |
+|---|---|---|---|
+| prepare | 3 -> 1 | — | `tree_barrier(release=False)` where the data was published by atomics or by write-through stores; the two `fence_system_release` in the route push |
+| GEMM1 | 0 | 4 -> 1 | the per-TILE acquire on `need`, and the per-poll acquire in the start gate |
+| layout | 2 -> 0 | 4 -> 3 | both barriers' release, and the per-poll acquire in the flags spin |
+
+The other rule that came out of this: a cross-device access is uncached, so what costs time is
+the number of SERIALISED round trips, not bytes. The route push ended with one thread walking
+the 8 peers (scount store + flag bump = 16 sequential trips, ~10 us); one lane per peer instead
+is ~2.5 us. Packing its four 4 B stores into one 16 B store changed nothing and was dropped.
 
 ### Measured and not kept
 
