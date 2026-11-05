@@ -75,6 +75,44 @@ poisoned calls. The layout kernel takes 0.025-0.044 ms.
 For comparison, the route-push path WITH the compact plan timed is 0.92-1.04x over 512-16384
 on the same node (`test_gemm1.py` reports 0.98-1.33x for it because it leaves the plan out).
 
+### In a CUDA graph
+
+`test_recv_layout.py --graph` also captures each side in a CUDA graph (SDMA: `arm` + prepare +
+layout + gated GEMM1; aiter: compact prepare + fused stage1) and times replays the same way
+(sync and barrier between calls), after the eager numbers in the same process. `arm()` takes a
+device tensor of chunk counts, so it is captured too. Three poisoned replays, and one more after
+aiter's graph has rewritten the shared tables, are checked bit for bit against aiter.
+
+| tokens/rank | 256 | 512 | 1024 | 4096 | 16384 |
+|---|---|---|---|---|---|
+| GLM-5.2 | 1.26x (eager 1.17x) | | 1.19x (1.13x) | 1.10x (1.06x) | 1.02x (0.99x) |
+| V4-Pro | 1.16x (1.07x) | | 1.09x (1.06x) | 1.02x (1.01x) | 0.98x (0.97x) |
+| V4.1-Flash | 1.40x (1.29x) | 1.30x (1.23x) | 1.12x (1.08x) | 1.03x (1.00x) | 0.98x (0.96x) |
+
+8x MI355X, aiter 46cdc4c52, `--chunk-rows 256 --early-chunks 2`; Flash 256/512 on a second node
+(the 256 point repeats to the same 1.40x). The graph removes the launch gaps of the SDMA side's
+four kernels (0.02-0.09 ms); aiter's two-kernel side barely moves.
+
+aiter's fixed-slot dispatch (no compact plan; 48 experts per rank only, i.e. V4-Pro and Flash,
+on by default up to mtpr 128, `AITER_MEGA_FIXED_SLOT_MAX_MTPR` extends it) is NOT in this
+comparison: every point here is mtpr >= 256, where aiter runs compact. GLM-5.2 (32 experts per
+rank) is always compact.
+
+### Measured and not kept
+
+* `--stream-group G` (prepare puts every chunk itself, a group of G chunks as soon as the quant
+  pass that fills it is done; per-pass counters, no rendezvous): GLM-5.2 bs 16384 removes the
+  GEMM1 head wait (64-90 us -> 6-14 us per workgroup) but prepare and layout grow by as much;
+  best 3.861 ms against 3.908 ms (cr 512, G 1), ~1%.
+* `--early-chunks` x `--chunk-rows` at bs 16384 is flat. Caveat: before this change FlyDSL's
+  cache key did not see the `Arena` (it keys on closure scalars only), so a GEMM1 compiled for
+  one chunk_rows / early_chunks could be reused for another from the same cache directory. The
+  kernels now close over `repr(arena)`; sweeps run before this should be redone.
+
+`--trace N` (in `test_recv_layout.py`) prints where in GEMM1's tile order the gates wait, in ten
+slices: at bs 16384 essentially all of the wait is in the first slice; the later ones wait only
+their ~4 us of gate overhead.
+
 ## Status -- read before relying on it
 
 * Needs aiter with `MegaMoEV2`'s compact prepare (its plan tables are reused for the route
@@ -93,7 +131,8 @@ on the same node (`test_gemm1.py` reports 0.98-1.33x for it because it leaves th
   The gain is the dispatch overhead, which is roughly fixed, over a GEMM1 that grows with the
   token count: that overhead is 41% of the call at bs 512 and 18% at bs 8192 (`--trace`).
 * One call at a time. Nothing yet protects `S` and `R` between back-to-back calls (the tests
-  put a barrier between calls), and the SDMA signal / flag totals are kept by the host.
+  put a barrier between calls), and the SDMA signal / flag totals are advanced by `arm()` (a
+  device tensor op, so it can be captured in a graph).
 * Not done, and measured not to be worth it: GEMM1 does not do this rank's tokens first. A tile
   mixes all source ranks, so a local-first tile has to be padded -- this rank owns 1/8 of an
   expert's rows against a 64 or 128-row tile -- and the padding costs more GEMM1 time than the

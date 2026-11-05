@@ -63,8 +63,8 @@ from stage1_sdma import Arena, memrealtime, post_rest_chunks
 
 
 #: ``trace``: int64 slots per workgroup, and work items recorded per workgroup (8 + 3 * items).
-TRACE_STRIDE = 128
-TRACE_ITEMS = 40
+TRACE_STRIDE = 1024
+TRACE_ITEMS = 338
 
 
 class WindowAScaleLoader(AScaleLoader):
@@ -155,6 +155,9 @@ def compile_gemm1_sdma(
     ``[2]`` end, ``[3]`` its number of work items, and from ``[8]`` per item ``(gate start, gate
     passed, item done)``, up to ``TRACE_ITEMS`` items. Workgroup 0 (comm): start and end only.
     """
+    # FlyDSL's cache key holds a closure's scalars only, not ``gate_arena``: its repr has to be
+    # one, or a kernel compiled for another chunk_rows / early_chunks is reused.
+    GATE_KEY = repr(gate_arena)
     gate_npes = gate_arena.npes if gate_arena else 0
     gate_epr = gate_arena.experts_per_rank if gate_arena else 0
     assert tile_k == 256 and model_dim % tile_k == 0 and tile_n % num_waves == 0
@@ -190,6 +193,7 @@ def compile_gemm1_sdma(
         arg_cnt: fx.Int64, arg_trace: fx.Int64,
     ):
     # fmt: on
+        _ = GATE_KEY
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         a_buf = lds.pool
         a_scale_lds = lds.A_scale
