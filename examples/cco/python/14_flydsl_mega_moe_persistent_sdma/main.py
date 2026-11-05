@@ -256,8 +256,12 @@ def _time_graph(fn, iters):
 def run_bench(args, rank, world, device):
     moe, ref_w = _build(args, rank, world, device)
     rows = []
+    # Every token count takes the first rows of one max-size input, as aiter's MegaMoE test
+    # does: the timings then compare one to one (at 2048 / 4096 tokens a differently drawn
+    # routing alone moved the layer time by 0.06 ms, from the per-rank load).
+    full = _make_inputs(args.max_tok, rank, args.seed, device)
     for bs in [int(v) for v in args.bs_list.split(",")]:
-        inp = _make_inputs(bs, rank, args.seed, device)
+        inp = tuple(t[:bs].contiguous() for t in full)
         ms_ = [_time_graph(lambda: moe(*inp), args.iters) for _ in range(args.rounds)]
         # Graph replays must leave the protocol state valid: check the output after them.
         rel = _rel_l2(moe(*inp).clone(), _reference(*inp, ref_w, rank, world))
