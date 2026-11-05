@@ -103,7 +103,8 @@ if(BUILD_IO)
 
     # CPU-only regression checks with provider stand-ins; no libibverbs link.
     add_executable(test_fault_injector io/test_fault_injector.cpp
-                   ${CMAKE_SOURCE_DIR}/src/io/rdma/fault_injector.cpp)
+                   ${CMAKE_SOURCE_DIR}/src/io/rdma/fault_injector.cpp
+                   ${CMAKE_SOURCE_DIR}/src/io/rdma/ledger.cpp)
     target_include_directories(test_fault_injector PRIVATE ${CMAKE_SOURCE_DIR}
                                ${CMAKE_SOURCE_DIR}/include
                                ${CMAKE_SOURCE_DIR}/3rdparty/msgpack-c/include)

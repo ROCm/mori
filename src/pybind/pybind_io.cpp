@@ -156,6 +156,11 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readwrite("host", &mori::io::IOEngineConfig::host)
       .def_readwrite("port", &mori::io::IOEngineConfig::port);
 
+  py::enum_<mori::io::QuiescenceState>(m, "QuiescenceState")
+      .value("Pending", mori::io::QuiescenceState::Pending)
+      .value("Quiesced", mori::io::QuiescenceState::Quiesced)
+      .value("Unprovable", mori::io::QuiescenceState::Unprovable);
+
   py::class_<mori::io::TransferStatus>(m, "TransferStatus")
       .def(py::init<>())
       .def("Code", &mori::io::TransferStatus::Code)
@@ -167,6 +172,12 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("Failed", &mori::io::TransferStatus::Failed)
       .def("SetCode", &mori::io::TransferStatus::SetCode)
       .def("SetMessage", &mori::io::TransferStatus::SetMessage)
+      .def("Quiescence", &mori::io::TransferStatus::Quiescence)
+      .def("Quiesced", &mori::io::TransferStatus::Quiesced)
+      .def("WaitQuiescence", &mori::io::TransferStatus::WaitQuiescence, py::arg("timeout_ms") = -1,
+           py::call_guard<py::gil_scoped_release>())
+      .def("WaitQuiesced", &mori::io::TransferStatus::WaitQuiesced, py::arg("timeout_ms") = -1,
+           py::call_guard<py::gil_scoped_release>())
       .def("Wait", &mori::io::TransferStatus::Wait, py::call_guard<py::gil_scoped_release>())
       .def("WaitFor", &mori::io::TransferStatus::WaitFor, py::arg("timeout_ms") = -1,
            py::call_guard<py::gil_scoped_release>());

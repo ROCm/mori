@@ -58,6 +58,95 @@ void WaitEpoch(std::atomic<uint32_t>& word, uint32_t expected,
 }
 }  // namespace
 
+namespace {
+void WakeParts(std::atomic<int>& word) {
+  static_assert(sizeof(word) == sizeof(uint32_t));
+  syscall(SYS_futex, reinterpret_cast<int*>(&word), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr,
+          0);
+}
+}  // namespace
+
+void CqCallbackMeta::Seal() {
+  sealed.store(true, std::memory_order_release);
+  WakeParts(unfinishedParts);
+}
+
+void CqCallbackMeta::Finish(TransferStatus* s, Outcome* part, StatusCode code,
+                            const std::string& message) {
+  {
+    std::lock_guard<std::mutex> lock(outcomeMu);
+    *part = Outcome{code, message};
+  }
+  if (unfinishedParts.fetch_sub(1, std::memory_order_acq_rel) != 2) {
+    WakeParts(unfinishedParts);
+    return;
+  }
+  // The last result owns the publication phase. Zero is visible only after Update.
+  {
+    std::lock_guard<std::mutex> lock(outcomeMu);
+    const auto& report = awaitsNotification && dataOutcome.code <= StatusCode::ERR_BEGIN &&
+                                 notificationOutcome.code > StatusCode::ERR_BEGIN
+                             ? notificationOutcome
+                             : dataOutcome;
+    s->Update(report.code, report.message);
+  }
+  unfinishedParts.fetch_sub(1, std::memory_order_release);
+  WakeParts(unfinishedParts);
+}
+
+bool CqCallbackMeta::WaitDataFor(int timeoutMs) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(outcomeMu, std::try_to_lock);
+      if (lock && dataOutcome.code != StatusCode::IN_PROGRESS)
+        return dataOutcome.code == StatusCode::SUCCESS;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::yield();
+  }
+}
+
+QuiescenceState CqCallbackMeta::Quiescence(int waitMs) {
+  int parts = unfinishedParts.load(std::memory_order_acquire);
+  if (parts == kQuiesced) return QuiescenceState::Quiesced;
+  // No target reads (or marker drive) until every posting shard has returned.
+  if (sealed.load(std::memory_order_acquire)) {
+    std::shared_ptr<SubmissionLedger> pending;
+    for (auto& [weak, seq] : target) {
+      if (!seq) continue;
+      auto ledger = weak.lock();
+      if (!ledger) return QuiescenceState::Unprovable;
+      if (ledger->Done() >= seq) continue;
+      if (ledger->Frozen()) return QuiescenceState::Unprovable;
+      pending = std::move(ledger);
+    }
+    if (!pending && parts == 0) {
+      unfinishedParts.compare_exchange_strong(parts, kQuiesced, std::memory_order_acq_rel);
+      return QuiescenceState::Quiesced;
+    }
+    if (pending && waitMs) {
+      pending->WaitForChange(waitMs);
+      return Quiescence();
+    }
+  }
+  if (waitMs) {
+    timespec slice{waitMs / 1000, (waitMs % 1000) * 1000000L};
+    syscall(SYS_futex, reinterpret_cast<int*>(&unfinishedParts), FUTEX_WAIT_PRIVATE, parts, &slice,
+            nullptr, 0);
+    return Quiescence();
+  }
+  return QuiescenceState::Pending;
+}
+
+void SubmissionLedger::WaitForChange(int timeoutMs) {
+  admission_.waiters.fetch_add(1, kSqAdmissionOrder);
+  auto epoch = admission_.epoch.load(kSqAdmissionOrder);
+  WaitEpoch(admission_.epoch, epoch,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs));
+  admission_.waiters.fetch_sub(1, kSqAdmissionOrder);
+}
+
 SubmissionLedger::SubmissionLedger(int capacity) : capacity_(capacity) {
   if (capacity < 2) throw std::invalid_argument("SQ capacity must be at least 2");
   size_t size = 1;

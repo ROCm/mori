@@ -27,6 +27,7 @@ namespace mori {
 namespace io {
 
 struct TransferStatus;
+struct CqCallbackMeta;
 
 // Seam over the ibverbs calls on MORI-IO's host data path. Every such call site
 // goes through Verbs() so a build with MORI_IO_FAULT_INJECTION can swap in the
@@ -50,7 +51,7 @@ class VerbsOps {
   virtual void ReleaseAsyncContext(ibv_context* ctx) = 0;
   virtual void ForgetAsyncEndpoint(ibv_context* ctx, uint32_t qpn, ibv_cq* cq) = 0;
   // Test builds can stage a notification fault after the data has completed.
-  virtual void BeforeNotify(ibv_qp* qp, TransferStatus* status) = 0;
+  virtual void BeforeNotify(ibv_qp* qp, CqCallbackMeta* meta) = 0;
 };
 
 // The real calls: standard libibverbs ibv_*, not a vendor direct-verbs API.
@@ -79,7 +80,7 @@ class RealVerbs final : public VerbsOps {
   void UnwatchAsyncContext(ibv_context*) override {}
   void ReleaseAsyncContext(ibv_context*) override {}
   void ForgetAsyncEndpoint(ibv_context*, uint32_t, ibv_cq*) override {}
-  void BeforeNotify(ibv_qp*, TransferStatus*) override {}
+  void BeforeNotify(ibv_qp*, CqCallbackMeta*) override {}
 };
 
 #ifdef MORI_IO_FAULT_INJECTION

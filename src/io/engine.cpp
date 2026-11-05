@@ -117,6 +117,7 @@ TransferUniqueId IOEngineSession::AllocateTransferUniqueId() {
 
 void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
                            TransferStatus* status, TransferUniqueId id) {
+  status->CheckReusable();
   MORI_IO_FUNCTION_TIMER;
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session read");
@@ -129,6 +130,7 @@ void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
 
 void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id) {
+  status->CheckReusable();
   MORI_IO_FUNCTION_TIMER;
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session write");
@@ -142,6 +144,7 @@ void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size
 
 void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                 const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+  status->CheckReusable();
   MORI_IO_FUNCTION_TIMER;
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session batch read");
@@ -155,6 +158,7 @@ void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remo
 void IOEngineSession::BatchWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                  const SizeVec& sizes, TransferStatus* status,
                                  TransferUniqueId id) {
+  status->CheckReusable();
   MORI_IO_FUNCTION_TIMER;
   // ADDITIVE (MORI_ROCTX=1): brackets the host write dispatch for this transfer.
   mori::io::MoriRoctxRange _mori_roctx_("mori.io.session_batch_write", static_cast<uint64_t>(id));
@@ -592,6 +596,7 @@ std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) c
 
 void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                     size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
+  status->CheckReusable();
   MORI_IO_FUNCTION_TIMER;
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine read");
@@ -607,6 +612,7 @@ void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const Memor
 void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
                      size_t remoteOffset, size_t size, TransferStatus* status,
                      TransferUniqueId id) {
+  status->CheckReusable();
   MORI_IO_FUNCTION_TIMER;
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine write");
@@ -633,6 +639,7 @@ void IOEngine::BatchRead(const MemDescVec& localDest, const BatchSizeVec& localO
   assert(batchSize == ids.size());
 
   for (size_t i = 0; i < batchSize; i++) {
+    status[i]->CheckReusable();
     std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
     internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine batch read");
     Backend* backend = nullptr;
@@ -662,6 +669,7 @@ void IOEngine::BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localO
   assert(batchSize == ids.size());
 
   for (size_t i = 0; i < batchSize; i++) {
+    status[i]->CheckReusable();
     std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
     internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine batch write");
     Backend* backend = nullptr;

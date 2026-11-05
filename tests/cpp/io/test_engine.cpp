@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -196,7 +197,7 @@ class LedgerVerbs : public VerbsOps {
   void UnwatchAsyncContext(ibv_context*) override {}
   void ReleaseAsyncContext(ibv_context*) override {}
   void ForgetAsyncEndpoint(ibv_context*, uint32_t, ibv_cq*) override {}
-  void BeforeNotify(ibv_qp*, TransferStatus*) override {}
+  void BeforeNotify(ibv_qp*, CqCallbackMeta*) override {}
 };
 
 SubmissionLedger::PostResult PostLedger(SubmissionLedger& ledger, LedgerVerbs& verbs, int count,
@@ -210,6 +211,111 @@ SubmissionLedger::PostResult PostLedger(SubmissionLedger& ledger, LedgerVerbs& v
   }
   return ledger.PostToSq(nullptr, wrs.data(), count, SubmissionLedger::Kind::Data, meta,
                          credit ? credit : count, final, meta->id, 0, verbs);
+}
+
+void CaseReusableStatusContention() {
+  TransferStatus status;
+  std::promise<void> entered, resume;
+  auto release = resume.get_future().share();
+  std::atomic<bool> block{false};
+  status.SetQuiescenceCallback([&](int) {
+    if (block.load()) {
+      entered.set_value();
+      release.wait();
+    }
+    return QuiescenceState::Quiesced;
+  });
+  block = true;
+  auto installer = std::async(std::launch::async, [&] {
+    status.SetQuiescenceCallback([](int) { return QuiescenceState::Quiesced; });
+  });
+  entered.get_future().wait();
+  auto reuse = std::async(std::launch::async, [&] { status.CheckReusable(); });
+  auto waiting = reuse.wait_for(std::chrono::milliseconds(20));
+  resume.set_value();
+  installer.get();
+  reuse.get();
+  Require(waiting == std::future_status::timeout, "reuse blocks on snapshot contention");
+  Require(status.Quiesced(), "already quiescent status remains reusable");
+}
+
+void CaseOperationLongWaitSlice() {
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 1, 0);
+  auto start = std::chrono::steady_clock::now();
+  std::thread publisher([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    meta->ReportData(&status, StatusCode::SUCCESS, "empty");
+    meta->Seal();
+  });
+  meta->Quiescence(1001);
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  publisher.join();
+  Require(meta->Quiescence() == QuiescenceState::Quiesced, "long slice accepts a valid timespec");
+  Require(elapsed >= std::chrono::milliseconds(10),
+          "long slice did not fail immediately with EINVAL");
+}
+
+void CaseOperationQuiescence() {
+  TransferStatus status;
+  Require(status.Quiesced(), "never submitted status is quiescent");
+  auto ledger = std::make_shared<SubmissionLedger>(8);
+  LedgerVerbs verbs;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 1, 1);
+  meta->target.emplace_back(ledger, 0);
+  status.SetQuiescenceCallback([meta](int slice) { return meta->Quiescence(slice); });
+  status.SetCode(StatusCode::IN_PROGRESS);
+  Require(status.Quiescence() == QuiescenceState::Pending, "unsealed operation is pending");
+  // An invalid target must remain unread while the posting phase is open.
+  meta->target[0] = {std::weak_ptr<SubmissionLedger>{}, 7};
+  Require(status.Quiescence() == QuiescenceState::Pending, "unsealed target never read");
+  auto posted = PostLedger(*ledger, verbs, 1, meta);
+  meta->target[0] = {ledger, posted.dataSeq};
+  ledger->OnSqCompletion(kSqTag | posted.dataSeq, IBV_WC_SUCCESS, "done");
+  Require(status.Succeeded() && !status.Quiesced(), "result alone does not seal submission");
+  meta->Seal();
+  Require(status.WaitQuiesced(10), "sealed published covered operation");
+  ledger.reset();
+  Require(status.Quiesced(), "certified evidence survives ledger destruction");
+  status.SetCode(StatusCode::INIT);
+  auto next = std::make_shared<CqCallbackMeta>(&status, 2, 0);
+  status.SetQuiescenceCallback([next](int slice) { return next->Quiescence(slice); });
+  status.SetCode(StatusCode::IN_PROGRESS);
+  bool threw = false;
+  try {
+    status.CheckReusable();
+  } catch (const std::logic_error&) {
+    threw = true;
+  }
+  Require(threw && status.Code() == StatusCode::IN_PROGRESS,
+          "reuse refuses without state mutation");
+  status.SetCode(StatusCode::INIT);
+  Require(!status.Quiesced(), "SetCode INIT cannot clear old proof");
+  next->ReportData(&status, StatusCode::SUCCESS, "empty");
+  next->Seal();
+  Require(status.Quiesced(), "empty published operation");
+}
+
+void CaseOperationNotificationPublication() {
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 1, 0, true);
+  status.SetQuiescenceCallback([meta](int slice) { return meta->Quiescence(slice); });
+  status.SetCode(StatusCode::IN_PROGRESS);
+  meta->Seal();
+  meta->ReportData(&status, StatusCode::SUCCESS, "data");
+  Require(status.InProgress() && !status.Quiesced(), "notification still pending");
+  meta->ReportNotification(&status, StatusCode::SUCCESS, "notification");
+  Require(status.Succeeded() && status.Quiesced(), "publication completes both paths");
+  TransferStatus lost;
+  auto ledger = std::make_shared<SubmissionLedger>(8);
+  auto pending = std::make_shared<CqCallbackMeta>(&lost, 2, 0);
+  pending->target.emplace_back(ledger, 1);
+  lost.SetQuiescenceCallback([pending](int slice) { return pending->Quiescence(slice); });
+  pending->ReportData(&lost, StatusCode::ERR_RDMA_OP, "failed");
+  pending->Seal();
+  Require(lost.WaitQuiescence(1) == QuiescenceState::Pending, "absolute wait deadline");
+  ledger.reset();
+  Require(lost.Quiescence() == QuiescenceState::Unprovable, "uncertified lost source");
 }
 
 void CaseSubmissionLedgerBasic() {
@@ -2032,6 +2138,10 @@ int main(int argc, char* argv[]) {
 
   SetLogLevel("info");
   std::vector<TestCase> cases = {
+      {"operation_quiescence", CaseOperationQuiescence},
+      {"reusable_status_contention", CaseReusableStatusContention},
+      {"operation_long_wait_slice", CaseOperationLongWaitSlice},
+      {"operation_notification_publication", CaseOperationNotificationPublication},
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"submission_ledger_shared_qp_signals", CaseSubmissionLedgerSharedQpSignals},
       {"submission_ledger_fail_all", CaseSubmissionLedgerFailAll},

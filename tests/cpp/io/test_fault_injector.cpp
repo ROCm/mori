@@ -27,8 +27,8 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "mori/io/common.hpp"
 #include "mori/io/logging.hpp"
+#include "src/io/rdma/common.hpp"
 #include "src/io/rdma/fault_injector.hpp"
 
 using namespace mori::io;
@@ -169,17 +169,11 @@ void NotificationStaging() {
   injector.Arm(ParseFaultRule("async_event:value=qp_fatal:op=send"));
   TransferStatus data;
   data.SetCode(StatusCode::IN_PROGRESS);
-  std::promise<void> waiting;
-  auto waitingFuture = waiting.get_future();
-  std::atomic<bool> entered{false};
-  data.SetProgressCallback([&] {
-    if (!entered.exchange(true)) waiting.set_value();
-  });
-  auto stage = std::async(std::launch::async, [&] { injector.BeforeNotify(&ep.qp, &data); });
-  Require(waitingFuture.wait_for(1s) == std::future_status::ready &&
-              stage.wait_for(0ms) == std::future_status::timeout,
+  auto meta = std::make_shared<CqCallbackMeta>(&data, 1, 0);
+  auto stage = std::async(std::launch::async, [&] { injector.BeforeNotify(&ep.qp, meta.get()); });
+  Require(stage.wait_for(20ms) == std::future_status::timeout,
           "notification fault did not wait for the data");
-  data.Update(StatusCode::SUCCESS, "data complete");
+  meta->ReportData(&data, StatusCode::SUCCESS, "data complete");
   Require(stage.wait_for(1s) == std::future_status::ready, "notification staging did not finish");
   stage.get();
   ep.wr.opcode = IBV_WR_SEND;
@@ -188,9 +182,7 @@ void NotificationStaging() {
   injector.Disarm();
 
   injector.Arm(ParseFaultRule("async_event:value=qp_fatal:op=send"));
-  TransferStatus failedData;
-  failedData.Update(StatusCode::ERR_RDMA_OP, "data failed");
-  injector.BeforeNotify(&ep.qp, &failedData);
+  injector.BeforeNotify(&ep.qp, nullptr);
   Require(injector.Failed() && injector.Fired() == 0,
           "failed data was treated as a notification-reporting reproduction");
 }

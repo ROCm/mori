@@ -151,69 +151,43 @@ void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector
                          uint64_t totalLength, size_t chunkBytes, int maxChunks,
                          uint64_t maxMessageSize);
 
-struct CqCallbackMeta {
-  CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
-      : status(s), id(id_), totalBatchSize(n) {
-    dataStatus.SetCode(StatusCode::IN_PROGRESS);
-  }
+class SubmissionLedger;
 
-  // Claimed with exchange(nullptr) by whoever completes the transfer first, so a
-  // terminal update happens exactly once even though the CQ poller and the async
-  // event monitor can both reach the same meta concurrently.
+struct CqCallbackMeta {
+  CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n, bool notify = false)
+      : status(s),
+        id(id_),
+        totalBatchSize(n),
+        awaitsNotification(notify),
+        unfinishedParts(notify ? 3 : 2) {}
+
   std::atomic<TransferStatus*> status{nullptr};
   TransferUniqueId id{0};
   int totalBatchSize{0};
   std::atomic<uint32_t> finishedBatchSize{0};
   internal::IoCallDiagnostics diagnostics{};
+  const bool awaitsNotification;
+  std::vector<std::pair<std::weak_ptr<SubmissionLedger>, uint64_t>> target;
+  std::atomic<bool> sealed{false};
 
-  // Set before the data WRs are posted when a notification SEND follows them. The
-  // data WRs and the notification post then finish independently, and whichever
-  // finishes last reports the transfer: a notification that cannot be posted never
-  // turns it terminal while its data WRs are still on the wire, and is never lost
-  // behind a SUCCESS the data already reported.
-  bool awaitsNotification{false};
-
-  // Reports the data WRs' outcome through `s`, the status the caller claimed.
+  void Seal();
+  QuiescenceState Quiescence(int waitMs = 0);
   void ReportData(TransferStatus* s, StatusCode code, const std::string& message) {
-    if (!awaitsNotification) {
-      s->Update(code, message);
-      return;
-    }
-    dataStatus.Update(code, message);
     Finish(s, &dataOutcome, code, message);
   }
-
-  // The data WRs' own outcome while the caller's status waits for the notification too;
-  // a notification fault staged in test builds waits for it.
-  TransferStatus dataStatus;
-
-  // Reports the notification post's outcome; `s` is the posting thread's own status.
   void ReportNotification(TransferStatus* s, StatusCode code, const std::string& message) {
     Finish(s, &notificationOutcome, code, message);
   }
+  bool WaitDataFor(int timeoutMs);
 
  private:
   struct Outcome {
-    StatusCode code{StatusCode::SUCCESS};
+    StatusCode code{StatusCode::IN_PROGRESS};
     std::string message;
   };
-
-  // A data failure wins over a notification failure; only both succeeding is SUCCESS.
-  void Finish(TransferStatus* s, Outcome* part, StatusCode code, const std::string& message) {
-    {
-      std::lock_guard<std::mutex> lock(outcomeMu);
-      *part = Outcome{code, message};
-    }
-    if (unfinishedParts.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
-    std::lock_guard<std::mutex> lock(outcomeMu);
-    const Outcome& report = dataOutcome.code <= StatusCode::ERR_BEGIN &&
-                                    notificationOutcome.code > StatusCode::ERR_BEGIN
-                                ? notificationOutcome
-                                : dataOutcome;
-    s->Update(report.code, report.message);
-  }
-
-  std::atomic<int> unfinishedParts{2};
+  void Finish(TransferStatus* s, Outcome* part, StatusCode code, const std::string& message);
+  static constexpr int kQuiesced = -1;
+  std::atomic<int> unfinishedParts;
   std::mutex outcomeMu;
   Outcome dataOutcome;
   Outcome notificationOutcome;
@@ -242,6 +216,7 @@ class SubmissionLedger {
   bool Reserve(int count, int timeoutUs, std::string* error, ReserveFailure* failure = nullptr);
   void CancelReservation(int count);
   void NotifyAdmission();
+  void WaitForChange(int timeoutMs);
   void Close(bool freeze = false);
   void FreezeForShutdown();
   bool Closed() const;
@@ -370,8 +345,8 @@ struct RdmaOpRet {
 
 void NotifySqStateChanged(const EpPair& ep);
 
-// `dataStatus` holds the outcome of the transfer's data WRs (CqCallbackMeta::dataStatus).
-RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* dataStatus, TransferUniqueId id);
+// The injection hook waits on the operation's data outcome before a notification fault.
+RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, CqCallbackMeta* meta, TransferUniqueId id);
 
 namespace detail {
 
@@ -386,6 +361,7 @@ struct RdmaTransferControl {
   bool creditByWrCount{false};
   bool ownsTotalBatchSize{true};
   bool disableMerge{false};
+  size_t targetBase{0};
 };
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,

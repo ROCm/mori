@@ -96,7 +96,7 @@ class FaultInjector final : public VerbsOps {
   void UnwatchAsyncContext(ibv_context* ctx) override;
   void ReleaseAsyncContext(ibv_context* ctx) noexcept override;
   void ForgetAsyncEndpoint(ibv_context* ctx, uint32_t qpn, ibv_cq* cq) noexcept override;
-  void BeforeNotify(ibv_qp* qp, TransferStatus* status) noexcept override;
+  void BeforeNotify(ibv_qp* qp, CqCallbackMeta* meta) noexcept override;
 
  private:
   FaultInjector();

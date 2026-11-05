@@ -34,8 +34,8 @@
 #include <utility>
 #include <vector>
 
-#include "mori/io/common.hpp"
 #include "mori/io/logging.hpp"
+#include "src/io/rdma/common.hpp"
 
 namespace mori {
 namespace io {
@@ -651,7 +651,7 @@ void FaultInjector::ForgetAsyncEndpoint(ibv_context* ctx, uint32_t qpn, ibv_cq* 
   FailInjection("forgetting async endpoint");
 }
 
-void FaultInjector::BeforeNotify(ibv_qp* qp, TransferStatus* status) noexcept try {
+void FaultInjector::BeforeNotify(ibv_qp* qp, CqCallbackMeta* meta) noexcept try {
   if (!armed_.load(std::memory_order_relaxed)) return;
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -671,7 +671,7 @@ void FaultInjector::BeforeNotify(ibv_qp* qp, TransferStatus* status) noexcept tr
   }
   // The normal CQ consumer updates status after retiring the data record.
   // Wait outside mu_; no post guard remains when RdmaNotifyTransfer is entered.
-  if (status == nullptr || status->WaitFor(5000) != StatusCode::SUCCESS) {
+  if (meta == nullptr || !meta->WaitDataFor(5000)) {
     FailInjection("data did not complete before notification fault");
   }
 } catch (const std::exception& error) {

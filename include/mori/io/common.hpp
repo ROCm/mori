@@ -27,9 +27,12 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <msgpack.hpp>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -167,6 +170,8 @@ struct MemoryDesc {
 
 using TransferUniqueId = uint64_t;
 
+enum class QuiescenceState : uint8_t { Pending, Quiesced, Unprovable };
+
 struct TransferStatus {
  public:
   TransferStatus() = default;
@@ -253,10 +258,67 @@ struct TransferStatus {
     return code.load(std::memory_order_acquire);
   }
 
+  // A snapshot keeps the same operation alive throughout a query or wait.
+  QuiescenceState Quiescence() const {
+    std::unique_lock<std::mutex> lock(quiescenceMu_, std::try_to_lock);
+    if (!lock) return QuiescenceState::Pending;
+    auto query = quiescenceCallback_;
+    lock.unlock();
+    return query ? (*query)(0) : QuiescenceState::Quiesced;
+  }
+  bool Quiesced() const { return Quiescence() == QuiescenceState::Quiesced; }
+  QuiescenceState WaitQuiescence(int timeoutMs = -1) const {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs < 0 ? 0 : timeoutMs);
+    std::shared_ptr<std::function<QuiescenceState(int)>> query;
+    while (true) {
+      std::unique_lock<std::mutex> lock(quiescenceMu_, std::try_to_lock);
+      if (lock) {
+        query = quiescenceCallback_;
+        break;
+      }
+      if (timeoutMs >= 0 && std::chrono::steady_clock::now() >= deadline)
+        return QuiescenceState::Pending;
+      std::this_thread::yield();
+    }
+    if (!query) return QuiescenceState::Quiesced;
+    while (true) {
+      auto result = (*query)(0);
+      if (result != QuiescenceState::Pending) return result;
+      auto now = std::chrono::steady_clock::now();
+      if (timeoutMs >= 0 && now >= deadline) return result;
+      // Only wait for a whole millisecond when it fits within the remaining budget.
+      int slice = timeoutMs < 0 || deadline - now >= std::chrono::milliseconds(1) ? 1 : 0;
+      result = (*query)(slice);
+      if (result != QuiescenceState::Pending) return result;
+      if (!slice) std::this_thread::yield();
+    }
+  }
+  bool WaitQuiesced(int timeoutMs = -1) const {
+    return WaitQuiescence(timeoutMs) == QuiescenceState::Quiesced;
+  }
+  void CheckReusable() const {
+    std::lock_guard<std::mutex> lock(quiescenceMu_);
+    CheckReusableLocked();
+  }
+  void SetQuiescenceCallback(std::function<QuiescenceState(int)> callback) {
+    auto next = std::make_shared<std::function<QuiescenceState(int)>>(std::move(callback));
+    {
+      std::lock_guard<std::mutex> lock(quiescenceMu_);
+      CheckReusableLocked();
+      quiescenceCallback_.swap(next);
+    }
+  }
+
   void SetWaitCallback(std::function<void()> cb) { waitCallback = std::move(cb); }
   void SetProgressCallback(std::function<void()> cb) { progressCallback = std::move(cb); }
 
  private:
+  void CheckReusableLocked() const {
+    if (quiescenceCallback_ && (*quiescenceCallback_)(0) != QuiescenceState::Quiesced)
+      throw std::logic_error("transfer status still owns unquiesced buffers");
+  }
+
   StatusCode CodeWithProgress() {
     PollProgress();
     return code.load(std::memory_order_acquire);
@@ -267,6 +329,8 @@ struct TransferStatus {
     if (progressCallback) progressCallback();
   }
 
+  mutable std::mutex quiescenceMu_;
+  std::shared_ptr<std::function<QuiescenceState(int)>> quiescenceCallback_;
   std::atomic<StatusCode> code{StatusCode::INIT};
   mutable std::mutex msgMu;
   std::string msg;

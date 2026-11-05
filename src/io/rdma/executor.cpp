@@ -137,6 +137,7 @@ void MultithreadExecutor::Worker::MainLoop() {
     control.creditByWrCount = chunk;
     control.ownsTotalBatchSize = false;
     control.disableMerge = chunk;
+    control.targetBase = task.epId;
 
     thread_local std::vector<application::RdmaMemoryRegion> localMrPerEp(1);
     thread_local std::vector<application::RdmaMemoryRegion> remoteMrPerEp(1);

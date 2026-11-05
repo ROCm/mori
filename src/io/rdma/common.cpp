@@ -321,8 +321,7 @@ static void ResetMergedWorkRequestPointers(MergedWorkRequest* wr) {
 /*                                         Rdma Utilities                                         */
 /* ---------------------------------------------------------------------------------------------- */
 
-RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* dataStatus,
-                             TransferUniqueId id) {
+RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, CqCallbackMeta* meta, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
 
   std::string reserveErr;
@@ -340,7 +339,7 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* dataStatus,
 
   for (size_t i = 0; i < eps.size(); i++) {
     const application::RdmaEndpoint& ep = eps[i].local;
-    Verbs().BeforeNotify(ep.ibvHandle.qp, dataStatus);
+    Verbs().BeforeNotify(ep.ibvHandle.qp, meta);
     NotifMessage msg{id, static_cast<int>(i), static_cast<int>(eps.size())};
 
     struct ibv_sge sge{};
@@ -715,6 +714,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, batchWrNum, SubmissionLedger::Kind::Data,
         callbackMeta, static_cast<int>(epMergedSinceSignal[epId]), isLastBatchForEp, id,
         roctxTransferEnabled ? epBytesSinceSignal[epId] : 0, Verbs());
+    if (result.dataSeq && !callbackMeta->target.empty()) {
+      auto& seq = callbackMeta->target[control.targetBase + epId].second;
+      seq = std::max(seq, result.dataSeq);
+    }
     if (result.error == ECANCELED) {
       return {StatusCode::ERR_RDMA_OP, "endpoint is closed; submission rejected"};
     }

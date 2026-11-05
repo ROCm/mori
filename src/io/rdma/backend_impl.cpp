@@ -676,21 +676,21 @@ bool RdmaManager::NeedsQpReplacement(int devId, uint32_t qpNum) const {
   return peerFailures_.NeedsQpReplacement(PeerFailureTracker::QpKey{DeviceName(devId), qpNum});
 }
 
-bool RdmaManager::RejectIfPortDown(const EpPairVec& eps, TransferStatus* status) {
+bool RdmaManager::RejectIfPortDown(const EpPairVec& eps,
+                                   const std::shared_ptr<CqCallbackMeta>& meta) {
   for (const auto& ep : eps) {
     if (!portDown_[ep.ldevId].load(std::memory_order_relaxed)) continue;
     portRejected_[ep.ldevId].fetch_add(1, std::memory_order_relaxed);
     // Reuse the engine's existing log deduplication. The port transition was
     // already logged once; do not emit an ERROR for every rejected transfer.
-    auto meta = std::make_shared<CqCallbackMeta>(status, 0, 0);
-    internal::PublishCurrentIoCallDiagnostics(meta);
     meta->diagnostics.MarkRootCause();
     meta->diagnostics.TryMarkLogged(internal::IoFailureKind::RootCause);
     const auto& [device, port] = availDevices[ep.ldevId];
-    status->Update(
-        StatusCode::ERR_RDMA_OP,
-        "local port " + device->Name() + ":" + std::to_string(port) +
-            " is down (IBV_EVENT_PORT_ERR); rejecting new submissions until it is ACTIVE again");
+    if (auto* status = meta->status.exchange(nullptr, std::memory_order_acq_rel))
+      meta->ReportData(
+          status, StatusCode::ERR_RDMA_OP,
+          "local port " + device->Name() + ":" + std::to_string(port) +
+              " is down (IBV_EVENT_PORT_ERR); rejecting new submissions until it is ACTIVE again");
     return true;
   }
   return false;
@@ -1483,20 +1483,61 @@ static void FinishSubmission(const EpPairVec& eps, const std::shared_ptr<CqCallb
       meta->ReportData(s, ret.code, ret.message);
     }
   }
-  if (!notify) return;
-  RdmaOpRet notifRet = ret.Failed() ? RdmaOpRet{StatusCode::SUCCESS, ""}
-                                    : RdmaNotifyTransfer(eps, &meta->dataStatus, id);
+  if (!notify) {
+    meta->Seal();
+    return;
+  }
+  RdmaOpRet notifRet =
+      ret.Failed() ? RdmaOpRet{StatusCode::SUCCESS, ""} : RdmaNotifyTransfer(eps, meta.get(), id);
   meta->ReportNotification(status, notifRet.code, notifRet.message);
+  meta->Seal();
 }
+
+namespace {
+class SubmissionScope {
+ public:
+  SubmissionScope(const EpPairVec& eps, TransferStatus* s, TransferUniqueId id, int count,
+                  bool notify)
+      : eps_(eps),
+        status_(s),
+        id_(id),
+        notify_(notify),
+        meta(std::make_shared<CqCallbackMeta>(s, id, count, notify)) {
+    meta->target.reserve(eps.size());
+    for (const auto& ep : eps) meta->target.emplace_back(ep.ledger, 0);
+    s->SetQuiescenceCallback(
+        [operation = meta](int slice) { return operation->Quiescence(slice); });
+    s->SetCode(StatusCode::IN_PROGRESS);
+    internal::PublishCurrentIoCallDiagnostics(meta);
+  }
+  ~SubmissionScope() {
+    if (!meta->sealed.load(std::memory_order_acquire)) {
+      auto code = status_->Code();
+      FinishSubmission(eps_, meta, status_, id_,
+                       {code > StatusCode::ERR_BEGIN ? code : StatusCode::ERR_RDMA_OP,
+                        code > StatusCode::ERR_BEGIN ? status_->Message()
+                                                     : "submission exited before completion"},
+                       notify_);
+    }
+  }
+
+ private:
+  const EpPairVec& eps_;
+  TransferStatus* status_;
+  TransferUniqueId id_;
+  bool notify_;
+
+ public:
+  const std::shared_ptr<CqCallbackMeta> meta;
+};
+}  // namespace
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
-  status->SetCode(StatusCode::IN_PROGRESS);
-  if (rdma_ && rdma_->RejectIfPortDown(eps, status)) return;
-  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
-  callbackMeta->awaitsNotification = config.enableNotification;
-  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+  SubmissionScope scope(eps, status, id, 1, config.enableNotification);
+  auto callbackMeta = scope.meta;
+  if (rdma_ && rdma_->RejectIfPortDown(eps, callbackMeta)) return;
 
   RdmaOpRet ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, {localOffset},
                                      {remoteOffset}, {size}, callbackMeta, id, isRead, 1,
@@ -1509,8 +1550,9 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                                         const SizeVec& sizes, TransferStatus* status,
                                         TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
-  status->SetCode(StatusCode::IN_PROGRESS);
-  if (rdma_ && rdma_->RejectIfPortDown(eps, status)) return;
+  SubmissionScope scope(eps, status, id, 0, config.enableNotification);
+  auto callbackMeta = scope.meta;
+  if (rdma_ && rdma_->RejectIfPortDown(eps, callbackMeta)) return;
 
   const bool chunk = config.enableTransferChunking;
   const bool canUseWorkerChunking =
@@ -1554,9 +1596,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     totalCredit = static_cast<int>(sizes.size());
   }
 
-  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
-  callbackMeta->awaitsNotification = config.enableNotification;
-  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+  callbackMeta->totalBatchSize = totalCredit;
   RdmaOpRet ret;
   if (canUseWorkerChunking) {
     ExecutorReq req{eps,
@@ -1736,7 +1776,11 @@ void RdmaBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
   assert(sizes.size() == remoteOffsets.size());
   size_t batchSize = sizes.size();
   if (batchSize == 0) {
-    status->SetCode(StatusCode::SUCCESS);
+    const EpPairVec empty;
+    SubmissionScope scope(empty, status, id, 0, false);
+    if (auto* s = scope.meta->status.exchange(nullptr))
+      scope.meta->ReportData(s, StatusCode::SUCCESS, "");
+    scope.meta->Seal();
     return;
   }
 

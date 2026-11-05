@@ -136,7 +136,7 @@ class RdmaManager {
   // Name of an available device; availDevices is fixed, so this takes no lock.
   std::string DeviceName(int devId) const;
   // Session admission only: never reject part-way through posting a transfer.
-  bool RejectIfPortDown(const EpPairVec& eps, TransferStatus* status);
+  bool RejectIfPortDown(const EpPairVec& eps, const std::shared_ptr<CqCallbackMeta>& meta);
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
