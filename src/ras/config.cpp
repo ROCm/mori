@@ -21,106 +21,52 @@
 // SOFTWARE.
 #include "src/ras/config.hpp"
 
-#include <algorithm>
-#include <cerrno>
-#include <cstdlib>
-#include <set>
-#include <sstream>
+#include <optional>
 
+#include "mori/utils/cpu_list.hpp"
 #include "mori/utils/env_utils.hpp"
 
 namespace mori {
 namespace ras {
-namespace {
 
-constexpr int kMaxCpu = 65535;
-
-bool ParseUnsigned(const std::string& s, uint64_t max, uint64_t* out) {
-  if (s.empty() || s[0] < '0' || s[0] > '9') return false;
-  errno = 0;
-  char* end = nullptr;
-  unsigned long long v = std::strtoull(s.c_str(), &end, 10);
-  if (errno != 0 || *end != '\0' || v > max) return false;
-  *out = v;
-  return true;
-}
-
-std::string Trim(const std::string& s) {
-  size_t b = s.find_first_not_of(" \t");
-  if (b == std::string::npos) return "";
-  return s.substr(b, s.find_last_not_of(" \t") - b + 1);
-}
-
-// "0-3,8,10-11" in ascending order without duplicates. False on any malformed item.
-bool ParseCpuList(const std::string& spec, std::vector<int>* out) {
-  std::set<int> cpus;
-  std::stringstream ss(spec);
-  std::string item;
-  while (std::getline(ss, item, ',')) {
-    item = Trim(item);
-    size_t dash = item.find('-');
-    uint64_t lo, hi;
-    if (dash == std::string::npos) {
-      if (!ParseUnsigned(item, kMaxCpu, &lo)) return false;
-      hi = lo;
-    } else if (!ParseUnsigned(item.substr(0, dash), kMaxCpu, &lo) ||
-               !ParseUnsigned(item.substr(dash + 1), kMaxCpu, &hi) || lo > hi) {
-      return false;
-    }
-    for (uint64_t c = lo; c <= hi; ++c) cpus.insert(static_cast<int>(c));
-  }
-  if (cpus.empty()) return false;
-  out->assign(cpus.begin(), cpus.end());
-  return true;
-}
-
-}  // namespace
-
-RasConfig ConfigFromEnv(const GetEnvFn& getenv) {
+RasConfig ConfigFromEnv() {
   RasConfig c;
-  auto get = [&](const char* name) -> std::string {
-    const char* v = getenv(name);
-    return v == nullptr ? std::string() : std::string(v);
-  };
   auto invalid = [&](const char* name, const std::string& value, const std::string& fallback) {
     c.warnings.push_back(std::string(name) + "=" + value + " is invalid; using " + fallback);
   };
 
-  std::string v = get("MORI_RAS_ENABLE");
-  if (!v.empty()) {
-    std::optional<bool> b = env::detail::ParseBool(v.c_str());
-    if (b.has_value()) {
-      c.enable = *b;
+  if (std::optional<std::string> v = env::GetString("MORI_RAS_ENABLE")) {
+    std::optional<bool> enable = env::detail::ParseBool(v->c_str());
+    if (enable.has_value()) {
+      c.enable = *enable;
     } else {
-      invalid("MORI_RAS_ENABLE", v, "0");
+      invalid("MORI_RAS_ENABLE", *v, "0");
     }
   }
 
-  c.ifname = get("MORI_RAS_IFNAME");
+  c.ifname = env::GetString("MORI_RAS_IFNAME").value_or("");
 
-  v = get("MORI_RAS_PORT");
-  if (!v.empty()) {
-    uint64_t port;
-    if (!ParseUnsigned(v, 65535, &port)) {
-      invalid("MORI_RAS_PORT", v, "an ephemeral port");
-    } else if (port == kRcclRasPort) {
+  if (std::optional<std::string> v = env::GetString("MORI_RAS_PORT")) {
+    std::optional<int> port = env::GetInt("MORI_RAS_PORT");
+    if (!port.has_value() || *port < 0 || *port > 65535) {
+      invalid("MORI_RAS_PORT", *v, "an ephemeral port");
+    } else if (*port == kRcclRasPort) {
       c.warnings.push_back(
           "MORI_RAS_PORT=28028 is RCCL RAS's client port; using an ephemeral port");
     } else {
-      c.port = static_cast<uint16_t>(port);
+      c.port = static_cast<uint16_t>(*port);
     }
   }
 
-  v = get("MORI_RAS_CPU_AFFINITY");
-  if (!v.empty() && !ParseCpuList(v, &c.cpuAffinity)) {
-    c.cpuAffinity.clear();
-    invalid("MORI_RAS_CPU_AFFINITY", v, "no pinning");
+  if (std::optional<std::string> v = env::GetString("MORI_RAS_CPU_AFFINITY")) {
+    std::optional<std::vector<int>> cpus = ParseCpuList(*v);
+    if (cpus.has_value()) {
+      c.cpuAffinity = *cpus;
+    } else {
+      invalid("MORI_RAS_CPU_AFFINITY", *v, "no pinning");
+    }
   }
   return c;
-}
-
-RasConfig ConfigFromEnv() {
-  return ConfigFromEnv([](const char* name) { return std::getenv(name); });
 }
 
 }  // namespace ras

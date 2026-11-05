@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <map>
 #include <string>
 
@@ -30,11 +31,15 @@ using namespace mori::ras;
 
 namespace {
 
+// ConfigFromEnv() with exactly `env` set among the MORI_RAS_* variables.
 RasConfig Parse(const std::map<std::string, std::string>& env) {
-  return ConfigFromEnv([&](const char* name) -> const char* {
-    auto it = env.find(name);
-    return it == env.end() ? nullptr : it->second.c_str();
-  });
+  const char* const kVars[] = {"MORI_RAS_ENABLE", "MORI_RAS_IFNAME", "MORI_RAS_PORT",
+                               "MORI_RAS_CPU_AFFINITY"};
+  for (const char* name : kVars) unsetenv(name);
+  for (const auto& [name, value] : env) setenv(name.c_str(), value.c_str(), 1);
+  RasConfig c = ConfigFromEnv();
+  for (const char* name : kVars) unsetenv(name);
+  return c;
 }
 
 bool Warned(const RasConfig& c, const std::string& needle) {

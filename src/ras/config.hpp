@@ -22,7 +22,6 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <vector>
 
@@ -43,8 +42,6 @@ struct RasConfig {
   std::vector<std::string> warnings;
 };
 
-using GetEnvFn = std::function<const char*(const char*)>;
-RasConfig ConfigFromEnv(const GetEnvFn& getenv);
 RasConfig ConfigFromEnv();
 
 }  // namespace ras
