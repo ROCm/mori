@@ -1106,6 +1106,7 @@ mori_package_data = [
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
     "ops/dispatch_combine_v2/tuning_configs/*.csv",
+    "io/sim_catalog.yaml",  # MORI_IO_SIM_CATALOG timing for measured hardware
     "tools/*.sh",
     "tools/mori.conf",
     "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)

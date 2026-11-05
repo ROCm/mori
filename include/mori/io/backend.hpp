@@ -120,6 +120,11 @@ inline std::ostream& operator<<(std::ostream& os, const XgmiBackendConfig& c) {
   return os << "numStreams[" << c.numStreams << "] numEvents[" << c.numEvents << "]";
 }
 
+// Only creatable in simulation mode (MORI_IO_SIM_ENABLE=1); there is no hardware TCP backend.
+struct TcpBackendConfig : public BackendConfig {
+  TcpBackendConfig() : BackendConfig(BackendType::TCP) {}
+};
+
 struct FabricBackendConfig : public BackendConfig {
   FabricBackendConfig() : BackendConfig(BackendType::FABRIC) {}
   FabricBackendConfig(int numStreams_, int numEvents_)

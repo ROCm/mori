@@ -1728,9 +1728,8 @@ bool RdmaBackend::HasActiveDevices() {
   return !GetActiveDevicePortList(ctx.GetRdmaDeviceList()).empty();
 }
 
-RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
-                         const RdmaBackendConfig& beConfig)
-    : myEngKey(k), config(beConfig) {
+RdmaBackendConfig ResolveRdmaBackendConfig(const RdmaBackendConfig& beConfig) {
+  RdmaBackendConfig config = beConfig;
   env::Override("MORI_IO_ENABLE_NOTIFICATION", config.enableNotification,
                 mori::env::detail::ParseBool);
   env::Override("MORI_IO_ENABLE_CHUNKING", config.enableTransferChunking,
@@ -1750,7 +1749,12 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
   env::Override("MORI_IO_POLL_CQ_MODE", config.pollCqMode, ParsePollCqMode);
   ValidateRdmaNotificationConfig(config);
   ValidateRdmaTransferConfig(config);
+  return config;
+}
 
+RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
+                         const RdmaBackendConfig& beConfig)
+    : myEngKey(k), config(ResolveRdmaBackendConfig(beConfig)) {
   auto rdmaCtx = std::make_unique<application::RdmaContext>(application::RdmaBackendType::IBVerbs);
   rdma.reset(new mori::io::RdmaManager(config, rdmaCtx.get()));
   (void)rdmaCtx.release();

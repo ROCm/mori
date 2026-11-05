@@ -128,34 +128,8 @@ bool GdsEngine::CanHandle(const TransferRef& src, const TransferRef& dst) const 
   return src.IsFile() && !dst.IsFile() && dst.HasHostPtr() && IsGpu(dst);
 }
 
-namespace {
-// One plan per item.  Only the GPU destination is bounds-checked.
-class GdsPlanBuilder final : public TransferPlanBuilder {
- public:
-  GdsPlanBuilder(const GdsEngine& engine, size_t expected_items) : engine_(engine) {
-    out_.plans.reserve(expected_items);
-  }
-  void Add(const TransferItem& item) override {
-    if (item.size == 0) return;
-    if (!engine_.CanHandle(item.src, item.dst) ||
-        !RangeFits(item.dst_offset, item.size, item.dst.size)) {
-      out_.rejected_tags.push_back(item.tag);
-      return;
-    }
-    TransferPlan plan = PlanBetween(item, TransferDirection::kLocal);
-    AppendSegment(&plan, item.src_offset, item.dst_offset, item.size, item.tag);
-    out_.plans.push_back(std::move(plan));
-  }
-  TransferPlanSet Finish() override { return std::move(out_); }
-
- private:
-  const GdsEngine& engine_;
-  TransferPlanSet out_;
-};
-}  // namespace
-
 std::unique_ptr<TransferPlanBuilder> GdsEngine::CreatePlanBuilder(size_t expected_items) const {
-  return std::make_unique<GdsPlanBuilder>(*this, expected_items);
+  return MakeFilePlanBuilder(*this, expected_items);
 }
 
 std::unique_ptr<TransferHandle> GdsEngine::Submit(std::vector<TransferPlan> plans) {
