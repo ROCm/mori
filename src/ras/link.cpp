@@ -177,7 +177,7 @@ void LinkManager::RunOnce(int maxWaitMs) {
   if (n < 0) {
     if (errno != EINTR && !(Degraded() & kDegradedLoopError)) {
       AddDegraded(kDegradedLoopError);
-      RAS_LOG_WARN("RAS epoll_wait failed: {}; RAS is degraded", std::strerror(errno));
+      RAS_LOG_ERROR("RAS epoll_wait failed: {}; RAS is degraded", std::strerror(errno));
     }
     n = 0;
   }

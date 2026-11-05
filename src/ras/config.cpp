@@ -37,6 +37,7 @@ RasConfig ConfigFromEnv() {
 
   if (std::optional<std::string> v = env::GetString("MORI_RAS_ENABLE")) {
     std::optional<bool> enable = env::detail::ParseBool(v->c_str());
+    c.requested = enable.value_or(true);
     if (enable.has_value()) {
       c.enable = *enable;
     } else {

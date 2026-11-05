@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -34,6 +35,7 @@
 #include <vector>
 
 #include "mori/ras/ras.hpp"
+#include "src/ras/logging.hpp"
 #include "src/ras/runtime.hpp"
 #include "tests/cpp/ras/ras_test_util.hpp"
 
@@ -71,6 +73,23 @@ std::vector<int> ThreadsNamed(const std::string& name) {
 int FindThread(const std::string& name) {
   std::vector<int> tids = ThreadsNamed(name);
   return tids.empty() ? -1 : tids.back();
+}
+
+// What RAS logs to stdout while `body` runs, at MORI's default level, which shows only errors.
+// For a child body: stdout stays redirected.
+std::string RasLogAtDefaultLevel(const std::function<void()>& body) {
+  RasLogger()->set_level(spdlog::level::err);
+  std::fflush(stdout);
+  FILE* capture = std::tmpfile();
+  dup2(fileno(capture), STDOUT_FILENO);
+  body();
+  RasLogger()->flush();
+  std::fflush(stdout);
+  std::rewind(capture);
+  std::string out;
+  char buf[4096];
+  for (size_t n; (n = std::fread(buf, 1, sizeof(buf), capture)) > 0;) out.append(buf, n);
+  return out;
 }
 
 CoreParams LocalCore() {
@@ -195,6 +214,46 @@ TEST(RasRuntime, ABlockedPortLeavesRasOffAndDegraded) {
               return 0;
             }),
             0);
+}
+
+// MORI shows only errors by default. Whoever set MORI_RAS_ENABLE must still see why RAS isn't
+// doing what they asked; everyone else must see nothing new.
+TEST(RasRuntime, ProblemsShowAtTheDefaultLogLevelOnlyWhenRasWasAskedFor) {
+  int holder = -1;
+  std::string held = std::to_string(ras_test::HoldPort("0.0.0.0", &holder));
+  struct Case {
+    const char* enable;  // MORI_RAS_ENABLE, or nullptr for unset
+    const char* port;    // MORI_RAS_PORT, or nullptr for unset
+    const char* shown;   // in the log, or nullptr for an empty log
+  };
+  const Case cases[] = {
+      {"1", held.c_str(), "RAS is off for this process: port "},
+      {"1", "http", "MORI_RAS_PORT=http is invalid"},
+      {"maybe", nullptr, "MORI_RAS_ENABLE=maybe is invalid"},
+      {nullptr, "http", nullptr},
+      {"0", "http", nullptr},
+  };
+  for (const Case& c : cases) {
+    EXPECT_EQ(RunInChild([&c] {
+                auto set = [](const char* name, const char* value) {
+                  value != nullptr ? setenv(name, value, 1) : unsetenv(name);
+                };
+                set("MORI_RAS_ENABLE", c.enable);
+                set("MORI_RAS_PORT", c.port);
+                std::string log =
+                    RasLogAtDefaultLevel([] { (void)RasRuntime::EnsureStarted(Params()); });
+                if (c.shown == nullptr) {
+                  CHILD_CHECK(log.empty());
+                } else {
+                  CHILD_CHECK(log.find(c.shown) != std::string::npos);
+                }
+                return 0;
+              }),
+              0)
+        << "MORI_RAS_ENABLE=" << (c.enable ? c.enable : "(unset)")
+        << " MORI_RAS_PORT=" << (c.port ? c.port : "(unset)");
+  }
+  close(holder);
 }
 
 TEST(RasRuntime, TheRasThreadRunsAtLowPriorityWhereItIsPinned) {

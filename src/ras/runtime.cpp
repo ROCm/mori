@@ -186,8 +186,8 @@ void RasCore::ThreadMain() {
     }
     int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
     if (rc != 0) {
-      RAS_LOG_WARN("MORI_RAS_CPU_AFFINITY can't be applied ({}); the RAS thread isn't pinned",
-                   std::strerror(rc));
+      RAS_LOG_ERROR("MORI_RAS_CPU_AFFINITY can't be applied ({}); the RAS thread isn't pinned",
+                    std::strerror(rc));
     }
   }
   pthread_setname_np(pthread_self(), "mori-ras");
@@ -261,7 +261,13 @@ RasRuntime* RasRuntime::EnsureStarted(const StartParams& params) {
   if (status.state != RunState::kNotStarted) return nullptr;
 
   RasConfig config = ConfigFromEnv();
-  for (const std::string& w : config.warnings) RAS_LOG_WARN("{}", w);
+  for (const std::string& w : config.warnings) {
+    if (config.requested) {
+      RAS_LOG_ERROR("{}", w);
+    } else {
+      RAS_LOG_WARN("{}", w);
+    }
+  }
   if (!config.enable) {
     status = RuntimeStatus{RunState::kDisabled, 0, "MORI_RAS_ENABLE is not set"};
     return nullptr;
@@ -276,7 +282,7 @@ RasRuntime* RasRuntime::EnsureStarted(const StartParams& params) {
   std::string error;
   if (!core->Start(&error)) {
     status = RuntimeStatus{RunState::kFailed, kDegradedInitFailed, error};
-    RAS_LOG_WARN("RAS is off for this process: {}", error);
+    RAS_LOG_ERROR("RAS is off for this process: {}", error);
     delete core;
     return nullptr;
   }

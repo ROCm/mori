@@ -21,9 +21,11 @@
 // SOFTWARE.
 #pragma once
 
-// RAS logging. Expected conditions, such as a peer without RAS, a connection refused during
-// teardown, or a port already in use, log at debug: operators and post-mortem tools read
-// warnings as failures.
+// RAS logging. MORI shows only errors by default, so whatever keeps RAS from doing what
+// MORI_RAS_ENABLE asked for logs at error: a runtime that can't start, an invalid MORI_RAS_*
+// value, a setting that can't be applied, a degraded loop. Expected conditions, such as a peer
+// without RAS or a connection refused during teardown, log at debug: operators and post-mortem
+// tools read warnings as failures.
 //
 // RAS logs through RasLogger(), not MORI_LOG. MORI_LOG caches each logger in a function-local
 // static, and at exit those statics, spdlog's registry with them, can be destroyed while the
@@ -52,3 +54,4 @@ void DisableLoggingForExit();
 #define RAS_LOG_DEBUG(...) RAS_LOG_AT(debug, __VA_ARGS__)
 #define RAS_LOG_INFO(...) RAS_LOG_AT(info, __VA_ARGS__)
 #define RAS_LOG_WARN(...) RAS_LOG_AT(warn, __VA_ARGS__)
+#define RAS_LOG_ERROR(...) RAS_LOG_AT(error, __VA_ARGS__)

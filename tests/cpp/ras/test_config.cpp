@@ -67,6 +67,11 @@ TEST(RasConfig, ParsesEnable) {
   RasConfig bad = Parse({{"MORI_RAS_ENABLE", "maybe"}});
   EXPECT_FALSE(bad.enable);
   EXPECT_TRUE(Warned(bad, "MORI_RAS_ENABLE"));
+  // Anything but a false value asks for RAS, even a typo.
+  EXPECT_TRUE(bad.requested);
+  EXPECT_TRUE(Parse({{"MORI_RAS_ENABLE", "1"}}).requested);
+  EXPECT_FALSE(Parse({{"MORI_RAS_ENABLE", "0"}}).requested);
+  EXPECT_FALSE(Parse({}).requested);
 }
 
 TEST(RasConfig, NeverUsesRcclRasPort) {

@@ -36,6 +36,7 @@ constexpr uint16_t kRcclRasPort = 28028;
 // typo never turns RAS into a failure.
 struct RasConfig {
   bool enable{false};            // MORI_RAS_ENABLE: off by default through P3
+  bool requested{false};         // MORI_RAS_ENABLE is set to anything but a false value
   std::string ifname;            // MORI_RAS_IFNAME: the interface for RAS links
   uint16_t port{0};              // MORI_RAS_PORT: the peer listener port; 0 picks one
   std::vector<int> cpuAffinity;  // MORI_RAS_CPU_AFFINITY: CPUs for the RAS thread, e.g. 0-3,8
