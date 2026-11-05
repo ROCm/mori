@@ -294,7 +294,11 @@ _CARD_KW = dict(world_size=8, max_tok_per_rank=512, max_recv=4096, warp_per_bloc
 
 
 def _without_card_dedup(info):
-    return {k: v for k, v in info.items() if k not in ("cardDedup", "region.fwdMap")}
+    return {
+        k: v
+        for k, v in info.items()
+        if k not in ("cardDedup", "region.fwdMap", "cfgText")
+    }
 
 
 def test_card_dedup_adds_a_forward_map_and_nothing_else():
@@ -307,6 +311,8 @@ def test_card_dedup_adds_a_forward_map_and_nothing_else():
     assert (off["cardDedup"], off["region.fwdMap"]) == (False, 0)
     assert (on["cardDedup"], on["region.fwdMap"]) == (True, 4096 * 4)
     assert _without_card_dedup(on) == _without_card_dedup(off)
+    # The rendered Cfg, the kernel's cache key, gains the knob and nothing else.
+    assert on["cfgText"] == off["cfgText"][:-1] + ", .cardDedup=true}"
     # Dispatch only: combine keeps its Cfg, and with it its cache entry.
     comb = cb.EpCombinePlan.describe(**_CARD_KW, card_dedup=True)
     assert (comb["cardDedup"], comb["region.fwdMap"]) == (False, 0)
