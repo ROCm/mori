@@ -41,6 +41,12 @@ token's rows go and writes the route headers, and ``qpack`` quantises each bf16 
 straight into its slab / landing rows -- the same bytes as aiter's quantisation, without
 pack's extra read and write of every routed row.
 
+``gemm1="7001"`` (``--gemm1 7001``) runs aiter#7001's fused Stage1 GEMM1 tiles instead of the
+8-wave GEMM1, in one launch that also packs the rows (``gemm1_7001_sdma``): producer
+workgroups pack each (destination, segment) in expert order and the copy puts of a segment
+start as soon as it is packed, so there is no pack / qpack launch before it. It needs aiter
+with aiter#7001's ``mega_moe/gemm1.py`` and the prepare's quantisation (no ``fuse_quant``).
+
 aiter's compact prepare (routing plan, ``TILE_INPUT_BASE``), Stage2 and combine are used
 as they are; only the Stage1 launch is replaced. ``install()`` swaps ``moe._s1_mega`` and
 ``moe._s1_mega_bundle`` for this op (``uninstall()`` restores them, or use it as a context
@@ -72,6 +78,8 @@ Needs aiter's compact Stage1 with the route-major payload (``max_tok_per_rank`` 
 32768), the a8w4 SwiGLU ("silu") configuration, and mori built with SDMA.
 """
 
+import dataclasses
+
 import torch
 import torch.distributed as dist
 
@@ -82,6 +90,9 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from gemm1_8wave_sdma import SCALE_MODES, compile_gemm1_8wave_sdma
 from pack import build_pack
 from quant_pack import build_quant_pack, build_route
+
+#: GEMM1 of the fused kernel: example 13's 8-wave GEMM1, or aiter#7001's Stage1 tiles.
+GEMM1_MODES = ("8wave", "7001")
 
 
 def _view(ptr, nbytes, device):
@@ -110,13 +121,29 @@ class MegaMoEStage1Sdma:
     of them; 2 and 4 are within run-to-run noise of each other end to end.
     ``fuse_quant``: quantise straight into the send rows (``quant_pack``) instead of pack;
     ``moe`` must then be called with bf16 input (``forward``), the prepare's quant input.
+    ``gemm1``: "8wave" (``gemm1_8wave_sdma``) or "7001" (aiter#7001's Stage1 tiles, the rows
+    packed by ``producers`` workgroups of the same launch; ``gemm1_7001_sdma``).
     """
 
-    def __init__(self, moe, scale_mode="auto", shufflers=4, fuse_quant=False):
+    def __init__(
+        self,
+        moe,
+        scale_mode="auto",
+        shufflers=4,
+        fuse_quant=False,
+        gemm1="8wave",
+        producers=32,
+    ):
         from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator
 
         assert scale_mode == "auto" or scale_mode in SCALE_MODES, scale_mode
         assert moe._a_dtype == "fp8" and moe.act == "silu", "a8w4 SwiGLU only"
+        assert gemm1 in GEMM1_MODES, gemm1
+        assert not (
+            gemm1 == "7001" and fuse_quant
+        ), "--gemm1 7001 packs the prepare's fp8 rows itself (no --fuse-quant)"
+        self.gemm1 = gemm1
+        self.producers = int(producers)
         self.moe = moe
         self.scale_mode = scale_mode
         self.shufflers = int(shufflers)
@@ -174,6 +201,10 @@ class MegaMoEStage1Sdma:
             rank=moe.rank,
         )
         self.kernels = {}
+        # --gemm1 7001: per (destination, segment), the call whose rows it holds packed.
+        self.seg_done = torch.zeros(
+            (moe.epr + 1) * moe.world_size, dtype=torch.int32, device=dev
+        )
         self._prod = None
         self.fuse_quant = bool(fuse_quant)
         self._x_bf16 = (
@@ -198,6 +229,46 @@ class MegaMoEStage1Sdma:
         if self.scale_mode != "auto":
             return self.scale_mode
         return "shuffler" if sort_block_m == 128 else "ldsw"
+
+    def kernel_7001(self, sbm, num_cu, cfg):
+        """``--gemm1 7001``: the launcher for one Stage1 config (``cfg`` has the fields of
+        aiter's Stage1Config)."""
+        from gemm1_7001_sdma import compile_gemm1_7001_sdma
+
+        key = ("7001", sbm, num_cu, cfg["tile_n"], cfg["num_waves"], cfg["work_shards"])
+        if key not in self.kernels:
+            moe = self.moe
+            assert cfg.get("grid_mult", 1) == 1, "compact Stage1: one workgroup per CU"
+            self.kernels[key] = compile_gemm1_7001_sdma(
+                model_dim=self.K,
+                inter_dim=moe.inter_dim,
+                rank=moe.rank,
+                experts_per_rank=moe.epr,
+                fuse_npes=moe.world_size,
+                fuse_mtpr=moe.mtpr,
+                sort_block_m=sbm,
+                tile_n=cfg["tile_n"],
+                tile_k=cfg["tile_k"],
+                num_waves=cfg["num_waves"],
+                pipe_weights=cfg["pipe_weights"],
+                mfma_amajor=cfg["mfma_amajor"],
+                swizzle_a=cfg["swizzle_a"],
+                async_a_copy=cfg["async_a_copy"],
+                use_tile_resource=cfg["use_tile_resource"],
+                waves_per_eu_hint=cfg["waves_per_eu_hint"],
+                num_cu=num_cu,
+                b_nt=cfg["b_nt"],
+                work_shards=cfg["work_shards"],
+                swiglu_limit=moe.swiglu_limit,
+                off_slab_x=self.off_slab_x,
+                off_slab_sc=self.off_slab_sc,
+                off_land_x=self.off_land_x,
+                off_land_sc=self.off_land_sc,
+                off_spare=self.off_spare,
+                topk=moe.topk,
+                producers=self.producers,
+            )
+        return self.kernels[key]
 
     def kernel_for(self, sbm, num_cu, scale_mode):
         key = (sbm, num_cu, scale_mode)
@@ -257,6 +328,32 @@ class MegaMoEStage1Sdma:
         ), "compact, route-major payload only"
         mode = self.scale_mode_for(sort_block_m)
         shuffler = mode == "shuffler"
+        if self.gemm1 == "7001":
+            self.sig_base.add_(moe.epr + 1)
+            self._call_7001(
+                out,
+                x,
+                w,
+                scale_x,
+                scale_w,
+                sorted_token_ids,
+                expert_ids,
+                num_valid_ids,
+                out_scale,
+                tokens,
+                addr_disp,
+                addr_in_tok,
+                addr_in_idx,
+                addr_in_wts,
+                addr_in_sc,
+                addr_parity,
+                addr_expected,
+                stream,
+                sort_block_m,
+                num_cu,
+                _ignored,
+            )
+            return
         launch = self.kernel_for(sort_block_m, num_cu, mode)
         self.sig_base.add_(moe.epr + 1)
         self.cursor.zero_()
@@ -331,6 +428,64 @@ class MegaMoEStage1Sdma:
             fx.Int64(
                 self.sig_base.data_ptr()
             ),  # sig_base: this call's signal target base
+            stream,
+        )
+
+    def _call_7001(
+        self,
+        out,
+        x,
+        w,
+        scale_x,
+        scale_w,
+        sorted_token_ids,
+        expert_ids,
+        num_valid_ids,
+        out_scale,
+        tokens,
+        addr_disp,
+        addr_in_tok,
+        addr_in_idx,
+        addr_in_wts,
+        addr_in_sc,
+        addr_parity,
+        addr_expected,
+        stream,
+        sort_block_m,
+        num_cu,
+        kw,
+    ):
+        """``--gemm1 7001``: one launch packs, puts and runs #7001's GEMM1 tiles on the
+        landing rows (``gemm1_7001_sdma``); no pack / qpack before it."""
+        moe, K = self.moe, self.K
+        # The Stage1 config: the launch's own keywords, or (bundle launches) the active one.
+        cfg = kw if "tile_n" in kw else dataclasses.asdict(moe._active_config.stage1)
+        land_x = _view(self.mem.ptr + self.off_land_x, self.r_rows * K, moe.dev)
+        land_sc = _view(self.mem.ptr + self.off_land_sc, self.r_rows * self.SC, moe.dev)
+        _run_compiled(
+            self.kernel_7001(sort_block_m, num_cu, cfg),
+            out,
+            land_x.view(x.dtype).view(self.r_rows, K),  # A: the landing rows
+            w,
+            land_sc.view(scale_x.dtype).view(self.r_rows, -1),  # their raw e8m0
+            scale_w,
+            sorted_token_ids,
+            expert_ids,
+            num_valid_ids,
+            out_scale,
+            tokens,
+            addr_disp,
+            addr_parity,
+            addr_expected,
+            fx.Int64(self.win.handle),
+            fx.Int64(self.dev_comm.ptr),
+            fx.Int64(self.sig_base.data_ptr()),
+            addr_in_tok,  # the prepare's fp8 rows
+            addr_in_sc,  # and their e8m0
+            addr_in_wts,
+            addr_in_idx,
+            fx.Int64(self.seg_done.data_ptr()),
+            fx.Int64(self.mem.ptr),  # this rank's window base
             stream,
         )
 

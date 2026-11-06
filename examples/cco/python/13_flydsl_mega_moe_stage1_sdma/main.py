@@ -31,6 +31,8 @@ starts on an expert as soon as its rows have landed:
 
     pack.py                  the sender-side pack kernel
     gemm1_8wave_sdma.py      the fused kernel: SDMA puts + scale shufflers + 8-wave GEMM1
+    gemm1_7001_sdma.py       ``--gemm1 7001``: one launch that packs, puts and runs
+                             aiter#7001's Stage1 GEMM1 tiles (no pack launch before it)
     mega_moe_stage1_sdma.py  the op, ``MegaMoEStage1Sdma``: cco window, launches, and
                              ``install()`` into a MegaMoEV2 in place of its Stage1 launch
 
@@ -47,6 +49,9 @@ Needs aiter (MegaMoEV2 with the compact prepare), FlyDSL, and mori built with SD
 
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 main.py test --bs 8192
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 main.py bench --bs-list 2048,4096,8192
+
+``--gemm1 7001`` needs aiter with aiter#7001's ``mega_moe/gemm1.py``; compare against that
+aiter's own Stage1.
 """
 
 import argparse
@@ -179,6 +184,7 @@ def _make_sdma(moe, args):
         scale_mode=args.scale_mode,
         shufflers=args.shufflers,
         fuse_quant=args.fuse_quant,
+        gemm1=args.gemm1,
     )
 
 
@@ -411,6 +417,13 @@ def _parse_args():
         help="shuffler workgroups in the shuffler mode",
     )
 
+    common.add_argument(
+        "--gemm1",
+        choices=("8wave", "7001"),
+        default="8wave",
+        help="GEMM1 of the fused kernel: the 8-wave GEMM1, or aiter#7001's Stage1 tiles "
+        "with the packing in the same launch (needs aiter with aiter#7001; no --fuse-quant)",
+    )
     common.add_argument(
         "--fuse-quant",
         action="store_true",

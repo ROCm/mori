@@ -204,6 +204,22 @@ The aiter baseline above is main `f0b96f49e`. Against main plus the open ROCm/ai
 0.18 ms (layer +0.17 / +0.20..+0.26 / +0.21 ms): once the CU dispatch is that cheap, the
 extra pack copy (about 0.19 ms at 8192) costs more than the CU time the copy engines save.
 
+`--gemm1 7001` (needs aiter with the files of ROCm/aiter#7001) runs #7001's own Stage1 GEMM1
+tiles instead of the 8-wave GEMM1, in one launch that also packs the rows: producer
+workgroups pack each (destination, segment) in expert order and the SDMA puts of a segment
+start as soon as it is packed, so no pack launch runs before it. Against aiter + #7001 on one
+node (CUDA Graph, Stage1 including prepare, ms):
+
+| tokens/rank | aiter + #7001 | `--fuse-quant` (8-wave) | `--gemm1 7001` |
+|---|---|---|---|
+| 2048 | 0.813-0.820 | 0.911-0.915 | 0.872-0.874 |
+| 4096 | 1.167-1.174 | 1.333-1.335 | 1.171-1.173 |
+| 8192 | 2.022-2.052 | 2.142-2.149 | 2.010-2.014 |
+
+Even at 4096 and 8192, still about 0.05 ms slower at 2048. The copy engines bound it now: KFD
+recommends one XGMI SDMA engine per peer link on this node, and the transfer alone takes
+about as long as #7001's GEMM1 without its dispatch.
+
 `MORI_CCO_GDA_CONN=full` is required for GDA (03, 06) when both ranks share one
 node; LSA examples (02, 04, 05) ignore it. Each example prints `SUCCESS` on pass.
 
