@@ -25,7 +25,6 @@
 #include <unistd.h>
 
 #include <array>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -33,6 +32,7 @@
 #include "assert.hpp"
 #include "comm/proxy_network.hip.hpp"
 #include "hip_check.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori::kiwi::ep {
 
@@ -147,11 +147,7 @@ void all2all_t::initialize(char* heap_base,
                       static_cast<size_t>(local_size_) * sizeof(uintptr_t), hipMemcpyHostToDevice));
 
   if (rank_me == 0) {
-    std::fprintf(stderr,
-                 "kiwi_ep hybrid count all-to-all nodes=%d local_size=%d "
-                 "storage=gpu-symmetric-heap transpose=receive-side "
-                 "lane_mapping=rank%%local_size\n",
-                 num_nodes_, local_size_);
+    MORI_OPS_DEBUG("kiwi-ep count all-to-all: nodes={} local_size={}", num_nodes_, local_size_);
   }
 }
 
