@@ -370,16 +370,26 @@ int FaultInjector::PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) {
   } catch (...) {
     FailInjection("preparing send injection");
   }
-  int ret = real_.PostSend(qp, wr, bad);
-  if (tracking_.load(std::memory_order_acquire)) {
+  auto trackedData = [](const ibv_send_wr* cur) {
+    const bool data = cur->opcode == IBV_WR_RDMA_WRITE ||
+                      cur->opcode == IBV_WR_RDMA_WRITE_WITH_IMM || cur->opcode == IBV_WR_RDMA_READ;
+    return data && (cur->send_flags & IBV_SEND_SIGNALED);
+  };
+  // Register before posting: once posted, a WR's completion can be polled (and
+  // erased) before this thread runs again.
+  const bool tracking = tracking_.load(std::memory_order_acquire);
+  if (tracking) {
     std::lock_guard<std::mutex> lock(mu_);
-    for (ibv_send_wr* cur = wr; cur != nullptr && (ret == 0 || cur != *bad); cur = cur->next) {
-      const bool data = cur->opcode == IBV_WR_RDMA_WRITE ||
-                        cur->opcode == IBV_WR_RDMA_WRITE_WITH_IMM ||
-                        cur->opcode == IBV_WR_RDMA_READ;
-      if (data && (cur->send_flags & IBV_SEND_SIGNALED)) {
-        dataWrsInFlight_[{qp->context, qp->qp_num, cur->wr_id}] = qp;
-      }
+    for (ibv_send_wr* cur = wr; cur != nullptr; cur = cur->next) {
+      if (trackedData(cur)) dataWrsInFlight_[{qp->context, qp->qp_num, cur->wr_id}] = qp;
+    }
+  }
+  int ret = real_.PostSend(qp, wr, bad);
+  if (tracking && ret != 0) {
+    // *bad and the WRs after it were not posted.
+    std::lock_guard<std::mutex> lock(mu_);
+    for (ibv_send_wr* cur = *bad; cur != nullptr; cur = cur->next) {
+      if (trackedData(cur)) dataWrsInFlight_.erase({qp->context, qp->qp_num, cur->wr_id});
     }
   }
   if (inject) PublishAsyncEvent(qp, SendOpcode(wr), event);
