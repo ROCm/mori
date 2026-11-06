@@ -179,6 +179,7 @@ void PageBackend::InstallTierConfig(TierConfig cfg) {
     throw std::invalid_argument("PageBackend: buffer_bases / buffer_sizes length mismatch");
   }
   allocator_ = std::make_unique<PageBitmapAllocator>(page_size_, cfg.buffer_sizes);
+  owned_.reserve(KeyIndexReserve(allocator_->TotalBytes(), page_size_));
   buffer_descs_ = std::move(cfg.buffer_descs);
   buffer_bases_ = std::move(cfg.buffer_bases);
   BuildBufferRefs();

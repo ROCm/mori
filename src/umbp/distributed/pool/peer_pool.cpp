@@ -96,6 +96,15 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
       transfer_engine_(transfer_engine),
       tier_graph_(policy_ == nullptr ? nullptr : policy_->TierGraph()),
       transition_executor_(backends, transfer_engine) {
+  if (backends_ != nullptr) {
+    uint64_t keys = 0;
+    for (uint32_t id = 0; id < BackendRegistry::kMaxBackends; ++id) {
+      auto* backend = backends_->Get(id);
+      if (backend == nullptr || backend->Tier() == TierType::SSD) continue;
+      keys += KeyIndexReserve(backend->Capacity().total_bytes, backend->PageSize());
+    }
+    placements_.reserve(keys);
+  }
   if (tier_graph_ != nullptr) {
     // A tier graph without an engine would accept offload and promotion rules
     // and then silently fail every one of them, leaving the topology looking
