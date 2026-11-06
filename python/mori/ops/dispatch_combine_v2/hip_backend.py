@@ -425,7 +425,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 cfg.schedule = tuple(
                     (e, db, dw, comb_b, comb_w) for (e, db, dw, _, _) in cfg.schedule
                 )
-        self._schedule = tuning.resolve_schedule(cfg)
+        self._schedule = tuning.resolve_schedule(
+            cfg, cu_count=self._multi_processor_count
+        )
         if cfg.rank == 0 and not cfg.async_ll and logger.isEnabledFor(logging.INFO):
             logger.info("%s", tuning.describe_schedule(cfg, self._schedule))
         self._dispatch_specs = tuple(
@@ -1342,9 +1344,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             seq["combine_recv"] = ("combine_recvcopy",)
         return seq
 
-    # Which leg's dtype each pass is compiled for. Same rule as _INTERNODE_LEG:
-    # compiling a combine pass with the dispatch dtype is how an fp8 dispatch ends
-    # up writing half the bytes a bf16 combine view reads.
+    # Which leg's dtype each pass is compiled for, the rule
+    # _build_internode_kernels applies per phase: compiling a combine pass with
+    # the dispatch dtype is how an fp8 dispatch ends up writing half the bytes a
+    # bf16 combine view reads.
     @staticmethod
     def _asyncll_leg(group):
         return "dispatch" if group.startswith("dispatch") else "combine"
@@ -1380,7 +1383,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         block_num = cfg.dispatch_block_num
         warp_per_block = cfg.warp_num_per_block
 
-        self._plans = []
         plans_by_pass = {}
         # The second value is MORI_ASYNCLL_SKIP_RESET, which no longer selects
         # anything: main dropped the host total_recv reset it skipped (and
@@ -1404,7 +1406,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 plan.bind(rdmaBlockNum=0, replayMode=0)
                 plans_by_pass[name] = plan
                 self._plans.append(plan)
-        self._asyncll_plans = plans_by_pass
         self._asyncll_groups = {
             group: plan_api.make_launch_group([plans_by_pass[n] for n in names])
             for group, names in sequences.items()
@@ -1637,9 +1638,29 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """
 
         def run(*, input, num_tokens, dest_map, **kwargs):
-            # Combine reuses dispatch's indices and folds the RECEIVED weights
-            # from the arena. The input weights are indexed by source token and
-            # cannot serve as combine's weights buffer.
+            # Two of the kernel's arguments are set by dispatch and READ AGAIN by
+            # combine, but the base only hands them to dispatch -- combine's
+            # signature carries no indices and treats `weights` as a request
+            # rather than an input. v1 does not notice because its handle keeps
+            # both across the pair; here they have to be remembered explicitly.
+            #
+            #   tokenIndices  EpCombineAllGeneric dereferences it unconditionally
+            #                 (args.tokenIndices[tokenId * topk + laneId]), so a
+            #                 null is a fault, not a skipped branch.
+            #   weightsBuf    it is a DIFFERENT tensor in each phase, and its
+            #                 NULLNESS is the kernel's only gate on the fold. It
+            #                 also sets `combXferBytes = hidden + (weights ? wt :
+            #                 0)`, but only the combine passes index that, so the
+            #                 phases need not agree on null-ness.
+            #
+            # Dispatch's weightsBuf is the caller's per-input-token weights and is
+            # indexed by source token id. Combine's is indexed by RECEIVED token
+            # id (`CombineSync` stages `weightsBuf + tokenId * topk` for tokenId in
+            # [0, totalRecvTokenNum)), so it must be the weights dispatch just
+            # delivered -- the `dispatch_out_weights` region, which is exactly the
+            # `dispatch_weights` output v1's callers hand back to `combine()`.
+            # Passing the input weights here does not fault: it folds the right
+            # number of node slots holding other tokens' weights.
             if phase == "dispatch":
                 weights, indices = kwargs.get("weights"), kwargs.get("indices")
                 self._internode_has_weights = weights is not None

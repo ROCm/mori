@@ -22,22 +22,22 @@ e.g. gfx942_mi308x_InterNodeV2_ep16.csv
 Each row is one rule, a launch geometry for one shape, phase and token ceiling:
 
 ```csv
-num_experts,topk,phase,dtype,hidden_dim,zero_copy,quant_type,num_tokens,block_num,rdma_block_num,warp_per_block,active_qps,combine_load_first,avg_latency_us,bandwidth_gbps,avg_rdma_bandwidth_gbps,avg_xgmi_bandwidth_gbps,avg_ll_bandwidth_gbps,bandwidth_metric
-256,8,dispatch,bf16,7168,,,4,64,42,4,2,,75.12,1.52,1.52,5.1,5.63,grand_mean
-256,8,combine,bf16,7168,0,none,4,16,10,4,1,1,84.85,1.35,1.35,4.5,4.97,grand_mean
+num_experts,topk,phase,dtype,hidden_dim,num_tokens,block_num,rdma_block_num,warp_per_block,active_qps,combine_load_first,avg_latency_us,bandwidth_gbps,avg_rdma_bandwidth_gbps,avg_xgmi_bandwidth_gbps,avg_ll_bandwidth_gbps,bandwidth_metric
+256,8,dispatch,bf16,7168,4,64,42,4,2,,75.12,1.52,1.52,5.1,5.63,grand_mean
+256,8,combine,bf16,7168,4,16,10,4,1,1,84.85,1.35,1.35,4.5,4.97,grand_mean
 ```
 
-- The first eight columns are the selector. `num_experts` is the total expert
-  count, `ep * experts_per_rank`; `zero_copy` and `quant_type` are combine-only
-  and empty on dispatch rows.
+- The first six columns are the selector. `num_experts` is the total expert
+  count, `ep * experts_per_rank`. V2 has no zero-copy mode and its tables
+  serve `quant_type="none"` only, so neither is a column.
 - `block_num`, `rdma_block_num` and `warp_per_block` are the geometry.
   Intra-node rules use `rdma_block_num` 0.
 - `active_qps` and `combine_load_first` are the optional per-bucket flags below;
   empty means the default. Booleans are written 0 or 1.
 - The metric columns are for reference only; lookup never reads them.
 - Rows are grouped by shape (`num_experts`, `topk`, `hidden_dim`). Within a
-  shape, dispatch rows come before combine rows, then by dtype, the combine
-  fields and `num_tokens`. The tuning save rewrites the file in that order, so a
+  shape, dispatch rows come before combine rows, then by dtype and
+  `num_tokens`. The tuning save rewrites the file in that order, so a
   diff shows only the rules that changed.
 - A table is checked when it is loaded: an unknown or missing column, a cell
   that does not parse, a field the kernel family does not read, or two rows
@@ -63,36 +63,35 @@ The largest count in one MI355X op is 4, and 2 for InterNodeV2LL 272/9 and
 `InterNodeV2` combine rules may set `combine_load_first` to 1 (empty means 0).
 That bucket's combine pass is then compiled with the load-first peer gather
 (`WarpAccumLF`). It is chosen per bucket, not from the declared capacity, and
-other tables may not set it. Current settings:
+other tables may not set it. It changes nothing at a top-k the load-first gather
+has no case for, such as 16: both gathers then fall through to the same
+`WarpAccumDynamic`, so no 896/16 rule sets it. Current settings:
 
 - MI355X: chosen per bucket together with the active QP counts; a bucket the
   whole-table A/B did not change keeps its previous setting (the earlier
   capacity ≤ 256 rule). On for 256/8 bf16 H7168 and H6144 and 272/9 bf16
   H7168 at T4–256; 384/6 bf16 H5120 at T4–256 and T4096; 256/6 bf16 H7168 and
-  384/6 bf16 H7168 at T64–256 and T4096; 896/16 bf16 H3584 at T8, T32 and
-  T4096. Off elsewhere.
+  384/6 bf16 H7168 at T64–256 and T4096. Off elsewhere.
 - MI308X: chosen per bucket together with the active QP counts, and kept only
   where a whole-table A/B against the previous tables confirmed it: on for
   256/8 bf16 H7168 at T4–512, T2048 and T4096; 256/8 bf16 H6144 at T4–128 and
   T2048; 256/6 bf16 H7168 at T64–128; 384/6 bf16 H7168 at T64–256; 384/6
   bf16 H5120, re-tuned with its geometry, at T4–256, T2048 and T4096.
-  272/9 and 896/16, re-tuned on the kernel with the topk-9/16 combine gather
-  fixed: on for 272/9 bf16 H7168 at T4–256, T1024 and T2048, and for 896/16
-  bf16 H3584 at T16, T32, T256 and T512.
-  Off elsewhere.
+  272/9, re-tuned on the kernel with the topk-9/16 combine gather fixed: on
+  for 272/9 bf16 H7168 at T4–256, T1024 and T2048. Off elsewhere.
 - MI300X: chosen per bucket together with the active QP counts, and kept only
   where a whole-table A/B against the previous tables confirmed it: on for
   256/8 bf16 H7168 and H6144 and 384/6 bf16 H5120 at T4–256; 272/9 bf16 H7168
-  at T4–128; 256/6 and 384/6 bf16 H7168 at T64–256; 896/16 bf16 H3584 at T16,
-  T32 and T256. Off elsewhere.
+  at T4–128; 256/6 and 384/6 bf16 H7168 at T64–256. Off elsewhere.
 
 ## Lookup
 
-- **Only the current model's own file is read.** A model without a file, such
-  as MI350X or MI325X today, does not borrow another model's CSV; it falls
+- **Only the current model's own file is read**, except that MI350X, the same
+  die and CU count as MI355X, reads MI355X's (`_MODEL_ALIAS`). A model without
+  a file, such as MI325X today, does not borrow another model's CSV; it falls
   back to the default geometry (inter-node: the config defaults clamped to the
-  CU count; intra-node: the Python tables in `hip_tuning_configs.py`, where
-  MI350X shares MI355X's entries, then `_hip_default()`).
+  CU count; intra-node: the Python tables in `hip_tuning_configs.py`, then
+  `_hip_default()`).
 - `num_experts`, `topk`, `dtype` and `hidden_dim` must match exactly. Dispatch
   and combine are matched independently, each with its own dtype.
 - FP4 dispatch rows store the packed width: `hidden_dim` 3584 means a logical
@@ -103,8 +102,8 @@ other tables may not set it. Current settings:
   `rdma_block_num < block_num`. Fields set explicitly on the config override
   the table, and are not clamped.
 - `MORI_EP_V2_TUNING_DIR` points lookup at another directory.
-  `MORI_EP_DISP_GEOM` / `MORI_EP_COMB_GEOM` (`B,R,W[,active_qps]`) bypass the
-  tables entirely, for sweeps.
+  `MORI_EP_DISP_GEOM` / `MORI_EP_COMB_GEOM` (`B,R,W[,active_qps]`) replace one
+  phase's geometry in every bucket, for sweeps; the other phase keeps its rules.
 
 ## Coverage
 
@@ -158,82 +157,36 @@ runs.
 
 Metrics are only comparable between rows measured under the same conditions.
 
-- **QP count.** Inter-node latency depends heavily on the active count
-  (`active_qps`, above) and on the allocation (`num_qp_per_pe`) on MI308X:
-  QP64 adds about 270 µs per phase at T ≤ 512. MI308X inter-node rows were
-  measured with an allocation of 8 and each rule's own count, except FP8
-  combine rows, which keep earlier two-QP measurements. MI300X inter-node
-  rows likewise, FP8 combine rows included, with no count above 4. MI355X
-  inter-node rows changed on 2026-11-02/03 were measured the same way; the ones
-  it left unchanged keep the earlier harness-sweep measurements (an allocation
-  of 2, `scale_dim` 32), whose metrics are not comparable.
-- **Protocol.** Uniform routing, `scale_dim=0`, capacity equal to the token
+- **QPs.** Inter-node rows are measured with an allocation of 8
+  (`num_qp_per_pe=8`) and each rule's own active count. Inter-node latency
+  depends heavily on both (on MI308X an allocation of 64 adds about 270 µs per
+  phase at T ≤ 512), so a run with another allocation does not reproduce the
+  rows. Two groups keep earlier conditions and are not comparable with the
+  rest: the MI308X FP8 combine rows (two QPs), and the MI355X rows its last
+  re-tune left unchanged (an allocation of 2, `scale_dim` 32).
+- **Workload.** Uniform routing, `scale_dim=0`, capacity equal to the token
   count, `quant_type="none"`. The 264/9 and 272/9 rows use replica routing
   (`--routing replica`): eight distinct routed experts drawn uniformly, plus
   the token's own rank's replica. FP8 and FP4 dispatch rows are measured with
-  the bucket's BF16 combine rule; MI300X FP8 combine rows in a symmetric FP8
-  op, with the bucket's FP8 dispatch rule. For FP4 the combine reduces the
+  the bucket's BF16 combine rule, and FP8 combine rows in a symmetric FP8 op
+  with the bucket's FP8 dispatch rule. For FP4 the combine reduces the
   decoded payload, decoded between the two timed phases where FP8 is cast to
   BF16.
-  Timing uses 3 passes × (20 warmup + 30 timed rounds), dropping the first
-  timed round of each pass. A measurement is accepted only after correctness
-  checks, and only if each phase has
-  mean/median ≤ 1.10 and max/median ≤ 5, and the per-pass D+C means vary by
-  ≤ 1.20×.
-- **MI300X EP8.** Every rule was re-tuned and measured with the protocol above
-  on one MI300X, each rank pinned to four physical cores on its GPU's NUMA
-  node. Unpinned, the T ≤ 128 cells settle per run into a regime up to 1.5×
-  slower, which more rounds do not average out. Each phase was screened over
-  blocks 8–304 × warps 4, 8 and 16 against the previous table, two rounds,
-  and a bucket took the new rules only where they were ≥1% faster (D+C summed
-  over the dispatch dtypes) in every round of a whole-table A/B and again in
-  a confirming one. The JIT cache must be warm before timing: a cell measured
-  right after its kernels compile starts from idle-dropped clocks and reads up
-  to 40% slow at T64.
-- **MI300X EP16.** Every rule was re-tuned and measured with the protocol
-  above on two MI300X nodes (ConnectX-7, 400 Gb/s a rail), ranks pinned as
-  for EP8. Geometry was screened per family and phase in two rounds against
-  the previous tables, or the defaults for a shape without rows; the active
-  QP counts and the V2 combine load-first then in one round of whole-table
-  variants. A bucket took the new rules only where they were ≥1% faster (D+C
-  summed over the dispatch dtypes) in every round of a whole-table A/B against
-  the previous tables, and again in a confirming one. The FP4 dispatch and FP8
-  combine rows were added later, geometry and active QP count screened
-  together against the defaults, with the same rounds and gates.
-- **MI355X EP16.** Re-tuned on 2026-11-02/03 on two MI355X nodes (ionic
-  NICs, `MORI_DISABLE_IONIC_CCQE=1`) with the protocol above, on the kernel
-  with the topk-9/16 combine gather and copy tail fixed. Per bucket: geometry
-  screened over 37 candidates per phase in two rounds, then the active QP
-  counts and load-first, then a whole-table A/B against the previous tables
-  and a confirming one; a bucket took the new rules only where they were ≥1%
-  faster (D+C summed over the dispatch dtypes) in every round. Rows for a
-  bucket that had none and was not changed hold the configuration it ran
-  before (the next bucket's rule or the default), so the new rules of its
-  neighbours do not move it. On 896/16 InterNodeV2LL dispatch, 256 blocks ×
-  16 warps (256/128/16, 256/170/16) gave wrong results on 1 rank in 16 in 4
-  of 54 runs; those geometries are excluded there. Its T2048 bf16 and T4096
-  fp8 rules, re-picked without them, are in the next item.
-- **MI355X EP8, and twelve later EP16 rows.** Measured on 2026-11-03/04 on
-  another cluster's MI355X nodes (amdgpu 6.16.6 and GPU firmware bundle
-  01.25.16.03; the EP16 item above ran on 6.14.14 and bundle 01.26.00.02),
-  with the protocol above. EP8 256/8 h6144, 264/9 and 384/6 h5120 were tuned
-  from scratch: geometry over 18 candidates per phase in two rounds, then a
-  whole-table A/B and a confirming one, the same ≥1%-in-every-round rule; 18
-  of 21 buckets took new rules, and their correctness pass (20 inputs a cell)
-  was clean on two nodes. In EP16, the FP4 dispatch rows at T4–T16 and the
-  FP8 combine rows at T4–T64 that changed were picked on top of the item
-  above and took over only where they beat its rules in a head-to-head
-  confirm A/B; the 896/16 InterNodeV2LL T2048 bf16 (256/170/4) and T4096 fp8
-  (256/170/8) dispatch rules took over the same way. That cluster gives
-  intermittent wrong results, on the old rules as often as on the new, in
-  0.3–8% of runs at T ≤ 512 (not seen on the first one); the twelve EP16
-  rows were picked with the checks recorded but not gating, so they are
-  timed, not verified.
-- **Kernel.** The MI308X 264/9, 272/9 InterNodeV2, 896/16 and FP4 dispatch
-  rows, and every MI300X row, were re-tuned and measured on the kernel
-  with the topk-9/16 combine gather and the 3584 B copy tail fixed
-  (`device_primitives.hpp`). The 272/9 InterNodeV2LL rows predate the fix,
-  which moves them by under 0.5%.
+- **Timing.** 3 passes × (20 warmup + 30 timed rounds), dropping the first
+  timed round of each pass. Pin each rank to physical cores on its GPU's NUMA
+  node and warm the JIT cache first: on MI300X, unpinned T ≤ 128 cells settle
+  per run into a regime up to 1.5× slower, and a cell timed right after its
+  kernels compile starts from idle-dropped clocks and reads up to 40% slow at
+  T64.
+- **Acceptance.** A measurement counts only after the correctness checks
+  pass, and only if each phase has mean/median ≤ 1.10 and max/median ≤ 5 and
+  the per-pass D+C means vary by ≤ 1.20×.
+- **Selection.** Geometry is screened per family and phase against the
+  current tables, or the defaults for a shape without rows, then the active
+  QP counts and the combine load-first. A bucket takes new rules only where
+  they are ≥1% faster (D+C summed over the dispatch dtypes) in every round of
+  a whole-table A/B against the previous tables, and again in a confirming
+  one.
 - **Metrics.** `avg_latency_us` is the mean over all retained samples.
   Bandwidths are grand means of per-rank, per-round `bytes / time`, not
   `bytes / mean latency`. `bandwidth_gbps` is XGMI for intra-node rows, RDMA for

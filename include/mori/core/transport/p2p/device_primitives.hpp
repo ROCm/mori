@@ -316,9 +316,9 @@ inline __device__ void WarpCopy(T* __restrict__ dst, const T* __restrict__ src, 
   if constexpr (Unroll > 1) {
     WarpCopyImpl<T, 1>(dst, src, offset, nelems);
   }
-  // Less than one 16 B vector per lane is left (512 B of a 3584 B row), which the
-  // element loop would write one element per lane per pass, a byte at a time for
-  // 1-byte types. The narrower passes only run on pointers aligned to their width.
+  // Less than one 16 B vector per lane is left, which the element loop would write
+  // one element per lane per pass, a byte at a time for 1-byte types. The narrower
+  // passes only run on pointers aligned to their width.
   WarpCopyNarrow<T, 8>(dst, src, offset, nelems);
   WarpCopyNarrow<T, 4>(dst, src, offset, nelems);
   WarpCopyNarrow<T, 2>(dst, src, offset, nelems);
@@ -494,8 +494,8 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   // With 4 and 8 B vectors a batch's loads are all issued before any of them is
   // accumulated, so a count without a case of its own keeps up to 8 peer reads in
   // flight instead of one, at the AccumNum=8 case's footprint. 16 B vectors load one
-  // source at a time: a JIT kernel compiles only its topk's path, and 8 x 16 B in
-  // flight per lane pushes the LL combine gather into spills.
+  // source at a time: batching them here took the topk-9 LL combine gather from
+  // 82-94 to 123-128 VGPRs, with spills, and 5-6% slower above T512.
   constexpr int kLoadBatch = 8;
   const int laneId = threadIdx.x & (warpSize - 1);
   size_t offset = 0;

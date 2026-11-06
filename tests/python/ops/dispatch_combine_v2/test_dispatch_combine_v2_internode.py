@@ -112,15 +112,15 @@ plus an accumulate in three kernels and a wider staging slot.
 import argparse
 import ctypes
 import dataclasses
+import logging
 import math
 import os
 import re
 import sys
 import time
-from numbers import Real
 from pathlib import Path
+from typing import NamedTuple
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from mori.cco import Communicator
@@ -407,6 +407,44 @@ def _generate_round(rng, cfg, num_tokens, device, dtype, routing="uniform"):
     return inp, idx, wts, scales
 
 
+class _Golden(NamedTuple):
+    unique_pes: torch.Tensor  # (tokens, 1): distinct destination ranks per token
+    hidden: torch.Tensor
+    hidden_bound: torch.Tensor
+    weights: torch.Tensor | None
+    weights_bound: torch.Tensor | None
+
+
+def _golden(cfg, args, inp, idx, wts=None):
+    """What an identity expert's combine must return, with its error bounds.
+
+    combine[t] sums one copy of input[t] per DISTINCT destination rank, so the
+    golden is unique_pes[t] * input[t]. The bound has to scale with unique_pes:
+    the sum has that many terms in the wire dtype, so its error grows with their
+    number and magnitude -- not with |golden| at that element, which cancellation
+    can make arbitrarily small. v1's harness bounds the same way. Weights are
+    summed in f32, so theirs is much tighter; both are None without ``wts``.
+    """
+    pes = idx.long() // cfg.num_experts_per_rank
+    unique = (
+        torch.stack(
+            [(pes[:, j : j + 1] != pes[:, :j]).all(dim=1) for j in range(pes.shape[1])],
+            dim=1,
+        )
+        .sum(dim=1, keepdim=True)
+        .float()
+    )
+    eps = 3e-1 if (args.quant_type != "none" or cfg.dispatch_dtype in _FP8) else 8e-3
+    source = inp.float()
+    return _Golden(
+        unique,
+        unique * source,
+        eps * unique * source.abs().clamp(min=1.0),
+        None if wts is None else unique * wts.float(),
+        None if wts is None else 2e-3 * unique,
+    )
+
+
 def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
     """One dispatch+combine against the analytic golden. True if this rank agrees.
 
@@ -433,39 +471,10 @@ def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
     torch.cuda.synchronize()
     comm.barrier()
 
-    num_tokens = inp.shape[0]
-    idx_cpu = idx.cpu()
-    unique_pes = np.array(
-        [
-            len(
-                {
-                    int(idx_cpu[t, j]) // cfg.num_experts_per_rank
-                    for j in range(args.topk)
-                }
-            )
-            for t in range(num_tokens)
-        ]
-    )
-    unique_pes_column = torch.from_numpy(unique_pes).view(num_tokens, 1).float()
-    got = out.float().cpu()
-    expected = unique_pes_column * inp.float().cpu()
-    input_magnitude = inp.float().cpu().abs()
-    eps = 3e-1 if (args.quant_type != "none" or cfg.dispatch_dtype in _FP8) else 8e-3
-    hidden_ok = bool(
-        (
-            (got - expected).abs()
-            <= eps * unique_pes_column * input_magnitude.clamp(min=1.0)
-        ).all()
-    )
-    weights_ok = (
-        True
-        if out_w is None
-        else bool(
-            (
-                (out_w.cpu() - unique_pes_column * wts.float().cpu()).abs()
-                <= 2e-3 * unique_pes_column
-            ).all()
-        )
+    golden = _golden(cfg, args, inp, idx, wts)
+    hidden_ok = bool(((out.float() - golden.hidden).abs() <= golden.hidden_bound).all())
+    weights_ok = out_w is None or bool(
+        ((out_w.float() - golden.weights).abs() <= golden.weights_bound).all()
     )
     if not (hidden_ok and weights_ok) and dist_handle.rank == 0:
         print(
@@ -1079,35 +1088,11 @@ def _timed_pass(
 ):
     """One warmup+timed block. Returns (dispatch_us, combine_us) as grand means over
     rounds x ranks, plus (worst_dispatch, worst_combine) as the worst single round."""
-    events = [torch.cuda.Event(enable_timing=True) for _ in range(3 * num_rounds + 1)]
-    # Same tensor lifetime as the timed loop; see the warmup in _bench for why
-    # the inline temporary costs the second timed round a hipMalloc. It matters
-    # more here: this function reports a worst-single-round that the tuner uses
-    # to break ties, against a default --tuning-margin-us of 1.5.
-    warmup_combine_input = None
-    for _ in range(num_warmup):
-        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
-        warmup_combine_input = convert(dispatch_out[0])
-        op.combine(warmup_combine_input, combine_weights, routing=dispatch_out[5])
-    del warmup_combine_input
-    torch.cuda.synchronize()
-    events[0].record()
-    for i in range(num_rounds):
-        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
-        events[3 * i + 1].record()
-        combine_input = convert(dispatch_out[0])
-        events[3 * i + 2].record()
-        op.combine(combine_input, combine_weights, routing=dispatch_out[5])
-        events[3 * i + 3].record()
-    torch.cuda.synchronize()
-    keep = slice(args.drop_rounds, None)
-    dispatch_us = [
-        events[3 * i].elapsed_time(events[3 * i + 1]) * 1e3 for i in range(num_rounds)
-    ][keep]
-    combine_us = [
-        events[3 * i + 2].elapsed_time(events[3 * i + 3]) * 1e3
-        for i in range(num_rounds)
-    ][keep]
+    rounds = _timed_rounds(
+        op, inp, idx, wts, sc, combine_weights, convert, num_rounds, num_warmup
+    )[args.drop_rounds :]
+    dispatch_us = [dispatch for dispatch, _ in rounds]
+    combine_us = [combine for _, combine in rounds]
 
     def grand_mean(values):
         return (
@@ -1148,30 +1133,40 @@ def _build_op(cfg, comm, dispatch_geometry, combine_geometry):
     The intranode backend has no such hook; there the geometry is pinned through
     the config fields, which also drops the tuned schedule.
     """
-    if not cfg.is_internode:
-        pinned = dataclasses.replace(
-            cfg,
-            schedule=None,
-            dispatch_block_num=dispatch_geometry[0],
-            warp_num_per_block=dispatch_geometry[2],
-            combine_block_num=combine_geometry[0],
-            combine_warp_num_per_block=combine_geometry[2],
-        )
-        return EpDispatchCombineOp(pinned, comm)
-    previous = (
-        os.environ.get("MORI_EP_DISP_GEOM"),
-        os.environ.get("MORI_EP_COMB_GEOM"),
-    )
-    os.environ["MORI_EP_DISP_GEOM"] = ",".join(map(str, dispatch_geometry))
-    os.environ["MORI_EP_COMB_GEOM"] = ",".join(map(str, combine_geometry))
+    # The backend logs every op's full schedule at INFO; a sweep builds one op
+    # per candidate, and its own report already names each geometry.
+    backend_log = logging.getLogger("mori.ops.dispatch_combine_v2.hip_backend")
+    backend_level = backend_log.level
+    backend_log.setLevel(logging.WARNING)
     try:
-        return EpDispatchCombineOp(cfg, comm)
+        if not cfg.is_internode:
+            pinned = dataclasses.replace(
+                cfg,
+                schedule=None,
+                dispatch_block_num=dispatch_geometry[0],
+                warp_num_per_block=dispatch_geometry[2],
+                combine_block_num=combine_geometry[0],
+                combine_warp_num_per_block=combine_geometry[2],
+            )
+            return EpDispatchCombineOp(pinned, comm)
+        previous = (
+            os.environ.get("MORI_EP_DISP_GEOM"),
+            os.environ.get("MORI_EP_COMB_GEOM"),
+        )
+        os.environ["MORI_EP_DISP_GEOM"] = ",".join(map(str, dispatch_geometry))
+        os.environ["MORI_EP_COMB_GEOM"] = ",".join(map(str, combine_geometry))
+        try:
+            return EpDispatchCombineOp(cfg, comm)
+        finally:
+            for name, value in zip(
+                ("MORI_EP_DISP_GEOM", "MORI_EP_COMB_GEOM"), previous
+            ):
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
     finally:
-        for name, value in zip(("MORI_EP_DISP_GEOM", "MORI_EP_COMB_GEOM"), previous):
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        backend_log.setLevel(backend_level)
 
 
 def _median(values):
@@ -1179,11 +1174,27 @@ def _median(values):
     return ordered[len(ordered) // 2]
 
 
-def _metric_timing_pass(
-    op, inp, idx, wts, sc, combine_weights, convert, num_rounds, num_warmup
+def _timed_rounds(
+    op,
+    inp,
+    idx,
+    wts,
+    sc,
+    combine_weights,
+    convert,
+    num_rounds,
+    num_warmup,
+    *,
+    barrier=False,
 ):
-    """Local event timings with v1's barrier before, not inside, the timed loop."""
+    """Warmup, then num_rounds timed dispatch+combine pairs on this rank:
+    (dispatch_us, combine_us) per round. ``barrier`` lines the ranks up before,
+    not inside, the timed loop, as v1 does for the metrics it reports."""
     events = [torch.cuda.Event(enable_timing=True) for _ in range(3 * num_rounds + 1)]
+    # Same tensor lifetime as the timed loop; see the warmup in _bench for why
+    # the inline temporary costs the second timed round a hipMalloc. It matters
+    # more for the tuner, which breaks ties on the worst single round against a
+    # default --tuning-margin-us of 1.5.
     warmup_combine_input = None
     for _ in range(num_warmup):
         dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
@@ -1191,7 +1202,8 @@ def _metric_timing_pass(
         op.combine(warmup_combine_input, combine_weights, routing=dispatch_out[5])
     del warmup_combine_input
     torch.cuda.synchronize()
-    dist.barrier()
+    if barrier:
+        dist.barrier()
     events[0].record()
     for i in range(num_rounds):
         dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
@@ -1210,30 +1222,10 @@ def _metric_timing_pass(
     ]
 
 
-def _integer(value, name, minimum):
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, Real)
-        or not math.isfinite(value)
-        or value != int(value)
-        or value < minimum
-    ):
-        raise ValueError(f"{name} must be an integer >= {minimum}")
-    return int(value)
-
-
 def _summarize_metric_samples(
-    gathered,
-    *,
-    num_passes,
-    num_rounds,
-    num_warmup,
-    drop_rounds,
-    max_tokens,
-    topk,
-    ll,
+    gathered, *, num_passes, num_rounds, drop_rounds, max_tokens, topk, ll
 ):
-    """Return (rounded tuning metrics, evidence) from CPU all-gather rows.
+    """Rounded tuning metrics from the CPU all-gather rows.
 
     Each rank contributes four metadata values followed by interleaved
     dispatch/combine microseconds in pass-major, round-major order. Metadata is
@@ -1241,57 +1233,10 @@ def _summarize_metric_samples(
     bytes/token. Bandwidth is averaged after dividing each rank's own bytes by
     each retained latency. The LL scale is rank 0's, applied after that average.
     """
-    num_passes = _integer(num_passes, "num_passes", 1)
-    num_rounds = _integer(num_rounds, "num_rounds", 1)
-    num_warmup = _integer(num_warmup, "num_warmup", 0)
-    drop_rounds = _integer(drop_rounds, "drop_rounds", 0)
-    max_tokens = _integer(max_tokens, "max_tokens", 0)
-    topk = _integer(topk, "topk", 1)
-    if drop_rounds >= num_rounds:
-        raise ValueError("drop_rounds must leave at least one retained round per pass")
-    if not isinstance(ll, bool):
-        raise ValueError("ll must be a boolean")
-    try:
-        rows = [list(row) for row in gathered]
-    except TypeError as exc:
-        raise ValueError("gathered must contain rank rows") from exc
-    if not rows:
-        raise ValueError("gathered must contain at least one rank")
-
-    row_length = 4 + 2 * num_passes * num_rounds
-    for rank, row in enumerate(rows):
-        if len(row) != row_length:
-            raise ValueError(
-                f"rank {rank}: expected {row_length} values, received {len(row)}"
-            )
-        for column, (name, minimum) in enumerate(
-            (
-                ("recv_tokens", 0),
-                ("rdma_algo_tokens", 0),
-                ("dispatch_bytes_per_token", 1),
-                ("combine_bytes_per_token", 1),
-            )
-        ):
-            row[column] = _integer(row[column], f"rank {rank} {name}", minimum)
-        for column in range(4, row_length):
-            value = row[column]
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, Real)
-                or not math.isfinite(value)
-                or value <= 0
-            ):
-                raise ValueError(
-                    f"rank {rank}, sample value {column - 4}: "
-                    "latency must be finite and positive"
-                )
-            row[column] = float(value)
-
-    samples_per_rank = num_passes * (num_rounds - drop_rounds)
-    sample_count = len(rows) * samples_per_rank
+    rows = [list(row) for row in gathered]
+    sample_count = len(rows) * num_passes * (num_rounds - drop_rounds)
     ll_scale_rank0 = max_tokens * topk / (rows[0][0] + 1)
     metrics = {}
-    unrounded = {}
     for phase_index, phase in enumerate(("dispatch", "combine")):
         latencies, rdma_bandwidths, xgmi_bandwidths = [], [], []
         for row in rows:
@@ -1315,47 +1260,14 @@ def _summarize_metric_samples(
             "avg_ll_bandwidth_gbps": ll_bandwidth,
             "avg_latency_us": latency,
         }
-        unrounded[phase] = values
         metrics[phase] = {
             **{name: round(value, 2) for name, value in values.items()},
             "bandwidth_metric": "grand_mean",
         }
-
-    evidence = {
-        "schema_version": 1,
-        "method": "grand_mean",
-        "parameters": {
-            "num_passes": num_passes,
-            "num_rounds": num_rounds,
-            "num_warmup": num_warmup,
-            "drop_rounds": drop_rounds,
-            "max_tokens": max_tokens,
-            "topk": topk,
-            "ll": ll,
-            "world_size": len(rows),
-        },
-        "row_layout": {
-            "metadata": [
-                "recv_tokens",
-                "rdma_algo_tokens",
-                "dispatch_bytes_per_token",
-                "combine_bytes_per_token",
-            ],
-            "samples": "pass-major, round-major, [dispatch_us, combine_us]",
-            "includes_dropped_rounds": True,
-        },
-        "rank_rows": rows,
-        "retained_samples_per_rank_per_phase": samples_per_rank,
-        "retained_samples_per_phase": sample_count,
-        "ll_scale_rank0": ll_scale_rank0,
-        "metrics_unrounded": unrounded,
-    }
-    return metrics, evidence
+    return metrics
 
 
-def _row_metrics(
-    op, cfg, args, dist_handle, rng_data, convert, ll, *, evidence_callback=None
-):
+def _row_metrics(op, cfg, args, dist_handle, rng_data, convert, ll):
     """Final metrics with v1's grand mean, separate from search estimators.
 
     Each rank computes bandwidth with its own payload and each retained round's
@@ -1363,9 +1275,7 @@ def _row_metrics(
     The headline is RDMA for v2 and LL for v2_ll. LL uses the global XGMI mean
     times rank 0's scale, exactly as v1's saved Average row does.
 
-    One CPU all-gather follows all synchronized timing passes. An optional
-    callback receives every rank's byte counts and raw rounds for replay;
-    those evidence fields are not added to tuning table rules.
+    One CPU all-gather follows all synchronized timing passes.
     """
     if (
         args.tuning_reps < 1
@@ -1389,7 +1299,7 @@ def _row_metrics(
     rdma_tokens = _rdma_algo_token_count(idx, cfg, ll)
     row = [total_recv, rdma_tokens, dispatch_bytes, combine_bytes]
     for _ in range(args.tuning_reps):
-        samples = _metric_timing_pass(
+        samples = _timed_rounds(
             op,
             inp,
             idx,
@@ -1399,22 +1309,19 @@ def _row_metrics(
             convert,
             args.rounds,
             args.warmup,
+            barrier=True,
         )
         row.extend(value for sample in samples for value in sample)
     gathered = dist_handle.all_gather_rows(row).tolist()
-    metrics, evidence = _summarize_metric_samples(
+    return _summarize_metric_samples(
         gathered,
         num_passes=args.tuning_reps,
         num_rounds=args.rounds,
-        num_warmup=args.warmup,
         drop_rounds=args.drop_rounds,
         max_tokens=args.max_tokens,
         topk=cfg.num_experts_per_token,
         ll=ll,
     )
-    if evidence_callback is not None:
-        evidence_callback(evidence)
-    return metrics
 
 
 def _active_qp_schedule(cfg):
@@ -1477,22 +1384,10 @@ def _stress(op, cfg, dist_handle, device, args, comm):
     ]
     expected = []
     if args.stress_check_interval:
-        # combine(weights=None) of an identity expert sums one copy per distinct
-        # destination rank: unique_pes[t] * input[t].
-        eps = 3e-1 if cfg.dispatch_dtype in _FP8 else 8e-3
+        # combine(weights=None), so only the hidden half is checked.
         for inp, idx, _, _ in datasets:
-            pes = idx.long() // cfg.num_experts_per_rank
-            unique = torch.stack(
-                [
-                    (pes[:, j : j + 1] != pes[:, :j]).all(dim=1)
-                    for j in range(pes.shape[1])
-                ],
-                dim=1,
-            ).sum(dim=1, keepdim=True)
-            golden = unique.float() * inp.float()
-            expected.append(
-                (golden, eps * unique.float() * inp.float().abs().clamp(min=1.0))
-            )
+            golden = _golden(cfg, args, inp, idx)
+            expected.append((golden.hidden, golden.hidden_bound))
     failed_checks = checks = 0
     if dist_handle.rank == 0:
         families = sorted({_family_that_ran(op, n) for n in set(counts)})
@@ -1655,6 +1550,7 @@ def _tune(cfg, dist_handle, device, args, comm):
             cfg.combine_dtype,
             kernel_family=kernel_family,
             experts_per_rank=cfg.num_experts_per_rank,
+            cu_count=num_cus,
         )
     else:
         # Re-resolve the schedule: the caller's config was built before
@@ -1796,7 +1692,9 @@ def _tune(cfg, dist_handle, device, args, comm):
         candidates = candidates[: args.tuning_limit]
     if shipped in candidates:
         candidates.remove(shipped)
-    if not candidates:
+    # With --tuning-save an empty list is a refresh run: measure and save the
+    # shipped geometry's row again.
+    if not candidates and not args.tuning_save:
         if dist_handle.rank == 0:
             print(
                 f"# TUNING tok={args.max_tokens}: nothing to compare -- every "
@@ -1807,7 +1705,9 @@ def _tune(cfg, dist_handle, device, args, comm):
     # Whether the printed table row should carry the active QP columns: only
     # when this sweep measured the count, or the shipped row already names one.
     # Otherwise the count is just the resolved default for THIS run's
-    # allocation, and pasting it would pin production to it.
+    # allocation, and pasting it would pin production to it. A pair sweep
+    # always measures the counts: it requires --tuning-qps or
+    # --tuning-candidate, and either names them.
     table_names_count = bool(
         table_row
         and (
@@ -1815,7 +1715,7 @@ def _tune(cfg, dist_handle, device, args, comm):
         )
     )
     report_active_qps = (
-        bool(args.tuning_qps) or len(candidate_fields) > 3 or table_names_count
+        pair or bool(args.tuning_qps) or len(candidate_fields) > 3 or table_names_count
     )
 
     if dist_handle.rank == 0:
@@ -2076,16 +1976,18 @@ def _tune(cfg, dist_handle, device, args, comm):
         comm.barrier()
 
     if dist_handle.rank == 0:
-        # best_median is None when nothing was measured against the incumbent,
-        # which is not a failure: `--tuning-candidate <the shipped geometry>`
-        # empties the candidate list (the shipped one is removed from it), and
-        # that is the shape of a REFRESH run -- keep the geometry, re-measure the
-        # avg_* fields. Formatting it unguarded is how that path used to die.
-        selection = (
-            f"median {args.tuning_metric}={best_median:.1f}us"
-            if best_median is not None
-            else "no candidate measured (refresh of the shipped geometry)"
-        )
+        # best_median is None when nothing was measured against the incumbent:
+        # either a refresh run (no candidates left) or every candidate was
+        # rejected by the backend. Formatting it unguarded is how that path
+        # used to die.
+        if best_median is not None:
+            selection = f"median {args.tuning_metric}={best_median:.1f}us"
+        elif not candidates:
+            selection = "no candidate measured (refresh of the shipped geometry)"
+        else:
+            selection = (
+                f"all {len(candidates)} candidates rejected, shipped geometry kept"
+            )
         # The active count columns only when this sweep measured the count or
         # the shipped rule already names one; otherwise it is just this run's
         # resolved default and pasting it would pin production to it.
@@ -2382,45 +2284,20 @@ def main(argv):
             torch.cuda.synchronize()
             comm.barrier()
 
-            idx_cpu = idx.cpu()
-            unique_pes = np.array(
-                [
-                    len(
-                        {
-                            int(idx_cpu[t, j]) // cfg.num_experts_per_rank
-                            for j in range(args.topk)
-                        }
-                    )
-                    for t in range(num_tokens)
-                ]
-            )
-            unique_pes_column = torch.from_numpy(unique_pes).view(num_tokens, 1).float()
-            expected_weights = unique_pes_column * wts.float().cpu()
-            expected = unique_pes_column * inp.float().cpu()
-
-            # The bound has to scale with unique_pes: combine sums that many
-            # contributions in the wire dtype, so the error grows with the number
-            # of terms and with the magnitude being summed -- not with |expected|
-            # at that element, which cancellation can make arbitrarily small. This
-            # is the same shape of bound v1's harness uses (it scales its
-            # per-element bound by unique_pes) rather than a flat allclose.
+            golden = _golden(cfg, args, inp, idx, wts)
+            unique_pes_column = golden.unique_pes.cpu()
+            unique_pes = unique_pes_column.view(-1)
+            expected = golden.hidden.cpu()
+            expected_weights = golden.weights.cpu()
+            bound = golden.hidden_bound.cpu()
             got = out.float().cpu()
             input_magnitude = inp.float().cpu().abs()
-            eps = 3e-1 if (args.quant_type != "none" or dtype in _FP8) else 8e-3
-            bound = eps * unique_pes_column * input_magnitude.clamp(min=1.0)
             hidden_ok = bool(((got - expected).abs() <= bound).all())
-            # Weights are transported as f32 and summed the same way, so their
-            # bound is much tighter -- but still proportional to unique_pes.
             got_weights = out_w.cpu() if out_w is not None else None
-            weights_ok = (
-                True
-                if got_weights is None
-                else bool(
-                    (
-                        (got_weights - expected_weights).abs()
-                        <= 2e-3 * unique_pes_column
-                    ).all()
-                )
+            weights_ok = got_weights is None or bool(
+                (
+                    (got_weights - expected_weights).abs() <= golden.weights_bound.cpu()
+                ).all()
             )
 
             if not (hidden_ok and weights_ok) and rank == 0:

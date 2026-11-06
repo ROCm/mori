@@ -206,9 +206,6 @@ def write_tables(directory, kernel_type, dispatch_rules, combine_rules):
             block_num=block,
             rdma_block_num=rdma,
             warp_per_block=warp,
-            **(
-                {"zero_copy": False, "quant_type": "none"} if phase == "combine" else {}
-            ),
             **({"active_qps": qps} if qps is not None else {}),
         )
         for phase, phase_rules in (

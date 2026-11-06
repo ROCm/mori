@@ -42,7 +42,7 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 
 | file | role |
 |---|---|
-| `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig` (+`.tuned()`), `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
+| `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig`, `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
 | `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
 | `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
 | `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here. A gfx125x `EpDispatchPlan` whose caller binds no `staging_base` gets one at its first launch, shared by the unbound plans of its layout, with a `FutureWarning`; instead, allocate `info["stagingBytes"]` bytes once, keep them alive, and `bind(staging_base=buf)` on every dispatch plan (a tensor is checked against that size and held; an int address is taken on trust). Sizes come from the plans: `EpDispatchPlan.describe(**request)` / `EpCombinePlan.describe(...)` return the info a plan would report without compiling it, and `arena_regions(*infos, region_names=...)` turns their `region.<stem>` keys into a `SymmArena` region list; binding checks an arena that has `size()` |
@@ -156,17 +156,18 @@ Leave `dispatch_block_num` / `combine_block_num` / `warp_num_per_block` /
 for this GPU model, shape and dtype out of `tuning_configs/`, one bucket per
 token range, with plans prepared up front. A pinned config field overrides only that
 field; the remaining fields stay tuned. The sweep hooks `MORI_EP_DISP_GEOM` /
-`MORI_EP_COMB_GEOM` (`"block,rdma,warp[,active_qps]"`) bypass table selection for
-both phases when either is set. Clear both when checking automatic selection.
+`MORI_EP_COMB_GEOM` (`"block,rdma,warp[,active_qps]"`) replace their phase's
+geometry in every bucket; the other phase keeps its table rules. Clear both when
+checking automatic selection.
 
 `MORI_EP_V2_TUNING_DIR` selects an alternate V2 table directory (intra and inter).
 `hip_tuning_configs.py` owns the table format (filenames, loading, checks and
 merge-on-save) as well as the HIP schedule and CU limits.
 
-- Only the current GPU model's own files are read. A model without one does not
-  borrow another model's CSV: inter-node uses the config's default geometry, and
-  intra-node the Python tables in `hip_tuning_configs.py`, where MI350X shares
-  MI355X's entries.
+- Only the current GPU model's own files are read, except that MI350X reads
+  MI355X's (same die and CU count). A model without one does not borrow another
+  model's CSV: inter-node uses the config's default geometry, and intra-node the
+  Python tables in `hip_tuning_configs.py`.
 - Each phase matches **its own dtype**: fp8 dispatch + bf16 combine reads the
   arch's fp8 dispatch rules (`fp8_e4m3_fnuz` on gfx942, `fp8_e4m3` on gfx950)
   and the same `bf16` combine rules as bf16 dispatch.
@@ -204,8 +205,6 @@ print(selected.combine)
 ```
 
 `family` is `"intra"`, `"v2"` or `"v2_ll"`; intra has `rdma_block_num=None`.
-`EpDispatchCombineConfig.tuned(kernel_backend="hip", ...)` uses the same HIP
-resolution as the normal constructor. FlyDSL keeps its existing entry points.
 Intra manual geometry retains its existing fallback behavior; inter supports
 per-field tuning overrides as described above.
 
@@ -216,16 +215,21 @@ the compiled kernel, and so do each bucket's active QP count, the op's drain cou
 and, for the ordinary combine, `combine_load_first`.
 
 Run a sweep on both nodes through the existing wrapper, using rank 0 on one
-node and rank 1 on the other, with the same rendezvous and tuning arguments:
+node and rank 1 on the other, with the same rendezvous and tuning arguments.
+Match the conditions the tables were measured under: an allocation of 8 QPs (a
+smaller one clamps every larger `active_qps` rule to it) and `--scale-dim 0`
+(the wrapper defaults to 2 QPs, and the entry to a scale dim of 32). The wrapper
+kills the run after `MORI_INTERNODE_TIMEOUT` seconds, 120 by default, which a
+sweep outlasts:
 
 ```bash
 # The MI355X tables were tuned with ionic CCQE disabled; match that.
-MORI_DISABLE_IONIC_CCQE=1 tools/run_internode_test.sh \
+MORI_DISABLE_IONIC_CCQE=1 MORI_INTERNODE_TIMEOUT=3600 tools/run_internode_test.sh \
     --rank <0-or-1> --master-addr <ip> --ifname <nic> \
     --entry tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py \
-    --cmd tuning --kernel-type v2 --max-tokens 4096 --num-qp 2 \
+    --cmd tuning --kernel-type v2 --max-tokens 4096 --num-qp 8 \
     --dtype bf16 --combine-dtype bf16 --hidden-dim 7168 --topk 8 \
-    -- --experts-per-rank 16 --tuning-phase dispatch --tuning-save \
+    -- --experts-per-rank 16 --scale-dim 0 --tuning-phase dispatch --tuning-save \
        --tuning-config-dir <directory>
 ```
 

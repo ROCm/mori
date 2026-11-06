@@ -1027,26 +1027,16 @@ inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, s
   }
 }
 
-template <EpInterNodeKernelCfg kConfig>
-__forceinline__ __device__ constexpr bool UseCombineLoadFirst() {
-  return kConfig.combineLoadFirst;
-}
-
 // Ordinary gather: load-first or plain, fixed at compile time per token bucket
 // by the tuning table's combine_load_first. The LL gather uses its separate path.
 template <EpInterNodeKernelCfg kConfig, typename TokT>
 __forceinline__ __device__ void CombineGatherNormal(TokT* dest, TokT** srcPtrs, int accumNum,
-                                                    size_t nelems, size_t tokHiddenBytes,
-                                                    size_t tokCombXferBytes) {
-  constexpr bool useLoadFirst = UseCombineLoadFirst<kConfig>();
-  if constexpr (useLoadFirst) {
-    // Arena bases are aligned; require aligned row and staging strides.
-    if ((tokHiddenBytes % 4 == 0) && (tokCombXferBytes % 4 == 0)) {
-      core::WarpAccumLF<TokT, 4, 2>(dest, srcPtrs, nullptr, accumNum, nelems);
-      return;
-    }
+                                                    size_t nelems) {
+  if constexpr (kConfig.combineLoadFirst) {
+    core::WarpAccumLF<TokT, 4, 2>(dest, srcPtrs, nullptr, accumNum, nelems);
+  } else {
+    core::WarpAccum<TokT, 4>(dest, srcPtrs, nullptr, accumNum, nelems);
   }
-  core::WarpAccum<TokT, 4>(dest, srcPtrs, nullptr, accumNum, nelems);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename TokT, typename T>
@@ -1086,7 +1076,7 @@ __forceinline__ __device__ void CombineIntraNodeTyped(EpDispatchCombineArgs& arg
     }
     CombineGatherNormal<kConfig, TokT>(
         reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes), srcPtrs,
-        config.numExpertPerToken, hiddenDim, tokHiddenBytes, tokCombXferBytes);
+        config.numExpertPerToken, hiddenDim);
     if (args.weightsBuf) {
       core::WarpAccum<float, 4>(
           reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes + tokHiddenBytes),
@@ -1240,7 +1230,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
 
               CombineGatherNormal<kConfig, TokT>(
                   reinterpret_cast<TokT*>(stagingPtr + tokIdx * tokCombXferBytes), srcPtrs,
-                  config.numExpertPerToken, hiddenDim, tokHiddenBytes, tokCombXferBytes);
+                  config.numExpertPerToken, hiddenDim);
 
               if (args.weightsBuf) {
                 core::WarpAccum<float, 4>(

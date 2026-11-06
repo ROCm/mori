@@ -29,6 +29,7 @@ package_data. CPU only.
 """
 
 import re
+from pathlib import Path
 
 import pytest
 import torch
@@ -40,15 +41,30 @@ ARCH, MODEL = "gfx942", "testgpu"
 NAME = re.compile(
     r"^(gfx\d+)_([a-z0-9]+)_(InterNodeV2|InterNodeV2LL|IntraNodeV2)_ep(\d+)\.csv$"
 )
+# package_data ships only *.csv, so an installed mori never has a leftover
+# JSON table to find; that check has to look at the checkout.
+SOURCE_TABLE_DIR = (
+    Path(__file__).resolve().parents[4]
+    / "python"
+    / "mori"
+    / "ops"
+    / "dispatch_combine_v2"
+    / "tuning_configs"
+)
 
 
 def shipped_tables():
     return sorted(tuning._INTERNODE_TABLE_DIR.glob("*.csv"))
 
 
+def test_no_json_tables_left_in_the_checkout():
+    if not SOURCE_TABLE_DIR.is_dir():
+        pytest.skip(f"no source checkout at {SOURCE_TABLE_DIR}")
+    assert not list(SOURCE_TABLE_DIR.glob("*.json"))
+
+
 def test_every_shipped_table_loads():
     assert shipped_tables(), f"no V2 tables in {tuning._INTERNODE_TABLE_DIR}"
-    assert not list(tuning._INTERNODE_TABLE_DIR.glob("*.json"))
     for path in shipped_tables():
         match = NAME.match(path.name)
         assert match, path.name
@@ -85,8 +101,6 @@ def rule(phase="dispatch", **fields):
         rdma_block_num=40,
         warp_per_block=4,
     )
-    if phase == "combine":
-        values.update(zero_copy=False, quant_type="none")
     values.update(fields)
     return values
 
@@ -108,9 +122,9 @@ def test_round_trip(tmp_path):
     assert lines[0] == ",".join(tuning._TABLE_COLUMNS)
     # Grouped by shape, dispatch before combine; booleans 0/1; absent fields
     # empty; 2.0 written as 2.
-    assert lines[1] == "64,4,dispatch,bf16,1024,,,16,80,40,4,,,,,,,,"
-    assert lines[2] == "64,4,dispatch,bf16,1024,,,128,80,40,4,1,,75.12,2,,,,"
-    assert lines[3] == "64,4,combine,bf16,1024,0,none,16,80,40,4,4,1,,,,,,"
+    assert lines[1] == "64,4,dispatch,bf16,1024,16,80,40,4,,,,,,,,"
+    assert lines[2] == "64,4,dispatch,bf16,1024,128,80,40,4,1,,75.12,2,,,,"
+    assert lines[3] == "64,4,combine,bf16,1024,16,80,40,4,4,1,,,,,,"
 
 
 def test_numpy_metrics_are_written_as_numbers(tmp_path):
@@ -123,7 +137,7 @@ def test_numpy_metrics_are_written_as_numbers(tmp_path):
 
 
 HEADER = ",".join(tuning._TABLE_COLUMNS)
-COMBINE = dict(phase="combine", zero_copy="0", quant_type="none")
+COMBINE = dict(phase="combine")
 
 
 def row(**cells):
@@ -154,11 +168,10 @@ def row(**cells):
         ("InterNodeV2", [HEADER, row(active_qps="0")], "active_qps=0 is below 1"),
         ("InterNodeV2", [HEADER, row(dtype="bf61")], "unknown dtype"),
         ("InterNodeV2", [HEADER, row(phase="both")], "neither dispatch nor combine"),
-        ("InterNodeV2", [HEADER, row(zero_copy="0")], "zero_copy is combine-only"),
         (
             "InterNodeV2",
-            [HEADER, row(phase="combine", zero_copy="0")],
-            "missing quant_type",
+            [HEADER, row(combine_load_first="1")],
+            "combine_load_first is combine-only",
         ),
         (
             "InterNodeV2",
@@ -171,6 +184,8 @@ def row(**cells):
             "InterNodeV2 only",
         ),
         ("IntraNodeV2", [HEADER, row(active_qps="2")], "internode only"),
+        ("InterNodeV2", [HEADER, row(rdma_block_num="0")], "at least 1"),
+        ("InterNodeV2LL", [HEADER, row(rdma_block_num="0")], "at least 1"),
         (
             "InterNodeV2",
             [HEADER, row(), row(block_num="64")],
@@ -256,6 +271,56 @@ def test_save_merges_by_selector(table_dir):
     ) == [(16, (80, 40, 4, None), None, False)]
 
 
+def test_an_aliased_model_reads_its_siblings_table(table_dir, monkeypatch):
+    tuning.save_internode_result(16, "dispatch", entry(active_qps=1))
+    monkeypatch.setattr(tuning, "_MODEL_ALIAS", {"aliasgpu": MODEL})
+    monkeypatch.setattr(tuning._gpu, "detect_model", lambda: "aliasgpu")
+    tuning._V2_RULES_CACHE.clear()
+    assert tuning.internode_buckets(
+        16, 1024, 4, torch.bfloat16, experts_per_rank=4
+    ) == [(16, (80, 40, 4, 1), None, False)]
+
+
+def test_intranode_lookup_by_dtype_string_reads_the_table(table_dir):
+    # aiter calls lookup() with the dtype string alone; it must get the same
+    # IntraNodeV2 rules as a config, which passes the torch dtypes.
+    for num_tokens, block in ((16, 32), (128, 64)):
+        for phase in ("dispatch", "combine"):
+            tuning.save_internode_result(
+                8,
+                phase,
+                entry(num_tokens=num_tokens, block_num=block, rdma_block_num=0),
+                kernel_family="intra",
+            )
+    by_string = tuning.lookup(8, 1024, 4, dtype="bf16", experts_per_rank=4)
+    by_dtype = tuning.lookup(
+        8,
+        1024,
+        4,
+        dtype="bf16",
+        experts_per_rank=4,
+        dispatch_dtype=torch.bfloat16,
+        combine_dtype=torch.bfloat16,
+    )
+    assert (
+        by_string["schedule"]
+        == by_dtype["schedule"]
+        == ((16, 32, 4, 32, 4), (128, 64, 4, 64, 4), (None, 64, 4, 64, 4))
+    )
+
+
+def test_an_untuned_intranode_phase_runs_the_default(table_dir):
+    tuning.save_internode_result(
+        8, "dispatch", entry(block_num=32, rdma_block_num=0), kernel_family="intra"
+    )
+    default = tuning._hip_default()
+    combine = (default["combine_block_num"], default["combine_warp_num_per_block"])
+    assert tuning.lookup(8, 1024, 4, dtype="bf16", experts_per_rank=4)["schedule"] == (
+        (16, 32, 4, *combine),
+        (None, 32, 4, *combine),
+    )
+
+
 def test_save_rejects_a_bad_rule_and_keeps_the_table(table_dir):
     path = tuning.save_internode_result(16, "dispatch", entry())
     before = path.read_text()
@@ -268,10 +333,8 @@ def test_save_rejects_a_bad_rule_and_keeps_the_table(table_dir):
     assert path.read_text() == before
 
 
-def test_schedule_description_names_the_table(table_dir):
-    # Logged at op construction on rank 0, so a stale call here breaks the build.
-    tuning.save_internode_result(16, "dispatch", entry(active_qps=1))
-    cfg = EpDispatchCombineConfig(
+def internode_config():
+    return EpDispatchCombineConfig(
         rank=0,
         world_size=16,
         gpu_per_node=8,
@@ -282,6 +345,30 @@ def test_schedule_description_names_the_table(table_dir):
         kernel_backend="hip",
         internode_kernel="v2",
     )
+
+
+def test_one_sweep_override_keeps_the_other_phase_tuned(table_dir, monkeypatch):
+    tuning.save_internode_result(16, "dispatch", entry(active_qps=1))
+    tuning.save_internode_result(
+        16, "combine", entry(active_qps=4, combine_load_first=True)
+    )
+    cfg = internode_config()
+    monkeypatch.setenv("MORI_EP_DISP_GEOM", "64,32,8,2")
+    assert tuning.internode_schedule(cfg) == [
+        (None, (64, 32, 8, 2), (80, 40, 4, 4), True)
+    ]
+    monkeypatch.delenv("MORI_EP_DISP_GEOM")
+    # A combine override runs the plain gather.
+    monkeypatch.setenv("MORI_EP_COMB_GEOM", "64,32,8,2")
+    assert tuning.internode_schedule(cfg) == [
+        (None, (80, 40, 4, 1), (64, 32, 8, 2), False)
+    ]
+
+
+def test_schedule_description_names_the_table(table_dir):
+    # Logged at op construction on rank 0, so a stale call here breaks the build.
+    tuning.save_internode_result(16, "dispatch", entry(active_qps=1))
+    cfg = internode_config()
     text = tuning.describe_schedule(cfg, tuning.resolve_schedule(cfg))
     table = table_dir / tuning.v2_table_filename(ARCH, MODEL, "InterNodeV2", 16)
     assert f"found: {table}" in text

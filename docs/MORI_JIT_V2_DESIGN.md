@@ -334,7 +334,8 @@ dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬�
 `(max_tok_inclusive|None, block, warp)` 的桶。实测结论直接编码在键里：**topk 会移动桶边界**
 （它决定 `_tpi = warpSize/topk`，也就是一个几何在多少 token 内能一轮盖完），**专家数不会**
 （64 vs 96 在所有几何/dtype/topk 上都在 2% 以内），所以后者用 `None` 通配——那个通配是个结论，
-不是省事。没扫过的形状拿不到 schedule，退回单档默认值。
+不是省事。这个结论只在单机上测过，所以通配只属于这张单机 Python 表；下面的 CSV 表按总专家数精确匹配。
+没扫过的形状拿不到 schedule，退回单档默认值。
 
 取值规则：**性能接近时取更小的几何**，因为少占 CU 在与专家 GEMM 重叠时是真收益。这类 3% 以内的取舍是
 **策略不是测量**（单次 bench 偶尔会偏 20%）；真正由数据定的是桶的**边界**，它们来自 10~40% 的差异。
@@ -342,10 +343,10 @@ dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬�
 HIP V2 的单机和跨机都以 `hip_tuning_configs.resolve_schedule(cfg)` 为 backend 入口，返回统一的
 `ScheduleEntry(max_tokens, dispatch, combine)`，每相是带 family、B/W/R、active QP 数和 load-first 的
 `KernelConfig`。
-单机先查 `IntraNodeV2` 表，某相没有规则时回退到 Python 表，显式 `cfg.schedule` 优先；跨机只查表。
+单机先查 `IntraNodeV2` 表，某相没有规则时回退到 Python 表，再没有就用单档默认值；只给 dtype 字符串的调用方
+（如 aiter）也按它对应的 dtype 查表。显式 `cfg.schedule` 优先；跨机只查表。
 `op.kernel_config(num_tokens)` 负责一次选桶，HIP 的 `_pick()` 与报告接口使用同一结果；
 绑定的单 kernel 或 pass group 直接执行，不再另选一遍 family/geometry。
-HIP 的 `Config.tuned()` 与普通构造走同一 HIP 入口，不再预读 FlyDSL 表。
 
 跨机的数据解析中，`internode_schedule(cfg)` 合并查表结果、手动覆盖和 token 边界，
 `internode_buckets()` 读取单个 family 的规则，
@@ -356,13 +357,14 @@ HIP 的 `Config.tuned()` 与普通构造走同一 HIP 入口，不再预读 FlyD
 
 每个 GPU 型号、kernel（`InterNodeV2`/`InterNodeV2LL`/`IntraNodeV2`）和 EP 一个 CSV，两相都在其中，
 命名为 `{arch}_{model}_{kernel}_ep{n}.csv`，例如 `gfx950_mi355x_InterNodeV2_ep16.csv`。每行一条规则，
-前八列 `num_experts,topk,phase,dtype,hidden_dim,zero_copy,quant_type,num_tokens` 是选择键，
+前六列 `num_experts,topk,phase,dtype,hidden_dim,num_tokens` 是选择键，
 各列含义见 tuning_configs/README.md。各相按**自身 dtype**查找：
 fp8 dispatch + bf16 combine 使用 fp8 dispatch 行和 bf16 combine 行。`num_tokens` 是包含上界的
 ceiling，最大一档也服务更大的 token 数。总专家数（`ep_size * experts_per_rank`）、`topk`、dtype 和
-hidden 都必须精确匹配：例如 EP16 的 256/8 只用 `num_experts=256, topk=8` 的行；只读当前型号自己的
-CSV，不跨型号或专家组合回退；未调优的相在跨机时使用配置默认几何，在单机时回退到 Python 表（其中
-MI350X 沿用 MI355X 的条目）。表在加载时整体校验，格式错误直接报错而不是跳过。
+hidden 都必须精确匹配：例如 EP16 的 256/8 只用 `num_experts=256, topk=8` 的行。CSV 的每一行都是
+按具体模型实测的，所以不沿用上面 Python 表的专家数通配。只读当前型号自己的
+CSV（MI350X 与 MI355X 同一颗 die、CU 数相同，读 MI355X 的），不跨型号或专家组合回退；未调优的相
+在跨机时使用配置默认几何，在单机时回退到 Python 表。表在加载时整体校验，格式错误直接报错而不是跳过。
 保存结果时按选择键替换或追加一行。V1 的历史通配兼容行为不变。
 两相可分别调优，默认按完整 dispatch+combine 周期评估收益，另一相保持选定几何。
 

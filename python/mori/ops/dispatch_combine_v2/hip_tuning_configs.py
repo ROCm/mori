@@ -91,6 +91,8 @@ _DISPATCH_TABLE: dict = {
     #
     # topk 6 and 8 measured identical; listed twice rather than wildcarded, so an
     # unmeasured topk gets the default instead of inheriting an agreement by accident.
+    # A shape the IntraNodeV2 table has rules for uses those first; this serves the
+    # other expert counts and the dtypes the table lacks (fp4, and fp8 at topk 6).
     "mi355x": {
         (8, 7168, 8, None): {
             None: ((None, 64, 8),),
@@ -198,21 +200,15 @@ _DISPATCH_TABLE: dict = {
 }
 
 # No dtype axis: combine reduces the bf16 staging region whatever dispatch carried,
-# and three runs per shape (one per dispatch dtype) agreed to 1-5%.
+# and three runs per shape (one per dispatch dtype) agreed to 1-5%. A shape with no
+# combine rule runs _hip_default()'s 64x8, which an early MI355X EP8 sweep picked
+# (us at ct=4096, topk 8, for 32x8 / 48x8 / 64x8 / 64x16 / 80x8: 991.6 / 750.5 /
+# 724.3 / 738.5 / 745.2) and which also moved MakeEpCfg off v1's 80; MI355X has since
+# been tuned per bucket in its IntraNodeV2 table. On gfx1250, 128x4 never wins and
+# 256x8 collapses 2x at 16384.
 _COMBINE_TABLE: dict = {
-    # MI355X/gfx950 EP8: 64x8 wins at every token count and both topk against
-    # 32x8 / 48x8 / 64x16 / 80x8 (us at ct=4096, topk 8: 991.6 / 750.5 / 724.3 / 738.5 /
-    # 745.2). Not merely the smallest tried -- 32x8 costs 37% at ct=4096 -- so MakeEpCfg
-    # and _hip_default() moved off v1's 80 to match. On gfx1250, 128x4 never wins and
-    # 256x8 collapses 2x at 16384.
-    "mi355x": {
-        (8, 7168, 8, None): ((None, 64, 8),),
-        (8, 7168, 6, None): ((None, 64, 8),),
-    },
     "gfx1250": {
-        (4, 7168, 8, None): ((None, 64, 8),),
-        # topk 9 = 8 routed + 1 shared. Also the combine half of the topk-9 dispatch
-        # schedule: lookup() returns the single-shot default unless both halves exist.
+        # topk 9 = 8 routed + 1 shared.
         (4, 7168, 9, None): (
             (64, 64, 4),
             (128, 64, 8),
@@ -220,13 +216,6 @@ _COMBINE_TABLE: dict = {
             (1024, 256, 8),
             (None, 192, 8),
         ),
-        (4, 7168, 6, None): ((None, 64, 8),),
-        # The single-shot default, listed so the EP8 and EP16 dispatch schedules have a combine half.
-        (8, 7168, 6, None): ((None, 64, 8),),
-        (16, 7168, 6, None): ((None, 64, 8),),
-        # The same for the EP4 hidden-2048 dispatch schedule (combine unswept there).
-        (4, 2048, 8, 64): ((None, 64, 8),),
-        (32, 7168, 6, None): ((None, 64, 8),),
     },
 }
 
@@ -425,6 +414,21 @@ def pick_bucket(buckets, num_tokens):
     return buckets[-1] if buckets else None
 
 
+def _ceilings(*bucket_lists, extra=()):
+    """Every finite ceiling of the bucket lists and ``extra``, ascending, then
+    None for the open-ended tail: the edges a merge of the lists breaks at."""
+    finite = {row[0] for rows in bucket_lists for row in rows if row[0] is not None}
+    return [*sorted(finite.union(extra)), None]
+
+
+def _probe(ceiling, ceilings):
+    """A token count inside the bucket ending at ``ceiling``: the ceiling
+    itself, or for the open-ended tail one past every finite ceiling."""
+    if ceiling is not None:
+        return ceiling
+    return max((c for c in ceilings if c is not None), default=0) + 1
+
+
 class KernelConfig(NamedTuple):
     """One HIP kernel choice; intra has no RDMA split."""
 
@@ -448,15 +452,16 @@ class ScheduleEntry(NamedTuple):
     combine: KernelConfig
 
 
-def resolve_schedule(cfg) -> tuple[ScheduleEntry, ...]:
+def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
     """The HIP V2 schedule consumed by both construction and token selection.
 
     Intra adapts the Python-table/explicit schedule resolved by Config. Inter
-    resolves the tables and overrides, then includes the family crossover in the
-    schedule. Loading and selection never depend on the declared token capacity;
-    that includes the combine load-first choice, which comes from each bucket's
-    rule (combine_load_first). AsyncLL is one entry: it compiles a single
-    geometry, and its specs derive every pass's grid themselves.
+    names each bucket of internode_schedule() with its kernel family; tuned
+    grids are clamped to ``cu_count``, the backend's own CU count. Loading and
+    selection never depend on the declared token capacity; that includes the
+    combine load-first choice, which comes from each bucket's rule
+    (combine_load_first). AsyncLL is one entry: it compiles a single geometry,
+    and its specs derive every pass's grid themselves.
     """
     if getattr(cfg, "async_ll", False):
         spec = KernelConfig("asyncll", cfg.dispatch_block_num, cfg.warp_num_per_block)
@@ -478,16 +483,11 @@ def resolve_schedule(cfg) -> tuple[ScheduleEntry, ...]:
             for ceiling, db, dw, cb, cw in rows
         )
 
-    geometries = internode_schedule(cfg)
-    edges = {row[0] for row in geometries if row[0] is not None}
-    if cfg.internode_kernel == "auto":
-        # Keep a zero-token LL entry when the crossover is zero, too.
-        edges.add(cfg.internode_auto_ll_max_tokens)
+    geometries = internode_schedule(cfg, cu_count=cu_count)
+    ceilings = [row[0] for row in geometries]
     entries = []
-    for ceiling in [*sorted(edges), None]:
-        probe = ceiling if ceiling is not None else max(edges, default=0) + 1
-        family = internode_kernel_family(cfg, probe)
-        _, dispatch, combine, load_first = pick_bucket(geometries, probe)
+    for ceiling, dispatch, combine, load_first in geometries:
+        family = internode_kernel_family(cfg, _probe(ceiling, ceilings))
         entries.append(
             ScheduleEntry(
                 ceiling,
@@ -537,7 +537,10 @@ def describe_schedule(cfg, schedule) -> str:
             if os.environ.get(name)
         ]
         if overrides:
-            lines.append(f"  tables bypassed by {', '.join(overrides)}")
+            lines.append(
+                "  table rules overridden by "
+                + ", ".join(f"{name}={os.environ[name]}" for name in overrides)
+            )
         lines.append(
             f"  QPs allocated per peer: {cfg.num_qp_per_pe}"
             + (f", active pinned to {cfg.active_qps}" if cfg.active_qps else "")
@@ -547,9 +550,13 @@ def describe_schedule(cfg, schedule) -> str:
             lines.append(f"  pinned fields: {', '.join(pinned)}")
     else:
         families = [_V2_KERNEL_TYPES["intra"]]
+    model = _device_key()
     for kernel_type in families:
+        if model is None:
+            lines.append(f"  no {kernel_type} table: unknown GPU model")
+            continue
         path = internode_table_dir() / v2_table_filename(
-            _gpu.arch_name(), _gpu.detect_model(), kernel_type, cfg.world_size
+            _gpu.arch_name(), model, kernel_type, cfg.world_size
         )
         lines.append(f"  {'found' if path.is_file() else 'missing'}: {path}")
     for row in schedule:
@@ -567,19 +574,28 @@ def _merge(disp, comb):
     The edges need not line up: the merged list breaks at the union of both, and each
     half keeps whatever it asked for on either side of the other's edge.
     """
-    edges = sorted(
-        {b[0] for b in disp if b[0] is not None}
-        | {b[0] for b in comb if b[0] is not None}
-    ) + [None]
-
     return tuple(
         (edge,) + pick_bucket(disp, edge)[1:] + pick_bucket(comb, edge)[1:]
-        for edge in edges
+        for edge in _ceilings(disp, comb)
     )
 
 
 # FlyDSL's dtype_str spelling, still accepted from callers that pass it (aiter's MegaMoE).
 _DISPATCH_DTYPE_ALIAS = {"fp4_disp_bf16_comb": "fp4"}
+
+
+def _wire_dtypes(wire):
+    """(dispatch, combine) torch dtypes for a dispatch wire name -- "bf16",
+    "fp8" in the arch's native encoding, or "fp4" -- with BF16 combine, the
+    only combine dtype the IntraNodeV2 tables hold. (None, None) otherwise."""
+    from mori.ops.tuning_config import CONFIG_STR_TO_DTYPE
+
+    if wire == "fp8":
+        wire = "fp8_e4m3_fnuz" if _gpu.arch_name() == "gfx942" else "fp8_e4m3"
+    dispatch = CONFIG_STR_TO_DTYPE.get(wire)
+    if dispatch is None:
+        return None, None
+    return dispatch, CONFIG_STR_TO_DTYPE["bf16"]
 
 
 def lookup(
@@ -595,23 +611,25 @@ def lookup(
     """HIP geometry for this device/shape/dtype, composed from HIP's own two tables.
 
     ``dtype`` is the dispatch wire ("bf16" / "fp8" / "fp4") and picks the dispatch
-    half; ``quant_type`` picks the combine half. An unswept shape gets the HIP
-    single-shot default (schedule=None). A swept one gets a per-token-count schedule
-    built from the dispatch and combine tables independently, so either half can be
-    re-tuned without touching the other.
+    half; ``quant_type`` picks the combine half. Each half is built independently,
+    so either can be re-tuned without touching the other: its IntraNodeV2 table
+    rules when it has any (``quant_type="none"`` only), else the Python table's,
+    else the HIP single-shot default. A shape with neither half tuned gets the
+    default and no schedule.
 
-    Given both legs' dtypes, the IntraNodeV2 table comes first. Each phase
-    takes its table rules when it has any and the Python table otherwise, so the
-    table can be filled one phase at a time.
+    The table is matched with the legs' torch dtypes; a caller that passes only
+    ``dtype`` gets the ones it names (_wire_dtypes), so both ways of calling read
+    the same rules.
     """
     base = _hip_default()
     dev = _device_key()
+    wire = _DISPATCH_DTYPE_ALIAS.get(dtype, dtype)
     disp = _bucket_key(
         _DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
     )
     if disp is not None:
         # None is the "every dtype measured the same" key; an exact dtype overrides it.
-        disp = disp.get(_DISPATCH_DTYPE_ALIAS.get(dtype, dtype)) or disp.get(None)
+        disp = disp.get(wire) or disp.get(None)
     comb = None
     if quant_type in _COMBINE_PUSH_TABLE:
         comb = _bucket_key(
@@ -625,6 +643,8 @@ def lookup(
         comb = _bucket_key(
             _COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
         )
+    if dispatch_dtype is None:
+        dispatch_dtype, combine_dtype = _wire_dtypes(wire)
     if dispatch_dtype is not None and quant_type == "none":
         table_disp, table_comb = intranode_buckets(
             world_size,
@@ -634,19 +654,14 @@ def lookup(
             combine_dtype,
             experts_per_rank=experts_per_rank,
         )
-        if table_disp or table_comb:
-            disp = table_disp or disp
-            comb = table_comb or comb
-            disp = disp or (
-                (None, base["dispatch_block_num"], base["warp_num_per_block"]),
-            )
-            comb = comb or (
-                (None, base["combine_block_num"], base["combine_warp_num_per_block"]),
-            )
-            base["schedule"] = _merge(disp, comb)
-            return base
-    if disp is None or comb is None:
-        return base  # half a schedule is not a schedule
+        disp = table_disp or disp
+        comb = table_comb or comb
+    if disp is None and comb is None:
+        return base
+    disp = disp or ((None, base["dispatch_block_num"], base["warp_num_per_block"]),)
+    comb = comb or (
+        (None, base["combine_block_num"], base["combine_warp_num_per_block"]),
+    )
     base["schedule"] = _merge(disp, comb)
     return base
 
@@ -680,14 +695,17 @@ def internode_kernel_families(cfg):
     )
 
 
-def fit_internode_geometry(geometry, *, clamp_to_cu=False):
-    """Leave at least one intra-node block; optionally cap tuned grids to CUs.
-    Fields after block, rdma, warp (the active QP count) pass through."""
+def fit_internode_geometry(geometry, *, clamp_to_cu=False, cu_count=None):
+    """Leave at least one intra-node block; optionally cap tuned grids to the
+    CU count: ``cu_count``, the count the op launches against, else KFD's. An
+    unknown count caps nothing. Fields after block, rdma, warp (the active QP
+    count) pass through."""
     if geometry is None:
         return None
     block, rdma, warp, *rest = geometry
-    if clamp_to_cu:
-        block = min(block, _gpu.cu_count() or 80)
+    limit = (cu_count or _gpu.cu_count()) if clamp_to_cu else 0
+    if limit:
+        block = min(block, limit)
     return (block, min(rdma, max(1, block - 1)), warp, *rest)
 
 
@@ -726,14 +744,17 @@ def _geometry_from_env(name, cfg):
     return geometry
 
 
-def internode_schedule(cfg):
+def internode_schedule(cfg, cu_count=None):
     """Resolve (inclusive token ceiling, dispatch B/R/W/QPs, combine B/R/W/QPs,
     combine load-first).
 
-    Either sweep env override bypasses both tables. Otherwise explicit config
-    fields override the selected family's table, with config defaults for an
-    untuned phase. Table values and unpinned defaults are CU-clamped; pinned
-    fields are kept as given. All paths keep R < B.
+    A sweep env override replaces its phase's geometry in every bucket, as
+    given, and a combine override runs the plain gather; with both set the
+    tables are not read. Otherwise explicit config fields override the
+    selected family's table, with config defaults for an untuned phase. Table
+    values and unpinned defaults are clamped to ``cu_count``
+    (fit_internode_geometry); pinned fields are kept as given. All paths keep
+    R < B. Under auto the family crossover is always a bucket edge.
     """
     defaults = [
         tuple(getattr(cfg, name) for name in fields) + (resolve_active_qps(cfg),)
@@ -743,14 +764,12 @@ def internode_schedule(cfg):
         _geometry_from_env("MORI_EP_DISP_GEOM", cfg),
         _geometry_from_env("MORI_EP_COMB_GEOM", cfg),
     ]
-    if any(overrides):
-        return [
-            (
-                None,
-                *(fit_internode_geometry(g or d) for g, d in zip(overrides, defaults)),
-                False,
-            )
-        ]
+    crossover = (
+        (cfg.internode_auto_ll_max_tokens,) if cfg.internode_kernel == "auto" else ()
+    )
+    if all(overrides):
+        fitted = tuple(fit_internode_geometry(g) for g in overrides)
+        return [(ceiling, *fitted, False) for ceiling in _ceilings(extra=crossover)]
 
     tables = {
         family: internode_buckets(
@@ -761,19 +780,17 @@ def internode_schedule(cfg):
             cfg.combine_dtype,
             kernel_family=family,
             experts_per_rank=cfg.num_experts_per_rank,
+            cu_count=cu_count,
         )
         or []
         for family in internode_kernel_families(cfg)
     }
-    edges = {row[0] for table in tables.values() for row in table if row[0] is not None}
-    if cfg.internode_kernel == "auto":
-        edges.add(cfg.internode_auto_ll_max_tokens)
+    ceilings = _ceilings(*tables.values(), extra=crossover)
 
     pinned = getattr(cfg, "_pinned_geometry", frozenset())
-    rows = []
-    for ceiling in [*sorted(edges), None]:
-        # The terminal bucket uses the family selected past every finite edge.
-        probe = ceiling if ceiling is not None else max(edges, default=0) + 1
+    rows, families = [], []
+    for ceiling in ceilings:
+        probe = _probe(ceiling, ceilings)
         family = internode_kernel_family(cfg, probe)
         tuned = pick_bucket(tables[family], probe)
         geometries = []
@@ -783,7 +800,9 @@ def internode_schedule(cfg):
             geometry = (
                 tuned[index]
                 if tuned and tuned[index]
-                else fit_internode_geometry(fallback, clamp_to_cu=True)
+                else fit_internode_geometry(
+                    fallback, clamp_to_cu=True, cu_count=cu_count
+                )
             )
             geometry = tuple(
                 getattr(cfg, name) if name in pinned else value
@@ -792,15 +811,23 @@ def internode_schedule(cfg):
                 resolve_active_qps(cfg, geometry[3]),
             )
             geometries.append(fit_internode_geometry(geometry))
+        geometries = [
+            geometry if override is None else fit_internode_geometry(override)
+            for geometry, override in zip(geometries, overrides)
+        ]
         # The load-first gather exists in the ordinary combine only.
-        load_first = bool(tuned and tuned[3]) and family == "v2"
+        load_first = (
+            bool(tuned and tuned[3]) and family == "v2" and overrides[1] is None
+        )
         row = (ceiling, *geometries, load_first)
-        # Equal geometry can span a crossover here. resolve_schedule() restores
-        # the family boundary when producing the executable configurations.
-        if rows and rows[-1][1:] == row[1:]:
+        # Equal neighbours of one family share a bucket. A family boundary
+        # stays an edge even between equal geometries, so each bucket's family
+        # follows from its ceiling alone (resolve_schedule).
+        if rows and rows[-1][1:] == row[1:] and families[-1] == family:
             rows[-1] = row
         else:
             rows.append(row)
+            families.append(family)
     return rows
 
 
@@ -815,18 +842,16 @@ def v2_table_filename(gpu_arch, gpu_model, kernel_type, ep_size):
     return f"{gpu_arch}_{gpu_model}_{kernel_type}_ep{ep_size}.csv"
 
 
-# One rule per row. The first eight columns are the selector (rows are ordered by
+# One rule per row. The first six columns are the selector (rows are ordered by
 # _table_key), then the geometry and its per-bucket flags, then metrics, which are
-# for readers only. An empty cell is an absent field: the combine-only fields
-# of a dispatch rule, and active_qps or combine_load_first left at the default.
+# for readers only. An empty cell is an absent field: active_qps or
+# combine_load_first (combine-only) left at the default.
 _TABLE_SELECTOR = (
     "num_experts",
     "topk",
     "phase",
     "dtype",
     "hidden_dim",
-    "zero_copy",
-    "quant_type",
     "num_tokens",
 )
 _TABLE_COLUMNS = _TABLE_SELECTOR + (
@@ -863,7 +888,7 @@ _TABLE_INT_MINIMUM = {
     "warp_per_block": 1,
     "active_qps": 1,
 }
-_TABLE_BOOLS = frozenset({"zero_copy", "combine_load_first"})
+_TABLE_BOOLS = frozenset({"combine_load_first"})
 _TABLE_FLOATS = frozenset(
     {
         "avg_latency_us",
@@ -890,8 +915,6 @@ def _table_key(rule):
         rule["hidden_dim"],
         _PHASE_ORDER[rule["phase"]],
         rule["dtype"],
-        bool(rule.get("zero_copy")),
-        rule.get("quant_type") or "",
         rule["num_tokens"],
     )
 
@@ -922,13 +945,10 @@ def _parse_table_row(cells, kernel_type, where):
             raise ValueError(f"{where}: {name}={text!r}: {exc}") from None
         rule[name] = value
     problems = [f"missing {name}" for name in _TABLE_REQUIRED if name not in rule]
-    combine_only = ("zero_copy", "quant_type", "combine_load_first")
     phase = rule.get("phase")
-    if phase == "combine":
-        problems += [f"missing {name}" for name in combine_only[:2] if name not in rule]
-    elif phase == "dispatch":
-        problems += [f"{name} is combine-only" for name in combine_only if name in rule]
-    elif phase is not None:
+    if phase == "dispatch" and "combine_load_first" in rule:
+        problems.append("combine_load_first is combine-only")
+    elif phase not in (None, "dispatch", "combine"):
         problems.append(f"phase {phase!r} is neither dispatch nor combine")
     if "dtype" in rule and rule["dtype"] not in _TABLE_DTYPES:
         problems.append(f"unknown dtype {rule['dtype']!r}")
@@ -936,6 +956,10 @@ def _parse_table_row(cells, kernel_type, where):
         problems.append("combine_load_first is read by InterNodeV2 only")
     if "active_qps" in rule and kernel_type == "IntraNodeV2":
         problems.append("active_qps is internode only")
+    if kernel_type != "IntraNodeV2" and rule.get("rdma_block_num") == 0:
+        # No block would run the RDMA leg, so the node-count signal would
+        # never fire and the op would hang.
+        problems.append("rdma_block_num must be at least 1 for an internode rule")
     problems += [
         f"{name}={rule[name]} is below {low}"
         for name, low in _TABLE_INT_MINIMUM.items()
@@ -1056,10 +1080,12 @@ def internode_buckets(
     combine_dtype=None,
     kernel_family="v2",
     experts_per_rank=None,
+    cu_count=None,
 ):
     """Return (token ceiling, dispatch geometry, combine geometry,
-    combine load-first) rows. A geometry is (block, rdma, warp, active_qps);
-    active_qps is the rule's optional count, None when the rule names none.
+    combine load-first) rows. A geometry is (block, rdma, warp, active_qps),
+    clamped to ``cu_count`` (fit_internode_geometry); active_qps is the
+    rule's optional count, None when the rule names none.
 
     Each phase matches its own dtype and stored width (packed for FP4 dispatch).
     A rule must match every selector exactly -- total experts (world_size *
@@ -1076,7 +1102,7 @@ def internode_buckets(
     kernel_type = _V2_KERNEL_TYPES.get(kernel_family)
     if kernel_type is None:
         return None
-    model, arch = _gpu.detect_model(), _gpu.arch_name()
+    model, arch = _device_key(), _gpu.arch_name()
     if model is None or arch is None:
         return None
     num_experts = world_size * experts_per_rank
@@ -1092,38 +1118,31 @@ def internode_buckets(
         "combine": hidden_dim,
     }
     rules = _v2_rules(arch, model, kernel_type, world_size)
-    edges, matched = set(), {}
-    for phase in _INTERNODE_PHASES:
-        dtype_str = DTYPE_TO_CONFIG_STR.get(dtypes[phase])
-        # The table is sorted by selector, so each phase's matches ascend in
-        # num_tokens.
-        matched[phase] = [
-            rule
+    # Each phase's matches as (ceiling, rule) buckets. The table is sorted by
+    # selector, so they ascend in num_tokens.
+    buckets = {
+        phase: [
+            (rule["num_tokens"], rule)
             for rule in rules
             if rule["phase"] == phase
             and rule["num_experts"] == num_experts
             and rule["topk"] == topk
-            and rule["dtype"] == dtype_str
+            and rule["dtype"] == DTYPE_TO_CONFIG_STR.get(dtypes[phase])
             and rule["hidden_dim"] == hidden_dims[phase]
-            and (
-                phase == "dispatch"
-                or (not rule["zero_copy"] and rule["quant_type"] == "none")
-            )
         ]
-        edges.update(rule["num_tokens"] for rule in matched[phase])
-    if not edges:
+        for phase in _INTERNODE_PHASES
+    }
+    # Every rule has a ceiling, so the open-ended tail is not a row of its own.
+    ceilings = _ceilings(*buckets.values())[:-1]
+    if not ceilings:
         return None
 
     table = []
-    for num_tokens in sorted(edges):
-        selected = {}
-        for phase in _INTERNODE_PHASES:
-            # Rules are sorted by num_tokens: the tightest ceiling, else the last.
-            rules = matched[phase]
-            selected[phase] = next(
-                (rule for rule in rules if num_tokens <= rule["num_tokens"]),
-                rules[-1] if rules else None,
-            )
+    for num_tokens in ceilings:
+        selected = [
+            (pick_bucket(buckets[phase], num_tokens) or (None, None))[1]
+            for phase in _INTERNODE_PHASES
+        ]
         geometries = [
             fit_internode_geometry(
                 (
@@ -1137,10 +1156,11 @@ def internode_buckets(
                     else None
                 ),
                 clamp_to_cu=True,
+                cu_count=cu_count,
             )
-            for rule in selected.values()
+            for rule in selected
         ]
-        combine = selected["combine"]
+        combine = selected[1]
         load_first = bool(combine is not None and combine.get("combine_load_first"))
         table.append((num_tokens, *geometries, load_first))
     return table
@@ -1191,6 +1211,7 @@ def lookup_internode(
     combine_dtype=None,
     kernel_family="v2",
     experts_per_rank=None,
+    cu_count=None,
 ):
     """Resolve one token count; backend construction uses internode_buckets."""
     table = internode_buckets(
@@ -1201,6 +1222,7 @@ def lookup_internode(
         combine_dtype,
         kernel_family,
         experts_per_rank,
+        cu_count=cu_count,
     )
     row = pick_bucket(table, num_tokens) if table else None
     if row is None or (row[1] is None and row[2] is None):
@@ -1235,11 +1257,8 @@ def save_internode_result(
             raise ValueError(f"V2 internode tuning requires a positive integer {name}")
     entry["num_experts"] = world_size * entry.pop("experts_per_rank")
     entry["phase"] = phase
-    if phase == "combine":
-        entry.setdefault("zero_copy", False)
-        entry.setdefault("quant_type", "none")
     if path is None:
-        model, arch = _gpu.detect_model(), _gpu.arch_name()
+        model, arch = _device_key(), _gpu.arch_name()
         if model is None or arch is None:
             raise RuntimeError(
                 "cannot save internode tuning for an unknown GPU; pass an explicit path"

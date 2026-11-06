@@ -116,8 +116,9 @@ class EpDispatchCombineConfig:
     # field overrides the tuning table for every token bucket while the fields
     # left None stay tuned, so you can fix one knob without hand-writing the
     # other five. MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM override a leg's whole
-    # geometry and bypass the table entirely: block,rdma,warp, plus an optional
-    # fourth field for the active QP count that also beats active_qps.
+    # geometry in every bucket, table and pinned fields included: block,rdma,warp,
+    # plus an optional fourth field for the active QP count that also beats
+    # active_qps.
     dispatch_block_num: int = None
     combine_block_num: int = None
     warp_num_per_block: int = None
@@ -542,45 +543,6 @@ class EpDispatchCombineConfig:
             if self.quant_type in ("fp8_direct_cast", "fp8_blockwise")
             else self.elem_size
         )
-
-    @classmethod
-    def tuned(cls, **kwargs):
-        """HIP uses the normal tuned-by-default constructor. FlyDSL retains its
-        legacy table prefill, with explicit kwargs taking precedence."""
-        backend = (
-            kwargs.get("kernel_backend")
-            or os.environ.get("MORI_V2_KERNEL_BACKEND")
-            or _default_backend()
-        )
-        if backend == "hip":
-            return cls(**kwargs)
-
-        from .tuning_configs import lookup
-
-        dt = kwargs.get("data_type", torch.bfloat16)
-        dtype = (
-            "fp4"
-            if dt == torch.float4_e2m1fn_x2
-            else ("fp8" if dt in _FP8_DTYPES else "bf16")
-        )
-        # The intranode tables say nothing about an internode config -- they are
-        # keyed on a single node's geometry and carry no rdma_block_num -- and
-        # pre-filling here would be indistinguishable from a caller pin, which
-        # the internode backend honours over its own table. Leave it alone and
-        # let _resolve_geometry / hip_tuning_configs do the work.
-        gpu_per_node = kwargs.get("gpu_per_node") or kwargs["world_size"]
-        if kwargs["world_size"] // gpu_per_node > 1:
-            return cls(**kwargs)
-
-        t = lookup(
-            kwargs["world_size"],
-            kwargs["hidden_dim"],
-            kwargs["num_experts_per_token"],
-            dtype=dtype,
-        )
-        for k, v in t.items():
-            kwargs.setdefault(k, v)
-        return cls(**kwargs)
 
     @property
     def dispatch_dtype(self):
