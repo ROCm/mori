@@ -429,6 +429,7 @@ add_library(
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
   distributed/pool_platform.cpp
+  distributed/scratch_arena.cpp
   distributed/distributed_client.cpp
   standalone/external_kv_identity_client.cpp
   standalone/ipc.cpp
