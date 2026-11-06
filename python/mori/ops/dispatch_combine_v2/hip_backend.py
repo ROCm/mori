@@ -951,10 +951,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"{leg} dtype {leg_dtype} has no AsyncLL kernel "
                     f"(have {', '.join(dtypes.values())})"
                 )
-        if cfg.active_qps is not None or cfg.active_qp_counts:
-            bad.append(
-                "active_qps / active_qp_counts (AsyncLL sends on every allocated QP)"
-            )
+        if cfg.active_qp_counts:
+            bad.append("active_qp_counts (AsyncLL has no set_active_qps)")
         if cfg.is_scatter:
             bad.append("combine_mode='scatter' (the AsyncLL combine gathers)")
         if cfg.enable_std_moe:
@@ -1353,15 +1351,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return "dispatch" if group.startswith("dispatch") else "combine"
 
     def _asyncll_request(self, cfg, dtype_tag, block_num, warp_per_block):
-        # AsyncLL stripes over every allocated QP and quiets them itself; the
-        # v2 drain count is not read by its kernels.
+        # AsyncLL stripes over its active QPs and quiets them itself; the v2
+        # drain count is not read by its kernels.
         request = self._internode_request(
             cfg,
             dtype_tag,
             block_num,
             warp_per_block,
             rdma_block_num=0,
-            active_qps=cfg.num_qp_per_pe,
+            active_qps=tuning.resolve_active_qps(cfg),
             num_qp_to_drain=0,
         )
         # The AsyncLL specs derive every grid themselves -- the copy passes from
@@ -1522,6 +1520,16 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         return run
 
+    def _reachable_schedule(self, cfg):
+        """Schedule rows a launch can select: those starting below the capacity."""
+        rows, lower = [], 0
+        for row in self._schedule:
+            if lower >= cfg.max_num_inp_token_per_rank:
+                break
+            rows.append(row)
+            lower = row.max_tokens if row.max_tokens is not None else lower
+        return rows
+
     def _build_internode_kernels(self, cfg) -> KernelSet:
         from mori.jit.v2 import plan_api
 
@@ -1546,12 +1554,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 ("combine", self._combine_specs),
             )
         }
-        # Every QP any launch of this op can send on: dispatch drains them all,
-        # because a combine may use more QPs than the dispatch after it. One
-        # op-wide value, so it adds no compiled variants -- but it does mean a
-        # bucket with a high count makes every bucket's dispatch drain that many.
+        # Dispatch drains every QP a launch of this op can send on; buckets above
+        # the token capacity are never launched, so they do not count.
         num_qp_to_drain = max(
-            spec.active_qps for specs in specs_by_phase.values() for spec in specs
+            [
+                spec.active_qps
+                for row in self._reachable_schedule(cfg)
+                for spec in (row.dispatch, row.combine)
+            ]
+            + list(self._selectable_active_qps)
         )
         plans = {}
         kernels = {"dispatch": {}, "combine": {}}

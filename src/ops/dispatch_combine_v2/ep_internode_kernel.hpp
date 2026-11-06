@@ -118,8 +118,8 @@ using EpDispatchCombineArgs = EpInterNodeArgs;
 //       leader. Callers are divergent (they sit under `if (laneId == 0)` and
 //       inside the deduplication ballot), so these must not contain a group
 //       barrier.
-//   EpInterNodeQuiet                                 warp-collective. Its one call site
-//       is warp-uniform, and ccoGda::flush requires at least warp scope because
+//   EpInterNodeQuiet                                 warp-collective. Its call sites
+//       are warp-uniform, and ccoGda::flush requires at least warp scope because
 //       it takes a warp-level CQ poll lock.
 //
 // EpInterNodePut replaces ShmemPutTypeNbiWarp, whose RDMA implementation is
@@ -848,26 +848,9 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
     }
   }
 
-  // Every QP any kernel of this op may send on (kConfig.numQpToDrain), not just
-  // the ones this dispatch used. The combine before it may have used more --
-  // the two phases choose their counts independently -- and nothing else polls
-  // a QP no dispatch uses. Leaving those unpolled is not incorrect (the send
-  // path polls for itself once the queue is full), but it turns into a stall
-  // inside a later combine instead of a cost paid here. Not the whole
-  // allocation either: flushing a QP that never carries traffic still costs a
-  // system fence, which measurably slows dispatch. Capped by the allocation:
-  // ccoGda takes the context id modulo it, so a qpId past it would only flush
-  // one of the same peer's lower QPs a second time.
-  //
-  // One (node, QP) pair per warp so different QPs drain concurrently, over the
-  // remote nodes only and numbered from warp 0. The send loops above target
-  // only remote nodes ((myNode + 1 + i) % nNodes), so the local node never has
-  // GDA traffic to drain. Skipping it is not just an optimisation: endpoints is
-  // world-indexed but RAIL only connects cross-node same-rail peers, so a local
-  // proxyPe's slot is zero-filled -- and on a single node the mask collapses to
-  // NONE and endpoints is null. flush() indexes it without a reachability
-  // check, so quieting the local node faults. Enumerating remote pairs directly
-  // also keeps the drains on the lowest warps rather than a later block.
+  // Drain every QP any kernel of this op may send on (a combine may have used more
+  // than this dispatch), capped by the allocation; one (remote node, QP) per warp.
+  // Skip the local node: under RAIL its endpoint is null and flush() would fault.
   constexpr int kDrainQps =
       kConfig.numQpToDrain > kConfig.numQpPerPe ? kConfig.numQpToDrain : kConfig.numQpPerPe;
   const int drainQps = min(kDrainQps, comm.ibgda.numQpPerPe);

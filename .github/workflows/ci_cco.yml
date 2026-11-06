@@ -601,8 +601,8 @@ jobs:
           # must tolerate, which the fixed-count cases above never reach. One
           # per family, because v2 and v2_ll each have their own barrier.
           for CASE in "v2 128" "v2 4096" "v2_ll 128" \
-                      "v2 4096 --num-qp 8 --active-qp-counts 1,2,4,8" \
-                      "v2_ll 128 --num-qp 8 --active-qp-counts 1,2,4,8"; do
+                      "v2 4096 --num-qp 8 -- --active-qp-counts 1,2,4,8" \
+                      "v2_ll 128 --num-qp 8 -- --active-qp-counts 1,2,4,8"; do
             set -- $CASE; KERNEL=$1; TOKENS=$2; shift 2; EXTRA="$*"
             echo "=== cco test kernel=$KERNEL max-tokens=$TOKENS $EXTRA port=$PORT ==="
             NODE2_CMD=(
