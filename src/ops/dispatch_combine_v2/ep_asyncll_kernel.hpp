@@ -185,6 +185,85 @@ __device__ __forceinline__ void PostPayloadAndNotify(
   }
 }
 
+// Copy a short field one 4 B word per lane, falling back to one byte per lane
+// unless the length and both ends are 4 B aligned. At the shapes in use they are
+// (hidden and scale rows are multiples of 4), but the record stride is the sum
+// of every field, so an odd scale row would misalign every record after it.
+__device__ __forceinline__ void LaneCopyWords(uint8_t* dst, const uint8_t* src, size_t bytes) {
+  const int lane = threadIdx.x & (warpSize - 1);
+  if (((bytes | reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src)) & 3) == 0) {
+    for (size_t b = static_cast<size_t>(lane) * 4; b < bytes;
+         b += static_cast<size_t>(warpSize) * 4)
+      *reinterpret_cast<uint32_t*>(dst + b) = *reinterpret_cast<const uint32_t*>(src + b);
+  } else {
+    for (size_t b = lane; b < bytes; b += warpSize) dst[b] = src[b];
+  }
+}
+
+// ---- Segmented receive (EpDispatchCombineConfig.async_ll_recv_layout) ----
+// args.segStride is 0 on an op built without the segmented layout. On one built with it, bit 63
+// is set on every call and the low 32 bits are this round's stride S, 0 for a compact round.
+constexpr uint64_t kSegCapableBit = uint64_t{1} << 63;
+__device__ __forceinline__ bool SegCapable(const EpDispatchCombineArgs& args) {
+  return (args.segStride & kSegCapableBit) != 0;
+}
+__device__ __forceinline__ int SegStrideOf(const EpDispatchCombineArgs& args) {
+  return static_cast<int>(args.segStride & 0xffffffffull);
+}
+
+// Every dispatch on a segmented-capable op, compact or segmented, sends each peer a mode word:
+// the round's epoch in the high half and its stride in the low half. The epoch is
+// crossDeviceBarrierFlag + 1 as read before this round's receive bumps it, the same on every
+// rank of a round, so a word that was not written this round (a peer that skipped it, or a
+// compact path that never sends one) cannot match either. The receive compares each peer's
+// word with its own and counts a mismatch: ranks that disagree on segmented vs compact, or on S,
+// read each other's rows at the wrong offsets.
+__device__ __forceinline__ uint64_t SegModeWord(uint64_t flag, int stride) {
+  return ((flag + 1) << 32) | static_cast<uint32_t>(stride);
+}
+
+// send_count words past the count/epoch pairs (segmented-capable ops only):
+//   [2W, 3W)    the mode word each source sent this rank, written by that source's engine
+//   3W          the local word this rank sends its own from
+//   3W+1, 3W+2  error counters (SegErrOverflow, SegErrMismatch), local, never sent
+//   [3W+3, 4W+3) this round's per-source row counts n_s, local (segment_counts())
+// Must match asyncll_seg_words() in internode_regions.py.
+__device__ __forceinline__ size_t SegStrideSlot(const EpInterNodeDeviceCfg& config, int srcPe) {
+  return (static_cast<size_t>(config.worldSize) * 2 + srcPe) * sizeof(uint64_t);
+}
+__device__ __forceinline__ size_t SegStrideSourceSlot(const EpInterNodeDeviceCfg& config) {
+  return static_cast<size_t>(config.worldSize) * 3 * sizeof(uint64_t);
+}
+constexpr int SegErrOverflow = 0;  // this rank had more rows for a peer than the stride
+constexpr int SegErrMismatch = 1;  // a peer's round did not use this rank's mode and stride
+__device__ __forceinline__ size_t SegErrSlot(const EpInterNodeDeviceCfg& config, int which) {
+  return (static_cast<size_t>(config.worldSize) * 3 + 1 + which) * sizeof(uint64_t);
+}
+__device__ __forceinline__ size_t SegCountSlot(const EpInterNodeDeviceCfg& config, int srcPe) {
+  return (static_cast<size_t>(config.worldSize) * 3 + 3 + srcPe) * sizeof(uint64_t);
+}
+// Counters, not sticky bits: the host keeps what it last saw, so it never has to clear a word
+// the device may be adding to.
+__device__ __forceinline__ void SegCountError(const EpDispatchCombineArgs& args,
+                                              const EpInterNodeDeviceCfg& config, int which) {
+  atomicAdd(
+      reinterpret_cast<unsigned long long*>(
+          args.reg(args.offSendCount)->template GetAs<uint8_t*>() + SegErrSlot(config, which)),
+      1ull);
+}
+// Compare every peer's mode word with this rank's. Lanes < npes of one warp, before the receive
+// bumps crossDeviceBarrierFlag.
+__device__ __forceinline__ void SegCheckModeWords(const EpDispatchCombineArgs& args,
+                                                  const EpInterNodeDeviceCfg& config, int lane,
+                                                  int myPe, int stride) {
+  if (lane == myPe) return;
+  const uint64_t want = SegModeWord(args.crossDeviceBarrierFlag[0], stride);
+  const uint64_t* word = reinterpret_cast<const uint64_t*>(
+      args.reg(args.offSendCount)->template GetAs<uint8_t*>() + SegStrideSlot(config, lane));
+  if (core::AtomicLoadRelaxedSystem(const_cast<uint64_t*>(word)) != want)
+    SegCountError(args, config, SegErrMismatch);
+}
+
 }  // namespace asyncll
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -193,52 +272,99 @@ __device__ __forceinline__ void PostPayloadAndNotify(
 // Routing only: no payload moves here. Groups of numExpertPerToken lanes inside a
 // warp cooperate on one token, each lane holding its own expert's destination, so
 // the deduplication is a register shuffle rather than a reload.
+//
+// Slots are claimed per BLOCK, not per entry. Every surviving entry needs the
+// next slot of its destination PE, and there are only worldSize counters: one
+// atomicAdd per entry put ~18k atomics on 8 addresses at EP8, top-6, 4096 tokens
+// and the pass took ~58 us for a few hundred KB of routing. Here each warp claims
+// its run inside the block (one LDS atomic per destination PE it touches), then
+// one thread per PE claims the block's whole run from the global counter: ~6.5 us
+// at that shape. The block walks the tokens in lockstep so every __syncthreads
+// is reached by all of its threads.
+//
+// Which slot an entry gets was never deterministic (it was atomic order before),
+// and nothing downstream depends on it: RecvCopy compacts each PE's slots in slot
+// order and records where each token came from.
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLSlotAssign_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
+  static_assert(kConfig.worldSize <= 64,
+                "slot claims are tracked in one 64-entry LDS array per destination PE");
   constexpr int numEpt = kConfig.numExpertPerToken;
   const int tokensPerWarp = warpSize / numEpt;
+  const int tokensPerBlock = warpNum * tokensPerWarp;
   const int expertIdx = laneId % numEpt;
   const int inWarpTokIdx = laneId / numEpt;
   const int baseLane = inWarpTokIdx * numEpt;
+  const unsigned long long lanesBelow = (1ull << laneId) - 1ull;
 
-  for (int warpTokBase = globalWarpId * tokensPerWarp; warpTokBase < args.curRankNumToken;
-       warpTokBase += globalWarpNum * tokensPerWarp) {
-    const int tokenId = warpTokBase + inWarpTokIdx;
+  __shared__ index_t blockClaims[64];
+  __shared__ index_t blockBase[64];
+
+  for (int blockTokBase = blockId * tokensPerBlock; blockTokBase < args.curRankNumToken;
+       blockTokBase += blockNum * tokensPerBlock) {
+    if (threadIdx.x < kConfig.worldSize) blockClaims[threadIdx.x] = 0;
+    __syncthreads();
+
+    const int tokenId = blockTokBase + warpId * tokensPerWarp + inWarpTokIdx;
     // warpSize need not be a multiple of numEpt (64 % 6 == 4 at top-k 6): the
     // trailing lanes alias the next warp's first token, so one entry would get two
     // slots and the orphan -- never written by SendCopy -- is read as a token by
     // the receiver. The test at top-k 6/9/10/12 exists for this.
     //
-    // Dropping a whole group keeps the shuffle below warp-coherent: inWarpTokIdx
-    // is group-uniform, so a group is either entirely in or entirely out.
-    if ((inWarpTokIdx >= tokensPerWarp) || (tokenId >= args.curRankNumToken)) continue;
-
+    // Those lanes and the ones past the last token stay in the loop as inactive
+    // rather than continuing: the ballots and shuffles below, and the block
+    // barriers, need every lane.
+    const bool active = (inWarpTokIdx < tokensPerWarp) && (tokenId < args.curRankNumToken);
     const int i = tokenId * numEpt + expertIdx;
-    const index_t destExpert = args.tokenIndices[i];
     // A negative expert id is the caller's "drop this slot" sentinel.
+    const index_t destExpert = active ? args.tokenIndices[i] : static_cast<index_t>(-1);
     const bool dropped = (destExpert < 0);
     const index_t destPe = dropped ? 0 : (destExpert / config.numExpertPerRank);
 
     // Deduplicate by shuffling the earlier lanes' destinations out of their
-    // registers. Every lane runs the same trip count so __shfl stays uniform --
-    // an early exit here is what makes it read an inactive lane.
+    // registers. inWarpTokIdx is group-uniform, so a group is entirely active or
+    // entirely not, and an inactive group's result is discarded. The mask keeps
+    // the trailing lanes' source lane inside the wave.
     bool isDuplicate = false;
     for (int j = 0; j < numEpt - 1; ++j) {
-      const index_t prevPe = __shfl(destPe, baseLane + j);
-      const bool prevDropped = __shfl(static_cast<int>(dropped), baseLane + j) != 0;
+      const int src = (baseLane + j) & (warpSize - 1);
+      const index_t prevPe = __shfl(destPe, src);
+      const bool prevDropped = __shfl(static_cast<int>(dropped), src) != 0;
       if ((j < expertIdx) && !prevDropped) isDuplicate = isDuplicate || (prevPe == destPe);
     }
 
     // An out-of-range expert id (an EPLB physical id past worldSize*numExpertPerRank)
     // would index destPeTokenCounter and SendBufSlotOffset out of bounds. Folded
-    // into the same null branch as the duplicate rather than skipped early, again
-    // to keep the shuffle above coherent.
+    // into the same null result as the duplicate rather than skipped early, again
+    // to keep the shuffles coherent.
     const bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
-    if (dropped || isDuplicate || peOutOfRange) {
-      args.dispDestTokIdMap[i] = NullSendBufSlotOffset(config);
-    } else {
-      const index_t destTokId = atomicAdd(args.destPeTokenCounter + destPe, 1);
+    const bool claims = active && !dropped && !isDuplicate && !peOutOfRange;
+
+    // This lane's offset within the block's run for its PE.
+    index_t inBlockTokId = 0;
+#pragma unroll
+    for (int pe = 0; pe < kConfig.worldSize; ++pe) {
+      const unsigned long long lanes = __ballot(claims && (destPe == pe));
+      if (lanes) {
+        const int leader = __ffsll(static_cast<long long>(lanes)) - 1;
+        index_t warpBase = 0;
+        if (laneId == leader)
+          warpBase = atomicAdd(&blockClaims[pe], static_cast<index_t>(__popcll(lanes)));
+        warpBase = __shfl(warpBase, leader);
+        if (claims && (destPe == pe))
+          inBlockTokId = warpBase + static_cast<index_t>(__popcll(lanes & lanesBelow));
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < kConfig.worldSize) {
+      const index_t n = blockClaims[threadIdx.x];
+      blockBase[threadIdx.x] = n ? atomicAdd(args.destPeTokenCounter + threadIdx.x, n) : 0;
+    }
+    __syncthreads();
+
+    if (active) {
+      const index_t destTokId = claims ? blockBase[destPe] + inBlockTokId : 0;
       // The counter is cleared by RecvCopy, one per round, so a SECOND
       // dispatch_send with no recv between it and the first keeps climbing from
       // where the first left off. Unbounded, SendBufSlotOffset then encodes a
@@ -251,10 +377,12 @@ __device__ void EpDispatchAsyncLLSlotAssign_body(EpDispatchCombineArgs args) {
       // right -- it is the host's call-order check that stops it being reachable
       // (dispatch_combine_op.py) -- but wrong-and-in-bounds beats corrupting a
       // peer's buffer, which is the one thing this kernel can still choose.
-      args.dispDestTokIdMap[i] = (destTokId < config.MaxNumTokensToSendPerRank())
+      args.dispDestTokIdMap[i] = (claims && destTokId < config.MaxNumTokensToSendPerRank())
                                      ? SendBufSlotOffset(config, destPe, destTokId)
                                      : NullSendBufSlotOffset(config);
     }
+    // blockClaims is reset at the top of the next round.
+    __syncthreads();
   }
 }
 
@@ -266,6 +394,14 @@ __device__ void EpDispatchAsyncLLSlotAssign_body(EpDispatchCombineArgs args) {
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
+  // A compact round on a segmented-capable op still sends its mode word (stride 0), so a peer
+  // running a segmented round in it notices. SendTransfer hands this word to SDMA after a
+  // kernel boundary, like the count below.
+  if (asyncll::SegCapable(args) && globalWarpId == 0 && laneId == 0) {
+    uint8_t* words = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
+    *reinterpret_cast<uint64_t*>(words + asyncll::SegStrideSourceSlot(config)) =
+        asyncll::SegModeWord(args.crossDeviceBarrierFlag[0], 0);
+  }
   if constexpr (asyncll::EarlyNotify<kConfig>) {
     // SlotAssign has completed. The following SendTransfer kernel may hand
     // these words directly to SDMA without an additional system fence.
@@ -443,6 +579,18 @@ __device__ void EpDispatchAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
     const int tokenNum =
         asyncll::SendTokenCount(config, core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe));
 
+    // Segmented-capable op (one node, SDMA): the mode word goes first on the queue the count
+    // follows on, so it has landed when the peer sees the count.
+    if (asyncll::SegCapable(args) && destPe != myPe && laneId == 0 &&
+        destPe / config.gpuPerNode == myNode) {
+      const EpInterNodeRegion wordRegion = args.reg(args.offSendCount);
+      sdma.put(destPe - args.lsaBase, EpInterNodeWindow(wordRegion),
+               EpInterNodeOffset(wordRegion, asyncll::SegStrideSlot(config, myPe)),
+               EpInterNodeWindow(wordRegion),
+               EpInterNodeOffset(wordRegion, asyncll::SegStrideSourceSlot(config)),
+               sizeof(uint64_t), asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset));
+    }
+
     if constexpr (asyncll::EarlyNotify<kConfig>) {
       if (destPe == myPe) {
         if (laneId == 0) {
@@ -615,6 +763,12 @@ __device__ void EpDispatchAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
 // Unpack what arrived into the dispatch output, and build the two maps combine
 // needs. Per-PE output offsets come from a warp prefix sum rather than an atomic,
 // so every block derives the same layout independently.
+//
+// The whole grid walks the concatenated output rather than giving each source PE
+// a fixed 1/worldSize of the blocks: with a static split the PE that sent the
+// most sets the kernel's length while the other groups sit idle, and the PEs a
+// rank receives from are rarely even. The owning PE of output row r is the last
+// one whose exclusive offset is <= r, read off the prefix sum with one ballot.
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
@@ -625,11 +779,6 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
   // which does know it. This catches only a worldSize no wave could hold.
   static_assert(kConfig.worldSize <= 64,
                 "the per-PE offset prefix sum is one wavefront wide; worldSize must fit it");
-
-  const int blocksPerPe = blockNum / npes;
-  if (blocksPerPe <= 0) return;
-  const int destPe = blockId / blocksPerPe;
-  if (destPe >= npes) return;
 
   const uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<const uint8_t*>();
 
@@ -645,56 +794,63 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
   }
   uint64_t peExclusive = __shfl_up(inclusive, 1);
   if (laneId == 0) peExclusive = 0;
-
-  const uint64_t peOffset = __shfl(peExclusive, destPe);
-  const uint64_t recvTokenNum = __shfl(myPeTokens, destPe);
   const uint64_t totalTokens = __shfl(inclusive, npes - 1);
 
-  const uint8_t* stagingPtr = (destPe != myPe)
-                                  ? args.reg(args.offDispatchInp)->template GetAs<const uint8_t*>()
-                                  : args.reg(args.offStaging)->template GetAs<const uint8_t*>();
-  stagingPtr += static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * xferBytes;
+  const uint8_t* peerBase = args.reg(args.offDispatchInp)->template GetAs<const uint8_t*>();
+  // This rank's own tokens were never transferred; they are still in staging.
+  const uint8_t* selfBase = args.reg(args.offStaging)->template GetAs<const uint8_t*>();
+  uint8_t* outTokens = args.reg(args.offDispatchOut)->template GetAs<uint8_t*>();
+  uint8_t* outIndices = args.reg(args.offOutIndices)->template GetAs<uint8_t*>();
+  uint8_t* outWeights = args.reg(args.offDispatchOutWeights)->template GetAs<uint8_t*>();
+  uint8_t* outScales = args.reg(args.offOutScales)->template GetAs<uint8_t*>();
 
-  const int peWarps = blocksPerPe * warpNum;
-  const int localWarpId = (blockId % blocksPerPe) * warpNum + warpId;
   const index_t warpsPerToken =
-      (recvTokenNum > 0) ? static_cast<index_t>((peWarps + recvTokenNum - 1) / recvTokenNum) : 1;
+      (totalTokens > 0) ? static_cast<index_t>((globalWarpNum + totalTokens - 1) / totalTokens) : 1;
   const size_t hiddenBytesPerWarp =
       ((hiddenBytes + warpsPerToken - 1) / warpsPerToken + 15) & ~static_cast<size_t>(15);
 
-  for (int i = localWarpId; i < static_cast<int>(recvTokenNum) * warpsPerToken; i += peWarps) {
-    const index_t tokenId = i / warpsPerToken;
+  for (int i = globalWarpId; i < static_cast<int>(totalTokens) * warpsPerToken;
+       i += globalWarpNum) {
+    const index_t destTokId = i / warpsPerToken;
     const index_t inTokenPartId = i % warpsPerToken;
-    const index_t destTokId = static_cast<index_t>(peOffset) + tokenId;
+    // Lane 0 always qualifies (its exclusive offset is 0), so the mask is never
+    // empty; a PE that sent nothing shares its offset with the next and is
+    // skipped by taking the highest qualifying lane.
+    const unsigned long long owners =
+        __ballot((laneId < npes) && (peExclusive <= static_cast<uint64_t>(destTokId)));
+    const int srcPe = 63 - __clzll(static_cast<long long>(owners));
+    const index_t tokenId = destTokId - static_cast<index_t>(__shfl(peExclusive, srcPe));
+    const uint8_t* record =
+        ((srcPe != myPe) ? peerBase : selfBase) +
+        (static_cast<size_t>(SendBufSlotOffset(config, srcPe, 0)) + tokenId) * xferBytes;
 
+    // Four 16 B loads in flight per lane: the source is what SDMA just wrote, so
+    // it comes from HBM, not cache, and one load per lane left it latency-bound.
     const size_t hiddenOffset = inTokenPartId * hiddenBytesPerWarp;
     if (hiddenOffset < hiddenBytes) {
       const size_t len = min(hiddenBytesPerWarp, hiddenBytes - hiddenOffset);
-      core::WarpCopy<uint8_t, 1>(args.reg(args.offDispatchOut)->template GetAs<uint8_t*>() +
-                                     destTokId * hiddenBytes + hiddenOffset,
-                                 stagingPtr + tokenId * xferBytes + hiddenOffset, len);
+      core::WarpCopy<uint8_t, 4>(outTokens + destTokId * hiddenBytes + hiddenOffset,
+                                 record + hiddenOffset, len);
     }
 
     if (inTokenPartId == 0) {
-      core::WarpCopy<uint8_t, 1>(
-          args.reg(args.offOutIndices)->template GetAs<uint8_t*>() + destTokId * indexBytes,
-          stagingPtr + tokenId * xferBytes + hiddenBytes, indexBytes);
+      // The metadata fields are a few dozen bytes each, below WarpCopy's vector
+      // width, which sent them through its byte-at-a-time tail; copy them a word
+      // per lane instead.
+      const uint8_t* meta = record + hiddenBytes;
+      asyncll::LaneCopyWords(outIndices + destTokId * indexBytes, meta, indexBytes);
       if (args.weightsBuf)
-        core::WarpCopy<uint8_t, 1>(
-            args.reg(args.offDispatchOutWeights)->template GetAs<uint8_t*>() +
-                destTokId * weightBytes,
-            stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes, weightBytes);
+        asyncll::LaneCopyWords(outWeights + destTokId * weightBytes, meta + indexBytes,
+                               weightBytes);
       if (scaleBytes > 0)
-        core::WarpCopy<uint8_t, 1>(
-            args.reg(args.offOutScales)->template GetAs<uint8_t*>() + destTokId * scaleBytes,
-            stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
+        asyncll::LaneCopyWords(outScales + destTokId * scaleBytes, meta + indexBytes + weightBytes,
+                               scaleBytes);
       if (laneId == 0) {
         // Where this token came from, so combine's send leg can put the result
         // back in the slot it arrived in.
-        args.dispReceiverIdxMap[destTokId] = SendBufSlotOffset(config, destPe, tokenId);
+        args.dispReceiverIdxMap[destTokId] = SendBufSlotOffset(config, srcPe, tokenId);
         args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>()[destTokId] =
-            reinterpret_cast<const index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes +
-                                             indexBytes + weightBytes + scaleBytes)[0];
+            reinterpret_cast<const index_t*>(meta + indexBytes + weightBytes + scaleBytes)[0];
       }
     }
   }
@@ -702,6 +858,9 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
   // One warp in the grid owns the epilogue: publish the total, clear what the
   // next call reads, and advance the combine barrier epoch.
   if (globalWarpId == 0) {
+    // Compact round on a segmented-capable op: every peer must have run one too.
+    if (asyncll::SegCapable(args) && laneId < npes)
+      asyncll::SegCheckModeWords(args, config, laneId, myPe, 0);
     if (laneId == 0) args.totalRecvTokenNum[0] = static_cast<index_t>(totalTokens);
     // The recv counts are deliberately NOT cleared here. Combine's send leg needs
     // to know how many tokens each peer sent us -- that is exactly how many we owe
@@ -1266,6 +1425,416 @@ __device__ void EpCombineAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
         T* base = (destPe != myPe) ? args.reg(args.offCombineInp)->template GetAs<T*>()
                                    : args.reg(args.offCombineStaging)->template GetAs<T*>();
         srcPtrs[j] = base + static_cast<size_t>(destTokId) * hiddenDim + hiddenDimOffset;
+      } else {
+        srcPtrs[j] = nullptr;
+      }
+    }
+
+    T* outPtr =
+        args.reg(args.offCombineOut)->template GetAs<T*>() + tokenId * hiddenDim + hiddenDimOffset;
+    core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, kTopk, hiddenDimSize);
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*            Segmented receive -- the expert reads the landing segments in place                 */
+/* ---------------------------------------------------------------------------------------------- */
+// With stride S > 0 (SegStrideOf; chosen per call by the host: identical on every rank, at least
+// every rank's token count, at most the capacity), source s's rows land at [s * S, s * S + n_s)
+// of this rank's inter_dispatch_inp, one block per field (SegLayout), so the expert reads plain
+// [worldSize * S, ...] arrays and dispatch has no RecvCopy. Rows past n_s still hold an older
+// round's data; RecvFinalizeSeg points their experts at a non-local one with weight 0, which the
+// expert's mask drops. The expert writes its output in the same layout to inter_dispatch_staging,
+// so what goes back to source s is rows [s * S, s * S + n_s) there. CombineSendTransferSeg sends
+// that in place and CombineRecvCopySeg reads the replies at [d * S + slot] of inter_combine_inp.
+//
+// SlotAssign is unchanged: dispDestTokIdMap still encodes SendBufSlotOffset with the capacity
+// stride (and its null sentinel), only the row a slot lives in moves. Peers' rows are staged at
+// that encoded slot in inter_staging, laid out per field as well; this rank's own rows are
+// written straight into its landing segment.
+namespace asyncll {
+
+// Byte offsets of the field blocks in inter_dispatch_inp / inter_staging under the segmented
+// layout, each worldSize * MaxNumTokensToSendPerRank rows. Must match asyncll_seg_layout in
+// internode_regions.py, which sizes both regions and builds the expert's views.
+struct SegLayout {
+  size_t hidden;
+  size_t index;
+  size_t weight;
+  size_t scale;
+  size_t srcTok;
+};
+
+__device__ __forceinline__ size_t SegAlign(size_t bytes) {
+  return (bytes + 255) & ~static_cast<size_t>(255);
+}
+
+__device__ __forceinline__ SegLayout SegLayoutOf(const EpInterNodeDeviceCfg& config,
+                                                 size_t hiddenBytes) {
+  const size_t rows = static_cast<size_t>(config.MaxNumTokensToSend());
+  SegLayout layout;
+  layout.hidden = 0;
+  layout.index = SegAlign(rows * hiddenBytes);
+  layout.weight = SegAlign(layout.index + rows * config.IndexBytes());
+  layout.scale = SegAlign(layout.weight + rows * config.WeightBytes());
+  layout.srcTok = SegAlign(layout.scale + rows * config.ScaleBytes());
+  return layout;
+}
+
+constexpr int kSegFields = 5;  // hidden, index, weight, scale, source token id
+
+// One peer's segmented dispatch payload. Lane f < kSegFields posts field block f, lane
+// kSegFields the stride word and, with early notify, lane kSegFields + 1 the count: one
+// reservation on one queue, in lane order, so the count lands after everything it covers.
+// Zero-byte lanes (an empty segment, no scales) drop out. A block too large for one packet
+// takes the sequential path, for the reason PostPayloadAndNotify gives.
+__device__ __forceinline__ void SegPostSegment(const ::mori::cco::ccoDevComm& comm, int peer,
+                                               int queueId, ::mori::cco::ccoWindow_t win,
+                                               size_t dstOffset, size_t srcOffset, size_t bytes) {
+  ::mori::cco::ccoSdma sdma{comm};
+  const bool big = __ballot(bytes > ::mori::cco::CCO_SDMA_MAX_COPY_BYTES) != 0;
+  if (big) {
+    for (int f = 0; f < kSegFields + 2; ++f) {
+      const size_t n = __shfl(static_cast<unsigned long long>(bytes), f);
+      const size_t dst = __shfl(static_cast<unsigned long long>(dstOffset), f);
+      const size_t src = __shfl(static_cast<unsigned long long>(srcOffset), f);
+      if (n != 0) sdma.put<::mori::cco::ccoCoopWarp>(peer, win, dst, win, src, n, queueId);
+    }
+  } else if (bytes != 0) {
+    sdma.put<::mori::cco::ccoCoopThread, false, false, ::mori::cco::ccoSdmaOptFlagsDefault,
+             ::mori::cco::ccoSdmaThreadSameQueue>(peer, win, dstOffset, win, srcOffset, bytes,
+                                                  queueId);
+  }
+}
+
+}  // namespace asyncll
+
+/* ------------------------------ EpDispatchAsyncLLSendCopySeg -----------------------------------
+ */
+// SendCopy with the per-field layout. Also publishes the stride word, and the counts clamped to
+// the stride: entries past it are dropped (and nulled in dispDestTokIdMap so combine does not
+// read a reply that never comes), which makes the round wrong, so it is flagged.
+template <EpInterNodeKernelCfg kConfig, typename T>
+__device__ void EpDispatchAsyncLLSendCopySeg_body(EpDispatchCombineArgs args) {
+  DEF_COMMON_VARS;
+  const int stride = asyncll::SegStrideOf(args);
+  if (globalWarpId == 0 && laneId < npes) {
+    const int raw = core::AtomicLoadRelaxed(args.destPeTokenCounter + laneId);
+    if (raw > stride) asyncll::SegCountError(args, config, asyncll::SegErrOverflow);
+    uint8_t* words = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
+    if constexpr (asyncll::EarlyNotify<kConfig>) {
+      *reinterpret_cast<uint64_t*>(words + asyncll::SendCountSlot(laneId)) =
+          static_cast<uint64_t>(min(raw, stride)) + 1;
+    }
+    if (laneId == 0)
+      *reinterpret_cast<uint64_t*>(words + asyncll::SegStrideSourceSlot(config)) =
+          asyncll::SegModeWord(args.crossDeviceBarrierFlag[0], stride);
+  }
+  const index_t totalEntries = args.curRankNumToken * config.numExpertPerToken;
+  if (totalEntries <= 0) return;
+
+  const index_t warpsPerToken = (globalWarpNum + totalEntries - 1) / totalEntries;
+  const size_t hiddenBytesPerWarp =
+      ((hiddenBytes + warpsPerToken - 1) / warpsPerToken + 15) & ~static_cast<size_t>(15);
+  const asyncll::SegLayout layout = asyncll::SegLayoutOf(config, hiddenBytes);
+  uint8_t* staging = args.reg(args.offStaging)->template GetAs<uint8_t*>();
+  uint8_t* landing = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>();
+
+  for (int i = globalWarpId; i < totalEntries * warpsPerToken; i += globalWarpNum) {
+    const index_t entryId = i / warpsPerToken;
+    const index_t inTokenPartId = i % warpsPerToken;
+
+    const index_t destTokOffset = args.dispDestTokIdMap[entryId];
+    if (destTokOffset >= NullSendBufSlotOffset(config)) continue;
+    const int destPe = PeFromSendBufSlotOffset(config, destTokOffset);
+    const int slotId = SlotIdFromSendBufSlotOffset(config, destTokOffset);
+    if (slotId >= stride) {
+      if (inTokenPartId == 0 && laneId == 0)
+        args.dispDestTokIdMap[entryId] = NullSendBufSlotOffset(config);
+      continue;
+    }
+
+    const bool self = (destPe == myPe);
+    uint8_t* base = self ? landing : staging;
+    const size_t row =
+        self ? static_cast<size_t>(myPe) * stride + slotId : static_cast<size_t>(destTokOffset);
+    const index_t srcTokId = entryId / config.numExpertPerToken;
+
+    const size_t hiddenOffset = inTokenPartId * hiddenBytesPerWarp;
+    if (hiddenOffset < hiddenBytes) {
+      const size_t len = min(hiddenBytesPerWarp, hiddenBytes - hiddenOffset);
+      core::WarpCopy<uint8_t, 1>(
+          base + layout.hidden + row * hiddenBytes + hiddenOffset,
+          static_cast<const uint8_t*>(args.inpTokenBuf) + srcTokId * hiddenBytes + hiddenOffset,
+          len);
+    }
+
+    if (inTokenPartId == 0) {
+      asyncll::LaneCopyWords(
+          base + layout.index + row * indexBytes,
+          reinterpret_cast<const uint8_t*>(args.tokenIndices) + srcTokId * indexBytes, indexBytes);
+      if (args.weightsBuf)
+        asyncll::LaneCopyWords(
+            base + layout.weight + row * weightBytes,
+            reinterpret_cast<const uint8_t*>(args.weightsBuf) + srcTokId * weightBytes,
+            weightBytes);
+      if (args.scalesBuf && (scaleBytes > 0))
+        asyncll::LaneCopyWords(base + layout.scale + row * scaleBytes,
+                               args.scalesBuf + srcTokId * scaleBytes, scaleBytes);
+      if (laneId == 0)
+        reinterpret_cast<index_t*>(base + layout.srcTok)[row] =
+            static_cast<index_t>(asyncll::SrcTokenIndex(config, myPe, srcTokId));
+    }
+  }
+}
+
+/* ---------------------------- EpDispatchAsyncLLSendTransferSeg ---------------------------------
+ */
+// SendTransfer with one packet per field block (SegPostSegment) into the peer's landing at
+// [myPe * S]. Same counts and queue as the original: with early notify the count rides the same
+// reservation, otherwise it is staged here and RecvTransfer sends it after its drain. Own rows
+// were written in place by SendCopySeg.
+template <EpInterNodeKernelCfg kConfig, typename T>
+__device__ void EpDispatchAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args,
+                                                      const ::mori::cco::ccoDevComm& comm) {
+  DEF_COMMON_VARS;
+  const int stride = asyncll::SegStrideOf(args);
+  const asyncll::SegLayout layout = asyncll::SegLayoutOf(config, hiddenBytes);
+  uint8_t* words = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
+
+  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    if (warpId != 0) continue;
+    const int raw = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+    const size_t tokenNum = static_cast<size_t>(min(raw, stride));
+
+    if (destPe == myPe) {
+      if (laneId == 0) {
+        if constexpr (asyncll::EarlyNotify<kConfig>) {
+          uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<uint8_t*>();
+          core::AtomicStoreReleaseSystem(
+              reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(myPe)),
+              static_cast<uint64_t>(tokenNum) + 1);
+        } else {
+          *reinterpret_cast<uint64_t*>(words + asyncll::SendCountSlot(myPe)) =
+              static_cast<uint64_t>(tokenNum) + 1;
+        }
+      }
+      continue;
+    }
+    // Single node only; the host refuses the segmented layout otherwise.
+    if (destPe / config.gpuPerNode != myNode) continue;
+    if constexpr (!asyncll::EarlyNotify<kConfig>) {
+      if (laneId == 0)
+        *reinterpret_cast<uint64_t*>(words + asyncll::SendCountSlot(destPe)) =
+            static_cast<uint64_t>(tokenNum) + 1;
+    }
+
+    // This lane's packet; see SegPostSegment for the lane assignment.
+    const EpInterNodeRegion landing = args.reg(args.offDispatchInp);
+    const EpInterNodeRegion staging = args.reg(args.offStaging);
+    const EpInterNodeRegion wordRegion = args.reg(args.offSendCount);
+    const size_t field = (laneId == 0)   ? layout.hidden
+                         : (laneId == 1) ? layout.index
+                         : (laneId == 2) ? layout.weight
+                         : (laneId == 3) ? layout.scale
+                                         : layout.srcTok;
+    const size_t fieldBytes = (laneId == 0)   ? hiddenBytes
+                              : (laneId == 1) ? indexBytes
+                              : (laneId == 2) ? weightBytes
+                              : (laneId == 3) ? scaleBytes
+                                              : srcTokenIdBytes;
+    size_t dst = 0, src = 0, bytes = 0;
+    if (laneId < asyncll::kSegFields) {
+      dst = EpInterNodeOffset(landing, field + static_cast<size_t>(myPe) * stride * fieldBytes);
+      src = EpInterNodeOffset(staging, field + static_cast<size_t>(destPe) *
+                                                   config.MaxNumTokensToSendPerRank() * fieldBytes);
+      bytes = tokenNum * fieldBytes;
+    } else if (laneId == asyncll::kSegFields) {
+      dst = EpInterNodeOffset(wordRegion, asyncll::SegStrideSlot(config, myPe));
+      src = EpInterNodeOffset(wordRegion, asyncll::SegStrideSourceSlot(config));
+      bytes = sizeof(uint64_t);
+    } else if (laneId == asyncll::kSegFields + 1 && asyncll::EarlyNotify<kConfig>) {
+      dst = EpInterNodeOffset(args.reg(args.offRecvTokenNum), asyncll::RecvCountSlot(myPe));
+      src = EpInterNodeOffset(wordRegion, asyncll::SendCountSlot(destPe));
+      bytes = sizeof(uint64_t);
+    }
+    asyncll::SegPostSegment(comm, destPe - args.lsaBase,
+                            asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
+                            EpInterNodeWindow(landing), dst, src, bytes);
+  }
+}
+
+/* ---------------------------- EpDispatchAsyncLLRecvFinalizeSeg ---------------------------------
+ */
+// Replaces RecvCopy: nothing is copied. Points every row past its segment's count (a hole) at a
+// non-local expert with weight 0 and zeroes its scales, records the counts for combine and for
+// segment_counts(), checks every peer's mode word, and runs RecvCopy's epilogue with
+// total_recv = worldSize * S, the row count of the views. RecvTransfer has seen every count, and
+// each count was queued behind its segment and mode word.
+template <EpInterNodeKernelCfg kConfig, typename T>
+__device__ void EpDispatchAsyncLLRecvFinalizeSeg_body(EpDispatchCombineArgs args) {
+  DEF_COMMON_VARS;
+  static_assert(kConfig.worldSize <= 64, "the segment counts are staged in a 64-entry LDS array");
+  const int stride = asyncll::SegStrideOf(args);
+  const uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<const uint8_t*>();
+
+  __shared__ int segRows[64];
+  if (threadIdx.x < npes) {
+    const uint64_t announced =
+        *reinterpret_cast<const uint64_t*>(recvCounts + asyncll::RecvCountSlot(threadIdx.x));
+    segRows[threadIdx.x] = static_cast<int>(min(announced - 1, static_cast<uint64_t>(stride)));
+  }
+  __syncthreads();
+
+  const asyncll::SegLayout layout = asyncll::SegLayoutOf(config, hiddenBytes);
+  uint8_t* landing = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>();
+  index_t* indices = reinterpret_cast<index_t*>(landing + layout.index);
+  float* weights = reinterpret_cast<float*>(landing + layout.weight);
+  uint32_t* scales = reinterpret_cast<uint32_t*>(landing + layout.scale);
+  // A whole number of dwords per scale row: the host refuses the layout otherwise.
+  const size_t scaleWords = scaleBytes / 4;
+  const index_t* srcTok = reinterpret_cast<const index_t*>(landing + layout.srcTok);
+  index_t* reverse = args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>();
+  const int rows = npes * stride;
+  // The next rank's first expert: this rank's expert mask drops it.
+  const index_t invalidExpert = ((myPe + 1) % npes) * config.numExpertPerRank;
+  for (int r = globalThdId; r < rows; r += globalThdNum) {
+    const int srcPe = r / stride;
+    if (r - srcPe * stride < segRows[srcPe]) {
+      reverse[r] = srcTok[r];
+      continue;
+    }
+    reverse[r] = -1;
+    for (int k = 0; k < config.numExpertPerToken; ++k) {
+      indices[static_cast<size_t>(r) * config.numExpertPerToken + k] = invalidExpert;
+      weights[static_cast<size_t>(r) * config.numExpertPerToken + k] = 0.0f;
+    }
+    // Stale scales could be anything (a NaN pattern included) to a consumer that touches every
+    // row's scale even for a masked expert; the hidden bytes stay stale, they are 25-50x larger.
+    for (size_t w = 0; w < scaleWords; ++w) scales[static_cast<size_t>(r) * scaleWords + w] = 0;
+  }
+
+  if (globalWarpId == 0) {
+    int mine = 0;
+    if (laneId < npes) {
+      mine = segRows[laneId];
+      // No re-arming: the epoch in the word already tells this round from the last.
+      asyncll::SegCheckModeWords(args, config, laneId, myPe, stride);
+      *reinterpret_cast<uint64_t*>(args.reg(args.offSendCount)->template GetAs<uint8_t*>() +
+                                   asyncll::SegCountSlot(config, laneId)) =
+          static_cast<uint64_t>(mine);
+      args.destPeTokenCounter[laneId] = 0;
+    }
+    if (laneId == 0) {
+      args.totalRecvTokenNum[0] = static_cast<index_t>(rows);
+      args.dispatchGridBarrier[0] = 0;
+      atomicAdd(args.crossDeviceBarrierFlag, 1ull);
+    }
+  }
+}
+
+/* --------------------------- EpCombineAsyncLLSendTransferSeg -----------------------------------
+ */
+// CombineSendTransfer straight from the segmented expert output (inter_dispatch_staging, which
+// peers never write) into the peer's inter_combine_inp at [myPe * S]. Without a SendCopy in front
+// of it, it also does that pass's early-notify bookkeeping, per peer: read and clear the count,
+// then stage the epoch and fence before the engine is handed either.
+template <EpInterNodeKernelCfg kConfig, typename T>
+__device__ void EpCombineAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args,
+                                                     const ::mori::cco::ccoDevComm& comm) {
+  DEF_COMMON_VARS;
+  ::mori::cco::ccoSdma sdma{comm};
+  const int stride = asyncll::SegStrideOf(args);
+  uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<uint8_t*>();
+  uint8_t* words = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
+
+  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    if (warpId != 0) continue;
+    uint64_t announced = 0;
+    if (laneId == 0) {
+      uint64_t* slot = reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(destPe));
+      announced = core::AtomicLoadRelaxedSystem(slot);
+      core::AtomicStoreRelaxedSystem(slot, uint64_t{0});
+    }
+    announced = __shfl(static_cast<unsigned long long>(announced), 0);
+    // 0 is "no dispatch this round" (see the original); never more than the segment.
+    const uint64_t tokenNum =
+        (announced == 0) ? 0 : min(announced - 1, static_cast<uint64_t>(stride));
+    const size_t remoteBase = static_cast<size_t>(myPe) * stride * hiddenBytes;
+    const size_t localBase = static_cast<size_t>(destPe) * stride * hiddenBytes;
+
+    if constexpr (asyncll::EarlyNotify<kConfig>) {
+      const uint64_t flag = args.crossDeviceBarrierFlag[0];
+      if (destPe == myPe) {
+        if (laneId == 0) {
+          uint64_t* barrier = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
+          core::AtomicStoreReleaseSystem(barrier + myPe, flag);
+        }
+        continue;
+      }
+      if (laneId == 0) {
+        *reinterpret_cast<uint64_t*>(words + asyncll::SendFlagSlot(destPe)) = flag;
+        // The engine reads the epoch from memory, and the clear above must be visible before
+        // the peer can see the epoch and start its next dispatch.
+        __threadfence_system();
+      }
+      asyncll::PostPayloadAndNotify(
+          comm, destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
+          EpInterNodeWindow(args.reg(args.offCombineInp)),
+          EpInterNodeOffset(args.reg(args.offCombineInp), remoteBase),
+          EpInterNodeWindow(args.reg(args.offDispatchStaging)),
+          EpInterNodeOffset(args.reg(args.offDispatchStaging), localBase),
+          static_cast<size_t>(tokenNum) * hiddenBytes,
+          EpInterNodeWindow(args.reg(args.offCrossDeviceBarrier)),
+          EpInterNodeOffset(args.reg(args.offCrossDeviceBarrier), myPe * sizeof(uint64_t)),
+          EpInterNodeWindow(args.reg(args.offSendCount)),
+          EpInterNodeOffset(args.reg(args.offSendCount), asyncll::SendFlagSlot(destPe)));
+      continue;
+    }
+
+    if (announced == 0 || destPe == myPe || tokenNum == 0) continue;
+    if (destPe / config.gpuPerNode != myNode) continue;
+    sdma.put<::mori::cco::ccoCoopWarp>(
+        destPe - args.lsaBase, EpInterNodeWindow(args.reg(args.offCombineInp)),
+        EpInterNodeOffset(args.reg(args.offCombineInp), remoteBase),
+        EpInterNodeWindow(args.reg(args.offDispatchStaging)),
+        EpInterNodeOffset(args.reg(args.offDispatchStaging), localBase), tokenNum * hiddenBytes,
+        asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset));
+  }
+}
+
+/* ------------------------------ EpCombineAsyncLLRecvCopySeg ------------------------------------
+ */
+// CombineRecvCopy for CombineSendTransferSeg: a peer's reply to slot j is at [peer * S + j] of
+// inter_combine_inp, and this rank's own never left its expert output, at [myPe * S + j].
+template <EpInterNodeKernelCfg kConfig, typename T>
+__device__ void EpCombineAsyncLLRecvCopySeg_body(EpDispatchCombineArgs args) {
+  DEF_COMMON_VARS;
+  constexpr int kTopk = kConfig.numExpertPerToken;
+
+  extern __shared__ char epAsyncLlShared[];
+  T** srcPtrs = reinterpret_cast<T**>(epAsyncLlShared) + warpId * kTopk;
+
+  if (args.curRankNumToken == 0) return;
+  const int stride = asyncll::SegStrideOf(args);
+  T* peerBase = args.reg(args.offCombineInp)->template GetAs<T*>();
+  T* selfBase = args.reg(args.offDispatchStaging)->template GetAs<T*>();
+
+  MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
+
+  for (int i = globalWarpId; i < args.curRankNumToken * mwIter.warpsPerItem; i += globalWarpNum) {
+    int tokenId, inTokenPartId;
+    size_t hiddenDimOffset, hiddenDimSize;
+    mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
+
+    for (int j = laneId; j < kTopk; j += warpSize) {
+      const index_t destTokId = args.dispDestTokIdMap[tokenId * kTopk + j];
+      const index_t destPe = PeFromSendBufSlotOffset(config, destTokId);
+
+      if (destPe < npes) {
+        const size_t row =
+            static_cast<size_t>(destPe) * stride + SlotIdFromSendBufSlotOffset(config, destTokId);
+        srcPtrs[j] = ((destPe != myPe) ? peerBase : selfBase) + row * hiddenDim + hiddenDimOffset;
       } else {
         srcPtrs[j] = nullptr;
       }
