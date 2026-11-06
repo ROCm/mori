@@ -113,9 +113,10 @@ counts in `active_qp_counts` can be selected, and selecting one never compiles
 or recreates a QP. A sweep pins it per phase instead, as a fourth field of
 `MORI_EP_DISP_GEOM` / `MORI_EP_COMB_GEOM` (`block,rdma,warp,active_qps`).
 Dispatch drains every QP the op can send on -- its largest active count over
-all buckets, both phases and `active_qp_counts`, not the whole allocation -- so
-QPs only a combine used are still polled once a cycle, while an op that never
-goes above two QPs pays for two.
+the buckets its token capacity can reach, both phases and `active_qp_counts`,
+not the whole allocation -- so QPs only a combine used are still polled once a
+cycle, while an op that never goes above two QPs pays for two. AsyncLL sends on
+the same resolved count (`active_qps`, else `min(2, num_qp_per_pe)`).
 
 What the barrier still needs is pairing: exactly one combine per dispatch on
 every rank. The wait target is the rank's own dispatch count times that fixed

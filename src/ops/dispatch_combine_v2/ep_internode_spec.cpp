@@ -117,26 +117,13 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   if (request.rdmaBlockNum > 0) cfg.rdmaBlockNum = request.rdmaBlockNum;
   if (request.mpCount > 0) cfg.mpCount = request.mpCount;
 
-  // QP 0 carries the remainder of a fixed per-combine marker total, so the
-  // total bounds how many QPs a kernel may send on. Checked ahead of the
-  // generic validity test, which rejects it too but blames the divisors.
-  const int activeQps = cfg.kernelCfg.numQpPerPe;
-  if (activeQps < 1 || activeQps > kCombineBarrierMarkerTotal) {
-    throw std::runtime_error("mori ep internode v2: numQpPerPe " + std::to_string(activeQps) +
-                             " must be in [1, " + std::to_string(kCombineBarrierMarkerTotal) + "]");
-  }
-  // Same bound for the drain count, which covers every count the op may send
-  // on; 0 means numQpPerPe.
-  const int drainQps = cfg.kernelCfg.numQpToDrain;
-  if (drainQps < 0 || drainQps > kCombineBarrierMarkerTotal) {
-    throw std::runtime_error("mori ep internode v2: numQpToDrain " + std::to_string(drainQps) +
-                             " must be in [0, " + std::to_string(kCombineBarrierMarkerTotal) + "]");
-  }
-
   if (!EpInterNodeKernelCfgIsValid(cfg.kernelCfg)) {
     throw std::runtime_error(
         "mori ep internode v2: unusable config " + Render(cfg.kernelCfg) +
-        "; every divisor must be positive and worldSize must be a multiple of gpuPerNode");
+        "; every divisor must be positive, worldSize a multiple of gpuPerNode, and "
+        "numQpPerPe / numQpToDrain within [1, " +
+        std::to_string(kCombineBarrierMarkerTotal) + "] / [0, " +
+        std::to_string(kCombineBarrierMarkerTotal) + "]");
   }
 
   if (cfg.asyncLlMode < 0 || cfg.asyncLlMode > 2) {

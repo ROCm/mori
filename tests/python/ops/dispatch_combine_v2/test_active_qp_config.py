@@ -135,14 +135,6 @@ def test_override_is_set_and_cleared():
     assert op._active_qps_override is None
 
 
-def test_allocation_is_capped_by_the_combine_marker_total():
-    # QP 0 carries the remainder of a fixed per-combine total (64), so a kernel
-    # can send on at most 64 QPs and allocating more cannot help.
-    assert config(num_qp_per_pe=64).num_qp_per_pe == 64
-    with pytest.raises(ValueError, match="num_qp_per_pe"):
-        config(num_qp_per_pe=65)
-
-
 @pytest.mark.parametrize(
     "raw,expected",
     [("64,32,8", (64, 32, 8, 2)), ("64, 32, 8, 4", (64, 32, 8, 4))],
@@ -324,6 +316,35 @@ def test_every_launch_key_is_built(tables, monkeypatch, family, selectable):
     assert {plan.request["numQpToDrain"] for plan in op._plans} == {expected_drain}
     # And the kernels carry each phase's own count; untuned buckets default to 2.
     assert {plan.request["numQpPerPe"] for plan in op._plans} >= {1, 4, 2}
+
+
+@pytest.mark.parametrize("capacity,expected", [(64, 2), (65, 4), (128, 4)])
+def test_drain_skips_buckets_above_the_capacity(
+    tables, monkeypatch, capacity, expected
+):
+    # The largest count sits in a bucket a 64-token op never launches (the
+    # internode capacity rounds up to a multiple of 64).
+    rules = (
+        [(64, 80, 40, 4, 1), (128, 80, 48, 8, 4)],
+        [(64, 80, 40, 4, 2), (128, 64, 48, 6, 4)],
+    )
+    write_tables(tables, "InterNodeV2", *rules)
+    tuning._V2_RULES_CACHE.clear()
+    cfg = config(internode_kernel="v2", max_num_inp_token_per_rank=capacity)
+    op = build(monkeypatch, cfg)
+    assert {plan.request["numQpToDrain"] for plan in op._plans} == {expected}
+
+
+@pytest.mark.parametrize(
+    "allocated,active,expected", [(8, None, 2), (1, None, 1), (8, 4, 4)]
+)
+def test_asyncll_sends_on_the_resolved_active_count(allocated, active, expected):
+    cfg = config(async_ll=True, num_qp_per_pe=allocated, active_qps=active)
+    op = object.__new__(EpDispatchCombineOpHip)
+    op._multi_processor_count = 80
+    op._asyncll_mode = 0
+    op._asyncll_fused_ctas = 0
+    assert op._asyncll_request(cfg, "bf16", 32, 4)["numQpPerPe"] == expected
 
 
 def test_launch_uses_the_override_then_the_bucket_count(tables, monkeypatch):

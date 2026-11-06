@@ -129,18 +129,9 @@ inline std::string RenderValue(EpInterNodeDType dtype) {
   }
 }
 
-// What one combine adds to each peer's cross-device barrier slot, whatever the
-// number of QPs it sent on. Every active QP carries one marker, ordered behind
-// that QP's data by the RC responder, and the markers of one combine sum to this
-// constant: QP 0 carries the remainder, every other QP carries 1. Each marker is
-// positive, so the slot reaching epoch * total means every marker has landed.
-//
-// The total must not depend on the active count. Dispatch and combine pick their
-// counts independently, per rank, from each rank's own token count -- ragged
-// batches put different ranks in different buckets -- and a receiver has no way
-// to learn how many QPs its peer used. A per-count target (epoch * active) makes
-// any disagreement an exact-equality wait that never finishes. It also bounds
-// the active count: QP 0's marker must stay positive.
+// Sum of one combine's barrier markers to a peer: QP 0 adds the remainder, every
+// other active QP adds 1. Fixed, so peers with different active counts still meet
+// at epoch * total; it also caps the active count.
 inline constexpr int kCombineBarrierMarkerTotal = 64;
 
 // ---------------------------------------------------------------------------
@@ -184,16 +175,10 @@ struct EpInterNodeKernelCfg {
   int numExpertPerToken{2};
   int maxTotalRecvTokens{0};
   int gpuPerNode{8};
-  // How many of the DevComm's allocated QPs this kernel sends on: QPs
-  // [0, numQpPerPe). Chosen per phase and per token bucket, and free to differ
-  // between ranks. Never use it as the endpoint-array stride; that is the
-  // allocation count, which CCO owns (ccoDevComm::ibgda.numQpPerPe).
+  // Active QPs [0, numQpPerPe) this kernel sends on; the allocation is
+  // ccoDevComm::ibgda.numQpPerPe.
   int numQpPerPe{1};
-  // How many QPs DispatchSync drains: every QP any kernel of this op may send
-  // on, which can exceed this kernel's own numQpPerPe -- a combine may use more
-  // QPs than the dispatch that follows it, and nothing else polls them. Flushing a QP
-  // that never carries traffic is not free, so this is the op's largest active
-  // count, not the allocation. 0 means numQpPerPe.
+  // QPs DispatchSync drains: the op's largest active count (0 = numQpPerPe).
   int numQpToDrain{0};
   EpQuantType quantType{EpQuantType::None};
   // Ordinary-v2 combine only: gather with load-first peer reads. Chosen per
