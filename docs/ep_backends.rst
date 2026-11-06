@@ -6,6 +6,11 @@ They have different configuration objects and initialization requirements.
 Keep an existing deployment on its tested API unless you are explicitly
 evaluating a migration.
 
+On gfx1201, the existing ``mori.ops`` API has an opt-in, single-node EP2/EP4
+transport for BF16/FP16 and top-k 1 through 64. See :doc:`rdna4_ep` for its
+configuration, restrictions and validation commands. This transport requires
+``MORI_RDNA4_EP=1``; architecture detection alone does not enable it.
+
 .. list-table:: EP paths in the development source
    :header-rows: 1
    :widths: 20 20 30 30

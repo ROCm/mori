@@ -2,6 +2,48 @@
 #include "src/ops/kernels/ep_common.hip"
 MORI_DEFINE_GPU_STATES
 
+#if defined(__gfx1201__)
+#include "src/ops/dispatch_combine/intranode_ep2.hpp"
+#include "src/ops/dispatch_combine/intranode_ep4.hpp"
+
+WRAP(EpDispatchIntraNodeEp4HybridKernel, bf16, hip_bfloat16)
+WRAP(EpCombineIntraNodeEp4PushKernel, bf16, hip_bfloat16)
+WRAP_BOOL(EpCombineIntraNodeEp4PushKernel, bf16_tile512, hip_bfloat16, 512)
+WRAP_BOOL(EpCombineIntraNodeEp4PushKernel, bf16_tile1024, hip_bfloat16, 1024)
+WRAP(EpDispatchIntraNodeEp2PushKernel, bf16, hip_bfloat16)
+WRAP_BOOL2(EpDispatchIntraNodeEp2PushKernel, bf16_small_v2, hip_bfloat16, true, true)
+WRAP_BOOL2(EpDispatchIntraNodeEp2PushKernel, bf16_small_v2_compat, hip_bfloat16, true, false)
+WRAP(EpCombineIntraNodeEp2Kernel, bf16_push, hip_bfloat16)
+WRAP_BOOL2(EpCombineIntraNodeEp2Kernel, bf16_push_small_v2_512, hip_bfloat16, true, 512)
+WRAP_BOOL2(EpCombineIntraNodeEp2Kernel, bf16_push_small_v2_1024, hip_bfloat16, true, 1024)
+WRAP(EpDispatchIntraNodeEp4HybridKernel, fp16, __half)
+WRAP(EpCombineIntraNodeEp4PushKernel, fp16, __half)
+WRAP_BOOL(EpCombineIntraNodeEp4PushKernel, fp16_tile512, __half, 512)
+WRAP_BOOL(EpCombineIntraNodeEp4PushKernel, fp16_tile1024, __half, 1024)
+WRAP(EpDispatchIntraNodeEp2PushKernel, fp16, __half)
+WRAP_BOOL2(EpDispatchIntraNodeEp2PushKernel, fp16_small_v2, __half, true, true)
+WRAP_BOOL2(EpDispatchIntraNodeEp2PushKernel, fp16_small_v2_compat, __half, true, false)
+WRAP(EpCombineIntraNodeEp2Kernel, fp16_push, __half)
+WRAP_BOOL2(EpCombineIntraNodeEp2Kernel, fp16_push_small_v2_512, __half, true, 512)
+WRAP_BOOL2(EpCombineIntraNodeEp2Kernel, fp16_push_small_v2_1024, __half, true, 1024)
+
+// Runtime top-k (1..64), separate from the measured top-8 instantiations.
+#define WRAP_RDNA4_TOPK(sfx, T)                                                               \
+  WRAP_BOOL(EpDispatchIntraNodeEp4HybridKernel, sfx##_topk, T, 0)                              \
+  WRAP_BOOL2(EpCombineIntraNodeEp4PushKernel, sfx##_topk, T, 0, 0)                             \
+  WRAP_BOOL2(EpCombineIntraNodeEp4PushKernel, sfx##_topk_tile512, T, 512, 0)                    \
+  WRAP_BOOL2(EpCombineIntraNodeEp4PushKernel, sfx##_topk_tile1024, T, 1024, 0)                  \
+  WRAP_BOOL3(EpDispatchIntraNodeEp2PushKernel, sfx##_topk, T, false, false, 0)                  \
+  WRAP_BOOL3(EpDispatchIntraNodeEp2PushKernel, sfx##_topk_small_v2, T, true, true, 0)            \
+  WRAP_BOOL3(EpDispatchIntraNodeEp2PushKernel, sfx##_topk_small_v2_compat, T, true, false, 0)     \
+  WRAP_BOOL3(EpCombineIntraNodeEp2Kernel, sfx##_topk_push, T, false, 512, 0)                    \
+  WRAP_BOOL3(EpCombineIntraNodeEp2Kernel, sfx##_topk_push_small_v2_512, T, true, 512, 0)          \
+  WRAP_BOOL3(EpCombineIntraNodeEp2Kernel, sfx##_topk_push_small_v2_1024, T, true, 1024, 0)
+WRAP_RDNA4_TOPK(bf16, hip_bfloat16)
+WRAP_RDNA4_TOPK(fp16, __half)
+#undef WRAP_RDNA4_TOPK
+#endif
+
 // Dispatch (block-local exact count + one remote fetch_add(N) per destPe + local slot
 // distribution). _ENTRY because the body behind this symbol depends on the architecture:
 // EpDispatchIntraNodeKernel_entry in intranode_entry.hpp picks it. Same for combine below.

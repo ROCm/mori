@@ -131,6 +131,7 @@ def _init_torch_dtype_map():
     _TORCH_DTYPE_TO_INT = {
         torch.float32: 0,
         torch.bfloat16: 1,
+        torch.float16: 6,
         torch.int32: 4,
     }
     if hasattr(torch, "float8_e4m3fn"):

@@ -19,7 +19,7 @@
 
 include_guard(GLOBAL)
 
-set(_MORI_SUPPORTED_ARCHS "gfx942;gfx950")
+set(_MORI_SUPPORTED_ARCHS "gfx942;gfx950;gfx1201")
 
 set(MORI_IONIC_CCQE
     "AUTO"
