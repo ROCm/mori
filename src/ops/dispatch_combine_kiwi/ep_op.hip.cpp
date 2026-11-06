@@ -125,7 +125,11 @@ ep_op_t::ep_op_t(const ep_op_config_t& config,
 }
 
 ep_op_t::~ep_op_t() {
-  if (ctx_) ctx_->join_proxy_threads();
+  if (!ctx_) return;
+  // dispatch/combine are enqueued on caller streams; drain them before the
+  // proxies stop, or their last posts are never sent.
+  (void)hipDeviceSynchronize();
+  ctx_->join_proxy_threads();
 }
 
 void ep_op_t::dispatch(const void* input, const float* weights, const void* scales,
