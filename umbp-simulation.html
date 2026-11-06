@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>UMBP storage and transfer simulation &mdash; MORI development (bd2e2434) documentation</title>
+  <title>UMBP storage and transfer simulation &mdash; MORI development (f24c13b3) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=0f3f2866"></script>
+      <script src="_static/documentation_options.js?v=71f6c039"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -557,7 +557,7 @@ tier policies and control RPCs. Payload storage/transfers are virtual; sim is of
 <span class="n">client</span><span class="o">.</span><span class="n">get_into_ptr</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>With <code class="docutils literal notranslate"><span class="pre">UMBPConfig.from_environment()</span></code>, the equivalent settings are <code class="docutils literal notranslate"><span class="pre">UMBP_SIM_ENABLE=1</span></code>,
+<p><code class="docutils literal notranslate"><span class="pre">UMBPConfig()</span></code> reads the equivalent settings from <code class="docutils literal notranslate"><span class="pre">UMBP_SIM_ENABLE=1</span></code>,
 <code class="docutils literal notranslate"><span class="pre">UMBP_SIM_PROFILE=/path/to/profile.json</span></code> and <code class="docutils literal notranslate"><span class="pre">UMBP_SIM_TRACE=/tmp/umbp-worker-0.jsonl</span></code>.
 Existing APIs and return types remain available. Use a separate trace file per client/run.
 DRAM, HBM and file-backed SSD tiers are supported. Embedded mode defaults to DRAM;
