@@ -68,15 +68,3 @@ class queue_error : public std::runtime_error {
       throw kiwi::queue::queue_error(std::string(#call) + " failed: " + hipGetErrorString(err_)); \
     }                                                                                             \
   } while (0)
-
-// Check HIP call in noexcept context (destructors, cleanup paths).
-// Asserts in debug, logs to stderr in release.
-#define HIP_CHECK_NOEXCEPT(call)                                                                  \
-  do {                                                                                            \
-    hipError_t err_ = (call);                                                                     \
-    if (err_ != hipSuccess) {                                                                     \
-      fprintf(stderr, "queue: %s failed: %s (%s:%d)\n", #call, hipGetErrorString(err_), __FILE__, \
-              __LINE__);                                                                          \
-      assert(err_ == hipSuccess && #call " failed");                                              \
-    }                                                                                             \
-  } while (0)

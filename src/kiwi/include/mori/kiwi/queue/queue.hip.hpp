@@ -26,9 +26,6 @@
  * Forward-declares the primary Queue template and provides canonical
  * type aliases. Include the specialization headers for full definitions:
  *   - device_to_host_queue.hip.hpp       ->  Queue<DeviceToHost, SPSC>
- *   - mpsc_device_to_host_queue.hip.hpp  ->  Queue<DeviceToHost, MPSC>
- *   - host_to_device_queue.hip.hpp       ->  Queue<HostToDevice, SPSC>
- *   - mpmc_host_to_device_queue.hip.hpp  ->  Queue<HostToDevice, MPMC>
  */
 
 #pragma once
@@ -54,8 +51,5 @@ class Queue;
 
 /// Canonical aliases
 using SPSCD2HQueue = Queue<Direction::DeviceToHost, Concurrency::SPSC>;
-using MPSCD2HQueue = Queue<Direction::DeviceToHost, Concurrency::MPSC>;
-using SPSCH2DQueue = Queue<Direction::HostToDevice, Concurrency::SPSC>;
-using MPMCH2DQueue = Queue<Direction::HostToDevice, Concurrency::MPMC>;
 
 }  // namespace mori::kiwi::queue

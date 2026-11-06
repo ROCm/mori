@@ -23,7 +23,7 @@
  * @file chunk_consumer.hpp
  * @brief Host consumer side of the device-to-host chunk format (private)
  *
- * Used by the host consumer of the SPSC and MPSC device-to-host queues.
+ * Used by the host consumer of the SPSC device-to-host queue.
  */
 
 #pragma once

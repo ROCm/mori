@@ -29,9 +29,6 @@ set(CMAKE_HIP_ARCHITECTURES "${MORI_KIWI_HIP_ARCHITECTURES}")
 
 set(MORI_KIWI_SOURCES
     queue/device_to_host_queue.cpp
-    queue/mpsc_device_to_host_queue.cpp
-    queue/host_to_device_queue.cpp
-    queue/mpmc_host_to_device_queue.cpp
     queue/host_memory.cpp
     topology/topology.cpp)
 set_source_files_properties(${MORI_KIWI_SOURCES} PROPERTIES LANGUAGE HIP)

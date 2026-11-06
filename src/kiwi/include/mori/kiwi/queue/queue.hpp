@@ -27,14 +27,11 @@
  * control-message transport between AMD GPUs and the host CPU.
  *
  * Features:
- * - Device-to-host and host-to-device queues
- * - SPSC queues in both directions, an MPSC device-to-host queue and an
- *   MPMC host-to-device queue
+ * - An SPSC device-to-host queue
  * - Device-to-host: 16-byte chunks per lane, each two halves of 4 B payload
  *   + 4 B signal (LL8),
  *   messages of up to 512 bytes plus 32-bit metadata, and one push API
  *   (push_reg, push_shared, push_global, push_lanes)
- * - Host-to-device: 64-byte wave-slots (56-byte payload in lanes 0-6)
  * - Full-wavefront (64 threads) cooperative device-side operations
  * - Lap epochs instead of clearing; cached producer/consumer progress to
  *   reduce PCIe traffic
@@ -73,11 +70,7 @@
 // Core headers
 #include "device_to_host_queue.hip.hpp"
 #include "error.hpp"
-#include "host_to_device_queue.hip.hpp"
-#include "mpmc_host_to_device_queue.hip.hpp"
-#include "mpsc_device_to_host_queue.hip.hpp"
 #include "queue.hip.hpp"
-#include "slot.hip.hpp"
 
 /**
  * @namespace kiwi::queue
