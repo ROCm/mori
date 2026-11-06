@@ -114,6 +114,15 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
     MORI_UMBP_INFO("[PeerPool] a lookup holds the eviction-class-1 keys it finds for {} ms",
                    low_class_lookup_hold_.count());
   }
+  if (backends_ != nullptr) {
+    uint64_t keys = 0;
+    for (uint32_t id = 0; id < BackendRegistry::kMaxBackends; ++id) {
+      auto* backend = backends_->Get(id);
+      if (backend == nullptr || backend->Tier() == TierType::SSD) continue;
+      keys += KeyIndexReserve(backend->Capacity().total_bytes, backend->PageSize());
+    }
+    placements_.reserve(keys);
+  }
   if (tier_graph_ != nullptr) {
     // A tier graph without an engine would accept offload and promotion rules
     // and then silently fail every one of them, leaving the topology looking
