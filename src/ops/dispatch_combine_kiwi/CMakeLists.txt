@@ -35,7 +35,9 @@ if(BUILD_PYBINDS)
       OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
   endif()
   set(Python_EXECUTABLE ${PYTHON_EXECUTABLE})
-  find_package(Python REQUIRED COMPONENTS Interpreter Development)
+  # Development.Module, not Development: the module never links libpython, and
+  # the manylinux interpreters the published wheels are built with do not ship one.
+  find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
   execute_process(
     COMMAND ${Python_EXECUTABLE} -c "import pybind11; print(pybind11.get_include())"
     OUTPUT_VARIABLE MORI_KIWI_PYBIND11_INCLUDE_DIR
