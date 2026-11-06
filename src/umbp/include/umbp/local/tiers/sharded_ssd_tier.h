@@ -81,6 +81,7 @@ class ShardedSsdTier : public TierBackend {
   // The fullest drive's order first, then the next fullest: the drive closest
   // to full is the one that has to give space back.
   std::vector<EvictionHint> EvictionOrder(size_t max_keys) override;
+  void Touch(const std::vector<std::string>& keys) override;
   void SetRetiredFileHook(std::function<void(int fd)> on_close,
                           std::chrono::milliseconds grace) override;
   TierSpaceStats SpaceStats() const override;
