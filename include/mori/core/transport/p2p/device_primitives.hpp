@@ -272,10 +272,9 @@ inline __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {
   }
 }
 
-template <typename T, int Unroll>
+template <typename T, int Unroll, int VecBytes = 16>
 inline __device__ void WarpCopyImpl(T* __restrict__ dst, const T* __restrict__ src, size_t& offset,
                                     size_t nelems) {
-  constexpr int VecBytes = 16;
   constexpr int vecSize = VecBytes / sizeof(T);
   int laneId = threadIdx.x & (warpSize - 1);
   using DataType = typename VecTypeSelector<VecBytes>::dataType;
@@ -298,6 +297,16 @@ inline __device__ void WarpCopyImpl(T* __restrict__ dst, const T* __restrict__ s
   }
 }
 
+template <typename T, int VecBytes>
+inline __device__ void WarpCopyNarrow(T* __restrict__ dst, const T* __restrict__ src,
+                                      size_t& offset, size_t nelems) {
+  if constexpr ((sizeof(T) < VecBytes) && ((VecBytes % sizeof(T)) == 0)) {
+    const uintptr_t addr =
+        reinterpret_cast<uintptr_t>(dst + offset) | reinterpret_cast<uintptr_t>(src + offset);
+    if ((addr % VecBytes) == 0) WarpCopyImpl<T, 1, VecBytes>(dst, src, offset, nelems);
+  }
+}
+
 template <typename T, int Unroll = 1>
 inline __device__ void WarpCopy(T* __restrict__ dst, const T* __restrict__ src, size_t nelems) {
   int laneId = threadIdx.x & (warpSize - 1);
@@ -307,6 +316,12 @@ inline __device__ void WarpCopy(T* __restrict__ dst, const T* __restrict__ src, 
   if constexpr (Unroll > 1) {
     WarpCopyImpl<T, 1>(dst, src, offset, nelems);
   }
+  // Less than one 16 B vector per lane is left, which the element loop would write
+  // one element per lane per pass, a byte at a time for 1-byte types. The narrower
+  // passes only run on pointers aligned to their width.
+  WarpCopyNarrow<T, 8>(dst, src, offset, nelems);
+  WarpCopyNarrow<T, 4>(dst, src, offset, nelems);
+  WarpCopyNarrow<T, 2>(dst, src, offset, nelems);
 
   offset += laneId;
   while (offset < nelems) {
@@ -476,6 +491,12 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
 
   constexpr int vecSize = VecBytes / sizeof(T);
+  // With 4 and 8 B vectors a batch's loads are all issued before any of them is
+  // accumulated, so a count without a case of its own keeps up to 8 peer reads in
+  // flight instead of one, at the AccumNum=8 case's footprint. 16 B vectors load one
+  // source at a time: batching them here took the topk-9 LL combine gather from
+  // 82-94 to 123-128 VGPRs, with spills, and 5-6% slower above T512.
+  constexpr int kLoadBatch = 8;
   const int laneId = threadIdx.x & (warpSize - 1);
   size_t offset = 0;
 
@@ -488,14 +509,34 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
 
   for (size_t iter = 0; iter < numIters; ++iter) {
     AccumFp32Type accumValFp32[vecSize] = {AccumFp32Type{0}};
+    if constexpr (VecBytes <= 8) {
+      for (size_t first = 0; first < accumNum; first += kLoadBatch) {
+        DataType srcVals[kLoadBatch];
 #pragma unroll
-    for (int i = 0; i < accumNum; ++i) {
-      if (srcs[i] == nullptr) continue;
-      DataType srcVal = load<VecBytes>(srcs[i] + offset + laneOffset);
-      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+        for (int i = 0; i < kLoadBatch; ++i) {
+          if ((first + i < accumNum) && (srcs[first + i] != nullptr))
+            srcVals[i] = load<VecBytes>(srcs[first + i] + offset + laneOffset);
+        }
 #pragma unroll
-      for (int j = 0; j < vecSize; ++j) {
-        accumValFp32[j] += AccumFp32Type(reinterpret_cast<const T*>(&srcVal)[j]) * srcScale;
+        for (int i = 0; i < kLoadBatch; ++i) {
+          if ((first + i >= accumNum) || (srcs[first + i] == nullptr)) continue;
+          float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[first + i];
+#pragma unroll
+          for (int j = 0; j < vecSize; ++j) {
+            accumValFp32[j] += AccumFp32Type(reinterpret_cast<const T*>(&srcVals[i])[j]) * srcScale;
+          }
+        }
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < accumNum; ++i) {
+        if (srcs[i] == nullptr) continue;
+        DataType srcVal = load<VecBytes>(srcs[i] + offset + laneOffset);
+        float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+#pragma unroll
+        for (int j = 0; j < vecSize; ++j) {
+          accumValFp32[j] += AccumFp32Type(reinterpret_cast<const T*>(&srcVal)[j]) * srcScale;
+        }
       }
     }
 
@@ -778,6 +819,14 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
     WARP_ACCUM_CASE(8)
     WARP_ACCUM_CASE(10)
     default:
+      // 9 (topk 8 plus a fused shared expert) only with narrow vectors, for the
+      // register reason WarpAccumDynamic batches only narrow vectors.
+      if constexpr (VecBytes <= 8) {
+        if (accumNum == 9) {
+          WarpAccum<T, VecBytes, 9, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems);
+          break;
+        }
+      }
       WarpAccumDynamic<T, VecBytes>(dest, srcs, srcScales, accumNum, nelems);
       break;
   }
@@ -879,6 +928,12 @@ __forceinline__ __device__ void WarpAccumLF(T* __restrict__ dest, T* const* __re
     WARP_ACCUM_LF_CASE(8)
     WARP_ACCUM_LF_CASE(10)
     default:
+      if constexpr (VecBytes <= 8) {
+        if (accumNum == 9) {
+          WarpAccumLFImpl<T, VecBytes, 9, Unroll>(dest, srcs, srcScales, offset, nelems);
+          break;
+        }
+      }
       WarpAccumDynamic<T, VecBytes>(dest, srcs, srcScales, accumNum, nelems);
       return;
   }

@@ -129,6 +129,11 @@ inline std::string RenderValue(EpInterNodeDType dtype) {
   }
 }
 
+// Sum of one combine's barrier markers to a peer: QP 0 adds the remainder, every
+// other active QP adds 1. Fixed, so peers with different active counts still meet
+// at epoch * total; it also caps the active count.
+inline constexpr int kCombineBarrierMarkerTotal = 64;
+
 // ---------------------------------------------------------------------------
 // The part of EpDispatchCombineConfig the kernel is specialised on -- what gets
 // rendered into the TU, the way EpCfg is for the intranode pair. The generated
@@ -152,6 +157,10 @@ inline std::string RenderValue(EpInterNodeDType dtype) {
 //   header, because the kernel reads its grid from gridDim/blockDim rather than
 //   from kConfig. See the note there.
 //
+// Three fields are not shape: numQpPerPe (the active QP count) and
+// combineLoadFirst are chosen per token bucket from the tuning table, and
+// numQpToDrain is the op's largest active count.
+//
 // Defaults mirror EpDispatchCombineConfig's, except worldSize: 0 there means
 // "not filled in yet", which is nothing that can be compiled for.
 // ---------------------------------------------------------------------------
@@ -166,8 +175,16 @@ struct EpInterNodeKernelCfg {
   int numExpertPerToken{2};
   int maxTotalRecvTokens{0};
   int gpuPerNode{8};
+  // Active QPs [0, numQpPerPe) this kernel sends on; the allocation is
+  // ccoDevComm::ibgda.numQpPerPe.
   int numQpPerPe{1};
+  // QPs DispatchSync drains: the op's largest active count (0 = numQpPerPe).
+  int numQpToDrain{0};
   EpQuantType quantType{EpQuantType::None};
+  // Ordinary-v2 combine only: gather with load-first peer reads. Chosen per
+  // token bucket by the tuning table (combine_load_first), so it is part of the
+  // compiled identity; every other pass is built with the default.
+  bool combineLoadFirst{false};
 };
 
 // The device-side config the bodies read: purely the compiled-in shape, so the
@@ -203,12 +220,14 @@ inline void VisitFields(Self& cfg, const EpInterNodeKernelCfg& defaults, Visit&&
   MORI_FIELD(maxTotalRecvTokens);
   MORI_FIELD(gpuPerNode);
   MORI_FIELD(numQpPerPe);
+  MORI_FIELD(numQpToDrain);
   MORI_FIELD(quantType);
+  MORI_FIELD(combineLoadFirst);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeKernelCfg, 12,
+    EpInterNodeKernelCfg, 14,
     "added an EpInterNodeKernelCfg field -- update VisitFields(EpInterNodeKernelCfg) "
     "too, or the kernel silently compiles against its default");
 
@@ -234,8 +253,10 @@ inline std::string RenderValue(const EpInterNodeKernelCfg& cfg) { return Render(
 // diagnoses back to the caller that built it wrong.
 inline bool EpInterNodeKernelCfgIsValid(const EpInterNodeKernelCfg& cfg) {
   return cfg.worldSize > 0 && cfg.gpuPerNode > 0 && cfg.numQpPerPe > 0 &&
-         cfg.numExpertPerRank > 0 && cfg.numExpertPerToken > 0 && cfg.maxNumInpTokenPerRank > 0 &&
-         cfg.hiddenDim > 0 && (cfg.worldSize % cfg.gpuPerNode) == 0;
+         cfg.numQpPerPe <= kCombineBarrierMarkerTotal && cfg.numQpToDrain >= 0 &&
+         cfg.numQpToDrain <= kCombineBarrierMarkerTotal && cfg.numExpertPerRank > 0 &&
+         cfg.numExpertPerToken > 0 && cfg.maxNumInpTokenPerRank > 0 && cfg.hiddenDim > 0 &&
+         (cfg.worldSize % cfg.gpuPerNode) == 0;
 }
 
 // The args schema, in the form plan_api publishes.

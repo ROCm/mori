@@ -134,7 +134,9 @@ def main():
             inp = inp * INSCALE
         inp = inp.to(DTYPE).to(dev)
     if NOSELF:
-        idx = torch.randint(0, num_experts - EPR, (M, K), generator=g, dtype=torch.int32)
+        idx = torch.randint(
+            0, num_experts - EPR, (M, K), generator=g, dtype=torch.int32
+        )
         idx += (idx >= rank * EPR).to(torch.int32) * EPR
     else:
         idx = torch.randint(0, num_experts, (M, K), generator=g, dtype=torch.int32)
