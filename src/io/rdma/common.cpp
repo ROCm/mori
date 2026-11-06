@@ -1069,7 +1069,16 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     }
 
     bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
-    bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
+    // Signal when this EP's next batch would not fit beside its unsignaled WRs:
+    // only a completion releases their depth, so its reservation could never
+    // succeed. maxSqDepth need not be a multiple of postBatchSize.
+    const size_t nextSt = static_cast<size_t>(i + epNum) * postBatchSize;
+    const int nextBatchWrNum =
+        isLastBatchForEp
+            ? 0
+            : static_cast<int>(std::min<size_t>(postBatchSize, mergedWrCount - nextSt));
+    bool sqNearFull =
+        eps[epId].sqDepth && (epWrsSinceSignal[epId] + nextBatchWrNum > eps[epId].maxSqDepth);
     bool needSignal = isLastBatchForEp || sqNearFull;
 
     struct ibv_send_wr& last = mergedWrs[end - 1].wr;
