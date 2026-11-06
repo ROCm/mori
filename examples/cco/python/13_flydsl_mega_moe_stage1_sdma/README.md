@@ -117,6 +117,51 @@ Milliseconds, CUDA graph, median of 30 replays, bit-exact. fixed-slot wins at 25
 (fixed-slot was not measured there). The 1.40x at 256 in the first table is against compact
 alone; against fixed-slot the same point is 1.19x.
 
+### Publishing tiles in readiness order, and coalescing the quant stores (2026-11-06)
+
+Two changes on top of the numbers above, both bit-exact, both off by default:
+
+**`--ready-first` -- a scheduler wave instead of a per-tile gate.** GEMM1 used to gate every
+tile on the SDMA signals itself (`need[source][expert]` vs the signal level, once per tile, by
+`gate_npes` lanes). Now wave 0 of the comm workgroup reads each source's signal level ONCE per
+round and publishes m-tiles into a ready queue in the order they become ready; a worker claims a
+ticket with one `atomic_add` and reads the queue. Workers never touch the signals. Needs
+`--fuse-layout` (the scheduler starts when the layout in the same kernel is done).
+
+**`--quant-lds-store` -- one contiguous 16 B per lane.** The quantised row used to leave each
+lane as TWO 16-byte pieces 32 bytes apart, so every store instruction covered half of each 128 B
+line of an *uncached* (write-through) window. A wave now stages its round of 64 groups in LDS
+(2304 B per wave) and reads it back so that each lane stores ONE contiguous 16 B: 1024
+contiguous bytes per wave instruction, and the e8m0 scales packed 4 per dword. Same bytes, same
+cache modifier. `row_bytes` (5280 for Flash) is not 128 B aligned, so this buys contiguity, not
+alignment. ROCm/mori#904 measured the same change at 3.1x on its own dispatch.
+
+Flash, 8x MI355X, CUDA graph, interleaved A/B, 3 reps, medians of 30 replays, every run checked
+bit-exact. "base" is the 3-kernel path of the table above, "C1" is
+`--own-tokens --fuse-layout --ready-first`:
+
+| tokens/rank | base | C1 | C1 + `--quant-lds-store` | aiter compact | vs aiter |
+|---|---|---|---|---|---|
+| 256 | 0.218 | 0.222 | not measured | 0.344 | 1.55x (base) |
+| 512 | 0.270 | 0.260 | not measured | 0.376 | 1.45x |
+| 1024 | 0.389 | 0.354 | **0.345** | 0.463 | **1.34x** |
+| 2048 | 0.586 | 0.505 | **0.485** | 0.670 | **1.38x** |
+| 4096 | 0.845 | 0.811 | **0.778** | 0.910 | **1.17x** |
+| 8192 | 1.541 | 1.479 | not measured | 1.536 | 1.04x |
+
+At 256 the scheduler is a small loss (the first publish waits for the layout and for the slowest
+peer's first chunk, which no reordering shortens); use `--own-tokens` alone there. The store
+swizzle is what moved `prepare` at bs 4096 from 114.3 us to 73.4 us (quant pass 1: 54.3 -> 29.7).
+
+Where the time goes at bs 2048 under C1 (`--trace`, us from the prepare kernel's start, median
+over 8 ranks): prepare 74 (plan 22, staging 11, quant pass 1 36) -> early put 72 -> layout
+79..115 -> scheduler sees the layout done at 120, one round costs 8 -> the peers' first chunks
+are seen landing 116..135 -> **first m-tile published 140-157** -> every worker has started
+within 3 us -> all 215 m-tiles published by 240 -> workers end at ~508, of which 354 us is
+`do_tile` and only 5 us is queue wait. So the tile loop is compute-bound, and the front end is
+gated by the slowest peer's first chunk (put -> landing is 70-85 us, of which ~28 us is the wire
+time for 1.35 MB).
+
 ### What the cache operations cost
 
 Most of the gain above came from counting `buffer_wbl2` (whole-L2 writeback) and `buffer_inv`
@@ -135,6 +180,37 @@ the 8 peers (scount store + flag bump = 16 sequential trips, ~10 us); one lane p
 is ~2.5 us. Packing its four 4 B stores into one 16 B store changed nothing and was dropped.
 
 ### Measured and not kept
+
+* **Fusing the prepare into GEMM1** (`--fuse-prepare`, one launch per call): +-1% everywhere
+  (bs 1024 +10 us, bs 4096 -9 us). In a CUDA graph the launch gap is already ~0, and the fused
+  kernel has to add grid rendezvous of its own. The GEMM hot loop is byte-identical in the ISA
+  (1178 instructions, 64 MFMA, 226 VGPR, no spills) with and without the fusion, and
+  `amdgpu-disable-unclustered-high-rp-reschedule` changes nothing here.
+* **A dynamic, arrival-ordered layout** (a scheduler block that composes tiles from rows as they
+  land, with a per-expert ring): works and is bit-exact, but 90 us behind at bs 2048 even after
+  multi-pass quant and expert-group bucketing.
+* **local-first rows** (each expert's rows ordered by source, this rank first, with a per-tile
+  `tsrc` so a tile waits only for the sources it holds) and **arrival-order** (the same, ordered
+  by which peer's route flag arrived first): both publish the first tile 10-25 us earlier and
+  both end at the same time or later, because their tiles run ~4% slower. At EP8 an expert's
+  local rows are ~1/8 of a 64-row tile, so there is no local-only tile to run early.
+* **Layout on dedicated blocks** (`--layout-blocks 8/16/32`, overlapping the quant) and **layout
+  merged into the scheduler block**: +25 us and +90 us. The layout (32-36 us on 255 blocks) is
+  already hidden under the first chunk's landing, so making it earlier buys nothing.
+* **More quant blocks**: 511 blocks moves quant pass 1 from 55 to 41 us but the plan from 22 to
+  30 (atomic contention on the 384 histogram counters), net zero; 767 blocks deadlocks, since
+  only two 512-thread blocks fit per CU and the grid barrier needs them all resident.
+* **`--plan-blocks P`** (the plan on P = ceil(bs/512) blocks only, the rest waiting): plan 22 ->
+  19 but staging 15 -> 18, because the B2 rendezvous has to come back for every block.
+* `--unroll 2` is -3 us and `--unroll 4` is +7 us; `--quant-skip` (pass 1 skips the tokens with
+  no early row) is ~0 -- the quant is store-bound, not load-bound. Pre-building the early puts
+  and leaving only the doorbell (`aggregate` + `commit`), and `HSA_USERPTR_FOR_PAGED_MEM=0`,
+  are both 0.
+* **`--tile-n 256`** is 29% slower at bs 2048 and gives the per-tile fixed cost: 7.6 tiles per
+  worker x 46.8 us against 15.2 x 30.3 us, i.e. ~14 us per tile that does not depend on N (and
+  1.39 MB of B per tile in 14 us would need 25 TB/s, so the weight stream is mostly overlapped
+  with the MFMA). Fewer and bigger tiles are therefore better, which also rules out variable-M
+  tail tiles.
 
 * `--stream-group G` (prepare puts every chunk itself, a group of G chunks as soon as the quant
   pass that fills it is done; per-pass counters, no rendezvous): GLM-5.2 bs 16384 removes the
