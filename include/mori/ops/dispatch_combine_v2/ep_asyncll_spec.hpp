@@ -84,10 +84,10 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
 mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsyncLLKernel kind);
 
 // Grids that divide the work per destination rank must be an exact multiple of
-// worldSize: DispatchRecvCopy derives `blocksPerPe = gridDim.x / worldSize` and
-// then `destPe = blockIdx.x / blocksPerPe`, so a remainder leaves the tail blocks
-// decoding to a PE that does not exist. v1 aligns the same way at its launch
-// site (`mp - mp % worldSize`).
+// worldSize: the LSA transfer passes derive `destPe = globalWarpId /
+// (globalWarpNum / worldSize)`, so a remainder leaves the tail warps decoding to
+// a PE that does not exist. v1 aligns the same way at its launch site
+// (`mp - mp % worldSize`).
 constexpr int EpAsyncLLAlignGrid(int grid, int worldSize) {
   const int aligned = grid - (grid % worldSize);
   return aligned > 0 ? aligned : worldSize;
