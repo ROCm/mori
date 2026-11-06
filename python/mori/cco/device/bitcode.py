@@ -89,6 +89,7 @@ def _jit_compile(cov: int) -> str | None:
             _collect_include_dirs,
             _hipcc_device_bc,
             _strip_lifetime_intrinsics,
+            atomic_output,
             is_ccqe_enabled,
         )
 
@@ -136,14 +137,8 @@ def _jit_compile(cov: int) -> str | None:
                 _hipcc_device_bc(
                     cfg, wrapper, include_dirs, raw, cov=cov, extra_defines=sdma_define
                 )
-                # Waiters take bc_path as soon as it exists, and opt creates its
-                # output before writing it: build aside, then rename into place.
-                tmp_bc = cache_dir / f".{_BC_FILENAME}.{os.getpid()}.tmp"
-                try:
+                with atomic_output(bc_path) as tmp_bc:
                     _strip_lifetime_intrinsics(cfg, raw, tmp_bc)
-                    os.replace(tmp_bc, bc_path)
-                finally:
-                    tmp_bc.unlink(missing_ok=True)
         return str(bc_path)
     except Exception:
         return None

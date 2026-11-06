@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import os
@@ -94,6 +95,20 @@ class FileBaton:
             os.remove(self._lock_path)
         except OSError:
             pass
+
+
+@contextlib.contextmanager
+def atomic_output(path: str | Path):
+    """Yield a temp path renamed onto *path* on success: FileBaton waiters take
+    *wait_for* as soon as it exists, and compilers create their output before writing it.
+    """
+    path = Path(path)
+    tmp = path.with_name(f".{path.stem}.{os.getpid()}.tmp{path.suffix}")
+    try:
+        yield tmp
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _hipcc_device_bc(
@@ -445,7 +460,8 @@ def _build_bitcode(
         output.parent.mkdir(parents=True, exist_ok=True)
         import shutil
 
-        shutil.copy2(stripped_bc, output)
+        with atomic_output(output) as tmp_out:
+            shutil.copy2(stripped_bc, tmp_out)
 
     print(f"[mori-jit] Cached: {output}")
 
@@ -492,9 +508,9 @@ def _hipcc_genco(
 
     for d in include_dirs:
         cmd.extend(["-I", str(d)])
-    cmd.extend([str(source), "-o", str(output)])
-
-    subprocess.check_call(cmd, stderr=subprocess.STDOUT)
+    with atomic_output(output) as tmp_out:
+        cmd.extend([str(source), "-o", str(tmp_out)])
+        subprocess.check_call(cmd, stderr=subprocess.STDOUT)
 
 
 _PARALLEL_KERNEL_GROUPS: dict[str, list[str]] = {
