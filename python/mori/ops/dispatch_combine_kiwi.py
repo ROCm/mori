@@ -35,6 +35,9 @@ calling convention but is not a drop-in replacement:
   chooses its launch shape from the token count, or from ``num_blocks``.
 - ``combine()`` routes with the routing recorded by the preceding
   ``dispatch()``. Its ``indices`` argument is only shape-checked.
+- Ranks must be grouped by host: each host's ranks are contiguous and every
+  host has the same number of ranks. Construction aborts the process
+  otherwise, for every backend.
 
 The kernels push RDMA work to CPU proxy threads through KIWI invoke queues; the
 proxies post it with ibverbs. Setup runs over a torch.distributed process
@@ -210,8 +213,11 @@ class EpDispatchCombineKiwiOp:
     KIWI moves to MORI's transport):
         _num_proxy_threads: CPU threads posting RDMA work (one QP set each).
         _queue_capacity: invoke queue lines per queue (power of two).
-        _rcomp_backend: "auto", "rdma-only", or "hybrid" (HIP IPC for peers on
-            the same host).
+        _rcomp_backend: how token payloads reach peers on the same host.
+            "rdma-only" sends them over RDMA, "hybrid" writes them through
+            HIP IPC, and "auto" picks one per call from the token count.
+            Every backend still uses HIP IPC between same-host ranks for the
+            count all-to-all and the barrier.
         _device_name: RDMA device, e.g. "mlx5_0". Defaults to the NIC nearest
             the current GPU; ``MORI_KIWI_DEVICE_NAME`` overrides it.
     """
