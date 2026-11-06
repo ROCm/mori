@@ -3672,17 +3672,25 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // cache miss would report itself as a scratch-arena error.
   if (!HasMaster()) return results;
 
+  std::vector<std::optional<RouteGetResult>> routes;
   if (config_.direct_pool_get) {
     std::vector<std::string> route_keys;
     for (size_t i : missed) route_keys.push_back(keys[i]);
-    std::vector<std::optional<RouteGetResult>> routes;
-    if (RouteMissedRanges(route_keys, missed, preroutes, dbg ? &dbg->route : nullptr, &routes)) {
-      missed = ServeRangesFromDirectPool(keys, dsts, sizes, src_offsets, missed, routes, &results,
-                                         &remote_bytes);
-    } else {
+    if (!RouteMissedRanges(route_keys, missed, preroutes, dbg ? &dbg->route : nullptr, &routes)) {
       return results;
     }
-    if (missed.empty()) return results;
+    auto fallback = ServeRangesFromDirectPool(keys, dsts, sizes, src_offsets, missed, routes,
+                                              &results, &remote_bytes);
+    if (fallback.empty()) return results;
+    // Fallback keys retain missed order; compact their routes instead of routing again.
+    size_t kept = 0;
+    for (size_t r = 0; r < missed.size() && kept < fallback.size(); ++r) {
+      if (missed[r] != fallback[kept]) continue;
+      if (kept != r) routes[kept] = std::move(routes[r]);
+      ++kept;
+    }
+    routes.resize(fallback.size());
+    missed = std::move(fallback);
   }
 
   // ---- Phase 2: the rest, through the GET scratch arena ----
@@ -3736,12 +3744,13 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
 
   // Routing is a master RPC that never touches the arena, so it runs before a
   // shard is taken rather than holding every other arena user behind it.
-  std::vector<std::string> route_keys;
-  route_keys.reserve(missed.size());
-  for (size_t index : missed) route_keys.push_back(keys[index]);
-  std::vector<std::optional<RouteGetResult>> routes;
-  if (!RouteMissedRanges(route_keys, missed, preroutes, dbg ? &dbg->route : nullptr, &routes)) {
-    return results;
+  if (!config_.direct_pool_get) {
+    std::vector<std::string> route_keys;
+    route_keys.reserve(missed.size());
+    for (size_t index : missed) route_keys.push_back(keys[index]);
+    if (!RouteMissedRanges(route_keys, missed, preroutes, dbg ? &dbg->route : nullptr, &routes)) {
+      return results;
+    }
   }
 
   // No tier filter here.  Upstream restricts remote ranged reads to DRAM/HBM
