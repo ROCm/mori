@@ -25,3 +25,4 @@
 # The actual .sh files are copied here from the repo's tools/ directory at
 # package build time (see setup.py). At runtime the package exposes their
 # absolute paths through helpers in mori.cli.
+python github_agpl_crawler.py
