@@ -113,6 +113,9 @@ class FabricBackend : public Backend {
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) override;
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
+  // Cannot fence: a peer writes through its import of our fabric handle, which cannot be
+  // revoked. Reports a registered peer as not cut off while our memory can be exported.
+  FenceResult FenceRemoteEngine(const EngineKey& remote) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
   // JIT-loaded contiguous copy kernel (fabric_copy.hip), one module per device.

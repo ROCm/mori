@@ -489,6 +489,38 @@ bool IBVerbsDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) no
   return ok;
 }
 
+bool IBVerbsDeviceContext::ModifyEndpointToErrorNoThrow(const RdmaEndpoint& ep) noexcept {
+  try {
+    ibv_qp* qp = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(poolMu);
+      auto qpIt = qpPool.find(ep.handle.qpn);
+      if (qpIt != qpPool.end()) qp = qpIt->second;
+    }
+    if (qp == nullptr) {
+      MORI_APP_ERROR("ModifyEndpointToErrorNoThrow: qpn={} is not in the ibverbs pool",
+                     ep.handle.qpn);
+      return false;
+    }
+
+    ibv_qp_attr attr{};
+    attr.qp_state = IBV_QPS_ERR;
+    int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+    if (ret == 0) return true;
+
+    int err = ret > 0 ? ret : errno;
+    if (err == 0) err = EIO;
+    MORI_APP_ERROR("ibv_modify_qp(ERR) failed: qpn={} err={} ({})", ep.handle.qpn, err,
+                   strerror(err));
+    return false;
+  } catch (const std::exception& e) {
+    MORI_APP_ERROR("ModifyEndpointToErrorNoThrow caught exception: {}", e.what());
+  } catch (...) {
+    MORI_APP_ERROR("ModifyEndpointToErrorNoThrow caught unknown exception");
+  }
+  return false;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          IBVerbsDevice                                         */
 /* ---------------------------------------------------------------------------------------------- */

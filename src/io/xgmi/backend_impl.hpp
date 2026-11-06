@@ -23,6 +23,7 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -94,6 +95,9 @@ class XgmiBackend : public Backend {
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) override;
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
+  // Cannot fence: a same-node peer writes through its own IPC mapping of our memory, which
+  // HIP gives the exporter no way to revoke. Reports such a peer as not cut off.
+  FenceResult FenceRemoteEngine(const EngineKey& remote) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
   bool IsP2PAccessible(int srcDevice, int dstDevice) const;
@@ -183,6 +187,11 @@ class XgmiBackend : public Backend {
 
   std::unordered_map<EngineKey, EngineDesc> remoteEngines;
   mutable std::mutex remoteEnginesMu;
+  // For FenceRemoteEngine, which must not forget: whether this engine ever exported memory
+  // over IPC, and whether each peer it ever registered sits on this node. Deregistering a
+  // peer or its memory does not revoke an IPC mapping the peer may still hold.
+  std::atomic<bool> exportedMemory_{false};
+  std::unordered_map<EngineKey, bool> peerOnThisNodeSeen_;  // guarded by remoteEnginesMu
   int myPid{0};
   std::string scatterGatherHsacoPath_;
   std::vector<hipModule_t> scatterGatherModules_;
