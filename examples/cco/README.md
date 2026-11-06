@@ -25,6 +25,7 @@ examples/cco/
 | `python/11_flydsl_mega_moe_sdma` | py | MegaMoE stage2 + combine (gfx950) with the transfer done by SDMA: GEMM2 writes a rank-sorted send buffer and comm waves (one per peer) inside the GEMM kernel `put` it; `mega_moe_gemm2_with_sdma.py` is the op and its kernels, `gemm2_8wave.py` an 8-wave persistent GEMM2 for it (`--gemm2 8wave`), `main.py` its test and benchmark against aiter (needs aiter) |
 | `python/11_flydsl_mega_moe_sdma/sdma_bandwidth.py` | py | what one cco SDMA channel moves, with no GEMM in the way |
 | `python/12_flydsl_sdma_allgather_engine_wait` | py | In-place all-gather over run-time regions; the recommended `post_wait_mem_put_ptr` use: read each peer's READY once, plain put if it is there, else the copy engine (not a CU) waits for it |
+| `python/14_flydsl_sdma_dispatch` | py | MoE quantise-and-dispatch as one op, the transfer on the copy engines: the CUs only quantise and the engines ship each destination's run while the rest is still being written, so it costs about `max(quant, transfer)` instead of their sum; `sdma_dispatch.py` is the op, `test_dispatch_op.py` checks it against `per_1x32_mx_quant`, `bench_vs_epv2.py` times it against EPv2's FlyDSL backend (needs aiter) |
 | `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA device APIs |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (includes only `cco_scale_out.hpp`) |
@@ -160,6 +161,51 @@ copy engine waits) when it is not; `--mode cu` spins a CU on READY instead, and
 MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
   examples/cco/python/12_flydsl_sdma_allgather_engine_wait/main.py --skew-us 200
 ```
+
+Example 14 also uses `torchrun` and SDMA, and needs aiter for its quantisation
+kernel (`per_1x32_mx_quant`), on a node with 8 GPUs. It is the MoE dispatch of an
+EP layer as a standalone op: bf16 tokens in, every token delivered to each rank
+that routes to it as fp8 with one e8m0 per 32 values. The point is who moves the
+bytes — a CU dispatch quantises with the CUs and then copies with the CUs, two
+passes that cannot overlap, whereas here the CUs only quantise into a send buffer
+grouped by destination and the copy engines ship each run while the rest of it is
+still being written:
+
+```bash
+# every delivered row checked against per_1x32_mx_quant, through its source id
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/14_flydsl_sdma_dispatch/test_dispatch_op.py \
+  --network flash --bs 4096 --calls 4 --graph 10
+
+# against EPv2's FlyDSL backend, with aiter's quant in front of it
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/14_flydsl_sdma_dispatch/bench_vs_epv2.py \
+  --network flash --bs-list 512,1024,2048,4096,8192
+```
+
+EPv2's dispatch has no quantisation of its own (`quant_type` is the combine wire,
+scatter-only), so the benchmark puts the same aiter kernel in front of it and both
+legs deliver the same bytes — both deduplicate a token that routes to one rank
+through several of its experts. flash (hidden 5120, 384 experts, top-6), 8x gfx950,
+`--chunk-rows 512`, median of 30:
+
+| tokens/rank | 512 | 1024 | 2048 | 4096 | 8192 |
+|---|---|---|---|---|---|
+| EPv2 quant + dispatch | 187 us | 222 us | 292 us | 433 us | 700 us |
+| this example | 104 us | 140 us | 210 us | 347 us | 601 us |
+| | **1.80x** | **1.59x** | **1.39x** | **1.25x** | **1.16x** |
+
+The gap narrows as the batch grows because the transfer, not the quantisation,
+starts to dominate and there is less left to hide under it.
+
+`dispatch()` is one kernel launch with fixed arguments and no host-side state —
+the per-source signal totals and the call parity live on the device and the kernel
+advances them itself — so it can be captured in a CUDA graph and replayed, which
+is what `--graph N` tests. The receive side is packed from row 0 over all sources
+and laid out for a fused-MoE GEMM1 to read directly: `[rows, K]` fp8 with a row
+stride of exactly `K`, `[rows, K/32]` e8m0, `[rows, topk]` ids and weights, and
+`nrecv` rows of them. A source's last chunk may be short; those padding rows carry
+`ids` of -1 so a sorting pass skips them.
 
 `MORI_CCO_GDA_CONN=full` is required for GDA (03, 06) when both ranks share one
 node; LSA examples (02, 04, 05) ignore it. Each example prints `SUCCESS` on pass.
