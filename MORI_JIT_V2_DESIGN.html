@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI JIT v2 &mdash; MORI development (41c5257d) documentation</title>
+  <title>MORI JIT v2 &mdash; MORI development (bd2e2434) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=c7bd7a57"></script>
+      <script src="_static/documentation_options.js?v=0f3f2866"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -685,7 +685,11 @@ kernel 安静地读错 buffer。按 schema 顺序取的 offset 序列一旦不�
 <li><p><strong>arch 路由在 host 侧</strong>：include 哪个 body、调哪个函数，由 <code class="docutils literal notranslate"><span class="pre">RenderSource</span></code> 按
 <code class="docutils literal notranslate"><span class="pre">GetToolchain().arch</span></code> 决定——gfx125x 渲染 <code class="docutils literal notranslate"><span class="pre">ep_intranode_1250x.hpp</span></code> 的 TDM 版本，其余渲染 portable
 版。不是 device <code class="docutils literal notranslate"><span class="pre">#if</span></code>：渲染时看到的 arch 就是 <code class="docutils literal notranslate"><span class="pre">--offload-arch</span></code> 的 arch，两侧不可能不一致；而这个
-选择写在源码文本里，所以自动进 key，两种 body 各有自己的缓存条目。</p></li>
+选择写在源码文本里，所以自动进 key，两种 body 各有自己的缓存条目。
+host 按前缀判断（<code class="docutils literal notranslate"><span class="pre">gfx125</span></code> 选 TDM body，<code class="docutils literal notranslate"><span class="pre">gfx12</span></code> 定 wave32），所以 <code class="docutils literal notranslate"><span class="pre">gfx1250-strict</span></code> 走的是与
+gfx1250 相同的路。device 侧不能用 <code class="docutils literal notranslate"><span class="pre">__gfx1250__</span></code>：strict 目标只定义 <code class="docutils literal notranslate"><span class="pre">__gfx1250_strict__</span></code>。共用
+头文件一律测 <code class="docutils literal notranslate"><span class="pre">MORI_GFX125X</span></code> / <code class="docutils literal notranslate"><span class="pre">MORI_WAVE32</span></code>（<code class="docutils literal notranslate"><span class="pre">include/mori/core/arch.hpp</span></code>，cco.hpp 里是
+<code class="docutils literal notranslate"><span class="pre">CCO_GFX125X</span></code>）；<code class="docutils literal notranslate"><span class="pre">ep_intranode_1250x.hpp</span></code> 在 device pass 看不到 <code class="docutils literal notranslate"><span class="pre">CCO_GFX125X</span></code> 时直接 <code class="docutils literal notranslate"><span class="pre">#error</span></code>。</p></li>
 </ul>
 <p><strong>为什么生成不能放 Python</strong>：Cfg 同时是 NTTP 类型，Python 渲染就要自己维护一份字段列表和默认值
 → 两张清单的问题原样回来。几何算术同理——device 侧也要调它。</p>
@@ -784,6 +788,8 @@ topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏�
 <p>工具链层另有一组只影响解析的变量：<code class="docutils literal notranslate"><span class="pre">MORI_JIT_ARCH</span></code>、<code class="docutils literal notranslate"><span class="pre">MORI_JIT_HIPCC</span></code>、<code class="docutils literal notranslate"><span class="pre">MORI_SOURCE_ROOT</span></code>、
 <code class="docutils literal notranslate"><span class="pre">MORI_JIT_CACHE_DIR</span></code>、<code class="docutils literal notranslate"><span class="pre">MORI_JIT_EXTRA_FLAGS</span></code>（进 flags，所以进 key）、<code class="docutils literal notranslate"><span class="pre">MORI_DEVICE_NIC</span></code>，
 以及两个诊断用的 <code class="docutils literal notranslate"><span class="pre">MORI_JIT_VERBOSE</span></code> / <code class="docutils literal notranslate"><span class="pre">MORI_JIT_KEEP_FAILED</span></code>。</p>
+<p>arch 默认取当前设备的 <code class="docutils literal notranslate"><span class="pre">gcnArchName</span></code>（去掉 <code class="docutils literal notranslate"><span class="pre">:</span></code> 之后的特性串）。同一块 gfx1250 设备按运行时设置报
+<code class="docutils literal notranslate"><span class="pre">gfx1250</span></code> 或 <code class="docutils literal notranslate"><span class="pre">gfx1250-strict</span></code>，两者的 code object 互不能加载。加载失败时报错会给出 code object 与设备各自的 arch。</p>
 </section>
 <section id="dtype">
 <h3>3.7 dtype 是传输属性，不是算术属性<a class="headerlink" href="#dtype" title="Link to this heading"></a></h3>
@@ -1120,7 +1126,7 @@ kernel</strong>——独立的 JIT 模块、入口符号和缓存 key，不是�
 
   <div role="contentinfo">
     <p>&#169; Copyright 2026, AMD.
-      <span class="lastupdated">Last updated on 2026-11-05.
+      <span class="lastupdated">Last updated on 2026-11-06.
       </span></p>
   </div>
 
