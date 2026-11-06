@@ -371,9 +371,13 @@ class CollectivesFacade {
   // count (chunk = count); the full input is npes*count. SetReduceMode() selects
   // push|pull; SetPushLogSlices() tunes the push slice count. `dt` and `op`
   // select the element type and reduction; F32/BF16/F16/S32/S64 support all four
-  // ops (SUM/PRODUCT/MIN/MAX).
+  // ops (SUM/PRODUCT/MIN/MAX). isAsync always pushes and returns once the SDMA
+  // scatter is issued; the reduce runs in AsyncDone. Input must stay untouched
+  // and output unread until then, and no other collective may run on this
+  // communicator in between.
   hipError_t RunReduceScatter(const void* input, void* output, size_t count,
-                              DataType dt, ReduceOpKind op, hipStream_t stream);
+                              DataType dt, ReduceOpKind op, hipStream_t stream,
+                              bool isAsync = false);
 
   // All-reduce: input is the full N = npes*chunk vector (symmetric heap), output
   // is the full reduced N vector (symmetric heap). numElems is the TOTAL element
@@ -395,9 +399,9 @@ class CollectivesFacade {
   hipError_t RunAllGather(const void* input, void* output, size_t chunkBytes, hipStream_t stream,
                           bool isAsync = false);
 
-  // Completes the pending async collective (all-gather, all-to-all or
-  // collective-permute) on `stream`, waiting for its SDMA copies; a no-op if
-  // none is pending.
+  // Completes the pending async collective (all-gather, all-to-all,
+  // collective-permute or reduce-scatter) on `stream`, waiting for its SDMA
+  // copies (and reducing, for reduce-scatter); a no-op if none is pending.
   hipError_t AsyncDone(hipStream_t stream);
 
   // All-to-all: addrs[p] = {chunk sent to peer p, recv slot for sender p}, one
@@ -541,8 +545,10 @@ class CollectivesFacade {
 
   // Real reduce implementations, keyed by element type T and reduction Op. Defined
   // only in the MORI_KERNELS_IMPL TU; the enum Run* entry points dispatch to them.
+  // `phase` is kSync, kAsyncStart or kAsyncDone (PhaseFlags).
   template <class T, class Op>
-  hipError_t reduceScatterImpl(const void* input, void* output, size_t count, hipStream_t stream);
+  hipError_t reduceScatterImpl(const void* input, void* output, size_t count, hipStream_t stream,
+                               int phase);
   template <class T, class Op>
   hipError_t allReduceImpl(const void* input, void* output, size_t numElems, hipStream_t stream);
 
@@ -554,10 +560,16 @@ private:
   uint64_t* barrierCtr_;     // this range's control slot in state_.commCtl
   uint64_t* arrived_;        // barrierCtr_ + kCCLMaxPeers
   // The async collective awaiting AsyncDone.
-  enum class AsyncOp { kNone, kAllGather, kAllToAll, kPermute };
+  enum class AsyncOp { kNone, kAllGather, kAllToAll, kPermute, kReduceScatter };
   struct PendingAsync {
     AsyncOp op = AsyncOp::kNone;
     int npes = 0, dstPe = -1, srcPe = -1;  // kPermute only: global PE ranks
+    // kReduceScatter only: the call's arguments, to redo its dispatch in AsyncDone.
+    const void* input = nullptr;
+    void* output = nullptr;
+    size_t count = 0;
+    DataType dt{};
+    ReduceOpKind reduceOp{};
   };
   PendingAsync pending_;
 };
