@@ -294,4 +294,4 @@ def lookup(world_size, hidden_dim, topk, dtype="fp8"):
     entry = dev_table.get((world_size, hidden_dim, topk))
     if entry:
         base["schedule"] = entry.get(dtype) or entry.get("fp8") or base["schedule"]
-    return base
+    return gpu_utils.fit_blocks_to_cus(base)

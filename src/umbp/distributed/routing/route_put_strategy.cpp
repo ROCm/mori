@@ -96,12 +96,35 @@ std::string SummarizeClientTiers(const std::vector<ClientRecord>& alive_clients)
   return JoinStrings(summaries);
 }
 
+// A put-eligible tier with room; with @p honor_floor, also not under its min_object_bytes.
+bool TakesObject(const LogicalTierCapacity& logical, uint64_t block_size, bool honor_floor) {
+  return logical.put_eligible && AllocatableBytes(logical.capacity) >= block_size &&
+         !(honor_floor && block_size < logical.min_object_bytes);
+}
+
+// Whether any target takes @p block_size above its floor; if none does, floors are ignored.
+bool AnyTargetAboveFloor(const std::vector<ClientRecord>& candidates, uint64_t block_size,
+                         const std::unordered_set<std::string>& exclude_nodes) {
+  for (const auto& client : candidates) {
+    if (exclude_nodes.count(client.node_id)) continue;
+    if (client.logical_tier_capacities.empty()) {
+      for (const auto& [tier, cap] : client.tier_capacities) {
+        if (AllocatableBytes(cap) >= block_size) return true;
+      }
+    }
+    for (const auto& [name, logical] : client.logical_tier_capacities) {
+      if (TakesObject(logical, block_size, true)) return true;
+    }
+  }
+  return false;
+}
+
 // Indices of candidates that can fit block_size on a single @p tier.
 // Every (node, tier) pair that can hold `block_size`.  tier_capacities is a
 // std::map, so the pairs come out in ascending TierType per node — the order is
 // deterministic, which keeps most-available tie-breaks reproducible.
 std::vector<PlacementSlot> CollectEligibleSlots(
-    const std::vector<ClientRecord>& candidates, uint64_t block_size,
+    const std::vector<ClientRecord>& candidates, uint64_t block_size, bool honor_floor,
     const std::unordered_set<std::string>& exclude_nodes) {
   std::vector<PlacementSlot> slots;
   for (size_t i = 0; i < candidates.size(); ++i) {
@@ -109,9 +132,7 @@ std::vector<PlacementSlot> CollectEligibleSlots(
     if (exclude_nodes.count(client.node_id)) continue;
     if (!client.logical_tier_capacities.empty()) {
       for (const auto& [name, logical] : client.logical_tier_capacities) {
-        if (!logical.put_eligible || AllocatableBytes(logical.capacity) < block_size) {
-          continue;
-        }
+        if (!TakesObject(logical, block_size, honor_floor)) continue;
         slots.push_back({i, logical.representative_tier, name, logical.capacity.available_bytes});
       }
     } else {
@@ -239,7 +260,7 @@ size_t ConfigurableRoutePutStrategy::PickWeighted(const std::vector<uint64_t>& w
 
 std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNodeTier(
     const std::vector<ClientRecord>& candidates, const std::string& node_id, TierType tier,
-    uint64_t block_size, const std::unordered_set<std::string>& exclude_nodes,
+    uint64_t block_size, bool honor_floor, const std::unordered_set<std::string>& exclude_nodes,
     const std::string& logical_tier) const {
   if (node_id.empty() || exclude_nodes.count(node_id)) return std::nullopt;
   auto it = std::find_if(candidates.begin(), candidates.end(),
@@ -247,8 +268,8 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNodeTier(
   if (it == candidates.end()) return std::nullopt;
   if (!logical_tier.empty()) {
     auto cap = it->logical_tier_capacities.find(logical_tier);
-    if (cap == it->logical_tier_capacities.end() || !cap->second.put_eligible ||
-        AllocatableBytes(cap->second.capacity) < block_size) {
+    if (cap == it->logical_tier_capacities.end() ||
+        !TakesObject(cap->second, block_size, honor_floor)) {
       return std::nullopt;
     }
     return MakeRouted(*it, cap->second.representative_tier, logical_tier);
@@ -262,7 +283,7 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNodeTier(
 
 std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNode(
     const std::vector<ClientRecord>& candidates, const std::string& node_id, uint64_t block_size,
-    const std::unordered_set<std::string>& exclude_nodes) const {
+    bool honor_floor, const std::unordered_set<std::string>& exclude_nodes) const {
   if (node_id.empty() || exclude_nodes.count(node_id)) return std::nullopt;
   auto it = std::find_if(candidates.begin(), candidates.end(),
                          [&](const ClientRecord& c) { return c.node_id == node_id; });
@@ -275,9 +296,8 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNode(
   std::string best_logical;
   if (!it->logical_tier_capacities.empty()) {
     for (const auto& [name, logical] : it->logical_tier_capacities) {
-      if (!logical.put_eligible) continue;
+      if (!TakesObject(logical, block_size, honor_floor)) continue;
       const auto& cap = logical.capacity;
-      if (AllocatableBytes(cap) < block_size) continue;
       if (best == nullptr || cap.available_bytes > best->available_bytes) {
         best = &cap;
         best_tier = logical.representative_tier;
@@ -298,18 +318,20 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNode(
 }
 
 std::optional<RoutePutResult> ConfigurableRoutePutStrategy::SelectByAlgo(
-    const std::vector<ClientRecord>& candidates, uint64_t block_size,
+    const std::vector<ClientRecord>& candidates, uint64_t block_size, bool honor_floor,
     const std::unordered_set<std::string>& exclude_nodes,
     const std::optional<std::string>& preferred_node) {
   // A preferred node now wins outright when it has room anywhere: with no tier
   // order left, there is no "remote HBM beats local DRAM" case for it to break.
   if (preferred_node) {
-    if (auto r = TrySelectOnNode(candidates, *preferred_node, block_size, exclude_nodes)) {
+    if (auto r =
+            TrySelectOnNode(candidates, *preferred_node, block_size, honor_floor, exclude_nodes)) {
       return r;
     }
   }
 
-  std::vector<PlacementSlot> slots = CollectEligibleSlots(candidates, block_size, exclude_nodes);
+  std::vector<PlacementSlot> slots =
+      CollectEligibleSlots(candidates, block_size, honor_floor, exclude_nodes);
   if (slots.empty()) return std::nullopt;
 
   size_t chosen = 0;
@@ -370,7 +392,7 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
     if (total > 0) {
       // SelectByAlgo honors HBM-before-DRAM, so a hit here is the fastest tier
       // on which the whole batch fits — pin both node and tier to it.
-      if (auto whole = SelectByAlgo(candidates, total, exclude_nodes)) {
+      if (auto whole = SelectByAlgo(candidates, total, /*honor_floor=*/false, exclude_nodes)) {
         anchor_node = whole->node_id;
         anchor_tier = whole->tier;
         anchor_logical_tier = whole->logical_tier;
@@ -406,23 +428,25 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
       continue;
     }
 
+    const bool honor_floor = AnyTargetAboveFloor(candidates, block_size, exclude_nodes);
     std::optional<RoutePutResult> selected;
     if (affinity_ == NodeAffinity::kLocal) {
       // Node-first: the local node's roomiest tier, then a global fallback.
       if (anchor_node) {
-        selected = TrySelectOnNode(candidates, *anchor_node, block_size, exclude_nodes);
+        selected =
+            TrySelectOnNode(candidates, *anchor_node, block_size, honor_floor, exclude_nodes);
       }
-      if (!selected) selected = SelectByAlgo(candidates, block_size, exclude_nodes);
+      if (!selected) selected = SelectByAlgo(candidates, block_size, honor_floor, exclude_nodes);
     } else if (affinity_ == NodeAffinity::kSame) {
       // Whole-batch hit: keep every key on the pinned node AND tier.
       if (anchor_tier) {
         selected = TrySelectOnNodeTier(candidates, *anchor_node, *anchor_tier, block_size,
-                                       exclude_nodes, anchor_logical_tier);
+                                       honor_floor, exclude_nodes, anchor_logical_tier);
       }
       if (!selected) {
         // The pinned tier is full.  Drop the tier pin, keep preferring the
         // sticky node, and re-anchor to wherever this key actually landed.
-        selected = SelectByAlgo(candidates, block_size, exclude_nodes, anchor_node);
+        selected = SelectByAlgo(candidates, block_size, honor_floor, exclude_nodes, anchor_node);
         anchor_tier = std::nullopt;
         anchor_logical_tier.clear();
         if (selected && selected->outcome == RoutePutOutcome::kRouted) {
@@ -430,7 +454,7 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
         }
       }
     } else {
-      selected = SelectByAlgo(candidates, block_size, exclude_nodes);
+      selected = SelectByAlgo(candidates, block_size, honor_floor, exclude_nodes);
     }
 
     // Apply projected capacity, then log against the FINAL returned value: a

@@ -140,6 +140,10 @@ mori_ep_dispatch_bf16_ws8_h2048_k8_64x16(EpArgs args) { EpDispatchBody<kCfg, Tok
   `GetToolchain().arch` 决定——gfx125x 渲染 `ep_intranode_1250x.hpp` 的 TDM 版本，其余渲染 portable
   版。不是 device `#if`：渲染时看到的 arch 就是 `--offload-arch` 的 arch，两侧不可能不一致；而这个
   选择写在源码文本里，所以自动进 key，两种 body 各有自己的缓存条目。
+  host 按前缀判断（`gfx125` 选 TDM body，`gfx12` 定 wave32），所以 `gfx1250-strict` 走的是与
+  gfx1250 相同的路。device 侧不能用 `__gfx1250__`：strict 目标只定义 `__gfx1250_strict__`。共用
+  头文件一律测 `MORI_GFX125X` / `MORI_WAVE32`（`include/mori/core/arch.hpp`，cco.hpp 里是
+  `CCO_GFX125X`）；`ep_intranode_1250x.hpp` 在 device pass 看不到 `CCO_GFX125X` 时直接 `#error`。
 
 **为什么生成不能放 Python**：Cfg 同时是 NTTP 类型，Python 渲染就要自己维护一份字段列表和默认值
 → 两张清单的问题原样回来。几何算术同理——device 侧也要调它。
@@ -227,6 +231,9 @@ topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏�
 工具链层另有一组只影响解析的变量：`MORI_JIT_ARCH`、`MORI_JIT_HIPCC`、`MORI_SOURCE_ROOT`、
 `MORI_JIT_CACHE_DIR`、`MORI_JIT_EXTRA_FLAGS`（进 flags，所以进 key）、`MORI_DEVICE_NIC`，
 以及两个诊断用的 `MORI_JIT_VERBOSE` / `MORI_JIT_KEEP_FAILED`。
+
+arch 默认取当前设备的 `gcnArchName`（去掉 `:` 之后的特性串）。同一块 gfx1250 设备按运行时设置报
+`gfx1250` 或 `gfx1250-strict`，两者的 code object 互不能加载。加载失败时报错会给出 code object 与设备各自的 arch。
 
 ### 3.7 dtype 是传输属性，不是算术属性
 

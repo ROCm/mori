@@ -1736,9 +1736,25 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       }
     }
 
-    HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(core::RdmaEndpointDevice)));
-    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(), numEps * sizeof(core::RdmaEndpointDevice),
-                                hipMemcpyHostToDevice));
+    // Each SQ's ready marks (doorbell coalescing, cco_scale_out.hpp) live in the
+    // same allocation, after the endpoints, so freeing ibgda.endpoints frees them.
+    const size_t epsBytes = numEps * sizeof(core::RdmaEndpointDevice);
+    size_t numMarks = 0;
+    for (const auto& ep : epsHost) {
+      const uint32_t n = ep.wqHandle.sqWqeNum;
+      if (n & (n - 1)) MORI_SHMEM_ERROR("GDA SQ depth {} is not a power of two", n);
+      numMarks += n;
+    }
+    char* block = nullptr;
+    HIP_RUNTIME_CHECK(hipMalloc(&block, epsBytes + numMarks * sizeof(core::WqeReadyMark)));
+    auto* marks = reinterpret_cast<core::WqeReadyMark*>(block + epsBytes);
+    HIP_RUNTIME_CHECK(hipMemset(marks, 0, numMarks * sizeof(core::WqeReadyMark)));
+    for (auto& ep : epsHost) {
+      ep.wqHandle.readyMarks = ep.wqHandle.sqWqeNum ? marks : nullptr;
+      marks += ep.wqHandle.sqWqeNum;
+    }
+    epsGpu = reinterpret_cast<core::RdmaEndpointDevice*>(block);
+    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(), epsBytes, hipMemcpyHostToDevice));
   }
   ibgda.endpoints = epsGpu;
 

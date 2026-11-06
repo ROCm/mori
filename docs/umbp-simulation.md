@@ -19,7 +19,7 @@ client.put_from_ptr(key, ptr, nbytes)
 client.get_into_ptr(key, ptr, nbytes)
 ```
 
-With `UMBPConfig.from_environment()`, the equivalent settings are `UMBP_SIM_ENABLE=1`,
+`UMBPConfig()` reads the equivalent settings from `UMBP_SIM_ENABLE=1`,
 `UMBP_SIM_PROFILE=/path/to/profile.json` and `UMBP_SIM_TRACE=/tmp/umbp-worker-0.jsonl`.
 Existing APIs and return types remain available. Use a separate trace file per client/run.
 DRAM, HBM and file-backed SSD tiers are supported. Embedded mode defaults to DRAM;

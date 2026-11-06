@@ -30,6 +30,7 @@ names for the GPU model, kernel family and EP size (read_v2_table()).
 from __future__ import annotations
 
 import csv
+import functools
 import io
 import numbers
 import os
@@ -52,6 +53,39 @@ def _device_key():
         return _MODEL_ALIAS.get(model, model)
     if _gpu.topology()[1] == 120500:  # gfx1250 has no MI model name
         return "gfx1250"
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _detected_arch():
+    try:
+        from mori.jit.config import detect_gpu_arch
+
+        return detect_gpu_arch()
+    except Exception:
+        return None
+
+
+def _device_keys():
+    """Table keys to try, most specific first. KFD reports gfx1250 for every ASIC
+    revision and either code target, so the parts that can run gfx1250-strict are
+    told apart by their revision (0), or by running it; whichever code they run, they
+    use the gfx1250-strict rows when there is one.
+    """
+    key = _device_key()
+    if key != "gfx1250":
+        return (key,)
+    rev = _gpu.asic_revision()
+    if rev == 0 or (rev is None and _detected_arch() == "gfx1250-strict"):
+        return ("gfx1250-strict", "gfx1250")
+    return (key,)
+
+
+def _first_bucket(table, devs, *shape):
+    for dev in devs:
+        found = _bucket_key(table.get(dev, {}), *shape)
+        if found is not None:
+            return found
     return None
 
 
@@ -197,6 +231,52 @@ _DISPATCH_TABLE: dict = {
             "fp4": ((256, 32, 8), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
         },
     },
+    # Parts that can run gfx1250-strict (ASIC revision 0), either code target, EP4.
+    # Dispatch and combine hold one block per CU (LDS) while a block waits for the whole
+    # grid, and these parts have fewer CUs than the 256-block gfx1250 rows assume, so
+    # those would hang on them.
+    # Graph-timed, median of 3 rounds; within 3-5% the smaller geometry wins.
+    "gfx1250-strict": {
+        (4, 7168, 8, None): {
+            None: ((512, 64, 8), (1024, 64, 16), (None, 64, 8)),
+            "fp8": ((256, 64, 8), (1024, 64, 16), (1536, 64, 24), (None, 64, 32)),
+            "fp4": (
+                (256, 64, 8),
+                (512, 128, 8),
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (8192, 64, 32),
+                (None, 128, 16),
+            ),
+        },
+        (4, 7168, 9, None): {
+            None: ((4096, 64, 8), (None, 64, 16)),
+            "fp8": ((256, 64, 8), (1024, 64, 16), (1536, 64, 24), (None, 64, 32)),
+            "fp4": (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (8192, 64, 32),
+                (None, 128, 16),
+            ),
+        },
+        (4, 7168, 6, None): {
+            None: ((4096, 64, 8), (None, 64, 16)),
+            "fp8": ((1024, 64, 8), (1536, 64, 24), (2048, 64, 16), (None, 64, 32)),
+            "fp4": (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (8192, 64, 32),
+                (None, 128, 16),
+            ),
+        },
+        # 16 warps from 512 tokens; the gfx1250 rows' 8-warp grids trail well behind here.
+        (4, 2048, 8, 64): {
+            "bf16": ((256, 32, 8), (512, 32, 16), (1024, 64, 16), (None, 128, 16)),
+            "fp4": ((256, 32, 8), (512, 32, 16), (1024, 64, 16), (None, 128, 16)),
+        },
+    },
 }
 
 # No dtype axis: combine reduces the bf16 staging region whatever dispatch carried,
@@ -216,6 +296,12 @@ _COMBINE_TABLE: dict = {
             (1024, 256, 8),
             (None, 192, 8),
         ),
+    },
+    # The gfx1250-strict parts, as their dispatch rows.
+    "gfx1250-strict": {
+        (4, 7168, 8, None): ((128, 64, 4), (512, 128, 8), (None, 64, 8)),
+        (4, 7168, 9, None): ((128, 64, 4), (256, 128, 8), (None, 64, 8)),
+        (4, 7168, 6, None): ((128, 64, 4), (256, 128, 8), (None, 64, 8)),
     },
 }
 
@@ -272,10 +358,31 @@ _COMBINE_PUSH_TABLE: dict = {
                 (None, 64, 16),
             ),
         },
+        # gfx1250-strict parts, EP4. No 24-warp geometry: several times slower there.
+        "gfx1250-strict": {
+            (4, 7168, 6, None): ((256, 64, 8), (1024, 64, 16), (None, 128, 8)),
+            (4, 7168, 9, None): (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (1536, 128, 8),
+                (2048, 128, 16),
+                (4096, 192, 8),
+                (None, 128, 8),
+            ),
+        },
     },
     "fp4_blockwise_fp32": {
         "gfx1250": {
             (4, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
+        },
+        "gfx1250-strict": {
+            (4, 7168, 6, None): (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (4096, 128, 8),
+                (8192, 192, 8),
+                (None, 128, 8),
+            ),
         },
     },
     "fp8_blockwise": {
@@ -302,6 +409,11 @@ _COMBINE_PUSH_TABLE: dict = {
                 (16384, 128, 24),
                 (None, 64, 16),
             ),
+        },
+        # gfx1250-strict parts, EP4: no 24-warp geometry, as above.
+        "gfx1250-strict": {
+            (4, 7168, 6, None): ((256, 64, 8), (1536, 64, 16), (None, 128, 16)),
+            (4, 7168, 9, None): ((256, 64, 8), (1536, 64, 16), (None, 128, 16)),
         },
     },
 }
@@ -367,6 +479,8 @@ def ll128(
     experts_per_rank=None,
     quant_type="none",
 ):
+    if _device_keys()[0] == "gfx1250-strict":
+        return None  # LL128's polls miss peer writes on these parts; use the schedule
     per_shape = _LL128_TABLE.get(quant_type, {}).get(_device_key(), {})
     entry = _bucket_key(per_shape, world_size, hidden_dim, topk, experts_per_rank)
     plan = entry.get(dtype) if entry else None
@@ -622,27 +736,18 @@ def lookup(
     the same rules.
     """
     base = _hip_default()
-    dev = _device_key()
+    devs = _device_keys()
+    shape = (world_size, hidden_dim, topk, experts_per_rank)
     wire = _DISPATCH_DTYPE_ALIAS.get(dtype, dtype)
-    disp = _bucket_key(
-        _DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
-    )
+    disp = _first_bucket(_DISPATCH_TABLE, devs, *shape)
     if disp is not None:
         # None is the "every dtype measured the same" key; an exact dtype overrides it.
         disp = disp.get(wire) or disp.get(None)
     comb = None
     if quant_type in _COMBINE_PUSH_TABLE:
-        comb = _bucket_key(
-            _COMBINE_PUSH_TABLE[quant_type].get(dev, {}),
-            world_size,
-            hidden_dim,
-            topk,
-            experts_per_rank,
-        )
+        comb = _first_bucket(_COMBINE_PUSH_TABLE[quant_type], devs, *shape)
     if comb is None:
-        comb = _bucket_key(
-            _COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
-        )
+        comb = _first_bucket(_COMBINE_TABLE, devs, *shape)
     if dispatch_dtype is None:
         dispatch_dtype, combine_dtype = _wire_dtypes(wire)
     if dispatch_dtype is not None and quant_type == "none":
@@ -657,13 +762,13 @@ def lookup(
         disp = table_disp or disp
         comb = table_comb or comb
     if disp is None and comb is None:
-        return base
+        return _gpu.fit_blocks_to_cus(base)
     disp = disp or ((None, base["dispatch_block_num"], base["warp_num_per_block"]),)
     comb = comb or (
         (None, base["combine_block_num"], base["combine_warp_num_per_block"]),
     )
     base["schedule"] = _merge(disp, comb)
-    return base
+    return _gpu.fit_blocks_to_cus(base)
 
 
 _INTERNODE_TABLE_DIR = Path(__file__).parent / "tuning_configs"
