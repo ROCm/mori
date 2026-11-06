@@ -329,16 +329,21 @@ class ep_context_t {
   void stream_sync(hipStream_t stream);
 
  private:
+  // "hostname [node <id>]" for setup error messages.
+  std::string peer_label(int rank) const;
+
   config_t cfg_;
   ep_device_workspace_layout_t device_workspace_layout_;
   std::unique_ptr<ep_comm_context_t> comm_ctx_;
   std::unique_ptr<all2all_t> all2all_;
+  // Per-rank mori::ResolveNodeId values; equal ids mean the same node.
+  std::vector<std::string> peer_node_ids_;
+  std::vector<std::string> peer_hostnames_;
   // HIP-IPC payload resources are provisioned independently from the
   // backend selected for any particular launch.
   bool rcomp_ipc_resources_provisioned_ = false;
   std::vector<uint8_t> rcomp_peer_is_local_;
   std::vector<uint8_t> rcomp_peer_is_ipc_;
-  std::vector<std::string> rcomp_peer_hostnames_;
   // Per-rank physical GPU PCI Bus IDs are exchanged between processes.
   // rcomp_peer_hip_devices_ stores the matching ordinal resolved inside this
   // process, so it is valid for HIP capability queries on this rank.

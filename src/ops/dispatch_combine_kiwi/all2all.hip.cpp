@@ -22,11 +22,8 @@
 #include "all2all.hip.hpp"
 
 #include <hip/hip_runtime.h>
-#include <unistd.h>
 
-#include <array>
 #include <cstdlib>
-#include <cstring>
 #include <string>
 
 #include "assert.hpp"
@@ -36,21 +33,16 @@
 
 namespace mori::kiwi::ep {
 
-namespace {
-
-constexpr size_t EP_HOSTNAME_BYTES = 256;
-
-}  // namespace
-
 all2all_t::all2all_t(const config_t& cfg, ep_comm_context_t& comm_ctx, char* heap_base, int heap_id,
+                     const std::vector<std::string>& node_ids,
                      const std::vector<uintptr_t>* reusable_peer_heap_bases)
     : cfg_(cfg), comm_ctx_(comm_ctx), heap_id_(heap_id) {
-  initialize(heap_base, reusable_peer_heap_bases);
+  initialize(heap_base, node_ids, reusable_peer_heap_bases);
 }
 
 all2all_t::~all2all_t() { finalize(); }
 
-void all2all_t::initialize(char* heap_base,
+void all2all_t::initialize(char* heap_base, const std::vector<std::string>& node_ids,
                            const std::vector<uintptr_t>* reusable_peer_heap_bases) {
   const int rank_n = comm_ctx_.rank_n();
   const int rank_me = comm_ctx_.rank_me();
@@ -58,39 +50,26 @@ void all2all_t::initialize(char* heap_base,
                  "config.world_size does not match bootstrap rank count");
   KIWI_EP_ASSERT(heap_base != nullptr && heap_id_ >= 0,
                  "hybrid count all-to-all requires a symmetric GPU heap");
-
-  std::array<char, EP_HOSTNAME_BYTES> local_hostname{};
-  KIWI_EP_ASSERT(gethostname(local_hostname.data(), local_hostname.size()) == 0,
-                 "gethostname failed during hybrid count all-to-all initialization");
-  local_hostname.back() = '\0';
-
-  std::vector<char> all_hostnames(static_cast<size_t>(rank_n) * EP_HOSTNAME_BYTES, '\0');
-  comm_ctx_.bootstrap().Allgather(local_hostname.data(), all_hostnames.data(), EP_HOSTNAME_BYTES);
-
-  std::vector<std::string> hostnames(static_cast<size_t>(rank_n));
-  for (int rank = 0; rank < rank_n; ++rank) {
-    const char* hostname = all_hostnames.data() + static_cast<size_t>(rank) * EP_HOSTNAME_BYTES;
-    hostnames[static_cast<size_t>(rank)] =
-        std::string(hostname, strnlen(hostname, EP_HOSTNAME_BYTES));
-  }
+  KIWI_EP_ASSERT(node_ids.size() == static_cast<size_t>(rank_n),
+                 "count all-to-all needs one node id per rank");
 
   int group_size = 0;
   int node_count = 0;
   for (int begin = 0; begin < rank_n;) {
     int end = begin + 1;
     while (end < rank_n &&
-           hostnames[static_cast<size_t>(end)] == hostnames[static_cast<size_t>(begin)]) {
+           node_ids[static_cast<size_t>(end)] == node_ids[static_cast<size_t>(begin)]) {
       ++end;
     }
     const int size = end - begin;
     if (group_size == 0) {
       group_size = size;
     } else {
-      KIWI_EP_ASSERT(size == group_size, "ranks must form equal-size contiguous hostname groups");
+      KIWI_EP_ASSERT(size == group_size, "ranks must form equal-size contiguous node groups");
     }
     for (int prior = 0; prior < begin; ++prior) {
-      KIWI_EP_ASSERT(hostnames[static_cast<size_t>(prior)] != hostnames[static_cast<size_t>(begin)],
-                     "ranks for one hostname are not contiguous");
+      KIWI_EP_ASSERT(node_ids[static_cast<size_t>(prior)] != node_ids[static_cast<size_t>(begin)],
+                     "ranks for one node are not contiguous");
     }
     ++node_count;
     begin = end;

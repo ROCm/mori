@@ -56,7 +56,7 @@ enum class quant_format_t : int32_t {
 };
 
 // RCOMP payload backend. RDMA_ONLY uses RDMA payloads; HYBRID writes
-// exact-hostname-local peer payloads through HIP IPC and retains RDMA payloads
+// same-node peer payloads through HIP IPC and retains RDMA payloads
 // plus receiver-owned readiness signals for all other peers. AUTO resolves the
 // concrete backend independently for each active-token launch.
 enum class rcomp_backend_t : int32_t {

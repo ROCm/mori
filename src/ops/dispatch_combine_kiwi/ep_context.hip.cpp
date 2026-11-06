@@ -36,13 +36,20 @@
 #include "all2all.hip.hpp"
 #include "assert.hpp"
 #include "hip_check.hpp"
+#include "mori/utils/host_utils.hpp"
 
 namespace mori::kiwi::ep {
 
 namespace {
 
 constexpr size_t EP_HOSTNAME_BYTES = 256;
+constexpr size_t EP_NODE_ID_BYTES = 256;
 constexpr size_t EP_PCI_BUS_ID_BYTES = 32;
+
+struct node_record_t {
+  char node_id[EP_NODE_ID_BYTES];
+  char hostname[EP_HOSTNAME_BYTES];
+};
 
 std::string string_from_fixed_buffer(const char* data, size_t capacity) {
   size_t len = 0;
@@ -66,16 +73,16 @@ std::string hostname_from_fixed_buffer(const char* data) {
     if (hip_error == hipSuccess) {
       fprintf(stderr,
               "mori::kiwi::ep::ep_context_t: rcomp_backend=hybrid rank %d "
-              "cannot initialize same-host peer rank %d "
-              "(hostnames '%s'/'%s', local HIP device %d PCI '%s', "
+              "cannot initialize same-node peer rank %d "
+              "(hosts '%s'/'%s', local HIP device %d PCI '%s', "
               "peer PCI '%s' resolved to local HIP device %d): %s\n",
               rank, peer_rank, local_hostname.c_str(), peer_hostname.c_str(), local_hip_device,
               local_pci_bus_id.c_str(), peer_pci_bus_id.c_str(), peer_hip_device, step);
     } else {
       fprintf(stderr,
               "mori::kiwi::ep::ep_context_t: rcomp_backend=hybrid rank %d "
-              "cannot initialize same-host peer rank %d "
-              "(hostnames '%s'/'%s', local HIP device %d PCI '%s', "
+              "cannot initialize same-node peer rank %d "
+              "(hosts '%s'/'%s', local HIP device %d PCI '%s', "
               "peer PCI '%s' resolved to local HIP device %d): %s (%s)\n",
               rank, peer_rank, local_hostname.c_str(), peer_hostname.c_str(), local_hip_device,
               local_pci_bus_id.c_str(), peer_pci_bus_id.c_str(), peer_hip_device, step,
@@ -85,13 +92,13 @@ std::string hostname_from_fixed_buffer(const char* data) {
     if (hip_error == hipSuccess) {
       fprintf(stderr,
               "mori::kiwi::ep::ep_context_t: rcomp_backend=hybrid rank %d "
-              "cannot initialize HIP IPC on hostname '%s' local HIP "
+              "cannot initialize HIP IPC on host '%s' local HIP "
               "device %d PCI '%s': %s\n",
               rank, local_hostname.c_str(), local_hip_device, local_pci_bus_id.c_str(), step);
     } else {
       fprintf(stderr,
               "mori::kiwi::ep::ep_context_t: rcomp_backend=hybrid rank %d "
-              "cannot initialize HIP IPC on hostname '%s' local HIP "
+              "cannot initialize HIP IPC on host '%s' local HIP "
               "device %d PCI '%s': %s (%s)\n",
               rank, local_hostname.c_str(), local_hip_device, local_pci_bus_id.c_str(), step,
               hipGetErrorString(hip_error));
@@ -101,6 +108,11 @@ std::string hostname_from_fixed_buffer(const char* data) {
 }
 
 }  // namespace
+
+std::string ep_context_t::peer_label(int rank) const {
+  return peer_hostnames_[static_cast<size_t>(rank)] + " [node " +
+         peer_node_ids_[static_cast<size_t>(rank)] + "]";
+}
 
 ep_context_t::ep_context_t(const config_t& cfg,
                            std::shared_ptr<application::BootstrapNetwork> bootstrap)
@@ -156,32 +168,49 @@ ep_context_t::ep_context_t(const config_t& cfg,
                                                   cfg_.num_devices, cfg_.device_name,
                                                   static_cast<size_t>(cfg_.queue_capacity));
 
-  if (rcomp_ipc_resources_provisioned_) {
+  {
     const int rank_n = comm_ctx_->rank_n();
     KIWI_EP_ASSERT(rank_n == cfg_.world_size,
                    "mori::kiwi::ep::ep_context_t: config.world_size does "
                    "not match bootstrap rank count");
 
-    std::array<char, EP_HOSTNAME_BYTES> local_hostname{};
-    KIWI_EP_ASSERT(gethostname(local_hostname.data(), local_hostname.size()) == 0,
+    // Same-node peers are keyed on ResolveNodeId, as in the rest of mori:
+    // distinct machines can share a hostname.
+    node_record_t local_record{};
+    KIWI_EP_ASSERT(gethostname(local_record.hostname, sizeof(local_record.hostname)) == 0,
                    "mori::kiwi::ep::ep_context_t: gethostname failed");
-    local_hostname.back() = '\0';
-    const std::string local_hostname_string = hostname_from_fixed_buffer(local_hostname.data());
+    local_record.hostname[sizeof(local_record.hostname) - 1] = '\0';
+    const std::string local_node_id =
+        mori::ResolveNodeId(hostname_from_fixed_buffer(local_record.hostname));
+    KIWI_EP_ASSERT(!local_node_id.empty() && local_node_id.size() < sizeof(local_record.node_id),
+                   "mori::kiwi::ep::ep_context_t: node id is empty or longer than 255 bytes");
+    std::memcpy(local_record.node_id, local_node_id.data(), local_node_id.size());
 
-    std::vector<char> all_hostnames(static_cast<size_t>(rank_n) * EP_HOSTNAME_BYTES, '\0');
-    comm_ctx_->bootstrap().Allgather(local_hostname.data(), all_hostnames.data(),
-                                     EP_HOSTNAME_BYTES);
-
-    rcomp_peer_is_local_.assign(static_cast<size_t>(rank_n), 0);
-    rcomp_peer_hostnames_.resize(static_cast<size_t>(rank_n));
+    std::vector<node_record_t> records(static_cast<size_t>(rank_n));
+    comm_ctx_->bootstrap().Allgather(&local_record, records.data(), sizeof(node_record_t));
+    peer_node_ids_.resize(static_cast<size_t>(rank_n));
+    peer_hostnames_.resize(static_cast<size_t>(rank_n));
     for (int rank = 0; rank < rank_n; ++rank) {
-      rcomp_peer_hostnames_[static_cast<size_t>(rank)] = hostname_from_fixed_buffer(
-          all_hostnames.data() + static_cast<size_t>(rank) * EP_HOSTNAME_BYTES);
-      rcomp_peer_is_local_[static_cast<size_t>(rank)] =
-          (rcomp_peer_hostnames_[static_cast<size_t>(rank)] == local_hostname_string) ? 1 : 0;
+      const node_record_t& record = records[static_cast<size_t>(rank)];
+      peer_node_ids_[static_cast<size_t>(rank)] =
+          string_from_fixed_buffer(record.node_id, EP_NODE_ID_BYTES);
+      peer_hostnames_[static_cast<size_t>(rank)] = hostname_from_fixed_buffer(record.hostname);
     }
+  }
 
+  if (rcomp_ipc_resources_provisioned_) {
+    const int rank_n = comm_ctx_->rank_n();
     const int rank_me = comm_ctx_->rank_me();
+    rcomp_peer_is_local_.assign(static_cast<size_t>(rank_n), 0);
+    for (int rank = 0; rank < rank_n; ++rank) {
+      rcomp_peer_is_local_[static_cast<size_t>(rank)] =
+          (peer_node_ids_[static_cast<size_t>(rank)] ==
+           peer_node_ids_[static_cast<size_t>(rank_me)])
+              ? 1
+              : 0;
+    }
+    const std::string local_hostname_string = peer_label(rank_me);
+
     int local_hip_device = 0;
     HIP_CHECK(hipGetDevice(&local_hip_device));
     std::array<char, EP_PCI_BUS_ID_BYTES> local_hip_pci_bus_id{};
@@ -231,10 +260,9 @@ ep_context_t::ep_context_t(const config_t& cfg,
 
       const std::string& peer_pci_bus_id = rcomp_peer_hip_pci_bus_ids_[static_cast<size_t>(rank)];
       if (peer_pci_bus_id.empty()) {
-        rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string,
-                                rcomp_peer_hostnames_[static_cast<size_t>(rank)], local_hip_device,
-                                local_hip_pci_bus_id_string, -1, "<empty>",
-                                "same-host peer published an empty PCI Bus ID", hipSuccess);
+        rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string, peer_label(rank),
+                                local_hip_device, local_hip_pci_bus_id_string, -1, "<empty>",
+                                "same-node peer published an empty PCI Bus ID", hipSuccess);
       }
 
       int peer_hip_device = -1;
@@ -243,8 +271,7 @@ ep_context_t::ep_context_t(const config_t& cfg,
         err = hipDeviceGetPCIBusId(candidate_pci_bus_id.data(),
                                    static_cast<int>(candidate_pci_bus_id.size()), device);
         if (err != hipSuccess) {
-          rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string,
-                                  rcomp_peer_hostnames_[static_cast<size_t>(rank)],
+          rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string, peer_label(rank),
                                   local_hip_device, local_hip_pci_bus_id_string, device,
                                   peer_pci_bus_id,
                                   "hipDeviceGetPCIBusId failed while resolving the "
@@ -254,8 +281,7 @@ ep_context_t::ep_context_t(const config_t& cfg,
         if (string_from_fixed_buffer(candidate_pci_bus_id.data(), candidate_pci_bus_id.size()) ==
             peer_pci_bus_id) {
           if (peer_hip_device >= 0) {
-            rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string,
-                                    rcomp_peer_hostnames_[static_cast<size_t>(rank)],
+            rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string, peer_label(rank),
                                     local_hip_device, local_hip_pci_bus_id_string, device,
                                     peer_pci_bus_id,
                                     "peer PCI Bus ID resolved to multiple local HIP "
@@ -266,10 +292,9 @@ ep_context_t::ep_context_t(const config_t& cfg,
         }
       }
       if (peer_hip_device < 0) {
-        rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string,
-                                rcomp_peer_hostnames_[static_cast<size_t>(rank)], local_hip_device,
-                                local_hip_pci_bus_id_string, -1, peer_pci_bus_id,
-                                "same-host peer PCI Bus ID could not be resolved to a "
+        rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string, peer_label(rank),
+                                local_hip_device, local_hip_pci_bus_id_string, -1, peer_pci_bus_id,
+                                "same-node peer PCI Bus ID could not be resolved to a "
                                 "locally visible HIP device",
                                 hipSuccess);
       }
@@ -278,19 +303,19 @@ ep_context_t::ep_context_t(const config_t& cfg,
       int peer_access = 0;
       err = hipDeviceCanAccessPeer(&peer_access, local_hip_device, peer_hip_device);
       if (err != hipSuccess || peer_access == 0) {
-        rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string,
-                                rcomp_peer_hostnames_[static_cast<size_t>(rank)], local_hip_device,
-                                local_hip_pci_bus_id_string, peer_hip_device, peer_pci_bus_id,
-                                "hipDeviceCanAccessPeer reports no peer access", err);
+        rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string, peer_label(rank),
+                                local_hip_device, local_hip_pci_bus_id_string, peer_hip_device,
+                                peer_pci_bus_id, "hipDeviceCanAccessPeer reports no peer access",
+                                err);
       }
 
       int native_atomics = 0;
       err = hipDeviceGetP2PAttribute(&native_atomics, hipDevP2PAttrNativeAtomicSupported,
                                      local_hip_device, peer_hip_device);
       if (err != hipSuccess || native_atomics == 0) {
-        rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string,
-                                rcomp_peer_hostnames_[static_cast<size_t>(rank)], local_hip_device,
-                                local_hip_pci_bus_id_string, peer_hip_device, peer_pci_bus_id,
+        rcomp_hybrid_init_abort(rank_me, rank, local_hostname_string, peer_label(rank),
+                                local_hip_device, local_hip_pci_bus_id_string, peer_hip_device,
+                                peer_pci_bus_id,
                                 "hipDevP2PAttrNativeAtomicSupported is unavailable", err);
       }
       rcomp_peer_is_ipc_[static_cast<size_t>(rank)] = 1;
@@ -322,11 +347,7 @@ ep_context_t::ep_context_t(const config_t& cfg,
     const int rank_me = comm_ctx_->rank_me();
     int local_hip_device = 0;
     HIP_CHECK(hipGetDevice(&local_hip_device));
-    char hostname[EP_HOSTNAME_BYTES] = {};
-    KIWI_EP_ASSERT(gethostname(hostname, sizeof(hostname)) == 0,
-                   "mori::kiwi::ep::ep_context_t: gethostname failed");
-    hostname[sizeof(hostname) - 1] = '\0';
-    const std::string local_hostname = hostname_from_fixed_buffer(hostname);
+    const std::string local_hostname = peer_label(rank_me);
     std::array<char, EP_PCI_BUS_ID_BYTES> local_hip_pci_bus_id{};
     hipError_t err =
         hipDeviceGetPCIBusId(local_hip_pci_bus_id.data(),
@@ -350,7 +371,7 @@ ep_context_t::ep_context_t(const config_t& cfg,
 
     std::vector<hipIpcMemHandle_t> peer_ipc_handles(static_cast<size_t>(cfg_.world_size));
     // This is intentionally a world communicator collective so every rank
-    // keeps the same setup ordering.  Only exact-hostname peers are opened.
+    // keeps the same setup ordering.  Only same-node peers are opened.
     comm_ctx_->bootstrap().Allgather(&local_heap_ipc_handle, peer_ipc_handles.data(),
                                      sizeof(hipIpcMemHandle_t));
 
@@ -364,8 +385,7 @@ ep_context_t::ep_context_t(const config_t& cfg,
       err = hipIpcOpenMemHandle(&mapped_peer_heap, peer_ipc_handles[static_cast<size_t>(rank)],
                                 hipIpcMemLazyEnablePeerAccess);
       if (err != hipSuccess || mapped_peer_heap == nullptr) {
-        rcomp_hybrid_init_abort(rank_me, rank, local_hostname,
-                                rcomp_peer_hostnames_[static_cast<size_t>(rank)], local_hip_device,
+        rcomp_hybrid_init_abort(rank_me, rank, local_hostname, peer_label(rank), local_hip_device,
                                 local_hip_pci_bus_id_string,
                                 rcomp_peer_hip_devices_[static_cast<size_t>(rank)],
                                 rcomp_peer_hip_pci_bus_ids_[static_cast<size_t>(rank)],
@@ -392,7 +412,7 @@ ep_context_t::ep_context_t(const config_t& cfg,
   if (rcomp_ipc_resources_provisioned_) {
     reusable_count_peer_heap_bases = &rcomp_peer_heap_bases_;
   }
-  all2all_ = std::make_unique<all2all_t>(cfg_, *comm_ctx_, d_heap_buf_, heap_id_,
+  all2all_ = std::make_unique<all2all_t>(cfg_, *comm_ctx_, d_heap_buf_, heap_id_, peer_node_ids_,
                                          reusable_count_peer_heap_bases);
 
   // Output tensors for recv data (device memory)

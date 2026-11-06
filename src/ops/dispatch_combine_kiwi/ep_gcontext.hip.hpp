@@ -93,7 +93,7 @@ struct ep_gcontext_t {
   uint8_t post_put_multicast_cb_id;
   // Provisioned IPC payload-routing metadata. peer_heap_bases and
   // peer_is_ipc are device allocations populated during context setup:
-  // exact-hostname-local non-self peers use an imported HIP IPC heap, while
+  // same-node non-self peers use an imported HIP IPC heap, while
   // self remains direct and remote peers use RDMA.
   const uintptr_t* rcomp_peer_heap_bases;
   const uint8_t* rcomp_peer_is_ipc;

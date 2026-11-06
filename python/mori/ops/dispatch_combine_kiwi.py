@@ -35,9 +35,10 @@ calling convention but is not a drop-in replacement:
   chooses its launch shape from the token count, or from ``num_blocks``.
 - ``combine()`` routes with the routing recorded by the preceding
   ``dispatch()``. Its ``indices`` argument is only shape-checked.
-- Ranks must be grouped by host: each host's ranks are contiguous and every
-  host has the same number of ranks. Construction aborts the process
-  otherwise, for every backend.
+- Ranks must be grouped by node: each node's ranks are contiguous and every
+  node has the same number of ranks. A node is identified as elsewhere in
+  MORI: ``MORI_NODE_ID`` if set, else the kernel boot id, else the hostname.
+  Construction aborts the process otherwise, for every backend.
 
 The kernels push RDMA work to CPU proxy threads through KIWI invoke queues; the
 proxies post it with ibverbs. Setup runs over a torch.distributed process

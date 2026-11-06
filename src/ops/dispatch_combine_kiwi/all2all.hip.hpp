@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "assert.hpp"
@@ -121,7 +122,10 @@ __device__ inline void wait_all2all(const ep_gcontext_t& gctx, ep_all2all_ticket
 // all-to-all. The receive path itself is entirely GPU-side.
 class all2all_t {
  public:
+  // node_ids holds each rank's mori::ResolveNodeId; ranks with equal ids
+  // share a node and must be contiguous.
   all2all_t(const config_t& cfg, ep_comm_context_t& comm_ctx, char* heap_base, int heap_id,
+            const std::vector<std::string>& node_ids,
             const std::vector<uintptr_t>* reusable_peer_heap_bases);
   ~all2all_t();
 
@@ -137,7 +141,8 @@ class all2all_t {
   const uintptr_t* device_local_peer_heap_bases() const { return d_local_peer_heap_bases_; }
 
  private:
-  void initialize(char* heap_base, const std::vector<uintptr_t>* reusable_peer_heap_bases);
+  void initialize(char* heap_base, const std::vector<std::string>& node_ids,
+                  const std::vector<uintptr_t>* reusable_peer_heap_bases);
   void finalize();
 
   const config_t& cfg_;
