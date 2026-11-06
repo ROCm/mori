@@ -25,6 +25,7 @@ examples/cco/
 | `python/11_flydsl_mega_moe_sdma` | py | MegaMoE stage2 + combine (gfx950) with the transfer done by SDMA: GEMM2 writes a rank-sorted send buffer and comm waves (one per peer) inside the GEMM kernel `put` it; `mega_moe_gemm2_with_sdma.py` is the op and its kernels, `gemm2_8wave.py` an 8-wave persistent GEMM2 for it (`--gemm2 8wave`), `main.py` its test and benchmark against aiter (needs aiter) |
 | `python/11_flydsl_mega_moe_sdma/sdma_bandwidth.py` | py | what one cco SDMA channel moves, with no GEMM in the way |
 | `python/12_flydsl_sdma_allgather_engine_wait` | py | In-place all-gather over run-time regions; the recommended `post_wait_mem_put_ptr` use: read each peer's READY once, plain put if it is there, else the copy engine (not a CU) waits for it |
+| `python/13_flydsl_mega_moe_stage1_sdma` | py | MegaMoE Stage1 (dispatch + GEMM1, gfx950) with the dispatch done by SDMA: a pack kernel lays out this rank's rows per (destination, expert), then one fused kernel puts them (workgroup 0, one signalled put pair per peer and expert) while an 8-wave GEMM1 starts on each expert as soon as its rows land; `mega_moe_stage1_sdma.py` is the op (installs into aiter's `MegaMoEV2` in place of its Stage1 launch), `gemm1_8wave_sdma.py` the fused kernel, `main.py` its test and benchmark against aiter (needs aiter) |
 | `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA device APIs |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (includes only `cco_scale_out.hpp`) |
@@ -160,6 +161,64 @@ copy engine waits) when it is not; `--mode cu` spins a CU on READY instead, and
 MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
   examples/cco/python/12_flydsl_sdma_allgather_engine_wait/main.py --skew-us 200
 ```
+
+Example 13 also uses `torchrun` and SDMA, and needs aiter (`MegaMoEV2` with the compact
+prepare; measured with aiter `f0b96f49e` plus the files of ROCm/aiter#7196) and FlyDSL 0.4.1,
+on a gfx950 node with 8 GPUs; mori must be built with `BUILD_CCO_SDMA=ON`. It replaces only
+the Stage1 launch of aiter's operator (prepare, Stage2 and combine stay aiter's), so the layer
+output must match aiter's byte for byte; `test` checks that over 4 back-to-back calls with
+alternating inputs, `bench` times Stage1 (including prepare) and the whole layer with CUDA Graphs:
+
+```bash
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/13_flydsl_mega_moe_stage1_sdma/main.py test --bs 8192
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/13_flydsl_mega_moe_stage1_sdma/main.py bench --bs-list 2048,4096,8192
+```
+
+`--scale-mode` picks how GEMM1 gets the A scales of the landed rows. `shuffler`: a few
+workgroups (`--shufflers`, default 4) put them into the contiguous GEMM's layout once per
+M-tile, and a work item waits only on their flags. `ldsw`: every work item waits on the 7 peer
+signals and stages its M-tile's scales into LDS. `auto` (default) takes the shuffler when
+aiter's Stage1 `sort_block_m` is 128 (the 4096 and 8192 buckets) and ldsw otherwise. Stage1
+including prepare against aiter, v4_pro on 8x MI355X, CUDA Graph, max over ranks, byte-exact:
+
+| tokens/rank | 2048 | 4096 | 8192 |
+|---|---|---|---|
+| `shuffler` (2 or 4 blocks) | +0.07..+0.09 ms | -0.04..-0.05 ms | **-0.17..-0.23 ms** (aiter 2.40..2.43) |
+| `ldsw` | +0.008 ms | +0.005 ms | -0.07 ms |
+
+The shuffler delays the first M-tile by expert 0's shuffle, which only pays off at large
+batches. The whole-layer gain is smaller than the Stage1 gain (8192: -0.09..-0.12 ms).
+`main.py bench` with the default `auto` on one node (ms):
+
+| tokens/rank | scale mode | Stage1 aiter | Stage1 SDMA | layer aiter | layer SDMA |
+|---:|---|---:|---:|---:|---:|
+| 2048 | ldsw | 0.933 | 0.958 (+0.025) | 1.572 | 1.622 (+0.050) |
+| 4096 | shuffler | 1.439 | 1.369 (-0.070) | 2.466 | 2.443 (-0.023) |
+| 8192 | shuffler | 2.431 | 2.212 (**-0.219**) | 4.548 | 4.422 (-0.126) |
+
+The aiter baseline above is main `f0b96f49e`. Against main plus the open ROCm/aiter#7001
+(faster compact Stage1 producer and GEMM1 tiles; same node, interleaved), aiter's Stage1 is
+0.820 / 1.177 / 2.040 ms at 2048 / 4096 / 8192 and this example is **slower** by 0.13 / 0.19 /
+0.18 ms (layer +0.17 / +0.20..+0.26 / +0.21 ms): once the CU dispatch is that cheap, the
+extra pack copy (about 0.19 ms at 8192) costs more than the CU time the copy engines save.
+
+`--gemm1 7001` (needs aiter with the files of ROCm/aiter#7001) runs #7001's own Stage1 GEMM1
+tiles instead of the 8-wave GEMM1, in one launch that also packs the rows: producer
+workgroups pack each (destination, segment) in expert order and the SDMA puts of a segment
+start as soon as it is packed, so no pack launch runs before it. Against aiter + #7001 on one
+node (CUDA Graph, Stage1 including prepare, ms):
+
+| tokens/rank | aiter + #7001 | `--fuse-quant` (8-wave) | `--gemm1 7001` |
+|---|---|---|---|
+| 2048 | 0.813-0.820 | 0.911-0.915 | 0.872-0.874 |
+| 4096 | 1.167-1.174 | 1.333-1.335 | 1.171-1.173 |
+| 8192 | 2.022-2.052 | 2.142-2.149 | 2.010-2.014 |
+
+Even at 4096 and 8192, still about 0.05 ms slower at 2048. The copy engines bound it now: KFD
+recommends one XGMI SDMA engine per peer link on this node, and the transfer alone takes
+about as long as #7001's GEMM1 without its dispatch.
 
 `MORI_CCO_GDA_CONN=full` is required for GDA (03, 06) when both ranks share one
 node; LSA examples (02, 04, 05) ignore it. Each example prints `SUCCESS` on pass.
