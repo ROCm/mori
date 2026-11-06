@@ -1,7 +1,11 @@
+# Every RAS test, so CI can build just these: cmake --build <dir> --target ras_tests
+add_custom_target(ras_tests)
+
 # The RAS API with RAS built out. It never links mori_ras, so it is built either way.
 add_executable(test_ras_built_out test_built_out.cpp)
 target_include_directories(test_ras_built_out PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME ras_built_out COMMAND test_ras_built_out)
+add_dependencies(ras_tests test_ras_built_out)
 
 if(NOT BUILD_RAS)
   return()
@@ -14,6 +18,7 @@ function(mori_ras_test name)
   target_include_directories(test_ras_${name} PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_ras_${name} PRIVATE mori_ras gtest_main)
   add_test(NAME ras_${name} COMMAND test_ras_${name})
+  add_dependencies(ras_tests test_ras_${name})
 endfunction()
 
 mori_ras_test(bounded_queues)
