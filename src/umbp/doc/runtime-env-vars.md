@@ -127,11 +127,11 @@ Read by the **spdk_proxy daemon** (for intervals it emits) and by the
 
 ---
 
-## UMBPConfig overlay (FromEnvironment)
+## UMBPConfig overlay
 
-`UMBPConfig::FromEnvironment()` overlays these on top of the struct
-defaults. Set them before constructing the C++ client (or letting the
-Python wrapper construct one) — they are read once.
+`UMBPConfig()` (and its alias `UMBPConfig::FromEnvironment()`) overlays
+these on top of the struct defaults; fields the caller assigns afterwards
+win. Set them before constructing the config — they are read once, there.
 
 | Env var | Default | Description |
 |---|---|---|
@@ -146,7 +146,7 @@ Python wrapper construct one) — they are read once.
 | `UMBP_SSD_VERIFY_CRC` | `1` | Compute checksums on write, verify on read.  Off isolates how much of the SSD path is integrity work rather than storage — the DRAM tier does no checksumming, so an unqualified comparison conflates the two.  Records written with it off carry `kFlagNoCrc` and stay readable either way. |
 | `UMBP_SSD_TIER_IO_THREADS` | `4` | Worker threads for the CPU-bound phases *inside one drive's* batch (checksum verify on read, checksum + record assembly on write).  Matches the DRAM tier's default so a DRAM-vs-SSD comparison is not silently 4 threads against 1. |
 | `UMBP_SSD_SHARD_IO_THREADS` | `0` | Worker threads for the multi-drive fan-out.  `0` = one per drive, which is what saturates N drives.  Ignored with a single `UMBP_SSD_DIR`. |
-| `UMBP_SSD_SINGLE_FLIGHT` | `1` | Coalesce concurrent reads of the same key: the first requester touches the drive, the rest are served by memcpy from its buffer.  Exists for MLA + TP, where every attention-TP rank GETs a byte-identical key and one page is otherwise read `tp_size` times.  MHA keys carry a per-rank suffix and never collide, so this is a no-op there.  Reaches only configs built by `UMBPConfig::FromEnvironment()` — sglang's `UMBPStore` needs the pybind `single_flight_reads` field instead. |
+| `UMBP_SSD_SINGLE_FLIGHT` | `1` | Coalesce concurrent reads of the same key: the first requester touches the drive, the rest are served by memcpy from its buffer.  Exists for MLA + TP, where every attention-TP rank GETs a byte-identical key and one page is otherwise read `tp_size` times.  MHA keys carry a per-rank suffix and never collide, so this is a no-op there. |
 | `UMBP_SSD_DURABILITY` | `strict` | `strict` fdatasync()s every batch write; `relaxed` leaves it to the kernel.  Relaxed is safe for a pure cache — the bytes are re-fetchable and the peer discards leftover segments at startup — so the flush buys nothing there while costing a large share of write time.  Unknown values leave the configured mode untouched. |
 | `UMBP_SSD_TIMING` | unset | Diagnostic.  Prints a stage-by-stage `[SsdPerf/tier]`, `[SsdPerf/shard]` and `[SsdPerf/peer]` breakdown per batch (index lookup / device IO / CRC / fan-out, with implied GB/s), which is what answers "device or CPU?" without a profiler.  Several lines per batch — turn it off again after investigating. |
 | `UMBP_SSD_BACKEND` | `file` | `file` or `spdk`. Implicitly upgraded to `spdk` if `UMBP_SPDK_NVME_PCI` is set. |

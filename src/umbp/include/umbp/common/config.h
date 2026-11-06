@@ -135,10 +135,8 @@ struct UMBPSsdConfig {
   // Coalesce concurrent reads of the same key: only the first touches the drive,
   // the rest are served by memcpy from its buffer.  For MLA + TP, where every
   // attention-TP rank GETs a byte-identical key; MHA keys carry a per-rank suffix
-  // and never collide, so it is a no-op there.  NOTE: UMBP_SSD_SINGLE_FLIGHT only
-  // reaches configs built by FromEnvironment() (the standalone server); sglang
-  // constructs UMBPConfig directly and needs the pybind field.  [SsdPerf/peer]
-  // reports merged=/merged_total=, which is what tells you it fired.
+  // and never collide, so it is a no-op there.  [SsdPerf/peer] reports
+  // merged=/merged_total=, which is what tells you it fired.
   bool single_flight_reads = true;
 
   // Checksum on write, verify on read.  Turning it off isolates how much of the
@@ -526,6 +524,11 @@ struct KvIndexerConfig {
 };
 
 struct UMBPConfig {
+  // The UMBP_* environment supplies the defaults, so a caller that builds a
+  // config and assigns only some fields (vLLM's UMBPStoreConnector) still gets
+  // the rest, sim mode included, from the environment.  Assignments win.
+  UMBPConfig() { LoadEnvironment(); }
+
   UMBPDramConfig dram;
   UMBPSsdConfig ssd;
   UMBPEvictionConfig eviction;
@@ -696,8 +699,12 @@ struct UMBPConfig {
     return true;
   }
 
-  static UMBPConfig FromEnvironment() {
-    UMBPConfig cfg;
+  // Same as UMBPConfig(); kept for existing callers.
+  static UMBPConfig FromEnvironment() { return UMBPConfig(); }
+
+ private:
+  void LoadEnvironment() {
+    UMBPConfig& cfg = *this;
     auto getenv_str = [](const char* name, const std::string& def) -> std::string {
       const char* v = std::getenv(name);
       return v ? v : def;
@@ -831,8 +838,6 @@ struct UMBPConfig {
             (std::atoi(local_rank) == 0) ? UMBPRole::SharedSSDLeader : UMBPRole::SharedSSDFollower;
       }
     }
-
-    return cfg;
   }
 };
 
