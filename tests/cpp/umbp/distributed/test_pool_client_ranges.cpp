@@ -41,6 +41,7 @@
 #include "umbp/common/device_gather.h"
 #include "umbp/common/host_registration.h"
 #include "umbp/distributed/config.h"
+#include "umbp/distributed/direct_pool_get.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_server.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
@@ -251,7 +252,8 @@ class PoolClientRangesTest : public ::testing::Test {
   std::unique_ptr<PoolClient> MakeClient(const std::string& node_id, size_t dram_capacity,
                                          std::vector<char>& get_scratch,
                                          std::vector<char>& put_scratch,
-                                         bool locality_prefetch = true) {
+                                         bool locality_prefetch = true,
+                                         bool direct_pool_get = false) {
     PoolClientConfig cfg;
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
@@ -278,6 +280,7 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.ranged_put_scratch_size = put_scratch.size();
     cfg.cache_remote_fetches = false;
     cfg.ranged_locality_prefetch = locality_prefetch;
+    cfg.direct_pool_get = direct_pool_get;
     auto client = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(client->Init());
     EXPECT_TRUE(client->RegisterMemory(get_scratch.data(), get_scratch.size()));
@@ -1399,6 +1402,36 @@ TEST_F(PoolClientRangesTest, WholeObjectReadFallsBackToArenaWithoutASlot) {
   EXPECT_EQ(std::memcmp(out.data(), object.data(), kObjectSize), 0);
   EXPECT_FALSE(LocallyResident(cramped.get(), key)) << "nowhere to cache it, and that is fine";
   cramped->Shutdown();
+}
+
+TEST_F(PoolClientRangesTest, DirectPoolReadFallsBackToArenaWhileSlotsHaveReaders) {
+  std::vector<char> get_scratch(kScratchSize), put_scratch(kScratchSize);
+  auto client = MakeClient("ranges-direct", kCallerCapacity, get_scratch, put_scratch,
+                           /*locality_prefetch=*/false, /*direct_pool_get=*/true);
+  auto* backend = client->Backends().Get(TierType::DRAM);
+  ASSERT_NE(backend, nullptr);
+  DirectPoolGetCache pinned_cache(kCallerCapacity);
+  auto reader = pinned_cache.Acquire(backend, "pinned", kCallerCapacity);
+  ASSERT_TRUE(reader);
+  ASSERT_EQ(backend->Capacity().available_bytes, 0u);
+
+  const std::string key = "direct-slot-unavailable";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < object.size(); ++i) object[i] = static_cast<char>(i * 73 + 19);
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  client->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(client.get(), key));
+
+  std::vector<char> out(kObjectSize, char(0xc3)), expected = out;
+  for (const auto offset : {size_t{5000}, size_t{123}})
+    std::memcpy(expected.data() + offset, object.data() + offset, 777);
+  ASSERT_EQ(client->BatchGetRanges({key}, {{out.data() + 5000, out.data() + 123}}, {{777, 777}},
+                                   {{5000, 123}}),
+            std::vector<bool>{true});
+  EXPECT_EQ(out, expected);
+  EXPECT_FALSE(LocallyResident(client.get(), key));
+  EXPECT_EQ(backend->Capacity().available_bytes, 0u);
 }
 
 // Ranges that cover every byte but arrive out of order do NOT make the arena

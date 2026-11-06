@@ -972,7 +972,8 @@ class PoolClient {
                            std::vector<bool>* results, bool recache_remote = true);
 
   // Fetch missing intervals into private pool slots, then scatter with reader holds.
-  void ServeRangesFromDirectPool(
+  // Return key indices that need scratch because no private slot was available.
+  std::vector<size_t> ServeRangesFromDirectPool(
       const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
       const std::vector<std::vector<size_t>>& sizes,
       const std::vector<std::vector<size_t>>& offsets, const std::vector<size_t>& missed,

@@ -3677,10 +3677,12 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     for (size_t i : missed) route_keys.push_back(keys[i]);
     std::vector<std::optional<RouteGetResult>> routes;
     if (RouteMissedRanges(route_keys, missed, preroutes, dbg ? &dbg->route : nullptr, &routes)) {
-      ServeRangesFromDirectPool(keys, dsts, sizes, src_offsets, missed, routes, &results,
-                                &remote_bytes);
+      missed = ServeRangesFromDirectPool(keys, dsts, sizes, src_offsets, missed, routes, &results,
+                                         &remote_bytes);
+    } else {
+      return results;
     }
-    return results;
+    if (missed.empty()) return results;
   }
 
   // ---- Phase 2: the rest, through the GET scratch arena ----
@@ -4325,14 +4327,15 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
   return plan;
 }
 
-void PoolClient::ServeRangesFromDirectPool(
+std::vector<size_t> PoolClient::ServeRangesFromDirectPool(
     const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
     const std::vector<std::vector<size_t>>& sizes, const std::vector<std::vector<size_t>>& offsets,
     const std::vector<size_t>& missed, const std::vector<std::optional<RouteGetResult>>& routes,
     std::vector<bool>* results, double* remote_bytes,
     const std::function<void(const BatchGetPlan&, std::vector<bool>*)>& fetch) {
   auto* backend = registry_.Get(medium_);
-  if (!backend || backend->Tier() != TierType::DRAM || !direct_pool_get_cache_) return;
+  if (!backend || backend->Tier() != TierType::DRAM || !direct_pool_get_cache_) return missed;
+  std::vector<size_t> unavailable;
   using Entry = DirectPoolGetCache::Entry;
   using Interval = DirectPoolGetCache::Interval;
   struct Work {
@@ -4380,7 +4383,9 @@ void PoolClient::ServeRangesFromDirectPool(
             (*results)[i] = transfer_engine_->Transfer(copies, &failed) && failed.empty();
           }
         } else {
-          MORI_UMBP_WARN("[DirectPoolGet] no local slot key='{}' bytes={}", keys[i], object_size);
+          // Pool budget or allocation pressure must not fail a valid remote GET.
+          // Leave this key for the bounded scratch path after releasing this round.
+          unavailable.push_back(i);
         }
         continue;
       }
@@ -4501,6 +4506,7 @@ void PoolClient::ServeRangesFromDirectPool(
     work.clear();
     direct_pool_get_cache_->Trim();
   }
+  return unavailable;
 }
 
 std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMedium(

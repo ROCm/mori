@@ -104,13 +104,11 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
     scratch_opts.backing = HostBufferBacking::kAnonymousHugetlb;
     scratch_opts.hugepage_size = dc.ranged_scratch_hugepage_size;
   }
-  // PUT always has its own arena; direct pool GET does not need a GET arena.
+  // Keep a bounded GET arena for reads that cannot acquire a private pool slot.
   if (dc.ranged_scratch_size > 0) {
-    if (!direct_pool_get_)
-      ranged_get_scratch_handle_ = platform_->AllocateHost(dc.ranged_scratch_size, scratch_opts);
+    ranged_get_scratch_handle_ = platform_->AllocateHost(dc.ranged_scratch_size, scratch_opts);
     ranged_put_scratch_handle_ = platform_->AllocateHost(dc.ranged_scratch_size, scratch_opts);
-    if ((!direct_pool_get_ && !ranged_get_scratch_handle_.valid()) ||
-        !ranged_put_scratch_handle_.valid()) {
+    if (!ranged_get_scratch_handle_.valid() || !ranged_put_scratch_handle_.valid()) {
       // HostBufferHandle is not RAII and the destructor/Close() won't run when a
       // constructor throws, so free whatever did allocate before bailing out
       // (Free() is a no-op on an invalid handle).
