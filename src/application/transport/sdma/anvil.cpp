@@ -392,7 +392,10 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // ringing its doorbell hangs, so fold every selected id down to its backing
   // even engine (id & ~1) and dedup, preserving order, so the per-engine queue
   // budget is not double-charged.
-  if (isMi308x(srcNode)) {
+  const bool mi308x = isMi308x(srcNode);
+  // A single-engine peer link whose recommended engine is fused off.
+  const bool foldedLink = mi308x && srcNode != dstNode && engines.size() == 1 && (engines[0] & 1u);
+  if (mi308x) {
     uint32_t seen = 0;
     std::vector<uint32_t> evenEngines;
     for (uint32_t e : engines) {
@@ -415,9 +418,30 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // eventually exhaust the per-engine queue slots.
   auto& channels = sdma_channels_[std::make_pair(srcNode, dstNode)];
   if (static_cast<int>(channels.size()) < numChannels) {
+    auto& use = peer_engine_use_[srcNode];
+    // The fold above can put two single-engine peer links of one GPU on the same
+    // engine (masks 0x40 and 0x80 both land on engine 6), serialising this GPU's
+    // copies to both peers. When such a collision involves a folded link and an
+    // xGMI engine (2, 4 or 6; engine 0 is the general one) of this GPU is still
+    // unused, the new link takes that engine. Links with correct (even)
+    // recommendations never fold, and with every xGMI engine already busy the
+    // recommended assignment is kept.
+    if (mi308x && srcNode != dstNode && numEngines == 1 && channels.empty() &&
+        use.links[engines[0]] > 0 && (foldedLink || use.foldedLinks[engines[0]] > 0)) {
+      for (uint32_t e : {2u, 4u, 6u}) {
+        if (use.links[e] == 0) {
+          engines[0] = e;
+          break;
+        }
+      }
+    }
     const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
     for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
       uint32_t engineId = engines[c % numEngines];
+      if (srcNode != dstNode) {
+        use.links[engineId]++;
+        if (foldedLink) use.foldedLinks[engineId]++;
+      }
       channels.emplace_back(std::make_unique<SdmaQueue>(hsakmtNode, engineId));
     }
   }
