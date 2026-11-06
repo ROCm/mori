@@ -178,6 +178,9 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   int logS = resolveLogS(chunkBytes, /*allReduce=*/false);
   const size_t maxSlicesByData = std::max<size_t>(1, chunkElemsC / VecSize);
   while (logS > 0 && (1ULL << logS) > maxSlicesByData) logS--;
+  // Slicing only helps the SYNC path, where it overlaps SDMA-copy latency with
+  // the reduction. 
+  if (phase != kSync) logS = 0;
 
   if (mode == RsMode::kPull) {
     // The kernel resolves peer pe's copy of `input` device-side by the same
@@ -193,7 +196,7 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
     });
   } else if (phase == kAsyncStart) {
     // Start only: issue the SDMA scatter and exit; AsyncDone reduces.
-    ReduceScatterPushScatter<ComputeT><<<1, 64, 0, stream>>>(
+    ReduceScatterPushStart<ComputeT><<<1, 64, 0, stream>>>(
         myPe_, nPes_, logS, chunkElemsC, devComm_, state_.heapWin,
         reinterpret_cast<const ComputeT*>(input),
         reinterpret_cast<ComputeT*>(state_.staging), barrierCtr_, arrived_);
@@ -209,6 +212,16 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
         /*doScatter=*/phase == kSync);
   }
   return hipGetLastError();
+}
+
+// MORI_DISABLE_ASYNC=1 forces every async collective to run synchronously, for
+// A/B against the async path. Read once; the env var is not expected to change.
+bool AsyncDisabled() {
+  static const bool disabled = [] {
+    const char* e = std::getenv("MORI_DISABLE_ASYNC");
+    return e != nullptr && e[0] == '1';
+  }();
+  return disabled;
 }
 
 // Enum entry point: dispatch (dt, op) to reduceScatterImpl for F32/BF16/F16/S32/S64
@@ -347,6 +360,7 @@ hipError_t CollectivesFacade::RunAllReduce(const void* input, void* output, size
 hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size_t chunkBytes,
                                            hipStream_t stream, bool isAsync) {
   constexpr int kThreads = 64;
+  isAsync = isAsync && !AsyncDisabled();
   if (isAsync) {
     // Start only: issue the SDMA scatter and exit; AsyncDone waits for it.
     AllGatherPushKernel<kAsyncStart><<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output,
