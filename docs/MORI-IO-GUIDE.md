@@ -106,7 +106,7 @@ from mori.io import (
 |--------|-------------|
 | `InProgress()` | Transfer still in progress |
 | `Succeeded()` | Transfer completed successfully |
-| `Failed()` | Transfer failed |
+| `Failed()` | Transfer failed. Over RDMA it reports only once none of the transfer's WRs can still move data, so its buffers may then be reused |
 | `Code()` | Get status code |
 | `Message()` | Get status message |
 | `Wait()` | Block until transfer completes |

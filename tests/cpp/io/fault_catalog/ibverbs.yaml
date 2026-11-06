@@ -7,6 +7,9 @@
 #             the target was told
 #   recovers  once the fault clears, a new transfer between the same engines succeeds
 #   alive     the process neither exits nor crashes
+#   stopped   (initiator-side faults) when the transfer reports an error, none of its
+#             data WRs can still run: each has completed or sits on a QP in ERR, so
+#             a caller that frees its buffers on that error frees nothing in use
 #   waits     (entries with waits: true) the call returns with the transfer still
 #             IN_PROGRESS: the fault hits after its data WRs are on the wire, and
 #             the caller may reuse its buffers once the transfer reports an error
@@ -24,6 +27,10 @@
 #               omit for no fault
 #   transfer    write | read  (one 1 MiB transfer)
 #               batch         (BatchWrite of 2 non-adjacent segments over 2 QPs)
+#               large_then_small, small_then_large
+#                             (BatchWrite of a 256 MiB and a 4 KiB segment over 2
+#                              QPs, the named one posted first: a fault on the small
+#                              one lands while the large one is still on the wire)
 #   notify      MORI notifications on: a SEND/RECV after the data tells the target
 #               (default false)
 #   warmup      clean transfers before the fault is armed; 0 arms it before the
@@ -59,6 +66,28 @@
   real_world: post fails on QP 2 after QP 1 already posted
   rule: post_send_fail:skip=1
   transfer: batch
+
+- id: post_send_fail.large_then_small
+  real_world: post fails on QP 2 while QP 1's large write is still on the wire
+  rule: post_send_fail:skip=1
+  transfer: large_then_small
+
+# Chunked into 4 MiB WRs posted 4 at a time, so when the ninth post fails both QPs hold
+# unsignaled WRs of the transfer with nothing behind them to report their completion.
+- id: post_send_fail.unsignaled_pending
+  real_world: a post fails while both QPs still hold unsignaled WRs of the transfer
+  rule: post_send_fail:skip=8
+  transfer: large_then_small
+  env: MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
+
+# Every post after the eighth fails, the completion markers included: the QPs holding
+# pending unsignaled WRs are cut instead, so the transfer still ends, and the next one
+# gets new QPs.
+- id: post_send_fail.unsignaled_pending.no_marker
+  real_world: a post fails partway and the QP refuses the completion marker too
+  rule: post_send_fail:skip=8:count=0
+  transfer: large_then_small
+  env: MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
 
 - id: post_send_fail.notify
   real_world: data posted, then the notification post fails
@@ -145,6 +174,12 @@
   rule: cqe_error:op=write
   transfer: batch
 
+# The small write completes first, so the error lands on it while the large one runs.
+- id: cqe_error.small_then_large
+  real_world: one QP fails while the other QP's large write is still on the wire
+  rule: cqe_error:op=write
+  transfer: small_then_large
+
 # Initiator side only: the injected error lands after the real SEND was
 # delivered, so the target is still told. cqe_drop.notify.recv covers the target side.
 - id: cqe_error.notify.rnr
@@ -207,3 +242,8 @@
   real_world: one of two QPs dies
   rule: qp_error
   transfer: batch
+
+- id: qp_error.small_then_large
+  real_world: one QP dies before its small write while the other QP's large write runs
+  rule: qp_error
+  transfer: small_then_large
