@@ -29,6 +29,7 @@
 #include <utility>
 #include <vector>
 
+#include "mori/io/enum.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 #include "umbp/common/grpc_limits.h"
@@ -122,8 +123,16 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         metric_sink_(metric_sink) {}
 
   grpc::Status GetPeerInfo(grpc::ServerContext* /*context*/,
-                           const ::umbp::GetPeerInfoRequest* /*request*/,
+                           const ::umbp::GetPeerInfoRequest* request,
                            ::umbp::GetPeerInfoResponse* response) override {
+    if (request->protocol_version() != 0 &&
+        request->protocol_version() != mori::io::kMoriIoProtocolVersion) {
+      return grpc::Status(
+          grpc::FAILED_PRECONDITION,
+          "protocol version mismatch (peer=" + std::to_string(request->protocol_version()) +
+              ", local=" + std::to_string(mori::io::kMoriIoProtocolVersion) + ")");
+    }
+
     if (!engine_desc_bytes_.empty()) {
       response->set_engine_desc(std::string(engine_desc_bytes_.begin(), engine_desc_bytes_.end()));
     }
@@ -155,6 +164,10 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     // Uniform across backends; BackendRegistry::Register refuses a backend that
     // disagrees, so there is one page size to report.
     if (registry_ != nullptr) response->set_page_size(registry_->PageSize());
+
+    response->set_protocol_version(mori::io::kMoriIoProtocolVersion);
+    response->set_agent_mode(static_cast<uint32_t>(mori::io::AgentMode::READ_WRITE));
+    if (registry_ != nullptr) response->set_block_size(registry_->PageSize());
     return grpc::Status::OK;
   }
 
