@@ -138,7 +138,7 @@ int CollectivesFacade::resolveLogS(size_t chunkBytes, bool allReduce) const {
 
 template <class T, class Op>
 hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* output_v, size_t count,
-                                                hipStream_t stream) {
+                                                hipStream_t stream, int phase) {
   const T* input = static_cast<const T*>(input_v);
   T* output = static_cast<T*>(output_v);
   using ComputeT = typename detail::ReduceComputeType<T>::type;
@@ -146,7 +146,9 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
 
   const size_t chunkElems = count;
   const size_t chunkBytes = chunkElems * sizeof(T);
-  const RsMode mode = resolveMode(chunkBytes * nPes_, /*allReduce=*/false);
+  // Async always pushes: only the push path splits into start and done.
+  const RsMode mode =
+      phase != kSync ? RsMode::kPush : resolveMode(chunkBytes * nPes_, /*allReduce=*/false);
 
   // The reduce runs on a compute type derived from T (float reduces as float,
   // bf16 reduces as a packed pair). Data buffers stay physically T; counts
@@ -189,14 +191,22 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
                                   state_.groupCtr, barrierCtr_);
       return hipGetLastError();
     });
+  } else if (phase == kAsyncStart) {
+    // Start only: issue the SDMA scatter and exit; AsyncDone reduces.
+    ReduceScatterPushScatter<ComputeT><<<1, 64, 0, stream>>>(
+        myPe_, nPes_, logS, chunkElemsC, devComm_, state_.heapWin,
+        reinterpret_cast<const ComputeT*>(input),
+        reinterpret_cast<ComputeT*>(state_.staging), barrierCtr_, arrived_);
   } else {
     // Every block loops over all S slices (no block-to-slice mapping), so the
-    // grid needs no rounding to a multiple of S.
+    // grid needs no rounding to a multiple of S. blocks/logS depend only on
+    // count and facade state, so a kAsyncDone launch matches its start.
     ReduceScatterPushKernel<NumVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
         myPe_, nPes_, logS, reinterpret_cast<ComputeT*>(output),
         state_.groupCtr, chunkElemsC, devComm_, state_.heapWin,
         reinterpret_cast<const ComputeT*>(input),
-        reinterpret_cast<ComputeT*>(state_.staging), barrierCtr_, arrived_);
+        reinterpret_cast<ComputeT*>(state_.staging), barrierCtr_, arrived_,
+        /*doScatter=*/phase == kSync);
   }
   return hipGetLastError();
 }
@@ -204,15 +214,27 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
 // Enum entry point: dispatch (dt, op) to reduceScatterImpl for F32/BF16/F16/S32/S64
 // and all four reduction ops.
 hipError_t CollectivesFacade::RunReduceScatter(const void* input, void* output, size_t count,
-                                               DataType dt, ReduceOpKind op, hipStream_t stream) {
+                                               DataType dt, ReduceOpKind op, hipStream_t stream,
+                                               bool isAsync) {
+  isAsync = isAsync && !AsyncDisabled();
+  const int phase = isAsync ? kAsyncStart : kSync;
   auto go = [=](auto typeTag) {
     using T = decltype(typeTag);
     return detail::DispatchReduceOp<T>(op, [=](auto reduceOp) {
       using Op = decltype(reduceOp);
-      return this->reduceScatterImpl<T, Op>(input, output, count, stream);
+      return this->reduceScatterImpl<T, Op>(input, output, count, stream, phase);
     });
   };
-  return detail::DispatchReduceType(dt, go);
+  hipError_t err = detail::DispatchReduceType(dt, go);
+  if (isAsync && err == hipSuccess) {
+    pending_ = {AsyncOp::kReduceScatter};
+    pending_.input = input;
+    pending_.output = output;
+    pending_.count = count;
+    pending_.dt = dt;
+    pending_.reduceOp = op;
+  }
+  return err;
 }
 
 template <class T, class Op>
@@ -363,7 +385,7 @@ hipError_t CollectivesFacade::AsyncDone(hipStream_t stream) {
   const PendingAsync p = pending_;
   pending_ = {};
   constexpr int kThreads = 64;
-  // The done phase never reads the buffer / size arguments.
+  // Only the reduce-scatter done phase reads buffer / size arguments.
   switch (p.op) {
     case AsyncOp::kNone:
       return hipSuccess;
@@ -380,12 +402,22 @@ hipError_t CollectivesFacade::AsyncDone(hipStream_t stream) {
                        p.npes, p.dstPe, p.srcPe, nullptr, nullptr, 0, state_.devComm,
                        state_.heapWin, state_.permuteCtr, state_.permuteNum);
       break;
+    case AsyncOp::kReduceScatter:
+      // Redo the start's dispatch: the done kernel is per type and op.
+      return detail::DispatchReduceType(p.dt, [&](auto typeTag) {
+        using T = decltype(typeTag);
+        return detail::DispatchReduceOp<T>(p.reduceOp, [&](auto reduceOp) {
+          return this->reduceScatterImpl<T, decltype(reduceOp)>(p.input, p.output, p.count,
+                                                                stream, kAsyncDone);
+        });
+      });
   }
   return hipGetLastError();
 }
 
 hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chunkBytes,
                                           hipStream_t stream, bool isAsync) {
+  isAsync = isAsync && !AsyncDisabled();
   assert(static_cast<int>(addrs.size()) == nPes_ && "addrs size must equal npes");
   // Fill the preallocated pinned (host-visible, device-readable) AddressPair
   // buffer with a plain host write, then launch -- no per-call device copy.
@@ -453,6 +485,7 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
                                                    size_t numBytes, int srcPe,
                                                    const std::vector<int>& dstPes,
                                                    hipStream_t stream, bool isAsync) {
+  isAsync = isAsync && !AsyncDisabled();
   if (dstPes.size() > 1) {
     FACADE_PRINTF("CollectivePermute: unsupported dstPes.size()=%zu", dstPes.size());
     return hipErrorNotSupported;
@@ -525,7 +558,7 @@ namespace mori {
 namespace ccl {
 
 hipError_t CollectivesFacade::RunReduceScatter(const void*, void*, size_t, DataType, ReduceOpKind,
-                                               hipStream_t) {
+                                               hipStream_t, bool) {
   return hipErrorNotSupported;
 }
 hipError_t CollectivesFacade::RunAllReduce(const void*, void*, size_t, DataType, ReduceOpKind,

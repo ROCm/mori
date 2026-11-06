@@ -160,6 +160,13 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 // input/staging/output MUST live in the symmetric static heap (ShmemMalloc) so
 // the address-based SDMA put can translate local->peer (offset from heapBaseAddr);
 // groupCtr is a plain hipMalloc'd buffer (never peer-written).
+//
+// Async split: ReduceScatterPushScatter (1 block) runs Phase 1 only and exits
+// with the copies in flight; the later ReduceScatterPushKernel launch with
+// doScatter=false runs Phases 2-3, WaitDelivered and the gen bump. It recovers
+// the same pushGen because my slot still holds the start's odd pushGen-1. Between
+// the two launches input must stay untouched, output unread, and no other
+// collective may run on this PE range (staging is shared).
 // ---------------------------------------------------------------------------
 
 // Phases 2 + 3 for ONE slice: wait until slice `slice` has landed from every
@@ -358,7 +365,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
                                     cco::ccoDevComm devComm, cco::ccoWindow_t heapWin,
                                     const T* __restrict__ input, T* __restrict__ staging,
                                     uint64_t* __restrict__ barrierCtr,
-                                    uint64_t* __restrict__ arrived) {
+                                    uint64_t* __restrict__ arrived, bool doScatter) {
 // Original gen counter idea:
 // gen = gen_ptr[0];
 // __syncthreads();
@@ -374,8 +381,9 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
   // block out advances it, after every block has counted in.
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
   const uint32_t stride4G = heapWin->stride4G;
-  // Phase 1: scatter the input to the staging buffer
-  if (blockIdx.x == 0) {
+  // Phase 1: scatter the input to the staging buffer (already done by
+  // ReduceScatterPushScatter when doScatter is false)
+  if (doScatter && blockIdx.x == 0) {
     // Finishing the previous launch only proves peers SENT to us, not that they
     // are done reducing what we sent them: each peer's queue polls for its
     // arrival in this launch before writing into its staging.
@@ -429,6 +437,34 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
       atomicInc(&groupCtr[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1) {
     AtomicStore<ESystemScope>(&barrierCtr[myPe], pushGen);
   }
+}
+
+// Async start of the push reduce-scatter: Phase 1 of ReduceScatterPushKernel
+// only, launched with a single block. Exits with the copies in flight; finish
+// with ReduceScatterPushKernel(doScatter=false).
+template <class T>
+__global__ void ReduceScatterPushScatter(int myPe, int npes, int logS, size_t chunkElems,
+                                         cco::ccoDevComm devComm, cco::ccoWindow_t heapWin,
+                                         const T* __restrict__ input,
+                                         T* __restrict__ staging,
+                                         uint64_t* __restrict__ barrierCtr,
+                                         uint64_t* __restrict__ arrived) {
+  const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
+  const uint32_t stride4G = heapWin->stride4G;
+  PostArrival(barrierCtr, pushGen - 1, myPe, npes, stride4G);
+  __syncthreads();
+  StartSdmaScatter<sizeof(T), /*AlwaysGated=*/true>(
+      devComm.sdma, npes, logS, pushGen,
+      [=](int peer) {
+        const int slot = (myPe < peer ? myPe : myPe - 1);   // my slot in peer's staging
+        auto [stagingP, arrivedP] = PeerPtrs(staging + slot * chunkElems,
+                      arrived + myPe * kArrivedStride, peer, myPe, stride4G);
+        return ScatterPeer{
+            peer != myPe, chunkElems,
+            reinterpret_cast<const uint8_t*>(input + peer * chunkElems),
+            reinterpret_cast<uint8_t*>(stagingP), arrivedP,
+            BarrierGate(barrierCtr, peer), static_cast<uint32_t>(pushGen - 1)};
+      });
 }
 
 // ---------------------------------------------------------------------------
