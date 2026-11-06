@@ -211,6 +211,10 @@ struct config_t {
   // per-call launch count from active tokens. Automatic contexts provision
   // their endpoint capacity from max_num_inp_token_per_rank.
   int num_blocks = 4;
+  // Upper bound on automatic block counts; 0 means none. make_config sets it
+  // to the device's compute unit count, the largest grid whose blocks stay
+  // co-resident for the grid barriers. Explicit num_blocks is not clamped.
+  int max_auto_num_blocks = 0;
   int num_proxy_threads = 4;  // CPU proxy threads for invoke→RDMA
   // RDMA devices used by proxies. Not an independent tunable for EP: each proxy
   // thread owns exactly one device (concurrent progress on a shared device
@@ -244,13 +248,17 @@ struct config_t {
   int num_experts_per_rank() const { return num_experts / world_size; }
   int rank_of_expert(int expert_id) const { return expert_id / num_experts_per_rank(); }
   bool uses_automatic_num_blocks() const { return num_blocks == 0; }
+  int capped_auto_num_blocks(int recommended) const {
+    return max_auto_num_blocks > 0 && recommended > max_auto_num_blocks ? max_auto_num_blocks
+                                                                        : recommended;
+  }
   // Number of blocks provisioned at construction. Automatic mode derives
   // this directly from the configured maximum input capacity; explicit mode
   // keeps its fixed launch count.
   int provisioned_num_blocks() const {
-    return uses_automatic_num_blocks()
-               ? recommended_num_blocks(max_num_inp_token_per_rank, world_size)
-               : num_blocks;
+    return uses_automatic_num_blocks() ? capped_auto_num_blocks(recommended_num_blocks(
+                                             max_num_inp_token_per_rank, world_size))
+                                       : num_blocks;
   }
   // Number of invoke SPSC queues: one per producer wavefront. Derived
   // from provisioned_num_blocks(), never tuned directly.
@@ -264,9 +272,8 @@ struct config_t {
   runtime_defaults_t launch_policy_for(int active_num_tokens) const {
     runtime_defaults_t policy =
         recommended_runtime_defaults(active_num_tokens > 0 ? active_num_tokens : 1, world_size);
-    if (!uses_automatic_num_blocks()) {
-      policy.num_blocks = num_blocks;
-    }
+    policy.num_blocks =
+        uses_automatic_num_blocks() ? capped_auto_num_blocks(policy.num_blocks) : num_blocks;
     if (rcomp_backend != rcomp_backend_t::AUTO) {
       policy.rcomp_backend = rcomp_backend;
     }

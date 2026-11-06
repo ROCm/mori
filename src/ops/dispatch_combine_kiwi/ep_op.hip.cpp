@@ -72,6 +72,10 @@ config_t make_config(const ep_op_config_t& in) {
   cfg.topk = in.topk;
   cfg.max_num_inp_token_per_rank = in.max_num_inp_token_per_rank;
   cfg.num_blocks = in.num_blocks;
+  int hip_device = 0;
+  HIP_CHECK_THROW(hipGetDevice(&hip_device));
+  HIP_CHECK_THROW(hipDeviceGetAttribute(&cfg.max_auto_num_blocks,
+                                        hipDeviceAttributeMultiprocessorCount, hip_device));
   cfg.num_proxy_threads = in.num_proxy_threads;
   cfg.queue_capacity = in.queue_capacity;
   cfg.device_name = in.device_name;
