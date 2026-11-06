@@ -31,16 +31,18 @@ from .local_expert_count import (
 )
 
 # dispatch_combine_v2, gemm_ar, gemm_a2a, a2a_gemm, gemm_ag and ag_gemm
-# (FlyDSL) require the optional `flydsl` dependency, so they are imported
-# lazily: `import mori.ops` stays usable without flydsl installed, and each
-# submodule resolves on first access.
+# (FlyDSL) require the optional `flydsl` dependency, and
+# dispatch_combine_kiwi requires a BUILD_OPS_KIWI build, so they are imported
+# lazily: `import mori.ops` stays usable without them, and each submodule
+# resolves on first access.
 _LAZY_SUBMODULES = {
-    "dispatch_combine_v2",
-    "gemm_ar",
-    "gemm_a2a",
     "a2a_gemm",
-    "gemm_ag",
     "ag_gemm",
+    "dispatch_combine_kiwi",
+    "dispatch_combine_v2",
+    "gemm_a2a",
+    "gemm_ag",
+    "gemm_ar",
 }
 
 
