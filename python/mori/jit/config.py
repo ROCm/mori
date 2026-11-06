@@ -313,6 +313,15 @@ def is_debuginfo_enabled() -> bool:
     return val.lower() in ("1", "true", "yes", "on")
 
 
+def is_resource_usage_enabled() -> bool:
+    """Return True if MORI_JIT_RESOURCE_USAGE is set to a truthy value.
+
+    Only kernels that are actually compiled report; cached .hsaco files are reused silently.
+    """
+    val = os.environ.get("MORI_JIT_RESOURCE_USAGE", "")
+    return val.lower() in ("1", "true", "yes", "on")
+
+
 def detect_build_config() -> BuildConfig:
     """Auto-detect the full build config (cached after first call)."""
     global _cached_config

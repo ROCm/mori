@@ -199,6 +199,16 @@ jobs:
           $CT exec $CONTAINER bash -c \
             "cd $GITHUB_WORKSPACE && BUILD_BENCHMARK=ON BUILD_CCO_SDMA=ON BUILD_EXAMPLES=ON pip install . && pip install prettytable"
 
+      # Outside pytest so the per-kernel VGPR/AGPR/scratch/occupancy remarks reach the log, and
+      # into a throwaway cache so every kernel is compiled rather than reused.
+      - name: JIT kernel resource usage
+        continue-on-error: true
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && MORI_JIT_RESOURCE_USAGE=1 MORI_JIT_CACHE_DIR=\$(mktemp -d) \
+              timeout 900 python -c 'from mori.jit import precompile; precompile()'
+          "
+
       - name: MORI-EP (intranode)
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
@@ -391,6 +401,7 @@ jobs:
           $CT exec $CONTAINER bash -c "
             set -e
             cd $GITHUB_WORKSPACE
+            MORI_SHMEM_HEAP_SIZE=6G timeout 120 mpirun --allow-run-as-root -np 2 ./build/examples/test_warp_copy_alignment
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
