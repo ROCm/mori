@@ -332,6 +332,13 @@ def _ocp_fp_defines(arch: str) -> list[str]:
     return ["-DHIP_ENABLE_GFX950_OCP_BUILTINS=1"] if "gfx950" in str(arch) else []
 
 
+def _arch_family_defines(arch: str) -> list[str]:
+    """The host's gfx125x decision (see _FASTPATH_ARCH_PREFIX), so device code can check it."""
+    return (
+        ["-DMORI_HOST_GFX125X=1"] if str(arch).startswith(_FASTPATH_ARCH_PREFIX) else []
+    )
+
+
 def _debuginfo_flags() -> list[str]:
     """Return hipcc debug flags if MORI_DEBUG_INFO is enabled."""
     return ["-g", "-ggdb"] if is_debuginfo_enabled() else []
@@ -479,6 +486,7 @@ def _hipcc_genco(
         *_ccqe_defines(),
         *_profiler_defines(),
         *_ocp_fp_defines(cfg.arch),
+        *_arch_family_defines(cfg.arch),
         *_tunable_defines(),
     ]
 
