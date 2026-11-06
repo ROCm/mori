@@ -100,8 +100,8 @@ struct EngineDesc {
   // is created. Opaque bytes (see DescBlob) — e.g. OFI stores its addr_name.
   BackendDescBlobMap backendDescs;
 
-  uint32_t protocolVersion{kMoriIoProtocolVersion};
-  uint32_t agentMode{static_cast<uint32_t>(AgentMode::READ_WRITE)};
+  uint32_t protocolVersion{0};
+  uint32_t agentMode{0};
   uint64_t blockSize{0};
 
   bool operator==(const EngineDesc& rhs) const noexcept {

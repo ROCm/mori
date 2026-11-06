@@ -31,8 +31,8 @@ using namespace mori::io;
 
 TEST(EngineDescCompat, DefaultFieldValues) {
   EngineDesc desc;
-  EXPECT_EQ(desc.protocolVersion, kMoriIoProtocolVersion);
-  EXPECT_EQ(desc.agentMode, static_cast<uint32_t>(AgentMode::READ_WRITE));
+  EXPECT_EQ(desc.protocolVersion, 0u);
+  EXPECT_EQ(desc.agentMode, 0u);
   EXPECT_EQ(desc.blockSize, 0u);
 }
 

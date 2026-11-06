@@ -182,6 +182,8 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.host = config.host;
   desc.port = config.port;
   desc.pid = static_cast<int>(getpid());
+  desc.protocolVersion = kMoriIoProtocolVersion;
+  desc.agentMode = static_cast<uint32_t>(AgentMode::READ_WRITE);
   MORI_IO_INFO("Create engine key {} node_id {} hostname {}", key, desc.nodeId, hostname);
 }
 
@@ -388,30 +390,6 @@ void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
         "Remote engine {} (node_id {}) has protocolVersion=0; assuming legacy peer — "
         "skipping strict compatibility checks",
         remote.key, remote.nodeId);
-  }
-
-  if (remote.agentMode != 0 && desc.agentMode != 0) {
-    bool localReads = (desc.agentMode & static_cast<uint32_t>(AgentMode::READ)) != 0;
-    bool localWrites = (desc.agentMode & static_cast<uint32_t>(AgentMode::WRITE)) != 0;
-    bool remoteReads = (remote.agentMode & static_cast<uint32_t>(AgentMode::READ)) != 0;
-    bool remoteWrites = (remote.agentMode & static_cast<uint32_t>(AgentMode::WRITE)) != 0;
-    bool compatible = (localReads && remoteWrites) || (localWrites && remoteReads);
-    if (!compatible) {
-      MORI_IO_WARN(
-          "Remote engine {} (node_id {}): no complementary transfer direction "
-          "(local mode={:#x}, remote mode={:#x})",
-          remote.key, remote.nodeId, desc.agentMode, remote.agentMode);
-    }
-  }
-
-  if (remote.blockSize != 0 && desc.blockSize != 0 && remote.blockSize != desc.blockSize) {
-    MORI_IO_ERROR(
-        "Rejecting remote engine {} (node_id {}): block size mismatch "
-        "(local={}, remote={})",
-        remote.key, remote.nodeId, desc.blockSize, remote.blockSize);
-    throw std::runtime_error(
-        "MoRI-IO handshake failed: block size mismatch (local=" + std::to_string(desc.blockSize) +
-        ", remote=" + std::to_string(remote.blockSize) + ")");
   }
 
   for (auto& it : backends) {
