@@ -319,6 +319,14 @@ class MediumBackend : public MetricSource {
   // keys picked by recency alone can leave every segment partly live.
   virtual bool OwnsEvictionOrder() const { return false; }
 
+  // Count these keys as just used, for a caller that used them without reading
+  // them here (it served them from a faster cache of its own).  Recency is the
+  // only thing that moves: no lease, no read.  Keys move in the order given, so
+  // the last is the most recent.  Returns how many are held here, a duplicate
+  // counted each time; a medium that does not implement it (SsdBackend today)
+  // keeps its order and returns 0.
+  virtual size_t Touch(const std::vector<std::string>& /*keys*/) { return 0; }
+
   // ---- observability ----
   //
   // A backend does NOT report its own operation counts, byte volumes or
