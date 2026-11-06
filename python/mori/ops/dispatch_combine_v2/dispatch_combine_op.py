@@ -214,6 +214,12 @@ class EpDispatchCombineConfig:
     # Pick "lsa" for a small-batch, empty-seam call; keep "sdma" otherwise, when
     # the point is the overlap, or when this op will later run across nodes.
     async_ll_transport: str = "sdma"
+    # Give this op its own SDMA queue per peer instead of the shared one (sdma
+    # transport only). Set it when two ops interleave on one stream, e.g.
+    # single-stream two-batch overlap: a recv then no longer waits for the other
+    # op's send. With the ops on separate streams, a two-op microbenchmark is
+    # slower but DeepSeek-V4 prefill was still faster, so measure that case.
+    async_ll_own_sdma_queue: bool = False
 
     def __post_init__(self):
         # Node grouping first: is_internode gates checks further down, and the

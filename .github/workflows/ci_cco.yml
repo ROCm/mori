@@ -87,6 +87,16 @@ jobs:
             timeout 120 python -m pytest -v \
               tests/python/ops/dispatch_combine_v2/test_internode_regions.py"
 
+      - name: Check arch detection, tuning keys and AsyncLL options
+        run: |
+          # No GPU needed: arch-string matching, the ASIC-revision table keys and their
+          # CU fit, the per-target macro guard, and the AsyncLL defaults per arch.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 120 python -m pytest -v \
+              tests/python/ops/dispatch_combine_v2/test_gfx1250_strict_arch.py \
+              tests/python/ops/dispatch_combine_v2/test_asyncll_options.py"
+
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
           # MORI_CCO_SKIP_GDA_FULL=1: the MI355X-AINIC runner has no intranode
@@ -427,8 +437,16 @@ jobs:
           # MORI_ENABLE_SDMA=1 matters for the sdma leg: without SDMA queues every
           # put is a no-op and the receiver spins until the timeout, so a runner
           # that quietly lost SDMA shows up as this step timing out, not passing.
-          for transport in sdma lsa; do
-            $CT exec -e MORI_ENABLE_SDMA=1 -e TRANSPORT=$transport $CONTAINER bash -c "\
+          #
+          # sdma runs once per notification protocol: early notification is the
+          # gfx950 default, so legacy and fused receive each need an explicit run.
+          for run in "sdma" "sdma MORI_ASYNCLL_EARLY_NOTIFY=0" "sdma MORI_ASYNCLL_FUSED_RECV=1" "lsa"; do
+            set -- $run
+            transport=$1; shift
+            envs="-e MORI_ENABLE_SDMA=1 -e TRANSPORT=$transport"
+            for e in "$@"; do envs="$envs -e $e"; done
+            echo "== test_asyncll $run"
+            $CT exec $envs $CONTAINER bash -c "\
               cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
               out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_asyncll.py 2>&1) || \
                 { echo \"\$out\"; exit 1; }; \
