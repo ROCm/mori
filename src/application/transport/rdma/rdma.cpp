@@ -404,11 +404,20 @@ bool ReadIbEnableRelaxedOrderingEnv() {
 }
 
 int MaybeAddRelaxedOrderingFlag(int accessFlag) {
-#ifdef IBV_ACCESS_RELAXED_ORDERING
+  // IBV_ACCESS_RELAXED_ORDERING is an enumerator of enum ibv_access_flags in
+  // <infiniband/verbs.h> (= IBV_ACCESS_OPTIONAL_FIRST, 1 << 20), not a macro. Guarding it
+  // with #ifdef is therefore always false, which compiled this branch out and made
+  // MORI_IB_ENABLE_RELAXED_ORDERING a silent no-op.
   if (ReadIbEnableRelaxedOrderingEnv()) {
+    static const bool logged = [] {
+      MORI_APP_INFO(
+          "MORI_IB_ENABLE_RELAXED_ORDERING=1: registering memory regions with "
+          "IBV_ACCESS_RELAXED_ORDERING");
+      return true;
+    }();
+    (void)logged;
     return accessFlag | IBV_ACCESS_RELAXED_ORDERING;
   }
-#endif
   return accessFlag;
 }
 
