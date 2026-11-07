@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -166,7 +167,7 @@ void ObserveBatchBandwidth(MetricSink* sink, double bytes, double seconds, const
 //
 //  Note the paths are NOT symmetric, and the timers are what proves it: a get
 //  resolves locally first and only routes on a miss, while a put issues
-//  BatchRoutePut on EVERY call including fully-local ones.
+//  BatchRoutePut on every call unless UMBP_DISTRIBUTED_OFFLOAD=0.
 //
 //  Off by default; knobs mirror UMBP_HBM_COPY_DEBUG:
 //    UMBP_RANGED_CALL_DEBUG=1             enable
@@ -846,6 +847,20 @@ bool PoolClient::Init() {
   bool expected = false;
   if (!initialized_.compare_exchange_strong(expected, true)) return true;
 
+  distributed_offload_ = true;
+  if (const char* value = std::getenv("UMBP_DISTRIBUTED_OFFLOAD")) {
+    std::string flag(value);
+    std::transform(flag.begin(), flag.end(), flag.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (flag == "0" || flag == "false" || flag == "off") {
+      distributed_offload_ = false;
+    } else if (flag != "1" && flag != "true" && flag != "on") {
+      MORI_UMBP_ERROR("[PoolClient] UMBP_DISTRIBUTED_OFFLOAD must be 0/1, false/true or off/on");
+      initialized_.store(false);
+      return false;
+    }
+  }
+
   if (config_.workload_trace_path.empty()) {
     if (const char* path = std::getenv("UMBP_WORKLOAD_TRACE_PATH")) {
       config_.workload_trace_path = path;
@@ -879,6 +894,8 @@ bool PoolClient::Init() {
   } else {
     MORI_UMBP_INFO("[PoolClient] no master configured; running single-node");
   }
+  MORI_UMBP_INFO("[PoolClient] PUT placement={}",
+                 HasMaster() && distributed_offload_ ? "distributed" : "local-only");
 
   try {
     auto engines = platform_->CreateTransferEngine(config_, backend_configs);
@@ -2429,7 +2446,7 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
   for (size_t i = 0; i < sizes.size(); ++i) block_sizes[i] = static_cast<uint64_t>(sizes[i]);
   std::vector<std::optional<RoutePutResult>> routes;
   std::unordered_set<std::string> excludes;
-  if (!HasMaster()) {
+  if (!HasMaster() || !distributed_offload_) {
     RouteAllPutsLocally(keys.size(), &routes);
   } else {
     auto status = master_client_->BatchRoutePut(keys, block_sizes, excludes, &routes);
@@ -4084,12 +4101,11 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
 
   std::vector<std::optional<RoutePutResult>> routes;
   std::unordered_set<std::string> excludes;
-  // Unconditional, unlike the get path, which routes only what it missed
-  // locally.  Every put pays this RPC even when every key lands on this node.
+  // Distributed placement routes every put, unlike GET's local-first lookup.
   grpc::Status route_status;
   {
     PhaseTimer route_timer(dbg ? &dbg->route : nullptr);
-    if (!HasMaster()) {
+    if (!HasMaster() || !distributed_offload_) {
       RouteAllPutsLocally(route_keys.size(), &routes);
     } else {
       route_status = master_client_->BatchRoutePut(route_keys, route_sizes, excludes, &routes);
