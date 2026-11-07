@@ -10,7 +10,12 @@ description: >-
   MORI bug or an environment/toolchain problem. Also: (2) on ROCm 7.0-7.2.x a clr
   hipMemSetAccess sub-buffer bug makes mori-cco 2-node ccoDevCommCreate fail with
   "hipMemSetAccess ... invalid argument"; (3) on ROCm 7.2.x clr routes uncached VMM
-  allocations to the coarse-grained pool, making cco combine ~10-15us slower.
+  allocations to the coarse-grained pool, making cco combine ~10-15us slower; (4)
+  amdgpu-dkms hipMemGetInfo miscounts RDMA-registered VRAM (seen on 6.14.x/6.16.x, not fixed
+  in any public release yet): dma-buf MRs make
+  allocations or kernel loads fail although VRAM is free (HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+  "no kernel image is available"), repeated ibv_reg_mr MRs on one buffer make free VRAM
+  exceed the card.
 ---
 
 # MORI Known Issues
@@ -324,3 +329,69 @@ the uncached flag into `deviceVmemAlloc` (it is hard-coded to `0`), and in
 `gpu_ext_fine_grained_segment_` when the uncached flag is set and that pool exists, else
 fall back to `gpuvm_segment_` (unchanged for every non-uncached allocation). Both Issue 2
 and Issue 3 ship in a single rebuilt `libamdhip64.so`.
+
+---
+
+## Issue 4 — amdgpu-dkms: RDMA-registered VRAM miscounted in `hipMemGetInfo`
+
+**Affects:** anything that registers HIP VRAM for RDMA (MoRI-IO, UMBP, shmem, cco).
+Reproduced on amdgpu-dkms **6.14.14, 6.16.6 and 6.16.13**; by their sources every public
+release through 31.60 (7.1.9) computes free VRAM the same way. Only the KFD free-VRAM
+count is wrong — the free VRAM `hipMemGetInfo` reports and, on 6.14.x / 6.16.x, new
+allocations are checked against; physical usage (`mem_info_vram_used`) is right.
+ROCm/mori#721.
+
+**Symptoms:**
+
+- **dma-buf MRs** (`ibv_reg_dmabuf_mr`: `MORI_ENABLE_DMABUF_REG=1`, or the fallback when
+  `ibv_reg_mr` fails): free VRAM drops by the whole allocation once it is registered
+  (MoRI-IO registers lazily, so after the first transfer). Later allocations and kernel
+  loads fail although VRAM is free: `HSA_STATUS_ERROR_OUT_OF_RESOURCES`, Triton
+  `no kernel image is available`, HIP error 209, or a SIGSEGV in `libamdhip64` at the
+  next launch.
+- **peer-memory MRs** (`ibv_reg_mr`, mori's default): each MR after the first on one
+  allocation — another NIC, another engine, a sub-buffer — adds the whole allocation back.
+  `hipMemGetInfo` can exceed the card, and allocations sized from it fail with OOM.
+
+**Root cause:** KFD free VRAM is `total - kfd.vram_used - vram_pin_size + kfd.vram_pinned`.
+`amdgpu_bo_pin()` adds a BO to `vram_pin_size` on its first pin only;
+`amdgpu_amdkfd_gpuvm_pin_bo()` (the peer-memory path) adds the whole BO to
+`kfd.vram_pinned` on every call, and dma-buf pins never do. "drm/amdkfd: correct
+vram_available calculation" moves the credit into `amdgpu_bo_pin()` (first pin / last
+unpin), which fixes both directions.
+
+**31.x releases (6.18.x – 7.1.x):** the allocation check
+(`amdgpu_amdkfd_reserve_mem_limit()`) no longer adds `kfd.vram_pinned` back, so it counts
+every RDMA-pinned BO twice whichever way it was registered, while `hipMemGetInfo` still
+credits peer-memory pins: allocations fail although `hipMemGetInfo` reports the registered
+size as free. "amdkfd: Fix memory availability double accounting of kfd pinned objects"
+makes the check use the free-VRAM count. Found in the sources, not reproduced on hardware.
+
+**Detection:** `cat /sys/module/amdgpu/version`. To see why an MR went through dma-buf
+(`RegisterRdmaMemoryRegionAuto ibv_reg_mr registration failed ... errno`), set
+`MORI_APP_LOG_LEVEL=warn`; mori logs only errors by default.
+
+**Workaround in mori** (`KfdPinAccounting`, `src/application/transport/rdma/`), off by
+default; enable it with `MORI_KFD_PIN_FIX=1`. It probes the driver at the first
+registration of a VRAM allocation of 64 MiB or more and acts only if the driver
+miscounts; `MORI_KFD_PIN_FIX=force` skips the probe. It then keeps exactly one
+peer-memory pin per registered allocation — the allocation's first `ibv_reg_mr` MR, or a
+page-sized anchor MR — and registers further MRs of that allocation through dma-buf, so
+it needs peer memory (`lsmod | grep ib_peer_mem`). With `MORI_APP_LOG_LEVEL=info` it logs
+the probe result, e.g. `KFD pin accounting: amdgpu 6.16.6 miscounts RDMA pins of VRAM
+(probe: dma-buf pin -1, peer-memory pins 0 then +1 BO); keeping one peer-memory pin per
+registered allocation`; what it cannot fix is logged as an error. Not covered:
+allocations under 64 MiB, VMM and IPC-imported memory, Ionic CQ/SQ/RQ rings and atomic
+ibufs (registered by the provider), and hosts without peer memory (no anchor possible). On
+the 31.x releases it corrects `hipMemGetInfo` but cannot change the allocation check.
+Building with `ENABLE_KFD_PIN_FIX=OFF` leaves the code out.
+
+**Fix:** an amdgpu-dkms with both patches above. No public release has them yet (checked
+through 31.60): only an internal 31.40.1.1 build (6.19.14.31400101) does, the public 31.40.1
+(6.19.14.31400100) does not. Check ROCm/mori#721 before upgrading. Until then:
+
+- On 6.14.x / 6.16.x with peer memory, do not set `MORI_ENABLE_DMABUF_REG`. ionic shows
+  the same bandwidth and registration time for both MR types.
+- Without peer memory (dma-buf only), or on the 31.x releases, nothing in user space
+  helps; leave headroom for the registered size (e.g. a lower `--mem-fraction-static` /
+  `--gpu-memory-utilization`).
