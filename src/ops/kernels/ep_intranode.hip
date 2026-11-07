@@ -55,6 +55,17 @@ MORI_FP8_ANY(WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel,
 MORI_FP8_ANY(WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel,
                               bf16_nop2p_fp4_blockwise_noweight_block256_vec8_top9, hip_bfloat16,
                               false, false, false, true, false, 256, 9, true))
+// AccumNum=6 variants. The top8/top9 set above covers DeepSeek-V3/R1 (8 routed experts, or 8+1
+// with shared-expert fusion); a model routing 6 has no AccumNum=6 symbol to select, so its
+// combine falls off the vectorized dequant entirely onto WarpAccumCombineDequantSegment, which
+// unpacks one nibble per lane per step. Registered for FP4 only: FP8 blockwise moves twice the
+// bytes per element, so the reduce is not the same bottleneck there.
+MORI_FP8_ANY(WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel,
+                              bf16_nop2p_fp4_blockwise_noweight_block128_vec8_top6, hip_bfloat16,
+                              false, false, false, true, false, 128, 6, true))
+MORI_FP8_ANY(WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel,
+                              bf16_nop2p_fp4_blockwise_noweight_block256_vec8_top6, hip_bfloat16,
+                              false, false, false, true, false, 256, 6, true))
 
 // Convert (used with ENABLE_STANDARD_MOE_ADAPT)
 extern "C" __global__ void mori_ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {

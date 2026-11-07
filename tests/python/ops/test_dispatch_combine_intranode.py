@@ -19,6 +19,9 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import contextlib
+import os
+
 import pytest
 import mori
 import torch
@@ -32,6 +35,31 @@ from tests.python.ops.dispatch_combine_test_utils import (
     run_ep_dispatch_combine_test,
     run_ep_dispatch_local_expert_count_test,
 )
+
+
+_COMBINE_SCALE_DIM_ENV = "MORI_FP8_COMBINE_SCALE_DIM"
+
+
+@contextlib.contextmanager
+def _combine_scale_dim(value):
+    """Override the blockwise combine's internal scale_dim for one op.
+
+    The C++ handle constructor reads it from the environment, and the worker pool
+    is session-scoped and spawned before any test body runs, so a monkeypatch in
+    the caller would never reach the rank that builds the handle.
+    """
+    if value is None:
+        yield
+        return
+    previous = os.environ.get(_COMBINE_SCALE_DIM_ENV)
+    os.environ[_COMBINE_SCALE_DIM_ENV] = str(value)
+    try:
+        yield
+    finally:
+        if previous is None:
+            del os.environ[_COMBINE_SCALE_DIM_ENV]
+        else:
+            os.environ[_COMBINE_SCALE_DIM_ENV] = previous
 
 
 def _combine_fp4_supported():
@@ -100,6 +128,7 @@ def _test_dispatch_combine(
     sentinel_pattern=None,
     weightless=False,
     expect_combine_kernel_substr=None,
+    combine_scale_dim=None,
 ):
     config = _make_intranode_config(
         rank=rank,
@@ -116,15 +145,16 @@ def _test_dispatch_combine(
         max_total_recv_tokens=max_total_recv_tokens,
         kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
     )
-    run_ep_dispatch_combine_test(
-        config,
-        EpDispatchCombineTestCase,
-        use_max_token_num=use_max_token_num,
-        routing=routing,
-        check_results=check_results,
-        weightless=weightless,
-        expect_combine_kernel_substr=expect_combine_kernel_substr,
-    )
+    with _combine_scale_dim(combine_scale_dim):
+        run_ep_dispatch_combine_test(
+            config,
+            EpDispatchCombineTestCase,
+            use_max_token_num=use_max_token_num,
+            routing=routing,
+            check_results=check_results,
+            weightless=weightless,
+            expect_combine_kernel_substr=expect_combine_kernel_substr,
+        )
 
 
 def _test_dispatch_combine_ll(
@@ -388,6 +418,68 @@ def test_dispatch_combine_weightless_vec8(
                     None,  # sentinel_pattern
                     True,  # weightless
                     expect_combine_kernel_substr,
+                ],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+# The AccumNum=6 fp4_blockwise specialization, for models routing 6 experts per
+# token. Unlike the topk 8/9 cases above this one cannot ride the default
+# MORI_FP8_COMBINE_SCALE_DIM=56: hidden_dim=5120 would give block_elems=92, which
+# is not a registered block size, so selection would fall back to the generic
+# kernel. 40 and 20 put it on the registered 128 and 256. Both are asserted,
+# because a missing AccumNum=6 symbol fails by silently selecting the scalar
+# generic kernel, which produces the same weightless numbers.
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("data_type", (torch.bfloat16,))
+@pytest.mark.parametrize("hidden_dim", (5120,))
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (128,))
+@pytest.mark.parametrize("num_experts_per_rank", (32,))
+@pytest.mark.parametrize("num_experts_per_token", (6,))
+@pytest.mark.parametrize("use_external_inp_buf", (True,))
+@pytest.mark.parametrize("combine_scale_dim,block_elems", ((40, 128), (20, 256)))
+def test_dispatch_combine_weightless_vec8_fp4_top6(
+    torch_dist_process_manager,
+    world_size,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    use_external_inp_buf,
+    combine_scale_dim,
+    block_elems,
+):
+    if not _combine_fp4_supported():
+        pytest.skip(
+            "fp4_blockwise combine requires a gfx950 GPU (OCP FP4 instructions)"
+        )
+    expect_combine_kernel_substr = f"noweight_block{block_elems}_vec8_top6"
+    for i in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine,
+                [
+                    world_size,
+                    data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
+                    use_external_inp_buf,
+                    0,  # scale_dim
+                    1,  # scale_type_size
+                    "fp4_blockwise",
+                    0,  # max_total_recv_tokens
+                    None,  # routing
+                    False,  # use_max_token_num
+                    True,  # check_results
+                    None,  # sentinel_pattern
+                    True,  # weightless
+                    expect_combine_kernel_substr,
+                    combine_scale_dim,
                 ],
             )
         )
