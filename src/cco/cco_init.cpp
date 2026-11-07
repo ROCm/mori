@@ -473,7 +473,14 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
 
   // Step 1: bootstrap
   comm->bootNet = bootNet;
-  comm->bootNet->Initialize();
+  try {
+    comm->bootNet->Initialize();
+  } catch (...) {
+    delete comm->bootNet;  // owned here; deleting closes what Initialize() opened
+    delete comm;
+    *outComm = nullptr;
+    throw;
+  }
   comm->rank = comm->bootNet->GetLocalRank();
   comm->worldSize = comm->bootNet->GetWorldSize();
 
@@ -533,6 +540,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
           manualCnt, comm->worldSize);
       delete comm->ctx;
       comm->bootNet->Finalize();
+      delete comm->bootNet;
       delete comm;
       *outComm = nullptr;
       return -1;
@@ -574,6 +582,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
           comm->rank, firstInTeam, lastInTeam, lsaCount);
       delete comm->ctx;
       comm->bootNet->Finalize();
+      delete comm->bootNet;
       delete comm;
       *outComm = nullptr;
       return -1;
@@ -590,6 +599,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
             comm->rank, lsaCount, r, allLsaSizes[r]);
         delete comm->ctx;
         comm->bootNet->Finalize();
+        delete comm->bootNet;
         delete comm;
         *outComm = nullptr;
         return -1;
@@ -680,6 +690,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
           comm->lsaSize);
       delete comm->ctx;
       comm->bootNet->Finalize();
+      delete comm->bootNet;
       delete comm;
       *outComm = nullptr;
       return -1;
