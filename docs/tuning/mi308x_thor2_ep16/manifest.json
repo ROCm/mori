@@ -1,0 +1,97 @@
+{
+  "base_commit": "62ee267419f1649ae61c269a9a5ed1aa7c223bed",
+  "branch": "perf/mi308-thor2-moe-tuning",
+  "prerequisite": "Historical measurement only: bnxt-prerequisite.patch applied to base_commit; the complete fix is now upstream in PR #653 (ceac6df66e84152a5cd40a31d38909553bd7fabe).",
+  "hosts": [
+    "skyriver07",
+    "skyriver04"
+  ],
+  "gpu": "MI308X",
+  "gpus_per_node": 8,
+  "world_size": 16,
+  "cu_per_gpu": 80,
+  "nic": "Broadcom Thor2 / bnxt_re_bond, 400 Gb/s per rail",
+  "rocm": "7.14",
+  "num_qp_per_pe": 2,
+  "rdma_sl": 5,
+  "rdma_tc": 160,
+  "tokens_per_rank": [
+    4,
+    16,
+    64,
+    256,
+    1024,
+    4096,
+    8192,
+    16384
+  ],
+  "models": {
+    "deepseek-ai/DeepSeek-V4-Pro": {
+      "hidden_size": 7168,
+      "topk": 6,
+      "routed_experts": 384,
+      "experts_per_rank": 24,
+      "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/b5968e9190ef611bbf34a7229255be88a0e937c1/config.json",
+      "revision": "b5968e9190ef611bbf34a7229255be88a0e937c1"
+    },
+    "deepseek-ai/DeepSeek-V4-Flash": {
+      "hidden_size": 4096,
+      "topk": 6,
+      "routed_experts": 256,
+      "experts_per_rank": 16,
+      "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/resolve/60d8d70770c6776ff598c94bb586a859a38244f1/config.json",
+      "revision": "60d8d70770c6776ff598c94bb586a859a38244f1"
+    },
+    "deepseek-ai/DeepSeek-R1": {
+      "hidden_size": 7168,
+      "topk": 8,
+      "routed_experts": 256,
+      "experts_per_rank": 16,
+      "source": "https://huggingface.co/deepseek-ai/DeepSeek-R1/resolve/56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad/config.json",
+      "revision": "56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad"
+    }
+  },
+  "kernel_families": [
+    "v2",
+    "v2_ll"
+  ],
+  "transport_dtypes": [
+    "bf16->bf16",
+    "fp8_e4m3fnuz->bf16"
+  ],
+  "scale_format": "float32; bf16 scale_dim=0; fp8 scale_dim=hidden_size/128",
+  "routing": "uniform random top-k without replacement, new seed on each validation process",
+  "timing": "eager HIP events; warmup=20, timed=30, drop_first=1; excludes dtype conversion and expert computation",
+  "search": "Fixed-reference coordinate search. Initial quick grid: 30 candidates. Joint search adds 80/48/8 and 80/64/8; tokens>=1024 focus on blocks32/64/80 with5warmup/10round screening, otherwise20/30. Complete neutral pair rechecked.",
+  "validation": "Three fresh two-node process batches, each point once per batch with fresh CCO state; 5 paired reps and ordinary single-live-op A/B; seeds4242/5219/6196.",
+  "acceptance": "all 3 paired tests win by max(1.5us,2%) with tuner tail guard; every candidate bench beats reference median by same margin; rank-max total p95 <= matched reference p95 * 1.10",
+  "limitations": [
+    "Communication shape microbenchmark, not full DeepSeek inference.",
+    "FP8 FNUZ is the MI308 transport representation; V4 native packed UE8M0 scales and FP4 expert weights are not implemented by this experiment.",
+    "No automatic interpolation to unmeasured token counts or other NICs/EP sizes.",
+    "No host firmware, network QoS, or clock changes. Existing firmware 235.2.40.0 and 50% lossless-TC allocation are documented in mori-check logs.",
+    "Uniform routing is not a replay of measured model router traces."
+  ],
+  "qp_candidates": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "qp_screening": "Fixed D/C geometry (80,48,8); 3 interleaved reps, fresh CCO op+communicator per case in persistent Python/gloo workers. New QPs are created per case. 1152 bench cases.",
+  "port_counters": "Both physical members of all8bonds on bothnodes. ethtool priority5 byte/PFC counters,1.2s settling after each capture and before entering capture from an uncaptured interval; includes correctness+warmup+timing traffic.",
+  "jit_preparation": "All 1536 requested plans built ahead of measurement with 12 compiler threads; no kernel launched during precompile. Identical content-hash cache copied to peer.",
+  "pcie_device_links": "Read on both nodes: all 8 GPU and 8 RDMA device links show 32.0 GT/s x16 (PCIe 5.0); this does not characterize switch uplinks.",
+  "joint_search_process": "Search phases use fresh CCO communicator/op, with persistent Python/gloo workers after the first ~25 points; final acceptance uses three fresh process pairs.",
+  "qp_geometry_recheck": "720 additional ordinary benches for tokens>=256 at the tuned geometry, rechecking all four QP counts; filter median p95 <= initially chosen QP p95*1.1, then fewest QPs within 2% of fastest eligible median. Final independent validation follows.",
+  "capacity": "max_num_inp_token_per_rank equals live input tokens in each case; no larger-capacity/dynamic-live-token performance claim.",
+  "validation_process": "Three fresh two-node process batches; each of 96 points once per batch in a fresh CCO communicator/op, seeds4242/5219/6196, order reversed/rotated between batches; within each point 5 paired reps and ordinary one-live-op A/B.",
+  "integration_validation_base": "ceac6df66e84152a5cd40a31d38909553bd7fabe",
+  "integration_validation": {
+    "region_and_binding_tests_passed": 35,
+    "two_node_checks_passed": 5,
+    "validation_csv_trials_audited": 288,
+    "accepted_profiles_reproduced": 62,
+    "full_performance_matrix_rerun": false
+  }
+}

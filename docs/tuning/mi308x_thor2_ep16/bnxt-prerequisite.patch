@@ -1,0 +1,19 @@
+diff --git a/include/mori/cco/cco_scale_out.hpp b/include/mori/cco/cco_scale_out.hpp
+index 4a765aaf..e23ea529 100644
+--- a/include/mori/cco/cco_scale_out.hpp
++++ b/include/mori/cco/cco_scale_out.hpp
+@@ -437,7 +437,13 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t
+             __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+         uint32_t completed = (dbTouch & ~mask) | (wqeCounter & mask);
+         if (completed > dbTouch) completed -= wq->sqWqeNum;
+-        __hip_atomic_fetch_max(&wq->doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
++        // Serial-order update from PR #653: a stale CQE can reconstruct a
++        // completion below zero. An unsigned max would latch it permanently.
++        // pollCqLock serializes every writer on this BNXT path.
++        uint32_t cur = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
++        if (static_cast<int32_t>(completed - cur) > 0) {
++          __hip_atomic_store(&wq->doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
++        }
+       }
+       __threadfence();
+       core::ReleaseLock(&cq->pollCqLock);
