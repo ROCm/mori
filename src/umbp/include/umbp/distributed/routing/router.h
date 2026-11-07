@@ -24,8 +24,10 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -56,10 +58,11 @@ class Router {
   std::optional<RouteGetResolution> RouteGet(const std::string& key, const std::string& node_id,
                                              const std::unordered_set<std::string>& exclude_nodes);
 
-  // Pick a target node to write to.  Master holds no per-Put state in
-  // the new design: the writer follows up with peer.AllocateSlot to
-  // actually reserve capacity, and on ENOSPC at the peer the writer
-  // retries RoutePut with the failed node added to `exclude_nodes`.
+  // Pick a target node to write to.  The writer follows up with
+  // peer.AllocateSlot to actually reserve capacity, and on ENOSPC at the peer
+  // the writer retries RoutePut with the failed node added to `exclude_nodes`.
+  // The only per-Put state is a short-lived key -> route memo: a repeat put of
+  // a key routed but not yet indexed goes to the same node.
   std::optional<RoutePutResult> RoutePut(const std::string& key, const std::string& node_id,
                                          uint64_t block_size,
                                          const std::unordered_set<std::string>& exclude_nodes);
@@ -75,11 +78,27 @@ class Router {
 
   void SetLeaseDuration(std::chrono::system_clock::duration d) { lease_duration_ = d; }
 
+  // How long a routed key keeps its route while its ADD is in flight; must
+  // cover a writer's heartbeat interval.  Zero disables the memo.
+  void SetInflightPutTtl(std::chrono::steady_clock::duration d) { inflight_ttl_ = d; }
+
  private:
+  void PinInflightRoutes(const std::vector<std::string>& keys,
+                         const std::unordered_set<std::string>& alive_nodes,
+                         const std::unordered_set<std::string>& exclude_nodes,
+                         std::vector<std::optional<RoutePutResult>>* results);
+
   IMasterMetadataStore& store_;
   std::unique_ptr<RouteGetStrategy> get_strategy_;
   std::unique_ptr<RoutePutStrategy> put_strategy_;
   std::chrono::system_clock::duration lease_duration_{std::chrono::seconds{10}};
+
+  // Two generations rotated every TTL bound the memo without per-entry timers.
+  std::chrono::steady_clock::duration inflight_ttl_{std::chrono::seconds{10}};
+  std::mutex inflight_mutex_;
+  std::unordered_map<std::string, RoutePutResult> inflight_current_;
+  std::unordered_map<std::string, RoutePutResult> inflight_previous_;
+  std::chrono::steady_clock::time_point inflight_rotated_at_{};
 };
 
 }  // namespace mori::umbp

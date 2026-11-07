@@ -22,6 +22,7 @@
 #include "umbp/distributed/routing/router.h"
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include "mori/utils/mori_log.hpp"
 
@@ -71,8 +72,46 @@ std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
   // (best-effort: no throw, every key reads as unroutable).
   auto exists_mask = store_.BatchExistsBlock(keys);
   auto candidates = store_.ListAliveClients();
-  return put_strategy_->SelectBatch(node_id, block_sizes, exists_mask, std::move(candidates),
-                                    exclude_nodes);
+  std::unordered_set<std::string> alive_nodes;
+  for (const auto& c : candidates) alive_nodes.insert(c.node_id);
+  auto results = put_strategy_->SelectBatch(node_id, block_sizes, exists_mask,
+                                            std::move(candidates), exclude_nodes);
+  if (inflight_ttl_.count() > 0) PinInflightRoutes(keys, alive_nodes, exclude_nodes, &results);
+  return results;
+}
+
+// Replicated KV has every TP rank put the same key at once, and the index only
+// learns of it from the writer's next heartbeat; repeat puts routed elsewhere
+// before then would each leave a copy, so they follow the first route.
+void Router::PinInflightRoutes(const std::vector<std::string>& keys,
+                               const std::unordered_set<std::string>& alive_nodes,
+                               const std::unordered_set<std::string>& exclude_nodes,
+                               std::vector<std::optional<RoutePutResult>>* results) {
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(inflight_mutex_);
+  if (now - inflight_rotated_at_ >= inflight_ttl_) {
+    if (now - inflight_rotated_at_ >= 2 * inflight_ttl_) inflight_current_.clear();
+    inflight_previous_ = std::move(inflight_current_);
+    inflight_current_.clear();
+    inflight_rotated_at_ = now;
+  }
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto& result = (*results)[i];
+    if (!result || result->outcome != RoutePutOutcome::kRouted) continue;
+    const RoutePutResult* prior = nullptr;
+    if (auto it = inflight_current_.find(keys[i]); it != inflight_current_.end()) {
+      prior = &it->second;
+    } else if (auto it = inflight_previous_.find(keys[i]); it != inflight_previous_.end()) {
+      prior = &it->second;
+    }
+    if (prior != nullptr && alive_nodes.count(prior->node_id) != 0 &&
+        exclude_nodes.count(prior->node_id) == 0) {
+      result = *prior;
+      continue;
+    }
+    // No prior route, or the writer failed on its node: this pick becomes the route.
+    inflight_current_[keys[i]] = *result;
+  }
 }
 
 std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
