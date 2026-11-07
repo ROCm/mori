@@ -68,6 +68,7 @@ def sim_env(monkeypatch):
         "MORI_IO_SIM_CATALOG",
         "MORI_IO_SIM_GPU",
         "MORI_IO_SIM_NIC",
+        "MORI_IO_SIM_CATALOG_STRICT",
     ):
         monkeypatch.delenv(k, raising=False)
     for backend, profile in PROFILES.items():
@@ -369,13 +370,25 @@ def test_catalogs_layer_and_variables_win(sim_env, tmp_path):
         (entry("nvlink", "n", 1), "backend must be rdma, tcp or xgmi"),
         (entry("rdma", "n", "fast"), "bandwidth_gbps must be a number"),
         (entry("rdma", "n", 0), "bandwidth must be positive"),
-        (entry("rdma", "n", 1, extra="  per_op_ns: 3\n"), "unknown field 'per_op_ns'"),
         (entry("rdma", "n", 1) + entry("rdma", "n", 2), "second rdma entry for nic n"),
     ],
 )
 def test_bad_catalog_is_rejected(sim_env, tmp_path, text, error):
     use_catalog(sim_env, tmp_path, text)
     with pytest.raises(RuntimeError, match=error):
+        make_engine("pf")
+
+
+def test_unknown_catalog_field_is_skipped_unless_strict(sim_env, tmp_path):
+    # A field from a newer mori: skipped with a warning, the known fields still apply.
+    use_catalog(
+        sim_env, tmp_path, entry("rdma", "testnic", 20, extra="  per_op_ns: 3\n")
+    )
+    sim_env.setenv("MORI_IO_SIM_NIC", "testnic")
+    make_engine("pf")
+    assert io_sim_profile(BackendType.RDMA)["bw_gbps"] == 20
+    sim_env.setenv("MORI_IO_SIM_CATALOG_STRICT", "1")
+    with pytest.raises(RuntimeError, match="unknown field 'per_op_ns'"):
         make_engine("pf")
 
 
