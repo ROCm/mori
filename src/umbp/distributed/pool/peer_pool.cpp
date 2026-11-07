@@ -417,8 +417,12 @@ size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_
     constexpr int kPrefetchThreads = 8;
     std::vector<TierTransitionResult> results(jobs.size());
     ParallelFor(jobs.size(), kPrefetchThreads, [&](size_t j) {
-      results[j] = transition_executor_.Execute(jobs[j].key, jobs[j].source_backend_id, targets[j],
-                                                /*remove_source=*/false);
+      try {
+        results[j] =
+            transition_executor_.Execute(jobs[j].key, jobs[j].source_backend_id, targets[j],
+                                         /*remove_source=*/false);
+      } catch (...) { /* FinishTransitionLocked releases the failed job's reservation. */
+      }
     });
 
     std::lock_guard<std::mutex> lock(operation_mutex_);
@@ -467,6 +471,19 @@ size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_
     prefetched_.push_front(std::move(victims[i]));
   }
   return copied;
+}
+
+std::vector<bool> PeerPool::LeasePrefetched(const std::vector<std::string>& keys,
+                                            std::chrono::milliseconds ttl) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  std::vector<bool> ready(keys.size(), false);
+  if (backends_ == nullptr) return ready;
+  for (auto* backend : backends_->All()) {
+    if (backend->Tier() != TierType::DRAM) continue;
+    const auto leased = backend->ExtendReadLease(keys, ttl);
+    for (size_t i = 0; i < keys.size() && i < leased.size(); ++i) ready[i] = ready[i] || leased[i];
+  }
+  return ready;
 }
 
 TierTransitionResult PeerPool::RunTransition(std::unique_lock<std::mutex>& lock,

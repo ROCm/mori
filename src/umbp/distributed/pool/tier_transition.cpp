@@ -109,6 +109,19 @@ TierTransitionResult TierTransitionExecutor::Execute(
   if (!source->AcquireMigrationRead(key, &resolved, targets_reach_files) || !resolved.found) {
     return result;
   }
+  // Both background prefetch and ordinary tier transitions must release pins
+  // on exceptions, otherwise ClearLocal can race a permanently pinned source.
+  struct ReadPin {
+    MediumBackend* backend;
+    const std::string& key;
+    void Release() {
+      if (backend) {
+        backend->ReleaseMigrationRead(key);
+        backend = nullptr;
+      }
+    }
+    ~ReadPin() { Release(); }
+  } source_pin{source, key};
   const bool source_reaches_files = FileReachable(source);
 
   for (uint32_t target_backend_id : target_backend_ids) {
@@ -121,17 +134,20 @@ TierTransitionResult TierTransitionExecutor::Execute(
     AllocateResult& allocation = allocations.front();
 
     if (allocation.outcome == AllocateOutcome::kSuccessAllocated) {
+      struct PendingSlot {
+        MediumBackend* backend;
+        uint64_t slot;
+        ~PendingSlot() { backend->BatchAbort({slot}); }
+      } slot_guard{target, allocation.slot_id};
       std::vector<TransferItem> transfers;
       if (!BuildTransfers(source, resolved, target, allocation, &transfers) ||
           !transfer_engine_->Transfer(transfers, nullptr)) {
-        target->BatchAbort({allocation.slot_id});
         result.retryable = true;
         continue;
       }
       result.bytes_read += resolved.size;
       auto committed = target->BatchCommit({CommitRequest{allocation.slot_id, key}});
       if (committed.empty() || !committed.front().success) {
-        target->BatchAbort({allocation.slot_id});
         result.retryable = true;
         continue;
       }
@@ -152,23 +168,22 @@ TierTransitionResult TierTransitionExecutor::Execute(
       result.retryable = true;
       continue;
     }
+    ReadPin target_pin{target, key};
 
     result.success = true;
     result.retryable = false;
     result.target_backend_id = target_backend_id;
     result.bytes_moved = resolved.size;
-    source->ReleaseMigrationRead(key);
+    source_pin.Release();
     if (remove_source) {
       auto evicted = source->Evict({key});
       const uint64_t freed = evicted.empty() ? 0 : evicted.front().bytes_freed;
       result.source_draining = freed == 0 && source->Contains(key);
       result.bytes_freed = freed;
     }
-    target->ReleaseMigrationRead(key);
     return result;
   }
 
-  source->ReleaseMigrationRead(key);
   return result;
 }
 

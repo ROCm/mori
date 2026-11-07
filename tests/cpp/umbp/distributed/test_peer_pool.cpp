@@ -182,6 +182,7 @@ class FailingEngine final : public TransferEngine {
  public:
   explicit FailingEngine(int failures) : failures_(failures) {}
   void FailNext(int n) { failures_.store(n); }
+  void ThrowNext() { throw_next_ = true; }
 
   const char* Name() const override { return "failing"; }
   TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
@@ -196,6 +197,7 @@ class FailingEngine final : public TransferEngine {
     return inner_.CreatePlanBuilder(expected_items);
   }
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
+    if (throw_next_.exchange(false)) throw std::runtime_error("injected submit failure");
     if (failures_.load() > 0) {
       failures_.fetch_sub(1);
       return nullptr;  // the copy never happened
@@ -206,6 +208,7 @@ class FailingEngine final : public TransferEngine {
  private:
   LocalCopyEngine inner_;
   std::atomic<int> failures_;
+  std::atomic<bool> throw_next_{false};
 };
 
 class BusyResolveBackend final : public MockBackend {
@@ -1645,6 +1648,23 @@ TEST(PeerPoolLocalEviction, RejectsBadConfigAndLeavesAnUnorderedMediumAlone) {
   ASSERT_TRUE(pool.EnableLocalEviction(id, 0.9, 0.5));
   pool.RunLocalEvictionOnceForTest();
   EXPECT_TRUE(registry.Get("dram")->Contains("k"));
+}
+
+TEST(PeerPool, PrefetchCopyExceptionsReleasePinsAndAllowRetry) {
+  FailingEngine engine(0);
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 4096, 4);
+  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, 4096, 4);
+  LogicalTierConfig kv;
+  kv.members = {{"dram", 1}, {"ssd", 1}};
+  auto graph = LogicalTierGraph::Compile({kv}, registry);
+  ASSERT_TRUE(graph.ok());
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(graph.graph), &engine);
+  CommitKey(&pool, "retry", "ssd");
+  engine.ThrowNext();
+  EXPECT_EQ(pool.Prefetch({"retry"}, 4096), 0u);
+  EXPECT_EQ(pool.Prefetch({"retry"}, 4096), 1u);
+  pool.ClearLocal();  // no leaked source or target migration pins
 }
 
 }  // namespace

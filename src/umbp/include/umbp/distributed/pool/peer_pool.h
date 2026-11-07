@@ -139,6 +139,9 @@ class PeerPool {
   // the coming read is served from DRAM. The SSD copy stays, and the oldest
   // prefetched copies are dropped past `budget_bytes`. Returns the keys copied.
   size_t Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes);
+  // Validate committed DRAM copies and protect them from eviction, in input order.
+  std::vector<bool> LeasePrefetched(const std::vector<std::string>& keys,
+                                    std::chrono::milliseconds ttl);
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
   // request, in order.
