@@ -1898,6 +1898,7 @@ void CaseXgmiCrossEngineIpc() {
 
   HIP_RUNTIME_CHECK(hipSetDevice(0));
   HIP_RUNTIME_CHECK(hipMemset(srcMem.ptr, 0xAB, kSize));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   HIP_RUNTIME_CHECK(hipSetDevice(1));
   HIP_RUNTIME_CHECK(hipMemset(dstMem.ptr, 0x00, kSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
