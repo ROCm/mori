@@ -697,6 +697,7 @@ class CMakeBuild(build_ext):
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
+        build_ops_kiwi_enabled = _env_flag("BUILD_OPS_KIWI", "OFF")
         with_mpi = (
             "ON"
             if (
@@ -758,6 +759,7 @@ class CMakeBuild(build_ext):
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
             f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
             f"-DBUILD_OPS_DEVICE={build_ops_device}",
+            f"-DBUILD_OPS_KIWI={'ON' if build_ops_kiwi_enabled else 'OFF'}",
             f"-DBUILD_CCO_SDMA={BUILD_CCO_SDMA}",
             f"-DMORI_MULTITHREAD_SUPPORT={multithread_support}",
             "-B",
@@ -850,6 +852,14 @@ class CMakeBuild(build_ext):
             shutil.copyfile(umbp_pybinds_src, umbp_pybinds_dst)
         elif umbp_pybinds_dst.exists():
             umbp_pybinds_dst.unlink()
+
+        for kiwi_lib in ("libmori_ops_kiwi.so", "libmori_kiwi_ep_pybinds.so"):
+            kiwi_src = build_dir / "src/ops/dispatch_combine_kiwi" / kiwi_lib
+            kiwi_dst = root_dir / "python/mori" / kiwi_lib
+            if build_ops_kiwi_enabled and kiwi_src.exists():
+                shutil.copyfile(kiwi_src, kiwi_dst)
+            elif kiwi_dst.exists():
+                kiwi_dst.unlink()
 
         spdk_proxy_src = build_dir / "src/umbp/spdk_proxy"
         spdk_proxy_dst = root_dir / "python/mori/spdk_proxy"
@@ -1092,6 +1102,8 @@ mori_package_data = [
     "libmori_jit.so",  # JIT v2 C ABI + plan registry
     "libmori_ops_v2.so",  # v2 EP kernels' host side; registers into libmori_jit
     "libmori_umbp_pybinds.so",  # optional: only present when BUILD_UMBP=ON
+    "libmori_ops_kiwi.so",  # optional: only present when BUILD_OPS_KIWI=ON
+    "libmori_kiwi_ep_pybinds.so",  # optional: only present when BUILD_OPS_KIWI=ON
     "umbp_master",
     "umbp_standalone_server",
     "_jit-sources/include/**/*.hpp",

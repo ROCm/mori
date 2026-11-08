@@ -143,6 +143,7 @@ jobs:
             rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
             socket_ifname: ens14np0
             qp_max_send_wr: 4096
+            build_ops_kiwi: "ON"
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -157,6 +158,7 @@ jobs:
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       MORI_IO_QP_MAX_SEND_WR: ${{ matrix.qp_max_send_wr }}
+      BUILD_OPS_KIWI: ${{ matrix.build_ops_kiwi || 'OFF' }}
     timeout-minutes: 45
     steps:
       - name: Fix workspace permissions
@@ -197,12 +199,19 @@ jobs:
       - name: Install mori
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_BENCHMARK=ON BUILD_CCO_SDMA=ON BUILD_EXAMPLES=ON pip install . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && BUILD_BENCHMARK=ON BUILD_CCO_SDMA=ON BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI pip install . && pip install prettytable"
 
       - name: MORI-EP (intranode)
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE && timeout 360 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+          "
+
+      - name: KIWI-EP (intranode)
+        if: matrix.build_ops_kiwi == 'ON'
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_kiwi_dispatch_combine.py -v
           "
 
       - name: MORI-EP (internode_v1)
@@ -777,6 +786,7 @@ jobs:
             rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
             ct: docker
             timeout_minutes: 90
+            build_ops_kiwi: "ON"
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -806,6 +816,7 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      BUILD_OPS_KIWI: ${{ matrix.build_ops_kiwi || 'OFF' }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
       - name: Fix workspace permissions
@@ -906,12 +917,12 @@ jobs:
       - name: Install mori (node1)
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))"
+            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))"
 
       - name: Install mori (node2)
         run: |
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
+            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
 
       # The IO benchmark runner defaults to the native C++ engine
       # (tools/run_internode_io_benchmark.sh --engine cpp), which needs the
@@ -1244,6 +1255,33 @@ jobs:
             wait
             sleep 1
             PORT=$((PORT + 1))
+          done
+
+      - name: KIWI-EP internode test (EP16)
+        if: matrix.build_ops_kiwi == 'ON'
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          ENTRY="tests/python/ops/test_kiwi_dispatch_combine_internode.py"
+          PORT=29210
+          for BACKEND in rdma-only hybrid auto; do
+            for DTYPE in bf16 fp8_e4m3_fnuz; do
+              echo "=== KIWI EP16 rcomp-backend=$BACKEND dtype=$DTYPE port=$PORT ==="
+              NODE2_CMD=(
+                $CT exec -e MORI_INTERNODE_TIMEOUT=300 $CONTAINER bash $SCRIPT
+                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                --ifname $NODE2_IFNAME --entry $ENTRY --nproc-per-node 8
+                --cmd test --kernel-type $BACKEND --dtype $DTYPE --max-tokens 128
+              )
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+              NODE2_PID=$!
+              $CT exec -e MORI_INTERNODE_TIMEOUT=300 $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                --ifname $NODE1_IFNAME --entry $ENTRY --nproc-per-node 8 \
+                --cmd test --kernel-type $BACKEND --dtype $DTYPE --max-tokens 128
+              wait $NODE2_PID
+              sleep 1
+              PORT=$((PORT + 1))
+            done
           done
 
       - name: MORI-CCL internode hier allgather bit-exact smoke
