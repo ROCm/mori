@@ -1151,7 +1151,19 @@ static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh, bool isFabric,
   if (rdmaDevCtx) {
     application::RdmaMemoryRegion mr;
     if (isFabric) {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionAuto(wh->localPtr, wh->size);
+      // A fabric window has no shareFd, so export one. Device addressing is window-relative
+      // (iova=0) as on the FD path, but RegisterRdmaMemoryRegionAuto registers iova=VA.
+      uint64_t dmabufOffset = 0;
+      int fabricFd = comm->iovaZeroMode
+                         ? application::TryExportDmabufFd(wh->localPtr, wh->size, &dmabufOffset)
+                         : -1;
+      if (fabricFd >= 0) {
+        mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(wh->localPtr, wh->size, fabricFd,
+                                                             dmabufOffset);
+        close(fabricFd);
+      } else {
+        mr = rdmaDevCtx->RegisterRdmaMemoryRegionAuto(wh->localPtr, wh->size);
+      }
     } else if (comm->iovaZeroMode) {
       mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(wh->localPtr, wh->size, shareFd);
     } else {
