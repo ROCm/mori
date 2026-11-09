@@ -788,6 +788,131 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
 /* ---------------------------------------------------------------------------------------------- */
 /*                        Load-first + unroll combine gather (v2-style)                           */
 /* ---------------------------------------------------------------------------------------------- */
+// E4M3 element types whose float conversions WarpAccumLFImpl does two at a time with the packed
+// cvt builtins. The per-element conversions of __hip_fp8_e4m3(_fnuz) spend one cvt per byte and
+// then reassemble the bytes, which on gfx950 is ~3x the VALU of the accumulation it feeds.
+template <typename T>
+inline constexpr bool kWarpAccumPackedFp8 =
+#if HIP_FP8_CVT_FAST_PATH
+#if defined(MORI_FP8_TYPE_OCP_ENABLED)
+    std::is_same_v<T, __hip_fp8_e4m3> ||
+#endif
+#if defined(MORI_FP8_TYPE_FNUZ_ENABLED)
+    std::is_same_v<T, __hip_fp8_e4m3_fnuz> ||
+#endif
+#endif
+    false;
+
+// hip_bfloat16(float) rounds in software (~5 VALU per element); gfx950 has v_cvt_pk_bf16_f32,
+// which rounds the same way (RNE) two at a time. gfx942 has no such instruction. Only NaN payload
+// bits can differ from the software path.
+template <typename T>
+inline constexpr bool kWarpAccumPackedBf16 =
+#if defined(__gfx950__)
+    std::is_same_v<T, hip_bfloat16> ||
+#endif
+    false;
+
+// mori_fp4x2_e2m1 already converts with the packed gfx950 cvts, but always through byte 0 of a
+// register, so every byte is shifted into and out of place. The byte-select operands of the same
+// cvts address the byte where it is, which gives the same bits without the shifts.
+template <typename T>
+inline constexpr bool kWarpAccumPackedFp4 =
+#if defined(__gfx950__) && defined(MORI_HAS_OCP_FP) && defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && \
+    HIP_ENABLE_GFX950_OCP_BUILTINS == 1
+    std::is_same_v<T, mori_fp4x2_e2m1> ||
+#endif
+    false;
+
+#if HIP_FP8_CVT_FAST_PATH
+// Same saturation as the __HIP_SATFINITE float -> fp8 conversion of the HIP type: finite values
+// clamp to the largest finite fp8, NaN and Inf are passed to the cvt unclamped. Keeping it exact is
+// what makes the packed path bit-identical to T(float).
+template <typename T>
+__device__ __forceinline__ float SatFiniteForFp8(float v) {
+  constexpr float kMax = (T::__default_interpret == __HIP_E4M3_FNUZ) ? 240.0f : 448.0f;
+  return ((__float_as_uint(v) & 0x7F800000u) != 0x7F800000u)
+             ? __builtin_amdgcn_fmed3f(v, kMax, -kMax)
+             : v;
+}
+#endif
+
+template <typename T>
+inline constexpr bool kWarpAccumPackedDecode =
+    kWarpAccumPackedFp8<T> || kWarpAccumPackedFp4<T> || std::is_same_v<T, hip_bfloat16>;
+template <typename T>
+inline constexpr bool kWarpAccumPackedEncode =
+    kWarpAccumPackedFp8<T> || kWarpAccumPackedFp4<T> || kWarpAccumPackedBf16<T>;
+
+// acc[j] += element j of the VecBytes-wide source w, times scale. Element j is the j-th T, so for
+// fp4x2 one acc entry (a float2) is one byte.
+template <typename T, int VecBytes, typename AccT>
+__device__ __forceinline__ void WarpAccumPackedDecode(AccT* acc, const uint32_t* w, float scale) {
+#pragma unroll
+  for (int k = 0; k < VecBytes / 4; ++k) {
+    if constexpr (std::is_same_v<T, hip_bfloat16>) {
+      // bf16 is the top half of an f32, so both halves of a dword widen exactly with one op each.
+      acc[2 * k + 0] += __uint_as_float(w[k] << 16) * scale;
+      acc[2 * k + 1] += __uint_as_float(w[k] & 0xFFFF0000u) * scale;
+    }
+#if HIP_FP8_CVT_FAST_PATH
+    if constexpr (kWarpAccumPackedFp8<T>) {
+      const auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(w[k], false);
+      const auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(w[k], true);
+      acc[4 * k + 0] += lo[0] * scale;
+      acc[4 * k + 1] += lo[1] * scale;
+      acc[4 * k + 2] += hi[0] * scale;
+      acc[4 * k + 3] += hi[1] * scale;
+    }
+#endif
+#if defined(__gfx950__) && defined(MORI_HAS_OCP_FP) && defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && \
+    HIP_ENABLE_GFX950_OCP_BUILTINS == 1
+    if constexpr (kWarpAccumPackedFp4<T>) {
+      const auto b0 = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(w[k], 1.0f, 0);
+      const auto b1 = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(w[k], 1.0f, 1);
+      const auto b2 = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(w[k], 1.0f, 2);
+      const auto b3 = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(w[k], 1.0f, 3);
+      acc[4 * k + 0] += float2(b0[0], b0[1]) * scale;
+      acc[4 * k + 1] += float2(b1[0], b1[1]) * scale;
+      acc[4 * k + 2] += float2(b2[0], b2[1]) * scale;
+      acc[4 * k + 3] += float2(b3[0], b3[1]) * scale;
+    }
+#endif
+  }
+}
+
+// One output dword of T from the accumulators of its 4 / sizeof(T) elements; the packed
+// counterpart of T(acc[j]) for each of them.
+template <typename T, typename AccT>
+__device__ __forceinline__ uint32_t WarpAccumPackedEncodeWord(const AccT* acc) {
+  uint32_t word = 0;
+#if HIP_FP8_CVT_FAST_PATH
+  if constexpr (kWarpAccumPackedFp8<T>) {
+    word = __builtin_amdgcn_cvt_pk_fp8_f32(SatFiniteForFp8<T>(acc[0]), SatFiniteForFp8<T>(acc[1]),
+                                           word, false);
+    word = __builtin_amdgcn_cvt_pk_fp8_f32(SatFiniteForFp8<T>(acc[2]), SatFiniteForFp8<T>(acc[3]),
+                                           word, true);
+  }
+#endif
+#if defined(__gfx950__)
+  if constexpr (kWarpAccumPackedBf16<T>) {
+    typedef float F32x2 __attribute__((ext_vector_type(2)));
+    typedef __bf16 Bf16x2 __attribute__((ext_vector_type(2)));
+    word = __builtin_bit_cast(uint32_t, __builtin_convertvector((F32x2){acc[0], acc[1]}, Bf16x2));
+  }
+#endif
+#if defined(__gfx950__) && defined(MORI_HAS_OCP_FP) && defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && \
+    HIP_ENABLE_GFX950_OCP_BUILTINS == 1
+  if constexpr (kWarpAccumPackedFp4<T>) {
+    word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(word, acc[0].x, acc[0].y, 1.0f, 0);
+    word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(word, acc[1].x, acc[1].y, 1.0f, 1);
+    word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(word, acc[2].x, acc[2].y, 1.0f, 2);
+    word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(word, acc[3].x, acc[3].y, 1.0f, 3);
+  }
+#endif
+  return word;
+}
+
 // Issues ALL AccumNum*Unroll vector loads for a warp's Unroll consecutive
 // vec-chunks BEFORE any accumulate, so up to AccumNum*Unroll remote (xGMI/CCO
 // peer) reads are in flight at once — hiding the high peer-read latency that
@@ -838,20 +963,32 @@ __forceinline__ __device__ void WarpAccumLFImpl(T* __restrict__ dest, T* const* 
 #pragma unroll AccumNum
       for (int i = 0; i < AccumNum; ++i) {
         if (csrcs[i] == nullptr) continue;
+        if constexpr (kWarpAccumPackedDecode<T>) {
+          WarpAccumPackedDecode<T, VecBytes>(acc[u], reinterpret_cast<const uint32_t*>(&vals[u][i]),
+                                             scales[i]);
+        } else {
 #pragma unroll vecSize
-        for (int j = 0; j < vecSize; ++j)
-          acc[u][j] += AccumFp32Type(reinterpret_cast<const T*>(&vals[u][i])[j]) * scales[i];
+          for (int j = 0; j < vecSize; ++j)
+            acc[u][j] += AccumFp32Type(reinterpret_cast<const T*>(&vals[u][i])[j]) * scales[i];
+        }
       }
     }
 
     union {
       DataType outVec[Unroll];
       T outVal[Unroll][vecSize];
+      uint32_t outWord[Unroll][VecBytes / 4];
     };
 #pragma unroll Unroll
     for (int u = 0; u < Unroll; ++u) {
+      if constexpr (kWarpAccumPackedEncode<T>) {
+#pragma unroll
+        for (int k = 0; k < VecBytes / 4; ++k)
+          outWord[u][k] = WarpAccumPackedEncodeWord<T>(&acc[u][k * (4 / sizeof(T))]);
+      } else {
 #pragma unroll vecSize
-      for (int j = 0; j < vecSize; ++j) outVal[u][j] = T(acc[u][j]);
+        for (int j = 0; j < vecSize; ++j) outVal[u][j] = T(acc[u][j]);
+      }
       store<VecBytes>(dest + offset + laneOffset + u * warpSize * vecSize, outVec[u]);
     }
     offset += elemsPerWarp;
