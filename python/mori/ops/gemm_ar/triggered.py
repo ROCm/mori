@@ -41,13 +41,18 @@ GEMM is the caller's: it writes the partial ``[m, n]`` (bf16, row-major) into
 :attr:`~GemmTriggeredAllReduceOp.gate_view` (``GateTileBase = 0``)::
 
     op.arm(m)                                               # host: this call's chains
+    op.begin(m)                                             # concurrent mode: reducer
     gemm(..., out=op.input_view(m), gate_view=op.gate_view)  # current stream
-    out = op.complete(m)                                    # reduce + wait, current stream
+    out = op.complete(m)                                    # (reduce +) wait, current stream
+
+``reduce_mode="concurrent"`` launches the reducer in :meth:`begin`, on a
+high-priority stream, so bands are reduced while the GEMM runs.
 
 Calls are host-synchronous: arm call k+1 only after call k's :meth:`complete` was
-issued, and finish with ``out`` before the next GEMM. :meth:`arm` raises if the
-previous call's device waits timed out; :meth:`check` also verifies every gate.
-:meth:`close` is collective. The window must be cco's default uncached memory.
+issued, and finish with ``out`` before the next GEMM (concurrent mode: before the
+next :meth:`begin`). :meth:`arm` raises if the previous call's device waits timed
+out; :meth:`check` also verifies every gate. :meth:`close` is collective. The
+window must be cco's default uncached memory.
 """
 
 from __future__ import annotations
@@ -132,7 +137,8 @@ class GemmTriggeredAllReduceOp:
 
     One instance serves one feature count ``n`` and any token count ``m <= m_max``
     with ``m / producer.mt1`` bands divisible by the world size. bf16 only.
-    ``reducer_blocks`` work-groups reduce the bands in order. ``ag_engine_offset``
+    ``reducer_blocks`` work-groups reduce the bands in order, after the GEMM or
+    beside it (``reduce_mode``). ``ag_engine_offset``
     ``None`` (default) chains the all-gather behind the reduce-scatter on the link's
     engine; an offset gives it its own queues on another engine (gfx942 only).
     ``wait_polls`` bounds every device wait. Construction is collective.
@@ -149,6 +155,7 @@ class GemmTriggeredAllReduceOp:
         m_max: int,
         producer: GateProducerSpec,
         reducer_blocks: int = 32,
+        reduce_mode: str = "after",
         ag_engine_offset: int | None = None,
         ring_bytes: int = 0,
         wait_polls: int = 1 << 24,
@@ -168,6 +175,17 @@ class GemmTriggeredAllReduceOp:
             raise ValueError(f"n={n}: rows must be whole 16-byte packs")
         if reducer_blocks < 1:
             raise ValueError("reducer_blocks must be >= 1")
+        if reduce_mode not in ("after", "concurrent"):
+            raise ValueError(f"reduce_mode={reduce_mode!r}: 'after' or 'concurrent'")
+        if reduce_mode == "concurrent":
+            cus = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+            if reducer_blocks > cus // 4:
+                raise ValueError(
+                    f"reducer_blocks={reducer_blocks}: concurrent mode allows at most "
+                    f"a quarter of the {cus} CUs"
+                )
         if os.environ.get("CCO_UNCACHED_WINDOW", "1") == "0":
             raise ValueError(
                 "needs cco's default uncached window (CCO_UNCACHED_WINDOW)"
@@ -182,6 +200,7 @@ class GemmTriggeredAllReduceOp:
         self.comm, self.rank, self.world_size = comm, comm.rank, ws
         self.n, self.producer = n, producer
         self.reducer_blocks, self.wait_polls = reducer_blocks, wait_polls
+        self.reduce_mode = reduce_mode
         self.quiesce_timeout_s = quiesce_timeout_s
         self.rebase_at = self.REBASE_AT  # lowered by tests to force a re-base
         self.layout = TriggeredArLayout(
@@ -193,6 +212,15 @@ class GemmTriggeredAllReduceOp:
         self._batches = {}
         self._faulted = None
         self._armed_m = None
+        self._begun = False
+        self._reduce_stream = None
+        if reduce_mode == "concurrent":
+            self._reduce_stream = torch.cuda.Stream(
+                priority=torch.cuda.Stream.priority_range()[1]
+            )
+            self._reduce_stream_fx = fx.Stream(self._reduce_stream)
+            self._ready = torch.cuda.Event()
+            self._reduced = torch.cuda.Event()
         #: Collective re-bases so far.
         self.rebases = 0
         self._err_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
@@ -316,6 +344,7 @@ class GemmTriggeredAllReduceOp:
             why = "did not drain the previous call" if stuck else "has no room"
             self._fault(f"a queue {why}", release=stuck)
         self._armed_m = m
+        self._begun = False
 
     def _batch(self, m: int) -> TriggerBatch:
         """This call's chains (built once per m): per peer, reduce-scatter, all-gather, mark."""
@@ -362,8 +391,33 @@ class GemmTriggeredAllReduceOp:
         self._batches[m] = batch
         return batch
 
+    def begin(self, m: int) -> None:
+        """Concurrent mode: launches the reducer on the op's stream, after the work
+        queued so far on the current stream. Call between :meth:`arm` and the GEMM.
+
+        Does nothing in "after" mode. Call :meth:`complete` even if the GEMM is not
+        launched: the reducer's waits then time out and the next :meth:`arm`
+        faults.
+        """
+        self._check_open()
+        self._check_m(m)
+        if self._armed_m != m:
+            raise RuntimeError(
+                f"begin(m={m}) does not match the armed call ({self._armed_m})"
+            )
+        if self._begun:
+            raise RuntimeError(f"begin(m={m}) was already called for this call")
+        if self._reduce_stream is not None:
+            reduce, _ = self._compiled(m)
+            self._ready.record(torch.cuda.current_stream())
+            self._reduce_stream.wait_event(self._ready)
+            reduce(self.base, self.wait_polls, stream=self._reduce_stream_fx)
+            self._reduced.record(self._reduce_stream)
+        self._begun = True
+
     def complete(self, m: int) -> torch.Tensor:
-        """Launches the reduce and the final wait on the current stream.
+        """Launches the final wait on the current stream, after the reduce ("after"
+        mode) or after joining the op's stream (concurrent mode).
 
         Returns the output view, valid once the stream reaches this point.
         """
@@ -373,11 +427,17 @@ class GemmTriggeredAllReduceOp:
             raise RuntimeError(
                 f"complete(m={m}) does not match the armed call ({self._armed_m})"
             )
+        if self._reduce_stream is not None and not self._begun:
+            raise RuntimeError(f"complete(m={m}): concurrent mode needs begin(m)")
         self._armed_m = None
+        self._begun = False
         reduce, wait = self._compiled(m)
         torch_stream = torch.cuda.current_stream()
         stream = fx.Stream(torch_stream)
-        reduce(self.base, self.wait_polls, stream=stream)
+        if self._reduce_stream is None:
+            reduce(self.base, self.wait_polls, stream=stream)
+        else:
+            torch_stream.wait_event(self._reduced)
         wait(self.base, self.wait_polls, stream=stream)
         self._err_host.copy_(self._err_view(), non_blocking=True)
         self._err_ready = torch.cuda.Event()
@@ -449,6 +509,7 @@ class GemmTriggeredAllReduceOp:
         call never got its targets), drain, and refuse further calls."""
         self._faulted = why
         self._armed_m = None
+        self._begun = False
         torch.cuda.synchronize()
         lay = self.layout
         # Peers must not trust anything a released chain delivers from here on.
@@ -483,6 +544,7 @@ class GemmTriggeredAllReduceOp:
         torch.cuda.synchronize()
         self.comm.barrier()
         self.arm(m)
+        self.begin(m)
         nb = self.layout.bands(m)
         self._gate_words(self.layout.rs_gate_off, nb).copy_(
             torch.from_numpy(self.rs_gates.expected[:nb].astype(np.int64))
