@@ -460,7 +460,7 @@ static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
 
 // Warn when the kernel lacks CONFIG_PCI_P2PDMA: a peer window import is then pinned in
 // system memory instead of mapped peer-to-peer, and KFD may keep every rank's queues
-// evicted (ROCm/mori#917). p2pdma.c is built only with that option, so its symbol in
+// evicted. p2pdma.c is built only with that option, so its symbol in
 // /proc/kallsyms ("<addr> <type> <name> [module]") tells, with or without a readable
 // kernel config. dma_buf_attach is always built: seeing it shows the names are listed.
 static void CcoWarnIfNoDmabufP2P() {
@@ -475,7 +475,7 @@ static void CcoWarnIfNoDmabufP2P() {
   if (listed && !p2p) {
     MORI_SHMEM_WARN(
         "ccoCommCreate: kernel lacks CONFIG_PCI_P2PDMA — peer window imports may be pinned in "
-        "system memory and leave KFD queues evicted (ROCm/mori#917)");
+        "system memory and leave KFD queues evicted");
   }
 }
 

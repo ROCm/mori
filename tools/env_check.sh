@@ -1272,7 +1272,7 @@ dominant_group() {
 #   cco windows (every dispatch_combine_v2 EpDispatchCombineOp registers one) are
 #   shared between ranks as dma-bufs. Without CONFIG_PCI_P2PDMA a peer import is
 #   pinned in system memory instead of mapped peer-to-peer, and KFD may keep every
-#   rank's queues evicted (ROCm/mori#917). p2pdma.c is built only with that option,
+#   rank's queues evicted. p2pdma.c is built only with that option,
 #   so its symbol in /proc/kallsyms tells, with or without a readable kernel config
 #   (a container has none). dma_buf_attach is always built: finding it shows the
 #   names are listed at all. WARN, not FAIL: the kernel is a proxy for the amdgpu driver.
@@ -1283,7 +1283,7 @@ check_kernel_p2p_dmabuf() {
     elif grep -q ' pci_p2pdma_distance_many$' /proc/kallsyms; then
         log_ok "CONFIG_PCI_P2PDMA=y"
     else
-        log_warn "CONFIG_PCI_P2PDMA is not set — cco register_window (and so EPv2) may leave KFD queues evicted; rebuild the kernel with it (ROCm/mori#917)"
+        log_warn "CONFIG_PCI_P2PDMA is not set — cco register_window (and so EPv2) may leave KFD queues evicted; rebuild the kernel with it"
     fi
 }
 
