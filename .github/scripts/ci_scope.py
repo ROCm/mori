@@ -27,9 +27,8 @@ Run by .github/workflows/ci-scope.yml. Writes these step outputs:
   mori    MoRI CI on MI355X: EP v1, shmem, IO, CCL (ci.yml)
   mi300x  MoRI CI on MI300X: build, intranode, internode (ci.yml)
   umbp    UMBP unit tests (ci.yml)
-  cco     CCO CI: cco, EPv2 and the fused GEMM ops (ci_cco.yml)
-  fused   within cco: the fused GEMM + collective steps
-  epv2    within cco: the EPv2 steps and the CCO internode job
+  cco     CCO unit test (cco and EPv2) and CCO internode (ci_cco.yml)
+  fused   CCO fused GEMM + collective job (ci_cco.yml)
   reason  why
 
 Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
@@ -51,7 +50,7 @@ import subprocess
 import sys
 import time
 
-LANES = ("mori", "mi300x", "umbp", "cco", "fused", "epv2")
+LANES = ("mori", "mi300x", "umbp", "cco", "fused")
 
 # First match wins; a path that matches nothing is "core" and runs every lane.
 AREAS = [
@@ -101,9 +100,8 @@ MI300X_PATHS = re.compile(
 LANE_AREAS = {
     "mori": {"core", "io", "build", "ci_mori", "ci_shared"},
     "umbp": {"core", "io", "build", "umbp", "ci_mori", "ci_shared"},
-    "cco": {"core", "build", "cco", "fused", "epv2", "ci_cco", "ci_shared"},
+    "cco": {"core", "build", "cco", "epv2", "ci_cco", "ci_shared"},
     "fused": {"core", "build", "cco", "fused", "ci_cco", "ci_shared"},
-    "epv2": {"core", "build", "cco", "epv2", "ci_cco", "ci_shared"},
 }
 
 
