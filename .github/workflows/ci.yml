@@ -372,7 +372,9 @@ jobs:
 
       - name: MORI-CPP shmem_benchmark (P2P)
         run: |
+          # set -e: a launch killed by its timeout fails the step instead of passing.
           $CT exec $CONTAINER bash -c "
+            set -e
             cd $GITHUB_WORKSPACE
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_bw
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_bw
@@ -384,13 +386,15 @@ jobs:
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency -s warp
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_bw -s thread
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_bw -s thread
-            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_latency -s thread
-            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency -s thread
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_latency -s thread -e 1M
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency -s thread -e 1M
           "
 
       - name: MORI-CPP shmem_benchmark (RDMA)
         run: |
+          # set -e: a launch killed by its timeout fails the step instead of passing.
           $CT exec $CONTAINER bash -c "
+            set -e
             cd $GITHUB_WORKSPACE
             MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_put_bw
             MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_get_bw
@@ -846,8 +850,11 @@ jobs:
     steps: &internode-steps
       - name: Fix workspace permissions
         run: |
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           WS="${GITHUB_WORKSPACE}"
-          if [ -d "$WS" ]; then
+          if [ -d "$WS" ] && [ -z "$ROOTLESS" ]; then
             $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
               chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
           fi
@@ -911,10 +918,13 @@ jobs:
           # way "Fix workspace permissions" does on node1. The CI container runs
           # as root, so the previous job leaves root-owned build output in the
           # workspace and the rsync below dies on EPERM before anything builds.
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             $CT rm -f $CONTAINER 2>/dev/null || true
             mkdir -p $GITHUB_WORKSPACE
-            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
+            test -n '$ROOTLESS' || $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           "
           rsync -az --exclude='.git' \
@@ -1357,8 +1367,11 @@ jobs:
       - name: Cleanup node1
         if: always()
         run: |
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           $CT rm -f $CONTAINER || true
-          if $CT image inspect $IMAGE &>/dev/null; then
+          if [ -z "$ROOTLESS" ] && $CT image inspect $IMAGE &>/dev/null; then
             $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
                 chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           fi

@@ -62,8 +62,11 @@ jobs:
         run: |
           # Docker runs the build as root; a cancelled job leaves root-owned files
           # that break actions/checkout's cleanup.
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           WS="${GITHUB_WORKSPACE}"
-          if [ -d "$WS" ]; then
+          if [ -d "$WS" ] && [ -z "$ROOTLESS" ]; then
             $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
               chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
           fi
@@ -443,7 +446,10 @@ jobs:
         if: always()
         run: |
           # Restore workspace ownership (build ran as root in the container).
-          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
+          [ -n "$ROOTLESS" ] || $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           # Graceful stop so GPU ranks release HIP/KFD contexts (not SIGKILLed).
           CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
 
@@ -774,14 +780,20 @@ jobs:
       - name: Cleanup node1
         if: always()
         run: |
-          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
+          [ -n "$ROOTLESS" ] || $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
 
       - name: Cleanup node2
         if: always()
         run: |
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
-            $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+            test -n '$ROOTLESS' || $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
             cd $GITHUB_WORKSPACE && CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
           " || true
 
