@@ -54,17 +54,29 @@ LANES = ("mori", "mi300x", "umbp", "cco")
 # First match wins; a path that matches nothing is "core" and runs every lane.
 AREAS = [
     ("ignored", r"(\.md|\.rst|\.png|\.jpg|\.svg)$|^docs/|^LICENSE|^\.gitignore$"),
-    ("ignored", r"^\.github/(ISSUE_TEMPLATE|PULL_REQUEST_TEMPLATE|CODEOWNERS)|^\.claude/"),
+    (
+        "ignored",
+        r"^\.github/(ISSUE_TEMPLATE|PULL_REQUEST_TEMPLATE|CODEOWNERS)|^\.claude/",
+    ),
     ("ci_mori", r"^\.github/workflows/ci\.yml$"),
     ("ci_cco", r"^\.github/workflows/ci_cco\.yml$"),
-    ("ci_shared", r"^\.github/workflows/ci-scope\.yml$|^\.github/scripts/ci_scope\.py$"),
+    (
+        "ci_shared",
+        r"^\.github/workflows/ci-scope\.yml$|^\.github/scripts/ci_scope\.py$",
+    ),
     # Other workflows (nightly, docs, pre-commit, ...) do not run in PR CI.
     ("ignored", r"^\.github/"),
     ("umbp", r"(^|/|_)umbp(/|_|\.|$)|^examples/monitoring/"),
     ("epv2", r"(^|/)dispatch_combine_v2(/|$)|(^|/)jit/v2/"),
-    ("cco", r"(^|/|_)cco(/|_|\.|$)|^python/mori/ops/(gemm_ar|gemm_ag|gemm_a2a|ag_gemm|a2a_gemm)/"),
+    (
+        "cco",
+        r"(^|/|_)cco(/|_|\.|$)|^python/mori/ops/(gemm_ar|gemm_ag|gemm_a2a|ag_gemm|a2a_gemm)/",
+    ),
     ("io", r"(^|/|_)io(/|_|\.|$)"),
-    ("build", r"^(setup\.py|pyproject\.toml|CMakeLists\.txt|requirements[^/]*\.txt)$|^cmake/|^docker/|^3rdparty/"),
+    (
+        "build",
+        r"^(setup\.py|pyproject\.toml|CMakeLists\.txt|requirements[^/]*\.txt)$|^cmake/|^docker/|^3rdparty/",
+    ),
 ]
 
 # On a PR the MI300X lanes run only when one of these changed (or with ci:mi300x):
@@ -103,21 +115,30 @@ def lanes_for_files(files, labels):
 
 
 def gh_lines(*args):
-    out = subprocess.run(["gh", "api", *args], check=True, capture_output=True, text=True)
+    out = subprocess.run(
+        ["gh", "api", *args], check=True, capture_output=True, text=True
+    )
     return [line for line in out.stdout.splitlines() if line.strip()]
 
 
 def changed_files(repo, pr):
-    return gh_lines("--paginate", f"repos/{repo}/pulls/{pr}/files", "--jq", ".[].filename")
+    return gh_lines(
+        "--paginate", f"repos/{repo}/pulls/{pr}/files", "--jq", ".[].filename"
+    )
 
 
 def wait_for_precommit(repo, sha, appear_s=300, finish_s=1200):
     """Conclusion of the head commit's pre-commit check; None if it never starts."""
     start = time.time()
     while True:
-        runs = [json.loads(x) for x in gh_lines(
-            f"repos/{repo}/commits/{sha}/check-runs?check_name=pre-commit",
-            "--jq", ".check_runs[] | {status, conclusion}")]
+        runs = [
+            json.loads(x)
+            for x in gh_lines(
+                f"repos/{repo}/commits/{sha}/check-runs?check_name=pre-commit",
+                "--jq",
+                ".check_runs[] | {status, conclusion}",
+            )
+        ]
         done = [r["conclusion"] for r in runs if r["status"] == "completed"]
         if done:
             return "success" if "success" in done else done[0]
@@ -137,13 +158,21 @@ def decide(env):
         if label == "ci:full":
             return dict.fromkeys(LANES, True), "ci:full label added"
         if label == "ci:mi300x":
-            return {**dict.fromkeys(LANES, False), "mi300x": True}, "ci:mi300x label added"
+            return {
+                **dict.fromkeys(LANES, False),
+                "mi300x": True,
+            }, "ci:mi300x label added"
         return dict.fromkeys(LANES, False), f"label '{label}' needs no CI"
     if env.get("PR_DRAFT") == "true" and "ci:full" not in labels:
-        return dict.fromkeys(LANES, False), "draft PR (add ci:full or mark it ready to run CI)"
+        return (
+            dict.fromkeys(LANES, False),
+            "draft PR (add ci:full or mark it ready to run CI)",
+        )
     precommit = wait_for_precommit(env["REPO"], env["PR_HEAD_SHA"])
     if precommit not in (None, "success"):
-        raise SystemExit(f"::error::pre-commit is '{precommit}' on {env['PR_HEAD_SHA']}; fix it to run GPU CI")
+        raise SystemExit(
+            f"::error::pre-commit is '{precommit}' on {env['PR_HEAD_SHA']}; fix it to run GPU CI"
+        )
     if "ci:full" in labels:
         return dict.fromkeys(LANES, True), "ci:full label"
     return lanes_for_files(changed_files(env["REPO"], env["PR_NUMBER"]), labels)
@@ -151,12 +180,18 @@ def decide(env):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--files", help="classify the paths in this file (one per line) and exit")
-    ap.add_argument("--labels", default="", help="comma-separated PR labels for --files")
+    ap.add_argument(
+        "--files", help="classify the paths in this file (one per line) and exit"
+    )
+    ap.add_argument(
+        "--labels", default="", help="comma-separated PR labels for --files"
+    )
     args = ap.parse_args()
     if args.files:
         files = [line.strip() for line in open(args.files) if line.strip()]
-        lanes, reason = lanes_for_files(files, set(filter(None, args.labels.split(","))))
+        lanes, reason = lanes_for_files(
+            files, set(filter(None, args.labels.split(",")))
+        )
         print(json.dumps({**lanes, "reason": reason}))
         return
 
@@ -165,7 +200,14 @@ def main():
         for lane in LANES:
             out.write(f"{lane}={str(lanes[lane]).lower()}\n")
         out.write(f"reason={reason}\n")
-    summary = ["## CI scope", "", f"**Reason:** {reason}", "", "| lane | runs |", "|---|---|"]
+    summary = [
+        "## CI scope",
+        "",
+        f"**Reason:** {reason}",
+        "",
+        "| lane | runs |",
+        "|---|---|",
+    ]
     summary += [f"| {lane} | {'yes' if lanes[lane] else 'no'} |" for lane in LANES]
     with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as out:
         out.write("\n".join(summary) + "\n")
