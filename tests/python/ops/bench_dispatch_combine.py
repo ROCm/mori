@@ -975,23 +975,6 @@ def _get_default_launch_config(
     use_external_inp_buf,
 ):
     zero_copy = not use_external_inp_buf
-    # Every number below was tuned on gfx942. gfx125x keeps its geometry in the library instead --
-    # _intranode_{dispatch,combine}_default_launch, keyed on the same arch test the kernel uses to
-    # pick its body -- and 0 is how a caller tells _resolve_launch_params it has no opinion and
-    # reaches them. So this table is not consulted there at all, rather than being consulted and
-    # then corrected in one of its cells.
-    #
-    # It was corrected in one cell, and both halves of that went wrong. The zero-copy cell was given
-    # 192x32, true when written, then dispatch moved to the TDM body that stages one token tile per
-    # warp and 32 warps became a 458,752 B request against a 327,680 B budget -- a default that
-    # cannot launch. The other cell was left alone and still hands gfx1250 a 256x14 combine, which
-    # measures 219.4us / 967.5 GB/s against the library default's 191.1us / 1111.0 GB/s at EP4 4K
-    # bf16 hidden 7168, both check-armed. A per-arch exception inside a per-arch table is the shape
-    # of the mistake; the arch owns its defaults or it does not.
-    from mori.ops.dispatch_combine import _is_gfx125x
-
-    if _is_gfx125x():
-        return LaunchConfig(0, 0, 0, 0)
     if world_size <= 4:
         if max_num_inp_token_per_rank > 128:
             return (
