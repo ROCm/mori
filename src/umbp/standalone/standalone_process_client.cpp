@@ -64,6 +64,11 @@ void EncodeKvBlock(const KvBlockMetadata& block, ::umbp::StandaloneKvBlock* requ
   }
 }
 
+void SetLookupDeadline(grpc::ClientContext* context, int timeout_ms) {
+  if (timeout_ms > 0)
+    context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms));
+}
+
 void CheckKvMetadataStatus(const grpc::Status& status) {
   if (status.error_code() == grpc::StatusCode::INVALID_ARGUMENT)
     throw std::invalid_argument(status.error_message());
@@ -450,6 +455,7 @@ bool StandaloneProcessClient::Exists(const std::string& key) const {
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
   grpc::ClientContext ctx;
+  SetLookupDeadline(&ctx, standalone_config_.lookup_timeout_ms);
   ::umbp::KeyRequest req;
   req.set_key(key);
   ::umbp::BoolResponse resp;
@@ -757,6 +763,7 @@ std::vector<bool> StandaloneProcessClient::BatchExists(const std::vector<std::st
   std::shared_lock lk(op_mutex_);
   if (closed_) return std::vector<bool>(keys.size(), false);
   grpc::ClientContext ctx;
+  SetLookupDeadline(&ctx, standalone_config_.lookup_timeout_ms);
   ::umbp::BatchKeysRequest req;
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::BatchBoolResponse resp;
@@ -773,6 +780,7 @@ size_t StandaloneProcessClient::BatchExistsConsecutive(const std::vector<std::st
   std::shared_lock lk(op_mutex_);
   if (closed_) return 0;
   grpc::ClientContext ctx;
+  SetLookupDeadline(&ctx, standalone_config_.lookup_timeout_ms);
   ::umbp::BatchKeysRequest req;
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::CountResponse resp;
