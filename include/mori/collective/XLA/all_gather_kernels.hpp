@@ -131,13 +131,20 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
                                     cco::ccoDevComm devComm,
                                     cco::ccoWindow_t heapWin,
                                     uint64_t* __restrict__ barrierCtr,
-                                    uint64_t* __restrict__ arrived) {
+                                    uint64_t* __restrict__ arrived,
+                                    bool dbgNanCheck = false) {
   const uint32_t stride4G = heapWin->stride4G;
   // Every lane of the first wave reads my slot before lane myPe posts. A
   // kAsyncDone launch finds the start's pushGen - 1 there, so it gets the same.
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
 
   if constexpr (Flags & kAsyncStart) {
+    // Debug (MORI_CCL_NAN_CHECK): scan my shard BEFORE the push, so a hit means
+    // the all-gather RECEIVED NaN (upstream bug) rather than produced it.
+    if (dbgNanCheck) {
+      DebugScanBf16(input, chunkBytes, myPe, -1, "ag-in");
+      __syncthreads();
+    }
     // A peer finishing its previous launch only proves our shard reached it; each
     // peer's queue polls for its arrival in this launch before writing its output.
     PostArrival(barrierCtr, pushGen - 1, myPe, npes, stride4G);
@@ -173,6 +180,12 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
   // System-scope ACQUIRE: output was written by peers' SDMA over XGMI, so
   // invalidate against another device's writes before any reader trusts output.
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+
+  // Debug (MORI_CCL_NAN_CHECK): scan the full gathered output AFTER the copy
+  // landed. A hit here with clean "ag-in" means the all-gather PRODUCED the NaN.
+  if (dbgNanCheck) {
+    DebugScanBf16(output, chunkBytes * npes, myPe, -1, "ag-out");
+  }
 
   // Output already fully written by SDMA. The block read pushGen at entry, so
   // it can advance the generation for the next launch now.

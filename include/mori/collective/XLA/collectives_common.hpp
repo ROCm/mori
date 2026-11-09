@@ -776,6 +776,41 @@ __device__ __forceinline__ bool LastBlockOut(uint32_t* groupCtr) {
   return BroadcastLane0(last) != 0;
 }
 
+// ---------------------------------------------------------------------------
+// Debug: device-side NaN/Inf scanner for the push copy collectives, gated by a
+// host flag (MORI_CCL_NAN_CHECK=1). Interprets the buffer as bf16 (the only type
+// under investigation) and flags any element whose 8-bit exponent is all ones:
+// that is +/-Inf (mantissa == 0) or NaN (mantissa != 0). Reporting is throttled
+// to kDbgNanMaxPrints prints across the whole run via a device counter, so it
+// never floods; each line gives pe, a tag ("a2a-in"/"a2a-out"/"ag-in"/"ag-out"),
+// the peer, the flat bf16 index and the raw 16-bit pattern. A thread stops at its
+// first find; the aim is only to learn whether a push kernel RECEIVES NaN on its
+// input or PRODUCES it on its output.
+static constexpr unsigned kDbgNanMaxPrints = 64;
+static __device__ unsigned g_dbgNanPrints = 0;
+
+__device__ __forceinline__ bool IsBadBf16(uint16_t x) {
+  return (x & 0x7F80u) == 0x7F80u;  // exp all ones => Inf (mant 0) or NaN (mant != 0)
+}
+
+__device__ __forceinline__ void DebugScanBf16(const void* buf, size_t bytes, int myPe,
+                                              int peer, const char* tag) {
+  if (buf == nullptr) return;
+  const uint16_t* p = static_cast<const uint16_t*>(buf);
+  const size_t n = bytes / sizeof(uint16_t);
+  const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  for (size_t i = gtid; i < n; i += stride) {
+    if (IsBadBf16(p[i])) {
+      if (atomicAdd(&g_dbgNanPrints, 1u) < kDbgNanMaxPrints) {
+        printf("[MORI NaN] pe=%d %s peer=%d idx=%zu/%zu bits=0x%04x\n", myPe, tag, peer, i,
+               n, static_cast<unsigned>(p[i]));
+      }
+      return;  // this thread's first find is enough
+    }
+  }
+}
+
 #endif  // __HIPCC__ || __HIP__
 
 }  // namespace ccl

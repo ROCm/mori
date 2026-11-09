@@ -180,7 +180,7 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   while (logS > 0 && (1ULL << logS) > maxSlicesByData) logS--;
   // Slicing only helps the SYNC path, where it overlaps SDMA-copy latency with
   // the reduction. 
-  if (phase != kSync) logS = 0;
+  // if (phase != kSync) logS = 0;
 
   if (mode == RsMode::kPull) {
     // The kernel resolves peer pe's copy of `input` device-side by the same
@@ -222,6 +222,17 @@ bool AsyncDisabled() {
     return e != nullptr && e[0] == '1';
   }();
   return disabled;
+}
+
+// MORI_CCL_NAN_CHECK=1 turns on the device-side bf16 NaN/Inf scan in the sync
+// push all-to-all / all-gather kernels (input before the push, output after), to
+// localize whether a push collective receives or produces NaN. Read once.
+bool NanCheckEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("MORI_CCL_NAN_CHECK");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
 }
 
 // Enum entry point: dispatch (dt, op) to reduceScatterImpl for F32/BF16/F16/S32/S64
@@ -372,8 +383,9 @@ hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size
   const size_t totalBytes = chunkBytes * nPes_;
   // Pull needs every peer slot (output + peer*chunkBytes) 16B-aligned, i.e.
   // chunkBytes and both bases 16B-aligned; otherwise fall through to push.
-  const uintptr_t bits = chunkBytes | reinterpret_cast<uintptr_t>(input) |
-                         reinterpret_cast<uintptr_t>(output);
+  const uintptr_t bits = chunkBytes;
+  //  | reinterpret_cast<uintptr_t>(input) |
+  //                        reinterpret_cast<uintptr_t>(output);
   if (resolveCopyMode(totalBytes, kAutoPullMaxBytesAg) == RsMode::kPull &&
       PullCopy16Aligned(bits) && PullNpesSupported(nPes_)) {
     constexpr int kPullThreads = 256;
@@ -391,7 +403,8 @@ hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size
   }
   // Single block: SDMA pushes my shard to every peer's output[myPe] slot (+ self).
   AllGatherPushKernel<kSync><<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output, chunkBytes,
-                                     devComm_, state_.heapWin, barrierCtr_, arrived_);
+                                     devComm_, state_.heapWin, barrierCtr_, arrived_,
+                                     NanCheckEnabled());
   return hipGetLastError();
 }
 
@@ -441,10 +454,10 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
   }
   const size_t totalBytes = chunkBytes * nPes_;
   uintptr_t bits = chunkBytes;
-  for (int p = 0; p < nPes_; ++p) {
-    bits |= reinterpret_cast<uintptr_t>(addrs[p].first) |
-            reinterpret_cast<uintptr_t>(addrs[p].second);
-  }
+  // for (int p = 0; p < nPes_; ++p) {
+  //   bits |= reinterpret_cast<uintptr_t>(addrs[p].first) |
+  //           reinterpret_cast<uintptr_t>(addrs[p].second);
+  // }
   constexpr int kThreads = 64;
   if (isAsync) {
     // Start only: issue the SDMA scatter and exit; AsyncDone waits for it.
@@ -474,7 +487,7 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
   // Single block: SDMA pushes each send slot p to peer p's recv slot (+ self).
   AllToAllPushKernel<kSync><<<1, kThreads, 0, stream>>>(myPe_, nPes_, 
                     state_.pinnedPairs, chunkBytes, devComm_,
-                    state_.heapWin, barrierCtr_, arrived_);
+                    state_.heapWin, barrierCtr_, arrived_, NanCheckEnabled());
   return hipGetLastError();
 }
 
