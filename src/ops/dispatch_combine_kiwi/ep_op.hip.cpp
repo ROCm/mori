@@ -26,7 +26,9 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "comm/rdma.hpp"
 #include "ep_context.hip.hpp"
+#include "ep_tuning.hpp"
 #include "hip_check.hpp"
 
 namespace mori::kiwi::ep {
@@ -78,7 +80,10 @@ config_t make_config(const ep_op_config_t& in) {
                                         hipDeviceAttributeMultiprocessorCount, hip_device));
   cfg.num_proxy_threads = in.num_proxy_threads;
   cfg.queue_capacity = in.queue_capacity;
-  cfg.device_name = in.device_name;
+  // Resolved here so the tuning key describes the NIC the proxies open.
+  cfg.device_name = rdma::resolve_device_name(in.device_name);
+  cfg.gpu_arch = current_gpu_arch();
+  cfg.nic_family = nic_family_for_hca(cfg.device_name);
   cfg.dispatch_elem_size = in.dispatch_elem_size;
   cfg.combine_elem_size = in.combine_elem_size;
   cfg.dispatch_quant_format = parse_quant_format(in.dispatch_quant_format);

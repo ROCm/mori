@@ -95,7 +95,7 @@ class ep_comm_context_t {
 
  private:
   void wait_drained();
-  void proxy_thread_func(int thread_id, int num_proxy_threads, int selected_cpu);
+  void proxy_thread_func(int thread_id, int num_proxy_threads, std::vector<int> cpus);
 
   std::shared_ptr<application::BootstrapNetwork> bootstrap_;
   int num_queues_ = 0;

@@ -28,13 +28,17 @@
 namespace mori::kiwi::p2p {
 namespace topology {
 
-// Return one selected CPU per proxy thread, or -1 when no usable CPU can be
-// selected.  CPUs are chosen from the current HIP device's KFD-local CPU slice
-// when it intersects the process affinity mask; otherwise they are partitioned
-// across the currently allowed mask.
-std::vector<int> choose_proxy_thread_cpus(int num_proxy_threads);
+// CPUs for the proxy threads serving the current HIP device: its PCI-local
+// CPUs within the calling thread's affinity mask. Empty when they do not
+// intersect or cannot be read; proxies then keep the mask they inherit. Call
+// on the thread that selected the device, since hipSetDevice() is per thread.
+// KIWI_PROXY_AFFINITY_DEBUG=1 prints the set.
+std::vector<int> proxy_thread_cpu_set();
 
-void pin_proxy_thread_to_cpu(int thread_id, int num_proxy_threads, int selected_cpu);
+// Restrict the calling thread to cpus and leave placement within them to the
+// scheduler. Pinning each proxy to a CPU chosen independently per rank lets
+// ranks collide on one CPU; a shared set cannot. No-op for an empty set.
+void bind_current_thread_to_cpus(const std::vector<int>& cpus);
 
 }  // namespace topology
 }  // namespace mori::kiwi::p2p

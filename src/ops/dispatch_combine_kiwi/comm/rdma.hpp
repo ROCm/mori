@@ -58,11 +58,15 @@ enum class post_status_t {
   retry,
 };
 
+// The RDMA device name to use: `device_name` if set, else
+// MORI_KIWI_DEVICE_NAME, else the NIC that TopoSystem::MatchGpuAndNic pairs
+// with the current HIP device.
+std::string resolve_device_name(const std::string& device_name);
+
 // One NIC port and protection domain, shared by all devices of an EP context.
 class net_context_t {
  public:
-  // An empty `device_name` selects MORI_KIWI_DEVICE_NAME, then the NIC that
-  // TopoSystem::MatchGpuAndNic pairs with the current HIP device.
+  // `device_name` is resolved with resolve_device_name().
   explicit net_context_t(const std::string& device_name);
   ~net_context_t();
 
