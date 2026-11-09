@@ -1647,5 +1647,158 @@ TEST(PeerPoolLocalEviction, RejectsBadConfigAndLeavesAnUnorderedMediumAlone) {
   EXPECT_TRUE(registry.Get("dram")->Contains("k"));
 }
 
+TEST(PeerPoolCompletionPins, RetryReleaseClearAndLateTokensPreservePageLifetime) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 64, 4,
+                      std::chrono::milliseconds(1));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  const auto total_bytes = registry.Get("dram")->Capacity().total_bytes;
+  CommitKey(&pool, "kv", "dram");
+  auto first = pool.AcquireReadBatch({"kv"}, "reader:1", pool.Generation(), true);
+  ASSERT_TRUE(first.accepted);
+  ASSERT_TRUE(first.entries.front().resolved.found);
+  auto duplicate = pool.AcquireReadBatch({"kv"}, "reader:1", pool.Generation(), true);
+  EXPECT_EQ(duplicate.token, first.token);
+  duplicate.entries.clear();
+  first.entries.clear();  // RPC serialization would drop these caller-side holds.
+  std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  EXPECT_EQ(pool.Evict({"kv"}, PoolEvictMode::kDiscard).front().bytes_freed, 0u);
+  const auto old_generation = pool.Generation();
+  pool.ClearLocal();
+  registry.Get("dram")->ClearFullSyncAcked();
+  EXPECT_EQ(registry.Get("dram")->Capacity().available_bytes, total_bytes - 64);
+  EXPECT_FALSE(pool.AcquireReadBatch({"kv"}, "reader:2", old_generation, true).accepted);
+  EXPECT_TRUE(pool.ReleaseReadPins({first.token}).front());
+  EXPECT_TRUE(pool.ReleaseReadPins({first.token}).front());
+  static_cast<PageBackend*>(static_cast<InstrumentedBackend*>(registry.Get("dram"))->Inner())
+      ->RunReaperOnceForTest();
+  EXPECT_EQ(registry.Get("dram")->Capacity().available_bytes, total_bytes);
+  EXPECT_FALSE(pool.AcquireReadBatch({"kv"}, "reader:1", pool.Generation(), true).accepted);
+  CommitKey(&pool, "kv", "dram");
+  auto current = pool.AcquireReadBatch({"kv"}, "reader:3", pool.Generation(), true);
+  ASSERT_TRUE(current.accepted);
+  current.entries.clear();
+  EXPECT_TRUE(pool.ReleaseReadPins({first.token}).front());
+  EXPECT_EQ(pool.Evict({"kv"}, PoolEvictMode::kDiscard).front().bytes_freed, 0u);
+  EXPECT_TRUE(pool.ReleaseReadPins({current.token}).front());
+  EXPECT_EQ(pool.Evict({"kv"}, PoolEvictMode::kDiscard).front().bytes_freed, 64u);
+}
+
+TEST(PeerPoolCompletionPins, OrderedReadsHaveNoLifetimeRequestLimit) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 64, 4);
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  CommitKey(&pool, "kv", "dram");
+  for (uint64_t sequence = 1; sequence <= 66000; ++sequence) {
+    auto grant = pool.AcquireReadBatch({"kv"}, "reader:" + std::to_string(sequence), 0, false);
+    ASSERT_TRUE(grant.accepted) << sequence;
+    ASSERT_TRUE(pool.ReleaseReadPins({grant.token}).front());
+  }
+  EXPECT_FALSE(pool.AcquireReadBatch({"kv"}, "reader:1", 0, false).accepted);
+}
+
+TEST(PeerPoolCompletionPins, AbandonedOperationsFenceDelayedAcquireAndReserve) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 64, 4);
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  const auto total_bytes = registry.Get("dram")->Capacity().total_bytes;
+  CommitKey(&pool, "kv", "dram");
+  EXPECT_TRUE(pool.AbandonReadOperations({"reader:1"}).front());
+  EXPECT_FALSE(pool.AcquireReadBatch({"kv"}, "reader:1", 0, false).accepted);
+  auto grant = pool.AcquireReadBatch({"kv"}, "reader:2", 0, false);
+  ASSERT_TRUE(grant.accepted);
+  grant.entries.clear();
+  EXPECT_TRUE(pool.AbandonReadOperations({"reader:2"}).front());
+  EXPECT_TRUE(pool.ReleaseReadPins({grant.token}).front());
+  EXPECT_EQ(pool.Evict({"kv"}, PoolEvictMode::kDiscard).front().bytes_freed, 64u);
+
+  EXPECT_TRUE(pool.BatchAbortProtected({{{0, 0}, "writer:1", false, true}}).front());
+  auto request = PutRequest("new", "dram");
+  request.operation_id = "writer:1";
+  request.expected_pool_generation = 0;
+  EXPECT_EQ(pool.BatchAllocate({request}).front().allocation.outcome, AllocateOutcome::kFailed);
+  request.operation_id = "writer:2";
+  auto allocation = pool.BatchAllocate({request}).front();
+  ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_FALSE(pool.BatchAbortProtected({{{0, 0}, "writer:2", false, false}}).front());
+  EXPECT_EQ(registry.Get("dram")->Capacity().available_bytes, total_bytes - 64);
+  EXPECT_TRUE(pool.BatchAbortProtected({{{0, 0}, "writer:2", false, true}}).front());
+  EXPECT_EQ(registry.Get("dram")->Capacity().available_bytes, total_bytes);
+  EXPECT_EQ(pool.BatchAllocate({request}).front().allocation.outcome, AllocateOutcome::kFailed);
+}
+
+TEST(PeerPoolCompletionPins, ProtectedWritesRequireDrainAndRespectClearEpoch) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 64, 4);
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  const auto total_bytes = registry.Get("dram")->Capacity().total_bytes;
+  auto request = PutRequest("kv", "dram");
+  request.operation_id = "writer:1";
+  request.expected_pool_generation = pool.Generation();
+  auto allocation = pool.BatchAllocate({request}).front();
+  ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_EQ(pool.BatchAllocate({request}).front().allocation.slot_id,
+            allocation.allocation.slot_id);
+  PoolSlotRef slot{allocation.backend_id, allocation.allocation.slot_id};
+  EXPECT_FALSE(pool.BatchAbort({slot}).front());
+  EXPECT_FALSE(
+      pool.BatchCommit({{slot, "kv", request.operation_id, false}}).front().commit.success);
+  pool.ClearLocal();
+  registry.Get("dram")->ClearFullSyncAcked();
+  EXPECT_FALSE(pool.BatchCommit({{slot, "kv", request.operation_id, true}}).front().commit.success);
+  EXPECT_FALSE(registry.Get("dram")->Contains("kv"));
+  EXPECT_EQ(registry.Get("dram")->Capacity().available_bytes, total_bytes);
+  request.operation_id = "writer:2";
+  EXPECT_EQ(pool.BatchAllocate({request}).front().allocation.outcome, AllocateOutcome::kFailed);
+  request.expected_pool_generation = pool.Generation();
+  auto next = pool.BatchAllocate({request}).front();
+  ASSERT_EQ(next.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_TRUE(pool.BatchAbortProtected(
+                      {{{next.backend_id, next.allocation.slot_id}, request.operation_id, true}})
+                  .front());
+}
+
+TEST(PeerPoolCompletionPins, LostBatchCommitReplyAndDedupReplayAreIdempotent) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 64, 4);
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  const auto total_bytes = registry.Get("dram")->Capacity().total_bytes;
+  std::vector<PoolPlacementRequest> requests{PutRequest("kv-a", "dram"),
+                                             PutRequest("kv-b", "dram")};
+  requests[0].operation_id = "writer:1";
+  requests[1].operation_id = "writer:2";
+  std::vector<PoolCommitRequest> commits;
+  for (auto& request : requests) request.expected_pool_generation = pool.Generation();
+  auto allocations = pool.BatchAllocate(requests);
+  for (size_t i = 0; i < requests.size(); ++i) {
+    ASSERT_EQ(allocations[i].allocation.outcome, AllocateOutcome::kSuccessAllocated);
+    commits.push_back({{allocations[i].backend_id, allocations[i].allocation.slot_id},
+                       requests[i].key,
+                       requests[i].operation_id,
+                       true});
+  }
+  for (const auto& result : pool.BatchCommit(commits)) EXPECT_TRUE(result.commit.success);
+  for (const auto& result : pool.BatchCommit(commits)) EXPECT_TRUE(result.commit.success);
+
+  auto dedup = PutRequest("kv-a", "dram");
+  dedup.operation_id = "writer:3";
+  dedup.expected_pool_generation = pool.Generation();
+  ASSERT_EQ(pool.BatchAllocate({dedup}).front().allocation.outcome,
+            AllocateOutcome::kSuccessAlreadyExists);
+  ASSERT_EQ(pool.Evict({"kv-a"}, PoolEvictMode::kDiscard).front().bytes_freed, 64u);
+  EXPECT_EQ(pool.BatchAllocate({dedup}).front().allocation.outcome,
+            AllocateOutcome::kSuccessAlreadyExists);
+  EXPECT_EQ(registry.Get("dram")->Capacity().available_bytes, total_bytes - 64);
+  EXPECT_TRUE(registry.Get("dram")->Contains("kv-b"));
+  // Once compacted, a stale commit reports failure while the newer object is
+  // untouched and the old successful dedup never creates writable bytes.
+  for (const auto& result : pool.BatchCommit(commits)) EXPECT_FALSE(result.commit.success);
+}
+
 }  // namespace
 }  // namespace mori::umbp

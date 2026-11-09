@@ -230,6 +230,7 @@ enum class EvictionOrder : int {
 enum class MemoryRegistration : int {
   kPinned = 0,         // record it and export it to the IO engine
   kLocalCopyOnly = 1,  // record it only; no MR, no dmabuf export
+  kFabricLocal = 2,    // local GPU endpoint for FABRIC, without RDMA registration
 };
 
 // Structured form of one (buffer_index, page_index) slot.  Used by the

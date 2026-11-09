@@ -21,13 +21,21 @@
 // SOFTWARE.
 #include "umbp/distributed/transfer/mori_io_engine.h"
 
+#include <hip/hip_runtime.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <exception>
 #include <functional>
 #include <iterator>
 #include <limits>
 #include <msgpack.hpp>
+#include <numeric>
+#include <random>
+#include <sstream>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -39,6 +47,16 @@
 namespace mori::umbp {
 
 namespace {
+
+std::string IncarnationKey(const std::string& node_id) {
+  static std::atomic<uint64_t> sequence{0};
+  std::random_device random;
+  std::ostringstream key;
+  key << node_id << "/" << getpid() << "/" << std::hex
+      << std::chrono::steady_clock::now().time_since_epoch().count() << "/" << random() << "/"
+      << sequence.fetch_add(1, std::memory_order_relaxed);
+  return key.str();
+}
 
 // Same two endpoints?  Ids are only unique per IOEngine, so compare engine keys too.
 bool SameEndpoints(const TransferPlan& plan, const TransferRef& src, const TransferRef& dst) {
@@ -87,6 +105,16 @@ class MoriIoEngine::RdmaHandle final : public TransferHandle {
     }
   }
 
+  bool WaitOnStream(void* stream) override {
+    bool ready = presettled_.empty();
+    for (auto& set : sets_) {
+      for (auto& status : set->statuses) {
+        if (status.WaitOnStream(stream) != mori::io::StatusCode::SUCCESS) ready = false;
+      }
+    }
+    return ready;
+  }
+
   void Wait(std::vector<TransferFailure>* failures) override {
     if (drained_) return;
     drained_ = true;
@@ -106,6 +134,7 @@ class MoriIoEngine::RdmaHandle final : public TransferHandle {
         f.code = set->statuses[g].CodeUint32();
         f.message = set->statuses[g].Message();
         f.endpoint = set->endpoints[g];
+        f.resources_quarantined = set->statuses[g].ResourcesQuarantined();
         failures->push_back(std::move(f));
       }
     }
@@ -130,52 +159,100 @@ class MoriIoEngine::RdmaHandle final : public TransferHandle {
 // ---------------------------------------------------------------------------
 
 MoriIoEngine::MoriIoEngine(std::string engine_key, mori::io::IOEngineConfig io_config,
-                           uint64_t bounce_bytes)
+                           uint64_t bounce_bytes, UMBPIoEngineConfig transport_config)
     : local_engine_key_(std::move(engine_key)),
       io_config_(std::move(io_config)),
-      bounce_size_(bounce_bytes) {}
+      transport_config_(std::move(transport_config)),
+      bounce_size_(transport_config_.mode == UMBPTransferMode::kFabricStrict ? 0 : bounce_bytes) {}
 
 MoriIoEngine::~MoriIoEngine() { Shutdown(); }
 
 bool MoriIoEngine::Init() {
   if (io_engine_ != nullptr) return true;
-  if (io_config_.host.empty()) return false;
-
-  io_engine_ = std::make_unique<mori::io::IOEngine>(local_engine_key_, io_config_);
-  // Adopt whatever key the engine actually published: IsRemoteMemory compares
-  // a descriptor's engineKey against this, so a transformed key here would make
-  // every local buffer look remote.
-  local_engine_key_ = io_engine_->GetEngineDesc().key;
-
-  mori::io::RdmaBackendConfig rdma_cfg;
-  rdma_cfg.qpPerTransfer = 4;
-  rdma_cfg.enableTransferChunking = true;
-  rdma_cfg.numNicsPerTransfer = 4;
-  // Completion is read from the initiator's own CQ and peers never call
-  // PopInboundTransferStatus, so a notification SEND per transfer would only cost
-  // an SQ slot here, an RQ slot on the peer and a notifPool entry it never frees.
-  rdma_cfg.enableNotification = false;
-  // UMBP only sets the config defaults above.  All RDMA knobs (qpPerTransfer /
-  // postBatchSize / numWorkerThreads / pollCqMode / chunking / numNics / ...)
-  // are overridable via MORI_IO_* env in the RDMA backend ctor, shared by every
-  // IO backend user; no UMBP-specific entry points.
-  io_engine_->CreateBackend(mori::io::BackendType::RDMA, rdma_cfg);
-
-  if (bounce_size_ > 0) {
-    bounce_buffer_ = std::make_unique<char[]>(bounce_size_);
-    std::memset(bounce_buffer_.get(), 0, bounce_size_);
-    bounce_ref_ = RegisterMemory(bounce_buffer_.get(), bounce_size_,
-                                 mori::io::MemoryLocationType::CPU, /*device=*/-1);
-    if (!bounce_ref_.HasMemoryDesc()) {
-      MORI_UMBP_WARN("[MoriIoEngine] bounce buffer could not be registered; staging disabled");
-      bounce_buffer_.reset();
-      bounce_ref_ = TransferRef{};
+  const bool strict = transport_config_.mode == UMBPTransferMode::kFabricStrict;
+  const bool fabric = transport_config_.mode != UMBPTransferMode::kRdma;
+  if (io_config_.host.empty() && !fabric) return false;
+  if (strict && transport_config_.fabric_kernel_path.empty()) {
+    MORI_UMBP_ERROR("[MoriIoEngine] fabric_strict requires fabric_kernel_path");
+    return false;
+  }
+  // FABRIC has no RDMA control listener; the peer gRPC endpoint carries metadata.
+  if (io_config_.host.empty()) io_config_.host = "127.0.0.1";
+  try {
+    local_engine_key_ = IncarnationKey(local_engine_key_);
+    io_engine_ = std::make_unique<mori::io::IOEngine>(local_engine_key_, io_config_);
+    local_engine_key_ = io_engine_->GetEngineDesc().key;
+    enabled_backend_mask_ = 0;
+    if (fabric) {
+      try {
+        io_engine_->CreateBackend(mori::io::BackendType::FABRIC, mori::io::FabricBackendConfig{});
+        enabled_backend_mask_ |= mori::io::BackendBit(mori::io::BackendType::FABRIC);
+        if (!transport_config_.fabric_kernel_path.empty()) {
+          io_engine_->LoadFabricCopyModule(transport_config_.fabric_kernel_path);
+        }
+      } catch (const std::exception& e) {
+        if (strict) throw;
+        MORI_UMBP_WARN("[MoriIoEngine] auto: FABRIC unavailable; retaining RDMA path: {}",
+                       e.what());
+      }
+      int devices = 0;
+      (void)hipGetDeviceCount(&devices);
+      bool ready = false;
+      for (int device = 0; device < devices; ++device) ready |= io_engine_->IsFabricReady(device);
+      if (strict && !ready) {
+        MORI_UMBP_ERROR(
+            "[MoriIoEngine] fabric_strict: no GPU has a ready fabric copy module/domain");
+        Shutdown();
+        return false;
+      }
+      if (!ready) {
+        MORI_UMBP_WARN(
+            "[MoriIoEngine] FABRIC not copy-ready; auto requests require another backend");
+      }
+    }
+    if (!strict) {
+      mori::io::RdmaBackendConfig rdma_cfg;
+      rdma_cfg.qpPerTransfer = 4;
+      rdma_cfg.enableTransferChunking = true;
+      rdma_cfg.numNicsPerTransfer = 4;
+      rdma_cfg.enableNotification = false;
+      try {
+        io_engine_->CreateBackend(mori::io::BackendType::RDMA, rdma_cfg);
+        enabled_backend_mask_ |= mori::io::BackendBit(mori::io::BackendType::RDMA) |
+                                 mori::io::BackendBit(mori::io::BackendType::XGMI);
+      } catch (const std::exception& e) {
+        if (!fabric) throw;
+        MORI_UMBP_WARN("[MoriIoEngine] auto: RDMA unavailable; retaining FABRIC: {}", e.what());
+      }
+    }
+    io_engine_->SetTransferBackendMask(strict ? mori::io::BackendBit(mori::io::BackendType::FABRIC)
+                                              : enabled_backend_mask_);
+    if (strict || !(enabled_backend_mask_ & mori::io::BackendBit(mori::io::BackendType::RDMA))) {
       bounce_size_ = 0;
     }
+    if (bounce_size_ > 0) {
+      bounce_buffer_ = std::make_unique<char[]>(bounce_size_);
+      std::memset(bounce_buffer_.get(), 0, bounce_size_);
+      try {
+        bounce_ref_ = RegisterMemory(bounce_buffer_.get(), bounce_size_,
+                                     mori::io::MemoryLocationType::CPU, /*device=*/-1);
+      } catch (const std::exception& e) {
+        if (!fabric) throw;
+        MORI_UMBP_WARN("[MoriIoEngine] auto: host bounce registration unavailable: {}", e.what());
+      }
+      if (!bounce_ref_.HasMemoryDesc()) {
+        bounce_buffer_.reset();
+        bounce_ref_ = TransferRef{};
+        bounce_size_ = 0;
+      }
+    }
+  } catch (const std::exception& e) {
+    MORI_UMBP_ERROR("[MoriIoEngine] init failed: {}", e.what());
+    Shutdown();
+    return false;
   }
-
-  MORI_UMBP_INFO("[MoriIoEngine] initialized on {}:{} bounce_bytes={}", io_config_.host,
-                 io_config_.port, bounce_size_);
+  MORI_UMBP_INFO("[MoriIoEngine] initialized key={} mode={} bounce_bytes={}", local_engine_key_,
+                 static_cast<int>(transport_config_.mode), bounce_size_);
   return true;
 }
 
@@ -199,9 +276,32 @@ void MoriIoEngine::Shutdown() {
 
 TransferRef MoriIoEngine::RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
                                          int device) {
+  return RegisterMemoryWithBackends(base, size, loc, device, mori::io::kAllBackendMask);
+}
+
+TransferRef MoriIoEngine::RegisterMemoryWithBackends(void* base, size_t size,
+                                                     mori::io::MemoryLocationType loc, int device,
+                                                     uint32_t allowed_backend_mask) {
   TransferRef ref = TransferRef::HostBytes(base, size, loc, device);
   if (io_engine_ == nullptr || base == nullptr || size == 0) return ref;
-  ref.mem = io_engine_->RegisterMemory(base, size, device, loc);
+  const bool strict = transport_config_.mode == UMBPTransferMode::kFabricStrict;
+  uint32_t mask = allowed_backend_mask & enabled_backend_mask_;
+  if (strict && loc != mori::io::MemoryLocationType::GPU) return ref;
+  if (strict && !io_engine_->IsFabricReady(device)) {
+    throw std::runtime_error("fabric_strict registration requires a copy-ready GPU");
+  }
+  if (mask == 0) return ref;
+  try {
+    ref.mem = io_engine_->RegisterMemoryWithBackends(base, size, device, loc, mask);
+  } catch (const std::exception& e) {
+    const uint32_t fabric_mask = mori::io::BackendBit(mori::io::BackendType::FABRIC);
+    if (transport_config_.mode != UMBPTransferMode::kAuto ||
+        loc != mori::io::MemoryLocationType::GPU || !(mask & fabric_mask) || mask == fabric_mask) {
+      throw;
+    }
+    MORI_UMBP_WARN("[MoriIoEngine] auto: registration fell back to FABRIC-only: {}", e.what());
+    ref.mem = io_engine_->RegisterMemoryWithBackends(base, size, device, loc, fabric_mask);
+  }
   return ref;
 }
 
@@ -241,10 +341,25 @@ bool MoriIoEngine::EnsureRemoteEngine(const std::string& node_id,
     return false;
   }
 
-  if (io_engine_ != nullptr) io_engine_->RegisterRemoteEngine(desc);
-
+  if (desc.key.empty() || desc.key == local_engine_key_) {
+    MORI_UMBP_ERROR("[MoriIoEngine] refusing invalid remote identity from '{}'", node_id);
+    return false;
+  }
   std::lock_guard<std::mutex> lock(remotes_mutex_);
   auto& remote = remotes_[node_id];
+  if (remote.engine_registered && remote.engine_desc == desc) return true;
+  if (!remote.engine_desc.key.empty() && !(remote.engine_desc == desc)) {
+    if (remote.engine_registered && io_engine_) {
+      io_engine_->DeregisterRemoteEngine(remote.engine_desc);
+    }
+    remote = RemoteNode{};
+  }
+  try {
+    if (io_engine_) io_engine_->RegisterRemoteEngine(desc);
+  } catch (const std::exception& e) {
+    MORI_UMBP_ERROR("[MoriIoEngine] remote registration failed for '{}': {}", node_id, e.what());
+    return false;
+  }
   remote.engine_desc = std::move(desc);
   remote.engine_registered = (io_engine_ != nullptr);
   return true;
@@ -258,7 +373,12 @@ bool MoriIoEngine::HasRemoteEngine(const std::string& node_id) const {
 
 void MoriIoEngine::ForgetRemote(const std::string& node_id) {
   std::lock_guard<std::mutex> lock(remotes_mutex_);
-  remotes_.erase(node_id);
+  auto it = remotes_.find(node_id);
+  if (it == remotes_.end()) return;
+  if (io_engine_ && it->second.engine_registered) {
+    io_engine_->DeregisterRemoteEngine(it->second.engine_desc);
+  }
+  remotes_.erase(it);
 }
 
 void MoriIoEngine::CacheRemoteBuffers(const std::string& node_id,
@@ -288,23 +408,17 @@ void MoriIoEngine::CacheRemoteBuffers(const std::string& node_id,
       continue;
     }
 
-    if (shelf[d.buffer_index].HasMemoryDesc()) {
-      // Already hydrated.  First-write-wins is only safe while a descriptor is
-      // immutable for a given address — a CHANGED descriptor means two buffers
-      // are claiming one address, which does not fail loudly on its own: the
-      // reader would keep planning RDMA against valid-looking memory and return
-      // the wrong bytes as a hit.  That is exactly how the pre-backend_id
-      // collision stayed invisible, so say so and keep the incumbent.
-      const auto& held = shelf[d.buffer_index].mem;
-      if (!(held == mem)) {
-        MORI_UMBP_ERROR(
-            "[MoriIoEngine] CacheRemoteBuffers: conflicting desc from '{}' backend={} "
-            "buffer_index={} (held id={} data={:#x} size={}, offered id={} data={:#x} size={}); "
-            "keeping the held one — the peer is publishing two buffers at one address",
-            node_id, d.backend_id, d.buffer_index, held.id, held.data, held.size, mem.id, mem.data,
-            mem.size);
-      }
+    if (!remote.engine_desc.key.empty() && mem.engineKey != remote.engine_desc.key) {
+      MORI_UMBP_ERROR("[MoriIoEngine] discarding stale region for '{}' engine={}", node_id,
+                      mem.engineKey);
       continue;
+    }
+    if (shelf[d.buffer_index].HasMemoryDesc()) {
+      const auto& held = shelf[d.buffer_index].mem;
+      if (held == mem) continue;
+      if (io_engine_) io_engine_->InvalidateRemoteMemory(held);
+      MORI_UMBP_INFO("[MoriIoEngine] invalidated changed region '{}' backend={} buffer={}", node_id,
+                     d.backend_id, d.buffer_index);
     }
     shelf[d.buffer_index] = TransferRef::Remote(std::move(mem));
   }
@@ -318,7 +432,9 @@ bool MoriIoEngine::HasRemoteBuffers(const std::string& node_id) const {
   // turns into BatchResolveKeysRequest.omit_descs.  GetPeerInfo publishes every
   // backend at once, so any non-empty shelf means the whole handshake landed.
   for (const auto& shelf : it->second.buffers) {
-    if (!shelf.empty()) return true;
+    for (const auto& ref : shelf) {
+      if (ref.HasMemoryDesc()) return true;
+    }
   }
   return false;
 }
@@ -364,7 +480,10 @@ bool MoriIoEngine::CanHandle(const TransferRef& src, const TransferRef& dst) con
   const bool dst_remote = IsRemoteMemory(dst, local_engine_key_);
   if (src_remote == dst_remote) return false;  // both local or both remote
   const TransferRef& local = src_remote ? dst : src;
-  if (local.HasMemoryDesc()) return true;          // zero copy
+  if (local.HasMemoryDesc()) {
+    const TransferRef& remote = src_remote ? src : dst;
+    return io_engine_->GetSelectedBackend(local.mem, remote.mem).has_value();
+  }
   return IsBounceable(local) && bounce_size_ > 0;  // staged through the pool
 }
 
@@ -390,11 +509,19 @@ struct PairKeyHash {
 class MoriIoPlanBuilder final : public TransferPlanBuilder {
  public:
   MoriIoPlanBuilder(const std::string& local_key, uint64_t bounce_size,
-                    const TransferRef& bounce_ref)
-      : local_key_(local_key), bounce_size_(bounce_size), bounce_ref_(bounce_ref) {}
+                    const TransferRef& bounce_ref, bool fabric_strict = false)
+      : local_key_(local_key),
+        bounce_size_(bounce_size),
+        bounce_ref_(bounce_ref),
+        fabric_strict_(fabric_strict) {}
 
   void Add(const TransferItem& item) override {
     if (item.size == 0) return;
+    if (fabric_strict_ && (item.src.loc != mori::io::MemoryLocationType::GPU ||
+                           item.dst.loc != mori::io::MemoryLocationType::GPU)) {
+      out_.rejected_tags.push_back(item.tag);
+      return;
+    }
     const bool src_remote = IsRemoteMemory(item.src, local_key_);
     const bool dst_remote = IsRemoteMemory(item.dst, local_key_);
     if (src_remote == dst_remote) {  // both local or both remote
@@ -481,6 +608,7 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
   const std::string& local_key_;
   const uint64_t bounce_size_;
   const TransferRef& bounce_ref_;
+  const bool fabric_strict_;
   TransferPlanSet out_;
   std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> pair_to_plans_;
   std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> bounce_to_plans_;
@@ -491,7 +619,9 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
 
 std::unique_ptr<TransferPlanBuilder> MoriIoEngine::CreatePlanBuilder(
     size_t /*expected_items*/) const {
-  return MakeRdmaPlanBuilder(local_engine_key_, bounce_size_, bounce_ref_);
+  return std::make_unique<MoriIoPlanBuilder>(
+      local_engine_key_, bounce_size_, bounce_ref_,
+      transport_config_.mode == UMBPTransferMode::kFabricStrict);
 }
 
 std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& local_key,
@@ -518,8 +648,27 @@ bool MoriIoEngine::PostPlans(const std::vector<TransferPlan>& plans, RdmaHandle*
   };
 
   for (const auto& plan : plans) {
-    RdmaHandle::PostSet* set = set_for(plan.dir);
     const bool pulling = (plan.dir == TransferDirection::kPull);
+    const auto& local = pulling ? plan.dst.mem : plan.src.mem;
+    const auto& remote = pulling ? plan.src.mem : plan.dst.mem;
+    const auto backend = io_engine_->GetSelectedBackend(local, remote);
+    if (!backend) {
+      TransferFailure failure;
+      failure.tags = plan.tags;
+      failure.code = static_cast<uint32_t>(mori::io::StatusCode::ERR_NOT_FOUND);
+      failure.message = "no permitted backend can reach this endpoint pair";
+      failure.endpoint = remote.engineKey;
+      handle->AddPresettled(std::move(failure));
+      continue;
+    }
+    const auto backend_index = static_cast<size_t>(*backend);
+    if (backend_index < kBackendCount) {
+      const size_t direction_index = pulling ? 0 : 1;
+      submitted_plans_[backend_index][direction_index].fetch_add(1, std::memory_order_relaxed);
+      const uint64_t bytes = std::accumulate(plan.sizes.begin(), plan.sizes.end(), uint64_t{0});
+      submitted_bytes_[backend_index][direction_index].fetch_add(bytes, std::memory_order_relaxed);
+    }
+    RdmaHandle::PostSet* set = set_for(plan.dir);
     // local = dst when pulling, src when pushing.
     set->local_descs.push_back(pulling ? plan.dst.mem : plan.src.mem);
     set->remote_descs.push_back(pulling ? plan.src.mem : plan.dst.mem);
@@ -631,6 +780,26 @@ std::unique_ptr<TransferHandle> MoriIoEngine::Submit(std::vector<TransferPlan> p
 
   if (!any) return nullptr;
   return handle;
+}
+
+std::vector<MetricSample> MoriIoEngine::SampleMetrics() const {
+  static constexpr const char* names[] = {"unknown", "xgmi", "rdma", "tcp", "fabric", "ofi"};
+  std::vector<MetricSample> samples;
+  for (size_t backend = 0; backend < kBackendCount; ++backend) {
+    for (size_t direction = 0; direction < 2; ++direction) {
+      MetricLabels labels{{"backend", names[backend]},
+                          {"direction", direction == 0 ? "pull" : "push"}};
+      samples.push_back(
+          MetricSample{"mori_umbp_transport_submitted_bytes_total",
+                       "Bytes submitted by the selected MORI-IO backend", labels,
+                       submitted_bytes_[backend][direction].load(std::memory_order_relaxed)});
+      samples.push_back(
+          MetricSample{"mori_umbp_transport_submitted_plans_total",
+                       "Plans submitted by the selected MORI-IO backend", std::move(labels),
+                       submitted_plans_[backend][direction].load(std::memory_order_relaxed)});
+    }
+  }
+  return samples;
 }
 
 }  // namespace mori::umbp

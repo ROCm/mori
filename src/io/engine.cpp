@@ -26,6 +26,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -121,6 +122,11 @@ void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
   MORI_IO_FUNCTION_TIMER;
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session read");
+  auto registration = engine->RetainLocalRegistration(localMemory, status);
+  if (!registration) {
+    status->Update(StatusCode::ERR_BAD_STATE, "Local registration unavailable");
+    return;
+  }
   backendSess->Read(localOffset, remoteOffset, size, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Session read error {} message {}", status->CodeUint32(),
@@ -133,6 +139,11 @@ void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size
   MORI_IO_FUNCTION_TIMER;
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session write");
+  auto registration = engine->RetainLocalRegistration(localMemory, status);
+  if (!registration) {
+    status->Update(StatusCode::ERR_BAD_STATE, "Local registration unavailable");
+    return;
+  }
   backendSess->Write(localOffset, remoteOffset, size, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Session write error {} message {}", status->CodeUint32(),
@@ -146,6 +157,11 @@ void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remo
   MORI_IO_FUNCTION_TIMER;
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session batch read");
+  auto registration = engine->RetainLocalRegistration(localMemory, status);
+  if (!registration) {
+    status->Update(StatusCode::ERR_BAD_STATE, "Local registration unavailable");
+    return;
+  }
   backendSess->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Session batch read error {} message {}", status->CodeUint32(),
@@ -161,6 +177,11 @@ void IOEngineSession::BatchWrite(const SizeVec& localOffsets, const SizeVec& rem
   mori::io::MoriRoctxRange _mori_roctx_("mori.io.session_batch_write", static_cast<uint64_t>(id));
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session batch write");
+  auto registration = engine->RetainLocalRegistration(localMemory, status);
+  if (!registration) {
+    status->Update(StatusCode::ERR_BAD_STATE, "Local registration unavailable");
+    return;
+  }
   backendSess->BatchWrite(localOffsets, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Session batch write error {} message {}", status->CodeUint32(),
@@ -477,7 +498,15 @@ void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
 }
 
 MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc) {
+  return RegisterMemoryWithBackends(data, size, device, loc, kAllBackendMask);
+}
+
+MemoryDesc IOEngine::RegisterMemoryWithBackends(void* data, size_t size, int device,
+                                                MemoryLocationType loc,
+                                                uint32_t allowedBackendMask) {
+  if (data == nullptr || size == 0) throw std::invalid_argument("Invalid memory registration");
   MemoryDesc memDesc;
+  memDesc.registeredBackendMask = 0;
   memDesc.engineKey = desc.key;
   memDesc.id = nextMemUid.fetch_add(1, std::memory_order_relaxed);
   memDesc.deviceId = device;
@@ -492,22 +521,113 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
     memDesc.numaNode = DetectNumaNode(data);
   }
 
-  for (auto& it : backends) {
-    it.second->RegisterMemory(memDesc);
+  try {
+    for (auto& it : backends) {
+      if ((allowedBackendMask & BackendBit(it.first)) == 0) continue;
+      it.second->RegisterMemory(memDesc);
+      memDesc.registeredBackendMask |= BackendBit(it.first);
+    }
+  } catch (...) {
+    for (auto& it : backends) {
+      if (memDesc.registeredBackendMask & BackendBit(it.first)) {
+        it.second->DeregisterMemory(memDesc);
+      }
+    }
+    throw;
   }
 
-  memPool.insert({memDesc.id, memDesc});
+  {
+    std::lock_guard<std::mutex> lock(memPoolMu);
+    memPool.insert({memDesc.id, memDesc});
+    registrationStates.emplace(memDesc.id, std::make_shared<RegistrationState>());
+  }
   MORI_IO_TRACE("Register memory address {} size {} device {} loc {} with id {}", data, size,
                 device, static_cast<uint32_t>(loc), memDesc.id);
   return memDesc;
 }
 
-void IOEngine::DeregisterMemory(const MemoryDesc& desc) {
-  for (auto& it : backends) {
-    it.second->DeregisterMemory(desc);
+std::shared_ptr<void> IOEngine::RetainLocalRegistration(const MemoryDesc& local,
+                                                        TransferStatus* status) {
+  if (local.engineKey != desc.key || status == nullptr) return {};
+  std::shared_ptr<RegistrationState> state;
+  {
+    std::lock_guard<std::mutex> lock(memPoolMu);
+    auto it = registrationStates.find(local.id);
+    if (it == registrationStates.end()) return {};
+    state = it->second;
   }
-  memPool.erase(desc.id);
-  MORI_IO_TRACE("Deregister memory {} at address {}", desc.id, desc.data);
+  auto ticket = std::make_shared<RegistrationTicket>();
+  ticket->status = status;
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (!state->accepting) return {};
+  state->tickets.erase(std::remove_if(state->tickets.begin(), state->tickets.end(),
+                                      [](const auto& item) { return item.expired(); }),
+                       state->tickets.end());
+  state->tickets.push_back(ticket);
+  status->AddLifetimeObserver([state, ticket](bool quarantined) {
+    std::lock_guard<std::recursive_mutex> ticketLock(ticket->mutex);
+    ticket->status = nullptr;
+    if (quarantined) {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->quarantined = true;
+    }
+  });
+  return std::shared_ptr<void>(ticket.get(), [ticket](void*) {
+    {
+      std::lock_guard<std::recursive_mutex> lock(ticket->mutex);
+      ticket->submissionComplete = true;
+    }
+    ticket->submissionReady.notify_all();
+  });
+}
+
+void IOEngine::DeregisterMemory(const MemoryDesc& memory) {
+  if (memory.engineKey != desc.key) {
+    throw std::invalid_argument("DeregisterMemory requires a local descriptor");
+  }
+  std::shared_ptr<RegistrationState> state;
+  {
+    std::lock_guard<std::mutex> lock(memPoolMu);
+    auto it = registrationStates.find(memory.id);
+    if (it == registrationStates.end()) return;
+    state = it->second;
+  }
+  std::lock_guard<std::mutex> deregisterLock(state->deregisterMutex);
+  if (state->deregistered) return;
+  std::vector<std::shared_ptr<RegistrationTicket>> tickets;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->accepting = false;
+    for (auto& item : state->tickets)
+      if (auto ticket = item.lock()) tickets.push_back(ticket);
+  }
+  for (auto& ticket : tickets) {
+    // The observer takes the same lock before status destruction; no raw status
+    // is dereferenced after its owner has drained/destroyed it.
+    std::unique_lock<std::recursive_mutex> lock(ticket->mutex);
+    ticket->submissionReady.wait(lock, [&] { return ticket->submissionComplete; });
+    if (ticket->status) {
+      ticket->status->Wait();
+      if (ticket->status && ticket->status->ResourcesQuarantined()) {
+        std::lock_guard<std::mutex> stateLock(state->mutex);
+        state->quarantined = true;
+      }
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->quarantined) throw std::runtime_error("DRAIN_UNCONFIRMED: registration quarantined");
+  }
+  for (auto& it : backends) {
+    if (memory.registeredBackendMask & BackendBit(it.first)) it.second->DeregisterMemory(memory);
+  }
+  {
+    std::lock_guard<std::mutex> lock(memPoolMu);
+    memPool.erase(memory.id);
+    registrationStates.erase(memory.id);
+  }
+  state->deregistered = true;
+  InvalidateRouteCache();
 }
 
 TransferUniqueId IOEngine::AllocateTransferUniqueId() {
@@ -516,58 +636,56 @@ TransferUniqueId IOEngine::AllocateTransferUniqueId() {
   return id;
 }
 
-Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remote) {
-  if (backends.empty()) {
-    return nullptr;
-  }
+void IOEngine::SetTransferBackendMask(uint32_t mask) {
+  transferBackendMask.store(mask, std::memory_order_release);
+  InvalidateRouteCache();
+}
 
+std::optional<BackendType> IOEngine::GetSelectedBackend(const MemoryDesc& local,
+                                                        const MemoryDesc& remote) {
+  Backend* selected = SelectBackend(local, remote);
+  for (const auto& entry : backends) {
+    if (entry.second.get() == selected) return entry.first;
+  }
+  return std::nullopt;
+}
+
+void IOEngine::InvalidateRemoteMemory(const MemoryDesc& remote) {
+  if (remote.engineKey == desc.key) {
+    throw std::invalid_argument("InvalidateRemoteMemory requires a remote descriptor");
+  }
+  for (auto& entry : backends) entry.second->InvalidateRemoteMemory(remote);
+  InvalidateRouteCache();
+}
+
+bool IOEngine::IsFabricReady(int device) {
+  auto it = backends.find(BackendType::FABRIC);
+  auto* fabric = it == backends.end() ? nullptr : dynamic_cast<FabricBackend*>(it->second.get());
+  return fabric != nullptr && fabric->IsReady(device);
+}
+
+Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remote) {
+  const uint32_t eligible = transferBackendMask.load(std::memory_order_acquire) &
+                            local.registeredBackendMask & remote.registeredBackendMask;
   RouteCacheKey routeKey{remote.engineKey, local.loc, remote.loc, local.deviceId,
                          remote.deviceId,  local.id,  remote.id};
-
-  if (auto cachedType = QueryRouteCache(routeKey); cachedType.has_value()) {
-    auto cachedBackend = backends.find(cachedType.value());
-    if (cachedBackend != backends.end() && cachedBackend->second->CanHandle(local, remote)) {
-      return cachedBackend->second.get();
+  auto usable = [&](BackendType type) -> Backend* {
+    auto it = backends.find(type);
+    if ((eligible & BackendBit(type)) == 0 || it == backends.end() ||
+        !it->second->CanHandle(local, remote))
+      return nullptr;
+    return it->second.get();
+  };
+  if (auto cached = QueryRouteCache(routeKey)) {
+    if (Backend* backend = usable(*cached)) return backend;
+  }
+  for (BackendType type : {BackendType::XGMI, BackendType::FABRIC, BackendType::RDMA,
+                           BackendType::OFI, BackendType::TCP}) {
+    if (Backend* backend = usable(type)) {
+      UpdateRouteCache(routeKey, type);
+      return backend;
     }
   }
-
-  auto xgmiIt = backends.find(BackendType::XGMI);
-  bool isIntraNodeCapable = xgmiIt != backends.end() && xgmiIt->second->CanHandle(local, remote);
-  // For intra-node GPU transfers, prefer XGMI when it can handle this pair.
-  if (isIntraNodeCapable) {
-    UpdateRouteCache(routeKey, BackendType::XGMI);
-    return xgmiIt->second.get();
-  }
-
-  // Next prefer FABRIC: cross-node GPU pairs in the same scale-up domain (vPOD)
-  // reachable over the UALink super-node fabric, which is faster than RDMA.
-  auto fabricIt = backends.find(BackendType::FABRIC);
-  if (fabricIt != backends.end() && fabricIt->second->CanHandle(local, remote)) {
-    UpdateRouteCache(routeKey, BackendType::FABRIC);
-    return fabricIt->second.get();
-  }
-
-  auto rdmaIt = backends.find(BackendType::RDMA);
-  if (rdmaIt != backends.end() && rdmaIt->second->CanHandle(local, remote)) {
-    UpdateRouteCache(routeKey, BackendType::RDMA);
-    return rdmaIt->second.get();
-  }
-
-#ifdef MORI_USE_LIBFABRIC
-  auto ofiIt = backends.find(BackendType::OFI);
-  if (ofiIt != backends.end() && ofiIt->second->CanHandle(local, remote)) {
-    UpdateRouteCache(routeKey, BackendType::OFI);
-    return ofiIt->second.get();
-  }
-#endif
-
-  auto tcpIt = backends.find(BackendType::TCP);
-  if (tcpIt != backends.end() && tcpIt->second->CanHandle(local, remote)) {
-    UpdateRouteCache(routeKey, BackendType::TCP);
-    return tcpIt->second.get();
-  }
-
-  // No backend can handle this pair (e.g. cross-node under XGMI-only fallback).
   return nullptr;
 }
 
@@ -608,6 +726,11 @@ void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const Memor
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine read");
   Backend* backend = nullptr;
   SELECT_BACKEND_AND_RETURN_IF_NONE(localDest, remoteSrc, status, backend);
+  auto registration = RetainLocalRegistration(localDest, status);
+  if (!registration) {
+    status->Update(StatusCode::ERR_BAD_STATE, "Local registration unavailable");
+    return;
+  }
   backend->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Engine read error {} message {}", status->CodeUint32(),
@@ -623,6 +746,11 @@ void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const Memor
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine write");
   Backend* backend = nullptr;
   SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc, remoteDest, status, backend);
+  auto registration = RetainLocalRegistration(localSrc, status);
+  if (!registration) {
+    status->Update(StatusCode::ERR_BAD_STATE, "Local registration unavailable");
+    return;
+  }
   backend->Write(localSrc, localOffset, remoteDest, remoteOffset, size, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Engine write error {} message {}", status->CodeUint32(),
@@ -647,7 +775,16 @@ void IOEngine::BatchRead(const MemDescVec& localDest, const BatchSizeVec& localO
     std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
     internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine batch read");
     Backend* backend = nullptr;
-    SELECT_BACKEND_AND_RETURN_IF_NONE(localDest[i], remoteSrc[i], status[i], backend);
+    backend = SelectBackend(localDest[i], remoteSrc[i]);
+    if (backend == nullptr) {
+      status[i]->Update(StatusCode::ERR_BAD_STATE, "No eligible backend for batch group");
+      continue;
+    }
+    auto registration = RetainLocalRegistration(localDest[i], status[i]);
+    if (!registration) {
+      status[i]->Update(StatusCode::ERR_BAD_STATE, "Local registration unavailable");
+      continue;
+    }
     backend->BatchRead(localDest[i], localOffsets[i], remoteSrc[i], remoteOffsets[i], sizes[i],
                        status[i], ids[i]);
     if (status[i]->Failed()) {
@@ -676,7 +813,16 @@ void IOEngine::BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localO
     std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
     internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine batch write");
     Backend* backend = nullptr;
-    SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc[i], remoteDest[i], status[i], backend);
+    backend = SelectBackend(localSrc[i], remoteDest[i]);
+    if (backend == nullptr) {
+      status[i]->Update(StatusCode::ERR_BAD_STATE, "No eligible backend for batch group");
+      continue;
+    }
+    auto registration = RetainLocalRegistration(localSrc[i], status[i]);
+    if (!registration) {
+      status[i]->Update(StatusCode::ERR_BAD_STATE, "Local registration unavailable");
+      continue;
+    }
     backend->BatchWrite(localSrc[i], localOffsets[i], remoteDest[i], remoteOffsets[i], sizes[i],
                         status[i], ids[i]);
     if (status[i]->Failed()) {
@@ -690,6 +836,7 @@ std::optional<IOEngineSession> IOEngine::CreateSession(const MemoryDesc& local,
                                                        const MemoryDesc& remote) {
   IOEngineSession sess{};
   sess.engine = this;
+  sess.localMemory = local;
 
   Backend* backend = SelectBackend(local, remote);
   if (backend == nullptr) {

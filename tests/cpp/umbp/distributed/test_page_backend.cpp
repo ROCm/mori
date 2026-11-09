@@ -1241,4 +1241,119 @@ TEST(PageBackendAutoFlush, FullSyncSnapshotClearsOutbox) {
   EXPECT_EQ(delta[0].kind, KvEvent::Kind::ADD);
 }
 
+TEST(PageBackendProtectedWrites, ReaperAndLegacyCallsCannotRecycleProtectedSlot) {
+  auto backend = MakeAllocator(std::chrono::milliseconds(1));
+  AllocateRequest request{"protected", kPageSize};
+  request.operation_id = "writer:1";
+  auto allocation = backend->BatchAllocate({request}).front();
+  ASSERT_TRUE(HasSlot(allocation));
+  EXPECT_EQ(allocation.pending_ttl_ms, 0u);
+  EXPECT_EQ(backend->BatchAllocate({request}).front().slot_id, allocation.slot_id);
+  const auto free_before = backend->Capacity().available_bytes;
+  std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  backend->RunReaperOnceForTest();
+  EXPECT_EQ(backend->Capacity().available_bytes, free_before);
+  EXPECT_FALSE(backend->BatchAbort({allocation.slot_id}).front());
+  EXPECT_FALSE(backend->BatchCommit({{allocation.slot_id, request.key}}).front().success);
+  EXPECT_FALSE(
+      backend->BatchCommit({{allocation.slot_id, request.key, "writer:2", true}}).front().success);
+  EXPECT_FALSE(
+      backend->BatchAbortProtected({{allocation.slot_id, request.operation_id, false}}).front());
+  auto committed =
+      backend->BatchCommit({{allocation.slot_id, request.key, request.operation_id, true}});
+  EXPECT_TRUE(committed.front().success);
+  EXPECT_TRUE(backend->BatchCommit({{allocation.slot_id, request.key, request.operation_id, true}})
+                  .front()
+                  .success);
+}
+
+TEST(PageBackendProtectedWrites, ClearRetainsPendingUntilConfirmedAbort) {
+  auto backend = MakeAllocator(std::chrono::milliseconds(1));
+  AllocateRequest request{"protected", kPageSize};
+  request.operation_id = "writer:1";
+  auto allocation = backend->BatchAllocate({request}).front();
+  ASSERT_TRUE(HasSlot(allocation));
+  backend->ClearLocal();
+  backend->ClearFullSyncAcked();
+  std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  backend->RunReaperOnceForTest();
+  EXPECT_EQ(backend->Capacity().available_bytes, backend->Capacity().total_bytes - kPageSize);
+  EXPECT_TRUE(
+      backend->BatchAbortProtected({{allocation.slot_id, request.operation_id, true}}).front());
+  EXPECT_EQ(backend->Capacity().available_bytes, backend->Capacity().total_bytes);
+  EXPECT_FALSE(HasSlot(backend->BatchAllocate({request}).front()));
+  request.operation_id = "writer:2";
+  auto replacement = backend->BatchAllocate({request}).front();
+  ASSERT_TRUE(HasSlot(replacement));
+  EXPECT_TRUE(backend->BatchAbortProtected({{allocation.slot_id, "writer:1", true}}).front());
+  EXPECT_EQ(backend->Capacity().available_bytes, backend->Capacity().total_bytes - kPageSize);
+  EXPECT_TRUE(
+      backend->BatchAbortProtected({{replacement.slot_id, request.operation_id, true}}).front());
+}
+
+TEST(PageBackendProtectedWrites, OrderedReceiptsDoNotImposeLifetimeOperationLimit) {
+  auto backend = MakeAllocator();
+  for (uint64_t sequence = 1; sequence <= 66000; ++sequence) {
+    AllocateRequest request{"reused-key", kPageSize};
+    request.operation_id = "ordered-writer:" + std::to_string(sequence);
+    auto allocation = backend->BatchAllocate({request}).front();
+    ASSERT_TRUE(HasSlot(allocation)) << sequence;
+    ASSERT_TRUE(
+        backend->BatchAbortProtected({{allocation.slot_id, request.operation_id, true}}).front());
+  }
+  AllocateRequest stale{"reused-key", kPageSize};
+  stale.operation_id = "ordered-writer:1";
+  EXPECT_FALSE(HasSlot(backend->BatchAllocate({stale}).front()));
+}
+
+TEST(PageBackendProtectedWrites, LostBatchCommitReplyCanBeReplayed) {
+  auto backend = MakeAllocator();
+  std::vector<AllocateRequest> requests{{"kv-a", kPageSize}, {"kv-b", kPageSize}};
+  requests[0].operation_id = "writer:1";
+  requests[1].operation_id = "writer:2";
+  auto allocations = backend->BatchAllocate(requests);
+  std::vector<CommitRequest> commits;
+  for (size_t i = 0; i < requests.size(); ++i) {
+    ASSERT_TRUE(HasSlot(allocations[i]));
+    commits.push_back({allocations[i].slot_id, requests[i].key, requests[i].operation_id, true});
+  }
+  for (const auto& result : backend->BatchCommit(commits)) EXPECT_TRUE(result.success);
+  for (const auto& result : backend->BatchCommit(commits)) EXPECT_TRUE(result.success);
+
+  AllocateRequest next{"kv-c", kPageSize};
+  next.operation_id = "writer:3";
+  auto allocation = backend->BatchAllocate({next}).front();
+  ASSERT_TRUE(HasSlot(allocation));
+  ASSERT_TRUE(
+      backend->BatchAbortProtected({{allocation.slot_id, next.operation_id, true}}).front());
+  // A newer terminal batch compacts prior results; old replay fails without
+  // deleting or reallocating the bytes that the earlier batch published.
+  for (const auto& result : backend->BatchCommit(commits)) EXPECT_FALSE(result.success);
+  EXPECT_TRUE(backend->Contains("kv-a"));
+  EXPECT_TRUE(backend->Contains("kv-b"));
+}
+
+TEST(PageBackendProtectedWrites, DedupReceiptCannotAllocateAfterEviction) {
+  auto backend = MakeAllocator();
+  auto original = AllocateOk(*backend, "kv", kPageSize);
+  ASSERT_TRUE(original.has_value());
+  uint64_t bytes = 0;
+  ASSERT_TRUE(backend->Commit(original->slot_id, "kv", bytes));
+  AllocateRequest request{"kv", kPageSize};
+  request.operation_id = "writer:1";
+  ASSERT_EQ(backend->BatchAllocate({request}).front().outcome,
+            AllocateOutcome::kSuccessAlreadyExists);
+  ASSERT_EQ(backend->Evict({"kv"}).front().bytes_freed, kPageSize);
+  EXPECT_EQ(backend->BatchAllocate({request}).front().outcome,
+            AllocateOutcome::kSuccessAlreadyExists);
+  EXPECT_EQ(backend->Capacity().available_bytes, backend->Capacity().total_bytes);
+  request.operation_id = "writer:2";
+  auto replacement = backend->BatchAllocate({request}).front();
+  ASSERT_TRUE(HasSlot(replacement));
+  EXPECT_TRUE(
+      backend->BatchAbortProtected({{replacement.slot_id, request.operation_id, true}}).front());
+  request.operation_id = "writer:1";
+  EXPECT_EQ(backend->BatchAllocate({request}).front().outcome, AllocateOutcome::kFailed);
+}
+
 }  // namespace mori::umbp

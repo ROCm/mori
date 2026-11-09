@@ -32,6 +32,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -1702,5 +1703,242 @@ TEST_F(PoolClientRangesTest, ConcurrentMixedShapesAllReturnCorrectBytes) {
   }
 }
 
+}  // namespace
+}  // namespace mori::umbp
+
+namespace mori::umbp {
+namespace {
+
+struct FaultedSubmissionState {
+  size_t submissions = 0;
+  size_t throw_on = 0;
+  // Submit has already posted work, but the caller did not receive a handle
+  // with which to establish completion. Keep that work alive for the test.
+  std::vector<std::unique_ptr<TransferHandle>> inaccessible_handles;
+};
+
+class SubmitFaultEngine final : public TransferEngine {
+ public:
+  SubmitFaultEngine(std::unique_ptr<TransferEngine> engine,
+                    std::shared_ptr<FaultedSubmissionState> state)
+      : engine_(std::move(engine)), state_(std::move(state)) {}
+  const char* Name() const override { return "submit-fault"; }
+  bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
+    return engine_->CanHandle(src, dst);
+  }
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items) const override {
+    return engine_->CreatePlanBuilder(expected_items);
+  }
+  TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
+                             int device) override {
+    return engine_->RegisterMemory(base, size, loc, device);
+  }
+  TransferRef RegisterMemoryWithBackends(void* base, size_t size, mori::io::MemoryLocationType loc,
+                                         int device, uint32_t mask) override {
+    return engine_->RegisterMemoryWithBackends(base, size, loc, device, mask);
+  }
+  TransferRef RegisterFile(int fd, uint64_t offset, uint64_t size) override {
+    return engine_->RegisterFile(fd, offset, size);
+  }
+  void Deregister(const TransferRef& ref) override { engine_->Deregister(ref); }
+  std::vector<MetricSample> SampleMetrics() const override { return engine_->SampleMetrics(); }
+  std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
+    const size_t call = ++state_->submissions;
+    auto handle = engine_->Submit(std::move(plans));
+    if (call == state_->throw_on) {
+      state_->inaccessible_handles.push_back(std::move(handle));
+      throw std::runtime_error("injected exception after posting GPU work");
+    }
+    return handle;
+  }
+
+ private:
+  std::unique_ptr<TransferEngine> engine_;
+  std::shared_ptr<FaultedSubmissionState> state_;
+};
+
+class SubmitFaultPlatform final : public PoolPlatform {
+ public:
+  explicit SubmitFaultPlatform(std::shared_ptr<FaultedSubmissionState> state)
+      : delegate_(MakePoolPlatform(UMBPSimConfig{})), state_(std::move(state)) {}
+  Engines CreateTransferEngine(const PoolClientConfig& config,
+                               const std::vector<BackendInstanceConfig>& backends) override {
+    auto engines = delegate_->CreateTransferEngine(config, backends);
+    if (engines.transfer)
+      engines.transfer = std::make_unique<SubmitFaultEngine>(std::move(engines.transfer), state_);
+    return engines;
+  }
+  std::unique_ptr<MediumBackend> CreateBackend(const BackendInstanceConfig& backend,
+                                               uint64_t page_size,
+                                               const PoolClientConfig& config) override {
+    return delegate_->CreateBackend(backend, page_size, config);
+  }
+  TransferRef LocalUserBytes(void* ptr, size_t size,
+                             const TransferRef& registered_ref) const override {
+    return delegate_->LocalUserBytes(ptr, size, registered_ref);
+  }
+  HostBufferHandle AllocateHost(size_t size, const HostBufferOptions& options) override {
+    return delegate_->AllocateHost(size, options);
+  }
+  void FreeHost(HostBufferHandle& buffer) override { delegate_->FreeHost(buffer); }
+  void AddHostGatherRegion(void* ptr, size_t size) override {
+    delegate_->AddHostGatherRegion(ptr, size);
+  }
+  void ClearHostGatherRegions() override { delegate_->ClearHostGatherRegions(); }
+
+ private:
+  std::shared_ptr<PoolPlatform> delegate_;
+  std::shared_ptr<FaultedSubmissionState> state_;
+};
+
+class PoolClientGpuDirectTest : public ::testing::Test {
+ protected:
+  virtual std::shared_ptr<PoolPlatform> CreatePlatform() { return nullptr; }
+  void SetUp() override {
+    const char* module = std::getenv("MORI_FABRIC_TEST_MODULE");
+    int count = 0;
+    if (!module || hipGetDeviceCount(&count) != hipSuccess || count == 0)
+      GTEST_SKIP() << "set MORI_FABRIC_TEST_MODULE to test fabric-ready GPUs";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    PoolClientConfig cfg;
+    cfg.master_config.node_id = "gpu-direct-local";
+    cfg.medium = TierType::HBM;
+    cfg.hbm.buffer_sizes = {1 << 20};
+    cfg.hbm.device = 0;
+    cfg.hbm.allocation = UMBPHbmAllocation::kFabricVmm;
+    cfg.dram_page_size = 4096;
+    cfg.io_engine.mode = UMBPTransferMode::kFabricStrict;
+    cfg.io_engine.fabric_kernel_path = module;
+    cfg.kv_put_placement = UMBPKvPutPlacement::kOwnerLocal;
+    cfg.kv_ranged_path = UMBPKvRangedPath::kGpuDirect;
+    cfg.kv_max_inflight_reads = 1;
+    cfg.eviction_mode = PeerEvictionMode::kMaster;
+    client_ = std::make_unique<PoolClient>(cfg, CreatePlatform());
+    ASSERT_TRUE(client_->Init());
+    ASSERT_EQ(hipMalloc(&source_, kObject), hipSuccess);
+    ASSERT_EQ(hipMalloc(&destination_, 32768), hipSuccess);
+    expected_.resize(kObject);
+    for (size_t i = 0; i < kObject; ++i) expected_[i] = static_cast<char>((i * 13 + 7) % 251);
+    ASSERT_EQ(hipMemcpy(source_, expected_.data(), kObject, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_TRUE(client_->RegisterMemory(source_, kObject, mori::io::MemoryLocationType::GPU, 0,
+                                        MemoryRegistration::kLocalCopyOnly));
+    ASSERT_TRUE(client_->RegisterMemory(destination_, 32768, mori::io::MemoryLocationType::GPU, 0,
+                                        MemoryRegistration::kLocalCopyOnly));
+    ASSERT_TRUE(client_->RegisterMemory(destination_, 32768, mori::io::MemoryLocationType::GPU, 0,
+                                        MemoryRegistration::kFabricLocal));
+    ASSERT_TRUE(client_->Put("kv-layout", source_, kObject));
+  }
+  void TearDown() override {
+    if (client_) client_->Shutdown();
+    if (client_ && client_->HasQuarantinedTransfers()) return;
+    if (source_) (void)hipFree(source_);
+    if (destination_) (void)hipFree(destination_);
+  }
+  static constexpr size_t kObject = 3 * 4096 + 37;
+  std::unique_ptr<PoolClient> client_;
+  void* source_ = nullptr;
+  void* destination_ = nullptr;
+  std::vector<char> expected_;
+};
+
+TEST_F(PoolClientGpuDirectTest, IndependentUnalignedRangesCrossPagesAndWaitOnStream) {
+  auto* dst = static_cast<char*>(destination_);
+  const std::vector<size_t> sizes{96, 61, 31};
+  const std::vector<size_t> offsets{4000, 8129, 17};
+  auto read = client_->SubmitBatchGetRangesGpuDirect(
+      {"kv-layout"}, {{dst + 13, dst + 8197, dst + 16391}}, {sizes}, {offsets});
+  hipStream_t stream = nullptr;
+  ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+  EXPECT_TRUE(read->WaitOnStream(stream));
+  std::vector<char> actual(32768);
+  ASSERT_EQ(hipMemcpyAsync(actual.data(), dst, actual.size(), hipMemcpyDeviceToHost, stream),
+            hipSuccess);
+  ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+  ASSERT_EQ(read->Wait(), std::vector<bool>{true});
+  EXPECT_FALSE(read->ResourcesQuarantined());
+  EXPECT_EQ(std::memcmp(actual.data() + 13, expected_.data() + offsets[0], sizes[0]), 0);
+  EXPECT_EQ(std::memcmp(actual.data() + 8197, expected_.data() + offsets[1], sizes[1]), 0);
+  EXPECT_EQ(std::memcmp(actual.data() + 16391, expected_.data() + offsets[2], sizes[2]), 0);
+  EXPECT_EQ(read->Wait(), std::vector<bool>{true});
+  ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+TEST_F(PoolClientGpuDirectTest, RejectsOverlappingDestinationsAndBoundsBeforeSubmit) {
+  auto* dst = static_cast<char*>(destination_);
+  EXPECT_FALSE(client_->RegisterMemory(dst + 16, 32, mori::io::MemoryLocationType::GPU, 0,
+                                       MemoryRegistration::kFabricLocal));
+  // An overlapping narrow registration must not shadow the containing arena
+  // and make its valid tail appear unregistered.
+  ASSERT_EQ(client_->BatchGetRanges({"kv-layout"}, {{dst + 32736}}, {{32}}, {{0}}),
+            std::vector<bool>{true});
+  std::vector<char> tail(32);
+  ASSERT_EQ(hipMemcpy(tail.data(), dst + 32736, tail.size(), hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(std::memcmp(tail.data(), expected_.data(), tail.size()), 0);
+  EXPECT_EQ(client_->BatchGetRanges({"kv-layout"}, {{dst, dst + 16}}, {{32, 32}}, {{0, 64}}),
+            std::vector<bool>{false});
+  EXPECT_EQ(client_->BatchGetRanges({"kv-layout"}, {{dst + 32760}}, {{32}}, {{0}}),
+            std::vector<bool>{false});
+  EXPECT_EQ(client_->BatchGetRanges({"kv-layout"}, {{dst}}, {{32}}, {{kObject - 16}}),
+            std::vector<bool>{false});
+}
+
+TEST_F(PoolClientGpuDirectTest, InflightBudgetRetiresAndShutdownDrainsOutstandingRead) {
+  auto* dst = static_cast<char*>(destination_);
+  auto first = client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{dst}}, {{256}}, {{0}});
+  auto blocked =
+      client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{dst + 1024}}, {{256}}, {{256}});
+  EXPECT_EQ(blocked->Wait(), std::vector<bool>{false});
+  ASSERT_EQ(first->Wait(), std::vector<bool>{true});
+  auto next =
+      client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{dst + 1024}}, {{256}}, {{256}});
+  client_->Shutdown();
+  EXPECT_EQ(next->Wait(), std::vector<bool>{true});
+}
+
+class PoolClientGpuSubmitFaultTest : public PoolClientGpuDirectTest {
+ protected:
+  std::shared_ptr<PoolPlatform> CreatePlatform() override {
+    return std::make_shared<SubmitFaultPlatform>(fault_);
+  }
+  std::shared_ptr<FaultedSubmissionState> fault_ = std::make_shared<FaultedSubmissionState>();
+};
+
+TEST_F(PoolClientGpuSubmitFaultTest, SubmitExceptionQuarantinesReadBeforeHandlePublication) {
+  auto* backend = client_->Backends().Get(TierType::HBM);
+  ASSERT_NE(backend, nullptr);
+  const auto available_before = backend->Capacity().available_bytes;
+  ASSERT_LT(available_before, backend->Capacity().total_bytes);
+  fault_->throw_on = fault_->submissions + 1;
+  EXPECT_THROW(
+      client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{destination_}}, {{256}}, {{0}}),
+      std::runtime_error);
+  ASSERT_EQ(fault_->inaccessible_handles.size(), 1u);
+  ASSERT_NE(fault_->inaccessible_handles.front(), nullptr);
+  EXPECT_TRUE(client_->HasQuarantinedTransfers());
+  EXPECT_FALSE(client_->RegisterMemory(destination_, 32768, mori::io::MemoryLocationType::GPU, 0,
+                                       MemoryRegistration::kFabricLocal));
+  client_->DeregisterMemory(destination_);  // Must retain the existing registration.
+
+  ASSERT_TRUE(client_->Clear());
+  EXPECT_FALSE(backend->Contains("kv-layout"));
+  EXPECT_EQ(backend->Capacity().available_bytes, available_before)
+      << "the failed submission still owns its source pages";
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"replacement", kObject}}).front().outcome,
+            AllocateOutcome::kFailed);
+  EXPECT_EQ(client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{destination_}}, {{256}}, {{0}})
+                ->Wait(),
+            std::vector<bool>{false});
+
+  // Only this test can recover the inaccessible handle. Prove that the copy
+  // was actually submitted before the exception and still references valid
+  // source/destination memory even though Clear removed the key.
+  std::vector<TransferFailure> failures;
+  fault_->inaccessible_handles.front()->Wait(&failures);
+  EXPECT_TRUE(failures.empty());
+  std::vector<char> actual(256);
+  ASSERT_EQ(hipMemcpy(actual.data(), destination_, actual.size(), hipMemcpyDeviceToHost),
+            hipSuccess);
+  EXPECT_EQ(std::memcmp(actual.data(), expected_.data(), actual.size()), 0);
+}
 }  // namespace
 }  // namespace mori::umbp

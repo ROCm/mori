@@ -41,6 +41,18 @@ namespace mori {
 using namespace umbp;
 
 void RegisterMoriUmbp(py::module_& m) {
+  // The UMBP extension can be imported independently of the ops/IO module.
+  // Reuse its global IO enum when present; a local fallback also allows the
+  // main extension to register its own enum later without a type collision.
+  if (auto* existing = py::detail::get_type_info(typeid(mori::io::MemoryLocationType), false)) {
+    m.attr("MemoryLocationType") =
+        py::reinterpret_borrow<py::object>(reinterpret_cast<PyObject*>(existing->type));
+  } else {
+    py::enum_<mori::io::MemoryLocationType>(m, "MemoryLocationType", py::module_local())
+        .value("Unknown", mori::io::MemoryLocationType::Unknown)
+        .value("CPU", mori::io::MemoryLocationType::CPU)
+        .value("GPU", mori::io::MemoryLocationType::GPU);
+  }
   py::enum_<HostBufferBacking>(m, "UMBPHostBufferBacking")
       .value("Anonymous", HostBufferBacking::kAnonymous)
       .value("AnonymousHugetlb", HostBufferBacking::kAnonymousHugetlb)
@@ -236,10 +248,31 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("auto_heartbeat", &UMBPMasterClientConfig::auto_heartbeat)
       .def_readwrite("tags", &UMBPMasterClientConfig::tags);
 
+  py::enum_<MemoryRegistration>(m, "MemoryRegistration")
+      .value("PINNED", MemoryRegistration::kPinned)
+      .value("LOCAL_COPY_ONLY", MemoryRegistration::kLocalCopyOnly)
+      .value("FABRIC_LOCAL", MemoryRegistration::kFabricLocal);
+
+  py::enum_<UMBPTransferMode>(m, "UMBPTransferMode")
+      .value("RDMA", UMBPTransferMode::kRdma)
+      .value("AUTO", UMBPTransferMode::kAuto)
+      .value("FABRIC_STRICT", UMBPTransferMode::kFabricStrict);
+  py::enum_<UMBPHbmAllocation>(m, "UMBPHbmAllocation")
+      .value("HIP", UMBPHbmAllocation::kHipMalloc)
+      .value("FABRIC_VMM", UMBPHbmAllocation::kFabricVmm);
+  py::enum_<UMBPKvPutPlacement>(m, "UMBPKvPutPlacement")
+      .value("MASTER", UMBPKvPutPlacement::kMaster)
+      .value("OWNER_LOCAL", UMBPKvPutPlacement::kOwnerLocal);
+  py::enum_<UMBPKvRangedPath>(m, "UMBPKvRangedPath")
+      .value("LEGACY", UMBPKvRangedPath::kLegacy)
+      .value("GPU_DIRECT", UMBPKvRangedPath::kGpuDirect);
+
   py::class_<UMBPIoEngineConfig>(m, "UMBPIoEngineConfig")
       .def(py::init<>())
       .def_readwrite("host", &UMBPIoEngineConfig::host)
-      .def_readwrite("port", &UMBPIoEngineConfig::port);
+      .def_readwrite("port", &UMBPIoEngineConfig::port)
+      .def_readwrite("mode", &UMBPIoEngineConfig::mode)
+      .def_readwrite("fabric_kernel_path", &UMBPIoEngineConfig::fabric_kernel_path);
 
   py::enum_<CacheRemoteAdmission>(m, "CacheRemoteAdmission")
       .value("SIZE", CacheRemoteAdmission::SIZE)
@@ -254,7 +287,8 @@ void RegisterMoriUmbp(py::module_& m) {
   py::class_<UMBPHbmConfig>(m, "UMBPHbmConfig")
       .def(py::init<>())
       .def_readwrite("device", &UMBPHbmConfig::device)
-      .def_readwrite("capacity_bytes", &UMBPHbmConfig::capacity_bytes);
+      .def_readwrite("capacity_bytes", &UMBPHbmConfig::capacity_bytes)
+      .def_readwrite("allocation", &UMBPHbmConfig::allocation);
 
   py::class_<UMBPDistributedConfig>(m, "UMBPDistributedConfig")
       .def(py::init<>())
@@ -281,7 +315,11 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("workload_trace_client_id", &UMBPDistributedConfig::workload_trace_client_id)
       .def_readwrite("workload_trace_seed", &UMBPDistributedConfig::workload_trace_seed)
       .def_readwrite("medium", &UMBPDistributedConfig::medium)
-      .def_readwrite("hbm", &UMBPDistributedConfig::hbm);
+      .def_readwrite("hbm", &UMBPDistributedConfig::hbm)
+      .def_readwrite("kv_put_placement", &UMBPDistributedConfig::kv_put_placement)
+      .def_readwrite("kv_ranged_path", &UMBPDistributedConfig::kv_ranged_path)
+      .def_readwrite("kv_max_inflight_reads", &UMBPDistributedConfig::kv_max_inflight_reads)
+      .def_readwrite("kv_max_inflight_bytes", &UMBPDistributedConfig::kv_max_inflight_bytes);
 
   py::class_<UMBPStandaloneProcessConfig>(m, "UMBPStandaloneProcessConfig")
       .def(py::init<>())
@@ -342,6 +380,19 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("backend_policy_path", &UMBPConfig::backend_policy_path)
       .def_readwrite("page_size", &UMBPConfig::page_size);
 
+  py::class_<PoolClient::KvReadHandle, std::shared_ptr<PoolClient::KvReadHandle>>(m, "KvReadHandle")
+      .def("wait", &PoolClient::KvReadHandle::Wait, py::call_guard<py::gil_scoped_release>())
+      .def(
+          "wait_on_stream",
+          [](PoolClient::KvReadHandle& self, uintptr_t stream) {
+            return self.WaitOnStream(reinterpret_cast<void*>(stream));
+          },
+          py::arg("stream"), py::call_guard<py::gil_scoped_release>())
+      .def_property_readonly("resources_quarantined", [](const PoolClient::KvReadHandle& self) {
+        py::gil_scoped_release release;
+        return self.ResourcesQuarantined();
+      });
+
   py::class_<IUMBPClient, std::unique_ptr<IUMBPClient>>(m, "UMBPClient")
       // Not `py::arg("config") = UMBPConfig{}`: that default would snapshot the
       // environment once, at import time.
@@ -364,6 +415,20 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("batch_get_ranges_into_ptr", &IUMBPClient::BatchGetRanges, py::arg("keys"),
            py::arg("ptrs"), py::arg("sizes"), py::arg("src_offsets"),
            py::call_guard<py::gil_scoped_release>())
+      .def(
+          "submit_batch_get_ranges_gpu_direct",
+          [](IUMBPClient& self, const std::vector<std::string>& keys,
+             const std::vector<std::vector<uintptr_t>>& ptrs,
+             const std::vector<std::vector<size_t>>& sizes,
+             const std::vector<std::vector<size_t>>& src_offsets) {
+            auto* distributed = dynamic_cast<DistributedClient*>(&self);
+            if (!distributed)
+              throw std::runtime_error(
+                  "asynchronous GPU-direct ranged reads are unsupported in standalone mode");
+            return distributed->SubmitBatchGetRangesGpuDirect(keys, ptrs, sizes, src_offsets);
+          },
+          py::arg("keys"), py::arg("ptrs"), py::arg("sizes"), py::arg("src_offsets"),
+          py::keep_alive<0, 1>(), py::call_guard<py::gil_scoped_release>())
       .def("batch_put_ranges_from_ptr", &IUMBPClient::BatchPutRanges, py::arg("keys"),
            py::arg("object_sizes"), py::arg("ptrs"), py::arg("sizes"), py::arg("dst_offsets"),
            py::call_guard<py::gil_scoped_release>())
@@ -375,22 +440,26 @@ void RegisterMoriUmbp(py::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())
+      .def("close", &IUMBPClient::Close, py::call_guard<py::gil_scoped_release>())
       .def("is_distributed", &IUMBPClient::IsDistributed)           // pure getter, no I/O
       .def("get_deployment_mode", &IUMBPClient::GetDeploymentMode)  // pure getter, no I/O
       .def("get_backend_mode", &IUMBPClient::GetBackendMode)        // pure getter, no I/O
       .def("supports_ranged_io", &IUMBPClient::SupportsRangedIO)    // pure getter, no I/O
-      // Bound to the pinned form on purpose.  MemoryRegistration selects
-      // whether a region is pinned for RDMA or merely recorded for local
-      // copies, and that is decided by the deployment -- the standalone server
-      // picks it from its inner backend mode.  A caller reaching this binding
-      // is registering its own buffers and always wants them pinned, so the
-      // knob is kept off the Python surface rather than offered and ignored.
+      .def_property_readonly("has_quarantined_transfers",
+                             [](const IUMBPClient& self) {
+                               py::gil_scoped_release release;
+                               return self.HasQuarantinedTransfers();
+                             })
+      // Existing callers retain pinned registration. FABRIC_LOCAL explicitly
+      // skips RDMA pinning for GPU IPC mappings used as local copy endpoints.
       .def(
           "register_memory",
           [](IUMBPClient& self, uintptr_t ptr, size_t size, mori::io::MemoryLocationType loc,
-             int device) { return self.RegisterMemory(ptr, size, loc, device); },
+             int device,
+             MemoryRegistration mode) { return self.RegisterMemory(ptr, size, loc, device, mode); },
           py::arg("ptr"), py::arg("size"), py::arg("loc") = mori::io::MemoryLocationType::CPU,
-          py::arg("device") = -1, py::call_guard<py::gil_scoped_release>())
+          py::arg("device") = -1, py::arg("mode") = MemoryRegistration::kPinned,
+          py::call_guard<py::gil_scoped_release>())
       .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"),
            py::call_guard<py::gil_scoped_release>())
       .def("report_external_kv_blocks", &IUMBPClient::ReportExternalKvBlocks, py::arg("hashes"),

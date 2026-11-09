@@ -199,6 +199,10 @@ class IUMBPClient {
     return true;
   }
   virtual void DeregisterMemory(uintptr_t /*ptr*/) {}
+  virtual bool HasQuarantinedTransfers() const { return false; }
+  // Service wrappers use this after a submission exception with no confirmed
+  // drain. Backends supporting GPU transfers must preserve their backing.
+  virtual void QuarantineTransfers() {}
 
   // ---- External KV Events (for unmanaged L1/L2 cache blocks) ----
 

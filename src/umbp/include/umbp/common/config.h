@@ -25,9 +25,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -264,10 +266,68 @@ struct UMBPMasterClientConfig {
   std::vector<std::string> tags;
 };
 
-// RDMA IO-engine endpoint parameters.
+enum class UMBPTransferMode { kRdma, kAuto, kFabricStrict };
+enum class UMBPHbmAllocation { kHipMalloc, kFabricVmm };
+enum class UMBPKvPutPlacement { kMaster, kOwnerLocal };
+enum class UMBPKvRangedPath { kLegacy, kGpuDirect };
+
+inline UMBPTransferMode TransferModeFromEnvironment() {
+  const char* value = std::getenv("UMBP_TRANSFER_MODE");
+  const std::string mode = value ? value : "rdma";
+  if (mode == "rdma") return UMBPTransferMode::kRdma;
+  if (mode == "auto") return UMBPTransferMode::kAuto;
+  if (mode == "fabric_strict") return UMBPTransferMode::kFabricStrict;
+  throw std::invalid_argument("UMBP_TRANSFER_MODE must be rdma, auto, or fabric_strict");
+}
+
+inline UMBPHbmAllocation HbmAllocationFromEnvironment() {
+  const char* value = std::getenv("UMBP_HBM_ALLOCATION");
+  const std::string mode = value ? value : "hip";
+  if (mode == "hip") return UMBPHbmAllocation::kHipMalloc;
+  if (mode == "fabric_vmm") return UMBPHbmAllocation::kFabricVmm;
+  throw std::invalid_argument("UMBP_HBM_ALLOCATION must be hip or fabric_vmm");
+}
+
+inline UMBPKvPutPlacement KvPutPlacementFromEnvironment() {
+  const char* value = std::getenv("UMBP_KV_PUT_PLACEMENT");
+  const std::string mode = value ? value : "master";
+  if (mode == "master") return UMBPKvPutPlacement::kMaster;
+  if (mode == "owner_local") return UMBPKvPutPlacement::kOwnerLocal;
+  throw std::invalid_argument("UMBP_KV_PUT_PLACEMENT must be master or owner_local");
+}
+
+inline UMBPKvRangedPath KvRangedPathFromEnvironment() {
+  const char* value = std::getenv("UMBP_KV_RANGED_PATH");
+  const std::string mode = value ? value : "legacy";
+  if (mode == "legacy" || mode == "host") return UMBPKvRangedPath::kLegacy;
+  if (mode == "gpu_direct") return UMBPKvRangedPath::kGpuDirect;
+  throw std::invalid_argument("UMBP_KV_RANGED_PATH must be legacy, host, or gpu_direct");
+}
+
+inline size_t PositiveSizeFromEnvironment(const char* name, size_t default_value) {
+  const char* value = std::getenv(name);
+  if (!value) return default_value;
+  const std::string text(value);
+  size_t consumed = 0;
+  if (text.empty() || text.front() == '-') {
+    throw std::invalid_argument(std::string(name) + " must be a positive integer");
+  }
+  const auto parsed = std::stoull(text, &consumed);
+  if (consumed != text.size() || parsed == 0 || parsed > std::numeric_limits<size_t>::max()) {
+    throw std::invalid_argument(std::string(name) + " must be a positive integer");
+  }
+  return static_cast<size_t>(parsed);
+}
+
+// IO-engine endpoint and transport options. The RDMA default preserves existing deployments.
 struct UMBPIoEngineConfig {
   std::string host;   // RDMA engine hostname (formerly UMBPDistributedConfig::io_engine_host)
   uint16_t port = 0;  // RDMA engine port; 0 = OS-assigned ephemeral port (formerly io_engine_port)
+  UMBPTransferMode mode = TransferModeFromEnvironment();
+  std::string fabric_kernel_path = [] {
+    const char* value = std::getenv("UMBP_FABRIC_KERNEL_PATH");
+    return value ? std::string(value) : std::string{};
+  }();
 };
 
 // Admission policy for re-caching remotely-fetched blocks locally.
@@ -303,6 +363,7 @@ inline bool ShouldAdmitReCache(bool cache_remote_fetches, CacheRemoteAdmission p
 struct UMBPHbmConfig {
   int device = 0;               // GPU ordinal the pool is allocated on
   uint64_t capacity_bytes = 0;  // single-buffer pool size
+  UMBPHbmAllocation allocation = HbmAllocationFromEnvironment();
 };
 
 // The one storage medium a legacy distributed node serves.
@@ -480,6 +541,12 @@ struct UMBPDistributedConfig {
   // Caller-owned, must outlive the client, null disables. Ignored when
   // master_config.master_address is set.
   MetricSink* metric_sink = nullptr;
+
+  UMBPKvPutPlacement kv_put_placement = KvPutPlacementFromEnvironment();
+  UMBPKvRangedPath kv_ranged_path = KvRangedPathFromEnvironment();
+  size_t kv_max_inflight_reads = PositiveSizeFromEnvironment("UMBP_KV_MAX_INFLIGHT_READS", 32);
+  size_t kv_max_inflight_bytes =
+      PositiveSizeFromEnvironment("UMBP_KV_MAX_INFLIGHT_BYTES", size_t{256} * 1024 * 1024);
 };
 
 // User-facing same-host standalone-process configuration.  Set
@@ -652,6 +719,21 @@ struct UMBPConfig {
       if (d.master_config.node_address.empty()) {
         if (error_message)
           *error_message = "distributed.master_config.node_address must not be empty";
+        return false;
+      }
+      if (d.kv_max_inflight_reads == 0 || d.kv_max_inflight_bytes == 0) {
+        if (error_message) *error_message = "KV in-flight read and byte budgets must be > 0";
+        return false;
+      }
+      if (d.io_engine.mode == UMBPTransferMode::kFabricStrict &&
+          d.io_engine.fabric_kernel_path.empty()) {
+        if (error_message) *error_message = "fabric_strict requires io_engine.fabric_kernel_path";
+        return false;
+      }
+      if (d.io_engine.mode == UMBPTransferMode::kFabricStrict && backend_policy_path.empty() &&
+          d.backend_policy_path.empty() && d.medium == UMBPMedium::HBM &&
+          d.hbm.allocation != UMBPHbmAllocation::kFabricVmm) {
+        if (error_message) *error_message = "fabric_strict HBM pools require fabric_vmm allocation";
         return false;
       }
       // Only the selected medium's sizing is checked: a node that serves HBM

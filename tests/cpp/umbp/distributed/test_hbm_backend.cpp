@@ -31,12 +31,15 @@
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <memory>
 #include <numeric>
 #include <vector>
 
+#include "mori/io/backend.hpp"
+#include "mori/io/engine.hpp"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
@@ -91,6 +94,38 @@ class DeviceBuffer {
   void* ptr_ = nullptr;
   size_t size_ = 0;
 };
+
+TEST(HbmBackend, FabricVmmBuffersKeepLogicalCapacityAndExportRegistration) {
+  if (!HaveGpu()) GTEST_SKIP() << "requires a GPU with fabric VMM support";
+  HbmPageMemorySource source(0, UMBPHbmAllocation::kFabricVmm);
+  std::vector<PageMemorySource::Buffer> buffers;
+  if (!source.Allocate({4097, 8195}, &buffers)) {
+    GTEST_SKIP() << "fabric VMM allocation unavailable on this GPU/runtime";
+  }
+  ASSERT_EQ(buffers.size(), 2u);
+  EXPECT_EQ(buffers[0].size, 4097u);
+  EXPECT_EQ(buffers[1].size, 8195u);
+  mori::io::IOEngine engine("hbm-vmm-test", {});
+  engine.CreateBackend(mori::io::BackendType::FABRIC, mori::io::FabricBackendConfig{});
+  for (const auto& buffer : buffers) {
+    auto descriptor = engine.RegisterMemoryWithBackends(
+        buffer.base, buffer.size, 0, mori::io::MemoryLocationType::GPU,
+        mori::io::BackendBit(mori::io::BackendType::FABRIC));
+    EXPECT_TRUE(std::any_of(descriptor.fabricHandle.begin(), descriptor.fabricHandle.end(),
+                            [](char byte) { return byte != 0; }));
+    EXPECT_EQ(descriptor.size, buffer.size);
+    EXPECT_GE(descriptor.fabricAllocSize, buffer.size);
+    std::vector<char> sent(buffer.size, static_cast<char>(0x35));
+    std::vector<char> received(buffer.size);
+    ASSERT_EQ(hipMemcpy(buffer.base, sent.data(), sent.size(), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(received.data(), buffer.base, received.size(), hipMemcpyDeviceToHost),
+              hipSuccess);
+    EXPECT_EQ(sent, received);
+    engine.DeregisterMemory(descriptor);
+  }
+  source.Release();
+  source.Release();  // cleanup is idempotent
+}
 
 // ---------------------------------------------------------------------------
 //  Selection — the reason this engine exists
@@ -322,6 +357,84 @@ TEST(HbmCopyEngine, CopiesDeviceToDevice) {
 
   ASSERT_EQ(hipMemcpy(dst.data(), b.get(), kBytes, hipMemcpyDeviceToHost), hipSuccess);
   EXPECT_EQ(std::memcmp(src.data(), dst.data(), kBytes), 0);
+}
+
+TEST(HbmCopyEngine, DeviceRangesInstallReadinessOnConsumerStream) {
+  if (!HaveGpu()) GTEST_SKIP() << "no GPU visible";
+  ASSERT_EQ(hipSetDevice(0), hipSuccess);
+  constexpr size_t kFragment = 4096;
+  constexpr size_t kFragments = 16;
+  constexpr size_t kBytes = kFragment * kFragments;
+  DeviceBuffer source(kBytes), destination(kBytes), observed(kBytes);
+  ASSERT_TRUE(source.valid());
+  ASSERT_TRUE(destination.valid());
+  ASSERT_TRUE(observed.valid());
+  std::vector<char> input(kBytes), output(kBytes);
+  std::iota(input.begin(), input.end(), 5);
+  ASSERT_EQ(hipMemcpy(source.get(), input.data(), kBytes, hipMemcpyHostToDevice), hipSuccess);
+  ASSERT_EQ(hipMemset(destination.get(), 0, kBytes), hipSuccess);
+
+  HbmCopyEngine engine;
+  auto builder = engine.CreatePlanBuilder(kFragments);
+  for (size_t i = 0; i < kFragments; ++i) {
+    // Reverse source order so the planner retains scattered D2D ranges.
+    builder->Add(MakeItem(GpuRef(source.get(), kBytes), (kFragments - i - 1) * kFragment,
+                          GpuRef(destination.get(), kBytes), i * kFragment, kFragment, i));
+  }
+  auto plans = builder->Finish();
+  ASSERT_TRUE(plans.rejected_tags.empty());
+  auto handle = engine.Submit(std::move(plans.plans));
+  ASSERT_NE(handle, nullptr);
+  hipStream_t consumer = nullptr;
+  ASSERT_EQ(hipStreamCreateWithFlags(&consumer, hipStreamNonBlocking), hipSuccess);
+  EXPECT_TRUE(handle->WaitOnStream(reinterpret_cast<void*>(consumer)));
+  EXPECT_EQ(
+      hipMemcpyAsync(observed.get(), destination.get(), kBytes, hipMemcpyDeviceToDevice, consumer),
+      hipSuccess);
+  EXPECT_EQ(hipStreamSynchronize(consumer), hipSuccess);
+  EXPECT_EQ(hipStreamDestroy(consumer), hipSuccess);
+  ASSERT_EQ(hipMemcpy(output.data(), observed.get(), kBytes, hipMemcpyDeviceToHost), hipSuccess);
+  for (size_t i = 0; i < kFragments; ++i)
+    EXPECT_EQ(std::memcmp(output.data() + i * kFragment,
+                          input.data() + (kFragments - i - 1) * kFragment, kFragment),
+              0);
+  std::vector<TransferFailure> failures;
+  handle->Wait(&failures);
+  EXPECT_TRUE(failures.empty());
+  handle->Wait(&failures);
+  EXPECT_TRUE(failures.empty());
+}
+
+TEST(HbmCopyEngine, DeviceHandleDestructionDrainsAndReusesStream) {
+  if (!HaveGpu()) GTEST_SKIP() << "no GPU visible";
+  ASSERT_EQ(hipSetDevice(0), hipSuccess);
+  constexpr size_t kBytes = 1ULL << 20;
+  DeviceBuffer source(kBytes), destination(kBytes);
+  ASSERT_TRUE(source.valid());
+  ASSERT_TRUE(destination.valid());
+  std::vector<unsigned char> output(kBytes);
+  HbmCopyEngine engine;
+  const uint64_t created_before = HbmCopyEngine::GatherStreamsCreated();
+  for (unsigned char value = 1; value <= 8; ++value) {
+    ASSERT_EQ(hipMemset(source.get(), value, kBytes), hipSuccess);
+    // Producer writes must be ready before a nonblocking copy stream reads
+    // them; the transfer's completion event only covers the copy itself.
+    ASSERT_EQ(hipStreamSynchronize(nullptr), hipSuccess);
+    auto builder = engine.CreatePlanBuilder(1);
+    builder->Add(MakeItem(GpuRef(source.get(), kBytes), 0, GpuRef(destination.get(), kBytes), 0,
+                          kBytes, value));
+    auto plans = builder->Finish();
+    {
+      auto handle = engine.Submit(std::move(plans.plans));
+      ASSERT_NE(handle, nullptr);
+      // The destructor must complete queued copies before buffers are reused.
+    }
+    ASSERT_EQ(hipMemcpy(output.data(), destination.get(), kBytes, hipMemcpyDeviceToHost),
+              hipSuccess);
+    EXPECT_TRUE(std::all_of(output.begin(), output.end(),
+                            [value](unsigned char byte) { return byte == value; }));
+  }
+  EXPECT_LE(HbmCopyEngine::GatherStreamsCreated() - created_before, 1u);
 }
 
 // ---------------------------------------------------------------------------

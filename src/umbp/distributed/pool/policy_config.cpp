@@ -202,7 +202,12 @@ PolicyBackendSpec ParseBackend(const std::string& name, const Value& value) {
                     context + ".capacity");
 
   if (type == "hbm") {
-    RejectUnknownFields(object, {"type", "capacity", "devices"}, context);
+    RejectUnknownFields(object, {"type", "capacity", "devices", "allocation"}, context);
+    if (const Value* allocation = OptionalField(object, "allocation")) {
+      backend.hbm_allocation = AsEnum<UMBPHbmAllocation>(
+          *allocation, context + ".allocation",
+          {{"hip", UMBPHbmAllocation::kHipMalloc}, {"fabric_vmm", UMBPHbmAllocation::kFabricVmm}});
+    }
     backend.tier = TierType::HBM;
     const ListValue& devices =
         AsArray(RequiredField(object, "devices", context), context + ".devices");
@@ -610,6 +615,7 @@ bool ApplyBackendPolicy(const BackendPolicyConfig& policy, PoolClientConfig* con
                                                       : backend.name + "@" + std::to_string(device);
           instance.tier = TierType::HBM;
           instance.hbm.device = device;
+          instance.hbm.allocation = backend.hbm_allocation.value_or(config->hbm.allocation);
           instance.hbm.buffer_sizes = {base + (i < remainder ? 1 : 0)};
           concrete_names.push_back(instance.name);
           concrete_backends.push_back(std::move(instance));

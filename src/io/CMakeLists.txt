@@ -41,6 +41,25 @@ set_target_properties(
              INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
 
+# Opt-in module build for strict FABRIC users. Keep the host IO library usable
+# without hipcc; callers build this target and pass its path to the IO engine.
+if(USE_ROCM AND GPU_ARCH)
+  find_program(MORI_FABRIC_HIPCC NAMES hipcc HINTS "${ROCM_PATH}/bin")
+  if(MORI_FABRIC_HIPCC)
+    set(MORI_FABRIC_COPY_MODULE "${CMAKE_CURRENT_BINARY_DIR}/fabric_copy.hsaco")
+    add_custom_command(
+      OUTPUT "${MORI_FABRIC_COPY_MODULE}"
+      COMMAND "${MORI_FABRIC_HIPCC}" --genco "--offload-arch=${GPU_ARCH}"
+              -std=c++17 "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fabric_copy.hip"
+              -o "${MORI_FABRIC_COPY_MODULE}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fabric_copy.hip"
+      COMMENT "Compiling FABRIC copy module for ${GPU_ARCH}"
+      VERBATIM)
+    add_custom_target(mori_fabric_copy_kernel DEPENDS "${MORI_FABRIC_COPY_MODULE}")
+    install(FILES "${MORI_FABRIC_COPY_MODULE}" DESTINATION lib OPTIONAL)
+  endif()
+endif()
+
 # ── libfabric (OFI backend) ─────────────────────────────────────────────────
 # Requested via MORI_USE_LIBFABRIC, but never a hard build/runtime dependency.
 # libfabric is loaded at runtime via dlopen (see ofi/ofi_shim.cpp), never linked,

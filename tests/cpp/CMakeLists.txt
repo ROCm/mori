@@ -81,6 +81,11 @@ if(BUILD_IO)
   target_link_libraries(bench_engine mori_application mori_io)
 
   add_executable(test_transfer_wait io/test_transfer_wait.cpp)
+  add_executable(test_fabric_integration io/test_fabric_integration.cpp)
+  target_include_directories(test_fabric_integration PRIVATE
+      ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/3rdparty/msgpack-c/include ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_fabric_integration PRIVATE mori_application mori_io)
+  add_test(NAME io_fabric_integration COMMAND test_fabric_integration)
 
   target_include_directories(test_transfer_wait
                              PUBLIC ${CMAKE_SOURCE_DIR}/include)

@@ -59,6 +59,7 @@ class WorkloadTraceRecorder;
 
 class PeerServiceServer;
 class PeerPool;
+struct PoolSlotRef;
 class KvIndexerReporter;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
@@ -93,6 +94,29 @@ std::unordered_map<int, int> GpuNumaNodes();
 // allocator outbox is shipped to master via the heartbeat thread.
 class PoolClient {
  public:
+  // One independently consumable group of GPU ranges. Keep the handle and
+  // destination allocations alive until Wait returns. WaitOnStream queues the
+  // transfer events on an inference stream; Wait still retires owner pins.
+  class KvReadHandle {
+   public:
+    ~KvReadHandle();
+    std::vector<bool> Wait();
+    bool WaitOnStream(void* hip_stream);
+    bool ResourcesQuarantined() const;
+
+   private:
+    friend class PoolClient;
+    mutable std::mutex mutex_;
+    bool waited_ = false;
+    bool quarantined_ = false;
+    std::vector<bool> results_;
+    std::function<void(std::vector<bool>*, bool*)> finish_;
+    std::function<bool(void*)> stream_wait_;
+  };
+  std::shared_ptr<KvReadHandle> SubmitBatchGetRangesGpuDirect(
+      const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets);
   explicit PoolClient(PoolClientConfig config, std::shared_ptr<PoolPlatform> platform = nullptr);
   ~PoolClient();
 
@@ -131,6 +155,8 @@ class PoolClient {
                       int device = -1, MemoryRegistration mode = MemoryRegistration::kPinned);
 
   void DeregisterMemory(void* ptr);
+  bool HasQuarantinedTransfers() const { return gpu_quarantined_.load(); }
+  void QuarantineTransfers();
 
   // Optional Indexer reporting, configured once at the storage owner.
   void ConfigureKvIndexer(const KvIndexerConfig& config);
@@ -389,13 +415,38 @@ class PoolClient {
   struct PeerConnection {
     std::string node_id;
     std::string peer_address;
-    std::unique_ptr<void, void (*)(void*)> peer_stub{nullptr, +[](void*) {}};
+    std::shared_ptr<void> peer_stub;
+    std::string owner_incarnation;
+    uint64_t pool_generation = 0;
+    bool completion_pins = false;
     // Guards first-contact connection setup (stub creation + engine/buffer-desc
     // hydration via GetPeerInfo) in EnsurePeerServiceConnection.
     std::mutex conn_mutex;
   };
   std::mutex peers_mutex_;
   std::unordered_map<std::string, std::unique_ptr<PeerConnection>> peers_;
+  std::string operation_client_id_;
+  std::atomic<uint64_t> next_operation_{1};
+  std::string NewOperationId();
+  mutable std::shared_mutex async_read_mutex_;
+  std::mutex async_handles_mutex_;
+  std::mutex async_control_mutex_;
+  std::condition_variable async_prepare_cv_;
+  size_t async_preparing_ = 0;
+  bool async_read_blocked_ = false;
+  std::vector<std::weak_ptr<KvReadHandle>> async_reads_;
+  void DrainAsyncReads();
+  std::mutex kv_budget_mutex_;
+  size_t kv_inflight_reads_ = 0;
+  uint64_t kv_inflight_bytes_ = 0;
+  std::map<uintptr_t, uintptr_t> kv_active_destinations_;
+  std::atomic<bool> gpu_quarantined_{false};
+  void QuarantineGpuResources();
+  bool TransferWithDrain(const std::vector<TransferItem>& items, std::vector<size_t>* failed_tags,
+                         const TransferEngine::StepTiming* timing = nullptr);
+  using LocalSlotOperations = std::map<std::pair<uint32_t, uint64_t>, std::string>;
+  void AbortLocalSlots(const std::vector<PoolSlotRef>& slots,
+                       const LocalSlotOperations& operations);
 
   // Caller MUST NOT hold peers_mutex_; this helper acquires it.
   PeerConnection& GetOrConnectPeer(const std::string& node_id, const std::string& peer_address);
@@ -428,6 +479,7 @@ class PoolClient {
     void* base;
     size_t size;
     TransferRef ref;
+    MemoryRegistration mode = MemoryRegistration::kPinned;
   };
   mutable std::shared_mutex registered_mem_mutex_;
   std::vector<RegisteredRegion> registered_regions_;
@@ -871,6 +923,9 @@ class PoolClient {
     // and is the only user.
     const TransferRef* dst_ref = nullptr;
     uint64_t dst_ref_offset = 0;
+    // Direct ranges name independent destination regions in caller span order.
+    // Unlike a packed arena, they need not share an allocation or GPU.
+    const std::vector<void*>* range_dsts = nullptr;
     RouteGetResult route;
 
     size_t DstBytes() const { return dst_bytes != 0 ? dst_bytes : size; }
@@ -1055,6 +1110,7 @@ class PoolClient {
     const BatchPutItem* item;
     SlotPlan plan;
     uint64_t slot_id;
+    std::string operation_id;
     bool failed = false;
   };
 
@@ -1068,7 +1124,8 @@ class PoolClient {
   bool AllocateRemotePutEntries(const std::vector<BatchPutItem>& items,
                                 ::umbp::UMBPPeer::Stub* stub, std::vector<RemotePutEntry>* entries,
                                 std::vector<uint64_t>* abort_slots,
-                                std::vector<PutEntryOutcome>* results);
+                                std::vector<PutEntryOutcome>* results, PeerConnection& peer,
+                                std::unordered_map<uint64_t, std::string>* slot_operations);
   // Build one TransferItem per page, tagged with the entry index.  Whether an
   // item ends up zero-copy or staged, and how items group into wire transfers,
   // are both the engine's business now — this only names endpoints.
@@ -1076,12 +1133,13 @@ class PoolClient {
                                std::vector<TransferItem>* items);
   void FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
                                 std::vector<uint64_t>& abort_slots,
-                                std::vector<PutEntryOutcome>* results,
-                                ::umbp::UMBPPeer::Stub* stub);
+                                std::vector<PutEntryOutcome>* results, ::umbp::UMBPPeer::Stub* stub,
+                                const std::unordered_map<uint64_t, std::string>& slot_operations,
+                                const std::string& owner_incarnation);
 
   bool PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items, PeerConnection& peer,
                                ::umbp::UMBPPeer::Stub* stub, std::vector<RemoteGetEntry>* entries,
-                               std::vector<bool>* results);
+                               std::vector<bool>* results, std::shared_ptr<void>* pin_hold);
   bool BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, const std::string& node_id,
                                std::vector<TransferItem>* items);
   void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results,
@@ -1093,10 +1151,14 @@ class PoolClient {
   // engine's TransferHandle, which is where the raw TransferStatus* the RDMA
   // backend holds actually live.
   struct RemoteGetInFlight {
+    PoolClient* owner = nullptr;
     PeerConnection* peer = nullptr;
     std::vector<RemoteGetEntry> entries;
     std::unique_ptr<TransferHandle> handle;
+    std::shared_ptr<void> read_pin_hold;
+    bool quarantined = false;
     bool drained = false;
+    ~RemoteGetInFlight();
   };
 
   // Submit half: GetOrConnectPeer + EnsurePeerServiceConnection +
@@ -1112,6 +1174,10 @@ class PoolClient {
   // contract violation — it just works.
   std::unique_ptr<RemoteGetInFlight> SubmitRemoteBatchGet(const std::vector<BatchGetItem>& items,
                                                           std::vector<bool>* results);
+  std::vector<bool> BatchGetRangesGpuDirect(const std::vector<std::string>& keys,
+                                            const std::vector<std::vector<void*>>& dsts,
+                                            const std::vector<std::vector<size_t>>& sizes,
+                                            const std::vector<std::vector<size_t>>& src_offsets);
   // Wait half: wait the handle (never breaks early), map per-plan failure back
   // to per-key (per-item AND), then FinalizeRemoteGetEntries.
   void WaitRemoteBatchGet(RemoteGetInFlight& inflight, std::vector<bool>* results,
@@ -1121,14 +1187,20 @@ class PoolClient {
   // `abort_slots` feed FinalizeRemotePutEntries and `stub` issues its
   // commit/abort RPCs.
   struct RemotePutInFlight {
+    PoolClient* owner = nullptr;
     PeerConnection* peer = nullptr;
     ::umbp::UMBPPeer::Stub* stub = nullptr;
+    std::shared_ptr<void> stub_hold;
+    std::string owner_incarnation;
+    std::unordered_map<uint64_t, std::string> slot_operations;
     std::vector<RemotePutEntry> entries;
     // Malformed slots from Allocate (not in `entries`); Finalize appends
     // entry.failed slots and aborts the union (peer Abort is idempotent).
     std::vector<uint64_t> abort_slots;
     std::unique_ptr<TransferHandle> handle;
     bool drained = false;
+    bool quarantined = false;
+    ~RemotePutInFlight();
   };
 
   // Submit half: allocate + build + engine Plan/Submit (NOT waited).  Returns

@@ -420,7 +420,7 @@ bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t 
   req.set_size(size);
   req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
-  grpc::Status status = stub_->Put(&ctx, req, &resp);
+  grpc::Status status = InvokeTransferRpc(resp, [&] { return stub_->Put(&ctx, req, &resp); });
   return call.Result(status.ok() && resp.ok());
 }
 
@@ -440,7 +440,7 @@ bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t 
   req.set_size(size);
   req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
-  grpc::Status status = stub_->Get(&ctx, req, &resp);
+  grpc::Status status = InvokeTransferRpc(resp, [&] { return stub_->Get(&ctx, req, &resp); });
   return call.Result(status.ok() && resp.ok());
 }
 
@@ -490,9 +490,10 @@ std::vector<bool> StandaloneProcessClient::BatchPutImpl(const std::vector<std::s
   }
   grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
-  grpc::Status status = stub_->BatchPut(&ctx, req, &resp);
+  grpc::Status status = InvokeTransferRpc(resp, [&] { return stub_->BatchPut(&ctx, req, &resp); });
   CheckKvMetadataStatus(status);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+    if (status.ok()) resources_quarantined_ = true;
     return std::vector<bool>(keys.size(), false);
   }
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
@@ -527,9 +528,11 @@ std::vector<bool> StandaloneProcessClient::BatchPutWithDepth(const std::vector<s
   }
   grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
-  grpc::Status status = stub_->BatchPutWithDepth(&ctx, req, &resp);
+  grpc::Status status =
+      InvokeTransferRpc(resp, [&] { return stub_->BatchPutWithDepth(&ctx, req, &resp); });
   CheckKvMetadataStatus(status);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+    if (status.ok()) resources_quarantined_ = true;
     return std::vector<bool>(keys.size(), false);
   }
   return call.Result(std::vector<bool>(resp.ok().begin(), resp.ok().end()));
@@ -559,8 +562,9 @@ std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::strin
   }
   grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
-  grpc::Status status = stub_->BatchGet(&ctx, req, &resp);
+  grpc::Status status = InvokeTransferRpc(resp, [&] { return stub_->BatchGet(&ctx, req, &resp); });
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+    if (status.ok()) resources_quarantined_ = true;
     return std::vector<bool>(keys.size(), false);
   }
   return call.Result(std::vector<bool>(resp.ok().begin(), resp.ok().end()));
@@ -692,14 +696,18 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
 
     grpc::ClientContext ctx;
     ::umbp::BatchBoolResponse resp;
-    const grpc::Status status = stub_->BatchGetRanges(&ctx, req, &resp);
+    const grpc::Status status =
+        InvokeTransferRpc(resp, [&] { return stub_->BatchGetRanges(&ctx, req, &resp); });
     if (!status.ok()) return failed;
     if (resp.key_handle_unknown()) {
       ForgetKeyHandle(handle);
       handle = 0;
       continue;
     }
-    if (resp.ok_size() != static_cast<int>(keys.size())) return failed;
+    if (resp.ok_size() != static_cast<int>(keys.size())) {
+      resources_quarantined_ = true;
+      return failed;
+    }
     RememberKeyHandle(keys, resp.key_handle(), fingerprint);
     return call.Result(std::vector<bool>(resp.ok().begin(), resp.ok().end()));
   }
@@ -745,9 +753,13 @@ std::vector<bool> StandaloneProcessClient::BatchPutRanges(
 
   grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
-  const grpc::Status status = stub_->BatchPutRanges(&ctx, req, &resp);
+  const grpc::Status status =
+      InvokeTransferRpc(resp, [&] { return stub_->BatchPutRanges(&ctx, req, &resp); });
   CheckKvMetadataStatus(status);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
+  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+    if (status.ok()) resources_quarantined_ = true;
+    return failed;
+  }
   return call.Result(std::vector<bool>(resp.ok().begin(), resp.ok().end()));
 }
 
@@ -859,7 +871,7 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size,
   SimCall call(sim_trace_.get(), "register_memory", 0, size);
   if (closing_) return false;
   std::unique_lock lk(op_mutex_);
-  if (closed_) return false;
+  if (closed_ || resources_quarantined_) return false;
   return call.Result(memory_exporter_->Register(*this, ptr, size, loc, device));
 }
 
@@ -912,6 +924,12 @@ bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, i
   for (const auto& tag : standalone_config_.tags) req.add_tags(tag);
   req.set_kind(::umbp::MEMORY_KIND_GPU_IPC);
   req.set_device_id(device_id);
+  hipUUID uuid{};
+  if (hipDeviceGetUuid(&uuid, device_id) != hipSuccess) {
+    MORI_UMBP_ERROR("[StandaloneProcessClient] GPU UUID query failed for device={}", device_id);
+    return false;
+  }
+  req.set_gpu_uuid(reinterpret_cast<const char*>(&uuid), sizeof(uuid));
   req.set_ipc_handle(reinterpret_cast<const char*>(&handle), sizeof(handle));
   req.set_ipc_offset(ipc_offset);
   req.set_alloc_base(allocation_address);
@@ -993,6 +1011,8 @@ bool StandaloneProcessClient::RegisterHostShmMemory(uintptr_t ptr, size_t size) 
 }
 
 void StandaloneProcessClient::DeregisterMemoryLocked() {
+  if (resources_quarantined_)
+    throw std::runtime_error("standalone exported memory is quarantined after an unconfirmed RPC");
   std::string client_id;
   std::vector<RegisteredRegion> regions;
   {
@@ -1009,8 +1029,15 @@ void StandaloneProcessClient::DeregisterMemoryLocked() {
   req.set_client_id(client_id);
   ::umbp::Empty resp;
   if (!stub_) throw std::runtime_error("standalone DeregisterMemory RPC has no active stub");
-  const grpc::Status status = stub_->DeregisterMemory(&ctx, req, &resp);
+  grpc::Status status;
+  try {
+    status = stub_->DeregisterMemory(&ctx, req, &resp);
+  } catch (...) {
+    resources_quarantined_ = true;
+    throw;
+  }
   if (!status.ok()) {
+    resources_quarantined_ = true;
     throw std::runtime_error("standalone DeregisterMemory RPC failed: " + status.error_message());
   }
 

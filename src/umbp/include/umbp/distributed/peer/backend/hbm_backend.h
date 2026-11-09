@@ -26,12 +26,13 @@
 #include <memory>
 #include <vector>
 
+#include "umbp/common/config.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
 
 namespace mori::umbp {
 
-// GPU HBM, allocated with hipMalloc on a fixed device.
+// GPU HBM, allocated with hipMalloc or fabric-exportable VMM on a fixed device.
 //
 // THE WHOLE HBM BACKEND IS THIS CLASS.  There is no HbmBackend type, and that
 // is the finding rather than a shortcut: PageBackend's slot lifecycle, bitmap
@@ -48,10 +49,12 @@ namespace mori::umbp {
 // pool land on whichever thread happened to allocate first.
 class HbmPageMemorySource final : public PageMemorySource {
  public:
-  explicit HbmPageMemorySource(int device) : device_(device) {}
+  explicit HbmPageMemorySource(int device,
+                               UMBPHbmAllocation allocation = UMBPHbmAllocation::kHipMalloc)
+      : device_(device), allocation_(allocation) {}
   ~HbmPageMemorySource() override { Release(); }
 
-  // hipMalloc one buffer per size, on device_.  All-or-nothing.
+  // Allocate one buffer per logical size, on device_. All-or-nothing.
   bool Allocate(const std::vector<uint64_t>& sizes, std::vector<Buffer>* out) override;
   void Release() override;
 
@@ -63,6 +66,7 @@ class HbmPageMemorySource final : public PageMemorySource {
 
  private:
   int device_ = 0;
+  UMBPHbmAllocation allocation_ = UMBPHbmAllocation::kHipMalloc;
   std::vector<void*> ptrs_;
 };
 
@@ -71,10 +75,10 @@ class HbmPageMemorySource final : public PageMemorySource {
 // returns MediumBackend, so PoolClient::Init names no concrete backend type.
 //
 // `device` is the GPU ordinal the pool is allocated on.  `buffer_sizes` is one
-// hipMalloc per entry, in bytes.
-std::unique_ptr<MediumBackend> MakeHbmBackend(uint64_t page_size, int device,
-                                              std::vector<uint64_t> buffer_sizes,
-                                              std::chrono::milliseconds pending_ttl,
-                                              std::chrono::milliseconds read_lease_ttl);
+// allocation per entry, in bytes; VMM granularity padding is not advertised.
+std::unique_ptr<MediumBackend> MakeHbmBackend(
+    uint64_t page_size, int device, std::vector<uint64_t> buffer_sizes,
+    std::chrono::milliseconds pending_ttl, std::chrono::milliseconds read_lease_ttl,
+    UMBPHbmAllocation allocation = UMBPHbmAllocation::kHipMalloc);
 
 }  // namespace mori::umbp

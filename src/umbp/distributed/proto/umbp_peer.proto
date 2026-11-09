@@ -24,6 +24,10 @@ service UMBPPeer {
   rpc BatchCommitSlots  (BatchCommitSlotsRequest)   returns (BatchCommitSlotsResponse);
   rpc BatchAbortSlots   (BatchAbortSlotsRequest)    returns (BatchAbortSlotsResponse);
   rpc BatchResolveKeys  (BatchResolveKeysRequest)   returns (BatchResolveKeysResponse);
+  rpc BatchAcquireReadKeys(BatchAcquireReadKeysRequest) returns (BatchAcquireReadKeysResponse);
+  rpc BatchReleaseReadPins(BatchReleaseReadPinsRequest) returns (BatchReleaseReadPinsResponse);
+  rpc BatchAbortProtectedSlots(BatchAbortProtectedSlotsRequest)
+      returns (BatchAbortProtectedSlotsResponse);
 }
 
 // ============================================================
@@ -54,6 +58,9 @@ message GetPeerInfoResponse {
   // Uniform across backends — BackendRegistry refuses to register a backend
   // that disagrees, because every wire carrying pages carries ONE page_size.
   uint64 page_size                       = 11;
+  string owner_incarnation = 12;
+  uint64 pool_generation = 13;
+  bool completion_pins = 14;
 }
 
 // ============================================================
@@ -77,6 +84,11 @@ message AllocateSlotRequest {
   // buffer on that node, so the reader that wrote the object fetches it through
   // NICs on the same node index at both ends.  Absent: no preference.
   optional int32 preferred_numa_node = 6;
+  // Nonempty selects protected ownership. The caller must establish GPU drain
+  // before Commit/Abort; expiry and heartbeat loss never free these pages.
+  string operation_id = 7;
+  string expected_owner_incarnation = 8;
+  uint64 expected_pool_generation = 9;
 }
 // AllocateSlot / BatchAllocateSlots per-entry outcome.
 // FAILED_NO_SPACE is split out so the writer can keep retrying with
@@ -111,6 +123,9 @@ message AllocateSlotResponse {
 message CommitSlotRequest {
   uint64 slot_id = 1;
   string key     = 2;
+  string operation_id = 3;
+  bool transfer_drained = 4;
+  string expected_owner_incarnation = 5;
 }
 message CommitSlotResponse {
   bool success = 1;  // false if slot already reaped or unknown
@@ -164,17 +179,24 @@ message EvictKeyResponse {
 
 message BatchAllocateSlotsRequest {
   repeated AllocateSlotRequest entries = 1;
+  string expected_owner_incarnation = 2;
+  uint64 expected_pool_generation = 3;
 }
 message BatchAllocateSlotsResponse {
   repeated AllocateSlotResponse entries = 1;
+  string owner_incarnation = 2;
+  uint64 pool_generation = 3;
 }
 
 message BatchCommitSlotEntry {
   uint64 slot_id = 1;
   string key     = 2;
+  string operation_id = 3;
+  bool transfer_drained = 4;
 }
 message BatchCommitSlotsRequest {
   repeated BatchCommitSlotEntry entries = 1;
+  string expected_owner_incarnation = 2;
 }
 message BatchCommitSlotsResponse {
   repeated bool success = 1;
@@ -246,3 +268,43 @@ message BatchResolveKeysResponse {
   repeated uint32 buffer_index = 7;
   repeated uint32 page_index   = 8;
 }
+
+// A grant retains ALL completion holds in this batch, including staged bytes.
+// Retry the same operation id to recover a lost reply. After release, that id
+// can never acquire again. Partial BUSY batches must be released before a new
+// operation is issued. Pin release is valid across Clear within an incarnation.
+message BatchAcquireReadKeysRequest {
+  BatchResolveKeysRequest resolve = 1;
+  string operation_id = 2;
+  string expected_owner_incarnation = 3;
+  uint64 expected_pool_generation = 4;
+}
+message BatchAcquireReadKeysResponse {
+  BatchResolveKeysResponse resolved = 1;
+  uint64 read_pin_token = 2;
+  string owner_incarnation = 3;
+  uint64 pool_generation = 4;
+}
+message BatchReleaseReadPinsRequest {
+  repeated uint64 read_pin_tokens = 1;
+  string expected_owner_incarnation = 2;
+  // Cancels an acquire whose reply was uncertain BEFORE any GPU work was
+  // submitted. Also fences a delayed/retried acquire with the same id.
+  repeated string abandoned_operation_ids = 3;
+  bool no_gpu_work_submitted = 4;
+}
+message BatchReleaseReadPinsResponse { repeated bool success = 1; }
+
+message ProtectedAbortSlotEntry {
+  uint64 slot_id = 1;
+  string operation_id = 2;
+  bool transfer_drained = 3;
+  // With slot_id=0, cancel/recover a reserve by operation_id. The caller must
+  // not have posted any GPU work for this operation.
+  bool no_gpu_work_submitted = 4;
+}
+message BatchAbortProtectedSlotsRequest {
+  repeated ProtectedAbortSlotEntry entries = 1;
+  string expected_owner_incarnation = 2;
+}
+message BatchAbortProtectedSlotsResponse { repeated bool success = 1; }

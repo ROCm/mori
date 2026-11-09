@@ -26,6 +26,7 @@
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
+#include "src/io/fabric/backend_impl.hpp"
 
 namespace mori::umbp {
 
@@ -41,16 +42,22 @@ class ScopedDevice {
       previous_ = -1;
       return;
     }
-    if (device == previous_) return;  // nothing to restore
+    if (device == previous_) {
+      valid_ = true;
+      return;
+    }
     if (hipSetDevice(device) != hipSuccess) {
       previous_ = -1;
       return;
     }
     restore_ = true;
+    valid_ = true;
   }
   ~ScopedDevice() {
     if (restore_ && previous_ >= 0) (void)hipSetDevice(previous_);
   }
+
+  bool Valid() const { return valid_; }
 
   ScopedDevice(const ScopedDevice&) = delete;
   ScopedDevice& operator=(const ScopedDevice&) = delete;
@@ -58,29 +65,43 @@ class ScopedDevice {
  private:
   int previous_ = -1;
   bool restore_ = false;
+  bool valid_ = false;
 };
 
 }  // namespace
 
 bool HbmPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vector<Buffer>* out) {
+  if (out == nullptr) return false;
   ScopedDevice scope(device_);
+  if (!scope.Valid()) {
+    MORI_UMBP_ERROR("[HbmPageMemorySource] cannot select device {}", device_);
+    return false;
+  }
 
   std::vector<void*> taken;
   std::vector<Buffer> staged;
   for (uint64_t size : sizes) {
     if (size == 0) continue;
     void* ptr = nullptr;
-    const hipError_t err = hipMalloc(&ptr, static_cast<size_t>(size));
+    const bool fabric = allocation_ == UMBPHbmAllocation::kFabricVmm;
+    const hipError_t err = fabric ? hipSuccess : hipMalloc(&ptr, static_cast<size_t>(size));
+    if (fabric) ptr = mori::io::FabricMalloc(static_cast<size_t>(size), device_);
     if (err != hipSuccess || ptr == nullptr) {
-      MORI_UMBP_ERROR("[HbmPageMemorySource] hipMalloc({}) on device {} failed: {}", size, device_,
-                      hipGetErrorString(err));
+      MORI_UMBP_ERROR("[HbmPageMemorySource] {}({}) on device {} failed: {}",
+                      fabric ? "FabricMalloc" : "hipMalloc", size, device_,
+                      fabric ? "fabric VMM allocation failed" : hipGetErrorString(err));
       // All-or-nothing, matching the PageMemorySource contract: unwind only
       // what this call took, leaving `out` and any earlier pool untouched.
-      for (void* p : taken) (void)hipFree(p);
+      for (void* p : taken) {
+        if (fabric)
+          mori::io::FabricFree(p);
+        else
+          (void)hipFree(p);
+      }
       return false;
     }
-    // hipMalloc returns exactly the requested size — no rounding to report, in
-    // contrast to the host source's hugepage mapped_size.
+    // Advertise logical capacity only. FabricMalloc may round its physical VMM
+    // allocation up to granularity; that padding must not become KV capacity.
     staged.push_back(Buffer{ptr, size});
     taken.push_back(ptr);
   }
@@ -95,6 +116,10 @@ void HbmPageMemorySource::Release() {
   if (ptrs_.empty()) return;
   ScopedDevice scope(device_);
   for (void* p : ptrs_) {
+    if (allocation_ == UMBPHbmAllocation::kFabricVmm) {
+      mori::io::FabricFree(p);
+      continue;
+    }
     const hipError_t err = hipFree(p);
     if (err != hipSuccess) {
       MORI_UMBP_ERROR("[HbmPageMemorySource] hipFree on device {} failed: {}", device_,
@@ -107,9 +132,10 @@ void HbmPageMemorySource::Release() {
 std::unique_ptr<MediumBackend> MakeHbmBackend(uint64_t page_size, int device,
                                               std::vector<uint64_t> buffer_sizes,
                                               std::chrono::milliseconds pending_ttl,
-                                              std::chrono::milliseconds read_lease_ttl) {
+                                              std::chrono::milliseconds read_lease_ttl,
+                                              UMBPHbmAllocation allocation) {
   return std::make_unique<PageBackend>(TierType::HBM, page_size,
-                                       std::make_unique<HbmPageMemorySource>(device),
+                                       std::make_unique<HbmPageMemorySource>(device, allocation),
                                        std::move(buffer_sizes), pending_ttl, read_lease_ttl);
 }
 

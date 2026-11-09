@@ -60,12 +60,20 @@ void FabricFree(void* ptr);
 /* ---------------------------------------------------------------------------------------------- */
 class FabricBackend;
 
+// Must match the descriptor layout consumed by fabricBatchCopyKernel.
+struct FabricCopySegment {
+  const char* src;
+  char* dst;
+  size_t size;
+};
+
 class FabricBackendSession : public BackendSession {
  public:
   FabricBackendSession() = default;
   FabricBackendSession(const FabricBackendConfig& config, void* localAddr, void* remoteAddr,
                        int localDevice, FabricBackend* backend, StreamPool* streamPool,
-                       EventPool* eventPool);
+                       EventPool* eventPool, std::shared_ptr<void> regionLifetime = {},
+                       std::shared_ptr<std::atomic<bool>> validity = {});
   ~FabricBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -89,6 +97,8 @@ class FabricBackendSession : public BackendSession {
   FabricBackend* backend{nullptr};
   StreamPool* streamPool{nullptr};
   EventPool* eventPool{nullptr};
+  std::shared_ptr<void> regionLifetime;
+  std::shared_ptr<std::atomic<bool>> validity;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -103,6 +113,7 @@ class FabricBackend : public Backend {
   void DeregisterRemoteEngine(const EngineDesc&) override;
   void RegisterMemory(MemoryDesc& desc) override;
   void DeregisterMemory(const MemoryDesc& desc) override;
+  void InvalidateRemoteMemory(const MemoryDesc& desc) override;
   void ReadWrite(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                  size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id,
                  bool isRead) override;
@@ -118,6 +129,10 @@ class FabricBackend : public Backend {
   // JIT-loaded contiguous copy kernel (fabric_copy.hip), one module per device.
   void LoadFabricCopyModule(const std::string& hsacoPath);
   hipFunction_t GetFabricCopyFunc(int deviceId);
+  hipFunction_t GetFabricBatchCopyFunc(int deviceId);
+  bool IsReady(int deviceId);
+  hipError_t LaunchBatchCopy(const std::vector<FabricCopySegment>& segments, int device,
+                             hipStream_t stream, std::shared_ptr<void>* lifetime);
 
  private:
   void Initialize();
@@ -127,7 +142,8 @@ class FabricBackend : public Backend {
   // Import a peer's fabric handle and map it into a fresh local VA; cached per
   // (remote engine, remote mem id, local device). Returns the mapped pointer, or
   // the local pointer directly when the memory is owned by this engine.
-  void* GetImportedAddress(const MemoryDesc& desc, int localDeviceId);
+  struct ImportedRegion;
+  std::shared_ptr<ImportedRegion> GetImportedRegion(const MemoryDesc& desc, int localDeviceId);
 
   struct SessionCacheKey {
     EngineKey remoteEngineKey;
@@ -150,13 +166,24 @@ class FabricBackend : public Backend {
       return seed;
     }
   };
-  FabricBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
-  void InvalidateSessionsForMemory(MemoryUniqueId id);
+  std::shared_ptr<FabricBackendSession> GetOrCreateSessionCached(const MemoryDesc& local,
+                                                                 const MemoryDesc& remote);
+  void InvalidateSessionsForMemory(const MemoryDesc& desc);
 
   struct ImportedRegion {
     hipMemGenericAllocationHandle_t handle{};
     void* mappedAddr{nullptr};
     size_t size{0};
+    int device{-1};
+    bool ownsMapping{true};
+    ~ImportedRegion();
+  };
+  struct BatchStaging {
+    FabricCopySegment* host{nullptr};
+    FabricCopySegment* devicePtr{nullptr};
+    size_t capacity{0};
+    int device{-1};
+    ~BatchStaging();
   };
   struct ImportCacheKey {
     EngineKey engineKey;
@@ -195,19 +222,24 @@ class FabricBackend : public Backend {
   std::unordered_map<std::string, int> localDeviceByBusId;
 
   mutable std::shared_mutex importMutex;
-  std::unordered_map<ImportCacheKey, ImportedRegion, ImportCacheKeyHash> importedRegions;
+  std::unordered_map<ImportCacheKey, std::shared_ptr<ImportedRegion>, ImportCacheKeyHash>
+      importedRegions;
 
-  std::unordered_map<SessionCacheKey, std::unique_ptr<FabricBackendSession>, SessionCacheKeyHash>
+  std::unordered_map<SessionCacheKey, std::shared_ptr<FabricBackendSession>, SessionCacheKeyHash>
       sessionCache;
   std::mutex sessionCacheMu;
 
   std::unordered_map<EngineKey, EngineDesc> remoteEngines;
+  std::unordered_map<EngineKey, std::shared_ptr<std::atomic<bool>>> remoteValidity;
   mutable std::mutex remoteEnginesMu;
 
   std::string fabricCopyHsacoPath_;
   std::vector<hipModule_t> fabricCopyModules_;
   std::vector<hipFunction_t> fabricCopyFuncs_;
+  std::vector<hipFunction_t> fabricBatchCopyFuncs_;
   std::mutex moduleMu_;
+  std::mutex stagingMu_;
+  std::vector<std::shared_ptr<BatchStaging>> batchStaging_;
 };
 
 }  // namespace io

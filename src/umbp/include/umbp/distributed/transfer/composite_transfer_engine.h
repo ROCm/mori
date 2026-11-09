@@ -68,6 +68,8 @@ class CompositeTransferEngine final : public TransferEngine {
   // merged.  Returns an invalid ref only when no engine claimed the memory.
   TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
                              int device) override;
+  TransferRef RegisterMemoryWithBackends(void* base, size_t size, mori::io::MemoryLocationType loc,
+                                         int device, uint32_t allowed_backend_mask) override;
   // Fan out to the first file-capable sub-engine (GdsEngine): it owns the fd
   // registration outright and returns a File ref carrying its handle.  Invalid
   // when no file engine is configured.

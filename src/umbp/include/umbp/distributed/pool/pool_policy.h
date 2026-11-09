@@ -48,6 +48,8 @@ struct PoolPlacementRequest {
   std::string backend_name;
   std::string logical_tier;
   int preferred_numa_node = -1;
+  std::string operation_id;
+  uint64_t expected_pool_generation = UINT64_MAX;
 };
 
 // Decision-only interface. A policy returns backend ids; PeerPool owns slot

@@ -50,6 +50,7 @@
 
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/peer/backend/mock_backend.h"
+#include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp_peer.grpc.pb.h"
@@ -665,6 +666,115 @@ TEST(PeerServicePortExclusivity, SecondServerCannotBindTheSamePort) {
 
   second.Stop();
   first.Stop();
+}
+
+TEST(PeerServiceCompletionPins, RpcEpochRetryAndReleaseProtectOwnerPages) {
+  BackendRegistry registry;
+  PageBackend::TierConfig config;
+  config.buffer_sizes = {4 * 64};
+  config.buffer_descs = {{0x11}};
+  auto backend = std::make_unique<PageBackend>(
+      TierType::DRAM, 64, config, std::chrono::milliseconds(1), std::chrono::milliseconds(1));
+  auto* page = backend.get();
+  ASSERT_TRUE(registry.Register("dram", std::move(backend)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  PoolPlacementRequest put;
+  put.key = "kv";
+  put.size = 64;
+  put.tier = TierType::DRAM;
+  auto allocation = pool.BatchAllocate({put}).front();
+  ASSERT_TRUE(pool.BatchCommit({{{allocation.backend_id, allocation.allocation.slot_id}, "kv"}})
+                  .front()
+                  .commit.success);
+  PeerServiceServer server(pool);
+  ASSERT_TRUE(server.Start(0));
+  auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(server.BoundPort()),
+                                     grpc::InsecureChannelCredentials());
+  auto stub = ::umbp::UMBPPeer::NewStub(channel);
+  ::umbp::GetPeerInfoResponse info;
+  grpc::ClientContext info_context;
+  ASSERT_TRUE(stub->GetPeerInfo(&info_context, {}, &info).ok());
+  ASSERT_TRUE(info.completion_pins());
+  ASSERT_FALSE(info.owner_incarnation().empty());
+
+  ::umbp::BatchAcquireReadKeysRequest request;
+  request.mutable_resolve()->add_keys("kv");
+  request.set_operation_id("reader:1");
+  request.set_expected_pool_generation(info.pool_generation());
+  request.set_expected_owner_incarnation("stale-owner");
+  ::umbp::BatchAcquireReadKeysResponse grant;
+  grpc::ClientContext stale_context;
+  EXPECT_EQ(stub->BatchAcquireReadKeys(&stale_context, request, &grant).error_code(),
+            grpc::StatusCode::FAILED_PRECONDITION);
+  request.set_expected_owner_incarnation(info.owner_incarnation());
+  grpc::ClientContext acquire_context;
+  ASSERT_TRUE(stub->BatchAcquireReadKeys(&acquire_context, request, &grant).ok());
+  ASSERT_NE(grant.read_pin_token(), 0u);
+  ASSERT_TRUE(grant.resolved().found(0));
+  ::umbp::BatchAcquireReadKeysResponse duplicate;
+  grpc::ClientContext retry_context;
+  ASSERT_TRUE(stub->BatchAcquireReadKeys(&retry_context, request, &duplicate).ok());
+  EXPECT_EQ(duplicate.read_pin_token(), grant.read_pin_token());
+  EXPECT_EQ(pool.Evict({"kv"}, PoolEvictMode::kDiscard).front().bytes_freed, 0u);
+
+  pool.ClearLocal();
+  page->ClearFullSyncAcked();
+  page->RunReaperOnceForTest();
+  EXPECT_EQ(page->Capacity().available_bytes, 3u * 64);
+  ::umbp::BatchReleaseReadPinsRequest release;
+  release.add_read_pin_tokens(grant.read_pin_token());
+  release.set_expected_owner_incarnation(info.owner_incarnation());
+  ::umbp::BatchReleaseReadPinsResponse released;
+  grpc::ClientContext release_context;
+  ASSERT_TRUE(stub->BatchReleaseReadPins(&release_context, release, &released).ok());
+  ASSERT_TRUE(released.success(0));
+  page->RunReaperOnceForTest();
+  EXPECT_EQ(page->Capacity().available_bytes, 4u * 64);
+  request.set_expected_pool_generation(pool.Generation());
+  grpc::ClientContext replay_context;
+  EXPECT_EQ(stub->BatchAcquireReadKeys(&replay_context, request, &duplicate).error_code(),
+            grpc::StatusCode::FAILED_PRECONDITION);
+
+  ::umbp::BatchReleaseReadPinsRequest abandon;
+  abandon.set_expected_owner_incarnation(info.owner_incarnation());
+  abandon.add_abandoned_operation_ids("reader:2");
+  ::umbp::BatchReleaseReadPinsResponse cancelled;
+  grpc::ClientContext no_proof_context;
+  ASSERT_TRUE(stub->BatchReleaseReadPins(&no_proof_context, abandon, &cancelled).ok());
+  EXPECT_FALSE(cancelled.success(0));
+  abandon.set_no_gpu_work_submitted(true);
+  grpc::ClientContext abandon_context;
+  cancelled.Clear();
+  ASSERT_TRUE(stub->BatchReleaseReadPins(&abandon_context, abandon, &cancelled).ok());
+  EXPECT_TRUE(cancelled.success(0));
+  request.set_operation_id("reader:2");
+  grpc::ClientContext delayed_acquire_context;
+  EXPECT_EQ(stub->BatchAcquireReadKeys(&delayed_acquire_context, request, &duplicate).error_code(),
+            grpc::StatusCode::FAILED_PRECONDITION);
+
+  ::umbp::BatchAllocateSlotsRequest reserve;
+  reserve.set_expected_owner_incarnation(info.owner_incarnation());
+  reserve.set_expected_pool_generation(pool.Generation());
+  auto* entry = reserve.add_entries();
+  entry->set_key("protected");
+  entry->set_size(64);
+  entry->set_tier(::umbp::TIER_DRAM);
+  entry->set_operation_id("writer:1");
+  ::umbp::BatchAllocateSlotsResponse reservation;
+  grpc::ClientContext reserve_context;
+  ASSERT_TRUE(stub->BatchAllocateSlots(&reserve_context, reserve, &reservation).ok());
+  ASSERT_EQ(reservation.entries(0).outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
+  EXPECT_EQ(page->Capacity().available_bytes, 3u * 64);
+  ::umbp::BatchAbortProtectedSlotsRequest abort;
+  abort.set_expected_owner_incarnation(info.owner_incarnation());
+  auto* abort_entry = abort.add_entries();
+  abort_entry->set_operation_id("writer:1");
+  abort_entry->set_no_gpu_work_submitted(true);
+  ::umbp::BatchAbortProtectedSlotsResponse aborted;
+  grpc::ClientContext abort_context;
+  ASSERT_TRUE(stub->BatchAbortProtectedSlots(&abort_context, abort, &aborted).ok());
+  ASSERT_TRUE(aborted.success(0));
+  EXPECT_EQ(page->Capacity().available_bytes, 4u * 64);
 }
 
 }  // namespace

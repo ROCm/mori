@@ -32,6 +32,12 @@ else()
   find_library(_TEST_GRPCPP_LIB NAMES grpc++ REQUIRED)
 endif()
 
+# Manual two-host UALink validation; requires matching fabric-ready GPUs.
+add_executable(umbp_ualink_kv_driver ualink_kv_driver.cpp)
+target_link_libraries(umbp_ualink_kv_driver PRIVATE umbp_core umbp_common
+                     ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})
+target_compile_features(umbp_ualink_kv_driver PRIVATE cxx_std_17)
+
 # MasterClient::FlushHeartbeat: immediate wakeup, no-op before start,
 # flush-while-in-flight.
 add_executable(test_umbp_master_client_flush_heartbeat
@@ -325,6 +331,8 @@ target_link_libraries(
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
 add_test(NAME umbp_pool_client_ranges COMMAND test_umbp_pool_client_ranges)
+add_test(NAME umbp_gpu_direct_ranges COMMAND test_umbp_pool_client_ranges
+         --gtest_filter=PoolClientGpu*Test.*)
 
 # test_umbp_ssd_ranged_io — ranged multi-buffer I/O on an SSD-medium node
 # (doc/design-ssd-ranged-io.md, D0): the capability flag now turning on the

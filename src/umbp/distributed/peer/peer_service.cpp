@@ -25,6 +25,8 @@
 
 #include <chrono>
 #include <limits>
+#include <random>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -124,6 +126,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status GetPeerInfo(grpc::ServerContext* /*context*/,
                            const ::umbp::GetPeerInfoRequest* /*request*/,
                            ::umbp::GetPeerInfoResponse* response) override {
+    response->set_owner_incarnation(owner_incarnation_);
+    response->set_pool_generation(pool_ == nullptr ? 0 : pool_->Generation());
+    response->set_completion_pins(true);
     if (!engine_desc_bytes_.empty()) {
       response->set_engine_desc(std::string(engine_desc_bytes_.begin(), engine_desc_bytes_.end()));
     }
@@ -173,11 +178,17 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       return grpc::Status::OK;
     }
     PoolPlacementRequest entry;
+    if (!request->operation_id().empty() &&
+        request->expected_owner_incarnation() != owner_incarnation_)
+      return StaleOwner();
     entry.key = request->key();
     entry.size = request->size();
     entry.tier = TierFromProto(request->tier());
     entry.backend_name = request->backend_name();
     entry.logical_tier = request->logical_tier();
+    entry.operation_id = request->operation_id();
+    if (!entry.operation_id.empty())
+      entry.expected_pool_generation = request->expected_pool_generation();
     if (request->has_preferred_numa_node())
       entry.preferred_numa_node = request->preferred_numa_node();
     auto pool_result = pool_->BatchAllocate({entry}).front();
@@ -216,9 +227,14 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       return grpc::Status::OK;
     }
     PoolCommitRequest entry;
+    if (!request->operation_id().empty() &&
+        request->expected_owner_incarnation() != owner_incarnation_)
+      return StaleOwner();
     entry.slot.backend_id = BackendIdFromSlotId(request->slot_id());
     entry.slot.local_slot_id = LocalSlotId(request->slot_id());
     entry.key = request->key();
+    entry.operation_id = request->operation_id();
+    entry.transfer_drained = request->transfer_drained();
     const auto result = pool_->BatchCommit({entry}).front().commit;
     response->set_success(result.success);
     if (result.success) {
@@ -281,6 +297,13 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                                   const ::umbp::BatchAllocateSlotsRequest* request,
                                   ::umbp::BatchAllocateSlotsResponse* response) override {
     const int n = request->entries_size();
+    response->set_owner_incarnation(owner_incarnation_);
+    response->set_pool_generation(pool_ == nullptr ? 0 : pool_->Generation());
+    for (const auto& entry : request->entries()) {
+      if (!entry.operation_id().empty() &&
+          request->expected_owner_incarnation() != owner_incarnation_)
+        return StaleOwner();
+    }
     for (int i = 0; i < n; ++i) {
       response->add_entries()->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
     }
@@ -295,6 +318,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       entry.tier = TierFromProto(request->entries(i).tier());
       entry.backend_name = request->entries(i).backend_name();
       entry.logical_tier = request->entries(i).logical_tier();
+      entry.operation_id = request->entries(i).operation_id();
+      if (!entry.operation_id.empty())
+        entry.expected_pool_generation = request->expected_pool_generation();
       if (request->entries(i).has_preferred_numa_node()) {
         entry.preferred_numa_node = request->entries(i).preferred_numa_node();
       }
@@ -330,6 +356,11 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                                 const ::umbp::BatchCommitSlotsRequest* request,
                                 ::umbp::BatchCommitSlotsResponse* response) override {
     const int n = request->entries_size();
+    for (const auto& entry : request->entries()) {
+      if (!entry.operation_id().empty() &&
+          request->expected_owner_incarnation() != owner_incarnation_)
+        return StaleOwner();
+    }
     for (int i = 0; i < n; ++i) response->add_success(false);
     if (pool_ == nullptr) return grpc::Status::OK;
 
@@ -340,6 +371,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       entry.slot.backend_id = BackendIdFromSlotId(request->entries(i).slot_id());
       entry.slot.local_slot_id = LocalSlotId(request->entries(i).slot_id());
       entry.key = request->entries(i).key();
+      entry.operation_id = request->entries(i).operation_id();
+      entry.transfer_drained = request->entries(i).transfer_drained();
       entries.push_back(std::move(entry));
     }
 
@@ -427,7 +460,87 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     return grpc::Status::OK;
   }
 
+  grpc::Status BatchAcquireReadKeys(grpc::ServerContext*,
+                                    const ::umbp::BatchAcquireReadKeysRequest* request,
+                                    ::umbp::BatchAcquireReadKeysResponse* response) override {
+    response->set_owner_incarnation(owner_incarnation_);
+    response->set_pool_generation(pool_ == nullptr ? 0 : pool_->Generation());
+    if (request->expected_owner_incarnation() != owner_incarnation_) return StaleOwner();
+    if (pool_ == nullptr) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "no peer pool");
+    const auto& resolve = request->resolve();
+    std::vector<std::string> keys(resolve.keys().begin(), resolve.keys().end());
+    auto grant = pool_->AcquireReadBatch(
+        keys, request->operation_id(), request->expected_pool_generation(), !resolve.omit_descs());
+    response->set_pool_generation(grant.generation);
+    if (!grant.accepted) {
+      return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                          "stale generation, released operation, or pin capacity exhausted");
+    }
+    response->set_read_pin_token(grant.token);
+    std::vector<ResolvedKeyEntry> entries(keys.size());
+    std::vector<BufferMemoryDescBytes> descs;
+    std::set<std::pair<uint32_t, uint32_t>> seen;
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < grant.entries.size() && i < entries.size(); ++i) {
+      auto& source = grant.entries[i];
+      auto& entry = entries[i];
+      entry.outcome = EffectiveResolveOutcome(source.resolved);
+      entry.found = source.resolved.found;
+      entry.backend_id = source.backend_id;
+      entry.tier = source.tier;
+      entry.size = source.resolved.size;
+      entry.pages = source.resolved.pages;
+      if (entry.found) bytes += entry.size;
+      for (auto desc : source.resolved.descs) {
+        desc.backend_id = source.backend_id;
+        if (seen.emplace(desc.backend_id, desc.buffer_index).second)
+          descs.push_back(std::move(desc));
+      }
+    }
+    EncodeBatchResolveResponse(entries, registry_ == nullptr ? 0 : registry_->PageSize(), descs,
+                               response->mutable_resolved());
+    RecordInboundGet(bytes, "remote");
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchReleaseReadPins(grpc::ServerContext*,
+                                    const ::umbp::BatchReleaseReadPinsRequest* request,
+                                    ::umbp::BatchReleaseReadPinsResponse* response) override {
+    if (request->expected_owner_incarnation() != owner_incarnation_) return StaleOwner();
+    if (pool_ == nullptr) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "no peer pool");
+    std::vector<uint64_t> tokens(request->read_pin_tokens().begin(),
+                                 request->read_pin_tokens().end());
+    for (bool success : pool_->ReleaseReadPins(tokens)) response->add_success(success);
+    std::vector<std::string> abandoned(request->abandoned_operation_ids().begin(),
+                                       request->abandoned_operation_ids().end());
+    const auto cancelled = request->no_gpu_work_submitted()
+                               ? pool_->AbandonReadOperations(abandoned)
+                               : std::vector<bool>(abandoned.size(), false);
+    // successes are tokens first, then abandoned operation ids.
+    for (bool success : cancelled) response->add_success(success);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchAbortProtectedSlots(
+      grpc::ServerContext*, const ::umbp::BatchAbortProtectedSlotsRequest* request,
+      ::umbp::BatchAbortProtectedSlotsResponse* response) override {
+    if (request->expected_owner_incarnation() != owner_incarnation_) return StaleOwner();
+    if (pool_ == nullptr) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "no peer pool");
+    std::vector<PoolProtectedAbortRequest> entries;
+    for (const auto& entry : request->entries()) {
+      entries.push_back({{BackendIdFromSlotId(entry.slot_id()), LocalSlotId(entry.slot_id())},
+                         entry.operation_id(),
+                         entry.transfer_drained(),
+                         entry.no_gpu_work_submitted()});
+    }
+    for (bool success : pool_->BatchAbortProtected(entries)) response->add_success(success);
+    return grpc::Status::OK;
+  }
+
  private:
+  grpc::Status StaleOwner() const {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "owner incarnation mismatch");
+  }
   MediumBackend* Backend(uint32_t backend_id) const {
     return registry_ == nullptr ? nullptr : registry_->Get(backend_id);
   }
@@ -457,6 +570,11 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   const std::vector<MediumBackend*> media_;
   const std::vector<uint8_t>& engine_desc_bytes_;
   MetricSink* metric_sink_;
+  const std::string owner_incarnation_ = [] {
+    std::random_device random;
+    return std::to_string(random()) + "-" + std::to_string(random()) + "-" +
+           std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  }();
 };
 
 PeerServiceServer::PeerServiceServer(PeerPool& pool, std::vector<uint8_t> engine_desc_bytes,

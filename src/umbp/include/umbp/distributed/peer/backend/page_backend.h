@@ -266,6 +266,10 @@ class PageBackend : public MediumBackend {
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override;
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
+  bool SupportsProtectedWrites() const override { return true; }
+  bool QuarantineBackingMemory() override;
+  std::vector<bool> BatchAbortProtected(
+      const std::vector<ProtectedAbortRequest>& requests) override;
   std::vector<ResolvedEntry> BatchResolve(
       const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
       ResolveReader reader = ResolveReader::kRemote,
@@ -341,6 +345,8 @@ class PageBackend : public MediumBackend {
     // Snapshot of allocator_generation_ at Allocate().  Commit() rejects
     // slots whose generation no longer matches the current.
     uint64_t generation = 0;
+    std::string operation_id;
+    std::string key;
   };
 
   struct OwnedSlot {
@@ -501,6 +507,17 @@ class PageBackend : public MediumBackend {
   std::vector<TransferRef> buffer_refs_;
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
+  struct WriteReceipt {
+    std::string key;
+    uint64_t size = 0;
+    AllocateResult allocation;
+    bool settled = false;
+    CommitResult commit;
+  };
+  // Retained for this allocator incarnation; no TTL can resurrect an operation.
+  std::unordered_map<std::string, WriteReceipt> protected_writes_;
+  std::unordered_map<std::string, OrderedOperationClient> protected_write_clients_;
+  void RetireProtectedWritesLocked(const std::vector<std::string>& operation_ids);
   std::unordered_map<std::string, OwnedSlot> owned_;
   std::vector<KvEvent> pending_events_;
 
@@ -558,6 +575,7 @@ class PageBackend : public MediumBackend {
   // it does not own.  Non-null for both production constructors, so Init() has
   // exactly one path regardless of medium.
   std::unique_ptr<PageMemorySource> source_;
+  bool quarantined_ = false;
   std::vector<uint64_t> source_buffer_sizes_;
   uint64_t max_mr_bytes_ = kDefaultDramMaxMrBytes;
 

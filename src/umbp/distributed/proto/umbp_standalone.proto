@@ -64,6 +64,9 @@ message BoolResponse {
   bool ok = 1;
   string error = 2;
   bool supports_kv_metadata = 3; // ConfigureKvIndexer capability handshake.
+  // Completion/drain could not be proved. The worker must retain all exported
+  // allocations even when this operation returned false or the client closes.
+  bool resources_quarantined = 4;
 }
 
 enum StandaloneBackendMode {
@@ -161,6 +164,7 @@ message BatchBoolResponse {
   // offered fingerprint. Nothing was read; `ok` is empty. Repeat the call with
   // the keys.
   bool key_handle_unknown = 3;
+  bool resources_quarantined = 4;
 }
 
 enum MemoryKind {
@@ -183,6 +187,8 @@ message RegisterMemoryRequest {
   uint64 ipc_offset = 10;
   uint64 alloc_base = 11;
   reserved 12;
+  // Physical identity; worker and server may expose GPUs in different orders.
+  bytes gpu_uuid = 13;
 }
 
 message DeregisterMemoryRequest {

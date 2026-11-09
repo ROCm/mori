@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <msgpack.hpp>
 #include <numeric>
 #include <set>
 #include <string>
@@ -418,6 +419,67 @@ TransferRef LocalRegistered(void* base, uint64_t size, mori::io::MemoryUniqueId 
   ref.mem.size = size;
   ref.mem.loc = mori::io::MemoryLocationType::CPU;
   return ref;
+}
+
+TEST(MoriIoEngine, RemoteIncarnationInvalidatesDescriptorsAndRejectsLateOldRegions) {
+  MoriIoEngine engine("local", {}, 0);
+  auto packed = [](const auto& value) {
+    msgpack::sbuffer buffer;
+    msgpack::pack(buffer, value);
+    return std::string(buffer.data(), buffer.size());
+  };
+  mori::io::EngineDesc owner;
+  owner.key = "owner/epoch-1";
+  owner.port = 1234;
+  ASSERT_TRUE(engine.EnsureRemoteEngine("owner", packed(owner)));
+  mori::io::MemoryDesc memory;
+  memory.engineKey = owner.key;
+  memory.id = 7;
+  memory.loc = mori::io::MemoryLocationType::GPU;
+  memory.size = 4096;
+  memory.fabricHandle[0] = 1;
+  BufferMemoryDescBytes entry;
+  entry.backend_id = 0;
+  entry.buffer_index = 0;
+  auto first = packed(memory);
+  entry.desc_bytes.assign(first.begin(), first.end());
+  engine.CacheRemoteBuffers("owner", {entry});
+  ASSERT_TRUE(engine.HasRemoteBuffers("owner"));
+  memory.fabricHandle[0] = 2;
+  memory.fabricOffset = 128;
+  auto changed = packed(memory);
+  entry.desc_bytes.assign(changed.begin(), changed.end());
+  engine.CacheRemoteBuffers("owner", {entry});
+  ASSERT_EQ(engine.RemoteBufferSnapshot("owner", 0).front().mem.fabricHandle[0], 2);
+  EXPECT_EQ(engine.RemoteBufferSnapshot("owner", 0).front().mem.fabricOffset, 128u);
+  owner.key = "owner/epoch-2";
+  ASSERT_TRUE(engine.EnsureRemoteEngine("owner", packed(owner)));
+  EXPECT_FALSE(engine.HasRemoteBuffers("owner"));
+  engine.CacheRemoteBuffers("owner", {entry});  // late epoch-1 metadata
+  EXPECT_FALSE(engine.HasRemoteBuffers("owner"));
+  engine.ForgetRemote("owner");
+  EXPECT_TRUE(engine.RemoteBufferSnapshot("owner", 0).empty());
+}
+
+TEST(MoriIoEngine, FabricStrictPlannerRejectsCpuAndBouncePaths) {
+  UMBPIoEngineConfig config;
+  config.mode = UMBPTransferMode::kFabricStrict;
+  config.fabric_kernel_path = "/unused/fabric.hsaco";
+  MoriIoEngine engine("local", {}, 1 << 20, config);
+  char buffer[4096];
+  auto local = LocalRegistered(buffer, sizeof(buffer), 1);
+  auto peer = RemoteRef("peer", 2, sizeof(buffer));
+  const auto cpu = engine.Plan({MakeItem(local, 0, peer, 0, sizeof(buffer), 7)});
+  EXPECT_TRUE(cpu.plans.empty());
+  EXPECT_EQ(cpu.rejected_tags, (std::vector<size_t>{7}));
+  local.loc = local.mem.loc = mori::io::MemoryLocationType::GPU;
+  peer.loc = peer.mem.loc = mori::io::MemoryLocationType::GPU;
+  const auto gpu = engine.Plan({MakeItem(local, 0, peer, 0, sizeof(buffer), 8)});
+  ASSERT_EQ(gpu.plans.size(), 1u);
+  EXPECT_FALSE(gpu.plans.front().uses_bounce);
+  auto unregistered = TransferRef::HostBytes(buffer, sizeof(buffer));
+  EXPECT_EQ(engine.Plan({MakeItem(unregistered, 0, peer, 0, sizeof(buffer), 9)}).rejected_tags,
+            (std::vector<size_t>{9}));
 }
 
 TEST(MoriIoEngine, GroupsZeroCopyByEndpointsAndCapsSegments) {

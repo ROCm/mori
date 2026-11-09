@@ -98,6 +98,10 @@ constexpr size_t kVectorBytes = 16;
 //  geometry needed to rebuild the case in a unit test, and the bandwidth
 //  ACTUALLY achieved.
 //
+//  The timings below cover the synchronous host/device paths; asynchronous
+//  D2D batches report geometry separately without claiming a bandwidth from
+//  submission latency.
+//
 //  On measurement honesty: the per-fragment costs quoted in device_gather.h
 //  (~0.57 us, "flat across fragment sizes from 8 KiB to 221 KiB") are host-side
 //  submission costs, not data-movement costs -- a figure that is flat across a
@@ -295,12 +299,15 @@ class GatherStreamPool {
 
   // The current device must already be `device_id`.  nullptr if no stream is
   // free and a new one cannot be created.
-  hipStream_t Acquire(int device_id) {
+  hipStream_t Acquire(int device_id, bool wait_for_capacity = true) {
     {
       std::unique_lock<std::mutex> lock(mutex_);
       Device& device = devices_[device_id];
-      device.returned.wait(lock,
-                           [&] { return !device.idle.empty() || cap_ == 0 || device.live < cap_; });
+      auto available = [&] { return !device.idle.empty() || cap_ == 0 || device.live < cap_; };
+      // Async Submit must not wait for a stream held by an earlier handle
+      // whose caller has not reached Wait yet.
+      if (!wait_for_capacity && !available()) return nullptr;
+      if (wait_for_capacity) device.returned.wait(lock, available);
       if (!device.idle.empty()) {
         hipStream_t stream = device.idle.back();
         device.idle.pop_back();
@@ -325,6 +332,26 @@ class GatherStreamPool {
     device.returned.notify_one();
   }
 
+  hipEvent_t AcquireEvent(int device_id) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto& events = devices_[device_id].idle_events;
+      if (!events.empty()) {
+        hipEvent_t event = events.back();
+        events.pop_back();
+        return event;
+      }
+    }
+    hipEvent_t event = nullptr;
+    if (hipEventCreateWithFlags(&event, hipEventDisableTiming) != hipSuccess) return nullptr;
+    return event;
+  }
+
+  void ReleaseEvent(int device_id, hipEvent_t event) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    devices_[device_id].idle_events.push_back(event);
+  }
+
   // For an acquired stream that will not be released.
   void Discard(int device_id) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -338,6 +365,7 @@ class GatherStreamPool {
  private:
   struct Device {
     std::vector<hipStream_t> idle;
+    std::vector<hipEvent_t> idle_events;
     size_t live = 0;  // created and not discarded
     std::condition_variable returned;
   };
@@ -384,6 +412,131 @@ class SettledHandle final : public TransferHandle {
  private:
   std::vector<TransferFailure> failures_;
   bool reported_ = false;
+};
+
+// Streams remain exclusively owned until the batch's completion event has
+// settled. An error after any HIP enqueue is drained before buffers can be
+// released. A failed drain leaves the HIP resources allocated and tells the
+// caller to retain the corresponding memory.
+class DeviceCopyHandle final : public TransferHandle {
+ public:
+  struct Batch {
+    int device = -1;
+    hipStream_t stream = nullptr;
+    hipEvent_t event = nullptr;
+    std::vector<size_t> tags;
+    hipError_t error = hipSuccess;
+    const char* operation = "hipMemcpyAsync";
+    bool submitted = false;
+    bool recorded = false;
+    bool settled = false;
+    bool quarantined = false;
+  };
+
+  explicit DeviceCopyHandle(std::vector<TransferFailure> failures)
+      : failures_(std::move(failures)), has_failure_(!failures_.empty()) {}
+  ~DeviceCopyHandle() override { Wait(nullptr); }
+
+  // Add all batches before enqueuing work. This also makes an exceptional
+  // Submit unwind through a handle that knows every stream requiring a drain.
+  std::vector<Batch>& Batches() { return batches_; }
+
+  void Wait(std::vector<TransferFailure>* failures) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (waited_) return;
+    int previous = -1;
+    (void)hipGetDevice(&previous);
+    for (auto& batch : batches_) Settle(batch);
+    for (const auto& batch : batches_)
+      if (batch.error != hipSuccess) has_failure_ = true;
+    if (previous >= 0) (void)hipSetDevice(previous);
+    // Settle first, even if reporting throws due to allocation failure.
+    waited_ = true;
+    if (failures == nullptr) return;
+    for (auto& failure : failures_) failures->push_back(std::move(failure));
+    for (const auto& batch : batches_) {
+      if (batch.error == hipSuccess) continue;
+      failures->push_back(
+          TransferFailure{batch.tags, static_cast<uint32_t>(batch.error),
+                          std::string(batch.operation) + ": " + hipGetErrorString(batch.error),
+                          "hbm:dev" + std::to_string(batch.device), batch.quarantined});
+    }
+    failures_.clear();
+  }
+
+  bool WaitOnStream(void* stream) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (has_failure_) return false;
+    for (const auto& batch : batches_)
+      if (batch.error != hipSuccess || batch.quarantined) return false;
+    if (waited_) return true;
+    int previous = -1;
+    (void)hipGetDevice(&previous);
+    bool success = true;
+    for (const auto& batch : batches_) {
+      if (!batch.submitted) continue;
+      if (!batch.recorded || hipSetDevice(batch.device) != hipSuccess ||
+          hipStreamWaitEvent(reinterpret_cast<hipStream_t>(stream), batch.event, 0) != hipSuccess)
+        success = false;
+    }
+    if (previous >= 0) (void)hipSetDevice(previous);
+    return success;
+  }
+
+ private:
+  static void Settle(Batch& batch) {
+    if (batch.settled) return;
+    batch.settled = true;
+    if (batch.stream == nullptr) return;
+    const hipError_t selected = hipSetDevice(batch.device);
+    bool drained = !batch.submitted;
+    if (selected == hipSuccess && batch.submitted) {
+      if (batch.recorded && batch.error == hipSuccess) {
+        const hipError_t event_error = hipEventSynchronize(batch.event);
+        drained = event_error == hipSuccess;
+        if (!drained) {
+          batch.error = event_error;
+          batch.operation = "hipEventSynchronize";
+        }
+      }
+      if (!drained) drained = hipStreamSynchronize(batch.stream) == hipSuccess;
+    }
+    if (selected != hipSuccess && batch.error == hipSuccess) {
+      batch.error = selected;
+      batch.operation = "hipSetDevice";
+    }
+    if (!drained) {
+      if (batch.error == hipSuccess) batch.error = hipErrorUnknown;
+      batch.quarantined = true;
+      // Discard removes this poisoned stream from capacity accounting while
+      // retaining the actual HIP stream/event: completion was not proved.
+      GatherStreamPool::Instance().Discard(batch.device);
+      MORI_UMBP_ERROR("[HbmCopyEngine] dev={} copy drain unconfirmed; retaining stream/event",
+                      batch.device);
+      return;
+    }
+    if (batch.event != nullptr && selected == hipSuccess) {
+      if (batch.error == hipSuccess)
+        GatherStreamPool::Instance().ReleaseEvent(batch.device, batch.event);
+      else
+        (void)hipEventDestroy(batch.event);
+    }
+    if (batch.error == hipSuccess && selected == hipSuccess) {
+      GatherStreamPool::Instance().Release(batch.device, batch.stream);
+    } else {
+      // A confirmed failed stream is retired instead of reused.
+      if (selected == hipSuccess) (void)hipStreamDestroy(batch.stream);
+      GatherStreamPool::Instance().Discard(batch.device);
+    }
+    batch.event = nullptr;
+    batch.stream = nullptr;
+  }
+
+  std::mutex mutex_;
+  std::vector<Batch> batches_;
+  std::vector<TransferFailure> failures_;
+  bool waited_ = false;
+  bool has_failure_ = false;
 };
 
 }  // namespace
@@ -443,7 +596,7 @@ void HbmCopyEngine::Prewarm(size_t gather_streams_per_device) {
   const bool gather = !GatherDisabled().load(std::memory_order_relaxed) && DeviceGatherEnabled();
   int previous_device = 0;
   (void)hipGetDevice(&previous_device);
-  if (gather) GatherStreamPool::Instance().SetCap(gather_streams_per_device);
+  GatherStreamPool::Instance().SetCap(gather_streams_per_device);
   size_t warmed = 0;
   for (int device_id = 0; device_id < devices; ++device_id) {
     if (hipSetDevice(device_id) != hipSuccess) {
@@ -455,31 +608,52 @@ void HbmCopyEngine::Prewarm(size_t gather_streams_per_device) {
     // of its own: with the pool capped, these are the engines a copy can ever
     // be given, and their queues are the only SDMA queues created.
     std::vector<hipStream_t> streams;
-    for (size_t i = 0; gather && i < gather_streams_per_device; ++i) {
+    streams.reserve(gather_streams_per_device);
+    std::vector<hipEvent_t> events(gather_streams_per_device, nullptr);
+    for (size_t i = 0; i < gather_streams_per_device; ++i) {
       hipStream_t stream = GatherStreamPool::Instance().Acquire(device_id);
       if (stream == nullptr) break;
       streams.push_back(stream);
-      (void)PrewarmDeviceGather(device_id, stream, kPrewarmGatherFragments);
+      if (gather) (void)PrewarmDeviceGather(device_id, stream, kPrewarmGatherFragments);
     }
     void* host_bytes = nullptr;
     void* device_bytes = nullptr;
     if (hipHostMalloc(&host_bytes, kPrewarmCopyBytes, hipHostMallocDefault) == hipSuccess &&
-        hipMalloc(&device_bytes, kPrewarmCopyBytes) == hipSuccess) {
+        hipMalloc(&device_bytes, 2 * kPrewarmCopyBytes) == hipSuccess) {
       // The hipMemcpy fallback runs on the null stream.
       (void)hipMemcpy(device_bytes, host_bytes, kPrewarmCopyBytes, hipMemcpyHostToDevice);
       (void)hipMemcpy(host_bytes, device_bytes, kPrewarmCopyBytes, hipMemcpyDeviceToHost);
+      // Warm each borrowed stream's D2D queue and completion event as well as
+      // the old null-stream host/device path.
+      const size_t chunk_bytes = kPrewarmCopyBytes / std::max<size_t>(streams.size(), 1);
+      for (size_t i = 0; i < streams.size(); ++i) {
+        (void)hipMemcpyAsync(static_cast<char*>(device_bytes) + kPrewarmCopyBytes + i * chunk_bytes,
+                             static_cast<char*>(device_bytes) + i * chunk_bytes, chunk_bytes,
+                             hipMemcpyDeviceToDevice, streams[i]);
+        events[i] = GatherStreamPool::Instance().AcquireEvent(device_id);
+        if (events[i] != nullptr) (void)hipEventRecord(events[i], streams[i]);
+      }
     }
-    for (hipStream_t stream : streams) {
+    bool drained = true;
+    for (size_t i = 0; i < streams.size(); ++i) {
+      hipStream_t stream = streams[i];
       if (hipStreamSynchronize(stream) == hipSuccess) {
+        if (events[i] != nullptr) GatherStreamPool::Instance().ReleaseEvent(device_id, events[i]);
         GatherStreamPool::Instance().Release(device_id, stream);
         ++warmed;
       } else {
+        drained = false;
         (void)hipGetLastError();
         GatherStreamPool::Instance().Discard(device_id);
       }
     }
-    if (device_bytes != nullptr) (void)hipFree(device_bytes);
-    if (host_bytes != nullptr) (void)hipHostFree(host_bytes);
+    if (drained) {
+      if (device_bytes != nullptr) (void)hipFree(device_bytes);
+      if (host_bytes != nullptr) (void)hipHostFree(host_bytes);
+    } else {
+      MORI_UMBP_ERROR("[HbmCopyEngine] prewarm drain dev={} unconfirmed; retaining allocations",
+                      device_id);
+    }
     (void)hipGetLastError();
   }
   (void)hipSetDevice(previous_device);
@@ -534,7 +708,8 @@ const char* HbmCopyEngine::GatherSkipName(GatherSkip reason) {
 }
 
 std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferPlan>& plans,
-                                                     std::vector<GatherSkip>* skip_reasons) {
+                                                     std::vector<GatherSkip>* skip_reasons,
+                                                     std::vector<TransferFailure>* failures) {
   std::vector<char> done(plans.size(), 0);
   if (skip_reasons != nullptr) skip_reasons->assign(plans.size(), GatherSkip::kUnrecorded);
   // Submit passes nullptr unless debug mode is on, so the hot path pays one
@@ -646,7 +821,7 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       note_bucket(GatherSkip::kSetDeviceFailed);
       continue;
     }
-    hipStream_t stream = GatherStreamPool::Instance().Acquire(device_id);
+    hipStream_t stream = GatherStreamPool::Instance().Acquire(device_id, false);
     if (stream == nullptr) {
       note_bucket(GatherSkip::kNoStream);
       continue;
@@ -656,22 +831,34 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     // -- so the interval is the kernel's real cost, and enabling debug does not
     // perturb what is being measured.
     const auto started = std::chrono::steady_clock::now();
-    if (!LaunchDeviceGather(bucket.fragments.data(), bucket.fragments.size(), device_id, stream)) {
-      GatherStreamPool::Instance().Release(device_id, stream);
-      note_bucket(GatherSkip::kLaunchFailed);
-      continue;
-    }
+    const bool launched =
+        LaunchDeviceGather(bucket.fragments.data(), bucket.fragments.size(), device_id, stream);
+    // A false launch result can still follow an async descriptor upload or a
+    // partially posted kernel. Drain it before fallback, just as a sync error.
     const hipError_t sync = hipStreamSynchronize(stream);
-    if (sync != hipSuccess) {
+    if (!launched || sync != hipSuccess) {
       // Latch off: a kernel that cannot complete here will not start working
       // later, and every caller still has the fallback.  The stream is dropped
       // rather than returned to the pool.
+      const bool drained = sync == hipSuccess || hipStreamSynchronize(stream) == hipSuccess;
       (void)hipGetLastError();
       GatherStreamPool::Instance().Discard(device_id);
       GatherDisabled().store(true, std::memory_order_relaxed);
-      MORI_UMBP_ERROR("[HbmCopyEngine] gather sync dev={} failed: {}", device_id,
-                      hipGetErrorString(sync));
-      note_bucket(GatherSkip::kSyncFailed);
+      if (drained) {
+        (void)hipStreamDestroy(stream);
+      } else {
+        // An unconfirmed kernel can still touch all plans in its bucket.
+        // Retain backing memory and prevent a racing fallback rewrite.
+        for (size_t p : bucket.plan_indices) {
+          done[p] = -1;
+          failures->push_back(TransferFailure{plans[p].tags, static_cast<uint32_t>(sync),
+                                              "gather drain unconfirmed",
+                                              "hbm:dev" + std::to_string(device_id), true});
+        }
+      }
+      MORI_UMBP_ERROR("[HbmCopyEngine] gather dev={} failed (launched={} drained={}): {}",
+                      device_id, launched, drained, hipGetErrorString(sync));
+      note_bucket(launched ? GatherSkip::kSyncFailed : GatherSkip::kLaunchFailed);
       continue;
     }
     GatherStreamPool::Instance().Release(device_id, stream);
@@ -716,14 +903,20 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
   }
   const bool debug = DebugEnabled();
   std::vector<GatherSkip> skips;
-  const std::vector<char> gathered = GatherEligiblePlans(plans, debug ? &skips : nullptr);
+  const std::vector<char> gathered =
+      GatherEligiblePlans(plans, debug ? &skips : nullptr, &failures);
   // The pass may have left the current device anywhere.
   current_device = -1;
 
+  std::map<int, std::vector<size_t>> d2d_buckets;
   for (size_t plan_index = 0; plan_index < plans.size(); ++plan_index) {
     const auto& plan = plans[plan_index];
     if (gathered[plan_index] != 0) continue;
     const int want_device = DeviceFor(plan);
+    if (KindFor(plan.src, plan.dst) == hipMemcpyDeviceToDevice) {
+      d2d_buckets[want_device >= 0 ? want_device : entry_device].push_back(plan_index);
+      continue;
+    }
     if (want_device >= 0 && want_device != current_device) {
       if (!device_touched) {
         if (hipGetDevice(&entry_device) != hipSuccess) entry_device = -1;
@@ -782,13 +975,91 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
     }
   }
 
+  if (d2d_buckets.empty()) {
+    if (device_touched && entry_device >= 0) (void)hipSetDevice(entry_device);
+    return std::make_unique<SettledHandle>(std::move(failures));
+  }
+
+  auto handle = std::make_unique<DeviceCopyHandle>(std::move(failures));
+  auto& batches = handle->Batches();
+  batches.reserve(d2d_buckets.size());
+  // Allocate bookkeeping before launching the first asynchronous copy.
+  for (const auto& [device_id, indices] : d2d_buckets) {
+    batches.emplace_back();
+    auto& batch = batches.back();
+    batch.device = device_id;
+    for (size_t p : indices)
+      batch.tags.insert(batch.tags.end(), plans[p].tags.begin(), plans[p].tags.end());
+  }
+  size_t batch_index = 0;
+  for (const auto& [device_id, indices] : d2d_buckets) {
+    auto& batch = batches[batch_index++];
+    batch.error = device_id >= 0 ? hipSetDevice(device_id) : hipErrorInvalidDevice;
+    if (batch.error != hipSuccess) {
+      batch.operation = "hipSetDevice";
+      continue;
+    }
+    batch.stream = GatherStreamPool::Instance().Acquire(device_id, false);
+    if (batch.stream == nullptr) {
+      batch.error = hipErrorOutOfMemory;
+      batch.operation = "D2D stream pool capacity/create";
+      continue;
+    }
+    batch.event = GatherStreamPool::Instance().AcquireEvent(device_id);
+    if (batch.event == nullptr) {
+      batch.error = hipErrorOutOfMemory;
+      batch.operation = "D2D completion event create";
+      continue;
+    }
+  }
+  // Finish all allocation and diagnostic work before enqueuing the first
+  // copy, so a C++ allocation exception cannot strand another device's batch.
+  if (debug) {
+    for (const auto& [device_id, indices] : d2d_buckets)
+      for (size_t p : indices)
+        if (DebugSampleThisCall()) LogPlanGeometry("D2D-async", p, plans[p], device_id);
+  }
+  batch_index = 0;
+  for (const auto& [device_id, indices] : d2d_buckets) {
+    auto& batch = batches[batch_index++];
+    if (batch.error != hipSuccess) continue;
+    batch.error = hipSetDevice(device_id);
+    if (batch.error != hipSuccess) {
+      batch.operation = "hipSetDevice";
+      continue;
+    }
+    for (size_t p : indices) {
+      const auto& plan = plans[p];
+      char* dst = static_cast<char*>(plan.dst.host_ptr);
+      const char* src = static_cast<const char*>(plan.src.host_ptr);
+      for (size_t i = 0; i < plan.sizes.size(); ++i) {
+        if (plan.sizes[i] == 0) continue;
+        // Even a failed HIP API may have enqueued work before reporting its
+        // error, so destruction must drain after the first attempted enqueue.
+        batch.submitted = true;
+        batch.error = hipMemcpyAsync(dst + plan.dst_offsets[i], src + plan.src_offsets[i],
+                                     plan.sizes[i], hipMemcpyDeviceToDevice, batch.stream);
+        if (batch.error != hipSuccess) break;
+      }
+      if (batch.error != hipSuccess) break;
+    }
+    if (batch.error != hipSuccess) continue;
+    batch.submitted = true;
+    batch.error = hipEventRecord(batch.event, batch.stream);
+    if (batch.error != hipSuccess) {
+      batch.operation = "hipEventRecord";
+    } else {
+      batch.recorded = true;
+    }
+  }
+
   if (device_touched && entry_device >= 0) {
     // Best effort: a failure here cannot be attributed to any one plan, and the
-    // transfers themselves already settled.
+    // queued batches remain owned by the returned handle.
     (void)hipSetDevice(entry_device);
   }
 
-  return std::make_unique<SettledHandle>(std::move(failures));
+  return handle;
 }
 
 }  // namespace mori::umbp

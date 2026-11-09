@@ -73,6 +73,12 @@ class DistributedClient : public IUMBPClient {
                                    const std::vector<std::vector<uintptr_t>>& dsts,
                                    const std::vector<std::vector<size_t>>& sizes,
                                    const std::vector<std::vector<size_t>>& src_offsets) override;
+  // Submit direct reads into registered GPU ranges. Keep destination allocations
+  // alive through handle->Wait(); WaitOnStream only installs GPU readiness.
+  std::shared_ptr<PoolClient::KvReadHandle> SubmitBatchGetRangesGpuDirect(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets);
   std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
                                    const std::vector<size_t>& object_sizes,
                                    const std::vector<std::vector<uintptr_t>>& srcs,
@@ -106,6 +112,8 @@ class DistributedClient : public IUMBPClient {
                       int device = -1,
                       MemoryRegistration mode = MemoryRegistration::kPinned) override;
   void DeregisterMemory(uintptr_t ptr) override;
+  bool HasQuarantinedTransfers() const override;
+  void QuarantineTransfers() override;
 
   bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;
   bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;
@@ -146,6 +154,7 @@ class DistributedClient : public IUMBPClient {
   std::atomic<bool> closing_{false};
   mutable std::shared_mutex op_mutex_;
   bool closed_ = false;
+  std::atomic<bool> quarantined_{false};
 };
 
 }  // namespace mori::umbp

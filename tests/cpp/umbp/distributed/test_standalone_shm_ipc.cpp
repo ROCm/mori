@@ -35,6 +35,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -48,6 +49,134 @@
 
 namespace mori::umbp {
 namespace {
+
+// Exercise the worker's uncertainty contract without requiring a GPU or a
+// real shared-memory importer. Simulated registration still records exported
+// ranges, while this service controls transfer/deregistration replies.
+class QuarantineReplyService final : public ::umbp::UMBPStandalone::Service {
+ public:
+  enum class Reply { kFlagged, kLost, kDeregisterRejected };
+  explicit QuarantineReplyService(Reply reply) : reply_(reply) {}
+  std::atomic<int> data_calls{0};
+  std::atomic<int> deregister_calls{0};
+
+  grpc::Status Ping(grpc::ServerContext*, const ::umbp::Empty*,
+                    ::umbp::PingResponse* response) override {
+    response->set_ready(true);
+    response->set_simulation(true);
+    response->set_deployment_mode(::umbp::STANDALONE_BACKEND_DISTRIBUTED);
+    response->set_supports_ranged_io(true);
+    return grpc::Status::OK;
+  }
+  grpc::Status RegisterMemory(grpc::ServerContext*, const ::umbp::RegisterMemoryRequest*,
+                              ::umbp::BoolResponse* response) override {
+    response->set_ok(true);
+    return grpc::Status::OK;
+  }
+  grpc::Status Get(grpc::ServerContext*, const ::umbp::GetRequest*,
+                   ::umbp::BoolResponse* response) override {
+    ++data_calls;
+    if (reply_ == Reply::kLost)
+      return {grpc::StatusCode::UNAVAILABLE, "reply lost after admission"};
+    response->set_ok(false);
+    response->set_resources_quarantined(true);
+    return grpc::Status::OK;
+  }
+  grpc::Status BatchGetRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
+                              ::umbp::BatchBoolResponse* response) override {
+    ++data_calls;
+    for (int i = 0; i < request->range_counts_size(); ++i) response->add_ok(false);
+    response->set_resources_quarantined(true);
+    return grpc::Status::OK;
+  }
+  grpc::Status DeregisterMemory(grpc::ServerContext*, const ::umbp::DeregisterMemoryRequest*,
+                                ::umbp::Empty*) override {
+    ++deregister_calls;
+    if (reply_ == Reply::kDeregisterRejected)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "backend drain unconfirmed"};
+    return grpc::Status::OK;
+  }
+
+ private:
+  Reply reply_;
+};
+
+class QuarantineRpcServer {
+ public:
+  explicit QuarantineRpcServer(QuarantineReplyService::Reply reply) : service(reply) {
+    grpc::ServerBuilder builder;
+    int port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(&service);
+    server_ = builder.BuildAndStart();
+    address_ = "127.0.0.1:" + std::to_string(port);
+  }
+  ~QuarantineRpcServer() {
+    if (server_) server_->Shutdown();
+  }
+  std::unique_ptr<IUMBPClient> MakeClient() {
+    if (!server_) return nullptr;
+    UMBPConfig config;
+    config.sim.enabled = true;
+    UMBPStandaloneProcessConfig process;
+    process.address = address_;
+    process.startup_timeout_ms = 1000;
+    config.standalone_process = process;
+    return CreateUMBPClient(config);
+  }
+  QuarantineReplyService service;
+
+ private:
+  std::string address_;
+  std::unique_ptr<grpc::Server> server_;
+};
+
+TEST(StandaloneQuarantineTest, FlaggedRangedReplyRetainsRegistrationsAndBlocksNewIo) {
+  QuarantineRpcServer server(QuarantineReplyService::Reply::kFlagged);
+  auto client = server.MakeClient();
+  ASSERT_NE(client, nullptr);
+  std::vector<unsigned char> bytes(64);
+  const auto ptr = reinterpret_cast<uintptr_t>(bytes.data());
+  ASSERT_TRUE(client->RegisterMemory(ptr, bytes.size()));
+  EXPECT_EQ(client->BatchGetRanges({"key"}, {{ptr}}, {{16}}, {{0}}), std::vector<bool>({false}));
+  EXPECT_TRUE(client->HasQuarantinedTransfers());
+  EXPECT_THROW(client->DeregisterMemory(ptr), std::runtime_error);
+  EXPECT_EQ(server.service.deregister_calls.load(), 0);
+  EXPECT_FALSE(client->Get("key", ptr, 16));
+  EXPECT_EQ(server.service.data_calls.load(), 1);
+  EXPECT_FALSE(client->RegisterMemory(ptr, bytes.size()));
+  client->Close();
+  EXPECT_TRUE(client->HasQuarantinedTransfers());
+  EXPECT_EQ(server.service.deregister_calls.load(), 0);
+}
+
+TEST(StandaloneQuarantineTest, LostTransferReplyConservativelyRetainsExportedMemory) {
+  QuarantineRpcServer server(QuarantineReplyService::Reply::kLost);
+  auto client = server.MakeClient();
+  ASSERT_NE(client, nullptr);
+  std::vector<unsigned char> bytes(64);
+  const auto ptr = reinterpret_cast<uintptr_t>(bytes.data());
+  ASSERT_TRUE(client->RegisterMemory(ptr, bytes.size()));
+  EXPECT_FALSE(client->Get("key", ptr, 16));
+  EXPECT_TRUE(client->HasQuarantinedTransfers());
+  EXPECT_THROW(client->DeregisterMemory(ptr), std::runtime_error);
+  client->Close();
+  EXPECT_EQ(server.service.deregister_calls.load(), 0);
+}
+
+TEST(StandaloneQuarantineTest, RejectedDeregisterReplyKeepsStickyQuarantine) {
+  QuarantineRpcServer server(QuarantineReplyService::Reply::kDeregisterRejected);
+  auto client = server.MakeClient();
+  ASSERT_NE(client, nullptr);
+  std::vector<unsigned char> bytes(64);
+  const auto ptr = reinterpret_cast<uintptr_t>(bytes.data());
+  ASSERT_TRUE(client->RegisterMemory(ptr, bytes.size()));
+  EXPECT_THROW(client->DeregisterMemory(ptr), std::runtime_error);
+  EXPECT_TRUE(client->HasQuarantinedTransfers());
+  EXPECT_THROW(client->DeregisterMemory(ptr), std::runtime_error);
+  client->Close();
+  EXPECT_EQ(server.service.deregister_calls.load(), 1);
+}
 
 TEST(StandaloneShmIpcTest, AnonymousShmRegistryLookupMapsSameMemory) {
   HostMemAllocator allocator;

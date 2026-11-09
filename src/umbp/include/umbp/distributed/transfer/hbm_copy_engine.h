@@ -109,31 +109,27 @@ class HbmCopyEngine final : public TransferEngine {
   // launch cost); a segment never crosses a host registration piece.
   std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
-  // Performs the copies inline; the returned handle is already settled.
-  //
-  // Synchronous hipMemcpy, deliberately, matching LocalCopyEngine's contract
-  // that a local transfer costs no round trip.  An async/stream variant would
-  // overlap the segments within one plan, but the parallelism that actually
-  // matters here is ACROSS keys and already exists above this engine, in
-  // PoolClient's UMBP_DRAM_{READ,WRITE}_THREADS executors.  A shared stream
-  // would also need its own synchronization, since Submit is called from those
-  // worker threads concurrently — cost with no matching win at KV-block sizes,
-  // where a multi-MiB copy dwarfs the per-call launch overhead.
+  // D2D plans are batched per device on exclusively borrowed streams and
+  // return an event-backed handle. Host/device gather and fallback copies
+  // complete inline. Wait/handle destruction drains every queued D2D batch;
+  // WaitOnStream installs a GPU dependency while the caller retains memory.
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
 
   // Gather streams created since process start, across all engines.  They are
   // pooled per device and outlive the thread that first used them, so this
-  // tracks the peak number of gathers in flight at once, not the number of
+  // tracks peak gathers and D2D batches in flight at once, not the number of
   // threads that have called Submit.  Lets a test assert the reuse.
   static uint64_t GatherStreamsCreated();
 
-  // Creates `gather_streams_per_device` gather streams on every GPU, runs an
-  // empty gather on each and a hipMemcpy each way on the null stream, so that
+  // Creates `gather_streams_per_device` copy streams on every GPU, runs an
+  // empty gather when enabled, a D2D copy and completion event on each stream,
+  // and a hipMemcpy each way on the null stream, so that
   // the hardware queues (compute, and SDMA for each copy engine those copies
   // are given), descriptor staging and kernel code object that copies would
   // otherwise create on first use already exist.  It also caps each device at
-  // that many gather streams, so that later gathers wait for one rather than
-  // create more.  Call it before serving.  Creating a hardware queue migrates
+  // that many streams. At capacity, host/device plans use their inline copy
+  // fallback and D2D Submit returns a capacity error, allowing callers to wait
+  // or throttle earlier handles. Call it before serving. A hardware queue migrates
   // its context-save area into VRAM, and with the GPU nearly full, as it is
   // next to an inference server, that has been seen to stall the whole process
   // for 30-46 s at a time (amdgpu 6.16); so has loading the kernel's code
@@ -166,14 +162,15 @@ class HbmCopyEngine final : public TransferEngine {
 
   // Run the gather kernel over the batch's eligible segments, bucketed by
   // device.  Returns a per-plan flag: 1 means fully copied by the kernel, 0
-  // means "not taken" and never "failed" — Submit then runs its hipMemcpy loop
-  // for it, which reaches the same result whether or not fragments landed.
+  // means "not taken"; -1 means a failed, unconfirmed drain, for which Submit
+  // must retain memory and must not enqueue a fallback copy.
   // May leave the current HIP device changed.
   //
   // `skip_reasons`, when non-null, is resized to plans.size() and filled with
   // the per-plan verdict.  Submit passes it only in debug mode.
   std::vector<char> GatherEligiblePlans(const std::vector<TransferPlan>& plans,
-                                        std::vector<GatherSkip>* skip_reasons);
+                                        std::vector<GatherSkip>* skip_reasons,
+                                        std::vector<TransferFailure>* failures);
 
   // The address `device_id` must use to reach `ptr`, or null when no registered
   // region covers it or that device cannot gather from the one that does.

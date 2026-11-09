@@ -64,3 +64,30 @@ extern "C" __global__ void fabricCopyKernel(char* __restrict__ dst, const char* 
     }
   }
 }
+
+struct FabricCopySegment {
+  const char* src;
+  char* dst;
+  size_t size;
+};
+
+// A CTA owns one independent segment. Multiple CTAs per segment hide remote
+// load latency; grid-stride work handles arbitrary lengths and scalar tails.
+extern "C" __global__ void fabricBatchCopyKernel(const FabricCopySegment* segments, size_t count,
+                                                 unsigned blocksPerSegment) {
+  const size_t segment = blockIdx.x / blocksPerSegment;
+  if (segment >= count) return;
+  const auto item = segments[segment];
+  const size_t tid = (blockIdx.x % blocksPerSegment) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(blocksPerSegment) * blockDim.x;
+  if ((reinterpret_cast<uintptr_t>(item.src) & 15) == 0 &&
+      (reinterpret_cast<uintptr_t>(item.dst) & 15) == 0) {
+    const size_t vectors = item.size / 16;
+    const auto* src = reinterpret_cast<const uint4*>(item.src);
+    auto* dst = reinterpret_cast<uint4*>(item.dst);
+    for (size_t i = tid; i < vectors; i += stride) dst[i] = src[i];
+    for (size_t i = vectors * 16 + tid; i < item.size; i += stride) item.dst[i] = item.src[i];
+  } else {
+    for (size_t i = tid; i < item.size; i += stride) item.dst[i] = item.src[i];
+  }
+}

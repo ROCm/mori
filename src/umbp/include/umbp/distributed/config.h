@@ -197,6 +197,7 @@ struct HbmOwnershipConfig {
   // whichever thread allocates first (see HbmPageMemorySource).
   int device = 0;
   std::vector<uint64_t> buffer_sizes;
+  UMBPHbmAllocation allocation = UMBPHbmAllocation::kHipMalloc;
 };
 
 // SSD-tier construction parameters lowered from the user-facing UMBPConfig.
@@ -261,6 +262,10 @@ struct PoolClientConfig {
   UMBPSimConfig sim;
   UMBPMasterClientConfig master_config;
   UMBPIoEngineConfig io_engine;
+  UMBPKvPutPlacement kv_put_placement = UMBPKvPutPlacement::kMaster;
+  UMBPKvRangedPath kv_ranged_path = UMBPKvRangedPath::kLegacy;
+  size_t kv_max_inflight_reads = 32;
+  size_t kv_max_inflight_bytes = 256ULL * 1024 * 1024;
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;
 
@@ -411,6 +416,10 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   PoolClientConfig pc;
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
+  pc.kv_put_placement = dc.kv_put_placement;
+  pc.kv_ranged_path = dc.kv_ranged_path;
+  pc.kv_max_inflight_reads = dc.kv_max_inflight_reads;
+  pc.kv_max_inflight_bytes = dc.kv_max_inflight_bytes;
   pc.staging_buffer_size = dc.staging_buffer_size;
   // The ranged scratch buffers/sizes are set by DistributedClient after it
   // allocates and registers the two arenas (see DistributedClient ctor).
@@ -441,6 +450,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   // hipMalloc'd memory), so it can be lowered directly here instead of via a
   // caller-supplied parameter.
   pc.hbm.device = dc.hbm.device;
+  pc.hbm.allocation = dc.hbm.allocation;
   if (dc.hbm.capacity_bytes > 0) pc.hbm.buffer_sizes = {dc.hbm.capacity_bytes};
   pc.local_evict_high_watermark = dram_high_watermark;
   pc.local_evict_low_watermark = dram_low_watermark;

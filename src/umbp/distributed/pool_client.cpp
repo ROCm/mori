@@ -36,6 +36,8 @@
 #include <map>
 #include <msgpack.hpp>
 #include <numeric>
+#include <random>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -89,6 +91,110 @@ size_t RangedScratchShardsFromEnv() {
 }
 
 namespace {
+
+// A release has no lease deadline: a lost release retains memory on the owner
+// rather than allowing recycling while a remote GPU may still be reading it.
+struct RemoteReadPin {
+  std::shared_ptr<void> stub;
+  std::string incarnation;
+  uint64_t token = 0;
+  ~RemoteReadPin() {
+    if (!stub || token == 0) return;
+    ::umbp::BatchReleaseReadPinsRequest req;
+    req.add_read_pin_tokens(token);
+    req.set_expected_owner_incarnation(incarnation);
+    for (int attempt = 0; attempt != 2; ++attempt) {
+      grpc::ClientContext ctx;
+      ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+      ::umbp::BatchReleaseReadPinsResponse resp;
+      auto status =
+          static_cast<::umbp::UMBPPeer::Stub*>(stub.get())->BatchReleaseReadPins(&ctx, req, &resp);
+      if (status.ok() && resp.success_size() == 1 && resp.success(0)) return;
+      if (status.error_code() == grpc::StatusCode::FAILED_PRECONDITION) return;
+    }
+    MORI_UMBP_ERROR("[PoolClient] read pin {} release was not acknowledged; owner retains it",
+                    token);
+  }
+};
+
+template <typename T>
+void Quarantine(std::shared_ptr<T> resource) {
+  if (resource) (void)new std::shared_ptr<T>(std::move(resource));
+}
+
+bool UnconfirmedDrain(const std::vector<TransferFailure>& failures) {
+  return std::any_of(failures.begin(), failures.end(),
+                     [](const auto& f) { return f.resources_quarantined; });
+}
+
+void AbortRemoteSlots(::umbp::UMBPPeer::Stub* stub, const std::vector<uint64_t>& slots,
+                      const std::unordered_map<uint64_t, std::string>& operations,
+                      const std::string& incarnation) {
+  ::umbp::BatchAbortSlotsRequest legacy;
+  ::umbp::BatchAbortProtectedSlotsRequest protected_req;
+  protected_req.set_expected_owner_incarnation(incarnation);
+  for (uint64_t slot : slots) {
+    auto op = operations.find(slot);
+    if (op == operations.end() || op->second.empty()) {
+      legacy.add_slot_ids(slot);
+      continue;
+    }
+    auto* entry = protected_req.add_entries();
+    entry->set_slot_id(slot);
+    entry->set_operation_id(op->second);
+    entry->set_transfer_drained(true);
+  }
+  if (protected_req.entries_size()) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+    ::umbp::BatchAbortProtectedSlotsResponse resp;
+    auto status = stub->BatchAbortProtectedSlots(&ctx, protected_req, &resp);
+    if (!status.ok())
+      MORI_UMBP_ERROR("[PoolClient] protected abort unacknowledged; owner retains slots: {}",
+                      status.error_message());
+  }
+  if (legacy.slot_ids_size()) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+    ::umbp::BatchAbortSlotsResponse resp;
+    (void)stub->BatchAbortSlots(&ctx, legacy, &resp);
+  }
+}
+
+void AbandonRemoteReads(::umbp::UMBPPeer::Stub* stub, const std::string& operation,
+                        const std::string& incarnation) {
+  ::umbp::BatchReleaseReadPinsRequest req;
+  req.set_expected_owner_incarnation(incarnation);
+  req.add_abandoned_operation_ids(operation);
+  req.set_no_gpu_work_submitted(true);
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+  ::umbp::BatchReleaseReadPinsResponse resp;
+  auto status = stub->BatchReleaseReadPins(&ctx, req, &resp);
+  if (!status.ok())
+    MORI_UMBP_WARN("[PoolClient] abandoned read {} not acknowledged: {}", operation,
+                   status.error_message());
+}
+
+void AbandonRemoteWrites(::umbp::UMBPPeer::Stub* stub,
+                         const ::umbp::BatchAllocateSlotsRequest& allocation) {
+  ::umbp::BatchAbortProtectedSlotsRequest req;
+  req.set_expected_owner_incarnation(allocation.expected_owner_incarnation());
+  for (const auto& ask : allocation.entries()) {
+    if (ask.operation_id().empty()) continue;
+    auto* entry = req.add_entries();
+    entry->set_operation_id(ask.operation_id());
+    entry->set_no_gpu_work_submitted(true);
+  }
+  if (!req.entries_size()) return;
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+  ::umbp::BatchAbortProtectedSlotsResponse resp;
+  auto status = stub->BatchAbortProtectedSlots(&ctx, req, &resp);
+  if (!status.ok())
+    MORI_UMBP_WARN("[PoolClient] abandoned reservations not acknowledged: {}",
+                   status.error_message());
+}
 
 // ---------------------------------------------------------------------------
 //  Bandwidth metrics
@@ -839,12 +945,131 @@ std::unique_ptr<PoolPolicy> MakeConfiguredPoolPolicy(
 
 PoolClient::PoolClient(PoolClientConfig config, std::shared_ptr<PoolPlatform> platform)
     : config_(std::move(config)),
-      platform_(platform ? std::move(platform) : MakePoolPlatform(config_.sim)) {}
+      platform_(platform ? std::move(platform) : MakePoolPlatform(config_.sim)) {
+  std::random_device random;
+  std::ostringstream identity;
+  identity << std::hex << random() << random() << random() << random();
+  operation_client_id_ = identity.str();
+}
 PoolClient::~PoolClient() { Shutdown(); }
 
+std::string PoolClient::NewOperationId() {
+  return operation_client_id_ + ":" + std::to_string(next_operation_.fetch_add(1));
+}
+
+void PoolClient::QuarantineGpuResources() {
+  gpu_quarantined_ = true;
+  for (auto* backend : registry_.All()) backend->QuarantineBackingMemory();
+}
+
+void PoolClient::QuarantineTransfers() {
+  std::shared_lock<std::shared_mutex> lifecycle_guard(async_read_mutex_);
+  QuarantineGpuResources();
+}
+
+bool PoolClient::TransferWithDrain(const std::vector<TransferItem>& items,
+                                   std::vector<size_t>* failed_tags,
+                                   const TransferEngine::StepTiming* timing) {
+  std::vector<size_t> rejected;
+  TransferPlanSet planned;
+  {
+    PhaseTimer timer(timing ? timing->plan : nullptr);
+    planned = transfer_engine_->Plan(items);
+  }
+  rejected = planned.rejected_tags;
+  std::unique_ptr<TransferHandle> handle;
+  const bool has_plans = !planned.plans.empty();
+  {
+    PhaseTimer timer(timing ? timing->submit : nullptr);
+    if (has_plans) {
+      try {
+        handle = transfer_engine_->Submit(std::move(planned.plans));
+      } catch (...) {
+        // Submit may have posted work before throwing and provides no handle
+        // with which to prove its completion. Preserve every referenced pool
+        // allocation rather than allowing exception cleanup to recycle it.
+        QuarantineGpuResources();
+        throw;
+      }
+    }
+  }
+  std::vector<TransferFailure> failures;
+  {
+    PhaseTimer timer(timing ? timing->wait : nullptr);
+    if (handle) handle->Wait(&failures);
+  }
+  if (has_plans && !handle)
+    for (const auto& item : items) rejected.push_back(item.tag);
+  for (const auto& failure : failures)
+    rejected.insert(rejected.end(), failure.tags.begin(), failure.tags.end());
+  if (UnconfirmedDrain(failures)) {
+    QuarantineGpuResources();
+    if (handle) (void)handle.release();
+  }
+  if (failed_tags) {
+    std::sort(rejected.begin(), rejected.end());
+    rejected.erase(std::unique(rejected.begin(), rejected.end()), rejected.end());
+    *failed_tags = rejected;
+  }
+  return rejected.empty() && (!has_plans || handle != nullptr) && !gpu_quarantined_;
+}
+
+void PoolClient::AbortLocalSlots(const std::vector<PoolSlotRef>& slots,
+                                 const LocalSlotOperations& operations) {
+  if (gpu_quarantined_ || !default_pool_) return;
+  std::vector<PoolSlotRef> legacy;
+  std::vector<PoolProtectedAbortRequest> protected_slots;
+  for (const auto& slot : slots) {
+    auto found = operations.find({slot.backend_id, slot.local_slot_id});
+    if (found == operations.end() || found->second.empty())
+      legacy.push_back(slot);
+    else
+      protected_slots.push_back({slot, found->second, true});
+  }
+  if (!legacy.empty()) default_pool_->BatchAbort(legacy);
+  if (!protected_slots.empty()) default_pool_->BatchAbortProtected(protected_slots);
+}
+
+PoolClient::RemoteGetInFlight::~RemoteGetInFlight() {
+  if (!drained && handle) {
+    std::vector<TransferFailure> failures;
+    handle->Wait(&failures);
+    quarantined = UnconfirmedDrain(failures);
+  }
+  if (quarantined) {
+    if (owner) owner->QuarantineGpuResources();
+    Quarantine(std::move(read_pin_hold));
+    if (handle) (void)handle.release();
+  }
+}
+
+PoolClient::RemotePutInFlight::~RemotePutInFlight() {
+  if (quarantined) {
+    if (owner) owner->QuarantineGpuResources();
+    if (handle) (void)handle.release();
+    return;
+  }
+  if (drained) return;
+  std::vector<TransferFailure> failures;
+  if (handle) handle->Wait(&failures);
+  if (UnconfirmedDrain(failures)) {
+    if (owner) owner->QuarantineGpuResources();
+    if (handle) (void)handle.release();
+    return;
+  }
+  std::vector<uint64_t> all = abort_slots;
+  for (const auto& entry : entries) all.push_back(entry.slot_id);
+  if (stub) AbortRemoteSlots(stub, all, slot_operations, owner_incarnation);
+}
+
 bool PoolClient::Init() {
+  if (gpu_quarantined_) return false;
   bool expected = false;
   if (!initialized_.compare_exchange_strong(expected, true)) return true;
+  {
+    std::lock_guard<std::mutex> guard(async_handles_mutex_);
+    async_read_blocked_ = false;
+  }
 
   if (config_.workload_trace_path.empty()) {
     if (const char* path = std::getenv("UMBP_WORKLOAD_TRACE_PATH")) {
@@ -954,6 +1179,18 @@ bool PoolClient::Init() {
       backend->Shutdown();
       Shutdown();
       return false;
+    }
+    if (config_.io_engine.mode == UMBPTransferMode::kFabricStrict &&
+        backend->Tier() == TierType::HBM) {
+      for (size_t b = 0; b < backend->BufferCount(); ++b) {
+        if (backend->BufferRef(b).mem.fabricHandle.empty()) {
+          MORI_UMBP_ERROR("[PoolClient] strict FABRIC source pool '{}' buffer {} is not exportable",
+                          backend_config.name, b);
+          backend->Shutdown();
+          Shutdown();
+          return false;
+        }
+      }
     }
     if (!registry_.Register(backend_config.name, std::move(backend))) {
       Shutdown();
@@ -1211,8 +1448,11 @@ bool PoolClient::Init() {
 }
 
 void PoolClient::Shutdown() {
+  std::lock_guard<std::mutex> control_guard(async_control_mutex_);
   if (!initialized_) return;
   initialized_ = false;
+  DrainAsyncReads();
+  std::unique_lock<std::shared_mutex> async_guard(async_read_mutex_);
 
   if (kv_indexer_) {
     for (auto* backend : registry_.All()) backend->SetChangeHook({});
@@ -1268,7 +1508,7 @@ void PoolClient::Shutdown() {
   // hipHostUnregister the gather regions before their backing memory goes
   // away: the medium's buffers die with the registry below, and the scratch
   // arena is caller-owned and freed after Shutdown returns.
-  platform_->ClearHostGatherRegions();
+  if (!gpu_quarantined_) platform_->ClearHostGatherRegions();
 
   // Every backend deregisters its memory through transfer_engine_ inside its
   // own destructor — this MUST run before transfer_engine_ is torn down below.
@@ -1282,11 +1522,17 @@ void PoolClient::Shutdown() {
 
   if (transfer_engine_) {
     std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
-    for (auto& reg : registered_regions_) transfer_engine_->Deregister(reg.ref);
+    if (!gpu_quarantined_)
+      for (auto& reg : registered_regions_) transfer_engine_->Deregister(reg.ref);
     registered_regions_.clear();
   }
   peer_directory_ = nullptr;
-  transfer_engine_.reset();
+  if (gpu_quarantined_) {
+    (void)transfer_engine_.release();
+    Quarantine(platform_);
+  } else {
+    transfer_engine_.reset();
+  }
 
   // Drop the sink before the object it may point at. In the master-backed
   // deployment metric_sink_ aliases master_client_, so leaving it set here
@@ -1392,11 +1638,20 @@ LocalEvictionMetrics PoolClient::LocalEvictionStats() const {
 
 bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocationType loc,
                                 int device, MemoryRegistration mode) {
-  if (!transfer_engine_ && mode == MemoryRegistration::kPinned) {
+  std::lock_guard<std::mutex> control_guard(async_control_mutex_);
+  DrainAsyncReads();
+  ScopeExit admission_resume{[this] {
+    std::lock_guard<std::mutex> guard(async_handles_mutex_);
+    async_read_blocked_ = !initialized_;
+  }};
+  std::unique_lock<std::shared_mutex> async_guard(async_read_mutex_);
+  if (gpu_quarantined_) return false;
+  if (!transfer_engine_ && mode != MemoryRegistration::kLocalCopyOnly) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: transfer engine not available");
     return false;
   }
-  if (ptr == nullptr || size == 0) {
+  if (ptr == nullptr || size == 0 ||
+      size > std::numeric_limits<uintptr_t>::max() - reinterpret_cast<uintptr_t>(ptr)) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: invalid args ptr={}, size={}", ptr, size);
     return false;
   }
@@ -1409,11 +1664,29 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
     // Re-registering the same base with a larger size is not idempotent: the
     // existing registration covers fewer bytes, so FindRegisteredMemory would
     // start rejecting the tail and silently fall back to unregistered bytes.
-    if (size <= reg.size) return true;
-    MORI_UMBP_ERROR(
-        "[PoolClient] RegisterMemory: ptr={} already registered with smaller size {}<{}", ptr,
-        reg.size, size);
-    return false;
+    if (size > reg.size || reg.ref.loc != loc ||
+        (loc == mori::io::MemoryLocationType::GPU && device >= 0 && reg.ref.device != device)) {
+      MORI_UMBP_ERROR("[PoolClient] RegisterMemory: incompatible existing region ptr={}", ptr);
+      return false;
+    }
+    if (mode == MemoryRegistration::kLocalCopyOnly || reg.mode == mode ||
+        (reg.mode == MemoryRegistration::kPinned && mode == MemoryRegistration::kFabricLocal &&
+         reg.ref.HasMemoryDesc() &&
+         (reg.ref.mem.registeredBackendMask & mori::io::BackendBit(mori::io::BackendType::FABRIC))))
+      return true;
+  } else {
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t end = begin + size;
+    const bool overlaps_next =
+        at != registered_regions_.end() && reinterpret_cast<uintptr_t>(at->base) < end;
+    const bool overlaps_previous =
+        at != registered_regions_.begin() &&
+        reinterpret_cast<uintptr_t>(std::prev(at)->base) + std::prev(at)->size > begin;
+    if (overlaps_next || overlaps_previous) {
+      MORI_UMBP_ERROR("[PoolClient] RegisterMemory: overlapping allocation ptr={}, size={}", ptr,
+                      size);
+      return false;
+    }
   }
 
   if (mode == MemoryRegistration::kLocalCopyOnly) {
@@ -1421,7 +1694,7 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
     // local engine selection reads off it, and every engine's Deregister
     // no-ops on a ref without a descriptor.
     TransferRef ref = TransferRef::HostBytes(ptr, size, loc, device);
-    registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref)});
+    registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref), mode});
     return true;
   }
 
@@ -1429,7 +1702,15 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
   // map).  A throw here would propagate out through the pybind boundary; the
   // documented contract is a bool.
   try {
-    TransferRef ref = transfer_engine_->RegisterMemory(ptr, size, loc, device);
+    // Upgrade an earlier local declaration to a transport-capable registration.
+    // Register first, so failure keeps the previously usable region intact.
+    const size_t registered_size =
+        at != registered_regions_.end() && at->base == ptr ? at->size : size;
+    TransferRef ref = mode == MemoryRegistration::kFabricLocal
+                          ? transfer_engine_->RegisterMemoryWithBackends(
+                                ptr, registered_size, loc, device,
+                                mori::io::BackendBit(mori::io::BackendType::FABRIC))
+                          : transfer_engine_->RegisterMemory(ptr, registered_size, loc, device);
     // Validate what came back rather than trusting it. A ref whose location or
     // device disagrees with what the caller allocated would send every later
     // transfer to the wrong engine, and one that covers fewer bytes than asked
@@ -1444,7 +1725,12 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
       return false;
     }
     // Inserted in place rather than appended: lookups binary-search this.
-    registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref)});
+    if (at != registered_regions_.end() && at->base == ptr) {
+      transfer_engine_->Deregister(at->ref);
+      *at = RegisteredRegion{ptr, registered_size, std::move(ref), mode};
+    } else {
+      registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref), mode});
+    }
   } catch (const std::exception& error) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory failed for ptr={}, size={}: {}", ptr, size,
                     error.what());
@@ -1459,6 +1745,18 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
 
 void PoolClient::DeregisterMemory(void* ptr) {
   if (ptr == nullptr) return;
+  std::lock_guard<std::mutex> control_guard(async_control_mutex_);
+  DrainAsyncReads();
+  ScopeExit admission_resume{[this] {
+    std::lock_guard<std::mutex> guard(async_handles_mutex_);
+    async_read_blocked_ = !initialized_;
+  }};
+  if (gpu_quarantined_) {
+    MORI_UMBP_ERROR(
+        "[PoolClient] deregistration refused: GPU drain is unconfirmed; retain allocations");
+    return;
+  }
+  std::unique_lock<std::shared_mutex> async_guard(async_read_mutex_);
   std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
   auto it = std::lower_bound(
       registered_regions_.begin(), registered_regions_.end(), ptr,
@@ -1597,15 +1895,25 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   request.tier = tier;
   request.logical_tier = logical_tier;
   request.preferred_numa_node = PreferredNumaNodeFor(const_cast<void*>(src), size);
+  if (config_.io_engine.mode != UMBPTransferMode::kRdma && tier != TierType::SSD) {
+    request.operation_id = NewOperationId();
+    request.expected_pool_generation = default_pool_->Generation();
+  }
   auto pool_alloc = default_pool_->BatchAllocate({request}).front();
+  const PoolSlotRef reserved_slot{pool_alloc.backend_id, pool_alloc.allocation.slot_id};
+  LocalSlotOperations operations{
+      {{reserved_slot.backend_id, reserved_slot.local_slot_id}, request.operation_id}};
+  ScopeExit cleanup{[&] {
+    if (pool_alloc.allocation.outcome == AllocateOutcome::kSuccessAllocated)
+      AbortLocalSlots({reserved_slot}, operations);
+  }};
   if (pool_alloc.in_flight) return PutAttemptOutcome::kSuccessAlreadyExists;
   auto* backend = registry_.Get(pool_alloc.backend_id);
   // A medium that publishes no buffer endpoints cannot be reached in-process at
   // all; route the key elsewhere rather than allocating a slot we cannot fill.
   if (backend == nullptr || backend->BufferCount() == 0) {
     if (pool_alloc.allocation.outcome == AllocateOutcome::kSuccessAllocated) {
-      default_pool_->BatchAbort(
-          {PoolSlotRef{pool_alloc.backend_id, pool_alloc.allocation.slot_id}});
+      AbortLocalSlots({reserved_slot}, operations);
     }
     MORI_UMBP_WARN("[PoolClient] Local Put: tier={} has no in-process-addressable backend",
                    static_cast<int>(tier));
@@ -1625,15 +1933,17 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   std::vector<TransferItem> items;
   if (!BuildLocalPageTransfers(backend, alloc_res.pages, alloc_res.page_size,
                                const_cast<void*>(src), size, /*to_backend=*/true, &items) ||
-      !transfer_engine_->Transfer(items, /*failed_tags=*/nullptr)) {
-    default_pool_->BatchAbort({PoolSlotRef{pool_alloc.backend_id, alloc_res.slot_id}});
+      !TransferWithDrain(items, /*failed_tags=*/nullptr)) {
+    AbortLocalSlots({reserved_slot}, operations);
     return PutAttemptOutcome::kFatal;
   }
   PoolCommitRequest commit;
   commit.slot = PoolSlotRef{pool_alloc.backend_id, alloc_res.slot_id};
   commit.key = key;
+  commit.operation_id = request.operation_id;
+  commit.transfer_drained = true;
   if (!default_pool_->BatchCommit({commit}).front().commit.success) {
-    default_pool_->BatchAbort({commit.slot});
+    AbortLocalSlots({commit.slot}, operations);
     return PutAttemptOutcome::kFatal;
   }
   CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
@@ -1968,6 +2278,8 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
   // each backend so weighted/logical-tier placement and pending state remain
   // authoritative.
   std::vector<PoolAllocateResult> allocations;
+  std::vector<std::string> operation_ids(requests.size());
+  LocalSlotOperations operations;
   std::vector<MediumBackend*> backend_of(requests.size(), nullptr);
   {
     PhaseTimer alloc_timer(sinks.resolve);
@@ -1979,13 +2291,29 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
       asks.push_back(PoolPlacementRequest{*request.key, request.object_size, request.tier,
                                           /*backend_name=*/{}, request.logical_tier,
                                           preferred_node});
+      if (config_.io_engine.mode != UMBPTransferMode::kRdma && request.tier != TierType::SSD) {
+        asks.back().operation_id = NewOperationId();
+        asks.back().expected_pool_generation = default_pool_->Generation();
+      }
+      operation_ids[asks.size() - 1] = asks.back().operation_id;
     }
     allocations = default_pool_->BatchAllocate(asks);
     allocations.resize(requests.size());
     for (size_t r = 0; r < requests.size(); ++r) {
       backend_of[r] = registry_.Get(allocations[r].backend_id);
+      if (allocations[r].allocation.outcome == AllocateOutcome::kSuccessAllocated)
+        operations[{allocations[r].backend_id, allocations[r].allocation.slot_id}] =
+            operation_ids[r];
     }
   }
+
+  ScopeExit allocation_cleanup{[&] {
+    std::vector<PoolSlotRef> slots;
+    for (const auto& alloc : allocations)
+      if (alloc.allocation.outcome == AllocateOutcome::kSuccessAllocated)
+        slots.push_back({alloc.backend_id, alloc.allocation.slot_id});
+    AbortLocalSlots(slots, operations);
+  }};
 
   struct PendingWrite {
     size_t request_index = 0;
@@ -2038,9 +2366,9 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
   // stay disjoint.
   if (sinks.build != nullptr && sinks.classify != nullptr) *sinks.build -= *sinks.classify;
   if (sinks.items != nullptr) *sinks.items += items.size();
-  auto flush_aborts = [this, &to_abort] {
+  auto flush_aborts = [this, &to_abort, &operations] {
     if (to_abort.empty()) return;
-    default_pool_->BatchAbort(to_abort);
+    AbortLocalSlots(to_abort, operations);
     to_abort.clear();
   };
 
@@ -2050,7 +2378,8 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
   }
 
   std::vector<size_t> failed_tags;
-  transfer_engine_->Transfer(items, &failed_tags, sinks.steps);
+  TransferWithDrain(items, &failed_tags, sinks.steps);
+  if (gpu_quarantined_) return;
   const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
 
   // Commit is still strictly after the transfer, and a slot that fails either
@@ -2064,7 +2393,8 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
       to_abort.push_back(write.slot);
       continue;
     }
-    commits.push_back(PoolCommitRequest{write.slot, *requests[write.request_index].key});
+    commits.push_back(PoolCommitRequest{write.slot, *requests[write.request_index].key,
+                                        operation_ids[write.request_index], true});
     commit_owner.push_back(write.request_index);
   }
 
@@ -2429,7 +2759,7 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
   for (size_t i = 0; i < sizes.size(); ++i) block_sizes[i] = static_cast<uint64_t>(sizes[i]);
   std::vector<std::optional<RoutePutResult>> routes;
   std::unordered_set<std::string> excludes;
-  if (!HasMaster()) {
+  if (!HasMaster() || config_.kv_put_placement == UMBPKvPutPlacement::kOwnerLocal) {
     RouteAllPutsLocally(keys.size(), &routes);
   } else {
     auto status = master_client_->BatchRoutePut(keys, block_sizes, excludes, &routes);
@@ -2539,9 +2869,22 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
       asks.push_back(PoolPlacementRequest{
           *item.key, item.size, item.route.tier, /*backend_name=*/{}, item.route.logical_tier,
           PreferredNumaNodeFor(const_cast<void*>(item.src), item.size)});
+      if (config_.io_engine.mode != UMBPTransferMode::kRdma && item.route.tier != TierType::SSD) {
+        asks.back().operation_id = NewOperationId();
+        asks.back().expected_pool_generation = default_pool_->Generation();
+      }
     }
     auto allocations = default_pool_->BatchAllocate(asks);
     allocations.resize(local.size());
+    LocalSlotOperations operations;
+    std::vector<PoolSlotRef> all_reserved;
+    for (size_t k = 0; k < local.size(); ++k) {
+      if (allocations[k].allocation.outcome != AllocateOutcome::kSuccessAllocated) continue;
+      const PoolSlotRef slot{allocations[k].backend_id, allocations[k].allocation.slot_id};
+      all_reserved.push_back(slot);
+      operations[{slot.backend_id, slot.local_slot_id}] = asks[k].operation_id;
+    }
+    ScopeExit allocation_cleanup{[&] { AbortLocalSlots(all_reserved, operations); }};
 
     // `staged` carries the keys that reached the copy phase; every slot that
     // does not survive placement, copy or commit lands in `to_abort`.
@@ -2579,11 +2922,12 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
       if (BuildLocalPageTransfers(backend_of[k], alloc.pages, alloc.page_size,
                                   const_cast<void*>(item.src), item.size, /*to_backend=*/true,
                                   &items) &&
-          transfer_engine_->Transfer(items, /*failed_tags=*/nullptr)) {
+          TransferWithDrain(items, /*failed_tags=*/nullptr)) {
         copied[k] = 1;
       }
     });
 
+    if (gpu_quarantined_) return;
     std::vector<PoolCommitRequest> commits;
     std::vector<size_t> commit_owner;
     commits.reserve(staged.size());
@@ -2594,7 +2938,7 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
         to_abort.push_back(slot);
         continue;
       }
-      commits.push_back(PoolCommitRequest{slot, *local[k].key});
+      commits.push_back(PoolCommitRequest{slot, *local[k].key, asks[k].operation_id, true});
       commit_owner.push_back(k);
     }
 
@@ -2609,7 +2953,7 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
       (*results)[local[k].index] = PutEntryOutcome::kSucceeded;
       put_bytes += static_cast<double>(local[k].size);
     }
-    if (!to_abort.empty()) default_pool_->BatchAbort(to_abort);
+    if (!to_abort.empty()) AbortLocalSlots(to_abort, operations);
 
     if (put_bytes > 0.0) {
       // One update for the batch rather than two per key; the totals are the
@@ -2682,34 +3026,31 @@ std::unique_ptr<PoolClient::RemotePutInFlight> PoolClient::SubmitRemoteBatchPut(
     fail_all();
     return nullptr;
   }
+  std::unique_lock<std::mutex> peer_guard(peer.conn_mutex);
+  if (config_.io_engine.mode != UMBPTransferMode::kRdma && !peer.completion_pins) {
+    fail_all();
+    return nullptr;
+  }
   auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
 
   auto inflight = std::make_unique<RemotePutInFlight>();
+  inflight->owner = this;
   inflight->peer = &peer;
   inflight->stub = stub;
+  inflight->stub_hold = peer.peer_stub;
+  inflight->owner_incarnation = peer.completion_pins ? peer.owner_incarnation : std::string{};
 
   // Abort already-allocated slots on a synchronous failure that returns nullptr
   // (no WaitRemoteBatchPut/finalize will run for them).
-  auto abort_now = [&](std::vector<uint64_t> slot_ids) {
-    if (slot_ids.empty()) return;
-    ::umbp::BatchAbortSlotsRequest abort_req;
-    for (uint64_t slot_id : slot_ids) abort_req.add_slot_ids(slot_id);
-    ::umbp::BatchAbortSlotsResponse abort_resp;
-    grpc::ClientContext abort_ctx;
-    // Best-effort: a failed abort just leaves the slots for the peer reaper to
-    // reclaim at pending_ttl. Warn to aid diagnosis but do not propagate.
-    auto s = stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
-    if (!s.ok()) {
-      MORI_UMBP_WARN(
-          "[PoolClient] SubmitRemoteBatchPut: BatchAbortSlots({} slots) failed on {}: {}",
-          slot_ids.size(), first.route.node_id, s.error_message());
-    }
+  auto abort_now = [&](const std::vector<uint64_t>& slots) {
+    AbortRemoteSlots(stub, slots, inflight->slot_operations, inflight->owner_incarnation);
   };
 
   // Allocate RPC + per-key dedup/failure mapping; malformed slots go to
   // inflight->abort_slots. On total failure results are written and the
   // malformed list already aborted inside the callee — nothing left in flight.
-  if (!AllocateRemotePutEntries(items, stub, &inflight->entries, &inflight->abort_slots, results)) {
+  if (!AllocateRemotePutEntries(items, stub, &inflight->entries, &inflight->abort_slots, results,
+                                peer, &inflight->slot_operations)) {
     return nullptr;
   }
 
@@ -2755,7 +3096,13 @@ std::unique_ptr<PoolClient::RemotePutInFlight> PoolClient::SubmitRemoteBatchPut(
   }
   // POST; do NOT wait.  Everything the post references — including any bytes
   // staged through the engine's bounce pool — is owned by the returned handle.
-  inflight->handle = transfer_engine_->Submit(std::move(planned.plans));
+  try {
+    inflight->handle = transfer_engine_->Submit(std::move(planned.plans));
+  } catch (...) {
+    inflight->quarantined = true;
+    QuarantineGpuResources();
+    throw;
+  }
   if (inflight->handle == nullptr) {
     abort_everything();
     return nullptr;
@@ -2769,19 +3116,40 @@ void PoolClient::WaitRemoteBatchPut(RemotePutInFlight& f, std::vector<PutEntryOu
   std::vector<TransferFailure> failures;
   if (f.handle != nullptr) f.handle->Wait(&failures);
   ApplyTransferFailures(f.entries, failures, "RemotePut");
-  FinalizeRemotePutEntries(f.entries, f.abort_slots, results, f.stub);
+  f.quarantined = UnconfirmedDrain(failures);
+  if (f.quarantined) {
+    for (auto& entry : f.entries) (*results)[entry.result_index] = PutEntryOutcome::kFailed;
+    QuarantineGpuResources();
+    MORI_UMBP_ERROR("[PoolClient] GPU write drain unconfirmed; owner slots remain protected");
+    return;
+  }
+  FinalizeRemotePutEntries(f.entries, f.abort_slots, results, f.stub, f.slot_operations,
+                           f.owner_incarnation);
 }
 
-bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items,
-                                          ::umbp::UMBPPeer::Stub* stub,
-                                          std::vector<RemotePutEntry>* entries,
-                                          std::vector<uint64_t>* abort_slots,
-                                          std::vector<PutEntryOutcome>* results) {
+bool PoolClient::AllocateRemotePutEntries(
+    const std::vector<BatchPutItem>& items, ::umbp::UMBPPeer::Stub* stub,
+    std::vector<RemotePutEntry>* entries, std::vector<uint64_t>* abort_slots,
+    std::vector<PutEntryOutcome>* results, PeerConnection& peer,
+    std::unordered_map<uint64_t, std::string>* slot_operations) {
   entries->clear();
   ::umbp::BatchAllocateSlotsRequest alloc_req;
+  bool allocation_transferred = false;
+  ScopeExit uncertain_reserve_cleanup{[&] {
+    if (!allocation_transferred) AbandonRemoteWrites(stub, alloc_req);
+  }};
+  if (peer.completion_pins) {
+    alloc_req.set_expected_owner_incarnation(peer.owner_incarnation);
+    alloc_req.set_expected_pool_generation(peer.pool_generation);
+  }
+  // Protected writes are part of the opt-in FABRIC lifecycle. Legacy RDMA
+  // still serves SSD peers whose staging backend cannot reserve protected slots.
+  const bool protected_writes =
+      peer.completion_pins && config_.io_engine.mode != UMBPTransferMode::kRdma;
   for (const auto& item : items) {
     auto* entry = alloc_req.add_entries();
     entry->set_size(item.size);
+    if (protected_writes) entry->set_operation_id(NewOperationId());
     entry->set_tier(static_cast<::umbp::TierType>(item.route.tier));
     entry->set_key(*item.key);
     entry->set_logical_tier(item.route.logical_tier);
@@ -2790,9 +3158,22 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
   }
 
   ::umbp::BatchAllocateSlotsResponse alloc_resp;
-  grpc::ClientContext alloc_ctx;
-  auto alloc_status = stub->BatchAllocateSlots(&alloc_ctx, alloc_req, &alloc_resp);
+  grpc::Status alloc_status;
+  for (int attempt = 0; attempt != (peer.completion_pins ? 3 : 1); ++attempt) {
+    grpc::ClientContext alloc_ctx;
+    alloc_ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+    alloc_status = stub->BatchAllocateSlots(&alloc_ctx, alloc_req, &alloc_resp);
+    if (alloc_status.ok() || alloc_status.error_code() == grpc::StatusCode::FAILED_PRECONDITION)
+      break;
+  }
+  if (peer.completion_pins && alloc_status.ok() &&
+      (alloc_resp.owner_incarnation() != peer.owner_incarnation ||
+       alloc_resp.pool_generation() != peer.pool_generation))
+    alloc_status = grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "write owner epoch changed");
   if (!alloc_status.ok() || alloc_resp.entries_size() != static_cast<int>(items.size())) {
+    AbandonRemoteWrites(stub, alloc_req);
+    if (alloc_status.error_code() == grpc::StatusCode::FAILED_PRECONDITION)
+      peer_directory_->ForgetRemote(peer.node_id);
     MORI_UMBP_WARN("[PoolClient] BatchAllocateSlots failed on {}: {}", items.front().route.node_id,
                    alloc_status.error_message());
     for (const auto& item : items) (*results)[item.index] = PutEntryOutcome::kFailed;
@@ -2830,6 +3211,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
     }
 
     PoolClient::SlotPlan plan = FromAllocateSlotResponse(resp_entry);
+    (*slot_operations)[plan.slot_id] = alloc_req.entries(static_cast<int>(i)).operation_id();
     if (!SizeMatchesAllocation(item.size, plan.pages.size(), plan.page_size)) {
       MORI_UMBP_ERROR("[PoolClient] BatchPut: malformed slot for key='{}'", *item.key);
       abort_slots->push_back(plan.slot_id);
@@ -2841,28 +3223,18 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
     entry.result_index = item.index;
     entry.item = &item;
     entry.slot_id = plan.slot_id;
+    entry.operation_id = (*slot_operations)[plan.slot_id];
     entry.plan = std::move(plan);
     entries->push_back(std::move(entry));
   }
 
   if (entries->empty()) {
-    if (!abort_slots->empty()) {
-      ::umbp::BatchAbortSlotsRequest abort_req;
-      for (uint64_t slot_id : *abort_slots) abort_req.add_slot_ids(slot_id);
-      ::umbp::BatchAbortSlotsResponse abort_resp;
-      grpc::ClientContext abort_ctx;
-      // Best-effort: a failed abort just leaves the slots for the peer reaper to
-      // reclaim at pending_ttl. Warn to aid diagnosis but do not propagate.
-      auto abort_status = stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
-      if (!abort_status.ok()) {
-        MORI_UMBP_WARN(
-            "[PoolClient] AllocateRemotePutEntries: BatchAbortSlots({} slots) failed: {}",
-            abort_slots->size(), abort_status.error_message());
-      }
-      abort_slots->clear();
-    }
+    AbortRemoteSlots(stub, *abort_slots, *slot_operations,
+                     peer.completion_pins ? peer.owner_incarnation : std::string{});
+    abort_slots->clear();
     return false;
   }
+  allocation_transferred = true;
   return true;
 }
 
@@ -2934,11 +3306,13 @@ bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries,
   return true;
 }
 
-void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
-                                          std::vector<uint64_t>& abort_slots,
-                                          std::vector<PutEntryOutcome>* results,
-                                          ::umbp::UMBPPeer::Stub* stub) {
+void PoolClient::FinalizeRemotePutEntries(
+    std::vector<RemotePutEntry>& entries, std::vector<uint64_t>& abort_slots,
+    std::vector<PutEntryOutcome>* results, ::umbp::UMBPPeer::Stub* stub,
+    const std::unordered_map<uint64_t, std::string>& slot_operations,
+    const std::string& owner_incarnation) {
   ::umbp::BatchCommitSlotsRequest commit_req;
+  commit_req.set_expected_owner_incarnation(owner_incarnation);
   std::vector<size_t> commit_indices;
   commit_indices.reserve(entries.size());
 
@@ -2952,13 +3326,21 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
     auto* commit = commit_req.add_entries();
     commit->set_slot_id(entry.slot_id);
     commit->set_key(*entry.item->key);
+    commit->set_operation_id(entry.operation_id);
+    commit->set_transfer_drained(true);
     commit_indices.push_back(idx);
   }
 
   if (!commit_indices.empty()) {
     ::umbp::BatchCommitSlotsResponse commit_resp;
-    grpc::ClientContext commit_ctx;
-    auto commit_status = stub->BatchCommitSlots(&commit_ctx, commit_req, &commit_resp);
+    grpc::Status commit_status;
+    for (int attempt = 0; attempt != (owner_incarnation.empty() ? 1 : 3); ++attempt) {
+      grpc::ClientContext commit_ctx;
+      commit_ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+      commit_status = stub->BatchCommitSlots(&commit_ctx, commit_req, &commit_resp);
+      if (commit_status.ok() || commit_status.error_code() == grpc::StatusCode::FAILED_PRECONDITION)
+        break;
+    }
     if (!commit_status.ok() ||
         commit_resp.success_size() != static_cast<int>(commit_indices.size())) {
       const std::string& node_id = entries[commit_indices.front()].item->route.node_id;
@@ -2989,17 +3371,7 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
   }
 
   if (!abort_slots.empty()) {
-    ::umbp::BatchAbortSlotsRequest abort_req;
-    for (uint64_t slot_id : abort_slots) abort_req.add_slot_ids(slot_id);
-    ::umbp::BatchAbortSlotsResponse abort_resp;
-    grpc::ClientContext abort_ctx;
-    // Best-effort: a failed abort just leaves the slots for the peer reaper to
-    // reclaim at pending_ttl. Warn to aid diagnosis but do not propagate.
-    auto abort_status = stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
-    if (!abort_status.ok()) {
-      MORI_UMBP_WARN("[PoolClient] FinalizeRemotePutEntries: BatchAbortSlots({} slots) failed: {}",
-                     abort_slots.size(), abort_status.error_message());
-    }
+    AbortRemoteSlots(stub, abort_slots, slot_operations, owner_incarnation);
     abort_slots.clear();
   }
 }
@@ -3478,6 +3850,338 @@ bool PoolClient::RouteMissedRanges(const std::vector<std::string>& route_keys,
   return true;
 }
 
+std::shared_ptr<PoolClient::KvReadHandle> PoolClient::SubmitBatchGetRangesGpuDirect(
+    const std::vector<std::string>& input_keys, const std::vector<std::vector<void*>>& input_dsts,
+    const std::vector<std::vector<size_t>>& input_sizes,
+    const std::vector<std::vector<size_t>>& input_offsets) {
+  auto output = std::make_shared<KvReadHandle>();
+  output->results_.assign(input_keys.size(), false);
+  struct ReadState {
+    PoolClient* owner = nullptr;
+    std::vector<std::string> keys;
+    std::vector<std::vector<void*>> dsts;
+    std::vector<std::vector<size_t>> sizes, offsets;
+    std::vector<std::vector<ByteSpan>> spans;
+    BatchGetPlan plan;
+    std::vector<bool> results;
+    std::shared_lock<std::shared_mutex> operation_guard;
+    std::shared_ptr<void> budget;
+    std::vector<std::shared_ptr<const void>> local_holds;
+    std::vector<std::unique_ptr<TransferHandle>> local_handles;
+    std::vector<std::unique_ptr<RemoteGetInFlight>> remote;
+    ~ReadState() {
+      // An admission rejection never acquired the lifecycle lock or resources;
+      // it must not touch the registry while Shutdown may be dismantling it.
+      bool quarantined = operation_guard.owns_lock() && owner && owner->gpu_quarantined_;
+      for (auto& handle : local_handles) {
+        if (!handle) continue;
+        std::vector<TransferFailure> failures;
+        handle->Wait(&failures);
+        quarantined = quarantined || UnconfirmedDrain(failures);
+      }
+      if (quarantined) {
+        owner->QuarantineGpuResources();
+        for (auto& hold : local_holds) Quarantine(std::move(hold));
+        for (auto& handle : local_handles) (void)handle.release();
+      }
+    }
+  };
+  auto state = std::make_shared<ReadState>();
+  state->owner = this;
+  {
+    std::lock_guard<std::mutex> guard(async_handles_mutex_);
+    if (!initialized_ || async_read_blocked_) return output;
+    ++async_preparing_;
+  }
+  ScopeExit preparation_done{[this] {
+    std::lock_guard<std::mutex> guard(async_handles_mutex_);
+    --async_preparing_;
+    async_prepare_cv_.notify_all();
+  }};
+  state->operation_guard = std::shared_lock<std::shared_mutex>(async_read_mutex_);
+  if (!initialized_ || gpu_quarantined_ || input_keys.empty() ||
+      !RangeBatchShapeValid(input_keys.size(), input_dsts, input_sizes, input_offsets))
+    return output;
+  uint64_t bytes = 0;
+  std::vector<std::pair<uintptr_t, uintptr_t>> destinations;
+  for (size_t i = 0; i < input_dsts.size(); ++i)
+    for (size_t r = 0; r < input_dsts[i].size(); ++r) {
+      const uintptr_t begin = reinterpret_cast<uintptr_t>(input_dsts[i][r]);
+      const size_t size = input_sizes[i][r];
+      if (size == 0 || begin == 0 || size > std::numeric_limits<uintptr_t>::max() - begin)
+        return output;
+      destinations.emplace_back(begin, begin + size);
+    }
+  std::sort(destinations.begin(), destinations.end());
+  for (size_t i = 1; i < destinations.size(); ++i)
+    if (destinations[i].first < destinations[i - 1].second) return output;
+  for (const auto& ranges : input_sizes)
+    for (size_t size : ranges) {
+      if (size > std::numeric_limits<uint64_t>::max() - bytes) return output;
+      bytes += size;
+    }
+  {
+    std::lock_guard<std::mutex> guard(kv_budget_mutex_);
+    if (kv_inflight_reads_ >= config_.kv_max_inflight_reads ||
+        bytes > config_.kv_max_inflight_bytes ||
+        kv_inflight_bytes_ > config_.kv_max_inflight_bytes - bytes) {
+      CountMetric("umbp_client_gpu_direct_budget_rejected_total",
+                  "GPU read groups rejected by inflight limits", {}, 1);
+      return output;
+    }
+    for (const auto& [begin, end] : destinations) {
+      auto after = kv_active_destinations_.upper_bound(begin);
+      if ((after != kv_active_destinations_.end() && after->first < end) ||
+          (after != kv_active_destinations_.begin() && std::prev(after)->second > begin)) {
+        CountMetric("umbp_client_gpu_direct_overlap_rejected_total",
+                    "GPU groups with overlapping destinations", {}, 1);
+        return output;
+      }
+    }
+    for (const auto& [begin, end] : destinations) kv_active_destinations_.emplace(begin, end);
+    ++kv_inflight_reads_;
+    kv_inflight_bytes_ += bytes;
+  }
+  state->budget = std::shared_ptr<void>(new uint64_t(bytes), [this, destinations](void* value) {
+    const uint64_t reserved = *static_cast<uint64_t*>(value);
+    delete static_cast<uint64_t*>(value);
+    std::lock_guard<std::mutex> guard(kv_budget_mutex_);
+    --kv_inflight_reads_;
+    kv_inflight_bytes_ -= reserved;
+    for (const auto& [begin, end] : destinations) kv_active_destinations_.erase(begin);
+  });
+  auto reserve_source = [this, state](uint64_t size) {
+    std::lock_guard<std::mutex> guard(kv_budget_mutex_);
+    if (size > config_.kv_max_inflight_bytes ||
+        kv_inflight_bytes_ > config_.kv_max_inflight_bytes - size)
+      return false;
+    kv_inflight_bytes_ += size;
+    *static_cast<uint64_t*>(state->budget.get()) += size;
+    return true;
+  };
+  state->keys = input_keys;
+  state->dsts = input_dsts;
+  state->sizes = input_sizes;
+  state->offsets = input_offsets;
+  const auto& keys = state->keys;
+  const auto& dsts = state->dsts;
+  const auto& sizes = state->sizes;
+  const auto& src_offsets = state->offsets;
+  const size_t n = keys.size();
+  state->results.assign(n, false);
+  auto& results = state->results;
+  std::vector<size_t> candidates;
+  // Resolve each destination against its stable registered allocation. A
+  // caller opting into GPU direct gets an explicit failure for an unregistered
+  // range; it never silently consumes the host bounce pool.
+  for (size_t i = 0; i < n; ++i) {
+    if (sizes[i].empty()) continue;
+    bool valid = true;
+    for (size_t r = 0; r < sizes[i].size(); ++r) {
+      auto [ref, offset] = UserBufferRef(dsts[i][r], sizes[i][r]);
+      if (dsts[i][r] == nullptr || sizes[i][r] == 0 || !ref.HasMemoryDesc() ||
+          ref.loc != mori::io::MemoryLocationType::GPU || offset > ref.size ||
+          sizes[i][r] > ref.size - offset) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid)
+      candidates.push_back(i);
+    else
+      MORI_UMBP_WARN("[PoolClient] GPU direct GET requires registered GPU ranges key='{}'",
+                     keys[i]);
+  }
+  std::vector<std::optional<RouteGetResult>> preroutes;
+  if (!config_.local_first && !RouteAllRangesUpFront(keys, nullptr, &preroutes)) return output;
+  std::vector<size_t> missed;
+  std::vector<ObjectExtent> extents(n);
+  for (size_t i : candidates) extents[i] = ReadExtent(sizes[i], src_offsets[i]);
+  while (!candidates.empty()) {
+    std::vector<MediumBackend*> holders;
+    std::vector<ResolvedEntry> resolutions;
+    std::vector<size_t> later;
+    ResolveLocalBatch(
+        keys, candidates, &holders, &resolutions, [](size_t) { return true; }, &later, &extents);
+    std::unordered_set<size_t> deferred(later.begin(), later.end());
+    std::vector<TransferItem> all_items;
+    std::vector<size_t> built_keys;
+    for (size_t i : candidates) {
+      if (deferred.count(i)) continue;
+      if (holders[i] == nullptr) {
+        missed.push_back(i);
+        continue;
+      }
+      const auto& resolved = resolutions[i];
+      if (!RangesAreDisjointAndInBounds(resolved.size, sizes[i], src_offsets[i])) continue;
+      if (!reserve_source(resolved.size)) continue;
+      std::vector<ObjectRange> ranges;
+      FillReadRanges(dsts[i], sizes[i], src_offsets[i], &ranges);
+      std::vector<TransferItem> items;
+      bool built = false;
+      if (resolved.file_ref.IsFile()) {
+        built = BuildLocalFileRangeTransfers(resolved.file_ref, ranges, i, &items);
+      } else if (RebaseRangesOntoCoveredWindow(resolved, &ranges)) {
+        built =
+            BuildLocalRangeTransfers(holders[i], resolved.pages, resolved.page_size,
+                                     resolved.covered_size ? resolved.covered_size : resolved.size,
+                                     ranges, false, i, &items);
+      }
+      if (!built) {
+        missed.push_back(i);
+        continue;
+      }
+      all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
+                       std::make_move_iterator(items.end()));
+      built_keys.push_back(i);
+    }
+    // Holds survive both submit and the eventual Wait, including every local
+    // destination copy. No remote read TTL participates in reclamation.
+    for (size_t i : built_keys)
+      if (resolutions[i].hold) state->local_holds.push_back(resolutions[i].hold);
+    auto planned = transfer_engine_->Plan(all_items);
+    std::unordered_set<size_t> rejected(planned.rejected_tags.begin(), planned.rejected_tags.end());
+    for (size_t i : built_keys)
+      if (!rejected.count(i)) results[i] = true;
+    if (!planned.plans.empty()) {
+      // Allocate the owning slot before posting. A vector growth failure must
+      // not destroy a just-posted handle before its drain result is inspected.
+      state->local_handles.emplace_back();
+      try {
+        state->local_handles.back() = transfer_engine_->Submit(std::move(planned.plans));
+      } catch (...) {
+        QuarantineGpuResources();
+        throw;
+      }
+      if (!state->local_handles.back()) {
+        state->local_handles.pop_back();
+        for (size_t i : built_keys) results[i] = false;
+      }
+    }
+    candidates = std::move(later);
+  }
+  if (HasMaster() && !missed.empty()) {
+    std::vector<std::string> route_keys;
+    for (size_t i : missed) route_keys.push_back(keys[i]);
+    std::vector<std::optional<RouteGetResult>> routes;
+    const bool routed = RouteMissedRanges(route_keys, missed, preroutes, nullptr, &routes);
+    if (!routed) routes.assign(missed.size(), std::nullopt);
+    state->spans.resize(n);
+    auto& spans = state->spans;
+    auto& plan = state->plan;
+    for (size_t r = 0; r < missed.size(); ++r) {
+      const size_t i = missed[r];
+      if (!routes[r] || routes[r]->node_id == config_.master_config.node_id ||
+          !RangesAreDisjointAndInBounds(routes[r]->size, sizes[i], src_offsets[i]))
+        continue;
+      if (!reserve_source(routes[r]->size)) continue;
+      for (size_t j = 0; j < sizes[i].size(); ++j)
+        spans[i].push_back({src_offsets[i][j], sizes[i][j]});
+      BatchGetItem item{};
+      item.index = i;
+      item.key = &keys[i];
+      item.size = routes[r]->size;
+      item.dst_bytes = std::accumulate(sizes[i].begin(), sizes[i].end(), size_t{0});
+      item.spans = &spans[i];
+      item.range_dsts = &dsts[i];
+      item.route = *routes[r];
+      plan.remote_groups[item.route.node_id].push_back(std::move(item));
+    }
+    for (const auto& [node, items] : plan.remote_groups) {
+      if (auto f = SubmitRemoteBatchGet(items, &results)) {
+        for (const auto& entry : f->entries)
+          if (!entry.failed) results[entry.result_index] = true;
+        state->remote.push_back(std::move(f));
+      }
+    }
+  }
+  output->results_ = results;
+  output->stream_wait_ = [state](void* stream) {
+    if (std::any_of(state->results.begin(), state->results.end(), [](bool ok) { return !ok; }))
+      return false;
+    bool accepted = true;
+    for (auto& local : state->local_handles) accepted = local->WaitOnStream(stream) && accepted;
+    for (auto& remote : state->remote) accepted = remote->handle->WaitOnStream(stream) && accepted;
+    return accepted;
+  };
+  output->finish_ = [this, state](std::vector<bool>* out, bool* quarantined) {
+    for (auto& local : state->local_handles) {
+      std::vector<TransferFailure> failures;
+      local->Wait(&failures);
+      for (const auto& failure : failures)
+        for (size_t tag : failure.tags)
+          if (tag < state->results.size()) state->results[tag] = false;
+      *quarantined = *quarantined || UnconfirmedDrain(failures);
+    }
+    for (auto& remote : state->remote) {
+      WaitRemoteBatchGet(*remote, &state->results, false);
+      *quarantined = *quarantined || remote->quarantined;
+    }
+    if (*quarantined) {
+      QuarantineGpuResources();
+      for (auto& hold : state->local_holds) Quarantine(std::move(hold));
+      for (auto& handle : state->local_handles) (void)handle.release();
+      CountMetric("umbp_client_gpu_quarantined_reads_total",
+                  "Read groups with unconfirmed GPU drain", {}, 1);
+    }
+    *out = state->results;
+    uint64_t completed = 0;
+    for (size_t i = 0; i < out->size(); ++i)
+      if ((*out)[i])
+        completed += std::accumulate(state->sizes[i].begin(), state->sizes[i].end(), uint64_t{0});
+    CountMetric("umbp_client_gpu_direct_get_bytes_total",
+                "Requested bytes landed directly in GPU ranges", {}, completed);
+  };
+  {
+    std::lock_guard<std::mutex> guard(async_handles_mutex_);
+    async_reads_.erase(std::remove_if(async_reads_.begin(), async_reads_.end(),
+                                      [](const auto& h) { return h.expired(); }),
+                       async_reads_.end());
+    async_reads_.push_back(output);
+  }
+  return output;
+}
+
+PoolClient::KvReadHandle::~KvReadHandle() { Wait(); }
+std::vector<bool> PoolClient::KvReadHandle::Wait() {
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (!waited_) {
+    if (finish_) finish_(&results_, &quarantined_);
+    waited_ = true;
+    stream_wait_ = {};
+    finish_ = {};  // retires pins, registrations and byte budget after Wait
+  }
+  return results_;
+}
+bool PoolClient::KvReadHandle::WaitOnStream(void* stream) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (waited_)
+    return !quarantined_ &&
+           std::all_of(results_.begin(), results_.end(), [](bool ok) { return ok; });
+  return stream_wait_ && stream_wait_(stream);
+}
+bool PoolClient::KvReadHandle::ResourcesQuarantined() const {
+  std::lock_guard<std::mutex> guard(mutex_);
+  return quarantined_;
+}
+void PoolClient::DrainAsyncReads() {
+  std::vector<std::shared_ptr<KvReadHandle>> handles;
+  {
+    std::unique_lock<std::mutex> guard(async_handles_mutex_);
+    async_read_blocked_ = true;
+    async_prepare_cv_.wait(guard, [this] { return async_preparing_ == 0; });
+    for (const auto& weak : async_reads_)
+      if (auto h = weak.lock()) handles.push_back(std::move(h));
+  }
+  for (auto& handle : handles) handle->Wait();
+}
+std::vector<bool> PoolClient::BatchGetRangesGpuDirect(
+    const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  return SubmitBatchGetRangesGpuDirect(keys, dsts, sizes, src_offsets)->Wait();
+}
+
 std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& keys,
                                              const std::vector<std::vector<void*>>& dsts,
                                              const std::vector<std::vector<size_t>>& sizes,
@@ -3486,6 +4190,9 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::vector<bool> results(n, false);
   if (!initialized_ || n == 0 || !RangeBatchShapeValid(n, dsts, sizes, src_offsets)) {
     return results;
+  }
+  if (config_.kv_ranged_path == UMBPKvRangedPath::kGpuDirect) {
+    return BatchGetRangesGpuDirect(keys, dsts, sizes, src_offsets);
   }
 
   // Observed at scope exit for whichever phases ran; see ScopedBatchBandwidth.
@@ -4089,7 +4796,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   grpc::Status route_status;
   {
     PhaseTimer route_timer(dbg ? &dbg->route : nullptr);
-    if (!HasMaster()) {
+    if (!HasMaster() || config_.kv_put_placement == UMBPKvPutPlacement::kOwnerLocal) {
       RouteAllPutsLocally(route_keys.size(), &routes);
     } else {
       route_status = master_client_->BatchRoutePut(route_keys, route_sizes, excludes, &routes);
@@ -4587,10 +5294,18 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
   auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
 
   auto inflight = std::make_unique<RemoteGetInFlight>();
+  inflight->owner = this;
   inflight->peer = &peer;
+  std::unique_lock<std::mutex> peer_guard(peer.conn_mutex);
+  if (config_.io_engine.mode != UMBPTransferMode::kRdma && !peer.completion_pins) {
+    MORI_UMBP_ERROR("[PoolClient] FABRIC peer '{}' lacks completion pin protocol", peer.node_id);
+    fail_all();
+    return nullptr;
+  }
 
   // resolve RPC + per-key validation; failed keys already written to *results.
-  if (!PrepareRemoteGetEntries(items, peer, stub, &inflight->entries, results)) {
+  if (!PrepareRemoteGetEntries(items, peer, stub, &inflight->entries, results,
+                               &inflight->read_pin_hold)) {
     return nullptr;
   }
 
@@ -4642,7 +5357,13 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
   // handle, including any bytes staged through the engine's bounce pool.
   plan_timer.Stop();
   PhaseTimer post_timer(t_remote_leg ? t_remote_leg->build_post : nullptr);
-  inflight->handle = transfer_engine_->Submit(std::move(planned.plans));
+  try {
+    inflight->handle = transfer_engine_->Submit(std::move(planned.plans));
+  } catch (...) {
+    inflight->quarantined = true;
+    QuarantineGpuResources();
+    throw;
+  }
   if (inflight->handle == nullptr) {
     for (auto& entry : inflight->entries) (*results)[entry.result_index] = false;
     return nullptr;
@@ -4661,15 +5382,28 @@ void PoolClient::WaitRemoteBatchGet(RemoteGetInFlight& f, std::vector<bool>* res
   }
   PhaseTimer final_timer(t_remote_leg ? t_remote_leg->final_ : nullptr);
   ApplyTransferFailures(f.entries, failures, "RemoteGet");
+  f.quarantined = UnconfirmedDrain(failures);
+  if (f.quarantined) {
+    for (auto& entry : f.entries) {
+      entry.failed = true;
+      (*results)[entry.result_index] = false;
+    }
+    MORI_UMBP_ERROR(
+        "[PoolClient] GPU read drain unconfirmed; retaining owner pins and destinations");
+    QuarantineGpuResources();
+    return;
+  }
   // Nothing to copy out here even for a staged read: the engine owns its bounce
   // pool and lands the bytes in the user's dst before its Wait returns.
   FinalizeRemoteGetEntries(f.entries, results, recache_remote);
+  f.read_pin_hold.reset();
 }
 
 bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
                                          PeerConnection& peer, ::umbp::UMBPPeer::Stub* stub,
                                          std::vector<RemoteGetEntry>* entries,
-                                         std::vector<bool>* results) {
+                                         std::vector<bool>* results,
+                                         std::shared_ptr<void>* pin_hold) {
   entries->clear();
 
   // Ask the peer to omit the buffer descriptors once we have already hydrated
@@ -4688,6 +5422,11 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
   const auto retry_deadline = std::chrono::steady_clock::now() + retry_timeout;
   std::chrono::milliseconds backoff{1};
   size_t busy_attempts = 0;
+  std::string operation_id = NewOperationId();
+  ScopeExit uncertain_acquire_cleanup{[&] {
+    if (peer.completion_pins && !*pin_hold && entries->empty())
+      AbandonRemoteReads(stub, operation_id, peer.owner_incarnation);
+  }};
   while (true) {
     ::umbp::BatchResolveKeysResponse resolve_resp;
     grpc::ClientContext resolve_ctx;
@@ -4698,9 +5437,45 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
       for (const auto& item : items) (*results)[item.index] = false;
       return false;
     }
-    resolve_ctx.set_deadline(std::chrono::system_clock::now() + remaining);
+    resolve_ctx.set_deadline(
+        std::chrono::system_clock::now() +
+        std::min(remaining, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::milliseconds{500})));
     grpc::Status resolve_status;
-    {
+    if (peer.completion_pins) {
+      ::umbp::BatchAcquireReadKeysRequest acquire;
+      *acquire.mutable_resolve() = resolve_req;
+      acquire.set_operation_id(operation_id);
+      acquire.set_expected_owner_incarnation(peer.owner_incarnation);
+      acquire.set_expected_pool_generation(peer.pool_generation);
+      ::umbp::BatchAcquireReadKeysResponse grant;
+      {
+        PhaseTimer resolve_timer(t_remote_leg ? t_remote_leg->resolve : nullptr);
+        resolve_status = stub->BatchAcquireReadKeys(&resolve_ctx, acquire, &grant);
+      }
+      if (resolve_status.ok() && grant.read_pin_token() != 0) {
+        auto pin = std::make_shared<RemoteReadPin>();
+        pin->stub = peer.peer_stub;
+        pin->incarnation = grant.owner_incarnation();
+        pin->token = grant.read_pin_token();
+        *pin_hold = std::move(pin);  // own the grant before ANY decode/build failure
+      }
+      if (resolve_status.ok() &&
+          (grant.owner_incarnation() != peer.owner_incarnation ||
+           grant.pool_generation() != peer.pool_generation || grant.read_pin_token() == 0)) {
+        resolve_status = grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "peer epoch changed");
+      }
+      resolve_resp = std::move(*grant.mutable_resolved());
+      if (!resolve_status.ok()) {
+        if (resolve_status.error_code() == grpc::StatusCode::FAILED_PRECONDITION) {
+          peer_directory_->ForgetRemote(peer.node_id);
+        } else if (std::chrono::steady_clock::now() < retry_deadline) {
+          // Recover an uncertain acquire reply using the SAME operation id.
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          continue;
+        }
+      }
+    } else {
       PhaseTimer resolve_timer(t_remote_leg ? t_remote_leg->resolve : nullptr);
       resolve_status = stub->BatchResolveKeys(&resolve_ctx, resolve_req, &resolve_resp);
     }
@@ -4735,6 +5510,8 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     // progress impossible; it can also leave stale page locations if a retry
     // outlives the lease.
     ++busy_attempts;
+    pin_hold->reset();
+    operation_id = NewOperationId();
     const auto sleep_for =
         std::min(backoff, std::chrono::duration_cast<std::chrono::milliseconds>(
                               retry_deadline - std::chrono::steady_clock::now()));
@@ -4820,7 +5597,9 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
     // one instead of failing.
     TransferRef dst;
     uint64_t dst_base = 0;
-    if (entry.item->dst_ref != nullptr) {
+    if (entry.item->range_dsts != nullptr) {
+      // Each range below resolves its own registered destination.
+    } else if (entry.item->dst_ref != nullptr) {
       dst = *entry.item->dst_ref;
       dst_base = entry.item->dst_ref_offset;
     } else {
@@ -4855,7 +5634,22 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
       // the bound.
       entry_items.reserve(entry.item->spans->size() + entry.plan.pages.size());
       size_t packed_cursor = 0;
-      for (const auto& span : *entry.item->spans) {
+      for (size_t r = 0; r < entry.item->spans->size(); ++r) {
+        const auto& span = (*entry.item->spans)[r];
+        TransferRef range_dst = dst;
+        uint64_t range_base = dst_base + packed_cursor;
+        if (entry.item->range_dsts != nullptr) {
+          if (r >= entry.item->range_dsts->size()) {
+            entry.failed = true;
+            break;
+          }
+          std::tie(range_dst, range_base) = UserBufferRef((*entry.item->range_dsts)[r], span.size);
+          if (!range_dst.HasMemoryDesc() || range_dst.loc != mori::io::MemoryLocationType::GPU) {
+            entry.failed = true;
+            entry_items.clear();
+            break;
+          }
+        }
         const bool walked = ForEachRangePageFragment(
             entry.plan.pages, entry.plan.page_size, entry.item->size, span.object_offset, span.size,
             [&](size_t page_index, uint64_t tier_offset, size_t fragment, size_t copied) {
@@ -4865,8 +5659,8 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
               item.tag = idx;
               item.src = *buf;
               item.src_offset = tier_offset;
-              item.dst = dst;
-              item.dst_offset = dst_base + packed_cursor + copied;
+              item.dst = range_dst;
+              item.dst_offset = range_base + copied;
               item.size = fragment;
               entry_items.push_back(std::move(item));
               return true;
@@ -5130,6 +5924,10 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
     }
 
     if (peer_directory_ != nullptr) {
+      if ((!peer.owner_incarnation.empty() && peer.owner_incarnation != resp.owner_incarnation()) ||
+          (peer.completion_pins && peer.pool_generation != resp.pool_generation())) {
+        peer_directory_->ForgetRemote(peer.node_id);
+      }
       if (!peer_directory_->EnsureRemoteEngine(peer.node_id, resp.engine_desc())) return false;
 
       // Every backend's buffers arrive in one list, each entry naming the
@@ -5150,6 +5948,9 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
       }
       peer_directory_->CacheRemoteBuffers(peer.node_id, descs);
     }
+    peer.owner_incarnation = resp.owner_incarnation();
+    peer.pool_generation = resp.pool_generation();
+    peer.completion_pins = resp.completion_pins();
     return true;
   };
 
@@ -5175,7 +5976,7 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
     return false;
   }
 
-  peer.peer_stub = std::unique_ptr<void, void (*)(void*)>(
+  peer.peer_stub = std::shared_ptr<void>(
       stub.release(), +[](void* p) { delete static_cast<::umbp::UMBPPeer::Stub*>(p); });
   return true;
 }

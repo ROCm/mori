@@ -32,6 +32,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -314,7 +315,26 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
 }
 
 void PageBackend::Shutdown() {
+  StopReaper();
   if (!owns_memory_) return;
+  bool outstanding = quarantined_;
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    for (const auto& [id, slot] : pending_) outstanding |= !slot.operation_id.empty();
+    for (const auto& [key, slot] : owned_) outstanding |= slot.hold.use_count() > 1;
+    for (const auto& slot : deferred_frees_) outstanding |= slot.hold.use_count() > 1;
+  }
+  if (outstanding) {
+    // A missing peer is not a GPU fence. Deliberately retain the entire source
+    // rather than destroy/reuse exported memory while remote work may access it.
+    // Recovery of these allocations requires a verified device/process fence.
+    MORI_UMBP_ERROR("[PageBackend] quarantining source at shutdown: transfers still own pages");
+    (void)source_.release();
+    owned_refs_.clear();
+    owns_memory_ = false;
+    registrar_ = nullptr;
+    return;
+  }
   if (registrar_ != nullptr) {
     for (const auto& ref : owned_refs_) registrar_->Deregister(ref);
   }
@@ -326,6 +346,15 @@ void PageBackend::Shutdown() {
 
   owns_memory_ = false;
   registrar_ = nullptr;
+}
+
+bool PageBackend::QuarantineBackingMemory() {
+  {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    quarantined_ = true;
+  }
+  StopReaper();
+  return owns_memory_ && source_ != nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +455,7 @@ AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size
   };
 
   const uint32_t num_pages = SizeToPages(size, page_size_);
+  if (quarantined_) return fail(AllocateOutcome::kFailed, "QUARANTINED");
   if (num_pages == 0) return fail(AllocateOutcome::kFailed, "ZERO_SIZE");
 
   // Block new allocations between ClearLocal() and full-sync ack — any
@@ -501,12 +531,52 @@ std::vector<AllocateResult> PageBackend::BatchAllocate(
   std::vector<AllocateResult> out(entries.size());
   if (entries.empty()) return out;
   std::unique_lock<std::shared_mutex> lock(mutex_);
+  std::vector<std::string> terminal_operations;
   for (size_t i = 0; i < entries.size(); ++i) {
+    if (!entries[i].operation_id.empty()) {
+      auto receipt = protected_writes_.find(entries[i].operation_id);
+      if (receipt != protected_writes_.end()) {
+        // Terminal dedup success can be replayed, but never grants writable memory.
+        const auto pending = pending_.find(receipt->second.allocation.slot_id);
+        if (receipt->second.key == entries[i].key && receipt->second.size == entries[i].size &&
+            ((!receipt->second.settled && pending != pending_.end() &&
+              pending->second.generation == allocator_generation_) ||
+             receipt->second.allocation.outcome == AllocateOutcome::kSuccessAlreadyExists)) {
+          out[i] = receipt->second.allocation;
+        }
+        continue;
+      }
+      if (auto ordered = OrderedOperation(entries[i].operation_id)) {
+        if (protected_write_clients_.find(ordered->first) == protected_write_clients_.end() &&
+            protected_write_clients_.size() >= 4096)
+          continue;
+        if (ordered->second <= protected_write_clients_[ordered->first].completed) continue;
+      }
+      // Bound retained receipts; exhaustion fails closed rather than forgetting old tokens.
+      if (protected_writes_.size() >= 65536) continue;
+    }
     out[i] = AllocateLocked(entries[i].key, entries[i].size, entries[i].preferred_numa_node);
     if (out[i].outcome == AllocateOutcome::kSuccessAllocated) {
       out[i].descs = BuildBufferDescsLocked(out[i].pages);
+      if (!entries[i].operation_id.empty()) {
+        auto& slot = pending_.at(out[i].slot_id);
+        slot.operation_id = entries[i].operation_id;
+        slot.key = entries[i].key;
+        out[i].pending_ttl_ms = 0;
+        protected_writes_.emplace(entries[i].operation_id,
+                                  WriteReceipt{entries[i].key, entries[i].size, out[i]});
+      }
+    } else if (out[i].outcome == AllocateOutcome::kSuccessAlreadyExists &&
+               !entries[i].operation_id.empty()) {
+      // Reserve returning ALREADY_EXISTS is terminal: a delayed copy of this
+      // request must not reserve new bytes after the existing key is evicted.
+      WriteReceipt receipt{entries[i].key, entries[i].size, out[i]};
+      receipt.settled = true;
+      protected_writes_.emplace(entries[i].operation_id, std::move(receipt));
+      terminal_operations.push_back(entries[i].operation_id);
     }
   }
+  RetireProtectedWritesLocked(terminal_operations);
   return out;
 }
 
@@ -525,6 +595,11 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
   auto it = pending_.find(slot_id);
   if (it == pending_.end()) {
     MORI_UMBP_WARN("[PageBackend] Commit reason=SLOT_GONE key='{}' slot_id={}", key, slot_id);
+    return false;
+  }
+
+  if (!it->second.operation_id.empty()) {
+    // Legacy commit lacks the completion proof and must not free/publish this slot.
     return false;
   }
 
@@ -566,9 +641,34 @@ std::vector<CommitResult> PageBackend::BatchCommit(const std::vector<CommitReque
   std::vector<CommitResult> out(entries.size());
   if (entries.empty()) return out;
   std::unique_lock<std::shared_mutex> lock(mutex_);
+  std::vector<std::string> terminal_operations;
   for (size_t i = 0; i < entries.size(); ++i) {
+    if (entries[i].operation_id.empty()) {
+      out[i].success = CommitLocked(entries[i].slot_id, entries[i].key, out[i].bytes_committed);
+      continue;
+    }
+    auto receipt = protected_writes_.find(entries[i].operation_id);
+    if (receipt == protected_writes_.end() || receipt->second.key != entries[i].key ||
+        receipt->second.allocation.slot_id != entries[i].slot_id || !entries[i].transfer_drained) {
+      continue;
+    }
+    if (receipt->second.settled) {
+      out[i] = receipt->second.commit;
+      continue;
+    }
+    auto pending = pending_.find(entries[i].slot_id);
+    if (pending == pending_.end()) continue;
+    // Completion is established by the caller. Temporarily enter the legacy
+    // promotion path, including generation rejection after ClearLocal.
+    pending->second.operation_id.clear();
     out[i].success = CommitLocked(entries[i].slot_id, entries[i].key, out[i].bytes_committed);
+    receipt->second.settled = true;
+    receipt->second.commit = out[i];
+    receipt->second.allocation.pages.clear();
+    receipt->second.allocation.descs.clear();
+    terminal_operations.push_back(entries[i].operation_id);
   }
+  RetireProtectedWritesLocked(terminal_operations);
   return out;
 }
 
@@ -580,6 +680,7 @@ bool PageBackend::Abort(uint64_t slot_id) {
 bool PageBackend::AbortLocked(uint64_t slot_id) {
   auto it = pending_.find(slot_id);
   if (it == pending_.end()) return true;  // already reaped / aborted — idempotent
+  if (!it->second.operation_id.empty()) return false;
   if (allocator_) allocator_->Deallocate(it->second.pages);
   pending_.erase(it);
   return true;
@@ -593,6 +694,74 @@ std::vector<bool> PageBackend::BatchAbort(const std::vector<uint64_t>& slot_ids)
   return out;
 }
 
+std::vector<bool> PageBackend::BatchAbortProtected(
+    const std::vector<ProtectedAbortRequest>& requests) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  std::vector<bool> out(requests.size(), false);
+  std::vector<std::string> terminal_operations;
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const auto& request = requests[i];
+    auto receipt = protected_writes_.find(request.operation_id);
+    if (request.operation_id.empty()) continue;
+    if (receipt == protected_writes_.end()) {
+      if (!request.no_gpu_work_submitted || request.slot_id != 0) continue;
+      if (auto ordered = OrderedOperation(request.operation_id)) {
+        if (protected_write_clients_.find(ordered->first) == protected_write_clients_.end() &&
+            protected_write_clients_.size() >= 4096)
+          continue;
+        if (ordered->second <= protected_write_clients_[ordered->first].completed) {
+          out[i] = true;
+          continue;
+        }
+      }
+      if (protected_writes_.size() >= 65536) continue;
+      WriteReceipt cancelled;
+      cancelled.settled = true;
+      protected_writes_.emplace(request.operation_id, std::move(cancelled));
+      terminal_operations.push_back(request.operation_id);
+      out[i] = true;
+      continue;
+    }
+    const uint64_t slot_id = receipt->second.allocation.slot_id;
+    const bool wildcard = request.no_gpu_work_submitted && request.slot_id == 0;
+    if ((!wildcard && slot_id != request.slot_id) ||
+        (!request.transfer_drained && !request.no_gpu_work_submitted))
+      continue;
+    if (!receipt->second.settled) {
+      auto pending = pending_.find(slot_id);
+      if (pending != pending_.end()) pending->second.operation_id.clear();
+      out[i] = AbortLocked(slot_id);
+      receipt->second.settled = true;
+      receipt->second.allocation.pages.clear();
+      receipt->second.allocation.descs.clear();
+      terminal_operations.push_back(request.operation_id);
+    } else {
+      out[i] = true;  // A late abort never removes an already committed object.
+    }
+  }
+  RetireProtectedWritesLocked(terminal_operations);
+  return out;
+}
+
+void PageBackend::RetireProtectedWritesLocked(const std::vector<std::string>& operation_ids) {
+  std::map<std::string, std::vector<std::string>> batches;
+  for (const auto& operation : operation_ids) {
+    auto ordered = OrderedOperation(operation);
+    if (!ordered) continue;  // Opaque IDs retain bounded individual tombstones.
+    auto& client = protected_write_clients_[ordered->first];
+    client.completed = std::max(client.completed, ordered->second);
+    batches[ordered->first].push_back(operation);
+  }
+  for (auto& [name, operations] : batches) {
+    auto& client = protected_write_clients_.at(name);
+    std::unordered_set<std::string> retained(operations.begin(), operations.end());
+    for (const auto& old : client.terminal_operations) {
+      if (!retained.count(old)) protected_writes_.erase(old);
+    }
+    client.terminal_operations = std::move(operations);
+  }
+}
+
 // ---------------------------------------------------------------------------
 //  Resolve (read path; grants a short read lease to fence eviction)
 // ---------------------------------------------------------------------------
@@ -602,6 +771,7 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
   // its own lock, so neither needs exclusion here.
   std::shared_lock<std::shared_mutex> lock(mutex_);
   ResolvedEntry r;
+  if (quarantined_) return r;
   auto it = owned_.find(key);
   if (it == owned_.end()) return r;
   r.outcome = ResolveOutcome::kFound;
@@ -629,6 +799,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
   // building -- is read-only against owned_.  This is the concurrency that the
   // gated exists sweep measures, so it must not serialize.
   std::shared_lock<std::shared_mutex> lock(mutex_);
+  if (quarantined_) return out;
   // One now() for the batch: it runs in well under a millisecond against a
   // TTL measured in seconds, so the last key loses nothing worth a syscall.
   const int64_t lease_deadline = SteadyNs(std::chrono::steady_clock::now() + read_lease_ttl_);
@@ -1050,7 +1221,7 @@ void PageBackend::ReaperSweep() {
   // Expire pending slots whose deadline has passed.  No event is emitted:
   // the slot was never owned, master never indexed it.
   for (auto it = pending_.begin(); it != pending_.end();) {
-    if (it->second.deadline <= now) {
+    if (it->second.operation_id.empty() && it->second.deadline <= now) {
       if (allocator_) allocator_->Deallocate(it->second.pages);
       MORI_UMBP_DEBUG("[PageBackend] reaped pending slot {} ({} bytes)", it->first,
                       it->second.size);

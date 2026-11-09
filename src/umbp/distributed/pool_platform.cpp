@@ -61,7 +61,17 @@ std::chrono::milliseconds SsdReadLeaseTtl() {
 class RealPoolPlatform final : public PoolPlatform {
  public:
   Engines CreateTransferEngine(const PoolClientConfig& config,
-                               const std::vector<BackendInstanceConfig>&) override {
+                               const std::vector<BackendInstanceConfig>& backends) override {
+    if (config.io_engine.mode == UMBPTransferMode::kFabricStrict) {
+      for (const auto& backend : backends) {
+        if (backend.tier == TierType::HBM &&
+            backend.hbm.allocation != UMBPHbmAllocation::kFabricVmm) {
+          MORI_UMBP_ERROR("[PoolPlatform] fabric_strict HBM backend '{}' requires fabric_vmm",
+                          backend.name);
+          return {};
+        }
+      }
+    }
     // Local host, local GPU, file, then remote: preserve the real dispatch order.
     auto composite = std::make_unique<CompositeTransferEngine>();
     composite->AddEngine(std::make_unique<LocalCopyEngine>());
@@ -77,12 +87,12 @@ class RealPoolPlatform final : public PoolPlatform {
     }
 #endif
     PeerDirectory* peers = nullptr;
-    if (!config.io_engine.host.empty()) {
+    if (!config.io_engine.host.empty() || config.io_engine.mode != UMBPTransferMode::kRdma) {
       mori::io::IOEngineConfig io_cfg;
       io_cfg.host = config.io_engine.host;
       io_cfg.port = config.io_engine.port;
       auto rdma = std::make_unique<MoriIoEngine>(config.master_config.node_id, io_cfg,
-                                                 config.staging_buffer_size);
+                                                 config.staging_buffer_size, config.io_engine);
       if (!rdma->Init()) {
         MORI_UMBP_ERROR("[PoolClient] MoriIoEngine init failed on {}:{}", config.io_engine.host,
                         config.io_engine.port);
@@ -116,7 +126,7 @@ class RealPoolPlatform final : public PoolPlatform {
       case TierType::HBM:
         return MakeHbmBackend(page_size, config.hbm.device, config.hbm.buffer_sizes,
                               /*pending_ttl=*/std::chrono::milliseconds{30000},
-                              /*read_lease_ttl=*/DramReadLeaseTtl());
+                              /*read_lease_ttl=*/DramReadLeaseTtl(), config.hbm.allocation);
       case TierType::SSD: {
         SsdBackend::Config ssd_cfg;
         ssd_cfg.page_size = page_size;

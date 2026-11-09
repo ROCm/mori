@@ -80,6 +80,31 @@ TEST(BackendPolicyConfig, NumaPolicyPreservesHostOptionsAndSplitsBothNodes) {
   EXPECT_EQ(dram.prefault_threads, 4);
 }
 
+TEST(BackendPolicyConfig, HbmFabricAllocationIsExplicitOrInherited) {
+  for (const char* allocation : {"", ",\"allocation\":\"fabric_vmm\""}) {
+    const std::string json =
+        std::string(
+            R"({"schema_version":1,"backends":{"h":{"type":"hbm","capacity":"8MiB","devices":[0,1])") +
+        allocation + R"(}},"tiers":[{"name":"hot","backends":{"h":100}}],"entry_tier":"hot"})";
+    auto loaded = LoadBackendPolicyJson(json);
+    ASSERT_TRUE(loaded.ok()) << loaded.error << " " << json;
+    PoolClientConfig output;
+    output.hbm.allocation = UMBPHbmAllocation::kFabricVmm;
+    std::string error;
+    ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, &output, &error)) << error;
+    ASSERT_EQ(output.backends.size(), 2u);
+    for (const auto& backend : output.backends) {
+      EXPECT_EQ(backend.hbm.allocation, UMBPHbmAllocation::kFabricVmm);
+      EXPECT_EQ(backend.hbm.buffer_sizes, (std::vector<uint64_t>{4ULL << 20}));
+    }
+  }
+  const auto invalid = LoadBackendPolicyJson(R"({"schema_version":1,"backends":{
+    "h":{"type":"hbm","capacity":"8MiB","devices":[0],"allocation":"fabric_typo"}},
+    "tiers":[{"name":"hot","backends":{"h":100}}],"entry_tier":"hot"})");
+  EXPECT_FALSE(invalid.ok());
+  EXPECT_NE(invalid.error.find("allocation"), std::string::npos);
+}
+
 // The three-tier example we ship, read from disk rather than copied here, so
 // that editing one without the other fails this test.
 TEST(BackendPolicyConfig, ParsesAndLowersShippedExample) {

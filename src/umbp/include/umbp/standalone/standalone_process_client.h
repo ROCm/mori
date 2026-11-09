@@ -83,6 +83,8 @@ class StandaloneProcessClient : public IUMBPClient {
   }
   UMBPDeploymentMode GetBackendMode() const override { return backend_mode_; }
   bool SupportsRangedIO() const override { return supports_ranged_io_; }
+  bool HasQuarantinedTransfers() const override { return resources_quarantined_.load(); }
+  void QuarantineTransfers() override { resources_quarantined_ = true; }
 
   // `mode` is accepted and ignored: this client owns nothing to pin. It forwards
   // the region to the server, which decides how to declare it to the backend.
@@ -101,6 +103,25 @@ class StandaloneProcessClient : public IUMBPClient {
       const std::vector<std::string>& hashes) override;
 
  private:
+  // Once an RPC was admitted, a lost/exceptional reply cannot prove that the
+  // server stopped touching exported memory. Keep the state sticky and retain
+  // registrations until process teardown rather than allowing a later OK RPC
+  // to make those allocations reusable.
+  template <typename Response, typename Rpc>
+  grpc::Status InvokeTransferRpc(Response& response, Rpc&& rpc) {
+    if (resources_quarantined_) {
+      response.set_resources_quarantined(true);
+      return {grpc::StatusCode::FAILED_PRECONDITION, "standalone exported memory is quarantined"};
+    }
+    try {
+      grpc::Status status = rpc();
+      if (!status.ok() || response.resources_quarantined()) resources_quarantined_ = true;
+      return status;
+    } catch (...) {
+      resources_quarantined_ = true;
+      throw;
+    }
+  }
   std::vector<bool> BatchPutImpl(const std::vector<std::string>& keys,
                                  const std::vector<uintptr_t>& srcs,
                                  const std::vector<size_t>& sizes);
@@ -135,6 +156,7 @@ class StandaloneProcessClient : public IUMBPClient {
 
   mutable std::shared_mutex op_mutex_;
   std::atomic<bool> closing_{false};
+  std::atomic<bool> resources_quarantined_{false};
   bool closed_ = false;
   UMBPDeploymentMode backend_mode_ = UMBPDeploymentMode::StandaloneProcess;
   bool supports_ranged_io_ = false;

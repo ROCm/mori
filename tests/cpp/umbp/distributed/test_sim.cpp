@@ -534,8 +534,9 @@ TEST_F(SimTest, GdsNewReaderDelaysActiveCompletionAndRejectsOverflow) {
       engine.Transfer({{engine.RegisterFile(2, 0, huge), 0,
                         TransferRef::HostBytes(gpu.host_ptr, huge, MemLoc::GPU, 0), 0, huge, 1}},
                       nullptr));
-  auto second = std::async(std::launch::async,
-                           [&] { return engine.Transfer({{file, 0, gpu, 0, kPage, 2}}, nullptr); });
+  auto second = std::async(std::launch::async, [&] {
+    return engine.Transfer({{file, 0, gpu, 0, kPage, 2}}, nullptr);
+  });
   EXPECT_EQ(first.wait_for(230ms), std::future_status::timeout);
   EXPECT_TRUE(first.get());
   EXPECT_GE(Clock::now() - started, 310ms);  // First now finishes near 350ms, not 200ms.
@@ -560,8 +561,9 @@ TEST_F(SimTest, GdsAndOrdinarySameChannelReservationsDoNotOverlap) {
   auto write = std::async(std::launch::async,
                           [&] { return engine.SimulateStorage(false, kPage, 1, false); });
   std::this_thread::sleep_for(20ms);
-  auto later = std::async(std::launch::async,
-                          [&] { return engine.Transfer({{file, 0, gpu, 0, kPage, 1}}, nullptr); });
+  auto later = std::async(std::launch::async, [&] {
+    return engine.Transfer({{file, 0, gpu, 0, kPage, 1}}, nullptr);
+  });
   EXPECT_EQ(write.wait_for(250ms), std::future_status::timeout);
   EXPECT_TRUE(first.get());
   EXPECT_TRUE(write.get());
@@ -1132,6 +1134,62 @@ TEST_P(SimClusterApiTest, RemoteRangedIoRequiresScratch) {
   EXPECT_FALSE(owner->Exists("offload"));
 }
 
+TEST_F(SimClusterTest, DefaultRdmaRemotePutStillServesSsdPeer) {
+  ScopedEnv transport("UMBP_TRANSFER_MODE", "rdma");
+  Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,"bandwidth_bytes_per_second":1e10},
+    "cpu_file":{"channel":"disk","latency_ns":0,"bandwidth_bytes_per_second":1e10},
+    "file_cpu":{"channel":"disk","latency_ns":0,"bandwidth_bytes_per_second":1e10},
+    "remote_read":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e10},
+    "remote_write":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e10}})");
+
+  const auto owner_node = Node("ssd-owner");
+  PoolClientConfig owner_config;
+  owner_config.sim = owner_node.sim;
+  owner_config.master_config = owner_node.distributed->master_config;
+  owner_config.auto_peer_service_port = true;
+  owner_config.medium = TierType::SSD;
+  owner_config.ssd = SsdConfig().ssd;
+  owner_config.ssd_staging_buffer_slots = 8;
+  owner_config.dram_page_size = kPage;
+  ASSERT_EQ(owner_config.io_engine.mode, UMBPTransferMode::kRdma);
+  auto owner = std::make_unique<PoolClient>(owner_config);
+  ASSERT_TRUE(owner->Init());
+  auto* ssd = owner->Backends().Get(TierType::SSD);
+  ASSERT_NE(ssd, nullptr);
+  ASSERT_FALSE(ssd->SupportsProtectedWrites());
+
+  const auto writer_node = Node("ssd-writer", 1);
+  PoolClientConfig writer_config;
+  writer_config.sim = writer_node.sim;
+  writer_config.master_config = writer_node.distributed->master_config;
+  writer_config.auto_peer_service_port = true;
+  writer_config.dram.buffer_sizes = {kPage};
+  writer_config.dram_page_size = kPage;
+  writer_config.cache_remote_fetches = false;
+  ASSERT_EQ(writer_config.io_engine.mode, UMBPTransferMode::kRdma);
+  auto writer = std::make_unique<PoolClient>(writer_config);
+  ASSERT_TRUE(writer->Init());
+  auto* dram = writer->Backends().Get(TierType::DRAM);
+  ASSERT_NE(dram, nullptr);
+  ASSERT_TRUE(writer->RegisterMemory(reinterpret_cast<void*>(ptr_), 64 * kPage));
+
+  // Every object exceeds the writer's capacity, so allocation and commit must
+  // cross the peer RPC boundary into SSD, which advertises completion pins
+  // but intentionally does not support protected-write reservations.
+  ASSERT_TRUE(writer->Put("ssd-whole", reinterpret_cast<void*>(ptr_), 2 * kPage));
+  EXPECT_EQ(
+      writer->BatchPut({"ssd-batch-a", "ssd-batch-b"},
+                       {reinterpret_cast<void*>(ptr_), reinterpret_cast<void*>(ptr_ + 2 * kPage)},
+                       {2 * kPage, 3 * kPage}),
+      (std::vector<bool>{true, true}));
+  for (const auto& key : {"ssd-whole", "ssd-batch-a", "ssd-batch-b"}) {
+    EXPECT_TRUE(ssd->Contains(key));
+    EXPECT_FALSE(dram->Contains(key));
+  }
+  EXPECT_EQ(ssd->OwnedKeyCount(), 3u);
+  EXPECT_FALSE(writer->HasQuarantinedTransfers());
+}
+
 class SimRecacheTest : public SimClusterTest, public ::testing::WithParamInterface<MemLoc> {};
 INSTANTIATE_TEST_SUITE_P(CpuAndGpuCallers, SimRecacheTest,
                          ::testing::Values(MemLoc::CPU, MemLoc::GPU));
@@ -1143,6 +1201,9 @@ TEST_P(SimRecacheTest, RemoteRecacheAndEvictionKeepRealMetadata) {
   ASSERT_TRUE(owner->Put("evicted", payload, kPage));
   owner->Master().FlushHeartbeat();
   auto reader = Pool("reader", true);
+  // Pool() initially registers this virtual range as CPU. Reclassification
+  // to a GPU endpoint must end that registration before changing its type.
+  reader->DeregisterMemory(payload);
   ASSERT_TRUE(
       reader->RegisterMemory(payload, 64 * kPage, GetParam(), GetParam() == MemLoc::GPU ? 0 : -1));
   ASSERT_TRUE(Await([&] { return reader->Exists("cached"); }));

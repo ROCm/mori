@@ -178,7 +178,9 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
     std::vector<const char*> missing;
     if (!node_address.has_value()) missing.push_back("UMBP_NODE_ADDRESS");
     if (!node_id.has_value()) missing.push_back("UMBP_NODE_ID");
-    if (!io_engine_host.has_value()) missing.push_back("UMBP_IO_ENGINE_HOST");
+    if (!io_engine_host.has_value() &&
+        mori::umbp::TransferModeFromEnvironment() == mori::umbp::UMBPTransferMode::kRdma)
+      missing.push_back("UMBP_IO_ENGINE_HOST");
     if (!missing.empty()) {
       std::ostringstream oss;
       oss << "master-backed standalone server requested but missing required env:";

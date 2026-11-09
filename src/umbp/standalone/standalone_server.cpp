@@ -631,8 +631,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
-    SetBool(response, client_->Put(request->key(), ptr, static_cast<size_t>(request->size())));
-    return grpc::Status::OK;
+    return RunTransfer(response, [&] {
+      SetBool(response, client_->Put(request->key(), ptr, static_cast<size_t>(request->size())));
+    });
   }
 
   grpc::Status Get(grpc::ServerContext*, const ::umbp::GetRequest* request,
@@ -648,8 +649,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
-    SetBool(response, client_->Get(request->key(), ptr, static_cast<size_t>(request->size())));
-    return grpc::Status::OK;
+    return RunTransfer(response, [&] {
+      SetBool(response, client_->Get(request->key(), ptr, static_cast<size_t>(request->size())));
+    });
   }
 
   grpc::Status BatchPut(grpc::ServerContext*, const ::umbp::BatchDataRequest* request,
@@ -669,8 +671,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::vector<KvMetadataPin> metadata;
     auto metadata_status = PrepareKvMetadata(request->kv_blocks(), metadata);
     if (!metadata_status.ok()) return metadata_status;
-    FillResults(client_->BatchPut(keys, ptrs, sizes), response);
-    return grpc::Status::OK;
+    return RunTransfer(response,
+                       [&] { FillResults(client_->BatchPut(keys, ptrs, sizes), response); });
   }
 
   grpc::Status BatchPutRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
@@ -720,8 +722,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::vector<KvMetadataPin> metadata;
     auto metadata_status = PrepareKvMetadata(request->kv_blocks(), metadata);
     if (!metadata_status.ok()) return metadata_status;
-    FillResults(client_->BatchPutRanges(keys, object_sizes, ptrs, sizes, offsets), response);
-    return grpc::Status::OK;
+    return RunTransfer(response, [&] {
+      FillResults(client_->BatchPutRanges(keys, object_sizes, ptrs, sizes, offsets), response);
+    });
   }
 
   grpc::Status BatchPutWithDepth(grpc::ServerContext*,
@@ -761,8 +764,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::vector<KvMetadataPin> metadata;
     auto metadata_status = PrepareKvMetadata(request->kv_blocks(), metadata);
     if (!metadata_status.ok()) return metadata_status;
-    FillResults(client_->BatchPutWithDepth(keys, ptrs, sizes, depths), response);
-    return grpc::Status::OK;
+    return RunTransfer(response, [&] {
+      FillResults(client_->BatchPutWithDepth(keys, ptrs, sizes, depths), response);
+    });
   }
 
   grpc::Status BatchGet(grpc::ServerContext*, const ::umbp::BatchDataRequest* request,
@@ -779,8 +783,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
-    FillResults(client_->BatchGet(keys, ptrs, sizes), response);
-    return grpc::Status::OK;
+    return RunTransfer(response,
+                       [&] { FillResults(client_->BatchGet(keys, ptrs, sizes), response); });
   }
 
   grpc::Status BatchGetRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
@@ -858,8 +862,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
             static_cast<size_t>(request->object_offsets(static_cast<int>(cursor))));
       }
     }
-    FillResults(client_->BatchGetRanges(*keys, ptrs, sizes, offsets), response);
-    return grpc::Status::OK;
+    return RunTransfer(response, [&] {
+      FillResults(client_->BatchGetRanges(*keys, ptrs, sizes, offsets), response);
+    });
   }
 
   grpc::Status Exists(grpc::ServerContext*, const ::umbp::KeyRequest* request,
@@ -991,9 +996,17 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                                 const ::umbp::DeregisterMemoryRequest* request,
                                 ::umbp::Empty*) override {
     std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
-    RemoveExternalIdentity(request->client_id());
-    UnmapClient(request->client_id());
-    return grpc::Status::OK;
+    try {
+      if (!UnmapClient(request->client_id()))
+        return {grpc::StatusCode::FAILED_PRECONDITION,
+                "exported memory remains quarantined after an unconfirmed transfer drain"};
+      RemoveExternalIdentity(request->client_id());
+      return grpc::Status::OK;
+    } catch (...) {
+      transfer_resources_quarantined_ = true;
+      return {grpc::StatusCode::FAILED_PRECONDITION,
+              "deregistration failed without confirmed memory release"};
+    }
   }
 
   grpc::Status ReportExternalKvBlocks(grpc::ServerContext*,
@@ -1417,8 +1430,32 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     SetBool(response, true);
   }
 
-  void RegisterGpuIpc(const ::umbp::RegisterMemoryRequest& request,
-                      ::umbp::BoolResponse* response) {
+  void RegisterGpuIpc(const ::umbp::RegisterMemoryRequest& input, ::umbp::BoolResponse* response) {
+    auto request = input;
+    if (!request.gpu_uuid().empty()) {
+      int count = 0, matched = -1;
+      if (request.gpu_uuid().size() != sizeof(hipUUID) || hipGetDeviceCount(&count) != hipSuccess) {
+        SetBool(response, false, "invalid or unavailable GPU UUID");
+        return;
+      }
+      for (int device = 0; device < count; ++device) {
+        hipUUID uuid{};
+        if (hipDeviceGetUuid(&uuid, device) == hipSuccess &&
+            std::memcmp(&uuid, request.gpu_uuid().data(), sizeof(uuid)) == 0) {
+          matched = device;
+          break;
+        }
+      }
+      if (matched < 0) {
+        SetBool(response, false, "worker GPU UUID is not visible to the server");
+        return;
+      }
+      request.set_device_id(matched);
+    } else if (backend_config_.distributed &&
+               backend_config_.distributed->kv_ranged_path == UMBPKvRangedPath::kGpuDirect) {
+      SetBool(response, false, "GPU direct IPC registration requires physical GPU UUID");
+      return;
+    }
     const UMBPDeploymentMode mode = client_->GetDeploymentMode();
     if (mode != UMBPDeploymentMode::Distributed) {
       SetBool(response, false, "GPU IPC registration requires a Distributed backend");
@@ -1496,11 +1533,13 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     // becomes its own transfer plan instead of sharing one. Measured on
     // DSv4-Pro/TP8 at 256K, that is plan = 23.2% of a ranged call against 1.4%
     // once declared.
-    if (!RegisterBackendMemory(entry.base, static_cast<size_t>(entry.size),
-                               mori::io::MemoryLocationType::GPU, entry.device_id,
-                               mode == UMBPDeploymentMode::Local
-                                   ? MemoryRegistration::kPinned
-                                   : MemoryRegistration::kLocalCopyOnly)) {
+    if (!RegisterBackendMemory(
+            entry.base, static_cast<size_t>(entry.size), mori::io::MemoryLocationType::GPU,
+            entry.device_id,
+            backend_config_.distributed &&
+                    backend_config_.distributed->kv_ranged_path == UMBPKvRangedPath::kGpuDirect
+                ? MemoryRegistration::kFabricLocal
+                : MemoryRegistration::kLocalCopyOnly)) {
       ReleaseIpcMapping(key);
       SetBool(response, false, "inner backend RegisterMemory failed");
       return;
@@ -1545,23 +1584,31 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return ipc_maps_.size();
   }
 
-  void UnmapClient(const std::string& client_id) {
+  bool UnmapClient(const std::string& client_id) {
     std::vector<RegisteredMemory> mems;
     {
       std::unique_lock<std::shared_mutex> lock(memory_mu_);
       auto it = memory_.find(client_id);
-      if (it == memory_.end()) return;
+      if (it == memory_.end()) return true;
       mems.swap(it->second);
       memory_.erase(it);
     }
     const size_t mappings_before = IpcMappingCount();
-    for (const auto& mem : mems) ReleaseRegisteredMemory(mem);
+    std::vector<RegisteredMemory> retained;
+    for (const auto& mem : mems)
+      if (!ReleaseRegisteredMemory(mem)) retained.push_back(mem);
+    if (!retained.empty()) {
+      std::unique_lock<std::shared_mutex> lock(memory_mu_);
+      auto& entries = memory_[client_id];
+      entries.insert(entries.end(), retained.begin(), retained.end());
+    }
     const size_t mappings_after = IpcMappingCount();
     MORI_UMBP_INFO(
         "[StandaloneServer] unmapped client_id={} regions={} ipc_allocations_released={} "
         "ipc_allocations_remaining={}",
         client_id, mems.size(),
         mappings_before >= mappings_after ? mappings_before - mappings_after : 0, mappings_after);
+    return retained.empty();
   }
 
   void UnmapAll() {
@@ -1586,21 +1633,34 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                              int device = -1,
                              MemoryRegistration mode = MemoryRegistration::kPinned) {
     std::unique_lock<std::shared_mutex> lock(client_mu_);
-    if (shutdown_.load()) return false;
+    if (shutdown_.load() || HasQuarantinedTransfersLocked()) return false;
     return client_->RegisterMemory(reinterpret_cast<uintptr_t>(base), size, loc, device, mode);
   }
 
-  void ReleaseRegisteredMemory(const RegisteredMemory& mem) {
-    if (!mem.base) return;
+  bool ReleaseRegisteredMemory(const RegisteredMemory& mem) {
+    if (!mem.base) return true;
     {
       std::unique_lock<std::shared_mutex> lock(client_mu_);
-      client_->DeregisterMemory(reinterpret_cast<uintptr_t>(mem.base));
+      if (HasQuarantinedTransfersLocked()) {
+        MORI_UMBP_ERROR(
+            "[StandaloneServer] retaining IPC/host mapping after unconfirmed GPU drain");
+        return false;
+      }
+      try {
+        client_->DeregisterMemory(reinterpret_cast<uintptr_t>(mem.base));
+      } catch (...) {
+        transfer_resources_quarantined_ = true;
+        client_->QuarantineTransfers();
+        MORI_UMBP_ERROR("[StandaloneServer] backend deregistration failed; retaining mapping");
+        return false;
+      }
     }
     if (mem.kind == MemoryKind::kGpuIpc) {
       ReleaseIpcMapping(IpcKey{mem.client_id, mem.device_id, mem.alloc_base});
     } else {
       munmap(mem.base, static_cast<size_t>(mem.size));
     }
+    return true;
   }
 
   // Resolves (client_id, region_base, offset) to a server-local pointer.
@@ -1718,6 +1778,35 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return sizes;
   }
 
+  bool HasQuarantinedTransfersLocked() const {
+    return transfer_resources_quarantined_.load() || client_->HasQuarantinedTransfers();
+  }
+
+  template <typename Response, typename Operation>
+  grpc::Status RunTransfer(Response* response, Operation&& operation) {
+    // DataPathLock already holds client_mu_. Do not acquire it again here.
+    if (HasQuarantinedTransfersLocked()) {
+      response->set_resources_quarantined(true);
+      return {grpc::StatusCode::FAILED_PRECONDITION,
+              "standalone backend resources are quarantined"};
+    }
+    try {
+      operation();
+      response->set_resources_quarantined(HasQuarantinedTransfersLocked());
+      return grpc::Status::OK;
+    } catch (const std::exception& error) {
+      transfer_resources_quarantined_ = true;
+      client_->QuarantineTransfers();
+      response->set_resources_quarantined(true);
+      return {grpc::StatusCode::INTERNAL, error.what()};
+    } catch (...) {
+      transfer_resources_quarantined_ = true;
+      client_->QuarantineTransfers();
+      response->set_resources_quarantined(true);
+      return {grpc::StatusCode::INTERNAL, "standalone transfer failed without a confirmed drain"};
+    }
+  }
+
   static void FillResults(const std::vector<bool>& results, ::umbp::BatchBoolResponse* response) {
     response->mutable_ok()->Reserve(static_cast<int>(results.size()));
     for (bool ok : results) response->add_ok(ok);
@@ -1764,6 +1853,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   std::string fd_socket_path_;
   std::unique_ptr<grpc::Server> server_;
   std::atomic<bool> shutdown_{false};
+  std::atomic<bool> transfer_resources_quarantined_{false};
 
   // Data operations acquire client_mu_ before memory_mu_ and keep the client
   // lock through the backend call, making it the lifetime barrier for resolved

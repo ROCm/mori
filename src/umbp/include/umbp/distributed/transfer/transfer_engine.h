@@ -174,6 +174,14 @@ class MemoryRegistrar {
   // still gets a usable local-only endpoint rather than a failure.
   virtual TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
                                      int device) = 0;
+  // Restrict transport registration, e.g. a caller-owned GPU IPC mapping must
+  // not be pinned by RDMA merely to become a local FABRIC destination.
+  virtual TransferRef RegisterMemoryWithBackends(void* base, size_t size,
+                                                 mori::io::MemoryLocationType loc, int device,
+                                                 uint32_t allowed_backend_mask) {
+    (void)allowed_backend_mask;
+    return RegisterMemory(base, size, loc, device);
+  }
 
   // Register an O_DIRECT file range so a file engine can move it directly
   // between the drive and device memory, returning a File TransferRef with the
@@ -350,6 +358,9 @@ struct TransferFailure {
   uint32_t code = 0;
   std::string message;
   std::string endpoint;  // remote engine key, for diagnosis
+  // GPU termination could not be proved; upper layers must retain all backing
+  // pages/pins rather than aborting or reusing them on this terminal error.
+  bool resources_quarantined = false;
 };
 
 // Posted, not-yet-settled work.  OWNS everything Submit referenced — mori-io's
@@ -370,6 +381,14 @@ class TransferHandle {
   // plan that did not succeed.  Never breaks early — every plan is waited, so
   // no status is left live.  Idempotent: a second call appends nothing.
   virtual void Wait(std::vector<TransferFailure>* failures) = 0;
+
+  // Enqueue GPU readiness on the caller's stream. True only means the stream
+  // dependency is installed; the handle and all memory still need host Wait
+  // before release. False asks the caller to use the compatible host wait.
+  virtual bool WaitOnStream(void* stream) {
+    (void)stream;
+    return false;
+  }
 
  protected:
   TransferHandle() = default;

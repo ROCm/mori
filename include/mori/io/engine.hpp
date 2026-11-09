@@ -71,9 +71,12 @@ class IOEngineSession {
 
   IOEngine* engine{nullptr};
   std::shared_ptr<BackendSession> backendSess{nullptr};
+  MemoryDesc localMemory;
 };
 
 class IOEngine {
+  friend class IOEngineSession;
+
  public:
   IOEngine(EngineKey, IOEngineConfig);
   ~IOEngine();
@@ -87,7 +90,14 @@ class IOEngine {
   void DeregisterRemoteEngine(const EngineDesc&);
 
   MemoryDesc RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc);
+  MemoryDesc RegisterMemoryWithBackends(void* data, size_t size, int device, MemoryLocationType loc,
+                                        uint32_t allowedBackendMask);
   void DeregisterMemory(const MemoryDesc& desc);
+  // Remote invalidation does not touch the local memory-id namespace.
+  void InvalidateRemoteMemory(const MemoryDesc& remote);
+  void SetTransferBackendMask(uint32_t mask);
+  std::optional<BackendType> GetSelectedBackend(const MemoryDesc& local, const MemoryDesc& remote);
+  bool IsFabricReady(int device);
 
   TransferUniqueId AllocateTransferUniqueId();
   void Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
@@ -153,6 +163,9 @@ class IOEngine {
   };
 
   Backend* SelectBackend(const MemoryDesc& local, const MemoryDesc& remote);
+  // The lease gates deregistration until backend submission has returned;
+  // its status observer then holds the registration through GPU completion.
+  std::shared_ptr<void> RetainLocalRegistration(const MemoryDesc& local, TransferStatus* status);
   void CreateSimBackend(BackendType requested, const BackendConfig& beConfig);
   bool SupportsXgmiBackendByP2P() const;
   void EnsureXgmiBackendCreatedIfSupported();
@@ -168,7 +181,24 @@ class IOEngine {
  private:
   std::atomic<uint32_t> nextTransferUid{0};
   std::atomic<uint32_t> nextMemUid{0};
+  std::atomic<uint32_t> transferBackendMask{kAllBackendMask};
   std::unordered_map<MemoryUniqueId, MemoryDesc> memPool;
+  std::mutex memPoolMu;
+  struct RegistrationTicket {
+    std::recursive_mutex mutex;
+    std::condition_variable_any submissionReady;
+    bool submissionComplete{false};
+    TransferStatus* status{nullptr};
+  };
+  struct RegistrationState {
+    std::mutex mutex;
+    std::mutex deregisterMutex;
+    bool accepting{true};
+    bool quarantined{false};
+    bool deregistered{false};
+    std::vector<std::weak_ptr<RegistrationTicket>> tickets;
+  };
+  std::unordered_map<MemoryUniqueId, std::shared_ptr<RegistrationState>> registrationStates;
   std::unordered_map<BackendType, std::unique_ptr<Backend>> backends;
   mutable std::shared_mutex routeCacheMu;
   std::unordered_map<RouteCacheKey, BackendType, RouteCacheKeyHash> routeCache;

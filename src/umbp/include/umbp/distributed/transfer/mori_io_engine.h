@@ -22,6 +22,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "mori/io/engine.hpp"
+#include "umbp/common/config.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
 
@@ -40,7 +42,7 @@ std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& loca
                                                          uint64_t bounce_size,
                                                          const TransferRef& bounce_ref);
 
-// The mori-io (RDMA) implementation of TransferEngine, and the only place in
+// The mori-io (RDMA/FABRIC) implementation of TransferEngine, and the only place in
 // UMBP that names mori::io::IOEngine.
 //
 // Everything moved here from PoolClient in Phase 6 is something that had to
@@ -61,10 +63,11 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   // `bounce_bytes` sizes the single staging region used when a caller's buffer
   // is not registered.  Zero disables staging: an unregistered endpoint is then
   // rejected by Plan rather than bounced.
-  MoriIoEngine(std::string engine_key, mori::io::IOEngineConfig io_config, uint64_t bounce_bytes);
+  MoriIoEngine(std::string engine_key, mori::io::IOEngineConfig io_config, uint64_t bounce_bytes,
+               UMBPIoEngineConfig transport_config = {});
   ~MoriIoEngine() override;
 
-  // Create the IOEngine + RDMA backend and register the bounce buffer.
+  // Create configured IO backends, load FABRIC copies, and register any CPU bounce buffer.
   // Returns false if the engine could not be created; the object is then
   // inert (Active() == false) rather than unusable — a node with no RDMA still
   // registers memory (host_ptr only) and serves purely local transfers through
@@ -80,6 +83,8 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
 
   TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
                              int device) override;
+  TransferRef RegisterMemoryWithBackends(void* base, size_t size, mori::io::MemoryLocationType loc,
+                                         int device, uint32_t allowed_backend_mask) override;
   void Deregister(const TransferRef& ref) override;
 
   // True iff exactly one endpoint is a registered REMOTE memory and the other
@@ -95,6 +100,7 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
+  std::vector<MetricSample> SampleMetrics() const override;
 
   // ---- PeerDirectory ----
   //
@@ -138,6 +144,11 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   std::string local_engine_key_;
   mori::io::IOEngineConfig io_config_;
   std::unique_ptr<mori::io::IOEngine> io_engine_;
+  UMBPIoEngineConfig transport_config_;
+  uint32_t enabled_backend_mask_ = 0;
+  static constexpr size_t kBackendCount = 6;
+  std::array<std::array<std::atomic<uint64_t>, 2>, kBackendCount> submitted_bytes_{};
+  std::array<std::array<std::atomic<uint64_t>, 2>, kBackendCount> submitted_plans_{};
 
   mutable std::mutex remotes_mutex_;
   std::unordered_map<std::string, RemoteNode> remotes_;

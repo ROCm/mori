@@ -101,7 +101,8 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
   // Zero-sized is the default and means "this deployment does not do ranged
   // I/O": no arena, no registration, and SupportsRangedIO() reports false, so
   // a client that never issues ranged operations stops paying for the arena.
-  if (dc.ranged_scratch_size > 0) AllocateRangedScratch(dc);
+  if (dc.ranged_scratch_size > 0 && dc.kv_ranged_path != UMBPKvRangedPath::kGpuDirect)
+    AllocateRangedScratch(dc);
 
   auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership),
                                       config.dram.high_watermark, config.dram.low_watermark);
@@ -300,6 +301,21 @@ std::vector<bool> DistributedClient::BatchGetRanges(
   return call.Result(pool_client_->BatchGetRanges(keys, dst_ptrs, sizes, src_offsets));
 }
 
+std::shared_ptr<PoolClient::KvReadHandle> DistributedClient::SubmitBatchGetRangesGpuDirect(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  if (closing_) return nullptr;
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return nullptr;
+  std::vector<std::vector<void*>> dst_ptrs(dsts.size());
+  for (size_t i = 0; i < dsts.size(); ++i) {
+    dst_ptrs[i].reserve(dsts[i].size());
+    for (uintptr_t ptr : dsts[i]) dst_ptrs[i].push_back(reinterpret_cast<void*>(ptr));
+  }
+  return pool_client_->SubmitBatchGetRangesGpuDirect(keys, dst_ptrs, sizes, src_offsets);
+}
+
 std::vector<bool> DistributedClient::BatchPutRanges(
     const std::vector<std::string>& keys, const std::vector<size_t>& object_sizes,
     const std::vector<std::vector<uintptr_t>>& srcs, const std::vector<std::vector<size_t>>& sizes,
@@ -421,6 +437,7 @@ void DistributedClient::Close() {
 
   if (pool_client_) {
     pool_client_->Shutdown();
+    quarantined_ = pool_client_->HasQuarantinedTransfers();
     pool_client_.reset();
   }
 
@@ -518,15 +535,27 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
 }
 
 void DistributedClient::FreeRangedScratch() {
-  for (auto& handle : ranged_scratch_handles_) platform_->FreeHost(handle);
+  if (!quarantined_)
+    for (auto& handle : ranged_scratch_handles_) platform_->FreeHost(handle);
   ranged_scratch_handles_.clear();
   ranged_get_scratch_.clear();
   ranged_put_scratch_.clear();
 }
 
 bool DistributedClient::IsDistributed() const { return true; }
+bool DistributedClient::HasQuarantinedTransfers() const {
+  std::shared_lock lk(op_mutex_);
+  return quarantined_ || (pool_client_ && pool_client_->HasQuarantinedTransfers());
+}
+void DistributedClient::QuarantineTransfers() {
+  std::unique_lock lk(op_mutex_);
+  quarantined_ = true;
+  if (pool_client_) pool_client_->QuarantineTransfers();
+}
 
 bool DistributedClient::SupportsRangedIO() const {
+  if (config_.distributed && config_.distributed->kv_ranged_path == UMBPKvRangedPath::kGpuDirect)
+    return true;
   // The scratch arenas are the whole opt-in.  They are purely a remote-path
   // resource -- remote gets are staged in them, remote puts assembled in them --
   // and they default to zero, so a deployment that never issues ranged I/O

@@ -122,6 +122,14 @@ class InstrumentedBackend final : public MediumBackend {
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& reqs) override;
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& reqs) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
+  bool SupportsProtectedWrites() const override { return inner_->SupportsProtectedWrites(); }
+  bool QuarantineBackingMemory() override { return inner_->QuarantineBackingMemory(); }
+  std::vector<bool> BatchAbortProtected(
+      const std::vector<ProtectedAbortRequest>& requests) override {
+    auto results = inner_->BatchAbortProtected(requests);
+    NotifyChange();
+    return results;
+  }
   std::vector<ResolvedEntry> BatchResolve(
       const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
       ResolveReader reader = ResolveReader::kRemote,

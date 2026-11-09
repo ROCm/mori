@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "umbp/common/config.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -65,6 +66,7 @@ struct PolicyBackendSpec {
   int staging_slots = 0;
   // SSD only, optional: smaller objects land here only if no other tier member takes them.
   uint64_t min_object_bytes = 0;
+  std::optional<UMBPHbmAllocation> hbm_allocation;
 };
 
 struct LogicalTierBackendConfig {

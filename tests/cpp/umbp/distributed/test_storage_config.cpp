@@ -27,6 +27,7 @@
 #include <string>
 
 #include "umbp/common/config.h"
+#include "umbp/distributed/config.h"
 
 namespace mori::umbp {
 namespace {
@@ -118,6 +119,97 @@ TEST(StorageConfig, DefaultConstructionReadsEnvironment) {
   EXPECT_EQ(config.sim.profile_path, "/tmp/sim-profile.json");
   EXPECT_EQ(config.dram.capacity_bytes, 12345u);
   EXPECT_FALSE(UMBPConfig().sim.enabled);
+}
+
+class ScopedEnvironment {
+ public:
+  ScopedEnvironment(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) previous_ = std::string(old);
+    if (value)
+      setenv(name, value, 1);
+    else
+      unsetenv(name);
+  }
+  ~ScopedEnvironment() {
+    if (previous_)
+      setenv(name_.c_str(), previous_->c_str(), 1);
+    else
+      unsetenv(name_.c_str());
+  }
+
+ private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
+
+TEST(FabricStorageConfig, DefaultsPreserveRdmaAndHipAllocation) {
+  ScopedEnvironment mode("UMBP_TRANSFER_MODE", nullptr);
+  ScopedEnvironment allocation("UMBP_HBM_ALLOCATION", nullptr);
+  ScopedEnvironment placement("UMBP_KV_PUT_PLACEMENT", nullptr);
+  ScopedEnvironment ranged("UMBP_KV_RANGED_PATH", nullptr);
+  UMBPDistributedConfig config;
+  EXPECT_EQ(config.io_engine.mode, UMBPTransferMode::kRdma);
+  EXPECT_EQ(config.hbm.allocation, UMBPHbmAllocation::kHipMalloc);
+  EXPECT_EQ(config.kv_put_placement, UMBPKvPutPlacement::kMaster);
+  EXPECT_EQ(config.kv_ranged_path, UMBPKvRangedPath::kLegacy);
+}
+
+TEST(FabricStorageConfig, EnvironmentOptionsSurviveLowering) {
+  ScopedEnvironment mode("UMBP_TRANSFER_MODE", "fabric_strict");
+  ScopedEnvironment module("UMBP_FABRIC_KERNEL_PATH", "/tmp/fabric.hsaco");
+  ScopedEnvironment allocation("UMBP_HBM_ALLOCATION", "fabric_vmm");
+  ScopedEnvironment placement("UMBP_KV_PUT_PLACEMENT", "owner_local");
+  ScopedEnvironment ranged("UMBP_KV_RANGED_PATH", "gpu_direct");
+  ScopedEnvironment reads("UMBP_KV_MAX_INFLIGHT_READS", "7");
+  ScopedEnvironment bytes("UMBP_KV_MAX_INFLIGHT_BYTES", "1234567");
+  UMBPDistributedConfig config;
+  config.hbm.device = 3;
+  config.hbm.capacity_bytes = 123456;
+  const auto lowered = ToPoolClientConfig(config, {});
+  EXPECT_EQ(lowered.io_engine.mode, UMBPTransferMode::kFabricStrict);
+  EXPECT_EQ(lowered.io_engine.fabric_kernel_path, "/tmp/fabric.hsaco");
+  EXPECT_EQ(lowered.hbm.allocation, UMBPHbmAllocation::kFabricVmm);
+  EXPECT_EQ(lowered.hbm.device, 3);
+  EXPECT_EQ(lowered.hbm.buffer_sizes, (std::vector<uint64_t>{123456}));
+  EXPECT_EQ(lowered.kv_put_placement, UMBPKvPutPlacement::kOwnerLocal);
+  EXPECT_EQ(lowered.kv_ranged_path, UMBPKvRangedPath::kGpuDirect);
+  EXPECT_EQ(lowered.kv_max_inflight_reads, 7u);
+  EXPECT_EQ(lowered.kv_max_inflight_bytes, 1234567u);
+}
+
+TEST(FabricStorageConfig, RejectsUnknownTransportBeforeHardwareInitialization) {
+  ScopedEnvironment mode("UMBP_TRANSFER_MODE", "fabric_typo");
+  EXPECT_THROW(UMBPDistributedConfig{}, std::invalid_argument);
+}
+
+TEST(FabricStorageConfig, RejectsNonpositiveOrMalformedBudgets) {
+  for (const char* value : {"0", "-1", "7garbage"}) {
+    ScopedEnvironment reads("UMBP_KV_MAX_INFLIGHT_READS", value);
+    EXPECT_THROW(UMBPDistributedConfig{}, std::invalid_argument) << value;
+  }
+}
+
+TEST(FabricStorageConfig, StrictAllowsAConsumerWithoutAnExportedLocalHbmPool) {
+  UMBPConfig config;
+  config.ssd.enabled = false;
+  config.distributed = UMBPDistributedConfig{};
+  auto& distributed = *config.distributed;
+  distributed.master_config.node_id = "consumer";
+  distributed.master_config.node_address = "127.0.0.1:5000";
+  distributed.io_engine.mode = UMBPTransferMode::kFabricStrict;
+  distributed.io_engine.fabric_kernel_path = "/tmp/fabric.hsaco";
+  std::string error;
+  ASSERT_TRUE(config.Validate(&error)) << error;
+  distributed.medium = UMBPMedium::HBM;
+  distributed.hbm.capacity_bytes = 4096;
+  distributed.hbm.allocation = UMBPHbmAllocation::kHipMalloc;
+  EXPECT_FALSE(config.Validate(&error));
+  EXPECT_NE(error.find("fabric_vmm"), std::string::npos);
+  distributed.hbm.allocation = UMBPHbmAllocation::kFabricVmm;
+  EXPECT_TRUE(config.Validate(&error)) << error;
+  distributed.io_engine.fabric_kernel_path.clear();
+  EXPECT_FALSE(config.Validate(&error));
+  EXPECT_NE(error.find("fabric_kernel_path"), std::string::npos);
 }
 
 }  // namespace

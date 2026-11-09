@@ -122,6 +122,11 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
 PeerPool::~PeerPool() {
   StopLocalEviction();  // first: a pass may still be using the transition worker
   StopTransitionWorker();
+  // An RPC server stopping does not fence remote GPU loads. Retain active
+  // holds so PageBackend::Shutdown can quarantine its backing allocation.
+  for (auto& [operation, receipt] : read_receipts_) {
+    if (!receipt.released) (void)new PoolReadGrant(std::move(receipt.grant));
+  }
 }
 
 bool PeerPool::EnqueueTransition(TransitionJob job) {
@@ -563,7 +568,28 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
   std::vector<size_t> next_candidate(requests.size(), 0);
   std::vector<size_t> active;
   active.reserve(requests.size());
+  std::unordered_set<std::string> new_operations;
   for (size_t i = 0; i < requests.size(); ++i) {
+    if (!requests[i].operation_id.empty()) {
+      if (requests[i].expected_pool_generation != clear_epoch_) continue;
+      auto receipt = protected_placements_.find(requests[i].operation_id);
+      if (receipt != protected_placements_.end()) {
+        if (receipt->second.generation == clear_epoch_ && receipt->second.key == requests[i].key &&
+            receipt->second.size == requests[i].size &&
+            (!receipt->second.settled || receipt->second.allocation.allocation.outcome ==
+                                             AllocateOutcome::kSuccessAlreadyExists))
+          out[i] = receipt->second.allocation;
+        continue;
+      }
+      if (!new_operations.insert(requests[i].operation_id).second) continue;
+      if (auto ordered = OrderedOperation(requests[i].operation_id)) {
+        if (protected_write_clients_.find(ordered->first) == protected_write_clients_.end() &&
+            protected_write_clients_.size() >= 4096)
+          continue;
+        if (ordered->second <= protected_write_clients_[ordered->first].completed) continue;
+      }
+      if (protected_placements_.size() >= 65536) continue;
+    }
     auto existing = placements_.find(requests[i].key);
     if (existing != placements_.end()) {
       auto* existing_backend = backends_->Get(existing->second);
@@ -635,20 +661,29 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
       retry.push_back(index);
     };
 
-    for (const auto& [backend_id, indices] : by_backend) {
+    for (const auto& [backend_id, assigned_indices] : by_backend) {
       auto* backend = backends_->Get(backend_id);
       if (backend == nullptr) {
-        for (size_t index : indices) advance(index);
+        for (size_t index : assigned_indices) advance(index);
         continue;
+      }
+      std::vector<size_t> indices;
+      for (size_t index : assigned_indices) {
+        if (!requests[index].operation_id.empty() && !backend->SupportsProtectedWrites()) {
+          pending_keys_.erase(requests[index].key);
+        } else {
+          indices.push_back(index);
+        }
       }
 
       std::vector<AllocateRequest> backend_requests;
       backend_requests.reserve(indices.size());
       for (size_t index : indices) {
-        backend_requests.push_back(AllocateRequest{requests[index].key, requests[index].size,
-                                                   requests[index].preferred_numa_node});
+        AllocateRequest request{requests[index].key, requests[index].size,
+                                requests[index].preferred_numa_node};
+        request.operation_id = requests[index].operation_id;
+        backend_requests.push_back(std::move(request));
       }
-
       auto results = backend->BatchAllocate(backend_requests);
       for (size_t i = 0; i < indices.size(); ++i) {
         const size_t index = indices[i];
@@ -665,7 +700,8 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
             const auto expires_at =
                 ttl_ms == 0 ? std::chrono::steady_clock::time_point::max()
                             : std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms);
-            pending_keys_[requests[index].key] = PendingPlacement{backend_id, slot_id, expires_at};
+            pending_keys_[requests[index].key] =
+                PendingPlacement{backend_id, slot_id, expires_at, requests[index].operation_id};
             pending_slots_[{backend_id, slot_id}] = requests[index].key;
             break;
           }
@@ -685,6 +721,19 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
     }
     active = std::move(retry);
   }
+  std::vector<std::string> terminal_operations;
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const bool allocated = out[i].allocation.outcome == AllocateOutcome::kSuccessAllocated;
+    const bool already_exists = out[i].allocation.outcome == AllocateOutcome::kSuccessAlreadyExists;
+    if (!requests[i].operation_id.empty() && (allocated || already_exists)) {
+      protected_placements_.emplace(
+          requests[i].operation_id,
+          ProtectedPlacement{
+              requests[i].key, requests[i].size, out[i], already_exists, {}, clear_epoch_});
+      if (already_exists) terminal_operations.push_back(requests[i].operation_id);
+    }
+  }
+  RetireProtectedWritesLocked(terminal_operations);
   return out;
 }
 
@@ -705,7 +754,37 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
 
   std::map<uint32_t, std::vector<size_t>> by_backend;
   std::set<std::pair<uint32_t, uint64_t>> accepted_slots;
+  std::vector<std::string> terminal_operations;
   for (size_t i = 0; i < requests.size(); ++i) {
+    if (!requests[i].operation_id.empty()) {
+      auto receipt = protected_placements_.find(requests[i].operation_id);
+      if (receipt == protected_placements_.end() || receipt->second.key != requests[i].key ||
+          receipt->second.allocation.backend_id != requests[i].slot.backend_id ||
+          receipt->second.allocation.allocation.slot_id != requests[i].slot.local_slot_id ||
+          !requests[i].transfer_drained)
+        continue;
+      if (receipt->second.settled) {
+        out[i] = receipt->second.commit;
+        continue;
+      }
+      auto* backend = backends_->Get(requests[i].slot.backend_id);
+      if (backend == nullptr) continue;
+      auto result = backend->BatchCommit({CommitRequest{
+          requests[i].slot.local_slot_id, requests[i].key, requests[i].operation_id, true}});
+      if (result.size() != 1) continue;
+      out[i] = PoolCommitResult{requests[i].slot.backend_id, result.front()};
+      receipt->second.settled = true;
+      receipt->second.commit = out[i];
+      receipt->second.allocation.allocation.pages.clear();
+      receipt->second.allocation.allocation.descs.clear();
+      terminal_operations.push_back(requests[i].operation_id);
+      release_pending(requests[i].slot);
+      if (out[i].commit.success) {
+        placements_[requests[i].key] = requests[i].slot.backend_id;
+        TouchLocked(requests[i].key);
+      }
+      continue;
+    }
     const auto slot_key =
         std::make_pair(requests[i].slot.backend_id, requests[i].slot.local_slot_id);
     if (requests[i].slot.backend_id >= BackendRegistry::kMaxBackends ||
@@ -720,6 +799,7 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
         pending->second.local_slot_id != requests[i].slot.local_slot_id) {
       continue;
     }
+    if (!pending->second.operation_id.empty()) continue;
     if (pending->second.expires_at <= std::chrono::steady_clock::now()) {
       auto* backend = backends_->Get(requests[i].slot.backend_id);
       if (backend != nullptr) backend->BatchAbort({requests[i].slot.local_slot_id});
@@ -733,6 +813,7 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
     pending->second.expires_at = std::chrono::steady_clock::time_point::max();
     by_backend[requests[i].slot.backend_id].push_back(i);
   }
+  RetireProtectedWritesLocked(terminal_operations);
 
   // Unlocked: an SSD commit is the device write, and every lookup and read
   // needs this lock.
@@ -808,10 +889,183 @@ std::vector<bool> PeerPool::BatchAbort(const std::vector<PoolSlotRef>& slots) {
     auto results = backend->BatchAbort(local_slot_ids);
     for (size_t i = 0; i < indices.size(); ++i) {
       if (i < results.size()) out[indices[i]] = results[i];
-      release_pending(slots[indices[i]]);
+      if (out[indices[i]]) release_pending(slots[indices[i]]);
     }
   }
   return out;
+}
+
+uint64_t PeerPool::Generation() const {
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  return clear_epoch_;
+}
+
+PoolReadGrant PeerPool::AcquireReadBatch(const std::vector<std::string>& keys,
+                                         const std::string& operation_id,
+                                         uint64_t expected_generation, bool include_descs) {
+  std::lock_guard<std::mutex> lock(read_pin_mutex_);
+  PoolReadGrant rejected;
+  rejected.generation = Generation();
+  if (operation_id.empty() || rejected.generation != expected_generation) return rejected;
+  auto old = read_receipts_.find(operation_id);
+  if (old != read_receipts_.end()) {
+    if (!old->second.released && old->second.keys == keys &&
+        old->second.grant.generation == expected_generation)
+      return old->second.grant;
+    return rejected;
+  }
+  if (auto ordered = OrderedOperation(operation_id)) {
+    if (read_clients_.find(ordered->first) == read_clients_.end() && read_clients_.size() >= 4096)
+      return rejected;
+    if (ordered->second <= read_clients_[ordered->first]) return rejected;
+  }
+  if (read_receipts_.size() >= 65536) return rejected;
+  auto entries = BatchResolve(keys, include_descs, false, ResolveReader::kLocal);
+  if (Generation() != expected_generation) return rejected;
+  for (auto& entry : entries) {
+    // A backend that cannot provide a completion hold must fail closed.
+    if (entry.resolved.found && !entry.resolved.hold) {
+      entry.resolved = ResolvedEntry{};
+      entry.resolved.outcome = ResolveOutcome::kFailed;
+    }
+  }
+  PoolReadGrant grant{true, next_read_token_++, expected_generation, std::move(entries)};
+  read_tokens_.emplace(grant.token, operation_id);
+  read_receipts_.emplace(operation_id, ReadReceipt{keys, grant, false});
+  return grant;
+}
+
+std::vector<bool> PeerPool::ReleaseReadPins(const std::vector<uint64_t>& tokens) {
+  std::lock_guard<std::mutex> lock(read_pin_mutex_);
+  std::vector<bool> out(tokens.size(), false);
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    auto token = read_tokens_.find(tokens[i]);
+    if (token == read_tokens_.end()) {
+      out[i] = tokens[i] > 0 && tokens[i] < next_read_token_;
+      continue;
+    }
+    auto& receipt = read_receipts_.at(token->second);
+    // Receipt/token tombstones remain, so duplicate release is harmless and a
+    // retried acquire cannot produce new references to recycled pages.
+    receipt.released = true;
+    receipt.grant.entries.clear();
+    if (auto ordered = OrderedOperation(token->second)) {
+      auto& completed = read_clients_[ordered->first];
+      completed = std::max(completed, ordered->second);
+      read_receipts_.erase(token->second);
+      read_tokens_.erase(token);
+    }
+    out[i] = true;
+  }
+  return out;
+}
+
+std::vector<bool> PeerPool::AbandonReadOperations(const std::vector<std::string>& operation_ids) {
+  std::lock_guard<std::mutex> lock(read_pin_mutex_);
+  std::vector<bool> out(operation_ids.size(), false);
+  for (size_t i = 0; i < operation_ids.size(); ++i) {
+    const auto& operation = operation_ids[i];
+    if (operation.empty()) continue;
+    auto receipt = read_receipts_.find(operation);
+    if (auto ordered = OrderedOperation(operation)) {
+      if (read_clients_.find(ordered->first) == read_clients_.end() && read_clients_.size() >= 4096)
+        continue;
+      auto& completed = read_clients_[ordered->first];
+      completed = std::max(completed, ordered->second);
+      if (receipt != read_receipts_.end()) {
+        read_tokens_.erase(receipt->second.grant.token);
+        read_receipts_.erase(receipt);
+      }
+    } else {
+      if (receipt == read_receipts_.end()) {
+        if (read_receipts_.size() >= 65536) continue;
+        receipt = read_receipts_.emplace(operation, ReadReceipt{}).first;
+      }
+      receipt->second.released = true;
+      receipt->second.grant.entries.clear();
+    }
+    out[i] = true;
+  }
+  return out;
+}
+
+std::vector<bool> PeerPool::BatchAbortProtected(
+    const std::vector<PoolProtectedAbortRequest>& requests) {
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  std::vector<bool> out(requests.size(), false);
+  std::vector<std::string> terminal_operations;
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const auto& request = requests[i];
+    auto receipt = protected_placements_.find(request.operation_id);
+    if (request.operation_id.empty()) continue;
+    if (receipt == protected_placements_.end()) {
+      if (!request.no_gpu_work_submitted || request.slot.local_slot_id != 0) continue;
+      if (auto ordered = OrderedOperation(request.operation_id)) {
+        if (protected_write_clients_.find(ordered->first) == protected_write_clients_.end() &&
+            protected_write_clients_.size() >= 4096)
+          continue;
+        if (ordered->second <= protected_write_clients_[ordered->first].completed) {
+          out[i] = true;
+          continue;
+        }
+      }
+      if (protected_placements_.size() >= 65536) continue;
+      ProtectedPlacement cancelled;
+      cancelled.settled = true;
+      cancelled.generation = clear_epoch_;
+      protected_placements_.emplace(request.operation_id, std::move(cancelled));
+      terminal_operations.push_back(request.operation_id);
+      out[i] = true;
+      continue;
+    }
+    const auto slot = PoolSlotRef{receipt->second.allocation.backend_id,
+                                  receipt->second.allocation.allocation.slot_id};
+    const bool wildcard = request.no_gpu_work_submitted && request.slot.local_slot_id == 0;
+    if ((!request.transfer_drained && !request.no_gpu_work_submitted) ||
+        (!wildcard && (slot.backend_id != request.slot.backend_id ||
+                       slot.local_slot_id != request.slot.local_slot_id)))
+      continue;
+    if (receipt->second.settled) {
+      out[i] = true;
+      continue;
+    }
+    auto* backend = backends_ == nullptr ? nullptr : backends_->Get(slot.backend_id);
+    if (backend == nullptr) continue;
+    auto result = backend->BatchAbortProtected({ProtectedAbortRequest{
+        slot.local_slot_id, request.operation_id, true, request.no_gpu_work_submitted}});
+    if (result.size() != 1 || !result.front()) continue;
+    out[i] = true;
+    receipt->second.settled = true;
+    receipt->second.allocation.allocation.pages.clear();
+    receipt->second.allocation.allocation.descs.clear();
+    terminal_operations.push_back(request.operation_id);
+    auto pending = pending_slots_.find({slot.backend_id, slot.local_slot_id});
+    if (pending != pending_slots_.end()) {
+      pending_keys_.erase(pending->second);
+      pending_slots_.erase(pending);
+    }
+  }
+  RetireProtectedWritesLocked(terminal_operations);
+  return out;
+}
+
+void PeerPool::RetireProtectedWritesLocked(const std::vector<std::string>& operation_ids) {
+  std::map<std::string, std::vector<std::string>> batches;
+  for (const auto& operation : operation_ids) {
+    auto ordered = OrderedOperation(operation);
+    if (!ordered) continue;
+    auto& client = protected_write_clients_[ordered->first];
+    client.completed = std::max(client.completed, ordered->second);
+    batches[ordered->first].push_back(operation);
+  }
+  for (auto& [name, operations] : batches) {
+    auto& client = protected_write_clients_.at(name);
+    std::unordered_set<std::string> retained(operations.begin(), operations.end());
+    for (const auto& old : client.terminal_operations) {
+      if (!retained.count(old)) protected_placements_.erase(old);
+    }
+    client.terminal_operations = std::move(operations);
+  }
 }
 
 std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::string>& keys,

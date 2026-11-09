@@ -184,6 +184,7 @@ class Backend {
 
   virtual void RegisterMemory(MemoryDesc& desc) = 0;
   virtual void DeregisterMemory(const MemoryDesc& desc) = 0;
+  virtual void InvalidateRemoteMemory(const MemoryDesc&) {}
 
   virtual void ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                          const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,

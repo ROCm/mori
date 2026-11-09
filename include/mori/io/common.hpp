@@ -42,6 +42,11 @@
 namespace mori {
 namespace io {
 
+constexpr uint32_t BackendBit(BackendType type) {
+  return uint32_t{1} << static_cast<uint32_t>(type);
+}
+constexpr uint32_t kAllBackendMask = ~uint32_t{0};
+
 struct BackendBitmap {
   uint32_t bits{0};
 
@@ -121,6 +126,7 @@ struct EngineDesc {
   // Backend-supplied descriptor blobs, captured by IOEngine after each backend
   // is created. Opaque bytes (see DescBlob) — e.g. OFI stores its addr_name.
   BackendDescBlobMap backendDescs;
+
   RasDesc ras;
 
   bool operator==(const EngineDesc& rhs) const noexcept {
@@ -174,18 +180,26 @@ struct MemoryDesc {
   // fetch; base/size come from data/size.
   BackendDescBlobMap backendDescs;
 
+  // Legacy peers default to unrestricted; explicit registrations advertise
+  // only the selected backends, so local IPC GPU endpoints can exclude RDMA.
+  uint32_t registeredBackendMask{kAllBackendMask};
+
   // Not constexpr: comparing backendDescs (unordered_map) is not a constant expr.
   bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
            (deviceBusId == rhs.deviceBusId) && (data == rhs.data) && (size == rhs.size) &&
            (loc == rhs.loc) && (numaNode == rhs.numaNode) && (ipcOffset == rhs.ipcOffset) &&
-           (backendDescs == rhs.backendDescs);
+           (backendDescs == rhs.backendDescs) && (ipcHandle == rhs.ipcHandle) &&
+           (fabricHandle == rhs.fabricHandle) && (vpodId == rhs.vpodId) &&
+           (vpodPpodId == rhs.vpodPpodId) && (fabricOffset == rhs.fabricOffset) &&
+           (fabricAllocSize == rhs.fabricAllocSize) &&
+           (registeredBackendMask == rhs.registeredBackendMask);
   }
 
   // Append-only: new fields MUST go at the end to preserve wire compatibility.
   MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode,
                  ipcOffset, fabricHandle, vpodId, vpodPpodId, fabricOffset, fabricAllocSize,
-                 backendDescs);
+                 backendDescs, registeredBackendMask);
 };
 
 using TransferUniqueId = uint64_t;
@@ -193,7 +207,7 @@ using TransferUniqueId = uint64_t;
 struct TransferStatus {
  public:
   TransferStatus() = default;
-  ~TransferStatus() = default;
+  ~TransferStatus() { NotifyLifetimeObservers(); }
   TransferStatus(const TransferStatus&) = delete;
   TransferStatus& operator=(const TransferStatus&) = delete;
   TransferStatus(TransferStatus&&) = delete;
@@ -217,12 +231,15 @@ struct TransferStatus {
       code.store(val, std::memory_order_release);
     }
     cv_.notify_all();
+    if (val != StatusCode::INIT && val != StatusCode::IN_PROGRESS) NotifyLifetimeObservers();
   }
 
   bool Init() { return Code() == StatusCode::INIT; }
   bool InProgress() { return Code() == StatusCode::IN_PROGRESS; }
   bool Succeeded() { return Code() == StatusCode::SUCCESS; }
   bool Failed() { return Code() > StatusCode::ERR_BEGIN; }
+  bool ResourcesQuarantined() const { return resourcesQuarantined.load(std::memory_order_acquire); }
+  void SetResourcesQuarantined() { resourcesQuarantined.store(true, std::memory_order_release); }
 
   void SetCode(enum StatusCode val) {
     {
@@ -231,6 +248,7 @@ struct TransferStatus {
     }
     if (val != StatusCode::INIT && val != StatusCode::IN_PROGRESS) {
       cv_.notify_all();
+      NotifyLifetimeObservers();
     }
   }
   void SetMessage(const std::string& val) {
@@ -278,8 +296,36 @@ struct TransferStatus {
 
   void SetWaitCallback(std::function<void()> cb) { waitCallback = std::move(cb); }
   void SetProgressCallback(std::function<void()> cb) { progressCallback = std::move(cb); }
+  // SUCCESS means the GPU dependency was enqueued, not that bytes are ready.
+  // CPU/RDMA backends without a stream fence return ERR_BAD_STATE; callers can
+  // use the existing host Wait as a compatibility path.
+  StatusCode WaitOnStream(void* stream) {
+    if (streamWaitCallback) return streamWaitCallback(stream);
+    StatusCode current = Code();
+    return current == StatusCode::SUCCESS ? current : StatusCode::ERR_BAD_STATE;
+  }
+  void SetStreamWaitCallback(std::function<StatusCode(void*)> cb) {
+    streamWaitCallback = std::move(cb);
+  }
+  // IOEngine uses this to protect backend registrations during submission.
+  // Registration is before enqueue; callbacks run after a terminal state or
+  // status destruction. Observers must not throw.
+  void AddLifetimeObserver(std::function<void(bool)> observer) {
+    std::lock_guard<std::mutex> lock(lifetimeMu);
+    lifetimeObservers.push_back(std::move(observer));
+  }
 
  private:
+  void NotifyLifetimeObservers() {
+    std::vector<std::function<void(bool)>> observers;
+    {
+      std::lock_guard<std::mutex> lock(lifetimeMu);
+      observers.swap(lifetimeObservers);
+    }
+    const bool quarantine =
+        ResourcesQuarantined() || code.load(std::memory_order_acquire) == StatusCode::IN_PROGRESS;
+    for (auto& observer : observers) observer(quarantine);
+  }
   StatusCode CodeWithProgress() {
     PollProgress();
     return code.load(std::memory_order_acquire);
@@ -291,10 +337,14 @@ struct TransferStatus {
   }
 
   std::atomic<StatusCode> code{StatusCode::INIT};
+  std::atomic<bool> resourcesQuarantined{false};
   mutable std::mutex msgMu;
   std::string msg;
   std::function<void()> waitCallback;
   std::function<void()> progressCallback;
+  std::function<StatusCode(void*)> streamWaitCallback;
+  std::mutex lifetimeMu;
+  std::vector<std::function<void(bool)>> lifetimeObservers;
   std::condition_variable cv_;
 };
 

@@ -63,6 +63,14 @@ class CompositeTransferEngine::FanOutHandle final : public TransferHandle {
   void AddFailure(TransferFailure f) { failures_.push_back(std::move(f)); }
   bool Empty() const { return handles_.empty() && failures_.empty(); }
 
+  bool WaitOnStream(void* stream) override {
+    bool ready = failures_.empty();
+    for (auto& entry : handles_) {
+      if (!entry.handle->WaitOnStream(stream)) ready = false;
+    }
+    return ready;
+  }
+
   void Wait(std::vector<TransferFailure>* failures) override {
     if (drained_) return;
     drained_ = true;
@@ -135,9 +143,17 @@ void CompositeTransferEngine::RecordSettled(size_t engine_index, TransferDirecti
 
 TransferRef CompositeTransferEngine::RegisterMemory(void* base, size_t size,
                                                     mori::io::MemoryLocationType loc, int device) {
+  return RegisterMemoryWithBackends(base, size, loc, device, mori::io::kAllBackendMask);
+}
+
+TransferRef CompositeTransferEngine::RegisterMemoryWithBackends(void* base, size_t size,
+                                                                mori::io::MemoryLocationType loc,
+                                                                int device,
+                                                                uint32_t allowed_backend_mask) {
   TransferRef merged;
   for (auto& engine : engines_) {
-    TransferRef part = engine->RegisterMemory(base, size, loc, device);
+    TransferRef part =
+        engine->RegisterMemoryWithBackends(base, size, loc, device, allowed_backend_mask);
     if (part.HasHostPtr() && !merged.HasHostPtr()) {
       merged.host_ptr = part.host_ptr;
       merged.size = part.size;

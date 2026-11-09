@@ -63,6 +63,15 @@ struct PoolSlotRef {
 struct PoolCommitRequest {
   PoolSlotRef slot;
   std::string key;
+  std::string operation_id;
+  bool transfer_drained = false;
+};
+
+struct PoolProtectedAbortRequest {
+  PoolSlotRef slot;
+  std::string operation_id;
+  bool transfer_drained = false;
+  bool no_gpu_work_submitted = false;
 };
 
 struct PoolCommitResult {
@@ -74,6 +83,13 @@ struct PoolResolvedEntry {
   uint32_t backend_id = BackendRegistry::kMaxBackends;
   TierType tier = TierType::UNKNOWN;
   ResolvedEntry resolved;
+};
+
+struct PoolReadGrant {
+  bool accepted = false;
+  uint64_t token = 0;
+  uint64_t generation = 0;
+  std::vector<PoolResolvedEntry> entries;
 };
 
 // What PeerPool::Evict did with one request.
@@ -124,6 +140,13 @@ class PeerPool {
   std::vector<PoolAllocateResult> BatchAllocate(const std::vector<PoolPlacementRequest>& requests);
   std::vector<PoolCommitResult> BatchCommit(const std::vector<PoolCommitRequest>& requests);
   std::vector<bool> BatchAbort(const std::vector<PoolSlotRef>& slots);
+  std::vector<bool> BatchAbortProtected(const std::vector<PoolProtectedAbortRequest>& requests);
+  PoolReadGrant AcquireReadBatch(const std::vector<std::string>& keys,
+                                 const std::string& operation_id, uint64_t expected_generation,
+                                 bool include_descs);
+  std::vector<bool> ReleaseReadPins(const std::vector<uint64_t>& tokens);
+  std::vector<bool> AbandonReadOperations(const std::vector<std::string>& operation_ids);
+  uint64_t Generation() const;
   // `reader` and `extents` (parallel to `keys`, or null) are passed to every
   // backend asked (see MediumBackend::BatchResolve).
   std::vector<PoolResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
@@ -183,6 +206,7 @@ class PeerPool {
     uint32_t backend_id = BackendRegistry::kMaxBackends;
     uint64_t local_slot_id = 0;
     std::chrono::steady_clock::time_point expires_at = std::chrono::steady_clock::time_point::max();
+    std::string operation_id;
   };
 
   struct TransitionJob {
@@ -314,6 +338,27 @@ class PeerPool {
   std::map<std::string, uint64_t> tier_read_hits_;
   // Invalidates a resolve plan if a clear completed while it was dispatched.
   uint64_t clear_epoch_ = 0;
+  struct ProtectedPlacement {
+    std::string key;
+    uint64_t size = 0;
+    PoolAllocateResult allocation;
+    bool settled = false;
+    PoolCommitResult commit;
+    uint64_t generation = 0;
+  };
+  std::unordered_map<std::string, ProtectedPlacement> protected_placements_;
+  std::unordered_map<std::string, OrderedOperationClient> protected_write_clients_;
+  void RetireProtectedWritesLocked(const std::vector<std::string>& operation_ids);
+  struct ReadReceipt {
+    std::vector<std::string> keys;
+    PoolReadGrant grant;
+    bool released = false;
+  };
+  std::mutex read_pin_mutex_;
+  std::unordered_map<std::string, ReadReceipt> read_receipts_;
+  std::unordered_map<uint64_t, std::string> read_tokens_;
+  std::unordered_map<std::string, uint64_t> read_clients_;
+  uint64_t next_read_token_ = 1;
 
   std::mutex transition_mutex_;
   std::condition_variable transition_cv_;

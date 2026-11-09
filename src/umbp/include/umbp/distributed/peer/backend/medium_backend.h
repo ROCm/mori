@@ -22,6 +22,7 @@
 #pragma once
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -40,6 +41,26 @@
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
+
+// Ordered clients permit bounded replay protection: a completed sequence may
+// never acquire again, while earlier active operations remain recoverable.
+inline std::optional<std::pair<std::string, uint64_t>> OrderedOperation(
+    const std::string& operation_id) {
+  const auto split = operation_id.rfind(':');
+  if (split == std::string::npos || split == 0 || split + 1 == operation_id.size()) return {};
+  uint64_t sequence = 0;
+  const auto* begin = operation_id.data() + split + 1;
+  const auto* end = operation_id.data() + operation_id.size();
+  const auto parsed = std::from_chars(begin, end, sequence);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || sequence == 0) return {};
+  return std::make_pair(operation_id.substr(0, split), sequence);
+}
+
+struct OrderedOperationClient {
+  uint64_t completed = 0;
+  // Retain the most recently completed RPC batch for whole-batch retries.
+  std::vector<std::string> terminal_operations;
+};
 
 // One storage medium on a peer.
 //
@@ -128,6 +149,8 @@ struct AllocateRequest {
   // The writer is a local file engine: a file-backed medium may hand out a
   // file range (AllocateResult::file_ref) instead of staged pages.
   bool allow_file_ref = false;
+  // Nonempty opts into completion-driven ownership. No TTL may reclaim it.
+  std::string operation_id;
 };
 
 // Populated fields below `outcome` are meaningful ONLY when
@@ -151,6 +174,15 @@ struct AllocateResult {
 struct CommitRequest {
   uint64_t slot_id = 0;
   std::string key;
+  std::string operation_id;
+  bool transfer_drained = false;
+};
+
+struct ProtectedAbortRequest {
+  uint64_t slot_id = 0;
+  std::string operation_id;
+  bool transfer_drained = false;
+  bool no_gpu_work_submitted = false;
 };
 
 struct CommitResult {
@@ -353,6 +385,15 @@ class MediumBackend : public MetricSource {
   // Idempotent: a slot already reaped or never seen still reports true.  False
   // is reserved for a state not currently produced.
   virtual std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) = 0;
+  // Explicit opt-in: legacy staging backends must not silently use a TTL.
+  virtual bool SupportsProtectedWrites() const { return false; }
+  // Called after unconfirmed GPU drain. True means teardown will retain the
+  // entire owned backing allocation; this is isolation, not a hardware fence.
+  virtual bool QuarantineBackingMemory() { return false; }
+  virtual std::vector<bool> BatchAbortProtected(
+      const std::vector<ProtectedAbortRequest>& requests) {
+    return std::vector<bool>(requests.size(), false);
+  }
 
   // Look up keys and protect each hit from concurrent Evict: for the lease
   // window (kRemote), or while its `hold` lives (kLocal).  A kLocal batch too
