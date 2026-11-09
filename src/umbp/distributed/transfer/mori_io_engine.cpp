@@ -117,16 +117,20 @@ class MoriIoEngine::RdmaHandle final : public TransferHandle {
 
   void Wait(std::vector<TransferFailure>* failures) override {
     if (drained_) return;
+    // Finish every posted group before failure reporting can allocate. Marking
+    // drained_ or reporting an early failure first would let bad_alloc skip
+    // later statuses and make destruction free a still-live backend callback.
+    for (auto& set : sets_)
+      for (auto& status : set->statuses) status.Wait();
     drained_ = true;
     if (failures != nullptr) {
       failures->insert(failures->end(), std::make_move_iterator(presettled_.begin()),
                        std::make_move_iterator(presettled_.end()));
     }
     presettled_.clear();
-    // Wait every group; never break early, so no status is left live.
+    // All groups are terminal; reporting exceptions cannot strand GPU/RDMA work.
     for (auto& set : sets_) {
       for (size_t g = 0; g < set->statuses.size(); ++g) {
-        set->statuses[g].Wait();
         if (set->statuses[g].Succeeded()) continue;
         if (failures == nullptr) continue;
         TransferFailure f;

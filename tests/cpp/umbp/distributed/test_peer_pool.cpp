@@ -27,11 +27,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -44,6 +46,26 @@
 #include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
+
+namespace {
+thread_local bool failPeerPoolRetirementAllocation = false;
+
+struct RetirementAllocationFailureScope {
+  RetirementAllocationFailureScope() { failPeerPoolRetirementAllocation = true; }
+  ~RetirementAllocationFailureScope() { failPeerPoolRetirementAllocation = false; }
+};
+}  // namespace
+
+void* operator new(std::size_t bytes) {
+  if (failPeerPoolRetirementAllocation) throw std::bad_alloc();
+  if (void* result = std::malloc(bytes == 0 ? 1 : bytes)) return result;
+  throw std::bad_alloc();
+}
+void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+void operator delete(void* ptr) noexcept { std::free(ptr); }
+void operator delete[](void* ptr) noexcept { std::free(ptr); }
+void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, std::size_t) noexcept { std::free(ptr); }
 
 namespace mori::umbp {
 namespace {
@@ -1697,6 +1719,41 @@ TEST(PeerPoolCompletionPins, OrderedReadsHaveNoLifetimeRequestLimit) {
     ASSERT_TRUE(pool.ReleaseReadPins({grant.token}).front());
   }
   EXPECT_FALSE(pool.AcquireReadBatch({"kv"}, "reader:1", 0, false).accepted);
+}
+
+TEST(PeerPoolCompletionPins, DestructionRetainsActiveGrantWhenAllocationFails) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 64, 4);
+  auto pool = std::make_unique<PeerPool>(&registry, MakeSingleBackendPolicy());
+  const auto total_bytes = registry.Get("dram")->Capacity().total_bytes;
+  CommitKey(pool.get(), "kv", "dram");
+  auto grant = pool->AcquireReadBatch({"kv"}, "reader:1", 0, false);
+  ASSERT_TRUE(grant.accepted);
+  ASSERT_TRUE(grant.entries.front().resolved.found);
+  grant.entries.clear();  // The RPC response no longer holds owner pages.
+  pool->ClearLocal();
+  registry.Get("dram")->ClearFullSyncAcked();
+  ASSERT_EQ(registry.Get("dram")->Capacity().available_bytes, total_bytes - 64);
+
+  bool injected = false;
+  {
+    RetirementAllocationFailureScope failure;
+    try {
+      void* probe = ::operator new(1);
+      ::operator delete(probe);
+    } catch (const std::bad_alloc&) {
+      injected = true;
+    }
+    // Before preallocating the grant owner, this attempted a new allocation
+    // in PeerPool's destructor and terminated instead of retaining the pages.
+    pool.reset();
+  }
+  EXPECT_TRUE(injected);
+  static_cast<PageBackend*>(static_cast<InstrumentedBackend*>(registry.Get("dram"))->Inner())
+      ->RunReaperOnceForTest();
+  EXPECT_EQ(registry.Get("dram")->Capacity().available_bytes, total_bytes - 64)
+      << "server destruction must retain the active grant without allocating";
 }
 
 TEST(PeerPoolCompletionPins, AbandonedOperationsFenceDelayedAcquireAndReserve) {

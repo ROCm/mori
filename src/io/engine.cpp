@@ -558,27 +558,45 @@ std::shared_ptr<void> IOEngine::RetainLocalRegistration(const MemoryDesc& local,
   }
   auto ticket = std::make_shared<RegistrationTicket>();
   ticket->status = status;
+  // Construct the submission guard before publishing a ticket or allocating
+  // callbacks. Any subsequent setup exception must still wake deregistration.
+  auto registration = std::shared_ptr<void>(ticket.get(), [ticket](void*) {
+    {
+      std::lock_guard<std::mutex> lock(ticket->mutex);
+      ticket->submissionComplete = true;
+    }
+    ticket->submissionReady.notify_all();
+  });
   std::lock_guard<std::mutex> lock(state->mutex);
   if (!state->accepting) return {};
   state->tickets.erase(std::remove_if(state->tickets.begin(), state->tickets.end(),
                                       [](const auto& item) { return item.expired(); }),
                        state->tickets.end());
-  state->tickets.push_back(ticket);
-  status->AddLifetimeObserver([state, ticket](bool quarantined) {
-    std::lock_guard<std::recursive_mutex> ticketLock(ticket->mutex);
+  // Install both status callbacks before publishing the ticket. In particular,
+  // a callback allocation failure must never expose an unprotected raw status.
+  status->SetDestructionCallback([state, ticket](bool quarantined) {
+    std::unique_lock<std::mutex> lock(ticket->mutex);
     ticket->status = nullptr;
+    ticket->submissionReady.wait(lock, [&] { return ticket->activeWaiters == 0; });
+    // An active waiter may have proved completion while destruction waited.
+    // Otherwise an abandoned IN_PROGRESS status must quarantine its backing.
+    if (ticket->terminalObserved ? ticket->quarantined : quarantined) {
+      std::lock_guard<std::mutex> stateLock(state->mutex);
+      state->quarantined = true;
+    }
+  });
+  status->AddLifetimeObserver([state, ticket](bool quarantined) {
+    std::lock_guard<std::mutex> ticketLock(ticket->mutex);
+    ticket->status = nullptr;
+    ticket->terminalObserved = true;
+    ticket->quarantined = quarantined;
     if (quarantined) {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->quarantined = true;
     }
   });
-  return std::shared_ptr<void>(ticket.get(), [ticket](void*) {
-    {
-      std::lock_guard<std::recursive_mutex> lock(ticket->mutex);
-      ticket->submissionComplete = true;
-    }
-    ticket->submissionReady.notify_all();
-  });
+  state->tickets.push_back(ticket);
+  return registration;
 }
 
 void IOEngine::DeregisterMemory(const MemoryDesc& memory) {
@@ -602,13 +620,26 @@ void IOEngine::DeregisterMemory(const MemoryDesc& memory) {
       if (auto ticket = item.lock()) tickets.push_back(ticket);
   }
   for (auto& ticket : tickets) {
-    // The observer takes the same lock before status destruction; no raw status
-    // is dereferenced after its owner has drained/destroyed it.
-    std::unique_lock<std::recursive_mutex> lock(ticket->mutex);
+    std::unique_lock<std::mutex> lock(ticket->mutex);
     ticket->submissionReady.wait(lock, [&] { return ticket->submissionComplete; });
-    if (ticket->status) {
-      ticket->status->Wait();
-      if (ticket->status && ticket->status->ResourcesQuarantined()) {
+    if (auto* status = ticket->status) {
+      ++ticket->activeWaiters;
+      // The destruction callback waits for this guard before status members
+      // disappear. GPU completion callbacks may take ticket->mutex, so never
+      // invoke Wait, progress, or stream callbacks while holding that mutex.
+      struct WaiterGuard {
+        RegistrationTicket& ticket;
+        ~WaiterGuard() {
+          {
+            std::lock_guard<std::mutex> lock(ticket.mutex);
+            --ticket.activeWaiters;
+          }
+          ticket.submissionReady.notify_all();
+        }
+      } guard{*ticket};
+      lock.unlock();
+      status->Wait();
+      if (status->ResourcesQuarantined()) {
         std::lock_guard<std::mutex> stateLock(state->mutex);
         state->quarantined = true;
       }

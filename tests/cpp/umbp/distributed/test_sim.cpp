@@ -534,9 +534,8 @@ TEST_F(SimTest, GdsNewReaderDelaysActiveCompletionAndRejectsOverflow) {
       engine.Transfer({{engine.RegisterFile(2, 0, huge), 0,
                         TransferRef::HostBytes(gpu.host_ptr, huge, MemLoc::GPU, 0), 0, huge, 1}},
                       nullptr));
-  auto second = std::async(std::launch::async, [&] {
-    return engine.Transfer({{file, 0, gpu, 0, kPage, 2}}, nullptr);
-  });
+  auto second = std::async(std::launch::async,
+                           [&] { return engine.Transfer({{file, 0, gpu, 0, kPage, 2}}, nullptr); });
   EXPECT_EQ(first.wait_for(230ms), std::future_status::timeout);
   EXPECT_TRUE(first.get());
   EXPECT_GE(Clock::now() - started, 310ms);  // First now finishes near 350ms, not 200ms.
@@ -561,9 +560,8 @@ TEST_F(SimTest, GdsAndOrdinarySameChannelReservationsDoNotOverlap) {
   auto write = std::async(std::launch::async,
                           [&] { return engine.SimulateStorage(false, kPage, 1, false); });
   std::this_thread::sleep_for(20ms);
-  auto later = std::async(std::launch::async, [&] {
-    return engine.Transfer({{file, 0, gpu, 0, kPage, 1}}, nullptr);
-  });
+  auto later = std::async(std::launch::async,
+                          [&] { return engine.Transfer({{file, 0, gpu, 0, kPage, 1}}, nullptr); });
   EXPECT_EQ(write.wait_for(250ms), std::future_status::timeout);
   EXPECT_TRUE(first.get());
   EXPECT_TRUE(write.get());
@@ -1132,6 +1130,46 @@ TEST_P(SimClusterApiTest, RemoteRangedIoRequiresScratch) {
   EXPECT_EQ(reader->BatchPutRanges({"offload"}, {2 * kPage}, {{ptr_}}, {{2 * kPage}}, {{0}}),
             std::vector<bool>{false});
   EXPECT_FALSE(owner->Exists("offload"));
+}
+
+TEST_P(SimClusterApiTest, GpuDirectReadsPreserveConfiguredRemoteRangedPutScratch) {
+  auto owner_config = Node("direct-owner", 64);
+  owner_config.distributed->io_engine.mode = UMBPTransferMode::kAuto;
+  owner_config.distributed->kv_put_placement = UMBPKvPutPlacement::kOwnerLocal;
+  auto owner = Client(owner_config, GetParam());
+  ASSERT_TRUE(owner->RegisterMemory(ptr_, 64 * kPage));
+  ASSERT_TRUE(owner->Put("direct-shared", ptr_, 2 * kPage));
+  ASSERT_TRUE(owner->Flush());
+
+  auto reader_config = Node("direct-reader", 1);
+  reader_config.distributed->io_engine.mode = UMBPTransferMode::kAuto;
+  reader_config.distributed->kv_ranged_path = UMBPKvRangedPath::kGpuDirect;
+  reader_config.distributed->kv_put_placement = UMBPKvPutPlacement::kMaster;
+  // Direct GET needs no scratch, but this explicit configuration must retain
+  // the PUT arena. Simulated GPU bytes are inaccessible: all metadata and
+  // peer RPCs are real, and any accidental host payload access would fault.
+  reader_config.distributed->ranged_scratch_size = 32 * kPage;
+  auto reader = Client(reader_config, GetParam());
+  ASSERT_TRUE(reader->SupportsRangedIO());
+  ASSERT_TRUE(reader->RegisterMemory(ptr_, 64 * kPage, MemLoc::GPU, 0));
+  ASSERT_TRUE(Await([&] { return reader->Exists("direct-shared"); }));
+  EXPECT_EQ(reader->BatchGetRanges({"direct-shared"}, {{ptr_, ptr_ + kPage}}, {{128, 128}},
+                                   {{kPage - 64, 2 * kPage - 128}}),
+            std::vector<bool>{true});
+
+  // The whole object exceeds reader capacity, forcing a remote allocation,
+  // GPU-to-host range assembly in the retained PUT arena and a peer commit.
+  ASSERT_EQ(
+      reader->BatchPutRanges({"direct-ranged-offload"}, {4 * kPage}, {{ptr_, ptr_ + 2 * kPage}},
+                             {{2 * kPage, 2 * kPage}}, {{0, 2 * kPage}}),
+      std::vector<bool>{true});
+  EXPECT_TRUE(owner->Get("direct-ranged-offload", ptr_, 4 * kPage));
+  EXPECT_FALSE(owner->HasQuarantinedTransfers());
+  EXPECT_FALSE(reader->HasQuarantinedTransfers());
+  reader->Close();
+  owner->Close();
+  EXPECT_FALSE(reader->HasQuarantinedTransfers());
+  EXPECT_FALSE(owner->HasQuarantinedTransfers());
 }
 
 TEST_F(SimClusterTest, DefaultRdmaRemotePutStillServesSsdPeer) {

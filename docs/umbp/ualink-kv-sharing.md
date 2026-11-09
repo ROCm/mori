@@ -41,8 +41,8 @@ as environment variables. Set environment variables before creating the config.
 
 Configure the peer as HBM, with `hbm.device` and `hbm.capacity_bytes` appropriate
 for the local GPU (the internal pool config uses `hbm.buffer_sizes`). Strict mode
-verifies that advertised HBM pools export fabric
-handles. A consumer's local destination may be an ordinary `hipMalloc` allocation;
+verifies that advertised HBM pools export fabric handles. A consumer's local
+destination may be an ordinary `hipMalloc` allocation;
 only the remote source must be fabric-exportable. A consumer does not have to
 advertise a nonempty HBM pool. Strict mode rejects a CPU endpoint, missing fabric
 capability, mismatched domains, or unavailable copy module; it does not stage or
@@ -52,6 +52,12 @@ switch the payload to RDMA.
 RDMA registration failure can leave a valid FABRIC-only GPU region. Selective
 registration records its capabilities in the memory descriptor, so a backend
 cannot claim an unregistered endpoint.
+
+GPU direct GET does not allocate a host GET scratch arena. If
+`distributed.ranged_scratch_size` is explicitly positive, the client retains a
+PUT arena for the existing remote ranged-write assembly path, including its
+NUMA/hugepage configuration. Producer-local PUT and GPU direct GET need no such
+arena. Direct remote scatter PUT over FABRIC is not part of this version.
 
 Build the module for the GPU architecture detected by CMake:
 
@@ -90,6 +96,9 @@ Python distributed clients expose `submit_batch_get_ranges_gpu_direct`, returnin
 `KvReadHandle` with `wait()`, `wait_on_stream(stream_ptr)` and
 `resources_quarantined`. Each handle represents one independently consumable
 range group; callers can schedule layer groups separately.
+Read handles can be completed or destroyed on a different thread from the
+submitting thread. Counted state leases cover asynchronous resources through
+retirement; preparation locks remain within the submitting call.
 Python `client.close()` drains outstanding embedded read handles before releasing
 pool resources; it is idempotent. Check `has_quarantined_transfers` afterward
 before releasing caller-owned GPU allocations on an error path.
@@ -207,8 +216,13 @@ cold-import repetition. Use aligned ranges when measuring the vector-copy path,
 and unaligned ranges to verify arbitrary layout correctness. The driver
 asserts ownership, absence of a consumer-local replica, byte correctness, stream
 ordering and actual selected FABRIC transport counters. Cold first-read and warm
-latencies are separate. Reported bandwidth uses requested bytes and completed
-transfer time, not enqueue time or unmeasured physical link bytes.
+latencies are separate. GET latency includes route lookup, acquire RPC,
+planning, submission, completion wait and pin-release RPC. Reported bandwidth
+uses requested bytes and this end-to-end GET time. The
+`selected_fabric_submitted_bytes` counter measures submitted plans; successful
+completion and byte verification accompany it. Neither measurement isolates
+kernel time or physical link traffic. Cold samples measure the first GET after
+client reconstruction; reconstruction itself occurs outside the GET timer.
 
 Relevant checks include `io_fabric_integration`, `test_page_backend`,
 `umbp_peer_pool`, `test_peer_service_dispatch`, `test_transfer_engine`,
@@ -226,16 +240,20 @@ model speedup is assumed from single-host correctness tests.
 
 ### Verification of this branch
 
-Built and tested on 2026-11-09, on `ctheliosr-1b114-f01-2` (`gfx1250`), from
+Relevant UMBP/IO targets built and tested on 2026-11-09, on
+`ctheliosr-1b114-f01-2` (`gfx1250`), from
 upstream main `af56d9b50b1e286deba7be9f6b416c5750436d87` with ROCm under
 `/opt/rocm`. The tested feature branch is `feat/umbp-ualink-kv-sharing`.
 
 | Check | Result |
 | --- | --- |
 | Relevant CTest selection | 10/10 passed |
-| Simulated cluster API, recache and transport compatibility | 9/9 passed, including default RDMA single/batch PUT to a remote SSD owner |
-| PageBackend / PeerPool / peer-service lifecycle and protocol cases | 131 passed |
-| GPU direct ranges, NUMA transfers and post-then-throw injection | 6/6 passed |
+| Simulated cluster API, recache and transport compatibility | 11/11 passed, including configured remote PUT scratch alongside direct GET |
+| PageBackend / PeerPool / peer-service lifecycle and protocol cases | 132 passed, including active-grant destruction under allocation failure |
+| GPU direct ranges, NUMA transfers and exception injection | 13/13 passed: 11 GPU direct cases and 2 NUMA cases |
+| Completion-report exception protocol cases | 3/3 passed with real master/peer RPCs and simulated data movement |
+| Transfer planner/executor cases | 27/27 passed, including report allocation failure with posted completion still pending |
+| FABRIC IO integration | CPU and real GPU modes passed, including concurrent status/deregistration and C++ allocation-budget regressions |
 | HBM allocation and asynchronous D2D copy cases | 15/15 passed |
 | Standalone IPC/control cases | 14 passed in the default run; the remaining key-handle-off case passed separately with `UMBP_KEY_HANDLE_SLOTS=0` |
 | Python extension | Independent import, enum/config use, async range API, default HIP stream, idempotent wait/close and byte verification passed |
@@ -252,3 +270,6 @@ The host also lacked an active RDMA device, so the original RDMA-dependent
 batch-put and full ranged integration fixtures could not be validated here.
 The driver above is ready for the two-host test. Native inference integration,
 packed-path comparisons and model TTFT/TPOT measurements remain separate work.
+
+The follow-up findings, performance opportunities and two-host validation matrix
+are recorded in [ualink-kv-review.md](ualink-kv-review.md).

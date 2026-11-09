@@ -1410,11 +1410,17 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "simulated address reservation failed");
       return;
     }
+    // GPU direct requires the same registered destination descriptor as the
+    // real IPC path. The simulated engine creates it without HIP or IPC work.
+    const auto registration =
+        gpu && backend_config_.distributed &&
+                backend_config_.distributed->kv_ranged_path == UMBPKvRangedPath::kGpuDirect
+            ? MemoryRegistration::kFabricLocal
+            : (gpu ? MemoryRegistration::kLocalCopyOnly : MemoryRegistration::kPinned);
     if (!RegisterBackendMemory(
             buffer.ptr, buffer.mapped_size,
             gpu ? mori::io::MemoryLocationType::GPU : mori::io::MemoryLocationType::CPU,
-            request.device_id(),
-            gpu ? MemoryRegistration::kLocalCopyOnly : MemoryRegistration::kPinned)) {
+            request.device_id(), registration)) {
       munmap(buffer.ptr, buffer.mapped_size);
       SetBool(response, false, "simulated backend registration failed");
       return;

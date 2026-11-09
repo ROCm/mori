@@ -101,79 +101,139 @@ size_t AlignToFabricGranularity(int device, size_t size) {
 struct TransferCompletion {
   TransferStatus* status{nullptr};
   hipEvent_t event{nullptr};
+  hipStream_t stream{nullptr};
   int eventDevice{-1};
   EventPool* eventPool{nullptr};
-  std::function<void()> cleanup;
+  std::unique_ptr<fabric::internal::QuarantineEntry> quarantineEntry;
   std::once_flag completionOnce;
   std::atomic<bool> completed{false};
+  bool submitted{false};
+  bool recorded{false};
   std::mutex eventMu;
 
-  ~TransferCompletion() {
-    // A caller can abandon its status without polling its event. Destruction
-    // still cannot prove the copy stopped or release its imported VA/staging.
-    if (!completed.load(std::memory_order_acquire) && cleanup)
-      fabric::internal::QuarantineResources(std::move(cleanup));
+  void ReturnEvent() noexcept {
+    if (event == nullptr) return;
+    try {
+      eventPool->PutEvent(event, eventDevice);
+    } catch (...) {
+      // Completion has already been proved. Pool growth must not strand a
+      // terminal status when host allocation fails.
+      (void)hipEventDestroy(event);
+    }
+    event = nullptr;
   }
 
-  void Finalize(hipError_t err, const char* operation) {
-    if (err == hipSuccess) {
-      // Drop references only after the device event proved completion.
-      if (cleanup) cleanup();
-      cleanup = {};
-      eventPool->PutEvent(event, eventDevice);
-      status->SetCode(StatusCode::SUCCESS);
+  ~TransferCompletion() {
+    if (completed.load(std::memory_order_acquire)) return;
+    if (submitted) {
+      fabric::internal::QuarantineResources(std::move(quarantineEntry));
     } else {
-      fabric::internal::SettleSubmissionError(
-          status, std::string("FABRIC: ") + operation + " failed: " + hipGetErrorString(err), false,
-          std::move(cleanup));
+      ReturnEvent();
+    }
+  }
+
+  void Finish(hipError_t error, bool drained) {
+    if (drained) {
+      quarantineEntry.reset();
+      ReturnEvent();
+    } else {
+      // This entry and its callback were allocated before enqueue. Retaining
+      // imports/descriptors here does not allocate, including on bad_alloc.
+      fabric::internal::QuarantineResources(std::move(quarantineEntry));
+      status->SetResourcesQuarantined();
     }
     completed.store(true, std::memory_order_release);
+    // Publish a terminal code before allocating a diagnostic message.
+    status->SetCode(error == hipSuccess ? StatusCode::SUCCESS : StatusCode::ERR_GPU_OP);
+  }
+
+  void Finalize(hipError_t error, const char* operation) {
+    Finish(error, error == hipSuccess);
+    if (error != hipSuccess) {
+      status->SetMessage(std::string("FABRIC: ") + operation + " failed: " +
+                         hipGetErrorString(error) + "; DRAIN_UNCONFIRMED: resources quarantined");
+    }
+  }
+
+  // The submission path holds eventMu, including the submitted/recorded flags.
+  void FailSubmissionLocked(hipError_t error, const char* operation) {
+    const bool drained = hipStreamSynchronize(stream) == hipSuccess;
+    Finish(error, drained);
+    status->SetMessage(std::string("FABRIC: ") + operation +
+                       " failed: " + hipGetErrorString(error) +
+                       (drained ? "" : "; DRAIN_UNCONFIRMED: resources quarantined"));
+  }
+
+  void FailSubmissionException() noexcept {
+    std::lock_guard<std::mutex> lock(eventMu);
+    if (completed.load(std::memory_order_acquire)) return;
+    const bool drained = hipStreamSynchronize(stream) == hipSuccess;
+    Finish(hipErrorUnknown, drained);
   }
 
   void FinalizeBlocking() {
     std::lock_guard<std::mutex> lock(eventMu);
+    if (completed.load(std::memory_order_acquire)) return;
     std::call_once(completionOnce, [this]() {
       ScopedHipDeviceGuard guard;
       (void)hipSetDevice(eventDevice);
-      Finalize(hipEventSynchronize(event), "hipEventSynchronize");
+      Finalize(recorded ? hipEventSynchronize(event) : hipStreamSynchronize(stream),
+               recorded ? "hipEventSynchronize" : "hipStreamSynchronize");
     });
   }
 
   void FinalizeNonBlocking() {
     std::lock_guard<std::mutex> lock(eventMu);
-    if (completed.load(std::memory_order_acquire)) return;
+    if (completed.load(std::memory_order_acquire) || !recorded) return;
     ScopedHipDeviceGuard guard;
     (void)hipSetDevice(eventDevice);
-    hipError_t err = hipEventQuery(event);
-    if (err == hipErrorNotReady) {
+    hipError_t error = hipEventQuery(event);
+    if (error == hipErrorNotReady) {
       (void)hipGetLastError();
       return;
     }
-    std::call_once(completionOnce, [this, err]() { Finalize(err, "hipEventQuery"); });
+    std::call_once(completionOnce, [this, error]() { Finalize(error, "hipEventQuery"); });
   }
 };
 
-void ArmTransferCompletion(TransferStatus* status, hipEvent_t event, int eventDevice,
-                           EventPool* eventPool, std::function<void()> cleanup = {}) {
-  auto completion = std::make_shared<TransferCompletion>();
+std::shared_ptr<TransferCompletion> PrepareTransferCompletion(TransferStatus* status,
+                                                              hipEvent_t event, hipStream_t stream,
+                                                              int eventDevice, EventPool* eventPool,
+                                                              std::shared_ptr<void> region) {
+  std::shared_ptr<TransferCompletion> completion;
+  try {
+    completion = std::make_shared<TransferCompletion>();
+  } catch (...) {
+    try {
+      eventPool->PutEvent(event, eventDevice);
+    } catch (...) {
+      (void)hipEventDestroy(event);
+    }
+    throw;
+  }
   completion->status = status;
   completion->event = event;
+  completion->stream = stream;
   completion->eventDevice = eventDevice;
   completion->eventPool = eventPool;
-  completion->cleanup = std::move(cleanup);
+  completion->quarantineEntry = std::make_unique<fabric::internal::QuarantineEntry>();
+  completion->quarantineEntry->region = std::move(region);
+  // All callback allocations precede the first HIP enqueue and IN_PROGRESS.
   status->SetStreamWaitCallback([completion](void* stream) {
     std::lock_guard<std::mutex> lock(completion->eventMu);
     if (completion->completed.load(std::memory_order_acquire)) return completion->status->Code();
+    if (!completion->recorded) return StatusCode::ERR_BAD_STATE;
     ScopedHipDeviceGuard guard;
     if (hipSetDevice(completion->eventDevice) != hipSuccess) return StatusCode::ERR_GPU_OP;
     // hipStreamWaitEvent captures the current record; later event reuse does
     // not change this dependency. The consumer stream must belong to this GPU.
-    hipError_t err =
+    hipError_t error =
         hipStreamWaitEvent(reinterpret_cast<hipStream_t>(stream), completion->event, 0);
-    return err == hipSuccess ? StatusCode::SUCCESS : StatusCode::ERR_GPU_OP;
+    return error == hipSuccess ? StatusCode::SUCCESS : StatusCode::ERR_GPU_OP;
   });
   status->SetWaitCallback([completion]() { completion->FinalizeBlocking(); });
   status->SetProgressCallback([completion]() { completion->FinalizeNonBlocking(); });
+  return completion;
 }
 
 // Registry backing FabricMalloc / FabricFree.
@@ -353,34 +413,32 @@ void FabricBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, si
     return;
   }
 
-  auto failSubmitted = [&](hipError_t error, const char* operation) {
-    const bool drained = hipStreamSynchronize(stream) == hipSuccess;
-    if (drained) eventPool->PutEvent(event, localDevice);
-    fabric::internal::SettleSubmissionError(
-        status, std::string("FABRIC: ") + operation + " failed: " + hipGetErrorString(error),
-        drained, [keep = regionLifetime]() {});
-  };
-
+  auto completion =
+      PrepareTransferCompletion(status, event, stream, localDevice, eventPool, regionLifetime);
   void* src = isRead ? static_cast<char*>(remoteAddr) + remoteOffset
                      : static_cast<char*>(localAddr) + localOffset;
   void* dst = isRead ? static_cast<char*>(localAddr) + localOffset
                      : static_cast<char*>(remoteAddr) + remoteOffset;
-
-  err = LaunchCopy(dst, src, size, stream);
-  if (err != hipSuccess) {
-    failSubmitted(err, "copy launch");
-    return;
+  try {
+    std::lock_guard<std::mutex> submissionLock(completion->eventMu);
+    completion->submitted = true;
+    err = LaunchCopy(dst, src, size, stream);
+    if (err != hipSuccess) {
+      completion->FailSubmissionLocked(err, "copy launch");
+      return;
+    }
+    err = hipEventRecord(event, stream);
+    if (err != hipSuccess) {
+      completion->FailSubmissionLocked(err, "hipEventRecord");
+      return;
+    }
+    completion->recorded = true;
+    status->SetCode(StatusCode::IN_PROGRESS);
+    MORI_IO_TRACE("FABRIC: Transfer issued, id={}, size={}, isRead={}", id, size, isRead);
+  } catch (...) {
+    completion->FailSubmissionException();
+    throw;
   }
-
-  err = hipEventRecord(event, stream);
-  if (err != hipSuccess) {
-    failSubmitted(err, "hipEventRecord");
-    return;
-  }
-
-  status->SetCode(StatusCode::IN_PROGRESS);
-  ArmTransferCompletion(status, event, localDevice, eventPool, [keep = regionLifetime]() {});
-  MORI_IO_TRACE("FABRIC: Transfer issued, id={}, size={}, isRead={}", id, size, isRead);
 }
 
 void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
@@ -404,14 +462,6 @@ void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const Siz
   if (err != hipSuccess) {
     status->Update(StatusCode::ERR_GPU_OP,
                    std::string("FABRIC: Failed to set device: ") + hipGetErrorString(err));
-    return;
-  }
-
-  hipStream_t stream = streamPool->GetNextStream(localDevice);
-  hipEvent_t event = eventPool->GetEvent(localDevice);
-  if (stream == nullptr || event == nullptr) {
-    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to get stream or event from pool");
-    if (event != nullptr) eventPool->PutEvent(event, localDevice);
     return;
   }
 
@@ -450,24 +500,13 @@ void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const Siz
 
   if (segments.empty()) {
     status->SetCode(StatusCode::SUCCESS);
-    eventPool->PutEvent(event, localDevice);
     return;
   }
 
-  std::shared_ptr<void> staging;
-  auto keepReferences = [region = regionLifetime, &staging]() { return [region, staging]() {}; };
-  auto failSubmitted = [&](hipError_t error, const char* operation) {
-    const bool drained = hipStreamSynchronize(stream) == hipSuccess;
-    if (drained) eventPool->PutEvent(event, localDevice);
-    fabric::internal::SettleSubmissionError(
-        status, std::string("FABRIC: ") + operation + " failed: " + hipGetErrorString(error),
-        drained, keepReferences());
-  };
-
   const bool useBatch = segments.size() > 1 && backend != nullptr &&
                         backend->GetFabricBatchCopyFunc(localDevice) != nullptr;
+  std::vector<FabricCopySegment> descriptors;
   if (useBatch) {
-    std::vector<FabricCopySegment> descriptors;
     descriptors.reserve(segments.size());
     for (const auto& seg : segments) {
       const char* src = isRead ? static_cast<char*>(remoteAddr) + seg.remoteOff
@@ -476,35 +515,54 @@ void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const Siz
                          : static_cast<char*>(remoteAddr) + seg.remoteOff;
       descriptors.push_back({src, dst, seg.sz});
     }
-    err = backend->LaunchBatchCopy(descriptors, localDevice, stream, &staging);
-    if (err != hipSuccess) {
-      failSubmitted(err, "batch copy launch");
-      return;
-    }
-  } else {
-    // Old modules without the optional batch entrypoint remain supported.
-    for (const auto& seg : segments) {
-      void* src = isRead ? static_cast<char*>(remoteAddr) + seg.remoteOff
-                         : static_cast<char*>(localAddr) + seg.localOff;
-      void* dst = isRead ? static_cast<char*>(localAddr) + seg.localOff
-                         : static_cast<char*>(remoteAddr) + seg.remoteOff;
-      err = LaunchCopy(dst, src, seg.sz, stream);
-      if (err != hipSuccess) {
-        failSubmitted(err, "batch copy launch");
-        return;
-      }
-    }
   }
 
-  err = hipEventRecord(event, stream);
-  if (err != hipSuccess) {
-    failSubmitted(err, "hipEventRecord");
+  hipStream_t stream = streamPool->GetNextStream(localDevice);
+  hipEvent_t event = eventPool->GetEvent(localDevice);
+  if (stream == nullptr || event == nullptr) {
+    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to get stream or event from pool");
+    if (event != nullptr) eventPool->PutEvent(event, localDevice);
     return;
   }
-  status->SetCode(StatusCode::IN_PROGRESS);
-  ArmTransferCompletion(status, event, localDevice, eventPool, keepReferences());
-  MORI_IO_TRACE("FABRIC: Batch transfer issued, id={}, segments={}, isRead={}", id, segments.size(),
-                isRead);
+  auto completion =
+      PrepareTransferCompletion(status, event, stream, localDevice, eventPool, regionLifetime);
+  try {
+    std::lock_guard<std::mutex> submissionLock(completion->eventMu);
+    completion->submitted = true;
+    if (useBatch) {
+      err = backend->LaunchBatchCopy(descriptors, localDevice, stream,
+                                     &completion->quarantineEntry->staging);
+      if (err != hipSuccess) {
+        completion->FailSubmissionLocked(err, "batch copy launch");
+        return;
+      }
+    } else {
+      // Old modules without the optional batch entrypoint remain supported.
+      for (const auto& seg : segments) {
+        void* src = isRead ? static_cast<char*>(remoteAddr) + seg.remoteOff
+                           : static_cast<char*>(localAddr) + seg.localOff;
+        void* dst = isRead ? static_cast<char*>(localAddr) + seg.localOff
+                           : static_cast<char*>(remoteAddr) + seg.remoteOff;
+        err = LaunchCopy(dst, src, seg.sz, stream);
+        if (err != hipSuccess) {
+          completion->FailSubmissionLocked(err, "batch copy launch");
+          return;
+        }
+      }
+    }
+    err = hipEventRecord(event, stream);
+    if (err != hipSuccess) {
+      completion->FailSubmissionLocked(err, "hipEventRecord");
+      return;
+    }
+    completion->recorded = true;
+    status->SetCode(StatusCode::IN_PROGRESS);
+    MORI_IO_TRACE("FABRIC: Batch transfer issued, id={}, segments={}, isRead={}", id,
+                  segments.size(), isRead);
+  } catch (...) {
+    completion->FailSubmissionException();
+    throw;
+  }
 }
 
 bool FabricBackendSession::Alive() const {

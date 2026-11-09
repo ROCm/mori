@@ -207,7 +207,16 @@ using TransferUniqueId = uint64_t;
 struct TransferStatus {
  public:
   TransferStatus() = default;
-  ~TransferStatus() { NotifyLifetimeObservers(); }
+  ~TransferStatus() {
+    // A deregistration waiter may be using this status after releasing the
+    // registration's mutex. Keep all members alive until that waiter returns.
+    if (destructionCallback) {
+      const bool quarantine =
+          ResourcesQuarantined() || code.load(std::memory_order_acquire) == StatusCode::IN_PROGRESS;
+      destructionCallback(quarantine);
+    }
+    NotifyLifetimeObservers();
+  }
   TransferStatus(const TransferStatus&) = delete;
   TransferStatus& operator=(const TransferStatus&) = delete;
   TransferStatus(TransferStatus&&) = delete;
@@ -314,6 +323,11 @@ struct TransferStatus {
     std::lock_guard<std::mutex> lock(lifetimeMu);
     lifetimeObservers.push_back(std::move(observer));
   }
+  // Unlike terminal observers, this callback remains installed until status
+  // destruction. It must not throw. One registration owns a status submission.
+  void SetDestructionCallback(std::function<void(bool)> callback) {
+    destructionCallback = std::move(callback);
+  }
 
  private:
   void NotifyLifetimeObservers() {
@@ -343,6 +357,7 @@ struct TransferStatus {
   std::function<void()> waitCallback;
   std::function<void()> progressCallback;
   std::function<StatusCode(void*)> streamWaitCallback;
+  std::function<void(bool)> destructionCallback;
   std::mutex lifetimeMu;
   std::vector<std::function<void(bool)>> lifetimeObservers;
   std::condition_variable cv_;

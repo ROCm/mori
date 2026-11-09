@@ -20,8 +20,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Phase 6 transfer layer, without gRPC or RDMA: every engine's planner,
-// LocalCopyEngine's executor, and CompositeTransferEngine's routing.
+// Phase 6 transfer layer without physical RDMA: every engine's planner,
+// LocalCopyEngine's executor, CompositeTransferEngine's routing, and simulated
+// RDMA completion lifetime.
 // MoriIoEngine's transfers need a fabric: see test_cross_node_smoke.
 
 #include <fcntl.h>
@@ -30,9 +31,11 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <msgpack.hpp>
+#include <new>
 #include <numeric>
 #include <set>
 #include <string>
@@ -48,6 +51,20 @@
 #include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp/distributed/transfer/posix_engine.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
+
+namespace {
+thread_local bool failTransferReportAllocation = false;
+}
+void* operator new(std::size_t bytes) {
+  if (failTransferReportAllocation) throw std::bad_alloc();
+  if (void* result = std::malloc(bytes == 0 ? 1 : bytes)) return result;
+  throw std::bad_alloc();
+}
+void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+void operator delete(void* ptr) noexcept { std::free(ptr); }
+void operator delete[](void* ptr) noexcept { std::free(ptr); }
+void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, std::size_t) noexcept { std::free(ptr); }
 
 namespace mori::umbp {
 namespace {
@@ -408,7 +425,7 @@ TEST(HbmCopyEngine, GathersRunOnPrewarmedStreams) {
 }
 
 // ---------------------------------------------------------------------------
-//  MoriIoEngine (planning only: the engine is never Init()ed)
+//  MoriIoEngine (planning and simulated completion lifetime)
 // ---------------------------------------------------------------------------
 
 // Registered with this node's engine: the zero-copy local side.
@@ -419,6 +436,70 @@ TransferRef LocalRegistered(void* base, uint64_t size, mori::io::MemoryUniqueId 
   ref.mem.size = size;
   ref.mem.loc = mori::io::MemoryLocationType::CPU;
   return ref;
+}
+
+TEST(MoriIoEngine, ReportingAllocationFailureStillDrainsPostedWork) {
+  struct ScopedEnv {
+    std::string name, old;
+    bool existed;
+    ScopedEnv(const char* key, const char* value) : name(key) {
+      const char* previous = std::getenv(key);
+      existed = previous != nullptr;
+      if (previous) old = previous;
+      setenv(key, value, 1);
+    }
+    ~ScopedEnv() {
+      if (existed)
+        setenv(name.c_str(), old.c_str(), 1);
+      else
+        unsetenv(name.c_str());
+    }
+  } simulation("MORI_IO_SIM_ENABLE", "1"), backend("MORI_IO_SIM_BACKEND", "rdma"),
+      latency("MORI_IO_SIM_RDMA_LATENCY_US", "1000000"), scale("MORI_IO_SIM_TIME_SCALE", "1");
+  MoriIoEngine owner("report-owner", {"127.0.0.1", 0}, 0);
+  MoriIoEngine reader("report-reader", {"127.0.0.1", 0}, 0);
+  ASSERT_TRUE(owner.Init());
+  ASSERT_TRUE(reader.Init());
+  auto packedOwner = owner.PackedLocalEngineDesc(), packedReader = reader.PackedLocalEngineDesc();
+  ASSERT_TRUE(
+      reader.EnsureRemoteEngine("owner", std::string(packedOwner.begin(), packedOwner.end())));
+  ASSERT_TRUE(
+      owner.EnsureRemoteEngine("reader", std::string(packedReader.begin(), packedReader.end())));
+  std::vector<char> source(4096, 'k'), destination(4096, 0);
+  auto remote =
+      owner.RegisterMemory(source.data(), source.size(), mori::io::MemoryLocationType::CPU, -1);
+  auto local = reader.RegisterMemory(destination.data(), destination.size(),
+                                     mori::io::MemoryLocationType::CPU, -1);
+  auto unavailable = TransferRef::Remote(remote.mem);
+  ++unavailable.mem.id;  // keep its rejected plan separate from the valid MR pair
+  unavailable.mem.registeredBackendMask = 0;
+  // A presettled failure precedes a real asynchronous simulated RDMA group.
+  // Reporting the failure must not skip that group's completion status.
+  auto plans =
+      reader.Plan({MakeItem(unavailable, 0, local, 0, 32, 1),
+                   MakeItem(TransferRef::Remote(remote.mem), 0, local, 0, source.size(), 2)});
+  ASSERT_EQ(plans.plans.size(), 2u);
+  auto handle = reader.Submit(std::move(plans.plans));
+  ASSERT_NE(handle, nullptr);
+  std::vector<TransferFailure> failures;
+  bool allocationFailed = false;
+  try {
+    struct AllocationFailureScope {
+      AllocationFailureScope() { failTransferReportAllocation = true; }
+      ~AllocationFailureScope() { failTransferReportAllocation = false; }
+    } fail;
+    handle->Wait(&failures);
+  } catch (const std::bad_alloc&) {
+    allocationFailed = true;
+  }
+  EXPECT_TRUE(allocationFailed);
+  handle.reset();
+  // An abandoned IN_PROGRESS status quarantines its registration. Successful
+  // deregistration after destruction proves Wait drained despite reporting OOM.
+  // The IO simulator models completion timing and never copies payload bytes.
+  EXPECT_NO_THROW(reader.Deregister(local));
+  reader.Shutdown();
+  owner.Deregister(remote);
 }
 
 TEST(MoriIoEngine, RemoteIncarnationInvalidatesDescriptorsAndRejectsLateOldRegions) {

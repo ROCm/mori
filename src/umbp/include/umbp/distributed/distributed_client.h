@@ -137,12 +137,12 @@ class DistributedClient : public IUMBPClient {
   // load/offload overlap sglang's direct linker wants). Each direction has
   // config.distributed.ranged_scratch_size in one arena, or laid out by NUMA node
   // (config.distributed.ranged_scratch_numa_layout); allocated only when the
-  // size is > 0.
+  // size is > 0. GPU-direct reads omit the GET arena and preserve PUT scratch.
   std::vector<PoolClientConfig::RangedScratchArena> ranged_get_scratch_;
   std::vector<PoolClientConfig::RangedScratchArena> ranged_put_scratch_;
   std::vector<HostBufferHandle> ranged_scratch_handles_;
   void AllocateRangedScratch(const UMBPDistributedConfig& dc);
-  bool LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base);
+  bool LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base, bool include_get);
   void FreeRangedScratch();
   // No master address => no routing => this node can never hold, fetch or
   // serve a remote key.  Set once at construction; read by SupportsRangedIO,

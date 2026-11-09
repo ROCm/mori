@@ -185,9 +185,12 @@ class IOEngine {
   std::unordered_map<MemoryUniqueId, MemoryDesc> memPool;
   std::mutex memPoolMu;
   struct RegistrationTicket {
-    std::recursive_mutex mutex;
-    std::condition_variable_any submissionReady;
+    std::mutex mutex;
+    std::condition_variable submissionReady;
     bool submissionComplete{false};
+    bool terminalObserved{false};
+    bool quarantined{false};
+    size_t activeWaiters{0};
     TransferStatus* status{nullptr};
   };
   struct RegistrationState {

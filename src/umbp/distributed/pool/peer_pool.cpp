@@ -125,7 +125,7 @@ PeerPool::~PeerPool() {
   // An RPC server stopping does not fence remote GPU loads. Retain active
   // holds so PageBackend::Shutdown can quarantine its backing allocation.
   for (auto& [operation, receipt] : read_receipts_) {
-    if (!receipt.released) (void)new PoolReadGrant(std::move(receipt.grant));
+    if (!receipt.released) (void)receipt.grant.release();
   }
 }
 
@@ -909,9 +909,9 @@ PoolReadGrant PeerPool::AcquireReadBatch(const std::vector<std::string>& keys,
   if (operation_id.empty() || rejected.generation != expected_generation) return rejected;
   auto old = read_receipts_.find(operation_id);
   if (old != read_receipts_.end()) {
-    if (!old->second.released && old->second.keys == keys &&
-        old->second.grant.generation == expected_generation)
-      return old->second.grant;
+    if (!old->second.released && old->second.grant && old->second.keys == keys &&
+        old->second.grant->generation == expected_generation)
+      return *old->second.grant;
     return rejected;
   }
   if (auto ordered = OrderedOperation(operation_id)) {
@@ -930,8 +930,16 @@ PoolReadGrant PeerPool::AcquireReadBatch(const std::vector<std::string>& keys,
     }
   }
   PoolReadGrant grant{true, next_read_token_++, expected_generation, std::move(entries)};
-  read_tokens_.emplace(grant.token, operation_id);
-  read_receipts_.emplace(operation_id, ReadReceipt{keys, grant, false});
+  ReadReceipt receipt{keys, std::make_unique<PoolReadGrant>(grant), false};
+  auto inserted = read_receipts_.emplace(operation_id, std::move(receipt)).first;
+  try {
+    read_tokens_.emplace(grant.token, operation_id);
+  } catch (...) {
+    // No grant was published, so these holds can retire. Keep both indexes
+    // consistent if token indexing cannot allocate its node or key copy.
+    read_receipts_.erase(inserted);
+    throw;
+  }
   return grant;
 }
 
@@ -948,7 +956,7 @@ std::vector<bool> PeerPool::ReleaseReadPins(const std::vector<uint64_t>& tokens)
     // Receipt/token tombstones remain, so duplicate release is harmless and a
     // retried acquire cannot produce new references to recycled pages.
     receipt.released = true;
-    receipt.grant.entries.clear();
+    receipt.grant->entries.clear();
     if (auto ordered = OrderedOperation(token->second)) {
       auto& completed = read_clients_[ordered->first];
       completed = std::max(completed, ordered->second);
@@ -973,7 +981,7 @@ std::vector<bool> PeerPool::AbandonReadOperations(const std::vector<std::string>
       auto& completed = read_clients_[ordered->first];
       completed = std::max(completed, ordered->second);
       if (receipt != read_receipts_.end()) {
-        read_tokens_.erase(receipt->second.grant.token);
+        read_tokens_.erase(receipt->second.grant->token);
         read_receipts_.erase(receipt);
       }
     } else {
@@ -982,7 +990,7 @@ std::vector<bool> PeerPool::AbandonReadOperations(const std::vector<std::string>
         receipt = read_receipts_.emplace(operation, ReadReceipt{}).first;
       }
       receipt->second.released = true;
-      receipt->second.grant.entries.clear();
+      if (receipt->second.grant) receipt->second.grant->entries.clear();
     }
     out[i] = true;
   }

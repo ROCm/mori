@@ -97,6 +97,7 @@ class PoolClient {
   // One independently consumable group of GPU ranges. Keep the handle and
   // destination allocations alive until Wait returns. WaitOnStream queues the
   // transfer events on an inference stream; Wait still retires owner pins.
+  // Completion and destruction may occur on a different thread from Submit.
   class KvReadHandle {
    public:
     ~KvReadHandle();
@@ -106,6 +107,8 @@ class PoolClient {
 
    private:
     friend class PoolClient;
+    void FinishLocked() noexcept;
+    void Drain() noexcept;
     mutable std::mutex mutex_;
     bool waited_ = false;
     bool quarantined_ = false;
@@ -295,6 +298,9 @@ class PoolClient {
  private:
   PoolClientConfig config_;
   std::shared_ptr<PoolPlatform> platform_;
+  // Allocated before any submission; release the owner without allocating if
+  // unconfirmed GPU work requires retaining platform-managed mappings.
+  std::unique_ptr<std::shared_ptr<PoolPlatform>> platform_quarantine_hold_;
   std::atomic<bool> initialized_{false};
 
   // Sample every instrumented component on this node — each registered storage
@@ -431,8 +437,9 @@ class PoolClient {
   mutable std::shared_mutex async_read_mutex_;
   std::mutex async_handles_mutex_;
   std::mutex async_control_mutex_;
-  std::condition_variable async_prepare_cv_;
+  std::condition_variable async_read_cv_;
   size_t async_preparing_ = 0;
+  size_t async_live_reads_ = 0;
   bool async_read_blocked_ = false;
   std::vector<std::weak_ptr<KvReadHandle>> async_reads_;
   void DrainAsyncReads();
@@ -441,7 +448,7 @@ class PoolClient {
   uint64_t kv_inflight_bytes_ = 0;
   std::map<uintptr_t, uintptr_t> kv_active_destinations_;
   std::atomic<bool> gpu_quarantined_{false};
-  void QuarantineGpuResources();
+  void QuarantineGpuResources() noexcept;
   bool TransferWithDrain(const std::vector<TransferItem>& items, std::vector<size_t>* failed_tags,
                          const TransferEngine::StepTiming* timing = nullptr);
   using LocalSlotOperations = std::map<std::pair<uint32_t, uint64_t>, std::string>;
@@ -1138,8 +1145,9 @@ class PoolClient {
                                 const std::string& owner_incarnation);
 
   bool PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items, PeerConnection& peer,
-                               ::umbp::UMBPPeer::Stub* stub, std::vector<RemoteGetEntry>* entries,
-                               std::vector<bool>* results, std::shared_ptr<void>* pin_hold);
+                               const std::shared_ptr<void>& stub_hold,
+                               std::vector<RemoteGetEntry>* entries, std::vector<bool>* results,
+                               std::shared_ptr<void>* pin_hold);
   bool BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, const std::string& node_id,
                                std::vector<TransferItem>* items);
   void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results,
@@ -1155,7 +1163,9 @@ class PoolClient {
     PeerConnection* peer = nullptr;
     std::vector<RemoteGetEntry> entries;
     std::unique_ptr<TransferHandle> handle;
-    std::shared_ptr<void> read_pin_hold;
+    // The wrapper is allocated before Acquire/Submit, so quarantine can retain
+    // the grant by releasing it without allocating during an OOM failure.
+    std::unique_ptr<std::shared_ptr<void>> read_pin_hold;
     bool quarantined = false;
     bool drained = false;
     ~RemoteGetInFlight();

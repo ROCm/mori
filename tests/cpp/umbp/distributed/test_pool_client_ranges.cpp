@@ -29,8 +29,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <mutex>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1712,9 +1717,57 @@ namespace {
 struct FaultedSubmissionState {
   size_t submissions = 0;
   size_t throw_on = 0;
+  size_t plan_builders = 0;
+  size_t throw_on_plan = 0;
+  bool gate_next_wait = false;
+  bool throw_next_wait = false;
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool wait_entered = false;
+  bool release_wait = false;
   // Submit has already posted work, but the caller did not receive a handle
   // with which to establish completion. Keep that work alive for the test.
   std::vector<std::unique_ptr<TransferHandle>> inaccessible_handles;
+};
+
+// Model an allocation failure while reporting terminal transfer status. A
+// repeated Wait is empty, just like a handle whose status is already settled.
+class ThrowWaitOnceHandle final : public TransferHandle {
+ public:
+  explicit ThrowWaitOnceHandle(std::unique_ptr<TransferHandle> handle)
+      : handle_(std::move(handle)) {}
+  void Wait(std::vector<TransferFailure>*) override {
+    if (reported_) return;
+    reported_ = true;
+    handle_->Wait(nullptr);
+    throw std::bad_alloc();
+  }
+  bool WaitOnStream(void* stream) override { return handle_->WaitOnStream(stream); }
+
+ private:
+  std::unique_ptr<TransferHandle> handle_;
+  bool reported_ = false;
+};
+
+class RetirementGateHandle final : public TransferHandle {
+ public:
+  RetirementGateHandle(std::unique_ptr<TransferHandle> handle,
+                       std::shared_ptr<FaultedSubmissionState> state)
+      : handle_(std::move(handle)), state_(std::move(state)) {}
+  void Wait(std::vector<TransferFailure>* failures) override {
+    {
+      std::unique_lock<std::mutex> guard(state_->gate_mutex);
+      state_->wait_entered = true;
+      state_->gate_cv.notify_all();
+      state_->gate_cv.wait(guard, [&] { return state_->release_wait; });
+    }
+    handle_->Wait(failures);
+  }
+  bool WaitOnStream(void* stream) override { return handle_->WaitOnStream(stream); }
+
+ private:
+  std::unique_ptr<TransferHandle> handle_;
+  std::shared_ptr<FaultedSubmissionState> state_;
 };
 
 class SubmitFaultEngine final : public TransferEngine {
@@ -1727,6 +1780,7 @@ class SubmitFaultEngine final : public TransferEngine {
     return engine_->CanHandle(src, dst);
   }
   std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items) const override {
+    if (++state_->plan_builders == state_->throw_on_plan) throw std::bad_alloc();
     return engine_->CreatePlanBuilder(expected_items);
   }
   TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
@@ -1749,6 +1803,14 @@ class SubmitFaultEngine final : public TransferEngine {
       state_->inaccessible_handles.push_back(std::move(handle));
       throw std::runtime_error("injected exception after posting GPU work");
     }
+    if (state_->gate_next_wait && handle) {
+      state_->gate_next_wait = false;
+      return std::make_unique<RetirementGateHandle>(std::move(handle), state_);
+    }
+    if (state_->throw_next_wait && handle) {
+      state_->throw_next_wait = false;
+      return std::make_unique<ThrowWaitOnceHandle>(std::move(handle));
+    }
     return handle;
   }
 
@@ -1759,8 +1821,9 @@ class SubmitFaultEngine final : public TransferEngine {
 
 class SubmitFaultPlatform final : public PoolPlatform {
  public:
-  explicit SubmitFaultPlatform(std::shared_ptr<FaultedSubmissionState> state)
-      : delegate_(MakePoolPlatform(UMBPSimConfig{})), state_(std::move(state)) {}
+  explicit SubmitFaultPlatform(std::shared_ptr<FaultedSubmissionState> state,
+                               const UMBPSimConfig& sim = {})
+      : delegate_(MakePoolPlatform(sim)), state_(std::move(state)) {}
   Engines CreateTransferEngine(const PoolClientConfig& config,
                                const std::vector<BackendInstanceConfig>& backends) override {
     auto engines = delegate_->CreateTransferEngine(config, backends);
@@ -1794,6 +1857,7 @@ class SubmitFaultPlatform final : public PoolPlatform {
 class PoolClientGpuDirectTest : public ::testing::Test {
  protected:
   virtual std::shared_ptr<PoolPlatform> CreatePlatform() { return nullptr; }
+  virtual size_t MaxInflightReads() const { return 1; }
   void SetUp() override {
     const char* module = std::getenv("MORI_FABRIC_TEST_MODULE");
     int count = 0;
@@ -1811,7 +1875,7 @@ class PoolClientGpuDirectTest : public ::testing::Test {
     cfg.io_engine.fabric_kernel_path = module;
     cfg.kv_put_placement = UMBPKvPutPlacement::kOwnerLocal;
     cfg.kv_ranged_path = UMBPKvRangedPath::kGpuDirect;
-    cfg.kv_max_inflight_reads = 1;
+    cfg.kv_max_inflight_reads = MaxInflightReads();
     cfg.eviction_mode = PeerEvictionMode::kMaster;
     client_ = std::make_unique<PoolClient>(cfg, CreatePlatform());
     ASSERT_TRUE(client_->Init());
@@ -1895,6 +1959,62 @@ TEST_F(PoolClientGpuDirectTest, InflightBudgetRetiresAndShutdownDrainsOutstandin
   EXPECT_EQ(next->Wait(), std::vector<bool>{true});
 }
 
+TEST_F(PoolClientGpuDirectTest, CompletionCanRetireOnAnotherThread) {
+  auto read =
+      client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{destination_}}, {{256}}, {{0}});
+  std::vector<bool> result;
+  std::thread completion([&] { result = read->Wait(); });
+  completion.join();
+  EXPECT_EQ(result, std::vector<bool>{true});
+  EXPECT_FALSE(read->ResourcesQuarantined());
+  // Registration drains/reuses the lifecycle gate after the other thread has
+  // retired the read; it must not depend on the submitting thread unlocking.
+  EXPECT_TRUE(client_->RegisterMemory(destination_, 32768, mori::io::MemoryLocationType::GPU, 0,
+                                      MemoryRegistration::kFabricLocal));
+  std::vector<char> actual(256);
+  ASSERT_EQ(hipMemcpy(actual.data(), destination_, actual.size(), hipMemcpyDeviceToHost),
+            hipSuccess);
+  EXPECT_EQ(std::memcmp(actual.data(), expected_.data(), actual.size()), 0);
+}
+
+TEST_F(PoolClientGpuDirectTest, ShutdownOnAnotherThreadDrainsAnUnwaitedHandle) {
+  auto read =
+      client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{destination_}}, {{256}}, {{0}});
+  std::thread shutdown([&] { client_->Shutdown(); });
+  shutdown.join();
+  EXPECT_EQ(read->Wait(), std::vector<bool>{true});
+  EXPECT_FALSE(read->ResourcesQuarantined());
+  std::vector<char> actual(256);
+  ASSERT_EQ(hipMemcpy(actual.data(), destination_, actual.size(), hipMemcpyDeviceToHost),
+            hipSuccess);
+  EXPECT_EQ(std::memcmp(actual.data(), expected_.data(), actual.size()), 0);
+}
+
+class PoolClientGpuConcurrentReadTest : public PoolClientGpuDirectTest {
+ protected:
+  size_t MaxInflightReads() const override { return 4; }
+};
+
+TEST_F(PoolClientGpuConcurrentReadTest, OneThreadCanSubmitMultipleGroupsBeforeCompletion) {
+  auto* dst = static_cast<char*>(destination_);
+  auto first = client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{dst}}, {{256}}, {{0}});
+  auto second =
+      client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{dst + 1024}}, {{256}}, {{256}});
+  std::vector<bool> first_result, second_result;
+  std::thread first_completion([&] { first_result = first->Wait(); });
+  std::thread second_completion([&] { second_result = second->Wait(); });
+  first_completion.join();
+  second_completion.join();
+  EXPECT_EQ(first_result, std::vector<bool>{true});
+  EXPECT_EQ(second_result, std::vector<bool>{true});
+  EXPECT_FALSE(client_->HasQuarantinedTransfers());
+  std::vector<char> actual(1280);
+  ASSERT_EQ(hipMemcpy(actual.data(), destination_, actual.size(), hipMemcpyDeviceToHost),
+            hipSuccess);
+  EXPECT_EQ(std::memcmp(actual.data(), expected_.data(), 256), 0);
+  EXPECT_EQ(std::memcmp(actual.data() + 1024, expected_.data() + 256, 256), 0);
+}
+
 class PoolClientGpuSubmitFaultTest : public PoolClientGpuDirectTest {
  protected:
   std::shared_ptr<PoolPlatform> CreatePlatform() override {
@@ -1902,6 +2022,212 @@ class PoolClientGpuSubmitFaultTest : public PoolClientGpuDirectTest {
   }
   std::shared_ptr<FaultedSubmissionState> fault_ = std::make_shared<FaultedSubmissionState>();
 };
+
+TEST_F(PoolClientGpuSubmitFaultTest, PreparationAllocationFailureRetiresBudgetAndDestinations) {
+  const auto submits_before = fault_->submissions;
+  fault_->throw_on_plan = fault_->plan_builders + 1;
+  EXPECT_THROW(
+      client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{destination_}}, {{256}}, {{0}}),
+      std::bad_alloc);
+  EXPECT_EQ(fault_->submissions, submits_before);
+  EXPECT_FALSE(client_->HasQuarantinedTransfers());
+  // With a one-read budget, leaked counts or destination reservations would
+  // refuse this read of the same bytes into the same arena.
+  auto retry =
+      client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{destination_}}, {{256}}, {{0}});
+  EXPECT_EQ(retry->Wait(), std::vector<bool>{true});
+  std::thread shutdown([&] { client_->Shutdown(); });
+  shutdown.join();
+}
+
+TEST_F(PoolClientGpuSubmitFaultTest, ShutdownWaitsForAnExpiredHandleStillBeingDestroyed) {
+  fault_->gate_next_wait = true;
+  auto read =
+      client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{destination_}}, {{256}}, {{0}});
+  std::thread retirement([read = std::move(read)]() mutable { read.reset(); });
+  bool entered = false;
+  {
+    std::unique_lock<std::mutex> guard(fault_->gate_mutex);
+    entered = fault_->gate_cv.wait_for(guard, std::chrono::seconds(5),
+                                       [&] { return fault_->wait_entered; });
+  }
+  EXPECT_TRUE(entered);
+  std::atomic<bool> shutdown_started{false}, shutdown_finished{false};
+  std::thread shutdown([&] {
+    shutdown_started = true;
+    client_->Shutdown();
+    shutdown_finished = true;
+  });
+  while (!shutdown_started) std::this_thread::yield();
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  EXPECT_FALSE(shutdown_finished)
+      << "an expired weak handle can still own a state waiting for transfer completion";
+  {
+    std::lock_guard<std::mutex> guard(fault_->gate_mutex);
+    fault_->release_wait = true;
+  }
+  fault_->gate_cv.notify_all();
+  retirement.join();
+  shutdown.join();
+  EXPECT_TRUE(shutdown_finished);
+  EXPECT_FALSE(client_->HasQuarantinedTransfers());
+  std::vector<char> actual(256);
+  ASSERT_EQ(hipMemcpy(actual.data(), destination_, actual.size(), hipMemcpyDeviceToHost),
+            hipSuccess);
+  EXPECT_EQ(std::memcmp(actual.data(), expected_.data(), actual.size()), 0);
+}
+
+TEST_F(PoolClientGpuSubmitFaultTest, WaitReportingExceptionFailsClosedAndRetiresLifecycle) {
+  auto* backend = client_->Backends().Get(TierType::HBM);
+  ASSERT_NE(backend, nullptr);
+  const auto available_before = backend->Capacity().available_bytes;
+  fault_->throw_next_wait = true;
+  auto read =
+      client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{destination_}}, {{256}}, {{0}});
+  EXPECT_EQ(read->Wait(), std::vector<bool>{false});
+  EXPECT_EQ(read->Wait(), std::vector<bool>{false});
+  EXPECT_TRUE(read->ResourcesQuarantined());
+  EXPECT_TRUE(client_->HasQuarantinedTransfers());
+  ASSERT_TRUE(client_->Clear());
+  EXPECT_EQ(backend->Capacity().available_bytes, available_before)
+      << "failure-report allocation must not release the source hold";
+  std::thread shutdown([&] { client_->Shutdown(); });
+  shutdown.join();
+}
+
+TEST_F(PoolClientGpuSubmitFaultTest, DestructorContainsWaitReportingException) {
+  fault_->throw_next_wait = true;
+  auto read =
+      client_->SubmitBatchGetRangesGpuDirect({"kv-layout"}, {{destination_}}, {{256}}, {{0}});
+  read.reset();
+  EXPECT_TRUE(client_->HasQuarantinedTransfers());
+  std::thread shutdown([&] { client_->Shutdown(); });
+  shutdown.join();
+}
+
+// Real master/peer RPCs with a simulated data path make report-allocation
+// failures deterministic without relying on a physical GPU failure or NIC.
+class PoolClientWaitFaultTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    char path[] = "/tmp/umbp-wait-fault-XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    directory_ = path;
+    const auto profile_path = directory_ + "/profile.json";
+    std::ofstream(profile_path) << R"({"id":"wait-fault","paths":{
+          "cpu_cpu":{"channel":"host","latency_ns":0,"bandwidth_bytes_per_second":1e10},
+          "cpu_gpu":{"channel":"gpu","latency_ns":0,"bandwidth_bytes_per_second":1e10},
+          "remote_read":{"channel":"wire","latency_ns":0,"bandwidth_bytes_per_second":1e10},
+          "remote_write":{"channel":"wire","latency_ns":0,"bandwidth_bytes_per_second":1e10}}})";
+    sim_.enabled = true;
+    sim_.profile_path = profile_path;
+    MasterServerConfig config;
+    config.listen_address = "127.0.0.1:0";
+    master_ = std::make_unique<MasterServer>(std::move(config));
+    master_thread_ = std::thread([this] { master_->Run(); });
+    for (int i = 0; i < 200 && master_->GetBoundPort() == 0; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_NE(master_->GetBoundPort(), 0);
+    owner_ = MakeClient("wait-owner", 16 * kPage, true);
+    reader_ = MakeClient("wait-reader", kPage, false);
+    source_.resize(2 * kPage, 19);
+    destination_.resize(2 * kPage);
+    ASSERT_TRUE(reader_->RegisterMemory(source_.data(), source_.size()));
+    ASSERT_TRUE(reader_->RegisterMemory(destination_.data(), destination_.size(),
+                                        mori::io::MemoryLocationType::GPU, 0));
+    ASSERT_TRUE(owner_->Put("remote", source_.data(), source_.size()));
+    owner_->Master().FlushHeartbeat();
+    // Flush only wakes the heartbeat worker; wait for its publication to
+    // reach the master before exercising the remote metadata path.
+    ASSERT_TRUE(WaitForExists(reader_.get(), "remote"));
+  }
+  void TearDown() override {
+    if (reader_) reader_->Shutdown();
+    if (owner_) owner_->Shutdown();
+    reader_.reset();
+    owner_.reset();
+    if (master_) master_->Shutdown();
+    if (master_thread_.joinable()) master_thread_.join();
+    if (!directory_.empty()) std::filesystem::remove_all(directory_);
+  }
+  std::unique_ptr<PoolClient> MakeClient(const std::string& id, size_t capacity, bool owner) {
+    PoolClientConfig config;
+    config.sim = sim_;
+    config.master_config.node_id = id;
+    config.master_config.node_address = "127.0.0.1";
+    config.master_config.master_address = "127.0.0.1:" + std::to_string(master_->GetBoundPort());
+    config.auto_peer_service_port = true;
+    config.dram_page_size = kPage;
+    config.dram.buffer_sizes = {capacity};
+    config.cache_remote_fetches = false;
+    config.ranged_locality_prefetch = false;
+    config.eviction_mode = PeerEvictionMode::kMaster;
+    config.io_engine.mode = UMBPTransferMode::kAuto;
+    config.kv_put_placement = owner ? UMBPKvPutPlacement::kOwnerLocal : UMBPKvPutPlacement::kMaster;
+    config.kv_ranged_path = UMBPKvRangedPath::kGpuDirect;
+    auto platform = owner ? nullptr : std::make_shared<SubmitFaultPlatform>(fault_, sim_);
+    auto client = std::make_unique<PoolClient>(config, std::move(platform));
+    EXPECT_TRUE(client->Init());
+    return client;
+  }
+  static constexpr size_t kPage = 4096;
+  std::string directory_;
+  UMBPSimConfig sim_;
+  std::shared_ptr<FaultedSubmissionState> fault_ = std::make_shared<FaultedSubmissionState>();
+  std::unique_ptr<MasterServer> master_;
+  std::thread master_thread_;
+  std::unique_ptr<PoolClient> owner_, reader_;
+  std::vector<char> source_, destination_;
+};
+
+TEST_F(PoolClientWaitFaultTest, RemoteReadReportingExceptionRetainsOwnerPin) {
+  fault_->throw_next_wait = true;
+  auto read = reader_->SubmitBatchGetRangesGpuDirect({"remote"}, {{destination_.data()}}, {{128}},
+                                                     {{kPage - 64}});
+  EXPECT_EQ(read->Wait(), std::vector<bool>{false});
+  EXPECT_EQ(read->Wait(), std::vector<bool>{false});
+  EXPECT_TRUE(read->ResourcesQuarantined());
+  EXPECT_TRUE(reader_->HasQuarantinedTransfers());
+  auto* backend = owner_->Backends().Get(TierType::DRAM);
+  ASSERT_NE(backend, nullptr);
+  EXPECT_EQ(backend->Evict({"remote"}).front().bytes_freed, 0u)
+      << "reporting failure must not release the remote read grant";
+  reader_->Shutdown();
+}
+
+TEST_F(PoolClientWaitFaultTest, RemoteWriteReportingExceptionDoesNotPublishOrAbort) {
+  auto* backend = owner_->Backends().Get(TierType::DRAM);
+  ASSERT_NE(backend, nullptr);
+  const auto available_before = backend->Capacity().available_bytes;
+  fault_->throw_next_wait = true;
+  // The two-page object cannot fit the reader's one-page pool, ensuring that
+  // master placement selects the owner and exercises a protected remote slot.
+  EXPECT_FALSE(reader_->Put("remote-write", source_.data(), source_.size()));
+  EXPECT_TRUE(reader_->HasQuarantinedTransfers());
+  EXPECT_FALSE(backend->Contains("remote-write"));
+  EXPECT_EQ(backend->Capacity().available_bytes, available_before - source_.size());
+}
+
+TEST_F(PoolClientWaitFaultTest, PreparationUnwindContainsWaitExceptionAndRetainsLocalHold) {
+  auto* backend = reader_->Backends().Get(TierType::DRAM);
+  ASSERT_NE(backend, nullptr);
+  const auto allocated = backend->BatchAllocate({AllocateRequest{"local", kPage}}).front();
+  ASSERT_EQ(allocated.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(backend->BatchCommit({CommitRequest{allocated.slot_id, "local"}}).front().success);
+  const auto available_before = backend->Capacity().available_bytes;
+  fault_->throw_next_wait = true;
+  // Local planning/submission completes first. Remote planning then fails,
+  // exercising ReadState's cleanup during exception unwinding, before publish.
+  fault_->throw_on_plan = fault_->plan_builders + 2;
+  EXPECT_THROW(reader_->SubmitBatchGetRangesGpuDirect(
+                   {"local", "remote"}, {{destination_.data()}, {destination_.data() + kPage}},
+                   {{128}, {128}}, {{0}, {0}}),
+               std::bad_alloc);
+  EXPECT_TRUE(reader_->HasQuarantinedTransfers());
+  ASSERT_TRUE(reader_->Clear());
+  EXPECT_EQ(backend->Capacity().available_bytes, available_before);
+  reader_->Shutdown();
+}
 
 TEST_F(PoolClientGpuSubmitFaultTest, SubmitExceptionQuarantinesReadBeforeHandlePublication) {
   auto* backend = client_->Backends().Get(TierType::HBM);

@@ -98,11 +98,11 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
   // NUMA layout for a client many GPUs share.  Its page size matters too: each
   // arena is one NIC memory region, and hugepages cut its translation entries.
   //
-  // Zero-sized is the default and means "this deployment does not do ranged
-  // I/O": no arena, no registration, and SupportsRangedIO() reports false, so
-  // a client that never issues ranged operations stops paying for the arena.
-  if (dc.ranged_scratch_size > 0 && dc.kv_ranged_path != UMBPKvRangedPath::kGpuDirect)
-    AllocateRangedScratch(dc);
+  // GPU-direct GET does not use an arena. An explicitly sized PUT arena still
+  // supports ranged writes routed to another node, independently of GET mode.
+  // Zero-sized is the default: no arena or host registration for direct reads
+  // and producer-local writes.
+  if (dc.ranged_scratch_size > 0) AllocateRangedScratch(dc);
 
   auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership),
                                       config.dram.high_watermark, config.dram.low_watermark);
@@ -449,17 +449,20 @@ void DistributedClient::Close() {
 }
 
 void DistributedClient::AllocateRangedScratch(const UMBPDistributedConfig& dc) {
+  const bool include_get = dc.kv_ranged_path != UMBPKvRangedPath::kGpuDirect;
   HostBufferOptions opts;
   if (dc.ranged_scratch_use_hugepages) {
     opts.backing = HostBufferBacking::kAnonymousHugetlb;
     opts.hugepage_size = dc.ranged_scratch_hugepage_size;
   }
-  if (dc.ranged_scratch_numa_layout && LayOutRangedScratchByNuma(dc.ranged_scratch_size, opts)) {
+  if (dc.ranged_scratch_numa_layout &&
+      LayOutRangedScratchByNuma(dc.ranged_scratch_size, opts, include_get)) {
     return;
   }
   // One arena per direction, each of ranged_scratch_size, so the two
   // directions never share a buffer or a lock and can run concurrently.
   for (auto* arenas : {&ranged_get_scratch_, &ranged_put_scratch_}) {
+    if (arenas == &ranged_get_scratch_ && !include_get) continue;
     HostBufferHandle handle = platform_->AllocateHost(dc.ranged_scratch_size, opts);
     if (!handle.valid()) {
       // HostBufferHandle is not RAII and the destructor/Close() won't run when a
@@ -473,12 +476,13 @@ void DistributedClient::AllocateRangedScratch(const UMBPDistributedConfig& dc) {
   // Hugepages fall back to 4 KiB silently, so log what was actually mapped.
   const HostBufferHandle& first = ranged_scratch_handles_.front();
   MORI_UMBP_INFO(
-      "[DistributedClient] ranged scratch: 2 arenas x {} MiB, {} KiB pages ({})",
-      first.mapped_size >> 20, first.actual_alignment >> 10,
+      "[DistributedClient] ranged scratch: {} arena(s) x {} MiB, {} KiB pages ({})",
+      include_get ? 2 : 1, first.mapped_size >> 20, first.actual_alignment >> 10,
       first.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb" : "anonymous");
 }
 
-bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base) {
+bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base,
+                                                  bool include_get) {
   // An equal part of the bytes per node that has GPUs.  The shards are counted
   // over the whole arena, as they are for one arena, so a shard is
   // bytes / shards either way; unset, there is one per GPU.
@@ -486,13 +490,13 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
   std::set<int> nodes;
   for (const auto& [device, node] : gpus) nodes.insert(node);
   if (nodes.empty()) {
-    MORI_UMBP_INFO("[DistributedClient] ranged scratch: no GPU NUMA affinity, so one arena");
+    MORI_UMBP_INFO("[DistributedClient] ranged scratch: no GPU NUMA affinity, so flat layout");
     return false;
   }
   const size_t part = bytes / nodes.size() / 64 * 64;
   if (part == 0) {
     MORI_UMBP_WARN(
-        "[DistributedClient] ranged scratch: {} B is too small for {} NUMA nodes, so one arena",
+        "[DistributedClient] ranged scratch: {} B is too small for {} NUMA nodes, so flat layout",
         bytes, nodes.size());
     return false;
   }
@@ -512,10 +516,11 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
     opts.numa_bind_mode = NumaBindMode::kBind;
     opts.require_numa_binding = true;
     for (auto* arenas : {&ranged_get_scratch_, &ranged_put_scratch_}) {
+      if (arenas == &ranged_get_scratch_ && !include_get) continue;
       HostBufferHandle handle = platform_->AllocateHost(part, opts);
       if (!handle.valid()) {
         MORI_UMBP_WARN(
-            "[DistributedClient] ranged scratch: {} B on NUMA node {} unavailable, so one arena",
+            "[DistributedClient] ranged scratch: {} B on NUMA node {} unavailable, so flat layout",
             part, node);
         FreeRangedScratch();
         return false;
@@ -528,8 +533,9 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
   }
   const HostBufferHandle& first = ranged_scratch_handles_.front();
   MORI_UMBP_INFO(
-      "[DistributedClient] ranged scratch: 2 arenas x {} KiB by NUMA node ({}), {} KiB pages ({})",
-      (part * nodes.size()) >> 10, layout, first.actual_alignment >> 10,
+      "[DistributedClient] ranged scratch: {} arena(s) x {} KiB by NUMA node ({}), {} KiB pages "
+      "({})",
+      include_get ? 2 : 1, (part * nodes.size()) >> 10, layout, first.actual_alignment >> 10,
       first.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb" : "anonymous");
   return true;
 }
@@ -554,6 +560,8 @@ void DistributedClient::QuarantineTransfers() {
 }
 
 bool DistributedClient::SupportsRangedIO() const {
+  // GPU direct supports reads without GET scratch; remote ranged writes still
+  // need the separately configured PUT arena. Local writes never use it.
   if (config_.distributed && config_.distributed->kv_ranged_path == UMBPKvRangedPath::kGpuDirect)
     return true;
   // The scratch arenas are the whole opt-in.  They are purely a remote-path

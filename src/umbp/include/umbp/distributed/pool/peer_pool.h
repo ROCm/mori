@@ -351,7 +351,9 @@ class PeerPool {
   void RetireProtectedWritesLocked(const std::vector<std::string>& operation_ids);
   struct ReadReceipt {
     std::vector<std::string> keys;
-    PoolReadGrant grant;
+    // Prepared before publishing the grant. An active receipt may outlive the
+    // RPC server, so destruction retains it with release(), without allocation.
+    std::unique_ptr<PoolReadGrant> grant;
     bool released = false;
   };
   std::mutex read_pin_mutex_;
