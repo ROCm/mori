@@ -156,6 +156,15 @@ TEST(Render, EveryScalarFieldReachesTheText) {
   c = base;
   c.useWeights = false;
   differs(c, "useWeights");
+  c = base;
+  c.callTokMax = 64;
+  differs(c, "callTokMax");
+  c = base;
+  c.ll128 = true;
+  differs(c, "ll128");
+  c = base;
+  c.ll128CombineOnly = true;
+  differs(c, "ll128CombineOnly");
 }
 
 TEST(Geometry, BlockThreadsIsWarpsTimesWave) {
@@ -280,6 +289,7 @@ TEST(Sizes, RegionsFollowTheRecvCapacity) {
   EpCfg c;  // ws 8, 128 tok/rank -> 1024 slots, topk 8
   c.scaleBytes = 224;
   EXPECT_EQ(EpRegionTokOffBytes(c), 4u);
+  EXPECT_EQ(EpRegionTokOff1250xBytes(c), 256u + 8 * 8 * 4);
   EXPECT_EQ(EpRegionRecvNumBytes(c), 2u * 8 * 4);
   EXPECT_EQ(EpRegionRecvToSrcBytes(c), 1024u * 4);
   EXPECT_EQ(EpRegionOutIdxBytes(c), 1024u * 8 * 4);
@@ -289,6 +299,8 @@ TEST(Sizes, RegionsFollowTheRecvCapacity) {
   EXPECT_EQ(EpRegionOutScalesBytes(c), 1024u * 256);  // padded to 128 B
   c.scaleBytes = 0;
   EXPECT_EQ(EpRegionOutScalesBytes(c), 0u);
+  c.worldSize = 16;
+  EXPECT_EQ(EpRegionTokOff1250xBytes(c), 4u);
 }
 
 TEST(Sha256, KnownVectors) {
@@ -616,6 +628,49 @@ TEST(AsyncLLMode, FactoryRejectsInvalidAndIncompatibleModes) {
                                      EpInterNodeFamily::AsyncLL));
 }
 
+TEST(AsyncLLMode, FusedReceiveGridIsCappedAtHalfTheDeviceByDefault) {
+  const auto kinds = {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy};
+  // Only the fused mode resolves a ceiling, and only its receive copies use it.
+  for (int mode : {0, 1}) {
+    const auto cfg = AsyncLLCfgForMode(mode);
+    EXPECT_EQ(cfg.asyncLlFusedRecvCtas, 0);
+    for (const auto kind : kinds) {
+      EXPECT_EQ(EpAsyncLLGeometry(cfg, kind).gridX, static_cast<unsigned>(cfg.mpCount));
+    }
+  }
+  const auto fused = AsyncLLCfgForMode(2);
+  EXPECT_EQ(fused.asyncLlFusedRecvCtas, fused.mpCount / 2);
+  for (const auto kind : kinds) {
+    EXPECT_EQ(EpAsyncLLGeometry(fused, kind).gridX, static_cast<unsigned>(fused.mpCount / 2));
+  }
+  EXPECT_EQ(EpAsyncLLGeometry(fused, EpAsyncLLKernel::CombineSendCopy).gridX,
+            static_cast<unsigned>(fused.mpCount));
+
+  // An explicit ceiling is aligned down to worldSize and never widens the grid.
+  EpInterNodeRequest request;
+  request.worldSize = 4;
+  request.gpuPerNode = 4;
+  request.asyncLlMode = 2;
+  for (const auto& [ctas, grid] : std::vector<std::pair<int, int>>{{10, 8}, {1, 4}, {1000, 64}}) {
+    request.asyncLlFusedRecvCtas = ctas;
+    const auto cfg = MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                        EpInterNodeFamily::AsyncLL);
+    EXPECT_EQ(cfg.asyncLlFusedRecvCtas, ctas);
+    EXPECT_EQ(EpAsyncLLGeometry(cfg, EpAsyncLLKernel::DispatchRecvCopy).gridX,
+              static_cast<unsigned>(grid));
+  }
+
+  request.asyncLlFusedRecvCtas = -1;
+  EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                  EpInterNodeFamily::AsyncLL),
+               std::runtime_error);
+  request.asyncLlMode = 1;
+  request.asyncLlFusedRecvCtas = 16;
+  EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                  EpInterNodeFamily::AsyncLL),
+               std::runtime_error);
+}
+
 TEST(AsyncLLMode, ReceiveEntryAndDefinesUseThePlanMode) {
   for (const auto kind : {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy}) {
     const std::string stem = kind == EpAsyncLLKernel::DispatchRecvCopy ? "EpDispatchAsyncLLRecvCopy"
@@ -737,6 +792,7 @@ TEST(Describe, ReportsTheSizesWithoutCompiling) {
   auto d = ParseInfo(DescribePlan("ep_dispatch", {{"scaleBytes", 224}}));
   EpCfg c;
   c.scaleBytes = 224;
+  c.aggReserve = true;
   EXPECT_EQ(d["stagingBytes"], std::to_string(EpStagingTotalBytes(c)));
   EXPECT_EQ(d["scaleStride"], "256");
   EXPECT_EQ(d["region.dispOut"], std::to_string(EpRegionDispOutBytes(c)));
@@ -759,4 +815,30 @@ TEST(Describe, FailsWhereCreateWould) {
   // The push combine is gfx125x only; RenderSource rejects it, compiled or not.
   ToolchainOverride guard(FakeToolchain("gfx942", "mlx5"));
   EXPECT_THROW(DescribePlan("ep_combine", {{"combineFp4", 1}}), std::runtime_error);
+}
+
+// --------------------------------------------------------------------------
+// gfx1250-strict is a gfx125x target of its own.
+// --------------------------------------------------------------------------
+
+TEST(Gfx1250Strict, RoutesLikeGfx1250) {
+  EXPECT_EQ(mori::jit::v2::WaveSizeForArch("gfx1250-strict"), 32);
+  ToolchainOverride guard(FakeToolchain("gfx1250-strict", "ionic"));
+  const EpCfg cfg;
+  EXPECT_NE(mori::ops::v2::EpDispatchSpec::RenderSource(cfg).find("ep_intranode_1250x.hpp"),
+            std::string::npos);
+  EXPECT_NE(mori::ops::v2::EpDispatchSpec::EntryName(cfg).find("_tdm"), std::string::npos);
+  EpCfg c;
+  c.scaleBytes = 224;
+  c.aggReserve = true;
+  EXPECT_EQ(ParseInfo(DescribePlan("ep_dispatch", {{"scaleBytes", 224}}))["stagingBytes"],
+            std::to_string(EpStagingTotalBytes(c)));
+  EXPECT_NO_THROW(DescribePlan("ep_combine", {{"combineFp4", 1}}));
+}
+
+TEST(Gfx1250Strict, HasItsOwnCacheEntries) {
+  EXPECT_EQ(fs::path(CacheDirWith("gfx1250-strict", "ionic")).parent_path().filename(),
+            "gfx1250-strict_ionic");
+  EXPECT_NE(fs::path(CacheDirWith("gfx1250-strict", "ionic")).filename(),
+            fs::path(CacheDirWith("gfx1250", "ionic")).filename());
 }

@@ -104,6 +104,7 @@ class SSDTier : public TierBackend {
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
   std::vector<EvictionHint> EvictionOrder(size_t max_keys) override;
+  void Touch(const std::vector<std::string>& keys) override;
   void SetRetiredFileHook(std::function<void(int fd)> on_close,
                           std::chrono::milliseconds grace) override;
 
@@ -176,6 +177,9 @@ class SSDTier : public TierBackend {
   // direct I/O is on and `dst`/`size` do not meet the alignment rules.
   IoStatus ReadValueInto(int fd, void* dst, size_t size, uint64_t value_offset) const;
   IoStatus WritePrepared(int fd, const segment::PreparedRecord& pr, bool sync) const;
+  // Runs a batch read on a free read ring (io_driver_ under io_mu_ without
+  // read rings); adds the time spent waiting for one to *wait_ms.
+  IoStatus BatchRead(const std::function<IoStatus(StorageIoDriver&)>& read, double* wait_ms) const;
   bool ShouldVerifyCrc(bool crc_valid) const { return ssd_config_.verify_crc && crc_valid; }
   int TierThreads() const;
 
@@ -202,6 +206,12 @@ class SSDTier : public TierBackend {
   mutable std::mutex mu_;
   mutable std::mutex io_mu_;
   std::unique_ptr<StorageIoDriver> io_driver_;
+  struct ReadRing {
+    std::mutex mu;
+    std::unique_ptr<StorageIoDriver> driver;
+  };
+  std::vector<std::unique_ptr<ReadRing>> read_rings_;  // empty = reads use io_driver_
+  mutable std::atomic<size_t> next_read_ring_{0};
   segment::Index index_;
   segment::Scanner scanner_;
   std::unique_ptr<segment::Writer> writer_;

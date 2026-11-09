@@ -29,26 +29,31 @@
 // Design (device-IR binding layer adapted to a scalar-only DSL FFI):
 //   * Device objects cross the boundary as scalar handles (uint64 = intptr):
 //     ccoDevComm*, ccoWindow_t — reinterpreted back here.
-//   * Template axes (Coop / ThreadMode / RemoteAction) are MONOMORPHIZED: one
-//     extern "C" symbol per valid combination, name-mangled with a tag suffix
-//     (see the tables below). Each symbol body is a single fully-specialized
-//     facade call — no runtime branch, no type erasure. The Python bindings
-//     pick the symbol by name from the (compile-time) coop/thread_mode/signal_op
-//     the kernel author passes, so the kernel emits one direct llvm.call to one
-//     instantiation. This is how C++ templates cross a scalar FFI with zero
-//     dispatch overhead, and lets ThreadMode be selected freely.
+//   * Template axes (Coop / ThreadMode / RemoteAction / doorbell mode) are
+//     MONOMORPHIZED: one extern "C" symbol per valid combination, name-mangled
+//     with a tag suffix (see the tables below). The Python bindings pick the
+//     symbol by name from the compile-time arguments the kernel author passes,
+//     so the kernel emits one direct llvm.call. The remaining axes (team; SDMA
+//     flags) ride in a `flags` word that folds to one instantiation once the
+//     wrapper is inlined with a constant.
 //   * Provider is fixed at build time via CCO_GDA_BUILD_PROVIDER (NIC macro), so
-//     only one ccoGda<P> specialization is built (same model as the C++ kernels).
+//     only that provider's ccoGda<P, Mode> specializations are built.
 //
 // Symbol tags (registered in python/mori/cco/device/ops.py):
 //   GDA data path (put/put_value/get) — (ThreadMode,Coop) tag, since aggregate is
 //   only valid with thread coop (static_assert in cco_scale_out.hpp):
 //     it = independent+thread   iw = independent+warp
 //     ib = independent+block    at = aggregate+thread
-//   signal/wait/flush — coop-only tag: thread / warp / block.
+//   signal/wait_signal/flush_async/wait — coop-only tag: thread / warp / block;
+//   flush/flush_peer — warp / block.
 //   put/put_value/signal also carry a remote-action tag: none / inc / add.
+//   The handle's doorbell mode is a name suffix too: put/put_value/get take ""
+//   (Immediate) / __deferred / __caller_ordered; flush/flush_peer/flush_async ""
+//   / __caller_ordered. GDA put/put_value/get/signal/flush_peer/flush_async take
+//   a trailing `flags` word for the team only (GdaWithTeam).
 //   SDMA put/get on resolved addresses — coop tag only; their other axes ride
-//   in a `flags` argument (SdmaWithFlags), constant-folded once inlined.
+//   in a `flags` argument (SdmaWithFlags). Either `flags` constant-folds once
+//   the wrapper is inlined.
 //   Side-effect-only wrappers return int status 0 rather than void. Triton's
 //   extern_elementwise requires a concrete return element type; FlyDSL ignores
 //   the status.
@@ -60,6 +65,8 @@
 namespace {
 using namespace mori::cco;
 using Gda = ccoGda<CCO_GDA_BUILD_PROVIDER>;
+template <ccoGdaDoorbellMode M>
+using GdaMode = ccoGda<CCO_GDA_BUILD_PROVIDER, M>;
 #if BUILD_CCO_SDMA
 using Sdma = ccoSdma;
 #endif
@@ -69,6 +76,10 @@ inline __device__ const ccoDevComm* AsDevComm(uint64_t h) {
 }
 inline __device__ ccoWindow_t AsWindow(uint64_t h) { return reinterpret_cast<ccoWindow_t>(h); }
 inline __device__ ccoGdaSignal_t AsSig(int id) { return static_cast<ccoGdaSignal_t>(id); }
+
+// A template argument chosen from `flags` by GdaWithTeam / SdmaWithFlags below.
+template <typename T, T v>
+using Const = std::integral_constant<T, v>;
 }  // namespace
 
 // Inlined into the kernel after link (thin forwarder, like a header-only call).
@@ -268,9 +279,6 @@ constexpr int kSdmaFlagSameQueue = 1 << 4;
 constexpr int kSdmaFlagAll =
     kSdmaFlagOptMask | kSdmaFlagLocalSignal | kSdmaFlagRemoteSignal | kSdmaFlagSameQueue;
 
-template <typename T, T v>
-using Const = std::integral_constant<T, v>;
-
 // Calls fn(localSignal, remoteSignal, optFlags, threadMode), each a
 // std::integral_constant, for the instantiation `flags` names.
 template <typename Coop, typename Fn>
@@ -365,6 +373,127 @@ CCO_DEV uint64_t cco_sdma_signal_slot(uint64_t dc, int src, int qid) {
   Sdma sdma{*AsDevComm(dc)};
   return reinterpret_cast<uint64_t>(sdma.signalSlot(src, qid));
 }
+
+// ── SDMA engine-side wait and broadcast ──
+// cco_sdma_{post_wait_mem,post_wait_signal,put_broadcast}__<coop>:
+// ccoSdma::postWaitMem / postWaitSignal / putBroadcast. They take only the
+// Aggregate opt flag (the broadcast also the two signals), so `flags` is the
+// SdmaFlags subset below; any other bit traps. A compile-time constant `flags`
+// folds to one instantiation once inlined, as for cco_sdma_put_ptr__<coop>.
+namespace {
+template <typename Fn>
+inline __device__ void SdmaWaitWithFlags(int flags, Fn&& fn) {
+  if (flags & ~static_cast<int>(ccoSdmaOptFlagsAggregate)) __builtin_trap();  // unknown flag
+  if (flags & ccoSdmaOptFlagsAggregate) {
+    fn(Const<uint32_t, ccoSdmaOptFlagsAggregate>{});
+  } else {
+    fn(Const<uint32_t, ccoSdmaOptFlagsDefault>{});
+  }
+}
+
+// Calls fn(localSignal, remoteSignal, optFlags) for the instantiation `flags` names.
+template <typename Fn>
+inline __device__ void SdmaBroadcastWithFlags(int flags, Fn&& fn) {
+  constexpr int kAll = ccoSdmaOptFlagsAggregate | kSdmaFlagLocalSignal | kSdmaFlagRemoteSignal;
+  if (flags & ~kAll) __builtin_trap();  // unknown flag, or one putBroadcast has no template for
+  auto withOpt = [&](auto local, auto remote) {
+    if (flags & ccoSdmaOptFlagsAggregate) {
+      fn(local, remote, Const<uint32_t, ccoSdmaOptFlagsAggregate>{});
+    } else {
+      fn(local, remote, Const<uint32_t, ccoSdmaOptFlagsDefault>{});
+    }
+  };
+  auto withRemote = [&](auto local) {
+    if (flags & kSdmaFlagRemoteSignal) {
+      withOpt(local, std::true_type{});
+    } else {
+      withOpt(local, std::false_type{});
+    }
+  };
+  if (flags & kSdmaFlagLocalSignal) {
+    withRemote(std::true_type{});
+  } else {
+    withRemote(std::false_type{});
+  }
+}
+}  // namespace
+
+// Park queue (peer, qid) until (*(win + off) & mask) <cmp> value. `win`/`off`
+// address memory on THIS GPU; value and mask are the low 32 bits of the
+// arguments. `cmp` is ccoSdmaCmp (0 Always .. 6 Gt); anything else traps.
+#define CCO_DEF_SDMA_POST_WAIT_MEM(TAG, COOP)                                                     \
+  CCO_DEV int cco_sdma_post_wait_mem__##TAG(uint64_t dc, int peer, int qid, uint64_t win,         \
+                                            uint64_t off, uint64_t value, int cmp, uint64_t mask, \
+                                            int flags) {                                          \
+    Sdma sdma{*AsDevComm(dc)};                                                                    \
+    if (static_cast<uint32_t>(cmp) > static_cast<uint32_t>(ccoSdmaCmpGt)) __builtin_trap();       \
+    SdmaWaitWithFlags(flags, [&](auto opt) {                                                      \
+      sdma.postWaitMem<COOP, decltype(opt)::value>(                                               \
+          peer, qid, AsWindow(win), off, static_cast<uint32_t>(value),                            \
+          static_cast<ccoSdmaCmp>(cmp), static_cast<uint32_t>(mask));                             \
+    });                                                                                           \
+    return 0;                                                                                     \
+  }
+CCO_DEF_SDMA_POST_WAIT_MEM(thread, ccoCoopThread)
+CCO_DEF_SDMA_POST_WAIT_MEM(warp, ccoCoopWarp)
+CCO_DEF_SDMA_POST_WAIT_MEM(block, ccoCoopBlock)
+#undef CCO_DEF_SDMA_POST_WAIT_MEM
+
+// Park queue (peer, qid) until our signal slot (src lsa rank, sig_qid) holds
+// `expected` or more. The engine compares 32 bits: `expected` must stay below 2^32.
+#define CCO_DEF_SDMA_POST_WAIT_SIGNAL(TAG, COOP)                                           \
+  CCO_DEV int cco_sdma_post_wait_signal__##TAG(uint64_t dc, int peer, int qid, int src,    \
+                                               int sigQid, uint64_t expected, int flags) { \
+    Sdma sdma{*AsDevComm(dc)};                                                             \
+    SdmaWaitWithFlags(flags, [&](auto opt) {                                               \
+      sdma.postWaitSignal<COOP, decltype(opt)::value>(peer, qid, src, sigQid, expected);   \
+    });                                                                                    \
+    return 0;                                                                              \
+  }
+CCO_DEF_SDMA_POST_WAIT_SIGNAL(thread, ccoCoopThread)
+CCO_DEF_SDMA_POST_WAIT_SIGNAL(warp, ccoCoopWarp)
+CCO_DEF_SDMA_POST_WAIT_SIGNAL(block, ccoCoopBlock)
+#undef CCO_DEF_SDMA_POST_WAIT_SIGNAL
+
+// One local src -> two destinations in one COPY packet. (peer, dW, dO) is the
+// first destination and selects the queue; (peer2, dW2, dO2) the second.
+#define CCO_DEF_SDMA_PUT_BROADCAST(TAG, COOP)                                                    \
+  CCO_DEV int cco_sdma_put_broadcast__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO,     \
+                                            int peer2, uint64_t dW2, uint64_t dO2, uint64_t sW,  \
+                                            uint64_t sO, uint64_t n, int qid, int flags) {       \
+    Sdma sdma{*AsDevComm(dc)};                                                                   \
+    SdmaBroadcastWithFlags(flags, [&](auto local, auto remote, auto opt) {                       \
+      sdma.putBroadcast<COOP, decltype(local)::value, decltype(remote)::value,                   \
+                        decltype(opt)::value>(peer, AsWindow(dW), dO, peer2, AsWindow(dW2), dO2, \
+                                              AsWindow(sW), sO, n, qid);                         \
+    });                                                                                          \
+    return 0;                                                                                    \
+  }
+CCO_DEF_SDMA_PUT_BROADCAST(thread, ccoCoopThread)
+CCO_DEF_SDMA_PUT_BROADCAST(warp, ccoCoopWarp)
+CCO_DEF_SDMA_PUT_BROADCAST(block, ccoCoopBlock)
+#undef CCO_DEF_SDMA_PUT_BROADCAST
+
+// Fused wait + put: ccoSdma::postWaitMemPutPtr (POLL_REGMEM, COPY and its
+// signals in one reservation, one doorbell). Thread scope only. `flags`:
+// LOCAL_SIGNAL / REMOTE_SIGNAL / AGGREGATE; other bits trap, as does a bad cmp.
+CCO_DEV int cco_sdma_post_wait_mem_put_ptr__thread(uint64_t dc, int peer, int qid, uint64_t win,
+                                                   uint64_t off, uint64_t value, int cmp,
+                                                   uint64_t mask, uint64_t dst, uint64_t src,
+                                                   uint64_t n, int flags) {
+  Sdma sdma{*AsDevComm(dc)};
+  if (static_cast<uint32_t>(cmp) > static_cast<uint32_t>(ccoSdmaCmpGt)) __builtin_trap();
+  const auto w = AsWindow(win);
+  void* d = reinterpret_cast<void*>(dst);
+  void* s = reinterpret_cast<void*>(src);
+  const auto c = static_cast<ccoSdmaCmp>(cmp);
+  const auto v = static_cast<uint32_t>(value), m = static_cast<uint32_t>(mask);
+  SdmaBroadcastWithFlags(flags, [&](auto local, auto remote, auto opt) {
+    sdma.postWaitMemPutPtr<decltype(local)::value, decltype(remote)::value, decltype(opt)::value>(
+        peer, qid, w, off, v, c, m, d, s, n);
+  });
+  return 0;
+}
 #endif  // BUILD_CCO_SDMA
 
 // ── ccoDevComm field accessors ──
@@ -373,59 +502,117 @@ CCO_DEV int cco_devcomm_world_size(uint64_t dc) { return AsDevComm(dc)->worldSiz
 CCO_DEV int cco_devcomm_lsa_rank(uint64_t dc) { return AsDevComm(dc)->lsaRank; }
 CCO_DEV int cco_devcomm_lsa_size(uint64_t dc) { return AsDevComm(dc)->lsaSize; }
 
-// ── GDA put: cco_gda_put__<tc>__<sig> ──
-#define CCO_DEF_PUT(TAG, TM, COOP, SIG)                                                      \
-  CCO_DEV int cco_gda_put__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW,       \
-                                          uint64_t dO, uint64_t sW, uint64_t sO, uint64_t n, \
-                                          int sid, uint64_t sv) {                            \
-    Gda gda{*AsDevComm(dc), ctx};                                                            \
-    gda.put<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, AsWindow(sW), sO, n, CCO_RA_##SIG,   \
-                                COOP{});                                                     \
-    return 0;                                                                                \
+// ── GDA `flags` ──
+// The GDA data path, signal and per-peer completion take a trailing `flags` word
+// carrying only the team `peer` is numbered in; the doorbell mode is in the
+// symbol name. Mirrored by GdaFlags in ops.py. The wrappers are inlined into the
+// caller's kernel, so a compile-time constant `flags` folds the dispatch to one
+// instantiation. Any other bit traps.
+namespace {
+// Bit 8 selects CCO_TEAM_GDA (peer is an index in the GDA team -- the node index
+// on a RAIL connection) over CCO_TEAM_WORLD.
+constexpr int kGdaFlagTeamGda = 1 << 8;
+
+// Calls fn(team), a std::integral_constant, for the team `flags` names.
+template <typename Fn>
+inline __device__ void GdaWithTeam(int flags, Fn&& fn) {
+  if (flags & ~kGdaFlagTeamGda) __builtin_trap();  // unknown flag
+  if (flags & kGdaFlagTeamGda) {
+    fn(Const<ccoTeamMode, CCO_TEAM_GDA>{});
+  } else {
+    fn(Const<ccoTeamMode, CCO_TEAM_WORLD>{});
   }
-#define CCO_DEF_PUT_SIGS(TAG, TM, COOP) \
-  CCO_DEF_PUT(TAG, TM, COOP, none)      \
-  CCO_DEF_PUT(TAG, TM, COOP, inc)       \
-  CCO_DEF_PUT(TAG, TM, COOP, add)
+}
+
+// A flushAsync request in one scalar: qpIdx in the high half, postIdx (a 32-bit
+// serial) in the low half.
+inline __device__ uint64_t PackRequest(const ccoGdaRequest_t& req) {
+  return (static_cast<uint64_t>(static_cast<uint32_t>(req.qpIdx)) << 32) |
+         static_cast<uint32_t>(req.postIdx);
+}
+inline __device__ ccoGdaRequest_t UnpackRequest(uint64_t packed) {
+  ccoGdaRequest_t req{};
+  req.qpIdx = static_cast<int>(packed >> 32);
+  req.postIdx = static_cast<uint32_t>(packed);
+  return req;
+}
+}  // namespace
+
+// Doorbell modes as (symbol suffix, mode): the data path takes all three, the
+// flushes the two that flush differently. X gets the caller's args first.
+#define CCO_DOORBELL_LIST(X, ...)                    \
+  X(__VA_ARGS__, , ccoGdaDoorbellImmediate)          \
+  X(__VA_ARGS__, __deferred, ccoGdaDoorbellDeferred) \
+  X(__VA_ARGS__, __caller_ordered, ccoGdaDoorbellCallerOrdered)
+#define CCO_FLUSH_DOORBELL_LIST(X, ...)     \
+  X(__VA_ARGS__, , ccoGdaDoorbellImmediate) \
+  X(__VA_ARGS__, __caller_ordered, ccoGdaDoorbellCallerOrdered)
+
+// ── GDA put: cco_gda_put__<tc>__<sig><doorbell> ──
+#define CCO_DEF_PUT(TAG, TM, COOP, SIG, DB, MODE)                                                \
+  CCO_DEV int cco_gda_put__##TAG##__##SIG##DB(uint64_t dc, int ctx, int peer, uint64_t dW,       \
+                                              uint64_t dO, uint64_t sW, uint64_t sO, uint64_t n, \
+                                              int sid, uint64_t sv, int flags) {                 \
+    GdaMode<MODE> gda{*AsDevComm(dc), ctx};                                                      \
+    GdaWithTeam(flags, [&](auto team) {                                                          \
+      gda.put<decltype(team)::value, TM, decltype(CCO_RA_##SIG), COOP>(                          \
+          peer, AsWindow(dW), dO, AsWindow(sW), sO, n, CCO_RA_##SIG, COOP{});                    \
+    });                                                                                          \
+    return 0;                                                                                    \
+  }
+#define CCO_DEF_PUT_SIGS(TAG, TM, COOP)               \
+  CCO_DOORBELL_LIST(CCO_DEF_PUT, TAG, TM, COOP, none) \
+  CCO_DOORBELL_LIST(CCO_DEF_PUT, TAG, TM, COOP, inc)  \
+  CCO_DOORBELL_LIST(CCO_DEF_PUT, TAG, TM, COOP, add)
 CCO_TC_LIST(CCO_DEF_PUT_SIGS)
 #undef CCO_DEF_PUT_SIGS
 #undef CCO_DEF_PUT
 
-// ── GDA put_value: cco_gda_put_value__<tc>__<sig> ──
-#define CCO_DEF_PUTV(TAG, TM, COOP, SIG)                                                     \
-  CCO_DEV int cco_gda_put_value__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW, \
-                                                uint64_t dO, uint64_t value, int sid,        \
-                                                uint64_t sv) {                               \
-    Gda gda{*AsDevComm(dc), ctx};                                                            \
-    gda.putValue<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, value, CCO_RA_##SIG, COOP{});   \
-    return 0;                                                                                \
+// ── GDA put_value: cco_gda_put_value__<tc>__<sig><doorbell> ──
+#define CCO_DEF_PUTV(TAG, TM, COOP, SIG, DB, MODE)                                               \
+  CCO_DEV int cco_gda_put_value__##TAG##__##SIG##DB(uint64_t dc, int ctx, int peer, uint64_t dW, \
+                                                    uint64_t dO, uint64_t value, int sid,        \
+                                                    uint64_t sv, int flags) {                    \
+    GdaMode<MODE> gda{*AsDevComm(dc), ctx};                                                      \
+    GdaWithTeam(flags, [&](auto team) {                                                          \
+      gda.putValue<decltype(team)::value, TM, uint64_t, decltype(CCO_RA_##SIG), COOP>(           \
+          peer, AsWindow(dW), dO, value, CCO_RA_##SIG, COOP{});                                  \
+    });                                                                                          \
+    return 0;                                                                                    \
   }
-#define CCO_DEF_PUTV_SIGS(TAG, TM, COOP) \
-  CCO_DEF_PUTV(TAG, TM, COOP, none)      \
-  CCO_DEF_PUTV(TAG, TM, COOP, inc)       \
-  CCO_DEF_PUTV(TAG, TM, COOP, add)
+#define CCO_DEF_PUTV_SIGS(TAG, TM, COOP)               \
+  CCO_DOORBELL_LIST(CCO_DEF_PUTV, TAG, TM, COOP, none) \
+  CCO_DOORBELL_LIST(CCO_DEF_PUTV, TAG, TM, COOP, inc)  \
+  CCO_DOORBELL_LIST(CCO_DEF_PUTV, TAG, TM, COOP, add)
 CCO_TC_LIST(CCO_DEF_PUTV_SIGS)
 #undef CCO_DEF_PUTV_SIGS
 #undef CCO_DEF_PUTV
 
-// ── GDA get (no remote action): cco_gda_get__<tc> ──
-#define CCO_DEF_GET(TAG, TM, COOP)                                                         \
-  CCO_DEV int cco_gda_get__##TAG(uint64_t dc, int ctx, int peer, uint64_t rW, uint64_t rO, \
-                                 uint64_t lW, uint64_t lO, uint64_t n) {                   \
-    Gda gda{*AsDevComm(dc), ctx};                                                          \
-    gda.get<CCO_TEAM_WORLD, TM>(peer, AsWindow(rW), rO, AsWindow(lW), lO, n, COOP{});      \
-    return 0;                                                                              \
+// ── GDA get (no remote action): cco_gda_get__<tc><doorbell> ──
+#define CCO_DEF_GET(TAG, TM, COOP, DB, MODE)                                                   \
+  CCO_DEV int cco_gda_get__##TAG##DB(uint64_t dc, int ctx, int peer, uint64_t rW, uint64_t rO, \
+                                     uint64_t lW, uint64_t lO, uint64_t n, int flags) {        \
+    GdaMode<MODE> gda{*AsDevComm(dc), ctx};                                                    \
+    GdaWithTeam(flags, [&](auto team) {                                                        \
+      gda.get<decltype(team)::value, TM, COOP>(peer, AsWindow(rW), rO, AsWindow(lW), lO, n,    \
+                                               COOP{});                                        \
+    });                                                                                        \
+    return 0;                                                                                  \
   }
-CCO_TC_LIST(CCO_DEF_GET)
+#define CCO_DEF_GET_MODES(TAG, TM, COOP) CCO_DOORBELL_LIST(CCO_DEF_GET, TAG, TM, COOP)
+CCO_TC_LIST(CCO_DEF_GET_MODES)
+#undef CCO_DEF_GET_MODES
 #undef CCO_DEF_GET
 
 // ── GDA signal (inc/add only): cco_gda_signal__<coop>__<sig> ──
-#define CCO_DEF_SIGNAL(TAG, COOP, SIG)                                                \
-  CCO_DEV int cco_gda_signal__##TAG##__##SIG(uint64_t dc, int ctx, int peer, int sid, \
-                                             uint64_t sv) {                           \
-    Gda gda{*AsDevComm(dc), ctx};                                                     \
-    gda.signal<CCO_TEAM_WORLD>(peer, CCO_RA_##SIG, COOP{});                           \
-    return 0;                                                                         \
+// A signal always rings, so it has no doorbell suffix (Immediate handle).
+#define CCO_DEF_SIGNAL(TAG, COOP, SIG)                                                             \
+  CCO_DEV int cco_gda_signal__##TAG##__##SIG(uint64_t dc, int ctx, int peer, int sid, uint64_t sv, \
+                                             int flags) {                                          \
+    Gda gda{*AsDevComm(dc), ctx};                                                                  \
+    GdaWithTeam(                                                                                   \
+        flags, [&](auto team) { gda.signal<decltype(team)::value>(peer, CCO_RA_##SIG, COOP{}); }); \
+    return 0;                                                                                      \
   }
 #define CCO_DEF_SIGNAL_SIGS(TAG, COOP) \
   CCO_DEF_SIGNAL(TAG, COOP, inc)       \
@@ -457,18 +644,57 @@ CCO_DEV int cco_gda_reset_signal(uint64_t dc, int ctx, int sigId) {
 CCO_COOP_LIST(CCO_DEF_WAIT)
 #undef CCO_DEF_WAIT
 
-// ── GDA completion (>= warp): cco_gda_flush__<coop> / cco_gda_flush_peer__<coop> ──
-#define CCO_DEF_FLUSH(TAG, COOP)                                          \
-  CCO_DEV int cco_gda_flush__##TAG(uint64_t dc, int ctx) {                \
-    Gda gda{*AsDevComm(dc), ctx};                                         \
-    gda.flush(COOP{});                                                    \
-    return 0;                                                             \
-  }                                                                       \
-  CCO_DEV int cco_gda_flush_peer__##TAG(uint64_t dc, int ctx, int peer) { \
-    Gda gda{*AsDevComm(dc), ctx};                                         \
-    gda.flush(peer, COOP{});                                              \
-    return 0;                                                             \
+// ── GDA completion (>= warp): cco_gda_flush__<coop><doorbell> /
+//    cco_gda_flush_peer__<coop><doorbell> ──
+// The __caller_ordered flushes release CallerOrdered posts; the plain ones serve
+// Immediate and Deferred posts. flush_peer's `flags` carries only the team.
+#define CCO_DEF_FLUSH(TAG, COOP, DB, MODE)                                                        \
+  CCO_DEV int cco_gda_flush__##TAG##DB(uint64_t dc, int ctx) {                                    \
+    GdaMode<MODE> gda{*AsDevComm(dc), ctx};                                                       \
+    gda.flush(COOP{});                                                                            \
+    return 0;                                                                                     \
+  }                                                                                               \
+  CCO_DEV int cco_gda_flush_peer__##TAG##DB(uint64_t dc, int ctx, int peer, int flags) {          \
+    GdaMode<MODE> gda{*AsDevComm(dc), ctx};                                                       \
+    GdaWithTeam(flags, [&](auto team) { gda.flush<decltype(team)::value, COOP>(peer, COOP{}); }); \
+    return 0;                                                                                     \
   }
-CCO_DEF_FLUSH(warp, ccoCoopWarp)
-CCO_DEF_FLUSH(block, ccoCoopBlock)
+CCO_FLUSH_DOORBELL_LIST(CCO_DEF_FLUSH, warp, ccoCoopWarp)
+CCO_FLUSH_DOORBELL_LIST(CCO_DEF_FLUSH, block, ccoCoopBlock)
 #undef CCO_DEF_FLUSH
+
+// ── GDA split completion: cco_gda_flush_async__<coop><doorbell> / cco_gda_wait__<coop> ──
+// flush_async rings `peer`'s QP up to its current reservation (deferred posts
+// included) and returns a request; wait polls the CQ until that request has
+// completed. Work can go between them. The request is one uint64 (PackRequest)
+// and is only meaningful to wait() with the same dev_comm. Wait with the same
+// coop: every lane holds the request for thread and warp scope, only thread 0
+// for block scope, and a thread-scope request is one per lane.
+#define CCO_DEF_FLUSH_ASYNC(TAG, COOP, DB, MODE)                                               \
+  CCO_DEV uint64_t cco_gda_flush_async__##TAG##DB(uint64_t dc, int ctx, int peer, int flags) { \
+    GdaMode<MODE> gda{*AsDevComm(dc), ctx};                                                    \
+    ccoGdaRequest_t req{};                                                                     \
+    GdaWithTeam(flags, [&](auto team) {                                                        \
+      gda.flushAsync<decltype(team)::value, COOP>(peer, &req, COOP{});                         \
+    });                                                                                        \
+    uint64_t packed = PackRequest(req);                                                        \
+    if constexpr (std::is_same_v<COOP, ccoCoopWarp>) packed = __shfl(packed, 0);               \
+    return packed;                                                                             \
+  }
+#define CCO_DEF_FLUSH_ASYNC_MODES(TAG, COOP) CCO_FLUSH_DOORBELL_LIST(CCO_DEF_FLUSH_ASYNC, TAG, COOP)
+CCO_COOP_LIST(CCO_DEF_FLUSH_ASYNC_MODES)
+#undef CCO_DEF_FLUSH_ASYNC_MODES
+#undef CCO_DEF_FLUSH_ASYNC
+
+#define CCO_DEF_WAIT_REQUEST(TAG, COOP)                                     \
+  CCO_DEV int cco_gda_wait__##TAG(uint64_t dc, int ctx, uint64_t request) { \
+    Gda gda{*AsDevComm(dc), ctx};                                           \
+    ccoGdaRequest_t req = UnpackRequest(request);                           \
+    gda.wait(req, COOP{});                                                  \
+    return 0;                                                               \
+  }
+CCO_COOP_LIST(CCO_DEF_WAIT_REQUEST)
+#undef CCO_DEF_WAIT_REQUEST
+
+#undef CCO_FLUSH_DOORBELL_LIST
+#undef CCO_DOORBELL_LIST

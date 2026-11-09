@@ -29,8 +29,9 @@ machinery):
 
   * :mod:`._bindings`  — 1:1 FFI prototypes for ``libmori_cco_device.bc``.
   * :mod:`._internal`  — the ``_ffi`` factory + ``cco_struct`` decorator.
-  * :mod:`.handles`    — OO handles ``DevComm`` / ``Window`` / ``Gda`` and the
-                         ``CoopScope`` / ``SignalOp`` / ``ThreadMode`` enums.
+  * :mod:`.handles`    — OO handles ``DevComm`` / ``Window`` / ``Gda``; the enums
+                         (``CoopScope`` / ``SignalOp`` / ``ThreadMode`` / ``Team``
+                         / ``GdaDoorbell``) come from :mod:`mori.cco.device.ops`.
 
 Example (inside ``@flyc.kernel``)::
 
@@ -42,7 +43,14 @@ Example (inside ``@flyc.kernel``)::
 """
 
 from mori.cco.device.bitcode import find_cco_bitcode, get_bitcode_path
-from mori.cco.device.ops import SdmaFlags, SdmaOptFlags
+from mori.cco.device.ops import (
+    GdaDoorbell,
+    GdaFlags,
+    SdmaCmp,
+    SdmaFlags,
+    SdmaOptFlags,
+    Team,
+)
 from .handles import (
     DevComm,
     Window,
@@ -63,8 +71,12 @@ __all__ = [
     "CoopScope",
     "SignalOp",
     "ThreadMode",
+    "Team",
+    "GdaDoorbell",
+    "GdaFlags",
     "SdmaOptFlags",
     "SdmaFlags",
+    "SdmaCmp",
     "find_cco_bitcode",
     "get_bitcode_path",
     "_bindings",

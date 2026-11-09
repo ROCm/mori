@@ -1,0 +1,46 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
+// SPDX-License-Identifier: Apache-2.0
+// Modified by AMD: mutation-only subset; field numbers and RPC path are unchanged.
+
+syntax = "proto3";
+package kv_indexer.v1;
+
+enum TierType {
+  TIER_UNKNOWN = 0;
+  TIER_HBM = 1;
+  TIER_DRAM = 2;
+  TIER_SSD = 3;
+}
+
+enum ExternalKvActionType {
+  ACTION_UNKNOWN = 0;
+  ACTION_REPORT = 1;
+  ACTION_REVOKE = 2;
+  ACTION_CLEAR_ALL_AT_TIER = 3;
+}
+
+message ExternalKvAction {
+  ExternalKvActionType type = 1;
+  TierType tier = 2;
+  repeated sfixed64 hashes = 3 [packed = true];
+  repeated uint32 component_masks = 4;
+  repeated uint32 block_sizes = 5;
+  optional sfixed64 parent_block_hash = 6;
+}
+
+message ApplyExternalKvBatchRequest {
+  string worker_id = 1;
+  uint64 seq = 2;
+  repeated ExternalKvAction actions = 3;
+  string worker_address = 4;
+  reserved 5;
+  string dram_pool_id = 7;
+}
+
+message ApplyExternalKvBatchResponse {
+  reserved 1, 2, 3;
+}
+
+service KVIndexer {
+  rpc ApplyExternalKvBatch(ApplyExternalKvBatchRequest) returns (ApplyExternalKvBatchResponse);
+}

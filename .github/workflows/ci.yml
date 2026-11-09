@@ -149,6 +149,7 @@ jobs:
             rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
             socket_ifname: ens14np0
             qp_max_send_wr: 4096
+            build_ops_kiwi: "ON"
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -163,6 +164,7 @@ jobs:
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       MORI_IO_QP_MAX_SEND_WR: ${{ matrix.qp_max_send_wr }}
+      BUILD_OPS_KIWI: ${{ matrix.build_ops_kiwi || 'OFF' }}
     timeout-minutes: 45
     steps:
       - name: Fix workspace permissions
@@ -203,12 +205,19 @@ jobs:
       - name: Install mori
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_BENCHMARK=ON BUILD_CCO_SDMA=ON BUILD_EXAMPLES=ON pip install . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && BUILD_BENCHMARK=ON BUILD_CCO_SDMA=ON BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI pip install . && pip install prettytable"
 
       - name: MORI-EP (intranode)
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE && timeout 360 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+          "
+
+      - name: KIWI-EP (intranode)
+        if: matrix.build_ops_kiwi == 'ON'
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_kiwi_dispatch_combine.py -v
           "
 
       - name: MORI-EP (internode_v1)
@@ -298,6 +307,18 @@ jobs:
             cmake -B build_io -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF
             cmake --build build_io -j --target test_engine
             timeout 300 ./build_io/tests/cpp/test_engine
+          "
+
+      - name: MORI-RAS C++
+        run: |
+          # BUILD_RAS defaults to OFF until RAS matures, so no other step builds RAS. This one
+          # keeps it compiling and its tests running.
+          $CT exec $CONTAINER bash -c "
+            set -e
+            cd $GITHUB_WORKSPACE
+            cmake -B build_ras -DBUILD_RAS=ON -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF
+            cmake --build build_ras -j --target ras_tests
+            cd build_ras && timeout 300 ctest -R '^ras_' --output-on-failure
           "
 
       - name: MORI-IO fault catalog (ibverbs)
@@ -794,6 +815,7 @@ jobs:
             rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
             ct: docker
             timeout_minutes: 90
+            build_ops_kiwi: "ON"
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -824,6 +846,7 @@ jobs:
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
       HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
+      BUILD_OPS_KIWI: ${{ matrix.build_ops_kiwi || 'OFF' }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
       - name: Fix workspace permissions
@@ -926,12 +949,12 @@ jobs:
       - name: Install mori (node1)
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))"
+            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))"
 
       - name: Install mori (node2)
         run: |
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
+            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
 
       # The IO benchmark runner defaults to the native C++ engine
       # (tools/run_internode_io_benchmark.sh --engine cpp), which needs the
@@ -1174,6 +1197,38 @@ jobs:
             done
           done
 
+      - name: MORI-EP internode stress_accuracy (every round verified)
+        run: |
+          # stress only surfaces hangs and faults; stress_accuracy checks every round's dispatch
+          # and combine results, so it catches the nodeRecvTokenNum and DispatchSync races in
+          # internode_v1. 1024 tokens with 200 us jitter is where an unfixed build failed
+          # (round 1110 on 2x8 MI355X); 20k rounds take about 50 s per kernel.
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          SA_ENV="-e MORI_INTERNODE_TIMEOUT=600 -e MORI_STRESS_ROUNDS=20000 -e MORI_STRESS_JITTER=200"
+          # AI NIC runs the atomic-free V1/V1LL signalling, as the nightly atomic-free bench does;
+          # with RDMA-atomic chunk signals it mis-routes a token (open issue, not these races).
+          if [[ "${{ matrix.platform }}" == "MI355X_AINIC" ]]; then
+            SA_ENV="$SA_ENV -e MORI_EP_DISABLE_RDMA_ATOMICS=1"
+          fi
+          PORT=29150
+          for KERNEL in v1 v1_ll; do
+            echo "=== stress_accuracy kernel=$KERNEL max-tokens=1024 rounds=20000 jitter=200us port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec $SA_ENV $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd stress_accuracy --kernel-type $KERNEL --max-tokens 1024
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec $SA_ENV $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd stress_accuracy --kernel-type $KERNEL --max-tokens 1024
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
+          done
+
       - name: MORI-EP internode rail-only (MORI_ENABLE_RAIL_ONLY)
         run: |
           # Same v1/v1_ll path with cross-rail QPs never created. Guards the claim
@@ -1232,6 +1287,33 @@ jobs:
             wait
             sleep 1
             PORT=$((PORT + 1))
+          done
+
+      - name: KIWI-EP internode test (EP16)
+        if: matrix.build_ops_kiwi == 'ON'
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          ENTRY="tests/python/ops/test_kiwi_dispatch_combine_internode.py"
+          PORT=29210
+          for BACKEND in rdma-only hybrid auto; do
+            for DTYPE in bf16 fp8_e4m3_fnuz; do
+              echo "=== KIWI EP16 rcomp-backend=$BACKEND dtype=$DTYPE port=$PORT ==="
+              NODE2_CMD=(
+                $CT exec -e MORI_INTERNODE_TIMEOUT=300 $CONTAINER bash $SCRIPT
+                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                --ifname $NODE2_IFNAME --entry $ENTRY --nproc-per-node 8
+                --cmd test --kernel-type $BACKEND --dtype $DTYPE --max-tokens 128
+              )
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+              NODE2_PID=$!
+              $CT exec -e MORI_INTERNODE_TIMEOUT=300 $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                --ifname $NODE1_IFNAME --entry $ENTRY --nproc-per-node 8 \
+                --cmd test --kernel-type $BACKEND --dtype $DTYPE --max-tokens 128
+              wait $NODE2_PID
+              sleep 1
+              PORT=$((PORT + 1))
+            done
           done
 
       - name: MORI-CCL internode hier allgather bit-exact smoke
