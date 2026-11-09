@@ -67,7 +67,7 @@ num_experts,topk,phase,dtype,hidden_dim,num_tokens,block_num,rdma_block_num,warp
 256,8,combine,fp8_e4m3_fnuz,6144,512,96,64,8,2,,193.8,32.39,32.39,106.18,132.72,grand_mean
 256,8,combine,fp8_e4m3_fnuz,6144,1024,96,64,8,2,,316.75,39.62,39.62,129.79,155.79,grand_mean
 256,8,combine,fp8_e4m3_fnuz,6144,2048,96,64,8,2,,568.71,44.12,44.12,144.26,177.67,grand_mean
-256,8,combine,fp8_e4m3_fnuz,6144,4096,96,64,8,2,,1076.72,46.6,46.6,152.47,187.81,grand_mean
+256,8,combine,fp8_e4m3_fnuz,6144,4096,128,64,8,2,,809.64,61.98,61.98,202.8,249.79,grand_mean
 256,8,dispatch,bf16,7168,4,64,42,4,1,,60.7,1.89,1.89,6.31,6.97,grand_mean
 256,8,dispatch,bf16,7168,8,32,16,4,1,,62.43,3.68,3.68,12.08,13.81,grand_mean
 256,8,dispatch,bf16,7168,16,32,16,4,1,,64.67,7.07,7.07,23.2,25.82,grand_mean
@@ -111,7 +111,7 @@ num_experts,topk,phase,dtype,hidden_dim,num_tokens,block_num,rdma_block_num,warp
 256,8,combine,fp8_e4m3_fnuz,7168,512,96,64,8,2,,218.78,33.47,33.47,109.7,137.12,grand_mean
 256,8,combine,fp8_e4m3_fnuz,7168,1024,96,64,8,2,,371.78,39.38,39.38,129.01,154.85,grand_mean
 256,8,combine,fp8_e4m3_fnuz,7168,2048,96,64,8,2,,655.26,44.68,44.68,146.08,179.91,grand_mean
-256,8,combine,fp8_e4m3_fnuz,7168,4096,96,64,8,2,,1273.92,45.98,45.98,150.38,184.23,grand_mean
+256,8,combine,fp8_e4m3_fnuz,7168,4096,128,64,8,2,,912.62,64.25,64.25,210.1,257.39,grand_mean
 272,9,dispatch,bf16,7168,4,64,42,4,1,,62.19,1.86,1.86,6.78,7.62,grand_mean
 272,9,dispatch,bf16,7168,8,64,42,4,1,,64.39,3.58,3.58,12.88,15.21,grand_mean
 272,9,dispatch,bf16,7168,16,32,16,4,1,,65.67,6.98,6.98,25.1,28.46,grand_mean
