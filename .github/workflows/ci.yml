@@ -1153,30 +1153,35 @@ jobs:
             "$CT exec $CONTAINER bash -c 'pkill -9 -f \"[t]ests\\.python\\.io\\.benchmark\" 2>/dev/null || true; pkill -9 -f \"[t]est_dispatch_combine_internode\" 2>/dev/null || true; sleep 2'"
 
       - name: MORI-EP internode normal kernel bench
-        # No performance signal on a shared runner, and the nightly runs the same
-        # sweep with its perf upload; workflow_dispatch and ci:full still run it.
-        if: (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        # Also a correctness gate: every point verifies one full-capacity round
+        # in the default (MANUAL) launch geometry; the nightly bench uses AUTO.
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29140
-          for KERNEL in v1 v1_ll; do
-            for TOKENS in 64 128 1024 2048 4096; do
-              echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD=(
-                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
-                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-                --ifname $NODE2_IFNAME
-                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
-              )
-              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
-                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-                --ifname $NODE1_IFNAME \
-                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
-              wait
-              sleep 1
-              PORT=$((PORT + 1))
-            done
+          if [ "${{ (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && 'full' || 'pr' }}" = pr ]; then
+            # The smallest and largest size per kernel; workflow_dispatch and ci:full run all 10.
+            POINTS="v1:64 v1:4096 v1_ll:64 v1_ll:4096"
+          else
+            POINTS=$(for k in v1 v1_ll; do for t in 64 128 1024 2048 4096; do printf '%s:%s ' $k $t; done; done)
+          fi
+          for P in $POINTS; do
+            KERNEL=${P%%:*}
+            TOKENS=${P##*:}
+            echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
           done
 
       - name: MORI-EP internode normal kernel stress
@@ -1184,7 +1189,7 @@ jobs:
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29160
           if [ "${{ (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && 'full' || 'pr' }}" = pr ]; then
-            # One point per kernel; the nightly, workflow_dispatch and ci:full run the full sweep.
+            # One point per kernel; the nightly, workflow_dispatch and ci:full run all 10.
             POINTS="v1:4096 v1_ll:128"
           else
             POINTS=$(for k in v1 v1_ll; do for t in 64 128 1024 2048 4096; do printf '%s:%s ' $k $t; done; done)
