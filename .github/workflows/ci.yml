@@ -4,6 +4,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # labeled: ci:full / ci:mi300x; ready_for_review: drafts run nothing.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_dispatch:
     inputs:
       run_umbp_single_node_hicache:
@@ -24,9 +26,12 @@ on:
         description: Enable DP/EP modes when launching the hicache test
 permissions:
   contents: read
+  pull-requests: read  # ci-scope reads the PR's files
+  checks: read  # ci-scope waits for pre-commit
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # A labeled run gets its own group, so adding a label does not cancel the PR's run.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && format('-{0}', github.event.label.name) || '' }}
   cancel-in-progress: true
 
 env:
@@ -37,8 +42,14 @@ env:
 
 
 jobs:
+  scope:
+    name: scope
+    uses: ./.github/workflows/ci-scope.yml
+
   build:
     name: mori build (${{ matrix.platform }})
+    needs: scope
+    if: needs.scope.outputs.mori == 'true' || needs.scope.outputs.umbp == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -46,13 +57,11 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
-          - platform: MI300X_MLX
-            runner: [self-hosted, 300_mlx_p19_29]
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
     timeout-minutes: 15
-    steps:
+    steps: &build-steps
       - name: Fix workspace permissions
         run: |
           # Docker pytest/pip runs as root; stale root-owned files break actions/checkout cleanup.
@@ -111,9 +120,24 @@ jobs:
           $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
 
+  build-mi300x:
+    name: mori build (${{ matrix.platform }})
+    needs: scope
+    if: needs.scope.outputs.mi300x == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI300X_MLX
+            runner: [self-hosted, 300_mlx_p19_29]
+    timeout-minutes: 15
+    steps: *build-steps
+
   intranode-test:
     name: mori intranode test (${{ matrix.platform }})
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.mori == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -130,20 +154,6 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             socket_ifname: eno0
-          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
-          # both only on the RoCE path. mlx5_8 is deliberately not in
-          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
-          # rendezvous interface), not one of the 8 rails.
-          # qp_max_send_wr works around mlx5 rejecting mori-io's default QP
-          # (8192 send WRs + 64-byte notification inline) with EINVAL: mlx5
-          # sizes every WQE for its largest op (192-byte UMR header), so the
-          # SQ needs 4 MiB against a 2 MiB (32768 x 64-byte WQEBB) cap.
-          - platform: MI300X_MLX
-            runner: [self-hosted, 300_mlx_p19_29]
-            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
-            socket_ifname: ens14np0
-            qp_max_send_wr: 4096
-            build_ops_kiwi: "ON"
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -151,7 +161,7 @@ jobs:
           #   rdma_sl: 3
           #   rdma_tc: 104
           #   socket_ifname: enp49s0f1np1
-    env:
+    env: &intranode-env
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
@@ -160,7 +170,7 @@ jobs:
       MORI_IO_QP_MAX_SEND_WR: ${{ matrix.qp_max_send_wr }}
       BUILD_OPS_KIWI: ${{ matrix.build_ops_kiwi || 'OFF' }}
     timeout-minutes: 45
-    steps:
+    steps: &intranode-steps
       - name: Fix workspace permissions
         run: |
           WS="${GITHUB_WORKSPACE}"
@@ -475,12 +485,40 @@ jobs:
                 chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           fi
 
+  intranode-test-mi300x:
+    name: mori intranode test (${{ matrix.platform }})
+    needs: [scope, build-mi300x]
+    if: needs.scope.outputs.mi300x == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
+          # both only on the RoCE path. mlx5_8 is deliberately not in
+          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
+          # rendezvous interface), not one of the 8 rails.
+          # qp_max_send_wr works around mlx5 rejecting mori-io's default QP
+          # (8192 send WRs + 64-byte notification inline) with EINVAL: mlx5
+          # sizes every WQE for its largest op (192-byte UMR header), so the
+          # SQ needs 4 MiB against a 2 MiB (32768 x 64-byte WQEBB) cap.
+          - platform: MI300X_MLX
+            runner: [self-hosted, 300_mlx_p19_29]
+            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+            socket_ifname: ens14np0
+            qp_max_send_wr: 4096
+            build_ops_kiwi: "ON"
+    env: *intranode-env
+    timeout-minutes: 45
+    steps: *intranode-steps
+
   # Gate for "does mori still build and run on the next ROCm major". Kept to the
   # single EP intranode test on one runner: the rest of the intranode suite is
   # ROCm-version agnostic, and the ROCm 10 base image is a separate ~30GB pull.
   intranode-test-rocm10:
     name: mori intranode test (ROCm 10, MI355X_AINIC)
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.mori == 'true'
     runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
     env:
       # py3.11 rather than the 7.14 lane's py3.12 — this is the tag the ROCm 10
@@ -568,7 +606,8 @@ jobs:
 
   jax-intranode-test:
     name: mori JAX intranode test (${{ matrix.platform }})
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.mori == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -661,7 +700,8 @@ jobs:
 
   umbp-unit-test:
     name: mori umbp unit test (${{ matrix.platform }})
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.umbp == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -763,7 +803,8 @@ jobs:
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.mori == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -781,24 +822,6 @@ jobs:
             rdma_tc: 104
             ct: podman
             timeout_minutes: 45
-          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
-          # both only on the RoCE path. mlx5_8 is deliberately not in
-          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
-          # rendezvous interface), not one of the 8 rails.
-          # node1 is the runner itself (banff-ccs-aus-p19-05); node2 is the peer
-          # it drives over ssh (banff-ccs-aus-p19-14). Both addresses are the
-          # ens14np0 100GbE port used for TCP rendezvous.
-          - platform: MI300X_MLX
-            runner: [self-hosted, 300_mlx_p19_29]
-            node1_host: 10.194.132.110
-            node2_host: 10.194.132.71
-            node2_port: 22
-            node1_ifname: ens14np0
-            node2_ifname: ens14np0
-            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
-            ct: docker
-            timeout_minutes: 90
-            build_ops_kiwi: "ON"
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -812,7 +835,7 @@ jobs:
           #   rdma_tc: 104
           #   ct: docker
           #   timeout_minutes: 45
-    env:
+    env: &internode-env
       CT: ${{ matrix.ct }}
       # node2's sshd checks every new connection against the Conductor auth
       # service, which intermittently answers 503 and denies the login (ssh exits
@@ -830,7 +853,7 @@ jobs:
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
       BUILD_OPS_KIWI: ${{ matrix.build_ops_kiwi || 'OFF' }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
-    steps:
+    steps: &internode-steps
       - name: Fix workspace permissions
         run: |
           WS="${GITHUB_WORKSPACE}"
@@ -1348,6 +1371,37 @@ jobs:
             -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT rm -f $CONTAINER || true"
 
+  internode-test-mi300x:
+    name: mori internode test (${{ matrix.platform }})
+    needs: [scope, build-mi300x]
+    if: needs.scope.outputs.mi300x == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
+          # both only on the RoCE path. mlx5_8 is deliberately not in
+          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
+          # rendezvous interface), not one of the 8 rails.
+          # node1 is the runner itself (banff-ccs-aus-p19-05); node2 is the peer
+          # it drives over ssh (banff-ccs-aus-p19-14). Both addresses are the
+          # ens14np0 100GbE port used for TCP rendezvous.
+          - platform: MI300X_MLX
+            runner: [self-hosted, 300_mlx_p19_29]
+            node1_host: 10.194.132.110
+            node2_host: 10.194.132.71
+            node2_port: 22
+            node1_ifname: ens14np0
+            node2_ifname: ens14np0
+            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+            ct: docker
+            timeout_minutes: 90
+            build_ops_kiwi: "ON"
+    env: *internode-env
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    steps: *internode-steps
+
   umbp-single-node-hicache:
     name: mori umbp single-node hicache smoke test
     needs: build
@@ -1409,3 +1463,25 @@ jobs:
       - name: Cleanup hicache container
         if: always()
         run: docker rm -f umbp-single-node >/dev/null 2>&1 || true
+
+  ci-gate:
+    name: MoRI CI gate
+    # One check that is green when every lane the scope picked passed; a lane
+    # the scope skipped counts as passed.
+    if: always()
+    needs: [scope, build, build-mi300x, intranode-test, intranode-test-mi300x, intranode-test-rocm10, jax-intranode-test, umbp-unit-test, internode-test, internode-test-mi300x]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check lane results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          REASON: ${{ needs.scope.outputs.reason }}
+        run: |
+          echo "Scope: ${REASON:-n/a}"
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)\t\(.value.result)"' | tee results.tsv
+          if awk -F'\t' '$2 != "success" && $2 != "skipped"' results.tsv | grep -q .; then
+            echo "::error::a CI lane did not pass"; exit 1
+          fi
+          if ! grep -qP '^scope\tsuccess$' results.tsv; then
+            echo "::error::CI scope did not succeed"; exit 1
+          fi

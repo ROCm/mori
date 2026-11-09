@@ -4,37 +4,68 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # labeled: ci:full / ci:mi300x; ready_for_review: drafts run nothing.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pull-requests: read  # ci-scope reads the PR's files
+  checks: read  # ci-scope waits for pre-commit
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # A labeled run gets its own group, so adding a label does not cancel the PR's run.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && format('-{0}', github.event.label.name) || '' }}
   cancel-in-progress: true
 
 env:
   IMAGE: rocm/mori:ci-cco
   BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
   CONTAINER: mori_cco_ci_${{ github.run_id }}
-  CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
+  CT: podman  # MI355X-AINIC runner (cco-internode-test) is podman rootless
 
 jobs:
+  scope:
+    name: scope
+    uses: ./.github/workflows/ci-scope.yml
+
   cco-unit-test:
     name: CCO unit test (${{ matrix.platform }})
+    needs: scope
+    if: needs.scope.outputs.cco == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Single node, so it shares ci.yml's intranode runner and leaves
+          # MI355X-AINIC to the two internode jobs, which need that pair.
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC]
+            runner: [self-hosted, MI355X-AINIC-PIT-G17]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
     env:
+      CT: docker
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
-    timeout-minutes: 60
+      # Pinned for the same reason as ci.yml's intranode-test socket_ifname: on
+      # this host auto-detection picks eno1, which does not accept local TCP.
+      MORI_SOCKET_IFNAME: eno0
+      NCCL_SOCKET_IFNAME: eno0
+    timeout-minutes: 90
     steps:
+      - name: Fix workspace permissions
+        run: |
+          # Docker runs the build as root; a cancelled job leaves root-owned files
+          # that break actions/checkout's cleanup.
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -56,6 +87,8 @@ jobs:
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+            -e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -483,7 +516,8 @@ jobs:
     name: CCO internode test (${{ matrix.platform }})
     # Serialised behind the single-node job rather than run beside it: both want
     # all 8 GPUs and the same NICs on node1.
-    needs: cco-unit-test
+    needs: [scope, cco-unit-test]
+    if: needs.scope.outputs.cco == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -698,3 +732,25 @@ jobs:
             $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
             cd $GITHUB_WORKSPACE && CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
           " || true
+
+  ci-gate:
+    name: CCO CI gate
+    # One check that is green when every lane the scope picked passed; a lane
+    # the scope skipped counts as passed.
+    if: always()
+    needs: [scope, cco-unit-test, cco-internode-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check lane results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          REASON: ${{ needs.scope.outputs.reason }}
+        run: |
+          echo "Scope: ${REASON:-n/a}"
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)\t\(.value.result)"' | tee results.tsv
+          if awk -F'\t' '$2 != "success" && $2 != "skipped"' results.tsv | grep -q .; then
+            echo "::error::a CI lane did not pass"; exit 1
+          fi
+          if ! grep -qP '^scope\tsuccess$' results.tsv; then
+            echo "::error::CI scope did not succeed"; exit 1
+          fi

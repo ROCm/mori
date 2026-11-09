@@ -1,0 +1,54 @@
+name: CI scope
+
+# Called first by ci.yml and ci_cco.yml; .github/scripts/ci_scope.py has the rules.
+on:
+  workflow_call:
+    outputs:
+      mori:
+        description: MoRI CI on MI355X (EP v1, shmem, IO, CCL)
+        value: ${{ jobs.detect.outputs.mori }}
+      mi300x:
+        description: MoRI CI on MI300X
+        value: ${{ jobs.detect.outputs.mi300x }}
+      umbp:
+        description: UMBP unit tests
+        value: ${{ jobs.detect.outputs.umbp }}
+      cco:
+        description: CCO CI (cco, EPv2, fused GEMM ops)
+        value: ${{ jobs.detect.outputs.cco }}
+      reason:
+        description: Why these lanes run
+        value: ${{ jobs.detect.outputs.reason }}
+
+jobs:
+  detect:
+    name: detect
+    runs-on: ubuntu-latest
+    # Waits up to 20 min for pre-commit on the head commit.
+    timeout-minutes: 30
+    outputs:
+      mori: ${{ steps.scope.outputs.mori }}
+      mi300x: ${{ steps.scope.outputs.mi300x }}
+      umbp: ${{ steps.scope.outputs.umbp }}
+      cco: ${{ steps.scope.outputs.cco }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Decide which lanes run
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: python3 .github/scripts/ci_scope.py
