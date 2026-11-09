@@ -95,8 +95,9 @@ MI300X_PATHS = re.compile(
     r"^(src|include/mori|python/mori)/ops/(?!dispatch_combine_v2/|gemm_|ag_gemm/|a2a_gemm/|__init__\.py$)"
     r"|^tests/python/ops/(?!dispatch_combine_v2/)|^examples/ops/"
     r"|(^|/)(shmem|kiwi)(/|_|\.|$)|mlx5|(^|/|_)io(/|_|\.|$)"
-    r"|^(src|include/mori)/application/(transport/(rdma|sdma)|bootstrap|topology)/"
-    r"|^include/mori/core/|^(src|include/mori)/collective/|^python/mori/(jit/config\.py|ccl/)"
+    r"|^(src|include/mori)/application/(transport/(rdma|sdma)|bootstrap|topology|context|memory)/"
+    r"|^include/mori/core/|^(src|include/mori)/collective/|^python/mori/(jit/(?!v2/)|ccl/)"
+    r"|^tests/python/ccl/|^tools/run_internode_ccl_ag\.sh$|^src/pybind/pybind_(ops|shmem|ccl)\.cpp$"
     r"|^(setup\.py|pyproject\.toml|CMakeLists\.txt)$|^cmake/|^docker/|^3rdparty/"
     r"|^\.github/workflows/ci\.yml$|^\.github/workflows/ci-scope\.yml$"
     r"|^\.github/scripts/ci_scope\.py$|^tools/run_internode_test\.sh$"
@@ -185,7 +186,14 @@ def decide(env):
     labels = live_labels(env)
     label = env.get("LABEL_NAME", "")
     first_attempt = env.get("GITHUB_RUN_ATTEMPT", "1") == "1"
-    if action == "labeled" and first_attempt and label not in ("ci:full", "ci:mi300x"):
+    # Labels whose first run replaces the PR's run; ci:mi300x only for a caller
+    # that has MI300X lanes.
+    run_labels = (
+        ("ci:full", "ci:mi300x")
+        if env.get("HAS_MI300X", "true") == "true"
+        else ("ci:full",)
+    )
+    if action == "labeled" and first_attempt and label not in run_labels:
         return dict.fromkeys(LANES, False), f"label '{label}' needs no CI"
     if env.get("PR_DRAFT") == "true" and "ci:full" not in labels:
         return (
@@ -220,9 +228,15 @@ def main():
         return
 
     lanes, reason = decide(os.environ)
+    # Full internode bench/stress sweeps: workflow_dispatch, or ci:full on a PR.
+    event = os.environ.get("EVENT_NAME", "")
+    full = event == "workflow_dispatch" or (
+        event == "pull_request" and "ci:full" in live_labels(os.environ)
+    )
     with open(os.environ["GITHUB_OUTPUT"], "a") as out:
         for lane in LANES:
             out.write(f"{lane}={str(lanes[lane]).lower()}\n")
+        out.write(f"full={str(full).lower()}\n")
         out.write(f"reason={reason}\n")
     summary = [
         "## CI scope",

@@ -14,9 +14,9 @@ permissions:
   checks: read  # ci-scope waits for pre-commit
 
 concurrency:
-  # ci:full and ci:mi300x runs replace the PR's run with a superset; any other
-  # label gets its own group, so adding it does not cancel the PR's run.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && github.event.label.name != 'ci:mi300x' && format('-{0}', github.event.label.name) || '' }}
+  # A ci:full run replaces the PR's run with a superset; the first run of any
+  # other label gets its own group, so adding it does not cancel the PR's run.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.run_attempt == 1 && github.event.label.name != 'ci:full' && format('-{0}', github.event.label.name) || '' }}
   cancel-in-progress: true
 
 env:
@@ -29,6 +29,8 @@ jobs:
   scope:
     name: scope
     uses: ./.github/workflows/ci-scope.yml
+    with:
+      has_mi300x: false
 
   cco-unit-test:
     name: CCO unit test (${{ matrix.platform }})

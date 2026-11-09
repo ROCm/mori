@@ -30,9 +30,10 @@ permissions:
   checks: read  # ci-scope waits for pre-commit
 
 concurrency:
-  # ci:full and ci:mi300x runs replace the PR's run with a superset; any other
-  # label gets its own group, so adding it does not cancel the PR's run.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && github.event.label.name != 'ci:mi300x' && format('-{0}', github.event.label.name) || '' }}
+  # ci:full and ci:mi300x runs replace the PR's run with a superset; the first
+  # run of any other label gets its own group, so adding it does not cancel the
+  # PR's run (a re-run of it is a normal run and joins the PR's group).
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.run_attempt == 1 && github.event.label.name != 'ci:full' && github.event.label.name != 'ci:mi300x' && format('-{0}', github.event.label.name) || '' }}
   cancel-in-progress: true
 
 env:
@@ -1158,7 +1159,7 @@ jobs:
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29140
-          if [ "${{ (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && 'full' || 'pr' }}" = pr ]; then
+          if [ "${{ needs.scope.outputs.full == 'true' && 'full' || 'pr' }}" = pr ]; then
             # The smallest and largest size per kernel; workflow_dispatch and ci:full run all 10.
             POINTS="v1:64 v1:4096 v1_ll:64 v1_ll:4096"
           else
@@ -1188,7 +1189,7 @@ jobs:
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29160
-          if [ "${{ (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && 'full' || 'pr' }}" = pr ]; then
+          if [ "${{ needs.scope.outputs.full == 'true' && 'full' || 'pr' }}" = pr ]; then
             # One point per kernel; the nightly, workflow_dispatch and ci:full run all 10.
             POINTS="v1:4096 v1_ll:128"
           else

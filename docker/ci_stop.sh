@@ -28,9 +28,11 @@ echo "=== [ci_stop] gracefully stopping '$CONTAINER' ==="
 ' 2>/dev/null || true
 # Wait for the interrupted workload to exit, then stop. PID 1 (sleep infinity)
 # ignores SIGTERM, so a plain stop always waited out the whole timeout.
-for _ in $(seq "$STOP_TIMEOUT"); do
-  left=$("$CT" exec "$CONTAINER" ps -eo pid=,args= 2>/dev/null |
-    awk '$1 != 1 && !/sleep infinity/ && !/ps -eo/' | wc -l)
+# Zombies (stat Z) do not count: without --init nothing reaps them.
+deadline=$((SECONDS + STOP_TIMEOUT))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  left=$(timeout 10 "$CT" exec "$CONTAINER" ps -eo pid=,stat=,args= 2>/dev/null |
+    awk '$1 != 1 && $2 !~ /^Z/ && !/sleep infinity/ && !/ps -eo/' | wc -l)
   [ "${left:-0}" -eq 0 ] && break
   sleep 1
 done

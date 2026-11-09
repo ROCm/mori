@@ -3,6 +3,11 @@ name: CI scope
 # Called first by ci.yml and ci_cco.yml; .github/scripts/ci_scope.py has the rules.
 on:
   workflow_call:
+    inputs:
+      has_mi300x:
+        description: Whether the caller has MI300X lanes (ci:mi300x then runs CI)
+        type: boolean
+        default: true
     outputs:
       mori:
         description: MoRI CI on MI355X (EP v1, shmem, IO, CCL)
@@ -19,6 +24,9 @@ on:
       fused:
         description: The CCO fused GEMM + collective job
         value: ${{ jobs.detect.outputs.fused }}
+      full:
+        description: Run the full internode bench/stress sweeps
+        value: ${{ jobs.detect.outputs.full }}
       reason:
         description: Why these lanes run
         value: ${{ jobs.detect.outputs.reason }}
@@ -35,6 +43,7 @@ jobs:
       umbp: ${{ steps.scope.outputs.umbp }}
       cco: ${{ steps.scope.outputs.cco }}
       fused: ${{ steps.scope.outputs.fused }}
+      full: ${{ steps.scope.outputs.full }}
       reason: ${{ steps.scope.outputs.reason }}
     steps:
       - name: Checkout
@@ -55,4 +64,5 @@ jobs:
           PR_DRAFT: ${{ github.event.pull_request.draft }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          HAS_MI300X: ${{ inputs.has_mi300x }}
         run: python3 .github/scripts/ci_scope.py
