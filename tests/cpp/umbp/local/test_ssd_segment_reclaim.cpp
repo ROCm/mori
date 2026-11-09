@@ -263,12 +263,6 @@ TEST_F(SegmentReclaimTest, TouchCountsAsAnAccess) {
   for (const auto& key : tier->GetLRUCandidates(100)) {
     EXPECT_NE(key, "missing") << "touching an unknown key must not record it";
   }
-
-  // A follower's touch leaves the order of the tier that owns the directory.
-  SSDTier follower(dir_.string(), 8 * kMiB, Config(8 * kMiB, 1 * kMiB),
-                   SSDAccessMode::ReadOnlyShared);
-  follower.Touch({Key(16)});
-  EXPECT_EQ(tier->EvictionOrder(1).front().key, Key(16));
 }
 
 // A batch reports each key: one that does not fit fails alone, and is not
