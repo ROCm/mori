@@ -124,7 +124,7 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   // EP on gfx125x goes through EPv2 (mori.ops.dispatch_combine_v2).
   if (useCcoComm && config.worldSize > config.gpuPerNode) {
     throw std::runtime_error(
-        "EpDispatchCombineHandle with the CCO backend (MORI_EP_COMM=cco, the default on gfx125x) "
+        "EpDispatchCombineHandle with the CCO backend (MORI_EP_COMM=cco) "
         "supports intra-node only, but worldSize=" +
         std::to_string(config.worldSize) + " > gpuPerNode=" + std::to_string(config.gpuPerNode) +
         ": its symmetric buffers are not registered for RDMA. Use EPv2 "

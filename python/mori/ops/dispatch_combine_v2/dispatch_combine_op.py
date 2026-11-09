@@ -66,9 +66,13 @@ _BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
 
 
 def _default_backend() -> str:
-    from mori.ops.dispatch_combine import _is_gfx125x
+    try:
+        from mori.jit.core import _FASTPATH_ARCH_PREFIX, _target_arch
 
-    return "hip" if _is_gfx125x() else "flydsl"
+        gfx125x = _target_arch().startswith(_FASTPATH_ARCH_PREFIX)
+    except Exception:
+        gfx125x = False
+    return "hip" if gfx125x else "flydsl"
 
 
 _FP4_QUANT_TYPES = ("fp4_blockwise", "fp4_blockwise_fp32")

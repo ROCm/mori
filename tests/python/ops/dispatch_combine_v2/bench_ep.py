@@ -175,7 +175,7 @@ VERIFY_SCOPE = (
         else ("dispatch_bytes+push_bytes" if _PUSH else "dispatch_bytes+combine")
     )
 )
-# Geometry, same spelling as tools/ep_test.sh. Unset = the backend's tuned default.
+# Geometry. Unset = the backend's tuned default.
 _G = {
     k: (int(os.environ[k]) if os.environ.get(k) else None)
     for k in ("DBN", "DWPB", "CBN", "CWPB")
