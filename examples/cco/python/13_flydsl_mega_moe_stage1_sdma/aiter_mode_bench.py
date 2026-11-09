@@ -1,3 +1,24 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """aiter MegaMoEV2 stage1 (and the whole layer) in the mode this process got: fixed-slot
 (no compact plan) or compact. Which one is set by ``AITER_MEGA_FIXED_SLOT_MAX_MTPR`` at import
 (fixed-slot needs 48 experts per rank and mtpr <= that value), so run it once per mode:
@@ -55,8 +76,13 @@ def main():
         else:
             moe._run_compact_prepare(ids, args.bs, config.stage1, fs, quant_input=x)
             moe._run_fused_stage1(
-                moe._s1_quant_x[: args.bs], wts, moe._s1_quant_scale[: args.bs], ids,
-                stream=fs, config=config.stage1, prepared=True,
+                moe._s1_quant_x[: args.bs],
+                wts,
+                moe._s1_quant_scale[: args.bs],
+                ids,
+                stream=fs,
+                config=config.stage1,
+                prepared=True,
             )
 
     def layer():

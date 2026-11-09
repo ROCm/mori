@@ -82,6 +82,7 @@ if not hasattr(comm_ops, "traced"):
 # ``comm_ops.wait_lds_wave``. A workgroup barrier would be wrong here (waves of the block are on
 # their own tokens), so this is exactly ``s_waitcnt lgkmcnt(0)``.
 if not hasattr(comm_ops, "wait_lds_wave"):
+
     def _wait_lds_wave():
         rocdl.s_waitcnt(lgkmcnt=0)
 
@@ -206,7 +207,8 @@ class Arena:
     @property
     def max_routes(self):
         """Expert-major rows a rank can receive, at most: one per (source token, k), plus the
-        padding that rounds each expert's section up to a multiple of the sort block (<= 128)."""
+        padding that rounds each expert's section up to a multiple of the sort block (<= 128).
+        """
         return self.n_rows * self.topk + self.experts_per_rank * 128
 
     @property
@@ -218,13 +220,15 @@ class Arena:
     def off_rowmap(self):
         """``rowmap[r]``: the row that expert-major row ``r`` reads, counted from the start of
         ``S``: ``S`` rows are ``[0, n_rows)`` and ``R`` rows ``[n_rows, 2 * n_rows)``. My own
-        run is read from ``S`` in place. Filled by the receiver's layout (``layout_phase``)."""
+        run is read from ``S`` in place. Filled by the receiver's layout (``layout_phase``).
+        """
         return self.off_r + self.n_rows * self.row_bytes
 
     @property
     def off_wts(self):
         """``wts[r]``: the routing weight of row ``r`` (f32 bits). Unused since the route push
-        went (the layout writes aiter's ``wts_em``); kept so the window layout is phase 1b's."""
+        went (the layout writes aiter's ``wts_em``); kept so the window layout is phase 1b's.
+        """
         return self.off_rowmap + _align128(self.max_routes * 4)
 
     @property
@@ -372,7 +376,7 @@ def _quantize_group(x_rsrc, in_dword, raws=None):
 
 #: The quant's LDS staging for ONE round of 64 consecutive groups of one wave --
 #: 64 lanes x 32 payload bytes, then 64 lanes x one dword holding the lane's e8m0 scale.
-QLS_PAY = 64 * GROUP          # 2048 B
+QLS_PAY = 64 * GROUP  # 2048 B
 QLS_STRIDE = QLS_PAY + 64 * 4  # + 256 B of scale dwords = 2304 B per wave
 
 
@@ -404,8 +408,10 @@ def _read_round_lds(lds_pay, lds_sc, lane):
         at = lds_pay + fx.Int64(half * 1024) + fx.Int64(lane) * fx.Int64(16)
         pieces.append(
             fx.Vector.from_elements(
-                [fx.Int32(comm_ops.load_i32_lds(at + fx.Int64(i * 4)))
-                 for i in range_constexpr(4)],
+                [
+                    fx.Int32(comm_ops.load_i32_lds(at + fx.Int64(i * 4)))
+                    for i in range_constexpr(4)
+                ],
                 fx.Int32,
             )
         )
@@ -481,7 +487,8 @@ def put_chunk(sdma, win, peer, c, n, *, rank, arena, cco):
     bytes are there.
 
     Chunk ``c`` covers ``[c * CR, (c + 1) * CR)`` clipped to ``n``, or, with a ``head_rows``
-    head H, ``[0, H)`` for ``c == 0`` and ``[H + (c - 1) * CR, H + c * CR)`` after it."""
+    head H, ``[0, H)`` for ``c == 0`` and ``[H + (c - 1) * CR, H + c * CR)`` after it.
+    """
     rb, cap, CR = arena.row_bytes, arena.cap, arena.chunk_rows
     if const_expr(arena.head_rows > 0):
         H = arena.head_rows
@@ -524,8 +531,19 @@ def post_rest_chunks(sdma, win, wave, lane, cnt, *, rank, arena, cco):
                 )
 
 
-def make_prepare_phase(*, rank, arena, epr, quant_blocks, trace=False, split=3, unroll=1,
-                       prep_block=PREP_BLOCK, fused=False, no_plan=False):
+def make_prepare_phase(
+    *,
+    rank,
+    arena,
+    epr,
+    quant_blocks,
+    trace=False,
+    split=3,
+    unroll=1,
+    prep_block=PREP_BLOCK,
+    fused=False,
+    no_plan=False,
+):
     """The prepare as code a resident kernel can run: returns ``(prepare_phase, cfg)``.
     ``build_prepare`` wraps it in a kernel of its own; the fused GEMM1 (``gemm1_sdma``,
     ``fuse_prepare``) calls it at its front.
@@ -631,7 +649,7 @@ def make_prepare_phase(*, rank, arena, epr, quant_blocks, trace=False, split=3, 
         raise ValueError(f"one comm wave per peer needs npes <= {PW} waves")
     NOPLAN = int(no_plan)
     E = npes * epr
-    NW = quant_blocks            # the blocks that own tokens (every worker)
+    NW = quant_blocks  # the blocks that own tokens (every worker)
     nblocks = quant_blocks + 1
     n_bar_groups = (nblocks + BAR_GROUP - 1) // BAR_GROUP
     # the barrier counters, in bytes: B1 at 0, B3 at ``bar3_off`` (the middle slot belonged to a
@@ -650,15 +668,22 @@ def make_prepare_phase(*, rank, arena, epr, quant_blocks, trace=False, split=3, 
         raise ValueError(
             f"quant store swizzle: {PW} waves x {QLS_STRIDE} B of staging plus {LDS_QLS} B of "
             f"plan LDS is {lds_bytes} bytes, over the 64 KiB workgroup limit; use a smaller "
-            f"prep_block")
+            f"prep_block"
+        )
     STAGE_CUR = E  # the route staging's per-destination route cursors: cursor[E + d]
     n_done_groups = (NW + BAR_GROUP - 1) // BAR_GROUP
     DONE_TOP = n_done_groups  # the top counter sits past the per-group ones
 
     # the LDS bytes ``prepare_phase`` uses, at the address ``L`` it is given
     cfg = types.SimpleNamespace(
-        SPLIT=SPLIT, UNROLL=UNROLL, PB=PB, nblocks=nblocks, lds_bytes=lds_bytes,
-        ARENA_KEY=ARENA_KEY, NW=NW, NOPLAN=NOPLAN,
+        SPLIT=SPLIT,
+        UNROLL=UNROLL,
+        PB=PB,
+        nblocks=nblocks,
+        lds_bytes=lds_bytes,
+        ARENA_KEY=ARENA_KEY,
+        NW=NW,
+        NOPLAN=NOPLAN,
     )
 
     # fmt: off
@@ -1118,16 +1143,38 @@ def make_prepare_phase(*, rank, arena, epr, quant_blocks, trace=False, split=3, 
     return prepare_phase, cfg
 
 
-def build_prepare(*, rank, arena, epr, quant_blocks, trace=False, split=3, unroll=1,
-                  prep_block=PREP_BLOCK, no_plan=False):
+def build_prepare(
+    *,
+    rank,
+    arena,
+    epr,
+    quant_blocks,
+    trace=False,
+    split=3,
+    unroll=1,
+    prep_block=PREP_BLOCK,
+    no_plan=False,
+):
     """The prepare as a kernel of its own (see ``make_prepare_phase``): one resident launch of
     ``quant_blocks + 1`` blocks, comm workgroup 0 and the others quantising."""
     prepare_phase, cfg = make_prepare_phase(
-        rank=rank, arena=arena, epr=epr, quant_blocks=quant_blocks, trace=trace, split=split,
-        unroll=unroll, prep_block=prep_block, fused=False, no_plan=no_plan,
+        rank=rank,
+        arena=arena,
+        epr=epr,
+        quant_blocks=quant_blocks,
+        trace=trace,
+        split=split,
+        unroll=unroll,
+        prep_block=prep_block,
+        fused=False,
+        no_plan=no_plan,
     )
     npes, cap, hidden, CR, topk = (
-        arena.npes, arena.cap, arena.hidden, arena.chunk_rows, arena.topk,
+        arena.npes,
+        arena.cap,
+        arena.hidden,
+        arena.chunk_rows,
+        arena.topk,
     )
     PB = cfg.PB
 
@@ -1240,6 +1287,7 @@ def build_wait(*, rank, arena):
 
 LAYOUT_BLOCKS = 64
 
+
 def layout_lds_words(arena):
     """LDS words ``layout_phase`` needs (the same count for the standalone kernel and for the
     fused GEMM1, which lends it the front of its LDS pool)."""
@@ -1250,9 +1298,34 @@ def layout_lds_words(arena):
 
 
 @comm_ops.traced
-def layout_phase(*, rank, arena, sbm, max_tok, nb, tid, lbid, tpb, L, win, arg_expected,
-                 arg_hist, arg_cursor, arg_bar, arg_srcmap, arg_wts, arg_eids, arg_trb, arg_tib,
-                 arg_nv, arg_met, arg_ete, final_release, signal_done, arg_ldone):
+def layout_phase(
+    *,
+    rank,
+    arena,
+    sbm,
+    max_tok,
+    nb,
+    tid,
+    lbid,
+    tpb,
+    L,
+    win,
+    arg_expected,
+    arg_hist,
+    arg_cursor,
+    arg_bar,
+    arg_srcmap,
+    arg_wts,
+    arg_eids,
+    arg_trb,
+    arg_tib,
+    arg_nv,
+    arg_met,
+    arg_ete,
+    final_release,
+    signal_done,
+    arg_ldone,
+):
     """The receiver's layout, as code any resident kernel can run: ``nb`` blocks (this one is
     ``lbid``) of ``tpb`` threads, with ``L`` the LDS address of ``layout_lds_words`` words.
 
@@ -1359,7 +1432,9 @@ def layout_phase(*, rank, arena, sbm, max_tok, nb, tid, lbid, tpb, L, win, arg_e
     if tid < fx.Int32(epr):
         v = lld(fx.Int32(L_H) + tid)
         if v > fx.Int32(0):
-            comm_ops.atomic_add_agent(fx.Int64(arg_hist) + fx.Int64(tid) * fx.Int64(4), v)
+            comm_ops.atomic_add_agent(
+                fx.Int64(arg_hist) + fx.Int64(tid) * fx.Int64(4), v
+            )
     tree_barrier(fx.Int64(arg_bar), fx.Int32(nb), tid, lbid, release=False)
 
     # 3. section bases (every block the same), then this block's share of each expert
@@ -1380,7 +1455,9 @@ def layout_phase(*, rank, arena, sbm, max_tok, nb, tid, lbid, tpb, L, win, arg_e
         v = lld(fx.Int32(L_H) + tid)
         taken = fx.Int32(0)
         if v > fx.Int32(0):
-            taken = fx.Int32(comm_ops.atomic_add_agent(cursor_addr + fx.Int64(tid) * fx.Int64(4), v))
+            taken = fx.Int32(
+                comm_ops.atomic_add_agent(cursor_addr + fx.Int64(tid) * fx.Int64(4), v)
+            )
         lst(fx.Int32(L_BASE) + tid, lld(fx.Int32(L_EB) + tid) + taken)
     fx.barrier()
 
@@ -1389,7 +1466,9 @@ def layout_phase(*, rank, arena, sbm, max_tok, nb, tid, lbid, tpb, L, win, arg_e
         w0, src = route_of(fx.Int32(i))
         e = stage[w0]
         cell = e
-        slot = fx.Int32(comm_ops.atomic_add_lds(lw(fx.Int32(L_SLOT) + cell), fx.Int32(1)))
+        slot = fx.Int32(
+            comm_ops.atomic_add_lds(lw(fx.Int32(L_SLOT) + cell), fx.Int32(1))
+        )
         r = lld(fx.Int32(L_BASE) + cell) + slot
         rowmap[r] = stage[w0 + fx.Int32(1)]
         wts[r] = stage[w0 + fx.Int32(2)]
@@ -1422,8 +1501,13 @@ def layout_phase(*, rank, arena, sbm, max_tok, nb, tid, lbid, tpb, L, win, arg_e
     if (lbid == fx.Int32(0)) & (tid == fx.Int32(0)):
         ptr_buf_tensor(arg_nv, fx.Int32)[fx.Int32(0)] = lld(L_TOT)
         ptr_buf_tensor(arg_met, fx.Int32)[fx.Int32(0)] = lld(L_MET)
-    tree_barrier(fx.Int64(arg_bar) + fx.Int64(bar2_off), fx.Int32(nb), tid, lbid,
-                 release=final_release)
+    tree_barrier(
+        fx.Int64(arg_bar) + fx.Int64(bar2_off),
+        fx.Int32(nb),
+        tid,
+        lbid,
+        release=final_release,
+    )
     if const_expr(signal_done):
         # every block's tables are released (the rendezvous above): tell the scheduler
         if tid == fx.Int32(0):
@@ -1457,8 +1541,27 @@ def sched_lds_words(max_tiles):
 
 
 @comm_ops.traced
-def scheduler_phase(*, rank, arena, sbm, nb, max_tiles, lane, L, win, sdma, arg_sched, nv_rsrc,
-                    expert_of, sig_base, trace, trace_buf, trace_base, full_wait, expected):
+def scheduler_phase(
+    *,
+    rank,
+    arena,
+    sbm,
+    nb,
+    max_tiles,
+    lane,
+    L,
+    win,
+    sdma,
+    arg_sched,
+    nv_rsrc,
+    expert_of,
+    sig_base,
+    trace,
+    trace_buf,
+    trace_base,
+    full_wait,
+    expected,
+):
     """The tile scheduler: ONE wave (``lane`` 0..63) of the comm workgroup. The GEMM workers do
     not look at SDMA signals at all: they take tickets and read the READY QUEUE this wave
     writes: ``rq[pos] = m-tile`` in the order the tiles became ready, then ``rq_tail`` = pos
@@ -1518,20 +1621,25 @@ def scheduler_phase(*, rank, arena, sbm, nb, max_tiles, lane, L, win, sdma, arg_
     stamp_nt(trace_buf, total_q)
     n_slices = (total_q + fx.Int32(SCHED_WAVE_LANES - 1)) // fx.Int32(SCHED_WAVE_LANES)
     tail = fx.Int32(0)
-    seen = fx.Int32(0)      # trace: bit s = chunk 0 of source s already stamped
-    rnd = fx.Int32(0)       # trace: rounds done
+    seen = fx.Int32(0)  # trace: bit s = chunk 0 of source s already stamped
+    rnd = fx.Int32(0)  # trace: rounds done
     stamp(trace_buf, SCH_TR_R0)
     while tail < total_q:
         lvl = [None] * npes
         for s_ in range_constexpr(npes):
             if const_expr(s_ != rank):
-                lvl[s_] = fx.Int64(comm_ops.load_i64_acquire(
-                    fx.Int64(sdma.signal_slot(fx.Int32(s_), 0))))
+                lvl[s_] = fx.Int64(
+                    comm_ops.load_i64_acquire(
+                        fx.Int64(sdma.signal_slot(fx.Int32(s_), 0))
+                    )
+                )
         if const_expr(trace):
             for s_ in range_constexpr(npes):
                 if const_expr(s_ != rank):
                     hit = lvl[s_] >= fx.Int64(sig_base[fx.Int32(s_)] + fx.Int32(1))
-                    fresh = hit & (((seen // fx.Int32(1 << s_)) % fx.Int32(2)) == fx.Int32(0))
+                    fresh = hit & (
+                        ((seen // fx.Int32(1 << s_)) % fx.Int32(2)) == fx.Int32(0)
+                    )
                     if fresh:
                         stamp(trace_buf, SCH_TR_SRC0 + s_)
                     seen = seen + fresh.select(fx.Int32(1 << s_), fx.Int32(0))
@@ -1551,11 +1659,18 @@ def scheduler_phase(*, rank, arena, sbm, nb, max_tiles, lane, L, win, sdma, arg_
                             # no_plan: an expert's rows can be anywhere in the run: all of it
                             need = fx.Int32(0)
                         else:
-                            need = fx.Int32(comm_ops.load_i32_global_system(
-                                win + fx.Int64(OFF_NEED)
-                                + fx.Int64(fx.Int32(s_ * epr) + e) * fx.Int64(4)))
-                        good = (lvl[s_] >= fx.Int64(expected[fx.Int32(s_)])) if full_wait else (
-                            lvl[s_] >= fx.Int64(sig_base[fx.Int32(s_)] + need))
+                            need = fx.Int32(
+                                comm_ops.load_i32_global_system(
+                                    win
+                                    + fx.Int64(OFF_NEED)
+                                    + fx.Int64(fx.Int32(s_ * epr) + e) * fx.Int64(4)
+                                )
+                            )
+                        good = (
+                            (lvl[s_] >= fx.Int64(expected[fx.Int32(s_)]))
+                            if full_wait
+                            else (lvl[s_] >= fx.Int64(sig_base[fx.Int32(s_)] + need))
+                        )
                         ok = good.select(ok, fx.Int32(0))
             nf = (pending & (ok != fx.Int32(0))).select(fx.Int32(1), fx.Int32(0))
             # a prefix count over the lanes, through LDS (the wave runs in lockstep)
@@ -1573,7 +1688,11 @@ def scheduler_phase(*, rank, arena, sbm, nb, max_tiles, lane, L, win, sdma, arg_
                     pre = pre + lld(fx.Int32(W_F) + fx.Int32(i))
                 if nf > fx.Int32(0):
                     comm_ops.store_i32_global_system_monotonic(
-                        sched + fx.Int64(SCH_RQ * 4) + fx.Int64(pos + pre) * fx.Int64(4), t)
+                        sched
+                        + fx.Int64(SCH_RQ * 4)
+                        + fx.Int64(pos + pre) * fx.Int64(4),
+                        t,
+                    )
                     lst(t, w + fx.Int32(PUB))
             pos = pos + cnt
         if pos > tail:
@@ -1581,11 +1700,12 @@ def scheduler_phase(*, rank, arena, sbm, nb, max_tiles, lane, L, win, sdma, arg_
             rocdl.s_waitcnt(vmcnt=0)
             if lane == fx.Int32(0):
                 comm_ops.store_i32_global_system_monotonic(
-                    sched + fx.Int64(SCH_TAIL * 4), pos)
+                    sched + fx.Int64(SCH_TAIL * 4), pos
+                )
             if tail == fx.Int32(0):
-                stamp(trace_buf, SCH_TR_FIRST)     # first tile(s) published
+                stamp(trace_buf, SCH_TR_FIRST)  # first tile(s) published
             if pos == total_q:
-                stamp(trace_buf, SCH_TR_LAST)      # the last one
+                stamp(trace_buf, SCH_TR_LAST)  # the last one
             for ci in range_constexpr(len(SCH_CURVE)):
                 if (tail < fx.Int32(SCH_CURVE[ci])) & (pos >= fx.Int32(SCH_CURVE[ci])):
                     stamp(trace_buf, SCH_TR_CUR0 + ci)
@@ -1695,7 +1815,13 @@ class Stage1SdmaPrepare:
             max_tok,
         )
         self.arena = a = Arena(
-            self.npes, max_tok, hidden, chunk_rows, topk, self.epr, early_chunks,
+            self.npes,
+            max_tok,
+            hidden,
+            chunk_rows,
+            topk,
+            self.epr,
+            early_chunks,
             head_rows=int(head_rows),
         )
         a.check()
@@ -1717,7 +1843,9 @@ class Stage1SdmaPrepare:
         # Left at zero by every call, so zero from the start: the plan's counters; and the grid
         # barriers', which are never reset.
         self.hist = torch.zeros(experts, **i32)
-        self.cursor = torch.zeros(experts + self.npes, **i32)  # plan's | route staging's per dst
+        self.cursor = torch.zeros(
+            experts + self.npes, **i32
+        )  # plan's | route staging's per dst
         # One block per CU for the quant waves, less the comm workgroup.
         n_cu = torch.cuda.get_device_properties(dev).multi_processor_count
         self.quant_blocks = n_cu - 1 if quant_blocks is None else quant_blocks
@@ -1768,7 +1896,9 @@ class Stage1SdmaPrepare:
         # all of a source's chunks, which ``run_gemm1_sdma`` picks up from here
         self.no_plan = bool(no_plan)
         self.trace_buf = (
-            torch.zeros(PREP_SLOTS * (self.quant_blocks + 1) + 32, dtype=torch.int64, device=dev)
+            torch.zeros(
+                PREP_SLOTS * (self.quant_blocks + 1) + 32, dtype=torch.int64, device=dev
+            )
             if trace
             else None
         )
@@ -1843,7 +1973,10 @@ class Stage1SdmaPrepare:
         sbm = int(sbm)
         if sbm not in self._layouts:
             self._layouts[sbm] = build_layout(
-                rank=self.rank, arena=self.arena, sbm=sbm, max_tok=self.max_tok,
+                rank=self.rank,
+                arena=self.arena,
+                sbm=sbm,
+                max_tok=self.max_tok,
             )
         op, ws = moe._s1_op, moe._s1_dispatch_workspace
         ws["fanout_pair_config"].zero_()
@@ -1894,7 +2027,8 @@ class Stage1SdmaPrepare:
 
     def fused_prepare_args(self, x, ids, wts):
         """What the fused GEMM1 needs to run the prepare itself (``run_gemm1_sdma(fuse=...)``,
-        under the key ``"prepare"``): what ``run`` passes to the prepare kernel, as pointers."""
+        under the key ``"prepare"``): what ``run`` passes to the prepare kernel, as pointers.
+        """
         tokens = int(x.shape[0])
         if tokens > self.max_tok:
             raise ValueError(f"tokens={tokens} > max_tok={self.max_tok}")
@@ -1903,11 +2037,19 @@ class Stage1SdmaPrepare:
         if wts is None:
             raise ValueError("the route table needs the routing weights")
         return dict(
-            ids=ids.data_ptr(), x=x.data_ptr(), row_tok=self.row_tok.data_ptr(),
-            rowpos=self.rowpos.data_ptr(), cum=self.cum.data_ptr(), hist=self.hist.data_ptr(),
-            cursor=self.cursor.data_ptr(), bar=self.bar.data_ptr(), wts=wts.data_ptr(),
+            ids=ids.data_ptr(),
+            x=x.data_ptr(),
+            row_tok=self.row_tok.data_ptr(),
+            rowpos=self.rowpos.data_ptr(),
+            cum=self.cum.data_ptr(),
+            hist=self.hist.data_ptr(),
+            cursor=self.cursor.data_ptr(),
+            bar=self.bar.data_ptr(),
+            wts=wts.data_ptr(),
             trace=self.trace_buf.data_ptr() if self.trace else 0,
-            done=self.done.data_ptr(), qdone=self.qdone.data_ptr(), tokens=tokens,
+            done=self.done.data_ptr(),
+            qdone=self.qdone.data_ptr(),
+            tokens=tokens,
         )
 
     def post_rest(self, stream=None):
@@ -1941,7 +2083,9 @@ class Stage1SdmaPrepare:
             self.sched[:SCH_ZERO].zero_()
         # a device tensor keeps this capturable in a CUDA graph (no host copy)
         if not isinstance(chunks_from, torch.Tensor):
-            chunks_from = torch.as_tensor(chunks_from, dtype=torch.int32, device=self.expected.device)
+            chunks_from = torch.as_tensor(
+                chunks_from, dtype=torch.int32, device=self.expected.device
+            )
         self.expected[: self.npes] += chunks_from
         if routes:
             self.expected[self.npes :] += self.epr

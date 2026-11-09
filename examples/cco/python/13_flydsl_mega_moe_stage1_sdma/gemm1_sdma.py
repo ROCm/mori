@@ -82,7 +82,9 @@ from stage1_sdma import (
 
 #: ``trace``: int64 slots per workgroup, and work items recorded per workgroup (8 + 3 * items).
 TRACE_STRIDE = 2048
-TRACE_SLOTS = 5  # per item: gate start, gate passed, done (100 MHz); passed, done (s_memtime)
+TRACE_SLOTS = (
+    5  # per item: gate start, gate passed, done (100 MHz); passed, done (s_memtime)
+)
 TRACE_ITEMS = (TRACE_STRIDE - 8) // TRACE_SLOTS
 RF_TILE, RF_NEXT = 0, 1  # ``ready_first``: words of the ``rf`` LDS array
 
@@ -115,7 +117,9 @@ class WindowAScaleLoader(AScaleLoader):
                 if group < fx.Int32(groups_per_row):
                     lane = self._tx & fx.Int32(63)
                     packed = _load_row_map_subgroup(
-                        self._row_map_rsrc, tile_row_base_i32 + row, lane,
+                        self._row_map_rsrc,
+                        tile_row_base_i32 + row,
+                        lane,
                         padded_groups_per_row,
                     )
                     source_row = packed & fx.Int32(0xFFFFFF)
