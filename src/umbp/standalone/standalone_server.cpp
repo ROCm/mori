@@ -625,6 +625,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (!ResolveRange(request->client_id(), request->region_base(), request->shm_offset(),
                       request->size(), &ptr)) {
       SetBool(response, false, "unregistered or out-of-range shm buffer");
+      FlagUnknownClient(request->client_id(), {request->region_base()}, response);
       return grpc::Status::OK;
     }
     if (shutdown_.load()) {
@@ -642,6 +643,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (!ResolveRange(request->client_id(), request->region_base(), request->shm_offset(),
                       request->size(), &ptr)) {
       SetBool(response, false, "unregistered or out-of-range shm buffer");
+      FlagUnknownClient(request->client_id(), {request->region_base()}, response);
       return grpc::Status::OK;
     }
     if (shutdown_.load()) {
@@ -660,6 +662,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::vector<uintptr_t> ptrs;
     if (!ResolveBatch(*request, &ptrs)) {
       FillFalse(request->keys_size(), response);
+      FlagUnknownClient(request->client_id(), request->region_bases(), response);
       return grpc::Status::OK;
     }
     if (shutdown_.load()) {
@@ -694,6 +697,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
         shutdown_.load()) {
       FillFalse(request->keys_size(), response);
+      FlagUnknownClient(request->client_id(), request->region_bases(), response);
       return grpc::Status::OK;
     }
 
@@ -752,6 +756,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::vector<uintptr_t> ptrs;
     if (!ResolveRanges(request->client_id(), queries, &ptrs, /*allow_zero=*/false)) {
       FillFalse(request->keys_size(), response);
+      FlagUnknownClient(request->client_id(), request->region_bases(), response);
       return grpc::Status::OK;
     }
     if (shutdown_.load()) {
@@ -773,6 +778,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::vector<uintptr_t> ptrs;
     if (!ResolveBatch(*request, &ptrs)) {
       FillFalse(request->keys_size(), response);
+      FlagUnknownClient(request->client_id(), request->region_bases(), response);
       return grpc::Status::OK;
     }
     if (shutdown_.load()) {
@@ -839,6 +845,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
         shutdown_.load()) {
       FillFalse(static_cast<int>(key_count), response);
+      FlagUnknownClient(request->client_id(), request->region_bases(), response);
       return grpc::Status::OK;
     }
 
@@ -1685,6 +1692,23 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       queries.push_back({region_base, request.shm_offsets(i), request.sizes(i)});
     }
     return ResolveRanges(request.client_id(), queries, ptrs, /*allow_zero=*/false);
+  }
+
+  // For a data request that did not resolve. A client names only regions it
+  // registered, so one this server lacks went to an earlier server process --
+  // possibly while the client's others came here.
+  template <typename Response, typename Bases = std::initializer_list<uint64_t>>
+  void FlagUnknownClient(const std::string& client_id, const Bases& bases, Response* response) {
+    std::shared_lock<std::shared_mutex> lock(memory_mu_);
+    const auto it = memory_.find(client_id);
+    const auto held = [&](uint64_t base) {  // 0, the legacy first fit, takes any region
+      return it != memory_.end() &&
+             std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
+               return !base || mem.worker_base == base;
+             });
+    };
+    if (!held(0) || !std::all_of(bases.begin(), bases.end(), held))
+      response->set_client_unknown(true);
   }
 
   // `key_count` rather than request.keys_size(): a get may name its keys by a

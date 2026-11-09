@@ -54,6 +54,12 @@ namespace {
 
 std::atomic<uint64_t> g_client_counter{0};
 
+using Stub = ::umbp::UMBPStandalone::Stub;
+
+// A failed restore is tried again only after this; data calls go to the server
+// as it is meanwhile.
+constexpr auto kReplayRetryInterval = std::chrono::seconds(1);
+
 void EncodeKvBlock(const KvBlockMetadata& block, ::umbp::StandaloneKvBlock* request) {
   request->set_hash(block.hash);
   if (block.parent) request->set_parent(*block.parent);
@@ -96,6 +102,11 @@ void WarnLookupFailure(const char* op, const grpc::Status& status, int timeout_m
         "failures not logged since the last warning)",
         op, static_cast<int>(status.error_code()), status.error_message(), unlogged);
   }
+}
+
+// Every data call waits on a restore while it registers.
+void SetRegistrationDeadline(grpc::ClientContext* context, int timeout_ms) {
+  context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms));
 }
 
 void CheckKvMetadataStatus(const grpc::Status& status) {
@@ -311,15 +322,16 @@ class StandaloneProcessClient::VirtualMemoryExporter final : public MemoryExport
     req.set_worker_node_address(client.standalone_config_.worker_node_address);
     for (const auto& tag : client.standalone_config_.tags) req.add_tags(tag);
     grpc::ClientContext ctx;
+    SetRegistrationDeadline(&ctx, client.standalone_config_.startup_timeout_ms);
     ::umbp::BoolResponse resp;
     if (!client.stub_->RegisterMemory(&ctx, req, &resp).ok() || !resp.ok()) return false;
     std::lock_guard<std::mutex> lock(client.registration_mu_);
     const auto at = std::find_if(client.regions_.begin(), client.regions_.end(),
                                  [&](const auto& region) { return region.base == ptr; });
     if (at == client.regions_.end())
-      client.regions_.push_back({ptr, size, RegionKind::kVirtual});
+      client.regions_.push_back({ptr, size, RegionKind::kVirtual, req.device_id()});
     else
-      at->size = size;
+      *at = {ptr, size, RegionKind::kVirtual, req.device_id()};
     return true;
   }
 };
@@ -340,8 +352,10 @@ StandaloneProcessClient::StandaloneProcessClient(const UMBPConfig& config) : con
 
   address_ = standalone_config_.address;
   fd_socket_path_ = DeriveFdSocketPath(address_);
-  channel_ =
-      grpc::CreateCustomChannel(address_, grpc::InsecureChannelCredentials(), GrpcChannelArgs());
+  grpc::ChannelArguments channel_args = GrpcChannelArgs();
+  // The server can restart under this client; keep gRPC's reconnect backoff short.
+  channel_args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 1000);
+  channel_ = grpc::CreateCustomChannel(address_, grpc::InsecureChannelCredentials(), channel_args);
   stub_ = ::umbp::UMBPStandalone::NewStub(channel_);
 
   MaybeAutoStart();
@@ -434,6 +448,78 @@ bool StandaloneProcessClient::OffsetForLocked(uintptr_t ptr, size_t size, uint64
   return false;
 }
 
+template <typename Method, typename Request, typename Response>
+grpc::Status StandaloneProcessClient::CallRegistered(Method method, const Request& req,
+                                                     Response& resp) {
+  const auto rpc = [&] {
+    grpc::ClientContext ctx;
+    return ((*stub_).*method)(&ctx, req, &resp);
+  };
+  uint64_t epoch = registration_epoch_.load();
+  // Once part of a restore has landed the server stops answering client_unknown.
+  if (replay_needed_.load()) {
+    EnsureRegistrations(epoch, /*client_unknown=*/false);
+    epoch = registration_epoch_.load();
+  }
+  grpc::Status status = rpc();
+  const bool unknown = status.ok() && resp.client_unknown();
+  // A call on the wire when a restore starts can reach the server between the
+  // regions and the KV Indexer configuration a metadata put needs.
+  const bool raced = status.error_code() == grpc::StatusCode::INVALID_ARGUMENT &&
+                     (replay_needed_.load() || registration_epoch_.load() != epoch);
+  if (!unknown && !raced) return status;
+  if (!EnsureRegistrations(epoch, unknown))
+    return raced ? grpc::Status(grpc::StatusCode::UNAVAILABLE, "not registered again yet") : status;
+  resp.Clear();
+  return rpc();
+}
+
+bool StandaloneProcessClient::EnsureRegistrations(uint64_t observed_epoch, bool client_unknown) {
+  // Held for the whole restore, so a call that needs one waits here for it.
+  std::lock_guard<std::mutex> replay_lock(replay_mu_);
+  if (registration_epoch_.load() != observed_epoch) return true;
+  if (client_unknown) replay_needed_ = true;
+  if (!replay_needed_) return true;
+  if (std::chrono::steady_clock::now() < next_replay_) return false;
+
+  std::vector<RegisteredRegion> regions;
+  {
+    std::lock_guard<std::mutex> lock(registration_mu_);
+    regions = regions_;
+  }
+  MORI_UMBP_WARN("[StandaloneProcessClient] registering {} region(s) again with the server at {}",
+                 regions.size(), address_);
+  bool ok = true;
+  for (const auto& region : regions) {
+    const auto loc = region.device_id >= 0 ? mori::io::MemoryLocationType::GPU
+                                           : mori::io::MemoryLocationType::CPU;
+    try {
+      ok = memory_exporter_->Register(*this, region.base, region.size, loc, region.device_id) && ok;
+    } catch (const std::exception& e) {
+      MORI_UMBP_WARN("[StandaloneProcessClient] registering 0x{:x} again failed: {}", region.base,
+                     e.what());
+      ok = false;
+    }
+  }
+  if (ok && kv_indexer_request_) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+    ::umbp::BoolResponse resp;
+    ok = stub_->ConfigureKvIndexer(&ctx, *kv_indexer_request_, &resp).ok() && resp.ok();
+  }
+  if (!ok) {
+    MORI_UMBP_WARN("[StandaloneProcessClient] registering again failed; retrying in a second");
+    // Measured from the failure: the attempt itself can outlast the interval.
+    next_replay_ = std::chrono::steady_clock::now() + kReplayRetryInterval;
+    return false;
+  }
+  registration_epoch_.fetch_add(1);
+  replay_needed_ = false;
+  MORI_UMBP_INFO("[StandaloneProcessClient] registered client_id={} again with the server at {}",
+                 ClientId(), address_);
+  return true;
+}
+
 bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t size) {
   SimCall call(sim_trace_.get(), "put", 1, size);
   if (kv_metadata_provider_) {
@@ -446,7 +532,6 @@ bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t 
   uint64_t offset = 0;
   uint64_t region_base = 0;
   if (!OffsetFor(src, size, &offset, &region_base)) return false;
-  grpc::ClientContext ctx;
   ::umbp::PutRequest req;
   req.set_key(key);
   req.set_client_id(ClientId());
@@ -454,7 +539,7 @@ bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t 
   req.set_size(size);
   req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
-  grpc::Status status = stub_->Put(&ctx, req, &resp);
+  grpc::Status status = CallRegistered(&Stub::Put, req, resp);
   return call.Result(status.ok() && resp.ok());
 }
 
@@ -466,7 +551,6 @@ bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t 
   uint64_t offset = 0;
   uint64_t region_base = 0;
   if (!OffsetFor(dst, size, &offset, &region_base)) return false;
-  grpc::ClientContext ctx;
   ::umbp::GetRequest req;
   req.set_key(key);
   req.set_client_id(ClientId());
@@ -474,7 +558,7 @@ bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t 
   req.set_size(size);
   req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
-  grpc::Status status = stub_->Get(&ctx, req, &resp);
+  grpc::Status status = CallRegistered(&Stub::Get, req, resp);
   return call.Result(status.ok() && resp.ok());
 }
 
@@ -524,9 +608,8 @@ std::vector<bool> StandaloneProcessClient::BatchPutImpl(const std::vector<std::s
     req.add_region_bases(region_base);
     req.add_sizes(sizes[i]);
   }
-  grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
-  grpc::Status status = stub_->BatchPut(&ctx, req, &resp);
+  grpc::Status status = CallRegistered(&Stub::BatchPut, req, resp);
   CheckKvMetadataStatus(status);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
@@ -561,9 +644,8 @@ std::vector<bool> StandaloneProcessClient::BatchPutWithDepth(const std::vector<s
     req.add_sizes(sizes[i]);
     req.add_depths(i < depths.size() ? depths[i] : -1);
   }
-  grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
-  grpc::Status status = stub_->BatchPutWithDepth(&ctx, req, &resp);
+  grpc::Status status = CallRegistered(&Stub::BatchPutWithDepth, req, resp);
   CheckKvMetadataStatus(status);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
@@ -593,9 +675,8 @@ std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::strin
     req.add_region_bases(region_base);
     req.add_sizes(sizes[i]);
   }
-  grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
-  grpc::Status status = stub_->BatchGet(&ctx, req, &resp);
+  grpc::Status status = CallRegistered(&Stub::BatchGet, req, resp);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
@@ -726,9 +807,8 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
       for (const auto& key : keys) req.add_keys(key);
     }
 
-    grpc::ClientContext ctx;
     ::umbp::BatchBoolResponse resp;
-    const grpc::Status status = stub_->BatchGetRanges(&ctx, req, &resp);
+    const grpc::Status status = CallRegistered(&Stub::BatchGetRanges, req, resp);
     if (!status.ok()) return failed;
     if (resp.key_handle_unknown()) {
       ForgetKeyHandle(handle);
@@ -779,9 +859,8 @@ std::vector<bool> StandaloneProcessClient::BatchPutRanges(
     }
   }
 
-  grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
-  const grpc::Status status = stub_->BatchPutRanges(&ctx, req, &resp);
+  const grpc::Status status = CallRegistered(&Stub::BatchPutRanges, req, resp);
   CheckKvMetadataStatus(status);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
   return call.Result(std::vector<bool>(resp.ok().begin(), resp.ok().end()));
@@ -838,6 +917,8 @@ void StandaloneProcessClient::ConfigureKvIndexer(const KvIndexerConfig& config) 
   if (!response.supports_kv_metadata())
     throw std::runtime_error("standalone owner requires an upgrade for batched KV metadata");
   kv_metadata_provider_ = config.metadata_provider;
+  std::lock_guard<std::mutex> replay_lock(replay_mu_);
+  kv_indexer_request_ = request;
 }
 
 size_t StandaloneProcessClient::BatchPrefetch(const std::vector<std::string>& keys) {
@@ -979,6 +1060,7 @@ bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, i
   req.set_alloc_base(allocation_address);
 
   grpc::ClientContext ctx;
+  SetRegistrationDeadline(&ctx, standalone_config_.startup_timeout_ms);
   ::umbp::BoolResponse resp;
   const grpc::Status rpc_status = stub_->RegisterMemory(&ctx, req, &resp);
   if (!rpc_status.ok() || !resp.ok()) {
@@ -993,8 +1075,9 @@ bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, i
   });
   if (existing != regions_.end()) {
     existing->size = size;
+    existing->device_id = device_id;
   } else {
-    regions_.push_back({ptr, size, RegionKind::kGpuIpc});
+    regions_.push_back({ptr, size, RegionKind::kGpuIpc, device_id});
   }
   return true;
 }
@@ -1018,6 +1101,7 @@ bool StandaloneProcessClient::RegisterHostShmMemory(uintptr_t ptr, size_t size) 
     }
 
     grpc::ClientContext ctx;
+    SetRegistrationDeadline(&ctx, standalone_config_.startup_timeout_ms);
     ::umbp::RegisterMemoryRequest req;
     req.set_client_id(client_id);
     req.set_worker_base(reinterpret_cast<uintptr_t>(allocation->base));
