@@ -44,11 +44,11 @@ namespace mori {
 namespace ccl {
 
 // Single-block, compute-free all-to-all.
-//   srcPtrs : npes local symmetric-heap pointers; srcPtrs[p] sent to peer p.
-//   dstPtrs : npes local symmetric-heap pointers; dstPtrs[p] receives peer p's chunk.
+//   pairs      : npes endpoints, by value; pairs.p[p].source (local) is sent to
+//                peer p, pairs.p[p].dest (symmetric heap) receives peer p's chunk.
 //   chunkBytes : size in bytes of each per-peer chunk.
 template <int Flags>
-__global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __restrict__ pairs,
+__global__ void AllToAllPushKernel(int myPe, int npes, const AddressPairs pairs,
                                    size_t chunkBytes, cco::ccoDevComm devComm,
                                    cco::ccoWindow_t heapWin,
                                    uint64_t* __restrict__ barrierCtr,
@@ -71,15 +71,17 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
     // (pe - myPe)*stride4G<<32 -- the same inline LSA addressing the
     // reduce-scatter/all-reduce push kernels use. winBase cancels out, so this
     // needs no ccoGetLocalPtr/ccoGetLsaPeerPtr round trip. The source is an
-    // arbitrary per-peer local pointer (SDMA reads local VA directly).
-    uint8_t* const localDst = reinterpret_cast<uint8_t*>(pairs[myPe].dest);
+    // arbitrary per-peer local pointer (SDMA reads local VA directly). The lambda
+    // captures a pointer into the kernel arguments, not a per-thread copy of them.
+    const AddressPair* const pp = pairs.p;
+    uint8_t* const localDst = reinterpret_cast<uint8_t*>(pp[myPe].dest);
     StartSdmaScatter(
         devComm.sdma, npes, /*logS=*/0, pushGen,
         [=](int peer) {
           auto [dstP, sigP] = PeerPtrs(localDst, arrived + myPe * kArrivedStride,
                                        peer, myPe, stride4G);
           return ScatterPeer{true, chunkBytes,
-                             reinterpret_cast<const uint8_t*>(pairs[peer].source),
+                             reinterpret_cast<const uint8_t*>(pp[peer].source),
                              dstP, sigP,
                              peer != myPe ? BarrierGate(barrierCtr, peer) : nullptr,
                              static_cast<uint32_t>(pushGen - 1)};
@@ -105,10 +107,10 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
 
 // Multi-block, SDMA-free all-to-all: every PE reads, from each peer p, the chunk
 // p sends to it and stores it into its own recv slot for sender p.
-//   pairs      : npes host-pinned endpoints; pairs[p].dest (local) receives
+//   pairs      : npes endpoints, by value; pairs.p[p].dest (local) receives
 //                peer p's chunk. Unlike the push kernel, the SEND slots must also
 //                be symmetric: peer p's chunk for me sits at the heap offset of my
-//                own pairs[myPe].source, so it is read at PeerPtr(that, p).
+//                own pairs.p[myPe].source, so it is read at PeerPtr(that, p).
 //   chunkBytes : size in bytes of each per-peer chunk
 //   NPES       : compile-time peer count (see PullCopyInterleaved).
 //
@@ -120,15 +122,16 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
 template <int NPES, int NumVecs>
 __global__ void __launch_bounds__(256, 1)
 AllToAllPullKernel(int myPe, int npes, cco::ccoWindow_t heapWin,
-                    const AddressPair* __restrict__ pairs, size_t chunkBytes,
+                    const AddressPairs pairs, size_t chunkBytes,
                     uint32_t* __restrict__ groupCtr, uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
-  // pairs lives in host memory: read it once per block, not once per copy unit.
+  // Hoist the per-thread-indexed dests into LDS once per block, so the copy
+  // loop's statically indexed dsts[j] needs no kernel-argument reloads.
   __shared__ uint8_t* dsts[NPES];
   if (threadIdx.x < NPES) {
-    dsts[threadIdx.x] = static_cast<uint8_t*>(pairs[threadIdx.x].dest);
+    dsts[threadIdx.x] = static_cast<uint8_t*>(pairs.p[threadIdx.x].dest);
   }
-  const auto* src = static_cast<const uint8_t*>(pairs[myPe].source);
+  const auto* src = static_cast<const uint8_t*>(pairs.p[myPe].source);
 
   // In block 0's first wave every lane loads this before lane myPe posts.
   const uint64_t gen = AtomicLoad<EAgentScope>(&arrived[myPe]) & ~1ULL;

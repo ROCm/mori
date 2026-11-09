@@ -408,7 +408,7 @@ hipError_t CollectivesFacade::AsyncDone(hipStream_t stream) {
                        nullptr, 0, devComm_, state_.heapWin, barrierCtr_, arrived_);
       break;
     case AsyncOp::kAllToAll:
-      AllToAllPushKernel<kAsyncDone><<<1, kThreads, 0, stream>>>(myPe_, nPes_, nullptr, 0,
+      AllToAllPushKernel<kAsyncDone><<<1, kThreads, 0, stream>>>(myPe_, nPes_, AddressPairs{}, 0,
                        devComm_, state_.heapWin, barrierCtr_, arrived_);
       break;
     case AsyncOp::kPermute:
@@ -433,11 +433,12 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
                                           hipStream_t stream, bool isAsync) {
   isAsync = isAsync && !AsyncDisabled();
   assert(static_cast<int>(addrs.size()) == nPes_ && "addrs size must equal npes");
-  // Fill the preallocated pinned (host-visible, device-readable) AddressPair
-  // buffer with a plain host write, then launch -- no per-call device copy.
+  // The endpoints travel in the launch's kernel arguments, so a later call (or
+  // a graph replay) cannot change the pointers a queued launch reads.
+  AddressPairs pairs{};
   for (int p = 0; p < nPes_; ++p) {
-    state_.pinnedPairs[p].source = addrs[p].first;
-    state_.pinnedPairs[p].dest = addrs[p].second;
+    pairs.p[p].source = addrs[p].first;
+    pairs.p[p].dest = addrs[p].second;
   }
   const size_t totalBytes = chunkBytes * nPes_;
   uintptr_t bits = chunkBytes;
@@ -449,7 +450,7 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
   if (isAsync) {
     // Start only: issue the SDMA scatter and exit; AsyncDone waits for it.
     AllToAllPushKernel<kAsyncStart><<<1, kThreads, 0, stream>>>(myPe_, nPes_,
-                      state_.pinnedPairs, chunkBytes, devComm_,
+                      pairs, chunkBytes, devComm_,
                       state_.heapWin, barrierCtr_, arrived_);
     hipError_t err = hipGetLastError();
     if (err == hipSuccess) pending_ = {AsyncOp::kAllToAll};
@@ -466,14 +467,14 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
     // above guarantees nPes_ is 2/4/8, so DispatchNpes never hits its default.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
       AllToAllPullKernel<decltype(NPES_c)::value, kPullCopyVecs><<<blocks, kPullThreads, 0, stream>>>(
-          myPe_, nPes_, state_.heapWin, state_.pinnedPairs, chunkBytes, state_.groupCtr,
+          myPe_, nPes_, state_.heapWin, pairs, chunkBytes, state_.groupCtr,
           barrierCtr_);
       return hipGetLastError();
     });
   }
   // Single block: SDMA pushes each send slot p to peer p's recv slot (+ self).
   AllToAllPushKernel<kSync><<<1, kThreads, 0, stream>>>(myPe_, nPes_, 
-                    state_.pinnedPairs, chunkBytes, devComm_,
+                    pairs, chunkBytes, devComm_,
                     state_.heapWin, barrierCtr_, arrived_);
   return hipGetLastError();
 }

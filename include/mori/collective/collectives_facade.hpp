@@ -101,7 +101,7 @@ class CollectivesFacade {
   static constexpr size_t kAutoPullMaxBytesPermute = 1536ull << 10;
 
   // Per-peer all-to-all endpoints: addrs[p] = {chunk sent to peer p, recv slot
-  // for sender p}. The facade copies these into its pinned AddressPair buffer.
+  // for sender p}. The facade copies these into the launch's kernel arguments.
   using AddressVector = std::vector<std::pair<const void*, void*>>;
 
   CollectivesFacade(const CollectivesFacade&) = delete;
@@ -265,12 +265,7 @@ class CollectivesFacade {
     const size_t localCtrBytes = permuteNumBytes + kGroupCtrTotal * sizeof(uint32_t);
     HIP_RUNTIME_CHECK(hipMalloc(reinterpret_cast<void**>(&state.permuteNum), localCtrBytes));
     HIP_RUNTIME_CHECK(hipMemset(state.permuteNum, 0, localCtrBytes));
-    state.groupCtr = reinterpret_cast<uint32_t*>(state.permuteNum + 2 * kCCLMaxPeers);    // Preallocate the pinned (host-visible, device-readable) all-to-all pointer
-    // buffer once, so each RunAllToAll is a plain host fill + launch (no per-call
-    // device alloc/copy). Sized for the max supported peer count.
-    HIP_RUNTIME_CHECK(hipHostMalloc(reinterpret_cast<void**>(&state.pinnedPairs),
-                                    kCCLMaxPeers * sizeof(AddressPair), 
-                                    hipHostMallocDefault));
+    state.groupCtr = reinterpret_cast<uint32_t*>(state.permuteNum + 2 * kCCLMaxPeers);
 
     // SDMA device comm for the push path (passed by value into the push kernel).
     cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
@@ -447,7 +442,6 @@ class CollectivesFacade {
                                       // [kPermuteFlagSlots][kCCLMaxPeers] (slot [idx][p] written by PE p)
     uint64_t* commCtl{nullptr};  // symmetric, [kCommCtlSlots][kCommCtlWords] per-range
                                  // gen-barrier flags + SDMA completion slots
-    AddressPair* pinnedPairs{nullptr};  // host-pinned, device-readable
     cco::ccoComm* ccoComm{nullptr};
     // Static heap: one symmetric window backing all user buffers (bump allocator).
     cco::ccoWindow_t heapWin{nullptr};
@@ -472,9 +466,6 @@ class CollectivesFacade {
       }
       if (permuteNum != nullptr) {  // also backs groupCtr
         HIP_RUNTIME_CHECK(hipFree(permuteNum));
-      }
-      if (pinnedPairs != nullptr) {
-        HIP_RUNTIME_CHECK(hipHostFree(pinnedPairs));
       }
     }
   };

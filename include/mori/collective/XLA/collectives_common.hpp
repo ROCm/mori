@@ -118,11 +118,20 @@ enum PermuteFlagIdx {
   kPermuteFlagSlots,
 };
 
-// Per-peer all-to-all endpoints: chunk sent from `source` to peer p / received// into `dest` from peer p. Host-fillable, device-readable (host-pinned buffer).
+// Per-peer all-to-all endpoints: chunk sent from `source` to peer p / received
+// into `dest` from peer p.
 struct AddressPair {
   const void* source;
   void* dest;
 };
+
+// All endpoints of one all-to-all launch, passed BY VALUE as a kernel argument
+// so every queued or graph-captured launch keeps its own pointers (a shared
+// host table would be read at run/replay time, after later calls rewrote it).
+struct AddressPairs {
+  AddressPair p[kCCLMaxPeers];
+};
+static_assert(sizeof(AddressPairs) == kCCLMaxPeers * sizeof(AddressPair));
 
 #if defined(__HIPCC__) || defined(__HIP__)
 
