@@ -34,10 +34,12 @@ Run by .github/workflows/ci-scope.yml. Writes these step outputs:
 Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
 
   - a draft runs nothing, unless it has the ci:full label;
-  - adding ci:full runs everything; adding ci:mi300x runs the MI300X lanes;
-    adding any other label runs nothing;
+  - ci:full runs everything; ci:mi300x adds the MI300X lanes to the lanes the
+    changed files pick; labels are read live, so a re-run sees the current ones;
+  - adding any other label runs nothing (a re-run of that run is a normal run);
   - otherwise the lanes follow the changed files (rules below), after the
-    pre-commit check of the head commit has passed.
+    pre-commit check of the head commit has passed. A rename counts under both
+    its old and its new path.
 
 `--files FILE` classifies a list of paths offline, for checking the rules.
 """
@@ -52,7 +54,8 @@ import time
 
 LANES = ("mori", "mi300x", "umbp", "cco", "fused")
 
-# First match wins; a path that matches nothing is "core" and runs every lane.
+# First match wins; a path that matches nothing is "core" and runs every lane
+# except mi300x, which also needs MI300X_PATHS.
 AREAS = [
     ("ignored", r"(\.md|\.rst|\.png|\.jpg|\.svg)$|^docs/|^LICENSE|^\.gitignore$"),
     (
@@ -86,11 +89,14 @@ AREAS = [
 ]
 
 # On a PR the MI300X lanes run only when one of these changed (or with ci:mi300x):
-# EP v1, shmem, mlx5, IO, and what builds or runs them there.
+# EP v1, shmem, KIWI, mlx5, IO, the shared RDMA/SDMA/bootstrap/topology code, CCL,
+# NIC detection, and what builds or runs them there.
 MI300X_PATHS = re.compile(
     r"^(src|include/mori|python/mori)/ops/(?!dispatch_combine_v2/|gemm_|ag_gemm/|a2a_gemm/|__init__\.py$)"
     r"|^tests/python/ops/(?!dispatch_combine_v2/)|^examples/ops/"
     r"|(^|/)(shmem|kiwi)(/|_|\.|$)|mlx5|(^|/|_)io(/|_|\.|$)"
+    r"|^(src|include/mori)/application/(transport/(rdma|sdma)|bootstrap|topology)/"
+    r"|^include/mori/core/|^(src|include/mori)/collective/|^python/mori/(jit/config\.py|ccl/)"
     r"|^(setup\.py|pyproject\.toml|CMakeLists\.txt)$|^cmake/|^docker/|^3rdparty/"
     r"|^\.github/workflows/ci\.yml$|^\.github/workflows/ci-scope\.yml$"
     r"|^\.github/scripts/ci_scope\.py$|^tools/run_internode_test\.sh$"
@@ -130,7 +136,10 @@ def gh_lines(*args):
 
 def changed_files(repo, pr):
     return gh_lines(
-        "--paginate", f"repos/{repo}/pulls/{pr}/files", "--jq", ".[].filename"
+        "--paginate",
+        f"repos/{repo}/pulls/{pr}/files",
+        "--jq",
+        ".[] | .filename, (.previous_filename // empty)",
     )
 
 
@@ -155,20 +164,28 @@ def wait_for_precommit(repo, sha, appear_s=300, finish_s=1200):
         time.sleep(20)
 
 
+def live_labels(env):
+    """The PR's labels now; a re-run replays the original event's payload."""
+    try:
+        return set(
+            gh_lines(
+                f"repos/{env['REPO']}/issues/{env['PR_NUMBER']}/labels",
+                "--jq",
+                ".[].name",
+            )
+        )
+    except subprocess.CalledProcessError:
+        return set(json.loads(env.get("PR_LABELS") or "[]"))
+
+
 def decide(env):
     event, action = env.get("EVENT_NAME", ""), env.get("EVENT_ACTION", "")
-    labels = set(json.loads(env.get("PR_LABELS") or "[]"))
     if event != "pull_request":
         return dict.fromkeys(LANES, True), f"{event} event runs everything"
-    if action == "labeled":
-        label = env.get("LABEL_NAME", "")
-        if label == "ci:full":
-            return dict.fromkeys(LANES, True), "ci:full label added"
-        if label == "ci:mi300x":
-            return {
-                **dict.fromkeys(LANES, False),
-                "mi300x": True,
-            }, "ci:mi300x label added"
+    labels = live_labels(env)
+    label = env.get("LABEL_NAME", "")
+    first_attempt = env.get("GITHUB_RUN_ATTEMPT", "1") == "1"
+    if action == "labeled" and first_attempt and label not in ("ci:full", "ci:mi300x"):
         return dict.fromkeys(LANES, False), f"label '{label}' needs no CI"
     if env.get("PR_DRAFT") == "true" and "ci:full" not in labels:
         return (

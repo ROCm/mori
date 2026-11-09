@@ -14,8 +14,9 @@ permissions:
   checks: read  # ci-scope waits for pre-commit
 
 concurrency:
-  # A labeled run gets its own group, so adding a label does not cancel the PR's run.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && format('-{0}', github.event.label.name) || '' }}
+  # ci:full and ci:mi300x runs replace the PR's run with a superset; any other
+  # label gets its own group, so adding it does not cancel the PR's run.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && github.event.label.name != 'ci:mi300x' && format('-{0}', github.event.label.name) || '' }}
   cancel-in-progress: true
 
 env:
@@ -116,6 +117,12 @@ jobs:
           $CT exec $CONTAINER bash -c \
             "cd $GITHUB_WORKSPACE && python tools/verify_install.py"
 
+
+      - name: Verify the install without FlyDSL
+        # The only check that the hip EP backend registers without FlyDSL, as in a
+        # plain wheel install, for PRs that do not run ci.yml's build job.
+        run: |
+          $CT exec $CONTAINER bash -c "cd $GITHUB_WORKSPACE && python -c \"import sys, runpy; sys.modules['flydsl'] = None; runpy.run_path('tools/verify_install.py', run_name='__main__')\""
       - name: Check internode arena region invariants
         run: |
           # Pure function of the config: no GPU, no process group, no RDMA, so it
@@ -560,7 +567,8 @@ jobs:
     name: CCO internode test (${{ matrix.platform }})
     # Serialised behind the single-node job rather than run beside it: both want
     # all 8 GPUs and the same NICs on node1.
-    needs: [scope, cco-unit-test]
+    # Not on cco-unit-test: that runs on another runner.
+    needs: scope
     if: needs.scope.outputs.cco == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:

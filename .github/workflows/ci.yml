@@ -30,8 +30,9 @@ permissions:
   checks: read  # ci-scope waits for pre-commit
 
 concurrency:
-  # A labeled run gets its own group, so adding a label does not cancel the PR's run.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && format('-{0}', github.event.label.name) || '' }}
+  # ci:full and ci:mi300x runs replace the PR's run with a superset; any other
+  # label gets its own group, so adding it does not cancel the PR's run.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && github.event.label.name != 'ci:mi300x' && format('-{0}', github.event.label.name) || '' }}
   cancel-in-progress: true
 
 env:
@@ -49,7 +50,7 @@ jobs:
   build:
     name: mori build (${{ matrix.platform }})
     needs: scope
-    if: needs.scope.outputs.mori == 'true' || needs.scope.outputs.umbp == 'true'
+    if: needs.scope.outputs.mori == 'true' || needs.scope.outputs.umbp == 'true' || needs.scope.outputs.cco == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -61,7 +62,7 @@ jobs:
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
     timeout-minutes: 15
-    steps: &build-steps
+    steps:
       - name: Fix workspace permissions
         run: |
           # Docker pytest/pip runs as root; stale root-owned files break actions/checkout cleanup.
@@ -103,8 +104,10 @@ jobs:
       - name: Build and install mori (BUILD_CCO_SDMA=OFF)
         run: $CT exec $CONTAINER bash -c "BUILD_CCO_SDMA=OFF pip install ."
 
-      - name: Build and install mori (with examples)
-        run: $CT exec $CONTAINER bash -c "BUILD_EXAMPLES=ON pip install ."
+      # KIWI (MI300X only at run time) also builds for gfx950, so every PR that
+      # builds here compile-checks it.
+      - name: Build and install mori (with examples and KIWI)
+        run: $CT exec $CONTAINER bash -c "BUILD_EXAMPLES=ON BUILD_OPS_KIWI=ON pip install ."
 
       - name: Verify installation
         # Not a bare `import mori`: the native extensions are skipped with a
@@ -119,20 +122,6 @@ jobs:
           $CT rm -f $CONTAINER || true
           $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
-
-  build-mi300x:
-    name: mori build (${{ matrix.platform }})
-    needs: scope
-    if: needs.scope.outputs.mi300x == 'true'
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: MI300X_MLX
-            runner: [self-hosted, 300_mlx_p19_29]
-    timeout-minutes: 15
-    steps: *build-steps
 
   intranode-test:
     name: mori intranode test (${{ matrix.platform }})
@@ -487,7 +476,7 @@ jobs:
 
   intranode-test-mi300x:
     name: mori intranode test (${{ matrix.platform }})
-    needs: [scope, build-mi300x]
+    needs: scope
     if: needs.scope.outputs.mi300x == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -803,7 +792,8 @@ jobs:
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
-    needs: [scope, build]
+    # Not on build: that runs on another runner, and this job builds mori itself.
+    needs: scope
     if: needs.scope.outputs.mori == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -1153,9 +1143,9 @@ jobs:
             "$CT exec $CONTAINER bash -c 'pkill -9 -f \"[t]ests\\.python\\.io\\.benchmark\" 2>/dev/null || true; pkill -9 -f \"[t]est_dispatch_combine_internode\" 2>/dev/null || true; sleep 2'"
 
       - name: MORI-EP internode normal kernel bench
-        # A PR gets no performance signal from this on a shared runner, and the
-        # nightly runs the same sweep with its perf upload; main still runs it.
-        if: github.event_name != 'pull_request'
+        # No performance signal on a shared runner, and the nightly runs the same
+        # sweep with its perf upload; workflow_dispatch and ci:full still run it.
+        if: (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29140
@@ -1183,8 +1173,8 @@ jobs:
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29160
-          if [ "${{ github.event_name }}" = pull_request ]; then
-            # One point per kernel on a PR; main and the nightly run the full sweep.
+          if [ "${{ (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && 'full' || 'pr' }}" = pr ]; then
+            # One point per kernel; the nightly, workflow_dispatch and ci:full run the full sweep.
             POINTS="v1:4096 v1_ll:128"
           else
             POINTS=$(for k in v1 v1_ll; do for t in 64 128 1024 2048 4096; do printf '%s:%s ' $k $t; done; done)
@@ -1382,7 +1372,7 @@ jobs:
 
   internode-test-mi300x:
     name: mori internode test (${{ matrix.platform }})
-    needs: [scope, build-mi300x]
+    needs: scope
     if: needs.scope.outputs.mi300x == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -1478,7 +1468,7 @@ jobs:
     # One check that is green when every lane the scope picked passed; a lane
     # the scope skipped counts as passed.
     if: always()
-    needs: [scope, build, build-mi300x, intranode-test, intranode-test-mi300x, intranode-test-rocm10, jax-intranode-test, umbp-unit-test, internode-test, internode-test-mi300x]
+    needs: [scope, build, intranode-test, intranode-test-mi300x, intranode-test-rocm10, jax-intranode-test, umbp-unit-test, internode-test, internode-test-mi300x]
     runs-on: ubuntu-latest
     steps:
       - name: Check lane results

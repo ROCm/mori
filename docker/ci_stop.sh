@@ -26,9 +26,16 @@ echo "=== [ci_stop] gracefully stopping '$CONTAINER' ==="
 "$CT" exec "$CONTAINER" bash -c '
   pkill -INT -f "mpirun|orted|torchrun|[[:space:]]python[0-9.]*[[:space:]]|/build/tests/|/build/examples/|/build/benchmark/|pytest" 2>/dev/null || true
 ' 2>/dev/null || true
-sleep 5
+# Wait for the interrupted workload to exit, then stop. PID 1 (sleep infinity)
+# ignores SIGTERM, so a plain stop always waited out the whole timeout.
+for _ in $(seq "$STOP_TIMEOUT"); do
+  left=$("$CT" exec "$CONTAINER" ps -eo pid=,args= 2>/dev/null |
+    awk '$1 != 1 && !/sleep infinity/ && !/ps -eo/' | wc -l)
+  [ "${left:-0}" -eq 0 ] && break
+  sleep 1
+done
 
-"$CT" stop --timeout "$STOP_TIMEOUT" "$CONTAINER" 2>/dev/null || true
+"$CT" stop --timeout 5 "$CONTAINER" 2>/dev/null || true
 "$CT" rm -f "$CONTAINER" 2>/dev/null || true
 
 echo "=== [ci_stop] teardown of '$CONTAINER' complete ==="
