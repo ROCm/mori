@@ -460,8 +460,10 @@ static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
 // Warn when the kernel lacks the dma-buf options a peer window import needs: without
 // them the import is pinned in system memory instead of mapped peer-to-peer, and KFD
 // may keep every rank's queues evicted (ROCm/mori#917). Reads a plain-text kernel
-// config only (no zlib here for /proc/config.gz), so a host that exposes nothing else
-// stays silent. The config is a proxy for the amdgpu driver, hence a warning.
+// config (no zlib here for /proc/config.gz); without one (typical in a container) the
+// symbols in /proc/kallsyms still tell CONFIG_PCI_P2PDMA, which builds p2pdma.c.
+// CONFIG_DMABUF_MOVE_NOTIFY leaves no symbol. The kernel is a proxy for the amdgpu
+// driver, hence a warning.
 static void CcoWarnIfNoDmabufP2P() {
   struct utsname u;
   if (uname(&u) != 0) return;
@@ -485,6 +487,27 @@ static void CcoWarnIfNoDmabufP2P() {
           moveNotify ? "" : "CONFIG_DMABUF_MOVE_NOTIFY");
     }
     return;
+  }
+
+  FILE* f = fopen("/proc/kallsyms", "r");
+  if (!f) return;
+  auto endsWith = [](const char* line, const char* sym) {
+    size_t n = strlen(line), m = strlen(sym);
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) --n;
+    return n > m && line[n - m - 1] == ' ' && strncmp(line + n - m, sym, m) == 0;
+  };
+  bool listed = false, p2p = false;  // dma_buf_attach is always built: names are listed at all
+  char line[256];
+  while (fgets(line, sizeof(line), f)) {
+    if (endsWith(line, "dma_buf_attach")) listed = true;
+    if (endsWith(line, "pci_p2pdma_distance_many")) p2p = true;
+  }
+  fclose(f);
+  if (listed && !p2p) {
+    MORI_SHMEM_WARN(
+        "ccoCommCreate: kernel {} lacks CONFIG_PCI_P2PDMA (from /proc/kallsyms) — peer window "
+        "imports may be pinned in system memory and leave KFD queues evicted (ROCm/mori#917)",
+        rel);
   }
 }
 

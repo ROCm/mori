@@ -1286,7 +1286,20 @@ check_kernel_p2p_dmabuf() {
         done
     fi
     if [[ -z "$text" ]]; then
-        log_skip "kernel config not readable (no /proc/config.gz, /boot/config-$(uname -r)) — cannot check dma-buf P2P options"
+        # No config (typical in a container). The symbols listed in /proc/kallsyms still
+        # tell CONFIG_PCI_P2PDMA: p2pdma.c is built only with it. CONFIG_DMABUF_MOVE_NOTIFY
+        # leaves no symbol, so it cannot be told this way. dma_buf_attach is always built:
+        # finding it shows that the names are listed at all.
+        if grep -q ' dma_buf_attach$' /proc/kallsyms 2>/dev/null; then
+            if grep -q ' pci_p2pdma_distance_many$' /proc/kallsyms; then
+                log_ok "CONFIG_PCI_P2PDMA=y (from /proc/kallsyms; no kernel config readable)"
+            else
+                log_warn "CONFIG_PCI_P2PDMA is not set (from /proc/kallsyms; no kernel config readable)"
+                log_warn "cco register_window (and so EPv2) may leave KFD queues evicted; rebuild the kernel with CONFIG_PCI_P2PDMA=y (ROCm/mori#917)"
+            fi
+        else
+            log_skip "kernel config and /proc/kallsyms not readable (no /proc/config.gz, /boot/config-$(uname -r)) — cannot check dma-buf P2P options"
+        fi
         return 0
     fi
     for opt in CONFIG_PCI_P2PDMA CONFIG_DMABUF_MOVE_NOTIFY; do
