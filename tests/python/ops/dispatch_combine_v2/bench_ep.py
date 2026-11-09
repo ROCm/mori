@@ -39,6 +39,11 @@ that computes garbage never gets a bandwidth number. That check is deliberately
 one invariant, not a matrix -- test_op.py owns dtypes, quant, scatter, StdMoE,
 scales and recv-cap, across both backends.
 
+GB/s is the rows a rank receives times the row bytes, over that leg's time. The
+bus GB/s counts only the rows a rank sends to another card (switch~), since the
+copy a token makes to its own rank never crosses the switch; ROUTE=noself makes
+the two equal.
+
 Two machine-readable outputs sit alongside the human table. A final JSON line in
 aiter's print_json_table shape carries every point, one row per (backend, mode,
 m), so a parent driver reads results instead of parsing columns. And with
@@ -268,12 +273,13 @@ def main():
             .contiguous()
             .to(dev)
         )
-    # Unique destination PEs per token: what an identity expert makes combine sum.
-    U = (
-        torch.zeros(M, world, dtype=torch.bool)
-        .scatter_(1, (idx.cpu().long() // EPR), True)
-        .sum(1)
+    # Destination PEs per token. U, the distinct ones, is what an identity expert
+    # makes combine sum; X leaves this rank out: the copies that cross the switch.
+    hit = torch.zeros(M, world, dtype=torch.bool).scatter_(
+        1, (idx.cpu().long() // EPR), True
     )
+    U = hit.sum(1)
+    X = U - hit[:, rank].long()
 
     def gather_all(t):
         parts = [torch.empty_like(t.cpu()) for _ in range(world)]
@@ -1068,31 +1074,35 @@ def main():
                     capture_pair if mode == "graph" else eager_legs,
                     eager_legs,
                 )
-                got = torch.tensor([d_us, c_us, float(total)], dtype=torch.float64)
+                got = torch.tensor(
+                    [d_us, c_us, float(total), float(X[:ct].sum())],
+                    dtype=torch.float64,
+                )
                 dist.all_reduce(got)
                 n = world
                 d_us_m, c_us_m = float(got[0]) / n, float(got[1]) / n
                 recv_m = float(got[2]) / n
+                switch_m = float(got[3]) / n
                 # Bytes off one rank over that leg's time, BOTH cross-rank means,
                 # so the reported bandwidth follows from the recv_tokens and us
                 # this same row reports. Mixing a local byte count with a mean
                 # time gave a row whose columns did not agree with each other,
                 # and recv counts vary between ranks with the routing. The legs
                 # differ whenever dispatch is narrower than combine.
-                d_bw = (
-                    recv_m
-                    * (HIDDEN * _DISP_NBYTES + SCALE_DIM * SCALE_TS)
-                    / (1000**3)
-                    / (d_us_m / 1e6)
-                )
+                d_row = HIDDEN * _DISP_NBYTES + SCALE_DIM * SCALE_TS
+                d_bw = recv_m * d_row / (1000**3) / (d_us_m / 1e6)
                 c_row = _PUSH_WIRE if _PUSH else HIDDEN * 2
                 c_bw = recv_m * c_row / (1000**3) / (c_us_m / 1e6)
+                d_bus = switch_m * d_row / (1000**3) / (d_us_m / 1e6)
+                c_bus = switch_m * c_row / (1000**3) / (c_us_m / 1e6)
                 if rank == 0:
                     print(
                         f"  ct={ct:<5d} [{name}/{mode}] "
                         f"dispatch {got[0]/n:7.1f} us ({d_bw:6.1f} GB/s)  "
                         f"combine {got[1]/n:7.1f} us ({c_bw:6.1f} GB/s)  "
-                        f"pair {(got[0]+got[1])/n:7.1f} us  recv~{got[2]/n:.0f}",
+                        f"pair {(got[0]+got[1])/n:7.1f} us  recv~{got[2]/n:.0f}  "
+                        f"bus dispatch {d_bus:6.1f} GB/s combine {c_bus:6.1f} GB/s "
+                        f"switch~{switch_m:.0f}",
                         flush=True,
                     )
                 lockstep()
@@ -1114,6 +1124,9 @@ def main():
                             pair_us=round(d_us_m + c_us_m, 2),
                             dispatch_gbps=round(d_bw, 1),
                             combine_gbps=round(c_bw, 1),
+                            switch_tokens=round(switch_m),
+                            dispatch_bus_gbps=round(d_bus, 1),
+                            combine_bus_gbps=round(c_bus, 1),
                             verified=VERIFY_SCOPE,
                             **clocks(smi),
                         )
