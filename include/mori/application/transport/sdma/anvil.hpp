@@ -45,20 +45,54 @@
 
 namespace anvil {
 
+// What the host producer of a private queue needs to drive it: the ring, the
+// hardware read/write pointers and doorbell (libhsakmt's, host-mapped), and the
+// GPU's HDP flush register. The host counterpart of SdmaQueueDeviceHandle: a queue
+// is driven through one or the other, never both. The ring is VRAM behind the BAR,
+// so host packet stores reach the engine only after an HDP flush; hdpFlush is null
+// if the GPU exposes none.
+struct SdmaQueueHostHandle {
+  uint32_t* ring;
+  uint64_t ringBytes;
+  volatile uint64_t* rptr;
+  volatile uint64_t* wptr;
+  volatile uint64_t* doorbell;
+  volatile uint32_t* hdpFlush;
+  uint32_t engineId;
+};
+
 class SdmaQueue {
  public:
   // hsakmtNodeId is libhsakmt's node id, not the sysfs one (see connect()).
   SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId);
   ~SdmaQueue();
 
+  SdmaQueue(const SdmaQueue&) = delete;
+  SdmaQueue& operator=(const SdmaQueue&) = delete;
+
+  // A private queue: no device code can post to it (no device handle), and its ring
+  // is ringBytes (a power of two, at least one page). Returns null if KFD refuses the
+  // queue (e.g. the engine's slots are taken), so callers can fail without exiting.
+  static std::unique_ptr<SdmaQueue> CreatePrivate(uint32_t hsakmtNodeId, uint32_t engineId,
+                                                  uint64_t ringBytes, volatile uint32_t* hdpFlush);
+
+  // Null for a private queue.
   SdmaQueueDeviceHandle* deviceHandle() const;
+  // For a private queue's single host producer; a shared queue belongs to its device
+  // posters. The pointers stay valid only while this queue lives.
+  SdmaQueueHostHandle hostHandle() const;
 
  private:
-  uint64_t* cachedWptr_;
-  uint64_t* committedWptr_;
-  void* queueBuffer_;
-  HsaQueueResource queue_;
-  SdmaQueueDeviceHandle* deviceHandle_;
+  SdmaQueue() = default;
+
+  uint64_t* cachedWptr_{nullptr};
+  uint64_t* committedWptr_{nullptr};
+  void* queueBuffer_{nullptr};
+  uint64_t ringBytes_{SDMA_QUEUE_SIZE};
+  uint32_t engineId_{0};
+  volatile uint32_t* hdpFlush_{nullptr};
+  HsaQueueResource queue_{};
+  SdmaQueueDeviceHandle* deviceHandle_{nullptr};
 };
 
 class AnvilLib {
@@ -85,6 +119,16 @@ class AnvilLib {
 
   // Get the SDMA queue for a given src/dst node pair and channel index.
   SdmaQueue* getSdmaQueue(int srcNode, int dstNode, int channelIdx = 0);
+
+  // A private queue on the engine connect() would give channel 0 of this pair,
+  // moved by engineOffset within that engine's class (general or xGMI); 0 keeps it.
+  // Owned by the caller and never shared: it is not one of the pair's channels.
+  // Offsets are accepted on every arch here; callers decide where they are safe to
+  // use. Null if the offset is negative or lands on an odd engine on MI308X (fused
+  // off there), or if KFD refuses the queue; like connect(), exits if the node has
+  // no libhsakmt id.
+  std::unique_ptr<SdmaQueue> createPrivateQueue(int srcNode, int dstNode, int engineOffset = 0,
+                                                uint64_t ringBytes = SDMA_QUEUE_SIZE);
 
   // Map a HIP device ordinal to its KFD sysfs node id. For single-process callers
   // (e.g. the examples) that only have HIP device ids; multi-process collectives
@@ -122,6 +166,9 @@ class AnvilLib {
   int getOamId(int node);
 
   int getSdmaEngineId(int srcNode, int dstNode);
+
+  // Engines for the src->dst link, in the order connect() assigns them to channels.
+  std::vector<uint32_t> linkEngines(int srcNode, int dstNode);
 
   // Bitmask of SDMA engine ids KFD recommends for the src->dst xGMI link to
   // reach maximum bandwidth (sysfs recommended_sdma_engine_id_mask). Returns 0

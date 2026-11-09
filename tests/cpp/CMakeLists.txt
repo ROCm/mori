@@ -43,6 +43,11 @@ target_include_directories(test_transport_tcp
 target_include_directories(test_transport_tcp PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_transport_tcp mori_application)
 
+add_executable(test_sdma_private_queue application/test_sdma_private_queue.cpp)
+target_include_directories(test_sdma_private_queue
+                           PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_sdma_private_queue mori_application gtest_main)
+
 add_executable(test_transport_ibverbs application/test_transport_ibverbs.cpp)
 
 target_include_directories(test_transport_ibverbs
