@@ -22,11 +22,11 @@
 //
 // DEVICE ONLY, gfx125x only. Included by the generated TU, never by host.
 //
-// gfx1250 TDM intranode dispatch + combine on cco-LSA, ported from
-// src/ops/dispatch_combine/intranode_1250x.hpp (bf16/fp32 gather path). Same
-// mechanical mapping as the portable body, whose EpPeer/EpLocal/EpWait*/EpFlat*/
-// EpMultiWarpIter helpers are reused; the TDM machinery (amd_gfx1250_TDM.h
-// builtins, the Tdm*/Mori* helpers, the _cusplit_* staging pools) is v1 verbatim.
+// gfx1250 TDM intranode dispatch + combine on cco-LSA (bf16/fp32 gather path).
+// Peer memory is one LSA window plus per-region offsets, as in the portable
+// body, whose EpPeer/EpLocal/EpWait*/EpFlat*/EpMultiWarpIter helpers are
+// reused. The TDM machinery (amd_gfx1250_TDM.h builtins, the Tdm*/Mori*
+// helpers, the _cusplit_* staging pools) is specific to this body.
 //
 // SCOPE: unquantized only. Combine keeps the UseP2PRead PULL + QUAD gather and
 // drops the PUSH/_nop2p and convert paths. Same arena as the portable body; the

@@ -459,8 +459,8 @@ memObj->GetAs<T*>(pe)  →  ccoGetLsaPeerPtr(win, pe, args.offRegion)
 13 个 `SymmMemObjPtr` 塌成一个 window handle + 8 个 offset。生成的 TU 不 include `mori/shmem`，
 所以没有设备全局变量、不需要 per-module init。
 
-gfx125x 的 TDM body 同样是机械移植（`intranode_1250x.hpp` → `ep_intranode_1250x.hpp`）：v1 的 cco 路径
-本来就把每块对称 buffer 从同一个 LSA window 里 bump 分配，和 SymmArena 是同一个内存模型，源码里的
+gfx125x 的 TDM body 同样是机械移植（v1 的 `intranode_1250x.hpp` → `ep_intranode_1250x.hpp`，v1 那份已删除）：
+v1 的 cco 路径（也已删除）本来就把每块对称 buffer 从同一个 LSA window 里 bump 分配，和 SymmArena 是同一个内存模型，源码里的
 `shmem` 命名空间只是那层抽象加几个与后端无关的自旋。TDM 那套机器（`amd_gfx1250_TDM.h` builtin、
 `_cusplit_*` 设备全局暂存池）原样保留。范围收到 hip 后端能服务的部分：非量化的 TDM dispatch +
 PULL/QUAD gather combine。
