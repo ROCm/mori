@@ -111,6 +111,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
 | `test_routing_snapshot.py` | `dispatch(..., snapshot=True)` handles outlive later dispatches: combine (twice) and replay with an older handle, both backends. `torchrun --standalone --nproc_per_node=2` |
 | `test_ll128_split.py` | an op past the LL128 table's `max_tok` runs small calls on its LL128 plans and the rest on the schedule's: one call sequence crossing `max_tok` both ways, synced (delivery, reverse map, bf16 sum), back to back eager and graph-replayed, and as snapshot handles, each combine equal to the synced one bit for bit. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` |
+| `test_bf16_push_select.py` | a bf16 op with a push-table entry picks its combine per call: one call sequence crossing LL128's `max_tok` and `in_view_pull_max` both ways, each call passing its input as a plain tensor, from `combine_in_view()`, and with weights. Checks which combine ran (only a push lands rows in `push_landing()`), the bf16 sum, the three results equal bit for bit, and back to back eager. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` (or 8) |
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |

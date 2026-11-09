@@ -564,6 +564,15 @@ def main():
             )
         return int(n[0]) + int(n[2])
 
+    def bf16_landing(op):
+        get = getattr(op, "push_landing", None)
+        if get is None:
+            return None
+        try:
+            return get()
+        except ValueError:
+            return None
+
     def prime(op, ct, i_, w_, x_, s_=None):
         """One full pair, untimed. Reads total_recv for the host, builds the buffer
         the timed loop will reuse, and with CHECK verifies the result through that
@@ -586,6 +595,10 @@ def main():
             checked = False
         if checked:  # identity expert: stage the dispatched tokens unchanged
             stage.copy_(op.recv_tokens()[:total].to(stage.dtype))
+        land = bf16_landing(op) if checked else None
+        if land is not None:
+            land.zero_()
+            lockstep()
         if push_checked:
             stage.copy_(push_quant_rows(total, r))
             op.push_landing().zero_()
@@ -597,7 +610,9 @@ def main():
         else:
             buf = stage
         out, outw = op.combine(
-            buf, weights=w_ if checked and not _PUSH else None, routing=r
+            buf,
+            weights=w_ if checked and not _PUSH and land is None else None,
+            routing=r,
         )
         lockstep()
         if dispatch_bad:
@@ -633,6 +648,16 @@ def main():
                 f"[{int(U[:ct].min())},{int(U[:ct].max())}])",
                 flush=True,
             )
+        if land is not None:
+            *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+            lockstep()
+            assert int(total_t.cpu().item()) == total, (
+                int(total_t.cpu().item()),
+                total,
+            )
+            stage.copy_(op.recv_tokens()[:total].to(stage.dtype))
+            _, outw = op.combine(stage, weights=w_, routing=r)
+            lockstep()
         w_ref = wts[:ct].float().cpu()
         ew = U[:ct].view(ct, 1).float() * w_ref
         gw = outw.float().cpu()
