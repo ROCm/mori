@@ -30,6 +30,7 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
     cdef struct ccoIbgdaWin:
         uint32_t* peerRkeys
         uint32_t lkey
+        uint32_t iovaBias
 
     cdef struct ccoWindowDevice:
         char* winBase

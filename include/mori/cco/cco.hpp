@@ -282,20 +282,21 @@ struct ccoWindowTableNode {
 struct ccoIbgdaWin {
   uint32_t* peerRkeys;  // [worldSize]
   uint32_t lkey;
+  uint32_t iovaBias;  // MR iova of window offset 0: the import's data offset (0 otherwise)
 };
 
 struct ccoWindowDevice {
   // LSA flat-VA addressing (intra-node only). winBase is the window's slot in
   // the LSA-sized flat VA reservation. Peer addressing uses LSA rank, not
-  // world rank. Cross-node access goes through ibgdaWin (iova=0 + offset).
-  //   winBase = flatBase + slotOffset
+  // world rank. Cross-node access goes through ibgdaWin (iovaBias + offset).
+  //   winBase = flatBase + slotOffset + dataOffset (nonzero only for imports)
   //   peer_va = winBase + ((uint64_t)peerLsaRank * stride4G << 32) + offset
   //   local   = winBase + ((uint64_t)lsaRank     * stride4G << 32) + offset
   char* winBase;
   uint32_t stride4G;  // perRankSize >> 32 (perRankSize is 4GB-aligned)
   int lsaRank;        // caller's index in the LSA team
 
-  // GDA / IBGDA (iova=0). raddr=dstOff, laddr=srcOff, rkey=peerRkeys[worldRank].
+  // GDA / IBGDA. raddr=dstOff+iovaBias, laddr=srcOff+iovaBias, rkey=peerRkeys[worldRank].
   ccoIbgdaWin ibgdaWin;
 
   // SDMA signal pool lives on ccoDevComm::sdma (per-DevComm, not per-window).
@@ -690,7 +691,7 @@ struct ccoLsaBarrierSession {
 
 // Flat-VA addressing helpers — intra-node (LSA) only. The flat VA covers the
 // LSA team, so peer indexing is by LSA rank. Cross-node access goes through the
-// GDA backend with iova=0 + offset and doesn't need these.
+// GDA backend with iovaBias + offset and doesn't need these.
 __device__ inline void* ccoGetLsaPeerPtr(ccoWindow_t win, int peerLsaRank, size_t offset = 0) {
   return win->winBase + ((static_cast<uint64_t>(peerLsaRank) * win->stride4G) << 32) + offset;
 }
@@ -904,6 +905,8 @@ struct ccoComm {
     bool isFabric{false};
     size_t slotOffset{0};
     size_t size{0};
+    // Key pointer minus the mapping start: nonzero only for an import from inside an allocation.
+    size_t dataOffset{0};
   };
   std::unordered_map<void*, AllocMeta> allocTable;
 
@@ -958,11 +961,14 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** ptr);
 int ccoMemFree(ccoComm* comm, void* ptr);
 // Like ccoMemAlloc, but aliases an EXTERNAL HIP VMM allocation (e.g. a
 // torch.symm_mem buffer) into the flat-VA slot instead of allocating: retains its
-// handle (hipMemRetainAllocationHandle) and maps it. Release via ccoMemFree.
+// handle (hipMemRetainAllocationHandle) and maps it. externalPtr may point inside
+// the allocation (torch >= 2.14 puts the signal pad first); *ptr then aliases the
+// same byte. Release via ccoMemFree.
 int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** ptr);
 
 // ── Phase 2: Window registration (P2P mapping + RDMA MR + SDMA signals + GPU structs) ──
-// Collective: all ranks must call in the same order with the same size.
+// Collective: all ranks must call in the same order with the same size (and, for imports, the
+// same data offset in the allocation).
 // Overload A: internal allocation (= MemAlloc + WindowRegister(ptr))
 int ccoWindowRegister(ccoComm* comm, size_t size, ccoWindow_t* win, void** localPtr);
 // Overload B: register pre-allocated ptr from ccoMemAlloc
