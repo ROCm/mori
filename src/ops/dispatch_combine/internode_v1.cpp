@@ -378,16 +378,8 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
 
     for (int tokenId = chunkStartTokenIdx + laneId; tokenId < chunkEndTokenIdx;
          tokenId += warpSize) {
-      bool shouldSend = false;
-      for (int e = 0; e < config.numExpertPerToken; e++) {
-        int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
-                       config.numExpertPerRank / config.gpuPerNode;
-        if (destNode == i) {
-          shouldSend |= true;
-          args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
-        }
-      }
-
+      // Post before the routing bookkeeping: it does not gate the write, and with a large topk its
+      // load/store chain delayed the post by ~15 us.
       index_t flagSlotId = 0;
       if (laneId == 0) {
         flagSlotId = atomicAdd(args.blockFlagCounter + i, 1);
@@ -408,6 +400,15 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
             args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
             args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
             tokenNum + 1, ChunkSignalOp<NoRdmaAtomics>(), proxyPe, qpId);
+      }
+      bool shouldSend = false;
+      for (int e = 0; e < config.numExpertPerToken; e++) {
+        int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
+                       config.numExpertPerRank / config.gpuPerNode;
+        if (destNode == i) {
+          shouldSend |= true;
+          args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
+        }
       }
       if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
@@ -914,6 +915,111 @@ inline __device__ size_t CombineVecStep(int warpSizeRt) {
          (kCombineVecBytes / sizeof(TokT));
 }
 
+// Every gather source sits on a distinct local rank, so at most this many are non-null.
+constexpr int kMaxGatherSrc = 8;
+
+// Moves a warp's non-null gather sources (one per lane, lanes < topk) to the front of ptrs, in
+// order, and returns how many there are, or -1 when there are more than kMaxGatherSrc. Without this
+// a topk outside WarpAccum's compile-time cases (e.g. 16) falls to WarpAccumDynamic, which issues
+// one peer read at a time.
+template <typename P>
+inline __device__ int CompactGatherSources(P** ptrs, int topk, int laneId) {
+  P* mine = (laneId < topk) ? ptrs[laneId] : nullptr;
+  uint64_t nz = __ballot(mine != nullptr);
+  int n = __popcll(nz);
+  if (n > kMaxGatherSrc) return -1;
+  if (mine != nullptr) ptrs[__popcll(nz & ((1ull << laneId) - 1))] = mine;
+  return n;
+}
+
+// Sums nSrc compacted bf16 sources into dest, issuing every load of a step before any accumulate.
+// Same fp32 accumulation order and conversions as WarpAccum. Sources go 4 at a time and their
+// pointers stay in LDS, and the bf16 halves are unpacked with shifts: the combine kernel is capped
+// at 128 VGPRs, and reading them through a pointer cast put the load buffers on the stack.
+inline __device__ void GatherCompactedBf16(hip_bfloat16* dest, hip_bfloat16* const* srcs, int nSrc,
+                                           size_t nelems) {
+  constexpr int kBatch = 4;
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const size_t vecEnd = (nelems / 8) * 8;
+  for (size_t off = static_cast<size_t>(laneId) * 8; off < vecEnd;
+       off += static_cast<size_t>(warpSize) * 8) {
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) acc[j] = 0.0f;
+#pragma unroll
+    for (int b = 0; b < kMaxGatherSrc; b += kBatch) {
+      if (b < nSrc) {
+        ulong2 v[kBatch];
+#pragma unroll
+        for (int i = 0; i < kBatch; i++) {
+          if (b + i < nSrc) v[i] = core::load<16>(srcs[b + i] + off);
+        }
+#pragma unroll
+        for (int i = 0; i < kBatch; i++) {
+          if (b + i < nSrc) {
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+              acc[j] += __uint_as_float(static_cast<uint32_t>(v[i].x >> (16 * j)) << 16);
+              acc[4 + j] += __uint_as_float(static_cast<uint32_t>(v[i].y >> (16 * j)) << 16);
+            }
+          }
+        }
+      }
+    }
+    ulong2 out;
+    out.x = 0;
+    out.y = 0;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      out.x |= static_cast<uint64_t>(hip_bfloat16(acc[j]).data) << (16 * j);
+      out.y |= static_cast<uint64_t>(hip_bfloat16(acc[4 + j]).data) << (16 * j);
+    }
+    core::store<16>(dest + off, out);
+  }
+  for (size_t off = vecEnd + laneId; off < nelems; off += warpSize) {
+    float acc = 0.0f;
+    for (int i = 0; i < nSrc; i++) acc += float(srcs[i][off]);
+    dest[off] = hip_bfloat16(acc);
+  }
+}
+
+// Per-element fp32 sum of nSrc compacted sources (the token weights), loads first.
+inline __device__ void GatherCompactedF32(float* dest, float* const* srcs, int nSrc, int nelems) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const float* p[kMaxGatherSrc];
+#pragma unroll
+  for (int i = 0; i < kMaxGatherSrc; i++) p[i] = (i < nSrc) ? srcs[i] : nullptr;
+  for (int off = laneId; off < nelems; off += warpSize) {
+    float v[kMaxGatherSrc];
+#pragma unroll
+    for (int i = 0; i < kMaxGatherSrc; i++) v[i] = (p[i] != nullptr) ? p[i][off] : 0.0f;
+    float acc = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kMaxGatherSrc; i++) {
+      if (p[i] != nullptr) acc += v[i];
+    }
+    dest[off] = acc;
+  }
+}
+
+// Gathers one bf16 slice (and, when doWeights, the token's weights) from compacted sources. Returns
+// false, leaving the sources untouched, for other types, unaligned slices or too many sources.
+template <typename TokT>
+inline __device__ bool GatherSliceCompacted(TokT* gdest, TokT** srcPtrs, float* wdest,
+                                            float** srcWeightsPtr, bool doWeights, int topk,
+                                            size_t nelems, bool vecAligned, int laneId) {
+  if constexpr (!std::is_same_v<TokT, hip_bfloat16>) {
+    return false;
+  } else {
+    const int nSrc = vecAligned ? CompactGatherSources(srcPtrs, topk, laneId) : -1;
+    if (nSrc < 0) return false;
+    CompactGatherSources(srcWeightsPtr, topk, laneId);
+    GatherCompactedBf16(gdest, srcPtrs, nSrc, nelems);
+    if (doWeights) GatherCompactedF32(wdest, srcWeightsPtr, nSrc, topk);
+    return true;
+  }
+}
+
 template <typename TokT>
 inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, size_t nelems,
                                      bool vecAligned) {
@@ -1013,13 +1119,17 @@ __forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs<T>
                                 destLocalTokId * config.numExpertPerToken;
       }
     }
-    CombineGather<TokT>(
-        reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes) + hiddenDimOffset, srcPtrs,
-        config.numExpertPerToken, hiddenDimSize, vecAligned);
-    if (args.weightsBuf && (inTokenPartId == mwIter.warpsPerItem - 1)) {
-      core::WarpAccum<float, 4>(
-          reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes + tokHiddenBytes),
-          srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+    TokT* gdest =
+        reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes) + hiddenDimOffset;
+    float* wdest =
+        reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes + tokHiddenBytes);
+    const bool doWeights = args.weightsBuf && (inTokenPartId == mwIter.warpsPerItem - 1);
+    if (!GatherSliceCompacted<TokT>(gdest, srcPtrs, wdest, srcWeightsPtr, doWeights,
+                                    config.numExpertPerToken, hiddenDimSize, vecAligned, laneId)) {
+      CombineGather<TokT>(gdest, srcPtrs, config.numExpertPerToken, hiddenDimSize, vecAligned);
+      if (doWeights)
+        core::WarpAccum<float, 4>(wdest, srcWeightsPtr, nullptr, config.numExpertPerToken,
+                                  config.numExpertPerToken);
     }
   }
 }
@@ -1280,14 +1390,18 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
                                     destLocalTokId * config.numExpertPerToken;
           }
         }
-        CombineGather<TokT>(reinterpret_cast<TokT*>(stagingPtr + globalTokenId * tokCombXferBytes) +
-                                hiddenDimOffset,
-                            srcPtrs, config.numExpertPerToken, hiddenDimSize, vecAligned);
-        if (args.weightsBuf && (inTokenPartId == 0)) {
-          core::WarpAccum<float, 4>(
-              reinterpret_cast<float*>(stagingPtr + globalTokenId * tokCombXferBytes +
-                                       tokHiddenBytes),
-              srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+        TokT* gdest = reinterpret_cast<TokT*>(stagingPtr + globalTokenId * tokCombXferBytes) +
+                      hiddenDimOffset;
+        float* wdest = reinterpret_cast<float*>(stagingPtr + globalTokenId * tokCombXferBytes +
+                                                tokHiddenBytes);
+        const bool doWeights = args.weightsBuf && (inTokenPartId == 0);
+        if (!GatherSliceCompacted<TokT>(gdest, srcPtrs, wdest, srcWeightsPtr, doWeights,
+                                        config.numExpertPerToken, hiddenDimSize, vecAligned,
+                                        laneId)) {
+          CombineGather<TokT>(gdest, srcPtrs, config.numExpertPerToken, hiddenDimSize, vecAligned);
+          if (doWeights)
+            core::WarpAccum<float, 4>(wdest, srcWeightsPtr, nullptr, config.numExpertPerToken,
+                                      config.numExpertPerToken);
         }
       }
 

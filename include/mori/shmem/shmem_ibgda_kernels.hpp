@@ -537,6 +537,19 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */
 /* ---------------------------------------------------------------------------------------------- */
+// Rings the send doorbell once the WQE stores are already fenced at system scope. ionic keeps no
+// doorbell record, so it needs neither the record fence nor the doorbell store's own release.
+template <core::ProviderType PrvdType>
+inline __device__ void RingDoorbellAfterFence(void* dbrAddr, uint64_t dbrVal) {
+  if constexpr (PrvdType == core::ProviderType::PSD) {
+    __hip_atomic_store(reinterpret_cast<uint64_t*>(dbrAddr), dbrVal, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+  } else {
+    __threadfence_system();
+    core::RingDoorbell<PrvdType>(dbrAddr, dbrVal);
+  }
+}
+
 template <core::ProviderType PrvdType>
 inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMemObjPtr dest,
                                                       size_t destOffset,
@@ -687,8 +700,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       } while (db_touched != warp_sq_counter);
 
       core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-      __threadfence_system();
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+      RingDoorbellAfterFence<PrvdType>(wq->dbrAddr, dbr_val);
       __threadfence_system();
 
       __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -867,8 +879,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
     } while (db_touched != warp_sq_counter);
 
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-    __threadfence_system();
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+    RingDoorbellAfterFence<PrvdType>(wq->dbrAddr, dbr_val);
     __threadfence_system();
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -1137,9 +1148,8 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
       } while (db_touched != warp_sq_counter);
 
       core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
-      __threadfence_system();
       // Ring doorbell every iteration (dbr_val comes from PostWrite or signal WQE)
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+      RingDoorbellAfterFence<PrvdType>(wq->dbrAddr, dbr_val);
       __threadfence_system();
 
       __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -1374,8 +1384,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
     } while (db_touched != warp_sq_counter);
 
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-    __threadfence_system();
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+    RingDoorbellAfterFence<PrvdType>(wq->dbrAddr, dbr_val);
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
@@ -1557,8 +1566,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
     } while (db_touched != warp_sq_counter);
 
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-    __threadfence_system();
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+    RingDoorbellAfterFence<PrvdType>(wq->dbrAddr, dbr_val);
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
@@ -1819,8 +1827,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
       } while (db_touched != warp_sq_counter);
 
       core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-      __threadfence_system();
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+      RingDoorbellAfterFence<PrvdType>(wq->dbrAddr, dbr_val);
       __threadfence_system();
 
       __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -2232,8 +2239,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
       } while (db_touched != warp_sq_counter);
 
       core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
-      __threadfence_system();
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+      RingDoorbellAfterFence<PrvdType>(wq->dbrAddr, dbr_val);
       __threadfence_system();
 
       __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -2445,8 +2451,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
     } while (db_touched != warp_sq_counter);
 
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-    __threadfence_system();
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+    RingDoorbellAfterFence<PrvdType>(wq->dbrAddr, dbr_val);
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
@@ -2592,8 +2597,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
     } while (db_touched != warp_sq_counter);
 
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-    __threadfence_system();
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+    RingDoorbellAfterFence<PrvdType>(wq->dbrAddr, dbr_val);
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
@@ -2806,8 +2810,7 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
       } while (db_touched != warp_sq_counter);
 
       core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-      __threadfence_system();
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+      RingDoorbellAfterFence<PrvdType>(wq->dbrAddr, dbr_val);
       __threadfence_system();
 
       __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -3019,8 +3022,7 @@ inline __device__ void ShmemGetMemNbiThreadKernelAddrImpl(void* dest, const void
       } while (db_touched != warp_sq_counter);
 
       core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-      __threadfence_system();
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+      RingDoorbellAfterFence<PrvdType>(wq->dbrAddr, dbr_val);
       __threadfence_system();
 
       __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
