@@ -28,6 +28,8 @@ Run by .github/workflows/ci-scope.yml. Writes these step outputs:
   mi300x  MoRI CI on MI300X: build, intranode, internode (ci.yml)
   umbp    UMBP unit tests (ci.yml)
   cco     CCO CI: cco, EPv2 and the fused GEMM ops (ci_cco.yml)
+  fused   within cco: the fused GEMM + collective steps
+  epv2    within cco: the EPv2 steps and the CCO internode job
   reason  why
 
 Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
@@ -49,7 +51,7 @@ import subprocess
 import sys
 import time
 
-LANES = ("mori", "mi300x", "umbp", "cco")
+LANES = ("mori", "mi300x", "umbp", "cco", "fused", "epv2")
 
 # First match wins; a path that matches nothing is "core" and runs every lane.
 AREAS = [
@@ -69,9 +71,14 @@ AREAS = [
     ("umbp", r"(^|/|_)umbp(/|_|\.|$)|^examples/monitoring/"),
     ("epv2", r"(^|/)dispatch_combine_v2(/|$)|(^|/)jit/v2/"),
     (
-        "cco",
-        r"(^|/|_)cco(/|_|\.|$)|^python/mori/ops/(gemm_ar|gemm_ag|gemm_a2a|ag_gemm|a2a_gemm)/",
+        "fused",
+        r"^python/mori/ops/(gemm_ar|gemm_ag|gemm_a2a|ag_gemm|a2a_gemm)/"
+        r"|^tests/python/cco/(test_)?(gemm_ar|gemm_ag|gemm_a2a|ag_gemm|a2a_gemm|flydsl_ar)"
+        r"|^tests/python/cco/kfd_settle\.py$"
+        r"|^benchmark/cco/flydsl/(gemm_ar|gemm_ag|gemm_a2a|ag_gemm|a2a_gemm|ar)/"
+        r"|^examples/cco/python/11_flydsl_mega_moe_sdma/",
     ),
+    ("cco", r"(^|/|_)cco(/|_|\.|$)"),
     ("io", r"(^|/|_)io(/|_|\.|$)"),
     (
         "build",
@@ -94,7 +101,9 @@ MI300X_PATHS = re.compile(
 LANE_AREAS = {
     "mori": {"core", "io", "build", "ci_mori", "ci_shared"},
     "umbp": {"core", "io", "build", "umbp", "ci_mori", "ci_shared"},
-    "cco": {"core", "build", "cco", "epv2", "ci_cco", "ci_shared"},
+    "cco": {"core", "build", "cco", "fused", "epv2", "ci_cco", "ci_shared"},
+    "fused": {"core", "build", "cco", "fused", "ci_cco", "ci_shared"},
+    "epv2": {"core", "build", "cco", "epv2", "ci_cco", "ci_shared"},
 }
 
 
@@ -107,7 +116,7 @@ def area_of(path):
 
 def lanes_for_files(files, labels):
     areas = {area_of(f) for f in files} - {"ignored"}
-    lanes = {lane: bool(areas & LANE_AREAS[lane]) for lane in ("mori", "umbp", "cco")}
+    lanes = {lane: bool(areas & want) for lane, want in LANE_AREAS.items()}
     mi300x_hit = any(MI300X_PATHS.search(f) for f in files)
     lanes["mi300x"] = "ci:mi300x" in labels or (lanes["mori"] and mi300x_hit)
     reason = "changed areas: " + (", ".join(sorted(areas)) or "none that need GPU CI")

@@ -16,6 +16,12 @@ on:
       cco:
         description: CCO CI (cco, EPv2, fused GEMM ops)
         value: ${{ jobs.detect.outputs.cco }}
+      fused:
+        description: Within cco, the fused GEMM + collective steps
+        value: ${{ jobs.detect.outputs.fused }}
+      epv2:
+        description: Within cco, the EPv2 steps and the CCO internode job
+        value: ${{ jobs.detect.outputs.epv2 }}
       reason:
         description: Why these lanes run
         value: ${{ jobs.detect.outputs.reason }}
@@ -31,6 +37,8 @@ jobs:
       mi300x: ${{ steps.scope.outputs.mi300x }}
       umbp: ${{ steps.scope.outputs.umbp }}
       cco: ${{ steps.scope.outputs.cco }}
+      fused: ${{ steps.scope.outputs.fused }}
+      epv2: ${{ steps.scope.outputs.epv2 }}
       reason: ${{ steps.scope.outputs.reason }}
     steps:
       - name: Checkout

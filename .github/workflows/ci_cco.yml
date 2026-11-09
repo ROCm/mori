@@ -245,6 +245,7 @@ jobs:
             timeout 600 python -m pytest -v $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_buffer.py"
 
       - name: Run CCO GEMM+AR numerics (up to 8 ranks)
+        if: needs.scope.outputs.fused == 'true'
         run: |
           # The op ships in mori.ops.gemm_ar, so run pytest from /tmp: from a
           # repo cwd `python/mori/` shadows the install and a packaging miss
@@ -263,6 +264,7 @@ jobs:
               $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
 
       - name: Run CCO GEMM+A2A numerics and the recv-reuse race (8 ranks)
+        if: needs.scope.outputs.fused == 'true'
         run: |
           # From /tmp for the same packaging reason as above. test_gemm_a2a.py
           # is the layout on the CPU; test_gemm_a2a_op.py runs the wrapper on 8
@@ -275,6 +277,7 @@ jobs:
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_a2a_op.py"
 
       - name: Run CCO A2A+GEMM numerics, band counting and the op (8 ranks)
+        if: needs.scope.outputs.fused == 'true'
         run: |
           # From /tmp for the same packaging reason as above. test_a2a_gemm.py
           # is the layout on the CPU, every mode through the benchmark, and the
@@ -286,6 +289,7 @@ jobs:
               $GITHUB_WORKSPACE/tests/python/cco/test_a2a_gemm_op.py"
 
       - name: Run CCO GEMM+AR benchmark (8 ranks, accuracy-gated)
+        if: needs.scope.outputs.fused == 'true'
         run: |
           # Accuracy is a gate (validated + rel_l2); absolute timings are only
           # recorded -- this runner is shared, so a microsecond threshold would
@@ -301,6 +305,7 @@ jobs:
       # tests settle and retry around that (anvil.cpp), the gemm_ar ones do not,
       # so running gemm_ar right after this step fails in hsaKmtCreateQueueExt.
       - name: Run CCO GEMM+AG op and kernel tests (up to 8 ranks)
+        if: needs.scope.outputs.fused == 'true'
         run: |
           $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
             cd /tmp && python -c 'import mori.ops.gemm_ag as g; print(g.__file__)' && \
@@ -312,6 +317,7 @@ jobs:
       # test_ag_gemm.py settles and retries around slow-to-return SDMA queues
       # (anvil.cpp); the gemm_ar tests do not.
       - name: Run CCO AG+GEMM numerics, back to back (up to 8 ranks)
+        if: needs.scope.outputs.fused == 'true'
         run: |
           # From /tmp for the packaging reason above. test_ag_gemm.py drives the
           # kernels through the benchmark: every mode against an fp32 reference
@@ -379,6 +385,7 @@ jobs:
             timeout 600 ctest --output-on-failure -R '^jit_'"
 
       - name: Run JIT v2 Python binding tests (1 rank, outside the repo)
+        if: needs.scope.outputs.epv2 == 'true'
         run: |
           # The ctypes/C-ABI seam: schema-vs-sizeof, request coercion, unknown-field
           # rejection. Single rank -- EpDispatchPlan(world_size=1) needs no communicator.
@@ -393,12 +400,14 @@ jobs:
               $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2/test_jit_binding.py -v"
 
       - name: Run ops-v2 dispatch/combine test (EP8, 8 ranks)
+        if: needs.scope.outputs.epv2 == 'true'
         run: |
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             python -m pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -v"
 
       - name: Run ops-v2 HIP backend (EP8, 8 ranks)
+        if: needs.scope.outputs.epv2 == 'true'
         run: |
           # The step above drives the FlyDSL backend; this one drives the HIP kernels
           # behind the same op. test_op.py reports per-case PASS/FAIL and does not exit
@@ -413,6 +422,7 @@ jobs:
             case \"\$out\" in *PASS*) ;; *) echo 'no PASS line: nothing ran'; exit 1;; esac"
 
       - name: Run ops-v2 HIP backend with per-token scales (EP8, 8 ranks)
+        if: needs.scope.outputs.epv2 == 'true'
         run: |
           # SCALE_DIM>0 turns on the forwarded per-token scale row and makes
           # test_op.py verify it through the routing reverse map (OP-SCALES). It is
@@ -427,6 +437,7 @@ jobs:
             case \"\$out\" in *OP-SCALES*) ;; *) echo 'no OP-SCALES line: scales never ran'; exit 1;; esac"
 
       - name: Run ops-v2 scales on a quantizing wire (fp8 and fp4 dispatch, EP8)
+        if: needs.scope.outputs.epv2 == 'true'
         run: |
           # The step above can only test scales on a BF16 wire: test_op.py gives
           # dispatch and combine one dtype, and the HIP backend refuses an fp8
@@ -452,12 +463,14 @@ jobs:
           done
 
       - name: Run ops-v2 backend parity (FlyDSL vs HIP, EP8)
+        if: needs.scope.outputs.epv2 == 'true'
         run: |
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
 
       - name: Run ops-v2 AsyncLL (EP8, sdma and lsa transports)
+        if: needs.scope.outputs.epv2 == 'true'
         run: |
           # The only CI coverage of the v2 AsyncLL family: ci.yml's async_ll steps
           # run v1's test_dispatch_combine_async_ll.py, which never touches it.
@@ -488,12 +501,14 @@ jobs:
           done
 
       - name: Run ops-v2 routing snapshot handles (EP8, both backends)
+        if: needs.scope.outputs.epv2 == 'true'
         run: |
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             timeout 900 torchrun --standalone --nproc_per_node=8 test_routing_snapshot.py"
 
       - name: Run ops-v2 dispatch/combine bench (EP8 smoke, both backends)
+        if: needs.scope.outputs.epv2 == 'true'
         run: |
           # bench_ep.py gates every point on an identity-expert check and exits
           # non-zero if one fails, so this is a smoke test as well as a bench.
@@ -517,7 +532,7 @@ jobs:
     # Serialised behind the single-node job rather than run beside it: both want
     # all 8 GPUs and the same NICs on node1.
     needs: [scope, cco-unit-test]
-    if: needs.scope.outputs.cco == 'true'
+    if: needs.scope.outputs.epv2 == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
