@@ -298,11 +298,8 @@ def _profiler_defines() -> list[str]:
     return ["-DENABLE_PROFILER"] if is_profiler_enabled() else []
 
 
-# Prefix rather than an enumeration: this tracks the kernel-side #if in
-# src/ops/dispatch_combine/intranode_entry.hpp, which tests the gfx125x arch macros to pick a body,
-# and a new member of that family should not need a second edit here to be recognised. The launch
-# path reads it to size combine's LDS and to pick PUSH vs PULL, both of which have to agree with
-# what the device compiled.
+# Prefix rather than an enumeration, so that a new member of the gfx125x family needs no edit here.
+# EP v2 reads it to pick its default backend.
 _FASTPATH_ARCH_PREFIX = "gfx125"
 _arch_cache: str | None = None
 
@@ -311,8 +308,8 @@ def _target_arch() -> str:
     """The arch the JIT will compile for, or "" when it cannot be determined.
 
     detect_gpu_arch() rather than get_build_config(): the latter also insists on hipcc and the LLVM
-    tools, and this is called from the LAUNCH path (the LDS budget in ops/dispatch_combine.py) where
-    a missing compiler must not raise. Any failure degrades to "", i.e. no fast path, never a crash.
+    tools, and this is called when an op is built (EP v2's default backend), where a missing
+    compiler must not raise. Any failure degrades to "", i.e. no fast path, never a crash.
     """
     global _arch_cache
     if _arch_cache is None:
@@ -330,13 +327,6 @@ def _ocp_fp_defines(arch: str) -> list[str]:
     the fp4_blockwise combine's E2M1 quant/dequant helpers. Without this the helpers fall back to
     slow software bit-manipulation. Only relevant on gfx950; a no-op elsewhere."""
     return ["-DHIP_ENABLE_GFX950_OCP_BUILTINS=1"] if "gfx950" in str(arch) else []
-
-
-def _arch_family_defines(arch: str) -> list[str]:
-    """The host's gfx125x decision (see _FASTPATH_ARCH_PREFIX), so device code can check it."""
-    return (
-        ["-DMORI_HOST_GFX125X=1"] if str(arch).startswith(_FASTPATH_ARCH_PREFIX) else []
-    )
 
 
 def _debuginfo_flags() -> list[str]:
@@ -486,7 +476,6 @@ def _hipcc_genco(
         *_ccqe_defines(),
         *_profiler_defines(),
         *_ocp_fp_defines(cfg.arch),
-        *_arch_family_defines(cfg.arch),
         *_tunable_defines(),
     ]
 

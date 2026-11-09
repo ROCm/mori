@@ -262,7 +262,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   // rank's slowest block has finished, so running them in that order used to cost cbar + cslot
   // where it can cost max(cbar, cslot). Instrumented at 512: cbar 6.60 -> 1.50 and cslot 3.38
   // -> 4.55, i.e. the sum 9.98 became 6.05; isolated A/B was +8.7% at 512 and +1.6% at 4096
-  // on the gfx1250 body (intranode_1250x.hpp lines 811-826).
+  // on the since-removed gfx1250 body.
   //
   // The slot read is against uncached peer memory, so it pays a full fabric round trip even
   // when the slot has long been zero -- issuing it while the grid barrier is still spinning is

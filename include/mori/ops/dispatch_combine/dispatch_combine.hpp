@@ -356,7 +356,7 @@ class EpDispatchCombineHandle {
 
   // CCO backend: when ccoCommPtr != nullptr, symmetric buffers are carved from a
   // cco window (LSA flat-VA) instead of the shmem heap. Lets intra-node EP run on
-  // archs where mori-shmem is unavailable (e.g. gfx1250). ccoAllocs tracks the
+  // archs where mori-shmem is unavailable. ccoAllocs tracks the
   // per-buffer resources so the handle can release them on teardown.
   void* ccoCommPtr{nullptr};
   bool useCcoComm{false};

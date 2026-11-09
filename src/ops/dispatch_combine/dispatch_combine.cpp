@@ -116,15 +116,15 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
     : config(config_) {
   ccoCommPtr = reinterpret_cast<void*>(ccoCommPtr_);
   useCcoComm = (ccoCommPtr != nullptr);
-  // The CCO backend (MORI_EP_COMM=cco, the default on gfx125x) only supports intra-node handles:
+  // The CCO backend (MORI_EP_COMM=cco) only supports intra-node handles:
   // its MallocSymm fills the LSA peer pointers of each symmetric buffer but not the RDMA fields
   // (SymmMemObj::peerPtrs / peerRkeys / lkey) that the cross-node kernels read, so the first
   // cross-node put would fault at address 0 on the GPU. Reject every kernel type here, before
   // anything uses the communicator, so that kernel types added later are rejected too. Cross-node
-  // EP on gfx125x goes through EPv2 (mori.ops.dispatch_combine_v2).
+  // EP goes through EPv2 (mori.ops.dispatch_combine_v2).
   if (useCcoComm && config.worldSize > config.gpuPerNode) {
     throw std::runtime_error(
-        "EpDispatchCombineHandle with the CCO backend (MORI_EP_COMM=cco, the default on gfx125x) "
+        "EpDispatchCombineHandle with the CCO backend (MORI_EP_COMM=cco) "
         "supports intra-node only, but worldSize=" +
         std::to_string(config.worldSize) + " > gpuPerNode=" + std::to_string(config.gpuPerNode) +
         ": its symmetric buffers are not registered for RDMA. Use EPv2 "
