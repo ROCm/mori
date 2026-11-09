@@ -128,6 +128,8 @@ from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchComb
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
+sys.path.insert(0, _HERE)
+from _data import decode_fp4, encode_fp4  # noqa: E402
 
 _DTYPES = {
     "bf16": torch.bfloat16,
@@ -136,6 +138,11 @@ _DTYPES = {
     "fp8_e4m3": torch.float8_e4m3fn,
 }
 _FP8 = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
+# Dispatch only: the op reduces combine in bf16 or fp32. Absent from older torch.
+_FP4 = getattr(torch, "float4_e2m1fn_x2", None)
+if _FP4 is not None:
+    _DTYPES["fp4"] = _FP4
+_DTYPE_NAMES = {dtype: name for name, dtype in _DTYPES.items()}
 
 
 class Dist:
@@ -208,7 +215,12 @@ def _parse_args(argv):
         choices=["uniform", "skewed", "local", "replica"],
     )
     parser.add_argument("--dtype", default="bf16", choices=list(_DTYPES))
-    parser.add_argument("--combine-dtype", default=None, choices=list(_DTYPES))
+    # Unset: the dispatch dtype, or bf16 under an fp4 dispatch.
+    parser.add_argument(
+        "--combine-dtype",
+        default=None,
+        choices=[name for name in _DTYPES if name != "fp4"],
+    )
     parser.add_argument(
         "--quant-type", default="none", choices=["none", "fp8_direct_cast"]
     )
@@ -337,9 +349,9 @@ def _generate_round(rng, cfg, num_tokens, device, dtype, routing="uniform"):
                  distinct routed experts drawn uniformly over every rank's other
                  slots. DeepSeek-V3/R1 at EP16 is 17 experts a rank, topk 9.
     """
-    inp = torch.randn(num_tokens, cfg.hidden_dim, generator=rng, device=device).to(
-        dtype
-    )
+    inp = torch.randn(num_tokens, cfg.hidden_dim, generator=rng, device=device)
+    # fp4 takes the bf16 draw rounded to e2m1, so its routing is the bf16 run's.
+    inp = encode_fp4(inp.to(torch.bfloat16)) if dtype == _FP4 else inp.to(dtype)
     num_experts = cfg.world_size * cfg.num_experts_per_rank
     if routing == "replica":
         routed_per_rank = cfg.num_experts_per_rank - 1
@@ -407,6 +419,20 @@ def _generate_round(rng, cfg, num_tokens, device, dtype, routing="uniform"):
     return inp, idx, wts, scales
 
 
+def _payload_f32(cfg, tensor):
+    """A dispatch payload's values as f32: fp4 decoded, every other dtype cast."""
+    return decode_fp4(tensor, torch.float32) if cfg.is_fp4 else tensor.float()
+
+
+def _combine_input(cfg, dispatched):
+    """What the identity expert hands combine: the dispatched tokens in the combine
+    dtype. The combine kernel reads its input as that type, so converting is the
+    caller's job -- an fp8 dispatch is cast, an fp4 one decoded."""
+    if cfg.is_fp4:
+        return decode_fp4(dispatched, cfg.combine_dtype)
+    return dispatched.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else dispatched
+
+
 class _Golden(NamedTuple):
     unique_pes: torch.Tensor  # (tokens, 1): distinct destination ranks per token
     hidden: torch.Tensor
@@ -435,7 +461,7 @@ def _golden(cfg, args, inp, idx, wts=None):
         .float()
     )
     eps = 3e-1 if (args.quant_type != "none" or cfg.dispatch_dtype in _FP8) else 8e-3
-    source = inp.float()
+    source = _payload_f32(cfg, inp)
     return _Golden(
         unique,
         unique * source,
@@ -456,11 +482,7 @@ def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
     dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
     torch.cuda.synchronize()
     comm.barrier()
-    combine_input = (
-        dispatch_out[0].to(cfg.combine_dtype)
-        if cfg.is_asymmetric_dtype
-        else dispatch_out[0]
-    )
+    combine_input = _combine_input(cfg, dispatch_out[0])
     # AsyncLL is the exception to "always fold here": its combine payload is
     # hidden-only, so the request raises rather than returning a tensor. The
     # hidden check below still runs, which is the half that can be wrong.
@@ -830,10 +852,8 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     torch.cuda.synchronize()
     comm.barrier()
 
-    # The examples harness's _convert_for_combine: the combine leg reads its
-    # input as its own element type, so an asymmetric config has to cast first.
     def convert(tensor):
-        return tensor.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else tensor
+        return _combine_input(cfg, tensor)
 
     combine_weights = wts if args.bench_weights else None
 
@@ -1043,7 +1063,8 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     if dist_handle.rank == 0:
         print(
             f"# BENCH tok={num_tokens} "
-            f"dtype={args.dtype}->{args.combine_dtype or args.dtype} "
+            f"dtype={_DTYPE_NAMES.get(cfg.dispatch_dtype)}->"
+            f"{_DTYPE_NAMES.get(cfg.combine_dtype)} "
             f"hidden={cfg.hidden_dim} topk={cfg.num_experts_per_token} "
             f"kernel={kernel_ran}{'(auto)' if args.kernel_type == 'auto' else ''} "
             f"dispatch={dispatch_mean:.1f}us [{dispatch_low:.1f}/{dispatch_high:.1f}] "
@@ -1409,11 +1430,7 @@ def _stress(op, cfg, dist_handle, device, args, comm):
         if qp_schedule:
             op.set_active_qps(_active_qp_for(qp_schedule, i, cfg, 0))
         dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
-        combine_input = (
-            dispatch_out[0].to(cfg.combine_dtype)
-            if cfg.is_asymmetric_dtype
-            else dispatch_out[0]
-        )
+        combine_input = _combine_input(cfg, dispatch_out[0])
         if qp_schedule:
             op.set_active_qps(_active_qp_for(qp_schedule, i, cfg, 1))
         # None, not wts: v1's soak combines without weights
@@ -1733,11 +1750,10 @@ def _tune(cfg, dist_handle, device, args, comm):
     inp, idx, wts, sc = _generate_round(
         rng, cfg, args.max_tokens, device, cfg.dispatch_dtype, args.routing
     )
-    convert = (
-        (lambda tensor: tensor.to(cfg.combine_dtype))
-        if cfg.is_asymmetric_dtype
-        else (lambda tensor: tensor)
-    )
+
+    def convert(tensor):
+        return _combine_input(cfg, tensor)
+
     combine_weights = wts if args.bench_weights else None
 
     # Only the swept phase varies; the other stays at the shipped value, because
@@ -2088,7 +2104,12 @@ def _save_tuning_row(
     entry = {
         "dtype": dtype_key,
         "num_tokens": args.max_tokens,
-        "hidden_dim": cfg.hidden_dim,
+        # An fp4 dispatch rule is keyed by the packed width, as lookup reads it.
+        "hidden_dim": (
+            cfg.hidden_dim // 2
+            if phase == "dispatch" and cfg.is_fp4
+            else cfg.hidden_dim
+        ),
         "topk": cfg.num_experts_per_token,
         # world_size x this is the model's expert count, which the rule stores
         # as num_experts, so two expert counts at the same (dtype, hidden,
@@ -2177,6 +2198,8 @@ def main(argv):
 
     dtype = _DTYPES[args.dtype]
     combine_dtype = _DTYPES[args.combine_dtype] if args.combine_dtype else None
+    if dtype == _FP4 and combine_dtype is None:
+        combine_dtype = torch.bfloat16
     max_tokens = args.max_tokens
 
     uid = Communicator.get_unique_id() if rank == 0 else None
@@ -2267,9 +2290,7 @@ def main(argv):
             # -> _to_combine_dtype). The combine kernel's T is the combine dtype
             # and it reads inpTokenBuf as T*, so handing it the fp8 dispatch
             # output unconverted reinterprets fp8 bytes as bf16.
-            combine_input = (
-                recv_x.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else recv_x
-            )
+            combine_input = _combine_input(cfg, recv_x)
             if qp_schedule:
                 op.set_active_qps(_active_qp_for(qp_schedule, round_index, cfg, 1))
             # `wts` is a REQUEST for the weight fold, and AsyncLL cannot serve
@@ -2291,7 +2312,7 @@ def main(argv):
             expected_weights = golden.weights.cpu()
             bound = golden.hidden_bound.cpu()
             got = out.float().cpu()
-            input_magnitude = inp.float().cpu().abs()
+            input_magnitude = _payload_f32(cfg, inp).cpu().abs()
             hidden_ok = bool(((got - expected).abs() <= bound).all())
             got_weights = out_w.cpu() if out_w is not None else None
             weights_ok = got_weights is None or bool(
