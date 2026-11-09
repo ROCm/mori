@@ -19,7 +19,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -27,6 +26,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -457,57 +458,24 @@ static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
   return hipSuccess;
 }
 
-// Warn when the kernel lacks the dma-buf options a peer window import needs: without
-// them the import is pinned in system memory instead of mapped peer-to-peer, and KFD
-// may keep every rank's queues evicted (ROCm/mori#917). Reads a plain-text kernel
-// config (no zlib here for /proc/config.gz); without one (typical in a container) the
-// symbols in /proc/kallsyms still tell CONFIG_PCI_P2PDMA, which builds p2pdma.c.
-// CONFIG_DMABUF_MOVE_NOTIFY leaves no symbol. The kernel is a proxy for the amdgpu
-// driver, hence a warning.
+// Warn when the kernel lacks CONFIG_PCI_P2PDMA: a peer window import is then pinned in
+// system memory instead of mapped peer-to-peer, and KFD may keep every rank's queues
+// evicted (ROCm/mori#917). p2pdma.c is built only with that option, so its symbol in
+// /proc/kallsyms ("<addr> <type> <name> [module]") tells, with or without a readable
+// kernel config. dma_buf_attach is always built: seeing it shows the names are listed.
 static void CcoWarnIfNoDmabufP2P() {
-  struct utsname u;
-  if (uname(&u) != 0) return;
-  const std::string rel = u.release;
-  for (const std::string& path :
-       {"/boot/config-" + rel, "/lib/modules/" + rel + "/build/.config"}) {
-    FILE* f = fopen(path.c_str(), "r");
-    if (!f) continue;
-    bool p2p = false, moveNotify = false;
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-      if (!strncmp(line, "CONFIG_PCI_P2PDMA=y", 19)) p2p = true;
-      if (!strncmp(line, "CONFIG_DMABUF_MOVE_NOTIFY=y", 27)) moveNotify = true;
-    }
-    fclose(f);
-    if (!p2p || !moveNotify) {
-      MORI_SHMEM_WARN(
-          "ccoCommCreate: kernel {} lacks {}{}{} — peer window imports may be pinned in system "
-          "memory and leave KFD queues evicted (ROCm/mori#917)",
-          rel, p2p ? "" : "CONFIG_PCI_P2PDMA", (!p2p && !moveNotify) ? " and " : "",
-          moveNotify ? "" : "CONFIG_DMABUF_MOVE_NOTIFY");
-    }
-    return;
+  std::ifstream ksyms("/proc/kallsyms");
+  std::string addr, type, name;
+  bool listed = false, p2p = false;
+  while (!p2p && ksyms >> addr >> type >> name) {
+    ksyms.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    listed |= name == "dma_buf_attach";
+    p2p = name == "pci_p2pdma_distance_many";
   }
-
-  FILE* f = fopen("/proc/kallsyms", "r");
-  if (!f) return;
-  auto endsWith = [](const char* line, const char* sym) {
-    size_t n = strlen(line), m = strlen(sym);
-    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) --n;
-    return n > m && line[n - m - 1] == ' ' && strncmp(line + n - m, sym, m) == 0;
-  };
-  bool listed = false, p2p = false;  // dma_buf_attach is always built: names are listed at all
-  char line[256];
-  while (fgets(line, sizeof(line), f)) {
-    if (endsWith(line, "dma_buf_attach")) listed = true;
-    if (endsWith(line, "pci_p2pdma_distance_many")) p2p = true;
-  }
-  fclose(f);
   if (listed && !p2p) {
     MORI_SHMEM_WARN(
-        "ccoCommCreate: kernel {} lacks CONFIG_PCI_P2PDMA (from /proc/kallsyms) — peer window "
-        "imports may be pinned in system memory and leave KFD queues evicted (ROCm/mori#917)",
-        rel);
+        "ccoCommCreate: kernel lacks CONFIG_PCI_P2PDMA — peer window imports may be pinned in "
+        "system memory and leave KFD queues evicted (ROCm/mori#917)");
   }
 }
 

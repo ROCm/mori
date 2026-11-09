@@ -239,8 +239,7 @@ Before a cross-node run, check the fabric:
 mori check <peer_ip>          # or: tools/env_check.sh <peer_ip>
 ```
 
-Seven steps — kernel dma-buf P2P options (`CONFIG_PCI_P2PDMA`, `CONFIG_DMABUF_MOVE_NOTIFY`; warns
-only, and is skipped when the kernel config is unreadable), NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
+Seven steps — kernel PCI P2PDMA support (`CONFIG_PCI_P2PDMA`, read from `/proc/kallsyms`; warns only), NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
 inter-node bandwidth and latency meshes over every NIC pair, on host memory and
 on GPU memory. Exits non-zero if any check failed, and reports the fabric
 topology, which decides what can run on it.

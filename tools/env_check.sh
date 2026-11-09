@@ -1270,48 +1270,21 @@ dominant_group() {
 
 # check_kernel_p2p_dmabuf
 #   cco windows (every dispatch_combine_v2 EpDispatchCombineOp registers one) are
-#   shared between ranks as dma-bufs. When the kernel lacks these two options, a
-#   peer import is pinned in system memory instead of mapped peer-to-peer, and KFD
-#   may keep every rank's queues evicted (ROCm/mori#917). WARN, not FAIL: the
-#   kernel config is only a proxy for what the amdgpu driver does, and it is
-#   unreadable in most containers (SKIP).
+#   shared between ranks as dma-bufs. Without CONFIG_PCI_P2PDMA a peer import is
+#   pinned in system memory instead of mapped peer-to-peer, and KFD may keep every
+#   rank's queues evicted (ROCm/mori#917). p2pdma.c is built only with that option,
+#   so its symbol in /proc/kallsyms tells, with or without a readable kernel config
+#   (a container has none). dma_buf_attach is always built: finding it shows the
+#   names are listed at all. WARN, not FAIL: the kernel is a proxy for the amdgpu driver.
 check_kernel_p2p_dmabuf() {
-    step "check kernel dma-buf P2P support (cco / EPv2)"
-    local text="" f opt missing=0
-    if [[ -r /proc/config.gz ]]; then
-        text=$(zcat /proc/config.gz 2>/dev/null)
+    step "check kernel PCI P2PDMA support (cco / EPv2)"
+    if ! grep -q ' dma_buf_attach$' /proc/kallsyms 2>/dev/null; then
+        log_skip "/proc/kallsyms not readable — cannot check CONFIG_PCI_P2PDMA"
+    elif grep -q ' pci_p2pdma_distance_many$' /proc/kallsyms; then
+        log_ok "CONFIG_PCI_P2PDMA=y"
     else
-        for f in "/boot/config-$(uname -r)" "/lib/modules/$(uname -r)/build/.config"; do
-            [[ -r "$f" ]] && { text=$(<"$f"); break; }
-        done
+        log_warn "CONFIG_PCI_P2PDMA is not set — cco register_window (and so EPv2) may leave KFD queues evicted; rebuild the kernel with it (ROCm/mori#917)"
     fi
-    if [[ -z "$text" ]]; then
-        # No config (typical in a container). The symbols listed in /proc/kallsyms still
-        # tell CONFIG_PCI_P2PDMA: p2pdma.c is built only with it. CONFIG_DMABUF_MOVE_NOTIFY
-        # leaves no symbol, so it cannot be told this way. dma_buf_attach is always built:
-        # finding it shows that the names are listed at all.
-        if grep -q ' dma_buf_attach$' /proc/kallsyms 2>/dev/null; then
-            if grep -q ' pci_p2pdma_distance_many$' /proc/kallsyms; then
-                log_ok "CONFIG_PCI_P2PDMA=y (from /proc/kallsyms; no kernel config readable)"
-            else
-                log_warn "CONFIG_PCI_P2PDMA is not set (from /proc/kallsyms; no kernel config readable)"
-                log_warn "cco register_window (and so EPv2) may leave KFD queues evicted; rebuild the kernel with CONFIG_PCI_P2PDMA=y (ROCm/mori#917)"
-            fi
-        else
-            log_skip "kernel config and /proc/kallsyms not readable (no /proc/config.gz, /boot/config-$(uname -r)) — cannot check dma-buf P2P options"
-        fi
-        return 0
-    fi
-    for opt in CONFIG_PCI_P2PDMA CONFIG_DMABUF_MOVE_NOTIFY; do
-        if grep -qx "$opt=y" <<<"$text"; then
-            log_ok "$opt=y"
-        else
-            log_warn "$opt is not set"
-            missing=1
-        fi
-    done
-    (( missing )) && log_warn "cco register_window (and so EPv2) may leave KFD queues evicted; rebuild the kernel with both =y (ROCm/mori#917)"
-    return 0
 }
 
 check_versions() {
