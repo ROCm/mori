@@ -515,9 +515,9 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufI
     std::abort();
   }
   MORI_APP_TRACE(
-      "RegisterRdmaMemoryRegionDmabufIova0, addr:{}, size:{}, dmabuf_fd:{}, iova:0, lkey:{}, "
-      "rkey:{}",
-      ptr, size, dmabuf_fd, mr->lkey, mr->rkey);
+      "RegisterRdmaMemoryRegionDmabufIova0, addr:{}, size:{}, dmabuf_fd:{}, dmabuf_offset:{}, "
+      "iova:0, lkey:{}, rkey:{}",
+      ptr, size, dmabuf_fd, dmabuf_offset, mr->lkey, mr->rkey);
   mrPool.insert({ptr, mr});
   application::RdmaMemoryRegion handle;
   handle.addr = 0;
