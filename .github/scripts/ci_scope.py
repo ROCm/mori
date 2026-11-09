@@ -29,13 +29,15 @@ Run by .github/workflows/ci-scope.yml. Writes these step outputs:
   umbp    UMBP unit tests (ci.yml)
   cco     CCO unit test (cco and EPv2) and CCO internode (ci_cco.yml)
   fused   CCO fused GEMM + collective job (ci_cco.yml)
+  full    full internode bench/stress sweeps: workflow_dispatch, or ci:full on a PR
   reason  why
 
 Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
 
   - a draft runs nothing, unless it has the ci:full label;
   - ci:full runs everything; ci:mi300x adds the MI300X lanes to the lanes the
-    changed files pick; labels are read live, so a re-run sees the current ones;
+    changed files pick (only for a caller with MI300X lanes, see HAS_MI300X);
+    labels are read live, so a re-run sees the current ones;
   - adding any other label runs nothing (a re-run of that run is a normal run);
   - otherwise the lanes follow the changed files (rules below), after the
     pre-commit check of the head commit has passed. A rename counts under both
@@ -180,10 +182,13 @@ def live_labels(env):
 
 
 def decide(env):
+    """(lanes, reason, full)."""
     event, action = env.get("EVENT_NAME", ""), env.get("EVENT_ACTION", "")
     if event != "pull_request":
-        return dict.fromkeys(LANES, True), f"{event} event runs everything"
+        full = event == "workflow_dispatch"
+        return dict.fromkeys(LANES, True), f"{event} event runs everything", full
     labels = live_labels(env)
+    full = "ci:full" in labels
     label = env.get("LABEL_NAME", "")
     first_attempt = env.get("GITHUB_RUN_ATTEMPT", "1") == "1"
     # Labels whose first run replaces the PR's run; ci:mi300x only for a caller
@@ -194,20 +199,24 @@ def decide(env):
         else ("ci:full",)
     )
     if action == "labeled" and first_attempt and label not in run_labels:
-        return dict.fromkeys(LANES, False), f"label '{label}' needs no CI"
+        return dict.fromkeys(LANES, False), f"label '{label}' needs no CI", full
     if env.get("PR_DRAFT") == "true" and "ci:full" not in labels:
         return (
             dict.fromkeys(LANES, False),
             "draft PR (add ci:full or mark it ready to run CI)",
+            full,
         )
     precommit = wait_for_precommit(env["REPO"], env["PR_HEAD_SHA"])
     if precommit not in (None, "success"):
         raise SystemExit(
             f"::error::pre-commit is '{precommit}' on {env['PR_HEAD_SHA']}; fix it to run GPU CI"
         )
-    if "ci:full" in labels:
-        return dict.fromkeys(LANES, True), "ci:full label"
-    return lanes_for_files(changed_files(env["REPO"], env["PR_NUMBER"]), labels)
+    if full:
+        return dict.fromkeys(LANES, True), "ci:full label", full
+    lanes, reason = lanes_for_files(
+        changed_files(env["REPO"], env["PR_NUMBER"]), labels
+    )
+    return lanes, reason, full
 
 
 def main():
@@ -227,12 +236,7 @@ def main():
         print(json.dumps({**lanes, "reason": reason}))
         return
 
-    lanes, reason = decide(os.environ)
-    # Full internode bench/stress sweeps: workflow_dispatch, or ci:full on a PR.
-    event = os.environ.get("EVENT_NAME", "")
-    full = event == "workflow_dispatch" or (
-        event == "pull_request" and "ci:full" in live_labels(os.environ)
-    )
+    lanes, reason, full = decide(os.environ)
     with open(os.environ["GITHUB_OUTPUT"], "a") as out:
         for lane in LANES:
             out.write(f"{lane}={str(lanes[lane]).lower()}\n")
