@@ -47,10 +47,21 @@ from torch.distributed.fsdp._fully_shard._all_gather_layout import (
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
 
 _POOLED_RANK_MAJOR = object()
+# FSDP layout contracts before output_metadata was added do not pass it
+_NOT_PASSED = object()
 # Backend instances share SDMA transport state within a process group.
 _LAST_WRITE_EVENTS: WeakKeyDictionary[dist.ProcessGroup, torch.Event] = (
     WeakKeyDictionary()
 )
+
+
+@dataclass(frozen=True)
+class _ParamContiguousSelection:
+    """Per-call metadata for a parameter-contiguous all-gather."""
+
+    split_sizes: torch.Tensor
+    split_offsets: torch.Tensor
+    input_nbytes: int
 
 
 @dataclass
@@ -280,7 +291,7 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
     def __init__(self, comm: "MoriSdmaAllGather") -> None:
         self.comm = self._comm = comm
         self._metadata_key: tuple | None = None
-        self._cached_metadata: tuple[torch.Tensor, torch.Tensor, int] | None = None
+        self._cached_metadata: _ParamContiguousSelection | None = None
 
     def prepare_output(
         self,
@@ -340,22 +351,20 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
             if offset * 4 != input_numel * element_size:
                 raise RuntimeError("MORI zero-copy allgather byte size mismatch")
             # Keep one immutable entry; pending calls may still use an older one.
-            metadata = (
-                torch.tensor(split_sizes_u32, dtype=torch.int64, device=device),
-                torch.tensor(split_offsets_u32, dtype=torch.int64, device=device),
-                input_numel * element_size,
+            metadata = _ParamContiguousSelection(
+                split_sizes=torch.tensor(
+                    split_sizes_u32, dtype=torch.int64, device=device
+                ),
+                split_offsets=torch.tensor(
+                    split_offsets_u32, dtype=torch.int64, device=device
+                ),
+                input_nbytes=input_numel * element_size,
             )
             self._cached_metadata = metadata
             self._metadata_key = key
-        (
-            self._comm._param_contiguous_split_sizes,
-            self._comm._param_contiguous_split_offsets,
-            self._comm._param_contiguous_input_nbytes,
-        ) = metadata
-        return (
-            self._comm._param_contiguous_split_sizes,
-            self._comm._param_contiguous_split_offsets,
-        )
+        # Only for FSDP versions that do not pass output_metadata to the comm
+        self._comm._prepared_selection = metadata
+        return metadata
 
     def finalize_outputs(self, metadata: AllGatherFinalizeMetadata) -> AllGatherOutputs:
         output, params = metadata.all_gather_output, metadata.param_metadata
@@ -498,9 +507,7 @@ class MoriSdmaAllGather(AllGather):
         self._last_use_event: torch.Event | None = None
         self._output_buffer_nbytes = 0
         self._registered_output_ptr: int | None = None
-        self._param_contiguous_split_sizes: torch.Tensor | None = None
-        self._param_contiguous_split_offsets: torch.Tensor | None = None
-        self._param_contiguous_input_nbytes = 0
+        self._prepared_selection: _ParamContiguousSelection | None = None
         self._warned_unaligned = False
         if output_pool is not None:
             output_pool._bind(self, group_key)
@@ -559,7 +566,10 @@ class MoriSdmaAllGather(AllGather):
         input_tensor: torch.Tensor,
         group: dist.ProcessGroup,
         async_op: bool = False,
+        output_metadata: object | None = _NOT_PASSED,
     ) -> Any | None:
+        if output_metadata is _NOT_PASSED:
+            output_metadata = self._prepared_selection
         pool = self._output_pool
         may_have_launched = False
         try:
@@ -589,7 +599,7 @@ class MoriSdmaAllGather(AllGather):
                         output_tensor, input_tensor, group=group, async_op=async_op
                     )
                 return self._call_full_group(
-                    output_tensor, input_tensor, group, async_op
+                    output_tensor, input_tensor, group, async_op, output_metadata
                 )
         except BaseException:
             if may_have_launched and pool is not None:
@@ -604,7 +614,9 @@ class MoriSdmaAllGather(AllGather):
             else:
                 self._clear_prepared_output()
 
-    def _call_full_group(self, output_tensor, input_tensor, group, async_op):
+    def _call_full_group(
+        self, output_tensor, input_tensor, group, async_op, output_metadata
+    ):
         stream = torch.cuda.current_stream(input_tensor.device)
         previous = _LAST_WRITE_EVENTS.get(group)
         if previous is not None and (
@@ -641,13 +653,9 @@ class MoriSdmaAllGather(AllGather):
         self._ensure_output_registered(collective, output_tensor)
         if self._output_pool is None:
             self._wait_for_peer_consumers(collective, group, stream)
-        if self._can_call_param_contiguous(input_tensor):
-            split_sizes = self._param_contiguous_split_sizes
-            split_offsets = self._param_contiguous_split_offsets
-            if split_sizes is None or split_offsets is None:
-                raise RuntimeError(
-                    "MORI param-contiguous allgather metadata is not initialized"
-                )
+        if self._can_call_param_contiguous(input_tensor, output_metadata):
+            split_sizes = output_metadata.split_sizes
+            split_offsets = output_metadata.split_offsets
             # This kernel waits for remote SDMA writes before completing.
             collective.enqueue_param_contiguous(
                 input_tensor,
@@ -703,24 +711,23 @@ class MoriSdmaAllGather(AllGather):
     def _clear_prepared_output(self) -> None:
         """Discard this call's layout selection without changing storage or leases."""
         self._native_fallback = False
-        self._param_contiguous_split_sizes = None
-        self._param_contiguous_split_offsets = None
-        self._param_contiguous_input_nbytes = 0
+        self._prepared_selection = None
 
     def _warn_unaligned_fallback(self, message: str) -> None:
         if not self._warned_unaligned:
             warnings.warn(message, stacklevel=3)
             self._warned_unaligned = True
 
-    def _can_call_param_contiguous(self, input_tensor: torch.Tensor) -> bool:
-        if (
-            self._param_contiguous_split_sizes is None
-            or self._param_contiguous_split_offsets is None
-        ):
+    def _can_call_param_contiguous(
+        self, input_tensor: torch.Tensor, output_metadata: object | None
+    ) -> bool:
+        if not isinstance(output_metadata, _ParamContiguousSelection):
             return False
-        if self._param_contiguous_input_nbytes != _tensor_nbytes(input_tensor):
-            self._clear_prepared_output()
-            return False
+        if output_metadata.input_nbytes != _tensor_nbytes(input_tensor):
+            raise RuntimeError(
+                "MORI param-contiguous allgather input does not match the "
+                "metadata its layout prepared"
+            )
         return True
 
     def _validate_tensors(

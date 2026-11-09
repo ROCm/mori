@@ -107,10 +107,10 @@ def _metadata_cache_case(rank: int, world_size: int) -> None:
 
     first = prepare([1024, 3072], torch.device("cuda"))
     with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")):
-        assert prepare([1024, 3072])[0] is first[0]
+        assert prepare([1024, 3072]).split_sizes is first.split_sizes
     with torch.cuda.device((rank + 1) % world_size):
         other = prepare([1024, 3072], torch.device("cuda"))
-        assert other[0].device.index == (rank + 1) % world_size
+        assert other.split_sizes.device.index == (rank + 1) % world_size
     del first, other
 
     for step in range(4):
@@ -122,7 +122,7 @@ def _metadata_cache_case(rank: int, world_size: int) -> None:
                 torch, "tensor", side_effect=AssertionError("cache miss")
             ):
                 hit = prepare(splits)
-            assert hit[0] is metadata[0] and hit[1] is metadata[1]
+            assert hit is metadata
             output = comm.allocate(
                 (count * world_size,), dtype=torch.float32, device=device
             )

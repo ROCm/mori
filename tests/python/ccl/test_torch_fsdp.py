@@ -139,7 +139,7 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         self.assertIs(copy_in, torch.ops.fsdp.all_gather_copy_in)
         self.assertIsInstance(selected_layout, DefaultAllGatherLayout)
         self.assertIsNone(metadata)
-        self.assertIsNone(comm._param_contiguous_split_sizes)
+        self.assertIsNone(comm._prepared_selection)
 
     def test_uses_safe_base_copy_in(self):
         comm = MoriSdmaAllGather()
@@ -163,23 +163,22 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         assert layout is not None
         metadata = _prepare(layout, [2, 4], dtype=torch.bfloat16)
         self.assertIsNotNone(metadata)
-        split_sizes, split_offsets = metadata
-        self.assertEqual(split_sizes.tolist(), [1, 2])
-        self.assertEqual(split_offsets.tolist(), [0, 1])
+        self.assertEqual(metadata.split_sizes.tolist(), [1, 2])
+        self.assertEqual(metadata.split_offsets.tolist(), [0, 1])
+        self.assertEqual(metadata.input_nbytes, 12)
 
     def test_metadata_cache_reuses_after_release(self) -> None:
         comm = MoriSdmaAllGather()
         first = _prepare(comm.layout, [2, 4], dtype=torch.bfloat16)
         comm.release_output()
-        self.assertIsNone(comm._param_contiguous_split_sizes)
+        self.assertIsNone(comm._prepared_selection)
         with (
             patch.object(torch, "tensor", side_effect=AssertionError("cache miss")),
             patch.object(torch, "empty", side_effect=AssertionError("allocation")),
         ):
             second = _prepare(comm.layout, [2, 4], dtype=torch.bfloat16)
-        self.assertIs(first[0], second[0])
-        self.assertIs(first[1], second[1])
-        self.assertEqual(comm._param_contiguous_input_nbytes, 12)
+        self.assertIs(first, second)
+        self.assertIs(comm._prepared_selection, second)
 
     def test_metadata_cache_invalidates_complete_key(self) -> None:
         cases = [
@@ -204,10 +203,10 @@ class TestMoriSdmaAllGather(unittest.TestCase):
                         device=device,
                     )
                 self.assertEqual(create.call_count, 2)
-                self.assertIsNot(first[0], second[0])
-                self.assertEqual(second[0].device, device)
-                self.assertEqual(first[0].tolist(), [2, 4])
-                self.assertEqual(first[1].tolist(), [0, 2])
+                self.assertIsNot(first.split_sizes, second.split_sizes)
+                self.assertEqual(second.split_sizes.device, device)
+                self.assertEqual(first.split_sizes.tolist(), [2, 4])
+                self.assertEqual(first.split_offsets.tolist(), [0, 2])
 
     def test_metadata_cache_does_not_bypass_fallback(self) -> None:
         comm = MoriSdmaAllGather()
@@ -215,7 +214,7 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         self.assertIsNone(
             _prepare(comm.layout, [2, 4], dtype=torch.bfloat16, eligible=False)
         )
-        self.assertIsNone(comm._param_contiguous_split_sizes)
+        self.assertIsNone(comm._prepared_selection)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             self.assertIsNone(_prepare(comm.layout, [1, 5], dtype=torch.bfloat16))
@@ -223,7 +222,7 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         self.assertIn("4-byte aligned", str(caught[0].message))
         with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")):
             restored = _prepare(comm.layout, [2, 4], dtype=torch.bfloat16)
-        self.assertIs(restored[0], first[0])
+        self.assertIs(restored, first)
 
     def test_metadata_cache_rejects_invalid_input_size(self) -> None:
         comm = MoriSdmaAllGather()
@@ -240,14 +239,14 @@ class TestMoriSdmaAllGather(unittest.TestCase):
                     can_use_param_contiguous_output=True,
                 )
             )
-        self.assertIsNone(comm._param_contiguous_split_sizes)
+        self.assertIsNone(comm._prepared_selection)
 
     def test_metadata_cache_retains_only_latest_entry(self) -> None:
         comm = MoriSdmaAllGather()
         references = []
         for size in range(2, 34, 2):
             metadata = _prepare(comm.layout, [size, 4])
-            references.append(weakref.ref(metadata[0]))
+            references.append(weakref.ref(metadata.split_sizes))
         del metadata
         comm.release_output()
         self.assertTrue(all(reference() is None for reference in references[:-1]))
@@ -263,11 +262,10 @@ class TestMoriSdmaAllGather(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "upload"),
         ):
             _prepare(comm.layout, [4, 2])
-        self.assertIsNone(comm._param_contiguous_split_sizes)
+        self.assertIsNone(comm._prepared_selection)
         with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")):
             restored = _prepare(comm.layout, [2, 4])
-        self.assertIs(restored[0], first[0])
-        self.assertIs(restored[1], first[1])
+        self.assertIs(restored, first)
 
     def test_metadata_cache_survives_failed_call_without_selecting_layout(self) -> None:
         comm = MoriSdmaAllGather()
@@ -277,10 +275,10 @@ class TestMoriSdmaAllGather(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "input"),
         ):
             comm(torch.empty(12), torch.empty(6), MagicMock())
-        self.assertFalse(comm._can_call_param_contiguous(torch.empty(6)))
+        self.assertIsNone(comm._prepared_selection)
         with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")):
             restored = _prepare(comm.layout, [2, 4])
-        self.assertIs(restored[0], first[0])
+        self.assertIs(restored, first)
 
     def test_unaligned_split_warns_once_and_falls_back(self) -> None:
         comm = MoriSdmaAllGather()
@@ -301,20 +299,21 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         assert layout is not None
         _prepare(layout, [1])
         self.assertIsNone(_prepare(layout, [1], eligible=False))
-        self.assertFalse(comm._can_call_param_contiguous(torch.empty(1)))
+        self.assertIsNone(comm._prepared_selection)
 
     def test_metadata_validation_does_not_read_gpu_values(self) -> None:
         comm = MoriSdmaAllGather()
-        _prepare(comm.layout, [2, 4], dtype=torch.bfloat16)
+        metadata = _prepare(comm.layout, [2, 4], dtype=torch.bfloat16)
         with patch.object(torch.Tensor, "item", side_effect=AssertionError):
             self.assertTrue(
-                comm._can_call_param_contiguous(torch.empty(6, dtype=torch.bfloat16))
+                comm._can_call_param_contiguous(
+                    torch.empty(6, dtype=torch.bfloat16), metadata
+                )
             )
-            self.assertFalse(
-                comm._can_call_param_contiguous(torch.empty(7, dtype=torch.bfloat16))
-            )
-        self.assertIsNone(comm._param_contiguous_split_sizes)
-        self.assertEqual(comm._param_contiguous_input_nbytes, 0)
+            with self.assertRaisesRegex(RuntimeError, "does not match the metadata"):
+                comm._can_call_param_contiguous(
+                    torch.empty(7, dtype=torch.bfloat16), metadata
+                )
 
     def test_allocate_reuses_persistent_output(self) -> None:
         comm = MoriSdmaAllGather()
@@ -485,15 +484,13 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         ):
             comm(output, input, group)
             self.assertEqual(output.tolist(), [0, 1, 0, 1, 2, 3, 4, 5, 2, 3, 4, 5])
-            self.assertIsNone(comm._param_contiguous_split_sizes)
-            self.assertIsNone(comm._param_contiguous_split_offsets)
-            self.assertEqual(comm._param_contiguous_input_nbytes, 0)
+            self.assertIsNone(comm._prepared_selection)
             # A custom input hook may return rank-major inputs without prepare.
             comm(output, input + 10, group)
         collective.enqueue_param_contiguous.assert_called_once()
         collective.enqueue.assert_called_once()
         self.assertEqual(output.tolist(), (input + 10).repeat(2).tolist())
-        self.assertEqual(metadata[0].tolist(), [2, 4])
+        self.assertEqual(metadata.split_sizes.tolist(), [2, 4])
 
     def test_async_work_orders_each_consumer_after_completion(self) -> None:
         comm = MoriSdmaAllGather(zero_copy_output=False)
@@ -926,7 +923,7 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         self.assertIsNone(pool._slots[0].owner)
         with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")):
             restored = _prepare(comm.layout, [2])
-        self.assertIs(restored[0], cached[0])
+        self.assertIs(restored, cached)
         self.assertFalse(comm._native_fallback)
 
     def test_unprepared_full_gather_after_subgroup_uses_pool(self):
@@ -966,7 +963,7 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "invalid input"),
         ):
             comm(output, torch.ones(6), pool._group)
-        self.assertFalse(comm._can_call_param_contiguous(torch.ones(6)))
+        self.assertIsNone(comm._prepared_selection)
         self.assertIsNone(pool._slots[0].owner)
         self.assertFalse(pool._failed)
 
@@ -1078,13 +1075,50 @@ class TestMoriFsdpOwnedLayout(unittest.TestCase):
 
     def test_base_contract_selection_and_outer_size_fallback(self):
         comm = MoriSdmaAllGather(fsdp_owned_output=True)
-        self.assertIsNotNone(comm.layout.prepare_output(self._metadata()))
-        self.assertTrue(comm._can_call_param_contiguous(torch.empty(6)))
-        self.assertIs(
-            comm.layout.prepare_output(self._metadata(input_outer_sizes=[2, 1])),
-            torch_fsdp._POOLED_RANK_MAJOR,
-        )
-        self.assertFalse(comm._can_call_param_contiguous(torch.empty(6)))
+        selection = comm.layout.prepare_output(self._metadata())
+        self.assertTrue(comm._can_call_param_contiguous(torch.empty(6), selection))
+        fallback = comm.layout.prepare_output(self._metadata(input_outer_sizes=[2, 1]))
+        self.assertIs(fallback, torch_fsdp._POOLED_RANK_MAJOR)
+        self.assertFalse(comm._can_call_param_contiguous(torch.empty(6), fallback))
+
+    def test_call_selects_output_from_metadata(self):
+        # FSDP passes output_metadata to the comm; earlier versions do not, and
+        # the comm then uses the selection that its layout last prepared
+        prepared = MoriSdmaAllGather(fsdp_owned_output=True)
+        selection = prepared.layout.prepare_output(self._metadata())
+        cases = [
+            ("passed selection", {"output_metadata": selection}, None, True),
+            ("passed rank-major", {"output_metadata": None}, selection, False),
+            ("not passed", {}, selection, True),
+            ("not passed, unprepared", {}, None, False),
+        ]
+        for name, kwargs, stashed, param_contiguous in cases:
+            with self.subTest(name):
+                comm = MoriSdmaAllGather(fsdp_owned_output=True)
+                comm._prepared_selection = stashed
+                collective = MagicMock()
+                with (
+                    patch.object(comm, "_get_collective", return_value=collective),
+                    patch.object(comm, "_wait_for_peer_consumers"),
+                    patch.object(comm, "_validate_tensors"),
+                    patch.object(torch.cuda, "current_stream"),
+                    patch.object(torch.Tensor, "record_stream", autospec=True),
+                ):
+                    result = comm(
+                        output_tensor=torch.empty(12),
+                        input_tensor=torch.empty(6),
+                        group=MagicMock(),
+                        async_op=False,
+                        **kwargs,
+                    )
+                self.assertIsNone(result)
+                self.assertEqual(
+                    collective.enqueue_param_contiguous.call_count,
+                    int(param_contiguous),
+                )
+                self.assertEqual(
+                    collective.enqueue.call_count, int(not param_contiguous)
+                )
 
     def test_parameter_outputs_refill_in_place_and_release_staging(self):
         comm = MoriSdmaAllGather(fsdp_owned_output=True)

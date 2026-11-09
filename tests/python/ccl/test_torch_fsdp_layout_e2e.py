@@ -21,12 +21,12 @@ class _CountedAllGather(MoriSdmaAllGather):
         self.param_contiguous_calls = 0
         self.rank_major_calls = 0
 
-    def _call_full_group(self, output, input, group, async_op):
-        if self._can_call_param_contiguous(input):
+    def _call_full_group(self, output, input, group, async_op, output_metadata):
+        if self._can_call_param_contiguous(input, output_metadata):
             self.param_contiguous_calls += 1
         else:
             self.rank_major_calls += 1
-        return super()._call_full_group(output, input, group, async_op)
+        return super()._call_full_group(output, input, group, async_op, output_metadata)
 
 
 def _case(
