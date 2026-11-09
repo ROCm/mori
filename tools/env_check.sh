@@ -1268,6 +1268,39 @@ dominant_group() {
 
 # ======================== check functions =======================
 
+# check_kernel_p2p_dmabuf
+#   cco windows (every dispatch_combine_v2 EpDispatchCombineOp registers one) are
+#   shared between ranks as dma-bufs. When the kernel lacks these two options, a
+#   peer import is pinned in system memory instead of mapped peer-to-peer, and KFD
+#   may keep every rank's queues evicted (ROCm/mori#917). WARN, not FAIL: the
+#   kernel config is only a proxy for what the amdgpu driver does, and it is
+#   unreadable in most containers (SKIP).
+check_kernel_p2p_dmabuf() {
+    step "check kernel dma-buf P2P support (cco / EPv2)"
+    local text="" f opt missing=0
+    if [[ -r /proc/config.gz ]]; then
+        text=$(zcat /proc/config.gz 2>/dev/null)
+    else
+        for f in "/boot/config-$(uname -r)" "/lib/modules/$(uname -r)/build/.config"; do
+            [[ -r "$f" ]] && { text=$(<"$f"); break; }
+        done
+    fi
+    if [[ -z "$text" ]]; then
+        log_skip "kernel config not readable (no /proc/config.gz, /boot/config-$(uname -r)) — cannot check dma-buf P2P options"
+        return 0
+    fi
+    for opt in CONFIG_PCI_P2PDMA CONFIG_DMABUF_MOVE_NOTIFY; do
+        if grep -qx "$opt=y" <<<"$text"; then
+            log_ok "$opt=y"
+        else
+            log_warn "$opt is not set"
+            missing=1
+        fi
+    done
+    (( missing )) && log_warn "cco register_window (and so EPv2) may leave KFD queues evicted; rebuild the kernel with both =y (ROCm/mori#917)"
+    return 0
+}
+
 check_versions() {
     step "check ainic firmware and driver version"
 
@@ -2339,6 +2372,8 @@ minority_note() {
         log_warn "also detected ${_VENDOR_COUNT[$name]} $name NIC(s) (not the dominant vendor) — skipping their firmware/QoS/DCQCN checks"
     done
 }
+
+check_kernel_p2p_dmabuf
 
 case "$_dominant_vendor" in
     ionic)

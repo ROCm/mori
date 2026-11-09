@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -456,6 +457,37 @@ static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
   return hipSuccess;
 }
 
+// Warn when the kernel lacks the dma-buf options a peer window import needs: without
+// them the import is pinned in system memory instead of mapped peer-to-peer, and KFD
+// may keep every rank's queues evicted (ROCm/mori#917). Reads a plain-text kernel
+// config only (no zlib here for /proc/config.gz), so a host that exposes nothing else
+// stays silent. The config is a proxy for the amdgpu driver, hence a warning.
+static void CcoWarnIfNoDmabufP2P() {
+  struct utsname u;
+  if (uname(&u) != 0) return;
+  const std::string rel = u.release;
+  for (const std::string& path :
+       {"/boot/config-" + rel, "/lib/modules/" + rel + "/build/.config"}) {
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) continue;
+    bool p2p = false, moveNotify = false;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+      if (!strncmp(line, "CONFIG_PCI_P2PDMA=y", 19)) p2p = true;
+      if (!strncmp(line, "CONFIG_DMABUF_MOVE_NOTIFY=y", 27)) moveNotify = true;
+    }
+    fclose(f);
+    if (!p2p || !moveNotify) {
+      MORI_SHMEM_WARN(
+          "ccoCommCreate: kernel {} lacks {}{}{} — peer window imports may be pinned in system "
+          "memory and leave KFD queues evicted (ROCm/mori#917)",
+          rel, p2p ? "" : "CONFIG_PCI_P2PDMA", (!p2p && !moveNotify) ? " and " : "",
+          moveNotify ? "" : "CONFIG_DMABUF_MOVE_NOTIFY");
+    }
+    return;
+  }
+}
+
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
                              ccoComm** outComm) {
   // Pin this thread to its GPU's NUMA-local CPUs before the bootstrap, the
@@ -663,6 +695,8 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
       // (e.g. a torch kernel launch) would report it as its own error.
       (void)hipGetLastError();
       MORI_SHMEM_INFO("ccoCommCreate: fabric handle probe failed, using FD path");
+      // Peers import windows as dma-bufs on this path. One report per host.
+      if (comm->lsaSize > 1 && comm->lsaRank == 0) CcoWarnIfNoDmabufP2P();
     }
   }
 
