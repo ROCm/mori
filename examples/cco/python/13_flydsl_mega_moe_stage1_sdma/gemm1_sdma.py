@@ -32,6 +32,10 @@ its rows through ``rowmap`` (``stage1_sdma.Arena``)::
 
 A row of the window is ``K`` fp8 bytes then ``K / 32`` e8m0 scales, ``row_bytes`` apart, so
 one index gives both the A row and its scale.
+
+Phase 1c: the gated kernel always builds the receive layout itself (no separate layout kernel,
+no start gate of its own); local_first, sched_layout, layout_blocks, arrival_order,
+sched_cache_need, pair_k and the ``S1_NO_URP`` switch are gone.
 """
 
 import functools
@@ -61,11 +65,9 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 
 from stage1_sdma import (
     PHASES_VER,
-    SCH_ARR,
     SCH_HEAD,
     SCH_LDONE,
     SCH_RQ,
-    SCH_TOT,
     SCH_TAIL,
     Arena,
     layout_lds_words,
@@ -74,21 +76,9 @@ from stage1_sdma import (
     memrealtime,
     memtime,
     post_rest_chunks,
-    sched_layout_phase,
     sched_lds_words,
     scheduler_phase,
 )
-
-
-import os as _os
-
-if _os.environ.get("S1_NO_URP") == "1":
-    # A/B switch: the AMDGPU UnclusteredHighRPReschedule stage re-orders the GEMM K loop when the
-    # kernel's register pressure is high (see the GEMM2 fix of 2026-10-29); the role code fused
-    # into this kernel raises it. Set before any kernel compiles.
-    from flydsl._mlir._mlir_libs._mlirDialectsFly import set_llvm_option_bool as _set_llvm_bool
-
-    _set_llvm_bool("amdgpu-disable-unclustered-high-rp-reschedule", True)
 
 #: ``trace``: int64 slots per workgroup, and work items recorded per workgroup (8 + 3 * items).
 TRACE_STRIDE = 2048
@@ -165,12 +155,8 @@ def compile_gemm1_sdma(
     async_a_copy: bool = True, use_tile_resource: bool = True, waves_per_eu_hint: int = 2,
     b_cache_modifier: int = 0, swiglu_limit: float = 0.0, num_cu: int = 256,
     gate_arena: Arena | None = None, gate_rank: int = 0, trace: bool = False,
-    fuse_layout: bool = False, fuse_prepare: bool = False, prep_trace: bool = False,
-    prep_split: int = 1, prep_unroll: int = 1, prep_stage_first: bool = False,
-    prep_own_tokens: bool = False, ready_first: bool = False, local_first: bool = False,
-    sched_layout: bool = False, prep_quant_skip: bool = False, layout_blocks: int = 0,
-    sched_cache_need: bool = False, arrival_order: bool = False,
-    pair_k: bool = False, prep_quant_lds_store: bool = False, prep_plan_blocks: int = 0,
+    fuse_prepare: bool = False, prep_trace: bool = False, prep_split: int = 3,
+    prep_unroll: int = 1, ready_first: bool = False, no_plan: bool = False,
 ):
     # fmt: on
     """Persistent GEMM1, one workgroup per CU, flat (m tile, n tile) work item per step.
@@ -179,23 +165,23 @@ def compile_gemm1_sdma(
     itself instead of leaving it to a ``wait`` kernel:
 
     * workgroup 0 is the comm workgroup: it puts the chunks of my runs that ``prepare`` did
-      not (``post_rest_chunks``; ``prepare`` put chunk 0), and the other workgroups compute;
-    * a compute workgroup waits once at the start for the peers' route rows (``flags``), then
-      before each tile for the chunks of every peer's run that the tile's expert needs
-      (``need``, and the SDMA signal counters, which count from ``sig_base``). A tile whose
-      chunks have landed starts at once, so the GEMM runs while later chunks are in flight.
-      Beyond one cache invalidation at the start there is no fence: see the comment there.
+      not (``post_rest_chunks``; ``prepare`` put the first ``early_chunks``), and the other
+      workgroups compute;
+    * the compute workgroups first build the receiver's layout (``layout_phase``): it waits
+      for every source's route flag, does the one acquire, and ends in a rendezvous that
+      releases the tables it wrote; only then is ``num_valid`` read to size the tile loop;
+    * then, before each tile, a workgroup waits for the chunks of every peer's run that the
+      tile's expert needs (``need``, and the SDMA signal counters, which count from
+      ``sig_base``). A tile whose chunks have landed starts at once, so the GEMM runs while
+      later chunks are in flight. There is no fence per tile: see the comment there.
 
-    ``fuse_layout`` (with ``gate_arena``): the receiver's layout (``layout_phase``, what the
-    separate layout kernel does) runs at the front of this kernel, in the compute workgroups,
-    instead of as a kernel of its own. It replaces the start gate (it waits for the same
-    flags), ends in a rendezvous that releases the tables it wrote, and only then is
-    ``num_valid`` read to size the tile loop.
+    Without ``gate_arena`` it is the plain static loop over tables built beforehand.
 
-    ``fuse_prepare`` (needs ``fuse_layout``): the prepare (``prepare_phase``: plan, quant, route
-    staging, the early puts) runs first in the same kernel, so a call is ONE launch. Workgroup
-    0 puts the early chunks inside it, then waits for every worker to have quantised its rows
+    ``fuse_prepare`` (with ``gate_arena``): the prepare (``prepare_phase``: plan, route staging,
+    quant, the early puts) runs first in the same kernel, so a call is ONE launch. Workgroup 0
+    puts the early chunks inside it, then waits for every worker to have quantised its rows
     (``qdone``, one-way arrivals) before it puts the rest; the workers go on to the layout.
+    The prepare's LDS (plan + quant store swizzle) is lent out of the pool.
 
     ``ready_first`` (with ``gate_arena``): the per-tile SDMA gate is gone. One wave of the comm
     workgroup is a TILE SCHEDULER (``scheduler_phase``): it watches the SDMA signal levels and
@@ -205,42 +191,14 @@ def compile_gemm1_sdma(
     (n_tile = ticket % n_tiles) work item. It exits when its ticket is past the last m-tile.
     No worker reads a signal or ``need``. ``arm`` must zero ``sched`` (``sched=True``).
 
-    ``local_first`` (needs ``ready_first``): ``layout_phase`` orders an expert's rows by source
-    in rotated order (local rank first) and writes ``tsrc[tile]``; the scheduler then lets a
-    tile start once the sources up to ``tsrc[tile]`` have landed (a tile of local rows only
-    waits for nothing). The kernel must run with the layout of the same ``local_first``.
-
-    ``sched_layout`` (needs ``ready_first`` and ``fuse_layout``): block 1 is layout + scheduler in
-    one (``sched_layout_phase``: block barriers only, tables written through, then wave 0 runs
-    the scheduler loop on them directly); blocks 2.. are workers and never run the layout; the
-    comm block no longer hosts the scheduler. The grid is unchanged (``num_cu`` blocks).
-
-    ``prep_quant_skip`` (``fuse_prepare``): the prepare's quant passes only load and quantise the
-    tokens they store (see ``make_prepare_phase``).
-
-    ``prep_quant_lds_store`` (``fuse_prepare``): the prepare's quantised-row stores go through an
-    LDS swizzle so each lane stores 16 CONTIGUOUS bytes (the wave 1024 per instruction) instead
-    of two half-line pieces 32 bytes apart; its staging is lent out of the same LDS pool
-    (see ``make_prepare_phase``).
-
-    ``prep_plan_blocks`` ``P`` (``fuse_prepare``, needs ``prep_own_tokens``): only the first ``P``
-    worker blocks run the prepare's plan, which brings back the prepare's grid barrier B2
-    (see ``make_prepare_phase``).
-
-    ``layout_blocks`` ``LB`` (needs ``fuse_prepare``, ``ready_first``, ``prep_own_tokens``): the
-    last ``LB`` workers own no tokens; right after the prepare's rendezvous B3 they run
-    ``layout_phase`` among themselves (``nb = LB``, so its two rendezvous are small) while the
-    other ``NW = num_cu - 1 - LB`` workers quantise. The scheduler waits for ``LB`` layout
-    arrivals. EVERY worker then runs the ticket loop that ends on the scheduler's m-tile count
-    (``SCH_TOT``), not on ``num_valid``: a quant worker is not past the layout's rendezvous.
-    Why a tile never reads a row that is still being quantised: the scheduler wave sits behind
-    comm's wait for ``qdone == q0 + NW`` (every quant block's S rows are retired, write-through)
-    and publishes nothing before it, so a published tile, local rows included, has all its rows.
+    ``no_plan`` (the prepare's): no ``need`` exists, so a tile (or the scheduler) waits for ALL
+    of every source's chunks of this call (``expected``).
 
     ``trace`` (with ``gate_arena``): thread 0 of each workgroup writes the clock (100 MHz) to
-    ``trace[bid * TRACE_STRIDE + ...]``: ``[0]`` kernel start, ``[1]`` start gate passed (flags),
-    ``[2]`` end, ``[3]`` its number of work items, and from ``[8]`` per item ``(gate start, gate
-    passed, item done)``, up to ``TRACE_ITEMS`` items. Workgroup 0 (comm): start and end only.
+    ``trace[bid * TRACE_STRIDE + ...]``: ``[0]`` kernel start, ``[1]`` layout done, ``[2]``
+    end, ``[3]`` its number of work items, and from ``[8]`` per item ``(gate start, gate
+    passed, item done)``, up to ``TRACE_ITEMS`` items. Workgroup 0 (comm): start and end only
+    (and, with ``ready_first``, the scheduler's ``SCH_TR_*`` slots).
     """
     # FlyDSL's cache key holds a closure's scalars only, not ``gate_arena``: its repr has to be
     # one, or a kernel compiled for another chunk_rows / early_chunks is reused.
@@ -265,64 +223,38 @@ def compile_gemm1_sdma(
         raise ValueError("the window exceeds the 32-bit buffer-resource range")
     if ready_first and not gate_arena:
         raise ValueError("ready_first needs gate_arena")
-    if local_first and not ready_first:
-        raise ValueError("local_first needs ready_first")
-    if sched_layout and not (ready_first and fuse_layout):
-        raise ValueError("sched_layout needs ready_first and fuse_layout")
-    if sched_layout and lds_pool_bytes < layout_lds_words(gate_arena, True) * 4:
-        raise ValueError("the LDS pool is too small for sched_layout_phase")
-    if arrival_order and not (local_first and ready_first and fuse_layout and not sched_layout):
-        raise ValueError("arrival_order needs local_first, ready_first, fuse_layout (not sched_layout)")
-    if layout_blocks:
-        if not (fuse_prepare and fuse_layout and ready_first and prep_own_tokens):
-            raise ValueError("layout_blocks needs fuse_prepare, fuse_layout, ready_first and own_tokens")
-        if sched_layout:
-            raise ValueError("layout_blocks and sched_layout are exclusive")
-        if not 0 < layout_blocks < num_cu - 1:
-            raise ValueError(f"layout_blocks={layout_blocks} must be in (0, {num_cu - 1})")
-    if (prep_quant_lds_store or prep_plan_blocks) and not fuse_prepare:
-        raise ValueError("prep_quant_lds_store / prep_plan_blocks need fuse_prepare")
-    if prep_plan_blocks and not prep_own_tokens:
-        raise ValueError("prep_plan_blocks needs prep_own_tokens")
-    NWQ = num_cu - 1 - layout_blocks   # workers that own tokens and quantise
+    NWQ = num_cu - 1   # workers: every one owns tokens and quantises (``fuse_prepare``)
     sched_words = 0
     if ready_first:
-        sched_words = sched_lds_words((gate_arena.max_routes + sort_block_m - 1) // sort_block_m,
-                                      (gate_npes * gate_epr if sched_cache_need else 0)
-                                      + (gate_npes if arrival_order else 0))
+        sched_words = sched_lds_words((gate_arena.max_routes + sort_block_m - 1) // sort_block_m)
         if sched_words * 4 > n_scale_bytes:
             raise ValueError(
                 f"ready_first: the scheduler's per-tile table ({sched_words} words) does not fit "
                 f"the A-scale LDS ({n_scale_bytes // 4} words) at sort_block_m={sort_block_m}")
         if gate_npes > 8 or gate_epr >= 65536:
             raise ValueError("ready_first: npes <= 8 and fewer than 65536 experts per rank")
-    if fuse_layout:
-        if not gate_arena:
-            raise ValueError("fuse_layout needs gate_arena")
-        if lds_pool_bytes < layout_lds_words(gate_arena, local_first) * 4:
+    if gate_arena:
+        if lds_pool_bytes < layout_lds_words(gate_arena) * 4:
             raise ValueError("the LDS pool is too small to lend the layout its words")
     prepare_phase = None
     if fuse_prepare:
-        if not fuse_layout:
-            raise ValueError("fuse_prepare needs fuse_layout")
+        if not gate_arena:
+            raise ValueError("fuse_prepare needs gate_arena")
         prepare_phase, pcfg = make_prepare_phase(
             rank=gate_rank, arena=gate_arena, epr=gate_epr, quant_blocks=num_cu - 1,
-            route_push=False, trace=prep_trace, recv_layout=True, split=prep_split,
-            unroll=prep_unroll, prep_block=total_threads, stage_first=prep_stage_first,
-            fused=True, own_tokens=prep_own_tokens, quant_skip=prep_quant_skip,
-            layout_blocks=layout_blocks, quant_lds_store=prep_quant_lds_store,
-            plan_blocks=prep_plan_blocks,
+            trace=prep_trace, split=prep_split, unroll=prep_unroll, prep_block=total_threads,
+            fused=True, no_plan=no_plan,
         )
         if pcfg.nblocks != num_cu or pcfg.PB != total_threads:
             raise ValueError("the prepare's grid must be the GEMM1's grid")
         if lds_pool_bytes < pcfg.lds_bytes:
-            # ``prep_quant_lds_store`` adds QLS_STRIDE (2304 B) per wave to this: 8 waves put
-            # pcfg.lds_bytes at ~6 KB + 18 KB. The pool is sort_block_m * tile_n / 2 * 4 bytes
-            # (128 KB at 128x512), so there is room; a small tile_n / sort_block_m could run out.
+            # the quant store swizzle adds QLS_STRIDE (2304 B) per wave to the plan's LDS: 8
+            # waves put pcfg.lds_bytes at ~6 KB + 18 KB. The pool is sort_block_m * tile_n / 2 *
+            # 4 bytes (128 KB at 128x512), so there is room; a small tile_n / sort_block_m could
+            # run out.
             raise ValueError(
                 f"the LDS pool ({lds_pool_bytes} B) is too small to lend the prepare its "
-                f"{pcfg.lds_bytes} bytes"
-                + (" (prep_quant_lds_store staging included)" if prep_quant_lds_store else ""))
+                f"{pcfg.lds_bytes} bytes (quant store staging included)")
 
     if ready_first:
         @fx.struct
@@ -339,11 +271,8 @@ def compile_gemm1_sdma(
 
     # fmt: off
     @flyc.kernel(name=f"stage1_sdma_gemm1_t{sort_block_m}x{tile_n}_rb{row_bytes}_r{expert_offset}_tr{int(trace)}"
-                      f"_g{int(bool(gate_npes))}_fl{int(fuse_layout)}_fp{int(fuse_prepare)}_ps{prep_split}u{prep_unroll}"
-                      f"pk{int(pair_k)}sf{int(prep_stage_first)}pt{int(prep_trace)}ow{int(prep_own_tokens)}"
-                      f"_rf{int(ready_first)}lf{int(local_first)}sl{int(sched_layout)}"
-                      f"_cn{int(sched_cache_need)}ao{int(arrival_order)}_qs{int(prep_quant_skip)}lb{int(layout_blocks)}"
-                      f"_ql{int(prep_quant_lds_store)}pb{int(prep_plan_blocks)}_pv{PHASES_VER}",
+                      f"_g{int(bool(gate_npes))}_fp{int(fuse_prepare)}_ps{prep_split}u{prep_unroll}"
+                      f"pt{int(prep_trace)}_rf{int(ready_first)}np{int(no_plan)}_pv{PHASES_VER}",
                  known_block_size=[total_threads, 1, 1])
     def kernel(
         out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_w: fx.Tensor, tile_row_base: fx.Tensor,
@@ -353,13 +282,10 @@ def compile_gemm1_sdma(
         arg_cnt: fx.Int64, arg_trace: fx.Int64,
         arg_hist: fx.Int64, arg_cursor: fx.Int64, arg_lbar: fx.Int64, arg_srcmap: fx.Int64,
         arg_wts: fx.Int64, arg_eids: fx.Int64, arg_trb: fx.Int64, arg_tib: fx.Int64,
-        arg_nv: fx.Int64, arg_met: fx.Int64, arg_ete: fx.Int64,
-        arg_tsrc: fx.Int64, arg_sched: fx.Int64,
+        arg_nv: fx.Int64, arg_met: fx.Int64, arg_ete: fx.Int64, arg_sched: fx.Int64,
         p_ids: fx.Int64, p_x: fx.Int64, p_row_tok: fx.Int64, p_rowpos: fx.Int64, p_cum: fx.Int64,
-        p_hist: fx.Int64, p_cursor: fx.Int64, p_bar: fx.Int64, p_pair_order: fx.Int64,
-        p_pair_base: fx.Int64, p_local_hist: fx.Int64, p_my_base: fx.Int64, p_wts: fx.Int64,
-        p_trace: fx.Int64, p_done: fx.Int64, p_stream: fx.Int64, p_qdone: fx.Int64,
-        p_tokens: fx.Int32,
+        p_hist: fx.Int64, p_cursor: fx.Int64, p_bar: fx.Int64, p_wts: fx.Int64,
+        p_trace: fx.Int64, p_done: fx.Int64, p_qdone: fx.Int64, p_tokens: fx.Int32,
     ):
     # fmt: on
         _ = GATE_KEY
@@ -410,7 +336,7 @@ def compile_gemm1_sdma(
         bid = fx.block_idx.x
 
         def work_items():
-            """Tile loop size, read when it is needed: with ``fuse_layout`` it is written by
+            """Tile loop size, read when it is needed: with ``gate_arena`` it is written by
             the layout at the front of this very kernel."""
             num_valid = nv_rsrc[fx.Int32(0)]
             return ((num_valid + fx.Int32(sort_block_m - 1)) // fx.Int32(sort_block_m)) * fx.Int32(n_tiles)
@@ -457,7 +383,7 @@ def compile_gemm1_sdma(
                 m_tile, n_wave_base + n_tile * fx.Int32(tile_n), sched.expert_of(m_tile), sched,
                 a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf, a_scale_lds,
                 a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, pipe_weights,
-                mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, True, pair_k,
+                mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, True, False,  # indirect, pair_k
             )
             stamp(trace_buf, slot0 + fx.Int32(2))
             stamp_mt(trace_buf, slot0 + fx.Int32(4))
@@ -478,15 +404,22 @@ def compile_gemm1_sdma(
                     # and the kernel already did one system acquire after waiting for the
                     # flags, so every ``need`` is visible by the time any tile runs. The load
                     # itself is system-scope (``sc0 sc1``), so it does not hit a stale line.
-                    need = fx.Int32(
-                        comm_ops.load_i32_global_system(
-                            fx.Int64(arg_win) + fx.Int64(gate_arena.off_need)
-                            + fx.Int64(tid * fx.Int32(gate_epr) + e_local) * fx.Int64(4),
+                    if const_expr(no_plan):
+                        # the prepare wrote no ``need`` (no counting sort): an expert's rows can be
+                        # anywhere in a source's run, so wait for all of its chunks of this call
+                        cco.DevComm(arg_dev_comm).sdma().wait_signal(
+                            tid, 0, fx.Int64(expected[tid])
                         )
-                    )
-                    cco.DevComm(arg_dev_comm).sdma().wait_signal(
-                        tid, 0, fx.Int64(sig_base[tid] + need)
-                    )
+                    else:
+                        need = fx.Int32(
+                            comm_ops.load_i32_global_system(
+                                fx.Int64(arg_win) + fx.Int64(gate_arena.off_need)
+                                + fx.Int64(tid * fx.Int32(gate_epr) + e_local) * fx.Int64(4),
+                            )
+                        )
+                        cco.DevComm(arg_dev_comm).sdma().wait_signal(
+                            tid, 0, fx.Int64(sig_base[tid] + need)
+                        )
                 fx.barrier()
                 stamp(trace_buf, slot0 + fx.Int32(1))
                 stamp_mt(trace_buf, slot0 + fx.Int32(3))
@@ -494,94 +427,11 @@ def compile_gemm1_sdma(
                 m_tile, n_wave_base + n_tile * fx.Int32(tile_n), sched.expert_of(m_tile), sched,
                 a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf, a_scale_lds,
                 a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, pipe_weights,
-                mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, True, pair_k,
+                mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, True, False,  # indirect, pair_k
             )
             if const_expr(gate_npes):
                 stamp(trace_buf, slot0 + fx.Int32(2))
                 stamp_mt(trace_buf, slot0 + fx.Int32(4))
-
-        def tot_ticket_loop():
-            """The ticket loop of a worker that does not read ``num_valid``: ticket -> q = ticket //
-            n_tiles; ONE lane polls ``rq_tail > q`` (the scheduler stores the m-tile count + 1 in
-            ``SCH_TOT`` BEFORE its first tail, so ``q >= count`` means the ticket is past the last
-            m-tile and the worker leaves), reads ``rq[q]`` only after it saw the tail, and the
-            next ticket is claimed at tile start. One ``fence_system_acquire`` before the first
-            tile: every table was written (and released) before the first tail, and the
-            acquire drops whatever line of them -- or of last call's rows -- this XCD's L2 holds."""
-            rf_lds = fx.Int64(fx.ptrtoint(lds.rf.ptr))
-            head_addr = fx.Int64(arg_sched) + fx.Int64(SCH_HEAD * 4)
-            tail_addr = fx.Int64(arg_sched) + fx.Int64(SCH_TAIL * 4)
-            tot_addr = fx.Int64(arg_sched) + fx.Int64(SCH_TOT * 4)
-            rq_addr = fx.Int64(arg_sched) + fx.Int64(SCH_RQ * 4)
-
-            def rfw(i):
-                return rf_lds + fx.Int64(i) * fx.Int64(4)
-
-            def claim():
-                return fx.Int32(comm_ops.atomic_add_agent(head_addr, fx.Int32(1)))
-
-            if tid == fx.Int32(0):
-                comm_ops.store_i32_lds(rfw(RF_NEXT), claim())
-            fx.barrier()
-            tk = fx.Int32(comm_ops.load_i32_lds(rfw(RF_NEXT)))
-            item = fx.Int32(0)
-            active = fx.Int32(1)
-            wacc = fx.Int64(0)      # trace: queue wait of tiles 1.. (thread 0), 100 MHz ticks
-            wfirst = fx.Int64(0)    # trace: the first wait
-            tacc = fx.Int64(0)      # trace: do_tile time
-            while active == fx.Int32(1):
-                q = tk // fx.Int32(n_tiles)
-                n_tile = tk - q * fx.Int32(n_tiles)
-                nxt = fx.Int32(0)
-                if tid == fx.Int32(0):
-                    # st 1: slot q is published; 2: q is past the last m-tile (the
-                    # scheduler stores the count + 1 BEFORE its first tail); 0: poll
-                    if const_expr(trace):
-                        tw0 = memrealtime()
-                    st = fx.Int32(0)
-                    while st == fx.Int32(0):
-                        tl = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
-                        tt = fx.Int32(comm_ops.load_i32_global_system(tot_addr))
-                        st = (tl > q).select(
-                            fx.Int32(1),
-                            ((tt > fx.Int32(0)) & (q >= tt - fx.Int32(1))).select(
-                                fx.Int32(2), fx.Int32(0)))
-                        if st == fx.Int32(0):
-                            rocdl.s_sleep(1)
-                    sel = fx.Int32(-1)
-                    if st == fx.Int32(1):
-                        # read only after the tail was seen: entry stored first
-                        sel = fx.Int32(comm_ops.load_i32_global_system(
-                            rq_addr + fx.Int64(q) * fx.Int64(4)))
-                    comm_ops.store_i32_lds(rfw(RF_TILE), sel)
-                    nxt = claim()
-                    if const_expr(trace):
-                        dw = memrealtime() - tw0
-                        wacc = wacc + (item > fx.Int32(0)).select(dw, fx.Int64(0))
-                        wfirst = (item == fx.Int32(0)).select(dw, wfirst)
-                fx.barrier()
-                m_tile = fx.Int32(comm_ops.load_i32_lds(rfw(RF_TILE)))
-                if m_tile >= fx.Int32(0):
-                    if item == fx.Int32(0):
-                        # the ONE invalidate: every table was written before the
-                        # first tail, so no line of them is cached after this
-                        comm_ops.fence_system_acquire()
-                    if const_expr(trace):
-                        ta = memrealtime()
-                    run_tile_rf(m_tile, n_tile, item)
-                    if const_expr(trace):
-                        tacc = tacc + (memrealtime() - ta)
-                if tid == fx.Int32(0):
-                    comm_ops.store_i32_lds(rfw(RF_NEXT), nxt)
-                fx.barrier()
-                tk = fx.Int32(comm_ops.load_i32_lds(rfw(RF_NEXT)))
-                item = item + fx.Int32(1)
-                active = (m_tile >= fx.Int32(0)).select(fx.Int32(1), fx.Int32(0))
-            stamp(trace_buf, fx.Int32(2))
-            stamp_i64(trace_buf, fx.Int32(3), fx.Int64(item - fx.Int32(1)))   # tiles this block ran
-            stamp_i64(trace_buf, fx.Int32(5), wacc)      # trace: queue wait, tiles 1..
-            stamp_i64(trace_buf, fx.Int32(6), wfirst)    # trace: first queue wait
-            stamp_i64(trace_buf, fx.Int32(7), tacc)      # trace: sum of tile times
 
         q0 = fx.Int32(0)
         if const_expr(fuse_prepare):
@@ -590,10 +440,8 @@ def compile_gemm1_sdma(
                 arg_row_tok=p_row_tok, arg_rowpos=p_rowpos, arg_cnt=arg_cnt, arg_cum=p_cum,
                 arg_hist=p_hist, arg_cursor=p_cursor, arg_bar=p_bar,
                 arg_s=fx.Int64(arg_win) + fx.Int64(gate_arena.off_s),
-                arg_dev_comm=arg_dev_comm, arg_win=arg_win_handle,
-                arg_pair_order=p_pair_order, arg_pair_base=p_pair_base,
-                arg_local_hist=p_local_hist, arg_my_base=p_my_base, arg_wts=p_wts,
-                arg_trace=p_trace, arg_done=p_done, arg_stream=p_stream, arg_qdone=p_qdone,
+                arg_dev_comm=arg_dev_comm, arg_win=arg_win_handle, arg_wts=p_wts,
+                arg_trace=p_trace, arg_done=p_done, arg_qdone=p_qdone,
                 L=fx.Int64(fx.ptrtoint(lds.pool.ptr)),
             )
             stamp(trace_buf, fx.Int32(4))   # trace: this block's prepare_phase is done
@@ -624,194 +472,116 @@ def compile_gemm1_sdma(
                     if (tid < fx.Int32(gate_npes)) & (tid != fx.Int32(gate_rank)):
                         cco.DevComm(arg_dev_comm).sdma().wait_signal(tid, 0, fx.Int64(expected[tid]))
                         stamp_at(trace_buf, fx.Int32(8) + tid)
-                if const_expr(ready_first and not sched_layout):
+                if const_expr(ready_first):
                     # wave 0 of the comm workgroup is the tile scheduler (it has put its peer's
                     # chunks above). Its tile table lives in the ``A_scale`` LDS of this block:
                     # only ``do_tile`` uses that, and workgroup 0 runs no tile.
                     if tid < fx.Int32(64):
                         scheduler_phase(
-                            rank=gate_rank, arena=gate_arena, sbm=sort_block_m,
-                            nb=layout_blocks if layout_blocks else num_cu - 1,
-                            wait_layout=fuse_layout, local_first=local_first,
+                            rank=gate_rank, arena=gate_arena, sbm=sort_block_m, nb=num_cu - 1,
                             max_tiles=(gate_arena.max_routes + sort_block_m - 1) // sort_block_m,
                             lane=tid, L=fx.Int64(fx.ptrtoint(lds.A_scale.ptr)),
                             win=fx.Int64(arg_win),
                             sdma=cco.DevComm(arg_dev_comm).sdma(), arg_sched=arg_sched,
-                            nv_rsrc=nv_rsrc, expert_of=sched.expert_of,
-                            tsrc_rsrc=ptr_buf_tensor(arg_tsrc, fx.Int32), sig_base=sig_base,
-                            direct=False, a_nv=0, a_eids=0, a_tsrc=0,
-                            publish_tot=layout_blocks > 0, trace=trace, trace_buf=trace_buf,
-                            trace_base=bid * fx.Int32(TRACE_STRIDE), cache_need=sched_cache_need, arrival=arrival_order,
-                            arg_arr=fx.Int64(arg_sched) + fx.Int64(SCH_ARR * 4),
+                            nv_rsrc=nv_rsrc, expert_of=sched.expert_of, sig_base=sig_base,
+                            trace=trace, trace_buf=trace_buf,
+                            trace_base=bid * fx.Int32(TRACE_STRIDE),
+                            full_wait=no_plan, expected=expected,
                         )
             else:
-                if const_expr(sched_layout):
-                    # ---- sched_layout: block 1 = layout + scheduler (block barriers only),
-                    # blocks 2.. = workers (prepare, then tickets; they never touch the tables
-                    # before the ready queue says a tile is published)
-                    if bid == fx.Int32(1):
-                        sched_layout_phase(
-                            rank=gate_rank, arena=gate_arena, sbm=sort_block_m,
-                            max_tok=gate_arena.cap, nb=1, tid=tid, lbid=fx.Int32(0),
-                            tpb=total_threads, L=fx.Int64(fx.ptrtoint(lds.pool.ptr)),
-                            win=fx.Int64(arg_win), arg_expected=arg_expected,
-                            arg_srcmap=arg_srcmap, arg_wts=arg_wts, arg_eids=arg_eids,
-                            arg_trb=arg_trb, arg_tib=arg_tib, arg_nv=arg_nv, arg_met=arg_met,
-                            arg_ete=arg_ete, local_first=local_first, arg_tsrc=arg_tsrc,
-                        )
-                        # the tables are in memory (write-through, barrier): wave 0 schedules,
-                        # the other waves are done
-                        if tid < fx.Int32(64):
-                            scheduler_phase(
-                                rank=gate_rank, arena=gate_arena, sbm=sort_block_m,
-                                nb=num_cu - 1, wait_layout=False, local_first=local_first,
-                                max_tiles=(gate_arena.max_routes + sort_block_m - 1) // sort_block_m,
-                                lane=tid, L=fx.Int64(fx.ptrtoint(lds.A_scale.ptr)),
-                                win=fx.Int64(arg_win),
-                                sdma=cco.DevComm(arg_dev_comm).sdma(), arg_sched=arg_sched,
-                                nv_rsrc=nv_rsrc, expert_of=sched.expert_of,
-                                tsrc_rsrc=ptr_buf_tensor(arg_tsrc, fx.Int32), sig_base=sig_base,
-                                direct=True, a_nv=arg_nv, a_eids=arg_eids, a_tsrc=arg_tsrc,
-                                publish_tot=True, trace=trace, trace_buf=trace_buf,
-                                trace_base=bid * fx.Int32(TRACE_STRIDE), cache_need=sched_cache_need, arrival=arrival_order,
-                            arg_arr=fx.Int64(arg_sched) + fx.Int64(SCH_ARR * 4),
-                            )
-                        stamp(trace_buf, fx.Int32(2))
-                    if bid > fx.Int32(1):
-                        tot_ticket_loop()
-                if const_expr(layout_blocks > 0):
-                    # ---- layout_blocks: the last ``layout_blocks`` workers own no token. The
-                    # prepare returned for them right after its rendezvous B3: they run the
-                    # layout among themselves (their two rendezvous are small) while the other
-                    # workers quantise. Nobody else touches the tables before the scheduler's
-                    # tail says a tile is published, so no quant worker takes part in them.
-                    if bid > fx.Int32(NWQ):
-                        layout_phase(
-                            rank=gate_rank, arena=gate_arena, sbm=sort_block_m,
-                            max_tok=gate_arena.cap, nb=layout_blocks, tid=tid,
-                            lbid=bid - fx.Int32(1 + NWQ), tpb=total_threads,
-                            L=fx.Int64(fx.ptrtoint(lds.pool.ptr)), win=fx.Int64(arg_win),
-                            arg_expected=arg_expected, arg_hist=arg_hist, arg_cursor=arg_cursor,
-                            arg_bar=arg_lbar, arg_srcmap=arg_srcmap, arg_wts=arg_wts,
-                            arg_eids=arg_eids, arg_trb=arg_trb, arg_tib=arg_tib, arg_nv=arg_nv,
-                            arg_met=arg_met, arg_ete=arg_ete, final_release=True,
-                            local_first=local_first, arg_tsrc=arg_tsrc, signal_done=True,
-                            arg_ldone=fx.Int64(arg_sched) + fx.Int64(SCH_LDONE * 4),
-                            arrival=arrival_order, arg_arr=fx.Int64(arg_sched) + fx.Int64(SCH_ARR * 4),
-                        )
-                    stamp(trace_buf, fx.Int32(1))
-                    tot_ticket_loop()
-                if const_expr(not (sched_layout or layout_blocks > 0)):
-                    if const_expr(fuse_layout):
-                        # the front of this kernel IS the layout: it waits for the same flags and
-                        # does the one acquire, and its last rendezvous releases the tables the
-                        # tiles below read from other workgroups
-                        layout_phase(
-                            rank=gate_rank, arena=gate_arena, sbm=sort_block_m, max_tok=gate_arena.cap,
-                            nb=num_cu - 1, tid=tid, lbid=bid - fx.Int32(1), tpb=total_threads,
-                            L=fx.Int64(fx.ptrtoint(lds.pool.ptr)), win=fx.Int64(arg_win),
-                            arg_expected=arg_expected, arg_hist=arg_hist, arg_cursor=arg_cursor,
-                            arg_bar=arg_lbar, arg_srcmap=arg_srcmap, arg_wts=arg_wts,
-                            arg_eids=arg_eids, arg_trb=arg_trb, arg_tib=arg_tib, arg_nv=arg_nv,
-                            arg_met=arg_met, arg_ete=arg_ete, final_release=True,
-                            local_first=local_first, arg_tsrc=arg_tsrc, signal_done=ready_first,
-                            arg_ldone=fx.Int64(arg_sched) + fx.Int64(SCH_LDONE * 4),
-                            arrival=arrival_order, arg_arr=fx.Int64(arg_sched) + fx.Int64(SCH_ARR * 4),
-                        )
-                    else:
-                        if tid < fx.Int32(gate_npes):
-                            # also relaxed: the poll is a system-scope load, and the single
-                            # ``fence_system_acquire`` below is what makes the data it guards visible.
-                            # With ``acquire=True`` every poll iteration invalidated the whole L2.
-                            comm_ops.spin_until_ge_i32_system(
-                                fx.Int64(arg_win) + fx.Int64(gate_arena.off_flags) + fx.Int64(tid) * fx.Int64(4),
-                                expected[fx.Int32(gate_npes) + tid],
-                            )
-                        fx.barrier()
-                        # The only cache invalidation of the kernel. A tile does none after it has
-                        # seen its chunks land (the SDMA signal is a relaxed load, and none was
-                        # needed): SDMA writes memory without touching this GPU's L2, so a stale
-                        # line would be one that this L2 already holds. Lines from earlier calls
-                        # are gone by now; and a line of this call is only read after its chunk
-                        # has landed, because a chunk starts on a 128 B line (``Arena.check``), so
-                        # no line is pulled in early by a neighbour's read. Measured: an acquire
-                        # per tile, of any scope, cost ~90 us of 0.96 ms (it invalidates L2, with
-                        # the weights in it). With ``fuse_layout`` the layout's own acquire (at its
-                        # start and in each of its rendezvous) plays this part.
-                        comm_ops.fence_system_acquire()
-                    stamp(trace_buf, fx.Int32(1))
-                    total_work = work_items()
-                    if const_expr(ready_first):
-                        # tickets over work items (q = ticket // n_tiles is the ready-queue index,
-                        # so a m-tile's n-tiles are consecutive); the m-tile comes from the queue
-                        rf_lds = fx.Int64(fx.ptrtoint(lds.rf.ptr))
-                        head_addr = fx.Int64(arg_sched) + fx.Int64(SCH_HEAD * 4)
-                        tail_addr = fx.Int64(arg_sched) + fx.Int64(SCH_TAIL * 4)
-                        rq_addr = fx.Int64(arg_sched) + fx.Int64(SCH_RQ * 4)
+                # the front of the workers IS the layout: it waits for the route flags and does
+                # the one acquire, and its last rendezvous releases the tables the tiles below
+                # read from other workgroups (and, ready_first, tells the scheduler). A tile does
+                # no cache invalidation after it has seen its chunks land (the SDMA signal is a
+                # relaxed load): SDMA writes memory without touching this GPU's L2, lines of
+                # earlier calls are gone by now, and a line of this call is only read after its
+                # chunk has landed, because a chunk starts on a 128 B line (``Arena.check``).
+                # Measured: an acquire per tile cost ~90 us of 0.96 ms (it invalidates L2, with
+                # the weights in it).
+                layout_phase(
+                    rank=gate_rank, arena=gate_arena, sbm=sort_block_m, max_tok=gate_arena.cap,
+                    nb=num_cu - 1, tid=tid, lbid=bid - fx.Int32(1), tpb=total_threads,
+                    L=fx.Int64(fx.ptrtoint(lds.pool.ptr)), win=fx.Int64(arg_win),
+                    arg_expected=arg_expected, arg_hist=arg_hist, arg_cursor=arg_cursor,
+                    arg_bar=arg_lbar, arg_srcmap=arg_srcmap, arg_wts=arg_wts,
+                    arg_eids=arg_eids, arg_trb=arg_trb, arg_tib=arg_tib, arg_nv=arg_nv,
+                    arg_met=arg_met, arg_ete=arg_ete, final_release=True,
+                    signal_done=ready_first,
+                    arg_ldone=fx.Int64(arg_sched) + fx.Int64(SCH_LDONE * 4),
+                )
+                stamp(trace_buf, fx.Int32(1))
+                total_work = work_items()
+                if const_expr(ready_first):
+                    # tickets over work items (q = ticket // n_tiles is the ready-queue index,
+                    # so a m-tile's n-tiles are consecutive); the m-tile comes from the queue
+                    rf_lds = fx.Int64(fx.ptrtoint(lds.rf.ptr))
+                    head_addr = fx.Int64(arg_sched) + fx.Int64(SCH_HEAD * 4)
+                    tail_addr = fx.Int64(arg_sched) + fx.Int64(SCH_TAIL * 4)
+                    rq_addr = fx.Int64(arg_sched) + fx.Int64(SCH_RQ * 4)
 
-                        def rfw(i):
-                            return rf_lds + fx.Int64(i) * fx.Int64(4)
+                    def rfw(i):
+                        return rf_lds + fx.Int64(i) * fx.Int64(4)
 
-                        def claim():
-                            return fx.Int32(comm_ops.atomic_add_agent(head_addr, fx.Int32(1)))
+                    def claim():
+                        return fx.Int32(comm_ops.atomic_add_agent(head_addr, fx.Int32(1)))
 
+                    if tid == fx.Int32(0):
+                        comm_ops.store_i32_lds(rfw(RF_NEXT), claim())
+                    fx.barrier()
+                    tk = fx.Int32(comm_ops.load_i32_lds(rfw(RF_NEXT)))
+                    item = fx.Int32(0)
+                    wacc = fx.Int64(0)
+                    wfirst = fx.Int64(0)
+                    tacc = fx.Int64(0)
+                    while tk < total_work:
+                        q = tk // fx.Int32(n_tiles)
+                        n_tile = tk - q * fx.Int32(n_tiles)
+                        nxt = fx.Int32(0)
                         if tid == fx.Int32(0):
-                            comm_ops.store_i32_lds(rfw(RF_NEXT), claim())
+                            # ONE lane waits for the scheduler to have published slot q. The
+                            # entry was stored (write-through) before the tail that covers
+                            # it; both are read with system-scope loads.
+                            if const_expr(trace):
+                                tw0 = memrealtime()
+                            tl = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
+                            while tl <= q:
+                                rocdl.s_sleep(1)
+                                tl = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
+                            comm_ops.store_i32_lds(rfw(RF_TILE), fx.Int32(
+                                comm_ops.load_i32_global_system(rq_addr + fx.Int64(q) * fx.Int64(4))))
+                            # the next ticket is claimed now, its latency hidden by the tile
+                            nxt = claim()
+                            if const_expr(trace):
+                                dw = memrealtime() - tw0
+                                wacc = wacc + (item > fx.Int32(0)).select(dw, fx.Int64(0))
+                                wfirst = (item == fx.Int32(0)).select(dw, wfirst)
+                        fx.barrier()
+                        m_tile = fx.Int32(comm_ops.load_i32_lds(rfw(RF_TILE)))
+                        if const_expr(trace):
+                            ta = memrealtime()
+                        run_tile_rf(m_tile, n_tile, item)
+                        if const_expr(trace):
+                            tacc = tacc + (memrealtime() - ta)
+                        if tid == fx.Int32(0):
+                            comm_ops.store_i32_lds(rfw(RF_NEXT), nxt)
                         fx.barrier()
                         tk = fx.Int32(comm_ops.load_i32_lds(rfw(RF_NEXT)))
-                        item = fx.Int32(0)
-                        wacc = fx.Int64(0)
-                        wfirst = fx.Int64(0)
-                        tacc = fx.Int64(0)
-                        while tk < total_work:
-                            q = tk // fx.Int32(n_tiles)
-                            n_tile = tk - q * fx.Int32(n_tiles)
-                            nxt = fx.Int32(0)
-                            if tid == fx.Int32(0):
-                                # ONE lane waits for the scheduler to have published slot q. The
-                                # entry was stored (write-through) before the tail that covers
-                                # it; both are read with system-scope loads.
-                                if const_expr(trace):
-                                    tw0 = memrealtime()
-                                tl = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
-                                while tl <= q:
-                                    rocdl.s_sleep(1)
-                                    tl = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
-                                comm_ops.store_i32_lds(rfw(RF_TILE), fx.Int32(
-                                    comm_ops.load_i32_global_system(rq_addr + fx.Int64(q) * fx.Int64(4))))
-                                # the next ticket is claimed now, its latency hidden by the tile
-                                nxt = claim()
-                                if const_expr(trace):
-                                    dw = memrealtime() - tw0
-                                    wacc = wacc + (item > fx.Int32(0)).select(dw, fx.Int64(0))
-                                    wfirst = (item == fx.Int32(0)).select(dw, wfirst)
-                            fx.barrier()
-                            m_tile = fx.Int32(comm_ops.load_i32_lds(rfw(RF_TILE)))
-                            if const_expr(trace):
-                                ta = memrealtime()
-                            run_tile_rf(m_tile, n_tile, item)
-                            if const_expr(trace):
-                                tacc = tacc + (memrealtime() - ta)
-                            if tid == fx.Int32(0):
-                                comm_ops.store_i32_lds(rfw(RF_NEXT), nxt)
-                            fx.barrier()
-                            tk = fx.Int32(comm_ops.load_i32_lds(rfw(RF_NEXT)))
-                            item = item + fx.Int32(1)
-                        stamp(trace_buf, fx.Int32(2))
-                        stamp_i64(trace_buf, fx.Int32(5), wacc)
-                        stamp_i64(trace_buf, fx.Int32(6), wfirst)
-                        stamp_i64(trace_buf, fx.Int32(7), tacc)
-                        if const_expr(trace):
-                            if tid == fx.Int32(0):
-                                trace_buf[bid * fx.Int32(TRACE_STRIDE) + fx.Int32(3)] = fx.Int64(item)
-                    else:
-                        for flat in range(bid - fx.Int32(1), total_work, fx.Int32(num_cu - 1)):
-                            run_tile(flat)
-                        stamp(trace_buf, fx.Int32(2))
-                        if const_expr(trace):
-                            if tid == fx.Int32(0):
-                                n_items = (total_work - (bid - fx.Int32(1)) + fx.Int32(num_cu - 2)) // fx.Int32(num_cu - 1)
-                                trace_buf[bid * fx.Int32(TRACE_STRIDE) + fx.Int32(3)] = fx.Int64(n_items)
+                        item = item + fx.Int32(1)
+                    stamp(trace_buf, fx.Int32(2))
+                    stamp_i64(trace_buf, fx.Int32(5), wacc)
+                    stamp_i64(trace_buf, fx.Int32(6), wfirst)
+                    stamp_i64(trace_buf, fx.Int32(7), tacc)
+                    if const_expr(trace):
+                        if tid == fx.Int32(0):
+                            trace_buf[bid * fx.Int32(TRACE_STRIDE) + fx.Int32(3)] = fx.Int64(item)
+                else:
+                    for flat in range(bid - fx.Int32(1), total_work, fx.Int32(num_cu - 1)):
+                        run_tile(flat)
+                    stamp(trace_buf, fx.Int32(2))
+                    if const_expr(trace):
+                        if tid == fx.Int32(0):
+                            n_items = (total_work - (bid - fx.Int32(1)) + fx.Int32(num_cu - 2)) // fx.Int32(num_cu - 1)
+                            trace_buf[bid * fx.Int32(TRACE_STRIDE) + fx.Int32(3)] = fx.Int64(n_items)
         else:
             total_work = work_items()
             for flat in range(bid, total_work, fx.Int32(num_cu)):
@@ -827,21 +597,18 @@ def compile_gemm1_sdma(
                arg_trace: fx.Int64, arg_hist: fx.Int64, arg_cursor: fx.Int64, arg_lbar: fx.Int64,
                arg_srcmap: fx.Int64, arg_wts: fx.Int64, arg_eids: fx.Int64, arg_trb: fx.Int64,
                arg_tib: fx.Int64, arg_nv: fx.Int64, arg_met: fx.Int64, arg_ete: fx.Int64,
-               arg_tsrc: fx.Int64, arg_sched: fx.Int64,
+               arg_sched: fx.Int64,
                p_ids: fx.Int64, p_x: fx.Int64, p_row_tok: fx.Int64, p_rowpos: fx.Int64,
                p_cum: fx.Int64, p_hist: fx.Int64, p_cursor: fx.Int64, p_bar: fx.Int64,
-               p_pair_order: fx.Int64, p_pair_base: fx.Int64, p_local_hist: fx.Int64,
-               p_my_base: fx.Int64, p_wts: fx.Int64, p_trace: fx.Int64, p_done: fx.Int64,
-               p_stream: fx.Int64, p_qdone: fx.Int64, p_tokens: fx.Int32, stream: fx.Stream):
+               p_wts: fx.Int64, p_trace: fx.Int64, p_done: fx.Int64, p_qdone: fx.Int64,
+               p_tokens: fx.Int32, stream: fx.Stream):
     # fmt: on
         kernel(out, x, w, scale_w, tile_row_base, tile_input_base, expert_ids, num_valid_ids,
                out_scale, rowmap, nvm, arg_dev_comm, arg_win, arg_sig_base, arg_expected,
                arg_win_handle, arg_cnt, arg_trace, arg_hist, arg_cursor, arg_lbar, arg_srcmap,
-               arg_wts, arg_eids, arg_trb, arg_tib, arg_nv, arg_met, arg_ete,
-               arg_tsrc, arg_sched,
-               p_ids, p_x, p_row_tok, p_rowpos, p_cum, p_hist, p_cursor, p_bar, p_pair_order,
-               p_pair_base, p_local_hist, p_my_base, p_wts, p_trace, p_done, p_stream, p_qdone,
-               p_tokens,
+               arg_wts, arg_eids, arg_trb, arg_tib, arg_nv, arg_met, arg_ete, arg_sched,
+               p_ids, p_x, p_row_tok, p_rowpos, p_cum, p_hist, p_cursor, p_bar, p_wts, p_trace,
+               p_done, p_qdone, p_tokens,
                value_attrs={
                    "rocdl.waves_per_eu": waves_per_eu_hint,
                    "rocdl.flat_work_group_size": f"{total_threads},{total_threads}",
@@ -854,14 +621,21 @@ def run_gemm1_sdma(out, window, w, scale_w, tile_row_base, tile_input_base, expe
                    num_valid, out_scale, rowmap, nvm, stream, prep=None, trace=None, fuse=None,
                    **kwargs):
     """``window`` is ``[S | R]`` as fp8 ``[2 * n_rows, row_bytes]``; the others are the
-    tensors of aiter's stage1 (``MegaMoEV2._s1_*`` and its dispatch op). With ``prep`` (a
-    ``Stage1SdmaPrepare`` that has ``arm``-ed this call) the kernel waits for the data itself.
-    ``fuse``: ``prep.fused_layout_args(moe)``; the kernel then also builds the receive layout
-    (``fuse_layout``) and the separate layout kernel must NOT be run for this call."""
+    tensors of aiter's stage1 (``MegaMoEV2._s1_*`` and its dispatch op).
+
+    With ``prep`` (a ``Stage1SdmaPrepare`` that has ``arm``-ed this call) the kernel waits for
+    the data AND builds the receive layout itself: ``fuse`` must be
+    ``prep.fused_layout_args(moe)`` (plus, for ``fuse_prepare``, ``fuse["prepare"] =
+    prep.fused_prepare_args(x, ids, wts)``), and the separate layout kernel must NOT be run for
+    this call. Without ``prep`` it is the plain static loop over tables built beforehand
+    (``prep.layout``)."""
     gate = {}
     dev_comm = win = sig_base = expected = win_handle = cnt = 0
     if prep is not None:
-        gate = dict(gate_arena=prep.arena, gate_rank=prep.rank)
+        if fuse is None:
+            raise ValueError("the gated GEMM1 builds the layout itself: pass "
+                             "fuse=prep.fused_layout_args(moe)")
+        gate = dict(gate_arena=prep.arena, gate_rank=prep.rank, no_plan=bool(prep.no_plan))
         dev_comm, win, win_handle = prep.dev_comm.ptr, prep.mem.ptr, prep.win.handle
         sig_base, expected, cnt = prep.sig_base.data_ptr(), prep.expected.data_ptr(), prep.cnt.data_ptr()
     if fuse is not None and prep is None:
@@ -869,40 +643,55 @@ def run_gemm1_sdma(out, window, w, scale_w, tile_row_base, tile_input_base, expe
     if prep is None:
         # no gate, no scheduler: the plain static loop whatever the flags say
         kwargs.pop("ready_first", None)
-        kwargs.pop("local_first", None)
-        kwargs.pop("sched_layout", None)
-        kwargs.pop("layout_blocks", None)
-        kwargs.pop("sched_cache_need", None)
-        kwargs.pop("arrival_order", None)
     elif kwargs.get("ready_first") and not prep.sched_on:
         raise ValueError("ready_first needs Stage1SdmaPrepare(sched=True) (arm zeroes its counters)")
     fz = dict(fuse or {})
     if prep is not None:
-        fz.setdefault("tsrc", prep.tsrc.data_ptr())
         fz.setdefault("sched", prep.sched.data_ptr())
     pz = fz.get("prepare")
     pre = {}
     if pz is not None:
         pre = dict(fuse_prepare=True, prep_trace=bool(prep.trace), prep_split=int(prep.split),
-                   prep_unroll=int(prep.unroll), prep_stage_first=bool(prep.stage_first),
-                   prep_own_tokens=bool(prep.own_tokens), prep_quant_skip=bool(prep.quant_skip),
-                   prep_quant_lds_store=bool(prep.quant_lds_store),
-                   prep_plan_blocks=int(prep.plan_blocks))
+                   prep_unroll=int(prep.unroll))
     launch = compile_gemm1_sdma(
         row_bytes=int(window.shape[1]), source_rows=int(window.shape[0]), trace=trace is not None,
-        fuse_layout=fuse is not None, **pre, **gate, **kwargs,
+        **pre, **gate, **kwargs,
     )
     fuse_ptrs = [fx.Int64(fz.get(k, 0)) for k in (
         "hist", "cursor", "lbar", "srcmap", "wts", "eids", "trb", "tib", "nv", "met", "ete",
-        "tsrc", "sched")]
+        "sched")]
     pz = pz or {}
     fuse_ptrs += [fx.Int64(pz.get(k, 0)) for k in (
-        "ids", "x", "row_tok", "rowpos", "cum", "hist", "cursor", "bar", "pair_order",
-        "pair_base", "local_hist", "my_base", "wts", "trace", "done", "stream", "qdone")]
+        "ids", "x", "row_tok", "rowpos", "cum", "hist", "cursor", "bar", "wts", "trace", "done",
+        "qdone")]
     fuse_ptrs.append(fx.Int32(int(pz.get("tokens", 0))))
     _run_compiled(
         launch, out, window, w, scale_w, tile_row_base, tile_input_base, expert_ids, num_valid,
         out_scale, rowmap, fx.Int32(nvm), fx.Int64(dev_comm), fx.Int64(win), fx.Int64(sig_base),
         fx.Int64(expected), fx.Int64(win_handle), fx.Int64(cnt),
         fx.Int64(trace.data_ptr() if trace is not None else 0), *fuse_ptrs, stream,
+    )
+
+
+def gemm1_kwargs(moe, config):
+    """``compile_gemm1_sdma`` / ``run_gemm1_sdma`` keyword arguments for aiter's stage1 shape and
+    tuning on ``moe`` (a ``MegaMoEV2``): the same tile as aiter's own GEMM1."""
+    s1 = config.stage1
+    return dict(
+        model_dim=moe.model_dim,
+        inter_dim=moe.inter_dim,
+        expert_offset=moe.rank * moe.epr,
+        sort_block_m=s1.sort_block_m,
+        tile_n=s1.tile_n,
+        tile_k=s1.tile_k,
+        num_waves=s1.num_waves,
+        pipe_weights=s1.pipe_weights,
+        mfma_amajor=s1.mfma_amajor,
+        swizzle_a=s1.swizzle_a,
+        async_a_copy=s1.async_a_copy,
+        use_tile_resource=s1.use_tile_resource,
+        waves_per_eu_hint=s1.waves_per_eu_hint,
+        b_cache_modifier=max(int(s1.b_nt), 0),
+        swiglu_limit=moe.swiglu_limit,
+        num_cu=moe._s1_num_cu,
     )
