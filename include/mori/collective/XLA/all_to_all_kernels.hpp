@@ -52,22 +52,13 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
                                    size_t chunkBytes, cco::ccoDevComm devComm,
                                    cco::ccoWindow_t heapWin,
                                    uint64_t* __restrict__ barrierCtr,
-                                   uint64_t* __restrict__ arrived,
-                                   bool dbgNanCheck = false) {
+                                   uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
   // Every lane of the first wave reads my slot before lane myPe posts. A
   // kAsyncDone launch finds the start's pushGen - 1 there, so it gets the same.
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
 
   if constexpr (Flags & kAsyncStart) {
-    // Debug (MORI_CCL_NAN_CHECK): scan every send slot BEFORE the push, so a hit
-    // means the a2a RECEIVED NaN (upstream bug) rather than produced it.
-    if (dbgNanCheck) {
-      for (int p = 0; p < npes; ++p) {
-        DebugScanBf16(pairs[p].source, chunkBytes, myPe, p, "a2a-in");
-      }
-      __syncthreads();
-    }
     // A peer finishing its previous launch only proves our chunk reached it; each
     // peer's queue polls for its arrival in this launch before writing its recv slot.
     PostArrival(barrierCtr, pushGen - 1, myPe, npes, stride4G);
@@ -104,14 +95,6 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
   __syncthreads();
   // System-scope ACQUIRE: recv slots were written by peers' SDMA over XGMI.
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-
-  // Debug (MORI_CCL_NAN_CHECK): scan every recv slot AFTER the copy landed. A hit
-  // here with clean "a2a-in" means the a2a itself PRODUCED the NaN.
-  if (dbgNanCheck) {
-    for (int p = 0; p < npes; ++p) {
-      DebugScanBf16(pairs[p].dest, chunkBytes, myPe, p, "a2a-out");
-    }
-  }
 
   // Recv buffers already fully written by SDMA. The block read pushGen at
   // entry, so it can advance the generation for the next launch now.
