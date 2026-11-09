@@ -1479,6 +1479,10 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
           int d = __shfl(myDestPe, sl);
           index_t dt = __shfl(myDestTokId, sl);
           int gTok = __shfl(tok, sl);
+          [[maybe_unused]] index_t scRow = 0;
+          if constexpr (kEpScaleBytes > 0) {
+            if (args.scalesBuf && !_scWave && !_scPay) scRow = __shfl(myScRow, sl);
+          }
           if (srcLane < 0) continue;
           if (dt < 0 || dt >= _stgCap) continue;
           index_t* sIdx =
@@ -1507,7 +1511,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
               constexpr int kDstDw = kEpScaleStride / 4;
               const unsigned int* srcS =
                   reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)gTok * kSrcDw;
-              const size_t sr = (size_t)(unsigned)__shfl(myScRow, sl);
+              const size_t sr = (size_t)(unsigned)scRow;
               if (sr < kEpScaleRows) {
                 unsigned int* dstS = reinterpret_cast<unsigned int*>(
                     _cusplit_stgScale + ((size_t)d * kEpScaleRows + sr) * kEpScaleStride);
