@@ -417,6 +417,7 @@ def _save_internode_tuning_result(
         "dtype": disp_dtype_str,
         "num_tokens": max_num_token,
         "hidden_dim": dispatch_hidden_dim,
+        "topk": config.num_experts_per_token,
         "block_num": best_disp_config[0],
         "rdma_block_num": best_disp_config[2],
         "warp_per_block": best_disp_config[1],
@@ -432,6 +433,7 @@ def _save_internode_tuning_result(
         "dtype": comb_dtype_str,
         "num_tokens": max_num_token,
         "hidden_dim": combine_hidden_dim,
+        "topk": config.num_experts_per_token,
         "zero_copy": False,
         "quant_type": qt_str,
         "block_num": best_comb_config[0],
@@ -569,6 +571,9 @@ class EpDispatchCombineTestCase:
         combine_dtype=None,
         max_total_recv_tokens=0,
         topk=8,
+        num_experts_per_rank=None,
+        scale_dim=32,
+        scale_type_size=4,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
@@ -586,18 +591,21 @@ class EpDispatchCombineTestCase:
         else:
             self.combine_hidden_dim = self.dispatch_hidden_dim
 
-        assert (
-            256 % self.world_size == 0
-        ), f"world_size={self.world_size} must divide 256 (total experts)"
+        if num_experts_per_rank is None:
+            assert (
+                256 % self.world_size == 0
+            ), f"world_size={self.world_size} must divide 256 (total experts)"
+            num_experts_per_rank = 256 // self.world_size
+        assert scale_type_size in (1, 4), "scale_type_size must be 1 (e8m0) or 4 (fp32)"
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=max(self.dispatch_hidden_dim, self.combine_hidden_dim),
-            scale_dim=32,
-            scale_type_size=4,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
             max_num_inp_token_per_rank=max_tokens,
-            num_experts_per_rank=256 // self.world_size,
+            num_experts_per_rank=num_experts_per_rank,
             num_experts_per_token=topk,
             warp_num_per_block=8,
             block_num=96,
@@ -744,13 +752,24 @@ class EpDispatchCombineTestCase:
         # gen scales
         all_rank_scales = [None] * self.world_size
         for r in range(self.world_size):
-            s = torch.rand(
-                num_token[r],
-                self.config.scale_dim,
-                dtype=torch.float32,
-                generator=self.rng,
-                device=self.device,
-            )
+            if self.config.scale_type_size == 1:
+                # e8m0-sized scales: raw bytes, compared bitwise
+                s = torch.randint(
+                    0,
+                    256,
+                    (num_token[r], self.config.scale_dim),
+                    dtype=torch.uint8,
+                    generator=self.rng,
+                    device=self.device,
+                )
+            else:
+                s = torch.rand(
+                    num_token[r],
+                    self.config.scale_dim,
+                    dtype=torch.float32,
+                    generator=self.rng,
+                    device=self.device,
+                )
             if r in keep_ranks:
                 all_rank_scales[r] = s
             else:
@@ -1807,6 +1826,14 @@ class EpDispatchCombineTestCase:
             comb_warp_per_block=comb_warp_per_block,
         )
         ll_mode_scale = bench_result[-1]
+        if self.rank == 0:
+            d = getattr(op, "_cached_dispatch_launch", None)
+            c = getattr(op, "_cached_combine_launch", None)
+            print(
+                f"resolved launch (block, rdma, warp): dispatch={d} combine={c} "
+                f"mode={os.environ.get('MORI_EP_LAUNCH_CONFIG_MODE', 'MANUAL')} "
+                f"tokens={max_num_token} cfg_max={self.config.max_num_inp_token_per_rank}"
+            )
         all_data, _ = self._all_gather_bench_data(bench_result)
         # all_data: (repeat, world_size, 6)
         # cols: d_rdma(0) d_xgmi(1) d_lat(2) c_rdma(3) c_xgmi(4) c_lat(5)
@@ -2030,9 +2057,14 @@ class EpDispatchCombineTestCase:
         return (worst, best, avg)
 
     def tuning_dispatch_combine(
-        self, max_num_token, save_tuning_config=None, skip_verify=False
+        self, max_num_token, save_tuning_config=None, skip_verify=False, op=None
     ):
         tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
+        if os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL") == "AUTO":
+            raise ValueError(
+                "unset MORI_EP_LAUNCH_CONFIG_MODE for --cmd tuning: under AUTO the op "
+                "ignores the per-candidate block/warp/rdma"
+            )
         if save_tuning_config and tuning_scope == "quick":
             raise ValueError(
                 "MORI_TUNING_SCOPE=quick cannot be combined with "
@@ -2043,7 +2075,8 @@ class EpDispatchCombineTestCase:
                 "unset (or =full) to save."
             )
 
-        op = mori.ops.EpDispatchCombineOp(self.config)
+        if op is None:
+            op = mori.ops.EpDispatchCombineOp(self.config)
         sm_count = torch.cuda.get_device_properties(
             self.rank % self.gpu_per_node
         ).multi_processor_count
@@ -2074,7 +2107,21 @@ class EpDispatchCombineTestCase:
             warp_list = [4, 6, 8, 12, 16]
             _rdma_mode = "full"
 
+        # Explicit candidate sets, e.g. MORI_TUNING_BLOCKS=64,96,128
+        # MORI_TUNING_WARPS=4,6,8 MORI_TUNING_RDMA_FRACS=0.333,0.5,0.667
+        def _env_list(name, cast):
+            v = os.environ.get(name)
+            return [cast(x) for x in v.split(",") if x.strip()] if v else None
+
+        block_list = _env_list("MORI_TUNING_BLOCKS", int) or block_list
+        warp_list = _env_list("MORI_TUNING_WARPS", int) or warp_list
+        rdma_fracs = _env_list("MORI_TUNING_RDMA_FRACS", float)
+
         def rdma_candidates_for(bn):
+            if rdma_fracs:
+                return sorted(
+                    set(v for v in (int(bn * f) for f in rdma_fracs) if 1 <= v < bn)
+                )
             if _rdma_mode == "quick":
                 return sorted(
                     set(v for v in [max(bn // 2, 1), bn * 2 // 3] if 1 <= v < bn)
@@ -2430,10 +2477,16 @@ def test_dispatch_combine(
     skip_verify=False,
     sentinel_pattern="every_other",
     topk=8,
+    num_experts_per_rank=None,
+    scale_dim=32,
+    scale_type_size=4,
+    config_max_tokens=None,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
+    cfg_max_tokens = config_max_tokens if config_max_tokens else max_tokens
+    assert cfg_max_tokens >= max_tokens, "--config-max-tokens must be >= --max-tokens"
 
     if cmd in (
         "test",
@@ -2448,7 +2501,7 @@ def test_dispatch_combine(
             global_rank,
             gpu_per_node,
             world_size,
-            max_tokens,
+            cfg_max_tokens,
             kernel_type,
             num_qp,
             quant_type,
@@ -2457,6 +2510,9 @@ def test_dispatch_combine(
             combine_dtype=combine_dtype,
             max_total_recv_tokens=max_total_recv_tokens,
             topk=topk,
+            num_experts_per_rank=num_experts_per_rank,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
         )
         test_case.setup()
         if cmd == "test":
@@ -2495,11 +2551,26 @@ def test_dispatch_combine(
         elif cmd == "profile":
             test_case.profile_dispatch_combine(max_tokens)
         elif cmd == "tuning":
-            test_case.tuning_dispatch_combine(
-                max_tokens,
-                save_tuning_config=save_tuning_config,
-                skip_verify=skip_verify,
+            # MORI_TUNING_TOKENS=1,2,4 tunes several token counts on one op
+            tokens_env = os.environ.get("MORI_TUNING_TOKENS")
+            token_list = (
+                [int(t) for t in tokens_env.split(",") if t.strip()]
+                if tokens_env
+                else [max_tokens]
             )
+            assert max(token_list) <= cfg_max_tokens, (
+                f"MORI_TUNING_TOKENS max {max(token_list)} exceeds the op capacity "
+                f"{cfg_max_tokens}; raise --config-max-tokens"
+            )
+            tuning_op = mori.ops.EpDispatchCombineOp(test_case.config)
+            for t in token_list:
+                test_case.tuning_dispatch_combine(
+                    t,
+                    save_tuning_config=save_tuning_config,
+                    skip_verify=skip_verify,
+                    op=tuning_op,
+                )
+            del tuning_op
         test_case.cleanup()
     elif cmd == "sweep_bench":
         sweep_bench_dispatch_combine(
@@ -2674,6 +2745,33 @@ parser.add_argument(
     help="Experts per token (default: 8)",
 )
 parser.add_argument(
+    "--num-experts-per-rank",
+    type=int,
+    default=None,
+    help="Experts per rank (default: 256 // world_size).",
+)
+parser.add_argument(
+    "--scale-dim",
+    type=int,
+    default=32,
+    help="Dispatch scale elements per token (default 32).",
+)
+parser.add_argument(
+    "--scale-type-size",
+    type=int,
+    default=4,
+    choices=[1, 4],
+    help="Bytes per scale element: 4 = fp32 (default), 1 = e8m0.",
+)
+parser.add_argument(
+    "--config-max-tokens",
+    type=int,
+    default=None,
+    help="Op capacity max_num_inp_token_per_rank (default: --max-tokens). "
+    "Set it above --max-tokens to bench/tune smaller batches against the buffers "
+    "a serving engine allocates.",
+)
+parser.add_argument(
     "--save-tuning-config",
     type=str,
     default=None,
@@ -2787,6 +2885,10 @@ if __name__ == "__main__":
             args_cli.skip_verify,
             args_cli.sentinel_pattern,
             args_cli.topk,
+            args_cli.num_experts_per_rank,
+            args_cli.scale_dim,
+            args_cli.scale_type_size,
+            args_cli.config_max_tokens,
         ),
         nprocs=gpu_per_node,
         join=True,
