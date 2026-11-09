@@ -133,7 +133,7 @@ using EpDispatchCombineArgs = EpInterNodeArgs;
 inline constexpr ::mori::core::ProviderType kEpInterNodeProvider = CCO_GDA_BUILD_PROVIDER;
 
 // A buffer's position in the arena window. Every EP buffer is a sub-region of
-// one registered window (EpDispatchCombineHandle::MallocSymm), and RDMA names a
+// one registered window (SymmArena, laid out by internode_regions.py), and RDMA names a
 // remote buffer as (window, byte offset) with iova=0 -- there is no peer VA to
 // hand the NIC, which is why a region is (window, offset).
 __device__ __forceinline__ ::mori::cco::ccoWindow_t EpInterNodeWindow(
