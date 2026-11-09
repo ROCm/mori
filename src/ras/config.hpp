@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -43,8 +44,24 @@ struct RasConfig {
   bool requested{false};         // MORI_RAS_ENABLE is set to anything but a false value
   std::string ifname;            // MORI_RAS_IFNAME: the interface for RAS links
   uint16_t port{0};              // MORI_RAS_PORT: the first port to try; 0 picks one
+  double timeoutFactor{1.0};     // MORI_RAS_TIMEOUT_FACTOR: scales every timeout and backoff
+  uint32_t heartbeatMs{1000};    // MORI_RAS_HEARTBEAT_MS: the heartbeat period
   std::vector<int> cpuAffinity;  // MORI_RAS_CPU_AFFINITY: CPUs for the RAS thread, e.g. 0-3,8
   std::vector<std::string> warnings;
+
+  uint64_t HeartbeatNs() const { return uint64_t{heartbeatMs} * 1000000; }
+  // An established link that hears nothing from its peer this long is down: RCCL's 20 s
+  // keep-alive timeout, or three heartbeats if those take longer.
+  uint64_t HeartbeatTimeoutNs() const {
+    return ScaledMs(std::max<uint64_t>(20000, uint64_t{heartbeatMs} * 3));
+  }
+  // Connect plus HELLO, in either direction: RCCL's 5 s connect warning.
+  uint64_t HandshakeTimeoutNs() const { return ScaledMs(5000); }
+  uint64_t ReconnectBackoffInitialNs() const { return ScaledMs(1000); }
+  uint64_t ReconnectBackoffMaxNs() const { return ScaledMs(30000); }
+  uint64_t ScaledMs(uint64_t ms) const {
+    return static_cast<uint64_t>(static_cast<double>(ms) * timeoutFactor * 1e6);
+  }
 };
 
 RasConfig ConfigFromEnv();

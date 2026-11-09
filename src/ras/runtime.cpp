@@ -75,7 +75,7 @@ void StopAtExit() {
     g_published.store(nullptr, std::memory_order_release);
     if (core != nullptr) StatusLocked().state = RunState::kStopped;
   }
-  if (core != nullptr) core->Stop();
+  if (core != nullptr) core->Stop(/*sendLeave=*/true);
 }
 
 // The first IPv4 address of `ifname`, else its first global IPv6 address.
@@ -120,7 +120,7 @@ RasCore::RasCore(CoreParams params) : params_(std::move(params)) {
 }
 
 RasCore::~RasCore() {
-  Stop();
+  Stop(/*sendLeave=*/true);
   if (thread_ != nullptr) {
     // Abandoned by Stop: it may still be running, so it keeps the link manager and queue.
     (void)queue_.release();
@@ -195,7 +195,7 @@ void RasCore::ThreadMain() {
   links_->SetIdentity(
       CollectIdentity(params_.nodeId, params_.hostname, params_.host, params_.pid, uuid_));
   while (!links_->StopRequested()) links_->RunOnce(1000);
-  links_->Shutdown();
+  links_->Shutdown(sendLeave_.load(std::memory_order_acquire));
   {
     std::lock_guard<std::mutex> lock(doneMu_);
     threadDone_ = true;
@@ -203,10 +203,11 @@ void RasCore::ThreadMain() {
   doneCv_.notify_all();
 }
 
-void RasCore::Stop() {
+void RasCore::Stop(bool sendLeave) {
   bool expected = false;
   if (!stopped_.compare_exchange_strong(expected, true)) return;
   if (!running_.load()) return;
+  sendLeave_.store(sendLeave, std::memory_order_release);
   links_->RequestStop();
   bool done;
   {

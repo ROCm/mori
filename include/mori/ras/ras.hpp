@@ -39,15 +39,17 @@
 // - A runtime that fails to start, e.g. because every port MORI_RAS_PORT allows is taken,
 //   stays off for the life of the process: Status() reports kFailed with kDegradedInitFailed
 //   and why, and engines advertise no endpoint. A failure after start sets a degraded bit but
-//   keeps the listener open.
-// - At exit, an atexit handler stops the RAS thread. That path doesn't log: MORI_LOG caches
-//   loggers in function-local statics, which may already be destroyed. The runtime object is
-//   never freed, so a thread still calling in during exit reaches a stopped runtime, not freed
-//   memory.
+//   keeps the listener open, so peers learn of it from HELLO and heartbeats.
+// - At exit, an atexit handler stops the RAS thread, which sends LEAVE on every link first.
+//   That path doesn't log: MORI_LOG caches loggers in function-local statics, which may
+//   already be destroyed. The runtime object is never freed, so a thread still calling in
+//   during exit reaches a stopped runtime, not freed memory.
 // - RAS doesn't follow a fork. In a child of a process that asked for RAS, Get() and
 //   EnsureStarted() return nullptr, so the child's engines advertise no endpoint, and the
-//   child's exit leaves the parent's runtime alone. RAS's sockets, epoll fd and eventfd are
-//   close-on-exec; a child that doesn't exec holds copies of them until it exits.
+//   child's exit leaves the parent's runtime alone: it sends no LEAVE. RAS's sockets, epoll fd
+//   and eventfd are close-on-exec; a child that doesn't exec holds copies of them until it
+//   exits. If the parent dies first, its links stay open in that child, so peers see the death
+//   at the heartbeat timeout (20 s, scaled by MORI_RAS_TIMEOUT_FACTOR) instead of at once.
 //
 // Thread safety: every member may be called from any thread. Enqueue() never blocks.
 

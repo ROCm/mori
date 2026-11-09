@@ -464,6 +464,11 @@ void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
     it.second->RegisterRemoteEngine(remote);
   }
   InvalidateRouteCache();
+  if (ras::RasRuntime* rt = ras::RasRuntime::Get()) {
+    const RasDesc& r = remote.ras;
+    rt->Enqueue(ras::PeerAdded{desc.key, remote.key, remote.nodeId, remote.hostname, remote.pid,
+                               ras::RasEndpoint{r.host, r.port, r.token, {r.uuidHi, r.uuidLo}}});
+  }
   MORI_IO_INFO("Register remote engine {} node_id {} hostname {}", remote.key.c_str(),
                remote.nodeId.c_str(), remote.hostname.c_str());
 }
@@ -473,6 +478,9 @@ void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
     it.second->DeregisterRemoteEngine(remote);
   }
   InvalidateRouteCache();
+  if (ras::RasRuntime* rt = ras::RasRuntime::Get()) {
+    rt->Enqueue(ras::PeerRemoved{desc.key, remote.key});
+  }
   MORI_IO_INFO("Deregister remote engine {}", remote.key.c_str());
 }
 
