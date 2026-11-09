@@ -3,8 +3,9 @@
 # MIT License
 # distutils: language = c++
 
-from libc.stdint cimport intptr_t
+from libc.stdint cimport intptr_t, uint32_t, uint64_t
 from libc.stddef cimport size_t
+from libc.stdlib cimport free, malloc, realloc
 from libc.string cimport memcpy
 
 from .cco cimport (
@@ -17,7 +18,12 @@ from .cco cimport (
     ccoMemAlloc, ccoMemImport, ccoMemFree,
     ccoWindowDeregister, ccoDevCommCreate, ccoDevCommDestroy,
     ccoDevCommCopyToDevice, ccoDevCommFreeDeviceCopy,
-    ccoBarrierAll, ccoWindowRegister,
+    ccoBarrierAll, ccoWindowRegister, ccoGetPeerPtr,
+    ccoTriggerQueue_t, ccoSdmaCmp, ccoSdmaCmpGe, CCO_SDMA_MAX_COPY_BYTES,
+    ccoTriggerCopy, ccoTriggerQueueInfo, _BatchChain,
+    ccoTriggerQueueCreate, ccoTriggerQueueDestroy, ccoTriggerAppendChain,
+    ccoTriggerKick, ccoTriggerKickAll, ccoTriggerQuiesce, ccoTriggerQueueState,
+    ccoTriggerQueueGetInfo, ccoTriggerQueueReadRing,
 )
 
 
@@ -429,3 +435,270 @@ def barrier_all(Comm comm):
         ret = ccoBarrierAll(comm._ptr)
     if ret != 0:
         raise RuntimeError(f"ccoBarrierAll failed: {ret}")
+
+
+def peer_ptr(Comm comm, intptr_t local_ptr, int pe):
+    """ccoGetPeerPtr: peer `pe`'s address of a symmetric pointer on this comm."""
+    cdef void* p
+    with nogil:
+        p = ccoGetPeerPtr(comm._ptr, <void*>local_ptr, pe)
+    if p == NULL:
+        raise ValueError(f"rank {pe} is not reachable over LSA from this rank")
+    return <intptr_t>p
+
+
+###############################################################################
+# TriggerQueue
+###############################################################################
+
+cdef ccoTriggerQueue_t _live(_TriggerQueue t) except NULL:
+    if t._q == NULL:
+        raise RuntimeError("TriggerQueue has been closed")
+    return t._q
+
+
+cdef class _TriggerQueue:
+    """A ccoTriggerQueue; the public API is mori.cco.trigger.TriggerQueue."""
+
+    def __cinit__(self):
+        self._q = NULL
+
+    def __init__(self, Comm comm, int pe, int engine_offset=0, uint64_t ring_bytes=0):
+        cdef int ret
+        cdef ccoTriggerQueue_t q = NULL
+        with nogil:
+            ret = ccoTriggerQueueCreate(comm._ptr, pe, engine_offset, ring_bytes, &q)
+        if ret != 0:
+            raise RuntimeError(f"ccoTriggerQueueCreate(pe={pe}) failed: {ret}")
+        self._q = q
+        self._comm = comm
+
+    def __dealloc__(self):
+        if self._q != NULL:
+            ccoTriggerQueueDestroy(self._q)
+            self._q = NULL
+
+    def close(self):
+        """Destroy the queue. Returns False if kicked work was not yet consumed."""
+        cdef int ret = 0
+        if self._q != NULL:
+            with nogil:
+                ret = ccoTriggerQueueDestroy(self._q)
+            self._q = NULL
+        return ret == 0
+
+    def append(self, intptr_t gate, uint32_t target, copies, intptr_t arrival,
+               int cmp=ccoSdmaCmpGe):
+        """Returns the ring index past the chain, or None if the ring is full."""
+        cdef ccoTriggerQueue_t q = _live(self)
+        cdef int n = len(copies)
+        cdef ccoTriggerCopy* cp = <ccoTriggerCopy*>malloc(max(n, 1) * sizeof(ccoTriggerCopy))
+        if cp == NULL:
+            raise MemoryError()
+        cdef int i, ret
+        cdef uint64_t end = 0
+        try:
+            for i in range(n):
+                src, dst, nbytes = copies[i]
+                cp[i].src = <const void*><intptr_t>src
+                cp[i].dst = <void*><intptr_t>dst
+                cp[i].bytes = nbytes
+            with nogil:
+                ret = ccoTriggerAppendChain(q, <const void*>gate, target, <ccoSdmaCmp>cmp,
+                                            cp, n, <void*>arrival, &end)
+        finally:
+            free(cp)
+        if ret == 1:
+            return None
+        if ret != 0:
+            raise RuntimeError(f"ccoTriggerAppendChain failed: {ret}")
+        return end
+
+    def kick(self):
+        cdef ccoTriggerQueue_t q = _live(self)
+        cdef int ret
+        with nogil:
+            ret = ccoTriggerKick(q)
+        if ret != 0:
+            raise RuntimeError(f"ccoTriggerKick failed: {ret}")
+
+    def quiesce(self, index=None, uint64_t timeout_ns=30_000_000_000):
+        cdef ccoTriggerQueue_t q = _live(self)
+        cdef uint64_t idx = 0xFFFFFFFFFFFFFFFF if index is None else index
+        cdef int ret
+        with nogil:
+            ret = ccoTriggerQuiesce(q, idx, timeout_ns)
+        if ret < 0:
+            raise RuntimeError(f"ccoTriggerQuiesce failed: {ret}")
+        return ret == 0
+
+    def state(self):
+        cdef ccoTriggerQueue_t q = _live(self)
+        cdef uint64_t r = 0, w = 0
+        if ccoTriggerQueueState(q, &r, &w) != 0:
+            raise RuntimeError("ccoTriggerQueueState failed")
+        return r, w
+
+    def _info(self):
+        cdef ccoTriggerQueueInfo info
+        if ccoTriggerQueueGetInfo(_live(self), &info) != 0:
+            raise RuntimeError("ccoTriggerQueueGetInfo failed")
+        return info.peer, info.engineId, info.ringBytes
+
+    @property
+    def engine_id(self):
+        return self._info()[1]
+
+    @property
+    def peer(self):
+        return self._info()[0]
+
+    @property
+    def ring_bytes(self):
+        return self._info()[2]
+
+    def read_ring(self, uint64_t index, uint64_t nbytes):
+        buf = bytearray(nbytes)
+        cdef unsigned char[:] view = buf
+        cdef int ret = ccoTriggerQueueReadRing(
+            _live(self), index, <void*>&view[0] if nbytes else NULL, nbytes)
+        if ret != 0:
+            raise RuntimeError(f"ccoTriggerQueueReadRing failed: {ret}")
+        return bytes(buf)
+
+
+###############################################################################
+# TriggerBatch
+###############################################################################
+
+cdef enum:
+    _BATCH_OK = 0
+    _BATCH_NO_ROOM = 1
+    _BATCH_DRAIN_TIMEOUT = 2
+
+TRIGGER_BATCH_OK = _BATCH_OK
+TRIGGER_BATCH_NO_ROOM = _BATCH_NO_ROOM
+TRIGGER_BATCH_DRAIN_TIMEOUT = _BATCH_DRAIN_TIMEOUT
+
+_UNIT_BYTES = 32  # ring bytes per SDMA packet
+
+cdef class _TriggerBatch:
+    """Chains over several queues, armed in one call; see mori.cco.trigger.TriggerBatch."""
+
+    def __cinit__(self):
+        self._chains = NULL
+        self._n = self._cap = self._nq = 0
+        self._qs = NULL
+        self._need = NULL
+        self._ring = NULL
+        self._queues = []
+
+    def __dealloc__(self):
+        free(self._chains)
+        free(self._qs)
+        free(self._need)
+        free(self._ring)
+
+    def add(self, _TriggerQueue queue, intptr_t gate, Py_ssize_t slot, copies, intptr_t arrival):
+        cdef int qi, i
+        cdef ccoTriggerQueue_t q = _live(queue)
+        cdef ccoTriggerCopy parsed[2]
+        cdef void* grown
+        n = len(copies)
+        if n > 2:
+            raise ValueError("a batched chain carries at most two copies")
+        if slot < 0:
+            raise ValueError("target slot must be >= 0")
+        if gate == 0 or gate & 3 or arrival == 0 or arrival & 7:
+            raise ValueError("gate must be 4-byte and arrival 8-byte aligned and non-null")
+        units = 2  # POLL + ATOMIC
+        for i in range(n):
+            src, dst, nbytes = copies[i]
+            if src == 0 or dst == 0 or nbytes <= 0:
+                raise ValueError(f"copy {i}: null address or no bytes")
+            parsed[i].src = <const void*><intptr_t>src
+            parsed[i].dst = <void*><intptr_t>dst
+            parsed[i].bytes = nbytes
+            units += (nbytes + CCO_SDMA_MAX_COPY_BYTES - 1) // CCO_SDMA_MAX_COPY_BYTES
+        for qi in range(self._nq):
+            if self._qs[qi] == q:
+                break
+        else:
+            qi = self._nq
+            grown = realloc(self._qs, (qi + 1) * sizeof(ccoTriggerQueue_t))
+            if grown == NULL:
+                raise MemoryError()
+            self._qs = <ccoTriggerQueue_t*>grown
+            grown = realloc(self._need, (qi + 1) * sizeof(uint64_t))
+            if grown == NULL:
+                raise MemoryError()
+            self._need = <uint64_t*>grown
+            grown = realloc(self._ring, (qi + 1) * sizeof(uint64_t))
+            if grown == NULL:
+                raise MemoryError()
+            self._ring = <uint64_t*>grown
+            self._qs[qi] = q
+            self._need[qi] = 0
+            self._ring[qi] = queue.ring_bytes
+            self._queues.append(queue)
+            self._nq += 1
+        if self._need[qi] + units * _UNIT_BYTES >= self._ring[qi]:
+            raise ValueError("the batch's chains for this queue cannot fit its ring")
+        if self._n == self._cap:
+            grown = realloc(self._chains, max(16, 2 * self._cap) * sizeof(_BatchChain))
+            if grown == NULL:
+                raise MemoryError()
+            self._chains = <_BatchChain*>grown
+            self._cap = max(16, 2 * self._cap)
+        cdef _BatchChain* c = &self._chains[self._n]
+        c.queue = qi
+        c.gate = <const void*>gate
+        c.slot = slot
+        c.arrival = <void*>arrival
+        c.numCopies = n
+        for i in range(n):
+            c.copies[i] = parsed[i]
+        self._need[qi] += units * _UNIT_BYTES
+        self._n += 1
+
+    def __len__(self):
+        return self._n
+
+    def arm(self, const uint64_t[::1] targets, uint64_t timeout_ns=30_000_000_000):
+        cdef int i, ret = 0
+        cdef uint64_t r, w, t
+        cdef Py_ssize_t ntargets = targets.shape[0]
+        cdef _BatchChain* c
+        for i in range(self._nq):
+            if (<_TriggerQueue>self._queues[i])._q != self._qs[i]:
+                raise RuntimeError("a queue of this batch has been closed")
+        for i in range(self._n):
+            if self._chains[i].slot < 0 or self._chains[i].slot >= ntargets:
+                raise IndexError(f"chain {i}: target slot {self._chains[i].slot} out of range")
+            if targets[self._chains[i].slot] >> 32:
+                raise ValueError(f"chain {i}: target does not fit the engine's 32-bit compare")
+        with nogil:
+            for i in range(self._nq):
+                if ccoTriggerQuiesce(self._qs[i], 0xFFFFFFFFFFFFFFFF, timeout_ns) != 0:
+                    ret = _BATCH_DRAIN_TIMEOUT
+                    break
+                ccoTriggerQueueState(self._qs[i], &r, &w)
+                if w - r + self._need[i] >= self._ring[i]:
+                    ret = _BATCH_NO_ROOM
+                    break
+            if ret == _BATCH_OK:
+                for i in range(self._n):
+                    c = &self._chains[i]
+                    t = targets[c.slot]
+                    ret = ccoTriggerAppendChain(self._qs[c.queue], c.gate, <uint32_t>t,
+                                                ccoSdmaCmpGe, c.copies, c.numCopies,
+                                                c.arrival, NULL)
+                    if ret != 0:
+                        # Unreachable after add()'s checks and the room check.
+                        ret = -1
+                        break
+                if ret == _BATCH_OK:
+                    ret = ccoTriggerKickAll(self._qs, self._nq)
+        if ret < 0:
+            raise RuntimeError(f"TriggerBatch.arm failed: {ret}")
+        return ret
