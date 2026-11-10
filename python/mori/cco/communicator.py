@@ -218,11 +218,15 @@ class ImportedWindow(CCOResource):
     """Window backed by an EXTERNAL HIP VMM allocation (e.g. a torch.symm_mem
     tensor buffer) mapped into cco's flat LSA VA via ``ccoMemImport``.
 
-    ``ext_ptr`` must be the base of a HIP VMM allocation exportable to the comm's
-    handle type. ``local_ptr`` is the cco flat-VA alias of that buffer; peers can
-    address it through the LSA window just like a ``ccoMemAlloc`` buffer. Cleanup
-    deregisters the window and frees the imported alias (unmap + drop the retained
-    handle refcount); the external owner keeps its own mapping.
+    ``ext_ptr`` must point into a HIP VMM allocation exportable to the comm's
+    handle type, at the same offset into it on every rank (torch 2.14's
+    ``symm_mem.empty()`` data starts 0x2400 bytes in, on every rank). An offset
+    that is not page-aligned rules out the window's RDMA MR, so such a window
+    works on a single-node comm without a FULL DevComm only. ``local_ptr`` is
+    the cco flat-VA alias of that buffer; peers can address it through the LSA
+    window just like a ``ccoMemAlloc`` buffer. Cleanup deregisters the window
+    and frees the imported alias (unmap + drop the retained handle refcount);
+    the external owner keeps its own mapping.
     """
 
     def __init__(self, comm: Communicator, ext_ptr: int, size: int) -> None:

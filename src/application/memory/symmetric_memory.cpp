@@ -1401,7 +1401,7 @@ void SymmMemManager::RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded, 
     }
 
     application::RdmaMemoryRegion mr =
-        rdmaDeviceContext->RegisterRdmaMemoryRegionDmabuf(chunkPtr, vmmChunkSize, dmabufFd);
+        rdmaDeviceContext->RegisterRdmaMemoryRegionDmabuf(chunkPtr, vmmChunkSize, dmabufFd, 0);
 
     vmmChunks[chunkIdx].lkey = mr.lkey;
     vmmChunks[chunkIdx].peerRkeys[rank] = mr.rkey;
