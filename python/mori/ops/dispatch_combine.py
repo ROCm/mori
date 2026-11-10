@@ -730,12 +730,9 @@ class EpDispatchCombineOp:
             cfg.num_experts_per_token,
             cfg.num_experts_per_rank,
             self.max_num_tokens_to_recv(),
-        )
-        self._sim_async = (
-            cfg.kernel_type.value == EpDispatchCombineKernelType.AsyncLL.value
+            cfg.kernel_type.value == EpDispatchCombineKernelType.AsyncLL.value,
         )
         self._sim_bufs = {}
-        self._sim_num_tokens = 0
         self._sim_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.local_expert_count = torch.zeros(
             cfg.num_experts_per_rank, dtype=torch.int32, device=self._sim_device
@@ -747,20 +744,20 @@ class EpDispatchCombineOp:
             self._sim_bufs[key] = torch.empty(shape, dtype=dtype, device=device)
         return self._sim_bufs[key]
 
-    def _sim_dispatch(self, input, scales, indices, routing, return_routing):
-        """Outputs are cut to the tokens this rank receives under the real routing of every rank,
-        so their shapes carry the EP imbalance; out_indices holds those tokens' expert ids, the
-        other outputs are not written. AsyncLL's send waits for every rank's send."""
+    # The C++ simulator (mori::moe::sim::EpSim) draws the routing and times the op; these only
+    # wrap its results in tensors, between arrive() and end_call() so that their cost runs inside
+    # the op's latency.
+    def _sim_dispatch(self, input, scales, routing, return_routing):
+        """Outputs are cut to the tokens this rank receives under the simulated routing, so their
+        shapes carry the EP imbalance; out_indices, total_recv and local_expert_count are real,
+        the other outputs are not written. The `indices` passed in are ignored."""
+        self._sim_ep.arrive()
         if routing is not None or return_routing:
             raise NotImplementedError("routing handles are not simulated")
-        cfg, n, dev = self.config, int(input.size(0)), input.device
+        cfg, dev, cpu = self.config, input.device, torch.device("cpu")
         k, max_recv = cfg.num_experts_per_token, self.max_num_tokens_to_recv()
-        ids = indices.to("cpu", torch.int32).contiguous()
-        if tuple(ids.shape) != (n, k):
-            raise ValueError(f"indices must be [{n}, {k}], got {tuple(ids.shape)}")
         # C++ writes host outputs in place; a torch copy here can cost ms when ranks share the
         # host's CPUs, since each rank's intra-op thread pool assumes all of them.
-        cpu = torch.device("cpu")
         out_ids = self._sim_buf("disp_i", (max_recv, k), TOPK_IDX_DTYPE, dev)
         recv_ids = (
             out_ids
@@ -774,11 +771,8 @@ class EpDispatchCombineOp:
             else self._sim_buf("lec_host", lec.shape, torch.int32, cpu)
         )
         total = self._sim_ep.dispatch(
-            ids.data_ptr(), n, recv_ids.data_ptr(), count.data_ptr()
+            int(input.size(0)), recv_ids.data_ptr(), count.data_ptr()
         )
-        if not self._sim_async:
-            self._sim_ep.wait()
-        self._sim_num_tokens = n
         if recv_ids is not out_ids:
             out_ids[:total].copy_(recv_ids[:total])
         if count is not lec:
@@ -792,28 +786,31 @@ class EpDispatchCombineOp:
             out_scales = out("disp_s", cfg.scale_dim, scales.dtype)
         total_recv = self._sim_buf("disp_total", (1,), TOPK_IDX_DTYPE, dev)
         total_recv.fill_(total)
-        return (
+        outputs = (
             out("disp_out", input.size(1), input.dtype),
             out("disp_w", k, torch.float32),
             out_scales,
             out_ids[:total],
             total_recv,
         )
+        self._sim_ep.end_call()
+        return outputs
 
     def _sim_combine(self, input, weights, routing):
         """Outputs are cut to this rank's own tokens, the ones its last dispatch sent."""
+        self._sim_ep.arrive()
         if routing is not None:
             raise NotImplementedError("routing handles are not simulated")
-        self._sim_ep.combine()
-        if not self._sim_async:
-            self._sim_ep.wait()
-        cfg, n, dev = self.config, self._sim_num_tokens, input.device
+        n = self._sim_ep.combine()
+        cfg, dev = self.config, input.device
         shape = (cfg.max_num_inp_token_per_rank, input.size(1))
         out_weights = None
         if weights is not None and weights.size(0) != 0:
             w_shape = (cfg.max_num_inp_token_per_rank, cfg.num_experts_per_token)
             out_weights = self._sim_buf("comb_w", w_shape, weights.dtype, dev)[:n]
-        return (self._sim_buf("comb_out", shape, input.dtype, dev)[:n], out_weights)
+        outputs = (self._sim_buf("comb_out", shape, input.dtype, dev)[:n], out_weights)
+        self._sim_ep.end_call()
+        return outputs
 
     # ------------------------------------------------------------------
     # Kernel launch helpers
@@ -1334,7 +1331,7 @@ class EpDispatchCombineOp:
         return_routing: bool = False,
     ):
         if self._sim:
-            return self._sim_dispatch(input, scales, indices, routing, return_routing)
+            return self._sim_dispatch(input, scales, routing, return_routing)
         if routing is not None and return_routing:
             raise ValueError(
                 "pass either `routing=` (replay) or `return_routing=True` "

@@ -23,14 +23,15 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace mori {
 namespace moe {
 // GPU-free EP (MORI_EP_SIM_ENABLE=1): dispatch and combine launch no kernel and move no token.
-// The ranks of one EP group, all on this host, exchange their routing through shared memory, so
-// each rank learns which tokens it would receive; each op takes a fixed MORI_EP_SIM_DISPATCH_US /
-// MORI_EP_SIM_COMBINE_US and, as with the real cross-device barrier, ends on every rank at the
-// latest arrival + latency.
+// Each rank draws its tokens' routing from MORI_EP_SIM_ROUTING, and the ranks of the EP group (all
+// on this host) exchange it through shared memory, so each rank learns which tokens it receives.
+// An op takes a fixed MORI_EP_SIM_DISPATCH_US / MORI_EP_SIM_COMBINE_US and, as with the real
+// cross-device barrier, ends on every rank at the latest arrival + latency.
 namespace sim {
 
 bool IsEnabled();
@@ -38,35 +39,51 @@ bool IsEnabled();
 class EpSim {
  public:
   // `group` names the shared memory and is the same on every rank; "" only when worldSize == 1.
+  // asyncSend: AsyncLL, whose send returns before the op ends and whose recv waits for it.
   EpSim(const std::string& group, int rank, int worldSize, int maxTokens, int topk,
-        int expertsPerRank, int maxRecv);
+        int expertsPerRank, int maxRecv, bool asyncSend);
   ~EpSim();
   EpSim(const EpSim&) = delete;
   EpSim& operator=(const EpSim&) = delete;
 
-  // ids: [numTokens, topk] global expert ids, -1 = unrouted. Waits for every rank's dispatch, then
-  // writes the ids of the tokens this rank receives to recvIds ([maxRecv, topk], by source rank
-  // then token) and their count per local expert to expertCount; returns how many it received.
-  int Dispatch(const int32_t* ids, int numTokens, int32_t* recvIds, int32_t* expertCount);
-  // Waits for every rank's combine.
-  void Combine();
-  // Sleeps until the last Dispatch/Combine ends on every rank.
+  // Marks this rank's arrival at the next Dispatch/Combine. Call it first, so that the caller's own
+  // work before the op runs inside the op's latency, as host work overlaps a kernel on a GPU.
+  void Arrive();
+  // Draws the expert ids of this rank's numTokens tokens from the next layer's distribution and
+  // exchanges them with every rank. Writes the ids of the tokens this rank receives to recvIds
+  // ([maxRecv, topk], by source rank then token) and their count per local expert to
+  // expertCount; returns how many tokens it receives.
+  int Dispatch(int numTokens, int32_t* recvIds, int32_t* expertCount);
+  // Returns the rows combine gives back: the token count of this rank's last dispatch.
+  int Combine();
+  // Ends a Dispatch/Combine call: waits for the op, except for an AsyncLL send.
+  void EndCall() const {
+    if (!asyncSend_) Wait();
+  }
+  // Sleeps until the last op ends on every rank.
   void Wait() const;
 
  private:
   struct Slot;
+  struct Layer;
   Slot* SlotOf(uint64_t seq, int rank) const;
-  // Begin stamps this rank's arrival into its slot; Finish publishes the slot and waits for all.
+  // Begin stamps this rank's arrival into its slot; Publish shares the slot and waits for all.
   Slot* Begin(int phase, double latencyUs, int numTokens);
-  void Finish(const Slot* mine);
+  void Publish(const Slot* mine);
+  // Draws this rank's routing into scratch_: ids, then per destination rank its tokens and hits.
+  void Route(int numTokens);
 
   int rank_, world_, maxTokens_, topk_, expertsPerRank_, maxRecv_;
+  bool asyncSend_;
   double dispatchUs_, combineUs_;
+  std::vector<Layer> layers_;
+  std::vector<int32_t> scratch_;  // the slot's contents, built here and copied in at once
   std::string name_;
   size_t bytes_{0}, slotBytes_{0};
   char* base_{nullptr};
-  uint64_t seq_{0};
-  int64_t deadlineNs_{0};
+  uint64_t seq_{0}, dispatches_{0};
+  int lastTokens_{0};
+  int64_t deadlineNs_{0}, arrivalNs_{0};
 };
 
 }  // namespace sim

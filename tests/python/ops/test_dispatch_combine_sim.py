@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """Simulated EP dispatch/combine (MORI_EP_SIM_ENABLE=1): runs without a GPU."""
+import os
 import socket
 import time
 
@@ -34,17 +35,20 @@ from mori.ops.dispatch_combine import (
     EpDispatchCombineOp,
 )
 
-HIDDEN, TOPK, EXPERTS_PER_RANK, MAX_TOKENS = 256, 4, 8, 128
+HIDDEN, TOPK, EXPERTS_PER_RANK, MAX_TOKENS = 256, 4, 8, 256
 DISPATCH_US, COMBINE_US = 3000, 5000
 ENV = {
     "MORI_EP_SIM_ENABLE": "1",
     "MORI_EP_SIM_DISPATCH_US": str(DISPATCH_US),
     "MORI_EP_SIM_COMBINE_US": str(COMBINE_US),
 }
+# Layer 0 uniform, layer 1 skewed with expert 0 (on rank 0) the hottest.
+ROUTING = "- alpha: 0\n- alpha: 2\n"
 
 
 @pytest.fixture(autouse=True)
 def sim_env(monkeypatch):
+    monkeypatch.delenv("MORI_EP_SIM_ROUTING", raising=False)
     for k, v in ENV.items():
         monkeypatch.setenv(k, v)
 
@@ -68,116 +72,121 @@ def _op(rank=0, world=1, kernel=EpDispatchCombineKernelType.IntraNode):
     )
 
 
-def _routing(rank, world):
-    """Rank `rank`'s tokens, skewed: rank 0's experts are 4x as likely as the others'."""
-    g = torch.Generator().manual_seed(rank)
-    n = 16 * (rank + 1)
-    p = torch.ones(world * EXPERTS_PER_RANK)
-    p[:EXPERTS_PER_RANK] = 4
-    ids = torch.stack([torch.multinomial(p, TOPK, generator=g) for _ in range(n)])
-    ids[::5, 1:] = -1  # some tokens use fewer experts
-    return ids.to(torch.int32)
-
-
-def _expected(rank, world):
-    lo, hi = rank * EXPERTS_PER_RANK, (rank + 1) * EXPERTS_PER_RANK
-    rows = [
-        r
-        for s in range(world)
-        for r in _routing(s, world)
-        if ((r >= lo) & (r < hi)).any()
-    ]
-    ids = torch.stack(rows) if rows else torch.empty(0, TOPK, dtype=torch.int32)
-    hits = ids[(ids >= lo) & (ids < hi)] - lo
-    return ids, torch.bincount(hits, minlength=EXPERTS_PER_RANK).to(torch.int32)
-
-
 def _inputs(n):
-    return torch.zeros(n, HIDDEN, dtype=torch.bfloat16), torch.ones(n, TOPK)
+    # The simulator draws its own routing: these indices are ignored.
+    return (
+        torch.zeros(n, HIDDEN, dtype=torch.bfloat16),
+        torch.ones(n, TOPK),
+        torch.full((n, TOPK), -1, dtype=torch.int32),
+    )
 
 
 def _check_dispatch(op, outputs, rank, world):
     out, out_w, out_s, out_i, total = outputs
-    want_ids, want_count = _expected(rank, world)
-    m = want_ids.size(0)
-    assert int(total.item()) == m
+    m = int(total.item())
     assert out.shape == (m, HIDDEN) and out_w.shape == (m, TOPK) and out_s is None
-    assert torch.equal(out_i, want_ids)
-    assert torch.equal(op.local_expert_count, want_count)
+    assert out_i.shape == (m, TOPK)
+    lo, hi = rank * EXPERTS_PER_RANK, (rank + 1) * EXPERTS_PER_RANK
+    assert ((out_i >= 0) & (out_i < world * EXPERTS_PER_RANK)).all()
+    assert all(len(set(row.tolist())) == TOPK for row in out_i)
+    local = (out_i >= lo) & (out_i < hi)
+    assert local.any(dim=1).all()
+    want = torch.bincount(out_i[local] - lo, minlength=EXPERTS_PER_RANK)
+    assert torch.equal(op.local_expert_count, want.to(torch.int32))
+    return m
 
 
 def test_single_rank_latency_and_shapes():
     op = _op()
-    ids = _routing(0, 1)
-    x, w = _inputs(ids.size(0))
+    x, w, idx = _inputs(16)
     t0 = time.monotonic()
-    outputs = op.dispatch(x, w, None, ids)
+    outputs = op.dispatch(x, w, None, idx)
     assert time.monotonic() - t0 >= DISPATCH_US / 1e6
-    _check_dispatch(op, outputs, 0, 1)
+    assert _check_dispatch(op, outputs, 0, 1) == 16  # one rank receives every token
 
     t0 = time.monotonic()
-    out, out_w = op.combine(outputs[0], outputs[1], ids)
+    out, out_w = op.combine(outputs[0], outputs[1], idx)
     assert time.monotonic() - t0 >= COMBINE_US / 1e6
-    assert out.shape == (ids.size(0), HIDDEN) and out_w.shape == (ids.size(0), TOPK)
+    assert out.shape == (16, HIDDEN) and out_w.shape == (16, TOPK)
 
 
 def test_asyncll_recv_waits_out_the_rest():
     op = _op(kernel=EpDispatchCombineKernelType.AsyncLL)
-    ids = _routing(0, 1)
-    x, w = _inputs(ids.size(0))
+    x, w, idx = _inputs(16)
     t0 = time.monotonic()
-    op.dispatch(x, w, None, ids)
+    op.dispatch(x, w, None, idx)
     assert time.monotonic() - t0 < DISPATCH_US / 2e6
     op.dispatch_recv()
     assert time.monotonic() - t0 >= DISPATCH_US / 1e6
 
-    op.combine(x, w, ids)
+    op.combine(x, w, idx)
     time.sleep(2 * COMBINE_US / 1e6)  # work that hides the transfer
     t0 = time.monotonic()
     op.combine_recv()
     assert time.monotonic() - t0 < 1e-3
 
 
-def test_latency_must_be_set(monkeypatch):
+def test_config_errors(monkeypatch, tmp_path):
     monkeypatch.delenv("MORI_EP_SIM_COMBINE_US")
     with pytest.raises(RuntimeError, match="MORI_EP_SIM_COMBINE_US"):
+        _op()
+    monkeypatch.setenv("MORI_EP_SIM_COMBINE_US", "1")
+    bad = tmp_path / "routing.yaml"
+    bad.write_text("- alpah: 1\n")
+    monkeypatch.setenv("MORI_EP_SIM_ROUTING", str(bad))
+    with pytest.raises(RuntimeError, match="unknown field 'alpah'"):
         _op()
 
 
 LATE_RANK, LATE_S = 3, 0.02
 
 
-def _rank_main(rank, world, port):
-    import os
-
-    os.environ.update(ENV)
+def _rank_main(rank, world, port, routing):
+    os.environ.update(ENV, MORI_EP_SIM_ROUTING=routing)
     dist.init_process_group(
         "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world
     )
     op = _op(rank, world)
-    ids = _routing(rank, world)
-    x, w = _inputs(ids.size(0))
-    for late in (False, True):
+    n = 64 * (rank + 1)
+    x, w, idx = _inputs(n)
+    sent = [None] * world
+    dist.all_gather_object(sent, n)
+    for step in range(4):
+        late = step == 3
         dist.barrier()
         if late and rank == LATE_RANK:
             time.sleep(LATE_S)
         t0 = time.monotonic()
-        outputs = op.dispatch(x, w, None, ids)
+        outputs = op.dispatch(x, w, None, idx)
         t1 = time.monotonic()
-        _check_dispatch(op, outputs, rank, world)
-        ends = [None] * world
-        dist.all_gather_object(ends, t1)
+        got = [None] * world
+        dist.all_gather_object(
+            got,
+            (
+                _check_dispatch(op, outputs, rank, world),
+                t1,
+                int(op.local_expert_count.sum()),
+            ),
+        )
+        recv, ends, hits = zip(*got)
+        assert sum(hits) == sum(sent) * TOPK  # every (token, expert) pair lands once
+        if step % 2 == 0:  # uniform layer
+            assert max(recv) < 1.3 * min(recv), recv
+        else:  # expert 0's rank is hot
+            assert recv[0] > 1.5 * max(recv[1:]), recv
         assert max(ends) - min(ends) < 3e-3, ends
         if late and rank != LATE_RANK:
             # less the spread of barrier exits across ranks
             assert t1 - t0 >= LATE_S + DISPATCH_US / 1e6 - 1e-3
-        out, _ = op.combine(outputs[0], outputs[1], ids)
-        assert out.shape == (ids.size(0), HIDDEN)
+        out, _ = op.combine(outputs[0], outputs[1], idx)
+        assert out.shape == (n, HIDDEN)
     dist.destroy_process_group()
 
 
-def test_ranks_see_their_own_imbalance():
+def test_routing_layers_and_imbalance(tmp_path):
+    routing = tmp_path / "routing.yaml"
+    routing.write_text(ROUTING)
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    mp.spawn(_rank_main, args=(4, port), nprocs=4)
+    mp.spawn(_rank_main, args=(4, port, str(routing)), nprocs=4)

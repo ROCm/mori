@@ -346,19 +346,19 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   using release = py::call_guard<py::gil_scoped_release>;
   m.def("ep_sim_enabled", &mori::moe::sim::IsEnabled);
   py::class_<EpSim>(m, "EpSim")
-      .def(py::init<const std::string&, int, int, int, int, int, int>(), py::arg("group"),
+      .def(py::init<const std::string&, int, int, int, int, int, int, bool>(), py::arg("group"),
            py::arg("rank"), py::arg("world_size"), py::arg("max_tokens"), py::arg("topk"),
-           py::arg("experts_per_rank"), py::arg("max_recv"))
+           py::arg("experts_per_rank"), py::arg("max_recv"), py::arg("async_send"))
       .def(
           "dispatch",
-          [](EpSim& sim, uintptr_t ids, int numTokens, uintptr_t recvIds, uintptr_t expertCount) {
-            return sim.Dispatch(reinterpret_cast<const int32_t*>(ids), numTokens,
-                                reinterpret_cast<int32_t*>(recvIds),
+          [](EpSim& sim, int numTokens, uintptr_t recvIds, uintptr_t expertCount) {
+            return sim.Dispatch(numTokens, reinterpret_cast<int32_t*>(recvIds),
                                 reinterpret_cast<int32_t*>(expertCount));
           },
-          py::arg("ids_ptr"), py::arg("num_tokens"), py::arg("recv_ids_ptr"),
-          py::arg("expert_count_ptr"), release())
+          py::arg("num_tokens"), py::arg("recv_ids_ptr"), py::arg("expert_count_ptr"), release())
+      .def("arrive", &EpSim::Arrive)
       .def("combine", &EpSim::Combine, release())
+      .def("end_call", &EpSim::EndCall, release())
       .def("wait", &EpSim::Wait, release());
 
   m.def("get_cur_rank_num_token", &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
