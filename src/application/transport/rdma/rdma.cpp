@@ -513,20 +513,20 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
 }
 
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufIova0(
-    void* ptr, size_t size, int dmabuf_fd, int accessFlag) {
+    void* ptr, size_t size, int dmabuf_fd, uint64_t dmabuf_offset, int accessFlag) {
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
-  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, 0, dmabuf_fd, effectiveAccessFlag);
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, dmabuf_offset, size, 0, dmabuf_fd, effectiveAccessFlag);
   if (!mr) {
     MORI_APP_ERROR(
         "RegisterRdmaMemoryRegionDmabufIova0 failed! addr:{}, size:{}, dmabuf_fd:{}, "
-        "accessFlag:{}, errno:{} ({})",
-        ptr, size, dmabuf_fd, effectiveAccessFlag, errno, strerror(errno));
+        "dmabuf_offset:{}, accessFlag:{}, errno:{} ({})",
+        ptr, size, dmabuf_fd, dmabuf_offset, effectiveAccessFlag, errno, strerror(errno));
     std::abort();
   }
   MORI_APP_TRACE(
-      "RegisterRdmaMemoryRegionDmabufIova0, addr:{}, size:{}, dmabuf_fd:{}, iova:0, lkey:{}, "
-      "rkey:{}",
-      ptr, size, dmabuf_fd, mr->lkey, mr->rkey);
+      "RegisterRdmaMemoryRegionDmabufIova0, addr:{}, size:{}, dmabuf_fd:{}, dmabuf_offset:{}, "
+      "iova:0, lkey:{}, rkey:{}",
+      ptr, size, dmabuf_fd, dmabuf_offset, mr->lkey, mr->rkey);
   mrPool.insert({ptr, mr});
   application::RdmaMemoryRegion handle;
   handle.addr = 0;
