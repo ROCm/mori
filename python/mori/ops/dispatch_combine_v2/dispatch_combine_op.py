@@ -233,42 +233,31 @@ class EpDispatchCombineConfig:
     # Receive layout of async_ll over "sdma" on one node: "compact" (default),
     # "segmented" or "auto".
     #
-    # "compact" rounds copy every source's rows into one dense prefix of the recv
-    # views ([0, total_recv)). An op built "segmented" can also run segmented
-    # rounds: a dispatch that passes segment_stride=S lands source s's rows at
-    # [s * S, s * S + n_s) and the recv views are the landing region itself,
-    # world_size * S rows, with no receive compaction. On the combine side the
-    # expert output is sent from the same layout, with no staging scatter. A
-    # dispatch without segment_stride runs a compact round on the same op, so one
-    # op serves both (e.g. compact under CUDA graphs).
+    # "compact" copies every source's rows into a dense prefix [0, total_recv) of
+    # the recv views. On an op built "segmented", a dispatch with
+    # segment_stride=S instead lands source s's rows at [s * S, s * S + n_s) and
+    # the recv views are that landing region (world_size * S rows): no receive
+    # compaction, and combine sends the expert output from the same layout. A
+    # dispatch without segment_stride still runs a compact round on that op
+    # (e.g. under CUDA graphs).
     #
-    # What a segmented round hands the consumer (the contract):
-    #   * every one of the world_size * S rows is an input row. Valid rows are
-    #     [s * S, s * S + n_s) per source, not a prefix. The rest (holes) carry
-    #     expert ids of the next rank's first expert with weight 0 and zeroed
-    #     scales, so a local expert_mask drops them; their hidden bytes are
-    #     stale, from an earlier round. Holes are typically a large share:
-    #     n_s counts only the tokens with an expert on this rank. Do not reduce
-    #     the hidden states across rows (a per-tensor scale, a global absmax):
-    #     a hole's stale bytes would leak into every row.
-    #   * total_recv reads world_size * S, the row count, so passing it as the
-    #     consumer's row bound (e.g. aiter fused_moe num_local_tokens) is right.
-    #     Do not truncate the views below that. segment_counts() has the n_s.
-    #   * the expert output must be written into combine_in_view() (also
-    #     world_size * S rows); combine copies any other tensor there first.
-    #   * S is the same on every rank in a round, at least every rank's token
-    #     count and at most effective_max_recv_per_rank (refused past it, on
-    #     every rank alike). Whether a round is segmented must also be the same
-    #     on every rank. Breaking either does not hang: a rank whose tokens
-    #     exceed S drops the rest (overflow), and ranks that disagree on the
-    #     mode or S read each other's rows at the wrong offsets (mismatch); both
-    #     are counted (segment_error_counts() / segment_error_flags()).
-    #   * the views' row count follows the host-side S, so a CUDA graph can
-    #     capture a segmented round only with a fixed S.
+    # Contract of a segmented round:
+    #   * all world_size * S rows are input rows, and total_recv reads that count
+    #     (pass it as e.g. aiter fused_moe num_local_tokens; do not truncate the
+    #     views). Rows outside the valid ranges (holes, often most of them) carry
+    #     a non-local expert with weight 0 and zeroed scales, so expert_mask drops
+    #     them; their hidden bytes are stale, so never reduce hidden states across
+    #     rows (per-tensor scale, global absmax). segment_counts() has the n_s.
+    #   * write the expert output into combine_in_view(); any other tensor is
+    #     copied there first.
+    #   * S must be the same on every rank, at least every rank's token count and
+    #     at most effective_max_recv_per_rank (refused past it); so must the
+    #     choice of segmented or compact. Violations do not hang; they are
+    #     counted (segment_error_counts()).
+    #   * the views' row count follows S, so a CUDA graph needs a fixed S.
     #
-    # "segmented" requires a config that supports it (the op refuses otherwise);
-    # "auto" picks "segmented" exactly when the config supports it, with no
-    # error, and the op's cfg.async_ll_recv_layout then reads the outcome.
+    # "segmented" is refused on a config that does not support it; "auto" picks
+    # it exactly when supported, and cfg.async_ll_recv_layout reads the outcome.
     async_ll_recv_layout: str = "compact"
 
     @property
