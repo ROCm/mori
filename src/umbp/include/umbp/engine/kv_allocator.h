@@ -68,7 +68,10 @@ class KvVmmApi {
                             const ExportedVmmHandle& exported) = 0;
 };
 
-std::shared_ptr<KvVmmApi> MakeHipVmmApi();
+// `forced_kind` is a validation seam for exercising both HIP shareable-handle
+// paths against real hardware. Production callers leave it unset and retain
+// per-device capability probing.
+std::shared_ptr<KvVmmApi> MakeHipVmmApi(std::optional<VmmHandleKind> forced_kind = std::nullopt);
 
 class KvVmmAllocator {
  public:

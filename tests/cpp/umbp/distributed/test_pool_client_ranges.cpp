@@ -214,6 +214,14 @@ bool WaitForExists(IUMBPClient* client, const std::string& key) {
 class PoolClientRangesTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    const std::string test_name = ::testing::UnitTest::GetInstance()->current_test_info()->name();
+    if (test_name == "GpuRangesUseGatherKernel" ||
+        test_name == "NumaGroupedArenasStageOnTheCallersNode") {
+      int devices = 0;
+      if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) {
+        GTEST_SKIP() << "no GPU";
+      }
+    }
     MasterServerConfig master_cfg;
     master_cfg.listen_address = "0.0.0.0:0";
     // The registry derives a 2 s client heartbeat from this TTL: short enough
@@ -756,6 +764,10 @@ TEST_F(PoolClientRangesTest, StaleSelfLocationIsExcludedBeforeRemoteFetch) {
 }
 
 TEST_F(PoolClientRangesTest, GpuRangesUseGatherKernel) {
+  int visible_devices = 0;
+  if (hipGetDeviceCount(&visible_devices) != hipSuccess || visible_devices == 0) {
+    GTEST_SKIP() << "no GPU";
+  }
   struct HipAllocation {
     void* ptr = nullptr;
     ~HipAllocation() {

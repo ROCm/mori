@@ -501,6 +501,40 @@ target_link_libraries(test_kv_vmm_allocator PRIVATE umbp_common GTest::gtest_mai
 target_compile_features(test_kv_vmm_allocator PRIVATE cxx_std_17)
 add_test(NAME umbp_kv_vmm_allocator COMMAND test_kv_vmm_allocator)
 
+# Real-device validation for engine-owned memory. Each case skips before any
+# device operation when no HIP GPU is visible; the filtered CTest entries make
+# the hardware matrix discoverable without moving CPU-only cases out of their
+# existing mixed targets.
+add_executable(test_engine_gpu test_engine_gpu.cpp)
+target_link_libraries(test_engine_gpu PRIVATE umbp_common hip::host GTest::gtest)
+target_compile_features(test_engine_gpu PRIVATE cxx_std_17)
+add_dependencies(test_engine_gpu umbp_standalone_server)
+
+function(add_umbp_gpu_gtest name target filter)
+  add_test(NAME ${name} COMMAND $<TARGET_FILE:${target}> --gtest_filter=${filter})
+  set_tests_properties(${name} PROPERTIES LABELS "gpu" SKIP_REGULAR_EXPRESSION
+                                                   "\\[  SKIPPED \\]")
+endfunction()
+
+add_umbp_gpu_gtest(umbp_gpu_vmm_same_gpu test_engine_gpu
+                   UmbpEngineGpu.PosixFdCrossProcessImportSameGpuIsByteExact)
+add_umbp_gpu_gtest(umbp_gpu_vmm_peer_gpu test_engine_gpu
+                   UmbpEngineGpu.PosixFdCrossProcessImportPeerGpuIsByteExact)
+add_umbp_gpu_gtest(umbp_gpu_executor_spans test_engine_gpu
+                   UmbpEngineGpu.ExecutorCopiesScatteredShortTailMultiRegionThroughSharedDram)
+add_umbp_gpu_gtest(umbp_gpu_vmm_rdma test_engine_gpu
+                   UmbpEngineGpu.OriginalVmmAllocationRegistersAndRoundTripsThroughRdma)
+add_umbp_gpu_gtest(umbp_gpu_f3_bytes test_engine_gpu
+                   UmbpEngineGpu.F3RetireCopiesVmmPageToSharedDramByteExactly)
+add_umbp_gpu_gtest(umbp_gpu_f3_process test_engine_gpu
+                   UmbpEngineGpu.SeparateNodeProcessF3DemotesAndLoadsSharedDram)
+add_umbp_gpu_gtest(umbp_gpu_layered_load test_engine_gpu
+                   UmbpEngineGpu.LayeredLoadStitchesPeerHbmPrefixAndSharedDramTail)
+add_umbp_gpu_gtest(umbp_gpu_remote_layered_load test_engine_gpu
+                   UmbpEngineGpu.RemoteLayeredLoadReadsOriginalVmmMrOverRdma)
+add_umbp_gpu_gtest(umbp_gpu_node_failstop test_engine_gpu
+                   UmbpEngineGpu.KilledNodeFailsLocalOnlyRankWithinHeartbeatDeadline)
+
 # BackendRegistry dispatch and the heartbeat event aggregation MediumBackend
 # absorbed from OwnedLocationSource. MockBackend is only the test double.
 add_executable(test_backend_registry test_backend_registry.cpp)
@@ -729,3 +763,44 @@ endif()
 target_link_libraries(test_umbp_sim PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
                                            ${_TEST_GRPCPP_LIB} GTest::gtest_main)
 add_test(NAME umbp_sim COMMAND test_umbp_sim)
+
+# Filtered aliases for every pre-existing UMBP test that dereferences a real
+# device pointer. These are intentionally added after all mixed CPU/GPU targets
+# exist; `ctest -L gpu` is the single hardware validation inventory.
+add_umbp_gpu_gtest(umbp_gpu_ssd_ranges_scatter test_umbp_ssd_tier_ranges
+                   SsdTierRangesDeviceTest.ScattersIntoDeviceBuffers)
+add_umbp_gpu_gtest(umbp_gpu_ssd_ranges_single test_umbp_ssd_tier_ranges
+                   SsdTierRangesDeviceTest.SingleSliceIntoDeviceBufferBounces)
+add_umbp_gpu_gtest(umbp_gpu_numa_ranges test_umbp_pool_client_ranges
+                   PoolClientNuma.RegisteredGpuWritesSteerAndCrossBufferReadsPreserveBytes)
+add_umbp_gpu_gtest(umbp_gpu_numa_whole test_umbp_pool_client_ranges
+                   PoolClientNuma.WholeObjectPutsSteerToWriterBuffer)
+add_umbp_gpu_gtest(umbp_gpu_pool_ranges_gather test_umbp_pool_client_ranges
+                   PoolClientRangesTest.GpuRangesUseGatherKernel)
+add_umbp_gpu_gtest(umbp_gpu_pool_ranges_numa test_umbp_pool_client_ranges
+                   PoolClientRangesTest.NumaGroupedArenasStageOnTheCallersNode)
+add_umbp_gpu_gtest(umbp_gpu_batch_put_roundtrip test_umbp_pool_client_batch_put
+                   BatchPutWarnTest.DeviceBufferRoundTripsByteExactOnLocalPath)
+add_umbp_gpu_gtest(umbp_gpu_batch_put_reject test_umbp_pool_client_batch_put
+                   BatchPutWarnTest.UnregisteredDeviceSourceIsRejectedNotHostStaged)
+add_umbp_gpu_gtest(umbp_gpu_transfer_lifetime test_transfer_engine
+                   HbmCopyEngine.GatherStreamsOutliveTheirThreads)
+add_umbp_gpu_gtest(umbp_gpu_transfer_prewarm test_transfer_engine
+                   HbmCopyEngine.GathersRunOnPrewarmedStreams)
+if(TARGET test_gds_engine)
+  add_umbp_gpu_gtest(umbp_gpu_gds test_gds_engine GdsEngine.ReadsFileRangeIntoDeviceMemory)
+endif()
+add_umbp_gpu_gtest(umbp_gpu_hbm_host_device test_hbm_backend
+                   HbmCopyEngine.RoundTripsHostToDeviceAndBack)
+add_umbp_gpu_gtest(umbp_gpu_hbm_scatter test_hbm_backend
+                   HbmCopyEngine.RoundTripsScatteredPagesThroughOneDeviceBuffer)
+add_umbp_gpu_gtest(umbp_gpu_hbm_device_device test_hbm_backend
+                   HbmCopyEngine.CopiesDeviceToDevice)
+add_umbp_gpu_gtest(umbp_gpu_hbm_register test_hbm_backend
+                   HbmBackend.RegistersItsPoolAsGpuMemoryOnItsDevice)
+add_umbp_gpu_gtest(umbp_gpu_hbm_pool_roundtrip test_hbm_backend
+                   HbmBackend.PutsAndGetsThroughTheCompositeEngine)
+add_umbp_gpu_gtest(umbp_gpu_ssd_gds test_ssd_backend
+                   SsdBackendGds.ResolvePublishesFileRefAndReadsIntoDeviceMemory)
+add_umbp_gpu_gtest(umbp_gpu_sim_pointer test_umbp_sim
+                   SimTest.DefaultGpuPointerClassificationKeepsRealAndSimCopies)

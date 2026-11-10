@@ -127,9 +127,26 @@ class UmbpLogCapture {
 // routing) + target with full 8 MiB.  Caller owns two src buffers:
 // caller_buf_ (ad-hoc malloc) and registered_buf_ (registered with
 // caller_->RegisterMemory).  Tests choose which one to feed BatchPut.
+// Probe before the fixture starts a peer: GPU-only aliases must skip cleanly
+// on CPU CI rather than failing first on unrelated RDMA initialization.
+bool DeviceMemoryAvailable() {
+  int count = 0;
+  if (hipGetDeviceCount(&count) != hipSuccess) {
+    (void)hipGetLastError();
+    return false;
+  }
+  return count > 0;
+}
+
 class BatchPutWarnTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    const std::string test_name = ::testing::UnitTest::GetInstance()->current_test_info()->name();
+    if ((test_name == "DeviceBufferRoundTripsByteExactOnLocalPath" ||
+         test_name == "UnregisteredDeviceSourceIsRejectedNotHostStaged") &&
+        !DeviceMemoryAvailable()) {
+      GTEST_SKIP() << "no HIP device available";
+    }
     caller_buf_ = std::malloc(kCallerBuf);
     registered_buf_ = std::malloc(kCallerBuf);
     ASSERT_NE(caller_buf_, nullptr);
@@ -426,18 +443,6 @@ TEST_F(BatchPutWarnTest, MultiPageObjectWithPartialTailRoundTripsByteExact) {
 // ---------------------------------------------------------------------------
 
 namespace {
-
-// Device memory is not available on every machine that runs this suite (and is
-// not available at all in a container without /dev/kfd), so the GPU cases skip
-// rather than fail. A skip here is not a pass — it means the case did not run.
-bool DeviceMemoryAvailable() {
-  int count = 0;
-  if (hipGetDeviceCount(&count) != hipSuccess) {
-    (void)hipGetLastError();
-    return false;
-  }
-  return count > 0;
-}
 
 class DeviceBuffer {
  public:

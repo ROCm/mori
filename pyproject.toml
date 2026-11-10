@@ -37,3 +37,8 @@ Repository = "https://github.com/ROCm/mori"
 
 [project.scripts]
 mori = "mori.cli:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires a real HIP GPU and is skipped in CPU-only environments",
+]

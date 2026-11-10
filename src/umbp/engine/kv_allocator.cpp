@@ -31,10 +31,13 @@ hipMemAllocationProp AllocationProp(int device, VmmHandleKind kind) {
 
 class HipVmmApi final : public KvVmmApi {
  public:
+  explicit HipVmmApi(std::optional<VmmHandleKind> forced_kind) : forced_kind_(forced_kind) {}
+
   hipError_t GetDevice(int* device) override { return hipGetDevice(device); }
   hipError_t SetDevice(int device) override { return hipSetDevice(device); }
 
   VmmHandleKind ProbeHandleKind(int device) override {
+    if (forced_kind_.has_value()) return *forced_kind_;
     std::lock_guard<std::mutex> lock(probe_mutex_);
     auto cached = handle_kinds_.find(device);
     if (cached != handle_kinds_.end()) return cached->second;
@@ -123,6 +126,7 @@ class HipVmmApi final : public KvVmmApi {
   }
 
  private:
+  std::optional<VmmHandleKind> forced_kind_;
   std::mutex probe_mutex_;
   std::unordered_map<int, VmmHandleKind> handle_kinds_;
 };
@@ -147,7 +151,9 @@ class DeviceGuard {
 
 }  // namespace
 
-std::shared_ptr<KvVmmApi> MakeHipVmmApi() { return std::make_shared<HipVmmApi>(); }
+std::shared_ptr<KvVmmApi> MakeHipVmmApi(std::optional<VmmHandleKind> forced_kind) {
+  return std::make_shared<HipVmmApi>(forced_kind);
+}
 
 void* KvVmmAllocator::Allocate(size_t size, int device) {
   if (size == 0 || device < 0) return nullptr;
