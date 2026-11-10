@@ -20,9 +20,9 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Check local href targets and fragments in a rendered Sphinx site, offline.
+"""Check local links, fragments and images in a rendered Sphinx site, offline.
 
-Scope: ``<a href>`` only. ``<link rel="next|prev">``, ``<img src>``, ``<script
+Scope: ``<a href>`` and ``<img src>``. ``<link rel="next|prev">``, ``<script
 src>`` and stylesheet ``<link href>`` are not followed -- the theme generates
 those from the toctree and the static tree, so they do not rot independently of
 the anchors that do. Do not read a clean run as "every asset resolves".
@@ -39,6 +39,7 @@ class Page(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.anchors = set()
         self.links = []
+        self.images = []
         self.feed(path.read_text(encoding="utf-8"))
 
     def handle_starttag(self, tag, attrs):
@@ -50,6 +51,8 @@ class Page(HTMLParser):
                 self.anchors.add(attrs["name"])
             if "href" in attrs:
                 self.links.append(attrs["href"])
+        if tag == "img" and "src" in attrs:
+            self.images.append(attrs["src"])
 
 
 def check(root):
@@ -60,6 +63,16 @@ def check(root):
     errors = []
     checked = 0
     for path, page in pages.items():
+        # A content image referenced through a raw HTML tag is not copied into
+        # the build, and nothing else would notice.
+        for src in page.images:
+            url = urlsplit(src)
+            if url.scheme or url.netloc:
+                continue
+            base = root if url.path.startswith("/") else path.parent
+            image = (base / unquote(url.path).lstrip("/")).resolve()
+            if not image.is_relative_to(root) or not image.is_file():
+                errors.append(f"{path.relative_to(root)}: missing image {src}")
         for href in page.links:
             url = urlsplit(href)
             if url.scheme or url.netloc:
