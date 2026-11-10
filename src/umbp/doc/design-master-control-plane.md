@@ -1016,7 +1016,7 @@ show from outside, and it names an *event*, never a metric. The dashboards
 beside it — client data rate, master RPC latency, RPC call rates, external
 KV — are backend-agnostic and stayed as they were.
 
-Set `MORI_UMBP_LOG_LEVEL=DEBUG` (or `UMBP_LOG_LEVEL=0`) to surface
+Set `MORI_UMBP_LOG_LEVEL=DEBUG` to surface
 per-RPC traces from `MORI_UMBP_INFO` / `MORI_UMBP_DEBUG`.
 
 ---
