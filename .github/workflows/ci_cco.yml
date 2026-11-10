@@ -1,14 +1,18 @@
 name: CCO CI test
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+# Called by ci.yml after its scope job, with the cco and fused lanes. ci.yml's
+# triggers, concurrency and gate cover these jobs.
+on:
+  workflow_call:
+    inputs:
+      cco:
+        description: Run the CCO unit, EPv2 single-node and CCO internode jobs
+        type: boolean
+        required: true
+      fused:
+        description: Run the CCO fused GEMM job
+        type: boolean
+        required: true
 
 env:
   IMAGE: rocm/mori:ci-cco
@@ -19,23 +23,47 @@ env:
 jobs:
   cco-unit-test:
     name: CCO unit test (${{ matrix.platform }})
+    if: inputs.cco
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Single node, so it shares ci.yml's intranode runner. MI355X-AINIC
+          # keeps the two internode jobs, which need that pair, cco-fused-test
+          # and cco-v2-test.
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC]
+            runner: [self-hosted, MI355X-AINIC-PIT-G17]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
     env:
+      CT: docker
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      # Pinned for the same reason as ci.yml's intranode-test socket_ifname: on
+      # this host auto-detection picks eno1, which does not accept local TCP.
+      MORI_SOCKET_IFNAME: eno0
+      NCCL_SOCKET_IFNAME: eno0
     timeout-minutes: 60
     steps:
-      - name: Checkout
+      - &cco-fix-perms
+        name: Fix workspace permissions
+        run: |
+          # Docker runs the build as root; a cancelled job leaves root-owned files
+          # that break actions/checkout's cleanup.
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ] && [ -z "$ROOTLESS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
+      - &cco-checkout
+        name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: true
@@ -43,32 +71,40 @@ jobs:
           # main; otherwise it would reuse the merge commit of the first attempt.
           ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
 
-      - name: Build CI image
+      - &cco-build-image
+        name: Build CI image
         run: |
           $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE \
             --build-arg GPU_ARCHS="gfx950 gfx1250" --build-arg WITH_FLYDSL=1 \
             -t $IMAGE -f docker/Dockerfile.dev .
 
-      - name: Start container
+      - &cco-start
+        name: Start container
         run: |
+          # A socket ifname only when the job sets one: an empty MORI_SOCKET_IFNAME
+          # is not unset to cco, which then looks for an interface named "".
           $CT rm -f $CONTAINER 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
+            ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
           $CT exec $CONTAINER \
             git config --global --add safe.directory $GITHUB_WORKSPACE
 
-      - name: Build mori with tests
+      - &cco-build-mori
+        name: Build mori with tests
         run: |
           # BUILD_UMBP=OFF: not needed for CCO, and its gtest discovery breaks under cmake 4.4.
           $CT exec $CONTAINER bash -c \
             "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON BUILD_BENCHMARK=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF BUILD_CCO_SDMA=ON pip install ."
 
-      - name: Verify the install is complete
+      - &cco-verify
+        name: Verify the install is complete
         # This image is the only one built WITH_FLYDSL=1, so it is the only job
         # that can assert both EP backends registered. A build that skips the
         # mori.cco.cco extension loses flydsl with it and everything below still
@@ -77,6 +113,12 @@ jobs:
           $CT exec $CONTAINER bash -c \
             "cd $GITHUB_WORKSPACE && python tools/verify_install.py"
 
+
+      - name: Verify the install without FlyDSL
+        # The only check that the hip EP backend registers without FlyDSL, as in a
+        # plain wheel install, for PRs that do not run ci.yml's build job.
+        run: |
+          $CT exec $CONTAINER bash -c "cd $GITHUB_WORKSPACE && python -c \"import sys, runpy; sys.modules['flydsl'] = None; runpy.run_path('tools/verify_install.py', run_name='__main__')\""
       - name: Check internode arena region invariants
         run: |
           # Pure function of the config: no GPU, no process group, no RDMA, so it
@@ -99,9 +141,9 @@ jobs:
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
-          # MORI_CCO_SKIP_GDA_FULL=1: the MI355X-AINIC runner has no intranode
-          # cross-rail RDMA, so GDA-FULL tests (gda_flush_async/gda_modes/
-          # multiprocess) can't form FULL connections; skip them here.
+          # MORI_CCO_SKIP_GDA_FULL=1: set on the MI355X-AINIC runner, which has no
+          # intranode cross-rail RDMA, so GDA-FULL tests (gda_flush_async/gda_modes/
+          # multiprocess) can't form FULL connections there. Not yet tried on PIT-G17.
           $CT exec -e MORI_CCO_SKIP_GDA_FULL=1 $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4 2>&1
 
       - name: Run CCO SDMA C++ tests (fork mode, 8 ranks)
@@ -166,7 +208,7 @@ jobs:
           $CT exec $CONTAINER bash -c "\
             mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_lsa_put"
           # TEMP: cco_gda_put bypassed on the MI355X-AINIC runner (GDA put not
-          # working there yet); re-enable once GDA is supported on this runner.
+          # working there); not yet tried on PIT-G17.
           # mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_gda_put
 
       - name: Run CCO Python examples (2 ranks)
@@ -180,8 +222,8 @@ jobs:
             MORI_ENABLE_SDMA=1 mpirun --allow-run-as-root -np 2 -x MORI_ENABLE_SDMA python 07_flydsl_sdma/main.py && \
             mpirun --allow-run-as-root -np 2 python 08_torch_symm_import/main.py && \
             MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=2 10_flydsl_sdma_allgather_async/main.py --iters 5 --timing-iters 5"
-            # GDA (device-initiated RDMA) examples fail on the runner (cross-rail
-            # RDMA); re-enable once that is fixed.
+            # GDA (device-initiated RDMA) examples failed on the MI355X-AINIC runner
+            # (cross-rail RDMA); not yet tried on PIT-G17.
             # mpirun --allow-run-as-root -np 2 python 03_flydsl_put/main.py
             # mpirun --allow-run-as-root -np 2 python 06_flydsl_gda_modes/main.py
 
@@ -190,6 +232,7 @@ jobs:
       # compiles src/allocator/symm_backend.cpp at all: every `pip install .` runs under
       # PEP 517 build isolation, where torch is not importable, so setup.py never
       # prebuilds the extension. Without this step nothing in CI compiles that file.
+
       - name: MORI torch SymmetricMemory backend
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e MORI_SYMM_FORCE_JIT=1 $CONTAINER bash -c "\
@@ -210,86 +253,6 @@ jobs:
           $CT exec $CONTAINER bash -c "\
             cd /tmp && \
             timeout 600 python -m pytest -v $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_buffer.py"
-
-      - name: Run CCO GEMM+AR numerics (up to 8 ranks)
-        run: |
-          # The op ships in mori.ops.gemm_ar, so run pytest from /tmp: from a
-          # repo cwd `python/mori/` shadows the install and a packaging miss
-          # (a subpackage find_packages never picked up) would read as green.
-          #
-          # test_gemm_ar_op.py is the public wrapper's own tests. The other two
-          # go through the benchmark, which calls the low-level builders, so
-          # they said nothing about that layer -- and three correctness bugs
-          # lived there behind a green suite.
-          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
-            cd /tmp && python -c 'import mori.ops.gemm_ar as g; print(g.GemmAllReduceOp)' && \
-            timeout 1800 python -m pytest -v \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_schedule.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
-
-      - name: Run CCO GEMM+A2A numerics and the recv-reuse race (8 ranks)
-        run: |
-          # From /tmp for the same packaging reason as above. test_gemm_a2a.py
-          # is the layout on the CPU; test_gemm_a2a_op.py runs the wrapper on 8
-          # ranks, including the race the recv-reuse credit exists for and its
-          # negative control with the credit off.
-          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
-            cd /tmp && python -c 'import mori.ops.gemm_a2a as g; print(g.GemmA2AOp)' && \
-            timeout 1800 python -m pytest -v \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_a2a.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_a2a_op.py"
-
-      - name: Run CCO A2A+GEMM numerics, band counting and the op (8 ranks)
-        run: |
-          # From /tmp for the same packaging reason as above. test_a2a_gemm.py
-          # is the layout on the CPU, every mode through the benchmark, and the
-          # signal-counter wrap; test_a2a_gemm_op.py runs the wrapper on 8 ranks.
-          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
-            cd /tmp && python -c 'import mori.ops.a2a_gemm as g; print(g.A2aGemmOp)' && \
-            timeout 1800 python -m pytest -v \
-              $GITHUB_WORKSPACE/tests/python/cco/test_a2a_gemm.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_a2a_gemm_op.py"
-
-      - name: Run CCO GEMM+AR benchmark (8 ranks, accuracy-gated)
-        run: |
-          # Accuracy is a gate (validated + rel_l2); absolute timings are only
-          # recorded -- this runner is shared, so a microsecond threshold would
-          # fail on a busy box and pass a real regression on an idle one. The
-          # one perf assertion is relative (fused beats split, measured back to
-          # back). -s so the numbers reach the log for a bisect to read.
-          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
-            cd $GITHUB_WORKSPACE && \
-            timeout 1800 pytest -v -s tests/python/cco/test_gemm_ar_bench.py"
-
-      # After the GEMM+AR steps on purpose. Each of these spawns 8-rank SDMA
-      # process groups, and their queues take seconds to come back; the gemm_ag
-      # tests settle and retry around that (anvil.cpp), the gemm_ar ones do not,
-      # so running gemm_ar right after this step fails in hsaKmtCreateQueueExt.
-      - name: Run CCO GEMM+AG op and kernel tests (up to 8 ranks)
-        run: |
-          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
-            cd /tmp && python -c 'import mori.ops.gemm_ag as g; print(g.__file__)' && \
-            timeout 2400 python -m pytest -v \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag_op.py"
-
-      # After the GEMM+AR steps for the same reason as the step above:
-      # test_ag_gemm.py settles and retries around slow-to-return SDMA queues
-      # (anvil.cpp); the gemm_ar tests do not.
-      - name: Run CCO AG+GEMM numerics, back to back (up to 8 ranks)
-        run: |
-          # From /tmp for the packaging reason above. test_ag_gemm.py drives the
-          # kernels through the benchmark: every mode against an fp32 reference
-          # for two operand sets, then calls back to back with a different rank
-          # held each time -- the race the closing barrier is for.
-          # test_ag_gemm_op.py is the public AgGemmOp, from one 8-rank spawn.
-          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
-            cd /tmp && python -c 'import mori.ops.ag_gemm as g; print(g.AgGemmOp)' && \
-            timeout 1500 python -m pytest -v \
-              $GITHUB_WORKSPACE/tests/python/cco/test_ag_gemm.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_ag_gemm_op.py"
 
       - name: Validate CCO ROCm runtime import order
         run: |
@@ -322,8 +285,8 @@ jobs:
 
       - name: Compile CCO Triton GDA variants (AINIC runtime gated)
         run: |
-          # Runtime GDA-FULL tests and examples are already gated on this runner:
-          # its intranode AINIC path faults even when both ranks use one HCA.
+          # Runtime GDA-FULL tests and examples are gated above: on the MI355X-AINIC
+          # runner the intranode AINIC path faults even when both ranks use one HCA.
           # Still create the resources and compile/link every Triton GDA variant.
           FIRST_RDMA_DEVICE="${MORI_RDMA_DEVICES%%,*}"
           $CT exec \
@@ -336,6 +299,7 @@ jobs:
             $CONTAINER bash -c "\
               cd $GITHUB_WORKSPACE && \
               timeout 300 pytest -v tests/python/cco/test_triton_gda.py"
+
       - name: Run JIT v2 C++ tests + host/device split guard
         run: |
           # Registered by tests/cpp/jit/CMakeLists.txt but selected by no job before
@@ -424,6 +388,165 @@ jobs:
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
 
+      - &cco-cleanup
+        name: Cleanup
+        if: always()
+        run: |
+          # Restore workspace ownership (build ran as root in the container).
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
+          [ -n "$ROOTLESS" ] || $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          # Graceful stop so GPU ranks release HIP/KFD contexts (not SIGKILLed).
+          CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
+
+  cco-fused-test:
+    name: CCO fused GEMM test (${{ matrix.platform }})
+    # The fused GEMM + collective ops use SDMA over loopback only. Their own runner
+    # takes them off the CCO unit test's critical path.
+    if: inputs.fused
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+    env:
+      CONTAINER: mori_cco_fused_${{ github.run_id }}
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      MORI_SOCKET_IFNAME: lo
+      NCCL_SOCKET_IFNAME: lo
+    timeout-minutes: 60
+    steps:
+      - *cco-fix-perms
+      - *cco-checkout
+      - *cco-build-image
+      - *cco-start
+      - *cco-build-mori
+      - *cco-verify
+
+      - name: Run CCO GEMM+AR numerics (up to 8 ranks)
+        run: |
+          # The op ships in mori.ops.gemm_ar, so run pytest from /tmp: from a
+          # repo cwd `python/mori/` shadows the install and a packaging miss
+          # (a subpackage find_packages never picked up) would read as green.
+          #
+          # test_gemm_ar_op.py is the public wrapper's own tests. The other two
+          # go through the benchmark, which calls the low-level builders, so
+          # they said nothing about that layer -- and three correctness bugs
+          # lived there behind a green suite.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.gemm_ar as g; print(g.GemmAllReduceOp)' && \
+            timeout 1800 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_schedule.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
+
+      - name: Run CCO GEMM+A2A numerics and the recv-reuse race (8 ranks)
+        run: |
+          # From /tmp for the same packaging reason as above. test_gemm_a2a.py
+          # is the layout on the CPU; test_gemm_a2a_op.py runs the wrapper on 8
+          # ranks, including the race the recv-reuse credit exists for and its
+          # negative control with the credit off.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.gemm_a2a as g; print(g.GemmA2AOp)' && \
+            timeout 1800 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_a2a.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_a2a_op.py"
+
+      - name: Run CCO A2A+GEMM numerics, band counting and the op (8 ranks)
+        run: |
+          # From /tmp for the same packaging reason as above. test_a2a_gemm.py
+          # is the layout on the CPU, every mode through the benchmark, and the
+          # signal-counter wrap; test_a2a_gemm_op.py runs the wrapper on 8 ranks.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.a2a_gemm as g; print(g.A2aGemmOp)' && \
+            timeout 1800 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_a2a_gemm.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_a2a_gemm_op.py"
+
+      - name: Run CCO GEMM+AR benchmark (8 ranks, accuracy-gated)
+        run: |
+          # Accuracy is a gate (validated + rel_l2); absolute timings are only
+          # recorded -- this runner is shared, so a microsecond threshold would
+          # fail on a busy box and pass a real regression on an idle one. The
+          # one perf assertion is relative (fused beats split, measured back to
+          # back). -s so the numbers reach the log for a bisect to read.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 1800 pytest -v -s tests/python/cco/test_gemm_ar_bench.py"
+
+      # After the GEMM+AR steps on purpose. Each of these spawns 8-rank SDMA
+      # process groups, and their queues take seconds to come back; the gemm_ag
+      # tests settle and retry around that (anvil.cpp), the gemm_ar ones do not,
+      # so running gemm_ar right after this step fails in hsaKmtCreateQueueExt.
+
+      - name: Run CCO GEMM+AG op and kernel tests (up to 8 ranks)
+        run: |
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.gemm_ag as g; print(g.__file__)' && \
+            timeout 2400 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag_op.py"
+
+      # After the GEMM+AR steps for the same reason as the step above:
+      # test_ag_gemm.py settles and retries around slow-to-return SDMA queues
+      # (anvil.cpp); the gemm_ar tests do not.
+
+      - name: Run CCO AG+GEMM numerics, back to back (up to 8 ranks)
+        run: |
+          # From /tmp for the packaging reason above. test_ag_gemm.py drives the
+          # kernels through the benchmark: every mode against an fp32 reference
+          # for two operand sets, then calls back to back with a different rank
+          # held each time -- the race the closing barrier is for.
+          # test_ag_gemm_op.py is the public AgGemmOp, from one 8-rank spawn.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.ag_gemm as g; print(g.AgGemmOp)' && \
+            timeout 1500 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_ag_gemm.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_ag_gemm_op.py"
+
+      - *cco-cleanup
+
+  cco-v2-test:
+    name: CCO EPv2 single-node test (${{ matrix.platform }})
+    # The EPv2 AsyncLL, routing-snapshot and bench steps, on the runner and in the
+    # configuration they always passed in as part of the CCO unit test. On
+    # MI355X-AINIC-PIT-G17, test_asyncll's back_to_back check fails.
+    if: inputs.cco
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The CCO unit test's values on this runner, where no device is named
+          # rdma*, so cco sees no NIC; no socket ifname, so it auto-detects.
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+    env:
+      CONTAINER: mori_cco_v2_${{ github.run_id }}
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+    timeout-minutes: 30
+    steps:
+      - *cco-fix-perms
+      - *cco-checkout
+      - *cco-build-image
+      - *cco-start
+      - *cco-build-mori
+      - *cco-verify
+
       - name: Run ops-v2 AsyncLL (EP8, sdma and lsa transports)
         run: |
           # The only CI coverage of the v2 AsyncLL family: ci.yml's async_ll steps
@@ -470,20 +593,13 @@ jobs:
             ITERS=20 WARMUP=10 \
             torchrun --standalone --nproc_per_node=8 bench_ep.py"
 
-
-      - name: Cleanup
-        if: always()
-        run: |
-          # Restore workspace ownership (build ran as root in the container).
-          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
-          # Graceful stop so GPU ranks release HIP/KFD contexts (not SIGKILLed).
-          CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
+      - *cco-cleanup
 
   cco-internode-test:
     name: CCO internode test (${{ matrix.platform }})
-    # Serialised behind the single-node job rather than run beside it: both want
-    # all 8 GPUs and the same NICs on node1.
-    needs: cco-unit-test
+    # Needs no other job: cco-unit-test runs on another runner, and this runner
+    # runs one job at a time, so it never overlaps the other jobs on node1.
+    if: inputs.cco
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -688,13 +804,19 @@ jobs:
       - name: Cleanup node1
         if: always()
         run: |
-          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
+          [ -n "$ROOTLESS" ] || $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
 
       - name: Cleanup node2
         if: always()
         run: |
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
-            $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+            test -n '$ROOTLESS' || $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
             cd $GITHUB_WORKSPACE && CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
           " || true

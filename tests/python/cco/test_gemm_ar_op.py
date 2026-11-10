@@ -33,7 +33,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import time
 
@@ -52,6 +51,8 @@ from mori.ops.gemm_ar.op import (  # noqa: E402
     padded_m,
     supports,
 )
+
+from . import kfd_settle  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 WORKER = pathlib.Path(__file__).with_name("gemm_ar_op_worker.py")
@@ -370,11 +371,10 @@ def _run_worker_multi(world_size: int, case: str, *extra: str, timeout: int = 90
 def _spawn_worker(
     world_size: int, case: str, *extra: str, timeout: int = 900, last: bool = False
 ):
-    time.sleep(_SETTLE_SECONDS)
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
-    result = subprocess.run(
+    result = kfd_settle.run(
         [
             sys.executable,
             "-m",

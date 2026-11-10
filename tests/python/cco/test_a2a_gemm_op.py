@@ -32,11 +32,12 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import time
 
 import pytest
+
+from . import kfd_settle
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("flydsl")
@@ -58,11 +59,10 @@ requires_world = pytest.mark.skipif(
 
 
 def _spawn(*args: str, timeout: int = 900, last: bool = False, env=None):
-    time.sleep(_SETTLE_SECONDS)
     env = {**os.environ, **(env or {})}
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
-    result = subprocess.run(
+    result = kfd_settle.run(
         [
             sys.executable,
             "-m",

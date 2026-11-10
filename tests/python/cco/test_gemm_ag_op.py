@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -43,6 +42,8 @@ import torch
 
 from mori.ops.gemm_ag import GemmAgOp, supports
 from mori.ops.gemm_ag.op import shape_constraint
+
+from . import kfd_settle
 
 WORKER = Path(__file__).with_name("gemm_ag_op_worker.py")
 #: fp8's own floor at these operands, and bf16's rounding for a bf16 C.
@@ -140,11 +141,10 @@ def test_explicit_modes_ignore_the_rule(mode, want):
 
 
 def _spawn(last=False):
-    time.sleep(_SETTLE_SECONDS)
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
-    result = subprocess.run(
+    result = kfd_settle.run(
         [
             sys.executable,
             "-m",
