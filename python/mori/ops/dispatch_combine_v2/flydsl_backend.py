@@ -81,6 +81,17 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 f"quant_type={cfg.quant_type!r} with an asymmetric dtype is the hip "
                 "backend's gfx125x push combine; pass kernel_backend='hip'",
             )
+        # Only the hip backend compiles the AsyncLL kernel family. Without this
+        # the op built ordinary kernels and ran them, reporting backend=flydsl
+        # and "passed", so async_ll=True meant something other than what it said
+        # -- only the split dispatch_send/dispatch_recv API raised, and a caller
+        # using plain dispatch()/combine() never found out.
+        if cfg.async_ll:
+            return (
+                "async_ll=True selects the AsyncLL kernel family, which only the "
+                "'hip' backend implements; pass kernel_backend='hip' (or set "
+                "MORI_V2_KERNEL_BACKEND=hip)",
+            )
         return ()
 
     def __init__(self, cfg: EpDispatchCombineConfig, comm):
@@ -163,9 +174,10 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
         self.combine_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         # Per-block xdb flag counters for the gather combine entry barrier: one
-        # i64 per block, fixed at xdb_flag_slots (== CU count, the max combine
-        # block_num). Every block owns a private counter and block 0 fills the
-        # unused tail so all stay in lockstep across calls with different block_num.
+        # i64 per block, fixed at xdb_flag_slots (combine block_num is clamped
+        # to it, see tuning_configs._MAX_COMBINE_BLOCKS). Every block owns a
+        # private counter and block 0 fills the unused tail so all stay in
+        # lockstep across calls with different block_num.
         self.cross_device_flag = torch.ones(
             xdb_flag_slots, dtype=torch.int64, device=device
         )

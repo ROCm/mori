@@ -46,6 +46,8 @@ name both halves); ``lookup`` still reads it as "fp4" for callers that pass
 
 from __future__ import annotations
 
+import functools
+
 from mori.ops import utils as _gpu
 
 # Models with no table of their own that reuse a tuned sibling's key.
@@ -61,6 +63,39 @@ def _device_key():
         return _MODEL_ALIAS.get(model, model)
     if _gpu.topology()[1] == 120500:  # gfx1250 has no MI model name
         return "gfx1250"
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _detected_arch():
+    try:
+        from mori.jit.config import detect_gpu_arch
+
+        return detect_gpu_arch()
+    except Exception:
+        return None
+
+
+def _device_keys():
+    """Table keys to try, most specific first. KFD reports gfx1250 for every ASIC
+    revision and either code target, so the parts that can run gfx1250-strict are
+    told apart by their revision (0), or by running it; whichever code they run, they
+    use the gfx1250-strict rows when there is one.
+    """
+    key = _device_key()
+    if key != "gfx1250":
+        return (key,)
+    rev = _gpu.asic_revision()
+    if rev == 0 or (rev is None and _detected_arch() == "gfx1250-strict"):
+        return ("gfx1250-strict", "gfx1250")
+    return (key,)
+
+
+def _first_bucket(table, devs, *shape):
+    for dev in devs:
+        found = _bucket_key(table.get(dev, {}), *shape)
+        if found is not None:
+            return found
     return None
 
 
@@ -165,6 +200,7 @@ _DISPATCH_TABLE: dict = {
         #   5120   149.4         161.0
         (8, 7168, 6, None): {
             None: ((2048, 64, 16), (None, 128, 16)),
+            "bf16": ((None, 64, 16),),
             "fp4": (
                 (1024, 64, 16),
                 (1536, 64, 24),
@@ -174,12 +210,76 @@ _DISPATCH_TABLE: dict = {
         },
         # EP16 on four 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-11. 128x16 is the only geometry
         # that builds the pinned-destination dispatch (kDPin in ep_intranode_1250x.hpp). 128x16
-        # minus 64x16, dispatch us, graph, one M=16384 plan, 3 alternating rounds: 1024 tokens a
-        # rank -11.0..-11.8, 2048 +2.2..+3.3, 3072 -6.0..-6.8, 8192 -14.7..-15.3, 16384
-        # -80.9..-83.3. 2048 is the only point 64x16 wins; the edge between them is unswept.
         (16, 7168, 6, None): {
             None: ((None, 64, 16),),
-            "fp4": ((4095, 64, 16), (None, 128, 16)),
+            "fp4": ((512, 64, 16), (None, 128, 16)),
+        },
+        (32, 7168, 6, None): {
+            None: ((512, 64, 16), (2048, 64, 16), (None, 128, 16)),
+            "fp4": ((512, 64, 16), (1024, 64, 16), (None, 128, 16)),
+        },
+        # EP4, hidden 2048, topk 8, 64 experts a rank (Qwen3.5-35B-A3B at DP4 + EP4), 2026-10-30.
+        # bench_ep.py, graph, ITERS=200, mean of 3 alternating rounds (spread <= 1.3 us). The
+        # 64x16 default costs bf16 up to 9% to 512 tokens a rank and 19-46% past it; fp4 12-26% to
+        # 1024 and about 2x past it, and on 64x16 fp4 is slower than bf16 at 192-256 and 2048-4096
+        # tokens. bf16 and fp4 take the same schedule; fp8 and other expert counts are unswept.
+        # Dispatch us:
+        #   ct     32x8   64x8  64x16  128x8  256x8     (bf16 | fp4)
+        #   64     24.4   24.5   26.6   24.4   24.4  |  21.3   21.1   23.8   21.0   20.9
+        #   256    25.3   25.1   25.3   25.0   25.0  |  21.6   21.5   26.8   21.5   21.5
+        #   512    31.4   26.3   26.9   26.0   26.0  |  31.5   21.9   26.0   21.7   21.7
+        #   1024   41.2   32.5   34.7   29.1   28.8  |  41.0   31.8   26.6   22.9   22.7
+        #   2048   64.2   43.6   51.8   38.3   35.5  |  67.6   41.6   52.7   32.4   25.7
+        #   4096  112.6   68.4   64.9   54.5   50.9  | 119.4   68.9   68.3   43.1   34.5
+        (4, 2048, 8, 64): {
+            "bf16": ((256, 32, 8), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
+            "fp4": ((256, 32, 8), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
+        },
+    },
+    # Parts that can run gfx1250-strict (ASIC revision 0), either code target, EP4.
+    # Dispatch and combine hold one block per CU (LDS) while a block waits for the whole
+    # grid, and these parts have fewer CUs than the 256-block gfx1250 rows assume, so
+    # those would hang on them.
+    # Graph-timed, median of 3 rounds; within 3-5% the smaller geometry wins.
+    "gfx1250-strict": {
+        (4, 7168, 8, None): {
+            None: ((512, 64, 8), (1024, 64, 16), (None, 64, 8)),
+            "fp8": ((256, 64, 8), (1024, 64, 16), (1536, 64, 24), (None, 64, 32)),
+            "fp4": (
+                (256, 64, 8),
+                (512, 128, 8),
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (8192, 64, 32),
+                (None, 128, 16),
+            ),
+        },
+        (4, 7168, 9, None): {
+            None: ((4096, 64, 8), (None, 64, 16)),
+            "fp8": ((256, 64, 8), (1024, 64, 16), (1536, 64, 24), (None, 64, 32)),
+            "fp4": (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (8192, 64, 32),
+                (None, 128, 16),
+            ),
+        },
+        (4, 7168, 6, None): {
+            None: ((4096, 64, 8), (None, 64, 16)),
+            "fp8": ((1024, 64, 8), (1536, 64, 24), (2048, 64, 16), (None, 64, 32)),
+            "fp4": (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (8192, 64, 32),
+                (None, 128, 16),
+            ),
+        },
+        # 16 warps from 512 tokens; the gfx1250 rows' 8-warp grids trail well behind here.
+        (4, 2048, 8, 64): {
+            "bf16": ((256, 32, 8), (512, 32, 16), (1024, 64, 16), (None, 128, 16)),
+            "fp4": ((256, 32, 8), (512, 32, 16), (1024, 64, 16), (None, 128, 16)),
         },
     },
 }
@@ -211,6 +311,15 @@ _COMBINE_TABLE: dict = {
         # The single-shot default, listed so the EP8 and EP16 dispatch schedules have a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
         (16, 7168, 6, None): ((None, 64, 8),),
+        # The same for the EP4 hidden-2048 dispatch schedule (combine unswept there).
+        (4, 2048, 8, 64): ((None, 64, 8),),
+        (32, 7168, 6, None): ((None, 64, 8),),
+    },
+    # The gfx1250-strict parts, as their dispatch rows.
+    "gfx1250-strict": {
+        (4, 7168, 8, None): ((128, 64, 4), (512, 128, 8), (None, 64, 8)),
+        (4, 7168, 9, None): ((128, 64, 4), (256, 128, 8), (None, 64, 8)),
+        (4, 7168, 6, None): ((128, 64, 4), (256, 128, 8), (None, 64, 8)),
     },
 }
 
@@ -259,11 +368,39 @@ _COMBINE_PUSH_TABLE: dict = {
                 (8192, 128, 16),
                 (None, 128, 24),
             ),
+            (32, 7168, 6, None): (
+                (512, 64, 8),
+                (2047, 64, 16),
+                (2048, 64, 24),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
+        },
+        # gfx1250-strict parts, EP4. No 24-warp geometry: several times slower there.
+        "gfx1250-strict": {
+            (4, 7168, 6, None): ((256, 64, 8), (1024, 64, 16), (None, 128, 8)),
+            (4, 7168, 9, None): (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (1536, 128, 8),
+                (2048, 128, 16),
+                (4096, 192, 8),
+                (None, 128, 8),
+            ),
         },
     },
     "fp4_blockwise_fp32": {
         "gfx1250": {
             (4, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
+        },
+        "gfx1250-strict": {
+            (4, 7168, 6, None): (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (4096, 128, 8),
+                (8192, 192, 8),
+                (None, 128, 8),
+            ),
         },
     },
     "fp8_blockwise": {
@@ -283,9 +420,100 @@ _COMBINE_PUSH_TABLE: dict = {
                 (16384, 128, 24),
                 (None, 64, 16),
             ),
+            (32, 7168, 6, None): (
+                (256, 64, 8),
+                (384, 128, 8),
+                (2048, 128, 16),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
+        },
+        # gfx1250-strict parts, EP4: no 24-warp geometry, as above.
+        "gfx1250-strict": {
+            (4, 7168, 6, None): ((256, 64, 8), (1536, 64, 16), (None, 128, 16)),
+            (4, 7168, 9, None): ((256, 64, 8), (1536, 64, 16), (None, 128, 16)),
         },
     },
 }
+
+_LL128_TABLE: dict = {
+    "fp4_blockwise": {
+        "gfx1250": {
+            (4, 7168, 6, None): {
+                "fp4": dict(max_tok=256, dispatch=(64, 16), combine=(64, 16))
+            },
+            (8, 7168, 6, None): {
+                "fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (16, 7168, 6, None): {
+                "fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (32, 7168, 6, None): {
+                "fp4": dict(max_tok=64, dispatch=(64, 16), combine=(64, 8))
+            },
+        },
+    },
+    "fp8_blockwise": {
+        "gfx1250": {
+            (4, 7168, 6, None): {
+                "fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))
+            },
+            (8, 7168, 6, None): {
+                "fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (16, 7168, 6, None): {
+                "fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (32, 7168, 6, None): {
+                "fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 8))
+            },
+        },
+    },
+    "none": {
+        "gfx1250": {
+            (4, 7168, 6, None): {
+                "bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16)),
+                "fp8": dict(max_tok=64, dispatch=(64, 8), combine=(64, 16)),
+            },
+            (8, 7168, 6, None): {
+                "bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16)),
+                "fp8": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16)),
+            },
+            (16, 7168, 6, None): {
+                "bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
+                "fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
+            },
+        },
+    },
+}
+
+
+def ll128(
+    world_size,
+    hidden_dim,
+    topk,
+    dtype,
+    max_tok,
+    experts_per_rank=None,
+    quant_type="none",
+):
+    if _device_keys()[0] == "gfx1250-strict":
+        return None  # LL128's polls miss peer writes on these parts; use the schedule
+    per_shape = _LL128_TABLE.get(quant_type, {}).get(_device_key(), {})
+    entry = _bucket_key(per_shape, world_size, hidden_dim, topk, experts_per_rank)
+    plan = entry.get(dtype) if entry else None
+    if plan is None:
+        return None
+    if max_tok <= plan["max_tok"]:
+        return {"dispatch": plan["dispatch"], "combine": plan["combine"]}
+    if max_tok <= plan.get("combine_max_tok", 0):
+        return {"combine": plan["combine"]}
+    return {
+        "dispatch": plan["dispatch"],
+        "combine": plan["combine"],
+        "max_tok": plan["max_tok"],
+    }
+
 
 # THE ROUND RULE outranks every shape choice above: _tpi = warpSize/topk tokens are
 # consumed per warp-iteration, so one round covers block*warp*_tpi tokens and coming up
@@ -347,28 +575,19 @@ def lookup(
     re-tuned without touching the other.
     """
     base = _hip_default()
-    dev = _device_key()
-    disp = _bucket_key(
-        _DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
-    )
+    devs = _device_keys()
+    shape = (world_size, hidden_dim, topk, experts_per_rank)
+    disp = _first_bucket(_DISPATCH_TABLE, devs, *shape)
     comb = None
     if quant_type in _COMBINE_PUSH_TABLE:
-        comb = _bucket_key(
-            _COMBINE_PUSH_TABLE[quant_type].get(dev, {}),
-            world_size,
-            hidden_dim,
-            topk,
-            experts_per_rank,
-        )
+        comb = _first_bucket(_COMBINE_PUSH_TABLE[quant_type], devs, *shape)
     if comb is None:
-        comb = _bucket_key(
-            _COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
-        )
+        comb = _first_bucket(_COMBINE_TABLE, devs, *shape)
     if disp is None or comb is None:
-        return base  # half a schedule is not a schedule
+        return _gpu.fit_blocks_to_cus(base)  # half a schedule is not a schedule
     # None is the "every dtype measured the same" key; an exact dtype overrides it.
     disp = disp.get(_DISPATCH_DTYPE_ALIAS.get(dtype, dtype)) or disp.get(None)
     if disp is None:
-        return base
+        return _gpu.fit_blocks_to_cus(base)
     base["schedule"] = _merge(disp, comb)
-    return base
+    return _gpu.fit_blocks_to_cus(base)

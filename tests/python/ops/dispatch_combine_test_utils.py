@@ -466,7 +466,10 @@ class EpDispatchCombineTestCase:
         dispatch_hidden_dim=None,
     ):
         self.config = config
-        self.device = torch.device("cuda", self.config.rank)
+        # The caller's device, not one derived from the config: single-host
+        # tests emulate several nodes with gpu_per_node < world_size, and
+        # multi-node runs have global ranks past the local device count.
+        self.device = torch.device("cuda", torch.cuda.current_device())
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(123)
         # Cross-dtype support: dispatch and combine may transport different
@@ -623,7 +626,12 @@ class EpDispatchCombineTestCase:
 
             if sentinel_pattern is not None and n > 0:
                 k = self.config.num_experts_per_token
-                if sentinel_pattern == "every_other":
+                if sentinel_pattern == "unrouted_token":
+                    # Padding-style token: every top-k routing id is -1, while
+                    # the remaining tokens keep the selected routing.
+                    indices[0, :] = -1
+                    sentinel_slots = []
+                elif sentinel_pattern == "every_other":
                     sentinel_slots = list(range(1, k, 2))
                 elif sentinel_pattern == "first_only":
                     sentinel_slots = list(range(1, k))

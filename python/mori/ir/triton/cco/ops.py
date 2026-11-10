@@ -28,7 +28,9 @@ boundary as ``uint64`` values:
 * a window is :attr:`mori.cco.RegisteredWindow.handle`.
 
 The C++ wrapper monomorphizes CCO template axes into symbol names.  For example,
-``gda_put_iw_inc`` calls ``cco_gda_put__iw__inc`` directly.
+``gda_put_iw_inc`` calls ``cco_gda_put__iw__inc`` directly, and
+``gda_put_iw_inc_deferred`` the ``GdaDoorbell.DEFERRED`` handle's
+``cco_gda_put__iw__inc__deferred``.
 """
 
 import triton.language as tl
@@ -37,10 +39,14 @@ from triton.language import core
 from mori.cco.device.ops import (
     CCO_DEVICE_FUNCTIONS,
     CoopScope,
+    GdaDoorbell,
+    GdaFlags,
     SignalOp,
+    Team,
     ThreadMode,
     SdmaOptFlags,
     SdmaFlags,
+    gda_doorbell_tag,
 )
 
 _LIB_NAME = "libmori_cco_device"
@@ -126,10 +132,26 @@ def _build_all():
 _all_ops = _build_all()
 globals().update(_all_ops)
 
+_GDA_FLUSH_FAMILIES = ("gda_flush", "gda_flush_peer", "gda_flush_async")
+
+
+@core.extern
+def _with_doorbell(name, doorbell, *args, _semantic=None):
+    """Calls extern ``name`` in GdaDoorbell mode ``doorbell`` (both constexpr),
+    e.g. gda_put_iw_none -> gda_put_iw_none_deferred."""
+    name = core._unwrap_if_constexpr(name)
+    flush = CCO_DEVICE_FUNCTIONS[name]["family"] in _GDA_FLUSH_FAMILIES
+    tag = gda_doorbell_tag(core._unwrap_if_constexpr(doorbell), flush=flush)
+    return _all_ops[name + tag[1:]](*args, _semantic=_semantic)
+
+
 __all__ = list(_all_ops) + [
     "CoopScope",
     "SignalOp",
     "ThreadMode",
+    "Team",
+    "GdaDoorbell",
+    "GdaFlags",
     "SdmaOptFlags",
     "SdmaFlags",
 ]

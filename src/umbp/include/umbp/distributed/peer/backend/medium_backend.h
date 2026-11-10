@@ -299,6 +299,10 @@ class MediumBackend : public MetricSource {
   // call (the default) simply has no outbox worth gating.
   virtual void SetEventPublishing(bool /*enabled*/) {}
 
+  // Installed on the operation decorator. Empty keys mean clear. No I/O here.
+  using ChangeHook = std::function<void(const std::vector<std::string>&)>;
+  virtual void SetChangeHook(ChangeHook /*callback*/) {}
+
   // ---- eviction ordering: the pool decides; a medium only supplies order ----
 
   // Start the recency order EvictionCandidates() reads.  Off by default (it
@@ -314,6 +318,10 @@ class MediumBackend : public MetricSource {
   // file SSD tier is one: it frees disk a whole segment file at a time, and
   // keys picked by recency alone can leave every segment partly live.
   virtual bool OwnsEvictionOrder() const { return false; }
+
+  // Renew these keys' recency without reading them: a client looked them up to
+  // load next.  No-op for keys not held, or when no order is kept.
+  virtual void Touch(const std::vector<std::string>& /*keys*/) {}
 
   // ---- observability ----
   //

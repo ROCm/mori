@@ -72,6 +72,11 @@ message AllocateSlotRequest {
   // backend registered for `tier`.
   optional string backend_name = 4;
   string logical_tier = 5;
+  // The NUMA node the writer's source lives on (its GPU's, or its staging
+  // arena's).  A peer whose DRAM tier has one buffer per node prefers the
+  // buffer on that node, so the reader that wrote the object fetches it through
+  // NICs on the same node index at both ends.  Absent: no preference.
+  optional int32 preferred_numa_node = 6;
 }
 // AllocateSlot / BatchAllocateSlots per-entry outcome.
 // FAILED_NO_SPACE is split out so the writer can keep retrying with

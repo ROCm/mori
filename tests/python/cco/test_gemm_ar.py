@@ -417,8 +417,24 @@ def test_blockscale_lands_at_the_fp8_floor(m, n, k):
     assert rel < 3e-3, f"blockscale relL2 {rel:.3e} against the fp32 reference"
 
 
-@pytest.mark.parametrize("m,n,k", [(1024, 512, 512), (2048, 5120, 2048)])
-def test_mxfp8_lands_at_the_fp8_floor(m, n, k):
+@pytest.mark.parametrize("scale_prefetch", [None, True])
+@pytest.mark.parametrize("quant", ["mxfp8", "mxfp8_raw"])
+@pytest.mark.parametrize(
+    "m,n,k",
+    # K=256, 640 and 1280 put the raw path's last scale chunk at 2, 1 and 2 of
+    # its 4 K steps: one chunk only, then the prologue's two, then one refilled
+    # in the loop. K=256 has no main-loop step for the prefetch, only the peeled
+    # ones; K=8192 is past SCALE_PREFETCH_MIN_K, so the default turns it on.
+    [
+        (1024, 512, 256),
+        (1024, 512, 512),
+        (1024, 512, 640),
+        (2048, 5120, 1280),
+        (2048, 5120, 2048),
+        (512, 512, 8192),
+    ],
+)
+def test_mxfp8_lands_at_the_fp8_floor(m, n, k, quant, scale_prefetch):
     """``quant="mxfp8"`` -- DeepSeek-V4.1-Flash's quantisation -- against fp32.
 
     32-wide ue8m0 on both sides, which is the scaled MFMA's own operand format:
@@ -431,7 +447,10 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k):
     same floor as the other two quantisations. A wrong lane mapping does not
     land near the floor: it misses by the ratio of two random powers of two.
 
-    ``n=5120, k=2048`` is ``wo_b`` per rank at TP4 on V4.1-Flash.
+    ``n=5120, k=2048`` is ``wo_b`` per rank at TP4 on V4.1-Flash. ``k=256``
+    runs no main-loop step at all, only the two peeled ones; ``k=8192`` is above
+    the K where ``scale_prefetch`` turns on by default, and ``True`` forces it
+    everywhere.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires a GPU")
@@ -466,6 +485,25 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k):
     rn = ref.norm()
 
     cfg = layout.ArConfig(world_size=2, m=m, n=n)
+    if quant == "mxfp8_raw" and scale_prefetch:
+        # Its scales come from LDS slots refilled every four steps, so a read
+        # one step ahead could cross into a chunk not yet staged.
+        with pytest.raises(ValueError, match="mxfp8_raw"):
+            compile_fused_gemm_scatter(
+                cfg,
+                0,
+                K=k,
+                BLOCK_M=256,
+                BLOCK_N=256,
+                b_preshuffled=True,
+                fuse=False,
+                swap_ab=True,
+                permlane=True,
+                lane_transpose=True,
+                quant=quant,
+                scale_prefetch=scale_prefetch,
+            )
+        return
     gemm = compile_fused_gemm_scatter(
         cfg,
         0,
@@ -477,17 +515,23 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k):
         swap_ab=True,
         permlane=True,
         lane_transpose=True,
-        quant="mxfp8",
+        quant=quant,
+        scale_prefetch=scale_prefetch,
     )
+    if quant == "mxfp8_raw":
+        # The quantiser's own row-major bytes, staged through LDS.
+        sa, sb = ea.to(torch.uint8).reshape(-1), eb.to(torch.uint8).reshape(-1)
+    else:
+        # A goes through preshuffle_a_scale (K-block major, four M tiles to a
+        # dword); B stays K-block major [K/32, N/32] int32.
+        sa, sb = preshuffle_a_scale(ea), eb.t().reshape(-1).contiguous()
     ours = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
     gemm(
         a.contiguous().view(torch.int8).view(-1),
         b_shuf.contiguous().view(torch.int8).view(-1),
         ours.view(-1),
-        # A goes through preshuffle_a_scale (K-block major, four M tiles to a
-        # dword); B stays K-block major [K/32, N/32] int32.
-        preshuffle_a_scale(ea),
-        eb.t().reshape(-1).contiguous(),
+        sa,
+        sb,
         m,
         n,
         0,
@@ -497,7 +541,144 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k):
     torch.cuda.synchronize()
 
     rel = ((ours.float() - ref).norm() / rn).item()
-    assert rel < 3e-3, f"mxfp8 relL2 {rel:.3e} against the fp32 reference"
+    assert rel < 3e-3, f"{quant} relL2 {rel:.3e} against the fp32 reference"
+
+
+@pytest.mark.parametrize("block_n", [128, 256])
+@pytest.mark.parametrize("m,n,k", [(1024, 5120, 4096), (512, 1024, 8192)])
+def test_scale_prefetch_is_bitwise_identical_on_both_tiles(m, n, k, block_n):
+    """Prefetch on by default against forced off, on both N tiles.
+
+    Only the order of the scale loads changes, so the output may not change by
+    a bit; the floor check in ``test_mxfp8_lands_at_the_fp8_floor`` could not
+    see a stale A1 half that happened to be close. ``block_n=128`` is
+    ``Mxfp8GemmOp``'s narrow tile (no permlane), where the end-of-step wait
+    did not cover ``a_next1``'s second load once the prefetch moved the scale
+    loads -- and the wait for them -- ahead of it. Both K are past
+    ``SCALE_PREFETCH_MIN_K``, so ``None`` means on.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    pytest.importorskip("flydsl")
+    import flydsl.expr as fx
+    from mori.ops.gemm_ar import compile_fused_gemm_scatter, preshuffle_b
+
+    g = torch.Generator(device="cuda").manual_seed(13)
+    a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    ea = torch.randint(
+        120, 123, (m, k // 32), generator=g, device="cuda", dtype=torch.int32
+    )
+    eb = torch.randint(
+        120, 123, (n // 32, k // 32), generator=g, device="cuda", dtype=torch.int32
+    )
+    sa, sb = preshuffle_a_scale(ea), eb.t().reshape(-1).contiguous()
+    b_shuf = preshuffle_b(b).contiguous().view(torch.int8).view(-1)
+    cfg = layout.ArConfig(world_size=2, m=m, n=n)
+    wide = block_n == 256
+    outs = {}
+    for prefetch in (None, False):
+        gemm = compile_fused_gemm_scatter(
+            cfg,
+            0,
+            K=k,
+            BLOCK_M=256,
+            BLOCK_N=block_n,
+            b_preshuffled=True,
+            fuse=False,
+            swap_ab=True,
+            permlane=wide,
+            lane_transpose=wide,
+            quant="mxfp8",
+            scale_prefetch=prefetch,
+        )
+        out = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
+        # A few calls each: an ordering hole shows up as a call that differs.
+        for _ in range(4):
+            gemm(
+                a.contiguous().view(torch.int8).view(-1),
+                b_shuf,
+                out.view(-1),
+                sa,
+                sb,
+                m,
+                n,
+                0,
+                0,
+                stream=fx.Stream(torch.cuda.current_stream()),
+            )
+            torch.cuda.synchronize()
+            outs.setdefault(prefetch, []).append(out.clone())
+    ref = outs[False][0]
+    for prefetch, runs in outs.items():
+        for i, got in enumerate(runs):
+            assert torch.equal(got, ref), (prefetch, i)
+
+
+@pytest.mark.parametrize("k", [4096, 8192])
+def test_fused_kernel_compiles_with_the_default_scale_prefetch(k, monkeypatch):
+    """The fused all-reduce kernel at K past ``SCALE_PREFETCH_MIN_K``, built
+    the way ``GemmAllReduceOp`` builds it, so the prefetch is on by default.
+
+    Compile only (FlyDSL's ``COMPILE_ONLY``): the main loop is the one the
+    bitwise test above runs with ``fuse=False``, and what ``fuse=True`` adds
+    is the epilogue's puts, which need a communicator to execute but not to
+    compile. Off is compiled alongside as the control.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    pytest.importorskip("flydsl")
+    import flydsl.expr as fx
+    from mori.ops.gemm_ar import compile_fused_gemm_scatter
+
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    m, n = 512, 1024
+    cfg = layout.ArConfig(world_size=2, m=m, n=n)
+    a = torch.zeros(m * k, device="cuda", dtype=torch.int8)
+    b = torch.zeros(n * k, device="cuda", dtype=torch.int8)
+    c = torch.zeros(m * n, device="cuda", dtype=torch.bfloat16)
+    sa = torch.zeros(m * k // 128, device="cuda", dtype=torch.int32)
+    sb = torch.zeros(n * k // 32, device="cuda", dtype=torch.int32)
+    for prefetch in (None, False):
+        gemm = compile_fused_gemm_scatter(
+            cfg,
+            0,
+            K=k,
+            BLOCK_M=256,
+            BLOCK_N=256,
+            b_preshuffled=True,
+            fuse=True,
+            transport="sdma",
+            quant="mxfp8",
+            swap_ab=True,
+            permlane=True,
+            lane_transpose=True,
+            scale_prefetch=prefetch,
+        )
+        gemm(a, b, c, sa, sb, m, n, 0, 0, stream=fx.Stream(torch.cuda.current_stream()))
+
+
+@pytest.mark.parametrize("quant", ["ptpc", "blockscale"])
+def test_scale_prefetch_refuses_a_quant_without_mxfp8_scales(quant):
+    """An explicit ``scale_prefetch=True`` used to be dropped for these."""
+    pytest.importorskip("flydsl")
+    from mori.ops.gemm_ar import compile_fused_gemm_scatter
+
+    with pytest.raises(ValueError, match="scale_prefetch"):
+        compile_fused_gemm_scatter(
+            layout.ArConfig(world_size=2, m=512, n=512),
+            0,
+            K=4096,
+            BLOCK_M=256,
+            BLOCK_N=256,
+            b_preshuffled=True,
+            fuse=False,
+            swap_ab=True,
+            permlane=True,
+            lane_transpose=True,
+            quant=quant,
+            scale_prefetch=True,
+        )
 
 
 @pytest.mark.parametrize("m,n,k", [(512, 512, 256), (4096, 7168, 1024)])
@@ -587,6 +768,21 @@ def test_swap_ab_is_bitwise_identical(m, n, k):
         assert torch.equal(
             got, ref
         ), f"swap_ab {extra} is not bit-identical to the unswapped path"
+
+
+def test_fused_kernel_reads_no_config_object():
+    """Config the fused kernel reads must reach it as scalars.
+
+    FlyDSL keys its compile cache on a kernel's scalar closure values; an
+    ``ArConfig`` read inside the body is not part of the key, so two configs
+    differing only there could share a cached kernel with the wrong offsets.
+    """
+    import re
+
+    src = (REPO_ROOT / "python/mori/ops/gemm_ar/kernels_fused.py").read_text()
+    start = src.index("    @flyc.kernel(name=_kname")
+    body = src[start : src.index("\n    @flyc.jit", start)]
+    assert not re.findall(r"\bcfg\.\w+", body)
 
 
 def test_rotated_tile_order_is_a_permutation_of_the_linear_one():
@@ -700,3 +896,42 @@ def test_gemm_ar_modes_agree(mode):
     assert record["validated"] is True
     assert record["max_rank_time_us"] > 0
     assert record["rel_l2"] < 5e-3
+
+
+@pytest.mark.parametrize(
+    "mode,k,extra",
+    [
+        # Every mode the BF16 kernel serves, at an odd K step count (192 / 64).
+        ("gemm-only", 192, ()),
+        ("split-sdma", 192, ()),
+        ("fused-sdma", 192, ()),
+        # K_ITERS == 2: no main-loop step, only the two peeled ones.
+        ("fused-sdma", 128, ()),
+        # Kimi-K3's shared-expert down_proj and attention o_proj, K per rank.
+        ("fused-sdma", 768, ()),
+        ("fused-sdma", 1536, ()),
+        # The narrow row tile, the other one the BF16 op accepts.
+        ("fused-sdma", 768, ("--block-m", "128")),
+        # Reduce-scatter only, and the fp8 all-gather wire.
+        ("fused-sdma", 768, ("--collective", "rs")),
+        ("fused-sdma", 768, ("--gather-dtype", "fp8", "--gather-transport", "lsa")),
+    ],
+)
+def test_bf16_gemm_all_reduce_validates(mode, k, extra):
+    """``--quant bf16``: the BF16 GEMM, alone and with the all-reduce.
+
+    The bench validates every row of the result against an fp32 reference and
+    gates it two-sided where the wire is lossy, so ``validated`` is the
+    assertion; the rest checks that the configuration asked for is the one that
+    ran.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    pytest.importorskip("flydsl")
+    record = _run_bench(2, mode, 512, 1024, k, ("--quant", "bf16", *extra))
+    assert record["validated"] is True, record
+    assert record["quant"] == "bf16" and record["k"] == k, record
+    if "fp8" in extra:
+        assert record["gather_dtype"] == "fp8", record
+    else:
+        assert record["rel_l2"] < 3e-3, record

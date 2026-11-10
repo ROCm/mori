@@ -47,11 +47,13 @@ from __future__ import annotations
 
 import ctypes
 import os
+import warnings
 from pathlib import Path
 
 __all__ = [
     "load_library",
     "make_plan",
+    "arena_regions",
     "make_launch_group",
     "LaunchGroup",
     "precompile",
@@ -216,7 +218,7 @@ def load_library(name: str = _ABI_NAME, extra_dirs=None) -> None:
 
 
 def _bind(lib: ctypes.CDLL) -> None:
-    """The whole ABI: ten symbols, the same for every kernel."""
+    """The whole ABI: twelve symbols, the same for every kernel."""
     lib.mori_jit_last_error.restype = ctypes.c_char_p
     lib.mori_jit_last_error.argtypes = []
 
@@ -240,6 +242,11 @@ def _bind(lib: ctypes.CDLL) -> None:
         ctypes.POINTER(ctypes.c_longlong),  # values
         ctypes.c_int,  # count
     ]
+
+    # Guarded: a library built before describe existed still loads.
+    if hasattr(lib, "mori_jit_plan_describe"):
+        lib.mori_jit_plan_describe.restype = ctypes.c_char_p
+        lib.mori_jit_plan_describe.argtypes = list(lib.mori_jit_plan_create.argtypes)
 
     lib.mori_jit_plan_destroy.restype = None
     lib.mori_jit_plan_destroy.argtypes = [ctypes.c_void_p]
@@ -316,10 +323,12 @@ def _as_ptr(x) -> int:
 # gives the constructor its parameters, the ARGS schema gives launch its struct
 # layout, and both come from C++ -- so registering a kernel there is the whole job.
 #
-# The only two conventions:
+# The only three conventions:
 #   * a request field tagged `e` (enum) accepts a name from DTYPES as well as an int
 #   * request fields under `off.` are region offsets: pass `arena=` and they are
 #     bound once from arena.offset(region)
+#   * an info key `region.<stem>` is the bytes that region needs (0 = no need);
+#     arena_regions() sizes an arena from it, and binding checks arena.size()
 # ---------------------------------------------------------------------------
 
 
@@ -422,6 +431,46 @@ def _enum_code(value) -> int:
     return DTYPES[name]
 
 
+def _parse_info(text: str) -> dict:
+    """`key=value` lines -> dict, with bools and ints converted."""
+    out = {}
+    for line in text.splitlines():
+        k, _, v = line.partition("=")
+        if not k:
+            continue
+        if v in ("true", "false"):
+            out[k] = v == "true"
+        elif v.lstrip("-").isdigit():
+            out[k] = int(v)
+        else:
+            out[k] = v
+    return out
+
+
+_REGION_KEY = "region."
+
+
+def arena_regions(*infos, region_names=None) -> list[tuple[str, int]]:
+    """The arena regions the given plans need, as ``[(name, nbytes)]``.
+
+    Each info (``plan.info`` or ``Plan.describe(...)``) reports ``region.<stem>``;
+    a region takes the largest any of them asks for, in the order they first
+    report it, and one no plan needs (0 everywhere) is left out. ``region_names``
+    maps a stem to the arena's name for it, as it does for ``arena=``.
+
+    Pass the info of every plan bound to the arena: a plan reports 0 for a region
+    another plan sizes (EP dispatch vs combine), yet binding still needs it to exist.
+    """
+    names = region_names or {}
+    need = {}
+    for info in infos:
+        for k, v in info.items():
+            if k.startswith(_REGION_KEY):
+                stem = k[len(_REGION_KEY) :]
+                need[stem] = max(need.get(stem, 0), int(v))
+    return [(names.get(stem, stem), n) for stem, n in need.items() if n > 0]
+
+
 def make_plan(kernel: str, enums: dict | None = None) -> type:
     """A Plan class for a kernel registered on the C++ side, generated from its
     published schemas. Nothing about the kernel is written here.
@@ -471,6 +520,31 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
             ctypes.addressof(buf) + getattr(args_t, name).offset, src, nbytes
         )
 
+    def _request(kwargs, extra):
+        """The request fields in `kwargs`, coerced; any other key is an error."""
+        req = {}
+        for snake, wire in snake_to_wire.items():
+            tag = req_schema[wire][0]
+            names = field_enums.get(wire)
+            if snake in kwargs:
+                req[wire] = _coerce(tag, wire, kwargs.pop(snake), names)
+            elif wire in kwargs:  # the C++ spelling also works
+                req[wire] = _coerce(tag, wire, kwargs.pop(wire), names)
+
+        if kwargs:
+            raise TypeError(
+                f"{kernel}: unknown argument(s) {sorted(kwargs)}; "
+                f"accepted: {sorted(snake_to_wire)} (+ {extra})"
+            )
+        return req
+
+    def _abi_request(req):
+        items = list(req.items())
+        n = len(items)
+        cnames = (ctypes.c_char_p * n)(*[k.encode() for k, _ in items])
+        cvalues = (ctypes.c_longlong * n)(*[int(v) for _, v in items])
+        return cnames, cvalues, n
+
     class Plan:
         _kernel = kernel
         _args_t = args_t
@@ -478,25 +552,8 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
 
         def __init__(self, *, arch=None, arena=None, region_names=None, **kwargs):
             lib = _load()
-            req = {}
-            for snake, wire in snake_to_wire.items():
-                tag = req_schema[wire][0]
-                names = field_enums.get(wire)
-                if snake in kwargs:
-                    req[wire] = _coerce(tag, wire, kwargs.pop(snake), names)
-                elif wire in kwargs:  # the C++ spelling also works
-                    req[wire] = _coerce(tag, wire, kwargs.pop(wire), names)
-
-            if kwargs:
-                raise TypeError(
-                    f"{kernel}: unknown argument(s) {sorted(kwargs)}; "
-                    f"accepted: {sorted(snake_to_wire)} (+ arch, arena, region_names)"
-                )
-
-            items = list(req.items())
-            n = len(items)
-            cnames = (ctypes.c_char_p * n)(*[k.encode() for k, _ in items])
-            cvalues = (ctypes.c_longlong * n)(*[int(v) for _, v in items])
+            req = _request(kwargs, "arch, arena, region_names")
+            cnames, cvalues, n = _abi_request(req)
             handle = lib.mori_jit_plan_create(
                 kernel.encode(), arch.encode() if arch else None, cnames, cvalues, n
             )
@@ -547,6 +604,58 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                         # Optional and genuinely off: the kernel's `if constexpr`
                         # is what keeps the 0 from being dereferenced.
                         self._defaults[wire] = 0
+                if hasattr(arena, "size"):
+                    self._check_arena(arena, names)
+                else:
+                    warnings.warn(
+                        f"{kernel}: the arena has no size(), so its regions are not "
+                        "checked against what the plan needs; give it one "
+                        "(SymmArena has it). Unchecked arenas will be refused.",
+                        FutureWarning,
+                        stacklevel=2,
+                    )
+
+        def _check_arena(self, arena, names) -> None:
+            # A region smaller than the plan needs is overrun by the kernel, on a
+            # peer as often as here; refuse it now. A region the plan reports as 0
+            # is one its kernel never dereferences (dispatch and outTok), however
+            # the arena sizes it.
+            info = self.info
+            for region in arg_regions.values():
+                need = int(info.get(_REGION_KEY + region, 0))
+                if not need:
+                    continue
+                name = names.get(region, region)
+                have = int(arena.size(name))
+                if have < need:
+                    self.close()
+                    raise ValueError(
+                        f"{kernel}: arena region {name!r} is {have} bytes, the plan "
+                        f"needs {need} (size the arena with arena_regions() over the "
+                        f"info of every plan bound to it)"
+                    )
+
+        @classmethod
+        def describe(cls, *, arch=None, **kwargs) -> dict:
+            """The `info` a plan for this request would report, without compiling it.
+
+            For sizing what the plan binds -- arena regions, staging -- before the
+            plan exists. Resolving the arch may still query the GPU (or set arch /
+            MORI_JIT_ARCH). cacheDir is empty: nothing was compiled.
+            """
+            lib = _load()
+            if not hasattr(lib, "mori_jit_plan_describe"):
+                raise RuntimeError(
+                    f"mori jit [{kernel}]: {library_path()} predates describe; rebuild it"
+                )
+            req = _request(kwargs, "arch")
+            cnames, cvalues, n = _abi_request(req)
+            text = lib.mori_jit_plan_describe(
+                kernel.encode(), arch.encode() if arch else None, cnames, cvalues, n
+            )
+            if text is None:
+                raise RuntimeError(f"mori jit [{kernel}] describe: {_error()}")
+            return _parse_info(text.decode())
 
         def bind(self, **args) -> None:
             """Pin launch arguments that never change between calls.
@@ -680,18 +789,7 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                 raise RuntimeError(f"mori jit [{kernel}] info: {_error()}")
             buf = ctypes.create_string_buffer(need)
             lib.mori_jit_plan_info(self._handle, buf, need)
-            out = {}
-            for line in buf.value.decode().splitlines():
-                k, _, v = line.partition("=")
-                if not k:
-                    continue
-                if v in ("true", "false"):
-                    out[k] = v == "true"
-                elif v.lstrip("-").isdigit():
-                    out[k] = int(v)
-                else:
-                    out[k] = v
-            return out
+            return _parse_info(buf.value.decode())
 
         def close(self) -> None:
             if getattr(self, "_handle", None) is not None:

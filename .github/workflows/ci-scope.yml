@@ -1,0 +1,68 @@
+name: CI scope
+
+# Called first by ci.yml; .github/scripts/ci_scope.py has the rules.
+on:
+  workflow_call:
+    inputs:
+      comment:
+        description: Keep a comment on the PR with the lanes (needs pull-requests write)
+        type: boolean
+        default: false
+    outputs:
+      mori:
+        description: MoRI CI on MI355X (EP v1, shmem, IO, CCL)
+        value: ${{ jobs.detect.outputs.mori }}
+      mi300x:
+        description: MoRI CI on MI300X
+        value: ${{ jobs.detect.outputs.mi300x }}
+      umbp:
+        description: UMBP unit tests
+        value: ${{ jobs.detect.outputs.umbp }}
+      cco:
+        description: CCO unit test (cco and EPv2), CCO EPv2 single-node test, CCO internode
+        value: ${{ jobs.detect.outputs.cco }}
+      fused:
+        description: The CCO fused GEMM + collective job
+        value: ${{ jobs.detect.outputs.fused }}
+      full:
+        description: Run the full internode bench/stress sweeps
+        value: ${{ jobs.detect.outputs.full }}
+      reason:
+        description: Why these lanes run
+        value: ${{ jobs.detect.outputs.reason }}
+
+jobs:
+  detect:
+    name: detect
+    runs-on: ubuntu-latest
+    # Waits up to 20 min for pre-commit on the head commit.
+    timeout-minutes: 30
+    outputs:
+      mori: ${{ steps.scope.outputs.mori }}
+      mi300x: ${{ steps.scope.outputs.mi300x }}
+      umbp: ${{ steps.scope.outputs.umbp }}
+      cco: ${{ steps.scope.outputs.cco }}
+      fused: ${{ steps.scope.outputs.fused }}
+      full: ${{ steps.scope.outputs.full }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+          # This job's token can write to the PR; the script gets it as GH_TOKEN.
+          persist-credentials: false
+
+      - name: Decide which lanes run
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          COMMENT: ${{ inputs.comment }}
+        run: python3 .github/scripts/ci_scope.py

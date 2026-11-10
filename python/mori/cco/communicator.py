@@ -329,6 +329,18 @@ class DevCommHandle(CCOResource):
         self._check_valid()
         return self._dev_comm.per_rank_size
 
+    @property
+    def sdma_num_queue(self) -> int:
+        """SDMA queues per peer this communicator actually connected.
+
+        Not the requested count: cco adopts what was really set up, and that is
+        0 -- with a logged error but no failure -- when the library was built
+        BUILD_CCO_SDMA=OFF, MORI_ENABLE_SDMA is unset, or no peer reports SDMA.
+        Every ccoSdma put on such a communicator moves no bytes.
+        """
+        self._check_valid()
+        return self._dev_comm.sdma_num_queue
+
     def __repr__(self) -> str:
         if not self.is_valid:
             return "<DevCommHandle: closed>"
