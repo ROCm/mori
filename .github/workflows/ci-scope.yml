@@ -49,7 +49,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          sparse-checkout: .github/scripts
+          # ci_scope.py reads what PR CI runs, builds or imports to tell which
+          # tools/ files count.
+          sparse-checkout: |
+            /.github/scripts/
+            /.github/workflows/
+            /docker/
+            /tools/
+            /cmake/
+            /python/mori/
+            /setup.py
+            /pyproject.toml
+            CMakeLists.txt
           sparse-checkout-cone-mode: false
           # This job's token can write to the PR; the script gets it as GH_TOKEN.
           persist-credentials: false

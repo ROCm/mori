@@ -41,7 +41,8 @@ Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
     the PR's CI (ci-rerun.yml); labels are read live, so the re-run sees it;
   - otherwise the lanes follow the changed files (rules below), after the
     pre-commit check of the head commit has passed. A rename counts under both
-    its old and its new path.
+    its old and its new path. A tools/ file counts only if something PR CI runs,
+    builds or imports names it (ci_tools).
 
 With COMMENT=true it keeps one comment on the PR up to date with the lanes.
 
@@ -55,6 +56,7 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 LANES = ("mori", "mi300x", "umbp", "cco", "fused")
 
@@ -66,6 +68,12 @@ AREAS = [
         "ignored",
         r"^\.github/(ISSUE_TEMPLATE|PULL_REQUEST_TEMPLATE|CODEOWNERS)|^\.claude/",
     ),
+    # Lint and style configs: only the pre-commit check reads them.
+    (
+        "ignored",
+        r"^(\.clang-format|\.typos\.toml|CPPLINT\.cfg|\.pre-commit-config\.yaml)$"
+        r"|^tools/codestyle/",
+    ),
     ("ci_cco", r"^\.github/workflows/ci_cco\.yml$"),
     # ci.yml runs the scope and calls ci_cco.yml, so it can affect every lane.
     (
@@ -74,6 +82,11 @@ AREAS = [
     ),
     # Other workflows (nightly, docs, pre-commit, ...) do not run in PR CI.
     ("ignored", r"^\.github/"),
+    # The JIT v2 C++ tests and their host/device split check run in the CCO unit test.
+    ("epv2", r"^tools/jit_v2/|^tests/cpp/jit/"),
+    # Any other tools/ file counts only if CI builds or runs it (ci_tools); then
+    # the rules below classify it.
+    ("tools", r"^tools/"),
     ("umbp", r"(^|/|_)umbp(/|_|\.|$)|^examples/monitoring/"),
     ("epv2", r"(^|/)dispatch_combine_v2(/|$)|(^|/)jit/v2/"),
     (
@@ -85,7 +98,16 @@ AREAS = [
         r"|^examples/cco/python/11_flydsl_mega_moe_sdma/",
     ),
     ("cco", r"(^|/|_)cco(/|_|\.|$)"),
-    ("io", r"(^|/|_)io(/|_|\.|$)"),
+    # RAS is built into mori_io.
+    ("io", r"(^|/|_)io(/|_|\.|$)|(^|/)ras(/|_|\.|$)"),
+    # KIWI builds only in the MI355X build job and the MI300X jobs.
+    ("kiwi", r"(^|/)(dispatch_combine_)?kiwi(/|_|\.|$)"),
+    # EP v1 tuning tables, tests and examples: only the EP v1 jobs read or run them.
+    (
+        "epv1",
+        r"^python/mori/ops/tuning_configs/|^tests/python/ops/|^examples/ops/"
+        r"|^tests/python/test_tuning_config_quant_types\.py$",
+    ),
     (
         "build",
         r"^(setup\.py|pyproject\.toml|CMakeLists\.txt|requirements[^/]*\.txt)$|^cmake/|^docker/|^3rdparty/",
@@ -98,7 +120,7 @@ AREAS = [
 MI300X_PATHS = re.compile(
     r"^(src|include/mori|python/mori)/ops/(?!dispatch_combine_v2/|gemm_|ag_gemm/|a2a_gemm/|__init__\.py$)"
     r"|^tests/python/ops/(?!dispatch_combine_v2/)|^examples/ops/"
-    r"|(^|/)(shmem|kiwi)(/|_|\.|$)|mlx5|(^|/|_)io(/|_|\.|$)"
+    r"|(^|/)(shmem|kiwi)(/|_|\.|$)|mlx5|(^|/|_)io(/|_|\.|$)|(^|/)ras(/|_|\.|$)"
     r"|^(src|include/mori)/application/(transport/(rdma|sdma)|bootstrap|topology|context|memory)/"
     r"|^include/mori/core/|^(src|include/mori)/collective/|^python/mori/(jit/(?!v2/)|ccl/)"
     r"|^tests/python/ccl/|^tools/run_internode_ccl_ag\.sh$|^src/pybind/pybind_(ops|shmem|ccl)\.cpp$"
@@ -109,17 +131,73 @@ MI300X_PATHS = re.compile(
 
 # Which areas switch on each lane; "core" (anything unmatched) switches on all.
 LANE_AREAS = {
-    "mori": {"core", "io", "build", "ci_shared"},
+    "mori": {"core", "io", "build", "kiwi", "epv1", "ci_shared"},
     "umbp": {"core", "io", "build", "umbp", "ci_shared"},
     "cco": {"core", "build", "cco", "epv2", "ci_cco", "ci_shared"},
     "fused": {"core", "build", "cco", "fused", "ci_cco", "ci_shared"},
 }
 
 
+# What PR CI runs, builds or imports: a tools/ file named in one of these, in a
+# docker/ file the workflows use, or in a tools/ file that counts, counts.
+CI_WORKFLOWS = (".github/workflows/ci.yml", ".github/workflows/ci_cco.yml")
+CI_ENTRY_FILES = (
+    *CI_WORKFLOWS,
+    "setup.py",
+    "pyproject.toml",
+    "**/CMakeLists.txt",
+    "cmake/**/*",
+    "python/mori/**/*.py",
+)
+ROOT = Path(__file__).resolve().parents[2]
+_ci_tools = None
+
+
+def ci_tools():
+    """tools/ files that CI uses; None (every one counts) without a checkout."""
+    global _ci_tools
+    if _ci_tools is None:
+        if not (ROOT / ".github/workflows/ci.yml").is_file():
+            return None
+        texts = [
+            f.read_text(errors="ignore")
+            for pattern in CI_ENTRY_FILES
+            for f in ROOT.glob(pattern)
+            if f.is_file() and "3rdparty" not in f.parts
+        ]
+        workflows = "\n".join(
+            (ROOT / w).read_text(errors="ignore") for w in CI_WORKFLOWS
+        )
+        texts += [
+            f.read_text(errors="ignore")
+            for f in (ROOT / "docker").rglob("*")
+            if f.is_file() and str(f.relative_to(ROOT)) in workflows
+        ]
+        tools = {
+            str(f.relative_to(ROOT)) for f in (ROOT / "tools").rglob("*") if f.is_file()
+        }
+        used, todo = set(), "\n".join(texts)
+        while todo:
+            new = {
+                t
+                for t in tools - used
+                if t in todo
+                or re.search(rf"(?<![\w.-]){re.escape(Path(t).name)}(?![\w-])", todo)
+            }
+            used |= new
+            todo = "\n".join((ROOT / t).read_text(errors="ignore") for t in new)
+        _ci_tools = used
+    return _ci_tools
+
+
 def area_of(path):
     for name, pattern in AREAS:
         if re.search(pattern, path):
-            return name
+            if name != "tools":
+                return name
+            used = ci_tools()
+            if used is not None and path not in used:
+                return "ignored"
     return "core"
 
 
