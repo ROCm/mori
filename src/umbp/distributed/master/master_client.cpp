@@ -381,7 +381,8 @@ grpc::Status MasterClient::BatchRoutePut(const std::vector<std::string>& keys,
 
 grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
                                          const std::unordered_set<std::string>& exclude_nodes,
-                                         std::vector<std::optional<RouteGetResult>>* out) {
+                                         std::vector<std::optional<RouteGetResult>>* out,
+                                         std::chrono::milliseconds timeout) {
   ScopedRpcTimer _rpc_timer(this, "BatchRouteGet");
   if (out == nullptr) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "out is null");
@@ -394,6 +395,7 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
 
   ::umbp::BatchRouteGetResponse resp;
   grpc::ClientContext ctx;
+  if (timeout.count() > 0) ctx.set_deadline(std::chrono::system_clock::now() + timeout);
   auto status = GetStub(stub_.get())->BatchRouteGet(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;

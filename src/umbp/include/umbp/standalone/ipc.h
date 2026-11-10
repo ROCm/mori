@@ -27,6 +27,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace mori::umbp::standalone {
 
@@ -44,6 +46,7 @@ struct FdRegistrationMessage {
 
 std::string UnixPathFromGrpcAddress(const std::string& address);
 std::string DeriveFdSocketPath(const std::string& grpc_address);
+std::string DeriveEngineSocketPath(const std::string& grpc_address);
 std::string DefaultStandaloneAddress();
 
 bool EnsureParentDirectory(const std::string& path, std::string* error = nullptr);
@@ -54,5 +57,13 @@ int RecvFdRegistration(int socket_fd, FdRegistrationMessage* message, std::strin
 
 bool SendStatus(int socket_fd, int32_t status, std::string* error = nullptr);
 bool RecvStatus(int socket_fd, int32_t* status, std::string* error = nullptr);
+
+// One versioned, length-delimited payload plus optional SCM_RIGHTS attachments.
+// FDs returned by RecvFramedMessage are owned by the caller.
+bool SendFramedMessage(int socket_fd, std::string_view payload, const std::vector<int>& fds,
+                       std::string* error = nullptr);
+bool RecvFramedMessage(int socket_fd, std::string* payload, std::vector<int>* fds,
+                       size_t max_payload = 16 * 1024 * 1024, size_t max_fds = 256,
+                       std::string* error = nullptr);
 
 }  // namespace mori::umbp::standalone

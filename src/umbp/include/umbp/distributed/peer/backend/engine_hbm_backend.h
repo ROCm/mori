@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "umbp/distributed/peer/backend/medium_backend.h"
@@ -23,6 +24,9 @@ struct EngineRegistration {
   uint32_t backend_id = 0;
   engine::RankId owner_rank = 0;
   engine::PageGeometry geometry;
+  std::string executor_id;
+  std::vector<uint8_t> engine_desc;
+  std::vector<engine::PeerVmmRegion> vmm_regions;
 };
 
 struct ResidentRecord {
@@ -57,11 +61,14 @@ struct EngineHbmHistoryStats {
 class EngineHbmBackend final : public MediumBackend {
  public:
   explicit EngineHbmBackend(EngineRegistration registration);
-  ~EngineHbmBackend() override = default;
+  ~EngineHbmBackend() override;
 
   TierType Tier() const override { return TierType::HBM; }
   const char* Name() const override { return "EngineHbmBackend"; }
   void SetBackendId(uint32_t backend_id) override;
+  bool Activate(EngineRegistration registration);
+  bool Active() const;
+  void FailSession();
   bool Init(MemoryRegistrar* registrar) override;
   void Shutdown() override;
 
@@ -88,6 +95,11 @@ class EngineHbmBackend final : public MediumBackend {
       const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
       ResolveReader reader = ResolveReader::kRemote,
       const std::vector<ObjectExtent>* extents = nullptr) override;
+  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                            bool allow_file_ref) override;
+  bool AcquireRetireMigrationRead(const std::string& key, engine::OperationId retire,
+                                  ResolvedEntry* resolved);
+  void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
 
@@ -117,13 +129,30 @@ class EngineHbmBackend final : public MediumBackend {
 
   engine::RetireTicket Retire(const std::vector<engine::AllocationHandle>& handles,
                               engine::OperationId operation);
-  std::vector<engine::RetireTicket> PollReadyRetires();
+  std::vector<engine::RetireTicket> PollReadyRetires(bool mark_reported = true);
+  std::optional<engine::RetireTicket> MarkRetireReported(engine::OperationId operation);
+  std::vector<engine::RetireTicket> PollTransitionRetires();
+  bool CompleteRetireTransition(engine::OperationId operation, bool success, bool unknown);
+  bool IsQualifiedReplica(const std::string& key) const;
   std::vector<std::string> RetireKeys(engine::OperationId ticket) const;
+  std::optional<engine::RetireState> RetireStatus(engine::OperationId ticket) const;
+  std::optional<engine::OperationId> RetireOperationForKey(const std::string& key) const;
+  bool ReopenRetireTransition(engine::OperationId operation);
   bool AcknowledgeReleased(engine::OperationId ticket);
   bool Quarantine(const std::vector<engine::AllocationHandle>& handles);
+  std::vector<engine::AllocationHandle> DrainQuarantineNotices();
   std::optional<engine::SlotState> State(uint32_t page_id) const;
+  uint64_t StateCount(engine::SlotState state) const;
   std::optional<engine::AllocationHandle> HandleForKey(const std::string& key) const;
+  bool IsDelegatedHandle(const engine::AllocationHandle& handle);
   ObjectView View(const engine::AllocationHandle& handle) const;
+  EngineRegistration RegistrationSnapshot() const;
+  engine::ResetLease BeginReset(engine::OperationId operation);
+  bool FinishReset(engine::OperationId lease, bool commit, engine::PoolEpoch* epoch,
+                   std::vector<std::string>* removed_keys,
+                   std::vector<engine::AllocationHandle>* approved = nullptr);
+  bool HoldIO(const std::vector<engine::AllocationHandle>& handles, engine::OperationId operation);
+  bool CompleteIO(engine::OperationId hold, engine::CompletionProof proof);
   void AdvanceAckWatermark(engine::OperationId watermark);
   EngineHbmHistoryStats HistoryStats() const;
 
@@ -142,6 +171,8 @@ class EngineHbmBackend final : public MediumBackend {
   std::vector<KvEvent> SnapshotLocked() const;
   void QueueEventLocked(KvEvent event, std::function<void()>* callback);
   void RefreshRetireLocked(engine::OperationId operation);
+  bool HasBlockingMigrationReadsLocked() const;
+  bool HasBlockingIoHoldsLocked() const;
   bool QuarantineLocked(const std::vector<engine::AllocationHandle>& handles,
                         std::function<void()>* callback);
 
@@ -153,12 +184,29 @@ class EngineHbmBackend final : public MediumBackend {
   std::unordered_map<engine::OperationId, std::vector<std::string>, engine::OperationIdHash>
       retire_keys_;
   std::deque<engine::OperationId> ready_retires_;
+  std::unordered_set<engine::OperationId, engine::OperationIdHash> reported_retires_;
+  std::deque<engine::RetireTicket> partial_quarantines_;
+  std::deque<engine::AllocationHandle> quarantine_notices_;
+  std::deque<engine::OperationId> transition_retires_;
   std::unordered_map<engine::OperationId, DelegateResult, engine::OperationIdHash> delegate_ops_;
   std::unordered_map<engine::OperationId, PublishResult, engine::OperationIdHash> publish_ops_;
+  std::unordered_map<engine::ResidentIdentity, size_t, engine::ResidentIdentityHash>
+      migration_reads_;
+  std::unordered_map<std::string, std::vector<engine::ResidentIdentity>> migration_read_tokens_;
+  std::unordered_map<engine::OperationId, std::vector<engine::AllocationHandle>,
+                     engine::OperationIdHash>
+      io_holds_;
+  std::unordered_map<engine::OperationId, engine::CompletionProof, engine::OperationIdHash>
+      io_completed_;
   std::unordered_map<std::string, uint64_t> ack_watermarks_;
   std::vector<KvEvent> pending_events_;
   bool initialized_ = false;
   bool permanently_shutdown_ = false;
+  bool active_ = false;
+  bool failed_session_ = false;
+  bool reset_sealed_ = false;
+  std::optional<engine::OperationId> reset_lease_;
+  std::vector<engine::AllocationHandle> reset_approved_;
   bool full_sync_pending_ = false;
   bool event_publishing_ = true;
   size_t auto_flush_threshold_ = static_cast<size_t>(-1);
@@ -168,5 +216,6 @@ class EngineHbmBackend final : public MediumBackend {
 };
 
 std::unique_ptr<MediumBackend> MakeEngineHbmBackend(EngineRegistration registration);
+std::string EngineHbmBackendName(engine::RankId rank);
 
 }  // namespace mori::umbp

@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "umbp/distributed/pool_client.h"
+#include "umbp/engine/engine_control.h"
 #include "umbp/local/host_mem_allocator.h"
 #include "umbp/sim/trace.h"
 #include "umbp/umbp_client.h"
@@ -43,7 +44,7 @@ namespace mori::umbp {
 /// the same transfer engine, with nothing routed, registered or heartbeated,
 /// and a local miss as the final answer.  Configuration alone decides which,
 /// which is why there is no separate local implementation.
-class DistributedClient : public IUMBPClient {
+class DistributedClient : public IUMBPClient, public engine::EngineControl {
  public:
   explicit DistributedClient(const UMBPConfig& config);
   ~DistributedClient() override;
@@ -100,6 +101,22 @@ class DistributedClient : public IUMBPClient {
   // an SSD node. See the definition for what the medium does still change (the
   // device read is whole-object until D1) and doc/design-ssd-ranged-io.md.
   bool SupportsRangedIO() const override;
+  engine::EngineControl* GetEngineControl() override { return this; }
+
+  bool RegisterEngine(EngineRegistration registration) override;
+  std::optional<uint32_t> BackendId(engine::RankId rank) const override;
+  std::vector<engine::SharedDramRegion> ExportSharedDram(engine::PoolEpoch epoch) override;
+  PeerPool* Pool() const override;
+  engine::ReadPlan Lookup(const std::vector<std::string>& keys, std::string name_space,
+                          std::string layout_id, uint32_t requester_backend_id) override;
+  engine::PreparedLoad PrepareLoad(const engine::ReadPlan& plan, std::string request_id,
+                                   const std::vector<engine::AllocationHandle>& targets,
+                                   uint32_t n_pages, const ReaderIdentity& reader,
+                                   engine::OperationId operation) override;
+  engine::CancelLoadResult CancelLoad(uint64_t prepared_id, engine::OperationId operation) override;
+  bool CompleteLoad(uint64_t prepared_id, engine::LoadOutcome outcome,
+                    engine::OperationId operation) override;
+  void SessionFailed(engine::RankId rank) override;
 
   bool RegisterMemory(uintptr_t ptr, size_t size,
                       mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,

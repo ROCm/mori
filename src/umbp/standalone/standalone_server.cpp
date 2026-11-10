@@ -63,6 +63,7 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/metrics/prometheus_metric_sink.h"
 #include "umbp/distributed/tier_proto.h"
+#include "umbp/engine/engine_session.h"
 #include "umbp/sim/sim.h"
 #include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
@@ -544,6 +545,20 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
     if (!StartFdListener()) return false;
 
+    const bool engine_mode = backend_config_.distributed.has_value() &&
+                             backend_config_.distributed->engine_hbm_ranks != 0;
+    if (engine_mode) {
+      auto* control = client_->GetEngineControl();
+      engine_sessions_ = std::make_unique<engine::EngineSessionServer>(control);
+      const std::string engine_path = DeriveEngineSocketPath(address_);
+      if (control == nullptr || !engine_sessions_->Start(engine_path, &error)) {
+        MORI_UMBP_ERROR("[StandaloneServer] engine control start failed: {}", error);
+        engine_sessions_.reset();
+        StopFdListener();
+        return false;
+      }
+    }
+
     grpc::ServerBuilder builder;
     ApplyGrpcLimits(&builder);
     builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, 4);
@@ -558,6 +573,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (!server_) {
       MORI_UMBP_ERROR("[StandaloneServer] failed to start gRPC server on {}", address_);
       StopFdListener();
+      engine_sessions_.reset();
       return false;
     }
 
@@ -586,6 +602,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (!shutdown_.compare_exchange_strong(expected, true)) return;
 
     StopFdListener();
+    if (engine_sessions_) engine_sessions_->Shutdown();
     // Reported here as well as periodically: a run that stops between two
     // round numbers would otherwise take its last, most-settled window of
     // measurements with it.
@@ -1755,6 +1772,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   UMBPConfig backend_config_;
   std::unique_ptr<IUMBPClient> client_;
   std::unique_ptr<MemoryImporter> memory_importer_;
+  std::unique_ptr<engine::EngineSessionServer> engine_sessions_;
   const bool shared_reads_;
   // A distributed backend on a non-SSD medium synchronizes concurrent puts,
   // gets and lookups itself -- it is driven that way by an embedded client's

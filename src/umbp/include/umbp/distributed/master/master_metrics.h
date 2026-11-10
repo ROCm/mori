@@ -189,6 +189,13 @@
 #define MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS_HELP \
   "Reads served by each logical tier of this client's pool"
 
+#define MORI_UMBP_METRIC_CLIENT_DRAM_HANDOFF_REFRESHES "mori_umbp_client_dram_handoff_refreshes_total"
+#define MORI_UMBP_METRIC_CLIENT_DRAM_HANDOFF_REFRESHES_HELP \
+  "DRAM admissions when the last qualified local engine HBM copy is released"
+#define MORI_UMBP_METRIC_CLIENT_ENGINE_DRAM_READ_GRANTS "mori_umbp_client_engine_dram_read_grants_total"
+#define MORI_UMBP_METRIC_CLIENT_ENGINE_DRAM_READ_GRANTS_HELP \
+  "Actual DRAM source grants for local or remote engine loads"
+
 // --- Local watermark eviction ----------------------------------------------
 // event=round|key|no_candidate|stalled|master_key (LocalEvictionMetrics); bytes
 // freed are in the backend evict series.

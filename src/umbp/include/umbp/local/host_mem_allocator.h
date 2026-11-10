@@ -68,6 +68,8 @@ class HostMemAllocator {
     void* base = nullptr;
     size_t mapped_size = 0;
     int fd = -1;
+    HostBufferBacking actual_backing = HostBufferBacking::kAnonymous;
+    size_t alignment = 0;
   };
 
   HostMemAllocator() = default;

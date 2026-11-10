@@ -198,6 +198,13 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   if (!ParseUint16Env("UMBP_PEER_SERVICE_PORT", &dist.peer_service_port, error)) return false;
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_STAGING_BUFFER_SIZE", &dist.staging_buffer_size, error))
     return false;
+  size_t engine_hbm_ranks = dist.engine_hbm_ranks;
+  if (!ParseSizeEnv("UMBP_ENGINE_HBM_RANKS", &engine_hbm_ranks, error)) return false;
+  if (engine_hbm_ranks > UINT32_MAX) {
+    *error = "UMBP_ENGINE_HBM_RANKS is out of range";
+    return false;
+  }
+  dist.engine_hbm_ranks = static_cast<uint32_t>(engine_hbm_ranks);
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", &dist.ranged_scratch_size, error))
     return false;
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES",

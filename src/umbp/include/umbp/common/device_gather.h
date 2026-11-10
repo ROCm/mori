@@ -54,8 +54,9 @@ struct DeviceGatherFragment {
 // enqueueing any work when the launch could not be issued, so the caller can
 // fall back to hipMemcpy.
 //
-// The descriptors are staged in a buffer kept per `stream`, so the caller must
-// not use `stream` from another thread until it has synchronized this launch.
+// Descriptor staging uses event-fenced per-stream slots. Concurrent callers may
+// enqueue on the same stream without synchronizing between launches; an in-use
+// slot is neither overwritten nor resized until its recorded event completes.
 bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int device_id,
                         hipStream_t stream);
 
@@ -63,8 +64,7 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
 // empty gather on it, so that a later LaunchDeviceGather of up to `capacity`
 // fragments allocates nothing.  The whole staging buffer is uploaded, which
 // makes the upload large enough to take a copy engine as a real batch's does.
-// Same contract as LaunchDeviceGather: the current device must be `device_id`,
-// and the caller synchronizes `stream`.
+// Same contract as LaunchDeviceGather: the current device must be `device_id`.
 bool PrewarmDeviceGather(int device_id, hipStream_t stream, size_t capacity);
 
 // Whether the gather kernel path is compiled in and not disabled via

@@ -143,6 +143,27 @@ TEST(ActivitySummary, ReportsPromotionAndDemotionAsAPairEvenWhenOneIsZero) {
   EXPECT_NE(all.find("1 failed, 3 retried, 2 dropped"), std::string::npos) << all;
 }
 
+TEST(ActivitySummary, ReportsF3OutcomesAndCurrentRetiringPressure) {
+  ActivitySummary summary;
+  summary.Render(ActivitySnapshot{}, 60.0);
+  ActivitySnapshot snap;
+  snap.transitions.f3_succeeded = 3;
+  snap.transitions.f3_failed = 17;
+  snap.transitions.f3_retried = 12;
+  snap.transitions.f3_rejected = 2;
+  snap.transitions.f3_source_missing = 1;
+  snap.transitions.f3_quarantined = 1;
+  snap.transitions.engine_retiring_pages = 31;
+  snap.transitions.f3_inflight = 8;
+  snap.transitions.f3_pending_keys = 23;
+  const std::string all = Joined(summary.Render(snap, 60.0));
+  EXPECT_NE(all.find("F3: 3 succeeded, 17 failed attempts, 12 retried, 2 rejected"),
+            std::string::npos)
+      << all;
+  EXPECT_NE(all.find("1 source-missing, 1 quarantined"), std::string::npos) << all;
+  EXPECT_NE(all.find("31 retiring pages, 8 in-flight, 23 pending keys"), std::string::npos) << all;
+}
+
 TEST(ActivitySummary, SurfacesLoadMissesWhichBytesAloneHide) {
   // A tier being asked for keys it does not have reads as zero load bytes,
   // exactly like a tier nobody is asking. Different bugs, same byte count.

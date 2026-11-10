@@ -85,6 +85,7 @@ class GrantTable {
   void AllowNewGrants(const std::vector<AllocationHandle>& sources);
   bool Held(const AllocationHandle& source) const;
   size_t HoldCount(const AllocationHandle& source) const;
+  size_t ActiveCount() const;
   std::vector<AllocationHandle> Expire(Clock::time_point now);
   std::vector<AllocationHandle> DrainQuarantineCandidates();
   void AdvanceAckWatermark(OperationId watermark);

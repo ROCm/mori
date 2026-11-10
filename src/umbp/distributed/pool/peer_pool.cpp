@@ -32,8 +32,10 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 #include "umbp/common/parallel_for.h"
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
@@ -41,6 +43,31 @@
 namespace mori::umbp {
 
 namespace {
+
+void WarnF3(std::string_view reason, const std::string& key, uint32_t source_backend,
+            std::string_view detail) {
+  struct State {
+    uint64_t count = 0;
+    uint64_t since_last = 0;
+    std::chrono::steady_clock::time_point last{};
+  };
+  static std::mutex mutex;
+  static std::unordered_map<std::string, State> states;
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(mutex);
+  auto& state = states[std::string(reason)];
+  ++state.count;
+  ++state.since_last;
+  if (state.last != std::chrono::steady_clock::time_point{} &&
+      now - state.last < std::chrono::seconds(10)) {
+    return;
+  }
+  MORI_UMBP_WARN(
+      "[F3] retire reason={} count={} since_last={} key='{}' source_backend={} detail='{}'", reason,
+      state.count, state.since_last, key, source_backend, detail);
+  state.since_last = 0;
+  state.last = now;
+}
 
 EngineHbmBackend* EngineBackend(MediumBackend* backend) {
   if (auto* instrumented = dynamic_cast<InstrumentedBackend*>(backend)) {
@@ -99,11 +126,16 @@ uint64_t UsedBytes(const TierCapacity& capacity) {
 
 PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy,
                    TransferEngine* transfer_engine)
+    : PeerPool(backends, std::move(policy), transfer_engine, RetirePreservationConfig{}) {}
+
+PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy,
+                   TransferEngine* transfer_engine, RetirePreservationConfig retire_config)
     : backends_(backends),
       policy_(std::move(policy)),
       transfer_engine_(transfer_engine),
       tier_graph_(policy_ == nullptr ? nullptr : policy_->TierGraph()),
-      transition_executor_(backends, transfer_engine) {
+      transition_executor_(backends, transfer_engine),
+      retire_config_(retire_config) {
   if (tier_graph_ != nullptr) {
     // A tier graph without an engine would accept offload and promotion rules
     // and then silently fail every one of them, leaving the topology looking
@@ -123,12 +155,28 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
       }
     }
     evict_demotion_retry_budget_ = EvictDemotionRetryBudget();
-    transition_worker_ = std::thread(&PeerPool::TransitionWorkerLoop, this);
+    const auto media = backends_ == nullptr ? std::vector<MediumBackend*>{} : backends_->All();
+    const bool engine_mode = std::any_of(media.begin(), media.end(), [](MediumBackend* backend) {
+      return EngineBackend(backend) != nullptr;
+    });
+    const size_t workers =
+        engine_mode ? std::max<size_t>(1, std::min<size_t>(retire_config_.max_inflight, 8)) : 1;
+    transition_workers_.reserve(workers);
+    for (size_t i = 0; i < workers; ++i) {
+      transition_workers_.emplace_back(&PeerPool::TransitionWorkerLoop, this);
+    }
+    maintenance_thread_ = std::thread(&PeerPool::EngineMaintenanceLoop, this);
   }
 }
 
 PeerPool::~PeerPool() {
   StopLocalEviction();  // first: a pass may still be using the transition worker
+  {
+    std::lock_guard<std::mutex> lock(maintenance_mutex_);
+    stop_maintenance_ = true;
+  }
+  maintenance_cv_.notify_all();
+  if (maintenance_thread_.joinable()) maintenance_thread_.join();
   StopTransitionWorker();
 }
 
@@ -164,7 +212,10 @@ void PeerPool::StopTransitionWorker() {
     std::fill(queued_by_tier_.begin(), queued_by_tier_.end(), 0);
   }
   transition_cv_.notify_all();
-  if (transition_worker_.joinable()) transition_worker_.join();
+  for (auto& worker : transition_workers_) {
+    if (worker.joinable()) worker.join();
+  }
+  transition_workers_.clear();
 }
 
 void PeerPool::TouchLocked(const std::string& key) {
@@ -520,7 +571,7 @@ TierTransitionResult PeerPool::RunTransition(std::unique_lock<std::mutex>& lock,
 
   lock.unlock();
   result = transition_executor_.Execute(job.key, job.source_backend_id, plan.targets,
-                                        plan.remove_source);
+                                        plan.remove_source, job.retire_operation);
   lock.lock();
   FinishTransitionLocked(job, result);
   return result;
@@ -544,11 +595,44 @@ void PeerPool::TransitionWorkerLoop() {
       if (tier_graph_ != nullptr) {
         const auto& tier = tier_graph_->NodeAt(job.source_tier);
         const bool watermark_driven = WatermarkDrivenLocked(job);
-        if (!watermark_driven || tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark)) {
+        // F3 is a correctness transition, not a watermark optimization.  A
+        // HBM tier configured with watermark offload must still preserve the
+        // last copy when the tree returns a page below the low watermark.
+        if (job.f3_preservation || !watermark_driven ||
+            tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark)) {
           if (job.evict && job.first_attempt == std::chrono::steady_clock::time_point{}) {
             job.first_attempt = std::chrono::steady_clock::now();
           }
+#ifdef MORI_UMBP_TESTING
+          if (job.f3_preservation && before_f3_run_hook_) before_f3_run_hook_(job.key);
+#endif
           const auto result = RunTransition(lock, job);
+          if (job.f3_preservation) {
+            if (result.success) {
+              ++transition_metrics_.f3_succeeded;
+              SatisfyRetireKeyLocked(job);
+            } else if (result.unknown) {
+              ++transition_metrics_.f3_failed;
+              QuarantineRetireSourceLocked(job);
+            } else if (result.source_missing) {
+              ++transition_metrics_.f3_failed;
+              SourceMissingRetireKeyLocked(job);
+            } else {
+              ++transition_metrics_.f3_failed;
+              WarnF3(result.failure_reason.empty() ? "ATTEMPT_FAILED" : result.failure_reason,
+                     job.key, job.source_backend_id, result.failure_detail);
+              retry = result.retryable && job.attempts < retire_config_.max_attempts &&
+                      std::chrono::steady_clock::now() - job.first_attempt <
+                          retire_config_.retry_timeout;
+              if (retry) {
+                ++transition_metrics_.retried;
+                ++transition_metrics_.f3_retried;
+              }
+              if (!retry) {
+                RejectRetireKeyLocked(job.key);
+              }
+            }
+          }
           // The evicted copy is the only one: retry what can clear, and drop it
           // only once the budget is spent or the target can never take it.
           evict_retry =
@@ -558,7 +642,9 @@ void PeerPool::TransitionWorkerLoop() {
           if (job.evict && !result.success && !evict_retry) DropEvictedCopyLocked(job);
           const bool still_pressured =
               watermark_driven && tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark);
-          retry = (still_pressured && !result.success && job.attempts < 3) || evict_retry;
+          if (!job.f3_preservation) {
+            retry = (still_pressured && !result.success && job.attempts < 3) || evict_retry;
+          }
           // Keep the drain going without waiting for the next commit batch to
           // notice the tier is still above its low watermark. The scan skips
           // whatever is still queued, so this tops the batch back up rather
@@ -593,6 +679,40 @@ void PeerPool::TransitionWorkerLoop() {
         --queued_by_tier_[source_tier];
       }
     }
+    if (!retry) {
+      std::lock_guard<std::mutex> lock(operation_mutex_);
+      ReevaluatePendingRetiresLocked();
+    }
+  }
+}
+
+void PeerPool::EngineMaintenanceLoop() {
+  for (;;) {
+    std::unique_lock<std::mutex> lock(maintenance_mutex_);
+    if (maintenance_cv_.wait_for(lock, std::chrono::milliseconds(100),
+                                 [&] { return stop_maintenance_; })) {
+      return;
+    }
+    lock.unlock();
+    RunEngineMaintenance();
+  }
+}
+
+void PeerPool::RunEngineMaintenance() {
+  ++engine_maintenance_rounds_;
+  if (backends_ == nullptr) return;
+  const auto now = GrantTable::Clock::now();
+  for (auto* medium : backends_->All()) {
+    auto* backend = EngineBackend(medium);
+    if (backend == nullptr || !backend->Active()) continue;
+    const uint32_t backend_id = backends_->BackendId(medium);
+    if (!backend->ExpireGrants(now).empty()) RefreshBackendResidencies(backend_id);
+    ProcessEngineRetires(backend_id);
+  }
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  for (auto& [id, grant] : dram_load_grants_) {
+    (void)id;
+    if (grant.expires_at <= now) grant.unknown = true;
   }
 }
 
@@ -1174,6 +1294,14 @@ PublishResult PeerPool::PublishResident(uint32_t backend_id,
   return result;
 }
 
+DelegateResult PeerPool::DelegateEnginePages(uint32_t backend_id, engine::RankId rank, size_t count,
+                                             engine::OperationId operation) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  return engine_backend == nullptr ? DelegateResult{}
+                                   : engine_backend->Delegate(rank, count, operation);
+}
+
 std::vector<GrantResult> PeerPool::AcquireEngineGrants(
     uint32_t backend_id, const ReaderIdentity& reader,
     const std::vector<engine::AllocationHandle>& handles, engine::OperationId operation,
@@ -1192,8 +1320,143 @@ std::vector<GrantReleaseResult> PeerPool::ReleaseEngineGrants(uint32_t backend_i
                                                               engine::OperationId operation) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
-  return engine_backend == nullptr ? std::vector<GrantReleaseResult>(grants.size())
-                                   : engine_backend->Release(reader, grants, proof, operation);
+  auto out = engine_backend == nullptr ? std::vector<GrantReleaseResult>(grants.size())
+                                       : engine_backend->Release(reader, grants, proof, operation);
+  if (engine_backend != nullptr) ProcessEngineRetires(backend_id);
+  if (std::any_of(out.begin(), out.end(), [](const auto& result) { return result.quarantined; })) {
+    RefreshBackendResidencies(backend_id);
+  }
+  return out;
+}
+
+std::vector<LoadSourceGrantResult> PeerPool::AcquireLoadSources(
+    const ReaderIdentity& reader, const std::vector<std::string>& keys,
+    const std::vector<uint32_t>& preferred_backends, const std::vector<TierType>& preferred_tiers,
+    engine::OperationId operation, GrantTable::Clock::time_point expires_at) {
+  std::vector<LoadSourceGrantResult> out(keys.size());
+  if (backends_ == nullptr || keys.empty() || preferred_backends.size() != keys.size() ||
+      preferred_tiers.size() != keys.size()) {
+    return out;
+  }
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  struct EngineBatch {
+    std::vector<size_t> positions;
+    std::vector<engine::AllocationHandle> handles;
+  };
+  std::unordered_map<uint32_t, EngineBatch> engine_batches;
+  std::vector<std::string> read_keys;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    std::vector<uint32_t> candidates;
+    if (preferred_backends[i] < BackendRegistry::kMaxBackends) {
+      candidates.push_back(preferred_backends[i]);
+    } else {
+      for (auto* backend : backends_->All()) {
+        const uint32_t backend_id = backends_->BackendId(backend);
+        if (backend == nullptr ||
+            (preferred_tiers[i] != TierType::UNKNOWN && backend->Tier() != preferred_tiers[i])) {
+          continue;
+        }
+        if (EngineBackend(backend) != nullptr)
+          candidates.insert(candidates.begin(), backend_id);
+        else if (backend->Tier() == TierType::DRAM)
+          candidates.push_back(backend_id);
+      }
+    }
+    for (uint32_t backend_id : candidates) {
+      MediumBackend* medium = backends_->Get(backend_id);
+      if (medium == nullptr) continue;
+      if (auto* engine_backend = EngineBackend(medium)) {
+        if (!engine_backend->IsQualifiedReplica(keys[i])) continue;
+        auto handle = engine_backend->HandleForKey(keys[i]);
+        if (!handle.has_value()) continue;
+        engine_batches[backend_id].positions.push_back(i);
+        engine_batches[backend_id].handles.push_back(*handle);
+        break;
+      }
+      if (medium->Tier() != TierType::DRAM) continue;
+      auto resolved = medium->BatchResolve({keys[i]}, /*include_descs=*/false,
+                                           /*allow_file_refs=*/false, ResolveReader::kLocal);
+      if (resolved.empty() || !resolved[0].found || !ValidateObjectView(resolved[0].view) ||
+          resolved[0].hold == nullptr) {
+        continue;
+      }
+      GrantId id;
+      {
+        std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+        id = GrantId{next_dram_load_grant_++};
+        dram_load_grants_.emplace(
+            id.value, DramLoadGrant{reader, keys[i], backend_id, resolved[0].hold, expires_at});
+        TouchLocked(keys[i]);
+        ++transition_metrics_.engine_dram_read_grants;
+      }
+      read_keys.push_back(keys[i]);
+      out[i].granted = true;
+      out[i].id = id;
+      out[i].backend_id = backend_id;
+      out[i].view = std::move(resolved[0].view);
+      break;
+    }
+  }
+  for (auto& [backend_id, batch] : engine_batches) {
+    auto* backend = EngineBackend(backends_->Get(backend_id));
+    if (backend == nullptr) continue;
+    auto granted = backend->Acquire(reader, batch.handles, operation, expires_at);
+    const auto registration = backend->RegistrationSnapshot();
+    for (size_t j = 0; j < granted.size() && j < batch.positions.size(); ++j) {
+      auto& result = out[batch.positions[j]];
+      result.granted = granted[j].granted;
+      result.id = granted[j].id;
+      result.backend_id = backend_id;
+      result.engine = true;
+      result.source = granted[j].source;
+      result.executor_id = registration.executor_id;
+      if (result.granted) result.view = backend->View(granted[j].source);
+    }
+  }
+  LocalReadReporter reporter;
+  if (!read_keys.empty()) {
+    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    reporter = local_read_reporter_;
+  }
+  if (reporter) reporter(read_keys);
+  return out;
+}
+
+std::vector<bool> PeerPool::ReleaseLoadSources(const ReaderIdentity& reader,
+                                               const std::vector<engine::LoadGrantRef>& grants,
+                                               engine::CompletionProof proof,
+                                               engine::OperationId operation) {
+  std::vector<bool> out(grants.size(), false);
+  std::unordered_map<uint32_t, std::vector<size_t>> engine_positions;
+  for (size_t i = 0; i < grants.size(); ++i) {
+    if (grants[i].engine) {
+      engine_positions[grants[i].backend_id].push_back(i);
+      continue;
+    }
+    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    auto grant = dram_load_grants_.find(grants[i].id);
+    if (grant == dram_load_grants_.end() || !(grant->second.reader == reader) ||
+        grant->second.backend_id != grants[i].backend_id || grant->second.key != grants[i].key) {
+      continue;
+    }
+    if (proof == engine::CompletionProof::kUnknown || grant->second.unknown) {
+      grant->second.unknown = true;
+      out[i] = true;  // retain the source hold for process lifetime
+    } else {
+      dram_load_grants_.erase(grant);
+      out[i] = true;
+    }
+  }
+  for (const auto& [backend_id, positions] : engine_positions) {
+    std::vector<GrantId> ids;
+    ids.reserve(positions.size());
+    for (size_t position : positions) ids.push_back(GrantId{grants[position].id});
+    auto released = ReleaseEngineGrants(backend_id, reader, ids, proof, operation);
+    for (size_t j = 0; j < released.size() && j < positions.size(); ++j) {
+      out[positions[j]] = released[j].released || released[j].quarantined;
+    }
+  }
+  return out;
 }
 
 engine::RetireTicket PeerPool::RetireEnginePages(
@@ -1204,31 +1467,511 @@ engine::RetireTicket PeerPool::RetireEnginePages(
   if (engine_backend == nullptr) {
     return engine::RetireTicket{operation, handles, engine::RetireState::kQuarantined};
   }
-  return engine_backend->Retire(handles, operation);
+  auto ticket = engine_backend->Retire(handles, operation);
+  ProcessEngineRetires(backend_id);
+  return ticket;
 }
 
 std::vector<engine::RetireTicket> PeerPool::PollReadyEngineRetires(uint32_t backend_id) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
-  return engine_backend == nullptr ? std::vector<engine::RetireTicket>{}
-                                   : engine_backend->PollReadyRetires();
+  if (engine_backend == nullptr) return {};
+  auto candidates = engine_backend->PollReadyRetires(/*mark_reported=*/false);
+  std::vector<engine::RetireTicket> tickets;
+  bool reopened = false;
+  std::unique_lock<std::mutex> operation_lock(operation_mutex_);
+  for (const auto& ticket : candidates) {
+    if (ticket.state == engine::RetireState::kReady) {
+      const std::string record_key = RetireRecordKey(backend_id, ticket.id);
+      const auto backing = retire_backing_holds_.find(record_key);
+      const bool has_stable_dram =
+          backing != retire_backing_holds_.end() && !backing->second.empty();
+      bool competing_retire = false;
+      if (!has_stable_dram) {
+        for (const auto& key : engine_backend->RetireKeys(ticket.id)) {
+          for (auto* medium : backends_->All()) {
+            auto* candidate = EngineBackend(medium);
+            if (candidate == nullptr || candidate == engine_backend) continue;
+            if (candidate->RetireOperationForKey(key).has_value()) {
+              competing_retire = true;
+              break;
+            }
+          }
+          if (competing_retire) break;
+        }
+      }
+      if (competing_retire && engine_backend->ReopenRetireTransition(ticket.id)) {
+        reopened = true;
+        continue;
+      }
+    }
+    auto current = engine_backend->MarkRetireReported(ticket.id);
+    if (current.has_value()) tickets.push_back(std::move(*current));
+  }
+  for (const auto& ticket : tickets) {
+    if (ticket.state != engine::RetireState::kQuarantined) continue;
+    const auto terminal = engine_backend->RetireStatus(ticket.id);
+    if (!terminal.has_value() || *terminal != engine::RetireState::kQuarantined) continue;
+    const std::string record_key = RetireRecordKey(backend_id, ticket.id);
+    auto pending = retire_preservations_.find(record_key);
+    if (pending != retire_preservations_.end()) {
+      const auto keys = pending->second.pending_keys;
+      for (const auto& key : keys) RemovePendingRetireKeyLocked(record_key, key);
+      ReleaseBackingHoldsLocked(&pending->second.backing_holds);
+      retire_preservations_.erase(pending);
+    }
+    auto retained = retire_backing_holds_.find(record_key);
+    if (retained != retire_backing_holds_.end()) {
+      ReleaseBackingHoldsLocked(&retained->second);
+      retire_backing_holds_.erase(retained);
+    }
+    // The worker that owns an F3 leader is the only place that releases the
+    // in-flight slot.  A terminal ticket may be observed while that worker is
+    // still proving quiescence; freeing the slot here would exceed the DMA
+    // limit and let Clear race the live transfer.
+  }
+  ReevaluatePendingRetiresLocked();
+  operation_lock.unlock();
+  if (reopened) {
+    // The ticket was Ready only because a peer HBM copy looked stable.  That
+    // peer is now retiring too, so make this record join the same F3 decision
+    // before any rank can consume Released.
+    ProcessEngineRetires(backend_id);
+  }
+  return tickets;
+}
+
+std::vector<engine::AllocationHandle> PeerPool::PollEngineQuarantines(uint32_t backend_id) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  return engine_backend == nullptr ? std::vector<engine::AllocationHandle>{}
+                                   : engine_backend->DrainQuarantineNotices();
 }
 
 bool PeerPool::AcknowledgeEngineReleased(uint32_t backend_id, engine::OperationId operation) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
   if (engine_backend == nullptr) return false;
+  std::unique_lock<std::mutex> operation_lock(operation_mutex_);
   const auto keys = engine_backend->RetireKeys(operation);
   if (keys.empty() || !engine_backend->AcknowledgeReleased(operation)) return false;
-  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
   for (const auto& key : keys) RefreshResidenciesLocked(key);
+  const std::string record = RetireRecordKey(backend_id, operation);
+  auto holds = retire_backing_holds_.find(record);
+  std::vector<std::string> reports;
+  if (holds != retire_backing_holds_.end()) {
+    RefreshDramHandoffLocked(keys, holds->second, &reports);
+    for (const auto& [hold_backend, key] : holds->second) {
+      if (auto* backing = backends_->Get(hold_backend)) backing->ReleaseMigrationRead(key);
+    }
+    retire_backing_holds_.erase(holds);
+  }
+  const auto reporter = local_read_reporter_;
+  operation_lock.unlock();
+  if (reporter && !reports.empty()) reporter(reports);
   return true;
+}
+
+void PeerPool::RefreshDramHandoffLocked(
+    const std::vector<std::string>& released_keys,
+    const std::vector<std::pair<uint32_t, std::string>>& backing_holds,
+    std::vector<std::string>* reports) {
+  const auto media = backends_->All();
+  std::unordered_set<std::string> refreshed;
+  for (const auto& [backend_id, key] : backing_holds) {
+    if (std::find(released_keys.begin(), released_keys.end(), key) == released_keys.end()) continue;
+    // Check the entire local HBM saving domain before touching any DRAM copy.
+    // Do not depend on the unordered residency set's DRAM/HBM iteration order.
+    const bool hbm_remains = std::any_of(media.begin(), media.end(), [&](MediumBackend* medium) {
+      auto* hbm = EngineBackend(medium);
+      return hbm != nullptr && hbm->IsQualifiedReplica(key);
+    });
+    if (hbm_remains) continue;
+    auto* backing = backends_->Get(backend_id);
+    if (backing == nullptr || backing->Tier() != TierType::DRAM || !backing->Contains(key)) continue;
+    // The backing read pin still protects these bytes. Existing and newly
+    // committed D2H copies re-enter DRAM with the same handoff admission heat.
+    // A previously selected victim can still run after unpin: eviction has no
+    // recency version, and this intentionally preserves that existing policy.
+    backing->Touch({key});
+    if (refreshed.insert(key).second) {
+      TouchLocked(key);
+      ++transition_metrics_.dram_handoff_refreshes;
+      reports->push_back(key);
+    }
+  }
 }
 
 void PeerPool::AdvanceEngineAckWatermark(uint32_t backend_id, engine::OperationId watermark) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
   if (engine_backend != nullptr) engine_backend->AdvanceAckWatermark(watermark);
+}
+
+engine::ResetLease PeerPool::BeginEngineReset(uint32_t backend_id, engine::OperationId operation) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  return backend == nullptr ? engine::ResetLease{} : backend->BeginReset(operation);
+}
+
+bool PeerPool::FinishEngineReset(uint32_t backend_id, engine::OperationId lease, bool commit,
+                                 engine::PoolEpoch* epoch,
+                                 std::vector<engine::AllocationHandle>* approved) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  if (backend == nullptr) return false;
+  std::vector<std::string> removed;
+  if (!backend->FinishReset(lease, commit, epoch, &removed, approved)) return false;
+  if (!commit) return true;
+  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+  for (const auto& key : removed) RefreshResidenciesLocked(key);
+  return true;
+}
+
+bool PeerPool::HoldEngineIO(uint32_t backend_id,
+                            const std::vector<engine::AllocationHandle>& handles,
+                            engine::OperationId operation) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  return backend != nullptr && backend->HoldIO(handles, operation);
+}
+
+bool PeerPool::CompleteEngineIO(uint32_t backend_id, engine::OperationId hold,
+                                engine::CompletionProof proof) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  const bool ok = backend != nullptr && backend->CompleteIO(hold, proof);
+  if (ok) ProcessEngineRetires(backend_id);
+  if (ok && proof == engine::CompletionProof::kUnknown) RefreshBackendResidencies(backend_id);
+  return ok;
+}
+
+bool PeerPool::QuarantineEnginePages(uint32_t backend_id,
+                                     const std::vector<engine::AllocationHandle>& handles) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  const bool ok = backend != nullptr && backend->Quarantine(handles);
+  if (ok) RefreshBackendResidencies(backend_id);
+  return ok;
+}
+
+void PeerPool::RefreshBackendResidencies(uint32_t backend_id) {
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  std::vector<std::string> keys;
+  for (const auto& [key, residents] : residencies_) {
+    if (residents.count(backend_id) != 0) keys.push_back(key);
+  }
+  for (const auto& key : keys) RefreshResidenciesLocked(key);
+}
+
+std::string PeerPool::RetireRecordKey(uint32_t backend_id, engine::OperationId operation) {
+  std::string out(reinterpret_cast<const char*>(operation.session_id.data()),
+                  operation.session_id.size());
+  out.append(reinterpret_cast<const char*>(&backend_id), sizeof(backend_id));
+  out.append(reinterpret_cast<const char*>(&operation.seq), sizeof(operation.seq));
+  return out;
+}
+
+bool PeerPool::QualifiedReplicaLocked(const std::string& key, uint32_t source_backend_id,
+                                      const std::string& retire_record) {
+  auto residents = residencies_.find(key);
+  if (residents == residencies_.end()) return false;
+  for (uint32_t backend_id : residents->second) {
+    if (backend_id == source_backend_id) continue;
+    MediumBackend* backend = backends_->Get(backend_id);
+    if (backend == nullptr) continue;
+    if (auto* engine = EngineBackend(backend)) {
+      if (engine->IsQualifiedReplica(key)) return true;
+      continue;
+    }
+    if (backend->Tier() != TierType::DRAM || !backend->Contains(key)) continue;
+    ResolvedEntry held;
+    if (!backend->AcquireMigrationRead(key, &held, /*allow_file_ref=*/true) || !held.found) {
+      continue;
+    }
+    auto& record = retire_preservations_[retire_record];
+    const auto identity = std::make_pair(backend_id, key);
+    if (std::find(record.backing_holds.begin(), record.backing_holds.end(), identity) ==
+        record.backing_holds.end()) {
+      record.backing_holds.push_back(identity);
+    } else {
+      backend->ReleaseMigrationRead(key);
+    }
+    return true;
+  }
+  return false;
+}
+
+void PeerPool::ProcessEngineRetires(uint32_t backend_id) {
+  auto* backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  if (backend == nullptr) return;
+  auto tickets = backend->PollTransitionRetires();
+  if (tickets.empty()) return;
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  for (const auto& ticket : tickets) {
+    const std::string record_key = RetireRecordKey(backend_id, ticket.id);
+    auto& record = retire_preservations_[record_key];
+    record.backend_id = backend_id;
+    record.operation = ticket.id;
+    auto retained = retire_backing_holds_.find(record_key);
+    if (retained != retire_backing_holds_.end()) {
+      for (const auto& hold : retained->second) {
+        if (std::find(record.backing_holds.begin(), record.backing_holds.end(), hold) ==
+            record.backing_holds.end()) {
+          record.backing_holds.push_back(hold);
+        } else if (auto* backing = backends_->Get(hold.first)) {
+          backing->ReleaseMigrationRead(hold.second);
+        }
+      }
+      retire_backing_holds_.erase(retained);
+    }
+    for (const auto& key : backend->RetireKeys(ticket.id)) {
+      if (!QualifiedReplicaLocked(key, backend_id, record_key)) {
+        AddPendingRetireKeyLocked(record_key, key);
+      }
+    }
+    if (record.pending_keys.empty()) {
+      FinalizeRetireRecordLocked(record_key, /*success=*/true);
+      continue;
+    }
+    if (tier_graph_ == nullptr || !tier_graph_->TierIndexForBackendId(backend_id).has_value()) {
+      const auto keys = record.pending_keys;
+      for (const auto& key : keys) RemovePendingRetireKeyLocked(record_key, key);
+      FinalizeRetireRecordLocked(record_key, /*success=*/false);
+      continue;
+    }
+  }
+  ReevaluatePendingRetiresLocked();
+}
+
+bool PeerPool::ScheduleF3LeaderLocked(const std::string& key, const std::string& record_key) {
+  if (f3_leaders_.count(key) != 0 || f3_inflight_.load() >= retire_config_.max_inflight ||
+      TransitionQueued(key)) {
+    return false;
+  }
+  auto record = retire_preservations_.find(record_key);
+  if (record == retire_preservations_.end() || record->second.pending_keys.count(key) == 0) {
+    return false;
+  }
+  auto source_tier = tier_graph_ == nullptr
+                         ? std::nullopt
+                         : tier_graph_->TierIndexForBackendId(record->second.backend_id);
+  if (!source_tier.has_value()) return false;
+  TransitionJob job{TierTransitionKind::kOffload, key, record->second.backend_id, *source_tier};
+  job.intent = TierTransitionIntent::kMove;
+  job.retire_operation = record->second.operation;
+  job.retire_backend_id = record->second.backend_id;
+  job.f3_preservation = true;
+  job.first_attempt = std::chrono::steady_clock::now();
+  auto* backend = EngineBackend(backends_->Get(record->second.backend_id));
+  job.retire_source = backend == nullptr ? std::nullopt : backend->HandleForKey(key);
+  if (!job.retire_source.has_value()) {
+    WarnF3("SOURCE_HANDLE_MISSING", key, record->second.backend_id,
+           "retire source handle disappeared before scheduling");
+    SourceMissingRetireKeyLocked(job);
+    return false;
+  }
+  f3_leaders_[key] =
+      F3Leader{record->second.backend_id, record->second.operation, record_key, *job.retire_source};
+  if (!EnqueueTransition(std::move(job))) {
+    f3_leaders_.erase(key);
+    return false;
+  }
+  f3_inflight_.fetch_add(1);
+  return true;
+}
+
+void PeerPool::ReevaluatePendingRetiresLocked() {
+  size_t remaining = pending_retire_fifo_.size();
+  while (remaining-- > 0 && !pending_retire_fifo_.empty() &&
+         f3_inflight_.load() < retire_config_.max_inflight) {
+    auto [record_key, key] = std::move(pending_retire_fifo_.front());
+    pending_retire_fifo_.pop_front();
+    ++f3_schedule_checks_;
+    queued_retire_keys_.erase(record_key + '\0' + key);
+    auto record = retire_preservations_.find(record_key);
+    if (record == retire_preservations_.end() || record->second.pending_keys.count(key) == 0 ||
+        f3_leaders_.count(key) != 0) {
+      continue;
+    }
+    if (!ScheduleF3LeaderLocked(key, record_key)) {
+      record = retire_preservations_.find(record_key);
+      if (record != retire_preservations_.end() && record->second.pending_keys.count(key) != 0 &&
+          f3_leaders_.count(key) == 0) {
+        AddPendingRetireKeyLocked(record_key, key);
+      }
+    }
+  }
+}
+
+void PeerPool::AddPendingRetireKeyLocked(const std::string& record_key, const std::string& key) {
+  auto record = retire_preservations_.find(record_key);
+  if (record == retire_preservations_.end()) return;
+  record->second.pending_keys.insert(key);
+  retire_waiters_[key].insert(record_key);
+  const std::string queued_key = record_key + '\0' + key;
+  if (f3_leaders_.count(key) == 0 && queued_retire_keys_.insert(queued_key).second) {
+    pending_retire_fifo_.emplace_back(record_key, key);
+  }
+}
+
+void PeerPool::RemovePendingRetireKeyLocked(const std::string& record_key, const std::string& key) {
+  auto record = retire_preservations_.find(record_key);
+  if (record != retire_preservations_.end()) record->second.pending_keys.erase(key);
+  auto waiters = retire_waiters_.find(key);
+  if (waiters != retire_waiters_.end()) {
+    waiters->second.erase(record_key);
+    if (waiters->second.empty()) retire_waiters_.erase(waiters);
+  }
+  queued_retire_keys_.erase(record_key + '\0' + key);
+}
+
+void PeerPool::ReleaseBackingHoldsLocked(
+    std::vector<std::pair<uint32_t, std::string>>* backing_holds) {
+  if (backing_holds == nullptr) return;
+  for (const auto& [backend_id, key] : *backing_holds) {
+    if (auto* backend = backends_->Get(backend_id)) backend->ReleaseMigrationRead(key);
+  }
+  backing_holds->clear();
+}
+
+void PeerPool::PreserveBackingHoldsLocked(
+    const std::string& record_key, std::vector<std::pair<uint32_t, std::string>>* backing_holds) {
+  if (backing_holds == nullptr) return;
+  auto& retained = retire_backing_holds_[record_key];
+  for (const auto& hold : *backing_holds) {
+    if (std::find(retained.begin(), retained.end(), hold) == retained.end()) {
+      retained.push_back(hold);
+    } else if (auto* backend = backends_->Get(hold.first)) {
+      backend->ReleaseMigrationRead(hold.second);
+    }
+  }
+  backing_holds->clear();
+}
+
+void PeerPool::FinalizeRetireRecordLocked(const std::string& record_key, bool success) {
+  auto record = retire_preservations_.find(record_key);
+  if (record == retire_preservations_.end() || !record->second.pending_keys.empty()) return;
+  auto* backend = EngineBackend(backends_->Get(record->second.backend_id));
+  bool ready = false;
+  if (record->second.ticket_already_ready) {
+    const auto state =
+        backend == nullptr ? std::nullopt : backend->RetireStatus(record->second.operation);
+    ready = state.has_value() && *state == engine::RetireState::kReady;
+  } else {
+    ready =
+        backend != nullptr && backend->CompleteRetireTransition(record->second.operation, success,
+                                                                /*unknown=*/false);
+  }
+  if (ready) {
+    PreserveBackingHoldsLocked(record_key, &record->second.backing_holds);
+  } else {
+    ReleaseBackingHoldsLocked(&record->second.backing_holds);
+  }
+  retire_preservations_.erase(record);
+}
+
+void PeerPool::FinishF3LeaderLocked(const std::string& key) {
+  if (f3_leaders_.erase(key) != 0 && f3_inflight_.load() > 0) f3_inflight_.fetch_sub(1);
+}
+
+void PeerPool::SatisfyRetireKeyLocked(const TransitionJob& job) {
+  auto waiters = retire_waiters_.find(job.key);
+  const auto records =
+      waiters == retire_waiters_.end()
+          ? std::vector<std::string>{}
+          : std::vector<std::string>(waiters->second.begin(), waiters->second.end());
+  for (const auto& record_key : records) {
+    auto record = retire_preservations_.find(record_key);
+    if (record == retire_preservations_.end()) continue;
+    const bool qualified = QualifiedReplicaLocked(job.key, record->second.backend_id, record_key);
+    RemovePendingRetireKeyLocked(record_key, job.key);
+    FinalizeRetireRecordLocked(record_key, qualified);
+  }
+  FinishF3LeaderLocked(job.key);
+}
+
+void PeerPool::SourceMissingRetireKeyLocked(const TransitionJob& job) {
+  ++transition_metrics_.f3_source_missing;
+  WarnF3("SOURCE_MISSING", job.key, job.source_backend_id,
+         "AcquireRetireMigrationRead could not resolve the retiring source");
+  std::string record_key;
+  auto leader = f3_leaders_.find(job.key);
+  if (leader != f3_leaders_.end()) record_key = leader->second.record_key;
+  if (record_key.empty() && job.retire_operation.has_value()) {
+    record_key = RetireRecordKey(job.retire_backend_id, *job.retire_operation);
+  }
+  if (!record_key.empty()) {
+    RemovePendingRetireKeyLocked(record_key, job.key);
+    FinalizeRetireRecordLocked(record_key, /*success=*/false);
+  }
+  FinishF3LeaderLocked(job.key);
+  auto waiters = retire_waiters_.find(job.key);
+  if (waiters != retire_waiters_.end()) {
+    const auto records = std::vector<std::string>(waiters->second.begin(), waiters->second.end());
+    for (const auto& waiter : records) AddPendingRetireKeyLocked(waiter, job.key);
+  }
+}
+
+void PeerPool::QuarantineRetireSourceLocked(const TransitionJob& job) {
+  ++transition_metrics_.f3_quarantined;
+  WarnF3("QUARANTINE", job.key, job.source_backend_id,
+         "transfer completion is unknown; source handle quarantined");
+  if (job.retire_source.has_value()) {
+    if (auto* backend = EngineBackend(backends_->Get(job.retire_backend_id))) {
+      (void)backend->Quarantine({*job.retire_source});
+    }
+  }
+  auto leader = f3_leaders_.find(job.key);
+  if (leader != f3_leaders_.end()) {
+    const std::string record_key = leader->second.record_key;
+    RemovePendingRetireKeyLocked(record_key, job.key);
+    FinalizeRetireRecordLocked(record_key, /*success=*/true);
+  }
+  FinishF3LeaderLocked(job.key);
+  RefreshResidenciesLocked(job.key);
+  for (auto* medium : backends_->All()) {
+    auto* candidate = EngineBackend(medium);
+    if (candidate == nullptr || candidate == EngineBackend(backends_->Get(job.retire_backend_id))) {
+      continue;
+    }
+    const auto operation = candidate->RetireOperationForKey(job.key);
+    if (!operation.has_value()) continue;
+    const auto status = candidate->RetireStatus(*operation);
+    if (!status.has_value() || *status != engine::RetireState::kReady) continue;
+    const uint32_t backend_id = backends_->BackendId(medium);
+    const std::string record_key = RetireRecordKey(backend_id, *operation);
+    auto& follower = retire_preservations_[record_key];
+    follower.backend_id = backend_id;
+    follower.operation = *operation;
+    follower.ticket_already_ready = true;
+    AddPendingRetireKeyLocked(record_key, job.key);
+  }
+  auto waiters = retire_waiters_.find(job.key);
+  if (waiters != retire_waiters_.end()) {
+    const auto records = std::vector<std::string>(waiters->second.begin(), waiters->second.end());
+    for (const auto& waiter : records) AddPendingRetireKeyLocked(waiter, job.key);
+  }
+}
+
+void PeerPool::RejectRetireKeyLocked(const std::string& key) {
+  uint32_t source_backend = BackendRegistry::kMaxBackends;
+  if (auto leader = f3_leaders_.find(key); leader != f3_leaders_.end()) {
+    source_backend = leader->second.backend_id;
+  }
+  ++transition_metrics_.f3_rejected;
+  WarnF3("REJECT", key, source_backend,
+         "retry budget exhausted; safe refusal releases the retiring page without a DRAM copy");
+  auto waiters = retire_waiters_.find(key);
+  const auto records =
+      waiters == retire_waiters_.end()
+          ? std::vector<std::string>{}
+          : std::vector<std::string>(waiters->second.begin(), waiters->second.end());
+  for (const auto& record_key : records) {
+    RemovePendingRetireKeyLocked(record_key, key);
+    FinalizeRetireRecordLocked(record_key, /*success=*/false);
+  }
+  FinishF3LeaderLocked(key);
 }
 
 uint32_t PeerPool::EvictSourceLocked(const PoolEvictRequest& request) const {
@@ -1645,18 +2388,59 @@ void PeerPool::SetEvictionCandidateSource(EvictionCandidateSource source) {
   candidate_source_ = std::move(source);
 }
 
-void PeerPool::ClearLocal() {
+void PeerPool::SetLocalReadReporter(LocalReadReporter reporter) {
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  local_read_reporter_ = std::move(reporter);
+}
+
+bool PeerPool::ClearLocal() {
+  if (backends_ != nullptr) {
+    const auto media = backends_->All();
+    if (std::any_of(media.begin(), media.end(), [](MediumBackend* backend) {
+          auto* engine = EngineBackend(backend);
+          return engine != nullptr && engine->Active();
+        })) {
+      MORI_UMBP_WARN(
+          "[PeerPool] ClearLocal rejected while engine HBM is active; use quiesce reset");
+      return false;
+    }
+  }
   std::unique_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   std::unique_lock<std::mutex> operation_lock(operation_mutex_);
   {
     std::lock_guard<std::mutex> lock(transition_mutex_);
     transition_queue_.clear();
     queued_transition_keys_.clear();
+    std::fill(queued_by_tier_.begin(), queued_by_tier_.end(), 0);
   }
   // Wiping state underneath an in-flight copy would let its target commit
   // resurrect a key the user asked to discard, so drain the copies first. The
   // queue is already empty, so no new key can enter the set.
   transition_idle_cv_.wait(operation_lock, [&] { return migrating_keys_.empty(); });
+
+  for (const auto& [record_key, record] : retire_preservations_) {
+    (void)record_key;
+    for (const auto& [hold_backend, key] : record.backing_holds) {
+      if (auto* backing = backends_ == nullptr ? nullptr : backends_->Get(hold_backend)) {
+        backing->ReleaseMigrationRead(key);
+      }
+    }
+  }
+  for (const auto& [record_key, holds] : retire_backing_holds_) {
+    (void)record_key;
+    for (const auto& [hold_backend, key] : holds) {
+      if (auto* backing = backends_ == nullptr ? nullptr : backends_->Get(hold_backend)) {
+        backing->ReleaseMigrationRead(key);
+      }
+    }
+  }
+  retire_preservations_.clear();
+  retire_backing_holds_.clear();
+  f3_leaders_.clear();
+  pending_retire_fifo_.clear();
+  queued_retire_keys_.clear();
+  retire_waiters_.clear();
+  f3_inflight_.store(0);
 
   if (backends_ != nullptr) {
     for (auto* backend : backends_->All()) backend->ClearLocal();
@@ -1672,6 +2456,7 @@ void PeerPool::ClearLocal() {
   prefetched_.clear();
   prefetched_bytes_ = 0;
   ++clear_epoch_;
+  return true;
 }
 
 std::vector<KvEvent> PeerPool::DrainPendingEvents() {
@@ -1772,7 +2557,17 @@ size_t PeerPool::PlacementCount() const {
 
 TierTransitionMetrics PeerPool::TransitionMetrics() const {
   std::lock_guard<std::mutex> lock(operation_mutex_);
-  return transition_metrics_;
+  TierTransitionMetrics out = transition_metrics_;
+  out.f3_inflight = f3_inflight_.load();
+  out.f3_pending_keys = retire_waiters_.size();
+  if (backends_ != nullptr) {
+    for (auto* medium : backends_->All()) {
+      if (auto* backend = EngineBackend(medium)) {
+        out.engine_retiring_pages += backend->StateCount(engine::SlotState::kRetiring);
+      }
+    }
+  }
+  return out;
 }
 
 std::map<std::string, uint64_t> PeerPool::TierReadHits() const {

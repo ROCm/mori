@@ -127,8 +127,9 @@ PageBackend::PageBackend(TierType tier, uint64_t page_size, OwnershipConfig owne
                          std::chrono::milliseconds reaper_interval)
     : PageBackend(tier, page_size,
                   std::make_unique<HostPageMemorySource>(HostPageMemorySource::Options{
-                      ownership.use_hugepages, ownership.hugepage_size, ownership.numa_nodes,
-                      ownership.prefault, ownership.numa_strict, ownership.prefault_threads}),
+                      ownership.use_hugepages, ownership.shared, ownership.hugepage_size,
+                      ownership.numa_nodes, ownership.prefault, ownership.numa_strict,
+                      ownership.prefault_threads}),
                   ownership.buffer_sizes, pending_ttl, read_lease_ttl, reaper_interval,
                   ownership.max_mr_bytes, ownership.numa_nodes) {}
 
@@ -213,6 +214,8 @@ void PageBackend::BuildBufferRefs() {
       }
     }
     buffer_refs_[i] = std::move(ref);
+    buffer_refs_[i].region_id = "page-region-" + std::to_string(reinterpret_cast<uintptr_t>(this)) +
+                                "-" + std::to_string(i);
   }
 }
 
@@ -314,6 +317,7 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
 }
 
 void PageBackend::Shutdown() {
+  ReleaseSharedRegions();
   if (!owns_memory_) return;
   if (registrar_ != nullptr) {
     for (const auto& ref : owned_refs_) registrar_->Deregister(ref);
@@ -326,6 +330,54 @@ void PageBackend::Shutdown() {
 
   owns_memory_ = false;
   registrar_ = nullptr;
+}
+
+std::vector<engine::SharedDramRegion> PageBackend::ExportSharedRegions(uint32_t backend_id,
+                                                                       engine::PoolEpoch epoch) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  if (!shared_regions_.empty()) return shared_regions_;
+  std::vector<engine::SharedDramRegion> regions;
+  std::vector<uintptr_t> holds;
+  for (uint32_t i = 0; i < buffer_refs_.size(); ++i) {
+    const auto& ref = buffer_refs_[i];
+    if (!ref.HasHostPtr() || ref.loc != mori::io::MemoryLocationType::CPU) goto fail;
+    auto allocation = HostMemAllocator::AcquireShmAllocation(
+        reinterpret_cast<uintptr_t>(ref.host_ptr), static_cast<size_t>(ref.size));
+    if (!allocation.has_value()) goto fail;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(allocation->base);
+    holds.push_back(base);
+    engine::SharedDramRegion region;
+    region.region_id = ref.region_id;
+    region.epoch = epoch;
+    region.backend_id = backend_id;
+    region.buffer_index = i;
+    region.fd = allocation->fd;
+    region.fd_offset = reinterpret_cast<uintptr_t>(ref.host_ptr) - base;
+    region.length = ref.size;
+    region.mapped_length = allocation->mapped_size;
+    region.numa_node = i < buffer_numa_nodes_.size() ? buffer_numa_nodes_[i] : -1;
+    region.alignment = allocation->alignment;
+    region.actual_backing = allocation->actual_backing;
+    region.memory = ref;
+    regions.push_back(std::move(region));
+  }
+  shared_regions_ = regions;
+  shared_region_holds_ = std::move(holds);
+  return shared_regions_;
+
+fail:
+  for (uintptr_t base : holds) HostMemAllocator::ReleaseShmAllocation(base);
+  return {};
+}
+
+void PageBackend::ReleaseSharedRegions() {
+  std::vector<uintptr_t> holds;
+  {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    holds.swap(shared_region_holds_);
+    shared_regions_.clear();
+  }
+  for (uintptr_t base : holds) HostMemAllocator::ReleaseShmAllocation(base);
 }
 
 // ---------------------------------------------------------------------------
@@ -356,8 +408,10 @@ bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vec
   ParallelFor(sizes.size(), buffer_workers, [&](size_t i) {
     if (sizes[i] == 0) return;
     HostBufferOptions opts;
-    opts.backing =
-        opts_.use_hugepages ? HostBufferBacking::kAnonymousHugetlb : HostBufferBacking::kAnonymous;
+    opts.backing = opts_.shared ? (opts_.use_hugepages ? HostBufferBacking::kAnonymousShmHugetlb
+                                                       : HostBufferBacking::kAnonymousShm)
+                                : (opts_.use_hugepages ? HostBufferBacking::kAnonymousHugetlb
+                                                       : HostBufferBacking::kAnonymous);
     opts.hugepage_size = opts_.hugepage_size;
     opts.numa_node = nodes.empty() ? -1 : nodes[i];
     opts.numa_bind_mode = preferred ? NumaBindMode::kPreferred : NumaBindMode::kBind;
@@ -705,7 +759,7 @@ bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* re
   if (resolved == nullptr) return false;
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto owned = owned_.find(key);
-  if (owned == owned_.end() || pins_.find(key) != pins_.end()) return false;
+  if (owned == owned_.end()) return false;
   resolved->outcome = ResolveOutcome::kFound;
   resolved->found = true;
   resolved->pages = owned->second.pages;
@@ -714,13 +768,20 @@ bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* re
   resolved->view =
       BuildPageObjectView(resolved->pages, page_size_, resolved->size, "page-backend-v1",
                           [this](uint32_t i) { return BufferRef(i); });
-  pins_[key] = PinState{next_pin_token_++, Now()};
+  auto [pin, inserted] = pins_.try_emplace(key, PinState{next_pin_token_++, 0, Now()});
+  ++pin->second.count;
   return true;
 }
 
 void PageBackend::ReleaseMigrationRead(const std::string& key) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
-  pins_.erase(key);
+  auto pin = pins_.find(key);
+  if (pin == pins_.end()) return;
+  if (pin->second.count > 1) {
+    --pin->second.count;
+  } else {
+    pins_.erase(pin);
+  }
 }
 
 bool PageBackend::Contains(const std::string& key) const {

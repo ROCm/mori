@@ -58,6 +58,9 @@ class MasterServer {
   // listen_address specifies port 0 (OS-assigned).  Returns 0 until Run()
   // has called BuildAndStart().
   uint16_t GetBoundPort() const { return bound_port_.load(); }
+#ifdef MORI_UMBP_TESTING
+  const IMasterMetadataStore* MetadataStoreForTest() const { return store_.get(); }
+#endif
 
   // Latest registered/heartbeat view of one peer. Used by tests to observe
   // whether capacity heartbeats aggregated across same-tier backends.

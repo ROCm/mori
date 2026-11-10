@@ -28,6 +28,7 @@
 #include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/peer/backend/ssd_backend.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
+#include "umbp/distributed/transfer/engine_transfer_engine.h"
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
@@ -64,6 +65,7 @@ class RealPoolPlatform final : public PoolPlatform {
                                const std::vector<BackendInstanceConfig>&) override {
     // Local host, local GPU, file, then remote: preserve the real dispatch order.
     auto composite = std::make_unique<CompositeTransferEngine>();
+    composite->AddEngine(std::make_unique<EngineTransferEngine>());
     composite->AddEngine(std::make_unique<LocalCopyEngine>());
     auto hbm = std::make_unique<HbmCopyEngine>();
     auto* hbm_observer = hbm.get();
@@ -103,6 +105,7 @@ class RealPoolPlatform final : public PoolPlatform {
         PageBackend::OwnershipConfig ownership;
         ownership.buffer_sizes = config.dram.buffer_sizes;
         ownership.use_hugepages = config.dram.use_hugepages;
+        ownership.shared = config.dram.shared;
         ownership.hugepage_size = config.dram.hugepage_size;
         ownership.numa_nodes = config.dram.numa_nodes;
         ownership.prefault = config.dram.prefault;

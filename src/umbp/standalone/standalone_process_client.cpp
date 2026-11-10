@@ -157,6 +157,9 @@ void ExportServerEnv(const UMBPConfig& config, const std::string& address) {
   SetEnv("UMBP_DRAM_PREFAULT", config.dram.prefault);
   SetEnv("UMBP_DRAM_HIGH_WM", config.dram.high_watermark);
   SetEnv("UMBP_DRAM_LOW_WM", config.dram.low_watermark);
+  if (config.distributed.has_value()) {
+    SetEnv("UMBP_ENGINE_HBM_RANKS", static_cast<size_t>(config.distributed->engine_hbm_ranks));
+  }
   SetEnv("UMBP_SSD_ENABLED", config.ssd.enabled);
   SetEnv("UMBP_SSD_DIR", config.ssd.storage_dir);
   SetEnv("UMBP_SSD_CAPACITY", config.ssd.capacity_bytes);

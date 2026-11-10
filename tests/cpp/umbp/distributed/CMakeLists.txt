@@ -486,6 +486,16 @@ target_link_libraries(test_engine_hbm_backend PRIVATE umbp_common GTest::gtest_m
 target_compile_features(test_engine_hbm_backend PRIVATE cxx_std_17)
 add_test(NAME umbp_engine_hbm_backend COMMAND test_engine_hbm_backend)
 
+add_executable(test_engine_control test_engine_control.cpp)
+target_link_libraries(test_engine_control PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_engine_control PRIVATE cxx_std_17)
+add_test(NAME umbp_engine_control COMMAND test_engine_control)
+
+add_executable(test_engine_pool_loop test_engine_pool_loop.cpp test_engine_recency.cpp)
+target_link_libraries(test_engine_pool_loop PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_engine_pool_loop PRIVATE cxx_std_17)
+add_test(NAME umbp_engine_pool_loop COMMAND test_engine_pool_loop)
+
 add_executable(test_kv_vmm_allocator test_kv_vmm_allocator.cpp)
 target_link_libraries(test_kv_vmm_allocator PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_kv_vmm_allocator PRIVATE cxx_std_17)

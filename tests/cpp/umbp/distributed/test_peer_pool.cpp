@@ -668,6 +668,19 @@ TEST(TieredPlacementPolicy, RejectsTierGraphWithoutTransferEngine) {
                std::invalid_argument);
 }
 
+TEST(TieredPlacementPolicy, LegacyTierGraphKeepsOneTransitionWorker) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, 64, 8);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, 64, 8);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine,
+                PeerPool::RetirePreservationConfig{8, std::chrono::milliseconds(100), 1});
+  EXPECT_EQ(pool.TransitionWorkerCountForTest(), 1u)
+      << "non-engine SSD offload keeps the legacy serialized writer";
+}
+
 TEST(TieredPlacementPolicy, IgnoresPhysicalRouteAndSpillsToConfiguredTarget) {
   LocalCopyEngine engine;
   BackendRegistry registry;

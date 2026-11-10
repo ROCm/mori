@@ -152,6 +152,39 @@ TEST(PageBackend, NumaWithoutHintFillsBuffersEvenly) {
   EXPECT_EQ(buffers, (std::vector<uint32_t>{0, 1, 0, 1}));
 }
 
+TEST(PageBackend, SharedRegionIdentityIsImmutableFromInit) {
+  PageBackend::OwnershipConfig cfg;
+  cfg.buffer_sizes = {4 * 4096};
+  cfg.shared = true;
+  cfg.use_hugepages = false;
+  cfg.prefault = false;
+  PageBackend backend(TierType::DRAM, 4096, cfg, std::chrono::seconds(30));
+  ASSERT_TRUE(backend.Init(nullptr));
+  const std::string before = backend.BufferRef(0).region_id;
+  ASSERT_FALSE(before.empty());
+  engine::PoolEpoch epoch;
+  auto exported = backend.ExportSharedRegions(/*backend_id=*/3, epoch);
+  ASSERT_EQ(exported.size(), 1u);
+  EXPECT_EQ(exported.front().region_id, before);
+  EXPECT_EQ(backend.BufferRef(0).region_id, before);
+}
+
+TEST(PageBackend, MigrationPinsAreReferenceCountedPerKey) {
+  auto backend = MakeAllocator();
+  auto allocated = backend->BatchAllocate({AllocateRequest{"pinned", kPageSize}}).front();
+  ASSERT_EQ(allocated.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(backend->BatchCommit({CommitRequest{allocated.slot_id, "pinned"}}).front().success);
+  ResolvedEntry first;
+  ResolvedEntry second;
+  ASSERT_TRUE(backend->AcquireMigrationRead("pinned", &first, true));
+  ASSERT_TRUE(backend->AcquireMigrationRead("pinned", &second, true));
+  backend->ReleaseMigrationRead("pinned");
+  EXPECT_EQ(backend->Evict({"pinned"}).front().bytes_freed, 0u)
+      << "one remaining pin must still protect the committed copy";
+  backend->ReleaseMigrationRead("pinned");
+  EXPECT_EQ(backend->Evict({"pinned"}).front().bytes_freed, kPageSize);
+}
+
 TEST(PageBackend, NumaHintStillWinsOverAnEvenFill) {
   auto backend = MakeTwoNodeBackend();
   ASSERT_NE(backend, nullptr);

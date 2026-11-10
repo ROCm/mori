@@ -54,6 +54,7 @@
 #include "umbp/distributed/indexer/kv_indexer_reporter.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
+#include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp/distributed/pool/peer_pool.h"
@@ -89,6 +90,73 @@ size_t RangedScratchShardsFromEnv() {
 }
 
 namespace {
+
+constexpr auto kEngineControlRpcTimeout = std::chrono::seconds(1);
+constexpr auto kEngineLoadRpcBudget = std::chrono::milliseconds(2500);
+
+std::chrono::system_clock::time_point EngineRpcAttemptDeadline(
+    std::chrono::system_clock::time_point total_deadline) {
+  return std::min(std::chrono::system_clock::now() + kEngineControlRpcTimeout, total_deadline);
+}
+
+EngineHbmBackend* AsEngineBackend(MediumBackend* backend) {
+  if (auto* instrumented = dynamic_cast<InstrumentedBackend*>(backend)) {
+    backend = instrumented->Inner();
+  }
+  return dynamic_cast<EngineHbmBackend*>(backend);
+}
+
+PageBackend* AsPageBackend(MediumBackend* backend) {
+  if (auto* instrumented = dynamic_cast<InstrumentedBackend*>(backend)) {
+    backend = instrumented->Inner();
+  }
+  return dynamic_cast<PageBackend*>(backend);
+}
+
+void EngineOperationToWire(const engine::OperationId& in, ::umbp::engine::OperationId* out) {
+  out->set_session_id(in.session_id.data(), in.session_id.size());
+  out->set_seq(in.seq);
+}
+
+bool SameTransferEndpoint(const TransferRef& left, const TransferRef& right) {
+  return left.kind == right.kind && left.host_ptr == right.host_ptr && left.size == right.size &&
+         left.loc == right.loc && left.device == right.device && left.mem == right.mem &&
+         left.executor_id == right.executor_id && left.region_id == right.region_id &&
+         left.executor_address == right.executor_address && left.file_fd == right.file_fd &&
+         left.file_offset == right.file_offset && left.gds_handle == right.gds_handle;
+}
+
+TransferRef EngineMemoryFromWire(const ::umbp::engine::MemoryRef& in) {
+  TransferRef out;
+  out.size = in.size();
+  out.loc = static_cast<mori::io::MemoryLocationType>(in.location());
+  out.device = in.device();
+  out.executor_id = in.executor_id();
+  out.region_id = in.region_id();
+  out.executor_address = in.address();
+  if (!in.memory_desc().empty()) {
+    try {
+      auto packed = msgpack::unpack(in.memory_desc().data(), in.memory_desc().size());
+      packed.get().convert(out.mem);
+    } catch (...) {
+      return {};
+    }
+  }
+  return out;
+}
+
+ObjectView EngineViewFromWire(const ::umbp::engine::ObjectView& in) {
+  ObjectView out;
+  out.size = in.size();
+  out.layout_id = in.layout_id();
+  for (const auto& span : in.spans()) {
+    out.spans.push_back(RegionSpan{EngineMemoryFromWire(span.buffer()), span.offset(),
+                                   span.length(), span.logical_offset(), span.layer_id(),
+                                   span.component()});
+  }
+  if (!ValidateObjectView(out)) out.spans.clear();
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 //  Bandwidth metrics
@@ -859,6 +927,13 @@ bool PoolClient::Init() {
   }
 
   if (!config_.policy_config_path.empty()) {
+    if (config_.engine_hbm_ranks != 0) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] engine HBM uses its fixed first-step topology; "
+          "backend_policy_path is not supported");
+      initialized_.store(false);
+      return false;
+    }
     auto loaded = LoadBackendPolicyFile(config_.policy_config_path);
     std::string error;
     if (!loaded.ok() || !ApplyBackendPolicy(*loaded.config, &config_, &error)) {
@@ -961,6 +1036,54 @@ bool PoolClient::Init() {
     }
   }
 
+  if (config_.engine_hbm_ranks != 0) {
+    if (config_.engine_hbm_ranks != 8) {
+      MORI_UMBP_ERROR("[PoolClient] engine_hbm_ranks must be 8 (got {})", config_.engine_hbm_ranks);
+      Shutdown();
+      return false;
+    }
+    for (engine::RankId rank = 0; rank < config_.engine_hbm_ranks; ++rank) {
+      EngineRegistration placeholder;
+      placeholder.owner_rank = rank;
+      auto backend = MakeInstrumentedBackend(MakeEngineHbmBackend(std::move(placeholder)));
+      if (!master_client_) backend->SetEventPublishing(false);
+      if (!backend->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get())) ||
+          !registry_.Register(EngineHbmBackendName(rank), std::move(backend))) {
+        MORI_UMBP_ERROR("[PoolClient] failed to prebuild engine HBM backend for rank {}", rank);
+        Shutdown();
+        return false;
+      }
+    }
+
+    LogicalTierConfig hbm;
+    hbm.name = "engine-hbm";
+    hbm.entry = false;  // framework publication only; ordinary Put starts in DRAM
+    hbm.offload_to = {"engine-dram"};
+    hbm.trigger = PoolOffloadTrigger::kOnEvict;
+    hbm.high_watermark = 0.95;
+    hbm.low_watermark = 0.90;
+    for (engine::RankId rank = 0; rank < config_.engine_hbm_ranks; ++rank) {
+      hbm.members.push_back({EngineHbmBackendName(rank), 1, 0});
+    }
+    LogicalTierConfig dram;
+    dram.name = "engine-dram";
+    dram.entry = true;
+    dram.high_watermark = 0.95;
+    dram.low_watermark = 0.90;
+    for (const auto& backend_config : backend_configs) {
+      if (backend_config.tier == TierType::DRAM) {
+        dram.members.push_back({backend_config.name, 1, 0});
+      }
+    }
+    if (dram.members.empty()) {
+      MORI_UMBP_ERROR("[PoolClient] engine HBM requires a DRAM backend");
+      Shutdown();
+      return false;
+    }
+    config_.placement_policy = PoolPlacementPolicy::TIERED;
+    config_.logical_tiers = {std::move(hbm), std::move(dram)};
+  }
+
   std::shared_ptr<const LogicalTierGraph> tier_graph;
   auto placement_policy =
       MakeConfiguredPoolPolicy(config_, backend_configs, registry_, &tier_graph);
@@ -969,8 +1092,11 @@ bool PoolClient::Init() {
     Shutdown();
     return false;
   }
-  default_pool_ =
-      std::make_unique<PeerPool>(&registry_, std::move(placement_policy), transfer_engine_.get());
+  default_pool_ = std::make_unique<PeerPool>(
+      &registry_, std::move(placement_policy), transfer_engine_.get(),
+      PeerPool::RetirePreservationConfig{config_.engine_f3_max_inflight,
+                                         config_.engine_f3_retry_timeout,
+                                         config_.engine_f3_max_attempts});
 
   // Local watermark eviction, for every medium unless a master's rounds own
   // DRAM/HBM (eviction_mode kMaster; SSD always evicts locally).  A node that
@@ -1145,6 +1271,13 @@ bool PoolClient::Init() {
     // Unless it evicts by its own LRU, its victims follow the master's
     // recency, which must then hear about the reads served here.
     master_client_->EnableLocalReadReports(config_.eviction_mode != PeerEvictionMode::kLocal);
+    if (default_pool_ != nullptr) {
+      default_pool_->SetLocalReadReporter([client = master_client_.get()](const auto& keys) {
+        // Master recency is per key, shared across its locations. Handoffs
+        // deliberately use the existing bounded, batched demand-read queue.
+        if (client->ReportsLocalReads()) client->NoteLocalReads(keys);
+      });
+    }
     auto status =
         master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes, logical_caps);
     if (!status.ok()) {
@@ -1248,7 +1381,10 @@ void PoolClient::Shutdown() {
     if (!status.ok()) {
       MORI_UMBP_WARN("[PoolClient] UnregisterSelf failed: {}", status.error_message());
     }
-    if (default_pool_) default_pool_->SetEvictionCandidateSource(nullptr);
+    if (default_pool_) {
+      default_pool_->SetEvictionCandidateSource(nullptr);
+      default_pool_->SetLocalReadReporter(nullptr);
+    }
   }
   // The masterless counterpart, joined at the same point in teardown and for
   // the same reason: its final tick samples the backends and transfer engine,
@@ -1338,7 +1474,7 @@ bool PoolClient::Clear() {
   if (!initialized_.load()) return true;
   // Clear physical state and the default Pool's logical placement index before
   // the full-sync empty snapshot goes out.
-  if (default_pool_ != nullptr) default_pool_->ClearLocal();
+  if (default_pool_ != nullptr && !default_pool_->ClearLocal()) return false;
 
   bool ok = true;
   if (master_client_) {
@@ -1368,6 +1504,711 @@ void PoolClient::CountMetric(std::string name, std::string help, MetricSink::Lab
   metric_sink_->AddCounter(std::move(name), std::move(help), std::move(labels), delta);
 }
 BackendRegistry& PoolClient::Backends() { return registry_; }
+
+std::optional<uint32_t> PoolClient::EngineBackendId(engine::RankId rank) const {
+  const auto* entry = registry_.GetEntry(EngineHbmBackendName(rank));
+  return entry == nullptr ? std::nullopt : std::optional<uint32_t>{entry->backend_id};
+}
+
+bool PoolClient::ActivateEngine(EngineRegistration registration) {
+  if (registration.owner_rank >= config_.engine_hbm_ranks || default_pool_ == nullptr) return false;
+  auto* backend = registry_.Get(EngineHbmBackendName(registration.owner_rank));
+  auto* engine_backend = AsEngineBackend(backend);
+  if (engine_backend == nullptr || !engine_backend->Activate(std::move(registration))) return false;
+  if (master_client_ != nullptr) master_client_->FlushHeartbeat();
+  return true;
+}
+
+void PoolClient::FailEngineSession(engine::RankId rank) {
+  auto* backend = registry_.Get(EngineHbmBackendName(rank));
+  auto* engine_backend = AsEngineBackend(backend);
+  if (engine_backend == nullptr) return;
+  engine_backend->FailSession();
+  if (default_pool_ != nullptr) {
+    auto backend_id = EngineBackendId(rank);
+    if (backend_id.has_value()) {
+      (void)default_pool_->PollReadyEngineRetires(*backend_id);
+      default_pool_->RefreshBackendResidencies(*backend_id);
+    }
+  }
+  if (master_client_ != nullptr) master_client_->FlushHeartbeat();
+  const auto failed_backend = EngineBackendId(rank);
+  if (failed_backend.has_value()) {
+    struct FailedLoad {
+      uint64_t id;
+      engine::OperationId operation;
+      engine::LoadOutcome outcome;
+    };
+    std::vector<FailedLoad> failed_loads;
+    {
+      std::lock_guard<std::mutex> lock(engine_load_mutex_);
+      for (const auto& [id, load] : engine_prepared_loads_) {
+        if (load.requester_backend_id == *failed_backend) {
+          failed_loads.push_back(
+              {id,
+               engine::OperationId{load.prepare_operation.session_id,
+                                   std::numeric_limits<uint64_t>::max()},
+               load.started ? engine::LoadOutcome::kUnknown : engine::LoadOutcome::kCanceled});
+        }
+      }
+    }
+    for (const auto& failed : failed_loads) {
+      (void)CompleteEngineLoad(failed.id, failed.outcome, failed.operation);
+    }
+  }
+}
+
+engine::ReadPlan PoolClient::LookupEngine(const std::vector<std::string>& keys,
+                                          std::string name_space, std::string layout_id,
+                                          uint32_t requester_backend_id) {
+  engine::ReadPlan out;
+  if (!initialized_ || default_pool_ == nullptr || keys.empty() || name_space.empty() ||
+      layout_id.empty() || requester_backend_id >= BackendRegistry::kMaxBackends) {
+    out.error = "invalid lookup request";
+    return out;
+  }
+  auto* requester = AsEngineBackend(registry_.Get(requester_backend_id));
+  if (requester == nullptr || !requester->Active()) {
+    out.error = "requester engine backend is inactive";
+    return out;
+  }
+  const auto requester_registration = requester->RegistrationSnapshot();
+  if (requester_registration.geometry.layout_id != layout_id) {
+    out.error = "requester layout mismatch";
+    return out;
+  }
+  out.epoch = requester_registration.epoch;
+  out.requester_backend_id = requester_backend_id;
+  out.name_space = std::move(name_space);
+  out.layout_id = std::move(layout_id);
+  out.keys = keys;
+  out.sources.resize(keys.size());
+  struct EngineLookupCandidate {
+    uint32_t backend_id;
+    EngineHbmBackend* backend;
+    EngineRegistration registration;
+  };
+  std::vector<EngineLookupCandidate> engine_candidates;
+  for (auto* medium : registry_.All()) {
+    const uint32_t backend_id = registry_.BackendId(medium);
+    auto* engine_backend = AsEngineBackend(medium);
+    if (engine_backend == nullptr || backend_id == requester_backend_id ||
+        !engine_backend->Active()) {
+      continue;
+    }
+    engine_candidates.push_back(
+        {backend_id, engine_backend, engine_backend->RegistrationSnapshot()});
+  }
+  std::vector<size_t> unresolved;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto& hint = out.sources[i];
+    hint.key = keys[i];
+    for (const auto& candidate : engine_candidates) {
+      if (!candidate.backend->IsQualifiedReplica(keys[i]) ||
+          candidate.registration.geometry.layout_id != out.layout_id) {
+        continue;
+      }
+      hint.kind = engine::ReadSourceKind::kLocalHbm;
+      hint.backend_id = candidate.backend_id;
+      hint.executor_id = candidate.registration.executor_id;
+      hint.layout_id = candidate.registration.geometry.layout_id;
+      hint.handle = candidate.backend->HandleForKey(keys[i]);
+      break;
+    }
+    if (hint.kind == engine::ReadSourceKind::kMissing) {
+      for (auto* medium : registry_.All()) {
+        if (medium == nullptr || medium->Tier() != TierType::DRAM || !medium->Contains(keys[i])) {
+          continue;
+        }
+        hint.kind = engine::ReadSourceKind::kLocalDram;
+        hint.backend_id = registry_.BackendId(medium);
+        hint.layout_id = out.layout_id;
+        break;
+      }
+    }
+    if (hint.kind == engine::ReadSourceKind::kMissing) unresolved.push_back(i);
+  }
+  if (!unresolved.empty() && master_client_ != nullptr) {
+    std::vector<std::string> remote_keys;
+    remote_keys.reserve(unresolved.size());
+    for (size_t position : unresolved) remote_keys.push_back(keys[position]);
+    std::vector<std::optional<RouteGetResult>> routes;
+    auto exclude_nodes = EngineLookupExcludes(config_.master_config.node_id);
+    if (master_client_
+            ->BatchRouteGet(
+                remote_keys, exclude_nodes, &routes,
+                std::chrono::duration_cast<std::chrono::milliseconds>(kEngineControlRpcTimeout))
+            .ok()) {
+      for (size_t i = 0; i < routes.size() && i < unresolved.size(); ++i) {
+        if (!routes[i].has_value() || routes[i]->node_id == config_.master_config.node_id) continue;
+        const auto remote_kind = EngineRemoteReadKind(routes[i]->tier);
+        if (remote_kind == engine::ReadSourceKind::kMissing) continue;
+        auto& hint = out.sources[unresolved[i]];
+        hint.kind = remote_kind;
+        hint.node_id = routes[i]->node_id;
+        hint.peer_address = routes[i]->peer_address;
+        hint.layout_id = out.layout_id;
+      }
+    }
+  }
+  while (out.valid_prefix < out.sources.size() &&
+         out.sources[out.valid_prefix].kind != engine::ReadSourceKind::kMissing) {
+    ++out.valid_prefix;
+    out.legal_boundaries.push_back(out.valid_prefix);
+  }
+  out.success = out.valid_prefix != 0;
+  if (!out.success) {
+    out.error = "no readable prefix";
+    return out;
+  }
+  {
+    std::lock_guard<std::mutex> lock(engine_load_mutex_);
+    for (auto it = engine_read_plans_.begin(); it != engine_read_plans_.end();) {
+      it = it->second.expires_at <= std::chrono::steady_clock::now() ? engine_read_plans_.erase(it)
+                                                                     : std::next(it);
+    }
+    out.id = next_read_plan_id_++;
+    engine_read_plans_[out.id] =
+        StoredReadPlan{out, std::chrono::steady_clock::now() + std::chrono::seconds(5)};
+  }
+  return out;
+}
+
+engine::ReadSourceKind PoolClient::EngineRemoteReadKind(TierType tier) {
+  if (tier == TierType::HBM) return engine::ReadSourceKind::kRemoteHbm;
+  if (tier == TierType::DRAM) return engine::ReadSourceKind::kRemoteDram;
+  return engine::ReadSourceKind::kMissing;
+}
+
+std::unordered_set<std::string> PoolClient::EngineLookupExcludes(std::string_view node_id) {
+  return node_id.empty() ? std::unordered_set<std::string>{}
+                         : std::unordered_set<std::string>{std::string(node_id)};
+}
+
+engine::PreparedLoad PoolClient::PrepareEngineLoad(
+    const engine::ReadPlan& supplied, std::string request_id,
+    const std::vector<engine::AllocationHandle>& targets, uint32_t n_pages,
+    const ReaderIdentity& reader, engine::OperationId operation) {
+  engine::PreparedLoad out;
+  constexpr uint32_t kMaxPreparedLoadPages = 256;
+  if (request_id.empty() || n_pages == 0 || n_pages > kMaxPreparedLoadPages ||
+      targets.size() != n_pages) {
+    out.error = "invalid prepare_load request";
+    return out;
+  }
+  engine::ReadPlan plan;
+  {
+    std::lock_guard<std::mutex> lock(engine_load_mutex_);
+    auto stored = engine_read_plans_.find(supplied.id);
+    if (stored == engine_read_plans_.end() ||
+        stored->second.expires_at <= std::chrono::steady_clock::now() ||
+        stored->second.plan.epoch != supplied.epoch || n_pages > stored->second.plan.valid_prefix) {
+      out.error = "stale or invalid read plan";
+      return out;
+    }
+    plan = stored->second.plan;
+    engine_read_plans_.erase(stored);
+  }
+  std::vector<ObjectView> target_views;
+  target_views.reserve(n_pages);
+  auto* target_backend = AsEngineBackend(registry_.Get(plan.requester_backend_id));
+  const auto target_registration =
+      target_backend == nullptr ? EngineRegistration{} : target_backend->RegistrationSnapshot();
+  std::unordered_set<engine::ResidentIdentity, engine::ResidentIdentityHash> target_identities;
+  for (const auto& target : targets) {
+    const auto identity = engine::ResidentIdentity(target);
+    if (target_backend == nullptr || target.backend_id != plan.requester_backend_id ||
+        target_registration.epoch != target.epoch || !target_identities.insert(identity).second ||
+        !target_backend->IsDelegatedHandle(target)) {
+      out.error = "invalid load target";
+      return out;
+    }
+    ObjectView view = target_backend->View(target);
+    if (!ValidateObjectView(view) || view.layout_id != plan.layout_id) {
+      out.error = "target layout mismatch";
+      return out;
+    }
+    target_views.push_back(std::move(view));
+  }
+  {
+    std::lock_guard<std::mutex> lock(engine_load_mutex_);
+    if (std::any_of(target_identities.begin(), target_identities.end(), [&](const auto& identity) {
+          return engine_load_targets_.count(identity) != 0;
+        })) {
+      out.error = "load target is already prepared";
+      return out;
+    }
+    engine_load_targets_.insert(target_identities.begin(), target_identities.end());
+  }
+  const auto release_target_claim = [&] {
+    std::lock_guard<std::mutex> lock(engine_load_mutex_);
+    for (const auto& identity : target_identities) engine_load_targets_.erase(identity);
+  };
+
+  std::vector<LoadSourceGrantResult> acquired(n_pages);
+  std::vector<engine::LoadGrantRef> grant_refs;
+  std::vector<engine::ExecutorBootstrap> bootstraps;
+  std::vector<size_t> local_positions;
+  std::vector<std::string> local_keys;
+  std::vector<uint32_t> local_backends;
+  std::vector<TierType> local_tiers;
+  for (size_t i = 0; i < n_pages; ++i) {
+    const auto& hint = plan.sources[i];
+    if (hint.kind == engine::ReadSourceKind::kLocalHbm ||
+        hint.kind == engine::ReadSourceKind::kLocalDram) {
+      local_positions.push_back(i);
+      local_keys.push_back(plan.keys[i]);
+      local_backends.push_back(hint.backend_id);
+      local_tiers.push_back(hint.kind == engine::ReadSourceKind::kLocalHbm ? TierType::HBM
+                                                                           : TierType::DRAM);
+    }
+  }
+  if (!local_positions.empty()) {
+    auto local = default_pool_->AcquireLoadSources(
+        reader, local_keys, local_backends, local_tiers, operation,
+        GrantTable::Clock::now() + std::chrono::seconds(30));
+    for (size_t i = 0; i < local.size(); ++i) acquired[local_positions[i]] = std::move(local[i]);
+  }
+
+  std::unordered_map<std::string, std::vector<size_t>> remote_groups;
+  for (size_t i = 0; i < n_pages; ++i) {
+    if (plan.sources[i].kind == engine::ReadSourceKind::kRemoteHbm ||
+        plan.sources[i].kind == engine::ReadSourceKind::kRemoteDram) {
+      remote_groups[plan.sources[i].node_id].push_back(i);
+    }
+  }
+  const auto remote_deadline = std::chrono::system_clock::now() + kEngineLoadRpcBudget;
+  for (const auto& [node_id, positions] : remote_groups) {
+    if (std::chrono::system_clock::now() >= remote_deadline) break;
+    const auto& first_hint = plan.sources[positions.front()];
+    auto& peer = GetOrConnectPeer(node_id, first_hint.peer_address);
+    if (!EnsurePeerServiceConnection(peer, /*force_refresh=*/false, std::nullopt, {},
+                                     remote_deadline)) {
+      continue;
+    }
+    auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+    ::umbp::BatchAcquireLoadSourcesRequest request;
+    request.set_reader_session(reader.session);
+    request.set_reader_request(reader.request);
+    EngineOperationToWire(operation, request.mutable_operation());
+    request.set_lease_ms(30000);
+    for (size_t position : positions) {
+      auto* entry = request.add_entries();
+      entry->set_key(plan.keys[position]);
+      entry->set_preferred_backend_id(BackendRegistry::kMaxBackends);
+      entry->set_preferred_tier(TierToProto(
+          plan.sources[position].kind == engine::ReadSourceKind::kRemoteHbm ? TierType::HBM
+                                                                            : TierType::DRAM));
+    }
+    ::umbp::BatchAcquireLoadSourcesResponse response;
+    const auto acquire_once = [&] {
+      response.Clear();
+      grpc::ClientContext context;
+      const auto deadline = EngineRpcAttemptDeadline(remote_deadline);
+      if (deadline <= std::chrono::system_clock::now()) {
+        return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                            "prepare_load total deadline exhausted");
+      }
+      context.set_deadline(deadline);
+      return stub->BatchAcquireLoadSources(&context, request, &response);
+    };
+    auto acquire_status = acquire_once();
+    if (!acquire_status.ok()) {
+      // The request may have reached the server even though its reply did not.
+      // Replay the idempotent operation, recover every grant, then compensate.
+      acquire_status = acquire_once();
+      if (acquire_status.ok() && response.grants_size() == static_cast<int>(positions.size())) {
+        ::umbp::BatchReleaseLoadSourcesRequest release;
+        release.set_reader_session(reader.session);
+        release.set_reader_request(reader.request);
+        EngineOperationToWire(operation, release.mutable_operation());
+        release.set_proof(static_cast<uint32_t>(engine::CompletionProof::kNeverSubmitted));
+        for (size_t i = 0; i < positions.size(); ++i) {
+          const auto& granted = response.grants(static_cast<int>(i));
+          if (!granted.granted()) continue;
+          auto* item = release.add_grants();
+          item->set_grant_id(granted.grant_id());
+          item->set_backend_id(granted.backend_id());
+          item->set_engine(granted.engine());
+          item->set_key(plan.keys[positions[i]]);
+        }
+        if (release.grants_size() != 0) {
+          ::umbp::BatchReleaseLoadSourcesResponse released;
+          for (int attempt = 0; attempt < 2; ++attempt) {
+            if (std::chrono::system_clock::now() >= remote_deadline) break;
+            grpc::ClientContext release_context;
+            release_context.set_deadline(EngineRpcAttemptDeadline(remote_deadline));
+            released.Clear();
+            if (stub->BatchReleaseLoadSources(&release_context, release, &released).ok()) break;
+          }
+        }
+      }
+      continue;
+    }
+    if (response.grants_size() != static_cast<int>(positions.size())) {
+      continue;
+    }
+    for (size_t i = 0; i < positions.size(); ++i) {
+      const auto& granted = response.grants(static_cast<int>(i));
+      if (!granted.granted()) continue;
+      auto& result = acquired[positions[i]];
+      result.granted = true;
+      result.id = GrantId{granted.grant_id()};
+      result.backend_id = granted.backend_id();
+      result.engine = granted.engine();
+      result.executor_id = granted.executor_id();
+      result.view = EngineViewFromWire(granted.view());
+      engine::LoadGrantRef ref;
+      ref.id = granted.grant_id();
+      ref.backend_id = granted.backend_id();
+      ref.remote = true;
+      ref.engine = granted.engine();
+      ref.node_id = node_id;
+      ref.peer_address = first_hint.peer_address;
+      ref.key = plan.keys[positions[i]];
+      grant_refs.push_back(std::move(ref));
+      std::lock_guard<std::mutex> peer_lock(peer.conn_mutex);
+      if (granted.engine()) {
+        auto executor =
+            std::find_if(peer.executors.begin(), peer.executors.end(),
+                         [&](const auto& e) { return e.executor_id == granted.executor_id(); });
+        if (executor != peer.executors.end()) {
+          bootstraps.push_back({executor->executor_id, executor->engine_desc});
+        }
+      } else if (!peer.engine_desc.empty()) {
+        bootstraps.push_back({peer.node_id, peer.engine_desc});
+      }
+    }
+  }
+
+  for (size_t i = 0; i < n_pages; ++i) {
+    if (!acquired[i].granted || !ValidateObjectView(acquired[i].view) ||
+        acquired[i].view.size != target_views[i].size) {
+      // Roll back every authorization acquired so far.
+      std::vector<engine::LoadGrantRef> local;
+      for (size_t j = 0; j < n_pages; ++j) {
+        if (!acquired[j].granted) continue;
+        engine::LoadGrantRef ref;
+        ref.id = acquired[j].id.value;
+        ref.backend_id = acquired[j].backend_id;
+        ref.engine = acquired[j].engine;
+        ref.key = plan.keys[j];
+        if (std::none_of(grant_refs.begin(), grant_refs.end(), [&](const auto& remote) {
+              return remote.key == ref.key && remote.id == ref.id;
+            })) {
+          local.push_back(ref);
+        }
+      }
+      if (!local.empty()) {
+        (void)default_pool_->ReleaseLoadSources(
+            reader, local, engine::CompletionProof::kNeverSubmitted, operation);
+      }
+      for (const auto& [node_id, positions] : remote_groups) {
+        std::vector<engine::LoadGrantRef> remote;
+        for (const auto& grant : grant_refs)
+          if (grant.node_id == node_id) remote.push_back(grant);
+        if (remote.empty()) continue;
+        auto& peer = GetOrConnectPeer(node_id, remote.front().peer_address);
+        auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+        ::umbp::BatchReleaseLoadSourcesRequest release;
+        release.set_reader_session(reader.session);
+        release.set_reader_request(reader.request);
+        EngineOperationToWire(operation, release.mutable_operation());
+        release.set_proof(static_cast<uint32_t>(engine::CompletionProof::kNeverSubmitted));
+        for (const auto& grant : remote) {
+          auto* item = release.add_grants();
+          item->set_grant_id(grant.id);
+          item->set_backend_id(grant.backend_id);
+          item->set_engine(grant.engine);
+          item->set_key(grant.key);
+        }
+        ::umbp::BatchReleaseLoadSourcesResponse ignored;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+          if (std::chrono::system_clock::now() >= remote_deadline) break;
+          grpc::ClientContext context;
+          context.set_deadline(EngineRpcAttemptDeadline(remote_deadline));
+          ignored.Clear();
+          if (stub->BatchReleaseLoadSources(&context, release, &ignored).ok()) break;
+        }
+      }
+      out.error = "load source grant rejected";
+      release_target_claim();
+      return out;
+    }
+  }
+
+  // Add local grant references and same-node executor bootstraps.
+  std::unordered_map<uint32_t, EngineRegistration> registration_cache;
+  std::unordered_set<std::string> peer_region_keys;
+  for (size_t i = 0; i < n_pages; ++i) {
+    if (std::any_of(grant_refs.begin(), grant_refs.end(), [&](const auto& remote) {
+          return remote.key == plan.keys[i] && remote.id == acquired[i].id.value;
+        })) {
+      continue;
+    }
+    engine::LoadGrantRef ref;
+    ref.id = acquired[i].id.value;
+    ref.backend_id = acquired[i].backend_id;
+    ref.engine = acquired[i].engine;
+    ref.key = plan.keys[i];
+    grant_refs.push_back(ref);
+    if (acquired[i].engine) {
+      auto* backend = AsEngineBackend(registry_.Get(acquired[i].backend_id));
+      if (backend != nullptr) {
+        auto [cached, inserted] = registration_cache.try_emplace(acquired[i].backend_id);
+        if (inserted) cached->second = backend->RegistrationSnapshot();
+        const auto& registration = cached->second;
+        bootstraps.push_back({registration.executor_id, registration.engine_desc});
+        for (const auto& region : registration.vmm_regions) {
+          const std::string region_key = region.executor_id + '\0' + region.region_id + '\0' +
+                                         std::to_string(region.mapping_id);
+          if ((region.fd >= 0 || !region.fabric.empty()) &&
+              peer_region_keys.insert(region_key).second) {
+            out.peer_regions.push_back(region);
+          }
+        }
+      }
+    }
+  }
+
+  const auto rollback_built_grants = [&](std::string error) {
+    uint64_t temporary_id = 0;
+    {
+      std::lock_guard<std::mutex> lock(engine_load_mutex_);
+      temporary_id = next_prepared_load_id_++;
+      PreparedLoadRecord temporary;
+      temporary.reader = reader;
+      temporary.grants = grant_refs;
+      temporary.created_at = std::chrono::steady_clock::now();
+      temporary.requester_backend_id = plan.requester_backend_id;
+      temporary.prepare_operation = operation;
+      temporary.targets = targets;
+      engine_prepared_loads_[temporary_id] = std::move(temporary);
+    }
+    (void)CompleteEngineLoad(temporary_id, engine::LoadOutcome::kCanceled, operation);
+    out.error = std::move(error);
+  };
+
+  uint64_t next_tag = 1;
+  std::map<int32_t, size_t> layer_positions;
+  for (size_t page = 0; page < n_pages; ++page) {
+    std::vector<TransferItem> items;
+    if (!BuildObjectViewTransfers(acquired[page].view, target_views[page], &items)) {
+      rollback_built_grants("could not intersect source and target views");
+      return out;
+    }
+    std::vector<const RegionSpan*> target_spans;
+    target_spans.reserve(target_views[page].spans.size());
+    for (const auto& span : target_views[page].spans) target_spans.push_back(&span);
+    std::sort(target_spans.begin(), target_spans.end(), [](const auto* left, const auto* right) {
+      return left->logical_offset < right->logical_offset;
+    });
+    uint64_t logical_at = 0;
+    size_t span_position = 0;
+    for (const auto& item : items) {
+      while (span_position < target_spans.size() &&
+             target_spans[span_position]->logical_offset + target_spans[span_position]->length <=
+                 logical_at) {
+        ++span_position;
+      }
+      if (span_position == target_spans.size() ||
+          target_spans[span_position]->logical_offset > logical_at ||
+          item.size > target_spans[span_position]->logical_offset +
+                          target_spans[span_position]->length - logical_at) {
+        rollback_built_grants("layer geometry does not cover transfer intersection");
+        return out;
+      }
+      const auto& target_span = *target_spans[span_position];
+      size_t layer_position = 0;
+      auto existing = layer_positions.find(target_span.layer_id);
+      if (existing == layer_positions.end()) {
+        layer_position = out.layers.size();
+        layer_positions[target_span.layer_id] = layer_position;
+        out.layers.push_back(
+            engine::LayerTransferPlan{target_span.layer_id, target_span.component, next_tag++, {}});
+      } else {
+        layer_position = existing->second;
+        if (out.layers[layer_position].component != target_span.component) {
+          out.layers[layer_position].component = "mixed";
+        }
+      }
+      auto& layer = out.layers[layer_position];
+      auto transfer = std::find_if(layer.plans.begin(), layer.plans.end(), [&](const auto& plan) {
+        return SameTransferEndpoint(plan.src, item.src) && SameTransferEndpoint(plan.dst, item.dst);
+      });
+      if (transfer == layer.plans.end()) {
+        TransferPlan new_plan;
+        new_plan.src = item.src;
+        new_plan.dst = item.dst;
+        new_plan.tags = {layer.tag};
+        layer.plans.push_back(std::move(new_plan));
+        transfer = std::prev(layer.plans.end());
+      }
+      transfer->src_offsets.push_back(item.src_offset);
+      transfer->dst_offsets.push_back(item.dst_offset);
+      transfer->sizes.push_back(item.size);
+      logical_at += item.size;
+    }
+  }
+  std::sort(out.layers.begin(), out.layers.end(),
+            [](const auto& left, const auto& right) { return left.layer_id < right.layer_id; });
+  std::sort(bootstraps.begin(), bootstraps.end(), [](const auto& left, const auto& right) {
+    return left.executor_id < right.executor_id;
+  });
+  bootstraps.erase(std::unique(bootstraps.begin(), bootstraps.end(),
+                               [](const auto& left, const auto& right) {
+                                 return left.executor_id == right.executor_id;
+                               }),
+                   bootstraps.end());
+  if (out.layers.empty()) {
+    rollback_built_grants("prepared load has no layer plans");
+    return out;
+  }
+  out.success = true;
+  out.request_id = std::move(request_id);
+  out.targets = targets;
+  out.grants = grant_refs;
+  out.bootstraps = std::move(bootstraps);
+  {
+    std::lock_guard<std::mutex> lock(engine_load_mutex_);
+    out.id = next_prepared_load_id_++;
+    PreparedLoadRecord record;
+    record.reader = reader;
+    record.grants = out.grants;
+    record.created_at = std::chrono::steady_clock::now();
+    record.requester_backend_id = plan.requester_backend_id;
+    record.prepare_operation = operation;
+    record.targets = targets;
+    engine_prepared_loads_[out.id] = std::move(record);
+  }
+  return out;
+}
+
+engine::CancelLoadResult PoolClient::CancelEngineLoad(uint64_t prepared_id,
+                                                      engine::OperationId operation) {
+  {
+    std::lock_guard<std::mutex> lock(engine_load_mutex_);
+    auto prepared = engine_prepared_loads_.find(prepared_id);
+    if (prepared == engine_prepared_loads_.end()) return engine::CancelLoadResult::kRejected;
+    if (prepared->second.terminal) return engine::CancelLoadResult::kCompleted;
+    if (prepared->second.started) return engine::CancelLoadResult::kInFlight;
+  }
+  return CompleteEngineLoad(prepared_id, engine::LoadOutcome::kCanceled, operation)
+             ? engine::CancelLoadResult::kNeverSubmitted
+             : engine::CancelLoadResult::kRejected;
+}
+
+bool PoolClient::CompleteEngineLoad(uint64_t prepared_id, engine::LoadOutcome outcome,
+                                    engine::OperationId operation) {
+  if (outcome == engine::LoadOutcome::kPending) {
+    std::lock_guard<std::mutex> lock(engine_load_mutex_);
+    auto prepared = engine_prepared_loads_.find(prepared_id);
+    if (prepared == engine_prepared_loads_.end() || prepared->second.terminal) return false;
+    prepared->second.started = true;
+    return true;
+  }
+  PreparedLoadRecord record;
+  {
+    std::lock_guard<std::mutex> lock(engine_load_mutex_);
+    auto prepared = engine_prepared_loads_.find(prepared_id);
+    if (prepared == engine_prepared_loads_.end() || prepared->second.terminal) return false;
+    prepared->second.terminal = true;
+    record = std::move(prepared->second);
+    engine_prepared_loads_.erase(prepared);
+    for (const auto& target : record.targets) {
+      engine_load_targets_.erase(engine::ResidentIdentity(target));
+    }
+  }
+  const engine::CompletionProof proof =
+      outcome == engine::LoadOutcome::kUnknown    ? engine::CompletionProof::kUnknown
+      : outcome == engine::LoadOutcome::kCanceled ? engine::CompletionProof::kNeverSubmitted
+                                                  : engine::CompletionProof::kCompleted;
+  std::vector<engine::LoadGrantRef> local;
+  std::unordered_map<std::string, std::vector<engine::LoadGrantRef>> remote;
+  for (const auto& grant : record.grants) {
+    if (grant.remote)
+      remote[grant.node_id].push_back(grant);
+    else
+      local.push_back(grant);
+  }
+  bool ok = true;
+  if (!local.empty()) {
+    const auto released = default_pool_->ReleaseLoadSources(record.reader, local, proof, operation);
+    ok = released.size() == local.size() &&
+         std::all_of(released.begin(), released.end(), [](bool value) { return value; });
+    if (record.prepare_operation.session_id == operation.session_id &&
+        record.prepare_operation.seq < operation.seq) {
+      std::unordered_set<uint32_t> advanced;
+      for (const auto& grant : local) {
+        if (grant.engine && advanced.insert(grant.backend_id).second) {
+          default_pool_->AdvanceEngineAckWatermark(grant.backend_id, record.prepare_operation);
+        }
+      }
+    }
+  }
+  const auto remote_deadline = std::chrono::system_clock::now() + kEngineLoadRpcBudget;
+  for (const auto& [node_id, grants] : remote) {
+    if (std::chrono::system_clock::now() >= remote_deadline) {
+      if (proof != engine::CompletionProof::kCompleted) ok = false;
+      break;
+    }
+    auto& peer = GetOrConnectPeer(node_id, grants.front().peer_address);
+    if (!EnsurePeerServiceConnection(peer, /*force_refresh=*/false, std::nullopt, {},
+                                     remote_deadline)) {
+      if (proof != engine::CompletionProof::kCompleted) ok = false;
+      continue;
+    }
+    auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+    ::umbp::BatchReleaseLoadSourcesRequest request;
+    request.set_reader_session(record.reader.session);
+    request.set_reader_request(record.reader.request);
+    EngineOperationToWire(operation, request.mutable_operation());
+    if (record.prepare_operation.session_id == operation.session_id &&
+        record.prepare_operation.seq < operation.seq) {
+      EngineOperationToWire(record.prepare_operation, request.mutable_ack_watermark());
+    }
+    request.set_proof(static_cast<uint32_t>(proof));
+    for (const auto& grant : grants) {
+      auto* item = request.add_grants();
+      item->set_grant_id(grant.id);
+      item->set_backend_id(grant.backend_id);
+      item->set_engine(grant.engine);
+      item->set_key(grant.key);
+    }
+    ::umbp::BatchReleaseLoadSourcesResponse response;
+    grpc::Status status;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      if (std::chrono::system_clock::now() >= remote_deadline) break;
+      grpc::ClientContext context;
+      context.set_deadline(EngineRpcAttemptDeadline(remote_deadline));
+      response.Clear();
+      status = stub->BatchReleaseLoadSources(&context, request, &response);
+      if (status.ok()) break;
+    }
+    const bool released = status.ok() &&
+                          response.released_size() == static_cast<int>(grants.size()) &&
+                          std::all_of(response.released().begin(), response.released().end(),
+                                      [](bool value) { return value; });
+    // A completed target is valid even if source cleanup becomes unreachable;
+    // the source lease will expire into quarantine. Failed/Unknown loads still
+    // require the cleanup result as part of their terminal proof.
+    ok = ok && (released || proof == engine::CompletionProof::kCompleted);
+  }
+  return ok;
+}
+
+std::vector<engine::SharedDramRegion> PoolClient::ExportSharedDram(engine::PoolEpoch epoch) {
+  std::vector<engine::SharedDramRegion> out;
+  for (auto* backend : registry_.All()) {
+    if (backend == nullptr || backend->Tier() != TierType::DRAM) continue;
+    auto* page = AsPageBackend(backend);
+    if (page == nullptr) continue;
+    auto regions = page->ExportSharedRegions(registry_.BackendId(backend), epoch);
+    out.insert(out.end(), std::make_move_iterator(regions.begin()),
+               std::make_move_iterator(regions.end()));
+  }
+  return out;
+}
 std::map<std::string, uint64_t> PoolClient::TierReadHits() const {
   return default_pool_ == nullptr ? std::map<std::string, uint64_t>{}
                                   : default_pool_->TierReadHits();
@@ -2723,6 +3564,18 @@ std::unique_ptr<PoolClient::RemotePutInFlight> PoolClient::SubmitRemoteBatchPut(
     }
     abort_now(std::move(all));
   };
+
+  std::unordered_set<uint32_t> allocated_backends;
+  for (const auto& entry : inflight->entries) allocated_backends.insert(entry.plan.backend_id);
+  for (uint32_t backend_id : allocated_backends) {
+    if (!EnsurePeerServiceConnection(peer, /*force_refresh=*/false, backend_id)) {
+      MORI_UMBP_WARN(
+          "[PoolClient] SubmitRemoteBatchPut: peer info does not advertise allocated backend {}",
+          backend_id);
+      abort_everything();
+      return nullptr;
+    }
+  }
 
   std::vector<TransferItem> transfer_items;
   if (!BuildRemotePutTransfers(inflight->entries, first.route.node_id, &transfer_items)) {
@@ -4745,6 +5598,20 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
   // omit_descs and sent none).
   if (!decoded.descs.empty()) peer_directory_->CacheRemoteBuffers(peer.node_id, decoded.descs);
 
+  std::unordered_set<uint32_t> resolved_backends;
+  for (const auto& key : decoded.keys) {
+    if (key.found) resolved_backends.insert(key.backend_id);
+  }
+  for (uint32_t backend_id : resolved_backends) {
+    if (!EnsurePeerServiceConnection(peer, /*force_refresh=*/false, backend_id)) {
+      MORI_UMBP_WARN(
+          "[PoolClient] BatchGet: peer info does not advertise resolved backend {} on {}",
+          backend_id, peer.node_id);
+      for (const auto& item : items) (*results)[item.index] = false;
+      return false;
+    }
+  }
+
   entries->reserve(items.size());
   for (size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
@@ -5108,7 +5975,10 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(const std::string& node
 //  Peer connection setup
 // ---------------------------------------------------------------------------
 
-bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
+bool PoolClient::EnsurePeerServiceConnection(
+    PeerConnection& peer, bool force_refresh, std::optional<uint32_t> required_backend,
+    std::string_view required_executor,
+    std::optional<std::chrono::system_clock::time_point> deadline) {
   std::lock_guard<std::mutex> lock(peer.conn_mutex);
   if (peer.peer_address.empty()) {
     return false;
@@ -5118,10 +5988,28 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
   // different owners: the stub is a control-plane connection kept here, while
   // the peer's engine desc and buffer descriptors are transfer-layer facts and
   // go straight into the engine's remote cache.
+  auto requirements_met = [&] {
+    if (required_backend.has_value() && peer.advertised_backends.count(*required_backend) == 0) {
+      return false;
+    }
+    if (!required_executor.empty() &&
+        std::none_of(peer.executors.begin(), peer.executors.end(), [&](const auto& executor) {
+          return executor.executor_id == required_executor;
+        })) {
+      return false;
+    }
+    return true;
+  };
   auto hydrate_from_peer = [&](::umbp::UMBPPeer::Stub* stub) -> bool {
+    ++peer_info_refreshes_;
     ::umbp::GetPeerInfoRequest req;
     ::umbp::GetPeerInfoResponse resp;
     grpc::ClientContext ctx;
+    const auto attempt_deadline = deadline.has_value()
+                                      ? EngineRpcAttemptDeadline(*deadline)
+                                      : std::chrono::system_clock::now() + kEngineControlRpcTimeout;
+    if (attempt_deadline <= std::chrono::system_clock::now()) return false;
+    ctx.set_deadline(attempt_deadline);
     auto status = stub->GetPeerInfo(&ctx, req, &resp);
     if (!status.ok()) {
       MORI_UMBP_ERROR("[PoolClient] GetPeerInfo failed for '{}': {}", peer.peer_address,
@@ -5150,20 +6038,51 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
       }
       peer_directory_->CacheRemoteBuffers(peer.node_id, descs);
     }
-    return true;
+    peer.protocol_capabilities = resp.protocol_capabilities();
+    peer.engine_desc.assign(resp.engine_desc().begin(), resp.engine_desc().end());
+    peer.advertised_backends.clear();
+    for (const auto& buffer : resp.buffer_descs()) {
+      peer.advertised_backends.insert(buffer.backend_id());
+    }
+    for (const auto& geometry : resp.backend_geometries()) {
+      peer.advertised_backends.insert(geometry.backend_id());
+    }
+    peer.executors.clear();
+    peer.executors.reserve(resp.executor_infos_size());
+    for (const auto& executor : resp.executor_infos()) {
+      PeerConnection::ExecutorBootstrap decoded;
+      decoded.executor_id = executor.executor_id();
+      decoded.backend_id = executor.backend_id();
+      peer.advertised_backends.insert(decoded.backend_id);
+      decoded.engine_desc.assign(executor.engine_desc().begin(), executor.engine_desc().end());
+      for (const auto& buffer : executor.buffers()) {
+        decoded.region_descs[buffer.region_id()] =
+            std::vector<uint8_t>(buffer.desc().begin(), buffer.desc().end());
+      }
+      for (const auto& geometry : resp.backend_geometries()) {
+        if (geometry.backend_id() != decoded.backend_id) continue;
+        decoded.page_size = geometry.page_size();
+        decoded.layout_id = geometry.layout_id();
+        break;
+      }
+      peer.executors.push_back(std::move(decoded));
+    }
+    peer.peer_info_loaded = true;
+    peer.last_peer_info_refresh = std::chrono::steady_clock::now();
+    return requirements_met();
   };
 
-  const bool engine_known =
-      peer_directory_ == nullptr || peer_directory_->HasRemoteEngine(peer.node_id);
-
   if (peer.peer_stub) {
-    if (!engine_known) {
-      auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
-      if (!hydrate_from_peer(stub)) {
-        peer.peer_stub.reset();
-        if (peer_directory_ != nullptr) peer_directory_->ForgetRemote(peer.node_id);
-        return false;
+    if (peer.peer_info_loaded && !force_refresh && requirements_met()) {
+      if (peer.protocol_capabilities != 0 ||
+          std::chrono::steady_clock::now() - peer.last_peer_info_refresh <
+              std::chrono::seconds(1)) {
+        return true;
       }
+    }
+    auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+    if (!hydrate_from_peer(stub)) {
+      return false;
     }
     return true;
   }
@@ -5179,6 +6098,20 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
       stub.release(), +[](void* p) { delete static_cast<::umbp::UMBPPeer::Stub*>(p); });
   return true;
 }
+
+#ifdef MORI_UMBP_TESTING
+bool PoolClient::RefreshPeerInfoForTest(const std::string& node_id,
+                                        const std::string& peer_address) {
+  auto& peer = GetOrConnectPeer(node_id, peer_address);
+  return EnsurePeerServiceConnection(peer, /*force_refresh=*/true);
+}
+
+bool PoolClient::EnsurePeerBackendForTest(const std::string& node_id,
+                                          const std::string& peer_address, uint32_t backend_id) {
+  auto& peer = GetOrConnectPeer(node_id, peer_address);
+  return EnsurePeerServiceConnection(peer, /*force_refresh=*/false, backend_id);
+}
+#endif
 
 void PoolClient::PublishComponentMetrics() {
   if (metric_sink_ == nullptr) return;
@@ -5225,6 +6158,10 @@ void PoolClient::PublishComponentMetrics() {
     };
 
     const TierTransitionMetrics tiers = default_pool_->TransitionMetrics();
+    sample(MORI_UMBP_METRIC_CLIENT_DRAM_HANDOFF_REFRESHES,
+           MORI_UMBP_METRIC_CLIENT_DRAM_HANDOFF_REFRESHES_HELP, {}, tiers.dram_handoff_refreshes);
+    sample(MORI_UMBP_METRIC_CLIENT_ENGINE_DRAM_READ_GRANTS,
+           MORI_UMBP_METRIC_CLIENT_ENGINE_DRAM_READ_GRANTS_HELP, {}, tiers.engine_dram_read_grants);
     sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
            {{"outcome", "attempted"}}, tiers.attempted);
     sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,

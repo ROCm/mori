@@ -2,6 +2,7 @@ syntax = "proto3";
 package umbp;
 
 import "umbp.proto";
+import "umbp_engine.proto";
 
 service UMBPPeer {
   rpc GetPeerInfo(GetPeerInfoRequest) returns (GetPeerInfoResponse);
@@ -24,6 +25,82 @@ service UMBPPeer {
   rpc BatchCommitSlots  (BatchCommitSlotsRequest)   returns (BatchCommitSlotsResponse);
   rpc BatchAbortSlots   (BatchAbortSlotsRequest)    returns (BatchAbortSlotsResponse);
   rpc BatchResolveKeys  (BatchResolveKeysRequest)   returns (BatchResolveKeysResponse);
+  rpc BatchAcquireEngine(BatchAcquireEngineRequest) returns (BatchAcquireEngineResponse);
+  rpc BatchReleaseEngine(BatchReleaseEngineRequest) returns (BatchReleaseEngineResponse);
+  rpc BatchAcquireLoadSources(BatchAcquireLoadSourcesRequest)
+      returns (BatchAcquireLoadSourcesResponse);
+  rpc BatchReleaseLoadSources(BatchReleaseLoadSourcesRequest)
+      returns (BatchReleaseLoadSourcesResponse);
+}
+
+message AcquireLoadSourceEntry {
+  string key = 1;
+  uint32 preferred_backend_id = 2;
+  TierType preferred_tier = 3;
+}
+message BatchAcquireLoadSourcesRequest {
+  bytes reader_session = 1;
+  string reader_request = 2;
+  umbp.engine.OperationId operation = 3;
+  repeated AcquireLoadSourceEntry entries = 4;
+  uint64 lease_ms = 5;
+}
+message LoadSourceGrant {
+  bool granted = 1;
+  uint64 grant_id = 2;
+  uint32 backend_id = 3;
+  bool engine = 4;
+  umbp.engine.AllocationHandle source = 5;
+  umbp.engine.ObjectView view = 7;
+  string executor_id = 8;
+}
+message BatchAcquireLoadSourcesResponse { repeated LoadSourceGrant grants = 1; }
+message ReleaseLoadSourceEntry {
+  uint64 grant_id = 1;
+  uint32 backend_id = 2;
+  bool engine = 3;
+  string key = 4;
+}
+message BatchReleaseLoadSourcesRequest {
+  bytes reader_session = 1;
+  string reader_request = 2;
+  umbp.engine.OperationId operation = 3;
+  repeated ReleaseLoadSourceEntry grants = 4;
+  uint32 proof = 5;
+  umbp.engine.OperationId ack_watermark = 6;
+}
+message BatchReleaseLoadSourcesResponse { repeated bool released = 1; }
+
+message BatchAcquireEngineRequest {
+  string reader_session = 1;
+  string reader_request = 2;
+  umbp.engine.OperationId operation = 3;
+  repeated string keys = 4;
+  uint64 lease_ms = 5;
+  umbp.engine.OperationId ack_watermark = 6;
+}
+message EngineGrant {
+  bool granted = 1;
+  uint64 grant_id = 2;
+  uint32 backend_id = 3;
+  umbp.engine.AllocationHandle source = 4;
+  umbp.engine.ObjectView view = 5;
+}
+message BatchAcquireEngineResponse { repeated EngineGrant grants = 1; }
+
+message BatchReleaseEngineRequest {
+  string reader_session = 1;
+  string reader_request = 2;
+  umbp.engine.OperationId operation = 3;
+  uint32 backend_id = 4;
+  repeated uint64 grant_ids = 5;
+  uint32 proof = 6;
+  umbp.engine.OperationId ack_watermark = 7;
+}
+message BatchReleaseEngineResponse {
+  repeated bool known = 1;
+  repeated bool released = 2;
+  repeated bool quarantined = 3;
 }
 
 // ============================================================
@@ -31,6 +108,22 @@ service UMBPPeer {
 // ============================================================
 
 message GetPeerInfoRequest {}
+message ExecutorBufferInfo {
+  string region_id = 1;
+  bytes desc = 2; // msgpack-packed mori::io::MemoryDesc
+}
+message ExecutorInfo {
+  string executor_id = 1;
+  bytes engine_desc = 2;
+  uint32 backend_id = 3;
+  repeated ExecutorBufferInfo buffers = 4;
+}
+message BackendGeometry {
+  uint32 backend_id = 1;
+  uint64 page_size = 2;
+  string layout_id = 3;
+  string executor_id = 4;
+}
 message GetPeerInfoResponse {
   bytes  engine_desc           = 1;
   // SSD capacity is reported via heartbeat tier_capacities, not here.
@@ -54,6 +147,10 @@ message GetPeerInfoResponse {
   // Uniform across backends — BackendRegistry refuses to register a backend
   // that disagrees, because every wire carrying pages carries ONE page_size.
   uint64 page_size                       = 11;
+  repeated ExecutorInfo executor_infos  = 12;
+  repeated BackendGeometry backend_geometries = 13;
+  // bit 0: ObjectView/span, bit 1: grants, bit 2: ordered executor completion.
+  uint64 protocol_capabilities = 14;
 }
 
 // ============================================================

@@ -135,6 +135,14 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
   const uint64_t moves_failed = Delta(now.transitions.failed, before.transitions.failed);
   const uint64_t moves_retried = Delta(now.transitions.retried, before.transitions.retried);
   const uint64_t moves_dropped = Delta(now.transitions.dropped, before.transitions.dropped);
+  const uint64_t f3_ok = Delta(now.transitions.f3_succeeded, before.transitions.f3_succeeded);
+  const uint64_t f3_failed = Delta(now.transitions.f3_failed, before.transitions.f3_failed);
+  const uint64_t f3_retried = Delta(now.transitions.f3_retried, before.transitions.f3_retried);
+  const uint64_t f3_rejected = Delta(now.transitions.f3_rejected, before.transitions.f3_rejected);
+  const uint64_t f3_missing =
+      Delta(now.transitions.f3_source_missing, before.transitions.f3_source_missing);
+  const uint64_t f3_quarantined =
+      Delta(now.transitions.f3_quarantined, before.transitions.f3_quarantined);
   const auto per_medium = [](const std::map<std::string, uint64_t>& now_bytes,
                              const std::map<std::string, uint64_t>& before_bytes) {
     std::map<std::string, uint64_t> out;
@@ -172,7 +180,10 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
   const bool anything = Moved(total) || promoted != 0 || demoted != 0 || moves_failed != 0 ||
                         moves_retried != 0 || moves_dropped != 0 || rc_admitted != 0 ||
                         rc_dropped != 0 || rc_prefetched != 0 || rc_fragmented != 0 ||
-                        rc_already != 0;
+                        rc_already != 0 || f3_ok != 0 || f3_failed != 0 || f3_retried != 0 ||
+                        f3_rejected != 0 || f3_missing != 0 || f3_quarantined != 0 ||
+                        now.transitions.engine_retiring_pages != 0 ||
+                        now.transitions.f3_inflight != 0 || now.transitions.f3_pending_keys != 0;
 
   std::vector<std::string> lines;
 
@@ -230,6 +241,25 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
     head += moves.data();
   }
   lines.push_back(std::move(head));
+
+  if (f3_ok != 0 || f3_failed != 0 || f3_retried != 0 || f3_rejected != 0 || f3_missing != 0 ||
+      f3_quarantined != 0 || now.transitions.engine_retiring_pages != 0 ||
+      now.transitions.f3_inflight != 0 || now.transitions.f3_pending_keys != 0) {
+    std::array<char, 320> f3{};
+    std::snprintf(
+        f3.data(), f3.size(),
+        "[UMBP]   F3: %llu succeeded, %llu failed attempts, %llu retried, %llu rejected, "
+        "%llu source-missing, %llu quarantined | now %llu retiring pages, %llu "
+        "in-flight, %llu pending keys",
+        static_cast<unsigned long long>(f3_ok), static_cast<unsigned long long>(f3_failed),
+        static_cast<unsigned long long>(f3_retried), static_cast<unsigned long long>(f3_rejected),
+        static_cast<unsigned long long>(f3_missing),
+        static_cast<unsigned long long>(f3_quarantined),
+        static_cast<unsigned long long>(now.transitions.engine_retiring_pages),
+        static_cast<unsigned long long>(now.transitions.f3_inflight),
+        static_cast<unsigned long long>(now.transitions.f3_pending_keys));
+    lines.emplace_back(f3.data());
+  }
 
   // ---- the local-tier admission path -------------------------------------
   // Only when it did something, because a deployment that never re-caches

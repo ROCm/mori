@@ -58,6 +58,8 @@ constexpr size_t kDefaultPageSize = 4096;
 struct ShmAllocRecord {
   int fd = -1;
   size_t size = 0;
+  HostBufferBacking actual_backing = HostBufferBacking::kAnonymous;
+  size_t alignment = 0;
   size_t active_registrations = 0;
   bool pending_free = false;
 };
@@ -385,6 +387,8 @@ HostBufferHandle AllocAnonymousShm(size_t size, const HostBufferOptions& opts) {
     ShmAllocRecord record;
     record.fd = fd;
     record.size = *mapped_size;
+    record.actual_backing = handle.actual_backing;
+    record.alignment = handle.actual_alignment;
     record.active_registrations = 0;
     ShmRegistry()[ptr] = record;
   }
@@ -468,6 +472,8 @@ HostBufferHandle AllocAnonymousShmHugetlb(size_t size, const HostBufferOptions& 
     ShmAllocRecord record;
     record.fd = fd;
     record.size = *mapped_size;
+    record.actual_backing = handle.actual_backing;
+    record.alignment = handle.actual_alignment;
     record.active_registrations = 0;
     ShmRegistry()[ptr] = record;
   }
@@ -611,6 +617,8 @@ std::optional<HostMemAllocator::ShmAllocation> HostMemAllocator::LookupShmAlloca
   allocation.base = it->first;
   allocation.mapped_size = it->second.size;
   allocation.fd = it->second.fd;
+  allocation.actual_backing = it->second.actual_backing;
+  allocation.alignment = it->second.alignment;
   return allocation;
 }
 
@@ -637,6 +645,8 @@ std::optional<HostMemAllocator::ShmAllocation> HostMemAllocator::AcquireShmAlloc
   allocation.base = it->first;
   allocation.mapped_size = it->second.size;
   allocation.fd = it->second.fd;
+  allocation.actual_backing = it->second.actual_backing;
+  allocation.alignment = it->second.alignment;
   return allocation;
 }
 

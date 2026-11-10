@@ -1,0 +1,356 @@
+syntax = "proto3";
+package umbp.engine;
+
+// Versioned payload carried over the standalone engine UDS.  The socket frame
+// header carries payload length and SCM_RIGHTS count; fd_index fields below
+// index that attachment vector and never contain a sender-process fd number.
+
+message PoolEpoch {
+  bytes boot_id = 1;
+  uint64 reset_seq = 2;
+}
+
+message OperationId {
+  bytes session_id = 1;
+  uint64 seq = 2;
+}
+
+message MemoryRef {
+  uint64 address = 1;
+  uint64 size = 2;
+  uint32 location = 3;
+  int32 device = 4;
+  bytes memory_desc = 5;
+  string executor_id = 6;
+  string region_id = 7;
+}
+
+message PageRegion {
+  string region_id = 1;
+  MemoryRef buffer = 2;
+  uint64 row_bytes = 3;
+  uint64 rows_per_page = 4;
+  uint64 logical_offset = 5;
+  int32 layer_id = 6;
+  string component = 7;
+}
+
+message PageGeometry {
+  uint32 page_tokens = 1;
+  uint32 num_pages = 2;
+  uint64 object_bytes = 3;
+  string layout_id = 4;
+  repeated PageRegion regions = 5;
+}
+
+message RegionSpan {
+  MemoryRef buffer = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+  uint64 logical_offset = 4;
+  int32 layer_id = 5;
+  string component = 6;
+}
+message ObjectView {
+  uint64 size = 1;
+  string layout_id = 2;
+  repeated RegionSpan spans = 3;
+}
+
+message AllocationHandle {
+  string pool_id = 1;
+  PoolEpoch epoch = 2;
+  uint32 backend_id = 3;
+  uint32 page_id = 4;
+  uint64 generation = 5;
+}
+
+message SharedDramRegion {
+  string region_id = 1;
+  PoolEpoch epoch = 2;
+  uint32 backend_id = 3;
+  uint32 buffer_index = 4;
+  uint32 fd_index = 5;
+  uint64 fd_offset = 6;
+  uint64 length = 7;
+  uint64 mapped_length = 8;
+  int32 numa_node = 9;
+  uint64 alignment = 10;
+  uint32 actual_backing = 11;
+  MemoryRef memory = 12;
+}
+
+message RegisterEngine {
+  uint32 rank_id = 1;
+  string pool_id = 2;
+  string executor_id = 3;
+  PoolEpoch epoch = 4;
+  PageGeometry geometry = 5;
+  uint32 heartbeat_ms = 6;
+  uint32 heartbeat_timeout_ms = 7;
+  bytes engine_desc = 8;
+  repeated RegisteredVmmRegion vmm_regions = 9;
+}
+message RegisteredVmmRegion {
+  string region_id = 1;
+  uint32 fd_index = 2;
+  uint64 mapped_size = 3;
+  int32 owner_device = 4;
+  uint32 handle_kind = 5;
+  bytes fabric = 6;
+  uint64 allocation_offset = 7;
+  uint64 region_size = 8;
+  uint64 mapping_id = 9;
+}
+
+message RegisterReply {
+  bool ok = 1;
+  string error = 2;
+  uint32 backend_id = 3;
+  PoolEpoch epoch = 4;
+  repeated SharedDramRegion dram_regions = 5;
+}
+
+message DelegateRequest { uint32 count = 1; }
+message DelegateReply {
+  bool ok = 1;
+  repeated AllocationHandle handles = 2;
+}
+
+message ResidentRecord {
+  string key = 1;
+  string parent_key = 2;
+  AllocationHandle handle = 3;
+}
+message PublishBatch { repeated ResidentRecord records = 1; }
+message PublishReply {
+  bool ok = 1;
+  repeated bool accepted = 2;
+}
+
+message RetireBatch { repeated AllocationHandle handles = 1; }
+message RetireReply {
+  uint32 state = 1;
+  repeated AllocationHandle handles = 2;
+  OperationId retire_op = 3;
+}
+
+message PollRetires {}
+message ReleasedBatch {
+  repeated RetireReply tickets = 1;
+  // Node-originated quarantine notifications are independent of retire
+  // tickets (for example grant expiry on a still-published page).
+  repeated AllocationHandle quarantined = 2;
+}
+message AcknowledgeReleased { repeated OperationId retire_ops = 1; }
+message AcknowledgeReply { repeated bool accepted = 1; }
+
+message TransferPlan {
+  MemoryRef source = 1;
+  MemoryRef target = 2;
+  repeated uint64 source_offsets = 3;
+  repeated uint64 target_offsets = 4;
+  repeated uint64 sizes = 5;
+  repeated uint64 tags = 6;
+}
+message PollWork {}
+message ExecutePlans {
+  uint64 transfer_id = 1;
+  repeated TransferPlan plans = 2;
+}
+message TransferFailure {
+  repeated uint64 tags = 1;
+  uint32 code = 2;
+  string message = 3;
+  bool quiesced = 4;
+  bool submitted = 5;
+}
+message CompleteTransfer {
+  uint64 transfer_id = 1;
+  bool quiesced = 2;
+  repeated TransferFailure failures = 3;
+  uint32 outcome = 4; // 0 completed, 1 never-submitted, 2 unknown
+}
+message ResetRequest {}
+message ResetReply {
+  bool ready = 1;
+  OperationId lease = 2;
+  PoolEpoch old_epoch = 3;
+  PoolEpoch new_epoch = 4;
+  repeated AllocationHandle approved = 5;
+}
+message ResetFinish {
+  OperationId lease = 1;
+  bool commit = 2;
+}
+message ResetFinished {
+  bool ok = 1;
+  PoolEpoch epoch = 2;
+  repeated AllocationHandle approved = 3;
+}
+message IOHold { repeated AllocationHandle handles = 1; }
+message IOHeld { bool ok = 1; }
+message IOComplete {
+  OperationId hold = 1;
+  uint32 proof = 2;
+}
+message QuarantineBatch { repeated AllocationHandle handles = 1; }
+
+enum ReadSourceKind {
+  READ_SOURCE_MISSING = 0;
+  READ_SOURCE_LOCAL_HBM = 1;
+  READ_SOURCE_LOCAL_DRAM = 2;
+  READ_SOURCE_REMOTE_HBM = 3;
+  READ_SOURCE_REMOTE_DRAM = 4;
+}
+message LookupBatch {
+  repeated string keys = 1;
+  string storage_namespace = 2;
+  string layout_id = 3;
+  uint32 requester_backend_id = 4;
+}
+message ReadSourceHint {
+  string key = 1;
+  ReadSourceKind kind = 2;
+  uint32 backend_id = 3;
+  string node_id = 4;
+  string peer_address = 5;
+  string executor_id = 6;
+  string layout_id = 7;
+  AllocationHandle handle = 8;
+}
+message ReadPlan {
+  bool ok = 1;
+  string error = 2;
+  uint64 plan_id = 3;
+  PoolEpoch epoch = 4;
+  string storage_namespace = 5;
+  string layout_id = 6;
+  repeated string keys = 7;
+  repeated ReadSourceHint sources = 8;
+  uint32 valid_prefix = 9;
+  repeated uint32 legal_boundaries = 10;
+  uint32 requester_backend_id = 11;
+}
+message PrepareLoad {
+  uint64 plan_id = 1;
+  string request_id = 2;
+  repeated AllocationHandle targets = 3;
+  uint32 n_pages = 4;
+}
+message LoadGrantRef {
+  uint64 grant_id = 1;
+  uint32 backend_id = 2;
+  bool remote = 3;
+  bool engine = 4;
+  string node_id = 5;
+  string peer_address = 6;
+  string key = 7;
+}
+message ExecutorBootstrap {
+  string executor_id = 1;
+  bytes engine_desc = 2;
+}
+message PeerVmmRegion {
+  string executor_id = 1;
+  string region_id = 2;
+  uint32 fd_index = 3;
+  uint64 mapped_size = 4;
+  int32 owner_device = 5;
+  uint32 handle_kind = 6;
+  bytes fabric = 7;
+  uint64 allocation_offset = 8;
+  uint64 region_size = 9;
+  uint64 mapping_id = 10;
+}
+message LayerTransferPlan {
+  int32 layer_id = 1;
+  string component = 2;
+  uint64 tag = 3;
+  repeated TransferPlan plans = 4;
+}
+message PreparedLoad {
+  bool ok = 1;
+  string error = 2;
+  uint64 prepared_id = 3;
+  string request_id = 4;
+  repeated AllocationHandle targets = 5;
+  repeated LoadGrantRef grants = 6;
+  repeated ExecutorBootstrap bootstraps = 7;
+  repeated LayerTransferPlan layers = 8;
+  repeated PeerVmmRegion peer_regions = 9;
+  bool peer_regions_more = 10;
+}
+message FetchPeerRegions { uint64 prepared_id = 1; }
+message PeerRegionBatch {
+  bool ok = 1;
+  string error = 2;
+  uint64 prepared_id = 3;
+  bool more = 4;
+  repeated PeerVmmRegion peer_regions = 5;
+}
+message CompleteLoad {
+  uint64 prepared_id = 1;
+  uint32 outcome = 2;
+}
+message CancelLoad { uint64 prepared_id = 1; }
+message CancelReply {
+  uint32 result = 1;
+  string error = 2;
+}
+
+message Heartbeat {
+  uint64 monotonic_seq = 1;
+  uint64 last_received_seq = 2;
+  uint64 last_applied_seq = 3;
+}
+
+message Status {
+  bool ok = 1;
+  string error = 2;
+}
+
+message EngineFrame {
+  uint32 version = 1;
+  OperationId op = 2;
+  PoolEpoch epoch = 3;
+  bool server_push = 4;
+  reserved 26, 27;
+  oneof body {
+    RegisterEngine register_engine = 10;
+    RegisterReply registered = 11;
+    DelegateRequest delegate = 12;
+    DelegateReply delegated = 13;
+    PublishBatch publish = 14;
+    PublishReply published = 15;
+    RetireBatch retire = 16;
+    RetireReply retired = 17;
+    PollRetires poll_retires = 18;
+    ReleasedBatch released = 19;
+    Heartbeat heartbeat = 20;
+    Status status = 21;
+    AcknowledgeReleased acknowledge_released = 22;
+    PollWork poll_work = 23;
+    ExecutePlans execute_plans = 24;
+    CompleteTransfer complete_transfer = 25;
+    ResetRequest reset = 28;
+    ResetReply reset_reply = 29;
+    LookupBatch lookup = 30;
+    ReadPlan read_plan = 31;
+    PrepareLoad prepare_load = 32;
+    PreparedLoad prepared = 33;
+    CompleteLoad complete_load = 34;
+    Status load_completed = 35;
+    CancelLoad cancel_load = 36;
+    CancelReply cancelled = 37;
+    FetchPeerRegions fetch_peer_regions = 38;
+    PeerRegionBatch peer_region_batch = 39;
+    ResetFinish reset_finish = 40;
+    ResetFinished reset_finished = 41;
+    IOHold io_hold = 42;
+    IOHeld io_held = 43;
+    IOComplete io_complete = 44;
+    AcknowledgeReply acknowledge_reply = 45;
+    QuarantineBatch quarantine = 46;
+  }
+}

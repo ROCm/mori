@@ -659,6 +659,26 @@ TEST(CompositeTransferEngine, RejectsAPairNoEngineClaims) {
   EXPECT_EQ(std::vector<size_t>({42}), planned.rejected_tags);
 }
 
+TEST(CompositeTransferEngine, RejectsUnknownLocationWithDetailedCanHandleFailure) {
+  CompositeTransferEngine composite;
+  composite.AddEngine(std::make_unique<LocalCopyEngine>());
+  composite.AddEngine(std::make_unique<HbmCopyEngine>());
+  std::array<uint8_t, 32> source{};
+  std::array<uint8_t, 32> target{};
+  TransferRef unknown = TransferRef::HostBytes(source.data(), source.size(),
+                                               mori::io::MemoryLocationType::Unknown, 0);
+  TransferRef cpu =
+      TransferRef::HostBytes(target.data(), target.size(), mori::io::MemoryLocationType::CPU, -1);
+  std::vector<size_t> failed;
+  std::vector<TransferFailure> details;
+  EXPECT_FALSE(composite.Transfer({MakeItem(unknown, 0, cpu, 0, 32, 9)}, &failed, nullptr, nullptr,
+                                  nullptr, &details));
+  ASSERT_EQ(details.size(), 1u);
+  EXPECT_NE(details.front().message.find("reason=CanHandle=false"), std::string::npos);
+  EXPECT_NE(details.front().message.find("loc=0 device=0"), std::string::npos);
+  EXPECT_NE(details.front().message.find("loc=1 device=-1"), std::string::npos);
+}
+
 TEST(CompositeTransferEngine, FailsTagsWhenASubEngineSubmitsNothing) {
   // A sub-engine that posts nothing must not silently drop keys: the caller
   // would wait for a completion that never comes and report success.
@@ -671,8 +691,15 @@ TEST(CompositeTransferEngine, FailsTagsWhenASubEngineSubmitsNothing) {
   TransferRef remote = RemoteRef("peer", /*id=*/9, 512);
 
   std::vector<size_t> failed;
-  EXPECT_FALSE(composite->Transfer({MakeItem(s, 0, remote, 0, 512, 5)}, &failed));
+  std::vector<TransferFailure> details;
+  EXPECT_FALSE(composite->Transfer({MakeItem(s, 0, remote, 0, 512, 5)}, &failed, nullptr, nullptr,
+                                   nullptr, &details));
   EXPECT_EQ(std::vector<size_t>({5}), failed);
+  ASSERT_EQ(details.size(), 1u);
+  EXPECT_EQ(details[0].tags, std::vector<size_t>({5}));
+  EXPECT_EQ(details[0].message, "SpyEngine submitted nothing");
+  EXPECT_FALSE(details[0].submitted);
+  EXPECT_TRUE(details[0].quiesced);
 }
 
 // ---------------------------------------------------------------------------

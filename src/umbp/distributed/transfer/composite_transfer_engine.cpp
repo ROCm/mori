@@ -307,6 +307,7 @@ std::unique_ptr<TransferHandle> CompositeTransferEngine::Submit(std::vector<Tran
     TransferFailure f;
     f.message = std::string(engine->Name()) + " submitted nothing";
     f.tags = std::move(tags);
+    f.submitted = false;
     handle->AddFailure(std::move(f));
   }
 

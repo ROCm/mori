@@ -262,6 +262,11 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("master_config", &UMBPDistributedConfig::master_config)
       .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
+      .def_readwrite("engine_hbm_ranks", &UMBPDistributedConfig::engine_hbm_ranks)
+      .def_readwrite("engine_f3_max_inflight", &UMBPDistributedConfig::engine_f3_max_inflight)
+      .def_readwrite("engine_f3_retry_timeout_ms",
+                     &UMBPDistributedConfig::engine_f3_retry_timeout_ms)
+      .def_readwrite("engine_f3_max_attempts", &UMBPDistributedConfig::engine_f3_max_attempts)
       .def_readwrite("ranged_scratch_size", &UMBPDistributedConfig::ranged_scratch_size)
       .def_readwrite("ranged_scratch_use_hugepages",
                      &UMBPDistributedConfig::ranged_scratch_use_hugepages)

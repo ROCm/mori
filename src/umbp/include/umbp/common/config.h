@@ -330,6 +330,14 @@ struct UMBPDistributedConfig {
   UMBPMasterClientConfig master_config;
   UMBPIoEngineConfig io_engine;
 
+  // Unified engine HBM node mode. The first implementation accepts only 0 or
+  // 8 so backend names/ids can be compiled into the TierGraph before ranks
+  // register their geometry.
+  uint32_t engine_hbm_ranks = 0;
+  size_t engine_f3_max_inflight = 8;
+  uint32_t engine_f3_retry_timeout_ms = 30000;
+  uint32_t engine_f3_max_attempts = 8;
+
   size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
 
   // Registered host arena used by ranged multi-buffer I/O. Remote objects are
@@ -639,6 +647,16 @@ struct UMBPConfig {
     }
     if (distributed.has_value()) {
       const auto& d = distributed.value();
+      if (d.engine_hbm_ranks != 0 && d.engine_hbm_ranks != 8) {
+        if (error_message) *error_message = "distributed.engine_hbm_ranks must be 0 or 8";
+        return false;
+      }
+      if (d.engine_hbm_ranks != 0 &&
+          (d.engine_f3_max_inflight == 0 || d.engine_f3_retry_timeout_ms == 0 ||
+           d.engine_f3_max_attempts == 0)) {
+        if (error_message) *error_message = "engine F3 limits must be positive";
+        return false;
+      }
       // master_address MAY be empty.  That is the single-node deployment: the
       // client keeps its whole data plane -- backends, transfer engine, peer
       // service -- and simply never consults a master.  Every read already

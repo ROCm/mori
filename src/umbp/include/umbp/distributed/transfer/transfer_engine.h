@@ -98,6 +98,13 @@ struct TransferRef {
   // (local), or they were hydrated from a peer's published descriptor (remote).
   mori::io::MemoryDesc mem{};
 
+  // Framework-owned memory is addressed by the rank executor that exported
+  // it. The node service must never dereference executor_address; it is an
+  // opaque address in another process and is routed through EngineTransferEngine.
+  std::string executor_id;
+  std::string region_id;
+  uint64_t executor_address = 0;
+
   // File view (kind == File).  A byte range [file_offset, file_offset + size) of
   // an O_DIRECT file.  gds_handle is a file engine's opaque registration of the
   // fd (a hipFileHandle_t), left null until RegisterFile fills it; `size` above
@@ -109,7 +116,10 @@ struct TransferRef {
   bool HasHostPtr() const { return host_ptr != nullptr && size > 0; }
   bool HasMemoryDesc() const { return mem.size > 0; }
   bool IsFile() const { return kind == Kind::File && file_fd >= 0; }
-  bool Valid() const { return HasHostPtr() || HasMemoryDesc() || IsFile(); }
+  bool HasEngineEndpoint() const {
+    return !executor_id.empty() && !region_id.empty() && executor_address != 0 && size > 0;
+  }
+  bool Valid() const { return HasHostPtr() || HasMemoryDesc() || HasEngineEndpoint() || IsFile(); }
 
   // Unregistered, directly-addressable bytes: a caller's Put src / Get dst that
   // was never passed to RegisterMemory.
@@ -325,6 +335,7 @@ struct TransferPlan {
 struct TransferPlanSet {
   std::vector<TransferPlan> plans;
   std::vector<size_t> rejected_tags;
+  std::vector<std::pair<size_t, std::string>> rejected_details;
 };
 
 // Plans a batch one item at a time; Finish() hands the plans over once.
@@ -350,6 +361,10 @@ struct TransferFailure {
   uint32_t code = 0;
   std::string message;
   std::string endpoint;  // remote engine key, for diagnosis
+  // False means a posted operation may still touch its buffers. The caller
+  // must quarantine native resources and both endpoints instead of aborting.
+  bool quiesced = true;
+  bool submitted = true;
 };
 
 // Posted, not-yet-settled work.  OWNS everything Submit referenced — mori-io's
@@ -425,11 +440,13 @@ class TransferEngine : public MemoryRegistrar, public MetricSource {
   // Plan + Submit + Wait, for callers with nothing to overlap.  Returns false
   // and fills `failed_tags` if anything was rejected or failed.
   bool Transfer(const std::vector<TransferItem>& items, std::vector<size_t>* failed_tags,
-                const StepTiming* timing = nullptr);
+                const StepTiming* timing = nullptr, bool* quiesced = nullptr,
+                bool* submitted = nullptr, std::vector<TransferFailure>* failure_details = nullptr);
 
   // Submit and wait for work that has already been planned.
   bool Transfer(TransferPlanSet planned, std::vector<size_t>* failed_tags,
-                const StepTiming* timing = nullptr);
+                const StepTiming* timing = nullptr, bool* quiesced = nullptr,
+                bool* submitted = nullptr, std::vector<TransferFailure>* failure_details = nullptr);
 };
 
 }  // namespace mori::umbp

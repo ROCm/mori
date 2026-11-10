@@ -284,6 +284,7 @@ set(UMBP_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/distributed/proto")
 set(UMBP_PROTO_FILE "${UMBP_PROTO_DIR}/umbp.proto")
 set(UMBP_PEER_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_peer.proto")
 set(UMBP_STANDALONE_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_standalone.proto")
+set(UMBP_ENGINE_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_engine.proto")
 set(UMBP_WORKLOAD_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_workload.proto")
 set(UMBP_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto_gen")
 file(MAKE_DIRECTORY ${UMBP_PROTO_GEN_DIR})
@@ -303,6 +304,9 @@ set(UMBP_STANDALONE_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.pb.h")
 set(UMBP_STANDALONE_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.cc")
 set(UMBP_STANDALONE_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.h")
 
+set(UMBP_ENGINE_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_engine.pb.cc")
+set(UMBP_ENGINE_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_engine.pb.h")
+
 set(UMBP_WORKLOAD_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_workload.pb.cc")
 set(UMBP_WORKLOAD_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_workload.pb.h")
 
@@ -319,6 +323,16 @@ add_custom_command(
   VERBATIM)
 
 add_custom_command(
+  OUTPUT ${UMBP_ENGINE_PROTO_SRCS} ${UMBP_ENGINE_PROTO_HDRS}
+  COMMAND
+    ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
+    --cpp_out=${UMBP_PROTO_GEN_DIR} ${_PROTOC_PROTO3_OPTIONAL_ARGS}
+    ${UMBP_ENGINE_PROTO_FILE}
+  DEPENDS ${UMBP_ENGINE_PROTO_FILE}
+  COMMENT "Generating UMBP engine control protobuf sources"
+  VERBATIM)
+
+add_custom_command(
   OUTPUT ${UMBP_PEER_PROTO_SRCS} ${UMBP_PEER_PROTO_HDRS} ${UMBP_PEER_GRPC_SRCS}
          ${UMBP_PEER_GRPC_HDRS}
   COMMAND
@@ -331,6 +345,7 @@ add_custom_command(
   # peer headers include "umbp.pb.h", so the peer generation depends on the
   # master proto being present and current.
   DEPENDS ${UMBP_PEER_PROTO_FILE} ${UMBP_PROTO_FILE} ${UMBP_PROTO_HDRS}
+          ${UMBP_ENGINE_PROTO_FILE} ${UMBP_ENGINE_PROTO_HDRS}
   COMMENT "Generating UMBP Peer protobuf/gRPC C++ sources"
   VERBATIM)
 
@@ -385,6 +400,7 @@ add_library(
   ${UMBP_PEER_GRPC_SRCS}
   ${UMBP_STANDALONE_PROTO_SRCS}
   ${UMBP_STANDALONE_GRPC_SRCS}
+  ${UMBP_ENGINE_PROTO_SRCS}
   ${UMBP_WORKLOAD_PROTO_SRCS}
   ${UMBP_INDEXER_SRCS}
   # Trace capture is a client feature: PoolClient records live traffic when
@@ -429,6 +445,11 @@ add_library(
   distributed/pool/grant_table.cpp
   distributed/pool/peer_pool.cpp
   engine/kv_allocator.cpp
+  engine/engine_session.cpp
+  engine/engine_client.cpp
+  engine/engine_dispatch.cpp
+  engine/engine_executor.cpp
+  distributed/transfer/engine_transfer_engine.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
   distributed/pool_platform.cpp

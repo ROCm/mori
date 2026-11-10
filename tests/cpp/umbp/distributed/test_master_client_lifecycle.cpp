@@ -79,6 +79,13 @@ class BlackholeMasterService final : public ::umbp::UMBPMaster::Service {
     return grpc::Status::OK;
   }
 
+  grpc::Status BatchRouteGet(grpc::ServerContext* ctx, const ::umbp::BatchRouteGetRequest*,
+                             ::umbp::BatchRouteGetResponse*) override {
+    route_get_entered_.store(true);
+    BlockUntilReleasedOrCancelled(ctx);
+    return grpc::Status::OK;
+  }
+
   void ReleaseAll() {
     std::lock_guard<std::mutex> lock(mu_);
     released_ = true;
@@ -87,6 +94,7 @@ class BlackholeMasterService final : public ::umbp::UMBPMaster::Service {
 
   bool HeartbeatEntered() const { return heartbeat_entered_.load(); }
   bool UnregisterEntered() const { return unregister_entered_.load(); }
+  bool RouteGetEntered() const { return route_get_entered_.load(); }
 
  private:
   // Park the handler until ReleaseAll() flips the flag or gRPC cancels
@@ -102,6 +110,7 @@ class BlackholeMasterService final : public ::umbp::UMBPMaster::Service {
   int heartbeat_interval_ms_;
   std::atomic<bool> heartbeat_entered_{false};
   std::atomic<bool> unregister_entered_{false};
+  std::atomic<bool> route_get_entered_{false};
   std::mutex mu_;
   std::condition_variable cv_;
   bool released_ = false;
@@ -181,6 +190,27 @@ TEST_F(MasterClientLifecycleTest, DestructorBoundedWhenMasterUnresponsive) {
       << " ms).  Heartbeat or UnregisterClient deadline "
          "may have regressed.";
   EXPECT_TRUE(service_->UnregisterEntered());
+}
+
+TEST_F(MasterClientLifecycleTest, BatchRouteGetDeadlineIsBelowEngineHeartbeatTimeout) {
+  UMBPMasterClientConfig cfg;
+  cfg.node_id = "lookup-deadline-node";
+  cfg.node_address = "127.0.0.1";
+  cfg.master_address = address_;
+  auto client = std::make_unique<MasterClient>(cfg);
+  std::map<TierType, TierCapacity> caps;
+  caps[TierType::DRAM] = {1 << 20, 1 << 20};
+  ASSERT_TRUE(client->RegisterSelf(caps).ok());
+
+  const auto started = std::chrono::steady_clock::now();
+  std::vector<std::optional<RouteGetResult>> routes;
+  auto status = client->BatchRouteGet({"blocked-key"}, {}, &routes, std::chrono::seconds(1));
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::DEADLINE_EXCEEDED);
+  EXPECT_TRUE(service_->RouteGetEntered());
+  EXPECT_LT(elapsed, std::chrono::seconds(2));
+  service_->ReleaseAll();
+  client.reset();
 }
 
 }  // namespace

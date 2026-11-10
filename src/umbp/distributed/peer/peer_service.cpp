@@ -23,9 +23,15 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <limits>
+#include <msgpack.hpp>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -34,6 +40,8 @@
 #include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/metrics/metric_sink.h"
+#include "umbp/distributed/peer/backend/engine_hbm_backend.h"
+#include "umbp/distributed/peer/backend/instrumented_backend.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/pool/peer_pool.h"
@@ -44,6 +52,12 @@
 namespace mori::umbp {
 
 namespace {
+
+#ifdef MORI_UMBP_TESTING
+std::atomic<bool> g_fail_next_load_acquire_reply{false};
+std::atomic<bool> g_fail_next_load_release_reply{false};
+std::atomic<uint32_t> g_load_rpc_delay_ms{0};
+#endif
 // Shared with master_server.cpp via UMBP_GRPC_SHUTDOWN_DEADLINE_SEC.
 std::chrono::seconds GrpcShutdownDeadline() {
   static const auto v =
@@ -68,6 +82,7 @@ std::chrono::seconds GrpcShutdownDeadline() {
 //  cannot reach the tag in any realistic process lifetime.
 // ---------------------------------------------------------------------------
 constexpr int kSlotBackendShift = 56;
+constexpr uint64_t kMaxEngineGrantLeaseMs = 5000;
 constexpr uint64_t kSlotLocalMask = (1ULL << kSlotBackendShift) - 1;
 
 uint64_t TagSlotId(uint32_t backend_id, uint64_t local_id) {
@@ -77,6 +92,64 @@ uint32_t BackendIdFromSlotId(uint64_t tagged) {
   return static_cast<uint32_t>(tagged >> kSlotBackendShift);
 }
 uint64_t LocalSlotId(uint64_t tagged) { return tagged & kSlotLocalMask; }
+
+EngineHbmBackend* EngineBackend(MediumBackend* backend) {
+  if (auto* instrumented = dynamic_cast<InstrumentedBackend*>(backend)) {
+    backend = instrumented->Inner();
+  }
+  return dynamic_cast<EngineHbmBackend*>(backend);
+}
+
+bool FromWire(const ::umbp::engine::OperationId& in, engine::OperationId* out) {
+  if (out == nullptr || in.session_id().size() != static_cast<int>(out->session_id.size()) ||
+      in.seq() == 0) {
+    return false;
+  }
+  std::memcpy(out->session_id.data(), in.session_id().data(), out->session_id.size());
+  out->seq = in.seq();
+  return true;
+}
+
+void ToWire(const engine::PoolEpoch& in, ::umbp::engine::PoolEpoch* out) {
+  out->set_boot_id(in.boot_id.data(), in.boot_id.size());
+  out->set_reset_seq(in.reset_seq);
+}
+
+void ToWire(const engine::AllocationHandle& in, ::umbp::engine::AllocationHandle* out) {
+  out->set_pool_id(in.pool_id);
+  ToWire(in.epoch, out->mutable_epoch());
+  out->set_backend_id(in.backend_id);
+  out->set_page_id(in.page_id);
+  out->set_generation(in.generation);
+}
+
+void ToWire(const TransferRef& in, ::umbp::engine::MemoryRef* out) {
+  out->set_size(in.size);
+  out->set_location(static_cast<uint32_t>(in.loc));
+  out->set_device(in.device);
+  out->set_executor_id(in.executor_id);
+  out->set_region_id(in.region_id);
+  out->set_address(in.executor_address);
+  if (in.HasMemoryDesc()) {
+    msgpack::sbuffer packed;
+    msgpack::pack(packed, in.mem);
+    out->set_memory_desc(packed.data(), packed.size());
+  }
+}
+
+void ToWire(const ObjectView& in, ::umbp::engine::ObjectView* out) {
+  out->set_size(in.size);
+  out->set_layout_id(in.layout_id);
+  for (const auto& span : in.spans) {
+    auto* converted = out->add_spans();
+    ToWire(span.buffer, converted->mutable_buffer());
+    converted->set_offset(span.offset);
+    converted->set_length(span.length);
+    converted->set_logical_offset(span.logical_offset);
+    converted->set_layer_id(span.layer_id);
+    converted->set_component(span.component);
+  }
+}
 
 // Drop a (pages, page_size, descs) tuple into a slot-shaped response
 // that exposes those fields directly.  Templated so the same body
@@ -105,6 +178,12 @@ void FillPagesAndDescs(Response* resp, const std::vector<PageLocation>& pages, u
 }
 
 }  // namespace
+
+#ifdef MORI_UMBP_TESTING
+void FailNextLoadAcquireReplyForTest() { g_fail_next_load_acquire_reply.store(true); }
+void FailNextLoadReleaseReplyForTest() { g_fail_next_load_release_reply.store(true); }
+void SetLoadRpcDelayForTest(uint32_t delay_ms) { g_load_rpc_delay_ms.store(delay_ms); }
+#endif
 
 class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Service {
  public:
@@ -151,6 +230,29 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         out->set_buffer_index(d.buffer_index);
         out->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
       }
+      auto* engine_backend = EngineBackend(backend);
+      if (engine_backend == nullptr || !engine_backend->Active()) continue;
+      const auto registration = engine_backend->RegistrationSnapshot();
+      auto* executor = response->add_executor_infos();
+      executor->set_executor_id(registration.executor_id);
+      executor->set_backend_id(backend_id);
+      if (!registration.engine_desc.empty()) {
+        executor->set_engine_desc(registration.engine_desc.data(), registration.engine_desc.size());
+      }
+      for (const auto& region : registration.geometry.regions) {
+        if (!region.buffer.HasMemoryDesc()) continue;
+        msgpack::sbuffer packed;
+        msgpack::pack(packed, region.buffer.mem);
+        auto* buffer = executor->add_buffers();
+        buffer->set_region_id(region.region_id);
+        buffer->set_desc(packed.data(), packed.size());
+      }
+      auto* geometry = response->add_backend_geometries();
+      geometry->set_backend_id(backend_id);
+      geometry->set_page_size(registration.geometry.object_bytes);
+      geometry->set_layout_id(registration.geometry.layout_id);
+      geometry->set_executor_id(registration.executor_id);
+      response->set_protocol_capabilities(response->protocol_capabilities() | 0x7);
     }
     // Uniform across backends; BackendRegistry::Register refuses a backend that
     // disagrees, so there is one page size to report.
@@ -424,6 +526,193 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     EncodeBatchResolveResponse(entries, registry_ == nullptr ? 0 : registry_->PageSize(),
                                batch_descs, response);
     RecordInboundGet(total_bytes, "remote");
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchAcquireEngine(grpc::ServerContext*,
+                                  const ::umbp::BatchAcquireEngineRequest* request,
+                                  ::umbp::BatchAcquireEngineResponse* response) override {
+    const size_t count = request->keys_size();
+    for (size_t i = 0; i < count; ++i) response->add_grants();
+    engine::OperationId operation;
+    if (pool_ == nullptr || registry_ == nullptr || request->reader_session().empty() ||
+        request->reader_request().empty() || !FromWire(request->operation(), &operation)) {
+      return grpc::Status::OK;
+    }
+
+    struct Pending {
+      std::vector<size_t> positions;
+      std::vector<engine::AllocationHandle> handles;
+    };
+    std::unordered_map<uint32_t, Pending> by_backend;
+    for (size_t i = 0; i < count; ++i) {
+      for (auto* medium : Media()) {
+        auto* backend = EngineBackend(medium);
+        if (backend == nullptr || !backend->Active()) continue;
+        auto handle = backend->HandleForKey(request->keys(static_cast<int>(i)));
+        if (!handle.has_value()) continue;
+        const uint32_t backend_id = registry_->BackendId(medium);
+        by_backend[backend_id].positions.push_back(i);
+        by_backend[backend_id].handles.push_back(*handle);
+        break;
+      }
+    }
+    const ReaderIdentity reader{request->reader_session(), request->reader_request()};
+    engine::OperationId ack_watermark;
+    const bool has_ack =
+        request->has_ack_watermark() && FromWire(request->ack_watermark(), &ack_watermark);
+    const auto lease_ms =
+        std::min<uint64_t>(std::max<uint64_t>(request->lease_ms(), 1), kMaxEngineGrantLeaseMs);
+    const auto expiry = GrantTable::Clock::now() + std::chrono::milliseconds(lease_ms);
+    for (auto& [backend_id, pending] : by_backend) {
+      if (has_ack) pool_->AdvanceEngineAckWatermark(backend_id, ack_watermark);
+      auto granted =
+          pool_->AcquireEngineGrants(backend_id, reader, pending.handles, operation, expiry);
+      auto* medium = registry_->Get(backend_id);
+      auto* backend = EngineBackend(medium);
+      for (size_t j = 0; j < granted.size() && j < pending.positions.size(); ++j) {
+        auto* out = response->mutable_grants(static_cast<int>(pending.positions[j]));
+        out->set_granted(granted[j].granted);
+        if (!granted[j].granted || backend == nullptr) continue;
+        out->set_grant_id(granted[j].id.value);
+        out->set_backend_id(backend_id);
+        ToWire(granted[j].source, out->mutable_source());
+        ToWire(backend->View(granted[j].source), out->mutable_view());
+      }
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchReleaseEngine(grpc::ServerContext*,
+                                  const ::umbp::BatchReleaseEngineRequest* request,
+                                  ::umbp::BatchReleaseEngineResponse* response) override {
+    engine::OperationId operation;
+    const uint32_t raw_proof = request->proof();
+    if (pool_ == nullptr || request->reader_session().empty() ||
+        request->reader_request().empty() || !FromWire(request->operation(), &operation) ||
+        raw_proof > static_cast<uint32_t>(engine::CompletionProof::kUnknown)) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "invalid engine release request or completion proof");
+    }
+    std::vector<GrantId> grants;
+    grants.reserve(request->grant_ids_size());
+    for (uint64_t id : request->grant_ids()) grants.push_back(GrantId{id});
+    engine::OperationId ack_watermark;
+    if (request->has_ack_watermark() && FromWire(request->ack_watermark(), &ack_watermark)) {
+      pool_->AdvanceEngineAckWatermark(request->backend_id(), ack_watermark);
+    }
+    auto released = pool_->ReleaseEngineGrants(
+        request->backend_id(), {request->reader_session(), request->reader_request()}, grants,
+        static_cast<engine::CompletionProof>(raw_proof), operation);
+    for (const auto& result : released) {
+      response->add_known(result.known);
+      response->add_released(result.released);
+      response->add_quarantined(result.quarantined);
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchAcquireLoadSources(grpc::ServerContext* context,
+                                       const ::umbp::BatchAcquireLoadSourcesRequest* request,
+                                       ::umbp::BatchAcquireLoadSourcesResponse* response) override {
+#ifdef MORI_UMBP_TESTING
+    if (const uint32_t delay = g_load_rpc_delay_ms.load(); delay != 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    }
+    if (context->IsCancelled()) {
+      return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "injected load RPC delay");
+    }
+#endif
+    const size_t count = request->entries_size();
+    for (size_t i = 0; i < count; ++i) response->add_grants();
+    engine::OperationId operation;
+    if (pool_ == nullptr || request->reader_session().empty() ||
+        request->reader_request().empty() || !FromWire(request->operation(), &operation)) {
+      return grpc::Status::OK;
+    }
+    std::vector<std::string> keys;
+    std::vector<uint32_t> backends;
+    std::vector<TierType> tiers;
+    keys.reserve(count);
+    backends.reserve(count);
+    tiers.reserve(count);
+    for (const auto& entry : request->entries()) {
+      keys.push_back(entry.key());
+      backends.push_back(entry.preferred_backend_id());
+      tiers.push_back(TierFromProto(entry.preferred_tier()));
+    }
+    const auto lease_ms =
+        std::min<uint64_t>(std::max<uint64_t>(request->lease_ms(), 1), kMaxEngineGrantLeaseMs);
+    auto granted = pool_->AcquireLoadSources(
+        {request->reader_session(), request->reader_request()}, keys, backends, tiers, operation,
+        GrantTable::Clock::now() + std::chrono::milliseconds(lease_ms));
+    for (size_t i = 0; i < granted.size() && i < count; ++i) {
+      auto* out = response->mutable_grants(static_cast<int>(i));
+      out->set_granted(granted[i].granted);
+      if (!granted[i].granted) continue;
+      out->set_grant_id(granted[i].id.value);
+      out->set_backend_id(granted[i].backend_id);
+      out->set_engine(granted[i].engine);
+      out->set_executor_id(granted[i].executor_id);
+      if (granted[i].source.has_value()) {
+        ToWire(*granted[i].source, out->mutable_source());
+      }
+      ToWire(granted[i].view, out->mutable_view());
+    }
+#ifdef MORI_UMBP_TESTING
+    if (g_fail_next_load_acquire_reply.exchange(false)) {
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "injected lost acquire reply");
+    }
+#endif
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchReleaseLoadSources(grpc::ServerContext* context,
+                                       const ::umbp::BatchReleaseLoadSourcesRequest* request,
+                                       ::umbp::BatchReleaseLoadSourcesResponse* response) override {
+#ifdef MORI_UMBP_TESTING
+    if (const uint32_t delay = g_load_rpc_delay_ms.load(); delay != 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    }
+    if (context->IsCancelled()) {
+      return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "injected load RPC delay");
+    }
+#endif
+    engine::OperationId operation;
+    if (pool_ == nullptr || request->reader_session().empty() ||
+        request->reader_request().empty() || !FromWire(request->operation(), &operation) ||
+        request->proof() > static_cast<uint32_t>(engine::CompletionProof::kUnknown)) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid load-source release");
+    }
+    std::vector<engine::LoadGrantRef> grants;
+    grants.reserve(request->grants_size());
+    for (const auto& item : request->grants()) {
+      engine::LoadGrantRef grant;
+      grant.id = item.grant_id();
+      grant.backend_id = item.backend_id();
+      grant.engine = item.engine();
+      grant.key = item.key();
+      grants.push_back(std::move(grant));
+    }
+    engine::OperationId ack_watermark;
+    if (request->has_ack_watermark() && FromWire(request->ack_watermark(), &ack_watermark) &&
+        ack_watermark.session_id == operation.session_id && ack_watermark.seq < operation.seq) {
+      std::unordered_set<uint32_t> advanced;
+      for (const auto& grant : grants) {
+        if (grant.engine && advanced.insert(grant.backend_id).second) {
+          pool_->AdvanceEngineAckWatermark(grant.backend_id, ack_watermark);
+        }
+      }
+    }
+    auto released = pool_->ReleaseLoadSources(
+        {request->reader_session(), request->reader_request()}, grants,
+        static_cast<engine::CompletionProof>(request->proof()), operation);
+    for (bool result : released) response->add_released(result);
+#ifdef MORI_UMBP_TESTING
+    if (g_fail_next_load_release_reply.exchange(false)) {
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "injected lost release reply");
+    }
+#endif
     return grpc::Status::OK;
   }
 

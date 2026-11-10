@@ -33,6 +33,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,6 +45,7 @@
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/metrics/activity_summary.h"
 #include "umbp/distributed/metrics/component_metrics.h"
+#include "umbp/distributed/peer/backend/engine_hbm_backend.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/pool_platform.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
@@ -219,6 +221,28 @@ class PoolClient {
   // Every named storage backend live on this node.  Callers use them through
   // MediumBackend — no concrete backend type is named outside PoolClient::Init.
   BackendRegistry& Backends();
+  bool ActivateEngine(EngineRegistration registration);
+  void FailEngineSession(engine::RankId rank);
+  std::optional<uint32_t> EngineBackendId(engine::RankId rank) const;
+  std::vector<engine::SharedDramRegion> ExportSharedDram(engine::PoolEpoch epoch);
+  PeerPool* EnginePool() const { return default_pool_.get(); }
+  engine::ReadPlan LookupEngine(const std::vector<std::string>& keys, std::string name_space,
+                                std::string layout_id, uint32_t requester_backend_id);
+  engine::PreparedLoad PrepareEngineLoad(const engine::ReadPlan& plan, std::string request_id,
+                                         const std::vector<engine::AllocationHandle>& targets,
+                                         uint32_t n_pages, const ReaderIdentity& reader,
+                                         engine::OperationId operation);
+  engine::CancelLoadResult CancelEngineLoad(uint64_t prepared_id, engine::OperationId operation);
+  bool CompleteEngineLoad(uint64_t prepared_id, engine::LoadOutcome outcome,
+                          engine::OperationId operation);
+  static engine::ReadSourceKind EngineRemoteReadKind(TierType tier);
+  static std::unordered_set<std::string> EngineLookupExcludes(std::string_view node_id);
+#ifdef MORI_UMBP_TESTING
+  uint64_t PeerInfoRefreshCountForTest() const { return peer_info_refreshes_.load(); }
+  bool RefreshPeerInfoForTest(const std::string& node_id, const std::string& peer_address);
+  bool EnsurePeerBackendForTest(const std::string& node_id, const std::string& peer_address,
+                                uint32_t backend_id);
+#endif
   TierTransitionMetrics TransitionMetrics() const;
   LocalEvictionMetrics LocalEvictionStats() const;
   std::map<std::string, uint64_t> TierReadHits() const;
@@ -387,20 +411,60 @@ class PoolClient {
   // Phase 6: the peer's engine desc and buffer descriptors moved into
   // MoriIoEngine, which is the layer that uses them.
   struct PeerConnection {
+    struct ExecutorBootstrap {
+      std::string executor_id;
+      uint32_t backend_id = BackendRegistry::kMaxBackends;
+      std::vector<uint8_t> engine_desc;
+      std::unordered_map<std::string, std::vector<uint8_t>> region_descs;
+      uint64_t page_size = 0;
+      std::string layout_id;
+    };
     std::string node_id;
     std::string peer_address;
     std::unique_ptr<void, void (*)(void*)> peer_stub{nullptr, +[](void*) {}};
     // Guards first-contact connection setup (stub creation + engine/buffer-desc
     // hydration via GetPeerInfo) in EnsurePeerServiceConnection.
     std::mutex conn_mutex;
+    bool peer_info_loaded = false;
+    std::chrono::steady_clock::time_point last_peer_info_refresh{};
+    uint64_t protocol_capabilities = 0;
+    std::vector<uint8_t> engine_desc;
+    std::vector<ExecutorBootstrap> executors;
+    std::unordered_set<uint32_t> advertised_backends;
   };
   std::mutex peers_mutex_;
   std::unordered_map<std::string, std::unique_ptr<PeerConnection>> peers_;
+  std::atomic<uint64_t> peer_info_refreshes_{0};
+
+  struct StoredReadPlan {
+    engine::ReadPlan plan;
+    std::chrono::steady_clock::time_point expires_at;
+  };
+  struct PreparedLoadRecord {
+    ReaderIdentity reader;
+    std::vector<engine::LoadGrantRef> grants;
+    std::chrono::steady_clock::time_point created_at;
+    uint32_t requester_backend_id = BackendRegistry::kMaxBackends;
+    engine::OperationId prepare_operation;
+    std::vector<engine::AllocationHandle> targets;
+    bool started = false;
+    bool terminal = false;
+  };
+  std::mutex engine_load_mutex_;
+  uint64_t next_read_plan_id_ = 1;
+  uint64_t next_prepared_load_id_ = 1;
+  std::unordered_map<uint64_t, StoredReadPlan> engine_read_plans_;
+  std::unordered_map<uint64_t, PreparedLoadRecord> engine_prepared_loads_;
+  std::unordered_set<engine::ResidentIdentity, engine::ResidentIdentityHash> engine_load_targets_;
 
   // Caller MUST NOT hold peers_mutex_; this helper acquires it.
   PeerConnection& GetOrConnectPeer(const std::string& node_id, const std::string& peer_address);
 
-  bool EnsurePeerServiceConnection(PeerConnection& peer);
+  bool EnsurePeerServiceConnection(
+      PeerConnection& peer, bool force_refresh = false,
+      std::optional<uint32_t> required_backend = std::nullopt,
+      std::string_view required_executor = {},
+      std::optional<std::chrono::system_clock::time_point> deadline = std::nullopt);
 
   // Endpoint for a caller-supplied buffer, plus the offset of `ptr` within it:
   // the registered region when RegisterMemory pinned it (zero copy, ref covers

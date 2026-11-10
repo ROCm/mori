@@ -42,6 +42,7 @@
 #include "umbp/distributed/peer/backend/page_pool.h"
 #include "umbp/distributed/peer/backend/peer_page_allocator.h"
 #include "umbp/distributed/types.h"
+#include "umbp/engine/engine_types.h"
 #include "umbp/local/host_mem_allocator.h"
 
 namespace mori::umbp {
@@ -114,6 +115,7 @@ class HostPageMemorySource final : public PageMemorySource {
  public:
   struct Options {
     bool use_hugepages = false;
+    bool shared = false;
     uint64_t hugepage_size = 2ULL * 1024 * 1024;
     std::vector<int> numa_nodes;
     bool prefault = true;
@@ -190,6 +192,7 @@ class PageBackend : public MediumBackend {
   // it from outside (design doc §1 item 4).
   struct OwnershipConfig {
     std::vector<uint64_t> buffer_sizes;
+    bool shared = false;
     bool use_hugepages = false;
     uint64_t hugepage_size = 2ULL * 1024 * 1024;
     std::vector<int> numa_nodes;
@@ -284,6 +287,9 @@ class PageBackend : public MediumBackend {
 
   size_t BufferCount() const override { return buffer_refs_.size(); }
   TransferRef BufferRef(uint32_t buffer_index) const override;
+  std::vector<engine::SharedDramRegion> ExportSharedRegions(uint32_t backend_id,
+                                                            engine::PoolEpoch epoch);
+  void ReleaseSharedRegions();
 
   // ==================== Single-key convenience ====================
   // NOT part of MediumBackend (design doc §3: "single-key Allocate/Commit/
@@ -520,6 +526,8 @@ class PageBackend : public MediumBackend {
   // BufferRef() costs an index rather than an msgpack unpack.  Immutable after
   // Init, hence readable without mutex_.
   std::vector<TransferRef> buffer_refs_;
+  std::vector<engine::SharedDramRegion> shared_regions_;
+  std::vector<uintptr_t> shared_region_holds_;
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::vector<QuarantinedPending> quarantined_pending_;
@@ -534,6 +542,7 @@ class PageBackend : public MediumBackend {
   // migration releases them.  The key stays an eviction candidate.
   struct PinState {
     uint64_t token = 0;
+    size_t count = 0;
     std::chrono::steady_clock::time_point acquired_at;  // for long-running warning only
   };
   std::unordered_map<std::string, PinState> pins_;

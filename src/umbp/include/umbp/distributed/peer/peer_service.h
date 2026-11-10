@@ -29,6 +29,12 @@
 
 namespace mori::umbp {
 
+#ifdef MORI_UMBP_TESTING
+void FailNextLoadAcquireReplyForTest();
+void FailNextLoadReleaseReplyForTest();
+void SetLoadRpcDelayForTest(uint32_t delay_ms);
+#endif
+
 class BackendRegistry;
 class MetricSink;
 class PeerPool;

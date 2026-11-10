@@ -90,8 +90,19 @@ struct TierTransitionMetrics {
   uint64_t succeeded = 0;
   uint64_t failed = 0;
   uint64_t dropped = 0;         // evicted copies whose demotion never landed (lost keys)
-  uint64_t retried = 0;         // eviction demotions re-queued after a retryable failure
+  uint64_t retried = 0;         // demotions/F3 jobs re-queued after a retryable failure
   uint64_t promote_failed = 0;  // of `failed`, promotions (the read stays on the source)
+  uint64_t f3_succeeded = 0;
+  uint64_t f3_failed = 0;  // attempts, including retry attempts
+  uint64_t f3_retried = 0;
+  uint64_t f3_rejected = 0;  // keys released after the retry budget was exhausted
+  uint64_t f3_source_missing = 0;
+  uint64_t f3_quarantined = 0;
+  uint64_t dram_handoff_refreshes = 0;
+  uint64_t engine_dram_read_grants = 0;
+  uint64_t engine_retiring_pages = 0;  // current gauge, not a cumulative counter
+  uint64_t f3_inflight = 0;            // current gauge
+  uint64_t f3_pending_keys = 0;        // current gauge
   uint64_t offloaded_bytes = 0;
   uint64_t promoted_bytes = 0;
   std::map<std::string, uint64_t> read_bytes;   // read off each source medium, by TierTypeName

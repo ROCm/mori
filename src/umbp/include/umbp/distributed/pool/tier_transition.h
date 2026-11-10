@@ -25,11 +25,13 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/engine/engine_types.h"
 
 namespace mori::umbp {
 
@@ -54,6 +56,11 @@ struct TierTransitionResult {
   // Failed in a way that can clear (no space, or a copy/commit/read-back
   // error), so a later attempt may succeed.  False for a shape failure.
   bool retryable = false;
+  bool unknown = false;
+  bool source_missing = false;
+  std::string failure_reason;
+  std::string failure_detail;
+  uint32_t failed_target_backend_id = BackendRegistry::kMaxBackends;
 };
 
 // Executes one peer-local copy or move. Placement policy and scheduling remain
@@ -63,9 +70,10 @@ class TierTransitionExecutor {
   TierTransitionExecutor(BackendRegistry* backends, TransferEngine* transfer_engine)
       : backends_(backends), transfer_engine_(transfer_engine) {}
 
-  TierTransitionResult Execute(const std::string& key, uint32_t source_backend_id,
-                               const std::vector<uint32_t>& target_backend_ids,
-                               bool remove_source) const;
+  TierTransitionResult Execute(
+      const std::string& key, uint32_t source_backend_id,
+      const std::vector<uint32_t>& target_backend_ids, bool remove_source,
+      std::optional<engine::OperationId> retire_operation = std::nullopt) const;
   TierTransitionResult Execute(const std::string& key, uint32_t source_backend_id,
                                const std::vector<uint32_t>& target_backend_ids,
                                TierTransitionIntent intent) const {

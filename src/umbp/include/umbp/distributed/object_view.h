@@ -24,6 +24,8 @@ struct RegionSpan {
   uint64_t offset = 0;
   uint64_t length = 0;
   uint64_t logical_offset = 0;
+  int32_t layer_id = -1;
+  std::string component;
 };
 
 struct ObjectView {
@@ -79,8 +81,12 @@ ObjectView BuildPageObjectView(const std::vector<PageLocation>& pages, uint64_t 
       view.spans.clear();
       return view;
     }
-    view.spans.push_back(RegionSpan{
-        std::move(ref), static_cast<uint64_t>(page.page_index) * page_size, length, logical});
+    view.spans.push_back(RegionSpan{std::move(ref),
+                                    static_cast<uint64_t>(page.page_index) * page_size,
+                                    length,
+                                    logical,
+                                    -1,
+                                    {}});
     logical += length;
   }
   if (!ValidateObjectView(view)) view.spans.clear();

@@ -106,6 +106,11 @@ size_t GrantTable::HoldCount(const AllocationHandle& source) const {
   return it == holds_.end() ? 0 : it->second;
 }
 
+size_t GrantTable::ActiveCount() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return grants_.size();
+}
+
 std::vector<AllocationHandle> GrantTable::Expire(Clock::time_point now) {
   std::vector<AllocationHandle> expired;
   std::lock_guard<std::mutex> lock(mutex_);

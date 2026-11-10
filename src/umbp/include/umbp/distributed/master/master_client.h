@@ -118,7 +118,8 @@ class MasterClient : public MetricSink {
                              std::vector<std::optional<RoutePutResult>>* out);
   grpc::Status BatchRouteGet(const std::vector<std::string>& keys,
                              const std::unordered_set<std::string>& exclude_nodes,
-                             std::vector<std::optional<RouteGetResult>>* out);
+                             std::vector<std::optional<RouteGetResult>>* out,
+                             std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
 
   // Read-only batched existence probe.  out[i] mirrors keys[i].  No
   // access-count / lease side effects on master, no per-node RouteGet

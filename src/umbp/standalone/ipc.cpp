@@ -35,9 +35,20 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace mori::umbp::standalone {
 namespace {
+
+constexpr uint32_t kFramedMessageMagic = 0x554d4246;  // "UMBF"
+constexpr uint16_t kFramedMessageVersion = 1;
+
+struct FramedMessageHeader {
+  uint32_t magic = kFramedMessageMagic;
+  uint16_t version = kFramedMessageVersion;
+  uint16_t fd_count = 0;
+  uint32_t payload_size = 0;
+};
 
 bool StartsWith(const std::string& value, const char* prefix) {
   return value.rfind(prefix, 0) == 0;
@@ -131,6 +142,18 @@ std::string DeriveFdSocketPath(const std::string& grpc_address) {
     path.replace(path.size() - suffix.size(), suffix.size(), ".fd.sock");
   } else {
     path += ".fd.sock";
+  }
+  return path;
+}
+
+std::string DeriveEngineSocketPath(const std::string& grpc_address) {
+  std::string path = UnixPathFromGrpcAddress(grpc_address);
+  const std::string suffix = ".grpc.sock";
+  if (path.size() >= suffix.size() &&
+      path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0) {
+    path.replace(path.size() - suffix.size(), suffix.size(), ".engine.sock");
+  } else {
+    path += ".engine.sock";
   }
   return path;
 }
@@ -292,6 +315,110 @@ bool SendStatus(int socket_fd, int32_t status, std::string* error) {
 bool RecvStatus(int socket_fd, int32_t* status, std::string* error) {
   if (!status) return false;
   return RecvAll(socket_fd, status, sizeof(*status), error);
+}
+
+bool SendFramedMessage(int socket_fd, std::string_view payload, const std::vector<int>& fds,
+                       std::string* error) {
+  if (payload.size() > UINT32_MAX || fds.size() > UINT16_MAX) {
+    SetError(error, "framed message is too large");
+    return false;
+  }
+  for (int fd : fds) {
+    if (fd < 0) {
+      SetError(error, "framed message contains invalid fd");
+      return false;
+    }
+  }
+
+  FramedMessageHeader header;
+  header.fd_count = static_cast<uint16_t>(fds.size());
+  header.payload_size = static_cast<uint32_t>(payload.size());
+  iovec iov{&header, sizeof(header)};
+  msghdr msg{};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  std::vector<char> control;
+  if (!fds.empty()) {
+    control.resize(CMSG_SPACE(fds.size() * sizeof(int)));
+    msg.msg_control = control.data();
+    msg.msg_controllen = control.size();
+    auto* cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(fds.size() * sizeof(int));
+    std::memcpy(CMSG_DATA(cmsg), fds.data(), fds.size() * sizeof(int));
+  }
+  ssize_t sent;
+  do {
+    sent = sendmsg(socket_fd, &msg, MSG_NOSIGNAL);
+  } while (sent < 0 && errno == EINTR);
+  if (sent != static_cast<ssize_t>(sizeof(header))) {
+    SetError(error, sent < 0 ? ErrnoMessage("sendmsg(frame)") : "short frame header send");
+    return false;
+  }
+  return payload.empty() || SendAll(socket_fd, payload.data(), payload.size(), error);
+}
+
+bool RecvFramedMessage(int socket_fd, std::string* payload, std::vector<int>* fds,
+                       size_t max_payload, size_t max_fds, std::string* error) {
+  if (payload == nullptr || fds == nullptr) return false;
+  payload->clear();
+  for (int fd : *fds) close(fd);
+  fds->clear();
+
+  FramedMessageHeader header;
+  iovec iov{&header, sizeof(header)};
+  std::vector<char> control(CMSG_SPACE(max_fds * sizeof(int)));
+  msghdr msg{};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control.data();
+  msg.msg_controllen = control.size();
+  ssize_t received;
+  do {
+    received = recvmsg(socket_fd, &msg, MSG_WAITALL);
+  } while (received < 0 && errno == EINTR);
+  auto close_delivered = [&]() {
+    for (auto* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+      if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) continue;
+      const size_t bytes = cmsg->cmsg_len >= CMSG_LEN(0) ? cmsg->cmsg_len - CMSG_LEN(0) : 0;
+      const auto* data = reinterpret_cast<const int*>(CMSG_DATA(cmsg));
+      for (size_t i = 0; i < bytes / sizeof(int); ++i) close(data[i]);
+    }
+  };
+  if (received != static_cast<ssize_t>(sizeof(header)) ||
+      (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+    close_delivered();
+    SetError(error, received < 0 ? ErrnoMessage("recvmsg(frame)") : "malformed frame header");
+    return false;
+  }
+  if (header.magic != kFramedMessageMagic || header.version != kFramedMessageVersion ||
+      header.payload_size > max_payload || header.fd_count > max_fds) {
+    close_delivered();
+    SetError(error, "invalid framed message header");
+    return false;
+  }
+
+  for (auto* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) continue;
+    const size_t bytes = cmsg->cmsg_len - CMSG_LEN(0);
+    const auto* data = reinterpret_cast<const int*>(CMSG_DATA(cmsg));
+    fds->insert(fds->end(), data, data + bytes / sizeof(int));
+  }
+  if (fds->size() != header.fd_count) {
+    for (int fd : *fds) close(fd);
+    fds->clear();
+    SetError(error, "framed message fd count mismatch");
+    return false;
+  }
+  payload->resize(header.payload_size);
+  if (header.payload_size > 0 && !RecvAll(socket_fd, payload->data(), payload->size(), error)) {
+    for (int fd : *fds) close(fd);
+    fds->clear();
+    payload->clear();
+    return false;
+  }
+  return true;
 }
 
 }  // namespace mori::umbp::standalone

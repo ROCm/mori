@@ -26,9 +26,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
+#include <vector>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_gather.h"
@@ -72,45 +74,82 @@ __global__ void GatherFragmentsKernel(const DeviceGatherFragment* __restrict__ f
   for (size_t i = index; i < fragment.bytes; i += stride) dst[i] = src[i];
 }
 
-// Per-stream descriptor staging.
-//
-// The caller holds `stream` exclusively from the upload to the synchronize
-// (see LaunchDeviceGather), so a stream's buffer is never in use twice at once,
-// and the count is bounded by the caller's streams rather than by however many
-// threads have ever called in. Never freed, for the same reason the streams are
-// never destroyed: releasing HIP resources from a static destructor races with
-// runtime teardown.
-struct DescriptorStaging {
+// A stream may have several in-flight launches. Each slot owns the pinned host
+// upload buffer, device descriptors and a completion event fencing their last
+// use. A later launch reuses/grows a slot only after hipEventQuery proves that
+// its upload and kernel have completed; otherwise it takes another slot. This
+// keeps SubmitLoad asynchronous without allowing one load to overwrite another
+// load's descriptors.
+struct DescriptorSlot {
   DeviceGatherFragment* host = nullptr;
   DeviceGatherFragment* device = nullptr;
   size_t capacity = 0;
+  hipEvent_t done = nullptr;
+  bool in_flight = false;
+  bool poisoned = false;
 };
 
-DescriptorStaging* StagingFor(hipStream_t stream, int device_id, size_t count) {
-  static std::mutex* staging_mutex = new std::mutex();
-  static auto* staging_by_stream = new std::unordered_map<hipStream_t, DescriptorStaging>();
+struct DescriptorLease {
+  DescriptorSlot* slot = nullptr;
+  std::unique_lock<std::mutex> lock;
+};
 
-  DescriptorStaging* staging_entry = nullptr;
-  {
-    // References into an unordered_map stay valid across rehashing.
-    std::lock_guard<std::mutex> lock(*staging_mutex);
-    staging_entry = &(*staging_by_stream)[stream];
+DescriptorLease StagingFor(hipStream_t stream, int device_id, size_t count) {
+  static std::mutex* staging_mutex = new std::mutex();
+  using StreamSlots = std::vector<std::unique_ptr<DescriptorSlot>>;
+  static auto* staging_by_stream = new std::map<std::pair<int, hipStream_t>, StreamSlots>();
+  DescriptorLease lease{nullptr, std::unique_lock<std::mutex>(*staging_mutex)};
+  auto& slots = (*staging_by_stream)[{device_id, stream}];
+  DescriptorSlot* reusable = nullptr;
+  for (const auto& owned : slots) {
+    DescriptorSlot* slot = owned.get();
+    if (slot->poisoned) continue;
+    if (slot->in_flight) {
+      const hipError_t ready = hipEventQuery(slot->done);
+      if (ready == hipErrorNotReady) continue;
+      if (ready != hipSuccess) {
+        slot->poisoned = true;
+        (void)hipGetLastError();
+        continue;
+      }
+      slot->in_flight = false;
+    }
+    if (slot->capacity >= count) {
+      reusable = slot;
+      break;
+    }
+    if (reusable == nullptr) reusable = slot;
   }
-  DescriptorStaging& staging = *staging_entry;
-  if (staging.capacity >= count) return &staging;
+
+  if (reusable == nullptr) {
+    auto created = std::make_unique<DescriptorSlot>();
+    if (hipEventCreateWithFlags(&created->done, hipEventDisableTiming) != hipSuccess) {
+      (void)hipGetLastError();
+      return lease;
+    }
+    reusable = created.get();
+    slots.push_back(std::move(created));
+  }
+  if (reusable->capacity >= count) {
+    reusable->in_flight = true;
+    lease.slot = reusable;
+    return lease;
+  }
 
   // Grow with headroom so a slowly increasing batch size does not reallocate
-  // on every call.
+  // on every call. This slot is proven idle, so replacing its old buffers cannot
+  // race an asynchronous upload.
   const size_t capacity = std::max<size_t>(count * 2, 256);
   const size_t bytes = capacity * sizeof(DeviceGatherFragment);
   DeviceGatherFragment* host = nullptr;
   DeviceGatherFragment* device = nullptr;
   hipError_t status = hipHostMalloc(reinterpret_cast<void**>(&host), bytes, hipHostMallocDefault);
   if (status != hipSuccess) {
-    MORI_UMBP_ERROR("[DeviceGather] hipHostMalloc for {} gather descriptors failed on device {}: {}",
-                    capacity, device_id, hipGetErrorString(status));
+    MORI_UMBP_ERROR(
+        "[DeviceGather] hipHostMalloc for {} gather descriptors failed on device {}: {}", capacity,
+        device_id, hipGetErrorString(status));
     (void)hipGetLastError();
-    return nullptr;
+    return lease;
   }
   status = hipMalloc(reinterpret_cast<void**>(&device), bytes);
   if (status != hipSuccess) {
@@ -118,15 +157,17 @@ DescriptorStaging* StagingFor(hipStream_t stream, int device_id, size_t count) {
                     capacity, device_id, hipGetErrorString(status));
     (void)hipGetLastError();
     (void)hipHostFree(host);
-    return nullptr;
+    return lease;
   }
 
-  if (staging.host != nullptr) (void)hipHostFree(staging.host);
-  if (staging.device != nullptr) (void)hipFree(staging.device);
-  staging.host = host;
-  staging.device = device;
-  staging.capacity = capacity;
-  return &staging;
+  if (reusable->host != nullptr) (void)hipHostFree(reusable->host);
+  if (reusable->device != nullptr) (void)hipFree(reusable->device);
+  reusable->host = host;
+  reusable->device = device;
+  reusable->capacity = capacity;
+  reusable->in_flight = true;
+  lease.slot = reusable;
+  return lease;
 }
 
 std::atomic<uint64_t>& LaunchCounter() {
@@ -161,7 +202,8 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
       (chunks + kThreadsPerBlock - 1) / kThreadsPerBlock, 1, kMaxBlocksPerFragment));
   if (count > std::numeric_limits<unsigned>::max() / blocks_per_fragment) return false;
 
-  DescriptorStaging* staging = StagingFor(stream, device_id, count);
+  auto lease = StagingFor(stream, device_id, count);
+  DescriptorSlot* staging = lease.slot;
   if (staging == nullptr) return false;
 
   std::memcpy(staging->host, fragments, count * sizeof(DeviceGatherFragment));
@@ -169,6 +211,7 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
       hipMemcpyAsync(staging->device, staging->host, count * sizeof(DeviceGatherFragment),
                      hipMemcpyHostToDevice, stream);
   if (status != hipSuccess) {
+    staging->poisoned = true;
     MORI_UMBP_ERROR("[DeviceGather] gather descriptor upload failed on device {}: {}", device_id,
                     hipGetErrorString(status));
     (void)hipGetLastError();
@@ -180,8 +223,16 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
                      dim3(kThreadsPerBlock), 0, stream, staging->device, blocks_per_fragment);
   status = hipGetLastError();
   if (status != hipSuccess) {
+    staging->poisoned = true;
     MORI_UMBP_ERROR("[DeviceGather] gather kernel launch failed on device {} (fragments={}): {}",
                     device_id, count, hipGetErrorString(status));
+    return false;
+  }
+  status = hipEventRecord(staging->done, stream);
+  if (status != hipSuccess) {
+    staging->poisoned = true;
+    MORI_UMBP_ERROR("[DeviceGather] descriptor fence failed on device {}: {}", device_id,
+                    hipGetErrorString(status));
     return false;
   }
   LaunchCounter().fetch_add(1, std::memory_order_relaxed);
@@ -189,7 +240,8 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
 }
 
 bool PrewarmDeviceGather(int device_id, hipStream_t stream, size_t capacity) {
-  DescriptorStaging* staging = StagingFor(stream, device_id, capacity);
+  auto lease = StagingFor(stream, device_id, capacity);
+  DescriptorSlot* staging = lease.slot;
   if (staging == nullptr) return false;
 
   const size_t bytes = staging->capacity * sizeof(DeviceGatherFragment);
@@ -197,6 +249,7 @@ bool PrewarmDeviceGather(int device_id, hipStream_t stream, size_t capacity) {
   hipError_t status =
       hipMemcpyAsync(staging->device, staging->host, bytes, hipMemcpyHostToDevice, stream);
   if (status != hipSuccess) {
+    staging->poisoned = true;
     MORI_UMBP_ERROR("[DeviceGather] prewarm descriptor upload failed on device {}: {}", device_id,
                     hipGetErrorString(status));
     (void)hipGetLastError();
@@ -207,7 +260,15 @@ bool PrewarmDeviceGather(int device_id, hipStream_t stream, size_t capacity) {
                      staging->device, 1u);
   status = hipGetLastError();
   if (status != hipSuccess) {
+    staging->poisoned = true;
     MORI_UMBP_ERROR("[DeviceGather] prewarm kernel launch failed on device {}: {}", device_id,
+                    hipGetErrorString(status));
+    return false;
+  }
+  status = hipEventRecord(staging->done, stream);
+  if (status != hipSuccess) {
+    staging->poisoned = true;
+    MORI_UMBP_ERROR("[DeviceGather] prewarm descriptor fence failed on device {}: {}", device_id,
                     hipGetErrorString(status));
     return false;
   }

@@ -175,6 +175,7 @@ struct MasterServerConfig {
 // exercises PageBitmapAllocator's cross-buffer scatter/gather strategy.
 struct DramOwnershipConfig {
   std::vector<uint64_t> buffer_sizes;
+  bool shared = false;
   bool use_hugepages = false;
   uint64_t hugepage_size = 2ULL * 1024 * 1024;
   std::vector<int> numa_nodes;
@@ -261,6 +262,13 @@ struct PoolClientConfig {
   UMBPSimConfig sim;
   UMBPMasterClientConfig master_config;
   UMBPIoEngineConfig io_engine;
+
+  // Engine-HBM first step is fixed at eight ranks. Zero disables the engine
+  // node surface for ordinary UMBP deployments.
+  uint32_t engine_hbm_ranks = 0;
+  size_t engine_f3_max_inflight = 8;
+  std::chrono::milliseconds engine_f3_retry_timeout{30000};
+  uint8_t engine_f3_max_attempts = 8;
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;
 
@@ -423,6 +431,11 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.cache_remote_admission = dc.cache_remote_admission;
   pc.admission_max_block_bytes = dc.admission_max_block_bytes;
   pc.prefetch_budget_bytes = dc.prefetch_budget_bytes;
+  pc.engine_hbm_ranks = dc.engine_hbm_ranks;
+  pc.engine_f3_max_inflight = dc.engine_f3_max_inflight;
+  pc.engine_f3_retry_timeout = std::chrono::milliseconds(dc.engine_f3_retry_timeout_ms);
+  pc.engine_f3_max_attempts =
+      static_cast<uint8_t>(std::min<uint32_t>(dc.engine_f3_max_attempts, 255));
   pc.ranged_locality_prefetch = dc.ranged_locality_prefetch;
   pc.local_first = dc.local_first;
   // 0 propagates through PoolClient -> MasterClient::RegisterSelf ->

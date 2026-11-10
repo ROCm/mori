@@ -36,6 +36,69 @@
 
 namespace mori::umbp {
 
+bool DistributedClient::RegisterEngine(EngineRegistration registration) {
+  std::shared_lock<std::shared_mutex> lock(op_mutex_);
+  return !closed_ && pool_client_ != nullptr &&
+         pool_client_->ActivateEngine(std::move(registration));
+}
+
+std::optional<uint32_t> DistributedClient::BackendId(engine::RankId rank) const {
+  std::shared_lock<std::shared_mutex> lock(op_mutex_);
+  return closed_ || pool_client_ == nullptr ? std::nullopt : pool_client_->EngineBackendId(rank);
+}
+
+std::vector<engine::SharedDramRegion> DistributedClient::ExportSharedDram(engine::PoolEpoch epoch) {
+  std::shared_lock<std::shared_mutex> lock(op_mutex_);
+  return closed_ || pool_client_ == nullptr ? std::vector<engine::SharedDramRegion>{}
+                                            : pool_client_->ExportSharedDram(epoch);
+}
+
+PeerPool* DistributedClient::Pool() const {
+  std::shared_lock<std::shared_mutex> lock(op_mutex_);
+  return closed_ || pool_client_ == nullptr ? nullptr : pool_client_->EnginePool();
+}
+
+engine::ReadPlan DistributedClient::Lookup(const std::vector<std::string>& keys,
+                                           std::string name_space, std::string layout_id,
+                                           uint32_t requester_backend_id) {
+  std::shared_lock<std::shared_mutex> lock(op_mutex_);
+  return closed_ || pool_client_ == nullptr
+             ? engine::ReadPlan{}
+             : pool_client_->LookupEngine(keys, std::move(name_space), std::move(layout_id),
+                                          requester_backend_id);
+}
+
+engine::PreparedLoad DistributedClient::PrepareLoad(
+    const engine::ReadPlan& plan, std::string request_id,
+    const std::vector<engine::AllocationHandle>& targets, uint32_t n_pages,
+    const ReaderIdentity& reader, engine::OperationId operation) {
+  std::shared_lock<std::shared_mutex> lock(op_mutex_);
+  return closed_ || pool_client_ == nullptr
+             ? engine::PreparedLoad{}
+             : pool_client_->PrepareEngineLoad(plan, std::move(request_id), targets, n_pages,
+                                               reader, operation);
+}
+
+engine::CancelLoadResult DistributedClient::CancelLoad(uint64_t prepared_id,
+                                                       engine::OperationId operation) {
+  std::shared_lock<std::shared_mutex> lock(op_mutex_);
+  return closed_ || pool_client_ == nullptr
+             ? engine::CancelLoadResult::kRejected
+             : pool_client_->CancelEngineLoad(prepared_id, operation);
+}
+
+bool DistributedClient::CompleteLoad(uint64_t prepared_id, engine::LoadOutcome outcome,
+                                     engine::OperationId operation) {
+  std::shared_lock<std::shared_mutex> lock(op_mutex_);
+  return !closed_ && pool_client_ != nullptr &&
+         pool_client_->CompleteEngineLoad(prepared_id, outcome, operation);
+}
+
+void DistributedClient::SessionFailed(engine::RankId rank) {
+  std::shared_lock<std::shared_mutex> lock(op_mutex_);
+  if (!closed_ && pool_client_ != nullptr) pool_client_->FailEngineSession(rank);
+}
+
 DistributedClient::DistributedClient(const UMBPConfig& config)
     : config_(config), platform_(MakePoolPlatform(config.sim)) {
   if (!config.distributed.has_value()) {
@@ -68,6 +131,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
   dram_ownership.buffer_sizes = SplitNumaCapacity(
       config.dram.capacity_bytes, dram_ownership.numa_nodes.size(), dc.dram_page_size);
   dram_ownership.use_hugepages = config.dram.use_hugepages;
+  dram_ownership.shared = dc.engine_hbm_ranks != 0;
   dram_ownership.hugepage_size = config.dram.hugepage_size;
   dram_ownership.prefault = config.dram.prefault;
   dram_ownership.numa_strict = config.dram.numa_strict;

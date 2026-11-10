@@ -37,6 +37,10 @@
 
 namespace mori::umbp {
 
+namespace engine {
+class EngineControl;
+}
+
 enum class UMBPDeploymentMode : int {
   // No client reports Local any more: the local backend is gone and an
   // embedded deployment is a DistributedClient with no master, which reports
@@ -175,6 +179,10 @@ class IUMBPClient {
 
   /// Whether this concrete backend implements ranged multi-buffer I/O.
   virtual bool SupportsRangedIO() const { return false; }
+
+  // Optional engine-owned HBM control plane.  Ordinary clients return null;
+  // DistributedClient exposes a narrow adapter over its existing PoolClient.
+  virtual engine::EngineControl* GetEngineControl() { return nullptr; }
 
   // ---- Optional zero-copy hooks ----
   //

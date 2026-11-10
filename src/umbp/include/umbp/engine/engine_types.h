@@ -8,12 +8,14 @@
 #include <cstdint>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "umbp/distributed/object_view.h"
+#include "umbp/local/host_mem_allocator.h"
 
 namespace mori::umbp::engine {
 
@@ -151,11 +153,27 @@ struct PageGeometry {
         view.spans.clear();
         return view;
       }
-      view.spans.push_back(RegionSpan{region.buffer, offset, bytes, region.logical_offset});
+      view.spans.push_back(RegionSpan{region.buffer, offset, bytes, region.logical_offset,
+                                      region.layer_id, region.component});
     }
     if (!ValidateObjectView(view)) view.spans.clear();
     return view;
   }
+};
+
+struct SharedDramRegion {
+  std::string region_id;
+  PoolEpoch epoch;
+  uint32_t backend_id = 0;
+  uint32_t buffer_index = 0;
+  int fd = -1;  // borrowed; send with SCM_RIGHTS, never close here
+  uint64_t fd_offset = 0;
+  uint64_t length = 0;
+  uint64_t mapped_length = 0;
+  int32_t numa_node = -1;
+  uint64_t alignment = 0;
+  HostBufferBacking actual_backing = HostBufferBacking::kAnonymous;
+  TransferRef memory;
 };
 
 inline std::string ComputeLayoutId(const PageGeometry& geometry) {
@@ -182,7 +200,14 @@ inline std::string ComputeLayoutId(const PageGeometry& geometry) {
 
 enum class SlotState : uint8_t { kFree, kDelegated, kPublished, kRetiring, kQuarantined };
 
-enum class RetireState : uint8_t { kWaitingHolds, kReady, kReleased, kQuarantined };
+enum class RetireState : uint8_t {
+  kWaitingHolds,
+  kTransitionPending,
+  kReady,
+  kReleased,
+  kQuarantined,
+  kBusy,
+};
 
 struct RetireTicket {
   OperationId id;
@@ -190,6 +215,116 @@ struct RetireTicket {
   RetireState state = RetireState::kWaitingHolds;
 };
 
+struct ResetLease {
+  OperationId id;
+  PoolEpoch old_epoch;
+  PoolEpoch new_epoch;
+  bool ready = false;
+  // Snapshot of the pages that reset is allowed to return to the rank.  Once
+  // Ready is reported this set can only shrink (a late quarantine), never
+  // grow; FinishReset returns the final subset with new_epoch applied.
+  std::vector<AllocationHandle> approved;
+};
+
+enum class PublishReceiptState : uint8_t {
+  kQueued,
+  kReady,
+  kSent,
+  kAccepted,
+  kRejected,
+  kCancelled,
+  kUnknown,
+};
+
+struct PublishReceipt {
+  uint64_t ticket = 0;
+  PublishReceiptState state = PublishReceiptState::kQueued;
+  std::vector<bool> accepted;
+};
+
 enum class CompletionProof : uint8_t { kCompleted, kNeverSubmitted, kUnknown };
+
+enum class ReadSourceKind : uint8_t {
+  kMissing,
+  kLocalHbm,
+  kLocalDram,
+  kRemoteHbm,
+  kRemoteDram,
+};
+
+struct ReadSourceHint {
+  std::string key;
+  ReadSourceKind kind = ReadSourceKind::kMissing;
+  uint32_t backend_id = std::numeric_limits<uint32_t>::max();
+  std::string node_id;
+  std::string peer_address;
+  std::string executor_id;
+  std::string layout_id;
+  std::optional<AllocationHandle> handle;
+};
+
+struct ReadPlan {
+  bool success = false;
+  uint64_t id = 0;
+  PoolEpoch epoch;
+  std::string name_space;
+  std::string layout_id;
+  uint32_t requester_backend_id = std::numeric_limits<uint32_t>::max();
+  std::vector<std::string> keys;
+  std::vector<ReadSourceHint> sources;
+  uint32_t valid_prefix = 0;
+  std::vector<uint32_t> legal_boundaries;
+  std::string error;
+};
+
+struct LoadGrantRef {
+  uint64_t id = 0;
+  uint32_t backend_id = std::numeric_limits<uint32_t>::max();
+  bool remote = false;
+  bool engine = false;
+  std::string node_id;
+  std::string peer_address;
+  std::string key;
+};
+
+struct ExecutorBootstrap {
+  std::string executor_id;
+  std::vector<uint8_t> engine_desc;
+};
+
+struct PeerVmmRegion {
+  std::string executor_id;
+  std::string region_id;
+  int fd = -1;
+  uint64_t mapped_size = 0;
+  uint64_t allocation_offset = 0;
+  uint64_t region_size = 0;
+  uint64_t mapping_id = 0;
+  int32_t owner_device = -1;
+  uint32_t handle_kind = 0;
+  std::vector<uint8_t> fabric;
+};
+
+struct LayerTransferPlan {
+  int32_t layer_id = -1;
+  std::string component;
+  uint64_t tag = 0;
+  std::vector<TransferPlan> plans;
+};
+
+struct PreparedLoad {
+  bool success = false;
+  uint64_t id = 0;
+  std::string request_id;
+  std::vector<AllocationHandle> targets;
+  std::vector<LoadGrantRef> grants;
+  std::vector<ExecutorBootstrap> bootstraps;
+  std::vector<PeerVmmRegion> peer_regions;
+  std::vector<LayerTransferPlan> layers;
+  std::string error;
+};
+
+enum class LoadOutcome : uint8_t { kPending, kCompleted, kFailed, kUnknown, kCanceled };
+enum class CancelLoadResult : uint8_t { kRejected, kNeverSubmitted, kInFlight, kCompleted };
 
 }  // namespace mori::umbp::engine

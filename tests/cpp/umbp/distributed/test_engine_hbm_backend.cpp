@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <condition_variable>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -124,6 +125,7 @@ TEST_F(EngineFixture, PublishAcquireRetireAndReleasedAreAuthoritative) {
 
   backend_->Release({"reader", "request"}, {grant[0].id}, engine::CompletionProof::kCompleted,
                     Op(6));
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(4), true, false));
   auto ready = backend_->PollReadyRetires();
   ASSERT_EQ(ready.size(), 1u);
   EXPECT_EQ(ready[0].state, engine::RetireState::kReady);
@@ -174,6 +176,14 @@ TEST_F(EngineFixture, DuplicateDelegateAndPublishOperationsReplaySameResult) {
   EXPECT_EQ(backend_->DrainPendingEvents().size(), 1u);
 }
 
+TEST_F(EngineFixture, ZeroAutoFlushThresholdDisablesCallback) {
+  int callbacks = 0;
+  backend_->SetAutoFlushHook(0, [&] { ++callbacks; });
+  auto handle = Publish("no-auto-flush");
+  EXPECT_TRUE(backend_->Contains("no-auto-flush"));
+  EXPECT_EQ(callbacks, 0);
+}
+
 TEST_F(EngineFixture, AcquireReplayUsesOriginalShapeAndBecomesTerminalAfterRelease) {
   auto handle = Publish("replay");
   const auto deadline = GrantTable::Clock::now() + std::chrono::seconds(1);
@@ -190,6 +200,7 @@ TEST_F(EngineFixture, AcquireReplayUsesOriginalShapeAndBecomesTerminalAfterRelea
   EXPECT_EQ(after_retire[0].id, first[0].id);
 
   backend_->Release({"reader", "req"}, {first[0].id}, engine::CompletionProof::kCompleted, Op(5));
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(4), true, false));
   auto after_release = backend_->Acquire({"reader", "req"}, {handle}, Op(3), deadline);
   ASSERT_EQ(after_release.size(), 1u);
   EXPECT_FALSE(after_release[0].granted);
@@ -229,6 +240,7 @@ TEST_F(EngineFixture, AcquireRetireAndLastReleaseShareOneAcceptanceDomain) {
     backend_->Release({"new", "req"}, {new_grant[0].id}, engine::CompletionProof::kCompleted,
                       Op(7));
   }
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(5), true, false));
   auto ready = backend_->PollReadyRetires();
   ASSERT_EQ(ready.size(), 1u);
   EXPECT_TRUE(backend_->AcknowledgeReleased(Op(5)));
@@ -256,7 +268,14 @@ TEST_F(EngineFixture, PublishAndRetireRejectDuplicatePhysicalSlotsAtomically) {
 
 TEST_F(EngineFixture, StaleQuarantineCannotAffectReusedGeneration) {
   auto old = Publish("old", 1);
-  ASSERT_EQ(backend_->Retire({old}, Op(3)).state, engine::RetireState::kReady);
+  ASSERT_EQ(backend_->Retire({old}, Op(3)).state, engine::RetireState::kTransitionPending);
+  ASSERT_EQ(backend_->PollTransitionRetires().size(), 1u);
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(3), true, false));
+  ASSERT_TRUE(backend_->ReopenRetireTransition(Op(3)));
+  auto reopened = backend_->PollTransitionRetires();
+  ASSERT_EQ(reopened.size(), 1u);
+  EXPECT_EQ(reopened[0].state, engine::RetireState::kTransitionPending);
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(3), true, false));
   ASSERT_EQ(backend_->PollReadyRetires().size(), 1u);
   ASSERT_TRUE(backend_->AcknowledgeReleased(Op(3)));
   auto current = old;
@@ -269,15 +288,145 @@ TEST_F(EngineFixture, StaleQuarantineCannotAffectReusedGeneration) {
   EXPECT_EQ(backend_->HandleForKey("current"), current);
 }
 
-TEST_F(EngineFixture, DelegatedQuarantineRequiresRanksStrictlyNewerGeneration) {
+TEST_F(EngineFixture, DelegatedQuarantineAcceptsTheReleasedGeneration) {
   auto delegated = backend_->Delegate(7, 1, Op(1));
   ASSERT_TRUE(delegated.success);
-  auto stale = delegated.handles[0];
-  EXPECT_FALSE(backend_->Quarantine({stale}));
-  auto in_use = stale;
-  ++in_use.generation;
-  EXPECT_TRUE(backend_->Quarantine({in_use}));
-  EXPECT_EQ(backend_->State(in_use.page_id), engine::SlotState::kQuarantined);
+  EXPECT_TRUE(backend_->Quarantine({delegated.handles[0]}))
+      << "a late guard for the generation just Released remains rank-authoritative";
+  EXPECT_EQ(backend_->State(delegated.handles[0].page_id), engine::SlotState::kQuarantined);
+}
+
+TEST_F(EngineFixture, RetireQuarantinesOnlyTheInvalidMemberOfAMixedBatch) {
+  auto delegated = backend_->Delegate(7, 2, Op(1));
+  ASSERT_TRUE(delegated.success);
+  auto first = delegated.handles[0];
+  auto second = delegated.handles[1];
+  ++first.generation;
+  ++second.generation;
+  ASSERT_TRUE(backend_
+                  ->PublishResident(
+                      {{"mixed-expired-a", {}, first}, {"mixed-expired-b", {}, second}}, Op(2))
+                  .success);
+  const auto now = GrantTable::Clock::now();
+  auto grant = backend_->Acquire({"reader", "mixed"}, {first}, Op(3), now);
+  ASSERT_TRUE(grant[0].granted);
+  ASSERT_EQ(backend_->ExpireGrants(now + std::chrono::milliseconds(1)),
+            std::vector<engine::AllocationHandle>({first}));
+  ASSERT_EQ(backend_->State(first.page_id), engine::SlotState::kQuarantined);
+
+  auto ticket = backend_->Retire({first, second}, Op(4));
+  ASSERT_EQ(ticket.handles, std::vector<engine::AllocationHandle>({second}));
+  EXPECT_EQ(ticket.state, engine::RetireState::kTransitionPending);
+  auto partial = backend_->PollReadyRetires();
+  ASSERT_EQ(partial.size(), 1u);
+  EXPECT_EQ(partial[0].handles, std::vector<engine::AllocationHandle>({first}));
+  EXPECT_EQ(partial[0].state, engine::RetireState::kQuarantined);
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(4), true, false));
+  auto ready = backend_->PollReadyRetires();
+  ASSERT_EQ(ready.size(), 1u);
+  EXPECT_EQ(ready[0].handles, std::vector<engine::AllocationHandle>({second}));
+  EXPECT_EQ(backend_->State(second.page_id), engine::SlotState::kRetiring);
+}
+
+TEST_F(EngineFixture, ReportedReadyRetireCannotBeReopenedUnderTheRankAck) {
+  auto handle = Publish("reported-ready");
+  ASSERT_EQ(backend_->Retire({handle}, Op(3)).state, engine::RetireState::kTransitionPending);
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(3), true, false));
+  ASSERT_EQ(backend_->PollReadyRetires().size(), 1u);
+  EXPECT_FALSE(backend_->ReopenRetireTransition(Op(3)));
+  EXPECT_TRUE(backend_->AcknowledgeReleased(Op(3)));
+}
+
+TEST_F(EngineFixture, ReportedReadyTicketQuarantinesAsOneImmutableTerminalBatch) {
+  auto delegated = backend_->Delegate(7, 2, Op(1));
+  ASSERT_TRUE(delegated.success);
+  auto first = delegated.handles[0];
+  auto second = delegated.handles[1];
+  ++first.generation;
+  ++second.generation;
+  ASSERT_TRUE(
+      backend_->PublishResident({{"reported-a", {}, first}, {"reported-b", {}, second}}, Op(2))
+          .success);
+  ASSERT_EQ(backend_->Retire({first, second}, Op(3)).state,
+            engine::RetireState::kTransitionPending);
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(3), true, false));
+  auto reported = backend_->PollReadyRetires();
+  ASSERT_EQ(reported.size(), 1u);
+  ASSERT_EQ(reported[0].handles.size(), 2u);
+
+  ASSERT_TRUE(backend_->Quarantine({first}));
+  auto terminal = backend_->PollReadyRetires();
+  ASSERT_EQ(terminal.size(), 1u);
+  EXPECT_EQ(terminal[0].state, engine::RetireState::kQuarantined);
+  EXPECT_EQ(terminal[0].handles, reported[0].handles)
+      << "a ticket already reported to the rank must never shrink under its ACK";
+  EXPECT_EQ(backend_->State(first.page_id), engine::SlotState::kQuarantined);
+  EXPECT_EQ(backend_->State(second.page_id), engine::SlotState::kQuarantined);
+  EXPECT_FALSE(backend_->AcknowledgeReleased(Op(3)));
+}
+
+TEST_F(EngineFixture, MarkReportedReturnsCurrentTicketAfterPartialQuarantineRace) {
+  auto delegated = backend_->Delegate(7, 2, Op(1));
+  ASSERT_TRUE(delegated.success);
+  auto first = delegated.handles[0];
+  auto second = delegated.handles[1];
+  ++first.generation;
+  ++second.generation;
+  ASSERT_TRUE(
+      backend_->PublishResident({{"race-a", {}, first}, {"race-b", {}, second}}, Op(2)).success);
+  ASSERT_EQ(backend_->Retire({first, second}, Op(3)).state,
+            engine::RetireState::kTransitionPending);
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(3), true, false));
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool popped = false;
+  bool allow_mark = false;
+  auto reporter = std::async(std::launch::async, [&] {
+    auto stale = backend_->PollReadyRetires(/*mark_reported=*/false);
+    EXPECT_EQ(stale.front().handles.size(), 2u);
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      popped = true;
+      cv.notify_all();
+      cv.wait(lock, [&] { return allow_mark; });
+    }
+    return backend_->MarkRetireReported(Op(3));
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(1), [&] { return popped; }));
+  }
+  ASSERT_TRUE(backend_->Quarantine({first}));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    allow_mark = true;
+  }
+  cv.notify_all();
+  auto current = reporter.get();
+  ASSERT_TRUE(current.has_value());
+  EXPECT_EQ(current->handles, std::vector<engine::AllocationHandle>{second});
+  auto partial = backend_->PollReadyRetires();
+  ASSERT_EQ(partial.size(), 1u);
+  EXPECT_EQ(partial[0].handles, std::vector<engine::AllocationHandle>{first});
+  EXPECT_TRUE(backend_->AcknowledgeReleased(Op(3)));
+  EXPECT_EQ(backend_->State(second.page_id), engine::SlotState::kDelegated);
+}
+
+TEST_F(EngineFixture, ReportedReadyAckRetriesAfterInternalReadWithoutLeakingTheSlot) {
+  auto handle = Publish("reported-ready-read");
+  ASSERT_EQ(backend_->Retire({handle}, Op(3)).state, engine::RetireState::kTransitionPending);
+  ASSERT_EQ(backend_->PollTransitionRetires().size(), 1u);
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(3), true, false));
+  ASSERT_EQ(backend_->PollReadyRetires().size(), 1u);
+  ResolvedEntry held;
+  ASSERT_TRUE(backend_->AcquireRetireMigrationRead("reported-ready-read", Op(3), &held));
+  EXPECT_FALSE(backend_->AcknowledgeReleased(Op(3)))
+      << "rank retries a transient ACK rejection; it does not fail-stop";
+  EXPECT_EQ(backend_->State(handle.page_id), engine::SlotState::kRetiring);
+  backend_->ReleaseMigrationRead("reported-ready-read");
+  EXPECT_TRUE(backend_->AcknowledgeReleased(Op(3)));
+  EXPECT_EQ(backend_->State(handle.page_id), engine::SlotState::kDelegated);
 }
 
 TEST_F(EngineFixture, UnknownGrantCompletionQuarantinesAndLogicalClearDoesNotRevive) {
@@ -301,6 +450,16 @@ TEST_F(EngineFixture, ExpiredGrantQuarantinesInsteadOfAuthorizingReuse) {
   ASSERT_EQ(expired.size(), 1u);
   EXPECT_EQ(backend_->State(handle.page_id), engine::SlotState::kQuarantined);
   EXPECT_TRUE(backend_->PollReadyRetires().empty());
+}
+
+TEST_F(EngineFixture, ExpiringSeveralReadersDeduplicatesTheQuarantineHandle) {
+  auto handle = Publish("expired-many");
+  const auto now = GrantTable::Clock::now();
+  ASSERT_TRUE(backend_->Acquire({"reader-a", "req"}, {handle}, Op(3), now)[0].granted);
+  ASSERT_TRUE(backend_->Acquire({"reader-b", "req"}, {handle}, Op(4), now)[0].granted);
+  auto expired = backend_->ExpireGrants(now);
+  ASSERT_EQ(expired, std::vector<engine::AllocationHandle>{handle});
+  EXPECT_EQ(backend_->State(handle.page_id), engine::SlotState::kQuarantined);
 }
 
 TEST_F(EngineFixture, ShutdownIsTerminalAndPreservesQuarantineAndGeneration) {
@@ -339,6 +498,7 @@ TEST_F(EngineFixture, AckWatermarkKeepsOperationHistoryAndReadyChecksBounded) {
     auto released = backend_->Release({"reader", request}, {grant[0].id},
                                       engine::CompletionProof::kCompleted, release_op);
     ASSERT_TRUE(released[0].released);
+    ASSERT_TRUE(backend_->CompleteRetireTransition(retire_op, true, false));
     ASSERT_EQ(backend_->PollReadyRetires().size(), 1u);
     ASSERT_TRUE(backend_->AcknowledgeReleased(retire_op));
     backend_->AdvanceAckWatermark(release_op);
@@ -360,7 +520,8 @@ TEST_F(EngineFixture, AckWatermarkKeepsOperationHistoryAndReadyChecksBounded) {
 
 TEST_F(EngineFixture, AckWatermarkDoesNotDropAnUnconsumedReadyRetire) {
   auto handle = Publish("ready-before-watermark");
-  ASSERT_EQ(backend_->Retire({handle}, Op(3)).state, engine::RetireState::kReady);
+  ASSERT_EQ(backend_->Retire({handle}, Op(3)).state, engine::RetireState::kTransitionPending);
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(3), true, false));
   backend_->AdvanceAckWatermark(Op(10));
   auto ready = backend_->PollReadyRetires();
   ASSERT_EQ(ready.size(), 1u);
@@ -370,9 +531,179 @@ TEST_F(EngineFixture, AckWatermarkDoesNotDropAnUnconsumedReadyRetire) {
   EXPECT_EQ(backend_->HistoryStats().retire_records, 0u);
 }
 
+TEST_F(EngineFixture, F3SafeRefusalMakesRetireReadyWithoutQuarantine) {
+  auto handle = Publish("safe-f3-refusal");
+  ASSERT_EQ(backend_->Retire({handle}, Op(3)).state, engine::RetireState::kTransitionPending);
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(3), /*success=*/false,
+                                                 /*unknown=*/false));
+  auto ready = backend_->PollReadyRetires();
+  ASSERT_EQ(ready.size(), 1u);
+  EXPECT_EQ(ready[0].state, engine::RetireState::kReady);
+  EXPECT_EQ(backend_->State(handle.page_id), engine::SlotState::kRetiring);
+  EXPECT_TRUE(backend_->AcknowledgeReleased(Op(3)));
+  EXPECT_EQ(backend_->State(handle.page_id), engine::SlotState::kDelegated);
+}
+
+TEST_F(EngineFixture, ResetIsBusyWithGrantThenSealsAndCommitsOneRank) {
+  auto handle = Publish("reset-key");
+  auto grant = backend_->Acquire({"reader", "req"}, {handle}, Op(3),
+                                 GrantTable::Clock::now() + std::chrono::seconds(1));
+  ASSERT_TRUE(grant[0].granted);
+
+  auto busy = backend_->BeginReset(Op(4));
+  EXPECT_FALSE(busy.ready);
+  auto after_busy = backend_->Acquire({"reader-2", "req"}, {handle}, Op(5),
+                                      GrantTable::Clock::now() + std::chrono::seconds(1));
+  ASSERT_TRUE(after_busy[0].granted) << "Busy must cancel the seal before replying";
+  backend_->Release({"reader", "req"}, {grant[0].id}, engine::CompletionProof::kCompleted, Op(6));
+  backend_->Release({"reader-2", "req"}, {after_busy[0].id}, engine::CompletionProof::kCompleted,
+                    Op(7));
+
+  auto ready = backend_->BeginReset(Op(8));
+  ASSERT_TRUE(ready.ready);
+  EXPECT_EQ(ready.new_epoch.reset_seq, ready.old_epoch.reset_seq + 1);
+  EXPECT_FALSE(backend_->Delegate(7, 1, Op(9)).success);
+  engine::PoolEpoch committed;
+  std::vector<std::string> removed;
+  ASSERT_TRUE(backend_->FinishReset(ready.id, true, &committed, &removed));
+  EXPECT_EQ(committed, ready.new_epoch);
+  EXPECT_EQ(removed, std::vector<std::string>{"reset-key"});
+  EXPECT_FALSE(backend_->Contains("reset-key"));
+  EXPECT_EQ(backend_->State(handle.page_id), engine::SlotState::kDelegated);
+}
+
+TEST_F(EngineFixture, ReadyResetPublishesAStableApprovedSnapshotThatOnlyShrinks) {
+  auto delegated = backend_->Delegate(7, 2, Op(1));
+  ASSERT_TRUE(delegated.success);
+  auto published = delegated.handles[0];
+  ++published.generation;
+  ASSERT_TRUE(backend_->PublishResident({{"reset-approved", {}, published}}, Op(2)).success);
+
+  auto lease = backend_->BeginReset(Op(3));
+  ASSERT_TRUE(lease.ready);
+  ASSERT_EQ(lease.approved.size(), 2u);
+  EXPECT_NE(std::find_if(lease.approved.begin(), lease.approved.end(),
+                         [&](const auto& handle) {
+                           return handle.page_id == published.page_id &&
+                                  handle.generation == published.generation;
+                         }),
+            lease.approved.end());
+
+  ASSERT_TRUE(backend_->Quarantine({published}));
+  auto replay = backend_->BeginReset(Op(3));
+  ASSERT_TRUE(replay.ready);
+  ASSERT_EQ(replay.approved.size(), 1u);
+  EXPECT_NE(replay.approved[0].page_id, published.page_id);
+  auto notices = backend_->DrainQuarantineNotices();
+  ASSERT_EQ(notices.size(), 1u);
+  EXPECT_EQ(notices[0].page_id, published.page_id)
+      << "the owning rank must be told when the Ready snapshot shrinks";
+
+  engine::PoolEpoch epoch;
+  std::vector<std::string> removed;
+  std::vector<engine::AllocationHandle> approved;
+  ASSERT_TRUE(backend_->FinishReset(lease.id, true, &epoch, &removed, &approved));
+  ASSERT_EQ(approved.size(), 1u);
+  EXPECT_EQ(approved[0].page_id, replay.approved[0].page_id);
+  EXPECT_EQ(approved[0].epoch, epoch);
+}
+
+TEST_F(EngineFixture, ResetSealRejectsNewMigrationAndCommitRechecksHolds) {
+  auto handle = Publish("migration-reset");
+  ResolvedEntry held;
+  ASSERT_TRUE(backend_->AcquireMigrationRead("migration-reset", &held, true));
+  EXPECT_FALSE(backend_->BeginReset(Op(3)).ready);
+  backend_->ReleaseMigrationRead("migration-reset");
+  auto lease = backend_->BeginReset(Op(4));
+  ASSERT_TRUE(lease.ready);
+  ResolvedEntry blocked;
+  EXPECT_FALSE(backend_->AcquireMigrationRead("migration-reset", &blocked, true));
+  engine::PoolEpoch epoch;
+  std::vector<std::string> removed;
+  std::vector<engine::AllocationHandle> approved;
+  EXPECT_TRUE(backend_->FinishReset(lease.id, true, &epoch, &removed, &approved));
+  EXPECT_EQ(approved.size(), 1u);
+  EXPECT_EQ(backend_->State(handle.page_id), engine::SlotState::kDelegated);
+}
+
+TEST_F(EngineFixture, RetireWaitsForIoHoldAndUnknownCompletionQuarantines) {
+  auto handle = Publish("io-key");
+  ASSERT_TRUE(backend_->HoldIO({handle}, Op(3)));
+  auto ticket = backend_->Retire({handle}, Op(4));
+  EXPECT_EQ(ticket.state, engine::RetireState::kWaitingHolds);
+  EXPECT_TRUE(backend_->PollReadyRetires().empty());
+  ASSERT_TRUE(backend_->CompleteIO(Op(3), engine::CompletionProof::kUnknown));
+  EXPECT_EQ(backend_->State(handle.page_id), engine::SlotState::kQuarantined);
+  auto quarantined = backend_->PollReadyRetires();
+  ASSERT_EQ(quarantined.size(), 1u);
+  EXPECT_EQ(quarantined[0].state, engine::RetireState::kQuarantined);
+  auto reset = backend_->BeginReset(Op(5));
+  ASSERT_TRUE(reset.ready) << "holds retained only by quarantined pages must not block reset";
+  engine::PoolEpoch epoch;
+  std::vector<std::string> removed;
+  std::vector<engine::AllocationHandle> approved;
+  ASSERT_TRUE(backend_->FinishReset(reset.id, true, &epoch, &removed, &approved));
+  EXPECT_EQ(backend_->State(handle.page_id), engine::SlotState::kQuarantined);
+  EXPECT_TRUE(std::none_of(approved.begin(), approved.end(),
+                           [&](const auto& item) { return item.page_id == handle.page_id; }));
+}
+
+TEST_F(EngineFixture, QuarantiningOnePageDoesNotStrandTheRestOfARetireBatch) {
+  auto delegated = backend_->Delegate(7, 2, Op(1));
+  ASSERT_TRUE(delegated.success);
+  auto first = delegated.handles[0];
+  auto second = delegated.handles[1];
+  ++first.generation;
+  ++second.generation;
+  ASSERT_TRUE(
+      backend_->PublishResident({{"multi-a", {}, first}, {"multi-b", {}, second}}, Op(2)).success);
+  ASSERT_EQ(backend_->Retire({first, second}, Op(3)).state,
+            engine::RetireState::kTransitionPending);
+  ASSERT_TRUE(backend_->Quarantine({first}));
+  auto partial = backend_->PollReadyRetires();
+  ASSERT_EQ(partial.size(), 1u);
+  EXPECT_EQ(partial[0].state, engine::RetireState::kQuarantined);
+  EXPECT_EQ(partial[0].handles, std::vector<engine::AllocationHandle>{first});
+  ASSERT_TRUE(backend_->CompleteRetireTransition(Op(3), true, false));
+  auto ready = backend_->PollReadyRetires();
+  ASSERT_EQ(ready.size(), 1u);
+  EXPECT_EQ(ready[0].handles, std::vector<engine::AllocationHandle>{second});
+  ASSERT_TRUE(backend_->AcknowledgeReleased(Op(3)));
+  EXPECT_EQ(backend_->State(first.page_id), engine::SlotState::kQuarantined);
+  EXPECT_EQ(backend_->State(second.page_id), engine::SlotState::kDelegated);
+}
+
+TEST_F(EngineFixture, UnknownMigrationHoldIsScopedToTheOldPageGeneration) {
+  auto old = Publish("reused-key");
+  ASSERT_EQ(backend_->Retire({old}, Op(3)).state, engine::RetireState::kTransitionPending);
+  ResolvedEntry old_read;
+  ASSERT_TRUE(backend_->AcquireRetireMigrationRead("reused-key", Op(3), &old_read));
+  ASSERT_TRUE(backend_->Quarantine({old}));
+  (void)backend_->PollReadyRetires();
+
+  auto delegated = backend_->Delegate(7, 1, Op(4));
+  ASSERT_TRUE(delegated.success);
+  auto current = delegated.handles[0];
+  ++current.generation;
+  ASSERT_TRUE(backend_->PublishResident({{"reused-key", {}, current}}, Op(5)).success);
+  EXPECT_EQ(backend_->Retire({current}, Op(6)).state, engine::RetireState::kTransitionPending);
+}
+
+TEST_F(EngineFixture, RetireDuringResetSealReturnsBusyWithoutChangingTheSlot) {
+  auto handle = Publish("sealed-retire");
+  auto reset = backend_->BeginReset(Op(3));
+  ASSERT_TRUE(reset.ready);
+  auto retire = backend_->Retire({handle}, Op(4));
+  EXPECT_EQ(retire.state, engine::RetireState::kBusy);
+  EXPECT_EQ(backend_->State(handle.page_id), engine::SlotState::kPublished);
+  engine::PoolEpoch epoch;
+  std::vector<std::string> removed;
+  EXPECT_TRUE(backend_->FinishReset(reset.id, false, &epoch, &removed));
+}
+
 TEST_F(EngineFixture, LegacyDataPlaneCannotBypassNegotiatedEngineProtocol) {
   EXPECT_EQ(backend_->BatchAllocate({{"x", 10}})[0].outcome, AllocateOutcome::kFailed);
-  EXPECT_EQ(backend_->BatchResolve({"x"}, true)[0].outcome, ResolveOutcome::kFailed);
+  EXPECT_EQ(backend_->BatchResolve({"x"}, true)[0].outcome, ResolveOutcome::kMissing);
   EXPECT_EQ(backend_->Evict({"x"})[0].bytes_freed, 0u);
 }
 
@@ -399,11 +730,52 @@ TEST_F(EngineFixture, PeerPoolOwnsPublishedResidencyUntilReleasedAck) {
   auto released = pool.ReleaseEngineGrants(backend_id, {"reader", "request"}, {grant[0].id},
                                            engine::CompletionProof::kCompleted, Op(24));
   ASSERT_TRUE(released[0].released);
-  ASSERT_EQ(pool.PollReadyEngineRetires(backend_id).size(), 1u);
+  auto ready = pool.PollReadyEngineRetires(backend_id);
+  ASSERT_EQ(ready.size(), 1u);
+  EXPECT_EQ(ready.front().state, engine::RetireState::kReady);
   EXPECT_TRUE(pool.AcknowledgeEngineReleased(backend_id, Op(23)));
   EXPECT_TRUE(pool.AcknowledgeEngineReleased(backend_id, Op(23)));
   EXPECT_TRUE(pool.ResidencyBackends("pool-key").empty());
   EXPECT_EQ(engine_backend->State(handle.page_id), engine::SlotState::kDelegated);
+}
+
+TEST_F(EngineFixture, PeerPoolMaintenanceExpiresGrantAndRefreshesResidency) {
+  BackendRegistry registry;
+  auto* engine_backend = backend_.get();
+  ASSERT_TRUE(registry.Register(
+      "engine", MakeInstrumentedBackend(std::unique_ptr<MediumBackend>(backend_.release()))));
+  const uint32_t backend_id = registry.BackendId(registry.Get("engine"));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  auto delegated = engine_backend->Delegate(7, 1, Op(30));
+  ASSERT_TRUE(delegated.success);
+  auto handle = delegated.handles[0];
+  handle.generation = 1;
+  ASSERT_TRUE(pool.PublishResident(backend_id, {{"ttl-key", {}, handle}}, Op(31)).success);
+  auto grant = pool.AcquireEngineGrants(backend_id, {"reader", "ttl"}, {handle}, Op(32),
+                                        GrantTable::Clock::now());
+  ASSERT_TRUE(grant[0].granted);
+  pool.RunEngineMaintenanceForTest();
+  EXPECT_EQ(engine_backend->State(handle.page_id), engine::SlotState::kQuarantined);
+  EXPECT_TRUE(pool.ResidencyBackends("ttl-key").empty());
+}
+
+TEST_F(EngineFixture, PeerPoolRejectsLegacyClearWhileEngineBackendIsActive) {
+  BackendRegistry registry;
+  auto* engine_backend = backend_.get();
+  ASSERT_TRUE(registry.Register(
+      "engine", MakeInstrumentedBackend(std::unique_ptr<MediumBackend>(backend_.release()))));
+  const uint32_t backend_id = registry.BackendId(registry.Get("engine"));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  auto delegated = engine_backend->Delegate(7, 1, Op(40));
+  ASSERT_TRUE(delegated.success);
+  auto handle = delegated.handles[0];
+  ++handle.generation;
+  ASSERT_TRUE(pool.PublishResident(backend_id, {{"clear-rejected", {}, handle}}, Op(41)).success);
+  const auto started = std::chrono::steady_clock::now();
+  EXPECT_FALSE(pool.ClearLocal());
+  EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::milliseconds(100));
+  EXPECT_TRUE(engine_backend->Contains("clear-rejected"));
+  EXPECT_EQ(engine_backend->State(handle.page_id), engine::SlotState::kPublished);
 }
 
 }  // namespace

@@ -77,6 +77,16 @@ struct PoolResolvedEntry {
   ResolvedEntry resolved;
 };
 
+struct LoadSourceGrantResult {
+  bool granted = false;
+  GrantId id;
+  uint32_t backend_id = BackendRegistry::kMaxBackends;
+  bool engine = false;
+  std::optional<engine::AllocationHandle> source;
+  ObjectView view;
+  std::string executor_id;
+};
+
 // What PeerPool::Evict did with one request.
 enum class PoolEvictOutcome {
   kNone,            // nothing freed: no such copy, or a read lease / pin holds it
@@ -116,8 +126,16 @@ struct PoolEvictRequest {
 // compatible while creating the seam for weighted and tiered policies.
 class PeerPool {
  public:
+  struct RetirePreservationConfig {
+    size_t max_inflight = 8;
+    std::chrono::milliseconds retry_timeout{30000};
+    uint8_t max_attempts = 8;
+  };
+
   PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy,
            TransferEngine* transfer_engine = nullptr);
+  PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy,
+           TransferEngine* transfer_engine, RetirePreservationConfig retire_config);
   ~PeerPool();
 
   BackendRegistry* Backends() const { return backends_; }
@@ -138,6 +156,8 @@ class PeerPool {
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
   PublishResult PublishResident(uint32_t backend_id, const std::vector<ResidentRecord>& records,
                                 engine::OperationId operation);
+  DelegateResult DelegateEnginePages(uint32_t backend_id, engine::RankId rank, size_t count,
+                                     engine::OperationId operation);
   std::vector<GrantResult> AcquireEngineGrants(uint32_t backend_id, const ReaderIdentity& reader,
                                                const std::vector<engine::AllocationHandle>& handles,
                                                engine::OperationId operation,
@@ -147,12 +167,32 @@ class PeerPool {
                                                       const std::vector<GrantId>& grants,
                                                       engine::CompletionProof proof,
                                                       engine::OperationId operation);
+  std::vector<LoadSourceGrantResult> AcquireLoadSources(
+      const ReaderIdentity& reader, const std::vector<std::string>& keys,
+      const std::vector<uint32_t>& preferred_backends, const std::vector<TierType>& preferred_tiers,
+      engine::OperationId operation, GrantTable::Clock::time_point expires_at);
+  std::vector<bool> ReleaseLoadSources(const ReaderIdentity& reader,
+                                       const std::vector<engine::LoadGrantRef>& grants,
+                                       engine::CompletionProof proof,
+                                       engine::OperationId operation);
   engine::RetireTicket RetireEnginePages(uint32_t backend_id,
                                          const std::vector<engine::AllocationHandle>& handles,
                                          engine::OperationId operation);
   std::vector<engine::RetireTicket> PollReadyEngineRetires(uint32_t backend_id);
+  std::vector<engine::AllocationHandle> PollEngineQuarantines(uint32_t backend_id);
   bool AcknowledgeEngineReleased(uint32_t backend_id, engine::OperationId operation);
   void AdvanceEngineAckWatermark(uint32_t backend_id, engine::OperationId watermark);
+  engine::ResetLease BeginEngineReset(uint32_t backend_id, engine::OperationId operation);
+  bool FinishEngineReset(uint32_t backend_id, engine::OperationId lease, bool commit,
+                         engine::PoolEpoch* epoch,
+                         std::vector<engine::AllocationHandle>* approved = nullptr);
+  bool HoldEngineIO(uint32_t backend_id, const std::vector<engine::AllocationHandle>& handles,
+                    engine::OperationId operation);
+  bool CompleteEngineIO(uint32_t backend_id, engine::OperationId hold,
+                        engine::CompletionProof proof);
+  bool QuarantineEnginePages(uint32_t backend_id,
+                             const std::vector<engine::AllocationHandle>& handles);
+  void RefreshBackendResidencies(uint32_t backend_id);
   // Copies keys held on SSD into DRAM of the same tier, else of a tier above, so
   // the coming read is served from DRAM. The SSD copy stays, and the oldest
   // prefetched copies are dropped past `budget_bytes`. Returns the keys copied.
@@ -164,7 +204,7 @@ class PeerPool {
                                      PoolEvictMode mode);
   // Every key unscoped: freed from the medium that currently holds it.
   std::vector<PoolEvictResult> Evict(const std::vector<std::string>& keys, PoolEvictMode mode);
-  void ClearLocal();
+  bool ClearLocal();
   std::vector<KvEvent> DrainPendingEvents();
   std::vector<KvEvent> SnapshotOwnedKeysForFullSync();
   std::map<std::string, LogicalTierCapacity> LogicalTierCapacities() const;
@@ -185,6 +225,19 @@ class PeerPool {
   LocalEvictionMetrics LocalEvictionStats() const;
   // Test seam: one synchronous pass.  Returns keys dropped or queued.
   size_t RunLocalEvictionOnceForTest() { return LocalEvictionPass(); }
+  void RunEngineMaintenanceForTest() { RunEngineMaintenance(); }
+#ifdef MORI_UMBP_TESTING
+  uint64_t EngineMaintenanceRoundsForTest() const { return engine_maintenance_rounds_.load(); }
+  size_t TransitionWorkerCountForTest() const { return transition_workers_.size(); }
+  uint64_t F3ScheduleChecksForTest() const { return f3_schedule_checks_.load(); }
+  std::vector<std::string> AccessOrderForTest() const {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    return {access_order_.begin(), access_order_.end()};
+  }
+  void SetBeforeF3RunHookForTest(std::function<void(const std::string&)> hook) {
+    before_f3_run_hook_ = std::move(hook);
+  }
+#endif
   // UMBP_EVICT_DEMOTION_RETRY_MS override; set it before queueing work.
   void SetEvictDemotionRetryBudgetForTest(std::chrono::milliseconds budget) {
     evict_demotion_retry_budget_ = budget;
@@ -196,6 +249,9 @@ class PeerPool {
   using EvictionCandidateSource = std::function<std::optional<std::vector<EvictionOffer>>(
       TierType tier, const std::string& logical_tier, uint64_t bytes)>;
   void SetEvictionCandidateSource(EvictionCandidateSource source);
+  // Batched demand-read/DRAM-handoff reports; invoked outside operation_mutex_.
+  using LocalReadReporter = std::function<void(const std::vector<std::string>&)>;
+  void SetLocalReadReporter(LocalReadReporter reporter);
 
  private:
   struct PendingPlacement {
@@ -216,6 +272,10 @@ class PeerPool {
     // Set by an explicit caller (cleaning/retirement); absent preserves the
     // tier graph's legacy promotion/offload policy.
     std::optional<TierTransitionIntent> intent;
+    std::optional<engine::OperationId> retire_operation;
+    std::optional<engine::AllocationHandle> retire_source;
+    uint32_t retire_backend_id = BackendRegistry::kMaxBackends;
+    bool f3_preservation = false;
   };
 
   // What the copy phase needs, resolved while the pool lock is still held.
@@ -229,6 +289,8 @@ class PeerPool {
   bool EnqueueTransition(TransitionJob job);
   bool TransitionQueued(const std::string& key);  // queued or running
   void TransitionWorkerLoop();
+  void RunEngineMaintenance();
+  void EngineMaintenanceLoop();
   void StopTransitionWorker();
   void DropEvictedCopyLocked(const TransitionJob& job);
 
@@ -246,6 +308,10 @@ class PeerPool {
                                                              std::chrono::milliseconds wait);
 
   void TouchLocked(const std::string& key);
+  void RefreshDramHandoffLocked(
+      const std::vector<std::string>& released_keys,
+      const std::vector<std::pair<uint32_t, std::string>>& backing_holds,
+      std::vector<std::string>* reports);
   void ForgetAccessLocked(const std::string& key);
   // Whether this read should promote the key out of `source_tier`, per that
   // tier's trigger. Counts the read for an kOnHits tier, so call it once per read.
@@ -274,6 +340,23 @@ class PeerPool {
   bool WatermarkDrivenLocked(const TransitionJob& job) const;
   TransitionPlan PlanTransitionLocked(const TransitionJob& job);
   void FinishTransitionLocked(const TransitionJob& job, const TierTransitionResult& result);
+  void ProcessEngineRetires(uint32_t backend_id);
+  bool ScheduleF3LeaderLocked(const std::string& key, const std::string& record_key);
+  void ReevaluatePendingRetiresLocked();
+  bool QualifiedReplicaLocked(const std::string& key, uint32_t source_backend_id,
+                              const std::string& retire_record);
+  void AddPendingRetireKeyLocked(const std::string& record_key, const std::string& key);
+  void RemovePendingRetireKeyLocked(const std::string& record_key, const std::string& key);
+  void FinalizeRetireRecordLocked(const std::string& record_key, bool success);
+  void ReleaseBackingHoldsLocked(std::vector<std::pair<uint32_t, std::string>>* backing_holds);
+  void PreserveBackingHoldsLocked(const std::string& record_key,
+                                  std::vector<std::pair<uint32_t, std::string>>* backing_holds);
+  void FinishF3LeaderLocked(const std::string& key);
+  void SatisfyRetireKeyLocked(const TransitionJob& job);
+  void SourceMissingRetireKeyLocked(const TransitionJob& job);
+  void QuarantineRetireSourceLocked(const TransitionJob& job);
+  void RejectRetireKeyLocked(const std::string& key);
+  static std::string RetireRecordKey(uint32_t backend_id, engine::OperationId operation);
   // Plans under `lock`, releases it for the byte copy, then reacquires it to
   // publish the outcome. Holding it across the copy would stall every
   // allocate / commit / resolve on the peer for the duration of an SSD write.
@@ -338,6 +421,7 @@ class PeerPool {
   std::vector<std::chrono::steady_clock::time_point> tier_scan_backoff_;
   TierTransitionMetrics transition_metrics_;
   std::map<std::string, uint64_t> tier_read_hits_;
+  LocalReadReporter local_read_reporter_;  // operation_mutex_
   // Invalidates a resolve plan if a clear completed while it was dispatched.
   uint64_t clear_epoch_ = 0;
 
@@ -349,8 +433,49 @@ class PeerPool {
   // no rescan, which is what keeps repeated commits off the placement map.
   std::vector<size_t> queued_by_tier_;
   bool stop_transition_worker_ = false;
-  std::thread transition_worker_;
+  std::vector<std::thread> transition_workers_;
+  std::mutex maintenance_mutex_;
+  std::condition_variable maintenance_cv_;
+  bool stop_maintenance_ = false;
+  std::thread maintenance_thread_;
+  std::atomic<uint64_t> engine_maintenance_rounds_{0};
   std::chrono::milliseconds evict_demotion_retry_budget_{30000};  // transition worker only
+  RetirePreservationConfig retire_config_;
+  std::atomic<size_t> f3_inflight_{0};
+  std::atomic<uint64_t> f3_schedule_checks_{0};
+  struct PendingRetirePreservation {
+    uint32_t backend_id = BackendRegistry::kMaxBackends;
+    engine::OperationId operation;
+    std::unordered_set<std::string> pending_keys;
+    std::vector<std::pair<uint32_t, std::string>> backing_holds;
+    bool ticket_already_ready = false;
+  };
+  std::unordered_map<std::string, PendingRetirePreservation> retire_preservations_;
+  struct F3Leader {
+    uint32_t backend_id = BackendRegistry::kMaxBackends;
+    engine::OperationId operation;
+    std::string record_key;
+    engine::AllocationHandle source;
+  };
+  std::unordered_map<std::string, F3Leader> f3_leaders_;
+  std::deque<std::pair<std::string, std::string>> pending_retire_fifo_;
+  std::unordered_set<std::string> queued_retire_keys_;
+  std::unordered_map<std::string, std::unordered_set<std::string>> retire_waiters_;
+  std::unordered_map<std::string, std::vector<std::pair<uint32_t, std::string>>>
+      retire_backing_holds_;
+  struct DramLoadGrant {
+    ReaderIdentity reader;
+    std::string key;
+    uint32_t backend_id = BackendRegistry::kMaxBackends;
+    std::shared_ptr<const void> hold;
+    GrantTable::Clock::time_point expires_at;
+    bool unknown = false;
+  };
+  uint64_t next_dram_load_grant_ = uint64_t{1} << 63;
+  std::unordered_map<uint64_t, DramLoadGrant> dram_load_grants_;
+#ifdef MORI_UMBP_TESTING
+  std::function<void(const std::string&)> before_f3_run_hook_;
+#endif
 
   // Local watermark eviction.  local_evict_mutex_ guards local_evict_,
   // stop_local_evict_ and the worker's start.
