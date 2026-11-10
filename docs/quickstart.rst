@@ -152,15 +152,14 @@ See :doc:`MORI-IR Guide <MORI-IR-GUIDE>` for full device function table and non-
 Profiling with MORI-VIZ
 -------------------------
 
-Capture warp-level kernel traces. Build with ``ENABLE_PROFILER=ON``, and keep
-it set when you run, so the JIT compiles the instrumented kernels:
+Capture warp-level kernel traces (build with ``ENABLE_PROFILER=ON``):
 
 .. code-block:: python
 
    from mori.kernel_profiler import export_to_perfetto
 
-   # After running dispatch/combine with an EpDispatchCombineOp `op`:
-   trace_buffer = op.get_debug_time_buf()
+   # After running dispatch/combine:
+   trace_buffer = mori.cpp.get_debug_time_buf(op._handle)
    export_to_perfetto(trace_buffer, "ep_trace.json")
 
    # Visualize at https://ui.perfetto.dev/

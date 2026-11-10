@@ -38,8 +38,7 @@ Every `UMBP_*` env var referenced below is documented in
 - NFS mount shared between all nodes (for logs, results, and mori/sglang source)
 - SSH key access from the local machine to all nodes
 - Docker with ROCm image available on all nodes
-- mori built with UMBP (`BUILD_UMBP=ON`, Step 3 below). UMBP needs the gRPC and
-  Protobuf development packages; without them the build skips UMBP with a warning.
+- mori built with `UMBP=ON` (Step 3 below)
 - SGLang checked out at `$NFS_BASE/sglang` with `benchmark/hicache/run_pd_disagg_bench_dp8ep8.sh`
   supporting both `PREFILL_URLS` (space-separated N prefill URLs) and the
   `wait_for_router_workers` gate (polls `/get_loads` after router is ready)
@@ -247,18 +246,14 @@ echo "=== Prometheus: http://${IP_DECODE}:9090 ==="
 
 ## Step 3 — Build mori on all nodes
 
-Clears the per-node build directory so cmake starts clean, then builds and installs
-mori with UMBP enabled. `MORI_PYBUILD_DIR` keeps each node's build in its own
-directory of the shared checkout, which is where the launchers below find
-`umbp_master` (`build_<hostname>/src/umbp/umbp_master`).
+Clears the per-node build directory so cmake starts clean, then builds with UMBP enabled.
 Builds run in parallel across every prefill node and the decode node.
 
 ```bash
 for NODE in "${ALL_NODES[@]}"; do
   $SSH $NODE "docker exec $CONTAINER bash -c '
     rm -rf ${NFS_BASE}/mori/build_\$(hostname) &&
-    cd ${NFS_BASE}/mori &&
-    MORI_PYBUILD_DIR=build_\$(hostname) BUILD_UMBP=ON pip install .'" &
+    cd ${NFS_BASE}/mori && UMBP=ON bash build.sh'" &
 done
 wait
 echo "mori builds done on ${#ALL_NODES[@]} node(s)"

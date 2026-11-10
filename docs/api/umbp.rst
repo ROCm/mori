@@ -86,7 +86,7 @@ The server exits cleanly on ``SIGINT`` / ``SIGTERM`` (e.g. ``Ctrl-C`` or ``kill`
 .. code-block:: bash
 
    mkdir -p build && cd build
-   cmake .. -DBUILD_UMBP=ON
+   cmake .. -DUMBP=ON
    make -j$(nproc) umbp_master
 
 The Python ``mori.umbp`` package auto-detects ``umbp_master`` packaged inside the
@@ -460,9 +460,10 @@ the one whose behaviour matches what you want:
   distinguish the two (e.g. surface oversized-batch errors), call through
   ``UMBPMasterClient`` instead.
 
-In standalone-process mode the data-plane client is a
-``StandaloneProcessClient``, which forwards both methods to the node's
-standalone server over gRPC.
+Both methods are also defined on ``StandaloneClient``, but the standalone
+implementation is a stub that always returns an empty list and never
+contacts a master — it exists only so the ``IUMBPClient`` interface stays
+uniform for non-distributed deployments.
 
 For placement writes, use ``UMBPMasterClient.report_external_kv_blocks(node_id,
 hashes, tier)`` when a scheduler or sidecar reports on behalf of a registered

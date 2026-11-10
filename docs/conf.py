@@ -83,9 +83,7 @@ html_theme_options = {
     "prev_next_buttons_location": "bottom",
     "style_external_links": False,
     "style_nav_header_background": "#C00000",  # AMD Red
-    # Expand only the current page's sections; expanding every page's put ~330
-    # entries in the sidebar of every page.
-    "collapse_navigation": True,
+    "collapse_navigation": False,
     "sticky_navigation": True,
     "navigation_depth": 4,
     "includehidden": True,

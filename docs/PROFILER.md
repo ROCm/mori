@@ -125,10 +125,6 @@ cmake -DENABLE_PROFILER=ON -B build -S .
 cmake --build build
 ```
 
-The device kernels are JIT-compiled when first used, so keep `ENABLE_PROFILER=ON`
-set when you run as well. Without it the JIT builds the uninstrumented kernels;
-the two builds are cached separately, so switching does not need a cache clear.
-
 ### Code Generation
 
 The profiler relies on a code generation script `tools/profiler/generate_profiler_bindings.py`. This script:
@@ -151,9 +147,9 @@ from mori.kernel_profiler import export_to_perfetto
 op = mori.ops.EpDispatchCombineOp(config)
 # ... run dispatch/combine ...
 
-# The trace buffer as a torch.Tensor (only available when built with ENABLE_PROFILER=ON)
+# Get debug buffer from handle (only available when ENABLE_PROFILER=ON)
 if hasattr(mori.cpp, "get_debug_time_buf"):
-    trace_buffer = op.get_debug_time_buf()
+    trace_buffer = mori.cpp.get_debug_time_buf(op._handle)
 
     # Option 1: Auto-discover all slots (simplest, recommended)
     export_to_perfetto(trace_buffer, "trace.json")
@@ -189,12 +185,12 @@ Pass the value to `export_to_perfetto`:
 -   **Conditional Compilation**: The `ENABLE_PROFILER` macro controls whether profiling code is compiled. In production builds, this is typically disabled to ensure zero overhead.
 -   **Buffer Limits**: Each warp can store up to 16384 events in a circular buffer. The system supports up to 4096 warps per rank by default. If profiling long-running kernels or multiple iterations, clear the buffer between runs to avoid data overlap:
     ```python
-    trace_buffer = op.get_debug_time_buf()
+    trace_buffer = mori.cpp.get_debug_time_buf(handle)
     trace_buffer.zero_()  # Clear before next profiled iteration
 
     # Also clear the offset buffer if needed
     if hasattr(mori.cpp, "get_debug_time_offset"):
-        offset_buffer = op.get_debug_time_offset()
+        offset_buffer = mori.cpp.get_debug_time_offset(handle)
         offset_buffer.zero_()
     ```
 -   **Single Iteration for Profiling**: When profiling, consider running only one iteration to get a clean trace without buffer wraparound.

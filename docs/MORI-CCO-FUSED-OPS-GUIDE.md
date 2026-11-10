@@ -14,10 +14,9 @@ transfer with the GEMM instead of running it before or after.
 | all-gather + GEMM | `AgGemmOp` | `mori.ops.ag_gemm` | ColumnParallelLinear after sequence parallelism | `A [M, K]`, its `B [N, K]` shard | `[P*M, N]`: every token times its shard |
 | all-to-all + GEMM | `A2aGemmOp` | `mori.ops.a2a_gemm` | o-projection under Ulysses SP | `[P*M, K/P]` (all tokens, its heads), the same `B [N, K]` | `[M, N]`, its tokens over all of K |
 
-`P` is the number of ranks and `M` is rows per rank. Every operator except
-`GemmAllReduceOp` and `GemmReduceScatterOp` also has a `mode="split"` (GEMM and
-transfer run back to back over the same window) as a baseline and a fallback.
-All measurements are on **MI355X (gfx950)**.
+`P` is the number of ranks and `M` is rows per rank. Every operator also has a
+`mode="split"` (GEMM and transfer run back to back over the same window) as a
+baseline and a fallback. All measurements are on **MI355X (gfx950)**.
 
 Each operator's README, next to its code, has the full design, every
 measurement table and the negative results:
@@ -74,10 +73,8 @@ The per-operator sections give the small-M numbers.
 
 ## What every operator has in common
 
-**Build and environment.** The GEMMs are FlyDSL kernels written for gfx950
-(MI355X), so every operator needs FlyDSL, which is an optional extra
-(`pip install 'amd_mori[flydsl]'`). Every operator moves data with the SDMA
-copy engines. That needs:
+**Build and environment.** Every operator moves data with the SDMA copy
+engines. That needs:
 
 - a MORI built with `BUILD_CCO_SDMA=ON` (the default);
 - `MORI_ENABLE_SDMA=1` at run time;
@@ -87,11 +84,8 @@ Setting the variable is not enough on a host library built without the flag:
 that library has no SDMA queues, every put silently does nothing, and the
 result is wrong rather than an error. Each operator's `self_test()` checks
 this. It is a collective, so call it on every rank once after construction.
-The `GemmA2AOp`, `GemmAgOp`, `AgGemmOp` and `A2aGemmOp` constructors also
-refuse a communicator without the SDMA queues they need; `GemmAllReduceOp`
-and `GemmReduceScatterOp` do not check, so for them `self_test()` is the only
-guard. The standalone `Mxfp8GemmOp` / `Mxfp8GemvOp` move no data and need no
-SDMA.
+The constructors also refuse a communicator without the SDMA queues they need.
+The standalone `Mxfp8GemmOp` / `Mxfp8GemvOp` move no data and need neither.
 
 **A window sized up front.** Each operator owns a symmetric window inside the
 communicator's VMM reservation, and the window cannot grow. Size the
@@ -149,9 +143,7 @@ reference, so dropping the Python object does not free it.
 
 **fp8 operands.** The fp8 operators take `torch.float8_e4m3fn` and reject
 `float8_e4m3fnuz`. The weight goes in once through
-`mori.ops.gemm_ar.preshuffle_b`. Quantising the activations is the caller's
-job: the examples below call `quantize_*` functions that stand for your own
-quantiser and are not part of MORI. Scales follow the `quant` contract:
+`mori.ops.gemm_ar.preshuffle_b`. Scales follow the `quant` contract:
 - `ptpc`: `a_scale [M]` and `b_scale [N]`, fp32.
 - `blockscale`: A 1x128 and B 128x128, fp32. `a_scale` is `[M, K/128]`
   column-major, flat, or `[K/128, M]`.
@@ -173,7 +165,7 @@ from mori.ops.gemm_ar import GemmAllReduceOp, GemmReduceScatterOp, preshuffle_b
 with GemmAllReduceOp(comm, n=7168, k=2048, m_max=16384, quant="blockscale") as op:
     b_shuffled = preshuffle_b(b_fp8)                       # once per weight
     m_pad = op.padded_m(x.shape[0])
-    a_fp8, a_scale = quantize_per_1x128(op.pad_rows(x, m_pad))   # your quantiser
+    a_fp8, a_scale = quantize_per_1x128(op.pad_rows(x, m_pad))
     out = op(a_fp8, b_shuffled, a_scale, b_scale)[: x.shape[0]]   # [M, N] bf16
 
 with GemmReduceScatterOp(comm, n=5120, k=2048, m_max=16384, quant="mxfp8") as op:
@@ -181,9 +173,7 @@ with GemmReduceScatterOp(comm, n=5120, k=2048, m_max=16384, quant="mxfp8") as op
 ```
 
 - **Quantisation**: `quant="blockscale"` (the default), `"mxfp8"`,
-  `"mxfp8_raw"` (row-major uint8 scales staged through LDS), or `"bf16"` (bf16
-  A and B with no scales, for layers the checkpoint keeps in bf16; the scatter
-  wire stays bf16). There is no `"ptpc"`.
+  `"mxfp8_raw"` (row-major uint8 scales staged through LDS), `"ptpc"`.
 - **fp8 on the wire** (all-reduce only): `gather_dtype="fp8"` sends the
   all-gather leg as e4m3 with one fp32 scale per row, halving its bytes.
   `gather_transport="lsa"` lets the CUs pull and widen in one step. This is
@@ -244,7 +234,7 @@ with GemmA2AOp(comm, n=10240, k=8192, m_max=16384, quant="ptpc") as op:
     op.self_test()
     b_shuffled = preshuffle_b(w_qkv)                       # [N, K], same on every rank
     m = op.padded_m(x.shape[0])
-    a_fp8, a_scale = quantize_per_token(op.pad_rows(x, m)) # your quantiser
+    a_fp8, a_scale = quantize_per_token(op.pad_rows(x, m))
     qkv = op(a_fp8, b_shuffled, a_scale, b_scale)          # [P*m, N/P] bf16
 ```
 
@@ -295,8 +285,8 @@ with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
 
 - **Precisions**: `in_dtype="bf16"` takes bf16 `a`/`b` (plain row-major
   weight), no scales, and returns bf16 or fp32. `in_dtype="fp8"` takes
-  `quant` = `ptpc` / `blockscale` / `mxfp8`, with the scale layouts under
-  "fp8 operands" above, and returns bf16.
+  `quant` = `ptpc` / `blockscale` / `mxfp8` exactly as `GemmAllReduceOp` does,
+  and returns bf16.
 - **`mode="auto"`** (the default) fuses an M once `ceil(M/256) * ceil(N/256)`
   is at least the device's CU count, and splits below that, per M on one
   instance. `"fused"` and `"split"` pin a path.
@@ -340,7 +330,7 @@ with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
         b_shuffled = preshuffle_b(b_fp8)                   # this rank's [N, K] shard
         m = op.padded_m(x.shape[0])
         rows, scales = op.local_rows(m)                    # quantise straight into the window
-        quantize_per_token_into(op.pad_rows(x, m), rows, scales)  # your quantiser
+        quantize_per_token_into(op.pad_rows(x, m), rows, scales)
         c = op(rows, b_shuffled, scales, b_scale)          # [P*m, N] bf16
 ```
 
@@ -379,7 +369,7 @@ with A2aGemmOp(comm, n=N, k=K, m_max=max_tokens_per_rank) as op:
     b = preshuffle_b(w_o)                                  # [N, K], same on every rank
     m = op.padded_m(tokens_per_rank)
     a = op.send_buffer(m)                                  # [P*m, K/P] fp8, in the window
-    quantize_attention_output_into(a)                      # your quantiser
+    quantize_attention_output_into(a)
     c = op(a, b, a_scale, b_scale)                         # [m, N] bf16
 ```
 

@@ -1,7 +1,7 @@
 Communication APIs
 ==================
 
-MORI's communication layers, each targeting a different use case.
+MORI provides three communication layers, each targeting different use cases.
 
 MORI-EP (Expert Parallelism)
 -----------------------------
@@ -41,9 +41,6 @@ Dispatch and combine kernels for MoE expert parallelism.
    * - ``AsyncLL``
      - 4
      - Async low-latency with pipelining
-   * - ``IntraNodeLL``
-     - 5
-     - Single-node low-latency, for small token counts
 
 **EpDispatchCombineOp methods:**
 
@@ -247,7 +244,7 @@ RDMA-based P2P communication for KVCache transfer.
    * - ``get_engine_desc()``
      - Get engine descriptor for remote registration
    * - ``create_backend(type, config)``
-     - Create an RDMA, XGMI, FABRIC or OFI backend (TCP only in simulation mode)
+     - Create RDMA/XGMI/TCP backend
    * - ``register_remote_engine(desc)``
      - Register a remote engine
    * - ``register_torch_tensor(tensor)``
@@ -261,8 +258,7 @@ RDMA-based P2P communication for KVCache transfer.
 
 **Enums:**
 
-- ``BackendType``: ``Unknown``, ``XGMI``, ``RDMA``, ``TCP`` (simulation mode only),
-  ``FABRIC``, ``OFI`` (needs MORI built with libfabric)
+- ``BackendType``: ``Unknown``, ``XGMI``, ``RDMA``, ``TCP``
 - ``StatusCode``: ``SUCCESS``, ``INIT``, ``IN_PROGRESS``, ``ERR_INVALID_ARGS``, ``ERR_NOT_FOUND``, ``ERR_RDMA_OP``, ``ERR_BAD_STATE``, ``ERR_GPU_OP``
 
 See :doc:`MORI-IO Guide <../MORI-IO-GUIDE>` for full API reference.
