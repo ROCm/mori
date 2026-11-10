@@ -520,7 +520,7 @@ def post_rest_chunks(sdma, win, wave, lane, cnt, *, rank, arena, cco):
     ``prepare`` did not (every one but the first ``early_chunks``). All rows are in ``S`` already, because
     ``prepare`` has finished, so nothing is waited for: the puts are posted back to back and
     the copy engine moves them while the GEMM computes. Used by ``build_post_rest`` and by the
-    comm workgroup of ``gemm1_sdma``."""
+    comm workgroup of ``gemm1``."""
     if (wave < fx.Int32(arena.npes)) & (wave != fx.Int32(rank)):
         n = cnt[wave]
         n_chunks = chunks_for_rows(n, arena)
@@ -545,7 +545,7 @@ def make_prepare_phase(
     no_plan=False,
 ):
     """The prepare as code a resident kernel can run: returns ``(prepare_phase, cfg)``.
-    ``build_prepare`` wraps it in a kernel of its own; the fused GEMM1 (``gemm1_sdma``,
+    ``build_prepare`` wraps it in a kernel of its own; the fused GEMM1 (``gemm1``,
     ``fuse_prepare``) calls it at its front.
 
     Workgroup 0 is the comm workgroup, the other ``quant_blocks`` quantise; every workgroup
@@ -1221,7 +1221,7 @@ def build_prepare(
 
 def build_post_rest(*, rank, arena):
     """Kernel 2: put the chunks ``prepare`` did not, for a caller that has no GEMM1 comm
-    workgroup (the tests; ``gemm1_sdma`` does this itself). One workgroup, one wave per peer.
+    workgroup (the tests; ``gemm1`` does this itself). One workgroup, one wave per peer.
     """
     import mori.cco.device.flydsl as cco
 
@@ -1722,7 +1722,7 @@ def build_layout(*, rank, arena, sbm, max_tok):
     """The receiver builds its own expert-major layout from the staged routes.
 
     One resident launch of ``LAYOUT_BLOCKS`` blocks, after the prepare and before GEMM1; the
-    work is ``layout_phase``. The gated GEMM1 (``gemm1_sdma``) runs it itself instead; this
+    work is ``layout_phase``. The gated GEMM1 (``gemm1``) runs it itself instead; this
     kernel is what the test's setup call (and ``Stage1SdmaPrepare.layout``) uses.
     """
     npes, epr, cap = arena.npes, arena.experts_per_rank, arena.cap
@@ -2073,7 +2073,7 @@ class Stage1SdmaPrepare:
 
     def arm(self, chunks_from, routes=True):
         """Bump the running totals for one call without waiting: ``chunks_from[s]`` = chunks
-        source ``s`` sends me. A kernel that waits on the device (``gemm1_sdma`` with ``prep``)
+        source ``s`` sends me. A kernel that waits on the device (``gemm1`` with ``prep``)
         reads ``sig_base`` (where this call's signals start) and ``expected``."""
         import torch
 

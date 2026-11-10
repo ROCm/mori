@@ -23,10 +23,10 @@
 (no compact plan) or compact. Which one is set by ``AITER_MEGA_FIXED_SLOT_MAX_MTPR`` at import
 (fixed-slot needs 48 experts per rank and mtpr <= that value), so run it once per mode:
 
-    AITER_MEGA_FIXED_SLOT_MAX_MTPR=2047 torchrun --nproc_per_node=8 aiter_mode_bench.py --bs 512
-    torchrun --nproc_per_node=8 aiter_mode_bench.py --bs 512           # default 255: compact
+    AITER_MEGA_FIXED_SLOT_MAX_MTPR=2047 torchrun --nproc_per_node=8 run_aiter_stage1.py --bs 512
+    torchrun --nproc_per_node=8 run_aiter_stage1.py --bs 512           # default 255: compact
 
-stage1 = quant + dispatch + GEMM1, the part test_recv_layout.py compares:
+stage1 = quant + dispatch + GEMM1, the part run_stage1.py compares:
   fixed-slot: quantize() then _run_fused_stage1()
   compact:    _run_compact_prepare(quant_input=x) then _run_fused_stage1(prepared=True)
 Each timed per call (sync + barrier between calls), eager and in a CUDA graph. ``--save``

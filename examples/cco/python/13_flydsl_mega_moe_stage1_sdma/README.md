@@ -8,12 +8,12 @@ and their e8m0 scales in place through an index table `rowmap`. No CU is spent o
 aiter plan runs. aiter's stage2 + combine consume the tables unchanged; the final layer output is
 bit for bit aiter's.
 
-| file | what |
-|---|---|
-| `stage1_sdma.py` | `Arena` (window layout), the prepare (`make_prepare_phase` / `build_prepare`), the receive layout (`layout_phase`), the tile scheduler (`scheduler_phase`), host `Stage1SdmaPrepare` |
-| `gemm1_sdma.py` | the gated GEMM1 kernel (`compile_gemm1_sdma`, `run_gemm1_sdma`, `gemm1_kwargs`) |
-| `test_recv_layout.py` | the whole chain against aiter: poisoned, bit-exact checked calls (`--stress`), eager and CUDA-graph timing, `--trace` |
-| `aiter_mode_bench.py` | aiter's stage1 in either of its two modes (compact / fixed-slot), for the comparison |
+| file | role | what |
+|---|---|---|
+| `run_stage1.py` | entry point | the whole chain against aiter: poisoned, bit-exact checked calls (`--stress`), eager and CUDA-graph timing, `--trace` |
+| `run_aiter_stage1.py` | baseline | aiter's stage1 alone, in either of its two modes (compact / fixed-slot), for the comparison |
+| `sdma_dispatch.py` | dispatch (both sides) | `Arena` (window layout); sender: the prepare (`make_prepare_phase` / `build_prepare`, host `Stage1SdmaPrepare`); receiver: the receive layout (`layout_phase`) and the tile scheduler (`scheduler_phase`) |
+| `gemm1.py` | GEMM1 | the gated GEMM1 kernel: reads A in place from the window through `rowmap`, gated on the SDMA signals (`compile_gemm1_sdma`, `run_gemm1_sdma`, `gemm1_kwargs`) |
 
 ## How it works
 
@@ -60,7 +60,7 @@ serialised round trips, not bytes). Data that crosses workgroups or devices is w
 ```bash
 cd mori
 MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
-  examples/cco/python/13_flydsl_mega_moe_stage1_sdma/test_recv_layout.py \
+  examples/cco/python/13_flydsl_mega_moe_stage1_sdma/run_stage1.py \
   --network flash --bs 2048 --ready-first --graph-only --stress 1 --time-iters 30
 ```
 
@@ -81,8 +81,8 @@ MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
 aiter's two modes, for the comparison (the test only runs aiter's compact mode):
 
 ```bash
-AITER_MEGA_FIXED_SLOT_MAX_MTPR=16383 torchrun --standalone --nproc_per_node=8 aiter_mode_bench.py --network flash --bs 256
-AITER_MEGA_FIXED_SLOT_MAX_MTPR=0     torchrun --standalone --nproc_per_node=8 aiter_mode_bench.py --network flash --bs 256
+AITER_MEGA_FIXED_SLOT_MAX_MTPR=16383 torchrun --standalone --nproc_per_node=8 run_aiter_stage1.py --network flash --bs 256
+AITER_MEGA_FIXED_SLOT_MAX_MTPR=0     torchrun --standalone --nproc_per_node=8 run_aiter_stage1.py --network flash --bs 256
 ```
 
 ## Results (2026-11-06 .. 11-09)

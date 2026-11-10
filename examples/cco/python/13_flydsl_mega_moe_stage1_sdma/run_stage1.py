@@ -19,7 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""recv_layout: stage1 with NO aiter plan -- the receiver builds its own expert-major layout.
+"""Example 13 entry point: SDMA stage1 with NO aiter plan -- the receiver builds its own expert-major layout.
 
     new prepare -> GEMM1 (gated; builds the layout itself) -> aiter stage2 + combine
     (``--fuse-prepare``: the prepare runs inside the GEMM1 too: one launch per call)
@@ -37,7 +37,7 @@ stores through LDS and splits a token over 3 waves; the gated GEMM1 always build
 Switches left: --ready-first, --no-plan, --fuse-prepare, --chunk-rows, --early-chunks,
 --head-rows, --sbm, --tile-n.
 
-    MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 test_recv_layout.py --bs 4096
+    MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 run_stage1.py --bs 4096
 """
 
 import argparse
@@ -55,14 +55,14 @@ import torch.distributed as dist  # noqa: E402
 from mori.cco import Communicator, UniqueId  # noqa: E402
 from mori.tensor_utils import from_gpu_ptr  # noqa: E402
 
-from gemm1_sdma import (  # noqa: E402
+from gemm1 import (  # noqa: E402
     TRACE_ITEMS,
     TRACE_SLOTS,
     TRACE_STRIDE,
     gemm1_kwargs,
     run_gemm1_sdma,
 )
-from stage1_sdma import PREP_SLOTS, Stage1SdmaPrepare  # noqa: E402
+from sdma_dispatch import PREP_SLOTS, Stage1SdmaPrepare  # noqa: E402
 
 #: ``trace_report``: GEMM1's tile order is cut into this many equal slices
 BUCKETS = 10

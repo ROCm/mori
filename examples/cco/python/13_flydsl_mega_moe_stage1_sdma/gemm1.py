@@ -26,7 +26,7 @@ Same compute as aiter's ``compile_gemm1`` (``do_tile``, the epilogue, the B load
 aiter's own, so the output is bit for bit the same); only where A comes from differs.
 aiter's dispatch copies every routed row into an expert-major ``rx``. Here the rows are
 where ``prepare`` and the peers' puts left them, once per (token, rank), and a tile finds
-its rows through ``rowmap`` (``stage1_sdma.Arena``)::
+its rows through ``rowmap`` (``sdma_dispatch.Arena``)::
 
     row r of a tile (an expert-major row)  ->  rowmap[r]  ->  row of the window
 
@@ -63,7 +63,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_buf_tensor,
 )
 
-from stage1_sdma import (
+from sdma_dispatch import (
     PHASES_VER,
     SCH_HEAD,
     SCH_LDONE,
