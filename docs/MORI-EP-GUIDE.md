@@ -54,7 +54,7 @@ op = mori.ops.EpDispatchCombineOp(config)
 dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, recv_num_token = \
     op.dispatch(input, weights, scales, indices)
 # ... run expert computation on dispatched tokens ...
-combine_output, combine_weights = op.combine(expert_output, weights, indices)
+combine_output, combine_weights = op.combine(expert_output, dispatch_weights, indices)
 op.reset()
 ```
 
@@ -71,7 +71,7 @@ op.reset()
 
 ## 1. Kernel Types
 
-MORI-EP provides five kernel types optimized for different network topologies and latency requirements:
+MORI-EP provides six kernel types optimized for different network topologies and latency requirements:
 
 | Kernel Type | Value | Topology | Transport | Use Case |
 |-------------|-------|----------|-----------|----------|
@@ -80,6 +80,7 @@ MORI-EP provides five kernel types optimized for different network topologies an
 | `InterNodeV1` | 2 | Multi-node | XGMI + RDMA | Optimized inter-node with higher bandwidth |
 | `InterNodeV1LL` | 3 | Multi-node | XGMI + RDMA | Low-latency variant of InterNodeV1 |
 | `AsyncLL` | 4 | Multi-node | XGMI + RDMA | Async low-latency with pipelined transfers |
+| `IntraNodeLL` | 5 | Single node | XGMI (P2P) | Low-latency `IntraNode` variant for small token counts |
 
 **How to choose:**
 
@@ -222,7 +223,7 @@ combine_output, combine_weights = op.combine(
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `input` | `torch.Tensor` | Expert output tokens |
-| `weights` | `torch.Tensor` | Expert weights for weighted combination |
+| `weights` | `torch.Tensor` | The weights `dispatch()` returned for the received tokens, or `None` |
 | `indices` | `torch.Tensor` | Top-K expert indices (same as dispatch) |
 | `use_external_inp_buf` | `int` | Override `config.use_external_inp_buf`: 0=zero-copy, 1=external buffer |
 | `call_reset` | `bool` | Call `reset()` automatically after combine |
@@ -381,7 +382,8 @@ mori.shmem.shmem_init_attr(
 Launch parameters are taken from `EpDispatchCombineConfig` defaults or per-call overrides:
 
 ```python
-# Use config defaults (block_num=80, warp_num_per_block=8)
+# No launch arguments: the config's block_num=80 and warp_num_per_block=8, except
+# IntraNode, which has per-kernel defaults (dispatch: 256x16, or 64x8 on gfx125x)
 op.dispatch(input, weights, scales, indices)
 
 # Override per call
@@ -396,12 +398,14 @@ Set `MORI_EP_LAUNCH_CONFIG_MODE=AUTO` to use pre-tuned launch parameters:
 export MORI_EP_LAUNCH_CONFIG_MODE=AUTO
 ```
 
-Auto mode selects parameters based on kernel type:
+Auto mode uses the tuned launch rules shipped for the GPU, kernel type and world
+size where there are some, and otherwise falls back by kernel type:
 
 | Kernel Type | block_num | rdma_block_num | warp_per_block |
 |-------------|-----------|----------------|----------------|
-| InterNodeV1, InterNodeV1LL | 96 | 64 | 8 |
-| IntraNode, InterNode, AsyncLL | 128 | 0 | 16 |
+| InterNodeV1 | 96 | 64 | 8 |
+| InterNodeV1LL | 256 | 128 | 8 |
+| All others | 128 | 0 | 16 |
 
 When auto mode is active, per-call `block_num`/`rdma_block_num`/`warp_per_block` arguments are ignored.
 
@@ -530,8 +534,11 @@ export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # Optional: exclude specific NICs
 
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
     --master_addr="10.194.129.65" --master_port=1234 \
-    examples/ops/dispatch_combine/test_dispatch_combine_internode.py --bench
+    examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench
 ```
+
+`torchrun` starts one process per node; the script starts the node's 8 ranks
+(`GPU_PER_NODE`) itself.
 
 The benchmark output reports total tokens received, RDMA token count, and total bandwidth (XGMI + RDMA). To calculate RDMA-only bandwidth:
 
@@ -787,7 +794,8 @@ python/mori/ops/tuning_configs/
 
 ## 11. Profiling with MORI-VIZ
 
-Build with profiling enabled:
+Build with profiling enabled, and keep `ENABLE_PROFILER=ON` set when you run:
+the JIT compiles the instrumented kernels only then.
 
 ```bash
 ENABLE_PROFILER=ON pip install -e .
@@ -796,11 +804,12 @@ ENABLE_PROFILER=ON pip install -e .
 Capture and export a trace:
 
 ```python
+import mori
 from mori.kernel_profiler import export_to_perfetto
 
 # Run dispatch/combine, then:
 if hasattr(mori.cpp, "get_debug_time_buf"):
-    trace_buffer = mori.cpp.get_debug_time_buf(op._handle)
+    trace_buffer = op.get_debug_time_buf()
     export_to_perfetto(trace_buffer, "ep_trace.json")
 ```
 
@@ -849,9 +858,9 @@ MORI-EP is integrated in several LLM inference frameworks:
 | `src/ops/dispatch_combine/dispatch_combine.cpp` | Core dispatch/combine implementation |
 | `src/ops/dispatch_combine/internode_v1.cpp` | InterNodeV1/V1LL kernels |
 | `src/ops/dispatch_combine/low_latency_async.cpp` | AsyncLL kernels |
-| `src/pybind/pybind.cpp` | Python module entry point |
-| `src/pybind/mori.cpp` | Ops/Shmem/IO binding registration |
+| `src/pybind/mori.cpp` | Python module entry point (`libmori_pybinds`) |
+| `src/pybind/pybind_ops.cpp` | Ops binding registration (`RegisterMoriOps`) |
 | `examples/ops/dispatch_combine/test_dispatch_combine.py` | Complete Python example |
 | `examples/ops/dispatch_combine/test_dispatch_combine_internode.py` | Inter-node example |
-| `tests/python/ops/test_dispatch_combine.py` | Correctness tests |
+| `tests/python/ops/test_dispatch_combine_*.py` | Correctness tests (intra-node, inter-node V1, AsyncLL, ...) |
 | `tests/python/ops/bench_dispatch_combine.py` | Performance benchmarks |

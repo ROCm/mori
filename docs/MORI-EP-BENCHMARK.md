@@ -35,11 +35,13 @@ rm -rf ~/.mori
 
 **3. Run the profiling job**
 
+The script starts its own ranks (`--world-size`, 8 by default), so run it with
+`python3`, not under `torchrun`:
+
 ```bash
 export ENABLE_PROFILER=ON
 
-torchrun --nnodes=1 --nproc_per_node=8 \
-    tests/python/ops/bench_dispatch_combine.py --cmd profile
+python3 tests/python/ops/bench_dispatch_combine.py --cmd profile
 ```
 
 Traces land as `trace_intranode_rank<rank>_<timestamp>.json` in the current working directory — one file per rank.  Open them in [Perfetto UI](https://ui.perfetto.dev) or analyze with `analyze_ep_kernel_trace.py` as described in the [trace analysis](#analyzing-traces-with-analyze_ep_kernel_tracepy) section.
@@ -54,8 +56,12 @@ export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # Optional: use `^` prefix to exclude s
 
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
     --master_addr="10.194.129.65" --master_port=1234 \
-    examples/ops/dispatch_combine/test_dispatch_combine_internode.py --bench
+    examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench
 ```
+
+`torchrun` starts one process per node (`--nproc_per_node=1`): the script reads
+the node count from `WORLD_SIZE` and starts `GPU_PER_NODE` ranks (8 by default)
+on each node itself.
 
 The output includes total number of tokens received, total number of RDMA tokens received, and total bandwidth (XGMI + RDMA combined). To calculate RDMA-only bandwidth:
 
@@ -156,10 +162,10 @@ Look for the line:
 
 *Mori* — run the bench script with `--cmd bench`:
 ```
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 ... \
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 ... \
     test_dispatch_combine_internode.py --max-tokens 128 --cmd bench
 ```
-Look for the line printed by `run_bench_once` (line 770):
+Look for the line printed by `run_bench_once`:
 ```
 rank 8 recv 26757 tokens 8166 rdma tokens
 ```
@@ -383,7 +389,7 @@ Mori ships a profiler that emits Perfetto-compatible JSON traces for each EP ker
 **1. Build with profiler enabled**
 
 ```bash
-cd /apps/ditian12/mori
+cd /path/to/mori
 ENABLE_PROFILER=ON pip3 install -e . --no-build-isolation -v
 ```
 
@@ -418,7 +424,7 @@ Repeat for `--kernel-type v1_ll` and `--kernel-type async_ll`.  Traces land as `
 
 ```bash
 python3 tools/profiler/analyze_ep_kernel_trace.py \
-    /apps/ditian12/mori/profile/v1/trace_rank_0_<timestamp>.json \
+    trace_rank_0_<timestamp>.json \
     --out timeline_v1.png
 ```
 

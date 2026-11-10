@@ -6,7 +6,8 @@ MORI-VIZ is a warp-level GPU kernel profiler with Perfetto integration. It captu
 Requirements
 ------------
 
-Build MORI with profiling enabled:
+Build MORI with profiling enabled, and keep ``ENABLE_PROFILER=ON`` set when you
+run, so the JIT compiles the instrumented kernels:
 
 .. code-block:: bash
 
@@ -24,7 +25,7 @@ Usage
 
    # Run dispatch/combine operations first, then:
    if hasattr(mori.cpp, "get_debug_time_buf"):
-       trace_buffer = mori.cpp.get_debug_time_buf(op._handle)
+       trace_buffer = op.get_debug_time_buf()
        export_to_perfetto(trace_buffer, "ep_trace.json")
 
 **Visualize:** Open the JSON file at `ui.perfetto.dev <https://ui.perfetto.dev/>`_.
@@ -54,7 +55,7 @@ export_to_perfetto
      - Description
    * - ``trace_buffer``
      -
-     - Raw trace buffer from ``mori.cpp.get_debug_time_buf(handle)``
+     - The trace buffer tensor from ``op.get_debug_time_buf()``
    * - ``filename``
      - ``"trace.json"``
      - Output file path (Perfetto JSON format)
@@ -83,9 +84,11 @@ Available via ``mori.cpp`` when built with ``ENABLE_PROFILER=ON``:
    * - Function
      - Description
    * - ``get_debug_time_buf(handle)``
-     - Get raw trace buffer from an EP handle
+     - ``(pointer, length)`` of an EP handle's trace buffer. Use
+       ``op.get_debug_time_buf()`` instead, which wraps it as a ``torch.Tensor``
    * - ``get_debug_time_offset(handle)``
-     - Get current write offset in the trace buffer
+     - ``(pointer, length)`` of the per-warp write offsets. Use
+       ``op.get_debug_time_offset()`` instead, which wraps it as a ``torch.Tensor``
    * - ``get_cur_device_wall_clock_freq_mhz()``
      - Get GPU wall clock frequency in MHz
 

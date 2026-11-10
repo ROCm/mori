@@ -1,6 +1,6 @@
 # MORI Shmem Guide
 
-MORI Shmem provides OpenSHMEM-style symmetric memory APIs for GPU memory management and RDMA communication. It is the foundation layer that MORI-EP and MORI-IO build upon — shmem must be initialized before using any other MORI component.
+MORI Shmem provides OpenSHMEM-style symmetric memory APIs for GPU memory management and RDMA communication. The original MORI-EP API (`mori.ops.EpDispatchCombineOp`) and MORI-CCL build on it, so shmem must be initialized before using them; on gfx125x the original EP API defaults to CCO instead (`MORI_EP_COMM`). MORI-IO, MORI-CCO and the CCO-based EPv2 API do not use shmem.
 
 ## Table of Contents
 
@@ -149,18 +149,21 @@ mori.shmem.shmem_init_attr(
 )
 ```
 
-### Method 3: MPI Communicator (C++ / MPI environments)
+### Method 3: MPI Communicator (C++ only)
 
-Use this in MPI-based applications. Pass `MORI_SHMEM_INIT_WITH_MPI_COMM` as the flag:
+Use this in C++ MPI applications, with MORI built with MPI support
+(`MORI_WITH_MPI=ON`). Pass the communicator through the attribute struct:
 
-```python
-mori.shmem.shmem_init_attr(
-    mori.shmem.MORI_SHMEM_INIT_WITH_MPI_COMM,
-    rank, world_size, mpi_comm,
-)
+```cpp
+#include "mori/shmem/shmem_api.hpp"
+
+mori::shmem::mori_shmem_init_attr_t attr{};
+attr.mpi_comm = &comm;  // an MPI_Comm
+mori::shmem::ShmemInitAttr(mori::shmem::MORI_SHMEM_INIT_WITH_MPI_COMM, &attr);
 ```
 
-> **Note:** This is primarily used in C++ applications where an `MPI_Comm` handle is available. In Python, Method 1 or Method 2 are preferred.
+> **Note:** There is no Python path for this method: `mori.shmem.shmem_init_attr` takes a
+> unique ID and cannot carry an `MPI_Comm`. In Python, use Method 1 or Method 2.
 
 ### Initialization Comparison
 
@@ -168,7 +171,7 @@ mori.shmem.shmem_init_attr(
 |--------|-------------|--------------|
 | PyTorch Process Group | LLM inference/training frameworks (vLLM, SGLang, etc.) | `torch.distributed` |
 | Unique ID | Standalone apps, custom launchers, non-PyTorch environments | None (any broadcast mechanism) |
-| MPI Communicator | C++ MPI applications | MPI |
+| MPI Communicator | C++ MPI applications | MPI, and MORI built with `MORI_WITH_MPI=ON` |
 
 ### Finalization
 
@@ -289,14 +292,14 @@ This copies the current GPU states to the `globalGpuStates` symbol in the dynami
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MORI_SHMEM_HEAP_SIZE` | Symmetric heap size (e.g., `"6G"`, `"2G"`, `"512M"`). Must be set before initialization. | Required |
-| `MORI_SHMEM_MODE` | Heap mode: `"static"`, `"vmm"`, or `"isolation"` | `"static"` |
+| `MORI_SHMEM_HEAP_SIZE` | Symmetric heap size (e.g., `"6G"`, `"2G"`, `"512M"`). Must be set before initialization. | 4 GB (`static_heap`), 16 GB (`vmm_heap`) |
+| `MORI_SHMEM_MODE` | Heap mode: `"static_heap"`, `"vmm_heap"`, or `"isolation"`. Any other value logs a warning and falls back to `static_heap`. | `"static_heap"` |
 | `MORI_SHMEM_HEAP_TYPE` | Heap memory type: `"normal"` (cached) or `"uncached"` | `"uncached"` |
 | `MORI_SHMEM_VMM_CHUNK_SIZE` | VMM mode chunk size in bytes | Auto |
 | `MORI_SOCKET_IFNAME` | Network interface for shmem bootstrap TCP connections (e.g., `"lo"`, `"eth0"`) | Auto-detect |
 | `MORI_RDMA_DEVICES` | RDMA NIC selection. Include: `mlx5_0,mlx5_1`. Exclude: `^mlx5_2,mlx5_3` | All available |
 | `LD_LIBRARY_PATH` | mori loads libibverbs dynamically at runtime (`dlopen`) instead of linking it; to use an out-of-tree libibverbs, put its directory here. | `libibverbs.so` / `libibverbs.so.1` |
-| `MORI_NUM_QP_PER_PE` | Number of RDMA queue pairs per PE | `1` |
+| `MORI_NUM_QP_PER_PE` | Number of RDMA queue pairs per PE | `4` |
 | `MORI_IB_GID_INDEX` | InfiniBand GID index for RDMA connections | Auto-detect |
 | `MORI_RDMA_SL` | RDMA service level | Auto |
 | `MORI_RDMA_TC` | RDMA traffic class | Auto |
@@ -369,5 +372,5 @@ rail-only: rank 3 rail 3 created QPs to 1 peers (4 QPs): 11
 | `python/mori/shmem/api.py` | Python shmem API |
 | `python/mori/shmem/__init__.py` | Public exports |
 | `include/mori/shmem/` | C++ shmem headers |
-| `src/pybind/pybind.cpp` | Python module entry point |
-| `src/pybind/mori.cpp` | Shmem binding registration (`RegisterMoriShmem`) |
+| `src/pybind/mori.cpp` | Python module entry point (`libmori_pybinds`) |
+| `src/pybind/pybind_shmem.cpp` | Shmem binding registration (`RegisterMoriShmem`) |

@@ -493,7 +493,7 @@ These workload flags apply to both engines (the C++ default and Python); only th
 launch wrapper differs. Shown against the C++ binary:
 
 ```bash
-tests/cpp/io/bench_engine --op write \
+build/tests/cpp/bench_engine --op write \
     --enable-sess --enable-batch-transfer --batch-contiguous \
     --disable-chunking \
     --num-qp-per-transfer 8 --num-worker-threads 8 \
