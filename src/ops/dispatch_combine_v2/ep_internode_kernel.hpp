@@ -214,6 +214,8 @@ __device__ __forceinline__ void EpInterNodePut(const ::mori::cco::ccoDevComm& co
                                                const EpInterNodeRegion dst, size_t dstOffset,
                                                const EpInterNodeRegion src, size_t srcOffset,
                                                size_t bytes, int pe, int qpId) {
+  // Nothing to send; mlx5 also reads a zero byte_count as 2^31 and errors the QP.
+  if (bytes == 0) return;
   if ((threadIdx.x & (warpSize - 1)) != 0) return;
   ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
   gda.template put<::mori::cco::CCO_TEAM_WORLD, ::mori::cco::ccoGdaThreadIndependent>(
