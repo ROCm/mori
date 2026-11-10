@@ -40,7 +40,7 @@ jobs:
 
       # The README links to the published pages, not to docs/*.md, so a renamed
       # page has to fail here rather than leave the README pointing at a 404.
-      - name: Check rendered local links and the README's links into the site
+      - name: Check rendered links and images, and the README's links into the site
         run: python tools/check_docs_links.py docs/_build/html --markdown README.md
 
       - name: Upload documentation artifacts

@@ -20,12 +20,14 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Check local href targets and fragments in a rendered Sphinx site, offline.
+"""Check local links, fragments and images in a rendered Sphinx site, offline.
 
-Scope: ``<a href>`` only. ``<link rel="next|prev">``, ``<img src>``, ``<script
-src>`` and stylesheet ``<link href>`` are not followed -- the theme generates
-those from the toctree and the static tree, so they do not rot independently of
-the anchors that do. Do not read a clean run as "every asset resolves".
+Scope: ``<a href>`` targets and fragments, and ``<img src>`` files.
+``<link rel="next|prev">``, ``<script src>`` and stylesheet ``<link href>`` are
+not followed -- the theme generates those from the toctree and the static tree,
+so they do not rot independently of the pages that do. Content images do: an
+image a page references through a raw HTML tag is not copied into the build.
+Do not read a clean run as "every asset resolves".
 
 ``--markdown`` also checks the links a Markdown file such as the README makes
 into the published site (``--site-url``), against the same rendered tree. They
@@ -47,6 +49,7 @@ class Page(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.anchors = set()
         self.links = []
+        self.images = []
         self.feed(path.read_text(encoding="utf-8"))
 
     def handle_starttag(self, tag, attrs):
@@ -58,6 +61,8 @@ class Page(HTMLParser):
                 self.anchors.add(attrs["name"])
             if "href" in attrs:
                 self.links.append(attrs["href"])
+        if tag == "img" and "src" in attrs:
+            self.images.append(attrs["src"])
 
 
 def site_links(text, site_url):
@@ -65,6 +70,15 @@ def site_links(text, site_url):
     site = re.escape(site_url)
     pattern = rf"\]\(<?({site}[^)\s>]*)>?\)|<({site}[^>\s]*)>|href=\"({site}[^\"]*)\""
     return [next(g for g in m.groups() if g) for m in re.finditer(pattern, text)]
+
+
+def local_target(root, page, url):
+    """The file a page-relative ``url`` (already split) points at."""
+    if not url.path:
+        return page
+    if url.path.startswith("/"):
+        return (root / unquote(url.path).lstrip("/")).resolve()
+    return (page.parent / unquote(url.path)).resolve()
 
 
 def problem(root, pages, target, fragment):
@@ -84,22 +98,24 @@ def check(root, markdown=(), site_url=SITE_URL):
         raise ValueError(f"Missing documentation root: {root / 'index.html'}")
     pages = {path.resolve(): Page(path) for path in root.rglob("*.html")}
     errors = []
-    checked = 0
+    checked = images = 0
     for path, page in pages.items():
         for href in page.links:
             url = urlsplit(href)
             if url.scheme or url.netloc:
                 continue
             checked += 1
-            if not url.path:
-                target = path
-            elif url.path.startswith("/"):
-                target = (root / unquote(url.path).lstrip("/")).resolve()
-            else:
-                target = (path.parent / unquote(url.path)).resolve()
-            why = problem(root, pages, target, url.fragment)
+            why = problem(root, pages, local_target(root, path, url), url.fragment)
             if why:
                 errors.append(f"{path.relative_to(root)}: {why} {href}")
+        for src in page.images:
+            url = urlsplit(src)
+            if url.scheme or url.netloc:
+                continue
+            images += 1
+            target = local_target(root, path, url)
+            if not target.is_relative_to(root) or not target.is_file():
+                errors.append(f"{path.relative_to(root)}: missing image {src}")
     site_url = site_url.rstrip("/") + "/"
     linked = 0
     for doc in markdown:
@@ -113,8 +129,9 @@ def check(root, markdown=(), site_url=SITE_URL):
     for error in sorted(set(errors)):
         print(error)
     print(
-        f"Checked {checked} local links in {len(pages)} HTML pages and {linked} site "
-        f"links in {len(markdown)} Markdown files; {len(set(errors))} errors"
+        f"Checked {checked} local links and {images} images in {len(pages)} HTML "
+        f"pages and {linked} site links in {len(markdown)} Markdown files; "
+        f"{len(set(errors))} errors"
     )
     return bool(errors)
 
