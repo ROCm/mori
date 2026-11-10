@@ -1285,6 +1285,13 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
   barrierFlag = __shfl(barrierFlag, 0);
 
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
+    // Neither dispatch nor this combine reads the count when every slot is flagged; consume it
+    // before clearing, or a late arrival leaks into the next round.
+    if ((laneId < nNodes) && (laneId != myNode)) {
+      while (core::AtomicLoadRelaxedSystem(
+                 args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>() + laneId) == 0) {
+      }
+    }
     if (laneId < nNodes) {
       core::AtomicStoreSeqCstSystem(
           args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>() + laneId, uint64_t{0});
