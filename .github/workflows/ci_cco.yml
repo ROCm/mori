@@ -610,7 +610,8 @@ jobs:
           # one step ahead of its own dispatch: the cases the combine barrier
           # must tolerate, which the fixed-count cases above never reach. One
           # per family, because v2 and v2_ll each have their own barrier.
-          for CASE in "v2 128" "v2 4096" "v2_ll 128" \
+          # Every case runs the op's default 8 QPs, which the tables are tuned for.
+          for CASE in "v2 128 --num-qp 8" "v2 4096 --num-qp 8" "v2_ll 128 --num-qp 8" \
                       "v2 4096 --num-qp 8 -- --active-qp-counts 1,2,4,8" \
                       "v2_ll 128 --num-qp 8 -- --active-qp-counts 1,2,4,8"; do
             set -- $CASE; KERNEL=$1; TOKENS=$2; shift 2; EXTRA="$*"
@@ -653,14 +654,14 @@ jobs:
               $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
               --rank 1 --master-addr $NODE1_HOST --master-port $PORT
               --ifname $NODE2_IFNAME --entry $ENTRY
-              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS
+              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS --num-qp 8
             )
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
             NODE2_PID=$!
             $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
               --ifname $NODE1_IFNAME --entry $ENTRY \
-              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS
+              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS --num-qp 8
             wait "$NODE2_PID"
             sleep 1
             PORT=$((PORT + 1))
@@ -684,14 +685,14 @@ jobs:
             $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME --entry $ENTRY
-            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096
+            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096 --num-qp 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
           NODE2_PID=$!
           $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME --entry $ENTRY \
-            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096
+            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096 --num-qp 8
           wait "$NODE2_PID"
 
       - name: Cleanup node1
