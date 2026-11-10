@@ -300,6 +300,7 @@ This copies the current GPU states to the `globalGpuStates` symbol in the dynami
 | `MORI_IB_GID_INDEX` | InfiniBand GID index for RDMA connections | Auto-detect |
 | `MORI_RDMA_SL` | RDMA service level | Auto |
 | `MORI_RDMA_TC` | RDMA traffic class | Auto |
+| `MORI_MLX5_RESOLVE_DMAC` | mlx5 RoCE only. Resolve the QP's destination MAC through an address handle, so that `ibv_create_ah` / `mlx5dv_init_obj` asks the kernel for the next hop (as `ibv_modify_qp` does) instead of using the peer NIC's own MAC. Required when the peer NICs are reached through a router (RoCE on a routed/L3 fabric); a same-L2 peer resolves to the same MAC either way. Set to `0` to fall back to the peer NIC's MAC, which is also what happens when resolution fails. Resolution is cached per peer for the life of the process. | `1` |
 | `MORI_DISABLE_P2P` | Disable P2P (XGMI) transport, force RDMA | Not set |
 | `MORI_ENABLE_RAIL_ONLY` | Only create RDMA QPs to same-rail peers (same index within their node). For rail-isolated fabrics where cross-rail QPs cannot be established. See [Rail-only connections](#rail-only-connections). | Not set |
 | `MORI_DISABLE_TOPO` | Disable topology detection | Not set |
