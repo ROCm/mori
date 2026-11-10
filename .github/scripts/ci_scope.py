@@ -27,7 +27,7 @@ Run by .github/workflows/ci-scope.yml. Writes these step outputs:
   mori    MoRI CI on MI355X: EP v1, shmem, IO, CCL (ci.yml)
   mi300x  MoRI CI on MI300X: build, intranode, internode (ci.yml)
   umbp    UMBP unit tests (ci.yml)
-  cco     CCO unit test (cco and EPv2) and CCO internode (ci_cco.yml)
+  cco     CCO unit test, CCO EPv2 single-node test, CCO internode (ci_cco.yml)
   fused   CCO fused GEMM + collective job (ci_cco.yml)
   full    full internode bench/stress sweeps: workflow_dispatch, or ci:full on a PR
   reason  why

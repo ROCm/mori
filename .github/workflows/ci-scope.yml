@@ -19,7 +19,7 @@ on:
         description: UMBP unit tests
         value: ${{ jobs.detect.outputs.umbp }}
       cco:
-        description: CCO unit test (cco and EPv2) and CCO internode
+        description: CCO unit test (cco and EPv2), CCO EPv2 single-node test, CCO internode
         value: ${{ jobs.detect.outputs.cco }}
       fused:
         description: The CCO fused GEMM + collective job

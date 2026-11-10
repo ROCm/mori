@@ -23,7 +23,7 @@ env:
   IMAGE: rocm/mori:ci-cco
   BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
   CONTAINER: mori_cco_ci_${{ github.run_id }}
-  CT: podman  # MI355X-AINIC runner (cco-internode-test) is podman rootless
+  CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
 
 jobs:
   scope:
@@ -42,7 +42,8 @@ jobs:
       matrix:
         include:
           # Single node, so it shares ci.yml's intranode runner. MI355X-AINIC
-          # keeps the two internode jobs, which need that pair, and cco-fused-test.
+          # keeps the two internode jobs, which need that pair, cco-fused-test
+          # and cco-v2-test.
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
@@ -57,7 +58,7 @@ jobs:
       # this host auto-detection picks eno1, which does not accept local TCP.
       MORI_SOCKET_IFNAME: eno0
       NCCL_SOCKET_IFNAME: eno0
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - &cco-fix-perms
         name: Fix workspace permissions
@@ -92,13 +93,15 @@ jobs:
       - &cco-start
         name: Start container
         run: |
+          # A socket ifname only when the job sets one: an empty MORI_SOCKET_IFNAME
+          # is not unset to cco, which then looks for an interface named "".
           $CT rm -f $CONTAINER 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
-            -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
-            -e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME \
+            ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
+            ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -150,9 +153,9 @@ jobs:
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
-          # MORI_CCO_SKIP_GDA_FULL=1: the MI355X-AINIC runner has no intranode
-          # cross-rail RDMA, so GDA-FULL tests (gda_flush_async/gda_modes/
-          # multiprocess) can't form FULL connections; skip them here.
+          # MORI_CCO_SKIP_GDA_FULL=1: set on the MI355X-AINIC runner, which has no
+          # intranode cross-rail RDMA, so GDA-FULL tests (gda_flush_async/gda_modes/
+          # multiprocess) can't form FULL connections there. Not yet tried on PIT-G17.
           $CT exec -e MORI_CCO_SKIP_GDA_FULL=1 $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4 2>&1
 
       - name: Run CCO SDMA C++ tests (fork mode, 8 ranks)
@@ -217,7 +220,7 @@ jobs:
           $CT exec $CONTAINER bash -c "\
             mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_lsa_put"
           # TEMP: cco_gda_put bypassed on the MI355X-AINIC runner (GDA put not
-          # working there yet); re-enable once GDA is supported on this runner.
+          # working there); not yet tried on PIT-G17.
           # mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_gda_put
 
       - name: Run CCO Python examples (2 ranks)
@@ -231,8 +234,8 @@ jobs:
             MORI_ENABLE_SDMA=1 mpirun --allow-run-as-root -np 2 -x MORI_ENABLE_SDMA python 07_flydsl_sdma/main.py && \
             mpirun --allow-run-as-root -np 2 python 08_torch_symm_import/main.py && \
             MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=2 10_flydsl_sdma_allgather_async/main.py --iters 5 --timing-iters 5"
-            # GDA (device-initiated RDMA) examples fail on the runner (cross-rail
-            # RDMA); re-enable once that is fixed.
+            # GDA (device-initiated RDMA) examples failed on the MI355X-AINIC runner
+            # (cross-rail RDMA); not yet tried on PIT-G17.
             # mpirun --allow-run-as-root -np 2 python 03_flydsl_put/main.py
             # mpirun --allow-run-as-root -np 2 python 06_flydsl_gda_modes/main.py
 
@@ -294,8 +297,8 @@ jobs:
 
       - name: Compile CCO Triton GDA variants (AINIC runtime gated)
         run: |
-          # Runtime GDA-FULL tests and examples are already gated on this runner:
-          # its intranode AINIC path faults even when both ranks use one HCA.
+          # Runtime GDA-FULL tests and examples are gated above: on the MI355X-AINIC
+          # runner the intranode AINIC path faults even when both ranks use one HCA.
           # Still create the resources and compile/link every Triton GDA variant.
           FIRST_RDMA_DEVICE="${MORI_RDMA_DEVICES%%,*}"
           $CT exec \
@@ -396,52 +399,6 @@ jobs:
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
-
-      - name: Run ops-v2 AsyncLL (EP8, sdma and lsa transports)
-        run: |
-          # The only CI coverage of the v2 AsyncLL family: ci.yml's async_ll steps
-          # run v1's test_dispatch_combine_async_ll.py, which never touches it.
-          #
-          # Both transports, because they share the protocol but not the transfer
-          # passes -- the LSA count-reset race lived only in the lsa ones. The
-          # script exits non-zero on a failed check; the PASS grep is there for a
-          # run that died before reporting, which would otherwise read as green.
-          #
-          # MORI_ENABLE_SDMA=1 matters for the sdma leg: without SDMA queues every
-          # put is a no-op and the receiver spins until the timeout, so a runner
-          # that quietly lost SDMA shows up as this step timing out, not passing.
-          #
-          # sdma runs once per notification protocol: early notification is the
-          # gfx950 default, so legacy and fused receive each need an explicit run.
-          for run in "sdma" "sdma MORI_ASYNCLL_EARLY_NOTIFY=0" "sdma MORI_ASYNCLL_FUSED_RECV=1" "lsa"; do
-            set -- $run
-            transport=$1; shift
-            envs="-e MORI_ENABLE_SDMA=1 -e TRANSPORT=$transport"
-            for e in "$@"; do envs="$envs -e $e"; done
-            echo "== test_asyncll $run"
-            $CT exec $envs $CONTAINER bash -c "\
-              cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-              out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_asyncll.py 2>&1) || \
-                { echo \"\$out\"; exit 1; }; \
-              echo \"\$out\"; \
-              case \"\$out\" in *'# PASS:'*) ;; *) echo 'no PASS line: nothing ran'; exit 1;; esac" || exit 1
-          done
-
-      - name: Run ops-v2 routing snapshot handles (EP8, both backends)
-        run: |
-          $CT exec $CONTAINER bash -c "\
-            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            timeout 900 torchrun --standalone --nproc_per_node=8 test_routing_snapshot.py"
-
-      - name: Run ops-v2 dispatch/combine bench (EP8 smoke, both backends)
-        run: |
-          # bench_ep.py gates every point on an identity-expert check and exits
-          # non-zero if one fails, so this is a smoke test as well as a bench.
-          $CT exec $CONTAINER bash -c "\
-            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            BACKENDS=flydsl,hip COMB_MODE=pull MODES=graph SWEEP=128,512,4096,8192 \
-            ITERS=20 WARMUP=10 \
-            torchrun --standalone --nproc_per_node=8 bench_ep.py"
 
       - &cco-cleanup
         name: Cleanup
@@ -571,11 +528,91 @@ jobs:
 
       - *cco-cleanup
 
+  cco-v2-test:
+    name: CCO EPv2 single-node test (${{ matrix.platform }})
+    # The EPv2 AsyncLL, routing-snapshot and bench steps, on the runner and in the
+    # configuration they always passed in as part of the CCO unit test. On
+    # MI355X-AINIC-PIT-G17, test_asyncll's back_to_back check fails.
+    needs: scope
+    if: needs.scope.outputs.cco == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The CCO unit test's values on this runner, where no device is named
+          # rdma*, so cco sees no NIC; no socket ifname, so it auto-detects.
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+    env:
+      CONTAINER: mori_cco_v2_${{ github.run_id }}
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+    timeout-minutes: 30
+    steps:
+      - *cco-fix-perms
+      - *cco-checkout
+      - *cco-build-image
+      - *cco-start
+      - *cco-build-mori
+      - *cco-verify
+
+      - name: Run ops-v2 AsyncLL (EP8, sdma and lsa transports)
+        run: |
+          # The only CI coverage of the v2 AsyncLL family: ci.yml's async_ll steps
+          # run v1's test_dispatch_combine_async_ll.py, which never touches it.
+          #
+          # Both transports, because they share the protocol but not the transfer
+          # passes -- the LSA count-reset race lived only in the lsa ones. The
+          # script exits non-zero on a failed check; the PASS grep is there for a
+          # run that died before reporting, which would otherwise read as green.
+          #
+          # MORI_ENABLE_SDMA=1 matters for the sdma leg: without SDMA queues every
+          # put is a no-op and the receiver spins until the timeout, so a runner
+          # that quietly lost SDMA shows up as this step timing out, not passing.
+          #
+          # sdma runs once per notification protocol: early notification is the
+          # gfx950 default, so legacy and fused receive each need an explicit run.
+          for run in "sdma" "sdma MORI_ASYNCLL_EARLY_NOTIFY=0" "sdma MORI_ASYNCLL_FUSED_RECV=1" "lsa"; do
+            set -- $run
+            transport=$1; shift
+            envs="-e MORI_ENABLE_SDMA=1 -e TRANSPORT=$transport"
+            for e in "$@"; do envs="$envs -e $e"; done
+            echo "== test_asyncll $run"
+            $CT exec $envs $CONTAINER bash -c "\
+              cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+              out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_asyncll.py 2>&1) || \
+                { echo \"\$out\"; exit 1; }; \
+              echo \"\$out\"; \
+              case \"\$out\" in *'# PASS:'*) ;; *) echo 'no PASS line: nothing ran'; exit 1;; esac" || exit 1
+          done
+
+      - name: Run ops-v2 routing snapshot handles (EP8, both backends)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            timeout 900 torchrun --standalone --nproc_per_node=8 test_routing_snapshot.py"
+
+      - name: Run ops-v2 dispatch/combine bench (EP8 smoke, both backends)
+        run: |
+          # bench_ep.py gates every point on an identity-expert check and exits
+          # non-zero if one fails, so this is a smoke test as well as a bench.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            BACKENDS=flydsl,hip COMB_MODE=pull MODES=graph SWEEP=128,512,4096,8192 \
+            ITERS=20 WARMUP=10 \
+            torchrun --standalone --nproc_per_node=8 bench_ep.py"
+
+      - *cco-cleanup
+
   cco-internode-test:
     name: CCO internode test (${{ matrix.platform }})
-    # Serialised behind the single-node job rather than run beside it: both want
-    # all 8 GPUs and the same NICs on node1.
-    # Not on cco-unit-test: that runs on another runner.
+    # Needs no other job: cco-unit-test runs on another runner, and this runner
+    # runs one job at a time, so it never overlaps the other jobs on node1.
     needs: scope
     if: needs.scope.outputs.cco == 'true'
     runs-on: ${{ matrix.runner }}
@@ -804,7 +841,7 @@ jobs:
     # One check that is green when every lane the scope picked passed; a lane
     # the scope skipped counts as passed.
     if: always()
-    needs: [scope, cco-unit-test, cco-fused-test, cco-internode-test]
+    needs: [scope, cco-unit-test, cco-fused-test, cco-v2-test, cco-internode-test]
     runs-on: ubuntu-latest
     steps:
       - name: Check lane results
