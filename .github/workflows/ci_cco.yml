@@ -1,17 +1,13 @@
 name: CCO CI test
 
-# Called by ci.yml after its scope job, with the cco and fused lanes. ci.yml's
+# Called by ci.yml after its scope job, with the test groups to run. ci.yml's
 # triggers, concurrency and gate cover these jobs.
 on:
   workflow_call:
     inputs:
-      cco:
-        description: Run the CCO unit, EPv2 single-node and CCO internode jobs
-        type: boolean
-        required: true
-      fused:
-        description: Run the CCO fused GEMM job
-        type: boolean
+      groups:
+        description: JSON list of the test groups whose steps run (ci_scope.py)
+        type: string
         required: true
 
 env:
@@ -23,7 +19,7 @@ env:
 jobs:
   cco-unit-test:
     name: CCO unit test (${{ matrix.platform }})
-    if: inputs.cco
+    if: contains(fromJSON(inputs.groups), 'cco') || contains(fromJSON(inputs.groups), 'epv2')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -115,11 +111,13 @@ jobs:
 
 
       - name: Verify the install without FlyDSL
+        if: contains(fromJSON(inputs.groups), 'epv2')
         # The only check that the hip EP backend registers without FlyDSL, as in a
         # plain wheel install, for PRs that do not run ci.yml's build job.
         run: |
           $CT exec $CONTAINER bash -c "cd $GITHUB_WORKSPACE && python -c \"import sys, runpy; sys.modules['flydsl'] = None; runpy.run_path('tools/verify_install.py', run_name='__main__')\""
       - name: Check internode arena region invariants
+        if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           # Pure function of the config: no GPU, no process group, no RDMA, so it
           # runs here rather than in the two-node job -- the only place the
@@ -130,6 +128,7 @@ jobs:
               tests/python/ops/dispatch_combine_v2/test_internode_regions.py"
 
       - name: Check arch detection, tuning keys and AsyncLL options
+        if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           # No GPU needed: arch-string matching, the ASIC-revision table keys and their
           # CU fit, the per-target macro guard, and the AsyncLL defaults per arch.
@@ -140,6 +139,7 @@ jobs:
               tests/python/ops/dispatch_combine_v2/test_asyncll_options.py"
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           # MORI_CCO_SKIP_GDA_FULL=1: set on the MI355X-AINIC runner, which has no
           # intranode cross-rail RDMA, so GDA-FULL tests (gda_flush_async/gda_modes/
@@ -147,6 +147,7 @@ jobs:
           $CT exec -e MORI_CCO_SKIP_GDA_FULL=1 $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4 2>&1
 
       - name: Run CCO SDMA C++ tests (fork mode, 8 ranks)
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           # Every one of these SKIPs and exits 0 when the comm has no SDMA queues,
           # so a build or runner that quietly loses SDMA would turn the whole
@@ -163,6 +164,7 @@ jobs:
             done"
 
       - name: Run CCO SDMA benchmarks (2 ranks, smoke)
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           # Smoke only: a shared runner cannot give stable perf numbers, so this
           # checks that every scope and completion mode still runs and reports.
@@ -204,6 +206,7 @@ jobs:
               \$B/cco_p2p_put_bw -t sdma -s thread -a -A 8 -b 256K -e 1M -n 100 -w 20 || exit 1"
 
       - name: Run CCO C++ examples (2 ranks)
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           $CT exec $CONTAINER bash -c "\
             mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_lsa_put"
@@ -212,6 +215,7 @@ jobs:
           # mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_gda_put
 
       - name: Run CCO Python examples (2 ranks)
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           $CT exec $CONTAINER bash -c "pip install mpi4py && \
             cd $GITHUB_WORKSPACE/examples/cco/python && \
@@ -234,11 +238,13 @@ jobs:
       # prebuilds the extension. Without this step nothing in CI compiles that file.
 
       - name: MORI torch SymmetricMemory backend
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e MORI_SYMM_FORCE_JIT=1 $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && timeout 600 pytest tests/python/allocator -v"
 
       - name: Run CCO SDMA Python API tests (spawn, up to 8 GPUs)
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           # The build step built with BUILD_CCO_SDMA=ON, which setup.py bakes into
           # the package, so the runtime JIT device wrapper picks up SDMA
@@ -248,6 +254,7 @@ jobs:
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
 
       - name: Run CCO FlyDSL buffer cache-policy check
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           # A wrong cache policy still runs, so check the bits in the emitted ISA.
           $CT exec $CONTAINER bash -c "\
@@ -255,6 +262,7 @@ jobs:
             timeout 600 python -m pytest -v $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_buffer.py"
 
       - name: Validate CCO ROCm runtime import order
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
@@ -263,6 +271,7 @@ jobs:
               tests/python/cco/test_rocm_import_order.py"
 
       - name: Run CCO Triton bindings, LSA, and SDMA tests
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           $CT exec \
             -e MORI_ENABLE_SDMA=1 \
@@ -275,6 +284,7 @@ jobs:
                 tests/python/cco/test_triton_sdma.py"
 
       - name: Run CCO Triton benchmark tests
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           $CT exec \
             -e MORI_ENABLE_SDMA=1 \
@@ -284,6 +294,7 @@ jobs:
               timeout 300 pytest -v tests/python/cco/test_triton_benchmark.py"
 
       - name: Compile CCO Triton GDA variants (AINIC runtime gated)
+        if: contains(fromJSON(inputs.groups), 'cco')
         run: |
           # Runtime GDA-FULL tests and examples are gated above: on the MI355X-AINIC
           # runner the intranode AINIC path faults even when both ranks use one HCA.
@@ -301,6 +312,7 @@ jobs:
               timeout 300 pytest -v tests/python/cco/test_triton_gda.py"
 
       - name: Run JIT v2 C++ tests + host/device split guard
+        if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           # Registered by tests/cpp/jit/CMakeLists.txt but selected by no job before
           # this one. Neither needs a GPU peer: jit_core exercises render/cache/schema,
@@ -310,6 +322,7 @@ jobs:
             timeout 600 ctest --output-on-failure -R '^jit_'"
 
       - name: Run JIT v2 Python binding tests (1 rank, outside the repo)
+        if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           # The ctypes/C-ABI seam: schema-vs-sizeof, request coercion, unknown-field
           # rejection. Single rank -- EpDispatchPlan(world_size=1) needs no communicator.
@@ -324,12 +337,14 @@ jobs:
               $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2/test_jit_binding.py -v"
 
       - name: Run ops-v2 dispatch/combine test (EP8, 8 ranks)
+        if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             python -m pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -v"
 
       - name: Run ops-v2 HIP backend (EP8, 8 ranks)
+        if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           # The step above drives the FlyDSL backend; this one drives the HIP kernels
           # behind the same op. test_op.py reports per-case PASS/FAIL and does not exit
@@ -344,6 +359,7 @@ jobs:
             case \"\$out\" in *PASS*) ;; *) echo 'no PASS line: nothing ran'; exit 1;; esac"
 
       - name: Run ops-v2 HIP backend with per-token scales (EP8, 8 ranks)
+        if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           # SCALE_DIM>0 turns on the forwarded per-token scale row and makes
           # test_op.py verify it through the routing reverse map (OP-SCALES). It is
@@ -358,6 +374,7 @@ jobs:
             case \"\$out\" in *OP-SCALES*) ;; *) echo 'no OP-SCALES line: scales never ran'; exit 1;; esac"
 
       - name: Run ops-v2 scales on a quantizing wire (fp8 and fp4 dispatch, EP8)
+        if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           # The step above can only test scales on a BF16 wire: test_op.py gives
           # dispatch and combine one dtype, and the HIP backend refuses an fp8
@@ -383,6 +400,7 @@ jobs:
           done
 
       - name: Run ops-v2 backend parity (FlyDSL vs HIP, EP8)
+        if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
@@ -404,7 +422,7 @@ jobs:
     name: CCO fused GEMM test (${{ matrix.platform }})
     # The fused GEMM + collective ops use SDMA over loopback only. Their own runner
     # takes them off the CCO unit test's critical path.
-    if: inputs.fused
+    if: contains(fromJSON(inputs.groups), 'fused')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -520,7 +538,7 @@ jobs:
     # The EPv2 AsyncLL, routing-snapshot and bench steps, on the runner and in the
     # configuration they always passed in as part of the CCO unit test. On
     # MI355X-AINIC-PIT-G17, test_asyncll's back_to_back check fails.
-    if: inputs.cco
+    if: contains(fromJSON(inputs.groups), 'epv2')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -599,7 +617,7 @@ jobs:
     name: CCO internode test (${{ matrix.platform }})
     # Needs no other job: cco-unit-test runs on another runner, and this runner
     # runs one job at a time, so it never overlaps the other jobs on node1.
-    if: inputs.cco
+    if: contains(fromJSON(inputs.groups), 'epv2')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
