@@ -9,6 +9,10 @@ on:
         description: JSON list of the test groups whose steps run (ci_scope.py)
         type: string
         required: true
+      full:
+        description: Run the fused GEMM cases a pull request skips (ci:full)
+        type: boolean
+        default: false
 
 env:
   IMAGE: rocm/mori:ci-cco
@@ -26,8 +30,7 @@ jobs:
       matrix:
         include:
           # Single node, so it shares ci.yml's intranode runner. MI355X-AINIC
-          # keeps the two internode jobs, which need that pair, cco-fused-test
-          # and cco-v2-test.
+          # keeps the two internode jobs, which need that pair, and cco-v2-test.
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
@@ -86,6 +89,7 @@ jobs:
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
             ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
+            ${MORI_CI_FULL:+-e MORI_CI_FULL=$MORI_CI_FULL} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -420,8 +424,8 @@ jobs:
 
   cco-fused-test:
     name: CCO fused GEMM test (${{ matrix.platform }})
-    # The fused GEMM + collective ops use SDMA over loopback only. Their own runner
-    # takes them off the CCO unit test's critical path.
+    # The fused GEMM + collective ops use SDMA over loopback only, so they need no
+    # NIC and run here rather than queue behind the internode jobs on MI355X-AINIC.
     if: contains(fromJSON(inputs.groups), 'fused')
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -429,12 +433,15 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC]
+            runner: [self-hosted, MI355X-AINIC-PIT-G17]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
     env:
+      CT: docker
       CONTAINER: mori_cco_fused_${{ github.run_id }}
+      # 0 skips the ci_full cases (tests/python/cco/conftest.py).
+      MORI_CI_FULL: ${{ (github.event_name != 'pull_request' || inputs.full) && '1' || '0' }}
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
@@ -449,6 +456,30 @@ jobs:
       - *cco-build-mori
       - *cco-verify
 
+      - name: Run CCO fused GEMM single-GPU kernel tests (a GPU per worker)
+        run: |
+          # The single_gpu cases check one kernel each against an fp32 reference,
+          # with no cco, and spend most of their time compiling. conftest.py gives
+          # every xdist worker its own GPU; the multi-rank cases stay in the steps
+          # below, one launch at a time.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            pip install pytest-xdist && cd /tmp && \
+            timeout 1200 python -m pytest -v -n 8 --dist worksteal -m single_gpu \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag.py"
+
+      - name: Run CCO fused GEMM 2- and 4-rank tests (4 GPUs per worker)
+        run: |
+          # Two launches at a time, each on its own four GPUs. The 8-rank cases stay
+          # in the steps below.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo -e MORI_TEST_GPUS_PER_WORKER=4 $CONTAINER bash -c "\
+            cd /tmp && \
+            timeout 1200 python -m pytest -v -n 2 --dist worksteal -m gpu_group \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_schedule.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
+
       - name: Run CCO GEMM+AR numerics (up to 8 ranks)
         run: |
           # The op ships in mori.ops.gemm_ar, so run pytest from /tmp: from a
@@ -461,7 +492,7 @@ jobs:
           # lived there behind a green suite.
           $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
             cd /tmp && python -c 'import mori.ops.gemm_ar as g; print(g.GemmAllReduceOp)' && \
-            timeout 1800 python -m pytest -v \
+            timeout 1800 python -m pytest -v -m 'not single_gpu and not gpu_group' \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_schedule.py \
@@ -510,7 +541,7 @@ jobs:
         run: |
           $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
             cd /tmp && python -c 'import mori.ops.gemm_ag as g; print(g.__file__)' && \
-            timeout 2400 python -m pytest -v \
+            timeout 2400 python -m pytest -v -m 'not single_gpu' \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag.py \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag_op.py"
 

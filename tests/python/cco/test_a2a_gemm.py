@@ -139,7 +139,9 @@ def _torchrun(script, *args, timeout=1800):
 
 
 @requires_gpus
-@pytest.mark.parametrize("acquire", ["inv", "none"])
+@pytest.mark.parametrize(
+    "acquire", ["inv", pytest.param("none", marks=pytest.mark.ci_full)]
+)
 def test_every_mode_is_exact_to_the_fp8_floor_back_to_back(acquire):
     world, rows = _torchrun(
         BENCH,
