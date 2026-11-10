@@ -24,6 +24,12 @@ on:
       fused:
         description: The CCO fused GEMM + collective job
         value: ${{ jobs.detect.outputs.fused }}
+      build:
+        description: The MI355X build job (compile check)
+        value: ${{ jobs.detect.outputs.build }}
+      groups:
+        description: JSON list of the test groups whose steps run
+        value: ${{ jobs.detect.outputs.groups }}
       full:
         description: Run the full internode bench/stress sweeps
         value: ${{ jobs.detect.outputs.full }}
@@ -43,13 +49,26 @@ jobs:
       umbp: ${{ steps.scope.outputs.umbp }}
       cco: ${{ steps.scope.outputs.cco }}
       fused: ${{ steps.scope.outputs.fused }}
+      build: ${{ steps.scope.outputs.build }}
+      groups: ${{ steps.scope.outputs.groups }}
       full: ${{ steps.scope.outputs.full }}
       reason: ${{ steps.scope.outputs.reason }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          sparse-checkout: .github/scripts
+          # ci_scope.py reads what PR CI runs, builds or imports to tell which
+          # tools/ files count.
+          sparse-checkout: |
+            /.github/scripts/
+            /.github/workflows/
+            /docker/
+            /tools/
+            /cmake/
+            /python/mori/
+            /setup.py
+            /pyproject.toml
+            CMakeLists.txt
           sparse-checkout-cone-mode: false
           # This job's token can write to the PR; the script gets it as GH_TOKEN.
           persist-credentials: false
