@@ -20,7 +20,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """Start / wait kernels of :class:`SdmaAllGatherOp`: example 12's engine-wait all-gather
-with a bounded wait. One wave, lane ``p`` serves peer ``p`` on SDMA queue ``(p, 0)``.
+with a bounded wait. One block of ``world`` threads rounded up to whole waves; thread
+``p`` serves peer ``p`` on SDMA queue ``(p, queue)``.
 """
 
 # No `from __future__ import annotations`: FlyDSL resolves the kernel parameter
@@ -40,11 +41,9 @@ from mori.cco.device.flydsl.signals import (
     signal_ptr,
     signal_store_u32,
 )
+from mori.jit.config import detect_wave_size
 
 from .op import CTRL_BYTES, EPOCH_OFF, FAULT_OFF, READY_OFF
-
-WAVE = 64
-QUEUE = 0
 
 
 def _ir(v):
@@ -85,13 +84,15 @@ def _next_epoch(w, rank, slot):
     return fx.Int32(local_load_u32(ptr)) + fx.Int32(1), ptr
 
 
-def build_kernels(rank: int, world: int):
+def build_kernels(rank: int, world: int, queue: int):
     """``(start, wait)`` launchers for ``rank``. ``live == 0`` makes either a no-op (a
     load check that touches no peer and no epoch)."""
+    wave = detect_wave_size()
+    block = -(-world // wave) * wave
+    # The FlyDSL disk cache does not hash kernel bodies: everything baked in is named.
+    tag = f"r{rank}_w{world}_q{queue}_b{block}"
 
-    @flyc.kernel(
-        name=f"mori_sdma_ag_start_r{rank}_w{world}", known_block_size=[WAVE, 1, 1]
-    )
+    @flyc.kernel(name=f"mori_sdma_ag_start_{tag}", known_block_size=[block, 1, 1])
     def start_kernel(dev_comm: Int64, win: Int64, base: Int64, blk: Int64, live: Int32):
         tid = fx.thread_idx.x
         w = cco.CachedWindow(win)
@@ -117,11 +118,11 @@ def build_kernels(rank: int, world: int):
                     # stale read only sees an older epoch and takes the engine wait.
                     ready = fx.Int32(_load_u32_system(signal_ptr(my_ready)))
                     if ready == epoch:
-                        sdma.put_ptr(tid, dst, src, blk, QUEUE, remote_signal=True)
+                        sdma.put_ptr(tid, dst, src, blk, queue, remote_signal=True)
                     if ready != epoch:
                         sdma.post_wait_mem_put_ptr(
                             tid,
-                            QUEUE,
+                            queue,
                             win,
                             my_ready_off,
                             epoch,
@@ -145,18 +146,16 @@ def build_kernels(rank: int, world: int):
         stream: fx.Stream = fx.Stream(None),
     ):
         start_kernel(dev_comm, win, base, blk, live).launch(
-            grid=(1, 1, 1), block=[WAVE, 1, 1], stream=stream
+            grid=(1, 1, 1), block=[block, 1, 1], stream=stream
         )
 
-    @flyc.kernel(
-        name=f"mori_sdma_ag_wait_r{rank}_w{world}", known_block_size=[WAVE, 1, 1]
-    )
+    @flyc.kernel(name=f"mori_sdma_ag_wait_{tag}", known_block_size=[block, 1, 1])
     def wait_kernel(dev_comm: Int64, win: Int64, live: Int32, spin_limit: Int32):
         tid = fx.thread_idx.x
         w = cco.CachedWindow(win)
         sdma = cco.DevComm(dev_comm).sdma()
         epoch, epoch_ptr = _next_epoch(w, rank, 1)
-        slot = signal_ptr(fx.Int64(sdma.signal_slot(tid, QUEUE)))
+        slot = signal_ptr(fx.Int64(sdma.signal_slot(tid, queue)))
         fault_ptr = signal_ptr(fx.Int64(w.lsa_ptr(rank, FAULT_OFF)))
         my_ready = fx.Int64(w.lsa_ptr(rank, READY_OFF)) + fx.Int64(tid) * fx.Int64(4)
         limit = spin_limit * (fx.Int32(1) - fx.Int32(local_load_u32(fault_ptr)))
@@ -168,7 +167,7 @@ def build_kernels(rank: int, world: int):
                         local_store_u32(fault_ptr, fx.Int32(1))
                         # Release my engine-held put, else it blocks my queue.
                         signal_store_u32(signal_ptr(my_ready), epoch)
-                    sdma.quiet_queue(tid, QUEUE)
+                    sdma.quiet_queue(tid, queue)
         fgpu.barrier()
         if live == 1:
             if tid == 0:
@@ -183,7 +182,7 @@ def build_kernels(rank: int, world: int):
         stream: fx.Stream = fx.Stream(None),
     ):
         wait_kernel(dev_comm, win, live, spin_limit).launch(
-            grid=(1, 1, 1), block=[WAVE, 1, 1], stream=stream
+            grid=(1, 1, 1), block=[block, 1, 1], stream=stream
         )
 
     return start, wait

@@ -24,7 +24,6 @@
 
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -32,19 +31,20 @@ from pathlib import Path
 import pytest
 import torch
 
+from . import kfd_settle
+
 WORKER = Path(__file__).with_name("sdma_allgather_op_worker.py")
-#: SDMA queues of a finished process group take seconds to come back.
+#: Back-off before the one retry when anvil still finds the SDMA engines full.
 _SETTLE_SECONDS = 15
 #: Marker of anvil's SDMA queue-creation failure while those queues come back.
 _QUEUE_EXHAUSTED = "anvil.cpp"
 
 
 def _spawn(world, last=False):
-    time.sleep(_SETTLE_SECONDS)
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
-    result = subprocess.run(
+    result = kfd_settle.run(
         [
             sys.executable,
             "-m",
@@ -57,7 +57,7 @@ def _spawn(world, last=False):
         env=env,
         capture_output=True,
         text=True,
-        timeout=900,
+        timeout=180,
     )
     out = result.stdout + result.stderr
     if result.returncode != 0 and _QUEUE_EXHAUSTED in out and not last:

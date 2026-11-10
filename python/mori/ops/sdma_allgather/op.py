@@ -25,10 +25,12 @@
 Contract: construction is collective; every rank calls ``start`` / ``wait`` in the same
 order with the same region, one call in flight; a rank's block is left alone from
 ``start`` to ``wait`` and the region is read before the next ``start`` in stream order;
-one node. SDMA queues are process-global (anvil shares them across every comm and
-shmem), and a put held for a late peer blocks its queue: nothing else in the process
-may use SDMA queue 0 between these GPUs. Epochs advance on the device, so a ``start`` /
-``wait`` pair can be captured in a graph.
+one host (SDMA reaches only same-host GPUs), at most ``MAX_PEERS`` ranks. SDMA queues are
+process-global (anvil shares them across every comm and shmem), and a put held for a
+late peer blocks its queue: nothing else in the process may use SDMA queue ``queue``
+between these GPUs. EP v1 and ccl use queues from 0 up, so ``queue >= 2`` keeps clear of
+EP v1 with two QPs per PE. Epochs advance on the device, so a ``start`` / ``wait`` pair
+can be captured in a graph.
 """
 
 from __future__ import annotations
@@ -49,6 +51,9 @@ ALIGN = 16
 #: Control area at the head of the window. READY: u32 slot ``p`` is written by rank
 #: ``p``. EPOCH: [0] start, [1] wait. FAULT: u32, sticky. EPOCH and FAULT are private.
 READY_OFF, EPOCH_OFF, FAULT_OFF, CTRL_BYTES = 0, 256, 512, 1024
+MAX_PEERS = (EPOCH_OFF - READY_OFF) // 4
+#: anvil's kMaxSdmaChannelsPerPair: SDMA queues a comm can have per GPU pair.
+MAX_SDMA_QUEUES = 8
 
 
 class SdmaAllGatherOp:
@@ -71,9 +76,17 @@ class SdmaAllGatherOp:
         capacity: int,
         *,
         agree: Callable[[bool], bool] | None = None,
+        queue: int = 0,
     ):
         self.comm = comm
         self.rank, self.world_size = comm.rank, comm.nranks
+        # Checked before any collective: with the same arguments on every rank (the
+        # contract), every rank raises here and none waits on a peer.
+        if not 1 <= self.world_size <= MAX_PEERS:
+            raise ValueError(f"world_size={self.world_size} not in [1, {MAX_PEERS}]")
+        if not 0 <= queue < MAX_SDMA_QUEUES:
+            raise ValueError(f"queue={queue} not in [0, {MAX_SDMA_QUEUES})")
+        self.queue = queue
         self.capacity = -(-capacity // ALIGN) * ALIGN
         self.mem = self.win = self.dev_comm = None
         self._inflight = self._closed = False
@@ -127,7 +140,7 @@ class SdmaAllGatherOp:
         reqs.gda_connection_type = GDA_CONNECTION_NONE
         reqs.gda_signal_count = 0
         reqs.gda_counter_count = 0
-        reqs.sdma_queue_count = 1
+        reqs.sdma_queue_count = self.queue + 1
         self.dev_comm = self.comm.create_dev_comm(reqs)
 
     def _load_kernels(self) -> None:
@@ -136,17 +149,19 @@ class SdmaAllGatherOp:
 
         from .kernels import build_kernels
 
-        if self.dev_comm.sdma_num_queue < 1:
+        # The comm's first dev-comm fixes its queue count.
+        if self.dev_comm.sdma_num_queue <= self.queue:
             raise RuntimeError(
-                "SdmaAllGatherOp needs SDMA queues: build mori with BUILD_CCO_SDMA=ON "
-                "and set MORI_ENABLE_SDMA=1"
+                f"SdmaAllGatherOp needs SDMA queue {self.queue}, the comm has "
+                f"{self.dev_comm.sdma_num_queue}: build mori with BUILD_CCO_SDMA=ON, set "
+                "MORI_ENABLE_SDMA=1, and create this op before other dev-comms on the comm"
             )
         if self.dev_comm.lsa_size != self.world_size:
             raise RuntimeError(
-                f"SdmaAllGatherOp needs one node; lsa_size={self.dev_comm.lsa_size}, "
+                f"SdmaAllGatherOp needs one host; lsa_size={self.dev_comm.lsa_size}, "
                 f"world_size={self.world_size}"
             )
-        start, wait = build_kernels(self.rank, self.world_size)
+        start, wait = build_kernels(self.rank, self.world_size, self.queue)
         stream = fx.Stream(torch.cuda.current_stream())
         # flyc.compile specializations skip the @jit dispatch: ~18 us host per pair.
         self._start = flyc.compile(
@@ -164,17 +179,7 @@ class SdmaAllGatherOp:
         if self._closed:
             raise RuntimeError("SdmaAllGatherOp is closed")
 
-    def region(self, block_bytes: int, base: int = 0) -> torch.Tensor:
-        """The uint8 view of a call's region: rank r's block at ``r * block_bytes``."""
-        self._check_open()
-        return self.buffer[base : base + self.world_size * block_bytes]
-
-    def start(self, block_bytes: int, base: int = 0, stream=None) -> None:
-        import flydsl.expr as fx
-
-        self._check_open()
-        if self._inflight:
-            raise RuntimeError("SdmaAllGatherOp: start while a gather is in flight")
+    def _check_region(self, block_bytes: int, base: int) -> None:
         if (
             block_bytes <= 0
             or base < 0
@@ -186,6 +191,20 @@ class SdmaAllGatherOp:
                 f"region base={base} block_bytes={block_bytes} x {self.world_size}: "
                 f"needs {ALIGN}-byte alignment and to fit in {self.capacity} bytes"
             )
+
+    def region(self, block_bytes: int, base: int = 0) -> torch.Tensor:
+        """The uint8 view of a call's region: rank r's block at ``r * block_bytes``."""
+        self._check_open()
+        self._check_region(block_bytes, base)
+        return self.buffer[base : base + self.world_size * block_bytes]
+
+    def start(self, block_bytes: int, base: int = 0, stream=None) -> None:
+        import flydsl.expr as fx
+
+        self._check_open()
+        if self._inflight:
+            raise RuntimeError("SdmaAllGatherOp: start while a gather is in flight")
+        self._check_region(block_bytes, base)
         stream = fx.Stream(stream or torch.cuda.current_stream())
         self._start(self.dev_comm.ptr, self.win.handle, base, block_bytes, 1, stream)
         self._inflight = True
