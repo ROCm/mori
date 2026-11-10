@@ -43,6 +43,7 @@ To help developers get started quickly, MORI also includes a suite of optimized 
 ## Features summary
 - Applications
     - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance.
+    - MORI-FUSED: GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, overlapping the transfer with the GEMM over the SDMA copy engines
     - MORI-IO: point-to-point communication library with ultra-low overhead
     - MORI-CCL: lightweight and flexible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained environment
     - MORI-UMBP: unified memory & bandwidth pool with tiered storage and distributed key-value access for scalable memory management
@@ -62,8 +63,9 @@ It is built from [`docs/`](https://github.com/ROCm/mori/tree/main/docs) on every
 |---|---|---|
 | Getting started | Installation, fabric checks and first steps | [Installation](https://rocm.github.io/mori/installation.html) · [Quickstart](https://rocm.github.io/mori/quickstart.html) |
 | MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples; choosing between the EP APIs and backends | [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html) · [Choosing an API and backend](https://rocm.github.io/mori/ep_backends.html) · [Benchmark](https://rocm.github.io/mori/MORI-EP-BENCHMARK.html) · [RDMA bandwidth](https://rocm.github.io/mori/rdma_bandwidth_utilization.html) |
+| MORI-FUSED | GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, built on MORI-CCO | [Guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html) |
 | MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](https://rocm.github.io/mori/MORI-SHMEM-GUIDE.html) |
-| MORI-CCO | Explicit-handle GPU communication over LSA, GDA and SDMA; fused GEMM + collective operators | [CCO Guide](https://rocm.github.io/mori/MORI-CCO-GUIDE.html) · [Fused GEMM + Collective Guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html) |
+| MORI-CCO | Explicit-handle GPU communication over LSA, GDA and SDMA | [CCO Guide](https://rocm.github.io/mori/MORI-CCO-GUIDE.html) |
 | MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](https://rocm.github.io/mori/MORI-IR-GUIDE.html) |
 | MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](https://rocm.github.io/mori/MORI-IO-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) |
 | MORI-UMBP | Unified memory & bandwidth pool: tiered storage, distributed KV access, transfer simulation | [Single-Node Smoke Test](https://rocm.github.io/mori/MORI-UMBP-SINGLE-NODE-GUIDE.html) · [Simulation](https://rocm.github.io/mori/umbp-simulation.html) · [Calibration](https://rocm.github.io/mori/umbp-calibration.html) · [PD Benchmark](https://rocm.github.io/mori/MORI-UMBP-PD-BENCHMARK.html) · [Tier-Management Benchmark](https://rocm.github.io/mori/UMBP-TIER-MANAGEMENT-BENCHMARK.html) |
