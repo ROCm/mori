@@ -56,12 +56,19 @@ enum class TierType : int {
 // eight instances, and a policy that also names hot and warm DRAM plus a pair of
 // SSDs lands at twelve.  The shelves are vectors, so unused ids cost a pointer
 // triple each.
-inline constexpr uint32_t kMaxBackendsPerPeer = 16;
+inline constexpr uint32_t kMaxStorageBackendsPerPeer = 16;
+// An ephemeral read arena has a wire address but never participates in KV
+// placement, capacity announcements, or tier transitions.
+inline constexpr uint32_t kFabricReadStagingBackendId = kMaxStorageBackendsPerPeer;
+inline constexpr uint32_t kMaxBackendsPerPeer = kMaxStorageBackendsPerPeer + 1;
 
 // Object bytes [offset, offset + length) a reader will touch; length 0 = all.
 struct ObjectExtent {
   uint64_t offset = 0;
   uint64_t length = 0;
+  bool operator==(const ObjectExtent& other) const {
+    return offset == other.offset && length == other.length;
+  }
 };
 
 struct TierCapacity {

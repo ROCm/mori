@@ -337,7 +337,7 @@ void LoadPolicy(Options* options) {
   if (!mori::umbp::ApplyBackendPolicy(*options->policy, &lowered, &error)) {
     UsageError("invalid --config: " + error);
   }
-  if (lowered.backends.size() > mori::umbp::kMaxBackendsPerPeer) {
+  if (lowered.backends.size() > mori::umbp::kMaxStorageBackendsPerPeer) {
     UsageError("--config expands beyond the per-peer backend limit");
   }
   for (const auto& backend : lowered.backends) {

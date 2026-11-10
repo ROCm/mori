@@ -147,11 +147,15 @@ TEST(FabricStorageConfig, DefaultsPreserveRdmaAndHipAllocation) {
   ScopedEnvironment allocation("UMBP_HBM_ALLOCATION", nullptr);
   ScopedEnvironment placement("UMBP_KV_PUT_PLACEMENT", nullptr);
   ScopedEnvironment ranged("UMBP_KV_RANGED_PATH", nullptr);
+  ScopedEnvironment staging("UMBP_FABRIC_READ_STAGING_BYTES", nullptr);
+  ScopedEnvironment staging_device("UMBP_FABRIC_READ_STAGING_DEVICE", nullptr);
   UMBPDistributedConfig config;
   EXPECT_EQ(config.io_engine.mode, UMBPTransferMode::kRdma);
   EXPECT_EQ(config.hbm.allocation, UMBPHbmAllocation::kHipMalloc);
   EXPECT_EQ(config.kv_put_placement, UMBPKvPutPlacement::kMaster);
   EXPECT_EQ(config.kv_ranged_path, UMBPKvRangedPath::kLegacy);
+  EXPECT_EQ(config.fabric_read_staging_bytes, 0u);
+  EXPECT_EQ(config.fabric_read_staging_device, 0);
 }
 
 TEST(FabricStorageConfig, EnvironmentOptionsSurviveLowering) {
@@ -162,6 +166,8 @@ TEST(FabricStorageConfig, EnvironmentOptionsSurviveLowering) {
   ScopedEnvironment ranged("UMBP_KV_RANGED_PATH", "gpu_direct");
   ScopedEnvironment reads("UMBP_KV_MAX_INFLIGHT_READS", "7");
   ScopedEnvironment bytes("UMBP_KV_MAX_INFLIGHT_BYTES", "1234567");
+  ScopedEnvironment staging("UMBP_FABRIC_READ_STAGING_BYTES", "8388608");
+  ScopedEnvironment staging_device("UMBP_FABRIC_READ_STAGING_DEVICE", "2");
   UMBPDistributedConfig config;
   config.hbm.device = 3;
   config.hbm.capacity_bytes = 123456;
@@ -175,6 +181,49 @@ TEST(FabricStorageConfig, EnvironmentOptionsSurviveLowering) {
   EXPECT_EQ(lowered.kv_ranged_path, UMBPKvRangedPath::kGpuDirect);
   EXPECT_EQ(lowered.kv_max_inflight_reads, 7u);
   EXPECT_EQ(lowered.kv_max_inflight_bytes, 1234567u);
+  EXPECT_EQ(lowered.fabric_read_staging_bytes, 8388608u);
+  EXPECT_EQ(lowered.fabric_read_staging_device, 2);
+  const PoolClientConfig direct;
+  EXPECT_EQ(direct.fabric_read_staging_bytes, 8388608u);
+  EXPECT_EQ(direct.fabric_read_staging_device, 2);
+}
+
+TEST(FabricStorageConfig, RejectsMalformedFabricReadStagingOptions) {
+  for (const char* value : {"", "-1", "8bytes", "18446744073709551616"}) {
+    ScopedEnvironment staging("UMBP_FABRIC_READ_STAGING_BYTES", value);
+    EXPECT_THROW(UMBPDistributedConfig{}, std::invalid_argument) << value;
+    EXPECT_THROW(PoolClientConfig{}, std::invalid_argument) << value;
+  }
+  for (const char* value : {"-1", "1garbage", "2147483648"}) {
+    ScopedEnvironment device("UMBP_FABRIC_READ_STAGING_DEVICE", value);
+    EXPECT_THROW(UMBPDistributedConfig{}, std::invalid_argument) << value;
+  }
+  ScopedEnvironment disabled("UMBP_FABRIC_READ_STAGING_BYTES", "0");
+  EXPECT_EQ(UMBPDistributedConfig{}.fabric_read_staging_bytes, 0u);
+}
+
+TEST(FabricStorageConfig, FabricReadStagingRequiresFabricAndDoesNotOptInHbmStorage) {
+  UMBPConfig config;
+  config.ssd.enabled = false;
+  config.distributed = UMBPDistributedConfig{};
+  auto& distributed = *config.distributed;
+  distributed.master_config.node_id = "dram-owner";
+  distributed.master_config.node_address = "127.0.0.1:5000";
+  distributed.medium = UMBPMedium::DRAM;
+  distributed.fabric_read_staging_bytes = 8ULL * 1024 * 1024;
+  distributed.io_engine.mode = UMBPTransferMode::kRdma;
+  std::string error;
+  EXPECT_FALSE(config.Validate(&error));
+  EXPECT_NE(error.find("fabric_read_staging_bytes"), std::string::npos);
+  distributed.io_engine.mode = UMBPTransferMode::kAuto;
+  EXPECT_TRUE(config.Validate(&error)) << error;
+  EXPECT_EQ(distributed.hbm.capacity_bytes, 0u);
+  const auto lowered = ToPoolClientConfig(distributed, {});
+  EXPECT_EQ(lowered.medium, TierType::DRAM);
+  EXPECT_TRUE(lowered.hbm.buffer_sizes.empty());
+  distributed.fabric_read_staging_device = -1;
+  EXPECT_FALSE(config.Validate(&error));
+  EXPECT_NE(error.find("fabric_read_staging_device"), std::string::npos);
 }
 
 TEST(FabricStorageConfig, RejectsUnknownTransportBeforeHardwareInitialization) {

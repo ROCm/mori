@@ -70,6 +70,7 @@ SsdBackend::~SsdBackend() {
 // ---------------------------------------------------------------------------
 
 bool SsdBackend::Init(MemoryRegistrar* registrar) {
+  if (quarantined_.load(std::memory_order_acquire)) return false;
   if (initialized_) return true;
   if (!cfg_.ssd.enabled) {
     MORI_UMBP_ERROR("[SsdBackend] Init: SSD tier is disabled in config");
@@ -149,6 +150,7 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
   }
 
   initialized_ = true;
+  accepting_requests_.store(true, std::memory_order_release);
   StartReaper();
   MORI_UMBP_INFO(
       "[SsdBackend] Init staging_pages={} page_size={} arena_bytes={} hugepages={} "
@@ -160,9 +162,23 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
 
 void SsdBackend::Shutdown() {
   if (!initialized_) return;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    accepting_requests_.store(false, std::memory_order_release);
+  }
   StopReaper();
 
-  if (registrar_ != nullptr && buffer_ref_.Valid()) registrar_->Deregister(buffer_ref_);
+  bool outstanding = quarantined_.load(std::memory_order_acquire);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Drain unheld reads first. Extent holds are not all kept in read_leases_,
+    // and writes may be in their unlocked IO phase, so arena occupancy is the
+    // conservative lifetime check for every kind of staging span.
+    ReclaimReadLeasesLocked(std::chrono::steady_clock::time_point::max());
+    outstanding |= staging_pages_in_use_.load(std::memory_order_relaxed) != 0;
+  }
+  if (!outstanding && registrar_ != nullptr && buffer_ref_.Valid())
+    registrar_->Deregister(buffer_ref_);
   buffer_ref_ = TransferRef{};
   buffer_desc_.clear();
 
@@ -180,8 +196,17 @@ void SsdBackend::Shutdown() {
   }
 
   // Deregister before release, same ordering rule as PageBackend::Shutdown.
-  if (staging_source_ != nullptr) staging_source_->Release();
-  staging_source_.reset();
+  if (outstanding) {
+    // An unconfirmed bridge H2D copy can still read the host source. Retain
+    // both its allocation and registration until a verified process/device
+    // fence; losing the completion hold is not evidence that DMA stopped.
+    quarantined_.store(true, std::memory_order_release);
+    MORI_UMBP_ERROR("[SsdBackend] retaining staging arena at shutdown: outstanding transfers");
+    (void)staging_source_.release();
+  } else {
+    if (staging_source_ != nullptr) staging_source_->Release();
+    staging_source_.reset();
+  }
   staging_base_ = nullptr;
 
   {
@@ -189,11 +214,23 @@ void SsdBackend::Shutdown() {
     pending_.clear();
     migration_reads_.clear();
     read_leases_.clear();
+    extent_stages_.clear();
+    shared_stages_.clear();
     staging_page_used_.clear();
   }
 
   initialized_ = false;
   registrar_ = nullptr;
+}
+
+bool SsdBackend::QuarantineBackingMemory() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    accepting_requests_.store(false, std::memory_order_release);
+    quarantined_.store(true, std::memory_order_release);
+  }
+  StopReaper();
+  return initialized_ && staging_source_ != nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -239,10 +276,15 @@ SsdBackend::StagingSpan SsdBackend::AcquireStagingSpanLocked(uint32_t page_count
   return span;
 }
 
-void SsdBackend::ReturnedSpans::Return(StagingSpan span) {
-  std::lock_guard<std::mutex> lock(mu);
-  spans.push_back(span);
-  count.store(spans.size(), std::memory_order_relaxed);
+void SsdBackend::ReturnedSpans::Return(StagingSpan span) noexcept {
+  try {
+    std::lock_guard<std::mutex> lock(mu);
+    spans.push_back(span);
+    count.store(spans.size(), std::memory_order_relaxed);
+  } catch (...) {
+    // A last-reader destructor must not throw. Keep the span occupied when
+    // its return cannot be recorded; Shutdown will retain its backing memory.
+  }
 }
 
 size_t SsdBackend::DrainReturnedSpansLocked() {
@@ -386,6 +428,7 @@ void SsdBackend::NoteEventQueuedLocked() {
 
 std::vector<AllocateResult> SsdBackend::BatchAllocate(const std::vector<AllocateRequest>& entries) {
   std::vector<AllocateResult> results(entries.size());
+  if (!accepting_requests_.load(std::memory_order_acquire)) return results;
   if (clear_full_sync_pending_.load(std::memory_order_acquire)) {
     // Gated until master has acked the empty full sync, same rule as
     // PageBackend: no new owned key may appear in that window.
@@ -413,6 +456,12 @@ std::vector<AllocateResult> SsdBackend::BatchAllocate(const std::vector<Allocate
   std::vector<size_t> unused_records;
   const auto now = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lock(mutex_);
+  if (!accepting_requests_.load(std::memory_order_acquire)) {
+    lock.unlock();
+    for (size_t i = 0; i < records.size(); ++i)
+      if (records[i]) ssd_->AbortReserved(entries[i].key, *records[i]);
+    return results;
+  }
   for (size_t i = 0; i < entries.size(); ++i) {
     const auto& req = entries[i];
     AllocateResult& out = results[i];
@@ -497,6 +546,7 @@ std::vector<CommitResult> SsdBackend::BatchCommit(const std::vector<CommitReques
   todo.reserve(entries.size());
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!accepting_requests_.load(std::memory_order_acquire)) return results;
     for (size_t i = 0; i < entries.size(); ++i) {
       auto it = pending_.find(entries[i].slot_id);
       if (it == pending_.end()) continue;  // results[i].success stays false
@@ -573,6 +623,8 @@ std::vector<bool> SsdBackend::BatchAbort(const std::vector<uint64_t>& slot_ids) 
   std::vector<PendingSlot> reserved;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (quarantined_.load(std::memory_order_acquire))
+      return std::vector<bool>(slot_ids.size(), false);
     for (uint64_t slot_id : slot_ids) {
       auto it = pending_.find(slot_id);
       if (it == pending_.end()) continue;  // idempotent: already reaped or unknown
@@ -615,12 +667,14 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
                                                     bool include_descs, bool allow_file_refs,
                                                     ResolveReader reader,
                                                     const std::vector<ObjectExtent>* extents) {
-  const bool local = reader == ResolveReader::kLocal;
+  // Completion-pinned wire reads need the same holds, covered extents, and
+  // shared stages as in-process reads, without the local half-arena budget.
+  const bool local = reader != ResolveReader::kRemote;
   std::vector<ResolvedEntry> results(keys.size());
-  if (keys.empty()) return results;
+  if (keys.empty() || !accepting_requests_.load(std::memory_order_acquire)) return results;
   const auto now = std::chrono::steady_clock::now();
-  // Stage only the bytes an in-process reader names (design-ssd-ranged-io.md D1).
-  // A remote reader's extent does not travel on the wire (D2), so it stages whole.
+  // Stage only the bytes an in-process or completion-pinned wire reader names.
+  // A legacy TTL reader stages the whole object.
   const bool use_extents =
       extent_staging_ && extents != nullptr && extents->size() == keys.size() && local;
 
@@ -671,6 +725,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // with no new reservation kept.  A local reader copies its part first.
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!accepting_requests_.load(std::memory_order_acquire)) return results;
     for (size_t i = 0; i < keys.size(); ++i) {
       auto it = read_leases_.find(keys[i]);
       if (it != read_leases_.end()) {  // a whole-object lease serves any extent too
@@ -766,7 +821,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
     };
     uint64_t requested_pages = 0;
     for (const Read& read : reads) requested_pages += read.page_count;
-    if (local) {
+    if (reader == ResolveReader::kLocal) {
       // Up to half the arena, leaving the rest to concurrent readers; the first
       // key goes past that so every call progresses.  The rest is kBusy.
       const uint64_t budget = std::max<size_t>(staging_page_used_.size() / 2, 1);
@@ -784,10 +839,6 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       }
       fail_from(staged, ResolveOutcome::kBusy);
       reads.resize(staged);
-      for (Read& read : reads) {
-        read.stage = std::make_shared<SharedStage>();
-        shared_stages_[read.stage_key] = read.stage;
-      }
     } else {
       if (requested_pages > staging_page_used_.size()) {
         fail_from(0, ResolveOutcome::kFailed);
@@ -807,6 +858,12 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
               j, reads.size());
           return results;
         }
+      }
+    }
+    if (local) {
+      for (Read& read : reads) {
+        read.stage = std::make_shared<SharedStage>();
+        shared_stages_[read.stage_key] = read.stage;
       }
     }
   }
@@ -893,7 +950,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
 
 bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
                                       bool allow_file_ref) {
-  if (resolved == nullptr) return false;
+  if (resolved == nullptr || !accepting_requests_.load(std::memory_order_acquire)) return false;
   if (!ssd_->PinForMigration(key)) return false;
   const uint64_t size = ssd_->SizeOf(key);
 
@@ -902,7 +959,8 @@ bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* res
   if (loc) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (!migration_reads_
+      if (!accepting_requests_.load(std::memory_order_acquire) ||
+          !migration_reads_
                .emplace(key, ReadLease{StagingSpan{}, size,
                                        std::chrono::steady_clock::time_point::max()})
                .second) {
@@ -927,7 +985,7 @@ bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* res
   StagingSpan span;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (migration_reads_.count(key) != 0) {
+    if (!accepting_requests_.load(std::memory_order_acquire) || migration_reads_.count(key) != 0) {
       ssd_->UnpinForMigration(key);
       return false;
     }
@@ -1098,6 +1156,7 @@ void SsdBackend::ReaperSweep() {
   const auto now = std::chrono::steady_clock::now();
   std::vector<PendingSlot> expired_records;
   std::unique_lock<std::mutex> lock(mutex_);
+  if (quarantined_.load(std::memory_order_acquire)) return;
 
   for (auto it = pending_.begin(); it != pending_.end();) {
     if (it->second.deadline <= now) {

@@ -157,6 +157,14 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         out->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
       }
     }
+    if (pool_ != nullptr) {
+      for (const auto& d : pool_->FabricReadStagingDescriptors()) {
+        auto* out = response->add_buffer_descs();
+        out->set_backend_id(d.backend_id);
+        out->set_buffer_index(d.buffer_index);
+        out->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
+      }
+    }
     // Uniform across backends; BackendRegistry::Register refuses a backend that
     // disagrees, so there is one page size to report.
     if (registry_ != nullptr) response->set_page_size(registry_->PageSize());
@@ -439,6 +447,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       entries[i].backend_id = result.backend_id;
       entries[i].size = r.size;
       entries[i].pages = std::move(r.pages);
+      entries[i].covered_offset = r.covered_offset;
+      entries[i].covered_size = r.covered_size;
       total_bytes += r.size;
 
       if (omit_descs) continue;
@@ -469,8 +479,14 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     if (pool_ == nullptr) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "no peer pool");
     const auto& resolve = request->resolve();
     std::vector<std::string> keys(resolve.keys().begin(), resolve.keys().end());
+    if (resolve.extents_size() != 0 && resolve.extents_size() != static_cast<int>(keys.size()))
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "extents must be parallel to keys");
+    std::vector<ObjectExtent> extents;
+    for (const auto& extent : resolve.extents())
+      extents.push_back({extent.offset(), extent.length()});
     auto grant = pool_->AcquireReadBatch(
-        keys, request->operation_id(), request->expected_pool_generation(), !resolve.omit_descs());
+        keys, request->operation_id(), request->expected_pool_generation(), !resolve.omit_descs(),
+        extents.empty() ? nullptr : &extents, request->require_fabric());
     response->set_pool_generation(grant.generation);
     if (!grant.accepted) {
       return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
@@ -490,6 +506,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       entry.tier = source.tier;
       entry.size = source.resolved.size;
       entry.pages = source.resolved.pages;
+      entry.covered_offset = source.resolved.covered_offset;
+      entry.covered_size = source.resolved.covered_size;
       if (entry.found) bytes += entry.size;
       for (auto desc : source.resolved.descs) {
         desc.backend_id = source.backend_id;

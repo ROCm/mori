@@ -23,6 +23,7 @@
 
 #include "umbp/common/device_copy.h"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/pool/fabric_read_staging.h"
 #include "umbp/distributed/pool_platform.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/sim/sim.h"
@@ -86,6 +87,14 @@ class SimPoolPlatform final : public PoolPlatform {
     const PointerLocation location = DetectPointerLocation(ptr);
     if (!location.IsDevice()) return TransferRef::HostBytes(ptr, size);
     return TransferRef::HostBytes(ptr, size, mori::io::MemoryLocationType::GPU, location.device_id);
+  }
+
+  std::shared_ptr<FabricReadStaging> CreateFabricReadStaging(TransferEngine* engine,
+                                                             uint64_t page_size, uint64_t bytes,
+                                                             int device) override {
+    return std::make_shared<FabricReadStaging>(
+        engine, std::make_unique<SimPageMemorySource>(mori::io::MemoryLocationType::GPU, device),
+        page_size, bytes);
   }
 
   HostBufferHandle AllocateHost(size_t size, const HostBufferOptions&) override {

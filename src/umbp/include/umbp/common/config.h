@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -319,6 +320,20 @@ inline size_t PositiveSizeFromEnvironment(const char* name, size_t default_value
   return static_cast<size_t>(parsed);
 }
 
+inline uint64_t NonnegativeIntegerFromEnvironment(
+    const char* name, uint64_t default_value,
+    uint64_t max_value = std::numeric_limits<uint64_t>::max()) {
+  const char* value = std::getenv(name);
+  if (!value) return default_value;
+  const std::string text(value);
+  uint64_t parsed = 0;
+  const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed);
+  if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || parsed > max_value) {
+    throw std::invalid_argument(std::string(name) + " must be a nonnegative integer within range");
+  }
+  return parsed;
+}
+
 // IO-engine endpoint and transport options. The RDMA default preserves existing deployments.
 struct UMBPIoEngineConfig {
   std::string host;   // RDMA engine hostname (formerly UMBPDistributedConfig::io_engine_host)
@@ -547,6 +562,13 @@ struct UMBPDistributedConfig {
   size_t kv_max_inflight_reads = PositiveSizeFromEnvironment("UMBP_KV_MAX_INFLIGHT_READS", 32);
   size_t kv_max_inflight_bytes =
       PositiveSizeFromEnvironment("UMBP_KV_MAX_INFLIGHT_BYTES", size_t{256} * 1024 * 1024);
+
+  // Exportable HBM read bridge for DRAM/SSD owners. Separate from KV placement
+  // capacity; 0 disables it. Requires auto or fabric_strict transfer mode.
+  uint64_t fabric_read_staging_bytes =
+      NonnegativeIntegerFromEnvironment("UMBP_FABRIC_READ_STAGING_BYTES", 0);
+  int fabric_read_staging_device = static_cast<int>(NonnegativeIntegerFromEnvironment(
+      "UMBP_FABRIC_READ_STAGING_DEVICE", 0, std::numeric_limits<int>::max()));
 };
 
 // User-facing same-host standalone-process configuration.  Set
@@ -723,6 +745,15 @@ struct UMBPConfig {
       }
       if (d.kv_max_inflight_reads == 0 || d.kv_max_inflight_bytes == 0) {
         if (error_message) *error_message = "KV in-flight read and byte budgets must be > 0";
+        return false;
+      }
+      if (d.fabric_read_staging_device < 0) {
+        if (error_message) *error_message = "fabric_read_staging_device must be >= 0";
+        return false;
+      }
+      if (d.fabric_read_staging_bytes > 0 && d.io_engine.mode == UMBPTransferMode::kRdma) {
+        if (error_message)
+          *error_message = "fabric_read_staging_bytes requires auto or fabric_strict transfer mode";
         return false;
       }
       if (d.io_engine.mode == UMBPTransferMode::kFabricStrict &&

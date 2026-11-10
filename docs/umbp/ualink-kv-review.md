@@ -151,8 +151,9 @@ until all consumers have completed.
 
 Actual f01-1/f01-2 data-path validation, cross-tray bandwidth, packed-path
 comparisons and model-level speedup remain outstanding until these tests run.
-Paged HBM/DRAM are covered by completion protection; local SSD GPU staging fault
-fencing remains separate work.
+Paged HBM/DRAM and cold-tier read staging are covered by completion protection.
+Remote protected SSD allocation remains unsupported; the cold-tier read feature
+serves committed owner-local SSD objects.
 
 ## Follow-up verification
 
@@ -180,3 +181,71 @@ Only the relevant UMBP/IO targets and independent UMBP Python extension were
 built. This reduced configuration disables OPS/SHMEM, so the generic MORI Python
 module cannot link those libraries. Actual two-host UALink validation remains
 pending; no cross-tray throughput or inference-speedup result is claimed.
+
+## DRAM/SSD extension reviewed on 2026-11-10
+
+Committed DRAM/SSD KV can now be read through a bounded owner HBM FABRIC arena.
+The installed runtime rejected Host/HostNuma Fabric export while Device VMM
+export/import/copy succeeded, so the implementation uses explicit owner H2D
+staging. The capability results are recorded in
+[ualink-host-memory-capability.md](ualink-host-memory-capability.md).
+
+Review corrections and optimizations:
+
+* SSD's previous local half-arena batch limit could return the same successful
+  prefix and BUSY suffix on every whole-grant retry. A completion-pinned reader
+  now reserves its whole batch against the full host arena, rolling back on
+  transient pressure and rejecting permanently oversized shapes.
+* Owner read receipts now reserve and publish in two phases. SSD I/O and H2D
+  run outside receipt locks; duplicate operations join one preparation. Short
+  publication locks atomically fence Clear/abandon before a token is exposed.
+  Latch tests verify that independent reads and pin releases proceed during a
+  slow preparation, and source/staging holds survive cancellation until drain.
+* Read windows reach the owner. SSD extent staging and H2D can prepare the
+  smallest continuous envelope of requested ranges. Object size/tier stay
+  unchanged; the consumer rebases ranges onto the covered window. Mixed native
+  HBM and cold-tier replies keep separate descriptor shelves and full-window
+  sentinels, including when descriptors are omitted on repeat reads.
+* The exportable HBM arena is allocated/registered once. Within-batch source
+  registrations are reused instead of copying descriptor metadata per page.
+  Its reserved wire backend ID never enters storage placement or capacity
+  announcements. Ordinary consumer GPU destinations stay directly registered.
+* Initialization failures retire the arena before its registrar. SSD shutdown
+  preserves whole/extent staging backing and registrations while completion
+  holds or uncertain GPU copies remain. Local H2D failures with unconfirmed
+  drain retain preallocated resource wrappers and quarantine backing.
+
+Validation on the final code:
+
+* Eight real local FABRIC cases passed for DRAM and SSD: noncontiguous multi-page
+  subsets, nonzero windows, batched/whole reads, cold/warm reuse, held-grant
+  capacity pressure and same-owner mixed HBM/cold-tier reads. The original GPU
+  source was overwritten after commit; requested and untouched destination
+  bytes, original storage ownership and only FABRIC pull bytes were verified.
+* Ten unit/regression CTest suites passed, covering 10 arena cases, 12 codec
+  cases, 62 peer pool cases, 56 SSD cases, 15 storage config cases, 51 page
+  cases, 25 peer service cases, 15 HBM cases, backend policy checks and 11 GPU
+  direct range cases. The GPU range suite used the real copy module.
+* Separate master/owner/consumer processes passed DRAM unaligned async and
+  SSD aligned blocking reads, each with five iterations and three cold-client
+  samples. Each call requested 17,010 bytes and the selected FABRIC submitted
+  byte count matched it. The SSD case used POSIX I/O with direct I/O enabled.
+  Both process tests ran locally; they do not measure a physical cross-tray link.
+* Seven existing local/standalone SSD ranged cases passed with the host's XGMI
+  fallback enabled. The legacy remote CPU/RDMA case could not pass on this
+  host without an active RDMA device. The new strict SSD FABRIC path passed.
+* The independent UMBP Python extension built and passed staging defaults,
+  environment parsing and writable configuration-field checks.
+* Forty-four SIM cases passed. The remaining existing
+  `IndexerMetadataPreservesScalarTraceAndFlushFailure/1` case was independently
+  reproduced and traced to commit `4a1c72f`: a pre-transfer metadata rejection
+  permanently quarantines the standalone client. It is outside this extension
+  and remains unresolved; the full SIM suite is not reported as passing.
+
+Logs are retained in `build-ualink/ualink-cold-*.log`. Actual f01-1/f01-2
+verification remains pending. The next performance experiment should measure
+SSD I/O, owner H2D, consumer FABRIC copy and control RPC costs separately.
+This version reuses arena allocations and mappings, but re-stages cold data
+per grant. Reusing an already-pinned HBM window across consumers would need
+immutable-content/generation identity, single-flight preparation and shared
+completion ownership; it is a separate optimization after tray measurements.

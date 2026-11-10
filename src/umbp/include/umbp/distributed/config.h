@@ -396,6 +396,13 @@ struct PoolClientConfig {
   // into eight racing binds.  The standalone server, which is one process per
   // node, opts in explicitly.
   MetricSink* metric_sink = nullptr;
+
+  // Dedicated exportable HBM arena for remote reads of host/SSD KV. This is
+  // transient read capacity and never advertised as a storage backend.
+  uint64_t fabric_read_staging_bytes =
+      NonnegativeIntegerFromEnvironment("UMBP_FABRIC_READ_STAGING_BYTES", 0);
+  int fabric_read_staging_device = static_cast<int>(NonnegativeIntegerFromEnvironment(
+      "UMBP_FABRIC_READ_STAGING_DEVICE", 0, std::numeric_limits<int>::max()));
 };
 
 // Lower a user-facing UMBPDistributedConfig to the internal PoolClientConfig.
@@ -420,6 +427,8 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.kv_ranged_path = dc.kv_ranged_path;
   pc.kv_max_inflight_reads = dc.kv_max_inflight_reads;
   pc.kv_max_inflight_bytes = dc.kv_max_inflight_bytes;
+  pc.fabric_read_staging_bytes = dc.fabric_read_staging_bytes;
+  pc.fabric_read_staging_device = dc.fabric_read_staging_device;
   pc.staging_buffer_size = dc.staging_buffer_size;
   // The ranged scratch buffers/sizes are set by DistributedClient after it
   // allocates and registers the two arenas (see DistributedClient ctor).

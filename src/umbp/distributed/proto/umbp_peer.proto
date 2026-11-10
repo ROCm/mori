@@ -209,6 +209,12 @@ message BatchAbortSlotsResponse {
   repeated bool success = 1;
 }
 
+message ReadObjectExtent {
+  uint64 offset = 1;
+  // Zero length requests the whole object.
+  uint64 length = 2;
+}
+
 message BatchResolveKeysRequest {
   repeated string keys = 1;
   // When set, the peer omits the per-buffer descriptors from the response: the
@@ -220,6 +226,9 @@ message BatchResolveKeysRequest {
   // While it published one medium's, this flag suppressed the descriptors that
   // would have corrected the reader, and the miss became a wrong-memory read.
   bool omit_descs = 2;
+  // Optional, parallel to keys. New completion-pin peers can stage only this
+  // object-relative window. Old peers ignore it and return the whole object.
+  repeated ReadObjectExtent extents = 3;
 }
 
 enum ResolveStatus {
@@ -267,6 +276,10 @@ message BatchResolveKeysResponse {
   // (buffer_index, page_index) pairs, walking keys in order.
   repeated uint32 buffer_index = 7;
   repeated uint32 page_index   = 8;
+  // Optional parallel arrays. Nonzero covered_size means pages tile only
+  // [covered_offset, covered_offset + covered_size); size remains object size.
+  repeated uint64 covered_offset = 11;
+  repeated uint64 covered_size = 12;
 }
 
 // A grant retains ALL completion holds in this batch, including staged bytes.
@@ -278,6 +291,9 @@ message BatchAcquireReadKeysRequest {
   string operation_id = 2;
   string expected_owner_incarnation = 3;
   uint64 expected_pool_generation = 4;
+  // Resolve a cold source through the owner's bounded GPU FABRIC read arena.
+  // Never authorizes RDMA fallback. Existing HBM sources remain direct.
+  bool require_fabric = 5;
 }
 message BatchAcquireReadKeysResponse {
   BatchResolveKeysResponse resolved = 1;

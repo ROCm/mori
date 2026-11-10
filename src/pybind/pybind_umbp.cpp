@@ -319,7 +319,10 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("kv_put_placement", &UMBPDistributedConfig::kv_put_placement)
       .def_readwrite("kv_ranged_path", &UMBPDistributedConfig::kv_ranged_path)
       .def_readwrite("kv_max_inflight_reads", &UMBPDistributedConfig::kv_max_inflight_reads)
-      .def_readwrite("kv_max_inflight_bytes", &UMBPDistributedConfig::kv_max_inflight_bytes);
+      .def_readwrite("kv_max_inflight_bytes", &UMBPDistributedConfig::kv_max_inflight_bytes)
+      .def_readwrite("fabric_read_staging_bytes", &UMBPDistributedConfig::fabric_read_staging_bytes)
+      .def_readwrite("fabric_read_staging_device",
+                     &UMBPDistributedConfig::fabric_read_staging_device);
 
   py::class_<UMBPStandaloneProcessConfig>(m, "UMBPStandaloneProcessConfig")
       .def(py::init<>())

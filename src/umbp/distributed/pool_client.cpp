@@ -58,6 +58,7 @@
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_service.h"
+#include "umbp/distributed/pool/fabric_read_staging.h"
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/range_map.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
@@ -967,6 +968,7 @@ std::string PoolClient::NewOperationId() {
 
 void PoolClient::QuarantineGpuResources() noexcept {
   gpu_quarantined_ = true;
+  if (default_pool_) default_pool_->QuarantineReadStaging();
   // All() builds a vector; emergency retention must also work when allocation
   // caused the failure. Dense IDs let us visit the same backends in place.
   for (uint32_t i = 0; i < registry_.Size(); ++i) {
@@ -1104,6 +1106,14 @@ PoolClient::RemotePutInFlight::~RemotePutInFlight() {
 
 bool PoolClient::Init() {
   if (gpu_quarantined_) return false;
+  if (config_.fabric_read_staging_device < 0 ||
+      (config_.fabric_read_staging_bytes > 0 &&
+       config_.io_engine.mode == UMBPTransferMode::kRdma)) {
+    MORI_UMBP_ERROR(
+        "[PoolClient] fabric read staging requires a nonnegative GPU device and auto or "
+        "fabric_strict transfer mode");
+    return false;
+  }
   bool expected = false;
   if (!initialized_.compare_exchange_strong(expected, true)) return true;
   {
@@ -1223,7 +1233,8 @@ bool PoolClient::Init() {
     if (config_.io_engine.mode == UMBPTransferMode::kFabricStrict &&
         backend->Tier() == TierType::HBM) {
       for (size_t b = 0; b < backend->BufferCount(); ++b) {
-        if (backend->BufferRef(b).mem.fabricHandle.empty()) {
+        const auto& token = backend->BufferRef(b).mem.fabricHandle;
+        if (std::all_of(token.begin(), token.end(), [](char byte) { return byte == 0; })) {
           MORI_UMBP_ERROR("[PoolClient] strict FABRIC source pool '{}' buffer {} is not exportable",
                           backend_config.name, b);
           backend->Shutdown();
@@ -1248,6 +1259,26 @@ bool PoolClient::Init() {
   }
   default_pool_ =
       std::make_unique<PeerPool>(&registry_, std::move(placement_policy), transfer_engine_.get());
+  if (config_.fabric_read_staging_bytes > 0) {
+    std::shared_ptr<FabricReadStaging> staging;
+    bool ready = false;
+    try {
+      staging = platform_->CreateFabricReadStaging(transfer_engine_.get(), page_size,
+                                                   config_.fabric_read_staging_bytes,
+                                                   config_.fabric_read_staging_device);
+      ready = staging && staging->Init(&registry_, !config_.sim.enabled);
+    } catch (...) {
+      ready = false;
+    }
+    if (!ready) {
+      MORI_UMBP_ERROR("[PoolClient] fabric read staging initialization failed");
+      // The arena's registration must retire before Shutdown destroys its engine.
+      staging.reset();
+      Shutdown();
+      return false;
+    }
+    default_pool_->SetFabricReadStaging(std::move(staging), [this] { QuarantineGpuResources(); });
+  }
 
   // Local watermark eviction, for every medium unless a master's rounds own
   // DRAM/HBM (eviction_mode kMaster; SSD always evicts locally).  A node that
@@ -5564,7 +5595,21 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
       peer_directory_ != nullptr && peer_directory_->HasRemoteBuffers(peer.node_id);
 
   ::umbp::BatchResolveKeysRequest resolve_req;
-  for (const auto& item : items) resolve_req.add_keys(*item.key);
+  for (const auto& item : items) {
+    resolve_req.add_keys(*item.key);
+    auto* extent = resolve_req.add_extents();
+    if (item.Ranged() && !item.spans->empty()) {
+      uint64_t begin = item.size, end = 0;
+      for (const auto& span : *item.spans) {
+        if (span.object_offset > item.size || span.size > item.size - span.object_offset)
+          return false;
+        begin = std::min<uint64_t>(begin, span.object_offset);
+        end = std::max<uint64_t>(end, span.object_offset + span.size);
+      }
+      extent->set_offset(begin);
+      extent->set_length(end - begin);
+    }
+  }
   resolve_req.set_omit_descs(have_descs);
 
   DecodedBatchResolve decoded;
@@ -5598,6 +5643,7 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
       acquire.set_operation_id(operation_id);
       acquire.set_expected_owner_incarnation(peer.owner_incarnation);
       acquire.set_expected_pool_generation(peer.pool_generation);
+      acquire.set_require_fabric(config_.io_engine.mode == UMBPTransferMode::kFabricStrict);
       ::umbp::BatchAcquireReadKeysResponse grant;
       {
         PhaseTimer resolve_timer(t_remote_leg ? t_remote_leg->resolve : nullptr);
@@ -5690,7 +5736,10 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
       (*results)[item.index] = false;
       continue;
     }
-    if (!SizeMatchesAllocation(item.size, key.pages.size(), decoded.page_size)) {
+    const uint64_t covered_bytes = key.covered_size ? key.covered_size : key.size;
+    if (!SizeMatchesAllocation(covered_bytes, key.pages.size(), decoded.page_size) ||
+        (!item.Ranged() && key.covered_size &&
+         (key.covered_offset != 0 || key.covered_size != key.size))) {
       MORI_UMBP_ERROR("[PoolClient] BatchGet: malformed slot for key='{}'", *item.key);
       (*results)[item.index] = false;
       continue;
@@ -5704,6 +5753,8 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     // once; the pages below are indices into THIS backend's buffers.
     entry.plan.backend_id = key.backend_id;
     entry.plan.pages = std::move(decoded.keys[i].pages);
+    entry.plan.covered_offset = key.covered_offset;
+    entry.plan.covered_size = key.covered_size;
     // Descriptors were hydrated batch-level above; the per-entry plan carries
     // none (BuildRemoteGetTransfers' EnsureBufferDescsCached call is a no-op on
     // an empty list and the read path resolves descriptors by buffer_index).
@@ -5800,8 +5851,18 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
             break;
           }
         }
+        size_t source_offset = span.object_offset;
+        if (entry.plan.covered_size &&
+            !RebaseRangeOntoWindow(entry.plan.covered_offset, entry.plan.covered_size,
+                                   &source_offset, span.size)) {
+          entry.failed = true;
+          entry_items.clear();
+          break;
+        }
+        const uint64_t covered_bytes =
+            entry.plan.covered_size ? entry.plan.covered_size : entry.item->size;
         const bool walked = ForEachRangePageFragment(
-            entry.plan.pages, entry.plan.page_size, entry.item->size, span.object_offset, span.size,
+            entry.plan.pages, entry.plan.page_size, covered_bytes, source_offset, span.size,
             [&](size_t page_index, uint64_t tier_offset, size_t fragment, size_t copied) {
               const TransferRef* buf = peer_buffer(entry.plan.pages[page_index]);
               if (buf == nullptr) return false;

@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <set>
@@ -36,6 +37,7 @@
 
 #include "umbp/common/env_time.h"
 #include "umbp/common/parallel_for.h"
+#include "umbp/distributed/pool/fabric_read_staging.h"
 
 namespace mori::umbp {
 
@@ -125,7 +127,7 @@ PeerPool::~PeerPool() {
   // An RPC server stopping does not fence remote GPU loads. Retain active
   // holds so PageBackend::Shutdown can quarantine its backing allocation.
   for (auto& [operation, receipt] : read_receipts_) {
-    if (!receipt.released) (void)receipt.grant.release();
+    if (!receipt->released) (void)receipt->grant.release();
   }
 }
 
@@ -900,47 +902,151 @@ uint64_t PeerPool::Generation() const {
   return clear_epoch_;
 }
 
+void PeerPool::SetFabricReadStaging(std::shared_ptr<FabricReadStaging> staging,
+                                    std::function<void()> quarantine) {
+  fabric_read_staging_ = std::move(staging);
+  read_staging_quarantine_ = std::move(quarantine);
+}
+
+std::vector<BufferMemoryDescBytes> PeerPool::FabricReadStagingDescriptors() const {
+  return fabric_read_staging_ ? fabric_read_staging_->Descriptors()
+                              : std::vector<BufferMemoryDescBytes>{};
+}
+
+void PeerPool::QuarantineReadStaging() noexcept {
+  if (fabric_read_staging_) fabric_read_staging_->QuarantineBackingMemory();
+}
+
 PoolReadGrant PeerPool::AcquireReadBatch(const std::vector<std::string>& keys,
                                          const std::string& operation_id,
-                                         uint64_t expected_generation, bool include_descs) {
-  std::lock_guard<std::mutex> lock(read_pin_mutex_);
+                                         uint64_t expected_generation, bool include_descs,
+                                         const std::vector<ObjectExtent>* extents,
+                                         bool require_fabric) {
   PoolReadGrant rejected;
   rejected.generation = Generation();
   if (operation_id.empty() || rejected.generation != expected_generation) return rejected;
-  auto old = read_receipts_.find(operation_id);
-  if (old != read_receipts_.end()) {
-    if (!old->second.released && old->second.grant && old->second.keys == keys &&
-        old->second.grant->generation == expected_generation)
-      return *old->second.grant;
-    return rejected;
-  }
-  if (auto ordered = OrderedOperation(operation_id)) {
-    if (read_clients_.find(ordered->first) == read_clients_.end() && read_clients_.size() >= 4096)
+  if (extents && extents->size() != keys.size()) return rejected;
+  const auto windows = extents ? *extents : std::vector<ObjectExtent>(keys.size());
+  for (const auto& window : windows) {
+    if ((window.length == 0 && window.offset != 0) ||
+        window.length > std::numeric_limits<uint64_t>::max() - window.offset)
       return rejected;
-    if (ordered->second <= read_clients_[ordered->first]) return rejected;
   }
-  if (read_receipts_.size() >= 65536) return rejected;
-  auto entries = BatchResolve(keys, include_descs, false, ResolveReader::kLocal);
-  if (Generation() != expected_generation) return rejected;
-  for (auto& entry : entries) {
-    // A backend that cannot provide a completion hold must fail closed.
-    if (entry.resolved.found && !entry.resolved.hold) {
-      entry.resolved = ResolvedEntry{};
-      entry.resolved.outcome = ResolveOutcome::kFailed;
+  std::shared_ptr<ReadReceipt> receipt;
+  for (;;) {
+    std::unique_lock<std::mutex> operation_lock(operation_mutex_);
+    std::unique_lock<std::mutex> lock(read_pin_mutex_);
+    rejected.generation = clear_epoch_;
+    if (rejected.generation != expected_generation) return rejected;
+    auto old = read_receipts_.find(operation_id);
+    if (old != read_receipts_.end()) {
+      const auto existing = old->second;
+      if (existing->released || existing->keys != keys ||
+          existing->generation != expected_generation || existing->extents != windows ||
+          existing->require_fabric != require_fabric)
+        return rejected;
+      if (existing->preparing) {
+        // A retry joins this preparation instead of resolving and staging a
+        // second copy. The CV releases the pin lock; no pool lock spans IO.
+        operation_lock.unlock();
+        existing->ready.wait(lock, [&] { return !existing->preparing || existing->released; });
+        continue;  // Recheck the generation and abandonment fence after waking.
+      }
+      if (existing->failure) std::rethrow_exception(existing->failure);
+      return existing->grant ? *existing->grant : rejected;
     }
+    if (auto ordered = OrderedOperation(operation_id)) {
+      if (read_clients_.find(ordered->first) == read_clients_.end() && read_clients_.size() >= 4096)
+        return rejected;
+      if (ordered->second <= read_clients_[ordered->first]) return rejected;
+    }
+    if (read_receipts_.size() >= 65536) return rejected;
+    receipt = std::make_shared<ReadReceipt>();
+    receipt->keys = keys;
+    receipt->extents = windows;
+    receipt->require_fabric = require_fabric;
+    receipt->generation = expected_generation;
+    receipt->preparing = true;
+    read_receipts_.emplace(operation_id, receipt);
+    break;
   }
-  PoolReadGrant grant{true, next_read_token_++, expected_generation, std::move(entries)};
-  ReadReceipt receipt{keys, std::make_unique<PoolReadGrant>(grant), false};
-  auto inserted = read_receipts_.emplace(operation_id, std::move(receipt)).first;
+
   try {
+    auto entries = BatchResolve(keys, include_descs, false, ResolveReader::kPinnedRemote, &windows);
+    {
+      std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+      std::lock_guard<std::mutex> lock(read_pin_mutex_);
+      rejected.generation = clear_epoch_;
+      if (receipt->released || rejected.generation != expected_generation) {
+        receipt->released = true;
+        receipt->preparing = false;
+        receipt->ready.notify_all();
+        return rejected;
+      }
+    }
+    for (auto& entry : entries) {
+      // A backend that cannot provide a completion hold must fail closed.
+      if (entry.resolved.found && !entry.resolved.hold) {
+        entry.resolved = ResolvedEntry{};
+        entry.resolved.outcome = ResolveOutcome::kFailed;
+      }
+    }
+    if (require_fabric) {
+      if (fabric_read_staging_) {
+        // The preparer owns source pins and staging resources until Stage has
+        // drained or quarantined H2D, even if Clear/Abandon cancels the receipt.
+        fabric_read_staging_->Stage(&entries, &windows, include_descs);
+        if (fabric_read_staging_->HasQuarantinedTransfers()) {
+          // Source pages may still be used by the owner-local H2D copy. Preserve
+          // every backing allocation, in addition to the arena's retained holds.
+          if (read_staging_quarantine_)
+            read_staging_quarantine_();
+          else if (backends_) {
+            for (uint32_t i = 0; i < backends_->Size(); ++i)
+              backends_->Get(i)->QuarantineBackingMemory();
+          }
+        }
+      } else {
+        for (auto& entry : entries) {
+          if (entry.resolved.found && entry.tier != TierType::HBM) {
+            entry.resolved = ResolvedEntry{};
+            entry.resolved.outcome = ResolveOutcome::kFailed;
+          }
+        }
+      }
+    }
+    // Allocate both the retained grant and the response before publication.
+    // A later allocation failure cannot strand a published token or source pin.
+    auto retained = std::make_unique<PoolReadGrant>(
+        PoolReadGrant{true, 0, expected_generation, std::move(entries)});
+    PoolReadGrant grant = *retained;
+    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    std::lock_guard<std::mutex> lock(read_pin_mutex_);
+    rejected.generation = clear_epoch_;
+    auto current = read_receipts_.find(operation_id);
+    if (receipt->released || rejected.generation != expected_generation ||
+        current == read_receipts_.end() || current->second != receipt) {
+      receipt->released = true;
+      receipt->preparing = false;
+      receipt->ready.notify_all();
+      return rejected;
+    }
+    grant.token = retained->token = next_read_token_;
     read_tokens_.emplace(grant.token, operation_id);
+    ++next_read_token_;
+    receipt->grant = std::move(retained);
+    receipt->preparing = false;
+    receipt->ready.notify_all();
+    return grant;
   } catch (...) {
-    // No grant was published, so these holds can retire. Keep both indexes
-    // consistent if token indexing cannot allocate its node or key copy.
-    read_receipts_.erase(inserted);
+    // The first preparer owns all work. Wake joined retries on every failure,
+    // preserving one terminal outcome instead of letting them stage again.
+    std::lock_guard<std::mutex> lock(read_pin_mutex_);
+    if (!receipt->released) receipt->failure = std::current_exception();
+    receipt->preparing = false;
+    receipt->ready.notify_all();
     throw;
   }
-  return grant;
 }
 
 std::vector<bool> PeerPool::ReleaseReadPins(const std::vector<uint64_t>& tokens) {
@@ -952,11 +1058,11 @@ std::vector<bool> PeerPool::ReleaseReadPins(const std::vector<uint64_t>& tokens)
       out[i] = tokens[i] > 0 && tokens[i] < next_read_token_;
       continue;
     }
-    auto& receipt = read_receipts_.at(token->second);
+    auto& receipt = *read_receipts_.at(token->second);
     // Receipt/token tombstones remain, so duplicate release is harmless and a
     // retried acquire cannot produce new references to recycled pages.
     receipt.released = true;
-    receipt.grant->entries.clear();
+    if (receipt.grant) receipt.grant->entries.clear();
     if (auto ordered = OrderedOperation(token->second)) {
       auto& completed = read_clients_[ordered->first];
       completed = std::max(completed, ordered->second);
@@ -981,16 +1087,22 @@ std::vector<bool> PeerPool::AbandonReadOperations(const std::vector<std::string>
       auto& completed = read_clients_[ordered->first];
       completed = std::max(completed, ordered->second);
       if (receipt != read_receipts_.end()) {
-        read_tokens_.erase(receipt->second.grant->token);
+        receipt->second->released = true;
+        receipt->second->ready.notify_all();
+        if (receipt->second->grant) {
+          read_tokens_.erase(receipt->second->grant->token);
+          receipt->second->grant->entries.clear();
+        }
         read_receipts_.erase(receipt);
       }
     } else {
       if (receipt == read_receipts_.end()) {
         if (read_receipts_.size() >= 65536) continue;
-        receipt = read_receipts_.emplace(operation, ReadReceipt{}).first;
+        receipt = read_receipts_.emplace(operation, std::make_shared<ReadReceipt>()).first;
       }
-      receipt->second.released = true;
-      if (receipt->second.grant) receipt->second.grant->entries.clear();
+      receipt->second->released = true;
+      receipt->second->ready.notify_all();
+      if (receipt->second->grant) receipt->second->grant->entries.clear();
     }
     out[i] = true;
   }
@@ -1083,7 +1195,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
   if (extents != nullptr && extents->size() != keys.size()) extents = nullptr;
   // A remote reader discards a response holding any kBusy key; a local one
   // reads its hits and comes back for the busy keys.
-  const bool busy_discards = reader == ResolveReader::kRemote;
+  const bool busy_discards = reader != ResolveReader::kLocal;
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   std::vector<PoolResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
@@ -1811,6 +1923,27 @@ void PeerPool::ClearLocal() {
   prefetched_.clear();
   prefetched_bytes_ = 0;
   ++clear_epoch_;
+  {
+    std::lock_guard<std::mutex> lock(read_pin_mutex_);
+    for (auto receipt = read_receipts_.begin(); receipt != read_receipts_.end();) {
+      const auto& state = receipt->second;
+      if (!state->preparing) {
+        ++receipt;
+        continue;
+      }
+      // Cancellation never destroys the preparer's local source/staging pins.
+      // Existing published grants retain their pins until the consumer drains.
+      state->released = true;
+      state->ready.notify_all();
+      if (auto ordered = OrderedOperation(receipt->first)) {
+        auto& completed = read_clients_.at(ordered->first);
+        completed = std::max(completed, ordered->second);
+        receipt = read_receipts_.erase(receipt);
+      } else {
+        ++receipt;
+      }
+    }
+  }
 }
 
 std::vector<KvEvent> PeerPool::DrainPendingEvents() {

@@ -266,5 +266,106 @@ TEST(BatchResolveCodec, OptimizedWireIsSmallerThanPerKeyDescs) {
   EXPECT_GT(naive_desc_total - opt_desc_total, 0u);
 }
 
+TEST(BatchResolveCodec, PartialStagingWindowKeepsObjectSizeAndReservedEndpoint) {
+  ResolvedKeyEntry entry;
+  entry.found = true;
+  entry.tier = TierType::SSD;
+  entry.size = 64 * 4096;
+  entry.backend_id = kFabricReadStagingBackendId;
+  entry.covered_offset = 11 * 4096 + 37;
+  entry.covered_size = 4096 + 19;
+  entry.pages = {{0, 2}, {0, 7}};
+  ::umbp::BatchResolveKeysResponse response;
+  EncodeBatchResolveResponse({entry}, 4096, {}, &response);
+  auto decoded = DecodeBatchResolveResponse(response);
+  ASSERT_EQ(decoded.keys.size(), 1u);
+  EXPECT_EQ(decoded.keys[0].size, entry.size);
+  EXPECT_EQ(decoded.keys[0].tier, TierType::SSD);
+  EXPECT_EQ(decoded.keys[0].backend_id, kFabricReadStagingBackendId);
+  EXPECT_EQ(decoded.keys[0].covered_offset, entry.covered_offset);
+  EXPECT_EQ(decoded.keys[0].covered_size, entry.covered_size);
+  EXPECT_EQ(decoded.keys[0].pages.size(), 2u);
+  EXPECT_EQ(decoded.keys[0].pages[1].page_index, 7u);
+  EXPECT_EQ(BackendRegistry::kMaxBackends, kFabricReadStagingBackendId);
+  EXPECT_EQ(kMaxBackendsPerPeer, BackendRegistry::kMaxBackends + 1);
+}
+
+TEST(BatchResolveCodec, MixedNativeFullAndStagingPartialRoundTripWithCachedDescriptors) {
+  std::vector<ResolvedKeyEntry> entries(2);
+  entries[0].found = true;
+  entries[0].tier = TierType::HBM;
+  entries[0].backend_id = 0;
+  entries[0].size = 3 * 4096;
+  entries[0].pages = {{0, 4}, {0, 9}, {0, 12}};
+  entries[1].found = true;
+  entries[1].tier = TierType::SSD;
+  entries[1].backend_id = kFabricReadStagingBackendId;
+  entries[1].size = 16 * 4096;
+  entries[1].covered_offset = 6 * 4096 + 37;
+  entries[1].covered_size = 4096 + 19;
+  entries[1].pages = {{0, 2}, {0, 7}};
+
+  auto native_desc = MakeDesc(0, "native-hbm");
+  native_desc.backend_id = 0;
+  auto staging_desc = MakeDesc(0, "fabric-read-staging");
+  staging_desc.backend_id = kFabricReadStagingBackendId;
+  const std::vector<BufferMemoryDescBytes> descs = {native_desc, staging_desc};
+
+  for (bool include_descs : {true, false}) {
+    SCOPED_TRACE(include_descs ? "cold descriptors" : "warm omitted descriptors");
+    ::umbp::BatchResolveKeysResponse response;
+    EncodeBatchResolveResponse(
+        entries, 4096, include_descs ? descs : std::vector<BufferMemoryDescBytes>{}, &response);
+    std::string wire;
+    ASSERT_TRUE(response.SerializeToString(&wire));
+    ::umbp::BatchResolveKeysResponse parsed;
+    ASSERT_TRUE(parsed.ParseFromString(wire));
+
+    // A partial entry makes coverage arrays parallel for the whole batch;
+    // the native whole object keeps the zero sentinel in its own slot.
+    ASSERT_EQ(parsed.covered_offset_size(), 2);
+    ASSERT_EQ(parsed.covered_size_size(), 2);
+    EXPECT_EQ(parsed.covered_offset(0), 0u);
+    EXPECT_EQ(parsed.covered_size(0), 0u);
+
+    const auto decoded = DecodeBatchResolveResponse(parsed);
+    EXPECT_EQ(decoded.page_size, 4096u);
+    ASSERT_EQ(decoded.keys.size(), entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+      ExpectKeyMatches(entries[i], decoded.keys[i]);
+      EXPECT_EQ(decoded.keys[i].backend_id, entries[i].backend_id);
+      EXPECT_EQ(decoded.keys[i].covered_offset, entries[i].covered_offset);
+      EXPECT_EQ(decoded.keys[i].covered_size, entries[i].covered_size);
+    }
+    ASSERT_EQ(decoded.descs.size(), include_descs ? descs.size() : 0u);
+    for (size_t i = 0; i < decoded.descs.size(); ++i) {
+      EXPECT_EQ(decoded.descs[i].backend_id, descs[i].backend_id);
+      EXPECT_EQ(decoded.descs[i].buffer_index, 0u);
+      EXPECT_EQ(decoded.descs[i].desc_bytes, descs[i].desc_bytes);
+    }
+  }
+}
+
+TEST(BatchResolveCodec, RejectsMalformedWindowWithoutPartialDecode) {
+  ResolvedKeyEntry entry;
+  entry.found = true;
+  entry.size = 8192;
+  entry.pages = {{0, 0}, {0, 1}};
+  ::umbp::BatchResolveKeysResponse response;
+  EncodeBatchResolveResponse({entry}, 4096, {}, &response);
+  EXPECT_EQ(response.covered_size_size(), 0);
+  EXPECT_EQ(response.covered_offset_size(), 0);
+  EXPECT_EQ(DecodeBatchResolveResponse(response).keys.size(), 1u);
+  response.add_covered_offset(8000);
+  EXPECT_TRUE(DecodeBatchResolveResponse(response).keys.empty());
+  response.add_covered_size(4096);
+  EXPECT_TRUE(DecodeBatchResolveResponse(response).keys.empty());
+  response.set_covered_offset(0, 0);
+  EXPECT_EQ(DecodeBatchResolveResponse(response).keys.size(), 1u);
+  response.set_covered_size(0, 0);
+  response.set_covered_offset(0, 1);
+  EXPECT_TRUE(DecodeBatchResolveResponse(response).keys.empty());
+}
+
 }  // namespace
 }  // namespace mori::umbp

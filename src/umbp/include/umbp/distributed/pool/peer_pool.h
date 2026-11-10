@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <future>
 #include <list>
@@ -47,6 +48,8 @@
 #include "umbp/distributed/pool/tier_transition.h"
 
 namespace mori::umbp {
+
+class FabricReadStaging;
 
 struct PoolAllocateResult {
   uint32_t backend_id = BackendRegistry::kMaxBackends;
@@ -143,7 +146,14 @@ class PeerPool {
   std::vector<bool> BatchAbortProtected(const std::vector<PoolProtectedAbortRequest>& requests);
   PoolReadGrant AcquireReadBatch(const std::vector<std::string>& keys,
                                  const std::string& operation_id, uint64_t expected_generation,
-                                 bool include_descs);
+                                 bool include_descs,
+                                 const std::vector<ObjectExtent>* extents = nullptr,
+                                 bool require_fabric = false);
+  // Configure before publishing the peer service. The arena is not a KV tier.
+  void SetFabricReadStaging(std::shared_ptr<FabricReadStaging> staging,
+                            std::function<void()> quarantine = {});
+  std::vector<BufferMemoryDescBytes> FabricReadStagingDescriptors() const;
+  void QuarantineReadStaging() noexcept;
   std::vector<bool> ReleaseReadPins(const std::vector<uint64_t>& tokens);
   std::vector<bool> AbandonReadOperations(const std::vector<std::string>& operation_ids);
   uint64_t Generation() const;
@@ -282,6 +292,8 @@ class PeerPool {
   BackendRegistry* backends_;
   std::unique_ptr<PoolPolicy> policy_;
   TransferEngine* transfer_engine_;
+  std::shared_ptr<FabricReadStaging> fabric_read_staging_;
+  std::function<void()> read_staging_quarantine_;
   std::shared_ptr<const LogicalTierGraph> tier_graph_;
   TierTransitionExecutor transition_executor_;
   // Only watermark-driven offload consumes recency order. On-evict policies
@@ -355,9 +367,18 @@ class PeerPool {
     // RPC server, so destruction retains it with release(), without allocation.
     std::unique_ptr<PoolReadGrant> grant;
     bool released = false;
+    std::vector<ObjectExtent> extents;
+    bool require_fabric = false;
+    uint64_t generation = 0;
+    bool preparing = false;
+    std::exception_ptr failure;
+    std::condition_variable ready;
   };
+  // Only reservation/publication uses both locks, always operation then pins.
+  // Resolve and owner H2D work retain their shared receipt outside both locks;
+  // abandonment can cancel it without dropping an in-flight copy's resources.
   std::mutex read_pin_mutex_;
-  std::unordered_map<std::string, ReadReceipt> read_receipts_;
+  std::unordered_map<std::string, std::shared_ptr<ReadReceipt>> read_receipts_;
   std::unordered_map<uint64_t, std::string> read_tokens_;
   std::unordered_map<std::string, uint64_t> read_clients_;
   uint64_t next_read_token_ = 1;

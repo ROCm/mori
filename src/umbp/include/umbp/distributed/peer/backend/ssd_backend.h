@@ -48,10 +48,11 @@ namespace mori::umbp {
 //     Allocate lends pages and Commit writes them out; Resolve fills pages under
 //     a read lease (a remote reader) or a hold (a local one, see ResolveReader).
 //     A remote batch is staged all or nothing: kBusy while the arena is full,
-//     kFailed if it can never fit.  A local batch is staged up to half the
-//     arena and the rest is kBusy.  A key's pages are one contiguous run of the
-//     arena.  A staged page goes back once its lease has expired and no hold is
-//     left: at the next reaper sweep, or at once when the arena is short.
+//     kFailed if it can never fit. Completion-pinned remote reads use this
+//     whole-batch admission with holds and optional extents. A local batch is
+//     staged up to half the arena and the rest is kBusy. A key's pages are one contiguous run of
+//     the arena.  A staged page goes back once its lease has expired and no hold is left: at the
+//     next reaper sweep, or at once when the arena is short.
 class SsdBackend : public MediumBackend {
  public:
   struct Config {
@@ -96,6 +97,7 @@ class SsdBackend : public MediumBackend {
   // starts the reaper.  Fails if the SSD tier itself could not be opened.
   bool Init(MemoryRegistrar* registrar) override;
   void Shutdown() override;
+  bool QuarantineBackingMemory() override;
 
   // From the SSD tier, NOT from the staging arena: capacity is a statement
   // about what this node can hold for the cluster, and the staging arena holds
@@ -189,7 +191,7 @@ class SsdBackend : public MediumBackend {
     std::mutex mu;
     std::vector<StagingSpan> spans;
     std::atomic<size_t> count{0};
-    void Return(StagingSpan span);
+    void Return(StagingSpan span) noexcept;
   };
 
   // The hold on a span holding only object bytes `window` (D1): it goes back
@@ -324,6 +326,8 @@ class SsdBackend : public MediumBackend {
   std::atomic<uint64_t> staging_pages_in_use_{0};
   std::atomic<uint64_t> staging_pages_peak_{0};  // written under mutex_
   bool initialized_ = false;
+  std::atomic<bool> accepting_requests_{false};
+  std::atomic<bool> quarantined_{false};
   MemoryRegistrar* registrar_ = nullptr;
 
   std::thread reaper_thread_;

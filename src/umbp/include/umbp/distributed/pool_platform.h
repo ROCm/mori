@@ -31,6 +31,8 @@
 
 namespace mori::umbp {
 
+class FabricReadStaging;
+
 // Allocation and transport composition; KV placement and control stay in PoolClient.
 // One instance per PoolClient. Its owning DistributedClient may share it for
 // allocations; engine observers must not be shared with another PoolClient.
@@ -46,6 +48,11 @@ class PoolPlatform {
   virtual std::unique_ptr<MediumBackend> CreateBackend(const BackendInstanceConfig& backend,
                                                        uint64_t page_size,
                                                        const PoolClientConfig& config) = 0;
+  // Independent of the storage tier: real platforms allocate exportable HBM,
+  // simulated platforms use host-backed memory with GPU registration metadata.
+  virtual std::shared_ptr<FabricReadStaging> CreateFabricReadStaging(TransferEngine* engine,
+                                                                     uint64_t page_size,
+                                                                     uint64_t bytes, int device);
   // Local transfers need real pointer classification or simulated registration metadata.
   virtual TransferRef LocalUserBytes(void* ptr, size_t size,
                                      const TransferRef& registered_ref) const = 0;

@@ -38,6 +38,17 @@ target_link_libraries(umbp_ualink_kv_driver PRIVATE umbp_core umbp_common
                      ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})
 target_compile_features(umbp_ualink_kv_driver PRIVATE cxx_std_17)
 
+add_executable(test_umbp_ualink_tier_sharing test_ualink_tier_sharing.cpp)
+target_link_libraries(test_umbp_ualink_tier_sharing PRIVATE umbp_core umbp_common hip::host
+                     ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB} GTest::gtest_main)
+target_compile_features(test_umbp_ualink_tier_sharing PRIVATE cxx_std_17)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_ualink_tier_sharing PRIVATE -Wl,--no-as-needed)
+endif()
+add_test(NAME umbp_ualink_tier_sharing COMMAND test_umbp_ualink_tier_sharing)
+set_tests_properties(umbp_ualink_tier_sharing PROPERTIES LABELS "integration;gpu;fabric"
+                     RUN_SERIAL TRUE TIMEOUT 120)
+
 # MasterClient::FlushHeartbeat: immediate wakeup, no-op before start,
 # flush-while-in-flight.
 add_executable(test_umbp_master_client_flush_heartbeat
@@ -493,6 +504,11 @@ add_executable(test_peer_pool test_peer_pool.cpp)
 target_link_libraries(test_peer_pool PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_peer_pool PRIVATE cxx_std_17)
 add_test(NAME umbp_peer_pool COMMAND test_peer_pool)
+
+add_executable(test_fabric_read_staging test_fabric_read_staging.cpp)
+target_link_libraries(test_fabric_read_staging PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_fabric_read_staging PRIVATE cxx_std_17)
+add_test(NAME umbp_fabric_read_staging COMMAND test_fabric_read_staging)
 
 # test_transfer_engine — the Phase 6 transfer layer without gRPC or RDMA:
 # every engine's planner, LocalCopyEngine's executor and the composite's routing.

@@ -50,6 +50,8 @@ struct ResolvedKeyEntry {
   // key; `pages` carries backend-local buffer indices and is meaningless
   // without it.
   uint32_t backend_id = 0;
+  uint64_t covered_offset = 0;
+  uint64_t covered_size = 0;
 };
 
 // One key decoded out of the SoA response (page_size and descs are batch-level
@@ -61,6 +63,8 @@ struct DecodedResolveKey {
   uint64_t size = 0;
   std::vector<PageLocation> pages;
   uint32_t backend_id = 0;
+  uint64_t covered_offset = 0;
+  uint64_t covered_size = 0;
 };
 
 // Whole-batch decode result.
@@ -119,6 +123,8 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
 
   size_t total_pages = 0;
   for (const auto& k : keys) total_pages += k.pages.size();
+  bool windows = false;
+  for (const auto& k : keys) windows |= k.covered_size != 0;
   resp->mutable_found()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_tier()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_size()->Reserve(static_cast<int>(keys.size()));
@@ -136,6 +142,10 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
     resp->add_size(k.size);
     resp->add_backend_id(k.backend_id);
     resp->add_page_count(static_cast<uint32_t>(k.pages.size()));
+    if (windows) {
+      resp->add_covered_offset(k.covered_offset);
+      resp->add_covered_size(k.covered_size);
+    }
     for (const auto& p : k.pages) {
       resp->add_buffer_index(p.buffer_index);
       resp->add_page_index(p.page_index);
@@ -177,6 +187,14 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
     return out;
   }
   if (resp.resolve_status_size() != 0 && resp.resolve_status_size() != n) return out;
+  const bool windows = resp.covered_size_size() != 0 || resp.covered_offset_size() != 0;
+  if (windows && (resp.covered_size_size() != n || resp.covered_offset_size() != n)) return out;
+  for (int i = 0; windows && i < n; ++i) {
+    const auto offset = resp.covered_offset(i);
+    const auto size = resp.covered_size(i);
+    if ((size == 0 && offset != 0) || offset > resp.size(i) || size > resp.size(i) - offset)
+      return out;
+  }
 
   size_t total_pages = 0;
   for (int i = 0; i < n; ++i) total_pages += resp.page_count(i);
@@ -195,6 +213,10 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
     k.tier = TierFromProto(resp.tier(i));
     k.size = resp.size(i);
     k.backend_id = resp.backend_id(i);
+    if (windows) {
+      k.covered_offset = resp.covered_offset(i);
+      k.covered_size = resp.covered_size(i);
+    }
     const uint32_t pc = resp.page_count(i);
     k.pages.reserve(pc);
     for (uint32_t p = 0; p < pc; ++p) {

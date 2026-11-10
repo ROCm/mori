@@ -27,6 +27,7 @@
 #include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/peer/backend/ssd_backend.h"
+#include "umbp/distributed/pool/fabric_read_staging.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
@@ -39,6 +40,15 @@
 namespace mori::umbp {
 
 std::shared_ptr<PoolPlatform> MakeSimPoolPlatform(const UMBPSimConfig& sim);
+
+std::shared_ptr<FabricReadStaging> PoolPlatform::CreateFabricReadStaging(TransferEngine* engine,
+                                                                         uint64_t page_size,
+                                                                         uint64_t bytes,
+                                                                         int device) {
+  return std::make_shared<FabricReadStaging>(
+      engine, std::make_unique<HbmPageMemorySource>(device, UMBPHbmAllocation::kFabricVmm),
+      page_size, bytes);
+}
 
 namespace {
 

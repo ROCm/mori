@@ -193,10 +193,13 @@ struct CommitResult {
 // Who reads what a resolve publishes.  kRemote is a peer, which cannot say when
 // it is done, so its bytes stay put for the read lease.  kLocal is this process:
 // it keeps each hit's `hold` until its copy returns, and comes back for any key
-// a staged medium answered kBusy.
+// a staged medium answered kBusy. kPinnedRemote serves a completion-pinned
+// wire grant: it retains the same holds but must prepare the batch together,
+// because its reader discards the whole grant if any key is kBusy.
 enum class ResolveReader {
   kRemote,
   kLocal,
+  kPinnedRemote,
 };
 
 // A resolve needs one more state than a cache lookup.  kBusy means this backend
@@ -495,7 +498,7 @@ class BackendRegistry {
  public:
   // Defined in types.h so the transfer layer can size its per-backend buffer
   // shelves without depending on this header (see kMaxBackendsPerPeer).
-  static constexpr uint32_t kMaxBackends = kMaxBackendsPerPeer;
+  static constexpr uint32_t kMaxBackends = kMaxStorageBackendsPerPeer;
 
   struct Entry {
     uint32_t backend_id = 0;

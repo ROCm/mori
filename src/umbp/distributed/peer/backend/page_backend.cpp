@@ -818,7 +818,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.size = it->second.size;
     entry.page_size = page_size_;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
-    if (reader == ResolveReader::kLocal) {
+    if (reader != ResolveReader::kRemote) {
       entry.hold = it->second.hold;
     } else {
       RenewLeaseAtomic(it->second, lease_deadline);

@@ -284,6 +284,8 @@ class PoolClient {
     // backend-local buffer_index does not name a buffer (see
     // BufferMemoryDescBytes).
     uint32_t backend_id = 0;
+    uint64_t covered_offset = 0;
+    uint64_t covered_size = 0;
   };
 
   // Per-entry outcome inside the Put pipeline; projected to `bool` at

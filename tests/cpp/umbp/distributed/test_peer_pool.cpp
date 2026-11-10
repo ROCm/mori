@@ -44,8 +44,10 @@
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
 #include "umbp/distributed/peer/backend/mock_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
+#include "umbp/distributed/pool/fabric_read_staging.h"
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
+#include "umbp/distributed/transfer/plan_builder.h"
 
 namespace {
 thread_local bool failPeerPoolRetirementAllocation = false;
@@ -335,6 +337,134 @@ class BlockingResolveBackend final : public MockBackend {
   std::condition_variable cv_;
   bool entered_ = false;
   bool released_ = false;
+};
+
+// A controlled preparation boundary. Tests open it before examining futures,
+// so a failing assertion cannot leave an async task blocked on destruction.
+class ReadPreparationGate {
+ public:
+  void Pause() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    ++calls_;
+    cv_.notify_all();
+    cv_.wait_for(lock, std::chrono::seconds(5), [&] { return open_; });
+  }
+  bool WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, std::chrono::seconds(5), [&] { return calls_ > 0; });
+  }
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    open_ = true;
+    cv_.notify_all();
+  }
+  int Calls() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return calls_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool open_ = false;
+  int calls_ = 0;
+};
+
+// A real page completion pin is held while this resolve is parked.
+class BlockingPinnedBackend final : public PageBackend {
+ public:
+  explicit BlockingPinnedBackend(ReadPreparationGate* gate, bool fail = false)
+      : PageBackend(TierType::DRAM, 64, Ownership(), kNoExpiry, std::chrono::milliseconds(1)),
+        gate_(gate),
+        fail_(fail) {}
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override {
+    auto result = PageBackend::BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
+    if (keys == std::vector<std::string>{"slow"}) {
+      gate_->Pause();
+      if (fail_) throw std::runtime_error("controlled resolve failure");
+    }
+    return result;
+  }
+
+ private:
+  static OwnershipConfig Ownership() {
+    OwnershipConfig ownership;
+    ownership.buffer_sizes = {8 * 64};
+    return ownership;
+  }
+  ReadPreparationGate* gate_;
+  bool fail_;
+};
+
+// The fake GPU arena and memcpy engine exercise H2D lifetime and publication
+// ordering without claiming to test hardware or physical cross-tray access.
+class ReadStagingArena final : public PageMemorySource {
+ public:
+  bool Allocate(const std::vector<uint64_t>& sizes, std::vector<Buffer>* out) override {
+    if (sizes.size() != 1) return false;
+    bytes_ = std::make_unique<char[]>(sizes.front());
+    out->push_back({bytes_.get(), sizes.front()});
+    return true;
+  }
+  void Release() override { bytes_.reset(); }
+  mori::io::MemoryLocationType LocationType() const override {
+    return mori::io::MemoryLocationType::GPU;
+  }
+  int Device() const override { return 0; }
+  const char* Name() const override { return "read-staging-test-arena"; }
+
+ private:
+  std::unique_ptr<char[]> bytes_;
+};
+
+class ReadStagingGateEngine final : public TransferEngine {
+ public:
+  explicit ReadStagingGateEngine(ReadPreparationGate* gate) : gate_(gate) {}
+  const char* Name() const override { return "read-staging-test-copy"; }
+  TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
+                             int device) override {
+    auto ref = TransferRef::HostBytes(base, size, loc, device);
+    ref.mem.size = size;
+    ref.mem.data = reinterpret_cast<uintptr_t>(base);
+    ref.mem.loc = loc;
+    ref.mem.deviceId = device;
+    return ref;
+  }
+  void Deregister(const TransferRef&) override {}
+  bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
+    return src.HasHostPtr() && dst.HasHostPtr();
+  }
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t) const override {
+    return MakePairPlanBuilder(*this, [](TransferPlan* plan, const TransferItem& item) {
+      AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
+    });
+  }
+  std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
+    class Handle final : public TransferHandle {
+     public:
+      Handle(std::vector<TransferPlan> plans, ReadPreparationGate* gate)
+          : plans_(std::move(plans)), gate_(gate) {}
+      void Wait(std::vector<TransferFailure>*) override {
+        gate_->Pause();
+        for (const auto& plan : plans_)
+          for (size_t i = 0; i < plan.sizes.size(); ++i)
+            std::memcpy(static_cast<char*>(plan.dst.host_ptr) + plan.dst_offsets[i],
+                        static_cast<const char*>(plan.src.host_ptr) + plan.src_offsets[i],
+                        plan.sizes[i]);
+      }
+
+     private:
+      std::vector<TransferPlan> plans_;
+      ReadPreparationGate* gate_;
+    };
+    return std::make_unique<Handle>(std::move(plans), gate_);
+  }
+
+ private:
+  ReadPreparationGate* gate_;
 };
 
 // Parks one backend commit, the step where an SSD medium writes the device.
@@ -1705,6 +1835,242 @@ TEST(PeerPoolCompletionPins, RetryReleaseClearAndLateTokensPreservePageLifetime)
   EXPECT_EQ(pool.Evict({"kv"}, PoolEvictMode::kDiscard).front().bytes_freed, 0u);
   EXPECT_TRUE(pool.ReleaseReadPins({current.token}).front());
   EXPECT_EQ(pool.Evict({"kv"}, PoolEvictMode::kDiscard).front().bytes_freed, 64u);
+}
+
+TEST(PeerPoolCompletionPins, RetriesMustPreserveReadWindowAndTransportRequirement) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 64, 4);
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  CommitKey(&pool, "kv", "dram");
+  std::vector<ObjectExtent> window{{1, 32}};
+  auto grant = pool.AcquireReadBatch({"kv"}, "reader:1", 0, true, &window);
+  ASSERT_TRUE(grant.accepted);
+  ASSERT_TRUE(grant.entries.front().resolved.found);
+  EXPECT_EQ(pool.AcquireReadBatch({"kv"}, "reader:1", 0, false, &window).token, grant.token);
+  std::vector<ObjectExtent> changed{{2, 32}};
+  EXPECT_FALSE(pool.AcquireReadBatch({"kv"}, "reader:1", 0, true, &changed).accepted);
+  EXPECT_FALSE(pool.AcquireReadBatch({"kv"}, "reader:1", 0, true, &window, true).accepted);
+  std::vector<ObjectExtent> malformed{{1, 0}};
+  EXPECT_FALSE(pool.AcquireReadBatch({"kv"}, "reader:2", 0, true, &malformed).accepted);
+  EXPECT_TRUE(pool.ReleaseReadPins({grant.token}).front());
+}
+
+TEST(PeerPoolCompletionPins, StrictColdReadWithoutArenaFailsWithoutChangingPlacement) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 64, 4);
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  CommitKey(&pool, "kv", "dram");
+  auto grant = pool.AcquireReadBatch({"kv"}, "reader:1", 0, true, nullptr, true);
+  ASSERT_TRUE(grant.accepted);
+  EXPECT_FALSE(grant.entries.front().resolved.found);
+  EXPECT_EQ(grant.entries.front().resolved.outcome, ResolveOutcome::kFailed);
+  EXPECT_TRUE(registry.Get("dram")->Contains("kv"));
+  EXPECT_TRUE(pool.FabricReadStagingDescriptors().empty());
+  EXPECT_TRUE(pool.ReleaseReadPins({grant.token}).front());
+}
+
+TEST(PeerPoolCompletionPins, SlowPreparationJoinsRetryAndAllowsReleaseAndIndependentRead) {
+  LocalCopyEngine engine;
+  ReadPreparationGate gate;
+  BackendRegistry registry;
+  auto backend = std::make_unique<BlockingPinnedBackend>(&gate);
+  ASSERT_TRUE(backend->Init(&engine));
+  ASSERT_TRUE(registry.Register("dram", std::move(backend)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  CommitKey(&pool, "slow", "dram");
+  CommitKey(&pool, "other", "dram");
+  auto prior = pool.AcquireReadBatch({"other"}, "prior:1", 0, true);
+  ASSERT_TRUE(prior.accepted);
+  prior.entries.clear();
+  auto first = std::async(std::launch::async,
+                          [&] { return pool.AcquireReadBatch({"slow"}, "reader:1", 0, true); });
+  ASSERT_TRUE(gate.WaitUntilEntered());
+  auto duplicate = std::async(std::launch::async,
+                              [&] { return pool.AcquireReadBatch({"slow"}, "reader:1", 0, true); });
+  EXPECT_EQ(duplicate.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+  auto release = std::async(std::launch::async, [&] {
+    return static_cast<bool>(pool.ReleaseReadPins({prior.token}).front());
+  });
+  auto independent = std::async(
+      std::launch::async, [&] { return pool.AcquireReadBatch({"other"}, "other:1", 0, true); });
+  auto mismatched = std::async(std::launch::async, [&] {
+    const std::vector<ObjectExtent> window{{1, 32}};
+    return pool.AcquireReadBatch({"slow"}, "reader:1", 0, true, &window).accepted;
+  });
+  const auto release_status = release.wait_for(std::chrono::milliseconds(500));
+  const auto independent_status = independent.wait_for(std::chrono::milliseconds(500));
+  const auto mismatch_status = mismatched.wait_for(std::chrono::milliseconds(500));
+  gate.Release();
+  EXPECT_EQ(release_status, std::future_status::ready);
+  EXPECT_EQ(independent_status, std::future_status::ready);
+  EXPECT_EQ(mismatch_status, std::future_status::ready);
+  EXPECT_TRUE(release.get());
+  EXPECT_FALSE(mismatched.get());
+  auto other = independent.get();
+  ASSERT_TRUE(other.accepted);
+  other.entries.clear();
+  EXPECT_TRUE(pool.ReleaseReadPins({other.token}).front());
+  auto grant = first.get();
+  auto retry = duplicate.get();
+  ASSERT_TRUE(grant.accepted);
+  ASSERT_TRUE(retry.accepted);
+  ASSERT_TRUE(grant.entries.front().resolved.found);
+  EXPECT_EQ(grant.token, retry.token);
+  EXPECT_EQ(gate.Calls(), 1);
+  grant.entries.clear();
+  retry.entries.clear();
+  EXPECT_EQ(pool.Evict({"slow"}, PoolEvictMode::kDiscard).front().bytes_freed, 0u);
+  EXPECT_TRUE(pool.ReleaseReadPins({grant.token}).front());
+  EXPECT_EQ(pool.Evict({"slow"}, PoolEvictMode::kDiscard).front().bytes_freed, 64u);
+}
+
+TEST(PeerPoolCompletionPins, AbandonPreparingOrderedAndUnorderedReadsWakesJoinedRetry) {
+  for (const std::string operation : {"reader:1", "legacy-reader"}) {
+    SCOPED_TRACE(operation);
+    LocalCopyEngine engine;
+    ReadPreparationGate gate;
+    BackendRegistry registry;
+    auto backend = std::make_unique<BlockingPinnedBackend>(&gate);
+    ASSERT_TRUE(backend->Init(&engine));
+    ASSERT_TRUE(registry.Register("dram", std::move(backend)));
+    PeerPool pool(&registry, MakeSingleBackendPolicy());
+    CommitKey(&pool, "slow", "dram");
+    auto first = std::async(std::launch::async,
+                            [&] { return pool.AcquireReadBatch({"slow"}, operation, 0, true); });
+    ASSERT_TRUE(gate.WaitUntilEntered());
+    auto duplicate = std::async(
+        std::launch::async, [&] { return pool.AcquireReadBatch({"slow"}, operation, 0, true); });
+    EXPECT_EQ(duplicate.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    auto abandon = std::async(std::launch::async, [&] {
+      return static_cast<bool>(pool.AbandonReadOperations({operation}).front());
+    });
+    const auto abandon_status = abandon.wait_for(std::chrono::milliseconds(500));
+    const auto duplicate_status = duplicate.wait_for(std::chrono::milliseconds(500));
+    const auto first_status = first.wait_for(std::chrono::milliseconds(0));
+    gate.Release();
+    EXPECT_EQ(abandon_status, std::future_status::ready);
+    EXPECT_EQ(duplicate_status, std::future_status::ready);
+    EXPECT_EQ(first_status, std::future_status::timeout);
+    EXPECT_TRUE(abandon.get());
+    EXPECT_FALSE(duplicate.get().accepted);
+    const auto rejected = first.get();
+    EXPECT_FALSE(rejected.accepted);
+    EXPECT_EQ(rejected.token, 0);
+    EXPECT_FALSE(pool.AcquireReadBatch({"slow"}, operation, 0, true).accepted);
+    EXPECT_EQ(gate.Calls(), 1);
+    EXPECT_EQ(pool.Evict({"slow"}, PoolEvictMode::kDiscard).front().bytes_freed, 64u);
+  }
+}
+
+TEST(PeerPoolCompletionPins, PreparingFailureSettlesAllRetriesWithoutResolvingAgain) {
+  LocalCopyEngine engine;
+  ReadPreparationGate gate;
+  BackendRegistry registry;
+  auto backend = std::make_unique<BlockingPinnedBackend>(&gate, true);
+  ASSERT_TRUE(backend->Init(&engine));
+  ASSERT_TRUE(registry.Register("dram", std::move(backend)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  CommitKey(&pool, "slow", "dram");
+  auto acquire = [&] {
+    try {
+      (void)pool.AcquireReadBatch({"slow"}, "reader:1", 0, true);
+      return std::string("unexpected success");
+    } catch (const std::runtime_error& error) {
+      return std::string(error.what());
+    }
+  };
+  auto first = std::async(std::launch::async, acquire);
+  ASSERT_TRUE(gate.WaitUntilEntered());
+  auto duplicate = std::async(std::launch::async, acquire);
+  EXPECT_EQ(duplicate.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+  gate.Release();
+  EXPECT_EQ(first.get(), "controlled resolve failure");
+  EXPECT_EQ(duplicate.get(), "controlled resolve failure");
+  EXPECT_EQ(acquire(), "controlled resolve failure");
+  EXPECT_EQ(gate.Calls(), 1);
+  EXPECT_TRUE(pool.AbandonReadOperations({"reader:1"}).front());
+  EXPECT_EQ(pool.Evict({"slow"}, PoolEvictMode::kDiscard).front().bytes_freed, 64u);
+}
+
+TEST(PeerPoolCompletionPins, H2DPreparationCancellationPreservesPinsUntilDrain) {
+  for (const bool clear : {false, true}) {
+    SCOPED_TRACE(clear ? "clear" : "abandon");
+    ReadPreparationGate gate;
+    ReadStagingGateEngine engine(&gate);
+    BackendRegistry registry;
+    RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 64, 4,
+                        std::chrono::milliseconds(1));
+    auto* backend =
+        static_cast<PageBackend*>(static_cast<InstrumentedBackend*>(registry.Get("dram"))->Inner());
+    PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+    auto staging =
+        std::make_shared<FabricReadStaging>(&engine, std::make_unique<ReadStagingArena>(), 64, 128);
+    ASSERT_TRUE(staging->Init(&registry, false));
+    pool.SetFabricReadStaging(staging);
+    CommitKey(&pool, "slow", "dram");
+    CommitKey(&pool, "other", "dram");
+    const auto total_bytes = registry.Get("dram")->Capacity().total_bytes;
+    auto prior = pool.AcquireReadBatch({"other"}, "prior:1", 0, true);
+    ASSERT_TRUE(prior.accepted);
+    prior.entries.clear();
+    auto acquire = [&] {
+      return pool.AcquireReadBatch({"slow"}, "reader:1", 0, true, nullptr, true);
+    };
+    auto first = std::async(std::launch::async, acquire);
+    ASSERT_TRUE(gate.WaitUntilEntered());
+    EXPECT_EQ(staging->InUseBytes(), 64);
+    auto duplicate = std::async(std::launch::async, acquire);
+    EXPECT_EQ(duplicate.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    auto release = std::async(std::launch::async, [&] {
+      return static_cast<bool>(pool.ReleaseReadPins({prior.token}).front());
+    });
+    const auto release_status = release.wait_for(std::chrono::milliseconds(500));
+    auto cancel = std::async(std::launch::async, [&] {
+      if (clear) {
+        pool.ClearLocal();
+        registry.Get("dram")->ClearFullSyncAcked();
+        return true;
+      }
+      return static_cast<bool>(pool.AbandonReadOperations({"reader:1"}).front());
+    });
+    const auto cancel_status = cancel.wait_for(std::chrono::milliseconds(500));
+    const auto duplicate_status = duplicate.wait_for(std::chrono::milliseconds(500));
+    const auto first_status = first.wait_for(std::chrono::milliseconds(0));
+    // Examine source lifetime while H2D is still parked, provided cancellation
+    // completed. The old pin-mutex serialization must fail rather than hang.
+    if (cancel_status == std::future_status::ready) {
+      EXPECT_EQ(staging->InUseBytes(), 64);
+      if (clear) {
+        EXPECT_EQ(backend->Capacity().available_bytes, total_bytes - 64);
+      } else {
+        EXPECT_EQ(pool.Evict({"slow"}, PoolEvictMode::kDiscard).front().bytes_freed, 0u);
+      }
+    }
+    gate.Release();
+    EXPECT_EQ(release_status, std::future_status::ready);
+    EXPECT_EQ(cancel_status, std::future_status::ready);
+    EXPECT_EQ(duplicate_status, std::future_status::ready);
+    EXPECT_EQ(first_status, std::future_status::timeout);
+    EXPECT_TRUE(release.get());
+    EXPECT_TRUE(cancel.get());
+    EXPECT_FALSE(duplicate.get().accepted);
+    auto rejected = first.get();
+    EXPECT_FALSE(rejected.accepted);
+    EXPECT_EQ(rejected.token, 0);
+    EXPECT_EQ(rejected.generation, clear ? 1 : 0);
+    EXPECT_EQ(staging->InUseBytes(), 0);
+    EXPECT_EQ(gate.Calls(), 1);
+    EXPECT_FALSE(pool.AcquireReadBatch({"slow"}, "reader:1", pool.Generation(), true, nullptr, true)
+                     .accepted);
+    if (clear) {
+      backend->RunReaperOnceForTest();
+      EXPECT_EQ(backend->Capacity().available_bytes, total_bytes);
+    } else {
+      EXPECT_EQ(pool.Evict({"slow"}, PoolEvictMode::kDiscard).front().bytes_freed, 64u);
+    }
+  }
 }
 
 TEST(PeerPoolCompletionPins, OrderedReadsHaveNoLifetimeRequestLimit) {

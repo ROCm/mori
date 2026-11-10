@@ -77,6 +77,43 @@ class LocalOnlyRegistrar final : public MemoryRegistrar {
   mori::io::MemoryLocationType last_loc = mori::io::MemoryLocationType::GPU;
 };
 
+struct StagingSourceLifetime {
+  int allocations = 0;
+  int releases = 0;
+  int destructions = 0;
+};
+
+class TrackedHostStagingSource final : public PageMemorySource {
+ public:
+  explicit TrackedHostStagingSource(std::shared_ptr<StagingSourceLifetime> lifetime)
+      : lifetime_(std::move(lifetime)), host_(HostPageMemorySource::Options{}) {}
+  ~TrackedHostStagingSource() override {
+    ++lifetime_->destructions;
+    Release();
+  }
+  bool Allocate(const std::vector<uint64_t>& sizes, std::vector<Buffer>* out) override {
+    if (!host_.Allocate(sizes, out)) return false;
+    ++lifetime_->allocations;
+    live_ = true;
+    return true;
+  }
+  void Release() override {
+    if (live_) ++lifetime_->releases;
+    live_ = false;
+    host_.Release();
+  }
+  mori::io::MemoryLocationType LocationType() const override {
+    return mori::io::MemoryLocationType::CPU;
+  }
+  int Device() const override { return -1; }
+  const char* Name() const override { return "TrackedHostStagingSource"; }
+
+ private:
+  std::shared_ptr<StagingSourceLifetime> lifetime_;
+  HostPageMemorySource host_;
+  bool live_ = false;
+};
+
 // `name`'s samples keyed by their one label's value.
 std::map<std::string, uint64_t> Samples(const MediumBackend& backend, const char* name) {
   std::map<std::string, uint64_t> out;
@@ -106,7 +143,8 @@ class SsdBackendTest : public ::testing::Test {
   // about exhaustion set it small.
   SsdBackend* Start(uint32_t staging_pages = 8,
                     std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500},
-                    uint64_t ssd_capacity = 64ULL * 1024 * 1024) {
+                    uint64_t ssd_capacity = 64ULL * 1024 * 1024,
+                    std::unique_ptr<PageMemorySource> staging_source = nullptr) {
     SsdBackend::Config cfg;
     cfg.page_size = kPageSize;
     cfg.staging_pages = staging_pages;
@@ -117,7 +155,7 @@ class SsdBackendTest : public ::testing::Test {
     cfg.ssd.ssd.capacity_bytes = ssd_capacity;
     cfg.ssd.ssd.io.backend = UMBPIoBackend::Posix;  // avoid io_uring container flakiness
 
-    auto owned = std::make_unique<SsdBackend>(std::move(cfg));
+    auto owned = std::make_unique<SsdBackend>(std::move(cfg), nullptr, std::move(staging_source));
     backend_ = std::move(owned);
     EXPECT_TRUE(backend_->Init(&registrar_));
     return backend_.get();
@@ -684,6 +722,64 @@ TEST_F(SsdBackendTest, ARemoteLeaseOutlivesALocalHold) {
             AllocateOutcome::kSuccessAllocated);
 }
 
+TEST_F(SsdBackendTest, PinnedRemoteBatchUsesFullArenaAndKeepsCompletionHolds) {
+  auto* backend = Start(4, std::chrono::seconds{60});
+  for (const char* key : {"a", "b", "c", "d", "e"})
+    ASSERT_TRUE(Put(backend, key, Payload(kPageSize, 3)));
+
+  // Three pages exceed the in-process half-arena budget, but a wire reader
+  // retries the whole batch and needs all three grants in the same response.
+  auto held = backend->BatchResolve({"a", "b", "c"}, false, false, ResolveReader::kPinnedRemote);
+  ASSERT_EQ(held.size(), 3u);
+  for (const auto& entry : held) {
+    ASSERT_TRUE(entry.found);
+    ASSERT_NE(entry.hold, nullptr);
+  }
+  EXPECT_EQ(PagesInUse(), 3u);
+  backend->RunReaperOnceForTest();
+  EXPECT_EQ(PagesInUse(), 3u) << "a completion pin must outlive reaper sweeps";
+
+  auto busy = backend->BatchResolve({"d", "e"}, false, false, ResolveReader::kPinnedRemote);
+  ASSERT_EQ(busy.size(), 2u);
+  for (const auto& entry : busy) EXPECT_EQ(entry.outcome, ResolveOutcome::kBusy);
+  EXPECT_EQ(PagesInUse(), 3u) << "partial reservation must roll back before a whole-batch retry";
+
+  held.clear();
+  backend->RunReaperOnceForTest();
+  EXPECT_EQ(PagesInUse(), 0u) << "pinned reads release with their holds rather than a 60s TTL";
+  auto retry = backend->BatchResolve({"d", "e"}, false, false, ResolveReader::kPinnedRemote);
+  for (const auto& entry : retry) {
+    EXPECT_TRUE(entry.found);
+    EXPECT_NE(entry.hold, nullptr);
+  }
+}
+
+TEST_F(SsdBackendTest, PinnedRemoteExtentsUseFullArenaAndRejectPermanentBatchShape) {
+  auto* backend = Start(4, std::chrono::seconds{60});
+  for (const char* key : {"a", "b", "c"}) ASSERT_TRUE(Put(backend, key, Payload(2 * kPageSize, 5)));
+  const std::vector<ObjectExtent> windows{{4096, 4096}, {12288, 4096}, {20480, 4096}};
+  auto held =
+      backend->BatchResolve({"a", "b", "c"}, false, false, ResolveReader::kPinnedRemote, &windows);
+  ASSERT_EQ(held.size(), 3u);
+  for (size_t i = 0; i < held.size(); ++i) {
+    EXPECT_TRUE(held[i].found);
+    EXPECT_NE(held[i].hold, nullptr);
+    EXPECT_EQ(held[i].covered_offset, windows[i].offset);
+    EXPECT_EQ(held[i].covered_size, windows[i].length);
+  }
+  EXPECT_EQ(PagesInUse(), 3u);
+  held.clear();
+  backend->RunReaperOnceForTest();
+  EXPECT_EQ(PagesInUse(), 0u);
+
+  // The whole-object batch needs six pages in a four-page arena. Identical
+  // retries cannot succeed, so report a permanent shape failure immediately.
+  auto too_large =
+      backend->BatchResolve({"a", "b", "c"}, false, false, ResolveReader::kPinnedRemote);
+  for (const auto& entry : too_large) EXPECT_EQ(entry.outcome, ResolveOutcome::kFailed);
+  EXPECT_EQ(PagesInUse(), 0u);
+}
+
 // ---------------------------------------------------------------------------
 //  Eviction and Clear
 // ---------------------------------------------------------------------------
@@ -839,6 +935,102 @@ TEST_F(SsdBackendTest, ShutdownDeregistersTheArena) {
   backend->Shutdown();
   EXPECT_EQ(registrar_.deregistrations, 1);
   backend->Shutdown();  // idempotent
+  EXPECT_EQ(registrar_.deregistrations, 1);
+}
+
+TEST_F(SsdBackendTest, ShutdownRetainsWholeReadBackingAndRegistration) {
+  auto lifetime = std::make_shared<StagingSourceLifetime>();
+  auto source = std::make_unique<TrackedHostStagingSource>(lifetime);
+  auto* retained_source = source.get();
+  auto* backend = Start(2, std::chrono::milliseconds{1}, 64ULL * 1024 * 1024, std::move(source));
+  const auto payload = Payload(4096, 7);
+  ASSERT_TRUE(Put(backend, "held", payload));
+  auto read = backend->BatchResolve({"held"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(read[0].found);
+  ASSERT_NE(read[0].hold, nullptr);
+  auto* staged =
+      static_cast<char*>(backend->BufferRef(0).host_ptr) + read[0].pages[0].page_index * kPageSize;
+
+  backend->Shutdown();
+  backend_.reset();
+  EXPECT_EQ(lifetime->allocations, 1);
+  EXPECT_EQ(lifetime->releases, 0);
+  EXPECT_EQ(lifetime->destructions, 0);
+  EXPECT_EQ(registrar_.deregistrations, 0);
+  if (lifetime->releases == 0) EXPECT_EQ(std::memcmp(staged, payload.data(), payload.size()), 0);
+  read.clear();
+  // Fake local registration has no hardware work. Reclaim the deliberately
+  // retained source after the test's last reader finishes.
+  if (lifetime->destructions == 0) delete retained_source;
+}
+
+TEST_F(SsdBackendTest, ShutdownRetainsExtentBackingAndRegistration) {
+  auto lifetime = std::make_shared<StagingSourceLifetime>();
+  auto source = std::make_unique<TrackedHostStagingSource>(lifetime);
+  auto* retained_source = source.get();
+  auto* backend = Start(8, std::chrono::milliseconds{1}, 64ULL * 1024 * 1024, std::move(source));
+  const auto payload = Payload(3 * kPageSize, 9);
+  ASSERT_TRUE(Put(backend, "window", payload));
+  const std::vector<ObjectExtent> extents{{4096, 4096}};
+  auto read = backend->BatchResolve({"window"}, false, false, ResolveReader::kLocal, &extents);
+  ASSERT_TRUE(read[0].found);
+  ASSERT_NE(read[0].hold, nullptr);
+  ASSERT_EQ(read[0].covered_size, 4096u);
+  ASSERT_EQ(PagesInUse(), 1u);
+  auto* staged =
+      static_cast<char*>(backend->BufferRef(0).host_ptr) + read[0].pages[0].page_index * kPageSize;
+
+  backend->Shutdown();
+  backend_.reset();
+  EXPECT_EQ(lifetime->releases, 0);
+  EXPECT_EQ(lifetime->destructions, 0);
+  EXPECT_EQ(registrar_.deregistrations, 0);
+  if (lifetime->releases == 0)
+    EXPECT_EQ(std::memcmp(staged, payload.data() + extents[0].offset, extents[0].length), 0);
+  read.clear();
+  if (lifetime->destructions == 0) delete retained_source;
+}
+
+TEST_F(SsdBackendTest, QuarantineStopsAdmissionsAndRetainsDrainedBacking) {
+  auto lifetime = std::make_shared<StagingSourceLifetime>();
+  auto source = std::make_unique<TrackedHostStagingSource>(lifetime);
+  auto* retained_source = source.get();
+  auto* backend = Start(2, std::chrono::milliseconds{1}, 64ULL * 1024 * 1024, std::move(source));
+  ASSERT_TRUE(Put(backend, "stored", Payload(4096, 4)));
+  const auto allocated = backend->BatchAllocate({AllocateRequest{"aborted", 4096}});
+  ASSERT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(backend->BatchAbort({allocated[0].slot_id})[0]);
+  ASSERT_EQ(PagesInUse(), 0u);
+
+  ASSERT_TRUE(backend->QuarantineBackingMemory());
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"new", 4096}})[0].outcome,
+            AllocateOutcome::kFailed);
+  EXPECT_FALSE(backend->BatchResolve({"stored"}, false, false, ResolveReader::kLocal)[0].found);
+  EXPECT_FALSE(backend->BatchAbort({allocated[0].slot_id})[0]);
+  ResolvedEntry migration;
+  EXPECT_FALSE(backend->AcquireMigrationRead("stored", &migration, false));
+  EXPECT_FALSE(backend->Init(&registrar_));
+  backend->Shutdown();
+  backend_.reset();
+  EXPECT_EQ(lifetime->releases, 0);
+  EXPECT_EQ(lifetime->destructions, 0);
+  EXPECT_EQ(registrar_.deregistrations, 0);
+  if (lifetime->destructions == 0) delete retained_source;
+}
+
+TEST_F(SsdBackendTest, DrainedLocalReadShutdownReleasesBacking) {
+  auto lifetime = std::make_shared<StagingSourceLifetime>();
+  auto source = std::make_unique<TrackedHostStagingSource>(lifetime);
+  auto* backend = Start(2, std::chrono::seconds{60}, 64ULL * 1024 * 1024, std::move(source));
+  ASSERT_TRUE(Put(backend, "drained", Payload(4096, 4)));
+  auto read = backend->BatchResolve({"drained"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(read[0].found);
+  ASSERT_NE(read[0].hold, nullptr);
+  read.clear();
+  // Shutdown reclaims this lease without waiting for a periodic reaper.
+  backend->Shutdown();
+  EXPECT_EQ(lifetime->releases, 1);
+  EXPECT_EQ(lifetime->destructions, 1);
   EXPECT_EQ(registrar_.deregistrations, 1);
 }
 

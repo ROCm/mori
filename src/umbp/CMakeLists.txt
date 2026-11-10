@@ -425,6 +425,7 @@ add_library(
   distributed/pool/policy_config.cpp
   distributed/pool/tier_graph.cpp
   distributed/pool/tier_transition.cpp
+  distributed/pool/fabric_read_staging.cpp
   distributed/pool/peer_pool.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp

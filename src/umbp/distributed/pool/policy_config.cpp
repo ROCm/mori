@@ -711,9 +711,9 @@ bool ApplyBackendPolicy(const BackendPolicyConfig& policy, PoolClientConfig* con
       concrete_tiers.push_back(std::move(lowered));
     }
 
-    if (concrete_backends.size() > kMaxBackendsPerPeer) {
+    if (concrete_backends.size() > kMaxStorageBackendsPerPeer) {
       Invalid("backend policy expands beyond the per-peer backend limit of " +
-              std::to_string(kMaxBackendsPerPeer));
+              std::to_string(kMaxStorageBackendsPerPeer));
     }
     const uint64_t page_size =
         config->dram_page_size == 0 ? 2ULL * 1024 * 1024 : config->dram_page_size;

@@ -2,6 +2,7 @@
 // separate processes (normally the producer/consumer are on different trays).
 // It deliberately never registers a default CTest that needs these services.
 #include <hip/hip_runtime_api.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -66,8 +67,11 @@ void Help() {
                "  peers: --advertise IP --run-id NAME --kernel COPY.hsaco --device 0\n"
                "  common geometry: --keys 32 --object-bytes 1048704 --page-bytes 65536\n"
                "                   --layout unaligned|aligned (default unaligned)\n"
-               "  producer: --node-id kv-owner --duration-sec 600\n"
+               "  producer: --node-id kv-owner --duration-sec 600 --medium hbm|dram|ssd\n"
+               "            --fabric-staging-bytes BYTES --staging-device 0\n"
+               "            --ssd-dir PATH --ssd-io posix|io_uring --ssd-direct-io 0|1\n"
                "  consumer: --node-id kv-reader --expected-owner kv-owner --iterations 100\n"
+               "            --expected-medium hbm|dram|ssd (defaults to --medium or hbm)\n"
                "            --cold-every 0 --verify-every 1 --timeout-sec 60 --async 1\n"
                "Integers are decimal bytes/counts. Both peers must use the same geometry/run id.\n";
 }
@@ -100,6 +104,27 @@ int Device(const Args& args) {
   const auto device = args.Size("device", 0);
   Require(device <= static_cast<size_t>(std::numeric_limits<int>::max()), "invalid device ordinal");
   return static_cast<int>(device);
+}
+
+int StagingDevice(const Args& args) {
+  const auto device = args.Size("staging-device", Device(args));
+  Require(device <= static_cast<size_t>(std::numeric_limits<int>::max()),
+          "invalid staging GPU ordinal");
+  return static_cast<int>(device);
+}
+
+TierType ParseMedium(const std::string& value) {
+  if (value == "hbm") return TierType::HBM;
+  if (value == "dram") return TierType::DRAM;
+  if (value == "ssd") return TierType::SSD;
+  throw std::runtime_error("expected medium hbm, dram or ssd, got " + value);
+}
+
+const char* MediumName(TierType tier) {
+  if (tier == TierType::HBM) return "hbm";
+  if (tier == TierType::DRAM) return "dram";
+  if (tier == TierType::SSD) return "ssd";
+  return "unknown";
 }
 
 struct DeviceBuffer {
@@ -249,13 +274,38 @@ PoolClientConfig PeerConfig(const Args& args, const Geometry& geometry, bool pro
   // Admission accounts for both destination ranges and the logical owner
   // objects whose read pins this group retains until CPU Wait completes.
   config.kv_max_inflight_bytes = Add(geometry.total, geometry.RequestedBytes());
-  config.medium = TierType::HBM;
+  // --medium chooses owner storage. Consumer local geometry stays HBM so the
+  // same command line can select the expected owner tier without a replica.
+  config.medium = producer ? ParseMedium(args.Get("medium", "hbm")) : TierType::HBM;
   config.hbm.device = Device(args);
   config.hbm.allocation = UMBPHbmAllocation::kFabricVmm;
   const size_t pages = geometry.object / geometry.page + (geometry.object % geometry.page != 0);
-  config.hbm.buffer_sizes = {
-      producer ? Multiply(Multiply(geometry.keys, pages), Multiply(2, geometry.page))
-               : Multiply(2, geometry.page)};
+  const size_t storageBytes = Multiply(Multiply(geometry.keys, pages), Multiply(2, geometry.page));
+  config.hbm.buffer_sizes = {producer ? storageBytes : Multiply(2, geometry.page)};
+  if (producer && config.medium != TierType::HBM) {
+    config.fabric_read_staging_bytes = args.Size("fabric-staging-bytes", storageBytes);
+    config.fabric_read_staging_device = StagingDevice(args);
+    Require(config.fabric_read_staging_bytes >= geometry.page,
+            "DRAM/SSD sharing requires at least one page of --fabric-staging-bytes");
+    if (config.medium == TierType::DRAM) {
+      config.dram.buffer_sizes = {storageBytes};
+    } else {
+      config.ssd.enabled = true;
+      config.ssd.ssd.storage_dir =
+          args.Get("ssd-dir", "/tmp/umbp-ualink-driver-" + std::to_string(getpid()));
+      Require(!config.ssd.ssd.storage_dir.empty(), "--ssd-dir must not be empty");
+      // Disk record overhead is separate from the aligned logical page budget.
+      config.ssd.ssd.capacity_bytes = Multiply(storageBytes, 2);
+      config.ssd.ssd.direct_io = args.Boolean("ssd-direct-io", true);
+      const auto io = args.Get("ssd-io", "posix");
+      Require(io == "posix" || io == "io_uring", "--ssd-io must be posix or io_uring");
+      config.ssd.ssd.io.backend = io == "posix" ? UMBPIoBackend::Posix : UMBPIoBackend::IoUring;
+      const size_t stagingPages = Multiply(Multiply(geometry.keys, pages), 2);
+      Require(stagingPages <= static_cast<size_t>(std::numeric_limits<int>::max()),
+              "SSD staging page count overflow");
+      config.ssd_staging_buffer_slots = static_cast<int>(stagingPages);
+    }
+  }
   config.dram_page_size = geometry.page;
   config.cache_remote_fetches = false;
   config.ranged_locality_prefetch = false;
@@ -317,9 +367,27 @@ void Producer(const Args& args, const Geometry& geometry) {
     Require(result.size() == keys.size() &&
                 std::all_of(result.begin(), result.end(), [](bool v) { return v; }),
             "producer BatchPut failed");
+    // Remote validation must read the stored objects, not retain aliases to
+    // the producer's original inference allocation.
+    Hip(hipMemset(source.pointer, 0xa7, geometry.total), "retire original producer KV bytes");
+    auto verifyStorage = [&] {
+      auto* storage = client.Backends().Get(config.medium);
+      Require(storage != nullptr, "configured producer storage backend missing");
+      for (const auto& key : keys) {
+        Require(storage->Contains(key), "producer key absent from configured storage tier");
+        for (const auto* backend : client.Backends().All())
+          Require(backend == storage || !backend->Contains(key),
+                  "producer key unexpectedly replicated into another storage tier");
+      }
+    };
+    verifyStorage();
     std::cout << "READY role=producer node=" << client.NodeId() << " keys=" << keys.size()
-              << " object_bytes=" << geometry.object << " transport=fabric_strict" << std::endl;
+              << " object_bytes=" << geometry.object << " medium=" << MediumName(config.medium)
+              << " fabric_staging_bytes=" << config.fabric_read_staging_bytes
+              << " staging_device=" << config.fabric_read_staging_device
+              << " transport=fabric_strict" << std::endl;
     Hold(args.Size("duration-sec", 600));
+    verifyStorage();
     client.DeregisterMemory(source.pointer);
     client.Shutdown();
   } catch (...) {
@@ -338,6 +406,7 @@ double Percentile(std::vector<double> values, double percentile) {
 
 void Consumer(const Args& args, const Geometry& geometry) {
   const auto config = PeerConfig(args, geometry, false);
+  const auto expectedMedium = ParseMedium(args.Get("expected-medium", args.Get("medium", "hbm")));
   const auto keys = geometry.KeyNames(args.Get("run-id"));
   const size_t iterations = args.Size("iterations", 100), coldEvery = args.Size("cold-every", 0);
   const size_t verifyEvery = args.Size("verify-every", 1);
@@ -377,7 +446,7 @@ void Consumer(const Args& args, const Geometry& geometry) {
     }
     for (const auto& route : routes) {
       Require(route->node_id == args.Get("expected-owner", "kv-owner") &&
-                  route->node_id != client->NodeId() && route->tier == TierType::HBM &&
+                  route->node_id != client->NodeId() && route->tier == expectedMedium &&
                   route->size == geometry.object,
               "key placement/size mismatch");
     }
@@ -473,7 +542,7 @@ void Consumer(const Args& args, const Geometry& geometry) {
                 << " latency_us=" << seconds * 1e6 << " consumer_ready_us=" << consumerSeconds * 1e6
                 << " selected_fabric_submitted_bytes=" << fabricBytes
                 << " selected_fabric_submitted_plans=" << fabricPlans
-                << " layout=" << geometry.layout
+                << " owner_medium=" << MediumName(expectedMedium) << " layout=" << geometry.layout
                 << " completion=" << (async ? "stream_wait" : "blocking_wait")
                 << " requested_GBps=" << geometry.RequestedBytes() / seconds / 1e9 << std::endl;
     }

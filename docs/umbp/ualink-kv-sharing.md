@@ -2,16 +2,20 @@
 
 This implementation extends UMBP's existing `MoriIoEngine` with MORI-IO's
 FABRIC backend. It does not introduce a second UMBP remote transfer engine.
-The control plane remains gRPC; KV payloads are pulled from the producer's
-fabric-exportable HBM into registered ranges on the consumer's GPU.
+The control plane remains gRPC; KV payloads are pulled from owner-local,
+fabric-exportable HBM into registered ranges on the consumer's GPU. HBM KV is
+read directly. DRAM and SSD KV use a bounded owner HBM read-staging arena while
+keeping their original storage tier and key ownership.
 
 ## Supported first version
 
-* Producer-local, immutable KV objects in UMBP-owned HBM VMM pools.
+* Producer-local, immutable KV objects in UMBP-owned HBM, DRAM or SSD storage.
+  DRAM/SSD owners explicitly enable an exportable HBM read-staging arena.
 * Consumer pulls a whole object or selected, possibly noncontiguous byte ranges.
   GPU direct ranges can belong to different registered allocations.
-* Strict FABRIC operation, or FABRIC/RDMA automatic selection. RDMA remains the
-  default for existing callers. CPU/SSD legacy paths retain their existing APIs.
+* Strict FABRIC operation for all three tiers. Automatic selection continues
+  to choose FABRIC/RDMA from the original endpoints; it does not request the
+  cold-tier HBM bridge. RDMA remains the default for existing callers.
 * Completion pins, protected pending writes, owner incarnation and pool
   generation checks, idempotent control-plane operations, and explicit GPU fault
   quarantine.
@@ -22,7 +26,7 @@ fabric-exportable HBM into registered ranges on the consumer's GPU.
 Native inference-owned KV export and remote-attention kernels are separate
 features. This version copies producer KV into the UMBP pool and copies remote
 KV into consumer inference memory. It does not provide a model-specific inference
-connector, GPU packed staging, or a layer scheduling policy.
+connector, consumer-side packed staging, or a layer scheduling policy.
 
 ## Transport and pool configuration
 
@@ -38,15 +42,22 @@ as environment variables. Set environment variables before creating the config.
 | `UMBP_KV_RANGED_PATH` | `legacy` (default), `gpu_direct` | Consumer destination path |
 | `UMBP_KV_MAX_INFLIGHT_READS` | `32` | Concurrent admitted read groups |
 | `UMBP_KV_MAX_INFLIGHT_BYTES` | `268435456` | Requested destination bytes plus logically pinned source bytes |
+| `UMBP_FABRIC_READ_STAGING_BYTES` | `0` (disabled) | Owner HBM capacity reserved for transient DRAM/SSD reads; positive multiples of the pool page size |
+| `UMBP_FABRIC_READ_STAGING_DEVICE` | `0` | Owner GPU that exports the read-staging arena |
 
-Configure the peer as HBM, with `hbm.device` and `hbm.capacity_bytes` appropriate
-for the local GPU (the internal pool config uses `hbm.buffer_sizes`). Strict mode
+Configure HBM owners with `hbm.device` and `hbm.capacity_bytes` appropriate
+for the local GPU (the internal pool config uses `hbm.buffer_sizes`). DRAM/SSD
+owners keep their storage configuration and set `fabric_read_staging_bytes` and
+`fabric_read_staging_device` in the distributed config. The byte budget allocates
+one arena at initialization; it is not storage placement capacity. Strict mode
 verifies that advertised HBM pools export fabric handles. A consumer's local
 destination may be an ordinary `hipMalloc` allocation;
 only the remote source must be fabric-exportable. A consumer does not have to
 advertise a nonempty HBM pool. Strict mode rejects a CPU endpoint, missing fabric
-capability, mismatched domains, or unavailable copy module; it does not stage or
-switch the payload to RDMA.
+capability, mismatched domains, or unavailable copy module. Cold-tier reads
+require the owner's configured bridge; strict mode never switches their payload
+to RDMA. The arena can be enabled on an `auto` owner to serve strict consumers,
+but an `auto` consumer continues to use the original cold-tier endpoint.
 
 `auto` uses actual endpoint capability and backend eligibility. An optional
 RDMA registration failure can leave a valid FABRIC-only GPU region. Selective
@@ -69,6 +80,66 @@ export UMBP_FABRIC_KERNEL_PATH="$PWD/build-ualink/src/io/fabric_copy.hsaco"
 Both GPUs must be in a compatible PPOD/VPOD and a fabric READY domain. gRPC
 addresses must be reachable between hosts. UALink availability is checked by
 the FABRIC backend, independently of a successful gRPC connection.
+
+## DRAM and SSD read paths
+
+```mermaid
+flowchart LR
+  subgraph O[Owner tray]
+    D[DRAM KV]
+    S[SSD KV]
+    R[SSD host read staging]
+    A[Reusable exportable HBM read staging]
+    H[Exportable HBM KV]
+    S -->|Local bounded SSD read| R
+    D -->|Local H2D| A
+    R -->|Local H2D| A
+  end
+  subgraph C[Consumer tray]
+    K[GPU FABRIC copy kernel]
+    G[Registered GPU KV destination]
+    K -->|Local GPU stores| G
+  end
+  A -->|Remote GPU loads over UALink| K
+  H -->|Remote GPU loads over UALink| K
+```
+
+The installed ROCr API supports Fabric export for GPU-agent allocations. Local
+Host/HostNuma VMM probes accepted allocation, mapping and local copies but
+returned `hipErrorInvalidValue` for Fabric export; Device VMM export/import
+succeeded. See [the capability evidence](ualink-host-memory-capability.md).
+This implementation therefore uses the explicit HBM bridge for cold tiers.
+
+The consumer sends an object-relative read window in the completion-pin acquire
+RPC. For scattered ranges, this is the smallest continuous envelope covering
+the ranges. SSD extent staging reads that envelope when enabled and supported;
+otherwise it reads the whole object before the HBM bridge copies the envelope.
+The reply preserves the complete object size and storage tier, and identifies
+the covered window and temporary HBM pages separately. The consumer copies
+only its requested ranges into its registered GPU allocation. Holes inside the
+envelope add SSD/H2D bytes without adding requested UALink copy bytes.
+
+The HBM arena is allocated, registered and advertised once, allowing descriptor
+and Fabric mapping reuse. Its dedicated wire backend ID is outside the storage
+registry; it never publishes a key, participates in placement, or creates a
+consumer-local UMBP replica. Source buffer references are reused within a batch,
+and transfers use the existing local H2D and MORI-IO FABRIC engines.
+
+All cold entries in a grant reserve HBM pages together. A batch that can never
+fit returns `FAILED`; temporary occupation by outstanding grants returns
+`BUSY`, with bounded client retry. SSD completion-pinned resolves also reserve
+their host staging batch together, avoiding partial-batch retry starvation.
+Size both arenas for the sum of rounded-up windows in a batch plus concurrent
+reads, or submit smaller groups. Arena pressure is exposed as a failed read
+after the retry budget, so callers can choose recomputation or a smaller group.
+
+Owner DRAM/SSD source holds survive until the local H2D handle confirms
+completion. The grant then holds the HBM staging pages until the consumer's
+remote GPU copy completes and releases its pin. Slow SSD I/O and H2D preparation
+run outside the read receipt mutex; retries of the same operation share one
+preparation, while other releases can proceed. Clear/abandon cancel preparation
+publication without freeing memory still used by a local copy. An unconfirmed
+local or remote drain quarantines the corresponding backing and registrations.
 
 ## GPU range API and completion contract
 
@@ -133,9 +204,11 @@ or submission; build/rejection paths release it. A fixed read lease is not used
 to authorize reclamation of these pages. BUSY grants are released before a new
 operation is issued.
 
-The owner currently serializes acquire/receipt work under one read-pin mutex.
-HBM lookup is short, but high fan-in should be profiled before moving to a
-sharded receipt table; a slow storage resolution can delay other acquires.
+The owner reserves and publishes receipts under short locks. Storage resolution
+and H2D preparation run outside those locks. Duplicate acquires wait for the
+same preparation result; Clear and abandonment prevent a cancelled preparation
+from publishing a new grant. High fan-in receipt-table contention should still
+be measured before adding shards or deferred release batching.
 
 FABRIC/auto remote writes reserve protected slots identified by operation ID. Local
 FABRIC-mode PUTs use the same protected lifecycle. A protected pending slot is
@@ -171,11 +244,11 @@ the same conservative quarantine applies; callers must check the client flag
 before freeing source or destination allocations after an exception.
 Recovery from a device fault requires an external device/process fencing policy;
 a timeout, lost heartbeat or changed epoch alone does not prove the GPU stopped.
-These protected-write and backing-quarantine guarantees cover the paged DRAM/HBM
-backends used by this feature. Remote protected allocation fails closed for
-unsupported backends. GPU writes into local SSD staging retain the existing SSD
-lifecycle and need separate fault-fencing work before mixing them into this KV
-sharing deployment.
+These guarantees cover paged DRAM/HBM backing and the host/HBM staging used by
+cold-tier reads. SSD shutdown retains its host arena and registration while
+completion holds or uncertain GPU work remain. Remote protected allocation
+still fails closed for unsupported backends, including SSD; cold-tier sharing
+uses committed owner-local objects, not a new remote SSD write protocol.
 
 ## KV identity and inference integration
 
@@ -224,18 +297,44 @@ completion and byte verification accompany it. Neither measurement isolates
 kernel time or physical link traffic. Cold samples measure the first GET after
 client reconstruction; reconstruction itself occurs outside the GET timer.
 
+For DRAM, add `--medium dram --fabric-staging-bytes 67108864` to the producer
+and `--expected-medium dram` to the consumer. For SSD, use
+`--medium ssd --fabric-staging-bytes 67108864 --ssd-dir /path/to/test-ssd`
+and `--expected-medium ssd`. The driver sizes its SSD host staging for its
+batch geometry; `--ssd-io posix|io_uring` and `--ssd-direct-io 0|1` select the
+local disk path. Use a fresh test directory and run ID for each run. The master
+command is unchanged. `--staging-device` can select a different owner GPU from
+the producer's source allocation; both endpoints must be locally reachable.
+
+The tier-sharing GPU test checks committed DRAM/SSD reads after poisoning the
+original producer GPU bytes, nonzero covered windows, batched and whole-object
+reads, untouched destinations, mapping reuse and held-grant capacity pressure.
+Run it with:
+
+```bash
+ctest --test-dir build-ualink -R '^umbp_ualink_tier_sharing$' --output-on-failure
+```
+
+It uses real local Fabric mappings between logical peers;
+the separate-process driver is needed for deployment checks, and f01-1/f01-2
+cross-host validation remains pending.
+
 Relevant checks include `io_fabric_integration`, `test_page_backend`,
 `umbp_peer_pool`, `test_peer_service_dispatch`, `test_transfer_engine`,
 `test_hbm_backend`, `umbp_storage_config`, `umbp_backend_policy_config`, and
-`umbp_gpu_direct_ranges`. Set `MORI_FABRIC_TEST_MODULE` to the generated module
+`umbp_gpu_direct_ranges`, plus `umbp_fabric_read_staging`, `umbp_ssd_backend`
+and `test_batch_resolve_codec`. Set `MORI_FABRIC_TEST_MODULE` to the generated module
 for the GPU direct range tests. The IO integration executable also accepts
 `--gpu-module /path/fabric_copy.hsaco`.
 
 Measure direct and existing staged paths on the same workload before choosing
 serving defaults. Record requested/planned bytes, selected backend, plan/kernel
 count, import cost, p50/p95/p99 completion latency, GPU compute contention and
-model TTFT/TPOT. The direct path removes host staging, but that alone does not
-establish lower latency than a tuned packed path. No cross-tray bandwidth or
+model TTFT/TPOT. For cold tiers, also record SSD staged bytes and owner H2D
+bytes separately from consumer submitted FABRIC bytes: the latter counts
+requested copy plans, not all local copies or physical bus traffic. GPU direct
+GET removes consumer host staging; cold tiers still pay owner staging costs.
+Compare those costs with a tuned RDMA or packed path. No cross-tray bandwidth or
 model speedup is assumed from single-host correctness tests.
 
 ### Verification of this branch
