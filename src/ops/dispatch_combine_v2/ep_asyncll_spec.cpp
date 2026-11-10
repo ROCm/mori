@@ -232,6 +232,16 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
       geometry.sharedBytes = static_cast<unsigned>(EpInterNodeCombineSharedBytes(cfg));
       break;
   }
+
+  // A fused copy holds its whole grid resident while it waits for its peers
+  // (see EpInterNodeCfg::asyncLlFusedRecvCtas). RecvCopy strides over its
+  // tokens, so a narrower grid only does the same work in fewer CTAs.
+  const bool fusedCopy = cfg.asyncLlMode == 2 && (kind == EpAsyncLLKernel::DispatchRecvCopy ||
+                                                  kind == EpAsyncLLKernel::CombineRecvCopy);
+  if (fusedCopy && cfg.asyncLlFusedRecvCtas > 0) {
+    const auto cap = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.asyncLlFusedRecvCtas, worldSize));
+    if (cap < geometry.gridX) geometry.gridX = cap;
+  }
   return geometry;
 }
 

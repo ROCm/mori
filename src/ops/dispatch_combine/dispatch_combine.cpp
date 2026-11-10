@@ -116,6 +116,20 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
     : config(config_) {
   ccoCommPtr = reinterpret_cast<void*>(ccoCommPtr_);
   useCcoComm = (ccoCommPtr != nullptr);
+  // The CCO backend (MORI_EP_COMM=cco, the default on gfx125x) only supports intra-node handles:
+  // its MallocSymm fills the LSA peer pointers of each symmetric buffer but not the RDMA fields
+  // (SymmMemObj::peerPtrs / peerRkeys / lkey) that the cross-node kernels read, so the first
+  // cross-node put would fault at address 0 on the GPU. Reject every kernel type here, before
+  // anything uses the communicator, so that kernel types added later are rejected too. Cross-node
+  // EP on gfx125x goes through EPv2 (mori.ops.dispatch_combine_v2).
+  if (useCcoComm && config.worldSize > config.gpuPerNode) {
+    throw std::runtime_error(
+        "EpDispatchCombineHandle with the CCO backend (MORI_EP_COMM=cco, the default on gfx125x) "
+        "supports intra-node only, but worldSize=" +
+        std::to_string(config.worldSize) + " > gpuPerNode=" + std::to_string(config.gpuPerNode) +
+        ": its symmetric buffers are not registered for RDMA. Use EPv2 "
+        "(mori.ops.dispatch_combine_v2) for cross-node EP.");
+  }
   assert(IsPowerOf2(config.gpuPerNode) && (config.worldSize % config.gpuPerNode == 0));
   if (!useCcoComm) {
     int shmemNumQpPerPe = ShmemNumQpPerPe();
@@ -156,7 +170,8 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   // cross-node traffic through their same-rail proxy PE, so they are fine;
   // InterNode v0 and AsyncLL post straight to `destExpert / numExpertPerRank`,
   // which lands on an unconnected QP and hangs. Fail at construction instead.
-  // CCO path (!useCcoComm) is excluded: CCO has its own CCO_GDA_CONNECTION_RAIL.
+  // Shmem backend only: cross-node handles on the CCO backend are rejected at the top of the
+  // constructor.
   if (!useCcoComm && config.worldSize > config.gpuPerNode && ShmemRailOnly() &&
       (config.kernelType == KernelType::InterNode || config.kernelType == KernelType::AsyncLL)) {
     throw std::runtime_error(
@@ -233,10 +248,37 @@ EpDispatchCombineHandle::~EpDispatchCombineHandle() {
   if (useCcoComm) FinalizeCcoAllocs();
 }
 
+// Describes the shmem symmetric heap for a failed MallocSymm: its size, its free space and how to
+// grow it, so the error names the cause instead of the hipMemset(nullptr) that would follow.
+static std::string DescribeShmemHeapForAllocFailure() {
+  auto* states = ShmemStatesSingleton::GetInstance();
+  size_t heapSize = 0;
+  if (states->mode == ShmemMode::StaticHeap) {
+    heapSize = states->memoryStates->staticHeapSize;
+  } else if (states->mode == ShmemMode::VMHeap) {
+    heapSize = states->memoryStates->vmmHeapVirtualSize;
+  } else {
+    return "isolation mode: the device allocation itself failed";
+  }
+  std::string desc = "current heap size " + std::to_string(heapSize) + " bytes";
+  if (auto* va = states->memoryStates->symmMemMgr->GetHeapVAManager()) {
+    size_t totalBlocks = 0, freeBlocks = 0, allocatedBlocks = 0, freeBytes = 0, largestFree = 0;
+    va->GetStats(totalBlocks, freeBlocks, allocatedBlocks, freeBytes, largestFree);
+    desc += ", free " + std::to_string(freeBytes) + " bytes, largest free block " +
+            std::to_string(largestFree) + " bytes";
+  }
+  return desc + "; if the heap is too small, increase MORI_SHMEM_HEAP_SIZE";
+}
+
 mori::application::SymmMemObjPtr EpDispatchCombineHandle::MallocSymm(size_t size,
                                                                      unsigned int flags) {
   if (!useCcoComm) {
     void* buf = ShmemExtMallocWithFlags(size, flags);
+    if (buf == nullptr && size > 0) {
+      throw std::runtime_error("MallocSymm: symmetric heap allocation of " + std::to_string(size) +
+                               " bytes failed on rank " + std::to_string(config.rank) + " (" +
+                               DescribeShmemHeapForAllocFailure() + ")");
+    }
     HIP_RUNTIME_CHECK(hipMemset(buf, 0, size));
     mori::application::SymmMemObjPtr obj = ShmemQueryMemObjPtr(buf);
     assert(obj.IsValid());

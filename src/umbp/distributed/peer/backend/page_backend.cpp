@@ -39,6 +39,7 @@
 #endif
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/nic_limits.h"
 #include "umbp/common/numa_config.h"
 #include "umbp/common/parallel_for.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
@@ -282,6 +283,12 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
         TransferRef ref = registrar->RegisterMemory(base, size, loc, device);
         owned_refs_.push_back(ref);
         if (ref.HasMemoryDesc()) {
+          WarnIfNicRegionExceedsAinicLimit(
+              "DRAM buffer " + std::to_string(b) + " region at " + std::to_string(offset >> 20) +
+                  " MiB",
+              size, buffer.backing_page_size,
+              "Use UMBP_DRAM_USE_HUGEPAGES, or a UMBP_DRAM_MAX_MR_BYTES of at most 2^18 pages "
+              "(1 GiB of 4 KiB ones).");
           msgpack::sbuffer sbuf;
           msgpack::pack(sbuf, ref.mem);
           desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
@@ -891,6 +898,16 @@ void PageBackend::TouchLru(const std::string& key, OwnedSlot& slot) {
   if (!track_eviction_order_) return;
   std::lock_guard<std::mutex> lru_lock(lru_mutex_);
   TouchLruLocked(key, slot);
+}
+
+void PageBackend::Touch(const std::vector<std::string>& keys) {
+  if (!track_eviction_order_) return;
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+  for (const auto& key : keys) {
+    auto it = owned_.find(key);
+    if (it != owned_.end()) TouchLruLocked(key, it->second);
+  }
 }
 
 void PageBackend::RemoveFromLru(OwnedSlot& slot) {

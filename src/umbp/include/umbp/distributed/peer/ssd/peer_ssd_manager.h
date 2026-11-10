@@ -88,6 +88,8 @@ class PeerSsdManager {
   // to know how big the key is while it still only holds the key's name.
   // `owned_` has carried this all along; only the accessor was missing.
   uint64_t SizeOf(const std::string& key) const;
+  // SizeOf for a batch under one lock; 0 = not owned.
+  std::vector<uint64_t> SizesOf(const std::vector<std::string>& keys) const;
 
   // Hold a key against eviction across a peer-local migration.  Uses the same
   // refcount as active reads so eviction has one protection rule.
@@ -137,6 +139,8 @@ class PeerSsdManager {
   // returns disk a whole segment at a time), so no other ranking should be
   // used to pick its victims.
   bool OrdersEviction() const;
+  // Renews recency in this class's LRU and the tier's order; reads nothing.
+  void Touch(const std::vector<std::string>& keys);
 
   // Forwards to the tier: see TierBackend::SetRetiredFileHook.
   void SetRetiredFileHook(std::function<void(int fd)> on_close, std::chrono::milliseconds grace);

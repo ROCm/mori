@@ -630,6 +630,35 @@ TEST(PeerPool, WeightedPolicyFallsBackWhenPrimaryHasNoSpace) {
   EXPECT_EQ(result.backend_id, registry.BackendId(registry.Get("dram_b")));
 }
 
+TEST(TieredPlacementPolicy, SmallObjectsSkipMembersWithMinObjectSize) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("ssd", std::make_unique<MockBackend>(TierType::SSD)));
+  auto compiled = LogicalTierGraph::Compile(
+      {LogicalTierConfig{{{"dram", 1}, {"ssd", 1000, 64 << 10}}}}, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  const uint32_t dram = registry.BackendId(registry.Get("dram"));
+  const uint32_t ssd = registry.BackendId(registry.Get("ssd"));
+  for (int i = 0; i < 32; ++i) {
+    const std::string key = "small-" + std::to_string(i);
+    EXPECT_EQ(compiled.graph->PutOrder(key, 4096), (std::vector<uint32_t>{dram, ssd}));
+    // Large and unknown sizes keep the plain weighted order.
+    EXPECT_EQ(compiled.graph->PutOrder(key, 1 << 20), compiled.graph->PutOrder(key));
+  }
+}
+
+TEST(TieredPlacementPolicy, AdvertisesLowestMinObjectSizePerTier) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("ssd", std::make_unique<MockBackend>(TierType::SSD)));
+  auto mixed =
+      LogicalTierGraph::Compile({LogicalTierConfig{{{"dram", 1}, {"ssd", 1, 64 << 10}}}}, registry);
+  auto ssd_only = LogicalTierGraph::Compile({LogicalTierConfig{{{"ssd", 1, 64 << 10}}}}, registry);
+  ASSERT_TRUE(mixed.ok() && ssd_only.ok());
+  EXPECT_EQ(mixed.graph->CapacitySnapshot().begin()->second.min_object_bytes, 0u);
+  EXPECT_EQ(ssd_only.graph->CapacitySnapshot().begin()->second.min_object_bytes, 64u << 10);
+}
+
 TEST(TieredPlacementPolicy, RejectsTierGraphWithoutTransferEngine) {
   BackendRegistry registry;
   ASSERT_TRUE(registry.Register("only", std::make_unique<MockBackend>(TierType::DRAM)));

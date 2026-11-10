@@ -74,7 +74,30 @@ def _get_hip_lib() -> ctypes.CDLL:
 
 def _check(err: int, msg: str = "") -> None:
     if err != 0:
-        raise RuntimeError(f"HIP error {err}: {msg}")
+        hip = _get_hip_lib()
+        hip.hipGetErrorName.restype = c_char_p
+        name = (hip.hipGetErrorName(err) or b"?").decode()
+        raise RuntimeError(f"HIP error {err} ({name}): {msg}")
+
+
+def _module_load_note() -> str:
+    """Why a module failed to load, when it targets another arch than the GPU."""
+    try:
+        from .config import detect_build_config, enumerated_gpu_arch
+
+        cfg = detect_build_config()
+        device = enumerated_gpu_arch(cfg.rocm_path)
+    except Exception:
+        return ""
+    if not device or device == cfg.arch:
+        return ""
+    note = f". The code object targets {cfg.arch} but the GPU is {device}"
+    if {cfg.arch, device} == {"gfx1250", "gfx1250-strict"}:
+        note += (
+            ": gfx1250 and gfx1250-strict code objects each load only where the"
+            " runtime reports that target"
+        )
+    return note + " (MORI_GPU_ARCHS overrides detection; unset it)"
 
 
 class HipModule:
@@ -84,7 +107,8 @@ class HipModule:
         hip = _get_hip_lib()
         self._module = c_void_p()
         err = hip.hipModuleLoad(byref(self._module), c_char_p(hsaco_path.encode()))
-        _check(err, f"hipModuleLoad({hsaco_path})")
+        if err != 0:
+            _check(err, f"hipModuleLoad({hsaco_path}){_module_load_note()}")
         self._functions: dict[str, HipFunction] = {}
         self._path = hsaco_path
 

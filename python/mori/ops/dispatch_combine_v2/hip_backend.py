@@ -50,6 +50,7 @@ FlyDSL is not installed.
 
 from __future__ import annotations
 
+import collections
 import functools
 import os
 
@@ -140,6 +141,69 @@ def _geometry_from_env(name):
 # MI308X out the same way (AnvilLib::isMi308x, DID 0x74A2). Capping all of gfx942
 # would have held MI300X and MI325X, which have the full set, to three as well.
 _ASYNCLL_SDMA_QUEUE_CAP = {"mi308x": 3}
+
+# Per device: how many live AsyncLL ops use each SDMA queue offset.
+_ASYNCLL_QUEUE_OFFSET_USERS = collections.defaultdict(collections.Counter)
+
+
+def _take_sdma_queue_offset(device_index: int, num_queues: int) -> int:
+    """Least-used offset among live ops on the device, lowest on a tie.
+
+    close() gives it back. More live ops than queues share one: slower, still
+    correct.
+    """
+    users = _ASYNCLL_QUEUE_OFFSET_USERS[device_index]
+    offset = min(range(num_queues), key=lambda o: (users[o], o))
+    users[offset] += 1
+    return offset
+
+
+def _give_back_sdma_queue_offset(device_index: int, offset: int) -> None:
+    users = _ASYNCLL_QUEUE_OFFSET_USERS[device_index]
+    users[offset] -= 1
+    if users[offset] <= 0:
+        del users[offset]
+
+
+def _hsa_cu_mask_cus(device_index: int, mp_count: int):
+    """CUs HSA_CU_MASK leaves this process on `device_index`, or None if unrestricted.
+
+    ROCr's syntax is `<gpus>:<cus>[;<gpus>:<cus>...]`, each side a comma list of
+    decimal indices or `a-b` ranges, e.g. `0-7:0-63`. GPU indices are ROCr's
+    enumeration order, which is the HIP/torch order unless HIP_VISIBLE_DEVICES
+    reorders devices. A setting this cannot read returns None, so the ceiling
+    falls back to the whole device rather than failing the op.
+    """
+    raw = os.environ.get("HSA_CU_MASK", "").strip()
+    if not raw:
+        return None
+
+    def indices(text):
+        out = set()
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            lo, sep, hi = part.partition("-")
+            lo, hi = int(lo), int(hi) if sep else int(lo)
+            if lo < 0 or hi < lo:
+                raise ValueError(part)
+            out.update(range(lo, hi + 1))
+        return out
+
+    try:
+        for entry in raw.split(";"):
+            if not entry.strip():
+                continue
+            gpus, _, cus = entry.partition(":")
+            if device_index in indices(gpus):
+                found = indices(cus)
+                if mp_count > 0:
+                    found = {c for c in found if c < mp_count}
+                return len(found)
+    except ValueError:
+        return None
+    return None
 
 
 def _asyncll_sdma_queues(model, gpu_per_node: int) -> int:
@@ -409,6 +473,21 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             if (cfg.is_internode or cfg.async_ll)
             else None
         )
+        # SDMA queue offset (QueueForPe adds it to the destination PE): 0, the
+        # shared queue, unless the caller opted in. LSA uses no SDMA queue.
+        self._sdma_queue_offset = 0
+        self._holds_sdma_queue_offset = False
+        if (
+            cfg.async_ll
+            and cfg.async_ll_transport == "sdma"
+            and cfg.async_ll_own_sdma_queue
+            and self._dev_comm is not None
+            and self._dev_comm.sdma_num_queue > 1
+        ):
+            self._sdma_queue_offset = _take_sdma_queue_offset(
+                self._device_index, self._dev_comm.sdma_num_queue
+            )
+            self._holds_sdma_queue_offset = True
 
         # gfx1250 dispatch staging: one dynamically-allocated buffer shared by
         # all dispatch schedule variants.  Must be set before _build_kernels
@@ -515,10 +594,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             requirements.gda_connection_type = _cco.GDA_CONNECTION_CROSSNODE
         if cfg.async_ll and cfg.async_ll_transport == "sdma":
             # One SDMA queue per peer. The transfer kernels run one issuing warp
-            # per destination and the queue is picked as destPe % sdmaNumQueue, so
-            # fewer queues than peers folds two warps onto one queue -- correct,
-            # but they then serialise on its in-order commit chain. Eight is the
-            # hardware cap; above it cco clamps with a warning.
+            # per destination and the queue is picked as (destPe + the op's
+            # sdmaQueueOffset) % sdmaNumQueue, so fewer queues than peers folds
+            # two warps onto one queue -- correct, but they then serialise on its
+            # in-order commit chain. Eight is the hardware cap; above it cco
+            # clamps with a warning.
             #
             # The count is a PERFORMANCE knob, not a correctness one, and asking
             # for more than a pair can hold is fatal rather than degrading:
@@ -1149,6 +1229,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ),
             rank=self.cfg.rank,
             lsaBase=self.lsa_base,
+            sdmaQueueOffset=self._sdma_queue_offset,
             dispDestTokIdMap=0,  # per-launch: the base passes token_dest_map or routing_dest_map
             interNodeDispDestTokIdMap=ptr(self.inter_disp_dest_tok_id_map),
             interNodeDispSendMap=ptr(self.inter_disp_send_map),
@@ -1373,7 +1454,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 raise ValueError(f"{name} must be '0' or '1', got {value!r}")
             return value == "1"
 
-        early = flag("MORI_ASYNCLL_EARLY_NOTIFY", arch == "gfx1250")
+        # On by default where it has been measured to win: gfx1250 (either code
+        # target), and gfx950 (MI355X), where it beat legacy at every token count,
+        # most with two overlapping streams.
+        early = flag(
+            "MORI_ASYNCLL_EARLY_NOTIFY", arch in ("gfx950", "gfx1250", "gfx1250-strict")
+        )
         fused = flag("MORI_ASYNCLL_FUSED_RECV", False)
         skip_reset = flag("MORI_ASYNCLL_SKIP_RESET", early)
         if (fused or skip_reset) and not early:
@@ -1383,6 +1469,34 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         # Must match EpInterNodeCfg::asyncLlMode: legacy, early, fused CTA wait.
         return (2 if fused else int(early)), skip_reset
+
+    @staticmethod
+    def _asyncll_fused_recv_ctas(mode, device_index=0, mp_count=0):
+        # Grid ceiling for the fused receive copies; 0 lets the native factory
+        # pick half the device. MORI_ASYNCLL_FUSED_RECV_CTAS is only a tuning
+        # override: the default exists so that fusion cannot starve another
+        # stream's sends into a deadlock.
+        name = "MORI_ASYNCLL_FUSED_RECV_CTAS"
+        value = os.environ.get(name, "0")
+        try:
+            ctas = int(value)
+        except ValueError:
+            ctas = -1
+        if ctas < 0:
+            raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        if mode != 2:
+            return 0
+        if ctas > 0:
+            return ctas
+        # "Half the device" has to mean half of what this process can use. The
+        # native default is mpCount / 2, and mpCount is the whole device even when
+        # HSA_CU_MASK leaves the process a fraction of it: at 64 of 256 CUs two
+        # 128-CTA fused grids fill every slot, and the ranks deadlock as if there
+        # were no ceiling at all.
+        usable = _hsa_cu_mask_cus(device_index, mp_count)
+        if usable is not None and 0 < usable < mp_count:
+            return max(usable // 2, 1)
+        return 0
 
     @classmethod
     def _asyncll_seq(cls, cfg, mode=0):
@@ -1421,6 +1535,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # geometry table supplies grids directly.
         request["mpCount"] = self._multi_processor_count
         request["asyncLlMode"] = self._asyncll_mode
+        request["asyncLlFusedRecvCtas"] = self._asyncll_fused_ctas
         return request
 
     def _build_asyncll_kernels(self, cfg) -> KernelSet:
@@ -1440,6 +1555,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # KernelSet.self_resets_counters with it), and AsyncLL's RecvCopy
         # always assigned the count. Still parsed so existing settings validate.
         self._asyncll_mode, _ = self._asyncll_options(cfg, self._arch)
+        self._asyncll_fused_ctas = self._asyncll_fused_recv_ctas(
+            self._asyncll_mode, self._device_index, self._multi_processor_count
+        )
         sequences = self._asyncll_seq(cfg, self._asyncll_mode)
         for group, names in sequences.items():
             for name in names:
@@ -1836,6 +1954,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._dev_comm = None
             self._internode_static_cache = None
             dev_comm.close()
+        if getattr(self, "_holds_sdma_queue_offset", False):
+            self._holds_sdma_queue_offset = False
+            _give_back_sdma_queue_offset(self._device_index, self._sdma_queue_offset)
 
     # -- views (same contract as the FlyDSL backend) -----------------------
 
