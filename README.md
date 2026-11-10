@@ -14,7 +14,6 @@
   <a href="https://rocm.github.io/mori/"><b>Documentation</b></a> |
   <a href="https://rocm.github.io/mori/installation.html"><b>Installation</b></a> |
   <a href="https://rocm.github.io/mori/quickstart.html"><b>Quickstart</b></a> |
-  <a href="https://rocm.github.io/mori/ep_backends.html"><b>Choosing an EP backend</b></a> |
   <a href="https://rocm.github.io/mori/api/communication.html"><b>API reference</b></a>
 </p>
 
@@ -61,8 +60,8 @@ It is built from [`docs/`](https://github.com/ROCm/mori/tree/main/docs) on every
 
 | **Topic** | **Description** | **Docs** |
 |---|---|---|
-| Getting started | Installation, fabric checks, first steps and choosing an EP API | [Installation](https://rocm.github.io/mori/installation.html) · [Quickstart](https://rocm.github.io/mori/quickstart.html) · [EP backends](https://rocm.github.io/mori/ep_backends.html) |
-| MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples | [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-EP-BENCHMARK.html) · [RDMA bandwidth](https://rocm.github.io/mori/rdma_bandwidth_utilization.html) |
+| Getting started | Installation, fabric checks and first steps | [Installation](https://rocm.github.io/mori/installation.html) · [Quickstart](https://rocm.github.io/mori/quickstart.html) |
+| MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples; choosing between the EP APIs and backends | [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html) · [Choosing an API and backend](https://rocm.github.io/mori/ep_backends.html) · [Benchmark](https://rocm.github.io/mori/MORI-EP-BENCHMARK.html) · [RDMA bandwidth](https://rocm.github.io/mori/rdma_bandwidth_utilization.html) |
 | MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](https://rocm.github.io/mori/MORI-SHMEM-GUIDE.html) |
 | MORI-CCO | Explicit-handle GPU communication over LSA, GDA and SDMA; fused GEMM + collective operators | [CCO Guide](https://rocm.github.io/mori/MORI-CCO-GUIDE.html) · [Fused GEMM + Collective Guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html) |
 | MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](https://rocm.github.io/mori/MORI-IR-GUIDE.html) |
