@@ -45,7 +45,8 @@ Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
     follow the groups (LANE_GROUPS), after the pre-commit check of the head commit
     has passed. A rename counts under both its old and its new path. A tools/ file
     counts only if something PR CI runs, builds or imports names it (ci_tools); a
-    module that importing mori.ops/io/shmem runs also counts for umbp.
+    module that importing mori.ops/io/shmem runs also counts for umbp; a conftest.py,
+    or a test package's __init__.py, counts for the groups of every file below it.
 
 With COMMENT=true it keeps one comment on the PR up to date with the lanes.
 
@@ -143,9 +144,8 @@ AREAS = [
     # Any other tools/ file counts only if CI builds or runs it (ci_tools); then the
     # rules below classify it.
     ("tools", "tools", r"^tools/"),
-    # Imported by the EPv2 tests and by the fused GEMM tests.
+    # The EPv2 tests import it.
     ("cco_tests", {"cco", "epv2"}, r"^examples/cco/python/cco_example_common\.py$"),
-    ("cco_tests", {"cco", "fused"}, r"^tests/python/cco/__init__\.py$"),
     (
         "fused",
         {"fused"},
@@ -252,9 +252,13 @@ CI_ENTRY_FILES = (
 # test_umbp_lazy_load imports these and checks that UMBP stays unloaded, so every
 # module those imports run counts for umbp too (umbp_lazy_files).
 UMBP_LAZY_IMPORTS = ("mori.ops", "mori.io", "mori.shmem")
+# pytest runs a conftest.py, and the __init__.py of a test package, for every test
+# below it, so they count for the groups of every file there.
+TEST_SETUP = re.compile(r"(^|/)conftest\.py$|^tests/(.+/)?__init__\.py$")
 ROOT = Path(__file__).resolve().parents[2]
 _ci_tools = None
 _umbp_lazy = None
+_tracked = None
 
 
 def ci_tools():
@@ -338,8 +342,32 @@ def umbp_lazy_files():
     return _umbp_lazy
 
 
+def tracked_files():
+    """Every tracked path (a sparse checkout lists them too); None without git."""
+    global _tracked
+    if _tracked is None:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(ROOT), "ls-files", "-z"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        _tracked = [f for f in out.split("\0") if f]
+    return _tracked
+
+
 def area_of(path):
     """(area, groups) of one path."""
+    if TEST_SETUP.search(path):
+        tracked = tracked_files()
+        if tracked is None:
+            return "core", set(ALL)
+        below = os.path.dirname(path) + "/" if "/" in path else ""
+        files = [f for f in tracked if f.startswith(below) and not TEST_SETUP.search(f)]
+        return "test_setup", set().union(*(area_of(f)[1] for f in files))
     for area, groups, pattern in AREAS:
         if not re.search(pattern, path):
             continue
