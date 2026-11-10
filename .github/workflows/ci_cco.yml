@@ -1,23 +1,18 @@
 name: CCO CI test
+
+# Called by ci.yml after its scope job, with the cco and fused lanes. ci.yml's
+# triggers, concurrency and gate cover these jobs.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-    # labeled: ci:full; ready_for_review: drafts run nothing.
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  pull-requests: read  # ci-scope reads the PR's files
-  checks: read  # ci-scope waits for pre-commit
-
-concurrency:
-  # A ci:full run replaces the PR's run with a superset; the first run of any
-  # other label gets its own group, so adding it does not cancel the PR's run.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.run_attempt == 1 && github.event.label.name != 'ci:full' && format('-{0}', github.event.label.name) || '' }}
-  cancel-in-progress: true
+  workflow_call:
+    inputs:
+      cco:
+        description: Run the CCO unit, EPv2 single-node and CCO internode jobs
+        type: boolean
+        required: true
+      fused:
+        description: Run the CCO fused GEMM job
+        type: boolean
+        required: true
 
 env:
   IMAGE: rocm/mori:ci-cco
@@ -26,16 +21,9 @@ env:
   CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
 
 jobs:
-  scope:
-    name: scope
-    uses: ./.github/workflows/ci-scope.yml
-    with:
-      has_mi300x: false
-
   cco-unit-test:
     name: CCO unit test (${{ matrix.platform }})
-    needs: scope
-    if: needs.scope.outputs.cco == 'true'
+    if: inputs.cco
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -416,8 +404,7 @@ jobs:
     name: CCO fused GEMM test (${{ matrix.platform }})
     # The fused GEMM + collective ops use SDMA over loopback only. Their own runner
     # takes them off the CCO unit test's critical path.
-    needs: scope
-    if: needs.scope.outputs.fused == 'true'
+    if: inputs.fused
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -533,8 +520,7 @@ jobs:
     # The EPv2 AsyncLL, routing-snapshot and bench steps, on the runner and in the
     # configuration they always passed in as part of the CCO unit test. On
     # MI355X-AINIC-PIT-G17, test_asyncll's back_to_back check fails.
-    needs: scope
-    if: needs.scope.outputs.cco == 'true'
+    if: inputs.cco
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -613,8 +599,7 @@ jobs:
     name: CCO internode test (${{ matrix.platform }})
     # Needs no other job: cco-unit-test runs on another runner, and this runner
     # runs one job at a time, so it never overlaps the other jobs on node1.
-    needs: scope
-    if: needs.scope.outputs.cco == 'true'
+    if: inputs.cco
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -835,25 +820,3 @@ jobs:
             test -n '$ROOTLESS' || $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
             cd $GITHUB_WORKSPACE && CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
           " || true
-
-  ci-gate:
-    name: CCO CI gate
-    # One check that is green when every lane the scope picked passed; a lane
-    # the scope skipped counts as passed.
-    if: always()
-    needs: [scope, cco-unit-test, cco-fused-test, cco-v2-test, cco-internode-test]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check lane results
-        env:
-          NEEDS: ${{ toJSON(needs) }}
-          REASON: ${{ needs.scope.outputs.reason }}
-        run: |
-          echo "Scope: ${REASON:-n/a}"
-          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)\t\(.value.result)"' | tee results.tsv
-          if awk -F'\t' '$2 != "success" && $2 != "skipped"' results.tsv | grep -q .; then
-            echo "::error::a CI lane did not pass"; exit 1
-          fi
-          if ! grep -qP '^scope\tsuccess$' results.tsv; then
-            echo "::error::CI scope did not succeed"; exit 1
-          fi

@@ -4,8 +4,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    # labeled: ci:full / ci:mi300x; ready_for_review: drafts run nothing.
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    # ready_for_review: drafts run nothing. The ci:full and ci:mi300x labels
+    # act through ci-rerun.yml, which re-runs this workflow when one is added.
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       run_umbp_single_node_hicache:
@@ -26,14 +27,9 @@ on:
         description: Enable DP/EP modes when launching the hicache test
 permissions:
   contents: read
-  pull-requests: read  # ci-scope reads the PR's files
-  checks: read  # ci-scope waits for pre-commit
 
 concurrency:
-  # ci:full and ci:mi300x runs replace the PR's run with a superset; the first
-  # run of any other label gets its own group, so adding it does not cancel the
-  # PR's run (a re-run of it is a normal run and joins the PR's group).
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.run_attempt == 1 && github.event.label.name != 'ci:full' && github.event.label.name != 'ci:mi300x' && format('-{0}', github.event.label.name) || '' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -47,6 +43,13 @@ jobs:
   scope:
     name: scope
     uses: ./.github/workflows/ci-scope.yml
+    # The one job that may write: it keeps the routing comment on the PR.
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: read
+    with:
+      comment: true
 
   build:
     name: mori build (${{ matrix.platform }})
@@ -1482,12 +1485,22 @@ jobs:
         if: always()
         run: docker rm -f umbp-single-node >/dev/null 2>&1 || true
 
+  cco:
+    name: CCO
+    # The CCO jobs live in ci_cco.yml; this run's scope picks which of them run.
+    needs: scope
+    if: needs.scope.outputs.cco == 'true' || needs.scope.outputs.fused == 'true'
+    uses: ./.github/workflows/ci_cco.yml
+    with:
+      cco: ${{ needs.scope.outputs.cco == 'true' }}
+      fused: ${{ needs.scope.outputs.fused == 'true' }}
+
   ci-gate:
-    name: MoRI CI gate
-    # One check that is green when every lane the scope picked passed; a lane
-    # the scope skipped counts as passed.
+    name: CI gate
+    # One check that is green when every lane the scope picked passed, CCO's
+    # included; a lane the scope skipped counts as passed.
     if: always()
-    needs: [scope, build, intranode-test, intranode-test-mi300x, intranode-test-rocm10, jax-intranode-test, umbp-unit-test, internode-test, internode-test-mi300x]
+    needs: [scope, build, intranode-test, intranode-test-mi300x, intranode-test-rocm10, jax-intranode-test, umbp-unit-test, internode-test, internode-test-mi300x, cco]
     runs-on: ubuntu-latest
     steps:
       - name: Check lane results

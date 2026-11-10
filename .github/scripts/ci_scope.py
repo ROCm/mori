@@ -20,13 +20,14 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Decide which GPU CI lanes a pull request needs.
+"""Decide which GPU CI lanes a pull request needs, and say so on the PR.
 
-Run by .github/workflows/ci-scope.yml. Writes these step outputs:
+Run once per CI run by .github/workflows/ci-scope.yml, which ci.yml calls first;
+ci.yml hands the cco and fused lanes to ci_cco.yml. Writes these step outputs:
 
-  mori    MoRI CI on MI355X: EP v1, shmem, IO, CCL (ci.yml)
-  mi300x  MoRI CI on MI300X: build, intranode, internode (ci.yml)
-  umbp    UMBP unit tests (ci.yml)
+  mori    MoRI CI on MI355X: EP v1, shmem, IO, CCL
+  mi300x  MoRI CI on MI300X: intranode, internode
+  umbp    UMBP unit tests
   cco     CCO unit test, CCO EPv2 single-node test, CCO internode (ci_cco.yml)
   fused   CCO fused GEMM + collective job (ci_cco.yml)
   full    full internode bench/stress sweeps: workflow_dispatch, or ci:full on a PR
@@ -35,13 +36,14 @@ Run by .github/workflows/ci-scope.yml. Writes these step outputs:
 Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
 
   - a draft runs nothing, unless it has the ci:full label;
-  - ci:full runs everything; ci:mi300x adds the MI300X lanes to the lanes the
-    changed files pick (only for a caller with MI300X lanes, see HAS_MI300X);
-    labels are read live, so a re-run sees the current ones;
-  - adding any other label runs nothing (a re-run of that run is a normal run);
+  - ci:full runs everything, with the full internode sweeps; ci:mi300x adds the
+    MI300X lanes to the lanes the changed files pick. Adding either label re-runs
+    the PR's CI (ci-rerun.yml); labels are read live, so the re-run sees it;
   - otherwise the lanes follow the changed files (rules below), after the
     pre-commit check of the head commit has passed. A rename counts under both
     its old and its new path.
+
+With COMMENT=true it keeps one comment on the PR up to date with the lanes.
 
 `--files FILE` classifies a list of paths offline, for checking the rules.
 """
@@ -64,11 +66,11 @@ AREAS = [
         "ignored",
         r"^\.github/(ISSUE_TEMPLATE|PULL_REQUEST_TEMPLATE|CODEOWNERS)|^\.claude/",
     ),
-    ("ci_mori", r"^\.github/workflows/ci\.yml$"),
     ("ci_cco", r"^\.github/workflows/ci_cco\.yml$"),
+    # ci.yml runs the scope and calls ci_cco.yml, so it can affect every lane.
     (
         "ci_shared",
-        r"^\.github/workflows/ci-scope\.yml$|^\.github/scripts/ci_scope\.py$",
+        r"^\.github/workflows/(ci|ci-scope)\.yml$|^\.github/scripts/ci_scope\.py$",
     ),
     # Other workflows (nightly, docs, pre-commit, ...) do not run in PR CI.
     ("ignored", r"^\.github/"),
@@ -107,8 +109,8 @@ MI300X_PATHS = re.compile(
 
 # Which areas switch on each lane; "core" (anything unmatched) switches on all.
 LANE_AREAS = {
-    "mori": {"core", "io", "build", "ci_mori", "ci_shared"},
-    "umbp": {"core", "io", "build", "umbp", "ci_mori", "ci_shared"},
+    "mori": {"core", "io", "build", "ci_shared"},
+    "umbp": {"core", "io", "build", "umbp", "ci_shared"},
     "cco": {"core", "build", "cco", "epv2", "ci_cco", "ci_shared"},
     "fused": {"core", "build", "cco", "fused", "ci_cco", "ci_shared"},
 }
@@ -163,7 +165,7 @@ def wait_for_precommit(repo, sha, appear_s=300, finish_s=1200):
             return "success" if "success" in done else done[0]
         waited = time.time() - start
         if (not runs and waited > appear_s) or waited > finish_s:
-            return None if not runs else "timed_out"
+            return None if not runs else "unfinished"
         time.sleep(20)
 
 
@@ -183,40 +185,101 @@ def live_labels(env):
 
 def decide(env):
     """(lanes, reason, full)."""
-    event, action = env.get("EVENT_NAME", ""), env.get("EVENT_ACTION", "")
+    event = env.get("EVENT_NAME", "")
     if event != "pull_request":
         full = event == "workflow_dispatch"
         return dict.fromkeys(LANES, True), f"{event} event runs everything", full
     labels = live_labels(env)
     full = "ci:full" in labels
-    label = env.get("LABEL_NAME", "")
-    first_attempt = env.get("GITHUB_RUN_ATTEMPT", "1") == "1"
-    # Labels whose first run replaces the PR's run; ci:mi300x only for a caller
-    # that has MI300X lanes.
-    run_labels = (
-        ("ci:full", "ci:mi300x")
-        if env.get("HAS_MI300X", "true") == "true"
-        else ("ci:full",)
-    )
-    if action == "labeled" and first_attempt and label not in run_labels:
-        return dict.fromkeys(LANES, False), f"label '{label}' needs no CI", full
-    if env.get("PR_DRAFT") == "true" and "ci:full" not in labels:
+    if env.get("PR_DRAFT") == "true" and not full:
         return (
             dict.fromkeys(LANES, False),
             "draft PR (add ci:full or mark it ready to run CI)",
             full,
         )
     precommit = wait_for_precommit(env["REPO"], env["PR_HEAD_SHA"])
-    if precommit not in (None, "success"):
+    if precommit == "unfinished":
         raise SystemExit(
-            f"::error::pre-commit is '{precommit}' on {env['PR_HEAD_SHA']}; fix it to run GPU CI"
+            "pre-commit has not finished after 20 min; /ci-rerun once it has"
         )
+    if precommit not in (None, "success"):
+        raise SystemExit(f"pre-commit is '{precommit}'; fix it to run GPU CI")
     if full:
         return dict.fromkeys(LANES, True), "ci:full label", full
     lanes, reason = lanes_for_files(
         changed_files(env["REPO"], env["PR_NUMBER"]), labels
     )
     return lanes, reason, full
+
+
+MARKER = "<!-- ci-scope -->"
+JOBS = {
+    "mori": "MoRI CI on MI355X: build, intranode, ROCm 10, JAX, internode",
+    "mi300x": "MoRI CI on MI300X: intranode, internode",
+    "umbp": "UMBP unit test",
+    "cco": "CCO unit test, CCO EPv2 single-node test, CCO internode",
+    "fused": "CCO fused GEMM test",
+}
+HINT = (
+    "Lanes follow the changed files. Adding `ci:full` re-runs CI with every lane and "
+    "the full internode sweeps; adding `ci:mi300x` re-runs it with the MI300X lanes "
+    "added. `/ci-rerun` re-runs CI against the current main."
+)
+
+
+def comment_body(env, lanes, reason, full):
+    """The PR comment; lanes=None means GPU CI did not start."""
+    run = "{}/{}/actions/runs/{}".format(
+        env.get("GITHUB_SERVER_URL", "https://github.com"),
+        env.get("REPO", ""),
+        env.get("GITHUB_RUN_ID", ""),
+    )
+    head = (
+        f"{MARKER}\n**GPU CI for `{env.get('PR_HEAD_SHA', '')[:8]}`** ([run]({run})): "
+    )
+    if lanes is None:
+        return head + f"not started, {reason}."
+    if not any(lanes.values()):
+        return head + f"none, {reason}.\n\n{HINT}"
+    if full:
+        reason += "; full internode sweeps"
+    rows = [
+        f"| `{lane}` | {'yes' if lanes[lane] else 'no'} | {JOBS[lane]} |"
+        for lane in LANES
+    ]
+    return "\n".join(
+        [head + reason, "", "| lane | runs | jobs |", "|---|---|---|", *rows, "", HINT]
+    )
+
+
+def post_comment(env, body):
+    """Create or update the PR's scope comment. A failure only warns: a fork PR's
+    token cannot write."""
+    repo, pr = env["REPO"], env["PR_NUMBER"]
+    try:
+        ids = gh_lines(
+            "--paginate",
+            f"repos/{repo}/issues/{pr}/comments",
+            "--jq",
+            '.[] | select(.user.login == "github-actions[bot]") '
+            f'| select(.body | startswith("{MARKER}")) | .id',
+        )
+        if ids:
+            gh_lines(
+                "-X",
+                "PATCH",
+                f"repos/{repo}/issues/comments/{ids[0]}",
+                "-f",
+                f"body={body}",
+            )
+        else:
+            gh_lines(
+                "-X", "POST", f"repos/{repo}/issues/{pr}/comments", "-f", f"body={body}"
+            )
+    except subprocess.CalledProcessError as e:
+        print(
+            f"::warning::could not update the CI scope comment: {(e.stderr or '').strip()[:300]}"
+        )
 
 
 def main():
@@ -236,8 +299,20 @@ def main():
         print(json.dumps({**lanes, "reason": reason}))
         return
 
-    lanes, reason, full = decide(os.environ)
-    with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+    env = os.environ
+    want = (
+        env.get("COMMENT") == "true"
+        and env.get("EVENT_NAME") == "pull_request"
+        and bool(env.get("PR_NUMBER"))
+    )
+    try:
+        lanes, reason, full = decide(env)
+    except SystemExit as e:
+        if want:
+            post_comment(env, comment_body(env, None, str(e.code), False))
+        print(f"::error::{e.code}")
+        return 1
+    with open(env["GITHUB_OUTPUT"], "a") as out:
         for lane in LANES:
             out.write(f"{lane}={str(lanes[lane]).lower()}\n")
         out.write(f"full={str(full).lower()}\n")
@@ -251,8 +326,10 @@ def main():
         "|---|---|",
     ]
     summary += [f"| {lane} | {'yes' if lanes[lane] else 'no'} |" for lane in LANES]
-    with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as out:
+    with open(env.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as out:
         out.write("\n".join(summary) + "\n")
+    if want:
+        post_comment(env, comment_body(env, lanes, reason, full))
     print(reason, lanes)
 
 

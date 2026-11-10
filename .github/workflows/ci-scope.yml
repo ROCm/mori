@@ -1,13 +1,13 @@
 name: CI scope
 
-# Called first by ci.yml and ci_cco.yml; .github/scripts/ci_scope.py has the rules.
+# Called first by ci.yml; .github/scripts/ci_scope.py has the rules.
 on:
   workflow_call:
     inputs:
-      has_mi300x:
-        description: Whether the caller has MI300X lanes (ci:mi300x then runs CI)
+      comment:
+        description: Keep a comment on the PR with the lanes (needs pull-requests write)
         type: boolean
-        default: true
+        default: false
     outputs:
       mori:
         description: MoRI CI on MI355X (EP v1, shmem, IO, CCL)
@@ -51,6 +51,8 @@ jobs:
         with:
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
+          # This job's token can write to the PR; the script gets it as GH_TOKEN.
+          persist-credentials: false
 
       - name: Decide which lanes run
         id: scope
@@ -58,11 +60,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_ACTION: ${{ github.event.action }}
-          LABEL_NAME: ${{ github.event.label.name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_DRAFT: ${{ github.event.pull_request.draft }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-          HAS_MI300X: ${{ inputs.has_mi300x }}
+          COMMENT: ${{ inputs.comment }}
         run: python3 .github/scripts/ci_scope.py
