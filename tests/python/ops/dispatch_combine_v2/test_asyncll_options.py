@@ -231,6 +231,12 @@ class AsyncLLSegmentedTest(unittest.TestCase):
                 all(off % 256 == 0 for off in offsets + [layout["src_tok"]])
             )
             regions = dict(asyncll_regions(cfg))
+            # The segmented expert output (world_size * S rows, S <= the receive
+            # cap) fits the compact-sized inter_dispatch_staging.
+            self.assertEqual(
+                regions["inter_dispatch_staging"],
+                cfg.world_size * cfg.max_num_inp_token_per_rank * cfg.hidden_dim * 2,
+            )
             if segmented:
                 self.assertGreaterEqual(regions["inter_dispatch_inp"], layout["bytes"])
                 self.assertGreaterEqual(regions["inter_staging"], layout["bytes"])
@@ -239,6 +245,12 @@ class AsyncLLSegmentedTest(unittest.TestCase):
                 self.assertEqual(regions["send_count"], (8 * 2 + 8 + 1 + 2 + 8) * 8)
             else:
                 self.assertEqual(regions["send_count"], 8 * 2 * 8)
+
+        # With a receive cap the segmented op keeps the capped staging too, so
+        # the layout costs no extra arena there (and no KV-cache pool).
+        cfg.max_total_recv_tokens = 8 * 50
+        regions = dict(asyncll_regions(cfg))
+        self.assertEqual(regions["inter_dispatch_staging"], 8 * 50 * 7168 * 2)
 
 
 if __name__ == "__main__":

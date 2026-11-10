@@ -213,13 +213,14 @@ def asyncll_regions(cfg):
 
     # The segmented layout (async_ll_recv_layout) lays the dispatch landing and
     # send staging out per field (see asyncll_seg_layout), lets the expert write
-    # its whole segmented output into inter_dispatch_staging, and adds its words
-    # to send_count (asyncll_seg_words).
-    if getattr(cfg, "async_ll_segmented", 0):
+    # its segmented output into inter_dispatch_staging, and adds its words to
+    # send_count (asyncll_seg_words).
+    # inter_dispatch_staging keeps its compact size: a segmented round's expert
+    # output is world_size * S rows with S <= the receive cap (per_rank above).
+    if cfg.async_ll_segmented:
         seg_bytes = asyncll_seg_layout(cfg)["bytes"]
         for name in ("inter_staging", "inter_dispatch_inp"):
             regions[name] = max(regions[name], seg_bytes)
-        regions["inter_dispatch_staging"] = send_slots * hidden_bytes
         regions["send_count"] += asyncll_seg_words(world_size)["extra"] * _U64
 
     # Combine gets its OWN send staging rather than reusing inter_staging.

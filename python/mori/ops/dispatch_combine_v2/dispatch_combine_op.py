@@ -248,16 +248,23 @@ class EpDispatchCombineConfig:
     #     expert ids of the next rank's first expert with weight 0 and zeroed
     #     scales, so a local expert_mask drops them; their hidden bytes are
     #     stale, from an earlier round. Holes are typically a large share:
-    #     n_s counts only the tokens with an expert on this rank.
+    #     n_s counts only the tokens with an expert on this rank. Do not reduce
+    #     the hidden states across rows (a per-tensor scale, a global absmax):
+    #     a hole's stale bytes would leak into every row.
     #   * total_recv reads world_size * S, the row count, so passing it as the
     #     consumer's row bound (e.g. aiter fused_moe num_local_tokens) is right.
     #     Do not truncate the views below that. segment_counts() has the n_s.
     #   * the expert output must be written into combine_in_view() (also
     #     world_size * S rows); combine copies any other tensor there first.
     #   * S is the same on every rank in a round, at least every rank's token
-    #     count and at most effective_max_recv_per_rank. Whether a round is
-    #     segmented must also be the same on every rank; a round where ranks
-    #     disagree on either is detected and counted (segment_error_flags()).
+    #     count and at most effective_max_recv_per_rank (refused past it, on
+    #     every rank alike). Whether a round is segmented must also be the same
+    #     on every rank. Breaking either does not hang: a rank whose tokens
+    #     exceed S drops the rest (overflow), and ranks that disagree on the
+    #     mode or S read each other's rows at the wrong offsets (mismatch); both
+    #     are counted (segment_error_counts() / segment_error_flags()).
+    #   * the views' row count follows the host-side S, so a CUDA graph can
+    #     capture a segmented round only with a fixed S.
     #
     # "segmented" requires a config that supports it (the op refuses otherwise);
     # "auto" picks "segmented" exactly when the config supports it, with no

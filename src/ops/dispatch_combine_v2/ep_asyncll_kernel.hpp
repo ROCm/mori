@@ -207,8 +207,15 @@ constexpr uint64_t kSegCapableBit = uint64_t{1} << 63;
 __device__ __forceinline__ bool SegCapable(const EpDispatchCombineArgs& args) {
   return (args.segStride & kSegCapableBit) != 0;
 }
-__device__ __forceinline__ int SegStrideOf(const EpDispatchCombineArgs& args) {
-  return static_cast<int>(args.segStride & 0xffffffffull);
+// Clamped to the per-source receive capacity. The host refuses a larger stride
+// (segment_stride), so this only matters when the arguments come from elsewhere:
+// the transfers then stay inside the peers' field blocks instead of writing past
+// them, and the round is wrong rather than a corrupted arena.
+__device__ __forceinline__ int SegStrideOf(const EpDispatchCombineArgs& args,
+                                           const EpInterNodeDeviceCfg& config) {
+  const uint64_t stride = args.segStride & 0xffffffffull;
+  const uint64_t cap = static_cast<uint64_t>(config.MaxNumTokensToRecvPerRank());
+  return static_cast<int>(stride < cap ? stride : cap);
 }
 
 // Every dispatch on a segmented-capable op, compact or segmented, sends each peer a mode word:
@@ -1447,6 +1454,13 @@ __device__ void EpCombineAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
 // so what goes back to source s is rows [s * S, s * S + n_s) there. CombineSendTransferSeg sends
 // that in place and CombineRecvCopySeg reads the replies at [d * S + slot] of inter_combine_inp.
 //
+// The expert reads the landing region until combine, so a peer must not land its next round's
+// rows there before this rank's expert is done. Today that holds through combine: a peer starts
+// its next dispatch only after its combine receive, which waits for this rank's epoch (posted by
+// CombineSendTransfer[Seg] with early notify, or by CombineRecvTransfer's barrier otherwise),
+// and both are issued on this rank's stream after the expert. A combine change that lets a
+// peer run ahead of that point must keep this ordering for the segmented layout.
+//
 // SlotAssign is unchanged: dispDestTokIdMap still encodes SendBufSlotOffset with the capacity
 // stride (and its null sentinel), only the row a slot lives in moves. Peers' rows are staged at
 // that encoded slot in inter_staging, laid out per field as well; this rank's own rows are
@@ -1516,7 +1530,7 @@ __device__ __forceinline__ void SegPostSegment(const ::mori::cco::ccoDevComm& co
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLSendCopySeg_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
-  const int stride = asyncll::SegStrideOf(args);
+  const int stride = asyncll::SegStrideOf(args, config);
   if (globalWarpId == 0 && laneId < npes) {
     const int raw = core::AtomicLoadRelaxed(args.destPeTokenCounter + laneId);
     if (raw > stride) asyncll::SegCountError(args, config, asyncll::SegErrOverflow);
@@ -1597,7 +1611,7 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args,
                                                       const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  const int stride = asyncll::SegStrideOf(args);
+  const int stride = asyncll::SegStrideOf(args, config);
   const asyncll::SegLayout layout = asyncll::SegLayoutOf(config, hiddenBytes);
   uint8_t* words = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
 
@@ -1632,18 +1646,14 @@ __device__ void EpDispatchAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args
     const EpInterNodeRegion landing = args.reg(args.offDispatchInp);
     const EpInterNodeRegion staging = args.reg(args.offStaging);
     const EpInterNodeRegion wordRegion = args.reg(args.offSendCount);
-    const size_t field = (laneId == 0)   ? layout.hidden
-                         : (laneId == 1) ? layout.index
-                         : (laneId == 2) ? layout.weight
-                         : (laneId == 3) ? layout.scale
-                                         : layout.srcTok;
-    const size_t fieldBytes = (laneId == 0)   ? hiddenBytes
-                              : (laneId == 1) ? indexBytes
-                              : (laneId == 2) ? weightBytes
-                              : (laneId == 3) ? scaleBytes
-                                              : srcTokenIdBytes;
     size_t dst = 0, src = 0, bytes = 0;
     if (laneId < asyncll::kSegFields) {
+      const size_t fieldOffsets[asyncll::kSegFields] = {layout.hidden, layout.index, layout.weight,
+                                                        layout.scale, layout.srcTok};
+      const size_t fieldRowBytes[asyncll::kSegFields] = {hiddenBytes, indexBytes, weightBytes,
+                                                         scaleBytes, srcTokenIdBytes};
+      const size_t field = fieldOffsets[laneId];
+      const size_t fieldBytes = fieldRowBytes[laneId];
       dst = EpInterNodeOffset(landing, field + static_cast<size_t>(myPe) * stride * fieldBytes);
       src = EpInterNodeOffset(staging, field + static_cast<size_t>(destPe) *
                                                    config.MaxNumTokensToSendPerRank() * fieldBytes);
@@ -1674,14 +1684,17 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLRecvFinalizeSeg_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
   static_assert(kConfig.worldSize <= 64, "the segment counts are staged in a 64-entry LDS array");
-  const int stride = asyncll::SegStrideOf(args);
+  const int stride = asyncll::SegStrideOf(args, config);
   const uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<const uint8_t*>();
 
   __shared__ int segRows[64];
   if (threadIdx.x < npes) {
     const uint64_t announced =
         *reinterpret_cast<const uint64_t*>(recvCounts + asyncll::RecvCountSlot(threadIdx.x));
-    segRows[threadIdx.x] = static_cast<int>(min(announced - 1, static_cast<uint64_t>(stride)));
+    // Biased by one; RecvTransfer waited for every count, so 0 should not reach here, but if
+    // it does, treat the segment as empty rather than letting announced - 1 wrap to "full".
+    segRows[threadIdx.x] =
+        (announced == 0) ? 0 : static_cast<int>(min(announced - 1, static_cast<uint64_t>(stride)));
   }
   __syncthreads();
 
@@ -1743,7 +1756,7 @@ __device__ void EpCombineAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args,
                                                      const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   ::mori::cco::ccoSdma sdma{comm};
-  const int stride = asyncll::SegStrideOf(args);
+  const int stride = asyncll::SegStrideOf(args, config);
   uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<uint8_t*>();
   uint8_t* words = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
 
@@ -1815,7 +1828,7 @@ __device__ void EpCombineAsyncLLRecvCopySeg_body(EpDispatchCombineArgs args) {
   T** srcPtrs = reinterpret_cast<T**>(epAsyncLlShared) + warpId * kTopk;
 
   if (args.curRankNumToken == 0) return;
-  const int stride = asyncll::SegStrideOf(args);
+  const int stride = asyncll::SegStrideOf(args, config);
   T* peerBase = args.reg(args.offCombineInp)->template GetAs<T*>();
   T* selfBase = args.reg(args.offDispatchStaging)->template GetAs<T*>();
 

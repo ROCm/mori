@@ -95,6 +95,19 @@ const std::vector<std::string>& EpAsyncLLSourceDeps() {
 
 }  // namespace
 
+bool EpAsyncLLIsSegmented(EpAsyncLLKernel kind) {
+  switch (kind) {
+    case EpAsyncLLKernel::DispatchSendCopySeg:
+    case EpAsyncLLKernel::DispatchSendTransferSeg:
+    case EpAsyncLLKernel::DispatchRecvFinalizeSeg:
+    case EpAsyncLLKernel::CombineSendTransferSeg:
+    case EpAsyncLLKernel::CombineRecvCopySeg:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool EpAsyncLLTakesComm(EpAsyncLLKernel kind) {
   switch (kind) {
     case EpAsyncLLKernel::DispatchSendTransfer:
@@ -159,7 +172,7 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
                 kind == EpAsyncLLKernel::CombineRecvTransferLsa))
     throw std::runtime_error("AsyncLL early notification requires the SDMA transport");
   // The segmented passes pair with the separate RecvTransfer the fused receive drops.
-  if (fused && kind >= EpAsyncLLKernel::DispatchSendCopySeg)
+  if (fused && EpAsyncLLIsSegmented(kind))
     throw std::runtime_error("AsyncLL segmented receive does not support the fused receive");
   const AsyncLLDescriptor descriptor = DescriptorFor(kind);
   const std::string entry = EpAsyncLLEntryName(cfg, kind);

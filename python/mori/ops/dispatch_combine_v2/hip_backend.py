@@ -80,6 +80,9 @@ logger = logging.getLogger(__name__)
 # segment_error_flags() bits.
 SEGMENT_ERR_OVERFLOW = 1
 SEGMENT_ERR_MISMATCH = 2
+# EpInterNodeArgs.segStride bit 63: the op has the segmented layout, so compact
+# rounds on it still exchange the mode word (asyncll::kSegCapableBit).
+SEG_CAPABLE_BIT = 1 << 63
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
 # after its own EpArgs fields (offTokOff -> "tokOff"); the region names match the
@@ -1084,6 +1087,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 "async_ll_recv_layout='segmented' needs world_size >= 2: an empty row points at "
                 "another rank's expert"
             )
+        if cfg.world_size > 64:
+            bad.append(
+                "async_ll_recv_layout='segmented' supports world_size <= 64: the receive "
+                "finalize stages one count per source in a 64-entry LDS array"
+            )
         if (cfg.scale_dim * cfg.scale_type_size) % 4:
             bad.append(
                 "async_ll_recv_layout='segmented' needs a whole number of dwords per scale row"
@@ -1597,7 +1605,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             if self.cfg.async_ll_segmented:
                 # Bit 63 marks a segmented-capable op, so compact rounds on it
                 # still exchange the mode word (asyncll::SegModeWord).
-                args["segStride"] = (1 << 63) | stride
+                args["segStride"] = SEG_CAPABLE_BIT | stride
             table = self._asyncll_groups_seg if stride else self._asyncll_groups
             stream = _raw_stream(self._device_index)
             for group in groups:
@@ -1624,15 +1632,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             raise ValueError(
                 "segment_stride needs an op built with async_ll_recv_layout='segmented'"
             )
-        # Two bounds meet here. The field blocks are sized by
-        # max_num_inp_token_per_rank rows per source, and the reverse map (one
-        # entry per recv row) by effective_max_recv_per_rank, which is at most
-        # that; so the receive cap is the binding one.
+        # Only the receive cap is checked here. It is the same on every rank, so
+        # a stride past it fails on every rank before any of them launches. The
+        # field blocks are sized by max_num_inp_token_per_rank rows per source and
+        # the reverse map and the expert output by effective_max_recv_per_rank,
+        # which is at most that, so the cap is the binding bound.
+        #
+        # A stride below this rank's token count is NOT refused: the other ranks
+        # would launch the round and wait in the receive forever. The send pass
+        # drops the rows past the stride instead and counts the round as an
+        # overflow (segment_error_counts()), so the caller sees a wrong round, not
+        # a hang.
         cap = cfg.effective_max_recv_per_rank
-        if not num_tokens <= stride <= cap:
+        if not 0 < stride <= cap:
             raise ValueError(
-                f"segment_stride={stride} must cover this rank's {num_tokens} "
-                f"tokens and stay within the per-source receive cap {cap}"
+                f"segment_stride={stride} must be positive and within the per-source "
+                f"receive cap {cap}"
             )
         self._seg_stride = int(stride)
 
@@ -1659,12 +1674,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def segment_error_counts(self):
-        """(overflow, mismatch): how many times each segmented-layout error has
-        happened on this rank since the op was built. overflow = a segmented round
-        where this rank had more rows for a peer than the stride (rows were
-        dropped); mismatch = a peer's round, segmented or compact, did not use this
-        rank's mode and stride (rows were read at the wrong offsets). Counted per
-        peer and round. Reads device memory, so it synchronizes."""
+        """(overflow, mismatch): cumulative counts of each segmented-layout error on
+        this rank since the op was built, counted per peer and round.
+
+        overflow: a segmented round where this rank had more rows for a peer than
+        the stride, i.e. it was called with segment_stride below its own token
+        count. The rows past the stride were dropped. mismatch: a peer's round,
+        segmented or compact, did not use this rank's mode and stride, so rows were
+        read at the wrong offsets.
+
+        Use this for totals (e.g. a periodic health check that diffs two reads);
+        segment_error_flags() answers "anything new since I last looked". Reads
+        device memory, so it synchronizes."""
         if not self.cfg.async_ll_segmented:
             return (0, 0)
         first = asyncll_seg_words(self.cfg.world_size)["errors"]
@@ -2009,11 +2030,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return "ll_" + name, self._ll_recv_cap
         return self._region(name), self._recv_cap
 
-    def _seg_view(self, key, region, offset, cols, dtype):
-        """Rows [0, world_size * stride) of a segmented field block."""
+    def _seg_view(self, key, region, offset, cols, dtype, per_source=None):
+        """Rows [0, world_size * stride) of a segmented field block of
+        per_source rows per source (default max_num_inp_token_per_rank)."""
         view = self._views.get(key)
         if view is None:
-            rows = self.cfg.world_size * self.cfg.max_num_inp_token_per_rank
+            per_source = per_source or self.cfg.max_num_inp_token_per_rank
+            rows = self.cfg.world_size * per_source
             ptr = self.arena.local_ptr(region) + offset
             view = from_gpu_ptr(ptr, (rows, cols), dtype)
             self._views[key] = view
@@ -2042,8 +2065,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def combine_in_view(self):
         if self._seg_stride:
             cols, dtype = self.cfg.hidden_dim, self.cfg.combine_dtype
+            # inter_dispatch_staging holds effective_max_recv_per_rank rows per
+            # source, the same as on a compact op (internode_regions.py).
             return self._seg_view(
-                "seg_combine_in", "inter_dispatch_staging", 0, cols, dtype
+                "seg_combine_in",
+                "inter_dispatch_staging",
+                0,
+                cols,
+                dtype,
+                per_source=self.cfg.effective_max_recv_per_rank,
             )
         view = self._views.get("combine_in")
         if view is None:

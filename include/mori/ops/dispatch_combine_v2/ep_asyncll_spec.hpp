@@ -87,6 +87,8 @@ enum class EpAsyncLLKernel {
 // True for the passes that take the device communicator, i.e. the ones that
 // touch an engine. The other five are local copies and need no comm.
 bool EpAsyncLLTakesComm(EpAsyncLLKernel kind);
+// True for the segmented-receive passes (async_ll_recv_layout).
+bool EpAsyncLLIsSegmented(EpAsyncLLKernel kind);
 
 std::string EpAsyncLLEntryName(const EpInterNodeCfg& cfg, EpAsyncLLKernel kind);
 std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kind);

@@ -1157,11 +1157,28 @@ def run_segmented(d, comm, layout, fp8):
         x, weights, scales, idx, gathered = _seg_inputs(
             d, dev, n, hidden, topk, epr, m, fp8, 97531 + rank, True
         )
-        if n >= 2:
-            refused(
-                "stride below this rank's tokens",
-                lambda: op.dispatch(x, weights, scales, idx, segment_stride=n - 1),
+        # A stride below some rank's tokens is not refused (a host error on that
+        # rank alone would leave the others waiting in the receive). Every rank
+        # runs the round; a rank with more rows for a peer than the stride drops
+        # the rest and counts an overflow, the others stay clean, nobody hangs.
+        small = max(1, max(counts) // 2)
+        dest = (idx.long() // epr).cpu()
+        rows_per_dest = [int((dest == pe).any(dim=1).sum()) for pe in range(world)]
+        want = 1 if max(rows_per_dest, default=0) > small else 0
+        *_, routing = op.dispatch(
+            x, weights, scales, idx, return_routing=True, segment_stride=small
+        )
+        op.combine(op.combine_in_view(), routing=routing)
+        torch.cuda.synchronize()
+        dist.barrier()
+        flags = op.segment_error_flags(clear=True)
+        if flags != want:
+            print(
+                f"[rank {rank}] seg level={level}: stride {small} under rows "
+                f"{rows_per_dest}: flags {flags}, want {want}",
+                flush=True,
             )
+            failures += 1
         refused(
             "stride above the capacity",
             lambda: op.dispatch(x, weights, scales, idx, segment_stride=m + 1),
