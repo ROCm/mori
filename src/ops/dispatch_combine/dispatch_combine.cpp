@@ -248,10 +248,37 @@ EpDispatchCombineHandle::~EpDispatchCombineHandle() {
   if (useCcoComm) FinalizeCcoAllocs();
 }
 
+// Describes the shmem symmetric heap for a failed MallocSymm: its size, its free space and how to
+// grow it, so the error names the cause instead of the hipMemset(nullptr) that would follow.
+static std::string DescribeShmemHeapForAllocFailure() {
+  auto* states = ShmemStatesSingleton::GetInstance();
+  size_t heapSize = 0;
+  if (states->mode == ShmemMode::StaticHeap) {
+    heapSize = states->memoryStates->staticHeapSize;
+  } else if (states->mode == ShmemMode::VMHeap) {
+    heapSize = states->memoryStates->vmmHeapVirtualSize;
+  } else {
+    return "isolation mode: the device allocation itself failed";
+  }
+  std::string desc = "current heap size " + std::to_string(heapSize) + " bytes";
+  if (auto* va = states->memoryStates->symmMemMgr->GetHeapVAManager()) {
+    size_t totalBlocks = 0, freeBlocks = 0, allocatedBlocks = 0, freeBytes = 0, largestFree = 0;
+    va->GetStats(totalBlocks, freeBlocks, allocatedBlocks, freeBytes, largestFree);
+    desc += ", free " + std::to_string(freeBytes) + " bytes, largest free block " +
+            std::to_string(largestFree) + " bytes";
+  }
+  return desc + "; if the heap is too small, increase MORI_SHMEM_HEAP_SIZE";
+}
+
 mori::application::SymmMemObjPtr EpDispatchCombineHandle::MallocSymm(size_t size,
                                                                      unsigned int flags) {
   if (!useCcoComm) {
     void* buf = ShmemExtMallocWithFlags(size, flags);
+    if (buf == nullptr && size > 0) {
+      throw std::runtime_error("MallocSymm: symmetric heap allocation of " + std::to_string(size) +
+                               " bytes failed on rank " + std::to_string(config.rank) + " (" +
+                               DescribeShmemHeapForAllocFailure() + ")");
+    }
     HIP_RUNTIME_CHECK(hipMemset(buf, 0, size));
     mori::application::SymmMemObjPtr obj = ShmemQueryMemObjPtr(buf);
     assert(obj.IsValid());

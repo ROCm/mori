@@ -4,6 +4,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # ready_for_review: drafts run nothing. The ci:full and ci:mi300x labels
+    # act through ci-rerun.yml, which re-runs this workflow when one is added.
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       run_umbp_single_node_hicache:
@@ -37,8 +40,21 @@ env:
 
 
 jobs:
+  scope:
+    name: scope
+    uses: ./.github/workflows/ci-scope.yml
+    # The one job that may write: it keeps the routing comment on the PR.
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: read
+    with:
+      comment: true
+
   build:
     name: mori build (${{ matrix.platform }})
+    needs: scope
+    if: needs.scope.outputs.mori == 'true' || needs.scope.outputs.umbp == 'true' || needs.scope.outputs.cco == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -46,8 +62,6 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
-          - platform: MI300X_MLX
-            runner: [self-hosted, 300_mlx_p19_29]
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -100,8 +114,10 @@ jobs:
       - name: Build and install mori (BUILD_CCO_SDMA=OFF)
         run: $CT exec $CONTAINER bash -c "BUILD_CCO_SDMA=OFF pip install ."
 
-      - name: Build and install mori (with examples)
-        run: $CT exec $CONTAINER bash -c "BUILD_EXAMPLES=ON pip install ."
+      # KIWI (MI300X only at run time) also builds for gfx950, so every PR that
+      # builds here compile-checks it.
+      - name: Build and install mori (with examples and KIWI)
+        run: $CT exec $CONTAINER bash -c "BUILD_EXAMPLES=ON BUILD_OPS_KIWI=ON pip install ."
 
       - name: Verify installation
         # Not a bare `import mori`: the native extensions are skipped with a
@@ -119,7 +135,8 @@ jobs:
 
   intranode-test:
     name: mori intranode test (${{ matrix.platform }})
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.mori == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -136,20 +153,6 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             socket_ifname: eno0
-          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
-          # both only on the RoCE path. mlx5_8 is deliberately not in
-          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
-          # rendezvous interface), not one of the 8 rails.
-          # qp_max_send_wr works around mlx5 rejecting mori-io's default QP
-          # (8192 send WRs + 64-byte notification inline) with EINVAL: mlx5
-          # sizes every WQE for its largest op (192-byte UMR header), so the
-          # SQ needs 4 MiB against a 2 MiB (32768 x 64-byte WQEBB) cap.
-          - platform: MI300X_MLX
-            runner: [self-hosted, 300_mlx_p19_29]
-            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
-            socket_ifname: ens14np0
-            qp_max_send_wr: 4096
-            build_ops_kiwi: "ON"
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -157,7 +160,7 @@ jobs:
           #   rdma_sl: 3
           #   rdma_tc: 104
           #   socket_ifname: enp49s0f1np1
-    env:
+    env: &intranode-env
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
@@ -166,7 +169,7 @@ jobs:
       MORI_IO_QP_MAX_SEND_WR: ${{ matrix.qp_max_send_wr }}
       BUILD_OPS_KIWI: ${{ matrix.build_ops_kiwi || 'OFF' }}
     timeout-minutes: 45
-    steps:
+    steps: &intranode-steps
       - name: Fix workspace permissions
         run: |
           WS="${GITHUB_WORKSPACE}"
@@ -379,7 +382,9 @@ jobs:
 
       - name: MORI-CPP shmem_benchmark (P2P)
         run: |
+          # set -e: a launch killed by its timeout fails the step instead of passing.
           $CT exec $CONTAINER bash -c "
+            set -e
             cd $GITHUB_WORKSPACE
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_bw
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_bw
@@ -391,13 +396,15 @@ jobs:
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency -s warp
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_bw -s thread
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_bw -s thread
-            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_latency -s thread
-            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency -s thread
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_latency -s thread -e 1M
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency -s thread -e 1M
           "
 
       - name: MORI-CPP shmem_benchmark (RDMA)
         run: |
+          # set -e: a launch killed by its timeout fails the step instead of passing.
           $CT exec $CONTAINER bash -c "
+            set -e
             cd $GITHUB_WORKSPACE
             MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_put_bw
             MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_get_bw
@@ -481,12 +488,40 @@ jobs:
                 chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           fi
 
+  intranode-test-mi300x:
+    name: mori intranode test (${{ matrix.platform }})
+    needs: scope
+    if: needs.scope.outputs.mi300x == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
+          # both only on the RoCE path. mlx5_8 is deliberately not in
+          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
+          # rendezvous interface), not one of the 8 rails.
+          # qp_max_send_wr works around mlx5 rejecting mori-io's default QP
+          # (8192 send WRs + 64-byte notification inline) with EINVAL: mlx5
+          # sizes every WQE for its largest op (192-byte UMR header), so the
+          # SQ needs 4 MiB against a 2 MiB (32768 x 64-byte WQEBB) cap.
+          - platform: MI300X_MLX
+            runner: [self-hosted, 300_mlx_p19_29]
+            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+            socket_ifname: ens14np0
+            qp_max_send_wr: 4096
+            build_ops_kiwi: "ON"
+    env: *intranode-env
+    timeout-minutes: 45
+    steps: *intranode-steps
+
   # Gate for "does mori still build and run on ROCm 7.14"; every other job runs
   # on 10.1. Kept to the EP intranode test on one runner: the rest of the
   # intranode suite is ROCm-version agnostic.
   intranode-test-rocm714:
     name: mori intranode test (ROCm 7.14, MI355X_AINIC)
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.mori == 'true'
     runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
     env:
       BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
@@ -574,7 +609,8 @@ jobs:
 
   jax-intranode-test:
     name: mori JAX intranode test (${{ matrix.platform }})
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.mori == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -670,7 +706,8 @@ jobs:
 
   umbp-unit-test:
     name: mori umbp unit test (${{ matrix.platform }})
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.umbp == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -772,7 +809,9 @@ jobs:
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
-    needs: build
+    # Not on build: that runs on another runner, and this job builds mori itself.
+    needs: scope
+    if: needs.scope.outputs.mori == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -798,24 +837,6 @@ jobs:
             # userptr instead. Not in the image: with SVM off every pageable copy is
             # pinned again. Drop it once the hosts' amdgpu-dkms carries the fix.
             hsa_use_svm: 0
-          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
-          # both only on the RoCE path. mlx5_8 is deliberately not in
-          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
-          # rendezvous interface), not one of the 8 rails.
-          # node1 is the runner itself (banff-ccs-aus-p19-05); node2 is the peer
-          # it drives over ssh (banff-ccs-aus-p19-14). Both addresses are the
-          # ens14np0 100GbE port used for TCP rendezvous.
-          - platform: MI300X_MLX
-            runner: [self-hosted, 300_mlx_p19_29]
-            node1_host: 10.194.132.110
-            node2_host: 10.194.132.71
-            node2_port: 22
-            node1_ifname: ens14np0
-            node2_ifname: ens14np0
-            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
-            ct: docker
-            timeout_minutes: 90
-            build_ops_kiwi: "ON"
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -829,7 +850,7 @@ jobs:
           #   rdma_tc: 104
           #   ct: docker
           #   timeout_minutes: 45
-    env:
+    env: &internode-env
       CT: ${{ matrix.ct }}
       # node2's sshd checks every new connection against the Conductor auth
       # service, which intermittently answers 503 and denies the login (ssh exits
@@ -848,11 +869,14 @@ jobs:
       HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
       BUILD_OPS_KIWI: ${{ matrix.build_ops_kiwi || 'OFF' }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
-    steps:
+    steps: &internode-steps
       - name: Fix workspace permissions
         run: |
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           WS="${GITHUB_WORKSPACE}"
-          if [ -d "$WS" ]; then
+          if [ -d "$WS" ] && [ -z "$ROOTLESS" ]; then
             $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
               chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
           fi
@@ -917,10 +941,13 @@ jobs:
           # way "Fix workspace permissions" does on node1. The CI container runs
           # as root, so the previous job leaves root-owned build output in the
           # workspace and the rsync below dies on EPERM before anything builds.
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             $CT rm -f $CONTAINER 2>/dev/null || true
             mkdir -p $GITHUB_WORKSPACE
-            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
+            test -n '$ROOTLESS' || $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           "
           rsync -az --exclude='.git' \
@@ -1150,51 +1177,65 @@ jobs:
             "$CT exec $CONTAINER bash -c 'pkill -9 -f \"[t]ests\\.python\\.io\\.benchmark\" 2>/dev/null || true; pkill -9 -f \"[t]est_dispatch_combine_internode\" 2>/dev/null || true; sleep 2'"
 
       - name: MORI-EP internode normal kernel bench
+        # Also a correctness gate: every point verifies one full-capacity round
+        # in the default (MANUAL) launch geometry; the nightly bench uses AUTO.
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29140
-          for KERNEL in v1 v1_ll; do
-            for TOKENS in 64 128 1024 2048 4096; do
-              echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD=(
-                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
-                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-                --ifname $NODE2_IFNAME
-                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
-              )
-              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
-                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-                --ifname $NODE1_IFNAME \
-                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
-              wait
-              sleep 1
-              PORT=$((PORT + 1))
-            done
+          if [ "${{ needs.scope.outputs.full == 'true' && 'full' || 'pr' }}" = pr ]; then
+            # The smallest and largest size per kernel; workflow_dispatch and ci:full run all 10.
+            POINTS="v1:64 v1:4096 v1_ll:64 v1_ll:4096"
+          else
+            POINTS=$(for k in v1 v1_ll; do for t in 64 128 1024 2048 4096; do printf '%s:%s ' $k $t; done; done)
+          fi
+          for P in $POINTS; do
+            KERNEL=${P%%:*}
+            TOKENS=${P##*:}
+            echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
           done
 
       - name: MORI-EP internode normal kernel stress
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29160
-          for KERNEL in v1 v1_ll; do
-            for TOKENS in 64 128 1024 2048 4096; do
-              echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD=(
-                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
-                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-                --ifname $NODE2_IFNAME
-                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
-              )
-              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
-                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-                --ifname $NODE1_IFNAME \
-                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
-              wait
-              sleep 1
-              PORT=$((PORT + 1))
-            done
+          if [ "${{ needs.scope.outputs.full == 'true' && 'full' || 'pr' }}" = pr ]; then
+            # One point per kernel; the nightly, workflow_dispatch and ci:full run all 10.
+            POINTS="v1:4096 v1_ll:128"
+          else
+            POINTS=$(for k in v1 v1_ll; do for t in 64 128 1024 2048 4096; do printf '%s:%s ' $k $t; done; done)
+          fi
+          for P in $POINTS; do
+            KERNEL=${P%%:*}
+            TOKENS=${P##*:}
+            echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
           done
 
       - name: MORI-EP internode stress_accuracy (every round verified)
@@ -1355,8 +1396,11 @@ jobs:
       - name: Cleanup node1
         if: always()
         run: |
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           $CT rm -f $CONTAINER || true
-          if $CT image inspect $IMAGE &>/dev/null; then
+          if [ -z "$ROOTLESS" ] && $CT image inspect $IMAGE &>/dev/null; then
             $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
                 chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           fi
@@ -1367,6 +1411,37 @@ jobs:
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT rm -f $CONTAINER || true"
+
+  internode-test-mi300x:
+    name: mori internode test (${{ matrix.platform }})
+    needs: scope
+    if: needs.scope.outputs.mi300x == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
+          # both only on the RoCE path. mlx5_8 is deliberately not in
+          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
+          # rendezvous interface), not one of the 8 rails.
+          # node1 is the runner itself (banff-ccs-aus-p19-05); node2 is the peer
+          # it drives over ssh (banff-ccs-aus-p19-14). Both addresses are the
+          # ens14np0 100GbE port used for TCP rendezvous.
+          - platform: MI300X_MLX
+            runner: [self-hosted, 300_mlx_p19_29]
+            node1_host: 10.194.132.110
+            node2_host: 10.194.132.71
+            node2_port: 22
+            node1_ifname: ens14np0
+            node2_ifname: ens14np0
+            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+            ct: docker
+            timeout_minutes: 90
+            build_ops_kiwi: "ON"
+    env: *internode-env
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    steps: *internode-steps
 
   umbp-single-node-hicache:
     name: mori umbp single-node hicache smoke test
@@ -1429,3 +1504,35 @@ jobs:
       - name: Cleanup hicache container
         if: always()
         run: docker rm -f umbp-single-node >/dev/null 2>&1 || true
+
+  cco:
+    name: CCO
+    # The CCO jobs live in ci_cco.yml; this run's scope picks which of them run.
+    needs: scope
+    if: needs.scope.outputs.cco == 'true' || needs.scope.outputs.fused == 'true'
+    uses: ./.github/workflows/ci_cco.yml
+    with:
+      cco: ${{ needs.scope.outputs.cco == 'true' }}
+      fused: ${{ needs.scope.outputs.fused == 'true' }}
+
+  ci-gate:
+    name: CI gate
+    # One check that is green when every lane the scope picked passed, CCO's
+    # included; a lane the scope skipped counts as passed.
+    if: always()
+    needs: [scope, build, intranode-test, intranode-test-mi300x, intranode-test-rocm714, jax-intranode-test, umbp-unit-test, internode-test, internode-test-mi300x, cco]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check lane results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          REASON: ${{ needs.scope.outputs.reason }}
+        run: |
+          echo "Scope: ${REASON:-n/a}"
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)\t\(.value.result)"' | tee results.tsv
+          if awk -F'\t' '$2 != "success" && $2 != "skipped"' results.tsv | grep -q .; then
+            echo "::error::a CI lane did not pass"; exit 1
+          fi
+          if ! grep -qP '^scope\tsuccess$' results.tsv; then
+            echo "::error::CI scope did not succeed"; exit 1
+          fi
