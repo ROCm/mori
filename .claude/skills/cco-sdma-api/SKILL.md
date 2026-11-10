@@ -81,6 +81,7 @@ Everything hangs off `ccoSdma sdma{devComm}`, constructed per kernel.
 | `putBroadcast(peer, dstWin, dstOff, peer2, dstWin2, dstOff2, srcWin, srcOff, bytes, queueId)` | one local source to two destinations in a single packet |
 | `postWaitMem(peer, queueId, win, off, value, cmp, mask)` | park a queue until a local flag holds — the engine polls, not a CU |
 | `postWaitSignal(peer, queueId, srcRank, sigQueueId, expected)` | `postWaitMem` on a signal slot |
+| `postWaitMemPutPtr<l, r>(peer, queueId, win, off, value, cmp, mask, dst, src, bytes)` | `postWaitMem` + `putPtr` in one reservation and one doorbell |
 
 `put`/`get` are non-blocking: they place a packet and (unless `Aggregate`) ring
 the doorbell. Nothing has happened when they return — you must drain.
@@ -315,9 +316,7 @@ unpack on the receiver.
 
 ## Engine-side wait and broadcast
 
-Two more packets, both gfx9 layouts validated on gfx950. On gfx12.5 they compile
-but trap when called, until the layouts are checked there; a multi-arch build
-still builds, and the caller must not reach them on gfx12.5.
+Two more packets, with the gfx9 layouts. Validated on gfx950 and gfx1250.
 
 Unlike `put`, these post from a **single issuer** and do no lane grouping: thread
 scope posts one active lane at a time (several lanes are serialized, so they may
@@ -364,6 +363,27 @@ posted to it waits too, and a flag that never arrives parks it for good (retry i
 unbounded). A full ring spins the poster until the wait clears. Give a waiting queue
 its own `queueId`.
 
+### postWaitMemPutPtr
+
+```cpp
+// lane p: copy my block to peer p once p has stored this call's epoch in my ready[p];
+// the engine waits, the kernel exits right after posting
+sdma.postWaitMemPutPtr<false, true>(p, q, ctrlWin, READY_OFF + 4 * p, epoch, ccoSdmaCmpEq,
+                                    0xFFFFFFFFu, dstOnPeer, src, bytes);
+```
+
+`postWaitMem<Aggregate>` + `putPtr<Aggregate>` + `commit` in one reservation and
+one doorbell: cheaper to post, same flag-to-copy latency. Thread scope; lanes on
+distinct queues post in parallel. `dst` is the peer's memory as mapped here
+(`lsa_ptr`), `win`/`offset` the local flag; `bytes == 0` posts wait + signals,
+and nothing without a signal. Over `CCO_SDMA_MAX_COPY_BYTES` (~1 GiB) it posts
+wait + chunked put + commit, one lane at a time, so on a shared queue each lane's
+copy waits only for its own flag and those of lanes posted before it.
+Use it when the flag is usually not there yet; a wait that already holds still
+costs ~1.6 µs over a plain `put`, so check the flag on the CU first if it usually
+is: read it once, plain `put` if it already holds, this post if not (example 12). Use `Eq` on a per-call epoch: the engine compares unsigned, so `Ge` on a
+running total misbehaves across the u32 wrap. The postWaitMem caveats apply.
+
 ### putBroadcast
 
 ```cpp
@@ -373,6 +393,12 @@ sdma.putBroadcast(next, recvWin, 0,  /*peer2=*/me, localCopyWin, 0,  sendWin, 0,
 One COPY packet, two destinations; `peer`/`dstWin` is the first and selects the
 queue, `peer2` may be your own rank. `remoteSignal` bumps each distinct destination
 peer other than yourself once; `localSignal` is one atomic for the call.
+
+The two destination addresses must be congruent mod 32 (`(dst1 ^ dst2) & 31 == 0`),
+as in ROCr's broadcast packet. If not, the second destination receives the data
+shifted by the offset difference: the whole range is wrong and up to 31 bytes next
+to it are overwritten. Nothing checks this unless you build with
+`MORI_CCO_SDMA_DEBUG`, which traps.
 
 A signal slot counts per (source rank, `queueId`), not per physical queue. The
 broadcast is posted on queue `(peer, q)` but its remote signal bumps `peer2`'s
@@ -403,7 +429,6 @@ a NOP, so the packet is never split across the ring end.
 | wrong data with several lanes per wave | `ccoSdmaThreadSameQueue` set while lanes target different queues |
 | receiver sees a signal but stale data | signal fired on a different queue than the copy |
 | a queue stops moving after `postWaitMem` | the flag never reached the value, or it points at another GPU's memory — `win`/`offset` must be local |
-| `putBroadcast`/`postWait*` trap | gfx12.5 build: those packet layouts are not validated there |
 | `postWaitSignal` releases too early | `expected` is 2^32 or more and was truncated to 32 bits |
 
 Build with `-DMORI_CCO_SDMA_DEBUG` when any of these appear: it turns the

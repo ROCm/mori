@@ -81,3 +81,6 @@ ARG WITH_FLYDSL=0
 # builds this image with an older one to keep those paths covered.
 ARG FLYDSL_VERSION=0.4.0
 RUN if [ "${WITH_FLYDSL}" = "1" ]; then pip install --no-cache-dir "flydsl==${FLYDSL_VERSION}"; fi
+
+# ci_cco.yml's fused GEMM job runs its single-GPU and 2-/4-rank cases under xdist.
+RUN pip install --no-cache-dir "pytest-xdist==3.8.0"

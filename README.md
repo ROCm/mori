@@ -187,6 +187,12 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 
 ✅ Supported &emsp; 🚧 Under Development
 
+A gfx1250 device can run as `gfx1250` or as `gfx1250-strict`, depending on the runtime.
+MORI JIT-compiles its kernels for whichever target the device reports, so one install
+serves both. The exception is UMBP's prebuilt gather kernel: build with
+`gfx1250-strict` in `MORI_GPU_ARCHS` to use it there (without it UMBP copies through
+the copy engine).
+
 <!-- mori-installation-start -->
 
 ## Installation
@@ -233,7 +239,7 @@ Before a cross-node run, check the fabric:
 mori check <peer_ip>          # or: tools/env_check.sh <peer_ip>
 ```
 
-Six steps — NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
+Seven steps — kernel PCI P2PDMA support (`CONFIG_PCI_P2PDMA`, read from `/proc/kallsyms`; warns only), NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
 inter-node bandwidth and latency meshes over every NIC pair, on host memory and
 on GPU memory. Exits non-zero if any check failed, and reports the fabric
 topology, which decides what can run on it.

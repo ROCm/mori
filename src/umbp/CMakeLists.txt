@@ -360,6 +360,21 @@ add_custom_target(umbp_workload_proto
                           ${UMBP_WORKLOAD_PROTO_HDRS})
 
 # ---------- Static library: umbp_common ---------------------------------------
+set(UMBP_INDEXER_SRCS "${UMBP_PROTO_GEN_DIR}/sgl_kv_indexer.pb.cc"
+                      "${UMBP_PROTO_GEN_DIR}/sgl_kv_indexer.grpc.pb.cc")
+add_custom_command(
+  OUTPUT ${UMBP_INDEXER_SRCS}
+         "${UMBP_PROTO_GEN_DIR}/sgl_kv_indexer.pb.h"
+         "${UMBP_PROTO_GEN_DIR}/sgl_kv_indexer.grpc.pb.h"
+  COMMAND
+    ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
+    --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_PROTO_DIR}/sgl_kv_indexer.proto
+  DEPENDS ${UMBP_PROTO_DIR}/sgl_kv_indexer.proto
+  COMMENT "Generating SGLang KV Indexer C++ sources"
+  VERBATIM)
+
 # Shared between PoolClient integration and standalone control-plane tools.
 
 add_library(
@@ -371,6 +386,7 @@ add_library(
   ${UMBP_STANDALONE_PROTO_SRCS}
   ${UMBP_STANDALONE_GRPC_SRCS}
   ${UMBP_WORKLOAD_PROTO_SRCS}
+  ${UMBP_INDEXER_SRCS}
   # Trace capture is a client feature: PoolClient records live traffic when
   # UMBP_WORKLOAD_TRACE_PATH is set, so the writer ships with the library. The
   # rest of the workload harness drives benchmarks and lives in
@@ -394,6 +410,11 @@ add_library(
   distributed/peer/backend/hbm_backend.cpp
   distributed/peer/backend/ssd_backend.cpp
   distributed/peer/backend/instrumented_backend.cpp
+  sim/sim.cpp
+  sim/sim_pool_platform.cpp
+  sim/ssd.cpp
+  sim/peer.cpp
+  sim/trace.cpp
   distributed/transfer/transfer_engine.cpp
   distributed/transfer/mori_io_engine.cpp
   distributed/transfer/local_copy_engine.cpp
@@ -407,6 +428,7 @@ add_library(
   distributed/pool/peer_pool.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
+  distributed/pool_platform.cpp
   distributed/distributed_client.cpp
   standalone/external_kv_identity_client.cpp
   standalone/ipc.cpp
@@ -535,6 +557,11 @@ target_link_libraries(umbp_core PUBLIC mori_logging)
 target_sources(umbp_common
                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/umbp_client_factory.cpp)
 
+# NIC limits are common to every registrant, but checking the AINIC limit reads
+# the firmware with mori_application's ionic parser, which umbp_core (and so
+# spdk_proxy) does not link; umbp_common reaches it through mori_io.
+target_sources(umbp_common PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common/nic_limits.cpp)
+
 # ---------- Master executable -------------------------------------------------
 
 add_executable(umbp_master distributed/bin/master_main.cpp)
@@ -587,6 +614,17 @@ target_link_libraries(umbp_tier_bench PRIVATE umbp_workload_bench
 set_target_properties(umbp_tier_bench PROPERTIES BUILD_RPATH "$ORIGIN"
                                                   INSTALL_RPATH "$ORIGIN"
                                                   BUILD_WITH_INSTALL_RPATH TRUE)
+
+# Optional sampler for examples/umbp/calibrate.py; never linked into the runtime.
+add_executable(umbp_sim_probe EXCLUDE_FROM_ALL sim/calibrate.cpp)
+add_executable(umbp_sim_remote_probe EXCLUDE_FROM_ALL sim/calibrate_remote.cpp)
+foreach(_probe IN ITEMS umbp_sim_probe umbp_sim_remote_probe)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(${_probe} PRIVATE -Wl,--no-as-needed)
+  endif()
+  target_link_libraries(${_probe} PRIVATE umbp_core umbp_common
+                                         ${_PROTOBUF_LIBS} ${_GRPCPP_LIB})
+endforeach()
 
 # ---------- Standalone-process executable ------------------------------------
 

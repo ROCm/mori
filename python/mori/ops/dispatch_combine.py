@@ -353,7 +353,7 @@ def _is_gfx125x():
     """Whether this device takes the TDM code paths.
 
     Single source of truth on the host side, because three things have to agree with the kernel's
-    own `#if defined(__gfx1250__) || defined(__gfx1251__)` and with each other: which dispatch body
+    own `#if defined(MORI_GFX125X)` and with each other: which dispatch body
     runs, how much dynamic LDS is reserved for it, and what launch geometry it is given. They used
     to be keyed on the MORI_DISP_TDM env instead, which let all three disagree with the compiled
     kernel whenever the variable was unset.
@@ -2264,6 +2264,29 @@ class EpDispatchCombineOp:
         )
         dist.all_gather(output, padded_input)
         return output
+
+    def get_dispatch_src_token_pos_buffer(self):
+        """Persistent device view of the dispatch source-position buffer.
+
+        Row i of a dispatch's output came from flat send index ``buf[i]`` (decode with
+        ``decode_send_flat_idx``). The view spans max_num_tokens_to_recv() rows; only the
+        first total_recv rows are valid, and each dispatch overwrites them. The buffer
+        does not move, so take the view once and read it in stream order after every
+        dispatch -- unlike get_dispatch_src_token_pos(), which synchronizes the device
+        and sizes the result to total_recv on each call.
+        """
+        if self.config.kernel_type.value not in (
+            EpDispatchCombineKernelType.IntraNode.value,
+            EpDispatchCombineKernelType.IntraNodeLL.value,
+            EpDispatchCombineKernelType.InterNodeV1.value,
+            EpDispatchCombineKernelType.InterNodeV1LL.value,
+            EpDispatchCombineKernelType.AsyncLL.value,
+        ):
+            raise NotImplementedError(
+                f"no dispatch source-position buffer for {self.config.kernel_type}"
+            )
+        ptr, _ = self._get_dispatch_src_token_pos_func(self._handle)
+        return from_gpu_ptr(ptr, (self.max_num_tokens_to_recv(),), TOPK_IDX_DTYPE)
 
     def get_dispatch_src_token_pos(self):
         torch.cuda.synchronize()

@@ -27,8 +27,9 @@ communicator, like its neighbours here.
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 test_asyncll.py
 
 Env: HIDDEN, TOPK, EPR, M, LOOP (at least 3), SHAPES to override the swept list,
-TRANSPORT=sdma|lsa, GRAPH_REPLAYS (default 32; 0 skips the graph regression) and
-BACK_TO_BACK (rounds with no host sync, default 6; 0 skips).
+TRANSPORT=sdma|lsa, GRAPH_REPLAYS (default 32; 0 skips the graph regression),
+BACK_TO_BACK (rounds with no host sync, default 6; 0 skips) and TWO_OPS (layers
+of the two-op interleave, default 4; 0 skips).
 
 What is checked, and why these and not more:
 
@@ -49,7 +50,7 @@ Both split and ordinary APIs run weighted -> unweighted -> weighted calls on one
 op. A small graph additionally replays fresh payload/weights with a zero-input
 receiver and with all ranks empty. Graph replay is checked after every call.
 
-Two scenarios target the protocol rather than the data path:
+Three scenarios target the protocol rather than the data path:
 
   * **back-to-back** -- several rounds with no host sync between them, checked
     only after the last. Everything above syncs after each phase, which closes
@@ -58,6 +59,10 @@ Two scenarios target the protocol rather than the data path:
     combine before dispatch, ...) is refused on the host before launching, and
     the op is usable afterwards, both by finishing the open round and by reset().
     Before the check existed these were wrong data, a GPU fault, or a hang.
+  * **two ops interleaved** -- two ops, each on its own communicator, called in
+    the single-stream order of a two-batch overlap, with no host sync. SDMA
+    queues are process-wide, so the ops must take different queue offsets or each
+    recv's drain also waits for the other op's transfers.
 
 The swept shapes are chosen for the two things that have actually broken:
 top-k that does not divide the wavefront (64 % 6 == 4, DeepSeek-V4's shape), and
@@ -557,6 +562,163 @@ def run_back_to_back(d, comm, rounds):
     return failures
 
 
+def run_two_ops_interleaved(d, comm_a, comm_b, layers):
+    """Two ops interleaved as single-stream TBO issues them, no host sync.
+
+    Checks that two opted-in ops get different SDMA queues, that an op closed
+    before B or one on the shared queue does not move B off the free queue,
+    that LSA takes no queue, and that results stay correct. The capacities
+    differ, as a TBO child's does.
+    """
+    hidden, topk, epr = 4096, 6, 16
+    caps = (64, 32)
+    rank, world = d.rank, d.world
+    dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
+    transport = os.environ.get("TRANSPORT", "sdma")
+
+    def config(m, own_queue=True):
+        return EpDispatchCombineConfig(
+            rank=rank,
+            world_size=world,
+            hidden_dim=hidden,
+            max_num_inp_token_per_rank=m,
+            num_experts_per_rank=epr,
+            num_experts_per_token=topk,
+            data_type=torch.bfloat16,
+            kernel_backend="hip",
+            async_ll=True,
+            async_ll_transport=transport,
+            async_ll_own_sdma_queue=own_queue,
+        )
+
+    plans = []
+    for k, m in enumerate(caps):
+        per_op = []
+        for layer in range(layers):
+            n = ((rank + layer + 3 * k) * 5) % (m + 1)
+            gen = torch.Generator(device=dev).manual_seed(
+                9876 + rank * 31 + layer * 7 + k
+            )
+            x = torch.randn(n, hidden, generator=gen, device=dev, dtype=torch.bfloat16)
+            w = torch.rand(n, topk, generator=gen, device=dev, dtype=torch.float32)
+            idx = _routing(rank, world, m, topk, epr, dev, gen, n)
+            per_op.append((x, w, idx, _gather_inputs(x, idx, w, world)))
+        plans.append(per_op)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    failures = 0
+    op_a = EpDispatchCombineOp(config(caps[0]), comm_a)
+    with EpDispatchCombineOp(config(caps[1]), comm_b) as gone:
+        gone_offset = gone._sdma_queue_offset
+    with EpDispatchCombineOp(config(caps[1], own_queue=False), comm_b) as shared:
+        shared_offset = shared._sdma_queue_offset
+    with op_a, EpDispatchCombineOp(config(caps[1]), comm_b) as op_b:
+        ops = (op_a, op_b)
+        num_queues = op_a._dev_comm.sdma_num_queue
+        offsets = [op._sdma_queue_offset for op in ops]
+        if transport == "sdma" and num_queues > 1:
+            ok = offsets[0] != offsets[1] and offsets[1] == gone_offset
+        else:
+            ok = offsets == [0, 0]
+        if not ok or shared_offset != 0:
+            print(
+                f"[rank {rank}] SDMA queue offsets: A/B {offsets}, closed op "
+                f"{gone_offset}, shared-queue op {shared_offset}, of {num_queues} "
+                f"({transport})",
+                flush=True,
+            )
+            failures += 1
+        if rank == 0:
+            print(
+                f"# asyncll two ops: sdma queues {num_queues}, offsets {offsets}, "
+                f"closed op {gone_offset}, shared-queue op {shared_offset}",
+                flush=True,
+            )
+
+        stages = [op.combine_in_view() for op in ops]
+        kept = [[None] * layers for _ in ops]
+        couts = [None, None]
+
+        def send(k, layer):
+            x, w, idx, _ = plans[k][layer]
+            return ops[k].dispatch_send(x, w, None, idx, return_routing=True)
+
+        def recv_and_return(k, layer, sent):
+            out, out_w, _, out_idx, total, routing = sent
+            ops[k].dispatch_recv()
+            # Stream-ordered copies: they run before this op's next dispatch can
+            # overwrite the region.
+            kept[k][layer] = {
+                "out": out.clone(),
+                "weights": out_w.clone(),
+                "indices": out_idx.clone(),
+                "total": total.clone(),
+                "reverse": routing.disp_tok_id_to_src_tok_id_local.clone(),
+            }
+            stages[k].copy_(out)  # identity expert
+            couts[k], _ = ops[k].combine_send(stages[k], routing=routing)
+
+        def finish_combine(k, layer):
+            ops[k].combine_recv()
+            kept[k][layer]["combined"] = couts[k][: plans[k][layer][0].shape[0]].clone()
+
+        for layer in range(layers):
+            sent_a = send(0, layer)
+            if layer:
+                finish_combine(1, layer - 1)
+            sent_b = send(1, layer)
+            recv_and_return(0, layer, sent_a)
+            recv_and_return(1, layer, sent_b)
+            finish_combine(0, layer)
+        finish_combine(1, layers - 1)
+
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        for k, m in enumerate(caps):
+            for layer, ((x, w, idx, gathered), snap) in enumerate(
+                zip(plans[k], kept[k])
+            ):
+                tag = f"two_ops op={'AB'[k]} layer={layer}"
+                _, bad = _check_dispatch(
+                    d,
+                    snap["out"],
+                    snap["indices"],
+                    snap["weights"],
+                    snap["total"],
+                    snap["reverse"],
+                    gathered,
+                    m,
+                    epr,
+                    tag,
+                )
+                failures += bad
+                n = x.shape[0]
+                if n:
+                    uniq = torch.tensor(
+                        [
+                            len({int(e) // epr for e in row.tolist()})
+                            for row in gathered[rank][1]
+                        ],
+                        dtype=torch.float32,
+                    )
+                    want = (gathered[rank][2].float() * uniq[:, None]).to(
+                        torch.bfloat16
+                    )
+                    got = snap["combined"].cpu()
+                    if not torch.allclose(
+                        got.float(), want.float(), atol=1e-2, rtol=1e-2
+                    ):
+                        diff = (got.float() - want.float()).abs().max().item()
+                        print(
+                            f"[rank {rank}] {tag}: combine max |diff| {diff:.4f}",
+                            flush=True,
+                        )
+                        failures += 1
+    return failures
+
+
 def run_call_order(d, comm):
     """Every out-of-order call raises before launching, and reset() recovers.
 
@@ -712,6 +874,9 @@ def main():
     back_to_back = int(os.environ.get("BACK_TO_BACK", "6"))
     if back_to_back < 0:
         raise ValueError("BACK_TO_BACK must be nonnegative")
+    two_ops = int(os.environ.get("TWO_OPS", "4"))
+    if two_ops < 0:
+        raise ValueError("TWO_OPS must be nonnegative")
 
     failures = 0
     # One communicator PER SHAPE, each with its own unique id, rather than one for
@@ -767,6 +932,18 @@ def main():
         if d.rank == 0:
             print(f"# asyncll back-to-back: {back_to_back} rounds done", flush=True)
 
+    if two_ops:
+        # One communicator per op, as a two-batch overlap builds them.
+        failures += own_comm(
+            lambda ca: own_comm(
+                lambda cb: run_two_ops_interleaved(d, ca, cb, two_ops), 4096, 64
+            ),
+            4096,
+            64,
+        )
+        if d.rank == 0:
+            print(f"# asyncll two ops interleaved: {two_ops} layers done", flush=True)
+
     failures += own_comm(lambda c: run_call_order(d, c), 2048, 32)
     if d.rank == 0:
         print("# asyncll call order: done", flush=True)
@@ -777,7 +954,7 @@ def main():
             f"# {'PASS' if total == 0 else 'FAIL'}: {total} failed checks across "
             f"{d.world} ranks, {len(shapes)} shapes x {loops} iterations x 2 APIs, "
             f"2 graph scenarios x {graph_replays} replays, "
-            f"{back_to_back} back-to-back rounds, call order",
+            f"{back_to_back} back-to-back rounds, {two_ops} two-op layers, call order",
             flush=True,
         )
     dist.destroy_process_group()

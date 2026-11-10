@@ -24,7 +24,7 @@
 // The gfx125x implementation of intra-node dispatch and combine.
 //
 // This file is reached only from intranode_entry.hpp, and only from inside its
-// `#if defined(__gfx1250__) || defined(__gfx1251__)', so nothing here tests the target
+// `#if defined(MORI_GFX125X)', so nothing here tests the target
 // architecture: every line is already known to be compiling for a card that has the TDM engine.
 // That is the whole point of the split -- arch tests interleaved with the code they guard is how a
 // transport and the values it is compiled with drift apart. If you find yourself wanting an arch

@@ -85,8 +85,21 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
                            "' (expected one of: file, spdk, spdk_proxy)");
 }
 
-PeerSsdManager::PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight)
-    : backend_(std::move(backend)), single_flight_(single_flight) {}
+PeerSsdManager::PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight,
+                               FanoutCopy fanout_copy)
+    : backend_(std::move(backend)),
+      fanout_copy_(std::move(fanout_copy)),
+      single_flight_(single_flight) {}
+
+bool PeerSsdManager::CopyFollower(void* dst, const void* src, size_t size) noexcept {
+  try {
+    if (fanout_copy_) return fanout_copy_(dst, src, size);
+    std::memcpy(dst, src, size);
+    return true;
+  } catch (...) {
+    return false;  // Publish copy failure too, so followers always wake up.
+  }
+}
 
 PeerSsdManager::~PeerSsdManager() = default;
 
@@ -108,6 +121,16 @@ uint64_t PeerSsdManager::SizeOf(const std::string& key) const {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = owned_.find(key);
   return it == owned_.end() ? 0 : it->second.size;
+}
+
+std::vector<uint64_t> PeerSsdManager::SizesOf(const std::vector<std::string>& keys) const {
+  std::vector<uint64_t> sizes(keys.size(), 0);
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto it = owned_.find(keys[i]);
+    if (it != owned_.end()) sizes[i] = it->second.size;
+  }
+  return sizes;
 }
 
 bool PeerSsdManager::PinForMigration(const std::string& key) {
@@ -310,6 +333,15 @@ bool PeerSsdManager::OrdersEviction() const {
   return backend_ != nullptr && backend_->Capabilities().orders_eviction;
 }
 
+void PeerSsdManager::Touch(const std::vector<std::string>& keys) {
+  if (backend_ == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& key : keys) TouchLocked(key);
+  }
+  backend_->Touch(keys);
+}
+
 void PeerSsdManager::SetRetiredFileHook(std::function<void(int fd)> on_close,
                                         std::chrono::milliseconds grace) {
   if (backend_) backend_->SetRetiredFileHook(std::move(on_close), grace);
@@ -483,11 +515,10 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
       if (it != inflight_reads_.end()) it->second->Retire(episode);
     }
     for (const auto& f : fanout) {
-      f->ok = read_ok;
-      if (read_ok) {
-        std::memcpy(f->dst, static_cast<const char*>(staging_ptr) + (f->offset - episode->offset),
-                    f->length);
-      }
+      f->ok = read_ok &&
+              CopyFollower(f->dst,
+                           static_cast<const char*>(staging_ptr) + (f->offset - episode->offset),
+                           f->length);
     }
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -677,33 +708,41 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(
   //
   // A leader whose read FAILED still publishes (ok=false) — followers must be
   // released with an error, never left to time out.
+  // One mutex_ acquisition to seal every episode and one to wake them, not two
+  // per key: a batch leads ~1k keys and the per-key locking alone cost ms.
   const auto t_fanout = ssdperf::Now();
-  for (size_t j = 0; j < todo.size(); ++j) {
-    const size_t i = todo[j];
-    const auto& ep = episodes[i];
-    std::vector<std::shared_ptr<FollowerTarget>> fanout;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<std::vector<std::shared_ptr<FollowerTarget>>> fanouts(todo.size());
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t j = 0; j < todo.size(); ++j) {
+      const auto& ep = episodes[todo[j]];
       ep->sealed = true;  // late arrivals now lead their own read instead of waiting
-      fanout.swap(ep->followers);
+      fanouts[j].swap(ep->followers);
       // Retire the episode so the next arrival starts a fresh one rather than
       // attaching to a read that is already past its snapshot.
-      auto it = inflight_reads_.find(keys[i]);
+      auto it = inflight_reads_.find(keys[todo[j]]);
       if (it != inflight_reads_.end()) it->second->Retire(ep);
     }
-    // Deliver outside the lock: holding mutex_ across a page-sized memcpy would
-    // stall every other read/evict here.
-    for (const auto& f : fanout) {
-      f->ok = ok[j];
-      if (!ok[j]) continue;
-      std::memcpy(f->dst, static_cast<const char*>(dsts[i]) + (f->offset - ep->offset), f->length);
+  }
+  // Deliver outside the lock: holding mutex_ across a page-sized memcpy would
+  // stall every other read/evict here.
+  for (size_t j = 0; j < todo.size(); ++j) {
+    const size_t i = todo[j];
+    for (const auto& f : fanouts[j]) {
+      f->ok = ok[j] &&
+              CopyFollower(f->dst,
+                           static_cast<const char*>(dsts[i]) + (f->offset - episodes[i]->offset),
+                           f->length);
+      if (!f->ok) continue;
       fanout_bytes += f->length;
       ++fanout_count;
     }
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      ep->done = true;
-      ep->cv.notify_all();
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t j = 0; j < todo.size(); ++j) {
+      episodes[todo[j]]->done = true;
+      episodes[todo[j]]->cv.notify_all();
     }
   }
   fanout_ms = ssdperf::MsSince(t_fanout);

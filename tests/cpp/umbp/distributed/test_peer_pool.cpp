@@ -630,6 +630,35 @@ TEST(PeerPool, WeightedPolicyFallsBackWhenPrimaryHasNoSpace) {
   EXPECT_EQ(result.backend_id, registry.BackendId(registry.Get("dram_b")));
 }
 
+TEST(TieredPlacementPolicy, SmallObjectsSkipMembersWithMinObjectSize) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("ssd", std::make_unique<MockBackend>(TierType::SSD)));
+  auto compiled = LogicalTierGraph::Compile(
+      {LogicalTierConfig{{{"dram", 1}, {"ssd", 1000, 64 << 10}}}}, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  const uint32_t dram = registry.BackendId(registry.Get("dram"));
+  const uint32_t ssd = registry.BackendId(registry.Get("ssd"));
+  for (int i = 0; i < 32; ++i) {
+    const std::string key = "small-" + std::to_string(i);
+    EXPECT_EQ(compiled.graph->PutOrder(key, 4096), (std::vector<uint32_t>{dram, ssd}));
+    // Large and unknown sizes keep the plain weighted order.
+    EXPECT_EQ(compiled.graph->PutOrder(key, 1 << 20), compiled.graph->PutOrder(key));
+  }
+}
+
+TEST(TieredPlacementPolicy, AdvertisesLowestMinObjectSizePerTier) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("ssd", std::make_unique<MockBackend>(TierType::SSD)));
+  auto mixed =
+      LogicalTierGraph::Compile({LogicalTierConfig{{{"dram", 1}, {"ssd", 1, 64 << 10}}}}, registry);
+  auto ssd_only = LogicalTierGraph::Compile({LogicalTierConfig{{{"ssd", 1, 64 << 10}}}}, registry);
+  ASSERT_TRUE(mixed.ok() && ssd_only.ok());
+  EXPECT_EQ(mixed.graph->CapacitySnapshot().begin()->second.min_object_bytes, 0u);
+  EXPECT_EQ(ssd_only.graph->CapacitySnapshot().begin()->second.min_object_bytes, 64u << 10);
+}
+
 TEST(TieredPlacementPolicy, RejectsTierGraphWithoutTransferEngine) {
   BackendRegistry registry;
   ASSERT_TRUE(registry.Register("only", std::make_unique<MockBackend>(TierType::DRAM)));
@@ -1162,6 +1191,11 @@ TEST(PeerPool, ReadPromotesColdKeyWithoutDeletingSource) {
   BackendRegistry registry;
   RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2);
   RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2);
+  std::atomic<int> dram_changes{0};
+  registry.Get("hot")->SetChangeHook([&](const auto& keys) {
+    if (!keys.empty()) EXPECT_EQ(keys, (std::vector<std::string>{"promote"}));
+    ++dram_changes;
+  });
 
   auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
   tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;
@@ -1170,11 +1204,13 @@ TEST(PeerPool, ReadPromotesColdKeyWithoutDeletingSource) {
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
   CommitKey(&pool, "promote", {}, "cold");
+  EXPECT_EQ(dram_changes.load(), 0);
   ASSERT_TRUE(pool.BatchResolve({"promote"}, false).front().resolved.found);
 
   EXPECT_TRUE(WaitForKey(&registry, "hot", "promote"));
   EXPECT_TRUE(registry.Get("cold")->Contains("promote"));
-  pool.ClearLocal();  // drains the in-flight copy
+  EXPECT_EQ(dram_changes.load(), 1);  // Promotion wakes the DRAM Indexer reporter.
+  pool.ClearLocal();                  // drains the in-flight copy
   // Only the source is charged the read, not the target's post-write pin.
   const TierTransitionMetrics moves = pool.TransitionMetrics();
   EXPECT_EQ(moves.read_bytes, (std::map<std::string, uint64_t>{{"SSD", 64}}));
@@ -1433,6 +1469,73 @@ TEST(PeerPoolLocalEviction, DrainsAFullBackendColdestFirstToItsLowWatermark) {
   EXPECT_EQ(pool.PlacementCount(), 5u);
   EXPECT_GE(pool.LocalEvictionStats().rounds, 1u);
   EXPECT_EQ(pool.LocalEvictionStats().keys, 4u);
+}
+
+TEST(PeerPoolLocalEviction, TouchedKeysOutliveColderOnesInTheOrderGiven) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10);
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("dram")), 0.9, 0.5));
+
+  for (int i = 0; i < 8; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  // Served from the caller's own cache, so never read here.  A prefix comes
+  // tail first, so that its head is the last of it to go.
+  EXPECT_EQ(pool.BatchTouch({"k5", "k4", "k3", "k2", "k1", "k0", "missing"}), 6u);
+  CommitKey(&pool, "k8");
+
+  // The untouched k6 and k7 go first, then the prefix's tail.
+  auto* dram = registry.Get("dram");
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_EQ(dram->OwnedKeyCount(), 5u);
+  for (int i = 4; i <= 7; ++i) EXPECT_FALSE(dram->Contains("k" + std::to_string(i))) << i;
+  for (int i : {0, 1, 2, 3, 8}) EXPECT_TRUE(dram->Contains("k" + std::to_string(i))) << i;
+  EXPECT_EQ(pool.LocalEvictionStats().keys, 4u);
+}
+
+TEST(PeerPool, ATouchReachesEveryCopyInAMediumThatKeepsAnOrder) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  for (const char* name : {"ordered_a", "ordered_b", "unordered"}) {
+    RegisterPageBackend(&registry, &engine, name, TierType::DRAM, kHostPage, 4);
+  }
+  registry.Get("ordered_a")->TrackEvictionOrder();
+  registry.Get("ordered_b")->TrackEvictionOrder();
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  // A copy in each medium, put there directly rather than through placement.
+  for (const char* name : {"ordered_a", "ordered_b", "unordered"}) {
+    auto* backend = registry.Get(name);
+    auto slot = backend->BatchAllocate({AllocateRequest{"k", 64}}).front();
+    ASSERT_TRUE(backend->BatchCommit({CommitRequest{slot.slot_id, "k"}}).front().success) << name;
+  }
+  EXPECT_EQ(pool.BatchTouch({"k", "missing"}), 2u);
+}
+
+TEST(PeerPool, WatermarkOffloadMovesATouchedKeyLast) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kHostPage, 10);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kHostPage, 40);
+  auto tiers = HotColdTiers(PoolOffloadTrigger::kWatermark);
+  tiers.front().high_watermark = 0.9;
+  tiers.front().low_watermark = 0.5;
+  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+
+  for (int i = 0; i < 8; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  // The oldest key, used from the caller's own cache.  The offload picks from
+  // the pool's own order, not from a medium's.
+  pool.BatchTouch({"k0"});
+  CommitKey(&pool, "k8");  // 9 of 10 pages
+
+  auto* hot = registry.Get("hot");
+  ASSERT_TRUE(WaitUntil([&] { return hot->OwnedKeyCount() <= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_TRUE(registry.Get("cold")->Contains("k1")) << "the coldest key stayed";
+  EXPECT_TRUE(hot->Contains("k0")) << "the touched key was offloaded";
+  EXPECT_FALSE(registry.Get("cold")->Contains("k0"));
 }
 
 TEST(PeerPoolLocalEviction, RankedCandidatesGoFirstAndTheMediumCoversTheRest) {

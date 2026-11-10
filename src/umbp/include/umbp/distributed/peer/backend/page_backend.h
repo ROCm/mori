@@ -225,10 +225,12 @@ class PageBackend : public MediumBackend {
   // This is the one Init() actually works against; the OwnershipConfig overload
   // funnels into it, so DRAM and HBM share a single allocation/registration
   // path rather than two that must be kept in step.
+  // NUMA labels steer the allocator; the source owns physical binding.
   PageBackend(TierType tier, uint64_t page_size, std::unique_ptr<PageMemorySource> source,
               std::vector<uint64_t> buffer_sizes, std::chrono::milliseconds pending_ttl,
               std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500},
-              std::chrono::milliseconds reaper_interval = std::chrono::milliseconds{200});
+              std::chrono::milliseconds reaper_interval = std::chrono::milliseconds{200},
+              uint64_t max_mr_bytes = kDefaultDramMaxMrBytes, std::vector<int> numa_nodes = {});
 
   ~PageBackend() override;
 
@@ -314,10 +316,14 @@ class PageBackend : public MediumBackend {
   void SetEventPublishing(bool enabled) override;
 
   // ==================== Eviction ordering ====================
-  // An LRU of owned keys (Commit inserts, Resolve renews), kept only after
+  // An LRU of owned keys (Commit inserts, Resolve and Touch renew), kept only after
   // TrackEvictionOrder().  Candidates skip what Evict() would refuse.
   void TrackEvictionOrder() override;
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
+
+  // Moves held keys to the recent end of the order, as a read would, without
+  // the read's lease.  0 until TrackEvictionOrder().
+  size_t Touch(const std::vector<std::string>& keys) override;
 
   // ==================== Reaper ====================
 
@@ -517,7 +523,7 @@ class PageBackend : public MediumBackend {
   std::vector<DeferredFree> deferred_frees_;
 
   // ---- eviction order (see TrackEvictionOrder) ----
-  // Front = most recently committed/resolved, back = eviction candidate.
+  // Front = most recently committed, resolved or touched; back = eviction candidate.
   // Empty and unmaintained until track_eviction_order_.
   std::list<std::string> lru_;
   // Guards lru_ and the per-slot lru_it/in_lru fields.  Separate from mutex_

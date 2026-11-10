@@ -4,6 +4,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # ready_for_review: drafts run nothing. The ci:full and ci:mi300x labels
+    # act through ci-rerun.yml, which re-runs this workflow when one is added.
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       run_umbp_single_node_hicache:
@@ -37,8 +40,21 @@ env:
 
 
 jobs:
+  scope:
+    name: scope
+    uses: ./.github/workflows/ci-scope.yml
+    # The one job that may write: it keeps the routing comment on the PR.
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: read
+    with:
+      comment: true
+
   build:
     name: mori build (${{ matrix.platform }})
+    needs: scope
+    if: needs.scope.outputs.build == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -46,8 +62,6 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
-          - platform: MI300X_MLX
-            runner: [self-hosted, 300_mlx_p19_29]
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -94,8 +108,10 @@ jobs:
       - name: Build and install mori (BUILD_CCO_SDMA=OFF)
         run: $CT exec $CONTAINER bash -c "BUILD_CCO_SDMA=OFF pip install ."
 
-      - name: Build and install mori (with examples)
-        run: $CT exec $CONTAINER bash -c "BUILD_EXAMPLES=ON pip install ."
+      # KIWI (MI300X only at run time) also builds for gfx950, so every PR that
+      # builds here compile-checks it.
+      - name: Build and install mori (with examples and KIWI)
+        run: $CT exec $CONTAINER bash -c "BUILD_EXAMPLES=ON BUILD_OPS_KIWI=ON pip install ."
 
       - name: Verify installation
         # Not a bare `import mori`: the native extensions are skipped with a
@@ -113,7 +129,8 @@ jobs:
 
   intranode-test:
     name: mori intranode test (${{ matrix.platform }})
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.mori == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -130,19 +147,6 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             socket_ifname: eno0
-          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
-          # both only on the RoCE path. mlx5_8 is deliberately not in
-          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
-          # rendezvous interface), not one of the 8 rails.
-          # qp_max_send_wr works around mlx5 rejecting mori-io's default QP
-          # (8192 send WRs + 64-byte notification inline) with EINVAL: mlx5
-          # sizes every WQE for its largest op (192-byte UMR header), so the
-          # SQ needs 4 MiB against a 2 MiB (32768 x 64-byte WQEBB) cap.
-          - platform: MI300X_MLX
-            runner: [self-hosted, 300_mlx_p19_29]
-            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
-            socket_ifname: ens14np0
-            qp_max_send_wr: 4096
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -150,15 +154,16 @@ jobs:
           #   rdma_sl: 3
           #   rdma_tc: 104
           #   socket_ifname: enp49s0f1np1
-    env:
+    env: &intranode-env
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       MORI_IO_QP_MAX_SEND_WR: ${{ matrix.qp_max_send_wr }}
+      BUILD_OPS_KIWI: ${{ matrix.build_ops_kiwi || 'OFF' }}
     timeout-minutes: 45
-    steps:
+    steps: &intranode-steps
       - name: Fix workspace permissions
         run: |
           WS="${GITHUB_WORKSPACE}"
@@ -197,33 +202,45 @@ jobs:
       - name: Install mori
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_BENCHMARK=ON BUILD_CCO_SDMA=ON BUILD_EXAMPLES=ON pip install . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && BUILD_BENCHMARK=ON BUILD_CCO_SDMA=ON BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI pip install . && pip install prettytable"
 
       - name: MORI-EP (intranode)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE && timeout 360 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
           "
 
+      - name: KIWI-EP (intranode)
+        if: matrix.build_ops_kiwi == 'ON' && contains(fromJSON(needs.scope.outputs.groups), 'kiwi')
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_kiwi_dispatch_combine.py -v
+          "
+
       - name: MORI-EP (internode_v1)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
           "
 
       - name: MORI-EP (routing handle)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_routing_handle.py -v
           "
 
       - name: MORI-EP (async_ll SDMA)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
           "
 
       - name: MORI-CCL (param-contiguous allgather SDMA)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ccl')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ccl/test_allgather_param_contiguous.py -v
@@ -231,12 +248,14 @@ jobs:
 
 
       - name: MORI-CCL (hier allgather offset spec, CPU)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ccl')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE && timeout 120 pytest tests/python/ccl/test_hier_allgather_cpu.py -v
           "
 
       - name: MORI-CCL (hier allgather bit-exact, single-node)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ccl')
         run: |
           # Splits the local 8 GPUs into simulated nodes to drive the hierarchical
           # pipeline (ranks_per_node < world), bit-exact vs all_gather_into_tensor.
@@ -247,12 +266,14 @@ jobs:
           "
 
       - name: MORI-EP (async_ll IBGDA)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
           "
 
       - name: MORI-EP (AUTO tuning config quant types, CPU)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           # Pure mapping test: no GPU, no RDMA. Named explicitly because the
           # only directory-level collection in this workflow is tests/python/io,
@@ -262,6 +283,7 @@ jobs:
           "
 
       - name: MORI-EP bench
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
@@ -273,6 +295,7 @@ jobs:
           "
 
       - name: MORI-IO
+        if: contains(fromJSON(needs.scope.outputs.groups), 'io')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
@@ -282,6 +305,7 @@ jobs:
           "
 
       - name: MORI-IO C++ (engine and TCP control plane)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'io')
         run: |
           # `pip install .` leaves BUILD_TESTS off, so test_engine is built here.
           # Its XGMI hidden-device cases re-launch the binary under a narrower
@@ -295,11 +319,24 @@ jobs:
             timeout 300 ./build_io/tests/cpp/test_engine
           "
 
+      - name: MORI-RAS C++
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ras')
+        run: |
+          # BUILD_RAS defaults to OFF until RAS matures, so no other step builds RAS. This one
+          # keeps it compiling and its tests running.
+          $CT exec $CONTAINER bash -c "
+            set -e
+            cd $GITHUB_WORKSPACE
+            cmake -B build_ras -DBUILD_RAS=ON -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF
+            cmake --build build_ras -j --target ras_tests
+            cd build_ras && timeout 300 ctest -R '^ras_' --output-on-failure
+          "
+
       - name: MORI-IO fault catalog (ibverbs)
         id: fault_ibverbs
         # The catalog's known_bug expectations were measured on ionic; other NICs
         # join once verified.
-        if: matrix.platform == 'MI355X_AINIC'
+        if: matrix.platform == 'MI355X_AINIC' && contains(fromJSON(needs.scope.outputs.groups), 'io')
         run: |
           # Injects the NIC faults in tests/cpp/io/fault_catalog/ibverbs.yaml between an
           # initiator on GPU 0 and a target on GPU 1, each on its own NIC. Entries marked
@@ -327,7 +364,7 @@ jobs:
 
       - name: MORI-IO fault catalog (async events)
         # Runs the binary the ibverbs step builds, so that step must have run (pass or fail).
-        if: ${{ !cancelled() && matrix.platform == 'MI355X_AINIC' && steps.fault_ibverbs.outcome != 'skipped' }}
+        if: ${{ !cancelled() && matrix.platform == 'MI355X_AINIC' && steps.fault_ibverbs.outcome != 'skipped' && contains(fromJSON(needs.scope.outputs.groups), 'io') }}
         run: |
           REPORT=$GITHUB_WORKSPACE/build_fault/fault_report.md
           set +e
@@ -343,6 +380,7 @@ jobs:
           exit $rc
 
       - name: MORI-IR
+        if: contains(fromJSON(needs.scope.outputs.groups), 'shmem')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e HOME=/tmp $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
@@ -352,8 +390,11 @@ jobs:
           "
 
       - name: MORI-CPP shmem_benchmark (P2P)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'shmem')
         run: |
+          # set -e: a launch killed by its timeout fails the step instead of passing.
           $CT exec $CONTAINER bash -c "
+            set -e
             cd $GITHUB_WORKSPACE
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_bw
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_bw
@@ -365,13 +406,16 @@ jobs:
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency -s warp
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_bw -s thread
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_bw -s thread
-            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_latency -s thread
-            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency -s thread
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_latency -s thread -e 1M
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency -s thread -e 1M
           "
 
       - name: MORI-CPP shmem_benchmark (RDMA)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'shmem')
         run: |
+          # set -e: a launch killed by its timeout fails the step instead of passing.
           $CT exec $CONTAINER bash -c "
+            set -e
             cd $GITHUB_WORKSPACE
             MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_put_bw
             MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_get_bw
@@ -388,6 +432,7 @@ jobs:
           "
 
       - name: MORI-CPP shmem (P2P)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'shmem')
         run: |
           $CT exec $CONTAINER bash -c "
             set -e
@@ -401,6 +446,7 @@ jobs:
           "
 
       - name: MORI-CPP shmem (IBGDA)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'shmem')
         run: |
           $CT exec $CONTAINER bash -c "
             set -e
@@ -414,6 +460,7 @@ jobs:
           "
 
       - name: MORI-CCL/shmem
+        if: contains(fromJSON(needs.scope.outputs.groups), 'shmem')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
@@ -421,6 +468,7 @@ jobs:
           "
 
       - name: MORI-CCL collectives
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ccl')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
@@ -429,6 +477,7 @@ jobs:
           "
 
       - name: MORI-EP async kernel bench (intranode)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
@@ -455,12 +504,40 @@ jobs:
                 chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           fi
 
+  intranode-test-mi300x:
+    name: mori intranode test (${{ matrix.platform }})
+    needs: scope
+    if: needs.scope.outputs.mi300x == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
+          # both only on the RoCE path. mlx5_8 is deliberately not in
+          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
+          # rendezvous interface), not one of the 8 rails.
+          # qp_max_send_wr works around mlx5 rejecting mori-io's default QP
+          # (8192 send WRs + 64-byte notification inline) with EINVAL: mlx5
+          # sizes every WQE for its largest op (192-byte UMR header), so the
+          # SQ needs 4 MiB against a 2 MiB (32768 x 64-byte WQEBB) cap.
+          - platform: MI300X_MLX
+            runner: [self-hosted, 300_mlx_p19_29]
+            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+            socket_ifname: ens14np0
+            qp_max_send_wr: 4096
+            build_ops_kiwi: "ON"
+    env: *intranode-env
+    timeout-minutes: 45
+    steps: *intranode-steps
+
   # Gate for "does mori still build and run on the next ROCm major". Kept to the
   # single EP intranode test on one runner: the rest of the intranode suite is
   # ROCm-version agnostic, and the ROCm 10 base image is a separate ~30GB pull.
   intranode-test-rocm10:
     name: mori intranode test (ROCm 10, MI355X_AINIC)
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.mori == 'true' && contains(fromJSON(needs.scope.outputs.groups), 'ep')
     runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
     env:
       # py3.11 rather than the 7.14 lane's py3.12 — this is the tag the ROCm 10
@@ -548,7 +625,8 @@ jobs:
 
   jax-intranode-test:
     name: mori JAX intranode test (${{ matrix.platform }})
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.mori == 'true' && contains(fromJSON(needs.scope.outputs.groups), 'ep')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -641,7 +719,8 @@ jobs:
 
   umbp-unit-test:
     name: mori umbp unit test (${{ matrix.platform }})
-    needs: build
+    needs: [scope, build]
+    if: needs.scope.outputs.umbp == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -743,7 +822,9 @@ jobs:
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
-    needs: build
+    # Not on build: that runs on another runner, and this job builds mori itself.
+    needs: scope
+    if: needs.scope.outputs.mori == 'true' && (contains(fromJSON(needs.scope.outputs.groups), 'ep') || contains(fromJSON(needs.scope.outputs.groups), 'ccl') || contains(fromJSON(needs.scope.outputs.groups), 'io'))
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -761,23 +842,6 @@ jobs:
             rdma_tc: 104
             ct: podman
             timeout_minutes: 45
-          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
-          # both only on the RoCE path. mlx5_8 is deliberately not in
-          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
-          # rendezvous interface), not one of the 8 rails.
-          # node1 is the runner itself (banff-ccs-aus-p19-05); node2 is the peer
-          # it drives over ssh (banff-ccs-aus-p19-14). Both addresses are the
-          # ens14np0 100GbE port used for TCP rendezvous.
-          - platform: MI300X_MLX
-            runner: [self-hosted, 300_mlx_p19_29]
-            node1_host: 10.194.132.110
-            node2_host: 10.194.132.71
-            node2_port: 22
-            node1_ifname: ens14np0
-            node2_ifname: ens14np0
-            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
-            ct: docker
-            timeout_minutes: 90
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -791,7 +855,7 @@ jobs:
           #   rdma_tc: 104
           #   ct: docker
           #   timeout_minutes: 45
-    env:
+    env: &internode-env
       CT: ${{ matrix.ct }}
       # node2's sshd checks every new connection against the Conductor auth
       # service, which intermittently answers 503 and denies the login (ssh exits
@@ -807,12 +871,16 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      BUILD_OPS_KIWI: ${{ matrix.build_ops_kiwi || 'OFF' }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
-    steps:
+    steps: &internode-steps
       - name: Fix workspace permissions
         run: |
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           WS="${GITHUB_WORKSPACE}"
-          if [ -d "$WS" ]; then
+          if [ -d "$WS" ] && [ -z "$ROOTLESS" ]; then
             $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
               chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
           fi
@@ -876,10 +944,13 @@ jobs:
           # way "Fix workspace permissions" does on node1. The CI container runs
           # as root, so the previous job leaves root-owned build output in the
           # workspace and the rsync below dies on EPERM before anything builds.
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             $CT rm -f $CONTAINER 2>/dev/null || true
             mkdir -p $GITHUB_WORKSPACE
-            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
+            test -n '$ROOTLESS' || $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           "
           rsync -az --exclude='.git' \
@@ -907,12 +978,12 @@ jobs:
       - name: Install mori (node1)
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))"
+            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))"
 
       - name: Install mori (node2)
         run: |
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
+            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
 
       # The IO benchmark runner defaults to the native C++ engine
       # (tools/run_internode_io_benchmark.sh --engine cpp), which needs the
@@ -924,12 +995,14 @@ jobs:
       # MORI_IO_BENCH_ENGINE_BIN (set on both containers at start) and derives the
       # matching LD_LIBRARY_PATH from it.
       - name: Build MORI-IO C++ bench_engine (both nodes)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'io')
         run: |
           BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build_bench -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF && cmake --build build_bench --target bench_engine -j && ls -la build_bench/tests/cpp/bench_engine"
           $CT exec $CONTAINER bash -c "$BUILD_CMD"
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
 
       - name: MORI-IO internode write sweep
+        if: contains(fromJSON(needs.scope.outputs.groups), 'io')
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           PORT=29120
@@ -956,6 +1029,7 @@ jobs:
           wait
 
       - name: MORI-IO internode read
+        if: contains(fromJSON(needs.scope.outputs.groups), 'io')
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           PORT=29121
@@ -980,6 +1054,7 @@ jobs:
           wait
 
       - name: MORI-IO internode CPU memory sweep (chunking + 4 NIC x 4 QP)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'io')
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           # CPU host memory, chunking on (default), striped across 4 NUMA-local NICs
@@ -1009,6 +1084,7 @@ jobs:
           done
 
       - name: MORI-IO internode multi-worker executor correctness (chunking off)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'io')
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           PORT=29124
@@ -1037,6 +1113,7 @@ jobs:
           wait
 
       - name: MORI-IO internode multi-worker executor correctness (chunking on)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'io')
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           PORT=29125
@@ -1069,6 +1146,7 @@ jobs:
           done
 
       - name: MORI-IO internode cross-rail write (rail affinity)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'io')
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           PORT=29127
@@ -1099,6 +1177,7 @@ jobs:
           wait
 
       - name: Reset GPU processes before EP internode bench
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           # IO internode steps leave many short-lived torchrun/mp.spawn workers; if any
           # linger they keep HIP UAR host mappings and the EP bench hits hipHostRegister
@@ -1108,54 +1187,104 @@ jobs:
             "$CT exec $CONTAINER bash -c 'pkill -9 -f \"[t]ests\\.python\\.io\\.benchmark\" 2>/dev/null || true; pkill -9 -f \"[t]est_dispatch_combine_internode\" 2>/dev/null || true; sleep 2'"
 
       - name: MORI-EP internode normal kernel bench
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
+        # Also a correctness gate: every point verifies one full-capacity round
+        # in the default (MANUAL) launch geometry; the nightly bench uses AUTO.
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29140
-          for KERNEL in v1 v1_ll; do
-            for TOKENS in 64 128 1024 2048 4096; do
-              echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD=(
-                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
-                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-                --ifname $NODE2_IFNAME
-                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
-              )
-              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
-                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-                --ifname $NODE1_IFNAME \
-                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
-              wait
-              sleep 1
-              PORT=$((PORT + 1))
-            done
+          if [ "${{ needs.scope.outputs.full == 'true' && 'full' || 'pr' }}" = pr ]; then
+            # The smallest and largest size per kernel; workflow_dispatch and ci:full run all 10.
+            POINTS="v1:64 v1:4096 v1_ll:64 v1_ll:4096"
+          else
+            POINTS=$(for k in v1 v1_ll; do for t in 64 128 1024 2048 4096; do printf '%s:%s ' $k $t; done; done)
+          fi
+          for P in $POINTS; do
+            KERNEL=${P%%:*}
+            TOKENS=${P##*:}
+            echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
           done
 
       - name: MORI-EP internode normal kernel stress
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29160
+          if [ "${{ needs.scope.outputs.full == 'true' && 'full' || 'pr' }}" = pr ]; then
+            # One point per kernel; the nightly, workflow_dispatch and ci:full run all 10.
+            POINTS="v1:4096 v1_ll:128"
+          else
+            POINTS=$(for k in v1 v1_ll; do for t in 64 128 1024 2048 4096; do printf '%s:%s ' $k $t; done; done)
+          fi
+          for P in $POINTS; do
+            KERNEL=${P%%:*}
+            TOKENS=${P##*:}
+            echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
+          done
+
+      - name: MORI-EP internode stress_accuracy (every round verified)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
+        run: |
+          # stress only surfaces hangs and faults; stress_accuracy checks every round's dispatch
+          # and combine results, so it catches the nodeRecvTokenNum and DispatchSync races in
+          # internode_v1. 1024 tokens with 200 us jitter is where an unfixed build failed
+          # (round 1110 on 2x8 MI355X); 20k rounds take about 50 s per kernel.
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          SA_ENV="-e MORI_INTERNODE_TIMEOUT=600 -e MORI_STRESS_ROUNDS=20000 -e MORI_STRESS_JITTER=200"
+          # AI NIC runs the atomic-free V1/V1LL signalling, as the nightly atomic-free bench does;
+          # with RDMA-atomic chunk signals it mis-routes a token (open issue, not these races).
+          if [[ "${{ matrix.platform }}" == "MI355X_AINIC" ]]; then
+            SA_ENV="$SA_ENV -e MORI_EP_DISABLE_RDMA_ATOMICS=1"
+          fi
+          PORT=29150
           for KERNEL in v1 v1_ll; do
-            for TOKENS in 64 128 1024 2048 4096; do
-              echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD=(
-                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
-                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-                --ifname $NODE2_IFNAME
-                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
-              )
-              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
-                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-                --ifname $NODE1_IFNAME \
-                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
-              wait
-              sleep 1
-              PORT=$((PORT + 1))
-            done
+            echo "=== stress_accuracy kernel=$KERNEL max-tokens=1024 rounds=20000 jitter=200us port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec $SA_ENV $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd stress_accuracy --kernel-type $KERNEL --max-tokens 1024
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec $SA_ENV $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd stress_accuracy --kernel-type $KERNEL --max-tokens 1024
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
           done
 
       - name: MORI-EP internode rail-only (MORI_ENABLE_RAIL_ONLY)
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           # Same v1/v1_ll path with cross-rail QPs never created. Guards the claim
           # that the EP internode data path only ever needs same-rail connections.
@@ -1186,6 +1315,7 @@ jobs:
           done
 
       - name: MORI-EP internode async kernel test
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ep')
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29180
@@ -1215,7 +1345,35 @@ jobs:
             PORT=$((PORT + 1))
           done
 
+      - name: KIWI-EP internode test (EP16)
+        if: matrix.build_ops_kiwi == 'ON' && contains(fromJSON(needs.scope.outputs.groups), 'kiwi')
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          ENTRY="tests/python/ops/test_kiwi_dispatch_combine_internode.py"
+          PORT=29210
+          for BACKEND in rdma-only hybrid auto; do
+            for DTYPE in bf16 fp8_e4m3_fnuz; do
+              echo "=== KIWI EP16 rcomp-backend=$BACKEND dtype=$DTYPE port=$PORT ==="
+              NODE2_CMD=(
+                $CT exec -e MORI_INTERNODE_TIMEOUT=300 $CONTAINER bash $SCRIPT
+                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                --ifname $NODE2_IFNAME --entry $ENTRY --nproc-per-node 8
+                --cmd test --kernel-type $BACKEND --dtype $DTYPE --max-tokens 128
+              )
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+              NODE2_PID=$!
+              $CT exec -e MORI_INTERNODE_TIMEOUT=300 $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                --ifname $NODE1_IFNAME --entry $ENTRY --nproc-per-node 8 \
+                --cmd test --kernel-type $BACKEND --dtype $DTYPE --max-tokens 128
+              wait $NODE2_PID
+              sleep 1
+              PORT=$((PORT + 1))
+            done
+          done
+
       - name: MORI-CCL internode hier allgather bit-exact smoke
+        if: contains(fromJSON(needs.scope.outputs.groups), 'ccl')
         run: |
           # world=16 (2 node x 8 GPU) hierarchical AllGather: intra-node SDMA +
           # inter-node RDMA, asserted byte-for-byte against a locally-computed
@@ -1254,8 +1412,11 @@ jobs:
       - name: Cleanup node1
         if: always()
         run: |
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           $CT rm -f $CONTAINER || true
-          if $CT image inspect $IMAGE &>/dev/null; then
+          if [ -z "$ROOTLESS" ] && $CT image inspect $IMAGE &>/dev/null; then
             $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
                 chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           fi
@@ -1266,6 +1427,37 @@ jobs:
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT rm -f $CONTAINER || true"
+
+  internode-test-mi300x:
+    name: mori internode test (${{ matrix.platform }})
+    needs: scope
+    if: needs.scope.outputs.mi300x == 'true' && (contains(fromJSON(needs.scope.outputs.groups), 'ep') || contains(fromJSON(needs.scope.outputs.groups), 'kiwi') || contains(fromJSON(needs.scope.outputs.groups), 'ccl') || contains(fromJSON(needs.scope.outputs.groups), 'io'))
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
+          # both only on the RoCE path. mlx5_8 is deliberately not in
+          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
+          # rendezvous interface), not one of the 8 rails.
+          # node1 is the runner itself (banff-ccs-aus-p19-05); node2 is the peer
+          # it drives over ssh (banff-ccs-aus-p19-14). Both addresses are the
+          # ens14np0 100GbE port used for TCP rendezvous.
+          - platform: MI300X_MLX
+            runner: [self-hosted, 300_mlx_p19_29]
+            node1_host: 10.194.132.110
+            node2_host: 10.194.132.71
+            node2_port: 22
+            node1_ifname: ens14np0
+            node2_ifname: ens14np0
+            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+            ct: docker
+            timeout_minutes: 90
+            build_ops_kiwi: "ON"
+    env: *internode-env
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    steps: *internode-steps
 
   umbp-single-node-hicache:
     name: mori umbp single-node hicache smoke test
@@ -1328,3 +1520,35 @@ jobs:
       - name: Cleanup hicache container
         if: always()
         run: docker rm -f umbp-single-node >/dev/null 2>&1 || true
+
+  cco:
+    name: CCO
+    # The CCO jobs live in ci_cco.yml; this run's scope picks which of them run.
+    needs: scope
+    if: needs.scope.outputs.cco == 'true' || needs.scope.outputs.fused == 'true'
+    uses: ./.github/workflows/ci_cco.yml
+    with:
+      groups: ${{ needs.scope.outputs.groups }}
+      full: ${{ needs.scope.outputs.full == 'true' }}
+
+  ci-gate:
+    name: CI gate
+    # One check that is green when every lane the scope picked passed, CCO's
+    # included; a lane the scope skipped counts as passed.
+    if: always()
+    needs: [scope, build, intranode-test, intranode-test-mi300x, intranode-test-rocm10, jax-intranode-test, umbp-unit-test, internode-test, internode-test-mi300x, cco]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check lane results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          REASON: ${{ needs.scope.outputs.reason }}
+        run: |
+          echo "Scope: ${REASON:-n/a}"
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)\t\(.value.result)"' | tee results.tsv
+          if awk -F'\t' '$2 != "success" && $2 != "skipped"' results.tsv | grep -q .; then
+            echo "::error::a CI lane did not pass"; exit 1
+          fi
+          if ! grep -qP '^scope\tsuccess$' results.tsv; then
+            echo "::error::CI scope did not succeed"; exit 1
+          fi

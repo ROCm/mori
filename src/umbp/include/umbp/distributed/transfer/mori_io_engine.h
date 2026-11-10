@@ -35,6 +35,11 @@
 
 namespace mori::umbp {
 
+// Shared with the simulator so registration, coalescing and bounce geometry agree.
+std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& local_key,
+                                                         uint64_t bounce_size,
+                                                         const TransferRef& bounce_ref);
+
 // The mori-io (RDMA) implementation of TransferEngine, and the only place in
 // UMBP that names mori::io::IOEngine.
 //
