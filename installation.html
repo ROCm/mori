@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Install MORI &mdash; MORI development (c7ed9fe5) documentation</title>
+  <title>Install MORI &mdash; MORI development (4ee8afc2) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=54144066"></script>
+      <script src="_static/documentation_options.js?v=7111a5a9"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -624,7 +624,7 @@ corresponding userspace library from your NIC vendor.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mori<span class="w"> </span>check<span class="w"> </span>&lt;peer_ip&gt;<span class="w">          </span><span class="c1"># or: tools/env_check.sh &lt;peer_ip&gt;</span>
 </pre></div>
 </div>
-<p>Six steps — NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
+<p>Seven steps — kernel PCI P2PDMA support (<code class="docutils literal notranslate"><span class="pre">CONFIG_PCI_P2PDMA</span></code>, read from <code class="docutils literal notranslate"><span class="pre">/proc/kallsyms</span></code>; warns only), NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
 inter-node bandwidth and latency meshes over every NIC pair, on host memory and
 on GPU memory. Exits non-zero if any check failed, and reports the fabric
 topology, which decides what can run on it.</p>
