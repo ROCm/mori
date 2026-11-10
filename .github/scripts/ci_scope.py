@@ -79,9 +79,10 @@ GROUPS = (
     "build",
 )
 ALL = frozenset(GROUPS)
-# The groups each lane's jobs test.
+# The groups each lane's jobs test. KIWI runs only on MI300X (build_ops_kiwi).
 LANE_GROUPS = {
-    "mori": {"ep", "kiwi", "ccl", "io", "ras", "shmem"},
+    "mori": {"ep", "ccl", "io", "ras", "shmem"},
+    "mi300x": {"ep", "kiwi", "ccl", "io", "ras", "shmem"},
     "umbp": {"umbp"},
     "cco": {"cco", "epv2"},
     "fused": {"fused"},
@@ -358,12 +359,12 @@ def lanes_for_files(files, labels):
     found = [area_of(f) for f in files]
     groups = set().union(*(g for _, g in found)) if found else set()
     lanes = {lane: bool(groups & want) for lane, want in LANE_GROUPS.items()}
-    lanes["build"] = lanes["mori"] or lanes["umbp"] or lanes["cco"] or "build" in groups
+    lanes["build"] = bool(groups - {"fused"})
     mi300x_hit = any(MI300X_PATHS.search(f) for f in files)
-    lanes["mi300x"] = "ci:mi300x" in labels or (lanes["mori"] and mi300x_hit)
-    if lanes["mi300x"] and not lanes["mori"]:
+    lanes["mi300x"] = "ci:mi300x" in labels or (lanes["mi300x"] and mi300x_hit)
+    if lanes["mi300x"] and not groups & LANE_GROUPS["mi300x"]:
         # ci:mi300x alone: the MI300X jobs run all their groups.
-        groups |= LANE_GROUPS["mori"]
+        groups |= LANE_GROUPS["mi300x"]
     areas = sorted({a for a, g in found if g})
     reason = "changed areas: " + (", ".join(areas) or "none that need GPU CI")
     return lanes, groups, reason
@@ -456,18 +457,17 @@ def decide(env):
 
 
 MARKER = "<!-- ci-scope -->"
-INTERNODE = {"ep", "kiwi", "ccl", "io"}
 # Each lane's jobs and the groups that start them (their if: in ci.yml, ci_cco.yml).
 JOBS = {
     "mori": (
         ("MI355X intranode", LANE_GROUPS["mori"]),
         ("MI355X ROCm 10", {"ep"}),
         ("MI355X JAX", {"ep"}),
-        ("MI355X internode", INTERNODE),
+        ("MI355X internode", {"ep", "ccl", "io"}),
     ),
     "mi300x": (
-        ("MI300X intranode", LANE_GROUPS["mori"]),
-        ("MI300X internode", INTERNODE),
+        ("MI300X intranode", LANE_GROUPS["mi300x"]),
+        ("MI300X internode", {"ep", "kiwi", "ccl", "io"}),
     ),
     "umbp": (("UMBP unit test", {"umbp"}),),
     "cco": (

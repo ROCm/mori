@@ -823,7 +823,7 @@ jobs:
     name: mori internode test (${{ matrix.platform }})
     # Not on build: that runs on another runner, and this job builds mori itself.
     needs: scope
-    if: needs.scope.outputs.mori == 'true' && (contains(fromJSON(needs.scope.outputs.groups), 'ep') || contains(fromJSON(needs.scope.outputs.groups), 'kiwi') || contains(fromJSON(needs.scope.outputs.groups), 'ccl') || contains(fromJSON(needs.scope.outputs.groups), 'io'))
+    if: needs.scope.outputs.mori == 'true' && (contains(fromJSON(needs.scope.outputs.groups), 'ep') || contains(fromJSON(needs.scope.outputs.groups), 'ccl') || contains(fromJSON(needs.scope.outputs.groups), 'io'))
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
