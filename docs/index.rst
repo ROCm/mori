@@ -22,6 +22,9 @@ MORI Documentation
    MORI-IR-GUIDE
    MORI-IO-GUIDE
    MORI-UMBP-SINGLE-NODE-GUIDE
+   umbp/README
+   umbp/user-guide.zh-CN
+   umbp/sglang-demo.zh-CN
    umbp-simulation
    umbp-calibration
    PROFILER
