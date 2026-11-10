@@ -38,57 +38,6 @@ logger = logging.getLogger(__name__)
 TOPK_IDX_DTYPE = torch.int32
 
 
-# Process-global CCO communicator, reused across ops (creating one per op would
-# re-run the socket bootstrap every time). Used when _ep_comm() resolves to cco, which
-# routes the C++ EP handle's symmetric buffers through a cco LSA window instead of
-# the mori-shmem heap (enables intra-node EP on archs without shmem support).
-_CCO_COMM = None
-
-
-def _maybe_get_cco_comm(config):
-    """Return a cached cco Communicator when the resolved backend is cco, else None.
-
-    Bootstraps once via a torch.distributed broadcast of the cco unique-id (the
-    same pattern the v2/FlyDSL path uses), sized for this config's symmetric
-    buffers. Reused for the lifetime of the process.
-    """
-    if _ep_comm() != "cco":
-        return None
-    global _CCO_COMM
-    if _CCO_COMM is not None:
-        return _CCO_COMM
-    from mori.cco import Communicator
-
-    if not dist.is_initialized():
-        raise RuntimeError(
-            "MORI_EP_COMM=cco requires an initialized torch.distributed group"
-        )
-    # Per-rank VMM must hold every symmetric buffer this rank allocates. The
-    # dispatch/combine token buffers dominate (~world * max_tok * hidden * dtype);
-    # use generous headroom for the ~18 buffers + alignment slack.
-    big = (
-        int(config.world_size)
-        * int(config.max_num_inp_token_per_rank)
-        * int(config.hidden_dim)
-        * int(config.max_token_type_size)
-    )
-    per_rank_vmm = 6 * big + (1 << 30)
-    uid = Communicator.get_unique_id() if config.rank == 0 else None
-    objs = [uid]
-    dist.broadcast_object_list(objs, src=0)
-    uid = objs[0]
-    _CCO_COMM = Communicator.init(
-        int(config.world_size), int(config.rank), uid, per_rank_vmm=per_rank_vmm
-    )
-    logger.info(
-        "MORI_EP_COMM=cco: created cco communicator rank=%d/%d per_rank_vmm=%d",
-        config.rank,
-        config.world_size,
-        per_rank_vmm,
-    )
-    return _CCO_COMM
-
-
 class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
     def __str__(self):
         return self.name
@@ -293,25 +242,6 @@ except AttributeError:
 _PTR_SIZE = 8
 
 
-def _ep_comm():
-    """Resolved backend for the EP handle's symmetric buffers: "cco" or "shmem".
-
-    gfx125x defaults to cco, everything else keeps mori-shmem. An explicit MORI_EP_COMM wins either
-    way, so the variable is still there for anyone who needs to force the other one.
-
-    This is an arch default for the same reason the dispatch body is: which backend can carry the
-    symmetric buffers is a property of the hardware, and a caller who has to know that in order to
-    set an environment variable will eventually not know it. cco routes the buffers through an LSA
-    window instead of the shmem heap, which is what makes intra-node EP work on an arch without
-    shmem support.
-
-    NOT VERIFIED on any non-gfx125x device -- there is none on this machine -- which is exactly why
-    the non-125x branch keeps the behaviour it already had rather than being changed blind.
-    """
-    val = os.environ.get("MORI_EP_COMM", "").strip().lower()
-    return val or "shmem"
-
-
 def warmup_jit_kernels(kernel_type):
     """Pre-compile kernels for a kernel_type. Call from main process before spawning workers."""
     from mori.ops._jit_loader import ensure_compiled, _compiled_hsaco
@@ -332,13 +262,13 @@ def _ensure_jit_kernels(kernel_type):
     ensure_compiled(_KERNEL_TYPE_TO_HIP[kernel_type])
 
 
-def _load_hip_modules(kernel_type, init_shmem=True):
+def _load_hip_modules(kernel_type):
     """Load HipModule for the given kernel_type and init shmem gpu states."""
     from mori.ops._jit_loader import load_hip_module
 
     if kernel_type not in _KERNEL_TYPE_TO_HIP:
         raise ValueError(f"Unknown kernel_type: {kernel_type}")
-    return load_hip_module(_KERNEL_TYPE_TO_HIP[kernel_type], init_shmem=init_shmem)
+    return load_hip_module(_KERNEL_TYPE_TO_HIP[kernel_type], init_shmem=True)
 
 
 class EpDispatchCombineOp:
@@ -380,15 +310,8 @@ class EpDispatchCombineOp:
             max_total_recv_tokens=config.max_total_recv_tokens,
         )
 
-        self._cco_comm = _maybe_get_cco_comm(config)
-        _cco_ptr = self._cco_comm.ptr if self._cco_comm is not None else 0
-        self._handle = handle_class(self._cpp_config, cco_comm_ptr=_cco_ptr)
-        # cco backend is shmem-free: skip shmem_module_init (asserts when mori-shmem
-        # is uninitialized; on gfx1250 shmem init can hang). Intra-node cco kernels
-        # use cco LSA peer pointers + pointer-based device waits, not the shmem heap.
-        self._hip_module = _load_hip_modules(
-            config.kernel_type, init_shmem=self._cco_comm is None
-        )
+        self._handle = handle_class(self._cpp_config)
+        self._hip_module = _load_hip_modules(config.kernel_type)
         self._handle_info = mori_cpp.get_handle_info(self._handle)
         # MORI_EP_DISABLE_RDMA_ATOMICS: the InterNodeV1/V1LL dispatch and combine kernels are
         # compiled twice, and this selects the variant that signals with RDMA WRITEs.

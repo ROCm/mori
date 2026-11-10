@@ -28,7 +28,6 @@
 #include <string>
 
 #include "mori/application/transport/rdma/rdma.hpp"
-#include "mori/cco/cco.hpp"
 #include "mori/core/core.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
@@ -111,33 +110,14 @@ EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedI32Array(const int32_
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     EpDispatchCombineHandle                                    */
 /* ---------------------------------------------------------------------------------------------- */
-EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_,
-                                                 uintptr_t ccoCommPtr_)
+EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_)
     : config(config_) {
-  ccoCommPtr = reinterpret_cast<void*>(ccoCommPtr_);
-  useCcoComm = (ccoCommPtr != nullptr);
-  // The CCO backend (MORI_EP_COMM=cco, the default on gfx125x) only supports intra-node handles:
-  // its MallocSymm fills the LSA peer pointers of each symmetric buffer but not the RDMA fields
-  // (SymmMemObj::peerPtrs / peerRkeys / lkey) that the cross-node kernels read, so the first
-  // cross-node put would fault at address 0 on the GPU. Reject every kernel type here, before
-  // anything uses the communicator, so that kernel types added later are rejected too. Cross-node
-  // EP on gfx125x goes through EPv2 (mori.ops.dispatch_combine_v2).
-  if (useCcoComm && config.worldSize > config.gpuPerNode) {
-    throw std::runtime_error(
-        "EpDispatchCombineHandle with the CCO backend (MORI_EP_COMM=cco) "
-        "supports intra-node only, but worldSize=" +
-        std::to_string(config.worldSize) + " > gpuPerNode=" + std::to_string(config.gpuPerNode) +
-        ": its symmetric buffers are not registered for RDMA. Use EPv2 "
-        "(mori.ops.dispatch_combine_v2) for cross-node EP.");
-  }
   assert(IsPowerOf2(config.gpuPerNode) && (config.worldSize % config.gpuPerNode == 0));
-  if (!useCcoComm) {
-    int shmemNumQpPerPe = ShmemNumQpPerPe();
-    if (config.numQpPerPe > shmemNumQpPerPe) {
-      config.numQpPerPe = shmemNumQpPerPe;
-      MORI_OPS_INFO("numQpPerPe {} larger than shmem numQpPerPe {}, set to {}", config.numQpPerPe,
-                    shmemNumQpPerPe, shmemNumQpPerPe);
-    }
+  int shmemNumQpPerPe = ShmemNumQpPerPe();
+  if (config.numQpPerPe > shmemNumQpPerPe) {
+    config.numQpPerPe = shmemNumQpPerPe;
+    MORI_OPS_INFO("numQpPerPe {} larger than shmem numQpPerPe {}, set to {}", config.numQpPerPe,
+                  shmemNumQpPerPe, shmemNumQpPerPe);
   }
 
   if (IsBlockwiseCombineQuant(config.quantType)) {
@@ -157,7 +137,7 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   // was tests that set MORI_ENABLE_SDMA inside the test function deadlocking
   // because Malloc started returning uncached buffers while Context still
   // believed the transport was P2P.
-  config.enableSdma = useCcoComm ? false : ShmemSdmaEnabled();
+  config.enableSdma = ShmemSdmaEnabled();
   MORI_OPS_INFO("EpDispatchCombine SDMA {} (currently only effective for AsyncLL kernel type)",
                 config.enableSdma ? "enabled" : "disabled");
   if (config.kernelType == KernelType::AsyncLL && !config.enableSdma && config.rank == 0) {
@@ -170,9 +150,7 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   // cross-node traffic through their same-rail proxy PE, so they are fine;
   // InterNode v0 and AsyncLL post straight to `destExpert / numExpertPerRank`,
   // which lands on an unconnected QP and hangs. Fail at construction instead.
-  // Shmem backend only: cross-node handles on the CCO backend are rejected at the top of the
-  // constructor.
-  if (!useCcoComm && config.worldSize > config.gpuPerNode && ShmemRailOnly() &&
+  if (config.worldSize > config.gpuPerNode && ShmemRailOnly() &&
       (config.kernelType == KernelType::InterNode || config.kernelType == KernelType::AsyncLL)) {
     throw std::runtime_error(
         "MORI_ENABLE_RAIL_ONLY is set, but kernelType=" +
@@ -231,11 +209,9 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
-  if (!useCcoComm) {
-    auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
-    if (states->status != mori::shmem::ShmemStatesStatus::Initialized) {
-      return;
-    }
+  auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
+  if (states->status != mori::shmem::ShmemStatesStatus::Initialized) {
+    return;
   }
   hipDeviceSynchronize();
   (void)hipGetLastError();
@@ -243,115 +219,20 @@ EpDispatchCombineHandle::~EpDispatchCombineHandle() {
   FinalizeTokenNumSignalBuf();
   FinalizeOrderMapBuf();
   FinalizeBarrier();
-  // Release any cco symmetric resources not already freed by the Finalize*Buf
-  // routines (all symmetric frees route through FreeSymm; this is a safety net).
-  if (useCcoComm) FinalizeCcoAllocs();
 }
 
 mori::application::SymmMemObjPtr EpDispatchCombineHandle::MallocSymm(size_t size,
                                                                      unsigned int flags) {
-  if (!useCcoComm) {
-    void* buf = ShmemExtMallocWithFlags(size, flags);
-    HIP_RUNTIME_CHECK(hipMemset(buf, 0, size));
-    mori::application::SymmMemObjPtr obj = ShmemQueryMemObjPtr(buf);
-    assert(obj.IsValid());
-    return obj;
-  }
-
-  // CCO backend: carve every symmetric buffer out of ONE LSA window (bump
-  // allocator). gfx942/ROCm fails hipMemSetAccess after a few *separate* VMM
-  // allocations, so we mirror FlyDSL's SymmArena: a single ccoWindowRegister,
-  // then sub-regions addressed by offset. Peer flat-VA of a sub-region is just
-  // ccoGetPeerPtr(subLocalPtr, pe), so kernels' GetAs<T*>(pe) work unchanged.
-  auto* comm = reinterpret_cast<mori::cco::ccoComm*>(ccoCommPtr);
-  if (ccoArenaLocalPtr == nullptr) {
-    ccoArenaSize = 6ull * static_cast<size_t>(config.MaxNumTokensToRecv()) * config.HiddenDimSz() *
-                       static_cast<size_t>(config.maxTokenTypeSize) +
-                   (static_cast<size_t>(256) << 20);
-    mori::cco::ccoWindow_t awin = nullptr;
-    void* aptr = nullptr;
-    int rc = mori::cco::ccoWindowRegister(comm, ccoArenaSize, &awin, &aptr);
-    if (rc != 0 || aptr == nullptr) {
-      throw std::runtime_error("MallocSymm: cco arena register failed (rc=" + std::to_string(rc) +
-                               ")");
-    }
-    ccoArenaWin = reinterpret_cast<void*>(awin);
-    ccoArenaLocalPtr = aptr;
-    ccoArenaBump = 0;
-    HIP_RUNTIME_CHECK(hipMemset(aptr, 0, ccoArenaSize));
-  }
-
-  const size_t kAlign = 256;
-  const size_t aligned = (size + kAlign - 1) & ~(kAlign - 1);
-  if (ccoArenaBump + aligned > ccoArenaSize) {
-    throw std::runtime_error("MallocSymm: cco arena exhausted (need " + std::to_string(aligned) +
-                             ", have " + std::to_string(ccoArenaSize - ccoArenaBump) + ")");
-  }
-  void* localPtr = static_cast<char*>(ccoArenaLocalPtr) + ccoArenaBump;
-  ccoArenaBump += aligned;  // sub-region already zeroed by the arena memset
-
-  const int ws = config.worldSize;
-  std::vector<uintptr_t> peers(ws);
-  for (int pe = 0; pe < ws; ++pe) {
-    peers[pe] = reinterpret_cast<uintptr_t>(mori::cco::ccoGetPeerPtr(comm, localPtr, pe));
-  }
-  uintptr_t* p2pDev = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&p2pDev, ws * sizeof(uintptr_t)));
-  HIP_RUNTIME_CHECK(hipMemcpy(p2pDev, peers.data(), ws * sizeof(uintptr_t), hipMemcpyHostToDevice));
-
-  auto* cpuObj = new mori::application::SymmMemObj();
-  cpuObj->localPtr = localPtr;
-  cpuObj->p2pPeerPtrs = p2pDev;  // device array; only dereferenced on device
-  cpuObj->size = size;
-  cpuObj->worldSize = ws;
-  mori::application::SymmMemObj* gpuObj = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&gpuObj, sizeof(mori::application::SymmMemObj)));
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(gpuObj, cpuObj, sizeof(mori::application::SymmMemObj), hipMemcpyHostToDevice));
-
-  // win=nullptr marks a sub-region (arena window is freed once in FinalizeCcoAllocs).
-  ccoAllocs.push_back(CcoSymmAlloc{nullptr, localPtr, cpuObj, gpuObj, p2pDev});
-
-  mori::application::SymmMemObjPtr obj;
-  obj.cpu = cpuObj;
-  obj.gpu = gpuObj;
+  void* buf = ShmemExtMallocWithFlags(size, flags);
+  HIP_RUNTIME_CHECK(hipMemset(buf, 0, size));
+  mori::application::SymmMemObjPtr obj = ShmemQueryMemObjPtr(buf);
+  assert(obj.IsValid());
   return obj;
 }
 
 void EpDispatchCombineHandle::FreeSymmByLocalPtr(void* localPtr) {
   if (localPtr == nullptr) return;
-  if (!useCcoComm) {
-    mori::shmem::ShmemFree(localPtr);
-    return;
-  }
-  // Sub-region: drop only its shadow objects; the shared arena window is released
-  // once in FinalizeCcoAllocs.
-  for (size_t i = 0; i < ccoAllocs.size(); ++i) {
-    if (ccoAllocs[i].localPtr != localPtr) continue;
-    CcoSymmAlloc a = ccoAllocs[i];
-    if (a.gpuObj) (void)hipFree(a.gpuObj);
-    if (a.p2pDev) (void)hipFree(a.p2pDev);
-    delete a.cpuObj;
-    ccoAllocs.erase(ccoAllocs.begin() + i);
-    break;
-  }
-}
-
-void EpDispatchCombineHandle::FinalizeCcoAllocs() {
-  if (!useCcoComm) return;
-  auto* comm = reinterpret_cast<mori::cco::ccoComm*>(ccoCommPtr);
-  for (auto& a : ccoAllocs) {
-    if (a.gpuObj) (void)hipFree(a.gpuObj);
-    if (a.p2pDev) (void)hipFree(a.p2pDev);
-    delete a.cpuObj;
-  }
-  ccoAllocs.clear();
-  if (ccoArenaWin != nullptr) {
-    mori::cco::ccoWindowDeregister(comm, reinterpret_cast<mori::cco::ccoWindow_t>(ccoArenaWin));
-    if (ccoArenaLocalPtr) mori::cco::ccoMemFree(comm, ccoArenaLocalPtr);
-    ccoArenaWin = nullptr;
-    ccoArenaLocalPtr = nullptr;
-  }
+  mori::shmem::ShmemFree(localPtr);
 }
 
 void EpDispatchCombineHandle::InitializeShmemBuf() {
