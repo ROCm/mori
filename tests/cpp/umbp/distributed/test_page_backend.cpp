@@ -508,6 +508,55 @@ TEST(PageBackend, PendingSlotExpiresAfterTtl) {
   EXPECT_EQ(cap.available_bytes, cap.total_bytes);
 }
 
+TEST(PageBackend, PendingEngineWriteHoldSurvivesTtlAbortAndClear) {
+  auto now = std::chrono::steady_clock::time_point{};
+  auto a = MakeAllocator(std::chrono::milliseconds{10});
+  a->SetClockForTest([&] { return now; });
+  const uint64_t available = a->Capacity().available_bytes;
+
+  AllocateRequest request{"engine-write", kPageSize, -1, false,
+                          /*acquire_write_hold=*/true};
+  auto allocation = a->BatchAllocate({request}).front();
+  ASSERT_EQ(allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(allocation.write_hold);
+  EXPECT_EQ(a->Capacity().available_bytes, available - kPageSize);
+
+  now += std::chrono::seconds(1);
+  a->ClearLocal();
+  a->RunReaperOnceForTest();
+  EXPECT_EQ(a->Capacity().available_bytes, available - kPageSize);
+  EXPECT_FALSE(a->BatchAbort({allocation.slot_id}).front());
+
+  ASSERT_TRUE(a->FinishPendingWrite(allocation.slot_id, allocation.write_hold,
+                                    PendingWriteOutcome::kCompleted));
+  EXPECT_TRUE(a->BatchAbort({allocation.slot_id}).front());
+  EXPECT_EQ(a->Capacity().available_bytes, available);
+}
+
+TEST(PageBackend, UnknownPendingEngineWriteMovesSameHoldIntoQuarantine) {
+  auto now = std::chrono::steady_clock::time_point{};
+  auto a = MakeAllocator(std::chrono::milliseconds{10});
+  a->SetClockForTest([&] { return now; });
+  const uint64_t available = a->Capacity().available_bytes;
+
+  AllocateRequest request{"unknown-write", kPageSize, -1, false,
+                          /*acquire_write_hold=*/true};
+  auto allocation = a->BatchAllocate({request}).front();
+  ASSERT_TRUE(allocation.write_hold);
+  now += std::chrono::seconds(1);
+  a->RunReaperOnceForTest();
+  EXPECT_EQ(a->Capacity().available_bytes, available - kPageSize);
+
+  ASSERT_TRUE(a->FinishPendingWrite(allocation.slot_id, allocation.write_hold,
+                                    PendingWriteOutcome::kUnknown));
+  allocation.write_hold.reset();
+  a->RunReaperOnceForTest();
+  EXPECT_EQ(a->QuarantinedPendingCountForTest(), 1u);
+  EXPECT_EQ(a->Capacity().available_bytes, available - kPageSize);
+  EXPECT_TRUE(a->BatchAbort({allocation.slot_id}).front());
+  EXPECT_EQ(a->Capacity().available_bytes, available - kPageSize);
+}
+
 // ---- Abort idempotency ------------------------------------------------------
 
 TEST(PageBackend, AbortIsIdempotent) {

@@ -69,6 +69,7 @@ class InstrumentedBackend final : public MediumBackend {
   // ---- identity: pass-through, and the source of the metric labels ----
   TierType Tier() const override { return inner_->Tier(); }
   const char* Name() const override { return inner_->Name(); }
+  void SetBackendId(uint32_t backend_id) override { inner_->SetBackendId(backend_id); }
 
   // ---- ownership ----
   bool Init(MemoryRegistrar* registrar) override;
@@ -122,6 +123,10 @@ class InstrumentedBackend final : public MediumBackend {
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& reqs) override;
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& reqs) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
+  bool FinishPendingWrite(uint64_t slot_id, const std::shared_ptr<const void>& hold,
+                          PendingWriteOutcome outcome) override {
+    return inner_->FinishPendingWrite(slot_id, hold, outcome);
+  }
   std::vector<ResolvedEntry> BatchResolve(
       const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
       ResolveReader reader = ResolveReader::kRemote,
@@ -130,6 +135,7 @@ class InstrumentedBackend final : public MediumBackend {
 
   // ---- bootstrap / local endpoints: pass-through ----
   uint64_t PageSize() const override { return inner_->PageSize(); }
+  bool HasIndependentGeometry() const override { return inner_->HasIndependentGeometry(); }
   std::vector<BufferMemoryDescBytes> AllBufferDescs() const override {
     return inner_->AllBufferDescs();
   }

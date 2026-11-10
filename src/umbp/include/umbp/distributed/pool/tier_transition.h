@@ -38,6 +38,11 @@ enum class TierTransitionKind {
   kPromotion,
 };
 
+// Explicit data-retention intent. Copy is used by proactive cleaning and keeps
+// the source resident; Move is used by demotion/retirement and releases it only
+// after the target commit succeeds.
+enum class TierTransitionIntent { kCopy, kMove };
+
 struct TierTransitionResult {
   bool success = false;
   uint32_t target_backend_id = BackendRegistry::kMaxBackends;
@@ -61,6 +66,12 @@ class TierTransitionExecutor {
   TierTransitionResult Execute(const std::string& key, uint32_t source_backend_id,
                                const std::vector<uint32_t>& target_backend_ids,
                                bool remove_source) const;
+  TierTransitionResult Execute(const std::string& key, uint32_t source_backend_id,
+                               const std::vector<uint32_t>& target_backend_ids,
+                               TierTransitionIntent intent) const {
+    return Execute(key, source_backend_id, target_backend_ids,
+                   intent == TierTransitionIntent::kMove);
+  }
 
  private:
   static bool BuildTransfers(MediumBackend* source, const ResolvedEntry& resolved,

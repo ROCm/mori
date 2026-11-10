@@ -407,11 +407,11 @@ void HostPageMemorySource::Release() {
 
 AllocateResult PageBackend::Allocate(const std::string& key, uint64_t size) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
-  return AllocateLocked(key, size);
+  return AllocateLocked(key, size, -1, false);
 }
 
 AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size,
-                                           int preferred_numa_node) {
+                                           int preferred_numa_node, bool acquire_write_hold) {
   auto fail = [&](AllocateOutcome outcome, const char* reason) {
     // A full tier fails every put and promotion; log a sample, not each key,
     // since this runs under the exclusive lock.
@@ -480,8 +480,9 @@ AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size
   slot.slot_id = next_slot_id_.fetch_add(1, std::memory_order_relaxed);
   slot.pages = std::move(*pages);
   slot.size = size;
-  slot.deadline = std::chrono::steady_clock::now() + pending_ttl_;
+  slot.deadline = Now() + pending_ttl_;
   slot.generation = allocator_generation_;
+  if (acquire_write_hold) slot.write_hold = std::make_shared<char>();
   const uint64_t slot_id = slot.slot_id;
   const auto slot_pages = slot.pages;
   pending_[slot_id] = std::move(slot);
@@ -492,7 +493,10 @@ AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size
   out.pages = slot_pages;
   out.size = size;
   out.page_size = page_size_;
+  out.view = BuildPageObjectView(out.pages, page_size_, out.size, "page-backend-v1",
+                                 [this](uint32_t i) { return BufferRef(i); });
   out.pending_ttl_ms = PendingTtlMs();
+  out.write_hold = pending_[slot_id].write_hold;
   return out;
 }
 
@@ -502,7 +506,8 @@ std::vector<AllocateResult> PageBackend::BatchAllocate(
   if (entries.empty()) return out;
   std::unique_lock<std::shared_mutex> lock(mutex_);
   for (size_t i = 0; i < entries.size(); ++i) {
-    out[i] = AllocateLocked(entries[i].key, entries[i].size, entries[i].preferred_numa_node);
+    out[i] = AllocateLocked(entries[i].key, entries[i].size, entries[i].preferred_numa_node,
+                            entries[i].acquire_write_hold);
     if (out[i].outcome == AllocateOutcome::kSuccessAllocated) {
       out[i].descs = BuildBufferDescsLocked(out[i].pages);
     }
@@ -525,6 +530,11 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
   auto it = pending_.find(slot_id);
   if (it == pending_.end()) {
     MORI_UMBP_WARN("[PageBackend] Commit reason=SLOT_GONE key='{}' slot_id={}", key, slot_id);
+    return false;
+  }
+
+  if (it->second.write_hold && !it->second.write_outcome.has_value()) {
+    MORI_UMBP_WARN("[PageBackend] Commit reason=WRITE_IN_FLIGHT key='{}' slot_id={}", key, slot_id);
     return false;
   }
 
@@ -553,7 +563,9 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
   OwnedSlot owned;
   owned.pages = std::move(it->second.pages);
   owned.size = it->second.size;
-  owned.hold = std::make_shared<char>();
+  owned.hold = it->second.write_hold
+                   ? std::move(it->second.write_hold)
+                   : std::static_pointer_cast<const void>(std::make_shared<char>());
   QueueEventLocked(KvEvent{KvEvent::Kind::ADD, key, tier_, owned.size});
   owned_[key] = std::move(owned);
   TouchLru(key, owned_[key]);
@@ -580,6 +592,10 @@ bool PageBackend::Abort(uint64_t slot_id) {
 bool PageBackend::AbortLocked(uint64_t slot_id) {
   auto it = pending_.find(slot_id);
   if (it == pending_.end()) return true;  // already reaped / aborted — idempotent
+  if (it->second.write_hold && !it->second.write_outcome.has_value()) {
+    it->second.abort_requested = true;
+    return false;
+  }
   if (allocator_) allocator_->Deallocate(it->second.pages);
   pending_.erase(it);
   return true;
@@ -591,6 +607,25 @@ std::vector<bool> PageBackend::BatchAbort(const std::vector<uint64_t>& slot_ids)
   std::unique_lock<std::shared_mutex> lock(mutex_);
   for (size_t i = 0; i < slot_ids.size(); ++i) out[i] = AbortLocked(slot_ids[i]);
   return out;
+}
+
+bool PageBackend::FinishPendingWrite(uint64_t slot_id, const std::shared_ptr<const void>& hold,
+                                     PendingWriteOutcome outcome) {
+  if (!hold) return false;
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = pending_.find(slot_id);
+  if (it == pending_.end() || !it->second.write_hold || it->second.write_hold.get() != hold.get()) {
+    return false;
+  }
+  if (outcome == PendingWriteOutcome::kUnknown) {
+    quarantined_pending_.push_back(QuarantinedPending{it->second.slot_id,
+                                                      std::move(it->second.pages), it->second.size,
+                                                      std::move(it->second.write_hold)});
+    pending_.erase(it);
+    return true;
+  }
+  it->second.write_outcome = outcome;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -609,10 +644,12 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
   r.pages = it->second.pages;
   r.size = it->second.size;
   r.page_size = page_size_;
+  r.view = BuildPageObjectView(r.pages, page_size_, r.size, "page-backend-v1",
+                               [this](uint32_t i) { return BufferRef(i); });
   // Extend the read lease so concurrent Evict reports bytes_freed=0 for
   // this key.  CAS-max rather than a plain store: with a shared lock two
   // readers can renew the same key at once, and neither may shorten it.
-  RenewLeaseAtomic(it->second, SteadyNs(std::chrono::steady_clock::now() + read_lease_ttl_));
+  RenewLeaseAtomic(it->second, SteadyNs(Now() + read_lease_ttl_));
   TouchLru(key, it->second);
   return r;
 }
@@ -631,7 +668,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
   std::shared_lock<std::shared_mutex> lock(mutex_);
   // One now() for the batch: it runs in well under a millisecond against a
   // TTL measured in seconds, so the last key loses nothing worth a syscall.
-  const int64_t lease_deadline = SteadyNs(std::chrono::steady_clock::now() + read_lease_ttl_);
+  const int64_t lease_deadline = SteadyNs(Now() + read_lease_ttl_);
   // Collect the hits, then touch the LRU once for the whole batch instead of
   // taking lru_mutex_ per key.  Nothing here can invalidate the pointers: a
   // shared lock excludes every writer of owned_.
@@ -646,6 +683,8 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.pages = it->second.pages;
     entry.size = it->second.size;
     entry.page_size = page_size_;
+    entry.view = BuildPageObjectView(entry.pages, page_size_, entry.size, "page-backend-v1",
+                                     [this](uint32_t b) { return BufferRef(b); });
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
     if (reader == ResolveReader::kLocal) {
       entry.hold = it->second.hold;
@@ -672,7 +711,10 @@ bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* re
   resolved->pages = owned->second.pages;
   resolved->size = owned->second.size;
   resolved->page_size = page_size_;
-  pins_[key] = PinState{next_pin_token_++, std::chrono::steady_clock::now()};
+  resolved->view =
+      BuildPageObjectView(resolved->pages, page_size_, resolved->size, "page-backend-v1",
+                          [this](uint32_t i) { return BufferRef(i); });
+  pins_[key] = PinState{next_pin_token_++, Now()};
   return true;
 }
 
@@ -712,7 +754,7 @@ std::vector<EvictResult> PageBackend::Evict(const std::vector<std::string>& keys
       out.push_back(std::move(r));
       continue;
     }
-    if (HasActiveReadLeaseLocked(it->second, std::chrono::steady_clock::now())) {
+    if (HasActiveReadLeaseLocked(it->second, Now())) {
       // Master will retry next round once the lease expires.  Emit no event.
       out.push_back(std::move(r));
       continue;
@@ -743,7 +785,7 @@ bool PageBackend::HasActivePinLocked(const std::string& key) const {
 
 void PageBackend::ClearLocal() {
   std::unique_lock<std::shared_mutex> lock(mutex_);
-  const auto now = std::chrono::steady_clock::now();
+  const auto now = Now();
 
   // Pending slots become pre-clear via generation mismatch; their pages
   // stay reserved (RDMA write may still be in flight) and are freed by the
@@ -860,7 +902,7 @@ std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
   if (max_count == 0) return out;
   std::shared_lock<std::shared_mutex> lock(mutex_);
   if (!track_eviction_order_) return out;
-  const auto now = std::chrono::steady_clock::now();
+  const auto now = Now();
   std::lock_guard<std::mutex> lru_lock(lru_mutex_);
   for (auto it = lru_.rbegin(); it != lru_.rend() && out.size() < max_count; ++it) {
     auto owned_it = owned_.find(*it);
@@ -1045,12 +1087,16 @@ void PageBackend::ReaperLoop() {
 
 void PageBackend::ReaperSweep() {
   std::unique_lock<std::shared_mutex> lock(mutex_);
-  const auto now = std::chrono::steady_clock::now();
+  const auto now = Now();
 
   // Expire pending slots whose deadline has passed.  No event is emitted:
   // the slot was never owned, master never indexed it.
   for (auto it = pending_.begin(); it != pending_.end();) {
-    if (it->second.deadline <= now) {
+    if (it->second.deadline <= now || it->second.abort_requested) {
+      if (it->second.write_hold && it->second.write_hold.use_count() > 1) {
+        ++it;
+        continue;
+      }
       if (allocator_) allocator_->Deallocate(it->second.pages);
       MORI_UMBP_DEBUG("[PageBackend] reaped pending slot {} ({} bytes)", it->first,
                       it->second.size);

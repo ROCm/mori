@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "umbp/distributed/peer/backend/engine_hbm_backend.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/peer/backend/mock_backend.h"
 
@@ -78,6 +79,32 @@ TEST(BackendRegistryDispatch, NamedSameTierInstancesKeepDenseStableIds) {
   ASSERT_EQ(registry.All().size(), 2u);
   EXPECT_EQ(registry.All()[0], registry.Get("dram-primary"));
   EXPECT_EQ(registry.All()[1], registry.Get("dram-secondary"));
+}
+
+TEST(BackendRegistryDispatch, ResultGeometryAllowsDifferentBackendPageSizes) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM, 4096)));
+  engine::PageGeometry geometry;
+  geometry.page_tokens = 256;
+  geometry.num_pages = 1;
+  geometry.object_bytes = 1399040;
+  geometry.regions.push_back(
+      {"region", TransferRef::HostBytes(reinterpret_cast<void*>(1), 2 * geometry.object_bytes),
+       geometry.object_bytes, 1, 0, 0, "kv"});
+  engine::PoolEpoch epoch;
+  ASSERT_TRUE(registry.Register("engine-hbm",
+                                MakeEngineHbmBackend({"pool", epoch, 1, 0, std::move(geometry)})));
+  EXPECT_EQ(registry.Get("dram")->PageSize(), 4096u);
+  EXPECT_EQ(registry.Get("engine-hbm")->PageSize(), 1399040u);
+  // Kept only for the legacy uniform PageBackend handshake.
+  EXPECT_EQ(registry.PageSize(), 4096u);
+}
+
+TEST(BackendRegistryDispatch, LegacyBackendsStillRequireOneWirePageSize) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("a", std::make_unique<MockBackend>(TierType::DRAM, 4096)));
+  EXPECT_FALSE(registry.Register("b", std::make_unique<MockBackend>(TierType::SSD, 8192)));
+  EXPECT_EQ(registry.Size(), 1u);
 }
 
 // ---- Heartbeat event aggregation -------------------------------------------

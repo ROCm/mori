@@ -36,10 +36,18 @@
 
 #include "umbp/common/env_time.h"
 #include "umbp/common/parallel_for.h"
+#include "umbp/distributed/peer/backend/instrumented_backend.h"
 
 namespace mori::umbp {
 
 namespace {
+
+EngineHbmBackend* EngineBackend(MediumBackend* backend) {
+  if (auto* instrumented = dynamic_cast<InstrumentedBackend*>(backend)) {
+    backend = instrumented->Inner();
+  }
+  return dynamic_cast<EngineHbmBackend*>(backend);
+}
 
 // How long a retryable eviction demotion keeps retrying before its copy is
 // dropped.  Time, not a count: the faults it rides out last a wall-clock
@@ -207,6 +215,31 @@ uint32_t PeerPool::FindOwnerLocked(const std::string& key) const {
   return BackendRegistry::kMaxBackends;
 }
 
+void PeerPool::AddResidencyLocked(const std::string& key, uint32_t backend_id) {
+  if (backend_id >= BackendRegistry::kMaxBackends) return;
+  residencies_[key].insert(backend_id);
+}
+
+void PeerPool::RefreshResidenciesLocked(const std::string& key) {
+  std::unordered_set<uint32_t> live;
+  if (backends_ != nullptr) {
+    for (auto* backend : backends_->All()) {
+      if (backend != nullptr && backend->Contains(key)) live.insert(backends_->BackendId(backend));
+    }
+  }
+  if (live.empty()) {
+    residencies_.erase(key);
+    placements_.erase(key);
+    return;
+  }
+  residencies_[key] = live;
+  auto preferred = placements_.find(key);
+  if (preferred == placements_.end() || live.count(preferred->second) == 0) {
+    const uint32_t owner = FindOwnerLocked(key);
+    placements_[key] = owner == BackendRegistry::kMaxBackends ? *live.begin() : owner;
+  }
+}
+
 size_t PeerPool::EnqueueWatermarkCandidatesLocked(LogicalTierGraph::TierIndex tier_index,
                                                   size_t max_count) {
   if (tier_graph_ == nullptr || max_count == 0) return 0;
@@ -268,15 +301,17 @@ bool PeerPool::WatermarkDrivenLocked(const TransitionJob& job) const {
 PeerPool::TransitionPlan PeerPool::PlanTransitionLocked(const TransitionJob& job) {
   TransitionPlan plan;
   if (tier_graph_ == nullptr) return plan;
-  auto placement = placements_.find(job.key);
-  if (placement == placements_.end() || placement->second != job.source_backend_id) {
+  auto resident = residencies_.find(job.key);
+  if (resident == residencies_.end() || resident->second.count(job.source_backend_id) == 0) {
     return plan;
   }
   if (!migrating_keys_.insert(job.key).second) return plan;
 
   const bool promotion = job.kind == TierTransitionKind::kPromotion;
   const auto& source_tier = tier_graph_->NodeAt(job.source_tier);
-  plan.remove_source = !promotion || source_tier.promote_mode == PoolTransitionMode::kMove;
+  plan.remove_source = job.intent.has_value()
+                           ? *job.intent == TierTransitionIntent::kMove
+                           : (!promotion || source_tier.promote_mode == PoolTransitionMode::kMove);
   plan.targets = promotion ? tier_graph_->PromoteTargetOrder(job.source_tier, job.key)
                            : tier_graph_->TransitionTargetOrder(job.source_tier, job.key);
   plan.valid = true;
@@ -300,6 +335,14 @@ void PeerPool::FinishTransitionLocked(const TransitionJob& job,
     ++transition_metrics_.failed;
     if (job.kind == TierTransitionKind::kPromotion) ++transition_metrics_.promote_failed;
     return;
+  }
+  AddResidencyLocked(job.key, result.target_backend_id);
+  if (result.bytes_freed != 0) {
+    auto resident = residencies_.find(job.key);
+    if (resident != residencies_.end()) {
+      resident->second.erase(job.source_backend_id);
+      if (resident->second.empty()) residencies_.erase(resident);
+    }
   }
   ++transition_metrics_.succeeded;
   // The target medium just grew without passing through BatchCommit.
@@ -568,11 +611,19 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
     if (existing != placements_.end()) {
       auto* existing_backend = backends_->Get(existing->second);
       if (existing_backend != nullptr && existing_backend->Contains(requests[i].key)) {
+        AddResidencyLocked(requests[i].key, existing->second);
         out[i].backend_id = existing->second;
         out[i].allocation.outcome = AllocateOutcome::kSuccessAlreadyExists;
         continue;
       }
       placements_.erase(existing);
+      RefreshResidenciesLocked(requests[i].key);
+      auto repaired = placements_.find(requests[i].key);
+      if (repaired != placements_.end()) {
+        out[i].backend_id = repaired->second;
+        out[i].allocation.outcome = AllocateOutcome::kSuccessAlreadyExists;
+        continue;
+      }
     }
     auto pending = pending_keys_.find(requests[i].key);
     if (pending != pending_keys_.end()) {
@@ -598,6 +649,7 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
     const uint32_t owner = FindOwnerLocked(requests[i].key);
     if (owner != BackendRegistry::kMaxBackends) {
       placements_[requests[i].key] = owner;
+      AddResidencyLocked(requests[i].key, owner);
       out[i].backend_id = owner;
       out[i].allocation.outcome = AllocateOutcome::kSuccessAlreadyExists;
       continue;
@@ -671,6 +723,7 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
           }
           case AllocateOutcome::kSuccessAlreadyExists:
             placements_[requests[index].key] = backend_id;
+            AddResidencyLocked(requests[index].key, backend_id);
             pending_keys_.erase(requests[index].key);
             break;
           case AllocateOutcome::kFailed:
@@ -760,6 +813,7 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
         out[indices[i]].commit = backend_results[i];
         if (backend_results[i].success) {
           placements_[request.key] = backend_id;
+          AddResidencyLocked(request.key, backend_id);
           TouchLocked(request.key);
         }
       }
@@ -886,8 +940,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       if (EffectiveResolveOutcome(out[i].resolved) == ResolveOutcome::kBusy) continue;
       const auto placement = placements_.find(keys[i]);
       if (placement == placements_.end() || placement->second != direct_backend_id) continue;
-      placements_.erase(placement);
-      ForgetAccessLocked(keys[i]);
+      RefreshResidenciesLocked(keys[i]);
+      if (residencies_.find(keys[i]) == residencies_.end()) ForgetAccessLocked(keys[i]);
     }
     return out;
   }
@@ -1022,6 +1076,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       // never move the logical owner backwards to a source that is draining.
       const bool metadata_current = placement_unchanged(i);
       if (metadata_current) placements_[keys[i]] = out[i].backend_id;
+      AddResidencyLocked(keys[i], out[i].backend_id);
       // A concurrent discard may have removed the key entirely. Do not
       // resurrect only its LRU entry from a resolve that started earlier.
       const bool still_placed = metadata_current || placements_.find(keys[i]) != placements_.end();
@@ -1037,11 +1092,13 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       if (EffectiveResolveOutcome(out[i].resolved) == ResolveOutcome::kBusy) continue;
       if (repaired[i].has_value()) {
         placements_[keys[i]] = *repaired[i];
+        AddResidencyLocked(keys[i], *repaired[i]);
         continue;
       }
       // A key the backends no longer hold must leave the access index too, or
       // it accumulates there for the life of the process and skews LRU order.
       placements_.erase(keys[i]);
+      residencies_.erase(keys[i]);
       ForgetAccessLocked(keys[i]);
     }
   }
@@ -1100,6 +1157,80 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
   return out;
 }
 
+PublishResult PeerPool::PublishResident(uint32_t backend_id,
+                                        const std::vector<ResidentRecord>& records,
+                                        engine::OperationId operation) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  if (engine_backend == nullptr) return {};
+  auto result = engine_backend->PublishResident(records, operation);
+  if (!result.success) return result;
+  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+  for (const auto& record : records) {
+    AddResidencyLocked(record.key, backend_id);
+    placements_[record.key] = backend_id;
+    TouchLocked(record.key);
+  }
+  return result;
+}
+
+std::vector<GrantResult> PeerPool::AcquireEngineGrants(
+    uint32_t backend_id, const ReaderIdentity& reader,
+    const std::vector<engine::AllocationHandle>& handles, engine::OperationId operation,
+    GrantTable::Clock::time_point expires_at) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  return engine_backend == nullptr
+             ? std::vector<GrantResult>(handles.size())
+             : engine_backend->Acquire(reader, handles, operation, expires_at);
+}
+
+std::vector<GrantReleaseResult> PeerPool::ReleaseEngineGrants(uint32_t backend_id,
+                                                              const ReaderIdentity& reader,
+                                                              const std::vector<GrantId>& grants,
+                                                              engine::CompletionProof proof,
+                                                              engine::OperationId operation) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  return engine_backend == nullptr ? std::vector<GrantReleaseResult>(grants.size())
+                                   : engine_backend->Release(reader, grants, proof, operation);
+}
+
+engine::RetireTicket PeerPool::RetireEnginePages(
+    uint32_t backend_id, const std::vector<engine::AllocationHandle>& handles,
+    engine::OperationId operation) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  if (engine_backend == nullptr) {
+    return engine::RetireTicket{operation, handles, engine::RetireState::kQuarantined};
+  }
+  return engine_backend->Retire(handles, operation);
+}
+
+std::vector<engine::RetireTicket> PeerPool::PollReadyEngineRetires(uint32_t backend_id) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  return engine_backend == nullptr ? std::vector<engine::RetireTicket>{}
+                                   : engine_backend->PollReadyRetires();
+}
+
+bool PeerPool::AcknowledgeEngineReleased(uint32_t backend_id, engine::OperationId operation) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  if (engine_backend == nullptr) return false;
+  const auto keys = engine_backend->RetireKeys(operation);
+  if (keys.empty() || !engine_backend->AcknowledgeReleased(operation)) return false;
+  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+  for (const auto& key : keys) RefreshResidenciesLocked(key);
+  return true;
+}
+
+void PeerPool::AdvanceEngineAckWatermark(uint32_t backend_id, engine::OperationId watermark) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  auto* engine_backend = backends_ == nullptr ? nullptr : EngineBackend(backends_->Get(backend_id));
+  if (engine_backend != nullptr) engine_backend->AdvanceAckWatermark(watermark);
+}
+
 uint32_t PeerPool::EvictSourceLocked(const PoolEvictRequest& request) const {
   constexpr uint32_t kNone = BackendRegistry::kMaxBackends;
   const auto holds = [&](uint32_t backend_id) {
@@ -1130,17 +1261,8 @@ void PeerPool::RepairAfterDropLocked(const std::string& key) {
     }
     if (draining->second.empty()) draining_sources_.erase(draining);
   }
-  auto placement = placements_.find(key);
-  if (placement != placements_.end()) {
-    auto* backend = backends_->Get(placement->second);
-    if (backend != nullptr && backend->Contains(key)) return;
-  }
-  const uint32_t owner = FindOwnerLocked(key);
-  if (owner != BackendRegistry::kMaxBackends) {
-    placements_[key] = owner;
-    return;
-  }
-  placements_.erase(key);
+  RefreshResidenciesLocked(key);
+  if (residencies_.find(key) != residencies_.end()) return;
   ForgetAccessLocked(key);
   draining_sources_.erase(key);
 }
@@ -1540,6 +1662,7 @@ void PeerPool::ClearLocal() {
     for (auto* backend : backends_->All()) backend->ClearLocal();
   }
   placements_.clear();
+  residencies_.clear();
   draining_sources_.clear();
   pending_keys_.clear();
   pending_slots_.clear();
@@ -1631,6 +1754,15 @@ std::optional<uint32_t> PeerPool::PlacementBackend(const std::string& key) const
   std::lock_guard<std::mutex> lock(operation_mutex_);
   auto it = placements_.find(key);
   return it == placements_.end() ? std::nullopt : std::optional<uint32_t>{it->second};
+}
+
+std::vector<uint32_t> PeerPool::ResidencyBackends(const std::string& key) const {
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  auto it = residencies_.find(key);
+  if (it == residencies_.end()) return {};
+  std::vector<uint32_t> out(it->second.begin(), it->second.end());
+  std::sort(out.begin(), out.end());
+  return out;
 }
 
 size_t PeerPool::PlacementCount() const {

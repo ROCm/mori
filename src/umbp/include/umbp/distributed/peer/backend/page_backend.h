@@ -266,6 +266,8 @@ class PageBackend : public MediumBackend {
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override;
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
+  bool FinishPendingWrite(uint64_t slot_id, const std::shared_ptr<const void>& hold,
+                          PendingWriteOutcome outcome) override;
   std::vector<ResolvedEntry> BatchResolve(
       const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
       ResolveReader reader = ResolveReader::kRemote,
@@ -326,6 +328,12 @@ class PageBackend : public MediumBackend {
 
   // Test seam: run one reaper sweep synchronously without the thread.
   void RunReaperOnceForTest() { ReaperSweep(); }
+  using ClockFn = std::function<std::chrono::steady_clock::time_point()>;
+  void SetClockForTest(ClockFn clock) { clock_ = std::move(clock); }
+  size_t QuarantinedPendingCountForTest() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return quarantined_pending_.size();
+  }
 
  private:
   // Lifecycle is owned by Init/Shutdown, not by the caller.  Both are
@@ -341,6 +349,16 @@ class PageBackend : public MediumBackend {
     // Snapshot of allocator_generation_ at Allocate().  Commit() rejects
     // slots whose generation no longer matches the current.
     uint64_t generation = 0;
+    std::shared_ptr<const void> write_hold;
+    std::optional<PendingWriteOutcome> write_outcome;
+    bool abort_requested = false;
+  };
+
+  struct QuarantinedPending {
+    uint64_t slot_id = 0;
+    std::vector<PageLocation> pages;
+    uint64_t size = 0;
+    std::shared_ptr<const void> write_hold;
   };
 
   struct OwnedSlot {
@@ -408,8 +426,8 @@ class PageBackend : public MediumBackend {
     }
   }
 
-  AllocateResult AllocateLocked(const std::string& key, uint64_t size,
-                                int preferred_numa_node = -1);
+  AllocateResult AllocateLocked(const std::string& key, uint64_t size, int preferred_numa_node = -1,
+                                bool acquire_write_hold = false);
   bool CommitLocked(uint64_t slot_id, const std::string& key, uint64_t& bytes_committed);
   bool AbortLocked(uint64_t slot_id);
 
@@ -448,6 +466,9 @@ class PageBackend : public MediumBackend {
 
   void ReaperLoop();
   void ReaperSweep();
+  std::chrono::steady_clock::time_point Now() const {
+    return clock_ ? clock_() : std::chrono::steady_clock::now();
+  }
 
   // ---- eviction order (see TrackEvictionOrder) ----
 
@@ -501,6 +522,7 @@ class PageBackend : public MediumBackend {
   std::vector<TransferRef> buffer_refs_;
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
+  std::vector<QuarantinedPending> quarantined_pending_;
   std::unordered_map<std::string, OwnedSlot> owned_;
   std::vector<KvEvent> pending_events_;
 
@@ -542,6 +564,7 @@ class PageBackend : public MediumBackend {
   uint64_t alloc_failures_ = 0;  // guarded by mutex_; samples the Allocate WARN
 
   std::atomic<uint64_t> next_slot_id_{1};
+  ClockFn clock_;
 
   // Set by ClearLocal(), cleared by ClearFullSyncAcked().  Gates Allocate()
   // so no new owned key appears between local clear and the first acked

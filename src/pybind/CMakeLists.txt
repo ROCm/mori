@@ -70,7 +70,8 @@ endif()
 # UMBP is its own module: it links gRPC/Protobuf, which importing mori.ops/io/shmem
 # must not require. mori.cpp loads it on first access to a name it lacks.
 if(BUILD_UMBP)
-  add_library(mori_umbp_pybinds SHARED mori_umbp.cpp pybind_umbp.cpp)
+  add_library(mori_umbp_pybinds SHARED mori_umbp.cpp pybind_umbp.cpp
+                                          pybind_umbp_engine.cpp)
   mori_pybind_module(mori_umbp_pybinds)
   target_link_libraries(mori_umbp_pybinds umbp_core umbp_common mori_io)
   target_compile_definitions(mori_umbp_pybinds PRIVATE MORI_BUILD_UMBP)

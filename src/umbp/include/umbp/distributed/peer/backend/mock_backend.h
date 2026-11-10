@@ -48,9 +48,8 @@ namespace mori::umbp {
 // that a test can drive through BackendRegistry — not a no-op stub.
 class MockBackend : public MediumBackend {
  public:
-  // The registry requires every backend on a peer to agree on a page size, so
-  // a mock sharing a registry with a real page-based backend must be told which
-  // one to report.
+  // Legacy page-list backends sharing one peer wire agree on page size. Only a
+  // negotiated independent-geometry backend (EngineHbmBackend) may differ.
   explicit MockBackend(TierType tier, uint64_t page_size = 1)
       : tier_(tier), page_size_(page_size) {}
 

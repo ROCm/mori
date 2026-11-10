@@ -36,6 +36,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/metrics/component_metrics.h"
+#include "umbp/distributed/object_view.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
 
@@ -128,7 +129,12 @@ struct AllocateRequest {
   // The writer is a local file engine: a file-backed medium may hand out a
   // file range (AllocateResult::file_ref) instead of staged pages.
   bool allow_file_ref = false;
+  // Engine transition targets request an in-process pending-write hold. Legacy
+  // RPC allocations leave this false and retain their original TTL behavior.
+  bool acquire_write_hold = false;
 };
+
+enum class PendingWriteOutcome : uint8_t { kCompleted, kNeverSubmitted, kUnknown };
 
 // Populated fields below `outcome` are meaningful ONLY when
 // outcome == kSuccessAllocated.
@@ -146,6 +152,12 @@ struct AllocateResult {
   uint64_t pending_ttl_ms = 0;
   // Set instead of `pages` when the bytes go straight into the medium's file.
   TransferRef file_ref{};
+  // In-process physical view. Old peer wire users keep consuming pages and
+  // page_size; an engine-aware wire advertises this capability explicitly.
+  ObjectView view;
+  // Opaque identity shared with the pending slot. The engine executor keeps it
+  // through commit/abort; old wire users never receive one.
+  std::shared_ptr<const void> write_hold;
 };
 
 struct CommitRequest {
@@ -205,6 +217,7 @@ struct ResolvedEntry {
   // `size` stays the object's.  In-process only; not carried on the wire.
   uint64_t covered_offset = 0;
   uint64_t covered_size = 0;
+  ObjectView view;
 };
 
 inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
@@ -229,6 +242,9 @@ class MediumBackend : public MetricSource {
 
   virtual TierType Tier() const = 0;
   virtual const char* Name() const = 0;
+  // Assigned by BackendRegistry. Most backends stamp it only at the wire
+  // boundary; an engine allocation handle carries it end to end.
+  virtual void SetBackendId(uint32_t /*backend_id*/) {}
 
   // ---- ownership ----
 
@@ -354,6 +370,11 @@ class MediumBackend : public MetricSource {
   // is reserved for a state not currently produced.
   virtual std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) = 0;
 
+  virtual bool FinishPendingWrite(uint64_t /*slot_id*/, const std::shared_ptr<const void>& /*hold*/,
+                                  PendingWriteOutcome /*outcome*/) {
+    return false;
+  }
+
   // Look up keys and protect each hit from concurrent Evict: for the lease
   // window (kRemote), or while its `hold` lives (kLocal).  A kLocal batch too
   // big for a staged medium at once is published in part, the rest kBusy.
@@ -419,6 +440,10 @@ class MediumBackend : public MetricSource {
   // ResolvedEntry so a batch spanning backends stays self-describing.
   virtual uint64_t PageSize() const = 0;
 
+  // True only for a backend whose wire protocol carries per-object geometry
+  // and never interprets the legacy peer-global page_size field.
+  virtual bool HasIndependentGeometry() const { return false; }
+
   // Descs for ALL configured buffers, ascending by buffer_index, so a
   // first-contact writer can hydrate its peer-side cache in one round trip
   // instead of learning buffers one allocation at a time.
@@ -481,28 +506,33 @@ class BackendRegistry {
     auto existing = id_by_name_.find(name);
     const uint32_t replacing_id = existing == id_by_name_.end() ? kMaxBackends : existing->second;
 
-    // Every wire carrying pages has one peer-global page size. When replacing
-    // an entry, compare against the other live instances so replacing the sole
-    // backend may legitimately establish a new size.
     uint64_t expected_page_size = 0;
     for (const auto& entry : entries_) {
-      if (entry->backend_id == replacing_id) continue;
+      if (entry->backend_id == replacing_id || entry->backend->HasIndependentGeometry()) continue;
       expected_page_size = entry->backend->PageSize();
       break;
     }
-    if (expected_page_size != 0 && backend->PageSize() != expected_page_size) {
+    if (expected_page_size != 0 && backend->PageSize() != expected_page_size &&
+        !backend->HasIndependentGeometry()) {
       MORI_UMBP_ERROR(
-          "[BackendRegistry] backend '{}' tier={} page_size={} disagrees with the peer's "
-          "page_size={}; every instance on a node must agree",
-          name, static_cast<int>(tier), backend->PageSize(), expected_page_size);
+          "[BackendRegistry] legacy backend '{}' page_size={} disagrees with page_size={}; "
+          "only negotiated object-geometry backends may differ",
+          name, backend->PageSize(), expected_page_size);
       return false;
     }
 
     if (existing != id_by_name_.end()) {
       auto& entry = entries_[existing->second];
+      backend->SetBackendId(entry->backend_id);
       entry->tier = tier;
       entry->backend = std::move(backend);
-      page_size_ = entries_.front()->backend->PageSize();
+      page_size_ = 0;
+      for (const auto& live : entries_) {
+        if (!live->backend->HasIndependentGeometry()) {
+          page_size_ = live->backend->PageSize();
+          break;
+        }
+      }
       return true;
     }
 
@@ -515,10 +545,13 @@ class BackendRegistry {
     entry->backend_id = id;
     entry->name = std::move(name);
     entry->tier = tier;
+    backend->SetBackendId(id);
     entry->backend = std::move(backend);
     id_by_name_[entry->name] = id;
     entries_.push_back(std::move(entry));
-    page_size_ = entries_.front()->backend->PageSize();
+    if (!entries_.back()->backend->HasIndependentGeometry() && page_size_ == 0) {
+      page_size_ = entries_.back()->backend->PageSize();
+    }
     return true;
   }
 
@@ -532,7 +565,8 @@ class BackendRegistry {
     return kMaxBackends;
   }
 
-  // Uniform across every registered backend (see Register).  Zero when empty.
+  // Legacy peer-global page size. New code uses the page size or ObjectView on
+  // each result; this remains the first backend's size for old PageBackend wire.
   uint64_t PageSize() const { return page_size_; }
 
   // Null if the tier has no live backend on this peer — a normal condition

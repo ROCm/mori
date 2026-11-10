@@ -408,6 +408,7 @@ add_library(
   distributed/metrics/activity_summary.cpp
   distributed/peer/backend/page_backend.cpp
   distributed/peer/backend/hbm_backend.cpp
+  distributed/peer/backend/engine_hbm_backend.cpp
   distributed/peer/backend/ssd_backend.cpp
   distributed/peer/backend/instrumented_backend.cpp
   sim/sim.cpp
@@ -425,7 +426,9 @@ add_library(
   distributed/pool/policy_config.cpp
   distributed/pool/tier_graph.cpp
   distributed/pool/tier_transition.cpp
+  distributed/pool/grant_table.cpp
   distributed/pool/peer_pool.cpp
+  engine/kv_allocator.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
   distributed/pool_platform.cpp

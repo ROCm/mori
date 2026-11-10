@@ -815,6 +815,9 @@ void PromoteByCopy(PeerPool* pool, BackendRegistry* registry, const std::string&
   ASSERT_TRUE(pool->BatchResolve({key}, false).front().resolved.found);
   ASSERT_TRUE(registry->Get("hot")->Contains(key));
   ASSERT_TRUE(registry->Get("cold")->Contains(key));
+  EXPECT_EQ(pool->ResidencyBackends(key),
+            (std::vector<uint32_t>{registry->BackendId(registry->Get("hot")),
+                                   registry->BackendId(registry->Get("cold"))}));
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
 }
 
@@ -1297,6 +1300,8 @@ TEST(PeerPool, ReadPromotesWithMoveDropsSourceAndKeepsBytes) {
   EXPECT_FALSE(registry.Get("cold")->Contains("moved"));
   EXPECT_EQ(pool.PlacementBackend("moved"),
             std::optional<uint32_t>{registry.BackendId(registry.Get("hot"))});
+  EXPECT_EQ(pool.ResidencyBackends("moved"),
+            (std::vector<uint32_t>{registry.BackendId(registry.Get("hot"))}));
   auto target_ref = registry.Get("hot")->BufferRef(resolved.resolved.pages[0].buffer_index);
   ASSERT_TRUE(target_ref.HasHostPtr());
   EXPECT_EQ(std::string(static_cast<char*>(target_ref.host_ptr) +

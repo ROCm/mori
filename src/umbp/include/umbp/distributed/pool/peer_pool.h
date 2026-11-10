@@ -43,6 +43,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "umbp/distributed/peer/backend/engine_hbm_backend.h"
 #include "umbp/distributed/pool/pool_policy.h"
 #include "umbp/distributed/pool/tier_transition.h"
 
@@ -135,6 +136,23 @@ class PeerPool {
   // check discards. Takes no read lease, but renews recency: a client looks
   // keys up to load them next, and evicting them in between fails that load.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
+  PublishResult PublishResident(uint32_t backend_id, const std::vector<ResidentRecord>& records,
+                                engine::OperationId operation);
+  std::vector<GrantResult> AcquireEngineGrants(uint32_t backend_id, const ReaderIdentity& reader,
+                                               const std::vector<engine::AllocationHandle>& handles,
+                                               engine::OperationId operation,
+                                               GrantTable::Clock::time_point expires_at);
+  std::vector<GrantReleaseResult> ReleaseEngineGrants(uint32_t backend_id,
+                                                      const ReaderIdentity& reader,
+                                                      const std::vector<GrantId>& grants,
+                                                      engine::CompletionProof proof,
+                                                      engine::OperationId operation);
+  engine::RetireTicket RetireEnginePages(uint32_t backend_id,
+                                         const std::vector<engine::AllocationHandle>& handles,
+                                         engine::OperationId operation);
+  std::vector<engine::RetireTicket> PollReadyEngineRetires(uint32_t backend_id);
+  bool AcknowledgeEngineReleased(uint32_t backend_id, engine::OperationId operation);
+  void AdvanceEngineAckWatermark(uint32_t backend_id, engine::OperationId watermark);
   // Copies keys held on SSD into DRAM of the same tier, else of a tier above, so
   // the coming read is served from DRAM. The SSD copy stays, and the oldest
   // prefetched copies are dropped past `budget_bytes`. Returns the keys copied.
@@ -153,6 +171,7 @@ class PeerPool {
   std::string LogicalTierForBackend(uint32_t backend_id) const;
 
   std::optional<uint32_t> PlacementBackend(const std::string& key) const;
+  std::vector<uint32_t> ResidencyBackends(const std::string& key) const;
   size_t PlacementCount() const;
   TierTransitionMetrics TransitionMetrics() const;
   // Reads this peer served, by the logical tier that held the key. Says whether
@@ -194,6 +213,9 @@ class PeerPool {
     // An eviction demotion's retries are bounded by time from its first attempt.
     std::chrono::steady_clock::time_point first_attempt{};
     bool evict = false;  // from Evict(): ignores watermarks; drops once retries run out
+    // Set by an explicit caller (cleaning/retirement); absent preserves the
+    // tier graph's legacy promotion/offload policy.
+    std::optional<TierTransitionIntent> intent;
   };
 
   // What the copy phase needs, resolved while the pool lock is still held.
@@ -236,6 +258,8 @@ class PeerPool {
   // is process-local and can be stale or empty (after a restart, or once
   // another path evicted the key), so the backends are the authority.
   uint32_t FindOwnerLocked(const std::string& key) const;
+  void AddResidencyLocked(const std::string& key, uint32_t backend_id);
+  void RefreshResidenciesLocked(const std::string& key);
   // The backend holding the copy a request names, or kMaxBackends.
   uint32_t EvictSourceLocked(const PoolEvictRequest& request) const;
   // Re-points the placement at a surviving copy (or forgets the key); drops
@@ -274,9 +298,11 @@ class PeerPool {
   // it; later policies can shard the protected state by key without changing
   // the public interface.
   mutable std::mutex operation_mutex_;
-  // Every use is a point lookup, insert or erase. Keeping this unordered avoids
-  // string comparisons in BatchResolve's publish critical section.
+  // Preferred read/placement copy retained for legacy policy behavior.
   std::unordered_map<std::string, uint32_t> placements_;
+  // Authoritative local residency set. Copy transitions add a target without
+  // dropping the source; move transitions remove the source after commit.
+  std::unordered_map<std::string, std::unordered_set<uint32_t>> residencies_;
   // A migration may install its target while an independent read lease delays
   // source deletion. Eviction retries must drain only that source, never fan
   // out and delete the durable target.

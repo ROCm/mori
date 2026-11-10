@@ -471,6 +471,26 @@ target_link_libraries(test_page_backend PRIVATE umbp_common
 target_compile_features(test_page_backend PRIVATE cxx_std_17)
 add_test(NAME test_page_backend COMMAND test_page_backend)
 
+add_executable(test_object_view test_object_view.cpp)
+target_link_libraries(test_object_view PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_object_view PRIVATE cxx_std_17)
+add_test(NAME umbp_object_view COMMAND test_object_view)
+
+add_executable(test_grant_table test_grant_table.cpp)
+target_link_libraries(test_grant_table PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_grant_table PRIVATE cxx_std_17)
+add_test(NAME umbp_grant_table COMMAND test_grant_table)
+
+add_executable(test_engine_hbm_backend test_engine_hbm_backend.cpp)
+target_link_libraries(test_engine_hbm_backend PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_engine_hbm_backend PRIVATE cxx_std_17)
+add_test(NAME umbp_engine_hbm_backend COMMAND test_engine_hbm_backend)
+
+add_executable(test_kv_vmm_allocator test_kv_vmm_allocator.cpp)
+target_link_libraries(test_kv_vmm_allocator PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_kv_vmm_allocator PRIVATE cxx_std_17)
+add_test(NAME umbp_kv_vmm_allocator COMMAND test_kv_vmm_allocator)
+
 # BackendRegistry dispatch and the heartbeat event aggregation MediumBackend
 # absorbed from OwnedLocationSource. MockBackend is only the test double.
 add_executable(test_backend_registry test_backend_registry.cpp)

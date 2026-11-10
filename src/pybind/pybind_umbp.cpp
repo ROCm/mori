@@ -41,6 +41,7 @@ namespace mori {
 using namespace umbp;
 
 void RegisterMoriUmbp(py::module_& m) {
+  RegisterMoriUmbpEngine(m);
   py::enum_<HostBufferBacking>(m, "UMBPHostBufferBacking")
       .value("Anonymous", HostBufferBacking::kAnonymous)
       .value("AnonymousHugetlb", HostBufferBacking::kAnonymousHugetlb)

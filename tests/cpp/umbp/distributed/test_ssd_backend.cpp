@@ -251,9 +251,12 @@ TEST_F(SsdBackendTest, ExecutorDemotesAndPromotesWithoutStaging) {
   ASSERT_TRUE(dram->BatchCommit({CommitRequest{slot.slot_id, "k"}})[0].success);
 
   TierTransitionExecutor executor(&registry, &engine_);
-  ASSERT_TRUE(executor.Execute("k", dram_id, {ssd_id}, /*remove_source=*/true).success);
+  ASSERT_TRUE(executor.Execute("k", dram_id, {ssd_id}, TierTransitionIntent::kCopy).success);
+  EXPECT_TRUE(dram->Contains("k"));
+  EXPECT_TRUE(ssd->Contains("k"));
+  ASSERT_TRUE(executor.Execute("k", dram_id, {ssd_id}, TierTransitionIntent::kMove).success);
   EXPECT_FALSE(dram->Contains("k"));
-  ASSERT_TRUE(executor.Execute("k", ssd_id, {dram_id}, /*remove_source=*/true).success);
+  ASSERT_TRUE(executor.Execute("k", ssd_id, {dram_id}, TierTransitionIntent::kMove).success);
   EXPECT_FALSE(ssd->Contains("k"));
 
   const auto got = dram->BatchResolve({"k"}, false)[0];
@@ -310,7 +313,7 @@ TEST_F(SsdBackendTest, ReportsAnOutOfRangeBufferAsInvalid) {
 // The tier also runs inside other programs (sglang, embedded), so it leaves the
 // process-wide fd limit alone; UMBP's executables raise it in main().
 TEST_F(SsdBackendTest, LeavesTheOpenFileLimitToTheExecutable) {
-  struct rlimit original{};
+  struct rlimit original {};
   ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
   if (original.rlim_max == RLIM_INFINITY || original.rlim_max <= 1024) {
     GTEST_SKIP() << "hard RLIMIT_NOFILE " << original.rlim_max << " leaves nothing to test";
@@ -324,7 +327,7 @@ TEST_F(SsdBackendTest, LeavesTheOpenFileLimitToTheExecutable) {
   ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &low), 0);
 
   Start();
-  struct rlimit now{};
+  struct rlimit now {};
   ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &now), 0);
   EXPECT_EQ(now.rlim_cur, 1024u);
 

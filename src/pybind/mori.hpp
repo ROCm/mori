@@ -35,5 +35,6 @@ void RegisterXLAFFIOps(pybind11::module_& m);
 #endif
 #ifdef MORI_BUILD_UMBP
 void RegisterMoriUmbp(pybind11::module_& m);
+void RegisterMoriUmbpEngine(pybind11::module_& m);
 #endif
 }  // namespace mori

@@ -61,6 +61,9 @@ bool TierTransitionExecutor::BuildTransfers(MediumBackend* source, const Resolve
   }
 
   items->clear();
+  if (!resolved.view.empty() && !allocation.view.empty()) {
+    return BuildObjectViewTransfers(resolved.view, allocation.view, items);
+  }
   for (uint64_t copied = 0; copied < resolved.size;) {
     TransferItem item;
     uint64_t src_run = 0;
@@ -116,19 +119,36 @@ TierTransitionResult TierTransitionExecutor::Execute(
     if (target == nullptr || target == source) continue;
 
     auto allocations =
-        target->BatchAllocate({AllocateRequest{key, resolved.size, -1, source_reaches_files}});
+        target->BatchAllocate({AllocateRequest{key, resolved.size, -1, source_reaches_files,
+                                               /*acquire_write_hold=*/true}});
     if (allocations.empty()) continue;
     AllocateResult& allocation = allocations.front();
 
     if (allocation.outcome == AllocateOutcome::kSuccessAllocated) {
       std::vector<TransferItem> transfers;
-      if (!BuildTransfers(source, resolved, target, allocation, &transfers) ||
-          !transfer_engine_->Transfer(transfers, nullptr)) {
-        target->BatchAbort({allocation.slot_id});
+      if (!BuildTransfers(source, resolved, target, allocation, &transfers)) {
+        const bool quiesced = !allocation.write_hold ||
+                              target->FinishPendingWrite(allocation.slot_id, allocation.write_hold,
+                                                         PendingWriteOutcome::kNeverSubmitted);
+        if (quiesced) target->BatchAbort({allocation.slot_id});
+        result.retryable = true;
+        continue;
+      }
+      if (!transfer_engine_->Transfer(transfers, nullptr)) {
+        const bool quiesced = !allocation.write_hold ||
+                              target->FinishPendingWrite(allocation.slot_id, allocation.write_hold,
+                                                         PendingWriteOutcome::kCompleted);
+        if (quiesced) target->BatchAbort({allocation.slot_id});
         result.retryable = true;
         continue;
       }
       result.bytes_read += resolved.size;
+      if (allocation.write_hold &&
+          !target->FinishPendingWrite(allocation.slot_id, allocation.write_hold,
+                                      PendingWriteOutcome::kCompleted)) {
+        result.retryable = true;
+        continue;
+      }
       auto committed = target->BatchCommit({CommitRequest{allocation.slot_id, key}});
       if (committed.empty() || !committed.front().success) {
         target->BatchAbort({allocation.slot_id});
