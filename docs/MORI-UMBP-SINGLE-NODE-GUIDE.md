@@ -1,6 +1,6 @@
 # MORI UMBP Single-Node Smoke Test
 
-This guide documents how to run the single-node UMBP + SGLang correctness smoke test that ships with Mori. The flow mirrors the `umbp-single-node-launcher` skill and launches the [`run_umbp_single_node_hicache.sh`](https://github.com/ROCm/mori/blob/main/src/umbp/scripts/run_umbp_single_node_hicache.sh) helper script inside a ROCm container.
+This guide documents how to run the single-node UMBP + SGLang correctness smoke test that ships with Mori. It launches the [`run_umbp_single_node_hicache.sh`](https://github.com/ROCm/mori/blob/main/src/umbp/scripts/run_umbp_single_node_hicache.sh) helper script inside a ROCm container.
 
 Use the placeholders in this document to map the workflow to any target node. Every environment-dependent value is surfaced as an argument or environment variable; update those inputs and the script can run unchanged.
 
@@ -40,8 +40,8 @@ Export the variables below to adapt the run to your environment. The script read
 | Variable | Default in script | When to change | Example |
 | --- | --- | --- | --- |
 | `MODEL_PATH` | `/apps/data/models/DeepSeek-V3-0324` | Real checkpoint location. | `/apps/data/models/DeepSeek-V3-0324` |
-| `SGLANG_REPO` | `${NFS_BASE}/sglang` | Local SGLang checkout. | `/apps/ditian12/sglang` |
-| `MORI_REPO` | `${NFS_BASE}/mori` | Local Mori checkout. | `/apps/ditian12/mori` |
+| `SGLANG_REPO` | `${NFS_BASE}/sglang` | Local SGLang checkout. | `/nfs/sglang` |
+| `MORI_REPO` | `${NFS_BASE}/mori` | Local Mori checkout. | `/nfs/mori` |
 | `RESULTS_DIR` | `${USER_HOME}/umbp_single_node_results` | Where to store logs. | `/tmp/umbp_results` |
 | `ENABLE_DP` | `false` | Enable DP+EP mode. | `true` |
 | `DP_SIZE` | `8` | Data parallel group size. | `4` |
@@ -52,12 +52,13 @@ Export the variables below to adapt the run to your environment. The script read
 | `UMBP_NODE_ADDRESS` | `127.0.0.1` | IP advertised to clients. | `<node-ip>` |
 | `UMBP_IO_ENGINE_PORT` | `16000` | Hicache IO engine port. | `16010` |
 | `UMBP_PEER_SERVICE_PORT` | `17000` | Peer service port. | `17010` |
-| `UMBP_SSD_STAGING_BYTES` | `268435456` (256 MiB) | Size of the dedicated remote-SSD read staging buffer. Allocated **only** when SSD is enabled (DRAM-only runs allocate nothing and are unaffected). Raise for large-KV models so each read slot fits one key's value. | `268435456` |
 | `USE_DUMMY_WEIGHTS` | `false` | Skip checkpoint validation. | `true` |
 | `MEM_FRACTION_STATIC` | `0.7` | Fraction reserved for static allocations. | `0.6` |
 | `PROBE_MAX_TIME` | `300` | Timeout for probe request in seconds. | `600` |
 
-The script also respects `MORI_BRANCH`, `SGLANG_BRANCH`, and `MORI_PIP_FLAGS` if they are supplied.
+The script also respects `MORI_PIP_FLAGS` (extra flags for its `pip install` of mori,
+default `--no-build-isolation -v`) and `RUN_GSM8K`: by default it runs two GSM8K
+benchmark rounds after the probe; set `RUN_GSM8K=false` to skip them.
 
 ## Launch Steps
 
@@ -122,6 +123,5 @@ Make sure the directory exists and has enough space.
 - **UMBP master logs**: Saved alongside server logs when `START_UMBP_MASTER=true`.
 - **Model validation**: The script validates that `MODEL_PATH` contains `model-*.safetensors` when running with real weights.
 - **Probe failures**: Inspect the tail of the server log; the script prints it automatically on errors.
-- **Remote SSD reads silently recompute (`size_too_large`)**: A remote SSD read must fit a key's whole value into one slot, where `per_slot = ssd_staging_buffer_size / ssd_staging_buffer_slots` (defaults 256 MiB / 16 = 16 MiB). The single-key page KV for an MLA model ≈ `page_size × (kv_lora_rank + qk_rope_head_dim) × dtype_bytes × num_layers` (DeepSeek-V3 5-layer ≈ 360 KB; full R1/V3 61-layer ≈ 4.5 MB). If `per_slot` is smaller, the read is dropped and the block is recomputed — requests don't error, but `mori_umbp_ssd_read_total{status="size_too_large"}` climbs and hit rate/throughput fall. Fix: raise `UMBP_SSD_STAGING_BYTES` or lower `ssd_staging_buffer_slots` so `per_slot ≥` the single-key page KV. (`ssd_staging_buffer_size` is allocated only when SSD is enabled, separate from the general `staging_buffer_size`.)
 
-Refer back to this document whenever the single-node smoke test needs to be run or automated. For the original skill instructions see `/home/ditian12/.codex/skills/umbp-single-node-launcher/SKILL.md`.
+Refer back to this document whenever the single-node smoke test needs to be run or automated.
