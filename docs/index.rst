@@ -26,6 +26,18 @@ New to MORI? :doc:`Install it <installation>`, then work through the :doc:`quick
 
 .. toctree::
    :hidden:
+   :caption: MORI-FUSED
+
+   Guide <MORI-CCO-FUSED-OPS-GUIDE>
+   GEMM + all-reduce / reduce-scatter <fused-gemm-ar>
+   GEMM + all-to-all <fused-gemm-a2a>
+   GEMM + all-gather <fused-gemm-ag>
+   All-gather + GEMM <fused-ag-gemm>
+   All-to-all + GEMM <fused-a2a-gemm>
+   GEMM + all-gather benchmark <fused-gemm-ag-benchmark>
+
+.. toctree::
+   :hidden:
    :caption: MORI-SHMEM and MORI-IR
 
    SHMEM guide <MORI-SHMEM-GUIDE>
@@ -37,7 +49,6 @@ New to MORI? :doc:`Install it <installation>`, then work through the :doc:`quick
 
    CCO guide <MORI-CCO-GUIDE>
    Device API for FlyDSL and Triton <cco-device-api>
-   Fused GEMM + collective operators <MORI-CCO-FUSED-OPS-GUIDE>
    Examples <cco-examples>
    Benchmarks <cco-benchmarks>
 
@@ -98,6 +109,9 @@ Components
    * - **MORI-EP**
      - Intra and inter-node dispatch/combine kernels for MoE Expert Parallelism
      - :doc:`MORI-EP-GUIDE`, then :doc:`ep_backends` to choose between the original API and EPv2
+   * - **MORI-FUSED**
+     - GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, overlapping the transfer with the GEMM over the SDMA copy engines; built on MORI-CCO
+     - :doc:`MORI-CCO-FUSED-OPS-GUIDE`
    * - **MORI-SHMEM**
      - OpenSHMEM-style symmetric memory APIs for GPU memory and RDMA
      - :doc:`MORI-SHMEM-GUIDE`
@@ -105,8 +119,8 @@ Components
      - Device bitcode that lets Triton and other GPU kernel frameworks call the shmem and CCO device APIs
      - :doc:`MORI-IR-GUIDE`
    * - **MORI-CCO**
-     - Collective Communication Object: explicit-handle GPU communication (LSA / GDA / SDMA), and the fused GEMM + collective operators built on it
-     - :doc:`MORI-CCO-GUIDE`, :doc:`MORI-CCO-FUSED-OPS-GUIDE`
+     - Collective Communication Object: explicit-handle GPU communication (LSA / GDA / SDMA)
+     - :doc:`MORI-CCO-GUIDE`
    * - **MORI-IO**
      - Point-to-point communication library for KVCache transfer via RDMA/XGMI
      - :doc:`MORI-IO-GUIDE`

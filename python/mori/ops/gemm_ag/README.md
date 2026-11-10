@@ -7,7 +7,7 @@ FP8 inputs produce BF16 output; BF16 inputs support BF16 or FP32 output.
 Communication uses the output dtype.
 
 [`GemmAgOp`](#using-it) is the public entry point. See
-[benchmark commands](../../../../benchmark/cco/flydsl/gemm_ag/README.md) for the
+[benchmark commands](https://github.com/ROCm/mori/blob/main/benchmark/cco/flydsl/gemm_ag/README.md) for the
 benchmarks, and [Experiments](#experiments) for what was tried and why. The
 retained measurements show:
 
@@ -142,12 +142,12 @@ removed kernels are in this branch's history.
 
 | Source | Entry points |
 |---|---|
-| [_gemm_a16w16_8wave.py](_gemm_a16w16_8wave.py) | `compile_bf16_gemm_ag`, including local split-K partials |
-| [kernels_fused.py](kernels_fused.py) | FP8 `compile_fused_gemm_ag` and `compile_gemm_local` |
-| [kernels_sdma.py](kernels_sdma.py) | `build_sdma_phases` and `build_sdma_chunk_post` |
-| [layout.py](layout.py) | `ag_config`, window offsets and counter layout |
-| [op.py](op.py) | `GemmAgOp`, the public wrapper over all of the above |
-| [_credit.py](_credit.py) | the recv-reuse credit the fused GEMMs and `gather` carry |
+| [_gemm_a16w16_8wave.py](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/_gemm_a16w16_8wave.py) | `compile_bf16_gemm_ag`, including local split-K partials |
+| [kernels_fused.py](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/kernels_fused.py) | FP8 `compile_fused_gemm_ag` and `compile_gemm_local` |
+| [kernels_sdma.py](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/kernels_sdma.py) | `build_sdma_phases` and `build_sdma_chunk_post` |
+| [layout.py](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/layout.py) | `ag_config`, window offsets and counter layout |
+| [op.py](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/op.py) | `GemmAgOp`, the public wrapper over all of the above |
+| [_credit.py](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/_credit.py) | the recv-reuse credit the fused GEMMs and `gather` carry |
 
 - Configuration supports 2–8 ranks. M and N must be positive multiples of
   their tile dimensions; N need not be divisible by `world_size * block_n`.
@@ -510,19 +510,19 @@ The implementation depends on four distinct ordering contracts:
    a slower rank is still reading; the benchmark replays identical operands, so
    a stale read there was the right answer and nothing caught it.
 
-Coverage: [`test_gemm_ag.py`](../../../../tests/python/cco/test_gemm_ag.py)
+Coverage: [`test_gemm_ag.py`](https://github.com/ROCm/mori/blob/main/tests/python/cco/test_gemm_ag.py)
 holds everything that needs no process group -- the layout arithmetic, the
 LDS dependency model and the SDMA completion model (both execute the real
 kernel bodies against a model), the benchmark's validation contract, and the
 single-GPU GEMM numerics with exact small-integer references, changed inputs
 and poisoned buffers, split-K checked per partial plane.
-[`test_gemm_ag_op.py`](../../../../tests/python/cco/test_gemm_ag_op.py) runs
+[`test_gemm_ag_op.py`](https://github.com/ROCm/mori/blob/main/tests/python/cco/test_gemm_ag_op.py) runs
 `GemmAgOp` on 8 ranks from one spawn: every precision and mode, every bf16
 tile, chunk counts, back-to-back calls with a held rank with the credit on and
 off, alternating M, `self_test` and its teeth.
 
 Benchmark commands and options are maintained in the
-[benchmark README](../../../../benchmark/cco/flydsl/gemm_ag/README.md).
+[benchmark README](https://github.com/ROCm/mori/blob/main/benchmark/cco/flydsl/gemm_ag/README.md).
 Historical run archives are separate from the maintained source tree.
 
 ## Experiments
@@ -538,7 +538,7 @@ lossy-wire cases, inputs are BF16 and accumulation, output and wire are FP32.
 The separate [Flash subgraph](#flash-ratio-2-projection-order) uses its own
 model dimensions and conditions. The sections above hold the main transport
 comparison and the correctness requirements; the
-[benchmark commands](../../../../benchmark/cco/flydsl/gemm_ag/README.md) use the
+[benchmark commands](https://github.com/ROCm/mori/blob/main/benchmark/cco/flydsl/gemm_ag/README.md) use the
 maintained kernel interfaces directly.
 
 ### Measurement conditions
@@ -871,7 +871,7 @@ studies above compare against have since been removed from the operator and
 the benchmark; reproducing those rows needs this branch's history before the
 removal. Use `bench_gemm_ag.py` for single-stream transports and
 `bench_gemm_ag_pipeline.py` for two-stream MORI, split-K and Torch backends;
-see the [command reference](../../../../benchmark/cco/flydsl/gemm_ag/README.md).
+see the [command reference](https://github.com/ROCm/mori/blob/main/benchmark/cco/flydsl/gemm_ag/README.md).
 The retained interfaces include local `split_k=2/4/8` partials,
 `build_sdma_chunk_post` and `fence="release"`. Defaults were not changed.
 `build_sdma_chunk_post` serves the two-stream pipeline experiment only and

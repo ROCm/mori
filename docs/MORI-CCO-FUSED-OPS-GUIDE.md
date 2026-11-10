@@ -1,4 +1,4 @@
-# MORI Fused GEMM + Collective Guide
+# MORI-FUSED: Fused GEMM + Collective Operators
 
 MORI fuses six collective patterns with the GEMM next to them, in one node,
 over the SDMA copy engines. Each one is a Python operator built on
@@ -20,12 +20,13 @@ transfer run back to back over the same window) as a baseline and a fallback.
 All measurements are on **MI355X (gfx950)**.
 
 Each operator's README, next to its code, has the full design, every
-measurement table and the negative results:
-[`gemm_ar`](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ar/README.md),
-[`gemm_a2a`](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_a2a/README.md),
-[`gemm_ag`](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/README.md),
-[`ag_gemm`](https://github.com/ROCm/mori/blob/main/python/mori/ops/ag_gemm/README.md),
-[`a2a_gemm`](https://github.com/ROCm/mori/blob/main/python/mori/ops/a2a_gemm/README.md).
+measurement table and the negative results; each is also a page in this
+section:
+[`gemm_ar`](fused-gemm-ar.md),
+[`gemm_a2a`](fused-gemm-a2a.md),
+[`gemm_ag`](fused-gemm-ag.md),
+[`ag_gemm`](fused-ag-gemm.md),
+[`a2a_gemm`](fused-a2a-gemm.md).
 This page covers what is common to all six, how to call each one, and the
 headline numbers.
 
@@ -446,5 +447,5 @@ trusting a number of your own:
   released.
 
 The `gemm_ar` README's
-[Measurement traps](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ar/README.md#measurement-traps)
+[Measurement traps](fused-gemm-ar.md#measurement-traps)
 lists the ones that have produced wrong numbers here.

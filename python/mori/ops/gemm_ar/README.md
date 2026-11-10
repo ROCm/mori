@@ -622,14 +622,14 @@ and joined streams; it does not evaluate receiver-ready reduction during one
 monolithic GEMM launch. All timings exclude activation preparation and use equal
 backing capacities with logical tail guards, as in the 2026-09-29 retest.
 Prototype code, patches, paired results and reproduction commands are archived
-in [`gemm-ar-followup-20260930`](</workspace/reports/gemm-ar-followup-20260930/README.md>).
+outside the repository, in `gemm-ar-followup-20260930`.
 
 Public integration was checked separately on `v2-015`: 65 host checks and all
 six TP8/TP4 public-op jobs passed, covering default/profile scheduling,
 changed-input graph replay, guards, self-test and both FP8 communication legs.
 The kernel timings above remain the prototype measurements; no new latency or
-model-quality claim is added. Integration logs and source hashes are in
-[`gemm-ar-integration-20260930`](</workspace/reports/gemm-ar-integration-20260930/README.md>).
+model-quality claim is added. Integration logs and source hashes are archived
+outside the repository, in `gemm-ar-integration-20260930`.
 
 ### Target operator update (2026-09-29)
 
@@ -676,8 +676,7 @@ latencies are separate measurements; full operator peaks and immediate physical
 reclamation are not established.
 
 Detailed results, commands, runtime/source hashes and failed attempts remain
-outside the repository in
-[`gemm-ar-v2-015-20260929`](</workspace/reports/gemm-ar-v2-015-20260929/README.md>).
+outside the repository, in `gemm-ar-v2-015-20260929`.
 These are operator microbenchmarks, not new model end-to-end speedups.
 
 ### The mxfp8 GEMM, on its own
@@ -1345,7 +1344,7 @@ All nine configurations passed independent FP32-reference, changed-input,
 graph-replay and guard checks; FP8 scatter also passed the actual-wire checks.
 Both FP8 legs give about **3.48% relL2**; model quality was not tested.
 Raw timings, 88,704 kernel records, per-rank breakdowns and reproduction commands
-are in [the phase archive](</workspace/reports/gemm-ar-phases-20260930/README.md>).
+are in the phase archive outside the repository, `gemm-ar-phases-20260930`.
 
 ### Kimi-K3 (blockscale, TP8 and TP4)
 

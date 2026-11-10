@@ -60,8 +60,8 @@ dimensions. For **DeepSeek-V4.1-Flash ratio 2**, set `-k 5120` and
 candidate. The N=512 result is one of the two projections. These commands
 measure projection followed by AG; Flash's current low-ratio CP implementation
 gathers inputs before projection. See the operator report's
-[model shapes](../../../../python/mori/ops/gemm_ag/README.md#model-shapes) and
-[projection-order comparison](../../../../python/mori/ops/gemm_ag/README.md#flash-ratio-2-projection-order).
+[model shapes](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/README.md#model-shapes) and
+[projection-order comparison](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/README.md#flash-ratio-2-projection-order).
 
 `--torch-gemm` uses native `torch.mm(..., out_dtype=torch.float32)` for
 BF16/FP32 `gemm-only`, `split-rccl` or `split-sdma` controls. The other existing
@@ -115,8 +115,8 @@ received tensor immediately before constructing references. The pipeline
 also poisons partial storage between replays. Nonfinite peer output fails
 validation. FP8 transport runs retain their initial precision-specific check.
 
-The [benchmark report](../../../../python/mori/ops/gemm_ag/README.md) and
-[experiments](../../../../python/mori/ops/gemm_ag/README.md#experiments) retain
+The [benchmark report](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/README.md) and
+[experiments](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/README.md#experiments) retain
 the measured findings. Historical generators, run plans and raw datasets are
 archived separately from the maintained source tree.
 
