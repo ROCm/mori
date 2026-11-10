@@ -46,6 +46,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .value("AnonymousHugetlb", HostBufferBacking::kAnonymousHugetlb)
       .value("AnonymousShm", HostBufferBacking::kAnonymousShm)
       .value("AnonymousShmHugetlb", HostBufferBacking::kAnonymousShmHugetlb)
+      .value("AnonymousThp", HostBufferBacking::kAnonymousThp)
       .export_values();
 
   py::class_<HostBufferHandle>(m, "UMBPHostBufferHandle")
@@ -57,6 +58,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readonly("mapped_size", &HostBufferHandle::mapped_size)
       .def_readonly("actual_backing", &HostBufferHandle::actual_backing)
       .def_readonly("actual_alignment", &HostBufferHandle::actual_alignment)
+      .def_readonly("thp_coverage", &HostBufferHandle::thp_coverage)
       .def("__bool__", &HostBufferHandle::valid)
       .def("__repr__", [](const HostBufferHandle& handle) {
         std::ostringstream oss;

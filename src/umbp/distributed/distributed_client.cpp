@@ -22,6 +22,7 @@
 #include "umbp/distributed/distributed_client.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <map>
 #include <mutex>
 #include <set>
@@ -35,6 +36,25 @@
 #include "umbp/distributed/config.h"
 
 namespace mori::umbp {
+namespace {
+
+// "hugetlb", "anonymous", or "thp, 99.5% hugepages" -- THP is best effort,
+// so its line says how much of the arena it covered.
+std::string DescribeBacking(const HostBufferHandle& handle) {
+  std::string out = HostBufferBackingName(handle.actual_backing);
+  if (handle.actual_backing == HostBufferBacking::kAnonymousThp) {
+    char buf[48];
+    if (handle.thp_coverage < 0) {
+      std::snprintf(buf, sizeof(buf), ", hugepage coverage unknown");
+    } else {
+      std::snprintf(buf, sizeof(buf), ", %.3f%% hugepages", handle.thp_coverage * 100.0);
+    }
+    out += buf;
+  }
+  return out;
+}
+
+}  // namespace
 
 DistributedClient::DistributedClient(const UMBPConfig& config)
     : config_(config), platform_(MakePoolPlatform(config.sim)) {
@@ -455,10 +475,8 @@ void DistributedClient::AllocateRangedScratch(const UMBPDistributedConfig& dc) {
   }
   // Hugepages fall back to 4 KiB silently, so log what was actually mapped.
   const HostBufferHandle& first = ranged_scratch_handles_.front();
-  MORI_UMBP_INFO(
-      "[DistributedClient] ranged scratch: 2 arenas x {} MiB, {} KiB pages ({})",
-      first.mapped_size >> 20, first.actual_alignment >> 10,
-      first.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb" : "anonymous");
+  MORI_UMBP_INFO("[DistributedClient] ranged scratch: 2 arenas x {} MiB, {} KiB pages ({})",
+                 first.mapped_size >> 20, first.actual_alignment >> 10, DescribeBacking(first));
 }
 
 bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base) {
@@ -512,8 +530,7 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
   const HostBufferHandle& first = ranged_scratch_handles_.front();
   MORI_UMBP_INFO(
       "[DistributedClient] ranged scratch: 2 arenas x {} KiB by NUMA node ({}), {} KiB pages ({})",
-      (part * nodes.size()) >> 10, layout, first.actual_alignment >> 10,
-      first.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb" : "anonymous");
+      (part * nodes.size()) >> 10, layout, first.actual_alignment >> 10, DescribeBacking(first));
   return true;
 }
 

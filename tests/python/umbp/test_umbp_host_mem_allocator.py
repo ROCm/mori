@@ -138,3 +138,46 @@ def test_free_is_idempotent_for_invalidated_handle():
     assert not handle
     assert handle.requested_size == 0
     assert handle.mapped_size == 0
+
+
+def _thp_enabled_mode() -> str:
+    try:
+        with open("/sys/kernel/mm/transparent_hugepage/enabled") as f:
+            line = f.read()
+    except OSError:
+        return ""
+    start, end = line.find("["), line.find("]")
+    return line[start + 1 : end] if 0 <= start < end else ""
+
+
+def test_anonymous_is_not_measured_for_thp():
+    allocator = UMBPHostMemAllocator()
+    handle = allocator.alloc(4096, UMBPHostBufferBacking.Anonymous)
+    assert handle
+    if handle.actual_backing == UMBPHostBufferBacking.Anonymous:
+        assert handle.thp_coverage == -1.0
+    allocator.free(handle)
+
+
+def test_thp_backing_can_be_requested_directly():
+    allocator = UMBPHostMemAllocator()
+    size = 3 * 1024 * 1024
+    handle = allocator.alloc(size, UMBPHostBufferBacking.AnonymousThp)
+
+    assert handle
+    if _thp_enabled_mode() not in ("always", "madvise"):
+        # Host THP off: plain anonymous pages.
+        assert handle.actual_backing == UMBPHostBufferBacking.Anonymous
+    else:
+        assert handle.actual_backing == UMBPHostBufferBacking.AnonymousThp
+        assert handle.mapped_size == 4 * 1024 * 1024
+        assert handle.ptr % (2 * 1024 * 1024) == 0
+        assert -1.0 <= handle.thp_coverage <= 1.0
+        if handle.thp_coverage >= 1.0:
+            assert handle.actual_alignment == 2 * 1024 * 1024
+        else:
+            assert handle.actual_alignment == _page_size()
+    _touch(handle, value=0x3C)
+
+    allocator.free(handle)
+    assert not handle

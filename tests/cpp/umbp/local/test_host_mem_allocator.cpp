@@ -27,6 +27,7 @@
 #include <dirent.h>
 #include <linux/mempolicy.h>
 #include <sched.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #endif
 
@@ -444,6 +445,319 @@ void TestFreeInvalidatesHandle() {
   std::printf("    PASS\n");
 }
 
+// ---------------------------------------------------------------------------
+// Transparent hugepages (kAnonymousThp)
+
+constexpr size_t kThp = 2ULL * 1024 * 1024;
+
+std::string RealThpEnabledMode() {
+  std::ifstream in("/sys/kernel/mm/transparent_hugepage/enabled");
+  std::string line;
+  if (!in || !std::getline(in, line)) return "";
+  const size_t open = line.find('['), close = line.find(']');
+  if (open == std::string::npos || close == std::string::npos) return "";
+  return line.substr(open + 1, close - open - 1);
+}
+
+bool HostThpUsable() {
+  const std::string mode = RealThpEnabledMode();
+  return mode == "always" || mode == "madvise";
+}
+
+void CheckThpHandle(const HostBufferHandle& handle, size_t requested) {
+  assert(handle.valid());
+  assert(handle.actual_backing == HostBufferBacking::kAnonymousThp);
+  assert(handle.requested_size == requested);
+  assert(handle.mapped_size == AlignUp(requested, kThp));
+  assert(reinterpret_cast<uintptr_t>(handle.ptr) % kThp == 0);
+  if (handle.thp_coverage >= 1.0) {
+    assert(handle.actual_alignment == kThp);
+  } else {
+    assert(handle.actual_alignment == GetPageSize());
+  }
+}
+
+void TestThpOffKeepsAnonymous() {
+  std::printf("  ThpOffKeepsAnonymous...\n");
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.thp = ThpMode::kOff;
+  auto handle = allocator.Alloc(12345, opts);
+  assert(handle.valid());
+  assert(handle.actual_backing == HostBufferBacking::kAnonymous);
+  assert(handle.actual_alignment == GetPageSize());
+  assert(handle.thp_coverage == -1.0);
+  allocator.Free(handle);
+  std::printf("    PASS\n");
+}
+
+void TestThpOnAlignsRoundsUpAndMeasures() {
+  std::printf("  ThpOnAlignsRoundsUpAndMeasures...\n");
+  if (!HostThpUsable()) {
+    std::printf("    SKIPPED (host THP is [%s])\n", RealThpEnabledMode().c_str());
+    return;
+  }
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.thp = ThpMode::kOn;
+  constexpr size_t kBytes = 64ULL * 1024 * 1024 + 1;  // rounds up to 66 MiB
+  auto handle = allocator.Alloc(kBytes, opts);
+  CheckThpHandle(handle, kBytes);
+  assert(handle.thp_coverage >= 0.0 && handle.thp_coverage <= 1.0);
+  TouchRange(handle);
+  const double coverage = handle.thp_coverage;
+  allocator.Free(handle);
+  assert(!handle.valid());
+
+  // Asking for the backing directly turns THP on for that call.
+  HostBufferOptions direct;
+  direct.backing = HostBufferBacking::kAnonymousThp;
+  direct.thp = ThpMode::kOff;
+  auto handle2 = allocator.Alloc(3 * 1024 * 1024, direct);
+  CheckThpHandle(handle2, 3 * 1024 * 1024);
+  TouchRange(handle2);
+  allocator.Free(handle2);
+  std::printf("    PASS (coverage %.4f)\n", coverage);
+}
+
+void TestThpWithoutPrefaultIsUnmeasured() {
+  std::printf("  ThpWithoutPrefaultIsUnmeasured...\n");
+  if (!HostThpUsable()) {
+    std::printf("    SKIPPED (host THP is [%s])\n", RealThpEnabledMode().c_str());
+    return;
+  }
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.thp = ThpMode::kOn;
+  opts.prefault = false;
+  opts.thp_require_full = true;  // no effect without prefault
+  auto handle = allocator.Alloc(5 * 1024 * 1024, opts);
+  CheckThpHandle(handle, 5 * 1024 * 1024);
+  assert(handle.thp_coverage == -1.0);
+  assert(handle.actual_alignment == GetPageSize());
+  TouchRange(handle);
+  allocator.Free(handle);
+  std::printf("    PASS\n");
+}
+
+void TestThpRequireFullEitherFullOrFails() {
+  std::printf("  ThpRequireFullEitherFullOrFails...\n");
+  if (!HostThpUsable()) {
+    std::printf("    SKIPPED (host THP is [%s])\n", RealThpEnabledMode().c_str());
+    return;
+  }
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.thp = ThpMode::kOn;
+  opts.thp_require_full = true;
+  auto handle = allocator.Alloc(32ULL * 1024 * 1024, opts);
+  if (handle.valid()) {
+    CheckThpHandle(handle, 32ULL * 1024 * 1024);
+    assert(handle.thp_coverage >= 1.0);
+    assert(handle.actual_alignment == kThp);
+    allocator.Free(handle);
+    std::printf("    PASS (fully backed)\n");
+  } else {
+    std::printf("    PASS (host could not back 32 MiB; allocation failed as required)\n");
+  }
+}
+
+void TestThpDisabledOnHostFallsBackToBasePages() {
+  std::printf("  ThpDisabledOnHostFallsBackToBasePages...\n");
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.thp = ThpMode::kOn;
+  for (const char* mode : {"never", ""}) {
+    SetThpEnabledModeForTesting(std::string(mode));
+    auto handle = allocator.Alloc(12345, opts);
+    assert(handle.valid());
+    assert(handle.actual_backing == HostBufferBacking::kAnonymous);
+    assert(handle.actual_alignment == GetPageSize());
+    assert(handle.thp_coverage == -1.0);
+    allocator.Free(handle);
+  }
+  SetThpEnabledModeForTesting(std::nullopt);
+  std::printf("    PASS\n");
+}
+
+// A hugetlb request that cannot be met falls back to THP, not 4 KiB pages.
+// An invalid hugepage size makes the fallback deterministic.
+void TestHugetlbFallbackGoesToThp() {
+  std::printf("  HugetlbFallbackGoesToThp...\n");
+  if (!HostThpUsable()) {
+    std::printf("    SKIPPED (host THP is [%s])\n", RealThpEnabledMode().c_str());
+    return;
+  }
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousHugetlb;
+  opts.hugepage_size = 3ULL * 1024 * 1024;
+  opts.thp = ThpMode::kOn;
+  auto handle = allocator.Alloc(4ULL * 1024 * 1024, opts);
+  CheckThpHandle(handle, 4ULL * 1024 * 1024);
+  allocator.Free(handle);
+  std::printf("    PASS\n");
+}
+
+#ifdef __linux__
+int RegionPolicy(void* addr) {
+  int mode = -1;
+  const long rc = syscall(__NR_get_mempolicy, &mode, nullptr, 0UL, addr,
+                          static_cast<unsigned long>(MPOL_F_ADDR));
+  assert(rc == 0);
+  return mode;
+}
+
+int AllowedMemNodes() {
+  std::vector<unsigned long> mask(1024 / (sizeof(unsigned long) * 8), 0);
+  if (syscall(__NR_get_mempolicy, nullptr, mask.data(), 1024UL, nullptr,
+              static_cast<unsigned long>(MPOL_F_MEMS_ALLOWED)) != 0) {
+    return 0;
+  }
+  int n = 0;
+  for (unsigned long w : mask) n += __builtin_popcountl(w);
+  return n;
+}
+#endif
+
+void TestThpInterleavesOnlyWhenNothingElsePlaces() {
+  std::printf("  ThpInterleavesOnlyWhenNothingElsePlaces...\n");
+#ifdef __linux__
+  if (!HostThpUsable() || AllowedMemNodes() < 2) {
+    std::printf("    SKIPPED (needs host THP and two or more allowed memory nodes)\n");
+    return;
+  }
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.thp = ThpMode::kOn;
+  opts.prefault = false;
+
+  auto unplaced = allocator.Alloc(8ULL * 1024 * 1024, opts);
+  assert(unplaced.valid());
+  assert(RegionPolicy(unplaced.ptr) == MPOL_INTERLEAVE);
+  allocator.Free(unplaced);
+
+  HostBufferOptions spread = opts;
+  spread.spread_prefault_across_nodes = true;
+  auto spread_handle = allocator.Alloc(8ULL * 1024 * 1024, spread);
+  assert(spread_handle.valid());
+  assert(RegionPolicy(spread_handle.ptr) == MPOL_DEFAULT);
+  allocator.Free(spread_handle);
+
+  HostBufferOptions bound = opts;
+  bound.numa_node = 0;
+  auto bound_handle = allocator.Alloc(8ULL * 1024 * 1024, bound);
+  assert(bound_handle.valid());
+  assert(RegionPolicy(bound_handle.ptr) == MPOL_BIND);
+  allocator.Free(bound_handle);
+
+  // An explicit task policy (numactl --membind) is left to apply.
+  unsigned long node0 = 1;
+  assert(syscall(__NR_set_mempolicy, MPOL_BIND, &node0, 64UL) == 0);
+  auto task_bound = allocator.Alloc(8ULL * 1024 * 1024, opts);
+  assert(syscall(__NR_set_mempolicy, MPOL_DEFAULT, nullptr, 0UL) == 0);
+  assert(task_bound.valid());
+  assert(RegionPolicy(task_bound.ptr) == MPOL_DEFAULT);
+  allocator.Free(task_bound);
+  std::printf("    PASS\n");
+#else
+  std::printf("    SKIPPED (not Linux)\n");
+#endif
+}
+
+// PR_SET_THP_DISABLE makes every fault in this process take base pages, so
+// the shortfall path runs deterministically: coverage 0, base-page alignment,
+// and require_full fails the allocation.
+void TestThpShortfallIsReportedAndRequireFullFails() {
+  std::printf("  ThpShortfallIsReportedAndRequireFullFails...\n");
+#if defined(__linux__) && defined(PR_SET_THP_DISABLE)
+  if (!HostThpUsable() || prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) != 0) {
+    std::printf("    SKIPPED (needs host THP and PR_SET_THP_DISABLE)\n");
+    return;
+  }
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.thp = ThpMode::kOn;
+  auto shortfall = allocator.Alloc(16ULL * 1024 * 1024, opts);
+  HostBufferOptions strict = opts;
+  strict.thp_require_full = true;
+  auto refused = allocator.Alloc(16ULL * 1024 * 1024, strict);
+  assert(prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0) == 0);
+
+  CheckThpHandle(shortfall, 16ULL * 1024 * 1024);
+  assert(shortfall.thp_coverage == 0.0);
+  assert(shortfall.actual_alignment == GetPageSize());
+  TouchRange(shortfall);
+  allocator.Free(shortfall);
+  assert(!refused.valid());
+  std::printf("    PASS\n");
+#else
+  std::printf("    SKIPPED (not Linux)\n");
+#endif
+}
+
+void TestThpCoverageFromSmapsText() {
+  std::printf("  ThpCoverageFromSmapsText...\n");
+  auto parse = [](const std::string& text, uintptr_t begin, size_t size) {
+    std::istringstream in(text);
+    return ThpCoverageFromSmaps(in, begin, size);
+  };
+  // Own VMA, fully huge (8 MiB = 8192 kB).
+  const std::string full =
+      "7f0000000000-7f0000800000 rw-p 00000000 00:00 0 \n"
+      "Size:               8192 kB\n"
+      "AnonHugePages:      8192 kB\n"
+      "VmFlags: rd wr mr mw me ac hg\n";
+  auto r = parse(full, 0x7f0000000000ULL, 8ULL << 20);
+  assert(r.has_value() && r->exact && r->coverage == 1.0);
+
+  // Half huge; neighbour VMAs before and after must not count.
+  const std::string half =
+      "7effffe00000-7f0000000000 rw-p 00000000 00:00 0 \n"
+      "AnonHugePages:      2048 kB\n"
+      "7f0000000000-7f0000800000 rw-p 00000000 00:00 0 \n"
+      "AnonHugePages:      4096 kB\n"
+      "7f0000800000-7f0000a00000 rw-p 00000000 00:00 0 [heap]\n"
+      "AnonHugePages:      2048 kB\n";
+  r = parse(half, 0x7f0000000000ULL, 8ULL << 20);
+  assert(r.has_value() && r->exact && r->coverage == 0.5);
+
+  // The range split into two VMAs (e.g. by mbind): summed, still exact.
+  const std::string split =
+      "7f0000000000-7f0000400000 rw-p 00000000 00:00 0 \n"
+      "AnonHugePages:      4096 kB\n"
+      "7f0000400000-7f0000800000 rw-p 00000000 00:00 0 \n"
+      "AnonHugePages:      2048 kB\n";
+  r = parse(split, 0x7f0000000000ULL, 8ULL << 20);
+  assert(r.has_value() && r->exact && r->coverage == 0.75);
+
+  // Merged with a neighbour: pro rata and marked inexact.
+  const std::string merged =
+      "7f0000000000-7f0001000000 rw-p 00000000 00:00 0 \n"
+      "AnonHugePages:      8192 kB\n";
+  r = parse(merged, 0x7f0000000000ULL, 8ULL << 20);
+  assert(r.has_value() && !r->exact && r->coverage == 0.5);
+
+  // No AnonHugePages line (kernel without THP): zero, not an error.
+  r = parse("7f0000000000-7f0000800000 rw-p 00000000 00:00 0 \nRss: 8192 kB\n", 0x7f0000000000ULL,
+            8ULL << 20);
+  assert(r.has_value() && r->coverage == 0.0);
+
+  // No overlapping VMA, empty or garbage input: not measured.
+  assert(!parse(full, 0x10000000ULL, 8ULL << 20).has_value());
+  assert(!parse("", 0x7f0000000000ULL, 8ULL << 20).has_value());
+  assert(!parse("garbage\nzz-yy nope\n", 0x7f0000000000ULL, 8ULL << 20).has_value());
+  std::printf("    PASS\n");
+}
+
+void TestBackingNames() {
+  std::printf("  BackingNames...\n");
+  assert(std::strcmp(HostBufferBackingName(HostBufferBacking::kAnonymousThp), "thp") == 0);
+  assert(std::strcmp(HostBufferBackingName(HostBufferBacking::kAnonymousHugetlb), "hugetlb") == 0);
+  assert(std::strcmp(HostBufferBackingName(HostBufferBacking::kAnonymous), "anonymous") == 0);
+  std::printf("    PASS\n");
+}
+
 }  // namespace
 
 void TestNumaFailureAndParallelPrefault() {
@@ -487,6 +801,16 @@ int main() {
   TestDoubleFreeIsSafe();
   TestFreeInvalidatesEvenOnMunmapFailure();
   TestFreeInvalidatesHandle();
+  TestThpOffKeepsAnonymous();
+  TestThpOnAlignsRoundsUpAndMeasures();
+  TestThpWithoutPrefaultIsUnmeasured();
+  TestThpRequireFullEitherFullOrFails();
+  TestThpDisabledOnHostFallsBackToBasePages();
+  TestHugetlbFallbackGoesToThp();
+  TestThpInterleavesOnlyWhenNothingElsePlaces();
+  TestThpShortfallIsReportedAndRequireFullFails();
+  TestThpCoverageFromSmapsText();
+  TestBackingNames();
   std::printf("=== ALL PASSED ===\n");
   return 0;
 }
