@@ -230,15 +230,11 @@ class RdmaDeviceContext {
   // ibv_reg_mr only; aborts on failure.
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                     int accessFlag = MR_DEFAULT_ACCESS_FLAG);
-  // dmabufOffset is where ptr sits in the dma-buf, which covers ptr's whole allocation.
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size, int dmabuf_fd,
-                                                          uint64_t dmabufOffset,
                                                           int accessFlag = MR_DEFAULT_ACCESS_FLAG);
-  // dmabuf registration with iova=0 (CCO symmetric flat-VA path; BNXT GDA). The NIC maps iova
-  // to the dma-buf page by page, so dmabufOffset must be page-aligned.
+  // dmabuf registration with iova=0 (CCO symmetric flat-VA path; BNXT GDA).
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabufIova0(
-      void* ptr, size_t size, int dmabuf_fd, uint64_t dmabufOffset,
-      int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+      void* ptr, size_t size, int dmabuf_fd, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   // Memory HIP reports as host registers with ibv_reg_mr alone. Other memory: ibv_reg_mr-first
   // registration; falls back to dmabuf. Set MORI_ENABLE_DMABUF_REG=1 to try dmabuf first instead
   // (falling back to ibv_reg_mr). This is the vendor-agnostic payload MR path; the same switch

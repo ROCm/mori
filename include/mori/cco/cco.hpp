@@ -288,7 +288,7 @@ struct ccoWindowDevice {
   // LSA flat-VA addressing (intra-node only). winBase is the window's slot in
   // the LSA-sized flat VA reservation. Peer addressing uses LSA rank, not
   // world rank. Cross-node access goes through ibgdaWin (iova=0 + offset).
-  //   winBase = flatBase + slotOffset + handleOffset (0 unless imported from inside an allocation)
+  //   winBase = flatBase + slotOffset
   //   peer_va = winBase + ((uint64_t)peerLsaRank * stride4G << 32) + offset
   //   local   = winBase + ((uint64_t)lsaRank     * stride4G << 32) + offset
   char* winBase;
@@ -904,9 +904,6 @@ struct ccoComm {
     bool isFabric{false};
     size_t slotOffset{0};
     size_t size{0};
-    // The slot maps the allocation from its start; the pointer handed out (the allocTable key)
-    // is this far into it. Non-zero only for ccoMemImport of a pointer inside its allocation.
-    size_t handleOffset{0};
   };
   std::unordered_map<void*, AllocMeta> allocTable;
 
@@ -962,11 +959,6 @@ int ccoMemFree(ccoComm* comm, void* ptr);
 // Like ccoMemAlloc, but aliases an EXTERNAL HIP VMM allocation (e.g. a
 // torch.symm_mem buffer) into the flat-VA slot instead of allocating: retains its
 // handle (hipMemRetainAllocationHandle) and maps it. Release via ccoMemFree.
-// externalPtr may point inside its allocation (torch 2.14's symm_mem.empty()
-// data starts 0x2400 bytes in); *ptr is then as far into the slot. Registering
-// it as a window needs the same offset on every rank, and an offset that is not
-// page-aligned rules out the window's RDMA MR, i.e. a comm spanning nodes or a
-// FULL DevComm.
 int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** ptr);
 
 // ── Phase 2: Window registration (P2P mapping + RDMA MR + SDMA signals + GPU structs) ──
