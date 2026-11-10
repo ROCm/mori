@@ -29,6 +29,7 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -142,6 +143,46 @@ static const std::string getBusId(int deviceId) {
     busIdChar[i] = std::tolower(busIdChar[i]);
   }
   return std::string(busIdChar);
+}
+
+static hsa_agent_t getHsaAgent(int deviceId) {
+  const std::string busId = getBusId(deviceId);
+  unsigned int domain, bus, device, function;
+  int parsedLength = 0;
+  if (std::sscanf(busId.c_str(), "%x:%x:%x.%x%n", &domain, &bus, &device, &function,
+                  &parsedLength) != 4 ||
+      parsedLength != static_cast<int>(busId.size()) || bus > 0xff || device > 0x1f ||
+      function > 7) {
+    throw std::runtime_error("Invalid PCI bus ID for HIP device " + std::to_string(deviceId) +
+                             ": " + busId);
+  }
+
+  const uint32_t bdf = (bus << 8) | (device << 3) | function;
+  hsa_agent_t matchedAgent{};
+  bool found = false;
+  // HIP_VISIBLE_DEVICES can filter or reorder HIP ordinals independently of
+  // hsa_iterate_agents. Match physical PCI identity instead of indexing by ordinal.
+  for (hsa_agent_t agent : gpuAgents_) {
+    uint32_t agentDomain, agentBdf;
+    CHECK_HSA_ERROR(hsa_agent_get_info(
+        agent, static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_DOMAIN), &agentDomain));
+    CHECK_HSA_ERROR(hsa_agent_get_info(
+        agent, static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_BDFID), &agentBdf));
+    if (agentDomain != domain || agentBdf != bdf) {
+      continue;
+    }
+    if (found) {
+      throw std::runtime_error("Multiple HSA GPU agents match HIP device " +
+                               std::to_string(deviceId) + " at PCI bus ID " + busId);
+    }
+    matchedAgent = agent;
+    found = true;
+  }
+  if (!found) {
+    throw std::runtime_error("No HSA GPU agent matches HIP device " + std::to_string(deviceId) +
+                             " at PCI bus ID " + busId);
+  }
+  return matchedAgent;
 }
 
 SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAgent,
@@ -265,12 +306,13 @@ void AnvilLib::init() {
 }
 
 bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
+  hsa_agent_t localAgent = getHsaAgent(srcDeviceId);
   uint32_t engineId = getSdmaEngineId(srcDeviceId, dstDeviceId);
   std::lock_guard<std::mutex> lock(channels_mutex_);
   auto key = std::make_pair(srcDeviceId, dstDeviceId);
   for (int c = 0; c < numChannels; ++c) {
     sdma_channels_[key].emplace_back(
-        std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
+        std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, localAgent, engineId));
   }
   return true;
 }
