@@ -28,13 +28,13 @@ New to MORI? :doc:`Install it <installation>`, then work through the :doc:`quick
    :hidden:
    :caption: MORI-FUSED
 
-   Guide <MORI-CCO-FUSED-OPS-GUIDE>
+   Overview <MORI-CCO-FUSED-OPS-GUIDE>
    GEMM + all-reduce / reduce-scatter <fused-gemm-ar>
    GEMM + all-to-all <fused-gemm-a2a>
    GEMM + all-gather <fused-gemm-ag>
    All-gather + GEMM <fused-ag-gemm>
    All-to-all + GEMM <fused-a2a-gemm>
-   GEMM + all-gather benchmark <fused-gemm-ag-benchmark>
+   Tests and benchmarks <fused-tests-and-benchmarks>
 
 .. toctree::
    :hidden:
