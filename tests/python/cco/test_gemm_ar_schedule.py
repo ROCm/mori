@@ -212,12 +212,9 @@ _WORKER = Path(__file__).resolve().parent / "gemm_ar_schedule_worker.py"
 @pytest.mark.parametrize(
     "world,args",
     [
-        pytest.param(
-            8,
-            ["--quant", "blockscale"],
-            id="tp8-blockscale",
-            marks=pytest.mark.ci_full,
-        ),
+        # wo_b has fitted blockscale plans for TP8 only (_Schedule in op.py), so a
+        # pull request keeps this case; a TP4 blockscale one would get the default.
+        pytest.param(8, ["--quant", "blockscale"], id="tp8-blockscale"),
         pytest.param(
             8,
             ["--quant", "blockscale", "--schedule", "default"],

@@ -30,7 +30,8 @@ jobs:
       matrix:
         include:
           # Single node, so it shares ci.yml's intranode runner. MI355X-AINIC
-          # keeps the two internode jobs, which need that pair, and cco-v2-test.
+          # keeps the two internode jobs, which need that pair, cco-fused-test
+          # and cco-v2-test.
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
@@ -424,8 +425,8 @@ jobs:
 
   cco-fused-test:
     name: CCO fused GEMM test (${{ matrix.platform }})
-    # The fused GEMM + collective ops use SDMA over loopback only, so they need no
-    # NIC and run here rather than queue behind the internode jobs on MI355X-AINIC.
+    # The fused GEMM + collective ops use SDMA over loopback only. Their own runner
+    # takes them off the CCO unit test's critical path.
     if: contains(fromJSON(inputs.groups), 'fused')
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -433,12 +434,11 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC-PIT-G17]
+            runner: [self-hosted, MI355X-AINIC]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
     env:
-      CT: docker
       CONTAINER: mori_cco_fused_${{ github.run_id }}
       # 0 skips the ci_full cases (tests/python/cco/conftest.py).
       MORI_CI_FULL: ${{ (github.event_name != 'pull_request' || inputs.full) && '1' || '0' }}
@@ -447,6 +447,16 @@ jobs:
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: lo
       NCCL_SOCKET_IFNAME: lo
+      # Every step that picks from these files by mark lists all of them, so a
+      # test's mark alone decides which step runs it.
+      GEMM_AR_TESTS: >-
+        ${{ github.workspace }}/tests/python/cco/test_gemm_ar.py
+        ${{ github.workspace }}/tests/python/cco/test_gemm_ar_op.py
+        ${{ github.workspace }}/tests/python/cco/test_gemm_ar_schedule.py
+        ${{ github.workspace }}/tests/python/cco/test_flydsl_ar.py
+      GEMM_AG_TESTS: >-
+        ${{ github.workspace }}/tests/python/cco/test_gemm_ag.py
+        ${{ github.workspace }}/tests/python/cco/test_gemm_ag_op.py
     timeout-minutes: 60
     steps:
       - *cco-fix-perms
@@ -463,22 +473,19 @@ jobs:
           # every xdist worker its own GPU; the multi-rank cases stay in the steps
           # below, one launch at a time.
           $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
-            pip install pytest-xdist && cd /tmp && \
+            cd /tmp && \
             timeout 1200 python -m pytest -v -n 8 --dist worksteal -m single_gpu \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag.py"
+              $GEMM_AR_TESTS $GEMM_AG_TESTS"
 
       - name: Run CCO fused GEMM 2- and 4-rank tests (4 GPUs per worker)
         run: |
           # Two launches at a time, each on its own four GPUs. The 8-rank cases stay
-          # in the steps below.
+          # in the steps below. No GEMM+AG file here: its multi-rank cases have to
+          # run after GEMM+AR's (see the GEMM+AG step).
           $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo -e MORI_TEST_GPUS_PER_WORKER=4 $CONTAINER bash -c "\
             cd /tmp && \
             timeout 1200 python -m pytest -v -n 2 --dist worksteal -m gpu_group \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_schedule.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
+              $GEMM_AR_TESTS"
 
       - name: Run CCO GEMM+AR numerics (up to 8 ranks)
         run: |
@@ -493,10 +500,7 @@ jobs:
           $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
             cd /tmp && python -c 'import mori.ops.gemm_ar as g; print(g.GemmAllReduceOp)' && \
             timeout 1800 python -m pytest -v -m 'not single_gpu and not gpu_group' \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_schedule.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
+              $GEMM_AR_TESTS"
 
       - name: Run CCO GEMM+A2A numerics and the recv-reuse race (8 ranks)
         run: |
@@ -542,8 +546,7 @@ jobs:
           $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
             cd /tmp && python -c 'import mori.ops.gemm_ag as g; print(g.__file__)' && \
             timeout 2400 python -m pytest -v -m 'not single_gpu' \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag.py \
-              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag_op.py"
+              $GEMM_AG_TESTS"
 
       # After the GEMM+AR steps for the same reason as the step above:
       # test_ag_gemm.py settles and retries around slow-to-return SDMA queues
