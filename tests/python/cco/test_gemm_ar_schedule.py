@@ -212,18 +212,33 @@ _WORKER = Path(__file__).resolve().parent / "gemm_ar_schedule_worker.py"
 @pytest.mark.parametrize(
     "world,args",
     [
-        (8, ["--quant", "blockscale"]),
-        (8, ["--quant", "blockscale", "--schedule", "default"]),
-        (4, ["--quant", "mxfp8"]),
-        (4, ["--quant", "mxfp8", "--scatter", "fp8"]),
-        (4, ["--quant", "mxfp8", "--scatter", "fp8", "--gather", "fp8"]),
-    ],
-    ids=[
-        "tp8-blockscale",
-        "tp8-blockscale-default",
-        "tp4-mxfp8",
-        "tp4-fp8-scatter",
-        "tp4-fp8-both",
+        # wo_b has fitted blockscale plans for TP8 only (_Schedule in op.py), so a
+        # pull request keeps this case; a TP4 blockscale one would get the default.
+        pytest.param(8, ["--quant", "blockscale"], id="tp8-blockscale"),
+        pytest.param(
+            8,
+            ["--quant", "blockscale", "--schedule", "default"],
+            id="tp8-blockscale-default",
+            marks=pytest.mark.ci_full,
+        ),
+        pytest.param(
+            4,
+            ["--quant", "mxfp8"],
+            id="tp4-mxfp8",
+            marks=pytest.mark.gpu_group,
+        ),
+        pytest.param(
+            4,
+            ["--quant", "mxfp8", "--scatter", "fp8"],
+            id="tp4-fp8-scatter",
+            marks=pytest.mark.gpu_group,
+        ),
+        pytest.param(
+            4,
+            ["--quant", "mxfp8", "--scatter", "fp8", "--gather", "fp8"],
+            id="tp4-fp8-both",
+            marks=pytest.mark.gpu_group,
+        ),
     ],
 )
 def test_schedule_worker_on_real_ranks(world, args):

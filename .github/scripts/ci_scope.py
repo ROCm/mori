@@ -32,7 +32,8 @@ ci.yml hands the cco and fused lanes to ci_cco.yml. Writes these step outputs:
   fused   CCO fused GEMM + collective job (ci_cco.yml)
   build   the MI355X build job (compile check)
   groups  JSON list of test groups (GROUPS); a step runs only if its group is listed
-  full    full internode bench/stress sweeps: workflow_dispatch, or ci:full on a PR
+  full    full internode bench/stress sweeps, and the fused GEMM cases a PR skips:
+          workflow_dispatch, or ci:full on a PR
   reason  why
 
 Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
@@ -507,8 +508,9 @@ JOBS = {
     "build": (("MoRI build (compile check)", ALL),),
 }
 HINT = (
-    "Lanes follow the changed files. Adding `ci:full` re-runs CI with every lane and "
-    "the full internode sweeps; adding `ci:mi300x` re-runs it with the MI300X lanes "
+    "Lanes follow the changed files. Adding `ci:full` re-runs CI with every lane, "
+    "the full internode sweeps and every fused GEMM case; adding `ci:mi300x` re-runs "
+    "it with the MI300X lanes "
     "added. `/ci-rerun` re-runs CI against the current main."
 )
 
@@ -528,7 +530,7 @@ def comment_body(env, lanes, reason, full, groups=frozenset()):
     if not any(lanes.values()):
         return head + f"none, {reason}.\n\n{HINT}"
     if full:
-        reason += "; full internode sweeps"
+        reason += "; full internode sweeps and every fused GEMM case"
     rows = []
     for lane in LANES:
         # A lane that runs lists the jobs its groups start; one that does not, all.

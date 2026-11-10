@@ -139,7 +139,11 @@ def _torchrun(script, *args, timeout=1800):
 
 
 @requires_gpus
-@pytest.mark.parametrize("acquire", ["inv", "none"])
+# A pull request runs "none", the README's variant; "inv" is the op's default,
+# which test_a2a_gemm_op.py runs on every pull request.
+@pytest.mark.parametrize(
+    "acquire", [pytest.param("inv", marks=pytest.mark.ci_full), "none"]
+)
 def test_every_mode_is_exact_to_the_fp8_floor_back_to_back(acquire):
     world, rows = _torchrun(
         BENCH,

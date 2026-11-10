@@ -1528,6 +1528,7 @@ jobs:
     uses: ./.github/workflows/ci_cco.yml
     with:
       groups: ${{ needs.scope.outputs.groups }}
+      full: ${{ needs.scope.outputs.full == 'true' }}
 
   ci-gate:
     name: CI gate

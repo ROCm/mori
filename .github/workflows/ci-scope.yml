@@ -31,7 +31,7 @@ on:
         description: JSON list of the test groups whose steps run
         value: ${{ jobs.detect.outputs.groups }}
       full:
-        description: Run the full internode bench/stress sweeps
+        description: Run the full internode bench/stress sweeps and every fused GEMM case
         value: ${{ jobs.detect.outputs.full }}
       reason:
         description: Why these lanes run
