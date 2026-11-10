@@ -270,6 +270,8 @@ class PoolClient {
   PoolClientConfig config_;
   std::shared_ptr<PoolPlatform> platform_;
   std::atomic<bool> initialized_{false};
+  // Read at Init. Disabling PUT routing preserves metadata publication and remote GET.
+  bool distributed_offload_ = true;
 
   // Sample every instrumented component on this node — each registered storage
   // backend, plus the transfer engine — and ship the result.  With a master it
