@@ -342,13 +342,24 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 
   m.def("launch_reset", &LaunchReset);
 
-  py::enum_<mori::moe::sim::Phase>(m, "EpSimPhase")
-      .value("Dispatch", mori::moe::sim::Phase::Dispatch)
-      .value("Combine", mori::moe::sim::Phase::Combine);
+  using mori::moe::sim::EpSim;
+  using release = py::call_guard<py::gil_scoped_release>;
   m.def("ep_sim_enabled", &mori::moe::sim::IsEnabled);
-  m.def("ep_sim_deadline", &mori::moe::sim::Deadline, py::arg("phase"));
-  m.def("ep_sim_sleep_until", &mori::moe::sim::SleepUntil, py::arg("deadline_ns"),
-        py::call_guard<py::gil_scoped_release>());
+  py::class_<EpSim>(m, "EpSim")
+      .def(py::init<const std::string&, int, int, int, int, int, int>(), py::arg("group"),
+           py::arg("rank"), py::arg("world_size"), py::arg("max_tokens"), py::arg("topk"),
+           py::arg("experts_per_rank"), py::arg("max_recv"))
+      .def(
+          "dispatch",
+          [](EpSim& sim, uintptr_t ids, int numTokens, uintptr_t recvIds, uintptr_t expertCount) {
+            return sim.Dispatch(reinterpret_cast<const int32_t*>(ids), numTokens,
+                                reinterpret_cast<int32_t*>(recvIds),
+                                reinterpret_cast<int32_t*>(expertCount));
+          },
+          py::arg("ids_ptr"), py::arg("num_tokens"), py::arg("recv_ids_ptr"),
+          py::arg("expert_count_ptr"), release())
+      .def("combine", &EpSim::Combine, release())
+      .def("wait", &EpSim::Wait, release());
 
   m.def("get_cur_rank_num_token", &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
   m.def("get_dispatch_src_token_pos", &GetDispatchSrcTokenId);

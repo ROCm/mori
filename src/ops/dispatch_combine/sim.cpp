@@ -21,13 +21,22 @@
 // SOFTWARE.
 #include "mori/ops/dispatch_combine/sim.hpp"
 
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
-#include <string>
+#include <system_error>
 #include <thread>
+#include <vector>
 
 #include "mori/utils/env_utils.hpp"
 
@@ -38,6 +47,7 @@ namespace sim {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+constexpr auto kTimeout = std::chrono::seconds(300);
 
 double LatencyUs(const char* name) {
   const char* raw = std::getenv(name);
@@ -50,24 +60,190 @@ double LatencyUs(const char* name) {
   return us;
 }
 
+int64_t NowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
+      .count();
+}
+
+// One per rank, its own cache line.
+struct alignas(64) RankState {
+  std::atomic<uint64_t> published;
+};
+
+// The default 50 us timer slack would dominate a 30 us op.
+void FineTimerSlack() {
+  thread_local const bool done = (prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL), true);
+  (void)done;
+}
+
 }  // namespace
+
+// Rank r's entry for op seq lives in slot seq % 2: a rank reaches op seq + 2 only after every rank
+// published seq + 1, which each does only after it finished reading seq.
+struct EpSim::Slot {
+  int64_t deadlineNs;
+  int32_t phase;
+  int32_t numTokens;
+  // Followed by, as the sender's dispatch buckets them: ids [maxTokens, topk]; toCount [world],
+  // how many of its tokens go to each rank; hits [world * expertsPerRank], per expert; and
+  // toList [world, maxTokens], which tokens go to each rank.
+  int32_t* Ints() { return reinterpret_cast<int32_t*>(this + 1); }
+  const int32_t* Ints() const { return reinterpret_cast<const int32_t*>(this + 1); }
+};
 
 bool IsEnabled() { return env::IsEnvVarEnabled("MORI_EP_SIM_ENABLE"); }
 
-int64_t Deadline(Phase phase) {
-  const double us =
-      LatencyUs(phase == Phase::Dispatch ? "MORI_EP_SIM_DISPATCH_US" : "MORI_EP_SIM_COMBINE_US");
-  const auto end = Clock::now() + std::chrono::nanoseconds(static_cast<int64_t>(us * 1e3));
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count();
+EpSim::EpSim(const std::string& group, int rank, int worldSize, int maxTokens, int topk,
+             int expertsPerRank, int maxRecv)
+    : rank_(rank),
+      world_(worldSize),
+      maxTokens_(maxTokens),
+      topk_(topk),
+      expertsPerRank_(expertsPerRank),
+      maxRecv_(maxRecv),
+      dispatchUs_(LatencyUs("MORI_EP_SIM_DISPATCH_US")),
+      combineUs_(LatencyUs("MORI_EP_SIM_COMBINE_US")) {
+  const size_t ints = static_cast<size_t>(maxTokens) * topk + worldSize +
+                      static_cast<size_t>(worldSize) * expertsPerRank +
+                      static_cast<size_t>(worldSize) * maxTokens;
+  slotBytes_ = (sizeof(Slot) + sizeof(int32_t) * ints + 63) / 64 * 64;
+  bytes_ = sizeof(RankState) * world_ + 2 * world_ * slotBytes_;
+  if (world_ == 1) {
+    base_ = static_cast<char*>(std::calloc(1, bytes_));
+    return;
+  }
+  if (group.empty()) throw std::invalid_argument("EP sim with world_size > 1 needs a group name");
+  name_ = "/mori_ep_sim." + group;
+  const int fd = shm_open(name_.c_str(), O_CREAT | O_RDWR, 0600);
+  if (fd < 0) throw std::system_error(errno, std::generic_category(), "shm_open " + name_);
+  struct stat st{};
+  // Ranks race to size it; any of them may win, and all ask for the same size.
+  const bool ok =
+      fstat(fd, &st) == 0 && (static_cast<size_t>(st.st_size) == bytes_ ||
+                              (st.st_size == 0 && ftruncate(fd, static_cast<off_t>(bytes_)) == 0));
+  void* p = ok ? mmap(nullptr, bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+  close(fd);
+  if (p == MAP_FAILED) {
+    throw std::runtime_error("EP sim: cannot map " + name_ +
+                             " (ranks disagree on the EP config, or a stale segment)");
+  }
+  base_ = static_cast<char*>(p);
 }
 
-void SleepUntil(int64_t deadlineNs) {
-  // The default 50 us timer slack, and the scheduler's wake-up delay, would dominate a 30 us op:
-  // sleep with 1 ns slack to 20 us short of the deadline, then spin.
-  thread_local const bool fineSlack = (prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL), true);
-  (void)fineSlack;
+EpSim::~EpSim() {
+  if (world_ == 1) {
+    std::free(base_);
+  } else if (base_ != nullptr) {
+    munmap(base_, bytes_);
+  }
+}
+
+EpSim::Slot* EpSim::SlotOf(uint64_t seq, int rank) const {
+  return reinterpret_cast<Slot*>(base_ + sizeof(RankState) * world_ +
+                                 ((seq % 2) * world_ + rank) * slotBytes_);
+}
+
+EpSim::Slot* EpSim::Begin(int phase, double latencyUs, int numTokens) {
+  if (numTokens > maxTokens_) {
+    throw std::invalid_argument("EP sim: " + std::to_string(numTokens) +
+                                " tokens exceed max_num_inp_token_per_rank " +
+                                std::to_string(maxTokens_));
+  }
+  Slot* mine = SlotOf(++seq_, rank_);
+  mine->deadlineNs = NowNs() + static_cast<int64_t>(latencyUs * 1e3);
+  mine->phase = phase;
+  mine->numTokens = numTokens;
+  return mine;
+}
+
+void EpSim::Finish(const Slot* mine) {
+  auto* state = reinterpret_cast<RankState*>(base_);
+  state[rank_].published.store(seq_, std::memory_order_release);
+  FineTimerSlack();
+  const auto start = Clock::now();
+  deadlineNs_ = 0;
+  for (int r = 0; r < world_; ++r) {
+    for (int spins = 0; state[r].published.load(std::memory_order_acquire) < seq_; ++spins) {
+      if (spins > 1000) std::this_thread::sleep_for(std::chrono::microseconds(2));
+      if (Clock::now() - start > kTimeout) {
+        throw std::runtime_error("EP sim rank " + std::to_string(rank_) + ": rank " +
+                                 std::to_string(r) + " never reached op " + std::to_string(seq_));
+      }
+    }
+    const Slot* other = SlotOf(seq_, r);
+    if (other->phase != mine->phase) {
+      throw std::runtime_error("EP sim op " + std::to_string(seq_) + ": ranks " +
+                               std::to_string(rank_) + " and " + std::to_string(r) +
+                               " disagree on dispatch vs combine");
+    }
+    deadlineNs_ = std::max(deadlineNs_, other->deadlineNs);
+  }
+  // Every rank has the segment mapped by now; drop its name so nothing outlives the job.
+  if (seq_ == 1 && rank_ == 0 && !name_.empty()) shm_unlink(name_.c_str());
+}
+
+int EpSim::Dispatch(const int32_t* ids, int numTokens, int32_t* recvIds, int32_t* expertCount) {
+  const int numExperts = world_ * expertsPerRank_;
+  const size_t idsLen = static_cast<size_t>(maxTokens_) * topk_;
+  Slot* mine = Begin(0, dispatchUs_, numTokens);
+
+  // Send side: bucket this rank's tokens by destination, so a receiver touches only its own.
+  int32_t* sentIds = mine->Ints();
+  int32_t* toCount = sentIds + idsLen;
+  int32_t* hits = toCount + world_;
+  int32_t* toList = hits + numExperts;
+  std::memcpy(sentIds, ids, sizeof(int32_t) * numTokens * topk_);
+  std::fill(toCount, toCount + world_ + numExperts, 0);
+  std::vector<int> lastToken(world_, -1);
+  for (int t = 0; t < numTokens; ++t) {
+    for (int j = 0; j < topk_; ++j) {
+      const int id = ids[t * topk_ + j];
+      if (id == -1) continue;
+      if (id < -1 || id >= numExperts) {
+        throw std::invalid_argument("EP sim: expert id " + std::to_string(id) + " outside [-1, " +
+                                    std::to_string(numExperts) + ")");
+      }
+      ++hits[id];
+      const int to = id / expertsPerRank_;
+      if (lastToken[to] != t) {
+        lastToken[to] = t;
+        toList[static_cast<size_t>(to) * maxTokens_ + toCount[to]++] = t;
+      }
+    }
+  }
+  Finish(mine);
+
+  // Receive side.
+  const int lo = rank_ * expertsPerRank_;
+  std::fill(expertCount, expertCount + expertsPerRank_, 0);
+  int recv = 0;
+  for (int r = 0; r < world_; ++r) {
+    const int32_t* src = SlotOf(seq_, r)->Ints();
+    const int32_t* srcToCount = src + idsLen;
+    const int32_t* srcHits = srcToCount + world_;
+    const int32_t* srcList = srcHits + numExperts + static_cast<size_t>(rank_) * maxTokens_;
+    const int n = srcToCount[rank_];
+    if (recv + n > maxRecv_) {
+      throw std::runtime_error("EP sim rank " + std::to_string(rank_) +
+                               " receives more tokens than max_num_tokens_to_recv " +
+                               std::to_string(maxRecv_));
+    }
+    for (int e = 0; e < expertsPerRank_; ++e) expertCount[e] += srcHits[lo + e];
+    for (int i = 0; i < n; ++i) {
+      std::memcpy(recvIds + static_cast<size_t>(recv++) * topk_, src + srcList[i] * topk_,
+                  sizeof(int32_t) * topk_);
+    }
+  }
+  return recv;
+}
+
+void EpSim::Combine() { Finish(Begin(1, combineUs_, 0)); }
+
+void EpSim::Wait() const {
+  // Spin the last 20 us: the scheduler's wake-up delay would dominate a short op.
+  FineTimerSlack();
   constexpr auto kSpinTail = std::chrono::microseconds(20);
-  const Clock::time_point end{std::chrono::nanoseconds(deadlineNs)};
+  const Clock::time_point end{std::chrono::nanoseconds(deadlineNs_)};
   if (end - Clock::now() > kSpinTail) std::this_thread::sleep_until(end - kSpinTail);
   while (Clock::now() < end) {
   }

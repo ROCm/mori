@@ -508,9 +508,10 @@ if __name__ == "__main__":
 | `GLOO_SOCKET_IFNAME` | — | TCP interface for torch distributed (e.g., `enp81s0f1`) |
 | `MASTER_ADDR` | — | Torch distributed master address |
 | `MASTER_PORT` | — | Torch distributed master port |
-| `MORI_EP_SIM_ENABLE` | `0` | `1`: run `EpDispatchCombineOp` without a GPU. Dispatch and combine launch no kernel and move no token; each sleeps a fixed time instead. Outputs keep their shapes but are not written, and `total_recv` is the rank's own token count. Routing handles and the standard-MoE helpers are not simulated. |
-| `MORI_EP_SIM_DISPATCH_US` | — (required with sim) | Simulated dispatch duration in microseconds. With AsyncLL, `dispatch()` starts it and `dispatch_recv()` sleeps out what is left. |
-| `MORI_EP_SIM_COMBINE_US` | — (required with sim) | Simulated combine duration in microseconds; `combine_recv()` as above. |
+| `MORI_EP_SIM_ENABLE` | `0` | `1`: run `EpDispatchCombineOp` without a GPU. No kernel runs and no token moves; the ranks of the EP group (all on one host) exchange their `indices` through shared memory. `dispatch()` returns outputs cut to the tokens this rank receives, so their shapes show the EP imbalance; `out_indices`, `total_recv` and `local_expert_count` hold the real values, the other outputs are not written. `combine()` returns outputs cut to the rank's own tokens. Like the real barrier, an op ends on every rank at the latest arrival plus its latency. Routing handles and the standard-MoE helpers are not simulated. |
+| `MORI_EP_SIM_DISPATCH_US` | — (required with sim) | Simulated dispatch latency in microseconds. With AsyncLL, `dispatch()` waits for every rank's send and `dispatch_recv()` sleeps out the rest. |
+| `MORI_EP_SIM_COMBINE_US` | — (required with sim) | Simulated combine latency in microseconds; `combine_recv()` as above. |
+| `MORI_EP_SIM_GROUP` | — | Shared-memory name for the sim when `torch.distributed` is not initialized: the same on every rank, unique per job. |
 
 ---
 

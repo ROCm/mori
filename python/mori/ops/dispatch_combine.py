@@ -135,6 +135,32 @@ def _maybe_get_cco_comm(config):
     return _CCO_COMM
 
 
+_ep_sim_ops = 0
+
+
+def _ep_sim_group(config):
+    """Shared-memory name of one EP op: the same on all its ranks, unique per op and job."""
+    global _ep_sim_ops
+    n, _ep_sim_ops = _ep_sim_ops, _ep_sim_ops + 1
+    if config.world_size == 1:
+        return ""
+    if os.environ.get("MORI_EP_SIM_GROUP"):
+        return f"{os.environ['MORI_EP_SIM_GROUP']}.{n}"
+    if not dist.is_initialized():
+        raise RuntimeError(
+            "MORI_EP_SIM_ENABLE with world_size > 1 needs torch.distributed "
+            "or MORI_EP_SIM_GROUP to name the shared memory"
+        )
+    import uuid
+
+    # Only the default store is used, so any (or a faked) process-group backend works.
+    store = dist.distributed_c10d._get_default_store()
+    key = f"mori_ep_sim/{dist.get_rank() - config.rank}/{n}"
+    if config.rank == 0:
+        store.set(key, uuid.uuid4().hex[:16])
+    return f"{store.get(key).decode()}.{n}"
+
+
 class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
     def __str__(self):
         return self.name
@@ -695,65 +721,99 @@ class EpDispatchCombineOp:
     # Simulation (MORI_EP_SIM_ENABLE): no GPU, no kernel; each op sleeps in C++
     # ------------------------------------------------------------------
     def _init_sim(self):
+        cfg = self.config
+        self._sim_ep = mori_cpp.EpSim(
+            _ep_sim_group(cfg),
+            cfg.rank,
+            cfg.world_size,
+            cfg.max_num_inp_token_per_rank,
+            cfg.num_experts_per_token,
+            cfg.num_experts_per_rank,
+            self.max_num_tokens_to_recv(),
+        )
+        self._sim_async = (
+            cfg.kernel_type.value == EpDispatchCombineKernelType.AsyncLL.value
+        )
         self._sim_bufs = {}
-        self._sim_deadline = 0
+        self._sim_num_tokens = 0
         self._sim_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.local_expert_count = torch.zeros(
-            self.config.num_experts_per_rank, dtype=torch.int32, device=self._sim_device
+            cfg.num_experts_per_rank, dtype=torch.int32, device=self._sim_device
         )
 
     def _sim_buf(self, name, shape, dtype, device):
-        # Outputs keep their real shapes; nothing writes them.
         key = (name, tuple(shape), dtype, device)
         if key not in self._sim_bufs:
             self._sim_bufs[key] = torch.empty(shape, dtype=dtype, device=device)
         return self._sim_bufs[key]
 
-    def _sim_run(self, phase):
-        # AsyncLL's send only starts the clock; its recv sleeps out the rest.
-        self._sim_deadline = mori_cpp.ep_sim_deadline(phase)
-        if self.config.kernel_type.value != EpDispatchCombineKernelType.AsyncLL.value:
-            mori_cpp.ep_sim_sleep_until(self._sim_deadline)
-
-    def _sim_dispatch(self, input, scales, routing, return_routing):
+    def _sim_dispatch(self, input, scales, indices, routing, return_routing):
+        """Outputs are cut to the tokens this rank receives under the real routing of every rank,
+        so their shapes carry the EP imbalance; out_indices holds those tokens' expert ids, the
+        other outputs are not written. AsyncLL's send waits for every rank's send."""
         if routing is not None or return_routing:
             raise NotImplementedError("routing handles are not simulated")
-        self._sim_run(mori_cpp.EpSimPhase.Dispatch)
-        n, k, dev = (
-            self.max_num_tokens_to_recv(),
-            self.config.num_experts_per_token,
-            input.device,
+        cfg, n, dev = self.config, int(input.size(0)), input.device
+        k, max_recv = cfg.num_experts_per_token, self.max_num_tokens_to_recv()
+        ids = indices.to("cpu", torch.int32).contiguous()
+        if tuple(ids.shape) != (n, k):
+            raise ValueError(f"indices must be [{n}, {k}], got {tuple(ids.shape)}")
+        # C++ writes host outputs in place; a torch copy here can cost ms when ranks share the
+        # host's CPUs, since each rank's intra-op thread pool assumes all of them.
+        cpu = torch.device("cpu")
+        out_ids = self._sim_buf("disp_i", (max_recv, k), TOPK_IDX_DTYPE, dev)
+        recv_ids = (
+            out_ids
+            if dev == cpu
+            else self._sim_buf("disp_i_host", out_ids.shape, torch.int32, cpu)
         )
+        lec = self.local_expert_count
+        count = (
+            lec
+            if lec.device == cpu
+            else self._sim_buf("lec_host", lec.shape, torch.int32, cpu)
+        )
+        total = self._sim_ep.dispatch(
+            ids.data_ptr(), n, recv_ids.data_ptr(), count.data_ptr()
+        )
+        if not self._sim_async:
+            self._sim_ep.wait()
+        self._sim_num_tokens = n
+        if recv_ids is not out_ids:
+            out_ids[:total].copy_(recv_ids[:total])
+        if count is not lec:
+            lec.copy_(count)
+
+        def out(name, cols, dtype):
+            return self._sim_buf(name, (max_recv, cols), dtype, dev)[:total]
+
         out_scales = None
-        if scales is not None and self.config.scale_dim > 0:
-            out_scales = self._sim_buf(
-                "disp_s", (n, self.config.scale_dim), scales.dtype, dev
-            )
+        if scales is not None and cfg.scale_dim > 0:
+            out_scales = out("disp_s", cfg.scale_dim, scales.dtype)
         total_recv = self._sim_buf("disp_total", (1,), TOPK_IDX_DTYPE, dev)
-        total_recv.fill_(
-            input.size(0)
-        )  # no routing model: a rank receives what it sends
+        total_recv.fill_(total)
         return (
-            self._sim_buf("disp_out", (n, input.size(1)), input.dtype, dev),
-            self._sim_buf("disp_w", (n, k), torch.float32, dev),
+            out("disp_out", input.size(1), input.dtype),
+            out("disp_w", k, torch.float32),
             out_scales,
-            self._sim_buf("disp_i", (n, k), TOPK_IDX_DTYPE, dev),
+            out_ids[:total],
             total_recv,
         )
 
     def _sim_combine(self, input, weights, routing):
+        """Outputs are cut to this rank's own tokens, the ones its last dispatch sent."""
         if routing is not None:
             raise NotImplementedError("routing handles are not simulated")
-        self._sim_run(mori_cpp.EpSimPhase.Combine)
-        n, dev = self.config.max_num_inp_token_per_rank, input.device
+        self._sim_ep.combine()
+        if not self._sim_async:
+            self._sim_ep.wait()
+        cfg, n, dev = self.config, self._sim_num_tokens, input.device
+        shape = (cfg.max_num_inp_token_per_rank, input.size(1))
         out_weights = None
         if weights is not None and weights.size(0) != 0:
-            k = self.config.num_experts_per_token
-            out_weights = self._sim_buf("comb_w", (n, k), weights.dtype, dev)
-        return (
-            self._sim_buf("comb_out", (n, input.size(1)), input.dtype, dev),
-            out_weights,
-        )
+            w_shape = (cfg.max_num_inp_token_per_rank, cfg.num_experts_per_token)
+            out_weights = self._sim_buf("comb_w", w_shape, weights.dtype, dev)[:n]
+        return (self._sim_buf("comb_out", shape, input.dtype, dev)[:n], out_weights)
 
     # ------------------------------------------------------------------
     # Kernel launch helpers
@@ -1274,7 +1334,7 @@ class EpDispatchCombineOp:
         return_routing: bool = False,
     ):
         if self._sim:
-            return self._sim_dispatch(input, scales, routing, return_routing)
+            return self._sim_dispatch(input, scales, indices, routing, return_routing)
         if routing is not None and return_routing:
             raise ValueError(
                 "pass either `routing=` (replay) or `return_routing=True` "
@@ -1505,7 +1565,7 @@ class EpDispatchCombineOp:
         call_local_expert_count: bool = False,
     ):
         if self._sim:
-            return mori_cpp.ep_sim_sleep_until(self._sim_deadline)
+            return self._sim_ep.wait()
         if hasattr(self, "_cached_dispatch_launch"):
             _, _, actual_wpb = self._cached_dispatch_launch
         else:
@@ -1910,7 +1970,7 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
     ):
         if self._sim:
-            return mori_cpp.ep_sim_sleep_until(self._sim_deadline)
+            return self._sim_ep.wait()
         if hasattr(self, "_cached_combine_launch"):
             _, _, actual_wpb = self._cached_combine_launch
         else:

@@ -22,20 +22,52 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace mori {
 namespace moe {
-// GPU-free EP (MORI_EP_SIM_ENABLE=1): dispatch and combine launch no kernel and move no token;
-// each sleeps the calling thread for MORI_EP_SIM_DISPATCH_US / MORI_EP_SIM_COMBINE_US instead.
+// GPU-free EP (MORI_EP_SIM_ENABLE=1): dispatch and combine launch no kernel and move no token.
+// The ranks of one EP group, all on this host, exchange their routing through shared memory, so
+// each rank learns which tokens it would receive; each op takes a fixed MORI_EP_SIM_DISPATCH_US /
+// MORI_EP_SIM_COMBINE_US and, as with the real cross-device barrier, ends on every rank at the
+// latest arrival + latency.
 namespace sim {
 
-enum class Phase { Dispatch, Combine };
-
 bool IsEnabled();
-// steady_clock time, in ns, at which an op of `phase` that starts now ends.
-int64_t Deadline(Phase phase);
-// Returns at once if `deadlineNs` has passed.
-void SleepUntil(int64_t deadlineNs);
+
+class EpSim {
+ public:
+  // `group` names the shared memory and is the same on every rank; "" only when worldSize == 1.
+  EpSim(const std::string& group, int rank, int worldSize, int maxTokens, int topk,
+        int expertsPerRank, int maxRecv);
+  ~EpSim();
+  EpSim(const EpSim&) = delete;
+  EpSim& operator=(const EpSim&) = delete;
+
+  // ids: [numTokens, topk] global expert ids, -1 = unrouted. Waits for every rank's dispatch, then
+  // writes the ids of the tokens this rank receives to recvIds ([maxRecv, topk], by source rank
+  // then token) and their count per local expert to expertCount; returns how many it received.
+  int Dispatch(const int32_t* ids, int numTokens, int32_t* recvIds, int32_t* expertCount);
+  // Waits for every rank's combine.
+  void Combine();
+  // Sleeps until the last Dispatch/Combine ends on every rank.
+  void Wait() const;
+
+ private:
+  struct Slot;
+  Slot* SlotOf(uint64_t seq, int rank) const;
+  // Begin stamps this rank's arrival into its slot; Finish publishes the slot and waits for all.
+  Slot* Begin(int phase, double latencyUs, int numTokens);
+  void Finish(const Slot* mine);
+
+  int rank_, world_, maxTokens_, topk_, expertsPerRank_, maxRecv_;
+  double dispatchUs_, combineUs_;
+  std::string name_;
+  size_t bytes_{0}, slotBytes_{0};
+  char* base_{nullptr};
+  uint64_t seq_{0};
+  int64_t deadlineNs_{0};
+};
 
 }  // namespace sim
 }  // namespace moe
