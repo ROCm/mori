@@ -117,6 +117,7 @@ def test_mode_is_accurate_and_reports_a_time(mode):
     assert r["max_rank_time_us"] > 0
 
 
+@pytest.mark.ci_full
 def test_fusing_beats_splitting_at_the_model_shape():
     """The op's whole claim, measured back to back on one box.
 
