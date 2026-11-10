@@ -1,5 +1,23 @@
 <h1 align="center">MORI</h1>
 
+<p align="center">
+  <b>Mo</b>dular <b>R</b>DMA <b>I</b>nterface: building blocks and libraries for high-performance GPU communication on AMD Instinct™ GPUs
+</p>
+
+<p align="center">
+  <a href="https://rocm.github.io/mori/"><img alt="Documentation" src="https://img.shields.io/badge/docs-rocm.github.io%2Fmori-C00000"></a>
+  <a href="https://pypi.org/project/amd-mori/"><img alt="PyPI" src="https://img.shields.io/pypi/v/amd-mori?label=pypi"></a>
+  <a href="https://pypi.org/project/amd-mori-nightly/"><img alt="PyPI nightly" src="https://img.shields.io/pypi/v/amd-mori-nightly?label=nightly"></a>
+</p>
+
+<p align="center">
+  <a href="https://rocm.github.io/mori/"><b>Documentation</b></a> |
+  <a href="https://rocm.github.io/mori/installation.html"><b>Installation</b></a> |
+  <a href="https://rocm.github.io/mori/quickstart.html"><b>Quickstart</b></a> |
+  <a href="https://rocm.github.io/mori/ep_backends.html"><b>Choosing an EP backend</b></a> |
+  <a href="https://rocm.github.io/mori/api/communication.html"><b>API reference</b></a>
+</p>
+
 ## News
 
 - **[2026/10]** 🔥 MoRI UMBP Empowers AMD Instinct™ MI355X GPU to Demonstrate Token-per-Dollar TCO Leadership on the Public AgentX Leaderboard ([blog](https://www.amd.com/en/developer/resources/technical-articles/2026/mori-umbp-empowers-amd-instinct-gpus.html)).
@@ -17,7 +35,7 @@
 
 ## Introduction
 
-<img src="docs/mori_arch_20260422_v1.jpg">
+<img alt="MORI architecture" src="https://raw.githubusercontent.com/ROCm/mori/main/docs/mori_arch_20260422_v1.jpg">
 
 **MORI** (**Mo**dular **R**DMA **I**nterface) is a **bottom-up, modular, and composable framework** for building high-performance communication applications with a strong focus on **RDMA + GPU integration**. Inspired by the role of MLIR in compiler infrastructure, MORI provides reusable and extensible building blocks that make it **easier for developers to adopt advanced techniques** such as IBGDA (Infiniband GPUDirect Async) and GDS (GPUDirect Storage).
 
@@ -37,13 +55,22 @@ To help developers get started quickly, MORI also includes a suite of optimized 
 
 ## Documentation
 
-| **Topic** | **Description** | **Guide** |
+📖 **<https://rocm.github.io/mori/>** — the full documentation, with navigation and search.
+It is built from [`docs/`](https://github.com/ROCm/mori/tree/main/docs) on every push to
+`main`, so it describes the development tree; each page's title names the commit.
+
+| **Topic** | **Description** | **Docs** |
 |---|---|---|
-| MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples | [EP Guide](docs/MORI-EP-GUIDE.md) |
-| MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](docs/MORI-SHMEM-GUIDE.md) |
-| MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](docs/MORI-IR-GUIDE.md) |
-| MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](docs/MORI-IO-GUIDE.md) |
-| MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](docs/PROFILER.md) |
+| Getting started | Installation, fabric checks, first steps and choosing an EP API | [Installation](https://rocm.github.io/mori/installation.html) · [Quickstart](https://rocm.github.io/mori/quickstart.html) · [EP backends](https://rocm.github.io/mori/ep_backends.html) |
+| MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples | [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-EP-BENCHMARK.html) · [RDMA bandwidth](https://rocm.github.io/mori/rdma_bandwidth_utilization.html) |
+| MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](https://rocm.github.io/mori/MORI-SHMEM-GUIDE.html) |
+| MORI-CCO | Explicit-handle GPU communication over LSA, GDA and SDMA; fused GEMM + collective operators | [CCO Guide](https://rocm.github.io/mori/MORI-CCO-GUIDE.html) · [Fused GEMM + Collective Guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html) |
+| MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](https://rocm.github.io/mori/MORI-IR-GUIDE.html) |
+| MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](https://rocm.github.io/mori/MORI-IO-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) |
+| MORI-UMBP | Unified memory & bandwidth pool: tiered storage, distributed KV access, transfer simulation | [Single-Node Smoke Test](https://rocm.github.io/mori/MORI-UMBP-SINGLE-NODE-GUIDE.html) · [Simulation](https://rocm.github.io/mori/umbp-simulation.html) · [Calibration](https://rocm.github.io/mori/umbp-calibration.html) · [PD Benchmark](https://rocm.github.io/mori/MORI-UMBP-PD-BENCHMARK.html) · [Tier-Management Benchmark](https://rocm.github.io/mori/UMBP-TIER-MANAGEMENT-BENCHMARK.html) |
+| MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](https://rocm.github.io/mori/PROFILER.html) |
+| API reference | Python APIs of EP, SHMEM, IO and IR; the profiler; the UMBP master client | [Communication](https://rocm.github.io/mori/api/communication.html) · [Profiler](https://rocm.github.io/mori/api/profiler.html) · [UMBP](https://rocm.github.io/mori/api/umbp.html) |
+| Internals | Host pre-compiled + device JIT architecture; the EPv2 HIP backend's JIT | [JIT Architecture](https://rocm.github.io/mori/MORI_JIT_ARCHITECTURE.html) · [JIT v2 Design](https://rocm.github.io/mori/MORI_JIT_V2_DESIGN.html) (Chinese) |
 
 ## Benchmarks
 
@@ -339,9 +366,9 @@ tools/run_internode_io_benchmark.sh --rank 0 --master-addr "10.194.129.65" --ifn
 # (run the same command on the second node with --rank 1)
 ```
 
-See [docs/MORI-IO-BENCHMARK.md](docs/MORI-IO-BENCHMARK.md) for both engines and tuning.
+See the [MORI-IO benchmark guide](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) for both engines and tuning.
 
-### Test MORI-IR (Triton + shmem integration, [guide](python/mori/ir/README.md))
+### Test MORI-IR (Triton + shmem integration, [guide](https://github.com/ROCm/mori/blob/main/python/mori/ir/README.md))
 
 ```bash
 # Basic shmem put (2 GPUs)
