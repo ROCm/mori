@@ -303,6 +303,18 @@ jobs:
             timeout 300 ./build_io/tests/cpp/test_engine
           "
 
+      - name: MORI-RAS C++
+        run: |
+          # BUILD_RAS defaults to OFF until RAS matures, so no other step builds RAS. This one
+          # keeps it compiling and its tests running.
+          $CT exec $CONTAINER bash -c "
+            set -e
+            cd $GITHUB_WORKSPACE
+            cmake -B build_ras -DBUILD_RAS=ON -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF
+            cmake --build build_ras -j --target ras_tests
+            cd build_ras && timeout 300 ctest -R '^ras_' --output-on-failure
+          "
+
       - name: MORI-IO fault catalog (ibverbs)
         id: fault_ibverbs
         # The catalog's known_bug expectations were measured on ionic; other NICs

@@ -896,3 +896,42 @@ def test_gemm_ar_modes_agree(mode):
     assert record["validated"] is True
     assert record["max_rank_time_us"] > 0
     assert record["rel_l2"] < 5e-3
+
+
+@pytest.mark.parametrize(
+    "mode,k,extra",
+    [
+        # Every mode the BF16 kernel serves, at an odd K step count (192 / 64).
+        ("gemm-only", 192, ()),
+        ("split-sdma", 192, ()),
+        ("fused-sdma", 192, ()),
+        # K_ITERS == 2: no main-loop step, only the two peeled ones.
+        ("fused-sdma", 128, ()),
+        # Kimi-K3's shared-expert down_proj and attention o_proj, K per rank.
+        ("fused-sdma", 768, ()),
+        ("fused-sdma", 1536, ()),
+        # The narrow row tile, the other one the BF16 op accepts.
+        ("fused-sdma", 768, ("--block-m", "128")),
+        # Reduce-scatter only, and the fp8 all-gather wire.
+        ("fused-sdma", 768, ("--collective", "rs")),
+        ("fused-sdma", 768, ("--gather-dtype", "fp8", "--gather-transport", "lsa")),
+    ],
+)
+def test_bf16_gemm_all_reduce_validates(mode, k, extra):
+    """``--quant bf16``: the BF16 GEMM, alone and with the all-reduce.
+
+    The bench validates every row of the result against an fp32 reference and
+    gates it two-sided where the wire is lossy, so ``validated`` is the
+    assertion; the rest checks that the configuration asked for is the one that
+    ran.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    pytest.importorskip("flydsl")
+    record = _run_bench(2, mode, 512, 1024, k, ("--quant", "bf16", *extra))
+    assert record["validated"] is True, record
+    assert record["quant"] == "bf16" and record["k"] == k, record
+    if "fp8" in extra:
+        assert record["gather_dtype"] == "fp8", record
+    else:
+        assert record["rel_l2"] < 3e-3, record
