@@ -28,7 +28,8 @@ measurement table and the negative results.
 
 - [Performance at a glance](#performance-at-a-glance)
 - [What every operator has in common](#what-every-operator-has-in-common)
-- [GEMM + all-reduce and reduce-scatter](fused-gemm-ar.md)
+- [GEMM + all-reduce](fused-gemm-ar.md)
+- [GEMM + reduce-scatter](fused-gemm-rs.md)
 - [GEMM + all-to-all](fused-gemm-a2a.md)
 - [GEMM + all-gather](fused-gemm-ag.md)
 - [All-gather + GEMM](fused-ag-gemm.md)

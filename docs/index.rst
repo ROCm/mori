@@ -29,7 +29,8 @@ New to MORI? :doc:`Install it <installation>`, then work through the :doc:`quick
    :caption: MORI-FUSED
 
    Overview <MORI-CCO-FUSED-OPS-GUIDE>
-   GEMM + all-reduce / reduce-scatter <fused-gemm-ar>
+   GEMM + all-reduce <fused-gemm-ar>
+   GEMM + reduce-scatter <fused-gemm-rs>
    GEMM + all-to-all <fused-gemm-a2a>
    GEMM + all-gather <fused-gemm-ag>
    All-gather + GEMM <fused-ag-gemm>
