@@ -303,6 +303,49 @@ def permlane_tile_constraint(block_n: int) -> str | None:
     return None
 
 
+def _option_constraint(
+    quant: str,
+    block_m: int,
+    block_n: int,
+    scatter_dtype: str,
+    gather_dtype: str,
+    gather_transport: str,
+) -> str | None:
+    """Why the constructor rejects these options, or None.
+
+    One copy for the constructor and ``supports``: the predicate used to skip
+    the permlane epilogue's block_n rule and the bf16 quantisation's wire
+    rule, and answered True where construction raised. ``quant`` must already
+    be one of ``QUANTS``.
+    """
+    # Each quantisation has exactly one legal BLOCK_M (see _quant_block_m).
+    # Reject a mismatch loudly rather than compiling a kernel whose scale
+    # indexing does not match the operand handed in.
+    why = _quant_tile_constraint(quant, block_m)
+    if why is not None:
+        return why
+    if quant == BF16_QUANT and scatter_dtype != "bf16":
+        return "quant='bf16' supports only the bf16 scatter wire"
+    if scatter_dtype not in WIRE_DTYPES:
+        return f"scatter_dtype={scatter_dtype!r} is not one of {WIRE_DTYPES}"
+    if gather_dtype not in WIRE_DTYPES:
+        return f"gather_dtype={gather_dtype!r} is not one of {sorted(WIRE_DTYPES)}"
+    if gather_transport not in GATHER_TRANSPORTS:
+        return (
+            f"gather_transport={gather_transport!r} is not one of "
+            f"{sorted(GATHER_TRANSPORTS)}"
+        )
+    why = permlane_tile_constraint(block_n)
+    if why is not None:
+        return why
+    # The tile has to be legal before the padding arithmetic runs: both
+    # padded_m and default_max_shapes divide by world_size * block_m.
+    why = _tile_constraints(block_m, block_n)
+    if why is not None:
+        return f"unsupported tile: {why}"
+    return None
+
+
 def _gemm_constraints(
     n: int, k: int, block_n: int, quant: str = "blockscale"
 ) -> str | None:
@@ -405,10 +448,16 @@ def supports(
     # block_m follows the quantisation unless the caller pins it; passing the
     # wrong one is a rejection rather than a silent reinterpretation.
     block_m = _default_block_m(quant) if block_m is None else block_m
-    # Tile and world size first: everything below divides by their product.
-    if world_size < 1 or _tile_constraints(block_m, block_n) is not None:
+    # World size and the constructor's option checks, the tile among them,
+    # first: everything below divides by world_size * block_m.
+    if world_size < 1:
         return False
-    if _quant_tile_constraint(quant, block_m) is not None:
+    if (
+        _option_constraint(
+            quant, block_m, block_n, scatter_dtype, gather_dtype, gather_transport
+        )
+        is not None
+    ):
         return False
     if m <= 0 or _gemm_constraints(n, k, block_n, quant) is not None:
         return False
@@ -690,37 +739,14 @@ class GemmAllReduceOp:
 
         if quant not in QUANTS:
             raise ValueError(f"quant={quant!r} is not one of {sorted(QUANTS)}")
-        # Each quantisation has exactly one legal BLOCK_M (see _quant_block_m).
-        # Default to it, and reject a mismatch loudly rather than compiling a
-        # kernel whose scale indexing does not match the operand handed in.
+        # Default block_m to the quantisation's one legal BLOCK_M.
         if block_m is None:
             block_m = _default_block_m(quant)
-        why = _quant_tile_constraint(quant, block_m)
+        why = _option_constraint(
+            quant, block_m, block_n, scatter_dtype, gather_dtype, gather_transport
+        )
         if why is not None:
             raise ValueError(why)
-        if quant == BF16_QUANT and scatter_dtype != "bf16":
-            raise ValueError("quant='bf16' supports only the bf16 scatter wire")
-        if scatter_dtype not in WIRE_DTYPES:
-            raise ValueError(
-                f"scatter_dtype={scatter_dtype!r} is not one of {WIRE_DTYPES}"
-            )
-        if gather_dtype not in WIRE_DTYPES:
-            raise ValueError(
-                f"gather_dtype={gather_dtype!r} is not one of {sorted(WIRE_DTYPES)}"
-            )
-        if gather_transport not in GATHER_TRANSPORTS:
-            raise ValueError(
-                f"gather_transport={gather_transport!r} is not one of "
-                f"{sorted(GATHER_TRANSPORTS)}"
-            )
-        why = permlane_tile_constraint(block_n)
-        if why is not None:
-            raise ValueError(why)
-        # The tile has to be legal before the padding arithmetic runs: both
-        # padded_m and default_max_shapes divide by world_size * block_m.
-        why = _tile_constraints(block_m, block_n)
-        if why is not None:
-            raise ValueError(f"unsupported tile: {why}")
         if m_max < 1 or sdma_queues < 1:
             raise ValueError(
                 f"m_max and sdma_queues must both be >= 1; got m_max={m_max} "

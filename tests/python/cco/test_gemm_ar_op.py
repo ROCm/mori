@@ -95,6 +95,14 @@ def test_supports_accepts_world_sizes_that_divide_the_block(world_size):
     assert supports(512, 1024, 512, world_size) is True
 
 
+def test_supports_rejects_an_fp8_scatter_under_bf16_quant():
+    """``supports`` said yes to this, and construction raised: the predicate
+    skipped the constructor's option checks, which it now shares through
+    ``_option_constraint``."""
+    assert supports(512, 1024, 512, 2, quant="bf16") is True
+    assert supports(512, 1024, 512, 2, quant="bf16", scatter_dtype="fp8") is False
+
+
 def test_supports_requires_the_fp8_row_multiple():
     """The fp8 conversion gives one wave a row, so N must be a whole wave-chunk."""
     assert supports(512, 7168, 512, 8, gather_dtype="fp8") is True
@@ -246,14 +254,17 @@ def test_supports_rejects_tiles_the_kernel_cannot_build(block_m):
     assert supports(4096, 7168, 2048, 8, block_m=block_m) is False
 
 
-@pytest.mark.parametrize("block_n", [128, 384, 0])
+@pytest.mark.parametrize("block_n", [128, 384, 512, 0])
 def test_supports_rejects_n_tiles_the_kernel_cannot_build(block_n):
+    """512 is a multiple of 256, which is all ``_tile_constraints`` asks, but
+    the permlane store pairs exactly two N tiles (``permlane_tile_constraint``).
+    ``supports`` used to answer True for it, and construction raised."""
     assert supports(4096, 7168, 2048, 8, block_n=block_n) is False
 
 
 def test_supports_accepts_the_legal_tile_multiples():
-    """256x512 is legal even though it is not the default 128x256."""
-    assert supports(4096, 7168, 2048, 8, block_m=256, block_n=512) is True
+    """256x256 is legal even though it is not the default 128x256."""
+    assert supports(4096, 7168, 2048, 8, block_m=256, block_n=256) is True
 
 
 @pytest.mark.parametrize("world_size", [0, -1])
