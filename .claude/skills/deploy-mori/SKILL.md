@@ -66,7 +66,7 @@ fi
 Probe optional mount paths on the host, only include ones that exist:
 
 ```bash
-for p in /shared /apps /dev/infiniband /sys/kernel/config /sys/kernel/debug; do
+for p in /shared /apps /boot /dev/infiniband /sys/kernel/config /sys/kernel/debug; do
   [ -e "$p" ] && echo "EXISTS: $p" || echo "MISSING: $p"
 done
 ```
@@ -91,6 +91,7 @@ sudo docker run \
     -v /shared:/shared \         # only if exists
     -v /apps:/apps \             # only if exists
     -v /lib/modules:/lib/modules \
+    -v /boot:/boot:ro \          # only if exists; Step 8 reads the host kernel config from it
     -v /sys/kernel/config:/sys/kernel/config \   # REQUIRED for bnxt DCQCN (configfs)
     -v /sys/kernel/debug:/sys/kernel/debug \     # REQUIRED for bnxt DCQCN (debugfs)
     --rm \
@@ -625,6 +626,72 @@ only `4: Warm Reboot` supported — a host reboot is the only recovery path.
 
 ---
 
+## Step 8: Check cco P2P support (kernel dma-buf)
+
+`mori-cco` (EPv2, `dispatch_combine_v2`) shares every symmetric window between ranks as a
+dma-buf. On a kernel built without `CONFIG_DMABUF_MOVE_NOTIFY` / `CONFIG_PCI_P2PDMA` the
+peer import is pinned in host memory instead of mapped peer-to-peer: EPv2 is ~9x slower, or
+on some hosts never finishes starting (every rank's KFD queues stay evicted). Nothing
+errors. Check it on every new box that will run EPv2. Details and fixes: the
+`known-issues` skill (Issue 1).
+
+**8a — Read the kernel config.** The container shares the host kernel. Both options must
+print `=y`:
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c "
+R=\$(uname -r)
+for f in /boot/config-\$R /lib/modules/\$R/build/.config; do
+  [ -r \$f ] && { echo \"config: \$f\"; grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' \$f; break; }
+done"
+```
+
+No `config:` line means the container cannot see the config (`/boot` was not mounted in
+Step 1; `/lib/modules/*/build` exists only where the host has its kernel headers). Do not
+stop here:
+
+- Host access given (ssh host, or the user can run commands there): run the same `grep`
+  on the host. The kernel release is the container's `uname -r`.
+- Otherwise ask the user to run `grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)`
+  on the host and paste the output, or go to 8b.
+
+**8b — Without a config.** `CONFIG_PCI_P2PDMA` shows in the symbols (`p2pdma.c` is built
+only with it; a non-root user still sees the names):
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c \
+  "grep -q ' pci_p2pdma_distance_many\$' /proc/kallsyms && echo PCI_P2PDMA=y || echo PCI_P2PDMA=missing"
+```
+
+`CONFIG_DMABUF_MOVE_NOTIFY` leaves no symbol, so test the result instead. `vmm_peer_probe`
+needs `hipcc`, at least 2 GPUs and ~2 GB of VRAM; it allocates VMM memory on one GPU, grants
+peer access from another, and reads whether the buffer stayed in VRAM:
+
+```bash
+sudo docker exec -w "$MORI_REPO_DIR/.claude/skills/known-issues" $CONTAINER_NAME bash -c "
+hipcc -O3 --offload-arch=\$(rocminfo | grep -m1 -o 'gfx[0-9a-f]*') vmm_peer_probe.cpp -o /tmp/vmm_peer_probe &&
+/tmp/vmm_peer_probe 1 0 2"
+```
+
+It needs `/sys/class/drm/card*/device/mem_info_vram_used` to be readable. `VERDICT: OK` means
+the kernel is fine; `VERDICT: AFFECTED` means follow the fix in `known-issues`.
+
+**Reading the result**
+
+| Result | Meaning |
+|---|---|
+| both options `=y`, or probe `VERDICT: OK` | fine |
+| either option missing, or `VERDICT: AFFECTED` | EPv2 will be slow or hang; tell the user, point to `known-issues` Issue 1 |
+| `PCI_P2PDMA=y` from kallsyms only, no probe run | `MOVE_NOTIFY` is unknown, say so; do not report the box as healthy |
+| nothing readable, no `hipcc` or one GPU | unknown; ask the user for the host `grep` |
+
+**MI355X uses the FD path.** `ccoCommCreate` tries a fabric handle first and falls back to
+dma-buf FDs. On MI355X `hipDeviceAttributeHandleTypeFabricSupported` is 0, so the FD path is
+the normal one and the kernel options above are what matter. With
+`MORI_GLOBAL_LOG_LEVEL=info` the log shows `fabric handle probe failed, using FD path`.
+
+---
+
 ## Known environment issues
 
 Some machines are configured in ways that make MORI slow without anything being wrong
@@ -642,7 +709,8 @@ performance problem that only shows up on one machine. The most common one:
   grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)
   ```
 
-  Both must print `=y`. See `.claude/skills/known-issues/SKILL.md`.
+  Both must print `=y`. In a container without the config, see Step 8 above. Details:
+  `.claude/skills/known-issues/SKILL.md`.
 
 ---
 
@@ -654,8 +722,8 @@ performance problem that only shows up on one machine. The most common one:
 - GPU arch and NIC type as reported by MORI
 - Kernels: JIT on first use (`~/.mori/jit/`)
 - `mori check` result — include full output, highlight any `[WARN]` or `[FAIL]`
-- Kernel `CONFIG_PCI_P2PDMA` / `CONFIG_DMABUF_MOVE_NOTIFY` — flag it if either is
-  missing (see Known environment issues above)
+- Kernel `CONFIG_PCI_P2PDMA` / `CONFIG_DMABUF_MOVE_NOTIFY` (Step 8) — flag it if either is
+  missing, and say when one could not be checked
 - Attach command (working directory set to the MORI source tree):
 
 ```bash

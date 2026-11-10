@@ -26,6 +26,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -456,6 +458,27 @@ static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
   return hipSuccess;
 }
 
+// Warn when the kernel lacks CONFIG_PCI_P2PDMA: a peer window import is then pinned in
+// system memory instead of mapped peer-to-peer, and KFD may keep every rank's queues
+// evicted. p2pdma.c is built only with that option, so its symbol in
+// /proc/kallsyms ("<addr> <type> <name> [module]") tells, with or without a readable
+// kernel config. dma_buf_attach is always built: seeing it shows the names are listed.
+static void CcoWarnIfNoDmabufP2P() {
+  std::ifstream ksyms("/proc/kallsyms");
+  std::string addr, type, name;
+  bool listed = false, p2p = false;
+  while (!p2p && ksyms >> addr >> type >> name) {
+    ksyms.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    listed |= name == "dma_buf_attach";
+    p2p = name == "pci_p2pdma_distance_many";
+  }
+  if (listed && !p2p) {
+    MORI_SHMEM_WARN(
+        "ccoCommCreate: kernel lacks CONFIG_PCI_P2PDMA — peer window imports may be pinned in "
+        "system memory and leave KFD queues evicted");
+  }
+}
+
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
                              ccoComm** outComm) {
   // Pin this thread to its GPU's NUMA-local CPUs before the bootstrap, the
@@ -663,6 +686,8 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
       // (e.g. a torch kernel launch) would report it as its own error.
       (void)hipGetLastError();
       MORI_SHMEM_INFO("ccoCommCreate: fabric handle probe failed, using FD path");
+      // Peers import windows as dma-bufs on this path. One report per host.
+      if (comm->lsaSize > 1 && comm->lsaRank == 0) CcoWarnIfNoDmabufP2P();
     }
   }
 
