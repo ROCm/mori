@@ -398,17 +398,39 @@ std::optional<uint8_t> ReadIoQpMinRnrTimerEnv() {
   return ReadQpRetryAttrEnv("MORI_IO_QP_MIN_RNR_TIMER", "MORI_RDMA_QP_MIN_RNR_TIMER", 31);
 }
 
+// RDMA READs (and atomics) a requester QP keeps in flight, applied as max_rd_atomic at
+// RTS; unset keeps the device limit. The ionic driver rounds the value down to 2^k - 1
+// (1, 3, 7, 15). 0 would leave the QP unable to issue READs at all.
+std::optional<uint8_t> ReadIoQpMaxRdAtomicEnv() {
+  std::optional<uint8_t> value =
+      ReadQpRetryAttrEnv("MORI_IO_QP_MAX_RD_ATOMIC", "MORI_RDMA_QP_MAX_RD_ATOMIC", 255);
+  if (value.has_value() && value.value() == 0) {
+    MORI_APP_WARN("Ignore a max_rd_atomic override of 0: a QP needs at least one READ in flight");
+    return std::nullopt;
+  }
+  return value;
+}
+
 bool ReadIbEnableRelaxedOrderingEnv() {
   std::optional<uint8_t> enable = ReadUint8FromEnvVar("MORI_IB_ENABLE_RELAXED_ORDERING");
   return enable.has_value() && enable.value() == 1;
 }
 
 int MaybeAddRelaxedOrderingFlag(int accessFlag) {
-#ifdef IBV_ACCESS_RELAXED_ORDERING
+  // IBV_ACCESS_RELAXED_ORDERING is an enumerator of enum ibv_access_flags in
+  // <infiniband/verbs.h> (= IBV_ACCESS_OPTIONAL_FIRST, 1 << 20), not a macro. Guarding it
+  // with #ifdef is therefore always false, which compiled this branch out and made
+  // MORI_IB_ENABLE_RELAXED_ORDERING a silent no-op.
   if (ReadIbEnableRelaxedOrderingEnv()) {
+    static const bool logged = [] {
+      MORI_APP_INFO(
+          "MORI_IB_ENABLE_RELAXED_ORDERING=1: registering memory regions with "
+          "IBV_ACCESS_RELAXED_ORDERING");
+      return true;
+    }();
+    (void)logged;
     return accessFlag | IBV_ACCESS_RELAXED_ORDERING;
   }
-#endif
   return accessFlag;
 }
 

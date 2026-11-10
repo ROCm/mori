@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -41,6 +40,8 @@ import pytest
 import torch
 
 from mori.ops.ag_gemm import MAX_CHUNKS, MAX_WORLD, AgGemmConfig
+
+from . import kfd_settle
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BENCH = REPO_ROOT / "benchmark" / "cco" / "flydsl" / "ag_gemm" / "bench_ag_gemm.py"
@@ -96,12 +97,11 @@ requires_gpus = pytest.mark.skipif(
 
 
 def _run_bench(*args, last=False):
-    time.sleep(_SETTLE_SECONDS)
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
     world = min(8, torch.cuda.device_count())
-    result = subprocess.run(
+    result = kfd_settle.run(
         [
             sys.executable,
             "-m",

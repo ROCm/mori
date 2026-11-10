@@ -205,6 +205,8 @@ std::optional<uint8_t> ReadIoQpTimeoutEnv();
 std::optional<uint8_t> ReadIoQpRetryCntEnv();
 std::optional<uint8_t> ReadIoQpRnrRetryEnv();
 std::optional<uint8_t> ReadIoQpMinRnrTimerEnv();
+// RDMA READs (and atomics) a requester QP keeps in flight; unset keeps the device limit.
+std::optional<uint8_t> ReadIoQpMaxRdAtomicEnv();
 
 bool ReadIbEnableRelaxedOrderingEnv();
 int MaybeAddRelaxedOrderingFlag(int accessFlag);

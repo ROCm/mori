@@ -33,7 +33,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import time
 
@@ -52,6 +51,8 @@ from mori.ops.gemm_ar.op import (  # noqa: E402
     padded_m,
     supports,
 )
+
+from . import kfd_settle  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 WORKER = pathlib.Path(__file__).with_name("gemm_ar_op_worker.py")
@@ -370,11 +371,10 @@ def _run_worker_multi(world_size: int, case: str, *extra: str, timeout: int = 90
 def _spawn_worker(
     world_size: int, case: str, *extra: str, timeout: int = 900, last: bool = False
 ):
-    time.sleep(_SETTLE_SECONDS)
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
-    result = subprocess.run(
+    result = kfd_settle.run(
         [
             sys.executable,
             "-m",
@@ -741,7 +741,8 @@ def test_close_releases_and_is_idempotent(worker_results):
 
 
 @requires_two_gpus
-def test_reduce_scatter_returns_my_band_of_the_sum(worker_results):
+@pytest.mark.parametrize("case", ["reduce_scatter", "bf16_reduce_scatter"])
+def test_reduce_scatter_returns_my_band_of_the_sum(worker_results, case):
     """``GemmReduceScatterOp`` end to end: the all-reduce pipeline minus the gather.
 
     Each rank gets ``[M/P, N]``, rows ``rank*M/P`` onward of the sum, at the fp8
@@ -750,9 +751,11 @@ def test_reduce_scatter_returns_my_band_of_the_sum(worker_results):
     wrong one). The comparison against the *next* rank's band has to fail, or
     the floor check cannot tell a wrong band offset from a right one. Its self-test
     must pass and must catch a scatter that did not happen, like the
-    all-reduce's.
+    all-reduce's. Run for blockscale and for ``quant="bf16"``, whose GEMM is a
+    different kernel feeding the same tail; 3e-3 is the BF16 output's rounding
+    floor as well as fp8's.
     """
-    r = _case(worker_results, "reduce_scatter")
+    r = _case(worker_results, case)
     assert r["self_test_passes"], r
     assert r["detects_missing_scatter"], r
     calls = [key for key in r if key.startswith("call") and key.count("_") == 1]
@@ -764,7 +767,8 @@ def test_reduce_scatter_returns_my_band_of_the_sum(worker_results):
 
 
 @requires_two_gpus
-def test_reduce_scatter_survives_a_slow_reader(worker_results):
+@pytest.mark.parametrize("case", ["reduce_scatter", "bf16_reduce_scatter"])
+def test_reduce_scatter_survives_a_slow_reader(worker_results, case):
     """No rank may push into a peer's recv slot while that peer still reads it.
 
     The reduce reads slots the peers fill and the next call's epilogue refills
@@ -776,7 +780,7 @@ def test_reduce_scatter_survives_a_slow_reader(worker_results):
     relL2 0.71 on one call in an alternating-M run. Every value is the worst
     over all ranks.
     """
-    r = _case(worker_results, "reduce_scatter")
+    r = _case(worker_results, case)
     assert r["slow_peer_order"][-1] == "rs_barrier", r
     # The hold has to have run, on the rank each call names, or every check
     # below passes vacuously (it did: the plan was stored under a key the op
@@ -789,3 +793,19 @@ def test_reduce_scatter_survives_a_slow_reader(worker_results):
     # Negative control: the same schedule without rs_barrier must corrupt a
     # held rank's band.
     assert max(r[f"unbarriered{i}"] for i in range(4)) > 0.5, r
+
+
+@requires_two_gpus
+def test_bf16_all_reduce_lands_at_the_bf16_floor(worker_results):
+    """``quant="bf16"`` through the public op: BF16 A, the checkpoint's
+    row-major weight, no scales -- two M through one instance with fresh
+    operands, then the fp8 gather, whose e4m3 wire costs ~2.5e-2 and must cost
+    something (a gate below 5e-3 would mean the wire stayed bf16). What the
+    launch would reinterpret as int16 is refused."""
+    r = _case(worker_results, "bf16_all_reduce")
+    calls = [key for key in r if key.startswith("call")]
+    assert len(calls) == 3, r
+    for key in calls:
+        assert r[key] < FP8_FLOOR, (key, r)
+    assert 5e-3 < r["fp8_gather"] < 4e-2, r
+    assert r["refuses_fp8_a"] and r["refuses_with_scale"] and r["refuses_wrong_n"], r

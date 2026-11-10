@@ -612,6 +612,14 @@ std::vector<bool> SSDTier::BatchWrite(const std::vector<std::string>& keys,
   if (ok) {
     for (size_t i : prepared_index) results[i] = true;
   }
+  if (payload_timing_observer_ && ssdperf::Enabled()) {
+    const auto cleanup_started = ssdperf::Now();
+    prepared.clear();
+    built.clear();
+    const double cleanup_ms = ssdperf::MsSince(cleanup_started);
+    payload_timing_observer_(
+        static_cast<uint64_t>((build_ms + io_ms + sync_ms + cleanup_ms) * 1e6));
+  }
   return results;
 }
 
@@ -860,6 +868,9 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
         ssdperf::Pct(crc_ms, total_ms), ssdperf::GbPerSec(verified_bytes, io_ms),
         ssdperf::GbPerSec(verified_bytes, crc_ms), use_batch);
   }
+
+  if (payload_timing_observer_ && ssdperf::Enabled())
+    payload_timing_observer_(static_cast<uint64_t>((io_ms + crc_ms) * 1e6));
 
   return results;
 }
@@ -1203,6 +1214,13 @@ std::vector<EvictionHint> SSDTier::EvictionOrder(size_t max_keys) {
   out.reserve(picks.size());
   for (auto& [key, bytes] : picks) out.push_back(EvictionHint{std::move(key), bytes});
   return out;
+}
+
+void SSDTier::Touch(const std::vector<std::string>& keys) {
+  std::lock_guard<std::mutex> lock(mu_);
+  for (const auto& key : keys) {
+    if (index_.FindKey(key) != nullptr) index_.TouchLRU(key);
+  }
 }
 
 void SSDTier::Clear() {
