@@ -26,6 +26,7 @@
 #include <cassert>
 
 #include "mori/ops/dispatch_combine/launch.hpp"
+#include "mori/ops/dispatch_combine/sim.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/pybind/profiler_registry.hpp"
 #include "mori/utils/hip_helper.hpp"
@@ -55,6 +56,80 @@ hipDataType IntToHipDataType(int dtype) {
     default:
       throw std::runtime_error("Unsupported dtype int: " + std::to_string(dtype));
   }
+}
+
+void RequireDevice(const mori::moe::EpDispatchCombineHandle& handle, const char* what) {
+  if (handle.sim) {
+    throw std::runtime_error(
+        std::string(what) +
+        " needs device buffers, which a MORI_EP_SIM_ENABLE handle does not have");
+  }
+}
+
+mori::moe::sim::EpSim& Sim(mori::moe::EpDispatchCombineHandle& handle) {
+  if (!handle.sim) throw std::runtime_error("handle was built without MORI_EP_SIM_ENABLE");
+  return *handle.sim;
+}
+
+void EpSimStart(mori::moe::EpDispatchCombineHandle& handle, const std::string& group,
+                const std::string& default_catalog) {
+  Sim(handle).Start(group, default_catalog);
+}
+
+int EpSimDispatch(mori::moe::EpDispatchCombineHandle& handle, int64_t indices_ptr,
+                  int64_t num_tokens, int dtype, int hidden_dim, bool has_scales) {
+  Sim(handle);
+  return mori::moe::sim::SimDispatch(handle, reinterpret_cast<const int32_t*>(indices_ptr),
+                                     static_cast<int>(num_tokens), IntToHipDataType(dtype),
+                                     hidden_dim, has_scales);
+}
+
+int EpSimCombine(mori::moe::EpDispatchCombineHandle& handle, int64_t indices_ptr, int dtype,
+                 int hidden_dim, bool zero_copy) {
+  Sim(handle);
+  return mori::moe::sim::SimCombine(handle, reinterpret_cast<const int32_t*>(indices_ptr),
+                                    handle.curRankNumToken, IntToHipDataType(dtype), hidden_dim,
+                                    zero_copy);
+}
+
+int EpSimWait(mori::moe::EpDispatchCombineHandle& handle) { return Sim(handle).Wait(); }
+
+py::dict EpSimLastStats(mori::moe::EpDispatchCombineHandle& handle) {
+  const auto& s = Sim(handle).LastStats();
+  py::dict d;
+  d["seq"] = s.seq;
+  d["phase"] = s.phase == mori::moe::sim::Phase::Dispatch ? "dispatch" : "combine";
+  d["model_us"] = s.modelUs;
+  d["elapsed_us"] = s.elapsedUs;
+  d["load_tokens"] = s.loadTokens;
+  d["recv_tokens"] = s.recvTokens;
+  d["source"] = s.source;
+  return d;
+}
+
+py::dict EpSimEstimate(const mori::moe::EpDispatchCombineConfig& config, const std::string& phase,
+                       int dtype, int hidden_dim, int num_tokens, bool zero_copy,
+                       const std::string& default_catalog) {
+  mori::moe::sim::EpSim sim(config);
+  sim.Start("", default_catalog, /*join=*/false);
+  mori::moe::sim::OpDesc op;
+  if (phase == "dispatch") {
+    op.phase = mori::moe::sim::Phase::Dispatch;
+  } else if (phase == "combine") {
+    op.phase = mori::moe::sim::Phase::Combine;
+  } else {
+    throw std::invalid_argument("phase must be dispatch or combine");
+  }
+  op.dtype = IntToHipDataType(dtype);
+  op.hiddenDim = hidden_dim > 0 ? hidden_dim : config.hiddenDim;
+  op.numTokens = num_tokens;
+  op.zeroCopy = zero_copy;
+  auto e = sim.EstimateUniform(op);
+  py::dict d;
+  d["latency_us"] = e.latencyUs;
+  d["tokens"] = e.tokens;
+  d["source"] = e.source;
+  return d;
 }
 
 void PrepareInferenceArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t input_ptr,
@@ -120,6 +195,7 @@ int64_t BuildArgsWithRouting(mori::moe::EpDispatchCombineHandle& handle, int rdm
 // Stream-ordered snapshot of the local view of dispTokIdToSrcTokIdMemObj into a caller tensor.
 void SnapshotDispTokIdToSrcTokIdLocal(mori::moe::EpDispatchCombineHandle& handle, int64_t dst_ptr,
                                       int64_t stream) {
+  RequireDevice(handle, "snapshot_disp_tok_id_to_src_tok_id_local");
   if (!handle.dispTokIdToSrcTokIdMemObj.IsValid()) return;
   auto* src = handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>();
   const auto& cfg = handle.config;
@@ -141,6 +217,7 @@ int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t 
 }
 
 py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_scales) {
+  RequireDevice(handle, "get_dispatch_output_ptrs");
   int64_t out_ptr = reinterpret_cast<int64_t>(handle.GetShmemDispatchOutTokMemObj()->Get());
   int64_t outW_ptr = reinterpret_cast<int64_t>(handle.shmemDispatchOutWeightsMemObj->Get());
   int64_t outS_ptr =
@@ -153,6 +230,7 @@ py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool
 }
 
 py::tuple GetCombineOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_weights) {
+  RequireDevice(handle, "get_combine_output_ptrs");
   int64_t out_ptr = reinterpret_cast<int64_t>(handle.GetShmemCombineOutTokMemObj()->Get());
   int64_t outW_ptr =
       has_weights ? reinterpret_cast<int64_t>(handle.shmemCombineOutWeightsMemObj->Get()) : 0;
@@ -196,6 +274,7 @@ int64_t BuildConvertDispatchOutputArgs(mori::moe::EpDispatchCombineHandle& handl
                                        int64_t dispatchOutX_ptr, int64_t dispatchOutTopkIdx_ptr,
                                        int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr,
                                        int hiddenDim) {
+  RequireDevice(handle, "build_convert_dispatch_output_args");
   auto* args = new mori::moe::ConvertDispatchOutputArgs{};
   args->config = handle.config;
   if (hiddenDim > 0) args->config.hiddenDim = hiddenDim;
@@ -216,6 +295,7 @@ int64_t BuildConvertDispatchOutputArgs(mori::moe::EpDispatchCombineHandle& handl
 int64_t BuildConvertCombineInputArgs(mori::moe::EpDispatchCombineHandle& handle,
                                      int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr,
                                      int hiddenDim) {
+  RequireDevice(handle, "build_convert_combine_input_args");
   auto* args = new mori::moe::ConvertCombineInputArgs{};
   args->config = handle.config;
   if (hiddenDim > 0) args->config.hiddenDim = hiddenDim;
@@ -240,11 +320,13 @@ int64_t GetStandardMoePackedRecvCountPtr(mori::moe::EpDispatchCombineHandle& han
 }
 
 int64_t GetCombineInputPtr(mori::moe::EpDispatchCombineHandle& handle) {
+  RequireDevice(handle, "get_combine_input_ptr");
   return reinterpret_cast<int64_t>(handle.GetShmemCombineInpTokMemObj()->Get());
 }
 #endif
 
 void LaunchReset(mori::moe::EpDispatchCombineHandle& handle, int64_t stream) {
+  if (handle.sim) return;
   handle.LaunchReset(reinterpret_cast<hipStream_t>(stream));
 }
 
@@ -259,6 +341,7 @@ void PyLaunchLocalExpertCount(const mori::moe::EpDispatchCombineConfig& config, 
 }
 
 py::tuple GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
+  RequireDevice(handle, "get_dispatch_src_token_pos");
   mori::moe::index_t recvNum = 0;
   HIP_RUNTIME_CHECK(
       hipMemcpy(&recvNum, handle.totalRecvTokenNum, sizeof(recvNum), hipMemcpyDeviceToHost));
@@ -269,12 +352,14 @@ py::tuple GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
 }
 
 py::tuple GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+  RequireDevice(handle, "get_dispatch_sender_token_idx_map");
   return py::make_tuple(
       reinterpret_cast<int64_t>(handle.dispSenderIdxMap),
       static_cast<int64_t>(handle.curRankNumToken * handle.config.numExpertPerToken));
 }
 
 py::tuple GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+  RequireDevice(handle, "get_dispatch_receiver_token_idx_map");
   mori::moe::index_t counter = 0;
   HIP_RUNTIME_CHECK(
       hipMemcpy(&counter, handle.localPeTokenCounter, sizeof(counter), hipMemcpyDeviceToHost));
@@ -284,6 +369,7 @@ py::tuple GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& han
 
 py::tuple GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
                                           int hidden_dim = -1) {
+  RequireDevice(handle, "get_registered_combine_input_buffer");
   const int actual = (hidden_dim > 0) ? hidden_dim : static_cast<int>(handle.config.hiddenDim);
   return py::make_tuple(reinterpret_cast<int64_t>(handle.GetShmemCombineInpTokMemObj()->Get()),
                         static_cast<int64_t>(handle.config.MaxNumTokensToRecv()),
@@ -340,6 +426,25 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 #endif
 
   m.def("launch_reset", &LaunchReset);
+
+  using release = py::call_guard<py::gil_scoped_release>;
+  m.def("ep_sim_enabled", &mori::moe::sim::IsEnabled);
+  m.def("ep_sim_uses_indices",
+        [](mori::moe::EpDispatchCombineHandle& handle) { return Sim(handle).UsesIndices(); });
+  m.def("ep_sim_start", &EpSimStart, py::arg("handle"), py::arg("group"),
+        py::arg("default_catalog") = "", release());
+  m.def("ep_sim_dispatch", &EpSimDispatch, py::arg("handle"), py::arg("indices_ptr"),
+        py::arg("num_tokens"), py::arg("dtype"), py::arg("hidden_dim"), py::arg("has_scales"),
+        release());
+  m.def("ep_sim_combine", &EpSimCombine, py::arg("handle"), py::arg("indices_ptr"),
+        py::arg("dtype"), py::arg("hidden_dim"), py::arg("zero_copy"), release());
+  m.def("ep_sim_wait", &EpSimWait, py::arg("handle"), release());
+  m.def("ep_sim_local_expert_count",
+        [](mori::moe::EpDispatchCombineHandle& handle) { return Sim(handle).LocalExpertCount(); });
+  m.def("ep_sim_last_stats", &EpSimLastStats, py::arg("handle"));
+  m.def("ep_sim_estimate", &EpSimEstimate, py::arg("config"), py::arg("phase"), py::arg("dtype"),
+        py::arg("hidden_dim"), py::arg("num_tokens"), py::arg("zero_copy") = false,
+        py::arg("default_catalog") = "");
 
   m.def("get_cur_rank_num_token", &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
   m.def("get_dispatch_src_token_pos", &GetDispatchSrcTokenId);

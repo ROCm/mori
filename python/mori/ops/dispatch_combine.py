@@ -135,6 +135,34 @@ def _maybe_get_cco_comm(config):
     return _CCO_COMM
 
 
+# MORI_EP_SIM_ENABLE: dispatch/combine are timed by the C++ simulator (mori::moe::sim::EpSim)
+# instead of run on a GPU; the default catalog of measured latencies ships next to this file.
+_EP_SIM_CATALOG = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "ep_sim_catalog.yaml"
+)
+_ep_sim_ops = 0
+
+
+def _ep_sim_group(config):
+    """Rendezvous name: the same on every rank of one op, unique per op and per job."""
+    global _ep_sim_ops
+    n = _ep_sim_ops
+    _ep_sim_ops += 1
+    base = os.environ.get("MORI_EP_SIM_GROUP")
+    if base:
+        return f"{base}.{n}"
+    if config.world_size == 1 or not dist.is_initialized():
+        return ""
+    import uuid
+
+    # The default store is plain TCP, so this works whatever (or however faked) the backend is.
+    store = dist.distributed_c10d._get_default_store()
+    key = f"mori_ep_sim/{dist.get_rank() - config.rank}/{n}"
+    if config.rank == 0:
+        store.set(key, uuid.uuid4().hex[:16])
+    return f"{store.get(key).decode()}.{n}"
+
+
 class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
     def __str__(self):
         return self.name
@@ -419,9 +447,36 @@ def _load_hip_modules(kernel_type, init_shmem=True):
     return load_hip_module(_KERNEL_TYPE_TO_HIP[kernel_type], init_shmem=init_shmem)
 
 
+def _make_cpp_config(config):
+    return mori_cpp.EpDispatchCombineConfig(
+        rank=config.rank,
+        world_size=config.world_size,
+        hidden_dim=config.hidden_dim,
+        scale_dim=config.scale_dim,
+        scale_type_size=config.scale_type_size,
+        max_token_type_size=config.max_token_type_size,
+        max_num_inp_token_per_rank=config.max_num_inp_token_per_rank,
+        num_experts_per_rank=config.num_experts_per_rank,
+        num_experts_per_token=config.num_experts_per_token,
+        warp_num_per_block=config.warp_num_per_block,
+        block_num=config.block_num,
+        use_external_inp_buf=config.use_external_inp_buf,
+        kernel_type=config.kernel_type,
+        gpu_per_node=config.gpu_per_node,
+        rdma_block_num=config.rdma_block_num,
+        num_qp_per_pe=config.num_qp_per_pe,
+        quant_type=_normalize_quant_type(config.quant_type),
+        max_total_recv_tokens=config.max_total_recv_tokens,
+    )
+
+
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
+        self._sim = mori_cpp.ep_sim_enabled()
+        if self._sim:
+            self._init_sim()
+            return
         # Wavefront size of THIS device (32 on gfx1250, 64 on gfx9xx). Used for
         # every kernel launch's block dim; keep consistent with the device-side
         # warpNum = blockDim.x / warpSize so combine LDS sizing stays in bounds.
@@ -433,26 +488,7 @@ class EpDispatchCombineOp:
             dist.barrier()
 
         handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
-        self._cpp_config = mori_cpp.EpDispatchCombineConfig(
-            rank=config.rank,
-            world_size=config.world_size,
-            hidden_dim=config.hidden_dim,
-            scale_dim=config.scale_dim,
-            scale_type_size=config.scale_type_size,
-            max_token_type_size=config.max_token_type_size,
-            max_num_inp_token_per_rank=config.max_num_inp_token_per_rank,
-            num_experts_per_rank=config.num_experts_per_rank,
-            num_experts_per_token=config.num_experts_per_token,
-            warp_num_per_block=config.warp_num_per_block,
-            block_num=config.block_num,
-            use_external_inp_buf=config.use_external_inp_buf,
-            kernel_type=config.kernel_type,
-            gpu_per_node=config.gpu_per_node,
-            rdma_block_num=config.rdma_block_num,
-            num_qp_per_pe=config.num_qp_per_pe,
-            quant_type=_normalize_quant_type(config.quant_type),
-            max_total_recv_tokens=config.max_total_recv_tokens,
-        )
+        self._cpp_config = _make_cpp_config(config)
 
         self._cco_comm = _maybe_get_cco_comm(config)
         _cco_ptr = self._cco_comm.ptr if self._cco_comm is not None else 0
@@ -685,6 +721,149 @@ class EpDispatchCombineOp:
         if dist.is_initialized():
             torch.cuda.synchronize()
             dist.barrier()
+
+    # ------------------------------------------------------------------
+    # Simulation (MORI_EP_SIM_ENABLE): no kernels, no device buffers
+    # ------------------------------------------------------------------
+    def _init_sim(self):
+        config = self.config
+        self._cpp_config = _make_cpp_config(config)
+        self._handle = mori_cpp.EpDispatchCombineHandle(
+            self._cpp_config, cco_comm_ptr=0
+        )
+        mori_cpp.ep_sim_start(self._handle, _ep_sim_group(config), _EP_SIM_CATALOG)
+        self._handle_info = mori_cpp.get_handle_info(self._handle)
+        self._get_cur_rank_num_token = mori_cpp.get_cur_rank_num_token
+        self._sim_uses_indices = mori_cpp.ep_sim_uses_indices(self._handle)
+        self._sim_bufs = {}
+        self._sim_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.local_expert_count = torch.zeros(
+            config.num_experts_per_rank, dtype=torch.int32, device=self._sim_device
+        )
+
+    def _sim_buf(self, key, shape, dtype, device):
+        # Outputs keep their real shapes; their contents are never written.
+        ck = (key, tuple(shape), dtype, device)
+        t = self._sim_bufs.get(ck)
+        if t is None:
+            t = torch.empty(shape, dtype=dtype, device=device)
+            self._sim_bufs[ck] = t
+        return t
+
+    def _sim_indices(self, indices):
+        """Host int32 copy of the routing the simulator reads, or (0, None) when it does not."""
+        if not self._sim_uses_indices:
+            return 0, None
+        k = self.config.num_experts_per_token
+        if indices.dim() != 2 or int(indices.size(1)) != k:
+            raise ValueError(
+                f"indices must be [num_tokens, {k}], got {tuple(indices.shape)}"
+            )
+        host = indices.detach().to("cpu", torch.int32).contiguous()
+        return host.data_ptr(), host
+
+    def _sim_not_supported(self, what):
+        if self._sim:
+            raise NotImplementedError(f"{what} is not simulated (MORI_EP_SIM_ENABLE)")
+
+    def _sim_finish_dispatch(self, total, call_local_expert_count):
+        total_recv = self._sim_buf(
+            "disp_total", (1,), TOPK_IDX_DTYPE, self._sim_out_device
+        )
+        total_recv.copy_(torch.tensor([total], dtype=TOPK_IDX_DTYPE))
+        if call_local_expert_count:
+            self.local_expert_count.copy_(
+                torch.tensor(
+                    mori_cpp.ep_sim_local_expert_count(self._handle), dtype=torch.int32
+                )
+            )
+
+    def _sim_dispatch(
+        self,
+        input,
+        weights,
+        scales,
+        indices,
+        call_local_expert_count,
+        routing,
+        return_routing,
+    ):
+        if routing is not None or return_routing:
+            raise NotImplementedError(
+                "routing handles are not simulated (MORI_EP_SIM_ENABLE)"
+            )
+        num_tokens, hidden_dim = int(input.size(0)), int(input.size(1))
+        has_scales = scales is not None and self.config.scale_dim > 0
+        ptr, _host = self._sim_indices(indices)
+        total = mori_cpp.ep_sim_dispatch(
+            self._handle,
+            ptr,
+            num_tokens,
+            dtype_to_int(input.dtype),
+            hidden_dim,
+            has_scales,
+        )
+        self._dispatch_dtype = input.dtype
+        self._sim_out_device = input.device
+        dev, k = input.device, self.config.num_experts_per_token
+        max_recv = self._cpp_config.max_num_tokens_to_recv()
+        out = self._sim_buf("disp_out", (max_recv, hidden_dim), input.dtype, dev)
+        out_weights = self._sim_buf("disp_w", (max_recv, k), torch.float32, dev)
+        out_scales = (
+            self._sim_buf(
+                "disp_s", (max_recv, self.config.scale_dim), scales.dtype, dev
+            )
+            if has_scales
+            else None
+        )
+        out_indices = self._sim_buf("disp_i", (max_recv, k), TOPK_IDX_DTYPE, dev)
+        total_recv = self._sim_buf("disp_total", (1,), TOPK_IDX_DTYPE, dev)
+        if total >= 0:  # AsyncLL only posts; dispatch_recv fills these in
+            self._sim_finish_dispatch(total, call_local_expert_count)
+        return (out, out_weights, out_scales, out_indices, total_recv)
+
+    def _sim_combine(self, input, weights, indices, use_external_inp_buf, routing):
+        if routing is not None:
+            raise NotImplementedError(
+                "routing handles are not simulated (MORI_EP_SIM_ENABLE)"
+            )
+        hidden_dim = int(input.size(1))
+        external = (
+            use_external_inp_buf
+            if use_external_inp_buf >= 0
+            else int(self.config.use_external_inp_buf)
+        )
+        self._check_combine_indices(indices, self._get_cur_rank_num_token(self._handle))
+        ptr, _host = self._sim_indices(indices)
+        mori_cpp.ep_sim_combine(
+            self._handle, ptr, dtype_to_int(input.dtype), hidden_dim, not external
+        )
+        self._combine_dtype = input.dtype
+        dev, max_inp = input.device, self.config.max_num_inp_token_per_rank
+        out = self._sim_buf("comb_out", (max_inp, hidden_dim), input.dtype, dev)
+        out_weights = None
+        if weights is not None and weights.size(0) != 0:
+            out_weights = self._sim_buf(
+                "comb_w",
+                (max_inp, self.config.num_experts_per_token),
+                weights.dtype,
+                dev,
+            )
+        return (out, out_weights)
+
+    def _sim_recv(self, phase, call_local_expert_count=False):
+        kt = self.config.kernel_type.value
+        if kt != EpDispatchCombineKernelType.AsyncLL.value:
+            raise ValueError(
+                f"{phase}_recv only supports AsyncLL, got kernel_type={kt}"
+            )
+        total = mori_cpp.ep_sim_wait(self._handle)
+        if phase == "dispatch":
+            self._sim_finish_dispatch(total, call_local_expert_count)
+
+    def sim_last_stats(self):
+        """Timing of the last simulated op on this rank: model_us, elapsed_us, source, ..."""
+        return mori_cpp.ep_sim_last_stats(self._handle)
 
     # ------------------------------------------------------------------
     # Kernel launch helpers
@@ -1097,6 +1276,14 @@ class EpDispatchCombineOp:
     def get_registered_combine_input_buffer(
         self, dtype: torch.dtype, hidden_dim: int = -1
     ):
+        if self._sim:
+            hidden = hidden_dim if hidden_dim > 0 else self.config.hidden_dim
+            return self._sim_buf(
+                "comb_inp",
+                (self.max_num_tokens_to_recv(), hidden),
+                dtype,
+                self._sim_device,
+            )
         ptr, shape0, shape1 = self._get_registered_combine_input_buffer(
             self._handle, hidden_dim
         )
@@ -1200,6 +1387,16 @@ class EpDispatchCombineOp:
         routing: "EpDispatchRoutingHandle | None" = None,
         return_routing: bool = False,
     ):
+        if self._sim:
+            return self._sim_dispatch(
+                input,
+                weights,
+                scales,
+                indices,
+                call_local_expert_count,
+                routing,
+                return_routing,
+            )
         if routing is not None and return_routing:
             raise ValueError(
                 "pass either `routing=` (replay) or `return_routing=True` "
@@ -1429,6 +1626,8 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
         call_local_expert_count: bool = False,
     ):
+        if self._sim:
+            return self._sim_recv("dispatch", call_local_expert_count)
         if hasattr(self, "_cached_dispatch_launch"):
             _, _, actual_wpb = self._cached_dispatch_launch
         else:
@@ -1494,6 +1693,10 @@ class EpDispatchCombineOp:
         tensor handed to ``dispatch()`` -- not the received-token indices that
         ``dispatch()`` returned.
         """
+        if self._sim:
+            return self._sim_combine(
+                input, weights, indices, use_external_inp_buf, routing
+            )
         if routing is not None and not self._supports_routing_handle():
             raise NotImplementedError(
                 f"routing handle path not supported for kernel_type="
@@ -1830,6 +2033,8 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
+        if self._sim:
+            return self._sim_recv("combine")
         if hasattr(self, "_cached_combine_launch"):
             _, _, actual_wpb = self._cached_combine_launch
         else:
@@ -1900,6 +2105,7 @@ class EpDispatchCombineOp:
         rdma_block_num: int = -1,
         warp_per_block: int = -1,
     ):
+        self._sim_not_supported("dispatch_standard_moe")
         set_fn = _cpp_dispatch_combine_factory(
             "set_standard_moe_output_buffers", allow_missing=True
         )
@@ -2016,6 +2222,7 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
         call_reset: bool = False,
     ):
+        self._sim_not_supported("combine_standard_moe")
         set_fn = _cpp_dispatch_combine_factory(
             "set_standard_moe_output_buffers", allow_missing=True
         )
@@ -2122,6 +2329,7 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
+        self._sim_not_supported("convert_dispatch_output")
         build_fn = _cpp_dispatch_combine_factory(
             "build_convert_dispatch_output_args", allow_missing=True
         )
@@ -2194,6 +2402,7 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
+        self._sim_not_supported("convert_combine_input")
         build_fn = _cpp_dispatch_combine_factory(
             "build_convert_combine_input_args", allow_missing=True
         )
@@ -2232,6 +2441,8 @@ class EpDispatchCombineOp:
         )
 
     def reset(self):
+        if self._sim:
+            return
         self._reset_func(self._handle, _current_stream())
 
     def _allgather_with_token_num_padding(self, input, max_token_num):
@@ -2275,6 +2486,7 @@ class EpDispatchCombineOp:
         dispatch -- unlike get_dispatch_src_token_pos(), which synchronizes the device
         and sizes the result to total_recv on each call.
         """
+        self._sim_not_supported("get_dispatch_src_token_pos_buffer")
         if self.config.kernel_type.value not in (
             EpDispatchCombineKernelType.IntraNode.value,
             EpDispatchCombineKernelType.IntraNodeLL.value,
@@ -2289,6 +2501,7 @@ class EpDispatchCombineOp:
         return from_gpu_ptr(ptr, (self.max_num_tokens_to_recv(),), TOPK_IDX_DTYPE)
 
     def get_dispatch_src_token_pos(self):
+        self._sim_not_supported("get_dispatch_src_token_pos")
         torch.cuda.synchronize()
 
         if self.config.kernel_type.value in (

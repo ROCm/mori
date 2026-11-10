@@ -508,6 +508,7 @@ if __name__ == "__main__":
 | `GLOO_SOCKET_IFNAME` | — | TCP interface for torch distributed (e.g., `enp81s0f1`) |
 | `MASTER_ADDR` | — | Torch distributed master address |
 | `MASTER_PORT` | — | Torch distributed master port |
+| `MORI_EP_SIM_ENABLE` | — | `1`: run dispatch/combine without a GPU, sleeping for a modelled duration. See [EP simulation](ep-simulation.md) for the `MORI_EP_SIM_*` variables. |
 
 ---
 
