@@ -281,8 +281,9 @@ relies on cco's default uncached window.
 
 Through the op (defaults, `acquire="none"`, graph replay, input written into
 `send_buffer`), the 70B shape at P=8 measured 136.6 / 262.0 / 430.9 us fused
-and 149.7 / 290.1 / 557.4 us split at `m_local` 2048 / 4096 / 8192 -- the best
-fused cells of the table above to within 1.3%.
+and 149.7 / 290.1 / 557.4 us split at `m_local` 2048 / 4096 / 8192. Against the
+best fused cells of the table above (134.4 / 258.6 / 435.2 us), the fused
+times are +1.6%, +1.3% and -1.0%.
 
 ## Running it
 
