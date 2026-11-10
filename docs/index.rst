@@ -16,7 +16,6 @@ MORI Documentation
    :caption: User Guides
 
    MORI-EP-GUIDE
-   ep-simulation
    MORI-SHMEM-GUIDE
    MORI-CCO-GUIDE
    MORI-CCO-FUSED-OPS-GUIDE

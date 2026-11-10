@@ -1125,7 +1125,6 @@ mori_package_data = [
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
     "io/sim_catalog.yaml",  # MORI_IO_SIM_CATALOG timing for measured hardware
-    "ops/ep_sim_catalog.yaml",  # MORI_EP_SIM_CATALOG default: measured EP latency curves
     "tools/*.sh",
     "tools/mori.conf",
     "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)

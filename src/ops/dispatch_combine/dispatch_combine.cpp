@@ -30,7 +30,6 @@
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/cco/cco.hpp"
 #include "mori/core/core.hpp"
-#include "mori/ops/dispatch_combine/sim.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/env_utils.hpp"
@@ -132,12 +131,6 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
         "(mori.ops.dispatch_combine_v2) for cross-node EP.");
   }
   assert(IsPowerOf2(config.gpuPerNode) && (config.worldSize % config.gpuPerNode == 0));
-  if (sim::IsEnabled()) {
-    sim = std::make_shared<sim::EpSim>(config);
-    multiProcessorCount = 256;
-    maxThreads = 1024;
-    return;
-  }
   if (!useCcoComm) {
     int shmemNumQpPerPe = ShmemNumQpPerPe();
     if (config.numQpPerPe > shmemNumQpPerPe) {
@@ -238,7 +231,6 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
-  if (sim) return;
   if (!useCcoComm) {
     auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
     if (states->status != mori::shmem::ShmemStatesStatus::Initialized) {
@@ -676,11 +668,6 @@ void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {}
 /* ---------------------------------------------------------------------------------------------- */
 EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
                                                      int rdmaBlockNum) {
-  if (handle.sim) {
-    throw std::runtime_error(
-        "EP dispatch/combine kernels cannot run under MORI_EP_SIM_ENABLE: the handle has no device "
-        "buffers; use the simulated dispatch/combine entry points");
-  }
   EpDispatchCombineArgsRaw args;
   args.config = handle.config;
   args.fp8BlockwiseCombineScaleDim = handle.fp8BlockwiseCombineScaleDim;

@@ -1,12 +1,13 @@
 set(MORI_OPS_SOURCES dispatch_combine/dispatch_combine.cpp
-                     dispatch_combine/launch.cpp dispatch_combine/sim.cpp)
+                     dispatch_combine/launch.cpp
+                     dispatch_combine/sim.cpp)
 
 add_library(mori_ops SHARED ${MORI_OPS_SOURCES})
 
 target_include_directories(mori_ops PUBLIC ${CMAKE_SOURCE_DIR}/)
 target_include_directories(mori_ops PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(mori_ops PUBLIC mori_application mori_shmem mori_logging
-                                      mori_cco hip::host dl rt)
+                                      mori_cco hip::host dl)
 
 set_target_properties(
   mori_ops

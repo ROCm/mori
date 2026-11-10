@@ -508,7 +508,9 @@ if __name__ == "__main__":
 | `GLOO_SOCKET_IFNAME` | — | TCP interface for torch distributed (e.g., `enp81s0f1`) |
 | `MASTER_ADDR` | — | Torch distributed master address |
 | `MASTER_PORT` | — | Torch distributed master port |
-| `MORI_EP_SIM_ENABLE` | — | `1`: run dispatch/combine without a GPU, sleeping for a modelled duration. See [EP simulation](ep-simulation.md) for the `MORI_EP_SIM_*` variables. |
+| `MORI_EP_SIM_ENABLE` | `0` | `1`: run `EpDispatchCombineOp` without a GPU. Dispatch and combine launch no kernel and move no token; each sleeps a fixed time instead. Outputs keep their shapes but are not written, and `total_recv` is the rank's own token count. Routing handles and the standard-MoE helpers are not simulated. |
+| `MORI_EP_SIM_DISPATCH_US` | — (required with sim) | Simulated dispatch duration in microseconds. With AsyncLL, `dispatch()` starts it and `dispatch_recv()` sleeps out what is left. |
+| `MORI_EP_SIM_COMBINE_US` | — (required with sim) | Simulated combine duration in microseconds; `combine_recv()` as above. |
 
 ---
 

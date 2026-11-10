@@ -41,7 +41,6 @@
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
-#include "mori/ops/dispatch_combine/sim.hpp"
 #include "mori/utils/limits.hpp"
 
 #ifdef __linux__
@@ -428,14 +427,6 @@ static void ensure_loaded() {
 void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights, void* scales,
                     void* indices, int64_t num_tokens, hipDataType dtype, int block_num,
                     int rdma_block_num, int warp_per_block, hipStream_t stream, int hidden_dim) {
-  if (handle.sim) {
-    handle.PrepareInference(dtype, input, nullptr, reinterpret_cast<float*>(weights),
-                            reinterpret_cast<uint8_t*>(scales), reinterpret_cast<index_t*>(indices),
-                            num_tokens);
-    sim::SimDispatch(handle, static_cast<const int32_t*>(indices), static_cast<int>(num_tokens),
-                     dtype, hidden_dim, scales != nullptr);
-    return;
-  }
   ensure_loaded();
 
   handle.PrepareInference(dtype, input, nullptr, reinterpret_cast<float*>(weights),
@@ -531,15 +522,6 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
                    int64_t num_tokens, hipDataType dtype, int block_num, int rdma_block_num,
                    int warp_per_block, int use_external_inp_buf, hipStream_t stream,
                    int hidden_dim) {
-  if (handle.sim) {
-    handle.PrepareInference(dtype, input, nullptr, reinterpret_cast<float*>(weights),
-                            reinterpret_cast<index_t*>(indices), num_tokens);
-    bool external =
-        use_external_inp_buf >= 0 ? use_external_inp_buf != 0 : handle.config.useExternalInpBuffer;
-    sim::SimCombine(handle, static_cast<const int32_t*>(indices), static_cast<int>(num_tokens),
-                    dtype, hidden_dim, !external);
-    return;
-  }
   ensure_loaded();
 
   handle.PrepareInference(dtype, input, nullptr, reinterpret_cast<float*>(weights),
@@ -667,10 +649,6 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
 // -----------------------------------------------------------------------
 void LaunchDispatchRecv(EpDispatchCombineHandle& handle, int block_num, int warp_per_block,
                         hipStream_t stream) {
-  if (handle.sim) {
-    handle.sim->Wait();
-    return;
-  }
   ensure_loaded();
 
   int wpb = (warp_per_block <= 0) ? handle.config.warpNumPerBlock : warp_per_block;
@@ -701,10 +679,6 @@ void LaunchDispatchRecv(EpDispatchCombineHandle& handle, int block_num, int warp
 // -----------------------------------------------------------------------
 void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num, int warp_per_block,
                        hipStream_t stream) {
-  if (handle.sim) {
-    handle.sim->Wait();
-    return;
-  }
   ensure_loaded();
 
   int wpb = (warp_per_block <= 0) ? handle.config.warpNumPerBlock : warp_per_block;

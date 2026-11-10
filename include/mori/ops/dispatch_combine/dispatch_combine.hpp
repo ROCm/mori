@@ -25,7 +25,6 @@
 #include <hip/library_types.h>
 
 #include <cstdint>
-#include <memory>
 #include <sstream>
 #include <variant>
 #include <vector>
@@ -215,10 +214,6 @@ struct EpDispatchCombineConfig {
 // and embedded by value in EpDispatchCombineArgs / EpDispatchCombineArgsRaw for kernel launch.
 
 // IntraNode: no RDMA path, staging buffer not needed.
-namespace sim {
-class EpSim;
-}
-
 struct ShmemBufsIntraNode {
   mori::application::SymmMemObjPtr dispatchOut;
   mori::application::SymmMemObjPtr combineInp;
@@ -358,9 +353,6 @@ class EpDispatchCombineHandle {
  public:
   // Config
   EpDispatchCombineConfig config;
-
-  // Set under MORI_EP_SIM_ENABLE: no device state exists, ops are timed by sim::EpSim.
-  std::shared_ptr<sim::EpSim> sim;
 
   // CCO backend: when ccoCommPtr != nullptr, symmetric buffers are carved from a
   // cco window (LSA flat-VA) instead of the shmem heap. Lets intra-node EP run on
