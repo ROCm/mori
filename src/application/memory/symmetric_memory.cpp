@@ -218,16 +218,16 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
-  std::vector<int> dstDeviceIds;
+  std::vector<int> sdmaPeers;
   for (int i = 0; i < worldSize; i++) {
     if (context.GetTransportType(i) != TransportType::SDMA) continue;
-    dstDeviceIds.push_back(i % 8);  // should be intra devices count
+    sdmaPeers.push_back(i);
   }
-  if (dstDeviceIds.size() != 0) {
-    int srcDeviceId = rank % 8;
+  if (!sdmaPeers.empty()) {
+    const int srcNode = context.LocalKfdNode();
     int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
-    // Allocate based on worldSize (not dstDeviceIds.size()) because indexing uses pe * numQ
-    // where pe ranges 0..worldSize-1. Using dstDeviceIds.size() causes buffer overflow.
+    // The kernel-facing array is indexed by global rank, while anvil's queue
+    // lookup uses the physical KFD node pair.
     size_t numDevices = static_cast<size_t>(worldSize);
     HIP_RUNTIME_CHECK(
         hipMalloc(&gpuMemObj->deviceHandles_d,
@@ -236,12 +236,13 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
         hipMemset(gpuMemObj->deviceHandles_d, 0,
                   numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
-    for (auto& dstDeviceId : dstDeviceIds) {
+    for (int pe : sdmaPeers) {
+      const int dstNode = context.KfdNodeId(pe);
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
-        auto* anvilHandle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+        auto* anvilHandle = anvil::anvil.getSdmaQueue(srcNode, dstNode, q)->deviceHandle();
         HIP_RUNTIME_CHECK(hipMemcpy(
             &gpuMemObj
-                 ->deviceHandles_d[static_cast<size_t>(dstDeviceId) * numOfQueuesPerDevice + q],
+                 ->deviceHandles_d[static_cast<size_t>(pe) * numOfQueuesPerDevice + q],
             &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
       }
     }

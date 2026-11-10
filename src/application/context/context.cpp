@@ -29,7 +29,9 @@
 #include <unistd.h>
 
 #include <cstdlib>
+#include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -113,31 +115,48 @@ void Context::CollectHostNames() {
   // cross-node ranks as co-located, over-counting rankInNode (trips assert below).
   std::string nodeId = ResolveNodeId(myHostname);
 
-  // Allgather a fixed-layout {pid, nodeId} record; fixed size avoids parsing.
-  constexpr int kPidSize = sizeof(pid_t);
-  constexpr int kStrMax = 256;  // node id: boot_id, hostname, or override
-  constexpr int kRecordSize = kPidSize + kStrMax;
+  // Exchange each rank's physical GPU identity as well as its host and pid.
+  // HIP ordinals are process-local and cannot identify a peer's GPU when each
+  // process sees a different slice or order of HIP_VISIBLE_DEVICES.
+  struct Pack {
+    int32_t pid;
+    int32_t kfdNodeId;
+    char nodeId[256];
+  } my = {};
+  my.pid = static_cast<int32_t>(getpid());
+  my.kfdNodeId = -1;
+  if (sdmaEnabled && !p2pDisabled) {
+    int hipDev = 0;
+    HIP_RUNTIME_CHECK(hipGetDevice(&hipDev));
+    my.kfdNodeId = anvil::anvil.kfdNodeIdForHipDevice(hipDev);
+  }
+  snprintf(my.nodeId, sizeof(my.nodeId), "%s", nodeId.c_str());
 
-  pid_t myPid = getpid();
-  char localBuffer[kRecordSize] = {};
-  memcpy(localBuffer, &myPid, kPidSize);
-  snprintf(localBuffer + kPidSize, kStrMax, "%s", nodeId.c_str());
+  std::vector<Pack> global(WorldSize());
+  bootNet.Allgather(&my, global.data(), sizeof(Pack));
 
-  std::vector<char> global(kRecordSize * WorldSize());
-  bootNet.Allgather(localBuffer, global.data(), kRecordSize);
-
-  std::string myNodeId(localBuffer + kPidSize);
+  std::string myNodeId(my.nodeId);
   peerInfos.resize(WorldSize());
   for (int i = 0; i < WorldSize(); i++) {
-    const char* rec = global.data() + i * kRecordSize;
-    pid_t peerPid;
-    memcpy(&peerPid, rec, kPidSize);
-    std::string peerNodeId(rec + kPidSize);
+    const Pack& other = global[i];
+    std::string peerNodeId(other.nodeId);
     peerInfos[i].sameHost = (peerNodeId == myNodeId);
-    peerInfos[i].sameProcess = peerInfos[i].sameHost && (peerPid == myPid);
+    peerInfos[i].sameProcess = peerInfos[i].sameHost && (other.pid == my.pid);
+    peerInfos[i].kfdNodeId = other.kfdNodeId;
     if (LocalRank() == 0) {
-      MORI_APP_TRACE("rank {} nodeId={} pid={} sameHost={} sameProcess={}", i, peerNodeId, peerPid,
+      MORI_APP_TRACE("rank {} nodeId={} pid={} sameHost={} sameProcess={}", i, peerNodeId, other.pid,
                      peerInfos[i].sameHost, peerInfos[i].sameProcess);
+    }
+  }
+
+  // SDMA memory registration includes bootstrap collectives. Reject a missing
+  // identity consistently on all ranks before any rank creates queues or enters
+  // those collectives. This branch's SDMA-only collectives cannot use P2P queues.
+  if (sdmaEnabled && !p2pDisabled) {
+    for (int i = 0; i < WorldSize(); i++) {
+      if (KfdNodeId(i) < 0) {
+        throw std::runtime_error("SDMA: no KFD node for rank " + std::to_string(i));
+      }
     }
   }
 }
@@ -236,15 +255,10 @@ void Context::InitializePossibleTransports() {
 
         if ((i == LocalRank()) || canAccessPeer) {
           if (IsSdmaEnabled()) {
-            if (i != LocalRank()) {
-              transportTypes.push_back(TransportType::SDMA);
-              anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
-              // Better performance if allocating all 8 queues
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
-            } else {
-              transportTypes.push_back(TransportType::SDMA);
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
-            }
+            transportTypes.push_back(TransportType::SDMA);
+            // Queue creation and lookup must use the same physical node keys.
+            // SDMA uses mapped IPC/fabric addresses; no HIP peer ordinal is needed.
+            anvil::anvil.connect(LocalKfdNode(), KfdNodeId(i), sdmaNumChannels);
           } else {
             transportTypes.push_back(TransportType::P2P);
           }

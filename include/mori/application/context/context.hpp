@@ -41,6 +41,9 @@ class Context {
   int WorldSize() const { return bootNet.GetWorldSize(); }
   int LocalRankInNode() const { return rankInNode; }
   const std::string& HostName() const { return myHostname; }
+  // KFD sysfs node ids identify GPUs independently of HIP_VISIBLE_DEVICES.
+  int KfdNodeId(int rank) const { return peerInfos[rank].kfdNodeId; }
+  int LocalKfdNode() const { return KfdNodeId(LocalRank()); }
 
   TransportType GetTransportType(int destRank) const { return transportTypes[destRank]; }
   const std::vector<TransportType>& GetTransportTypes() const { return transportTypes; }
@@ -75,6 +78,7 @@ class Context {
     // raw hostname, so it holds even when all machines share one hostname.
     bool sameHost{false};
     bool sameProcess{false};  // in the same OS process (same pid + same host)
+    int kfdNodeId{-1};  // host-global KFD sysfs node id; -1 if unresolved
   };
 
  private:
