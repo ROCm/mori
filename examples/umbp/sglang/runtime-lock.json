@@ -1,0 +1,25 @@
+{
+  "base_image": "lmsysorg/sglang-rocm@sha256:9b82c0b334618afe6182a542fe4adf3694b9b059edfeb41b997a22f2fd4c0a86",
+  "base_tag": "lmsysorg/sglang-rocm:v0.5.21-rocm10-mi45x-20261008",
+  "base_image_id": "sha256:392ff204760b8179d49b99daa593835fee8d2250d4268d0bd137093103de2ef6",
+  "git": {
+    "sglang": "943621c3364de6948fc02ee13c55b4f1cdf97f3a",
+    "mori": "879983bdbd8c65c52e9f79ad836a61cbffef98b6",
+    "aiter": "a6d2b564fd671724a3720b8edf70e8d674e4d694"
+  },
+  "torch": "2.11.0+rocm10.0.0",
+  "hip": "7.15.26333",
+  "standalone": {
+    "path": "/sgl-workspace/mori/python/mori/umbp_standalone_server",
+    "sha256": "7a1eaff3d0c9ce4c4b8d1c853b888151d38666acac93a9d0b4f86f686dbc4c62"
+  },
+  "linker": {
+    "path": "sglang/srt/mem_cache/storage/umbp/umbp_direct_linker.py",
+    "sha256": "864e9609303c3ce689bbf84352c854e73fc132963d3f3ef7a129e5db46d90708"
+  },
+  "model_patch": {
+    "path": "sglang/srt/models/deepseek_v4.py",
+    "before_sha256": "0daabb621a4533dc5c2c7105e01d62c8c0c5b8c6162f5d7020b09bc207f61448",
+    "after_sha256": "975feebdb5ea912527e9d21c8e9da7903403e9ae871af307ed15f842fd4a9271"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/inkcherry/MI455_inferencemax",
+  "commit": "d26286ef2bf8b6cc14d1624aa19df550e7e28a66",
+  "path": "repro/tp4/umbp",
+  "sha256": {
+    "run.py": "c1fe3c2efc9e6e0d8c4dc93ddb82fea1d4e1faecc59e6587167be52f18692c0c",
+    "launch-model.sh": "05c604b2c7a7d998c15bcee8d18c0eaba4b323bda49a0c69aacfeef1c483bc7e",
+    "probe.py": "4d2a6da2a03c6a077b4600a285fc2f7aaec522e02901f129cca31fc1ef232b15",
+    "replay.py": "0ad121977ac4ad81ac9928706a0270c2b6f3dd77bb05821f8d5f7b7e5b1ce39c",
+    "test_recipe.py": "1fd9cbfab7caa7259d1082c37c39cfc31ca7170c4bf01cc87121abc0a06651e8"
+  }
+}

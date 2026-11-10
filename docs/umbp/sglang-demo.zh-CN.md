@@ -6,6 +6,12 @@
 它记录了 2026-10-16 在 f01-2 上进行的四卡 MI455/gfx1250、DeepSeek V4 Pro、
 128 GiB host payload 实验，并提供启动与回放脚本。
 
+**同事首次运行请使用 [从公开基础镜像构建](sglang-build.zh-CN.md)。**
+新流程已收录 Dockerfile、启动脚本和自动生成输入的 DRAM fill/replay，
+不需要 `yangwu/umbp-resume:20261015` 或历史 workload。
+实际 Linker/Store 源码和学习路线见 [接入代码导读](sglang-linker-walkthrough.zh-CN.md)。
+下面的个人镜像和附件路径属于精确重跑历史实验的流程。
+
 ## 1. 对接结构
 
 该版本通过 SGLang **Unified Cache External Linker** 接入 Mori，后端选择 `mori`，
@@ -64,7 +70,9 @@ flowchart TD
 | PyTorch / HIP | `2.11.0+rocm10.0.0` / `7.15.26333` |
 | 模型目录 | `/data2/models/DeepSeek-V4-Pro` |
 
-镜像是历史本地镜像，不能假定公共 registry 可 pull。需要移交镜像、模型和以下附件：
+表中的 resume 镜像是历史本地镜像，不能假定公共 registry 可 pull。
+其原始父镜像已核实对应公开 SGLang ROCm manifest，新的构建方式见
+[构建文档](sglang-build.zh-CN.md)。精确重跑原始 A/B 需要移交镜像、模型和以下历史附件：
 
 ```text
 /home/yangwu/dsv4-tp4/umbp/attribution-ab-20261015/
@@ -76,7 +84,8 @@ flowchart TD
   correctness-pre-workload.json
 ```
 
-GitHub 分支不包含这些附件。本轮整理环境也没有上述历史附件，因此未在本轮重跑模型或硬件回放。
+GitHub 分支不包含这些历史附件。本轮未找回原始 integrated manifest 和 workload，
+因此未在本轮重跑历史模型或硬件回放。
 固定 Git HEAD 无法替代 integrated 快照。
 
 历史 standalone 程序位于镜像内：
@@ -347,4 +356,5 @@ fused mHC 和随后 sparse attention prefill 发生 fault，未进入正式测�
 | 本仓库 `sglang_linker_smoke.py` | 本机模拟 HTTP 服务验证两次相同请求、错误后端拒绝、abort / HTTP 错误处理及已有 output 拒绝；未连接真实模型 |
 | 文档与脚本 | 本地链接、Python 语法和格式检查通过 |
 
-真实 SGLang 模型启动和 MI455 回放需上述完整附件与硬件环境。
+精确重跑历史 MI455 A/B 需上述完整历史附件与硬件环境。
+新生成输入的 demo、公开基础镜像构建和新增 CPU 验证范围见 [构建与运行](sglang-build.zh-CN.md)。

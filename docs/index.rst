@@ -25,6 +25,8 @@ MORI Documentation
    umbp/README
    umbp/user-guide.zh-CN
    umbp/sglang-demo.zh-CN
+   umbp/sglang-build.zh-CN
+   umbp/sglang-linker-walkthrough.zh-CN
    umbp-simulation
    umbp-calibration
    PROFILER

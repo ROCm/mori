@@ -6,7 +6,8 @@ UMBP（Unified Memory/Bandwidth Pool）通过统一的指针 API 存储和恢复
 
 本文于 2026-11-10 按 Mori 源码提交
 [`a612473e56f2c509a06cccabef99aed0fff94a6b`](https://github.com/ROCm/mori/tree/a612473e56f2c509a06cccabef99aed0fff94a6b)
-核对接口。历史 SGLang 实验的版本和启动方式见 [SGLang demo](sglang-demo.zh-CN.md)。
+核对接口。SGLang 对接可从 [代码导读](sglang-linker-walkthrough.zh-CN.md) 和
+[构建与运行](sglang-build.zh-CN.md) 开始；历史版本和结果见 [实验记录](sglang-demo.zh-CN.md)。
 
 ## 1. 选择本机运行方式
 
@@ -329,4 +330,4 @@ GPU 传输或 RPC 异常后，失败返回值不总能证明另一进程已经�
 | HTTP 正常但没有 host hit | 两次小请求通常可从 GPU 命中；用固定 fill/replay 工作负载，并检查 Linker 日志与 cache details |
 
 基础接口验证使用 [local_kv_demo.py](../../examples/umbp/local_kv_demo.py)；
-框架接入验证继续 [SGLang demo](sglang-demo.zh-CN.md)。
+框架接入验证继续 [SGLang 构建与运行](sglang-build.zh-CN.md)。

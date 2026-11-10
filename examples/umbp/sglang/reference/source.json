@@ -1,0 +1,25 @@
+{
+  "kind": "source-extracted-from-pinned-public-image",
+  "base_image": "lmsysorg/sglang-rocm@sha256:9b82c0b334618afe6182a542fe4adf3694b9b059edfeb41b997a22f2fd4c0a86",
+  "sglang_git_head": "943621c3364de6948fc02ee13c55b4f1cdf97f3a",
+  "source_root": "/sgl-workspace/sglang/python",
+  "files": {
+    "umbp_direct_linker.py": {
+      "original_path": "sglang/srt/mem_cache/storage/umbp/umbp_direct_linker.py",
+      "sha256": "864e9609303c3ce689bbf84352c854e73fc132963d3f3ef7a129e5db46d90708"
+    },
+    "umbp_store.py": {
+      "original_path": "sglang/srt/mem_cache/storage/umbp/umbp_store.py",
+      "sha256": "70cdb66f481afa207d8de5e47e929d93f6c8968e91fb5c57233d8c27be4db951"
+    },
+    "unified_cache_linker.py": {
+      "original_path": "sglang/srt/mem_cache/unified_cache/unified_cache_linker.py",
+      "sha256": "2dd06a8a94b4deca65cb9e35b78f0e409fbeb6e33d3b9c18b3d4861a42c1bf4e"
+    },
+    "LICENSE": {
+      "original_path": "../LICENSE",
+      "sha256": "1495e1e757ef4d0925a2350563cf5754bb23c51701a8ec4fb3c5cdcbedae6747"
+    }
+  },
+  "note": "Learning reference; full import dependencies are supplied by the pinned image. Original base includes vendor changes in addition to Git HEAD."
+}

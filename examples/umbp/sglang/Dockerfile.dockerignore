@@ -1,0 +1,8 @@
+**
+!examples/
+!examples/umbp/
+!examples/umbp/sglang/
+!examples/umbp/sglang/**
+!examples/umbp/sglang_linker_smoke.py
+**/__pycache__/
+**/*.pyc
