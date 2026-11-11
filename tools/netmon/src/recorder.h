@@ -60,6 +60,11 @@ struct RecordOptions {
   std::vector<std::string> command;
   std::vector<Nic> nics;
   std::vector<Degraded> degraded;
+
+  // Live push (NETMON_LIVE_PUSH_DESIGN); disabled when push_url is empty.
+  std::string push_url, experiment, grafana;
+  uint64_t push_interval_ns = 1000000000ull;
+  bool push_all = false;
 };
 
 // Runs the recording. Must be called before any other thread exists (it sets the signal

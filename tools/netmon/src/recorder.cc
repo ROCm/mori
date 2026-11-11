@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <thread>
 
+#include "exporter.h"
 #include "meta_json.h"
 #include "writer.h"
 
@@ -60,6 +61,10 @@ struct MetaContext {
   std::vector<StreamStatsSnapshot> stats;  // empty for the initial meta
   std::vector<std::string> abandoned;
   std::string stop_reason;
+  // live push (final meta only)
+  bool has_push = false;
+  std::string push_url, experiment;
+  PushStats push;
 };
 
 std::string Kernel() {
@@ -120,6 +125,22 @@ std::string BuildMeta(const MetaContext& c, const std::string& status,
   }
   j.EndArray();
   j.Key("abandoned").StringArray(c.abandoned);
+  if (c.has_push) {
+    const PushStats& p = c.push;
+    j.Key("push").BeginObject().Key("url").String(c.push_url);
+    j.Key("experiment").String(c.experiment);
+    j.Key("points_sent").Uint(p.points_sent).Key("requests").Uint(p.requests);
+    j.Key("failed_points").Uint(p.failed_points).Key("dropped_samples").Uint(p.dropped_samples);
+    j.Key("unconfirmed_dropped").Uint(p.unconfirmed_dropped);
+    j.Key("clock_back_intervals").Uint(p.clock_back_intervals);
+    j.Key("log_dropped").Uint(p.log_dropped).Key("abandoned").Bool(p.abandoned);
+    j.Key("last_error");
+    if (p.last_error.empty())
+      j.Null();
+    else
+      j.String(p.last_error);
+    j.EndObject();
+  }
   j.Key("run_stats");
   if (c.stats.empty()) {
     j.Null();
@@ -237,6 +258,22 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
     return abort_writer(nullptr);
   }
 
+  // ---- live push preflight runs on its own thread, alongside the probes (design §6) ----
+  Exporter* exporter = nullptr;  // never freed: its threads may outlive every deadline
+  if (!opt->push_url.empty()) {
+    PushOptions po;
+    po.url = opt->push_url;
+    po.experiment = opt->experiment;
+    po.host = opt->host_id;
+    po.interval_ns = opt->push_interval_ns;
+    po.all_counters = opt->push_all;
+    po.quiet = opt->quiet;
+    po.grafana = opt->grafana;
+    exporter = new Exporter(po);
+    exporter->Start();
+  }
+  auto push_pending = [&] { return exporter && exporter->phase() == Exporter::Phase::kPreflight; };
+
   // ---- probe phase: every source is queried once on its own thread ----
   for (size_t i = 0; i < all.size(); i++) {
     all[i]->id = static_cast<int>(i);
@@ -251,6 +288,7 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
       std::lock_guard<std::mutex> lk(ctl->mu);
       for (auto& s : all) pending |= s->probe == ProbeState::kPending;
     }
+    pending |= push_pending();
     if (!pending) break;
     if (WaitSignal(stop_sigs, 100000000ull)) {
       interrupted = true;
@@ -304,6 +342,17 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
       }
     }
   }
+  if (exporter && abort_reason != "stuck") {
+    const Exporter::Phase ph = exporter->phase();
+    if (ph == Exporter::Phase::kPreflight && !interrupted) {
+      probe_report += "error: live push: no answer from " + opt->push_url + " within " +
+                      FormatDurationNs(opt->probe_timeout_ns) + "\n";
+      abort_reason = "stuck";
+    } else if (ph == Exporter::Phase::kFailed) {
+      probe_report += "error: live push: " + exporter->preflight_error() + "\n";
+      if (abort_reason.empty()) abort_reason = "live push unavailable";
+    }
+  }
   if (abort_reason != "stuck") fputs(probe_report.c_str(), stderr);
   if (abort_reason == "stuck") {
     // A thread is inside a driver call we cannot interrupt: clean up and leave without
@@ -335,6 +384,7 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
     }
   };
   if (!abort_reason.empty()) {
+    if (exporter) exporter->Abort();
     abandon_all();
     return abort_writer(abort_reason.c_str());
   }
@@ -386,13 +436,55 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
   }
   mc.start_real = RealNs();
   mc.start_mono = MonoNs();
+  if (exporter) writer->SetExportHook(exporter);  // batches only exist after "go"
   writer->RequestCreate(ws, BuildMeta(mc, "running", ""));
   if (!writer->Wait(MonoNs() + opt->io_timeout_ns, &st)) {
     HardExit(kExitSetup, "error: creating output files timed out (filesystem not responding)\n");
   }
   if (!st.ok()) {
+    if (exporter) exporter->Abort();
     abandon_all();
     return abort_writer(st.message().c_str());
+  }
+  if (exporter) {
+    std::vector<ExportStream> es;
+    for (auto* s : final_streams) {
+      ExportStream e;
+      e.netdev = s->netdev;
+      e.source = s->src->kind();
+      e.interval_ns = s->interval_ns;
+      e.snapshot_fraction = s->src->snapshot_fraction();
+      e.record_words = s->record_words();
+      e.batch_records = BatchRecordsFor(s->interval_ns);
+      e.names = s->src->names();
+      for (const auto& n : opt->nics) {
+        if (n.netdev == s->netdev) e.speed_mbps = n.speed_mbps;
+      }
+      if (e.source == "rdma" || e.source == "ipc")
+        es.push_back(e);
+      else
+        es.push_back(ExportStream{e.netdev,
+                                  e.source,
+                                  e.interval_ns,
+                                  e.snapshot_fraction,
+                                  e.record_words,
+                                  e.batch_records,
+                                  {},
+                                  e.speed_mbps});
+    }
+    std::string err;
+    if (!exporter->Configure(es, mc.start_real, &err)) {
+      exporter->Abort();
+      abandon_all();
+      return abort_writer(("live push: " + err).c_str());
+    }
+    fputs(exporter->Describe().c_str(), stderr);
+    for (const auto& u : exporter->DashboardUrls(opt->grafana)) {
+      fprintf(stderr, "  %s\n", u.c_str());
+    }
+    mc.has_push = true;
+    mc.push_url = opt->push_url;
+    mc.experiment = opt->experiment;
   }
 
   // ---- go ----
@@ -483,10 +575,20 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
     mc.stop_reason = "all streams stopped by errors";
 
   const bool drain = !writer->failed();
-  writer->RequestFinish(drain, status, [mc](const std::string& s, const std::string& err) {
-    return BuildMeta(mc, s, err);
-  });
-  const bool finished = writer->Wait(MonoNs() + opt->io_timeout_ns, &st);
+  // Runs on the writer thread after the drain: the exporter gets its own bounded budget
+  // (design §6 step 4), so the file deadline below is extended by the same amount.
+  const uint64_t push_wait_ns = exporter ? 3000000000ull : 0;
+  writer->RequestFinish(drain, status,
+                        [mc, exporter, push_wait_ns](const std::string& s, const std::string& err) {
+                          MetaContext m = mc;
+                          if (exporter) {
+                            exporter->CloseInput();
+                            exporter->WaitDone(MonoNs() + push_wait_ns);
+                            m.push = exporter->Snapshot();
+                          }
+                          return BuildMeta(m, s, err);
+                        });
+  const bool finished = writer->Wait(MonoNs() + opt->io_timeout_ns + push_wait_ns, &st);
 
   if (!finished) {
     // The writer is stuck (e.g. in an NFS write or its console output): touch no stdio.
@@ -520,6 +622,12 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
   }
   if (!mc.abandoned.empty()) {
     // Stuck samplers remain: the exit must stay bounded, so the summary is best effort.
+    HardExit(code, summary);
+  }
+  if (exporter) {
+    // With a live push, detached threads (exporter, log) remain and stderr may be full (an
+    // idle log thread does not mean stderr is writable): the summary is written with a
+    // bounded wait and the process leaves with _exit, keeping every object alive (design §6).
     HardExit(code, summary);
   }
   fputs(summary.c_str(), stderr);  // normal exit: an ordinary, possibly blocking, print

@@ -59,5 +59,11 @@ std::string Hostname();
 // Parse "2ms", "500us", "1s", "1.5m", "0". Max 1 day. Returns false on error.
 bool ParseDurationNs(const std::string& s, uint64_t* ns);
 std::string FormatDurationNs(uint64_t ns);
+// Python's os.path.abspath, lexically (no filesystem access): join with cwd, drop "." and
+// empty parts, resolve "..".
+std::string LexicalAbsPath(const std::string& path, const std::string& cwd);
+// Name of the parent directory of `path` (the importer's default experiment name):
+// os.path.basename(os.path.dirname(os.path.abspath(path))).
+std::string ParentDirName(const std::string& path, const std::string& cwd);
 
 }  // namespace netmon

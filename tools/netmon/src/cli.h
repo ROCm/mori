@@ -45,6 +45,12 @@ struct RecordArgs {
   std::string owner;
   bool sudo = false;
   bool quiet = false;
+  // live push (NETMON_LIVE_PUSH_DESIGN)
+  std::string push_url;
+  std::string experiment;
+  std::string grafana = "http://127.0.0.1:3000";
+  uint64_t push_interval_ns = 1000000000ull;
+  bool push_all = false;
 };
 
 constexpr uint64_t kMaxIntervalNs = 60ull * 1000000000ull;

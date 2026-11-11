@@ -40,6 +40,8 @@
 #include <mutex>
 #include <sstream>
 
+#include "exporter.h"
+#include "fake_vm.h"
 #include "harness.h"
 #include "privilege.h"
 #include "recorder.h"
@@ -205,10 +207,14 @@ void CheckRecordFile(const std::string& path, size_t width, bool expect_records)
   }
 }
 
+// Live push target of a case (a fake VictoriaMetrics started in the child).
+enum class Push { kNone, kOk, kBlackHole, kUnreachable };
+
 struct ChildCase {
   std::vector<Spec> specs;
   uint64_t duration_ns;
   void (*before)();
+  Push push = Push::kNone;
 };
 
 void InstallEnospc() {
@@ -216,6 +222,22 @@ void InstallEnospc() {
   Writer::write_fn = FailAfterBudget;
 }
 void InstallBlockingFinalMeta() { Writer::write_fn = BlockFinalMeta; }
+// The final meta write takes 1.2 s of the 1.5 s file budget (design §6: the push wait must
+// not eat into it).
+std::atomic<int> g_slow_meta_writes{0};
+ssize_t SlowFinalMeta(int fd, const void* p, size_t n) {
+  char link[64], target[512];
+  snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+  ssize_t len = readlink(link, target, sizeof(target) - 1);
+  if (len > 0) {
+    target[len] = 0;
+    if (std::strstr(target, "meta.json.tmp") && g_slow_meta_writes.fetch_add(1) >= 1)
+      usleep(1200000);
+  }
+  return ::write(fd, p, n);
+}
+void InstallSlowFinalMeta() { Writer::write_fn = SlowFinalMeta; }
+void ThrowInExporter() { Exporter::test_throw = true; }
 void InstallBlockingWrites() {
   g_calls_before_block = 6;  // lock, meta and a few batches, then every write blocks
   Writer::write_fn = BlockAfterCalls;
@@ -244,6 +266,15 @@ const std::map<std::string, ChildCase>& Cases() {
         300000000ull,
         nullptr}},
       {"final_meta_blocks", {{{"rdma", Mode::kOk}}, 300000000ull, InstallBlockingFinalMeta}},
+      {"push_ok", {{{"rdma", Mode::kOk}, {"ipc", Mode::kOk}}, 600000000ull, nullptr, Push::kOk}},
+      {"push_unreachable", {{{"rdma", Mode::kOk}}, 300000000ull, nullptr, Push::kUnreachable}},
+      {"push_black_hole", {{{"rdma", Mode::kOk}}, 600000000ull, nullptr, Push::kBlackHole}},
+      {"push_black_hole_full_stderr",
+       {{{"rdma", Mode::kFillsStderr}}, 600000000ull, nullptr, Push::kBlackHole}},
+      {"push_ok_full_stderr", {{{"rdma", Mode::kFillsStderr}}, 600000000ull, nullptr, Push::kOk}},
+      {"push_exporter_throws", {{{"rdma", Mode::kOk}}, 600000000ull, ThrowInExporter, Push::kOk}},
+      {"push_black_hole_slow_meta",
+       {{{"rdma", Mode::kOk}}, 600000000ull, InstallSlowFinalMeta, Push::kBlackHole}},
   };
   return cases;
 }
@@ -313,6 +344,15 @@ int RunRecorderCase(const char* name, const char* out) {
   o.stop_timeout_ns = 500000000ull;
   o.io_timeout_ns = 1500000000ull;
   o.host_id = "test";
+  if (c.push != Push::kNone) {
+    auto* vm = new nt::FakeVm();  // threads started before RunRecording: no signals here
+    if (c.push == Push::kBlackHole)
+      vm->import_mode = static_cast<int>(nt::FakeVm::Import::kBlackHole);
+    o.push_url = c.push == Push::kUnreachable ? "http://127.0.0.1:1" : vm->url();
+    o.experiment = "case";
+    o.push_all = true;  // fake counter names are not key counters
+    o.quiet = c.specs[0].mode != Mode::kFillsStderr;
+  }
   return RunRecording(&streams, &o);
 }
 
@@ -459,4 +499,83 @@ TEST(RecorderStuckProbeExitWithFullStderr) {
   CHECK_EQ(code, 1);
   CHECK(MonoNs() - t0 < 20000000000ull);
   CHECK(!Exists(dir));
+}
+
+TEST(RecorderPushNormal) {
+  TempDir tmp;
+  auto dir = tmp.path() + "/run";
+  int code = RunCase("push_ok", dir);
+  CHECK_EQ(code, 0);
+  const std::string meta = ReadAll(dir + "/meta.json");
+  CHECK(meta.find("\"status\": \"complete\"") != std::string::npos);
+  CHECK(meta.find("\"push\": {") != std::string::npos);
+  CHECK(meta.find("\"failed_points\": 0") != std::string::npos);
+  CHECK(meta.find("\"abandoned\": false") != std::string::npos);
+  CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
+}
+
+TEST(RecorderPushUnreachableFailsAtStartup) {
+  TempDir tmp;
+  auto dir = tmp.path() + "/run";
+  int code = RunCase("push_unreachable", dir);
+  CHECK_EQ(code, 1);
+  CHECK(!Exists(dir));  // nothing created
+}
+
+TEST(RecorderPushBlackHoleDoesNotChangeTheRecording) {
+  // VictoriaMetrics accepts connections but never answers: the recording completes with
+  // exit 0 and a final meta; the push is reported as abandoned or failed, in bounded time.
+  TempDir tmp;
+  auto dir = tmp.path() + "/run";
+  const uint64_t t0 = MonoNs();
+  int code = RunCase("push_black_hole", dir);
+  CHECK_EQ(code, 0);
+  CHECK(MonoNs() - t0 < 15000000000ull);
+  const std::string meta = ReadAll(dir + "/meta.json");
+  CHECK(meta.find("\"status\": \"complete\"") != std::string::npos);
+  CHECK(meta.find("\"push\": {") != std::string::npos);
+  CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
+}
+
+TEST(RecorderPushBlackHoleWithFullStderr) {
+  TempDir tmp;
+  auto dir = tmp.path() + "/run";
+  const uint64_t t0 = MonoNs();
+  int code = RunCase("push_black_hole_full_stderr", dir, -1, true);
+  CHECK_EQ(code, 0);
+  CHECK(MonoNs() - t0 < 20000000000ull);
+  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"complete\"") != std::string::npos);
+}
+
+TEST(RecorderPushWaitHasItsOwnBudget) {
+  // The final meta write takes most of the file budget while the push hangs: the push wait
+  // must not push the file work past its deadline (exit 0, final meta written).
+  TempDir tmp;
+  auto dir = tmp.path() + "/run";
+  int code = RunCase("push_black_hole_slow_meta", dir);
+  CHECK_EQ(code, 0);
+  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"complete\"") != std::string::npos);
+}
+
+TEST(RecorderPushNormalWithFullStderr) {
+  // The push works and finishes, but stderr is a full pipe: the final summary must not
+  // block the exit (an idle log thread does not make stderr writable).
+  TempDir tmp;
+  auto dir = tmp.path() + "/run";
+  const uint64_t t0 = MonoNs();
+  int code = RunCase("push_ok_full_stderr", dir, -1, true);
+  CHECK_EQ(code, 0);
+  CHECK(MonoNs() - t0 < 20000000000ull);
+  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"complete\"") != std::string::npos);
+}
+
+TEST(RecorderPushExporterExceptionOnlyStopsThePush) {
+  TempDir tmp;
+  auto dir = tmp.path() + "/run";
+  int code = RunCase("push_exporter_throws", dir);
+  CHECK_EQ(code, 0);
+  const std::string meta = ReadAll(dir + "/meta.json");
+  CHECK(meta.find("\"status\": \"complete\"") != std::string::npos);
+  CHECK(meta.find("internal error") != std::string::npos);
+  CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
 }

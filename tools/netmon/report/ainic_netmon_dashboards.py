@@ -101,6 +101,13 @@ def meta_target(ref, expr, fmt="table"):
     }
 
 
+LIVE_NOTE = (
+    "Data with target status 'live' comes from ainic-netmon record --push: an online "
+    "approximation of these rules; where a push failed the mean of that window may be off. "
+    "Import the recording (ainic-netmon-import --replace) for the exact numbers."
+)
+
+
 def envelope_targets(source, counter, label, scale, color_idx, refs):
     """max / min (filled between) and mean of normal-resolution intervals, plus low-res."""
     r = iter(refs)
@@ -178,7 +185,7 @@ def timeseries(
     targets,
     overrides,
     grid,
-    interval="$min_step",
+    interval="${min_step}ms",
     unit="none",
     desc="",
     links=None,
@@ -263,13 +270,21 @@ def variables(target_multi):
         "multi": target_multi,
         "includeAll": target_multi,
     }
+    # Largest safe step over the experiment's hosts (netmon_step_ms: written by the importer,
+    # and by a live push, where it only grows). Panels use ${min_step}ms.
     v_step = {
         "name": "min_step",
-        "label": "min step (low-res threshold)",
-        "type": "textbox",
-        "query": "6ms",
-        "current": {"text": "6ms", "value": "6ms"},
-        "description": "Smallest window of the envelope/mean panels; the importer prints the value for each experiment",
+        "label": "min step, ms (low-res threshold)",
+        "type": "query",
+        "datasource": DS,
+        "query": {
+            "query": f'query_result(max(last_over_time(netmon_step_ms{{experiment="$experiment"}}[{META_LOOKBACK}])))',
+            "refId": "V",
+        },
+        "regex": "/\\} ([0-9]+) /",
+        "refresh": 2,
+        "description": "Smallest window of the envelope/mean panels: 3 x the sampling baseline, the "
+        "largest over the experiment's hosts",
     }
     return {"list": [v_exp, v_tgt, v_step]}
 
@@ -322,7 +337,7 @@ def info_table(pid, grid, sel):
     )
 
 
-def quality_panel(pid, grid, interval="$min_step"):
+def quality_panel(pid, grid, interval="${min_step}ms"):
     return timeseries(
         pid,
         "Data quality: gaps (no valid interval) and their duration, s",
@@ -353,7 +368,7 @@ def quality_panel(pid, grid, interval="$min_step"):
 DETAIL_LINK = [
     {
         "title": "NIC detail (this target, this time range)",
-        "url": "/d/netmon-nic/netmon-nic-detail?var-experiment=${experiment}&var-target=${target}&var-min_step=${min_step}&${__url_time_range}",
+        "url": "/d/netmon-nic/netmon-nic-detail?var-experiment=${experiment}&var-target=${target}&${__url_time_range}",
     }
 ]
 
@@ -402,6 +417,7 @@ def overview():
             o1 + o2,
             {"x": 0, "y": y, "w": 9, "h": 8},
             links=DETAIL_LINK,
+            desc=LIVE_NOTE,
         )
     )
     pid += 1
@@ -414,6 +430,7 @@ def overview():
             t3 + t4,
             o3 + o4,
             {"x": 9, "y": y, "w": 7, "h": 8},
+            desc=LIVE_NOTE,
         )
     )
     pid += 1
@@ -449,6 +466,7 @@ def overview():
         "editable": True,
         "graphTooltip": 1,
         "time": {"from": "now-1h", "to": "now"},
+        "timepicker": {"refresh_intervals": ["2s", "5s", "10s", "30s", "1m", "5m"]},
         "templating": variables(True),
         "panels": panels,
     }
@@ -467,10 +485,11 @@ def nic_detail():
     panels.append(
         timeseries(
             pid,
-            "RDMA payload, Gb/s (envelope + mean per window ≥ $min_step)",
+            "RDMA payload, Gb/s (envelope + mean per window ≥ ${min_step}ms)",
             t1 + t2,
             o1 + o2,
             {"x": 0, "y": y, "w": 24, "h": 8},
+            desc=LIVE_NOTE,
         )
     )
     pid += 1
@@ -530,6 +549,7 @@ def nic_detail():
             t5 + t6,
             o5 + o6,
             {"x": 12, "y": y, "w": 12, "h": 8},
+            desc=LIVE_NOTE,
         )
     )
     pid += 1
@@ -592,6 +612,7 @@ def nic_detail():
         "editable": True,
         "graphTooltip": 1,
         "time": {"from": "now-1h", "to": "now"},
+        "timepicker": {"refresh_intervals": ["2s", "5s", "10s", "30s", "1m", "5m"]},
         "templating": variables(False),
         "panels": panels,
     }

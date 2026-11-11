@@ -324,6 +324,11 @@ class VerifierTests(unittest.TestCase):
                 p["datasource"]["uid"] = "other"
                 break
         self.assertNotEqual(V.query_config(d), V.query_config(d2))
+        d3 = json.loads(json.dumps(d))
+        for v in d3["templating"]["list"]:
+            if v["name"] == "min_step":
+                v["datasource"] = {"type": "prometheus", "uid": "other"}
+        self.assertNotEqual(V.query_config(d), V.query_config(d3))
 
 
 class DashboardTests(unittest.TestCase):
@@ -351,7 +356,7 @@ class DashboardTests(unittest.TestCase):
                         self.assertIn("[$__interval]", t["expr"])
                         self.assertNotIn("[$__rate_interval]", t["expr"])
                 if p["type"] == "timeseries":
-                    self.assertIn(p["interval"], ("$min_step", "1ms"))
+                    self.assertIn(p["interval"], ("${min_step}ms", "1ms"))
                     self.assertEqual(p["datasource"]["uid"], "netmon-vm")
             # Multi-valued variables are regex-escaped by Grafana: match them with =~,
             # single-valued ones (not escaped) with =.

@@ -25,8 +25,11 @@ set(NETMON_SOURCES
     src/cli.cc
     src/discover.cc
     src/ethtool_stats.cc
+    src/exporter.cc
     src/guarded_buffer.cc
+    src/http_client.cc
     src/ionic_ipc.cc
+    src/live_rates.cc
     src/meta_json.cc
     src/privilege.cc
     src/rdma_netlink.cc

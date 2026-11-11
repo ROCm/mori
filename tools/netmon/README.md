@@ -96,6 +96,18 @@ wall-clock grid on every node; nodes need NTP/PTP for millisecond alignment acro
 
 The output directory must not exist or be empty (a recording is never overwritten).
 
+Live view in Grafana while recording (VictoriaMetrics + Grafana from
+[`examples/monitoring/netmon`](../../examples/monitoring/netmon/README.md)):
+
+```
+ainic-netmon record -o /shared/exp42/{host} --push http://127.0.0.1:8428
+```
+
+The push runs on its own thread and never slows the samplers or the writer: when
+VictoriaMetrics is slow or unreachable, points are dropped and counted (`push` in
+`meta.json`). Live values are an online approximation; afterwards
+`ainic-netmon-import --replace` replaces them with the offline report's exact numbers.
+
 ### Notes and limits
 
 - **IPC** is an undocumented firmware protocol. It is enabled automatically only on firmware

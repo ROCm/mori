@@ -10,7 +10,8 @@ VictoriaMetrics + Grafana with two dashboards for recordings made by
 - **netmon NIC detail**: one `host/netdev`: the same panels plus raw points (one point per
   interval when zoomed to a 1 ms step), IPC wire bytes, PFC pause counters and run quality.
 
-Recordings are imported after the fact (`ainic-netmon-import`); there is no live push yet.
+Data gets there in two ways: live while recording (`ainic-netmon record --push`), and after
+the fact with exact numbers (`ainic-netmon-import`).
 
 ## Start
 
@@ -23,6 +24,24 @@ NETMON_VM_PORT=18428 NETMON_GRAFANA_PORT=13000 ./up.sh   # other ports
 `docker compose up -d`. Both containers run as you and listen on 127.0.0.1 only; Grafana
 allows anonymous admin access, so do not expose it. `./down.sh` stops them and keeps the data.
 
+## Live view while recording
+
+```
+ainic-netmon record -o /shared/exp42/{host} --push http://127.0.0.1:8428
+```
+
+- The recorder prints two dashboard links (last 5 minutes, refreshing every 2 s). Each node
+  pushes its own NICs; nodes recording into the same experiment appear together.
+- The recording itself is never affected: if VictoriaMetrics is slow or goes away, points are
+  dropped and counted (`push` in `meta.json`, warnings on stderr), and pushing resumes when it
+  is back. The recorder refuses to start if VictoriaMetrics is unreachable, or if this host
+  already pushed to this experiment.
+- Live numbers are an online approximation of the offline rules (slow samples and the
+  low-resolution threshold are judged on the last 1024 samples instead of the whole run; in
+  tests 99.95 % of the points are identical). In a window where a push failed, the mean may be
+  off (part of a request can be lost). The summary tables stay empty while live. When the
+  recording ends, import it with `--replace` to replace the live data with the exact numbers.
+
 ## Import and look
 
 ```
@@ -31,8 +50,9 @@ ainic-netmon-import /shared/exp42/nodeA /shared/exp42/nodeB
 
 - The experiment name defaults to the recordings' parent directory (`exp42`); `--experiment`
   sets it.
-- The importer prints the two dashboard URLs for the experiment's time range, and the
-  `min_step` to use (the low-resolution threshold, 6 ms for 2 ms sampling).
+- The importer prints the two dashboard URLs for the experiment's time range. The `min_step`
+  variable (the low-resolution threshold, e.g. 6 ms for 2 ms sampling) is set automatically
+  from the data.
 - An experiment is imported as a whole (its fixed window, `min_step` and time anchor depend
   on every recording). Re-importing needs `--replace` with all of its recordings; it deletes
   only `netmon_*` series of that experiment. Recordings that do not overlap in time are

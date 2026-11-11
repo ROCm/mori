@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <set>
 
+#include "http_client.h"
 #include "util.h"
 
 namespace netmon {
@@ -48,6 +49,16 @@ const char* RecordUsage() {
       --owner UID:GID    when running as root: owner of the output (see README)
       --sudo             not root: re-run this binary with sudo (asks for the password)
   -q, --quiet            no per-second console summary
+
+  live push to VictoriaMetrics (view in Grafana while recording; see examples/monitoring/netmon):
+      --push URL         e.g. http://127.0.0.1:8428. The recording is unaffected if VictoriaMetrics
+                         is slow or goes away (points are dropped and counted). Re-import the
+                         recording afterwards (ainic-netmon-import --replace) for exact numbers.
+      --experiment NAME  experiment label (default: name of DIR's parent directory)
+      --push-interval DUR  how often to push (default 1s)
+      --push-counters key|all  key counters + PFC (default), or every counter that changes
+      --grafana URL      only for the dashboard links printed at start (default
+                         http://127.0.0.1:3000)
 )";
 }
 
@@ -113,7 +124,22 @@ std::string ExpandHost(const std::string& path, const std::string& host_id) {
 }
 
 bool ParseRecordArgs(int argc, char** argv, RecordArgs* a, std::string* error) {
-  enum { kHostId = 1000, kNics, kSources, kIpcUnverified, kInterval, kTag, kCpus, kOwner, kSudo };
+  enum {
+    kHostId = 1000,
+    kNics,
+    kSources,
+    kIpcUnverified,
+    kInterval,
+    kTag,
+    kCpus,
+    kOwner,
+    kSudo,
+    kPush,
+    kExperiment,
+    kPushInterval,
+    kPushCounters,
+    kGrafana
+  };
   static const option opts[] = {
       {"out", required_argument, nullptr, 'o'},
       {"host-id", required_argument, nullptr, kHostId},
@@ -128,6 +154,11 @@ bool ParseRecordArgs(int argc, char** argv, RecordArgs* a, std::string* error) {
       {"sudo", no_argument, nullptr, kSudo},
       {"quiet", no_argument, nullptr, 'q'},
       {"help", no_argument, nullptr, 'h'},
+      {"push", required_argument, nullptr, kPush},
+      {"experiment", required_argument, nullptr, kExperiment},
+      {"push-interval", required_argument, nullptr, kPushInterval},
+      {"push-counters", required_argument, nullptr, kPushCounters},
+      {"grafana", required_argument, nullptr, kGrafana},
       {nullptr, 0, nullptr, 0},
   };
   std::set<int> seen;
@@ -217,6 +248,37 @@ bool ParseRecordArgs(int argc, char** argv, RecordArgs* a, std::string* error) {
       case 'q':
         a->quiet = true;
         break;
+      case kPush: {
+        HttpUrl u;
+        if (!ParseHttpUrl(v, &u, error)) return false;
+        a->push_url = v;
+        while (!a->push_url.empty() && a->push_url.back() == '/') a->push_url.pop_back();
+        break;
+      }
+      case kExperiment:
+        if (v.empty()) {
+          *error = "--experiment must not be empty";
+          return false;
+        }
+        a->experiment = v;
+        break;
+      case kPushInterval:
+        if (!ParseDurationNs(v, &a->push_interval_ns) || a->push_interval_ns < 100000000ull ||
+            a->push_interval_ns > kMaxIntervalNs) {
+          *error = "bad --push-interval '" + v + "' (100ms .. 60s)";
+          return false;
+        }
+        break;
+      case kPushCounters:
+        if (v != "key" && v != "all") {
+          *error = "--push-counters must be key or all";
+          return false;
+        }
+        a->push_all = v == "all";
+        break;
+      case kGrafana:
+        a->grafana = v;
+        break;
       case 'h':
         *error = "help";
         return false;
@@ -231,6 +293,11 @@ bool ParseRecordArgs(int argc, char** argv, RecordArgs* a, std::string* error) {
   }
   if (a->out.empty()) {
     *error = "-o/--out is required";
+    return false;
+  }
+  if (a->push_url.empty() && (seen.count(kExperiment) || seen.count(kPushInterval) ||
+                              seen.count(kPushCounters) || seen.count(kGrafana))) {
+    *error = "--experiment / --push-interval / --push-counters / --grafana need --push";
     return false;
   }
   return true;

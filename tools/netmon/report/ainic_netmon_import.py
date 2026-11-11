@@ -628,6 +628,13 @@ def cmd_import(args):
         meta.append((dict(lab, __name__="netmon_target_info"), 1.0))
     for lab, v in quality:
         meta.append((dict(lab, __name__="netmon_run_quality"), v))
+    for r in runs:  # the dashboards' min_step variable (max over hosts)
+        meta.append(
+            (
+                {"__name__": "netmon_step_ms", "experiment": exp, "host": r.host},
+                float(min_step),
+            )
+        )
     for lab, v in meta:
         b.add(lab, [anchor], [v])
     b.flush()
@@ -650,9 +657,7 @@ def cmd_import(args):
         f, t = int(window[0] // 1e6), int(window[1] // 1e6)
     else:
         f, t = anchor, anchor + 1000
-    q = urllib.parse.urlencode(
-        {"from": f, "to": t, "var-experiment": exp, "var-min_step": f"{min_step}ms"}
-    )
+    q = urllib.parse.urlencode({"from": f, "to": t, "var-experiment": exp})
     print(f"imported {b.total_points} points in {b.requests} requests; read-back OK")
     print(
         f"overview:   {args.grafana.rstrip('/')}/d/netmon-overview/netmon-overview?{q}"

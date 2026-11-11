@@ -13,6 +13,16 @@
     "from": "now-1h",
     "to": "now"
   },
+  "timepicker": {
+    "refresh_intervals": [
+      "2s",
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m"
+    ]
+  },
   "templating": {
     "list": [
       {
@@ -51,14 +61,19 @@
       },
       {
         "name": "min_step",
-        "label": "min step (low-res threshold)",
-        "type": "textbox",
-        "query": "6ms",
-        "current": {
-          "text": "6ms",
-          "value": "6ms"
+        "label": "min step, ms (low-res threshold)",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "netmon-vm"
         },
-        "description": "Smallest window of the envelope/mean panels; the importer prints the value for each experiment"
+        "query": {
+          "query": "query_result(max(last_over_time(netmon_step_ms{experiment=\"$experiment\"}[3650d])))",
+          "refId": "V"
+        },
+        "regex": "/\\} ([0-9]+) /",
+        "refresh": 2,
+        "description": "Smallest window of the envelope/mean panels: 3 x the sampling baseline, the largest over the experiment's hosts"
       }
     ]
   },
@@ -168,13 +183,13 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "RDMA payload, Gb/s (envelope + mean per window ≥ $min_step)",
-      "description": "",
+      "title": "RDMA payload, Gb/s (envelope + mean per window ≥ ${min_step}ms)",
+      "description": "Data with target status 'live' comes from ainic-netmon record --push: an online approximation of these rules; where a push failed the mean of that window may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
       "datasource": {
         "type": "prometheus",
         "uid": "netmon-vm"
       },
-      "interval": "$min_step",
+      "interval": "${min_step}ms",
       "maxDataPoints": 2000,
       "gridPos": {
         "x": 0,
@@ -672,7 +687,7 @@
         "type": "prometheus",
         "uid": "netmon-vm"
       },
-      "interval": "$min_step",
+      "interval": "${min_step}ms",
       "maxDataPoints": 2000,
       "gridPos": {
         "x": 0,
@@ -796,12 +811,12 @@
       "id": 6,
       "type": "timeseries",
       "title": "Port wire bytes (IPC), Gb/s, all traffic incl. ACKs",
-      "description": "",
+      "description": "Data with target status 'live' comes from ainic-netmon record --push: an online approximation of these rules; where a push failed the mean of that window may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
       "datasource": {
         "type": "prometheus",
         "uid": "netmon-vm"
       },
-      "interval": "$min_step",
+      "interval": "${min_step}ms",
       "maxDataPoints": 2000,
       "gridPos": {
         "x": 12,
@@ -1166,7 +1181,7 @@
         "type": "prometheus",
         "uid": "netmon-vm"
       },
-      "interval": "$min_step",
+      "interval": "${min_step}ms",
       "maxDataPoints": 2000,
       "gridPos": {
         "x": 0,
@@ -1227,7 +1242,7 @@
         "type": "prometheus",
         "uid": "netmon-vm"
       },
-      "interval": "$min_step",
+      "interval": "${min_step}ms",
       "maxDataPoints": 2000,
       "gridPos": {
         "x": 0,

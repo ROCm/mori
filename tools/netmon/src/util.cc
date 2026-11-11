@@ -138,4 +138,26 @@ std::string FormatDurationNs(uint64_t ns) {
   return buf;
 }
 
+std::string LexicalAbsPath(const std::string& path, const std::string& cwd) {
+  const std::string full = !path.empty() && path[0] == '/' ? path : cwd + "/" + path;
+  std::vector<std::string> parts;
+  for (const auto& p : Split(full, '/')) {
+    if (p.empty() || p == ".") continue;
+    if (p == "..") {
+      if (!parts.empty()) parts.pop_back();  // "/.." is "/"
+      continue;
+    }
+    parts.push_back(p);
+  }
+  std::string out;
+  for (const auto& p : parts) out += "/" + p;
+  return out.empty() ? "/" : out;
+}
+
+std::string ParentDirName(const std::string& path, const std::string& cwd) {
+  const std::string abs = LexicalAbsPath(path, cwd);
+  const std::string parent = abs.substr(0, abs.rfind('/'));
+  return parent.substr(parent.rfind('/') + 1);
+}
+
 }  // namespace netmon

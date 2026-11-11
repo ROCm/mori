@@ -116,6 +116,7 @@ void Writer::Main() {
         auto b = queue_->Pop(std::chrono::milliseconds(50), &drained);
         if (b && !failed_.load()) {
           WriteBatch(*b);
+          if (export_ && !failed_.load()) export_->Offer(*b);
           Summary(*b);
         }
         continue;  // b is freed here, outside any lock
@@ -330,6 +331,7 @@ Status Writer::DoFinish() {
       auto b = queue_->Pop(std::chrono::milliseconds(50), &drained);
       if (b) {
         if (!failed_.load()) WriteBatch(*b);
+        if (export_ && !failed_.load()) export_->Offer(*b);
         continue;
       }
       if (drained) break;

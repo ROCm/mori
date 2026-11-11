@@ -238,6 +238,46 @@ def ds_instant(grafana, expr, at_ms):
     ]
 
 
+def ds_instant_values(grafana, expr, at_ms, ds):
+    """[(labels, value, ts)] of an instant query run through Grafana on data source `ds`."""
+    q = {
+        "refId": "A",
+        "datasource": ds,
+        "expr": expr,
+        "range": False,
+        "instant": True,
+    }
+    out = []
+    for f in _post_ds_query(grafana, q, int(at_ms) - 1000, at_ms).get("frames", []):
+        fields = f["schema"]["fields"]
+        vals = f["data"]["values"]
+        if len(fields) > 1 and vals and vals[1]:
+            out.append((fields[1].get("labels", {}), vals[1][0], vals[0][0]))
+    return out
+
+
+def resolve_step_variable(grafana, dash, exp, at_ms):
+    """Value of the deployed `min_step` variable as the dashboard computes it: its
+    query_result(...) expression run through Grafana, formatted like Grafana's
+    query_result ('{labels} value timestamp'), then the variable's extraction regex."""
+    var = next(v for v in dash["templating"]["list"] if v["name"] == "min_step")
+    q = var["query"]["query"] if isinstance(var["query"], dict) else var["query"]
+    q = q.replace("$experiment", interpolate(dash, "experiment", exp))
+    m = re.fullmatch(r"query_result\((.*)\)", q.strip(), re.S)
+    if not m:
+        raise Mismatch(f"min_step variable: unexpected query {q!r}")
+    rows = ds_instant_values(grafana, m.group(1), at_ms, var.get("datasource"))
+    regex = re.fullmatch(r"/(.*)/", var.get("regex", "")).group(1)
+    for labels, value, ts in rows:
+        name = labels.get("__name__", "")
+        lab = ",".join(f'{k}="{v}"' for k, v in labels.items() if k != "__name__")
+        text = f"{name}{{{lab}}} {value:g} {int(ts)}"
+        mm = re.search(regex, text)
+        if mm:
+            return mm.group(1)
+    raise Mismatch(f"min_step variable resolves to nothing at {at_ms} ({rows})")
+
+
 def load_dashboards(args, gen):
     """Deployed dashboards (from a directory or Grafana) must equal the generated ones."""
     generated = {name: json.loads(text) for name, text in gen.render().items()}
@@ -294,7 +334,15 @@ def query_config(dash):
     for v in dash.get("templating", {}).get("list", []):
         out[("var", v["name"])] = tuple(
             json.dumps(_canon(v.get(k)), sort_keys=True)
-            for k in ("type", "query", "regex", "multi", "includeAll", "allValue")
+            for k in (
+                "type",
+                "datasource",
+                "query",
+                "regex",
+                "multi",
+                "includeAll",
+                "allValue",
+            )
         )
     return out
 
@@ -320,7 +368,7 @@ def data_queries(dash):
 
 def resolve_interval(panel, min_step):
     iv = panel.get("interval", "")
-    return min_step if iv == "$min_step" else iv
+    return min_step if iv == "${min_step}ms" else iv
 
 
 # --------------------------------------------------------------------------- command
@@ -381,11 +429,15 @@ def cmd_verify(args, imp):
         ("netmon_summary", summaries),
         ("netmon_target_info", [(lab, 1.0) for lab in infos]),
         ("netmon_run_quality", quality),
+        (
+            "netmon_step_ms",
+            [({"experiment": exp, "host": r.host}, float(min_step)) for r in runs],
+        ),
     ):
         for lab, v in items:
             want_meta[imp.label_key(dict(lab, __name__=name))] = v
     res = vm.instant(
-        'last_over_time({__name__=~"netmon_(summary|target_info|run_quality)",'
+        'last_over_time({__name__=~"netmon_(summary|target_info|run_quality|step_ms)",'
         f'experiment="{imp.esc(exp)}"}}[3650d])'
     )
     have = {imp.label_key(x["metric"]): float(x["value"][1]) for x in res}
@@ -424,6 +476,15 @@ def cmd_verify(args, imp):
             ("start edge ± 50 ms, 1000 px", w0 - 50, w0 + 50, 1000),
             ("end edge ± 50 ms, 1000 px", w1 - 50, w1 + 50, 1000),
         ]
+        # The panels' min interval comes from the deployed min_step variable: resolve it the
+        # way the dashboard does, in the earliest and latest sub-windows.
+        for name, dash in dashboards.items():
+            for at in (w0 + 10, w1):
+                got = resolve_step_variable(args.grafana, dash, exp, at)
+                if got != str(min_step):
+                    raise Mismatch(
+                        f"{name}: min_step variable is {got!r} at {at}, expected {min_step}"
+                    )
         ms = f"{min_step}ms"
         n_points = 0
         for t in targets:

@@ -242,6 +242,23 @@ int CmdRecord(int argc, char** argv) {
   opt.command.assign(argv, argv + argc);
   opt.command.insert(opt.command.begin(), "ainic-netmon");
   opt.nics = nics;
+  if (!a.push_url.empty()) {
+    opt.push_url = a.push_url;
+    opt.grafana = a.grafana;
+    opt.push_interval_ns = a.push_interval_ns;
+    opt.push_all = a.push_all;
+    opt.experiment = a.experiment;
+    if (opt.experiment.empty()) {
+      // Same default as ainic-netmon-import: the name of the output's parent directory.
+      char cwd[4096];
+      opt.experiment = ParentDirName(out, getcwd(cwd, sizeof(cwd)) ? cwd : "/");
+      if (opt.experiment.empty()) {
+        fprintf(stderr, "error: cannot derive an experiment name from %s: pass --experiment\n",
+                out.c_str());
+        return kExitSetup;
+      }
+    }
+  }
 
   std::vector<std::unique_ptr<Stream>> streams;
   bool fatal = false;

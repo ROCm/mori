@@ -47,6 +47,14 @@ struct WriterStream {
   int key_rx = -1;
 };
 
+// Receives every batch after it was written (the live push, NETMON_LIVE_PUSH_DESIGN §2). Called
+// on the writer thread; must not block, allocate or throw.
+class ExportHook {
+ public:
+  virtual ~ExportHook() = default;
+  virtual void Offer(const Batch& b) = 0;
+};
+
 class Writer {
  public:
   // Test hook: replaces ::write for record and meta writes.
@@ -72,6 +80,9 @@ class Writer {
     if (thread_.joinable()) thread_.join();
   }
 
+  // Before RequestCreate; the hook must outlive the writer thread.
+  void SetExportHook(ExportHook* h) { export_ = h; }
+
   bool failed() const { return failed_.load(); }
   std::string error();
 
@@ -89,6 +100,7 @@ class Writer {
   void SetFailed(const std::string& msg);
 
   BatchQueue* queue_;
+  ExportHook* export_ = nullptr;
   std::string dir_;
   bool quiet_;
 

@@ -125,3 +125,15 @@ TEST(JsonEscaping) {
   CHECK(j.str() ==
         "{\"a\\\"b\":\"x\\n\\t\\\\\\u0001\",\"n\":null,\"arr\":[\"p\",\"q\"],\"d\":1.5}");
 }
+
+TEST(DefaultExperimentName) {
+  // same as os.path.basename(os.path.dirname(os.path.abspath(p))) with cwd /w/exp
+  CHECK(ParentDirName("./run", "/w/exp") == "exp");
+  CHECK(ParentDirName("run/", "/w/exp") == "exp");
+  CHECK(ParentDirName("../exp2/n1", "/w/exp") == "exp2");
+  CHECK(ParentDirName("/shared/exp42/host1", "/x") == "exp42");
+  CHECK(ParentDirName("/shared/exp42/./host1/", "/x") == "exp42");
+  CHECK(ParentDirName("/a/b/../c/d", "/x") == "c");
+  CHECK(ParentDirName("/run", "/x").empty());  // parent is "/": no name
+  CHECK(LexicalAbsPath("../../..", "/a") == "/");
+}
