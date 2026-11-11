@@ -310,7 +310,7 @@ int ResolveRoceDmac(ibv_pd* pd, uint32_t portId, int gidIdx, const uint8_t remot
     uint8_t mac[ETHERNET_LL_SIZE];
   };
   // Sorted map: small, and lookups happen once per QP. The device name, unlike the context
-  // pointer, cannot be reused by another device.
+  // pointer, is not recycled when a context is closed and reopened.
   using Key = std::tuple<std::string, uint32_t, int, std::array<uint8_t, 16>>;
   static std::mutex cacheMutex;
   static std::map<Key, Entry> cache;
@@ -729,7 +729,8 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
            sizeof(remote_handle.eth.gid));
 
     // remote_handle.eth.mac is the peer NIC's own MAC, which only works on the same L2 segment.
-    // A DEVX QP bypasses the kernel's resolution, so resolve the next hop here (cached per peer).
+    // A DEVX QP bypasses the kernel's resolution, so resolve the next hop here (cached per local
+    // NIC and peer).
     // A resolution failure, or MORI_MLX5_RESOLVE_DMAC=0, keeps the old behaviour.
     uint8_t dmac[ETHERNET_LL_SIZE];
     memcpy(dmac, remote_handle.eth.mac, sizeof(dmac));
