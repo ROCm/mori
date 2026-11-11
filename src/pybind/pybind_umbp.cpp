@@ -28,6 +28,7 @@
 
 #include "src/pybind/mori.hpp"
 #include "umbp/common/config.h"
+#include "umbp/common/device_gather.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/distributed_client.h"
 #include "umbp/distributed/master/master_client.h"
@@ -40,7 +41,17 @@ namespace py = pybind11;
 namespace mori {
 using namespace umbp;
 
+namespace {
+DeviceCopyPolicy ParseCopyPolicy(const std::string& mode) {
+  if (mode == "default") return DeviceCopyPolicy::Default;
+  if (mode == "low_priority") return DeviceCopyPolicy::LowPriority;
+  throw std::invalid_argument("unknown copy_mode: " + mode);
+}
+}  // namespace
+
 void RegisterMoriUmbp(py::module_& m) {
+  m.def("device_copy_policy_count",
+        [](const std::string& mode) { return DeviceCopyPolicyCount(ParseCopyPolicy(mode)); });
   py::enum_<HostBufferBacking>(m, "UMBPHostBufferBacking")
       .value("Anonymous", HostBufferBacking::kAnonymous)
       .value("AnonymousHugetlb", HostBufferBacking::kAnonymousHugetlb)
@@ -362,9 +373,17 @@ void RegisterMoriUmbp(py::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("batch_get_into_ptr", &IUMBPClient::BatchGet, py::arg("keys"), py::arg("ptrs"),
            py::arg("sizes"), py::call_guard<py::gil_scoped_release>())
-      .def("batch_get_ranges_into_ptr", &IUMBPClient::BatchGetRanges, py::arg("keys"),
-           py::arg("ptrs"), py::arg("sizes"), py::arg("src_offsets"),
-           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "batch_get_ranges_into_ptr",
+          [](IUMBPClient& client, const std::vector<std::string>& keys,
+             const std::vector<std::vector<uintptr_t>>& ptrs,
+             const std::vector<std::vector<size_t>>& sizes,
+             const std::vector<std::vector<size_t>>& offsets, const std::string& copy_mode) {
+            ScopedDeviceCopyPolicy policy(ParseCopyPolicy(copy_mode));
+            return client.BatchGetRanges(keys, ptrs, sizes, offsets);
+          },
+          py::arg("keys"), py::arg("ptrs"), py::arg("sizes"), py::arg("src_offsets"), py::kw_only(),
+          py::arg("copy_mode") = "default", py::call_guard<py::gil_scoped_release>())
       .def("batch_put_ranges_from_ptr", &IUMBPClient::BatchPutRanges, py::arg("keys"),
            py::arg("object_sizes"), py::arg("ptrs"), py::arg("sizes"), py::arg("dst_offsets"),
            py::call_guard<py::gil_scoped_release>())
