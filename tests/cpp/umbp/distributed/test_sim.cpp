@@ -759,6 +759,9 @@ TEST_F(SimTest, StandaloneLookupsReportMissesOnceTheLookupTimeoutPasses) {
   ASSERT_EQ(bind(silent, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
   ASSERT_EQ(listen(silent, 16), 0);
   auto lookups = std::async(std::launch::async, [&] {
+    // The first RPC after Shutdown fails on the old connection without
+    // waiting; spend it so each lookup below meets the silent socket.
+    client->Exists("k");
     return !client->Exists("k") && client->BatchExists({"k"}) == std::vector<bool>({false}) &&
            client->BatchExistsConsecutive({"k"}) == 0;
   });

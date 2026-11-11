@@ -69,6 +69,34 @@ void SetLookupDeadline(grpc::ClientContext* context, int timeout_ms) {
     context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms));
 }
 
+// Lookups run on every scheduled request, so a stalled server fails all of
+// them; report at most one per interval and count the rest.
+void WarnLookupFailure(const char* op, const grpc::Status& status, int timeout_ms) {
+  using Clock = std::chrono::steady_clock;
+  constexpr Clock::duration kWarnInterval = std::chrono::seconds(10);
+  static std::atomic<Clock::rep> next_warning_at{0};
+  static std::atomic<uint64_t> unlogged_failures{0};
+  const Clock::rep now = Clock::now().time_since_epoch().count();
+  Clock::rep expected = next_warning_at.load(std::memory_order_relaxed);
+  if (now < expected || !next_warning_at.compare_exchange_strong(
+                            expected, now + kWarnInterval.count(), std::memory_order_relaxed)) {
+    unlogged_failures.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  const uint64_t unlogged = unlogged_failures.exchange(0, std::memory_order_relaxed);
+  if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
+    MORI_UMBP_WARN(
+        "[StandaloneProcessClient] {} got no answer within lookup_timeout_ms={}; reported as a "
+        "miss ({} more failures not logged since the last warning)",
+        op, timeout_ms, unlogged);
+  } else {
+    MORI_UMBP_WARN(
+        "[StandaloneProcessClient] {} failed (grpc code {}: {}); reported as a miss ({} more "
+        "failures not logged since the last warning)",
+        op, static_cast<int>(status.error_code()), status.error_message(), unlogged);
+  }
+}
+
 void CheckKvMetadataStatus(const grpc::Status& status) {
   if (status.error_code() == grpc::StatusCode::INVALID_ARGUMENT)
     throw std::invalid_argument(status.error_message());
@@ -460,6 +488,7 @@ bool StandaloneProcessClient::Exists(const std::string& key) const {
   req.set_key(key);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Exists(&ctx, req, &resp);
+  if (!status.ok()) WarnLookupFailure("Exists", status, standalone_config_.lookup_timeout_ms);
   return call.Result(status.ok() && resp.ok());
 }
 
@@ -768,6 +797,7 @@ std::vector<bool> StandaloneProcessClient::BatchExists(const std::vector<std::st
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchExists(&ctx, req, &resp);
+  if (!status.ok()) WarnLookupFailure("BatchExists", status, standalone_config_.lookup_timeout_ms);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
@@ -785,6 +815,8 @@ size_t StandaloneProcessClient::BatchExistsConsecutive(const std::vector<std::st
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::CountResponse resp;
   grpc::Status status = stub_->BatchExistsConsecutive(&ctx, req, &resp);
+  if (!status.ok())
+    WarnLookupFailure("BatchExistsConsecutive", status, standalone_config_.lookup_timeout_ms);
   return call.Result(status.ok() ? static_cast<size_t>(resp.count()) : 0);
 }
 
