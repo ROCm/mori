@@ -103,7 +103,22 @@ class HbmCopyEngine final : public TransferEngine {
   void ClearHostGatherRegions();
 
   // Both endpoints addressable in this process, at least one of them GPU.
+  //
+  // With YieldRegisteredHostGpuPairs(true, min_bytes), an item of at least
+  // `min_bytes` between a host and a GPU buffer that are BOTH registered with
+  // mori-io is declined by CanHandleSized, so the composite hands it to the
+  // engine behind this one: MoriIoEngine with local loopback, which moves it
+  // through the NIC instead of the copy engine or a gather kernel.  Smaller
+  // items, a pair with either side unregistered, and GPU <-> GPU stay here.
+  // CanHandle itself keeps answering true: this engine CAN carry the pair.
+  // Set once, at composition, only when that engine can really take the pair.
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
+  bool CanHandleSized(const TransferRef& src, const TransferRef& dst,
+                      uint64_t item_bytes) const override;
+  void YieldRegisteredHostGpuPairs(bool yield, uint64_t min_item_bytes = 0) {
+    yield_registered_host_gpu_pairs_ = yield;
+    yield_min_item_bytes_ = min_item_bytes;
+  }
 
   // One plan per buffer pair, contiguous segments merged (each hipMemcpy has a
   // launch cost); a segment never crosses a host registration piece.
@@ -180,6 +195,8 @@ class HbmCopyEngine final : public TransferEngine {
   // Kernels take this, never the host pointer -- see HostTierRegistration.
   void* HostRegionDeviceAddress(const void* ptr, size_t size, int device_id) const;
 
+  bool yield_registered_host_gpu_pairs_ = false;  // set once, at composition
+  uint64_t yield_min_item_bytes_ = 0;
   mutable std::mutex host_regions_mutex_;
   std::vector<std::unique_ptr<HostTierRegistration>> host_regions_;
 };

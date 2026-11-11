@@ -42,6 +42,11 @@ std::shared_ptr<PoolPlatform> MakeSimPoolPlatform(const UMBPSimConfig& sim);
 
 namespace {
 
+// Smallest item UMBP_LOCAL_RDMA_COPY carries on the NIC.  Measured on MI355X
+// (2 NICs, GPU idle): at 37-42 KiB the NIC is within ~6-23% of the gather
+// kernel, at 8 KiB it is 1.3-1.9x slower and at 1.7 KiB 2.5x.
+constexpr uint64_t kDefaultLocalRdmaCopyMinBytes = 32 * 1024;
+
 std::chrono::milliseconds DramReadLeaseTtl() {
   static const auto v = GetEnvMilliseconds("UMBP_DRAM_READ_LEASE_MS",
                                            std::chrono::milliseconds(500), /*min_allowed=*/1);
@@ -83,12 +88,28 @@ class RealPoolPlatform final : public PoolPlatform {
       io_cfg.port = config.io_engine.port;
       auto rdma = std::make_unique<MoriIoEngine>(config.master_config.node_id, io_cfg,
                                                  config.staging_buffer_size);
+      // Opt-in: carry registered host <-> GPU copies on the NIC instead of the
+      // copy engine / gather kernel.  Off by default; see runtime-env-vars.md.
+      const bool local_rdma_copy = GetEnvUint32("UMBP_LOCAL_RDMA_COPY", 0) != 0;
+      // The NIC only keeps up with the copy engine on large fragments, so the
+      // opt-in applies per item above this size (0: every item).
+      const uint64_t local_rdma_min_bytes =
+          GetEnvUint64("UMBP_LOCAL_RDMA_COPY_MIN_BYTES", kDefaultLocalRdmaCopyMinBytes);
+      rdma->SetLocalLoopback(local_rdma_copy, local_rdma_min_bytes);
       if (!rdma->Init()) {
         MORI_UMBP_ERROR("[PoolClient] MoriIoEngine init failed on {}:{}", config.io_engine.host,
                         config.io_engine.port);
         return {};
       }
       peers = rdma.get();
+      // Only yield the pair if the loopback really came up: Init() clears the
+      // flag when the engine cannot register itself.
+      hbm_observer->YieldRegisteredHostGpuPairs(rdma->LocalLoopback(),
+                                                rdma->LocalLoopbackMinBytes());
+      if (rdma->LocalLoopback()) {
+        MORI_UMBP_INFO(
+            "[PoolClient] UMBP_LOCAL_RDMA_COPY=1: registered host<->GPU copies use the NIC");
+      }
       composite->AddEngine(std::move(rdma));
     }
     hbm_engine_ = hbm_observer;

@@ -189,6 +189,15 @@ TransferEngine* CompositeTransferEngine::SelectEngine(const TransferRef& src,
   return nullptr;
 }
 
+TransferEngine* CompositeTransferEngine::SelectEngine(const TransferRef& src,
+                                                      const TransferRef& dst,
+                                                      uint64_t item_bytes) const {
+  for (const auto& engine : engines_) {
+    if (engine->CanHandleSized(src, dst, item_bytes)) return engine.get();
+  }
+  return nullptr;
+}
+
 bool CompositeTransferEngine::CanHandle(const TransferRef& src, const TransferRef& dst) const {
   return SelectEngine(src, dst) != nullptr;
 }
@@ -198,7 +207,7 @@ class CompositeTransferEngine::PlanBuilder final : public TransferPlanBuilder {
   PlanBuilder(const CompositeTransferEngine& owner, size_t expected_items)
       : owner_(owner), expected_items_(expected_items) {}
   void Add(const TransferItem& item) override {
-    TransferEngine* engine = owner_.SelectEngine(item.src, item.dst);
+    TransferEngine* engine = owner_.SelectEngine(item.src, item.dst, item.size);
     if (engine == nullptr) {
       rejected_.push_back(item.tag);
       owner_.rejected_items_.fetch_add(1, std::memory_order_relaxed);
