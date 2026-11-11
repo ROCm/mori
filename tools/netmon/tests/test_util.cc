@@ -1,0 +1,106 @@
+#include <cstring>
+
+#include "cli.h"
+#include "harness.h"
+#include "meta_json.h"
+#include "privilege.h"
+#include "util.h"
+
+using namespace netmon;
+
+namespace {
+
+bool Parse(std::vector<std::string> args, RecordArgs* a, std::string* err) {
+  args.insert(args.begin(), "record");
+  std::vector<char*> v;
+  for (auto& s : args) v.push_back(s.data());
+  v.push_back(nullptr);
+  return ParseRecordArgs(static_cast<int>(args.size()), v.data(), a, err);
+}
+
+}  // namespace
+
+TEST(Durations) {
+  uint64_t ns;
+  CHECK(ParseDurationNs("2ms", &ns) && ns == 2000000ull);
+  CHECK(ParseDurationNs("500us", &ns) && ns == 500000ull);
+  CHECK(ParseDurationNs("1.5s", &ns) && ns == 1500000000ull);
+  CHECK(ParseDurationNs("10m", &ns) && ns == 600000000000ull);
+  CHECK(ParseDurationNs("0", &ns) && ns == 0);
+  CHECK(!ParseDurationNs("5", &ns));
+  CHECK(!ParseDurationNs("ms", &ns));
+  CHECK(!ParseDurationNs("-1s", &ns));
+  CHECK(!ParseDurationNs("2days", &ns));
+  CHECK(!ParseDurationNs("1e30s", &ns));  // overflow guard
+}
+
+TEST(CpuListsAndIntervals) {
+  std::vector<int> c;
+  CHECK(ParseCpuList("0-3,8", &c) && c.size() == 5 && c[4] == 8);
+  CHECK(!ParseCpuList("3-1", &c));
+  CHECK(!ParseCpuList("a", &c));
+  CHECK(!ParseCpuList("", &c));
+  RecordArgs a;
+  std::string e;
+  CHECK(ParseIntervals("rdma=1ms,ethtool=0", &a, &e));
+  CHECK_EQ(a.interval_rdma_ns, 1000000ull);
+  CHECK_EQ(a.interval_ethtool_ns, 0ull);
+  CHECK(!ParseIntervals("foo=1ms", &a, &e));
+  CHECK(!ParseIntervals("rdma=2m", &a, &e));  // > 60 s
+}
+
+TEST(RecordArgs_) {
+  RecordArgs a;
+  std::string e;
+  CHECK(Parse({"-o", "/x/{host}", "--sources", "rdma,ipc", "--tag", "role=D", "--tag", "a=b", "-d",
+               "10s", "-q"},
+              &a, &e));
+  CHECK(!a.sources_auto && a.want_rdma && a.want_ipc && !a.want_ethtool);
+  CHECK(a.tags.size() == 2 && a.tags["role"] == "D");
+  CHECK(ExpandHost(a.out, "n1") == "/x/n1");
+  RecordArgs b;
+  CHECK(!Parse({"-o", "a", "-o", "b"}, &b, &e));  // duplicate single-value option
+  RecordArgs c;
+  CHECK(!Parse({"--nics", "x"}, &c, &e));  // missing -o
+  RecordArgs d;
+  CHECK(!Parse({"-o", "a", "--sources", "rdma,bogus"}, &d, &e));
+  RecordArgs f;
+  CHECK(!Parse({"-o", "a", "extra"}, &f, &e));
+  RecordArgs g;
+  CHECK(!Parse({"-o", "a", "--host-id", "a/b"}, &g, &e));
+}
+
+TEST(SudoArgv) {
+  auto v =
+      BuildSudoArgv("/abs/ainic-netmon", {"record", "-o", "dir with space", "--sudo"}, 1000, 1001);
+  std::vector<std::string> want = {"sudo",           "--",      "/abs/ainic-netmon", "record", "-o",
+                                   "dir with space", "--owner", "1000:1001"};
+  CHECK(v == want);
+  // An explicit --owner is kept and not overridden.
+  v = BuildSudoArgv("/b", {"record", "--owner", "5:6", "--sudo", "-o", "d"}, 1000, 1001);
+  want = {"sudo", "--", "/b", "record", "--owner", "5:6", "-o", "d"};
+  CHECK(v == want);
+  v = BuildSudoArgv("/b", {"record", "--owner=5:6", "--sudo"}, 1000, 1001);
+  CHECK(v.back() == "--owner=5:6");
+}
+
+TEST(OwnerParsing) {
+  uid_t u;
+  gid_t g;
+  CHECK(ParseOwner("100428:100428", &u, &g) && u == 100428 && g == 100428);
+  CHECK(!ParseOwner("100428", &u, &g));
+  CHECK(!ParseOwner("a:b", &u, &g));
+  CHECK(!ParseOwner("1:", &u, &g));
+  Owner o;
+  Status st;
+  CHECK(DetermineOwner("7:8", "/nonexistent/x", &o, &st) && o.uid == 7 && o.source == "--owner");
+  CHECK(!DetermineOwner("bad", "/x", &o, &st) && !st.ok());
+}
+
+TEST(JsonEscaping) {
+  JsonWriter j(false);
+  j.BeginObject().Key("a\"b").String("x\n\t\\\x01").Key("n").Null();
+  j.Key("arr").StringArray({"p", "q"}).Key("d").Double(1.5).EndObject();
+  CHECK(j.str() ==
+        "{\"a\\\"b\":\"x\\n\\t\\\\\\u0001\",\"n\":null,\"arr\":[\"p\",\"q\"],\"d\":1.5}");
+}
