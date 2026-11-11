@@ -22,6 +22,9 @@ python/mori/umbp_master
 python/mori/bin/
 # synced from tools/netmon/report by setup.py
 python/mori/_netmon_report.py
+python/mori/_netmon_import.py
+python/mori/_netmon_verify.py
+python/mori/_netmon_dashboards.py
 python/mori/umbp_standalone_server
 python/mori/spdk_proxy
 python/mori/examples/*

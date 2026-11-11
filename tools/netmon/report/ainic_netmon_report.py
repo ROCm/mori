@@ -136,7 +136,7 @@ class Run:
         self.speed = {
             n["netdev"]: n.get("speed_mbps", -1) for n in self.meta.get("nics", [])
         }
-        self.role = (self.meta.get("tags") or {}).get("role")
+        self.tags = self.meta.get("tags") or {}
 
     def stream(self, netdev, source):
         for s in self.streams:
@@ -223,12 +223,14 @@ class Rates:
             t, wall, seg, v, dec = t[keep], wall[keep], seg[keep], v[keep], dec[keep]
             resets_between = np.diff(dec) > 0
         n = 0 if v is None else len(v)
+        self.base_ns = float(stream.interval_ns)
         if n < 2:
             z = np.zeros(0)
             self.t_start = self.t_end = self.w_start = self.w_end = self.rate = (
                 self.dv
             ) = self.dt = z
             self.valid = self.lowres = self.local_valid = np.zeros(0, dtype=bool)
+            self.reset = self.clock = np.zeros(0, dtype=bool)
             return
         later, earlier = v[1:], v[:-1]
         ok = (later >= earlier) & ~resets_between  # compare before subtracting (u64)
@@ -249,17 +251,81 @@ class Rates:
         self.valid = (
             valid & same_seg & np.isfinite(self.w_start) & np.isfinite(self.w_end)
         )
+        self.base_ns = base
         self.lowres = (
             self.valid & (dt > LOWRES_FACTOR * base)
             if base > 0
             else np.zeros_like(valid)
         )
+        # Why an interval is not usable (for the importer's gap series): a counter reset /
+        # decrease, or a rate that is fine locally but has no certain wall-clock placement.
+        self.reset = ~ok
+        self.clock = valid & ~self.valid
         with np.errstate(divide="ignore", invalid="ignore"):
             self.rate = np.where(self.valid, dv / dt * 1e9, np.nan)  # per second
 
     def clip(self, w0, w1):
         """Mask of intervals lying inside [w0, w1] (wall ns)."""
         return self.valid & (self.w_start >= w0) & (self.w_end <= w1)
+
+    def end_ms(self):
+        """Wall-clock end of each interval in integer ms (VM's resolution); -1 if unknown."""
+        e = np.where(np.isfinite(self.w_end), self.w_end, -1e6)
+        return np.round(e / 1e6).astype(np.int64)
+
+
+# --------------------------------------------------------------------------- windows
+# One rule shared by the offline report and the dashboards (NETMON_DASHBOARD_DESIGN §3.4):
+# windows are (t - w, t] on a grid of integer ms; an interval belongs to the window that
+# contains its (ms-rounded) end time. Envelope and mean use normal-resolution intervals.
+
+
+def epoch_grid(from_ms, to_ms, step_ms):
+    """Window ends covering [from_ms, to_ms], aligned to multiples of step from the epoch
+    (Grafana's alignment; NETMON_DASHBOARD_DESIGN §2)."""
+    step_ms = max(int(step_ms), 1)
+    first = (int(from_ms) // step_ms) * step_ms
+    last = -(-int(to_ms) // step_ms) * step_ms
+    return np.arange(first, last + 1, step_ms, dtype=np.int64)
+
+
+def window_aggregate(r, grid_ms, w_ms, scale=1.0):
+    """Per window ending at grid_ms[i] (window (t - w_ms, t]): max, min, mean over
+    normal-resolution intervals, and the max low-resolution rate. NaN where a window has no
+    such interval (no zero filling)."""
+    grid_ms = np.asarray(grid_ms, dtype=np.int64)
+    n = len(grid_ms)
+    out = {k: np.full(n, np.nan) for k in ("max", "min", "mean", "low")}
+    if n == 0 or len(r.valid) == 0:
+        return out
+    end = r.end_ms()
+    step = int(grid_ms[1] - grid_ms[0]) if n > 1 else int(w_ms)
+    if step != int(w_ms):
+        raise ValueError("window_aggregate needs window == grid step")
+    # Window index: grid[i] - w < end <= grid[i]  ->  i = ceil((end - grid[0]) / step)
+    idx = -((grid_ms[0] - end) // step)
+    inside = (idx >= 0) & (idx < n)
+    normal = r.valid & ~r.lowres & inside
+    low = r.valid & r.lowres & inside
+    if normal.any():
+        i = idx[normal]
+        vals = r.rate[normal] * scale
+        mx = np.full(n, -np.inf)
+        mn = np.full(n, np.inf)
+        np.maximum.at(mx, i, vals)
+        np.minimum.at(mn, i, vals)
+        dv = np.bincount(i, weights=r.dv[normal], minlength=n)
+        dt = np.bincount(i, weights=r.dt[normal], minlength=n)
+        has = np.bincount(i, minlength=n) > 0
+        out["max"] = np.where(has, mx, np.nan)
+        out["min"] = np.where(has, mn, np.nan)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out["mean"] = np.where(has & (dt > 0), dv / dt * 1e9 * scale, np.nan)
+    if low.any():
+        lw = np.full(n, -np.inf)
+        np.maximum.at(lw, idx[low], r.rate[low] * scale)
+        out["low"] = np.where(np.isfinite(lw), lw, np.nan)
+    return out
 
 
 def weighted_quantile(values, weights, q):
@@ -334,30 +400,26 @@ def peak_over_window(r, mask, scale):
 # --------------------------------------------------------------------------- report
 
 
+def overview_step_ms(w0, w1, bins):
+    return max(1, int(np.ceil((w1 - w0) / 1e6 / max(bins, 1))))
+
+
 def overview_series(r, w0, w1, bins, scale):
-    """Envelope (min, max) and mean per time bin for normal-resolution intervals, plus the
-    low-resolution intervals as flat segments."""
+    """Envelope (min, max) and mean per window, by the rule shared with the dashboards
+    (window_aggregate on an epoch-aligned ms grid), plus the low-resolution intervals as
+    flat segments for display."""
+    step = overview_step_ms(w0, w1, bins)
+    grid = epoch_grid(w0 / 1e6, w1 / 1e6, step)
+    a = window_aggregate(r, grid, step, scale)
     m = r.clip(w0, w1)
-    normal = m & ~r.lowres
-    edges = np.linspace(w0, w1, bins + 1)
-    x = r.w_end[normal]
-    b = np.clip(np.searchsorted(edges, x, side="right") - 1, 0, bins - 1)
-    vals = r.rate[normal] * scale
-    cnt = np.bincount(b, minlength=bins)
-    dv = np.bincount(b, weights=r.dv[normal], minlength=bins)
-    dt = np.bincount(b, weights=r.dt[normal], minlength=bins)
-    mn = np.full(bins, np.inf)
-    mx = np.full(bins, -np.inf)
-    np.minimum.at(mn, b, vals)
-    np.maximum.at(mx, b, vals)
-    empty = cnt == 0
-    with np.errstate(divide="ignore", invalid="ignore"):
-        mean = np.where(empty, np.nan, dv / dt * 1e9 * scale)
-    mn[empty] = np.nan
-    mx[empty] = np.nan
-    centers = (edges[:-1] + edges[1:]) / 2
     lo = m & r.lowres
-    return centers, mn, mx, mean, (r.w_start[lo], r.w_end[lo], r.rate[lo] * scale)
+    return (
+        grid.astype(np.float64) * 1e6,
+        a["min"],
+        a["max"],
+        a["mean"],
+        (r.w_start[lo], r.w_end[lo], r.rate[lo] * scale),
+    )
 
 
 def detail_series(r, w0, w1, scale):
@@ -492,8 +554,8 @@ TX, RX = (
 )  # colour follows the entity: tx is always blue, rx orange
 
 
-def build_nic_fig(run, netdev, role, w0, w1, mode, bins):
-    fig = Fig(f"{run.host} / {netdev}" + (f" (role {role})" if role else ""))
+def build_nic_fig(run, netdev, w0, w1, mode, bins):
+    fig = Fig(f"{run.host} / {netdev}")
     gbps = 8 / 1e9
     rd = run.stream(netdev, "rdma")
     ip = run.stream(netdev, "ipc")
@@ -501,31 +563,6 @@ def build_nic_fig(run, netdev, role, w0, w1, mode, bins):
         tr = fig.row("RDMA payload bytes, Gb/s")
         add_series(tr, Rates(rd, RDMA_TX), w0, w1, gbps, "tx", TX, mode, bins)
         add_series(tr, Rates(rd, RDMA_RX), w0, w1, gbps, "rx", RX, mode, bins)
-        if role in ("P", "D"):
-            tr = fig.row("Direction view, Gb/s (assumes EP send ≈ recv)")
-            ep_only = RDMA_TX if role == "D" else RDMA_RX
-            add_series(
-                tr,
-                Rates(rd, ep_only),
-                w0,
-                w1,
-                gbps,
-                f"EP-only ({'tx' if role == 'D' else 'rx'})",
-                TX if role == "D" else RX,
-                mode,
-                bins,
-            )
-            add_series(
-                tr,
-                DiffRates(rd, role),
-                w0,
-                w1,
-                gbps,
-                ("rx − tx" if role == "D" else "tx − rx") + " (KV estimate)",
-                PALETTE[2],
-                mode,
-                bins,
-            )
         tr = fig.row("Congestion and retransmission, per second")
         for i, name in enumerate(CONGESTION):
             if rd.col(name) is not None:
@@ -559,22 +596,6 @@ def build_nic_fig(run, netdev, role, w0, w1, mode, bins):
                     tr, Rates(ip, name), w0, w1, 1.0, name, PALETTE[k], mode, bins
                 )
     return fig
-
-
-class DiffRates(Rates):
-    """Signed direction difference of RDMA bytes: D: rx - tx, P: tx - rx (same samples)."""
-
-    def __init__(self, stream, role):
-        a = Rates(stream, RDMA_RX if role == "D" else RDMA_TX)
-        b = Rates(stream, RDMA_TX if role == "D" else RDMA_RX)
-        self.__dict__.update(a.__dict__)
-        self.name = "diff"
-        self.valid = a.valid & b.valid
-        self.local_valid = a.local_valid & b.local_valid
-        self.lowres = a.lowres | b.lowres
-        self.dv = np.where(self.valid, a.dv - b.dv, 0.0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            self.rate = np.where(self.valid, self.dv / self.dt * 1e9, np.nan)
 
 
 def to_plotly(fig):
@@ -684,11 +705,10 @@ def parse_window(spec, w0, w1):
     return s, e
 
 
-def plotted_streams(runs, roles, nics):
+def plotted_streams(runs, nics):
     """(stream, number of curves drawn from it) for everything the report will plot."""
     out = []
     for r in runs:
-        role = roles.get(r.host, r.role)
         for s in r.streams:
             if (
                 (nics and s.netdev not in nics)
@@ -697,7 +717,7 @@ def plotted_streams(runs, roles, nics):
             ):
                 continue
             if s.source == "rdma":
-                n = 2 + len(CONGESTION) + (2 if role in ("P", "D") else 0)
+                n = 2 + len(CONGESTION)
             else:
                 n = 2 + len(PALETTE)  # wire tx/rx + at most one palette of PFC counters
             out.append((s, n))
@@ -710,12 +730,6 @@ def cmd_report(args):
     except ImportError:
         raise SystemExit("plotly is required for `report`: pip install plotly")
     runs = [Run(d) for d in args.run_dirs]
-    roles = {}
-    for item in args.role or []:
-        host, _, role = item.partition("=")
-        if role not in ("P", "D"):
-            raise SystemExit(f"--role {item}: role must be P or D")
-        roles[host] = role
     notes = []
     starts, ends = [], []
     for r in runs:
@@ -760,7 +774,7 @@ def cmd_report(args):
         w0, w1 = parse_window(args.window, w0, w1)
         mode = "detail"
     figs, rows = [], []
-    plotted = plotted_streams(runs, roles, args.nics)
+    plotted = plotted_streams(runs, args.nics)
     nseries = sum(n for _, n in plotted)
     bins = args.bins
     if mode == "overview":
@@ -781,12 +795,11 @@ def cmd_report(args):
                 f"--window selects ~{npts} points (limit {args.max_points}); choose a smaller window or --nics"
             )
     for r in runs:
-        role = roles.get(r.host, r.role)
         st = r.meta.get("run_stats") or {}
         for nd in r.netdevs():
             if args.nics and nd not in args.nics:
                 continue
-            figs.append(build_nic_fig(r, nd, role, w0, w1, mode, bins))
+            figs.append(build_nic_fig(r, nd, w0, w1, mode, bins))
             line = r.speed.get(nd, -1)
             thr = line * 1e6 * 0.8 if line and line > 0 else None
             for src, keys, label in (
@@ -924,12 +937,6 @@ def main(argv=None):
     )
     r.add_argument("run_dirs", nargs="+")
     r.add_argument("-o", "--output", default="ainic-netmon-report.html")
-    r.add_argument(
-        "--role",
-        action="append",
-        metavar="HOST=P|D",
-        help="node role for the direction view (default: meta tag role)",
-    )
     r.add_argument(
         "--window",
         help="START,END: seconds from the common start, or ISO UTC times; "

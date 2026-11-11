@@ -21,7 +21,7 @@ if(Python3_Interpreter_FOUND)
   if(NOT NETMON_NUMPY_MISSING)
     add_test(
       NAME netmon_report_tests
-      COMMAND ${Python3_EXECUTABLE} -m unittest -v test_report
+      COMMAND ${Python3_EXECUTABLE} -m unittest -v test_report test_import
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   else()
     message(STATUS "ainic-netmon: numpy not found, report tests skipped")

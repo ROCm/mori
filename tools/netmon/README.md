@@ -83,12 +83,13 @@ ainic-netmon record -o DIR -d 60s    # record; Ctrl-C or SIGTERM stops early
 ainic-netmon record --help
 ```
 
-Multi-node: run one recorder per node with a shared output path and a role tag, e.g.
+Multi-node: run one recorder per node with a shared output path, e.g.
 
 ```
-ainic-netmon record -o /shared/exp42/{host} -d 120s --tag role=D     # on decode nodes
-ainic-netmon record -o /shared/exp42/{host} -d 120s --tag role=P     # on prefill nodes
+ainic-netmon record -o /shared/exp42/{host} -d 120s     # on every node
 ```
+
+`--tag KEY=VALUE` stores free-form labels in `meta.json`; the tools do not interpret them.
 
 `{host}` expands to the host id (hostname, or `--host-id`). Sampling is aligned to the
 wall-clock grid on every node; nodes need NTP/PTP for millisecond alignment across hosts.
@@ -133,7 +134,7 @@ tx = rec[:, 4 + s["names"].index("tx_rdma_ucast_bytes")]
 ## Report
 
 ```
-ainic-netmon-report report DIR_nodeA DIR_nodeB -o report.html [--role HOST=P|D ...]
+ainic-netmon-report report DIR_nodeA DIR_nodeB -o report.html
 ainic-netmon-report report DIR -o zoom.html --window 12.5,12.8      # raw 2 ms points
 ainic-netmon-report csv DIR --nic benic1p1 --source rdma --counters tx_rdma_ucast_bytes --rate
 ```
@@ -143,10 +144,6 @@ ainic-netmon-report csv DIR --nic benic1p1 --source rdma --counters tx_rdma_ucas
 - One panel group per node and NIC: RDMA payload rates, congestion/retransmission rates, and
   with `ipc` the wire rates and PFC pause counters. The default view covers the whole recording
   as a min/max envelope per time bin (size budget `--max-mb`); `--window` shows raw points.
-- With a role, a direction view is added: EP all-to-all traffic is bidirectional, KV transfer
-  goes P -> D only, so on a D node `tx` is EP-only (a drop there means EP was slowed) and
-  `rx - tx` estimates the KV rate (P: `rx` and `tx - rx`). This assumes EP send ~= receive;
-  it fails when KV flows in both directions.
 - Sample time = `t0 + f * rtt` (f = 0.70 rdma, 0.25 ipc, measured). Requests slower than
   1.5x the median have no reliable snapshot time and are skipped for rates (the interval just
   becomes longer; cumulative counters lose nothing). Intervals longer than 3x the sampling

@@ -38,7 +38,7 @@ import ainic_netmon_report as R  # noqa: E402
 MS = 1_000_000
 
 
-def write_run(d, streams, host="h", role=None):
+def write_run(d, streams, host="h"):
     """streams: list of dicts(netdev, source, names, t0, rtt, real, err, values[n, k])."""
     os.makedirs(d, exist_ok=True)
     meta = {
@@ -50,8 +50,6 @@ def write_run(d, streams, host="h", role=None):
         "nics": [{"netdev": s["netdev"], "speed_mbps": 400000} for s in streams],
         "run_stats": {},
     }
-    if role:
-        meta["tags"]["role"] = role
     for s in streams:
         f = f"{s['netdev']}.{s['source']}.bin"
         n = len(s["t0"])
@@ -194,8 +192,8 @@ class ReportTests(unittest.TestCase):
             for i in range(8)
         ]
         run = write_run(self.tmp + "/multi", streams)
-        self.assertEqual(len(R.plotted_streams([run], {}, ["n3"])), 1)
-        self.assertEqual(len(R.plotted_streams([run], {}, None)), 8)
+        self.assertEqual(len(R.plotted_streams([run], ["n3"])), 1)
+        self.assertEqual(len(R.plotted_streams([run], None)), 8)
 
     def test_average_skips_reset_interval(self):
         t0, rtt, real, err, v = steady(30)

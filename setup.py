@@ -1032,22 +1032,31 @@ def _sync_bundled_scripts() -> None:
 _sync_bundled_scripts()
 
 
-def _sync_netmon_report() -> None:
-    """Ship the ainic-netmon report tool as ``mori._netmon_report``.
+_NETMON_MODULES = {
+    "ainic_netmon_report.py": "_netmon_report.py",
+    "ainic_netmon_import.py": "_netmon_import.py",
+    "ainic_netmon_verify.py": "_netmon_verify.py",
+    "ainic_netmon_dashboards.py": "_netmon_dashboards.py",
+}
 
-    The single source of truth is ``tools/netmon/report/ainic_netmon_report.py`` (it must
-    also work on its own, outside mori); the package gets a synced copy.
+
+def _sync_netmon_report() -> None:
+    """Ship the ainic-netmon report, importer and verifier as ``mori._netmon_*``.
+
+    The single source of truth is ``tools/netmon/report/`` (the scripts must also work on
+    their own, outside mori); the package gets synced copies.
     """
     here = Path(__file__).resolve().parent
-    src = here / "tools" / "netmon" / "report" / "ainic_netmon_report.py"
-    dst = here / "python" / "mori" / "_netmon_report.py"
-    if not src.is_file():
-        return
-    try:
-        if not dst.is_file() or dst.read_bytes() != src.read_bytes():
-            shutil.copy2(src, dst)
-    except OSError as exc:
-        print(f"[mori] WARN: failed to bundle the netmon report: {exc}")
+    for src_name, dst_name in _NETMON_MODULES.items():
+        src = here / "tools" / "netmon" / "report" / src_name
+        dst = here / "python" / "mori" / dst_name
+        if not src.is_file():
+            continue
+        try:
+            if not dst.is_file() or dst.read_bytes() != src.read_bytes():
+                shutil.copy2(src, dst)
+        except OSError as exc:
+            print(f"[mori] WARN: failed to bundle {src_name}: {exc}")
 
 
 _sync_netmon_report()

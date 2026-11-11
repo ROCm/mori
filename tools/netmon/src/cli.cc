@@ -43,7 +43,7 @@ const char* RecordUsage() {
       --ipc-unverified   enable ipc on a firmware outside the verified list
       --interval SPEC    e.g. rdma=2ms,ipc=2ms,ethtool=1s (default); 0 = back-to-back
   -d, --duration DUR     e.g. 60s, 10m (default: until Ctrl-C / SIGTERM)
-      --tag K=V          free-form metadata, repeatable (the report reads role=P|D)
+      --tag K=V          free-form metadata stored in meta.json, repeatable
       --cpus LIST        pin sampler threads round-robin, e.g. 0-7,64
       --owner UID:GID    when running as root: owner of the output (see README)
       --sudo             not root: re-run this binary with sudo (asks for the password)

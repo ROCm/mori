@@ -54,6 +54,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     return run(list(sys.argv[1:] if argv is None else argv))
 
 
+def import_main(argv: Optional[List[str]] = None) -> int:
+    """ainic-netmon-import: recordings -> VictoriaMetrics (examples/monitoring/netmon)."""
+    try:
+        from . import _netmon_import
+    except ImportError as exc:
+        print(f"[mori] ainic-netmon-import unavailable: {exc}", file=sys.stderr)
+        return 1
+    return _netmon_import.main(argv)
+
+
 def report_main(argv: Optional[List[str]] = None) -> int:
     # numpy is needed for both subcommands, plotly for `report`.
     try:

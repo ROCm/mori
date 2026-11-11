@@ -202,6 +202,12 @@ def _cmd_netmon_report(rest: List[str]) -> int:
     return netmon_entry.report_main(rest)
 
 
+def _cmd_netmon_import(rest: List[str]) -> int:
+    from . import netmon_entry
+
+    return netmon_entry.import_main(rest)
+
+
 def _cmd_version(_rest: List[str]) -> int:
     try:
         from . import __version__  # type: ignore[attr-defined]
@@ -226,6 +232,10 @@ _COMMANDS = {
     "netmon-report": (
         _cmd_netmon_report,
         "report/CSV for netmon recordings (same as `ainic-netmon-report`)",
+    ),
+    "netmon-import": (
+        _cmd_netmon_import,
+        "import netmon recordings into VictoriaMetrics (same as `ainic-netmon-import`)",
     ),
     "version": (_cmd_version, "print mori version"),
 }

@@ -1,0 +1,41 @@
+# VictoriaMetrics + Grafana for ainic-netmon recordings. Start with ./up.sh (it writes .env
+# with your uid/gid, the data directory and the ports), import with ainic-netmon-import.
+#
+# Both services use the host network and listen on 127.0.0.1 only.
+services:
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.156.0
+    network_mode: host
+    restart: unless-stopped
+    user: "${NETMON_UID}:${NETMON_GID}"
+    volumes:
+      - ${NETMON_DATA}/vm:/storage
+    command:
+      - -storageDataPath=/storage
+      - -httpListenAddr=127.0.0.1:${NETMON_VM_PORT}
+      # Imported recordings are historical: keep them (VM drops samples older than this).
+      - -retentionPeriod=${NETMON_VM_RETENTION}
+      # Only imported data: no need to hide the newest 30 s (the VM default).
+      - -search.latencyOffset=0s
+      # No -dedup.minScrapeInterval: it would merge millisecond samples.
+
+  grafana:
+    image: grafana/grafana:13.3.1
+    network_mode: host
+    restart: unless-stopped
+    user: "${NETMON_UID}:${NETMON_GID}"
+    environment:
+      - GF_SERVER_HTTP_ADDR=127.0.0.1
+      - GF_SERVER_HTTP_PORT=${NETMON_GRAFANA_PORT}
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/netmon/netmon_overview.json
+      - NETMON_VM_PORT=${NETMON_VM_PORT}
+    volumes:
+      - ${NETMON_DATA}/grafana:/var/lib/grafana
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards/netmon:ro
+    depends_on:
+      - victoriametrics

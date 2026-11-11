@@ -1,0 +1,4 @@
+# written by up.sh
+.env
+# default data directory of up.sh
+data/
