@@ -682,13 +682,14 @@ def _report_tables(
     routing is not perfectly balanced.
     """
     num_tokens = args.max_tokens
-    dispatch_elem_size = torch.tensor([], dtype=cfg.dispatch_dtype).element_size()
-    combine_elem_size = torch.tensor([], dtype=cfg.combine_dtype).element_size()
-    dispatch_bytes = total_recv * cfg.hidden_dim * dispatch_elem_size
-    combine_bytes = total_recv * cfg.hidden_dim * combine_elem_size
+    # Transport widths: packed FP4 moves hidden_dim / 2 bytes per token.
+    dispatch_token_bytes = cfg.token_nbytes
+    combine_token_bytes = cfg.combine_token_nbytes
+    dispatch_bytes = total_recv * dispatch_token_bytes
+    combine_bytes = total_recv * combine_token_bytes
     rdma_tokens = _rdma_algo_token_count(idx, cfg, ll)
-    dispatch_rdma_bytes = rdma_tokens * cfg.hidden_dim * dispatch_elem_size
-    combine_rdma_bytes = rdma_tokens * cfg.hidden_dim * combine_elem_size
+    dispatch_rdma_bytes = rdma_tokens * dispatch_token_bytes
+    combine_rdma_bytes = rdma_tokens * combine_token_bytes
     # LL packs a fixed slot per (token, expert) rather than only what routed, so
     # its wire bytes exceed the payload by this factor. v1 scales the XGMI
     # column by it to get the LL column.
@@ -773,17 +774,17 @@ def _report_tables(
         (rdma_column, xgmi_column, latency_column),
         phase_dtype,
         phase_geometry,
-        elem_size,
+        token_bytes,
     ) in (
-        ("Dispatch", (0, 1, 2), cfg.dispatch_dtype, geometry[0], dispatch_elem_size),
-        ("Combine", (3, 4, 5), cfg.combine_dtype, geometry[1], combine_elem_size),
+        ("Dispatch", (0, 1, 2), cfg.dispatch_dtype, geometry[0], dispatch_token_bytes),
+        ("Combine", (3, 4, 5), cfg.combine_dtype, geometry[1], combine_token_bytes),
     ):
         xgmi_stats = _phase_stats(gathered[:, :, xgmi_column])
         _print_phase_table(
             f"{name} Performance ({str(phase_dtype).split('.')[-1]}) "
             f"block={phase_geometry[0]} warp={phase_geometry[2]} "
             f"rdma={phase_geometry[1]} qps={phase_geometry[3]} "
-            f"~{num_tokens * cfg.hidden_dim * elem_size / (1024 ** 2):.1f} MB/rank",
+            f"~{num_tokens * token_bytes / (1024 ** 2):.1f} MB/rank",
             _phase_stats(gathered[:, :, rdma_column]),
             xgmi_stats,
             tuple(stat * ll_scale for stat in xgmi_stats),
