@@ -36,7 +36,9 @@ ci.yml hands the cco and fused lanes to ci_cco.yml. Writes these step outputs:
           workflow_dispatch, or ci:full on a PR
   reason  why
 
-Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
+A scheduled run on main picks lanes like a PR does, from the files changed since
+main's last green run, and runs nothing if main has not moved since its last run;
+workflow_dispatch runs everything. On a PR:
 
   - a draft runs nothing, unless it has the ci:full label;
   - ci:full runs everything, with the full internode sweeps; ci:mi300x adds the
@@ -49,7 +51,9 @@ Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
     module that importing mori.ops/io/shmem runs also counts for umbp; a conftest.py,
     or a test package's __init__.py, counts for the groups of every file below it.
 
-With COMMENT=true it keeps one comment on the PR up to date with the lanes.
+With COMMENT=true it keeps one comment on the PR up to date with the lanes. A fork
+PR's token cannot write it, so for a fork PR ci-scope-comment.yml runs this script
+from main with a write token instead.
 
 `--files FILE` classifies a list of paths offline, for checking the rules.
 """
@@ -438,6 +442,73 @@ def wait_for_precommit(repo, sha, appear_s=300, finish_s=1200):
         time.sleep(20)
 
 
+def main_runs(repo):
+    """(id, head_sha, conclusion) of ci.yml's finished, not cancelled, runs on main,
+    newest first."""
+    lines = gh_lines(
+        f"repos/{repo}/actions/workflows/ci.yml/runs"
+        "?branch=main&status=completed&per_page=30",
+        "--jq",
+        '.workflow_runs[] | select(.event != "pull_request"'
+        ' and .conclusion != "cancelled") | [.id, .head_sha, .conclusion] | @tsv',
+    )
+    return [tuple(line.split("\t")) for line in lines]
+
+
+def tested_anything(repo, run_id):
+    """Whether a run started a GPU lane, i.e. was not one that skipped them all."""
+    names = gh_lines(
+        f"repos/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100",
+        "--jq",
+        '.jobs[] | select(.conclusion != "skipped") | .name',
+    )
+    return any(not n.startswith(("scope", "CI gate")) for n in names)
+
+
+def changed_between(repo, base, head):
+    """Files changed from base to head; None when GitHub truncates the list."""
+    files = gh_lines(
+        f"repos/{repo}/compare/{base}...{head}",
+        "--jq",
+        ".files[] | .filename, (.previous_filename // empty)",
+    )
+    # The compare API lists at most 300 files.
+    return None if len(files) >= 300 else files
+
+
+def main_scope(repo, sha):
+    """(lanes, groups, reason) for a scheduled run of main at sha: nothing if the
+    last run that tested anything was of sha; otherwise the lanes for what changed
+    since the last run that tested anything and passed, so a failure keeps being
+    tested until main is green again; everything if that cannot be worked out."""
+    everything = dict.fromkeys(LANES, True), set(ALL)
+    try:
+        last = green = None
+        for run_id, run_sha, conclusion in main_runs(repo):
+            if not tested_anything(repo, run_id):
+                continue
+            last = last or run_sha
+            if conclusion == "success":
+                green = run_sha
+                break
+        if last == sha:
+            return (
+                dict.fromkeys(LANES, False),
+                set(),
+                f"main has not moved since its last run ({sha[:8]})",
+            )
+        if not green:
+            return *everything, "no recent green run of main to compare with"
+        files = changed_between(repo, green, sha)
+    except subprocess.CalledProcessError:
+        return *everything, "could not compare main with its last green run"
+    span = f"main {green[:8]}..{sha[:8]}"
+    if files is None:
+        return *everything, f"{span} changes more files than the compare API lists"
+    lanes, groups, reason = lanes_for_files(files, set())
+    return lanes, groups, f"{span} since its last green run, {reason}"
+
+
 def live_labels(env):
     """The PR's labels now; a re-run replays the original event's payload."""
     try:
@@ -457,6 +528,8 @@ def decide(env):
     event = env.get("EVENT_NAME", "")
     if event != "pull_request":
         full = event == "workflow_dispatch"
+        if event == "schedule" and env.get("HEAD_SHA"):
+            return (*main_scope(env["REPO"], env["HEAD_SHA"]), full)
         return (
             dict.fromkeys(LANES, True),
             set(ALL),
@@ -519,7 +592,8 @@ HINT = (
 
 def comment_body(env, lanes, reason, full, groups=frozenset()):
     """The PR comment; lanes=None means GPU CI did not start."""
-    run = "{}/{}/actions/runs/{}".format(
+    # RUN_URL: ci-scope-comment.yml writes a fork PR's comment from its own run.
+    run = env.get("RUN_URL") or "{}/{}/actions/runs/{}".format(
         env.get("GITHUB_SERVER_URL", "https://github.com"),
         env.get("REPO", ""),
         env.get("GITHUB_RUN_ID", ""),
