@@ -50,7 +50,7 @@ ainic-netmon-report report DIR -o report.html   # or: mori netmon-report ...
 
 `sudo ainic-netmon` on its own usually fails because sudo resets `PATH` (pip installs
 commands into a virtualenv or `~/.local/bin`). The report needs `numpy` and `plotly` in the
-Python environment. Build mori with `BUILD_NETMON=OFF` to leave the tool out.
+Python environment (`pip install amd_mori[netmon]`). Build mori with `BUILD_NETMON=OFF` to leave the tool out.
 
 ## Deployment: three ways, from most to least data
 

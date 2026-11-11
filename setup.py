@@ -881,7 +881,13 @@ class CMakeBuild(build_ext):
         # `ainic-netmon` / `mori netmon` entry points. Removed again when BUILD_NETMON=OFF.
         netmon_src = build_dir / "tools/netmon/ainic-netmon"
         netmon_dst = root_dir / "python/mori/bin/ainic-netmon"
-        if build_netmon == "ON" and netmon_src.exists():
+        if build_netmon == "ON":
+            if not netmon_src.exists():
+                raise RuntimeError(
+                    f"BUILD_NETMON=ON but {netmon_src} was not built; refusing to "
+                    "produce a wheel without ainic-netmon (set BUILD_NETMON=OFF to "
+                    "leave it out)"
+                )
             netmon_dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(netmon_src, netmon_dst)
             os.chmod(netmon_dst, 0o755)
