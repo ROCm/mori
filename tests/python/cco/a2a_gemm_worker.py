@@ -31,7 +31,8 @@ Every call gets fresh operands and is validated against the fp32 reference, so
 a band read before it landed shows up as the previous call's bytes. A hang is
 the other failure mode; the test's timeout catches it.
 
-Prints one ``RESULT_JSON`` line from rank 0 with every rank's verdicts.
+Prints one ``RESULT_JSON`` line from rank 0 per case with every rank's verdicts.
+``--case all`` runs every case and wait mode, each on a Communicator of its own.
 """
 
 from __future__ import annotations
@@ -90,26 +91,15 @@ def _preset(world: int, rank: int, value: int):
     return go
 
 
-def main() -> int:
-    p = argparse.ArgumentParser()
-    p.add_argument("--case", choices=("wrap", "mixed"), required=True)
-    p.add_argument("--wait", choices=("segment", "tile"), default="segment")
-    p.add_argument("--acquire", choices=("inv", "none"), default="inv")
-    p.add_argument("-m", type=int, default=1024)
-    p.add_argument("-n", type=int, default=1024)
-    p.add_argument("--calls", type=int, default=6)
-    a = p.parse_args()
-
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="cpu:gloo,cuda:nccl")
-    rank, world = dist.get_rank(), dist.get_world_size()
+def run_case(a, case, wait, rank, world):
+    """One case on a Communicator, dev-comm and window of its own, as a launch of
+    its own would have them; this rank's verdicts."""
     payload = [bytes(Communicator.get_unique_id()) if rank == 0 else None]
     dist.broadcast_object_list(payload, src=0)
     uid = UniqueId.from_bytes(payload[0])
     k = world * 256
     m, n = a.m, a.n
-    plan = [4] * a.calls if a.case == "wrap" else [4, 2] * (a.calls // 2)
+    plan = [4] * a.calls if case == "wrap" else [4, 2] * (a.calls // 2)
     cfgs = {c: A2aGemmConfig(world, m, k, 256, c) for c in set(plan)}
     cap = max(c.window_bytes for c in cfgs.values())
 
@@ -129,7 +119,7 @@ def main() -> int:
         reqs.sdma_queue_count = 1
         dc = comm.create_dev_comm(reqs)
         stream = fx.Stream(torch.cuda.current_stream())
-        if a.case == "wrap":
+        if case == "wrap":
             _preset(world, rank, 0xFFFF_FFF0)(dc.ptr, stream=stream)
         torch.cuda.synchronize()
         comm.barrier()
@@ -139,7 +129,7 @@ def main() -> int:
         comm.barrier()
 
         kernels = {
-            c: compile_a2a_gemm(cfg, rank, N=n, wait=a.wait, acquire=a.acquire)
+            c: compile_a2a_gemm(cfg, rank, N=n, wait=wait, acquire=a.acquire)
             for c, cfg in cfgs.items()
         }
         closers = {c: build_phases(cfg, rank)["barrier1"] for c, cfg in cfgs.items()}
@@ -170,12 +160,38 @@ def main() -> int:
             verdicts.append({"call": i, "chunks": chunks, "rel": rel, "ok": rel < TOL})
         win.close()
         mem.close()
-    gathered = [None] * world
-    dist.all_gather_object(gathered, verdicts)
-    if rank == 0:
-        print(
-            "RESULT_JSON " + json.dumps({"case": a.case, "ranks": gathered}), flush=True
-        )
+    return verdicts
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--case", choices=("wrap", "mixed", "all"), required=True)
+    p.add_argument("--wait", choices=("segment", "tile"), default="segment")
+    p.add_argument("--acquire", choices=("inv", "none"), default="inv")
+    p.add_argument("-m", type=int, default=1024)
+    p.add_argument("-n", type=int, default=1024)
+    p.add_argument("--calls", type=int, default=6)
+    a = p.parse_args()
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="cpu:gloo,cuda:nccl")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    # "all": both cases under both wait modes, keyed case/wait.
+    if a.case == "all":
+        runs = [(c, w) for c in ("wrap", "mixed") for w in ("segment", "tile")]
+    else:
+        runs = [(a.case, a.wait)]
+    for case, wait in runs:
+        verdicts = run_case(a, case, wait, rank, world)
+        gathered = [None] * world
+        dist.all_gather_object(gathered, verdicts)
+        key = f"{case}/{wait}" if a.case == "all" else case
+        if rank == 0:
+            print(
+                "RESULT_JSON " + json.dumps({"case": key, "ranks": gathered}),
+                flush=True,
+            )
     dist.barrier()
     dist.destroy_process_group()
     return 0

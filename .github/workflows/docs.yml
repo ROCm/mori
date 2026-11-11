@@ -38,8 +38,10 @@ jobs:
       - name: Build Sphinx documentation
         run: python -m sphinx -E -n -W --keep-going -b html docs docs/_build/html
 
-      - name: Check rendered local links
-        run: python tools/check_docs_links.py docs/_build/html
+      # The README links to the published pages, not to docs/*.md, so a renamed
+      # page has to fail here rather than leave the README pointing at a 404.
+      - name: Check rendered local links and the README's links into the site
+        run: python tools/check_docs_links.py docs/_build/html --markdown README.md
 
       - name: Upload documentation artifacts
         uses: actions/upload-artifact@v4

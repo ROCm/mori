@@ -458,6 +458,7 @@ def _mxfp8_gemm_rel_l2(
     ).item()
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 @pytest.mark.parametrize("quant", ["mxfp8", "mxfp8_raw"])
 @pytest.mark.parametrize(
@@ -480,6 +481,7 @@ def test_standalone_mxfp8_gemm(n, k, label, m, quant):
     assert _mxfp8_gemm_rel_l2(n, k, m, quant=quant) < FP8_FLOOR
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 @pytest.mark.parametrize("m", [1, 100, 1000])
 def test_standalone_mxfp8_raw_takes_any_m(m):
@@ -495,6 +497,7 @@ def test_standalone_mxfp8_raw_takes_any_m(m):
     assert _mxfp8_gemm_rel_l2(5120, 2048, m, quant="mxfp8_raw") < FP8_FLOOR
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 def test_standalone_mxfp8_gemm_pads_ragged_m():
     """A ragged M is zero-extended to the packed A scale's 64-row group.
@@ -511,6 +514,7 @@ def test_standalone_mxfp8_gemm_pads_ragged_m():
     assert _mxfp8_gemm_rel_l2(5120, 2048, 100, pad=True) < FP8_FLOOR
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 def test_standalone_mxfp8_gemm_refuses_unpadded_m():
     """M not on the group boundary is refused rather than quietly mis-scaled."""
@@ -557,6 +561,7 @@ def _mxfp8_gemv_rel_l2(n: int, k: int, m: int) -> float:
     ).item()
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 @pytest.mark.parametrize("n,k,label", [(8192, 1280, "wq_b"), (5120, 2048, "wo_b")])
 @pytest.mark.parametrize("m", [1, 3, 16, 17, 32])
@@ -570,6 +575,7 @@ def test_standalone_mxfp8_gemv(n, k, label, m):
     assert _mxfp8_gemv_rel_l2(n, k, m) < FP8_FLOOR
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 def test_mxfp8_gemv_refuses_m_above_its_tile():
     """Past 32 tokens it declines rather than silently truncating the batch.

@@ -382,6 +382,19 @@ TEST_F(SsdBackendTest, DsV4SizedObjectRoundTripsWith64KiBPages) {
   EXPECT_EQ(readback, payload);
 }
 
+// BatchTouch reaches the SSD tier for the keys it holds, and moves no bytes.
+TEST_F(SsdBackendTest, TouchCountsTheKeysTheTierHolds) {
+  SsdBackend* backend = Start();
+  ASSERT_TRUE(backend->OwnsEvictionOrder());
+  ASSERT_TRUE(Put(backend, "key-a", Payload(4096, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(4096, 2)));
+
+  EXPECT_EQ(backend->Touch({"key-a", "missing", "key-b"}), 2u);
+  EXPECT_EQ(backend->Touch({}), 0u);
+  EXPECT_EQ(PagesInUse(), 0u) << "a touch staged something";
+  EXPECT_FALSE(backend->Contains("missing"));
+}
+
 TEST_F(SsdBackendTest, GetOfAnUnknownKeyMisses) {
   SsdBackend* backend = Start();
   auto resolved = backend->BatchResolve({"never-written"}, false);
