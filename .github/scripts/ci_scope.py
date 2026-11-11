@@ -151,7 +151,8 @@ AREAS = [
         "fused",
         {"fused"},
         rf"^python/mori/ops/{FUSED_OPS}/|^tests/python/cco/(test_)?({FUSED_OPS}|flydsl_ar)"
-        r"|^tests/python/cco/kfd_settle\.py$|^benchmark/cco/flydsl/|^python/mori/ir/flydsl/",
+        r"|^tests/python/cco/(kfd_settle|bench_runs)\.py$|^benchmark/cco/flydsl/"
+        r"|^python/mori/ir/flydsl/",
     ),
     (
         "cco_tests",

@@ -86,50 +86,63 @@ def _spawn(*args: str, timeout: int = 900, last: bool = False, env=None):
         raise AssertionError(output[-4000:])
     lines = [ln for ln in output.splitlines() if ln.startswith("RESULT_JSON ")]
     assert lines, output[-4000:]
-    return json.loads(lines[-1].removeprefix("RESULT_JSON "))
+    return {
+        r["case"]: r["ranks"]
+        for r in (json.loads(ln.removeprefix("RESULT_JSON ")) for ln in lines)
+    }
+
+
+def _run_cases(*args: str, env=None):
+    """{case: per-rank results} of one launch."""
+    recs = _spawn(*args, env=env)
+    if recs is None:
+        time.sleep(_SETTLE_SECONDS * 3)
+        recs = _spawn(*args, last=True, env=env)
+    return recs
 
 
 def _run(*args: str, env=None):
-    rec = _spawn(*args, env=env)
-    if rec is None:
-        time.sleep(_SETTLE_SECONDS * 3)
-        rec = _spawn(*args, last=True, env=env)
-    return rec["ranks"]
+    return next(iter(_run_cases(*args, env=env).values()))
+
+
+@pytest.fixture(scope="module")
+def cases():
+    """Every case but reject, keyed "case/mode[/quant|/no-credit]", from one
+    8-rank launch."""
+    return _run_cases("--case", "all")
 
 
 @requires_world
-def test_self_test_sees_every_peer():
-    assert all(r["ok"] for r in _run("--case", "self_test"))
+def test_self_test_sees_every_peer(cases):
+    assert all(r["ok"] for r in cases["self_test"])
 
 
 @requires_world
 @pytest.mark.parametrize("quant", ["ptpc", "mxfp8"])
 @pytest.mark.parametrize("mode", ["fused", "split"])
-def test_op_lands_at_the_fp8_floor(mode, quant):
+def test_op_lands_at_the_fp8_floor(mode, quant, cases):
     """Two M values on one instance, alternating, then graph replays with fresh
     inputs: every received block, from every source, against fp32."""
-    ranks = _run("--case", "correct", "--mode", mode, "--quant", quant)
+    ranks = cases[f"correct/{mode}/{quant}"]
     bad = [(i, r["checks"]) for i, r in enumerate(ranks) if not r["ok"]]
     assert not bad, bad
 
 
 @requires_world
 @pytest.mark.parametrize("mode", ["fused", "split"])
-def test_credit_keeps_a_slow_reader_intact(mode):
+def test_credit_keeps_a_slow_reader_intact(mode, cases):
     """The victim reads call 1's result 50 ms late while its peers run call 2."""
-    victim = next(r for r in _run("--case", "race", "--mode", mode) if r["victim"])
+    victim = next(r for r in cases[f"race/{mode}"] if r["victim"])
     assert victim["ok"], victim
 
 
 @requires_world
 @pytest.mark.parametrize("mode", ["fused", "split"])
-def test_without_the_credit_the_race_is_real(mode):
+def test_without_the_credit_the_race_is_real(mode, cases):
     """Negative control: the same schedule with the credit off must corrupt the
     victim's unread recv. If this passes cleanly, the race test above proves
     nothing."""
-    victim = next(
-        r for r in _run("--case", "race", "--mode", mode, "--no-credit") if r["victim"]
-    )
+    victim = next(r for r in cases[f"race/{mode}/no-credit"] if r["victim"])
     assert not victim["ok"], victim
 
 
