@@ -30,21 +30,24 @@ is analytic: a pass means "matches the intended semantics", not "matches some
 other implementation", which is the property that has to survive the kernel being
 rewritten underneath it.
 
-TWO NODES ARE REQUIRED, and not merely for coverage -- the op refuses to build
-otherwise. ``gpu_per_node < world_size`` is what selects the internode path, and
-the op checks EP's node grouping against the communicator's LSA team; on one host
-CCO reports the whole world as one team, so a config claiming two nodes is
-rejected rather than silently running the intranode half. Lowering gpu_per_node
-on a single host does not emulate this either: RAIL leaves same-host peers
-without a QP.
+THE INTERNODE PATH NEEDS TWO NODES. ``gpu_per_node < world_size`` is what selects
+it, and the op checks EP's node grouping against the communicator's LSA team; on
+one host CCO reports the whole world as one team, so a config claiming two nodes
+is rejected rather than silently running the intranode half. Lowering
+gpu_per_node on a single host does not emulate this either: RAIL leaves
+same-host peers without a QP. On one node (world_size == gpu_per_node) this
+harness builds the intranode op instead; only ``--cmd test`` and
+``--cmd tuning`` accept that, and bench and stress exit.
 
     # rank 0 of 2, 8 GPUs each
     torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \\
         --master_addr=<ip> --master_port=<port> \\
         test_dispatch_combine_v2_internode.py --max-tokens 128
 
-``tools/run_internode_test.sh`` drives both ranks; the CLI below is the subset of
-the shmem harness's flags that means anything here.
+``tools/run_internode_test.sh`` with ``--entry`` set to this file runs one node's
+side (``--rank 0`` or ``1``; call it once per node). The CLI below keeps the
+shmem harness's flag names where the two mean the same thing, and adds its own,
+among them routing, process topology, active QPs, tuning, bench and stress.
 
 RoCE QoS: SET MORI_RDMA_TC AND MORI_RDMA_SL
 -------------------------------------------
@@ -194,8 +197,9 @@ def _parse_args(argv):
     # v1 uses 128 and 128; matching them keeps the two soaks comparable.
     parser.add_argument("--stress-datasets", type=int, default=128)
     parser.add_argument("--stress-sync-interval", type=int, default=128)
-    # Every rank on this node sends max_tokens in every dataset: a full-capacity
-    # sender, the case where the LL receive can finish on chunk flags alone.
+    # Node index (-1 = none) whose ranks all send max_tokens in every dataset: a
+    # full-capacity sender, the case where the LL receive can finish on chunk
+    # flags alone.
     parser.add_argument("--stress-full-node", type=int, default=-1)
     # Check every Nth round's combine output in place (0 = never). No sync is
     # added between that round's dispatch and combine.
@@ -250,8 +254,8 @@ def _parse_args(argv):
         "--tuning-phase", default="dispatch", choices=["dispatch", "combine", "pair"]
     )
     # Validation mode: sweep exactly one named candidate against the shipped
-    # geometry. A sweep winner is chosen by a greedy chain of paired tests, each
-    # with its own error; before it is written into the table it gets one long
+    # geometry. A sweep picks its winner from many short paired tests, each with
+    # its own error; before it is written into the table it gets one long
     # head-to-head against what it would replace. block,rdma,warp[,active_qps];
     # under --tuning-phase pair, dispatch,combine QP counts per pair, separated by
     # '/' (or ';', which a remote shell would split on).
@@ -1146,11 +1150,11 @@ def _build_op(cfg, comm, dispatch_geometry, combine_geometry):
     each candidate needs an op of its own and cannot be selected per launch the
     way v1's can.
 
-    The two are SEPARATE because the shipped table gives them separate values
-    (MI308X 256/8 hidden 7168 bf16 at 4 tokens: dispatch 64/42/4, combine
-    16/10/4). Driving both from one geometry means the sweep's incumbent is not
-    the configuration actually shipped, so "beats the incumbent" would not mean
-    "beats what we ship".
+    The two are SEPARATE because the shipped tables give them separate values
+    (MI308X InterNodeV2, 256/8 hidden 7168 bf16 at 4 tokens: dispatch 64/42/4,
+    combine 16/10/4). Driving both from one geometry means the sweep's incumbent
+    is not the configuration actually shipped, so "beats the incumbent" would not
+    mean "beats what we ship".
 
     The intranode backend has no such hook; there the geometry is pinned through
     the config fields, which also drops the tuned schedule.
@@ -1619,11 +1623,14 @@ def _tune(cfg, dist_handle, device, args, comm):
             )
         return active_qps
 
-    # The incumbent is what a user gets TODAY: the shipped row where there is
-    # one, and otherwise the geometry the config resolves on its own. Not
-    # candidates[0] -- that is just the smallest grid in the sweep, so on a shape
-    # with no row yet the whole sweep would be scored against a geometry nobody
-    # runs, and "beats the incumbent" would not mean "beats what we ship".
+    # The incumbent is the shipped row where there is one (clamped to this GPU's
+    # CU count, as the op clamps it), and otherwise the config's fallback
+    # geometry as given. That fallback is not clamped here, so on a part with
+    # fewer CUs than its block count (MI308X: 80 against 96) the incumbent runs a
+    # wider grid than the op a user builds would. Not candidates[0] -- that is
+    # just the smallest grid in the sweep, so on a shape with no row yet the
+    # whole sweep would be scored against a geometry nobody runs, and "beats the
+    # incumbent" would not mean "beats what we ship".
     #
     # Per phase, because a phase may have no rule: the tuner sweeps one phase
     # against the other's current value, so a bucket grows a phase at a time.
@@ -1720,12 +1727,11 @@ def _tune(cfg, dist_handle, device, args, comm):
                 flush=True,
             )
         return 0
-    # Whether the printed table row should carry the active QP columns: only
-    # when this sweep measured the count, or the shipped row already names one.
-    # Otherwise the count is just the resolved default for THIS run's
-    # allocation, and pasting it would pin production to it. A pair sweep
-    # always measures the counts: it requires --tuning-qps or
-    # --tuning-candidate, and either names them.
+    # Whether the reported and saved rules name an active QP count: only when
+    # this sweep measured the count, or the shipped rule already names one.
+    # Otherwise the count is this run's resolved default, and recording it would
+    # pin production to it. A pair sweep always measures the counts: it requires
+    # --tuning-qps or --tuning-candidate, and either names them.
     table_names_count = bool(
         table_row
         and (
@@ -1760,7 +1766,9 @@ def _tune(cfg, dist_handle, device, args, comm):
     # Only the swept phase varies; the other stays at the shipped value, because
     # the two are coupled (a dispatch with too few rdma blocks leaves the combine
     # after it slower) and a per-phase argmin measured against a DIFFERENT other
-    # phase does not carry over.
+    # phase does not carry over. Under --tuning-phase pair both phases keep their
+    # shipped geometry and only the active QP counts vary, as (dispatch, combine)
+    # pairs.
     def geometries(geometry):
         if pair:
             return geometry
@@ -1933,9 +1941,9 @@ def _tune(cfg, dist_handle, device, args, comm):
 
     best_op.close()
     if not args.tuning_greedy and fixed_wins:
-        # Sorted below, on rank 0 only -- but the winner has to be agreed by
+        # Sorted on every rank, not only rank 0: the winner has to be agreed by
         # EVERY rank before anyone builds an op for it, since building one is
-        # collective. fixed_wins is derived from allreduced medians, so the
+        # collective. fixed_wins is derived from allreduced timings, so the
         # ordering is identical on every rank and no communication is needed.
         fixed_wins.sort()
     if dist_handle.rank == 0 and not args.tuning_greedy:
@@ -1998,22 +2006,27 @@ def _tune(cfg, dist_handle, device, args, comm):
         # rejected by the backend. Formatting it unguarded is how that path
         # used to die.
         if best_median is not None:
-            selection = f"median {args.tuning_metric}={best_median:.1f}us"
+            # pair always selects on the total.
+            metric_name = "total" if pair else args.tuning_metric
+            selection = f"median {metric_name}={best_median:.1f}us"
         elif not candidates:
             selection = "no candidate measured (refresh of the shipped geometry)"
         else:
             selection = (
                 f"all {len(candidates)} candidates rejected, shipped geometry kept"
             )
-        # The active count columns only when this sweep measured the count or
-        # the shipped rule already names one; otherwise it is just this run's
-        # resolved default and pasting it would pin production to it.
-        if not report_active_qps:
-            active_qps_columns = ""
-        elif dispatch_row[3] == combine_row[3]:
-            active_qps_columns = f", {dispatch_row[3]}"
-        else:
-            active_qps_columns = f", {dispatch_row[3]}, {combine_row[3]}"
+        # The rules as --tuning-save writes them: the swept phase's, or both
+        # under pair; the active count only where the rule records it.
+        rule_fields = "block/rdma/warp" + ("/active_qps" if report_active_qps else "")
+        rule_width = 4 if report_active_qps else 3
+        rules = "; ".join(
+            f"{name} {rule_fields}={row[:rule_width]}"
+            for name, row in (
+                (("dispatch", dispatch_row), ("combine", combine_row))
+                if pair
+                else ((phase, best),)
+            )
+        )
         print(
             f"# TUNING RESULT tok={args.max_tokens} phase={phase}: "
             # Named for the metric, not the phase: --tuning-metric defaults to
@@ -2021,10 +2034,7 @@ def _tune(cfg, dist_handle, device, args, comm):
             # dispatch time is off by roughly a factor of two.
             f"block/rdma/warp/active_qps={best} {selection} (shipped was {shipped}, "
             f"qp_allocated={cfg.num_qp_per_pe})\n"
-            f"#   table row: ({args.max_tokens}, {dispatch_row[0]}, "
-            f"{dispatch_row[1]}, {dispatch_row[2]}, "
-            f"{combine_row[0]}, {combine_row[1]}, {combine_row[2]}"
-            f"{active_qps_columns}),",
+            f"#   {kernel_family} rules num_tokens={args.max_tokens}: {rules}",
             flush=True,
         )
         if args.tuning_save:

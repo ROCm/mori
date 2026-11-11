@@ -159,7 +159,9 @@ inline constexpr int kCombineBarrierMarkerTotal = 64;
 //
 // Three fields are not shape: numQpPerPe (the active QP count) and
 // combineLoadFirst are chosen per token bucket from the tuning table, and
-// numQpToDrain is the op's largest active count.
+// numQpToDrain is the op's largest active count. cfg.active_qps, a
+// MORI_EP_*_GEOM override or set_active_qps() replaces the table's QP count;
+// AsyncLL uses one op-wide count.
 //
 // Defaults mirror EpDispatchCombineConfig's, except worldSize: 0 there means
 // "not filled in yet", which is nothing that can be compiled for.
@@ -187,7 +189,7 @@ struct EpInterNodeKernelCfg {
   bool combineLoadFirst{false};
 };
 
-// The device-side config the bodies read: purely the compiled-in shape, so the
+// The device-side config the bodies read: purely compiled-in constants, so the
 // result is constexpr and every field folds to a literal at its use.
 constexpr EpInterNodeDeviceCfg EpInterNodeDeviceCfgOf(const EpInterNodeKernelCfg& kernelCfg) {
   EpInterNodeDeviceCfg deviceCfg{};

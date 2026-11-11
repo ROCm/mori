@@ -32,8 +32,10 @@ evaluating a migration.
    * - EPv2, HIP internode preview
      - HIP backend with ``gpu_per_node < world_size``
      - Multiple physical nodes over CCO/GDA
-     - BF16/FP32/FP8 dispatch; no FP4, quantization, standard-MoE conversion or
-       scatter combine. The communicator's node grouping must match the config.
+     - BF16/FP32/FP8 dispatch, plus packed FP4 dispatch with a BF16 or FP32
+       combine (not with ``async_ll``); no FP4 combine, quantization,
+       standard-MoE conversion or scatter combine. The communicator's node
+       grouping must match the config.
 
 This table describes development source, not a guarantee that all paths are
 available in every published wheel. Check the installed release and its
@@ -52,8 +54,9 @@ Import the EPv2 classes explicitly:
    )
 
 Select the backend with ``config.kernel_backend`` or
-``MORI_V2_KERNEL_BACKEND``. The FlyDSL backend is the default. Importing the
-package does not load either backend; construction loads the selected one.
+``MORI_V2_KERNEL_BACKEND``. The default is the HIP backend on gfx125x and the
+FlyDSL backend elsewhere. Importing the package does not load either backend;
+construction loads the selected one.
 EPv2 uses an explicit CCO communicator, described in :doc:`MORI-CCO-GUIDE`.
 It does not inherit the legacy API's process-global SHMEM bootstrap contract.
 

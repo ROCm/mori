@@ -825,10 +825,10 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
   DEF_COMMON_VARS;
 
   int nodePeOffset = myNode * config.gpuPerNode;
-  // The last warp sums destPeTokenCounter as soon as every warp has arrived, so each warp's add
-  // must be performed before it arrives. The add sites wait for the atomic's returned value,
-  // which orders it without the L2 writeback and invalidate of a __threadfence(); the counter
-  // is a device-scope atomic, so it is coherent across XCDs once performed.
+  // The last warp reads each destPeTokenCounter total as soon as every warp has arrived, so each
+  // warp's add must be performed before it arrives. The add sites wait for the atomic's returned
+  // value, which orders it without the L2 writeback and invalidate of a __threadfence(); the
+  // counter is a device-scope atomic, so it is coherent across XCDs once performed.
   int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(args.dispatchGridBarrier, 1);
   finishedWarp = __shfl(finishedWarp, 0);
@@ -974,9 +974,11 @@ inline __device__ void CombineSync(EpDispatchCombineArgs& args) {
 namespace combine_impl {
 
 // The LL gather uses 16-byte loads per lane. Gathering a token from its experts
-// can be limited by xGMI peer-read latency: core::WarpAccum issues AccumNum
-// loads before accumulating, and wider loads put more bytes in flight.
-// The ordinary path has a separate 4-byte load-first policy below.
+// can be limited by xGMI peer-read latency: for a topk with its own WarpAccum
+// case (1, 2, 4, 6, 8, 10), core::WarpAccum issues AccumNum loads before
+// accumulating, and wider loads put more bytes in flight. Other topk (e.g. 9,
+// 16) go through WarpAccumDynamic, which loads 16-byte vectors one source at a
+// time. The ordinary path has a separate 4-byte load-first policy below.
 //
 // Alignment and slice sizing matter here:
 //   - Both ends must be 16B-aligned. A combine staging slot interleaves the

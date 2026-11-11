@@ -133,8 +133,8 @@ jobs:
         run: |
           # No GPU needed: arch-string matching, the ASIC-revision table keys and their
           # CU fit, the per-target macro guard, and the AsyncLL defaults per arch. The
-          # tables load from the installed package, so one missing from package_data
-          # or failing to parse fails here.
+          # tables load from the installed package, so a build that ships no tables,
+          # or a table that fails to parse, fails here.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 120 python -m pytest -v \
@@ -742,12 +742,13 @@ jobs:
           # even compiles it. 128 is the LL band and 4096 the wide one, so each
           # family is exercised where it is the one a real caller would get.
           #
-          # The last two cases allocate 8 QPs and switch the active count every
-          # round, with the two nodes deliberately out of step and each combine
-          # one step ahead of its own dispatch: the cases the combine barrier
-          # must tolerate, which the fixed-count cases above never reach. One
-          # per family, because v2 and v2_ll each have their own barrier.
-          # Every case runs the op's default 8 QPs, which the tables are tuned for.
+          # The last two cases also compile active counts 1,2,4,8 and switch
+          # among them every round, with the two nodes deliberately out of step
+          # and each combine one step ahead of its own dispatch: the cases the
+          # combine barrier must tolerate, which the fixed-count cases above
+          # never reach. One per family, because v2 and v2_ll each run the
+          # shared barrier from their own combine kernel code. Every case
+          # allocates the op's default 8 QPs, so no table's count is clamped.
           for CASE in "v2 128 --num-qp 8" "v2 4096 --num-qp 8" "v2_ll 128 --num-qp 8" \
                       "v2 4096 --num-qp 8 -- --active-qp-counts 1,2,4,8" \
                       "v2_ll 128 --num-qp 8 -- --active-qp-counts 1,2,4,8"; do

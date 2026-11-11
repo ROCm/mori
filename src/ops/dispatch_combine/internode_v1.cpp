@@ -701,10 +701,10 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
   MORI_TRACE_SPAN(profiler, Slot::DispatchSync);
 
   int nodePeOffset = myNode * config.gpuPerNode;
-  // The last warp sums destPeTokenCounter as soon as every warp has arrived, so each warp's add
-  // must be performed before it arrives. The add sites wait for the atomic's returned value,
-  // which orders it without the L2 writeback and invalidate of a __threadfence(); the counter
-  // is a device-scope atomic, so it is coherent across XCDs once performed.
+  // The last warp reads each destPeTokenCounter total as soon as every warp has arrived, so each
+  // warp's add must be performed before it arrives. The add sites wait for the atomic's returned
+  // value, which orders it without the L2 writeback and invalidate of a __threadfence(); the
+  // counter is a device-scope atomic, so it is coherent across XCDs once performed.
   int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(args.dispatchGridBarrier, 1);
   finishedWarp = __shfl(finishedWarp, 0);
@@ -873,10 +873,13 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
 namespace combine_impl {
 
 // Gathering a token from its experts can be limited by xGMI peer-read latency.
-// CombineGather uses WarpAccum with 16B per lane when the rows are aligned. It
-// issues AccumNum loads before accumulating each vector step, putting more bytes
-// in flight than the 4B fallback. The separate intra-node path in intranode.hpp
-// uses WarpAccumLF, which also loads multiple vector steps before accumulating.
+// CombineGather uses WarpAccum with 16B per lane when the rows are aligned. For
+// a topk with its own WarpAccum case (1, 2, 4, 6, 8, 10) it issues AccumNum
+// loads before accumulating each vector step, putting more bytes in flight than
+// the 4B fallback. Other topk (e.g. 9, 16) go through WarpAccumDynamic, which
+// loads 16B vectors one source at a time. The separate intra-node path in
+// intranode.hpp uses WarpAccumLF, which also loads multiple vector steps before
+// accumulating.
 //
 // Alignment and slice sizing matter here:
 //   - Both ends must be 16B-aligned. A combine staging slot interleaves the
@@ -984,7 +987,7 @@ __forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs<T>
                         SendBufSlotOffset(config, nNodes + myNode, 0) * tokCombXferBytes;
 
   // Slices are snapped to a whole vector step so the gather below stays on
-  // WarpAccumLF's vector path instead of its scalar tail.
+  // WarpAccum's vector path instead of its scalar tail.
   MultiWarpIter mwIter(xgmiWarpNum, args.curRankNumToken, hiddenDim,
                        CombineVecStep<TokT>(warpSize));
   const bool vecAligned = CombineVecAligned(tokHiddenBytes, tokCombXferBytes);

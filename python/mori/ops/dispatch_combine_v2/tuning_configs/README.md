@@ -78,8 +78,11 @@ Current settings:
 - MI300X: every inter-node rule sets a count (1, 2 or 4).
 - MI355X: a rule sets a count (1, 2 or 4) only where the whole-table A/B kept a
   change. That is 121 of the 233 InterNodeV2 rules and 45 of the 233
-  InterNodeV2LL rules. The largest count in one MI355X op is 4, or 2 for
-  InterNodeV2LL 272/9 and 896/16.
+  InterNodeV2LL rules. Over all token counts, the largest count for one shape
+  is 4, or 2 for InterNodeV2LL 272/9 and 896/16. Under `auto` with its default
+  crossover of 512, every rule up to T512 comes from InterNodeV2LL and sets at
+  most 2, so an op whose capacity is at most 512 drains at most 2, unless
+  `cfg.active_qps` or `cfg.active_qp_counts` names a larger count.
 
 ### `combine_load_first`
 
@@ -120,9 +123,10 @@ Where it is on today (it is off everywhere else):
 
 ## Lookup
 
-- **Only the current model's own file is read.** The one exception is MI350X:
-  it has the same die and CU count as MI355X, so it reads MI355X's file
-  (`_MODEL_ALIAS`).
+- **Only the current model's own file is read.** The model comes from the PCI
+  device ID. MI350X reads MI355X's file (`_MODEL_ALIAS`), because it has the
+  same die and CU count. A gfx950 GPU whose device ID mori does not list is
+  also treated as MI355X.
 - A model without a file, such as MI325X today, does not borrow another
   model's CSV. It falls back to the default geometry:
   - inter-node: the config defaults, clamped to the CU count;
@@ -137,19 +141,31 @@ Where it is on today (it is off everywhere else):
   rule.
 - Geometry from a table is clamped to the GPU's CU count, and `rdma_block_num`
   stays below `block_num`.
-- Fields set explicitly on the config override the table. They are not clamped.
+- On the inter-node path, a geometry field set on the config replaces that
+  field in every bucket, and the fields left unset stay tuned. A set field is
+  not clamped to the CU count, but `rdma_block_num` is still kept below
+  `block_num` whenever `block_num` > 1.
+- On the intra-node path, setting any block or warp field, or `schedule`,
+  turns the table off for the op. A set `schedule` runs as given. Otherwise
+  the fields left unset take fixed defaults, not `_hip_default()`'s: dispatch
+  64 blocks × 16 warps, combine 80 × 4. Nothing on this path is clamped to the
+  CU count.
 - `MORI_EP_V2_TUNING_DIR` makes lookup read another directory.
 - `MORI_EP_DISP_GEOM` and `MORI_EP_COMB_GEOM` (`B,R,W[,active_qps]`) replace one
-  phase's geometry in every bucket. They are meant for sweeps. The other phase
-  keeps its rules.
+  inter-node phase's geometry in every bucket. They are meant for sweeps. The
+  other phase keeps its rules.
+  - Without the fourth field, the phase sends on `cfg.active_qps`, else
+    `min(2, num_qp_per_pe)`, not the rule's count.
+  - A combine override also turns load-first off in every bucket.
+  - Intra-node ops do not read them.
 
 ## Coverage
 
 | GPU (arch, CUs) | Shapes (experts / top-k) | Hidden | Dispatch dtypes |
 | --- | --- | --- | --- |
-| MI355X (gfx950, 256) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168; 6144 for 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3; fp4 for inter 256/8 |
-| MI308X (gfx942, 80) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168; 6144 for 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 |
-| MI300X (gfx942, 304) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168; 6144 for 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 |
+| MI355X (gfx950, 256) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168, plus 6144 for 256/8 and 5120 for 384/6; only 3584 for 896/16 | bf16, fp8_e4m3; fp4 for inter 256/8 at hidden 7168 |
+| MI308X (gfx942, 80) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168, plus 6144 for 256/8 and 5120 for 384/6; only 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 at hidden 7168 |
+| MI300X (gfx942, 304) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168, plus 6144 for 256/8 and 5120 for 384/6; only 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 at hidden 7168 |
 
 - Each GPU model has three tables: IntraNodeV2 (EP8), InterNodeV2 (EP16) and
   InterNodeV2LL (EP16).
@@ -270,19 +286,27 @@ How the shipped rows were chosen:
    against the defaults for a shape without rows.
 2. Then screen the active QP counts and the combine load-first.
 3. Run a whole-table A/B against the previous tables. A bucket takes the new
-   rules only if they are ≥1% faster in every round (D+C summed over the
+   rules only if they are ≥1% faster in every A/B pair (D+C summed over the
    dispatch dtypes).
 4. Repeat the whole-table A/B to confirm.
 
 What `--cmd tuning` does on its own:
 
 - It sweeps one bucket and one phase against the shipped rule, which stays
-  fixed.
+  fixed. With `--tuning-greedy`, each win becomes the incumbent for the
+  candidates after it, and the last win is selected.
+- A geometry's tail is the median over reps of its slowest round in each rep,
+  under the selection metric: by default the slowest dispatch round plus the
+  slowest combine round, each across ranks.
 - A candidate wins when both hold:
   - its paired median improvement is larger than both 1.5 µs and 2%
     (`--tuning-margin-us`, `--tuning-margin-frac`);
-  - its worst rep is slower than the shipped rule's worst rep by no more than
-    10% of the shipped median (`--tuning-tail-frac`).
+  - its tail is slower than the shipped rule's tail by no more than 10% of the
+    shipped median (`--tuning-tail-frac`).
+- Without `--tuning-greedy`, when no candidate wins, a candidate whose paired
+  median is within that margin and whose tail is better than the shipped
+  rule's by more than 10% of the shipped median is reported as `TAIL` and
+  selected instead. `--tuning-save` writes it as it would write a win.
 
 **Metrics**
 
@@ -299,12 +323,18 @@ What `--cmd tuning` does on its own:
 
 Tune with
 `tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py`
-(`--cmd tuning`), on both nodes. Start from the example command in
-[../README.md](../README.md). It sets what the defaults get wrong:
+(`--cmd tuning`). Inter-node rules are tuned on both nodes. Start from the
+example command in [../README.md](../README.md). It sets what the defaults get
+wrong:
 
 - `--num-qp 8` (the wrapper defaults to 2 QPs);
 - `--scale-dim 0` (the entry defaults to 32);
 - a long `MORI_INTERNODE_TIMEOUT` (the wrapper kills the run after 120 s).
+
+IntraNodeV2 rules are tuned on one node, where the entry builds the intra-node
+op. The wrapper always starts two nodes, so launch the entry with
+`torchrun --standalone --nproc_per_node=1` (it spawns the eight ranks), still
+with `--scale-dim 0`.
 
 The 264/9 and 272/9 rows also need `--routing replica`.
 
@@ -315,16 +345,18 @@ kernel family and EP size, or adds a new rule.
 `--tuning-save` does not check the winner. Before you keep one:
 
 1. **Confirm it head-to-head.** Run with
-   `--tuning-candidate block,rdma,warp[,active_qps]`. This measures that one
-   candidate against the shipped rule in a long paired run.
+   `--tuning-candidate block,rdma,warp[,active_qps]` and a larger
+   `--tuning-reps` than the sweep used (the default is 3). This measures only
+   that candidate against the shipped rule, in `--tuning-reps` paired passes.
 2. **Check correctness.** Run `--cmd test` at that token count, with
    `MORI_EP_V2_TUNING_DIR` pointing at the directory with the new rule.
-3. **Confirm the gain on the whole table.** Run `--cmd bench` over the
-   affected token counts and dtypes. Alternate between the old table and the
-   new one with `MORI_EP_V2_TUNING_DIR`, for several pairs. Keep the rule only
-   if the D+C total is ≥1% lower in every pair. This matters most at large
-   token counts: on MI308X at T1024, the sweep reported wins of 100–175 µs that
-   tied with the old rule in alternating runs.
+3. **Confirm the gain on the whole table.** `--cmd bench` needs two nodes, so
+   this step applies to inter-node rules. Run it over the affected token counts
+   and dtypes. Alternate between the old table and the new one with
+   `MORI_EP_V2_TUNING_DIR`, for several pairs. Keep the rule only if the D+C
+   total is ≥1% lower in every pair. This matters most at large token counts:
+   on MI308X at T1024, the sweep reported wins of 100–175 µs that tied with the
+   old rule in alternating runs.
 
 Also:
 

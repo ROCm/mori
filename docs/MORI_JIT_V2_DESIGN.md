@@ -295,10 +295,14 @@ expert → combine 整步捕成一张图，replay 反复复现同一结果。能
 ## 5. 两个后端共用一个 op
 
 `EpDispatchCombineOp(cfg, comm)` 按 `cfg.kernel_backend`（或 `MORI_V2_KERNEL_BACKEND`，默认
-`flydsl`）选出子类；也可直接实例化 `EpDispatchCombineOpHip`，`isinstance` 对两者都成立。
+gfx125x 为 `hip`、其余为 `flydsl`）选出子类；也可直接实例化 `EpDispatchCombineOpHip`，`isinstance`
+对两者都成立。
 
-**父类拥有 op 本身**——`dispatch()`/`combine()`/视图/生命周期各只有一份。
-默认 `_pick()` 服务 FlyDSL；HIP 覆盖它以选择统一的 `KernelConfig`。子类提供：
+**父类拥有 op 本身**——`dispatch()`/`combine()`/生命周期各只有一份；`recv_tokens()`、
+`combine_in_view()` 等视图由各后端自己实现。
+默认 `_pick()` 服务 FlyDSL；HIP 覆盖它以选择统一的 `KernelConfig`。HIP 子类提供下面三个 hook（另覆盖
+`_region`，把共享代码用的 region 名映射到 intranode/internode 各自的布局）；FlyDSL 在自己的
+`__init__` 里直接建 arena 和 KernelSet，只定义 `_unsupported`：
 
 ```python
 _regions(cfg)               # 这个后端要哪些 arena region
@@ -310,8 +314,9 @@ _unsupported(cfg)           # 它做不到什么
 kernel 内还是 host 侧）、`self_resets_counters`、`capabilities` / `unsupported`。形状抄自 aiter 的
 `MOEMetadata`——但不抄它事后拆 `functools.partial` 反查身份那一手，那是把身份丢掉又猜回来。
 
-唯一没法变成数据的是**调用约定**，所以它被吸收进 `_build_kernels`：返回的 callable 已经是父类的
-具名签名，FlyDSL 的位置参数和 ctypes plan 的关键字参数各自在 `_wrap_*` 里适配。
+唯一没法变成数据的是**调用约定**，所以它被吸收进各后端建 `KernelSet` 的那一步（HIP 的
+`_build_kernels`、FlyDSL 的 `__init__`）：返回的 callable 已经是父类的具名签名，FlyDSL 的位置参数和
+ctypes plan 的关键字参数各自在 `_wrap_*` 里适配。
 
 **特性面是真包含不是交集**：HIP 后端做 gather combine，dispatch 收 bf16/fp32/fp8/fp4、combine 出
 bf16/fp32（§3.7），其余一概不接：scatter、量化（`quant_type`，与直接传已量化载荷是两回事）、
@@ -350,9 +355,16 @@ dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬�
 HIP V2 的单机和跨机都以 `hip_tuning_configs.resolve_schedule(cfg)` 为 backend 入口，返回统一的
 `ScheduleEntry(max_tokens, dispatch, combine)`，每相是带 family、B/W/R、active QP 数和 load-first 的
 `KernelConfig`。
-单机先查 `IntraNodeV2` 表，某相没有规则时回退到 Python 表，再没有就用单档默认值；只给 dtype 字符串的调用方
-（如 aiter）也按它对应的 dtype 查表。显式 `cfg.schedule` 优先；跨机只查表。
-`op.kernel_config(num_tokens)` 负责一次选桶，HIP 的 `_pick()` 与报告接口使用同一结果；
+单机的查表在构造 `EpDispatchCombineConfig` 时完成，`resolve_schedule()` 只把得到的 `cfg.schedule`
+转成 `ScheduleEntry`。只有 `cfg.kernel_backend`、`MORI_V2_KERNEL_BACKEND` 或架构默认值解析为 `hip`
+时才查 HIP 的表：`quant_type="none"` 时先查 `IntraNodeV2` 表，某相没有规则时回退到 Python 表，再没有
+就用单档默认值；只给 dtype 字符串的调用方（如 aiter）也按它对应的 dtype 查表。否则 cfg 按 FlyDSL 的表
+解析：在 gfx942/gfx950 上既不设 `kernel_backend` 也不设 `MORI_V2_KERNEL_BACKEND` 就直接实例化
+`EpDispatchCombineOpHip`，HIP 沿用的是 FlyDSL 的几何。单机时只要显式给出 `cfg.schedule` 或任一
+block/warp 字段，整个 op 就不查表，未给的字段取单档默认值（dispatch 64×16、combine 80×4）；跨机忽略
+`cfg.schedule`，只读 CSV 表，不回退到 Python 表。
+`op.kernel_config(num_tokens)` 负责一次选桶，HIP 的 `_pick()` 与报告接口使用同一结果（gfx125x 上
+LL128 分段覆盖的小 token 数除外，`_pick()` 直接返回 LL128 plan）；
 绑定的单 kernel 或 pass group 直接执行，不再另选一遍 family/geometry。
 
 跨机的数据解析中，`internode_schedule(cfg)` 合并查表结果、手动覆盖和 token 边界，
@@ -368,8 +380,9 @@ HIP V2 的单机和跨机都以 `hip_tuning_configs.resolve_schedule(cfg)` 为 b
 各列含义见 tuning_configs/README.md。各相按**自身 dtype**查找：
 fp8 dispatch + bf16 combine 使用 fp8 dispatch 行和 bf16 combine 行。`num_tokens` 是包含上界的
 ceiling，最大一档也服务更大的 token 数。总专家数（`ep_size * experts_per_rank`）、`topk`、dtype 和
-hidden 都必须精确匹配：例如 EP16 的 256/8 只用 `num_experts=256, topk=8` 的行。CSV 的每一行都是
-按具体模型实测的，所以不沿用上面 Python 表的专家数通配。只读当前型号自己的
+hidden 都必须精确匹配（FP4 dispatch 行的 `hidden_dim` 存打包后的宽度，逻辑 hidden 7168 记为 3584）：
+例如 EP16 的 256/8 只用 `num_experts=256, topk=8` 的行。CSV 的每一行都是在该型号上按具体形状
+单独实测的，所以不沿用上面 Python 表的专家数通配。只读当前型号自己的
 CSV（MI350X 与 MI355X 同一颗 die、CU 数相同，读 MI355X 的），不跨型号或专家组合回退；未调优的相
 在跨机时使用配置默认几何，在单机时回退到 Python 表。表在加载时整体校验，格式错误直接报错而不是跳过。
 保存结果时按选择键替换或追加一行。V1 的历史通配兼容行为不变。
@@ -528,7 +541,7 @@ kernel**——独立的 JIT 模块、入口符号和缓存 key，不是一个 bo
 | `test_graph_capture.py` | EP8 | dispatch → identity expert → combine 整步捕成一张图并 replay |
 | `test_asym_dtype.py` | EP8 | fp8/fp4 dispatch + bf16 combine |
 | `test_internode_regions.py` | 单进程，不建 op、不碰 GPU | internode arena：region 名与 `_internode_static_args` 的契约（两侧独立转写），以及 kernel 索引算术蕴含的容量上界 |
-| `test_dispatch_combine_v2_internode.py` | 2 节点 × 8 GPU（EP16），torchrun 起，`gpu_per_node < world_size` 才建得起来 | identity expert 对解析 golden 的逐 rank 正确性；`--cmd bench` 对齐 v1 harness 的计时循环，`--cmd tuning` 通过 `hip_tuning_configs` 的 internode API 做配对式 sweep；`--kernel-type auto\|v2\|v2_ll` |
+| `test_dispatch_combine_v2_internode.py` | torchrun 起；2 节点 × 8 GPU（EP16）走 internode 路径，`bench`/`stress` 必须两节点；单节点时 `test`/`tuning` 建 intranode op（`IntraNodeV2` 表就是这样调的） | identity expert 对解析 golden 的逐 rank 正确性；`--cmd bench` 对齐 v1 harness 的计时循环，`--cmd tuning` 通过 `hip_tuning_configs` 的 internode API 做配对式 sweep；`--kernel-type auto\|v2\|v2_ll\|asyncll` |
 | `bench_ep.py` | EP4/EP8 | 性能 bench（各后端通用）；`DBN`/`DWPB`/`CBN`/`CWPB` 钉住几何即用于 `hip_tuning_configs` 调优 |
 
 `test_jit_binding.py` 在 CI 里**从 `/tmp` 跑**，不是从 checkout 跑：建一个 plan 需要

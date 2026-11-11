@@ -126,7 +126,8 @@ _DISPATCH_TABLE: dict = {
     # topk 6 and 8 measured identical; listed twice rather than wildcarded, so an
     # unmeasured topk gets the default instead of inheriting an agreement by accident.
     # A shape the IntraNodeV2 table has rules for uses those first; this serves the
-    # other expert counts and the dtypes the table lacks (fp4, and fp8 at topk 6).
+    # other expert counts and the dtypes the table lacks (fp4, and fp8 at 256
+    # experts topk 6).
     "mi355x": {
         (8, 7168, 8, None): {
             None: ((None, 64, 8),),
@@ -569,8 +570,10 @@ class ScheduleEntry(NamedTuple):
 def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
     """The HIP V2 schedule consumed by both construction and token selection.
 
-    Intra adapts the Python-table/explicit schedule resolved by Config. Inter
-    names each bucket of internode_schedule() with its kernel family; tuned
+    Intra adapts the schedule Config resolved: per phase, the IntraNodeV2 table's
+    rules when quant_type is "none", else the Python table's; an explicit
+    cfg.schedule is taken as given, and pinned or untuned geometry is one bucket.
+    Inter names each bucket of internode_schedule() with its kernel family; tuned
     grids are clamped to ``cu_count``, the backend's own CU count. Loading and
     selection never depend on the declared token capacity; that includes the
     combine load-first choice, which comes from each bucket's rule
@@ -626,7 +629,8 @@ def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
 
 
 def describe_schedule(cfg, schedule) -> str:
-    """Multi-line summary of a resolved schedule and the tables it came from."""
+    """Multi-line summary of a resolved schedule and the table files looked up for
+    its shape (found or missing)."""
 
     def fmt(spec):
         if spec.rdma_block_num is None:
@@ -801,10 +805,10 @@ def internode_kernel_families(cfg):
 
 
 def fit_internode_geometry(geometry, *, clamp_to_cu=False, cu_count=None):
-    """Leave at least one intra-node block; optionally cap tuned grids to the
-    CU count: ``cu_count``, the count the op launches against, else KFD's. An
-    unknown count caps nothing. Fields after block, rdma, warp (the active QP
-    count) pass through."""
+    """Cap rdma at max(1, block - 1), which leaves at least one intra-node block
+    whenever block > 1; optionally cap tuned grids to the CU count: ``cu_count``,
+    the count the op launches against, else KFD's. An unknown count caps nothing.
+    Fields after block, rdma, warp (the active QP count) pass through."""
     if geometry is None:
         return None
     block, rdma, warp, *rest = geometry
@@ -858,8 +862,9 @@ def internode_schedule(cfg, cu_count=None):
     tables are not read. Otherwise explicit config fields override the
     selected family's table, with config defaults for an untuned phase. Table
     values and unpinned defaults are clamped to ``cu_count``
-    (fit_internode_geometry); pinned fields are kept as given. All paths keep
-    R < B. Under auto the family crossover is always a bucket edge.
+    (fit_internode_geometry); pinned fields are kept as given. All paths cap R
+    at max(1, B - 1), so R < B whenever B > 1. Under auto the family crossover
+    is always a bucket edge.
     """
     defaults = [
         tuple(getattr(cfg, name) for name in fields) + (resolve_active_qps(cfg),)

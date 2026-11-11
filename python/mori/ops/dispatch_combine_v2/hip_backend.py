@@ -1411,12 +1411,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             for group, names in sequences.items()
         }
 
-        # Every spec the schedule can select maps to the SAME callable. AsyncLL
-        # compiles one geometry -- its specs derive each pass's grid from mpCount
-        # and worldSize, so (block, warp) only sets the block width and there is
-        # nothing to sweep -- but _pick still returns whatever the token count
-        # selects, and it clamps only against `dispatch`/`combine`, not against the
-        # four split tables. Answering for all of them keeps the lookup total.
+        # AsyncLL compiles one geometry -- its specs derive each pass's grid from
+        # mpCount and worldSize, so (block, warp) only sets the block width.
+        # resolve_schedule gives it a single entry, so each table holds that one
+        # spec and _pick returns it for every token count.
         def table(group):
             specs = (
                 self._dispatch_specs
@@ -1619,8 +1617,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """Selected HIP configurations for both phases, using this call's tokens.
 
         This reads the schedule prepared at construction: no table reload,
-        compilation or device query. Both intra and inter use this same path.
-        A set_active_qps() override replaces both phases' active count.
+        compilation or device query. Intra and inter both select from it. On
+        gfx125x, a token count within the LL128 split launches the LL128 kernels
+        instead (except a snapshot call under a push quant type), which this does
+        not report. AsyncLL reports active_qps as None; its kernels run with
+        resolve_active_qps(cfg). A set_active_qps() override replaces both
+        phases' active count.
         """
         selected = tuning.pick_bucket(self._schedule, num_tokens)
         override = getattr(self, "_active_qps_override", None)

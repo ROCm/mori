@@ -30,17 +30,24 @@ for each GPU.
   measurement is 3 passes × (20 warmup + 30 timed rounds), dropping the first
   round of each pass, and latency is the mean. V1 and V2 are measured
   alternately three times, and each cell is the median of the three; runs that
-  stalled throughout were discarded or re-measured. Every run used here passed
-  the correctness checks.
+  stalled throughout were discarded or re-measured. The D+C change compares the
+  medians of each run's D+C latency, not the sum of the D and C medians shown,
+  so it can differ from a change computed from those cells; the largest
+  difference is MI308X FP8 T4096 (−22.4% here, −25.1% from the D and C cells).
+  Every run used here passed the correctness checks.
 - **Bandwidth**: as in V1, the mean over ranks and rounds of "bytes / time",
   not the NIC line rate. The two variants differ only in how bytes are counted:
   - **XGMI bandwidth** counts the tokens this rank received.
   - **RDMA bandwidth** counts token × destination node, the local node
     included; for LL every token counts all nodes. With two nodes, about half
     of it actually crosses nodes.
-  - Both sides move the same bytes in a cell, so a bandwidth change follows the
-    latency change: in every row the XGMI and RDMA changes differ by less than
-    1.5 percentage points.
+  - Both sides move the same bytes in a cell, so a bandwidth change roughly
+    mirrors the latency change. It is not the exact inverse, since bandwidth is
+    a mean of per-round bytes / time and each cell is its own median; in two
+    MI308X cells (FP8 T4096 combine, BF16 T2048 dispatch) both changes are
+    negative, so the latency change favors V2 and the bandwidth change V1. In
+    every row the XGMI and RDMA changes differ by less than 1.5 percentage
+    points.
 
 ### 1.2 Environment per GPU
 
@@ -52,7 +59,10 @@ for each GPU.
 | NIC firmware | 235.2.40.0 | 28.40.1702 | 1.117.5-a-45 |
 
 The MI308X numbers were measured with a HIP runtime built from CLR source, not
-the one ROCm 7.2.1 ships, so stock ROCm 7.2.1 may not reproduce them.
+the one ROCm 7.2.1 ships: with the stock 7.0–7.2.x runtime V2 cannot set up
+across two nodes (`hipMemSetAccess` fails on its symmetric-memory windows; see
+Issue 2 of the known-issues skill, `.claude/skills/known-issues/SKILL.md`).
+ROCm 7.14 and later need no rebuild.
 
 ## 2. Overall results
 
@@ -91,15 +101,14 @@ less than 1.5 percentage points):
   dtypes on MI355X gain in both phases, by 8%–27% and 5%–18% respectively;
   MI308X's combine is within 7% of V1 except at T2048.
 - **Treat the MI308X small-batch numbers with caution.** At T ≤ 32 V1 runs much
-  slower than its own tuning table records; going by the two tables, the two
-  sides are about even at T ≤ 32. See 3.1.
+  slower than its own tuning table records; going by the two tables, V1 is the
+  faster side at T ≤ 32, with V2's FP8 D+C 3%–8% higher. See 3.1.
 - **Bandwidth is listed for large batches only.** Small batches are
-  latency-bound, and their bandwidth change is just the inverse of the latency
-  change.
-- **Part of the gap comes from rules V1 never tuned.** V1's BF16 dispatch rules
-  are incomplete on MI308X and MI355X, and V1's MI300X table has only LL rules
-  for T ≤ 64; the MI308X rules the normal kernel borrows are too small for
-  MI300X. See section 3.
+  latency-bound, and their bandwidth change only mirrors the latency change.
+- **Part of the gap comes from rules V1 never tuned.** V1 has no BF16 dispatch
+  rules for H7168 on MI308X and only some on MI355X, and V1's MI300X table has
+  only LL rules for T ≤ 64; the MI308X rules the normal kernel borrows are too
+  small for MI300X. See section 3.
 - **This is a kernel-level comparison, not end-to-end inference.** Only this
   one shape with uniform routing was measured; real workloads route unevenly
   and run expert computation between dispatch and combine.
@@ -139,10 +148,12 @@ latency change and a positive bandwidth change mean V2 is better.
 | BF16 | 2048 | normal | 1622.4 / 1616.5 | 1607.5 / 1321.6 | −0.9% | −18.2% | −9.4% | 121.21 → 120.21 (−0.8%) | 121.53 → 146.26 (+20.3%) | 37.03 → 36.72 (−0.8%) | 37.12 → 44.68 (+20.4%) |
 | BF16 | 4096 | normal | 3619.4 / 2957.5 | 2765.5 / 3110.2 | −23.6% | +5.2% | −11.2% | 110.66 → 138.71 (+25.3%) | 136.87 → 123.31 (−9.9%) | 33.83 → 42.41 (+25.4%) | 41.84 → 37.70 (−9.9%) |
 
-- **Where the gain comes from.** Small batches (LL) gain mostly in combine,
-  about 40% at T8; large batches (normal kernel) gain mostly in dispatch, which
-  is 40%–50% faster with FP8. The normal kernel's combine is clearly faster
-  only at T2048 (15%–18%); at T1024 and T4096 it is within 7% of V1.
+- **Where the gain comes from.** Up to T64 the LL kernel gains mostly in
+  combine, about 40% at T8; from T128 to T512 dispatch gains as much or more.
+  The normal kernel gains mostly in dispatch, which is 40%–50% faster with FP8;
+  BF16 T2048 is the exception, with dispatch level and combine 18% faster. The
+  normal kernel's combine is clearly faster only at T2048 (15%–18%); at T1024
+  and T4096 it is within 7% of V1.
 - **V1 has no tuned rules for BF16 dispatch.** V1's tuning tables have no BF16
   dispatch rule for H7168: V1's LL kernel borrows the H6144 (GLM-5) rules by
   relaxed matching (the four for T ≤ 32, with larger T reusing the T32 rule),
@@ -159,9 +170,10 @@ latency change and a positive bandwidth change mean V2 is better.
 - **V1 is slower at small batch than its own tuning table.** At T ≤ 32, V1's
   dispatch is 13%–30% slower than the table records and its combine 37%–67%
   slower, in all five measurements; at T64–T512 it is within ±10% of the table.
-  V2 is within 7% of its table at T ≤ 512. Going by the two tables, V1 and V2
-  are about even at T ≤ 32, so the small-batch gap here may mostly come from
-  the measurement conditions; the cause has not been investigated. These V1
+  V2 is within 7% of its table at T ≤ 512. Going by the two tables, V2's FP8
+  D+C at T ≤ 32 is 3%–8% higher than V1's (V1 has no H7168 rule for BF16
+  dispatch), so the small-batch gap here may come entirely from the
+  measurement conditions; the cause has not been investigated. These V1
   rules (#689) were measured with V1's own benchmark script, keeping only the
   lowest-latency runs.
 
@@ -252,13 +264,13 @@ latency change and a positive bandwidth change mean V2 is better.
   5%–18% in both phases. The gap narrows as T grows; at T4096 D+C is 7%–9%
   faster.
 - **For most buckets V1 uses the table's rule for that bucket.** Every bucket
-  does for FP8 dispatch and BF16 combine. BF16 dispatch has rules only for LL
-  T64 and T128 and normal-kernel T4096, and AUTO borrows other buckets' rules
-  for the rest: LL T4–T32 use T64's 128/64/8, T256 and T512 use T2048's
-  256/170/16, and normal-kernel T1024 and T2048 use T4096's 256/128/16. V1's
-  combine table also has an `fp8_direct_cast` rule (combine sent as FP8) for
-  the same buckets, which is faster but does not apply to the BF16 combine
-  here.
+  does for FP8 dispatch and BF16 combine. Of the buckets measured here, BF16
+  dispatch has rules only for LL T64 and T128 and normal-kernel T4096, and AUTO
+  uses the next larger rule for the rest: LL T4–T32 use T64's 128/64/8, LL T256
+  and T512 use the LL table's T2048 rule (256/170/16), and normal-kernel T1024
+  and T2048 use T4096's 256/128/16. V1's combine tables also have
+  `fp8_direct_cast` rules (combine sent as FP8) for T64–T4096, which are faster
+  but do not apply to the BF16 combine here.
 - **Both sides' measurements match their own tuning tables.** With the same
   rule, V1's measurement in every bucket is within −6% to +13% of its table
   record, and V2's within −10% to +1%.

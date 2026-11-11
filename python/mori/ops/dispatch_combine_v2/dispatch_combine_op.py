@@ -24,8 +24,8 @@
 Two backends live beside this module -- FlyDSL (``flydsl_backend``) and HIP/JIT
 (``hip_backend``) -- behind one class. ``EpDispatchCombineOp(cfg, comm)`` returns
 whichever ``cfg.kernel_backend`` (or ``MORI_V2_KERNEL_BACKEND``) names, defaulting
-to flydsl; ``EpDispatchCombineOpHip(cfg, comm)`` is the explicit form, and
-``isinstance(op, EpDispatchCombineOp)`` holds either way.
+to hip on gfx125x and flydsl elsewhere; ``EpDispatchCombineOpHip(cfg, comm)`` is
+the explicit form, and ``isinstance(op, EpDispatchCombineOp)`` holds either way.
 
 Neither backend is imported here. Selecting one imports only that one, so the HIP
 backend works on a machine with no flydsl.
@@ -43,7 +43,8 @@ its own arena and KernelSet there, so ``_unsupported`` is the only hook it defin
 
 The shared dispatch/combine body and lifecycle live here. HIP overrides _pick()
 to select its KernelConfig keys; the default selector serves FlyDSL's B/W keys.
-KernelSet flags describe staging, counter reset and optional capabilities.
+KernelSet flags describe in-kernel staging, optional capabilities and why a config
+cannot be served.
 """
 
 from __future__ import annotations
@@ -173,8 +174,8 @@ class EpDispatchCombineConfig:
     # of the shape. Unrelated to max_num_inp_token_per_rank, which is the
     # capacity. Read only when internode_kernel == "auto".
     internode_auto_ll_max_tokens: int = 512
-    # Which kernel backend serves this op: "flydsl" (default, full intranode
-    # feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
+    # Which kernel backend serves this op: "flydsl" (default except on gfx125x,
+    # full intranode feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
     # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
     # in bf16/fp32). "hip" is the only backend with an internode path -- flydsl's
     # _unsupported rejects any config whose gpu_per_node < world_size -- so a
@@ -660,14 +661,14 @@ class KernelSet:
     # Replay-routing dispatch. None = this backend has no replay.
     dispatch_replay: dict[tuple, Callable] | None = None
 
-    # The AsyncLL split. Each is the same (block_num, warp_num) -> callable shape
-    # as `dispatch`, but launching only half the pass sequence, so the caller can
-    # put its own work between the two. None = this backend runs send and recv in
-    # one launch and has no seam to expose.
-    dispatch_send: dict[tuple[int, int], Callable] | None = None
-    dispatch_recv: dict[tuple[int, int], Callable] | None = None
-    combine_send: dict[tuple[int, int], Callable] | None = None
-    combine_recv: dict[tuple[int, int], Callable] | None = None
+    # The AsyncLL split (HIP only). Each is keyed like `dispatch` (KernelConfig),
+    # but launches only half the pass sequence, so the caller can put its own work
+    # between the two. None = this backend runs send and recv in one launch and
+    # has no seam to expose.
+    dispatch_send: dict[tuple, Callable] | None = None
+    dispatch_recv: dict[tuple, Callable] | None = None
+    combine_send: dict[tuple, Callable] | None = None
+    combine_recv: dict[tuple, Callable] | None = None
 
     # True  -> combine's kernel stages the caller's tokens into out_tok itself.
     # False -> the op must copy them in on the host first (one extra torch kernel).

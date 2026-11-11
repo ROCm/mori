@@ -24,8 +24,8 @@
 One CSV per GPU model, kernel family and EP size holds both phases. A malformed
 table raises rather than being skipped: one that loaded wrong would run untuned
 geometry and nothing else would say so. Every shipped table is loaded from
-wherever this mori is installed, which also catches a table left out of
-package_data. CPU only.
+wherever this mori is installed, which also catches a build that installs no
+tables at all. CPU only.
 """
 
 import re
@@ -41,8 +41,8 @@ ARCH, MODEL = "gfx942", "testgpu"
 NAME = re.compile(
     r"^(gfx\d+)_([a-z0-9]+)_(InterNodeV2|InterNodeV2LL|IntraNodeV2)_ep(\d+)\.csv$"
 )
-# package_data ships only *.csv, so an installed mori never has a leftover
-# JSON table to find; that check has to look at the checkout.
+# A leftover JSON table is a file in the source tree, and the loader reads
+# only *.csv, so this check looks at the checkout rather than at the install.
 SOURCE_TABLE_DIR = (
     Path(__file__).resolve().parents[4]
     / "python"
