@@ -467,13 +467,15 @@ static bool CutQp(const EpPair& ep) {
 // degraded, for the recovery path. On a closed ledger the QP is dead, so they are left
 // uncounted as posted and the caller accounts them as never sent.
 // `skipEpId` is an EP the caller has already settled, or -1. Returns the credits it
-// settled (marker, cut or orphaned), which the caller counts as posted.
+// settled (marker, cut or orphaned), which the caller counts as posted, and adds each QP
+// it cut to `cutQps`.
 static int SettlePendingWrs(const EpPairVec& eps,
                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
                             bool isRead, int skipEpId, const char* reason,
                             std::vector<int>& epWrsSinceSignal,
                             std::vector<size_t>& epMergedSinceSignal,
-                            const std::shared_ptr<CqCallbackMeta>& callbackMeta) {
+                            const std::shared_ptr<CqCallbackMeta>& callbackMeta,
+                            std::vector<ibv_qp*>& cutQps) {
   int settledCredits = 0;
   for (size_t epId = 0; epId < eps.size(); ++epId) {
     if (static_cast<int>(epId) == skipEpId || epWrsSinceSignal[epId] <= 0) continue;
@@ -495,6 +497,7 @@ static int SettlePendingWrs(const EpPairVec& eps,
           reason, epId, pendingWrs);
       ReleaseSqDepth(eps[epId], pendingWrs);
       settledCredits += pendingCredits;
+      cutQps.push_back(eps[epId].local.ibvHandle.qp);
       callbackMeta->Account(pendingCredits, StatusCode::ERR_RDMA_OP,
                             "the QP was cut after a submission gave up", /*rootCause=*/false);
       continue;
@@ -1027,8 +1030,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   // Rotate the starting EP by transfer id so single-segment (single WR)
   // transfers spread evenly across all QPs instead of always landing on eps[0].
   int epStartOffset = static_cast<int>(id % static_cast<uint64_t>(epNum));
-  // Credits put on the wire or settled by this call, returned in every RdmaOpRet below.
+  // Credits put on the wire or settled by this call, returned in every RdmaOpRet below,
+  // and the QPs a give-up had to cut.
   int postedCredits = 0;
+  std::vector<ibv_qp*> cutQps;
   for (int i = 0; i < numPostBatch; i++) {
     int st = i * postBatchSize;
     int end = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
@@ -1045,8 +1050,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       // signaled WR behind them.
       postedCredits +=
           SettlePendingWrs(eps, remoteMrPerEp, isRead, -1, "send queue admission failed",
-                           epWrsSinceSignal, epMergedSinceSignal, callbackMeta);
-      return {StatusCode::ERR_RDMA_OP, reserveErr, postedCredits};
+                           epWrsSinceSignal, epMergedSinceSignal, callbackMeta, cutQps);
+      return {StatusCode::ERR_RDMA_OP, reserveErr, postedCredits, std::move(cutQps)};
     }
 
     const auto& localMr = localMrPerEp[epId];
@@ -1110,12 +1115,12 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         ReleaseSqDepth(eps[epId], epWrsSinceSignal[epId]);
         epWrsSinceSignal[epId] = 0;
         epMergedSinceSignal[epId] = 0;
-        postedCredits += SettlePendingWrs(eps, remoteMrPerEp, isRead, epId,
-                                          "endpoint retired by a fatal async event",
-                                          epWrsSinceSignal, epMergedSinceSignal, callbackMeta);
+        postedCredits += SettlePendingWrs(
+            eps, remoteMrPerEp, isRead, epId, "endpoint retired by a fatal async event",
+            epWrsSinceSignal, epMergedSinceSignal, callbackMeta, cutQps);
         return {StatusCode::ERR_RDMA_OP,
                 "endpoint was failed by a fatal verbs async event; submission rejected",
-                postedCredits};
+                postedCredits, std::move(cutQps)};
       }
       last.wr_id = recordId;
       last.send_flags = IBV_SEND_SIGNALED;
@@ -1181,15 +1186,16 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
 
       // What this batch and earlier ones put on the wire without a signaled WR behind
       // them, on this EP and the others.
-      postedCredits += SettlePendingWrs(eps, remoteMrPerEp, isRead, -1, "ibv_post_send failed",
-                                        epWrsSinceSignal, epMergedSinceSignal, callbackMeta);
+      postedCredits +=
+          SettlePendingWrs(eps, remoteMrPerEp, isRead, -1, "ibv_post_send failed", epWrsSinceSignal,
+                           epMergedSinceSignal, callbackMeta, cutQps);
 
       std::string message = "ibv_post_send failed with " + std::to_string(ret) + ": " +
                             strerror(ret) + " (posted " + std::to_string(postedCount) + "/" +
                             std::to_string(batchWrNum) + " WRs)";
       AppendHint(&message, BuildPostSendFailureHint(ret, eps[epId], epNum, postBatchSize, badWr,
                                                     PostSendOpKind::BatchData));
-      return {StatusCode::ERR_RDMA_OP, std::move(message), postedCredits};
+      return {StatusCode::ERR_RDMA_OP, std::move(message), postedCredits, std::move(cutQps)};
     }
 
     if (needSignal) {

@@ -1567,14 +1567,12 @@ static void FinishSubmission(const EpPairVec& eps, const std::shared_ptr<CqCallb
   assert(!ret.Init());
   if (ret.Failed()) {
     // A QP the submission had to cut to bound its WRs is dead: mark it, so the next
-    // transfer replaces it instead of posting into it.
+    // transfer replaces it instead of posting into it. A QP that went to Error any other
+    // way is marked by its error completions or its async event.
     if (rdma != nullptr) {
       for (const auto& ep : eps) {
-        ibv_qp_attr attr{};
-        ibv_qp_init_attr init{};
-        ibv_qp* qp = ep.local.ibvHandle.qp;
-        if (qp != nullptr && ibv_query_qp(qp, &attr, IBV_QP_STATE, &init) == 0 &&
-            attr.qp_state == IBV_QPS_ERR) {
+        if (std::find(ret.cutQps.begin(), ret.cutQps.end(), ep.local.ibvHandle.qp) !=
+            ret.cutQps.end()) {
           rdma->RecordQpFailed(ep);
         }
       }

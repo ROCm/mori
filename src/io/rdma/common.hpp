@@ -493,6 +493,9 @@ struct RdmaOpRet {
   // Credits this submission handed to the NIC or settled itself; a submission that gives
   // up partway accounts the rest of the transfer's credits as never sent.
   int postedCredits{0};
+  // QPs this submission moved to Error to stop WRs it could not otherwise bound; the
+  // caller marks them failed so the next transfer replaces them.
+  std::vector<ibv_qp*> cutQps;
 
   bool Init() { return code == StatusCode::INIT; }
   bool InProgress() { return code == StatusCode::IN_PROGRESS; }
