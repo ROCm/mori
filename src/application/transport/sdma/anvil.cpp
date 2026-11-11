@@ -29,6 +29,8 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +38,7 @@
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 
 #include "mori/utils/mori_log.hpp"
@@ -67,6 +70,11 @@ namespace {
       exit(EXIT_FAILURE);                                                                 \
     }                                                                                     \
   } while (0)
+
+// MI308X xGMI SDMA engines; 0 is the general engine and keeps loopback and host
+// copies. KFD exposes 8 user-queue slots per engine on gfx942.
+constexpr std::array<uint32_t, 3> kMi308xXgmiEngines = {2u, 4u, 6u};
+constexpr int kMi308xQueuesPerEngine = 8;
 
 // HSA agents
 std::vector<hsa_agent_t> cpuAgents_;
@@ -392,7 +400,8 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // ringing its doorbell hangs, so fold every selected id down to its backing
   // even engine (id & ~1) and dedup, preserving order, so the per-engine queue
   // budget is not double-charged.
-  if (isMi308x(srcNode)) {
+  const bool mi308x = isMi308x(srcNode);
+  if (mi308x) {
     uint32_t seen = 0;
     std::vector<uint32_t> evenEngines;
     for (uint32_t e : engines) {
@@ -405,7 +414,7 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
     engines.swap(evenEngines);
   }
 
-  int numEngines = static_cast<int>(engines.size());
+  const int numEngines = static_cast<int>(engines.size());
 
   // Queues live in this process-global singleton and are shared across every
   // Context/comm for this node pair (getSdmaQueue keys on KFD node ids, not on
@@ -416,12 +425,63 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   auto& channels = sdma_channels_[std::make_pair(srcNode, dstNode)];
   if (static_cast<int>(channels.size()) < numChannels) {
     const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
+    // The fold above puts several of a MI308X GPU's peer links on one engine
+    // (masks 0x40 and 0x80 both land on 6), serialising its copies to those
+    // peers, so its peer links are balanced over the xGMI engines instead.
+    const bool balance = mi308x && srcNode != dstNode;
+    if (balance) mi308xLinkEngine(srcNode, dstNode, engines);
     for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
-      uint32_t engineId = engines[c % numEngines];
+      const uint32_t engineId =
+          balance ? mi308xQueueEngine(srcNode, dstNode) : engines[c % numEngines];
       channels.emplace_back(std::make_unique<SdmaQueue>(hsakmtNode, engineId));
     }
   }
   return true;
+}
+
+// The engine of a MI308X peer link: the xGMI engine carrying the fewest of this
+// GPU's peer links, ties to a recommended engine, then the lowest id. Decided
+// once per (src, dst) so every queue of a link shares one engine: AsyncLL uses
+// one queue per peer per op, and a link whose queues were spread over engines
+// measured 28-53% slower.
+uint32_t AnvilLib::mi308xLinkEngine(int srcNode, int dstNode,
+                                    const std::vector<uint32_t>& recommended) {
+  const auto key = std::make_pair(srcNode, dstNode);
+  auto it = mi308x_link_engine_.find(key);
+  if (it != mi308x_link_engine_.end()) return it->second;
+  auto& use = mi308x_engine_use_[srcNode];
+  auto rank = [&](uint32_t e) {
+    const bool notRecommended =
+        std::find(recommended.begin(), recommended.end(), e) == recommended.end();
+    return std::make_tuple(use.links[e], notRecommended, e);
+  };
+  uint32_t best = kMi308xXgmiEngines[0];
+  for (uint32_t e : kMi308xXgmiEngines) {
+    if (rank(e) < rank(best)) best = e;
+  }
+  use.links[best]++;
+  mi308x_link_engine_[key] = best;
+  return best;
+}
+
+// The engine of one more queue on a MI308X peer link: the link's engine, or the
+// xGMI engine with the fewest queues once that one is full. KFD rejects the
+// ninth queue on an engine, and SdmaQueue's constructor would then exit().
+uint32_t AnvilLib::mi308xQueueEngine(int srcNode, int dstNode) {
+  auto& use = mi308x_engine_use_[srcNode];
+  uint32_t e = mi308x_link_engine_.at(std::make_pair(srcNode, dstNode));
+  if (use.queues[e] >= kMi308xQueuesPerEngine) {
+    e = *std::min_element(kMi308xXgmiEngines.begin(), kMi308xXgmiEngines.end(),
+                          [&](uint32_t a, uint32_t b) { return use.queues[a] < use.queues[b]; });
+    if (use.queues[e] >= kMi308xQueuesPerEngine) {
+      throw std::runtime_error("SDMA: KFD node " + std::to_string(srcNode) + " has all " +
+                               std::to_string(kMi308xQueuesPerEngine) +
+                               " queue slots of every xGMI SDMA engine in use; request fewer "
+                               "SDMA channels per peer (MORI_SDMA_NUM_CHANNELS)");
+    }
+  }
+  use.queues[e]++;
+  return e;
 }
 
 uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {
