@@ -174,9 +174,6 @@ struct CqCallbackMeta {
   // Credits that can no longer touch memory: completed, flushed, retired with their dead
   // QP, or never posted. Only Account() adds to it.
   std::atomic<uint32_t> finishedBatchSize{0};
-  // Credits handed to the NIC, so a submission that gives up partway knows how many
-  // never left and can account them itself.
-  std::atomic<int> postedCredits{0};
   internal::IoCallDiagnostics diagnostics{};
 
   // Accounts `credits` as finished with `code`. The status turns terminal only once every
@@ -493,6 +490,9 @@ struct RemoteEngineMeta {
 struct RdmaOpRet {
   StatusCode code{StatusCode::INIT};
   std::string message;
+  // Credits this submission handed to the NIC or settled itself; a submission that gives
+  // up partway accounts the rest of the transfer's credits as never sent.
+  int postedCredits{0};
 
   bool Init() { return code == StatusCode::INIT; }
   bool InProgress() { return code == StatusCode::IN_PROGRESS; }

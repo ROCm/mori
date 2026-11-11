@@ -444,7 +444,6 @@ static bool PostCompletionMarker(const EpPair& ep, const application::RdmaMemory
     ReleaseSqDepth(ep, 1);
     return false;
   }
-  callbackMeta->postedCredits.fetch_add(pendingCredits, std::memory_order_acq_rel);
   guard.MarkPosted();
   guard.Commit();
   return true;
@@ -467,13 +466,15 @@ static bool CutQp(const EpPair& ep) {
 // replaces it. Only a QP that cannot be cut has them parked as orphaned and the EP
 // degraded, for the recovery path. On a closed ledger the QP is dead, so they are left
 // uncounted as posted and the caller accounts them as never sent.
-// `skipEpId` is an EP the caller has already settled, or -1.
-static void SettlePendingWrs(const EpPairVec& eps,
-                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
-                             bool isRead, int skipEpId, const char* reason,
-                             std::vector<int>& epWrsSinceSignal,
-                             std::vector<size_t>& epMergedSinceSignal,
-                             const std::shared_ptr<CqCallbackMeta>& callbackMeta) {
+// `skipEpId` is an EP the caller has already settled, or -1. Returns the credits it
+// settled (marker, cut or orphaned), which the caller counts as posted.
+static int SettlePendingWrs(const EpPairVec& eps,
+                            const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                            bool isRead, int skipEpId, const char* reason,
+                            std::vector<int>& epWrsSinceSignal,
+                            std::vector<size_t>& epMergedSinceSignal,
+                            const std::shared_ptr<CqCallbackMeta>& callbackMeta) {
+  int settledCredits = 0;
   for (size_t epId = 0; epId < eps.size(); ++epId) {
     if (static_cast<int>(epId) == skipEpId || epWrsSinceSignal[epId] <= 0) continue;
     const int pendingWrs = epWrsSinceSignal[epId];
@@ -484,6 +485,7 @@ static void SettlePendingWrs(const EpPairVec& eps,
                              callbackMeta)) {
       MORI_IO_DEBUG("{}: posted a completion marker behind {} pending unsignaled WRs on ep {}",
                     reason, pendingWrs, epId);
+      settledCredits += pendingCredits;
       continue;
     }
     if (eps[epId].ledger && !eps[epId].ledger->Closed() && CutQp(eps[epId])) {
@@ -492,7 +494,7 @@ static void SettlePendingWrs(const EpPairVec& eps,
           "pending unsignaled WRs cannot run any longer",
           reason, epId, pendingWrs);
       ReleaseSqDepth(eps[epId], pendingWrs);
-      callbackMeta->postedCredits.fetch_add(pendingCredits, std::memory_order_acq_rel);
+      settledCredits += pendingCredits;
       callbackMeta->Account(pendingCredits, StatusCode::ERR_RDMA_OP,
                             "the QP was cut after a submission gave up", /*rootCause=*/false);
       continue;
@@ -503,7 +505,7 @@ static void SettlePendingWrs(const EpPairVec& eps,
         reason, epId, pendingWrs, pendingCredits);
     if (eps[epId].ledger) {
       if (eps[epId].ledger->InsertOrphaned(pendingWrs, callbackMeta, pendingCredits)) {
-        callbackMeta->postedCredits.fetch_add(pendingCredits, std::memory_order_acq_rel);
+        settledCredits += pendingCredits;
       } else {
         // A fatal event already closed this EP. FailAll() cannot have released these
         // WRs -- they were never in its ledger -- so the reservation is ours to give
@@ -525,6 +527,7 @@ static void SettlePendingWrs(const EpPairVec& eps,
     }
     NotifySqStateChanged(eps[epId]);
   }
+  return settledCredits;
 }
 
 namespace detail {
@@ -1024,6 +1027,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   // Rotate the starting EP by transfer id so single-segment (single WR)
   // transfers spread evenly across all QPs instead of always landing on eps[0].
   int epStartOffset = static_cast<int>(id % static_cast<uint64_t>(epNum));
+  // Credits put on the wire or settled by this call, returned in every RdmaOpRet below.
+  int postedCredits = 0;
   for (int i = 0; i < numPostBatch; i++) {
     int st = i * postBatchSize;
     int end = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
@@ -1038,9 +1043,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                                                PostSendOpKind::BatchData, reserveFailure));
       // Earlier batches may already be on the wire, this EP's included, without a
       // signaled WR behind them.
-      SettlePendingWrs(eps, remoteMrPerEp, isRead, -1, "send queue admission failed",
-                       epWrsSinceSignal, epMergedSinceSignal, callbackMeta);
-      return {StatusCode::ERR_RDMA_OP, reserveErr};
+      postedCredits +=
+          SettlePendingWrs(eps, remoteMrPerEp, isRead, -1, "send queue admission failed",
+                           epWrsSinceSignal, epMergedSinceSignal, callbackMeta);
+      return {StatusCode::ERR_RDMA_OP, reserveErr, postedCredits};
     }
 
     const auto& localMr = localMrPerEp[epId];
@@ -1090,7 +1096,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       if (!eps[epId].ledger) {
         ReleaseSqDepth(eps[epId], batchWrNum);
         return {StatusCode::ERR_RDMA_OP,
-                "submission ledger is not initialized for signaled WR tracking"};
+                "submission ledger is not initialized for signaled WR tracking", postedCredits};
       }
       postGuard = eps[epId].ledger->InsertForPost(epWrsSinceSignal[epId], callbackMeta,
                                                   static_cast<int>(epMergedSinceSignal[epId]));
@@ -1104,11 +1110,12 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         ReleaseSqDepth(eps[epId], epWrsSinceSignal[epId]);
         epWrsSinceSignal[epId] = 0;
         epMergedSinceSignal[epId] = 0;
-        SettlePendingWrs(eps, remoteMrPerEp, isRead, epId,
-                         "endpoint retired by a fatal async event", epWrsSinceSignal,
-                         epMergedSinceSignal, callbackMeta);
+        postedCredits += SettlePendingWrs(eps, remoteMrPerEp, isRead, epId,
+                                          "endpoint retired by a fatal async event",
+                                          epWrsSinceSignal, epMergedSinceSignal, callbackMeta);
         return {StatusCode::ERR_RDMA_OP,
-                "endpoint was failed by a fatal verbs async event; submission rejected"};
+                "endpoint was failed by a fatal verbs async event; submission rejected",
+                postedCredits};
       }
       last.wr_id = recordId;
       last.send_flags = IBV_SEND_SIGNALED;
@@ -1157,8 +1164,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         // Signaled WR was posted; CQ path (ledger->ReleaseByCqe) owns the release.
         postGuard.MarkPosted();
         postGuard.Commit();
-        callbackMeta->postedCredits.fetch_add(static_cast<int>(epMergedSinceSignal[epId]),
-                                              std::memory_order_acq_rel);
+        postedCredits += static_cast<int>(epMergedSinceSignal[epId]);
         epWrsSinceSignal[epId] = 0;
         epMergedSinceSignal[epId] = 0;
       } else if (needSignal) {
@@ -1175,15 +1181,15 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
 
       // What this batch and earlier ones put on the wire without a signaled WR behind
       // them, on this EP and the others.
-      SettlePendingWrs(eps, remoteMrPerEp, isRead, -1, "ibv_post_send failed", epWrsSinceSignal,
-                       epMergedSinceSignal, callbackMeta);
+      postedCredits += SettlePendingWrs(eps, remoteMrPerEp, isRead, -1, "ibv_post_send failed",
+                                        epWrsSinceSignal, epMergedSinceSignal, callbackMeta);
 
       std::string message = "ibv_post_send failed with " + std::to_string(ret) + ": " +
                             strerror(ret) + " (posted " + std::to_string(postedCount) + "/" +
                             std::to_string(batchWrNum) + " WRs)";
       AppendHint(&message, BuildPostSendFailureHint(ret, eps[epId], epNum, postBatchSize, badWr,
                                                     PostSendOpKind::BatchData));
-      return {StatusCode::ERR_RDMA_OP, std::move(message)};
+      return {StatusCode::ERR_RDMA_OP, std::move(message), postedCredits};
     }
 
     if (needSignal) {
@@ -1191,15 +1197,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       // sqDepth release. Releasing the guard lets a pending FailAll() proceed.
       postGuard.MarkPosted();
       postGuard.Commit();
-      callbackMeta->postedCredits.fetch_add(static_cast<int>(epMergedSinceSignal[epId]),
-                                            std::memory_order_acq_rel);
+      postedCredits += static_cast<int>(epMergedSinceSignal[epId]);
       epWrsSinceSignal[epId] = 0;
       epMergedSinceSignal[epId] = 0;
       if (roctxTransferEnabled) epBytesSinceSignal[epId] = 0;
     }
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
-  return {StatusCode::IN_PROGRESS, ""};
+  return {StatusCode::IN_PROGRESS, "", postedCredits};
 }
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,

@@ -289,9 +289,8 @@ void CaseTransferFailureWaitsForEveryQp() {
   TransferStatus partial;
   partial.SetCode(StatusCode::IN_PROGRESS);
   auto meta3 = std::make_shared<CqCallbackMeta>(&partial, 703, 5);
-  meta3->postedCredits.store(3);
-  meta3->Account(meta3->totalBatchSize - meta3->postedCredits.load(), StatusCode::ERR_RDMA_OP,
-                 "post failed");
+  const int posted = 3;  // RdmaOpRet::postedCredits of the submission that gave up
+  meta3->Account(meta3->totalBatchSize - posted, StatusCode::ERR_RDMA_OP, "post failed");
   Require(partial.InProgress(), "posted WRs keep the transfer in progress");
   meta3->Account(3, StatusCode::SUCCESS, "success");
   Require(partial.Failed() && partial.Message() == "post failed",

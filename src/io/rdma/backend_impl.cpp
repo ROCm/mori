@@ -1582,9 +1582,8 @@ static void FinishSubmission(const EpPairVec& eps, const std::shared_ptr<CqCallb
     // The post gave up. What it never posted is accounted here; what it did post is still
     // on the wire and is accounted by its completions, so the transfer fails only once
     // none of its WRs can still move data.
-    meta->Account(
-        std::max(0, meta->totalBatchSize - meta->postedCredits.load(std::memory_order_acquire)),
-        ret.code, ret.message);
+    assert(ret.postedCredits <= meta->totalBatchSize);
+    meta->Account(meta->totalBatchSize - ret.postedCredits, ret.code, ret.message);
   } else if (ret.Succeeded()) {
     // Nothing was posted, so no CQE ends this transfer.
     if (TransferStatus* s = meta->status.exchange(nullptr, std::memory_order_acq_rel)) {
