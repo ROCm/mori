@@ -1096,15 +1096,3 @@ jobs:
           CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
           # Only this leg's FlyDSL layer is unique; the rest is shared with ci-cco.
           $CT rmi -f $IMAGE 2>/dev/null || true
-
-  # PR CI built from source (ci.yml), full: every lane, the intranode jobs a PR
-  # skips, the full internode sweeps and every fused GEMM case.
-  ci-full:
-    name: CI full
-    uses: ./.github/workflows/ci.yml
-    # A called workflow gets no more than its caller grants; ci.yml's scope job
-    # asks for these (it writes only on a PR).
-    permissions:
-      contents: read
-      pull-requests: write
-      checks: read

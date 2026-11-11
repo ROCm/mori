@@ -32,20 +32,16 @@ ci.yml hands the cco and fused lanes to ci_cco.yml. Writes these step outputs:
   fused   CCO fused GEMM + collective job (ci_cco.yml)
   build   the MI355X build job (compile check)
   groups  JSON list of test groups (GROUPS); a step runs only if its group is listed
-  full    the intranode jobs (MI355X, MI300X, ROCm 10, JAX), the full internode
-          bench/stress sweeps, and the fused GEMM cases a PR skips: the nightly
-          (nightly.yml calls ci.yml, so the event is schedule), workflow_dispatch,
-          or ci:full on a PR
+  full    full internode bench/stress sweeps, and the fused GEMM cases a PR skips:
+          workflow_dispatch, or ci:full on a PR
   reason  why
 
-Non-PR events (push to main, the nightly, workflow_dispatch) run every lane; a push
-to main is not full, so it skips the intranode jobs. On a PR:
+Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
 
   - a draft runs nothing, unless it has the ci:full label;
-  - ci:full runs everything, with the intranode jobs and the full internode
-    sweeps; ci:mi300x adds the MI300X lanes to the lanes the changed files pick.
-    Adding either label re-runs the PR's CI (ci-rerun.yml); labels are read live,
-    so the re-run sees it;
+  - ci:full runs everything, with the full internode sweeps; ci:mi300x adds the
+    MI300X lanes to the lanes the changed files pick. Adding either label re-runs
+    the PR's CI (ci-rerun.yml); labels are read live, so the re-run sees it;
   - otherwise the test groups follow the changed files (rules below) and the lanes
     follow the groups (LANE_GROUPS), after the pre-commit check of the head commit
     has passed. A rename counts under both its old and its new path. A tools/ file
@@ -460,7 +456,7 @@ def decide(env):
     """(lanes, groups, reason, full)."""
     event = env.get("EVENT_NAME", "")
     if event != "pull_request":
-        full = event in ("workflow_dispatch", "schedule")
+        full = event == "workflow_dispatch"
         return (
             dict.fromkeys(LANES, True),
             set(ALL),
@@ -513,13 +509,11 @@ JOBS = {
     "fused": (("CCO fused GEMM test", {"fused"}),),
     "build": (("MoRI build (compile check)", ALL),),
 }
-# The jobs that run only when the scope is full (their if: in ci.yml).
-FULL_ONLY = {"MI355X intranode", "MI355X ROCm 10", "MI355X JAX", "MI300X intranode"}
 HINT = (
-    "Lanes follow the changed files. The intranode jobs run in the nightly; adding "
-    "`ci:full` re-runs CI with every lane, the intranode jobs, the full internode "
-    "sweeps and every fused GEMM case; adding `ci:mi300x` re-runs it with the MI300X "
-    "lanes added. `/ci-rerun` re-runs CI against the current main."
+    "Lanes follow the changed files. Adding `ci:full` re-runs CI with every lane, "
+    "the full internode sweeps and every fused GEMM case; adding `ci:mi300x` re-runs "
+    "it with the MI300X lanes "
+    "added. `/ci-rerun` re-runs CI against the current main."
 )
 
 
@@ -538,21 +532,14 @@ def comment_body(env, lanes, reason, full, groups=frozenset()):
     if not any(lanes.values()):
         return head + f"none, {reason}.\n\n{HINT}"
     if full:
-        reason += (
-            "; the intranode jobs, full internode sweeps and every fused GEMM case"
-        )
+        reason += "; full internode sweeps and every fused GEMM case"
     rows = []
     for lane in LANES:
         # A lane that runs lists the jobs its groups start; one that does not, all.
         jobs = [j for j, want in JOBS[lane] if not lanes[lane] or groups & want]
-        runs = "yes" if lanes[lane] else "no"
-        if lanes[lane] and not full:
-            later = [j for j in jobs if j in FULL_ONLY]
-            jobs = [j for j in jobs if j not in FULL_ONLY]
-            if later:
-                runs = "yes" if jobs else "nightly"
-                jobs.append("nightly: " + ", ".join(later))
-        rows.append(f"| `{lane}` | {runs} | {', '.join(jobs)} |")
+        rows.append(
+            f"| `{lane}` | {'yes' if lanes[lane] else 'no'} | {', '.join(jobs)} |"
+        )
     tests = ", ".join(g for g in GROUPS if g in groups) or "none"
     return "\n".join(
         [
