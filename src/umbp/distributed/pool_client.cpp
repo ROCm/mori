@@ -1065,8 +1065,10 @@ bool PoolClient::Init() {
   // plausible numbers, and local_first in particular changes whether the master
   // is consulted at all -- it is worth 30% of a fully-local call.
   MORI_UMBP_INFO(
-      "[PoolClient] routing: local_first={} cache_remote_fetches={} ranged_locality_prefetch={}",
-      config_.local_first, config_.cache_remote_fetches, config_.ranged_locality_prefetch);
+      "[PoolClient] routing: local_first={} cache_remote_fetches={} ranged_locality_prefetch={} "
+      "remote_single_flight={} (wait {} ms)",
+      config_.local_first, config_.cache_remote_fetches, config_.ranged_locality_prefetch,
+      config_.remote_single_flight, config_.remote_single_flight_wait_ms);
 
   if (master_client_) master_client_->SetBackendRegistry(&registry_);
 
@@ -3482,6 +3484,21 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
                                              const std::vector<std::vector<void*>>& dsts,
                                              const std::vector<std::vector<size_t>>& sizes,
                                              const std::vector<std::vector<size_t>>& src_offsets) {
+  RangedFollowers followers;
+  std::vector<bool> results = BatchGetRangesImpl(
+      keys, dsts, sizes, src_offsets, config_.remote_single_flight ? &followers : nullptr);
+  // After the call above has returned: its arena lease is released and its own
+  // episodes are finished, so waiting here cannot hold up the call we wait on.
+  if (!followers.indices.empty()) {
+    ServeRangedFollowers(keys, dsts, sizes, src_offsets, followers, &results);
+  }
+  return results;
+}
+
+std::vector<bool> PoolClient::BatchGetRangesImpl(
+    const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets, RangedFollowers* followers) {
   const size_t n = keys.size();
   std::vector<bool> results(n, false);
   if (!initialized_ || n == 0 || !RangeBatchShapeValid(n, dsts, sizes, src_offsets)) {
@@ -3855,12 +3872,25 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::unordered_map<size_t, bool> unit_ok;
   for (const auto& unit : units) unit_ok.emplace(unit.original, true);
 
+  // Single-flight: a whole-object unit another call is already pulling (or that
+  // has landed locally since phase 1) is left to ServeRangedFollowers instead
+  // of being pulled a second time.  Whatever this call leads is finished once
+  // its slots are committed, and on every exit after this point.
+  LedEpisodes led;
+  ScopeExit finish_led{[this, &led] { FinishRemoteEpisodes(&led); }};
+  if (followers != nullptr && CanInstallLocally()) {
+    ClaimRemoteFetches(keys, &units, &unit_ok, &led, followers);
+  }
+
   // Whole-object units skip the arena entirely when a slot can be had; what
   // comes back is everything that still needs one.
   {
     PhaseTimer medium_timer(dbg ? &dbg->rmt_medium : nullptr);
     units = ServeWholeObjectUnitsFromMedium(keys, std::move(units), &unit_ok, &remote_bytes);
   }
+  // Committed or given up: either way the joiners can stop waiting now, before
+  // this call spends time on its arena units.
+  FinishRemoteEpisodes(&led);
   if (units.empty()) {
     for (const auto& [original, ok] : unit_ok) results[original] = ok;
     return results;
@@ -4346,6 +4376,147 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
         .index = i, .key = &keys[i], .dst = dsts[i], .size = sizes[i], .route = route});
   }
   return plan;
+}
+
+void PoolClient::ClaimRemoteFetches(const std::vector<std::string>& keys,
+                                    std::vector<RangeFetchUnit>* units,
+                                    std::unordered_map<size_t, bool>* unit_ok, LedEpisodes* led,
+                                    RangedFollowers* followers) {
+  // Only whole-object units: they are the ones the slot path pulls AND commits,
+  // so they are the ones a second reader can be served from afterwards.
+  std::vector<size_t> candidates;
+  for (size_t u = 0; u < units->size(); ++u) {
+    if ((*units)[u].holds_whole_object) candidates.push_back(u);
+  }
+  if (candidates.empty()) return;
+  auto* backend = registry_.Get(medium_);
+  if (backend == nullptr) return;
+  std::vector<std::string> candidate_keys;
+  candidate_keys.reserve(candidates.size());
+  for (size_t u : candidates) candidate_keys.push_back(keys[(*units)[u].original]);
+
+  std::vector<char> follows(units->size(), 0);
+  {
+    // Under this lock a key being pulled always has its episode registered: the
+    // leader commits before FinishRemoteEpisodes, which takes this lock to
+    // retire the episode.  So "no episode and not committed" means nobody is
+    // pulling it, and this call takes it.
+    std::lock_guard<std::mutex> lock(remote_inflight_mutex_);
+    const std::vector<bool> present = backend->BatchContains(candidate_keys);
+    for (size_t c = 0; c < candidates.size(); ++c) {
+      const size_t u = candidates[c];
+      const std::string& key = candidate_keys[c];
+      const auto it = remote_inflight_.find(key);
+      if (it != remote_inflight_.end()) {
+        followers->indices.push_back((*units)[u].original);
+        followers->episodes.push_back(it->second);
+        follows[u] = 1;
+        single_flight_stats_.joined.fetch_add(1, std::memory_order_relaxed);
+      } else if (c < present.size() && present[c]) {
+        followers->indices.push_back((*units)[u].original);
+        followers->episodes.push_back(nullptr);
+        follows[u] = 1;
+        single_flight_stats_.already_local.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        auto episode = std::make_shared<RemoteFetchEpisode>();
+        remote_inflight_.emplace(key, episode);
+        led->emplace_back(key, std::move(episode));
+        single_flight_stats_.lead.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  // A whole-object unit is its key's only unit, so its key leaves unit_ok too.
+  std::vector<RangeFetchUnit> kept;
+  kept.reserve(units->size());
+  for (size_t u = 0; u < units->size(); ++u) {
+    if (follows[u]) {
+      unit_ok->erase((*units)[u].original);
+    } else {
+      kept.push_back(std::move((*units)[u]));
+    }
+  }
+  *units = std::move(kept);
+}
+
+SingleFlightActivity PoolClient::RemoteSingleFlightStats() const {
+  SingleFlightActivity out;
+  out.lead = single_flight_stats_.lead.load(std::memory_order_relaxed);
+  out.joined = single_flight_stats_.joined.load(std::memory_order_relaxed);
+  out.already_local = single_flight_stats_.already_local.load(std::memory_order_relaxed);
+  out.served_local = single_flight_stats_.served_local.load(std::memory_order_relaxed);
+  out.refetched = single_flight_stats_.refetched.load(std::memory_order_relaxed);
+  out.timed_out = single_flight_stats_.timed_out.load(std::memory_order_relaxed);
+  return out;
+}
+
+void PoolClient::FinishRemoteEpisodes(LedEpisodes* led) {
+  if (led->empty()) return;
+  {
+    std::lock_guard<std::mutex> lock(remote_inflight_mutex_);
+    for (const auto& [key, episode] : *led) {
+      const auto it = remote_inflight_.find(key);
+      if (it != remote_inflight_.end() && it->second == episode) remote_inflight_.erase(it);
+    }
+  }
+  for (const auto& [key, episode] : *led) {
+    {
+      std::lock_guard<std::mutex> lock(episode->mutex);
+      episode->done = true;
+    }
+    episode->cv.notify_all();
+  }
+  led->clear();
+}
+
+void PoolClient::ServeRangedFollowers(const std::vector<std::string>& keys,
+                                      const std::vector<std::vector<void*>>& dsts,
+                                      const std::vector<std::vector<size_t>>& sizes,
+                                      const std::vector<std::vector<size_t>>& src_offsets,
+                                      const RangedFollowers& followers,
+                                      std::vector<bool>* results) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(config_.remote_single_flight_wait_ms);
+  uint64_t timed_out = 0;
+  for (const auto& episode : followers.episodes) {
+    if (episode == nullptr) continue;
+    std::unique_lock<std::mutex> lock(episode->mutex);
+    if (!episode->cv.wait_until(lock, deadline, [&episode] { return episode->done; })) {
+      ++timed_out;
+    }
+  }
+
+  const size_t m = followers.indices.size();
+  std::vector<std::string> sub_keys;
+  std::vector<std::vector<void*>> sub_dsts;
+  std::vector<std::vector<size_t>> sub_sizes;
+  std::vector<std::vector<size_t>> sub_offsets;
+  sub_keys.reserve(m);
+  sub_dsts.reserve(m);
+  sub_sizes.reserve(m);
+  sub_offsets.reserve(m);
+  for (size_t index : followers.indices) {
+    sub_keys.push_back(keys[index]);
+    sub_dsts.push_back(dsts[index]);
+    sub_sizes.push_back(sizes[index]);
+    sub_offsets.push_back(src_offsets[index]);
+  }
+  // Counted before the re-read, so a key evicted in between counts as local
+  // here and is still read correctly (remotely) below.
+  if (auto* backend = registry_.Get(medium_); backend != nullptr) {
+    const std::vector<bool> present = backend->BatchContains(sub_keys);
+    uint64_t local = 0;
+    for (bool hit : present) local += hit ? 1 : 0;
+    single_flight_stats_.served_local.fetch_add(local, std::memory_order_relaxed);
+    single_flight_stats_.refetched.fetch_add(m - local, std::memory_order_relaxed);
+  }
+  single_flight_stats_.timed_out.fetch_add(timed_out, std::memory_order_relaxed);
+
+  // Single-flight off for the re-read: a key the leader did not leave local is
+  // pulled by this call itself, exactly as it would have been without the wait.
+  const std::vector<bool> again =
+      BatchGetRangesImpl(sub_keys, sub_dsts, sub_sizes, sub_offsets, /*followers=*/nullptr);
+  for (size_t j = 0; j < m; ++j) (*results)[followers.indices[j]] = again[j];
 }
 
 std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMedium(
@@ -5488,6 +5659,7 @@ ActivitySnapshot PoolClient::CollectActivitySnapshot() const {
   snap.recache.install_failed = recache_stats_.install_failed.load(std::memory_order_relaxed);
   snap.recache.prefetched = recache_stats_.prefetched.load(std::memory_order_relaxed);
   snap.recache.fragmented = recache_stats_.fragmented.load(std::memory_order_relaxed);
+  snap.single_flight = RemoteSingleFlightStats();
   return snap;
 }
 
