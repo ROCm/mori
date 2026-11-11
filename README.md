@@ -63,7 +63,6 @@ It is built from [`docs/`](https://github.com/ROCm/mori/tree/main/docs) on every
 | Getting started | Installation, fabric checks and first steps | [Installation](https://rocm.github.io/mori/installation.html) · [Quickstart](https://rocm.github.io/mori/quickstart.html) |
 | MORI-EP (EPv1, EPv2) | EPv1 (built on SHMEM) and EPv2 (built on CCO) dispatch/combine: API, kernel types and backends, configuration, usage examples, how to choose | [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-EP-BENCHMARK.html) · [RDMA bandwidth](https://rocm.github.io/mori/rdma_bandwidth_utilization.html) |
 | MORI-FUSED | GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, built on MORI-CCO | [Guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html) |
-| MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](https://rocm.github.io/mori/MORI-SHMEM-GUIDE.html) |
 | MORI-CCO | Next-generation collective communication object: communicator, symmetric-memory windows, LSA / GDA / SDMA device APIs | [CCO Guide](https://rocm.github.io/mori/MORI-CCO-GUIDE.html) |
 | MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](https://rocm.github.io/mori/MORI-IR-GUIDE.html) |
 | MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](https://rocm.github.io/mori/MORI-IO-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) |
