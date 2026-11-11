@@ -1407,8 +1407,8 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       break;
     }
     case MessageType::AskMemoryRegion: {
-      std::lock_guard<std::mutex> lock(mu);
       MessageAskMemoryRegion msg = p.ReadMessageAskMemoryRegion(hdr.len);
+      std::lock_guard<std::mutex> lock(mu);
       if (mems.find(msg.id) != mems.end()) {
         MemoryDesc& desc = mems[msg.id];
         auto localMr = rdma->GetLocalMemory(msg.devId, msg.id);

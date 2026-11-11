@@ -24,7 +24,9 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -42,6 +44,12 @@ struct TCPEndpointHandle {
 
 using TCPEndpointHandleVec = std::vector<TCPEndpointHandle>;
 
+using TCPReadDeadline = std::optional<std::chrono::steady_clock::time_point>;
+
+// One budget shared by all reads of a control message. A zero configured
+// timeout deliberately returns no deadline, preserving the existing opt-out.
+TCPReadDeadline MakeControlPlaneReadDeadline();
+
 class TCPEndpoint {
  public:
   TCPEndpoint(TCPEndpointHandle handle) : handle(handle) {}
@@ -49,6 +57,9 @@ class TCPEndpoint {
 
   int Send(const void* buf, size_t len);
   int Recv(void* buf, size_t len, size_t* consumed = nullptr);
+  // Deadline-aware reads preserve partial byte counts and report ETIMEDOUT.
+  // Passing no deadline preserves the legacy per-syscall socket timeout.
+  int Recv(void* buf, size_t len, size_t* consumed, const TCPReadDeadline& deadline);
 
  public:
   TCPEndpointHandle handle;

@@ -41,9 +41,10 @@ void ThrowRecvError(const char* op, size_t expected, size_t received, int rc, in
   throw ProtocolError(os.str());
 }
 
-void ReadExact(application::TCPEndpoint* ep, void* buf, size_t len, const char* op) {
+void ReadExact(application::TCPEndpoint* ep, void* buf, size_t len, const char* op,
+               const application::TCPReadDeadline& deadline) {
   size_t consumed = 0;
-  int rc = ep->Recv(buf, len, &consumed);
+  int rc = ep->Recv(buf, len, &consumed, deadline);
   int err = errno;
   if (rc != 0) ThrowRecvError(op, len, consumed, rc, err);
 }
@@ -97,9 +98,10 @@ Protocol::Protocol(application::TCPEndpointHandle eph) : ep(eph) {}
 Protocol::~Protocol() {}
 
 MessageHeader Protocol::ReadMessageHeader() {
+  readDeadline = application::MakeControlPlaneReadDeadline();
   MessageHeader hdr{};
-  ReadExact(&ep, &hdr.type, sizeof(hdr.type), "ReadMessageHeader(type)");
-  ReadExact(&ep, &hdr.len, sizeof(hdr.len), "ReadMessageHeader(len)");
+  ReadExact(&ep, &hdr.type, sizeof(hdr.type), "ReadMessageHeader(type)", readDeadline);
+  ReadExact(&ep, &hdr.len, sizeof(hdr.len), "ReadMessageHeader(len)", readDeadline);
   hdr.len = ntohl(hdr.len);
   return hdr;
 }
@@ -112,11 +114,14 @@ void Protocol::WriteMessageHeader(const MessageHeader& hdr) {
 
 MessageRegEndpoint Protocol::ReadMessageRegEndpoint(size_t len) {
   ValidateControlMessageLength(len, "MessageRegEndpoint");
+  if (!readDeadline) readDeadline = application::MakeControlPlaneReadDeadline();
   std::vector<char> buf(len);
-  ReadExact(&ep, buf.data(), len, "ReadMessageRegEndpoint(body)");
+  ReadExact(&ep, buf.data(), len, "ReadMessageRegEndpoint(body)", readDeadline);
   try {
     auto out = msgpack::unpack(buf.data(), len);
-    return out.get().as<MessageRegEndpoint>();
+    auto message = out.get().as<MessageRegEndpoint>();
+    readDeadline.reset();
+    return message;
   } catch (const std::exception& e) {
     throw ProtocolError(std::string("failed to decode MessageRegEndpoint: ") + e.what());
   }
@@ -132,11 +137,14 @@ void Protocol::WriteMessageRegEndpoint(const MessageRegEndpoint& msg) {
 
 MessageAskMemoryRegion Protocol::ReadMessageAskMemoryRegion(size_t len) {
   ValidateControlMessageLength(len, "MessageAskMemoryRegion");
+  if (!readDeadline) readDeadline = application::MakeControlPlaneReadDeadline();
   std::vector<char> buf(len);
-  ReadExact(&ep, buf.data(), len, "ReadMessageAskMemoryRegion(body)");
+  ReadExact(&ep, buf.data(), len, "ReadMessageAskMemoryRegion(body)", readDeadline);
   try {
     auto out = msgpack::unpack(buf.data(), len);
-    return out.get().as<MessageAskMemoryRegion>();
+    auto message = out.get().as<MessageAskMemoryRegion>();
+    readDeadline.reset();
+    return message;
   } catch (const std::exception& e) {
     throw ProtocolError(std::string("failed to decode MessageAskMemoryRegion: ") + e.what());
   }

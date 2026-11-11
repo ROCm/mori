@@ -43,6 +43,15 @@ target_include_directories(test_transport_tcp
 target_include_directories(test_transport_tcp PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_transport_tcp mori_application)
 
+add_executable(test_tcp_deadline application/test_tcp_deadline.cpp)
+target_link_libraries(test_tcp_deadline PRIVATE mori_application)
+add_test(NAME tcp_message_deadline COMMAND test_tcp_deadline)
+set_tests_properties(tcp_message_deadline PROPERTIES
+                    ENVIRONMENT "MORI_IO_CP_TIMEOUT_MS=120" TIMEOUT 5)
+add_test(NAME tcp_message_deadline_opt_out COMMAND test_tcp_deadline --opt-out)
+set_tests_properties(tcp_message_deadline_opt_out PROPERTIES
+                    ENVIRONMENT "MORI_IO_CP_TIMEOUT_MS=0" TIMEOUT 5)
+
 add_executable(test_transport_ibverbs application/test_transport_ibverbs.cpp)
 
 target_include_directories(test_transport_ibverbs
@@ -60,6 +69,23 @@ if(BUILD_IO)
   target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR}/include)
   target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_protocol mori_application mori_io)
+  add_test(NAME protocol_round_trip COMMAND test_protocol)
+  set_tests_properties(protocol_round_trip PROPERTIES
+                      ENVIRONMENT "MORI_IO_CP_TIMEOUT_MS=500" TIMEOUT 15)
+  add_test(NAME protocol_whole_frame_deadline COMMAND test_protocol --deadline-only)
+  set_tests_properties(protocol_whole_frame_deadline PROPERTIES
+                      ENVIRONMENT "MORI_IO_CP_TIMEOUT_MS=500" TIMEOUT 15)
+  add_test(NAME protocol_deadline_opt_out COMMAND test_protocol --deadline-opt-out)
+  set_tests_properties(protocol_deadline_opt_out PROPERTIES
+                      ENVIRONMENT "MORI_IO_CP_TIMEOUT_MS=0" TIMEOUT 15)
+
+  add_executable(test_control_plane_deadline io/test_control_plane_deadline.cpp)
+  target_include_directories(test_control_plane_deadline
+                             PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_control_plane_deadline PRIVATE mori_application mori_io)
+  add_test(NAME control_plane_deadline COMMAND test_control_plane_deadline)
+  set_tests_properties(control_plane_deadline PROPERTIES
+                      ENVIRONMENT "MORI_IO_CP_TIMEOUT_MS=500" TIMEOUT 15)
 
   add_executable(test_rail_affinity io/test_rail_affinity.cpp)
 

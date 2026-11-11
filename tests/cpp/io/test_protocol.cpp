@@ -19,12 +19,17 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <sys/socket.h>
+
 #include <cassert>
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <msgpack.hpp>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "mori/application/transport/tcp/tcp.hpp"
@@ -311,19 +316,133 @@ void TestOversizedControlMessageRejectedBeforeRead() {
   printf("  PASS: TestOversizedControlMessageRejectedBeforeRead\n");
 }
 
+namespace {
+struct ScopedTCPPair {
+  TCPInfoPair pair = PrepareTCPEndpoints();
+  ~ScopedTCPPair() {
+    pair.first.first->Close();
+    pair.second.first->Close();
+    delete pair.first.first;
+    delete pair.second.first;
+  }
+};
+
+void RequireDeadline(bool ok, const char* message) {
+  if (!ok) throw std::runtime_error(message);
+}
+
+msgpack::sbuffer EncodeRequest() {
+  MessageAskMemoryRegion request{};
+  request.ekey = "deadline-client";
+  request.id = 7;
+  msgpack::sbuffer body;
+  msgpack::pack(body, request);
+  return body;
+}
+
+// The header consumes 200ms and the body another 400ms. Each phase fits
+// within the configured 500ms budget; their sum does not. Restarting the
+// deadline between header and body would incorrectly accept this frame.
+void TestWholeFrameReadDeadline(bool optOut) {
+  ScopedTCPPair connection;
+  auto& pair = connection.pair;
+  Protocol receiver(pair.second.second);
+  auto body = EncodeRequest();
+  uint32_t len = htonl(static_cast<uint32_t>(body.size()));
+  std::vector<char> bytes{static_cast<char>(MessageType::AskMemoryRegion)};
+  const char* lenBytes = reinterpret_cast<const char*>(&len);
+  bytes.insert(bytes.end(), lenBytes, lenBytes + sizeof(len));
+  bytes.insert(bytes.end(), body.data(), body.data() + body.size());
+  int fd = pair.first.second.fd;
+  std::thread sender([fd, bytes] {
+    auto bodyTick = std::chrono::microseconds(400000 / (bytes.size() - 5));
+    for (size_t i = 0; i < bytes.size(); ++i) {
+      if (i > 0) std::this_thread::sleep_for(i < 5 ? std::chrono::microseconds(50000) : bodyTick);
+      if (send(fd, &bytes[i], 1, MSG_NOSIGNAL) != 1) break;
+    }
+  });
+  auto start = std::chrono::steady_clock::now();
+  bool timedOut = false;
+  bool complete = false;
+  try {
+    auto hdr = receiver.ReadMessageHeader();
+    auto request = receiver.ReadMessageAskMemoryRegion(hdr.len);
+    complete = request.ekey == "deadline-client" && request.id == 7;
+  } catch (const ProtocolError& e) {
+    std::string message = e.what();
+    timedOut = message.find("ReadMessageAskMemoryRegion(body)") != std::string::npos &&
+               message.find("errno=" + std::to_string(ETIMEDOUT)) != std::string::npos;
+  }
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  pair.second.first->CloseEndpoint(pair.second.second);
+  sender.join();
+  printf("  frame elapsed_ms=%lld complete=%d timed_out=%d\n",
+         static_cast<long long>(
+             std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
+         static_cast<int>(complete), static_cast<int>(timedOut));
+  if (optOut) {
+    RequireDeadline(complete && !timedOut, "timeout=0 failed a valid slow frame");
+  } else {
+    RequireDeadline(timedOut && !complete && elapsed < std::chrono::milliseconds(900),
+                    "whole-frame deadline did not bound header + payload read");
+    // A malformed/slow connection must not poison a following connection.
+    ScopedTCPPair healthy;
+    Protocol writer(healthy.pair.first.second), reader(healthy.pair.second.second);
+    MessageAskMemoryRegion request{};
+    request.ekey = "healthy-client";
+    writer.WriteMessageAskMemoryRegion(request);
+    auto hdr = reader.ReadMessageHeader();
+    auto result = reader.ReadMessageAskMemoryRegion(hdr.len);
+    RequireDeadline(result.ekey == "healthy-client", "healthy next Protocol request failed");
+  }
+  printf("  PASS: TestWholeFrameReadDeadline%s\n", optOut ? "OptOut" : "");
+}
+
+// The body-only API remains supported. A completed frame must discard its
+// budget so an idle gap before the next body-only read cannot expire it.
+void TestSequentialBodyOnlyReads() {
+  ScopedTCPPair connection;
+  auto& pair = connection.pair;
+  Protocol receiver(pair.second.second);
+  TCPEndpoint sender(pair.first.second);
+  auto body = EncodeRequest();
+  for (int i = 0; i < 2; ++i) {
+    if (i) std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    RequireDeadline(sender.Send(body.data(), body.size()) == 0, "body-only send failed");
+    auto request = receiver.ReadMessageAskMemoryRegion(body.size());
+    RequireDeadline(request.id == 7, "body-only decode failed");
+  }
+  printf("  PASS: TestSequentialBodyOnlyReads\n");
+}
+}  // namespace
+
 /* -------------------------------------------------------------------------- */
 /*                                    main                                    */
 /* -------------------------------------------------------------------------- */
 
-int main() {
-  printf("Running protocol tests...\n");
-  TestMessageRegEndpointRailId();
-  TestMessageRegEndpointBackwardCompat();
-  TestMessageRegEndpointMsgpackRoundTrip();
-  TestRailAffinityDecisionLogic();
-  TestReadMessageHeaderThrowsOnEof();
-  TestExpectMessageThrowsOnMismatch();
-  TestOversizedControlMessageRejectedBeforeRead();
-  printf("All protocol tests passed.\n");
-  return 0;
+int main(int argc, char** argv) {
+  try {
+    if (argc > 1 && std::strcmp(argv[1], "--deadline-only") == 0) {
+      TestWholeFrameReadDeadline(false);
+      TestSequentialBodyOnlyReads();
+      return 0;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--deadline-opt-out") == 0) {
+      TestWholeFrameReadDeadline(true);
+      return 0;
+    }
+    printf("Running protocol tests...\n");
+    TestMessageRegEndpointRailId();
+    TestMessageRegEndpointBackwardCompat();
+    TestMessageRegEndpointMsgpackRoundTrip();
+    TestRailAffinityDecisionLogic();
+    TestReadMessageHeaderThrowsOnEof();
+    TestExpectMessageThrowsOnMismatch();
+    TestOversizedControlMessageRejectedBeforeRead();
+    printf("All protocol tests passed.\n");
+    return 0;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "FAIL: %s\n", e.what());
+    return 2;
+  }
 }

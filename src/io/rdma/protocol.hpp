@@ -26,9 +26,10 @@
 #include <stdexcept>
 #include <string>
 
+#include "mori/application/transport/tcp/tcp.hpp"
 #include "mori/io/common.hpp"
 #include "mori/io/msgpack_adaptor.hpp"
-#include "src/io/rdma/backend_impl.hpp"
+#include "src/io/rdma/common.hpp"
 
 namespace mori {
 namespace io {
@@ -97,6 +98,7 @@ class Protocol {
 
  private:
   application::TCPEndpoint ep;
+  application::TCPReadDeadline readDeadline;
 };
 
 }  // namespace io

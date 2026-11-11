@@ -22,12 +22,16 @@
 // SOFTWARE.
 #include "mori/application/transport/tcp/tcp.hpp"
 
+#include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <system_error>
 
 #include "mori/application/utils/check.hpp"
@@ -97,6 +101,12 @@ bool ShutdownCloseNoThrow(int fd) noexcept {
 
 }  // namespace
 
+TCPReadDeadline MakeControlPlaneReadDeadline() {
+  int timeoutMs = ReadControlPlaneTimeoutMs();
+  if (timeoutMs == 0) return std::nullopt;
+  return std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           TCPEndpoint                                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -120,16 +130,54 @@ int TCPEndpoint::Send(const void* buf, size_t len) {
 }
 
 int TCPEndpoint::Recv(void* buf, size_t len, size_t* consumed) {
+  return Recv(buf, len, consumed, std::nullopt);
+}
+
+int TCPEndpoint::Recv(void* buf, size_t len, size_t* consumed, const TCPReadDeadline& deadline) {
   char* p = static_cast<char*>(buf);
   size_t got = 0;
+  if (len > 0 && handle.fd < 0) {
+    if (consumed) *consumed = 0;
+    errno = EBADF;
+    return -1;
+  }
   while (len > 0) {
-    ssize_t n = ::recv(handle.fd, p, len, 0);
+    if (deadline) {
+      auto remaining = *deadline - std::chrono::steady_clock::now();
+      if (remaining <= std::chrono::steady_clock::duration::zero()) {
+        if (consumed) *consumed = got;
+        errno = ETIMEDOUT;
+        return -1;
+      }
+      // Round up so a positive sub-millisecond remainder does not busy-poll.
+      auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count() + 1;
+      pollfd pfd{handle.fd, POLLIN, 0};
+      int timeoutMs = static_cast<int>(std::min<int64_t>(timeout, std::numeric_limits<int>::max()));
+      int rc = poll(&pfd, 1, timeoutMs);
+      if (rc < 0 && errno == EINTR) continue;
+      if (rc <= 0 || (pfd.revents & POLLNVAL)) {
+        if (consumed) *consumed = got;
+        if (rc == 0) errno = ETIMEDOUT;
+        if (rc > 0) errno = EBADF;
+        return -1;
+      }
+      if (std::chrono::steady_clock::now() >= *deadline) {
+        if (consumed) *consumed = got;
+        errno = ETIMEDOUT;
+        return -1;
+      }
+      // Read on HUP/ERR too, retaining the normal EOF/socket-error diagnostics.
+    }
+    // Do not change shared fd flags or SO_RCVTIMEO. Only deadline-aware reads
+    // are nonblocking; poll supplies their remaining whole-message budget.
+    ssize_t n = ::recv(handle.fd, p, len, deadline ? MSG_DONTWAIT : 0);
     if (n == 0) {
       if (consumed) *consumed = got;
       return 1;
     }
     if (n < 0) {
       if (errno == EINTR) continue;
+      if (deadline && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
       if (consumed) *consumed = got;
       return -1;
     }
