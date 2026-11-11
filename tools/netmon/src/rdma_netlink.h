@@ -34,9 +34,10 @@ std::vector<uint8_t> BuildStatGetRequest(uint32_t dev_index, uint32_t port, uint
 class RdmaNetlinkSource : public Source {
  public:
   ~RdmaNetlinkSource() override;
-  // Opens the socket and resolves the device; reads the counter names with one query.
-  // Runs before the sampler threads exist (no driver admin wait beyond one STAT_GET).
+  // Opens the socket only. Resolving the device and the first STAT_GET (which also yields
+  // the counter names) happen in Probe(), on the sampler thread under the startup deadline.
   Status Open(const std::string& ibdev, uint32_t port, uint64_t query_timeout_ns);
+  Status Probe(std::string* detail) override;
 
   const char* kind() const override { return "rdma"; }
   const std::vector<std::string>& names() const override { return names_; }
@@ -48,6 +49,7 @@ class RdmaNetlinkSource : public Source {
   Status ResolveDevIndex(const std::string& ibdev, uint32_t* index);
 
   int fd_ = -1;
+  std::string ibdev_;
   uint32_t dev_index_ = 0;
   uint32_t port_ = 1;
   uint32_t seq_ = 1;

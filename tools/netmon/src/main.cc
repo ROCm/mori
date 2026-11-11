@@ -84,7 +84,10 @@ int CmdList(int argc, char** argv) {
     Row r{n};
     if (!n.ibdev.empty()) {
       RdmaNetlinkSource s;
-      if (s.Open(n.ibdev, 1, kNetlinkTimeoutNs).ok()) r.rdma = static_cast<int>(s.names().size());
+      std::string detail;
+      if (s.Open(n.ibdev, 1, kNetlinkTimeoutNs).ok() && s.Probe(&detail).ok()) {
+        r.rdma = static_cast<int>(s.names().size());
+      }
     }
     EthtoolSource e;
     if (e.Open(n.netdev).ok()) r.eth = static_cast<int>(e.names().size());

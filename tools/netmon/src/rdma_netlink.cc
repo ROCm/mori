@@ -181,14 +181,22 @@ Status RdmaNetlinkSource::Open(const std::string& ibdev, uint32_t port, uint64_t
   if (bind(fd_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
     return Status::Errno("bind(NETLINK_RDMA)", errno);
   }
-  Status st = ResolveDevIndex(ibdev, &dev_index_);
+  ibdev_ = ibdev;
+  return Status::Ok();  // no query here: the first one runs in Probe(), under supervision
+}
+
+Status RdmaNetlinkSource::Probe(std::string* detail) {
+  Status st = ResolveDevIndex(ibdev_, &dev_index_);
   if (!st.ok()) return st;
   size_t count = 0;
   std::vector<uint64_t> tmp(1024);
-  st = Exchange(&names_, tmp.data(), tmp.size(), &count);
+  std::vector<std::string> names;
+  st = Exchange(&names, tmp.data(), tmp.size(), &count);
   if (!st.ok()) return st;
-  if (names_.empty()) return Status::Error(ibdev + ": STAT_GET returned no hw counters");
-  if (count > tmp.size()) return Status::Error(ibdev + ": too many hw counters");
+  if (names.empty()) return Status::Error(ibdev_ + ": STAT_GET returned no hw counters");
+  if (count > tmp.size()) return Status::Error(ibdev_ + ": too many hw counters");
+  names_ = std::move(names);
+  *detail = std::to_string(names_.size()) + " counters";
   return Status::Ok();
 }
 
@@ -260,10 +268,10 @@ Status RdmaNetlinkSource::ResolveDevIndex(const std::string& ibdev, uint32_t* in
 
 Status RdmaNetlinkSource::Exchange(std::vector<std::string>* names, uint64_t* vals, size_t max_vals,
                                    size_t* count) {
+  const uint64_t deadline = MonoNs() + timeout_ns_;
   const uint32_t seq = ++seq_;
   std::vector<uint8_t> req = nl::BuildStatGetRequest(dev_index_, port_, seq);
   if (send(fd_, req.data(), req.size(), 0) < 0) return Status::Errno("netlink send", errno);
-  const uint64_t deadline = MonoNs() + timeout_ns_;
   for (;;) {
     uint64_t now = MonoNs();
     if (now >= deadline) return Status::Error("netlink STAT_GET timed out");
@@ -291,6 +299,7 @@ Status RdmaNetlinkSource::Exchange(std::vector<std::string>* names, uint64_t* va
 }
 
 Status RdmaNetlinkSource::Query(uint64_t* out) {
+  if (names_.empty()) return Status::Error("rdma source queried before Probe()");
   size_t count = 0;
   Status st = Exchange(nullptr, out, names_.size(), &count);
   if (!st.ok()) return st;

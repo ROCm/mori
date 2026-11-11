@@ -21,6 +21,7 @@
 #include "harness.h"
 #include "privilege.h"
 #include "recorder.h"
+#include "util.h"
 #include "writer.h"
 
 using namespace netmon;
@@ -126,6 +127,19 @@ ssize_t FailAfterBudget(int fd, const void* p, size_t n) {
   if (static_cast<long>(n) > left) n = static_cast<size_t>(left);  // short write, then ENOSPC
   return ::write(fd, p, n);
 }
+// Blocks only the second write to meta.json.tmp (the final meta); records and the initial
+// meta are written normally.
+std::atomic<int> g_meta_writes{0};
+ssize_t BlockFinalMeta(int fd, const void* p, size_t n) {
+  char link[64], target[512];
+  snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+  ssize_t len = readlink(link, target, sizeof(target) - 1);
+  if (len > 0) {
+    target[len] = 0;
+    if (std::strstr(target, "meta.json.tmp") && g_meta_writes.fetch_add(1) >= 1) BlockForever();
+  }
+  return ::write(fd, p, n);
+}
 std::atomic<int> g_calls_before_block{0};
 ssize_t BlockAfterCalls(int fd, const void* p, size_t n) {
   if (g_calls_before_block.fetch_sub(1) <= 0) BlockForever();
@@ -159,6 +173,7 @@ void InstallEnospc() {
   g_budget = 12000;  // the lock and the initial meta fit, then ENOSPC partway through records
   Writer::write_fn = FailAfterBudget;
 }
+void InstallBlockingFinalMeta() { Writer::write_fn = BlockFinalMeta; }
 void InstallBlockingWrites() {
   g_calls_before_block = 6;  // lock, meta and a few batches, then every write blocks
   Writer::write_fn = BlockAfterCalls;
@@ -180,6 +195,7 @@ const std::map<std::string, ChildCase>& Cases() {
       {"enospc_and_stuck",
        {{{"rdma", Mode::kOk}, {"ipc", Mode::kStuckInQuery, 5}}, 2000000000ull, InstallEnospc}},
       {"writer_blocks", {{{"rdma", Mode::kOk}}, 300000000ull, InstallBlockingWrites}},
+      {"final_meta_blocks", {{{"rdma", Mode::kOk}}, 300000000ull, InstallBlockingFinalMeta}},
   };
   return cases;
 }
@@ -336,4 +352,26 @@ TEST(RecorderWriterBlocks) {
   auto dir = tmp.path() + "/run";
   int code = RunCase("writer_blocks", dir);
   CHECK_EQ(code, 3);
+}
+
+TEST(RecorderSigintDuringStuckProbe) {
+  // Cancelling while a probe is stuck must not turn into an unbounded join: it ends after the
+  // probe deadline with exit code 1 and removes what this run created.
+  TempDir tmp;
+  auto dir = tmp.path() + "/run";
+  const uint64_t t0 = MonoNs();
+  int code = RunCase("stuck_probe", dir, 200);
+  CHECK_EQ(code, 1);
+  CHECK(MonoNs() - t0 < 20000000000ull);
+  CHECK(!Exists(dir));
+}
+
+TEST(RecorderFinalMetaBlocks) {
+  TempDir tmp;
+  auto dir = tmp.path() + "/run";
+  int code = RunCase("final_meta_blocks", dir);
+  CHECK_EQ(code, 3);
+  // The records were all written; only the final meta is missing (still "running").
+  CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
+  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"running\"") != std::string::npos);
 }

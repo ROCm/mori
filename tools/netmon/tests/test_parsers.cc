@@ -166,6 +166,16 @@ TEST(IpcConsistencyVerdicts) {
   CHECK(r.verdict == ipc::Consistency::kInsufficient);
   CHECK(r.looks_like_reset);
 
+  // Few comparable fields, but one goes backwards: a contradiction outranks too little
+  // evidence.
+  std::vector<uint64_t> few_eth(ipc::kKnownFields, 0), few_live(ipc::kWords, 0);
+  few_eth[0] = 1000;
+  few_eth[4] = 5000;
+  few_live[0] = 1000;
+  few_live[4] = 4000;  // octets_rx_ok behind, but not collapsed
+  r = ipc::CheckConsistency(few_live.data(), eth_names, few_eth.data());
+  CHECK(r.verdict == ipc::Consistency::kFail);
+
   // New card, all-zero ethtool copy: nothing to compare.
   std::vector<uint64_t> zeros(ipc::kKnownFields, 0);
   r = ipc::CheckConsistency(live.data(), eth_names, zeros.data());

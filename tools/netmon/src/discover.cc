@@ -86,9 +86,10 @@ Status DiscoverNics(std::vector<Nic>* out, const std::string& root) {
     }
     std::string s;
     if (ReadTextFile(net + "/" + ifname + "/speed", &s)) {
+      const std::string text = Trim(s);  // must outlive `end`
       char* end = nullptr;
-      long long v = strtoll(Trim(s).c_str(), &end, 10);
-      if (end && *end == '\0') n.speed_mbps = v;
+      long long v = strtoll(text.c_str(), &end, 10);
+      if (!text.empty() && end && *end == '\0') n.speed_mbps = v;
     }
     if (ReadTextFile(root + "/sys/module/ionic/version", &s)) n.driver_version = Trim(s);
     if (root.empty()) {

@@ -94,7 +94,6 @@ class Writer {
   std::vector<uint64_t> bytes_ok_;
   struct Rate {
     uint64_t t0 = 0, tx0 = 0, rx0 = 0, t = 0, tx = 0, rx = 0;
-    double peak_tx = 0, peak_rx = 0;
     bool have = false;
   };
   std::vector<Rate> rates_;

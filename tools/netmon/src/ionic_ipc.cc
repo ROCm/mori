@@ -185,16 +185,16 @@ ConsistencyResult CheckConsistency(const uint64_t* ipc_vals,
                                 std::to_string(e));
     }
   }
-  if (r.compared < 4) {
-    r.verdict = Consistency::kInsufficient;
-  } else if (r.behind == 0) {
-    r.verdict = Consistency::kPass;
-  } else if (reset_like == r.behind) {
+  if (r.behind > 0 && reset_like == r.behind) {
     // Everything that went backwards collapsed: counters were cleared, not misaligned.
     r.looks_like_reset = true;
     r.verdict = Consistency::kInsufficient;
+  } else if (r.behind > 0) {
+    r.verdict = Consistency::kFail;  // a contradiction outranks too little evidence
+  } else if (r.compared < 4) {
+    r.verdict = Consistency::kInsufficient;
   } else {
-    r.verdict = Consistency::kFail;
+    r.verdict = Consistency::kPass;
   }
   return r;
 }
@@ -223,8 +223,9 @@ Status IonicIpcSource::Probe(std::string* detail) {
   if (!st.ok()) return st;
   ipc::ConsistencyResult r = ipc::CheckConsistency(iv.data(), eth_->names(), ev.data());
   *detail = "consistency " + r.Summary();
-  if (r.verdict == ipc::Consistency::kFail) {
-    return Status::Error("ipc layout check failed: " + r.Summary());
+  // Design §5.2: ipc is enabled only when the check passes (insufficient evidence included).
+  if (r.verdict != ipc::Consistency::kPass) {
+    return Status::Error("ipc consistency check did not pass: " + r.Summary());
   }
   return Status::Ok();
 }

@@ -227,10 +227,12 @@ void Writer::WriteBatch(const Batch& b) {
     if (w < 0 && errno == EINTR) continue;
     if (w <= 0) {
       const int err = w < 0 ? errno : EIO;
+      // Publish the failure first: the truncate below may itself block (NFS), and the main
+      // thread must still see the failure and start its supervised shutdown.
+      SetFailed("write " + streams_[i].file + ": " + std::strerror(err));
       // Keep only whole records so the file stays a valid prefix.
       const uint64_t keep = (bytes_ok_[i] + done) / rec_bytes * rec_bytes;
       if (ftruncate(fds_[i], static_cast<off_t>(keep)) == 0) bytes_ok_[i] = keep;
-      SetFailed("write " + streams_[i].file + ": " + std::strerror(err));
       return;
     }
     done += static_cast<size_t>(w);
@@ -246,13 +248,11 @@ void Writer::Summary(const Batch& b) {
     Rate& r = rates_[i];
     for (size_t k = 0; k < b.count; k++) {
       const uint64_t* rec = b.Record(k);
-      const uint64_t t = rec[0] / 2 + rec[1] / 2;
+      // Request end time; over a ~1 s window its error (< one request) is negligible.
+      // Per-sample peaks are left to the offline report, which applies the trusted-sample
+      // rule (design §7.4); a console peak from raw neighbours would show false spikes.
+      const uint64_t t = rec[1];
       const uint64_t tx = rec[4 + ws.key_tx], rx = rec[4 + ws.key_rx];
-      if (r.have && t > r.t && tx >= r.tx && rx >= r.rx) {
-        const double dt = static_cast<double>(t - r.t);
-        r.peak_tx = std::max(r.peak_tx, static_cast<double>(tx - r.tx) * 8 / dt);
-        r.peak_rx = std::max(r.peak_rx, static_cast<double>(rx - r.rx) * 8 / dt);
-      }
       if (!r.have || tx < r.tx || rx < r.rx) {  // first sample or counter reset
         r.t0 = t;
         r.tx0 = tx;
@@ -273,17 +273,16 @@ void Writer::Summary(const Batch& b) {
     if (!r.have || r.t <= r.t0) continue;
     const double dt = static_cast<double>(r.t - r.t0);
     char buf[160];
-    snprintf(buf, sizeof(buf), "%s tx %.1f/%.1f rx %.1f/%.1f", streams_[j].label.c_str(),
-             static_cast<double>(r.tx - r.tx0) * 8 / dt, r.peak_tx,
-             static_cast<double>(r.rx - r.rx0) * 8 / dt, r.peak_rx);
+    snprintf(buf, sizeof(buf), "%s tx %.1f rx %.1f", streams_[j].label.c_str(),
+             static_cast<double>(r.tx - r.tx0) * 8 / dt,
+             static_cast<double>(r.rx - r.rx0) * 8 / dt);
     if (!line.empty()) line += " | ";
     line += buf;
     r.t0 = r.t;
     r.tx0 = r.tx;
     r.rx0 = r.rx;
-    r.peak_tx = r.peak_rx = 0;
   }
-  if (!line.empty()) fprintf(stderr, "[Gb/s avg/peak] %s\n", line.c_str());
+  if (!line.empty()) fprintf(stderr, "[Gb/s, ~1 s average] %s\n", line.c_str());
 }
 
 Status Writer::WriteMetaAtomic(const std::string& text) {

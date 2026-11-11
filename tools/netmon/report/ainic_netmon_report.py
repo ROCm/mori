@@ -88,7 +88,12 @@ class Stream:
         """(t_mono ns float64, wall ns float64 with NaN where uncertain, slow mask)."""
         if self._times is None:
             self._times = sample_times(self.rec, self.f)
-        return self._times
+        return self._times[:3]
+
+    def segments(self):
+        """Wall-clock segment id per sample (-1: alignment uncertain)."""
+        self.times()
+        return self._times[3]
 
 
 class Run:
@@ -132,18 +137,25 @@ class Run:
 def sample_times(rec, f):
     if len(rec) == 0:
         e = np.zeros(0)
-        return e, e, np.zeros(0, dtype=bool)
+        return e, e, np.zeros(0, dtype=bool), np.zeros(0, dtype=np.int64)
     t0 = rec[:, 0].astype(np.int64)
     t1 = rec[:, 1].astype(np.int64)
     rtt = (t1 - t0).astype(np.float64)
     med = float(np.median(rtt))
     slow = rtt > SLOW_FACTOR * med if med > 0 else np.zeros(len(rtt), dtype=bool)
     t = t0 + f * rtt  # for slow samples this is only a nominal time (see module doc)
-    return t, wall_times(rec, t), slow
+    wall, seg = wall_times(rec, t)
+    return t, wall, slow, seg
 
 
 def wall_times(rec, t_mono):
-    """Map monotonic sample times to wall clock with clock-step segmentation."""
+    """Map monotonic sample times to wall clock with clock-step segmentation.
+
+    Returns (wall ns, segment id). Record i's anchor is read just *before* its query, and the
+    snapshot happens inside the query, so sample i lies between its own anchor and the next
+    trusted anchor after it. If those two anchors are in different segments (a clock step in
+    between), the sample's wall time is uncertain: wall = NaN, segment = -1.
+    """
     n = len(rec)
     t0 = rec[:, 0].astype(np.float64)
     real = rec[:, 2].astype(np.float64)
@@ -151,26 +163,22 @@ def wall_times(rec, t_mono):
     off = real - (t0 - err / 2.0)
     good = np.flatnonzero(err <= ANCHOR_MAX_ERR_NS)
     if len(good) == 0:
-        return np.full(n, np.nan)
+        return np.full(n, np.nan), np.full(n, -1, dtype=np.int64)
     steps = np.abs(np.diff(off[good])) > CLOCK_STEP_NS
-    seg_of_good = np.concatenate([[0], np.cumsum(steps)])
-    seg = np.full(n, -1, dtype=np.int64)
-    # Each sample takes the segment of the trusted anchors around it; if they differ, a clock
-    # step happened in between and its alignment is uncertain.
-    pos = (
-        np.searchsorted(good, np.arange(n), side="right") - 1
-    )  # last trusted anchor <= i
-    prev_seg = np.where(pos >= 0, seg_of_good[np.clip(pos, 0, None)], seg_of_good[0])
-    nxt = np.clip(pos + 1, 0, len(good) - 1)
-    next_seg = np.where(pos + 1 < len(good), seg_of_good[nxt], seg_of_good[-1])
-    is_anchor = np.zeros(n, dtype=bool)
-    is_anchor[good] = True
-    seg = np.where(is_anchor | (prev_seg == next_seg), prev_seg, -1)
-    seg[good] = seg_of_good
+    seg_of_good = np.concatenate([[0], np.cumsum(steps)]).astype(np.int64)
+    idx = np.arange(n)
+    before = np.searchsorted(good, idx, side="right") - 1  # last trusted anchor <= i
+    after = before + 1  # first trusted anchor > i
+    has_before = before >= 0
+    has_after = after < len(good)
+    seg_before = seg_of_good[np.clip(before, 0, len(good) - 1)]
+    seg_after = seg_of_good[np.clip(after, 0, len(good) - 1)]
+    seg = np.where(has_before, seg_before, seg_after)
+    seg = np.where(has_before & has_after & (seg_before != seg_after), -1, seg)
     nseg = int(seg_of_good[-1]) + 1
     seg_off = np.array([np.median(off[good][seg_of_good == k]) for k in range(nseg)])
     wall = np.where(seg >= 0, t_mono + seg_off[np.clip(seg, 0, None)], np.nan)
-    return wall
+    return wall, seg
 
 
 # --------------------------------------------------------------------------- rates and stats
@@ -181,22 +189,28 @@ class Rates:
 
     def __init__(self, stream, name):
         t, wall, slow = stream.times()
+        seg = stream.segments()
         v = stream.col(name)
         self.name = name
-        if v is not None:  # imprecise (slow) samples are skipped, see module doc
-            keep = ~slow
-            t, wall, v = t[keep], wall[keep], np.asarray(v)[keep]
+        resets_between = None
+        if v is not None:
+            v = np.asarray(v)
+            # Counter resets are found on the full series first, so dropping an imprecise
+            # sample can never bridge over a reset (e.g. 1000 -> [0] -> 1200 is not +200).
+            dec = np.concatenate([[0], np.cumsum(v[1:] < v[:-1])])
+            keep = ~slow  # imprecise (slow) samples are skipped, see module doc
+            t, wall, seg, v, dec = t[keep], wall[keep], seg[keep], v[keep], dec[keep]
+            resets_between = np.diff(dec) > 0
         n = 0 if v is None else len(v)
         if n < 2:
             z = np.zeros(0)
             self.t_start = self.t_end = self.w_start = self.w_end = self.rate = (
                 self.dv
             ) = self.dt = z
-            self.valid = self.lowres = np.zeros(0, dtype=bool)
+            self.valid = self.lowres = self.local_valid = np.zeros(0, dtype=bool)
             return
-        v = np.asarray(v)
         later, earlier = v[1:], v[:-1]
-        ok = later >= earlier  # compare before subtracting (u64)
+        ok = (later >= earlier) & ~resets_between  # compare before subtracting (u64)
         dv = np.where(ok, later - np.where(ok, earlier, later), 0).astype(np.float64)
         dt = np.diff(t)
         valid = ok & (dt > 0)
@@ -207,7 +221,13 @@ class Rates:
         self.t_start, self.t_end = t[:-1], t[1:]
         self.w_start, self.w_end = wall[:-1], wall[1:]
         self.dv, self.dt = dv, dt
-        self.valid = valid & np.isfinite(self.w_start) & np.isfinite(self.w_end)
+        # Local validity (monotonic rate is meaningful) vs wall-clock validity (both ends in
+        # the same clock segment): display and windowed stats need both.
+        self.local_valid = valid
+        same_seg = (seg[:-1] == seg[1:]) & (seg[:-1] >= 0)
+        self.valid = (
+            valid & same_seg & np.isfinite(self.w_start) & np.isfinite(self.w_end)
+        )
         self.lowres = (
             self.valid & (dt > LOWRES_FACTOR * base)
             if base > 0
@@ -258,26 +278,35 @@ def series_stats(r, w0, w1, scale, threshold=None):
 
 
 def peak_over_window(r, mask, scale):
-    """Max rate over 10 ms windows that lie entirely in normal-resolution coverage."""
+    """Max rate over 10 ms windows lying entirely in normal-resolution coverage.
+
+    Only runs of contiguous usable intervals that are each shorter than the window can resolve
+    10 ms; coarser runs give no 10 ms peak (an interval average is not a 10 ms rate).
+    Windows step by half a window and always include the one ending at the run's end.
+    """
     idx = np.flatnonzero(mask)
     if len(idx) == 0:
         return float("nan")
-    # Contiguous runs of usable intervals.
     breaks = np.flatnonzero(np.diff(idx) != 1)
     starts = np.concatenate([[0], breaks + 1])
     ends = np.concatenate([breaks + 1, [len(idx)]])
     best = float("nan")
     for a, b in zip(starts, ends):
         ii = idx[a:b]
+        if r.dt[ii].max() > PEAK_WINDOW_NS:
+            continue
         t = np.concatenate([[r.t_start[ii[0]]], r.t_end[ii]])
         c = np.concatenate([[0.0], np.cumsum(r.dv[ii])])
-        if t[-1] - t[0] < PEAK_WINDOW_NS:
+        last = t[-1] - PEAK_WINDOW_NS
+        if last < t[0]:
             continue
-        g = np.arange(t[0], t[-1], PEAK_WINDOW_NS / 2)  # 50% overlapping windows
-        if len(g) < 3:
-            continue
-        cg = np.interp(g, t, c)
-        rr = (cg[2:] - cg[:-2]) / PEAK_WINDOW_NS * 1e9 * scale
+        g = np.unique(np.append(np.arange(t[0], last, PEAK_WINDOW_NS / 2), last))
+        rr = (
+            (np.interp(g + PEAK_WINDOW_NS, t, c) - np.interp(g, t, c))
+            / PEAK_WINDOW_NS
+            * 1e9
+            * scale
+        )
         m = float(rr.max())
         best = m if np.isnan(best) else max(best, m)
     return best
@@ -522,6 +551,7 @@ class DiffRates(Rates):
         self.__dict__.update(a.__dict__)
         self.name = "diff"
         self.valid = a.valid & b.valid
+        self.local_valid = a.local_valid & b.local_valid
         self.lowres = a.lowres | b.lowres
         self.dv = np.where(self.valid, a.dv - b.dv, 0.0)
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -635,6 +665,26 @@ def parse_window(spec, w0, w1):
     return s, e
 
 
+def plotted_streams(runs, roles, nics):
+    """(stream, number of curves drawn from it) for everything the report will plot."""
+    out = []
+    for r in runs:
+        role = roles.get(r.host, r.role)
+        for s in r.streams:
+            if (
+                (nics and s.netdev not in nics)
+                or s.source not in ("rdma", "ipc")
+                or not len(s.rec)
+            ):
+                continue
+            if s.source == "rdma":
+                n = 2 + len(CONGESTION) + (2 if role in ("P", "D") else 0)
+            else:
+                n = 2 + len(PALETTE)  # wire tx/rx + at most one palette of PFC counters
+            out.append((s, n))
+    return out
+
+
 def cmd_report(args):
     try:
         import plotly  # noqa: F401
@@ -691,15 +741,8 @@ def cmd_report(args):
         w0, w1 = parse_window(args.window, w0, w1)
         mode = "detail"
     figs, rows = [], []
-    nseries = 0
-    for r in runs:
-        role = roles.get(r.host, r.role)
-        for nd in r.netdevs():
-            if args.nics and nd not in args.nics:
-                continue
-            for s in r.streams:
-                if s.netdev == nd and s.source in ("rdma", "ipc"):
-                    nseries += 2 + (len(CONGESTION) if s.source == "rdma" else 8)
+    plotted = plotted_streams(runs, roles, args.nics)
+    nseries = sum(n for _, n in plotted)
     bins = args.bins
     if mode == "overview":
         # Budget: ~3 traces x bins points per series, ~25 bytes per point in the HTML.
@@ -711,13 +754,9 @@ def cmd_report(args):
             bins = max(max_bins, 50)
     else:
         npts = 0
-        for r in runs:
-            for s in r.streams:
-                if s.source in ("rdma", "ipc") and len(s.rec):
-                    w = s.times()[1]
-                    npts += int(np.sum((w >= w0) & (w <= w1))) * (
-                        2 + (len(CONGESTION) if s.source == "rdma" else 8)
-                    )
+        for s, ncurves in plotted:  # same NIC filter and curve count as the plots
+            w = s.times()[1]
+            npts += int(np.sum((w >= w0) & (w <= w1))) * ncurves
         if npts > args.max_points:
             raise SystemExit(
                 f"--window selects ~{npts} points (limit {args.max_points}); choose a smaller window or --nics"

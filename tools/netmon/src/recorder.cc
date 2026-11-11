@@ -1,5 +1,6 @@
 #include "recorder.h"
 
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/utsname.h>
@@ -140,9 +141,20 @@ int WaitSignal(const sigset_t& set, uint64_t timeout_ns) {
   return sig > 0 ? sig : 0;
 }
 
-[[noreturn]] void HardExit(int code) {
-  fflush(stdout);
-  fflush(stderr);
+// Best-effort message for paths where a thread (e.g. the writer printing its summary) may hold
+// the stderr FILE lock or stderr may be a full pipe: no stdio, no blocking.
+void RawErr(const std::string& msg) {
+  pollfd p{STDERR_FILENO, POLLOUT, 0};
+  if (poll(&p, 1, 0) == 1 && (p.revents & POLLOUT)) {
+    ssize_t ignored = write(STDERR_FILENO, msg.data(), msg.size());
+    (void)ignored;
+  }
+}
+
+// Exit while other threads may still be stuck inside driver or filesystem calls: no
+// destructors, no stdio flushing (which could wait on a lock held by a stuck thread).
+[[noreturn]] void HardExit(int code, const std::string& msg = "") {
+  if (!msg.empty()) RawErr(msg);
   _exit(code);
 }
 
@@ -172,9 +184,8 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
   // ---- output directory and lock (writer thread) ----
   writer->RequestPrepare();
   if (!writer->Wait(MonoNs() + opt->io_timeout_ns, &st)) {
-    fprintf(stderr, "error: preparing %s timed out (filesystem not responding)\n",
-            opt->out_dir.c_str());
-    HardExit(kExitSetup);
+    HardExit(kExitSetup,
+             "error: preparing " + opt->out_dir + " timed out (filesystem not responding)\n");
   }
   auto abort_writer = [&](const char* why) {
     if (why) fprintf(stderr, "error: %s\n", why);
@@ -210,6 +221,24 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
     }
     if (MonoNs() >= probe_deadline) break;
   }
+  if (interrupted) {
+    // Cancel: ready probes give up now; probes still running keep their original deadline,
+    // so a probe stuck in an uninterruptible call cannot turn the cancel into an endless join.
+    {
+      std::lock_guard<std::mutex> lk(ctl->mu);
+      ctl->cmd = Command::kAbandon;
+      ctl->cv.notify_all();
+    }
+    for (;;) {
+      bool pending = false;
+      {
+        std::lock_guard<std::mutex> lk(ctl->mu);
+        for (auto& s : all) pending |= s->probe == ProbeState::kPending;
+      }
+      if (!pending || MonoNs() >= probe_deadline) break;
+      SleepNs(50000000ull);
+    }
+  }
 
   std::vector<Stream*> final_streams;
   std::string abort_reason;
@@ -217,12 +246,9 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
     std::lock_guard<std::mutex> lk(ctl->mu);
     for (auto& s : all) {
       if (s->probe == ProbeState::kPending) {
-        if (!interrupted) {
-          fprintf(stderr, "error: %s.%s did not answer its startup probe within %s\n",
-                  s->netdev.c_str(), s->src->kind(),
-                  FormatDurationNs(opt->probe_timeout_ns).c_str());
-          abort_reason = "stuck";
-        }
+        fprintf(stderr, "error: %s.%s did not answer its startup probe within %s\n",
+                s->netdev.c_str(), s->src->kind(), FormatDurationNs(opt->probe_timeout_ns).c_str());
+        abort_reason = "stuck";
       } else if (s->probe == ProbeState::kFailed) {
         if (s->required) {
           fprintf(stderr, "error: %s.%s: %s\n", s->netdev.c_str(), s->src->kind(),
@@ -244,9 +270,17 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
   if (abort_reason == "stuck") {
     // A thread is inside a driver call we cannot interrupt: clean up and leave without
     // destroying anything it may still use.
+    {
+      std::lock_guard<std::mutex> lk(ctl->mu);
+      ctl->cmd = Command::kAbandon;  // let the probes that did answer leave
+      ctl->cv.notify_all();
+    }
     writer->RequestAbort();
     Status ignored;
     if (writer->Wait(MonoNs() + 5000000000ull, &ignored)) writer->Join();
+    for (auto& s : all) {  // probes that answered have left by now; only stuck ones remain
+      if (s->exited.load() && s->thread.joinable()) s->thread.join();
+    }
     HardExit(kExitSetup);
   }
   if (interrupted) abort_reason = "interrupted during startup";
@@ -316,8 +350,7 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
   mc.start_mono = MonoNs();
   writer->RequestCreate(ws, BuildMeta(mc, "running", ""));
   if (!writer->Wait(MonoNs() + opt->io_timeout_ns, &st)) {
-    fprintf(stderr, "error: creating output files timed out (filesystem not responding)\n");
-    HardExit(kExitSetup);
+    HardExit(kExitSetup, "error: creating output files timed out (filesystem not responding)\n");
   }
   if (!st.ok()) {
     abandon_all();
@@ -392,8 +425,9 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
       s->thread.join();
     } else {
       mc.abandoned.push_back(s->file());
-      fprintf(stderr, "warning: %s.%s did not stop within %s (stuck in a driver call)\n",
-              s->netdev.c_str(), s->src->kind(), FormatDurationNs(opt->stop_timeout_ns).c_str());
+      // The writer may be printing (and stderr may be a full pipe): no stdio before it is done.
+      RawErr("warning: " + s->netdev + "." + s->src->kind() + " did not stop within " +
+             FormatDurationNs(opt->stop_timeout_ns) + " (stuck in a driver call)\n");
     }
   }
   bool all_errored = true;
@@ -416,6 +450,11 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
   });
   const bool finished = writer->Wait(MonoNs() + opt->io_timeout_ns, &st);
 
+  if (!finished) {
+    // The writer is stuck (e.g. in an NFS write or its console output): touch no stdio.
+    HardExit(kExitWriteFailed, "error: finalising the recording timed out\n");
+  }
+  writer->Join();  // done: its stdio use is over, so printing below cannot block on it
   for (size_t i = 0; i < final_streams.size(); i++) {
     const auto& x = mc.stats[i];
     fprintf(stderr, "%s: samples %llu, missed %llu, dropped %llu, errors %llu, max rtt %.1f us%s\n",
@@ -428,17 +467,16 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
   }
 
   int code = kExitOk;
-  if (!finished || writer->failed()) {
+  if (writer->failed()) {
     code = kExitWriteFailed;
-    fprintf(stderr, "error: %s\n",
-            finished ? writer->error().c_str() : "finalising the recording timed out");
+    fprintf(stderr, "error: %s\n", writer->error().c_str());
   } else if (!mc.abandoned.empty()) {
     code = kExitAbandoned;
   } else if (all_errored) {
     code = kExitAllStreamsFailed;
   }
-  if (!finished || !mc.abandoned.empty()) {
-    if (finished) writer->Join();  // the writer is done; only stuck samplers remain
+  if (!mc.abandoned.empty()) {
+    fflush(stderr);  // only our own output now; stuck samplers never touch stdio
     HardExit(code);
   }
   delete writer;
