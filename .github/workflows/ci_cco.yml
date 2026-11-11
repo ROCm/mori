@@ -261,6 +261,13 @@ jobs:
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
 
+      - name: Run SdmaAllGatherOp tests (spawn, 2/4/8 GPUs)
+        if: contains(fromJSON(inputs.groups), 'cco')
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd /tmp && \
+            timeout 600 python -m pytest -v $GITHUB_WORKSPACE/tests/python/cco/test_sdma_allgather_op.py"
+
       - name: Run CCO FlyDSL buffer cache-policy check
         if: contains(fromJSON(inputs.groups), 'cco')
         run: |
