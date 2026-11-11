@@ -23,10 +23,12 @@
 // Test tool: replays records through LiveRates and prints what it emits, so the Python tests
 // (test_live.py) and the live-vs-import comparison can check it against the offline Rates.
 //
-//   netmon_live_replay INTERVAL_NS SNAPSHOT_FRACTION COUNTERS OPTIONAL_MASK PENDING_CAP
+//   netmon_live_replay INTERVAL_NS SNAPSHOT_FRACTION COUNTERS OPTIONAL_MASK PENDING_CAP [IPC]
+//     IPC = 1: apply the IPC read-anomaly rule (as the live push does for ipc streams)
 //     stdin:  u64le records [t0, t1, real, real_err, v0 .. v(COUNTERS-1)]
 //     stdout: "I,c,low,end_ms,rate,increase,dt_s" / "G,c,clock,end_ms,dt_s" lines (%.17g),
-//             then "S,samples,unconfirmed_dropped,clock_back,ms_merged,gaps_dropped,baseline_ns"
+//             then
+//             "S,samples,unconfirmed_dropped,clock_back,ms_merged,gaps_dropped,baseline_ns,glitches"
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -50,7 +52,7 @@ class Printer : public netmon::LiveSink {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 6) {
+  if (argc != 6 && argc != 7) {
     fprintf(stderr, "usage: %s INTERVAL_NS F COUNTERS OPTIONAL_MASK PENDING_CAP < records\n",
             argv[0]);
     return 2;
@@ -62,7 +64,8 @@ int main(int argc, char** argv) {
   const size_t cap = strtoull(argv[5], nullptr, 10);
   std::vector<bool> optional(n, false);
   for (size_t c = 0; c < n && c < mask.size(); c++) optional[c] = mask[c] == '1';
-  netmon::LiveRates lr(interval, f, n, optional, cap);
+  const bool ipc = argc == 7 && argv[6][0] == '1';
+  netmon::LiveRates lr(interval, f, n, optional, cap, ipc);
   Printer p;
   std::vector<uint64_t> rec(4 + n);
   while (fread(rec.data(), sizeof(uint64_t), rec.size(), stdin) == rec.size()) {
@@ -70,10 +73,11 @@ int main(int argc, char** argv) {
   }
   lr.Finish(&p);
   const auto& st = lr.stats();
-  printf("S,%llu,%llu,%llu,%llu,%llu,%.17g\n", static_cast<unsigned long long>(st.samples),
+  printf("S,%llu,%llu,%llu,%llu,%llu,%.17g,%llu\n", static_cast<unsigned long long>(st.samples),
          static_cast<unsigned long long>(st.unconfirmed_dropped),
          static_cast<unsigned long long>(st.clock_back_intervals),
          static_cast<unsigned long long>(st.ms_merged),
-         static_cast<unsigned long long>(st.gaps_dropped), lr.BaselineNs());
+         static_cast<unsigned long long>(st.gaps_dropped), lr.BaselineNs(),
+         static_cast<unsigned long long>(st.glitches));
   return 0;
 }

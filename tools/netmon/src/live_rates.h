@@ -72,6 +72,7 @@ struct LiveStats {
   uint64_t clock_back_intervals = 0;  // dropped while paused after a backward step (§3.4)
   uint64_t ms_merged = 0;             // samples folded into the next interval (§3.4)
   uint64_t gaps_dropped = 0;          // gap points whose ms timestamp did not advance
+  uint64_t glitches = 0;              // IPC read anomalies skipped (per counter value)
 };
 
 class LiveRates {
@@ -83,8 +84,9 @@ class LiveRates {
   static constexpr int64_t kClockStepNs = 1000000;
 
   // `optional[c]`: counter c is emitted only from its first change on (§3.5).
+  // `read_anomalies`: apply the IPC read-anomaly rule (offline glitch_mask; IPC streams only).
   LiveRates(uint64_t interval_ns, double snapshot_fraction, size_t counters,
-            std::vector<bool> optional, size_t pending_cap);
+            std::vector<bool> optional, size_t pending_cap, bool read_anomalies = false);
 
   // rec = [t0_mono, t1_mono, real, real_err, v0 .. v(counters-1)].
   void Add(const uint64_t* rec, LiveSink* sink);
@@ -110,6 +112,8 @@ class LiveRates {
     bool optional = false, active = true;
     bool have_raw = false;
     uint64_t raw = 0, first = 0;
+    bool have_prev_any = false;  // the raw value of the previous sample, anomalies included
+    uint64_t prev_any = 0;
     bool reset_pending = false;
     bool have_base = false;
     double base_t = 0, base_wall = 0;
@@ -123,16 +127,19 @@ class LiveRates {
   };
 
   void Confirm(Sample& s, LiveSink* sink);
-  void Step(const Sample& s, LiveSink* sink);
+  void Step(const Sample& s, const Sample* next, LiveSink* sink);
   void EmitGap(Counter& k, size_t c, bool clock, int64_t end_ms, double dt_ns, LiveSink* sink);
 
   uint64_t interval_ns_;
   double f_;
   size_t pending_cap_;
+  bool read_anomalies_;
   std::vector<Counter> ctr_;
   WindowMedian rtt_{1024};
   WindowMedian off_{1024};
   std::deque<Sample> pending_;  // pending_[0] is the last trusted anchor once one was seen
+  Sample held_;                 // confirmed, waiting for its next neighbour (glitch rule)
+  bool have_held_ = false;
   bool have_anchor_ = false;
   double last_off_ = 0;
   int64_t seg_ = 0;

@@ -114,9 +114,17 @@ class FakeVm {
         Reply(c, 200, flags);
       }
     } else if (req.compare(0, 19, "GET /api/v1/series?") == 0) {
+      // Like VM: without limit=1 a large experiment returns every series (here > 64 KiB).
+      const bool limited = req.find("&limit=1 ") != std::string::npos;
+      std::string many = "{\"status\":\"success\",\"data\":[";
+      for (int i = 0; i < 6000; i++) many += std::string(i ? "," : "") + "{\"host\":\"h\"}";
+      many += "]}";  // ~78 KB: over the client's 64 KiB response bound
+      if (many.size() <= 65536) abort();
       Reply(c, 200,
-            series_conflict ? "{\"status\":\"success\",\"data\":[{\"host\":\"h\"}]}"
-                            : "{\"status\":\"success\",\"data\":[]}");
+            series_conflict
+                ? (limited ? std::string("{\"status\":\"success\",\"data\":[{\"host\":\"h\"}]}")
+                           : many)
+                : std::string("{\"status\":\"success\",\"data\":[]}"));
     } else if (req.compare(0, 20, "POST /api/v1/import ") == 0) {
       int k;
       {

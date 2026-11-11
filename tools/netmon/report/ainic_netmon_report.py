@@ -39,7 +39,14 @@ Rules (tools/netmon README, design §7.4 / §9):
     segments there, and samples between the two anchors around a step are "alignment
     uncertain" (no wall time).
   * Rates: consecutive samples only, counter compared before subtracting (a decrease is a
-    reset: no rate, the interval counts as uncovered). An interval longer than 3x the baseline
+    reset: no rate, the interval counts as uncovered). IPC replies only (firmware 1.117.5-a-45
+    returns one field with garbage upper 32 bits for one sample now and then): a value that
+    breaks the order while its raw neighbours agree (v[i-1] <= v[i+1], v[i] outside them) is
+    an anomaly: that sample is skipped for that counter and the interval bridging it is
+    invalid like a reset (a real reset, e.g. of a small counter or after a long stall, can look
+    the same, so it is never bridged into a rate). Without this, the jump back after such a
+    value became a "rate" of ~1e9 Gb/s. RDMA (netlink) counters never showed it and keep the plain rule. The
+    first and last samples are never judged (one neighbour). An interval longer than 3x the baseline
     (max(configured interval, median observed spacing)) is "low resolution": it only gives the
     interval average and is drawn and counted separately.
   * Stats: average = sum of valid increments / sum of their durations (low-res included);
@@ -205,6 +212,17 @@ def wall_times(rec, t_mono):
 # --------------------------------------------------------------------------- rates and stats
 
 
+def glitch_mask(v):
+    """IPC read anomalies (module doc), judged on the raw neighbours: v[i-1] <= v[i+1] and
+    v[i] outside them. Same rule as LiveRates (live push)."""
+    v = np.asarray(v, dtype=np.uint64)
+    g = np.zeros(len(v), dtype=bool)
+    if len(v) >= 3:
+        a, b, c = v[:-2], v[1:-1], v[2:]
+        g[1:-1] = (a <= c) & ((b < a) | (b > c))
+    return g
+
+
 class Rates:
     """Per-interval rates of one counter. Arrays are per interval (len = samples - 1)."""
 
@@ -214,11 +232,25 @@ class Rates:
         v = stream.col(name)
         self.name = name
         resets_between = None
+        self.glitches = 0
         if v is not None:
             v = np.asarray(v)
+            forced = None
+            if stream.source == "ipc":
+                # IPC read anomalies first (module doc): the sample is skipped for this
+                # counter and the interval bridging it is a reset (never a rate).
+                g = glitch_mask(v)
+                if g.any():
+                    self.glitches = int(g.sum())
+                    forced = np.cumsum(g)[~g]
+                    ok_g = ~g
+                    t, wall, seg, v = t[ok_g], wall[ok_g], seg[ok_g], v[ok_g]
+                    slow = slow[ok_g]
             # Counter resets are found on the full series first, so dropping an imprecise
             # sample can never bridge over a reset (e.g. 1000 -> [0] -> 1200 is not +200).
             dec = np.concatenate([[0], np.cumsum(v[1:] < v[:-1])])
+            if forced is not None:
+                dec = dec + forced
             keep = ~slow  # imprecise (slow) samples are skipped, see module doc
             t, wall, seg, v, dec = t[keep], wall[keep], seg[keep], v[keep], dec[keep]
             resets_between = np.diff(dec) > 0
@@ -761,6 +793,15 @@ def cmd_report(args):
         for s in r.streams:
             if s.ipc_unverified:
                 notes.append(f"{r.host}: {s.file} recorded with --ipc-unverified")
+            if s.source == "ipc" and len(s.rec) >= 3:
+                # IPC read anomalies (module doc) in the plotted counters
+                cols = [c for c in (IPC_TX, IPC_RX) if c in s.names]
+                n_anom = sum(int(glitch_mask(s.col(c)).sum()) for c in cols)
+                if n_anom:
+                    notes.append(
+                        f"{r.host}: {s.file}: {n_anom} IPC read anomalies skipped in the wire-byte "
+                        "counters (single bad values; see the module doc)"
+                    )
             unc = int(np.sum(~np.isfinite(s.times()[1])))
             if unc:
                 notes.append(

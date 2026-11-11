@@ -308,9 +308,12 @@ bool Exporter::Preflight(std::string* error) {
   // 3. this host must not have data in this experiment already
   const std::string match = "{__name__=~\"netmon_.+\",experiment=" + PromStr(opt_.experiment) +
                             ",host=" + PromStr(opt_.host) + "}";
-  r = http_.Request(
-      "GET", "/api/v1/series?match[]=" + UrlEncode(match) + "&start=" + UrlEncode(kAllTimeStart),
-      "", nullptr, MonoNs() + kRequestTimeoutNs);
+  // limit=1: only "any?" matters, and an experiment can have thousands of series (the full
+  // answer would exceed the client's 64 KiB response bound).
+  r = http_.Request("GET",
+                    "/api/v1/series?match[]=" + UrlEncode(match) +
+                        "&start=" + UrlEncode(kAllTimeStart) + "&limit=1",
+                    "", nullptr, MonoNs() + kRequestTimeoutNs);
   if (r.kind != HttpResult::Kind::kOk || r.status != 200) {
     *error = "VictoriaMetrics series query failed (" +
              (r.error.empty() ? "HTTP " + std::to_string(r.status) : r.error) + ")";
@@ -370,7 +373,7 @@ bool Exporter::ConfigureImpl(std::vector<ExportStream> streams, uint64_t start_r
     const size_t pending_cap =
         s.interval_ns ? std::max<uint64_t>(1000000000ull / s.interval_ns, 2) : 1024;
     st->lr = std::make_unique<LiveRates>(s.interval_ns, s.snapshot_fraction, st->counters,
-                                         optional[i], pending_cap);
+                                         optional[i], pending_cap, s.source == "ipc");
     const std::string base = "\"experiment\":" + Q(opt_.experiment) + ",\"host\":" + Q(host) +
                              ",\"netdev\":" + Q(s.netdev) +
                              ",\"target\":" + Q(host + "/" + s.netdev) +
@@ -495,6 +498,7 @@ PushStats Exporter::Snapshot() {
   for (const auto& r : rings_) s.dropped_samples += r->dropped.load();
   s.unconfirmed_dropped = unconfirmed_.load();
   s.clock_back_intervals = clock_back_.load();
+  s.read_anomalies = anomalies_.load();
   s.log_dropped = log_.dropped();
   {
     std::unique_lock<std::mutex> lk(mu_, std::try_to_lock);
@@ -608,13 +612,15 @@ void Exporter::UpdateStep() {
     if (b <= 0) continue;  // not warmed up yet
     step = std::max<int64_t>(step, static_cast<int64_t>(std::ceil(3 * b / 1e6 - 1e-9)));
   }
-  uint64_t unconfirmed = 0, back = 0;
+  uint64_t unconfirmed = 0, back = 0, anomalies = 0;
   for (auto& st : streams_) {
     unconfirmed += st->lr->stats().unconfirmed_dropped;
     back += st->lr->stats().clock_back_intervals;
+    anomalies += st->lr->stats().glitches;
   }
   unconfirmed_.store(unconfirmed);
   clock_back_.store(back);
+  anomalies_.store(anomalies);
   // Only increases are published (design §4.3): a too-small step leaves empty windows.
   if (step > std::max({step_prelim_, step_published_, step_pending_})) {
     step_pending_ = step;

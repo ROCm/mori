@@ -65,6 +65,7 @@ struct ExportStream {
 struct PushStats {
   uint64_t points_sent = 0, requests = 0, failed_points = 0, dropped_samples = 0;
   uint64_t unconfirmed_dropped = 0, clock_back_intervals = 0, log_dropped = 0;
+  uint64_t read_anomalies = 0;  // IPC values skipped by the read-anomaly rule
   bool abandoned = false;
   std::string last_error;
 };
@@ -178,7 +179,7 @@ class Exporter : public ExportHook {
   std::atomic<bool> crashed_{false};  // an exception stopped the exporter (push only)
 
   std::atomic<uint64_t> points_sent_{0}, requests_{0}, failed_points_{0};
-  std::atomic<uint64_t> unconfirmed_{0}, clock_back_{0};
+  std::atomic<uint64_t> unconfirmed_{0}, clock_back_{0}, anomalies_{0};
   std::mutex err_mu_;  // guards last_error_ only; held for an assignment at most
   std::string last_error_;
 

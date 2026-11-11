@@ -120,8 +120,7 @@ class ReportTests(unittest.TestCase):
         rtt = rtt.copy()
         rtt[20] = 4 * MS  # imprecise sample (> 1.5x median) ...
         v[20:] = v[20:] - v[20]  # ... that also carries a counter reset to 0,
-        v[21:] += v[19] + 1000  # after which the counter passes its pre-reset value
-        # (1000 -> 0 -> 1200 in miniature: without reset tracking, 19 -> 21 looks like +1000)
+        v[21:] += 1000  # after which the counter keeps counting from 0
         _, s = self.one(t0, rtt, real, err, v)
         r = R.Rates(s, "tx_rdma_ucast_bytes")
         # Samples 19 and 21 are adjacent after dropping 20, but a reset lies between them.
@@ -129,6 +128,30 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(bridged.any())
         self.assertFalse(r.valid[bridged].any())
         self.assertTrue(np.all(r.rate[r.valid] >= 0))
+
+    def test_rdma_dip_stays_a_reset(self):
+        # The read-anomaly rule is for IPC replies only: RDMA keeps the plain reset rule.
+        t0, rtt, real, err, v = steady(40)
+        v = v.copy()
+        v[20] = 0
+        _, s = self.one(t0, rtt, real, err, v)
+        r = R.Rates(s, "tx_rdma_ucast_bytes")
+        self.assertEqual(r.glitches, 0)
+        self.assertTrue(r.reset.any())
+
+    def test_glitch_mask(self):
+        a = np.uint64(0x0000_1234_0000_1000)
+        v = np.array(
+            [
+                a,
+                a + np.uint64(0x25FDC << 32),
+                a + np.uint64(9),
+                np.uint64(3),
+                a + np.uint64(20),
+            ],
+            dtype=np.uint64,
+        )
+        self.assertEqual(R.glitch_mask(v).tolist(), [False, True, False, True, False])
 
     def test_clock_step_segments(self):
         t0, rtt, real, err, v = steady(100, step_at=50, step_ns=10 * MS)

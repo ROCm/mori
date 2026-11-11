@@ -133,6 +133,7 @@ std::string BuildMeta(const MetaContext& c, const std::string& status,
     j.Key("failed_points").Uint(p.failed_points).Key("dropped_samples").Uint(p.dropped_samples);
     j.Key("unconfirmed_dropped").Uint(p.unconfirmed_dropped);
     j.Key("clock_back_intervals").Uint(p.clock_back_intervals);
+    j.Key("read_anomalies").Uint(p.read_anomalies);
     j.Key("log_dropped").Uint(p.log_dropped).Key("abandoned").Bool(p.abandoned);
     j.Key("last_error");
     if (p.last_error.empty())

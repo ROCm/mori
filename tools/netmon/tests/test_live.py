@@ -57,6 +57,7 @@ def replay(stream, names, optional="", cap=1024):
             str(len(names)),
             optional or "0" * len(names),
             str(cap),
+            "1" if stream.source == "ipc" else "0",
         ],
         input=rec.tobytes(),
         capture_output=True,
@@ -82,6 +83,7 @@ def replay(stream, names, optional="", cap=1024):
                 "ms_merged": int(p[4]),
                 "gaps_dropped": int(p[5]),
                 "baseline_ns": float(p[6]),
+                "glitches": int(p[7]),
             }
     return iv, gaps, stats
 
@@ -108,7 +110,7 @@ def offline(stream, name):
     return iv, resets, clock
 
 
-def run_of(tmp, n=300, interval=2 * MS, mutate=None, names=NAMES):
+def run_of(tmp, n=300, interval=2 * MS, mutate=None, names=NAMES, source="rdma"):
     t0, rtt, real, err, _ = steady(n, interval=interval)
     vals = np.stack(
         [
@@ -126,7 +128,7 @@ def run_of(tmp, n=300, interval=2 * MS, mutate=None, names=NAMES):
         [
             {
                 "netdev": "n0",
-                "source": "rdma",
+                "source": source,
                 "names": names,
                 "t0": t0,
                 "rtt": rtt,
@@ -136,7 +138,7 @@ def run_of(tmp, n=300, interval=2 * MS, mutate=None, names=NAMES):
                 "interval": interval,
             }
         ],
-    ).stream("n0", "rdma")
+    ).stream("n0", source)
 
 
 @unittest.skipUnless(REPLAY, "NETMON_LIVE_REPLAY not set (run through ctest)")
@@ -173,10 +175,13 @@ class LiveVsOffline(unittest.TestCase):
         self.assert_same(run_of(self.tmp, mutate=m))
 
     def test_reset_hidden_in_a_slow_sample(self):
-        # 1000 -> slow 0 -> 1200: the interval between the two kept samples is a reset
+        # The counter resets in a slow sample and stays low (X -> slow 0 -> 7 -> ...): the
+        # interval between the two kept samples around it is a reset. (An isolated dip that
+        # comes back, X -> 0 -> X+..., is a read glitch instead: test_read_glitches_...)
         def m(t0, rtt, real, err, v):
             rtt[100] = rtt[100] * 4
-            v[100, 1] = 0
+            v[100:, 1] = v[100:, 1] - v[100, 1]
+            v[101:, 1] += np.uint64(7)
             return t0, rtt, real, err, v
 
         live, gaps, _ = self.assert_same(run_of(self.tmp, mutate=m))
@@ -256,6 +261,112 @@ class LiveVsOffline(unittest.TestCase):
         # every live interval is one the offline computation also has
         self.assertTrue(set(live[NAMES[0]]) <= set(off_iv))
         self.assertTrue(gaps.get((NAMES[0], 1)))
+
+    def test_ipc_read_anomalies(self):
+        # Firmware a-45 IPC: one field's upper 32 bits garbage for one sample.
+        HW = np.uint64(0x25FDC << 32)
+
+        def m(t0, rtt, real, err, v):
+            v[100, 0] += HW  # high-word corruption: skipped, bridging interval invalid
+            v[180, 1] = np.uint64(
+                5
+            )  # an ambiguous dip: skipped, bridging interval invalid
+            v[230:, 0] = v[230:, 0] - v[230, 0]  # a real reset stays a reset
+            v[150, 2] += np.uint64(1 << 40)  # anomaly on the third counter too
+            return t0, rtt, real, err, v
+
+        s = run_of(self.tmp, mutate=m, source="ipc")
+        live, gaps, st = self.assert_same(s)  # identical to the offline rule
+        self.assertEqual(st["glitches"], 3)
+        for c in NAMES:
+            r = R.Rates(s, c)
+            self.assertLess(np.nanmax(r.rate) * 8 / 1e9, 1e4, c)  # no 1e9 Gb/s spike
+        t = s.times()[0]
+        r0 = R.Rates(s, NAMES[0])
+        hw_bridge = (r0.t_start == t[99]) & (r0.t_end == t[101])
+        self.assertTrue(hw_bridge.any() and not r0.valid[hw_bridge].any())
+        r1 = R.Rates(s, NAMES[1])
+        dip_bridge = (r1.t_start == t[179]) & (r1.t_end == t[181])
+        self.assertTrue(dip_bridge.any() and not r1.valid[dip_bridge].any())
+        self.assertTrue(r1.reset[dip_bridge].all())
+
+    def test_ipc_consecutive_anomalies(self):
+        # 10, 1000, 500, 20, 30 (Codex N1): judged on raw neighbours, offline and live alike
+        def m(t0, rtt, real, err, v):
+            v[100:105, 0] = (
+                np.array([10, 1000, 500, 20, 30], dtype=np.uint64) + v[99, 0]
+            )
+            v[105:, 0] = v[105:, 0] - v[105, 0] + v[104, 0]
+            v[200:204, 1] = v[200:204, 1] + np.array(
+                [0, 1 << 33, 1 << 34, 0], dtype=np.uint64
+            )
+            return t0, rtt, real, err, v
+
+        self.assert_same(run_of(self.tmp, mutate=m, source="ipc"))
+
+    def test_reset_that_looks_like_a_high_word_glitch(self):
+        # Codex N2: 0x1_10000000 -> 0x0_18000000 (a real reset) -> 0x1_20000000 after a long
+        # stall is possible at line rate: never a valid bridged rate, offline or live.
+        def m(t0, rtt, real, err, v):
+            v[:120, 0] = np.uint64(0x1_10000000)
+            v[120, 0] = np.uint64(0x0_18000000)
+            v[121:, 0] = np.uint64(0x1_20000000) + np.arange(
+                len(v) - 121, dtype=np.uint64
+            )
+            return t0, rtt, real, err, v
+
+        s = run_of(self.tmp, mutate=m, source="ipc")
+        self.assert_same(s)
+        r = R.Rates(s, NAMES[0])
+        t = s.times()[0]
+        from_119 = r.t_start == t[119]
+        self.assertTrue(from_119.any() and not r.valid[from_119].any())
+
+    def test_small_counter_reset_is_not_bridged(self):
+        # 1 -> 0 -> 2 is what a real reset of a small counter looks like: never a valid rate
+        def m(t0, rtt, real, err, v):
+            v[:, 2] = 1
+            v[150:, 2] = 0
+            v[151:, 2] = 2
+            return t0, rtt, real, err, v
+
+        for src in ("rdma", "ipc"):
+            s = run_of(f"{self.tmp}/{src}", mutate=m, source=src)
+            self.assert_same(s)
+            r = R.Rates(s, NAMES[2])
+            t = s.times()[0]
+            # nothing valid leaves the pre-reset sample (no bridge over the reset); the
+            # interval out of it is a reset either way
+            from_149 = r.t_start == t[149]
+            self.assertTrue(from_149.any(), src)
+            self.assertFalse(r.valid[from_149].any(), src)
+            self.assertTrue(r.reset[from_149].all(), src)
+
+    def test_ipc_anomaly_with_slow_sample_clock_step_and_activation(self):
+        def m(t0, rtt, real, err, v):
+            rtt[120] = rtt[120] * 4  # slow sample next to an anomaly
+            v[121, 0] += np.uint64(1 << 36)
+            real[200:] += np.uint64(5 * MS)  # clock step around another
+            v[199, 1] = np.uint64(3)
+            v[:, 2] = 0  # optional counter activated right at an anomaly
+            v[250:, 2] = np.arange(50, dtype=np.uint64) * 3 + 1
+            v[251, 2] += np.uint64(1 << 40)
+            return t0, rtt, real, err, v
+
+        s = run_of(self.tmp, mutate=m, source="ipc")
+        live, gaps, _ = replay(s, NAMES, optional="001")
+        for c in NAMES:
+            off_iv, off_resets, _ = offline(s, c)
+            if c == NAMES[2]:
+                self.assertEqual(
+                    live.get(c, []),
+                    off_iv[-len(live.get(c, [])) :] if live.get(c) else [],
+                )
+            else:
+                self.assertEqual(live.get(c, []), off_iv, c)
+            self.assertEqual(
+                [e for e, _ in gaps.get((c, 0), [])], [e for e, _ in off_resets], c
+            )
 
     def test_optional_counter_from_first_change(self):
         def m(t0, rtt, real, err, v):

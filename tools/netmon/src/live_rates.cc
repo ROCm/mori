@@ -73,10 +73,11 @@ int64_t RoundMs(double wall_ns) { return static_cast<int64_t>(std::nearbyint(wal
 }  // namespace
 
 LiveRates::LiveRates(uint64_t interval_ns, double snapshot_fraction, size_t counters,
-                     std::vector<bool> optional, size_t pending_cap)
+                     std::vector<bool> optional, size_t pending_cap, bool read_anomalies)
     : interval_ns_(interval_ns),
       f_(snapshot_fraction),
       pending_cap_(std::max<size_t>(pending_cap, 2)),
+      read_anomalies_(read_anomalies),
       ctr_(counters) {
   for (size_t c = 0; c < counters && c < optional.size(); c++) {
     ctr_[c].optional = optional[c];
@@ -142,34 +143,51 @@ void LiveRates::Finish(LiveSink* sink) {
     for (auto& p : pending_) Confirm(p, sink);
   }
   pending_.clear();
+  if (have_held_) Step(held_, nullptr, sink);  // the last sample has no next neighbour
+  have_held_ = false;
 }
 
 void LiveRates::Confirm(Sample& s, LiveSink* sink) {
-  if (s.uncertain) {
-    // Still part of the full series for reset detection (offline finds decreases on every
-    // sample), but never a base and never the end of a usable interval.
-    for (size_t c = 0; c < ctr_.size(); c++) {
-      Counter& k = ctr_[c];
-      const uint64_t v = s.v[c];
-      if (k.have_raw && v < k.raw) k.reset_pending = true;
-      k.raw = v;
-      if (!k.have_raw) k.first = v;
-      k.have_raw = true;
-      if (k.optional && !k.active && v != k.first) k.active = true;
-      if (k.have_base) k.clock_break = true;
-    }
-    return;
+  if (!s.uncertain) {
+    s.wall = s.t + off_.Get();
+    s.seg = seg_;
   }
-  s.wall = s.t + off_.Get();
-  s.seg = seg_;
-  Step(s, sink);
+  // One more sample of delay: a value is judged against both neighbours (read glitches).
+  if (have_held_) Step(held_, &s, sink);
+  held_ = std::move(s);
+  have_held_ = true;
 }
 
-void LiveRates::Step(const Sample& s, LiveSink* sink) {
-  const int64_t end_ms = RoundMs(s.wall);
+void LiveRates::Step(const Sample& s, const Sample* next, LiveSink* sink) {
+  const int64_t end_ms = s.uncertain ? 0 : RoundMs(s.wall);
   for (size_t c = 0; c < ctr_.size(); c++) {
     Counter& k = ctr_[c];
     const uint64_t v = s.v[c];
+    // 0. IPC read anomaly (offline glitch_mask, judged on the raw neighbours): v[i-1] <=
+    //    v[i+1] and v[i] outside them. The sample is skipped for this counter and the
+    //    interval bridging it is a reset (a real reset can look the same: never bridged).
+    if (read_anomalies_) {
+      const bool anomaly =
+          next && k.have_prev_any && k.prev_any <= next->v[c] && (v < k.prev_any || v > next->v[c]);
+      k.prev_any = v;
+      k.have_prev_any = true;
+      if (anomaly) {
+        if (k.have_raw) k.reset_pending = true;
+        stats_.glitches++;
+        continue;
+      }
+    }
+    if (s.uncertain) {
+      // Still part of the full series for reset detection (offline finds decreases on
+      // every sample), but never a base and never the end of a usable interval.
+      if (k.have_raw && v < k.raw) k.reset_pending = true;
+      if (!k.have_raw) k.first = v;
+      k.raw = v;
+      k.have_raw = true;
+      if (k.optional && !k.active && v != k.first) k.active = true;
+      if (k.have_base) k.clock_break = true;
+      continue;
+    }
     // 1. reset detection on the full series (slow samples included)
     if (k.have_raw && v < k.raw) k.reset_pending = true;
     if (!k.have_raw) k.first = v;
