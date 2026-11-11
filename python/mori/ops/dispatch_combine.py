@@ -161,6 +161,34 @@ def _ep_sim_group(config):
     return f"{store.get(key).decode()}.{n}"
 
 
+def ep_sim_mode():
+    """None when the sim is off, else MORI_EP_SIM_MODE: "standalone" (no GPU, no kernel, fixed
+    latency) or "runtime" (the real kernels on a simulated HIP runtime), by default runtime when
+    one is loaded."""
+    if not mori_cpp.ep_sim_enabled():
+        return None
+    available = mori_cpp.ep_sim_runtime_available()
+    mode = os.environ.get("MORI_EP_SIM_MODE") or (
+        "runtime" if available else "standalone"
+    )
+    if mode not in ("standalone", "runtime"):
+        raise ValueError(
+            f"MORI_EP_SIM_MODE must be standalone or runtime, got {mode!r}"
+        )
+    if mode == "runtime" and not available:
+        raise RuntimeError(
+            "MORI_EP_SIM_MODE=runtime needs a simulated HIP runtime (e.g. Sundial's libvgpu)"
+        )
+    return mode
+
+
+def _ep_sim_rt_group(config):
+    """Runtime mode: the all-to-all group name of one op (config: rank, world_size)."""
+    import uuid
+
+    return _ep_sim_group(config) or f"solo.{uuid.uuid4().hex[:16]}"
+
+
 class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
     def __str__(self):
         return self.name
@@ -468,7 +496,8 @@ class EpDispatchCombineOp:
             quant_type=_normalize_quant_type(config.quant_type),
             max_total_recv_tokens=config.max_total_recv_tokens,
         )
-        self._sim = mori_cpp.ep_sim_enabled()
+        sim_mode = ep_sim_mode()
+        self._sim = sim_mode == "standalone"
         if self._sim:
             self._init_sim()
             return
@@ -700,6 +729,9 @@ class EpDispatchCombineOp:
             raise ValueError(
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
             )
+
+        if sim_mode == "runtime":
+            mori_cpp.ep_sim_register_v1(self._handle, _ep_sim_rt_group(config))
 
         # Buffers are zeroed as they are allocated, and peers do not wait for that: once
         # a peer reaches dispatch, its kernel writes straight into our buffers. A rank a

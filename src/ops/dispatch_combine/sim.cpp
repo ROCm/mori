@@ -29,11 +29,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -75,12 +78,50 @@ uint64_t SplitMix64(uint64_t& state) {
   return z ^ (z >> 31);
 }
 
-// MORI_EP_SIM_ROUTING: one entry per MoE layer, in the order the layers dispatch.
+// Recorded per-layer hit counts: {"num_experts": E, "layers": [[hits of expert 0..E-1], ...]}.
+std::vector<std::vector<double>> LoadRecorded(const std::string& path, int numExperts) {
+  std::ifstream f(path);
+  const std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  const size_t at = s.find("\"layers\"");
+  if (!f || at == std::string::npos) throw std::runtime_error(path + ": no \"layers\"");
+  std::vector<std::vector<double>> layers;
+  std::vector<double> cur;
+  int depth = 0;
+  for (size_t i = s.find('[', at); i < s.size(); ++i) {
+    const char c = s[i];
+    if (c == '[') {
+      ++depth;
+      cur.clear();
+    } else if (c == ']') {
+      if (depth == 2) layers.push_back(cur);
+      if (--depth == 0) break;
+    } else if (depth == 2 &&
+               (std::isdigit(static_cast<unsigned char>(c)) || c == '-' || c == '.')) {
+      char* end = nullptr;
+      cur.push_back(std::strtod(s.c_str() + i, &end));
+      i = end - s.c_str() - 1;
+    }
+  }
+  if (layers.empty()) throw std::runtime_error(path + ": no layers");
+  for (size_t l = 0; l < layers.size(); ++l) {
+    const auto& w = layers[l];
+    if (static_cast<int>(w.size()) != numExperts ||
+        std::any_of(w.begin(), w.end(), [](double x) { return !(x >= 0); }))
+      throw std::runtime_error(path + ": layer " + std::to_string(l) + " needs " +
+                               std::to_string(numExperts) + " counts >= 0");
+  }
+  return layers;
+}
+
+// MORI_EP_SIM_ROUTING: one expert distribution per MoE layer, in the order the layers dispatch.
+// A .json file: recorded hit counts (above). Otherwise YAML, one entry per layer:
 //   - alpha: 1.2        expert popularity ~ 1 / rank^alpha; 0 (or no file) = uniform
 //     shuffle_seed: 7   optional: which experts are the hot ones; omitted = expert 0 is hottest
 std::vector<std::vector<double>> LoadRoutingWeights(int numExperts) {
   const char* path = std::getenv("MORI_EP_SIM_ROUTING");
   if (path == nullptr || *path == '\0') return {std::vector<double>(numExperts, 1.0)};
+  const std::string p(path);
+  if (p.size() > 5 && p.compare(p.size() - 5, 5, ".json") == 0) return LoadRecorded(p, numExperts);
   const auto entries = yaml::LoadFlatList(path);
   if (entries.empty()) throw std::runtime_error(std::string(path) + ": no layers");
   std::vector<std::vector<double>> layers;
@@ -135,7 +176,7 @@ struct EpSim::Slot {
 };
 
 // An expert distribution with Vose's alias table, for O(1) draws.
-struct EpSim::Layer {
+struct Routing::Layer {
   std::vector<double> weight, prob;
   std::vector<int> alias;
 
@@ -143,6 +184,7 @@ struct EpSim::Layer {
       : weight(std::move(w)), prob(weight.size(), 1.0), alias(weight.size()) {
     const int n = static_cast<int>(weight.size());
     const double sum = std::accumulate(weight.begin(), weight.end(), 0.0);
+    if (!(sum > 0)) throw std::runtime_error("EP sim routing: a layer has no positive weight");
     std::vector<double> p(n);
     std::vector<int> small, large;
     for (int i = 0; i < n; ++i) {
@@ -164,6 +206,43 @@ struct EpSim::Layer {
   }
 };
 
+Routing::Routing(int numExperts) {
+  for (auto& w : LoadRoutingWeights(numExperts)) layers_.emplace_back(std::move(w));
+}
+
+Routing::~Routing() = default;
+
+void Routing::Draw(uint64_t call, uint64_t seed, int numTokens, int topk, int32_t* ids) const {
+  const Layer& layer = layers_[call % layers_.size()];
+  const int n = static_cast<int>(layer.weight.size());
+  uint64_t rng = seed;
+  for (int t = 0; t < numTokens; ++t) {
+    int32_t* row = ids + static_cast<size_t>(t) * topk;
+    for (int j = 0; j < topk; ++j) {
+      auto taken = [&](int e) { return std::find(row, row + j, e) != row + j; };
+      int e = -1;
+      for (int tries = 0; tries < 64 && e < 0; ++tries) {
+        const uint64_t r = SplitMix64(rng);
+        const int i = static_cast<int>(((r >> 32) * n) >> 32);
+        const int pick = (r & 0xffffffffu) * 0x1p-32 < layer.prob[i] ? i : layer.alias[i];
+        if (!taken(pick)) e = pick;
+      }
+      if (e < 0) {
+        // Heavy skew keeps redrawing the experts already picked: draw from the rest directly.
+        double rest = 0;
+        for (int c = 0; c < n; ++c) rest += taken(c) ? 0 : layer.weight[c];
+        double u = (SplitMix64(rng) >> 11) * 0x1p-53 * rest;
+        for (int c = 0; c < n && (e < 0 || u >= 0); ++c) {
+          if (taken(c)) continue;
+          e = c;
+          u -= layer.weight[c];
+        }
+      }
+      row[j] = e;
+    }
+  }
+}
+
 bool IsEnabled() { return env::IsEnvVarEnabled("MORI_EP_SIM_ENABLE"); }
 
 EpSim::EpSim(const std::string& group, int rank, int worldSize, int maxTokens, int topk,
@@ -176,9 +255,9 @@ EpSim::EpSim(const std::string& group, int rank, int worldSize, int maxTokens, i
       maxRecv_(maxRecv),
       asyncSend_(asyncSend),
       dispatchUs_(LatencyUs("MORI_EP_SIM_DISPATCH_US")),
-      combineUs_(LatencyUs("MORI_EP_SIM_COMBINE_US")) {
+      combineUs_(LatencyUs("MORI_EP_SIM_COMBINE_US")),
+      routing_(worldSize * expertsPerRank) {
   if (topk > worldSize * expertsPerRank) throw std::invalid_argument("EP sim: topk > experts");
-  for (auto& w : LoadRoutingWeights(worldSize * expertsPerRank)) layers_.emplace_back(std::move(w));
 
   const size_t ints = static_cast<size_t>(maxTokens) * topk + worldSize +
                       static_cast<size_t>(worldSize) * expertsPerRank +
@@ -271,38 +350,19 @@ void EpSim::Publish(const Slot* mine) {
 }
 
 void EpSim::Route(int numTokens) {
-  const Layer& layer = layers_[dispatches_++ % layers_.size()];
-  const int n = static_cast<int>(layer.weight.size());
+  const int n = world_ * expertsPerRank_;
   int32_t* ids = scratch_.data();
   int32_t* toCount = ids + static_cast<size_t>(maxTokens_) * topk_;
   int32_t* hits = toCount + world_;
   int32_t* toList = hits + n;
   std::fill(toCount, toCount + world_ + n, 0);
   std::vector<int> lastToken(world_, -1);
-  uint64_t rng = (static_cast<uint64_t>(rank_) << 40) ^ seq_;  // reproducible, per rank and op
+  // reproducible, per rank and op
+  routing_.Draw(dispatches_++, (static_cast<uint64_t>(rank_) << 40) ^ seq_, numTokens, topk_, ids);
   for (int t = 0; t < numTokens; ++t) {
-    int32_t* row = ids + static_cast<size_t>(t) * topk_;
+    const int32_t* row = ids + static_cast<size_t>(t) * topk_;
     for (int j = 0; j < topk_; ++j) {
-      auto taken = [&](int e) { return std::find(row, row + j, e) != row + j; };
-      int e = -1;
-      for (int tries = 0; tries < 64 && e < 0; ++tries) {
-        const uint64_t r = SplitMix64(rng);
-        const int i = static_cast<int>(((r >> 32) * n) >> 32);
-        const int pick = (r & 0xffffffffu) * 0x1p-32 < layer.prob[i] ? i : layer.alias[i];
-        if (!taken(pick)) e = pick;
-      }
-      if (e < 0) {
-        // Heavy skew keeps redrawing the experts already picked: draw from the rest directly.
-        double rest = 0;
-        for (int c = 0; c < n; ++c) rest += taken(c) ? 0 : layer.weight[c];
-        double u = (SplitMix64(rng) >> 11) * 0x1p-53 * rest;
-        for (int c = 0; c < n && (e < 0 || u >= 0); ++c) {
-          if (taken(c)) continue;
-          e = c;
-          u -= layer.weight[c];
-        }
-      }
-      row[j] = e;
+      const int e = row[j];
       ++hits[e];
       const int to = e / expertsPerRank_;
       if (lastToken[to] != t) {  // once per destination rank

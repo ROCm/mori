@@ -360,6 +360,47 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
       .def("combine", &EpSim::Combine, release())
       .def("end_call", &EpSim::EndCall, release())
       .def("wait", &EpSim::Wait, release());
+  namespace simrt = mori::moe::sim::rt;
+  m.def("ep_sim_runtime_available", &simrt::Available);
+  m.def("ep_sim_stats", &simrt::Stats);
+  m.def(
+      "ep_sim_register_v1",
+      [](mori::moe::EpDispatchCombineHandle& h, const std::string& group) {
+        const auto& c = h.config;
+        const int64_t stride = c.MaxNumTokensToSend();
+        simrt::Register({1,
+                         c.rank,
+                         c.worldSize,
+                         c.gpuPerNode,
+                         c.maxNumInpTokenPerRank,
+                         c.numExpertPerToken,
+                         c.numExpertPerRank,
+                         c.MaxNumTokensToRecv(),
+                         stride,
+                         stride,
+                         0,
+                         0,
+                         0,
+                         0,
+                         {reinterpret_cast<uintptr_t>(h.dispatchGridBarrier),
+                          reinterpret_cast<uintptr_t>(h.totalRecvTokenNum)},
+                         group});
+      },
+      py::arg("handle"), py::arg("group"));
+  m.def(
+      "ep_sim_register_v2",
+      [](const std::string& group, int rank, int world, int gpuPerNode, int maxTok, int topk,
+         int expertsPerRank, int maxRecv, uintptr_t outIdx, uintptr_t srcMap,
+         std::vector<uintptr_t> keys, double dispRowBytes, double combRowBytes) {
+        // recv_to_src_token = src_rank * max_tok + token; tok_map = dest_rank * max_recv + slot
+        simrt::Register({2, rank, world, gpuPerNode, maxTok, topk, expertsPerRank, maxRecv, maxTok,
+                         maxRecv, dispRowBytes, combRowBytes, outIdx, srcMap, std::move(keys),
+                         group});
+      },
+      py::arg("group"), py::arg("rank"), py::arg("world_size"), py::arg("gpu_per_node"),
+      py::arg("max_tokens"), py::arg("topk"), py::arg("experts_per_rank"), py::arg("max_recv"),
+      py::arg("out_idx_ptr"), py::arg("src_map_ptr"), py::arg("keys"),
+      py::arg("dispatch_row_bytes"), py::arg("combine_row_bytes"));
 
   m.def("get_cur_rank_num_token", &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
   m.def("get_dispatch_src_token_pos", &GetDispatchSrcTokenId);

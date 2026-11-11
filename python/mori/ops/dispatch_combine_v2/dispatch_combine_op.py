@@ -1114,6 +1114,10 @@ class EpDispatchCombineOp:
 
         recv_views = None
         if routing is not None:
+            if getattr(self, "_sim_rt", False):
+                raise NotImplementedError(
+                    "MORI_EP_SIM_MODE=runtime does not simulate routing replay"
+                )
             table = self._kernels.dispatch_replay
             if table is None:
                 raise NotImplementedError(

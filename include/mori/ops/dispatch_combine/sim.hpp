@@ -36,6 +36,20 @@ namespace sim {
 
 bool IsEnabled();
 
+// The expert distributions of MORI_EP_SIM_ROUTING, one per MoE layer; dispatch calls cycle through
+// the layers.
+class Routing {
+ public:
+  explicit Routing(int numExperts);
+  ~Routing();
+  // topk distinct experts per token into ids[numTokens * topk], from the layer of dispatch `call`.
+  void Draw(uint64_t call, uint64_t seed, int numTokens, int topk, int32_t* ids) const;
+
+ private:
+  struct Layer;
+  std::vector<Layer> layers_;
+};
+
 class EpSim {
  public:
   // `group` names the shared memory and is the same on every rank; "" only when worldSize == 1.
@@ -65,7 +79,6 @@ class EpSim {
 
  private:
   struct Slot;
-  struct Layer;
   Slot* SlotOf(uint64_t seq, int rank) const;
   // Begin stamps this rank's arrival into its slot; Publish shares the slot and waits for all.
   Slot* Begin(int phase, double latencyUs, int numTokens);
@@ -76,7 +89,7 @@ class EpSim {
   int rank_, world_, maxTokens_, topk_, expertsPerRank_, maxRecv_;
   bool asyncSend_;
   double dispatchUs_, combineUs_;
-  std::vector<Layer> layers_;
+  Routing routing_;
   std::vector<int32_t> scratch_;  // the slot's contents, built here and copied in at once
   std::string name_;
   size_t bytes_{0}, slotBytes_{0};
@@ -86,6 +99,29 @@ class EpSim {
   int64_t deadlineNs_{0}, arrivalNs_{0};
 };
 
+// Runtime mode (MORI_EP_SIM_MODE=runtime, sim_rt.cpp): the op is built and launched as on a GPU,
+// on a simulated HIP runtime that calls mori's host handlers for the EP kernels.
+namespace rt {
+
+// A simulated runtime is loaded (it exports the symbols sim_rt.cpp looks up).
+bool Available();
+
+// One op. Map entries: source = srcRank * srcStride + token; destination = destRank * destStride
+// + slot, or world * destStride for a dropped pair.
+struct OpSpec {
+  int version;  // 1 = EpDispatchCombineOp, 2 = dispatch_combine_v2 (flydsl)
+  int rank, world, gpuPerNode, maxTok, topk, expertsPerRank, maxRecv;
+  int64_t srcStride, destStride;
+  double dispRowBytes, combRowBytes;  // v2 (v1: from the kernel)
+  uintptr_t outIdx, srcMap;           // v2 (v1: from the kernel arguments)
+  std::vector<uintptr_t> keys;        // device pointers that find the op in its kernels' arguments
+  std::string group;                  // the same on every rank, unique per op and job
+};
+void Register(const OpSpec& spec);
+// Counters of every op of this process (JSON); also written to MORI_EP_SIM_STATS_DIR.
+std::string Stats();
+
+}  // namespace rt
 }  // namespace sim
 }  // namespace moe
 }  // namespace mori

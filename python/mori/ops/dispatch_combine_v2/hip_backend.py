@@ -388,6 +388,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     """
 
     def __init__(self, cfg, comm):
+        from mori.ops.dispatch_combine import ep_sim_mode
+
+        if ep_sim_mode() == "runtime":
+            raise NotImplementedError(
+                "MORI_EP_SIM_MODE=runtime simulates the flydsl backend of dispatch_combine_v2 only"
+            )
         self.cfg = cfg
         self.comm = comm
         self._device_index = torch.cuda.current_device()
