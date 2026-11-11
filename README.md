@@ -1,10 +1,6 @@
 <h1 align="center">MORI</h1>
 
 <p align="center">
-  <b>Mo</b>dular <b>R</b>DMA <b>I</b>nterface: building blocks and libraries for high-performance GPU communication on AMD Instinct™ GPUs
-</p>
-
-<p align="center">
   <a href="https://rocm.github.io/mori/"><img alt="Documentation" src="https://img.shields.io/badge/docs-rocm.github.io%2Fmori-C00000"></a>
   <a href="https://pypi.org/project/amd-mori/"><img alt="PyPI" src="https://img.shields.io/pypi/v/amd-mori?label=pypi"></a>
   <a href="https://pypi.org/project/amd-mori-nightly/"><img alt="PyPI nightly" src="https://img.shields.io/pypi/v/amd-mori-nightly?label=nightly"></a>
