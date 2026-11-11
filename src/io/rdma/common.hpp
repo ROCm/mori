@@ -186,7 +186,7 @@ struct CqCallbackMeta {
   // failure on one QP were reported while the transfer's WRs on another were in flight.
   void Account(int credits, StatusCode code, const std::string& message, bool rootCause = true) {
     if (code > StatusCode::ERR_BEGIN) {
-      std::lock_guard<std::mutex> lock(failureMu);
+      std::lock_guard<std::mutex> lock(outcomeMu);
       if (!hasFailure.load(std::memory_order_relaxed) || (rootCause && !failureIsRootCause)) {
         failure = Outcome{code, message};
         failureIsRootCause = rootCause;
@@ -205,7 +205,7 @@ struct CqCallbackMeta {
     }
     Outcome report;
     {
-      std::lock_guard<std::mutex> lock(failureMu);
+      std::lock_guard<std::mutex> lock(outcomeMu);
       report = failure;
     }
     ReportData(s, report.code, report.message);
@@ -259,14 +259,14 @@ struct CqCallbackMeta {
   }
 
   std::atomic<int> unfinishedParts{2};
-  std::mutex outcomeMu;
+  std::mutex outcomeMu;  // guards the outcomes below
   Outcome dataOutcome;
   Outcome notificationOutcome;
-
-  std::mutex failureMu;
-  std::atomic<bool> hasFailure{false};
-  bool failureIsRootCause{false};  // guarded by failureMu, as `failure`
+  // The first data failure Account() saw, a root cause in preference to a flush.
   Outcome failure;
+  bool failureIsRootCause{false};
+  // Set once `failure` is; read without the lock so the success path never takes it.
+  std::atomic<bool> hasFailure{false};
 };
 
 // SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
