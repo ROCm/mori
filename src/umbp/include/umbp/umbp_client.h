@@ -122,6 +122,13 @@ class IUMBPClient {
   /// Stops at the first key that does not exist (early-stop).
   virtual size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const = 0;
 
+  /// Recency hint for objects the caller served from a faster cache of its
+  /// own, so never read here: counted as just used, as a read would be, but
+  /// nothing is read or leased, and keys not stored are skipped.  This node's
+  /// paged media move them in the order given, the last ending up the most
+  /// recent.  Returns the copies moved; 0 where unsupported.
+  virtual size_t BatchTouch(const std::vector<std::string>& /*keys*/) { return 0; }
+
   // ---- Lifecycle ----
 
   /// Remove all stored entries.  Returns true when the empty state is

@@ -835,6 +835,26 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
   return out;
 }
 
+size_t PeerPool::BatchTouch(const std::vector<std::string>& keys) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  if (keys.empty()) return 0;
+  std::vector<uint32_t> read_order;
+  {
+    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    if (backends_ == nullptr || policy_ == nullptr) return 0;
+    read_order = policy_->ReadOrder(*backends_);
+  }
+  // Every copy, not just the first in read order: a key held by two media is
+  // just as recently used in both.  The backend calls stay outside
+  // operation_mutex_, as in BatchContains.
+  size_t touched = 0;
+  for (uint32_t backend_id : read_order) {
+    auto* backend = backends_->Get(backend_id);
+    if (backend != nullptr) touched += backend->Touch(keys);
+  }
+  return touched;
+}
+
 std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys, PoolEvictMode mode) {
   std::unique_lock<std::mutex> operation_lock(operation_mutex_);
   std::vector<EvictResult> out;

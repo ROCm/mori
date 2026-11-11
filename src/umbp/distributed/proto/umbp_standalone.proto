@@ -16,6 +16,8 @@ service UMBPStandalone {
   rpc Exists(KeyRequest) returns (BoolResponse);
   rpc BatchExists(BatchKeysRequest) returns (BatchBoolResponse);
   rpc BatchExistsConsecutive(BatchKeysRequest) returns (CountResponse);
+  // IUMBPClient::BatchTouch; a server without it answers UNIMPLEMENTED.
+  rpc BatchTouch(BatchKeysRequest) returns (CountResponse);
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);

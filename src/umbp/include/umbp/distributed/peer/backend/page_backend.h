@@ -265,6 +265,9 @@ class PageBackend : public MediumBackend {
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
   std::vector<bool> BatchContains(const std::vector<std::string>& keys) const override;
+  // Moves held keys to the MRU end, as a read would, without the read's lease.
+  // 0 unless local eviction is on.
+  size_t Touch(const std::vector<std::string>& keys) override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
 
   uint64_t PageSize() const override { return page_size_; }

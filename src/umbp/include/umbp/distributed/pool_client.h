@@ -196,6 +196,8 @@ class PoolClient {
   // whether master surfaced any replica.  No RDMA, no lease bump.
   bool Exists(const std::string& key);
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
+  // Recency hint for keys the caller served from its own cache; this node only.
+  size_t BatchTouch(const std::vector<std::string>& keys);
 
   MasterClient& Master();
 

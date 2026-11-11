@@ -363,6 +363,12 @@ class MediumBackend : public MetricSource {
     return out;
   }
 
+  // Renew these keys' recency without reading them: a client used them from a
+  // faster cache of its own.  No lease, no read; keys move in the order given,
+  // so the last is the most recent.  Returns how many are held here; a medium
+  // that keeps no order returns 0.
+  virtual size_t Touch(const std::vector<std::string>& /*keys*/) { return 0; }
+
   // Master-driven eviction.  Idempotent; see EvictResult::bytes_freed.  One
   // result per key, in request order — the peer service relies on that to sum
   // freed bytes for a key mirrored across media.
