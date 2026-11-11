@@ -362,6 +362,40 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         )
         self._gate(self._kernels)
         self._closed = False
+        self._sim_register()
+
+    def _sim_register(self):
+        """MORI_EP_SIM_ENABLE on a simulated runtime: its handlers for this op's kernels find it by
+        these buffers and write its receive-side outputs."""
+        from mori.ops.dispatch_combine import _ep_sim_group, ep_sim_active
+
+        self._sim_rt = ep_sim_active()
+        if not self._sim_rt:
+            return
+        from mori import cpp as mori_cpp
+
+        cfg = self.cfg
+        mori_cpp.ep_sim_register_v2(
+            _ep_sim_group(cfg),
+            cfg.rank,
+            cfg.world_size,
+            int(cfg.gpu_per_node or cfg.world_size),
+            cfg.max_num_inp_token_per_rank,
+            cfg.num_experts_per_token,
+            cfg.num_experts_per_rank,
+            self._recv_cap,
+            self.arena.local_ptr("out_idx"),
+            self.arena.local_ptr("recv_to_src_token"),
+            [
+                self.dispatch_barrier.data_ptr(),
+                self.combine_barrier.data_ptr(),
+                self.total_recv.data_ptr(),
+            ],
+            float(
+                cfg.token_nbytes + self._scale_bytes + cfg.num_experts_per_token * 8 + 4
+            ),
+            float(cfg.combine_token_nbytes),
+        )
 
     def recv_tokens(self):
         """Arena disp_out [max_recv, hidden] (dispatch dest / expert-GEMM input).

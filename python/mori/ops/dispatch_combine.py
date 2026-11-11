@@ -135,6 +135,45 @@ def _maybe_get_cco_comm(config):
     return _CCO_COMM
 
 
+_ep_sim_ops = 0
+
+
+def ep_sim_active():
+    """MORI_EP_SIM_ENABLE=1: the EP ops run on a simulated HIP runtime (e.g. Sundial's libvgpu),
+    which calls mori's host handlers for the EP kernels (sim.hpp)."""
+    if not mori_cpp.ep_sim_enabled():
+        return False
+    if not mori_cpp.ep_sim_runtime_available():
+        raise RuntimeError(
+            "MORI_EP_SIM_ENABLE=1 needs a simulated HIP runtime (e.g. Sundial's libvgpu) loaded"
+        )
+    return True
+
+
+def _ep_sim_group(config):
+    """All-to-all group name of one simulated op (config: rank, world_size): the same on all its
+    ranks, unique per op and job."""
+    import uuid
+
+    global _ep_sim_ops
+    n, _ep_sim_ops = _ep_sim_ops, _ep_sim_ops + 1
+    if config.world_size == 1:
+        return f"solo.{uuid.uuid4().hex[:16]}"
+    if os.environ.get("MORI_EP_SIM_GROUP"):
+        return f"{os.environ['MORI_EP_SIM_GROUP']}.{n}"
+    if not dist.is_initialized():
+        raise RuntimeError(
+            "MORI_EP_SIM_ENABLE with world_size > 1 needs torch.distributed "
+            "or MORI_EP_SIM_GROUP to name the op's all-to-all group"
+        )
+    # Only the default store is used, so any (or a faked) process-group backend works.
+    store = dist.distributed_c10d._get_default_store()
+    key = f"mori_ep_sim/{dist.get_rank() - config.rank}/{n}"
+    if config.rank == 0:
+        store.set(key, uuid.uuid4().hex[:16])
+    return f"{store.get(key).decode()}.{n}"
+
+
 class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
     def __str__(self):
         return self.name
@@ -422,6 +461,7 @@ def _load_hip_modules(kernel_type, init_shmem=True):
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
+        sim = ep_sim_active()
         # Wavefront size of THIS device (32 on gfx1250, 64 on gfx9xx). Used for
         # every kernel launch's block dim; keep consistent with the device-side
         # warpNum = blockDim.x / warpSize so combine LDS sizing stays in bounds.
@@ -669,6 +709,9 @@ class EpDispatchCombineOp:
             raise ValueError(
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
             )
+
+        if sim:
+            mori_cpp.ep_sim_register_v1(self._handle, _ep_sim_group(config))
 
         # Buffers are zeroed as they are allocated, and peers do not wait for that: once
         # a peer reaches dispatch, its kernel writes straight into our buffers. A rank a

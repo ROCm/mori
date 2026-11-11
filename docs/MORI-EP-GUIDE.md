@@ -508,6 +508,11 @@ if __name__ == "__main__":
 | `GLOO_SOCKET_IFNAME` | — | TCP interface for torch distributed (e.g., `enp81s0f1`) |
 | `MASTER_ADDR` | — | Torch distributed master address |
 | `MASTER_PORT` | — | Torch distributed master port |
+| `MORI_EP_SIM_ENABLE` | `0` | `1`: run the EP ops GPU-free on a simulated HIP runtime that executes no kernel, such as Sundial's virtual GPU (`libvgpu`, loaded as `libamdhip64`). The op is built and launched as on a GPU, eagerly or in CUDA graphs, with the same output shapes (`EpDispatchCombineOp`; `dispatch_combine_v2` with the flydsl backend). The runtime calls mori's host handlers for the dispatch, combine and local-expert-count kernels at every launch and graph replay: each dispatch draws this rank's routing from `MORI_EP_SIM_ROUTING` into the caller's top-k, and `total_recv`, `out_indices`, the token maps and `local_expert_count` are written as the IntraNode kernel writes them. The runtime times the op from the rows each rank sends to each other rank. Not simulated: routing replay, the `hip` backend of `dispatch_combine_v2`. Without such a runtime the op raises at construction. |
+| `MORI_EP_SIM_ROUTING` | uniform | Expert distribution per MoE layer, in the order the layers dispatch; dispatch calls cycle through the layers. A YAML file: one entry per layer, `alpha` (expert popularity ~ 1 / rank^alpha, 0 = uniform) and optional `shuffle_seed` (which experts are hot; omitted = expert 0 is hottest), e.g. `- alpha: 1.2` / `  shuffle_seed: 7`. A `.json` file: recorded hit counts, `{"layers": [[hits of expert 0, ..., E-1], ...]}`. `input`: the caller's top-k as it is. |
+| `MORI_EP_SIM_GROUP` | — | Name of an op's all-to-all group when `torch.distributed` is not initialized: the same on every rank, unique per job. |
+| `MORI_EP_SIM_SEED` | `0` | Seed of the routing draws. |
+| `MORI_EP_SIM_STATS_DIR` / `MORI_EP_SIM_LOG_DIR` | — | Per-process op counters (`ep_sim.<pid>.json`, kept current) / one line per dispatch (`seq phase tokens received_rows lag_us sent_rows`). |
 
 ---
 
