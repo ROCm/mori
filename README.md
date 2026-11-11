@@ -40,7 +40,7 @@ To help developers get started quickly, MORI also includes a suite of optimized 
 - Applications
     - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance. Two generations:
         - EPv1: built on MORI-SHMEM.
-        - EPv2: built on MORI-CCO. Designed natively for gfx1250 and rack-scale EP. Two interchangeable kernel backends (FlyDSL and HIP). Intra-node (EP8) and a HIP internode preview over GDA RDMA.
+        - EPv2: built on MORI-CCO. Designed natively for gfx1250 and rack-scale EP.
     - MORI-FUSED: GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, overlapping the transfer with the GEMM over the SDMA copy engines
     - MORI-IO: point-to-point communication library with ultra-low overhead
     - MORI-CCL: lightweight and flexible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained environment
@@ -213,12 +213,6 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 | Volcano | 🚧 | 🚧 | 🚧 |
 
 ✅ Supported &emsp; 🚧 Under Development
-
-A gfx1250 device can run as `gfx1250` or as `gfx1250-strict`, depending on the runtime.
-MORI JIT-compiles its kernels for whichever target the device reports, so one install
-serves both. The exception is UMBP's prebuilt gather kernel: build with
-`gfx1250-strict` in `MORI_GPU_ARCHS` to use it there (without it UMBP copies through
-the copy engine).
 
 <!-- mori-installation-start -->
 
