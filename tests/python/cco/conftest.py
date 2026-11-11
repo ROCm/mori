@@ -76,7 +76,7 @@ def pytest_collection_modifyitems(config, items):
     if os.environ.get("MORI_CI_FULL") != "0":
         return
     skip = pytest.mark.skip(
-        reason="ci_full: runs on push to main, workflow_dispatch and ci:full"
+        reason="ci_full: runs in the scheduled main runs, workflow_dispatch and ci:full"
     )
     for item in items:
         if item.get_closest_marker("ci_full"):

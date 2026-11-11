@@ -36,7 +36,8 @@ ci.yml hands the cco and fused lanes to ci_cco.yml. Writes these step outputs:
           workflow_dispatch, or ci:full on a PR
   reason  why
 
-Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
+Non-PR events (the scheduled runs on main, workflow_dispatch) run everything,
+except a scheduled run of a main commit the last run already tested. On a PR:
 
   - a draft runs nothing, unless it has the ci:full label;
   - ci:full runs everything, with the full internode sweeps; ci:mi300x adds the
@@ -49,7 +50,9 @@ Non-PR events (push to main, workflow_dispatch) run everything. On a PR:
     module that importing mori.ops/io/shmem runs also counts for umbp; a conftest.py,
     or a test package's __init__.py, counts for the groups of every file below it.
 
-With COMMENT=true it keeps one comment on the PR up to date with the lanes.
+With COMMENT=true it keeps one comment on the PR up to date with the lanes. A fork
+PR's token cannot write it, so for a fork PR ci-scope-comment.yml runs this script
+from main with a write token instead.
 
 `--files FILE` classifies a list of paths offline, for checking the rules.
 """
@@ -438,6 +441,21 @@ def wait_for_precommit(repo, sha, appear_s=300, finish_s=1200):
         time.sleep(20)
 
 
+def last_main_run_sha(repo):
+    """head_sha of the newest finished, not cancelled, run of ci.yml on main."""
+    try:
+        shas = gh_lines(
+            f"repos/{repo}/actions/workflows/ci.yml/runs"
+            "?branch=main&status=completed&per_page=20",
+            "--jq",
+            '.workflow_runs[] | select(.event != "pull_request"'
+            ' and .conclusion != "cancelled") | .head_sha',
+        )
+    except subprocess.CalledProcessError:
+        return None
+    return shas[0] if shas else None
+
+
 def live_labels(env):
     """The PR's labels now; a re-run replays the original event's payload."""
     try:
@@ -457,6 +475,14 @@ def decide(env):
     event = env.get("EVENT_NAME", "")
     if event != "pull_request":
         full = event == "workflow_dispatch"
+        sha = env.get("HEAD_SHA", "")
+        if event == "schedule" and sha and last_main_run_sha(env["REPO"]) == sha:
+            return (
+                dict.fromkeys(LANES, False),
+                set(),
+                f"main has not moved since its last run ({sha[:8]})",
+                full,
+            )
         return (
             dict.fromkeys(LANES, True),
             set(ALL),
@@ -519,7 +545,8 @@ HINT = (
 
 def comment_body(env, lanes, reason, full, groups=frozenset()):
     """The PR comment; lanes=None means GPU CI did not start."""
-    run = "{}/{}/actions/runs/{}".format(
+    # RUN_URL: ci-scope-comment.yml writes a fork PR's comment from its own run.
+    run = env.get("RUN_URL") or "{}/{}/actions/runs/{}".format(
         env.get("GITHUB_SERVER_URL", "https://github.com"),
         env.get("REPO", ""),
         env.get("GITHUB_RUN_ID", ""),

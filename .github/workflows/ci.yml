@@ -1,7 +1,10 @@
 name: MoRI CI test
 on:
-  push:
-    branches: [main]
+  # main runs every 6 hours rather than on each merge: a merge cancelled the main
+  # run before it, so most never finished. ci_scope.py skips a run when main has
+  # not moved since the last one.
+  schedule:
+    - cron: '30 */6 * * *'
   pull_request:
     branches: [main]
     # ready_for_review: drafts run nothing. The ci:full and ci:mi300x labels
@@ -30,7 +33,9 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # A new push to a PR replaces its older run; a run on main finishes, and the
+  # next one waits for it.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   IMAGE: rocm/mori:ci
@@ -43,8 +48,10 @@ jobs:
   scope:
     name: scope
     uses: ./.github/workflows/ci-scope.yml
-    # The one job that may write: it keeps the routing comment on the PR.
+    # The one job that may write: it keeps the routing comment on the PR. It reads
+    # this workflow's runs to tell whether main moved since its last run.
     permissions:
+      actions: read
       contents: read
       pull-requests: write
       checks: read
