@@ -388,11 +388,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     """
 
     def __init__(self, cfg, comm):
-        from mori.ops.dispatch_combine import ep_sim_mode
+        from mori.ops.dispatch_combine import ep_sim_active
 
-        if ep_sim_mode() == "runtime":
+        if ep_sim_active():
             raise NotImplementedError(
-                "MORI_EP_SIM_MODE=runtime simulates the flydsl backend of dispatch_combine_v2 only"
+                "MORI_EP_SIM_ENABLE simulates the flydsl backend of dispatch_combine_v2 only"
             )
         self.cfg = cfg
         self.comm = comm

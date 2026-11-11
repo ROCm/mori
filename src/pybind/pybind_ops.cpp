@@ -342,49 +342,20 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 
   m.def("launch_reset", &LaunchReset);
 
-  using mori::moe::sim::EpSim;
-  using release = py::call_guard<py::gil_scoped_release>;
-  m.def("ep_sim_enabled", &mori::moe::sim::IsEnabled);
-  py::class_<EpSim>(m, "EpSim")
-      .def(py::init<const std::string&, int, int, int, int, int, int, bool>(), py::arg("group"),
-           py::arg("rank"), py::arg("world_size"), py::arg("max_tokens"), py::arg("topk"),
-           py::arg("experts_per_rank"), py::arg("max_recv"), py::arg("async_send"))
-      .def(
-          "dispatch",
-          [](EpSim& sim, int numTokens, uintptr_t recvIds, uintptr_t expertCount) {
-            return sim.Dispatch(numTokens, reinterpret_cast<int32_t*>(recvIds),
-                                reinterpret_cast<int32_t*>(expertCount));
-          },
-          py::arg("num_tokens"), py::arg("recv_ids_ptr"), py::arg("expert_count_ptr"), release())
-      .def("arrive", &EpSim::Arrive)
-      .def("combine", &EpSim::Combine, release())
-      .def("end_call", &EpSim::EndCall, release())
-      .def("wait", &EpSim::Wait, release());
-  namespace simrt = mori::moe::sim::rt;
-  m.def("ep_sim_runtime_available", &simrt::Available);
-  m.def("ep_sim_stats", &simrt::Stats);
+  namespace sim = mori::moe::sim;
+  m.def("ep_sim_enabled", &sim::IsEnabled);
+  m.def("ep_sim_runtime_available", &sim::Available);
+  m.def("ep_sim_stats", &sim::Stats);
   m.def(
       "ep_sim_register_v1",
       [](mori::moe::EpDispatchCombineHandle& h, const std::string& group) {
         const auto& c = h.config;
         const int64_t stride = c.MaxNumTokensToSend();
-        simrt::Register({1,
-                         c.rank,
-                         c.worldSize,
-                         c.gpuPerNode,
-                         c.maxNumInpTokenPerRank,
-                         c.numExpertPerToken,
-                         c.numExpertPerRank,
-                         c.MaxNumTokensToRecv(),
-                         stride,
-                         stride,
-                         0,
-                         0,
-                         0,
-                         0,
-                         {reinterpret_cast<uintptr_t>(h.dispatchGridBarrier),
-                          reinterpret_cast<uintptr_t>(h.totalRecvTokenNum)},
-                         group});
+        std::vector<uintptr_t> keys{reinterpret_cast<uintptr_t>(h.dispatchGridBarrier),
+                                    reinterpret_cast<uintptr_t>(h.totalRecvTokenNum)};
+        sim::Register({1, c.rank, c.worldSize, c.gpuPerNode, c.maxNumInpTokenPerRank,
+                       c.numExpertPerToken, c.numExpertPerRank, c.MaxNumTokensToRecv(), stride,
+                       stride, 0, 0, 0, 0, std::move(keys), group});
       },
       py::arg("handle"), py::arg("group"));
   m.def(
@@ -393,9 +364,9 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
          int expertsPerRank, int maxRecv, uintptr_t outIdx, uintptr_t srcMap,
          std::vector<uintptr_t> keys, double dispRowBytes, double combRowBytes) {
         // recv_to_src_token = src_rank * max_tok + token; tok_map = dest_rank * max_recv + slot
-        simrt::Register({2, rank, world, gpuPerNode, maxTok, topk, expertsPerRank, maxRecv, maxTok,
-                         maxRecv, dispRowBytes, combRowBytes, outIdx, srcMap, std::move(keys),
-                         group});
+        sim::Register({2, rank, world, gpuPerNode, maxTok, topk, expertsPerRank, maxRecv, maxTok,
+                       maxRecv, dispRowBytes, combRowBytes, outIdx, srcMap, std::move(keys),
+                       group});
       },
       py::arg("group"), py::arg("rank"), py::arg("world_size"), py::arg("gpu_per_node"),
       py::arg("max_tokens"), py::arg("topk"), py::arg("experts_per_rank"), py::arg("max_recv"),

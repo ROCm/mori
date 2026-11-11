@@ -1,7 +1,6 @@
 set(MORI_OPS_SOURCES dispatch_combine/dispatch_combine.cpp
                      dispatch_combine/launch.cpp
-                     dispatch_combine/sim.cpp
-                     dispatch_combine/sim_rt.cpp)
+                     dispatch_combine/sim.cpp)
 
 add_library(mori_ops SHARED ${MORI_OPS_SOURCES})
 

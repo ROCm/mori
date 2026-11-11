@@ -365,18 +365,18 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         self._sim_register()
 
     def _sim_register(self):
-        """MORI_EP_SIM_MODE=runtime: the simulated runtime's handlers for this op's kernels find it
-        by these buffers and write its receive-side outputs."""
-        from mori.ops.dispatch_combine import _ep_sim_rt_group, ep_sim_mode
+        """MORI_EP_SIM_ENABLE on a simulated runtime: its handlers for this op's kernels find it by
+        these buffers and write its receive-side outputs."""
+        from mori.ops.dispatch_combine import _ep_sim_group, ep_sim_active
 
-        self._sim_rt = ep_sim_mode() == "runtime"
+        self._sim_rt = ep_sim_active()
         if not self._sim_rt:
             return
         from mori import cpp as mori_cpp
 
         cfg = self.cfg
         mori_cpp.ep_sim_register_v2(
-            _ep_sim_rt_group(cfg),
+            _ep_sim_group(cfg),
             cfg.rank,
             cfg.world_size,
             int(cfg.gpu_per_node or cfg.world_size),

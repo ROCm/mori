@@ -27,83 +27,15 @@
 
 namespace mori {
 namespace moe {
-// GPU-free EP (MORI_EP_SIM_ENABLE=1): dispatch and combine launch no kernel and move no token.
-// Each rank draws its tokens' routing from MORI_EP_SIM_ROUTING, and the ranks of the EP group (all
-// on this host) exchange it through shared memory, so each rank learns which tokens it receives.
-// An op takes a fixed MORI_EP_SIM_DISPATCH_US / MORI_EP_SIM_COMBINE_US and, as with the real
-// cross-device barrier, ends on every rank at the latest arrival + latency.
+// GPU-free EP (MORI_EP_SIM_ENABLE=1): the EP ops are built and launched as on a GPU, eagerly or in
+// CUDA graphs, on a simulated HIP runtime that executes no kernel (e.g. Sundial's virtual GPU,
+// libvgpu). For the dispatch / combine / local expert count kernels the runtime calls mori's host
+// handlers (sim.cpp), which draw each dispatch's routing from MORI_EP_SIM_ROUTING, exchange it
+// through the runtime's all-to-all (which times the op) and write the outputs the kernels write.
 namespace sim {
 
 bool IsEnabled();
-
-// The expert distributions of MORI_EP_SIM_ROUTING, one per MoE layer; dispatch calls cycle through
-// the layers.
-class Routing {
- public:
-  explicit Routing(int numExperts);
-  ~Routing();
-  // topk distinct experts per token into ids[numTokens * topk], from the layer of dispatch `call`.
-  void Draw(uint64_t call, uint64_t seed, int numTokens, int topk, int32_t* ids) const;
-
- private:
-  struct Layer;
-  std::vector<Layer> layers_;
-};
-
-class EpSim {
- public:
-  // `group` names the shared memory and is the same on every rank; "" only when worldSize == 1.
-  // asyncSend: AsyncLL, whose send returns before the op ends and whose recv waits for it.
-  EpSim(const std::string& group, int rank, int worldSize, int maxTokens, int topk,
-        int expertsPerRank, int maxRecv, bool asyncSend);
-  ~EpSim();
-  EpSim(const EpSim&) = delete;
-  EpSim& operator=(const EpSim&) = delete;
-
-  // Marks this rank's arrival at the next Dispatch/Combine. Call it first, so that the caller's own
-  // work before the op runs inside the op's latency, as host work overlaps a kernel on a GPU.
-  void Arrive();
-  // Draws the expert ids of this rank's numTokens tokens from the next layer's distribution and
-  // exchanges them with every rank. Writes the ids of the tokens this rank receives to recvIds
-  // ([maxRecv, topk], by source rank then token) and their count per local expert to
-  // expertCount; returns how many tokens it receives.
-  int Dispatch(int numTokens, int32_t* recvIds, int32_t* expertCount);
-  // Returns the rows combine gives back: the token count of this rank's last dispatch.
-  int Combine();
-  // Ends a Dispatch/Combine call: waits for the op, except for an AsyncLL send.
-  void EndCall() const {
-    if (!asyncSend_) Wait();
-  }
-  // Sleeps until the last op ends on every rank.
-  void Wait() const;
-
- private:
-  struct Slot;
-  Slot* SlotOf(uint64_t seq, int rank) const;
-  // Begin stamps this rank's arrival into its slot; Publish shares the slot and waits for all.
-  Slot* Begin(int phase, double latencyUs, int numTokens);
-  void Publish(const Slot* mine);
-  // Draws this rank's routing into scratch_: ids, then per destination rank its tokens and hits.
-  void Route(int numTokens);
-
-  int rank_, world_, maxTokens_, topk_, expertsPerRank_, maxRecv_;
-  bool asyncSend_;
-  double dispatchUs_, combineUs_;
-  Routing routing_;
-  std::vector<int32_t> scratch_;  // the slot's contents, built here and copied in at once
-  std::string name_;
-  size_t bytes_{0}, slotBytes_{0};
-  char* base_{nullptr};
-  uint64_t seq_{0}, dispatches_{0};
-  int lastTokens_{0};
-  int64_t deadlineNs_{0}, arrivalNs_{0};
-};
-
-// Runtime mode (MORI_EP_SIM_MODE=runtime, sim_rt.cpp): the op is built and launched as on a GPU,
-// on a simulated HIP runtime that calls mori's host handlers for the EP kernels.
-namespace rt {
-
-// A simulated runtime is loaded (it exports the symbols sim_rt.cpp looks up).
+// A simulated runtime is loaded (it exports the symbols sim.cpp looks up).
 bool Available();
 
 // One op. Map entries: source = srcRank * srcStride + token; destination = destRank * destStride
@@ -121,7 +53,6 @@ void Register(const OpSpec& spec);
 // Counters of every op of this process (JSON); also written to MORI_EP_SIM_STATS_DIR.
 std::string Stats();
 
-}  // namespace rt
 }  // namespace sim
 }  // namespace moe
 }  // namespace mori

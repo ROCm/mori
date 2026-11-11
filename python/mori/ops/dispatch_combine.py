@@ -138,55 +138,40 @@ def _maybe_get_cco_comm(config):
 _ep_sim_ops = 0
 
 
+def ep_sim_active():
+    """MORI_EP_SIM_ENABLE=1: the EP ops run on a simulated HIP runtime (e.g. Sundial's libvgpu),
+    which calls mori's host handlers for the EP kernels (sim.hpp)."""
+    if not mori_cpp.ep_sim_enabled():
+        return False
+    if not mori_cpp.ep_sim_runtime_available():
+        raise RuntimeError(
+            "MORI_EP_SIM_ENABLE=1 needs a simulated HIP runtime (e.g. Sundial's libvgpu) loaded"
+        )
+    return True
+
+
 def _ep_sim_group(config):
-    """Shared-memory name of one EP op: the same on all its ranks, unique per op and job."""
+    """All-to-all group name of one simulated op (config: rank, world_size): the same on all its
+    ranks, unique per op and job."""
+    import uuid
+
     global _ep_sim_ops
     n, _ep_sim_ops = _ep_sim_ops, _ep_sim_ops + 1
     if config.world_size == 1:
-        return ""
+        return f"solo.{uuid.uuid4().hex[:16]}"
     if os.environ.get("MORI_EP_SIM_GROUP"):
         return f"{os.environ['MORI_EP_SIM_GROUP']}.{n}"
     if not dist.is_initialized():
         raise RuntimeError(
             "MORI_EP_SIM_ENABLE with world_size > 1 needs torch.distributed "
-            "or MORI_EP_SIM_GROUP to name the shared memory"
+            "or MORI_EP_SIM_GROUP to name the op's all-to-all group"
         )
-    import uuid
-
     # Only the default store is used, so any (or a faked) process-group backend works.
     store = dist.distributed_c10d._get_default_store()
     key = f"mori_ep_sim/{dist.get_rank() - config.rank}/{n}"
     if config.rank == 0:
         store.set(key, uuid.uuid4().hex[:16])
     return f"{store.get(key).decode()}.{n}"
-
-
-def ep_sim_mode():
-    """None when the sim is off, else MORI_EP_SIM_MODE: "standalone" (no GPU, no kernel, fixed
-    latency) or "runtime" (the real kernels on a simulated HIP runtime), by default runtime when
-    one is loaded."""
-    if not mori_cpp.ep_sim_enabled():
-        return None
-    available = mori_cpp.ep_sim_runtime_available()
-    mode = os.environ.get("MORI_EP_SIM_MODE") or (
-        "runtime" if available else "standalone"
-    )
-    if mode not in ("standalone", "runtime"):
-        raise ValueError(
-            f"MORI_EP_SIM_MODE must be standalone or runtime, got {mode!r}"
-        )
-    if mode == "runtime" and not available:
-        raise RuntimeError(
-            "MORI_EP_SIM_MODE=runtime needs a simulated HIP runtime (e.g. Sundial's libvgpu)"
-        )
-    return mode
-
-
-def _ep_sim_rt_group(config):
-    """Runtime mode: the all-to-all group name of one op (config: rank, world_size)."""
-    import uuid
-
-    return _ep_sim_group(config) or f"solo.{uuid.uuid4().hex[:16]}"
 
 
 class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
@@ -476,6 +461,18 @@ def _load_hip_modules(kernel_type, init_shmem=True):
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
+        sim = ep_sim_active()
+        # Wavefront size of THIS device (32 on gfx1250, 64 on gfx9xx). Used for
+        # every kernel launch's block dim; keep consistent with the device-side
+        # warpNum = blockDim.x / warpSize so combine LDS sizing stays in bounds.
+        self._warp_size = _detect_warp_size()
+        logger.debug("EpDispatchCombineOp: detected warp_size=%d", self._warp_size)
+        _ensure_jit_kernels(config.kernel_type)
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
         self._cpp_config = mori_cpp.EpDispatchCombineConfig(
             rank=config.rank,
             world_size=config.world_size,
@@ -496,23 +493,6 @@ class EpDispatchCombineOp:
             quant_type=_normalize_quant_type(config.quant_type),
             max_total_recv_tokens=config.max_total_recv_tokens,
         )
-        sim_mode = ep_sim_mode()
-        self._sim = sim_mode == "standalone"
-        if self._sim:
-            self._init_sim()
-            return
-
-        # Wavefront size of THIS device (32 on gfx1250, 64 on gfx9xx). Used for
-        # every kernel launch's block dim; keep consistent with the device-side
-        # warpNum = blockDim.x / warpSize so combine LDS sizing stays in bounds.
-        self._warp_size = _detect_warp_size()
-        logger.debug("EpDispatchCombineOp: detected warp_size=%d", self._warp_size)
-        _ensure_jit_kernels(config.kernel_type)
-
-        if dist.is_initialized():
-            dist.barrier()
-
-        handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
 
         self._cco_comm = _maybe_get_cco_comm(config)
         _cco_ptr = self._cco_comm.ptr if self._cco_comm is not None else 0
@@ -730,8 +710,8 @@ class EpDispatchCombineOp:
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
             )
 
-        if sim_mode == "runtime":
-            mori_cpp.ep_sim_register_v1(self._handle, _ep_sim_rt_group(config))
+        if sim:
+            mori_cpp.ep_sim_register_v1(self._handle, _ep_sim_group(config))
 
         # Buffers are zeroed as they are allocated, and peers do not wait for that: once
         # a peer reaches dispatch, its kernel writes straight into our buffers. A rank a
@@ -748,101 +728,6 @@ class EpDispatchCombineOp:
         if dist.is_initialized():
             torch.cuda.synchronize()
             dist.barrier()
-
-    # ------------------------------------------------------------------
-    # Simulation (MORI_EP_SIM_ENABLE): no GPU, no kernel; each op sleeps in C++
-    # ------------------------------------------------------------------
-    def _init_sim(self):
-        cfg = self.config
-        self._sim_ep = mori_cpp.EpSim(
-            _ep_sim_group(cfg),
-            cfg.rank,
-            cfg.world_size,
-            cfg.max_num_inp_token_per_rank,
-            cfg.num_experts_per_token,
-            cfg.num_experts_per_rank,
-            self.max_num_tokens_to_recv(),
-            cfg.kernel_type.value == EpDispatchCombineKernelType.AsyncLL.value,
-        )
-        self._sim_bufs = {}
-        self._sim_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.local_expert_count = torch.zeros(
-            cfg.num_experts_per_rank, dtype=torch.int32, device=self._sim_device
-        )
-
-    def _sim_buf(self, name, shape, dtype, device):
-        key = (name, tuple(shape), dtype, device)
-        if key not in self._sim_bufs:
-            self._sim_bufs[key] = torch.empty(shape, dtype=dtype, device=device)
-        return self._sim_bufs[key]
-
-    # The C++ simulator (mori::moe::sim::EpSim) draws the routing and times the op; these only
-    # wrap its results in tensors, between arrive() and end_call() so that their cost runs inside
-    # the op's latency.
-    def _sim_dispatch(self, input, scales, routing, return_routing):
-        """Outputs are cut to the tokens this rank receives under the simulated routing, so their
-        shapes carry the EP imbalance; out_indices, total_recv and local_expert_count are real,
-        the other outputs are not written. The `indices` passed in are ignored."""
-        self._sim_ep.arrive()
-        if routing is not None or return_routing:
-            raise NotImplementedError("routing handles are not simulated")
-        cfg, dev, cpu = self.config, input.device, torch.device("cpu")
-        k, max_recv = cfg.num_experts_per_token, self.max_num_tokens_to_recv()
-        # C++ writes host outputs in place; a torch copy here can cost ms when ranks share the
-        # host's CPUs, since each rank's intra-op thread pool assumes all of them.
-        out_ids = self._sim_buf("disp_i", (max_recv, k), TOPK_IDX_DTYPE, dev)
-        recv_ids = (
-            out_ids
-            if dev == cpu
-            else self._sim_buf("disp_i_host", out_ids.shape, torch.int32, cpu)
-        )
-        lec = self.local_expert_count
-        count = (
-            lec
-            if lec.device == cpu
-            else self._sim_buf("lec_host", lec.shape, torch.int32, cpu)
-        )
-        total = self._sim_ep.dispatch(
-            int(input.size(0)), recv_ids.data_ptr(), count.data_ptr()
-        )
-        if recv_ids is not out_ids:
-            out_ids[:total].copy_(recv_ids[:total])
-        if count is not lec:
-            lec.copy_(count)
-
-        def out(name, cols, dtype):
-            return self._sim_buf(name, (max_recv, cols), dtype, dev)[:total]
-
-        out_scales = None
-        if scales is not None and cfg.scale_dim > 0:
-            out_scales = out("disp_s", cfg.scale_dim, scales.dtype)
-        total_recv = self._sim_buf("disp_total", (1,), TOPK_IDX_DTYPE, dev)
-        total_recv.fill_(total)
-        outputs = (
-            out("disp_out", input.size(1), input.dtype),
-            out("disp_w", k, torch.float32),
-            out_scales,
-            out_ids[:total],
-            total_recv,
-        )
-        self._sim_ep.end_call()
-        return outputs
-
-    def _sim_combine(self, input, weights, routing):
-        """Outputs are cut to this rank's own tokens, the ones its last dispatch sent."""
-        self._sim_ep.arrive()
-        if routing is not None:
-            raise NotImplementedError("routing handles are not simulated")
-        n = self._sim_ep.combine()
-        cfg, dev = self.config, input.device
-        shape = (cfg.max_num_inp_token_per_rank, input.size(1))
-        out_weights = None
-        if weights is not None and weights.size(0) != 0:
-            w_shape = (cfg.max_num_inp_token_per_rank, cfg.num_experts_per_token)
-            out_weights = self._sim_buf("comb_w", w_shape, weights.dtype, dev)[:n]
-        outputs = (self._sim_buf("comb_out", shape, input.dtype, dev)[:n], out_weights)
-        self._sim_ep.end_call()
-        return outputs
 
     # ------------------------------------------------------------------
     # Kernel launch helpers
@@ -1255,10 +1140,6 @@ class EpDispatchCombineOp:
     def get_registered_combine_input_buffer(
         self, dtype: torch.dtype, hidden_dim: int = -1
     ):
-        if self._sim:
-            hidden = hidden_dim if hidden_dim > 0 else self.config.hidden_dim
-            shape = (self.max_num_tokens_to_recv(), hidden)
-            return self._sim_buf("comb_inp", shape, dtype, self._sim_device)
         ptr, shape0, shape1 = self._get_registered_combine_input_buffer(
             self._handle, hidden_dim
         )
@@ -1362,8 +1243,6 @@ class EpDispatchCombineOp:
         routing: "EpDispatchRoutingHandle | None" = None,
         return_routing: bool = False,
     ):
-        if self._sim:
-            return self._sim_dispatch(input, scales, routing, return_routing)
         if routing is not None and return_routing:
             raise ValueError(
                 "pass either `routing=` (replay) or `return_routing=True` "
@@ -1593,8 +1472,6 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
         call_local_expert_count: bool = False,
     ):
-        if self._sim:
-            return self._sim_ep.wait()
         if hasattr(self, "_cached_dispatch_launch"):
             _, _, actual_wpb = self._cached_dispatch_launch
         else:
@@ -1660,8 +1537,6 @@ class EpDispatchCombineOp:
         tensor handed to ``dispatch()`` -- not the received-token indices that
         ``dispatch()`` returned.
         """
-        if self._sim:
-            return self._sim_combine(input, weights, routing)
         if routing is not None and not self._supports_routing_handle():
             raise NotImplementedError(
                 f"routing handle path not supported for kernel_type="
@@ -1998,8 +1873,6 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        if self._sim:
-            return self._sim_ep.wait()
         if hasattr(self, "_cached_combine_launch"):
             _, _, actual_wpb = self._cached_combine_launch
         else:
@@ -2402,8 +2275,6 @@ class EpDispatchCombineOp:
         )
 
     def reset(self):
-        if self._sim:
-            return
         self._reset_func(self._handle, _current_stream())
 
     def _allgather_with_token_num_padding(self, input, max_token_num):
