@@ -1,10 +1,10 @@
 name: MoRI CI test
 on:
-  # main runs every 6 hours rather than on each merge: a merge cancelled the main
-  # run before it, so most never finished. ci_scope.py skips a run when main has
-  # not moved since the last one.
+  # main runs every 3 hours rather than on each merge: a merge cancelled the main
+  # run before it, so most never finished. ci_scope.py runs only the lanes for
+  # what changed since main's last green run, and nothing if main has not moved.
   schedule:
-    - cron: '30 */6 * * *'
+    - cron: '30 */3 * * *'
   pull_request:
     branches: [main]
     # ready_for_review: drafts run nothing. The ci:full and ci:mi300x labels
@@ -49,7 +49,7 @@ jobs:
     name: scope
     uses: ./.github/workflows/ci-scope.yml
     # The one job that may write: it keeps the routing comment on the PR. It reads
-    # this workflow's runs to tell whether main moved since its last run.
+    # this workflow's runs and their jobs to scope the scheduled runs on main.
     permissions:
       actions: read
       contents: read
