@@ -319,12 +319,18 @@ BANDWIDTH_METRIC_GRAND_MEAN = "grand_mean"
 
 
 def _rule_geometry(rule: dict) -> str:
-    """block/warp/rdma of a rule, in the order tuning prints them."""
-    return (
+    """block/warp/rdma of a rule, in the order tuning prints them, then the
+    V2 active QP count and combine load-first when the rule sets them."""
+    geometry = (
         f"block={rule.get('block_num')} "
         f"warp={rule.get('warp_per_block')} "
         f"rdma={rule.get('rdma_block_num')}"
     )
+    if rule.get("active_qps") is not None:
+        geometry += f" active_qps={rule['active_qps']}"
+    if rule.get("combine_load_first"):
+        geometry += " load_first"
+    return geometry
 
 
 def _is_number(value) -> bool:

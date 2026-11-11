@@ -147,18 +147,19 @@ AREAS = [
     ("tools", "tools", r"^tools/"),
     # The EPv2 tests import it.
     ("cco_tests", {"cco", "epv2"}, r"^examples/cco/python/cco_example_common\.py$"),
+    # The fused GEMM tests and test_sdma_allgather_op import it.
+    ("cco_tests", {"cco", "fused"}, r"^tests/python/cco/kfd_settle\.py$"),
     (
         "fused",
         {"fused"},
         rf"^python/mori/ops/{FUSED_OPS}/|^tests/python/cco/(test_)?({FUSED_OPS}|flydsl_ar)"
-        r"|^tests/python/cco/(kfd_settle|bench_runs)\.py$|^benchmark/cco/flydsl/"
-        r"|^python/mori/ir/flydsl/",
+        r"|^tests/python/cco/bench_runs\.py$|^benchmark/cco/flydsl/|^python/mori/ir/flydsl/",
     ),
     (
         "cco_tests",
         {"cco"},
         r"^tests/(cpp|python)/cco/|^examples/cco|^benchmark/cco/|^tools/run_cco_tests\.sh$"
-        r"|^(src|tests/python)/allocator/",
+        r"|^(src|tests/python)/allocator/|^python/mori/ops/sdma_allgather/",
     ),
     (
         "cco",
@@ -228,7 +229,7 @@ AREAS = [
 # EP v1, shmem, KIWI, mlx5, IO, the shared RDMA/SDMA/bootstrap/topology code, CCL,
 # NIC detection, and what builds or runs them there.
 MI300X_PATHS = re.compile(
-    r"^(src|include/mori|python/mori)/ops/(?!dispatch_combine_v2/|gemm_|ag_gemm/|a2a_gemm/|__init__\.py$)"
+    r"^(src|include/mori|python/mori)/ops/(?!dispatch_combine_v2/|gemm_|ag_gemm/|a2a_gemm/|sdma_allgather/|__init__\.py$)"
     r"|^tests/python/ops/(?!dispatch_combine_v2/)|^examples/ops/"
     r"|(^|/)(shmem|kiwi)(/|_|\.|$)|mlx5|(^|/|_)io(/|_|\.|$)|(^|/)ras(/|_|\.|$)"
     r"|^(src|include/mori)/application/(transport/(rdma|sdma)|bootstrap|topology|context|memory)/"
