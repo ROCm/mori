@@ -35,6 +35,23 @@ The binary `build-netmon/ainic-netmon` links glibc dynamically and libstdc++ sta
 can be copied to other hosts and containers (glibc >= the build host's). The Docker image
 (`docker/Dockerfile`) builds on Ubuntu 22.04 (glibc 2.35) and also contains the report tool.
 
+## Installed with mori
+
+mori builds this tool by default (`BUILD_NETMON=ON`) and ships it in the wheel, so after
+`pip install` of mori:
+
+```
+ainic-netmon list                       # or: mori netmon list
+ainic-netmon record -o DIR -d 60s       # unprivileged: rdma + ethtool
+ainic-netmon record --sudo -o DIR ...   # re-runs the binary with sudo (all sources)
+sudo "$(mori netmon --path)" record ... # equivalent, by absolute path
+ainic-netmon-report report DIR -o report.html   # or: mori netmon-report ...
+```
+
+`sudo ainic-netmon` on its own usually fails because sudo resets `PATH` (pip installs
+commands into a virtualenv or `~/.local/bin`). The report needs `numpy` and `plotly` in the
+Python environment. Build mori with `BUILD_NETMON=OFF` to leave the tool out.
+
 ## Deployment: three ways, from most to least data
 
 | Where | How | Sources |

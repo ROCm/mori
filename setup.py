@@ -885,8 +885,12 @@ class CMakeBuild(build_ext):
             netmon_dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(netmon_src, netmon_dst)
             os.chmod(netmon_dst, 0o755)
-        elif netmon_dst.exists():
-            netmon_dst.unlink()
+        else:
+            # Also drop a copy staged by an earlier BUILD_NETMON=ON build in build_lib:
+            # setuptools reuses that directory and would ship the stale binary.
+            for stale in (netmon_dst, build_lib / "mori/bin/ainic-netmon"):
+                if stale.exists():
+                    stale.unlink()
 
         umbp_master_src = build_dir / "src/umbp/umbp_master"
         umbp_master_dst = root_dir / "python/mori/umbp_master"
