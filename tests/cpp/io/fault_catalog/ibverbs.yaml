@@ -31,6 +31,9 @@
 #                             (BatchWrite of a 256 MiB and a 4 KiB segment over 2
 #                              QPs, the named one posted first: a fault on the small
 #                              one lands while the large one is still on the wire)
+#               spread        (BatchWrite of 4 non-adjacent 60 MiB segments over 4
+#                              QPs; with MORI_IO_NUM_WORKER_THREADS=4 each is posted
+#                              by its own worker thread)
 #   notify      MORI notifications on: a SEND/RECV after the data tells the target
 #               (default false)
 #   warmup      clean transfers before the fault is armed; 0 arms it before the
@@ -88,6 +91,25 @@
   rule: post_send_fail:skip=8:count=0
   transfer: large_then_small
   env: MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
+
+# Worker threads: four workers each post one 60 MiB segment, in 64 WRs 4 at a time, on
+# their own QP, so their ~16 posts each interleave. The failing worker returns at once
+# and the others keep posting; the transfer may report the failure only once every
+# worker's WRs have stopped, and the posted credits come back summed over the workers.
+- id: post_send_fail.workers.one
+  real_world: one worker thread's post fails while the other workers' writes are on the wire
+  rule: post_send_fail:skip=20
+  transfer: spread
+  env: MORI_IO_NUM_WORKER_THREADS=4,MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
+
+# Every post after the twentieth fails, completion markers included, so each worker still
+# posting fails (none can have finished its ~16 posts by then: at least three do) and
+# the QPs holding its pending WRs are cut.
+- id: post_send_fail.workers.several
+  real_world: several worker threads' posts fail, and their QPs refuse completion markers
+  rule: post_send_fail:skip=20:count=0
+  transfer: spread
+  env: MORI_IO_NUM_WORKER_THREADS=4,MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
 
 - id: post_send_fail.notify
   real_world: data posted, then the notification post fails

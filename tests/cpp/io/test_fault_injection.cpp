@@ -93,6 +93,9 @@ enum class Op {
   // lands while the large one is still on the wire. Segments go out in remote-offset order.
   LargeThenSmall,  // the large one is posted first: for faults on the second post
   SmallThenLarge,  // the small one is posted, and completes, first
+  // BatchWrite of 4 non-adjacent 60 MiB segments over 4 QPs. With worker threads each
+  // segment is posted by its own worker on its own QP, so the workers' posts interleave.
+  Spread,
 };
 
 enum class Side { Initiator, Target };  // which process the fault is armed in
@@ -153,10 +156,12 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
       e.op = Op::LargeThenSmall;
     } else if (transfer == "small_then_large") {
       e.op = Op::SmallThenLarge;
+    } else if (transfer == "spread") {
+      e.op = Op::Spread;
     } else {
       throw std::runtime_error(where +
-                               ": transfer must be write, read, batch, large_then_small or "
-                               "small_then_large, got '" +
+                               ": transfer must be write, read, batch, large_then_small, "
+                               "small_then_large or spread, got '" +
                                transfer + "'");
     }
     e.notify = mori::yaml::GetBool(raw, "notify", false, where);
@@ -239,6 +244,11 @@ constexpr size_t kSkewLargeBytes = size_t{256} << 20;
 constexpr size_t kSkewSmallBytes = 4 << 10;
 constexpr size_t kSkewFarOffset = kSkewLargeBytes + (1 << 20);
 constexpr size_t kBufBytes = kSkewFarOffset + kSkewSmallBytes;
+// Spread: [k * 64M, k * 64M + 60M) for k = 0..3, one per QP.
+constexpr int kSpreadSegments = 4;
+constexpr size_t kSpreadStride = size_t{64} << 20;
+constexpr size_t kSpreadBytes = size_t{60} << 20;
+static_assert((kSpreadSegments - 1) * kSpreadStride + kSpreadBytes <= kBufBytes);
 
 // The segments of a batch op: {offsets, sizes}, the same in the source and the destination.
 std::pair<SizeVec, SizeVec> Segments(Op op) {
@@ -249,6 +259,14 @@ std::pair<SizeVec, SizeVec> Segments(Op op) {
       return {{0, kSkewFarOffset}, {kSkewLargeBytes, kSkewSmallBytes}};
     case Op::SmallThenLarge:
       return {{0, 1 << 20}, {kSkewSmallBytes, kSkewLargeBytes}};
+    case Op::Spread: {
+      SizeVec offsets, sizes;
+      for (int k = 0; k < kSpreadSegments; ++k) {
+        offsets.push_back(k * kSpreadStride);
+        sizes.push_back(kSpreadBytes);
+      }
+      return {offsets, sizes};
+    }
     default:
       return {{0}, {kXferBytes}};
   }
@@ -329,7 +347,9 @@ std::unique_ptr<IOEngine> MakeEngine(const std::string& key, const Entry& e) {
   RdmaBackendConfig rdmaCfg{};
   rdmaCfg.enableNotification = e.notify;
   rdmaCfg.notifPerQp = 64;
-  rdmaCfg.qpPerTransfer = e.op == Op::Write || e.op == Op::Read ? 1 : 2;
+  rdmaCfg.qpPerTransfer = e.op == Op::Write || e.op == Op::Read ? 1
+                          : e.op == Op::Spread                  ? kSpreadSegments
+                                                                : 2;
   engine->CreateBackend(BackendType::RDMA, rdmaCfg);
   return engine;
 }
@@ -601,7 +621,8 @@ class PeerRig {
         break;
       case Op::Batch:
       case Op::LargeThenSmall:
-      case Op::SmallThenLarge: {
+      case Op::SmallThenLarge:
+      case Op::Spread: {
         MemDescVec local{local_->desc};
         MemDescVec remote{remote_};
         auto [segOffsets, segSizes] = Segments(op);
