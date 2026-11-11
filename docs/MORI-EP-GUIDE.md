@@ -2,9 +2,17 @@
 
 MORI-EP provides high-performance MoE (Mixture of Experts) dispatch and combine kernels for Expert Parallelism. It supports both intra-node (XGMI) and inter-node (RDMA) communication, delivering state-of-the-art bandwidth for token routing in models like DeepSeek V3.
 
+MORI-EP has two generations, EPv1 and EPv2. See [EP Generations](#ep-generations) to choose one. **Sections 1–12 describe EPv1** (`mori.ops`, built on MORI-SHMEM). EPv2 is described in EP Generations. Its package guide is [here](https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md).
+
 ## Table of Contents
 
-- [Quick Reference](#quick-reference)
+- [EP Generations](#ep-generations)
+  - [Choose a generation](#choose-a-generation)
+  - [EPv2 paths](#epv2-paths)
+  - [EPv2 quick start](#epv2-quick-start-8-gpus-one-node)
+  - [EPv2 restrictions](#epv2-restrictions)
+  - [Validation before tuning](#validation-before-tuning)
+- [Quick Reference (EPv1)](#quick-reference-epv1)
 - [1. Kernel Types](#1-kernel-types)
 - [2. Configuration](#2-configuration)
 - [3. Operator API](#3-operator-api)
@@ -26,7 +34,90 @@ MORI-EP provides high-performance MoE (Mixture of Experts) dispatch and combine 
 - [Build Options](#build-options)
 - [Source Files](#source-files)
 
-## Quick Reference
+## EP Generations
+
+### Choose a generation
+
+| | EPv1 | EPv2 |
+|---|---|---|
+| Built on | MORI-SHMEM (process-global init) | MORI-CCO (explicit `Communicator`) |
+| Import | `mori.ops` | `mori.ops.dispatch_combine_v2` |
+| Kernel selection | `EpDispatchCombineKernelType` (`IntraNode`, `InterNode`, `InterNodeV1`, ...) | `config.kernel_backend`: `"flydsl"` or `"hip"` (default: HIP on gfx125x, FlyDSL elsewhere). Internode is selected by `gpu_per_node < world_size` |
+| Intra-node | Yes | Yes |
+| Inter-node | Yes | HIP backend only, preview |
+| GPUs | gfx942, gfx950 | gfx942, gfx950, **gfx1250** |
+| Design target | Node-scale and multi-node EP | Native design for gfx1250 and rack-scale EP |
+
+**Which one to use:**
+
+- **gfx1250: use EPv2.** gfx1250 supports EPv2 only.
+- **gfx942 / gfx950 in production: keep the API you have tested.** EPv1 has the full set of inter-node kernels and tuning tables. Move to EPv2 only after you evaluate it.
+- **New work for rack-scale or gfx1250: start with EPv2.**
+
+The EPv1 and EPv2 paths use different configuration objects and different initialization. EPv1 needs SHMEM initialization ([Section 5](#5-initialization)). EPv2 needs an explicit CCO communicator ([CCO Guide](MORI-CCO-GUIDE.md)). EPv2 does not use the process-global SHMEM bootstrap.
+
+This guide describes the development source. Not all paths are in every published wheel. Check the installed release and its [release notes](https://github.com/ROCm/mori/releases).
+
+### EPv2 paths
+
+| Path | Selection | Topology | Scope and restrictions |
+|---|---|---|---|
+| EPv2, FlyDSL | `kernel_backend="flydsl"` | Intra-node only | Gather/scatter combine, quantization, standard-MoE conversion and routing replay, subject to the dtype and architecture restrictions below. |
+| EPv2, HIP | `kernel_backend="hip"` | Intra-node | Gather combine in BF16/FP32. Dispatch can carry already-quantized FP8/FP4 payloads. Does not need FlyDSL. |
+| EPv2, HIP internode (preview) | HIP backend with `gpu_per_node < world_size` | Multiple physical nodes over CCO/GDA | BF16/FP32/FP8 dispatch, plus packed FP4 dispatch with a BF16 or FP32 combine (not with `async_ll`). No FP4 combine, quantization, standard-MoE conversion or scatter combine. The node grouping of the communicator must match the config. |
+
+Select the backend with `config.kernel_backend` or `MORI_V2_KERNEL_BACKEND`. The default is the HIP backend on gfx125x and the FlyDSL backend elsewhere. Importing the package does not load a backend. Construction loads the selected one.
+
+### EPv2 quick start (8 GPUs, one node)
+
+```python
+from mori.cco import Communicator
+from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
+
+# Rank 0 creates the unique id; broadcast it out-of-band (torch.distributed, MPI)
+uid = Communicator.get_unique_id() if rank == 0 else None
+uid = broadcast(uid)
+
+with Communicator.init(world_size, rank, uid, per_rank_vmm=per_rank_bytes) as comm:
+    config = EpDispatchCombineConfig(
+        rank=rank,
+        world_size=world_size,
+        hidden_dim=7168,
+        max_num_inp_token_per_rank=4096,
+        num_experts_per_rank=32,
+        num_experts_per_token=8,
+        data_type=torch.bfloat16,
+        kernel_backend="hip",   # or "flydsl"; the default is HIP on gfx125x, FlyDSL elsewhere
+    )
+    op = EpDispatchCombineOp(config, comm)
+    recv_x, recv_w, recv_s, recv_i, total_recv, routing = op.dispatch(
+        input, weights, scales, indices, return_routing=True)
+    # ... run expert computation on recv_x ...
+    out, out_w = op.combine(expert_output, weights, routing=routing)
+```
+
+For `per_rank_vmm` sizing and the full configuration, see the [EPv2 package guide](https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md).
+
+### EPv2 restrictions
+
+- FP4 conversion kernels need gfx950 or gfx1250. gfx942 has no conversion intrinsics. The two targets use different instructions (gfx950: the `cvt_scalef32_pk_*_fp4` pair-at-a-time family; gfx1250: pack-of-8). This is a per-target port, not one shared path.
+- FP8 format depends on the target: OCP E4M3 on gfx950, E4M3FNUZ on gfx942.
+- On the internode path, `quant_type` must be `"none"`. The config rejects anything else when `world_size > gpu_per_node`, for any backend. The quantized-combine staging path is incomplete there. HIP is the only backend with an internode path today.
+- `gpu_per_node` sets the physical node grouping. One host cannot emulate the two-node internode test by changing `world_size` alone.
+- For internode, `internode_kernel` is `"v2"`, `"v2_ll"` or `"auto"`. `"auto"` chooses by the token count of the current call, not by the buffer capacity.
+
+### Validation before tuning
+
+Run the allocated-node checks in the [Quickstart](quickstart.rst) before you measure performance. The source package also has:
+
+- `tests/python/ops/dispatch_combine_v2/test_ep_backend_parity.py`: compare HIP and FlyDSL on the same inputs.
+- `tests/python/ops/dispatch_combine_v2/test_graph_capture.py`: graph replay.
+- `tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py`: real two-node correctness, benchmark, tuning and stress runs.
+- `tests/python/ops/dispatch_combine_v2/bench_ep.py`: benchmark points with an identity-expert correctness check by default.
+
+Record the MORI and FlyDSL revisions, backend, GPU, NIC, transport, dtype, quantization mode, shape and graph mode with your results. A successful intranode benchmark does not validate an internode configuration.
+
+## Quick Reference (EPv1)
 
 ```python
 import mori

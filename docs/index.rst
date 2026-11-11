@@ -71,7 +71,7 @@ Components
    * - **MORI-SHMEM**
      - OpenSHMEM-style symmetric memory APIs for GPU memory and RDMA
    * - **MORI-CCO**
-     - Collective Communication Object: explicit-handle GPU communication (LSA / GDA / SDMA)
+     - Next-Generation Collective Communication Object for GPUs: symmetric memory, natively designed for compute-communication fusion (LSA / GDA / SDMA)
    * - **MORI-UMBP**
      - Unified memory and bandwidth pool with tiered storage and distributed KV access
    * - **MORI-VIZ**

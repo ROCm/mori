@@ -1,7 +1,9 @@
 # MORI CCO Guide
 
-**CCO** (Collective Communication Object) is MORI's GPU communication layer
-built around an explicit communicator handle. Unlike a process-global singleton,
+**CCO** (Next-Generation Collective Communication Object for GPUs) is MORI's GPU
+communication layer. It supports symmetric memory (symm mem) and is natively
+designed for compute-communication fusion. It is built around an explicit
+communicator handle. Unlike a process-global singleton,
 every `ccoComm` is independently allocated, so a single process can hold multiple
 independent communicators and drive them concurrently from multiple threads.
 
@@ -13,6 +15,12 @@ CCO exposes GPU-initiated one-sided communication over three transports:
 - **GDA** (GPU-Direct Async) — cross-node one-sided RDMA (put / get / signal /
   counter) issued from the device.
 - **SDMA** — copy-engine transfers with a device-visible signal pool.
+
+CCO is built for compute-communication fusion: a GEMM kernel can issue the
+transfer itself, on symmetric memory, and overlap it with its own math. The
+fused GEMM + collective operators (`mori.ops.gemm_ar`, `gemm_a2a`, `gemm_ag`,
+`ag_gemm`, `a2a_gemm`) are described in the
+[Fused GEMM + Collective Guide](MORI-CCO-FUSED-OPS-GUIDE.md).
 
 ## Table of Contents
 
