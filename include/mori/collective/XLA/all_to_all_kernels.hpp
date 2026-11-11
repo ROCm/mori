@@ -105,6 +105,54 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPairs pairs,
   }
 }
 
+// Single-block, compute-free ragged all-to-all (XLA ragged-all-to-all
+// semantics). For peer p and update u (idx = p*U + u) PE myPe copies rows
+// [inOffs[idx], inOffs[idx] + sendSizes[idx]) of `input` to rows starting at
+// outOffs[idx] of peer p's `output`; outOffs index the RECEIVER's buffer. The
+// metadata (int64 rows) stays in device memory and is read by the SDMA issue
+// lanes. `output` must sit at the same symmetric-heap offset on every PE;
+// `input` may be any local buffer. Completion and generations are exactly
+// AllToAllPushKernel's: every peer gets one signal in slot 0.
+template <int Flags>
+__global__ void RaggedAllToAllPushKernel(int myPe, int npes, const void* input, void* output,
+                                         const int64_t* __restrict__ inOffs,
+                                         const int64_t* __restrict__ sendSizes,
+                                         const int64_t* __restrict__ outOffs, int U,
+                                         size_t rowBytes, cco::ccoDevComm devComm,
+                                         cco::ccoWindow_t heapWin,
+                                         uint64_t* __restrict__ barrierCtr,
+                                         uint64_t* __restrict__ arrived) {
+  const uint32_t stride4G = heapWin->stride4G;
+  const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
+
+  if constexpr (Flags & kAsyncStart) {
+    PostArrival(barrierCtr, pushGen - 1, myPe, npes, stride4G);
+    __syncthreads();
+
+    auto* const localDst = static_cast<uint8_t*>(output);
+    auto* const src = static_cast<const uint8_t*>(input);
+    uint64_t* const myRow = arrived + myPe * kArrivedStride;
+    StartSdmaRaggedScatter(
+        devComm.sdma, npes, U, inOffs, sendSizes, outOffs, rowBytes, pushGen,
+        [=](int peer) {
+          auto [dstP, rowP] = PeerPtrs(localDst, myRow, peer, myPe, stride4G);
+          return RaggedPeer{src, dstP, rowP, rowP + kRaggedScratch,
+                            peer != myPe ? BarrierGate(barrierCtr, peer) : nullptr,
+                            static_cast<uint32_t>(pushGen - 1)};
+        });
+  }
+  if constexpr ((Flags & kAsyncDone) == 0) return;
+
+  if (threadIdx.x < warpSize) {
+    WaitArrivedAndDelivered(arrived, /*slot=*/0, pushGen, myPe, npes, stride4G);
+  }
+  __syncthreads();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+  if (threadIdx.x == 0) {
+    AtomicStore<ESystemScope>(&barrierCtr[myPe], pushGen);
+  }
+}
+
 // Multi-block, SDMA-free all-to-all: every PE reads, from each peer p, the chunk
 // p sends to it and stores it into its own recv slot for sender p.
 //   pairs      : npes endpoints, by value; pairs.p[p].dest (local) receives

@@ -408,6 +408,19 @@ class CollectivesFacade {
   hipError_t RunAllToAll(const AddressVector& addrs, size_t chunkBytes, hipStream_t stream,
                          bool isAsync = false);
 
+  // Ragged all-to-all (XLA ragged-all-to-all semantics, SDMA push). For peer p
+  // and update u (idx = p*numUpdates + u), rows [inOffs[idx], +sendSizes[idx])
+  // of input go to rows starting at outOffs[idx] of peer p's output; outOffs
+  // index the receiver's buffer. inOffs/sendSizes/outOffs are device int64
+  // arrays of npes*numUpdates rows, read by the kernel (no host sync). rowBytes
+  // is the byte size of one row. output must be in the symmetric heap at the
+  // same offset on every rank; input may be any local buffer.
+  // isAsync: as for RunAllGather (input untouched, output unread until AsyncDone).
+  hipError_t RunRaggedAllToAll(const void* input, void* output, const int64_t* inOffs,
+                               const int64_t* sendSizes, const int64_t* outOffs,
+                               int numUpdates, size_t rowBytes, hipStream_t stream,
+                               bool isAsync = false);
+
   // Device-wide barrier across all PEs on the given stream.
   hipError_t RunBarrier(hipStream_t stream);
 
@@ -551,7 +564,7 @@ private:
   uint64_t* barrierCtr_;     // this range's control slot in state_.commCtl
   uint64_t* arrived_;        // barrierCtr_ + kCCLMaxPeers
   // The async collective awaiting AsyncDone.
-  enum class AsyncOp { kNone, kAllGather, kAllToAll, kPermute, kReduceScatter };
+  enum class AsyncOp { kNone, kAllGather, kAllToAll, kRaggedAllToAll, kPermute, kReduceScatter };
   struct PendingAsync {
     AsyncOp op = AsyncOp::kNone;
     int npes = 0, dstPe = -1, srcPe = -1;  // kPermute only: global PE ranks

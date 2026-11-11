@@ -29,11 +29,12 @@
 // Usage:
 //   ./collectives_benchmark --coll <name> --npes <n> --size <num_elems> [opts]
 //
-//   --coll   reduce_scatter|all_reduce|all_gather|all_to_all|collective_permute
-//            (aliases: rs|ar|ag|a2a|cp)                                [required]
+//   --coll   reduce_scatter|all_reduce|all_gather|all_to_all|collective_permute|
+//            ragged_all_to_all (aliases: rs|ar|ag|a2a|cp|ra2a)         [required]
 //   --npes   number of GPUs/PEs to run in this process (1..8)          [required]
 //   --size   TOTAL element count. For the sharded collectives the per-rank shard
-//            is size/npes; for collective_permute size is the per-rank buffer.
+//            is size/npes; for collective_permute size is the per-rank buffer;
+//            for ragged_all_to_all it is the per-rank input/output buffer.
 //                                                                      [required]
 //   --dtype  f32|bf16|f16|s32|s64   (reduction collectives)            [f32]
 //   --op     sum|prod|min|max       (reduction collectives)            [sum]
@@ -48,6 +49,15 @@
 //            on the full communicator, so the two interleave on the
 //            sub-communicator's PEs (regression test for per-communicator
 //            control flags)
+//   ragged_all_to_all only (rows = size/row; every update holds at most
+//   rows/(npes*updates) rows, so no buffer can overflow):
+//   --row    elements per row                                          [4096]
+//   --updates updates per peer (U)                                     [1]
+//   --zero-frac probability that an update is empty; > 0 also makes PE 0
+//            send nothing to the last PE (copy-free signal path)       [0.1]
+//   --seed   seed of the random update sizes                           [1]
+//   --uniform every update holds rows/(npes*updates) rows (a regular
+//            all-to-all, compare with --coll a2a)
 //
 // Note: dtype/op beyond f32/sum require a build with FACADE_REDUCE_USE_ALL_TYPES=1.
 
@@ -55,6 +65,7 @@
 #include <atomic>
 #include <cassert>
 #include <numeric>
+#include <random>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -92,7 +103,9 @@ static constexpr size_t kHeapSlack = 64ULL * 1024 * 1024;
 
 static size_t AlignUp(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
-enum class Collective { kReduceScatter, kAllReduce, kAllGather, kAllToAll, kCollectivePermute };
+enum class Collective {
+  kReduceScatter, kAllReduce, kAllGather, kAllToAll, kCollectivePermute, kRaggedAllToAll
+};
 
 struct Config {
   Collective coll{};
@@ -112,6 +125,12 @@ struct Config {
   int subBase{0};
   int subN{0};
   bool mix{false};
+  // ragged_all_to_all
+  size_t rowElems{4096};
+  int updates{1};
+  double zeroFrac{0.1};
+  uint64_t seed{1};
+  bool uniform{false};
   // Derived in main() by SizeHeap(): the facade's symmetric heap window, the
   // push-path staging carved from it, and the comm's flat-VA slot.
   size_t heapBytes{0};
@@ -234,6 +253,43 @@ __global__ void VerifyPermuteKernel(const ElemT* recv, size_t numElements, int s
   }
 }
 
+// Ragged all-to-all: element c of input row `row` on PE `pe`. Integers in
+// [1, 251], exact in every dtype; a row shifted by one changes the value.
+__host__ __device__ __forceinline__ float RaggedTag(int pe, size_t row, size_t c) {
+  return static_cast<float>(((static_cast<size_t>(pe) * 64 + row) * 3 + c) % 251 + 1);
+}
+static constexpr float kRaggedSentinel = -1.0f;
+
+template <class ElemT>
+__global__ void FillRaggedKernel(ElemT* input, ElemT* output, size_t rows, size_t rowElems,
+                                 int myPe) {
+  const size_t N = rows * rowElems;
+  for (size_t g = blockIdx.x * blockDim.x + threadIdx.x; g < N;
+       g += (size_t)gridDim.x * blockDim.x) {
+    input[g] = static_cast<ElemT>(RaggedTag(myPe, g / rowElems, g % rowElems));
+    output[g] = static_cast<ElemT>(kRaggedSentinel);
+  }
+}
+
+// expect[r] = srcPe*rows + srcRow for an output row written by an update, -1
+// for a row no update covers (must keep the sentinel).
+template <class ElemT>
+__global__ void VerifyRaggedKernel(const ElemT* output, const int64_t* expect, size_t rows,
+                                   size_t rowElems, uint32_t* errorCount) {
+  const size_t N = rows * rowElems;
+  for (size_t g = blockIdx.x * blockDim.x + threadIdx.x; g < N;
+       g += (size_t)gridDim.x * blockDim.x) {
+    const int64_t e = expect[g / rowElems];
+    const float expected =
+        e < 0 ? kRaggedSentinel
+              : RaggedTag(static_cast<int>(e / static_cast<int64_t>(rows)),
+                          static_cast<size_t>(e % static_cast<int64_t>(rows)), g % rowElems);
+    if (fabsf(static_cast<float>(output[g]) - expected) > 1e-3f) {
+      atomicAdd(errorCount, 1u);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Per-kernel launcher wrappers: the only place that needs the concrete element
 // type. Each wraps one templated kernel in detail::DispatchReduceType(dt) so the
@@ -298,6 +354,71 @@ static void LaunchVerifyPermute(DataType dt, const void* recv, size_t numElement
                                                           numElements, srcPe, errorCount);
     return hipSuccess;
   });
+}
+
+static void LaunchFillRagged(DataType dt, void* input, void* output, size_t rows, size_t rowElems,
+                             int myPe, int blocks, int threads, hipStream_t s) {
+  (void)detail::DispatchReduceType(dt, [&](auto tag) {
+    using ElemT = decltype(tag);
+    FillRaggedKernel<ElemT><<<blocks, threads, 0, s>>>(
+        static_cast<ElemT*>(input), static_cast<ElemT*>(output), rows, rowElems, myPe);
+    return hipSuccess;
+  });
+}
+
+static void LaunchVerifyRagged(DataType dt, const void* output, const int64_t* expect, size_t rows,
+                               size_t rowElems, uint32_t* errorCount, int blocks, int threads,
+                               hipStream_t s) {
+  (void)detail::DispatchReduceType(dt, [&](auto tag) {
+    using ElemT = decltype(tag);
+    VerifyRaggedKernel<ElemT><<<blocks, threads, 0, s>>>(static_cast<const ElemT*>(output), expect,
+                                                         rows, rowElems, errorCount);
+    return hipSuccess;
+  });
+}
+
+// Ragged all-to-all plan, identical on every PE (same seed): the sizes S and,
+// for every sender s, XLA's per-update metadata. Index (s, d, u) is
+// (s*npes + d)*U + u; inOffs index s's input, outOffs index d's output, where
+// updates are packed by (d, u) and by (s, u) respectively.
+struct RaggedPlan {
+  std::vector<int64_t> sizes, inOffs, outOffs;
+};
+
+static RaggedPlan MakeRaggedPlan(const Config& cfg, int npes, size_t cap) {
+  const int U = cfg.updates;
+  const size_t n = static_cast<size_t>(npes) * npes * U;
+  auto at = [&](int s, int d, int u) { return (static_cast<size_t>(s) * npes + d) * U + u; };
+  RaggedPlan plan{std::vector<int64_t>(n, static_cast<int64_t>(cap)), std::vector<int64_t>(n),
+                  std::vector<int64_t>(n)};
+  if (!cfg.uniform) {
+    std::mt19937_64 rng(cfg.seed);
+    std::uniform_int_distribution<int64_t> len(1, static_cast<int64_t>(cap));
+    std::bernoulli_distribution empty(cfg.zeroFrac);
+    for (auto& sz : plan.sizes) sz = empty(rng) ? 0 : len(rng);
+    if (cfg.zeroFrac > 0 && npes > 1) {
+      for (int u = 0; u < U; u++) plan.sizes[at(0, npes - 1, u)] = 0;
+    }
+  }
+  for (int s = 0; s < npes; s++) {
+    int64_t pos = 0;
+    for (int d = 0; d < npes; d++) {
+      for (int u = 0; u < U; u++) {
+        plan.inOffs[at(s, d, u)] = pos;
+        pos += plan.sizes[at(s, d, u)];
+      }
+    }
+  }
+  for (int d = 0; d < npes; d++) {
+    int64_t pos = 0;
+    for (int s = 0; s < npes; s++) {
+      for (int u = 0; u < U; u++) {
+        plan.outOffs[at(s, d, u)] = pos;
+        pos += plan.sizes[at(s, d, u)];
+      }
+    }
+  }
+  return plan;
 }
 
 // --mix: largest heap offset any PE reached in the sub-communicator phase.
@@ -532,6 +653,88 @@ static int RunCollective(const Config& cfg, CollectivesFacade* facade, ccoComm* 
             LaunchVerifyPermute(dt, recv, n, srcPe, e, blocksFor(n), kThreads, stream);
           });
     }
+    case Collective::kRaggedAllToAll: {
+      const size_t rowElems = cfg.rowElems, rowBytes = rowElems * elemSize;
+      const size_t rows = size / rowElems;
+      const int U = cfg.updates;
+      const size_t cap = rows / (static_cast<size_t>(npes) * U);
+      if (cap == 0) {
+        XPUT("ERROR: --size %zu holds %zu rows of %zu elements, fewer than npes*updates = %d",
+             size, rows, rowElems, npes * U);
+        return 1;
+      }
+      const RaggedPlan plan = MakeRaggedPlan(cfg, npes, cap);
+      const size_t nMeta = static_cast<size_t>(npes) * U;
+      const size_t mine = static_cast<size_t>(myPe) * nMeta;  // my rows of the plan
+      auto at = [&](int s, int d, int u) { return (static_cast<size_t>(s) * npes + d) * U + u; };
+
+      // Output rows this PE receives: expect[r] = srcPe*rows + srcRow, -1 if untouched.
+      std::vector<int64_t> expect(rows, -1);
+      for (int s = 0; s < npes; s++) {
+        for (int u = 0; u < U; u++) {
+          const size_t i = at(s, myPe, u);
+          for (int64_t k = 0; k < plan.sizes[i]; k++) {
+            expect[plan.outOffs[i] + k] =
+                static_cast<int64_t>(s) * static_cast<int64_t>(rows) + plan.inOffs[i] + k;
+          }
+        }
+      }
+      // Bytes each sender pushes to remote peers (self-copies excluded).
+      double myRemote = 0, maxRemote = 0, totalRemote = 0;
+      for (int s = 0; s < npes; s++) {
+        double r = 0;
+        for (int d = 0; d < npes; d++) {
+          if (d == s) continue;
+          for (int u = 0; u < U; u++) r += static_cast<double>(plan.sizes[at(s, d, u)]) * rowBytes;
+        }
+        if (s == myPe) myRemote = r;
+        maxRemote = std::max(maxRemote, r);
+        totalRemote += r;
+      }
+      if (myPe == 0) {
+        XPUT("ragged: rows=%zu row=%zu updates=%d cap=%zu rows/update | remote bytes: "
+             "rank0 %.0f max %.0f avg %.0f",
+             rows, rowElems, U, cap, myRemote, maxRemote, totalRemote / npes);
+      }
+
+      void* input = allocBytes(size);
+      void* output = allocBytes(size);
+      auto* dMeta = static_cast<int64_t*>(CollectivesFacade::Allocate(3 * nMeta * sizeof(int64_t)));
+      if (input == nullptr || output == nullptr || dMeta == nullptr) {
+        XPUT("ERROR: Allocate failed");
+        return 1;
+      }
+      int64_t* dInOffs = dMeta;
+      int64_t* dSendSizes = dMeta + nMeta;
+      int64_t* dOutOffs = dMeta + 2 * nMeta;
+      const size_t metaBytes = nMeta * sizeof(int64_t);
+      HIP_RUNTIME_CHECK(hipMemcpyAsync(dInOffs, plan.inOffs.data() + mine, metaBytes,
+                                       hipMemcpyHostToDevice, stream));
+      HIP_RUNTIME_CHECK(hipMemcpyAsync(dSendSizes, plan.sizes.data() + mine, metaBytes,
+                                       hipMemcpyHostToDevice, stream));
+      HIP_RUNTIME_CHECK(hipMemcpyAsync(dOutOffs, plan.outOffs.data() + mine, metaBytes,
+                                       hipMemcpyHostToDevice, stream));
+      int64_t* dExpect = nullptr;
+      HIP_RUNTIME_CHECK(hipMalloc(&dExpect, rows * sizeof(int64_t)));
+      HIP_RUNTIME_CHECK(hipMemcpyAsync(dExpect, expect.data(), rows * sizeof(int64_t),
+                                       hipMemcpyHostToDevice, stream));
+      const size_t N = rows * rowElems;
+      LaunchFillRagged(dt, input, output, rows, rowElems, myPe, blocksFor(N), kThreads, stream);
+      HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+      ccoBarrierAll(comm);
+      const int rc = BenchAndVerify(
+          cfg, comm, myPe, stream, myRemote, nullptr,
+          [&] {
+            return facade->RunRaggedAllToAll(input, output, dInOffs, dSendSizes, dOutOffs, U,
+                                             rowBytes, stream);
+          },
+          [&](uint32_t* e) {
+            LaunchVerifyRagged(dt, output, dExpect, rows, rowElems, e, blocksFor(N), kThreads,
+                               stream);
+          });
+      HIP_RUNTIME_CHECK(hipFree(dExpect));
+      return rc;
+    }
   }
   return 1;
 }
@@ -618,6 +821,8 @@ static bool ParseColl(const char* s, Collective& c) {
   else if (!std::strcmp(s, "all_to_all") || !std::strcmp(s, "a2a")) c = Collective::kAllToAll;
   else if (!std::strcmp(s, "collective_permute") || !std::strcmp(s, "cp"))
     c = Collective::kCollectivePermute;
+  else if (!std::strcmp(s, "ragged_all_to_all") || !std::strcmp(s, "ra2a"))
+    c = Collective::kRaggedAllToAll;
   else return false;
   return true;
 }
@@ -628,6 +833,7 @@ static const char* CollName(Collective c) {
     case Collective::kAllGather: return "all_gather";
     case Collective::kAllToAll: return "all_to_all";
     case Collective::kCollectivePermute: return "collective_permute";
+    case Collective::kRaggedAllToAll: return "ragged_all_to_all";
   }
   return "?";
 }
@@ -679,9 +885,10 @@ static void Usage(const char* prog) {
   XPUT("Usage: %s --coll <name> --npes <n> --size <num_elems> "
        "[--dtype f32|bf16|f16|s32|s64] [--op sum|prod|min|max] "
        "[--mode push|pull|auto|alt (alt: flip push/pull every call)] "
-       "[--logS <n>, -1 = auto] [--warmup <n>] [--iters <n>] [--sub base:n [--mix]]\n"
-       "  coll: reduce_scatter|all_reduce|all_gather|all_to_all|collective_permute "
-       "(rs|ar|ag|a2a|cp)",
+       "[--logS <n>, -1 = auto] [--warmup <n>] [--iters <n>] [--sub base:n [--mix]] "
+       "[--row <elems>] [--updates <n>] [--zero-frac <f>] [--seed <n>] [--uniform]\n"
+       "  coll: reduce_scatter|all_reduce|all_gather|all_to_all|collective_permute|"
+       "ragged_all_to_all (rs|ar|ag|a2a|cp|ra2a)",
        prog);
 }
 
@@ -708,6 +915,10 @@ static std::pair<size_t, size_t> CollectiveBytes(const Config& cfg, size_t npes)
     case Collective::kAllReduce:
     case Collective::kAllToAll:
     case Collective::kCollectivePermute: bufBytes = 2 * N; break;
+    case Collective::kRaggedAllToAll:
+      bufBytes = 2 * N + 3 * npes * cfg.updates * sizeof(int64_t) +
+                 3 * CollectivesFacade::kDefAlign;
+      break;
   }
 
   // Only the reduce paths in PUSH mode stage through peer-writable scratch
@@ -787,6 +998,16 @@ int main(int argc, char* argv[]) {
       }
     } else if (!std::strcmp(argv[i], "--mix")) {
       cfg.mix = true;
+    } else if (!std::strcmp(argv[i], "--row")) {
+      cfg.rowElems = static_cast<size_t>(std::atoll(need("--row")));
+    } else if (!std::strcmp(argv[i], "--updates")) {
+      cfg.updates = std::atoi(need("--updates"));
+    } else if (!std::strcmp(argv[i], "--zero-frac")) {
+      cfg.zeroFrac = std::atof(need("--zero-frac"));
+    } else if (!std::strcmp(argv[i], "--seed")) {
+      cfg.seed = static_cast<uint64_t>(std::strtoull(need("--seed"), nullptr, 10));
+    } else if (!std::strcmp(argv[i], "--uniform")) {
+      cfg.uniform = true;
     } else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
       Usage(argv[0]);
       return 0;
@@ -817,6 +1038,17 @@ int main(int argc, char* argv[]) {
   if (cfg.mix && cfg.subN == cfg.npes) {
     XPUT("ERROR: --mix needs a --sub smaller than the world");
     return 1;
+  }
+  if (cfg.coll == Collective::kRaggedAllToAll) {
+    if (cfg.rowElems < 1 || cfg.updates < 1 || cfg.updates > kRaggedMaxUpdates ||
+        cfg.zeroFrac < 0 || cfg.zeroFrac > 1) {
+      XPUT("ERROR: ragged_all_to_all needs --row >= 1, --updates in 1..%d, --zero-frac in [0, 1]",
+           kRaggedMaxUpdates);
+      return 1;
+    }
+    XPUT("collectives_benchmark: ragged row=%zu updates=%d zero-frac=%.3f seed=%llu%s",
+         cfg.rowElems, cfg.updates, cfg.zeroFrac, static_cast<unsigned long long>(cfg.seed),
+         cfg.uniform ? " uniform" : "");
   }
   SizeHeap(cfg);
 

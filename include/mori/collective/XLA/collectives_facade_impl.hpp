@@ -180,7 +180,7 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   while (logS > 0 && (1ULL << logS) > maxSlicesByData) logS--;
   // Slicing only helps the SYNC path, where it overlaps SDMA-copy latency with
   // the reduction. 
-  if (phase != kSync) logS = 0;
+  //if (phase != kSync) logS = 0;
 
   if (mode == RsMode::kPull) {
     // The kernel resolves peer pe's copy of `input` device-side by the same
@@ -411,6 +411,11 @@ hipError_t CollectivesFacade::AsyncDone(hipStream_t stream) {
       AllToAllPushKernel<kAsyncDone><<<1, kThreads, 0, stream>>>(myPe_, nPes_, AddressPairs{}, 0,
                        devComm_, state_.heapWin, barrierCtr_, arrived_);
       break;
+    case AsyncOp::kRaggedAllToAll:
+      RaggedAllToAllPushKernel<kAsyncDone><<<1, kThreads, 0, stream>>>(myPe_, nPes_, nullptr,
+                       nullptr, nullptr, nullptr, nullptr, 0, 0, devComm_, state_.heapWin,
+                       barrierCtr_, arrived_);
+      break;
     case AsyncOp::kPermute:
       CollectivePermutePushKernel<kAsyncDone><<<1, kThreads, 0, stream>>>(
                        p.npes, p.dstPe, p.srcPe, nullptr, nullptr, 0, state_.devComm,
@@ -475,6 +480,32 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
   // Single block: SDMA pushes each send slot p to peer p's recv slot (+ self).
   AllToAllPushKernel<kSync><<<1, kThreads, 0, stream>>>(myPe_, nPes_, 
                     pairs, chunkBytes, devComm_,
+                    state_.heapWin, barrierCtr_, arrived_);
+  return hipGetLastError();
+}
+
+hipError_t CollectivesFacade::RunRaggedAllToAll(const void* input, void* output,
+                                                const int64_t* inOffs, const int64_t* sendSizes,
+                                                const int64_t* outOffs, int numUpdates,
+                                                size_t rowBytes, hipStream_t stream,
+                                                bool isAsync) {
+  if (numUpdates < 1 || numUpdates > kRaggedMaxUpdates) {
+    return hipErrorInvalidValue;
+  }
+  isAsync = isAsync && !AsyncDisabled();
+  // 4 issue lanes per peer: nPes_ <= kCCLMaxPeers fills at most one wave.
+  constexpr int kThreads = 64;
+  static_assert(kCCLMaxPeers * 4 <= kThreads);
+  if (isAsync) {
+    RaggedAllToAllPushKernel<kAsyncStart><<<1, kThreads, 0, stream>>>(myPe_, nPes_, input,
+                      output, inOffs, sendSizes, outOffs, numUpdates, rowBytes, devComm_,
+                      state_.heapWin, barrierCtr_, arrived_);
+    hipError_t err = hipGetLastError();
+    if (err == hipSuccess) pending_ = {AsyncOp::kRaggedAllToAll};
+    return err;
+  }
+  RaggedAllToAllPushKernel<kSync><<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output,
+                    inOffs, sendSizes, outOffs, numUpdates, rowBytes, devComm_,
                     state_.heapWin, barrierCtr_, arrived_);
   return hipGetLastError();
 }

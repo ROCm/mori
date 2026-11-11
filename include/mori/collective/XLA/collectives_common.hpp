@@ -70,11 +70,14 @@ enum PhaseFlags : int {
 // 32-bit wrap-safe compare would misread it as reached after 2^31 launches.
 //   [0, kPushMaxSlices) : scatter slice s (all push collectives, launch gen)
 //   kBcastArrived + b     : all-reduce broadcast b (launch gen)
+//   kRaggedScratch        : sink for the swaps of a ragged peer's non-final
+//                           copies; never polled
 enum ArrivedIdx {
   kBcastArrived = kPushMaxSlices,
   kArrivedStride = 16,
+  kRaggedScratch = kArrivedStride - 1,
 };
-static_assert(kBcastArrived + 2 <= kArrivedStride, "arrived row too small");
+static_assert(kBcastArrived + 2 <= kRaggedScratch, "arrived row too small");
 
 // Per-communicator control slot: uint64 barrierCtr[kCCLMaxPeers] (gen-barrier
 // flags, see GenBarrier) followed by arrived[kCCLMaxPeers][kArrivedStride]. Both
@@ -313,6 +316,28 @@ __device__ __forceinline__ void WriteFusedPacket(int lane,
   const cco::ccoUint4 v = {dw[0], dw[1], dw[2], dw[3]};
   StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
 } 
+
+// The atomic half of WriteFusedPacket alone: seven single-dword NOPs (zero
+// dwords) then ATOMIC SWAP64 *slot = value, for a signal with no copy ahead of
+// it (COPY_LINEAR cannot encode 0 bytes). Same lane layout as WriteFusedPacket.
+__device__ __forceinline__ void WriteSignalPacket(int lane, const uint64_t* slot, uint64_t value,
+                                                  uint32_t* outBasePtr) {
+  uint32_t dw[4] = {0, 0, 0, 0};
+  if (lane == 2) {
+    decltype(SDMA_PKT_ATOMIC::HEADER_UNION) swp;
+    swp.DW_0_DATA = 0;
+    swp.op = SDMA_OP_ATOMIC;
+    swp.operation = kSdmaAtomicSwap64;
+    dw[0] = swp.DW_0_DATA;
+    dw[1] = (uint32_t)((uintptr_t)slot);
+    dw[2] = (uint32_t)((uintptr_t)slot >> 32);
+    dw[3] = static_cast<uint32_t>(value);
+  } else if (lane == 3) {
+    dw[0] = static_cast<uint32_t>(value >> 32);
+  }
+  const cco::ccoUint4 v = {dw[0], dw[1], dw[2], dw[3]};
+  StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
+}
 
 // SDMA re-reads the flag every `interval` clocks while parked on a POLL_REGMEM.
 static_assert(sizeof(SDMA_PKT_POLL_REGMEM) == 6 * sizeof(uint32_t),
@@ -615,6 +640,111 @@ __device__ __forceinline__ void StartSdmaGatedCopies(cco::ccoSdmaContext sdma, i
 
     if (p.active && sub == 0) {
       h.submitPacket(pktBase, pktBase + queuedBytes);
+      if (h.cachedHwReadIndex != hint0) {
+        AtomicStore<EAgentScope>(&shared->cachedHwReadIndex, h.cachedHwReadIndex);
+      }
+    }
+  }
+}
+
+// COPY_LINEAR count is 30 bits (bytes - 1), so one packet moves at most 1 GiB.
+static constexpr size_t kSdmaMaxCopyBytes = size_t{1} << 30;
+// Bounds a peer's packets ([POLL] + updates) well inside the 256KB ring.
+static constexpr int kRaggedMaxUpdates = 1024;
+static_assert((kRaggedMaxUpdates + 1) * kSDMACopySignalPkt < cco::CCO_SDMA_QUEUE_SIZE);
+
+__device__ __forceinline__ uint32_t NumCopyPackets(size_t bytes) {
+  return static_cast<uint32_t>((bytes + kSdmaMaxCopyBytes - 1) / kSdmaMaxCopyBytes);
+}
+
+// One peer of a ragged push scatter (see StartSdmaRaggedScatter).
+struct RaggedPeer {
+  const uint8_t* src;   // local input base; update u reads src + inOffs[u]*rowBytes
+  uint8_t* dst;         // peer's output base; update u lands at dst + outOffs[u]*rowBytes
+  uint64_t* sig;        // peer's copy of my completion slot
+  uint64_t* scratch;    // peer's copy of my kRaggedScratch slot
+  const uint32_t* gate = nullptr;  // as ScatterPeer::gate
+  uint32_t gateValue = 0;
+};
+
+// Ragged variant of StartSdmaScatter: peer p gets U updates, update u copying
+// sendSizes[p*U+u] rows from input row inOffs[p*U+u] to the peer's output row
+// outOffs[p*U+u]. The metadata is read here, on the device. Same lane mapping
+// (4 lanes per peer, sub==0 the queue's only producer); one reservation and
+// one doorbell for [POLL] + every packet of the peer.
+//
+// The queue is in-order, so only the peer's LAST packet swaps `value` into
+// `sig`; earlier ones swap into `scratch`, otherwise the receiver would see the
+// signal before the later copies landed. Empty updates are skipped, and a peer
+// with no bytes at all still gets its signal through a copy-free packet, so the
+// completion protocol is exactly StartSdmaScatter's at logS = 0.
+template <class PeerFn>
+__device__ __forceinline__ void StartSdmaRaggedScatter(cco::ccoSdmaContext sdma, int npes, int U,
+                                                       const int64_t* inOffs,
+                                                       const int64_t* sendSizes,
+                                                       const int64_t* outOffs, size_t rowBytes,
+                                                       uint64_t value, PeerFn peerOf) {
+  const int tid = static_cast<int>(threadIdx.x), B = static_cast<int>(blockDim.x);
+  const int nWork = npes << 2;
+  for (int i = tid; i < nWork; i += B) {
+    const int peer = i >> 2, sub = i & 3;
+    const RaggedPeer p = peerOf(peer);
+    const int64_t* sizes = sendSizes + static_cast<size_t>(peer) * U;
+    const int64_t* ins = inOffs + static_cast<size_t>(peer) * U;
+    const int64_t* outs = outOffs + static_cast<size_t>(peer) * U;
+
+    uint32_t nPkts = 0;
+    for (int u = 0; u < U; u++) {
+      nPkts += NumCopyPackets(static_cast<size_t>(sizes[u]) * rowBytes);
+    }
+    const uint32_t pollBytes = p.gate != nullptr ? kSDMACopySignalPkt : 0;
+    const uint64_t totalBytes =
+        pollBytes + static_cast<uint64_t>(nPkts > 0 ? nPkts : 1) * kSDMACopySignalPkt;
+
+    SdmaCollectiveHandle h, *shared = nullptr;
+    uint32_t* queueBuf = nullptr;
+    uint64_t hint0 = 0, pktBase = 0;
+    if (sub == 0) {
+      shared = GetSharedHandle(sdma.deviceHandles + peer);
+      h = *cco::impl::global(shared);
+      hint0 = h.cachedHwReadIndex;
+      queueBuf = h.queueBuf;
+      pktBase = h.ReserveSingleProducer(totalBytes);
+    }
+    queueBuf = BroadcastQuad(queueBuf);
+    pktBase = BroadcastQuad(pktBase);
+
+    uint64_t pos = pktBase;
+    if (pollBytes) {
+      WritePollPacket(sub, p.gate, p.gateValue,
+                      queueBuf + h.WrapIntoRing(pos) / sizeof(uint32_t));
+      pos += kSDMACopySignalPkt;
+    }
+    if (nPkts == 0) {
+      WriteSignalPacket(sub, p.sig, value, queueBuf + h.WrapIntoRing(pos) / sizeof(uint32_t));
+    } else {
+      uint32_t k = 0;
+      for (int u = 0; u < U; u++) {
+        size_t bytes = static_cast<size_t>(sizes[u]) * rowBytes;
+        if (bytes == 0) continue;
+        const uint8_t* src = p.src + static_cast<size_t>(ins[u]) * rowBytes;
+        uint8_t* dst = p.dst + static_cast<size_t>(outs[u]) * rowBytes;
+        while (bytes > 0) {
+          const size_t sz = bytes < kSdmaMaxCopyBytes ? bytes : kSdmaMaxCopyBytes;
+          const uint64_t* slot = ++k == nPkts ? p.sig : p.scratch;
+          WriteFusedPacket(sub, src, dst, sz, slot, value,
+                           queueBuf + h.WrapIntoRing(pos) / sizeof(uint32_t));
+          pos += kSDMACopySignalPkt;
+          src += sz;
+          dst += sz;
+          bytes -= sz;
+        }
+      }
+    }
+    cco::ccoSdmaPublishStores();
+    __builtin_amdgcn_wave_barrier();
+    if (sub == 0) {
+      h.submitPacket(pktBase, pktBase + totalBytes);
       if (h.cachedHwReadIndex != hint0) {
         AtomicStore<EAgentScope>(&shared->cachedHwReadIndex, h.cachedHwReadIndex);
       }
