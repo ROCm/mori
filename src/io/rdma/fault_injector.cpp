@@ -56,6 +56,7 @@ constexpr NamedValue kKinds[] = {
     {"async_event", static_cast<int>(FaultKind::AsyncEvent)},
     {"port_down", static_cast<int>(FaultKind::PortDown)},
     {"port_flap", static_cast<int>(FaultKind::PortFlap)},
+    {"qp_stuck", static_cast<int>(FaultKind::QpStuck)},
 };
 
 constexpr NamedValue kOpcodes[] = {
@@ -175,7 +176,8 @@ FaultRule ParseFaultRule(const std::string& spec) {
   std::vector<std::string> parts = Split(spec, ':');
   FaultRule rule;
   rule.kind = static_cast<FaultKind>(Lookup(kKinds, parts[0], false));
-  if (rule.kind == FaultKind::PostSendFail || rule.kind == FaultKind::PostRecvFail) {
+  if (rule.kind == FaultKind::PostSendFail || rule.kind == FaultKind::PostRecvFail ||
+      rule.kind == FaultKind::QpStuck) {
     rule.value = EIO;
   } else if (rule.kind == FaultKind::CqeError) {
     rule.value = IBV_WC_RETRY_EXC_ERR;
@@ -264,6 +266,7 @@ void FaultInjector::Arm(const FaultRule& rule) {
     failed_.store(false, std::memory_order_relaxed);
     qps_.clear();
     dataWrsInFlight_.clear();
+    stuckQps_.clear();
   }
   fired_.store(0, std::memory_order_relaxed);
   tracking_.store(true, std::memory_order_release);
@@ -278,6 +281,7 @@ void FaultInjector::Disarm() noexcept try {
   armed_.store(false, std::memory_order_release);
   tracking_.store(false, std::memory_order_release);
   dataWrsInFlight_.clear();
+  stuckQps_.clear();
   // Rule exhaustion already stopped new triggers. Only port_down uses explicit
   // Disarm as recovery; a flap must finish its timed interval independently.
   for (auto it = downPorts_.begin(); it != downPorts_.end();) {
@@ -335,8 +339,21 @@ void FaultInjector::RememberQp(ibv_qp* qp) {
   qps_[qp->context][qp->qp_num] = qp;
 }
 
+int FaultInjector::ModifyQp(ibv_qp* qp, ibv_qp_attr* attr, int attrMask) {
+  int value = 0;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (stuckQps_.count(qp)) value = rule_.value;
+  }
+  if (value != 0) {
+    RecordInjection(FaultKind::QpStuck, qp->qp_num, -1, value);
+    return value;
+  }
+  return real_.ModifyQp(qp, attr, attrMask);
+}
+
 bool FaultInjector::MoveQpToError(ibv_qp* qp) {
-  int ret = ModifyQpToError(qp);
+  int ret = ModifyQpToError(real_, qp);
   if (ret != 0) FailInjection("ibv_modify_qp(ERR)", ret);
   return ret == 0;
 }
@@ -354,6 +371,15 @@ int FaultInjector::PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) {
       RememberQp(qp);
       if (ShouldFire(FaultKind::PostSendFail, qp->qp_num, -1, &value)) {
         RecordInjection(FaultKind::PostSendFail, qp->qp_num, -1, value);
+        *bad = wr;
+        return value;
+      }
+      if (ShouldFire(FaultKind::QpStuck, qp->qp_num, -1, &value)) {
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          stuckQps_.insert(qp);
+        }
+        RecordInjection(FaultKind::QpStuck, qp->qp_num, -1, value);
         *bad = wr;
         return value;
       }

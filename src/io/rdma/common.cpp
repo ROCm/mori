@@ -446,10 +446,11 @@ static bool PostCompletionMarker(const EpPair& ep, const application::RdmaMemory
   return true;
 }
 
-// Moves `ep`'s QP to Error (ModifyQpToError); false if it has none or that fails.
+// Moves `ep`'s QP to Error (ModifyQpToError, through Verbs() so a test build can refuse
+// it); false if it has none or that fails.
 static bool CutQp(const EpPair& ep) {
   ibv_qp* qp = ep.local.ibvHandle.qp;
-  return qp != nullptr && ModifyQpToError(qp) == 0;
+  return qp != nullptr && ModifyQpToError(Verbs(), qp) == 0;
 }
 
 // When a post gives up partway, the WRs it already posted on an EP since that EP's last

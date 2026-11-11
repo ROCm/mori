@@ -54,6 +54,8 @@ enum class FaultKind : uint8_t {
   AsyncEvent,    // synthesize a verbs async event after posting
   PortDown,      // PORT_ERR until explicit Disarm(), then PORT_ACTIVE
   PortFlap,      // PORT_ERR followed by PORT_ACTIVE after value milliseconds
+  QpStuck,       // like PostSendFail, and until Disarm() a QP that refused a post also
+                 // refuses state changes (ModifyQp returns `value`): it cannot be cut
 };
 
 struct FaultRule {
@@ -67,7 +69,7 @@ struct FaultRule {
 
 // Parses "kind[:key=value]...", e.g. "cqe_drop:op=write:skip=10:count=1" or
 // "cqe_error:value=retry_exc". Kinds: post_send_fail, post_recv_fail, qp_error,
-// cqe_error, cqe_drop, async_event, port_down, port_flap. Keys: skip, count,
+// cqe_error, cqe_drop, async_event, port_down, port_flap, qp_stuck. Keys: skip, count,
 // value, op (write|read|send|recv|<int>),
 // qpn. Throws std::invalid_argument on a malformed spec.
 FaultRule ParseFaultRule(const std::string& spec);
@@ -98,6 +100,7 @@ class FaultInjector final : public VerbsOps {
   int GetAsyncEvent(ibv_context* ctx, ibv_async_event* event) noexcept override;
   void AckAsyncEvent(ibv_async_event* event) override;
   int QueryPort(ibv_context* ctx, uint8_t port, ibv_port_attr* attr) noexcept override;
+  int ModifyQp(ibv_qp* qp, ibv_qp_attr* attr, int attrMask) override;
   int WatchAsyncContext(ibv_context* ctx) override;
   void UnwatchAsyncContext(ibv_context* ctx) override;
   void ReleaseAsyncContext(ibv_context* ctx) noexcept override;
@@ -148,6 +151,8 @@ class FaultInjector final : public VerbsOps {
   std::unordered_map<ibv_cq*, ibv_context*> deadCqs_;
   std::unordered_set<ibv_context*> deadDevices_;
   std::atomic<bool> hasDeadResources_{false};
+  // qp_stuck: QPs that refused a post, and so refuse ModifyQp until Disarm().
+  std::unordered_set<ibv_qp*> stuckQps_;
   // For DataWrInFlight(): from Arm() to Disarm(), independent of the rule running out.
   std::atomic<bool> tracking_{false};
   std::map<std::tuple<ibv_context*, uint32_t, uint64_t>, ibv_qp*> dataWrsInFlight_;

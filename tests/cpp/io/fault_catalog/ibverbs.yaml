@@ -52,6 +52,10 @@
 #   no-completion-deadline  a lost CQE leaves the transfer IN_PROGRESS forever
 #   target-not-notified     the target can wait forever for a lost notification
 #   exit-on-post-recv-fail  a failed ibv_post_recv calls exit(-1)
+#   uncut-orphans           WRs a give-up can neither mark nor cut stay orphaned on a
+#                           live QP: no completion accounts them, so the transfer stays
+#                           IN_PROGRESS, and the degraded endpoint is never replaced, so
+#                           every later submission on it is rejected
 
 - id: none.write
   real_world: no fault (baseline)
@@ -91,6 +95,17 @@
   rule: post_send_fail:skip=8:count=0
   transfer: large_then_small
   env: MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
+
+# As .no_marker, but the QPs that refuse the posts also refuse to be moved to Error, so
+# their pending unsignaled WRs cannot be cut either: the last resort parks them as
+# orphaned and marks the endpoint degraded.
+- id: post_send_fail.unsignaled_pending.no_cut
+  real_world: a post fails partway on a stuck QP that refuses both the marker and the cut
+  rule: qp_stuck:skip=8:count=0
+  transfer: large_then_small
+  env: MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
+  known_bug: uncut-orphans
+  fails: ends, recovers
 
 # Worker threads: four workers each post one 60 MiB segment, in 64 WRs 4 at a time, on
 # their own QP, so their ~16 posts each interleave. The failing worker returns at once
