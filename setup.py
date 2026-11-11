@@ -694,6 +694,7 @@ class CMakeBuild(build_ext):
         build_benchmark = os.environ.get("BUILD_BENCHMARK", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
         build_ras = "ON" if _env_flag("BUILD_RAS", "OFF") else "OFF"
+        build_netmon = "ON" if _env_flag("BUILD_NETMON", "ON") else "OFF"
         build_umbp = "ON" if build_umbp_enabled else "OFF"
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
@@ -754,6 +755,7 @@ class CMakeBuild(build_ext):
             f"-DBUILD_BENCHMARK={build_benchmark}",
             f"-DBUILD_TESTS={build_tests}",
             f"-DBUILD_RAS={build_ras}",
+            f"-DBUILD_NETMON={build_netmon}",
             f"-DBUILD_UMBP={build_umbp}",
             f"-DUSE_REDIS_BACKEND={use_redis_backend}",
             f"-DUSE_SPDK={build_umbp_spdk}",
@@ -874,6 +876,17 @@ class CMakeBuild(build_ext):
             os.chmod(spdk_proxy_dst, 0o700)
         elif spdk_proxy_dst.exists():
             spdk_proxy_dst.unlink()
+
+        # ainic-netmon (tools/netmon): shipped as mori/bin/ainic-netmon, run through the
+        # `ainic-netmon` / `mori netmon` entry points. Removed again when BUILD_NETMON=OFF.
+        netmon_src = build_dir / "tools/netmon/ainic-netmon"
+        netmon_dst = root_dir / "python/mori/bin/ainic-netmon"
+        if build_netmon == "ON" and netmon_src.exists():
+            netmon_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(netmon_src, netmon_dst)
+            os.chmod(netmon_dst, 0o755)
+        elif netmon_dst.exists():
+            netmon_dst.unlink()
 
         umbp_master_src = build_dir / "src/umbp/umbp_master"
         umbp_master_dst = root_dir / "python/mori/umbp_master"
@@ -1009,9 +1022,31 @@ def _sync_bundled_scripts() -> None:
 _sync_bundled_scripts()
 
 
+def _sync_netmon_report() -> None:
+    """Ship the ainic-netmon report tool as ``mori._netmon_report``.
+
+    The single source of truth is ``tools/netmon/report/ainic_netmon_report.py`` (it must
+    also work on its own, outside mori); the package gets a synced copy.
+    """
+    here = Path(__file__).resolve().parent
+    src = here / "tools" / "netmon" / "report" / "ainic_netmon_report.py"
+    dst = here / "python" / "mori" / "_netmon_report.py"
+    if not src.is_file():
+        return
+    try:
+        if not dst.is_file() or dst.read_bytes() != src.read_bytes():
+            shutil.copy2(src, dst)
+    except OSError as exc:
+        print(f"[mori] WARN: failed to bundle the netmon report: {exc}")
+
+
+_sync_netmon_report()
+
+
 class CustomBuild(_build):
     def run(self) -> None:
         _sync_bundled_scripts()
+        _sync_netmon_report()
         self.run_command("build_ext")
         super().run()
 
@@ -1113,6 +1148,7 @@ mori_package_data = [
     "libmori_kiwi_ep_pybinds.so",  # optional: only present when BUILD_OPS_KIWI=ON
     "umbp_master",
     "umbp_standalone_server",
+    "bin/ainic-netmon",  # optional: absent when BUILD_NETMON=OFF
     "_jit-sources/include/**/*.hpp",
     "_jit-sources/include/**/*.h",
     "_jit-sources/include/**/*.cuh",
