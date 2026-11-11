@@ -30,8 +30,7 @@ jobs:
       matrix:
         include:
           # Single node, so it shares ci.yml's intranode runner. MI355X-AINIC
-          # keeps the two internode jobs, which need that pair, cco-fused-test
-          # and cco-v2-test.
+          # keeps the two internode jobs, which need that pair, and cco-v2-test.
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
@@ -411,6 +410,24 @@ jobs:
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
 
+      - name: Run ops-v2 routing snapshot handles (EP8, both backends)
+        if: contains(fromJSON(inputs.groups), 'epv2')
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            timeout 900 torchrun --standalone --nproc_per_node=8 test_routing_snapshot.py"
+
+      - name: Run ops-v2 dispatch/combine bench (EP8 smoke, both backends)
+        if: contains(fromJSON(inputs.groups), 'epv2')
+        run: |
+          # bench_ep.py gates every point on an identity-expert check and exits
+          # non-zero if one fails, so this is a smoke test as well as a bench.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            BACKENDS=flydsl,hip COMB_MODE=pull MODES=graph SWEEP=128,512,4096,8192 \
+            ITERS=20 WARMUP=10 \
+            torchrun --standalone --nproc_per_node=8 bench_ep.py"
+
       - &cco-cleanup
         name: Cleanup
         if: always()
@@ -425,8 +442,8 @@ jobs:
 
   cco-fused-test:
     name: CCO fused GEMM test (${{ matrix.platform }})
-    # The fused GEMM + collective ops use SDMA over loopback only. Their own runner
-    # takes them off the CCO unit test's critical path.
+    # The fused GEMM + collective ops use SDMA over loopback only, so they need no
+    # NIC and leave MI355X-AINIC to the jobs that need its two nodes.
     if: contains(fromJSON(inputs.groups), 'fused')
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -434,11 +451,12 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC]
+            runner: [self-hosted, MI355X-AINIC-PIT-G17]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
     env:
+      CT: docker
       CONTAINER: mori_cco_fused_${{ github.run_id }}
       # 0 skips the ci_full cases (tests/python/cco/conftest.py).
       MORI_CI_FULL: ${{ (github.event_name != 'pull_request' || inputs.full) && '1' || '0' }}
@@ -569,9 +587,10 @@ jobs:
 
   cco-v2-test:
     name: CCO EPv2 single-node test (${{ matrix.platform }})
-    # The EPv2 AsyncLL, routing-snapshot and bench steps, on the runner and in the
-    # configuration they always passed in as part of the CCO unit test. On
-    # MI355X-AINIC-PIT-G17, test_asyncll's back_to_back check fails.
+    # The EPv2 AsyncLL step alone, on the runner and in the configuration it always
+    # passed in as part of the CCO unit test: on MI355X-AINIC-PIT-G17,
+    # test_asyncll's back_to_back check fails. The other EPv2 steps run in
+    # cco-unit-test.
     if: contains(fromJSON(inputs.groups), 'epv2')
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -628,22 +647,6 @@ jobs:
               echo \"\$out\"; \
               case \"\$out\" in *'# PASS:'*) ;; *) echo 'no PASS line: nothing ran'; exit 1;; esac" || exit 1
           done
-
-      - name: Run ops-v2 routing snapshot handles (EP8, both backends)
-        run: |
-          $CT exec $CONTAINER bash -c "\
-            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            timeout 900 torchrun --standalone --nproc_per_node=8 test_routing_snapshot.py"
-
-      - name: Run ops-v2 dispatch/combine bench (EP8 smoke, both backends)
-        run: |
-          # bench_ep.py gates every point on an identity-expert check and exits
-          # non-zero if one fails, so this is a smoke test as well as a bench.
-          $CT exec $CONTAINER bash -c "\
-            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            BACKENDS=flydsl,hip COMB_MODE=pull MODES=graph SWEEP=128,512,4096,8192 \
-            ITERS=20 WARMUP=10 \
-            torchrun --standalone --nproc_per_node=8 bench_ep.py"
 
       - *cco-cleanup
 
@@ -751,13 +754,22 @@ jobs:
           # prettytable is not optional here: the bench prints its results through
           # it on the last rank, after the work is done, so a missing package fails
           # the run as a rendezvous timeout on the peer rather than an ImportError.
+          #
+          # Builds the wheel node2 installs as well, instead of node2 building its
+          # own. MORI_SKIP_PRECOMPILE: setup.py's background precompile would import
+          # mori while the wheel is still being built.
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && pip install . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && rm -rf dist_ci && MORI_SKIP_PRECOMPILE=1 pip wheel --no-deps -w dist_ci . && pip install dist_ci/*.whl && pip install prettytable"
 
       - name: Install mori (node2)
         run: |
+          # The wheel goes over the same ssh session that installs it: node2's sshd
+          # can refuse a new connection (see ci.yml's SSH_OPTS), so this opens no
+          # more of them than building there did.
+          WHEEL=$(basename $GITHUB_WORKSPACE/dist_ci/*.whl)
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && pip install . && pip install prettytable'"
+            "rm -rf $GITHUB_WORKSPACE/dist_ci && mkdir -p $GITHUB_WORKSPACE/dist_ci && cat > $GITHUB_WORKSPACE/dist_ci/$WHEEL && $CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && pip install dist_ci/$WHEEL && pip install prettytable'" \
+            < $GITHUB_WORKSPACE/dist_ci/$WHEEL
 
       - name: MORI-EP internode CCO kernel test
         run: |

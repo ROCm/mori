@@ -21,7 +21,8 @@
 # SOFTWARE.
 """``mori.ops.ag_gemm``: the window layout on the CPU, and every mode end to end.
 
-The GPU half drives ``bench_ag_gemm.py`` under torchrun. Each run validates every
+The GPU half drives ``bench_ag_gemm.py``, every run from one torchrun launch
+(``bench_runs.py``). Each run validates every
 row of C twice with different operands, then ``--back-to-back`` issues calls with
 no host sync between them, holding a different rank before each, and validates
 every call -- the case where a rank a call ahead refills a slot a held rank is
@@ -96,7 +97,12 @@ requires_gpus = pytest.mark.skipif(
 )
 
 
-def _run_bench(*args, last=False):
+DRIVER = Path(__file__).with_name("bench_runs.py")
+
+
+def _run_benches(runs, last=False):
+    """bench_ag_gemm.py once per argument list in runs, all from one launch;
+    the results in order."""
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
@@ -108,8 +114,9 @@ def _run_bench(*args, last=False):
             "torch.distributed.run",
             "--standalone",
             f"--nproc_per_node={world}",
+            str(DRIVER),
             str(BENCH),
-            *args,
+            json.dumps(runs),
         ],
         cwd=REPO_ROOT,
         env=env,
@@ -120,61 +127,65 @@ def _run_bench(*args, last=False):
     out = result.stdout + result.stderr
     if result.returncode != 0 and _QUEUE_EXHAUSTED in out and not last:
         time.sleep(_SETTLE_SECONDS * 3)
-        return _run_bench(*args, last=True)
-    hit = [ln for ln in out.splitlines() if ln.startswith("RESULT_JSON ")]
-    assert result.returncode == 0 and hit, out[-4000:]
-    return json.loads(hit[-1].removeprefix("RESULT_JSON "))
+        return _run_benches(runs, last=True)
+    hits = [
+        json.loads(ln.removeprefix("RESULT_JSON "))
+        for ln in out.splitlines()
+        if ln.startswith("RESULT_JSON ")
+    ]
+    assert len(hits) == len(runs), out[-4000:]
+    # A failed validation is each test's to report; any other non-zero exit is not.
+    assert result.returncode == 0 or not all(h["validated"] for h in hits), out[-4000:]
+    return hits
 
 
 SMALL = ["-m", "512", "-N", "1024", "-k", "1024", "--warmup", "2", "--iters", "3"]
+EVERY_MODE = {
+    "fused-sdma-1": ["--mode", "fused-sdma", "--chunks", "1"],
+    "fused-sdma-2": ["--mode", "fused-sdma", "--chunks", "2"],
+    "split-sdma": ["--mode", "split-sdma"],
+    "split-rccl": ["--mode", "split-rccl"],
+}
+PARTIAL_TILE = {
+    "fused": ["--mode", "fused-sdma", "--chunks", "2"],
+    "split": ["--mode", "split-sdma"],
+}
+
+
+@pytest.fixture(scope="module")
+def bench():
+    """Every GPU case below, from one launch."""
+    runs = {
+        f"every/{m}": [*a, *SMALL, "--back-to-back", "8"] for m, a in EVERY_MODE.items()
+    }
+    runs |= {
+        f"partial/{m}": [*a, "-m", "512", "-N", "1168", "-k", "1024"]
+        + ["--warmup", "2", "--iters", "3", "--back-to-back", "4"]
+        for m, a in PARTIAL_TILE.items()
+    }
+    runs["gemm-only"] = ["--mode", "gemm-only", *SMALL]
+    return dict(zip(runs, _run_benches(list(runs.values()))))
 
 
 @requires_gpus
-@pytest.mark.parametrize(
-    "mode",
-    [
-        ["--mode", "fused-sdma", "--chunks", "1"],
-        ["--mode", "fused-sdma", "--chunks", "2"],
-        ["--mode", "split-sdma"],
-        ["--mode", "split-rccl"],
-    ],
-    ids=lambda m: "-".join(m[1::2]) if len(m) > 2 else m[1],
-)
-def test_every_mode_is_exact_to_the_fp8_floor_back_to_back(mode):
-    r = _run_bench(*mode, *SMALL, "--back-to-back", "8")
+@pytest.mark.parametrize("mode", list(EVERY_MODE))
+def test_every_mode_is_exact_to_the_fp8_floor_back_to_back(mode, bench):
+    r = bench[f"every/{mode}"]
     assert r["validated"], r
     assert r["rel_l2"] < 3e-3, r
 
 
 @requires_gpus
-@pytest.mark.parametrize(
-    "mode",
-    [["--mode", "fused-sdma", "--chunks", "2"], ["--mode", "split-sdma"]],
-    ids=["fused", "split"],
-)
-def test_a_partial_last_column_tile_back_to_back(mode):
+@pytest.mark.parametrize("mode", list(PARTIAL_TILE))
+def test_a_partial_last_column_tile_back_to_back(mode, bench):
     """N=1168: four whole column tiles and 144 columns, masked in the store."""
-    r = _run_bench(
-        *mode,
-        "-m",
-        "512",
-        "-N",
-        "1168",
-        "-k",
-        "1024",
-        "--warmup",
-        "2",
-        "--iters",
-        "3",
-        "--back-to-back",
-        "4",
-    )
+    r = bench[f"partial/{mode}"]
     assert r["validated"], r
     assert r["rel_l2"] < 3e-3, r
 
 
 @requires_gpus
-def test_gemm_only_matches_the_same_reference():
+def test_gemm_only_matches_the_same_reference(bench):
     """The compute floor the others are measured against has to be right too."""
-    r = _run_bench("--mode", "gemm-only", *SMALL)
+    r = bench["gemm-only"]
     assert r["validated"], r

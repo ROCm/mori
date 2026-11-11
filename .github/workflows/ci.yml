@@ -51,6 +51,9 @@ jobs:
     with:
       comment: true
 
+  # A compile check that runs next to the tests rather than gating them: each test
+  # job builds mori itself, and on a shared runner a job that waits for this one
+  # only joins the queue once it finishes.
   build:
     name: mori build (${{ matrix.platform }})
     needs: scope
@@ -129,7 +132,7 @@ jobs:
 
   intranode-test:
     name: mori intranode test (${{ matrix.platform }})
-    needs: [scope, build]
+    needs: scope
     if: needs.scope.outputs.mori == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -535,7 +538,7 @@ jobs:
   # ROCm-version agnostic, and the ROCm 10 base image is a separate ~30GB pull.
   intranode-test-rocm10:
     name: mori intranode test (ROCm 10, MI355X_AINIC)
-    needs: [scope, build]
+    needs: scope
     if: needs.scope.outputs.mori == 'true' && contains(fromJSON(needs.scope.outputs.groups), 'ep')
     runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
     env:
@@ -624,7 +627,7 @@ jobs:
 
   jax-intranode-test:
     name: mori JAX intranode test (${{ matrix.platform }})
-    needs: [scope, build]
+    needs: scope
     if: needs.scope.outputs.mori == 'true' && contains(fromJSON(needs.scope.outputs.groups), 'ep')
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -718,7 +721,7 @@ jobs:
 
   umbp-unit-test:
     name: mori umbp unit test (${{ matrix.platform }})
-    needs: [scope, build]
+    needs: scope
     if: needs.scope.outputs.umbp == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -976,13 +979,19 @@ jobs:
 
       - name: Install mori (node1)
         run: |
+          # Builds the wheel node2 installs as well, instead of node2 building its
+          # own. MORI_SKIP_PRECOMPILE: setup.py's background precompile would import
+          # mori while the wheel is still being built.
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))"
+            "cd $GITHUB_WORKSPACE && rm -rf dist_ci && BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI MORI_SKIP_PRECOMPILE=1 pip wheel --no-deps -w dist_ci . && pip install dist_ci/*.whl && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))"
 
       - name: Install mori (node2)
         run: |
+          # The wheel goes over the same ssh session that installs it.
+          WHEEL=$(basename $GITHUB_WORKSPACE/dist_ci/*.whl)
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON BUILD_OPS_KIWI=$BUILD_OPS_KIWI pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
+            "rm -rf $GITHUB_WORKSPACE/dist_ci && mkdir -p $GITHUB_WORKSPACE/dist_ci && cat > $GITHUB_WORKSPACE/dist_ci/$WHEEL && $CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && pip install dist_ci/$WHEEL && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'" \
+            < $GITHUB_WORKSPACE/dist_ci/$WHEEL
 
       # The IO benchmark runner defaults to the native C++ engine
       # (tools/run_internode_io_benchmark.sh --engine cpp), which needs the
