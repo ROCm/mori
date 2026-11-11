@@ -38,7 +38,14 @@ namespace {
   for (;;) cv.wait(lk);
 }
 
-enum class Mode { kOk, kStuckInQuery, kStuckInProbe, kProbeFails, kFillsStderr };
+enum class Mode {
+  kOk,
+  kStuckInQuery,
+  kStuckInProbe,
+  kProbeFails,
+  kFillsStderr,
+  kFillsStderrInProbe
+};
 
 // Fill stderr (a pipe nobody reads) so every later write to it would block.
 void FillStderr() {
@@ -63,6 +70,7 @@ class FakeSource : public Source {
   Status Probe(std::string* detail) override {
     if (mode_ == Mode::kStuckInProbe) BlockForever();
     if (mode_ == Mode::kProbeFails) return Status::Error("fake probe failure");
+    if (mode_ == Mode::kFillsStderrInProbe) FillStderr();
     *detail = "ok";
     return Status::Ok();
   }
@@ -210,6 +218,10 @@ const std::map<std::string, ChildCase>& Cases() {
       {"writer_blocks", {{{"rdma", Mode::kOk}}, 300000000ull, InstallBlockingWrites}},
       {"stuck_sampler_full_stderr",
        {{{"rdma", Mode::kFillsStderr}, {"ipc", Mode::kStuckInQuery, 20}}, 300000000ull, nullptr}},
+      {"stuck_probe_full_stderr",
+       {{{"rdma", Mode::kFillsStderrInProbe}, {"ipc", Mode::kStuckInProbe}},
+        300000000ull,
+        nullptr}},
       {"final_meta_blocks", {{{"rdma", Mode::kOk}}, 300000000ull, InstallBlockingFinalMeta}},
   };
   return cases;
@@ -414,4 +426,16 @@ TEST(RecorderAbandonedExitWithFullStderr) {
   CHECK(MonoNs() - t0 < 20000000000ull);
   CHECK(ReadAll(dir + "/meta.json").find("\"abandoned\": [\"fake1.ipc.bin\"]") !=
         std::string::npos);
+}
+
+TEST(RecorderStuckProbeExitWithFullStderr) {
+  // A probe is stuck and stderr is full when the probe deadline expires: the startup abort
+  // must still exit (code 1) in bounded time and remove what it created.
+  TempDir tmp;
+  auto dir = tmp.path() + "/run";
+  const uint64_t t0 = MonoNs();
+  int code = RunCase("stuck_probe_full_stderr", dir, -1, true);
+  CHECK_EQ(code, 1);
+  CHECK(MonoNs() - t0 < 20000000000ull);
+  CHECK(!Exists(dir));
 }

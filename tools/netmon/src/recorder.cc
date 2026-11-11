@@ -258,31 +258,32 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
 
   std::vector<Stream*> final_streams;
   std::string abort_reason;
+  std::string probe_report;  // printed after the lock is released (stdio may block)
   {
     std::lock_guard<std::mutex> lk(ctl->mu);
     for (auto& s : all) {
+      const std::string name = s->netdev + "." + s->src->kind();
       if (s->probe == ProbeState::kPending) {
-        fprintf(stderr, "error: %s.%s did not answer its startup probe within %s\n",
-                s->netdev.c_str(), s->src->kind(), FormatDurationNs(opt->probe_timeout_ns).c_str());
+        probe_report += "error: " + name + " did not answer its startup probe within " +
+                        FormatDurationNs(opt->probe_timeout_ns) + "\n";
         abort_reason = "stuck";
       } else if (s->probe == ProbeState::kFailed) {
         if (s->required) {
-          fprintf(stderr, "error: %s.%s: %s\n", s->netdev.c_str(), s->src->kind(),
-                  s->probe_detail.c_str());
+          probe_report += "error: " + name + ": " + s->probe_detail + "\n";
           if (abort_reason.empty()) abort_reason = "required source failed";
         } else {
-          fprintf(stderr, "skip %s.%s: %s\n", s->netdev.c_str(), s->src->kind(),
-                  s->probe_detail.c_str());
+          probe_report += "skip " + name + ": " + s->probe_detail + "\n";
           opt->degraded.push_back({s->netdev, s->src->kind(), s->probe_detail});
         }
       } else {
         if (s->src->kind() == std::string("ipc")) {
-          fprintf(stderr, "%s.ipc: %s\n", s->netdev.c_str(), s->probe_detail.c_str());
+          probe_report += name + ": " + s->probe_detail + "\n";
         }
         final_streams.push_back(s.get());
       }
     }
   }
+  if (abort_reason != "stuck") fputs(probe_report.c_str(), stderr);
   if (abort_reason == "stuck") {
     // A thread is inside a driver call we cannot interrupt: clean up and leave without
     // destroying anything it may still use.
@@ -297,7 +298,7 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
     for (auto& s : all) {  // probes that answered have left by now; only stuck ones remain
       if (s->exited.load() && s->thread.joinable()) s->thread.join();
     }
-    HardExit(kExitSetup);
+    HardExit(kExitSetup, probe_report);  // bounded: stderr may be full
   }
   if (interrupted) abort_reason = "interrupted during startup";
   if (abort_reason.empty() && final_streams.empty()) abort_reason = "no usable stream";
