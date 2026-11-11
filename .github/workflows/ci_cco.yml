@@ -120,26 +120,30 @@ jobs:
         # plain wheel install, for PRs that do not run ci.yml's build job.
         run: |
           $CT exec $CONTAINER bash -c "cd $GITHUB_WORKSPACE && python -c \"import sys, runpy; sys.modules['flydsl'] = None; runpy.run_path('tools/verify_install.py', run_name='__main__')\""
-      - name: Check internode arena region invariants
+      - name: Check internode arena region and active QP invariants
         if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
-          # Pure function of the config: no GPU, no process group, no RDMA, so it
-          # runs here rather than in the two-node job -- the only place the
-          # internode region sizes are checked at all.
+          # Pure functions of the config: no GPU, no process group, no RDMA, so
+          # they run here rather than in the two-node job -- the only place the
+          # internode region sizes and the active QP resolution are checked.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 120 python -m pytest -v \
-              tests/python/ops/dispatch_combine_v2/test_internode_regions.py"
+              tests/python/ops/dispatch_combine_v2/test_internode_regions.py \
+              tests/python/ops/dispatch_combine_v2/test_active_qp_config.py"
 
-      - name: Check arch detection, tuning keys and AsyncLL options
+      - name: Check arch detection, tuning tables and AsyncLL options
         if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           # No GPU needed: arch-string matching, the ASIC-revision table keys and their
-          # CU fit, the per-target macro guard, and the AsyncLL defaults per arch.
+          # CU fit, the per-target macro guard, and the AsyncLL defaults per arch. The
+          # tables load from the installed package, so a build that ships no tables,
+          # or a table that fails to parse, fails here.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 120 python -m pytest -v \
               tests/python/ops/dispatch_combine_v2/test_gfx1250_strict_arch.py \
+              tests/python/ops/dispatch_combine_v2/test_v2_tuning_tables.py \
               tests/python/ops/dispatch_combine_v2/test_asyncll_options.py"
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
@@ -783,15 +787,25 @@ jobs:
           # config compiles only that one, so a job that never names v2_ll never
           # even compiles it. 128 is the LL band and 4096 the wide one, so each
           # family is exercised where it is the one a real caller would get.
-          for CASE in "v2 128" "v2 4096" "v2_ll 128"; do
-            set -- $CASE; KERNEL=$1; TOKENS=$2
-            echo "=== cco test kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+          #
+          # The last two cases also compile active counts 1,2,4,8 and switch
+          # among them every round, with the two nodes deliberately out of step
+          # and each combine one step ahead of its own dispatch: the cases the
+          # combine barrier must tolerate, which the fixed-count cases above
+          # never reach. One per family, because v2 and v2_ll each run the
+          # shared barrier from their own combine kernel code. Every case
+          # allocates the op's default 8 QPs, so no table's count is clamped.
+          for CASE in "v2 128 --num-qp 8" "v2 4096 --num-qp 8" "v2_ll 128 --num-qp 8" \
+                      "v2 4096 --num-qp 8 -- --active-qp-counts 1,2,4,8" \
+                      "v2_ll 128 --num-qp 8 -- --active-qp-counts 1,2,4,8"; do
+            set -- $CASE; KERNEL=$1; TOKENS=$2; shift 2; EXTRA="$*"
+            echo "=== cco test kernel=$KERNEL max-tokens=$TOKENS $EXTRA port=$PORT ==="
             NODE2_CMD=(
               $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
               --rank 1 --master-addr $NODE1_HOST --master-port $PORT
               --ifname $NODE2_IFNAME --entry $ENTRY
               --cmd test --kernel-type $KERNEL --quant-type none --dtype bf16
-              --max-tokens $TOKENS
+              --max-tokens $TOKENS $EXTRA
             )
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
             NODE2_PID=$!
@@ -799,7 +813,7 @@ jobs:
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
               --ifname $NODE1_IFNAME --entry $ENTRY \
               --cmd test --kernel-type $KERNEL --quant-type none --dtype bf16 \
-              --max-tokens $TOKENS
+              --max-tokens $TOKENS $EXTRA
             # With a pid, not bare: bare `wait` reaps every child and returns 0,
             # so node2 could fail its check and the job still pass on node1's
             # status alone. Half of EP16 lives over there.
@@ -824,14 +838,14 @@ jobs:
               $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
               --rank 1 --master-addr $NODE1_HOST --master-port $PORT
               --ifname $NODE2_IFNAME --entry $ENTRY
-              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS
+              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS --num-qp 8
             )
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
             NODE2_PID=$!
             $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
               --ifname $NODE1_IFNAME --entry $ENTRY \
-              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS
+              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS --num-qp 8
             wait "$NODE2_PID"
             sleep 1
             PORT=$((PORT + 1))
@@ -855,14 +869,14 @@ jobs:
             $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME --entry $ENTRY
-            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096
+            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096 --num-qp 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
           NODE2_PID=$!
           $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME --entry $ENTRY \
-            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096
+            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096 --num-qp 8
           wait "$NODE2_PID"
 
       - name: Cleanup node1

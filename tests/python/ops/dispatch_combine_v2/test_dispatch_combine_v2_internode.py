@@ -30,21 +30,24 @@ is analytic: a pass means "matches the intended semantics", not "matches some
 other implementation", which is the property that has to survive the kernel being
 rewritten underneath it.
 
-TWO NODES ARE REQUIRED, and not merely for coverage -- the op refuses to build
-otherwise. ``gpu_per_node < world_size`` is what selects the internode path, and
-the op checks EP's node grouping against the communicator's LSA team; on one host
-CCO reports the whole world as one team, so a config claiming two nodes is
-rejected rather than silently running the intranode half. Lowering gpu_per_node
-on a single host does not emulate this either: RAIL leaves same-host peers
-without a QP.
+THE INTERNODE PATH NEEDS TWO NODES. ``gpu_per_node < world_size`` is what selects
+it, and the op checks EP's node grouping against the communicator's LSA team; on
+one host CCO reports the whole world as one team, so a config claiming two nodes
+is rejected rather than silently running the intranode half. Lowering
+gpu_per_node on a single host does not emulate this either: RAIL leaves
+same-host peers without a QP. On one node (world_size == gpu_per_node) this
+harness builds the intranode op instead; only ``--cmd test`` and
+``--cmd tuning`` accept that, and bench and stress exit.
 
     # rank 0 of 2, 8 GPUs each
     torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \\
         --master_addr=<ip> --master_port=<port> \\
         test_dispatch_combine_v2_internode.py --max-tokens 128
 
-``tools/run_internode_test.sh`` drives both ranks; the CLI below is the subset of
-the shmem harness's flags that means anything here.
+``tools/run_internode_test.sh`` with ``--entry`` set to this file runs one node's
+side (``--rank 0`` or ``1``; call it once per node). The CLI below keeps the
+shmem harness's flag names where the two mean the same thing, and adds its own,
+among them routing, process topology, active QPs, tuning, bench and stress.
 
 RoCE QoS: SET MORI_RDMA_TC AND MORI_RDMA_SL
 -------------------------------------------
@@ -111,19 +114,25 @@ plus an accumulate in three kernels and a wider staging slot.
 
 import argparse
 import ctypes
+import dataclasses
+import logging
+import math
 import os
+import re
 import sys
 import time
+from pathlib import Path
+from typing import NamedTuple
 
-import numpy as np
 import torch
 import torch.distributed as dist
-
 from mori.cco import Communicator
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
+sys.path.insert(0, _HERE)
+from _data import decode_fp4, encode_fp4  # noqa: E402
 
 _DTYPES = {
     "bf16": torch.bfloat16,
@@ -132,6 +141,11 @@ _DTYPES = {
     "fp8_e4m3": torch.float8_e4m3fn,
 }
 _FP8 = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
+# Dispatch only: the op reduces combine in bf16 or fp32. Absent from older torch.
+_FP4 = getattr(torch, "float4_e2m1fn_x2", None)
+if _FP4 is not None:
+    _DTYPES["fp4"] = _FP4
+_DTYPE_NAMES = {dtype: name for name, dtype in _DTYPES.items()}
 
 
 class Dist:
@@ -183,6 +197,13 @@ def _parse_args(argv):
     # v1 uses 128 and 128; matching them keeps the two soaks comparable.
     parser.add_argument("--stress-datasets", type=int, default=128)
     parser.add_argument("--stress-sync-interval", type=int, default=128)
+    # Node index (-1 = none) whose ranks all send max_tokens in every dataset: a
+    # full-capacity sender, the case where the LL receive can finish on chunk
+    # flags alone.
+    parser.add_argument("--stress-full-node", type=int, default=-1)
+    # Check every Nth round's combine output in place (0 = never). No sync is
+    # added between that round's dispatch and combine.
+    parser.add_argument("--stress-check-interval", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=8)
@@ -193,14 +214,29 @@ def _parse_args(argv):
     # Where tokens go. "uniform" keeps every chunk full and so never exercises
     # the empty-chunk path; "skewed" and "local" do. See _generate_round.
     parser.add_argument(
-        "--routing", default="uniform", choices=["uniform", "skewed", "local"]
+        "--routing",
+        default="uniform",
+        choices=["uniform", "skewed", "local", "replica"],
     )
     parser.add_argument("--dtype", default="bf16", choices=list(_DTYPES))
-    parser.add_argument("--combine-dtype", default=None, choices=list(_DTYPES))
+    # Unset: the dispatch dtype, or bf16 under an fp4 dispatch.
+    parser.add_argument(
+        "--combine-dtype",
+        default=None,
+        choices=[name for name in _DTYPES if name != "fp4"],
+    )
     parser.add_argument(
         "--quant-type", default="none", choices=["none", "fp8_direct_cast"]
     )
+    # QPs ALLOCATED per peer (num_qp_per_pe). How many a kernel sends on is a
+    # separate choice: --active-qps, else the tuning table, else min(2, this).
     parser.add_argument("--num-qp", type=int, default=1)
+    # Pin the active QP count for every bucket and both phases (cfg.active_qps).
+    parser.add_argument("--active-qps", type=int, default=None)
+    # Extra counts compiled for op.set_active_qps(), comma-separated. Under
+    # --cmd test the rounds cycle through them, then through the table's own
+    # choice, so a switch between rounds is checked against the golden.
+    parser.add_argument("--active-qp-counts", default=None)
     # 30, matching _EP_ROUNDS in the examples harness. Lower is not a
     # small-sample caveat but a different estimator: at --rounds 3 with
     # --drop-rounds 1 the two kept rounds are the ones that harness documents as
@@ -215,21 +251,27 @@ def _parse_args(argv):
     # Smoke-test / bisect aid: stop after N candidates (0 = sweep all).
     parser.add_argument("--tuning-limit", type=int, default=0)
     parser.add_argument(
-        "--tuning-phase", default="dispatch", choices=["dispatch", "combine"]
+        "--tuning-phase", default="dispatch", choices=["dispatch", "combine", "pair"]
     )
     # Validation mode: sweep exactly one named candidate against the shipped
-    # geometry. A sweep winner is chosen by a greedy chain of paired tests, each
-    # with its own error; before it is written into the table it gets one long
-    # head-to-head against what it would replace.
+    # geometry. A sweep picks its winner from many short paired tests, each with
+    # its own error; before it is written into the table it gets one long
+    # head-to-head against what it would replace. block,rdma,warp[,active_qps];
+    # under --tuning-phase pair, dispatch,combine QP counts per pair, separated by
+    # '/' (or ';', which a remote shell would split on).
     parser.add_argument("--tuning-candidate", default=None)
-    # What a candidate is selected ON. "total" by default, and deliberately:
-    # internode_tuning_configs.py records that the two phases are COUPLED -- a
-    # dispatch with too few rdma blocks leaves the following combine ~18us slower
-    # at 4/8 tokens -- so the shipped small-token dispatch is NOT the dispatch
-    # argmin, it holds rdma high to keep the paired combine fast. Selecting a
-    # dispatch geometry on dispatch time alone reproduces exactly the mistake
-    # that comment warns about. "phase" is kept for looking at a phase in
-    # isolation, which is a diagnostic, not a way to choose a table row.
+    # Active QP counts to cross with every geometry, e.g. 1,2,4,8. Each must be
+    # within --num-qp, the allocation. Unset keeps the shipped count.
+    parser.add_argument("--tuning-qps", default=None)
+    # "shipped" keeps each phase's table geometry and varies only the active QP
+    # count (--tuning-qps). --tuning-phase pair always does: it crosses the
+    # dispatch and combine counts, because the op drains the larger of the two,
+    # so neither phase's best count is independent of the other's.
+    parser.add_argument(
+        "--tuning-geometry", default="sweep", choices=["sweep", "shipped"]
+    )
+    # Dispatch geometry can affect the following combine, so select on the
+    # pair total by default. "phase" is available for individual-op diagnostics.
     parser.add_argument("--tuning-metric", default="total", choices=["total", "phase"])
     # Greedy chaining (v1's shape: a winner becomes the incumbent) is OFF by
     # default here. With a chain, one lucky early win moves the baseline and
@@ -255,6 +297,13 @@ def _parse_args(argv):
     # worst-of-reps improvement makes a median TIE interesting. Fraction of the
     # incumbent's median.
     parser.add_argument("--tuning-tail-frac", type=float, default=0.10)
+    # Saving is opt-in. Confirm sweep winners in independent paired runs before
+    # adopting them; the sweep alone does not establish a stable improvement.
+    parser.add_argument("--tuning-save", action="store_true")
+    # Where --tuning-save writes. Default: this repo's copy of the table, not the
+    # installed package's -- a row is only useful once it is in a git diff
+    # somebody can read (same convention as the v1 bench's `auto`).
+    parser.add_argument("--tuning-config-dir", default=None)
     # The v1 bench calls combine with weights=None, so it does not pay for the
     # weight fold: an extra peer read per (token, destination) plus an accumulate
     # in three kernels, and a wider staging slot (combXferBytes = hidden + weights).
@@ -297,12 +346,38 @@ def _generate_round(rng, cfg, num_tokens, device, dtype, routing="uniform"):
                  on the per-node token count to retire them.
     ``local``    every expert is on the sender's own node, so a peer receives
                  NOTHING and every one of its chunks is empty. The extreme.
+    ``replica``  one shared expert fused in as a routed one, the way ATOM lays it
+                 out (SharedExpertMode.LOCAL_REPLICA): every rank's last expert
+                 slot is a replica of the shared expert and each token's last
+                 column is its own rank's replica; the other topk - 1 columns are
+                 distinct routed experts drawn uniformly over every rank's other
+                 slots. DeepSeek-V3/R1 at EP16 is 17 experts a rank, topk 9.
     """
-    inp = torch.randn(num_tokens, cfg.hidden_dim, generator=rng, device=device).to(
-        dtype
-    )
+    inp = torch.randn(num_tokens, cfg.hidden_dim, generator=rng, device=device)
+    # fp4 takes the bf16 draw rounded to e2m1, so its routing is the bf16 run's.
+    inp = encode_fp4(inp.to(torch.bfloat16)) if dtype == _FP4 else inp.to(dtype)
     num_experts = cfg.world_size * cfg.num_experts_per_rank
-    if routing == "uniform":
+    if routing == "replica":
+        routed_per_rank = cfg.num_experts_per_rank - 1
+        routed = torch.stack(
+            [
+                torch.randperm(
+                    cfg.world_size * routed_per_rank, generator=rng, device=device
+                )[: cfg.num_experts_per_token - 1]
+                for _ in range(num_tokens)
+            ]
+        )
+        # Routed expert p of rank p // routed_per_rank sits in the slot after the
+        # replicas of the ranks before it.
+        routed = routed + routed // routed_per_rank
+        shared = torch.full(
+            (num_tokens, 1),
+            cfg.rank * cfg.num_experts_per_rank + routed_per_rank,
+            dtype=routed.dtype,
+            device=device,
+        )
+        idx = torch.cat((routed, shared), dim=1).to(torch.int32)
+    elif routing == "uniform":
         idx = torch.stack(
             [
                 torch.randperm(num_experts, generator=rng, device=device)[
@@ -348,6 +423,58 @@ def _generate_round(rng, cfg, num_tokens, device, dtype, routing="uniform"):
     return inp, idx, wts, scales
 
 
+def _payload_f32(cfg, tensor):
+    """A dispatch payload's values as f32: fp4 decoded, every other dtype cast."""
+    return decode_fp4(tensor, torch.float32) if cfg.is_fp4 else tensor.float()
+
+
+def _combine_input(cfg, dispatched):
+    """What the identity expert hands combine: the dispatched tokens in the combine
+    dtype. The combine kernel reads its input as that type, so converting is the
+    caller's job -- an fp8 dispatch is cast, an fp4 one decoded."""
+    if cfg.is_fp4:
+        return decode_fp4(dispatched, cfg.combine_dtype)
+    return dispatched.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else dispatched
+
+
+class _Golden(NamedTuple):
+    unique_pes: torch.Tensor  # (tokens, 1): distinct destination ranks per token
+    hidden: torch.Tensor
+    hidden_bound: torch.Tensor
+    weights: torch.Tensor | None
+    weights_bound: torch.Tensor | None
+
+
+def _golden(cfg, args, inp, idx, wts=None):
+    """What an identity expert's combine must return, with its error bounds.
+
+    combine[t] sums one copy of input[t] per DISTINCT destination rank, so the
+    golden is unique_pes[t] * input[t]. The bound has to scale with unique_pes:
+    the sum has that many terms in the wire dtype, so its error grows with their
+    number and magnitude -- not with |golden| at that element, which cancellation
+    can make arbitrarily small. v1's harness bounds the same way. Weights are
+    summed in f32, so theirs is much tighter; both are None without ``wts``.
+    """
+    pes = idx.long() // cfg.num_experts_per_rank
+    unique = (
+        torch.stack(
+            [(pes[:, j : j + 1] != pes[:, :j]).all(dim=1) for j in range(pes.shape[1])],
+            dim=1,
+        )
+        .sum(dim=1, keepdim=True)
+        .float()
+    )
+    eps = 3e-1 if (args.quant_type != "none" or cfg.dispatch_dtype in _FP8) else 8e-3
+    source = _payload_f32(cfg, inp)
+    return _Golden(
+        unique,
+        unique * source,
+        eps * unique * source.abs().clamp(min=1.0),
+        None if wts is None else unique * wts.float(),
+        None if wts is None else 2e-3 * unique,
+    )
+
+
 def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
     """One dispatch+combine against the analytic golden. True if this rank agrees.
 
@@ -359,11 +486,7 @@ def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
     dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
     torch.cuda.synchronize()
     comm.barrier()
-    combine_input = (
-        dispatch_out[0].to(cfg.combine_dtype)
-        if cfg.is_asymmetric_dtype
-        else dispatch_out[0]
-    )
+    combine_input = _combine_input(cfg, dispatch_out[0])
     # AsyncLL is the exception to "always fold here": its combine payload is
     # hidden-only, so the request raises rather than returning a tensor. The
     # hidden check below still runs, which is the half that can be wrong.
@@ -374,39 +497,10 @@ def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
     torch.cuda.synchronize()
     comm.barrier()
 
-    num_tokens = inp.shape[0]
-    idx_cpu = idx.cpu()
-    unique_pes = np.array(
-        [
-            len(
-                {
-                    int(idx_cpu[t, j]) // cfg.num_experts_per_rank
-                    for j in range(args.topk)
-                }
-            )
-            for t in range(num_tokens)
-        ]
-    )
-    unique_pes_column = torch.from_numpy(unique_pes).view(num_tokens, 1).float()
-    got = out.float().cpu()
-    expected = unique_pes_column * inp.float().cpu()
-    input_magnitude = inp.float().cpu().abs()
-    eps = 3e-1 if (args.quant_type != "none" or cfg.dispatch_dtype in _FP8) else 8e-3
-    hidden_ok = bool(
-        (
-            (got - expected).abs()
-            <= eps * unique_pes_column * input_magnitude.clamp(min=1.0)
-        ).all()
-    )
-    weights_ok = (
-        True
-        if out_w is None
-        else bool(
-            (
-                (out_w.cpu() - unique_pes_column * wts.float().cpu()).abs()
-                <= 2e-3 * unique_pes_column
-            ).all()
-        )
+    golden = _golden(cfg, args, inp, idx, wts)
+    hidden_ok = bool(((out.float() - golden.hidden).abs() <= golden.hidden_bound).all())
+    weights_ok = out_w is None or bool(
+        ((out_w.float() - golden.weights).abs() <= golden.weights_bound).all()
     )
     if not (hidden_ok and weights_ok) and dist_handle.rank == 0:
         print(
@@ -498,27 +592,14 @@ def _report_loop_alignment(args, rank):
         )
 
 
-def _geometry_for_report(op, cfg, args):
-    """The (block, rdma, warp) each phase actually launched with, for the table
-    titles -- the point v1's `_launch_params_str` makes: a table that does not
-    name its launch config cannot be matched back to the run that produced it.
-    Read from the backend rather than from the config, because on the internode
-    path cfg.dispatch_block_num is a dict key and not a grid."""
-    try:
-        # EpDispatchCombineOpHip IS the backend -- it subclasses the op.
-        return (
-            tuple(op._internode_geom_for("dispatch", args.max_tokens)),
-            tuple(op._internode_geom_for("combine", args.max_tokens)),
-        )
-    except Exception:
-        from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
-
-        table_row = lookup(
-            cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, args.max_tokens
-        )
-        if table_row:
-            return tuple(table_row["dispatch"]), tuple(table_row["combine"])
-        return (0, 0, 0), (0, 0, 0)
+def _geometry_for_report(op, num_tokens):
+    """Report the same HIP configuration used to select the launch callable:
+    (block, rdma, warp, active_qps) per phase, after any set_active_qps()."""
+    selected = op.kernel_config(num_tokens)
+    return tuple(
+        (spec.block_num, spec.rdma_block_num, spec.warp_per_block, spec.active_qps)
+        for spec in (selected.dispatch, selected.combine)
+    )
 
 
 def _rdma_algo_token_count(idx, cfg, ll):
@@ -605,13 +686,14 @@ def _report_tables(
     routing is not perfectly balanced.
     """
     num_tokens = args.max_tokens
-    dispatch_elem_size = torch.tensor([], dtype=cfg.dispatch_dtype).element_size()
-    combine_elem_size = torch.tensor([], dtype=cfg.combine_dtype).element_size()
-    dispatch_bytes = total_recv * cfg.hidden_dim * dispatch_elem_size
-    combine_bytes = total_recv * cfg.hidden_dim * combine_elem_size
+    # Transport widths: packed FP4 moves hidden_dim / 2 bytes per token.
+    dispatch_token_bytes = cfg.token_nbytes
+    combine_token_bytes = cfg.combine_token_nbytes
+    dispatch_bytes = total_recv * dispatch_token_bytes
+    combine_bytes = total_recv * combine_token_bytes
     rdma_tokens = _rdma_algo_token_count(idx, cfg, ll)
-    dispatch_rdma_bytes = rdma_tokens * cfg.hidden_dim * dispatch_elem_size
-    combine_rdma_bytes = rdma_tokens * cfg.hidden_dim * combine_elem_size
+    dispatch_rdma_bytes = rdma_tokens * dispatch_token_bytes
+    combine_rdma_bytes = rdma_tokens * combine_token_bytes
     # LL packs a fixed slot per (token, expert) rather than only what routed, so
     # its wire bytes exceed the payload by this factor. v1 scales the XGMI
     # column by it to get the LL column.
@@ -680,11 +762,12 @@ def _report_tables(
         f"topk={cfg.num_experts_per_token} kernel={'v2_ll' if ll else 'v2'} "
         f"world={cfg.world_size} nodes={nodes}x{cfg.gpu_per_node} "
         f"experts/rank={cfg.num_experts_per_rank} scale_dim={cfg.scale_dim} "
-        f"qp={cfg.num_qp_per_pe}",
+        f"qp_allocated={cfg.num_qp_per_pe}",
         flush=True,
     )
     print(
-        f"# CONFIG dispatch block/rdma/warp={geometry[0]}  combine={geometry[1]}  "
+        f"# CONFIG dispatch block/rdma/warp/active_qps={geometry[0]}  "
+        f"combine={geometry[1]}  "
         f"rounds={args.rounds} warmup={args.warmup}  "
         f"recv_tokens={total_recv} rdma_algo_tokens={rdma_tokens}",
         flush=True,
@@ -695,17 +778,17 @@ def _report_tables(
         (rdma_column, xgmi_column, latency_column),
         phase_dtype,
         phase_geometry,
-        elem_size,
+        token_bytes,
     ) in (
-        ("Dispatch", (0, 1, 2), cfg.dispatch_dtype, geometry[0], dispatch_elem_size),
-        ("Combine", (3, 4, 5), cfg.combine_dtype, geometry[1], combine_elem_size),
+        ("Dispatch", (0, 1, 2), cfg.dispatch_dtype, geometry[0], dispatch_token_bytes),
+        ("Combine", (3, 4, 5), cfg.combine_dtype, geometry[1], combine_token_bytes),
     ):
         xgmi_stats = _phase_stats(gathered[:, :, xgmi_column])
         _print_phase_table(
             f"{name} Performance ({str(phase_dtype).split('.')[-1]}) "
             f"block={phase_geometry[0]} warp={phase_geometry[2]} "
-            f"rdma={phase_geometry[1]} "
-            f"~{num_tokens * cfg.hidden_dim * elem_size / (1024 ** 2):.1f} MB/rank",
+            f"rdma={phase_geometry[1]} qps={phase_geometry[3]} "
+            f"~{num_tokens * token_bytes / (1024 ** 2):.1f} MB/rank",
             _phase_stats(gathered[:, :, rdma_column]),
             xgmi_stats,
             tuple(stat * ll_scale for stat in xgmi_stats),
@@ -714,15 +797,14 @@ def _report_tables(
 
 
 def _family_that_ran(op, num_tokens):
-    """Which kernel family served this call.
+    """Which kernel family served this call, as kernel_config() resolves it.
 
-    AsyncLL is not one of the two the auto switch chooses between, so asking
-    _internode_use_ll about it reports whichever of v2/v2_ll the untouched
-    internode_kernel default happens to name -- a wrong label on a real number.
+    AsyncLL is reported with its transport: sdma and lsa are different kernels
+    behind the one schedule entry.
     """
     if getattr(op.cfg, "async_ll", False):
         return f"asyncll({op.cfg.async_ll_transport})"
-    return "v2_ll" if op._internode_use_ll(num_tokens) else "v2"
+    return op.kernel_config(num_tokens).dispatch.family
 
 
 def _bench(op, cfg, dist_handle, device, args, comm):
@@ -775,10 +857,8 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     torch.cuda.synchronize()
     comm.barrier()
 
-    # The examples harness's _convert_for_combine: the combine leg reads its
-    # input as its own element type, so an asymmetric config has to cast first.
     def convert(tensor):
-        return tensor.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else tensor
+        return _combine_input(cfg, tensor)
 
     combine_weights = wts if args.bench_weights else None
 
@@ -988,7 +1068,8 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     if dist_handle.rank == 0:
         print(
             f"# BENCH tok={num_tokens} "
-            f"dtype={args.dtype}->{args.combine_dtype or args.dtype} "
+            f"dtype={_DTYPE_NAMES.get(cfg.dispatch_dtype)}->"
+            f"{_DTYPE_NAMES.get(cfg.combine_dtype)} "
             f"hidden={cfg.hidden_dim} topk={cfg.num_experts_per_token} "
             f"kernel={kernel_ran}{'(auto)' if args.kernel_type == 'auto' else ''} "
             f"dispatch={dispatch_mean:.1f}us [{dispatch_low:.1f}/{dispatch_high:.1f}] "
@@ -1002,8 +1083,8 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     # performance tables. Off with --no-bench-tables; it costs one all_gather
     # after the timed loop and nothing inside it.
     if not args.no_bench_tables:
-        ll = op._internode_use_ll(args.max_tokens)
-        geometry = _geometry_for_report(op, cfg, args)
+        ll = op.kernel_config(args.max_tokens).dispatch.family == "v2_ll"
+        geometry = _geometry_for_report(op, args.max_tokens)
         _report_tables(
             dist_handle,
             cfg,
@@ -1033,35 +1114,11 @@ def _timed_pass(
 ):
     """One warmup+timed block. Returns (dispatch_us, combine_us) as grand means over
     rounds x ranks, plus (worst_dispatch, worst_combine) as the worst single round."""
-    events = [torch.cuda.Event(enable_timing=True) for _ in range(3 * num_rounds + 1)]
-    # Same tensor lifetime as the timed loop; see the warmup in _bench for why
-    # the inline temporary costs the second timed round a hipMalloc. It matters
-    # more here: this function reports a worst-single-round that the tuner uses
-    # to break ties, against a default --tuning-margin-us of 1.5.
-    warmup_combine_input = None
-    for _ in range(num_warmup):
-        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
-        warmup_combine_input = convert(dispatch_out[0])
-        op.combine(warmup_combine_input, combine_weights, routing=dispatch_out[5])
-    del warmup_combine_input
-    torch.cuda.synchronize()
-    events[0].record()
-    for i in range(num_rounds):
-        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
-        events[3 * i + 1].record()
-        combine_input = convert(dispatch_out[0])
-        events[3 * i + 2].record()
-        op.combine(combine_input, combine_weights, routing=dispatch_out[5])
-        events[3 * i + 3].record()
-    torch.cuda.synchronize()
-    keep = slice(args.drop_rounds, None)
-    dispatch_us = [
-        events[3 * i].elapsed_time(events[3 * i + 1]) * 1e3 for i in range(num_rounds)
-    ][keep]
-    combine_us = [
-        events[3 * i + 2].elapsed_time(events[3 * i + 3]) * 1e3
-        for i in range(num_rounds)
-    ][keep]
+    rounds = _timed_rounds(
+        op, inp, idx, wts, sc, combine_weights, convert, num_rounds, num_warmup
+    )[args.drop_rounds :]
+    dispatch_us = [dispatch for dispatch, _ in rounds]
+    combine_us = [combine for _, combine in rounds]
 
     def grand_mean(values):
         return (
@@ -1087,36 +1144,232 @@ def _timed_pass(
 
 
 def _build_op(cfg, comm, dispatch_geometry, combine_geometry):
-    """An op whose dispatch plans are compiled for `dispatch_geometry` and its
-    combine plans for `combine_geometry`. Goes through the MORI_EP_*_GEOM hook
-    the backend already exposes for sweeps: a geometry is a compile-time identity
-    there, read once at build time, so it cannot be selected per launch the way
-    v1's can.
+    """An op whose dispatch plans run `dispatch_geometry` and its combine plans
+    `combine_geometry`. Goes through the MORI_EP_*_GEOM hook the backend already
+    exposes for sweeps: it is read once, when the op resolves its schedule, so
+    each candidate needs an op of its own and cannot be selected per launch the
+    way v1's can.
 
-    The two are SEPARATE because the shipped table gives them separate values
-    (tokens 4: dispatch 64/32/8, combine 32/21/6). Driving both from one geometry
-    means the sweep's incumbent is not the configuration actually shipped, so
-    "beats the incumbent" would not mean "beats what we ship".
+    The two are SEPARATE because the shipped tables give them separate values
+    (MI308X InterNodeV2, 256/8 hidden 7168 bf16 at 4 tokens: dispatch 64/42/4,
+    combine 16/10/4). Driving both from one geometry means the sweep's incumbent
+    is not the configuration actually shipped, so "beats the incumbent" would not
+    mean "beats what we ship".
+
+    The intranode backend has no such hook; there the geometry is pinned through
+    the config fields, which also drops the tuned schedule.
     """
-    previous = (
-        os.environ.get("MORI_EP_DISP_GEOM"),
-        os.environ.get("MORI_EP_COMB_GEOM"),
-    )
-    os.environ["MORI_EP_DISP_GEOM"] = "%d,%d,%d" % dispatch_geometry
-    os.environ["MORI_EP_COMB_GEOM"] = "%d,%d,%d" % combine_geometry
+    # The backend logs every op's full schedule at INFO; a sweep builds one op
+    # per candidate, and its own report already names each geometry.
+    backend_log = logging.getLogger("mori.ops.dispatch_combine_v2.hip_backend")
+    backend_level = backend_log.level
+    backend_log.setLevel(logging.WARNING)
     try:
-        return EpDispatchCombineOp(cfg, comm)
+        if not cfg.is_internode:
+            pinned = dataclasses.replace(
+                cfg,
+                schedule=None,
+                dispatch_block_num=dispatch_geometry[0],
+                warp_num_per_block=dispatch_geometry[2],
+                combine_block_num=combine_geometry[0],
+                combine_warp_num_per_block=combine_geometry[2],
+            )
+            return EpDispatchCombineOp(pinned, comm)
+        previous = (
+            os.environ.get("MORI_EP_DISP_GEOM"),
+            os.environ.get("MORI_EP_COMB_GEOM"),
+        )
+        os.environ["MORI_EP_DISP_GEOM"] = ",".join(map(str, dispatch_geometry))
+        os.environ["MORI_EP_COMB_GEOM"] = ",".join(map(str, combine_geometry))
+        try:
+            return EpDispatchCombineOp(cfg, comm)
+        finally:
+            for name, value in zip(
+                ("MORI_EP_DISP_GEOM", "MORI_EP_COMB_GEOM"), previous
+            ):
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
     finally:
-        for name, value in zip(("MORI_EP_DISP_GEOM", "MORI_EP_COMB_GEOM"), previous):
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        backend_log.setLevel(backend_level)
 
 
 def _median(values):
     ordered = sorted(values)
     return ordered[len(ordered) // 2]
+
+
+def _timed_rounds(
+    op,
+    inp,
+    idx,
+    wts,
+    sc,
+    combine_weights,
+    convert,
+    num_rounds,
+    num_warmup,
+    *,
+    barrier=False,
+):
+    """Warmup, then num_rounds timed dispatch+combine pairs on this rank:
+    (dispatch_us, combine_us) per round. ``barrier`` lines the ranks up before,
+    not inside, the timed loop, as v1 does for the metrics it reports."""
+    events = [torch.cuda.Event(enable_timing=True) for _ in range(3 * num_rounds + 1)]
+    # Same tensor lifetime as the timed loop; see the warmup in _bench for why
+    # the inline temporary costs the second timed round a hipMalloc. It matters
+    # more for the tuner, which breaks ties on the worst single round against a
+    # default --tuning-margin-us of 1.5.
+    warmup_combine_input = None
+    for _ in range(num_warmup):
+        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        warmup_combine_input = convert(dispatch_out[0])
+        op.combine(warmup_combine_input, combine_weights, routing=dispatch_out[5])
+    del warmup_combine_input
+    torch.cuda.synchronize()
+    if barrier:
+        dist.barrier()
+    events[0].record()
+    for i in range(num_rounds):
+        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        events[3 * i + 1].record()
+        combine_input = convert(dispatch_out[0])
+        events[3 * i + 2].record()
+        op.combine(combine_input, combine_weights, routing=dispatch_out[5])
+        events[3 * i + 3].record()
+    torch.cuda.synchronize()
+    return [
+        (
+            events[3 * i].elapsed_time(events[3 * i + 1]) * 1e3,
+            events[3 * i + 2].elapsed_time(events[3 * i + 3]) * 1e3,
+        )
+        for i in range(num_rounds)
+    ]
+
+
+def _summarize_metric_samples(
+    gathered, *, num_passes, num_rounds, drop_rounds, max_tokens, topk, ll
+):
+    """Rounded tuning metrics from the CPU all-gather rows.
+
+    Each rank contributes four metadata values followed by interleaved
+    dispatch/combine microseconds in pass-major, round-major order. Metadata is
+    received tokens, algorithm RDMA tokens, dispatch bytes/token and combine
+    bytes/token. Bandwidth is averaged after dividing each rank's own bytes by
+    each retained latency. The LL scale is rank 0's, applied after that average.
+    """
+    rows = [list(row) for row in gathered]
+    sample_count = len(rows) * num_passes * (num_rounds - drop_rounds)
+    ll_scale_rank0 = max_tokens * topk / (rows[0][0] + 1)
+    metrics = {}
+    for phase_index, phase in enumerate(("dispatch", "combine")):
+        latencies, rdma_bandwidths, xgmi_bandwidths = [], [], []
+        for row in rows:
+            recv_tokens, rdma_tokens = row[:2]
+            width = row[2 + phase_index]
+            for pass_index in range(num_passes):
+                for round_index in range(drop_rounds, num_rounds):
+                    offset = 4 + 2 * (pass_index * num_rounds + round_index)
+                    latency = row[offset + phase_index]
+                    latencies.append(latency)
+                    rdma_bandwidths.append(rdma_tokens * width / (1000 * latency))
+                    xgmi_bandwidths.append(recv_tokens * width / (1000 * latency))
+        latency = math.fsum(latencies) / sample_count
+        rdma = math.fsum(rdma_bandwidths) / sample_count
+        xgmi = math.fsum(xgmi_bandwidths) / sample_count
+        ll_bandwidth = xgmi * ll_scale_rank0
+        values = {
+            "bandwidth_gbps": ll_bandwidth if ll else rdma,
+            "avg_rdma_bandwidth_gbps": rdma,
+            "avg_xgmi_bandwidth_gbps": xgmi,
+            "avg_ll_bandwidth_gbps": ll_bandwidth,
+            "avg_latency_us": latency,
+        }
+        metrics[phase] = {
+            **{name: round(value, 2) for name, value in values.items()},
+            "bandwidth_metric": "grand_mean",
+        }
+    return metrics
+
+
+def _row_metrics(op, cfg, args, dist_handle, rng_data, convert, ll):
+    """Final metrics with v1's grand mean, separate from search estimators.
+
+    Each rank computes bandwidth with its own payload and each retained round's
+    latency, then all samples across passes, ranks, and rounds are averaged.
+    The headline is RDMA for v2 and LL for v2_ll. LL uses the global XGMI mean
+    times rank 0's scale, exactly as v1's saved Average row does.
+
+    One CPU all-gather follows all synchronized timing passes.
+    """
+    if (
+        args.tuning_reps < 1
+        or args.rounds < 1
+        or not 0 <= args.drop_rounds < args.rounds
+    ):
+        raise ValueError("Metric sampling requires passes and retained rounds")
+    if args.warmup < 0:
+        raise ValueError("Metric warmup must be nonnegative")
+    inp, idx, wts, sc, combine_weights = rng_data
+    dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+    torch.cuda.synchronize()
+    total_recv = int(dispatch_out[4].item())
+    combine_input = convert(dispatch_out[0])
+    # Actual storage widths handle packed FP4 dispatch and unpacked BF16 combine.
+    dispatch_bytes = inp.shape[-1] * inp.element_size()
+    combine_bytes = combine_input.shape[-1] * combine_input.element_size()
+    op.combine(combine_input, combine_weights, routing=dispatch_out[5])
+    torch.cuda.synchronize()
+    del combine_input, dispatch_out
+    rdma_tokens = _rdma_algo_token_count(idx, cfg, ll)
+    row = [total_recv, rdma_tokens, dispatch_bytes, combine_bytes]
+    for _ in range(args.tuning_reps):
+        samples = _timed_rounds(
+            op,
+            inp,
+            idx,
+            wts,
+            sc,
+            combine_weights,
+            convert,
+            args.rounds,
+            args.warmup,
+            barrier=True,
+        )
+        row.extend(value for sample in samples for value in sample)
+    gathered = dist_handle.all_gather_rows(row).tolist()
+    return _summarize_metric_samples(
+        gathered,
+        num_passes=args.tuning_reps,
+        num_rounds=args.rounds,
+        drop_rounds=args.drop_rounds,
+        max_tokens=args.max_tokens,
+        topk=cfg.num_experts_per_token,
+        ll=ll,
+    )
+
+
+def _active_qp_schedule(cfg):
+    """The counts --active-qp-counts switches among, then None (back to the
+    table), or None when the flag is not given."""
+    return list(cfg.active_qp_counts) + [None] if cfg.active_qp_counts else None
+
+
+def _active_qp_for(schedule, round_index, cfg, phase_offset):
+    """The count this rank selects for one phase of one round.
+
+    Deliberately NOT in step. The combine barrier only carries markers between a
+    rank and its same-local-rank peer on each other node, so the offset is the
+    NODE index: with two nodes, those peers take adjacent schedule entries, and
+    phase_offset 1 puts combine one entry ahead of its own dispatch. Those are
+    the two cases the combine barrier has to tolerate. They actually differ only
+    where adjacent entries resolve to different counts: the trailing None means
+    each bucket's own count, which can equal a neighbour (e.g. 2,4 with a
+    default of 2). 1,2,4,8 at the default of 2 differs at every step.
+    """
+    node = cfg.rank // cfg.gpu_per_node
+    return schedule[(round_index + node + phase_offset) % len(schedule)]
 
 
 def _stress(op, cfg, dist_handle, device, args, comm):
@@ -1129,10 +1382,14 @@ def _stress(op, cfg, dist_handle, device, args, comm):
     internode_kernel="auto" -- the per-call switch between the v2 and v2_ll
     families, since the counts fall on both sides of the crossover.
 
-    No per-round verification: this looks for hangs, faults and protocol drift
-    over many rounds, and checking every round would hide them behind the
-    check's own synchronisation. The queue is drained every
+    By default no per-round verification: this looks for hangs, faults and
+    protocol drift over many rounds, and checking every round would hide them
+    behind the check's own synchronisation. The queue is drained every
     --stress-sync-interval rounds rather than every round for the same reason.
+    --stress-check-interval N compares every Nth round's combine output with the
+    identity-expert expectation after the round, never between its dispatch and
+    combine, so a combine that starts before dispatch state has landed is caught
+    rather than masked. --stress-full-node makes one node a full-capacity sender.
 
     v1 follows its soak with a CUDA-graph phase. Not reproduced here: graph
     capture over the internode plan sequence is untested, and adding it to a
@@ -1145,10 +1402,19 @@ def _stress(op, cfg, dist_handle, device, args, comm):
     counts = torch.randint(
         1, max_tokens + 1, [args.stress_datasets], generator=rng, device=device
     ).tolist()
+    if dist_handle.rank // cfg.gpu_per_node == args.stress_full_node:
+        counts = [max_tokens] * len(counts)
     datasets = [
         _generate_round(rng, cfg, int(n), device, cfg.dispatch_dtype, args.routing)
         for n in counts
     ]
+    expected = []
+    if args.stress_check_interval:
+        # combine(weights=None), so only the hidden half is checked.
+        for inp, idx, _, _ in datasets:
+            golden = _golden(cfg, args, inp, idx)
+            expected.append((golden.hidden, golden.hidden_bound))
+    failed_checks = checks = 0
     if dist_handle.rank == 0:
         families = sorted({_family_that_ran(op, n) for n in set(counts)})
         print(
@@ -1159,32 +1425,49 @@ def _stress(op, cfg, dist_handle, device, args, comm):
             flush=True,
         )
 
+    # Active QP switching as in --cmd test, on top of the ragged per-rank token
+    # counts; see _active_qp_for.
+    qp_schedule = _active_qp_schedule(cfg)
     dist.barrier()
     started = time.time()
     for i in range(args.rounds):
         inp, idx, wts, sc = datasets[i % len(datasets)]
+        if qp_schedule:
+            op.set_active_qps(_active_qp_for(qp_schedule, i, cfg, 0))
         dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
-        combine_input = (
-            dispatch_out[0].to(cfg.combine_dtype)
-            if cfg.is_asymmetric_dtype
-            else dispatch_out[0]
-        )
+        combine_input = _combine_input(cfg, dispatch_out[0])
+        if qp_schedule:
+            op.set_active_qps(_active_qp_for(qp_schedule, i, cfg, 1))
         # None, not wts: v1's soak combines without weights
         # (run_combine(op, combine_input, None, indices)), and since want_weights
         # is now honoured, passing them would make this a different kernel path
         # from the case it is meant to mirror.
-        op.combine(combine_input, None, routing=dispatch_out[5])
+        out, _ = op.combine(combine_input, None, routing=dispatch_out[5])
+        if args.stress_check_interval and i % args.stress_check_interval == 0:
+            golden, tolerance = expected[i % len(datasets)]
+            checks += 1
+            failed_checks += int(
+                not bool(((out.float() - golden).abs() <= tolerance).all())
+            )
         if i % args.stress_sync_interval == 0:
             torch.cuda.synchronize()
     torch.cuda.synchronize()
     comm.barrier()
 
+    failed_ranks = dist_handle.allreduce_sum(int(failed_checks > 0))
     if dist_handle.rank == 0:
+        verdict = "OK" if failed_ranks == 0 else "FAILED"
         print(
-            f"# STRESS OK: {args.rounds} rounds in {time.time() - started:.1f}s",
+            f"# STRESS {verdict}: {args.rounds} rounds in {time.time() - started:.1f}s"
+            + (
+                f"; {checks} checked rounds per rank, {failed_ranks} rank(s) with "
+                "mismatches"
+                if args.stress_check_interval
+                else ""
+            ),
             flush=True,
         )
-    return 0
+    return 0 if failed_ranks == 0 else 1
 
 
 def _tune(cfg, dist_handle, device, args, comm):
@@ -1240,35 +1523,231 @@ def _tune(cfg, dist_handle, device, args, comm):
         )
         return sorted({count for count in fractions if 1 <= count < block_count})
 
-    candidates = [
-        (block, rdma, warp)
-        for block in sorted(blocks)
-        for warp in warps
-        for rdma in rdma_block_counts(block)
-    ]
-    if args.tuning_candidate:
-        candidates = [tuple(int(x) for x in args.tuning_candidate.split(","))]
+    if cfg.is_internode:
+        geometry_candidates = [
+            (block, rdma, warp)
+            for block in sorted(blocks)
+            for warp in warps
+            for rdma in rdma_block_counts(block)
+        ]
+    else:
+        # Intranode has no RDMA split; the middle field stays 0.
+        geometry_candidates = [
+            (block, 0, warp) for block in sorted(blocks) for warp in warps
+        ]
+
+    from mori.ops.dispatch_combine_v2.hip_tuning_configs import (
+        internode_kernel_family,
+        lookup_internode,
+        pick_bucket,
+        resolve_active_qps,
+    )
+    from mori.ops.tuning_config import DTYPE_TO_CONFIG_STR
+
+    # Each phase's rules are keyed by ITS OWN leg's dtype, as v1 keys its two
+    # files: an fp8-dispatch + bf16-combine op writes fp8_e4m3 dispatch rules and
+    # bf16 combine rules. So the two strings can differ, and the saved row has to
+    # use the one for the phase being swept.
+    dtype_keys = {
+        "dispatch": DTYPE_TO_CONFIG_STR.get(cfg.dispatch_dtype),
+        "combine": DTYPE_TO_CONFIG_STR.get(cfg.combine_dtype),
+    }
+    kernel_family = (
+        internode_kernel_family(cfg, args.max_tokens) if cfg.is_internode else "intra"
+    )
+    if args.tuning_save or args.tuning_config_dir:
+        # Read the incumbent from the SAME table the winner will be written to.
+        # The kernels run from site-packages while --tuning-save writes the
+        # repo's copy, so without this a sweep would be judged against a row it
+        # is not about to replace -- and the second phase of a shape would not
+        # see the first phase's result at all.
+        os.environ["MORI_EP_V2_TUNING_DIR"] = str(_tuning_table_dir(args))
+    if cfg.is_internode:
+        table_row = lookup_internode(
+            cfg.world_size,
+            cfg.hidden_dim,
+            cfg.num_experts_per_token,
+            args.max_tokens,
+            cfg.dispatch_dtype,
+            cfg.combine_dtype,
+            kernel_family=kernel_family,
+            experts_per_rank=cfg.num_experts_per_rank,
+            cu_count=num_cus,
+        )
+    else:
+        # Re-resolve the schedule: the caller's config was built before
+        # MORI_EP_V2_TUNING_DIR pointed at the table this run writes.
+        current = dataclasses.replace(
+            cfg,
+            schedule=None,
+            dispatch_block_num=None,
+            warp_num_per_block=None,
+            combine_block_num=None,
+            combine_warp_num_per_block=None,
+        )
+        row = (
+            pick_bucket(current.schedule, args.max_tokens)
+            if current.schedule
+            else (
+                None,
+                current.dispatch_block_num,
+                current.warp_num_per_block,
+                current.combine_block_num,
+                current.combine_warp_num_per_block,
+            )
+        )
+        table_row = {
+            "dispatch": (row[1], 0, row[2], None),
+            "combine": (row[3], 0, row[4], None),
+        }
+
+    def incumbent(geometry):
+        # The count the op itself would run for this geometry, by the backend's
+        # own rules: a configured --active-qps wins, an open count takes the
+        # default, and a table count is clamped to the allocation. Named
+        # explicitly, so the incumbent and the candidates compare like with like.
+        # Intranode sends on no QP, so its count stays None.
+        block, rdma, warp = geometry[:3]
+        if not cfg.is_internode:
+            return (block, rdma, warp, None)
+        active_qps = geometry[3] if len(geometry) > 3 else None
+        return (block, rdma, warp, resolve_active_qps(cfg, active_qps))
+
+    def checked(active_qps):
+        # A count the sweep was ASKED for is rejected, not clamped: a clamped
+        # candidate would report a winner it never ran. Same rule as the env pin.
+        if not cfg.is_internode or not 1 <= active_qps <= cfg.num_qp_per_pe:
+            raise SystemExit(
+                f"active QP count {active_qps} is outside the allocation "
+                f"[1, --num-qp={cfg.num_qp_per_pe}] or not internode"
+            )
+        return active_qps
+
+    # The incumbent is the shipped row where there is one (clamped to this GPU's
+    # CU count, as the op clamps it), and otherwise the config's fallback
+    # geometry as given. That fallback is not clamped here, so on a part with
+    # fewer CUs than its block count (MI308X: 80 against 96) the incumbent runs a
+    # wider grid than the op a user builds would. Not candidates[0] -- that is
+    # just the smallest grid in the sweep, so on a shape with no row yet the
+    # whole sweep would be scored against a geometry nobody runs, and "beats the
+    # incumbent" would not mean "beats what we ship".
+    #
+    # Per phase, because a phase may have no rule: the tuner sweeps one phase
+    # against the other's current value, so a bucket grows a phase at a time.
+    def _incumbent(phase_name, config_geometry):
+        tuned = table_row.get(phase_name) if table_row else None
+        return incumbent(tuple(tuned) if tuned else config_geometry)
+
+    incumbent_dispatch = _incumbent(
+        "dispatch",
+        (cfg.dispatch_block_num, cfg.dispatch_rdma_block_num, cfg.warp_num_per_block),
+    )
+    incumbent_combine = _incumbent(
+        "combine",
+        (
+            cfg.combine_block_num,
+            cfg.combine_rdma_block_num,
+            cfg.combine_warp_num_per_block,
+        ),
+    )
+    phase = args.tuning_phase
+    pair = phase == "pair"
+    if pair:
+        # A candidate is a (dispatch, combine) geometry pair.
+        shipped = (incumbent_dispatch, incumbent_combine)
+    else:
+        shipped = incumbent_dispatch if phase == "dispatch" else incumbent_combine
+    if pair and (
+        not cfg.is_internode or not (args.tuning_qps or args.tuning_candidate)
+    ):
+        raise SystemExit(
+            "--tuning-phase pair is internode only and needs --tuning-qps or "
+            "--tuning-candidate"
+        )
+    if args.tuning_geometry == "shipped" and not pair:
+        geometry_candidates = [shipped[:3]]
+
+    # --tuning-qps crosses every geometry with every active count. Without it the
+    # sweep keeps the shipped count and varies the geometry alone, as before.
+    active_qp_candidates = (
+        [checked(int(count)) for count in args.tuning_qps.split(",")]
+        if args.tuning_qps
+        else ([] if pair else [shipped[3]])
+    )
+    if pair:
+        # Table geometry for both phases; every (dispatch, combine) count pair,
+        # or just the pairs --tuning-candidate names ("1,4/1,2": dispatch,combine
+        # counts per pair) to confirm a sweep's winners with more --tuning-reps.
+        count_pairs = (
+            [
+                tuple(checked(int(x)) for x in item.split(","))
+                for item in re.split(r"[;/]", args.tuning_candidate)
+            ]
+            if args.tuning_candidate
+            else [
+                (dq, cq) for dq in active_qp_candidates for cq in active_qp_candidates
+            ]
+        )
+        candidates = [
+            (incumbent_dispatch[:3] + (dq,), incumbent_combine[:3] + (cq,))
+            for dq, cq in count_pairs
+        ]
+    else:
+        candidates = [
+            geometry + (active_qps,)
+            for geometry in geometry_candidates
+            for active_qps in active_qp_candidates
+        ]
+    candidate_fields = ()
+    if args.tuning_candidate and not pair:
+        candidate_fields = tuple(int(x) for x in args.tuning_candidate.split(","))
+        # Three fields keep the shipped count, so a validation run changes the
+        # geometry alone; a fourth names the count.
+        candidates = [
+            candidate_fields[:3]
+            + (
+                (
+                    checked(candidate_fields[3])
+                    if len(candidate_fields) > 3
+                    else shipped[3]
+                ),
+            )
+        ]
     elif args.tuning_limit:
         candidates = candidates[: args.tuning_limit]
-
-    from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
-
-    table_row = lookup(
-        cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, args.max_tokens
-    )
-    # The incumbent is the SHIPPED pair, so a win means "better than what we ship".
-    incumbent_dispatch = tuple(table_row["dispatch"]) if table_row else candidates[0]
-    incumbent_combine = tuple(table_row["combine"]) if table_row else candidates[0]
-    phase = args.tuning_phase
-    shipped = incumbent_dispatch if phase == "dispatch" else incumbent_combine
     if shipped in candidates:
         candidates.remove(shipped)
+    # With --tuning-save an empty list is a refresh run: measure and save the
+    # shipped geometry's row again.
+    if not candidates and not args.tuning_save:
+        if dist_handle.rank == 0:
+            print(
+                f"# TUNING tok={args.max_tokens}: nothing to compare -- every "
+                f"candidate is the shipped {shipped}",
+                flush=True,
+            )
+        return 0
+    # Whether the reported and saved rules name an active QP count: only when
+    # this sweep measured the count, or the shipped rule already names one.
+    # Otherwise the count is this run's resolved default, and recording it would
+    # pin production to it. A pair sweep always measures the counts: it requires
+    # --tuning-qps or --tuning-candidate, and either names them.
+    table_names_count = bool(
+        table_row
+        and (
+            table_row["dispatch"][3] is not None or table_row["combine"][3] is not None
+        )
+    )
+    report_active_qps = (
+        pair or bool(args.tuning_qps) or len(candidate_fields) > 3 or table_names_count
+    )
 
     if dist_handle.rank == 0:
         print(
             f"# TUNING tok={args.max_tokens} phase={phase} "
             f"scope={args.tuning_scope} reps={args.tuning_reps} cus={num_cus} "
-            f"candidates={len(candidates)} shipped dispatch={incumbent_dispatch} "
+            f"candidates={len(candidates)} qp_allocated={cfg.num_qp_per_pe} "
+            f"shipped block/rdma/warp/active_qps dispatch={incumbent_dispatch} "
             f"combine={incumbent_combine}",
             flush=True,
         )
@@ -1276,27 +1755,30 @@ def _tune(cfg, dist_handle, device, args, comm):
     rng = torch.Generator(device=device)
     rng.manual_seed(4242 + dist_handle.rank)
     inp, idx, wts, sc = _generate_round(
-        rng, cfg, args.max_tokens, device, cfg.dispatch_dtype
+        rng, cfg, args.max_tokens, device, cfg.dispatch_dtype, args.routing
     )
-    convert = (
-        (lambda tensor: tensor.to(cfg.combine_dtype))
-        if cfg.is_asymmetric_dtype
-        else (lambda tensor: tensor)
-    )
+
+    def convert(tensor):
+        return _combine_input(cfg, tensor)
+
     combine_weights = wts if args.bench_weights else None
 
     # Only the swept phase varies; the other stays at the shipped value, because
     # the two are coupled (a dispatch with too few rdma blocks leaves the combine
     # after it slower) and a per-phase argmin measured against a DIFFERENT other
-    # phase does not carry over.
+    # phase does not carry over. Under --tuning-phase pair both phases keep their
+    # shipped geometry and only the active QP counts vary, as (dispatch, combine)
+    # pairs.
     def geometries(geometry):
+        if pair:
+            return geometry
         return (
             (geometry, incumbent_combine)
             if phase == "dispatch"
             else (incumbent_dispatch, geometry)
         )
 
-    if args.tuning_metric == "total":
+    if args.tuning_metric == "total" or pair:
 
         def metric(dispatch_value, combine_value):
             return dispatch_value + combine_value
@@ -1458,8 +1940,13 @@ def _tune(cfg, dist_handle, device, args, comm):
         comm.barrier()
 
     best_op.close()
-    if dist_handle.rank == 0 and not args.tuning_greedy:
+    if not args.tuning_greedy and fixed_wins:
+        # Sorted on every rank, not only rank 0: the winner has to be agreed by
+        # EVERY rank before anyone builds an op for it, since building one is
+        # collective. fixed_wins is derived from allreduced timings, so the
+        # ordering is identical on every rank and no communication is needed.
         fixed_wins.sort()
+    if dist_handle.rank == 0 and not args.tuning_greedy:
         print(
             f"# TUNING tok={args.max_tokens} phase={phase}: {len(fixed_wins)} of "
             f"{len(candidates)} candidates beat the fixed incumbent {shipped}",
@@ -1482,22 +1969,177 @@ def _tune(cfg, dist_handle, device, args, comm):
                 f"worst {candidate_worst:.0f}/{incumbent_worst:.0f})",
                 flush=True,
             )
-        if fixed_wins:
-            best = fixed_wins[0][2]
-            best_median = fixed_wins[0][3]
-    if dist_handle.rank == 0:
+    if not args.tuning_greedy and fixed_wins:
+        best = fixed_wins[0][2]
+        best_median = fixed_wins[0][3]
+
+    if pair:
+        dispatch_row, combine_row = best
+    else:
         dispatch_row = best if phase == "dispatch" else incumbent_dispatch
         combine_row = best if phase == "combine" else incumbent_combine
+
+    # Measure the pair that will actually be written, on every rank: the row's
+    # bandwidth and latency fields are v1's, and v1's mean them for the
+    # configuration it shipped. Reusing the sweep's own numbers would mean the
+    # winner's stats came from a comparison against a live second op holding a
+    # second symmetric window, which is not the state a user runs in.
+    metrics = None
+    if args.tuning_save:
+        final_op = _build_op(cfg, comm, dispatch_row, combine_row)
+        comm.barrier()
+        metrics = _row_metrics(
+            final_op,
+            cfg,
+            args,
+            dist_handle,
+            (inp, idx, wts, sc, combine_weights),
+            convert,
+            ll=kernel_family == "v2_ll",
+        )
+        final_op.close()
+        comm.barrier()
+
+    if dist_handle.rank == 0:
+        # best_median is None when nothing was measured against the incumbent:
+        # either a refresh run (no candidates left) or every candidate was
+        # rejected by the backend. Formatting it unguarded is how that path
+        # used to die.
+        if best_median is not None:
+            # pair always selects on the total.
+            metric_name = "total" if pair else args.tuning_metric
+            selection = f"median {metric_name}={best_median:.1f}us"
+        elif not candidates:
+            selection = "no candidate measured (refresh of the shipped geometry)"
+        else:
+            selection = (
+                f"all {len(candidates)} candidates rejected, shipped geometry kept"
+            )
+        # The rules as --tuning-save writes them: the swept phase's, or both
+        # under pair; the active count only where the rule records it.
+        rule_fields = "block/rdma/warp" + ("/active_qps" if report_active_qps else "")
+        rule_width = 4 if report_active_qps else 3
+        rules = "; ".join(
+            f"{name} {rule_fields}={row[:rule_width]}"
+            for name, row in (
+                (("dispatch", dispatch_row), ("combine", combine_row))
+                if pair
+                else ((phase, best),)
+            )
+        )
         print(
             f"# TUNING RESULT tok={args.max_tokens} phase={phase}: "
-            f"block/rdma/warp={best} median {phase}={best_median:.1f}us "
-            f"(shipped was {shipped})\n"
-            f"#   table row: ({args.max_tokens}, {dispatch_row[0]}, "
-            f"{dispatch_row[1]}, {dispatch_row[2]}, "
-            f"{combine_row[0]}, {combine_row[1]}, {combine_row[2]}),",
+            # Named for the metric, not the phase: --tuning-metric defaults to
+            # the dispatch+combine total, so "median dispatch=725us" read as a
+            # dispatch time is off by roughly a factor of two.
+            f"block/rdma/warp/active_qps={best} {selection} (shipped was {shipped}, "
+            f"qp_allocated={cfg.num_qp_per_pe})\n"
+            f"#   {kernel_family} rules num_tokens={args.max_tokens}: {rules}",
             flush=True,
         )
+        if args.tuning_save:
+            # pair writes both phases' rules; each names its measured count.
+            for saved_phase, row in (
+                (("dispatch", dispatch_row), ("combine", combine_row))
+                if pair
+                else ((phase, best),)
+            ):
+                _save_tuning_row(
+                    cfg,
+                    args,
+                    phase=saved_phase,
+                    dtype_key=dtype_keys[saved_phase],
+                    kernel_family=kernel_family,
+                    geometry=row,
+                    metrics=metrics[saved_phase],
+                    record_active_qps=report_active_qps and cfg.is_internode,
+                )
     return 0
+
+
+def _tuning_table_dir(args):
+    """Where --tuning-save writes, as a Path.
+
+    Defaults to THIS REPO's table rather than the installed package's: the
+    kernels run from site-packages, but a tuning row is only useful once it is a
+    diff somebody can read, and writing into site-packages leaves it nowhere. Same
+    reasoning as the v1 bench's `config_path auto`. parents[4] is the repo root
+    from tests/python/ops/dispatch_combine_v2/.
+    """
+    if args.tuning_config_dir:
+        return Path(args.tuning_config_dir)
+    return (
+        Path(__file__).resolve().parents[4]
+        / "python"
+        / "mori"
+        / "ops"
+        / "dispatch_combine_v2"
+        / "tuning_configs"
+    )
+
+
+def _save_tuning_row(
+    cfg,
+    args,
+    *,
+    phase,
+    dtype_key,
+    kernel_family,
+    geometry,
+    metrics,
+    record_active_qps=False,
+):
+    """Merge one swept phase's rule into the model's table for this kernel
+    family and EP size (hip_tuning_configs.v2_table_filename), which holds
+    every expert count, top-k and phase.
+
+    The rule names its active QP count only when the sweep measured it (or the
+    shipped rule already named one); otherwise the count is this run's resolved
+    default, and writing it would pin production to it.
+
+    Only the phase that was swept is written, as that phase's rule, so the
+    other phase's rule is untouched by construction -- writing the incumbent
+    back as if it were a result would claim a measurement that was never made.
+    """
+    from mori.ops.dispatch_combine_v2.hip_tuning_configs import save_internode_result
+
+    block_num, rdma_block_num, warp_per_block = geometry[:3]
+    if kernel_family == "intra":
+        # One node has no RDMA leg and no LL scale; xGMI is the transport.
+        metrics = {
+            "bandwidth_gbps": metrics["avg_xgmi_bandwidth_gbps"],
+            "avg_xgmi_bandwidth_gbps": metrics["avg_xgmi_bandwidth_gbps"],
+            "avg_latency_us": metrics["avg_latency_us"],
+            "bandwidth_metric": metrics["bandwidth_metric"],
+        }
+    entry = {
+        "dtype": dtype_key,
+        "num_tokens": args.max_tokens,
+        # An fp4 dispatch rule is keyed by the packed width, as lookup reads it.
+        "hidden_dim": (
+            cfg.hidden_dim // 2
+            if phase == "dispatch" and cfg.is_fp4
+            else cfg.hidden_dim
+        ),
+        "topk": cfg.num_experts_per_token,
+        # world_size x this is the model's expert count, which the rule stores
+        # as num_experts, so two expert counts at the same (dtype, hidden,
+        # topk, num_tokens) are two rules rather than one overwriting the other.
+        "experts_per_rank": cfg.num_experts_per_rank,
+        "block_num": block_num,
+        "rdma_block_num": rdma_block_num,
+        "warp_per_block": warp_per_block,
+        **({"active_qps": geometry[3]} if record_active_qps else {}),
+        # v1's metric field set, same names and same definitions (_row_metrics).
+        **metrics,
+    }
+    save_internode_result(
+        cfg.world_size,
+        phase,
+        entry,
+        kernel_family=kernel_family,
+        directory=_tuning_table_dir(args),
+    )
 
 
 def _spawn_entry(local_rank, argv, node_rank, num_nodes, ranks_per_node):
@@ -1558,14 +2200,17 @@ def main(argv):
     device = torch.device("cuda", dist_handle.local_rank)
 
     gpu_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
-    if npes <= gpu_per_node:
+    # One node builds the intranode op; only test and tuning support that.
+    if npes <= gpu_per_node and args.cmd not in ("test", "tuning"):
         raise SystemExit(
-            f"this test needs more than one node: world_size={npes} with "
+            f"--cmd {args.cmd} needs more than one node: world_size={npes} with "
             f"{gpu_per_node} GPUs per node is a single node"
         )
 
     dtype = _DTYPES[args.dtype]
     combine_dtype = _DTYPES[args.combine_dtype] if args.combine_dtype else None
+    if dtype == _FP4 and combine_dtype is None:
+        combine_dtype = torch.bfloat16
     max_tokens = args.max_tokens
 
     uid = Communicator.get_unique_id() if rank == 0 else None
@@ -1594,6 +2239,12 @@ def main(argv):
             quant_type=args.quant_type,
             gpu_per_node=gpu_per_node,
             num_qp_per_pe=args.num_qp,
+            active_qps=args.active_qps,
+            active_qp_counts=(
+                tuple(int(count) for count in args.active_qp_counts.split(","))
+                if args.active_qp_counts
+                else None
+            ),
             # AsyncLL is selected by its own flag; internode_kernel keeps its
             # default so the config stays valid (it is simply not read).
             async_ll=args.kernel_type == "asyncll",
@@ -1626,6 +2277,7 @@ def main(argv):
             dist_handle.shutdown()
             return return_code
 
+        qp_schedule = _active_qp_schedule(cfg)
         rng = torch.Generator(device=device)
         for round_index in range(args.rounds):
             rng.manual_seed(1234 + round_index * 977 + rank)
@@ -1634,6 +2286,8 @@ def main(argv):
                 rng, cfg, num_tokens, device, cfg.dispatch_dtype, args.routing
             )
 
+            if qp_schedule:
+                op.set_active_qps(_active_qp_for(qp_schedule, round_index, cfg, 0))
             recv_x, recv_w, recv_s, recv_i, total_recv, routing = op.dispatch(
                 inp, wts, sc, idx, return_routing=True
             )
@@ -1647,9 +2301,9 @@ def main(argv):
             # -> _to_combine_dtype). The combine kernel's T is the combine dtype
             # and it reads inpTokenBuf as T*, so handing it the fp8 dispatch
             # output unconverted reinterprets fp8 bytes as bf16.
-            combine_input = (
-                recv_x.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else recv_x
-            )
+            combine_input = _combine_input(cfg, recv_x)
+            if qp_schedule:
+                op.set_active_qps(_active_qp_for(qp_schedule, round_index, cfg, 1))
             # `wts` is a REQUEST for the weight fold, and AsyncLL cannot serve
             # one: its combine payload is hidden-only, so there is no per-token
             # metadata to accumulate (v1's AsyncLL is the same). Asking anyway
@@ -1662,45 +2316,20 @@ def main(argv):
             torch.cuda.synchronize()
             comm.barrier()
 
-            idx_cpu = idx.cpu()
-            unique_pes = np.array(
-                [
-                    len(
-                        {
-                            int(idx_cpu[t, j]) // cfg.num_experts_per_rank
-                            for j in range(args.topk)
-                        }
-                    )
-                    for t in range(num_tokens)
-                ]
-            )
-            unique_pes_column = torch.from_numpy(unique_pes).view(num_tokens, 1).float()
-            expected_weights = unique_pes_column * wts.float().cpu()
-            expected = unique_pes_column * inp.float().cpu()
-
-            # The bound has to scale with unique_pes: combine sums that many
-            # contributions in the wire dtype, so the error grows with the number
-            # of terms and with the magnitude being summed -- not with |expected|
-            # at that element, which cancellation can make arbitrarily small. This
-            # is the same shape of bound v1's harness uses (it scales its
-            # per-element bound by unique_pes) rather than a flat allclose.
+            golden = _golden(cfg, args, inp, idx, wts)
+            unique_pes_column = golden.unique_pes.cpu()
+            unique_pes = unique_pes_column.view(-1)
+            expected = golden.hidden.cpu()
+            expected_weights = golden.weights.cpu()
+            bound = golden.hidden_bound.cpu()
             got = out.float().cpu()
-            input_magnitude = inp.float().cpu().abs()
-            eps = 3e-1 if (args.quant_type != "none" or dtype in _FP8) else 8e-3
-            bound = eps * unique_pes_column * input_magnitude.clamp(min=1.0)
+            input_magnitude = _payload_f32(cfg, inp).cpu().abs()
             hidden_ok = bool(((got - expected).abs() <= bound).all())
-            # Weights are transported as f32 and summed the same way, so their
-            # bound is much tighter -- but still proportional to unique_pes.
             got_weights = out_w.cpu() if out_w is not None else None
-            weights_ok = (
-                True
-                if got_weights is None
-                else bool(
-                    (
-                        (got_weights - expected_weights).abs()
-                        <= 2e-3 * unique_pes_column
-                    ).all()
-                )
+            weights_ok = got_weights is None or bool(
+                (
+                    (got_weights - expected_weights).abs() <= golden.weights_bound.cpu()
+                ).all()
             )
 
             if not (hidden_ok and weights_ok) and rank == 0:

@@ -1124,6 +1124,7 @@ mori_package_data = [
     "_jit-sources/3rdparty/**/*.hpp",
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
+    "ops/dispatch_combine_v2/tuning_configs/*.csv",
     "io/sim_catalog.yaml",  # MORI_IO_SIM_CATALOG timing for measured hardware
     "tools/*.sh",
     "tools/mori.conf",

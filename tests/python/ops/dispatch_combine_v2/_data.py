@@ -136,12 +136,34 @@ def fill_fp8(shape, dist, gen, *, uniform=FP8_UNIFORM, constant=0.5):
 
 def _f32_to_e2m1_nibble(v):
     """Round f32 to the nearest OCP e2m1 code (0-7 magnitude, bit 3 = sign)."""
-    levels = torch.tensor(_E2M1_LEVELS, dtype=torch.float32)
+    levels = torch.tensor(_E2M1_LEVELS, dtype=torch.float32, device=v.device)
     mag = v.abs().clamp_(max=_E2M1_LEVELS[-1])
     # Midpoints between adjacent levels -> bucketize gives round-to-nearest.
     edges = (levels[1:] + levels[:-1]) / 2
     code = torch.bucketize(mag, edges).to(torch.uint8)
     return code | ((v < 0).to(torch.uint8) << 3)
+
+
+def encode_fp4(x):
+    """``x`` (rows, cols) rounded to e2m1 and packed: ``float4_e2m1fn_x2``
+    (rows, cols // 2) on ``x``'s device, low nibble the even element."""
+    rows, cols = x.shape
+    if cols % 2:
+        raise ValueError(f"fp4 needs an even column count, got {cols}")
+    nib = _f32_to_e2m1_nibble(x.float())
+    return (
+        (nib[:, 0::2] | (nib[:, 1::2] << 4)).contiguous().view(torch.float4_e2m1fn_x2)
+    )
+
+
+def decode_fp4(packed, dtype=torch.float32):
+    """Packed e2m1 (rows, cols // 2) back to ``dtype`` (rows, cols). Every e2m1
+    value is exact in bf16, so a bf16 decode loses nothing."""
+    levels = torch.tensor(_E2M1_LEVELS, dtype=torch.float32, device=packed.device)
+    lut = torch.cat((levels, -levels)).to(dtype)
+    b = packed.view(torch.uint8)
+    pairs = torch.stack((lut[(b & 0xF).long()], lut[(b >> 4).long()]), dim=-1)
+    return pairs.reshape(b.shape[0], b.shape[1] * 2)
 
 
 def fill_fp4(shape, dist, gen, *, uniform=FP4_UNIFORM, constant=0.0):
