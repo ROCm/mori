@@ -399,6 +399,16 @@ struct UMBPDistributedConfig {
   // gated by cache_remote_admission / admission_max_block_bytes.
   bool ranged_locality_prefetch = true;
 
+  // One remote pull per key per node at a time.  Concurrent whole-object ranged
+  // reads of the same remote key (every TP rank of an engine reading one
+  // TP-replicated object through a node-shared server) otherwise each pull it
+  // over RDMA and each commit it, and all but the first commit are thrown away.
+  // With this on, the first read pulls and commits; the others wait for that
+  // commit (up to remote_single_flight_wait_ms) and read the local copy, or
+  // pull it themselves if it did not land.
+  bool remote_single_flight = true;
+  uint32_t remote_single_flight_wait_ms = 30000;
+
   // Ask this node's own media before asking the master.
   //
   // A read is a two-part question: "who holds this key" (master) and "give me
