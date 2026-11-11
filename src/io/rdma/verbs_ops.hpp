@@ -28,6 +28,14 @@ namespace io {
 
 struct TransferStatus;
 
+// Moves `qp` to Error: each WR on it has then either completed or is flushed without
+// running, as when a fatal event kills a QP. Returns ibv_modify_qp's result.
+inline int ModifyQpToError(ibv_qp* qp) {
+  ibv_qp_attr attr{};
+  attr.qp_state = IBV_QPS_ERR;
+  return ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+}
+
 // Seam over the ibverbs calls on MORI-IO's host data path. Every such call site
 // goes through Verbs() so a build with MORI_IO_FAULT_INJECTION can swap in the
 // FaultInjector decorator (src/io/rdma/fault_injector.hpp) without touching the

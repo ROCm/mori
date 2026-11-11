@@ -269,11 +269,12 @@ void NotifySqStateChanged(const EpPair& ep) {
   FutexWakeAll(&event->epoch);
 }
 
-static bool TryReserveSqDepthOnce(const EpPair& ep, int wrCount) {
+// Reserves `wrCount` send-queue slots on `ep` if that keeps its depth within `limit`.
+static bool TryReserveSqDepthOnce(const EpPair& ep, int wrCount, int limit) {
   int observed = ep.sqDepth->load(kSqAdmissionOrder);
   while (true) {
     const int base = std::max(observed, 0);
-    if (base > ep.maxSqDepth - wrCount) return false;
+    if (base > limit - wrCount) return false;
 
     const int desired = base + wrCount;
     if (ep.sqDepth->compare_exchange_weak(observed, desired, kSqAdmissionOrder,
@@ -297,7 +298,7 @@ static bool TryReserveSqDepthSpin(const EpPair& ep, int wrCount, int epId, const
       return false;
     }
 
-    if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+    if (TryReserveSqDepthOnce(ep, wrCount, ep.maxSqDepth)) return true;
 
     if (std::chrono::steady_clock::now() >= deadline) {
       SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
@@ -342,7 +343,7 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
     return false;
   }
 
-  if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+  if (TryReserveSqDepthOnce(ep, wrCount, ep.maxSqDepth)) return true;
 
   auto* event = ep.sqAdmission.get();
   if (!event) {
@@ -371,7 +372,7 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
       return false;
     }
 
-    if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+    if (TryReserveSqDepthOnce(ep, wrCount, ep.maxSqDepth)) return true;
 
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
@@ -419,12 +420,8 @@ static bool PostCompletionMarker(const EpPair& ep, const application::RdmaMemory
                                  const std::shared_ptr<CqCallbackMeta>& callbackMeta) {
   if (!ep.ledger) return false;
   // The marker may use the slots normal admission holds back (kCompletionMarkerSlots).
-  if (ep.sqDepth) {
-    int observed = ep.sqDepth->load(kSqAdmissionOrder);
-    do {
-      if (std::max(observed, 0) >= ep.maxSqDepth + kCompletionMarkerSlots) return false;
-    } while (!ep.sqDepth->compare_exchange_weak(observed, std::max(observed, 0) + 1,
-                                                kSqAdmissionOrder, kSqAdmissionOrder));
+  if (ep.sqDepth && !TryReserveSqDepthOnce(ep, 1, ep.maxSqDepth + kCompletionMarkerSlots)) {
+    return false;
   }
   SubmissionLedger::PostGuard guard =
       ep.ledger->InsertForPost(pendingWrs + 1, callbackMeta, pendingCredits);
@@ -449,14 +446,10 @@ static bool PostCompletionMarker(const EpPair& ep, const application::RdmaMemory
   return true;
 }
 
-// Moves `ep`'s QP to Error: each WR on it has then either completed or is flushed without
-// running, as when a fatal event kills a QP.
+// Moves `ep`'s QP to Error (ModifyQpToError); false if it has none or that fails.
 static bool CutQp(const EpPair& ep) {
   ibv_qp* qp = ep.local.ibvHandle.qp;
-  if (qp == nullptr) return false;
-  ibv_qp_attr attr{};
-  attr.qp_state = IBV_QPS_ERR;
-  return ibv_modify_qp(qp, &attr, IBV_QP_STATE) == 0;
+  return qp != nullptr && ModifyQpToError(qp) == 0;
 }
 
 // When a post gives up partway, the WRs it already posted on an EP since that EP's last

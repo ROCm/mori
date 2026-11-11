@@ -336,9 +336,7 @@ void FaultInjector::RememberQp(ibv_qp* qp) {
 }
 
 bool FaultInjector::MoveQpToError(ibv_qp* qp) {
-  ibv_qp_attr attr{};
-  attr.qp_state = IBV_QPS_ERR;
-  int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+  int ret = ModifyQpToError(qp);
   if (ret != 0) FailInjection("ibv_modify_qp(ERR)", ret);
   return ret == 0;
 }
