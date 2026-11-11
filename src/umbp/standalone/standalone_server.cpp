@@ -862,6 +862,19 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return grpc::Status::OK;
   }
 
+  // Frees bytes, so it serializes with the writers.
+  grpc::Status BatchRemove(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
+                           ::umbp::CountResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    if (shutdown_.load()) {
+      response->set_count(0);
+      return grpc::Status::OK;
+    }
+    response->set_count(client_->BatchRemove(keys));
+    return grpc::Status::OK;
+  }
+
   grpc::Status Clear(grpc::ServerContext*, const ::umbp::Empty*,
                      ::umbp::BoolResponse* response) override {
     std::unique_lock<std::shared_mutex> lock(client_mu_);

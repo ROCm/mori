@@ -198,6 +198,9 @@ class PoolClient {
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
   // Recency hint for keys the caller served from its own cache; this node only.
   size_t BatchTouch(const std::vector<std::string>& keys);
+  // Drops keys the caller will never read again; this node only, and only
+  // without a master, whose index would still name the dropped copies.
+  size_t BatchRemove(const std::vector<std::string>& keys);
 
   MasterClient& Master();
 
