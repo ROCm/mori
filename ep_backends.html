@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Choosing an EP API and backend &mdash; MORI development (6386a615) documentation</title>
+  <title>Choosing an EP API and backend &mdash; MORI development (cfc98c00) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=f25bccff"></script>
+      <script src="_static/documentation_options.js?v=b3f4de48"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -323,6 +323,21 @@
 </li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">EP V1 vs V2 Inter-node Performance (DeepSeek-R1 on MI308X, MI300X and MI355X)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="EPv2_PERF.html#test-setup">1. Test setup</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#common-settings">1.1 Common settings</a></li>
+<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#environment-per-gpu">1.2 Environment per GPU</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="EPv2_PERF.html#overall-results">2. Overall results</a></li>
+<li class="toctree-l2"><a class="reference internal" href="EPv2_PERF.html#per-gpu-data">3. Per-GPU data</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#mi308x">3.1 MI308X</a></li>
+<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#mi300x">3.2 MI300X</a></li>
+<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#mi355x">3.3 MI355X</a></li>
+</ul>
+</li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#which-benchmark-to-use">Which benchmark to use</a></li>
@@ -588,8 +603,10 @@ payloads. Does not require FlyDSL.</p></td>
 <tr class="row-odd"><td><p>EPv2, HIP internode preview</p></td>
 <td><p>HIP backend with <code class="docutils literal notranslate"><span class="pre">gpu_per_node</span> <span class="pre">&lt;</span> <span class="pre">world_size</span></code></p></td>
 <td><p>Multiple physical nodes over CCO/GDA</p></td>
-<td><p>BF16/FP32/FP8 dispatch; no FP4, quantization, standard-MoE conversion or
-scatter combine. The communicator’s node grouping must match the config.</p></td>
+<td><p>BF16/FP32/FP8 dispatch, plus packed FP4 dispatch with a BF16 or FP32
+combine (not with <code class="docutils literal notranslate"><span class="pre">async_ll</span></code>); no FP4 combine, quantization,
+standard-MoE conversion or scatter combine. The communicator’s node
+grouping must match the config.</p></td>
 </tr>
 </tbody>
 </table>
@@ -606,8 +623,9 @@ available in every published wheel. Check the installed release and its
 </pre></div>
 </div>
 <p>Select the backend with <code class="docutils literal notranslate"><span class="pre">config.kernel_backend</span></code> or
-<code class="docutils literal notranslate"><span class="pre">MORI_V2_KERNEL_BACKEND</span></code>. The FlyDSL backend is the default. Importing the
-package does not load either backend; construction loads the selected one.
+<code class="docutils literal notranslate"><span class="pre">MORI_V2_KERNEL_BACKEND</span></code>. The default is the HIP backend on gfx125x and the
+FlyDSL backend elsewhere. Importing the package does not load either backend;
+construction loads the selected one.
 EPv2 uses an explicit CCO communicator, described in <a class="reference internal" href="MORI-CCO-GUIDE.html"><span class="doc">MORI CCO Guide</span></a>.
 It does not inherit the legacy API’s process-global SHMEM bootstrap contract.</p>
 <p>Read the maintained <a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md">EPv2 package guide</a>
