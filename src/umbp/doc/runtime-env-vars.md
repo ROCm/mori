@@ -1,12 +1,13 @@
 # UMBP Runtime-Tunable Environment Variables
 
-Single source of truth for every `UMBP_*` env var consumed by the
-Mori UMBP stack at runtime — both the in-process timing/retry knobs
-parsed by the C++ library and the deployment knobs read by Python
-launcher scripts and the SGLang/hicache integration layer.
+Reference for the `UMBP_*` env vars consumed by the Mori UMBP stack at
+runtime — both the in-process timing/retry knobs parsed by the C++ library
+and the deployment knobs read by Python launcher scripts and the
+SGLang/hicache integration layer. Not every `UMBP_*` variable the code
+reads is listed yet.
 
 See also:
-- [`design-master-control-plane.md`](./design-master-control-plane.md)
+- [`design-master-control-plane.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/design-master-control-plane.md)
   — what each knob actually affects.
 - `src/umbp/include/umbp/common/env_time.h` — parser helpers
   (`GetEnvSeconds / GetEnvMilliseconds / GetEnvMicroseconds /
@@ -77,20 +78,15 @@ that has loaded `libmori_umbp_pybinds.so`, i.e. imported `mori.umbp`).
 | Env var | Default | Unit | Description |
 |---|---|---|---|
 | `UMBP_EVICTION_MODE` | `local` | enum | How a node with a master evicts. `local`: every medium at this node's own watermarks (a tiered policy's per-tier pair, else the SSD / DRAM config pair), by its own LRU, without asking the master; the master leaves it out of its `EvictKey` rounds. `master_ranked`: the same, with victims ranked by the master (`GetEvictionCandidates`), falling back to local LRU. `master`: DRAM/HBM wait for the master's rounds (SSD still evicts locally). In both master modes the node reports the keys it reads locally on its heartbeats, since the master's recency otherwise sees only `RouteGet`. A node without a master always evicts locally, and every mode still serves `EvictKey`. |
-| `UMBP_DRAM_READ_LEASE_MS` | `500` | ms | Peer-side DRAM/HBM read lease: how long a single `PeerDramAllocator::Resolve` protects its key's pages from concurrent local `Evict`, covering one RDMA read of those pages. Only needs to exceed one DRAM RDMA round trip (sub-ms), so 500 ms is ~100x margin. Read once at `PoolClient::Init`; `min_allowed=1`. |
-| `UMBP_SSD_READ_LEASE_MS` | `3000` | ms | Peer-side SSD read-staging slot lease: how long a claimed staging slot is reserved before the peer reclaims it by TTL (the fallback when the reader's best-effort `ReleaseSsdLease` is lost), and, echoed back in `PrepareSsdReadResponse.lease_ttl_ms`, the reader's validity window anchored at `t_send`. Must exceed one SSD read + RDMA (slower than DRAM), but too long pins a configured staging slot on a lost release. Also the fallback for the `PrepareSsdRead` RPC deadline when `UMBP_SSD_PREPARE_TIMEOUT_MS` is unset. Read once at `PoolClient::Init`; `min_allowed=1`. Also the read lease of a policy-declared `SsdBackend`, where it governs how long a contiguous staging span stays claimed and so sets that backend's read concurrency against a fixed arena — see `staging_slots`. |
+| `UMBP_DRAM_READ_LEASE_MS` | `500` | ms | Read lease of a DRAM or HBM backend: how long a key's pages stay protected from local eviction while a peer reads them over RDMA. Only needs to exceed one DRAM RDMA round trip (sub-ms), so 500 ms is ~100x margin. Read once per process; `min_allowed=1`. |
+| `UMBP_SSD_READ_LEASE_MS` | `3000` | ms | Read lease of an SSD backend. It has to cover an SSD read plus the RDMA, not just the RDMA, and it is also how long a staging page stays claimed, so it sets the backend's read concurrency against its fixed staging arena: shortening it frees pages sooner and costs read coalescing. Read once per process; `min_allowed=1`. |
 | `UMBP_RESOLVE_BUSY_TIMEOUT_MS` | `30000` | ms | Overall deadline for retrying a peer-local or remote batch resolve that returned `BUSY` because SSD staging was temporarily full. Retries discard the whole response and use exponential backoff capped at 50 ms. A batch whose own working set exceeds the arena returns a permanent failure immediately and is not retried. Values above 300000 ms are clamped. |
 | `UMBP_RPC_SHUTDOWN_TIMEOUT_MS` | `3000` | ms | Deadline for `UnregisterClient` and the last `Heartbeat` in `~MasterClient`. Bounds `~MasterClient` worst-case at ≤ 2 × this value. |
 | `UMBP_GRPC_SHUTDOWN_DEADLINE_SEC` | `3` | sec | `server_->Shutdown(deadline)` budget, shared by master and peer service. |
 | `UMBP_METRICS_REPORT_INTERVAL_MS` | `1000` | ms | Cadence at which the pool client's `MasterClient` flushes buffered counters/gauges/histograms via `ReportMetrics`. |
 | `UMBP_STANDALONE_METRICS_PORT` | `9092` | port | Port the **standalone server** serves `/metrics` on when it runs **without a master**, so a masterless node publishes what it measures instead of discarding it. Not the master's `9091`, so a node running both does not have two processes contending for one port. `0`/`off`/`false`/`no` (case-insensitive) disables the endpoint; anything else that is not a port number is rejected at startup rather than read as "off". Ignored when a master is configured — the metrics go to the master then, and a second endpoint would double-count on any Prometheus scraping both. A failed bind logs `ERROR` and the server still starts. Scrape fragment: `examples/monitoring/umbp_standalone.scrape.yml`. |
 | `UMBP_SUMMARY_INTERVAL_MS` | `60000` | ms | Cadence of the periodic **activity summary**: one INFO line per window saying what this process offloaded, loaded, evicted, promoted and demoted, plus what is resident. Runs in **every** deployment — master, masterless, embedded — because it is the readout for the runs that have no Prometheus at all (a ctest, a one-shot benchmark, an sglang rank being bisected). `0` disables it. A window in which nothing moved still logs one line, carrying resident bytes and key count, because a node holding keys and moving none of them is the stall this is meant to catch. It replaced the per-key `DEBUG` logs on the re-cache and local-eviction paths; an unparseable value falls back to the default rather than refusing to start. |
-| `UMBP_RELEASE_LEASE_MAX_RETRIES` | `2` | count | `ReleaseSsdLease` RPC attempt cap on the SSD read path. `min_allowed=1`. |
-| `UMBP_SSD_GET_MAX_ATTEMPTS` | `1` | count | Total remote SSD get attempts per key. `1` = no retry. Only NO_SLOT and a reader-local lease expiry retry; rpc failure / NOT_FOUND do not. Raise to absorb staging-slot contention. `min_allowed=1`. |
-| `UMBP_SSD_GET_RETRY_BACKOFF_MS` | `2` | ms | Sleep between remote SSD get retries (only applied when another attempt follows). `min_allowed=1`. |
-| `UMBP_RELEASE_LEASE_TIMEOUT_MS` | `1000` | ms | Per-attempt gRPC deadline for the best-effort `ReleaseSsdLease` RPC so a slow peer can't stall the reader. `min_allowed=1`. |
-| `UMBP_SSD_PREPARE_TIMEOUT_MS` | `0` | ms | Per-call gRPC deadline for `PrepareSsdRead` so a hung/slow peer can't stall the serial batch. `0` = fall back to `UMBP_SSD_READ_LEASE_MS` (cluster-homogeneous). A timed-out / failed prepare is a hard not-served outcome (NOT retried, and never a miss). `min_allowed=0`. |
-| `UMBP_AUTO_FLUSH_EVENT_THRESHOLD` | `128` | count | Peer-side unshipped `KvEvent` outbox size at which a completed batch of puts auto-triggers a heartbeat flush (`FlushHeartbeat`), so the ADDs become visible at the master without waiting for the heartbeat interval or an explicit `Flush()`. Counted on `PeerDramAllocator` only (SSD events still wait for the interval). Parsed via `std::strtoull` (no WARN on bad input); unset / unparseable -> default `128`; `0` disables size-based auto-flush entirely (ADDs then ship only on the heartbeat interval or an explicit `Flush()`); set to a very large value to keep auto-flush armed but effectively never fire on size. Cached on first use in `MasterClient::SetPeerDramAllocator`. |
+| `UMBP_AUTO_FLUSH_EVENT_THRESHOLD` | `128` | count | Number of unshipped `KvEvent`s at which a backend's completed puts auto-trigger a heartbeat flush (`FlushHeartbeat`), so the ADDs become visible at the master without waiting for the heartbeat interval or an explicit `Flush()`. Every backend (DRAM, HBM, SSD) has the hook. Parsed via `std::strtoull` (no WARN on bad input); unset / unparseable -> default `128`. `0` disables size-based auto-flush on DRAM and HBM backends, but an SSD backend treats `0` as `1` and flushes on every event; set a very large value to keep auto-flush armed but effectively never fire on size. Read once per process. |
 | `UMBP_WORKLOAD_TRACE_PATH` | empty | path | Records successful production PUT/GET calls in the benchmark trace format. Empty disables recording. |
 | `UMBP_WORKLOAD_TRACE_CLIENT_ID` | `0` | id | Logical client stream written into production trace events. |
 | `UMBP_WORKLOAD_TRACE_SEED` | `0` | seed | Payload seed stored in the trace header for deterministic replay. |
@@ -138,7 +134,7 @@ win. Set them before constructing the config — they are read once, there.
 | `UMBP_DRAM_CAPACITY` | 4 GiB | `dram.capacity_bytes`. |
 | `UMBP_DRAM_HIGH_WM` / `UMBP_DRAM_LOW_WM` | `0.95` / `0.9` | DRAM tier eviction watermarks. |
 | `UMBP_SSD_ENABLED` | `1` | `0` to disable the SSD tier entirely.  **This no longer selects a medium**: a single-medium SSD node is chosen with `UMBP_DISTRIBUTED_MEDIUM=SSD` (or `distributed.medium`), or named as a backend in `UMBP_BACKEND_POLICY`, and `umbp_standalone_server` refuses to start if this is set while neither named one, rather than quietly serving DRAM. |
-| `UMBP_EMBEDDED_DRAM_PAGE_SIZE` | 2 MiB | Allocation granularity of the pool an **embedded** deployment gets when the config names no deployment at all.  The pool is paged, so a value smaller than a page still occupies one: a caller storing KV pages should set this to the page's exact byte size, and one storing small values wants it smaller.  Ignored once `distributed` is configured — set `distributed.dram_page_size` there instead. |
+| `UMBP_EMBEDDED_DRAM_PAGE_SIZE` | 64 KiB | Allocation granularity of the pool an **embedded** deployment gets when the config names no deployment at all.  The pool is paged, so a value smaller than a page still occupies one: a caller storing KV pages should set this to the page's exact byte size, and one storing small values wants it smaller.  Ignored once `distributed` is configured — set `distributed.dram_page_size` there instead. |
 | `UMBP_SSD_DIR` | `/tmp/umbp_ssd` | POSIX backend root(s).  **Comma-separated for multi-drive**, one directory per physical drive (e.g. `/mnt/nvme0,/mnt/nvme1`).  More than one turns the tier into a `ShardedSsdTier`: keys are placed on the drive with the most free space and batch IO runs on every drive at once, so the tier delivers their aggregate bandwidth. |
 | `UMBP_SSD_CAPACITY` | 32 GiB | `ssd.capacity_bytes`.  With multiple `UMBP_SSD_DIR` entries this is the TOTAL budget, split evenly across the drives.  Charged in **padded** on-disk bytes (see `UMBP_SSD_DIRECT_IO`), not raw value bytes, and in bytes **on disk**: an evicted record keeps its space until its whole segment file is deleted, so the used figure (and the eviction watermarks) count dead records too. |
 | `UMBP_SSD_SEGMENT_SIZE` | 4 GiB | `ssd.segment_size_bytes`, a multiple of 4096.  Segment files are the unit disk comes back in: eviction empties whole segments (emptiest and coldest first) and a segment file is deleted once nothing in it is live.  Smaller segments free space in finer steps and drop fewer still-useful keys with each one, at the cost of more files and fds.  A drive whose share of `UMBP_SSD_CAPACITY` is under 8 segments uses 1/8 of that share instead. |
@@ -173,8 +169,8 @@ win. Set them before constructing the config — they are read once, there.
 ## Deployment / launcher env vars
 
 Not parsed by the C++ library directly. These are consumed by the
-SGLang / hicache wrappers, `src/umbp/scripts/run_umbp_single_node_hicache.sh`,
-and `src/umbp/scripts/test_umbp_inner.sh` to construct the
+SGLang / hicache wrappers and `src/umbp/scripts/run_umbp_single_node_hicache.sh`
+to construct the
 `UMBPDistributedConfig` plumbed into the C++ side. Listed here so
 operators can find them in one place.
 

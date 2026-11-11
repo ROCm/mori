@@ -5,6 +5,9 @@ built around an explicit communicator handle. Unlike a process-global singleton,
 every `ccoComm` is independently allocated, so a single process can hold multiple
 independent communicators and drive them concurrently from multiple threads.
 
+The fused GEMM + collective operators built on CCO have their own section,
+[MORI-FUSED](MORI-CCO-FUSED-OPS-GUIDE.md).
+
 CCO exposes GPU-initiated one-sided communication over three transports:
 
 - **LSA** (Local Symmetric Access) — intra-node peer-to-peer over a flat

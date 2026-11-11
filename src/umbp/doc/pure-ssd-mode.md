@@ -60,12 +60,12 @@ variable; that exclusion is gone. Note what it does and does not buy: a ranged
 **put** runs at full speed, while a ranged **get** still reads the whole object
 off the drive and saves only the final copy into the caller's buffers, because
 a resolve stages the object before the requested ranges are known. See
-[design-ssd-ranged-io.md](design-ssd-ranged-io.md).
+[design-ssd-ranged-io.md](https://github.com/ROCm/mori/blob/main/src/umbp/doc/design-ssd-ranged-io.md).
 
 Deliberately **not** in that list: `UMBP_SSD_TIMING=1`. It is a diagnostic, not a
 production setting — it prints several `[SsdPerf/*]` lines per batch, which on a
 busy node is a lot of log. Turn it on when investigating throughput, off again
-after; see [runtime-env-vars.md](runtime-env-vars.md) for what it reports.
+after; see [runtime-env-vars.md](https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md) for what it reports.
 
 **Env var, on `umbp_master` — not the engine:**
 
@@ -126,13 +126,13 @@ seems to have no effect.
 |---|---|
 | `ssd_storage_dir` | Comma-separated, **one directory per physical drive**. More than one turns on multi-drive: keys are balanced across drives and batch I/O runs on all of them at once. |
 | `ssd_capacity_bytes` | The **total** across every drive, split evenly — not per drive. |
-| `ssd_staging_buffer_slots` / `_size` | Read staging. Per-slot size (`size / slots`) must stay **≥ your largest single value**. 512 slots over 4 GiB = 8 MiB/slot. |
-| (writes) | Puts land in the same staging arena, borrowed for the duration of the spill — there is no separate write-staging region to size. |
+| `ssd_staging_buffer_slots` | Size of the staging arena, in pages (`UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS`). `0`, the default, means 4 GiB worth, capped at the tier's capacity. |
+| (writes) | Remote puts stage through the same arena; local ones do not. There is no separate write-staging region to size. |
 
-Too few staging slots and a large batch spends rounds waiting for one. With the
-default `UMBP_SSD_GET_MAX_ATTEMPTS=1` that surfaces as a **cache miss**, not a
-retry — raise the slot count, or that setting, if your read staging is small
-relative to your batches.
+Only reads and remote writes stage, and a batch that does not fit waits for a
+later round rather than failing: busy resolves are retried for up to
+`UMBP_RESOLVE_BUSY_TIMEOUT_MS` (30 s by default). Only a batch whose own working
+set exceeds the whole arena fails at once.
 
 Each key lives whole on one drive, so a single-key read costs one drive's I/O.
 Capacity is charged in **padded on-disk bytes**: values are padded to 4 KiB, so
@@ -197,15 +197,14 @@ for HiCache's L3 path to initialize, but `random` routing skips any node that
 | Absurd read bandwidth, `iostat` shows ~1% device utilisation | You are reading the page cache: either `UMBP_SSD_DIRECT_IO=0`, or the startup probe fell back to buffered (the filesystem rejects `O_DIRECT`).  Check for `direct_io=true` on the `[SSDTier]` init line — requested is not the same as active |
 | Adding drives or nodes doesn't add bandwidth | Writes are skewed. Set `UMBP_ROUTE_PUT_SELECT_ALGO=random`, check `UMBP_ROUTE_PUT_NODE_AFFINITY=none` |
 | `random` set but still skewed | It was set on the engine instead of `umbp_master`. Check the master's startup strategy line |
-| Reads report misses under load | Read staging slots exhausted. Raise `ssd_staging_buffer_slots` or `UMBP_SSD_GET_MAX_ATTEMPTS` |
+| Reads report misses under load | Staging stayed full for longer than `UMBP_RESOLVE_BUSY_TIMEOUT_MS`, or a batch's own working set exceeds the arena. Check `staging_slot_full_reject` in `mori_umbp_backend_medium_events_total{tier="SSD"}` and raise `ssd_staging_buffer_slots` |
 | Puts fail on an SSD node | The staging arena is exhausted, so `BatchAllocate` had no page to hand out. Check `mori_umbp_backend_medium_events_total{tier="SSD", event="staging_put_full_reject"}` (the peer also logs a sampled `staging arena full` WARN) and raise `ssd_staging_buffer_slots`. `staging_slot_full_reject` counts the same pressure on reads |
 | Node comes up with an empty cache after an upgrade | On-disk record format changed; older records are dropped on version mismatch |
 | Tier fills far earlier than expected | Capacity is charged in padded bytes — small values pay up to 16× |
 | SSD used is well above the live data | Used counts dead records until their segment file empties. Compare `mori_umbp_backend_medium_state{state="live_bytes"}` with it; `medium_events_total{event="segment_deleted"}` should grow while the tier evicts |
 | Startup rejects `medium: SSD` | `ssd.capacity_bytes` or `ssd.segment_size_bytes` is 0 — the selected medium must be sized |
 | A config key seems to do nothing | `extra_config` is an allow-list; unknown or wrong-mode keys are ignored with a warning. Grep the engine log for `UMBPStore:` |
-| Reads keep missing after killing/relaunching a node several times | Master registry doesn't expire dead clients — stale entries stay capacity-weighted and `random` can still pick them. Restart `umbp_master` along with every engine/worker whenever node topology (count, capacity, drives) changes |
-| Near-100% misses (`NO_SLOT`/lease-expired in the log) right after adding capacity per node | Staging slots didn't scale with the new concurrent load. `ssd_staging_buffer_slots` needs to grow with how many concurrent callers can hit one node, not just with data volume |
+| Reads keep missing after killing/relaunching a node several times | The master drops a dead client only after it has missed heartbeats for `heartbeat_ttl × max_missed_heartbeats`; until then its entry stays capacity-weighted and `random` can still pick it. Restart `umbp_master` along with every engine/worker whenever node topology (count, capacity, drives) changes |
 | Resend right after a write misses instead of hitting | Write-through acks drain asynchronously; a flush/resend that lands before the SSD write actually completes evicts the key with no L3 trace. Give it a moment (scales with value size) before flushing/resending |
 
 ## Measured: L1 vs L2 vs L3
@@ -251,4 +250,4 @@ L3 is ~1.3x faster than cold recompute at 4K and ~9x by 128K.
 - Every setting above is also a plain field on `UMBPConfig` / `UMBPDistributedConfig`
   for callers driving the client directly, without SGLang.
 
-Full env-var reference: [runtime-env-vars.md](runtime-env-vars.md).
+Full env-var reference: [runtime-env-vars.md](https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md).

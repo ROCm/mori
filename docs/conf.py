@@ -77,6 +77,10 @@ source_suffix = {
 # -- Options for HTML output -------------------------------------------------
 html_theme = "sphinx_rtd_theme"
 html_static_path = ["_static"]
+# Copied to the site root as-is. nightly/ is the retired nightly-wheel index,
+# which now points at PyPI; it has to be part of every build because the
+# deploy replaces the whole site.
+html_extra_path = ["_extra"]
 
 html_theme_options = {
     "logo_only": False,
