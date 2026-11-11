@@ -62,6 +62,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libibverbs-dev && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# setup.py compiles through ccache when it is on PATH; ci_run.sh keeps the cache
+# in a volume.
+RUN apt-get update && apt-get install -y --no-install-recommends ccache && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # Sanity check (CPU-only at build time, GPU visible at runtime)
 RUN python${PYTHON_VERSION} -c \
         "import jax; print('JAX', jax.__version__); print('Devices:', jax.devices())" \

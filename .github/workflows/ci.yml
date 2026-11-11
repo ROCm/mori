@@ -1423,6 +1423,9 @@ jobs:
           # Rootless podman already maps container root to the runner user, so the
           # chown -R below would only cost time there.
           [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
+          # kill first: without --init, PID 1 (sleep infinity) ignores the SIGTERM
+          # that rm -f sends, so rm -f would wait out its 10 s stop timeout.
+          $CT kill $CONTAINER >/dev/null 2>&1 || true
           $CT rm -f $CONTAINER || true
           if [ -z "$ROOTLESS" ] && $CT image inspect $IMAGE &>/dev/null; then
             $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
@@ -1434,7 +1437,7 @@ jobs:
         run: |
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT rm -f $CONTAINER || true"
+            "$CT kill $CONTAINER >/dev/null 2>&1; $CT rm -f $CONTAINER || true"
 
   internode-test-mi300x:
     name: mori internode test (${{ matrix.platform }})
