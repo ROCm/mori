@@ -25,6 +25,8 @@ on:
         type: boolean
         default: false
         description: Enable DP/EP modes when launching the hicache test
+  # nightly.yml runs the whole workflow, full (ci_scope.py treats schedule as full).
+  workflow_call:
 permissions:
   contents: read
 
@@ -130,10 +132,13 @@ jobs:
           $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
 
+  # The intranode jobs (this one, MI300X, ROCm 10 and JAX) run only when the scope
+  # is full: in the nightly, on workflow_dispatch and with ci:full. A PR or a push
+  # to main skips them.
   intranode-test:
     name: mori intranode test (${{ matrix.platform }})
     needs: scope
-    if: needs.scope.outputs.mori == 'true'
+    if: needs.scope.outputs.mori == 'true' && needs.scope.outputs.full == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -509,7 +514,7 @@ jobs:
   intranode-test-mi300x:
     name: mori intranode test (${{ matrix.platform }})
     needs: scope
-    if: needs.scope.outputs.mi300x == 'true'
+    if: needs.scope.outputs.mi300x == 'true' && needs.scope.outputs.full == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -539,7 +544,7 @@ jobs:
   intranode-test-rocm10:
     name: mori intranode test (ROCm 10, MI355X_AINIC)
     needs: scope
-    if: needs.scope.outputs.mori == 'true' && contains(fromJSON(needs.scope.outputs.groups), 'ep')
+    if: needs.scope.outputs.mori == 'true' && needs.scope.outputs.full == 'true' && contains(fromJSON(needs.scope.outputs.groups), 'ep')
     runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
     env:
       # py3.11 rather than the 7.14 lane's py3.12 — this is the tag the ROCm 10
@@ -628,7 +633,7 @@ jobs:
   jax-intranode-test:
     name: mori JAX intranode test (${{ matrix.platform }})
     needs: scope
-    if: needs.scope.outputs.mori == 'true' && contains(fromJSON(needs.scope.outputs.groups), 'ep')
+    if: needs.scope.outputs.mori == 'true' && needs.scope.outputs.full == 'true' && contains(fromJSON(needs.scope.outputs.groups), 'ep')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -1202,7 +1207,7 @@ jobs:
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29140
           if [ "${{ needs.scope.outputs.full == 'true' && 'full' || 'pr' }}" = pr ]; then
-            # The smallest and largest size per kernel; workflow_dispatch and ci:full run all 10.
+            # The smallest and largest size per kernel; the nightly, workflow_dispatch and ci:full run all 10.
             POINTS="v1:64 v1:4096 v1_ll:64 v1_ll:4096"
           else
             POINTS=$(for k in v1 v1_ll; do for t in 64 128 1024 2048 4096; do printf '%s:%s ' $k $t; done; done)
