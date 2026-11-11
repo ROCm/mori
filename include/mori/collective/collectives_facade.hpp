@@ -339,6 +339,14 @@ class CollectivesFacade {
     state->heapUsed = 0;
   }
 
+  // True if [p, p + bytes) lies inside this communicator's heap window.
+  bool InHeap(const void* p, size_t bytes) const {
+    const auto addr = reinterpret_cast<uintptr_t>(p);
+    const auto base = reinterpret_cast<uintptr_t>(state_.heapBase);
+    return state_.heapBase != nullptr && addr >= base &&
+           bytes <= state_.heapSize && addr - base <= state_.heapSize - bytes;
+  }
+
   // Runtime tuning "backdoors" (replace the former RS_MODE / RS_LOG_PUSH_SLICES
   // env vars). Call after Create, before the Run*. Both return false and leave
   // the current value unchanged on an invalid request.

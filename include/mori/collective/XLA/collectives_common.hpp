@@ -44,9 +44,16 @@ static constexpr int kSDMAPollInterval = 4;
 static_assert(sizeof(uint32_t) + sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC) ==
                       kSDMACopySignalPkt,
               "Packet size mismatch: copy+atomic must be 64B");
+// COPY_LINEAR count is 30 bits (bytes - 1), so one packet moves at most 1 GiB.
+static constexpr size_t kSdmaMaxCopyBytes = size_t{1} << 30;
+// Bounds a peer's packets ([POLL] + updates) well inside the 256KB ring.
+static constexpr int kRaggedMaxUpdates = 1024;
+
 #if defined(__HIPCC__) || defined(__HIP__)
 static_assert(cco::CCO_SDMA_QUEUE_SIZE % kSDMACopySignalPkt == 0,
               "SDMA ring must be a multiple of the 64B fused packet");
+static_assert((kRaggedMaxUpdates + 1) * kSDMACopySignalPkt < cco::CCO_SDMA_QUEUE_SIZE,
+              "Ragged all-to-all updates must fit into the SDMA ring");
 #endif
 
 static constexpr int kCCLMaxPeers = 16;
@@ -646,12 +653,6 @@ __device__ __forceinline__ void StartSdmaGatedCopies(cco::ccoSdmaContext sdma, i
     }
   }
 }
-
-// COPY_LINEAR count is 30 bits (bytes - 1), so one packet moves at most 1 GiB.
-static constexpr size_t kSdmaMaxCopyBytes = size_t{1} << 30;
-// Bounds a peer's packets ([POLL] + updates) well inside the 256KB ring.
-static constexpr int kRaggedMaxUpdates = 1024;
-static_assert((kRaggedMaxUpdates + 1) * kSDMACopySignalPkt < cco::CCO_SDMA_QUEUE_SIZE);
 
 __device__ __forceinline__ uint32_t NumCopyPackets(size_t bytes) {
   return static_cast<uint32_t>((bytes + kSdmaMaxCopyBytes - 1) / kSdmaMaxCopyBytes);
