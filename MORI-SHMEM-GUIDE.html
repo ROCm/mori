@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI Shmem Guide &mdash; MORI development (47df0dad) documentation</title>
+  <title>MORI Shmem Guide &mdash; MORI development (338f5fef) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=b54a1fce"></script>
+      <script src="_static/documentation_options.js?v=ac0abb19"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -935,35 +935,39 @@
 <td><p>RDMA traffic class</p></td>
 <td><p>Auto</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_P2P</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_MLX5_RESOLVE_DMAC</span></code></p></td>
+<td><p>mlx5 RoCE only. Resolve the QP’s destination MAC through an address handle, so that <code class="docutils literal notranslate"><span class="pre">ibv_create_ah</span></code> / <code class="docutils literal notranslate"><span class="pre">mlx5dv_init_obj</span></code> asks the kernel for the next hop (as <code class="docutils literal notranslate"><span class="pre">ibv_modify_qp</span></code> does) instead of using the peer NIC’s own MAC. Required when the peer NICs are reached through a router (RoCE on a routed/L3 fabric); a same-L2 peer resolves to the same MAC either way. Set to <code class="docutils literal notranslate"><span class="pre">0</span></code> to fall back to the peer NIC’s MAC, which is also what happens when resolution fails. Resolution is cached per peer for the life of the process.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_P2P</span></code></p></td>
 <td><p>Disable P2P (XGMI) transport, force RDMA</p></td>
 <td><p>Not set</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_RAIL_ONLY</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_RAIL_ONLY</span></code></p></td>
 <td><p>Only create RDMA QPs to same-rail peers (same index within their node). For rail-isolated fabrics where cross-rail QPs cannot be established. See <a class="reference internal" href="#rail-only-connections">Rail-only connections</a>.</p></td>
 <td><p>Not set</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_TOPO</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_TOPO</span></code></p></td>
 <td><p>Disable topology detection</p></td>
 <td><p>Not set</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IGNORE_CPU_AFFINITY</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IGNORE_CPU_AFFINITY</span></code></p></td>
 <td><p>By default the thread calling <code class="docutils literal notranslate"><span class="pre">ShmemInit</span></code> is pinned to the CPUs local to its GPU (sysfs <code class="docutils literal notranslate"><span class="pre">local_cpulist</span></code>, intersected with the existing cpuset). Within that set the CPUs are grouped into physical cores by <code class="docutils literal notranslate"><span class="pre">thread_siblings_list</span></code> and partitioned into one disjoint slice per GPU on the NUMA node, so two ranks never share the two SMT siblings of one core; the split applies only when the process sees more than one GPU on that NUMA node and there is at least one physical core per GPU, otherwise the whole node is bound. Set to <code class="docutils literal notranslate"><span class="pre">1</span></code> to disable and leave CPU placement to an outer <code class="docutils literal notranslate"><span class="pre">numactl</span></code>/<code class="docutils literal notranslate"><span class="pre">torchrun</span></code>. Works in SPMT (single-process multi-GPU) too: each per-GPU init thread pins to its own GPU’s slice.</p></td>
 <td><p>Not set (binding on)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_CPU_AFFINITY_NO_SPLIT</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_CPU_AFFINITY_NO_SPLIT</span></code></p></td>
 <td><p>Bind to the whole NUMA node instead of this rank’s own slice of it.</p></td>
 <td><p>Not set (split on)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_GLOBAL_LOG_LEVEL</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_GLOBAL_LOG_LEVEL</span></code></p></td>
 <td><p>Global log verbosity: <code class="docutils literal notranslate"><span class="pre">TRACE</span></code>, <code class="docutils literal notranslate"><span class="pre">DEBUG</span></code>, <code class="docutils literal notranslate"><span class="pre">INFO</span></code>, <code class="docutils literal notranslate"><span class="pre">WARN</span></code>, <code class="docutils literal notranslate"><span class="pre">ERROR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">INFO</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_PRECOMPILE</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_PRECOMPILE</span></code></p></td>
 <td><p>Precompile all JIT kernels on import</p></td>
 <td><p>Not set</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_JIT</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_JIT</span></code></p></td>
 <td><p>Disable JIT compilation of device bitcode</p></td>
 <td><p>Not set</p></td>
 </tr>
