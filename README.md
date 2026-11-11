@@ -34,15 +34,18 @@
 
 **MORI** (**Mo**dular **R**DMA **I**nterface) is a **bottom-up, modular, and composable framework** for building high-performance communication applications with a strong focus on **RDMA + GPU integration**. Inspired by the role of MLIR in compiler infrastructure, MORI provides reusable and extensible building blocks that make it **easier for developers to adopt advanced techniques** such as IBGDA (Infiniband GPUDirect Async) and GDS (GPUDirect Storage).
 
-To help developers get started quickly, MORI also includes a suite of optimized libraries—**MORI-EP** (MoE dispatch & combine kernels), **MORI-IO** (p2p communication for KVCache transfer), and **MORI-CCL** (collective communication)—that deliver out-of-the-box performance, with support for AMD `Pensando DSC`, Broadcom `Thor2`, and NVIDIA Mellanox `ConnectX-7` NICs.
+To help developers get started quickly, MORI also includes a suite of optimized libraries—**MORI-EP** (MoE dispatch & combine kernels, in two generations: EPv1 on MORI-SHMEM and EPv2 on MORI-CCO), **MORI-IO** (p2p communication for KVCache transfer), **MORI-CCL** (collective communication), and **MORI-CCO** (Next-Generation Collective Communication Object for GPUs), and **MORI-FUSED** (GEMMs fused with collectives, built on MORI-CCO)—that deliver out-of-the-box performance, with support for AMD `Pensando DSC`, Broadcom `Thor2`, and NVIDIA Mellanox `ConnectX-7` NICs.
 
 ## Features summary
 - Applications
-    - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance.
+    - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance. Two generations:
+        - EPv1: built on MORI-SHMEM.
+        - EPv2: built on MORI-CCO. Designed natively for gfx1250 and rack-scale EP. Two interchangeable kernel backends (FlyDSL and HIP). Intra-node (EP8) and a HIP internode preview over GDA RDMA.
     - MORI-FUSED: GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, overlapping the transfer with the GEMM over the SDMA copy engines
     - MORI-IO: point-to-point communication library with ultra-low overhead
     - MORI-CCL: lightweight and flexible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained environment
     - MORI-UMBP: unified memory & bandwidth pool with tiered storage and distributed key-value access for scalable memory management
+    - MORI-CCO: Next-Generation Collective Communication Object for GPUs. Natively designed for compute-communication fusion, with symmetric memory support.
 - Framework
     - High-performance building blocks for IBGDA / P2P and more​
     - Modular & composable components for developing communication applications, such as transport management, topology detection and etc.
@@ -58,10 +61,10 @@ It is built from [`docs/`](https://github.com/ROCm/mori/tree/main/docs) on every
 | **Topic** | **Description** | **Docs** |
 |---|---|---|
 | Getting started | Installation, fabric checks and first steps | [Installation](https://rocm.github.io/mori/installation.html) · [Quickstart](https://rocm.github.io/mori/quickstart.html) |
-| MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples; choosing between the EP APIs and backends | [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html) · [Choosing an API and backend](https://rocm.github.io/mori/ep_backends.html) · [Benchmark](https://rocm.github.io/mori/MORI-EP-BENCHMARK.html) · [RDMA bandwidth](https://rocm.github.io/mori/rdma_bandwidth_utilization.html) |
+| MORI-EP (EPv1, EPv2) | EPv1 (built on SHMEM) and EPv2 (built on CCO) dispatch/combine: API, kernel types and backends, configuration, usage examples, how to choose | [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-EP-BENCHMARK.html) · [RDMA bandwidth](https://rocm.github.io/mori/rdma_bandwidth_utilization.html) |
 | MORI-FUSED | GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, built on MORI-CCO | [Guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html) |
 | MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](https://rocm.github.io/mori/MORI-SHMEM-GUIDE.html) |
-| MORI-CCO | Explicit-handle GPU communication over LSA, GDA and SDMA | [CCO Guide](https://rocm.github.io/mori/MORI-CCO-GUIDE.html) |
+| MORI-CCO | Next-generation collective communication object: communicator, symmetric-memory windows, LSA / GDA / SDMA device APIs | [CCO Guide](https://rocm.github.io/mori/MORI-CCO-GUIDE.html) |
 | MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](https://rocm.github.io/mori/MORI-IR-GUIDE.html) |
 | MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](https://rocm.github.io/mori/MORI-IO-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) |
 | MORI-UMBP | Unified memory & bandwidth pool: tiered storage, distributed KV access, transfer simulation | [Single-Node Smoke Test](https://rocm.github.io/mori/MORI-UMBP-SINGLE-NODE-GUIDE.html) · [Simulation](https://rocm.github.io/mori/umbp-simulation.html) · [Calibration](https://rocm.github.io/mori/umbp-calibration.html) · [PD Benchmark](https://rocm.github.io/mori/MORI-UMBP-PD-BENCHMARK.html) · [Tier-Management Benchmark](https://rocm.github.io/mori/UMBP-TIER-MANAGEMENT-BENCHMARK.html) |
@@ -332,6 +335,25 @@ python -c "import mori; print(mori.__version__)"
 ## Testing
 
 ### Test MORI-EP (dispatch / combine)
+
+#### EPv2 (MORI-CCO)
+
+```bash
+cd /path/to/mori
+export PYTHONPATH=/path/to/mori:$PYTHONPATH
+python -c "import mori; print(mori.__file__)"
+
+# Test correctness (8 GPUs)
+pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -q
+pytest tests/python/ops/dispatch_combine_v2/test_ep_backend_parity.py -q
+
+# Benchmark performance
+python tests/python/ops/dispatch_combine_v2/bench_ep.py
+```
+
+Two-node runs and their restrictions: see the [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html#epv2-restrictions).
+
+#### EPv1 (MORI-SHMEM)
 
 ```bash
 cd /path/to/mori

@@ -1,7 +1,7 @@
 Quickstart
 ==========
 
-Start with :doc:`installation` and choose an API using :doc:`ep_backends`.
+Start with :doc:`installation` and choose an API using :doc:`MORI-EP-GUIDE`.
 The snippets below explain the API flow; variables such as ``input_tokens``,
 ``weights`` and peer descriptors are application-provided, so these are not
 standalone programs.
@@ -27,7 +27,7 @@ The test programs construct inputs, initialize ranks, check results and clean up
 The EPv2 pytest wrapper also checks the runner's printed PASS/FAIL results; a zero
 exit code from the underlying ``test_op.py`` alone is not a correctness gate.
 Run them on an allocated node without competing jobs. For two-node EPv2,
-including its preview restrictions, see :doc:`ep_backends`.
+including its preview restrictions, see :doc:`MORI-EP-GUIDE`.
 
 API sketches
 ------------

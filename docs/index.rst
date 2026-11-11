@@ -110,7 +110,7 @@ Components
      - Start here
    * - **MORI-EP**
      - Intra and inter-node dispatch/combine kernels for MoE Expert Parallelism
-     - :doc:`MORI-EP-GUIDE`, then :doc:`ep_backends` to choose between the original API and EPv2
+     - :doc:`MORI-EP-GUIDE` (EPv1 on MORI-SHMEM, EPv2 on MORI-CCO, and how to choose), then :doc:`ep_backends`
    * - **MORI-FUSED**
      - GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, overlapping the transfer with the GEMM over the SDMA copy engines; built on MORI-CCO
      - :doc:`MORI-CCO-FUSED-OPS-GUIDE`
@@ -121,7 +121,7 @@ Components
      - Device bitcode that lets Triton and other GPU kernel frameworks call the shmem and CCO device APIs
      - :doc:`MORI-IR-GUIDE`
    * - **MORI-CCO**
-     - Collective Communication Object: explicit-handle GPU communication (LSA / GDA / SDMA)
+     - Next-Generation Collective Communication Object for GPUs: symmetric memory, natively designed for compute-communication fusion (LSA / GDA / SDMA)
      - :doc:`MORI-CCO-GUIDE`
    * - **MORI-IO**
      - Point-to-point communication library for KVCache transfer via RDMA/XGMI
