@@ -1,13 +1,15 @@
 #include "recorder.h"
 
-#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
+#include <thread>
 
 #include "meta_json.h"
 #include "writer.h"
@@ -141,20 +143,34 @@ int WaitSignal(const sigset_t& set, uint64_t timeout_ns) {
   return sig > 0 ? sig : 0;
 }
 
-// Best-effort message for paths where a thread (e.g. the writer printing its summary) may hold
-// the stderr FILE lock or stderr may be a full pipe: no stdio, no blocking.
-void RawErr(const std::string& msg) {
-  pollfd p{STDERR_FILENO, POLLOUT, 0};
-  if (poll(&p, 1, 0) == 1 && (p.revents & POLLOUT)) {
-    ssize_t ignored = write(STDERR_FILENO, msg.data(), msg.size());
-    (void)ignored;
-  }
+// Message on a path that must finish in bounded time. stderr may be a full pipe or a file on a
+// hung filesystem, and another thread may hold the stderr FILE lock, so even a raw write can
+// block: it runs on a detached thread and we wait at most `wait_ns`. If it does not finish,
+// the message is lost (the details are in meta.json) and _exit ends that thread.
+void BoundedErr(const std::string& msg, uint64_t wait_ns = 100000000ull) {
+  struct Job {
+    std::string text;
+    std::atomic<bool> done{false};
+  };
+  auto* job = new Job{msg};  // intentionally leaked: the thread may outlive this call
+  std::thread([job] {
+    size_t off = 0;
+    while (off < job->text.size()) {
+      ssize_t w = write(STDERR_FILENO, job->text.data() + off, job->text.size() - off);
+      if (w < 0 && errno == EINTR) continue;
+      if (w <= 0) break;
+      off += static_cast<size_t>(w);
+    }
+    job->done.store(true);
+  }).detach();
+  const uint64_t until = MonoNs() + wait_ns;
+  while (!job->done.load() && MonoNs() < until) SleepNs(1000000ull);
 }
 
 // Exit while other threads may still be stuck inside driver or filesystem calls: no
-// destructors, no stdio flushing (which could wait on a lock held by a stuck thread).
+// destructors and no stdio (a flush could wait on stderr backpressure or a held lock).
 [[noreturn]] void HardExit(int code, const std::string& msg = "") {
-  if (!msg.empty()) RawErr(msg);
+  if (!msg.empty()) BoundedErr(msg);
   _exit(code);
 }
 
@@ -426,8 +442,8 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
     } else {
       mc.abandoned.push_back(s->file());
       // The writer may be printing (and stderr may be a full pipe): no stdio before it is done.
-      RawErr("warning: " + s->netdev + "." + s->src->kind() + " did not stop within " +
-             FormatDurationNs(opt->stop_timeout_ns) + " (stuck in a driver call)\n");
+      BoundedErr("warning: " + s->netdev + "." + s->src->kind() + " did not stop within " +
+                 FormatDurationNs(opt->stop_timeout_ns) + " (stuck in a driver call)\n");
     }
   }
   bool all_errored = true;
@@ -454,31 +470,37 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
     // The writer is stuck (e.g. in an NFS write or its console output): touch no stdio.
     HardExit(kExitWriteFailed, "error: finalising the recording timed out\n");
   }
-  writer->Join();  // done: its stdio use is over, so printing below cannot block on it
+  writer->Join();  // done: its stdio use is over
+
+  std::string summary;
   for (size_t i = 0; i < final_streams.size(); i++) {
     const auto& x = mc.stats[i];
-    fprintf(stderr, "%s: samples %llu, missed %llu, dropped %llu, errors %llu, max rtt %.1f us%s\n",
-            final_streams[i]->file().c_str(), static_cast<unsigned long long>(x.samples),
-            static_cast<unsigned long long>(x.missed_slots),
-            static_cast<unsigned long long>(x.dropped), static_cast<unsigned long long>(x.errors),
-            static_cast<double>(x.max_rtt_ns) / 1e3,
-            x.stopped_by_errors ? " (stopped by errors)" : "");
-    if (!x.last_error.empty()) fprintf(stderr, "  last error: %s\n", x.last_error.c_str());
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "%s: samples %llu, missed %llu, dropped %llu, errors %llu, max rtt %.1f us%s\n",
+             final_streams[i]->file().c_str(), static_cast<unsigned long long>(x.samples),
+             static_cast<unsigned long long>(x.missed_slots),
+             static_cast<unsigned long long>(x.dropped), static_cast<unsigned long long>(x.errors),
+             static_cast<double>(x.max_rtt_ns) / 1e3,
+             x.stopped_by_errors ? " (stopped by errors)" : "");
+    summary += buf;
+    if (!x.last_error.empty()) summary += "  last error: " + x.last_error + "\n";
   }
 
   int code = kExitOk;
   if (writer->failed()) {
     code = kExitWriteFailed;
-    fprintf(stderr, "error: %s\n", writer->error().c_str());
+    summary += "error: " + writer->error() + "\n";
   } else if (!mc.abandoned.empty()) {
     code = kExitAbandoned;
   } else if (all_errored) {
     code = kExitAllStreamsFailed;
   }
   if (!mc.abandoned.empty()) {
-    fflush(stderr);  // only our own output now; stuck samplers never touch stdio
-    HardExit(code);
+    // Stuck samplers remain: the exit must stay bounded, so the summary is best effort.
+    HardExit(code, summary);
   }
+  fputs(summary.c_str(), stderr);  // normal exit: an ordinary, possibly blocking, print
   delete writer;
   delete ctl;
   delete queue;

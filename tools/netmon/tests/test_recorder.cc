@@ -2,6 +2,7 @@
 // (it installs process-wide signal state and may _exit), and the parent checks the exit code
 // and the files left behind.
 #include <dirent.h>
+#include <fcntl.h>
 #include <ftw.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -37,7 +38,18 @@ namespace {
   for (;;) cv.wait(lk);
 }
 
-enum class Mode { kOk, kStuckInQuery, kStuckInProbe, kProbeFails };
+enum class Mode { kOk, kStuckInQuery, kStuckInProbe, kProbeFails, kFillsStderr };
+
+// Fill stderr (a pipe nobody reads) so every later write to it would block.
+void FillStderr() {
+  int fl = fcntl(STDERR_FILENO, F_GETFL);
+  fcntl(STDERR_FILENO, F_SETFL, fl | O_NONBLOCK);
+  char junk[4096];
+  memset(junk, 'x', sizeof(junk));
+  while (write(STDERR_FILENO, junk, sizeof(junk)) > 0) {
+  }
+  fcntl(STDERR_FILENO, F_SETFL, fl);
+}
 
 class FakeSource : public Source {
  public:
@@ -57,6 +69,7 @@ class FakeSource : public Source {
   Status Query(uint64_t* out) override {
     if (mode_ == Mode::kStuckInQuery && calls_ >= static_cast<uint64_t>(stuck_after_))
       BlockForever();
+    if (mode_ == Mode::kFillsStderr && calls_ == 10) FillStderr();
     calls_++;
     for (size_t i = 0; i < names_.size(); i++) out[i] = calls_ * (i + 1);
     return Status::Ok();
@@ -195,6 +208,8 @@ const std::map<std::string, ChildCase>& Cases() {
       {"enospc_and_stuck",
        {{{"rdma", Mode::kOk}, {"ipc", Mode::kStuckInQuery, 5}}, 2000000000ull, InstallEnospc}},
       {"writer_blocks", {{{"rdma", Mode::kOk}}, 300000000ull, InstallBlockingWrites}},
+      {"stuck_sampler_full_stderr",
+       {{{"rdma", Mode::kFillsStderr}, {"ipc", Mode::kStuckInQuery, 20}}, 300000000ull, nullptr}},
       {"final_meta_blocks", {{{"rdma", Mode::kOk}}, 300000000ull, InstallBlockingFinalMeta}},
   };
   return cases;
@@ -203,29 +218,41 @@ const std::map<std::string, ChildCase>& Cases() {
 // Runs a recording case in a fresh process (fork + exec of this test binary), so the child
 // starts from main() with a clean runtime (sanitizers do not support running threads in a
 // child forked from a multi-threaded parent). Returns the exit code, or 128 + signal.
-int RunCase(const std::string& name, const std::string& out, int send_sigint_after_ms = -1) {
+int RunCase(const std::string& name, const std::string& out, int send_sigint_after_ms = -1,
+            bool stderr_to_unread_pipe = false) {
   std::string self = SelfExePath();
+  int p[2] = {-1, -1};
+  if (stderr_to_unread_pipe && pipe(p) != 0) return -1;
   pid_t pid = fork();
   if (pid == 0) {
+    if (stderr_to_unread_pipe) {
+      dup2(p[1], STDERR_FILENO);
+      close(p[0]);
+      close(p[1]);
+    }
     execl(self.c_str(), self.c_str(), "--recorder-case", name.c_str(), out.c_str(),
           static_cast<char*>(nullptr));
     _exit(127);
   }
+  if (p[1] >= 0) close(p[1]);  // keep the read end open, but never read it
   if (send_sigint_after_ms >= 0) {
     usleep(static_cast<useconds_t>(send_sigint_after_ms) * 1000);
     kill(pid, SIGINT);
   }
-  int status = 0;
+  int status = 0, code = -1;
   for (int waited = 0; waited < 600; waited++) {  // 60 s cap (sanitizer builds are slow)
     if (waitpid(pid, &status, WNOHANG) == pid) {
-      if (WIFEXITED(status)) return WEXITSTATUS(status);
-      return 128 + WTERMSIG(status);
+      code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+      break;
     }
     usleep(100000);
   }
-  kill(pid, SIGKILL);
-  waitpid(pid, &status, 0);
-  return -1;
+  if (code == -1) {
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+  }
+  if (p[0] >= 0) close(p[0]);
+  return code;
 }
 
 }  // namespace
@@ -374,4 +401,17 @@ TEST(RecorderFinalMetaBlocks) {
   // The records were all written; only the final meta is missing (still "running").
   CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
   CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"running\"") != std::string::npos);
+}
+
+TEST(RecorderAbandonedExitWithFullStderr) {
+  // stderr fills up during the run (a pipe nobody reads) and a sampler is stuck: the
+  // abandoned exit must still happen in bounded time (messages are best effort).
+  TempDir tmp;
+  auto dir = tmp.path() + "/run";
+  const uint64_t t0 = MonoNs();
+  int code = RunCase("stuck_sampler_full_stderr", dir, -1, true);
+  CHECK_EQ(code, 4);
+  CHECK(MonoNs() - t0 < 20000000000ull);
+  CHECK(ReadAll(dir + "/meta.json").find("\"abandoned\": [\"fake1.ipc.bin\"]") !=
+        std::string::npos);
 }

@@ -280,11 +280,11 @@ def series_stats(r, w0, w1, scale, threshold=None):
 def peak_over_window(r, mask, scale):
     """Max rate over 10 ms windows lying entirely in normal-resolution coverage.
 
-    Only runs of contiguous usable intervals that are each shorter than the window can resolve
-    10 ms; coarser runs give no 10 ms peak (an interval average is not a 10 ms rate).
+    Only intervals no longer than the window can resolve 10 ms: longer ones cut the runs (an
+    interval average is not a 10 ms rate) without discarding the usable data around them.
     Windows step by half a window and always include the one ending at the run's end.
     """
-    idx = np.flatnonzero(mask)
+    idx = np.flatnonzero(mask & (r.dt <= PEAK_WINDOW_NS))
     if len(idx) == 0:
         return float("nan")
     breaks = np.flatnonzero(np.diff(idx) != 1)
@@ -293,8 +293,6 @@ def peak_over_window(r, mask, scale):
     best = float("nan")
     for a, b in zip(starts, ends):
         ii = idx[a:b]
-        if r.dt[ii].max() > PEAK_WINDOW_NS:
-            continue
         t = np.concatenate([[r.t_start[ii[0]]], r.t_end[ii]])
         c = np.concatenate([[0.0], np.cumsum(r.dv[ii])])
         last = t[-1] - PEAK_WINDOW_NS

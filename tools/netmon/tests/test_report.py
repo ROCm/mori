@@ -142,6 +142,21 @@ class ReportTests(unittest.TestCase):
         r = R.Rates(s, "tx_rdma_ucast_bytes")
         self.assertTrue(np.isnan(R.peak_over_window(r, r.valid & ~r.lowres, 8 / 1e9)))
 
+    def test_one_coarse_interval_only_cuts_the_peak_windows(self):
+        # 5 ms sampling with one 12 ms gap (not low-res: 3x baseline is 15 ms): both sides
+        # still have enough data for 10 ms windows.
+        steps = [5] * 6 + [12] + [5] * 6
+        t0 = (np.concatenate([[0], np.cumsum(steps)]) * MS + 10**12).astype(np.uint64)
+        n = len(t0)
+        rtt = np.full(n, 1 * MS, dtype=np.uint64)
+        real = (t0.astype(np.int64) + 1_700_000_000 * 10**9).astype(np.uint64)
+        v = ((t0 - t0[0]).astype(np.float64) * 50.0).astype(np.uint64)  # 400 Gb/s
+        _, s = self.one(t0, rtt, real, np.zeros(n, dtype=np.uint64), v, interval=5 * MS)
+        r = R.Rates(s, "tx_rdma_ucast_bytes")
+        mask = r.valid & ~r.lowres
+        self.assertTrue(mask.all())  # the 12 ms interval is not low resolution
+        self.assertAlmostEqual(R.peak_over_window(r, mask, 8 / 1e9), 400.0, places=3)
+
     def test_budget_respects_nic_filter(self):
         t0, rtt, real, err, v = steady(10)
         streams = [
