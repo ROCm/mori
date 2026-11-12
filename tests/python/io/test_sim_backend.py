@@ -363,6 +363,31 @@ def test_xgmi_fence_assumes_a_peer_it_cannot_place_is_on_this_node(sim_env):
     assert unknown.supported and unknown.endpoints_failed == 1 and not unknown.ok
 
 
+def test_xgmi_fence_ignores_host_memory(sim_env):
+    # XGMI carries GPU memory only, so host buffers give no peer a path to cut.
+    a = make_engine("pf", backend=BackendType.XGMI)
+    a.register_memory(FAKE_PTR, MiB, -1, MemoryLocationType.CPU)
+    assert not a.fence_remote_engine("anyone").supported
+
+
+def test_xgmi_fence_remembers_a_peer_once_seen_on_this_node(sim_env):
+    sim_env.setenv("MORI_NODE_ID", "nodeA")
+    a = make_engine("pf", backend=BackendType.XGMI)
+    gpu_mem(a, MiB)
+    key = f"moved-{_counter[0]}"
+    here = IOEngine(key, IOEngineConfig(host="127.0.0.1", port=0))
+    here.create_backend(BackendType.XGMI)
+    a.register_remote_engine(here.get_engine_desc())
+    # The key comes back from another node; the incarnation that was here may still hold
+    # a mapping of a's memory.
+    sim_env.setenv("MORI_NODE_ID", "nodeB")
+    there = IOEngine(key, IOEngineConfig(host="127.0.0.1", port=0))
+    there.create_backend(BackendType.XGMI)
+    a.register_remote_engine(there.get_engine_desc())
+    result = a.fence_remote_engine(key)
+    assert result.supported and result.endpoints_failed == 1 and not result.ok
+
+
 def use_catalog(sim_env, tmp_path, *texts):
     """Catalog files in order, with the fixture's per-value variables cleared."""
     for backend, profile in PROFILES.items():
