@@ -907,13 +907,6 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
       continue;
     }
 
-    // Whole-token vector forward: the loads go out before the slot atomic, so the two overlap.
-    constexpr size_t kH = config.HiddenBytes(sizeof(T)), kI = config.IndexBytes(),
-                     kW = config.WeightBytes(), kS = config.ScaleBytes();
-    using Forward = ForwardTokenVec16<kH, kI, kW, kS>;
-    [[maybe_unused]] Forward fwd;
-    if constexpr (Forward::kUsable) fwd.Load(stagingPtr + globalTokenId * xferBytes);
-
     int destTokId = 0;
     if (laneId == 0) {
       destTokId = atomicAdd(args.reg(args.offDispTokOffset)->template GetAs<index_t*>(destPe), 1);
@@ -925,15 +918,6 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
     }
     if ((destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
     destTokId = __shfl(destTokId, 0);
-    if constexpr (Forward::kUsable) {
-      fwd.Store(
-          args.reg(args.offDispatchOut)->template GetAs<uint8_t*>(destPe) + destTokId * kH,
-          args.reg(args.offOutIndices)->template GetAs<uint8_t*>(destPe) + destTokId * kI,
-          args.reg(args.offDispatchOutWeights)->template GetAs<uint8_t*>(destPe) + destTokId * kW,
-          kS > 0 ? args.reg(args.offOutScales)->template GetAs<uint8_t*>(destPe) + destTokId * kS
-                 : nullptr);
-      continue;
-    }
     core::WarpCopy<uint8_t, 4>(
         args.reg(args.offDispatchOut)->template GetAs<uint8_t*>(destPe) + destTokId * hiddenBytes,
         stagingPtr + globalTokenId * xferBytes, hiddenBytes);
@@ -949,6 +933,122 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
           args.reg(args.offOutScales)->template GetAs<uint8_t*>(destPe) + destTokId * scaleBytes,
           stagingPtr + globalTokenId * xferBytes + hiddenBytes + indexBytes + weightBytes,
           scaleBytes);
+    }
+  }
+
+  if (laneId < config.gpuPerNode) {
+    int destPe = myNode * config.gpuPerNode + laneId;
+    index_t counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
+    // Wait for the add to be performed before this warp arrives in DispatchSync.
+    asm volatile("" ::"v"(counter) : "memory");
+  }
+}
+
+// v2_ll receive, one token per warp: indices read once, one slot atomic per distinct local PE,
+// the token loaded once and stored to each. Tokens ForwardTokenVec16 cannot hold take
+// DispatchInterNodeLLRecv.
+template <EpInterNodeKernelCfg kConfig, typename T>
+inline __device__ void DispatchInterNodeLLRecvTok(EpDispatchCombineArgs& args) {
+  DEF_COMMON_VARS;
+  constexpr size_t kH = config.HiddenBytes(sizeof(T)), kI = config.IndexBytes(),
+                   kW = config.WeightBytes(), kS = config.ScaleBytes();
+  using Forward = ForwardTokenVec16<kH, kI, kW, kS>;
+  constexpr int kTopk = kConfig.numExpertPerToken;
+
+  const int maxTok = config.MaxNumTokensToSendPerRank();
+  int maxChunkNum = core::CeilDiv(maxTok, warpSize);
+  uint64_t* chunkFlag = args.reg(args.offChunkFlag)->template GetAs<uint64_t*>();
+  uint64_t* nodeRecvTokenNum = args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>();
+  uint8_t* stagingPtr = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>();
+
+  int localPeTokenCounter = 0;
+  // nodeRecvTokenNum[node] as in DispatchInterNodeLLRecv: one cached node at a time.
+  int cachedNode = -1;
+  uint64_t cachedNodeFlag = 0;
+
+  const int stride = args.rdmaBlockNum * warpNum;
+  for (int i = globalWarpId; i < maxTok * (nNodes - 1); i += stride) {
+    int tokenId = i % maxTok;
+    int nodeId = i / maxTok;
+    int node = (myNode + 1 + nodeId) % nNodes;
+    int k = tokenId / warpSize;
+    int startTokenIdx = k * warpSize;
+
+    uint64_t thisChunkTokenNum = 0;
+    if (laneId == 0) {
+      if (node != cachedNode) {
+        cachedNode = node;
+        cachedNodeFlag = 0;
+      }
+      while (1) {
+        // Slots are 0 .. S-1 and nodeRecvTokenNum is S * warpSize + 1; see
+        // DispatchInterNodeLLRecv.
+        if ((cachedNodeFlag > 0) && (startTokenIdx >= (cachedNodeFlag - 1))) {
+          thisChunkTokenNum = 1;
+          break;
+        }
+        thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
+        if (thisChunkTokenNum > 0) break;
+        if (cachedNodeFlag == 0)
+          cachedNodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
+      }
+    }
+    thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
+    // Past the node's last slot, and so is the rest of this node: go to the next one.
+    if (thisChunkTokenNum == 0) {
+      const int nextNodeStart = (nodeId + 1) * maxTok;
+      const int offset = ((globalWarpId - nextNodeStart) % stride + stride) % stride;
+      i = nextNodeStart + offset - stride;  // the loop increment adds stride back
+      continue;
+    }
+    if (tokenId >= startTokenIdx + static_cast<int>(thisChunkTokenNum)) continue;
+
+    const int globalTokenId = SendBufSlotOffset(config, node, tokenId);
+    const uint8_t* slot = stagingPtr + globalTokenId * xferBytes;
+    Forward fwd;
+    fwd.Load(slot);
+
+    // Lane e < topk is expert e. A representative lane is the first expert of a local PE;
+    // sentinel (-1) experts get a unique impossible PE, as in DispatchInterNodeLLRecv.
+    int lanePe = -1;
+    if (laneId < kTopk) {
+      index_t laneExpert = reinterpret_cast<const index_t*>(slot + kH)[laneId];
+      lanePe = (laneExpert < 0) ? (-1 - static_cast<int>(laneId))
+                                : (laneExpert / config.numExpertPerRank);
+    }
+    const index_t srcTokId = reinterpret_cast<const index_t*>(slot + kH + kI + kW + kS)[0];
+    bool isRep = (laneId < kTopk) && (lanePe >= 0) && (lanePe < config.worldSize) &&
+                 (lanePe / config.gpuPerNode == myNode);
+#pragma unroll
+    for (int j = 0; j < kTopk; j++) {
+      const int pj = __shfl(lanePe, j);
+      if (j < laneId && pj == lanePe) isRep = false;
+    }
+
+    int destTokId = 0;
+    if (isRep) {
+      destTokId = atomicAdd(args.reg(args.offDispTokOffset)->template GetAs<index_t*>(lanePe), 1);
+      assert(destTokId < config.MaxNumTokensToRecv() &&
+             "Total recv token overflow: increase maxTotalRecvTokens");
+      args.interNodeDispDestTokIdMap[globalTokenId * kTopk + laneId] =
+          FlatTokenIndex(config, lanePe, destTokId);
+      args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>(lanePe)[destTokId] = srcTokId;
+    } else if (laneId < kTopk) {
+      args.interNodeDispDestTokIdMap[globalTokenId * kTopk + laneId] = NullFlatTokenIndex(config);
+    }
+
+    uint64_t reps = __ballot(isRep);
+    while (reps) {
+      const int j = __ffsll(static_cast<unsigned long long>(reps)) - 1;
+      reps &= reps - 1;
+      const int destPe = __shfl(lanePe, j);
+      const int dt = __shfl(destTokId, j);
+      if (laneId == destPe % config.gpuPerNode) localPeTokenCounter++;
+      fwd.Store(args.reg(args.offDispatchOut)->template GetAs<uint8_t*>(destPe) + dt * kH,
+                args.reg(args.offOutIndices)->template GetAs<uint8_t*>(destPe) + dt * kI,
+                args.reg(args.offDispatchOutWeights)->template GetAs<uint8_t*>(destPe) + dt * kW,
+                kS > 0 ? args.reg(args.offOutScales)->template GetAs<uint8_t*>(destPe) + dt * kS
+                       : nullptr);
     }
   }
 
@@ -1078,7 +1178,13 @@ __device__ void EpDispatchInterNodeV2LL_body(EpDispatchCombineArgs args,
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeLLSend<kConfig, T>(args, comm);
-    internode::DispatchInterNodeLLRecv<kConfig, T>(args);
+    constexpr EpInterNodeDeviceCfg kCfg = EpInterNodeDeviceCfgOf(kConfig);
+    if constexpr (ForwardTokenVec16<kCfg.HiddenBytes(sizeof(T)), kCfg.IndexBytes(),
+                                    kCfg.WeightBytes(), kCfg.ScaleBytes()>::kUsable) {
+      internode::DispatchInterNodeLLRecvTok<kConfig, T>(args);
+    } else {
+      internode::DispatchInterNodeLLRecv<kConfig, T>(args);
+    }
   } else {
     internode::WaitLLPostsIssued<kConfig, T>(args);
     internode::DispatchIntraNode<kConfig, T>(args);
