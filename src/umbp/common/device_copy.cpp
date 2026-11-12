@@ -28,8 +28,24 @@
 
 namespace mori::umbp {
 
+namespace {
+
+// ROCm 10.1's HIP can crash when several threads make their first HIP call at
+// once, as the SSD tiers' per-drive workers do, so it is initialized on one.
+void EnsureHipInitialized() {
+  static const bool initialized = [] {
+    (void)hipInit(0);
+    (void)hipGetLastError();
+    return true;
+  }();
+  (void)initialized;
+}
+
+}  // namespace
+
 PointerLocation DetectPointerLocation(const void* ptr) {
   if (ptr == nullptr) return {};
+  EnsureHipInitialized();
 
   hipPointerAttribute_t attributes{};
   const hipError_t status = hipPointerGetAttributes(&attributes, ptr);
@@ -48,6 +64,7 @@ PointerLocation DetectPointerLocation(const void* ptr) {
 
 ScopedHipDevice::ScopedHipDevice(int device_id) {
   if (device_id < 0) return;
+  EnsureHipInitialized();
   if (hipGetDevice(&previous_device_) != hipSuccess) {
     (void)hipGetLastError();
     return;
@@ -68,6 +85,7 @@ ScopedHipDevice::~ScopedHipDevice() {
 }
 
 bool DeviceCopy(void* dst, const void* src, size_t size, hipMemcpyKind kind, int device_id) {
+  EnsureHipInitialized();
   const hipError_t status = hipMemcpy(dst, src, size, kind);
   if (status != hipSuccess) {
     MORI_UMBP_ERROR("[UMBP] hipMemcpy failed on device {}: {}", device_id,

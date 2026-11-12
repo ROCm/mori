@@ -570,7 +570,7 @@ MAIN_STATUS = "MoRI CI (main)"
 JOBS = {
     "mori": (
         ("MI355X intranode", LANE_GROUPS["mori"]),
-        ("MI355X ROCm 10", {"ep"}),
+        ("MI355X ROCm 7.14", {"ep"}),
         ("MI355X JAX", {"ep"}),
         ("MI355X internode", {"ep", "ccl", "io"}),
     ),
