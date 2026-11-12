@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/mori-logo-dark.png">
+    <source type="image/svg+xml" srcset="docs/assets/mori-logo.svg">
     <img alt="MORI" src="docs/assets/mori-logo.png" width="420">
   </picture>
 </p>
