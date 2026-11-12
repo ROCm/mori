@@ -479,7 +479,7 @@ run 新增 16 份而不是 2 份，AOT 也无从谈起。旁证：gfx942 上 8 �
 4096 上 combine 快 12%，差在暂存拷贝：FlyDSL 在 kernel 前单独发一发 311MB 的 torch copy，
 HIP 在 kernel 内做、与 barrier 等待重叠——104µs 变 ~1µs。
 
-4×gfx1250（MI450）EP4，hidden=7168 topk=8，对照 v1 `tools/ep_test.sh` 的出厂默认，µs：
+4×gfx1250（MI450）EP4，hidden=7168 topk=8，对照 v1 的出厂默认，µs：
 
 | tok/rank | 64 | 512 | 2048 | 4096 | 16384 |
 |---|---|---|---|---|---|
@@ -505,7 +505,7 @@ memObj->GetAs<T*>(pe)  →  ccoGetLsaPeerPtr(win, pe, args.offRegion)
 13 个 `SymmMemObjPtr` 塌成一个 window handle + 8 个 offset。生成的 TU 不 include `mori/shmem`，
 所以没有设备全局变量、不需要 per-module init。
 
-gfx125x 的 TDM body 同样是机械移植（`intranode_1250x.hpp` → `ep_intranode_1250x.hpp`）：v1 的 cco 路径
+gfx125x 的 TDM body（`ep_intranode_1250x.hpp`）同样是从 v1 机械移植的：v1 的 cco 路径
 本来就把每块对称 buffer 从同一个 LSA window 里 bump 分配，和 SymmArena 是同一个内存模型，源码里的
 `shmem` 命名空间只是那层抽象加几个与后端无关的自旋。TDM 那套机器（`amd_gfx1250_TDM.h` builtin、
 `_cusplit_*` 设备全局暂存池）原样保留。范围收到 hip 后端能服务的部分：非量化的 TDM dispatch +

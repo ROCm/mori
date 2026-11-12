@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI JIT v2 &mdash; MORI development (eb27d56f) documentation</title>
+  <title>MORI JIT v2 &mdash; MORI development (bd82f048) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=4de36f08"></script>
+      <script src="_static/documentation_options.js?v=37726753"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -1057,7 +1057,7 @@ run 新增 16 份而不是 2 份，AOT 也无从谈起。旁证：gfx942 上 8 �
 </table>
 <p>4096 上 combine 快 12%，差在暂存拷贝：FlyDSL 在 kernel 前单独发一发 311MB 的 torch copy，
 HIP 在 kernel 内做、与 barrier 等待重叠——104µs 变 ~1µs。</p>
-<p>4×gfx1250（MI450）EP4，hidden=7168 topk=8，对照 v1 <code class="docutils literal notranslate"><span class="pre">tools/ep_test.sh</span></code> 的出厂默认，µs：</p>
+<p>4×gfx1250（MI450）EP4，hidden=7168 topk=8，对照 v1 的出厂默认，µs：</p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>tok/rank</p></th>
@@ -1100,7 +1100,7 @@ dispatch 41→3、combine 57→10（<code class="docutils literal notranslate"><
 </div>
 <p>13 个 <code class="docutils literal notranslate"><span class="pre">SymmMemObjPtr</span></code> 塌成一个 window handle + 8 个 offset。生成的 TU 不 include <code class="docutils literal notranslate"><span class="pre">mori/shmem</span></code>，
 所以没有设备全局变量、不需要 per-module init。</p>
-<p>gfx125x 的 TDM body 同样是机械移植（<code class="docutils literal notranslate"><span class="pre">intranode_1250x.hpp</span></code> → <code class="docutils literal notranslate"><span class="pre">ep_intranode_1250x.hpp</span></code>）：v1 的 cco 路径
+<p>gfx125x 的 TDM body（<code class="docutils literal notranslate"><span class="pre">ep_intranode_1250x.hpp</span></code>）同样是从 v1 机械移植的：v1 的 cco 路径
 本来就把每块对称 buffer 从同一个 LSA window 里 bump 分配，和 SymmArena 是同一个内存模型，源码里的
 <code class="docutils literal notranslate"><span class="pre">shmem</span></code> 命名空间只是那层抽象加几个与后端无关的自旋。TDM 那套机器（<code class="docutils literal notranslate"><span class="pre">amd_gfx1250_TDM.h</span></code> builtin、
 <code class="docutils literal notranslate"><span class="pre">_cusplit_*</span></code> 设备全局暂存池）原样保留。范围收到 hip 后端能服务的部分：非量化的 TDM dispatch +
