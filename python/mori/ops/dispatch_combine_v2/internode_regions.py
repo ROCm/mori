@@ -102,6 +102,7 @@ def internode_regions(cfg):
         + _I32
         + scale_bytes
     )
+    xfer_bytes = (xfer_bytes + 15) // 16 * 16  # XferBytesPerToken pads to 16 B
 
     # maxNumOutToken, the stride of the order maps.
     max_out_token = world_size * max_tokens_to_send_per_rank * cfg.num_experts_per_rank
@@ -186,6 +187,7 @@ def asyncll_regions(cfg):
     hidden_bytes = cfg.hidden_dim * cfg.max_token_type_size
     scale_bytes = cfg.scale_dim * cfg.scale_type_size
     xfer_bytes = hidden_bytes + topk * _I32 + topk * _F32 + _I32 + scale_bytes
+    xfer_bytes = (xfer_bytes + 15) // 16 * 16  # XferBytesPerToken pads to 16 B
 
     send_slots = world_size * max_send_per_rank
     regions["inter_staging"] = send_slots * xfer_bytes

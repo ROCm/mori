@@ -151,6 +151,28 @@ def test_barrier_has_a_slot_per_sender_and_qp(name):
     assert sizes["cross_device_barrier"] >= cfg.world_size * (1 + cfg.num_qp_per_pe) * 8
 
 
+@pytest.mark.parametrize("name", sorted(_CASES))
+def test_dispatch_slots_use_the_padded_stride(name):
+    """``XferBytesPerToken`` pads a slot to 16 B, so the dispatch regions are sized
+    at that stride: ``nNodes * m`` receive slots and ``m`` send slots."""
+    cfg = _CASES[name]
+    sizes = dict(internode_regions(cfg))
+    n_nodes = cfg.world_size // cfg.gpu_per_node
+    m = cfg.max_num_inp_token_per_rank
+    topk = cfg.num_experts_per_token
+    raw = (
+        cfg.hidden_dim * cfg.max_token_type_size
+        + topk * 4
+        + topk * 4
+        + 4
+        + cfg.scale_dim * cfg.scale_type_size
+    )
+    xfer = (raw + 15) // 16 * 16
+    assert sizes["inter_dispatch_inp"] >= n_nodes * m * xfer
+    assert sizes["inter_dispatch_staging"] >= m * xfer
+    assert sizes["inter_staging"] >= n_nodes * m * xfer
+
+
 def test_gpu_per_node_must_divide_the_world():
     with pytest.raises(ValueError):
         internode_regions(_cfg(world_size=16, gpu_per_node=6))

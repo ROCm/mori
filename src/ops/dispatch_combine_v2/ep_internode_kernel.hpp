@@ -322,6 +322,42 @@ __device__ __forceinline__ int32_t EpInterNodeWaitGt(int32_t* addr, int32_t val)
   return observed;
 }
 
+// A staged token is [hidden | indices | weights | scales], contiguous: forward it as one round of
+// 16 B loads, then the stores. Needs every part 16 B-sized and at most 8 vectors per lane.
+template <size_t kHidden, size_t kIndex, size_t kWeight, size_t kScale>
+struct ForwardTokenVec16 {
+  static constexpr int kVecs = static_cast<int>((kHidden + kIndex + kWeight + kScale) / 16);
+  static constexpr int kPerLane = (kVecs + warpSize - 1) / warpSize;
+  static constexpr bool kUsable = (kHidden % 16 == 0) && (kIndex % 16 == 0) &&
+                                  (kWeight % 16 == 0) && (kScale % 16 == 0) && (kPerLane <= 8);
+  uint4 regs[kPerLane];
+
+  __device__ __forceinline__ void Load(const uint8_t* src) {
+    const int lane = threadIdx.x & (warpSize - 1);
+#pragma unroll
+    for (int u = 0; u < kPerLane; u++) {
+      const int v = lane + u * warpSize;
+      if (v < kVecs) regs[u] = reinterpret_cast<const uint4*>(src)[v];
+    }
+  }
+
+  __device__ __forceinline__ void Store(uint8_t* hidden, uint8_t* index, uint8_t* weight,
+                                        uint8_t* scale) const {
+    constexpr int h = kHidden / 16, ix = kIndex / 16, w = kWeight / 16;
+    const int lane = threadIdx.x & (warpSize - 1);
+#pragma unroll
+    for (int u = 0; u < kPerLane; u++) {
+      const int v = lane + u * warpSize;
+      if (v >= kVecs) continue;
+      uint8_t* dst = v < h            ? hidden + 16 * v
+                     : v < h + ix     ? index + 16 * (v - h)
+                     : v < h + ix + w ? weight + 16 * (v - h - ix)
+                                      : scale + 16 * (v - h - ix - w);
+      *reinterpret_cast<uint4*>(dst) = regs[u];
+    }
+  }
+};
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   EpDispatchInterNodeV2                                  */
 /* ---------------------------------------------------------------------------------------------- */
@@ -377,6 +413,21 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int t
     core::WarpCopy(
         args.reg(args.offOutScales)->template GetAs<uint8_t*>(destPe) + destTokId * scaleBytes,
         args.scalesBuf + tokenId * scaleBytes, scaleBytes);
+  }
+}
+
+// v2_ll intra-node blocks wait for this rank's RDMA posts, which their XGMI stores would slow;
+// bounded (50 us), so a grid that is not fully resident cannot deadlock on it.
+template <EpInterNodeKernelCfg kConfig, typename T>
+inline __device__ void WaitLLPostsIssued(EpDispatchCombineArgs& args) {
+  DEF_COMMON_VARS;
+  if (laneId != 0) return;
+  const int expected = (nNodes - 1) * core::CeilDiv(args.curRankNumToken, warpSize);
+  const uint64_t deadline = wall_clock64() + 5000;  // 50 us at the 100 MHz wall clock
+  while (wall_clock64() < deadline) {
+    int posted = 0;
+    for (int n = 0; n < nNodes; n++) posted += core::AtomicLoadRelaxed(args.blockFlagCounter + n);
+    if (posted >= expected) break;
   }
 }
 
@@ -561,25 +612,14 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
 
     for (int tokenId = chunkStartTokenIdx + laneId; tokenId < chunkEndTokenIdx;
          tokenId += warpSize) {
-      bool shouldSend = false;
-      for (int e = 0; e < config.numExpertPerToken; e++) {
-        int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
-                       config.numExpertPerRank / config.gpuPerNode;
-        if (destNode == i) {
-          shouldSend |= true;
-          args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
-        }
-      }
-
-      index_t flagSlotId = 0;
-      if (laneId == 0) {
-        flagSlotId = atomicAdd(args.blockFlagCounter + i, 1);
-      }
-      flagSlotId = __shfl(flagSlotId, 0);
-
+      // Every chunk goes to every node here, so slot k is chunk k and the slots are exactly
+      // 0 .. S-1 without an atomic to hand them out.
+      const index_t flagSlotId = (tokenId - laneId) / warpSize;
       index_t destTokIdOffset = flagSlotId * warpSize;
       index_t destTokId = destTokIdOffset + laneId;
 
+      // Post first: the routing bookkeeping below is read only by combine, and its dependent
+      // load per expert would otherwise hold back the chunk's RDMA write.
       size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokId);
       if (laneId == 0) {
         index_t tokenNum = std::min(tokenId + warpSize, chunkEndTokenIdx) - tokenId;
@@ -591,6 +631,18 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
             args.reg(args.offDispatchStaging), stagingTokOffset, tokenNum * xferBytes,
             args.reg(args.offChunkFlag), (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
             tokenNum + 1, proxyPe, qpId);
+        // Counted once posted: the node token signal reads it, and WaitLLPostsIssued waits on it.
+        atomicAdd(args.blockFlagCounter + i, 1);
+      }
+
+      bool shouldSend = false;
+      for (int e = 0; e < config.numExpertPerToken; e++) {
+        int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
+                       config.numExpertPerRank / config.gpuPerNode;
+        if (destNode == i) {
+          shouldSend |= true;
+          args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
+        }
       }
       if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
@@ -787,12 +839,11 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
         cachedNodeFlag = 0;
       }
       while (1) {
-        // Checked before chunkFlag, and that is only safe because of how the
-        // sender numbers its slots: DispatchInterNodeLLSend takes them from
-        // atomicAdd(blockFlagCounter + node, 1), so they are exactly
-        // 0 .. S-1, and nodeRecvTokenNum is S * warpSize + 1. A slot at or past
-        // that bound was never handed out and can never get a flag. Numbering
-        // the slots any other way would make this drop tokens silently.
+        // Checked before chunkFlag, and that is only safe because both senders number their
+        // slots 0 .. S-1 (DispatchInterNodeLLSend by chunk index, DispatchInterNodeSend by
+        // atomicAdd(blockFlagCounter)) and send nodeRecvTokenNum = S * warpSize + 1. A slot at
+        // or past that bound was never handed out and can never get a flag. Numbering the
+        // slots any other way would make this drop tokens silently.
         if ((cachedNodeFlag > 0) && (startTokenIdx >= (cachedNodeFlag - 1))) {
           thisChunkTokenNum = 1;
           break;
@@ -856,6 +907,13 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
       continue;
     }
 
+    // Whole-token vector forward: the loads go out before the slot atomic, so the two overlap.
+    constexpr size_t kH = config.HiddenBytes(sizeof(T)), kI = config.IndexBytes(),
+                     kW = config.WeightBytes(), kS = config.ScaleBytes();
+    using Forward = ForwardTokenVec16<kH, kI, kW, kS>;
+    [[maybe_unused]] Forward fwd;
+    if constexpr (Forward::kUsable) fwd.Load(stagingPtr + globalTokenId * xferBytes);
+
     int destTokId = 0;
     if (laneId == 0) {
       destTokId = atomicAdd(args.reg(args.offDispTokOffset)->template GetAs<index_t*>(destPe), 1);
@@ -867,6 +925,15 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
     }
     if ((destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
     destTokId = __shfl(destTokId, 0);
+    if constexpr (Forward::kUsable) {
+      fwd.Store(
+          args.reg(args.offDispatchOut)->template GetAs<uint8_t*>(destPe) + destTokId * kH,
+          args.reg(args.offOutIndices)->template GetAs<uint8_t*>(destPe) + destTokId * kI,
+          args.reg(args.offDispatchOutWeights)->template GetAs<uint8_t*>(destPe) + destTokId * kW,
+          kS > 0 ? args.reg(args.offOutScales)->template GetAs<uint8_t*>(destPe) + destTokId * kS
+                 : nullptr);
+      continue;
+    }
     core::WarpCopy<uint8_t, 4>(
         args.reg(args.offDispatchOut)->template GetAs<uint8_t*>(destPe) + destTokId * hiddenBytes,
         stagingPtr + globalTokenId * xferBytes, hiddenBytes);
@@ -1013,6 +1080,7 @@ __device__ void EpDispatchInterNodeV2LL_body(EpDispatchCombineArgs args,
     internode::DispatchInterNodeLLSend<kConfig, T>(args, comm);
     internode::DispatchInterNodeLLRecv<kConfig, T>(args);
   } else {
+    internode::WaitLLPostsIssued<kConfig, T>(args);
     internode::DispatchIntraNode<kConfig, T>(args);
   }
   internode::DispatchSync<kConfig, T>(args, comm);

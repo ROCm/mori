@@ -540,8 +540,8 @@ at 2048, dispatch flat, and still a wash after `Unroll=4` removed the real
 bottleneck. Two reasons, and the second is the general one:
 
 * Dispatch never reached the TDM path at all. `XferBytesPerToken` is
-  7168*2 + 32 + 32 + 4 = 14404, so the slot stride is 4-byte aligned and source
-  and destination never share a 128 B phase.
+  7168*2 + 32 + 32 + 4 = 14404, padded to 14416, so the slot stride is 16 B but
+  not 128 B aligned and source and destination never share a 128 B phase.
 * The same ualoe data says TDM's advantage is a *grid-width* one, and below
   about 1 MB neither transport is grid-limited -- there the CU path is often the
   faster of the two. AsyncLL's transfer hands each warp tens of KB, so it sits in
@@ -550,11 +550,10 @@ bottleneck. Two reasons, and the second is the general one:
   transfer pass has none.
 
 **Padding the slot stride to a 128 B row.** The alignment above is real, and
-fixing it (`XferBytesPerToken` rounded up to 128, with `internode_regions.py`
-following) is worth ~3.4% on the dispatch half and ~1% on the pair, measured in
-the same matrix. Not taken here because it changes the arena layout shared with
-the v2 / v2_ll families for a gain that `Unroll=4` dwarfs; it is a reasonable
-separate change.
+fixing it (`XferBytesPerToken` rounded up to 128 rather than 16, with
+`internode_regions.py` following) is worth ~3.4% on the dispatch half and ~1% on
+the pair, measured in the same matrix. Not taken here: the gain is small next to
+`Unroll=4`, and it is a reasonable separate change.
 
 ### Reproducing
 
