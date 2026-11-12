@@ -122,6 +122,57 @@ def as_bytes(t):
     return t.view(torch.uint8)
 
 
+def small_grid_scales(d, comm, dev):
+    ct, k = 128, 8
+    num_experts = d.world * EPR
+    g = torch.Generator(device="cpu").manual_seed(4321 + d.rank)
+    idx = torch.randint(0, num_experts, (ct, k), generator=g, dtype=torch.int32).to(dev)
+    wts = torch.rand(ct, k, generator=g, dtype=torch.float32).to(dev)
+    sc_n_i32 = (SCALE_DIM + 3) // 4
+    scales = (
+        (torch.arange(ct, device=dev) + d.rank * 100003)
+        .view(ct, 1)
+        .expand(ct, sc_n_i32)
+        .contiguous()
+        .to(torch.int32)
+        .view(torch.uint8)
+    )
+    cfg = EpDispatchCombineConfig(
+        rank=d.rank,
+        world_size=d.world,
+        hidden_dim=HIDDEN,
+        max_num_inp_token_per_rank=ct,
+        num_experts_per_rank=EPR,
+        num_experts_per_token=k,
+        dispatch_data_type=DISP,
+        combine_data_type=torch.bfloat16,
+        combine_mode="gather",
+        scale_dim=SCALE_DIM,
+        scale_type_size=1,
+        dispatch_block_num=8,
+        warp_num_per_block=4,
+    )
+    with EpDispatchCombineOp(cfg, comm) as op:
+        comm.barrier()
+        _x, _w, out_s, _i, total_recv_t, routing = op.dispatch(
+            gen_inp(d.rank, ct).to(dev), wts, scales, idx, return_routing=True
+        )
+        total_recv = int(total_recv_t.cpu().item())
+        sync()
+        comm.barrier()
+        tis = routing.disp_tok_id_to_src_tok_id_local[:total_recv].cpu().long()
+        exp_sc = ((tis // ct) * 100003 + (tis % ct)).view(total_recv, 1)
+        got_sc = out_s[:total_recv].cpu()
+        ok_sc = bool(torch.equal(got_sc, exp_sc.expand(total_recv, sc_n_i32)))
+        errs_sc = d.allreduce_sum(0 if ok_sc else 1)
+    if d.rank == 0:
+        print(
+            f"# ASYM-SCALES({_TAG}) grid=8x4 topk={k} ct={ct}: "
+            f"{'PASS' if errs_sc == 0 else 'FAIL'} (recv={total_recv})",
+            flush=True,
+        )
+
+
 def main():
     d = Dist()
     rank, npes = d.rank, d.world
@@ -158,6 +209,8 @@ def main():
     with Communicator.init(
         npes, rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)
     ) as comm:
+        if SCALE_DIM:
+            small_grid_scales(d, comm, dev)
         cfg = EpDispatchCombineConfig(
             rank=rank,
             world_size=npes,
