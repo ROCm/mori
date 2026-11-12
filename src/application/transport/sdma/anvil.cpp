@@ -222,10 +222,27 @@ uint32_t hsakmtNodeForKfdNode(int node) {
   exit(EXIT_FAILURE);
 }
 
-}  // namespace
+// HDP_MEM_FLUSH_CNTL of the GPU at a KFD node, matched to its HSA agent by gpu_id.
+// Null if the agent is not found or the GPU exposes no register.
+volatile uint32_t* hdpFlushRegister(int node) {
+  const uint64_t gpuId = kfdGpuId(node);
+  for (const hsa_agent_t& agent : gpuAgents_) {
+    uint32_t uid = 0;
+    if (hsa_agent_get_info(agent, static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_DRIVER_UID),
+                           &uid) != HSA_STATUS_SUCCESS ||
+        uid != gpuId)
+      continue;
+    hsa_amd_hdp_flush_t hdp{};
+    if (hsa_agent_get_info(agent, static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_HDP_FLUSH),
+                           &hdp) != HSA_STATUS_SUCCESS)
+      return nullptr;
+    return hdp.HDP_MEM_FLUSH_CNTL;
+  }
+  return nullptr;
+}
 
-SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
-  // Allocate SDMA queue buffer on device side, requires ExecuteAccess
+// Memory for an SDMA queue's ring: VRAM the host can map and the engine can execute.
+HsaMemFlags ringMemFlags() {
   HsaMemFlags memFlags = {};
   memFlags.ui32.NonPaged = 1;
   memFlags.ui32.HostAccess = 1;
@@ -233,6 +250,14 @@ SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
   memFlags.ui32.NoNUMABind = 1;
   memFlags.ui32.ExecuteAccess = 1;
   memFlags.ui32.Uncached = 1;
+  return memFlags;
+}
+
+}  // namespace
+
+SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) : engineId_(engineId) {
+  // Allocate SDMA queue buffer on device side, requires ExecuteAccess
+  HsaMemFlags memFlags = ringMemFlags();
 
   // std::cout << "Allocating SDMA Queue Buffer for device: " << hsakmtNodeId << std::endl <<
   // std::flush;
@@ -279,14 +304,65 @@ SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
 
 SdmaQueue::~SdmaQueue() {
   CHECK_HSAKMT_SUCCESS(hsaKmtDestroyQueue(queue_.QueueId), "Failed to destroy queue.");
-  CHECK_HIP_ERROR(hipFree(deviceHandle_));
-  CHECK_HIP_ERROR(hipFree(cachedWptr_));
-  CHECK_HIP_ERROR(hipFree(committedWptr_));
+  if (deviceHandle_ != nullptr) {
+    CHECK_HIP_ERROR(hipFree(deviceHandle_));
+    CHECK_HIP_ERROR(hipFree(cachedWptr_));
+    CHECK_HIP_ERROR(hipFree(committedWptr_));
+  }
   CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(queueBuffer_), "Failed");
-  CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE), "Failed");
+  CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(queueBuffer_, ringBytes_), "Failed");
+}
+
+std::unique_ptr<SdmaQueue> SdmaQueue::CreatePrivate(uint32_t hsakmtNodeId, uint32_t engineId,
+                                                    uint64_t ringBytes,
+                                                    volatile uint32_t* hdpFlush) {
+  if (ringBytes < 4096 || (ringBytes & (ringBytes - 1)) != 0) {
+    MORI_APP_ERROR("SDMA: private queue ring of {} bytes is not a power of two >= 4096", ringBytes);
+    return nullptr;
+  }
+  void* ring = nullptr;
+  HsaQueueResource res{};
+  HSAKMT_STATUS st = hsaKmtAllocMemory(hsakmtNodeId, ringBytes, ringMemFlags(), &ring);
+  if (st != HSAKMT_STATUS_SUCCESS) {
+    MORI_APP_ERROR("SDMA: ring allocation of {} bytes failed ({})", ringBytes,
+                   static_cast<int>(st));
+    return nullptr;
+  }
+  st = hsaKmtMapMemoryToGPU(ring, ringBytes, NULL);
+  if (st != HSAKMT_STATUS_SUCCESS) {
+    MORI_APP_ERROR("SDMA: mapping a {}-byte ring failed ({})", ringBytes, static_cast<int>(st));
+    (void)hsaKmtFreeMemory(ring, ringBytes);
+    return nullptr;
+  }
+  st = hsaKmtCreateQueueExt(hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
+                            engineId, ring, ringBytes, nullptr, &res);
+  if (st != HSAKMT_STATUS_SUCCESS) {
+    MORI_APP_ERROR("SDMA: no queue on engine {} ({}); its slots may be taken", engineId,
+                   static_cast<int>(st));
+    (void)hsaKmtUnmapMemoryToGPU(ring);
+    (void)hsaKmtFreeMemory(ring, ringBytes);
+    return nullptr;
+  }
+  std::unique_ptr<SdmaQueue> q(new SdmaQueue());
+  q->queueBuffer_ = ring;
+  q->ringBytes_ = ringBytes;
+  q->engineId_ = engineId;
+  q->hdpFlush_ = hdpFlush;
+  q->queue_ = res;
+  return q;
 }
 
 SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const { return deviceHandle_; }
+
+SdmaQueueHostHandle SdmaQueue::hostHandle() const {
+  return SdmaQueueHostHandle{static_cast<uint32_t*>(queueBuffer_),
+                             ringBytes_,
+                             reinterpret_cast<volatile uint64_t*>(queue_.Queue_read_ptr_aql),
+                             reinterpret_cast<volatile uint64_t*>(queue_.Queue_write_ptr_aql),
+                             reinterpret_cast<volatile uint64_t*>(queue_.Queue_DoorBell_aql),
+                             hdpFlush_,
+                             engineId_};
+}
 
 AnvilLib::~AnvilLib() {
   for (auto& p : sdma_channels_) {
@@ -347,11 +423,7 @@ void AnvilLib::init() {
   return -1;
 }
 
-bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
-  std::lock_guard<std::mutex> lock(channels_mutex_);
-  // Spread the channels across the engines recommended for this peer link. On
-  // MI350 the mask typically reports 2 engines per peer; on platforms with a
-  // single recommended engine all channels share it.
+std::vector<uint32_t> AnvilLib::linkEngines(int srcNode, int dstNode) {
   std::vector<uint32_t> engines;
   engines.reserve(2);
   if (srcNode == dstNode) {
@@ -404,7 +476,15 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
     }
     engines.swap(evenEngines);
   }
+  return engines;
+}
 
+bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
+  std::lock_guard<std::mutex> lock(channels_mutex_);
+  // Spread the channels across the engines recommended for this peer link. On
+  // MI350 the mask typically reports 2 engines per peer; on platforms with a
+  // single recommended engine all channels share it.
+  std::vector<uint32_t> engines = linkEngines(srcNode, dstNode);
   int numEngines = static_cast<int>(engines.size());
 
   // Queues live in this process-global singleton and are shared across every
@@ -422,6 +502,36 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
     }
   }
   return true;
+}
+
+std::unique_ptr<SdmaQueue> AnvilLib::createPrivateQueue(int srcNode, int dstNode, int engineOffset,
+                                                        uint64_t ringBytes) {
+  // No lock: this touches no shared channel state (the queue belongs to the caller).
+  init();
+  std::vector<uint32_t> engines = linkEngines(srcNode, dstNode);
+  uint32_t engineId = engines.front();
+  if (engineOffset != 0) {
+    // Stay within the engine's class: general engines (0..nGeneral-1, shared with the
+    // runtime's own copy queues) or xGMI engines (nGeneral..nGeneral+nXgmi-1).
+    const uint64_t nGeneral = kfdNodeProperty(srcNode, "num_sdma_engines");
+    const uint64_t nXgmi = kfdNodeProperty(srcNode, "num_sdma_xgmi_engines");
+    const bool xgmi = engineId >= nGeneral;
+    const uint64_t first = xgmi ? nGeneral : 0;
+    const uint64_t count = xgmi ? nXgmi : nGeneral;
+    if (engineOffset < 0 || count == 0 || engineId >= nGeneral + nXgmi) {
+      MORI_APP_ERROR("SDMA: engine offset {} invalid for engine {} of node {}", engineOffset,
+                     engineId, srcNode);
+      return nullptr;
+    }
+    engineId = static_cast<uint32_t>(first + (engineId - first + engineOffset) % count);
+    // See connect(): an odd engine on MI308X is fused off and hangs.
+    if (isMi308x(srcNode) && (engineId & 1u)) {
+      MORI_APP_ERROR("SDMA: engine {} does not exist on MI308X", engineId);
+      return nullptr;
+    }
+  }
+  return SdmaQueue::CreatePrivate(hsakmtNodeForKfdNode(srcNode), engineId, ringBytes,
+                                  hdpFlushRegister(srcNode));
 }
 
 uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {
