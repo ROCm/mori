@@ -73,3 +73,13 @@ ARG WITH_FLYDSL=0
 # builds this image with an older one to keep those paths covered.
 ARG FLYDSL_VERSION=0.4.0
 RUN if [ "${WITH_FLYDSL}" = "1" ]; then pip install --no-cache-dir "flydsl==${FLYDSL_VERSION}"; fi
+
+# ci_cco.yml's fused GEMM job runs its single-GPU and 2-/4-rank cases under xdist.
+RUN pip install --no-cache-dir "pytest-xdist==3.8.0"
+
+# Last, so adding them does not rebuild the layers above. setup.py compiles
+# through ccache when it is on PATH (ci_run.sh keeps the cache in a volume), and
+# the internode jobs pin ranks with numactl.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ccache numactl && \
+    rm -rf /var/lib/apt/lists/*

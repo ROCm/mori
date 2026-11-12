@@ -85,41 +85,51 @@ def _spawn(*args: str, timeout: int = 900, last: bool = False, env=None):
         raise AssertionError(output[-4000:])
     lines = [ln for ln in output.splitlines() if ln.startswith("RESULT_JSON ")]
     assert lines, output[-4000:]
-    return json.loads(lines[-1].removeprefix("RESULT_JSON "))
+    return {
+        r["case"]: r["ranks"]
+        for r in (json.loads(ln.removeprefix("RESULT_JSON ")) for ln in lines)
+    }
+
+
+def _run_cases(*args: str, env=None):
+    """{case: per-rank results} of one launch."""
+    recs = _spawn(*args, env=env)
+    if recs is None:
+        time.sleep(_SETTLE_SECONDS * 3)
+        recs = _spawn(*args, last=True, env=env)
+    return recs
 
 
 def _run(*args: str, env=None):
-    rec = _spawn(*args, env=env)
-    if rec is None:
-        time.sleep(_SETTLE_SECONDS * 3)
-        rec = _spawn(*args, last=True, env=env)
-    return rec["ranks"]
+    return next(iter(_run_cases(*args, env=env).values()))
+
+
+@pytest.fixture(scope="module")
+def cases():
+    """Every case but reject, keyed "case/mode", from one 8-rank launch."""
+    return _run_cases("--case", "all")
 
 
 @requires_world
-def test_self_test_sees_every_peer():
-    assert all(r["ok"] for r in _run("--case", "self_test"))
+def test_self_test_sees_every_peer(cases):
+    assert all(r["ok"] for r in cases["self_test"])
 
 
 @requires_world
 @pytest.mark.parametrize("mode", ["fused", "split"])
-def test_op_lands_at_the_fp8_floor(mode):
+def test_op_lands_at_the_fp8_floor(mode, cases):
     """Four M on one instance (1, 2 and 4 bands, both wait modes), a call from
     ``send_buffer``, then graph replays with fresh inputs."""
-    ranks = _run("--case", "correct", "--mode", mode)
+    ranks = cases[f"correct/{mode}"]
     bad = [(i, r["checks"]) for i, r in enumerate(ranks) if not r["ok"]]
     assert not bad, bad
 
 
 @requires_world
 @pytest.mark.parametrize("mode", ["fused", "split"])
-def test_back_to_back_with_a_late_rank(mode):
+def test_back_to_back_with_a_late_rank(mode, cases):
     """No host sync between calls, and a different rank 20 ms late each time."""
-    bad = [
-        (i, r["rels"])
-        for i, r in enumerate(_run("--case", "skew", "--mode", mode))
-        if not r["ok"]
-    ]
+    bad = [(i, r["rels"]) for i, r in enumerate(cases[f"skew/{mode}"]) if not r["ok"]]
     assert not bad, bad
 
 

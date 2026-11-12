@@ -799,45 +799,42 @@ class EpDispatchCombineTestCase:
             return unpack_fp4x2(dispatch_output, dtype=self.combine_data_type)
         return dispatch_output.to(self.combine_data_type)
 
+    def _dst_rank_hits(self, indices):
+        """[tokens, world] bool: the ranks each token goes to (-1 slots go nowhere)."""
+        valid = indices >= 0
+        dst = torch.where(valid, indices // self.config.num_experts_per_rank, 0).long()
+        hits = torch.zeros(
+            indices.shape[0],
+            self.config.world_size,
+            dtype=torch.int32,
+            device=indices.device,
+        )
+        return hits.scatter_add_(1, dst, valid.int()) > 0
+
     def count_token_num(self, all_rank_indices):
+        ws = self.config.world_size
+        gpn = self.config.gpu_per_node
+        node_of = torch.arange(ws, device=self.device) // gpn
+        num_nodes = (ws + gpn - 1) // gpn
         # Per-rank counts
-        rank_counts = torch.zeros(
-            self.config.world_size, dtype=torch.int32, device=self.device
-        )
-        rank_counts_remote_recv = torch.zeros(
-            self.config.world_size, dtype=torch.int32, device=self.device
-        )
-        rank_counts_remote_send = torch.zeros(
-            self.config.world_size, dtype=torch.int32, device=self.device
-        )
+        rank_counts = torch.zeros(ws, dtype=torch.int32, device=self.device)
+        rank_counts_remote_recv = torch.zeros_like(rank_counts)
+        rank_counts_remote_send = torch.zeros_like(rank_counts)
 
         for src_rank, indices in enumerate(all_rank_indices):
-            src_node = src_rank // self.config.gpu_per_node
-
-            # Per token, map valid expert IDs to destination ranks (skip -1 sentinels).
-            for row in indices:
-                valid_experts = row[row >= 0]
-                if valid_experts.numel() == 0:
-                    continue
-                ur = torch.unique(valid_experts // self.config.num_experts_per_rank)
-
-                rank_counts[ur] += 1  # All ranks that receive this token
-
-                dst_nodes = {
-                    int(dst_rank // self.config.gpu_per_node)
-                    for dst_rank in ur.tolist()
-                }
-
-                for dst_rank in ur.tolist():
-                    dst_node = dst_rank // self.config.gpu_per_node
-                    if dst_node != src_node:
-                        # Receiving side
-                        rank_counts_remote_recv[dst_rank] += 1
-
-                # Sending side (dedup by node: count once if token goes to a remote node)
-                for dst_node in dst_nodes:
-                    if dst_node != src_node:
-                        rank_counts_remote_send[src_rank] += 1
+            src_node = src_rank // gpn
+            hits = self._dst_rank_hits(indices)
+            # All ranks that receive each token, and those of them on another node
+            rank_counts += hits.sum(dim=0, dtype=torch.int32)
+            rank_counts_remote_recv += (hits & (node_of != src_node)).sum(
+                dim=0, dtype=torch.int32
+            )
+            # Sending side (dedup by node: count once if token goes to a remote node)
+            node_hits = torch.zeros(
+                hits.shape[0], num_nodes, dtype=torch.int32, device=self.device
+            ).index_add_(1, node_of, hits.int())
+            per_node = (node_hits > 0).sum(dim=0, dtype=torch.int32)
+            rank_counts_remote_send[src_rank] += per_node.sum() - per_node[src_node]
 
         if self.config.rank == 0:
             print("Rank counts (deduplicated):", rank_counts)
@@ -908,6 +905,102 @@ class EpDispatchCombineTestCase:
             )
         return ret
 
+    def _check_combine(
+        self,
+        all_rank_num_token,
+        all_rank_indices,
+        all_rank_input,
+        all_rank_weights,
+        combine_output,
+        combine_output_weight,
+    ):
+        """Each of this rank's tokens comes back summed once per distinct rank it
+        went to; torch.allclose per token, for all tokens at once."""
+        combine_data_type = self.combine_data_type
+        n = int(all_rank_num_token[self.rank])
+        indices = all_rank_indices[self.rank][:n]
+        unique_pes = self._dst_rank_hits(indices).sum(dim=1)
+        routed = unique_pes > 0
+
+        inp = all_rank_input[self.rank][:n]
+        if _is_fp4x2_dtype(self.dispatch_data_type):
+            inp_converted = unpack_fp4x2(inp, dtype=combine_data_type)
+        else:
+            inp_converted = inp.to(combine_data_type)
+        expected = (inp_converted.to(torch.float32) * unique_pes[:, None]).to(
+            combine_data_type
+        )
+
+        atol, rtol = 1e-2, 1e-2
+        if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
+            atol, rtol = 1e-1, 1e-1
+        tol = torch.full((n,), atol, device=self.device)
+        if combine_data_type in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ):
+            tol = (2.0 * unique_pes).clamp(min=atol)
+            rtol = max(rtol, 0.15)
+        got, want = combine_output[:n].float(), expected.float()
+        # torch.isclose with a per-token atol: equal, or within tolerance. A NaN is
+        # never close, so it fails the token.
+        close = (got == want) | ((got - want).abs() <= tol[:, None] + rtol * want.abs())
+        bad = torch.nonzero(routed & ~close.all(dim=1)).flatten()
+        if bad.numel():
+            i = int(bad[0])
+            pes = [
+                idx // self.config.num_experts_per_rank
+                for idx in indices[i].tolist()
+                if idx >= 0
+            ]
+            unique_innode_pes = len(
+                [
+                    pe
+                    for pe in set(pes)
+                    if (pe // self.gpu_per_node == self.rank // self.gpu_per_node)
+                ]
+            )
+            print(
+                self.rank,
+                f"token {i} pes {pes} unique pes {len(set(pes))} unique innode pes "
+                f"{unique_innode_pes} ({bad.numel()} tokens bad)",
+            )
+            print(
+                f"{self.rank} got: ",
+                combine_output[i],
+                f"{self.rank} expected: ",
+                expected[i],
+                all_rank_input[self.rank][i],
+            )
+            assert False
+
+        if combine_output_weight is not None:
+            got_weight = combine_output_weight[:n]
+            expected_weight = all_rank_weights[self.rank][:n] * unique_pes[:, None]
+            bad = torch.nonzero(
+                routed
+                & ~torch.isclose(got_weight, expected_weight, atol=1e-5, rtol=1e-5).all(
+                    dim=1
+                )
+            ).flatten()
+            if bad.numel():
+                i = int(bad[0])
+                if self.config.rank == 0:
+                    print(f"Weight mismatch for token {i} ({bad.numel()} tokens bad):")
+                    print(f"  indices[{i}]: {indices[i].tolist()}")
+                    print(f"  unique_pes: {int(unique_pes[i])}")
+                    print(f"  got_weight: {got_weight[i]}")
+                    print(
+                        f"  expected_weight (weights[{i}] * {int(unique_pes[i])}): "
+                        f"{expected_weight[i]}"
+                    )
+                    print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
+                    print(f"  diff: {torch.abs(got_weight[i] - expected_weight[i])}")
+                    print(
+                        f"  max_diff: {torch.abs(got_weight[i] - expected_weight[i]).max()}"
+                    )
+                assert False, f"Weight assertion failed for token {i}"
+
     def run_test_once(self, op, test_data, error_round, round):
         (
             all_rank_num_token,
@@ -934,9 +1027,8 @@ class EpDispatchCombineTestCase:
 
         rank_counts, _, _ = self.count_token_num(all_rank_indices)
 
-        src_token_pos = op.get_dispatch_src_token_pos().tolist()
-        # max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
-        recv_token_num = len(src_token_pos)
+        src_token_pos = op.get_dispatch_src_token_pos()
+        recv_token_num = src_token_pos.numel()
 
         # Check recv token num
         print(f"rank {self.rank} recv {recv_token_num} tokens")
@@ -947,31 +1039,46 @@ class EpDispatchCombineTestCase:
             )
             assert False
 
-        # Check token equality
-        for i, src_token_id in enumerate(src_token_pos):
-            src_pe, src_tok_id = op.decode_send_flat_idx(src_token_id)
-            if _is_fp4x2_dtype(self.config.data_type):
-                is_pass = torch.equal(
-                    dispatch_output[i].view(torch.uint8),
-                    all_rank_input[src_pe][src_tok_id].view(torch.uint8),
-                )
-            else:
-                is_pass = torch.equal(
-                    dispatch_output[i], all_rank_input[src_pe][src_tok_id]
-                )
-            if not is_pass:
+        # Check token equality: every received row against the row it was sent
+        # from, all rows at once (decode_send_flat_idx, vectorized).
+        stride = op.max_num_tokens_to_send()
+        pos = src_token_pos.long()
+        src_pe, src_tok = pos // stride, pos % stride
+        num_token = all_rank_num_token.long()
+        in_range = (src_pe < self.world_size) & (
+            src_tok < num_token[src_pe.clamp(max=self.world_size - 1)]
+        )
+        assert bool(in_range.all()), (
+            f"rank {self.rank} received rows from no sent token: "
+            f"{pos[~in_range][:8].tolist()}"
+        )
+        sent_row = (torch.cumsum(num_token, 0) - num_token)[src_pe] + src_tok
+
+        def check_rows(name, got, per_rank, as_bytes=False):
+            want = torch.cat(per_rank)[sent_row]
+            got = got[:recv_token_num]
+            if as_bytes:
+                got, want = got.view(torch.uint8), want.view(torch.uint8)
+            bad = torch.nonzero((got != want).any(dim=1)).flatten()
+            if bad.numel():
+                i = int(bad[0])
                 print(
-                    f"rank {self.rank} token {i} assert {is_pass} expected {all_rank_input[src_pe][src_tok_id].view(torch.uint8)} got {dispatch_output[i].view(torch.uint8)}"
+                    f"rank {self.rank} {name} {i} of {recv_token_num} wrong "
+                    f"(from pe {int(src_pe[i])} token {int(src_tok[i])}), "
+                    f"{bad.numel()} rows bad: expected {want[i]} got {got[i]}"
                 )
                 assert False
-            if dispatch_weights is not None:
-                assert torch.equal(
-                    dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
-                )
-            assert torch.equal(
-                dispatch_indices[i], all_rank_indices[src_pe][src_tok_id]
-            )
-            assert torch.equal(dispatch_scales[i], all_rank_scales[src_pe][src_tok_id])
+
+        check_rows(
+            "token",
+            dispatch_output,
+            all_rank_input,
+            as_bytes=_is_fp4x2_dtype(self.config.data_type),
+        )
+        if dispatch_weights is not None:
+            check_rows("weights of token", dispatch_weights, all_rank_weights)
+        check_rows("indices of token", dispatch_indices, all_rank_indices)
+        check_rows("scales of token", dispatch_scales, all_rank_scales)
 
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
@@ -985,91 +1092,15 @@ class EpDispatchCombineTestCase:
         )
         torch.cuda.synchronize()
         combine_data_type = self.combine_data_type
-        for i in range(all_rank_num_token[self.rank]):
-            if _is_fp4x2_dtype(combine_data_type):
-                continue
-            pes = [
-                (idx // self.config.num_experts_per_rank)
-                for idx in all_rank_indices[self.rank][i].cpu().tolist()
-                if idx >= 0
-            ]
-            unique_pes = len(set(pes))
-            unique_innode_pes = len(
-                [
-                    pe
-                    for pe in set(pes)
-                    if (pe // self.gpu_per_node == self.rank // self.gpu_per_node)
-                ]
+        if not _is_fp4x2_dtype(combine_data_type):
+            self._check_combine(
+                all_rank_num_token,
+                all_rank_indices,
+                all_rank_input,
+                all_rank_weights,
+                combine_output,
+                combine_output_weight if dispatch_weights is not None else None,
             )
-            final_unique_pes = unique_pes
-            if final_unique_pes == 0:
-                continue
-
-            inp = all_rank_input[self.rank][i]
-            if _is_fp4x2_dtype(self.dispatch_data_type):
-                inp_converted = unpack_fp4x2(
-                    inp.unsqueeze(0), dtype=combine_data_type
-                ).squeeze(0)
-            else:
-                inp_converted = inp.to(combine_data_type)
-
-            got, expected = (
-                combine_output[i],
-                (inp_converted.to(torch.float32) * final_unique_pes).to(
-                    combine_data_type
-                ),
-            )
-
-            atol, rtol = 1e-2, 1e-2
-            if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
-                atol, rtol = 1e-1, 1e-1
-            if combine_data_type in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-            ):
-                atol = max(atol, 2.0 * final_unique_pes)
-                rtol = max(rtol, 0.15)
-            ok = torch.allclose(got.float(), expected.float(), atol=atol, rtol=rtol)
-            if not ok:
-                print(
-                    self.rank,
-                    f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
-                )
-                print(
-                    f"{self.rank} got: ",
-                    got,
-                    f"{self.rank} expected: ",
-                    expected,
-                    all_rank_input[self.rank][i],
-                )
-                assert False
-                # pass
-
-            if dispatch_weights is not None:
-                got_weight, expected_weight = (
-                    combine_output_weight[i],
-                    all_rank_weights[self.rank][i] * final_unique_pes,
-                )
-                weight_match = torch.allclose(
-                    got_weight, expected_weight, atol=1e-5, rtol=1e-5
-                )
-                if not weight_match and self.config.rank == 0:
-                    print(f"Weight mismatch for token {i}:")
-                    print(
-                        f"  indices[{i}]: {all_rank_indices[self.rank][i].cpu().tolist()}"
-                    )
-                    print(f"  pes: {pes}")
-                    print(f"  unique_pes: {unique_pes}")
-                    print(f"  got_weight: {got_weight}")
-                    print(
-                        f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
-                    )
-                    print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
-                    print(f"  diff: {torch.abs(got_weight - expected_weight)}")
-                    print(
-                        f"  max_diff: {torch.abs(got_weight - expected_weight).max()}"
-                    )
-                assert weight_match, f"Weight assertion failed for token {i}"
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Combine Pass")
 

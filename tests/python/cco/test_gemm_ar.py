@@ -218,6 +218,7 @@ def test_scatter_scale_granularity_is_finer_than_per_row():
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.single_gpu
 @pytest.mark.parametrize("m,n,k", [(512, 512, 256), (1024, 768, 512)])
 def test_ptpc_matches_an_fp32_reference(m, n, k):
     """The per-token/per-channel path, against fp32 done in torch.
@@ -272,6 +273,7 @@ def test_ptpc_matches_an_fp32_reference(m, n, k):
     )
 
 
+@pytest.mark.single_gpu
 @pytest.mark.parametrize("m,n,k", [(4096, 7168, 256), (16384, 7168, 512)])
 def test_ptpc_tail_reads_complete_lds(m, n, k):
     """The peeled tail must not read LDS its producing loads have not finished.
@@ -336,6 +338,7 @@ def test_ptpc_tail_reads_complete_lds(m, n, k):
     )
 
 
+@pytest.mark.single_gpu
 @pytest.mark.parametrize("m,n,k", [(1024, 512, 512), (2048, 7168, 2048)])
 def test_blockscale_lands_at_the_fp8_floor(m, n, k):
     """``quant="blockscale"`` -- the model's quantisation -- against fp32.
@@ -417,6 +420,7 @@ def test_blockscale_lands_at_the_fp8_floor(m, n, k):
     assert rel < 3e-3, f"blockscale relL2 {rel:.3e} against the fp32 reference"
 
 
+@pytest.mark.single_gpu
 @pytest.mark.parametrize("scale_prefetch", [None, True])
 @pytest.mark.parametrize("quant", ["mxfp8", "mxfp8_raw"])
 @pytest.mark.parametrize(
@@ -431,7 +435,7 @@ def test_blockscale_lands_at_the_fp8_floor(m, n, k):
         (1024, 512, 640),
         (2048, 5120, 1280),
         (2048, 5120, 2048),
-        (512, 512, 8192),
+        pytest.param(512, 512, 8192, marks=pytest.mark.ci_full),
     ],
 )
 def test_mxfp8_lands_at_the_fp8_floor(m, n, k, quant, scale_prefetch):
@@ -544,8 +548,12 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k, quant, scale_prefetch):
     assert rel < 3e-3, f"{quant} relL2 {rel:.3e} against the fp32 reference"
 
 
+@pytest.mark.single_gpu
 @pytest.mark.parametrize("block_n", [128, 256])
-@pytest.mark.parametrize("m,n,k", [(1024, 5120, 4096), (512, 1024, 8192)])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [(1024, 5120, 4096), pytest.param(512, 1024, 8192, marks=pytest.mark.ci_full)],
+)
 def test_scale_prefetch_is_bitwise_identical_on_both_tiles(m, n, k, block_n):
     """Prefetch on by default against forced off, on both N tiles.
 
@@ -615,7 +623,8 @@ def test_scale_prefetch_is_bitwise_identical_on_both_tiles(m, n, k, block_n):
             assert torch.equal(got, ref), (prefetch, i)
 
 
-@pytest.mark.parametrize("k", [4096, 8192])
+@pytest.mark.single_gpu
+@pytest.mark.parametrize("k", [4096, pytest.param(8192, marks=pytest.mark.ci_full)])
 def test_fused_kernel_compiles_with_the_default_scale_prefetch(k, monkeypatch):
     """The fused all-reduce kernel at K past ``SCALE_PREFETCH_MIN_K``, built
     the way ``GemmAllReduceOp`` builds it, so the prefetch is on by default.
@@ -681,6 +690,7 @@ def test_scale_prefetch_refuses_a_quant_without_mxfp8_scales(quant):
         )
 
 
+@pytest.mark.single_gpu
 @pytest.mark.parametrize("m,n,k", [(512, 512, 256), (4096, 7168, 1024)])
 def test_swap_ab_is_bitwise_identical(m, n, k):
     """Exchanging the MFMA operands must not change a single bit.
@@ -879,6 +889,7 @@ def test_fused_is_stable_across_repeats():
     assert all(v < 5e-3 for v in seen), seen
 
 
+@pytest.mark.gpu_group
 @pytest.mark.parametrize("mode", ["split-sdma", "fused-sdma", "split-lsa"])
 def test_gemm_ar_modes_agree(mode):
     """All three paths must land on the same all-reduced result.
@@ -898,6 +909,7 @@ def test_gemm_ar_modes_agree(mode):
     assert record["rel_l2"] < 5e-3
 
 
+@pytest.mark.gpu_group
 @pytest.mark.parametrize(
     "mode,k,extra",
     [

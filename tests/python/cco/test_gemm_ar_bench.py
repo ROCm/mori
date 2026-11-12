@@ -57,44 +57,40 @@ SMOKE = dict(world_size=8, m=4096, n=1024, k=512)
 MODEL_SHAPE = dict(world_size=8, m=16384, n=7168, k=2048)
 
 
-def _run(world_size, mode, m, n, k, quant="blockscale", iters=11):
+DRIVER = Path(__file__).with_name("bench_runs.py")
+MODES = ("gemm-only", "split-sdma", "fused-sdma")
+
+
+def _run(modes, world_size, m, n, k, quant="blockscale", iters=11):
+    """{mode: record} of bench_gemm_ar.py, every mode from one launch."""
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
+    shape = ["--quant", quant, "-m", str(m), "-n", str(n), "-k", str(k)]
+    shape += ["--warmup", "3", "--iters", str(iters)]
     command = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--standalone",
         f"--nproc_per_node={world_size}",
+        str(DRIVER),
         str(BENCH),
-        "--mode",
-        mode,
-        "--quant",
-        quant,
-        "-m",
-        str(m),
-        "-n",
-        str(n),
-        "-k",
-        str(k),
-        "--warmup",
-        "3",
-        "--iters",
-        str(iters),
+        json.dumps([["--mode", mode, *shape] for mode in modes]),
     ]
     result = subprocess.run(
         command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=1800
     )
     output = result.stdout + result.stderr
-    assert result.returncode == 0, output
     records = [
         json.loads(line.removeprefix("RESULT_JSON "))
         for line in output.splitlines()
         if line.startswith("RESULT_JSON ")
     ]
-    assert len(records) == 1, output
-    return records[0]
+    assert len(records) == len(modes), output
+    # A failed validation is each test's to report; any other non-zero exit is not.
+    assert result.returncode == 0 or not all(r["validated"] for r in records), output
+    return dict(zip(modes, records))
 
 
 def _require(world_size):
@@ -102,11 +98,16 @@ def _require(world_size):
         pytest.skip(f"requires {world_size} GPUs")
 
 
-@pytest.mark.parametrize("mode", ["gemm-only", "split-sdma", "fused-sdma"])
-def test_mode_is_accurate_and_reports_a_time(mode):
-    """Every mode computes the right thing, and says how long it took."""
+@pytest.fixture(scope="module")
+def smoke():
     _require(SMOKE["world_size"])
-    r = _run(mode=mode, **SMOKE)
+    return _run(MODES, **SMOKE)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_mode_is_accurate_and_reports_a_time(mode, smoke):
+    """Every mode computes the right thing, and says how long it took."""
+    r = smoke[mode]
     print(
         f"\n[gemm_ar] {mode:<11s} m={r['m']} n={r['n']} k={r['k']} "
         f"quant={r['quant']}  {r['max_rank_time_us']:9.1f} us  "
@@ -117,6 +118,7 @@ def test_mode_is_accurate_and_reports_a_time(mode):
     assert r["max_rank_time_us"] > 0
 
 
+@pytest.mark.ci_full
 def test_fusing_beats_splitting_at_the_model_shape():
     """The op's whole claim, measured back to back on one box.
 
@@ -125,8 +127,8 @@ def test_fusing_beats_splitting_at_the_model_shape():
     is only the ordering -- see this module's docstring for why.
     """
     _require(MODEL_SHAPE["world_size"])
-    fused = _run(mode="fused-sdma", **MODEL_SHAPE)
-    split = _run(mode="split-sdma", **MODEL_SHAPE)
+    runs = _run(("fused-sdma", "split-sdma"), **MODEL_SHAPE)
+    fused, split = runs["fused-sdma"], runs["split-sdma"]
 
     f, s = fused["max_rank_time_us"], split["max_rank_time_us"]
     print(

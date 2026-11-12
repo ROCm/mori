@@ -560,9 +560,8 @@ __device__ void EpDispatchAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
         sdma.quietQueue<::mori::cco::ccoCoopWarp>(
             destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset));
       } else {
-        // Same argument over RDMA, but every QP the send leg striped across has
-        // to be drained -- EpInterNodeQuiet loops them, flushing each context.
-        EpInterNodeQuiet(comm, destPe, config.numQpPerPe);
+        // Same argument over RDMA: drain every QP the send leg striped across.
+        for (int qpId = 0; qpId < config.numQpPerPe; ++qpId) EpInterNodeQuiet(comm, destPe, qpId);
       }
     }
 
@@ -1186,7 +1185,7 @@ __device__ void EpCombineAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
         sdma.quietQueue<::mori::cco::ccoCoopWarp>(
             destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset));
       else
-        EpInterNodeQuiet(comm, destPe, config.numQpPerPe);
+        for (int qpId = 0; qpId < config.numQpPerPe; ++qpId) EpInterNodeQuiet(comm, destPe, qpId);
     }
 
     if constexpr (asyncll::EarlyNotify<kConfig>) continue;

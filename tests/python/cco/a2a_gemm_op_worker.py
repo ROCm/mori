@@ -167,7 +167,9 @@ def case_reject(comm, n, k):
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument(
-        "--case", choices=("correct", "skew", "self_test", "reject"), required=True
+        "--case",
+        choices=("correct", "skew", "self_test", "reject", "all"),
+        required=True,
     )
     p.add_argument("--mode", default="fused")
     p.add_argument("-n", type=int, default=2048)
@@ -178,25 +180,41 @@ def main() -> int:
     rank, world, uid = _setup()
     k = world * args.k_shard
     m_max = max(M_PLAN)
+    # "all": every case but reject, an op each, keyed case/mode. reject stays a
+    # launch of its own: it needs the communicator's first dev-comm.
+    if args.case == "all":
+        runs = [("self_test", "fused")] + [
+            (case, mode) for case in ("correct", "skew") for mode in ("fused", "split")
+        ]
+    else:
+        runs = [(args.case, args.mode)]
     wb = A2aGemmOp.window_bytes_for(world, k=k, m_max=m_max)
-    with Communicator.init(world, rank, uid, per_rank_vmm=2 * wb + (256 << 20)) as comm:
-        if args.case == "reject":
-            res = case_reject(comm, args.n, k)
-        else:
-            x = _Inputs(rank, world, args.n, k)
-            with A2aGemmOp(comm, n=args.n, k=k, m_max=m_max, mode=args.mode) as op:
-                if args.case == "self_test":
-                    op.self_test()
-                    res = {"ok": True}
-                elif args.case == "correct":
-                    res = case_correct(op, x)
-                else:
-                    res = case_skew(op, x, args.delay_ms)
-                torch.cuda.synchronize()
-    gathered = [None] * world
-    dist.all_gather_object(gathered, res)
-    if rank == 0:
-        print("RESULT_JSON " + json.dumps({"case": args.case, "ranks": gathered}))
+    vmm = (len(runs) + 1) * wb + (256 << 20)
+    results = []
+    with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
+        for case, mode in runs:
+            if case == "reject":
+                res = case_reject(comm, args.n, k)
+            else:
+                x = _Inputs(rank, world, args.n, k)
+                with A2aGemmOp(comm, n=args.n, k=k, m_max=m_max, mode=mode) as op:
+                    if case == "self_test":
+                        op.self_test()
+                        res = {"ok": True}
+                    elif case == "correct":
+                        res = case_correct(op, x)
+                    else:
+                        res = case_skew(op, x, args.delay_ms)
+                    torch.cuda.synchronize()
+            key = (
+                case if args.case != "all" or case == "self_test" else f"{case}/{mode}"
+            )
+            results.append((key, res))
+    for key, res in results:
+        gathered = [None] * world
+        dist.all_gather_object(gathered, res)
+        if rank == 0:
+            print("RESULT_JSON " + json.dumps({"case": key, "ranks": gathered}))
     dist.barrier()
     return 0
 

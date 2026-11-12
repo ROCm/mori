@@ -125,19 +125,19 @@ struct EpInterNodeRegion {
 // Geometry is deliberately NOT here. blockNum and warpNumPerBlock come from
 // gridDim/blockDim, and rdmaBlockNum is a per-launch field of the args below --
 // not for tidiness, but because dispatch and combine are tuned to DIFFERENT
-// values for the same op (internode_tuning_configs: at 8 tokens dispatch runs
-// rdma=32/warp=8 while combine runs rdma=21/warp=6, and the table comment
-// records that the coupling is deliberate). Folding geometry into the config,
-// and thus later into the NTTP, would give the two phases disagreeing configs
-// over one shared arena.
+// values for the same op (the MI308X InterNodeV2 table, 256/8 hidden 7168 bf16:
+// at 8 tokens dispatch runs rdma=24/warp=4 while combine runs rdma=10/warp=8).
+// Folding geometry into the config, and thus later into the NTTP, would give the
+// two phases disagreeing configs over one shared arena.
 // ---------------------------------------------------------------------------
 struct EpInterNodeDeviceCfg {
-  // No `rank`. Every field here is a compiled-in shape constant, so the whole
-  // struct is constexpr and each read folds to a literal. Carrying the rank
-  // would make it a runtime object the compiler has to keep live in scalar
-  // registers across every inlined helper -- measured as dispatch_ll's SGPR
-  // spill count going 1 -> 15 against the pre-refactor kernel. The rank is
-  // `myPe` in DEF_COMMON_VARS, straight off args.
+  // No `rank`. Every field here is a compiled-in constant (the shape plus the
+  // active QP count numQpPerPe), so the whole struct is constexpr and each read
+  // folds to a literal. Carrying the rank would make it a runtime object the
+  // compiler has to keep live in scalar registers across every inlined
+  // helper -- measured as dispatch_ll's SGPR spill count going 1 -> 15 against
+  // the pre-refactor kernel. The rank is `myPe` in DEF_COMMON_VARS, straight
+  // off args.
   int worldSize{8};
   int hiddenDim{4096};
   int scaleDim{0};

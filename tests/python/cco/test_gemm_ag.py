@@ -440,6 +440,7 @@ def _spawn_bench(world_size, mode, m, n, k, extra=(), last=False):
     return records[0]
 
 
+@pytest.mark.single_gpu
 @pytest.mark.parametrize(
     "bm,bn,out_dtype",
     [
@@ -545,6 +546,7 @@ def test_split_k_rejects_incompatible_output(kwargs, match):
         bf16gemm.compile_bf16_gemm_ag(cfg, 0, **options)
 
 
+@pytest.mark.single_gpu
 @pytest.mark.parametrize("bm,bn", [(128, 128), (256, 256)])
 @pytest.mark.parametrize("splits,k", [(2, 256), (4, 768), (8, 7168)])
 def test_split_k_partials_and_changed_input_graph(bm, bn, splits, k):
@@ -608,6 +610,7 @@ def test_split_k_partials_and_changed_input_graph(bm, bn, splits, k):
         assert torch.equal(partials.sum(dim=0).cpu(), ah @ bh.T)
 
 
+@pytest.mark.ci_full
 @pytest.mark.parametrize("mode", ["gemm-only", "split-rccl"])
 def test_the_benchmark_baselines_validate(mode):
     """The two baselines only the benchmark has -- the GEMM alone, and it

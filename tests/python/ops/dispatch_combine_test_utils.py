@@ -562,20 +562,16 @@ class EpDispatchCombineTestCase:
             )
 
         total_experts = self.config.num_experts_per_rank * self.config.world_size
+        k = self.config.num_experts_per_token
+        slot = torch.arange(k, device=self.device)
 
         all_rank_indices = []
         for r in range(self.config.world_size):
             n = int(num_token[r])
+            tok = torch.arange(n, device=self.device)[:, None]
             if routing == "round_robin":
-                indices = torch.empty(
-                    n, self.config.num_experts_per_token, dtype=torch.int64
-                )
-                for i in range(n):
-                    base = (
-                        r * self.config.max_num_inp_token_per_rank + i
-                    ) * self.config.num_experts_per_token
-                    for j in range(self.config.num_experts_per_token):
-                        indices[i, j] = (base + j) % total_experts
+                base = (r * self.config.max_num_inp_token_per_rank + tok) * k
+                indices = (base + slot) % total_experts
             elif routing == "remote_round_robin":
                 # Balanced, no-skew round-robin over every destination rank
                 # except the local one, then round-robins over that rank's
@@ -583,17 +579,11 @@ class EpDispatchCombineTestCase:
                 assert (
                     self.config.world_size > 1
                 ), "remote_round_robin routing requires world_size > 1"
-                indices = torch.empty(
-                    n, self.config.num_experts_per_token, dtype=torch.int64
-                )
                 ws = self.config.world_size
                 nepr = self.config.num_experts_per_rank
-                for i in range(n):
-                    for j in range(self.config.num_experts_per_token):
-                        rec = i * self.config.num_experts_per_token + j
-                        dst = (r + 1 + (rec % (ws - 1))) % ws
-                        local_e = (rec // (ws - 1)) % nepr
-                        indices[i, j] = dst * nepr + local_e
+                rec = tok * k + slot
+                dst = (r + 1 + rec % (ws - 1)) % ws
+                indices = dst * nepr + (rec // (ws - 1)) % nepr
             elif routing == "spread":
                 # Sends exactly one expert to every rank (requires num_experts_per_token ==
                 # world_size). After per-rank deduplication each rank receives every source
@@ -602,27 +592,15 @@ class EpDispatchCombineTestCase:
                 assert (
                     self.config.num_experts_per_token == self.config.world_size
                 ), "spread routing requires num_experts_per_token == world_size"
-                indices = torch.empty(
-                    n, self.config.num_experts_per_token, dtype=torch.int64
-                )
-                for i in range(n):
-                    for j in range(self.config.num_experts_per_token):
-                        indices[i, j] = j * self.config.num_experts_per_rank
+                indices = (slot * self.config.num_experts_per_rank).expand(n, k).clone()
             elif routing == "all_to_one":
-                indices = torch.zeros(
-                    n, self.config.num_experts_per_token, dtype=torch.int64
-                )
+                indices = torch.zeros(n, k, dtype=torch.int64, device=self.device)
             else:
-                indices = torch.empty(
-                    n, self.config.num_experts_per_token, dtype=torch.int64
-                )
-                for i in range(n):
-                    perm = torch.randperm(
-                        total_experts,
-                        generator=self.rng,
-                        device=self.device,
-                    )
-                    indices[i] = perm[: self.config.num_experts_per_token]
+                # k distinct experts per token in random order: the distribution of
+                # a randperm prefix, for every token in one draw.
+                indices = torch.rand(
+                    n, total_experts, generator=self.rng, device=self.device
+                ).argsort(dim=1)[:, :k]
 
             if sentinel_pattern is not None and n > 0:
                 k = self.config.num_experts_per_token
