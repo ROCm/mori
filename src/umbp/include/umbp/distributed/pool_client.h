@@ -218,6 +218,9 @@ class PoolClient {
   // node's media.  In the master eviction modes the keys also join the local
   // reads reported to the master.  Never contacts another peer.
   size_t BatchTouch(const std::vector<std::string>& keys);
+  // Drops keys the caller will never read again; this node only, and only
+  // without a master, whose index would still name the dropped copies.
+  size_t BatchRemove(const std::vector<std::string>& keys);
 
   MasterClient& Master();
 
