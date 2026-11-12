@@ -31,7 +31,7 @@ production store options -- under different epilogues and collectives
                   gather (bf16 gather over LSA, one SDMA queue)
 * ``trig``        ``GemmTriggeredAllReduceOp`` driven by the same GEMM compiled
                   with ``gate_tail``: the host arms the copy-engine chains
-                  (``arm()``, timed apart), then begin / GEMM / complete
+                  (``arm()``), then begin / GEMM / complete
 * ``trig-agent``  the same with an agent-scope gate release
 * ``trig-conc``   ``trig`` with ``reduce_mode="concurrent"``
 * ``split``       the plain GEMM, then ``torch.distributed.all_reduce`` (RCCL)
@@ -51,18 +51,29 @@ Timing: before each call a host barrier and a ~2 ms hold kernel, so every launch
 is queued before the region starts; GPU events around the region; a call's time
 is its slowest rank's. Per round, the median over ``--iters`` calls; methods
 interleave round by round; reported: the median over rounds and each round.
-``--breakdown N`` also times each kernel of ``fused`` and ``trig`` (after mode)
-over N calls -- per segment, the slowest and the fastest rank.
+``arm()`` runs before the barrier, so it is not in a call's time; its host time
+is reported on its own (``arm_us``). ``--breakdown N`` also times each kernel of
+``fused`` and ``trig`` (after mode) over N calls -- per segment, the slowest and
+the fastest rank.
 
-    # DeepSeek wo_b, TP8
-    MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \\
-        bench_trig_vs_fused.py --rows 2048,4096,8192,16384 --breakdown 20
-    # DeepSeek-V4.1-Flash wo_b, TP4
-    MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=4 \\
-        bench_trig_vs_fused.py --features 5120 --rows 2048,4096,8192,16384
+Running: gfx950 only (the GEMM is mxfp8); build mori as usual. Kernels compile
+on first use, so the first output can take a minute or two. From the repo root::
 
-``--reducer-blocks`` sets the triggered op's reducer work-groups (default 32);
-in "after" mode 128-256 shrinks its gap at small M on MI355X.
+    B=benchmark/cco/flydsl/gemm_ar/bench_trig_vs_fused.py
+    # the GEMM's gate epilogue alone, on one GPU
+    pytest tests/python/cco/test_gemm_ar_gate_tail.py
+    # DeepSeek wo_b, TP8 (N=7168, K=2048)
+    MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 $B --breakdown 20
+    # DeepSeek-V4.1-Flash wo_b, TP4 (N=5120)
+    MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=4 $B --features 5120
+    # more reducer work-groups for the triggered op (default 32)
+    MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 $B \\
+        --rows 2048,16384 --methods fused,trig --reducer-blocks 128
+
+Rank 0 prints a ``ROW`` JSON line per M (and ``BREAKDOWN`` lines with
+``--breakdown``), then a table; ``--json PATH`` also writes the rows. On MI355X,
+128-256 reducer work-groups shrink the triggered op's gap at small M in "after"
+mode.
 """
 
 from __future__ import annotations
@@ -289,7 +300,9 @@ def _breakdown(
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     # Not "--n": torchrun would take it for an abbreviation of its own --nnodes etc.
     p.add_argument("--features", type=int, default=7168, help="N per rank")
     p.add_argument("--k", type=int, default=2048)
