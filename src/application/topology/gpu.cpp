@@ -22,10 +22,13 @@
 #include "mori/application/topology/gpu.hpp"
 
 #include <dlfcn.h>
+#include <link.h>
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
@@ -39,14 +42,41 @@ namespace application {
 // On ROCm 10.0 and earlier, we use rocm_smi (librocm_smi64).
 namespace {
 
+// The SMI library this process already has (torch links one), or "". A second copy
+// gets some of its calls bound to the first and reports no GPUs, so reuse it.
+std::string LoadedLibrary(const char* stem) {
+  struct Query {
+    const char* stem;
+    std::string path;
+  } query{stem, {}};
+  dl_iterate_phdr(
+      [](dl_phdr_info* info, size_t, void* data) {
+        auto* q = static_cast<Query*>(data);
+        const char* name = info->dlpi_name;
+        if (!name || !name[0]) return 0;
+        const char* slash = strrchr(name, '/');
+        const char* base = slash ? slash + 1 : name;
+        if (strncmp(base, q->stem, strlen(q->stem)) != 0) return 0;
+        q->path = name;
+        return 1;
+      },
+      &query);
+  return query.path;
+}
+
 #if MORI_USE_AMDSMI
 // ---- amd_smi path (ROCm 10.1+) ----
 
 void* OpenAmdSmi() {
-  const char* candidates[] = {
-      std::getenv("MORI_AMD_SMI_PATH"),  "libamd_smi.so",      "/opt/rocm/lib/libamd_smi.so",
-      std::getenv("MORI_ROCM_SMI_PATH"), "librocm_smi64.so.1", "librocm_smi64.so",
-      "/opt/rocm/lib/librocm_smi64.so.1"};
+  const std::string loaded = LoadedLibrary("libamd_smi.so");
+  const char* candidates[] = {loaded.c_str(),
+                              std::getenv("MORI_AMD_SMI_PATH"),
+                              "libamd_smi.so",
+                              "/opt/rocm/lib/libamd_smi.so",
+                              std::getenv("MORI_ROCM_SMI_PATH"),
+                              "librocm_smi64.so.1",
+                              "librocm_smi64.so",
+                              "/opt/rocm/lib/librocm_smi64.so.1"};
   for (const char* path : candidates) {
     if (path && path[0]) {
       if (void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL)) return h;
@@ -72,8 +102,10 @@ Fn Sym(void* handle, const char* name) {
 // ---- rocm_smi path (ROCm <= 10.0) ----
 
 void* OpenRocmSmi() {
-  const char* candidates[] = {std::getenv("MORI_ROCM_SMI_PATH"), "librocm_smi64.so.1",
-                              "librocm_smi64.so", "/opt/rocm/lib/librocm_smi64.so.1"};
+  const std::string loaded = LoadedLibrary("librocm_smi64.so");
+  const char* candidates[] = {loaded.c_str(), std::getenv("MORI_ROCM_SMI_PATH"),
+                              "librocm_smi64.so.1", "librocm_smi64.so",
+                              "/opt/rocm/lib/librocm_smi64.so.1"};
   for (const char* path : candidates) {
     if (path && path[0]) {
       if (void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL)) return h;
