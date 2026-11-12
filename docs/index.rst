@@ -18,9 +18,12 @@ MORI Documentation
    MORI-EP-GUIDE
    MORI-SHMEM-GUIDE
    MORI-CCO-GUIDE
+   MORI-CCO-FUSED-OPS-GUIDE
    MORI-IR-GUIDE
    MORI-IO-GUIDE
    MORI-UMBP-SINGLE-NODE-GUIDE
+   umbp-simulation
+   umbp-calibration
    PROFILER
 
 .. toctree::
@@ -28,7 +31,7 @@ MORI Documentation
    :caption: Benchmarks
 
    MORI-EP-BENCHMARK
-   MORI-GEMM-AR-BENCHMARK
+   EPv2_PERF
    MORI-IO-BENCHMARK
    MORI-UMBP-PD-BENCHMARK
    UMBP-TIER-MANAGEMENT-BENCHMARK

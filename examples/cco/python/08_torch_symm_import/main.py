@@ -54,13 +54,13 @@ import torch.distributed._symmetric_memory as symm_mem
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops
 from flydsl.expr.typing import Int32, Int64, T
 from flydsl._mlir.dialects import rocdl
 
 from mori.cco import Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE
 from mori.jit.hip_driver import _check, _get_hip_lib
 import mori.cco.device.flydsl as cco
+from mori.cco.device.flydsl import buffer
 
 PER_RANK_VMM = 1 * 1024 * 1024 * 1024
 N = 1024  # int32 elements
@@ -84,12 +84,12 @@ def lsa_gather_kernel(dev_comm: Int64, win_handle: Int64, src_rank: Int32):
     win = cco.Window(win_handle)
     src = win.lsa_ptr(src_rank, 0)  # peer's torch tensor (peer VA) — load directly
     dst = win.lsa_ptr(dc.lsa_rank, 0)  # my own torch tensor (local VA)
-    src_rsrc = buffer_ops.create_buffer_resource_from_addr(src)
-    dst_rsrc = buffer_ops.create_buffer_resource_from_addr(dst)
+    src_rsrc = buffer.create_buffer_resource_from_addr(src)
+    dst_rsrc = buffer.create_buffer_resource_from_addr(dst)
     for pk in range(tid, NUM_PACKS, THREADS):
         off = pk * 4  # i32-element offset of this 16 B pack
-        v = buffer_ops.buffer_load(src_rsrc, off, vec_width=4, dtype=T.i32)
-        buffer_ops.buffer_store(v, dst_rsrc, off)
+        v = buffer.buffer_load(src_rsrc, off, vec_width=4, dtype=T.i32)
+        buffer.buffer_store(v, dst_rsrc, off)
     rocdl.s_waitcnt(0)
 
 

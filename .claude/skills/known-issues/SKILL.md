@@ -1,13 +1,15 @@
 ---
 name: known-issues
 description: >-
-  Known environment issues that make MORI slow or behave oddly without being MORI bugs —
-  currently: HIP VMM peer traffic silently falling off XGMI onto PCIe/host memory on Linux
-  kernels built without CONFIG_DMABUF_MOVE_NOTIFY / CONFIG_PCI_P2PDMA, which hits mori-cco
-  (EPv2) but not mori-shmem (EPv1). Use when EPv2 / dispatch_combine_v2 / cco is much slower
-  than expected, when EPv2 is far slower than EPv1 on the same box, when a2a bandwidth does
-  not scale with the number of peers, or when the user asks whether a perf problem is a
-  MORI bug or an environment/toolchain problem. Also: (2) on ROCm 7.0-7.2.x a clr
+  Known environment issues that make MORI slow, hang or behave oddly without being MORI
+  bugs — currently: (1) HIP VMM peer memory pinned into host memory instead of peer VRAM
+  when the kernel lacks CONFIG_DMABUF_MOVE_NOTIFY AND the loaded amdgpu build checks that
+  option (most DKMS builds do), which hits mori-cco (EPv2) but not mori-shmem (EPv1) and
+  shows up as a ~9x slowdown or as EPv2 hanging / never finishing startup. Use when EPv2 /
+  dispatch_combine_v2 / cco is much slower than expected, or hangs on one box but not on
+  another, when EPv2 is far slower than EPv1 on the same box, when a2a bandwidth does not
+  scale with the number of peers, or when the user asks whether a perf problem is a MORI
+  bug or an environment/toolchain problem. Also: (2) on ROCm 7.0-7.2.x a clr
   hipMemSetAccess sub-buffer bug makes mori-cco 2-node ccoDevCommCreate fail with
   "hipMemSetAccess ... invalid argument"; (3) on ROCm 7.2.x clr routes uncached VMM
   allocations to the coarse-grained pool, making cco combine ~10-15us slower.
@@ -25,17 +27,43 @@ debugging MORI itself when performance is unexpectedly bad on a specific machine
 **Affects:** `mori-cco` (EPv2, `dispatch_combine_v2`) and anything else built on the
 HIP VMM API. **Does not affect** `mori-shmem` (EPv1), which uses IPC handles.
 
-**Root cause:** the Linux kernel was compiled **without**
-`CONFIG_DMABUF_MOVE_NOTIFY=y` (and usually also without `CONFIG_PCI_P2PDMA=y`).
-This is the case for the stock Ubuntu 22.04 GA **5.15** kernel. It is a *kernel build
-configuration* problem, not a kernel version bug and not an amdgpu regression — a 5.15
-rebuilt with those options works fine, and the Ubuntu **6.8 HWE** kernel already has them.
+**Root cause:** two conditions, and a machine is affected only when **both** hold.
 
-**Impact is silent.** Nothing errors, correctness still passes; the a2a path is just
-~9x slower.
+1. **The kernel was compiled without `CONFIG_DMABUF_MOVE_NOTIFY=y`** (and usually also
+   without `CONFIG_PCI_P2PDMA=y`).
+   - Known offenders: the stock Ubuntu 22.04 GA **5.15** kernel, and the Alibaba Cloud
+     Linux 3 **5.10.134-\*.al8** kernels found on MI308X hosts.
+   - It is a *kernel build configuration* problem, not a kernel version bug: a 5.15
+     rebuilt with those options works fine, and the Ubuntu **6.8 HWE** kernel already
+     has them.
+2. **The loaded amdgpu driver refuses to pin a dma-buf in VRAM when that option is off.**
+   - It does so with a compile-time check in `amdgpu_dma_buf_pin()` (see Mechanism).
+   - amdgpu DKMS 6.16.13 has the check (verified on three hosts).
+   - A pre-release amdgpu DKMS 7.2.0 build does not. An MI308X host running it on the
+     same 5.10.134-al8 kernel was **not** affected.
+
+So the verdict belongs to the pair (kernel config, amdgpu build), not to the kernel alone.
+Detection below checks both.
+
+**Impact: slow, or stuck. Nothing reports an error.**
+
+- **Usually slow.** Correctness still passes; the a2a path is just ~9x slower (table
+  below).
+- **It can also stop EPv2 outright.**
+  - [#917](https://github.com/ROCm/mori/issues/917) (8x MI355X, Ubuntu 5.15.0-70, DKMS
+    6.16.13): after window registration, the KFD queues of all ranks were evicted in
+    90–98% of runs, and vLLM never finished starting.
+  - 8x MI308X, 5.10.134-al8, DKMS 6.16.13: `test_asyncll.py` at 8 ranks hangs, on main
+    as well. The same test passes on a 5.10.134-al8 host whose amdgpu build keeps the
+    buffer in VRAM. The two hosts also run different firmware, so treat this as a strong
+    association, not an isolated cause.
 
 ### Symptoms
 
+- EPv2 (AsyncLL in particular) hangs or crawls in its first rounds, or a serving engine
+  never finishes starting, while EPv1 on the same box is fine.
+- The same EPv2 job behaves differently on two hosts with the same kernel. Compare their
+  amdgpu builds (Detection, step 3).
 - EPv2 dispatch/combine bandwidth is a fraction of EPv1's on the same machine.
 - Per-rank bandwidth plateaus at roughly a **single** XGMI link (~55 GB/s on MI355X),
   or below it — even though the box has 7 peers.
@@ -52,36 +80,77 @@ Measured on an 8x MI355X box (`HIDDEN=7168 TOPK=8 EPR=32`, bf16, 4096 tok/rank, 
 | EPv2 (cco / VMM) — **affected kernel** | **36 GB/s** | **54 GB/s** |
 | EPv2 (cco / VMM) — after fixing the kernel | **340 GB/s** | **390 GB/s** |
 
-### Detection (30 seconds, no GPU needed)
+### Detection
 
-```bash
-grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)
-```
+**The runtime probe (step 1) is the verdict.** Steps 2 and 3 explain the result and tell
+you which side to fix; neither decides it alone. In particular, a kernel without
+`CONFIG_DMABUF_MOVE_NOTIFY` does **not** by itself mean the machine is affected.
 
-Both must print `=y`. If either is missing (`# CONFIG_... is not set` or no output),
-the machine is affected.
-
-Also useful:
-
-```bash
-uname -r                                    # 5.15.0-*-generic (Ubuntu GA) is the usual offender
-grep -E 'CONFIG_IOMMU_DEFAULT' /boot/config-$(uname -r)
-```
-
-### Runtime confirmation
-
-`vmm_peer_probe.cpp` in this skill directory gives a direct verdict — it allocates VMM
-memory on one GPU, grants peer access from another, and checks whether the memory stayed
-in VRAM:
+**Step 1: runtime probe.** It needs two GPUs and takes a few seconds.
+`vmm_peer_probe.cpp` in this skill directory allocates VMM memory on one GPU, grants peer
+access from another, and checks whether the memory stayed in VRAM:
 
 ```bash
 hipcc -O3 --offload-arch=$(rocminfo | grep -m1 -o 'gfx[0-9a-f]*') \
       vmm_peer_probe.cpp -o vmm_peer_probe
 ./vmm_peer_probe            # defaults: owner=1 peer=0 size=8GB
+./vmm_peer_probe 7 6 2      # owner=7 peer=6 size=2GB, e.g. on GPUs other jobs leave free
 ```
 
-- `VERDICT: OK` — memory stayed in VRAM, the machine is fine.
-- `VERDICT: AFFECTED` — granting peer access evicted the buffer out of VRAM.
+- `VERDICT: OK`: the memory stayed in VRAM, so the machine is fine.
+- `VERDICT: AFFECTED`: granting peer access evicted the buffer out of VRAM. The probe's
+  message then points at the kernel config only; steps 2 and 3 show which side to change.
+
+**Step 2: kernel config.** No GPU needed.
+
+```bash
+grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)
+```
+
+- If both print `=y`, the kernel side is fine.
+- If either is missing (`# CONFIG_... is not set`, or no output), the result depends on
+  the amdgpu build (step 3).
+
+**Step 3: the amdgpu build.** No GPU needed. On ROCm machines amdgpu normally comes from
+DKMS, with its source under `/usr/src`. Print the pin function of the build that is
+installed for the running kernel:
+
+```bash
+dkms status amdgpu                  # which version is installed for $(uname -r)
+awk '/^static int amdgpu_dma_buf_pin\(/,/^}/' \
+    /usr/src/amdgpu-<version>/amd/amdgpu/amdgpu_dma_buf.c
+```
+
+- **Pick the right tree.** Use the version that `dkms status` reports as installed for the
+  running kernel. A host can carry several `/usr/src/amdgpu-*` trees, and
+  `modinfo -F version amdgpu` may print the version in another format (`7.2.0.0` for an
+  `amdgpu-7.2.0-...` tree).
+- **Read the whole function**, not a single grep hit. DKMS sources can hold `#if` variants
+  of it for different kernels.
+- **No `/usr/src/amdgpu-*` at all** (the in-kernel amdgpu): rely on step 1.
+
+What to look for in `amdgpu_dma_buf_pin()`:
+
+| what the function does | seen in | kernel without the option | kernel with it |
+|---|---|---|---|
+| strips VRAM under `if (!IS_ENABLED(CONFIG_DMABUF_MOVE_NOTIFY))`, otherwise per attachment | DKMS 6.16.13 | **affected** | fine |
+| strips VRAM only for attachments without `peer2peer`; no `IS_ENABLED` branch | pre-release DKMS 7.2.0 | fine | fine |
+| anything else (e.g. pins straight to `AMDGPU_GEM_DOMAIN_GTT`) | — | rely on step 1 | rely on step 1 |
+
+Hosts seen so far:
+
+| host | kernel | amdgpu | probe |
+|---|---|---|---|
+| 8x MI308X (two hosts) | 5.10.134-al8, both options unset | DKMS 6.16.13 (has the check) | AFFECTED |
+| 8x MI308X | 5.10.134-al8, both options unset | pre-release DKMS 7.2.0 (no check) | OK |
+| 8x MI300X | Ubuntu 5.15.0-70 rebuilt with both options `=y` | DKMS 6.16.13 (has the check) | OK |
+
+Also useful:
+
+```bash
+uname -r                                    # 5.15.0-*-generic (Ubuntu GA) and 5.10.134-*.al8 are known offenders
+grep -E 'CONFIG_IOMMU_DEFAULT' /boot/config-$(uname -r)
+```
 
 ### Mechanism (what actually happens)
 
@@ -107,6 +176,11 @@ hipcc -O3 --offload-arch=$(rocminfo | grep -m1 -o 'gfx[0-9a-f]*') \
    `IS_ENABLED()` is a **compile-time** constant taken from the kernel's own
    `autoconf.h`. Without move-notify support the kernel cannot ask an importer to drop
    its mapping when a buffer must move, so amdgpu conservatively refuses to pin in VRAM.
+
+   This is the code in the amdgpu builds that are affected. A build without the
+   `IS_ENABLED` branch keeps only the per-attachment loop. A peer GPU's attachment has
+   `peer2peer` set, so the buffer stays in VRAM even on a kernel without the option. That
+   is why the kernel config alone cannot decide (Detection, step 3).
 
 3. The buffer is therefore **pinned into host system memory**. Note this is stronger than
    "peer access falls back to PCIe": the data is not in peer VRAM at all. Every subsequent
@@ -162,7 +236,8 @@ long-lived.
 enabled alongside it because upstream `HSA_AMD_P2P` depends on both and it costs nothing.
 
 **Third option — one-line amdgpu DKMS patch, no kernel change.** Force the branch that
-keeps VRAM (its per-attachment `peer2peer` check is already satisfied):
+keeps VRAM (its per-attachment `peer2peer` check is already satisfied). This gives the
+same behaviour as the amdgpu builds that have no check at all (Detection, step 3):
 
 ```bash
 S=/usr/src/amdgpu-<version>/amd/amdgpu/amdgpu_dma_buf.c
@@ -181,11 +256,13 @@ Roll back with `sudo cp $S.orig $S` and rebuild.
 ### Verification after the fix
 
 ```bash
-grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)   # both =y
 ./vmm_peer_probe                                                             # VERDICT: OK
+grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)   # both =y,
+# or the installed amdgpu_dma_buf_pin() no longer has the IS_ENABLED branch (Detection, step 3)
 ```
 
-Then re-run the EPv2 kernel bench; per-rank bandwidth should be in the same range as EPv1.
+Then re-run the EPv2 kernel bench: per-rank bandwidth should be in the same range as EPv1,
+and EPv2 tests that hung before should complete.
 
 ---
 

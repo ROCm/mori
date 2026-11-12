@@ -445,26 +445,6 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
 
   unsigned int block_x = WARP_SIZE * wpb;
   int smem = dispatch_shared_mem(handle.config, wpb);
-  // The gfx125x dispatch body stages each token payload through ONE per-warp LDS tile; size the
-  // dynamic shared to warpNum * hiddenDim * elemSize (see intranode_1250x.hpp). gfx1250 has 320KB
-  // LDS/CU, so a 14KB bf16 tile lets ~22 warps/CU stay resident. Other arches take the WarpCopy
-  // body, which stages nothing and keeps the index-array reservation above.
-  //
-  // Keyed on the RUNTIME arch, not on a build macro. It used to be #ifdef MORI_DISP_TDM, which is
-  // the same condition the kernel used to compile its body under; now that the body is selected by
-  // __gfx1250__/__gfx1251__ alone, a host built without that macro would under-reserve LDS for a
-  // kernel that stages tiles into it. detect_hardware() has already cached the arch string.
-  detect_hardware();
-  if (s_cached_arch.rfind("gfx125", 0) == 0) {
-    int ws = 32;
-    (void)hipDeviceGetAttribute(&ws, hipDeviceAttributeWarpSize, 0);
-    if (ws <= 0) ws = 32;
-    int warpNum = static_cast<int>(block_x) / ws;
-    if (warpNum < 1) warpNum = 1;
-    int hd = (hidden_dim > 0) ? hidden_dim : handle.config.hiddenDim;
-    size_t elem = (dtype == HIP_R_32F) ? 4u : ((dtype == HIP_R_16BF) ? 2u : 1u);
-    smem = warpNum * hd * static_cast<int>(elem);
-  }
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(dtype);
   const char* af = AtomicFreeSuffix(handle);
@@ -577,8 +557,7 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
         // 0, top-k in {8,9}, EP > 4) and block_elems matches a registered symbol. top-k==9 covers
         // shared-expert fusion (8 routed + 1 fused shared). The FP4 variants share the exact launch
         // config as FP8; only the in-kernel codec differs. Keep in sync with the Python launch path
-        // in dispatch_combine.py -- except on transport, where they already differ: that path picks
-        // PULL on gfx125x while every name built here is _nop2p, i.e. PUSH.
+        // in dispatch_combine.py.
         const int block_elems = (args.config.hiddenDim + fp8ScaleDim - 1) / fp8ScaleDim;
         const bool baseVec8Top8Eligible =
             !hasWeights && (args.config.hiddenDim % 512 == 0) &&

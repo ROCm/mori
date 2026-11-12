@@ -1,11 +1,18 @@
 # `mori.ops.gemm_ar` -- an fp8 GEMM, with or without the all-reduce fused in
 
-Three operators over one mxfp8/blockscale GEMM kernel, for a tensor-parallel
+Four operators over one mxfp8/blockscale GEMM kernel, for a tensor-parallel
 attention block:
+
+Current optimization targets are V4 Pro TP8 `wo_b` GEMM + AR (blockscale,
+N=7168, K=2048), and V4.1 Flash TP4 `wo_b` GEMM + AR / standalone MXFP8 GEMM
+(N=5120, K=2048) plus `wq_b` standalone MXFP8 GEMM (N=8192, K=1280).
+Dimensions are per rank. Existing all-shape, GEMV and model-level results below
+are historical records from `main`; the dated updates cover only these targets.
 
 | op | for | what it does |
 |---|---|---|
 | `GemmAllReduceOp` (`op.py`) | a `RowParallelLinear` at prefill M | the GEMM with the all-reduce's scatter fused into its epilogue |
+| `GemmReduceScatterOp` (`op.py`) | the same, under sequence parallelism | the same pipeline without the gather: each rank keeps its row band |
 | `Mxfp8GemmOp` (`gemm.py`) | any mxfp8 linear at prefill M | the same GEMM, nothing fused, no communicator |
 | `Mxfp8GemvOp` (`gemv.py`) | any mxfp8 linear at decode M (<= 32) | a skinny GEMM built for a handful of tokens |
 
@@ -20,24 +27,35 @@ hold the kernels, `layout.py` every window offset and count, and
 `_gemm_a8w8_8wave.py` / `_shuffle.py` the two pieces vendored from aiter so mori
 does not depend on it.
 
-How to *run* the benchmarks, and a one-table summary of what they say, are in
-[`docs/MORI-GEMM-AR-BENCHMARK.md`](../../../../docs/MORI-GEMM-AR-BENCHMARK.md).
-Every full table lives here, next to the code it is about.
+How to *run* the benchmarks is in [Benchmarks and tests](#benchmarks-and-tests),
+how to reproduce the server numbers in
+[Reproducing the end-to-end numbers](#reproducing-the-end-to-end-numbers), and a
+summary of what they say opens [Measured results](#measured-results).
 
 ## Contents
 
 - [What it does](#what-it-does)
 - [Using it](#using-it)
   - [Fused GEMM + all-reduce](#fused-gemm--all-reduce)
+  - [Fused GEMM + reduce-scatter](#fused-gemm--reduce-scatter)
   - [The GEMM without a collective](#the-gemm-without-a-collective)
   - [fp8 on the wire](#fp8-on-the-wire)
   - [Benchmarks and tests](#benchmarks-and-tests)
+    - [Modes and quantisation](#modes-and-quantisation)
+    - [The fp8 wire's knobs](#the-fp8-wires-knobs)
+    - [The GEMM on its own, benchmarked](#the-gemm-on-its-own-benchmarked)
 - [Measured results](#measured-results)
+  - [Follow-up experiments (2026-09-30)](#follow-up-experiments-2026-09-30)
+  - [Target operator update (2026-09-29)](#target-operator-update-2026-09-29)
   - [The mxfp8 GEMM, on its own](#the-mxfp8-gemm-on-its-own)
   - [The mxfp8 GEMM against SGLang, across every shape](#the-mxfp8-gemm-against-sglang-across-every-shape)
   - [DeepSeek-V4-Pro (blockscale, TP8)](#deepseek-v4-pro-blockscale-tp8)
   - [DeepSeek-V4.1-Flash (mxfp8, TP4)](#deepseek-v41-flash-mxfp8-tp4)
+  - [Kimi-K3 (blockscale, TP8 and TP4)](#kimi-k3-blockscale-tp8-and-tp4)
+    - [Below the crossover there is nothing to chunk](#below-the-crossover-there-is-nothing-to-chunk)
+    - [An fp8 gather is worth more here than the fusing](#an-fp8-gather-is-worth-more-here-than-the-fusing)
   - [End to end, in SGLang](#end-to-end-in-sglang)
+    - [Reproducing the end-to-end numbers](#reproducing-the-end-to-end-numbers)
   - [Measurement traps](#measurement-traps)
 - [How it works](#how-it-works)
   - [Why the SDMA transport needs no epilogue change](#why-the-sdma-transport-needs-no-epilogue-change)
@@ -66,7 +84,7 @@ The rest of this section, and all of [How it works](#how-it-works), is about the
 fused one.
 
 The target is DeepSeek-V4-Pro's `wo_b`: a RowParallelLinear whose per-rank GEMM
-is `[M,1024] x [7168,1024]` fp8 -> `[M,7168]` bf16, immediately all-reduced.
+is `[M,2048] x [7168,2048]` fp8 -> `[M,7168]` bf16, immediately all-reduced.
 Split, that is `gemm(); all_reduce()`. Fused, the GEMM's C lands directly in a
 registered cco window and each destination's slice is pushed by the copy engine
 as soon as its last tile is written, so the reduce-scatter transfer overlaps the
@@ -76,9 +94,9 @@ Only the *scatter* half of the all-reduce is absorbed. The reduce and all-gather
 phases still run as their own kernels, reused verbatim from `ar.kernels_sdma`
 (`build_sdma_phases`), with `scatter` swapped for its drain-only twin.
 
-**Nothing here is a production kernel.** aiter's tuned CSV picks a ck/asm/cktile
-backend for (N=7168, K=1024), not this one, so the fused-vs-split comparison is
-internally valid but is not a claim about DSV4 as shipped.
+The earlier K=1024 experiments below are historical kernel controls. Their
+fused-vs-split comparisons do not establish performance at the current K=2048
+target or model end-to-end acceleration.
 
 ## Using it
 
@@ -155,11 +173,10 @@ stream rules apply to the result.
 to keep it. `pad_rows` returns a reused buffer with the same caveat. One
 instance is not usable concurrently.
 
-**Distinct M values.** Each M compiles its own kernel and takes its own counter
-set, capped by `max_shapes`. That defaults to *every* legal M under `m_max`
-(`m_max / (world_size * block_m)`), so the cap is not something a caller
-normally meets; a ninth distinct shape used to raise. Warm each M up once before
-capturing a graph.
+**Distinct plans.** Each padded-M/chunk plan compiles its own kernel and takes
+its own counter set, capped by `max_shapes`. The default reserves every legacy
+M under `m_max`, plus the fitted plans when enabled. Two logical M values with
+the same padding can need different counters. Warm each plan before graph capture.
 
 **Cleanup.** `close()` (or the `with` above) releases the window and its memory
 -- at the model shape about 700 MiB per rank. The communicator holds a strong
@@ -171,6 +188,104 @@ communicator. Synchronise first if anything may still be in flight.
 **dtype.** A and B must be `torch.float8_e4m3fn`. `float8_e4m3fnuz` is the same
 width but a different exponent bias, and the MMA atom implements OCP's, so it is
 rejected rather than silently returning a result 4x too large.
+
+**Optional `wo_b` schedule.** `schedule="wo_b"` selects the measured MI355X
+padding/chunk profile for Pro TP8 `(N=7168, K=2048, quant="blockscale")` and
+Flash TP4 `(N=5120, K=2048, quant="mxfp8")`. The default is `"default"`.
+Pass the original `logical_m` at launch; `padded_m()` does not save call state.
+For Flash, on a TP4 communicator with MXFP8 weights:
+
+```python
+from mori.ops.gemm_ar import preshuffle_a_scale
+
+settings = dict(n=5120, k=2048, m_max=16384, quant="mxfp8", schedule="wo_b")
+window_bytes = GemmAllReduceOp.window_bytes_for(world, **settings)
+# Use window_bytes when sizing the communicator's per_rank_vmm, then:
+b_shuffled = preshuffle_b(w_fp8)
+b_scale = w_exps.t().contiguous().to(torch.int32).reshape(-1)
+with GemmAllReduceOp(comm, **settings) as op:
+    logical_m = x.shape[0]
+    a_fp8, a_exps = quantize_mxfp8(op.pad_rows(x, op.padded_m(logical_m)))
+    out = op(a_fp8, b_shuffled, preshuffle_a_scale(a_exps), b_scale,
+             logical_m=logical_m)[:logical_m]
+    torch.cuda.synchronize()
+    out = out.clone()
+```
+
+For BF16 communication, Pro selects band2 at logical M=8200 and band1 at
+M=11264/13312; Flash selects align64/band1 at M=4200/8200 and band2 at
+M=11264. Other M, weight shapes and quantizations retain the legacy policy.
+This is a finite measured profile, not an interpolation rule.
+
+`scatter_dtype="fp8"` explicitly enables lossy scatter with separate reduction.
+On Flash TP4, the profile also selects align64/band1 at M=4200/8200 with BF16
+gather or `gather_dtype="fp8", gather_transport="lsa"`. Other FP8 combinations
+retain legacy scheduling. Pass identical settings to `window_bytes_for()` and
+the constructor. FP8 scatter retains BF16 staging; see the error measurements
+and limitations in the [follow-up results](#follow-up-experiments-2026-09-30).
+
+### Fused GEMM + reduce-scatter
+
+`GemmReduceScatterOp` is the same pipeline stopped before the gather, for a
+sequence-parallel layer that keeps only its own rows after a RowParallelLinear.
+Rank `r` gets `[M/P, N]`: rows `r*M/P` onward of the summed GEMM, the dim-0
+split `torch.distributed.reduce_scatter_tensor` makes. Construction, operands,
+padding, scales, the collective contract and `self_test` are all
+`GemmAllReduceOp`'s; it has no wire options, because the scatter is its only
+leg, and it takes neither `scatter_dtype="fp8"` nor `schedule="wo_b"`: the
+scatter stays bf16 and `M` pads by the default rule, so the bands are even.
+
+```python
+vmm = 2 * GemmReduceScatterOp.window_bytes_for(
+    world, m_max=M_MAX, n=N, k=K, quant="mxfp8"   # the constructor's settings
+) + (64 << 20)
+with GemmReduceScatterOp(comm, n=N, k=K, m_max=M_MAX, quant="mxfp8") as op:
+    band = op(a_fp8, b_shuffled, a_scale, b_scale)   # [m_pad / world, N]
+```
+
+No kernel is new. After the GEMM it runs `fused_rs_order` -- drain, reduce, and
+a barrier-only kernel, `rs_barrier`, that stands in for the one the gather used
+to provide. That barrier is load-bearing: the reduce reads recv slots the peers
+fill, and the next call's epilogue refills them, so without it a rank one call
+ahead overwrites a slower peer's slot mid-reduce. It was intermittent in the
+alternating-M test (relL2 0.71 on one call) and deterministic once one rank is
+held between drain and reduce (0.99 and 1.01; 2.4e-3 with the barrier) --
+which is what `test_reduce_scatter_survives_a_slow_reader` does. The test
+counts the holds, so it cannot pass without holding anyone, and reruns the
+same schedule without `rs_barrier` as a negative control that has to corrupt.
+
+**The padding decides the bands.** `M` has to be a multiple of
+`world_size * block_m` here as for the all-reduce, and the rows are split after
+that padding. A caller whose own sequence-parallel split is over a smaller
+granule (a multiple of `world_size` only) has to pad to this one *before* it
+shards, or the two disagree on which rows each rank holds.
+
+**Measured**, DeepSeek-V4.1-Flash `wo_b` (`[M, 5120]` K=2048, mxfp8) on 4x
+MI355X (ROCm 7.2, FlyDSL 0.4.0), `bench_gemm_ar.py --collective rs
+--sdma-queues 1`, graph replay, max over ranks, median of 3 interleaved rounds on
+an idle box (spread <= 4.7% at M=2048, <= 2.7% above); `split-rccl` is the GEMM
+followed by `reduce_scatter_tensor`, i.e. what a serving stack runs today:
+
+| M | `gemm-only` | `split-rccl` | `split-sdma` | `fused-sdma` | vs rccl | vs split-sdma |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 39.6 | 161.7 | 152.8 | 156.6 (c2) | -3.2% | +2.5% |
+| 4096 | 66.4 | 295.4 | 269.9 | **262.9** (c4) | -11.0% | -2.6% |
+| 8192 | 104.4 | 540.5 | 484.2 | **460.2** (c8) | -14.9% | -5.0% |
+| 16384 | 174.9 | 1065.3 | 917.3 | **834.5** (c8) | **-21.7%** | -9.0% |
+
+Two separate effects. The copy engines alone beat RCCL by 5-14% (`split-sdma`
+against `split-rccl`); fusing then hides about 83 of the 175us of GEMM at
+M=16384. At M=2048 there are only two chunks per destination and fusing loses
+to `split-sdma`; that split has no public op, though, and against the split a
+caller actually has -- the GEMM then `reduce_scatter_tensor` -- the fused op is
+ahead at every M measured, 2048 included. The link is
+still the limit: the unfused transfer is ~740us at M=16384, about 170 GB/s per
+rank over TP4's three links.
+
+`split-rccl` validates at relL2 3.15e-3 against everything else's 2.37e-3, and
+that is not an error: RCCL adds the partials in bf16 hop by hop, where the SDMA
+reduce accumulates in fp32 and rounds once. Its gate in the benchmark is
+correspondingly wider (6e-3).
 
 ### The GEMM without a collective
 
@@ -197,6 +312,12 @@ m_pad = op.padded_m(x.shape[0])
 a_fp8, a_exps = quantize_mxfp8(op.pad_rows(x, m_pad))   # pad before quantising
 out = op(a_fp8, b_shuffled, preshuffle_a_scale(a_exps), b_scale)[: x.shape[0]]
 
+# Or with the scales exactly as the quantiser and the checkpoint have them --
+# faster, any M, no shuffle. See "Row-major scales through LDS" below.
+op_raw = Mxfp8GemmOp(n=N, k=K, quant="mxfp8_raw")
+a_fp8, a_exps = quantize_mxfp8(x)
+out = op_raw(a_fp8, b_shuffled, a_exps, w_exps)
+
 # Decode. No padding and none needed; M is a runtime argument, and both scales
 # go in as the checkpoint stores them -- w_exps itself, not b_scale.
 assert supports_gemv(N, K)
@@ -204,10 +325,11 @@ gemv = Mxfp8GemvOp(n=N, k=K)
 out = gemv(x_fp8, b_shuffled, x_exps, w_exps)
 ```
 
-**They share the weight and not the scales.** `preshuffle_b` output serves both,
-so a server shuffles once. But `Mxfp8GemmOp` wants the A scale through
-`preshuffle_a_scale` -- K-block major, four M tiles to a dword -- while
-`Mxfp8GemvOp` takes **both scales exactly as the checkpoint stores them**,
+**They share the weight and, with `quant="mxfp8_raw"`, the scales too.**
+`preshuffle_b` output serves both, so a server shuffles once. The default
+`quant="mxfp8"` wants the A scale through `preshuffle_a_scale` -- K-block major,
+four M tiles to a dword -- while `Mxfp8GemvOp` and `"mxfp8_raw"` take **both
+scales exactly as the checkpoint stores them**,
 row-major ue8m0 bytes, `[M, K/32]` and `[N/32, K/32]`. That is not an
 inconsistency: the GEMM's sixteen lanes want sixteen *rows* of one K block and
 have to be coalesced, where the GEMV's are sixteen *tokens*, M is at most 32, and
@@ -219,11 +341,11 @@ shape is expressible -- K a multiple of 128, N a multiple of 256 for the GEMM
 and of 32 for the GEMV. M is deliberately not an argument to either: any M is
 *servable*, and whether it is *profitable* is the caller's call.
 
-**Which M is profitable is decided by the grid, not by M.** The GEMM's tile is
-256x256, so a caller should gate on `ceildiv(M, 256) * (N / 256)` and hand over
-at about 80 workgroups; a floor on M alone is only ever right for the N it was
-fitted to. The measurement behind that, and what it costs to get it wrong, is
-[here](#the-mxfp8-gemm-against-sglang-across-every-shape).
+**Which M is profitable depends on the grid.** The wide GEMM tile is 256x256,
+so `ceildiv(M, 256) * (N / 256)` is a useful descriptor. The
+[historical all-shape study](#the-mxfp8-gemm-against-sglang-across-every-shape)
+records earlier admission thresholds; use the current target measurements when
+choosing a policy for `wo_b` or `wq_b`. Public dispatch defaults are unchanged.
 
 **The GEMV's ceiling is 32 tokens**, because a token is an MFMA row and two tiles
 of them is where the register file runs out. It picks a compile-time
@@ -270,35 +392,155 @@ The first version launched 512 -- the quantize grid -- and lost to SDMA by 17%.
 
 ### Benchmarks and tests
 
+Needs a mori built with `BUILD_CCO_SDMA=ON`, which is the default -- worth
+checking on an older image, because setting `MORI_ENABLE_SDMA` does not make up
+for it: that only rebuilds the *device* bitcode, and a host library built
+without the flag has no SDMA queues, so every put silently does nothing and the
+all-reduce quietly produces zeros.
+
 ```bash
 # numerics
-MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
+BUILD_CCO_SDMA=ON MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
   pytest tests/python/cco/test_gemm_ar.py tests/python/cco/test_flydsl_ar.py \
-         tests/python/cco/test_gemm_ar_op.py
+         tests/python/cco/test_gemm_ar_op.py tests/python/cco/test_gemm_ar_schedule.py
 
-# the full mode comparison at the model's shape
-MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo python -m torch.distributed.run \
-  --standalone --nproc_per_node=8 benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py \
+# DeepSeek-V4-Pro, TP8
+MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
+  torchrun --standalone --nproc_per_node=8 \
+  benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py \
   --mode fused-sdma --quant blockscale -m 16384 -n 7168 -k 2048
+
+# DeepSeek-V4.1-Flash, TP4, with the wire that wins there
+MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
+  torchrun --standalone --nproc_per_node=4 \
+  benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py \
+  --mode fused-sdma --quant mxfp8 -m 16384 -n 5120 -k 2048 \
+  --gather-dtype fp8 --gather-transport lsa --no-fuse-quantize
 ```
 
-Requires a mori built with `BUILD_CCO_SDMA=ON`, which is the default. Setting
-`MORI_ENABLE_SDMA` in the environment only rebuilds the device bitcode -- a host
-library built without the flag has no queues, so every put silently does nothing
-and the all-reduce quietly produces zeros.
+Each run prints a `RESULT_JSON` line with `max_rank_time_us`, `rel_l2` and
+`validated`, so a sweep can be parsed rather than eyeballed.
 
-Every flag, every sweep driver, and how to drive the whole thing from a server
-are in
-[`docs/MORI-GEMM-AR-BENCHMARK.md`](../../../../docs/MORI-GEMM-AR-BENCHMARK.md).
+Matrices are presets of `sweep.py`, which runs one point per process, enforces
+the `BUILD_CCO_SDMA` guard, records occupancy either side, and **exits non-zero
+with the count of failed points**:
+
+```bash
+python benchmark/cco/flydsl/gemm_ar/sweep.py --list
+python benchmark/cco/flydsl/gemm_ar/sweep.py fused          # the mode matrix
+python benchmark/cco/flydsl/gemm_ar/sweep.py fused-wire     # the fp8 leg's knobs
+python benchmark/cco/flydsl/gemm_ar/report.py fused.jsonl
+```
+
+`report.py` keys on every configuration field a row carries, so a matrix that
+varies `gather_transport` or `fuse_quantize` renders as separate tables rather
+than silently overwriting itself.
+
+The public `wo_b` regression is `tests/python/cco/gemm_ar_schedule_worker.py`:
+run with `torch.distributed.run --standalone --nproc_per_node=8` and
+`--quant blockscale`, or TP4 and `--quant mxfp8`. Add `--schedule default` for
+the legacy control, or `--scatter fp8 [--gather fp8]` for Flash's lossy paths.
+It checks mixed-M graphs, changed inputs, guards and actual FP8 wire semantics.
+
 Read [Measurement traps](#measurement-traps) before trusting a small-M number
 from a harness of your own.
 
+#### Modes and quantisation
+
+`--mode` selects what is measured, all reaching the same end state:
+
+| mode | what runs |
+|---|---|
+| `gemm-only` | the GEMM alone, to size the ceiling |
+| `split-sdma` | `gemm` then a 4-kernel SDMA all-reduce |
+| `fused-sdma` | GEMM with the scatter fused into its epilogue |
+| `split-lsa` | `gemm` then the 2-kernel LSA all-reduce |
+| `fused-lsa` | GEMM storing straight into peers |
+
+`--quant` picks the operand contract, and it is per model -- `blockscale` for
+V4-Pro (A 1x128, B 128x128, fp32 scales), `mxfp8` for V4.1-Flash (32-wide ue8m0
+on both, int32). `mxfp8_raw` is the same quantisation with the scales as
+row-major uint8 bytes, staged through LDS; it is the faster of the two cold
+and at large M (see [the mxfp8 GEMM, on its own](#the-mxfp8-gemm-on-its-own)).
+Two more exist and are not for use: `mxfp8_unpacked` and `mxfp8_row` are the
+scale layouts `mxfp8` was chosen over, kept so the choice stays measurable.
+
+> **Pin `--quant` when comparing anything against anything.** The benchmark
+> defaults to `ptpc`, which is ~3% faster than `blockscale` and a different
+> kernel again from `mxfp8`. Reading one against the other looks exactly like a
+> machine that drifts overnight.
+
+mxfp8 compiles at `BLOCK_M=256` where blockscale needs 128, so M pads to a
+multiple of `world_size * 256`. That is not a tuning choice -- the packed scale
+puts a lane's four M tiles in one dword, which is four tiles only at
+`BLOCK_M//64 == 4`.
+
+#### The fp8 wire's knobs
+
+`--gather-dtype fp8` is [fp8 on the wire](#fp8-on-the-wire). The reduce still
+accumulates in fp32 and the output is still bf16; only the wire changes. The
+scatter leg is unchanged -- it carries partial sums that are then added across
+every rank, so its error would compound rather than being a single rounding.
+
+| flag | recommendation |
+|---|---|
+| `--gather-transport {sdma,lsa}` | **`lsa`**: CUs pull and widen on the way in, where SDMA has to land the fp8 and read it back out of local HBM |
+| `--no-fuse-quantize` | **on**: folding the narrowing into the reduce costs 1-2% |
+| `MORI_GEMM_AR_PULL_BLOCKS` | **48-80**; these are xGMI reads, so the grid throttles outstanding remote requests rather than covering HBM latency |
+
+The pull grid is the single most important tuning parameter (the table under
+[Who moves the fp8 gather](#who-moves-the-fp8-gather)). Sweep it with:
+
+```bash
+for b in 16 24 32 48 64 80 128 256; do
+  MORI_GEMM_AR_PULL_BLOCKS=$b MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
+    torchrun --standalone --nproc_per_node=8 \
+    benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py --mode fused-sdma \
+    --quant blockscale --gather-dtype fp8 --gather-transport lsa \
+    -m 16384 -n 7168 -k 2048
+  sleep 10
+done
+```
+
+#### The GEMM on its own, benchmarked
+
+Single process, no collective, so no `torchrun`. `bench_gemm.py` covers two
+scopes, and they are different questions rather than two views of one.
+`--scope kernel` takes operands that are already quantised and already padded,
+which is what a tile or a scale layout is chosen on; `--scope linear` starts from
+bf16 and puts quantisation, padding and the op's own tile dispatch inside the
+measurement, which is what a layer costs.
+
+```bash
+B=benchmark/cco/flydsl/gemm_ar
+
+# the multiply alone, either quantisation, any shape
+python $B/bench_gemm.py -n 5120 -k 2048 -m 4096 --scope kernel --impl auto
+
+# the layer, against SGLang. --impl gemm256,gemm128 pins mori's N tile so the
+# dispatch can be measured rather than trusted
+python $B/bench_gemm.py --shape wq_b -m 1024 --scope linear \
+  --impl auto,gemm256,gemm128,sglang
+
+# the skinny GEMM (M <= 32); --baseline none drops the SGLang import entirely
+python $B/bench_gemv.py --shape wq_b -m 1 --sweep
+```
+
+The SGLang baseline is optional throughout -- mori's own numbers need nothing
+installed but mori -- but `--scope linear` does need it, because the
+quantisation inside the measurement is SGLang's quantiser.
+
+Comparing against SGLang's own route needs its harness, which lives in the
+SGLang tree because the baseline does
+(`test/registered/perf/models/bench_mori_mxfp8_gemm.py`); it takes `-n`/`-k` for
+any shape, or a name for any of V4.1-Flash's layers.
+
 ## Measured results
 
-MI355X (gfx950), one node, otherwise idle, occupancy recorded before and after
-each run. Kernel timings are the median over repeated iterations, maximum over
-ranks. Run-to-run spread is about **2%**, so differences below that are not
-differences.
+The original tables are historical MI355X (gfx950) measurements, with their
+original scopes and timing methods. Their observed run-to-run spread was about
+2%; this is not a universal noise threshold. The dated update below records a
+separate operator retest and does not pool its numbers with the historical runs.
 
 Two models are covered and **they do not reach the same conclusion**, so they
 are kept apart rather than averaged:
@@ -308,8 +550,135 @@ are kept apart rather than averaged:
 | `wo_b` per rank | `[M, 7168]` K=2048, TP8 | `[M, 5120]` K=2048, TP4 |
 | quantisation | 1x128 / 128x128 fp8 block scale | **32-wide ue8m0 (mxfp8)** |
 | `--quant` | `blockscale` | `mxfp8` |
-| fusing, best wire | **-25%** at M=16384 | **-25%** at M=16384 |
-| what dominates it | the overlap | the fp8 wire and the GEMM |
+| best configuration | `fused-sdma` + fp8 gather | `fused-sdma` + fp8 gather over LSA |
+| at M=16384, against split-sdma/bf16 | **979.3 us against 1472.9, -33%** | **1192.1 us against 1592.5, -25%** |
+| what dominates it | the overlap | the fp8 wire, then the GEMM |
+| vs the model as it ships | 1419.5 us -> 979.3, **-31%** | see below |
+
+The rows come from [DeepSeek-V4-Pro](#deepseek-v4-pro-blockscale-tp8) and
+[DeepSeek-V4.1-Flash](#deepseek-v41-flash-mxfp8-tp4) below.
+
+**On V4.1-Flash most of the win is not the fusing.** The GEMM is 178us against
+1414us of communication, so hiding it entirely would be worth 11-15% and fusing
+collects about half of that. The fp8 wire is worth -15.6% on its own and the
+mxfp8 GEMM another -30.3% against the route SGLang would otherwise take. Reading
+V4-Pro's conclusion across would set every threshold wrong.
+
+The GEMM is also usable on its own, with no collective attached
+(`Mxfp8GemmOp`, and `Mxfp8GemvOp` for decode's token counts). Against SGLang's
+native mxfp8 linear across all twelve of V4.1-Flash's fp8 linear shapes, what
+decides the outcome is the grid, `ceildiv(M,256) * (N/256)`
+([the full study](#the-mxfp8-gemm-against-sglang-across-every-shape)):
+
+| grid (workgroups) | median vs SGLang |
+|---|---:|
+| 1-32 | +246.7% |
+| 33-64 | -0.7% |
+| 65-128 | **-10.2%** |
+| 129-256 | **-26.6%** |
+| >256 | **-26.4%** |
+
+End to end in a server ([End to end, in SGLang](#end-to-end-in-sglang)),
+V4.1-Flash prefill throughput at batch sizes 4-16 is **+5.6% to +6.0%** on the
+fp8 wire, **+2.2% to +2.5%** from the standalone GEMM with nothing fused, and
+**+7.4% to +7.7%** with both enabled; V4-Pro is **-5.0% GPU busy** over a
+profiled prefill. Per-layer wins are larger than end-to-end ones because `wo_b`
+is about 12% of the profile, and the two SGLang-side results stack without
+adding -- they split that layer by M rather than both working on it. One
+`both`-enabled server out of nine hit an illegal memory access under sustained
+load and has not reproduced; what has been ruled out is in that section.
+
+### Follow-up experiments (2026-09-30)
+
+The same two `wo_b` targets were evaluated on `v2-015` with isolated prototype
+modules. The positive joint profile and relaxed-row FP8 scatter are now
+available through the public op's opt-in settings above; defaults are unchanged.
+All 27 experiment jobs and four strict finite-value rechecks passed their numerical/guard checks,
+including post-graph output checks and mixed-M graph validations. Paired timings use 8 calls per graph and 21 replays:
+3 alternating rounds, or 5 for the independent Pro tail confirmations and
+macro-pipeline comparisons. No external GPU process was observed by the monitor.
+
+| Direction | Target | Result |
+|---|---|---|
+| Joint padding/chunk selection | Pro TP8 | M=8200: original padding with `chunk_bands=2` measured **702.48 µs**, versus **707.30 µs** for align64/band1 and **728.82 µs** for the original policy |
+| One-band short tails, independent confirmation | Pro TP8 | M=11264: **1074.35 → 819.42 µs** (−23.7%); M=13312: **1274.86 → 957.80 µs** (−24.9%). About **1.9% / 1.2%** faster than band2 in the same paired runs |
+| FP8 scatter + reduced padding | Flash TP4 | Versus FP8 scatter with original padding, align64/band1 saved another **12.2% / 11.0%** at M=4200 and **4.5% / 2.3%** at M=8200, for BF16 / FP8 gather respectively |
+| BF16 pull gather | Both, M=4096/16384 | No win over SDMA with 16/24/32/64/128 blocks; retain the existing gather path |
+| Two macro partitions on two streams | Both, M=16384 | **10.1% slower** on Pro TP8 and **5.6% slower** on Flash TP4; serial splitting was already 8.5% / 4.0% slower |
+
+The joint profile selects only among measured points, with a 2% margin
+over baseline; this is not a general dispatch policy. Mixed-M, changed-input
+and cached-graph checks passed with fixed window offsets, disjoint plan slots
+and counter capacity 16 (the one-band Pro tails require 11/13 chunks).
+
+The ragged FP8 prototype masks partial quantization tiles and transfers scales
+with the same owner/chunk boundaries as the payload. Both actual communication
+legs passed the existing wire checks. Rank-0 FP32-reference relL2 was about
+2.62% with BF16 gather and 3.48% with both FP8 legs; every rank passed the gates.
+This retains BF16 staging and does not implement register-direct quantization.
+
+The pipeline result applies to the tested macro split with separate queue lanes
+and joined streams; it does not evaluate receiver-ready reduction during one
+monolithic GEMM launch. All timings exclude activation preparation and use equal
+backing capacities with logical tail guards, as in the 2026-09-29 retest.
+Prototype code, patches, paired results and reproduction commands are archived
+in [`gemm-ar-followup-20260930`](</workspace/reports/gemm-ar-followup-20260930/README.md>).
+
+Public integration was checked separately on `v2-015`: 65 host checks and all
+six TP8/TP4 public-op jobs passed, covering default/profile scheduling,
+changed-input graph replay, guards, self-test and both FP8 communication legs.
+The kernel timings above remain the prototype measurements; no new latency or
+model-quality claim is added. Integration logs and source hashes are in
+[`gemm-ar-integration-20260930`](</workspace/reports/gemm-ar-integration-20260930/README.md>).
+
+### Target operator update (2026-09-29)
+
+Measured on `v2-015`, MI355X/gfx950, Torch 2.11 / ROCm 7.2.4 / FlyDSL 0.2.4,
+using MORI `fd35a5ec79d8` and SGLang operator source `e29ebcd051`. The published
+runs used GPU-process monitoring; the earlier run with background GPU work was
+excluded. GEMV, model end-to-end and model-quality tests were not rerun.
+
+The table summarizes the target operator results. Latencies are in µs;
+negative Δ means faster. Prefill comparisons use prequantized operands and
+8 calls per graph, 21 replays, 3 alternating rounds (5 for short tails).
+They exclude activation quantization/padding, weight packing and compilation.
+
+| Change | Target | Measured result |
+|---|---|---|
+| Short final chunk, `chunk_bands=2` | Pro TP8 `wo_b` | M=11264: **1074.44 → 835.64** (−22.2%); M=13312: **1273.25 → 969.71** (−23.8%) |
+| Reduced padding, align64 | Flash TP4 `wo_b` | True M=4200: **533.56 → 460.27** (−13.7%); M=8200: **894.46 → 830.37** (−7.2%). Pro TP8 gains were only 0.6% / 2.9% |
+| Workspace input/output alias | Both `wo_b` targets, M=16384 | Logical layout: **700.006 → 420.006 MiB/rank** (TP8), **520.006 → 280.006** (TP4); paired latency changed by −0.2% / −0.1% |
+| FP8 scatter | Flash TP4 `wo_b`, M=16384 | **−21.1%** with BF16 gather, **−26.6%** with FP8/LSA gather; Pro TP8 was **3.0% / 2.5% slower** |
+| Grouped reduce + quantize, 128/256/512 | Both `wo_b` targets, M=16384, FP8/LSA gather | Pro TP8 **4.2–4.3% slower**, Flash TP4 **2.4–2.5% slower**; retain separate phases |
+
+Standalone MXFP8 linear GPU paths were also compared on Flash TP4 `wo_b` and
+`wq_b`. At M=2048/4096/8192/16384, MORI auto was **25.4–32.2% / 28.7–40.9%**
+faster than SGLang, respectively; M=64/256 remained slower. These cold timings
+rotate 39 weight copies (390 MiB of FP8; SGLang also rotates its BF16 copy),
+use 3 alternating rounds, and include GPU activation quantization and padding.
+Python dispatch and graph construction are outside timed replay.
+
+Short tails require matching completion counts. Reduced padding uses
+`relaxed_rows=True`, positive `chunk_bands` and at least one full tile per rank.
+These and workspace reuse remain low-level/harness options; public padding,
+allocation and dispatch defaults are unchanged.
+
+FP8 scatter is a lossy option: Flash TP4 relL2 against the FP32 reference was
+**2.62%** with BF16 gather and **3.48%** with both FP8 legs. Independent reference,
+repeated/changed-input and actual payload/scale checks passed. Existing
+gather-only quality results do not validate FP8 scatter's model quality.
+
+The feature harness uses equal backing capacities with guards beyond each
+logical layout to avoid a multi-window registration failure in this runtime.
+Separate fresh-process allocation checks measured **702 → 422 MiB/rank** for
+TP8 and **522 → 282** for TP4. Those physical allocation deltas and the paired
+latencies are separate measurements; full operator peaks and immediate physical
+reclamation are not established.
+
+Detailed results, commands, runtime/source hashes and failed attempts remain
+outside the repository in
+[`gemm-ar-v2-015-20260929`](</workspace/reports/gemm-ar-v2-015-20260929/README.md>).
+These are operator microbenchmarks, not new model end-to-end speedups.
 
 ### The mxfp8 GEMM, on its own
 
@@ -358,6 +727,105 @@ state, so the mainloop is untouched.
 the permutation stays inside the 64 bytes one program already owns, so it is
 address arithmetic rather than traffic, and measures slightly *faster* than the
 stock kernel.
+
+**At long K the scales are loaded one K step ahead.** At the same 256x256 tile
+the mxfp8 GEMM measured 15-20% slower than ptpc, and none of that is the scaled
+MFMA: with constant scales instead of loaded ones it runs at ptpc's speed (899
+vs 905us at 16384x10240x8192). The cost is where the scale loads sit. They are
+issued at the top of a K step, after the previous step's tile prefetches, and
+the first MFMA waits for them with `s_waitcnt vmcnt(3)` -- which, because vmcnt
+retires in issue order, also waits for those prefetches. Every step loses about
+half a step of latency hiding. Issued one step earlier, the wait becomes
+`vmcnt(17..20)` and stops blocking; loading them two steps earlier gains nothing
+more.
+
+It is not free at short K: six more VGPRs are live across a step, in a kernel
+already at 256, and at K=2048 the 256x256 kernel spills 18 registers against
+4 without it. At the K where it turns on the reverse holds -- at K=4096 and
+8192 spills go from 6 (28 B of scratch) to 0. So `scale_prefetch` is on by
+default only for `quant="mxfp8"` at `K >= SCALE_PREFETCH_MIN_K` (4096). GEMM only, 256x256, MI355X, FlyDSL 0.4.0,
+CUDA-graph timed with B rotated past the LLC, median of two to three
+interleaved rounds, relL2 1.66e-3 throughout:
+
+| M x N x K | | off | on | |
+|---|---|---:|---:|---:|
+| 1024 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 49.6 | 44.4 | **-10.4%** |
+| 4096 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 95.9 | 90.3 | **-5.8%** |
+| 8192 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 151.5 | 146.8 | **-3.1%** |
+| 16384 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 274.9 | 265.2 | **-3.5%** |
+| 8192 x 7168 x 4096 | | 204.3 | 201.7 | -1.2% |
+| 8192 x 5120 x 8192 | V4.1-Flash `wo_b`, TP1 | 281.5 | 271.4 | **-3.6%** |
+| 16384 x 5120 x 8192 | V4.1-Flash `wo_b`, TP1 | 546.1 | 504.0 | **-7.7%** |
+| 4096 x 10240 x 8192 | | 282.8 | 267.6 | **-5.4%** |
+| 16384 x 10240 x 8192 | | 1099.5 | 989.2 | **-10.0%** |
+| 2048 x 18432 x 16384 | | 590.1 | 527.7 | **-10.6%** |
+| 8192 x 18432 x 16384 | | 1939.0 | 1835.8 | **-5.3%** |
+
+Below 4096 it is shape-dependent rather than a win. Forced on, V4.1-Flash's
+TP2 `wq_b` (16384 x 1280) is 0-5% slower from M=1024 to 8192 and level at
+16384, and the 256x256 shapes at K = 512 and 1280-2048 measured 1-8% slower;
+it was faster at K = 256, 640 and 1792 and on the 256x128 tile. 8192x7168x4096
+is the one shape at the threshold that does not gain, and it is level hot
+(+0.9%). `scale_prefetch=True/False` overrides the default.
+
+This and `"mxfp8_raw"` below take the same `vmcnt` coupling apart two ways:
+prefetch keeps the scales in global memory and issues their loads a step
+earlier, `"mxfp8_raw"` moves them into LDS. They do not combine: a raw-mode
+read one step ahead could cross into an LDS chunk not yet staged, so
+`scale_prefetch=True` with `"mxfp8_raw"` is refused, and so is it with
+`ptpc` or `blockscale`, which have no mxfp8 scales to prefetch.
+
+Moving the scale loads also moved the wait that had been retiring `a_next1`.
+The end-of-step `wait_barrier` was `2A + B` (A, B = A and B LDS steps), but
+only `A + 2B` loads are issued after `a_next1`: equal at 256x256, one too many
+on `Mxfp8GemmOp`'s 256x128 tile, where `a_next1`'s second load was covered
+only by the wait for the next step's scales -- issued after it without the
+prefetch, before it with. The wait is now `min(2A + B, A + 2B)`: `vmcnt(4)`
+at 256x128, the same code at 256x256. It was never seen to corrupt (12,800
+narrow-tile calls under a concurrent copy stream, all bit-identical); the
+tests now compare prefetch on against off bitwise on both tiles.
+
+**Row-major scales through LDS (`quant="mxfp8_raw"`) beat the packed and
+unpacked layouts read from global without the prefetch, cold and at large M**
+(the table below has where they do not; it was measured before the prefetch,
+and raw has not been compared against packed-with-prefetch at K >= 4096). The packed
+layout fixes the addresses but still reads from global once per K step, and that
+costs in two ways the counters above do not show. The MFMA that consumes a scale
+waits for it with `vmcnt`, which retires in issue order, so it also waits for
+the tile prefetches issued before it: 63 `vmcnt` waits in the K=2048 kernel.
+And the scale registers stay live across the step in a kernel already at 256
+VGPRs, which spills 8 of them at K=512. `"mxfp8_raw"`, after aiter's
+`ScaleRawLds`, has each wave copy its share of four K steps of scales into LDS
+with `buffer_load ... lds`, double-buffered, and read them back with
+`ds_read_u8`: 20 `vmcnt` waits, no spill at K=512. The row-major address problem
+does not come back, because the copy moves 16 bytes of a row per lane and the
+reads are LDS. GEMM only, MI355X, graph-timed, idle-gated, min of three passes
+with the two alternating:
+
+| M x N x K | tile | `mxfp8` cold | `mxfp8_raw` cold | | hot |
+|---|---|---:|---:|---:|---:|
+| 64 x 8192 x 1280 | 256x128 | 14.5 | 12.4 | -14.6% | +4.5% |
+| 1024 x 8192 x 1280 | 256x128 | 19.6 | 17.8 | -9.2% | +0.1% |
+| 64 x 5120 x 2048 | 256x128 | 18.8 | 16.7 | -11.4% | +6.0% |
+| 1024 x 5120 x 2048 | 256x128 | 22.5 | 20.2 | -10.4% | -0.2% |
+| 4096 x 5120 x 2048 | 256x256 | 51.6 | 48.5 | -5.9% | -5.8% |
+| 16384 x 5120 x 2048 | 256x256 | 149.2 | 146.5 | -1.8% | -2.3% |
+| 4096 x 7168 x 256 | 256x256 | 17.9 | 17.4 | -2.3% | -2.2% |
+| 16384 x 7168 x 512 | 256x256 | 86.7 | 76.7 | -11.5% | -12.0% |
+| 8192 x 7168 x 640 | 256x256 | 50.7 | 51.2 | +0.9% | +2.0% |
+| 8192 x 7168 x 1280 | 256x256 | 78.6 | 77.0 | -2.1% | -2.5% |
+| 4096 x 7168 x 2048 | 256x256 | 56.8 | 54.8 | -3.5% | -2.6% |
+| 16384 x 7168 x 2048 | 256x256 | 209.1 | 201.7 | -3.5% | -2.9% |
+| 32768 x 7168 x 1792 | 256x256 | 424.4 | 394.8 | -7.0% | -6.7% |
+| 8192 x 7168 x 4096 | 256x256 | 194.2 | 191.8 | -1.2% | -0.8% |
+
+Cold is the number a forward pass sees. The two places it loses are where the
+staging is not amortised: K=640 is five K steps in two chunks, and hot at M=64
+copies 256 rows of A scale for 64 real ones. It also takes any M, since there is
+no packed group to pad to. `"mxfp8"` stays the default so that callers whose
+quantiser writes the packed layout keep working; below K=4096 new callers
+should take `"mxfp8_raw"`. At K >= 4096, where `"mxfp8"` prefetches its
+scales, the two have not been compared.
 
 **Against the alternatives**, bf16 in and bf16 out, the whole pipeline including
 quantisation, M=16384:
@@ -753,11 +1221,11 @@ combination where it is asked for.
 **Picking the fp8 gather's transport.** The fp8 leg is worth more than the
 fusing here, so its own knobs matter. Three are real; two that look like knobs
 are not -- `--gather-bands` and `--fuse-reduce-push` are read only by
-`sdma_reduce_push`, which rejects `fp8_gather` outright, and
-`scatter_dtype='fp8'` raises `NotImplementedError` (its regions are sized but
-nothing writes the payload; that is the other leg and the larger remaining
-lever). TP4, M=16384, all 24 runs validated and all at relL2 2.31e-02 -- these
-knobs move time, not numbers:
+`sdma_reduce_push`, which rejects `fp8_gather` outright. The historical table
+below keeps BF16 scatter; the newer FP8 scatter prototype is measured separately
+in the [target update](#target-operator-update-2026-09-29). TP4, M=16384, all 24
+historical runs validated and all at relL2 2.31e-02 -- these knobs move time,
+not numbers:
 
 | | gather=sdma, fq off | fq on | **gather=lsa, fq off** | fq on |
 |---|---:|---:|---:|---:|
@@ -811,6 +1279,172 @@ plus a fill guard.
 
 > These numbers are only meaningful because `_PinnedLaunch` exists -- see
 > [Measurement traps](#measurement-traps).
+
+#### Operator phase breakdown (2026-09-30)
+
+Flash TP4 `wo_b`, **M=16384, N=5120, K=2048, MXFP8**, on `v2-015` using
+Mori `f3bff0ae`. These are fresh operator measurements; the earlier Pro TP8
+SGLang phase table describes a different workload. All configurations use
+256x256 GEMM tiles, one SDMA queue per peer where applicable, eight fused
+scatter chunks, and separate reduce/quantize.
+
+BF16 gather in every column; only the last column uses FP8 scatter:
+
+| Phase (µs) | split-LSA | split-SDMA | fused-SDMA | fused-SDMA, FP8 scatter |
+|---|---:|---:|---:|---:|
+| GEMM / GEMM+scatter | 184.0 | 149.9 | 202.2 | 257.1 |
+| Scatter / drain | — | 728.0 | 587.3 | 211.4 |
+| Reduce | — | 32.4 | 32.5 | 22.4 |
+| SDMA gather | — | 727.8 | 727.7 | 728.6 |
+| LSA AR (single kernel) | 1501.1 | — | — | — |
+| Whole call, tracing off | **1686.4** | **1638.8** | **1549.6** | **1219.7** |
+
+FP8 gather in every column below. `split` means split-SDMA, `fused` means
+fused-SDMA; `/ SDMA` or `/ LSA` identifies the **gather** transport. Scatter
+is BF16 except in the last column:
+
+| Phase (µs) | split / SDMA | split / LSA | fused / SDMA | fused / LSA | fused, both FP8 / LSA |
+|---|---:|---:|---:|---:|---:|
+| GEMM / GEMM+scatter | 184.5 | 182.0 | 229.9 | 228.3 | 268.3 |
+| Scatter / drain | 729.4 | 728.9 | 563.8 | 566.1 | 204.0 |
+| Reduce | 32.9 | 32.2 | 33.6 | 32.4 | 22.3 |
+| Quantize gather | 16.4 | 15.9 | 15.8 | 15.8 | 15.8 |
+| SDMA gather | 373.6 | — | 373.5 | — | — |
+| Gather barrier | — | 5.8 | — | 5.5 | 5.7 |
+| Dequantize gather | 40.2 | — | 39.8 | — | — |
+| LSA pull + dequantize | — | 388.0 | — | 386.4 | 385.2 |
+| Whole call, tracing off | **1376.6** | **1353.4** | **1257.0** | **1234.9** | **901.4** |
+
+The changes can be attributed as follows:
+
+- BF16 split-SDMA → fused-SDMA: the GEMM grows by **52.3 µs**,
+  while scatter/drain shrinks by **140.7 µs**. The combined
+  GEMM+scatter prefix saves **88.4 µs**; reduce/gather are
+  essentially unchanged. The whole call saves **89.2 µs**.
+- Fused BF16 → FP8/LSA gather: gather including conversion and its barrier
+  changes from **727.7 to 407.7 µs**, saving
+  **319.9 µs**. The whole call saves **314.7 µs**.
+- On top of FP8/LSA gather, FP8 scatter adds **40.0 µs** to the
+  GEMM/epilogue, saves **362.2 µs** of drain and **10.1 µs**
+  of reduce. The whole call saves another **333.5 µs**.
+
+`—` means no separate kernel. Split-LSA performs its reduction and gather in
+one `ar_2stage` kernel. Fused GEMM includes scatter submission and any scatter
+quantization; drain is only the remaining transfer wait and synchronization.
+GEMM times are measured inside each complete pipeline, whose preceding work
+and cache state differ; a standalone GEMM time cannot be substituted here.
+
+Phase entries are rocprofv3 kernel-duration means: each round uses all phases
+from the same rank (selected by the largest median trace-on whole-call time),
+then averages three rounds. Whole-call times are independently measured with
+tracing off: 8 calls/graph, 21 replays/round, median of three rank-max rounds.
+The two aggregations need not sum exactly. Trace-on total perturbation was
+at most **0.12%** across these configurations.
+
+All nine configurations passed independent FP32-reference, changed-input,
+graph-replay and guard checks; FP8 scatter also passed the actual-wire checks.
+Both FP8 legs give about **3.48% relL2**; model quality was not tested.
+Raw timings, 88,704 kernel records, per-rank breakdowns and reproduction commands
+are in [the phase archive](</workspace/reports/gemm-ar-phases-20260930/README.md>).
+
+### Kimi-K3 (blockscale, TP8 and TP4)
+
+A third model, and the first one here whose fused layer is an MLP `down_proj`
+rather than attention's `wo_b`. K3's text config is hidden 7168, dense
+intermediate 33792, `moe_intermediate` 3072 with 2 shared experts, and
+`first_k_dense_replace=1` -- so of 93 layers exactly one is dense and 92 are
+MoE. `down_proj` is `RowParallelLinear(intermediate, hidden)`, which puts
+**N = 7168** and **K/rank = intermediate / TP** in front of this op:
+
+| layer | count | TP8 K/rank | TP4 K/rank |
+|---|---:|---:|---:|
+| dense MLP `down_proj` | 1 | 4224 | 8448 |
+| shared experts `down_proj` | 92 | 768 | 1536 |
+
+All of them are expressible: 7168 is 28x256 and every K is a multiple of 128.
+That is not automatic -- `gemm_ag`'s K3 shapes (the *input* projections, N=6288
+and 3648) are not multiples of 128 and cannot be expressed at all. The
+difference is which side of the layer the collective is on: `down_proj`'s N is
+the hidden size, which is aligned by construction.
+
+**The shared-expert row is the one that matters**, since it is 92 of the 93
+layers, and it is also the hardest case: K/rank 768 at TP8 is a third of
+DSV4.1-Flash's 2048, so there is correspondingly less GEMM to hide the
+collective behind.
+
+8x MI355X, `--quant blockscale`, N=7168, bf16 wire on both legs and every
+opt-in path off, so this isolates fusing from everything else. Three
+alternating repetitions per arm, min of per-arm medians; within-arm spread was
+0.54% median and 3.49% worst. Negative is fused faster.
+
+| layer | K/rank | M=1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---:|---:|---:|---:|---:|---:|
+| TP8 shared | 768 | +2.7% | -0.5% | -3.5% | -5.1% | **-9.7%** |
+| TP8 dense | 4224 | +2.4% | -6.8% | -11.0% | -11.6% | **-21.4%** |
+| TP4 shared | 1536 | +4.0% | -1.4% | -5.7% | -7.7% | **-10.4%** |
+| TP4 dense | 8448 | +2.0% | -10.5% | -16.8% | -22.6% | **-21.6%** |
+
+The crossover is at M ~ 2048 and more K wins more, both as expected. All 120
+runs validated at relL2 2.35e-3.
+
+#### Below the crossover there is nothing to chunk
+
+Fusing loses 2-4% at M=1024, and `--chunk-bands` does not rescue it. The
+`chunks` each run reports says why: at M=1024 on TP8 a peer's slice is
+`1024/8 = 128` rows, exactly one `BLOCK_M=128` band, so the finest setting
+already produces one chunk. One chunk is one push after the GEMM, which is the
+split path with extra bookkeeping.
+
+| layer | M | split | fused | fused `--chunk-bands 1` | chunks |
+|---|---:|---:|---:|---:|---|
+| TP8 shared | 1024 | 120.1 | +2.6% | +2.9% | 1 -> 1 |
+| TP8 shared | 2048 | 197.8 | -0.0% | -0.3% | 2 -> 2 |
+| TP8 dense | 1024 | 157.0 | +2.9% | +1.6% | 1 -> 1 |
+| TP8 dense | 2048 | 270.9 | -6.6% | -6.6% | 2 -> 2 |
+| TP4 shared | 1024 | 187.0 | +3.3% | +2.7% | 2 -> 2 |
+| TP4 dense | 2048 | 480.3 | -10.6% | -10.6% | 4 -> 4 |
+
+`chunk_bands` is bands *per push*, so a smaller value means more chunks. A
+first pass used 2 and made M=2048 worse: a peer's slice there is two bands, so
+two bands per push collapses it to a single chunk and removes the overlap
+(`chunks` went 2 -> 1, and the arm measured +5.5%). The short-tail option is
+for shapes whose *default* chunking leaves a ragged tail, not for shapes that
+are too small to chunk.
+
+#### An fp8 gather is worth more here than the fusing
+
+`--gather-dtype fp8 --gather-transport lsa`, against the same fused kernel with
+a bf16 wire, at the M where fusing already wins:
+
+| layer | M | bf16 | fp8/lsa | vs bf16 | vs split |
+|---|---:|---:|---:|---:|---:|
+| TP8 shared | 8192 | 607.1 | 497.8 | **-18.0%** | -22.5% |
+| TP8 shared | 16384 | 1148.4 | 932.1 | **-18.8%** | -26.7% |
+| TP8 dense | 8192 | 784.4 | 677.6 | -13.6% | -23.8% |
+| TP8 dense | 16384 | 1493.7 | 1329.9 | -11.0% | -29.9% |
+| TP4 shared | 8192 | 1106.3 | 883.8 | **-20.1%** | -26.3% |
+| TP4 shared | 16384 | 2160.7 | 1713.0 | **-20.7%** | -29.0% |
+| TP4 dense | 8192 | 1389.9 | 1219.5 | -12.3% | -32.1% |
+| TP4 dense | 16384 | 2904.7 | 2406.5 | -17.2% | -35.1% |
+
+The two stack in the convenient direction: the shared-expert rows gain least
+from fusing and most from the fp8 wire, and they are 92 of the 93 layers.
+Together they are -26.7% against the split baseline at TP8 and -29.0% at TP4.
+
+This leg is lossy. relL2 goes from 2.35e-3 to 2.3-2.5e-2, an order of
+magnitude, and no model-quality result backs it at these shapes.
+
+> Three of the 120 runs in the second sweep were discarded, not averaged in:
+> they measured 70-240x the rest with all eight ranks slow together, and they
+> were the first runs after a `pkill -9` of an earlier sweep, which does not
+> let the SDMA queues be reclaimed -- see the 20-second rule in
+> [Benchmarks and tests](#benchmarks-and-tests). The remaining 117 were clean,
+> at 0.69% median within-arm spread.
+
+These are operator microbenchmarks against this op's own split path, which is
+the comparison that isolates fusing. They are not an end-to-end claim, and the
+baseline a framework would replace is its own collective (RCCL or AITER
+QuickReduce), not this one.
 
 ### End to end, in SGLang
 
@@ -912,6 +1546,66 @@ An earlier capture of the same four read 1101.9 / 1077.2 / 1050.4 / 1048.2, so
 this reproduces to about half a percent. The layer-level win is larger than the
 end-to-end one because `wo_b` is about 12% of the profile.
 
+#### Reproducing the end-to-end numbers
+
+The SGLang numbers need the integration branch and a mori built with
+`BUILD_CCO_SDMA=ON` on `PYTHONPATH`.
+
+```bash
+export MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo
+export PYTHONPATH=/path/to/mori-with-sdma
+export SGLANG_OPT_FUSED_WO_B_AR=1
+export SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER=1     # optional, the fp8 wire
+export SGLANG_OPT_MORI_MXFP8_GEMM=1              # optional, the GEMM alone
+export SGLANG_DEBUG_FUSED_WO_B_AR=1              # optional, logs per-layer relL2
+
+sglang serve --model-path <DeepSeek-V4-Pro> --tp 8 \
+  --attention-backend dsv4 --page-size 256 --chunked-prefill-size 16384 \
+  --mem-fraction-static 0.88 --kv-cache-dtype fp8_e4m3 \
+  --enforce-shared-experts-fusion
+```
+
+V4.1-Flash is the verified MI350X low-latency cell plus mori's variables, at
+TP4. `AITER_BF16_FP8_MOE_BOUND=0` is load-bearing and is *not* part of the
+published cell: the checkpoint has `swiglu_limit=10.0`, so its MoE takes AITER's
+clamped-SwiGLU INTERLEAVE path, where no `ck_moe_stage1` kernel exists for
+(bf16 activation x fp4 weight) -- every M below the default bound of 256, which
+is every decode step, raises "Unsupported kernel config for moe heuristic
+dispatch".
+
+```bash
+export SGLANG_USE_AITER=1 SGLANG_MOE_PADDING=1
+export AITER_FLYDSL_FORCE_REDUCE=1 ROCM_QUICK_REDUCE_QUANTIZATION=NONE
+export AITER_BF16_FP8_MOE_BOUND=0
+
+sglang serve --model-path <DeepSeek-V4.1-Flash> --tp 4 --ep-size 4 \
+  --disable-radix-cache --mem-fraction-static 0.78 \
+  --chunked-prefill-size 16384 \
+  --speculative-algorithm DSPARK --speculative-dspark-block-size 5 \
+  --cuda-graph-max-bs 64 --cuda-graph-backend-prefill breakable \
+  --cuda-graph-max-bs-prefill 4096
+```
+
+`--chunked-prefill-size` has to be at least the wire's floor or no prefill chunk
+ever reaches it and the fused variants quietly measure the base path.
+
+`--mem-fraction-static` has to leave room for the symmetric window, which is VMM
+memory **outside** torch's allocator: 700 MiB on V4-Pro's bf16 wire and 812 MiB
+on fp8, which needs the extra staging region; 163 MiB at V4.1-Flash's TP4 shape
+with `m_max=5120`.
+
+The capture protocol matters more than it looks. Profile a *different* prompt
+than the one used to warm up, `flush_cache` between them, and compare the same
+request on both sides -- an earlier A/B without those controls reported a **+8.3%
+regression** that did not exist.
+
+```python
+warm = "Pack my box with five dozen liquor jugs. " * 2800
+main = "The quick brown fox jumps over the lazy dog. " * 2800
+gen(warm); post("/flush_cache"); post("/start_profile")
+gen(main); post("/stop_profile")
+```
+
 ### Measurement traps
 
 Each of these produced a confident wrong number before being caught, and none is
@@ -968,7 +1662,9 @@ rebound to its shuffled form `[N/16, K/128, 2048]` after
 5120 into 320, `supports` rejected it for not being a multiple of `BLOCK_N`, and
 the path fell back **without a word**. The server stayed correct and the profile
 stayed plausible. Only a harness that asserts fusing *happened* catches this,
-which is why both the correctness check and the end-to-end test now do.
+which is why both the correctness check and the end-to-end test now do. Both
+integrations log the shapes they serve for this:
+`SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG=1` and `SGLANG_OPT_MORI_MXFP8_GEMM_SHAPE_LOG=1`.
 
 **A threshold fitted on a coarse M grid is fitted to the gap.** `NARROW_N_BELOW_M`
 was a bare `M < 2048`, measured on a grid that jumped 1024 -> 2048 and so never
@@ -983,6 +1679,11 @@ appearing *worst* of the three rather than best, since the pull is the one leg
 that does not go through SDMA. Perplexity catches it and nothing cheaper does:
 862511 against 3.26 on the same text. A short prompt cannot catch it either,
 because fusing needs M >= 4096.
+
+**Back-to-back 8-rank runs can fail to start.** They hit `hsaKmtCreateQueueExt`
+failures (`anvil.cpp:237`) when a previous run's ranks have not released their
+SDMA queues yet. About 10s between runs is enough; a leftover server holding
+queues is not.
 
 ## How it works
 
@@ -1431,12 +2132,12 @@ against a transfer that shrinks with M, so on the standalone all-reduce it is
 +2.4% at M=4096 and -11.2% at M=16384. Per phase at M=16384: quantize 12.4us,
 dequantize 88.2us, against ~218us saved on the push.
 
-The scatter leg stays bf16. It carries partial sums that are then added across
-every rank, so its fp8 error compounds rather than being a single rounding, and
-it is already mostly hidden behind the GEMM -- its 1140 GB/s is not a bandwidth,
-it is the tell that the pushes went out from the epilogue and the drain is only
-waiting for the tail. `scatter_dtype="fp8"` sizes its regions but raises
-`NotImplementedError`.
+The public operator defaults to BF16 scatter; `scatter_dtype="fp8"` opts into
+FP8 fused-SDMA with separate reduction, including the measured relaxed-row
+Flash plans. Compact receive storage, direct LSA scatter and fused
+reduce/quantize or reduce-triggered gather remain unsupported with FP8 scatter.
+Its additional quantization error needs separate evaluation; see the
+[follow-up results](#follow-up-experiments-2026-09-30).
 
 ### Firing the gather's puts from inside the reduce
 

@@ -2,7 +2,7 @@
 
 Lets FlyDSL and Triton kernels call the CCO GDA/LSA/SDMA device API through
 extern-C wrappers compiled to bitcode and linked into the kernel. The C++
-device implementation (`ccoGda<P>` / `ccoSdma`) is reused unchanged.
+device implementation (`ccoGda<P, Mode>` / `ccoSdma`) is reused unchanged.
 
 ## The layers (top → bottom)
 
@@ -13,7 +13,7 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   └─ Triton: mori.ir.triton.cco.gda_put_iw_inc(...)
        └─ core.extern_elementwise(..., cov5 bitcode)
             └─ llvm.call @cco_gda_put__iw__inc
-                 └─ ccoGda<P>::put<...>() / ccoSdma::put<...>()
+                 └─ ccoGda<P, Mode>::put<...>() / ccoSdma::put<...>()
 ```
 
 ## What to look at where
@@ -24,8 +24,11 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
 | The shared ABI metadata | `python/mori/cco/device/ops.py` (`CCO_DEVICE_FUNCTIONS`) |
 | FlyDSL FFI objects | `python/mori/cco/device/flydsl/_bindings.py` |
 | Triton extern wrappers | `python/mori/ir/triton/cco/ops.py` |
-| OO API (`DevComm/Window/Gda`) + enums (`CoopScope/SignalOp/ThreadMode`) | `python/mori/cco/device/flydsl/handles.py` |
+| OO API (`DevComm/Window/Gda`) | `python/mori/cco/device/flydsl/handles.py` |
+| Enums (`CoopScope/SignalOp/ThreadMode/Team/GdaDoorbell/GdaFlags`) | `python/mori/cco/device/ops.py` |
 | `_ffi` factory + `cco_struct` (handle keeps methods across `if`/`for`) | `flydsl/_internal.py` |
+| Buffer load/store with a cache policy that holds on every FlyDSL version | `flydsl/buffer.py` |
+| u32 signal-slot accessors (peer flags, rank-private epochs) | `flydsl/signals.py` |
 | How the `.bc` is located at runtime | `python/mori/cco/device/bitcode.py` (`find_cco_bitcode`) |
 | How the `.bc` is built (JIT, per arch+NIC+cov) | `bitcode.py::_jit_compile` (reuses `mori.jit`) |
 | How to prebuild the `.bc` manually | `tools/build_cco_bitcode.sh` |
@@ -37,12 +40,13 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   `uint64` intptrs (`ccoDevComm*`, `ccoWindow_t`); signal id/value cross as
   `int32`/`uint64`. Struct layout lives only in C++.
 - **No dispatch overhead (monomorphization).** Each template axis
-  (`Coop` × `ThreadMode` × `RemoteAction`) is compiled into a *distinct*
-  `extern "C"` symbol, name-mangled with a tag (`cco_gda_put__iw__inc` = indep
-  warp + signal-inc). `coop`/`thread_mode`/`signal_op` are compile-time constants
-  (Python enums), so `handles.py` picks the symbol by name at trace time and the
-  kernel emits **one direct call to one instantiation** — no runtime branch, no
-  type erasure, nothing to constant-fold. Passing a runtime DSL value for any
+  (`Coop` × `ThreadMode` × `RemoteAction` × doorbell mode) is compiled into a
+  *distinct* `extern "C"` symbol, name-mangled with a tag
+  (`cco_gda_put__iw__inc__deferred` = indep warp + signal-inc on a DEFERRED
+  handle). These are compile-time constants (Python enums), so `handles.py`
+  picks the symbol by name at trace time and the kernel emits **one direct call
+  to one instantiation**. The team rides in a constant `GdaFlags` word that
+  folds once the wrapper is inlined. Passing a runtime DSL value for any
   axis is a `TypeError` (it can't select a symbol). `always_inline` (`CCO_DEV`)
   then inlines the thin forwarder into the kernel.
 - **ThreadMode is selectable** (`ThreadMode.INDEPENDENT` / `AGGREGATE`); the
@@ -53,10 +57,12 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   FlyDSL ignores it; Triton needs a concrete element return type for
   `extern_elementwise`, especially when an argument is a block value.
 - **Provider fixed at build time** via `CCO_GDA_BUILD_PROVIDER` (NIC macro) — one
-  `ccoGda<P>` specialization per NIC, same as the C++ kernels / shmem bitcode.
+  `ccoGda<P, Mode>` per NIC, same as the C++ kernels / shmem bitcode.
 - **OO handles** (`DevComm/Window/Gda`) are method-carrying `fx.struct`s
-  (`cco_struct`): build once, reuse across control flow. `Gda.ctx` is `Constexpr`
-  so the handle carries a single IR value.
+  (`cco_struct`): build once, reuse across control flow. `Gda.ctx` and
+  `Gda.doorbell` are `Constexpr` so the handle carries a single IR value; an op
+  that posts to or flushes a QP takes `ctx=` to use another context for that
+  call, which may be a runtime value.
 
 ## LSA vs GDA — different models
 
@@ -64,7 +70,34 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   load/store-accessible VA. **The kernel operates on that pointer directly**
   (`buffer_load`/`buffer_store`); cco does NOT move the data. See examples 04/05.
 - **GDA** (RDMA): opaque network ops, so they ARE exposed as device ops —
-  `gda.put / put_value / get / signal / wait_signal / flush`. See examples 03/06.
+  `gda.put / put_value / get / signal / wait_signal / flush / flush_peer /
+  flush_async / wait`. `team` (`Team.WORLD`, or `Team.GDA` for a peer numbered
+  in the GDA team, i.e. the node index on a RAIL connection) rides in a
+  constant `GdaFlags` word.
+  - **Doorbell mode** belongs to the handle, `dc.gda(ctx,
+    doorbell=GdaDoorbell.X)`, and is part of the symbol name. `IMMEDIATE`
+    (default) posts ring for themselves. `DEFERRED` put / put_value / get post
+    without ringing; the next ring that reaches them (an IMMEDIATE post or
+    signal after them, a flush or flush_async) releases them. Worth it when one
+    warp posts many WQEs to a QP and releases them once. `CALLER_ORDERED` posts
+    also skip the ready mark, and only a CALLER_ORDERED flush releases them, for
+    callers that already order every post before the flush (contract on
+    `GdaDoorbell`); such a handle has no `signal`, so put with a `signal_op`.
+  - **QPs are shared** by every handle on one `ctx` (taken modulo
+    `gda_context_count`), whatever its mode. IMMEDIATE and DEFERRED mix freely;
+    while CALLER_ORDERED posts are pending on a QP, only CALLER_ORDERED handles
+    may post to or flush it. Nothing checks this, so give such traffic its own
+    contexts.
+  - **`flush_async` / `wait`**: `flush_async` returns a request for `wait`, so
+    work can go between them. Call `wait` with the same coop (with `BLOCK` only
+    thread 0 holds the request).
+  - **Per-call `ctx=`** picks the QP context (`wait` needs none: the request
+    names the QP). It may differ per lane only with coop `THREAD` on signal,
+    flush_async, and put / put_value / get in `ThreadMode.INDEPENDENT`;
+    `AGGREGATE`, `flush` and `flush_peer` need one `ctx` (and peer) across the
+    warp.
+
+  See examples 03/06.
 - **SDMA** (intra-node copy engine): `sdma.put / get` (window + offset) and
   `put_ptr / get_ptr` (resolved addresses) mirror `ccoSdma`'s, with its template
   arguments as compile-time keywords (`coop`, `local_signal`, `remote_signal`,
@@ -80,7 +113,7 @@ then install MORI and the example runtime deps:
 
 ```bash
 pip install .                          # builds + co-locates all libmori_*.so
-pip install mpi4py "flydsl==0.2.2"     # mpi4py: bootstrap; flydsl: the device bindings
+pip install mpi4py "flydsl==0.4.0"     # mpi4py: bootstrap; flydsl: the device bindings
 ```
 
 After `pip install .` no `PYTHONPATH` / `LD_LIBRARY_PATH` / `MORI_CCO_BC` is
@@ -124,9 +157,11 @@ torchrun --standalone --nproc_per_node=2 \
    public device API (`ccoGda` / `ccoSdma` / ...), not its internals. Template
    axes cross the scalar FFI one of two ways, both with no runtime cost:
    - a tag in the symbol name (`cco_<op>__<tag>`), one symbol per value: the GDA
-     ops via the `CCO_TC_LIST` / `CCO_COOP_LIST` X-macros, the SDMA coop scope;
+     ops via the `CCO_TC_LIST` / `CCO_COOP_LIST` X-macros and their doorbell
+     mode (`__deferred` / `__caller_ordered`), the SDMA coop scope;
    - a `flags` argument the wrapper dispatches on (`SdmaWithFlags` for
-     `cco_sdma_{put,get}_ptr__<coop>`). The wrapper is inlined, so a
+     `cco_sdma_{put,get}_ptr__<coop>`, `GdaWithTeam` for the team bit of the
+     GDA ops that take a peer). The wrapper is inlined, so a
      compile-time constant `flags` folds to one instantiation; the Python
      handles always pass one. Prefer this for an axis with many combinations.
    SDMA wrappers go inside `#if BUILD_CCO_SDMA`. JIT re-compiles automatically —
@@ -152,7 +187,7 @@ beyond the method names.
 | `03_flydsl_put` | GDA put + signal/wait (single-node FULL + 2-node CROSSNODE) |
 | `04_flydsl_lsa_put` | LSA direct peer-pointer store in the kernel |
 | `05_flydsl_lsa_allreduce` | LSA custom all-reduce: peer pointers + device signal barrier |
-| `06_flydsl_gda_modes` | GDA template matrix: (thread_mode,coop) {indep×thread/warp/block, aggr×thread} × signal {inc,add} |
+| `06_flydsl_gda_modes` | GDA template matrix: (thread_mode,coop) {indep×thread/warp/block, aggr×thread} × signal {inc,add}; deferred and caller-ordered puts + flush_async/wait per team |
 | `examples/cco/ir/test_triton_cco.py` | Triton DevComm queries plus LSA, SDMA, and GDA |
 
 ## FlyDSL kernel-author gotchas

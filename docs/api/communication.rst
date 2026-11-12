@@ -67,6 +67,80 @@ Dispatch and combine kernels for MoE expert parallelism.
 
 See :doc:`MORI-EP Guide <../MORI-EP-GUIDE>` for full API reference.
 
+AsyncLL v2 SDMA overlap
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The HIP backend of ``mori.ops.dispatch_combine_v2`` supports
+``async_ll=True, async_ll_transport="sdma"``. Run independent computation
+between ``dispatch_send()`` and ``dispatch_recv()``, and between
+``combine_send()`` and ``combine_recv()``. Receive data and counts are ready
+after the corresponding receive phase completes on the stream.
+
+SDMA queues are shared per GPU pair by all ops in a process. When two ops
+interleave on one stream (single-stream two-batch overlap), set
+``async_ll_own_sdma_queue=True`` on both so a receive does not wait for the
+other op's send. When the ops run on separate streams the option is not a
+clear win: a two-op microbenchmark gets slower, while DeepSeek-V4 prefill with
+two-stream two-batch overlap got faster. It is off by default; measure your
+workload before turning it on there. Only the ``"sdma"`` transport uses it.
+
+On a single gfx950 or gfx1250 node, the send phase now posts each payload followed by
+its ready notification on the same SDMA queue. The receive phase still waits
+for outgoing copies before the source buffers can be reused. Zero-token peers
+also exchange notifications. The redundant dispatch receive-count reset is
+omitted because the receive copy writes the total, including zero.
+
+These options are read once when an op is constructed:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Environment variable
+     - Default and effect
+   * - ``MORI_ASYNCLL_EARLY_NOTIFY``
+     - ``1`` on single-node gfx950 and gfx1250 SDMA; ``0`` elsewhere. Posts
+       notifications in the send phase. Other architectures can opt in with
+       ``1``.
+   * - ``MORI_ASYNCLL_SKIP_RESET``
+     - No longer has an effect. It skipped the host-side ``total_recv`` reset
+       before each dispatch; that reset has been removed for every kernel
+       family (the dispatch kernels now produce the count themselves), and
+       AsyncLL's receive copy always assigned it. Still accepted, so existing
+       settings do not fail.
+   * - ``MORI_ASYNCLL_FUSED_RECV``
+     - ``0``. Set ``1`` to fold receive waits into the copy passes. One wave
+       per CTA waits, then an acquire and CTA barrier release the copy waves.
+   * - ``MORI_ASYNCLL_FUSED_RECV_CTAS``
+     - ``0``, meaning half the compute units this process may use: the
+       device's, or its share under ``HSA_CU_MASK``. Grid ceiling for the
+       fused receive copies; ignored unless ``MORI_ASYNCLL_FUSED_RECV=1``.
+
+The first three variables accept ``0`` or ``1``. Skipping the reset or fusing
+receive requires early notification. Set all three to ``0`` for the legacy sequence.
+LSA and multi-node ops retain their existing protocol and ignore these SDMA
+options. The resolved notification mode is part of every native Plan's
+configuration and generated source, so different ops can coexist without
+changing the protocol of an already constructed Plan.
+
+The default targets single-node gfx950 and gfx1250 overlap. On MI355X (gfx950,
+EP8, hidden 7168, top-6), early notification beat the legacy sequence at every
+token count from 128 to 4096: by 2-5% on one stream and 3-11% with two
+overlapping streams. Receive fusion remains opt-in because its additional
+benefit depends on the token count and compute window.
+
+Receive fusion is a single-stream optimisation. A fused receive copy waits for
+its peers inside every CTA, so its whole grid stays resident for the wait. When
+two micro-batches overlap on two streams (two-batch overlap), that grid can
+crowd out the send pass the other stream must run before any peer's wait can
+end, and the ranks deadlock. The grid ceiling makes this unlikely but cannot
+rule it out: it is sized from the compute units the process may use, not from
+those another stream, kernel or process is occupying at the time.
+
+Do not combine receive fusion with micro-batches on two streams, especially
+when the device may be shared. On MI355X, two streams gained nothing from
+fusion over early notification, so dual-stream callers should use early
+notification alone, which is the gfx950 default.
+
 MORI Shmem (Symmetric Memory)
 -------------------------------
 

@@ -100,9 +100,13 @@ class IOEngine:
                 config = mori_cpp.FabricBackendConfig()
             elif type is mori_cpp.BackendType.OFI:
                 config = mori_cpp.OfiBackendConfig()
+            elif type is mori_cpp.BackendType.TCP:
+                config = mori_cpp.TcpBackendConfig()
             else:
                 raise NotImplementedError("backend not implemented yet")
         result = self._engine.CreateBackend(type, config)
+        if mori_cpp.io_sim_enabled():
+            return result
         if type is mori_cpp.BackendType.XGMI:
             self._load_scatter_gather_kernel()
         elif type is mori_cpp.BackendType.FABRIC:

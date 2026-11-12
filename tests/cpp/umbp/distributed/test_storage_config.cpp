@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <string>
 
 #include "umbp/common/config.h"
@@ -103,6 +104,20 @@ TEST(StorageConfig, AllowsMatchingSharedAndDistributedSettings) {
   config.distributed->dram_page_size = *config.page_size;
   std::string error;
   EXPECT_TRUE(config.ValidateStorageConfig(&error)) << error;
+}
+
+TEST(StorageConfig, DefaultConstructionReadsEnvironment) {
+  ASSERT_EQ(setenv("UMBP_SIM_ENABLE", "1", 1), 0);
+  ASSERT_EQ(setenv("UMBP_SIM_PROFILE", "/tmp/sim-profile.json", 1), 0);
+  ASSERT_EQ(setenv("UMBP_DRAM_CAPACITY", "12345", 1), 0);
+  const UMBPConfig config;
+  unsetenv("UMBP_SIM_ENABLE");
+  unsetenv("UMBP_SIM_PROFILE");
+  unsetenv("UMBP_DRAM_CAPACITY");
+  EXPECT_TRUE(config.sim.enabled);
+  EXPECT_EQ(config.sim.profile_path, "/tmp/sim-profile.json");
+  EXPECT_EQ(config.dram.capacity_bytes, 12345u);
+  EXPECT_FALSE(UMBPConfig().sim.enabled);
 }
 
 }  // namespace

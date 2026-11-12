@@ -26,6 +26,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -456,6 +458,27 @@ static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
   return hipSuccess;
 }
 
+// Warn when the kernel lacks CONFIG_PCI_P2PDMA: a peer window import is then pinned in
+// system memory instead of mapped peer-to-peer, and KFD may keep every rank's queues
+// evicted. p2pdma.c is built only with that option, so its symbol in
+// /proc/kallsyms ("<addr> <type> <name> [module]") tells, with or without a readable
+// kernel config. dma_buf_attach is always built: seeing it shows the names are listed.
+static void CcoWarnIfNoDmabufP2P() {
+  std::ifstream ksyms("/proc/kallsyms");
+  std::string addr, type, name;
+  bool listed = false, p2p = false;
+  while (!p2p && ksyms >> addr >> type >> name) {
+    ksyms.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    listed |= name == "dma_buf_attach";
+    p2p = name == "pci_p2pdma_distance_many";
+  }
+  if (listed && !p2p) {
+    MORI_SHMEM_WARN(
+        "ccoCommCreate: kernel lacks CONFIG_PCI_P2PDMA — peer window imports may be pinned in "
+        "system memory and leave KFD queues evicted");
+  }
+}
+
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
                              ccoComm** outComm) {
   // Pin this thread to its GPU's NUMA-local CPUs before the bootstrap, the
@@ -663,6 +686,8 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
       // (e.g. a torch kernel launch) would report it as its own error.
       (void)hipGetLastError();
       MORI_SHMEM_INFO("ccoCommCreate: fabric handle probe failed, using FD path");
+      // Peers import windows as dma-bufs on this path. One report per host.
+      if (comm->lsaSize > 1 && comm->lsaRank == 0) CcoWarnIfNoDmabufP2P();
     }
   }
 
@@ -771,7 +796,7 @@ int ccoCommDestroy(ccoComm* comm) {
   // in the flat VA. hipMemAddressFree fails if any sub-range is still mapped.
   for (auto& [ptr, meta] : comm->allocTable) {
     vmmProcessLock vmmLock;
-    (void)hipMemUnmap(ptr, meta.size);
+    (void)hipMemUnmap(static_cast<char*>(ptr) - meta.dataOffset, meta.size);
     (void)hipMemRelease(meta.physHandle);
     if (!meta.isFabric && meta.shareFd >= 0) close(meta.shareFd);
   }
@@ -968,14 +993,13 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR(
         "ccoMemImport: hipMemRetainAllocationHandle failed: {} ({}) — externalPtr "
-        "must be the base of a HIP VMM allocation",
+        "must point into a HIP VMM allocation",
         static_cast<int>(err), hipGetErrorString(err));
     return -1;
   }
 
-  // Validate: externalPtr is the allocation base and the range covers `size`.
-  // Our flat-VA map starts at offset 0 of the handle, so offset imports are
-  // unsupported (would need a per-handle base+offset scheme).
+  // externalPtr may sit inside the allocation (torch >= 2.14 puts its signal pad first): map the
+  // whole handle and hand back slot + dataOffset.
   void* rangeBase = nullptr;
   size_t rangeSize = 0;
   err = hipMemGetAddressRange(&rangeBase, &rangeSize, externalPtr);
@@ -985,19 +1009,20 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
     (void)hipMemRelease(physHandle);
     return -1;
   }
-  if (rangeBase != externalPtr) {
-    MORI_SHMEM_ERROR(
-        "ccoMemImport: externalPtr {} is not the allocation base {} "
-        "(offset imports unsupported)",
-        externalPtr, rangeBase);
+  const size_t dataOffset =
+      static_cast<size_t>(static_cast<char*>(externalPtr) - static_cast<char*>(rangeBase));
+  if (dataOffset > UINT32_MAX) {  // ccoIbgdaWin::iovaBias is 32-bit
+    MORI_SHMEM_ERROR("ccoMemImport: externalPtr {} is {} bytes into its allocation (max 4 GiB)",
+                     externalPtr, dataOffset);
     (void)hipMemRelease(physHandle);
     return -1;
   }
 
-  size_t alignedSize = AlignUp(size, comm->vmmGranularity);
+  size_t alignedSize = AlignUp(dataOffset + size, comm->vmmGranularity);
   if (alignedSize > rangeSize) {
-    MORI_SHMEM_ERROR("ccoMemImport: aligned size {} exceeds external allocation {}", alignedSize,
-                     rangeSize);
+    MORI_SHMEM_ERROR(
+        "ccoMemImport: offset {} + size {} (aligned {}) exceeds external allocation {} at {}",
+        dataOffset, size, alignedSize, rangeSize, rangeBase);
     (void)hipMemRelease(physHandle);
     return -1;
   }
@@ -1059,6 +1084,7 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
   meta.isFabric = useFabric;
   meta.slotOffset = slotOffset;
   meta.size = alignedSize;
+  meta.dataOffset = dataOffset;
   if (useFabric) {
     err = hipMemExportToShareableHandle(&meta.fabricHandle, physHandle,
                                         hipMemHandleTypeFabricCompat, 0);
@@ -1080,14 +1106,15 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
     rollbackSlot();
     return -1;
   }
+  void* dataVa = static_cast<char*>(localVa) + dataOffset;
   {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
-    comm->allocTable[localVa] = meta;
+    comm->allocTable[dataVa] = meta;
   }
 
-  *outPtr = localVa;
-  MORI_SHMEM_TRACE("ccoMemImport: done, externalPtr={} localPtr={} size={}", externalPtr, localVa,
-                   alignedSize);
+  *outPtr = dataVa;
+  MORI_SHMEM_TRACE("ccoMemImport: done, externalPtr={} localPtr={} dataOffset={} size={}",
+                   externalPtr, dataVa, dataOffset, alignedSize);
   return 0;
 }
 
@@ -1112,8 +1139,9 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
     meta = it->second;
     comm->allocTable.erase(it);
   }
-  // ptr == LocalSlotBase(comm) + meta.slotOffset == the address vaManager handed out.
-  (void)comm->vaManager->Free(reinterpret_cast<uintptr_t>(ptr));
+  // mapBase == LocalSlotBase(comm) + meta.slotOffset == the address vaManager handed out.
+  void* mapBase = static_cast<char*>(ptr) - meta.dataOffset;
+  (void)comm->vaManager->Free(reinterpret_cast<uintptr_t>(mapBase));
 
   size_t alignedSize = meta.size;
 
@@ -1121,7 +1149,7 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
 
   {
     vmmProcessLock vmmLock;
-    hipError_t err = hipMemUnmap(ptr, alignedSize);
+    hipError_t err = hipMemUnmap(mapBase, alignedSize);
     if (err != hipSuccess) {
       MORI_SHMEM_WARN("ccoMemFree: local hipMemUnmap failed: {} ({})", static_cast<int>(err),
                       hipGetErrorString(err));
@@ -1143,19 +1171,40 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
 /* ========================================================================== */
 
 // Collective: register wh's RDMA MR, Allgather rkeys, publish lkey/rkeys into its device struct.
-static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh, bool isFabric, int shareFd) {
+static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh, bool isFabric, int shareFd,
+                                size_t dataOffset) {
   uint32_t lkey = 0;
   uint32_t localRkey = 0;
+  uint32_t iovaBias = 0;
 
   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
   if (rdmaDevCtx) {
     application::RdmaMemoryRegion mr;
-    if (isFabric) {
+    if (isFabric && comm->iovaZeroMode) {
+      // A fabric window has no shareFd, so export one. Device addressing is window-relative
+      // (offset + iovaBias) as on the FD path, but RegisterRdmaMemoryRegionAuto registers iova=VA.
+      uint64_t dmabufOffset = 0;
+      int fabricFd = application::TryExportDmabufFd(wh->localPtr, wh->size, &dmabufOffset);
+      if (fabricFd < 0) {
+        MORI_SHMEM_ERROR(
+            "CcoWindowRegisterMr: dma-buf export failed for fabric window (ptr={} size={}); GDA "
+            "addresses windows by offset and needs an iova=0 MR",
+            wh->localPtr, wh->size);
+        std::abort();
+      }
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(wh->localPtr, wh->size, fabricFd,
+                                                           dmabufOffset);
+      iovaBias = static_cast<uint32_t>(dmabufOffset);
+      close(fabricFd);
+    } else if (isFabric) {
       mr = rdmaDevCtx->RegisterRdmaMemoryRegionAuto(wh->localPtr, wh->size);
     } else if (comm->iovaZeroMode) {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(wh->localPtr, wh->size, shareFd);
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(wh->localPtr, wh->size, shareFd,
+                                                           dataOffset);
+      iovaBias = static_cast<uint32_t>(dataOffset);
     } else {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabuf(wh->localPtr, wh->size, shareFd);
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabuf(wh->localPtr, wh->size, shareFd,
+                                                      MR_DEFAULT_ACCESS_FLAG, dataOffset);
     }
     lkey = mr.lkey;
     localRkey = mr.rkey;
@@ -1169,6 +1218,8 @@ static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh, bool isFabric,
                               sizeof(uint32_t) * comm->worldSize, hipMemcpyHostToDevice));
   HIP_RUNTIME_CHECK(
       hipMemcpy(&wh->devPtr->ibgdaWin.lkey, &lkey, sizeof(lkey), hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(&wh->devPtr->ibgdaWin.iovaBias, &iovaBias, sizeof(iovaBias),
+                              hipMemcpyHostToDevice));
 
   MORI_SHMEM_INFO("ccoWindowRegister: rank={} win={} lkey={}", comm->rank, (void*)wh->devPtr, lkey);
   for (int pe = 0; pe < comm->worldSize; pe++) {
@@ -1194,6 +1245,20 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
 
   MORI_SHMEM_TRACE("ccoWindowRegister: rank={} ptr={} size={} slotOffset={} fabric={}", rank, ptr,
                    size, slotOffset, useFabric);
+
+  // Peer addresses are winBase-relative, so every rank must import at the same data offset.
+  uint64_t dataOffset = meta.dataOffset;
+  std::vector<uint64_t> allDataOffsets(worldSize, 0);
+  comm->bootNet->Allgather(&dataOffset, allDataOffsets.data(), sizeof(uint64_t));
+  for (int pe = 0; pe < worldSize; pe++) {
+    if (allDataOffsets[pe] != dataOffset) {
+      MORI_SHMEM_ERROR(
+          "ccoWindowRegister: rank {} data offset {} differs from rank {} offset {}; imported "
+          "buffers must start at the same offset in their allocations on every rank",
+          rank, dataOffset, pe, allDataOffsets[pe]);
+      return -1;
+    }
+  }
 
   // P2P imported handles — collected during the exchange loop below,
   // ownership later transferred to ccoWindowHost so Deregister can release.
@@ -1436,7 +1501,7 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   HIP_RUNTIME_CHECK(hipMemset(peerRkeys_gpu, 0, sizeof(uint32_t) * worldSize));
 
   ccoWindowDevice hostShadow = {};
-  hostShadow.winBase = static_cast<char*>(comm->flatBase) + slotOffset;
+  hostShadow.winBase = static_cast<char*>(comm->flatBase) + slotOffset + dataOffset;
   hostShadow.stride4G = static_cast<uint32_t>(comm->perRankSize >> 32);
   hostShadow.lsaRank = comm->lsaRank;
   hostShadow.ibgdaWin.peerRkeys = peerRkeys_gpu;
@@ -1452,7 +1517,7 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   wh->peerRkeys_gpu = peerRkeys_gpu;
   wh->peerImportedHandles = std::move(p2pImportedHandles);
 
-  if (comm->windowMrsEnabled) CcoWindowRegisterMr(comm, wh, useFabric, meta.shareFd);
+  if (comm->windowMrsEnabled) CcoWindowRegisterMr(comm, wh, useFabric, meta.shareFd, dataOffset);
 
   // Publish into the per-comm window table (drives findWindow lookups).
   ccoComm::WindowTableEntry tableEntry;
@@ -1464,7 +1529,7 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
 
   *outWin = devPtr;
 
-  char* winBase = static_cast<char*>(comm->flatBase) + slotOffset;
+  char* winBase = static_cast<char*>(comm->flatBase) + slotOffset + dataOffset;
   MORI_SHMEM_INFO("ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} fabric={}",
                   rank, (void*)devPtr, (void*)winBase, size, slotOffset, useFabric);
   for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
@@ -1700,13 +1765,15 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     for (ccoWindowHost* wh : comm->windows) {
       bool isFabric = false;
       int shareFd = -1;
+      size_t dataOffset = 0;
       {
         std::lock_guard<std::mutex> lock(comm->allocMutex);
         const auto& meta = comm->allocTable.at(wh->localPtr);
         isFabric = meta.isFabric;
         shareFd = meta.shareFd;
+        dataOffset = meta.dataOffset;
       }
-      CcoWindowRegisterMr(comm, wh, isFabric, shareFd);
+      CcoWindowRegisterMr(comm, wh, isFabric, shareFd, dataOffset);
     }
   }
 
@@ -1736,9 +1803,25 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       }
     }
 
-    HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(core::RdmaEndpointDevice)));
-    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(), numEps * sizeof(core::RdmaEndpointDevice),
-                                hipMemcpyHostToDevice));
+    // Each SQ's ready marks (doorbell coalescing, cco_scale_out.hpp) live in the
+    // same allocation, after the endpoints, so freeing ibgda.endpoints frees them.
+    const size_t epsBytes = numEps * sizeof(core::RdmaEndpointDevice);
+    size_t numMarks = 0;
+    for (const auto& ep : epsHost) {
+      const uint32_t n = ep.wqHandle.sqWqeNum;
+      if (n & (n - 1)) MORI_SHMEM_ERROR("GDA SQ depth {} is not a power of two", n);
+      numMarks += n;
+    }
+    char* block = nullptr;
+    HIP_RUNTIME_CHECK(hipMalloc(&block, epsBytes + numMarks * sizeof(core::WqeReadyMark)));
+    auto* marks = reinterpret_cast<core::WqeReadyMark*>(block + epsBytes);
+    HIP_RUNTIME_CHECK(hipMemset(marks, 0, numMarks * sizeof(core::WqeReadyMark)));
+    for (auto& ep : epsHost) {
+      ep.wqHandle.readyMarks = ep.wqHandle.sqWqeNum ? marks : nullptr;
+      marks += ep.wqHandle.sqWqeNum;
+    }
+    epsGpu = reinterpret_cast<core::RdmaEndpointDevice*>(block);
+    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(), epsBytes, hipMemcpyHostToDevice));
   }
   ibgda.endpoints = epsGpu;
 

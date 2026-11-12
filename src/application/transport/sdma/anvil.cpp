@@ -29,6 +29,8 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +38,7 @@
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 
 #include "mori/utils/mori_log.hpp"
@@ -53,14 +56,25 @@ namespace {
     }                                                                                        \
   } while (0)
 
-#define CHECK_HSAKMT_SUCCESS(call, msg)                                                       \
-  do {                                                                                        \
-    if ((call) != HSAKMT_STATUS_SUCCESS) {                                                    \
-      std::cout << "ERROR code: " << std::dec << call << " " << msg << " (File: " << __FILE__ \
-                << ", Line: " << __LINE__ << ")" << std::endl;                                \
-      exit(EXIT_FAILURE);                                                                     \
-    }                                                                                         \
+// `call` is evaluated ONCE, into _st. It used to appear twice -- in the test and
+// again in the error message -- so every failure ran the KFD call a second time:
+// hsaKmtAllocMemory leaked the first block, hsaKmtFreeMemory double-freed,
+// hsaKmtCreateQueueExt asked for a second queue, and the code printed was the
+// RETRY's, which need not equal the one that actually failed.
+#define CHECK_HSAKMT_SUCCESS(call, msg)                                                   \
+  do {                                                                                    \
+    const HSAKMT_STATUS _st = (call);                                                     \
+    if (_st != HSAKMT_STATUS_SUCCESS) {                                                   \
+      std::cout << "ERROR code: " << std::dec << _st << " " << msg << " (File: " __FILE__ \
+                << ", Line: " << __LINE__ << ")" << std::endl;                            \
+      exit(EXIT_FAILURE);                                                                 \
+    }                                                                                     \
   } while (0)
+
+// MI308X xGMI SDMA engines; 0 is the general engine and keeps loopback and host
+// copies. KFD exposes 8 user-queue slots per engine on gfx942.
+constexpr std::array<uint32_t, 3> kMi308xXgmiEngines = {2u, 4u, 6u};
+constexpr int kMi308xQueuesPerEngine = 8;
 
 // HSA agents
 std::vector<hsa_agent_t> cpuAgents_;
@@ -140,50 +154,85 @@ std::tuple<uint32_t, uint32_t, bool> locIdAndDomainForNode(int node) {
   return std::tuple{locId, domain, true};
 }
 
-// hsa_iterate_agents (SetUp) enumerates ALL physical GPU agents in HSA order,
-// which is NOT filtered by HIP_VISIBLE_DEVICES. The srcDeviceId/deviceId that the
-// collective passes in is a HIP device ORDINAL (indexes only visible devices).
-// When the two diverge (e.g. HIP_VISIBLE_DEVICES=4,5,6,7) indexing gpuAgents_ by
-// the raw HIP ordinal selects the WRONG physical GPU -> the SDMA queue is created
-// on the wrong KFD node while the compute kernel runs on the intended GPU ->
-// "Memory access fault by GPU node-N". Match HIP ordinal -> HSA agent by PCI BDF
-// so the selection is correct in all cases. In the common HIP_VISIBLE_DEVICES=
-// 0..N-1 case this resolves to the identity map (BDF matches at the same index)
-// so the default path is behavior-identical.
-hsa_agent_t gpuAgentForHipDevice(int hipDeviceId) {
-  static std::mutex mapMutex;
-  static std::unordered_map<int, int> hipToAgent;
-  std::lock_guard<std::mutex> lock(mapMutex);
-  auto it = hipToAgent.find(hipDeviceId);
-  if (it != hipToAgent.end()) return gpuAgents_[it->second];
+// "name value" pairs of a KFD sysfs properties file. Empty if the file is missing,
+// or if KFD refuses the read (EPERM) because it belongs to a GPU the device cgroup
+// keeps from this process.
+std::unordered_map<std::string, uint64_t> readKfdProperties(std::istream& in) {
+  std::unordered_map<std::string, uint64_t> props;
+  std::string key, val;
+  while (in >> key >> val) props[key] = std::strtoull(val.c_str(), nullptr, 0);
+  return props;
+}
 
-  // BDF of the HIP device, parsed from its "domain:bus:device.function" string.
-  uint32_t hipBdf = getBusId(hipDeviceId);
-  // HSA_AMD_AGENT_INFO_BDFID exposes only the 16-bit bus/device/function, not the
-  // PCI domain, so on a multi-segment machine two GPUs can share the same 16-bit
-  // BDF. Only trust the match when it is UNIQUE; otherwise keep the identity
-  // fallback rather than risk selecting the wrong agent. domain is parsed but
-  // cannot be matched against the HSA side.
-  int match = hipDeviceId;  // identity fallback (also correct when HIP and HSA order align)
-  int nMatch = 0, firstMatch = -1;
-  for (size_t a = 0; a < gpuAgents_.size(); ++a) {
-    uint32_t bdfid = 0;
-    if (hsa_agent_get_info(gpuAgents_[a], (hsa_agent_info_t)HSA_AMD_AGENT_INFO_BDFID, &bdfid) !=
-        HSA_STATUS_SUCCESS)
-      continue;
-    if ((bdfid & 0xFFFF) == (hipBdf & 0xFFFF)) {
-      ++nMatch;
-      if (firstMatch < 0) firstMatch = static_cast<int>(a);
+std::unordered_map<std::string, uint64_t> readKfdProperties(const std::string& path) {
+  std::ifstream f(path);
+  return readKfdProperties(f);
+}
+
+std::string kfdNodePath(int node) {
+  return "/sys/class/kfd/kfd/topology/nodes/" + std::to_string(node);
+}
+
+uint64_t kfdNodeProperty(int node, const char* name) {
+  auto props = readKfdProperties(kfdNodePath(node) + "/properties");
+  auto it = props.find(name);
+  return it == props.end() ? 0 : it->second;
+}
+
+// gpu_id has its own file, not a properties line; 0 for a CPU node.
+uint64_t kfdGpuId(int node) {
+  std::ifstream f(kfdNodePath(node) + "/gpu_id");
+  uint64_t id = 0;
+  f >> id;
+  return id;
+}
+
+struct KfdLink {
+  int nodeTo;
+  uint32_t recSdmaEngIdMask;
+};
+
+// io_links then p2p_links, as libhsakmt lists them, in sysfs node ids. A node's
+// own io_links stay readable even to GPUs this process cannot open, which
+// libhsakmt drops. A link KFD gates on such a GPU (a p2p link carries the peer's
+// device) reads as EPERM and is skipped, as libhsakmt skips it.
+std::vector<KfdLink> kfdLinks(int node) {
+  std::vector<KfdLink> links;
+  for (const char* dir : {"io_links", "p2p_links"}) {
+    for (int i = 0;; ++i) {
+      std::ifstream f(kfdNodePath(node) + "/" + dir + "/" + std::to_string(i) + "/properties");
+      if (!f.is_open()) break;
+      auto props = readKfdProperties(f);
+      if (props.empty()) continue;
+      links.push_back({static_cast<int>(props["node_to"]),
+                       static_cast<uint32_t>(props["recommended_sdma_engine_id_mask"])});
     }
   }
-  if (nMatch == 1) match = firstMatch;
-  hipToAgent[hipDeviceId] = match;
-  return gpuAgents_[match];
+  return links;
+}
+
+// libhsakmt numbers only the nodes this process can open, 0..NumNodes-1, so in a
+// container given some of the host's GPUs its ids are not the sysfs ones. Match
+// the GPU by gpu_id.
+uint32_t hsakmtNodeForKfdNode(int node) {
+  const uint64_t gpuId = kfdGpuId(node);
+  HsaSystemProperties sys{};
+  if (gpuId != 0 && hsaKmtAcquireSystemProperties(&sys) == HSAKMT_STATUS_SUCCESS) {
+    for (uint32_t n = 0; n < sys.NumNodes; ++n) {
+      HsaNodeProperties props{};
+      if (hsaKmtGetNodeProperties(n, &props) == HSAKMT_STATUS_SUCCESS && props.KFDGpuID == gpuId)
+        return n;
+    }
+  }
+  // Exit like a failed hsaKmt call in SdmaQueue: shmem would catch an exception
+  // and blame the network, and cco cannot propagate one into Python.
+  MORI_APP_ERROR("SDMA: no libhsakmt node has the gpu_id of KFD node {}", node);
+  exit(EXIT_FAILURE);
 }
 
 }  // namespace
 
-SdmaQueue::SdmaQueue(uint32_t localNodeId, uint32_t engineId) {
+SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
   // Allocate SDMA queue buffer on device side, requires ExecuteAccess
   HsaMemFlags memFlags = {};
   memFlags.ui32.NonPaged = 1;
@@ -193,10 +242,10 @@ SdmaQueue::SdmaQueue(uint32_t localNodeId, uint32_t engineId) {
   memFlags.ui32.ExecuteAccess = 1;
   memFlags.ui32.Uncached = 1;
 
-  // std::cout << "Allocating SDMA Queue Buffer for device: " << localNodeId << std::endl <<
+  // std::cout << "Allocating SDMA Queue Buffer for device: " << hsakmtNodeId << std::endl <<
   // std::flush;
 
-  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(localNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
+  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
                        "Failed");
   CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL), "Failed");
 
@@ -205,7 +254,7 @@ SdmaQueue::SdmaQueue(uint32_t localNodeId, uint32_t engineId) {
   memset(&queue_, 0, sizeof(HsaQueueResource));
 
   CHECK_HSAKMT_SUCCESS(
-      hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
+      hsaKmtCreateQueueExt(hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
                            engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
       "Failed");
 
@@ -280,11 +329,12 @@ void AnvilLib::init() {
   });
 }
 
-// Map a HIP device ordinal to its KFD node id.
+// Map a HIP device ordinal to its KFD node id, the id connect() takes.
 /*static*/ uint32_t AnvilLib::nodeForHipDevice(int hipDev) {
-  uint32_t nodeId = 0;
-  CHECK_HSA_ERROR(hsa_agent_get_info(gpuAgentForHipDevice(hipDev), HSA_AGENT_INFO_NODE, &nodeId));
-  return nodeId;
+  int node = kfdNodeIdForHipDevice(hipDev);
+  if (node < 0)
+    throw std::runtime_error("SDMA: no KFD node for HIP device " + std::to_string(hipDev));
+  return static_cast<uint32_t>(node);
 }
 
 // Resolve the KFD topology node id of the given HIP device WITHOUT initializing HSA.
@@ -334,6 +384,33 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
     for (uint32_t b = 0; b < 32; ++b) {
       if (mask & (1u << b)) engines.push_back(b);
     }
+    // amdkfd recommends one engine per peer link only on a bare-metal, single-partition,
+    // 8-GPU hive (kfd_set_recommended_sdma_engines). Otherwise (an SR-IOV VF under any
+    // hypervisor, a hive of another size) it reports every xGMI engine: 14 on a GPU with 16
+    // SDMA engines in SPX mode. Round-robin over that puts channel 1 on an odd engine, where
+    // a copy started by a doorbell written from device code never runs. The static OAM table
+    // is the kernel's per-peer table for an 8-GPU hive, so use it for a 14-engine mask and
+    // only if the mask holds the engine it picks; otherwise (other parts, partition modes,
+    // an unreadable or out-of-range xGMI id) keep the KFD mask.
+    if (engines.size() == 14) {
+      try {
+        uint32_t e = static_cast<uint32_t>(getSdmaEngineId(srcNode, dstNode));
+        if (mask & (1u << e)) {
+          engines.assign(1, e);
+          static bool logged = false;  // connect() runs under channels_mutex_
+          if (!logged) {
+            logged = true;
+            MORI_APP_INFO(
+                "SDMA: amdkfd reports 14 engines per xGMI link, using the static OAM table to "
+                "pick one engine per peer");
+          }
+          MORI_APP_DEBUG("SDMA: node {} -> {} uses engine {}", srcNode, dstNode, e);
+        }
+      } catch (const std::exception& ex) {
+        MORI_APP_WARN("SDMA: node {} -> {} keeps the KFD engine mask: {}", srcNode, dstNode,
+                      ex.what());
+      }
+    }
     // Fall back to the static OAM table if KFD did not report a mask.
     if (engines.empty()) {
       int e = getSdmaEngineId(srcNode, dstNode);
@@ -350,7 +427,8 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // ringing its doorbell hangs, so fold every selected id down to its backing
   // even engine (id & ~1) and dedup, preserving order, so the per-engine queue
   // budget is not double-charged.
-  if (isMi308x(srcNode)) {
+  const bool mi308x = isMi308x(srcNode);
+  if (mi308x) {
     uint32_t seen = 0;
     std::vector<uint32_t> evenEngines;
     for (uint32_t e : engines) {
@@ -363,7 +441,7 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
     engines.swap(evenEngines);
   }
 
-  int numEngines = static_cast<int>(engines.size());
+  const int numEngines = static_cast<int>(engines.size());
 
   // Queues live in this process-global singleton and are shared across every
   // Context/comm for this node pair (getSdmaQueue keys on KFD node ids, not on
@@ -372,28 +450,70 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // hardware queues (getSdmaQueue only ever indexes the first numChannels) and
   // eventually exhaust the per-engine queue slots.
   auto& channels = sdma_channels_[std::make_pair(srcNode, dstNode)];
-  for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
-    uint32_t engineId = engines[c % numEngines];
-    channels.emplace_back(std::make_unique<SdmaQueue>(srcNode, engineId));
+  if (static_cast<int>(channels.size()) < numChannels) {
+    const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
+    // The fold above puts several of a MI308X GPU's peer links on one engine
+    // (masks 0x40 and 0x80 both land on 6), serialising its copies to those
+    // peers, so its peer links are balanced over the xGMI engines instead.
+    const bool balance = mi308x && srcNode != dstNode;
+    if (balance) mi308xLinkEngine(srcNode, dstNode, engines);
+    for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
+      const uint32_t engineId =
+          balance ? mi308xQueueEngine(srcNode, dstNode) : engines[c % numEngines];
+      channels.emplace_back(std::make_unique<SdmaQueue>(hsakmtNode, engineId));
+    }
   }
   return true;
 }
 
-uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {
-  HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
-    return 0;
+// The engine of a MI308X peer link: the xGMI engine carrying the fewest of this
+// GPU's peer links, ties to a recommended engine, then the lowest id. Decided
+// once per (src, dst) so every queue of a link shares one engine: AsyncLL uses
+// one queue per peer per op, and a link whose queues were spread over engines
+// measured 28-53% slower.
+uint32_t AnvilLib::mi308xLinkEngine(int srcNode, int dstNode,
+                                    const std::vector<uint32_t>& recommended) {
+  const auto key = std::make_pair(srcNode, dstNode);
+  auto it = mi308x_link_engine_.find(key);
+  if (it != mi308x_link_engine_.end()) return it->second;
+  auto& use = mi308x_engine_use_[srcNode];
+  auto rank = [&](uint32_t e) {
+    const bool notRecommended =
+        std::find(recommended.begin(), recommended.end(), e) == recommended.end();
+    return std::make_tuple(use.links[e], notRecommended, e);
+  };
+  uint32_t best = kMi308xXgmiEngines[0];
+  for (uint32_t e : kMi308xXgmiEngines) {
+    if (rank(e) < rank(best)) best = e;
   }
+  use.links[best]++;
+  mi308x_link_engine_[key] = best;
+  return best;
+}
 
-  std::vector<HsaIoLinkProperties> links(props.NumIOLinks);
-  if (hsaKmtGetNodeIoLinkProperties(srcNode, props.NumIOLinks, links.data()) !=
-      HSAKMT_STATUS_SUCCESS) {
-    return 0;
-  }
-  for (const auto& link : links) {
-    if (link.NodeTo == dstNode) {
-      return link.RecSdmaEngIdMask;
+// The engine of one more queue on a MI308X peer link: the link's engine, or the
+// xGMI engine with the fewest queues once that one is full. KFD rejects the
+// ninth queue on an engine, and SdmaQueue's constructor would then exit().
+uint32_t AnvilLib::mi308xQueueEngine(int srcNode, int dstNode) {
+  auto& use = mi308x_engine_use_[srcNode];
+  uint32_t e = mi308x_link_engine_.at(std::make_pair(srcNode, dstNode));
+  if (use.queues[e] >= kMi308xQueuesPerEngine) {
+    e = *std::min_element(kMi308xXgmiEngines.begin(), kMi308xXgmiEngines.end(),
+                          [&](uint32_t a, uint32_t b) { return use.queues[a] < use.queues[b]; });
+    if (use.queues[e] >= kMi308xQueuesPerEngine) {
+      throw std::runtime_error("SDMA: KFD node " + std::to_string(srcNode) + " has all " +
+                               std::to_string(kMi308xQueuesPerEngine) +
+                               " queue slots of every xGMI SDMA engine in use; request fewer "
+                               "SDMA channels per peer (MORI_SDMA_NUM_CHANNELS)");
     }
+  }
+  use.queues[e]++;
+  return e;
+}
+
+uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {
+  for (const auto& link : kfdLinks(srcNode)) {
+    if (link.nodeTo == dstNode) return link.recSdmaEngIdMask;
   }
   return 0;
 }
@@ -401,55 +521,33 @@ uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {
 // Engines KFD recommends for this GPU's link to a CPU node, i.e. the general
 // (non-xGMI) ones. Zero if the node reports no such link.
 uint32_t AnvilLib::getHostLinkEngineMask(int srcNode) {
-  HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
-    return 0;
-  }
-  std::vector<HsaIoLinkProperties> links(props.NumIOLinks);
-  if (hsaKmtGetNodeIoLinkProperties(srcNode, props.NumIOLinks, links.data()) !=
-      HSAKMT_STATUS_SUCCESS) {
-    return 0;
-  }
-  for (const auto& link : links) {
-    HsaNodeProperties to{};
-    if (hsaKmtGetNodeProperties(link.NodeTo, &to) != HSAKMT_STATUS_SUCCESS) continue;
-    if (to.NumFComputeCores != 0) continue;  // GPU node, not the host
-    if (link.RecSdmaEngIdMask) return link.RecSdmaEngIdMask;
+  for (const auto& link : kfdLinks(srcNode)) {
+    // A GPU, or a node KFD will not show us (only a GPU is ever hidden): not the host.
+    auto to = readKfdProperties(kfdNodePath(link.nodeTo) + "/properties");
+    if (to.empty() || to["simd_count"] != 0) continue;
+    if (link.recSdmaEngIdMask) return link.recSdmaEngIdMask;
   }
   return 0;
 }
 
 uint32_t AnvilLib::getAnyLinkEngineMask(int srcNode) {
-  HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
-    return 0;
-  }
-  std::vector<HsaIoLinkProperties> links(props.NumIOLinks);
-  if (hsaKmtGetNodeIoLinkProperties(srcNode, props.NumIOLinks, links.data()) !=
-      HSAKMT_STATUS_SUCCESS) {
-    return 0;
-  }
   uint32_t mask = 0;
-  for (const auto& link : links) mask |= link.RecSdmaEngIdMask;
+  for (const auto& link : kfdLinks(srcNode)) mask |= link.recSdmaEngIdMask;
   return mask;
 }
 
 // gfx12.5+ (gfx1250): the only arch whose loopback channels are spread over
 // engines. See connect() for why.
 bool AnvilLib::isGfx1250(int node) {
-  HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(node, &props) != HSAKMT_STATUS_SUCCESS) return false;
-  return props.EngineId.ui32.Major == 12 && props.EngineId.ui32.Minor == 5;
+  // libhsakmt's EngineId: major = v / 10000 % 100, minor = v / 100 % 100.
+  const uint64_t v = kfdNodeProperty(node, "gfx_target_version");
+  return v / 10000 % 100 == 12 && v / 100 % 100 == 5;
 }
 
 // MI308X (PCI device_id 0x74A2) is a 4-XCD harvest of the 8-XCD MI300X. Both are
 // gfx942, so EngineId cannot tell them apart; match the PCI device id instead.
 // See connect() for why its odd SDMA engine ids must be avoided.
-bool AnvilLib::isMi308x(int node) {
-  HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(node, &props) != HSAKMT_STATUS_SUCCESS) return false;
-  return props.DeviceId == 0x74A2;
-}
+bool AnvilLib::isMi308x(int node) { return kfdNodeProperty(node, "device_id") == 0x74A2; }
 
 SdmaQueue* AnvilLib::getSdmaQueue(int srcNode, int dstNode, int idx) {
   std::lock_guard<std::mutex> lock(channels_mutex_);
@@ -473,6 +571,10 @@ AnvilLib& AnvilLib::getInstance() {
 
 int AnvilLib::getOamId(int node) {
   auto [locId, domain, valid] = locIdAndDomainForNode(node);
+  if (valid && locId == ~0u) {
+    throw std::runtime_error("SDMA: cannot read KFD node " + std::to_string(node) +
+                             " (a GPU this process cannot open) to find its xGMI id");
+  }
   uint32_t bus = (locId >> 8) & 0xFF, dev = (locId >> 3) & 0x1F, func = locId & 0x7;
 
   char fpath[128];
@@ -492,6 +594,11 @@ int AnvilLib::getOamId(int node) {
 int AnvilLib::getSdmaEngineId(int srcNode, int dstNode) {
   int srcOamId = getOamId(srcNode);
   int dstOamId = getOamId(dstNode);
+  const int numOam = static_cast<int>(mi300xOamMap.size());
+  if (srcOamId < 0 || srcOamId >= numOam || dstOamId < 0 || dstOamId >= numOam) {
+    throw std::runtime_error("SDMA: xGMI physical id " + std::to_string(srcOamId) + " or " +
+                             std::to_string(dstOamId) + " is outside the OAM table");
+  }
 
   // Use even engines only
   return mi300xOamMap[srcOamId][dstOamId] * 2;

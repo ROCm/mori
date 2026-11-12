@@ -26,6 +26,8 @@
 namespace mori {
 namespace io {
 
+struct TransferStatus;
+
 // Seam over the ibverbs calls on MORI-IO's host data path. Every such call site
 // goes through Verbs() so a build with MORI_IO_FAULT_INJECTION can swap in the
 // FaultInjector decorator (src/io/rdma/fault_injector.hpp) without touching the
@@ -39,6 +41,16 @@ class VerbsOps {
   virtual int PollCq(ibv_cq* cq, int numEntries, ibv_wc* wc) = 0;
   virtual int GetCqEvent(ibv_comp_channel* ch, ibv_cq** cq, void** cqCtx) = 0;
   virtual int GetAsyncEvent(ibv_context* ctx, ibv_async_event* event) = 0;
+  virtual void AckAsyncEvent(ibv_async_event* event) = 0;
+  virtual int QueryPort(ibv_context* ctx, uint8_t port, ibv_port_attr* attr) = 0;
+  // Optional event source; the owner keeps its fd readable while events remain.
+  virtual int WatchAsyncContext(ibv_context* ctx) = 0;
+  virtual void UnwatchAsyncContext(ibv_context* ctx) = 0;
+  // Resource ownership differs from removing an async fd watch.
+  virtual void ReleaseAsyncContext(ibv_context* ctx) = 0;
+  virtual void ForgetAsyncEndpoint(ibv_context* ctx, uint32_t qpn, ibv_cq* cq) = 0;
+  // Test builds can stage a notification fault after the data has completed.
+  virtual void BeforeNotify(ibv_qp* qp, TransferStatus* status) = 0;
 };
 
 // The real calls: standard libibverbs ibv_*, not a vendor direct-verbs API.
@@ -59,6 +71,15 @@ class RealVerbs final : public VerbsOps {
   int GetAsyncEvent(ibv_context* ctx, ibv_async_event* event) override {
     return ibv_get_async_event(ctx, event);
   }
+  void AckAsyncEvent(ibv_async_event* event) override { ibv_ack_async_event(event); }
+  int QueryPort(ibv_context* ctx, uint8_t port, ibv_port_attr* attr) override {
+    return ibv_query_port(ctx, port, attr);
+  }
+  int WatchAsyncContext(ibv_context*) override { return -1; }
+  void UnwatchAsyncContext(ibv_context*) override {}
+  void ReleaseAsyncContext(ibv_context*) override {}
+  void ForgetAsyncEndpoint(ibv_context*, uint32_t, ibv_cq*) override {}
+  void BeforeNotify(ibv_qp*, TransferStatus*) override {}
 };
 
 #ifdef MORI_IO_FAULT_INJECTION

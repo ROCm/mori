@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -89,6 +90,28 @@ using EngineKey = std::string;
 using DescBlob = std::vector<uint8_t>;
 using BackendDescBlobMap = std::unordered_map<BackendType, DescBlob>;
 
+// The RAS runtime of the engine's process (include/mori/ras/ras.hpp): its peer listener, the
+// token a connecting runtime must present, and its runtime UUID. Empty when the engine has no
+// RAS, because RAS is built out, disabled, or failed to start; peers then don't link to it.
+//
+// It is EngineDesc's last field, not an entry in backendDescs: RAS isn't a backend, and
+// MSGPACK_DEFINE arrays only grow at the end, so an older decoder ignores it and this decoder
+// leaves it empty when an older EngineDesc lacks it.
+struct RasDesc {
+  std::string host;
+  uint16_t port{0};
+  std::string token;
+  uint64_t uuidHi{0};
+  uint64_t uuidLo{0};
+
+  bool operator==(const RasDesc& rhs) const noexcept {
+    return host == rhs.host && port == rhs.port && token == rhs.token && uuidHi == rhs.uuidHi &&
+           uuidLo == rhs.uuidLo;
+  }
+
+  MSGPACK_DEFINE(host, port, token, uuidHi, uuidLo);
+};
+
 struct EngineDesc {
   EngineKey key;
   std::string nodeId;
@@ -99,6 +122,7 @@ struct EngineDesc {
   // Backend-supplied descriptor blobs, captured by IOEngine after each backend
   // is created. Opaque bytes (see DescBlob) — e.g. OFI stores its addr_name.
   BackendDescBlobMap backendDescs;
+  RasDesc ras;
 
   uint32_t protocolVersion{0};
   uint32_t agentMode{0};
@@ -107,13 +131,14 @@ struct EngineDesc {
   bool operator==(const EngineDesc& rhs) const noexcept {
     return (key == rhs.key) && (nodeId == rhs.nodeId) && (hostname == rhs.hostname) &&
            (host == rhs.host) && (port == rhs.port) && (pid == rhs.pid) &&
-           (backendDescs == rhs.backendDescs) && (protocolVersion == rhs.protocolVersion) &&
+           (backendDescs == rhs.backendDescs) && (ras == rhs.ras) &&
+           (protocolVersion == rhs.protocolVersion) &&
            (agentMode == rhs.agentMode) && (blockSize == rhs.blockSize);
   }
 
   // Append-only: new fields MUST go at the end to preserve wire compatibility.
-  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid, backendDescs, protocolVersion, agentMode,
-                 blockSize);
+  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid, backendDescs, ras, protocolVersion,
+                 agentMode, blockSize);
 };
 
 using MemoryUniqueId = uint32_t;
@@ -249,9 +274,18 @@ struct TransferStatus {
 
     std::unique_lock<std::mutex> lock(msgMu);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    // A status that completes only when polled (XGMI, FABRIC) is never notified, so wake up to
+    // poll it, backing off from 50 us to 1 ms. Others are completed by a thread that notifies cv_.
+    auto pollInterval = std::chrono::microseconds(50);
     while (code.load(std::memory_order_acquire) == StatusCode::IN_PROGRESS) {
-      if (std::chrono::steady_clock::now() >= deadline) break;
-      cv_.wait_until(lock, deadline);
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) break;
+      if (progressCallback) {
+        cv_.wait_until(lock, std::min(deadline, now + pollInterval));
+        pollInterval = std::min(pollInterval * 2, std::chrono::microseconds(1000));
+      } else {
+        cv_.wait_until(lock, deadline);
+      }
       lock.unlock();
       PollProgress();
       lock.lock();

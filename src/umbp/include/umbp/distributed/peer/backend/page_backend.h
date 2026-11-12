@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "mori/io/engine.hpp"
+#include "umbp/common/config.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/peer/backend/page_pool.h"
 #include "umbp/distributed/peer/backend/peer_page_allocator.h"
@@ -80,6 +81,9 @@ class PageMemorySource {
     // Usable size.  May EXCEED the requested size (host hugepage rounding) —
     // PageBackend publishes this, not the request, so the extra is allocatable.
     uint64_t size = 0;
+    // Size of the pages backing the buffer (4 KiB, or the hugepage size).  NIC
+    // registrations start on these pages.  0 = unknown: never split.
+    uint64_t backing_page_size = 0;
   };
 
   // Allocate one buffer per entry of `sizes`, appending to `out`.  All or
@@ -192,6 +196,10 @@ class PageBackend : public MediumBackend {
     bool prefault = true;
     bool numa_strict = false;
     int prefault_threads = 0;
+    // Largest region of a buffer registered with the NIC as one memory region
+    // (UMBP_DRAM_MAX_MR_BYTES); a bigger buffer is registered in several,
+    // each its own allocator buffer on the same NUMA node.  0 = no limit.
+    uint64_t max_mr_bytes = kDefaultDramMaxMrBytes;
   };
 
   // `pending_ttl` is the only TTL in the system.  After this elapses
@@ -217,10 +225,12 @@ class PageBackend : public MediumBackend {
   // This is the one Init() actually works against; the OwnershipConfig overload
   // funnels into it, so DRAM and HBM share a single allocation/registration
   // path rather than two that must be kept in step.
+  // NUMA labels steer the allocator; the source owns physical binding.
   PageBackend(TierType tier, uint64_t page_size, std::unique_ptr<PageMemorySource> source,
               std::vector<uint64_t> buffer_sizes, std::chrono::milliseconds pending_ttl,
               std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500},
-              std::chrono::milliseconds reaper_interval = std::chrono::milliseconds{200});
+              std::chrono::milliseconds reaper_interval = std::chrono::milliseconds{200},
+              uint64_t max_mr_bytes = kDefaultDramMaxMrBytes, std::vector<int> numa_nodes = {});
 
   ~PageBackend() override;
 
@@ -306,10 +316,14 @@ class PageBackend : public MediumBackend {
   void SetEventPublishing(bool enabled) override;
 
   // ==================== Eviction ordering ====================
-  // An LRU of owned keys (Commit inserts, Resolve renews), kept only after
+  // An LRU of owned keys (Commit inserts, Resolve and Touch renew), kept only after
   // TrackEvictionOrder().  Candidates skip what Evict() would refuse.
   void TrackEvictionOrder() override;
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
+
+  // Moves held keys to the recent end of the order, as a read would, without
+  // the read's lease.  0 until TrackEvictionOrder().
+  size_t Touch(const std::vector<std::string>& keys) override;
 
   // ==================== Reaper ====================
 
@@ -431,6 +445,10 @@ class PageBackend : public MediumBackend {
   // for the OwnershipConfig ctor).
   void InstallTierConfig(TierConfig cfg);
 
+  // Region size for a buffer backed by `backing_page_size` pages: at most
+  // max_mr_bytes_, in whole backing and allocator pages.  0 = do not split.
+  uint64_t RegionBytes(uint64_t backing_page_size) const;
+
   void ReaperLoop();
   void ReaperSweep();
 
@@ -505,7 +523,7 @@ class PageBackend : public MediumBackend {
   std::vector<DeferredFree> deferred_frees_;
 
   // ---- eviction order (see TrackEvictionOrder) ----
-  // Front = most recently committed/resolved, back = eviction candidate.
+  // Front = most recently committed, resolved or touched; back = eviction candidate.
   // Empty and unmaintained until track_eviction_order_.
   std::list<std::string> lru_;
   // Guards lru_ and the per-slot lru_it/in_lru fields.  Separate from mutex_
@@ -544,6 +562,7 @@ class PageBackend : public MediumBackend {
   // exactly one path regardless of medium.
   std::unique_ptr<PageMemorySource> source_;
   std::vector<uint64_t> source_buffer_sizes_;
+  uint64_t max_mr_bytes_ = kDefaultDramMaxMrBytes;
 
   // Mirrored from source_ at construction (defaults suit the TierConfig ctor,
   // which is host memory by convention).  Read by BuildBufferRefs, which runs

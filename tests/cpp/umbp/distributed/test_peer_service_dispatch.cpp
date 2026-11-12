@@ -188,6 +188,32 @@ TEST_F(PeerServiceDispatchTest, BatchAllocateReportsInFlightPerEntry) {
   EXPECT_EQ(resp.entries(1).outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
 }
 
+TEST_F(PeerServiceDispatchTest, AllocatePassesTheWritersNumaHintToTheBackend) {
+  ::umbp::AllocateSlotRequest one;
+  one.set_key("one");
+  one.set_size(64);
+  one.set_tier(Proto(kSecondByTier));
+  one.set_preferred_numa_node(1);
+  ::umbp::AllocateSlotResponse one_resp;
+  grpc::ClientContext one_ctx;
+  ASSERT_TRUE(stub_->AllocateSlot(&one_ctx, one, &one_resp).ok());
+
+  ::umbp::BatchAllocateSlotsRequest batch;
+  for (const char* key : {"hinted", "unhinted"}) {
+    auto* e = batch.add_entries();
+    e->set_key(key);
+    e->set_size(64);
+    e->set_tier(Proto(kSecondByTier));
+  }
+  batch.mutable_entries(0)->set_preferred_numa_node(0);
+  ::umbp::BatchAllocateSlotsResponse batch_resp;
+  grpc::ClientContext batch_ctx;
+  ASSERT_TRUE(stub_->BatchAllocateSlots(&batch_ctx, batch, &batch_resp).ok());
+
+  // Absent on the wire is "no preference", not node 0.
+  EXPECT_EQ(Mock(kSecondByTier)->AllocateNumaHints(), (std::vector<int>{1, 0, -1}));
+}
+
 TEST_F(PeerServiceDispatchTest, AllocateForATierWithNoBackendFailsCleanly) {
   // SSD is a valid wire tier with no backend registered here — a normal
   // deployment shape, so it must be a FAILED outcome and not fall through to

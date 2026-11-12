@@ -47,7 +47,8 @@ namespace anvil {
 
 class SdmaQueue {
  public:
-  SdmaQueue(uint32_t localNodeId, uint32_t engineId);
+  // hsakmtNodeId is libhsakmt's node id, not the sysfs one (see connect()).
+  SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId);
   ~SdmaQueue();
 
   SdmaQueueDeviceHandle* deviceHandle() const;
@@ -75,24 +76,24 @@ class AnvilLib {
 
  public:
   void init();
-  // srcNode/dstNode are KFD topology node ids (== HSA_AGENT_INFO_NODE), a
-  // host-global GPU identity that does NOT depend on HIP_VISIBLE_DEVICES. This
-  // is the correct key for a peer even when the peer GPU is not in this
-  // process's HIP device list. Channels for a pair are shared process-wide.
+  // srcNode/dstNode are KFD sysfs node ids (N in /sys/class/kfd/kfd/topology/nodes/N),
+  // a host-global GPU identity that depends neither on HIP_VISIBLE_DEVICES nor on
+  // which GPUs a container exposes. libhsakmt numbers only the nodes this process
+  // can open, so anvil reads topology from sysfs and translates the local node
+  // only to create its queues. Channels for a pair are shared process-wide.
   bool connect(int srcNode, int dstNode, int numChannels = 1);
 
   // Get the SDMA queue for a given src/dst node pair and channel index.
   SdmaQueue* getSdmaQueue(int srcNode, int dstNode, int channelIdx = 0);
 
-  // Map a HIP device ordinal to its KFD node id. For single-process callers
+  // Map a HIP device ordinal to its KFD sysfs node id. For single-process callers
   // (e.g. the examples) that only have HIP device ids; multi-process collectives
   // should exchange node ids out-of-band instead (see Context::KfdNodeId).
   static uint32_t nodeForHipDevice(int hipDev);
 
-  // Resolve the KFD topology node id of the given HIP device WITHOUT initializing
-  // HSA. The KFD node id (the directory index under /sys/class/kfd/kfd/topology/nodes)
-  // is identical to what HSA_AGENT_INFO_NODE / hsaKmtGetNodeProperties report,
-  // and is a host-global identity independent of HIP_VISIBLE_DEVICES.
+  // Resolve the KFD sysfs node id (the directory index under
+  // /sys/class/kfd/kfd/topology/nodes) of the given HIP device WITHOUT initializing
+  // HSA. It can differ from HSA_AGENT_INFO_NODE when this process cannot open every GPU.
   static int kfdNodeIdForHipDevice(int hipDev);
 
  private:
@@ -141,8 +142,13 @@ class AnvilLib {
 
   // True for MI308X (PCI device_id 0x74A2), a 4-XCD harvest of the 8-XCD MI300X
   // whose odd-numbered SDMA engine ids are fused off. connect() folds selected
-  // engine ids down to the backing even engine on this part.
+  // engine ids down to the backing even engine on this part and balances its
+  // peer links over the xGMI engines.
   bool isMi308x(int deviceId);
+
+  // MI308X only; see connect(). Both assume channels_mutex_ is held.
+  uint32_t mi308xLinkEngine(int srcNode, int dstNode, const std::vector<uint32_t>& recommended);
+  uint32_t mi308xQueueEngine(int srcNode, int dstNode);
 
   struct PairHash {
     std::size_t operator()(const std::pair<int, int>& p) const {
@@ -154,6 +160,15 @@ class AnvilLib {
   std::once_flag init_flag;
   std::mutex channels_mutex_;
   std::unordered_map<std::pair<int, int>, SdmaQueueVector, PairHash> sdma_channels_;
+  // MI308X peer-link balancing state, guarded by channels_mutex_. Per source
+  // node, the peer links and queues on each SDMA engine id; and per (src, dst)
+  // link, the engine all of its queues were given.
+  struct Mi308xEngineUse {
+    std::array<int, 8> links{};
+    std::array<int, 8> queues{};
+  };
+  std::unordered_map<int, Mi308xEngineUse> mi308x_engine_use_;
+  std::unordered_map<std::pair<int, int>, uint32_t, PairHash> mi308x_link_engine_;
 };
 
 extern AnvilLib& anvil;

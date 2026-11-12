@@ -158,6 +158,16 @@ int ibv_dealloc_pd(struct ibv_pd* pd) {
   return fn ? fn(pd) : IbvUnavailable(-1);
 }
 
+// ---- address handles --------------------------------------------------------
+struct ibv_ah* ibv_create_ah(struct ibv_pd* pd, struct ibv_ah_attr* attr) {
+  MORI_IBV_RESOLVE(ibv_create_ah, "IBVERBS_1.1");
+  return fn ? fn(pd, attr) : IbvUnavailable<struct ibv_ah*>(nullptr);
+}
+int ibv_destroy_ah(struct ibv_ah* ah) {
+  MORI_IBV_RESOLVE(ibv_destroy_ah, "IBVERBS_1.1");
+  return fn ? fn(ah) : IbvUnavailable(-1);
+}
+
 // ---- memory regions ---------------------------------------------------------
 struct ibv_mr* ibv_reg_mr(struct ibv_pd* pd, void* addr, size_t length, int access) {
   MORI_IBV_RESOLVE(ibv_reg_mr, "IBVERBS_1.1");
@@ -219,6 +229,11 @@ int ibv_destroy_qp(struct ibv_qp* qp) {
 int ibv_modify_qp(struct ibv_qp* qp, struct ibv_qp_attr* attr, int attr_mask) {
   MORI_IBV_RESOLVE(ibv_modify_qp, "IBVERBS_1.1");
   return fn ? fn(qp, attr, attr_mask) : IbvUnavailable(-1);
+}
+int ibv_query_qp(struct ibv_qp* qp, struct ibv_qp_attr* attr, int attr_mask,
+                 struct ibv_qp_init_attr* init_attr) {
+  MORI_IBV_RESOLVE(ibv_query_qp, "IBVERBS_1.1");
+  return fn ? fn(qp, attr, attr_mask, init_attr) : IbvUnavailable(ENOSYS);
 }
 struct ibv_srq* ibv_create_srq(struct ibv_pd* pd, struct ibv_srq_init_attr* srq_init_attr) {
   MORI_IBV_RESOLVE(ibv_create_srq, "IBVERBS_1.1");

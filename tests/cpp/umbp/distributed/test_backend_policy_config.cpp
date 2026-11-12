@@ -336,6 +336,24 @@ TEST(BackendPolicyConfig, LowersSsdStagingSlotsAndDefaultsWhenAbsent) {
   EXPECT_FALSE(negative.ok());
 }
 
+TEST(BackendPolicyConfig, LowersSsdMinObjectSizeOntoTierMembers) {
+  auto loaded = LoadBackendPolicyJson(R"json(
+    {"backends":{"d":{"type":"dram","capacity":"1GiB"},
+                 "s":{"type":"ssd","capacity":"1GiB","path":"/tmp/a","min_object_size":"64KiB"}},
+     "tiers":[{"backends":{"d":1,"s":2}}]}
+  )json");
+  ASSERT_TRUE(loaded.ok()) << loaded.error;
+  PoolClientConfig output;
+  output.dram_page_size = 64ULL << 10;
+  std::string error;
+  ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, &output, &error)) << error;
+  ASSERT_EQ(output.logical_tiers.size(), 1u);
+  for (const auto& member : output.logical_tiers[0].members) {
+    EXPECT_EQ(member.min_object_bytes, member.backend_name == "s" ? 64ULL << 10 : 0u)
+        << member.backend_name;
+  }
+}
+
 TEST(BackendPolicyConfig, ApplyIsAtomicWhenLoweringFails) {
   auto loaded = LoadBackendPolicyJson(R"json(
     {"backends":{"d":{"type":"dram","capacity":"1MiB"}},

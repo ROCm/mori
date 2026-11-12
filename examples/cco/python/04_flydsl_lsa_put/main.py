@@ -44,12 +44,12 @@ except ImportError:
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops
 from flydsl.expr.typing import Int64, T
 from flydsl._mlir.dialects import rocdl
 
 from mori.cco import Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE
 import mori.cco.device.flydsl as cco
+from mori.cco.device.flydsl import buffer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cco_example_common import set_device, sync, fill, zero, read  # noqa: E402
@@ -60,7 +60,6 @@ NBYTES = NUM_ELEMS * 8
 NUM_PACKS = NBYTES // 16  # 16 B (vector<4xi32>) per pack
 THREADS = 256
 DST_RANK = 1  # rank 1's LSA rank
-_CM_UNCACHED = 3  # SC0|SC1: store bypasses L1+L2 -> reaches peer HBM
 
 
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -72,12 +71,13 @@ def lsa_put_kernel(dev_comm: Int64, win_handle: Int64):
     win = cco.Window(win_handle)
     src = win.lsa_ptr(dc.lsa_rank, 0)  # my own slot (local VA)
     dst = win.lsa_ptr(DST_RANK, 0)  # rank 1's slot (peer VA) — load/store directly
-    src_rsrc = buffer_ops.create_buffer_resource_from_addr(src)
-    dst_rsrc = buffer_ops.create_buffer_resource_from_addr(dst)
+    src_rsrc = buffer.create_buffer_resource_from_addr(src)
+    dst_rsrc = buffer.create_buffer_resource_from_addr(dst)
     for pk in range(tid, NUM_PACKS, THREADS):
         off = pk * 4  # i32-element offset of this 16 B pack
-        v = buffer_ops.buffer_load(src_rsrc, off, vec_width=4, dtype=T.i32)
-        buffer_ops.buffer_store(v, dst_rsrc, off, cache_modifier=_CM_UNCACHED)
+        v = buffer.buffer_load(src_rsrc, off, vec_width=4, dtype=T.i32)
+        # Past L1+L2 so the store reaches the peer's HBM.
+        buffer.buffer_store(v, dst_rsrc, off, cache_modifier=buffer.CM_SC0_SC1)
     rocdl.s_waitcnt(0)
 
 

@@ -19,12 +19,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include <arpa/inet.h>
 #include <fcntl.h>
 #include <hip/hip_runtime_api.h>
 #include <limits.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -143,48 +140,17 @@ bool WaitInboundStatusWithTimeout(IOEngine* engine, const EngineKey& remoteKey, 
   return false;
 }
 
-int GetFreePort() {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return -1;
-
-  int opt = 1;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = 0;
-  addr.sin_addr.s_addr = INADDR_ANY;
-
-  if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    close(fd);
-    return -1;
-  }
-
-  socklen_t len = sizeof(addr);
-  if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-    close(fd);
-    return -1;
-  }
-
-  int port = ntohs(addr.sin_port);
-
-  close(fd);
-  return port;
-}
-
 ConnectedEnginePair CreateConnectedRdmaPair(const std::string& prefix, bool enableNotification) {
   if (!RdmaBackend::HasActiveDevices()) {
     throw TestSkip("requires at least one active RDMA device");
   }
 
+  // Port 0 lets each backend bind its own ephemeral port. A port probed up front
+  // is only free until CreateBackend binds it, and two probes can return the same one.
   IOEngineConfig cfg;
   cfg.host = "127.0.0.1";
-  cfg.port = GetFreePort();
-  Require(cfg.port > 0, "failed to allocate free tcp port for initiator");
+  cfg.port = 0;
   auto initiator = std::make_unique<IOEngine>(prefix + "_initiator", cfg);
-
-  cfg.port = GetFreePort();
-  Require(cfg.port > 0, "failed to allocate free tcp port for target");
   auto target = std::make_unique<IOEngine>(prefix + "_target", cfg);
 
   RdmaBackendConfig rdmaCfg{};
@@ -1932,6 +1898,7 @@ void CaseXgmiCrossEngineIpc() {
 
   HIP_RUNTIME_CHECK(hipSetDevice(0));
   HIP_RUNTIME_CHECK(hipMemset(srcMem.ptr, 0xAB, kSize));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   HIP_RUNTIME_CHECK(hipSetDevice(1));
   HIP_RUNTIME_CHECK(hipMemset(dstMem.ptr, 0x00, kSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -2184,6 +2151,35 @@ void CaseXgmiHiddenDeviceImporterNonZeroDevice() {
   RunHiddenDeviceSplitVisibility(totalGpus - 1, "0,1", 1);
 }
 
+// Regression: GPUs outside an XGMI hive (PCIe-only cards) all report KFD hive_id 0,
+// and hidden-device eligibility required a shared non-zero hive, so CreateSession
+// returned nullopt for every pair. This is prefill and decode on adjacent GPUs,
+// one GPU per process.
+void CaseXgmiHiddenDeviceAdjacentGpus() {
+  int totalGpus = GetGpuCount();
+  if (totalGpus < 2) throw TestSkip("requires at least 2 GPUs");
+  RunHiddenDeviceSplitVisibility(0, "1", 0);
+}
+
+// A hidden remote GPU that is neither in the local GPU's hive nor one of its KFD P2P
+// peers must still be rejected.
+void CaseXgmiHiddenDeviceRejectsUnknownPeer() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_hidden_unknown_peer_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  auto local = RegisterGpuMemory(&engine, 4096, 0);
+  MemoryDesc remote = local.desc;
+  remote.deviceBusId = "0000:ff:1f.7";
+  Require(!engine.CreateSession(local.desc, remote).has_value(),
+          "CreateSession should fail for a hidden GPU that is not a P2P peer");
+}
+
 void CaseXgmiInboundNotificationIsUnsupported() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -2245,6 +2241,42 @@ void CaseXgmiConcurrentWaitAndPollIsSafe() {
   Require(status.Succeeded(),
           "xgmi concurrent wait/poll transfer failed: code=" + std::to_string(status.CodeUint32()) +
               ", msg='" + status.Message() + "'");
+}
+
+void CaseXgmiBoundedWaitReturnsOnCompletion() {
+  if (GetGpuCount() < 2) throw TestSkip("requires at least 2 GPUs");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_bounded_wait_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  constexpr size_t kSize = 64 * 1024 * 1024;
+  auto src = RegisterGpuMemory(&engine, kSize, 0);
+  auto dst = RegisterGpuMemory(&engine, kSize, 1);
+
+  // An XGMI status completes only when polled; a bounded wait must poll it rather than sleep to
+  // its deadline.
+  for (bool waitAll : {false, true}) {
+    TransferStatus status;
+    engine.Write(src.desc, 0, dst.desc, 0, kSize, &status, engine.AllocateTransferUniqueId());
+    auto start = std::chrono::steady_clock::now();
+    if (waitAll) {
+      engine.WaitAll({&status}, 10000);
+    } else {
+      status.WaitFor(10000);
+    }
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count();
+    const std::string how = waitAll ? "WaitAll(10000)" : "WaitFor(10000)";
+    Require(status.Succeeded(),
+            how + " transfer failed: code=" + std::to_string(status.CodeUint32()) + ", msg='" +
+                status.Message() + "'");
+    Require(ms < 2000, how + " returned after " + std::to_string(ms) + " ms for a 64 MiB copy");
+  }
 }
 
 struct TestCase {
@@ -2330,8 +2362,11 @@ int main(int argc, char* argv[]) {
       {"xgmi_hidden_device_export_from_nonzero_device",
        CaseXgmiHiddenDeviceExportFromNonZeroDevice},
       {"xgmi_hidden_device_importer_nonzero_device", CaseXgmiHiddenDeviceImporterNonZeroDevice},
+      {"xgmi_hidden_device_adjacent_gpus", CaseXgmiHiddenDeviceAdjacentGpus},
+      {"xgmi_hidden_device_rejects_unknown_peer", CaseXgmiHiddenDeviceRejectsUnknownPeer},
       {"xgmi_inbound_notification_is_unsupported", CaseXgmiInboundNotificationIsUnsupported},
       {"xgmi_concurrent_wait_and_poll_is_safe", CaseXgmiConcurrentWaitAndPollIsSafe},
+      {"xgmi_bounded_wait_returns_on_completion", CaseXgmiBoundedWaitReturnsOnCompletion},
   };
 
   int passed = 0;

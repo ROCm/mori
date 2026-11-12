@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -67,8 +68,10 @@ class PeerSsdManager {
  public:
   explicit PeerSsdManager(const PeerSsdConfig& cfg);
 
-  // Test-only: inject a fake backend.
-  explicit PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight = true);
+  // Inject storage and follower copies while retaining the ownership/read protocol.
+  using FanoutCopy = std::function<bool(void*, const void*, size_t)>;
+  explicit PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight = true,
+                          FanoutCopy fanout_copy = {});
 
   ~PeerSsdManager();
 
@@ -85,6 +88,8 @@ class PeerSsdManager {
   // to know how big the key is while it still only holds the key's name.
   // `owned_` has carried this all along; only the accessor was missing.
   uint64_t SizeOf(const std::string& key) const;
+  // SizeOf for a batch under one lock; 0 = not owned.
+  std::vector<uint64_t> SizesOf(const std::vector<std::string>& keys) const;
 
   // Hold a key against eviction across a peer-local migration.  Uses the same
   // refcount as active reads so eviction has one protection rule.
@@ -134,6 +139,9 @@ class PeerSsdManager {
   // returns disk a whole segment at a time), so no other ranking should be
   // used to pick its victims.
   bool OrdersEviction() const;
+  // Renews recency in this class's LRU and the tier's order; reads nothing.
+  // Returns how many of the keys a read would find here.
+  size_t Touch(const std::vector<std::string>& keys);
 
   // Forwards to the tier: see TierBackend::SetRetiredFileHook.
   void SetRetiredFileHook(std::function<void(int fd)> on_close, std::chrono::milliseconds grace);
@@ -252,6 +260,8 @@ class PeerSsdManager {
 
   mutable std::mutex mutex_;
   std::unique_ptr<TierBackend> backend_;  // null when cfg.enabled == false
+  FanoutCopy fanout_copy_;
+  bool CopyFollower(void* dst, const void* src, size_t size) noexcept;
 
   // key -> {size, lru position}.  The authoritative owned-location map.
   std::unordered_map<std::string, OwnedEntry> owned_;
@@ -306,10 +316,20 @@ class PeerSsdManager {
   };
 
   struct InflightRead {
-    int refs = 0;  // leader + followers + independents holding this key
-    // Non-null exactly while a leader is mid-read; the leader clears it on
-    // completion so the next arrival starts a fresh episode.
-    std::shared_ptr<ReadEpisode> episode;
+    int refs = 0;  // leaders + followers holding this key
+    // One per leader mid-read, so ranged readers of different extents each lead
+    // one; a leader removes its own on completion.
+    std::vector<std::shared_ptr<ReadEpisode>> episodes;
+
+    std::shared_ptr<ReadEpisode> Joinable(uint64_t offset, uint64_t length) const {
+      for (const auto& e : episodes) {
+        if (!e->sealed && e->Covers(offset, length)) return e;
+      }
+      return nullptr;
+    }
+    void Retire(const std::shared_ptr<ReadEpisode>& e) {
+      episodes.erase(std::remove(episodes.begin(), episodes.end(), e), episodes.end());
+    }
   };
 
   // Read priority + eviction coordination (all guarded by mutex_):

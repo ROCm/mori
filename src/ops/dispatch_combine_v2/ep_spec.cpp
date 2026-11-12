@@ -60,6 +60,11 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "one of them");
   }
   c.combineFp8 = (kind == EpKernelKind::Combine) && req.combineFp8;
+  if (req.combineBf16Push && (req.combineFp4 || req.combineFp8)) {
+    throw std::runtime_error(
+        "mori v2 ep: combineBf16Push is the push combine without quantization, and combineFp4 / "
+        "combineFp8 pick a quantized wire; set one of them");
+  }
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -71,12 +76,45 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   const bool isDispatch = kind == EpKernelKind::Dispatch;
   // Only the gfx125x dispatch body implements it; everywhere else the Cfg, and so
   // the rendered source and its cache key, stays exactly what it was without it.
-  c.aggReserve = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
+  c.aggReserve = isDispatch && arch.rfind("gfx125", 0) == 0;
+  c.callTokMax = isDispatch && arch.rfind("gfx125", 0) == 0 && req.callTokMax > 0 &&
+                         req.callTokMax < req.maxTokPerRank
+                     ? req.callTokMax
+                     : 0;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
 
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
+
+  if (req.ll128) {
+    const bool pushE8m0 = req.combineFp8 || (req.combineFp4 && !req.combineFp4F32Scale);
+    const bool bf16 = !req.combineFp4 && !req.combineFp8 &&
+                      (req.dtype == EpDType::Bf16 || (isDispatch && req.dtype == EpDType::Fp8));
+    if (arch.rfind("gfx125", 0) != 0 || !(pushE8m0 || bf16) || req.maxTokPerRank > 512 ||
+        c.waveSize != 32 || c.blockNum > (isDispatch ? 128 : 256)) {
+      throw std::runtime_error(
+          "mori v2 ep: ll128 needs gfx125x, the fp4 / fp8 push combine with e8m0 scales or a bf16 "
+          "combine with a bf16 / fp8 dispatch, at most 512 tokens a rank, wave32, and at most 128 "
+          "dispatch / 256 combine blocks");
+    }
+    c.ll128 = true;
+  }
+  if (req.ll128CombineOnly && !isDispatch) {
+    const bool pushE8m0 = req.combineFp8 || (req.combineFp4 && !req.combineFp4F32Scale);
+    if (req.ll128 || arch.rfind("gfx125", 0) != 0 || !pushE8m0 || c.waveSize != 32 ||
+        c.blockNum > 256) {
+      throw std::runtime_error(
+          "mori v2 ep: ll128CombineOnly needs gfx125x, the fp4 / fp8 push combine with e8m0 "
+          "scales, wave32, at most 256 combine blocks, and no ll128");
+    }
+    c.ll128CombineOnly = true;
+  }
+  c.combineBf16Push = !isDispatch && req.combineBf16Push && !c.ll128 && !c.ll128CombineOnly;
+  if (c.combineBf16Push && c.dtype != EpDType::Bf16) {
+    throw std::runtime_error(
+        "mori v2 ep: combineBf16Push sums bf16 rows, so it needs a bf16 combine");
+  }
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
   // but combine sums across sources, so a byte type there would compile and
@@ -151,13 +189,9 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
   // text, same sha256, same cache entry.
   std::string scaleDefs;
   if (cfg.scaleBytes > 0) {
-    // ROWS is the per-peer stride: the staging is indexed peer*ROWS + destTokId, so
-    // it has to be the peer's full receive capacity and not the smaller per-peer
-    // share of the idx/wt pool. BYTES is the caller's row, STRIDE what we lay it
-    // down at: staging reads one and writes the other.
     scaleDefs = "#define MORI_EP_SCALE_BYTES " + std::to_string(cfg.scaleBytes) +
                 "\n#define MORI_EP_SCALE_STRIDE " + std::to_string(EpScaleStride(cfg)) +
-                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpMaxRecv(cfg)) + "\n";
+                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpScaleRows(cfg)) + "\n";
   }
   std::string worldDef = "#define MORI_EP_WORLD_SIZE " + std::to_string(cfg.worldSize) + "\n" +
                          "#define MORI_EP_MAX_RECV " + std::to_string(EpMaxRecv(cfg)) + "\n";
@@ -181,11 +215,51 @@ const std::vector<std::string>& EpSourceDeps() {
   return deps;
 }
 
+std::string EpKv(const char* key, size_t value) {
+  return std::string(key) + "=" + std::to_string(value) + "\n";
+}
+
+// Every arena region, in EpArgs order: what this kernel's Cfg needs, 0 for the
+// regions the other kernel's Cfg sizes.
+std::string EpRegionInfo(const EpCfg& c, EpKernelKind kind) {
+  const bool disp = kind == EpKernelKind::Dispatch;
+  const size_t tokOff = !disp            ? EpRegionTokOffBytes(c)
+                        : c.ll128        ? EpLl128StageBytes(c)
+                        : EpArchIs1250() ? EpRegionTokOff1250xBytes(c)
+                                         : EpRegionTokOffBytes(c);
+  return EpKv("region.tokOff", tokOff) + EpKv("region.recvNum", EpRegionRecvNumBytes(c)) +
+         EpKv("region.recvToSrc", EpRegionRecvToSrcBytes(c)) +
+         EpKv("region.outIdx", EpRegionOutIdxBytes(c)) +
+         EpKv("region.outWts", EpRegionOutWtsBytes(c)) +
+         EpKv("region.dispOut", disp ? EpRegionDispOutBytes(c) : 0) +
+         EpKv("region.outTok", disp ? 0 : EpRegionOutTokBytes(c)) +
+         EpKv("region.xdb", EpRegionXdbBytes(c)) +
+         EpKv("region.outScales", disp ? EpRegionOutScalesBytes(c) : 0);
+}
+
 }  // namespace
+
+// Plan info: the Cfg, plus the sizes a caller allocates for it.
+std::string EpDispatchInfo(const EpCfg& c) {
+  return Describe(c) + EpKv("scaleStride", EpScaleStride(c)) +
+         EpKv("stagingBytes", EpArchIs1250() ? EpStagingTotalBytes(c) : 0) +
+         EpRegionInfo(c, EpKernelKind::Dispatch);
+}
+
+std::string EpCombineInfo(const EpCfg& c) {
+  std::string s = Describe(c);
+  if (EpCombinePush(c) || c.combineBf16Push) {
+    s += EpKv("pushWireBytes", EpCombinePushWireBytes(c)) +
+         EpKv("pushLandRows", EpCombinePushLandRows(c)) +
+         EpKv("pushLandOff", EpCombinePushLandOff(c));
+  }
+  return s + EpRegionInfo(c, EpKernelKind::Combine);
+}
 
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
   if (cfg.combineFp8) return EpEntryName(cfg, "combine_fp8");
+  if (cfg.combineBf16Push) return EpEntryName(cfg, "combine_bf16p");
   if (!cfg.combineFp4) return EpEntryName(cfg, "combine");
   return EpEntryName(cfg, cfg.combineFp4F32Scale ? "combine_fp4b" : "combine_fp4");
 }
@@ -195,10 +269,9 @@ std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
-  if (EpCombinePush(cfg) && !EpArchIs1250()) {
+  if ((EpCombinePush(cfg) || cfg.combineBf16Push) && !EpArchIs1250()) {
     throw std::runtime_error(
-        "mori v2 ep: the fp4/fp8 push combine is gfx125x only (it moves every token through "
-        "TDM)");
+        "mori v2 ep: the push combine is gfx125x only (it moves every token through TDM)");
   }
   return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
 }
@@ -267,9 +340,9 @@ int EpNoPrecompile(const std::string&) { return 0; }
 // MORI_EP_ARGS_SCHEMA is generated from MORI_EP_ARGS_FIELDS next to the struct
 // (ep_cfg.hpp), which also static_asserts that the list is in declaration order.
 MORI_JIT_DEFINE_PLAN(ep_dispatch, mori::ops::v2::EpDispatchSpec, EpDispatchFromFields,
-                     mori::ops::v2::EpRequestSchema, mori::ops::v2::Describe, EpNoPrecompile,
+                     mori::ops::v2::EpRequestSchema, mori::ops::v2::EpDispatchInfo, EpNoPrecompile,
                      mori::ops::v2::EpArgs, MORI_EP_ARGS_SCHEMA)
 
 MORI_JIT_DEFINE_PLAN(ep_combine, mori::ops::v2::EpCombineSpec, EpCombineFromFields,
-                     mori::ops::v2::EpRequestSchema, mori::ops::v2::Describe, EpNoPrecompile,
+                     mori::ops::v2::EpRequestSchema, mori::ops::v2::EpCombineInfo, EpNoPrecompile,
                      mori::ops::v2::EpArgs, MORI_EP_ARGS_SCHEMA)

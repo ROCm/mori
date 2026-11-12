@@ -22,18 +22,27 @@ jobs:
     # building elsewhere can hand the tests a wheel their runtime disagrees with.
     runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
     env:
-      IMAGE: rocm/mori:ci-py${{ matrix.python }}
+      IMAGE: rocm/mori:manylinux-rocm${{ matrix.rocm }}
+      MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
     strategy:
       fail-fast: false
       matrix:
         include:
-          # py3.10 stays on 7.2.4: ROCm 7.14 ships no py3.10/ubuntu22.04 image.
-          # Dockerfile.dev skips its apt ROCm 7.14 install when the base already
-          # has a dev stack, so both lanes build from the same file.
+          # Built in docker/Dockerfile.manylinux, so a wheel needs nothing newer
+          # than glibc 2.28 instead of the glibc/libstdc++ of the Ubuntu image that
+          # ships its Python. Each lane builds against the ROCm its test image
+          # below runs: 7.2.4 for py3.10, so a 7.x wheel is still built and tested
+          # every night, and 10.1, the Dockerfile's default, for py3.12.
           - python: "3.10"
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            rocm: "7.2.4"
+            rocm_build_args: >-
+              --build-arg ROCM_VERSION=7.2.4
+              --build-arg ROCM_REPO=https://repo.radeon.com/rocm/rhel8/7.2.4/main
+              --build-arg ROCM_GPG=https://repo.radeon.com/rocm/rocm.gpg.key
+              --build-arg "ROCM_PACKAGES=rocm-hip-runtime-devel rocm-smi-lib"
           - python: "3.12"
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            rocm: "10.1"
+            rocm_build_args: ""
     steps:
       # Must precede Checkout: later steps run as root inside the CI container
       # and write build output into the mounted workspace. Cleanup chowns it
@@ -45,7 +54,7 @@ jobs:
       - name: Reset workspace ownership
         run: |
           mkdir -p $GITHUB_WORKSPACE
-          for IMG in $IMAGE ${{ matrix.base_image }}; do
+          for IMG in $IMAGE $MANYLINUX_IMAGE; do
             $CT image inspect "$IMG" >/dev/null 2>&1 || continue
             $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE "$IMG" \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE >/dev/null 2>&1 && break
@@ -60,15 +69,16 @@ jobs:
 
       - name: Clean stale dist
         run: |
-          $CT run --rm -v ${{ runner.temp }}:/runner_temp ${{ matrix.base_image }} \
-            rm -rf /runner_temp/dist || true
+          $CT run --rm -v ${{ runner.temp }}:/runner_temp $MANYLINUX_IMAGE \
+            rm -rf /runner_temp/dist /runner_temp/dist-pypi || true
 
-      - name: Build CI image
-        run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
+      - name: Build manylinux image
+        run: $CT build --network=host ${{ matrix.rocm_build_args }} -t $IMAGE -f docker/Dockerfile.manylinux .
 
       - name: Build wheels
         run: |
-          BASE_VER=$(git describe --tags --abbrev=0 | sed 's/^v//')
+          # v1.2.4.post1 -> 1.2.4; else the nightly is 1.2.4.1.devN, below 1.2.5.devN
+          BASE_VER=$(git describe --tags --abbrev=0 --match 'v[0-9]*' | sed -E 's/^v([0-9]+(\.[0-9]+)*).*/\1/')
           NEXT_VER=$(echo "$BASE_VER" | awk -F. '{$NF=$NF+1; print}' OFS=.)
           DATE=$(date +%Y%m%d)
           SHA=$(git rev-parse --short HEAD)
@@ -78,27 +88,34 @@ jobs:
           $CT run --rm --network=host \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE -w $GITHUB_WORKSPACE \
             -v ${{ runner.temp }}/dist:/tmp/dist \
+            -v ${{ runner.temp }}/dist-pypi:/tmp/dist-pypi \
             $IMAGE bash -c "
+              set -e
               git config --global --add safe.directory '*'
 
               # The builder is an MI355X box, so setup.py would otherwise detect
               # gfx950 and emit a single-arch wheel that cannot launch a kernel on
-              # the MI300X_MLX test runners (gfx942).
-              export MORI_GPU_ARCHS='gfx942;gfx950'
+              # the MI300X_MLX test runners (gfx942). No runner has gfx1250, but the
+              # published wheels need its ahead-of-time code (UMBP's gather kernel).
+              export MORI_GPU_ARCHS='gfx942;gfx950;gfx1250'
 
+              # The script's auditwheel repair tags each wheel manylinux_2_28 and
+              # fails the build if it needs a newer glibc or libstdc++.
               echo '=== Building CI test wheel (amd_mori ${GH_VERSION}) ==='
               SETUPTOOLS_SCM_PRETEND_VERSION=${GH_VERSION} \
-                python3 -m pip wheel --no-deps -w /tmp/dist .
+                python3 tools/build_manylinux_wheel.py \
+                  --python ${{ matrix.python }} --out-dir /tmp/dist
 
               echo '=== Building PyPI wheel (amd_mori_nightly ${PYPI_VERSION}) ==='
               sed -i 's/name = \"amd_mori\"/name = \"amd_mori_nightly\"/' pyproject.toml
               SETUPTOOLS_SCM_PRETEND_VERSION=${PYPI_VERSION} \
-                python3 -m pip wheel --no-deps -w /tmp/dist .
+                python3 tools/build_manylinux_wheel.py \
+                  --python ${{ matrix.python }} --out-dir /tmp/dist-pypi
               git checkout pyproject.toml
             "
 
           echo "=== produced ==="
-          ls -lh ${{ runner.temp }}/dist/
+          ls -lh ${{ runner.temp }}/dist/ ${{ runner.temp }}/dist-pypi/
 
       - name: Verify wheel contents
         # Gate on the artifact itself, before anything installs it: a wheel built
@@ -107,53 +124,29 @@ jobs:
         # where that is cheap to catch and the only one before publish.
         run: |
           $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
-            -v ${{ runner.temp }}/dist:/tmp/dist -w $GITHUB_WORKSPACE \
+            -v ${{ runner.temp }}/dist:/tmp/dist \
+            -v ${{ runner.temp }}/dist-pypi:/tmp/dist-pypi -w $GITHUB_WORKSPACE \
             $IMAGE bash -c "
               set -e
-              for whl in /tmp/dist/*.whl; do
+              for whl in /tmp/dist/*.whl /tmp/dist-pypi/*.whl; do
                 python3 tools/verify_install.py --wheel \$whl
               done
             "
 
-      - name: Retag PyPI wheels (manylinux platform tag)
+      - name: Load wheel on glibc 2.28
+        # The only glibc 2.28 the wheels meet in this workflow: the test jobs run on
+        # Ubuntu, and auditwheel's check is static and skips the excluded
+        # ROCm/libdrm/libnuma. This resolves every packaged library against EL8's
+        # glibc and libstdc++ for real. mori.io/ops/ccl import torch, so they stay out.
         run: |
-          mkdir -p ${{ runner.temp }}/dist-pypi
-          cat > ${{ runner.temp }}/retag.py << 'PYEOF'
-          import zipfile, shutil, os, sys, tempfile
-          src, dst, plat = sys.argv[1], sys.argv[2], sys.argv[3]
-          shutil.copy2(src, dst)
-          with zipfile.ZipFile(dst, 'r') as zin:
-              wheel_file = [n for n in zin.namelist() if n.endswith('/WHEEL')][0]
-              content = zin.read(wheel_file).decode()
-          fixed = content.replace('linux_x86_64', plat)
-          tmpfd, tmppath = tempfile.mkstemp(suffix='.whl')
-          os.close(tmpfd)
-          with zipfile.ZipFile(dst, 'r') as zin, zipfile.ZipFile(tmppath, 'w') as zout:
-              for item in zin.infolist():
-                  data = zin.read(item.filename)
-                  if item.filename == wheel_file:
-                      data = fixed.encode()
-                  zout.writestr(item, data)
-          shutil.move(tmppath, dst)
-          print(f'Retagged: {os.path.basename(dst)}')
-          PYEOF
-          $CT run --rm \
-            -v ${{ runner.temp }}/dist:/tmp/dist:ro \
-            -v ${{ runner.temp }}/dist-pypi:/tmp/dist-pypi \
-            -v ${{ runner.temp }}/retag.py:/tmp/retag.py:ro \
-            $IMAGE bash -c "
-              pip install auditwheel -q
-              for whl in /tmp/dist/amd_mori_nightly-*.whl; do
-                PLAT=\$(auditwheel show \"\$whl\" 2>&1 | grep -o 'manylinux_[0-9_]*_x86_64' | head -1)
-                if [ -z \"\$PLAT\" ]; then PLAT=linux_x86_64; fi
-                NEWNAME=\$(basename \"\$whl\" | sed \"s/linux_x86_64/\$PLAT/\")
-                python3 /tmp/retag.py \"\$whl\" \"/tmp/dist-pypi/\$NEWNAME\" \"\$PLAT\"
-              done
-            "
-          $CT run --rm -v ${{ runner.temp }}/dist-pypi:/tmp/dist-pypi $IMAGE \
-            chown -R $(id -u):$(id -g) /tmp/dist-pypi
-          echo "=== PyPI wheels ==="
-          ls -lh ${{ runner.temp }}/dist-pypi/
+          PYTAG=cp$(echo "${{ matrix.python }}" | tr -d .)
+          $CT run --rm -v ${{ runner.temp }}/dist-pypi:/tmp/dist-pypi $IMAGE bash -c "
+            set -e
+            PY=/opt/python/${PYTAG}-${PYTAG}/bin/python
+            \$PY -m pip install -q /tmp/dist-pypi/*.whl
+            cd /tmp
+            \$PY -c 'import ctypes, glob, os, mori.cpp, mori.cco.cco, mori.jit, mori.shmem, mori.umbp; [ctypes.CDLL(p, os.RTLD_NOW) for p in glob.glob(os.path.dirname(mori.__file__) + \"/lib*.so\")]'
+          "
 
       - name: Upload CI test wheel (amd_mori)
         uses: actions/upload-artifact@v4
@@ -177,7 +170,7 @@ jobs:
               -v ${{ runner.temp }}:/runner_temp \
               $IMAGE bash -c "
                 chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null
-                rm -rf /runner_temp/dist
+                rm -rf /runner_temp/dist /runner_temp/dist-pypi
               " || true
 
   # ── Stage 2a: Intranode tests (install from build artifact) ────────────────
@@ -207,7 +200,7 @@ jobs:
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
@@ -221,7 +214,7 @@ jobs:
           - platform: MI300X_MLX
             python: "3.12"
             runner: [self-hosted, 300_mlx_p19_29]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
             rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
             socket_ifname: ens14np0
             timeout_minutes: 90
@@ -455,10 +448,18 @@ jobs:
             rdma_tc: 104
             ct: podman
             timeout_minutes: 45
+            # These hosts' amdgpu-dkms lacks 93aa919 ("drm/amdkfd: fix vram
+            # allocation failure for a special case"): hipMemCreate (VRAM with no VA
+            # yet) fails with EADDRINUSE, reported as out of memory, while any SVM
+            # range sits below its size, and libhsakmt registers every pageable
+            # buffer HIP pins for a copy as one. HSA_USE_SVM=0 registers them as
+            # userptr instead. Not in the image: with SVM off every pageable copy is
+            # pinned again. Drop it once the hosts' amdgpu-dkms carries the fix.
+            hsa_use_svm: 0
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
             node1_host: 10.2.80.20
             node2_host: 10.2.80.10
             node2_port: 22
@@ -469,6 +470,7 @@ jobs:
             rdma_tc: 104
             ct: podman
             timeout_minutes: 45
+            hsa_use_svm: 0  # as the py3.10 entry
           # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
           # both only on the RoCE path. mlx5_8 is deliberately not in
           # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
@@ -479,7 +481,7 @@ jobs:
           - platform: MI300X_MLX
             python: "3.12"
             runner: [self-hosted, 300_mlx_p19_29]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
             node1_host: 10.194.132.110
             node2_host: 10.194.132.71
             node2_port: 22
@@ -515,6 +517,7 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
       # Perf dashboard capture on node1/rank0 (MI355X_AINIC only for now).
       MORI_PERF_OUT: ${{ matrix.platform == 'MI355X_AINIC' && format('{0}/_perf/perf.jsonl', github.workspace) || '' }}
       MORI_PERF_RUN_ID: ${{ github.run_id }}
@@ -558,6 +561,7 @@ jobs:
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            ${HSA_USE_SVM:+-e HSA_USE_SVM=$HSA_USE_SVM} \
             -e MORI_PERF_OUT=$MORI_PERF_OUT \
             -e MORI_PERF_RUN_ID=$MORI_PERF_RUN_ID \
             -e MORI_PERF_COMMIT=$MORI_PERF_COMMIT \
@@ -601,6 +605,7 @@ jobs:
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              ${HSA_USE_SVM:+-e HSA_USE_SVM=$HSA_USE_SVM} \
               -e MORI_IO_BENCH_ENGINE_BIN=$GITHUB_WORKSPACE/build_bench/tests/cpp/bench_engine \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
               -w $GITHUB_WORKSPACE \
@@ -945,7 +950,7 @@ jobs:
           - python: "3.10"
             base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
           - python: "3.12"
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
     env:
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
     steps:
@@ -1004,3 +1009,105 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+
+  flydsl-compat:
+    # CI proper runs the FlyDSL that aiter pins (docker/Dockerfile.dev). mori's
+    # FlyDSL shims (mori.cco.device.flydsl.buffer and
+    # ops/dispatch_combine_v2/flydsl_compat.py) still carry 0.2.x and 0.3.x paths
+    # for environments pinned to an older one; this runs the FlyDSL-backed tests
+    # on those so the paths stay exercised: 0.2.4 is flydsl.expr.buffer_ops, and
+    # 0.3.0 still takes `aux` on the raw buffer ops positionally (0.3.1 made it the
+    # keyword attribute that CI's 0.4.0 covers).
+    name: FlyDSL ${{ matrix.flydsl }} compat (MI355X_AINIC)
+    runs-on: [self-hosted, MI355X-AINIC]
+    strategy:
+      fail-fast: false
+      max-parallel: 1  # each leg uses all 8 GPUs; never share a host
+      matrix:
+        flydsl: ["0.2.4", "0.3.0"]
+    env:
+      MORI_RDMA_DEVICES: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7  # as ci_cco.yml
+      MORI_RDMA_SL: 3
+      MORI_RDMA_TC: 104
+      HSA_USE_SVM: 0  # the amdgpu-dkms workaround, see test-wheel-internode
+      IMAGE: rocm/mori:ci-flydsl-${{ matrix.flydsl }}
+      BASE_IMAGE: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
+      CONTAINER: mori_flydsl_compat_${{ github.run_id }}_${{ strategy.job-index }}
+      CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build image
+        run: |
+          $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE \
+            --build-arg GPU_ARCHS="gfx950" --build-arg WITH_FLYDSL=1 \
+            --build-arg FLYDSL_VERSION=${{ matrix.flydsl }} \
+            -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -e HSA_USE_SVM=$HSA_USE_SVM \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Build mori
+        run: |
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && BUILD_UMBP=OFF BUILD_CCO_SDMA=ON pip install . && pip show flydsl"
+
+      - name: CCO SDMA Python API
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
+
+      - name: FlyDSL buffer cache-policy check
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd /tmp && \
+            timeout 600 python -m pytest -v $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_buffer.py"
+
+      - name: GEMM+AR numerics
+        run: |
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && \
+            timeout 1800 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
+
+      - name: ops-v2 dispatch/combine, FlyDSL backend (EP8)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            python -m pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -v"
+
+      - name: CCO FlyDSL examples (2 ranks)
+        run: |
+          $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "pip install mpi4py && \
+            cd $GITHUB_WORKSPACE/examples/cco/python && \
+            mpirun --allow-run-as-root -np 2 python 04_flydsl_lsa_put/main.py && \
+            mpirun --allow-run-as-root -np 2 python 05_flydsl_lsa_allreduce/main.py && \
+            mpirun --allow-run-as-root -np 2 -x MORI_ENABLE_SDMA python 07_flydsl_sdma/main.py && \
+            mpirun --allow-run-as-root -np 2 python 08_torch_symm_import/main.py && \
+            torchrun --standalone --nproc_per_node=2 10_flydsl_sdma_allgather_async/main.py --iters 5 --timing-iters 5"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
+          # Only this leg's FlyDSL layer is unique; the rest is shared with ci-cco.
+          $CT rmi -f $IMAGE 2>/dev/null || true

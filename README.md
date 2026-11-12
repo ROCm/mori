@@ -1,4 +1,23 @@
-<h1 align="center">MORI</h1>
+<p align="center">
+  <picture>
+    <source type="image/svg+xml" srcset="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo.svg">
+    <img alt="MORI" src="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo.png" width="420">
+  </picture>
+</p>
+
+<p align="center">
+  <a href="https://rocm.github.io/mori/"><img alt="Documentation" src="https://img.shields.io/badge/docs-rocm.github.io%2Fmori-C00000"></a>
+  <a href="https://pypi.org/project/amd-mori/"><img alt="PyPI" src="https://img.shields.io/pypi/v/amd-mori?label=pypi"></a>
+  <a href="https://pypi.org/project/amd-mori-nightly/"><img alt="PyPI nightly" src="https://img.shields.io/pypi/v/amd-mori-nightly?label=nightly"></a>
+  <a href="https://github.com/ROCm/mori/actions/workflows/ci.yml?query=branch%3Amain+event%3Aschedule"><img alt="main CI" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FROCm%2Fmori%2Fbadges%2Fmain-ci.json"></a>
+</p>
+
+<p align="center">
+  <a href="https://rocm.github.io/mori/"><b>Documentation</b></a> |
+  <a href="https://rocm.github.io/mori/installation.html"><b>Installation</b></a> |
+  <a href="https://rocm.github.io/mori/quickstart.html"><b>Quickstart</b></a> |
+  <a href="https://rocm.github.io/mori/api/communication.html"><b>API reference</b></a>
+</p>
 
 ## News
 
@@ -17,7 +36,7 @@
 
 ## Introduction
 
-<img src="docs/mori_arch_20260422_v1.jpg">
+<img alt="MORI architecture" src="https://raw.githubusercontent.com/ROCm/mori/main/docs/mori_arch_20260422_v1.jpg">
 
 **MORI** (**Mo**dular **R**DMA **I**nterface) is a **bottom-up, modular, and composable framework** for building high-performance communication applications with a strong focus on **RDMA + GPU integration**. Inspired by the role of MLIR in compiler infrastructure, MORI provides reusable and extensible building blocks that make it **easier for developers to adopt advanced techniques** such as IBGDA (Infiniband GPUDirect Async) and GDS (GPUDirect Storage).
 
@@ -26,6 +45,7 @@ To help developers get started quickly, MORI also includes a suite of optimized 
 ## Features summary
 - Applications
     - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance.
+    - MORI-FUSED: GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, overlapping the transfer with the GEMM over the SDMA copy engines
     - MORI-IO: point-to-point communication library with ultra-low overhead
     - MORI-CCL: lightweight and flexible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained environment
     - MORI-UMBP: unified memory & bandwidth pool with tiered storage and distributed key-value access for scalable memory management
@@ -37,13 +57,23 @@ To help developers get started quickly, MORI also includes a suite of optimized 
 
 ## Documentation
 
-| **Topic** | **Description** | **Guide** |
+📖 **<https://rocm.github.io/mori/>** — the full documentation, with navigation and search.
+It is built from [`docs/`](https://github.com/ROCm/mori/tree/main/docs) on every push to
+`main`, so it describes the development tree; each page's title names the commit.
+
+| **Topic** | **Description** | **Docs** |
 |---|---|---|
-| MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples | [EP Guide](docs/MORI-EP-GUIDE.md) |
-| MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](docs/MORI-SHMEM-GUIDE.md) |
-| MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](docs/MORI-IR-GUIDE.md) |
-| MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](docs/MORI-IO-GUIDE.md) |
-| MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](docs/PROFILER.md) |
+| Getting started | Installation, fabric checks and first steps | [Installation](https://rocm.github.io/mori/installation.html) · [Quickstart](https://rocm.github.io/mori/quickstart.html) |
+| MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples; choosing between the EP APIs and backends | [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html) · [Choosing an API and backend](https://rocm.github.io/mori/ep_backends.html) · [Benchmark](https://rocm.github.io/mori/MORI-EP-BENCHMARK.html) · [RDMA bandwidth](https://rocm.github.io/mori/rdma_bandwidth_utilization.html) |
+| MORI-FUSED | GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, built on MORI-CCO | [Guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html) |
+| MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](https://rocm.github.io/mori/MORI-SHMEM-GUIDE.html) |
+| MORI-CCO | Explicit-handle GPU communication over LSA, GDA and SDMA | [CCO Guide](https://rocm.github.io/mori/MORI-CCO-GUIDE.html) |
+| MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](https://rocm.github.io/mori/MORI-IR-GUIDE.html) |
+| MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](https://rocm.github.io/mori/MORI-IO-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) |
+| MORI-UMBP | Unified memory & bandwidth pool: tiered storage, distributed KV access, transfer simulation | [Single-Node Smoke Test](https://rocm.github.io/mori/MORI-UMBP-SINGLE-NODE-GUIDE.html) · [Simulation](https://rocm.github.io/mori/umbp-simulation.html) · [Calibration](https://rocm.github.io/mori/umbp-calibration.html) · [PD Benchmark](https://rocm.github.io/mori/MORI-UMBP-PD-BENCHMARK.html) · [Tier-Management Benchmark](https://rocm.github.io/mori/UMBP-TIER-MANAGEMENT-BENCHMARK.html) |
+| MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](https://rocm.github.io/mori/PROFILER.html) |
+| API reference | Python APIs of EP, SHMEM, IO and IR; the profiler; the UMBP master client | [Communication](https://rocm.github.io/mori/api/communication.html) · [Profiler](https://rocm.github.io/mori/api/profiler.html) · [UMBP](https://rocm.github.io/mori/api/umbp.html) |
+| Internals | Host pre-compiled + device JIT architecture; the EPv2 HIP backend's JIT | [JIT Architecture](https://rocm.github.io/mori/MORI_JIT_ARCHITECTURE.html) · [JIT v2 Design](https://rocm.github.io/mori/MORI_JIT_V2_DESIGN.html) (Chinese) |
 
 ## Benchmarks
 
@@ -187,6 +217,12 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 
 ✅ Supported &emsp; 🚧 Under Development
 
+A gfx1250 device can run as `gfx1250` or as `gfx1250-strict`, depending on the runtime.
+MORI JIT-compiles its kernels for whichever target the device reports, so one install
+serves both. The exception is UMBP's prebuilt gather kernel: build with
+`gfx1250-strict` in `MORI_GPU_ARCHS` to use it there (without it UMBP copies through
+the copy engine).
+
 <!-- mori-installation-start -->
 
 ## Installation
@@ -194,6 +230,7 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 ### Prerequisites
 
 - ROCm >= 6.4 (hipcc needed at runtime for JIT kernel compilation, not at install time)
+  - On RHEL/Rocky/AlmaLinux also install `gcc-c++`: that JIT needs the C++ standard headers, which ROCm's RPMs do not pull in. Without them every kernel compile fails with `Could not find standard C++ header 'cmath'`.
 - System packages (required for `pip install`; not bundled in wheels). On Debian/Ubuntu install at least:
   - `libibverbs-dev`, `ibverbs-utils`
   See [docker/Dockerfile.dev](https://github.com/ROCm/mori/blob/main/docker/Dockerfile.dev) for the full apt list used in CI/dev images.
@@ -232,7 +269,7 @@ Before a cross-node run, check the fabric:
 mori check <peer_ip>          # or: tools/env_check.sh <peer_ip>
 ```
 
-Six steps — NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
+Seven steps — kernel PCI P2PDMA support (`CONFIG_PCI_P2PDMA`, read from `/proc/kallsyms`; warns only), NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
 inter-node bandwidth and latency meshes over every NIC pair, on host memory and
 on GPU memory. Exits non-zero if any check failed, and reports the fabric
 topology, which decides what can run on it.
@@ -332,9 +369,9 @@ tools/run_internode_io_benchmark.sh --rank 0 --master-addr "10.194.129.65" --ifn
 # (run the same command on the second node with --rank 1)
 ```
 
-See [docs/MORI-IO-BENCHMARK.md](docs/MORI-IO-BENCHMARK.md) for both engines and tuning.
+See the [MORI-IO benchmark guide](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) for both engines and tuning.
 
-### Test MORI-IR (Triton + shmem integration, [guide](python/mori/ir/README.md))
+### Test MORI-IR (Triton + shmem integration, [guide](https://github.com/ROCm/mori/blob/main/python/mori/ir/README.md))
 
 ```bash
 # Basic shmem put (2 GPUs)

@@ -42,7 +42,8 @@ scale's group -- a lane's four M tiles are four 16-row tiles -- and
 `preshuffle_a_scale` enforces it. Anything else is zero-extended internally,
 which costs at most 63 rows of GEMM. That is a far looser constraint than the
 fused op's `world_size * BLOCK_M`, where a whole row band has to belong to one
-destination.
+destination. With ``quant="mxfp8_raw"`` there is no packed group and any M
+goes in as it is.
 """
 
 from __future__ import annotations
@@ -58,7 +59,9 @@ from .op import (
     MIN_K,
     MXFP8_BLOCK,
     MXFP8_BLOCK_M,
+    MXFP8_QUANTS,
     _flatten_mxfp8_a_scale,
+    _flatten_mxfp8_raw_scale,
     _PinnedLaunch,
     _tile_constraints,
     permlane_tile_constraint,
@@ -169,11 +172,12 @@ class Mxfp8GemmOp:
         op = Mxfp8GemmOp(n=8192, k=1280)
         out = op(a_fp8, b_preshuffled, a_scale, b_scale)   # [M, N] bf16
 
-    ``b_preshuffled`` is a weight through :func:`~mori.ops.gemm_ar.preshuffle_b`
-    and ``a_scale`` is through :func:`~mori.ops.gemm_ar.preshuffle_a_scale`;
-    ``b_scale`` is the ``[N/32, K/32]`` ue8m0 bytes K-block major and widened to
-    int32, flat. Those are the same operands ``GemmAllReduceOp`` takes, and for
-    the same reasons -- see its docstring.
+    ``b_preshuffled`` is a weight through :func:`~mori.ops.gemm_ar.preshuffle_b`.
+    The scales follow ``quant``, as for ``GemmAllReduceOp`` -- see its
+    ``__call__``: ``"mxfp8"`` takes ``a_scale`` through
+    :func:`~mori.ops.gemm_ar.preshuffle_a_scale` and ``b_scale`` as the
+    ``[N/32, K/32]`` ue8m0 bytes K-block major and widened to int32, flat;
+    ``"mxfp8_raw"`` takes both as the quantiser's row-major uint8 bytes.
 
     No communicator and no symmetric window: the output is an ordinary tensor,
     allocated here or supplied by the caller.
@@ -185,7 +189,10 @@ class Mxfp8GemmOp:
         n: int,
         k: int,
         block_n: int = DEFAULT_BLOCK_N,
+        quant: str = "mxfp8",
     ):
+        if quant not in MXFP8_QUANTS:
+            raise ValueError(f"quant={quant!r} is not one of {list(MXFP8_QUANTS)}")
         why = _tile_constraints(MXFP8_BLOCK_M, block_n)
         if why is not None:
             raise ValueError(f"unsupported tile: {why}")
@@ -196,13 +203,16 @@ class Mxfp8GemmOp:
         if why is not None:
             raise ValueError(f"unsupported shape: {why}")
         self.n, self.k = n, k
+        self.quant = quant
+        #: Rows M is zero-extended to: the packed A scale's group, or 1.
+        self.m_group = SCALE_GROUP_M if quant == "mxfp8" else 1
         self.block_m, self.block_n = MXFP8_BLOCK_M, block_n
         self._launch: dict[bool, _PinnedLaunch] = {}
         self._pad_in: torch.Tensor | None = None
 
     def padded_m(self, m: int) -> int:
-        """``m`` rounded up to a whole packed A-scale group."""
-        return (m + SCALE_GROUP_M - 1) // SCALE_GROUP_M * SCALE_GROUP_M
+        """``m`` rounded up to a whole packed A-scale group; ``m`` for raw."""
+        return (m + self.m_group - 1) // self.m_group * self.m_group
 
     def wants_narrow_n(self, m: int) -> bool:
         """Whether this M runs the 128-wide N tile. See `_WIDE_TILE_MIN_GRID`."""
@@ -247,7 +257,7 @@ class Mxfp8GemmOp:
                 BLOCK_N=block_n,
                 b_preshuffled=True,
                 fuse=False,
-                quant="mxfp8",
+                quant=self.quant,
                 swap_ab=True,
                 permlane=permlane,
                 lane_transpose=permlane,
@@ -306,6 +316,8 @@ class Mxfp8GemmOp:
                 )
             if t.device.type != "cuda":
                 raise ValueError(f"{name} must be on a GPU, got {t.device}")
+        if self.quant == "mxfp8_raw":
+            return  # checked where they are flattened
         for name, t, numel in (
             ("a_scale", a_scale, m * self.k // (4 * MXFP8_BLOCK)),
             ("b_scale", b_scale, (self.n // MXFP8_BLOCK) * (self.k // MXFP8_BLOCK)),
@@ -327,19 +339,29 @@ class Mxfp8GemmOp:
     ) -> torch.Tensor:
         """``a_fp8 @ b_preshuffled.T`` with 32-wide ue8m0 scales, into bf16.
 
-        ``M`` must already be a multiple of 64 and the operands must agree with
-        it -- this does not pad, because the A scale is built over the padded M
-        and repairing its packed layout afterwards is not a reshape. Use
-        :meth:`padded_m` and :meth:`pad_rows` on the *unquantised* input.
+        For ``"mxfp8"``, ``M`` must already be a multiple of 64 and the operands
+        must agree with it -- this does not pad, because the A scale is built
+        over the padded M and repairing its packed layout afterwards is not a
+        reshape. Use :meth:`padded_m` and :meth:`pad_rows` on the *unquantised*
+        input. ``"mxfp8_raw"`` takes any M.
         """
         m = a_fp8.shape[0]
-        if m % SCALE_GROUP_M:
+        if m % self.m_group:
             raise ValueError(
-                f"M={m} must be a multiple of {SCALE_GROUP_M} (the packed A "
+                f"M={m} must be a multiple of {self.m_group} (the packed A "
                 f"scale's group); pad the bf16 input with pad_rows() before "
                 f"quantising, not the fp8 afterwards"
             )
         self._check_operands(a_fp8, b_preshuffled, a_scale, b_scale, m)
+        if self.quant == "mxfp8_raw":
+            a_scale = _flatten_mxfp8_raw_scale(
+                "a_scale", a_scale, m, self.k // MXFP8_BLOCK
+            )
+            b_scale = _flatten_mxfp8_raw_scale(
+                "b_scale", b_scale, self.n // MXFP8_BLOCK, self.k // MXFP8_BLOCK
+            )
+        else:
+            a_scale = _flatten_mxfp8_a_scale(a_scale, m, self.k)
         if out is None:
             out = torch.empty((m, self.n), dtype=torch.bfloat16, device=a_fp8.device)
         elif tuple(out.shape) != (m, self.n) or out.dtype != torch.bfloat16:
@@ -351,7 +373,7 @@ class Mxfp8GemmOp:
             a_fp8.contiguous().view(torch.int8).view(-1),
             b_preshuffled.contiguous().view(torch.int8).view(-1),
             out.view(-1),
-            _flatten_mxfp8_a_scale(a_scale, m, self.k),
+            a_scale,
             b_scale.reshape(-1),
             m,
             self.n,

@@ -69,6 +69,15 @@ std::vector<std::string> Toolchain::Flags() const {
       "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
   };
   if (arch.rfind("gfx950", 0) == 0) f.push_back("-DHIP_ENABLE_GFX950_OCP_BUILTINS=1");
+  // cco.hpp hides the whole ccoSdma class behind this macro, so a TU that calls
+  // it does not merely lose an optimisation -- the name is undeclared and the
+  // compile fails. Unconditional rather than per-kernel: Flags() is hashed into
+  // the cache key (Compiler::CacheDirFor), so a kernel that does not use SDMA
+  // just gets a different key, not a stale module. The host library is built
+  // with BUILD_CCO_SDMA=ON by default; where it is OFF the queue count comes
+  // back 0 and the host-side gate reports that, which is a clearer failure than
+  // an undeclared identifier out of hipcc.
+  f.push_back("-DBUILD_CCO_SDMA=1");
   // Picks the GDA provider cco_scale_out.hpp compiles ccoGda<P> for; without it a
   // JIT TU on a bnxt/ionic host silently builds mlx5 WQEs. Mirrors
   // MoriDetectDevice.cmake, which likewise emits nothing for mlx5 -- the #else.

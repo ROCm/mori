@@ -37,11 +37,14 @@ gpu_per_node; there is no kernel_type enum on the v2 side):
   ``internode_regions`` arena and a device communicator: copystaging +
   dispatch for a round of dispatch, combinesync + combinesyncbarrier + combine
   + combineall for a round of combine. Gather only, bf16/fp32/fp8 on either
-  leg (no fp4). "v2" and "v2_ll" are two distinct kernel families rather than
+  leg, plus packed fp4 dispatch with bf16/fp32 combine. FP4 combine is not
+  supported. "v2" and "v2_ll" are two distinct kernel families rather than
   a runtime branch: ``cfg.internode_kernel`` (auto | v2 | v2_ll) says which are
   compiled, and only "auto" compiles both and chooses per launch, at
-  ``cfg.internode_auto_ll_max_tokens``. Geometry is a compile-time identity on this
-  path, so every bucket of ``internode_tuning_configs`` is built up front.
+  ``cfg.internode_auto_ll_max_tokens``. ``hip_tuning_configs.resolve_schedule``
+  resolves both paths to the same kernel configurations before plans are built.
+  Internode geometry changes reuse the compiled module; each plan retains its
+  own grid, block and RDMA split.
   No other backend implements internode.
 
 Imports ``ep_plans`` (the C++/JIT plans) but never flydsl, so it works where
@@ -50,22 +53,29 @@ FlyDSL is not installed.
 
 from __future__ import annotations
 
+import collections
+import functools
+import logging
 import os
 
 import torch
 
+from mori.ops import utils as _gpu
 from mori.tensor_utils import from_gpu_ptr
 
 from . import ep_plans as cb
+from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
-from .internode_regions import internode_regions
+from .internode_regions import asyncll_regions, internode_regions
 from .symm_arena import SymmArena
+
+logger = logging.getLogger(__name__)
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
 # after its own EpArgs fields (offTokOff -> "tokOff"); the region names match the
 # FlyDSL op's, and so do the sizes EXCEPT out_scales -- this backend pads the row,
-# FlyDSL does not. A plan binds offsets, never sizes, so an arena sized for the
-# wrong one is overrun silently: size it from scale_stride_bytes().
+# FlyDSL does not. The sizes come from the plans (region.<stem> in their info,
+# EpRegion* in ep_cfg.hpp): size an arena with ep_plans.arena_regions().
 _REGIONS = {
     "tokOff": "tok_off",
     "recvNum": "recv_num",
@@ -77,6 +87,19 @@ _REGIONS = {
     "xdb": "cross_device_barrier",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
 }
+
+_LL_REGIONS = dict(
+    _REGIONS,
+    recvNum="ll_recv_num",
+    recvToSrc="ll_recv_to_src_token",
+    outIdx="ll_out_idx",
+    outWts="ll_out_wts",
+    dispOut="ll_disp_out",
+    outTok="ll_out_tok",
+    outScales="ll_out_scales",
+)
+
+_LL_SPEC = ("ll128",)
 
 # Only what EpDType enumerates -- fp16 is absent because plan_api.DTYPES has no code
 # for it, and advertising it here would alias onto another one. Dispatch only copies,
@@ -96,20 +119,99 @@ _SCALE_ALIGN = 128
 _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
 
-def _geometry_from_env(name):
-    """``"block,rdma,warp"`` from the environment, or None.
+# SDMA queues per GPU pair that a PART is known to fit, when AsyncLL would
+# otherwise ask for one per peer. Only parts that CANNOT hold the full eight
+# belong here; everything else keeps the peer count.
+#
+# Keyed on the model (mori.ops.utils.detect_model, i.e. the PCI device id), not
+# the arch: MI300X, MI325X and MI308X are all gfx942, and only MI308X is short of
+# engines. Its xGMI engines fold to the even ids {2,4,6} and ROCr's own blit
+# queues take part of that, so three is what a pair fits -- asking for eight on
+# 8xMI308X returns HSAKMT_STATUS_NO_MEMORY from hsaKmtCreateQueueExt and anvil
+# exit()s the process; with three the AsyncLL suite passes there. anvil singles
+# MI308X out the same way (AnvilLib::isMi308x, DID 0x74A2). Capping all of gfx942
+# would have held MI300X and MI325X, which have the full set, to three as well.
+_ASYNCLL_SDMA_QUEUE_CAP = {"mi308x": 3}
 
-    Sweep-only. Read at build time (see _internode_geometry_buckets): the
-    internode plans are compiled per geometry, so a geometry cannot be chosen at
-    launch and a sweep has to pin it before the op is constructed.
+# Per device: how many live AsyncLL ops use each SDMA queue offset.
+_ASYNCLL_QUEUE_OFFSET_USERS = collections.defaultdict(collections.Counter)
+
+
+def _take_sdma_queue_offset(device_index: int, num_queues: int) -> int:
+    """Least-used offset among live ops on the device, lowest on a tie.
+
+    close() gives it back. More live ops than queues share one: slower, still
+    correct.
     """
-    raw = os.environ.get(name)
+    users = _ASYNCLL_QUEUE_OFFSET_USERS[device_index]
+    offset = min(range(num_queues), key=lambda o: (users[o], o))
+    users[offset] += 1
+    return offset
+
+
+def _give_back_sdma_queue_offset(device_index: int, offset: int) -> None:
+    users = _ASYNCLL_QUEUE_OFFSET_USERS[device_index]
+    users[offset] -= 1
+    if users[offset] <= 0:
+        del users[offset]
+
+
+def _hsa_cu_mask_cus(device_index: int, mp_count: int):
+    """CUs HSA_CU_MASK leaves this process on `device_index`, or None if unrestricted.
+
+    ROCr's syntax is `<gpus>:<cus>[;<gpus>:<cus>...]`, each side a comma list of
+    decimal indices or `a-b` ranges, e.g. `0-7:0-63`. GPU indices are ROCr's
+    enumeration order, which is the HIP/torch order unless HIP_VISIBLE_DEVICES
+    reorders devices. A setting this cannot read returns None, so the ceiling
+    falls back to the whole device rather than failing the op.
+    """
+    raw = os.environ.get("HSA_CU_MASK", "").strip()
     if not raw:
         return None
-    parts = tuple(int(x) for x in raw.replace(" ", "").split(","))
-    if len(parts) != 3:
-        raise ValueError(f"{name}={raw!r}: want three ints, block,rdma,warp")
-    return parts
+
+    def indices(text):
+        out = set()
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            lo, sep, hi = part.partition("-")
+            lo, hi = int(lo), int(hi) if sep else int(lo)
+            if lo < 0 or hi < lo:
+                raise ValueError(part)
+            out.update(range(lo, hi + 1))
+        return out
+
+    try:
+        for entry in raw.split(";"):
+            if not entry.strip():
+                continue
+            gpus, _, cus = entry.partition(":")
+            if device_index in indices(gpus):
+                found = indices(cus)
+                if mp_count > 0:
+                    found = {c for c in found if c < mp_count}
+                return len(found)
+    except ValueError:
+        return None
+    return None
+
+
+def _asyncll_sdma_queues(model, gpu_per_node: int) -> int:
+    """How many SDMA queues per pair to ask cco for, 0 to leave the env default.
+
+    `model` is detect_model()'s answer, None when the part is not one it knows.
+
+    An explicit MORI_SDMA_NUM_CHANNELS is the operator saying what this machine
+    can take, so it wins: returning 0 lets cco fall through to it. Without that
+    deference this request silently beat the env knob, and the only way out of
+    the MI308X abort was to edit the source.
+    """
+    if os.environ.get("MORI_SDMA_NUM_CHANNELS"):
+        return 0
+    want = min(8, max(1, gpu_per_node))
+    cap = _ASYNCLL_SDMA_QUEUE_CAP.get(model)
+    return min(want, cap) if cap else want
 
 
 def _raw_stream(device_index: int) -> int:
@@ -132,22 +234,23 @@ def _raw_stream(device_index: int) -> int:
 
 
 def scale_stride_bytes(scale_bytes: int) -> int:
-    """What a DESTINATION scale row is laid down at: EpScaleStride in ep_cfg.hpp.
+    """What a DESTINATION scale row is laid down at (EpScaleStride in ep_cfg.hpp).
 
     Anything addressing the region itself strides by this; recv_scales() hides it.
-    Mirrored from the C++ because sizing happens before any kernel exists.
+    For callers sizing without a plan: the plan's own info["scaleStride"], asked
+    of describe().
     """
     if scale_bytes <= 0:
         return 0
-    return (scale_bytes + _SCALE_ALIGN - 1) // _SCALE_ALIGN * _SCALE_ALIGN
+    return _dispatch_info(scale_bytes=int(scale_bytes))["scaleStride"]
 
 
 def ep_staging_bytes(
     world_size: int, max_recv: int, scale_bytes: int, max_tok_per_rank: int = 0
 ) -> int:
-    """Total bytes for the gfx1250 dispatch staging buffer.
-
-    Mirrors EpStagingTotalBytes in ep_cfg.hpp.
+    """Bytes of the dispatch staging buffer (EpStagingTotalBytes in ep_cfg.hpp): the
+    plan's info["stagingBytes"], asked of describe(). 0 where the dispatch does not
+    stage (anything but gfx125x).
 
     ``max_recv`` is EpCfg.maxRecv, where 0 is not a cap of zero but "ask
     EpMaxRecv", which answers world_size * max_tok_per_rank -- and that is the
@@ -163,181 +266,108 @@ def ep_staging_bytes(
             "no max_tok_per_rank was given, so the receive cap is unknown. Pass "
             "max_tok_per_rank, or pass an already-resolved cap as max_recv."
         )
-    pool = world_size * recv
-    max_topk = 16
-    max_blocks = 512
+    return _dispatch_info(
+        world_size=int(world_size),
+        max_recv=int(recv),
+        max_tok_per_rank=int(max_tok_per_rank or recv // world_size),
+        scale_bytes=int(scale_bytes),
+    )["stagingBytes"]
 
-    def a128(x):
-        return (x + 127) & ~127
 
-    off = a128(pool * max_topk * 4)  # stgIdx
-    off = a128(off + pool * max_topk * 4)  # stgWt
-    off = a128(off + pool * 4)  # stgSrc
-    off = a128(off + max_blocks * world_size * 4)  # blkBase
-    off = a128(off + max_blocks * world_size * 4)  # blkCount
-    if scale_bytes > 0:
-        s_stride = scale_stride_bytes(scale_bytes)
-        off = a128(off + world_size * recv * s_stride)
-    return off
+@functools.lru_cache(maxsize=None)
+def _dispatch_info_cached(fields: tuple) -> dict:
+    return cb.EpDispatchPlan.describe(**dict(fields))
+
+
+def _dispatch_info(**fields) -> dict:
+    return _dispatch_info_cached(tuple(sorted(fields.items())))
+
+
+@functools.lru_cache(maxsize=None)
+def _combine_info_cached(fields: tuple) -> dict:
+    return cb.EpCombinePlan.describe(**dict(fields))
 
 
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
-_PUSH_SLOT_ALIGN = 128
 PUSH_QGROUP = {"fp4_blockwise": 32, "fp4_blockwise_fp32": 128, "fp8_blockwise": 32}
-_PUSH_SCALE_BYTES = {"fp4_blockwise": 1, "fp4_blockwise_fp32": 4, "fp8_blockwise": 1}
-_PUSH_ELEM_BITS = {"fp4_blockwise": 4, "fp4_blockwise_fp32": 4, "fp8_blockwise": 8}
+# The combine request fields each push quant type turns on.
+_PUSH_REQUEST = {
+    "fp4_blockwise": (("combine_fp4", 1),),
+    "fp4_blockwise_fp32": (("combine_fp4", 1), ("combine_fp4_f32_scale", 1)),
+    "fp8_blockwise": (("combine_fp8", 1),),
+}
 
 
 def push_wire_nbytes(cfg) -> int:
-    h = cfg.hidden_dim
-    q = cfg.quant_type
-    wire = h * _PUSH_ELEM_BITS[q] // 8 + h // PUSH_QGROUP[q] * _PUSH_SCALE_BYTES[q]
-    return (wire + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
+    """Bytes of one landed row of the push combine (EpCombinePushWireBytes): the
+    plan's info["pushWireBytes"], asked of describe(). Reads cfg.hidden_dim and
+    cfg.quant_type; the push combine, and so this, is gfx125x only."""
+    fields = (("hidden_dim", int(cfg.hidden_dim)), *_PUSH_REQUEST[cfg.quant_type])
+    return _combine_info_cached(tuple(sorted(fields)))["pushWireBytes"]
 
 
 def push_land_rows(cfg) -> int:
-    """EpFp4LandRows: a token gets back one row per distinct destination rank, fp4 or fp8."""
-    return cfg.max_num_inp_token_per_rank * min(
-        cfg.world_size, cfg.num_experts_per_token
+    """Landing rows of the push combine, one per token and destination rank
+    (EpCombinePushLandRows): the plan's info["pushLandRows"], asked of describe().
+    Reads cfg.max_num_inp_token_per_rank, cfg.world_size and
+    cfg.num_experts_per_token; gfx125x only, as the push combine is."""
+    fields = (
+        ("world_size", int(cfg.world_size)),
+        ("max_tok_per_rank", int(cfg.max_num_inp_token_per_rank)),
+        ("num_expert_per_token", int(cfg.num_experts_per_token)),
+        *_PUSH_REQUEST["fp4_blockwise"],
     )
+    return _combine_info_cached(tuple(sorted(fields)))["pushLandRows"]
+
+
+def ll128_layout(cfg):
+    if cfg.is_internode or cfg.async_ll:
+        return None
+    if cfg.quant_type == "none" and cfg.combine_dtype is not torch.bfloat16:
+        return None
+    if cfg.is_fp4:
+        dt = "fp4"
+    elif cfg.dispatch_dtype in _FP8_TUNING_DTYPES:
+        dt = "fp8"
+    elif cfg.dispatch_dtype is torch.bfloat16 and cfg.quant_type == "none":
+        dt = "bf16"
+    else:
+        return None
+    from .hip_tuning_configs import ll128
+
+    geom = ll128(
+        cfg.world_size,
+        cfg.hidden_dim,
+        cfg.num_experts_per_token,
+        dt,
+        cfg.max_num_inp_token_per_rank,
+        experts_per_rank=cfg.num_experts_per_rank,
+        quant_type=cfg.quant_type,
+    )
+    if geom is None:
+        return None
+    cap = cfg.max_num_inp_token_per_rank
+    n = geom.get("max_tok", cap)
+    return dict(geom, max_tok=n, region_names=_LL_REGIONS if n < cap else _REGIONS)
 
 
 class TokOffExt:
-    """Dispatch's slot allocator word outside the cco window (single-host gfx1250 EP, opt-in: MORI_EP_TOKOFF_EXT=1).
-
-    One int per rank in hipExtMallocWithFlags(hipDeviceMallocUncached) memory,
-    opened on every peer by IPC handle. ``peers`` is the device array of
-    world_size pointers the kernel indexes by PE (EpArgs.tokOffPeers). The
-    window's hipMemCreate mapping serializes returning SYSTEM RMWs from several
-    GPUs on one int; this allocation does not.
-
-    PROTOTYPE: the 64-byte handles are exchanged over torch.distributed, which
-    the caller must have initialised.
-    """
-
-    _BYTES = 4096
-    _UNCACHED = 0x3  # hipDeviceMallocUncached
-    _LAZY_PEER = 0x1  # hipIpcMemLazyEnablePeerAccess
+    peers = None
 
     @staticmethod
-    def wanted(world) -> bool:
-        """MORI_EP_TOKOFF_EXT=1 (default off), and every rank on this host.
+    def wanted(world=1) -> bool:
+        return False
 
-        The peers' words are opened by hipIpc handle, which no other host can open;
-        an EP spanning hosts keeps the word in the cco window, which is mapped across
-        them. Collective over the default process group, like the constructor.
-        """
-        v = os.environ.get("MORI_EP_TOKOFF_EXT", "").strip().lower()
-        if v not in ("1", "true", "yes", "on"):
-            return False
-        import socket
-
-        import torch.distributed as dist
-
-        if not (dist.is_available() and dist.is_initialized()):
-            return True  # the constructor reports the missing process group
-        # The kernel's boot id, not the hostname: containers on one host each have
-        # a hostname of their own.
-        try:
-            with open("/proc/sys/kernel/random/boot_id") as f:
-                host = f.read().strip()
-        except OSError:
-            host = socket.gethostname()
-        hosts = [None] * world
-        dist.all_gather_object(hosts, host)
-        return len(set(hosts)) == 1
-
-    def __init__(self, rank, world, dev):
-        import ctypes
-
-        import torch.distributed as dist
-
-        from mori.jit.hip_driver import _get_hip_lib
-
-        if not (dist.is_available() and dist.is_initialized()):
-            raise RuntimeError(
-                "tokoff-ext exchanges IPC handles over torch.distributed; "
-                "initialise a process group first"
-            )
-
-        class _Handle(ctypes.Structure):
-            _fields_ = [("reserved", ctypes.c_char * 64)]
-
-        hip = _get_hip_lib()
-        vp = ctypes.c_void_p
-        hip.hipExtMallocWithFlags.argtypes = [
-            ctypes.POINTER(vp),
-            ctypes.c_size_t,
-            ctypes.c_uint,
-        ]
-        hip.hipMemset.argtypes = [vp, ctypes.c_int, ctypes.c_size_t]
-        hip.hipIpcGetMemHandle.argtypes = [ctypes.POINTER(_Handle), vp]
-        hip.hipIpcOpenMemHandle.argtypes = [ctypes.POINTER(vp), _Handle, ctypes.c_uint]
-        hip.hipIpcCloseMemHandle.argtypes = [vp]
-        hip.hipFree.argtypes = [vp]
-        self._hip, self._dev, self._mine, self._opened = hip, dev, None, []
-
-        def chk(err, what):
-            if err != 0:
-                raise RuntimeError(
-                    f"MORI_EP_TOKOFF_EXT: {what} returned hipError {err}"
-                )
-
-        with torch.cuda.device(dev):
-            mine = vp()
-            chk(
-                hip.hipExtMallocWithFlags(
-                    ctypes.byref(mine), self._BYTES, self._UNCACHED
-                ),
-                "hipExtMallocWithFlags",
-            )
-            self._mine = mine.value
-            chk(hip.hipMemset(self._mine, 0, self._BYTES), "hipMemset")
-            chk(hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
-            handle = _Handle()
-            chk(
-                hip.hipIpcGetMemHandle(ctypes.byref(handle), self._mine),
-                "hipIpcGetMemHandle",
-            )
-            # string_at, not .reserved: a c_char array field reads back cut at the first NUL.
-            raw = ctypes.string_at(ctypes.addressof(handle), 64)
-            handles = [None] * world
-            dist.all_gather_object(handles, raw)
-            ptrs = []
-            for pe in range(world):
-                if pe == rank:
-                    ptrs.append(self._mine)
-                    continue
-                peer = vp()
-                err = hip.hipIpcOpenMemHandle(
-                    ctypes.byref(peer),
-                    _Handle.from_buffer_copy(handles[pe]),
-                    self._LAZY_PEER,
-                )
-                # Lazy peer setup can leave hipErrorPeerAccessAlreadyEnabled sticky
-                # even on success (see ccoDevCommCreate); consume it.
-                hip.hipGetLastError()
-                chk(err, f"hipIpcOpenMemHandle(pe {pe})")
-                ptrs.append(peer.value)
-                self._opened.append(peer.value)
-            self.peers = torch.tensor(ptrs, dtype=torch.int64, device=dev)
-        dist.barrier()
+    def __init__(self, rank=0, world=1, dev=None):
+        pass
 
     def zero(self):
-        """Collective, like the op's reset(): every rank zeroes its own word."""
-        with torch.cuda.device(self._dev):
-            self._hip.hipMemset(self._mine, 0, 4)
-            self._hip.hipDeviceSynchronize()
+        pass
 
     def close(self):
-        for p in self._opened:
-            self._hip.hipIpcCloseMemHandle(p)
-        self._opened = []
-        if self._mine is not None:
-            self._hip.hipFree(self._mine)
-            self._mine = None
+        pass
 
 
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
@@ -363,10 +393,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._views = {}
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
+        self._arch = _arch.split(":")[0]
         self._is1250 = _arch.split(":")[0].startswith("gfx125")
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
+        lay = ll128_layout(cfg) if self._is1250 else None
+        split = lay is not None and lay["max_tok"] < cfg.max_num_inp_token_per_rank
+        self._ll128_geom = None if split else lay
+        self._ll128_split = lay if split else None
+        self._ll_recv_cap = cfg.world_size * lay["max_tok"] if split else 0
+        self._ll_last = False
 
         # Gate FIRST: rejecting a config after taking a symmetric window would
         # leak it (the arena is registered with the communicator), and the whole
@@ -374,7 +411,40 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._gate(
             KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg))
         )
+        # Active QP counts set_active_qps() may switch to. Each is compiled for
+        # every bucket geometry, so a switch never compiles at launch.
+        self._selectable_active_qps = tuple(cfg.active_qp_counts or ())
+        self._active_qps_override = None
 
+        if self._ll128_geom is not None and cfg.schedule:
+            comb_b, comb_w = self._ll128_geom["combine"]
+            if "dispatch" in self._ll128_geom:
+                disp_b, disp_w = self._ll128_geom["dispatch"]
+                cfg.schedule = ((None, disp_b, disp_w, comb_b, comb_w),)
+            else:
+                cfg.schedule = tuple(
+                    (e, db, dw, comb_b, comb_w) for (e, db, dw, _, _) in cfg.schedule
+                )
+        self._schedule = tuning.resolve_schedule(
+            cfg, cu_count=self._multi_processor_count
+        )
+        if cfg.rank == 0 and not cfg.async_ll and logger.isEnabledFor(logging.INFO):
+            logger.info("%s", tuning.describe_schedule(cfg, self._schedule))
+        self._dispatch_specs = tuple(
+            dict.fromkeys(row.dispatch for row in self._schedule)
+        )
+        self._combine_specs = tuple(
+            dict.fromkeys(row.combine for row in self._schedule)
+        )
+        self._bf16_push = self._bf16_push_layout(cfg)
+        self._push_specs = tuple(
+            dict.fromkeys(
+                tuning.KernelConfig("intra", b, w) for _, b, w in self._bf16_push or ()
+            )
+        )
+        # What each intranode plan will report, per variant -- its arena regions,
+        # staging, push landing -- asked before any of them is built.
+        self._disp_infos, self._comb_infos = self._describe(cfg)
         self.arena = SymmArena(comm, self._regions(cfg))
         try:
             self._build(cfg, comm)
@@ -393,44 +463,76 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         torch.cuda.synchronize(dev)
         comm.barrier()
 
-    @staticmethod
-    def _specs_from(cfg):
-        disp, comb = EpDispatchCombineOp._specs_from(cfg)
-        if cfg.schedule and cfg.quant_type in _PUSH_QUANT_TYPES:
-            comb = sorted({(cb, cw) for (_, _, _, cb, cw) in cfg.schedule})
-        return disp, comb
+    def _bf16_push_layout(self, cfg):
+        if (
+            not self._is1250
+            or cfg.is_internode
+            or cfg.async_ll
+            or cfg.quant_type != "none"
+            or (
+                cfg.dispatch_dtype is not torch.bfloat16
+                and cfg.dispatch_dtype not in _FP8_TUNING_DTYPES
+            )
+            or cfg.combine_dtype is not torch.bfloat16
+            or not cfg.schedule
+            or self._ll128_geom is not None
+        ):
+            return None
+        flag = os.environ.get("MORI_EP_BF16_PUSH", "1")
+        if flag not in ("0", "1"):
+            raise ValueError(f"MORI_EP_BF16_PUSH must be '0' or '1', got {flag!r}")
+        if flag == "0":
+            return None
+        return tuning.bf16_push(
+            cfg.world_size,
+            cfg.hidden_dim,
+            cfg.num_experts_per_token,
+            experts_per_rank=cfg.num_experts_per_rank,
+        )
 
     def _build(self, cfg, comm):
         dev = self.dev
         self.arena.zero()
 
-        self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
-        self._dev_comm = self._make_dev_comm(cfg, comm) if cfg.is_internode else None
-        # Decided before the kernels are built: how the dispatch plans reserve slots
-        # follows where the slot allocator word lives (see TokOffExt below).
-        self._tokoff_wanted = (
-            not cfg.is_internode and self._is1250 and TokOffExt.wanted(cfg.world_size)
+        # AsyncLL needs one on a single node too -- ccoSdma hangs off the device
+        # communicator, not off the window -- which is why the test is not just
+        # is_internode.
+        self._dev_comm = (
+            self._make_dev_comm(cfg, comm)
+            if (cfg.is_internode or cfg.async_ll)
+            else None
         )
+        # SDMA queue offset (QueueForPe adds it to the destination PE): 0, the
+        # shared queue, unless the caller opted in. LSA uses no SDMA queue.
+        self._sdma_queue_offset = 0
+        self._holds_sdma_queue_offset = False
+        if (
+            cfg.async_ll
+            and cfg.async_ll_transport == "sdma"
+            and cfg.async_ll_own_sdma_queue
+            and self._dev_comm is not None
+            and self._dev_comm.sdma_num_queue > 1
+        ):
+            self._sdma_queue_offset = _take_sdma_queue_offset(
+                self._device_index, self._dev_comm.sdma_num_queue
+            )
+            self._holds_sdma_queue_offset = True
 
         # gfx1250 dispatch staging: one dynamically-allocated buffer shared by
         # all dispatch schedule variants.  Must be set before _build_kernels
         # because dispatch plans bind the pointer at construction time.
         self.dispatch_staging = None
-        if self._is1250 and not cfg.is_internode:
-            raw_scale = self._scale_i32(cfg) * 4
-            stg_bytes = ep_staging_bytes(
-                cfg.world_size, cfg.effective_max_recv, raw_scale
+        stg_bytes = max((i["stagingBytes"] for i in self._disp_infos), default=0)
+        if stg_bytes > 0:
+            self.dispatch_staging = torch.zeros(
+                stg_bytes, dtype=torch.uint8, device=dev
             )
-            if stg_bytes > 0:
-                self.dispatch_staging = torch.zeros(
-                    stg_bytes, dtype=torch.uint8, device=dev
-                )
 
         self._kernels = self._build_kernels(cfg, self.arena)
 
-        if cfg.is_internode:
+        if cfg.is_internode or cfg.async_ll:
             self._alloc_internode_buffers(cfg)
             return
 
@@ -444,19 +546,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # dispatch signal on, the push combine's landing offset of the rows it
         # returns (EpFp4LandTo; dispatch writes it, combine reads it).
         self.dest_pe_counter = torch.zeros(2 * cfg.world_size, **i32)
-        # Dispatch's slot allocator word lives in IPC-shared hipExtMallocWithFlags
-        # memory instead of the cco window (see TokOffExt): the cco-window slot
-        # atomic serializes on newer fw/KMD stacks. gfx1250 intranode only -- the
-        # only kernel that reads tokOffPeers. Opt-in for a single-host EP with
-        # MORI_EP_TOKOFF_EXT=1; otherwise, and always for an EP spanning hosts, the
-        # word stays in the cco window (tokOffPeers stays None -> kernel EpTokOff
-        # falls back to the VMM hipMemCreate window).
-        self._tokoff_ext = None
-        self.tok_off_peers = None
-        if self._tokoff_wanted:
-            self._tokoff_ext = TokOffExt(cfg.rank, cfg.world_size, dev)
-            self.tok_off_peers = self._tokoff_ext.peers
         self.total_recv = torch.zeros(1, **i32)
+        self._recv = self.total_recv
+        self._ll_recv = torch.zeros(1, **i32) if self._ll128_split is not None else None
+        self._snapshot_zeroes_count = self._ll128_split is not None or (
+            self._ll128_geom is not None and "dispatch" in self._ll128_geom
+        )
         self.dispatch_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
         # Monotone epoch. Starts at 1 so the zeroed barrier slots cannot alias
@@ -477,7 +572,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # never touches it -> left None (binds as 0).
         self.combine_barrier_fan = None
         if self._is1250:
-            max_comb_blocks = max(b for b, _ in self._combine_specs)
+            max_comb_blocks = max(
+                spec.block_num for spec in (*self._combine_specs, *self._push_specs)
+            )
             if max_comb_blocks > _XDB_FLAG_SLOTS:
                 raise ValueError(
                     f"combine block_num {max_comb_blocks} exceeds the {_XDB_FLAG_SLOTS} "
@@ -504,10 +601,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         * RAIL rather than the CROSSNODE default. The kernels talk only to their
           own local rank on other nodes, so that is the only connection set they
           need, and asking for more costs QPs that never carry traffic.
-        * a context count of num_qp_per_pe. ccoGda picks its QP as
-          ``contextId % numQpPerPe``, so fewer contexts than QPs silently
-          collapses the stripes onto a subset of them -- no error, just less
-          bandwidth than the config asked for.
+        * num_qp_per_pe allocated contexts. Each kernel sends on a prefix of
+          them (its active count, KernelConfig.active_qps); the count stored in
+          the DevComm stays the allocation because it is also the endpoint-array
+          stride for world-rank addressing.
         """
         from mori.cco import cco as _cco
         from mori.cco.communicator import DevCommHandle
@@ -515,6 +612,40 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         requirements = _cco.DevCommRequirements()
         requirements.gda_connection_type = _cco.GDA_CONNECTION_RAIL
         requirements.gda_context_count = max(1, cfg.num_qp_per_pe)
+        if cfg.async_ll and cfg.nodes > 1:
+            # CROSSNODE, not the RAIL set the v2/v2_ll families ask for. Those
+            # aggregate through a same-rail proxy -- each rank only ever talks to
+            # its own local rank on another node -- so same-rail QPs are all they
+            # can use. AsyncLL addresses peers individually: rank i sends to rank
+            # j directly, which is a cross-rail path and needs a QP to every
+            # cross-node peer.
+            #
+            # This also means AsyncLL cannot run across nodes on a rail-only
+            # fabric. That failure is silent (QP setup is a TCP exchange and
+            # succeeds; no data moves), so confirm the fabric with an ib_write_bw
+            # between two DIFFERENT rails before trusting a multi-node run.
+            requirements.gda_connection_type = _cco.GDA_CONNECTION_CROSSNODE
+        if cfg.async_ll and cfg.async_ll_transport == "sdma":
+            # One SDMA queue per peer. The transfer kernels run one issuing warp
+            # per destination and the queue is picked as (destPe + the op's
+            # sdmaQueueOffset) % sdmaNumQueue, so fewer queues than peers folds
+            # two warps onto one queue -- correct, but they then serialise on its
+            # in-order commit chain. Eight is the hardware cap; above it cco
+            # clamps with a warning.
+            #
+            # The count is a PERFORMANCE knob, not a correctness one, and asking
+            # for more than a pair can hold is fatal rather than degrading:
+            # anvil's queue creation is CHECK_HSAKMT_SUCCESS, which exit()s. On
+            # 8xMI308X, 8 queues per pair gets HSAKMT_STATUS_NO_MEMORY from
+            # hsaKmtCreateQueueExt and every rank leaves the process -- its xGMI
+            # engines fold to the even ids {2,4,6} and ROCr's own blit queues
+            # take part of that, so three is what fits. With <= 3 the whole
+            # AsyncLL suite passes there, which is why this clamps rather than
+            # trying to recover: by the time the request is refused the process
+            # is already gone.
+            requirements.sdma_queue_count = _asyncll_sdma_queues(
+                _gpu.detect_model(), cfg.gpu_per_node
+            )
         handle = DevCommHandle(comm, requirements=requirements)
 
         # A rejected handle still owns its QPs, so every exit below its
@@ -547,6 +678,28 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"rank {cfg.rank} has CCO lsa_rank {handle.lsa_rank} but EP's node "
                     f"layout implies {expected_lsa_rank}: world ranks are not laid out "
                     "node-major, so worldPe - lsaBase is not an LSA rank"
+                )
+            # The env check in _asyncll_unsupported catches MORI_ENABLE_SDMA being
+            # unset before anything is built, but it is not the only way to end
+            # up with no queues: a library built BUILD_CCO_SDMA=OFF, or peers that
+            # do not report SDMA capability, get 0 too. cco only logs that, and
+            # every ccoSdma put then moves no bytes, so the receiver spins on a
+            # count that never arrives -- a hang, not an error. Ask the handle for
+            # what it actually connected. A node of one has no same-node peer and
+            # makes no SDMA put at all, so 0 is correct there.
+            if (
+                cfg.async_ll
+                and cfg.async_ll_transport == "sdma"
+                and handle.lsa_size > 1
+                and handle.sdma_num_queue == 0
+            ):
+                raise ValueError(
+                    "async_ll_transport='sdma' but this communicator has no SDMA "
+                    "queues (mori built with BUILD_CCO_SDMA=OFF, MORI_ENABLE_SDMA "
+                    "unset, or no peer reports SDMA capability -- the log above "
+                    "says which); every transfer would be a no-op and the receiver "
+                    "would wait forever. Use async_ll_transport='lsa', which needs "
+                    "no engine, or fix the SDMA setup"
                 )
         except BaseException:
             handle.close()
@@ -593,7 +746,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
         self.dest_pe_counter = torch.zeros(world_size, **i32)
         self.block_flag_counter = torch.zeros(n_nodes, **i32)
+        # AsyncLL only: recv slot -> the send-buffer slot it arrived in, written by
+        # dispatch's RecvCopy and read by combine's SendCopy. One entry per slot
+        # this rank can receive into.
+        self.disp_receiver_idx_map = (
+            torch.zeros(cfg.effective_max_recv, **i32) if cfg.async_ll else None
+        )
         self.total_recv = torch.zeros(1, **i32)
+        self._recv, self._ll_recv = self.total_recv, None
         self.dispatch_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
         self.inter_blocks_barrier = torch.zeros(4, dtype=torch.uint32, device=dev)
@@ -622,9 +782,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # struct -- so passing the whole schema each time cost a ctypes field
         # write per field per launch. Binding leaves six.
         static_args = self._internode_static_args()
-        for plans_by_pass in self._internode_plans.values():
-            for plan in plans_by_pass.values():
-                plan.bind(**static_args)
+        for plan in self._plans:
+            plan.bind(**static_args)
 
     def _internode_unsupported(self, cfg) -> tuple[str, ...]:
         bad = []
@@ -640,6 +799,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"{leg} dtype {leg_dtype} has no internode kernel "
                     f"(have {', '.join(self._INTERNODE_DTYPE.values())})"
                 )
+        if cfg.combine_dtype == torch.float4_e2m1fn_x2:
+            bad.append("fp4 combine is not supported on the internode path")
+        elif cfg.dispatch_dtype == torch.float4_e2m1fn_x2 and cfg.combine_dtype not in (
+            torch.bfloat16,
+            torch.float32,
+        ):
+            bad.append(
+                "fp4 dispatch requires bf16 or fp32 combine on the internode path"
+            )
         if cfg.is_scatter:
             bad.append("combine_mode='scatter' (the internode kernels gather)")
         if cfg.enable_std_moe:
@@ -692,17 +860,93 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         unchanged. The internode kernel lays its rows down packed
         (`destTokId * ScaleBytes`, ScaleBytes = scaleDim * scaleTypeSize) and
         internode_regions sizes out_scales that way, so there it is the row itself.
-        Use the module-level function when there is no op yet (sizing an arena)."""
-        if self.cfg.is_internode:
+        Before there is an op, EpDispatchPlan.describe(...)["scaleStride"]."""
+        # AsyncLL stages scales the same packed way the internode kernels do
+        # (destTokId * ScaleBytes), so it reads the row unchanged too.
+        if self.cfg.is_internode or self.cfg.async_ll:
             return self._scale_row_bytes()
-        return scale_stride_bytes(self._scale_row_bytes())
+        return self._disp_infos[0]["scaleStride"]
 
-    @classmethod
-    def _scale_stride_i32(cls, cfg) -> int:
-        """Dwords per DESTINATION scale row, 0 when the transport is off."""
-        return scale_stride_bytes(cls._scale_i32(cfg) * 4) // 4
+    def _describe(self, cfg):
+        """(dispatch infos, combine infos): every intranode variant, asked of
+        describe(), which compiles nothing. Empty on the internode and AsyncLL
+        paths, whose regions come from their own formulas."""
+        if cfg.is_internode or cfg.async_ll:
+            return (), ()
+        disp, comb = self._plan_requests(cfg)
+        return (
+            tuple(
+                cb.EpDispatchPlan.describe(
+                    **disp,
+                    block_num=spec.block_num,
+                    warp_per_block=spec.warp_per_block,
+                    call_tok_max=cap,
+                )
+                for spec in self._dispatch_specs
+                for cap in self._dispatch_caps(cfg, spec)
+            ),
+            tuple(
+                cb.EpCombinePlan.describe(
+                    **comb,
+                    block_num=spec.block_num,
+                    warp_per_block=spec.warp_per_block,
+                )
+                for spec in self._combine_specs
+            )
+            + tuple(
+                cb.EpCombinePlan.describe(
+                    **comb,
+                    combine_bf16_push=True,
+                    block_num=spec.block_num,
+                    warp_per_block=spec.warp_per_block,
+                )
+                for spec in self._push_specs
+            ),
+        )
+
+    def _snapshot_recv_views(self, disp_spec):
+        if disp_spec == _LL_SPEC:
+            names, cap = ("ll_recv_to_src_token", "ll_out_idx"), self._ll_recv_cap
+        else:
+            geom = self._ll128_geom
+            if geom is None:
+                return None
+            if "dispatch" not in geom:
+                raise ValueError(
+                    "snapshot=True on an op whose LL128 combine runs behind the schedule's "
+                    "dispatch: that combine reads the slot map peers write into the arena, "
+                    "which the next dispatch overwrites"
+                )
+            names, cap = ("recv_to_src_token", "out_idx"), self._recv_cap
+        return (
+            from_gpu_ptr(self.arena.local_ptr(names[0]), (cap,), torch.int32),
+            from_gpu_ptr(
+                self.arena.local_ptr(names[1]),
+                (cap * self.cfg.num_experts_per_token,),
+                torch.int32,
+            ),
+        )
+
+    def _reverse_source(self, disp_spec):
+        if disp_spec != _LL_SPEC:
+            return super()._reverse_source(disp_spec)
+        view = self._views.get("ll_reverse")
+        if view is None:
+            view = self._views["ll_reverse"] = from_gpu_ptr(
+                self.arena.local_ptr("ll_recv_to_src_token"),
+                (self._ll_recv_cap,),
+                torch.int32,
+            )
+        return view, self._ll_reencode
+
+    def _ll_reencode(self, rev):
+        n = self._ll128_split["max_tok"]
+        return rev // n * self.cfg.max_num_inp_token_per_rank + rev % n
 
     def _regions(self, cfg):
+        if cfg.async_ll:
+            # Same names, per-rank send extents. See asyncll_regions.
+            return asyncll_regions(cfg)
         if cfg.is_internode:
             # Sized exactly, region by region. v1 sizes its arena with a 256 MB
             # slack term on a rough estimate; this is the exact sum, which is both
@@ -710,46 +954,148 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # risk (a wrong formula corrupts a neighbour). test_internode_regions
             # compares every entry against what v1 allocates for the same config.
             return internode_regions(cfg)
-        # token_nbytes / combine_token_nbytes rather than elem*hidden: they are the
-        # only forms that are right for fp4, where 2 values share a byte.
-        cap = cfg.effective_max_recv
-        topk = cfg.num_experts_per_token
-        out_tok = cap * cfg.combine_token_nbytes
-        if cfg.quant_type in _PUSH_QUANT_TYPES:
-            land_rows = push_land_rows(cfg)
-            out_tok += land_rows * push_wire_nbytes(cfg)
-            # Row flags of the overlapped combine (EpFp4Ovl in ep_intranode_1250x.hpp),
-            # which runs from four ranks up.
-            if cfg.world_size >= 4:
-                out_tok += land_rows * 8
-        regions = [
-            ("tok_off", 4),
-            # gfx1250 with the aggregated reservation: one 8-byte signal a source, its
-            # recv count + 1 and in the high word the push combine's landing offset of
-            # that source's rows here. Otherwise 4-byte count signals in the first half.
-            ("recv_num", 2 * cfg.world_size * 4),
-            ("recv_to_src_token", cap * 4),
-            ("out_idx", cap * topk * 4),
-            ("out_wts", cap * topk * 4),
-            ("disp_out", cap * cfg.token_nbytes),
-            ("out_tok", out_tok),
-            ("cross_device_barrier", cfg.world_size * 8),
-        ]
-        if self._scale_i32(cfg):
-            # Sized by the DESTINATION stride, which is the caller's row padded to
-            # 128 B: the kernel lays the rows down at that pitch, so an arena sized
-            # for the unpadded row would be overrun by the last tokens.
-            # Padded rows only land aligned if the region does; that is another
-            # file's constant, and lowering it reads as a perf regression.
+        # Sized by the plans themselves (EpRegion* in ep_cfg.hpp), every variant
+        # asked, so the arena covers each one.
+        regions = cb.arena_regions(
+            *self._disp_infos, *self._comb_infos, region_names=_REGIONS
+        )
+        ll = self._ll128_requests(cfg)
+        if ll is not None:
+            sizes = dict(regions)
+            for name, n in cb.arena_regions(
+                cb.EpDispatchPlan.describe(**ll[0]),
+                cb.EpCombinePlan.describe(**ll[1]),
+                region_names=self._ll128_split["region_names"],
+            ):
+                sizes[name] = max(sizes.get(name, 0), n)
+            regions = list(sizes.items())
+        if any(name == "out_scales" for name, _ in regions):
+            # The kernel lays scale rows down at a 128 B pitch, which only lands
+            # aligned if the region does; that is another file's constant.
             assert SymmArena._ALIGN % _SCALE_ALIGN == 0, (
                 f"SymmArena._ALIGN={SymmArena._ALIGN} does not keep scale regions "
                 f"{_SCALE_ALIGN} B-aligned; the padding in EpScaleStride buys nothing"
             )
-            regions.append(("out_scales", cap * self._scale_stride_i32(cfg) * 4))
         return regions
+
+    def _asyncll_unsupported(self, cfg) -> tuple[str, ...]:
+        """AsyncLL's own range. Checked before the arena or the communicator is
+        taken, like every other gate here."""
+        bad = []
+        # Shares the internode kernels' dtype and feature range -- it reduces the
+        # same way and stages through the same slots -- except packed fp4, which
+        # only the v2/v2_ll dispatch carries.
+        dtypes = {k: v for k, v in self._INTERNODE_DTYPE.items() if v != "fp4"}
+        for leg, leg_dtype in (
+            ("dispatch", cfg.dispatch_dtype),
+            ("combine", cfg.combine_dtype),
+        ):
+            if leg_dtype not in dtypes:
+                bad.append(
+                    f"{leg} dtype {leg_dtype} has no AsyncLL kernel "
+                    f"(have {', '.join(dtypes.values())})"
+                )
+        if cfg.active_qp_counts:
+            bad.append("active_qp_counts (AsyncLL has no set_active_qps)")
+        if cfg.is_scatter:
+            bad.append("combine_mode='scatter' (the AsyncLL combine gathers)")
+        if cfg.enable_std_moe:
+            bad.append("enable_std_moe (not implemented on the AsyncLL path)")
+        if cfg.quant_type != "none":
+            bad.append(
+                f"quant_type={cfg.quant_type!r} (AsyncLL transports unquantized)"
+            )
+        if cfg.async_ll_transport not in ("sdma", "lsa"):
+            bad.append(
+                f"async_ll_transport={cfg.async_ll_transport!r} (have 'sdma', 'lsa')"
+            )
+        if cfg.nodes > 1 and cfg.async_ll_transport == "lsa":
+            bad.append(
+                "async_ll_transport='lsa' with gpu_per_node="
+                f"{cfg.gpu_per_node} < world_size={cfg.world_size}: peer stores "
+                "reach only ranks inside this one's flat LSA window. Use 'sdma', "
+                "whose cross-node peers go over ccoGda"
+            )
+        # Without this the communicator comes back with zero SDMA queues and every
+        # put is a silent no-op -- the tokens never move and the receiver spins on
+        # a count that never arrives. A hang with no message is the worst way to
+        # learn about an unset environment variable.
+        if cfg.async_ll_transport == "sdma" and os.environ.get(
+            "MORI_ENABLE_SDMA", ""
+        ) not in ("1", "true", "True"):
+            bad.append(
+                "MORI_ENABLE_SDMA is not set: cco creates no SDMA queues without "
+                "it and every AsyncLL transfer would be a no-op (or use "
+                "async_ll_transport='lsa', which needs no engine)"
+            )
+        return tuple(bad)
+
+    def _plan_requests(self, cfg):
+        """(dispatch, combine) request fields every plan of this op shares."""
+        common = dict(
+            world_size=cfg.world_size,
+            max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+            num_expert_per_rank=cfg.num_experts_per_rank,
+            num_expert_per_token=cfg.num_experts_per_token,
+            max_recv=cfg.effective_max_recv,
+            use_weights=True,
+        )
+        # The two legs are separate Plans, so each carries its own dtype and its own
+        # element count -- which is what makes an asymmetric config (fp8/fp4 in,
+        # bf16 out) just two ordinary kernels. hiddenDim is "elements of THIS leg's
+        # dtype", so fp4 halves it: 2 e2m1 live in one transported byte.
+        disp = dict(
+            common,
+            hidden_dim=cfg.hidden_dim // 2 if cfg.is_fp4 else cfg.hidden_dim,
+            dtype=cfg.dispatch_dtype,
+            # Dword-padded: the kernel copies the row as dwords, and EpCfgIsValid
+            # rejects a Cfg whose row is not a whole number of them.
+            scale_bytes=self._scale_i32(cfg) * 4,
+        )
+        comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
+        if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
+            comb["combine_fp4"] = True
+        if cfg.quant_type == "fp4_blockwise_fp32":
+            comb["combine_fp4_f32_scale"] = True
+        if cfg.quant_type == "fp8_blockwise":
+            comb["combine_fp8"] = True
+        geom = self._ll128_geom
+        if geom is not None and "dispatch" in geom:
+            disp.update(
+                ll128=True,
+                combine_fp4=comb.get("combine_fp4", False),
+                combine_fp8=comb.get("combine_fp8", False),
+            )
+            comb["ll128"] = True
+        elif geom is not None:
+            comb["ll128_combine_only"] = True
+        return disp, comb
+
+    def _ll128_requests(self, cfg):
+        split = self._ll128_split
+        if split is None:
+            return None
+        n = split["max_tok"]
+        disp, comb = self._plan_requests(cfg)
+        ll = dict(max_tok_per_rank=n, max_recv=cfg.world_size * n, ll128=True)
+        (disp_b, disp_w), (comb_b, comb_w) = split["dispatch"], split["combine"]
+        return (
+            dict(
+                disp,
+                **ll,
+                combine_fp4=comb.get("combine_fp4", False),
+                combine_fp8=comb.get("combine_fp8", False),
+                call_tok_max=n,
+                block_num=disp_b,
+                warp_per_block=disp_w,
+            ),
+            dict(comb, **ll, block_num=comb_b, warp_per_block=comb_w),
+        )
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
+        if cfg.async_ll:
+            return self._asyncll_unsupported(cfg)
         if cfg.is_internode:
             return self._internode_unsupported(cfg)
         bad = []
@@ -797,15 +1143,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # The C++ validator rejects a shrunk cap: the recv capacity is also the
         # flat-index stride, so an overflow re-encodes to the next peer instead
         # of merely overrunning the region.
-        # The push combine's landing offsets ride the aggregated reservation's
-        # dispatch signal, which TokOffExt turns off.
-        if cfg.quant_type in _PUSH_QUANT_TYPES and getattr(
-            self, "_tokoff_wanted", False
-        ):
-            bad.append(
-                f"quant_type={cfg.quant_type!r} needs the aggregated dispatch "
-                "reservation, which MORI_EP_TOKOFF_EXT=1 turns off"
-            )
         worst = cfg.world_size * cfg.max_num_inp_token_per_rank
         if cfg.effective_max_recv < worst:
             bad.append(
@@ -819,39 +1156,21 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         torch.float32: "f32",
         torch.float8_e4m3fnuz: "fp8_fnuz",
         torch.float8_e4m3fn: "fp8_ocp",
+        torch.float4_e2m1fn_x2: "fp4",  # packed dispatch only; see _internode_unsupported
     }
 
-    # Which leg each pass belongs to. The two legs are separate Plans and carry
-    # DIFFERENT element types, exactly as the intranode path does: the kernel's
-    # `T` is "elements of this leg's dtype", and `hiddenBytes = hiddenDim *
-    # sizeof(T)` sizes the dispatch payload in one and the combine output in the
-    # other. Compiling all eight with the dispatch dtype is what made an fp8
-    # dispatch write hidden*sizeof(fp8) bytes where the bf16 combine_out view
-    # reads hidden*sizeof(bf16) -- half the output left as whatever was there.
-    _INTERNODE_LEG = {
-        "copystaging": "dispatch",
-        "dispatch": "dispatch",
-        "dispatch_ll": "dispatch",
-        "combinesync": "combine",
-        "combinesyncbarrier": "combine",
-        "combine": "combine",
-        "combine_ll": "combine",
-        "combineall": "combine",
-    }
-
-    # (phase, low_latency) -> the pass sequence, in launch order. Two for
-    # dispatch, four for combine; the LL and non-LL members of each pair are
-    # separate compiled entries rather than a runtime branch.
+    # Pass order is the single source for both plan construction and launch.
+    # Common passes share a plan across families at the same geometry.
     _INTERNODE_SEQ = {
-        ("dispatch", False): ("copystaging", "dispatch"),
-        ("dispatch", True): ("copystaging", "dispatch_ll"),
-        ("combine", False): (
+        ("dispatch", "v2"): ("copystaging", "dispatch"),
+        ("dispatch", "v2_ll"): ("copystaging", "dispatch_ll"),
+        ("combine", "v2"): (
             "combinesync",
             "combinesyncbarrier",
             "combine",
             "combineall",
         ),
-        ("combine", True): (
+        ("combine", "v2_ll"): (
             "combinesync",
             "combinesyncbarrier",
             "combine_ll",
@@ -860,11 +1179,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     }
 
     def _internode_request(
-        self, cfg, dtype_tag, block_num, warp_per_block, rdma_block_num
+        self,
+        cfg,
+        dtype_tag,
+        block_num,
+        warp_per_block,
+        rdma_block_num,
+        active_qps,
+        num_qp_to_drain,
     ):
+        # Each phase uses its own dtype. FP4 dispatch counts packed bytes,
+        # while combine and the shared arena keep the logical hidden dimension.
         return dict(
             worldSize=cfg.world_size,
-            hiddenDim=cfg.hidden_dim,
+            hiddenDim=cfg.hidden_dim // 2 if dtype_tag == "fp4" else cfg.hidden_dim,
             scaleDim=cfg.scale_dim,
             scaleTypeSize=cfg.scale_type_size,
             maxTokenTypeSize=cfg.max_token_type_size,
@@ -873,7 +1201,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             numExpertPerToken=cfg.num_experts_per_token,
             maxTotalRecvTokens=cfg.max_total_recv_tokens,
             gpuPerNode=cfg.gpu_per_node,
-            numQpPerPe=cfg.num_qp_per_pe,
+            # The kernel's ACTIVE count; the allocation lives in the DevComm.
+            numQpPerPe=active_qps,
+            numQpToDrain=num_qp_to_drain,
             quantType=(
                 cfg.quant_type.replace("_", "").lower()
                 if cfg.quant_type != "none"
@@ -926,8 +1256,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # Absent, not zero-sized, when the transport is off; the kernel gates
             # on cfg.scaleDim and never dereferences it.
             offOutScales=offset("out_scales") if has_scales else 0,
+            # AsyncLL's SDMA source word for the small count/epoch writes. Absent
+            # from the other families' arenas, where the kernels never read it.
+            offSendCount=offset("send_count") if arena.has("send_count") else 0,
+            offCombineStaging=(
+                offset("inter_combine_staging")
+                if arena.has("inter_combine_staging")
+                else 0
+            ),
             rank=self.cfg.rank,
             lsaBase=self.lsa_base,
+            sdmaQueueOffset=self._sdma_queue_offset,
             dispDestTokIdMap=0,  # per-launch: the base passes token_dest_map or routing_dest_map
             interNodeDispDestTokIdMap=ptr(self.inter_disp_dest_tok_id_map),
             interNodeDispSendMap=ptr(self.inter_disp_send_map),
@@ -938,278 +1277,418 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dispatchGridBarrier=ptr(self.dispatch_barrier),
             interNodeBlocksBarrier=ptr(self.inter_blocks_barrier),
             crossDeviceBarrierFlag=ptr(self.cross_device_flag),
+            dispReceiverIdxMap=ptr(self.disp_receiver_idx_map),
             # The HOST struct, not DevCommHandle.ptr (the device-side copy): the args
             # embed a ccoDevComm by value, so the binding memcpys from host memory.
             devComm=self._dev_comm._dev_comm.host_ptr,
         )
         return self._internode_static_cache
 
-    def _internode_variants(self, phase):
-        """The kernel names of `phase` this config needs compiled.
-
-        "v2" and "v2_ll" are separate JIT modules, so naming one in the config
-        compiles one; only "auto" needs both, because only "auto" chooses per
-        launch. Returned as a tuple so it can be concatenated with the passes
-        that are common to both.
-        """
-        kernel_family = self.cfg.internode_kernel
-        plain, low_latency = phase, phase + "_ll"
-        if kernel_family == "v2":
-            return (plain,)
-        if kernel_family == "v2_ll":
-            return (low_latency,)
-        return (plain, low_latency)
-
-    def _internode_use_ll(self, num_tokens):
-        """Which of the two families this launch runs.
-
-        Fixed by the config unless it is "auto", where the token count decides at
-        the configured crossover. An explicit choice cannot fall back: the other
-        family was never compiled.
-        """
-        kernel_family = self.cfg.internode_kernel
-        if kernel_family == "v2":
-            return False
-        if kernel_family == "v2_ll":
-            return True
-        return num_tokens <= self.cfg.internode_auto_ll_max_tokens
-
-    _PIN_FIELDS = {
-        "dispatch": (
-            "dispatch_block_num",
-            "dispatch_rdma_block_num",
-            "warp_num_per_block",
+    # -- AsyncLL ---------------------------------------------------------
+    #
+    # Nine passes in four groups. The grouping IS the feature: dispatch_send
+    # returns as soon as its three kernels are enqueued, and the ccoSdma copies
+    # they posted drain while the caller runs whatever comes next.
+    # The two transfer passes are named per transport; everything else is shared.
+    _ASYNCLL_SEQ_TEMPLATE = {
+        "dispatch_send": (
+            "dispatch_slotassign",
+            "dispatch_sendcopy",
+            "dispatch_sendtransfer{sfx}",
         ),
-        "combine": (
-            "combine_block_num",
-            "combine_rdma_block_num",
-            "combine_warp_num_per_block",
-        ),
+        "dispatch_recv": ("dispatch_recvtransfer{sfx}", "dispatch_recvcopy"),
+        "combine_send": ("combine_sendcopy", "combine_sendtransfer{sfx}"),
+        "combine_recv": ("combine_recvtransfer{sfx}", "combine_recvcopy"),
     }
 
-    def _overlay_pinned_geometry(self, cfg, phase, geometry):
-        """Overlay the caller's pinned geometry on a tuned triple, field by field.
-
-        A pinned field is a manual override and beats the table; an unpinned one
-        keeps what the table chose. cfg._pinned_geometry is the caller's original
-        input -- by this point every field holds a number, because
-        _resolve_geometry() filled the unpinned ones with the untuned fallback.
-        """
-        pinned = getattr(cfg, "_pinned_geometry", frozenset())
-        return tuple(
-            getattr(cfg, name) if name in pinned else tuned_value
-            for name, tuned_value in zip(self._PIN_FIELDS[phase], geometry)
-        )
+    # LSA's dispatch send is two passes, not three. The staging hop exists so
+    # ccoSdma has a local contiguous source to hand the engine; a peer store does
+    # not need one, so the gather addresses the peer itself and the bulk copy --
+    # a whole pass over the payload -- is gone. The fused kernel also publishes
+    # the counts, which is all SendTransferLsa did besides copying.
+    _ASYNCLL_SEQ_DISPATCH_SEND_LSA = (
+        "dispatch_slotassign",
+        "dispatch_sendcopy_lsa",
+    )
 
     @staticmethod
-    def _fit_internode_geometry(geometry):
-        """Force rdma_block_num < block_num.
+    def _asyncll_options(cfg, arch):
+        # Resolve once per op. Shared copy passes also serve LSA, so topology
+        # alone cannot select the SDMA notification protocol in native code.
+        if cfg.async_ll_transport != "sdma" or cfg.nodes != 1:
+            return 0, False
 
-        The kernel splits the grid: blocks below rdmaBlockNum take the RDMA leg,
-        the rest take the intra-node one. rdma >= block leaves the intra-node
-        half with no blocks AND makes the dispatch fan-in wait for
-        rdmaBlockNum * warpNum arrivals that can never happen -- every peer then
-        spins forever, with no host-side error. internode_tuning_configs.lookup()
-        clamps on the table-hit path; this is the choke point that covers the
-        env-pin and untuned paths too.
-        """
-        block, rdma, warp = geometry
-        return (block, min(rdma, max(1, block - 1)), warp)
+        def flag(name, default):
+            value = os.environ.get(name, "1" if default else "0")
+            if value not in ("0", "1"):
+                raise ValueError(f"{name} must be '0' or '1', got {value!r}")
+            return value == "1"
 
-    def _internode_geometry_buckets(self, cfg):
-        return [
-            (
-                max_tokens,
-                self._fit_internode_geometry(dispatch_geometry),
-                self._fit_internode_geometry(combine_geometry),
+        # On by default where it has been measured to win: gfx1250 (either code
+        # target), and gfx950 (MI355X), where it beat legacy at every token count,
+        # most with two overlapping streams.
+        early = flag(
+            "MORI_ASYNCLL_EARLY_NOTIFY", arch in ("gfx950", "gfx1250", "gfx1250-strict")
+        )
+        fused = flag("MORI_ASYNCLL_FUSED_RECV", False)
+        skip_reset = flag("MORI_ASYNCLL_SKIP_RESET", early)
+        if (fused or skip_reset) and not early:
+            raise ValueError(
+                "MORI_ASYNCLL_FUSED_RECV and MORI_ASYNCLL_SKIP_RESET require "
+                "MORI_ASYNCLL_EARLY_NOTIFY=1"
             )
-            for max_tokens, dispatch_geometry, combine_geometry in (
-                self._internode_geometry_buckets_raw(cfg)
-            )
-        ]
+        # Must match EpInterNodeCfg::asyncLlMode: legacy, early, fused CTA wait.
+        return (2 if fused else int(early)), skip_reset
 
-    def _internode_geometry_buckets_raw(self, cfg):
-        """``[(max_tokens | None, dispatch_geometry, combine_geometry)]``, coarsest
-        last.
+    @staticmethod
+    def _asyncll_fused_recv_ctas(mode, device_index=0, mp_count=0):
+        # Grid ceiling for the fused receive copies; 0 lets the native factory
+        # pick half the device. MORI_ASYNCLL_FUSED_RECV_CTAS is only a tuning
+        # override: the default exists so that fusion cannot starve another
+        # stream's sends into a deadlock.
+        name = "MORI_ASYNCLL_FUSED_RECV_CTAS"
+        value = os.environ.get(name, "0")
+        try:
+            ctas = int(value)
+        except ValueError:
+            ctas = -1
+        if ctas < 0:
+            raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        if mode != 2:
+            return 0
+        if ctas > 0:
+            return ctas
+        # "Half the device" has to mean half of what this process can use. The
+        # native default is mpCount / 2, and mpCount is the whole device even when
+        # HSA_CU_MASK leaves the process a fraction of it: at 64 of 256 CUs two
+        # 128-CTA fused grids fill every slot, and the ranks deadlock as if there
+        # were no ceiling at all.
+        usable = _hsa_cu_mask_cus(device_index, mp_count)
+        if usable is not None and 0 < usable < mp_count:
+            return max(usable // 2, 1)
+        return 0
 
-        Compilation happens at build time, so every geometry a launch could pick
-        has to be known now -- which is why this returns the whole schedule and
-        not just the one for the current token count. Same rule as the intranode
-        schedule: `_pick` must never be able to trigger a compile.
+    @classmethod
+    def _asyncll_seq(cls, cfg, mode=0):
+        lsa = cfg.async_ll_transport == "lsa"
+        sfx = "_lsa" if lsa else ""
+        seq = {
+            group: tuple(n.format(sfx=sfx) for n in names)
+            for group, names in cls._ASYNCLL_SEQ_TEMPLATE.items()
+        }
+        # The unfused LSA sequence is reachable through MORI_ASYNCLL_LSA_FUSED=0
+        # so the fusion can be A/B'd against it on one box in one container.
+        # Comparing against the pre-fusion numbers recorded elsewhere would be
+        # comparing across machines, which on these parts is enough to move a
+        # single-digit effect either way.
+        if lsa and os.environ.get("MORI_ASYNCLL_LSA_FUSED", "1") != "0":
+            seq["dispatch_send"] = cls._ASYNCLL_SEQ_DISPATCH_SEND_LSA
+        if mode == 2:
+            seq["dispatch_recv"] = ("dispatch_recvcopy",)
+            seq["combine_recv"] = ("combine_recvcopy",)
+        return seq
 
-        The table keeps dispatch and combine on DIFFERENT rdma/warp values for the
-        same token count, which a single geometry per bucket cannot express; that
-        is why a bucket carries two triples rather than one.
-        """
-        from .internode_tuning_configs import _TABLE, _device_key, lookup
+    # Which leg's dtype each pass is compiled for, the rule
+    # _build_internode_kernels applies per phase: compiling a combine pass with
+    # the dispatch dtype is how an fp8 dispatch ends up writing half the bytes a
+    # bf16 combine view reads.
+    @staticmethod
+    def _asyncll_leg(group):
+        return "dispatch" if group.startswith("dispatch") else "combine"
 
-        # Sweep hook: pin one geometry for every token count, bypassing the table.
-        # A geometry is a compile-time identity here, so a sweep cannot select one
-        # at launch the way the intranode path can -- it has to be fixed before
-        # the plans are built, which is before the op exists. Hence an env var
-        # rather than a CLI flag threaded through the config.
-        pinned_dispatch = _geometry_from_env("MORI_EP_DISP_GEOM")
-        pinned_combine = _geometry_from_env("MORI_EP_COMB_GEOM")
-        if pinned_dispatch or pinned_combine:
-            config_dispatch = (
-                cfg.dispatch_block_num,
-                cfg.dispatch_rdma_block_num,
-                cfg.warp_num_per_block,
-            )
-            config_combine = (
-                cfg.combine_block_num,
-                cfg.combine_rdma_block_num,
-                cfg.combine_warp_num_per_block,
-            )
-            return [
-                (
-                    None,
-                    pinned_dispatch or config_dispatch,
-                    pinned_combine or config_combine,
-                )
-            ]
+    def _asyncll_request(self, cfg, dtype_tag, block_num, warp_per_block):
+        # AsyncLL stripes over its active QPs and quiets them itself; the v2
+        # drain count is not read by its kernels.
+        request = self._internode_request(
+            cfg,
+            dtype_tag,
+            block_num,
+            warp_per_block,
+            rdma_block_num=0,
+            active_qps=tuning.resolve_active_qps(cfg),
+            num_qp_to_drain=0,
+        )
+        # The AsyncLL specs derive every grid themselves -- the copy passes from
+        # mpCount, the transfer passes from worldSize -- so the device's CU count
+        # has to reach them. The internode request never carries it because its
+        # geometry table supplies grids directly.
+        request["mpCount"] = self._multi_processor_count
+        request["asyncLlMode"] = self._asyncll_mode
+        request["asyncLlFusedRecvCtas"] = self._asyncll_fused_ctas
+        return request
 
-        dtype = "fp8" if cfg.dispatch_dtype in _FP8_TUNING_DTYPES else "bf16"
-        key = (_device_key(), cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token)
-        entry = _TABLE.get(key)
-        if not entry:
-            # Untuned shape: one bucket, whatever the config resolved to.
-            return [
-                (
-                    None,
-                    (
-                        cfg.dispatch_block_num,
-                        cfg.dispatch_rdma_block_num,
-                        cfg.warp_num_per_block,
-                    ),
-                    (
-                        cfg.combine_block_num,
-                        cfg.combine_rdma_block_num,
-                        cfg.combine_warp_num_per_block,
-                    ),
-                )
-            ]
-        schedule = entry.get(dtype) or entry.get("fp8")
-        buckets = []
-        for row in schedule:
-            max_tokens = row[0]
-            geometry = lookup(
-                cfg.world_size,
-                cfg.hidden_dim,
-                cfg.num_experts_per_token,
-                max_tokens if max_tokens is not None else 1 << 30,
-                dtype=dtype,
-            )
-            buckets.append(
-                (
-                    max_tokens,
-                    self._overlay_pinned_geometry(
-                        cfg, "dispatch", geometry["dispatch"]
-                    ),
-                    self._overlay_pinned_geometry(cfg, "combine", geometry["combine"]),
-                )
-            )
-        return buckets
+    def _build_asyncll_kernels(self, cfg) -> KernelSet:
+        from mori.jit.v2 import plan_api
 
-    def _build_internode_kernels(self, cfg) -> KernelSet:
-        # One tag per leg, not one for the op: see _INTERNODE_LEG. Both keys are
-        # present -- _internode_unsupported rejected the config otherwise.
         leg_dtype = {
             "dispatch": self._INTERNODE_DTYPE[cfg.dispatch_dtype],
             "combine": self._INTERNODE_DTYPE[cfg.combine_dtype],
         }
+        block_num = cfg.dispatch_block_num
+        warp_per_block = cfg.warp_num_per_block
 
-        self._internode_buckets = self._internode_geometry_buckets(cfg)
-        self._plans = []
-        # Keyed by the geometry triple so two buckets that resolve to the same
-        # geometry share one compile -- the shipped table does exactly that for
-        # tokens 4 and 8.
-        self._internode_plans = {}
-        # Collect the passes each geometry has to serve BEFORE building any, and
-        # union them: a geometry is not owned by one phase. The shipped table
-        # gives tokens 16 the same triple for dispatch and combine, so keying on
-        # the triple alone and skipping an already-present one leaves that
-        # geometry holding only whichever phase was seen first -- a KeyError on
-        # the other phase's first launch, at run time, not build time.
-        passes_by_geometry = {}
-        for _, dispatch_geometry, combine_geometry in self._internode_buckets:
-            for geometry, names in (
-                (
-                    dispatch_geometry,
-                    ("copystaging",) + self._internode_variants("dispatch"),
-                ),
-                (
-                    combine_geometry,
-                    ("combinesync", "combinesyncbarrier")
-                    + self._internode_variants("combine")
-                    + ("combineall",),
-                ),
-            ):
-                passes_by_geometry.setdefault(geometry, set()).update(names)
-        for geometry, names in passes_by_geometry.items():
-            block, rdma, warp = geometry
-            plans_by_pass = {}
-            for pass_name in sorted(names):
-                request = self._internode_request(
-                    cfg, leg_dtype[self._INTERNODE_LEG[pass_name]], block, warp, rdma
+        plans_by_pass = {}
+        # The second value is MORI_ASYNCLL_SKIP_RESET, which no longer selects
+        # anything: main dropped the host total_recv reset it skipped (and
+        # KernelSet.self_resets_counters with it), and AsyncLL's RecvCopy
+        # always assigned the count. Still parsed so existing settings validate.
+        self._asyncll_mode, _ = self._asyncll_options(cfg, self._arch)
+        self._asyncll_fused_ctas = self._asyncll_fused_recv_ctas(
+            self._asyncll_mode, self._device_index, self._multi_processor_count
+        )
+        sequences = self._asyncll_seq(cfg, self._asyncll_mode)
+        for group, names in sequences.items():
+            for name in names:
+                request = self._asyncll_request(
+                    cfg, leg_dtype[self._asyncll_leg(group)], block_num, warp_per_block
                 )
-                plans_by_pass[pass_name] = cb.EP_INTERNODE_PLANS[pass_name](**request)
-                # Two launch arguments that never vary for THIS plan, so they
-                # belong on the plan rather than in every launch's dict:
-                #   rdmaBlockNum  a plan is compiled per geometry and lives in
-                #                 exactly one `_internode_plans[geometry]`, so the
-                #                 value a launch could pass is always geometry[1].
-                #   replayMode    this backend has no replay path (KernelSet
-                #                 carries dispatch_replay=None); it is always 0.
-                # bind() stores ints in the plan's cached struct, and _launch_buf
-                # re-writes only the per-call names and the non-int defaults --
-                # so a bound int is written once at bind time and never again,
-                # while a passed one costs a _set_arg every launch (~1.2us each,
-                # x2 args x2 launches per round).
-                plans_by_pass[pass_name].bind(rdmaBlockNum=rdma, replayMode=0)
-            self._internode_plans[geometry] = plans_by_pass
-            self._plans.extend(plans_by_pass.values())
+                plan = cb.EP_ASYNCLL_PLANS[name](**request)
+                # Neither varies for AsyncLL: there is one geometry per op, and
+                # this backend has no replay path. Bound rather than passed so the
+                # value is written into the plan's struct once instead of per
+                # launch.
+                plan.bind(rdmaBlockNum=0, replayMode=0)
+                plans_by_pass[name] = plan
+                self._plans.append(plan)
+        self._asyncll_groups = {
+            group: plan_api.make_launch_group([plans_by_pass[n] for n in names])
+            for group, names in sequences.items()
+        }
 
-        # One bound launch group per (geometry, phase, low-latency). The set of
-        # plans a launch fires is fixed by that triple, so the validation and the
-        # ctypes handle array belong here rather than on the launch path. A
-        # geometry only carries the passes it actually serves, hence the subset
-        # test -- the shipped table gives dispatch and combine the same triple at
-        # 16 tokens but different ones elsewhere.
+        # AsyncLL compiles one geometry -- its specs derive each pass's grid from
+        # mpCount and worldSize, so (block, warp) only sets the block width.
+        # resolve_schedule gives it a single entry, so each table holds that one
+        # spec and _pick returns it for every token count.
+        def table(group):
+            specs = (
+                self._dispatch_specs
+                if group.startswith("dispatch")
+                else self._combine_specs
+            )
+            fn = self._wrap_asyncll(group)
+            return {spec: fn for spec in specs}
+
+        both = {
+            "dispatch": self._wrap_asyncll("dispatch_send", "dispatch_recv"),
+            "combine": self._wrap_asyncll("combine_send", "combine_recv"),
+        }
+        return KernelSet(
+            # dispatch()/combine() stay available and simply run both halves back
+            # to back, so a caller that does not want the seam sees the ordinary
+            # API and the parity tests need no special case.
+            dispatch={spec: both["dispatch"] for spec in self._dispatch_specs},
+            combine={spec: both["combine"] for spec in self._combine_specs},
+            dispatch_send=table("dispatch_send"),
+            dispatch_recv=table("dispatch_recv"),
+            combine_send=table("combine_send"),
+            combine_recv=table("combine_recv"),
+            dispatch_replay=None,
+            stages_in_kernel=True,
+            capabilities=frozenset({"gather", "scales", "async_ll"}),
+        )
+
+    def _wrap_asyncll(self, *groups):
+        """Launch one or more AsyncLL pass groups against one filled arg struct.
+
+        Same two-field memory as _wrap_internode and for the same reason: combine
+        reads `tokenIndices` and the weights region that DISPATCH was handed, but
+        the base's combine signature carries neither.
+        """
+
+        def run(*, input, num_tokens, dest_map, **kwargs):
+            phase = "dispatch" if groups[0].startswith("dispatch") else "combine"
+            if phase == "dispatch":
+                if groups[0] == "dispatch_recv":
+                    # dispatch_recv() launches this half with only input/dest_map/
+                    # num_tokens, but its copy pass gates the weight unpack on
+                    # weightsBuf: reuse what the send half was handed, or the recv
+                    # weights view is never written.
+                    weights = getattr(self, "_asyncll_weights", None)
+                    indices = getattr(self, "_asyncll_indices", None)
+                else:
+                    weights, indices = kwargs.get("weights"), kwargs.get("indices")
+                    self._asyncll_weights = weights
+                self._asyncll_has_weights = weights is not None
+                self._asyncll_indices = indices
+                weights_ptr = 0 if weights is None else weights.data_ptr()
+                if (
+                    weights_ptr == 0
+                    and weights is not None
+                    and "dispatch_recv" in groups
+                ):
+                    # A rank with no tokens of its own (empty weights, null data_ptr)
+                    # still receives its peers' tokens, and the recv copy pass only
+                    # uses weightsBuf as the gate for unpacking their weights. Keep
+                    # it non-null; the send half reads nothing with 0 tokens.
+                    weights_ptr = self.recv_weights().data_ptr()
+            else:
+                # AsyncLL does not fold weights on combine, and says so rather
+                # than returning a zero tensor that looks like an answer.
+                #
+                # The fold the internode family does (EpCombineAll's second
+                # WarpAccum) reads the weights back out of the COMBINE staging,
+                # which carries topk floats per token alongside the hidden row.
+                # AsyncLL's combine payload is hidden-only by design -- see
+                # asyncll_regions -- so there is nothing to accumulate, and
+                # widening it would add topk*4 bytes per token to the one
+                # transfer this kernel family exists to make cheap. v1's AsyncLL
+                # makes the same trade: low_latency_async.cpp writes weights on
+                # dispatch and never on combine.
+                if kwargs.get("want_weights", False):
+                    raise NotImplementedError(
+                        "AsyncLL combine does not produce output weights: its "
+                        "combine payload carries no per-token metadata (v1's "
+                        "AsyncLL is the same). Call combine() with weights=None, "
+                        "or use a non-AsyncLL kernel family if you need the fold."
+                    )
+                weights_ptr = 0
+                indices = getattr(self, "_asyncll_indices", None)
+
+            # Only what varies; everything fixed for the op's lifetime was bound
+            # onto the plans in _alloc_internode_buffers.
+            args = dict(
+                curRankNumToken=num_tokens,
+                dispDestTokIdMap=dest_map.data_ptr(),
+                tokenIndices=0 if indices is None else indices.data_ptr(),
+                inpTokenBuf=input.data_ptr(),
+                weightsBuf=weights_ptr,
+                scalesBuf=(
+                    kwargs["scales"].data_ptr()
+                    if kwargs.get("scales") is not None
+                    else 0
+                ),
+            )
+            stream = _raw_stream(self._device_index)
+            for group in groups:
+                self._asyncll_groups[group].launch(stream, **args)
+
+        return run
+
+    def _reachable_schedule(self, cfg):
+        """Schedule rows a launch can select: those starting below the capacity."""
+        rows, lower = [], 0
+        for row in self._schedule:
+            if lower >= cfg.max_num_inp_token_per_rank:
+                break
+            rows.append(row)
+            lower = row.max_tokens if row.max_tokens is not None else lower
+        return rows
+
+    def _build_internode_kernels(self, cfg) -> KernelSet:
         from mori.jit.v2 import plan_api
 
-        self._internode_groups = {}
-        for geometry, plans_by_pass in self._internode_plans.items():
-            for sequence_key, names in self._INTERNODE_SEQ.items():
-                if all(name in plans_by_pass for name in names):
-                    self._internode_groups[(geometry, sequence_key)] = (
-                        plan_api.make_launch_group(
-                            [plans_by_pass[name] for name in names]
-                        )
+        # set_active_qps() swaps the count of whatever spec a bucket picks, so
+        # each selectable count is built for every spec.
+        specs_by_phase = {
+            phase: tuple(
+                dict.fromkeys(
+                    variant
+                    for spec in specs
+                    for variant in (
+                        spec,
+                        *(
+                            spec._replace(active_qps=count)
+                            for count in self._selectable_active_qps
+                        ),
                     )
+                )
+            )
+            for phase, specs in (
+                ("dispatch", self._dispatch_specs),
+                ("combine", self._combine_specs),
+            )
+        }
+        # Dispatch drains every QP a launch of this op can send on; buckets above
+        # the token capacity are never launched, so they do not count.
+        num_qp_to_drain = max(
+            [
+                spec.active_qps
+                for row in self._reachable_schedule(cfg)
+                for spec in (row.dispatch, row.combine)
+            ]
+            + list(self._selectable_active_qps)
+        )
+        plans = {}
+        kernels = {"dispatch": {}, "combine": {}}
+        for phase, dtype in (
+            ("dispatch", cfg.dispatch_dtype),
+            ("combine", cfg.combine_dtype),
+        ):
+            for spec in specs_by_phase[phase]:
+                request = self._internode_request(
+                    cfg,
+                    self._INTERNODE_DTYPE[dtype],
+                    spec.block_num,
+                    spec.warp_per_block,
+                    spec.rdma_block_num,
+                    spec.active_qps,
+                    num_qp_to_drain,
+                )
+                group_plans = []
+                for pass_name in self._INTERNODE_SEQ[phase, spec.family]:
+                    # Common passes share a plan across families at one geometry.
+                    # Only the ordinary combine pass compiles the load-first
+                    # gather, so only its key and request carry the flag.
+                    load_first = pass_name == "combine" and spec.load_first
+                    key = (
+                        pass_name,
+                        spec.block_num,
+                        spec.warp_per_block,
+                        spec.rdma_block_num,
+                        spec.active_qps,
+                        load_first,
+                    )
+                    if key not in plans:
+                        plan = cb.EP_INTERNODE_PLANS[pass_name](
+                            **request, combineLoadFirst=load_first
+                        )
+                        self._plans.append(plan)
+                        plan.bind(rdmaBlockNum=spec.rdma_block_num, replayMode=0)
+                        plans[key] = plan
+                    group_plans.append(plans[key])
+                group = plan_api.make_launch_group(group_plans)
+                kernels[phase][spec] = self._wrap_internode(phase, group)
 
-        dispatch_spec = (cfg.dispatch_block_num, cfg.warp_num_per_block)
-        combine_spec = (cfg.combine_block_num, cfg.combine_warp_num_per_block)
         return KernelSet(
-            dispatch={dispatch_spec: self._wrap_internode("dispatch")},
-            combine={combine_spec: self._wrap_internode("combine")},
+            dispatch=kernels["dispatch"],
+            combine=kernels["combine"],
             dispatch_replay=None,
             stages_in_kernel=True,
             capabilities=frozenset({"gather", "scales", "internode"}),
         )
 
-    def _internode_geom_for(self, phase, num_tokens):
-        """The tuned geometry for this token count. Buckets are ordered, coarsest
-        last, and a schedule with no None sentinel falls back to the last one --
-        exactly as `_pick` walks the intranode schedule."""
-        bucket = self._internode_buckets[-1]
-        for row in self._internode_buckets:
-            if row[0] is None or num_tokens <= row[0]:
-                bucket = row
-                break
-        return bucket[1] if phase == "dispatch" else bucket[2]
+    def kernel_config(self, num_tokens) -> tuning.ScheduleEntry:
+        """Selected HIP configurations for both phases, using this call's tokens.
 
-    def _wrap_internode(self, phase):
+        This reads the schedule prepared at construction: no table reload,
+        compilation or device query. Intra and inter both select from it. On
+        gfx125x, a token count within the LL128 split launches the LL128 kernels
+        instead (except a snapshot call under a push quant type), which this does
+        not report. AsyncLL reports active_qps as None; its kernels run with
+        resolve_active_qps(cfg). A set_active_qps() override replaces both
+        phases' active count.
+        """
+        selected = tuning.pick_bucket(self._schedule, num_tokens)
+        override = getattr(self, "_active_qps_override", None)
+        if override is None:
+            return selected
+        return selected._replace(
+            dispatch=selected.dispatch._replace(active_qps=override),
+            combine=selected.combine._replace(active_qps=override),
+        )
+
+    def _pick(self, num_tokens, snapshot=False):
+        split = getattr(self, "_ll128_split", None)
+        if (
+            split is not None
+            and num_tokens <= split["max_tok"]
+            and not (snapshot and self.cfg.quant_type in _PUSH_QUANT_TYPES)
+        ):
+            return _LL_SPEC, _LL_SPEC
+        selected = self.kernel_config(num_tokens)
+        return selected.dispatch, selected.combine
+
+    def _wrap_internode(self, phase, group):
         """One ABI crossing for the whole pass sequence.
 
         Every pass shares the schema and the same filled struct, so the arguments
@@ -1218,24 +1697,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """
 
         def run(*, input, num_tokens, dest_map, **kwargs):
-            use_low_latency = self._internode_use_ll(num_tokens)
-            geometry = self._internode_geom_for(phase, num_tokens)
-            group = self._internode_groups[(geometry, (phase, use_low_latency))]
-
             # Two of the kernel's arguments are set by dispatch and READ AGAIN by
             # combine, but the base only hands them to dispatch -- combine's
             # signature carries no indices and treats `weights` as a request
             # rather than an input. v1 does not notice because its handle keeps
             # both across the pair; here they have to be remembered explicitly.
             #
-            #   tokenIndices  EpCombineAll dereferences it unconditionally
+            #   tokenIndices  EpCombineAllGeneric dereferences it unconditionally
             #                 (args.tokenIndices[tokenId * topk + laneId]), so a
             #                 null is a fault, not a skipped branch.
             #   weightsBuf    it is a DIFFERENT tensor in each phase, and its
             #                 NULLNESS is the kernel's only gate on the fold. It
             #                 also sets `combXferBytes = hidden + (weights ? wt :
-            #                 0)`, but only the four combine passes index that, so
-            #                 the phases need not agree on null-ness.
+            #                 0)`, but only the combine passes index that, so the
+            #                 phases need not agree on null-ness.
             #
             # Dispatch's weightsBuf is the caller's per-input-token weights and is
             # indexed by source token id. Combine's is indexed by RECEIVED token
@@ -1270,10 +1745,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             held_indices = getattr(self, "_internode_indices", None)
             indices_ptr = 0 if held_indices is None else held_indices.data_ptr()
 
-            # Only what varies. The rest is bound on the plan; see
-            # _build_internode_kernels -- rdmaBlockNum and replayMode used to be
-            # passed here and are bound there now, since neither can differ
-            # between two launches that reach the same plan.
+            # Static pointers, rdmaBlockNum and replayMode are already bound.
             args = dict(
                 curRankNumToken=num_tokens,
                 dispDestTokIdMap=dest_map.data_ptr(),
@@ -1292,64 +1764,76 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _build_kernels(self, cfg, arena) -> KernelSet:
         bad = self._unsupported(cfg)
-        if not bad and cfg.is_internode:
-            return self._build_internode_kernels(cfg)
         if bad:
-            # Build nothing when the config is out of range: constructing a Plan
-            # compiles, and compiling a kernel we are about to reject is both
-            # slow and misleading.
             return KernelSet(dispatch={}, combine={}, unsupported=bad)
 
-        common = dict(
-            world_size=cfg.world_size,
-            max_tok_per_rank=cfg.max_num_inp_token_per_rank,
-            num_expert_per_rank=cfg.num_experts_per_rank,
-            num_expert_per_token=cfg.num_experts_per_token,
-            max_recv=cfg.effective_max_recv,
-            use_weights=True,
-            arena=arena,
-            region_names=_REGIONS,
-        )
-        # The two legs are separate Plans, so each carries its own dtype and its own
-        # element count -- which is what makes an asymmetric config (fp8/fp4 in,
-        # bf16 out) just two ordinary kernels. hiddenDim is "elements of THIS leg's
-        # dtype", so fp4 halves it: 2 e2m1 live in one transported byte.
-        disp_cfg = dict(
-            hidden_dim=cfg.hidden_dim // 2 if cfg.is_fp4 else cfg.hidden_dim,
-            dtype=cfg.dispatch_dtype,
-            # Dword-padded: the kernel copies the row as dwords, and EpCfgIsValid
-            # rejects a Cfg whose row is not a whole number of them.
-            scale_bytes=self._scale_i32(cfg) * 4,
-        )
-        comb_cfg = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
-        if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
-            comb_cfg["combine_fp4"] = True
-        if cfg.quant_type == "fp4_blockwise_fp32":
-            comb_cfg["combine_fp4_f32_scale"] = True
-        if cfg.quant_type == "fp8_blockwise":
-            comb_cfg["combine_fp8"] = True
+        self._plans = []
+        if cfg.async_ll:
+            return self._build_asyncll_kernels(cfg)
+        if cfg.is_internode:
+            return self._build_internode_kernels(cfg)
+
+        disp_req, comb_req = self._plan_requests(cfg)
+        bound = dict(arena=arena, region_names=_REGIONS)
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
-        self._plans = []
-        # The RMWs on one slot word serialize in the cco window, so there a rank's
-        # blocks add up their tokens and reserve once per destination; in TokOffExt's
-        # allocation every block reserves its own.
-        ext = int(getattr(self, "_tokoff_wanted", False))
-        for b, w in self._dispatch_specs:
-            plan = cb.EpDispatchPlan(
-                **common, **disp_cfg, block_num=b, warp_per_block=w, tok_off_ext=ext
+        for spec in self._dispatch_specs:
+            sized = []
+            for cap in self._dispatch_caps(cfg, spec):
+                plan = cb.EpDispatchPlan(
+                    **disp_req,
+                    **bound,
+                    block_num=spec.block_num,
+                    warp_per_block=spec.warp_per_block,
+                    call_tok_max=cap,
+                )
+                plan.bind(rank=cfg.rank)
+                if self.dispatch_staging is not None:
+                    plan.bind(staging_base=self.dispatch_staging)
+                self._plans.append(plan)
+                sized.append((cap, plan))
+            dispatch[spec] = self._wrap_dispatch(sized)
+        for spec in self._combine_specs:
+            plan = cb.EpCombinePlan(
+                **comb_req,
+                **bound,
+                block_num=spec.block_num,
+                warp_per_block=spec.warp_per_block,
             )
             plan.bind(rank=cfg.rank)
-            if self.dispatch_staging is not None:
-                plan.bind(staging_base=self.dispatch_staging.data_ptr())
             self._plans.append(plan)
-            dispatch[(b, w)] = self._wrap_dispatch(plan)
-        for b, w in self._combine_specs:
-            plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
+            combine[spec] = self._wrap_combine(plan)
+        push = {}
+        for spec in self._push_specs:
+            plan = cb.EpCombinePlan(
+                **comb_req,
+                **bound,
+                combine_bf16_push=True,
+                block_num=spec.block_num,
+                warp_per_block=spec.warp_per_block,
+            )
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
-            combine[(b, w)] = self._wrap_combine(plan)
+            push[spec] = self._wrap_combine(plan)
+        if push:
+            combine = {
+                spec: self._pull_or_push(run, push) for spec, run in combine.items()
+            }
+        ll = self._ll128_requests(cfg)
+        if ll is not None:
+            ll_bound = dict(arena=arena, region_names=self._ll128_split["region_names"])
+            plan = cb.EpDispatchPlan(**ll[0], **ll_bound)
+            plan.bind(rank=cfg.rank)
+            if self.dispatch_staging is not None:
+                plan.bind(staging_base=self.dispatch_staging)
+            self._plans.append(plan)
+            n = self._ll128_split["max_tok"]
+            dispatch[_LL_SPEC] = self._wrap_dispatch([(n, plan)], ll=True)
+            plan = cb.EpCombinePlan(**ll[1], **ll_bound)
+            plan.bind(rank=cfg.rank)
+            self._plans.append(plan)
+            combine[_LL_SPEC] = self._wrap_combine(plan, ll=True)
 
         return KernelSet(
             dispatch=dispatch,
@@ -1363,17 +1847,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ),
         )
 
+    def reset(self):
+        super().reset()
+        self._recv.zero_()
+        if self._ll_recv is not None:
+            self._ll_recv.zero_()
+
     def _close_backend(self):
         for plan in getattr(self, "_plans", ()):
             plan.close()
         # After the plans: they carry staging_base by value, so nothing may still be
         # able to launch when the tensor behind it goes.
         self.dispatch_staging = None
-        ext = getattr(self, "_tokoff_ext", None)
-        if ext is not None:
-            self._tokoff_ext = None
-            self.tok_off_peers = None
-            ext.close()
         # After the plans: they embed the ccoDevComm by value and their kernels
         # dereference its QPs. The static args cache the host struct's address, so
         # it goes too -- nothing may re-read it once the handle is gone.
@@ -1382,6 +1867,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._dev_comm = None
             self._internode_static_cache = None
             dev_comm.close()
+        if getattr(self, "_holds_sdma_queue_offset", False):
+            self._holds_sdma_queue_offset = False
+            _give_back_sdma_queue_offset(self._device_index, self._sdma_queue_offset)
 
     # -- views (same contract as the FlyDSL backend) -----------------------
 
@@ -1396,22 +1884,36 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         "recv_to_src_token": ("recv_to_src_token", "disp_tok_id_to_src_tok_id"),
     }
 
+    # AsyncLL overrides where it differs from the internode layout. Only one
+    # region does: the combine input needs to be somewhere peers never write.
+    # See asyncll_regions.
+    _ASYNCLL_VIEW_REGION = {"out_tok": "inter_dispatch_staging"}
+
     def _region(self, name):
         intranode, internode = self._VIEW_REGION[name]
+        # AsyncLL's arena is the internode one with different extents, so it uses
+        # the internode names even on a single node.
+        if self.cfg.async_ll:
+            return self._ASYNCLL_VIEW_REGION.get(name, internode)
         return internode if self.cfg.is_internode else intranode
 
+    def _recv_region(self, name):
+        if self._ll_last:
+            return "ll_" + name, self._ll_recv_cap
+        return self._region(name), self._recv_cap
+
     def recv_tokens(self):
-        view = self._views.get("recv_tokens")
+        key = "ll_recv_tokens" if self._ll_last else "recv_tokens"
+        view = self._views.get(key)
         if view is not None:
             return view
         # fp4 packs 2 e2m1 per element of the torch dtype -> last dim is hidden/2.
         cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
+        region, rows = self._recv_region("disp_out")
         view = from_gpu_ptr(
-            self.arena.local_ptr(self._region("disp_out")),
-            (self._recv_cap, cols),
-            self.cfg.dispatch_dtype,
+            self.arena.local_ptr(region), (rows, cols), self.cfg.dispatch_dtype
         )
-        self._views["recv_tokens"] = view
+        self._views[key] = view
         return view
 
     def combine_in_view(self):
@@ -1426,25 +1928,29 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def recv_weights(self):
-        view = self._views.get("recv_weights")
+        key = "ll_recv_weights" if self._ll_last else "recv_weights"
+        view = self._views.get(key)
         if view is None:
+            region, rows = self._recv_region("out_wts")
             view = from_gpu_ptr(
-                self.arena.local_ptr(self._region("out_wts")),
-                (self._recv_cap, self.cfg.num_experts_per_token),
+                self.arena.local_ptr(region),
+                (rows, self.cfg.num_experts_per_token),
                 torch.float32,
             )
-            self._views["recv_weights"] = view
+            self._views[key] = view
         return view
 
     def recv_indices(self):
-        view = self._views.get("recv_indices")
+        key = "ll_recv_indices" if self._ll_last else "recv_indices"
+        view = self._views.get(key)
         if view is None:
+            region, rows = self._recv_region("out_idx")
             view = from_gpu_ptr(
-                self.arena.local_ptr(self._region("out_idx")),
-                (self._recv_cap, self.cfg.num_experts_per_token),
+                self.arena.local_ptr(region),
+                (rows, self.cfg.num_experts_per_token),
                 torch.int32,
             )
-            self._views["recv_indices"] = view
+            self._views[key] = view
         return view
 
     def recv_scales(self):
@@ -1456,20 +1962,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         path, packed on the internode one. Anything reading the region by pointer
         needs that pitch, not this shape.
         """
-        view = self._views.get("recv_scales")
+        key = "ll_recv_scales" if self._ll_last else "recv_scales"
+        view = self._views.get(key)
         if view is not None:
             return view
         n_i32 = self._scale_i32(self.cfg)
         if not n_i32:
             return None
         stride_i32 = self.scale_stride_bytes() // 4
+        region, n = self._recv_region("out_scales")
         rows = from_gpu_ptr(
-            self.arena.local_ptr(self._region("out_scales")),
-            (self._recv_cap, stride_i32),
+            self.arena.local_ptr(region),
+            (n, stride_i32),
             torch.int32,
         )
         view = rows[:, :n_i32]
-        self._views["recv_scales"] = view
+        self._views[key] = view
         return view
 
     def local_expert_count(self):
@@ -1485,10 +1993,65 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     # -- ops ---------------------------------------------------------------
 
+    def set_active_qps(self, active_qps):
+        """Override the active QP count of every bucket, both phases, for the
+        launches that follow; None goes back to what each bucket resolved.
+
+        Only counts listed in cfg.active_qp_counts can be selected -- they are
+        the ones compiled for every bucket geometry. Rank-local: ranks, and the
+        dispatch and combine of one pair, may use different counts, because a
+        combine's barrier contribution does not depend on it (see
+        kCombineBarrierMarkerTotal). A captured graph keeps the plans it was
+        captured with.
+        """
+        if not self.cfg.is_internode:
+            raise ValueError("active_qps requires the internode HIP backend")
+        if active_qps is not None and (
+            type(active_qps) is not int or active_qps not in self._selectable_active_qps
+        ):
+            raise ValueError(
+                f"active_qps={active_qps!r} was not compiled; selectable counts "
+                f"are active_qp_counts={self._selectable_active_qps}"
+            )
+        self._active_qps_override = active_qps
+
     # -- kernel adapters: the ctypes plan -> the base's named convention --
 
-    def _wrap_dispatch(self, plan):
-        def run(*, input, indices, weights, scales, dest_map, num_tokens):
+    def _dispatch_caps(self, cfg, spec):
+        cap = int(cfg.max_num_inp_token_per_rank)
+        if (
+            not self._is1250
+            or not cfg.schedule
+            or cfg.world_size < 16
+            or (self._ll128_geom is not None and "dispatch" in self._ll128_geom)
+        ):
+            return [cap]
+        caps = {
+            cap if row.max_tokens is None else min(int(row.max_tokens), cap)
+            for row in self._schedule
+            if row.dispatch == spec
+        }
+        if not caps or self._schedule[-1].dispatch == spec:
+            caps.add(cap)
+        return sorted(caps)
+
+    def _wrap_dispatch(self, sized, ll=False):
+        def run(
+            *,
+            input,
+            indices,
+            weights,
+            scales,
+            dest_map,
+            num_tokens,
+        ):
+            plan = next((p for c, p in sized if num_tokens <= c), None)
+            if plan is None:
+                raise ValueError(
+                    f"dispatch of {num_tokens} tokens is past this variant's largest "
+                    f"call size {sized[-1][0]}"
+                )
+            count = self._ll_recv if ll else self._recv
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
                 token_indices=indices,
@@ -1497,24 +2060,41 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 scales_buf=scales,
                 disp_dest_tok_id_map=dest_map,
                 dest_pe_token_counter=self.dest_pe_counter,
-                # None -> 0 -> the window's offTokOff (MORI_EP_TOKOFF_EXT off)
-                tok_off_peers=getattr(self, "tok_off_peers", None),
-                total_recv_token_num=self.total_recv,
+                total_recv_token_num=count,
                 grid_barrier=self.dispatch_barrier,
                 num_tokens=num_tokens,
             )
+            self.total_recv = count
+            self._ll_last = ll
 
         return run
 
-    def _wrap_combine(self, plan):
+    def _wrap_combine(self, plan, ll=False):
         push = self.cfg.quant_type in _PUSH_QUANT_TYPES
+        src_ptr = self.arena.local_ptr(
+            "ll_recv_to_src_token" if ll else "recv_to_src_token"
+        )
+        idx_ptr = self.arena.local_ptr("ll_out_idx" if ll else "out_idx")
+        clears = ll or self._ll128_geom is not None
 
-        def run(*, input, dest_map, total_recv, num_tokens, want_weights=False):
+        def run(
+            *,
+            input,
+            dest_map,
+            total_recv,
+            num_tokens,
+            want_weights=False,
+            recv_to_src=None,
+            recv_idx=None,
+        ):
             if want_weights and push:
                 raise NotImplementedError(
                     f"quant_type={self.cfg.quant_type!r} folds no weights; call combine "
                     "with weights=None"
                 )
+            own = total_recv is self._recv or total_recv is self._ll_recv
+            if clears and not own:
+                total_recv = total_recv.clone()
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
                 inp_token_buf=input,
@@ -1527,22 +2107,64 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 grid_barrier=self.combine_barrier,
                 xdb_flag=self.cross_device_flag,
                 combine_barrier_fan=self.combine_barrier_fan,  # None on non-gfx1250 -> 0
+                recv_to_src=src_ptr if recv_to_src is None else recv_to_src.data_ptr(),
+                recv_idx=idx_ptr if recv_idx is None else recv_idx.data_ptr(),
+                num_tokens=num_tokens,
+            )
+
+        return run
+
+    def _pull_or_push(self, pull, push):
+        routes = tuple(
+            (mx, push[tuning.KernelConfig("intra", b, w)])
+            for mx, b, w in self._bf16_push
+        )
+
+        def run(
+            *,
+            input,
+            dest_map,
+            total_recv,
+            num_tokens,
+            want_weights=False,
+            recv_to_src=None,
+            recv_idx=None,
+        ):
+            if want_weights or total_recv is not self._recv:
+                return pull(
+                    input=input,
+                    dest_map=dest_map,
+                    total_recv=total_recv,
+                    num_tokens=num_tokens,
+                    want_weights=want_weights,
+                    recv_to_src=recv_to_src,
+                    recv_idx=recv_idx,
+                )
+            return tuning.pick_bucket(routes, num_tokens)[1](
+                input=input,
+                dest_map=dest_map,
+                total_recv=total_recv,
                 num_tokens=num_tokens,
             )
 
         return run
 
     def push_landing(self):
-        if self.cfg.quant_type not in _PUSH_QUANT_TYPES:
+        if self.cfg.quant_type not in _PUSH_QUANT_TYPES and not self._push_specs:
             raise ValueError(
                 f"no landing rows: quant_type {self.cfg.quant_type!r} is not a push one"
             )
         view = self._views.get("push_landing")
         if view is None:
+            info = next((i for i in self._comb_infos if "pushLandRows" in i), None)
+            if info is None:
+                raise RuntimeError(
+                    f"no landing rows: none of this op's {len(self._comb_infos)} "
+                    "combine plans reports a push landing (info['pushLandRows'])"
+                )
             view = from_gpu_ptr(
-                self.arena.local_ptr("out_tok")
-                + self._recv_cap * self.cfg.combine_token_nbytes,
-                (push_land_rows(self.cfg), push_wire_nbytes(self.cfg)),
+                self.arena.local_ptr("out_tok") + info["pushLandOff"],
+                (info["pushLandRows"], info["pushWireBytes"]),
                 torch.uint8,
             )
             self._views["push_landing"] = view

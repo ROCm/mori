@@ -18,12 +18,12 @@ else()
 endif()
 
 set(Python_EXECUTABLE ${PYTHON_EXECUTABLE})
-find_package(Python REQUIRED COMPONENTS Interpreter Development)
+# Development.Module, not Development: the modules never link libpython, and the
+# manylinux interpreters the published wheels are built with do not ship one.
+find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 
 set(PYTHON_INCLUDE_DIRS ${Python_INCLUDE_DIRS})
-set(PYTHON_LIBRARIES ${Python_LIBRARIES})
 message(STATUS "Python include dirs: ${PYTHON_INCLUDE_DIRS}")
-message(STATUS "Python libraries: ${PYTHON_LIBRARIES}")
 
 execute_process(
   COMMAND ${PYTHON_EXECUTABLE} -c
@@ -35,6 +35,11 @@ if(NOT _pybind11_result EQUAL 0)
   message(FATAL_ERROR "Failed to find pybind11 include dir")
 endif()
 message(STATUS "pybind11 include dir: ${PYBIND11_INCLUDE_DIR}")
+# Under pip's build isolation pybind11 sits in a new random /tmp/pip-build-env-*
+# on every build; a copy at a fixed path keeps the pybind sources' compile
+# commands the same from build to build, so ccache can reuse them.
+file(COPY "${PYBIND11_INCLUDE_DIR}/" DESTINATION "${CMAKE_BINARY_DIR}/_pybind11/include")
+set(PYBIND11_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_pybind11/include")
 
 # What every pybind module here shares. The rpath lets it find libmori_*.so beside it.
 function(mori_pybind_module tgt)
