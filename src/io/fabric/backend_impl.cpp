@@ -625,6 +625,7 @@ void FabricBackend::RegisterMemory(MemoryDesc& desc) {
 
   static_assert(sizeof(fh) == kFabricHandleSize, "fabric handle size mismatch");
   std::memcpy(desc.fabricHandle.data(), &fh, sizeof(fh));
+  exportedMemory_.store(true, std::memory_order_release);
 
   // The registered pointer may be a sub-allocation inside a larger fabric VMM
   // allocation (e.g. a torch tensor carved out of a MemPool segment). Record its
@@ -836,14 +837,11 @@ bool FabricBackend::PopInboundTransferStatus(EngineKey /*remote*/, TransferUniqu
 }
 
 FenceResult FabricBackend::FenceRemoteEngine(const EngineKey& remote) {
-  // Without a fabric-capable device none of our memory is exported, so no peer can reach it.
-  const bool exports = std::any_of(deviceSupportsFabric.begin(), deviceSupportsFabric.end(),
-                                   [](char supported) { return supported != 0; });
-  if (!exports) return FenceResult{};
-  {
-    // vPODs are per device, so a registered peer is treated as reachable.
-    std::lock_guard<std::mutex> lock(remoteEnginesMu);
-    if (remoteEngines.count(remote) == 0) return FenceResult{};
+  // Until a fabric handle is exported, no peer can reach our memory this way. After that any
+  // peer may hold an import, registered with this engine or not: the handle travels in the
+  // MemoryDesc, and deregistering the peer or the memory revokes neither.
+  if (remote == myEngKey || !exportedMemory_.load(std::memory_order_acquire)) {
+    return FenceResult{};
   }
   return UncutPath(remote, "fabric", "its import of our fabric handle cannot be revoked");
 }

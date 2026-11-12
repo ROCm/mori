@@ -23,6 +23,7 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -206,6 +207,9 @@ class FabricBackend : public Backend {
 
   std::unordered_map<EngineKey, EngineDesc> remoteEngines;
   mutable std::mutex remoteEnginesMu;
+  // Whether a fabric handle of our memory was ever exported, for FenceRemoteEngine: a peer's
+  // import outlives the deregistration of the memory or of the peer.
+  std::atomic<bool> exportedMemory_{false};
 
   std::string fabricCopyHsacoPath_;
   std::vector<hipModule_t> fabricCopyModules_;

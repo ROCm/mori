@@ -831,9 +831,12 @@ FenceResult XgmiBackend::FenceRemoteEngine(const EngineKey& remote) {
 void XgmiBackend::RegisterRemoteEngine(const EngineDesc& desc) {
   std::lock_guard<std::mutex> lock(remoteEnginesMu);
   remoteEngines[desc.key] = desc;
-  peerOnThisNodeSeen_[desc.key] = !myNodeId.empty() && !desc.nodeId.empty()
-                                      ? desc.nodeId == myNodeId
-                                      : desc.hostname == myHostname;
+  // Once seen on this node, always: re-registering the key from another node does not
+  // revoke a mapping the earlier incarnation may still hold.
+  bool& onThisNode = peerOnThisNodeSeen_[desc.key];
+  onThisNode =
+      onThisNode || (!myNodeId.empty() && !desc.nodeId.empty() ? desc.nodeId == myNodeId
+                                                               : desc.hostname == myHostname);
   MORI_IO_TRACE("XGMI: Registered remote engine {} hostname {}", desc.key, desc.hostname);
 }
 
@@ -848,6 +851,9 @@ void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
     MORI_IO_TRACE("XGMI: Skipping non-GPU memory registration for id={}", desc.id);
     return;
   }
+  // Reachable even if the IPC export below fails: a peer in this process falls back to the
+  // direct P2P pointer (GetRemappedAddress).
+  exportedMemory_.store(true, std::memory_order_release);
 
   // hipIpcGetMemHandle is keyed to the *base* of the underlying allocation, not
   // to an interior pointer. When `data` is a sub-region (e.g. a per-layer view
@@ -893,7 +899,6 @@ void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
 
   std::unique_lock<std::shared_mutex> lock(ipcMutex);
   localIpcHandles[desc.id] = handle;
-  exportedMemory_.store(true, std::memory_order_release);
   MORI_IO_TRACE("XGMI: Registered memory id={}, addr={}, size={}, ipcOffset={}", desc.id, desc.data,
                 desc.size, desc.ipcOffset);
 }

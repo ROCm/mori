@@ -190,8 +190,9 @@ class XgmiBackend : public Backend {
 
   std::unordered_map<EngineKey, EngineDesc> remoteEngines;
   mutable std::mutex remoteEnginesMu;
-  // For FenceRemoteEngine, which must not forget: whether this engine ever exported memory
-  // over IPC, and whether each peer it ever registered sits on this node. Deregistering a
+  // For FenceRemoteEngine, which must not forget: whether this engine ever registered GPU
+  // memory (exported over IPC, or reachable by a peer in this process through a direct
+  // pointer), and whether each peer it ever registered sat on this node. Deregistering a
   // peer or its memory does not revoke an IPC mapping the peer may still hold.
   std::atomic<bool> exportedMemory_{false};
   std::unordered_map<EngineKey, bool> peerOnThisNodeSeen_;  // guarded by remoteEnginesMu

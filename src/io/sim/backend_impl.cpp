@@ -426,9 +426,11 @@ std::optional<uint16_t> SimBackend::GetListenPort() const {
 
 void SimBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
   std::lock_guard<std::mutex> lock(peersMu_);
-  peerOnThisNodeSeen_[rdesc.key] = !self_.nodeId.empty() && !rdesc.nodeId.empty()
-                                       ? rdesc.nodeId == self_.nodeId
-                                       : rdesc.hostname == self_.hostname;
+  // As XgmiBackend: once seen on this node, always.
+  bool& onThisNode = peerOnThisNodeSeen_[rdesc.key];
+  onThisNode = onThisNode ||
+               (!self_.nodeId.empty() && !rdesc.nodeId.empty() ? rdesc.nodeId == self_.nodeId
+                                                               : rdesc.hostname == self_.hostname);
   auto& peer = peers_[rdesc.key];
   if (peer && peer->desc == rdesc) return;
   peer = std::make_shared<Peer>();
@@ -444,7 +446,8 @@ void SimBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
 void SimBackend::RegisterMemory(MemoryDesc& desc) {
   std::lock_guard<std::mutex> lock(memsMu_);
   mems_[desc.id] = desc;
-  exportedMemory_.store(true, std::memory_order_release);
+  // As XgmiBackend, which only handles GPU memory.
+  if (desc.loc == MemoryLocationType::GPU) exportedMemory_.store(true, std::memory_order_release);
 }
 
 void SimBackend::DeregisterMemory(const MemoryDesc& desc) {
