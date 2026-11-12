@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "mori/jit/v2/compiler.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace jit {
@@ -99,6 +100,13 @@ class KernelSpec {
         hipDeviceGetAttribute(&limit, hipDeviceAttributeMaxSharedMemoryPerBlock, dev) ==
             hipSuccess) {
       CheckWorkgroupLds(Derived::EntryName(cfg), staticLds, p.geom.sharedBytes, limit);
+    } else {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        MORI_WARN(mori::modules::OPS, "[jit] LDS query failed for {}; workgroup LDS check skipped",
+                  Derived::EntryName(cfg));
+      }
     }
     return p;
   }
