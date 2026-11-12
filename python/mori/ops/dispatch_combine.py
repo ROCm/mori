@@ -172,6 +172,8 @@ _FP4_COMBINE_KERNELS = frozenset(
         "EpCombineIntraNodeKernel_bf16_nop2p_fp4_blockwise_noweight_block256_vec8",
         "EpCombineIntraNodeKernel_bf16_nop2p_fp4_blockwise_noweight_block128_vec8_top9",
         "EpCombineIntraNodeKernel_bf16_nop2p_fp4_blockwise_noweight_block256_vec8_top9",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4_blockwise_noweight_block128_vec8_top6",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4_blockwise_noweight_block256_vec8_top6",
     }
 )
 
@@ -1657,47 +1659,43 @@ class EpDispatchCombineOp:
             EpDispatchCombineKernelType.IntraNodeLL.value,
         ):
             if quant_type in _BLOCKWISE_COMBINE_QUANT_TYPES:
-                # Mirror of the AccumNum=8/9 + VecBytes=8 specialization gating in
-                # LaunchCombine() / launch.cpp. top-k==9 covers shared-expert fusion
-                # (8 routed + 1 fused shared). Keep in sync.
+                # Mirror of the AccumNum + VecBytes=8 specialization gating in
+                # LaunchCombine() / launch.cpp. Keep in sync.
                 fp8_scale_dim = self._fp8_blockwise_combine_scale_dim
                 block_elems = (hidden_dim + fp8_scale_dim - 1) // fp8_scale_dim
+                is_fp4 = quant_type == EpDispatchCombineQuantType.Fp4BlockwiseQuant
+                # Registered AccumNum variants, per codec: top-8 is the unsuffixed name and
+                # the others carry their count. top-9 covers shared-expert fusion (8 routed +
+                # 1 fused shared); FP4 also carries top-6 for models routing 6 experts, which
+                # would otherwise fall off the vectorized dequant.
+                topk = self.config.num_experts_per_token
+                accum_nums = (6, 8, 9) if is_fp4 else (8, 9)
                 base_vec8_top8_eligible = (
                     weight_ptr == 0
                     and (hidden_dim % 512) == 0
-                    and self.config.num_experts_per_token in (8, 9)
+                    and topk in accum_nums
                     and self.config.world_size > 4
                 )
-                top9 = self.config.num_experts_per_token == 9
+                topk_suffix = "" if topk == 8 else f"_top{topk}"
                 # PUSH on every arch. gfx125x used to pick the _p2p symbol here so blockwise could
                 # ride the TDM tile fold, which was worth 3646.2us -> 1410.9us; that fold is gone
                 # (intranode_entry.hpp keeps quantization out of the TDM body), so the _p2p symbol
-                # no longer buys anything and cost the weightless top8/top9 vec8 kernels below,
+                # no longer buys anything and cost the weightless vec8 kernels below,
                 # which have no _p2p variant.
-                kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise"
+                # The FP4 variants share the exact launch config as the fp8_blockwise ones;
+                # only the in-kernel quant/dequant math differs.
+                codec = "fp4_blockwise" if is_fp4 else "fp8_blockwise"
+                prefix = "EpCombineIntraNodeKernel_bf16_nop2p_"
+                kernel_name = prefix + codec
                 use_vec8_top8 = False
-                if base_vec8_top8_eligible:
-                    if block_elems == 128:
-                        kernel_name = (
-                            "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block128_vec8_top9"
-                            if top9
-                            else "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block128_vec8"
-                        )
-                        use_vec8_top8 = True
-                    elif block_elems == 256:
-                        kernel_name = (
-                            "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block256_vec8_top9"
-                            if top9
-                            else "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block256_vec8"
-                        )
-                        use_vec8_top8 = True
-                # Blockwise FP4: select the packed-FP4 kernel variants (identical launch config to
-                # the fp8_blockwise variants; only the in-kernel quant/dequant math differs). Assert the
-                # derived name is a registered fp4_blockwise symbol so a naming mismatch fails loudly.
-                if quant_type == EpDispatchCombineQuantType.Fp4BlockwiseQuant:
-                    kernel_name = kernel_name.replace(
-                        "_fp8_blockwise", "_fp4_blockwise"
+                if base_vec8_top8_eligible and block_elems in (128, 256):
+                    kernel_name = (
+                        f"{prefix}{codec}_noweight_block{block_elems}_vec8{topk_suffix}"
                     )
+                    use_vec8_top8 = True
+                # Assert the derived name is a registered fp4_blockwise symbol so a naming
+                # mismatch fails loudly rather than at the launch.
+                if is_fp4:
                     assert (
                         kernel_name in _FP4_COMBINE_KERNELS
                     ), f"fp4_blockwise combine selected unregistered kernel '{kernel_name}'"
