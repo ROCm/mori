@@ -80,7 +80,8 @@ TEST(EngineDescCompat, LegacyPeerDeserializesToDefaults) {
   EXPECT_EQ(desc.key, "legacy-engine");
   EXPECT_EQ(desc.nodeId, "node-old");
   EXPECT_EQ(desc.port, 9999);
-  // New fields should default to 0 when absent from the wire.
+  // New fields should default to 0/empty when absent from the wire.
+  EXPECT_EQ(desc.ras, RasDesc{});
   EXPECT_EQ(desc.protocolVersion, 0u);
   EXPECT_EQ(desc.agentMode, 0u);
   EXPECT_EQ(desc.blockSize, 0u);
