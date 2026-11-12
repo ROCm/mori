@@ -36,6 +36,7 @@ examples/cco/**/_dump_*.py
 *.core
 .claude/*
 !.claude/skills/
+!.claude/agents/
 .codex/
 .cache/
 CMakeFiles/
