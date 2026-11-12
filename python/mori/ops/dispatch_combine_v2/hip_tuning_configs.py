@@ -584,7 +584,9 @@ class ScheduleEntry(NamedTuple):
     combine: KernelConfig
 
 
-def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
+def resolve_schedule(
+    cfg, cu_count=None, kernel_family=None
+) -> tuple[ScheduleEntry, ...]:
     """The HIP V2 schedule consumed by both construction and token selection.
 
     Intra adapts the schedule Config resolved: per phase, the IntraNodeV2 table's
@@ -617,11 +619,10 @@ def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
             for ceiling, db, dw, cb, cw in rows
         )
 
-    geometries = internode_schedule(cfg, cu_count=cu_count)
-    ceilings = [row[0] for row in geometries]
+    family = kernel_family or internode_kernel_family(cfg)
+    geometries = internode_schedule(cfg, cu_count=cu_count, kernel_family=family)
     entries = []
     for ceiling, dispatch, combine, load_first in geometries:
-        family = internode_kernel_family(cfg, _probe(ceiling, ceilings))
         entries.append(
             ScheduleEntry(
                 ceiling,
@@ -643,6 +644,21 @@ def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
             )
         )
     return tuple(entries)
+
+
+def resolve_ll_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
+    if (
+        getattr(cfg, "async_ll", False)
+        or not cfg.is_internode
+        or cfg.internode_kernel != "auto"
+    ):
+        return ()
+    rows = []
+    for row in resolve_schedule(cfg, cu_count=cu_count, kernel_family="v2_ll"):
+        rows.append(row)
+        if row.max_tokens is None or row.max_tokens >= cfg.internode_auto_ll_max_tokens:
+            break
+    return tuple(rows)
 
 
 def describe_schedule(cfg, schedule) -> str:
@@ -807,11 +823,13 @@ _INTERNODE_GEOMETRY_FIELDS = (
 )
 
 
-def internode_kernel_family(cfg, num_tokens):
-    """Resolve auto using live tokens, independently of the declared capacity."""
+def internode_kernel_family(cfg, max_tokens=None):
+    """Resolve auto from the call's max token count across ranks; v2 without one."""
     if cfg.internode_kernel != "auto":
         return cfg.internode_kernel
-    return "v2_ll" if num_tokens <= cfg.internode_auto_ll_max_tokens else "v2"
+    if max_tokens is not None and max_tokens <= cfg.internode_auto_ll_max_tokens:
+        return "v2_ll"
+    return "v2"
 
 
 def internode_kernel_families(cfg):
@@ -870,7 +888,7 @@ def _geometry_from_env(name, cfg):
     return geometry
 
 
-def internode_schedule(cfg, cu_count=None):
+def internode_schedule(cfg, cu_count=None, kernel_family=None):
     """Resolve (inclusive token ceiling, dispatch B/R/W/QPs, combine B/R/W/QPs,
     combine load-first).
 
@@ -898,8 +916,9 @@ def internode_schedule(cfg, cu_count=None):
         fitted = tuple(fit_internode_geometry(g) for g in overrides)
         return [(ceiling, *fitted, False) for ceiling in _ceilings(extra=crossover)]
 
-    tables = {
-        family: internode_buckets(
+    family = kernel_family or internode_kernel_family(cfg)
+    table = (
+        internode_buckets(
             cfg.world_size,
             cfg.hidden_dim,
             cfg.num_experts_per_token,
@@ -910,16 +929,14 @@ def internode_schedule(cfg, cu_count=None):
             cu_count=cu_count,
         )
         or []
-        for family in internode_kernel_families(cfg)
-    }
-    ceilings = _ceilings(*tables.values(), extra=crossover)
+    )
+    ceilings = _ceilings(table, extra=crossover)
 
     pinned = getattr(cfg, "_pinned_geometry", frozenset())
-    rows, families = [], []
+    rows = []
     for ceiling in ceilings:
         probe = _probe(ceiling, ceilings)
-        family = internode_kernel_family(cfg, probe)
-        tuned = pick_bucket(tables[family], probe)
+        tuned = pick_bucket(table, probe)
         geometries = []
         for index, (fields, fallback) in enumerate(
             zip(_INTERNODE_GEOMETRY_FIELDS, defaults), start=1
@@ -947,14 +964,11 @@ def internode_schedule(cfg, cu_count=None):
             bool(tuned and tuned[3]) and family == "v2" and overrides[1] is None
         )
         row = (ceiling, *geometries, load_first)
-        # Equal neighbours of one family share a bucket. A family boundary
-        # stays an edge even between equal geometries, so each bucket's family
-        # follows from its ceiling alone (resolve_schedule).
-        if rows and rows[-1][1:] == row[1:] and families[-1] == family:
+        # Equal neighbours share a bucket.
+        if rows and rows[-1][1:] == row[1:]:
             rows[-1] = row
         else:
             rows.append(row)
-            families.append(family)
     return rows
 
 

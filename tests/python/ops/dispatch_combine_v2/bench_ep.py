@@ -581,7 +581,8 @@ def main():
         dispatch accumulates into it while only combine clears it, so the next
         combine would stage twice the tokens and run past the arena.
         Returns (total_recv, buf, ok, checked)."""
-        *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+        route = dict(return_routing=True, max_num_inp_token_across_ranks=ct)
+        *_, total_t, r = op.dispatch(i_, w_, s_, x_, **route)
         lockstep()  # the reverse map is only valid after this barrier
         total = int(total_t.cpu().item())
         dispatch_bad = check_dispatch(op, total, r)
@@ -620,7 +621,7 @@ def main():
         if push_checked:
             ok = check_push_quant(out, ct) == 0
             for k in range(1, CHECK_REPEAT + 1):
-                *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                *_, total_t, r = op.dispatch(i_, w_, s_, x_, **route)
                 lockstep()
                 assert int(total_t.cpu().item()) == total, (
                     int(total_t.cpu().item()),
@@ -649,7 +650,7 @@ def main():
                 flush=True,
             )
         if land is not None:
-            *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+            *_, total_t, r = op.dispatch(i_, w_, s_, x_, **route)
             lockstep()
             assert int(total_t.cpu().item()) == total, (
                 int(total_t.cpu().item()),
@@ -1044,6 +1045,7 @@ def main():
     for ct in SWEEP:
         i_, w_, x_ = inp[:ct], wts[:ct], idx[:ct]
         s_ = scales[:ct] if SCALE_DIM else None
+        route = dict(return_routing=True, max_num_inp_token_across_ranks=ct)
         for name, op in ops.items():
             points += 1
             total, buf, ok, was_checked = prime(op, ct, i_, w_, x_, s_)
@@ -1060,7 +1062,7 @@ def main():
 
             def one_pair():
                 """A layer's two all2all legs, in order, nothing in between."""
-                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, **route)
                 op.combine(buf, routing=r)
 
             def capture_pair():
@@ -1069,7 +1071,7 @@ def main():
                 combine graph was captured against that handle."""
                 gd = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gd):
-                    *_, r_cap = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                    *_, r_cap = op.dispatch(i_, w_, s_, x_, **route)
                 lockstep()
                 gc = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gc):
@@ -1080,7 +1082,7 @@ def main():
             held = [None]  # eager's combine needs the handle its dispatch produced
 
             def eager_d():
-                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, **route)
                 held[0] = r
 
             def eager_legs():

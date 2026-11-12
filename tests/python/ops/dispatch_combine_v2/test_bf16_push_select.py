@@ -101,7 +101,13 @@ def run(cfg, comm, lim, sizes, args):
     def pair(i, how):
         x, idx, w = args[i]
         out, _, _, _, _, h = op.dispatch(
-            x, w, None, idx, return_routing=True, snapshot=how == "snapshot"
+            x,
+            w,
+            None,
+            idx,
+            return_routing=True,
+            snapshot=how == "snapshot",
+            max_num_inp_token_across_ranks=max(sizes[i]),
         )
         if how == "mixed":
             how = "in_view" if (rank + i) % 2 else "plain"
@@ -130,7 +136,7 @@ def run(cfg, comm, lim, sizes, args):
             got[how] = pair(i, how)
             sync()
             if land is not None:
-                check(f"path_{how}", bool(land.any()) == pushes(n, how, lim))
+                check(f"path_{how}", bool(land.any()) == pushes(max(ns), how, lim))
             check(
                 f"bf16_sum_{how}",
                 torch.allclose(got[how].float().cpu(), want, atol=2e-2, rtol=2e-2),

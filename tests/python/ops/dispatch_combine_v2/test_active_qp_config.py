@@ -278,8 +278,10 @@ def build(monkeypatch, cfg):
     op._active_qps_override = None
     op._multi_processor_count = 80
     op._schedule = tuning.resolve_schedule(cfg)
-    op._dispatch_specs = tuple(dict.fromkeys(e.dispatch for e in op._schedule))
-    op._combine_specs = tuple(dict.fromkeys(e.combine for e in op._schedule))
+    op._ll_schedule = tuning.resolve_ll_schedule(cfg)
+    rows = op._schedule + op._ll_schedule
+    op._dispatch_specs = tuple(dict.fromkeys(e.dispatch for e in rows))
+    op._combine_specs = tuple(dict.fromkeys(e.combine for e in rows))
     op._plans = []
     op._kernels = op._build_internode_kernels(cfg)
     return op
@@ -300,11 +302,12 @@ def test_every_launch_key_is_built(tables, monkeypatch, family, selectable):
     for override in (None, *(selectable or ())):
         op._active_qps_override = override
         for num_tokens in range(1, cfg.max_num_inp_token_per_rank + 1):
-            dispatch, combine = op._pick(num_tokens)
-            assert dispatch in op._kernels.dispatch
-            assert combine in op._kernels.combine
-            if override is not None:
-                assert dispatch.active_qps == combine.active_qps == override
+            for peak in (None, num_tokens):
+                dispatch, combine = op._pick(num_tokens, max_tokens=peak)
+                assert dispatch in op._kernels.dispatch
+                assert combine in op._kernels.combine
+                if override is not None:
+                    assert dispatch.active_qps == combine.active_qps == override
     op._active_qps_override = None
 
     # Every plan drains the op's largest active count, one op-wide value: the
@@ -313,6 +316,37 @@ def test_every_launch_key_is_built(tables, monkeypatch, family, selectable):
     assert {plan.request["numQpToDrain"] for plan in op._plans} == {expected_drain}
     # And the kernels carry each phase's own count; untuned buckets default to 2.
     assert {plan.request["numQpPerPe"] for plan in op._plans} >= {1, 4, 2}
+
+
+def test_auto_family_follows_the_peak_across_ranks(tables, monkeypatch):
+    op = build(monkeypatch, config(internode_auto_ll_max_tokens=8))
+    for num_tokens in (1, 8):
+        assert op._pick(num_tokens)[0].family == "v2"
+        assert op._pick(num_tokens, max_tokens=8)[0].family == "v2_ll"
+        assert op._pick(num_tokens, max_tokens=9)[0].family == "v2"
+    assert op.kernel_config(64, 128).dispatch.family == "v2"
+
+
+@pytest.mark.parametrize(
+    "low_latency,family", [(None, "auto"), (True, "v2_ll"), (False, "v2")]
+)
+def test_low_latency_names_the_internode_family(low_latency, family):
+    assert config(low_latency=low_latency).internode_kernel == family
+    cfg = config(low_latency=low_latency, internode_kernel=family)
+    assert cfg.internode_kernel == family
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        (dict(low_latency=True, internode_kernel="v2"), "conflicts"),
+        (dict(low_latency=False, internode_kernel="v2_ll"), "conflicts"),
+        (dict(low_latency=1), "low_latency must be"),
+    ],
+)
+def test_reject_invalid_low_latency(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        config(**kwargs)
 
 
 @pytest.mark.parametrize("capacity,expected", [(64, 2), (65, 4), (128, 4)])

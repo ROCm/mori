@@ -27,7 +27,7 @@ import torch.distributed as dist
 
 import mori.cco as cco
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
-from mori.ops.dispatch_combine_v2.hip_backend import ll128_layout
+from mori.ops.dispatch_combine_v2.hip_backend import _LL_SPEC, ll128_layout
 
 HIDDEN = 7168
 TOPK = 6
@@ -45,7 +45,7 @@ _SCALE_DTYPE = {1: torch.uint8, 4: torch.float32}
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
 
-def make_cfg(case, rank, world):
+def make_cfg(case, rank, world, low_latency=None):
     q, dt, scale_dim, scale_size = _CASES[case]
     bf16 = dt is torch.bfloat16
     return EpDispatchCombineConfig(
@@ -62,6 +62,7 @@ def make_cfg(case, rank, world):
         scale_type_size=scale_size,
         kernel_backend="hip",
         quant_type=q,
+        low_latency=low_latency,
     )
 
 
@@ -144,7 +145,9 @@ def run(case, cfg, comm, dev, lut, lim, sizes, args):
     refs = []
     for i, n in enumerate(sizes):
         x, idx, w, s = args[i]
-        out, ow, osc, oidx, total, h = op.dispatch(x, w, s, idx, return_routing=True)
+        out, ow, osc, oidx, total, h = op.dispatch(
+            x, w, s, idx, return_routing=True, max_num_inp_token_across_ranks=n
+        )
         sync()
         tot = int(total.item())
         rev = h.disp_tok_id_to_src_tok_id_local[:tot].cpu()
@@ -166,7 +169,9 @@ def run(case, cfg, comm, dev, lut, lim, sizes, args):
 
     def pair(i):
         x, idx, w, s = args[i]
-        out, _, _, _, _, h = op.dispatch(x, w, s, idx, return_routing=True)
+        out, _, _, _, _, h = op.dispatch(
+            x, w, s, idx, return_routing=True, max_num_inp_token_across_ranks=sizes[i]
+        )
         o, _ = op.combine(expert(out, lut), routing=h)
         return o.clone()
 
@@ -183,7 +188,9 @@ def run(case, cfg, comm, dev, lut, lim, sizes, args):
         so = torch.empty(n, HIDDEN, dtype=torch.bfloat16, device=dev)
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=pool):
-            out, _, _, _, _, h = op.dispatch(x, w, s, idx, return_routing=True)
+            out, _, _, _, _, h = op.dispatch(
+                x, w, s, idx, return_routing=True, max_num_inp_token_across_ranks=n
+            )
             o, _ = op.combine(expert(out, lut), routing=h)
             so.copy_(o)
         graphs[n] = (g, st, so)
@@ -208,7 +215,13 @@ def run(case, cfg, comm, dev, lut, lim, sizes, args):
         for i in (a, b):
             x, idx, w, s = args[i]
             out, _, _, _, _, h = op.dispatch(
-                x, w, s, idx, return_routing=True, snapshot=True
+                x,
+                w,
+                s,
+                idx,
+                return_routing=True,
+                snapshot=True,
+                max_num_inp_token_across_ranks=sizes[i],
             )
             check(f"snapshot_path_{side}", out.shape[0] == rows(sizes[i]))
             ins.append(expert(out, lut).clone())
@@ -226,6 +239,65 @@ def run(case, cfg, comm, dev, lut, lim, sizes, args):
             check(f"snapshot_own_reverse_map_{side}", sorted(rev.tolist()) == want)
 
     op.close()
+
+    def expect(ll, give, shape):
+        if ll is False or shape == "large":
+            return False
+        if shape == "small":
+            return give or ll is True
+        return None if ll is True and not give else False
+
+    shapes = (
+        ("small", [lim] * world),
+        ("large", [lim + 1] * world),
+        ("straddle", [lim + r % 2 for r in range(world)]),
+    )
+    for ll in (None, True, False):
+        sub = EpDispatchCombineOp(make_cfg(case, rank, world, ll), comm)
+        for give in (True, False):
+            for j, (shape, counts) in enumerate(shapes):
+                peak = max(counts) if give else None
+                tag = f"low_latency_{ll}_{'peak' if give else 'nopeak'}_{shape}"
+                want = expect(ll, give, shape)
+                picked = {sub._pick(c, False, peak)[0] == _LL_SPEC for c in counts}
+                if len(picked) > 1:
+                    check(f"{tag}_not_launched", want is None)
+                    continue
+                check(f"{tag}_agree", want is not None and picked == {want})
+                if want is None:
+                    continue
+                i, n = 1000 + j, counts[rank]
+                x, idx, w, s = (
+                    None if t is None else t.to(dev)
+                    for t in make_inputs(cfg, i, rank, n)
+                )
+                out, ow, osc, oidx, total, h = sub.dispatch(
+                    x,
+                    w,
+                    s,
+                    idx,
+                    return_routing=True,
+                    max_num_inp_token_across_ranks=peak,
+                )
+                sync()
+                tot = int(total.item())
+                rev = h.disp_tok_id_to_src_tok_id_local[:tot].cpu()
+                srcs = [make_inputs(cfg, i, src, counts[src]) for src in range(world)]
+                check(f"{tag}_path", out.shape[0] == world * (lim if want else M))
+                check(f"{tag}_reverse_map", sorted(rev.tolist()) == keys(srcs))
+                check(f"{tag}_delivery", delivered(srcs, rev, out, oidx, ow, osc))
+                o, _ = sub.combine(expert(out, lut), routing=h)
+                sync()
+                if not push:
+                    mine = srcs[rank]
+                    u = torch.zeros(n, world).scatter_(1, mine[1].long() // EPR, 1.0)
+                    want_sum = u.sum(1, keepdim=True) * mine[0].float()
+                    check(
+                        f"{tag}_bf16_sum",
+                        torch.allclose(o.float().cpu(), want_sum, atol=2e-2, rtol=2e-2),
+                    )
+        sub.close()
+
     failures = 0
     for name, ok in checks.items():
         bad = torch.tensor([0 if ok else 1], dtype=torch.int32)

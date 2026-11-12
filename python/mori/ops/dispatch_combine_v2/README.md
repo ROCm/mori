@@ -83,6 +83,36 @@ the payload pass walks the token map, the warps left without a token then send a
 of the metadata, so the token warps go straight to the payload. Geometries with at
 most 8 warps per block, such as EP4's tuned 64 × 8, keep the plain map.
 
+## Low latency
+
+`low_latency` (config field, default `None`) asks for the low-latency kernels,
+with the same name and meaning as AITER's v1 flag. `max_num_inp_token_across_ranks`
+(`dispatch` keyword, default `None`) is the largest `input.shape[0]` any rank
+passes to that call. Pass the same value on every rank: the op checks only that
+it lies between this rank's token count and `max_num_inp_token_per_rank`. The
+combine of the returned handle reuses it; `EpDispatchRoutingHandle.from_tensors`
+takes it as a keyword.
+
+| `low_latency` | `max_num_inp_token_across_ranks` | gfx125x intranode | internode |
+|---|---|---|---|
+| `True` | given | LL128 if it is `<= max_tok` | `v2_ll` |
+| `True` | `None` | LL128 if this rank's tokens are `<= max_tok` | `v2_ll` |
+| `False` | any | the schedule; no LL128 plans are built | `v2` |
+| `None` | given | LL128 if it is `<= max_tok` | `v2_ll` if it is `<= internode_auto_ll_max_tokens` |
+| `None` | `None` | LL128 only when the capacity is `<= max_tok` | `v2` |
+
+- `max_tok` is the per-rank token limit of the shape's LL128 plans
+  (`_LL128_TABLE` in `hip_tuning_configs.py`, 16 to 256). A capacity at or
+  below it runs every call on LL128, since no rank can pass more.
+- LL128 and the schedule's kernels keep separate call counters, so every rank
+  must take the same one in a call. A call whose ranks fall on both sides of
+  `max_tok` hangs. `True` without `max_num_inp_token_across_ranks` leaves that
+  to the caller.
+- Internode, `True` and `False` are `internode_kernel="v2_ll"` and `"v2"`;
+  combining either with the other family raises.
+- On GPUs without LL128 (all but gfx125x) `low_latency` does not change the
+  intranode kernels; AsyncLL stays behind `async_ll`.
+
 ## Internode config
 
 There is no kernel-type enum: the internode path is selected by
@@ -92,8 +122,8 @@ the **hip** backend implements it.
 | field | default | role |
 |---|---|---|
 | `gpu_per_node` | `None` → `world_size`, i.e. one node | GPUs per physical node; `world_size` must be a positive multiple of it. Setting it smaller is what selects the internode path. It is EP's own idea of a node and is checked against the communicator's LSA team (`lsa_size`, `lsa_rank`) at construction |
-| `internode_kernel` | `"auto"` | Which internode kernel family runs. `"v2"` = the general path (chunked, deduplicating, sized for wide tokens); `"v2_ll"` = low latency (no dedup across expert slots, one entry per node per token). They are separate JIT modules, so naming one compiles only that one and it cannot fall back; `"auto"` compiles both and chooses per launch |
-| `internode_auto_ll_max_tokens` | `512` | The `"auto"` crossover, compared against **this call's** token count (`input.shape[0]` for dispatch, `routing.cur_rank_num_token` for combine): `<=` runs `v2_ll`, `>` runs `v2`. One op therefore alternates as the batch changes. Unrelated to `max_num_inp_token_per_rank`, which is the capacity. Read only when `internode_kernel == "auto"`; must be >= 0 |
+| `internode_kernel` | `"auto"` | Which internode kernel family runs. `"v2"` = the general path (chunked, deduplicating, sized for wide tokens); `"v2_ll"` = low latency (no dedup across expert slots, one entry per node per token). They are separate JIT modules, so naming one compiles only that one and it cannot fall back; `"auto"` compiles both and chooses per launch. `low_latency` `True` / `False` sets it to `"v2_ll"` / `"v2"` ([Low latency](#low-latency)) |
+| `internode_auto_ll_max_tokens` | `512` | The `"auto"` crossover, compared against the `max_num_inp_token_across_ranks` the dispatch is given (its combine reuses it): `<=` runs `v2_ll`; `>`, or a dispatch without it, runs `v2`. One op therefore alternates as the batch changes. Unrelated to `max_num_inp_token_per_rank`, which is the capacity. Read only when `internode_kernel == "auto"`; must be >= 0 |
 | `num_qp_per_pe` | `8` | QPs **allocated** per connected peer, fixed for the DevComm's lifetime; at most 64. Unused by intranode kernels |
 | `active_qps` | `None` | Pin the **active** count -- how many of the allocated QPs a kernel sends on -- for every bucket and both phases. `None`: the tuning table's count, else `min(2, num_qp_per_pe)` |
 | `active_qp_counts` | `None` | Extra counts, e.g. `(1, 2, 4, 8)`, compiled for every bucket geometry so `op.set_active_qps()` can switch to them |
@@ -126,9 +156,10 @@ total, so a dispatch without its combine, or a second combine, leaves a peer
 waiting for a value that never comes. Complete each dispatch/combine pair
 before starting the next, and order arena reuse across streams and graph
 replays. Everything else a launch picks from its own token count may differ
-between ranks in one cycle: the family under `auto`, the geometry, the active
-count and load-first. Both families exchange the same chunk flags, node counts
-and send-slot layout and share the combine barrier.
+between ranks in one cycle: the geometry, the active count and load-first. The
+family under `auto` follows `max_num_inp_token_across_ranks`, the same on every
+rank. Both families exchange the same chunk flags, node counts and send-slot
+layout and share the combine barrier.
 
 Two further internode-only rules `__post_init__` applies: `quant_type` must be
 `"none"` (the internode combine's fp8 staging path is incomplete and returns
@@ -183,8 +214,9 @@ merge-on-save) as well as the HIP schedule and CU limits.
   (`experts_per_rank=24, topk=6`) only `num_experts=384, topk=6`. Unknown
   combinations use the default geometry; V2 has no wildcard rule. Saving needs
   both values to fill the selector. V1's legacy wildcard lookup is unchanged.
-- `InterNodeV2` and `InterNodeV2LL` have separate files. In `auto` mode the family
-  crossover is also a bucket edge, so each launch uses its own family's rules.
+- `InterNodeV2` and `InterNodeV2LL` have separate files. In `auto` mode each
+  family gets its own schedule from its own file, `v2` over every bucket and
+  `v2_ll` up to the crossover, so each launch uses its own family's rules.
 
 ### HIP V2 configuration interface
 
@@ -193,18 +225,21 @@ Both intra and inter follow the same path:
 1. `hip_tuning_configs.resolve_schedule(cfg)` returns a schedule with named
    `dispatch` and `combine` configurations. Intra adapts the schedule the config
    resolved (the `IntraNodeV2` table, else the Python tables per phase) or an
-   explicit `cfg.schedule`; inter resolves tables/overrides and the V2/LL
-   crossover.
+   explicit `cfg.schedule`; inter resolves tables/overrides for one family,
+   and under `auto` `resolve_ll_schedule(cfg)` adds the `v2_ll` buckets up to
+   the crossover.
 2. `hip_backend._build_kernels()` prepares one callable per selectable
    `KernelConfig`: one plan for intra, a fixed pass group for inter. On gfx125x
    at 16 ranks or more with a schedule (tuned or an explicit `cfg.schedule`), an
    intra dispatch `KernelConfig` instead gets one plan per bucket ceiling it
    serves, and its callable picks among them by the call's token count.
-3. `op.kernel_config(num_tokens)` selects an inclusive token bucket, and
+3. `op.kernel_config(num_tokens, max_tokens=None)` selects an inclusive token
+   bucket by `num_tokens`, from the `v2_ll` schedule when `auto` resolves
+   `max_tokens` (the dispatch's `max_num_inp_token_across_ranks`) to it, and
    dispatch and combine launch the `KernelConfig`s it returns. The exception is
    a gfx125x intranode op whose LL128 geometry covers fewer tokens than its
-   capacity: a call at or below that LL128 `max_tok` runs separate LL128 plans,
-   which `kernel_config()` does not report. A `snapshot=True` dispatch, and the
+   capacity: a call [Low latency](#low-latency) sends to LL128 runs separate
+   LL128 plans, which `kernel_config()` does not report. A `snapshot=True` dispatch, and the
    combine of its handle, with `quant_type` `fp4_blockwise`,
    `fp4_blockwise_fp32` or `fp8_blockwise` stay on the schedule's plans.
    A gfx1250 intranode op with a bf16 combine and an entry in
@@ -276,12 +311,12 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank |
 | `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
 | `test_routing_snapshot.py` | `dispatch(..., snapshot=True)` handles outlive later dispatches: combine (twice) and replay with an older handle, both backends. `torchrun --standalone --nproc_per_node=2` |
-| `test_ll128_split.py` | an op past the LL128 table's `max_tok` runs small calls on its LL128 plans and the rest on the schedule's: one call sequence crossing `max_tok` both ways, synced (delivery, reverse map, bf16 sum), back to back eager and graph-replayed, and as snapshot handles, each combine equal to the synced one bit for bit. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` |
-| `test_bf16_push_select.py` | a bf16 op with a push-table entry picks its combine per call: calls crossing LL128's `max_tok` and every push bucket edge both ways, first with one token count on every rank, then above `max_tok` with a different count on each rank. Each call passes its input as a plain tensor, from `combine_in_view()`, from `combine_in_view()` on alternate ranks only, with weights, and through a `snapshot=True` handle. Checks which combine ran (only a push lands rows in `push_landing()`; weights and snapshot handles pull), the bf16 sum, every result equal to the plain one bit for bit, and back to back eager. Under `MORI_EP_BF16_PUSH=0` it checks that no push plan is built. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` (or 8) |
+| `test_ll128_split.py` | an op past the LL128 table's `max_tok` runs calls whose `max_num_inp_token_across_ranks` is at most `max_tok` on its LL128 plans and the rest on the schedule's: one call sequence crossing `max_tok` both ways, synced (delivery, reverse map, bf16 sum), back to back eager and graph-replayed, and as snapshot handles, each combine equal to the synced one bit for bit; then calls whose ranks fall on both sides of `max_tok`, under each `low_latency`. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` |
+| `test_bf16_push_select.py` | a bf16 op with a push-table entry picks its combine per call: calls crossing LL128's `max_tok` and every push bucket edge both ways, first with one token count on every rank, then above `max_tok` with a different count on each rank, every call passing the largest as `max_num_inp_token_across_ranks`. Each call passes its input as a plain tensor, from `combine_in_view()`, from `combine_in_view()` on alternate ranks only, with weights, and through a `snapshot=True` handle. Checks which combine ran (only a push lands rows in `push_landing()`; weights and snapshot handles pull), the bf16 sum, every result equal to the plain one bit for bit, and back to back eager. Under `MORI_EP_BF16_PUSH=0` it checks that no push plan is built. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` (or 8) |
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
-| `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMB_MODE=push\|pull` (default `push`, the fp4 combine: hip backend on gfx125x only), `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR`, `ROUTE=rand\|ring\|noself`, `LATE_US` (rank 0 reaches every timed dispatch that many µs after the others) |
+| `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure. Every rank sends the point's token count and passes it as `max_num_inp_token_across_ranks`. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMB_MODE=push\|pull` (default `push`, the fp4 combine: hip backend on gfx125x only), `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR`, `ROUTE=rand\|ring\|noself`, `LATE_US` (rank 0 reaches every timed dispatch that many µs after the others) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
 

@@ -398,7 +398,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
-        lay = ll128_layout(cfg) if self._is1250 else None
+        lay = (
+            ll128_layout(cfg) if self._is1250 and cfg.low_latency is not False else None
+        )
         split = lay is not None and lay["max_tok"] < cfg.max_num_inp_token_per_rank
         self._ll128_geom = None if split else lay
         self._ll128_split = lay if split else None
@@ -428,14 +430,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._schedule = tuning.resolve_schedule(
             cfg, cu_count=self._multi_processor_count
         )
+        self._ll_schedule = tuning.resolve_ll_schedule(
+            cfg, cu_count=self._multi_processor_count
+        )
+        rows = self._schedule + self._ll_schedule
         if cfg.rank == 0 and not cfg.async_ll and logger.isEnabledFor(logging.INFO):
-            logger.info("%s", tuning.describe_schedule(cfg, self._schedule))
-        self._dispatch_specs = tuple(
-            dict.fromkeys(row.dispatch for row in self._schedule)
-        )
-        self._combine_specs = tuple(
-            dict.fromkeys(row.combine for row in self._schedule)
-        )
+            logger.info("%s", tuning.describe_schedule(cfg, rows))
+        self._dispatch_specs = tuple(dict.fromkeys(row.dispatch for row in rows))
+        self._combine_specs = tuple(dict.fromkeys(row.combine for row in rows))
         self._bf16_push = self._bf16_push_layout(cfg)
         self._push_specs = tuple(
             dict.fromkeys(
@@ -1566,12 +1568,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _reachable_schedule(self, cfg):
         """Schedule rows a launch can select: those starting below the capacity."""
-        rows, lower = [], 0
-        for row in self._schedule:
-            if lower >= cfg.max_num_inp_token_per_rank:
-                break
-            rows.append(row)
-            lower = row.max_tokens if row.max_tokens is not None else lower
+        rows = []
+        for schedule in (self._schedule, self._ll_schedule):
+            lower = 0
+            for row in schedule:
+                if lower >= cfg.max_num_inp_token_per_rank:
+                    break
+                rows.append(row)
+                lower = row.max_tokens if row.max_tokens is not None else lower
         return rows
 
     def _build_internode_kernels(self, cfg) -> KernelSet:
@@ -1657,18 +1661,24 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             capabilities=frozenset({"gather", "scales", "internode"}),
         )
 
-    def kernel_config(self, num_tokens) -> tuning.ScheduleEntry:
+    def kernel_config(self, num_tokens, max_tokens=None) -> tuning.ScheduleEntry:
         """Selected HIP configurations for both phases, using this call's tokens.
 
         This reads the schedule prepared at construction: no table reload,
         compilation or device query. Intra and inter both select from it. On
-        gfx125x, a token count within the LL128 split launches the LL128 kernels
-        instead (except a snapshot call under a push quant type), which this does
-        not report. AsyncLL reports active_qps as None; its kernels run with
-        resolve_active_qps(cfg). A set_active_qps() override replaces both
-        phases' active count.
+        gfx125x, a call the low_latency rule sends to LL128 launches the LL128
+        kernels instead (except a snapshot call under a push quant type), which
+        this does not report. AsyncLL reports active_qps as None; its kernels
+        run with resolve_active_qps(cfg). A set_active_qps() override replaces
+        both phases' active count.
         """
-        selected = tuning.pick_bucket(self._schedule, num_tokens)
+        schedule = self._schedule
+        if (
+            self._ll_schedule
+            and tuning.internode_kernel_family(self.cfg, max_tokens) == "v2_ll"
+        ):
+            schedule = self._ll_schedule
+        selected = tuning.pick_bucket(schedule, num_tokens)
         override = getattr(self, "_active_qps_override", None)
         if override is None:
             return selected
@@ -1677,15 +1687,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             combine=selected.combine._replace(active_qps=override),
         )
 
-    def _pick(self, num_tokens, snapshot=False):
+    def _pick(self, num_tokens, snapshot=False, max_tokens=None):
         split = getattr(self, "_ll128_split", None)
-        if (
-            split is not None
-            and num_tokens <= split["max_tok"]
-            and not (snapshot and self.cfg.quant_type in _PUSH_QUANT_TYPES)
+        if split is not None and not (
+            snapshot and self.cfg.quant_type in _PUSH_QUANT_TYPES
         ):
-            return _LL_SPEC, _LL_SPEC
-        selected = self.kernel_config(num_tokens)
+            bound = max_tokens
+            if bound is None and self.cfg.low_latency:
+                bound = num_tokens
+            if bound is not None and bound <= split["max_tok"]:
+                return _LL_SPEC, _LL_SPEC
+        selected = self.kernel_config(num_tokens, max_tokens)
         return selected.dispatch, selected.combine
 
     def _wrap_internode(self, phase, group):

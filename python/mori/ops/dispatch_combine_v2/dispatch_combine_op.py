@@ -168,16 +168,17 @@ class EpDispatchCombineConfig:
     #   "v2"     the general path: chunked, deduplicating, sized for wide tokens.
     #   "v2_ll"  low latency: no dedup across expert slots, one entry per node
     #            per token, which wins while the wire is not the bottleneck.
-    #   "auto"   compile BOTH and pick per launch from the token count, at
-    #            internode_auto_ll_max_tokens. This is the only mode that can switch
-    #            at runtime, and it is the only one that pays for both compiles.
+    #   "auto"   compile BOTH and pick per launch from max_num_inp_token_across_ranks,
+    #            at internode_auto_ll_max_tokens ("v2" without it). The only mode that
+    #            switches at runtime, and the only one that pays for both compiles.
     internode_kernel: str = "auto"
-    # The "auto" crossover. Compared against THIS CALL's token count -- dispatch
-    # uses input.shape[0], combine routing.cur_rank_num_token -- so one op
+    # The "auto" crossover. Compared against the max_num_inp_token_across_ranks
+    # this call's dispatch is given -- its combine reuses it -- so one op
     # alternates between the families as the batch changes; it is not a property
     # of the shape. Unrelated to max_num_inp_token_per_rank, which is the
     # capacity. Read only when internode_kernel == "auto".
     internode_auto_ll_max_tokens: int = 512
+    low_latency: bool = None
     # Which kernel backend serves this op: "flydsl" (default except on gfx125x,
     # full intranode feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
     # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
@@ -315,6 +316,20 @@ class EpDispatchCombineConfig:
                 "internode_auto_ll_max_tokens must be >= 0, got "
                 f"{self.internode_auto_ll_max_tokens}"
             )
+        if self.low_latency is not None:
+            if type(self.low_latency) is not bool:
+                raise ValueError(
+                    "low_latency must be True, False or None, got "
+                    f"{self.low_latency!r}"
+                )
+            if self.is_internode:
+                family = "v2_ll" if self.low_latency else "v2"
+                if self.internode_kernel not in ("auto", family):
+                    raise ValueError(
+                        f"low_latency={self.low_latency} conflicts with "
+                        f"internode_kernel={self.internode_kernel!r}"
+                    )
+                self.internode_kernel = family
         if self.combine_mode not in ("gather", "scatter"):
             raise ValueError(
                 f"combine_mode must be gather|scatter, got {self.combine_mode!r}"
@@ -737,6 +752,7 @@ class EpDispatchRoutingHandle:
         reverse_src_view=None,
         reverse_encode=None,
         recv_maps=None,
+        max_num_inp_token_across_ranks=None,
     ):
         self.disp_dest_tok_id_map = disp_dest_tok_id_map
         self.recv_maps = recv_maps
@@ -744,6 +760,7 @@ class EpDispatchRoutingHandle:
         self.inter_node_disp_send_map = inter_node_disp_send_map
         self.total_recv_token_num = total_recv_token_num
         self.cur_rank_num_token = cur_rank_num_token
+        self.max_num_inp_token_across_ranks = max_num_inp_token_across_ranks
         # Either an already-materialized reverse map (from_tensors round-trip) or
         # a live arena view to clone on first access (dispatch()).
         self._reverse_cache = disp_tok_id_to_src_tok_id_local
@@ -770,8 +787,14 @@ class EpDispatchRoutingHandle:
         )
 
     @classmethod
-    def from_tensors(cls, tensors, cur_rank_num_token=0):
-        return cls(*tensors, cur_rank_num_token=cur_rank_num_token)
+    def from_tensors(
+        cls, tensors, cur_rank_num_token=0, max_num_inp_token_across_ranks=None
+    ):
+        return cls(
+            *tensors,
+            cur_rank_num_token=cur_rank_num_token,
+            max_num_inp_token_across_ranks=max_num_inp_token_across_ranks,
+        )
 
 
 class EpDispatchCombineOp:
@@ -922,7 +945,7 @@ class EpDispatchCombineOp:
 
     # -- shared: variant selection -----------------------------------------
 
-    def _pick(self, num_tokens, snapshot=False):
+    def _pick(self, num_tokens, snapshot=False, max_tokens=None):
         """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
         count via the per-token schedule; falls back to the single-shot specs
         otherwise. Clamped to variants that were actually built, so the hot path
@@ -1024,6 +1047,7 @@ class EpDispatchCombineOp:
         routing=None,
         return_routing=False,
         snapshot=False,
+        max_num_inp_token_across_ranks=None,
     ):
         """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
         scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32.
@@ -1060,6 +1084,7 @@ class EpDispatchCombineOp:
                 return_routing=return_routing,
                 kernels=self._kernels.dispatch,
                 snapshot=snapshot,
+                max_num_inp_token_across_ranks=max_num_inp_token_across_ranks,
             )
 
     def _dispatch_impl(
@@ -1073,6 +1098,7 @@ class EpDispatchCombineOp:
         return_routing,
         kernels,
         snapshot=False,
+        max_num_inp_token_across_ranks=None,
     ):
         """The body of dispatch(), parameterised by which kernel table runs.
 
@@ -1113,7 +1139,13 @@ class EpDispatchCombineOp:
         cap = self.cfg.max_num_inp_token_per_rank
         if n > cap:
             raise ValueError(f"{n} tokens exceeds max_num_inp_token_per_rank={cap}")
-        disp_spec, _ = self._pick(n, snapshot)
+        peak = max_num_inp_token_across_ranks
+        if peak is not None and not n <= peak <= cap:
+            raise ValueError(
+                f"max_num_inp_token_across_ranks={peak} must be at least this "
+                f"rank's {n} tokens and at most max_num_inp_token_per_rank={cap}"
+            )
+        disp_spec, _ = self._pick(n, snapshot, peak)
 
         recv_views = None
         if routing is not None:
@@ -1179,6 +1211,7 @@ class EpDispatchCombineOp:
             reverse_src_view=reverse if recv_maps is None else recv_maps[0],
             reverse_encode=encode,
             recv_maps=recv_maps,
+            max_num_inp_token_across_ranks=peak,
         )
         return base + (handle,)
 
@@ -1205,7 +1238,9 @@ class EpDispatchCombineOp:
         _dispatch_impl."""
         ct = routing.cur_rank_num_token
         _, comb_spec = self._pick(
-            ct, routing.total_recv_token_num is not self.total_recv
+            ct,
+            routing.total_recv_token_num is not self.total_recv,
+            routing.max_num_inp_token_across_ranks,
         )
 
         if not self._kernels.stages_in_kernel and not self.cfg.enable_std_moe:
