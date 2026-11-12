@@ -341,6 +341,79 @@ def test_fence_cuts_peer_until_unfenced():
     assert pop_inbound(b, a_key, uid) is not None
 
 
+# A transfer of this many bytes stays on the simulated 45 GB/s link for about 95 ms.
+LONG = 4 << 30
+
+
+def test_fence_fails_queued_transfers_at_once():
+    a, b = make_engine("pf"), make_engine("dc")
+    connect(a, b)
+    a_mem, b_mem = gpu_mem(a, 2 * LONG), gpu_mem(b, 2 * LONG)
+    _, st = write(b, b_mem, a_mem, [LONG])
+    result = b.fence_remote_engine(a.get_engine_desc().key)
+    assert result.transfers_failed == 1
+    # Failed when the fence returns, as RdmaBackend's FailAll does, not at its deadline.
+    assert st.Failed() and "fenced" in st.Message()
+
+
+def test_fence_reaches_a_peer_deregistered_with_transfers_in_flight():
+    a, b = make_engine("pf"), make_engine("dc")
+    connect(a, b)
+    a_mem, b_mem = gpu_mem(a, 2 * LONG), gpu_mem(b, 2 * LONG)
+    _, st = write(a, a_mem, b_mem, [LONG])
+    # The transfer keeps the old registration's connection; registering again makes a new one.
+    b_desc = b.get_engine_desc()
+    a.deregister_remote_engine(b_desc)
+    a.register_remote_engine(b_desc)
+    result = a.fence_remote_engine(b_desc.key)
+    assert result.transfers_failed == 1 and result.endpoints_fenced >= 1
+    assert st.Failed() and "fenced" in st.Message()
+
+
+def test_producer_fenced_mid_session_is_not_taken_for_dead():
+    a, b = make_engine("pf"), make_engine("dc")
+    connect(a, b)
+    a_key = a.get_engine_desc().key
+    a_mem, b_mem, b_new = (
+        gpu_mem(a, 64 * MiB),
+        gpu_mem(b, 64 * MiB),
+        gpu_mem(b, 64 * MiB),
+    )
+    _, st = write(a, a_mem, b_mem, [MiB])
+    assert a.wait_all([st]) == StatusCode.SUCCESS, st.Message()
+    assert b.fence_remote_engine(a_key).ok
+    # a's first contact after the fence asks about memory it has not used yet, over the
+    # connection b cut: refused, but b is not dead.
+    _, st = write(a, a_mem, b_new, [MiB])
+    assert a.wait_all([st]) == StatusCode.ERR_RDMA_OP
+    assert "fenced" in st.Message()
+    assert b.unfence_remote_engine(a_key)
+    _, st = write(a, a_mem, b_new, [MiB])
+    assert a.wait_all([st]) == StatusCode.SUCCESS, st.Message()
+
+
+def test_transfer_on_a_cut_connection_fails_after_a_reconnect():
+    a, b = make_engine("pf"), make_engine("dc")
+    connect(a, b)
+    a_key = a.get_engine_desc().key
+    a_mem, b_mem, b_new = (
+        gpu_mem(a, 2 * LONG),
+        gpu_mem(b, 2 * LONG),
+        gpu_mem(b, 64 * MiB),
+    )
+    _, long_st = write(a, a_mem, b_mem, [LONG])
+    # b cuts a's connection and lets it back in at once; a's next transfer, to memory it has
+    # not used yet, opens a new connection while the long one is still on the link.
+    assert b.fence_remote_engine(a_key).ok
+    assert b.unfence_remote_engine(a_key)
+    _, st = write(a, a_mem, b_new, [MiB])
+    assert a.wait_all([st]) == StatusCode.SUCCESS, st.Message()
+    # The long transfer went out on the cut connection: lost with it, not completed over the
+    # new one.
+    assert a.wait_all([long_st]) == StatusCode.ERR_RDMA_OP
+    assert "connection" in long_st.Message()
+
+
 def test_fence_unsupported_without_a_network_backend():
     # XGMI has no connection a fence could cut, so it must never report the peer as cut off.
     a = make_engine("pf", backend=BackendType.XGMI)
