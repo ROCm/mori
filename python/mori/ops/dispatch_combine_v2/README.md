@@ -365,7 +365,7 @@ v2_ll's 64-71, so a CQE drain is not what is costing it.
 establishes that TDM reaches the xGMI ceiling (~1640 GB/s one-way) on 512 blocks
 where a CU vector copy needs 8192, so a transport whose whole cost is CU-issued
 peer stores looks like the case for it. Written as a global -> LDS -> peer
-double-buffered copy, following `src/ops/dispatch_combine/intranode_1250x.hpp`,
+double-buffered copy, following v1's gfx1250 kernels,
 which is where the non-obvious part comes from: a TDM store can target a PEER's
 flat address, not only local memory. Measured on an idle gfx1250 node at EP4,
 five interleaved rounds, and it is a wash or slightly negative -- combine +1.6%
