@@ -322,6 +322,15 @@ __device__ __forceinline__ int32_t EpInterNodeWaitGt(int32_t* addr, int32_t val)
   return observed;
 }
 
+// Wait until this wave's stores have completed (gfx9's vmcnt counts them; gfx12 has storecnt).
+__device__ __forceinline__ void EpInterNodeWaitStores() {
+#if defined(MORI_GFX125X) || defined(__GFX12__)
+  __asm__ volatile("s_wait_storecnt 0x0" ::: "memory");
+#else
+  __builtin_amdgcn_s_waitcnt(0);
+#endif
+}
+
 // A staged token is [hidden | indices | weights | scales], contiguous: forward it as one round of
 // 16 B loads, then the stores. Needs every part 16 B-sized and at most 8 vectors per lane.
 template <size_t kHidden, size_t kIndex, size_t kWeight, size_t kScale>
@@ -364,7 +373,7 @@ struct ForwardTokenVec16 {
 namespace internode {
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int tokenId, int expId,
-                                              int destPe, int& localPeTokenCounter) {
+                                              int destPe) {
   DEF_COMMON_VARS;
 
   index_t tokenExpertId = tokenId * config.numExpertPerToken + expId;
@@ -387,8 +396,6 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int t
     index_t flat = args.dispDestTokIdMap[tokenExpertId];
     destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
   }
-  // Skip per-PE counter in replay routing (caller's totalRecvTokenNum is already correct).
-  if (!args.replayMode && laneId == (destPe % config.gpuPerNode)) localPeTokenCounter++;
   size_t srcTokOffset = tokenId * hiddenDim;
   size_t destTokOffset = destTokId * hiddenDim;
 
@@ -428,6 +435,7 @@ inline __device__ void WaitLLPostsIssued(EpDispatchCombineArgs& args) {
     int posted = 0;
     for (int n = 0; n < nNodes; n++) posted += core::AtomicLoadRelaxed(args.blockFlagCounter + n);
     if (posted >= expected) break;
+    __builtin_amdgcn_s_sleep(16);  // these pollers are idle; keep their loads off the fabric
   }
 }
 
@@ -440,8 +448,6 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs& args) {
   int tokenPerBlock = (args.curRankNumToken + xgmiBlockNum - 1) / xgmiBlockNum;
   int startTokenIdx = (blockId - blockOffset) * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
-
-  int localPeTokenCounter = 0;
 
   for (int i = warpId; i < (endTokenIdx - startTokenIdx) * config.numExpertPerToken; i += warpNum) {
     index_t tokenId = i / config.numExpertPerToken + startTokenIdx;
@@ -471,16 +477,8 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs& args) {
           args.dispDestTokIdMap[expertOffset] = NullFlatTokenIndex(config);
         continue;
       }
-      DispatchIntraNodeBlock<kConfig, T>(args, tokenId, inTokenExpertId, destPe,
-                                         localPeTokenCounter);
+      DispatchIntraNodeBlock<kConfig, T>(args, tokenId, inTokenExpertId, destPe);
     }
-  }
-
-  if (laneId < config.gpuPerNode) {
-    int destPe = myNode * config.gpuPerNode + laneId;
-    index_t counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
-    // Wait for the add to be performed before this warp arrives in DispatchSync.
-    asm volatile("" ::"v"(counter) : "memory");
   }
 }
 
@@ -631,8 +629,14 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
             args.reg(args.offDispatchStaging), stagingTokOffset, tokenNum * xferBytes,
             args.reg(args.offChunkFlag), (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
             tokenNum + 1, proxyPe, qpId);
-        // Counted once posted: the node token signal reads it, and WaitLLPostsIssued waits on it.
-        atomicAdd(args.blockFlagCounter + i, 1);
+        // Counted once posted: WaitLLPostsIssued waits on it, and whoever posts node i's last
+        // chunk sends its token count, so no barrier over every RDMA warp is needed.
+        const int posted = atomicAdd(args.blockFlagCounter + i, 1) + 1;
+        if (posted == totalChunkNum) {
+          EpInterNodeCountSignal<kConfig.noRdmaAtomics>(
+              comm, args.reg(args.offNodeRecvTokenNum), myNode * sizeof(uint64_t),
+              static_cast<uint64_t>(posted) * warpSize + 1, proxyPe);
+        }
       }
 
       bool shouldSend = false;
@@ -648,20 +652,11 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
     }
   }
 
-  int finishedWarp = 0;
-  if (laneId == 0) finishedWarp = atomicAdd(&args.interNodeBlocksBarrier[1], 1);
-  finishedWarp = __shfl(finishedWarp, 0);
-  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
-    // Skips the local node for the same reason as DispatchInterNodeSend above.
-    if ((laneId < nNodes) && (laneId != myNode)) {
-      int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      index_t numTokenSignal =
-          core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      EpInterNodeCountSignal<kConfig.noRdmaAtomics>(comm, args.reg(args.offNodeRecvTokenNum),
-                                                    myNode * sizeof(uint64_t), numTokenSignal,
-                                                    proxyPe);
-    }
-    if (laneId == 0) args.interNodeBlocksBarrier[1] = 0;
+  // Nothing to post: the count (zero chunks) still has to reach every remote node.
+  if (totalChunkNum == 0 && globalWarpId == 0 && laneId < nNodes && laneId != myNode) {
+    int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
+    EpInterNodeCountSignal<kConfig.noRdmaAtomics>(comm, args.reg(args.offNodeRecvTokenNum),
+                                                  myNode * sizeof(uint64_t), 1, proxyPe);
   }
 }
 
@@ -675,8 +670,6 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
   uint64_t* chunkFlag = args.reg(args.offChunkFlag)->template GetAs<uint64_t*>();
   uint64_t* nodeRecvTokenNum = args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>();
   uint8_t* stagingPtr = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>();
-
-  int localPeTokenCounter = 0;
 
   for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
        bid += args.rdmaBlockNum) {
@@ -760,15 +753,6 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
         }
       }
 
-      // Per-destination-PE counter. It is owned by lane (destPe % gpuPerNode),
-      // not by the lane that took the slot, so this stays a loop.
-      if (!args.replayMode) {
-        for (int e = 0; e < config.numExpertPerToken; e++) {
-          if (!__shfl(static_cast<int>(laneValid), e)) continue;
-          if ((__shfl(lanePe, e) % config.gpuPerNode) == laneId) localPeTokenCounter++;
-        }
-      }
-
       for (int e = 0; e < config.numExpertPerToken; e++) {
         if (!__shfl(static_cast<int>(laneValid), e)) continue;
         int destPe = __shfl(lanePe, e);
@@ -792,13 +776,6 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
       }
     }
   }
-
-  if (laneId < config.gpuPerNode) {
-    int destPe = myNode * config.gpuPerNode + laneId;
-    index_t counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
-    // Wait for the add to be performed before this warp arrives in DispatchSync.
-    asm volatile("" ::"v"(counter) : "memory");
-  }
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
@@ -810,8 +787,6 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
   uint64_t* chunkFlag = args.reg(args.offChunkFlag)->template GetAs<uint64_t*>();
   uint64_t* nodeRecvTokenNum = args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>();
   uint8_t* stagingPtr = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>();
-
-  int localPeTokenCounter = 0;
 
   // Cache nodeRecvTokenNum[node]: unchanged once observed non-zero until
   // combine resets it. One scalar + tag, not a per-node array -- nodeId only
@@ -916,7 +891,6 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
           FlatTokenIndex(config, destPe, destTokId);
       args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>(destPe)[destTokId] = srcTokId;
     }
-    if ((destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
     destTokId = __shfl(destTokId, 0);
     core::WarpCopy<uint8_t, 4>(
         args.reg(args.offDispatchOut)->template GetAs<uint8_t*>(destPe) + destTokId * hiddenBytes,
@@ -934,13 +908,6 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
           stagingPtr + globalTokenId * xferBytes + hiddenBytes + indexBytes + weightBytes,
           scaleBytes);
     }
-  }
-
-  if (laneId < config.gpuPerNode) {
-    int destPe = myNode * config.gpuPerNode + laneId;
-    index_t counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
-    // Wait for the add to be performed before this warp arrives in DispatchSync.
-    asm volatile("" ::"v"(counter) : "memory");
   }
 }
 
@@ -961,7 +928,6 @@ inline __device__ void DispatchInterNodeLLRecvTok(EpDispatchCombineArgs& args) {
   uint64_t* nodeRecvTokenNum = args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>();
   uint8_t* stagingPtr = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>();
 
-  int localPeTokenCounter = 0;
   // nodeRecvTokenNum[node] as in DispatchInterNodeLLRecv: one cached node at a time.
   int cachedNode = -1;
   uint64_t cachedNodeFlag = 0;
@@ -991,6 +957,7 @@ inline __device__ void DispatchInterNodeLLRecvTok(EpDispatchCombineArgs& args) {
         if (thisChunkTokenNum > 0) break;
         if (cachedNodeFlag == 0)
           cachedNodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
+        __builtin_amdgcn_s_sleep(4);  // most of the warps wait here; space out their loads
       }
     }
     thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
@@ -1043,20 +1010,12 @@ inline __device__ void DispatchInterNodeLLRecvTok(EpDispatchCombineArgs& args) {
       reps &= reps - 1;
       const int destPe = __shfl(lanePe, j);
       const int dt = __shfl(destTokId, j);
-      if (laneId == destPe % config.gpuPerNode) localPeTokenCounter++;
       fwd.Store(args.reg(args.offDispatchOut)->template GetAs<uint8_t*>(destPe) + dt * kH,
                 args.reg(args.offOutIndices)->template GetAs<uint8_t*>(destPe) + dt * kI,
                 args.reg(args.offDispatchOutWeights)->template GetAs<uint8_t*>(destPe) + dt * kW,
                 kS > 0 ? args.reg(args.offOutScales)->template GetAs<uint8_t*>(destPe) + dt * kS
                        : nullptr);
     }
-  }
-
-  if (laneId < config.gpuPerNode) {
-    int destPe = myNode * config.gpuPerNode + laneId;
-    index_t counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
-    // Wait for the add to be performed before this warp arrives in DispatchSync.
-    asm volatile("" ::"v"(counter) : "memory");
   }
 }
 
@@ -1065,39 +1024,40 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
                                     const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
 
-  int nodePeOffset = myNode * config.gpuPerNode;
-  // The last warp reads each destPeTokenCounter total as soon as every warp has arrived, so each
-  // warp's add must be performed before it arrives. The add sites wait for the atomic's returned
-  // value, which orders it without the L2 writeback and invalidate of a __threadfence(); the
-  // counter is a device-scope atomic, so it is coherent across XCDs once performed.
-  int finishedWarp = 0;
-  if (laneId == 0) finishedWarp = atomicAdd(args.dispatchGridBarrier, 1);
-  finishedWarp = __shfl(finishedWarp, 0);
-  if ((finishedWarp + 1) == globalWarpNum) {
-    if (laneId < config.gpuPerNode) {
-      int destPe = myNode * config.gpuPerNode + laneId;
-      index_t numTokenSignal = core::AtomicLoadSeqCstSystem(args.destPeTokenCounter + destPe) + 1;
-      index_t* signal = args.reg(args.offRecvTokenNum)->template GetAs<index_t*>(destPe) + myPe;
-      core::AtomicStoreSeqCstSystem(signal, numTokenSignal);
-    }
-    if (laneId == 0)
-      __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
-    index_t* recvTokenNums = args.reg(args.offRecvTokenNum)->template GetAs<index_t*>();
-    for (int destPe = nodePeOffset + laneId; destPe < (nodePeOffset + config.gpuPerNode);
-         destPe += warpSize) {
-      index_t* signal = recvTokenNums + destPe;
-      index_t recvTokenNum = EpInterNodeWaitGt(signal, 0) - 1;
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-      __threadfence_system();
-      // reset local counter
-      core::AtomicStoreSeqCstSystem(signal, 0);
-      core::AtomicStoreSeqCstSystem(args.destPeTokenCounter + destPe, 0);
-    }
-
-    if (laneId == 0) {
-      args.reg(args.offDispTokOffset)->template GetAs<index_t*>()[0] = 0;
-      atomicAdd(args.crossDeviceBarrierFlag, 1);
+  // Senders take slots with atomics on the destination's dispTokOffset, so once every local PE
+  // is done a PE's own counter is its received total. A warp's slot atomics have returned and
+  // its forwarded stores complete here, before its block's one arrival; completed means visible
+  // at the peer because the window is uncached.
+  EpInterNodeWaitStores();
+  __syncthreads();
+  if (warpId == 0) {
+    int finishedBlock = 0;
+    if (laneId == 0) finishedBlock = atomicAdd(args.dispatchGridBarrier, 1);
+    finishedBlock = __shfl(finishedBlock, 0);
+    if ((finishedBlock + 1) == blockNum) {
+      const int nodePeOffset = myNode * config.gpuPerNode;
+      index_t* doneFlags = args.reg(args.offRecvTokenNum)->template GetAs<index_t*>();
+      if (laneId < config.gpuPerNode) {
+        __hip_atomic_store(
+            args.reg(args.offRecvTokenNum)->template GetAs<index_t*>(nodePeOffset + laneId) + myPe,
+            index_t{1}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+      if (laneId == 0)
+        __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+      if (laneId < config.gpuPerNode) {
+        index_t* done = doneFlags + nodePeOffset + laneId;
+        EpInterNodeWaitGt(done, 0);
+        __hip_atomic_store(done, index_t{0}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+      // Read after every local PE said it is done (the wave reconverges past the waits).
+      if (laneId == 0) {
+        index_t* slots = args.reg(args.offDispTokOffset)->template GetAs<index_t*>();
+        args.totalRecvTokenNum[0] =
+            __hip_atomic_load(slots, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(slots, index_t{0}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        atomicAdd(args.crossDeviceBarrierFlag, 1);
+      }
     }
   }
 
@@ -1133,7 +1093,6 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
 
-  if (globalThdId == 0) args.totalRecvTokenNum[0] = 0;
   if (args.curRankNumToken == 0) return;
 
   MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
