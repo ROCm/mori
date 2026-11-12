@@ -223,20 +223,30 @@ struct Buffer {
   MemoryDesc desc;
 };
 
-// Writes `src` (owned by `from`) into `dst` (owned by another engine) and waits.
-// Returns false if the write did not complete successfully within the timeout.
+// Waits for `status`. A transfer still running at the timeout ends the run: unwinding would
+// free its status, and the buffers the NIC may still use, under it.
+void WaitOrStop(TransferStatus* status, int timeoutMs) {
+  if (WaitTerminal(status, timeoutMs)) return;
+  printf("FATAL: a transfer was still running after %d ms; stopping\n", timeoutMs);
+  fflush(stdout);
+  std::abort();
+}
+
+// Writes `src` (owned by `from`) into `dst` (owned by another engine), waits, and returns
+// whether the write succeeded.
 bool WriteAndWait(IOEngine* from, const Buffer& src, const Buffer& dst,
                   int timeoutMs = kTransferTimeoutMs) {
   TransferStatus status;
   from->Write(src.desc, 0, dst.desc, 0, kBufSize, &status, from->AllocateTransferUniqueId());
-  if (!WaitTerminal(&status, timeoutMs)) return false;
+  WaitOrStop(&status, timeoutMs);
   return status.Succeeded();
 }
 
-// True if the write threw or did not succeed: what a refused connection looks like.
+// True if the write threw or did not succeed: what a refused connection looks like. Waits out
+// the NIC's retry budget, since a write on a cut connection ends only when that runs out.
 bool WriteRefused(IOEngine* from, const Buffer& src, const Buffer& dst) {
   try {
-    return !WriteAndWait(from, src, dst, 15000);
+    return !WriteAndWait(from, src, dst, kStaleWriteTimeoutMs);
   } catch (const std::exception&) {
     return true;
   }
@@ -248,7 +258,8 @@ bool WriteEventually(IOEngine* from, const Buffer& src, const Buffer& dst, int b
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
   do {
     try {
-      if (WriteAndWait(from, src, dst)) return true;
+      // An attempt on a connection that is already dead ends only when the NIC's retries do.
+      if (WriteAndWait(from, src, dst, kStaleWriteTimeoutMs)) return true;
     } catch (const std::exception&) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -441,7 +452,8 @@ void TestFenceForgetsInboundNotifications(Rig& rig) {
   const TransferUniqueId id = rig.producer->AllocateTransferUniqueId();
   TransferStatus status;
   rig.producer->Write(src.desc, 0, dst.desc, 0, kBufSize, &status, id);
-  CHECK(WaitTerminal(&status, kTransferTimeoutMs) && status.Succeeded(), "write must succeed");
+  WaitOrStop(&status, kTransferTimeoutMs);
+  CHECK(status.Succeeded(), "write must succeed");
 
   // The notification follows the data; wait until the receiver has counted it.
   TransferStatus inbound;

@@ -46,6 +46,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -265,16 +266,21 @@ struct Buffer {
       memset(data, v, kBufBytes);
     }
   }
-  // One flag per slot: did anything land in it?
-  std::vector<bool> Landed() const {
+  std::vector<uint8_t> Snapshot() const {
     std::vector<uint8_t> h(kBufBytes);
     if (gpu)
       HIP_OK(hipMemcpy(h.data(), data, kBufBytes, hipMemcpyDeviceToHost));
     else
       memcpy(h.data(), data, kBufBytes);
+    return h;
+  }
+  // One flag per slot: did anything land in it?
+  std::vector<bool> Landed() const {
+    std::vector<uint8_t> h = Snapshot();
     std::vector<bool> out(kSlots);
     for (int s = 0; s < kSlots; ++s) {
-      out[s] = h[s * kSlotBytes] != 0 || h[(s + 1) * kSlotBytes - 1] != 0;
+      out[s] = std::any_of(h.begin() + s * kSlotBytes, h.begin() + (s + 1) * kSlotBytes,
+                           [](uint8_t b) { return b != 0; });
     }
     return out;
   }
@@ -348,8 +354,8 @@ int RunReceiver(const Args& a) {
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
   FenceResult fence = engine->FenceRemoteEngine(kProducerKey);
-  std::vector<bool> atFence = buf.Landed();
-  const int nAtFence = Count(atFence);
+  const std::vector<uint8_t> atFence = buf.Snapshot();
+  const int nAtFence = Count(buf.Landed());
   std::printf("  fence: ok=%d fenced=%d failed=%d transfers_failed=%d, %d/%d slots had landed\n",
               fence.Ok(), fence.endpointsFenced, fence.endpointsFailed, fence.transfersFailed,
               nAtFence, kSlots - 1);
@@ -357,15 +363,25 @@ int RunReceiver(const Args& a) {
 
   std::string streamDone = ch->Expect("STREAM_DONE");
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  std::vector<bool> finalState = buf.Landed();
-  int latecomers = 0;
-  for (int s = 0; s < kSlots; ++s) latecomers += (finalState[s] && !atFence[s]);
+  // Every byte, not a flag per slot: a slot partly written when the fence returned, or a
+  // late write that changes only interior bytes, must count too.
+  const std::vector<uint8_t> finalState = buf.Snapshot();
+  int lateSlots = 0;
+  size_t lateBytes = 0;
+  for (int s = 0; s < kSlots; ++s) {
+    size_t changed = 0;
+    for (size_t i = s * kSlotBytes; i < (s + 1) * kSlotBytes; ++i) {
+      changed += finalState[i] != atFence[i];
+    }
+    lateSlots += changed != 0;
+    lateBytes += changed;
+  }
   verdict(fence.Ok() && fence.endpointsFenced >= 1, "B. fence reported ok and cut the connection");
   verdict(nAtFence < kSlots - 1,
           "B. the fence landed mid-stream (the stream was not already over)");
-  verdict(latecomers == 0, "B. nothing landed after the fence returned (" +
-                               std::to_string(latecomers) +
-                               " late slots); producer saw: " + streamDone);
+  verdict(lateBytes == 0, "B. nothing landed after the fence returned (" +
+                              std::to_string(lateBytes) + " late bytes in " +
+                              std::to_string(lateSlots) + " slots); producer saw: " + streamDone);
 
   // C. The producer is still alive. Once the receiver lets it back in, its writes have
   // to notice its dead connection, rebuild through the normal handshake, and land.
@@ -424,14 +440,13 @@ int RunProducer(const Args& a) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kStreamGapMs));
   }
-  int ok = 0, bad = 0, hung = 0;
+  int ok = 0, bad = 0;
   std::string firstErr;
   for (auto& st : sts) {
     if (st->Init()) continue;  // never posted: the write threw
-    if (!WaitTerminal(st.get(), 90000)) {
-      ++hung;
-      continue;
-    }
+    // Going on would refill `src` under a write the NIC may still be reading, and free the
+    // statuses it would still complete.
+    if (!WaitTerminal(st.get(), 90000)) Die("a stream write was still running after 90 s");
     if (st->Succeeded()) {
       ++ok;
     } else {
@@ -440,8 +455,8 @@ int RunProducer(const Args& a) {
     }
   }
   ch->Expect("FENCED", 5000);  // already sent long ago; keeps the two sides in step
-  ch->Send("STREAM_DONE ok=" + std::to_string(ok) + " failed=" + std::to_string(bad) + " refused=" +
-           std::to_string(refused) + " hung=" + std::to_string(hung) + " [" + firstErr + "]");
+  ch->Send("STREAM_DONE ok=" + std::to_string(ok) + " failed=" + std::to_string(bad) +
+           " refused=" + std::to_string(refused) + " [" + firstErr + "]");
 
   // C. new writes from the same, still-running producer, retried like a connector
   // retrying the request.
@@ -456,11 +471,8 @@ int RunProducer(const Args& a) {
     auto st = std::make_unique<TransferStatus>();
     try {
       write(0, st.get());
-      if (!WaitTerminal(st.get(), 30000)) {
-        outcome = "no completion in 30s";
-        (void)st.release();  // the NIC may still complete it
-        break;
-      }
+      // Likewise: returning would free `src` under it.
+      if (!WaitTerminal(st.get(), 30000)) Die("a retried write was still running after 30 s");
       if (st->Succeeded()) {
         outcome = "succeeded";
         break;
