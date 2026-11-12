@@ -261,6 +261,8 @@ class RdmaDeviceContext {
     assert(false && "not implemented");
   }
   virtual bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept;
+  // Whether DestroyRdmaEndpointNoThrow releases an endpoint before context teardown.
+  virtual bool SupportsEndpointDestroy() const { return false; }
 
   ibv_srq* CreateRdmaSrqIfNx(const RdmaEndpointConfig&);
 
