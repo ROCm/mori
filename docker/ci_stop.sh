@@ -26,9 +26,24 @@ echo "=== [ci_stop] gracefully stopping '$CONTAINER' ==="
 "$CT" exec "$CONTAINER" bash -c '
   pkill -INT -f "mpirun|orted|torchrun|[[:space:]]python[0-9.]*[[:space:]]|/build/tests/|/build/examples/|/build/benchmark/|pytest" 2>/dev/null || true
 ' 2>/dev/null || true
-sleep 5
+# Wait for the interrupted workload to exit, then stop.
+# Zombies (stat Z) do not count: without --init nothing reaps them.
+deadline=$((SECONDS + STOP_TIMEOUT))
+left=1
+while [ "$SECONDS" -lt "$deadline" ]; do
+  left=$(timeout 10 "$CT" exec "$CONTAINER" ps -eo pid=,stat=,args= 2>/dev/null |
+    awk '$1 != 1 && $2 !~ /^Z/ && !/sleep infinity/ && !/ps -eo/' | wc -l)
+  [ "${left:-0}" -eq 0 ] && break
+  sleep 1
+done
 
-"$CT" stop --timeout "$STOP_TIMEOUT" "$CONTAINER" 2>/dev/null || true
+# With the workload gone only sleep infinity is left, and without --init it is
+# PID 1, which ignores SIGTERM: a stop would wait out its whole timeout.
+if [ "${left:-0}" -eq 0 ]; then
+  "$CT" kill "$CONTAINER" >/dev/null 2>&1 || true
+else
+  "$CT" stop --timeout 5 "$CONTAINER" 2>/dev/null || true
+fi
 "$CT" rm -f "$CONTAINER" 2>/dev/null || true
 
 echo "=== [ci_stop] teardown of '$CONTAINER' complete ==="

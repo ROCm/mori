@@ -36,6 +36,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/ras/ras.hpp"
 #include "mori/utils/host_utils.hpp"
 #include "src/io/call_diagnostics_internal.hpp"
 #include "src/io/fabric/backend_impl.hpp"
@@ -183,10 +184,20 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.host = config.host;
   desc.port = config.port;
   desc.pid = static_cast<int>(getpid());
+  // RAS starts with the process's first engine. Built out, disabled, or failed to start, it
+  // returns nullptr and the engine advertises no RAS endpoint.
+  if (ras::RasRuntime* rt =
+          ras::RasRuntime::EnsureStarted({desc.nodeId, desc.hostname, desc.host, desc.pid})) {
+    ras::RasEndpoint ep = rt->Endpoint();
+    desc.ras = RasDesc{ep.host, ep.port, ep.token, ep.uuid.hi, ep.uuid.lo};
+    rt->Enqueue(ras::EngineRegistered{desc.key});
+  }
   MORI_IO_INFO("Create engine key {} node_id {} hostname {}", key, desc.nodeId, hostname);
 }
 
-IOEngine::~IOEngine() {}
+IOEngine::~IOEngine() {
+  if (ras::RasRuntime* rt = ras::RasRuntime::Get()) rt->Enqueue(ras::EngineUnregistered{desc.key});
+}
 
 void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
   if (sim::IsEnabled()) {

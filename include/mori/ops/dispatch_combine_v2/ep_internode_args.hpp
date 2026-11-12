@@ -125,19 +125,19 @@ struct EpInterNodeRegion {
 // Geometry is deliberately NOT here. blockNum and warpNumPerBlock come from
 // gridDim/blockDim, and rdmaBlockNum is a per-launch field of the args below --
 // not for tidiness, but because dispatch and combine are tuned to DIFFERENT
-// values for the same op (internode_tuning_configs: at 8 tokens dispatch runs
-// rdma=32/warp=8 while combine runs rdma=21/warp=6, and the table comment
-// records that the coupling is deliberate). Folding geometry into the config,
-// and thus later into the NTTP, would give the two phases disagreeing configs
-// over one shared arena.
+// values for the same op (the MI308X InterNodeV2 table, 256/8 hidden 7168 bf16:
+// at 8 tokens dispatch runs rdma=24/warp=4 while combine runs rdma=10/warp=8).
+// Folding geometry into the config, and thus later into the NTTP, would give the
+// two phases disagreeing configs over one shared arena.
 // ---------------------------------------------------------------------------
 struct EpInterNodeDeviceCfg {
-  // No `rank`. Every field here is a compiled-in shape constant, so the whole
-  // struct is constexpr and each read folds to a literal. Carrying the rank
-  // would make it a runtime object the compiler has to keep live in scalar
-  // registers across every inlined helper -- measured as dispatch_ll's SGPR
-  // spill count going 1 -> 15 against the pre-refactor kernel. The rank is
-  // `myPe` in DEF_COMMON_VARS, straight off args.
+  // No `rank`. Every field here is a compiled-in constant (the shape plus the
+  // active QP count numQpPerPe), so the whole struct is constexpr and each read
+  // folds to a literal. Carrying the rank would make it a runtime object the
+  // compiler has to keep live in scalar registers across every inlined
+  // helper -- measured as dispatch_ll's SGPR spill count going 1 -> 15 against
+  // the pre-refactor kernel. The rank is `myPe` in DEF_COMMON_VARS, straight
+  // off args.
   int worldSize{8};
   int hiddenDim{4096};
   int scaleDim{0};
@@ -265,6 +265,7 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(rdmaBlockNum, "i32")                 \
   X(replayMode, "i32")                   \
   X(curRankNumToken, "i32")              \
+  X(sdmaQueueOffset, "i32")              \
   X(tokenIndices, "p")                   \
   X(inpTokenBuf, "p")                    \
   X(weightsBuf, "p")                     \
@@ -332,6 +333,9 @@ struct EpInterNodeArgs {
   // the binding computes.
   int32_t replayMode{0};
   int32_t curRankNumToken{0};
+  // AsyncLL/SDMA: per-op offset added to the destination PE when picking its SDMA
+  // queue (asyncll::QueueForPe). Fills the alignment gap, so no field moves.
+  int32_t sdmaQueueOffset{0};
 
   ep_index_t* tokenIndices{nullptr};
   // void*, like the intranode EpArgs: callers cast at the use site. Keeping it
@@ -387,7 +391,7 @@ constexpr bool EpInterNodeArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpInterNodeArgsFieldCount == 40,
+static_assert(detail::kEpInterNodeArgsFieldCount == 41,
               "added an EpInterNodeArgs field -- add it to MORI_EP_INTERNODE_ARGS_FIELDS in "
               "the same position and bump this count");
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),

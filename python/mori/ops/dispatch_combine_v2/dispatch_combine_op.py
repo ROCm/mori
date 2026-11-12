@@ -24,8 +24,8 @@
 Two backends live beside this module -- FlyDSL (``flydsl_backend``) and HIP/JIT
 (``hip_backend``) -- behind one class. ``EpDispatchCombineOp(cfg, comm)`` returns
 whichever ``cfg.kernel_backend`` (or ``MORI_V2_KERNEL_BACKEND``) names, defaulting
-to flydsl; ``EpDispatchCombineOpHip(cfg, comm)`` is the explicit form, and
-``isinstance(op, EpDispatchCombineOp)`` holds either way.
+to hip on gfx125x and flydsl elsewhere; ``EpDispatchCombineOpHip(cfg, comm)`` is
+the explicit form, and ``isinstance(op, EpDispatchCombineOp)`` holds either way.
 
 Neither backend is imported here. Selecting one imports only that one, so the HIP
 backend works on a machine with no flydsl.
@@ -41,9 +41,10 @@ A subclass supplies four hooks -- two with no default, two with one::
 That is the HIP backend's route. The FlyDSL one overrides ``__init__`` and builds
 its own arena and KernelSet there, so ``_unsupported`` is the only hook it defines.
 
-Everything else -- arena, scratch buffers, variant selection, lifecycle -- is here.
-Behavioural differences between the backends are *data* on the KernelSet, not
-methods to override, after aiter's ``MOEMetadata``.
+The shared dispatch/combine body and lifecycle live here. HIP overrides _pick()
+to select its KernelConfig keys; the default selector serves FlyDSL's B/W keys.
+KernelSet flags describe in-kernel staging, optional capabilities and why a config
+cannot be served.
 """
 
 from __future__ import annotations
@@ -66,9 +67,13 @@ _BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
 
 
 def _default_backend() -> str:
-    from mori.ops.dispatch_combine import _is_gfx125x
+    try:
+        from mori.jit.core import _FASTPATH_ARCH_PREFIX, _target_arch
 
-    return "hip" if _is_gfx125x() else "flydsl"
+        gfx125x = _target_arch().startswith(_FASTPATH_ARCH_PREFIX)
+    except Exception:
+        gfx125x = False
+    return "hip" if gfx125x else "flydsl"
 
 
 _FP4_QUANT_TYPES = ("fp4_blockwise", "fp4_blockwise_fp32")
@@ -115,8 +120,10 @@ class EpDispatchCombineConfig:
     # Pinning is per FIELD, not all-or-nothing: on the internode path a pinned
     # field overrides the tuning table for every token bucket while the fields
     # left None stay tuned, so you can fix one knob without hand-writing the
-    # other five. MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM override the whole triple
-    # for a leg and bypass the table entirely.
+    # other five. MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM override a leg's whole
+    # geometry in every bucket, table and pinned fields included: block,rdma,warp,
+    # plus an optional fourth field for the active QP count that also beats
+    # active_qps.
     dispatch_block_num: int = None
     combine_block_num: int = None
     warp_num_per_block: int = None
@@ -135,16 +142,23 @@ class EpDispatchCombineConfig:
     # and must agree with the communicator's LSA team, which the op checks at
     # construction rather than assuming.
     gpu_per_node: int = None
-    # QPs per peer on the RDMA leg. Only read on the internode path, where 1
-    # starves it (~1.5x); the intranode path never reaches RDMA and ignores it,
-    # so the default is the value the only consumer wants.
-    num_qp_per_pe: int = 2
+    # Allocated QPs per peer on the RDMA leg, fixed for this op's lifetime.
+    # The intranode path does not use QPs. How many a kernel sends on -- the
+    # active count, a compile-time constant of each kernel -- is chosen per
+    # phase and per token bucket by the tuning table, within this allocation.
+    num_qp_per_pe: int = 8
+    # Pin the active count for every bucket and both phases, over the table.
+    # None: the table's count, else min(2, num_qp_per_pe).
+    active_qps: int = None
+    # Extra active counts compiled for every bucket geometry, so that
+    # op.set_active_qps() can switch to any of them without compiling.
+    active_qp_counts: tuple = None
     # Widest transported element, which is what sizes the staging buffers. None
     # => max over the two legs, which is what the buffers actually have to hold.
     max_token_type_size: int = None
     # RDMA-block split of the grid, per phase. Runtime, never compiled in:
     # dispatch and combine are deliberately tuned to DIFFERENT values (see
-    # internode_tuning_configs), so one compiled-in value cannot serve both.
+    # hip_tuning_configs), so one compiled-in value cannot serve both.
     # Pinnable like the block/warp fields above, and clamped to < block_num.
     dispatch_rdma_block_num: int = None
     combine_rdma_block_num: int = None
@@ -164,8 +178,8 @@ class EpDispatchCombineConfig:
     # of the shape. Unrelated to max_num_inp_token_per_rank, which is the
     # capacity. Read only when internode_kernel == "auto".
     internode_auto_ll_max_tokens: int = 512
-    # Which kernel backend serves this op: "flydsl" (default, full intranode
-    # feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
+    # Which kernel backend serves this op: "flydsl" (default except on gfx125x,
+    # full intranode feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
     # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
     # in bf16/fp32). "hip" is the only backend with an internode path -- flydsl's
     # _unsupported rejects any config whose gpu_per_node < world_size -- so a
@@ -214,6 +228,12 @@ class EpDispatchCombineConfig:
     # Pick "lsa" for a small-batch, empty-seam call; keep "sdma" otherwise, when
     # the point is the overlap, or when this op will later run across nodes.
     async_ll_transport: str = "sdma"
+    # Give this op its own SDMA queue per peer instead of the shared one (sdma
+    # transport only). Set it when two ops interleave on one stream, e.g.
+    # single-stream two-batch overlap: a recv then no longer waits for the other
+    # op's send. With the ops on separate streams, a two-op microbenchmark is
+    # slower but DeepSeek-V4 prefill was still faster, so measure that case.
+    async_ll_own_sdma_queue: bool = False
 
     def __post_init__(self):
         # Node grouping first: is_internode gates checks further down, and the
@@ -227,8 +247,38 @@ class EpDispatchCombineConfig:
                 "node * gpu_per_node + local rank and a partial node has no such "
                 "encoding"
             )
-        if self.num_qp_per_pe < 1:
-            raise ValueError(f"num_qp_per_pe must be >= 1, got {self.num_qp_per_pe}")
+        # 64 is kCombineBarrierMarkerTotal (ep_internode_cfg.hpp): QP 0 carries
+        # the remainder of that fixed per-combine total, so it caps how many QPs
+        # a kernel may send on, and so the most worth allocating.
+        if type(self.num_qp_per_pe) is not int or not 1 <= self.num_qp_per_pe <= 64:
+            raise ValueError(
+                f"num_qp_per_pe must be an integer in [1, 64], got {self.num_qp_per_pe}"
+            )
+        if self.active_qps is not None:
+            if (
+                type(self.active_qps) is not int
+                or not 1 <= self.active_qps <= self.num_qp_per_pe
+            ):
+                raise ValueError(
+                    "active_qps must be an integer between 1 and num_qp_per_pe"
+                )
+            if not self.is_internode:
+                raise ValueError("active_qps is only supported by the internode path")
+        if self.active_qp_counts is not None:
+            counts = tuple(self.active_qp_counts)
+            if not counts or any(
+                type(count) is not int or not 1 <= count <= self.num_qp_per_pe
+                for count in counts
+            ):
+                raise ValueError(
+                    "active_qp_counts must contain integers in "
+                    f"[1, num_qp_per_pe={self.num_qp_per_pe}]"
+                )
+            self.active_qp_counts = tuple(sorted(set(counts)))
+            if not self.is_internode:
+                raise ValueError(
+                    "active_qp_counts is only supported by the internode path"
+                )
 
         # all-or-none: setting only one silently defaults the other to data_type.
         if (self.dispatch_data_type is None) != (self.combine_data_type is None):
@@ -363,16 +413,12 @@ class EpDispatchCombineConfig:
         self._resolve_geometry()
 
     def _resolve_geometry(self):
-        """Fill block/warp/schedule. Tuned-by-default: when the caller pinned
-        neither a schedule nor any block/warp, pull the tuned geometry for this
-        device/shape/dtype from the SELECTED BACKEND's tuning table (so the plain
-        constructor is tuned automatically — EpDispatchCombineConfig.tuned() is now
-        just an explicit alias). If any field is pinned, honor it and fill the rest
-        with the single-shot fallback (no schedule).
+        """Fill defaults and the intranode schedule for the selected backend.
 
-        Each backend tunes its OWN kernel: the hip and flydsl kernels are different
-        implementations with different optima, so hip reads hip_tuning_configs and
-        flydsl reads tuning_configs -- they never share a table."""
+        Internode only gets fallback values here. Its backend builds the full
+        schedule via hip_tuning_configs.resolve_schedule(), retaining any
+        fields the caller pinned in _pinned_geometry.
+        """
         pinned = self.schedule is not None or any(
             g is not None
             for g in (
@@ -383,13 +429,8 @@ class EpDispatchCombineConfig:
             )
         )
         if self.is_internode:
-            # The intranode tables are keyed on a single node's geometry and
-            # carry no rdma_block_num, so they have nothing to say about this
-            # config. Internode geometry comes from internode_tuning_configs,
-            # which the backend applies per phase and per token count. A
-            # `schedule` bucket already carries per-phase block and warp counts,
-            # but it has no rdma_block_num field at all, so it cannot carry the
-            # DIFFERENT rdma values dispatch and combine are tuned to.
+            # cfg.schedule describes intranode block/warp pairs only. Internode
+            # needs an independent RDMA split for each phase as well.
             self.schedule = None
             if self.dispatch_block_num is None:
                 self.dispatch_block_num = 96
@@ -423,6 +464,8 @@ class EpDispatchCombineConfig:
                     dtype=self.dispatch_dtype_str,
                     experts_per_rank=self.num_experts_per_rank,
                     quant_type=self.quant_type,
+                    dispatch_dtype=self.dispatch_dtype,
+                    combine_dtype=self.combine_dtype,
                 )
             else:
                 from .tuning_configs import lookup
@@ -505,39 +548,6 @@ class EpDispatchCombineConfig:
             if self.quant_type in ("fp8_direct_cast", "fp8_blockwise")
             else self.elem_size
         )
-
-    @classmethod
-    def tuned(cls, **kwargs):
-        """Build a config with block/warp geometry pulled from tuning_configs
-        (unless explicitly overridden in kwargs). Kept for back-compat and to
-        force per-field tuning even when some geometry is overridden; the plain
-        constructor is now also tuned-by-default (see _resolve_geometry)."""
-        from .tuning_configs import lookup
-
-        dt = kwargs.get("data_type", torch.bfloat16)
-        dtype = (
-            "fp4"
-            if dt == torch.float4_e2m1fn_x2
-            else ("fp8" if dt in _FP8_DTYPES else "bf16")
-        )
-        # The intranode tables say nothing about an internode config -- they are
-        # keyed on a single node's geometry and carry no rdma_block_num -- and
-        # pre-filling here would be indistinguishable from a caller pin, which
-        # the internode backend honours over its own table. Leave it alone and
-        # let _resolve_geometry / internode_tuning_configs do the work.
-        gpu_per_node = kwargs.get("gpu_per_node") or kwargs["world_size"]
-        if kwargs["world_size"] // gpu_per_node > 1:
-            return cls(**kwargs)
-
-        t = lookup(
-            kwargs["world_size"],
-            kwargs["hidden_dim"],
-            kwargs["num_experts_per_token"],
-            dtype=dtype,
-        )
-        for k, v in t.items():
-            kwargs.setdefault(k, v)
-        return cls(**kwargs)
 
     @property
     def dispatch_dtype(self):
@@ -648,21 +658,21 @@ class KernelSet:
     with a new quirk adds a flag here, not a method to every subclass.
     """
 
-    # (block_num, warp_num) -> callable. Keys must cover every spec the op's
-    # schedule can select; the op clamps to what is present.
-    dispatch: dict[tuple[int, int], Callable]
-    combine: dict[tuple[int, int], Callable]
+    # Backend selection key -> callable. HIP uses KernelConfig; FlyDSL uses
+    # (block_num, warp_num). _pick() returns keys from these same maps.
+    dispatch: dict[tuple, Callable]
+    combine: dict[tuple, Callable]
     # Replay-routing dispatch. None = this backend has no replay.
-    dispatch_replay: dict[tuple[int, int], Callable] | None = None
+    dispatch_replay: dict[tuple, Callable] | None = None
 
-    # The AsyncLL split. Each is the same (block_num, warp_num) -> callable shape
-    # as `dispatch`, but launching only half the pass sequence, so the caller can
-    # put its own work between the two. None = this backend runs send and recv in
-    # one launch and has no seam to expose.
-    dispatch_send: dict[tuple[int, int], Callable] | None = None
-    dispatch_recv: dict[tuple[int, int], Callable] | None = None
-    combine_send: dict[tuple[int, int], Callable] | None = None
-    combine_recv: dict[tuple[int, int], Callable] | None = None
+    # The AsyncLL split (HIP only). Each is keyed like `dispatch` (KernelConfig),
+    # but launches only half the pass sequence, so the caller can put its own work
+    # between the two. None = this backend runs send and recv in one launch and
+    # has no seam to expose.
+    dispatch_send: dict[tuple, Callable] | None = None
+    dispatch_recv: dict[tuple, Callable] | None = None
+    combine_send: dict[tuple, Callable] | None = None
+    combine_recv: dict[tuple, Callable] | None = None
 
     # True  -> combine's kernel stages the caller's tokens into out_tok itself.
     # False -> the op must copy them in on the host first (one extra torch kernel).
@@ -836,10 +846,9 @@ class EpDispatchCombineOp:
 
     # -- hooks a subclass must supply --------------------------------------
     #
-    # Exactly four, and no more: the arena layout, the kernels, and (optionally)
-    # what the backend cannot do and which arena region a shared view reads.
-    # Everything a caller touches -- dispatch(), combine(), the views, _pick,
-    # close -- is implemented once, here.
+    # Arena layout, kernel construction, supported features and region names.
+    # Dispatch/combine and lifecycle are shared. HIP also overrides _pick() for
+    # its unified intra/inter kernel configuration keys.
 
     def _regions(self, cfg) -> list[tuple[str, int]]:
         """[(region_name, nbytes)] this backend needs carved out of the arena.

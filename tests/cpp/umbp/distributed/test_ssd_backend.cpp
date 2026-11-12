@@ -382,6 +382,19 @@ TEST_F(SsdBackendTest, DsV4SizedObjectRoundTripsWith64KiBPages) {
   EXPECT_EQ(readback, payload);
 }
 
+// BatchTouch reaches the SSD tier for the keys it holds, and moves no bytes.
+TEST_F(SsdBackendTest, TouchCountsTheKeysTheTierHolds) {
+  SsdBackend* backend = Start();
+  ASSERT_TRUE(backend->OwnsEvictionOrder());
+  ASSERT_TRUE(Put(backend, "key-a", Payload(4096, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(4096, 2)));
+
+  EXPECT_EQ(backend->Touch({"key-a", "missing", "key-b"}), 2u);
+  EXPECT_EQ(backend->Touch({}), 0u);
+  EXPECT_EQ(PagesInUse(), 0u) << "a touch staged something";
+  EXPECT_FALSE(backend->Contains("missing"));
+}
+
 TEST_F(SsdBackendTest, GetOfAnUnknownKeyMisses) {
   SsdBackend* backend = Start();
   auto resolved = backend->BatchResolve({"never-written"}, false);
@@ -763,6 +776,21 @@ TEST_F(SsdBackendTest, CandidatesAreColdestFirstAndSkipALeasedKey) {
   EXPECT_EQ(offers.size(), 2u);
 }
 
+// A client loads what its lookup found seconds later; evicting it in between fails the load.
+TEST_F(SsdBackendTest, PoolLookupRenewsTheKeysEvictionOrder) {
+  SsdBackend* ssd = Start();
+  ASSERT_TRUE(Put(ssd, "a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(ssd, "b", Payload(1024, 2)));
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("ssd", std::move(backend_)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+
+  ASSERT_TRUE(pool.BatchContains({"a"})[0]);
+  const auto offers = ssd->EvictionCandidates(10);
+  ASSERT_EQ(offers.size(), 2u);
+  EXPECT_EQ(offers[0].key, "b");
+}
+
 TEST_F(SsdBackendTest, PoolLocalEvictionDrainsTheSsdMediumThroughEvict) {
   // SSD's watermark eviction now runs in the pool and reaches it via Evict().
   constexpr uint64_t kCapacity = 1024 * 1024;
@@ -1050,6 +1078,30 @@ TEST_F(SsdBackendExtentTest, WindowsOfOneKeyShareAReadOnlyWhenIdentical) {
   EXPECT_EQ(DeviceReadBytes() - before, 2u * 65536);
   EXPECT_EQ(Staged(got[1], 65536), Slice(object, 0, 65536));
   EXPECT_EQ(Staged(got[2], 65536), Slice(object, 720896, 65536));
+  got.clear();
+  backend_->RunReaperOnceForTest();
+  EXPECT_EQ(PagesInUse(), 0u);
+}
+
+// Local readers of one window across calls (the TP ranks) share one staged copy.
+TEST_F(SsdBackendExtentTest, LocalReadersOfOneWindowShareOneStage) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  std::vector<std::vector<ResolvedEntry>> got(4);
+  std::vector<std::thread> readers;
+  for (auto& out : got) {
+    readers.emplace_back([this, &out] { out = ResolveExtents({"k"}, {ObjectExtent{0, 65536}}); });
+  }
+  for (auto& reader : readers) reader.join();
+  for (const auto& out : got) {
+    ASSERT_TRUE(out[0].found);
+    EXPECT_EQ(out[0].pages, got[0][0].pages);
+  }
+  EXPECT_EQ(DeviceReadBytes() - before, 65536u);
+  EXPECT_EQ(Staged(got[3][0], 65536), Slice(object, 0, 65536));
   got.clear();
   backend_->RunReaperOnceForTest();
   EXPECT_EQ(PagesInUse(), 0u);

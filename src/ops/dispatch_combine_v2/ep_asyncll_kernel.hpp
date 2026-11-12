@@ -149,9 +149,14 @@ __device__ __forceinline__ int SrcTokenIndex(const EpInterNodeDeviceCfg& config,
   return pe * config.MaxNumTokensToSendPerRank() + srcTokId;
 }
 
-__device__ __forceinline__ int QueueForPe(const ::mori::cco::ccoDevComm& comm, int destPe) {
+// `offset` (args.sdmaQueueOffset) is per op, so ops that opt in post to their own
+// queue and a recv's drain no longer waits for another op's copies. One op's
+// traffic to a peer still shares one queue, so the protocol's ordering holds.
+__device__ __forceinline__ int QueueForPe(const ::mori::cco::ccoDevComm& comm, int destPe,
+                                          int offset) {
   const uint32_t n = comm.sdma.sdmaNumQueue;
-  return (n == 0) ? 0 : static_cast<int>(static_cast<uint32_t>(destPe) % n);
+  if (n == 0) return 0;
+  return static_cast<int>((static_cast<uint32_t>(destPe) + static_cast<uint32_t>(offset)) % n);
 }
 
 // The first active lane places the payload, the second its ready word, in one
@@ -452,7 +457,7 @@ __device__ void EpDispatchAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
         const size_t localBase =
             static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * xferBytes;
         asyncll::PostPayloadAndNotify(
-            comm, destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe),
+            comm, destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
             EpInterNodeWindow(args.reg(args.offDispatchInp)),
             EpInterNodeOffset(args.reg(args.offDispatchInp), remoteBase),
             EpInterNodeWindow(args.reg(args.offStaging)),
@@ -507,7 +512,7 @@ __device__ void EpDispatchAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
       continue;
     }
 
-    const int q = asyncll::QueueForPe(comm, destPe);
+    const int q = asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset);
     // The destination addresses ITS copy of dispatchInp at this rank's slice, and
     // the source is this rank's staging at the destination's slice -- the two
     // halves of SendBufSlotOffset's symmetry, and the one place a transposed
@@ -552,12 +557,11 @@ __device__ void EpDispatchAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
       if (sameNode) {
         // Our payload to this peer is out of the queue before its count word
         // goes, so the peer seeing a non-zero count has the tokens too.
-        sdma.quietQueue<::mori::cco::ccoCoopWarp>(destPe - args.lsaBase,
-                                                  asyncll::QueueForPe(comm, destPe));
+        sdma.quietQueue<::mori::cco::ccoCoopWarp>(
+            destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset));
       } else {
-        // Same argument over RDMA, but every QP the send leg striped across has
-        // to be drained -- EpInterNodeQuiet loops them, flushing each context.
-        EpInterNodeQuiet(comm, destPe, config.numQpPerPe);
+        // Same argument over RDMA: drain every QP the send leg striped across.
+        for (int qpId = 0; qpId < config.numQpPerPe; ++qpId) EpInterNodeQuiet(comm, destPe, qpId);
       }
     }
 
@@ -580,7 +584,7 @@ __device__ void EpDispatchAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
                EpInterNodeOffset(args.reg(args.offRecvTokenNum), asyncll::RecvCountSlot(myPe)),
                EpInterNodeWindow(args.reg(args.offSendCount)),
                EpInterNodeOffset(args.reg(args.offSendCount), asyncll::SendCountSlot(destPe)),
-               sizeof(uint64_t), asyncll::QueueForPe(comm, destPe));
+               sizeof(uint64_t), asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset));
     } else {
       // Cross-node. An ADD rather than a store, because that is the only remote
       // update ccoGda offers at an arbitrary window offset -- and it is exactly
@@ -1087,7 +1091,7 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
         const size_t localBase =
             static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * hiddenBytes;
         asyncll::PostPayloadAndNotify(
-            comm, destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe),
+            comm, destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
             EpInterNodeWindow(args.reg(args.offCombineInp)),
             EpInterNodeOffset(args.reg(args.offCombineInp), remoteBase),
             EpInterNodeWindow(args.reg(args.offCombineStaging)),
@@ -1149,7 +1153,7 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
       continue;
     }
 
-    const int q = asyncll::QueueForPe(comm, destPe);
+    const int q = asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset);
     sdma.put<::mori::cco::ccoCoopWarp>(
         destPe - args.lsaBase, EpInterNodeWindow(args.reg(args.offCombineInp)),
         EpInterNodeOffset(args.reg(args.offCombineInp), remoteBase),
@@ -1178,10 +1182,10 @@ __device__ void EpCombineAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
     // RecvTransfer: from a single lane these deadlock.
     if (destPe != myPe) {
       if (sameNode)
-        sdma.quietQueue<::mori::cco::ccoCoopWarp>(destPe - args.lsaBase,
-                                                  asyncll::QueueForPe(comm, destPe));
+        sdma.quietQueue<::mori::cco::ccoCoopWarp>(
+            destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset));
       else
-        EpInterNodeQuiet(comm, destPe, config.numQpPerPe);
+        for (int qpId = 0; qpId < config.numQpPerPe; ++qpId) EpInterNodeQuiet(comm, destPe, qpId);
     }
 
     if constexpr (asyncll::EarlyNotify<kConfig>) continue;
@@ -1207,7 +1211,7 @@ __device__ void EpCombineAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
                EpInterNodeOffset(args.reg(args.offCrossDeviceBarrier), myPe * sizeof(uint64_t)),
                EpInterNodeWindow(args.reg(args.offSendCount)),
                EpInterNodeOffset(args.reg(args.offSendCount), asyncll::SendFlagSlot(destPe)),
-               sizeof(uint64_t), asyncll::QueueForPe(comm, destPe));
+               sizeof(uint64_t), asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset));
     } else {
       // Cross-node publishes the epoch as an ADD OF ONE, which is the same value
       // the two branches above store. crossDeviceBarrierFlag is bumped once per
@@ -1285,8 +1289,8 @@ __device__ __forceinline__ void EpAsyncLLFusedQuiet(EpDispatchCombineArgs args,
   const int lane = threadIdx.x & (warpSize - 1);
   if (blockIdx.x == 0 && threadIdx.x < warpSize && lane < kConfig.worldSize && lane != args.rank) {
     ::mori::cco::ccoSdma sdma{comm};
-    sdma.quietQueue<::mori::cco::ccoCoopThread>(lane - args.lsaBase,
-                                                asyncll::QueueForPe(comm, lane));
+    sdma.quietQueue<::mori::cco::ccoCoopThread>(
+        lane - args.lsaBase, asyncll::QueueForPe(comm, lane, args.sdmaQueueOffset));
   }
 }
 

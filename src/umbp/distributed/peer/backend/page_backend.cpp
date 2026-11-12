@@ -39,6 +39,7 @@
 #endif
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/nic_limits.h"
 #include "umbp/common/numa_config.h"
 #include "umbp/common/parallel_for.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
@@ -282,6 +283,12 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
         TransferRef ref = registrar->RegisterMemory(base, size, loc, device);
         owned_refs_.push_back(ref);
         if (ref.HasMemoryDesc()) {
+          WarnIfNicRegionExceedsAinicLimit(
+              "DRAM buffer " + std::to_string(b) + " region at " + std::to_string(offset >> 20) +
+                  " MiB",
+              size, buffer.backing_page_size,
+              "Use UMBP_DRAM_USE_HUGEPAGES, or a UMBP_DRAM_MAX_MR_BYTES of at most 2^18 pages "
+              "(1 GiB of 4 KiB ones).");
           msgpack::sbuffer sbuf;
           msgpack::pack(sbuf, ref.mem);
           desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
@@ -866,6 +873,24 @@ std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
         EvictionOffer{*it, static_cast<uint64_t>(owned_it->second.pages.size()) * page_size_});
   }
   return out;
+}
+
+size_t PageBackend::Touch(const std::vector<std::string>& keys) {
+  if (keys.empty()) return 0;
+  // Shared, like the resolve paths: only the LRU position changes, and the LRU
+  // has its own lock.  Collect first so lru_mutex_ is taken once.
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  if (!track_eviction_order_) return 0;
+  std::vector<std::pair<const std::string*, OwnedSlot*>> held;
+  held.reserve(keys.size());
+  for (const auto& key : keys) {
+    auto it = owned_.find(key);
+    if (it != owned_.end()) held.emplace_back(&key, &it->second);
+  }
+  if (held.empty()) return 0;
+  std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+  for (auto& [key, slot] : held) TouchLruLocked(*key, *slot);
+  return held.size();
 }
 
 void PageBackend::TouchLruLocked(const std::string& key, OwnedSlot& slot) {

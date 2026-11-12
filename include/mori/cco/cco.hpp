@@ -128,7 +128,12 @@ __device__ inline T* global(T* ptr) {
  * width — so add any further wave32 arch to CCO_WAVE32 below. Masks are uint64_t
  * either way; on wave32 only the low half is populated.
  * ──────────────────────────────────────────────────────────────────────────── */
-#if defined(__gfx1250__)
+// gfx125x family, incl. gfx1250-strict (no __gfx1250__). Mirrors MORI_GFX125X in
+// mori/core/arch.hpp; kept here since this header includes no other mori header.
+#if defined(__gfx1250__) || defined(__gfx1251__) || defined(__gfx1250_strict__)
+#define CCO_GFX125X 1
+#endif
+#if defined(CCO_GFX125X)
 #define CCO_WAVE32 1
 #endif
 #ifdef CCO_WAVE32
@@ -277,20 +282,21 @@ struct ccoWindowTableNode {
 struct ccoIbgdaWin {
   uint32_t* peerRkeys;  // [worldSize]
   uint32_t lkey;
+  uint32_t iovaBias;  // MR iova of window offset 0: the import's data offset (0 otherwise)
 };
 
 struct ccoWindowDevice {
   // LSA flat-VA addressing (intra-node only). winBase is the window's slot in
   // the LSA-sized flat VA reservation. Peer addressing uses LSA rank, not
-  // world rank. Cross-node access goes through ibgdaWin (iova=0 + offset).
-  //   winBase = flatBase + slotOffset
+  // world rank. Cross-node access goes through ibgdaWin (iovaBias + offset).
+  //   winBase = flatBase + slotOffset + dataOffset (nonzero only for imports)
   //   peer_va = winBase + ((uint64_t)peerLsaRank * stride4G << 32) + offset
   //   local   = winBase + ((uint64_t)lsaRank     * stride4G << 32) + offset
   char* winBase;
   uint32_t stride4G;  // perRankSize >> 32 (perRankSize is 4GB-aligned)
   int lsaRank;        // caller's index in the LSA team
 
-  // GDA / IBGDA (iova=0). raddr=dstOff, laddr=srcOff, rkey=peerRkeys[worldRank].
+  // GDA / IBGDA. raddr=dstOff+iovaBias, laddr=srcOff+iovaBias, rkey=peerRkeys[worldRank].
   ccoIbgdaWin ibgdaWin;
 
   // SDMA signal pool lives on ccoDevComm::sdma (per-DevComm, not per-window).
@@ -685,7 +691,7 @@ struct ccoLsaBarrierSession {
 
 // Flat-VA addressing helpers — intra-node (LSA) only. The flat VA covers the
 // LSA team, so peer indexing is by LSA rank. Cross-node access goes through the
-// GDA backend with iova=0 + offset and doesn't need these.
+// GDA backend with iovaBias + offset and doesn't need these.
 __device__ inline void* ccoGetLsaPeerPtr(ccoWindow_t win, int peerLsaRank, size_t offset = 0) {
   return win->winBase + ((static_cast<uint64_t>(peerLsaRank) * win->stride4G) << 32) + offset;
 }
@@ -899,6 +905,8 @@ struct ccoComm {
     bool isFabric{false};
     size_t slotOffset{0};
     size_t size{0};
+    // Key pointer minus the mapping start: nonzero only for an import from inside an allocation.
+    size_t dataOffset{0};
   };
   std::unordered_map<void*, AllocMeta> allocTable;
 
@@ -953,11 +961,14 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** ptr);
 int ccoMemFree(ccoComm* comm, void* ptr);
 // Like ccoMemAlloc, but aliases an EXTERNAL HIP VMM allocation (e.g. a
 // torch.symm_mem buffer) into the flat-VA slot instead of allocating: retains its
-// handle (hipMemRetainAllocationHandle) and maps it. Release via ccoMemFree.
+// handle (hipMemRetainAllocationHandle) and maps it. externalPtr may point inside
+// the allocation (torch >= 2.14 puts the signal pad first); *ptr then aliases the
+// same byte. Release via ccoMemFree.
 int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** ptr);
 
 // ── Phase 2: Window registration (P2P mapping + RDMA MR + SDMA signals + GPU structs) ──
-// Collective: all ranks must call in the same order with the same size.
+// Collective: all ranks must call in the same order with the same size (and, for imports, the
+// same data offset in the allocation).
 // Overload A: internal allocation (= MemAlloc + WindowRegister(ptr))
 int ccoWindowRegister(ccoComm* comm, size_t size, ccoWindow_t* win, void** localPtr);
 // Overload B: register pre-allocated ptr from ccoMemAlloc
@@ -1044,7 +1055,7 @@ constexpr size_t CCO_SDMA_MAX_COPY_BYTES = 0x3fffffe0ull;
 // gfx12.5+ reads cache scope and temporal hints out of bits gfx9 leaves reserved,
 // gated by the header's npd bit. ROCr picks the same split (BlitSdmaV6 vs V4);
 // gfx9 wants them zero for peak xGMI bandwidth.
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
 #define CCO_SDMA_SCOPE_FIELDS 1
 #endif
 
@@ -1281,10 +1292,12 @@ typedef struct CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12_TAG {
 static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12) == 13 * sizeof(uint32_t),
               "SDMA gfx12 rect copy packet must be exactly 13 dwords");
 
-// POLL_REGMEM and COPY_BROADCAST use the gfx9 layouts (validated on gfx950).
-// gfx12.5 lays both out differently, so ccoSdma::putBroadcast / postWaitMem /
-// postWaitSignal trap there (device side, so multi-arch builds still compile)
-// rather than post a misread packet.
+// POLL_REGMEM and COPY_BROADCAST use the gfx9 layouts (validated on gfx950), and
+// the same ones on gfx12.5 (validated on gfx1250): ROCr's sdma_registers.h has one
+// struct for each on every arch, unlike the 2D rect packet above, which did get a
+// new layout. The only gfx12.5 addition is POLL_REGMEM's `scope` field in DW5
+// (previously reserved), which ccoSdmaWritePoll sets as ROCr's BuildPollCommand
+// does -- under CCO_SDMA_SCOPE_FIELDS, like the COPY and ATOMIC packets.
 //
 // POLL_REGMEM parks the queue until (*addr & mask) <func> value holds.
 typedef struct CCO_SDMA_PKT_POLL_REGMEM_TAG {
@@ -1308,7 +1321,8 @@ typedef struct CCO_SDMA_PKT_POLL_REGMEM_TAG {
     struct {
       unsigned int interval : 16;
       unsigned int retry_count : 12;
-      unsigned int reserved_0 : 4;
+      unsigned int scope : 2;  // gfx12.5+; reserved (0) on gfx9
+      unsigned int reserved_0 : 2;
     };
     unsigned int DW_5_DATA;
   } DW5_UNION;
@@ -1357,7 +1371,7 @@ constexpr bool CCO_SDMA_BREAK_ON_RETRIES = false;
 // s_waitcnt intrinsic; gfx9 keeps it because a release fence there also writes
 // back L2, which the uncached ring does not need.
 __device__ __forceinline__ void ccoSdmaPublishStores() {
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
 #else
   __builtin_amdgcn_s_waitcnt(0);
@@ -1403,7 +1417,7 @@ __device__ __forceinline__ CCO_SDMA_PKT_ATOMIC ccoCreateAtomicIncPacket(HSAuint6
   return packet;
 }
 
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
 using ccoSdmaCopy2DPacket = CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12;
 
 // Largest element (log2 bytes, at most 16B) dividing the width, both pitches and
@@ -1688,7 +1702,7 @@ inline __device__ void ccoSdmaWriteAtomic(uint32_t* queueBuf, uint64_t at, HSAui
 // packet can never straddle the ring end, which a multi-unit packet at an
 // arbitrary unit could. A run reserves one slot less a unit of slack for that
 // alignment; whatever the alignment leaves over is NOP-filled after the run.
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
 constexpr uint64_t CCO_SDMA_2D_SLOT = 2 * CCO_SDMA_UNIT;
 #else
 constexpr uint64_t CCO_SDMA_2D_SLOT = 4 * CCO_SDMA_UNIT;
@@ -1732,7 +1746,7 @@ inline __device__ void ccoSdmaWriteCopy2D(uint32_t* queueBuf, uint64_t at, const
   }
 }
 
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
 // The most one gfx12 packet carries: 64Ki elements per row, and 64Ki rows -- 16Ki
 // once the pitch needs the slice field. Pieces of these sizes keep the element.
 __device__ __forceinline__ void ccoSdma2DPieceLimits(const ccoSdmaRect& r, uint32_t& maxW,
@@ -1779,6 +1793,9 @@ inline __device__ void ccoSdmaWritePoll(uint32_t* queueBuf, uint64_t at, const v
   pkt.MASK = mask;
   pkt.DW5_UNION.interval = CCO_SDMA_POLL_INTERVAL;
   pkt.DW5_UNION.retry_count = CCO_SDMA_POLL_RETRY_FOREVER;
+#ifdef CCO_SDMA_SCOPE_FIELDS
+  pkt.DW5_UNION.scope = CCO_SDMA_MEMORY_SCOPE_SYS;
+#endif
   const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
   auto dst = impl::global(ccoSdmaUnitAt(queueBuf, at));
   dst->vec[0] = ccoUint4{p[0], p[1], p[2], p[3]};
@@ -2313,7 +2330,7 @@ __device__ inline void ccoSdmaDispatchPut2D(const ccoSdmaContext& s, int peer, u
   if constexpr (localSignal) localTarget = s.signalBuf + slot;
   if constexpr (remoteSignal) remoteTarget = s.peerSignalPtrs[peer] + slot;
   const uint32_t queueKey = static_cast<uint32_t>(peer) * n + static_cast<uint32_t>(queueId);
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
   // Past one packet's extents: split. Every lane posts its last piece in one
   // converged call, so a batch still carries one signal.
   uint32_t maxW, maxH;
@@ -2731,8 +2748,7 @@ struct ccoSdma {
   // destination and also selects the queue, (peer, queueId); `peer2` is the
   // second and may be our own LSA rank. Template arguments as put(), except
   // there is no SignalPerCopy and no lane grouping: thread scope posts one
-  // active lane at a time, warp/block scope lets the leader post. Not supported
-  // on gfx12.5, where it traps.
+  // active lane at a time, warp/block scope lets the leader post.
   //   localSignal:  one trailing ATOMIC into our own signalBuf[myLsaRank*n+q].
   //   remoteSignal: one ATOMIC into each destination peer's pool at the same
   //                 index, skipping ourselves and a repeated peer.
@@ -2743,6 +2759,11 @@ struct ccoSdma {
   // landed" can therefore be released by a broadcast's signal while an earlier put
   // on (peer2, q) is still in flight; only the cumulative total is reliable. Use a
   // distinct queueId for broadcasts if you wait on per-queue completion.
+  // The two destination addresses must be congruent mod 32 (the packet's
+  // dst-alignment rule; ROCr rejects a mismatched pair). Otherwise the second
+  // destination receives the data shifted by the offset difference, the whole
+  // range is wrong, and up to 31 bytes next to it are overwritten. Nothing
+  // checks this unless MORI_CCO_SDMA_DEBUG is set, which traps.
   // Measured slower than two put()s when either destination is remote (one
   // engine cannot overlap the two writes); it only wins when both are local.
   template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
@@ -2755,14 +2776,14 @@ struct ccoSdma {
                   "ccoSdma::putBroadcast supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate)) == 0,
                   "ccoSdma::putBroadcast: only ccoSdmaOptFlagsAggregate is supported");
-#ifdef CCO_SDMA_SCOPE_FIELDS
-    __builtin_trap();  // gfx12.5 packet layout not validated
-    return;
-#endif
     const ccoSdmaContext& s = comm.sdma;
     void* dst1 = ccoGetLsaPeerPtr(dstWin, peer, dstOffset);
     void* dst2 = ccoGetLsaPeerPtr(dstWin2, peer2, dstOffset2);
     void* src = ccoGetLocalPtr(srcWin, srcOffset);
+    if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
+      if ((reinterpret_cast<uintptr_t>(dst1) ^ reinterpret_cast<uintptr_t>(dst2)) & 31)
+        __builtin_trap();  // putBroadcast: destinations must be congruent mod 32
+    }
     ccoSdmaDispatchBroadcast<Coop, localSignal, remoteSignal, optFlags>(
         s, peer, peer2, dst1, dst2, src, bytes, queueId, static_cast<uint32_t>(comm.lsaRank));
   }
@@ -2778,7 +2799,7 @@ struct ccoSdma {
   // the pair. Caveats: the queue is blocked until the condition holds, so
   // anything else posted to it waits too, and a flag that never arrives parks it
   // for good. A full ring spins the poster until the wait clears. Thread scope
-  // posts one active lane at a time. Not supported on gfx12.5, where it traps.
+  // posts one active lane at a time.
   template <typename Coop = ccoCoopThread, uint32_t optFlags = ccoSdmaOptFlagsDefault>
   __device__ inline void postWaitMem(int peer, int queueId, ccoWindow_t win, size_t offset,
                                      uint32_t value, ccoSdmaCmp cmp = ccoSdmaCmpEq,
@@ -2788,10 +2809,6 @@ struct ccoSdma {
                   "ccoSdma::postWaitMem supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate)) == 0,
                   "ccoSdma::postWaitMem: only ccoSdmaOptFlagsAggregate is supported");
-#ifdef CCO_SDMA_SCOPE_FIELDS
-    __builtin_trap();  // gfx12.5 packet layout not validated
-    return;
-#endif
     ccoSdmaDispatchWait<Coop, optFlags>(comm.sdma, peer, queueId, ccoGetLocalPtr(win, offset),
                                         value, mask, static_cast<uint32_t>(cmp));
   }
@@ -2812,7 +2829,7 @@ struct ccoSdma {
   // (CCO_SDMA_MAX_COPY_BYTES, ~1 GiB) takes the composed path, one lane's wait
   // and chunks at a time. With Independent lanes on one queue, lanes whose copy
   // exceeds the cap post first (one at a time), then the rest, so chain order
-  // is not lane order. Traps on gfx12.5.
+  // is not lane order.
   template <bool localSignal = false, bool remoteSignal = false,
             uint32_t optFlags = ccoSdmaOptFlagsDefault>
   __device__ inline void postWaitMemPutPtr(int peer, int queueId, ccoWindow_t win, size_t offset,
@@ -2820,10 +2837,6 @@ struct ccoSdma {
                                            void* src, size_t bytes) {
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate)) == 0,
                   "ccoSdma::postWaitMemPutPtr: only ccoSdmaOptFlagsAggregate is supported");
-#ifdef CCO_SDMA_SCOPE_FIELDS
-    __builtin_trap();  // gfx12.5 packet layout not validated
-    return;
-#endif
     ccoSdmaWaitPutThread<localSignal, remoteSignal, optFlags>(
         comm.sdma, peer, queueId, ccoGetLocalPtr(win, offset), value, mask,
         static_cast<uint32_t>(cmp), dst, src, bytes, static_cast<uint32_t>(comm.lsaRank),
@@ -2844,10 +2857,6 @@ struct ccoSdma {
                   "ccoSdma::postWaitSignal supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate)) == 0,
                   "ccoSdma::postWaitSignal: only ccoSdmaOptFlagsAggregate is supported");
-#ifdef CCO_SDMA_SCOPE_FIELDS
-    __builtin_trap();  // gfx12.5 packet layout not validated
-    return;
-#endif
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     if (sigQueueId < 0 || static_cast<uint32_t>(sigQueueId) >= n) return;

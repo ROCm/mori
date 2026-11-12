@@ -1,0 +1,283 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+#include "src/ras/link.hpp"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+
+#include "src/ras/logging.hpp"
+
+namespace mori {
+namespace ras {
+namespace {
+
+constexpr uint64_t kTagListener = ~0ull;
+constexpr uint64_t kTagEvents = ~0ull - 1;
+constexpr uint64_t kPublishIntervalNs = 50ull * 1000 * 1000;
+constexpr size_t kEventsPerIteration = 1024;
+constexpr int kListenBacklog = 128;
+
+template <class... Fs>
+struct Overloaded : Fs... {
+  using Fs::operator()...;
+};
+template <class... Fs>
+Overloaded(Fs...) -> Overloaded<Fs...>;
+
+void CloseFd(int& fd) {
+  if (fd >= 0) close(fd);
+  fd = -1;
+}
+
+}  // namespace
+
+uint64_t MonoNowNs() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+LinkManager::LinkManager(Options options) : opts_(std::move(options)) {}
+
+LinkManager::~LinkManager() {
+  CloseFd(listenFd_);
+  CloseFd(epollFd_);
+}
+
+bool LinkManager::Listen(const std::string& bindHost, std::string* error) {
+  sockaddr_storage addr{};
+  socklen_t addrLen = 0;
+  auto* v4 = reinterpret_cast<sockaddr_in*>(&addr);
+  auto* v6 = reinterpret_cast<sockaddr_in6*>(&addr);
+  if (bindHost.empty()) {
+    v4->sin_family = AF_INET;
+    v4->sin_addr.s_addr = htonl(INADDR_ANY);
+    addrLen = sizeof(*v4);
+  } else if (inet_pton(AF_INET, bindHost.c_str(), &v4->sin_addr) == 1) {
+    v4->sin_family = AF_INET;
+    addrLen = sizeof(*v4);
+  } else if (inet_pton(AF_INET6, bindHost.c_str(), &v6->sin6_addr) == 1) {
+    v6->sin6_family = AF_INET6;
+    addrLen = sizeof(*v6);
+  } else {
+    *error = "the RAS listener can't bind '" + bindHost + "': not an IP address";
+    return false;
+  }
+  // MORI_RAS_PORT=P allows P to P + kRasPortSpan - 1, and 0 an ephemeral port. Neither ever
+  // takes RCCL RAS's port, which an ephemeral pick lands on if the host's range includes it.
+  const int first = opts_.config.port;
+  const int last = first == 0 ? 0 : std::min(first + kRasPortSpan - 1, 65535);
+  const int attempts = first == 0 ? 8 : last - first + 1;
+  for (int attempt = 0; attempt < attempts; ++attempt) {
+    const uint16_t want = static_cast<uint16_t>(first == 0 ? 0 : first + attempt);
+    if (want == kRcclRasPort) continue;
+    int fd = socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+      *error = std::string("socket: ") + std::strerror(errno);
+      return false;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (addr.ss_family == AF_INET) {
+      v4->sin_port = htons(want);
+    } else {
+      v6->sin6_port = htons(want);
+    }
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), addrLen) != 0) {
+      int err = errno;
+      CloseFd(fd);
+      if (err == EADDRINUSE && want != 0) continue;  // another process has it
+      *error = std::string("bind: ") + std::strerror(err);
+      return false;
+    }
+    if (listen(fd, kListenBacklog) != 0) {
+      int err = errno;
+      CloseFd(fd);
+      // SO_REUSEADDR lets two sockets bind a port that neither listens on yet; the second
+      // listen() fails, and that process moves on to the next port.
+      if (err == EADDRINUSE && want != 0) continue;
+      *error = std::string("listen: ") + std::strerror(err);
+      return false;
+    }
+    sockaddr_storage bound{};
+    socklen_t len = sizeof(bound);
+    getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &len);
+    uint16_t port =
+        ntohs(bound.ss_family == AF_INET ? reinterpret_cast<sockaddr_in*>(&bound)->sin_port
+                                         : reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port);
+    if (port == kRcclRasPort) {
+      CloseFd(fd);
+      continue;
+    }
+    listenFd_ = fd;
+    port_ = port;
+    return true;
+  }
+  const std::string where = bindHost.empty() ? "0.0.0.0" : bindHost;
+  if (first == 0) {
+    *error = "every ephemeral port picked was 28028";
+  } else if (first == last) {
+    *error = "port " + std::to_string(first) + " on " + where + " is in use";
+  } else {
+    *error = "ports " + std::to_string(first) + "-" + std::to_string(last) + " on " + where +
+             " are all in use";
+  }
+  return false;
+}
+
+bool LinkManager::InitLoop(std::string* error) {
+  epollFd_ = epoll_create1(EPOLL_CLOEXEC);
+  if (epollFd_ < 0) {
+    *error = std::string("epoll_create1: ") + std::strerror(errno);
+    return false;
+  }
+  epoll_event ev{};
+  ev.events = EPOLLIN;
+  ev.data.u64 = kTagListener;
+  if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, listenFd_, &ev) != 0) {
+    *error = std::string("epoll_ctl: ") + std::strerror(errno);
+    return false;
+  }
+  if (opts_.events != nullptr && opts_.events->HasWakeFd()) {
+    ev.data.u64 = kTagEvents;
+    if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, opts_.events->WakeFd(), &ev) != 0) {
+      *error = std::string("epoll_ctl: ") + std::strerror(errno);
+      return false;
+    }
+  }
+  return true;
+}
+
+void LinkManager::SetIdentity(const RasProcessId& self) {
+  self_ = self;
+  MarkDirty();
+}
+
+void LinkManager::RunOnce(int maxWaitMs) {
+  uint64_t now = MonoNowNs();
+  int timeout = maxWaitMs;
+  if (dirty_) {
+    uint64_t due = lastPublishNs_ + kPublishIntervalNs;
+    timeout = std::min<int>(timeout, due <= now ? 0 : static_cast<int>((due - now) / 1000000) + 1);
+  }
+  if (moreEvents_) timeout = 0;
+
+  epoll_event evs[64];
+  int n = epoll_wait(epollFd_, evs, 64, timeout);
+  if (n < 0) {
+    if (errno != EINTR && !(Degraded() & kDegradedLoopError)) {
+      AddDegraded(kDegradedLoopError);
+      RAS_LOG_ERROR("RAS epoll_wait failed: {}; RAS is degraded", std::strerror(errno));
+    }
+    n = 0;
+  }
+  for (int i = 0; i < n; ++i) {
+    if (evs[i].data.u64 == kTagListener) AcceptAll();
+  }
+  // Drained every pass, not only on a wakeup, so a missed wakeup only delays events.
+  if (opts_.events != nullptr) {
+    opts_.events->ConsumeWakeup();
+    size_t handled =
+        opts_.events->Drain([this](RasEvent& ev) { HandleEvent(ev); }, kEventsPerIteration);
+    moreEvents_ = handled == kEventsPerIteration;
+  }
+  now = MonoNowNs();
+  if (dirty_ && now >= lastPublishNs_ + kPublishIntervalNs) Publish(now);
+}
+
+// The listener reserves the advertised endpoint; inbound connections are accepted and closed.
+void LinkManager::AcceptAll() {
+  for (;;) {
+    int fd = accept4(listenFd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (fd < 0) return;
+    ++inboundAccepted_;
+    CloseFd(fd);
+    MarkDirty();
+  }
+}
+
+void LinkManager::HandleEvent(RasEvent& ev) {
+  std::visit(Overloaded{
+                 [&](EngineRegistered& e) { localEngines_.insert(e.engineKey); },
+                 [&](EngineUnregistered& e) { localEngines_.erase(e.engineKey); },
+             },
+             ev);
+  MarkDirty();
+}
+
+void LinkManager::Publish(uint64_t nowNs) {
+  auto snap = std::make_shared<RuntimeSnapshot>();
+  snap->self = self_;
+  snap->listenPort = port_;
+  snap->degraded = Degraded();
+  if (opts_.events != nullptr) {
+    EventQueueStats q = opts_.events->Stats();
+    snap->events.capacity = q.capacity;
+    snap->events.enqueued = q.enqueued;
+    snap->events.dropped = q.dropped;
+    snap->events.droppedByKind.assign(q.droppedByKind.begin(), q.droppedByKind.end());
+    snap->events.depthHighWater = q.depthHighWater;
+  }
+  snap->inboundAccepted = inboundAccepted_;
+  {
+    std::lock_guard<std::mutex> lock(snapshotMu_);
+    published_ = std::move(snap);
+  }
+  lastPublishNs_ = nowNs;
+  dirty_ = false;
+}
+
+void LinkManager::Shutdown() {
+  CloseFd(listenFd_);
+  CloseFd(epollFd_);
+}
+
+void LinkManager::RequestStop() {
+  stop_.store(true, std::memory_order_release);
+  if (opts_.events != nullptr) opts_.events->Wake();
+}
+
+RuntimeSnapshot LinkManager::Snapshot() const {
+  RuntimeSnapshot s;
+  {
+    std::lock_guard<std::mutex> lock(snapshotMu_);
+    if (published_) s = *published_;
+  }
+  s.listenPort = port_;
+  s.degraded = Degraded();  // any thread may set a bit between publications
+  return s;
+}
+
+void LinkManager::AddDegraded(uint32_t reasons) {
+  degraded_.fetch_or(reasons, std::memory_order_acq_rel);
+  if (opts_.events != nullptr) opts_.events->Wake();
+}
+}  // namespace ras
+}  // namespace mori

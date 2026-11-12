@@ -31,7 +31,8 @@ jobs:
           # Built in docker/Dockerfile.manylinux, so a wheel needs nothing newer
           # than glibc 2.28 instead of the glibc/libstdc++ of the Ubuntu image that
           # ships its Python. Each lane builds against the ROCm its test image
-          # below runs: 7.2.4 for py3.10, 7.14 for py3.12.
+          # below runs: 7.2.4 for py3.10, so a 7.x wheel is still built and tested
+          # every night, and 10.1, the Dockerfile's default, for py3.12.
           - python: "3.10"
             rocm: "7.2.4"
             rocm_build_args: >-
@@ -40,7 +41,7 @@ jobs:
               --build-arg ROCM_GPG=https://repo.radeon.com/rocm/rocm.gpg.key
               --build-arg "ROCM_PACKAGES=rocm-hip-runtime-devel rocm-smi-lib"
           - python: "3.12"
-            rocm: "7.14"
+            rocm: "10.1"
             rocm_build_args: ""
     steps:
       # Must precede Checkout: later steps run as root inside the CI container
@@ -199,7 +200,7 @@ jobs:
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
@@ -213,7 +214,7 @@ jobs:
           - platform: MI300X_MLX
             python: "3.12"
             runner: [self-hosted, 300_mlx_p19_29]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
             rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
             socket_ifname: ens14np0
             timeout_minutes: 90
@@ -447,10 +448,18 @@ jobs:
             rdma_tc: 104
             ct: podman
             timeout_minutes: 45
+            # These hosts' amdgpu-dkms lacks 93aa919 ("drm/amdkfd: fix vram
+            # allocation failure for a special case"): hipMemCreate (VRAM with no VA
+            # yet) fails with EADDRINUSE, reported as out of memory, while any SVM
+            # range sits below its size, and libhsakmt registers every pageable
+            # buffer HIP pins for a copy as one. HSA_USE_SVM=0 registers them as
+            # userptr instead. Not in the image: with SVM off every pageable copy is
+            # pinned again. Drop it once the hosts' amdgpu-dkms carries the fix.
+            hsa_use_svm: 0
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
             node1_host: 10.2.80.20
             node2_host: 10.2.80.10
             node2_port: 22
@@ -461,6 +470,7 @@ jobs:
             rdma_tc: 104
             ct: podman
             timeout_minutes: 45
+            hsa_use_svm: 0  # as the py3.10 entry
           # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
           # both only on the RoCE path. mlx5_8 is deliberately not in
           # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
@@ -471,7 +481,7 @@ jobs:
           - platform: MI300X_MLX
             python: "3.12"
             runner: [self-hosted, 300_mlx_p19_29]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
             node1_host: 10.194.132.110
             node2_host: 10.194.132.71
             node2_port: 22
@@ -507,6 +517,7 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
       # Perf dashboard capture on node1/rank0 (MI355X_AINIC only for now).
       MORI_PERF_OUT: ${{ matrix.platform == 'MI355X_AINIC' && format('{0}/_perf/perf.jsonl', github.workspace) || '' }}
       MORI_PERF_RUN_ID: ${{ github.run_id }}
@@ -550,6 +561,7 @@ jobs:
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            ${HSA_USE_SVM:+-e HSA_USE_SVM=$HSA_USE_SVM} \
             -e MORI_PERF_OUT=$MORI_PERF_OUT \
             -e MORI_PERF_RUN_ID=$MORI_PERF_RUN_ID \
             -e MORI_PERF_COMMIT=$MORI_PERF_COMMIT \
@@ -593,6 +605,7 @@ jobs:
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              ${HSA_USE_SVM:+-e HSA_USE_SVM=$HSA_USE_SVM} \
               -e MORI_IO_BENCH_ENGINE_BIN=$GITHUB_WORKSPACE/build_bench/tests/cpp/bench_engine \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
               -w $GITHUB_WORKSPACE \
@@ -937,7 +950,7 @@ jobs:
           - python: "3.10"
             base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
           - python: "3.12"
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
     env:
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
     steps:
@@ -1016,8 +1029,9 @@ jobs:
       MORI_RDMA_DEVICES: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7  # as ci_cco.yml
       MORI_RDMA_SL: 3
       MORI_RDMA_TC: 104
+      HSA_USE_SVM: 0  # the amdgpu-dkms workaround, see test-wheel-internode
       IMAGE: rocm/mori:ci-flydsl-${{ matrix.flydsl }}
-      BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+      BASE_IMAGE: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
       CONTAINER: mori_flydsl_compat_${{ github.run_id }}_${{ strategy.job-index }}
       CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
     timeout-minutes: 90
@@ -1041,6 +1055,7 @@ jobs:
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -e HSA_USE_SVM=$HSA_USE_SVM \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity

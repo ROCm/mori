@@ -131,6 +131,7 @@ class SsdBackend : public MediumBackend {
   // a staged or migration read holds.
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
   bool OwnsEvictionOrder() const override;
+  size_t Touch(const std::vector<std::string>& keys) override;
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
 
@@ -201,6 +202,31 @@ class SsdBackend : public MediumBackend {
   };
   static constexpr uint64_t kExtentAlign = 4096;  // the SSD record alignment
 
+  // One local staged read of a key (+ window) that other local resolves of the
+  // same bytes join instead of staging their own copy: the TP ranks of a
+  // replicated-KV model ask for identical extents at once.  Guarded by mutex_.
+  class SharedStage {
+   public:
+    // `entry` must stay put until Wait returns.
+    void Join(ResolvedEntry* entry) { joiners_.push_back(entry); }
+    // Hands every joiner the outcome and a hold; true if later resolves may still attach.
+    bool Finish(ResolveOutcome outcome, StagingSpan staged, uint64_t object_size,
+                ObjectExtent staged_window, const std::shared_ptr<const void>& reader_hold);
+    // False on timeout: `entry` gets kBusy and stops being a joiner.
+    bool Wait(std::unique_lock<std::mutex>& lock, ResolvedEntry* entry);
+
+    bool done = false;
+    StagingSpan span;  // a done extent's, for late joiners
+    uint64_t size = 0;
+    ObjectExtent window;
+    std::weak_ptr<const void> hold;  // joinable while any reader still holds it
+
+   private:
+    std::condition_variable cv_;
+    std::vector<ResolvedEntry*> joiners_;  // in waiting calls' results
+  };
+  static constexpr std::chrono::seconds kJoinWait{30};
+
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
   // the requested size is currently available, even after reclaiming leases.
   StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
@@ -254,6 +280,8 @@ class SsdBackend : public MediumBackend {
   std::unordered_map<std::string, ReadLease> read_leases_;
   std::unordered_map<std::string, ReadLease> migration_reads_;
   std::vector<ExtentStage> extent_stages_;
+  // Key (+ window) -> its local staged read: in flight, or an extent still held.
+  std::unordered_map<std::string, std::shared_ptr<SharedStage>> shared_stages_;
   bool extent_staging_ = false;  // set at Init (UMBP_SSD_EXTENT_STAGING)
 
   // Opt-in switch (UMBP_ENABLE_GDS=1): route SSD reads of O_DIRECT records

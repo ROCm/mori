@@ -188,9 +188,6 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("tier_io_threads", &UMBPSsdConfig::tier_io_threads)
       .def_readwrite("direct_io", &UMBPSsdConfig::direct_io)
       .def_readwrite("verify_crc", &UMBPSsdConfig::verify_crc)
-      // sglang's UMBPStore builds UMBPConfig directly rather than via
-      // FromEnvironment(), so UMBP_SSD_SINGLE_FLIGHT never reaches it — this is
-      // the only way to turn coalescing off on that path.
       .def_readwrite("single_flight_reads", &UMBPSsdConfig::single_flight_reads)
       .def_readwrite("high_watermark", &UMBPSsdConfig::high_watermark)
       .def_readwrite("low_watermark", &UMBPSsdConfig::low_watermark)
@@ -291,6 +288,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("address", &UMBPStandaloneProcessConfig::address)
       .def_readwrite("auto_start", &UMBPStandaloneProcessConfig::auto_start)
       .def_readwrite("startup_timeout_ms", &UMBPStandaloneProcessConfig::startup_timeout_ms)
+      .def_readwrite("lookup_timeout_ms", &UMBPStandaloneProcessConfig::lookup_timeout_ms)
       .def_readwrite("worker_node_id", &UMBPStandaloneProcessConfig::worker_node_id)
       .def_readwrite("worker_node_address", &UMBPStandaloneProcessConfig::worker_node_address)
       .def_readwrite("tags", &UMBPStandaloneProcessConfig::tags);
@@ -346,8 +344,10 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("page_size", &UMBPConfig::page_size);
 
   py::class_<IUMBPClient, std::unique_ptr<IUMBPClient>>(m, "UMBPClient")
-      .def(py::init([](const UMBPConfig& cfg) { return CreateUMBPClient(cfg); }),
-           py::arg("config") = UMBPConfig{})
+      // Not `py::arg("config") = UMBPConfig{}`: that default would snapshot the
+      // environment once, at import time.
+      .def(py::init([]() { return CreateUMBPClient(UMBPConfig{}); }))
+      .def(py::init([](const UMBPConfig& cfg) { return CreateUMBPClient(cfg); }), py::arg("config"))
       // All I/O-path methods release the GIL: they block on RDMA, SSD, or gRPC
       // Python metadata providers reacquire it through pybind11/functional.h.
       .def("put_from_ptr", &IUMBPClient::Put, py::arg("key"), py::arg("src"), py::arg("size"),
@@ -373,6 +373,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("batch_prefetch", &IUMBPClient::BatchPrefetch, py::arg("keys"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("batch_touch", &IUMBPClient::BatchTouch, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())
