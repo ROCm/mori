@@ -1007,6 +1007,76 @@ void ccoDevCommFreeDeviceCopy(ccoDevComm* devicePtr);
 // ── Host barrier ──
 int ccoBarrierAll(ccoComm* comm);
 
+// ── SDMA packet definitions shared by host and device code ──
+
+// Comparison for an engine-side wait (ccoSdma::postWaitMem, ccoTriggerAppendChain):
+// the queue resumes once `(*addr & mask) <cmp> value` holds. Values are the
+// POLL_REGMEM func field.
+enum ccoSdmaCmp : uint32_t {
+  ccoSdmaCmpAlways = 0,
+  ccoSdmaCmpLt = 1,
+  ccoSdmaCmpLe = 2,
+  ccoSdmaCmpEq = 3,
+  ccoSdmaCmpNe = 4,
+  ccoSdmaCmpGe = 5,
+  ccoSdmaCmpGt = 6,
+};
+
+// A COPY's count field is 30 bits, so one packet moves at most 1GB. ROCr rounds
+// the cap down to a 32B multiple so chunk boundaries stay unit-aligned.
+constexpr size_t CCO_SDMA_MAX_COPY_BYTES = 0x3fffffe0ull;
+
+// ── Host-armed SDMA trigger queues ──
+//
+// A trigger queue is a private SDMA queue to one LSA peer that only the host writes.
+// The host appends chains [POLL gate] [COPY]... [ATOMIC arrival += 1] and kicks; the
+// engine waits at each POLL until a kernel bumps the gate (low 32 bits compared). The
+// ATOMIC runs after the copies, so a reader that sees the arrival sees the data.
+//
+// One host thread per queue. Calls return 0 on success and -1 on error;
+// ccoTriggerAppendChain returns 1 when the ring is full and ccoTriggerQuiesce returns
+// 1 on timeout. Kick only a queue that is drained or parked on a closed gate.
+typedef struct ccoTriggerQueue* ccoTriggerQueue_t;
+
+struct ccoTriggerCopy {
+  const void* src;
+  void* dst;
+  uint64_t bytes;
+};
+
+struct ccoTriggerQueueInfo {
+  int peer;  // world rank
+  uint32_t engineId;
+  uint64_t ringBytes;
+};
+
+// `pe` is a world rank in this rank's LSA team (as for ccoGetPeerPtr). The queue uses
+// the engine of the comm's channel 0 to `pe`, moved by engineOffset within its class
+// (gfx942 only; even offsets on MI308X). ringBytes 0 selects 256 KiB, otherwise a
+// power of two of at least 4 KiB. Requires MORI_ENABLE_SDMA and gfx942 or gfx950.
+int ccoTriggerQueueCreate(ccoComm* comm, int pe, int engineOffset, uint64_t ringBytes,
+                          ccoTriggerQueue_t* queue);
+// Destroys the queue. The caller should first open every gate it waits on and quiesce
+// it; returns 1 (and destroys anyway) if kicked work was not yet consumed.
+int ccoTriggerQueueDestroy(ccoTriggerQueue_t queue);
+// Appends one chain without kicking. `gate` is on this GPU; copies and `arrival` may
+// address any GPU-mapped memory. Copies over CCO_SDMA_MAX_COPY_BYTES are split.
+// *endIndex receives the ring index just past the chain.
+int ccoTriggerAppendChain(ccoTriggerQueue_t queue, const void* gate, uint32_t target,
+                          ccoSdmaCmp cmp, const ccoTriggerCopy* copies, int numCopies,
+                          void* arrival, uint64_t* endIndex);
+// Publishes the appended chains and rings the doorbell.
+int ccoTriggerKick(ccoTriggerQueue_t queue);
+// Kicks several queues behind one HDP flush per GPU. One producer thread for all.
+int ccoTriggerKickAll(const ccoTriggerQueue_t* queues, int numQueues);
+// Waits until the engine has consumed the ring up to `index` (UINT64_MAX: all kicked).
+int ccoTriggerQuiesce(ccoTriggerQueue_t queue, uint64_t index, uint64_t timeoutNs);
+// Engine read index and host write index, in monotonic ring bytes.
+int ccoTriggerQueueState(ccoTriggerQueue_t queue, uint64_t* readIndex, uint64_t* writeIndex);
+int ccoTriggerQueueGetInfo(ccoTriggerQueue_t queue, ccoTriggerQueueInfo* info);
+// Copies ring contents from monotonic `index`, for inspection (4-byte aligned).
+int ccoTriggerQueueReadRing(ccoTriggerQueue_t queue, uint64_t index, void* out, uint64_t bytes);
+
 }  // namespace cco
 }  // namespace mori
 
@@ -1042,9 +1112,6 @@ const unsigned int CCO_SDMA_OP_ATOMIC = 10;
 const unsigned int CCO_SDMA_SUBOP_COPY_LINEAR = 0;
 const unsigned int CCO_SDMA_ATOMIC_ADD64 = 47;
 const unsigned int CCO_SDMA_MEMORY_SCOPE_SYS = 3;
-// A COPY's count field is 30 bits, so one packet moves at most 1GB. ROCr rounds
-// the cap down to a 32B multiple so chunk boundaries stay unit-aligned.
-constexpr size_t CCO_SDMA_MAX_COPY_BYTES = 0x3fffffe0ull;
 
 // gfx12.5+ reads cache scope and temporal hints out of bits gfx9 leaves reserved,
 // gated by the header's npd bit. ROCr picks the same split (BlitSdmaV6 vs V4);
@@ -1591,18 +1658,6 @@ inline __device__ ccoSdmaQueueDeviceHandle ccoSdmaLoadQueueHandle(ccoSdmaQueueDe
 enum ccoSdmaThreadMode : uint32_t {
   ccoSdmaThreadIndependent = 0,
   ccoSdmaThreadSameQueue = 1,
-};
-
-// Comparison for an engine-side wait (ccoSdma::postWaitMem): the queue resumes
-// once `(*addr & mask) <cmp> value` holds. Values are the POLL_REGMEM func field.
-enum ccoSdmaCmp : uint32_t {
-  ccoSdmaCmpAlways = 0,
-  ccoSdmaCmpLt = 1,
-  ccoSdmaCmpLe = 2,
-  ccoSdmaCmpEq = 3,
-  ccoSdmaCmpNe = 4,
-  ccoSdmaCmpGe = 5,
-  ccoSdmaCmpGt = 6,
 };
 
 // Default: one signal per put() call. At thread scope the lanes sharing a queue
