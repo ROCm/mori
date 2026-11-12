@@ -75,7 +75,7 @@ class _Harness:
     def seed(self, rank, call):
         return (call << 8) | rank | (1 << 40)
 
-    def call(self, m, *, mode=0, spin_cycles=0, clobber=False, armed=False):
+    def call(self, m, *, mode=0, spin_cycles=0, clobber=False, armed=False, begin=True):
         """One call; returns whether the output equals the reference exactly."""
         op, stream = self.op, torch.cuda.current_stream()
         s = stream.cuda_stream
@@ -83,6 +83,8 @@ class _Harness:
         self.calls += 1
         if not armed:
             op.arm(m)
+            if begin:
+                op.begin(m)
         out = op.output_view(m)
         out.fill_(NAN_BF16)
         tiles_x = (N + self.mt0 - 1) // self.mt0
@@ -191,20 +193,38 @@ def _case_misuse(h, m):
     from mori.ops.gemm_ar import GateProducerSpec, GemmTriggeredAllReduceOp
 
     op = h.op
-    with pytest.raises(ValueError, match="reducer_blocks"):
-        GemmTriggeredAllReduceOp(
-            h.comm,
-            n=N,
-            m_max=m,
-            producer=GateProducerSpec(mt0=h.mt0, mt1=h.mt1),
-            reducer_blocks=0,
-        )
+    for bad, why in (
+        (dict(reducer_blocks=0), "reducer_blocks"),
+        (dict(reduce_mode="beside"), "reduce_mode"),
+        (dict(reduce_mode="concurrent", reducer_blocks=10_000), "quarter"),
+    ):
+        with pytest.raises(ValueError, match=why):
+            GemmTriggeredAllReduceOp(
+                h.comm,
+                n=N,
+                m_max=m,
+                producer=GateProducerSpec(mt0=h.mt0, mt1=h.mt1),
+                **bad,
+            )
     with pytest.raises(RuntimeError, match="armed"):
         op.complete(m)
+    with pytest.raises(RuntimeError, match="armed"):
+        op.begin(m)
     op.arm(m)
     with pytest.raises(RuntimeError, match="not completed"):
         op.arm(m)
+    if op.reduce_mode == "concurrent":
+        with pytest.raises(RuntimeError, match="begin"):
+            op.complete(m)
+    op.begin(m)
+    with pytest.raises(RuntimeError, match="already"):
+        op.begin(m)
     assert h.call(m, armed=True), "the call after the refused requests is inexact"
+
+
+def _case_no_begin(h, ms, calls_per_m):
+    bad = [m for m in ms for _ in range(calls_per_m) if not h.call(m, begin=False)]
+    assert not bad, f"inexact calls without begin() at m={bad}"
 
 
 CASES = {
@@ -215,6 +235,7 @@ CASES = {
     "clobber": _case_clobber,
     "self_test": _case_self_test,
     "misuse": _case_misuse,
+    "no_begin": _case_no_begin,
 }
 
 
@@ -236,8 +257,18 @@ def _spawn_entry(rank, *args):
     _worker(rank, *args)
 
 
+def _require_cus(setup) -> None:
+    if setup.get("reduce_mode") != "concurrent":
+        return
+    need = 4 * setup.get("reducer_blocks", 32)
+    cus = torch.cuda.get_device_properties(0).multi_processor_count
+    if cus < need:
+        pytest.skip(f"a concurrent reducer of this size needs {need} CUs, have {cus}")
+
+
 def _run(world_size, case, setup, args):
     _require_gpus(world_size)
+    _require_cus(setup)
     from mori.cco import Communicator
 
     os.environ["MORI_ENABLE_SDMA"] = "1"
@@ -272,33 +303,55 @@ def _run(world_size, case, setup, args):
     assert not errs, "\n\n".join(errs)
 
 
+MODES = ["after", "concurrent"]
+
+
+@pytest.mark.parametrize("reduce_mode", MODES)
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("mt0,mt1", [(96, 128), (256, 256)])
-def test_exact(world_size, mt0, mt1):
+def test_exact(world_size, mt0, mt1, reduce_mode):
     step = mt1 * world_size
     ms = sorted({step, 2048 // step * step or step, 8192})
     _run(
         world_size,
         "exact",
-        dict(mt0=mt0, mt1=mt1, m_max=8192),
+        dict(mt0=mt0, mt1=mt1, m_max=8192, reduce_mode=reduce_mode),
         dict(ms=ms, calls_per_m=3),
     )
 
 
+@pytest.mark.parametrize("reduce_mode", MODES)
 @pytest.mark.parametrize("world_size", [2, 8])
-def test_varying_m(world_size):
+def test_varying_m(world_size, reduce_mode):
     step = 128 * world_size
     ms = [step * 2, step * 8, step, step * 4, step * 8, step]
     _run(
         world_size,
         "exact",
-        dict(mt0=96, mt1=128, m_max=step * 8),
+        dict(mt0=96, mt1=128, m_max=step * 8, reduce_mode=reduce_mode),
         dict(ms=ms, calls_per_m=1),
     )
 
 
+@pytest.mark.parametrize("reducer_blocks", [1, 64])
+def test_concurrent_reducer_sizes(reducer_blocks):
+    _run(
+        8,
+        "exact",
+        dict(
+            mt0=256,
+            mt1=256,
+            m_max=8192,
+            reduce_mode="concurrent",
+            reducer_blocks=reducer_blocks,
+        ),
+        dict(ms=[2048, 8192], calls_per_m=3),
+    )
+
+
+@pytest.mark.parametrize("reduce_mode", MODES)
 @pytest.mark.parametrize("ag_engine_offset", [None, 1])
-def test_queue_placement(ag_engine_offset):
+def test_queue_placement(ag_engine_offset, reduce_mode):
     _run(
         8,
         "exact",
@@ -307,61 +360,80 @@ def test_queue_placement(ag_engine_offset):
             mt1=128,
             m_max=2048,
             ag_engine_offset=ag_engine_offset,
+            reduce_mode=reduce_mode,
         ),
         dict(ms=[1024, 2048], calls_per_m=5),
     )
 
 
-def test_rebase():
+def test_after_mode_without_begin():
+    _run(
+        8,
+        "no_begin",
+        dict(mt0=96, mt1=128, m_max=2048),
+        dict(ms=[1024, 2048], calls_per_m=3),
+    )
+
+
+@pytest.mark.parametrize("reduce_mode", MODES)
+def test_rebase(reduce_mode):
     _run(
         8,
         "rebase",
-        dict(mt0=96, mt1=128, m_max=2048),
+        dict(mt0=96, mt1=128, m_max=2048, reduce_mode=reduce_mode),
         dict(ms=[1024, 2048], calls=20),
     )
 
 
-def test_missing_add_faults():
+@pytest.mark.parametrize("reduce_mode", MODES)
+def test_missing_add_faults(reduce_mode):
     _run(
         4,
         "missing_add",
-        dict(mt0=96, mt1=128, m_max=1024, quiesce_timeout_s=5.0),
-        dict(m=1024, polls=1 << 16),
+        dict(
+            mt0=96, mt1=128, m_max=1024, quiesce_timeout_s=5.0, reduce_mode=reduce_mode
+        ),
+        # Concurrent waits start before the producer is launched.
+        dict(m=1024, polls=1 << 16 if reduce_mode == "after" else 1 << 18),
     )
 
 
-def test_slow_reader():
+@pytest.mark.parametrize("reduce_mode", MODES)
+def test_slow_reader(reduce_mode):
     _run(
         8,
         "slow_reader",
-        dict(mt0=96, mt1=128, m_max=2048),
+        dict(mt0=96, mt1=128, m_max=2048, reduce_mode=reduce_mode),
         dict(m=2048, calls=16),
     )
 
 
-def test_output_overwritten_after_complete():
+@pytest.mark.parametrize("reduce_mode", MODES)
+def test_output_overwritten_after_complete(reduce_mode):
     _run(
         8,
         "clobber",
-        dict(mt0=96, mt1=128, m_max=2048),
+        dict(mt0=96, mt1=128, m_max=2048, reduce_mode=reduce_mode),
         dict(m=2048, calls=50),
     )
 
 
-def test_self_test():
+@pytest.mark.parametrize("reduce_mode", MODES)
+def test_self_test(reduce_mode):
     _run(
         8,
         "self_test",
-        dict(mt0=96, mt1=128, m_max=2048),
+        dict(mt0=96, mt1=128, m_max=2048, reduce_mode=reduce_mode),
         dict(m=2048),
     )
 
 
-def test_misuse():
+@pytest.mark.parametrize("reduce_mode", MODES)
+def test_misuse(reduce_mode):
     _run(
         2,
         "misuse",
-        dict(mt0=96, mt1=128, m_max=2048),
+        dict(mt0=96, mt1=128, m_max=2048, reduce_mode=reduce_mode),
         dict(m=2048),
     )
 
@@ -372,10 +444,11 @@ def test_misuse():
 def test_soak():
     calls = int(os.environ["MORI_TRIGGER_SOAK"])
     m = int(os.environ.get("MORI_TRIGGER_SOAK_M", "2048"))
+    mode = os.environ.get("MORI_TRIGGER_SOAK_MODE", "after")
     mt1 = 256 if m >= 8192 else 128
     _run(
         8,
         "exact",
-        dict(mt0=96 if mt1 == 128 else 256, mt1=mt1, m_max=m),
+        dict(mt0=96 if mt1 == 128 else 256, mt1=mt1, m_max=m, reduce_mode=mode),
         dict(ms=[m], calls_per_m=calls),
     )
