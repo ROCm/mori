@@ -419,6 +419,13 @@ _COMBINE_PUSH_TABLE: dict = {
     },
 }
 
+_BF16_PUSH_TABLE: dict = {
+    "gfx1250": {
+        (4, 7168, 6, None): ((128, 64, 8), (512, 64, 16), (None, 64, 24)),
+        (8, 7168, 6, None): ((192, 64, 8), (512, 64, 16), (None, 64, 24)),
+    },
+}
+
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
@@ -496,6 +503,16 @@ def ll128(
         "combine": plan["combine"],
         "max_tok": plan["max_tok"],
     }
+
+
+def bf16_push(world_size, hidden_dim, topk, experts_per_rank=None):
+    return _bucket_key(
+        _BF16_PUSH_TABLE.get(_device_keys()[0], {}),
+        world_size,
+        hidden_dim,
+        topk,
+        experts_per_rank,
+    )
 
 
 # THE ROUND RULE outranks every shape choice above: _tpi = warpSize/topk tokens are

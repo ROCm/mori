@@ -252,6 +252,7 @@ struct EpCfg {
   // combineFp4's push combine with an MXFP8 wire: e4m3 plus one e8m0 scale per 32
   // elements. Exclusive with combineFp4 (MakeEpCfg).
   bool combineFp8 = false;
+  bool combineBf16Push = false;
   bool aggReserve = false;
   int callTokMax = 0;
   bool ll128 = false;
@@ -276,6 +277,7 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(combineFp4);
   MORI_FIELD(combineFp4F32Scale);
   MORI_FIELD(combineFp8);
+  MORI_FIELD(combineBf16Push);
   MORI_FIELD(aggReserve);
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
@@ -283,7 +285,7 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 19, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 20, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -376,6 +378,7 @@ constexpr int EpCombinePushLandRows(const EpCfg& c) {
   return c.maxTokPerRank * EpCombinePushRows(c);
 }
 constexpr int EpCombinePushWireBytes(const EpCfg& c) {
+  if (c.combineBf16Push) return EpTokenBytes(c);
   const int pay = c.combineFp8 ? c.hiddenDim : c.hiddenDim / 2;
   const int sc = c.combineFp4F32Scale ? c.hiddenDim / 128 * 4 : c.hiddenDim / 32;
   return (pay + sc + EpCombinePushSlotAlign - 1) / EpCombinePushSlotAlign * EpCombinePushSlotAlign;
@@ -388,7 +391,8 @@ constexpr size_t EpCombinePushFlagOff(const EpCfg& c) {
 }
 // True when some warp count takes the overlapped reduce (EpFp4Ovl), the row flags' user.
 constexpr bool EpCombinePushOvlAny(const EpCfg& c) {
-  return EpCombinePush(c) && !c.combineFp4F32Scale && !EpIsWideEp(c) && c.worldSize >= 4;
+  return (EpCombinePush(c) || c.combineBf16Push) && !c.combineFp4F32Scale && !EpIsWideEp(c) &&
+         c.worldSize >= 4;
 }
 
 // The scale row's SLOT stride: the caller's row padded to 128 B. A transfer is a
@@ -553,7 +557,7 @@ constexpr size_t EpRegionDispOutBytes(const EpCfg& c) {
 constexpr size_t EpRegionOutTokBytes(const EpCfg& c) {
   if (c.ll128 || c.ll128CombineOnly)
     return EpCombinePushLandOff(c) + (size_t)EpCombinePushLandRows(c) * EpLl128LandRowBytes(c);
-  if (!EpCombinePush(c)) return EpCombinePushLandOff(c);
+  if (!EpCombinePush(c) && !c.combineBf16Push) return EpCombinePushLandOff(c);
   return EpCombinePushFlagOff(c) +
          (EpCombinePushOvlAny(c) ? (size_t)EpCombinePushLandRows(c) * 8 : 0);
 }

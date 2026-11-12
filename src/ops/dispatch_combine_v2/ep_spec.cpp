@@ -60,6 +60,11 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "one of them");
   }
   c.combineFp8 = (kind == EpKernelKind::Combine) && req.combineFp8;
+  if (req.combineBf16Push && (req.combineFp4 || req.combineFp8)) {
+    throw std::runtime_error(
+        "mori v2 ep: combineBf16Push is the push combine without quantization, and combineFp4 / "
+        "combineFp8 pick a quantized wire; set one of them");
+  }
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -104,6 +109,11 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
           "scales, wave32, at most 256 combine blocks, and no ll128");
     }
     c.ll128CombineOnly = true;
+  }
+  c.combineBf16Push = !isDispatch && req.combineBf16Push && !c.ll128 && !c.ll128CombineOnly;
+  if (c.combineBf16Push && c.dtype != EpDType::Bf16) {
+    throw std::runtime_error(
+        "mori v2 ep: combineBf16Push sums bf16 rows, so it needs a bf16 combine");
   }
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
@@ -238,7 +248,7 @@ std::string EpDispatchInfo(const EpCfg& c) {
 
 std::string EpCombineInfo(const EpCfg& c) {
   std::string s = Describe(c);
-  if (EpCombinePush(c)) {
+  if (EpCombinePush(c) || c.combineBf16Push) {
     s += EpKv("pushWireBytes", EpCombinePushWireBytes(c)) +
          EpKv("pushLandRows", EpCombinePushLandRows(c)) +
          EpKv("pushLandOff", EpCombinePushLandOff(c));
@@ -249,6 +259,7 @@ std::string EpCombineInfo(const EpCfg& c) {
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
   if (cfg.combineFp8) return EpEntryName(cfg, "combine_fp8");
+  if (cfg.combineBf16Push) return EpEntryName(cfg, "combine_bf16p");
   if (!cfg.combineFp4) return EpEntryName(cfg, "combine");
   return EpEntryName(cfg, cfg.combineFp4F32Scale ? "combine_fp4b" : "combine_fp4");
 }
@@ -258,10 +269,9 @@ std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
-  if (EpCombinePush(cfg) && !EpArchIs1250()) {
+  if ((EpCombinePush(cfg) || cfg.combineBf16Push) && !EpArchIs1250()) {
     throw std::runtime_error(
-        "mori v2 ep: the fp4/fp8 push combine is gfx125x only (it moves every token through "
-        "TDM)");
+        "mori v2 ep: the push combine is gfx125x only (it moves every token through TDM)");
   }
   return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
 }
