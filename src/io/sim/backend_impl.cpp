@@ -433,6 +433,7 @@ void SimBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
                                                                : rdesc.hostname == self_.hostname);
   auto& peer = peers_[rdesc.key];
   if (peer && peer->desc == rdesc) return;
+  if (peer) RetirePeerLocked(rdesc.key, peer);
   peer = std::make_shared<Peer>();
   peer->desc = rdesc;
 }
@@ -440,7 +441,33 @@ void SimBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
 void SimBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   // In-flight transfers keep their Peer alive, as RDMA QPs outlive the engine registration.
   std::lock_guard<std::mutex> lock(peersMu_);
-  peers_.erase(rdesc.key);
+  auto it = peers_.find(rdesc.key);
+  if (it == peers_.end()) return;
+  RetirePeerLocked(rdesc.key, it->second);
+  peers_.erase(it);
+}
+
+void SimBackend::RetirePeerLocked(const EngineKey& remote, const std::shared_ptr<Peer>& peer) {
+  auto& retired = retiredPeers_[remote];
+  retired.erase(std::remove_if(retired.begin(), retired.end(),
+                               [](const std::weak_ptr<Peer>& p) { return p.expired(); }),
+                retired.end());
+  retired.push_back(peer);
+}
+
+std::vector<std::shared_ptr<SimBackend::Peer>> SimBackend::PeerIncarnations(
+    const EngineKey& remote) const {
+  std::vector<std::shared_ptr<Peer>> out;
+  std::lock_guard<std::mutex> lock(peersMu_);
+  auto it = peers_.find(remote);
+  if (it != peers_.end()) out.push_back(it->second);
+  auto retired = retiredPeers_.find(remote);
+  if (retired != retiredPeers_.end()) {
+    for (const auto& weak : retired->second) {
+      if (auto peer = weak.lock()) out.push_back(std::move(peer));
+    }
+  }
+  return out;
 }
 
 void SimBackend::RegisterMemory(MemoryDesc& desc) {
@@ -532,17 +559,39 @@ FenceResult SimBackend::FenceRemoteEngine(const EngineKey& remote) {
       if (key == remote && shutdown(fd, SHUT_RDWR) == 0) ++result.endpointsFenced;
     }
   }
-  // Our own connection to the peer, and transfers still in flight on it.
-  if (auto peer = GetPeer(remote)) {
+  // Our own connections to the peer, and transfers still in flight on them, including those of
+  // an incarnation deregistered or replaced while they were.
+  for (const auto& peer : PeerIncarnations(remote)) {
     std::lock_guard<std::mutex> lock(peer->mu);
     peer->fenceEpoch.fetch_add(1);
-    result.transfersFailed = peer->inFlight.load();
+    result.transfersFailed += peer->inFlight.load();
     if (peer->ep.has_value()) {
       ctx_->CloseEndpointNoThrow(*peer->ep);
       peer->ep.reset();
       ++result.endpointsFenced;
     }
     peer->verifiedMems.clear();
+  }
+  // Fail the queued ones now, as RdmaBackend's FailAll does, not at their simulated deadline.
+  // Taking them out of the queue makes them ours; one the timer thread has already taken
+  // fails in Complete on the epoch.
+  std::vector<Completion> cancelled;
+  {
+    std::lock_guard<std::mutex> lock(timerMu_);
+    std::vector<Completion> kept;
+    while (!timerQ_.empty()) {
+      Completion c = timerQ_.top();
+      timerQ_.pop();
+      const bool fenced =
+          c.peer && c.peer->desc.key == remote && c.peer->fenceEpoch.load() != c.fenceEpoch;
+      (fenced ? cancelled : kept).push_back(std::move(c));
+    }
+    for (auto& c : kept) timerQ_.push(std::move(c));
+  }
+  for (auto& c : cancelled) {
+    c.peer->inFlight.fetch_sub(1);
+    c.status->Update(StatusCode::ERR_RDMA_OP,
+                     "peer " + c.peer->desc.key + " was fenced; its connection was shut down");
   }
   MORI_IO_INFO("SimBackend({}) fenced engine {}: {} connection(s), {} transfer(s) in flight",
                sim::BackendTypeName(type_), remote, result.endpointsFenced, result.transfersFailed);
@@ -595,34 +644,46 @@ void SimBackend::EnsurePeerReady(const std::shared_ptr<Peer>& peer, const Memory
   if (peer->dead.load() || peer->verifiedMems.count(remote.id) != 0) return;
 
   const EngineKey& ekey = peer->desc.key;
-  if (!peer->ep.has_value()) {
-    try {
-      peer->ep = ctx_->Connect(peer->desc.host, peer->desc.port);
-    } catch (const std::exception& e) {
-      // Nothing listens there any more: the peer is gone. The caller fails the transfer.
-      MarkPeerDead(*peer, e.what());
-      return;
-    }
-    MORI_IO_INFO("SimBackend({}) connected engine {} to {} at {}:{}", sim::BackendTypeName(type_),
-                 self_.key, ekey, peer->desc.host, peer->desc.port);
-  }
-
   SimAskMemoryReply reply;
   bool fenced = false;
-  try {
-    WriteSimMsg(peer->ep->fd, SimMsgType::AskMemory, SimAskMemory{self_.key, remote.id});
-    auto [type, body] = ReadSimMsg(peer->ep->fd);
-    if (type == SimMsgType::Fenced) {
-      fenced = true;
-    } else if (type != SimMsgType::AskMemoryReply) {
-      throw std::runtime_error("unexpected reply type " + std::to_string(static_cast<int>(type)));
-    } else {
-      reply = UnpackSimMsg<SimAskMemoryReply>(body);
+  // A connection made earlier may have been cut since, by a fence of the peer's: if asking
+  // over it fails, ask once more over a new one. Only a peer nothing listens for is dead.
+  for (bool retried = false;; retried = true) {
+    const bool reused = peer->ep.has_value();
+    if (!reused) {
+      try {
+        peer->ep = ctx_->Connect(peer->desc.host, peer->desc.port);
+      } catch (const std::exception& e) {
+        // Nothing listens there any more: the peer is gone. The caller fails the transfer.
+        MarkPeerDead(*peer, e.what());
+        return;
+      }
+      ++peer->connGen;
+      MORI_IO_INFO("SimBackend({}) connected engine {} to {} at {}:{}", sim::BackendTypeName(type_),
+                   self_.key, ekey, peer->desc.host, peer->desc.port);
     }
-  } catch (const std::exception& e) {
-    MarkPeerDead(*peer, e.what());
-    throw std::runtime_error("SimBackend: control plane to engine " + ekey +
-                             " failed: " + e.what());
+    try {
+      WriteSimMsg(peer->ep->fd, SimMsgType::AskMemory, SimAskMemory{self_.key, remote.id});
+      auto [type, body] = ReadSimMsg(peer->ep->fd);
+      if (type == SimMsgType::Fenced) {
+        fenced = true;
+      } else if (type != SimMsgType::AskMemoryReply) {
+        throw std::runtime_error("unexpected reply type " + std::to_string(static_cast<int>(type)));
+      } else {
+        reply = UnpackSimMsg<SimAskMemoryReply>(body);
+      }
+      break;
+    } catch (const std::exception& e) {
+      if (reused && !retried) {
+        peer->verifiedMems.clear();
+        ctx_->CloseEndpointNoThrow(*peer->ep);
+        peer->ep.reset();
+        continue;
+      }
+      DropPeerConnectionLocked(*peer, e.what());
+      throw std::runtime_error("SimBackend: control plane to engine " + ekey +
+                               " failed: " + e.what());
+    }
   }
   if (fenced) {
     // The peer refused us on purpose; it closes this connection, and the next transfer
@@ -708,6 +769,7 @@ void SimBackend::Submit(const MemoryDesc& local, const SizeVec& localOffsets,
 
   std::shared_ptr<Peer> peer;
   uint64_t fenceEpoch = 0;
+  uint64_t connGen = 0;
   if (HasControlPlane()) {
     peer = GetPeer(remote.engineKey);
     if (!peer) {
@@ -736,14 +798,23 @@ void SimBackend::Submit(const MemoryDesc& local, const SizeVec& localOffsets,
                      "simulated peer " + remote.engineKey + " is unreachable");
       return;
     }
+    // The connection this transfer goes out on, taken together with its admission to it.
+    std::lock_guard<std::mutex> lock(peer->mu);
+    if (!peer->ep.has_value()) {
+      status->Update(StatusCode::ERR_RDMA_OP,
+                     "the connection to " + remote.engineKey + " was lost while posting");
+      return;
+    }
+    connGen = peer->connGen;
+    peer->inFlight.fetch_add(1);
   }
 
   status->SetCode(StatusCode::IN_PROGRESS);
   auto deadline = ReserveLink(isRead, bytes, sizes.size());
-  if (peer) peer->inFlight.fetch_add(1);
   {
     std::lock_guard<std::mutex> lock(timerMu_);
-    timerQ_.push(Completion{deadline, timerSeq_++, status, id, std::move(peer), fenceEpoch});
+    timerQ_.push(
+        Completion{deadline, timerSeq_++, status, id, std::move(peer), fenceEpoch, connGen});
   }
   timerCv_.notify_one();
   MORI_IO_TRACE("SimBackend({}) transfer {} {} {} bytes in {} segments to {}",
@@ -800,6 +871,10 @@ void SimBackend::Complete(Completion& c) {
       }
       if (c.peer->dead.load()) {
         err = "peer marked unreachable";
+      } else if (c.peer->connGen != c.connGen) {
+        // Its connection broke and a later transfer opened a new one; this one is lost with
+        // the old, and the new connection is fine.
+        err = "its connection was lost";
       } else if (PeerSocketClosedLocked(*c.peer)) {
         err = "control-plane connection closed";
         DropPeerConnectionLocked(*c.peer, err);

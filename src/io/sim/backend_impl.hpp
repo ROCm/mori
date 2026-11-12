@@ -139,6 +139,9 @@ class SimBackend : public Backend {
     EngineDesc desc;
     std::mutex mu;  // serializes this peer's control-plane socket
     std::optional<application::TCPEndpointHandle> ep;
+    // Bumped under `mu` by each new connection; a transfer submitted on an earlier one fails
+    // on completion, as one on a QP that has since been replaced.
+    uint64_t connGen{0};
     std::atomic<bool> dead{false};
     std::unordered_map<MemoryUniqueId, size_t> verifiedMems;
     // Bumped under `mu` by each fence; a transfer submitted before it fails on completion.
@@ -153,6 +156,7 @@ class SimBackend : public Backend {
     TransferUniqueId id;
     std::shared_ptr<Peer> peer;  // null for XGMI, which has no control plane
     uint64_t fenceEpoch{0};
+    uint64_t connGen{0};
     bool operator>(const Completion& o) const {
       return deadline != o.deadline ? deadline > o.deadline : seq > o.seq;
     }
@@ -162,6 +166,11 @@ class SimBackend : public Backend {
   bool IsFenced(const EngineKey& remote) const;
   bool IsSameNode(const EngineKey& remote) const;
   std::shared_ptr<Peer> GetPeer(const EngineKey& remote) const;
+  // The current Peer for `remote` and the earlier ones still alive: a peer deregistered or
+  // replaced while its transfers were in flight keeps their connection until they complete.
+  std::vector<std::shared_ptr<Peer>> PeerIncarnations(const EngineKey& remote) const;
+  // Keeps `peer`, which is leaving peers_, reachable by a fence. Called under peersMu_.
+  void RetirePeerLocked(const EngineKey& remote, const std::shared_ptr<Peer>& peer);
   // Connects and checks the remote memory once, as RdmaBackend does when it builds QPs and MRs.
   void EnsurePeerReady(const std::shared_ptr<Peer>& peer, const MemoryDesc& remote);
   bool PeerSocketClosedLocked(Peer& peer);
@@ -188,6 +197,7 @@ class SimBackend : public Backend {
 
   mutable std::mutex peersMu_;
   std::unordered_map<EngineKey, std::shared_ptr<Peer>> peers_;
+  std::unordered_map<EngineKey, std::vector<std::weak_ptr<Peer>>> retiredPeers_;  // peersMu_
   std::unordered_set<EngineKey> fencedPeers_;  // guarded by peersMu_
   // As XgmiBackend: never forgotten, since deregistering does not revoke an IPC mapping.
   std::unordered_map<EngineKey, bool> peerOnThisNodeSeen_;  // guarded by peersMu_
