@@ -100,6 +100,7 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   // Only the ordinary Combine pass reads it; keeping it false elsewhere lets the
   // other passes share one compiled module across load-first and plain buckets.
   cfg.kernelCfg.combineLoadFirst = (kind == EpInterNodeKernel::Combine) && request.combineLoadFirst;
+  cfg.kernelCfg.noRdmaAtomics = request.noRdmaAtomics;
   cfg.asyncLlMode = request.asyncLlMode;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);
@@ -130,6 +131,9 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
     throw std::runtime_error(
         "mori ep v2: asyncLlMode must be 0 (legacy), 1 (early), or "
         "2 (fused CTA receive)");
+  }
+  if (request.noRdmaAtomics && family == EpInterNodeFamily::AsyncLL) {
+    throw std::runtime_error("mori ep v2: AsyncLL has no write-signalling (noRdmaAtomics) variant");
   }
   if (cfg.asyncLlMode != 0 && family != EpInterNodeFamily::AsyncLL) {
     throw std::runtime_error("mori ep v2: asyncLlMode is only supported by AsyncLL plans");

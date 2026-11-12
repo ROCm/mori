@@ -224,6 +224,78 @@ __device__ __forceinline__ void EpInterNodePut(const ::mori::cco::ccoDevComm& co
       ::mori::cco::ccoCoopThread{});
 }
 
+// Atomic-free counterparts (kConfig.noRdmaAtomics), for NICs whose RDMA atomics cannot target GPU
+// memory. A flag WRITE replaces the add because every flag slot has a single writer per round
+// and its owner zeroes it before the next round, so the add always lands on zero. The flag
+// goes on the same QP after the data, so RC's in-order execution still publishes it last.
+__device__ __forceinline__ void EpInterNodeWriteValue(const ::mori::cco::ccoDevComm& comm,
+                                                      const EpInterNodeRegion dst, size_t dstOffset,
+                                                      uint64_t value, int pe, int qpId = 0) {
+  ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
+  gda.template putValue<::mori::cco::CCO_TEAM_WORLD>(pe, EpInterNodeWindow(dst),
+                                                     EpInterNodeOffset(dst, dstOffset), value);
+}
+
+// Same reservation shape as EpInterNodePutSignal for the data; the group leader then posts the
+// flag in a second reservation, so it lands behind every lane's write on this QP.
+__device__ __forceinline__ void EpInterNodePutThenWrite(
+    const ::mori::cco::ccoDevComm& comm, const EpInterNodeRegion dst, size_t dstOffset,
+    const EpInterNodeRegion src, size_t srcOffset, size_t bytes, const EpInterNodeRegion signal,
+    size_t signalOffset, uint64_t signalValue, int pe, int qpId) {
+  ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
+  gda.template put<::mori::cco::CCO_TEAM_WORLD, ::mori::cco::ccoGdaThreadAggregate>(
+      pe, EpInterNodeWindow(dst), EpInterNodeOffset(dst, dstOffset), EpInterNodeWindow(src),
+      EpInterNodeOffset(src, srcOffset), bytes, ::mori::cco::ccoGda_NoSignal{},
+      ::mori::cco::ccoCoopThread{});
+  const uint64_t active = __ballot(1);
+  if (static_cast<int>(threadIdx.x & (warpSize - 1)) ==
+      __ffsll(static_cast<unsigned long long>(active)) - 1) {
+    EpInterNodeWriteValue(comm, signal, signalOffset, signalValue, pe, qpId);
+  }
+}
+
+template <bool NoRdmaAtomics>
+__device__ __forceinline__ void EpInterNodeChunkPut(const ::mori::cco::ccoDevComm& comm,
+                                                    const EpInterNodeRegion dst, size_t dstOffset,
+                                                    const EpInterNodeRegion src, size_t srcOffset,
+                                                    size_t bytes, const EpInterNodeRegion signal,
+                                                    size_t signalOffset, uint64_t signalValue,
+                                                    int pe, int qpId) {
+  if constexpr (NoRdmaAtomics) {
+    EpInterNodePutThenWrite(comm, dst, dstOffset, src, srcOffset, bytes, signal, signalOffset,
+                            signalValue, pe, qpId);
+  } else {
+    EpInterNodePutSignal(comm, dst, dstOffset, src, srcOffset, bytes, signal, signalOffset,
+                         signalValue, pe, qpId);
+  }
+}
+
+template <bool NoRdmaAtomics>
+__device__ __forceinline__ void EpInterNodeCountSignal(const ::mori::cco::ccoDevComm& comm,
+                                                       const EpInterNodeRegion dst,
+                                                       size_t dstOffset, uint64_t value, int pe) {
+  if constexpr (NoRdmaAtomics) {
+    EpInterNodeWriteValue(comm, dst, dstOffset, value, pe);
+  } else {
+    EpInterNodeAtomicAdd(comm, dst, dstOffset, value, pe);
+  }
+}
+
+// Atomic-free combine barrier. Writes cannot accumulate, so each (sender, qp) gets its own slot,
+// after the worldSize per-rank slots the intra-node barrier and the atomic path use. Every rank
+// marks the op's largest active count (numQpToDrain), so peers whose buckets picked different
+// active counts still agree on which slots to wait for.
+template <EpInterNodeKernelCfg kConfig>
+__device__ __forceinline__ constexpr int EpInterNodeBarrierQps() {
+  return kConfig.numQpToDrain > kConfig.numQpPerPe ? kConfig.numQpToDrain : kConfig.numQpPerPe;
+}
+
+template <EpInterNodeKernelCfg kConfig>
+__device__ __forceinline__ constexpr size_t EpInterNodeBarrierQpSlot(int senderPe, int qpId) {
+  return kConfig.worldSize + static_cast<size_t>(senderPe) * EpInterNodeBarrierQps<kConfig>() +
+         qpId;
+}
+
 // Drains one stripe: flush(peer) only polls the QP belonging to its own
 // context, so each QP a peer was sent on has to be flushed separately.
 __device__ __forceinline__ void EpInterNodeQuiet(const ::mori::cco::ccoDevComm& comm, int pe,
@@ -434,11 +506,11 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs& args,
         if (count > 0) {
           size_t stagingTokOffset = tokenId * xferBytes;
           int qpId = (tokenId / warpSize) % config.numQpPerPe;
-          EpInterNodePutSignal(comm, args.reg(args.offDispatchInp), remoteIdx * xferBytes,
-                               args.reg(args.offDispatchStaging), stagingTokOffset,
-                               count * xferBytes, args.reg(args.offChunkFlag),
-                               (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
-                               proxyPe, qpId);
+          EpInterNodeChunkPut<kConfig.noRdmaAtomics>(
+              comm, args.reg(args.offDispatchInp), remoteIdx * xferBytes,
+              args.reg(args.offDispatchStaging), stagingTokOffset, count * xferBytes,
+              args.reg(args.offChunkFlag), (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
+              flag, proxyPe, qpId);
         }
         if (!args.replayMode) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
       }
@@ -463,8 +535,9 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs& args,
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       index_t numTokenSignal =
           core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      EpInterNodeAtomicAdd(comm, args.reg(args.offNodeRecvTokenNum), myNode * sizeof(uint64_t),
-                           numTokenSignal, proxyPe);
+      EpInterNodeCountSignal<kConfig.noRdmaAtomics>(comm, args.reg(args.offNodeRecvTokenNum),
+                                                    myNode * sizeof(uint64_t), numTokenSignal,
+                                                    proxyPe);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
   }
@@ -513,11 +586,11 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
         size_t stagingTokOffset = tokenId * xferBytes;
         int qpId = (tokenId / warpSize) % config.numQpPerPe;
 
-        EpInterNodePutSignal(comm, args.reg(args.offDispatchInp), remoteIdx * xferBytes,
-                             args.reg(args.offDispatchStaging), stagingTokOffset,
-                             tokenNum * xferBytes, args.reg(args.offChunkFlag),
-                             (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), tokenNum + 1,
-                             proxyPe, qpId);
+        EpInterNodeChunkPut<kConfig.noRdmaAtomics>(
+            comm, args.reg(args.offDispatchInp), remoteIdx * xferBytes,
+            args.reg(args.offDispatchStaging), stagingTokOffset, tokenNum * xferBytes,
+            args.reg(args.offChunkFlag), (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
+            tokenNum + 1, proxyPe, qpId);
       }
       if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
@@ -532,8 +605,9 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       index_t numTokenSignal =
           core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      EpInterNodeAtomicAdd(comm, args.reg(args.offNodeRecvTokenNum), myNode * sizeof(uint64_t),
-                           numTokenSignal, proxyPe);
+      EpInterNodeCountSignal<kConfig.noRdmaAtomics>(comm, args.reg(args.offNodeRecvTokenNum),
+                                                    myNode * sizeof(uint64_t), numTokenSignal,
+                                                    proxyPe);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[1] = 0;
   }
@@ -1303,10 +1377,18 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      for (int i = 0; i < config.numQpPerPe; i++) {
-        EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
-                             args.rank * sizeof(uint64_t),
-                             CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
+      if constexpr (kConfig.noRdmaAtomics) {
+        for (int i = 0; i < EpInterNodeBarrierQps<kConfig>(); i++) {
+          EpInterNodeWriteValue(comm, args.reg(args.offCrossDeviceBarrier),
+                                EpInterNodeBarrierQpSlot<kConfig>(args.rank, i) * sizeof(uint64_t),
+                                barrierFlag, proxyPe, i);
+        }
+      } else {
+        for (int i = 0; i < config.numQpPerPe; i++) {
+          EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
+                               args.rank * sizeof(uint64_t),
+                               CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
+        }
       }
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
@@ -1314,8 +1396,18 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
     uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * kCombineBarrierMarkerTotal)) {
+      if constexpr (kConfig.noRdmaAtomics) {
+        // A peer cannot write round r+1 before this rank leaves round r, so each slot is exactly
+        // barrierFlag; == turns a desync into a hang instead of an early, silent pass.
+        for (int i = 0; i < EpInterNodeBarrierQps<kConfig>(); i++) {
+          while (core::AtomicLoadRelaxedSystem(localBarrierPtr + EpInterNodeBarrierQpSlot<kConfig>(
+                                                                     proxyPe, i)) != barrierFlag) {
+          }
+        }
+      } else {
+        while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
+               (barrierFlag * kCombineBarrierMarkerTotal)) {
+        }
       }
     }
   }
@@ -1456,10 +1548,18 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      for (int i = 0; i < config.numQpPerPe; i++) {
-        EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
-                             args.rank * sizeof(uint64_t),
-                             CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
+      if constexpr (kConfig.noRdmaAtomics) {
+        for (int i = 0; i < EpInterNodeBarrierQps<kConfig>(); i++) {
+          EpInterNodeWriteValue(comm, args.reg(args.offCrossDeviceBarrier),
+                                EpInterNodeBarrierQpSlot<kConfig>(args.rank, i) * sizeof(uint64_t),
+                                barrierFlag, proxyPe, i);
+        }
+      } else {
+        for (int i = 0; i < config.numQpPerPe; i++) {
+          EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
+                               args.rank * sizeof(uint64_t),
+                               CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
+        }
       }
       __threadfence_system();
     }
@@ -1469,8 +1569,18 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * kCombineBarrierMarkerTotal)) {
+      if constexpr (kConfig.noRdmaAtomics) {
+        // A peer cannot write round r+1 before this rank leaves round r, so each slot is exactly
+        // barrierFlag; == turns a desync into a hang instead of an early, silent pass.
+        for (int i = 0; i < EpInterNodeBarrierQps<kConfig>(); i++) {
+          while (core::AtomicLoadRelaxedSystem(localBarrierPtr + EpInterNodeBarrierQpSlot<kConfig>(
+                                                                     proxyPe, i)) != barrierFlag) {
+          }
+        }
+      } else {
+        while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
+               (barrierFlag * kCombineBarrierMarkerTotal)) {
+        }
       }
     }
   }

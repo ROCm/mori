@@ -370,6 +370,14 @@ class TokOffExt:
         pass
 
 
+def _relaxed_ordering_enabled():
+    """MORI_IB_ENABLE_RELAXED_ORDERING as rdma.cpp reads it: exactly the value 1."""
+    try:
+        return int(os.environ.get("MORI_IB_ENABLE_RELAXED_ORDERING", "")) == 1
+    except ValueError:
+        return False
+
+
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     """C++/JIT-kernel EP op: gather combine, no quant, no replay.
 
@@ -398,6 +406,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
+        # MORI_EP_DISABLE_RDMA_ATOMICS as the C++ IsEnvVarEnabled reads it: set, and not
+        # 0/false/off/no. Compiled into the v2 / v2_ll plans (kConfig.noRdmaAtomics).
+        _af = os.environ.get("MORI_EP_DISABLE_RDMA_ATOMICS", "")
+        self._no_rdma_atomics = _af.lower() not in ("", "0", "false", "off", "no")
         lay = ll128_layout(cfg) if self._is1250 else None
         split = lay is not None and lay["max_tok"] < cfg.max_num_inp_token_per_rank
         self._ll128_geom = None if split else lay
@@ -810,6 +822,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         if cfg.is_scatter:
             bad.append("combine_mode='scatter' (the internode kernels gather)")
+        if getattr(self, "_no_rdma_atomics", False) and _relaxed_ordering_enabled():
+            bad.append(
+                "MORI_EP_DISABLE_RDMA_ATOMICS with MORI_IB_ENABLE_RELAXED_ORDERING=1 "
+                "(with relaxed ordering a WRITE signal may become visible before its data)"
+            )
         if cfg.enable_std_moe:
             bad.append("enable_std_moe (not implemented on the internode path)")
         if cfg.quant_type != "none":
@@ -1009,6 +1026,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append(
                 f"async_ll_transport={cfg.async_ll_transport!r} (have 'sdma', 'lsa')"
             )
+        if cfg.nodes > 1 and getattr(self, "_no_rdma_atomics", False):
+            bad.append(
+                "MORI_EP_DISABLE_RDMA_ATOMICS (cross-node AsyncLL signals with RDMA "
+                "atomics; use v2 / v2_ll)"
+            )
         if cfg.nodes > 1 and cfg.async_ll_transport == "lsa":
             bad.append(
                 "async_ll_transport='lsa' with gpu_per_node="
@@ -1204,6 +1226,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # The kernel's ACTIVE count; the allocation lives in the DevComm.
             numQpPerPe=active_qps,
             numQpToDrain=num_qp_to_drain,
+            noRdmaAtomics=getattr(self, "_no_rdma_atomics", False),
             quantType=(
                 cfg.quant_type.replace("_", "").lower()
                 if cfg.quant_type != "none"
@@ -1413,6 +1436,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # has to reach them. The internode request never carries it because its
         # geometry table supplies grids directly.
         request["mpCount"] = self._multi_processor_count
+        # AsyncLL has no write-signalling variant; cross-node ones are refused in the gate.
+        request["noRdmaAtomics"] = False
         request["asyncLlMode"] = self._asyncll_mode
         request["asyncLlFusedRecvCtas"] = self._asyncll_fused_ctas
         return request

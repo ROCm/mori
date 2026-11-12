@@ -88,7 +88,8 @@ def _cfg(**over):
 
 
 # Chosen to exercise the branches the formulas actually have: scales on/off, one
-# node vs many, and the max_total_recv_tokens clamp.
+# node vs many, the max_total_recv_tokens clamp, and enough QPs that the per-QP
+# barrier slots outgrow the per-rank ones.
 _CASES = {
     "base": _cfg(),
     "single_node": _cfg(world_size=8, gpu_per_node=8),
@@ -96,6 +97,7 @@ _CASES = {
         world_size=8, gpu_per_node=4, scale_dim=0, scale_type_size=0, num_qp_per_pe=1
     ),
     "recv_cap_clamped": _cfg(max_total_recv_tokens=256, num_experts_per_token=4),
+    "eight_qps": _cfg(num_qp_per_pe=8),
 }
 
 
@@ -138,6 +140,15 @@ def test_staging_holds_every_slot_the_kernel_indexes(name):
     slots = 2 * n_nodes * cfg.max_num_inp_token_per_rank
     comb_xfer = cfg.hidden_dim * cfg.max_token_type_size + cfg.num_experts_per_token * 4
     assert sizes["inter_staging"] >= slots * comb_xfer
+
+
+@pytest.mark.parametrize("name", sorted(_CASES))
+def test_barrier_has_a_slot_per_sender_and_qp(name):
+    """The atomic-free combine barrier keeps one u64 slot per (sender, qp) after
+    the world_size per-rank slots (``EpInterNodeBarrierQpSlot``)."""
+    cfg = _CASES[name]
+    sizes = dict(internode_regions(cfg))
+    assert sizes["cross_device_barrier"] >= cfg.world_size * (1 + cfg.num_qp_per_pe) * 8
 
 
 def test_gpu_per_node_must_divide_the_world():

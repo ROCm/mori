@@ -560,7 +560,7 @@ same intent):
    `MORI_CHECK_ATOMIC_RUNS` times (default 3), because the AINIC failure depends
    on the QP slot a run lands on. Any failed run **fails** the check: MORI-EP
    signals with atomics by default and hangs (`MORI_EP_DISABLE_RDMA_ATOMICS=1`
-   switches InterNodeV1/V1LL to write-based signalling).
+   switches InterNodeV1/V1LL and EPv2 v2/v2_ll to write-based signalling).
 7. **inter-node latency** — `ib_write_lat` to a peer: same peer IP
 
 Steps 5/7 are skipped without a peer IP — run from both nodes to test cross-node connectivity.

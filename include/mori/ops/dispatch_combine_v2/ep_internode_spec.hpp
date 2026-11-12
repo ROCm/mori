@@ -186,6 +186,8 @@ struct EpInterNodeRequest {
   EpInterNodeDType dtype = EpInterNodeDType::Bf16;
   // Applied to the ordinary Combine pass only; see EpInterNodeKernelCfg.
   bool combineLoadFirst = false;
+  // See EpInterNodeKernelCfg::noRdmaAtomics. Not for AsyncLL.
+  bool noRdmaAtomics = false;
   // AsyncLL only; the host resolves transport/env policy before constructing a plan.
   int asyncLlMode = 0;
   // geometry; 0 = the placeholder MakeEpInterNodeCfg picks
@@ -215,6 +217,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
   MORI_FIELD(quantType);
   MORI_FIELD(dtype);
   MORI_FIELD(combineLoadFirst);
+  MORI_FIELD(noRdmaAtomics);
   MORI_FIELD(asyncLlMode);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
@@ -225,7 +228,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeRequest, 21,
+    EpInterNodeRequest, 22,
     "added an EpInterNodeRequest field -- update VisitFields(EpInterNodeRequest) too");
 
 std::string EpInterNodeRequestSchema();
