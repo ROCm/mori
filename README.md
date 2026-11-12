@@ -64,7 +64,6 @@ It is built from [`docs/`](https://github.com/ROCm/mori/tree/main/docs) on every
 | MORI-EP (EPv1, EPv2) | EPv1 (built on SHMEM) and EPv2 (built on CCO) dispatch/combine: API, kernel types and backends, configuration, usage examples, how to choose | [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-EP-BENCHMARK.html) · [RDMA bandwidth](https://rocm.github.io/mori/rdma_bandwidth_utilization.html) |
 | MORI-FUSED | GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, built on MORI-CCO | [Guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html) |
 | MORI-CCO | Next-generation collective communication object: communicator, symmetric-memory windows, LSA / GDA / SDMA device APIs | [CCO Guide](https://rocm.github.io/mori/MORI-CCO-GUIDE.html) |
-| MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](https://rocm.github.io/mori/MORI-IR-GUIDE.html) |
 | MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](https://rocm.github.io/mori/MORI-IO-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) |
 | MORI-UMBP | Unified memory & bandwidth pool: tiered storage, distributed KV access, transfer simulation | [Single-Node Smoke Test](https://rocm.github.io/mori/MORI-UMBP-SINGLE-NODE-GUIDE.html) · [Simulation](https://rocm.github.io/mori/umbp-simulation.html) · [Calibration](https://rocm.github.io/mori/umbp-calibration.html) · [PD Benchmark](https://rocm.github.io/mori/MORI-UMBP-PD-BENCHMARK.html) · [Tier-Management Benchmark](https://rocm.github.io/mori/UMBP-TIER-MANAGEMENT-BENCHMARK.html) |
 | MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](https://rocm.github.io/mori/PROFILER.html) |
@@ -379,16 +378,6 @@ tools/run_internode_io_benchmark.sh --rank 0 --master-addr "10.194.129.65" --ifn
 ```
 
 See the [MORI-IO benchmark guide](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) for both engines and tuning.
-
-### Test MORI-IR (Triton + shmem integration, [guide](https://github.com/ROCm/mori/blob/main/python/mori/ir/README.md))
-
-```bash
-# Basic shmem put (2 GPUs)
-torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
-
-# Allreduce (8 GPUs)
-torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
-```
 
 ## Contribution Guide
 

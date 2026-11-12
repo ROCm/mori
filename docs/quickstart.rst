@@ -120,8 +120,8 @@ Allocate GPU memory accessible across all ranks:
 
 See the :doc:`Shmem Guide <MORI-SHMEM-GUIDE>` for full API reference.
 
-MORI-IR: Device Bitcode for GPU Kernels
------------------------------------------
+MORI-SHMEM: Device Bitcode for GPU Kernels
+------------------------------------------
 
 Use MORI shmem device functions inside Triton (or any LLVM-based) kernels:
 
@@ -147,7 +147,7 @@ Use MORI shmem device functions inside Triton (or any LLVM-based) kernels:
 
    my_kernel[(grid,)](buf, BLOCK=1024, extern_libs=get_extern_libs())
 
-See :doc:`MORI-IR Guide <MORI-IR-GUIDE>` for full device function table and non-Triton integration.
+See the :doc:`Shmem Guide <MORI-SHMEM-GUIDE>` for the full device function table and non-Triton integration, and the :doc:`CCO Guide <MORI-CCO-GUIDE>` for the CCO device API.
 
 Profiling with MORI-VIZ
 -------------------------
@@ -172,6 +172,5 @@ Next Steps
 
 * :doc:`MORI-EP Guide <MORI-EP-GUIDE>` — Full EP API reference and examples
 * :doc:`Shmem Guide <MORI-SHMEM-GUIDE>` — Symmetric memory concepts and APIs
-* :doc:`MORI-IR Guide <MORI-IR-GUIDE>` — Device bitcode integration for Triton
 * :doc:`MORI-IO Guide <MORI-IO-GUIDE>` — IO architecture and Python API
 * :doc:`Profiler <PROFILER>` — Warp-level kernel profiler

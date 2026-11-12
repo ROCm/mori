@@ -40,10 +40,9 @@ New to MORI? :doc:`Install it <installation>`, then work through the :doc:`quick
 
 .. toctree::
    :hidden:
-   :caption: MORI-SHMEM and MORI-IR
+   :caption: MORI-SHMEM
 
    SHMEM guide <MORI-SHMEM-GUIDE>
-   IR guide <MORI-IR-GUIDE>
 
 .. toctree::
    :hidden:
@@ -117,9 +116,6 @@ Components
    * - **MORI-SHMEM**
      - OpenSHMEM-style symmetric memory APIs for GPU memory and RDMA
      - :doc:`MORI-SHMEM-GUIDE`
-   * - **MORI-IR**
-     - Device bitcode that lets Triton and other GPU kernel frameworks call the shmem and CCO device APIs
-     - :doc:`MORI-IR-GUIDE`
    * - **MORI-CCO**
      - Next-Generation Collective Communication Object for GPUs: symmetric memory, natively designed for compute-communication fusion (LSA / GDA / SDMA)
      - :doc:`MORI-CCO-GUIDE`

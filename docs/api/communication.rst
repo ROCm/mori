@@ -267,8 +267,8 @@ RDMA-based P2P communication for KVCache transfer.
 
 See :doc:`MORI-IO Guide <../MORI-IO-GUIDE>` for full API reference.
 
-MORI-IR (Device Bitcode Integration)
---------------------------------------
+Device Bitcode Integration (mori.ir)
+-------------------------------------
 
 Framework-agnostic device bitcode and ABI metadata for integrating MORI shmem
 into GPU kernel frameworks (Triton, FlyDSL, MLIR, custom HIP, etc.).
@@ -347,4 +347,4 @@ into GPU kernel frameworks (Triton, FlyDSL, MLIR, custom HIP, etc.).
      - ``quiet_thread()``, ``fence_thread()``, ``barrier_all_block()``
      - Ordering and synchronization
 
-See :doc:`MORI-IR Guide <../MORI-IR-GUIDE>` for full device function table and integration examples.
+See the :doc:`Shmem Guide <../MORI-SHMEM-GUIDE>` for the full device function table and integration examples.
