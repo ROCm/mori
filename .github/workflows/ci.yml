@@ -1578,6 +1578,7 @@ jobs:
     needs: [scope, build, intranode-test, intranode-test-mi300x, intranode-test-rocm714, jax-intranode-test, umbp-unit-test, internode-test, internode-test-mi300x, cco]
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       statuses: write
     steps:
       - name: Check lane results
@@ -1607,3 +1608,56 @@ jobs:
             -f state="$STATE" -f context="MoRI CI (main)" \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             -f description="${REASON:0:140}"
+
+      - name: Report each job on main's commit
+        # The run's own checks do not show on the commit, so each job it ran goes
+        # there as MoRI CI (main) / <job>, linking to the job's log. Details only:
+        # a failed post must not fail the gate, which is main's verdict.
+        if: always() && github.event_name == 'schedule' && needs.scope.outputs.status == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" --jq '
+            def took:
+              if . >= 3600 then "\(. / 3600 | floor)h \(. % 3600 / 60 | floor)m"
+              elif . >= 60 then "\(. / 60 | floor)m \(. % 60)s"
+              else "\(.)s" end;
+            .jobs[]
+            | select(.status == "completed" and .conclusion != "skipped")
+            | select(.name | test("^(scope|CI gate|main CI badge)") | not)
+            | ((.completed_at | fromdateiso8601) - ((.started_at // .completed_at) | fromdateiso8601)
+               | floor | took) as $took
+            | (if .conclusion == "success" then ["success", "Successful in \($took)"]
+               elif .conclusion == "cancelled" then ["error", "Cancelled after \($took)"]
+               else ["failure", "Failing after \($took)"] end) as [$state, $description]
+            | [.name, $state, .html_url, $description] | @tsv' |
+          while IFS=$'\t' read -r NAME STATE URL DESCRIPTION; do
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" --silent \
+              -f state="$STATE" -f context="MoRI CI (main) / $NAME" \
+              -f target_url="$URL" -f description="$DESCRIPTION"
+          done
+
+  # The README's main CI badge (ci-badge.yml): the commit a scheduled run tests, in
+  # progress while its lanes run, then as the CI gate reported it. ci_scope.py's
+  # tested_anything tells these jobs from the lanes by their name.
+  badge-start:
+    name: main CI badge (start)
+    needs: scope
+    if: github.event_name == 'schedule' && needs.scope.outputs.status == 'true'
+    uses: ./.github/workflows/ci-badge.yml
+    permissions:
+      contents: write
+      statuses: read
+
+  badge-result:
+    name: main CI badge (result)
+    # Also after a run that tests nothing: that leaves the commit's MoRI CI (main)
+    # as an earlier run reported it, so the badge does not turn a failure green.
+    needs: [ci-gate, badge-start]
+    if: always() && github.event_name == 'schedule'
+    uses: ./.github/workflows/ci-badge.yml
+    permissions:
+      contents: write
+      statuses: read
