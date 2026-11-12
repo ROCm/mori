@@ -465,6 +465,13 @@ add_test(NAME test_in_memory_master_metadata_store COMMAND test_in_memory_master
 
 # test_page_backend — PageBackend (formerly PeerDramAllocator), one instance
 # == one medium (backend-agnostic refactor Phase 2)
+# L1 block pools: slot table, eviction order, cross-pool fetch and the gRPC
+# round trip, all over host memory.
+add_executable(test_l1_pool test_l1_pool.cpp)
+target_link_libraries(test_l1_pool PRIVATE umbp_l1 GTest::gtest_main)
+target_compile_features(test_l1_pool PRIVATE cxx_std_17)
+add_test(NAME test_l1_pool COMMAND test_l1_pool)
+
 add_executable(test_page_backend test_page_backend.cpp)
 target_link_libraries(test_page_backend PRIVATE umbp_common
                                                 GTest::gtest_main)
