@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo-dark.png">
-    <img alt="MORI" src="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo.png" width="420">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/mori-logo-dark.png">
+    <img alt="MORI" src="docs/assets/mori-logo.png" width="420">
   </picture>
 </p>
 
