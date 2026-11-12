@@ -70,3 +70,9 @@ from .communicator import (
     DevCommHandle,
     communicator_of_window,
 )
+
+from .trigger import (
+    TriggerBatch,
+    TriggerQueue,
+    peer_ptr,
+)

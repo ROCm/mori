@@ -115,6 +115,9 @@ class CCODevCommRequirements(_cco.DevCommRequirements):
 class CCOResource(ABC):
     """Abstract base for CCO communicator-owned resources."""
 
+    #: Closed before the communicator's other resources (see ``close_all_resources``).
+    close_first: bool = False
+
     def __init__(self, comm: Communicator) -> None:
         self._comm = comm
         self._closed = False
@@ -394,7 +397,10 @@ class Communicator:
 
     def close_all_resources(self) -> None:
         """Close all tracked resources (best-effort; errors are suppressed)."""
-        for r in reversed(list(self._resources)):  # snapshot: close() untracks
+        # Newest first; trigger queues first, since their chains address the other resources.
+        for r in sorted(
+            reversed(list(self._resources)), key=lambda r: not r.close_first
+        ):
             try:
                 r.close()
             except Exception:
