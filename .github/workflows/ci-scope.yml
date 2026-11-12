@@ -36,6 +36,9 @@ on:
       reason:
         description: Why these lanes run
         value: ${{ jobs.detect.outputs.reason }}
+      status:
+        description: A scheduled run set a pending commit status the CI gate must finish
+        value: ${{ jobs.detect.outputs.status }}
 
 jobs:
   detect:
@@ -53,6 +56,7 @@ jobs:
       groups: ${{ steps.scope.outputs.groups }}
       full: ${{ steps.scope.outputs.full }}
       reason: ${{ steps.scope.outputs.reason }}
+      status: ${{ steps.scope.outputs.status }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4

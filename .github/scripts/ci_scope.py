@@ -35,10 +35,13 @@ ci.yml hands the cco and fused lanes to ci_cco.yml. Writes these step outputs:
   full    full internode bench/stress sweeps, and the fused GEMM cases a PR skips:
           workflow_dispatch, or ci:full on a PR
   reason  why
+  status  true when a scheduled run tests main and the CI gate must finish the
+          commit status it set (MAIN_STATUS)
 
 A scheduled run on main picks lanes like a PR does, from the files changed since
 main's last green run, and runs nothing if main has not moved since its last run;
-workflow_dispatch runs everything. On a PR:
+workflow_dispatch runs everything. A scheduled run's checks do not show on the commit
+it tests, so it reports there as the commit status MAIN_STATUS. On a PR:
 
   - a draft runs nothing, unless it has the ci:full label;
   - ci:full runs everything, with the full internode sweeps; ci:mi300x adds the
@@ -561,6 +564,8 @@ def decide(env):
 
 
 MARKER = "<!-- ci-scope -->"
+# Also in ci.yml's CI gate, which sets the final state.
+MAIN_STATUS = "MoRI CI (main)"
 # Each lane's jobs and the groups that start them (their if: in ci.yml, ci_cco.yml).
 JOBS = {
     "mori": (
@@ -660,6 +665,33 @@ def post_comment(env, body):
         )
 
 
+def post_main_status(env, state, description):
+    """Set MAIN_STATUS on the commit a scheduled run tests. A failure only warns."""
+    run = "{}/{}/actions/runs/{}".format(
+        env.get("GITHUB_SERVER_URL", "https://github.com"),
+        env.get("REPO", ""),
+        env.get("GITHUB_RUN_ID", ""),
+    )
+    try:
+        gh_lines(
+            "-X",
+            "POST",
+            f"repos/{env['REPO']}/statuses/{env['HEAD_SHA']}",
+            "-f",
+            f"state={state}",
+            "-f",
+            f"context={MAIN_STATUS}",
+            "-f",
+            f"target_url={run}",
+            "-f",
+            f"description={description[:140]}",
+        )
+    except subprocess.CalledProcessError as e:
+        print(
+            f"::warning::could not set {MAIN_STATUS}: {(e.stderr or '').strip()[:300]}"
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -699,12 +731,22 @@ def main():
         print(f"::error::{e.code}")
         return 1
     names = [g for g in GROUPS if g in groups]
+    # pending until the CI gate finishes it; a commit main already reported on (or
+    # one with nothing that needs GPU CI) gets nothing left to finish.
+    status = False
+    if env.get("EVENT_NAME") == "schedule" and env.get("HEAD_SHA"):
+        if any(lanes.values()):
+            post_main_status(env, "pending", reason)
+            status = True
+        elif not reason.startswith("main has not moved"):
+            post_main_status(env, "success", reason)
     with open(env["GITHUB_OUTPUT"], "a") as out:
         for lane in LANES:
             out.write(f"{lane}={str(lanes[lane]).lower()}\n")
         out.write(f"groups={json.dumps(names)}\n")
         out.write(f"full={str(full).lower()}\n")
         out.write(f"reason={reason}\n")
+        out.write(f"status={str(status).lower()}\n")
     summary = [
         "## CI scope",
         "",

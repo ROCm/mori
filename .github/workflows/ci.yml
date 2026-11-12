@@ -48,13 +48,14 @@ jobs:
   scope:
     name: scope
     uses: ./.github/workflows/ci-scope.yml
-    # The one job that may write: it keeps the routing comment on the PR. It reads
-    # this workflow's runs and their jobs to scope the scheduled runs on main.
+    # It keeps the routing comment on the PR, and on main the commit status of a
+    # scheduled run. It reads this workflow's runs and their jobs to scope those runs.
     permissions:
       actions: read
       contents: read
       pull-requests: write
       checks: read
+      statuses: write
     with:
       comment: true
 
@@ -1556,8 +1557,11 @@ jobs:
     if: always()
     needs: [scope, build, intranode-test, intranode-test-mi300x, intranode-test-rocm10, jax-intranode-test, umbp-unit-test, internode-test, internode-test-mi300x, cco]
     runs-on: ubuntu-latest
+    permissions:
+      statuses: write
     steps:
       - name: Check lane results
+        id: check
         env:
           NEEDS: ${{ toJSON(needs) }}
           REASON: ${{ needs.scope.outputs.reason }}
@@ -1570,3 +1574,16 @@ jobs:
           if ! grep -qP '^scope\tsuccess$' results.tsv; then
             echo "::error::CI scope did not succeed"; exit 1
           fi
+
+      - name: Report on main's commit
+        # The commit status the scope set as pending, with this run's result.
+        if: always() && github.event_name == 'schedule' && needs.scope.outputs.status == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE: ${{ steps.check.outcome == 'success' && 'success' || (contains(needs.*.result, 'cancelled') && 'error' || 'failure') }}
+          REASON: ${{ needs.scope.outputs.reason }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$STATE" -f context="MoRI CI (main)" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            -f description="${REASON:0:140}"
