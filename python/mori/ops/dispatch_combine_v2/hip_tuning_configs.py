@@ -175,6 +175,20 @@ _DISPATCH_TABLE: dict = {
             None: ((512, 64, 8), (2048, 64, 16), (None, 128, 16)),
             "fp4": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
         },
+        # hidden 5120 (DeepSeek-V4.1-Flash), topk 6, 96 experts a rank, bf16 (only shape swept); the 64x16 single-shot default
+        # never completes at this hidden size (64x4/8/12 and 16-warp combine do). Graph us, one run:
+        #   ct     64x8   64x12  128x8  128x12
+        #   64     27.7   26.4   27.7   26.4
+        #   512    32.5   33.5   32.2   31.6
+        #   2048   63.2   69.2   57.7   61.2
+        #   8192  188.3  183.7  170.7  171.6
+        (4, 5120, 6, 96): {
+            "bf16": ((None, 128, 8),),
+        },
+        # The same hidden for its 128-expert topk-3 draft MoE (32 experts a rank).
+        (4, 5120, 3, 32): {
+            "bf16": ((None, 128, 8),),
+        },
         # EP8 on two 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-03; the grid stays at 64 blocks
         # (the rest of the CUs belong to the co-resident GEMM). What wins is one token a warp:
         # past 1024 tokens 64x16 gives some warps a second token, and its metadata split
@@ -297,6 +311,8 @@ _COMBINE_TABLE: dict = {
             (1024, 256, 8),
             (None, 192, 8),
         ),
+        (4, 5120, 6, 96): ((None, 64, 8),),
+        (4, 5120, 3, 32): ((None, 64, 8),),
     },
     # The gfx1250-strict parts, as their dispatch rows.
     "gfx1250-strict": {
