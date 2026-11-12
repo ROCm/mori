@@ -1,0 +1,174 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// UMBP L1 block pool: UMBP owns the GPU (HBM) memory an engine keeps its paged
+// KV cache in, the slot table over it, and a content index shared by every pool
+// in a group. An engine process maps its pool and reads/writes slots in place;
+// it asks this service which slot to use and what a slot holds.
+//
+// The service is application-agnostic. It knows fixed-size slots, opaque keys
+// and byte regions; it never sees tokens, layers or sequences.
+
+syntax = "proto3";
+
+package umbp.l1;
+
+service UMBPL1Pool {
+  // Create (or re-attach to) a pool of `bytes` on `device` and return a handle
+  // the caller maps into its own address space.
+  rpc Attach(AttachRequest) returns (AttachResponse);
+  // Declare how the pool's bytes divide into slots.
+  rpc BindLayout(BindLayoutRequest) returns (StatusResponse);
+  // Take over slot management for a bound pool. Resets every slot to vacant.
+  rpc Open(OpenRequest) returns (OpenResponse);
+  // Hand out slots for new content, evicting cached content only as far as
+  // the caller says it must have.
+  rpc Allocate(AllocateRequest) returns (AllocateResponse);
+  // Hold / release / publish transitions, applied in order.
+  rpc Apply(ApplyRequest) returns (StatusResponse);
+  // The owner's device has finished every write issued up to a point in time.
+  rpc Commit(CommitRequest) returns (StatusResponse);
+  // Make the longest leading run of `keys` resident in this pool by copying
+  // from other pools in the group.
+  rpc Fetch(FetchRequest) returns (FetchResponse);
+  // Drop every key of this pool.
+  rpc Clear(PoolRequest) returns (StatusResponse);
+  // Release the pool and its memory.
+  rpc Detach(PoolRequest) returns (StatusResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+message StatusResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message PoolRequest {
+  string pool_id = 1;
+}
+
+message AttachRequest {
+  string pool_id = 1;
+  // Pools share content only within a group. The caller chooses a group id
+  // that changes whenever the meaning of a slot's bytes changes.
+  string group = 2;
+  int32 device = 3;
+  uint64 bytes = 4;
+}
+
+message AttachResponse {
+  bool ok = 1;
+  string error = 2;
+  // How `handle` is to be opened: "hip_ipc" (hipIpcOpenMemHandle) or "host".
+  string handle_kind = 3;
+  bytes handle = 4;
+  uint64 bytes = 5;
+  // False when an existing pool with the same shape was returned.
+  bool created = 6;
+}
+
+// Slot i of a region occupies [offset + i * unit_bytes, offset + (i+1) * unit_bytes).
+message Region {
+  uint64 offset = 1;
+  uint64 unit_bytes = 2;
+}
+
+message BindLayoutRequest {
+  string pool_id = 1;
+  uint32 num_slots = 2;
+  repeated Region regions = 3;
+}
+
+message OpenRequest {
+  string pool_id = 1;
+}
+
+message OpenResponse {
+  bool ok = 1;
+  string error = 2;
+  uint32 num_slots = 3;
+}
+
+message AllocateRequest {
+  string pool_id = 1;
+  // Slots wanted. Vacant slots are handed out up to this many.
+  uint32 count = 2;
+  // Slots the caller cannot do without: cached content is evicted only to
+  // reach this many. A caller that asks ahead of need sets it below `count`,
+  // so asking ahead never destroys content early.
+  uint32 min_count = 3;
+}
+
+message AllocateResponse {
+  bool ok = 1;
+  string error = 2;
+  // May be shorter than `count` when the pool has no more free slots.
+  repeated uint32 slots = 3 [packed = true];
+  // Keys whose content was destroyed to hand these slots out.
+  repeated bytes evicted_keys = 4;
+}
+
+enum OpKind {
+  OP_HOLD = 0;     // owner takes a free slot for the content it already holds
+  OP_RELEASE = 1;  // owner no longer references the slot
+  OP_PUBLISH = 2;  // slot now holds the content named by the next key
+}
+
+message ApplyRequest {
+  string pool_id = 1;
+  repeated OpKind kinds = 2 [packed = true];
+  repeated uint32 slots = 3 [packed = true];
+  // One per OP_PUBLISH, in op order.
+  repeated bytes keys = 4;
+  // When these transitions were decided, on a clock the owner also uses for
+  // Commit. The owner's device may still be writing a slot it has just
+  // published or released, so other pools may not read such a slot, and a
+  // fetch may not fill it, until a Commit at or past this stamp. 0 = settled.
+  uint64 stamp = 5;
+}
+
+message CommitRequest {
+  string pool_id = 1;
+  // Every device write issued before this instant has landed.
+  uint64 committed = 2;
+}
+
+message FetchRequest {
+  string pool_id = 1;
+  repeated bytes keys = 2;
+}
+
+message FetchResponse {
+  bool ok = 1;
+  string error = 2;
+  // slots[i] holds keys[i]; shorter than `keys` when the run stopped early.
+  repeated uint32 slots = 3 [packed = true];
+  // Keys of this pool destroyed to make room.
+  repeated bytes evicted_keys = 4;
+  uint32 copied_slots = 5;
+  uint64 copied_bytes = 6;
+  uint64 copy_micros = 7;
+}
+
+message StatsRequest {}
+
+message PoolStats {
+  string pool_id = 1;
+  string group = 2;
+  int32 device = 3;
+  uint64 bytes = 4;
+  uint32 num_slots = 5;
+  uint32 held = 6;
+  uint32 cached = 7;
+  uint32 vacant = 8;
+  uint64 evicted = 9;
+  uint64 fetched_in_slots = 10;
+  uint64 fetched_in_bytes = 11;
+  uint64 served_out_slots = 12;
+  uint64 copy_micros = 13;
+}
+
+message StatsResponse {
+  repeated PoolStats pools = 1;
+}
