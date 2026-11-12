@@ -281,6 +281,8 @@ class EpDispatchCombineOp:
                 "EP v1 (mori.ops.dispatch_combine) runs on wave64 GPUs only, "
                 f"this one is wave{wave}; use EP v2 (mori.ops.dispatch_combine_v2)"
             )
+        if os.environ.get("MORI_EP_COMM"):
+            logger.warning("MORI_EP_COMM is ignored: EP v1 always uses shmem")
         self.config = config
         self._warp_size = 64
         _ensure_jit_kernels(config.kernel_type)
