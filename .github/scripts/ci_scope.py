@@ -465,7 +465,7 @@ def tested_anything(repo, run_id):
         "--jq",
         '.jobs[] | select(.conclusion != "skipped") | .name',
     )
-    return any(not n.startswith(("scope", "CI gate")) for n in names)
+    return any(not n.startswith(("scope", "CI gate", "main CI badge")) for n in names)
 
 
 def changed_between(repo, base, head):
@@ -564,7 +564,8 @@ def decide(env):
 
 
 MARKER = "<!-- ci-scope -->"
-# Also in ci.yml's CI gate, which sets the final state.
+# Also in ci.yml's CI gate, which sets the final state, and in ci-badge.yml, which
+# shows it in the README.
 MAIN_STATUS = "MoRI CI (main)"
 # Each lane's jobs and the groups that start them (their if: in ci.yml, ci_cco.yml).
 JOBS = {
