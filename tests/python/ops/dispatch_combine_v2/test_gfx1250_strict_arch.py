@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import unittest
+from itertools import product
 from pathlib import Path
 from unittest.mock import patch
 
@@ -117,14 +118,21 @@ class TuningKeyTest(unittest.TestCase):
 
     def test_ep4_hidden5120_avoids_the_16_warp_dispatch(self):
         # The 64x16 single-shot dispatch never completes at hidden 5120.
-        for topk, epr in ((6, 96), (3, 32)):
+        want = {(256, 4, 64, 8), (256, 4, 256, 4), (256, 8, 256, 4)}
+        for (topk, epr), dtype in product(((6, 96), (3, 32)), ("bf16", "fp8", "fp4")):
             t = self.lookup(
-                self.REV1, {}, (4, 5120, topk), dtype="bf16", experts_per_rank=epr
+                self.REV1, {}, (4, 5120, topk), dtype=dtype, experts_per_rank=epr
             )
-            with self.subTest(topk=topk):
+            with self.subTest(topk=topk, dtype=dtype):
                 self.assertEqual(
-                    {(b[1], b[2], b[3], b[4]) for b in t["schedule"]}, {(128, 8, 64, 8)}
+                    {(b[1], b[2], b[3], b[4]) for b in t["schedule"]}, want
                 )
+
+    def test_ep4_hidden5120_rev0_stays_within_its_cus(self):
+        for topk, epr in ((6, 96), (3, 32)):
+            t = self.lookup(self.REV0, {}, (4, 5120, topk), experts_per_rank=epr)
+            with self.subTest(topk=topk):
+                self.assertLessEqual(max(max(b[1], b[3]) for b in t["schedule"]), 128)
 
     def test_rev0_row_wins(self):
         row = {"gfx1250-strict": {self.SHAPE + (None,): {None: ((None, 32, 4),)}}}
