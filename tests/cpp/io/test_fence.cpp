@@ -97,6 +97,8 @@ constexpr int kStaleWriteTimeoutMs = 30000;
 // A peer whose rebuild was refused while fenced waits before trying again (failed QP
 // replacement backs off), so after unfencing it may take a few attempts to get back.
 constexpr int kRebuildBudgetMs = 15000;
+// Time for the Unfenced notice, one local TCP message, to reach the producer.
+constexpr int kUnfencedNoticeMs = 500;
 
 const char* const kProducer = "fence_producer";
 const char* const kReceiver = "fence_receiver";
@@ -413,6 +415,53 @@ void TestRestartedPeerRefusedUntilUnfenced(Rig& rig) {
   CHECK(dst.AllEqual(0xF6), "the restarted peer's write must land");
 }
 
+void TestIdleProducerRebuildsAtOnceAfterUnfence(Rig& rig) {
+  Buffer src(rig.producer.get(), 0x5A);
+  Buffer dst(rig.receiver.get(), 0x00);
+  CHECK(WriteAndWait(rig.producer.get(), src, dst), "warm-up write must succeed");
+
+  // The producer sends nothing while fenced, so nothing of its own tells it the connection
+  // was cut. Only the receiver's Unfenced notice, which names the cut connections, can.
+  CHECK(rig.receiver->FenceRemoteEngine(kProducer).Ok(), "fence must succeed");
+  CHECK(rig.receiver->UnfenceRemoteEngine(kProducer), "producer must have been fenced");
+  std::this_thread::sleep_for(std::chrono::milliseconds(kUnfencedNoticeMs));
+
+  // Its first write must rebuild the connection, not go out on the cut QP and fail after
+  // the transport's retries.
+  dst.Fill(0x00);
+  src.Fill(0x6B);
+  CHECK(WriteAndWait(rig.producer.get(), src, dst),
+        "the first write after the unfence must rebuild the cut connection and succeed");
+  CHECK(dst.AllEqual(0x6B), "the write over the rebuilt connection must land");
+}
+
+void TestFenceForgetsInboundNotifications(Rig& rig) {
+  Buffer src(rig.producer.get(), 0x3C);
+  Buffer dst(rig.receiver.get(), 0x00);
+  const TransferUniqueId id = rig.producer->AllocateTransferUniqueId();
+  TransferStatus status;
+  rig.producer->Write(src.desc, 0, dst.desc, 0, kBufSize, &status, id);
+  CHECK(WaitTerminal(&status, kTransferTimeoutMs) && status.Succeeded(), "write must succeed");
+
+  // The notification follows the data; wait until the receiver has counted it.
+  TransferStatus inbound;
+  bool seen = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+  while (!seen && std::chrono::steady_clock::now() < deadline) {
+    seen = rig.receiver->PopInboundTransferStatus(kProducer, id, &inbound);
+    if (!seen) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  CHECK(seen, "the receiver must see the write's notification");
+
+  // A producer restarted under the same key numbers its transfers from zero again, so
+  // after the fence this id must not read as complete before a new transfer arrives.
+  CHECK(rig.receiver->FenceRemoteEngine(kProducer).Ok(), "fence must succeed");
+  TransferStatus stale;
+  CHECK(!rig.receiver->PopInboundTransferStatus(kProducer, id, &stale),
+        "a fence must forget the peer's completed notifications");
+  CHECK(rig.receiver->UnfenceRemoteEngine(kProducer), "producer must have been fenced");
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                    Main                                     */
 /* -------------------------------------------------------------------------- */
@@ -443,6 +492,9 @@ int main() {
        TestLiveProducerRebuildsAfterFence},
       {"7. peer restarted while fenced is refused until unfenced",
        TestRestartedPeerRefusedUntilUnfenced},
+      {"8. idle producer: its first write after the unfence rebuilds",
+       TestIdleProducerRebuildsAtOnceAfterUnfence},
+      {"9. fence forgets the peer's completed notifications", TestFenceForgetsInboundNotifications},
   };
 
   int passed = 0;
