@@ -63,6 +63,7 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/metrics/prometheus_metric_sink.h"
 #include "umbp/distributed/tier_proto.h"
+#include "umbp/l1/l1_service.h"
 #include "umbp/sim/sim.h"
 #include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
@@ -552,6 +553,11 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     int selected_port = 0;
     builder.AddListeningPort(address_, grpc::InsecureServerCredentials(), &selected_port);
     builder.RegisterService(this);
+    // L1 block pools ride the same socket. Registering costs nothing: no GPU
+    // context or memory exists until an engine attaches a pool.
+    l1_manager_ = std::make_shared<l1::PoolManager>(l1::MakeHipMemoryApi());
+    l1_service_ = l1::MakeL1PoolService(l1_manager_);
+    builder.RegisterService(l1_service_.get());
     mode_t old_umask = umask(0077);
     server_ = builder.BuildAndStart();
     umask(old_umask);
@@ -1776,6 +1782,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   const bool concurrent_backend_;
   std::string address_;
   std::string fd_socket_path_;
+  // Declared before server_ so they outlive it: handlers may still be running
+  // until the server is destroyed.
+  std::shared_ptr<l1::PoolManager> l1_manager_;
+  std::unique_ptr<grpc::Service> l1_service_;
   std::unique_ptr<grpc::Server> server_;
   std::atomic<bool> shutdown_{false};
 
