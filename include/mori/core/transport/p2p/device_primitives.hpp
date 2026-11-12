@@ -753,13 +753,6 @@ __device__ __forceinline__ float SatFiniteForFp8(float v) {
 }
 #endif
 
-template <typename T>
-inline constexpr bool kWarpAccumPackedDecode =
-    kWarpAccumPackedFp8<T> || kWarpAccumPackedFp4<T>;// || std::is_same_v<T, hip_bfloat16>;
-template <typename T>
-inline constexpr bool kWarpAccumPackedEncode =
-    kWarpAccumPackedFp8<T> || kWarpAccumPackedFp4<T>;// || kWarpAccumPackedBf16<T>;
-
 // acc[j] += element j of the VecBytes-wide source w, times scale. Element j is the j-th T, so for
 // fp4x2 one acc entry (a float2) is one byte.
 template <typename T, int VecBytes, typename AccT>
@@ -772,7 +765,7 @@ __device__ __forceinline__ void WarpAccumPackedDecode(AccT* acc, const uint32_t*
       acc[2 * k + 1] += __uint_as_float(w[k] & 0xFFFF0000u) * scale;
     }
 #if HIP_FP8_CVT_FAST_PATH
-    if constexpr (kWarpAccumPackedFp8<T>) {
+    else if constexpr (kWarpAccumPackedFp8<T>) {
       const auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(w[k], false);
       const auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(w[k], true);
       acc[4 * k + 0] += lo[0] * scale;
@@ -782,23 +775,33 @@ __device__ __forceinline__ void WarpAccumPackedDecode(AccT* acc, const uint32_t*
     }
 #endif
 #ifdef MORI_HAS_OCP_FP
-    if constexpr (kWarpAccumPackedFp4<T>) {
+    else if constexpr (kWarpAccumPackedFp4<T>) {
       acc[4 * k + 0] += fp4x2_to_float2<0>(w[k]) * scale;
       acc[4 * k + 1] += fp4x2_to_float2<1>(w[k]) * scale;
       acc[4 * k + 2] += fp4x2_to_float2<2>(w[k]) * scale;
       acc[4 * k + 3] += fp4x2_to_float2<3>(w[k]) * scale;
     }
 #endif
+    else {
+      // Generic fallback (no packed hardware conversion for T): decode the 4 / sizeof(T)
+      // elements of T packed into this dword one at a time, same as the scalar path.
+      constexpr int kPerDword = 4 / sizeof(T);
+#pragma unroll
+      for (int j = 0; j < kPerDword; ++j) {
+        acc[k * kPerDword + j] += AccT(VecElem<T>(w[k], j)) * scale;
+      }
+    }
   }
 }
 
 // One output dword of T from the accumulators of its 4 / sizeof(T) elements; the packed
 // counterpart of T(acc[j]) for each of them.
 template <typename T, typename AccT>
-__device__ __forceinline__ uint32_t WarpAccumPackedEncodeWord(const AccT* acc) {
+__device__ __forceinline__ uint32_t AccumPackedEncodeWord(const AccT* acc) {
   uint32_t word = 0;
+  if constexpr(false) { }
 #if HIP_FP8_CVT_FAST_PATH
-  if constexpr (kWarpAccumPackedFp8<T>) {
+  else if constexpr (kWarpAccumPackedFp8<T>) {
     word = __builtin_amdgcn_cvt_pk_fp8_f32(SatFiniteForFp8<T>(acc[0]), SatFiniteForFp8<T>(acc[1]),
                                            word, false);
     word = __builtin_amdgcn_cvt_pk_fp8_f32(SatFiniteForFp8<T>(acc[2]), SatFiniteForFp8<T>(acc[3]),
@@ -806,20 +809,32 @@ __device__ __forceinline__ uint32_t WarpAccumPackedEncodeWord(const AccT* acc) {
   }
 #endif
 #if defined(__gfx950__)
-  if constexpr (kWarpAccumPackedBf16<T>) {
+  else if constexpr (kWarpAccumPackedBf16<T>) {
     typedef float F32x2 __attribute__((ext_vector_type(2)));
     typedef __bf16 Bf16x2 __attribute__((ext_vector_type(2)));
     word = __builtin_bit_cast(uint32_t, __builtin_convertvector((F32x2){acc[0], acc[1]}, Bf16x2));
   }
 #endif
 #ifdef MORI_HAS_OCP_FP
-  if constexpr (kWarpAccumPackedFp4<T>) {
+  else if constexpr (kWarpAccumPackedFp4<T>) {
     word = float2_to_fp4x2<0>(word, acc[0]);
     word = float2_to_fp4x2<1>(word, acc[1]);
     word = float2_to_fp4x2<2>(word, acc[2]);
     word = float2_to_fp4x2<3>(word, acc[3]);
   }
 #endif
+  else {
+    // Generic fallback (no packed hardware conversion for T): pack the 4 / sizeof(T) accumulators
+    // of this dword by independently narrowing each one, T(acc[j]), same as the scalar path.
+    constexpr int n = 4 / sizeof(T);
+    union {
+      T vals[n];
+      uint32_t w;
+    } packed;
+#pragma unroll
+    for (int j = 0; j < n; ++j) packed.vals[j] = T(acc[j]);
+    word = packed.w;
+  }
   return word;
 }
 
@@ -873,15 +888,8 @@ __forceinline__ __device__ void WarpAccumLFImpl(T* __restrict__ dest, T* const* 
 #pragma unroll AccumNum
       for (int i = 0; i < AccumNum; ++i) {
         if (csrcs[i] == nullptr) continue;
-        if constexpr (kWarpAccumPackedDecode<T>) {
-          WarpAccumPackedDecode<T, VecBytes>(acc[u], reinterpret_cast<const uint32_t*>(&vals[u][i]),
-                                             scales[i]);
-        } else {
-#pragma unroll vecSize
-          for (int j = 0; j < vecSize; ++j) {
-            acc[u][j] += AccumFp32Type(VecElem<T>(vals[u][i], j)) * scales[i];
-          }
-        }
+        WarpAccumPackedDecode<T, VecBytes>(acc[u], reinterpret_cast<const uint32_t*>(&vals[u][i]),
+                                           scales[i]);
       } // for AccumNum
     } // for Unroll
 
@@ -892,16 +900,9 @@ __forceinline__ __device__ void WarpAccumLFImpl(T* __restrict__ dest, T* const* 
     };
 #pragma unroll Unroll
     for (int u = 0; u < Unroll; ++u) {
-      if constexpr (kWarpAccumPackedEncode<T>) {
 #pragma unroll
-        for (int k = 0; k < VecBytes / 4; ++k) {
-          outWord[u][k] = WarpAccumPackedEncodeWord<T>(&acc[u][k * (4 / sizeof(T))]);
-        }
-      } else {
-#pragma unroll vecSize
-        for (int j = 0; j < vecSize; ++j) {
-          outVal[u][j] = T(acc[u][j]);
-        }
+      for (int k = 0; k < VecBytes / 4; ++k) {
+        outWord[u][k] = AccumPackedEncodeWord<T>(&acc[u][k * (4 / sizeof(T))]);
       }
       const size_t ofs = offset + (laneId + u * warpSize) * vecSize;
       store<VecBytes>(dest + ofs, outVec[u]);
