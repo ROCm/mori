@@ -1732,10 +1732,12 @@ def _tune(cfg, dist_handle, device, args, comm):
     # Otherwise the count is this run's resolved default, and recording it would
     # pin production to it. A pair sweep always measures the counts: it requires
     # --tuning-qps or --tuning-candidate, and either names them.
+    # A bucket can hold one phase's rule before the other is tuned.
     table_names_count = bool(
         table_row
-        and (
-            table_row["dispatch"][3] is not None or table_row["combine"][3] is not None
+        and any(
+            table_row[name] is not None and table_row[name][3] is not None
+            for name in ("dispatch", "combine")
         )
     )
     report_active_qps = (
