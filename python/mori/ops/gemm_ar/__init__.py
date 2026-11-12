@@ -51,11 +51,16 @@ _LAZY = {
     "build_sdma_phases": "kernels_sdma",
     "build_sdma_ar": "kernels_sdma",
     "build_lsa_ar": "kernels_lsa",
+    "GateProducerSpec": "gates",
+    "GateTable": "gates",
+    "gate_view": "gates",
 }
 
 __all__ = [
     "MAX_WORLD",
     "ArConfig",
+    "GateProducerSpec",
+    "GateTable",
     "GemmAllReduceOp",
     "GemmReduceScatterOp",
     "Mxfp8GemmOp",
@@ -66,6 +71,7 @@ __all__ = [
     "build_sdma_phases",
     "compile_fused_gemm_scatter",
     "counter_chunks",
+    "gate_view",
     "padded_m",
     "preshuffle_a_scale",
     "preshuffle_b",
