@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source type="image/svg+xml" srcset="docs/assets/mori-logo.svg">
-    <img alt="MORI" src="docs/assets/mori-logo.png" width="420">
+    <source type="image/svg+xml" srcset="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo.svg">
+    <img alt="MORI" src="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo.png" width="420">
   </picture>
 </p>
 
