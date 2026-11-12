@@ -19,8 +19,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include <unordered_set>
-
 #include "src/io/rdma/common.hpp"
 
 namespace mori {
@@ -150,12 +148,11 @@ int SubmissionLedger::FailAll(StatusCode code, const std::string& message,
 
   // Update() wakes WaitFor() sleepers, so run it outside the ledger lock to keep
   // woken threads from contending on a lock this call still holds.
-  std::unordered_set<const CqCallbackMeta*> transfers;
+  int failed = 0;
   for (auto& [meta, credits] : retired) {
-    transfers.insert(meta.get());
-    meta->Account(credits, code, message);
+    if (meta->Account(credits, code, message)) ++failed;
   }
-  return static_cast<int>(transfers.size());
+  return failed;
 }
 
 bool SubmissionLedger::Closed() const {

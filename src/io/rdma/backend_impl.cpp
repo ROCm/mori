@@ -649,14 +649,21 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
   auto epConfig = GetRdmaEndpointConfig(devId);
-  EpPair ep{weight, devId, rdevId, remoteKey, local, remote, std::make_shared<std::atomic<int>>(0),
-            // Admission stops short of the send queue's size; completion markers use the rest.
-            static_cast<int>(epConfig.maxMsgsNum) > 2 * kCompletionMarkerSlots
-                ? static_cast<int>(epConfig.maxMsgsNum) - kCompletionMarkerSlots
-                : static_cast<int>(epConfig.maxMsgsNum),
+  // Admission stops short of the send queue's size; completion markers use the rest.
+  const int sqSize = static_cast<int>(epConfig.maxMsgsNum);
+  const int markerSlots = sqSize > 2 * kCompletionMarkerSlots ? kCompletionMarkerSlots : 0;
+  EpPair ep{weight,
+            devId,
+            rdevId,
+            remoteKey,
+            local,
+            remote,
+            std::make_shared<std::atomic<int>>(0),
+            sqSize - markerSlots,
             std::make_shared<std::atomic<bool>>(false),
             std::make_shared<SubmissionLedger>(config.notifPerQp),
             std::make_shared<SqAdmissionEvent>()};
+  ep.markerSlots = markerSlots;
   meta.rTable[topoKey].push_back(ep);
 
   EndpointId id = nextEndpointId_.fetch_add(1);

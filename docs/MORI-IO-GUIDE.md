@@ -106,7 +106,7 @@ from mori.io import (
 |--------|-------------|
 | `InProgress()` | Transfer still in progress |
 | `Succeeded()` | Transfer completed successfully |
-| `Failed()` | Transfer failed. Over RDMA it reports only once none of the transfer's WRs can still move data, so its buffers may then be reused |
+| `Failed()` | Transfer failed. Over RDMA it reports only once none of the transfer's WRs can still move data, so its buffers may then be reused. Exception: when a submission gives up and has to move a QP to the error state, RDMA WRITE packets already on the wire can still land in the remote buffer shortly after; only a fence on the receiving side closes that window |
 | `Code()` | Get status code |
 | `Message()` | Get status message |
 | `Wait()` | Block until transfer completes |

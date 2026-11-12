@@ -419,8 +419,9 @@ static bool PostCompletionMarker(const EpPair& ep, const application::RdmaMemory
                                  bool isRead, int pendingWrs, int pendingCredits,
                                  const std::shared_ptr<CqCallbackMeta>& callbackMeta) {
   if (!ep.ledger) return false;
-  // The marker may use the slots normal admission holds back (kCompletionMarkerSlots).
-  if (ep.sqDepth && !TryReserveSqDepthOnce(ep, 1, ep.maxSqDepth + kCompletionMarkerSlots)) {
+  // The marker may use the slots normal admission holds back, and never more than the
+  // send queue really has.
+  if (ep.sqDepth && !TryReserveSqDepthOnce(ep, 1, ep.maxSqDepth + ep.markerSlots)) {
     return false;
   }
   SubmissionLedger::PostGuard guard =
@@ -457,7 +458,9 @@ static bool CutQp(const EpPair& ep) {
 // signaled one have nothing behind them to report their completion. Put a completion
 // marker behind them. Where that cannot be posted, cut the QP so they cannot run any
 // longer and account them now; the caller marks the QP failed, so the next transfer
-// replaces it. Only a QP that cannot be cut has them parked as orphaned and the EP
+// replaces it. Unlike a marker's completion, the cut does not wait for the peer: WRITE
+// packets already on the wire can still land remotely, which only a receiver-side
+// fence closes. Only a QP that cannot be cut has them parked as orphaned and the EP
 // degraded, for the recovery path. On a closed ledger the QP is dead, so they are left
 // uncounted as posted and the caller accounts them as never sent.
 // `skipEpId` is an EP the caller has already settled, or -1. Returns the credits it

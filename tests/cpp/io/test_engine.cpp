@@ -263,8 +263,9 @@ void CaseTransferFailureWaitsForEveryQp() {
   dead.Insert(2, true, meta, 2);
   const uint64_t liveId = live.Insert(2, true, meta, 2);
 
-  Require(dead.FailAll(StatusCode::ERR_RDMA_OP, "qp died", &sqDepthDead) == 1,
-          "FailAll should count the transfer it failed");
+  // The transfer still waits on the live QP, so this FailAll does not fail it yet.
+  Require(dead.FailAll(StatusCode::ERR_RDMA_OP, "qp died", &sqDepthDead) == 0,
+          "FailAll should count only the transfers it turned terminal");
   Require(status.InProgress(), "a failure must wait for the transfer's WRs on the live QP");
 
   int credits = 0;

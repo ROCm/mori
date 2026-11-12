@@ -181,7 +181,8 @@ struct CqCallbackMeta {
   // to a flush), else success. So a failed status means no WR of the transfer can still
   // move data: a caller may free or reuse its buffers then, which it could not if a
   // failure on one QP were reported while the transfer's WRs on another were in flight.
-  void Account(int credits, StatusCode code, const std::string& message, bool rootCause = true) {
+  // True if this call turned the status terminal.
+  bool Account(int credits, StatusCode code, const std::string& message, bool rootCause = true) {
     if (code > StatusCode::ERR_BEGIN) {
       std::lock_guard<std::mutex> lock(outcomeMu);
       if (!hasFailure.load(std::memory_order_relaxed) || (rootCause && !failureIsRootCause)) {
@@ -192,13 +193,13 @@ struct CqCallbackMeta {
     }
     const uint32_t before =
         finishedBatchSize.fetch_add(static_cast<uint32_t>(credits), std::memory_order_acq_rel);
-    if (static_cast<int64_t>(before) + credits < totalBatchSize) return;
+    if (static_cast<int64_t>(before) + credits < totalBatchSize) return false;
     TransferStatus* s = status.exchange(nullptr, std::memory_order_acq_rel);
-    if (s == nullptr) return;
+    if (s == nullptr) return false;
     // The success path never takes the lock: no failure was recorded.
     if (!hasFailure.load(std::memory_order_acquire)) {
       ReportData(s, code, message);
-      return;
+      return true;
     }
     Outcome report;
     {
@@ -206,6 +207,7 @@ struct CqCallbackMeta {
       report = failure;
     }
     ReportData(s, report.code, report.message);
+    return true;
   }
 
   // Set before the data WRs are posted when a notification SEND follows them. The
@@ -379,7 +381,8 @@ class SubmissionLedger {
   // has died, so no CQE can ever arrive for the records left behind, and none of
   // their WRs can run any more. Their credits are accounted as failed; a transfer
   // also spanning live QPs reports once its WRs there finish too. Returns the
-  // number of transfers this call failed.
+  // number of transfers this call failed, i.e. whose status it turned terminal (a
+  // transfer that still waits on another QP is counted by whoever finishes it).
   //
   // This also closes the ledger for good. Closing matters as much as failing: a
   // submitter that cleared the degraded check just before the event arrives is
@@ -456,6 +459,10 @@ struct EpPair {
   std::shared_ptr<SubmissionLedger> ledger;
   // Shared across EpPair copies that refer to the same QP.
   std::shared_ptr<SqAdmissionEvent> sqAdmission;
+  // Send-queue slots above maxSqDepth that only completion markers may use: those the
+  // queue really has beyond admission (kCompletionMarkerSlots, or 0 when it is too small
+  // to spare them).
+  int markerSlots{0};
 };
 
 // Which endpoints a fatal async event takes down with it. A QP event hits one
