@@ -114,6 +114,7 @@ from ._gemm_a8w8_8wave import (
     wait_barrier,
 )
 from ._mxfp8_scale_lds import Mxfp8ScaleLds
+from .gates import GATE_STRIDE
 
 
 def _acquire_peer_lock(lock_ptr):
@@ -950,8 +951,25 @@ def compile_fused_gemm_scatter(
     chunk_bands: int = 0,
     relaxed_rows: bool = False,
     scale_prefetch: bool | None = None,
+    gate_tail: bool = False,
+    gate_scope: str = "system",
 ):
     """Compile the GEMM, with (``fuse=True``) or without the scatter epilogue.
+
+    ``gate_tail`` (with ``fuse=False`` only) ends every block with the trigger
+    gate epilogue instead: once the block's C tile has retired, thread 0 adds 1
+    to its row band's gate with a release. The ``win`` argument then carries
+    the address of band 0's gate, and band ``b``'s gate sits at
+    ``win + b * GATE_STRIDE`` -- the layout of ``GemmTriggeredAllReduceOp``'s
+    reduce-scatter gates, so the kernel can drive that op directly.
+
+    ``gate_scope`` is the release's scope. ``"system"`` writes the L2 back
+    first (``buffer_wbl2``), which a cached C needs before a copy engine reads
+    it. ``"agent"`` skips that, and is enough when C and the gates live in
+    uncached memory (a cco window), where retired stores are already in memory
+    -- the same ground the fused epilogue's agent-scope counters stand on. With
+    C in a cco window the two measure the same on MI355X: the epilogue's cost is
+    the wait for the block's stores, not the write-back.
 
     ``fuse=False`` emits the identical kernel minus the epilogue tail, so the
     split baseline and the fused kernel differ in exactly one thing. That is why
@@ -1194,6 +1212,11 @@ def compile_fused_gemm_scatter(
     # BLOCK_M rows; pushing each band as it completes is what lets every link
     # start streaming early instead of waiting for its whole slice.
     chunks = cfg.counter_chunks if fuse else 1
+    if gate_tail and fuse:
+        raise ValueError("gate_tail replaces the scatter epilogue: pass fuse=False")
+    if gate_scope not in ("system", "agent"):
+        raise ValueError(f"gate_scope must be 'system' or 'agent', got {gate_scope!r}")
+    gate_syncscope = "" if gate_scope == "system" else "agent"
     if chunk_bands and (not fuse or direct_lsa):
         raise ValueError("chunk_bands requires fused SDMA")
     if chunk_bands and chunks != ceildiv(m_tiles_per_peer, chunk_bands):
@@ -1243,8 +1266,12 @@ def compile_fused_gemm_scatter(
     if fp8_scatter:
         _kname_tag += "F"
 
+    if gate_tail:
+        _kind = "gateA" if gate_scope == "agent" else "gate"
+    else:
+        _kind = transport if fuse else "split"
     _kname = (
-        f"mori_fused_{(transport if fuse else 'split')}_8w_"
+        f"mori_fused_{_kind}_8w_"
         f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_{_kname_tag}{'f' if scale_prefetch else ''}"
         f"{'p' if emit_put else 'x'}{atomic_order[0]}_r{rank}"
     )
@@ -1785,6 +1812,24 @@ def compile_fused_gemm_scatter(
             store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
             store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
         # ---- end pinned copy ----
+
+        if const_expr(gate_tail):
+            # Trigger gate epilogue: every wave's C stores retired, then one
+            # release add of 1 on this block's row-band gate. The copy engine
+            # parked on that gate reads the band from memory: at system scope the
+            # release writes the L2 back first; at agent scope C must be uncached.
+            wait_barrier(0)
+            if fx.thread_idx.x == 0:
+                _llvm_d.atomicrmw(
+                    _llvm_d.AtomicBinOp.add,
+                    signal_ptr(
+                        fx.Int64(win) + fx.Int64(block_m) * fx.Int64(GATE_STRIDE)
+                    ),
+                    fx.Int64(1).ir_value(),
+                    _llvm_d.AtomicOrdering.release,
+                    syncscope=gate_syncscope,
+                    alignment=8,
+                )
 
         if const_expr(fp8_scatter):
             # Reuse the BF16 output region as GEMM staging, then
