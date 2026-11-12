@@ -19,6 +19,8 @@ service UMBPStandalone {
   rpc BatchPrefetch(BatchKeysRequest) returns (CountResponse);
   // IUMBPClient::BatchTouch; a server without it answers UNIMPLEMENTED.
   rpc BatchTouch(BatchKeysRequest) returns (CountResponse);
+  // IUMBPClient::BatchRemove; a server without it answers UNIMPLEMENTED.
+  rpc BatchRemove(BatchKeysRequest) returns (CountResponse);
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);

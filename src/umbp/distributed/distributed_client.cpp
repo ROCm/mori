@@ -361,6 +361,13 @@ size_t DistributedClient::BatchTouch(const std::vector<std::string>& keys) {
   return pool_client_->BatchTouch(keys);
 }
 
+size_t DistributedClient::BatchRemove(const std::vector<std::string>& keys) {
+  if (closing_ || keys.empty()) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return 0;
+  return pool_client_->BatchRemove(keys);
+}
+
 // ---------------------------------------------------------------------------
 // RegisterMemory / DeregisterMemory
 // ---------------------------------------------------------------------------

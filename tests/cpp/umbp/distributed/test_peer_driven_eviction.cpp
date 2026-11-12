@@ -231,5 +231,21 @@ TEST_F(PeerDrivenEvictionTest, EvictsLocallyUnlessTheModeIsMaster) {
   }
 }
 
+TEST_F(PeerDrivenEvictionTest, BatchRemoveKeepsTheCopiesAMasterIndexes) {
+  // The master's index would still name dropped copies, so with a master the
+  // node keeps them, whichever mode evicts its DRAM.
+  for (const auto mode :
+       {PeerEvictionMode::kLocal, PeerEvictionMode::kMasterRanked, PeerEvictionMode::kMaster}) {
+    SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<int>(mode));
+    auto* node = Start(/*master_supports=*/true, mode);
+    ASSERT_NE(node, nullptr);
+    ASSERT_TRUE(PutKeysTheMasterKnows(2));
+    EXPECT_EQ(node->BatchRemove({Key(0), Key(1)}), 0u);
+    EXPECT_TRUE(Dram()->Contains(Key(0)));
+    EXPECT_TRUE(Dram()->Contains(Key(1)));
+    Stop();
+  }
+}
+
 }  // namespace
 }  // namespace mori::umbp

@@ -149,6 +149,14 @@ class IUMBPClient {
   /// `master` mode), or from an older server.
   virtual size_t BatchTouch(const std::vector<std::string>& /*keys*/) { return 0; }
 
+  /// Drop objects the caller knows it will never read again, so they stop
+  /// taking capacity from ones it will: every copy on this node's media, and
+  /// only without a master, whose index would still name them.  Keys not
+  /// stored are skipped, and copies being read or moved between tiers right
+  /// now are kept.  Returns the objects dropped: 0 where unsupported, or from
+  /// an older server.
+  virtual size_t BatchRemove(const std::vector<std::string>& /*keys*/) { return 0; }
+
   // ---- Lifecycle ----
 
   /// Remove all stored entries.  Returns true when the empty state is
