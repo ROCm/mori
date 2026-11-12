@@ -274,9 +274,8 @@ struct Buffer {
       memcpy(h.data(), data, kBufBytes);
     return h;
   }
-  // One flag per slot: did anything land in it?
-  std::vector<bool> Landed() const {
-    std::vector<uint8_t> h = Snapshot();
+  // One flag per slot: did anything land in it? Of `h`, a Snapshot().
+  static std::vector<bool> Landed(const std::vector<uint8_t>& h) {
     std::vector<bool> out(kSlots);
     for (int s = 0; s < kSlots; ++s) {
       out[s] = std::any_of(h.begin() + s * kSlotBytes, h.begin() + (s + 1) * kSlotBytes,
@@ -339,7 +338,8 @@ int RunReceiver(const Args& a) {
 
   // A. one unfenced write must arrive, so the later silence means something.
   ch->Expect("A_DONE");
-  verdict(buf.Landed()[0], "A. unfenced write from the remote producer landed in slot 0");
+  verdict(buf.Landed(buf.Snapshot())[0],
+          "A. unfenced write from the remote producer landed in slot 0");
   buf.Fill(0x00);
 
   // B. fence mid-stream.
@@ -347,7 +347,7 @@ int RunReceiver(const Args& a) {
   auto t0 = std::chrono::steady_clock::now();
   std::vector<bool> landed;
   for (;;) {
-    landed = buf.Landed();
+    landed = buf.Landed(buf.Snapshot());
     if (Count(landed) >= kFenceAfterSlots) break;
     if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30))
       Die("stream never started");
@@ -355,7 +355,7 @@ int RunReceiver(const Args& a) {
   }
   FenceResult fence = engine->FenceRemoteEngine(kProducerKey);
   const std::vector<uint8_t> atFence = buf.Snapshot();
-  const int nAtFence = Count(buf.Landed());
+  const int nAtFence = Count(buf.Landed(atFence));
   std::printf("  fence: ok=%d fenced=%d failed=%d transfers_failed=%d, %d/%d slots had landed\n",
               fence.Ok(), fence.endpointsFenced, fence.endpointsFailed, fence.transfersFailed,
               nAtFence, kSlots - 1);
@@ -390,7 +390,7 @@ int RunReceiver(const Args& a) {
   ch->Send("GO_RETRY");
   std::string retry = ch->Expect("RETRY_DONE");
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  verdict(buf.Landed()[0],
+  verdict(buf.Landed(buf.Snapshot())[0],
           "C. a live producer rebuilt its connection and a retried write landed; "
           "producer saw: " +
               retry);

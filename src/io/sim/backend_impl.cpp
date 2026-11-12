@@ -813,6 +813,14 @@ void SimBackend::Submit(const MemoryDesc& local, const SizeVec& localOffsets,
   auto deadline = ReserveLink(isRead, bytes, sizes.size());
   {
     std::lock_guard<std::mutex> lock(timerMu_);
+    // A fence that ran since the check above bumped the epoch before draining the queue, so
+    // this transfer would miss the drain: fail it here, as the fence would have.
+    if (peer && peer->fenceEpoch.load() != fenceEpoch) {
+      peer->inFlight.fetch_sub(1);
+      status->Update(StatusCode::ERR_RDMA_OP,
+                     "peer " + peer->desc.key + " was fenced; its connection was shut down");
+      return;
+    }
     timerQ_.push(
         Completion{deadline, timerSeq_++, status, id, std::move(peer), fenceEpoch, connGen});
   }
