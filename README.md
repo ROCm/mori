@@ -1,4 +1,9 @@
-<h1 align="center">MORI</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo-dark.png">
+    <img alt="MORI" src="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo.png" width="420">
+  </picture>
+</p>
 
 <p align="center">
   <a href="https://rocm.github.io/mori/"><img alt="Documentation" src="https://img.shields.io/badge/docs-rocm.github.io%2Fmori-C00000"></a>
