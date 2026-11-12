@@ -73,10 +73,6 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
   if (thdId < args.config.worldSize) {
-    // Backoff in the cross-device wait: the empty tight spin livelocks the cco/xGMI fabric under
-    // CNT2's timing and never re-observes the peer's flag write -> combine hangs (plain's slower
-    // timing happens to dodge it). s_sleep throttles the poll (matches GridBarrier's spin) and lets
-    // the peer flag become visible.
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
       __builtin_amdgcn_s_sleep(1);
     }

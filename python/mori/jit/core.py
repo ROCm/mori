@@ -298,11 +298,6 @@ def _profiler_defines() -> list[str]:
     return ["-DENABLE_PROFILER"] if is_profiler_enabled() else []
 
 
-# Prefix rather than an enumeration: this tracks the kernel-side #if in
-# src/ops/dispatch_combine/intranode_entry.hpp, which tests the gfx125x arch macros to pick a body,
-# and a new member of that family should not need a second edit here to be recognised. The launch
-# path reads it to size combine's LDS and to pick PUSH vs PULL, both of which have to agree with
-# what the device compiled.
 _FASTPATH_ARCH_PREFIX = "gfx125"
 _arch_cache: str | None = None
 

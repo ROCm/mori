@@ -11,9 +11,9 @@ backends:
 - **hip**: C++/HIP kernels JIT-compiled by the v2 JIT framework. Gather combine
   only, in bf16/fp32; the dispatch leg also carries fp8 and fp4 (transport only —
   it moves an already-quantized payload). A dedicated gfx125x TDM body is selected
-  by arch. **The only backend with an internode path** (bf16/f32/fp8, no fp4, no
-  quant/StdMoE/scatter). Works on a machine with no FlyDSL. See
-  `docs/MORI_JIT_V2_DESIGN.md`.
+  by arch. **The only backend with an internode path** (bf16/f32/fp8, plus packed
+  fp4 dispatch with bf16/fp32 combine; no quant/StdMoE/scatter). Works on a machine
+  with no FlyDSL. See `docs/MORI_JIT_V2_DESIGN.md`.
 
 Select with `cfg.kernel_backend` or `MORI_V2_KERNEL_BACKEND`. Same-node peer
 addresses are computed in-kernel over the flat LSA VA, no host P2P tables; a peer
@@ -21,10 +21,12 @@ on another node is reached with GDA RDMA. Reference =
 ROCm/FlyDSL PR #522 (`dispatch_combine_intranode_{kernel,op}.py`).
 
 Supported token dtypes: **bf16**, **f32**, **fp8** (gather-only; OCP e4m3 on
-gfx950, e4m3**fnuz** max 240 on gfx942) and **fp4** (e2m1, gather-only,
-**gfx950 and gfx1250** — the conversion intrinsics don't exist on gfx942. The
-two differ: gfx950 uses the pair-at-a-time `cvt_scalef32_pk_*_fp4` family,
-gfx1250 a single pack-of-8 per i32, so `_accum_funcs` branches on `WAVE`).
+gfx950, e4m3**fnuz** max 240 on gfx942) and **fp4** (e2m1, gather-only;
+FlyDSL's fp4 conversion is **gfx950 and gfx1250** only — the conversion
+intrinsics don't exist on gfx942. The two differ: gfx950 uses the pair-at-a-time
+`cvt_scalef32_pk_*_fp4` family, gfx1250 a single pack-of-8 per i32, so
+`_accum_funcs` branches on `WAVE`. The hip backend's packed fp4 dispatch is
+transport only and also runs on gfx942).
 Combine: gather (UseP2PRead) **and** scatter (`_nop2p`); weighted combine
 (`out_weights`); StdMoE (ConvertDispatchOutput / ConvertCombineInput, standalone
 + wired into the op); fp8 combine-wire **quant** (`fp8_direct_cast` **and**
@@ -42,7 +44,7 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 
 | file | role |
 |---|---|
-| `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig` (+`.tuned()`), `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
+| `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig`, `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
 | `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
 | `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
 | `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here. A gfx125x `EpDispatchPlan` whose caller binds no `staging_base` gets one at its first launch, shared by the unbound plans of its layout, with a `FutureWarning`; instead, allocate `info["stagingBytes"]` bytes once, keep them alive, and `bind(staging_base=buf)` on every dispatch plan (a tensor is checked against that size and held; an int address is taken on trust). Sizes come from the plans: `EpDispatchPlan.describe(**request)` / `EpCombinePlan.describe(...)` return the info a plan would report without compiling it, and `arena_regions(*infos, region_names=...)` turns their `region.<stem>` keys into a `SymmArena` region list; binding checks an arena that has `size()` |
@@ -51,8 +53,8 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 | `flydsl_prims.py` | FlyDSL device primitives: system atomics / ordered stores / fences / volatile-spin waits |
 | `intranode_kernels.py` | FlyDSL kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
 | `tuning_configs.py` | **flydsl** kernel geometry: per-(world,hidden,topk) block/warp lookup |
-| `hip_tuning_configs.py` | **hip** kernel geometry, separate table (never borrows flydsl's); same `lookup` contract. Independent dispatch/combine tables, keyed by device, shape and topk, plus the dispatch dtype (`dispatch_dtype_str`: bf16/fp8/fp4) for dispatch and `quant_type` for combine; an unswept shape gets a single-shot default |
-| `internode_tuning_configs.py` | **hip** internode kernel geometry, a third table: token-count buckets keyed by device, shape, topk and dispatch dtype, carrying `(block_num, rdma_block_num, warp_num)` **per phase** — dispatch and combine are tuned to different values over one shared arena. The internode plans are compiled per geometry, so the backend walks the whole table at build time and `lookup` only picks a prebuilt bucket; `block_num` is clamped to the CU count |
+| `hip_tuning_configs.py` | **hip** configuration selection: `resolve_schedule(cfg)` returns `ScheduleEntry` rows for both intra and inter. Each phase has a `KernelConfig(family, block_num, warp_per_block, rdma_block_num, load_first, active_qps)`. Inter reads its CSV table; intra reads the `IntraNodeV2` table first and falls back to Python tables per phase, whose dispatch half is keyed by `dispatch_dtype_str` (bf16/fp8/fp4) and combine half by `quant_type`. File names come from `v2_table_filename()`; `read_v2_table()` / `write_v2_table()` parse, check and write the tables, and `save_internode_result()` merges a tuning result by selector |
+| `tuning_configs/*.csv` | V2 rules, one CSV per GPU model, kernel and EP size holding both phases: `{arch}_{model}_{kernel}_ep{n}.csv`, e.g. `gfx950_mi355x_InterNodeV2_ep16.csv`. Kernels are `InterNodeV2`, `InterNodeV2LL` and `IntraNodeV2`; `--cmd tuning --tuning-save` merges a rule into them. Columns and how the shipped rows were measured: [tuning_configs/README.md](tuning_configs/README.md) |
 
 ## gfx125x dispatch: slot reservation
 
@@ -92,26 +94,190 @@ the **hip** backend implements it.
 | `gpu_per_node` | `None` → `world_size`, i.e. one node | GPUs per physical node; `world_size` must be a positive multiple of it. Setting it smaller is what selects the internode path. It is EP's own idea of a node and is checked against the communicator's LSA team (`lsa_size`, `lsa_rank`) at construction |
 | `internode_kernel` | `"auto"` | Which internode kernel family runs. `"v2"` = the general path (chunked, deduplicating, sized for wide tokens); `"v2_ll"` = low latency (no dedup across expert slots, one entry per node per token). They are separate JIT modules, so naming one compiles only that one and it cannot fall back; `"auto"` compiles both and chooses per launch |
 | `internode_auto_ll_max_tokens` | `512` | The `"auto"` crossover, compared against **this call's** token count (`input.shape[0]` for dispatch, `routing.cur_rank_num_token` for combine): `<=` runs `v2_ll`, `>` runs `v2`. One op therefore alternates as the batch changes. Unrelated to `max_num_inp_token_per_rank`, which is the capacity. Read only when `internode_kernel == "auto"`; must be >= 0 |
-| `num_qp_per_pe` | `2` | QPs per peer on the RDMA leg. Only the internode path reads it, and 1 starves it (~1.5x), so the default is what that path wants; the intranode path ignores it. Must be >= 1 |
+| `num_qp_per_pe` | `8` | QPs **allocated** per connected peer, fixed for the DevComm's lifetime; at most 64. Unused by intranode kernels |
+| `active_qps` | `None` | Pin the **active** count -- how many of the allocated QPs a kernel sends on -- for every bucket and both phases. `None`: the tuning table's count, else `min(2, num_qp_per_pe)` |
+| `active_qp_counts` | `None` | Extra counts, e.g. `(1, 2, 4, 8)`, compiled for every bucket geometry so `op.set_active_qps()` can switch to them |
+
+The active count is a compile-time constant of each kernel, chosen like the
+geometry: per phase and per token bucket, from the tuning table, so a rank
+picks it from its own token count. Ranks therefore may run different counts in
+one cycle, and so may a dispatch and the combine that follows it. That is safe
+because a combine's contribution to the cross-node barrier does not depend on
+its count: every active QP carries one marker behind its data, and the markers
+of one combine always sum to the same total (`kCombineBarrierMarkerTotal` in
+`ep_internode_cfg.hpp`).
+
+`op.set_active_qps(n)` overrides the count of every bucket, both phases, for the
+launches that follow, and `op.set_active_qps(None)` returns to each bucket's own
+resolved count (`active_qps` if set, else the table's, else
+`min(2, num_qp_per_pe)`); only
+counts in `active_qp_counts` can be selected, and selecting one never compiles
+or recreates a QP. A sweep pins it per phase instead, as a fourth field of
+`MORI_EP_DISP_GEOM` / `MORI_EP_COMB_GEOM` (`block,rdma,warp,active_qps`).
+Dispatch drains every QP the op can send on -- its largest active count over
+the buckets its token capacity can reach, both phases and `active_qp_counts`,
+not the whole allocation -- so QPs only a combine used are still polled once a
+cycle, while an op that never goes above two QPs pays for two. AsyncLL sends on
+the same resolved count (`active_qps`, else `min(2, num_qp_per_pe)`).
+
+What the barrier still needs is pairing: exactly one combine per dispatch on
+every rank. The wait target is the rank's own dispatch count times that fixed
+total, so a dispatch without its combine, or a second combine, leaves a peer
+waiting for a value that never comes. Complete each dispatch/combine pair
+before starting the next, and order arena reuse across streams and graph
+replays. Everything else a launch picks from its own token count may differ
+between ranks in one cycle: the family under `auto`, the geometry, the active
+count and load-first. Both families exchange the same chunk flags, node counts
+and send-slot layout and share the combine barrier.
 
 Two further internode-only rules `__post_init__` applies: `quant_type` must be
 `"none"` (the internode combine's fp8 staging path is incomplete and returns
 wrong tokens), and `max_num_inp_token_per_rank` is rounded up to a multiple of
 the wavefront width, because send slots are handed out in whole wavefronts.
 
+Internode FP4 dispatch accepts real `torch.float4_e2m1fn_x2` tensors of shape
+`[tokens, hidden_dim / 2]`: each byte stores two E2M1 values, with the even
+logical element in the low nibble. `hidden_dim` remains the logical width in
+the config and must be a multiple of 32 for the 16-byte payload alignment.
+This is transport of already packed data. The expert stage must provide an
+unpacked `[received_tokens, hidden_dim]` BF16 or FP32 tensor to combine;
+FP4 combine and FP4 dispatch with FP8 combine are unsupported.
+
+For ordinary `internode_kernel="v2"`, a combine rule with
+`combine_load_first` set to 1 compiles that token bucket's combine with
+4-byte-per-lane load-first peer gathers (`WarpAccumLF<T, 4, 2>`); other buckets
+use `WarpAccum<T, 4>`. The choice is per bucket and per GPU model, independent
+of the declared capacity. Only the combine pass depends on it, and that pass is
+compiled once per pair of active QP count and load-first setting the schedule
+uses. It has no effect on `v2_ll`, which has its own gather.
+
+### Internode geometry: tuned by default
+
+Leave `dispatch_block_num` / `combine_block_num` / `warp_num_per_block` /
+`combine_warp_num_per_block` / `dispatch_rdma_block_num` /
+`combine_rdma_block_num` at `None` and the backend resolves the swept geometry
+for this GPU model, shape and dtype out of `tuning_configs/`, one bucket per
+token range, with plans prepared up front. A pinned config field overrides only that
+field; the remaining fields stay tuned. The sweep hooks `MORI_EP_DISP_GEOM` /
+`MORI_EP_COMB_GEOM` (`"block,rdma,warp[,active_qps]"`) replace their phase's
+geometry in every bucket; the other phase keeps its table rules. Clear both when
+checking automatic selection.
+
+`MORI_EP_V2_TUNING_DIR` selects an alternate V2 table directory (intra and inter).
+`hip_tuning_configs.py` owns the table format (filenames, loading, checks and
+merge-on-save) as well as the HIP schedule and CU limits.
+
+- Only the current GPU model's own files are read, except that MI350X reads
+  MI355X's (same die and CU count). A model without one does not borrow another
+  model's CSV: inter-node uses the config's default geometry, and intra-node the
+  Python tables in `hip_tuning_configs.py`.
+- Each phase matches **its own dtype**: fp8 dispatch + bf16 combine reads the
+  arch's fp8 dispatch rules (`fp8_e4m3_fnuz` on gfx942, `fp8_e4m3` on gfx950)
+  and the same `bf16` combine rules as bf16 dispatch.
+- `num_tokens` is an inclusive ceiling; the largest matching rule also serves
+  larger token counts. Dispatch/combine bucket edges are combined into a schedule,
+  while a phase without matching rules keeps its default geometry.
+- Total experts (`ep_size * experts_per_rank`) and top-k are selector columns of
+  every rule (`num_experts`, `topk`): at EP16, 256/8 (`experts_per_rank=16,
+  topk=8`) matches only `num_experts=256, topk=8` rules, and 384/6
+  (`experts_per_rank=24, topk=6`) only `num_experts=384, topk=6`. Unknown
+  combinations use the default geometry; V2 has no wildcard rule. Saving needs
+  both values to fill the selector. V1's legacy wildcard lookup is unchanged.
+- `InterNodeV2` and `InterNodeV2LL` have separate files. In `auto` mode the family
+  crossover is also a bucket edge, so each launch uses its own family's rules.
+
+### HIP V2 configuration interface
+
+Both intra and inter follow the same path:
+
+1. `hip_tuning_configs.resolve_schedule(cfg)` returns a schedule with named
+   `dispatch` and `combine` configurations. Intra adapts the schedule the config
+   resolved (the `IntraNodeV2` table, else the Python tables per phase) or an
+   explicit `cfg.schedule`; inter resolves tables/overrides and the V2/LL
+   crossover.
+2. `hip_backend._build_kernels()` prepares one callable per selectable
+   `KernelConfig`: one plan for intra, a fixed pass group for inter. On gfx125x
+   at 16 ranks or more with a schedule (tuned or an explicit `cfg.schedule`), an
+   intra dispatch `KernelConfig` instead gets one plan per bucket ceiling it
+   serves, and its callable picks among them by the call's token count.
+3. `op.kernel_config(num_tokens)` selects an inclusive token bucket, and
+   dispatch and combine launch the `KernelConfig`s it returns. The exception is
+   a gfx125x intranode op whose LL128 geometry covers fewer tokens than its
+   capacity: a call at or below that LL128 `max_tok` runs separate LL128 plans,
+   which `kernel_config()` does not report. A `snapshot=True` dispatch, and the
+   combine of its handle, with `quant_type` `fp4_blockwise`,
+   `fp4_blockwise_fp32` or `fp8_blockwise` stay on the schedule's plans.
+   A gfx1250 intranode op with a bf16 combine and an entry in
+   `_BF16_PUSH_TABLE` (`hip_tuning_configs.py`; gfx1250-strict parts have
+   none) also builds bf16 push combine plans, and every combine that is not on
+   the LL128 plans runs one, picked by the call's token count from that entry.
+   A combine with weights, or of a `snapshot=True` handle, runs the schedule's
+   combine that `kernel_config()` reports. The push plans add a landing area
+   to the arena; `MORI_EP_BF16_PUSH=0` builds neither.
+
+For configuration reporting, use the same interface on either path:
+
+```python
+selected = op.kernel_config(num_tokens)
+print(selected.dispatch.family, selected.dispatch.block_num,
+      selected.dispatch.warp_per_block, selected.dispatch.rdma_block_num)
+print(selected.combine)
+```
+
+`family` is `"intra"`, `"v2"` or `"v2_ll"`, or `"asyncll"` on an AsyncLL op;
+intra and AsyncLL have `rdma_block_num=None`.
+Intra manual geometry retains its existing fallback behavior; inter supports
+per-field tuning overrides as described above.
+
+Intra B/W participate in compilation. Inter B/R/W are plan launch settings:
+different geometries can share a compiled module while retaining separate plans
+for their grid, block size and bound RDMA split. Inter shape/dtype still specialize
+the compiled kernel, and so do each bucket's active QP count, the op's drain count
+and, for the ordinary combine, `combine_load_first`.
+
+Run a sweep on both nodes through the existing wrapper, using rank 0 on one
+node and rank 1 on the other, with the same rendezvous and tuning arguments.
+Match the conditions most rows were measured under: an allocation of 8 QPs (a
+smaller one clamps every larger `active_qps` rule to it) and `--scale-dim 0`
+(the wrapper defaults to 2 QPs, and the entry to a scale dim of 32); the rows
+measured under other conditions are listed in
+[tuning_configs/README.md](tuning_configs/README.md). The wrapper kills the run
+after `MORI_INTERNODE_TIMEOUT` seconds, 120 by default, which a sweep outlasts:
+
+```bash
+# The MI355X tables were tuned with ionic CCQE disabled; match that.
+MORI_DISABLE_IONIC_CCQE=1 MORI_INTERNODE_TIMEOUT=3600 tools/run_internode_test.sh \
+    --rank <0-or-1> --master-addr <ip> --ifname <nic> \
+    --entry tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py \
+    --cmd tuning --kernel-type v2 --max-tokens 4096 --num-qp 8 \
+    --dtype bf16 --combine-dtype bf16 --hidden-dim 7168 --topk 8 \
+    -- --experts-per-rank 16 --scale-dim 0 --tuning-phase dispatch --tuning-save \
+       --tuning-config-dir <directory>
+```
+
+Repeat for each token ceiling and phase being tuned. `--tuning-save` merges the
+selected rule into the model's table; without it the sweep only reports results.
+`--tuning-candidate block,rdma,warp[,active_qps]` restricts the sweep to one candidate. Selection
+defaults to the dispatch+combine pair's total latency (`--tuning-metric total`),
+with the other phase held at its selected geometry. A bf16 combine rule is shared
+by bf16, fp8 and fp4 dispatch, so validate the affected input dtypes before
+replacing it, or use a separate tuning directory for a dtype-specific experiment.
+Table layout, coverage and measurement conditions are in
+[tuning_configs/README.md](tuning_configs/README.md).
+
 Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 
 | file | role |
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
-| `test_dispatch_combine_v2_internode.py` | the internode entry: a torchrun script (not a pytest wrapper) for correctness, bench and tuning over CCO/GDA. `--cmd test\|bench\|tuning\|stress`, `--max-tokens`, `--hidden-dim`, `--topk`, `--dtype`/`--combine-dtype`, `--num-qp` (default 1), `--kernel-type auto\|v2\|v2_ll`, `--auto-ll-max-tokens`, `--rounds`, `--spawn`. **Needs two nodes**: the op refuses a config whose node grouping disagrees with the communicator's LSA team, so one host cannot emulate it |
+| `test_dispatch_combine_v2_internode.py` | the internode entry: a torchrun script (not a pytest wrapper) for correctness, bench and tuning over CCO/GDA. `--cmd test\|bench\|tuning\|stress`, `--max-tokens`, `--hidden-dim`, `--topk`, `--dtype`/`--combine-dtype`, `--num-qp` (QPs allocated, default 1), `--active-qps`, `--active-qp-counts` (under `--cmd test`/`stress` the ranks switch among them, deliberately out of step), `--tuning-qps` (active counts crossed with the geometry sweep), `--kernel-type auto\|v2\|v2_ll\|asyncll`, `--auto-ll-max-tokens`, `--rounds`, `--spawn`. `--cmd tuning` sweeps one phase (`--tuning-phase dispatch\|combine`) against the other's shipped value, or with `--tuning-phase pair` the dispatch/combine active QP pairs at the shipped geometry, and, with `--tuning-save`, merges the winner into `tuning_configs/` (`--tuning-config-dir`). **`bench` and `stress` need two nodes**: the script runs them only on the internode op and refuses them on one node. One host cannot emulate that op either, because it refuses a config whose node grouping disagrees with the communicator's LSA team. On one node, `test` and `tuning` build the intranode op instead, which is how the `IntraNodeV2` tables are tuned |
 | `test_internode_regions.py` | pure-Python invariants of `internode_regions()`: the name contract with the backend and the capacity bounds the kernel's indexing implies. No GPU, no process group |
 | `test_op_lifecycle.py` | arena-leak regression: rebuilding the op on one long-lived `Communicator`; `close()` must free and untrack the window. `torchrun --standalone --nproc_per_node=2` |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank |
 | `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
 | `test_routing_snapshot.py` | `dispatch(..., snapshot=True)` handles outlive later dispatches: combine (twice) and replay with an older handle, both backends. `torchrun --standalone --nproc_per_node=2` |
 | `test_ll128_split.py` | an op past the LL128 table's `max_tok` runs small calls on its LL128 plans and the rest on the schedule's: one call sequence crossing `max_tok` both ways, synced (delivery, reverse map, bf16 sum), back to back eager and graph-replayed, and as snapshot handles, each combine equal to the synced one bit for bit. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` |
-| `test_bf16_push_select.py` | a bf16 op with a push-table entry picks its combine per call: one call sequence crossing LL128's `max_tok` and `in_view_pull_max` both ways, each call passing its input as a plain tensor, from `combine_in_view()`, and with weights. Checks which combine ran (only a push lands rows in `push_landing()`), the bf16 sum, the three results equal bit for bit, and back to back eager. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` (or 8) |
+| `test_bf16_push_select.py` | a bf16 op with a push-table entry picks its combine per call: calls crossing LL128's `max_tok` and every push bucket edge both ways, first with one token count on every rank, then above `max_tok` with a different count on each rank. Each call passes its input as a plain tensor, from `combine_in_view()`, from `combine_in_view()` on alternate ranks only, with weights, and through a `snapshot=True` handle. Checks which combine ran (only a push lands rows in `push_landing()`; weights and snapshot handles pull), the bf16 sum, every result equal to the plain one bit for bit, and back to back eager. Under `MORI_EP_BF16_PUSH=0` it checks that no push plan is built. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` (or 8) |
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
@@ -366,7 +532,7 @@ v2_ll's 64-71, so a CQE drain is not what is costing it.
 establishes that TDM reaches the xGMI ceiling (~1640 GB/s one-way) on 512 blocks
 where a CU vector copy needs 8192, so a transport whose whole cost is CU-issued
 peer stores looks like the case for it. Written as a global -> LDS -> peer
-double-buffered copy, following `src/ops/dispatch_combine/intranode_1250x.hpp`,
+double-buffered copy, following v1's gfx1250 kernels,
 which is where the non-obvious part comes from: a TDM store can target a PEER's
 flat address, not only local memory. Measured on an idle gfx1250 node at EP4,
 five interleaved rounds, and it is a wash or slightly negative -- combine +1.6%

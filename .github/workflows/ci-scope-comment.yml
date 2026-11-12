@@ -1,0 +1,76 @@
+name: CI scope comment
+
+# ci.yml's scope job keeps the routing comment on a PR, but a fork PR's
+# pull_request token is read-only, so it cannot write one there. This runs in
+# this repository's context with a write token once the PR's CI run starts: it
+# checks out main (never the PR's code), works out the same lanes from the PR's
+# files and labels through the API with ci_scope.py, and writes the comment.
+# (pull_request_target would also have a write token, but GitHub blocks it by
+# default in public repositories from 2026-11-02.)
+on:
+  workflow_run:
+    workflows: [MoRI CI test]
+    types: [in_progress]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+
+jobs:
+  comment:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name != github.repository
+    runs-on: ubuntu-latest
+    # ci_scope.py waits up to 20 min for pre-commit on the head commit.
+    timeout-minutes: 30
+    concurrency:
+      group: ci-scope-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          # What ci_scope.py reads, as in ci-scope.yml.
+          sparse-checkout: |
+            /.github/scripts/
+            /.github/workflows/
+            /docker/
+            /tools/
+            /cmake/
+            /python/mori/
+            /setup.py
+            /pyproject.toml
+            CMakeLists.txt
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Find the PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD: ${{ github.event.workflow_run.head_repository.owner.login }}:${{ github.event.workflow_run.head_branch }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # workflow_run carries no PR number for a fork's run: find the open PR
+          # whose head is that branch at that commit (none if it moved on since).
+          gh api -X GET "repos/$REPO/pulls" -f state=open -f base=main -f head="$HEAD" \
+            --jq ".[] | select(.head.sha == \"$SHA\")
+                  | \"number=\(.number)\ndraft=\(.draft)\nlabels=\([.labels[].name] | tojson)\"" \
+            | head -n 3 >> "$GITHUB_OUTPUT"
+
+      - name: Update the CI scope comment
+        if: steps.pr.outputs.number
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: pull_request
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_DRAFT: ${{ steps.pr.outputs.draft }}
+          PR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          PR_LABELS: ${{ steps.pr.outputs.labels }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          COMMENT: "true"
+        run: python3 .github/scripts/ci_scope.py

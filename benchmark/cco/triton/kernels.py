@@ -197,6 +197,7 @@ def gda_p2p_kernel(
                 bytes_per_program,
                 0,
                 0,
+                0,  # GdaFlags
             )
         else:
             cco.gda_get_ib(
@@ -208,6 +209,7 @@ def gda_p2p_kernel(
                 recv_win,
                 offset,
                 bytes_per_program,
+                0,  # GdaFlags
             )
         if metric == 1:
             cco.gda_flush_warp(dev_comm, pid)

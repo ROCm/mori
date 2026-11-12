@@ -175,7 +175,7 @@ VERIFY_SCOPE = (
         else ("dispatch_bytes+push_bytes" if _PUSH else "dispatch_bytes+combine")
     )
 )
-# Geometry, same spelling as tools/ep_test.sh. Unset = the backend's tuned default.
+# Geometry. Unset = the backend's tuned default.
 _G = {
     k: (int(os.environ[k]) if os.environ.get(k) else None)
     for k in ("DBN", "DWPB", "CBN", "CWPB")
@@ -269,11 +269,11 @@ def main():
             .to(dev)
         )
     # Unique destination PEs per token: what an identity expert makes combine sum.
-    U = (
-        torch.zeros(M, world, dtype=torch.bool)
-        .scatter_(1, (idx.cpu().long() // EPR), True)
-        .sum(1)
+    hit = torch.zeros(M, world, dtype=torch.bool).scatter_(
+        1, (idx.cpu().long() // EPR), True
     )
+    U = hit.sum(1)
+    X = U - hit[:, rank].long()
 
     def gather_all(t):
         parts = [torch.empty_like(t.cpu()) for _ in range(world)]
@@ -1093,31 +1093,35 @@ def main():
                     capture_pair if mode == "graph" else eager_legs,
                     eager_legs,
                 )
-                got = torch.tensor([d_us, c_us, float(total)], dtype=torch.float64)
+                got = torch.tensor(
+                    [d_us, c_us, float(total), float(X[:ct].sum())],
+                    dtype=torch.float64,
+                )
                 dist.all_reduce(got)
                 n = world
                 d_us_m, c_us_m = float(got[0]) / n, float(got[1]) / n
                 recv_m = float(got[2]) / n
+                switch_m = float(got[3]) / n
                 # Bytes off one rank over that leg's time, BOTH cross-rank means,
                 # so the reported bandwidth follows from the recv_tokens and us
                 # this same row reports. Mixing a local byte count with a mean
                 # time gave a row whose columns did not agree with each other,
                 # and recv counts vary between ranks with the routing. The legs
                 # differ whenever dispatch is narrower than combine.
-                d_bw = (
-                    recv_m
-                    * (HIDDEN * _DISP_NBYTES + SCALE_DIM * SCALE_TS)
-                    / (1000**3)
-                    / (d_us_m / 1e6)
-                )
+                d_row = HIDDEN * _DISP_NBYTES + SCALE_DIM * SCALE_TS
+                d_bw = recv_m * d_row / (1000**3) / (d_us_m / 1e6)
                 c_row = _PUSH_WIRE if _PUSH else HIDDEN * 2
                 c_bw = recv_m * c_row / (1000**3) / (c_us_m / 1e6)
+                d_bus = switch_m * d_row / (1000**3) / (d_us_m / 1e6)
+                c_bus = switch_m * c_row / (1000**3) / (c_us_m / 1e6)
                 if rank == 0:
                     print(
                         f"  ct={ct:<5d} [{name}/{mode}] "
                         f"dispatch {got[0]/n:7.1f} us ({d_bw:6.1f} GB/s)  "
                         f"combine {got[1]/n:7.1f} us ({c_bw:6.1f} GB/s)  "
-                        f"pair {(got[0]+got[1])/n:7.1f} us  recv~{got[2]/n:.0f}",
+                        f"pair {(got[0]+got[1])/n:7.1f} us  recv~{got[2]/n:.0f}  "
+                        f"bus dispatch {d_bus:6.1f} GB/s combine {c_bus:6.1f} GB/s "
+                        f"switch~{switch_m:.0f}",
                         flush=True,
                     )
                 lockstep()
@@ -1139,6 +1143,9 @@ def main():
                             pair_us=round(d_us_m + c_us_m, 2),
                             dispatch_gbps=round(d_bw, 1),
                             combine_gbps=round(c_bw, 1),
+                            switch_tokens=round(switch_m),
+                            dispatch_bus_gbps=round(d_bus, 1),
+                            combine_bus_gbps=round(c_bus, 1),
                             verified=VERIFY_SCOPE,
                             **clocks(smi),
                         )

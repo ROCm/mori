@@ -35,7 +35,9 @@ TOPK = 6
 EPR = int(os.environ.get("EPR", 8))
 M = int(os.environ.get("M", 8192))
 ROUNDS = int(os.environ.get("ROUNDS", 2))
-HOWS = ("plain", "in_view", "weights")
+PUSH = os.environ.get("MORI_EP_BF16_PUSH", "1") == "1"
+HOWS = ("plain", "in_view", "mixed", "weights", "snapshot")
+PULLS = ("weights", "snapshot")
 
 
 def make_cfg(rank, world):
@@ -51,10 +53,20 @@ def make_cfg(rank, world):
     )
 
 
-def call_sizes(lim, pull_max):
-    edges = [1, lim, lim + 1, pull_max, pull_max + 1, M]
-    once = edges + edges[::-1] + [lim + 1, M, pull_max, 1, pull_max + 1, lim]
-    return once * ROUNDS
+def call_sizes(lim, buckets, world):
+    edges = [e for e, _, _ in buckets if e is not None and lim < e < M]
+    steps = [n for e in edges for n in (e, e + 1)]
+    same = [n for n in (1, lim, lim + 1, *steps, M) if n]
+    calls = [(n,) * world for n in same + same[::-1]]
+    for e in sorted({lim + 1, *edges, M // 4, M // 2}):
+        if lim < e < M:
+            calls += [tuple(e + r % 2 for r in range(world)), (1,) * world]
+    spread = [lim + 1, *(e + 1 for e in edges), M]
+    calls.append(tuple(spread[r % len(spread)] for r in range(world)))
+    calls.append(tuple(spread[::-1][r % len(spread)] for r in range(world)))
+    if lim < 4000 and M >= 4200:
+        calls.append((4000,) + (4200,) * (world - 1))
+    return calls * ROUNDS
 
 
 def make_inputs(i, src, n, world):
@@ -67,13 +79,11 @@ def make_inputs(i, src, n, world):
     return x, idx, w
 
 
-def pushes(n, how, lim, pull_max):
-    if n <= lim or how == "weights":
-        return False
-    return how == "plain" or n > pull_max
+def pushes(n, how, lim):
+    return PUSH and n > lim and how not in PULLS
 
 
-def run(cfg, comm, lim, pull_max, sizes, args):
+def run(cfg, comm, lim, sizes, args):
     rank, world = cfg.rank, cfg.world_size
     op = EpDispatchCombineOp(cfg, comm)
     checks = {}
@@ -85,10 +95,17 @@ def run(cfg, comm, lim, pull_max, sizes, args):
         torch.cuda.synchronize()
         comm.barrier()
 
+    def hows(i):
+        return [h for h in HOWS if h != "snapshot" or min(sizes[i]) > lim]
+
     def pair(i, how):
         x, idx, w = args[i]
-        out, _, _, _, _, h = op.dispatch(x, w, None, idx, return_routing=True)
-        if how == "plain":
+        out, _, _, _, _, h = op.dispatch(
+            x, w, None, idx, return_routing=True, snapshot=how == "snapshot"
+        )
+        if how == "mixed":
+            how = "in_view" if (rank + i) % 2 else "plain"
+        if how in ("plain", "snapshot"):
             o, _ = op.combine(out, routing=h)
         else:
             view = op.combine_in_view()[: out.shape[0]]
@@ -97,31 +114,32 @@ def run(cfg, comm, lim, pull_max, sizes, args):
         return o.clone()
 
     built = bool(op._push_specs)
-    check("push_plans_built", built)
+    check("push_plans_built" if PUSH else "no_push_plans", built == PUSH)
     land = op.push_landing() if built else None
     refs = []
-    for i, n in enumerate(sizes):
+    for i, ns in enumerate(sizes):
+        n = ns[rank]
         x, idx, _ = (t.cpu() for t in args[i])
         u = torch.zeros(n, world).scatter_(1, idx.long() // EPR, 1.0)
         want = u.sum(1, keepdim=True) * x.float()
         got = {}
-        for how in HOWS:
+        for how in hows(i):
             if land is not None:
                 land.zero_()
             sync()
             got[how] = pair(i, how)
             sync()
             if land is not None:
-                check(f"path_{how}", bool(land.any()) == pushes(n, how, lim, pull_max))
+                check(f"path_{how}", bool(land.any()) == pushes(n, how, lim))
             check(
                 f"bf16_sum_{how}",
                 torch.allclose(got[how].float().cpu(), want, atol=2e-2, rtol=2e-2),
             )
+            if how != "plain":
+                check(f"plain_equals_{how}", torch.equal(got["plain"], got[how]))
             refs.append(got[how])
-        check("plain_equals_in_view", torch.equal(got["plain"], got["in_view"]))
-        check("in_view_equals_weights", torch.equal(got["in_view"], got["weights"]))
 
-    got = [pair(i, how) for i in range(len(sizes)) for how in HOWS]
+    got = [pair(i, how) for i in range(len(sizes)) for how in hows(i)]
     sync()
     check("eager_back_to_back", all(map(torch.equal, got, refs)))
 
@@ -144,22 +162,23 @@ def main():
     dev = torch.device("cuda", torch.cuda.current_device())
 
     cfg = make_cfg(rank, world)
-    geom = bf16_push(world, HIDDEN, TOPK, experts_per_rank=EPR)
+    buckets = bf16_push(world, HIDDEN, TOPK, experts_per_rank=EPR)
     lay = ll128_layout(cfg)
-    if geom is None or lay is None or geom["in_view_pull_max"] >= M:
+    lim = 0 if lay is None else lay["max_tok"]
+    if buckets is None or lim >= M:
         if rank == 0:
-            print(f"# BF16PUSH: SKIP (EP{world} has no push entry below M={M})")
+            print(f"# BF16PUSH: SKIP (EP{world} M={M} has no bf16 push entry)")
         dist.destroy_process_group()
         return
-    lim, pull_max = lay["max_tok"], geom["in_view_pull_max"]
-    sizes = call_sizes(lim, pull_max)
+    sizes = call_sizes(lim, buckets, world)
     args = [
-        tuple(t.to(dev) for t in make_inputs(i, rank, n, world))
-        for i, n in enumerate(sizes)
+        tuple(t.to(dev) for t in make_inputs(i, rank, ns[rank], world))
+        for i, ns in enumerate(sizes)
     ]
     if rank == 0:
         print(
-            f"# BF16PUSH EP{world} M={M} ll128={lim} pull_max={pull_max} sizes={sizes}"
+            f"# BF16PUSH EP{world} M={M} ll128={lim} push={int(PUSH)} "
+            f"buckets={buckets} calls={sizes[: len(sizes) // ROUNDS]}"
         )
     torch.cuda.synchronize()
 
@@ -168,7 +187,7 @@ def main():
     vmm = 2 * (world * M * HIDDEN * 2 * 3 + (16 << 20)) + (1 << 30)
     comm = cco.Communicator.init(world, rank, obj[0], vmm)
 
-    failures = run(cfg, comm, lim, pull_max, sizes, args)
+    failures = run(cfg, comm, lim, sizes, args)
 
     if rank == 0:
         print(f"# total bf16 push select failures: {failures}", flush=True)
