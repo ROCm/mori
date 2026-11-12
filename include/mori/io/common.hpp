@@ -132,8 +132,8 @@ struct EngineDesc {
     return (key == rhs.key) && (nodeId == rhs.nodeId) && (hostname == rhs.hostname) &&
            (host == rhs.host) && (port == rhs.port) && (pid == rhs.pid) &&
            (backendDescs == rhs.backendDescs) && (ras == rhs.ras) &&
-           (protocolVersion == rhs.protocolVersion) &&
-           (agentMode == rhs.agentMode) && (blockSize == rhs.blockSize);
+           (protocolVersion == rhs.protocolVersion) && (agentMode == rhs.agentMode) &&
+           (blockSize == rhs.blockSize);
   }
 
   // Append-only: new fields MUST go at the end to preserve wire compatibility.
