@@ -54,6 +54,8 @@ _LAZY = {
     "GateProducerSpec": "gates",
     "GateTable": "gates",
     "gate_view": "gates",
+    "GemmTriggeredAllReduceOp": "triggered",
+    "TriggeredArLayout": "triggered",
 }
 
 __all__ = [
@@ -63,6 +65,7 @@ __all__ = [
     "GateTable",
     "GemmAllReduceOp",
     "GemmReduceScatterOp",
+    "GemmTriggeredAllReduceOp",
     "Mxfp8GemmOp",
     "Mxfp8GemvOp",
     "ar_config",
