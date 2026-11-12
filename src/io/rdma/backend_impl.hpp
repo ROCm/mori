@@ -68,6 +68,13 @@ EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
                                            const std::vector<int>& localDevOrder,
                                            const std::vector<int>& wantPerRank);
 
+// Connections a fence cut, as parallel lists of QP numbers: the fencing engine's
+// (`localQpns`) and the fenced peer's (`peerQpns`).
+struct CutConnections {
+  std::vector<uint32_t> localQpns;
+  std::vector<uint32_t> peerQpns;
+};
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -92,8 +99,12 @@ class RdmaManager {
   // Remote memory management APIs
   std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,
                                                                MemoryUniqueId);
+  // Bumped by every fence of the peer, which drops its cached memory regions. Read it
+  // before asking the peer for a region and pass it to RegisterRemoteMemory, which then
+  // caches the reply only if no fence came in between.
+  uint64_t RemoteMemoryEpoch(const EngineKey&) const;
   void RegisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId,
-                            application::RdmaMemoryRegion);
+                            application::RdmaMemoryRegion, uint64_t epoch);
   void DeregisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId);
 
   // Endpoint management APIs
@@ -141,11 +152,17 @@ class RdmaManager {
 
   // Lets a fenced peer connect again. The caller decides when that is safe, which is
   // once nothing the peer still has queued can reach buffers that were handed out.
-  // Returns whether the peer was fenced.
-  bool UnfenceRemoteEngine(const EngineKey& remoteKey);
+  // Returns whether the peer was fenced, and fills `cut` with the connections the
+  // fences since the last unfence cut, for the peer to retire its ends of them.
+  bool UnfenceRemoteEngine(const EngineKey& remoteKey, CutConnections* cut);
   // Whether connections with `remoteKey` are currently refused. Callers use it to
   // refuse early; ConnectEndpoint still enforces it under the lock.
   bool IsPeerFenced(const EngineKey& remoteKey) const;
+  // `remoteKey` unfenced this engine after cutting `cut`, given in our terms (`localQpns`
+  // are ours). Marks our ends failed: an idle QP would otherwise look live until its next
+  // transfer failed after the transport's retries. Endpoints built since are not in
+  // `cut`, so they stay. Returns how many were marked.
+  int RetireEndpointsCutByPeer(const EngineKey& remoteKey, const CutConnections& cut);
 
   /* -------------------------------- Peer failure -------------------------------- */
   // Takes the oldest recorded failure; polled by an application thread.
@@ -183,8 +200,13 @@ class RdmaManager {
   std::unordered_set<EngineKey> fencedPeers_;
   // Endpoints a fence took out of the route table but could not move to Error. They
   // are no longer in rTable, so only this keeps a later fence from reporting the peer
-  // cut off; every fence retries them. Guarded by `mu`.
+  // cut off; every fence retries them, and unfencing keeps them, since the peer can
+  // still write through them. Guarded by `mu`.
   std::unordered_map<EngineKey, EpPairVec> uncutEndpoints_;
+  // Connections cut by fences since the peer was last unfenced. Guarded by `mu`.
+  std::unordered_map<EngineKey, CutConnections> cutConnections_;
+  // Per peer, the number of fences so far: see RemoteMemoryEpoch. Guarded by `mu`.
+  std::unordered_map<EngineKey, uint64_t> remoteMemoryEpochs_;
   // Serializes fences, so a fence never returns while another one is still cutting.
   std::mutex fenceMu_;
 
@@ -215,6 +237,11 @@ class NotifManager {
   void RegisterDevice(int devId);
 
   bool PopInboundTransferStatus(const EngineKey&, TransferUniqueId, TransferStatus*);
+
+  // While a peer is fenced, its notifications are dropped, and fencing forgets those
+  // already counted: a peer that restarts numbers its transfers from zero again, and
+  // an old count must not report one of its new transfers complete.
+  void SetPeerFenced(const EngineKey&, bool fenced);
 
   void MainLoop();
   void Start();
@@ -274,6 +301,7 @@ class NotifManager {
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> registeredRuntimes_;
   std::unordered_map<EndpointId, QpNotifContext> notifCtxById_;
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
+  std::unordered_set<EngineKey> fencedPeers_;
 
   std::unordered_map<TransferStatus*, int> localNotif;
 
@@ -304,12 +332,13 @@ class ControlPlaneServer {
   // Endpoint management
   void BuildRdmaConn(EngineKey, TopoKeyPair, int nicRank);
 
-  // Tells `ekey` this engine has unfenced it. Best effort: an unreachable peer is only
-  // logged, after at most the control-plane timeout.
-  void NotifyUnfenced(const EngineKey& ekey) noexcept;
-  // Called with the sender's key when a peer reports it has unfenced this engine. Set
-  // before Start().
-  void SetUnfencedHandler(std::function<void(const EngineKey&)> handler) {
+  // Tells `ekey` this engine has unfenced it, and which of its connections were cut.
+  // Best effort: an unreachable peer is only logged, after at most the control-plane
+  // timeout.
+  void NotifyUnfenced(const EngineKey& ekey, const CutConnections& cut) noexcept;
+  // Called with the sender's key, and the connections it cut in our terms (`localQpns`
+  // are ours), when a peer reports it has unfenced this engine. Set before Start().
+  void SetUnfencedHandler(std::function<void(const EngineKey&, const CutConnections&)> handler) {
     onUnfenced = std::move(handler);
   }
 
@@ -344,7 +373,7 @@ class ControlPlaneServer {
   NotifManager* notif{nullptr};
   std::unordered_map<EngineKey, EngineDesc> engines;
   std::unordered_map<MemoryUniqueId, MemoryDesc> mems;
-  std::function<void(const EngineKey&)> onUnfenced;
+  std::function<void(const EngineKey&, const CutConnections&)> onUnfenced;
 };
 
 /* ---------------------------------------------------------------------------------------------- */

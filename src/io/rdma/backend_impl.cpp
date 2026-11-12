@@ -462,9 +462,19 @@ std::optional<application::RdmaMemoryRegion> RdmaManager::GetRemoteMemory(Engine
   return remote.mTable.at(key);
 }
 
+uint64_t RdmaManager::RemoteMemoryEpoch(const EngineKey& ekey) const {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  auto it = remoteMemoryEpochs_.find(ekey);
+  return it == remoteMemoryEpochs_.end() ? 0 : it->second;
+}
+
 void RdmaManager::RegisterRemoteMemory(EngineKey ekey, int remRdmaDevId, MemoryUniqueId id,
-                                       application::RdmaMemoryRegion mr) {
+                                       application::RdmaMemoryRegion mr, uint64_t epoch) {
   std::unique_lock<std::shared_mutex> lock(mu);
+  // A fence since the region was asked for dropped the cache; the reply may come from
+  // the incarnation it fenced, so it is not cached.
+  auto epochIt = remoteMemoryEpochs_.find(ekey);
+  if ((epochIt == remoteMemoryEpochs_.end() ? 0 : epochIt->second) != epoch) return;
   MemoryKey key{remRdmaDevId, id};
   RemoteEngineMeta& remote = remotes[ekey];
   remote.mTable[key] = mr;
@@ -840,6 +850,8 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
       // that comes back may have registered different memory under the same ids.
       it->second.mTable.clear();
     }
+    // A memory-region reply still in flight must not refill the cache either.
+    ++remoteMemoryEpochs_[remoteKey];
   }
 
   FenceResult result;
@@ -847,11 +859,13 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
 
   const std::string message = "peer " + remoteKey + " was fenced; its connection was shut down";
   EpPairVec stillUncut;
+  CutConnections cut;
   for (const auto& ep : victims) {
     // Cut the peer off first. This is the step the caller relies on, so it must not
     // wait behind the local bookkeeping below.
     application::RdmaDeviceContext* devCtx = GetRdmaDeviceContext(ep.ldevId);
-    if (devCtx == nullptr || !devCtx->ModifyEndpointToErrorNoThrow(ep.local)) {
+    const bool isCut = devCtx != nullptr && devCtx->ModifyEndpointToErrorNoThrow(ep.local);
+    if (!isCut) {
       ++result.endpointsFailed;
       stillUncut.push_back(ep);
       MORI_IO_ERROR("fence: could not move qpn={} (peer {}) to Error; peer may still write",
@@ -860,28 +874,35 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
       // and the caller learns from endpointsFailed that the fence is incomplete.
     } else {
       ++result.endpointsFenced;
+      cut.localQpns.push_back(ep.local.handle.qpn);
+      cut.peerQpns.push_back(ep.remote.qpn);
     }
     // A session built concurrently can still hold this QP; marking it failed gets that
     // session replaced. Nothing else would: refused posts and, without notifications, an
     // empty receive queue produce no completion to report the QP.
     RecordQpFailed(ep);
 
-    // Same treatment as a fatal async event: refuse new posts, close the ledger,
-    // and fail whatever was in flight so no waiter hangs on a completion that the
-    // dead QP will never deliver.
+    // Refuse new posts, as after a fatal async event.
     if (ep.degraded) ep.degraded->store(true, kSqAdmissionOrder);
-    if (ep.ledger) {
+    // On a cut QP, fail whatever was in flight so no waiter hangs on a completion the
+    // dead QP will never deliver. A QP still running keeps its transfers: their
+    // completions end them, and failing them now would let a caller reuse buffers the
+    // NIC is still reading or writing.
+    if (isCut && ep.ledger) {
       result.transfersFailed +=
           ep.ledger->FailAll(StatusCode::ERR_RDMA_OP, message, ep.sqDepth.get());
     }
     NotifySqStateChanged(ep);
   }
 
+  std::unique_lock<std::shared_mutex> lock(mu);
+  CutConnections& allCut = cutConnections_[remoteKey];
+  allCut.localQpns.insert(allCut.localQpns.end(), cut.localQpns.begin(), cut.localQpns.end());
+  allCut.peerQpns.insert(allCut.peerQpns.end(), cut.peerQpns.begin(), cut.peerQpns.end());
   if (result.endpointsFailed > 0) {
     result.message = std::to_string(result.endpointsFailed) + " of " +
                      std::to_string(victims.size()) + " endpoint(s) of peer " + remoteKey +
                      " could not be fenced";
-    std::unique_lock<std::shared_mutex> lock(mu);
     EpPairVec& uncut = uncutEndpoints_[remoteKey];
     uncut.insert(uncut.end(), stillUncut.begin(), stillUncut.end());
   }
@@ -893,11 +914,40 @@ bool RdmaManager::IsPeerFenced(const EngineKey& remoteKey) const {
   return fencedPeers_.count(remoteKey) != 0;
 }
 
-bool RdmaManager::UnfenceRemoteEngine(const EngineKey& remoteKey) {
+bool RdmaManager::UnfenceRemoteEngine(const EngineKey& remoteKey, CutConnections* cut) {
   std::unique_lock<std::shared_mutex> lock(mu);
-  // The caller lets the peer back in, so the QPs a fence could not cut no longer matter.
-  uncutEndpoints_.erase(remoteKey);
+  // uncutEndpoints_ stays: the peer can still write through those QPs, so the next
+  // fence must try them again.
+  auto it = cutConnections_.find(remoteKey);
+  if (it != cutConnections_.end()) {
+    if (cut != nullptr) *cut = std::move(it->second);
+    cutConnections_.erase(it);
+  }
   return fencedPeers_.erase(remoteKey) != 0;
+}
+
+int RdmaManager::RetireEndpointsCutByPeer(const EngineKey& remoteKey, const CutConnections& cut) {
+  if (cut.localQpns.size() != cut.peerQpns.size()) return 0;
+  EpPairVec retired;
+  {
+    std::shared_lock<std::shared_mutex> lock(mu);
+    auto it = remotes.find(remoteKey);
+    if (it == remotes.end()) return 0;
+    for (const auto& [topo, eps] : it->second.rTable) {
+      for (const auto& ep : eps) {
+        // QP numbers are unique per device only; matching both ends rules out a QP of
+        // another device that happens to share ours.
+        for (size_t i = 0; i < cut.localQpns.size(); ++i) {
+          if (ep.local.handle.qpn == cut.localQpns[i] && ep.remote.qpn == cut.peerQpns[i]) {
+            retired.push_back(ep);
+            break;
+          }
+        }
+      }
+    }
+  }
+  for (const auto& ep : retired) RecordQpFailed(ep);
+  return static_cast<int>(retired.size());
 }
 
 bool RdmaManager::HasIonicDevice() const {
@@ -1131,6 +1181,9 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         assert(msg.totalNum > 0);
 
         EngineKey ekey = ep.remoteEngineKey;
+        // The fence gave up on this peer's transfers, and its QPs are not used again, so
+        // the receive is neither counted nor replenished.
+        if (fencedPeers_.count(ekey) != 0) continue;
         if (notifPool[ekey].find(msg.id) == notifPool[ekey].end()) {
           notifPool[ekey][msg.id] = msg.totalNum;
         }
@@ -1309,6 +1362,16 @@ bool NotifManager::PopInboundTransferStatus(const EngineKey& remote, TransferUni
   return false;
 }
 
+void NotifManager::SetPeerFenced(const EngineKey& remote, bool fenced) {
+  std::lock_guard<std::mutex> lock(mu);
+  if (fenced) {
+    fencedPeers_.insert(remote);
+    notifPool.erase(remote);
+  } else {
+    fencedPeers_.erase(remote);
+  }
+}
+
 void NotifManager::Start() {
   if (running.load()) return;
   if (config.pollCqMode == PollCqMode::EVENT) {
@@ -1408,7 +1471,7 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
                topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc);
 }
 
-void ControlPlaneServer::NotifyUnfenced(const EngineKey& ekey) noexcept {
+void ControlPlaneServer::NotifyUnfenced(const EngineKey& ekey, const CutConnections& cut) noexcept {
   try {
     std::string host;
     int port = 0;
@@ -1421,7 +1484,7 @@ void ControlPlaneServer::NotifyUnfenced(const EngineKey& ekey) noexcept {
     }
     application::TCPEndpointHandle tcph = ctx->Connect(host, port);
     TcpEndpointGuard tcpGuard(ctx.get(), tcph);
-    Protocol(tcph).WriteMessageUnfenced({myEngKey});
+    Protocol(tcph).WriteMessageUnfenced({myEngKey, cut.peerQpns, cut.localQpns});
   } catch (const std::exception& e) {
     MORI_IO_WARN(
         "Could not tell engine {} it was unfenced ({}); it reconnects once its QP "
@@ -1550,7 +1613,8 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
     case MessageType::Unfenced: {
       MessageUnfenced msg = p.ReadMessageUnfenced(hdr.len);
       MORI_IO_INFO("Engine {} unfenced this engine", msg.ekey);
-      if (onUnfenced) onUnfenced(msg.ekey);
+      // In our terms: the sender's QPs are the peer's.
+      if (onUnfenced) onUnfenced(msg.ekey, CutConnections{msg.yourQpns, msg.myQpns});
       break;
     }
     case MessageType::AskMemoryRegion: {
@@ -1911,8 +1975,14 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
 
   server.reset(new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, config, rdma.get(),
                                       notif.get()));
-  server->SetUnfencedHandler(
-      [this](const EngineKey& remote) { ForgetQpReplacementBackoff(remote); });
+  server->SetUnfencedHandler([this](const EngineKey& remote, const CutConnections& cut) {
+    const int retired = rdma->RetireEndpointsCutByPeer(remote, cut);
+    if (retired > 0) {
+      MORI_IO_INFO("Engine {} cut {} of our connection(s) while it fenced us; rebuilding them",
+                   remote, retired);
+    }
+    ForgetQpReplacementBackoff(remote);
+  });
   server->Start();
 
   if (config.qpPerTransfer == 1 && rdma->HasIonicDevice()) {
@@ -2149,6 +2219,8 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
     }
 
     if (remoteMrByDev.find(ep.rdevId) == remoteMrByDev.end()) {
+      // Read before the lookup: a fence between the two then makes the epoch stale.
+      const uint64_t epoch = rdma->RemoteMemoryEpoch(ekey);
       auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remote.id);
       if (!remoteMr.has_value()) {
         application::RdmaMemoryRegion fetchedMr =
@@ -2161,7 +2233,7 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
           throw std::runtime_error(ss.str());
         }
         remoteMr = fetchedMr;
-        rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, *remoteMr);
+        rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, *remoteMr, epoch);
       }
       remoteMrByDev[ep.rdevId] = *remoteMr;
     }
@@ -2190,6 +2262,7 @@ FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
   // with us could still see the old endpoints, cache a session over them, and leave
   // it pointing at dead QPs once the fence lands.
   FenceResult result = rdma->FenceRemoteEngine(remote);
+  notif->SetPeerFenced(remote, true);
 
   std::lock_guard<std::mutex> lock(sessionCacheMu);
   for (auto it = sessionCache.begin(); it != sessionCache.end();) {
@@ -2204,12 +2277,15 @@ FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
 }
 
 bool RdmaBackend::UnfenceRemoteEngine(const EngineKey& remote) {
-  if (!rdma || !rdma->UnfenceRemoteEngine(remote)) return false;
+  CutConnections cut;
+  if (!rdma || !rdma->UnfenceRemoteEngine(remote, &cut)) return false;
+  notif->SetPeerFenced(remote, false);
   // Sessions of ours that raced the fence wait to be replaced; they may try again now.
   ForgetQpReplacementBackoff(remote);
   // The peer's QPs died because of the fence, and it paces their replacement as if its path
-  // were failing, up to a minute after repeated fences. Telling it lets it rebuild now.
-  server->NotifyUnfenced(remote);
+  // were failing, up to a minute after repeated fences. Telling it which ones lets it rebuild
+  // now, even those it has not used since and still takes for live.
+  server->NotifyUnfenced(remote, cut);
   return true;
 }
 

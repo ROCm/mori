@@ -25,6 +25,7 @@
 #include <msgpack.hpp>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "mori/io/common.hpp"
 #include "mori/io/msgpack_adaptor.hpp"
@@ -70,7 +71,11 @@ struct MessageAskMemoryRegion {
 
 struct MessageUnfenced {
   EngineKey ekey;  // the engine that lifted its fence
-  MSGPACK_DEFINE(ekey);
+  // The connections its fences cut, as parallel lists of QP numbers: the receiver's
+  // and the sender's.
+  std::vector<uint32_t> yourQpns;
+  std::vector<uint32_t> myQpns;
+  MSGPACK_DEFINE(ekey, yourQpns, myQpns);
 };
 
 struct MessageBuildConn {
