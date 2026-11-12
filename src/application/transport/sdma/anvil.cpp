@@ -376,6 +376,33 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
     for (uint32_t b = 0; b < 32; ++b) {
       if (mask & (1u << b)) engines.push_back(b);
     }
+    // amdkfd recommends one engine per peer link only on a bare-metal, single-partition,
+    // 8-GPU hive (kfd_set_recommended_sdma_engines). Otherwise (an SR-IOV VF under any
+    // hypervisor, a hive of another size) it reports every xGMI engine: 14 on a GPU with 16
+    // SDMA engines in SPX mode. Round-robin over that puts channel 1 on an odd engine, where
+    // a copy started by a doorbell written from device code never runs. The static OAM table
+    // is the kernel's per-peer table for an 8-GPU hive, so use it for a 14-engine mask and
+    // only if the mask holds the engine it picks; otherwise (other parts, partition modes,
+    // an unreadable or out-of-range xGMI id) keep the KFD mask.
+    if (engines.size() == 14) {
+      try {
+        uint32_t e = static_cast<uint32_t>(getSdmaEngineId(srcNode, dstNode));
+        if (mask & (1u << e)) {
+          engines.assign(1, e);
+          static bool logged = false;  // connect() runs under channels_mutex_
+          if (!logged) {
+            logged = true;
+            MORI_APP_INFO(
+                "SDMA: amdkfd reports 14 engines per xGMI link, using the static OAM table to "
+                "pick one engine per peer");
+          }
+          MORI_APP_DEBUG("SDMA: node {} -> {} uses engine {}", srcNode, dstNode, e);
+        }
+      } catch (const std::exception& ex) {
+        MORI_APP_WARN("SDMA: node {} -> {} keeps the KFD engine mask: {}", srcNode, dstNode,
+                      ex.what());
+      }
+    }
     // Fall back to the static OAM table if KFD did not report a mask.
     if (engines.empty()) {
       int e = getSdmaEngineId(srcNode, dstNode);
@@ -507,6 +534,11 @@ int AnvilLib::getOamId(int node) {
 int AnvilLib::getSdmaEngineId(int srcNode, int dstNode) {
   int srcOamId = getOamId(srcNode);
   int dstOamId = getOamId(dstNode);
+  const int numOam = static_cast<int>(mi300xOamMap.size());
+  if (srcOamId < 0 || srcOamId >= numOam || dstOamId < 0 || dstOamId >= numOam) {
+    throw std::runtime_error("SDMA: xGMI physical id " + std::to_string(srcOamId) + " or " +
+                             std::to_string(dstOamId) + " is outside the OAM table");
+  }
 
   // Use even engines only
   return mi300xOamMap[srcOamId][dstOamId] * 2;
