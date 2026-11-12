@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // Standalone hardware driver. Run one master, one producer and one consumer in
 // separate processes (normally the producer/consumer are on different trays).
 // It deliberately never registers a default CTest that needs these services.
@@ -19,6 +40,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "src/io/fabric/backend_impl.hpp"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_server.h"
@@ -67,6 +89,7 @@ void Help() {
                "  peers: --advertise IP --run-id NAME --kernel COPY.hsaco --device 0\n"
                "  common geometry: --keys 32 --object-bytes 1048704 --page-bytes 65536\n"
                "                   --layout unaligned|aligned (default unaligned)\n"
+               "            --storage-page-bytes BYTES (defaults to --page-bytes)\n"
                "  producer: --node-id kv-owner --duration-sec 600 --medium hbm|dram|ssd\n"
                "            --fabric-staging-bytes BYTES --staging-device 0\n"
                "            --ssd-dir PATH --ssd-io posix|io_uring --ssd-direct-io 0|1\n"
@@ -129,9 +152,22 @@ const char* MediumName(TierType tier) {
 
 struct DeviceBuffer {
   void* pointer = nullptr;
-  explicit DeviceBuffer(size_t bytes) { Hip(hipMalloc(&pointer, bytes), "hipMalloc"); }
+  bool fabric = false;
+  explicit DeviceBuffer(size_t bytes, bool exportable = false, int device = 0)
+      : fabric(exportable) {
+    if (fabric) {
+      pointer = mori::io::FabricMalloc(bytes, device);
+      Require(pointer != nullptr, "fabric destination allocation");
+    } else
+      Hip(hipMalloc(&pointer, bytes), "hipMalloc");
+  }
   ~DeviceBuffer() {
-    if (pointer) (void)hipFree(pointer);
+    if (pointer) {
+      if (fabric)
+        mori::io::FabricFree(pointer);
+      else
+        (void)hipFree(pointer);
+    }
   }
   // A failed GPU fence gives no permission to release memory it may still use.
   void Quarantine() { pointer = nullptr; }
@@ -177,6 +213,9 @@ class ObservedPlatform final : public PoolPlatform {
     inner_->AddHostGatherRegion(ptr, size);
   }
   void ClearHostGatherRegions() override { inner_->ClearHostGatherRegions(); }
+  void* HostDeviceAddress(const void* ptr, size_t size, int device) const override {
+    return inner_->HostDeviceAddress(ptr, size, device);
+  }
   struct Counters {
     uint64_t fabricBytes = 0, otherBytes = 0, fabricPlans = 0;
   };
@@ -279,13 +318,15 @@ PoolClientConfig PeerConfig(const Args& args, const Geometry& geometry, bool pro
   config.medium = producer ? ParseMedium(args.Get("medium", "hbm")) : TierType::HBM;
   config.hbm.device = Device(args);
   config.hbm.allocation = UMBPHbmAllocation::kFabricVmm;
-  const size_t pages = geometry.object / geometry.page + (geometry.object % geometry.page != 0);
-  const size_t storageBytes = Multiply(Multiply(geometry.keys, pages), Multiply(2, geometry.page));
-  config.hbm.buffer_sizes = {producer ? storageBytes : Multiply(2, geometry.page)};
+  const size_t storagePage = args.Size("storage-page-bytes", geometry.page);
+  Require(storagePage > 0, "storage page size must be positive");
+  const size_t pages = geometry.object / storagePage + (geometry.object % storagePage != 0);
+  const size_t storageBytes = Multiply(Multiply(geometry.keys, pages), Multiply(2, storagePage));
+  config.hbm.buffer_sizes = {producer ? storageBytes : Multiply(2, storagePage)};
   if (producer && config.medium != TierType::HBM) {
     config.fabric_read_staging_bytes = args.Size("fabric-staging-bytes", storageBytes);
     config.fabric_read_staging_device = StagingDevice(args);
-    Require(config.fabric_read_staging_bytes >= geometry.page,
+    Require(config.fabric_read_staging_bytes >= storagePage,
             "DRAM/SSD sharing requires at least one page of --fabric-staging-bytes");
     if (config.medium == TierType::DRAM) {
       config.dram.buffer_sizes = {storageBytes};
@@ -306,7 +347,7 @@ PoolClientConfig PeerConfig(const Args& args, const Geometry& geometry, bool pro
       config.ssd_staging_buffer_slots = static_cast<int>(stagingPages);
     }
   }
-  config.dram_page_size = geometry.page;
+  config.dram_page_size = storagePage;
   config.cache_remote_fetches = false;
   config.ranged_locality_prefetch = false;
   config.prefetch_budget_bytes = 0;
@@ -413,7 +454,7 @@ void Consumer(const Args& args, const Geometry& geometry) {
   const bool async = args.Boolean("async", true);
   const uint64_t seed = Seed(args.Get("run-id"));
   Require(iterations > 0 && verifyEvery > 0, "iterations/verify-every must be positive");
-  DeviceBuffer destination(geometry.total);
+  DeviceBuffer destination(geometry.total, args.Size("fabric-destination", 0) != 0, Device(args));
   DeviceBuffer consumed(geometry.total);
   ConsumerStream inference;
   std::shared_ptr<ObservedPlatform> platform;
@@ -509,8 +550,13 @@ void Consumer(const Args& args, const Geometry& geometry) {
       Require(after.fabricBytes >= before.fabricBytes && after.otherBytes >= before.otherBytes &&
                   after.fabricPlans >= before.fabricPlans,
               "transport counters moved backwards");
-      const uint64_t fabricBytes = after.fabricBytes - before.fabricBytes;
-      const uint64_t fabricPlans = after.fabricPlans - before.fabricPlans;
+      const uint64_t pullBytes = after.fabricBytes - before.fabricBytes;
+      const uint64_t fabricBytes = pullBytes + handle->OwnerPushBytes();
+      const uint64_t fabricPlans =
+          after.fabricPlans - before.fabricPlans + handle->OwnerPushPlans();
+      if (args.Size("expect-owner-push", 0))
+        Require(handle->OwnerPushBytes() == geometry.RequestedBytes() && pullBytes == 0,
+                "GET did not use owner-push for all requested bytes");
       Require(fabricBytes == geometry.RequestedBytes() && after.otherBytes == before.otherBytes &&
                   fabricPlans > 0,
               "selected FABRIC submitted bytes differ from requested remote ranges");
@@ -532,14 +578,16 @@ void Consumer(const Args& args, const Geometry& geometry) {
                          geometry.sourceOffsets[range] + i - geometry.destinationOffsets[range]);
               }
             }
-            Require(actual[key * geometry.object + i] == expected,
-                    "byte mismatch key=" + std::to_string(key) + " offset=" + std::to_string(i));
+            if (actual[key * geometry.object + i] != expected)
+              throw std::runtime_error("byte mismatch key=" + std::to_string(key) +
+                                       " offset=" + std::to_string(i));
           }
         }
       }
       std::cout << "SAMPLE phase=" << (isCold ? "cold" : "warm") << " iteration=" << iteration
                 << " requested_bytes=" << geometry.RequestedBytes()
                 << " latency_us=" << seconds * 1e6 << " consumer_ready_us=" << consumerSeconds * 1e6
+                << " owner_push_submitted_bytes=" << handle->OwnerPushBytes()
                 << " selected_fabric_submitted_bytes=" << fabricBytes
                 << " selected_fabric_submitted_plans=" << fabricPlans
                 << " owner_medium=" << MediumName(expectedMedium) << " layout=" << geometry.layout

@@ -119,6 +119,45 @@ TEST(BatchResolveCodec, RoundTripPreservesEveryField) {
   }
 }
 
+TEST(BatchResolveCodec, PackedCoverageSurvivesWireRoundTripAlongsideLegacyEntries) {
+  auto entries = SampleEntries();
+  entries[0].packed_ranges = {{5, 100}, {8190, 5}};
+  entries[0].pages = {{0, 7}};
+  ::umbp::BatchResolveKeysResponse encoded, parsed;
+  EncodeBatchResolveResponse(entries, 4096, {}, &encoded);
+  ASSERT_TRUE(parsed.ParseFromString(encoded.SerializeAsString()));
+  const auto decoded = DecodeBatchResolveResponse(parsed);
+  ASSERT_EQ(decoded.keys.size(), entries.size());
+  EXPECT_EQ(decoded.keys[0].packed_ranges, entries[0].packed_ranges);
+  EXPECT_EQ(decoded.keys[0].pages, entries[0].pages);
+  EXPECT_TRUE(decoded.keys[2].packed_ranges.empty());
+
+  encoded.mutable_packed_ranges()->RemoveLast();
+  EXPECT_TRUE(DecodeBatchResolveResponse(encoded).keys.empty());
+}
+
+TEST(BatchResolveCodec, RejectsInvalidPackedCoverageInsteadOfReadingHolesOrOverflows) {
+  for (const auto& ranges : std::vector<std::vector<ObjectExtent>>{{{0, 0}},
+                                                                   {{UINT64_MAX, 2}},
+                                                                   {{100, 5}, {10, 5}},
+                                                                   {{10, 5}, {12, 8}},
+                                                                   {{10, 5}, {15, 8}},
+                                                                   {{12287, 2}}}) {
+    auto entries = SampleEntries();
+    entries[0].packed_ranges = ranges;
+    ::umbp::BatchResolveKeysResponse response;
+    EncodeBatchResolveResponse(entries, 4096, {}, &response);
+    EXPECT_TRUE(DecodeBatchResolveResponse(response).keys.empty());
+  }
+  auto entries = SampleEntries();
+  entries[0].packed_ranges = {{10, 5}};
+  entries[0].covered_offset = 10;
+  entries[0].covered_size = 5;
+  ::umbp::BatchResolveKeysResponse response;
+  EncodeBatchResolveResponse(entries, 4096, {}, &response);
+  EXPECT_TRUE(DecodeBatchResolveResponse(response).keys.empty());
+}
+
 TEST(BatchResolveCodec, FlattenedPagesSliceByKey) {
   // Two found keys with different page counts must not bleed into each other.
   std::vector<ResolvedKeyEntry> entries(2);

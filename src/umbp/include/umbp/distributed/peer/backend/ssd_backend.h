@@ -175,6 +175,7 @@ class SsdBackend : public MediumBackend {
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
     std::shared_ptr<const void> hold;  // copied into each kLocal hit
+    uint64_t content_version = 0;
   };
 
   // A lease ClearLocal took while a local reader still held it; freed once
@@ -213,7 +214,8 @@ class SsdBackend : public MediumBackend {
     void Join(ResolvedEntry* entry) { joiners_.push_back(entry); }
     // Hands every joiner the outcome and a hold; true if later resolves may still attach.
     bool Finish(ResolveOutcome outcome, StagingSpan staged, uint64_t object_size,
-                ObjectExtent staged_window, const std::shared_ptr<const void>& reader_hold);
+                ObjectExtent staged_window, const std::shared_ptr<const void>& reader_hold,
+                uint64_t version = 0);
     // False on timeout: `entry` gets kBusy and stops being a joiner.
     bool Wait(std::unique_lock<std::mutex>& lock, ResolvedEntry* entry);
 
@@ -222,6 +224,7 @@ class SsdBackend : public MediumBackend {
     uint64_t size = 0;
     ObjectExtent window;
     std::weak_ptr<const void> hold;  // joinable while any reader still holds it
+    uint64_t content_version = 0;
 
    private:
     std::condition_variable cv_;

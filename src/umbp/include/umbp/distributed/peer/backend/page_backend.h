@@ -352,6 +352,7 @@ class PageBackend : public MediumBackend {
   struct OwnedSlot {
     std::vector<PageLocation> pages;
     uint64_t size = 0;
+    uint64_t content_version = 0;
     // Eviction fence, renewed by every Resolve.  Lives here rather than in a
     // map keyed by the same string, which cost a second hash of a ~128-byte
     // key per resolve.  Zero means no lease.
@@ -381,6 +382,7 @@ class PageBackend : public MediumBackend {
     OwnedSlot(OwnedSlot&& other) noexcept
         : pages(std::move(other.pages)),
           size(other.size),
+          content_version(other.content_version),
           read_lease_ns(other.read_lease_ns.load(std::memory_order_relaxed)),
           hold(std::move(other.hold)),
           lru_it(other.lru_it),
@@ -389,6 +391,7 @@ class PageBackend : public MediumBackend {
       if (this == &other) return *this;
       pages = std::move(other.pages);
       size = other.size;
+      content_version = other.content_version;
       read_lease_ns.store(other.read_lease_ns.load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
       hold = std::move(other.hold);

@@ -40,6 +40,32 @@
 namespace mori::umbp {
 namespace {
 
+TEST(PackedRangesTest, NormalizesOverlapAndMapsOnlyCoveredObjectBytes) {
+  std::vector<ObjectExtent> ranges;
+  ASSERT_TRUE(NormalizeObjectRanges({{40, 5}, {10, 8}, {15, 5}, {20, 4}, {10, 1}}, 64, &ranges));
+  EXPECT_EQ(ranges, (std::vector<ObjectExtent>{{10, 14}, {40, 5}}));
+  EXPECT_EQ(PackedRangeBytes(ranges), 29);
+  size_t offset = 42;
+  ASSERT_TRUE(RebaseRangeOntoPackedRanges(ranges, &offset, 3));
+  EXPECT_EQ(offset, 26);
+  EXPECT_EQ(offset % 16, 42 % 16);
+  offset = 23;
+  EXPECT_FALSE(RebaseRangeOntoPackedRanges(ranges, &offset, 18));
+  EXPECT_EQ(offset, 23);
+}
+
+TEST(PackedRangesTest, InvalidAndOverflowingRangesDoNotPublishPartialCoverage) {
+  const std::vector<ObjectExtent> original{{2, 3}};
+  auto ranges = original;
+  EXPECT_FALSE(NormalizeObjectRanges({{0, 1}, {63, 2}}, 64, &ranges));
+  EXPECT_EQ(ranges, original);
+  EXPECT_FALSE(NormalizeObjectRanges({{UINT64_MAX, 1}}, UINT64_MAX, &ranges));
+  EXPECT_EQ(ranges, original);
+  EXPECT_FALSE(NormalizeObjectRanges({{1, 0}}, 64, &ranges));
+  ASSERT_TRUE(NormalizeObjectRanges({{UINT64_MAX - 8, 8}}, UINT64_MAX, &ranges));
+  EXPECT_EQ(PackedRangeBytes(ranges), 15);
+}
+
 struct Fragment {
   size_t page_index;
   uint64_t tier_offset;

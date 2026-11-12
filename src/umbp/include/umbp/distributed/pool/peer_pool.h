@@ -88,11 +88,18 @@ struct PoolResolvedEntry {
   ResolvedEntry resolved;
 };
 
+struct FabricReadPushRequest;
+class FabricReadPush;
+
 struct PoolReadGrant {
   bool accepted = false;
   uint64_t token = 0;
   uint64_t generation = 0;
   std::vector<PoolResolvedEntry> entries;
+  bool push_supported = false;
+  bool push_drained = false;
+  uint64_t push_bytes = 0;
+  uint64_t push_plans = 0;
 };
 
 // What PeerPool::Evict did with one request.
@@ -148,12 +155,18 @@ class PeerPool {
                                  const std::string& operation_id, uint64_t expected_generation,
                                  bool include_descs,
                                  const std::vector<ObjectExtent>* extents = nullptr,
-                                 bool require_fabric = false);
+                                 bool require_fabric = false,
+                                 const std::vector<std::vector<ObjectExtent>>* ranges = nullptr,
+                                 const FabricReadPushRequest* push = nullptr);
   // Configure before publishing the peer service. The arena is not a KV tier.
   void SetFabricReadStaging(std::shared_ptr<FabricReadStaging> staging,
                             std::function<void()> quarantine = {});
   std::vector<BufferMemoryDescBytes> FabricReadStagingDescriptors() const;
   void QuarantineReadStaging() noexcept;
+  void SetFabricReadPush(std::shared_ptr<FabricReadPush> push) {
+    fabric_read_push_ = std::move(push);
+  }
+  bool SupportsReadPush() const { return fabric_read_push_ != nullptr; }
   std::vector<bool> ReleaseReadPins(const std::vector<uint64_t>& tokens);
   std::vector<bool> AbandonReadOperations(const std::vector<std::string>& operation_ids);
   uint64_t Generation() const;
@@ -293,6 +306,7 @@ class PeerPool {
   std::unique_ptr<PoolPolicy> policy_;
   TransferEngine* transfer_engine_;
   std::shared_ptr<FabricReadStaging> fabric_read_staging_;
+  std::shared_ptr<FabricReadPush> fabric_read_push_;
   std::function<void()> read_staging_quarantine_;
   std::shared_ptr<const LogicalTierGraph> tier_graph_;
   TierTransitionExecutor transition_executor_;
@@ -368,7 +382,9 @@ class PeerPool {
     std::unique_ptr<PoolReadGrant> grant;
     bool released = false;
     std::vector<ObjectExtent> extents;
+    std::vector<std::vector<ObjectExtent>> ranges;
     bool require_fabric = false;
+    std::string push_signature;
     uint64_t generation = 0;
     bool preparing = false;
     std::exception_ptr failure;

@@ -1,17 +1,43 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// SPDX-License-Identifier: MIT
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <functional>
+#include <future>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "umbp/distributed/peer/backend/mock_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
+#include "umbp/distributed/pool/fabric_read_push.h"
 #include "umbp/distributed/pool/fabric_read_staging.h"
 #include "umbp/distributed/pool/peer_pool.h"
+#include "umbp/distributed/range_map.h"
 #include "umbp/distributed/transfer/plan_builder.h"
 
 namespace mori::umbp {
@@ -69,7 +95,13 @@ class SourceBackend final : public MockBackend {
                                   loc_ == Location::CPU ? -1 : 0);
   }
   size_t BufferCount() const override { return 1; }
-  mutable int lookups = 0;
+  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool, bool = false,
+                                          ResolveReader = ResolveReader::kRemote,
+                                          const std::vector<ObjectExtent>* = nullptr) override {
+    return std::vector<ResolvedEntry>(keys.size(), forced_resolution);
+  }
+  ResolvedEntry forced_resolution;
+  mutable std::atomic<int> lookups{0};
 
  private:
   Location loc_;
@@ -98,6 +130,7 @@ class CopyEngine final : public TransferEngine {
   }
   void Deregister(const TransferRef&) override { ++stats_->deregistrations; }
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
+    if (push_mode) return src.HasHostPtr() && dst.HasMemoryDesc() && !dst.HasHostPtr();
     return src.HasHostPtr() && dst.HasHostPtr() && src.loc == Location::CPU &&
            dst.loc == Location::GPU;
   }
@@ -113,8 +146,12 @@ class CopyEngine final : public TransferEngine {
     class Handle final : public TransferHandle {
      public:
       Handle(std::vector<TransferPlan> work, Fault fault, std::shared_ptr<ArenaStats> stats,
-             uint64_t* copied)
-          : work_(std::move(work)), fault_(fault), stats_(std::move(stats)), copied_(copied) {
+             uint64_t* copied, std::function<void()> before_wait)
+          : work_(std::move(work)),
+            fault_(fault),
+            stats_(std::move(stats)),
+            copied_(copied),
+            before_wait_(std::move(before_wait)) {
         ++stats_->live_handles;
       }
       ~Handle() override { --stats_->live_handles; }
@@ -122,6 +159,7 @@ class CopyEngine final : public TransferEngine {
         if (fault_ == Fault::kThrow) throw std::runtime_error("unknown H2D completion");
         if (waited_) return;
         waited_ = true;
+        if (before_wait_) before_wait_();
         if (fault_ != Fault::kNone) {
           TransferFailure failure;
           failure.code = 1;
@@ -133,9 +171,11 @@ class CopyEngine final : public TransferEngine {
         }
         for (const auto& plan : work_)
           for (size_t i = 0; i < plan.sizes.size(); ++i) {
-            std::memcpy(static_cast<char*>(plan.dst.host_ptr) + plan.dst_offsets[i],
-                        static_cast<const char*>(plan.src.host_ptr) + plan.src_offsets[i],
-                        plan.sizes[i]);
+            std::memcpy(
+                static_cast<char*>(plan.dst.host_ptr ? plan.dst.host_ptr
+                                                     : reinterpret_cast<void*>(plan.dst.mem.data)) +
+                    plan.dst_offsets[i],
+                static_cast<const char*>(plan.src.host_ptr) + plan.src_offsets[i], plan.sizes[i]);
             *copied_ += plan.sizes[i];
           }
       }
@@ -146,13 +186,16 @@ class CopyEngine final : public TransferEngine {
       std::shared_ptr<ArenaStats> stats_;
       uint64_t* copied_;
       bool waited_ = false;
+      std::function<void()> before_wait_;
     };
-    return std::make_unique<Handle>(std::move(plans), fault, stats_, &copied_bytes);
+    return std::make_unique<Handle>(std::move(plans), fault, stats_, &copied_bytes, before_wait);
   }
   bool exportable = true;
+  bool push_mode = false;
   Fault fault = Fault::kNone;
   size_t submissions = 0;
   uint64_t copied_bytes = 0;
+  std::function<void()> before_wait;
 
  private:
   std::shared_ptr<ArenaStats> stats_;
@@ -196,11 +239,194 @@ class FabricReadStagingTest : public testing::Test {
     }
     return out;
   }
+  std::vector<char> PackedPayload(const PoolResolvedEntry& entry) {
+    const auto& ranges = entry.resolved.packed_ranges;
+    const auto bytes = StagedBytes(entry, PackedRangeBytes(ranges));
+    std::vector<char> payload;
+    for (const auto& range : ranges) {
+      size_t offset = range.offset;
+      EXPECT_TRUE(RebaseRangeOntoPackedRanges(ranges, &offset, range.length));
+      payload.insert(payload.end(), bytes.begin() + offset, bytes.begin() + offset + range.length);
+    }
+    return payload;
+  }
   std::shared_ptr<ArenaStats> stats = std::make_shared<ArenaStats>();
   CopyEngine engine;
   BackendRegistry registry;
   SourceBackend* cpu = nullptr;
 };
+
+class PushPeers final : public PeerDirectory {
+ public:
+  std::vector<uint8_t> PackedLocalEngineDesc() const override { return {}; }
+  bool EnsureRemoteEngine(const std::string&, const std::string&) override { return true; }
+  bool HasRemoteEngine(const std::string&) const override { return true; }
+  void ForgetRemote(const std::string&) override {}
+  void CacheRemoteBuffers(const std::string&, const std::vector<BufferMemoryDescBytes>&) override {}
+  bool HasRemoteBuffers(const std::string&) const override { return true; }
+  std::vector<TransferRef> RemoteBufferSnapshot(const std::string&, uint32_t) const override {
+    return {};
+  }
+};
+
+TEST_F(FabricReadStagingTest, OwnerPushCopiesFinalRangesAndRejectsBoundsBeforePosting) {
+  PushPeers peers;
+  engine.push_mode = true;
+  bool quarantined = false;
+  FabricReadPush push(
+      &engine, &peers, &registry, 0,
+      [](const void* ptr, size_t, int) { return const_cast<void*>(ptr); },
+      [&] { quarantined = true; });
+  std::vector<char> destination(80, char(0x7f));
+  auto dst = engine.RegisterMemory(destination.data(), destination.size(), Location::GPU, 0);
+  dst.host_ptr = nullptr;
+  dst.mem.engineKey = "reader";
+  FabricReadPushRequest request;
+  request.ranges = {{{13, 19, dst, 3}, {48, 8, dst, 50}}};
+  std::vector<PoolResolvedEntry> entries{Entry(64, {1, 3, 0, 2})};
+  const auto result = push.Execute(&entries, request);
+  ASSERT_TRUE(result.supported);
+  EXPECT_TRUE(result.drained);
+  EXPECT_EQ(result.submitted_bytes, 27);
+  EXPECT_EQ(engine.copied_bytes, 27);
+  for (size_t i = 0; i < destination.size(); ++i) {
+    char expected = char(0x7f);
+    if (i >= 3 && i < 22) expected = i < 6 ? char(29 + i - 3) : char(48 + i - 6);
+    if (i >= 50 && i < 58) expected = char(32 + i - 50);
+    EXPECT_EQ(destination[i], expected) << i;
+  }
+  request.ranges[0][1].destination_offset = 79;
+  EXPECT_FALSE(push.Execute(&entries, request).supported);
+  EXPECT_EQ(engine.submissions, 1);
+  EXPECT_FALSE(quarantined);
+}
+
+TEST_F(FabricReadStagingTest, OwnerPushRetryJoinsOnceAndFencesChangedDestinationAndRelease) {
+  PushPeers peers;
+  engine.push_mode = true;
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  pool.SetFabricReadPush(std::make_shared<FabricReadPush>(
+      &engine, &peers, &registry, 0,
+      [](const void* ptr, size_t, int) { return const_cast<void*>(ptr); }, [] {}));
+  cpu->forced_resolution = Entry(64).resolved;
+  std::vector<char> destination(64);
+  auto dst = engine.RegisterMemory(destination.data(), destination.size(), Location::GPU, 0);
+  dst.host_ptr = nullptr;
+  FabricReadPushRequest request;
+  request.signature = "immutable request";
+  request.ranges = {{{1, 31, dst, 2}}};
+  const auto epoch = pool.Generation();
+  auto acquire = [&] {
+    return pool.AcquireReadBatch({"key"}, "push-op", epoch, false, nullptr, false, nullptr,
+                                 &request);
+  };
+  std::promise<void> entered, release;
+  auto released = release.get_future().share();
+  engine.before_wait = [&] {
+    entered.set_value();
+    released.wait();
+  };
+  auto first_call = std::async(std::launch::async, acquire);
+  entered.get_future().wait();
+  auto retry_call = std::async(std::launch::async, acquire);
+  EXPECT_EQ(retry_call.wait_for(std::chrono::milliseconds(10)), std::future_status::timeout);
+  EXPECT_FALSE(pool.AbandonReadOperations({"push-op"})[0]);
+  release.set_value();
+  auto first = first_call.get();
+  const auto retry = retry_call.get();
+  ASSERT_TRUE(first.accepted);
+  EXPECT_EQ(retry.token, first.token);
+  ASSERT_TRUE(first.push_supported);
+  EXPECT_TRUE(first.push_drained);
+  EXPECT_EQ(acquire().token, first.token);
+  EXPECT_EQ(engine.submissions, 1);
+  request.signature = "different destination";
+  EXPECT_FALSE(acquire().accepted);
+  request.signature = "immutable request";
+  EXPECT_FALSE(pool.AbandonReadOperations({"push-op"})[0]);
+  EXPECT_TRUE(pool.ReleaseReadPins({first.token})[0]);
+  EXPECT_FALSE(acquire().accepted);
+  EXPECT_EQ(engine.submissions, 1);
+}
+
+TEST_F(FabricReadStagingTest, ClearDuringPushCannotReleaseSourceBeforeGpuDrain) {
+  PushPeers peers;
+  engine.push_mode = true;
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  pool.SetFabricReadPush(std::make_shared<FabricReadPush>(
+      &engine, &peers, &registry, 0,
+      [](const void* ptr, size_t, int) { return const_cast<void*>(ptr); }, [] {}));
+  cpu->forced_resolution = Entry(64).resolved;
+  std::weak_ptr<const void> source_pin = cpu->forced_resolution.hold;
+  std::vector<char> destination(64);
+  auto dst = engine.RegisterMemory(destination.data(), destination.size(), Location::GPU, 0);
+  dst.host_ptr = nullptr;
+  FabricReadPushRequest request;
+  request.signature = "cancel-push";
+  request.ranges = {{{0, 64, dst, 0}}};
+  engine.before_wait = [&] {
+    cpu->forced_resolution.hold.reset();
+    pool.ClearLocal();
+    EXPECT_FALSE(source_pin.expired());
+  };
+  const auto grant = pool.AcquireReadBatch({"key"}, "cancel-push", pool.Generation(), false,
+                                           nullptr, false, nullptr, &request);
+  EXPECT_FALSE(grant.accepted);
+  EXPECT_TRUE(source_pin.expired());
+  EXPECT_EQ(engine.copied_bytes, 64);
+  EXPECT_FALSE(pool.AcquireReadBatch({"key"}, "cancel-push", pool.Generation(), false, nullptr,
+                                     false, nullptr, &request)
+                   .accepted);
+  EXPECT_EQ(engine.submissions, 1);
+}
+
+TEST_F(FabricReadStagingTest, OwnerPushBusyBatchDoesNotWriteSuccessfulPrefix) {
+  PushPeers peers;
+  engine.push_mode = true;
+  FabricReadPush push(
+      &engine, &peers, &registry, 0,
+      [](const void* ptr, size_t, int) { return const_cast<void*>(ptr); }, [] {});
+  std::vector<char> destination(128, 7);
+  auto dst = engine.RegisterMemory(destination.data(), destination.size(), Location::GPU, 0);
+  dst.host_ptr = nullptr;
+  FabricReadPushRequest request;
+  request.ranges = {{{0, 64, dst, 0}}, {{0, 64, dst, 64}}};
+  std::vector<PoolResolvedEntry> entries{Entry(64), {}};
+  entries[1].resolved.outcome = ResolveOutcome::kBusy;
+  const auto result = push.Execute(&entries, request);
+  EXPECT_FALSE(result.supported);
+  EXPECT_TRUE(result.drained);
+  EXPECT_EQ(engine.submissions, 0);
+  EXPECT_TRUE(std::all_of(destination.begin(), destination.end(), [](char c) { return c == 7; }));
+}
+
+TEST_F(FabricReadStagingTest, OwnerPushUnsupportedMappingDoesNotWriteAndUnknownDrainRetains) {
+  PushPeers peers;
+  engine.push_mode = true;
+  bool mapped = false, quarantined = false;
+  FabricReadPush push(
+      &engine, &peers, &registry, 0,
+      [&](const void* ptr, size_t, int) { return mapped ? const_cast<void*>(ptr) : nullptr; },
+      [&] { quarantined = true; });
+  std::vector<char> destination(64, 7);
+  auto dst = engine.RegisterMemory(destination.data(), destination.size(), Location::GPU, 0);
+  dst.host_ptr = nullptr;
+  FabricReadPushRequest request;
+  request.ranges = {{{0, 64, dst, 0}}};
+  std::vector<PoolResolvedEntry> entries{Entry(64)};
+  EXPECT_FALSE(push.Execute(&entries, request).supported);
+  EXPECT_EQ(engine.submissions, 0);
+  mapped = true;
+  engine.fault = CopyEngine::Fault::kUnconfirmed;
+  std::weak_ptr<const void> hold = entries.front().resolved.hold;
+  const auto result = push.Execute(&entries, request);
+  EXPECT_TRUE(result.supported);
+  EXPECT_FALSE(result.drained);
+  entries.clear();
+  EXPECT_FALSE(hold.expired());
+  EXPECT_TRUE(quarantined);
+  EXPECT_EQ(stats->live_handles, 1);
+}
 
 TEST_F(FabricReadStagingTest, CopiesSubsetAcrossNoncontiguousSourcePagesAndRecyclesOnLastPin) {
   auto staging = MakeStaging();
@@ -217,7 +443,7 @@ TEST_F(FabricReadStagingTest, CopiesSubsetAcrossNoncontiguousSourcePagesAndRecyc
   EXPECT_EQ(result.resolved.descs.size(), 1);
   EXPECT_EQ(result.resolved.descs.front().backend_id, FabricReadStaging::kBackendId);
   EXPECT_EQ(engine.copied_bytes, 19);
-  EXPECT_EQ(cpu->lookups, 1);
+  EXPECT_EQ(cpu->lookups.load(), 1);
   EXPECT_TRUE(source_hold.expired());
   std::vector<char> expected{29, 30, 31};
   for (char byte = 48; byte < 64; ++byte) expected.push_back(byte);
@@ -255,6 +481,53 @@ TEST_F(FabricReadStagingTest, ExistingCoverageUsesObjectRelativeOffsetsAndOmitte
   EXPECT_EQ(staging->InUseBytes(), 0);
 }
 
+TEST_F(FabricReadStagingTest, SparseUnionCopiesOnlyRequestedBytesIntoCompactPages) {
+  auto staging = MakeStaging(2 * kPage);
+  std::vector<PoolResolvedEntry> entries{Entry(64, {1, 3, 0, 2})};
+  const std::vector<ObjectExtent> windows{{1, 60}};
+  // Unsorted and overlapping spans must share their bytes, even across a
+  // source page boundary. The 60-byte envelope cannot fit this 32-byte arena.
+  const std::vector<std::vector<ObjectExtent>> ranges{{{58, 3}, {13, 6}, {1, 4}, {15, 6}}};
+  ASSERT_TRUE(staging->Stage(&entries, &windows, true, &ranges));
+  EXPECT_EQ(engine.copied_bytes, 15);
+  EXPECT_EQ(staging->InUseBytes(), 2 * kPage);
+  const auto& result = entries.front();
+  EXPECT_EQ(result.resolved.size, 64);
+  EXPECT_EQ(result.resolved.covered_offset, 0);
+  EXPECT_EQ(result.resolved.covered_size, 0);
+  EXPECT_EQ(result.resolved.packed_ranges, (std::vector<ObjectExtent>{{1, 4}, {13, 8}, {58, 3}}));
+  EXPECT_EQ(PackedPayload(result),
+            (std::vector<char>{17, 18, 19, 20, 29, 30, 31, 48, 49, 50, 51, 52, 42, 43, 44}));
+}
+
+TEST_F(FabricReadStagingTest, SparseRequestOutsideWindowOrObjectNeverPosts) {
+  auto staging = MakeStaging();
+  for (const auto& spans : std::vector<std::vector<ObjectExtent>>{
+           {{0, 2}}, {{31, 3}}, {{63, 2}}, {{17, 0}}, {{UINT64_MAX, 4}}}) {
+    std::vector<PoolResolvedEntry> entries{Entry(64)};
+    const std::vector<ObjectExtent> windows{{16, 16}};
+    const std::vector<std::vector<ObjectExtent>> ranges{spans};
+    EXPECT_FALSE(staging->Stage(&entries, &windows, true, &ranges));
+    EXPECT_FALSE(entries.front().resolved.found);
+    EXPECT_EQ(engine.submissions, 0);
+    EXPECT_EQ(staging->InUseBytes(), 0);
+  }
+}
+
+TEST_F(FabricReadStagingTest, PacksRangesFromAnAlreadyStagedSsdWindow) {
+  auto staging = MakeStaging(kPage);
+  std::vector<PoolResolvedEntry> entries{Entry(256, {2, 5})};
+  entries.front().tier = TierType::SSD;
+  entries.front().resolved.covered_offset = 17;
+  entries.front().resolved.covered_size = 29;
+  const std::vector<ObjectExtent> windows{{20, 24}};
+  const std::vector<std::vector<ObjectExtent>> ranges{{{20, 3}, {40, 4}}};
+  ASSERT_TRUE(staging->Stage(&entries, &windows, false, &ranges));
+  EXPECT_EQ(engine.copied_bytes, 7);
+  EXPECT_TRUE(entries.front().resolved.descs.empty());
+  EXPECT_EQ(PackedPayload(entries.front()), (std::vector<char>{35, 36, 37, 87, 88, 89, 90}));
+}
+
 TEST_F(FabricReadStagingTest, NoExtentCopiesOnlyExistingCoverage) {
   auto staging = MakeStaging();
   std::vector<PoolResolvedEntry> entries{Entry(256, {2, 5})};
@@ -265,6 +538,173 @@ TEST_F(FabricReadStagingTest, NoExtentCopiesOnlyExistingCoverage) {
   EXPECT_EQ(entries.front().resolved.covered_offset, 17);
   EXPECT_EQ(entries.front().resolved.covered_size, 29);
   entries.clear();
+}
+
+TEST_F(FabricReadStagingTest, CacheReusesImmutableBytesAfterReleaseAndRejectsNewContentVersion) {
+  auto staging = MakeStaging();
+  staging->EnableCache(4 * kPage);
+  auto make = [&](uint64_t version, uint32_t first) {
+    std::vector<PoolResolvedEntry> entries{Entry(32, {first, first + 1})};
+    entries.front().resolved.content_version = version;
+    return entries;
+  };
+  auto entries = make(1, 0);
+  ASSERT_TRUE(staging->Stage(&entries));
+  const auto original = StagedBytes(entries.front(), 32);
+  entries.clear();
+  EXPECT_EQ(staging->InUseBytes(), 32);
+  entries = make(1, 0);
+  ASSERT_TRUE(staging->Stage(&entries, nullptr, false));
+  EXPECT_EQ(engine.copied_bytes, 32);
+  EXPECT_EQ(StagedBytes(entries.front(), 32), original);
+  EXPECT_TRUE(entries.front().resolved.descs.empty());
+  entries.clear();
+  entries = make(2, 4);
+  ASSERT_TRUE(staging->Stage(&entries));
+  EXPECT_EQ(engine.copied_bytes, 64);
+  EXPECT_NE(StagedBytes(entries.front(), 32), original);
+  EXPECT_EQ(staging->GetCacheStats().hits, 1);
+  entries.clear();
+  staging.reset();
+  EXPECT_EQ(stats->releases, 1);
+  EXPECT_EQ(stats->deregistrations, 1);
+}
+
+TEST_F(FabricReadStagingTest, CacheEvictionPreservesActiveGrantsAndReclaimsIdlePages) {
+  auto staging = MakeStaging(2 * kPage);
+  staging->EnableCache(2 * kPage);
+  std::vector<PoolResolvedEntry> first{Entry(32, {0, 1})};
+  first.front().resolved.content_version = 1;
+  ASSERT_TRUE(staging->Stage(&first));
+  const auto expected = StagedBytes(first.front(), 32);
+  std::vector<PoolResolvedEntry> second{Entry(32, {4, 5})};
+  second.front().resolved.content_version = 2;
+  EXPECT_FALSE(staging->Stage(&second));
+  EXPECT_EQ(second.front().resolved.outcome, ResolveOutcome::kBusy);
+  EXPECT_EQ(StagedBytes(first.front(), 32), expected);
+  EXPECT_EQ(engine.copied_bytes, 32);
+  first.clear();
+  second = {Entry(32, {4, 5})};
+  second.front().resolved.content_version = 2;
+  ASSERT_TRUE(staging->Stage(&second));
+  EXPECT_EQ(engine.copied_bytes, 64);
+  second.clear();
+  first = {Entry(32, {0, 1})};
+  first.front().resolved.content_version = 1;
+  ASSERT_TRUE(staging->Stage(&first));
+  EXPECT_EQ(engine.copied_bytes, 96);
+  EXPECT_EQ(StagedBytes(first.front(), 32), expected);
+}
+
+TEST_F(FabricReadStagingTest, MetadataCacheHitRequiresLiveMatchingContentAndCompleteCoverage) {
+  auto staging = MakeStaging();
+  staging->EnableCache(4 * kPage);
+  std::vector<PoolResolvedEntry> original{Entry(64)};
+  original.front().resolved.content_version = 11;
+  const std::vector<ObjectExtent> windows{{0, 64}};
+  const std::vector<std::vector<ObjectExtent>> ranges{{{0, 4}, {48, 4}}};
+  ASSERT_TRUE(staging->Stage(&original, &windows, true, &ranges));
+  auto metadata = [&] {
+    auto entry = Entry(64);
+    entry.resolved.content_version = 11;
+    entry.resolved.pages.clear();
+    entry.resolved.hold.reset();
+    return std::vector<PoolResolvedEntry>{entry};
+  };
+  auto hit = metadata();
+  ASSERT_TRUE(staging->TryCached(&hit, &windows, true, &ranges));
+  EXPECT_EQ(PackedPayload(hit.front()), PackedPayload(original.front()));
+  EXPECT_TRUE(hit.front().resolved.hold);
+  EXPECT_EQ(engine.copied_bytes, 8);
+  auto changed = metadata();
+  changed.front().resolved.content_version = 12;
+  EXPECT_FALSE(staging->TryCached(&changed, &windows, true, &ranges));
+  changed = metadata();
+  changed.front().resolved.found = false;
+  EXPECT_FALSE(staging->TryCached(&changed, &windows, true, &ranges));
+  changed = metadata();
+  const std::vector<std::vector<ObjectExtent>> different{{{0, 4}, {47, 5}}};
+  EXPECT_FALSE(staging->TryCached(&changed, &windows, true, &different));
+}
+
+TEST_F(FabricReadStagingTest, ConcurrentIdenticalReadsJoinOneH2dPreparation) {
+  auto staging = MakeStaging(2 * kPage);
+  staging->EnableCache(2 * kPage);
+  std::promise<void> started, release;
+  const auto released = release.get_future().share();
+  engine.before_wait = [&] {
+    started.set_value();
+    released.wait();
+  };
+  std::vector<PoolResolvedEntry> first{Entry(32, {0, 1})}, second = first;
+  first.front().resolved.content_version = second.front().resolved.content_version = 1;
+  auto leader = std::async(std::launch::async, [&] { return staging->Stage(&first); });
+  started.get_future().wait();
+  auto follower = std::async(std::launch::async, [&] { return staging->Stage(&second); });
+  for (int i = 0; i < 1000 && staging->GetCacheStats().joins == 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const bool joined = staging->GetCacheStats().joins == 1;
+  release.set_value();
+  EXPECT_TRUE(joined);
+  EXPECT_TRUE(leader.get());
+  EXPECT_TRUE(follower.get());
+  EXPECT_EQ(engine.submissions, 1);
+  EXPECT_EQ(engine.copied_bytes, 32);
+  EXPECT_EQ(StagedBytes(first.front(), 32), StagedBytes(second.front(), 32));
+}
+
+TEST_F(FabricReadStagingTest, FailedCachePreparationWakesJoinerAndAllowsRetry) {
+  auto staging = MakeStaging(2 * kPage);
+  staging->EnableCache(2 * kPage);
+  engine.fault = CopyEngine::Fault::kDrained;
+  std::promise<void> started, release;
+  const auto released = release.get_future().share();
+  engine.before_wait = [&] {
+    started.set_value();
+    released.wait();
+  };
+  std::vector<PoolResolvedEntry> first{Entry(32)}, second = first;
+  first.front().resolved.content_version = second.front().resolved.content_version = 1;
+  auto leader = std::async(std::launch::async, [&] { return staging->Stage(&first); });
+  started.get_future().wait();
+  auto follower = std::async(std::launch::async, [&] { return staging->Stage(&second); });
+  for (int i = 0; i < 1000 && staging->GetCacheStats().joins == 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const bool joined = staging->GetCacheStats().joins == 1;
+  release.set_value();
+  EXPECT_TRUE(joined);
+  EXPECT_FALSE(leader.get());
+  EXPECT_FALSE(follower.get());
+  EXPECT_EQ(first.front().resolved.outcome, ResolveOutcome::kFailed);
+  EXPECT_EQ(second.front().resolved.outcome, ResolveOutcome::kFailed);
+  EXPECT_EQ(engine.submissions, 1);
+  EXPECT_EQ(staging->GetCacheStats().bytes, 0);
+  EXPECT_EQ(staging->InUseBytes(), 0);
+  engine.fault = CopyEngine::Fault::kNone;
+  engine.before_wait = {};
+  first = {Entry(32)};
+  first.front().resolved.content_version = 1;
+  ASSERT_TRUE(staging->Stage(&first));
+  EXPECT_EQ(engine.submissions, 2);
+  EXPECT_EQ(engine.copied_bytes, 32);
+}
+
+TEST_F(FabricReadStagingTest, CachedSparseCoverageDoesNotServeDifferentRangesOrUnknownVersions) {
+  auto staging = MakeStaging();
+  staging->EnableCache(4 * kPage);
+  const std::vector<ObjectExtent> windows{{0, 64}};
+  const std::vector<std::vector<ObjectExtent>> low{{{0, 4}, {48, 4}}}, high{{{8, 4}, {48, 4}}};
+  for (const auto* ranges : {&low, &low, &high}) {
+    std::vector<PoolResolvedEntry> entries{Entry(64)};
+    entries.front().resolved.content_version = 1;
+    ASSERT_TRUE(staging->Stage(&entries, &windows, true, ranges));
+    EXPECT_EQ(entries.front().resolved.packed_ranges, ranges->front());
+  }
+  EXPECT_EQ(engine.submissions, 2);
+  EXPECT_EQ(engine.copied_bytes, 16);
+  std::vector<PoolResolvedEntry> unknown{Entry(16, {6})};
+  ASSERT_TRUE(staging->Stage(&unknown));
+  EXPECT_EQ(engine.submissions, 3);
 }
 
 TEST_F(FabricReadStagingTest, PressureReturnsBusyWithoutPostingAndAdmissionIsAtomic) {

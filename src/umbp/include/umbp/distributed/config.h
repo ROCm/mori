@@ -401,6 +401,8 @@ struct PoolClientConfig {
   // transient read capacity and never advertised as a storage backend.
   uint64_t fabric_read_staging_bytes =
       NonnegativeIntegerFromEnvironment("UMBP_FABRIC_READ_STAGING_BYTES", 0);
+  bool fabric_read_staging_cache =
+      NonnegativeIntegerFromEnvironment("UMBP_FABRIC_READ_STAGING_CACHE", 1, 1) != 0;
   int fabric_read_staging_device = static_cast<int>(NonnegativeIntegerFromEnvironment(
       "UMBP_FABRIC_READ_STAGING_DEVICE", 0, std::numeric_limits<int>::max()));
 };
@@ -428,6 +430,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.kv_max_inflight_reads = dc.kv_max_inflight_reads;
   pc.kv_max_inflight_bytes = dc.kv_max_inflight_bytes;
   pc.fabric_read_staging_bytes = dc.fabric_read_staging_bytes;
+  pc.fabric_read_staging_cache = dc.fabric_read_staging_cache;
   pc.fabric_read_staging_device = dc.fabric_read_staging_device;
   pc.staging_buffer_size = dc.staging_buffer_size;
   // The ranged scratch buffers/sizes are set by DistributedClient after it

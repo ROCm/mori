@@ -36,6 +36,7 @@ MORI Documentation
    MORI-IO-BENCHMARK
    MORI-UMBP-PD-BENCHMARK
    UMBP-TIER-MANAGEMENT-BENCHMARK
+   umbp/ualink-optimizations.zh-CN
    rdma_bandwidth_utilization
 
 .. toctree::

@@ -37,7 +37,9 @@
 
 #include "umbp/common/env_time.h"
 #include "umbp/common/parallel_for.h"
+#include "umbp/distributed/pool/fabric_read_push.h"
 #include "umbp/distributed/pool/fabric_read_staging.h"
+#include "umbp/distributed/range_map.h"
 
 namespace mori::umbp {
 
@@ -921,11 +923,21 @@ PoolReadGrant PeerPool::AcquireReadBatch(const std::vector<std::string>& keys,
                                          const std::string& operation_id,
                                          uint64_t expected_generation, bool include_descs,
                                          const std::vector<ObjectExtent>* extents,
-                                         bool require_fabric) {
+                                         bool require_fabric,
+                                         const std::vector<std::vector<ObjectExtent>>* ranges,
+                                         const FabricReadPushRequest* push) {
   PoolReadGrant rejected;
   rejected.generation = Generation();
   if (operation_id.empty() || rejected.generation != expected_generation) return rejected;
+  if (push && (!fabric_read_push_ || require_fabric || push->ranges.size() != keys.size()))
+    return rejected;
   if (extents && extents->size() != keys.size()) return rejected;
+  if (ranges && (ranges->size() != keys.size() || !require_fabric)) return rejected;
+  auto canonical_ranges = ranges ? *ranges : std::vector<std::vector<ObjectExtent>>{};
+  for (auto& spans : canonical_ranges) {
+    if (!NormalizeObjectRanges(spans, std::numeric_limits<uint64_t>::max(), &spans))
+      return rejected;
+  }
   const auto windows = extents ? *extents : std::vector<ObjectExtent>(keys.size());
   for (const auto& window : windows) {
     if ((window.length == 0 && window.offset != 0) ||
@@ -943,7 +955,8 @@ PoolReadGrant PeerPool::AcquireReadBatch(const std::vector<std::string>& keys,
       const auto existing = old->second;
       if (existing->released || existing->keys != keys ||
           existing->generation != expected_generation || existing->extents != windows ||
-          existing->require_fabric != require_fabric)
+          existing->require_fabric != require_fabric || existing->ranges != canonical_ranges ||
+          existing->push_signature != (push ? push->signature : std::string{}))
         return rejected;
       if (existing->preparing) {
         // A retry joins this preparation instead of resolving and staging a
@@ -964,7 +977,9 @@ PoolReadGrant PeerPool::AcquireReadBatch(const std::vector<std::string>& keys,
     receipt = std::make_shared<ReadReceipt>();
     receipt->keys = keys;
     receipt->extents = windows;
+    receipt->ranges = canonical_ranges;
     receipt->require_fabric = require_fabric;
+    if (push) receipt->push_signature = push->signature;
     receipt->generation = expected_generation;
     receipt->preparing = true;
     read_receipts_.emplace(operation_id, receipt);
@@ -972,7 +987,15 @@ PoolReadGrant PeerPool::AcquireReadBatch(const std::vector<std::string>& keys,
   }
 
   try {
-    auto entries = BatchResolve(keys, include_descs, false, ResolveReader::kPinnedRemote, &windows);
+    std::vector<PoolResolvedEntry> entries;
+    bool cached = false;
+    if (require_fabric && fabric_read_staging_ && fabric_read_staging_->GetCacheStats().bytes > 0) {
+      entries = BatchResolve(keys, false, false, ResolveReader::kMetadata, &windows);
+      cached = fabric_read_staging_->TryCached(&entries, &windows, include_descs,
+                                               ranges ? &canonical_ranges : nullptr);
+    }
+    if (!cached)
+      entries = BatchResolve(keys, include_descs, false, ResolveReader::kPinnedRemote, &windows);
     {
       std::lock_guard<std::mutex> operation_lock(operation_mutex_);
       std::lock_guard<std::mutex> lock(read_pin_mutex_);
@@ -995,7 +1018,9 @@ PoolReadGrant PeerPool::AcquireReadBatch(const std::vector<std::string>& keys,
       if (fabric_read_staging_) {
         // The preparer owns source pins and staging resources until Stage has
         // drained or quarantined H2D, even if Clear/Abandon cancels the receipt.
-        fabric_read_staging_->Stage(&entries, &windows, include_descs);
+        if (!cached)
+          fabric_read_staging_->Stage(&entries, &windows, include_descs,
+                                      ranges ? &canonical_ranges : nullptr);
         if (fabric_read_staging_->HasQuarantinedTransfers()) {
           // Source pages may still be used by the owner-local H2D copy. Preserve
           // every backing allocation, in addition to the arena's retained holds.
@@ -1019,6 +1044,22 @@ PoolReadGrant PeerPool::AcquireReadBatch(const std::vector<std::string>& keys,
     // A later allocation failure cannot strand a published token or source pin.
     auto retained = std::make_unique<PoolReadGrant>(
         PoolReadGrant{true, 0, expected_generation, std::move(entries)});
+    if (push) {
+      const auto outcome = fabric_read_push_->Execute(&retained->entries, *push);
+      retained->push_supported = outcome.supported;
+      retained->push_drained = outcome.drained;
+      retained->push_bytes = outcome.submitted_bytes;
+      retained->push_plans = outcome.submitted_plans;
+      // A completed push can release source pages immediately. The receipt
+      // retains only terminal metadata for duplicate/lost RPC replies.
+      if (outcome.supported && outcome.drained) {
+        for (auto& entry : retained->entries) {
+          entry.resolved.hold.reset();
+          entry.resolved.pages.clear();
+          entry.resolved.descs.clear();
+        }
+      }
+    }
     PoolReadGrant grant = *retained;
     std::lock_guard<std::mutex> operation_lock(operation_mutex_);
     std::lock_guard<std::mutex> lock(read_pin_mutex_);
@@ -1081,6 +1122,8 @@ std::vector<bool> PeerPool::AbandonReadOperations(const std::vector<std::string>
     const auto& operation = operation_ids[i];
     if (operation.empty()) continue;
     auto receipt = read_receipts_.find(operation);
+    // A reader cannot assert that the owner did not submit a push.
+    if (receipt != read_receipts_.end() && !receipt->second->push_signature.empty()) continue;
     if (auto ordered = OrderedOperation(operation)) {
       if (read_clients_.find(ordered->first) == read_clients_.end() && read_clients_.size() >= 4096)
         continue;
@@ -1279,7 +1322,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
     read_order = policy_->ReadOrder(*backends_);
   }
-  PromoteForRead(keys, &preferred);
+  if (reader != ResolveReader::kMetadata) PromoteForRead(keys, &preferred);
 
   // A flat mask avoids one heap allocation per key in the common 1023-key
   // ranged-get batch.

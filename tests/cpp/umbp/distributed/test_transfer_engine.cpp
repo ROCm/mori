@@ -45,6 +45,8 @@
 #include "umbp/common/aligned_buffer.h"
 #include "umbp/common/device_gather.h"
 #include "umbp/common/host_registration.h"
+#include "umbp/distributed/range_map.h"
+#include "umbp/distributed/transfer/coalesce.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
@@ -90,6 +92,64 @@ TransferRef RemoteRef(const std::string& engine_key, mori::io::MemoryUniqueId id
   desc.size = size;
   desc.loc = mori::io::MemoryLocationType::CPU;
   return TransferRef::Remote(std::move(desc));
+}
+
+TEST(TransferCoalescing, PreservesBytesAcrossFragmentedPagesAndRegistrationBoundaries) {
+  constexpr size_t page = 64, object = 5 * page - 3;
+  std::vector<std::vector<char>> source(2, std::vector<char>(8 * page));
+  std::vector<char> destination(object + 32, char(0xd3)), expected = destination;
+  std::vector<TransferRef> refs;
+  for (size_t b = 0; b < source.size(); ++b) {
+    for (size_t i = 0; i < source[b].size(); ++i) source[b][i] = (b * 47 + i * 13) % 251;
+    auto ref = RemoteRef("owner", b + 1, source[b].size());
+    ref.loc = ref.mem.loc = mori::io::MemoryLocationType::GPU;
+    ref.host_ptr = source[b].data();
+    refs.push_back(ref);
+  }
+  auto dst = RemoteRef("consumer", 1, destination.size());
+  dst.loc = dst.mem.loc = mori::io::MemoryLocationType::GPU;
+  dst.host_ptr = destination.data();
+  const std::vector<PageLocation> pages{{0, 1}, {0, 2}, {0, 7}, {1, 0}, {1, 1}};
+  std::vector<TransferItem> items;
+  ASSERT_TRUE(ForEachRangePageFragment(
+      pages, page, object, 3, object - 6,
+      [&](size_t p, uint64_t offset, size_t bytes, size_t copied) {
+        const auto& src = refs[pages[p].buffer_index];
+        if (items.empty() ||
+            !ExtendRegisteredGpuTransfer(&items.back(), src, offset, dst, 13 + copied, bytes, 7))
+          items.push_back(MakeItem(src, offset, dst, 13 + copied, bytes, 7));
+        return true;
+      }));
+  ASSERT_EQ(items.size(), 3u);
+  for (const auto& item : items)
+    std::memcpy(static_cast<char*>(item.dst.host_ptr) + item.dst_offset,
+                static_cast<const char*>(item.src.host_ptr) + item.src_offset, item.size);
+  for (size_t i = 0; i < object - 6; ++i) {
+    const size_t at = 3 + i;
+    const auto& slot = pages[at / page];
+    expected[13 + i] = source[slot.buffer_index][slot.page_index * page + at % page];
+  }
+  EXPECT_EQ(destination, expected);
+}
+
+TEST(TransferCoalescing, DoesNotMergeDifferentFailureTagsEnginesOrOversizedSegments) {
+  auto src = RemoteRef("owner", 1, uint64_t{1} << 34);
+  auto dst = RemoteRef("consumer", 1, uint64_t{1} << 34);
+  src.loc = dst.loc = mori::io::MemoryLocationType::GPU;
+  auto item = MakeItem(src, 0, dst, 0, 32, 0);
+  EXPECT_FALSE(ExtendRegisteredGpuTransfer(&item, src, 32, dst, 32, 16, 1));
+  auto other = src;
+  other.mem.engineKey = "other-owner";
+  EXPECT_FALSE(ExtendRegisteredGpuTransfer(&item, other, 32, dst, 32, 16, 0));
+  EXPECT_FALSE(ExtendRegisteredGpuTransfer(&item, src, 33, dst, 32, 16, 0));
+  EXPECT_FALSE(ExtendRegisteredGpuTransfer(&item, src, 32, dst, 33, 16, 0));
+  item.size = UINT32_MAX - 1;
+  EXPECT_TRUE(ExtendRegisteredGpuTransfer(&item, src, item.size, dst, item.size, 1, 0));
+  EXPECT_FALSE(ExtendRegisteredGpuTransfer(&item, src, item.size, dst, item.size, 1, 0));
+  EXPECT_EQ(item.size, UINT32_MAX);
+  item.src_offset = UINT64_MAX - 15;
+  item.size = 32;
+  EXPECT_FALSE(ExtendRegisteredGpuTransfer(&item, src, 16, dst, 32, 1, 0));
 }
 
 // TransferPlanBuilder's rules: every non-empty item is rejected or planned, and

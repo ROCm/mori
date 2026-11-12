@@ -628,6 +628,7 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
   OwnedSlot owned;
   owned.pages = std::move(it->second.pages);
   owned.size = it->second.size;
+  owned.content_version = slot_id;
   owned.hold = std::make_shared<char>();
   QueueEventLocked(KvEvent{KvEvent::Kind::ADD, key, tier_, owned.size});
   owned_[key] = std::move(owned);
@@ -814,9 +815,11 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     auto& entry = out[i];
     entry.outcome = ResolveOutcome::kFound;
     entry.found = true;
-    entry.pages = it->second.pages;
     entry.size = it->second.size;
+    entry.content_version = it->second.content_version;
     entry.page_size = page_size_;
+    if (reader == ResolveReader::kMetadata) continue;
+    entry.pages = it->second.pages;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
     if (reader != ResolveReader::kRemote) {
       entry.hold = it->second.hold;

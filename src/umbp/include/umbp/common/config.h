@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -339,6 +340,15 @@ struct UMBPIoEngineConfig {
   std::string host;   // RDMA engine hostname (formerly UMBPDistributedConfig::io_engine_host)
   uint16_t port = 0;  // RDMA engine port; 0 = OS-assigned ephemeral port (formerly io_engine_port)
   UMBPTransferMode mode = TransferModeFromEnvironment();
+  unsigned fabric_max_blocks_per_segment = static_cast<unsigned>(std::max<uint64_t>(
+      1, NonnegativeIntegerFromEnvironment("UMBP_FABRIC_MAX_BLOCKS_PER_SEGMENT", 8, 128)));
+  uint64_t fabric_get_chunk_bytes =
+      NonnegativeIntegerFromEnvironment("UMBP_FABRIC_GET_CHUNK_BYTES", 0);
+  unsigned fabric_pipeline_depth = static_cast<unsigned>(std::max<uint64_t>(
+      1, NonnegativeIntegerFromEnvironment("UMBP_FABRIC_PIPELINE_DEPTH", 2, 32)));
+  bool fabric_owner_push = NonnegativeIntegerFromEnvironment("UMBP_FABRIC_OWNER_PUSH", 0, 1) != 0;
+  bool fabric_cache_descriptors =
+      NonnegativeIntegerFromEnvironment("UMBP_FABRIC_CACHE_DESCRIPTORS", 0, 1) != 0;
   std::string fabric_kernel_path = [] {
     const char* value = std::getenv("UMBP_FABRIC_KERNEL_PATH");
     return value ? std::string(value) : std::string{};
@@ -567,6 +577,8 @@ struct UMBPDistributedConfig {
   // capacity; 0 disables it. Requires auto or fabric_strict transfer mode.
   uint64_t fabric_read_staging_bytes =
       NonnegativeIntegerFromEnvironment("UMBP_FABRIC_READ_STAGING_BYTES", 0);
+  bool fabric_read_staging_cache =
+      NonnegativeIntegerFromEnvironment("UMBP_FABRIC_READ_STAGING_CACHE", 1, 1) != 0;
   int fabric_read_staging_device = static_cast<int>(NonnegativeIntegerFromEnvironment(
       "UMBP_FABRIC_READ_STAGING_DEVICE", 0, std::numeric_limits<int>::max()));
 };

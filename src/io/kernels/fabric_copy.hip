@@ -35,34 +35,42 @@
 
 #include <cstdint>
 
-// dst/src are byte pointers; either may alias remote (imported) HBM. When both
-// are 16-byte aligned the bulk is copied as uint4 (vectorized); a scalar tail
-// handles the remainder and the fully-unaligned case.
+// Vectorize the bulk whenever both pointers can reach the same alignment.
+// Prefix and tail stay inside the authorized byte range; never round a read
+// down into a neighboring grant or write past the destination range.
+template <class Word>
+__device__ __forceinline__ void CopyAligned(char* dst, const char* src, size_t bytes, size_t tid,
+                                            size_t stride) {
+  constexpr size_t width = sizeof(Word);
+  const size_t align = (width - (reinterpret_cast<uintptr_t>(src) & (width - 1))) & (width - 1);
+  const size_t prefix = bytes < align ? bytes : align;
+  for (size_t i = tid; i < prefix; i += stride) dst[i] = src[i];
+  const size_t count = (bytes - prefix) / width;
+  const auto* input = reinterpret_cast<const Word*>(src + prefix);
+  auto* output = reinterpret_cast<Word*>(dst + prefix);
+  for (size_t i = tid; i < count; i += stride) output[i] = input[i];
+  for (size_t i = prefix + count * width + tid; i < bytes; i += stride) dst[i] = src[i];
+}
+
+__device__ __forceinline__ void CopyRange(char* dst, const char* src, size_t bytes, size_t tid,
+                                          size_t stride) {
+  const uintptr_t different = reinterpret_cast<uintptr_t>(src) ^ reinterpret_cast<uintptr_t>(dst);
+  if ((different & 15) == 0)
+    CopyAligned<uint4>(dst, src, bytes, tid, stride);
+  else if ((different & 7) == 0)
+    CopyAligned<uint2>(dst, src, bytes, tid, stride);
+  else if ((different & 3) == 0)
+    CopyAligned<uint32_t>(dst, src, bytes, tid, stride);
+  else if ((different & 1) == 0)
+    CopyAligned<uint16_t>(dst, src, bytes, tid, stride);
+  else
+    for (size_t i = tid; i < bytes; i += stride) dst[i] = src[i];
+}
+
 extern "C" __global__ void fabricCopyKernel(char* __restrict__ dst, const char* __restrict__ src,
                                             size_t nbytes) {
-  size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  size_t nthreads = static_cast<size_t>(gridDim.x) * blockDim.x;
-
-  uintptr_t s = reinterpret_cast<uintptr_t>(src);
-  uintptr_t d = reinterpret_cast<uintptr_t>(dst);
-
-  if ((s & 15) == 0 && (d & 15) == 0 && nbytes >= 16) {
-    size_t nvec = nbytes / 16;
-    size_t tailStart = nvec * 16;
-
-    const uint4* srcV = reinterpret_cast<const uint4*>(src);
-    uint4* dstV = reinterpret_cast<uint4*>(dst);
-    for (size_t i = tid; i < nvec; i += nthreads) {
-      dstV[i] = srcV[i];
-    }
-    for (size_t i = tailStart + tid; i < nbytes; i += nthreads) {
-      dst[i] = src[i];
-    }
-  } else {
-    for (size_t i = tid; i < nbytes; i += nthreads) {
-      dst[i] = src[i];
-    }
-  }
+  CopyRange(dst, src, nbytes, static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x,
+            static_cast<size_t>(gridDim.x) * blockDim.x);
 }
 
 struct FabricCopySegment {
@@ -80,14 +88,5 @@ extern "C" __global__ void fabricBatchCopyKernel(const FabricCopySegment* segmen
   const auto item = segments[segment];
   const size_t tid = (blockIdx.x % blocksPerSegment) * blockDim.x + threadIdx.x;
   const size_t stride = static_cast<size_t>(blocksPerSegment) * blockDim.x;
-  if ((reinterpret_cast<uintptr_t>(item.src) & 15) == 0 &&
-      (reinterpret_cast<uintptr_t>(item.dst) & 15) == 0) {
-    const size_t vectors = item.size / 16;
-    const auto* src = reinterpret_cast<const uint4*>(item.src);
-    auto* dst = reinterpret_cast<uint4*>(item.dst);
-    for (size_t i = tid; i < vectors; i += stride) dst[i] = src[i];
-    for (size_t i = vectors * 16 + tid; i < item.size; i += stride) item.dst[i] = item.src[i];
-  } else {
-    for (size_t i = tid; i < item.size; i += stride) item.dst[i] = item.src[i];
-  }
+  CopyRange(item.dst, item.src, item.size, tid, stride);
 }

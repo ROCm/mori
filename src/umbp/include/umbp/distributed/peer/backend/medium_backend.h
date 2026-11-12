@@ -200,6 +200,9 @@ enum class ResolveReader {
   kRemote,
   kLocal,
   kPinnedRemote,
+  // Immutable content identity/size only. No pages, read lease, or storage IO;
+  // unsupported backends may return missing and the caller resolves normally.
+  kMetadata,
 };
 
 // A resolve needs one more state than a cache lookup.  kBusy means this backend
@@ -240,6 +243,12 @@ struct ResolvedEntry {
   // `size` stays the object's.  In-process only; not carried on the wire.
   uint64_t covered_offset = 0;
   uint64_t covered_size = 0;
+  // Fabric staging may pack a range union into its pages. Empty preserves the
+  // contiguous representation above; otherwise coverage is the union itself.
+  std::vector<ObjectExtent> packed_ranges;
+  // Backend-local immutable content identity, never reused during this backend
+  // instance's lifetime. Zero means the backend cannot support content caching.
+  uint64_t content_version = 0;
 };
 
 inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {

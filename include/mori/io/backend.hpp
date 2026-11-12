@@ -132,10 +132,16 @@ struct FabricBackendConfig : public BackendConfig {
 
   int numStreams{64};
   int numEvents{64};
+  // Keep the conservative default; large segments can use more CTAs after
+  // measuring the target fabric and workload. Range is [1, 128].
+  unsigned maxBlocksPerSegment{8};
+  // Reuse descriptors only from completed batch slots with identical addresses/sizes.
+  bool cacheBatchDescriptors{false};
 };
 
 inline std::ostream& operator<<(std::ostream& os, const FabricBackendConfig& c) {
-  return os << "numStreams[" << c.numStreams << "] numEvents[" << c.numEvents << "]";
+  return os << "numStreams[" << c.numStreams << "] numEvents[" << c.numEvents
+            << "] maxBlocksPerSegment[" << c.maxBlocksPerSegment << "]";
 }
 
 /* ---------------------------------------------------------------------------------------------- */

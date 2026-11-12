@@ -726,13 +726,22 @@ hipError_t FabricBackend::LaunchBatchCopy(const std::vector<FabricCopySegment>& 
     return hipErrorInvalidValue;
   }
   std::shared_ptr<BatchStaging> staging;
+  bool cached = false;
   {
     std::lock_guard<std::mutex> lock(stagingMu_);
     for (auto& candidate : batchStaging_) {
       if (candidate.use_count() == 1 && candidate->device == device &&
           candidate->capacity >= segments.size()) {
-        staging = candidate;
-        break;
+        if (config.cacheBatchDescriptors && candidate->uploadedCount == segments.size() &&
+            std::equal(segments.begin(), segments.end(), candidate->host,
+                       [](const auto& a, const auto& b) {
+                         return a.src == b.src && a.dst == b.dst && a.size == b.size;
+                       })) {
+          staging = candidate;
+          cached = true;
+          break;
+        }
+        if (!staging) staging = candidate;
       }
     }
     if (!staging) {
@@ -750,15 +759,32 @@ hipError_t FabricBackend::LaunchBatchCopy(const std::vector<FabricCopySegment>& 
   }
   // Returned before any enqueue so the caller can retain even failed uploads.
   *lifetime = staging;
-  std::memcpy(staging->host, segments.data(), segments.size() * sizeof(FabricCopySegment));
-  hipError_t err =
-      hipMemcpyAsync(staging->devicePtr, staging->host, segments.size() * sizeof(FabricCopySegment),
-                     hipMemcpyHostToDevice, stream);
-  if (err != hipSuccess) return err;
+  // A cached slot has no in-flight users. Its last upload and kernel have
+  // drained before completion released the lifetime. Reusing pointer values
+  // is safe even after remapping: these are descriptors, never cached payload
+  // or authorization; current registrations are checked by the caller.
+  if (!cached) {
+    {
+      // Publish host descriptor bytes under the same mutex used for matching.
+      // shared_ptr::use_count alone is not a CPU memory-ordering fence.
+      std::lock_guard<std::mutex> lock(stagingMu_);
+      staging->uploadedCount = 0;
+      std::memcpy(staging->host, segments.data(), segments.size() * sizeof(FabricCopySegment));
+    }
+    hipError_t err =
+        hipMemcpyAsync(staging->devicePtr, staging->host,
+                       segments.size() * sizeof(FabricCopySegment), hipMemcpyHostToDevice, stream);
+    if (err != hipSuccess) return err;
+    {
+      std::lock_guard<std::mutex> lock(stagingMu_);
+      staging->uploadedCount = segments.size();
+    }
+  }
   size_t maxBytes = 0;
   for (const auto& segment : segments) maxBytes = std::max(maxBytes, segment.size);
-  unsigned blocksPerSegment =
-      static_cast<unsigned>(std::clamp<size_t>(((maxBytes + 15) / 16 + 255) / 256, 1, 8));
+  unsigned blocksPerSegment = static_cast<unsigned>(
+      std::clamp<size_t>(maxBytes / 4096 + (maxBytes % 4096 != 0), 1,
+                         std::clamp<unsigned>(config.maxBlocksPerSegment, 1, 128)));
   if (segments.size() > std::numeric_limits<unsigned>::max() / blocksPerSegment) {
     return hipErrorInvalidValue;
   }

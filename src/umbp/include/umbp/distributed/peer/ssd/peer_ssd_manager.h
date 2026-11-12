@@ -52,6 +52,7 @@ enum class SsdReadStatus { kOk, kNotFound, kSizeTooLarge, kError };
 struct SsdReadOutcome {
   SsdReadStatus status = SsdReadStatus::kError;
   size_t size = 0;
+  uint64_t content_version = 0;
 };
 
 // Peer-side owner of the local SSD tier: one SSD TierBackend + the
@@ -90,6 +91,8 @@ class PeerSsdManager {
   uint64_t SizeOf(const std::string& key) const;
   // SizeOf for a batch under one lock; 0 = not owned.
   std::vector<uint64_t> SizesOf(const std::vector<std::string>& keys) const;
+  // Atomic size/version snapshot without reading or pinning disk data.
+  std::vector<SsdReadOutcome> Describe(const std::vector<std::string>& keys) const;
 
   // Hold a key against eviction across a peer-local migration.  Uses the same
   // refcount as active reads so eviction has one protection rule.
@@ -244,6 +247,7 @@ class PeerSsdManager {
   struct OwnedEntry {
     uint64_t size = 0;
     std::list<std::string>::iterator lru_it;  // position of this key in lru_
+    uint64_t content_version = 0;
   };
 
   // Splice |key| to the MRU (front) of the recency list.  Caller holds mutex_
@@ -264,6 +268,7 @@ class PeerSsdManager {
 
   // key -> {size, lru position}.  The authoritative owned-location map.
   std::unordered_map<std::string, OwnedEntry> owned_;
+  uint64_t next_content_version_ = 1;
   std::list<std::string> lru_;  // front = most-recently-used, back = LRU
   std::vector<KvEvent> pending_events_;
   // Guarded by mutex_ alongside pending_events_.  See SetEventPublishing.

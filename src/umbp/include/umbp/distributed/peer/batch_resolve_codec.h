@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/range_map.h"
 #include "umbp/distributed/tier_proto.h"
 #include "umbp/distributed/types.h"
 #include "umbp_peer.pb.h"
@@ -52,6 +53,7 @@ struct ResolvedKeyEntry {
   uint32_t backend_id = 0;
   uint64_t covered_offset = 0;
   uint64_t covered_size = 0;
+  std::vector<ObjectExtent> packed_ranges;
 };
 
 // One key decoded out of the SoA response (page_size and descs are batch-level
@@ -65,6 +67,7 @@ struct DecodedResolveKey {
   uint32_t backend_id = 0;
   uint64_t covered_offset = 0;
   uint64_t covered_size = 0;
+  std::vector<ObjectExtent> packed_ranges;
 };
 
 // Whole-batch decode result.
@@ -125,6 +128,8 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
   for (const auto& k : keys) total_pages += k.pages.size();
   bool windows = false;
   for (const auto& k : keys) windows |= k.covered_size != 0;
+  bool packed = false;
+  for (const auto& k : keys) packed |= !k.packed_ranges.empty();
   resp->mutable_found()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_tier()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_size()->Reserve(static_cast<int>(keys.size()));
@@ -145,6 +150,14 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
     if (windows) {
       resp->add_covered_offset(k.covered_offset);
       resp->add_covered_size(k.covered_size);
+    }
+    if (packed) {
+      auto* ranges = resp->add_packed_ranges();
+      for (const auto& range : k.packed_ranges) {
+        auto* span = ranges->add_spans();
+        span->set_offset(range.offset);
+        span->set_length(range.length);
+      }
     }
     for (const auto& p : k.pages) {
       resp->add_buffer_index(p.buffer_index);
@@ -188,11 +201,23 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
   }
   if (resp.resolve_status_size() != 0 && resp.resolve_status_size() != n) return out;
   const bool windows = resp.covered_size_size() != 0 || resp.covered_offset_size() != 0;
+  const bool packed = resp.packed_ranges_size() != 0;
+  if (packed && resp.packed_ranges_size() != n) return out;
   if (windows && (resp.covered_size_size() != n || resp.covered_offset_size() != n)) return out;
   for (int i = 0; windows && i < n; ++i) {
     const auto offset = resp.covered_offset(i);
     const auto size = resp.covered_size(i);
     if ((size == 0 && offset != 0) || offset > resp.size(i) || size > resp.size(i) - offset)
+      return out;
+  }
+  std::vector<std::vector<ObjectExtent>> packed_ranges(n);
+  for (int i = 0; packed && i < n; ++i) {
+    auto& ranges = packed_ranges[i];
+    for (const auto& span : resp.packed_ranges(i).spans())
+      ranges.push_back({span.offset(), span.length()});
+    std::vector<ObjectExtent> canonical;
+    if (!NormalizeObjectRanges(ranges, resp.size(i), &canonical) || canonical != ranges ||
+        (!ranges.empty() && windows && resp.covered_size(i) != 0))
       return out;
   }
 
@@ -213,6 +238,7 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
     k.tier = TierFromProto(resp.tier(i));
     k.size = resp.size(i);
     k.backend_id = resp.backend_id(i);
+    k.packed_ranges = std::move(packed_ranges[i]);
     if (windows) {
       k.covered_offset = resp.covered_offset(i);
       k.covered_size = resp.covered_size(i);

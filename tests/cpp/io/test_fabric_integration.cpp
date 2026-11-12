@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #include <dlfcn.h>
 #include <hip/hip_runtime_api.h>
 
@@ -378,6 +399,78 @@ void TestGpuAllocationFailures(IOEngine& reader, const MemoryDesc& remote, void*
   Check(injected > 0 && successful > 0, "allocation sweep missed failure or successful submission");
 }
 
+// Exhaust every pair of source/destination offsets modulo 16, including
+// prefixes shorter than a word and sizes on either side of vector/page ends.
+void TestCopyBoundaries(const char* modulePath) {
+  constexpr size_t stride = 8192;
+  constexpr size_t cases = 16 * 16;
+  constexpr size_t bytes = stride * cases;
+  void *source = nullptr, *destination = nullptr, *deviceSegments = nullptr;
+  struct Segment {
+    const char* src;
+    char* dst;
+    size_t size;
+  };
+  Check(hipMalloc(&source, bytes) == hipSuccess, "boundary source allocation");
+  Check(hipMalloc(&destination, bytes) == hipSuccess, "boundary destination allocation");
+  Check(hipMalloc(&deviceSegments, cases * sizeof(Segment)) == hipSuccess, "boundary descriptors");
+  std::vector<unsigned char> input(bytes), actual(bytes), expected(bytes);
+  for (size_t i = 0; i < bytes; ++i) input[i] = (i * 13 + (i >> 8) * 7) % 251;
+  Check(hipMemcpy(source, input.data(), bytes, hipMemcpyHostToDevice) == hipSuccess,
+        "boundary source initialization");
+  hipModule_t module{};
+  hipFunction_t contiguous{}, batch{};
+  Check(hipModuleLoad(&module, modulePath) == hipSuccess, "boundary module");
+  Check(hipModuleGetFunction(&contiguous, module, "fabricCopyKernel") == hipSuccess,
+        "boundary contiguous function");
+  Check(hipModuleGetFunction(&batch, module, "fabricBatchCopyKernel") == hipSuccess,
+        "boundary batch function");
+  for (size_t length : {0u, 1u, 2u, 3u, 7u, 8u, 9u, 15u, 16u, 17u, 31u, 32u, 33u, 255u, 256u, 257u,
+                        4095u, 4096u, 4097u}) {
+    std::fill(expected.begin(), expected.end(), 0xd3);
+    std::vector<Segment> segments;
+    for (size_t si = 0; si < 16; ++si) {
+      for (size_t di = 0; di < 16; ++di) {
+        const size_t base = (si * 16 + di) * stride + 32;
+        segments.push_back({static_cast<char*>(source) + base + si,
+                            static_cast<char*>(destination) + base + di, length});
+        std::memcpy(expected.data() + base + di, input.data() + base + si, length);
+      }
+    }
+    Check(hipMemcpy(deviceSegments, segments.data(), cases * sizeof(Segment),
+                    hipMemcpyHostToDevice) == hipSuccess,
+          "boundary descriptors upload");
+    // The one-segment entry point and both small/large batched grids must obey
+    // the same byte coverage. The entire allocation verifies all guard gaps.
+    for (unsigned blocks : {0u, 1u, 8u, 128u}) {
+      Check(hipMemset(destination, 0xd3, bytes) == hipSuccess, "boundary destination reset");
+      if (blocks == 0) {
+        for (auto segment : segments) {
+          void* args[] = {&segment.dst, &segment.src, &segment.size};
+          Check(hipModuleLaunchKernel(contiguous, 8, 1, 1, 256, 1, 1, 0, nullptr, args, nullptr) ==
+                    hipSuccess,
+                "boundary contiguous launch");
+        }
+      } else {
+        size_t count = cases;
+        void* args[] = {&deviceSegments, &count, &blocks};
+        Check(hipModuleLaunchKernel(batch, cases * blocks, 1, 1, 256, 1, 1, 0, nullptr, args,
+                                    nullptr) == hipSuccess,
+              "boundary batch launch");
+      }
+      Check(hipDeviceSynchronize() == hipSuccess, "boundary copy drain");
+      Check(hipMemcpy(actual.data(), destination, bytes, hipMemcpyDeviceToHost) == hipSuccess,
+            "boundary result download");
+      Check(actual == expected, "boundary payload or guard mismatch");
+    }
+  }
+  Check(hipModuleUnload(module) == hipSuccess, "boundary module unload");
+  Check(hipFree(deviceSegments) == hipSuccess, "boundary descriptors free");
+  Check(hipFree(destination) == hipSuccess, "boundary destination free");
+  Check(hipFree(source) == hipSuccess, "boundary source free");
+  std::cout << "PASS copy boundaries: 19 sizes x 256 alignments x 4 launch modes\n";
+}
+
 void TestGpuFabric(const char* module) {
   unsetenv("MORI_IO_SIM_ENABLE");
   int devices = 0;
@@ -388,6 +481,7 @@ void TestGpuFabric(const char* module) {
   IOEngine owner("gpu-fabric-owner", {"127.0.0.1", 0});
   IOEngine reader("gpu-fabric-reader", {"127.0.0.1", 0});
   FabricBackendConfig config;
+  config.cacheBatchDescriptors = true;
   owner.CreateBackend(BackendType::FABRIC, config);
   reader.CreateBackend(BackendType::FABRIC, config);
   owner.LoadFabricCopyModule(module);
@@ -396,6 +490,7 @@ void TestGpuFabric(const char* module) {
     std::cout << "SKIP GPU: device 0 fabric or module unavailable\n";
     return;
   }
+  TestCopyBoundaries(module);
   constexpr size_t bytes = 65536;
   void* source = FabricMalloc(bytes, 0);
   Check(source != nullptr, "fabric VMM allocation failed on ready device");
@@ -419,6 +514,29 @@ void TestGpuFabric(const char* module) {
   TransferStatusPtrVec pointers{&status};
   TransferUniqueIdVec ids{reader.AllocateTransferUniqueId()};
   SizeVec srcOffsets{17, 4096, 8192}, dstOffsets{33, 16384, 32768}, lengths{81, 2048, 4096};
+  // Repeated descriptors must reuse only completed slots; changes in count or
+  // offsets must upload a new layout. Verify guards as well as payload.
+  for (int round = 0; round < 6; ++round) {
+    const bool changed = round >= 2 && round < 4;
+    SizeVec from = changed ? SizeVec{19, 4098} : srcOffsets;
+    SizeVec to = changed ? SizeVec{35, 16386} : dstOffsets;
+    SizeVec count = changed ? SizeVec{83, 2050} : lengths;
+    Check(hipMemset(destination, 0x5a, bytes) == hipSuccess, "layout guard initialization");
+    TransferStatus repeat;
+    TransferStatusPtrVec repeatPointers{&repeat};
+    TransferUniqueIdVec repeatIds{reader.AllocateTransferUniqueId()};
+    reader.BatchRead({local}, {to}, {remote}, {from}, {count}, repeatPointers, repeatIds);
+    repeat.Wait();
+    Check(repeat.Succeeded(), "repeated descriptor copy failed");
+    Check(hipMemcpy(actual.data(), destination, bytes, hipMemcpyDeviceToHost) == hipSuccess,
+          "layout download");
+    for (size_t at = 0; at < bytes; ++at) {
+      char expected = 0x5a;
+      for (size_t i = 0; i < count.size(); ++i)
+        if (at >= to[i] && at - to[i] < count[i]) expected = pattern[from[i] + at - to[i]];
+      Check(actual[at] == expected, "stale cached descriptor or guard overwrite");
+    }
+  }
   reader.BatchRead({local}, {dstOffsets}, {remote}, {srcOffsets}, {lengths}, pointers, ids);
   hipStream_t stream = nullptr;
   Check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) == hipSuccess, "stream creation");
@@ -473,6 +591,8 @@ void TestGpuFabric(const char* module) {
 
 int main(int argc, char** argv) {
   try {
+    Check(argc == 1 || (argc == 3 && std::string(argv[1]) == "--gpu-module"),
+          "usage: test_fabric_integration [--gpu-module PATH]");
     TestCompletionGuard();
     TestWireIdentity();
     if (argc == 3 && std::string(argv[1]) == "--gpu-module")

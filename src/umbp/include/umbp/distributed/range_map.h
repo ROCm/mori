@@ -24,12 +24,79 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <utility>
 #include <vector>
 
 #include "umbp/common/range_utils.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
+
+// Canonicalize a sparse request before using it as coverage or a cache key.
+// Reject invalid input without publishing a partial union.
+inline bool NormalizeObjectRanges(const std::vector<ObjectExtent>& input, uint64_t object_size,
+                                  std::vector<ObjectExtent>* output) {
+  auto sorted = input;
+  for (const auto& range : sorted) {
+    if (range.length == 0 || range.offset > object_size ||
+        range.length > object_size - range.offset)
+      return false;
+  }
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto& a, const auto& b) { return a.offset < b.offset; });
+  std::vector<ObjectExtent> merged;
+  for (const auto& range : sorted) {
+    if (!merged.empty() && range.offset - merged.back().offset <= merged.back().length) {
+      merged.back().length =
+          std::max(merged.back().length, range.offset - merged.back().offset + range.length);
+    } else {
+      merged.push_back(range);
+    }
+  }
+  *output = std::move(merged);
+  return true;
+}
+
+// Keep each range's original 16-byte alignment so compacting sparse input does
+// not turn an otherwise vectorized FABRIC copy into a byte-copy fallback.
+inline uint64_t PackedRangePadding(uint64_t cursor, uint64_t object_offset) {
+  return (object_offset % 16 + 16 - cursor % 16) % 16;
+}
+
+inline uint64_t PackedRangeBytes(const std::vector<ObjectExtent>& ranges) {
+  uint64_t bytes = 0;
+  for (const auto& range : ranges) {
+    const uint64_t padding = PackedRangePadding(bytes, range.offset);
+    if (padding > std::numeric_limits<uint64_t>::max() - bytes) return 0;
+    bytes += padding;
+    if (range.length > std::numeric_limits<uint64_t>::max() - bytes) return 0;
+    bytes += range.length;
+  }
+  return bytes;
+}
+
+// Translate only a fully covered range. Reading across a hole must fail even
+// when its endpoints would fit inside the packed allocation.
+inline bool RebaseRangeOntoPackedRanges(const std::vector<ObjectExtent>& ranges,
+                                        size_t* object_offset, size_t size) {
+  uint64_t packed = 0;
+  for (const auto& range : ranges) {
+    const uint64_t padding = PackedRangePadding(packed, range.offset);
+    if (padding > std::numeric_limits<uint64_t>::max() - packed) return false;
+    packed += padding;
+    if (*object_offset >= range.offset && *object_offset - range.offset <= range.length &&
+        size <= range.length - (*object_offset - range.offset)) {
+      const uint64_t into = *object_offset - range.offset;
+      if (packed > std::numeric_limits<size_t>::max() - into) return false;
+      *object_offset = static_cast<size_t>(packed + into);
+      return true;
+    }
+    if (range.length > std::numeric_limits<uint64_t>::max() - packed) return false;
+    packed += range.length;
+  }
+  return false;
+}
 
 // The object-range -> page-range mapping, in one place.
 //

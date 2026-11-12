@@ -1,5 +1,24 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// SPDX-License-Identifier: MIT
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // Real local FABRIC integration for DRAM/SSD owners. Logical peers share one
 // fabric-ready GPU here; the hardware driver covers deployment across trays.
 #include <gtest/gtest.h>
@@ -379,7 +398,8 @@ TEST_P(UalinkTierSharing, MultiPageSubsetColdAndWarmStayInOwnerTier) {
 }
 
 TEST_P(UalinkTierSharing, OutstandingGrantBoundsStagingAndReleaseEnablesRetry) {
-  StartPeers(kObjectPages * kPage);
+  // One compact request occupies ceil((2*kPage + 313)/kPage) == 3 pages.
+  StartPeers(3 * kPage);
   ASSERT_FALSE(::testing::Test::HasFatalFailure());
   ASSERT_EQ(hipMemset(destination_, 0xd3, 2 * kObject), hipSuccess);
   const auto before = observed_->ReadCounters();
@@ -403,6 +423,120 @@ TEST_P(UalinkTierSharing, OutstandingGrantBoundsStagingAndReleaseEnablesRetry) {
   VerifyBytes(0);
   VerifyBytes(1);
   VerifyFabric(before, 2);
+  VerifyOwnership();
+}
+
+TEST_P(UalinkTierSharing, TwoSparseGrantsFitWhereOnlyOneEnvelopeUsedToFit) {
+  StartPeers(kObjectPages * kPage);
+  ASSERT_FALSE(::testing::Test::HasFatalFailure());
+  ASSERT_EQ(hipMemset(destination_, 0xd3, 2 * kObject), hipSuccess);
+  const auto before = observed_->ReadCounters();
+  auto first = Read(0);
+  auto second = Read(1);
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(first->Wait(), (std::vector<bool>{true}));
+  EXPECT_EQ(second->Wait(), (std::vector<bool>{true}));
+  VerifyBytes(0);
+  VerifyBytes(1);
+  VerifyFabric(before, 2);
+  VerifyOwnership();
+}
+
+TEST_P(UalinkTierSharing, RepeatedReadUsesCachedContentWithoutAnotherSsdRead) {
+  StartPeers(4 * kObjectPages * kPage);
+  ASSERT_FALSE(::testing::Test::HasFatalFailure());
+  ASSERT_EQ(hipMemset(destination_, 0xd3, 2 * kObject), hipSuccess);
+  auto first = Read(0);
+  ASSERT_NE(first, nullptr);
+  ASSERT_EQ(first->Wait(), (std::vector<bool>{true}));
+  first.reset();
+  const auto disk_bytes = [&] {
+    uint64_t bytes = 0;
+    for (const auto& sample : owner_->Backends().Get(GetParam())->SampleMetrics())
+      for (const auto& [name, value] : sample.labels)
+        if (name == "event" && value == "device_read") bytes += sample.value;
+    return bytes;
+  };
+  const uint64_t before = disk_bytes();
+  if (GetParam() == TierType::SSD) ASSERT_GT(before, 0);
+  for (int i = 0; i < 3; ++i) {
+    auto hit = Read(0);
+    ASSERT_NE(hit, nullptr);
+    ASSERT_EQ(hit->Wait(), (std::vector<bool>{true}));
+    VerifyBytes(0);
+    EXPECT_EQ(disk_bytes(), before);
+  }
+}
+
+TEST_P(UalinkTierSharing, ClearAndRepublishSameKeyDoesNotReuseOldStagedContent) {
+  StartPeers(4 * kObjectPages * kPage);
+  ASSERT_FALSE(::testing::Test::HasFatalFailure());
+  ASSERT_EQ(hipMemset(destination_, 0xd3, 2 * kObject), hipSuccess);
+  auto first = Read(0);
+  ASSERT_NE(first, nullptr);
+  ASSERT_EQ(first->Wait(), (std::vector<bool>{true}));
+  first.reset();
+  VerifyBytes(0);
+  ASSERT_TRUE(owner_->Clear());
+  for (auto& byte : expected_) byte ^= 0x55;
+  ASSERT_EQ(hipMemcpy(source_, expected_.data(), expected_.size(), hipMemcpyHostToDevice),
+            hipSuccess);
+  ASSERT_EQ(owner_->BatchPut({"tier-key-0", "tier-key-1"},
+                             {source_, static_cast<char*>(source_) + kObject}, {kObject, kObject}),
+            (std::vector<bool>{true, true}));
+  std::vector<std::optional<RouteGetResult>> routes;
+  for (int i = 0; i < 250; ++i) {
+    const auto status = reader_->Master().BatchRouteGet({"tier-key-0", "tier-key-1"}, {}, &routes);
+    if (status.ok() && routes.size() == 2 && routes[0] && routes[1]) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  ASSERT_EQ(routes.size(), 2u);
+  ASSERT_TRUE(routes[0] && routes[1]);
+  // Existing protocol rejects a cached pre-Clear peer generation once and
+  // invalidates that connection. It must never serve the old cached bytes.
+  auto stale = Read(0);
+  ASSERT_NE(stale, nullptr);
+  EXPECT_EQ(stale->Wait(), (std::vector<bool>{false}));
+  for (size_t key = 0; key < 2; ++key) {
+    auto current = Read(key);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(current->Wait(), (std::vector<bool>{true}));
+    VerifyBytes(key);
+  }
+  VerifyOwnership();
+}
+
+TEST_P(UalinkTierSharing, EvictAndRepublishChangesContentVersionWithoutChangingPoolGeneration) {
+  StartPeers(4 * kObjectPages * kPage);
+  ASSERT_FALSE(::testing::Test::HasFatalFailure());
+  ASSERT_EQ(hipMemset(destination_, 0xd3, 2 * kObject), hipSuccess);
+  auto first = Read(0);
+  ASSERT_NE(first, nullptr);
+  ASSERT_EQ(first->Wait(), (std::vector<bool>{true}));
+  first.reset();
+  auto* backend = owner_->Backends().Get(GetParam());
+  uint64_t freed = 0;
+  for (int i = 0; i < 250 && !freed; ++i) {
+    const auto result = backend->Evict({"tier-key-0"});
+    ASSERT_EQ(result.size(), 1u);
+    freed = result.front().bytes_freed;
+    if (!freed) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_GT(freed, 0);
+  for (size_t i = 0; i < kObject; ++i) expected_[i] ^= 0x33;
+  ASSERT_EQ(hipMemcpy(source_, expected_.data(), kObject, hipMemcpyHostToDevice), hipSuccess);
+  ASSERT_TRUE(owner_->Put("tier-key-0", source_, kObject));
+  std::vector<std::optional<RouteGetResult>> routes;
+  for (int i = 0; i < 250; ++i) {
+    const auto status = reader_->Master().BatchRouteGet({"tier-key-0"}, {}, &routes);
+    if (status.ok() && routes.size() == 1 && routes[0]) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  auto current = Read(0);
+  ASSERT_NE(current, nullptr);
+  ASSERT_EQ(current->Wait(), (std::vector<bool>{true}));
+  VerifyBytes(0);
   VerifyOwnership();
 }
 

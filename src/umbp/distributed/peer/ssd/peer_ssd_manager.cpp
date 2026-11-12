@@ -142,6 +142,18 @@ bool PeerSsdManager::PinForMigration(const std::string& key) {
   return true;
 }
 
+std::vector<SsdReadOutcome> PeerSsdManager::Describe(const std::vector<std::string>& keys) const {
+  std::vector<SsdReadOutcome> out(keys.size());
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto it = owned_.find(keys[i]);
+    if (it != owned_.end() && evicting_.count(keys[i]) == 0)
+      out[i] = {SsdReadStatus::kOk, static_cast<size_t>(it->second.size),
+                it->second.content_version};
+  }
+  return out;
+}
+
 void PeerSsdManager::UnpinForMigration(const std::string& key) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = inflight_reads_.find(key);
@@ -263,7 +275,7 @@ void PeerSsdManager::RecordWrittenLocked(const std::string& key, uint64_t size) 
     return;
   }
   lru_.push_front(key);
-  owned_.emplace(key, OwnedEntry{size, lru_.begin()});
+  owned_.emplace(key, OwnedEntry{size, lru_.begin(), next_content_version_++});
   if (event_publishing_) {
     pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, size});
   }
@@ -440,6 +452,7 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   // Resolve size and mark the read in flight under the lock, then run the
   // blocking SSD IO outside it (so a concurrent copy Write is not serialized).
   size_t size = 0;
+  uint64_t content_version = 0;
   bool following = false;  // a leader will fill our buffer; else we lead
   std::shared_ptr<ReadEpisode> episode;
   // Our own slot in the leader's fan-out list, kept because the leader swaps
@@ -459,6 +472,7 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
       return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
     }
     size = it->second.size;
+    content_version = it->second.content_version;
     // Reject over-capacity before touching the device (no in-flight mark, no IO).
     if (size > staging_cap) {
       metrics_.read_size_too_large.fetch_add(1, std::memory_order_relaxed);
@@ -546,7 +560,7 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   }
   metrics_.read_ok.fetch_add(1, std::memory_order_relaxed);
   // No read_bytes: only tier moves stage here, and the pool counts their bytes.
-  return SsdReadOutcome{SsdReadStatus::kOk, size};
+  return SsdReadOutcome{SsdReadStatus::kOk, size, content_version};
 }
 
 std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(
@@ -621,6 +635,7 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(
         continue;
       }
       out[i].size = size;
+      out[i].content_version = it->second.content_version;
       auto& slot = inflight_reads_[keys[i]];
       if (!slot) slot = std::make_unique<InflightRead>();
       const int prior = slot->refs++;

@@ -639,14 +639,17 @@ std::vector<bool> SsdBackend::BatchAbort(const std::vector<uint64_t>& slot_ids) 
 
 bool SsdBackend::SharedStage::Finish(ResolveOutcome outcome, StagingSpan staged,
                                      uint64_t object_size, ObjectExtent staged_window,
-                                     const std::shared_ptr<const void>& reader_hold) {
+                                     const std::shared_ptr<const void>& reader_hold,
+                                     uint64_t version) {
   done = true;
   span = staged;
   size = object_size;
   window = staged_window;
+  content_version = version;
   for (ResolvedEntry* joiner : joiners_) {
     joiner->outcome = outcome;
     joiner->hold = reader_hold;
+    joiner->content_version = version;
   }
   joiners_.clear();
   cv_.notify_all();
@@ -681,7 +684,8 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // Every found result is filled here, so its paths cannot drift.  Caller holds mutex_.
   // `window` is the object bytes the span holds when it is not all of them.
   auto publish_span = [&](ResolvedEntry& out, StagingSpan span, uint64_t size,
-                          const std::shared_ptr<const void>& hold, ObjectExtent window) {
+                          const std::shared_ptr<const void>& hold, ObjectExtent window,
+                          uint64_t version = 0) {
     if (local) out.hold = hold;
     out.outcome = ResolveOutcome::kFound;
     out.found = true;
@@ -693,12 +697,13 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
     out.page_size = cfg_.page_size;
     out.covered_offset = window.offset;
     out.covered_size = window.length;
+    out.content_version = version;
     if (include_descs && !buffer_desc_.empty()) {
       out.descs = {BufferMemoryDescBytes{kStagingBufferIndex, buffer_desc_}};
     }
   };
   auto publish = [&](ResolvedEntry& out, const ReadLease& lease) {
-    publish_span(out, lease.span, lease.size, lease.hold, ObjectExtent{});
+    publish_span(out, lease.span, lease.size, lease.hold, ObjectExtent{}, lease.content_version);
   };
 
   // One device read and the input indices it serves; the first is the one that scheduled it.
@@ -716,7 +721,17 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   reads.reserve(keys.size());
   // Before mutex_: one PeerSsdManager lock, not one per key under ours.  A key
   // evicted or rewritten meanwhile fails its read like any racing evict.
-  const std::vector<uint64_t> sizes = ssd_->SizesOf(keys);
+  const auto contents = ssd_->Describe(keys);
+  if (reader == ResolveReader::kMetadata) {
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (contents[i].status != SsdReadStatus::kOk) continue;
+      results[i].found = true;
+      results[i].outcome = ResolveOutcome::kFound;
+      results[i].size = contents[i].size;
+      results[i].content_version = contents[i].content_version;
+    }
+    return results;
+  }
 
   // Phase 1 (ONE lock): serve every key that is already staged, size every
   // unique remaining key, then reserve the spans.  A remote reader retries a
@@ -727,7 +742,14 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
     std::lock_guard<std::mutex> lock(mutex_);
     if (!accepting_requests_.load(std::memory_order_acquire)) return results;
     for (size_t i = 0; i < keys.size(); ++i) {
+      if (contents[i].status != SsdReadStatus::kOk) continue;
       auto it = read_leases_.find(keys[i]);
+      if (it != read_leases_.end() && it->second.content_version != contents[i].content_version) {
+        extent_stages_.push_back(ExtentStage{it->second.span, ObjectExtent{0, it->second.size},
+                                             std::move(it->second.hold)});
+        read_leases_.erase(it);
+        it = read_leases_.end();
+      }
       if (it != read_leases_.end()) {  // a whole-object lease serves any extent too
         if (!local) it->second.expires_at = now + cfg_.read_lease_ttl;
         publish(results[i], it->second);
@@ -758,7 +780,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
         }
       }
 
-      const uint64_t size = sizes[i];
+      const uint64_t size = contents[i].size;
       if (size == 0) continue;
 
       // The extent widened to the 4 KiB record alignment (so O_DIRECT lands in
@@ -786,6 +808,11 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       }
       if (local) {
         auto shared = shared_stages_.find(schedule_key);
+        if (shared != shared_stages_.end() &&
+            shared->second->content_version != contents[i].content_version) {
+          shared_stages_.erase(shared);
+          shared = shared_stages_.end();
+        }
         if (shared != shared_stages_.end()) {
           SharedStage& stage = *shared->second;
           if (!stage.done) {
@@ -794,7 +821,8 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
             continue;
           }
           if (auto hold = stage.hold.lock(); hold != nullptr && stage.size == size) {
-            publish_span(results[i], stage.span, stage.size, hold, stage.window);
+            publish_span(results[i], stage.span, stage.size, hold, stage.window,
+                         stage.content_version);
             continue;
           }
           shared_stages_.erase(shared);
@@ -863,6 +891,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
     if (local) {
       for (Read& read : reads) {
         read.stage = std::make_shared<SharedStage>();
+        read.stage->content_version = contents[read.results.front()].content_version;
         shared_stages_[read.stage_key] = read.stage;
       }
     }
@@ -894,8 +923,10 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   std::unique_lock<std::mutex> lock(mutex_);
   // A stage nobody can join any more leaves the map, unless a newer one replaced it.
   auto finish_stage = [&](const Read& read, ResolveOutcome outcome, StagingSpan span, uint64_t size,
-                          const std::shared_ptr<const void>& hold) {
-    if (read.stage == nullptr || read.stage->Finish(outcome, span, size, read.window, hold)) return;
+                          const std::shared_ptr<const void>& hold, uint64_t version = 0) {
+    if (read.stage == nullptr ||
+        read.stage->Finish(outcome, span, size, read.window, hold, version))
+      return;
     auto it = shared_stages_.find(read.stage_key);
     if (it != shared_stages_.end() && it->second == read.stage) shared_stages_.erase(it);
   };
@@ -915,11 +946,13 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       // which promises the WHOLE object to the next resolve of the key.
       const auto hold = std::make_shared<ExtentHold>(returned_, read.span);
       for (size_t index : read.results) {
-        publish_span(results[index], read.span, outcomes[j].size, hold, read.window);
+        publish_span(results[index], read.span, outcomes[j].size, hold, read.window,
+                     outcomes[j].content_version);
       }
       extent_stages_total_.fetch_add(1, std::memory_order_relaxed);
       extent_stage_bytes_.fetch_add(read.window.length, std::memory_order_relaxed);
-      finish_stage(read, ResolveOutcome::kFound, read.span, outcomes[j].size, hold);
+      finish_stage(read, ResolveOutcome::kFound, read.span, outcomes[j].size, hold,
+                   outcomes[j].content_version);
       continue;
     }
     // A concurrent Resolve of the same key may have staged it while this read
@@ -927,22 +960,25 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
     // reader's lease starts expired: only its hold keeps the page.
     const auto lease_deadline = local ? std::chrono::steady_clock::time_point{}
                                       : std::chrono::steady_clock::now() + cfg_.read_lease_ttl;
-    auto [it, inserted] = read_leases_.emplace(
-        keys[read.results.front()],
-        ReadLease{read.span, outcomes[j].size, lease_deadline, std::make_shared<char>()});
+    auto [it, inserted] =
+        read_leases_.emplace(keys[read.results.front()],
+                             ReadLease{read.span, outcomes[j].size, lease_deadline,
+                                       std::make_shared<char>(), outcomes[j].content_version});
     if (!inserted) {
       ReleaseStagingSpanLocked(read.span);
       if (!local) it->second.expires_at = lease_deadline;
     }
     for (size_t index : read.results) publish(results[index], it->second);
-    finish_stage(read, ResolveOutcome::kFound, it->second.span, it->second.size, it->second.hold);
+    finish_stage(read, ResolveOutcome::kFound, it->second.span, it->second.size, it->second.hold,
+                 it->second.content_version);
   }
 
   // Phase 4: wait for the stages joined in Phase 1.  Only after this call's own
   // stages are done, so two calls joining each other cannot deadlock.
   for (auto& [i, stage] : joined) {
     if (stage->Wait(lock, &results[i]) && results[i].outcome == ResolveOutcome::kFound) {
-      publish_span(results[i], stage->span, stage->size, results[i].hold, stage->window);
+      publish_span(results[i], stage->span, stage->size, results[i].hold, stage->window,
+                   stage->content_version);
     }
   }
   return results;

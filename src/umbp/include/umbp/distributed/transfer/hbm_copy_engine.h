@@ -175,8 +175,10 @@ class HbmCopyEngine final : public TransferEngine {
   // The address `device_id` must use to reach `ptr`, or null when no registered
   // region covers it or that device cannot gather from the one that does.
   // Kernels take this, never the host pointer -- see HostTierRegistration.
+ public:
   void* HostRegionDeviceAddress(const void* ptr, size_t size, int device_id) const;
 
+ private:
   mutable std::mutex host_regions_mutex_;
   std::vector<std::unique_ptr<HostTierRegistration>> host_regions_;
 };

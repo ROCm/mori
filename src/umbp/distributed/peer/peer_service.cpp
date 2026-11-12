@@ -23,8 +23,10 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
+#include <msgpack.hpp>
 #include <random>
 #include <set>
 #include <string>
@@ -38,6 +40,7 @@
 #include "umbp/distributed/metrics/metric_sink.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
+#include "umbp/distributed/pool/fabric_read_push.h"
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/tier_proto.h"
 #include "umbp/distributed/types.h"
@@ -129,6 +132,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     response->set_owner_incarnation(owner_incarnation_);
     response->set_pool_generation(pool_ == nullptr ? 0 : pool_->Generation());
     response->set_completion_pins(true);
+    response->set_read_push(pool_ && pool_->SupportsReadPush());
     if (!engine_desc_bytes_.empty()) {
       response->set_engine_desc(std::string(engine_desc_bytes_.begin(), engine_desc_bytes_.end()));
     }
@@ -484,15 +488,67 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     std::vector<ObjectExtent> extents;
     for (const auto& extent : resolve.extents())
       extents.push_back({extent.offset(), extent.length()});
+    if (resolve.ranges_size() != 0 && resolve.ranges_size() != static_cast<int>(keys.size()))
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "ranges must be parallel to keys");
+    std::vector<std::vector<ObjectExtent>> ranges(resolve.ranges_size());
+    for (int i = 0; i < resolve.ranges_size(); ++i)
+      for (const auto& span : resolve.ranges(i).spans())
+        ranges[i].push_back({span.offset(), span.length()});
+    FabricReadPushRequest push;
+    if (request->has_push()) {
+      const auto& wire = request->push();
+      if (request->require_fabric() || wire.reader_id().empty() ||
+          wire.keys_size() != static_cast<int>(keys.size()))
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid push shape");
+      push.signature = request->SerializeAsString();
+      push.reader_id = wire.reader_id();
+      push.engine_desc = wire.engine_desc();
+      push.ranges.resize(keys.size());
+      try {
+        mori::io::EngineDesc engine;
+        msgpack::unpack(wire.engine_desc().data(), wire.engine_desc().size()).get().convert(engine);
+        for (int i = 0; i < wire.keys_size(); ++i) {
+          for (const auto& span : wire.keys(i).ranges()) {
+            FabricReadPushRange range;
+            range.source_offset = span.source_offset();
+            range.size = span.length();
+            range.destination_offset = span.destination_offset();
+            auto& ref = range.destination;
+            msgpack::unpack(span.destination_desc().data(), span.destination_desc().size())
+                .get()
+                .convert(ref.mem);
+            ref.loc = ref.mem.loc;
+            ref.size = ref.mem.size;
+            ref.device = ref.mem.deviceId;
+            if (ref.mem.engineKey != engine.key || ref.loc != mori::io::MemoryLocationType::GPU ||
+                !range.size || range.destination_offset > ref.size ||
+                range.size > ref.size - range.destination_offset ||
+                std::all_of(ref.mem.fabricHandle.begin(), ref.mem.fabricHandle.end(),
+                            [](char c) { return c == 0; }))
+              return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid push destination");
+            push.ranges[i].push_back(std::move(range));
+          }
+        }
+      } catch (...) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid push descriptor");
+      }
+    }
     auto grant = pool_->AcquireReadBatch(
         keys, request->operation_id(), request->expected_pool_generation(), !resolve.omit_descs(),
-        extents.empty() ? nullptr : &extents, request->require_fabric());
+        extents.empty() ? nullptr : &extents, request->require_fabric(),
+        ranges.empty() ? nullptr : &ranges, request->has_push() ? &push : nullptr);
     response->set_pool_generation(grant.generation);
     if (!grant.accepted) {
       return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                           "stale generation, released operation, or pin capacity exhausted");
     }
     response->set_read_pin_token(grant.token);
+    if (request->has_push()) {
+      response->set_push_supported(grant.push_supported);
+      response->set_push_drained(grant.push_drained);
+      response->set_push_submitted_bytes(grant.push_bytes);
+      response->set_push_submitted_plans(grant.push_plans);
+    }
     std::vector<ResolvedKeyEntry> entries(keys.size());
     std::vector<BufferMemoryDescBytes> descs;
     std::set<std::pair<uint32_t, uint32_t>> seen;
@@ -505,9 +561,10 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       entry.backend_id = source.backend_id;
       entry.tier = source.tier;
       entry.size = source.resolved.size;
-      entry.pages = source.resolved.pages;
+      if (!request->has_push()) entry.pages = source.resolved.pages;
       entry.covered_offset = source.resolved.covered_offset;
       entry.covered_size = source.resolved.covered_size;
+      entry.packed_ranges = source.resolved.packed_ranges;
       if (entry.found) bytes += entry.size;
       for (auto desc : source.resolved.descs) {
         desc.backend_id = source.backend_id;

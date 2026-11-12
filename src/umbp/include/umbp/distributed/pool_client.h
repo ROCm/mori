@@ -104,6 +104,9 @@ class PoolClient {
     std::vector<bool> Wait();
     bool WaitOnStream(void* hip_stream);
     bool ResourcesQuarantined() const;
+    // Owner-acknowledged FABRIC submissions (payload bytes, not bus counters).
+    uint64_t OwnerPushBytes() const { return owner_push_bytes_; }
+    uint64_t OwnerPushPlans() const { return owner_push_plans_; }
 
    private:
     friend class PoolClient;
@@ -112,6 +115,7 @@ class PoolClient {
     mutable std::mutex mutex_;
     bool waited_ = false;
     bool quarantined_ = false;
+    uint64_t owner_push_bytes_ = 0, owner_push_plans_ = 0;
     std::vector<bool> results_;
     std::function<void(std::vector<bool>*, bool*)> finish_;
     std::function<bool(void*)> stream_wait_;
@@ -286,6 +290,7 @@ class PoolClient {
     uint32_t backend_id = 0;
     uint64_t covered_offset = 0;
     uint64_t covered_size = 0;
+    std::vector<ObjectExtent> packed_ranges;
   };
 
   // Per-entry outcome inside the Put pipeline; projected to `bool` at
@@ -427,6 +432,7 @@ class PoolClient {
     std::string owner_incarnation;
     uint64_t pool_generation = 0;
     bool completion_pins = false;
+    bool read_push = false;
     // Guards first-contact connection setup (stub creation + engine/buffer-desc
     // hydration via GetPeerInfo) in EnsurePeerServiceConnection.
     std::mutex conn_mutex;
@@ -1171,6 +1177,7 @@ class PoolClient {
     bool quarantined = false;
     bool drained = false;
     ~RemoteGetInFlight();
+    uint64_t push_bytes = 0, push_plans = 0;
   };
 
   // Submit half: GetOrConnectPeer + EnsurePeerServiceConnection +
@@ -1184,6 +1191,13 @@ class PoolClient {
   // submit-all loop over several peers cannot deadlock on the bounce pool and a
   // batch that mixes registered and unregistered buffers is no longer a
   // contract violation — it just works.
+  std::shared_ptr<KvReadHandle> SubmitBatchGetRangesGpuDirectImpl(
+      const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets);
+  bool TryRemoteBatchPush(const std::vector<BatchGetItem>& items, PeerConnection& peer,
+                          const std::shared_ptr<void>& stub, RemoteGetInFlight* inflight,
+                          std::vector<bool>* results);
   std::unique_ptr<RemoteGetInFlight> SubmitRemoteBatchGet(const std::vector<BatchGetItem>& items,
                                                           std::vector<bool>* results);
   std::vector<bool> BatchGetRangesGpuDirect(const std::vector<std::string>& keys,

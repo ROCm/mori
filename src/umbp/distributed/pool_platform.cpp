@@ -168,6 +168,9 @@ class RealPoolPlatform final : public PoolPlatform {
   void AddHostGatherRegion(void* ptr, size_t size) override {
     if (hbm_engine_) hbm_engine_->AddHostGatherRegion(ptr, size);
   }
+  void* HostDeviceAddress(const void* ptr, size_t size, int device) const override {
+    return hbm_engine_ ? hbm_engine_->HostRegionDeviceAddress(ptr, size, device) : nullptr;
+  }
   void ClearHostGatherRegions() override {
     if (hbm_engine_) hbm_engine_->ClearHostGatherRegions();
     hbm_engine_ = nullptr;

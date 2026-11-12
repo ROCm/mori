@@ -58,9 +58,11 @@
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_service.h"
+#include "umbp/distributed/pool/fabric_read_push.h"
 #include "umbp/distributed/pool/fabric_read_staging.h"
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/range_map.h"
+#include "umbp/distributed/transfer/coalesce.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp_peer.grpc.pb.h"
 
@@ -120,6 +122,17 @@ struct RemoteReadPin {
       // A failed allocation/RPC during cleanup must retain the owner's grant,
       // rather than escape a destructor. The owner never expires this pin.
     }
+  }
+};
+
+// The RPC returns only after owner GPU completion. No cross-process HIP event
+// is required for a confirmed synchronous push. Uncertain completion is sticky.
+class CompletedPushHandle final : public TransferHandle {
+ public:
+  bool uncertain = true;
+  bool WaitOnStream(void*) override { return !uncertain; }
+  void Wait(std::vector<TransferFailure>* failures) override {
+    if (uncertain) failures->push_back({{}, 1, "owner push completion uncertain", {}, true});
   }
 };
 
@@ -1277,7 +1290,18 @@ bool PoolClient::Init() {
       Shutdown();
       return false;
     }
+    if (config_.fabric_read_staging_cache) staging->EnableCache(config_.fabric_read_staging_bytes);
     default_pool_->SetFabricReadStaging(std::move(staging), [this] { QuarantineGpuResources(); });
+  }
+
+  if (config_.io_engine.mode == UMBPTransferMode::kFabricStrict &&
+      config_.io_engine.fabric_owner_push && peer_directory_) {
+    default_pool_->SetFabricReadPush(std::make_shared<FabricReadPush>(
+        transfer_engine_.get(), peer_directory_, &registry_, config_.fabric_read_staging_device,
+        [this](const void* ptr, size_t bytes, int device) {
+          return platform_->HostDeviceAddress(ptr, bytes, device);
+        },
+        [this] { QuarantineGpuResources(); }));
   }
 
   // Local watermark eviction, for every medium unless a master's rounds own
@@ -3933,6 +3957,89 @@ bool PoolClient::RouteMissedRanges(const std::vector<std::string>& route_keys,
 }
 
 std::shared_ptr<PoolClient::KvReadHandle> PoolClient::SubmitBatchGetRangesGpuDirect(
+    const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& offsets) {
+  const uint64_t limit = config_.io_engine.fabric_get_chunk_bytes;
+  if (!limit || keys.size() < 2 || config_.io_engine.mode != UMBPTransferMode::kFabricStrict)
+    return SubmitBatchGetRangesGpuDirectImpl(keys, dsts, sizes, offsets);
+  auto output = std::make_shared<KvReadHandle>();
+  output->results_.assign(keys.size(), false);
+  if (!RangeBatchShapeValid(keys.size(), dsts, sizes, offsets)) return output;
+  // Splitting must preserve whole-call overlap rejection, even if an early
+  // group is drained before a later group is admitted.
+  std::vector<std::pair<uintptr_t, uintptr_t>> destinations;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    for (size_t r = 0; r < sizes[i].size(); ++r) {
+      const auto at = reinterpret_cast<uintptr_t>(dsts[i][r]);
+      if (!at || !sizes[i][r] || sizes[i][r] > std::numeric_limits<uintptr_t>::max() - at)
+        return output;
+      destinations.emplace_back(at, at + sizes[i][r]);
+    }
+  }
+  std::sort(destinations.begin(), destinations.end());
+  for (size_t i = 1; i < destinations.size(); ++i)
+    if (destinations[i].first < destinations[i - 1].second) return output;
+  struct Group {
+    size_t begin;
+    std::shared_ptr<KvReadHandle> handle;
+  };
+  auto groups = std::make_shared<std::vector<Group>>();
+  groups->reserve(keys.size());
+  const size_t depth = std::max<size_t>(
+      1, std::min<size_t>(config_.io_engine.fabric_pipeline_depth, config_.kv_max_inflight_reads));
+  size_t retired = 0;
+  for (size_t begin = 0; begin < keys.size();) {
+    if (groups->size() - retired >= depth) {
+      auto& old = (*groups)[retired++];
+      (void)old.handle->Wait();
+      if (old.handle->ResourcesQuarantined()) break;
+    }
+    uint64_t bytes = 0;
+    size_t end = begin;
+    while (end < keys.size()) {
+      uint64_t next = 0;
+      for (size_t length : sizes[end]) {
+        if (length > std::numeric_limits<uint64_t>::max() - next) return output;
+        next += length;
+      }
+      if (end != begin && (next > limit || bytes > limit - next)) break;
+      ++end;
+      if (next >= limit) break;
+      bytes += next;
+    }
+    // Each group retains the existing source pin, destination admission and
+    // event protocol. Preparing the next cold group can overlap the preceding
+    // group's FABRIC pull; callers see readiness only through the aggregate.
+    auto handle = SubmitBatchGetRangesGpuDirectImpl(
+        {keys.begin() + begin, keys.begin() + end}, {dsts.begin() + begin, dsts.begin() + end},
+        {sizes.begin() + begin, sizes.begin() + end},
+        {offsets.begin() + begin, offsets.begin() + end});
+    output->owner_push_bytes_ += handle->OwnerPushBytes();
+    output->owner_push_plans_ += handle->OwnerPushPlans();
+    groups->push_back({begin, std::move(handle)});
+    begin = end;
+  }
+  output->stream_wait_ = [groups](void* stream) {
+    bool ready = true;
+    for (auto& group : *groups) ready = group.handle->WaitOnStream(stream) && ready;
+    return ready;
+  };
+  output->finish_ = [groups](std::vector<bool>* results, bool* quarantined) noexcept {
+    for (auto& group : *groups) {
+      try {
+        const auto values = group.handle->Wait();
+        std::copy(values.begin(), values.end(), results->begin() + group.begin);
+        *quarantined = group.handle->ResourcesQuarantined() || *quarantined;
+      } catch (...) {
+        *quarantined = true;
+      }
+    }
+  };
+  return output;
+}
+
+std::shared_ptr<PoolClient::KvReadHandle> PoolClient::SubmitBatchGetRangesGpuDirectImpl(
     const std::vector<std::string>& input_keys, const std::vector<std::vector<void*>>& input_dsts,
     const std::vector<std::vector<size_t>>& input_sizes,
     const std::vector<std::vector<size_t>>& input_offsets) {
@@ -4230,6 +4337,10 @@ std::shared_ptr<PoolClient::KvReadHandle> PoolClient::SubmitBatchGetRangesGpuDir
     }
   }
   output->results_ = results;
+  for (const auto& remote : state->remote) {
+    output->owner_push_bytes_ += remote->push_bytes;
+    output->owner_push_plans_ += remote->push_plans;
+  }
   output->stream_wait_ = [state](void* stream) {
     if (std::any_of(state->results.begin(), state->results.end(), [](bool ok) { return !ok; }))
       return false;
@@ -5435,6 +5546,115 @@ void PoolClient::NoteRangedInstallFailure(size_t count) {
               static_cast<double>(count));
 }
 
+bool PoolClient::TryRemoteBatchPush(const std::vector<BatchGetItem>& items, PeerConnection& peer,
+                                    const std::shared_ptr<void>& stub_hold,
+                                    RemoteGetInFlight* inflight, std::vector<bool>* results) {
+  if (!config_.io_engine.fabric_owner_push || !peer.read_push || !peer.completion_pins ||
+      config_.io_engine.mode != UMBPTransferMode::kFabricStrict)
+    return false;
+  ::umbp::BatchAcquireReadKeysRequest request;
+  request.set_operation_id(NewOperationId());
+  request.set_expected_owner_incarnation(peer.owner_incarnation);
+  request.set_expected_pool_generation(peer.pool_generation);
+  request.mutable_resolve()->set_omit_descs(true);
+  auto* push = request.mutable_push();
+  push->set_reader_id(config_.master_config.node_id);
+  const auto engine_desc = peer_directory_->PackedLocalEngineDesc();
+  push->set_engine_desc(engine_desc.data(), engine_desc.size());
+  for (const auto& item : items) {
+    if (!item.range_dsts || !item.spans || item.route.tier == TierType::HBM ||
+        item.range_dsts->size() != item.spans->size())
+      return false;
+    request.mutable_resolve()->add_keys(*item.key);
+    uint64_t begin = item.size, end = 0;
+    auto* key = push->add_keys();
+    for (size_t r = 0; r < item.spans->size(); ++r) {
+      const auto& span = (*item.spans)[r];
+      auto [ref, offset] = UserBufferRef((*item.range_dsts)[r], span.size);
+      if (!ref.HasMemoryDesc() || ref.loc != mori::io::MemoryLocationType::GPU ||
+          std::all_of(ref.mem.fabricHandle.begin(), ref.mem.fabricHandle.end(),
+                      [](char c) { return c == 0; }) ||
+          span.object_offset > item.size || span.size > item.size - span.object_offset)
+        return false;
+      auto* range = key->add_ranges();
+      range->set_source_offset(span.object_offset);
+      range->set_length(span.size);
+      range->set_destination_offset(offset);
+      msgpack::sbuffer packed;
+      msgpack::pack(packed, ref.mem);
+      range->set_destination_desc(packed.data(), packed.size());
+      begin = std::min<uint64_t>(begin, span.object_offset);
+      end = std::max<uint64_t>(end, span.object_offset + span.size);
+    }
+    auto* extent = request.mutable_resolve()->add_extents();
+    extent->set_offset(begin);
+    extent->set_length(end - begin);
+  }
+  // Prepare every retention wrapper before authorizing the first remote write.
+  auto completed = std::make_unique<CompletedPushHandle>();
+  auto* completion = completed.get();
+  auto pin = std::make_shared<RemoteReadPin>();
+  pin->stub = stub_hold;
+  pin->incarnation = peer.owner_incarnation;
+  inflight->entries.reserve(items.size());
+  for (const auto& item : items) {
+    RemoteGetEntry entry;
+    entry.item = &item;
+    entry.result_index = item.index;
+    entry.failed = true;
+    inflight->entries.push_back(std::move(entry));
+  }
+  inflight->handle = std::move(completed);
+  inflight->quarantined = true;
+  bool confirmed = false;
+  ScopeExit protect_destination{[&] {
+    if (!confirmed) QuarantineGpuResources();
+  }};
+  const auto deadline = std::chrono::steady_clock::now() + ResolveBusyRetryTimeout();
+  do {
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
+    ::umbp::BatchAcquireReadKeysResponse response;
+    const auto status = static_cast<::umbp::UMBPPeer::Stub*>(stub_hold.get())
+                            ->BatchAcquireReadKeys(&context, request, &response);
+    if (!status.ok()) {
+      if (status.error_code() == grpc::StatusCode::FAILED_PRECONDITION) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    if (response.owner_incarnation() != peer.owner_incarnation ||
+        response.pool_generation() != peer.pool_generation || !response.read_pin_token() ||
+        !response.push_drained())
+      break;
+    confirmed = true;
+    completion->uncertain = false;
+    inflight->quarantined = false;
+    pin->token = response.read_pin_token();
+    *inflight->read_pin_hold = pin;
+    if (!response.push_supported()) {
+      // The owner explicitly confirms no destination write was posted.
+      inflight->read_pin_hold->reset();
+      inflight->entries.clear();
+      inflight->handle.reset();
+      return false;
+    }
+    const auto decoded = DecodeBatchResolveResponse(response.resolved());
+    if (decoded.keys.size() == items.size()) {
+      for (size_t i = 0; i < items.size(); ++i) {
+        inflight->entries[i].failed =
+            !decoded.keys[i].found || decoded.keys[i].size != items[i].size;
+      }
+    }
+    inflight->push_bytes = response.push_submitted_bytes();
+    inflight->push_plans = response.push_submitted_plans();
+    CountMetric("umbp_client_owner_push_submitted_bytes_total",
+                "Owner acknowledged FABRIC push payload bytes", {}, inflight->push_bytes);
+    return true;
+  } while (std::chrono::steady_clock::now() < deadline);
+  for (const auto& item : items) (*results)[item.index] = false;
+  return true;
+}
+
 std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
     const std::vector<BatchGetItem>& items, std::vector<bool>* results) {
   if (items.empty()) return nullptr;
@@ -5479,6 +5699,8 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
     fail_all();
     return nullptr;
   }
+
+  if (TryRemoteBatchPush(items, peer, stub_hold, inflight.get(), results)) return inflight;
 
   // resolve RPC + per-key validation; failed keys already written to *results.
   if (!PrepareRemoteGetEntries(items, peer, stub_hold, &inflight->entries, results,
@@ -5595,9 +5817,17 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
       peer_directory_ != nullptr && peer_directory_->HasRemoteBuffers(peer.node_id);
 
   ::umbp::BatchResolveKeysRequest resolve_req;
+  // Native HBM needs no compact staging. Avoid serializing and canonicalizing
+  // every span on that control path. A stale HBM route remains safe: if the
+  // owner now resolves CPU storage, it stages the enclosing extent instead.
+  const bool compact_staging = config_.io_engine.mode == UMBPTransferMode::kFabricStrict &&
+                               std::any_of(items.begin(), items.end(), [](const auto& item) {
+                                 return item.range_dsts && item.route.tier != TierType::HBM;
+                               });
   for (const auto& item : items) {
     resolve_req.add_keys(*item.key);
     auto* extent = resolve_req.add_extents();
+    auto* ranges = compact_staging ? resolve_req.add_ranges() : nullptr;
     if (item.Ranged() && !item.spans->empty()) {
       uint64_t begin = item.size, end = 0;
       for (const auto& span : *item.spans) {
@@ -5605,6 +5835,11 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
           return false;
         begin = std::min<uint64_t>(begin, span.object_offset);
         end = std::max<uint64_t>(end, span.object_offset + span.size);
+        if (ranges != nullptr && item.range_dsts != nullptr) {
+          auto* requested = ranges->add_spans();
+          requested->set_offset(span.object_offset);
+          requested->set_length(span.size);
+        }
       }
       extent->set_offset(begin);
       extent->set_length(end - begin);
@@ -5736,8 +5971,11 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
       (*results)[item.index] = false;
       continue;
     }
-    const uint64_t covered_bytes = key.covered_size ? key.covered_size : key.size;
+    const uint64_t covered_bytes = !key.packed_ranges.empty()
+                                       ? PackedRangeBytes(key.packed_ranges)
+                                       : (key.covered_size ? key.covered_size : key.size);
     if (!SizeMatchesAllocation(covered_bytes, key.pages.size(), decoded.page_size) ||
+        (!item.Ranged() && !key.packed_ranges.empty()) ||
         (!item.Ranged() && key.covered_size &&
          (key.covered_offset != 0 || key.covered_size != key.size))) {
       MORI_UMBP_ERROR("[PoolClient] BatchGet: malformed slot for key='{}'", *item.key);
@@ -5755,6 +5993,7 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     entry.plan.pages = std::move(decoded.keys[i].pages);
     entry.plan.covered_offset = key.covered_offset;
     entry.plan.covered_size = key.covered_size;
+    entry.plan.packed_ranges = std::move(decoded.keys[i].packed_ranges);
     // Descriptors were hydrated batch-level above; the per-entry plan carries
     // none (BuildRemoteGetTransfers' EnsureBufferDescsCached call is a no-op on
     // an empty list and the read path resolves descriptors by buffer_index).
@@ -5852,6 +6091,12 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
           }
         }
         size_t source_offset = span.object_offset;
+        if (!entry.plan.packed_ranges.empty() &&
+            !RebaseRangeOntoPackedRanges(entry.plan.packed_ranges, &source_offset, span.size)) {
+          entry.failed = true;
+          entry_items.clear();
+          break;
+        }
         if (entry.plan.covered_size &&
             !RebaseRangeOntoWindow(entry.plan.covered_offset, entry.plan.covered_size,
                                    &source_offset, span.size)) {
@@ -5860,12 +6105,19 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
           break;
         }
         const uint64_t covered_bytes =
-            entry.plan.covered_size ? entry.plan.covered_size : entry.item->size;
+            !entry.plan.packed_ranges.empty()
+                ? PackedRangeBytes(entry.plan.packed_ranges)
+                : (entry.plan.covered_size ? entry.plan.covered_size : entry.item->size);
         const bool walked = ForEachRangePageFragment(
             entry.plan.pages, entry.plan.page_size, covered_bytes, source_offset, span.size,
             [&](size_t page_index, uint64_t tier_offset, size_t fragment, size_t copied) {
               const TransferRef* buf = peer_buffer(entry.plan.pages[page_index]);
               if (buf == nullptr) return false;
+              if (config_.io_engine.mode == UMBPTransferMode::kFabricStrict &&
+                  entry.item->range_dsts != nullptr && !entry_items.empty() &&
+                  ExtendRegisteredGpuTransfer(&entry_items.back(), *buf, tier_offset, range_dst,
+                                              range_base + copied, fragment, idx))
+                return true;
               TransferItem item;
               item.tag = idx;
               item.src = *buf;
@@ -6162,6 +6414,7 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
     peer.owner_incarnation = resp.owner_incarnation();
     peer.pool_generation = resp.pool_generation();
     peer.completion_pins = resp.completion_pins();
+    peer.read_push = resp.read_push();
     return true;
   };
 

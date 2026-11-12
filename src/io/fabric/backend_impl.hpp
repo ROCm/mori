@@ -182,6 +182,7 @@ class FabricBackend : public Backend {
     FabricCopySegment* host{nullptr};
     FabricCopySegment* devicePtr{nullptr};
     size_t capacity{0};
+    size_t uploadedCount{0};
     int device{-1};
     ~BatchStaging();
   };

@@ -61,6 +61,7 @@ message GetPeerInfoResponse {
   string owner_incarnation = 12;
   uint64 pool_generation = 13;
   bool completion_pins = 14;
+  bool read_push = 15;
 }
 
 // ============================================================
@@ -215,6 +216,14 @@ message ReadObjectExtent {
   uint64 length = 2;
 }
 
+// Sorted, disjoint object ranges. In a resolve response the page list stores
+// their concatenation, padding each span's start to its object offset modulo
+// 16. Padding is not readable coverage. Empty means the legacy contiguous
+// covered_offset/covered_size representation.
+message ReadObjectRanges {
+  repeated ReadObjectExtent spans = 1;
+}
+
 message BatchResolveKeysRequest {
   repeated string keys = 1;
   // When set, the peer omits the per-buffer descriptors from the response: the
@@ -229,6 +238,9 @@ message BatchResolveKeysRequest {
   // Optional, parallel to keys. New completion-pin peers can stage only this
   // object-relative window. Old peers ignore it and return the whole object.
   repeated ReadObjectExtent extents = 3;
+  // Optional, parallel to keys. Opts into compact Fabric staging. Old owners
+  // ignore this and still serve the enclosing extent correctly.
+  repeated ReadObjectRanges ranges = 4;
 }
 
 enum ResolveStatus {
@@ -280,6 +292,9 @@ message BatchResolveKeysResponse {
   // [covered_offset, covered_offset + covered_size); size remains object size.
   repeated uint64 covered_offset = 11;
   repeated uint64 covered_size = 12;
+  // Only emitted to a reader that requested ranges. When nonempty for a key,
+  // its pages tile the concatenated spans and the legacy coverage is zero.
+  repeated ReadObjectRanges packed_ranges = 13;
 }
 
 // A grant retains ALL completion holds in this batch, including staged bytes.
@@ -294,12 +309,33 @@ message BatchAcquireReadKeysRequest {
   // Resolve a cold source through the owner's bounded GPU FABRIC read arena.
   // Never authorizes RDMA fallback. Existing HBM sources remain direct.
   bool require_fabric = 5;
+  // Optional owner-push, negotiated through GetPeerInfo.read_push.
+  ReadPushRequest push = 6;
+}
+message ReadPushRange {
+  uint64 source_offset = 1;
+  uint64 length = 2;
+  bytes destination_desc = 3;
+  uint64 destination_offset = 4;
+}
+message ReadPushKey { repeated ReadPushRange ranges = 1; }
+message ReadPushRequest {
+  string reader_id = 1;
+  bytes engine_desc = 2;
+  repeated ReadPushKey keys = 3;
 }
 message BatchAcquireReadKeysResponse {
   BatchResolveKeysResponse resolved = 1;
   uint64 read_pin_token = 2;
   string owner_incarnation = 3;
   uint64 pool_generation = 4;
+  // supported=false + drained=true guarantees that no write was submitted.
+  // A missing reply or drained=false requires destination quarantine, never a
+  // TTL/abandon or fallback. Retry the identical operation to recover a reply.
+  bool push_supported = 5;
+  bool push_drained = 6;
+  uint64 push_submitted_bytes = 7;
+  uint64 push_submitted_plans = 8;
 }
 message BatchReleaseReadPinsRequest {
   repeated uint64 read_pin_tokens = 1;

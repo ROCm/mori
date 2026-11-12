@@ -189,7 +189,10 @@ bool MoriIoEngine::Init() {
     enabled_backend_mask_ = 0;
     if (fabric) {
       try {
-        io_engine_->CreateBackend(mori::io::BackendType::FABRIC, mori::io::FabricBackendConfig{});
+        mori::io::FabricBackendConfig config;
+        config.maxBlocksPerSegment = transport_config_.fabric_max_blocks_per_segment;
+        config.cacheBatchDescriptors = transport_config_.fabric_cache_descriptors;
+        io_engine_->CreateBackend(mori::io::BackendType::FABRIC, config);
         enabled_backend_mask_ |= mori::io::BackendBit(mori::io::BackendType::FABRIC);
         if (!transport_config_.fabric_kernel_path.empty()) {
           io_engine_->LoadFabricCopyModule(transport_config_.fabric_kernel_path);

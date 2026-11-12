@@ -60,6 +60,7 @@ class PoolPlatform {
   virtual void FreeHost(HostBufferHandle& buffer) = 0;
   virtual void AddHostGatherRegion(void*, size_t) {}
   virtual void ClearHostGatherRegions() {}
+  virtual void* HostDeviceAddress(const void*, size_t, int) const { return nullptr; }
 };
 
 std::shared_ptr<PoolPlatform> MakePoolPlatform(const UMBPSimConfig& sim);

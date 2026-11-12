@@ -1858,6 +1858,7 @@ class PoolClientGpuDirectTest : public ::testing::Test {
  protected:
   virtual std::shared_ptr<PoolPlatform> CreatePlatform() { return nullptr; }
   virtual size_t MaxInflightReads() const { return 1; }
+  virtual uint64_t ChunkBytes() const { return 0; }
   void SetUp() override {
     const char* module = std::getenv("MORI_FABRIC_TEST_MODULE");
     int count = 0;
@@ -1876,6 +1877,7 @@ class PoolClientGpuDirectTest : public ::testing::Test {
     cfg.kv_put_placement = UMBPKvPutPlacement::kOwnerLocal;
     cfg.kv_ranged_path = UMBPKvRangedPath::kGpuDirect;
     cfg.kv_max_inflight_reads = MaxInflightReads();
+    cfg.io_engine.fabric_get_chunk_bytes = ChunkBytes();
     cfg.eviction_mode = PeerEvictionMode::kMaster;
     client_ = std::make_unique<PoolClient>(cfg, CreatePlatform());
     ASSERT_TRUE(client_->Init());
@@ -1988,6 +1990,48 @@ TEST_F(PoolClientGpuDirectTest, ShutdownOnAnotherThreadDrainsAnUnwaitedHandle) {
   ASSERT_EQ(hipMemcpy(actual.data(), destination_, actual.size(), hipMemcpyDeviceToHost),
             hipSuccess);
   EXPECT_EQ(std::memcmp(actual.data(), expected_.data(), actual.size()), 0);
+}
+
+class PoolClientGpuPipelineTest : public PoolClientGpuDirectTest {
+ protected:
+  size_t MaxInflightReads() const override { return 2; }
+  uint64_t ChunkBytes() const override { return 256; }
+};
+TEST_F(PoolClientGpuPipelineTest, BoundedGroupsPreserveReadinessAndWholeCallOverlapRejection) {
+  auto* dst = static_cast<char*>(destination_);
+  ASSERT_EQ(hipMemset(dst, 0x7f, 32768), hipSuccess);
+  std::vector<std::string> keys(5, "kv-layout");
+  std::vector<std::vector<void*>> destinations;
+  std::vector<std::vector<size_t>> sizes(5, {256}), offsets;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    destinations.push_back({dst + i * 512});
+    offsets.push_back({i * 256 + 1});
+  }
+  auto read = client_->SubmitBatchGetRangesGpuDirect(keys, destinations, sizes, offsets);
+  ASSERT_TRUE(read->WaitOnStream(nullptr));
+  // Shutdown sees and drains every child read even when the aggregate handle
+  // is held by another thread. Its later Wait still reports the same results.
+  std::thread stop([&] { client_->Shutdown(); });
+  stop.join();
+  EXPECT_EQ(read->Wait(), std::vector<bool>(5, true));
+  EXPECT_FALSE(read->ResourcesQuarantined());
+  std::vector<char> actual(32768);
+  ASSERT_EQ(hipMemcpy(actual.data(), dst, actual.size(), hipMemcpyDeviceToHost), hipSuccess);
+  for (size_t i = 0; i < actual.size(); ++i) {
+    const size_t group = i / 512, at = i % 512;
+    const char expected = group < 5 && at < 256 ? expected_[group * 256 + 1 + at] : char(0x7f);
+    ASSERT_EQ(actual[i], expected) << i;
+  }
+}
+TEST_F(PoolClientGpuPipelineTest, RejectsOverlapBetweenDifferentChunksBeforeAnyCopy) {
+  auto* dst = static_cast<char*>(destination_);
+  ASSERT_EQ(hipMemset(dst, 0x7f, 32768), hipSuccess);
+  auto read = client_->SubmitBatchGetRangesGpuDirect(
+      {"kv-layout", "kv-layout"}, {{dst}, {dst + 128}}, {{256}, {256}}, {{0}, {256}});
+  EXPECT_EQ(read->Wait(), (std::vector<bool>{false, false}));
+  std::vector<char> actual(32768);
+  ASSERT_EQ(hipMemcpy(actual.data(), dst, actual.size(), hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_TRUE(std::all_of(actual.begin(), actual.end(), [](char c) { return c == char(0x7f); }));
 }
 
 class PoolClientGpuConcurrentReadTest : public PoolClientGpuDirectTest {
