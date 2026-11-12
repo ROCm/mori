@@ -580,21 +580,27 @@ constexpr size_t EpRegionOutScalesBytes(const EpCfg& c) {
 // Capped by the physical LDS rather than by combine's budget: the two are the
 // same number today, but for a shared physical reason, not because dispatch
 // follows combine.
+//
+// The dispatch body's static __shared__ arrays take LDS beside the dynamic slabs, so
+// the slabs get the ceiling less EpDispatch1250xStaticLdsBytes. A workgroup over the
+// ceiling is accepted by the launch and then never scheduled: the dispatch hangs.
+constexpr int EpDispatch1250xStaticLdsBytes = 4096;
+constexpr int EpDispatch1250xSlabLdsBytes = Ep1250xLdsBytes - EpDispatch1250xStaticLdsBytes;
 constexpr int EpDispatch1250xSlabBytes(const EpCfg& c) {
   const int payload = c.hiddenDim * EpElemSize(c.dtype);
   if (c.dtype == EpDType::Fp4x2) {
     constexpr int kFp4Pack = 4;
     const long long packedTotal = (long long)c.warpPerBlock * kFp4Pack * payload;
-    return packedTotal <= Ep1250xLdsBytes ? kFp4Pack * payload : payload;
+    return packedTotal <= EpDispatch1250xSlabLdsBytes ? kFp4Pack * payload : payload;
   }
   if (c.scaleBytes <= 0) return payload;
   const int wide = c.hiddenDim * EpElemSize(EpDType::Bf16);
   const long long total = (long long)wide * c.warpPerBlock;
-  return (wide > payload && total <= Ep1250xLdsBytes) ? wide : payload;
+  return (wide > payload && total <= EpDispatch1250xSlabLdsBytes) ? wide : payload;
 }
 constexpr int EpDispatch1250xMetaSlabBytes(const EpCfg& c) {
   const int slab = EpDispatch1250xSlabBytes(c);
-  return ((long long)c.warpPerBlock * 2 * slab <= Ep1250xLdsBytes) ? slab : 0;
+  return ((long long)c.warpPerBlock * 2 * slab <= EpDispatch1250xSlabLdsBytes) ? slab : 0;
 }
 constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
   return c.warpPerBlock * (EpDispatch1250xSlabBytes(c) + EpDispatch1250xMetaSlabBytes(c));
