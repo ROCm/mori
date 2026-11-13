@@ -421,6 +421,8 @@ static void OrphanPendingWrsOnOtherEps(const EpPairVec& eps, int failedEpId, con
   for (size_t otherEpId = 0; otherEpId < eps.size(); ++otherEpId) {
     if (static_cast<int>(otherEpId) == failedEpId) continue;
     if (epWrsSinceSignal[otherEpId] <= 0) continue;
+    // The slot held for these WRs' tail (see RdmaBatchReadWrite) goes unused.
+    ReleaseSqDepth(eps[otherEpId], 1);
     MORI_IO_WARN(
         "{} on ep {}: moving pending unsignaled WRs on ep {} "
         "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
@@ -448,6 +450,63 @@ static void OrphanPendingWrsOnOtherEps(const EpPairVec& eps, int failedEpId, con
       eps[otherEpId].degraded->store(true, kSqAdmissionOrder);
     }
     NotifySqStateChanged(eps[otherEpId]);
+  }
+}
+
+// When a batch cannot reserve SQ depth, the WRs this post already put on the wire
+// without a signaled tail would hold their depth forever, since no CQE covers them.
+// End each such run with a signaled zero-length RDMA write in the slot held for its
+// tail; its CQE releases the run and the slot like any signaled tail would. The QPs
+// are healthy here, so nothing is parked or marked degraded unless that write cannot
+// be posted either.
+static void CloseUnsignaledRuns(const EpPairVec& eps,
+                                const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                                std::vector<int>& epWrsSinceSignal,
+                                std::vector<size_t>& epMergedSinceSignal,
+                                const std::shared_ptr<CqCallbackMeta>& callbackMeta) {
+  for (size_t epId = 0; epId < eps.size(); ++epId) {
+    const int pending = epWrsSinceSignal[epId];
+    if (pending <= 0 || !eps[epId].sqDepth) continue;
+    const int merged = static_cast<int>(epMergedSinceSignal[epId]);
+    epWrsSinceSignal[epId] = 0;
+    epMergedSinceSignal[epId] = 0;
+
+    SubmissionLedger::PostGuard guard;
+    if (eps[epId].ledger)
+      guard = eps[epId].ledger->InsertForPost(pending + 1, callbackMeta, merged);
+    if (!guard) {
+      // A fatal async event retired the endpoint: no CQE will come for these WRs.
+      ReleaseSqDepth(eps[epId], pending + 1);
+      continue;
+    }
+
+    struct ibv_send_wr wr{};
+    wr.wr_id = guard.RecordId();
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = remoteMrPerEp[epId].addr;
+    wr.wr.rdma.rkey = remoteMrPerEp[epId].rkey;
+    struct ibv_send_wr* badWr = nullptr;
+    int ret = Verbs().PostSend(eps[epId].local.ibvHandle.qp, &wr, &badWr);
+    if (ret == 0) {
+      guard.MarkPosted();
+      guard.Commit();
+      MORI_IO_DEBUG("ep {}: ended {} unsignaled WRs with a signaled zero-length write", epId,
+                    pending);
+      continue;
+    }
+
+    guard.Commit();
+    ReleaseSqDepth(eps[epId], 1);
+    MORI_IO_WARN(
+        "ep {}: ibv_post_send of the zero-length write ending {} unsignaled WRs failed with {}: "
+        "{}; moving them to orphaned and marking the EP degraded",
+        epId, pending, ret, strerror(ret));
+    if (!eps[epId].ledger->InsertOrphaned(pending, callbackMeta, merged)) {
+      ReleaseSqDepth(eps[epId], pending);
+    }
+    if (eps[epId].degraded) eps[epId].degraded->store(true, kSqAdmissionOrder);
+    NotifySqStateChanged(eps[epId]);
   }
 }
 
@@ -955,11 +1014,26 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     int epId = (i + epStartOffset) % static_cast<int>(epNum);
     int batchWrNum = end - st;
 
+    // While WRs this post put on an EP have no signaled tail yet, it holds one more SQ
+    // slot there, for the zero-length write that ends them if a later batch cannot
+    // reserve depth (CloseUnsignaledRuns).
+    const bool holdsTailSlot = eps[epId].sqDepth && epWrsSinceSignal[epId] > 0;
+    bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
+    // Signal while the next batch still fits beside the unsignaled WRs and their tail
+    // slot; past that point it would wait on WRs whose depth only a later batch frees.
+    bool sqNearFull =
+        eps[epId].sqDepth &&
+        int64_t{epWrsSinceSignal[epId]} + batchWrNum + 1 + postBatchSize > eps[epId].maxSqDepth;
+    bool needSignal = isLastBatchForEp || sqNearFull;
+    const bool takesTailSlot = eps[epId].sqDepth && !needSignal && !holdsTailSlot;
+
     std::string reserveErr;
     SqReserveFailureKind reserveFailure = SqReserveFailureKind::None;
-    if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "batch", &reserveErr, &reserveFailure)) {
+    if (!TryReserveSqDepth(eps[epId], batchWrNum + (takesTailSlot ? 1 : 0), epId, "batch",
+                           &reserveErr, &reserveFailure)) {
       AppendHint(&reserveErr, BuildSqDepthHint(eps[epId], epNum, postBatchSize,
                                                PostSendOpKind::BatchData, reserveFailure));
+      CloseUnsignaledRuns(eps, remoteMrPerEp, epWrsSinceSignal, epMergedSinceSignal, callbackMeta);
       return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
 
@@ -988,10 +1062,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       epBytesSinceSignal[epId] += batchBytes;
     }
 
-    bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
-    bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
-    bool needSignal = isLastBatchForEp || sqNearFull;
-
     struct ibv_send_wr& last = mergedWrs[end - 1].wr;
     uint64_t recordId = 0;
     // Keeps the record in Posting state across ibv_post_send below, so a fatal
@@ -999,7 +1069,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     SubmissionLedger::PostGuard postGuard;
     if (needSignal) {
       if (!eps[epId].ledger) {
-        ReleaseSqDepth(eps[epId], batchWrNum);
+        ReleaseSqDepth(eps[epId], batchWrNum + (holdsTailSlot ? 1 : 0));
         return {StatusCode::ERR_RDMA_OP,
                 "submission ledger is not initialized for signaled WR tracking"};
       }
@@ -1012,7 +1082,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         // unsignaled behind it, and this QP/CQ can no longer produce one. Give
         // back the depth held on this EP and park what the siblings already
         // posted, so the caller sees a failure instead of waiting forever.
-        ReleaseSqDepth(eps[epId], epWrsSinceSignal[epId]);
+        ReleaseSqDepth(eps[epId], epWrsSinceSignal[epId] + (holdsTailSlot ? 1 : 0));
         epWrsSinceSignal[epId] = 0;
         epMergedSinceSignal[epId] = 0;
         OrphanPendingWrsOnOtherEps(eps, epId, "endpoint retired by a fatal async event",
@@ -1099,6 +1169,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         }
         NotifySqStateChanged(eps[epId]);
       }
+      if (holdsTailSlot || takesTailSlot) ReleaseSqDepth(eps[epId], 1);
 
       OrphanPendingWrsOnOtherEps(eps, epId, "ibv_post_send failed", epWrsSinceSignal,
                                  epMergedSinceSignal, callbackMeta);
@@ -1119,6 +1190,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       epWrsSinceSignal[epId] = 0;
       epMergedSinceSignal[epId] = 0;
       if (roctxTransferEnabled) epBytesSinceSignal[epId] = 0;
+      if (holdsTailSlot) ReleaseSqDepth(eps[epId], 1);
     }
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
