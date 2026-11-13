@@ -86,6 +86,7 @@ def pushes(n, how, lim):
 def run(cfg, comm, lim, sizes, args):
     rank, world = cfg.rank, cfg.world_size
     op = EpDispatchCombineOp(cfg, comm)
+    fold = getattr(op, "_card", None) is not None
     checks = {}
 
     def check(name, ok):
@@ -96,7 +97,9 @@ def run(cfg, comm, lim, sizes, args):
         comm.barrier()
 
     def hows(i):
-        return [h for h in HOWS if h != "snapshot" or min(sizes[i]) > lim]
+        return [
+            h for h in HOWS if h != "snapshot" or (min(sizes[i]) > lim and not fold)
+        ]
 
     def pair(i, how, peak=True):
         x, idx, w = args[i]
@@ -146,6 +149,15 @@ def run(cfg, comm, lim, sizes, args):
             if how != "plain":
                 check(f"plain_equals_{how}", torch.equal(got["plain"], got[how]))
             refs.append(got[how])
+
+    if fold:
+        i = next(i for i, ns in enumerate(sizes) if min(ns) > lim)
+        try:
+            pair(i, "snapshot")
+            refused = False
+        except ValueError:
+            refused = True
+        check("snapshot_refused", refused)
 
     got = [pair(i, how) for i in range(len(sizes)) for how in hows(i)]
     sync()
