@@ -1259,6 +1259,27 @@ def run_segmented(d, comm, layout, fp8):
         dist.barrier()
         failures += _seg_check_combine(d, cout, gathered, epr, tag)
         failures += _seg_flags(d, op, tag)
+
+        # reset() zeroes the device counters, so the flags' baseline must restart
+        # with them: a mismatch right after a reset is flagged, not hidden until
+        # the counters climb past the old baseline.
+        op.reset()
+        torch.cuda.synchronize()
+        dist.barrier()
+        tag = f"seg level={level} mismatch after reset"
+        if op.segment_error_counts() != (0, 0):
+            print(
+                f"[rank {rank}] {tag}: counters {op.segment_error_counts()} after reset",
+                flush=True,
+            )
+            failures += 1
+        *_, routing = op.dispatch(
+            x, weights, scales, idx, return_routing=True, segment_stride=wrong
+        )
+        op.combine(op.combine_in_view(), routing=routing)
+        torch.cuda.synchronize()
+        dist.barrier()
+        failures += _seg_flags(d, op, tag, want=2)
     return failures
 
 

@@ -1632,8 +1632,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             raise ValueError(
                 "segment_stride needs an op built with async_ll_recv_layout='segmented'"
             )
-        # Only the receive cap is checked here. It is the same on every rank, so
-        # a stride past it fails on every rank before any of them launches. The
+        # Only the receive cap is checked here. It is the same on every rank, so a
+        # stride past it fails on every rank before any of them launches -- as long
+        # as S itself is the same on every rank, which the contract requires: compute
+        # it from values every rank shares (e.g. the max token count after the DP
+        # all-gather). A rank that alone passes a stride past the cap raises here
+        # while the others enter the round and wait for it. The
         # field blocks are sized by max_num_inp_token_per_rank rows per source and
         # the reverse map and the expert output by effective_max_recv_per_rank,
         # which is at most that, so the cap is the binding bound.
@@ -1675,13 +1679,19 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def segment_error_counts(self):
         """(overflow, mismatch): cumulative counts of each segmented-layout error on
-        this rank since the op was built, counted per peer and round.
+        this rank since the op was built or last reset(), counted per peer and
+        round.
 
         overflow: a segmented round where this rank had more rows for a peer than
         the stride, i.e. it was called with segment_stride below its own token
-        count. The rows past the stride were dropped. mismatch: a peer's round,
-        segmented or compact, did not use this rank's mode and stride, so rows were
-        read at the wrong offsets.
+        count. The rows past the stride were dropped. Only the rank that dropped
+        rows counts it; its peers see a short segment and count nothing. mismatch: a
+        peer's round, segmented or compact, did not use this rank's mode and stride,
+        so rows were read at the wrong offsets. Every rank counts that.
+
+        So the counts, and segment_error_flags(), differ between ranks: reduce them
+        across ranks (e.g. an all-reduce max) before acting on them, such as
+        falling back to compact, or the ranks diverge in the next round.
 
         Use this for totals (e.g. a periodic health check that diffs two reads);
         segment_error_flags() answers "anything new since I last looked". Reads
@@ -1980,6 +1990,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._recv.zero_()
         if self._ll_recv is not None:
             self._ll_recv.zero_()
+        # The arena zero above also cleared the segment error counters, so the
+        # segment_error_flags() baseline restarts with them.
+        self._seg_error_base = (0, 0)
 
     def _close_backend(self):
         for plan in getattr(self, "_plans", ()):

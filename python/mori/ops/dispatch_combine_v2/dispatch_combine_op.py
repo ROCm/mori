@@ -250,10 +250,19 @@ class EpDispatchCombineConfig:
     #     rows (per-tensor scale, global absmax). segment_counts() has the n_s.
     #   * write the expert output into combine_in_view(); any other tensor is
     #     copied there first.
-    #   * S must be the same on every rank, at least every rank's token count and
-    #     at most effective_max_recv_per_rank (refused past it); so must the
-    #     choice of segmented or compact. Violations do not hang; they are
-    #     counted (segment_error_counts()).
+    #   * S must be the same on every rank, so compute it from values every rank
+    #     shares (e.g. the max token count after the DP all-gather); so must the
+    #     choice of segmented or compact. S is at least every rank's token count
+    #     and at most effective_max_recv_per_rank.
+    #       - S past that cap is refused on the host before launch. On every rank
+    #         that is fine; a rank that alone passes one leaves the others
+    #         waiting for it.
+    #       - The other violations do not hang; they are counted
+    #         (segment_error_counts()). S below a rank's rows for a peer drops the
+    #         rest and counts an overflow on that rank only; a stride or mode that
+    #         differs between ranks counts a mismatch on every rank.
+    #       - So the error flags differ between ranks: reduce them across ranks
+    #         before acting on them (e.g. falling back to compact).
     #   * the views' row count follows S, so a CUDA graph needs a fixed S.
     #
     # "segmented" is refused on a config that does not support it; "auto" picks
