@@ -464,13 +464,10 @@ void IOEngine::CaptureBackendDesc(BackendType type) {
 void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
   if (remote.protocolVersion != 0 && desc.protocolVersion != 0 &&
       remote.protocolVersion != desc.protocolVersion) {
-    MORI_IO_ERROR(
-        "Rejecting remote engine {} (node_id {}): protocol version mismatch "
-        "(local={}, remote={})",
+    MORI_IO_WARN(
+        "Remote engine {} (node_id {}): protocol version mismatch "
+        "(local={}, remote={}) — proceeding with warning",
         remote.key, remote.nodeId, desc.protocolVersion, remote.protocolVersion);
-    throw std::runtime_error("MoRI-IO handshake failed: protocol version mismatch (local=" +
-                             std::to_string(desc.protocolVersion) +
-                             ", remote=" + std::to_string(remote.protocolVersion) + ")");
   }
 
   if (remote.protocolVersion == 0) {
