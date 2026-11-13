@@ -135,7 +135,7 @@ Components
 Supported Hardware
 ------------------
 
-**GPUs:** MI308X, MI300X, MI325X, MI355X (MI450X under development)
+**GPUs:** MI308X, MI300X, MI325X, MI355X
 
 **NICs:** AMD Pollara (AINIC), Mellanox ConnectX-7, Broadcom Thor2 (Volcano under development)
 
