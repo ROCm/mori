@@ -328,7 +328,9 @@ jobs:
           # Its XGMI hidden-device cases re-launch the binary under a narrower
           # HIP_VISIBLE_DEVICES, so the parent must see every GPU.
           # test_fence pins host-memory engines to one NIC: they are otherwise spread
-          # round-robin, and two NICs of one node need not reach each other.
+          # round-robin, and two NICs of one node need not reach each other. It runs
+          # again with 4 QPs per transfer, so a fence cuts transfers spread over QPs.
+          # test_fence_xnode needs two nodes and is run by hand.
           $CT exec $CONTAINER bash -c "
             set -e
             cd $GITHUB_WORKSPACE
@@ -337,6 +339,7 @@ jobs:
             timeout 300 ./build_io/tests/cpp/test_engine
             timeout 120 ./build_io/tests/cpp/test_transfer_wait
             MORI_IO_RDMA_NIC_IDX=0 timeout 120 ./build_io/tests/cpp/test_fence
+            MORI_IO_RDMA_NIC_IDX=0 MORI_IO_QP_PER_TRANSFER=4 timeout 120 ./build_io/tests/cpp/test_fence
           "
 
       - name: MORI-RAS C++

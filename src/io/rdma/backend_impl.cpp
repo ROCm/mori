@@ -860,12 +860,16 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
   const std::string message = "peer " + remoteKey + " was fenced; its connection was shut down";
   EpPairVec stillUncut;
   CutConnections cut;
-  for (const auto& ep : victims) {
-    // Cut the peer off first. This is the step the caller relies on, so it must not
-    // wait behind the local bookkeeping below.
+  // Cut every QP of the peer first. This is the step the caller relies on, so it must not
+  // wait behind the bookkeeping below. It also comes before any transfer is failed: all
+  // QPs of a transfer lead to this peer, so failing one transfer's work on a cut QP while
+  // a sibling QP was still running would let its caller reuse buffers the NIC still uses.
+  std::vector<bool> isCut(victims.size(), false);
+  for (size_t i = 0; i < victims.size(); ++i) {
+    const EpPair& ep = victims[i];
     application::RdmaDeviceContext* devCtx = GetRdmaDeviceContext(ep.ldevId);
-    const bool isCut = devCtx != nullptr && devCtx->ModifyEndpointToErrorNoThrow(ep.local);
-    if (!isCut) {
+    isCut[i] = devCtx != nullptr && devCtx->ModifyEndpointToErrorNoThrow(ep.local);
+    if (!isCut[i]) {
       ++result.endpointsFailed;
       stillUncut.push_back(ep);
       MORI_IO_ERROR("fence: could not move qpn={} (peer {}) to Error; peer may still write",
@@ -877,6 +881,9 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
       cut.localQpns.push_back(ep.local.handle.qpn);
       cut.peerQpns.push_back(ep.remote.qpn);
     }
+  }
+  for (size_t i = 0; i < victims.size(); ++i) {
+    const EpPair& ep = victims[i];
     // A session built concurrently can still hold this QP; marking it failed gets that
     // session replaced. Nothing else would: refused posts and, without notifications, an
     // empty receive queue produce no completion to report the QP.
@@ -887,8 +894,9 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
     // On a cut QP, fail whatever was in flight so no waiter hangs on a completion the
     // dead QP will never deliver. A QP still running keeps its transfers: their
     // completions end them, and failing them now would let a caller reuse buffers the
-    // NIC is still reading or writing.
-    if (isCut && ep.ledger) {
+    // NIC is still reading or writing. (A transfer that also has work on such a QP stays
+    // in flight only once a status waits for all its QPs, which #907 brings.)
+    if (isCut[i] && ep.ledger) {
       result.transfersFailed +=
           ep.ledger->FailAll(StatusCode::ERR_RDMA_OP, message, ep.sqDepth.get());
     }
@@ -2277,9 +2285,13 @@ FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
 }
 
 bool RdmaBackend::UnfenceRemoteEngine(const EngineKey& remote) {
-  CutConnections cut;
-  if (!rdma || !rdma->UnfenceRemoteEngine(remote, &cut)) return false;
+  if (!rdma) return false;
+  // Take notifications from the peer again before letting it reconnect: a connection it
+  // builds the moment it is let back in must not have its first notification dropped.
+  // Its QPs cut by the fence carry nothing new until then.
   notif->SetPeerFenced(remote, false);
+  CutConnections cut;
+  if (!rdma->UnfenceRemoteEngine(remote, &cut)) return false;
   // Sessions of ours that raced the fence wait to be replaced; they may try again now.
   ForgetQpReplacementBackoff(remote);
   // The peer's QPs died because of the fence, and it paces their replacement as if its path
