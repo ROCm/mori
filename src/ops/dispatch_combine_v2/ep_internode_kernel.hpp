@@ -375,17 +375,211 @@ struct ForwardTokenVec16 {
 /*                                   EpDispatchInterNodeV2                                  */
 /* ---------------------------------------------------------------------------------------------- */
 namespace internode {
+
+// moeSort: as a warp places a token on a same-node PE it also buckets the token's experts on that
+// PE for aiter's moe_sorting. Lane kTopk + j owns expert slot j, so its bucket atomic issues in
+// the same instruction as the row atomic of lane 0 (or of the PE's representative lane).
+//
+// The moe_sort region holds kEpr counters, one per 128 B line so that different experts do not
+// queue on one line at the owner, then kEpr buckets of MaxNumTokensToRecv entries.
+constexpr int kMoeSortCountStride = 128 / sizeof(ep_index_t);
+
+template <EpInterNodeKernelCfg kConfig>
+inline __device__ int MoeSortSlot(int laneId) {
+  static_assert(!kConfig.moeSort || 2 * kConfig.numExpertPerToken <= warpSize,
+                "moeSort needs two lanes per expert slot");
+  return laneId - kConfig.numExpertPerToken;
+}
+
+template <EpInterNodeKernelCfg kConfig>
+inline __device__ int2* MoeSortBuckets(uint8_t* region) {
+  return reinterpret_cast<int2*>(region + kConfig.numExpertPerRank * 128);
+}
+
+// What a lane needs to bucket one expert slot, loaded before the row atomic so that the atomic is
+// the only round trip the bucketing adds. counter == nullptr: nothing to bucket.
+struct MoeSortLane {
+  ep_index_t* counter{nullptr};
+  int2* bucket{nullptr};
+  float weight{0.f};
+  int slot{0};
+};
+
+template <EpInterNodeKernelCfg kConfig>
+inline __device__ MoeSortLane MoeSortPrepare(EpDispatchCombineArgs& args, int pe, ep_index_t expert,
+                                             int slot, const float* weight) {
+  constexpr EpInterNodeDeviceCfg config = EpInterNodeDeviceCfgOf(kConfig);
+  const int local = expert % config.numExpertPerRank;
+  uint8_t* region = args.reg(args.offMoeSort)->template GetAs<uint8_t*>(pe);
+  MoeSortLane lane;
+  lane.counter = reinterpret_cast<ep_index_t*>(region) + local * kMoeSortCountStride;
+  lane.bucket =
+      MoeSortBuckets<kConfig>(region) + static_cast<size_t>(local) * config.MaxNumTokensToRecv();
+  lane.weight = *weight;
+  lane.slot = slot;
+  return lane;
+}
+
+// One bucket entry: (row | topk slot << 24, weight), aiter's sorted id and weight.
+template <EpInterNodeKernelCfg kConfig>
+inline __device__ void MoeSortPut(const MoeSortLane& lane, int pos, int row) {
+  assert(pos < EpInterNodeDeviceCfgOf(kConfig).MaxNumTokensToRecv());
+  lane.bucket[pos] = make_int2(row | (lane.slot << 24), __float_as_int(lane.weight));
+}
+
+// Sorted-row blocks whose expert the finalize looks up in LDS; beyond this it searches.
+constexpr int kMoeSortLdsBlocks = 2048;
+
+// The finalize's LDS: per-expert counts and offsets, and which expert each sorted block holds.
+template <int kEpr>
+struct MoeSortShared {
+  int cnt[kEpr];
+  int off[kEpr + 1];
+  uint16_t blockExpert[kMoeSortLdsBlocks];
+};
+
+// Warp 0 of the last block, once every same-node PE is done: lane e reads and resets expert e's
+// counter, in the same round trip as the caller's read of the row count.
+template <EpInterNodeKernelCfg kConfig>
+inline __device__ int MoeSortLoadCount(EpDispatchCombineArgs& args, int laneId) {
+  constexpr int kEpr = kConfig.numExpertPerRank;
+  static_assert(kEpr <= warpSize, "one lane per local expert");
+  if (laneId >= kEpr) return 0;
+  ep_index_t* ctr =
+      args.reg(args.offMoeSort)->template GetAs<ep_index_t*>() + laneId * kMoeSortCountStride;
+  const int c = __hip_atomic_load(ctr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  __hip_atomic_store(ctr, ep_index_t{0}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  return c;
+}
+
+// Then: pad each expert to sortBlockM and lay them out in expert order, as aiter's moe_sorting does
+// with expert_mask, writing sorted_expert_ids and num_valid_ids. MoeSortGather writes the rows.
+template <EpInterNodeKernelCfg kConfig>
+inline __device__ void MoeSortLayout(EpDispatchCombineArgs& args, int laneId, int c, int recvRows,
+                                     MoeSortShared<kConfig.numExpertPerRank>& sh) {
+  constexpr int kEpr = kConfig.numExpertPerRank;
+  const int bm = args.sortBlockM;
+  // aiter's block_m is a power of two; keep the division for anything else.
+  const int p = (bm & (bm - 1)) == 0 ? (c + bm - 1) & -bm : (c + bm - 1) / bm * bm;
+  int incl = p;
+  for (int d = 1; d < warpSize; d <<= 1) {
+    const int up = __shfl_up(incl, d);
+    if (laneId >= d) incl += up;
+  }
+  const int off = incl - p;
+  if (laneId < kEpr) {
+    sh.cnt[laneId] = c;
+    sh.off[laneId] = off;
+    for (int b = off / bm; b < (off + p) / bm; b++) {
+      args.sortedExpertIds[b] = laneId;
+      if (b < kMoeSortLdsBlocks) sh.blockExpert[b] = static_cast<uint16_t>(laneId);
+    }
+  }
+  if (laneId == kEpr - 1) {
+    sh.off[kEpr] = incl;
+    args.sortNumValid[0] = incl;
+    args.sortNumValid[1] = recvRows;
+    // FC2 accumulates into rows [0, recvRows], the last one from the weight-0 padding rows.
+    if (args.sortZeroRowBytes > 0) args.sortZeroState[0] = recvRows + 1;
+  }
+}
+
+// The whole last block, after MoeSortLayout: copy each expert's bucket to its range and pad it.
+template <EpInterNodeKernelCfg kConfig, typename T>
+inline __device__ void MoeSortGather(EpDispatchCombineArgs& args, int recvRows,
+                                     const MoeSortShared<kConfig.numExpertPerRank>& sh) {
+  DEF_COMMON_VARS;
+  constexpr int kEpr = kConfig.numExpertPerRank;
+  constexpr int kTopk = kConfig.numExpertPerToken;
+  constexpr int kU = 8;  // rows per thread per pass, loaded before any is stored
+  const int bm = args.sortBlockM;
+  const int total = sh.off[kEpr];
+  auto expertOf = [&](int i) {
+    const int b = i / bm;
+    if (b < kMoeSortLdsBlocks) return static_cast<int>(sh.blockExpert[b]);
+    int lo = 0, hi = kEpr - 1;
+    while (lo < hi) {
+      const int mid = (lo + hi + 1) / 2;
+      if (sh.off[mid] <= i)
+        lo = mid;
+      else
+        hi = mid - 1;
+    }
+    return lo;
+  };
+  // Each expert's bucket goes to a contiguous range, so consecutive rows read consecutive entries.
+  const int2 pad = make_int2(recvRows | (kTopk << 24), 0);
+  const int2* buckets =
+      MoeSortBuckets<kConfig>(args.reg(args.offMoeSort)->template GetAs<uint8_t*>());
+  for (int base = thdId; base < total; base += kU * thdNum) {
+    int2 v[kU];
+#pragma unroll
+    for (int u = 0; u < kU; u++) {
+      const int i = base + u * thdNum;
+      v[u] = pad;
+      if (i < total) {
+        const int e = expertOf(i);
+        const int j = i - sh.off[e];
+        if (j < sh.cnt[e]) v[u] = buckets[static_cast<size_t>(e) * config.MaxNumTokensToRecv() + j];
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kU; u++) {
+      const int i = base + u * thdNum;
+      if (i < total) {
+        args.sortedTokenIds[i] = v[u].x;
+        args.sortedWeights[i] = __int_as_float(v[u].y);
+      }
+    }
+  }
+}
+
+// moeSort with zeroing: the intra-node blocks clear the rows of the expert output the last FC2
+// accumulated into (sortZeroState[0], set by MoeSortLayout) while the inter-node leg is still
+// in flight. The buffer is this rank's own; no peer reads it, and the previous combine has
+// already copied it out.
+template <EpInterNodeKernelCfg kConfig, typename T>
+inline __device__ void MoeSortZeroRows(EpDispatchCombineArgs& args) {
+  DEF_COMMON_VARS;
+  const size_t rowBytes = static_cast<size_t>(args.sortZeroRowBytes);
+  const int rowNum = min(args.sortZeroState[0], config.MaxNumTokensToRecv());
+  const size_t vecs = static_cast<size_t>(rowNum) * rowBytes / sizeof(uint4);
+  const int xgmiBlockNum = blockNum - args.rdmaBlockNum;
+  uint4* dst = static_cast<uint4*>(args.sortZeroOut);
+  for (size_t v = static_cast<size_t>(blockId - args.rdmaBlockNum) * thdNum + thdId; v < vecs;
+       v += static_cast<size_t>(xgmiBlockNum) * thdNum)
+    dst[v] = make_uint4(0, 0, 0, 0);
+}
+
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int tokenId, int expId,
-                                              int destPe) {
+                                              int destPe, index_t laneExpert) {
   DEF_COMMON_VARS;
 
   index_t tokenExpertId = tokenId * config.numExpertPerToken + expId;
   index_t destTokId = 0;
   if (!args.replayMode) {
+    // moeSort: lane kTopk + j buckets expert slot j if that expert is on destPe; laneExpert is
+    // expert j in lane j.
+    [[maybe_unused]] MoeSortLane sort;
+    [[maybe_unused]] index_t got = 0;
+    if constexpr (kConfig.moeSort) {
+      const int j = MoeSortSlot<kConfig>(laneId);
+      const index_t e = __shfl(laneExpert, (j >= 0 && j < config.numExpertPerToken) ? j : 0);
+      if (j >= 0 && j < config.numExpertPerToken && e >= 0 && e / config.numExpertPerRank == destPe)
+        sort = MoeSortPrepare<kConfig>(args, destPe, e, j,
+                                       args.weightsBuf + tokenId * config.numExpertPerToken + j);
+      index_t* counter = (laneId == 0)
+                             ? args.reg(args.offDispTokOffset)->template GetAs<index_t*>(destPe)
+                             : sort.counter;
+      if (counter) got = atomicAdd(counter, 1);
+    }
     if (laneId == 0) {
       // decide token id in dest pe
-      destTokId = atomicAdd(args.reg(args.offDispTokOffset)->template GetAs<index_t*>(destPe), 1);
+      if constexpr (kConfig.moeSort)
+        destTokId = got;
+      else
+        destTokId = atomicAdd(args.reg(args.offDispTokOffset)->template GetAs<index_t*>(destPe), 1);
       assert(destTokId < config.MaxNumTokensToRecv() &&
              "Total recv token overflow: increase maxTotalRecvTokens");
       args.dispDestTokIdMap[tokenExpertId] = FlatTokenIndex(config, destPe, destTokId);
@@ -395,6 +589,9 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int t
           static_cast<index_t>(FlatTokenIndex(config, myPe, tokenId)));
     }
     destTokId = __shfl(destTokId, 0);
+    if constexpr (kConfig.moeSort) {
+      if (sort.counter) MoeSortPut<kConfig>(sort, got, destTokId);
+    }
   } else {
     // Replay routing: reuse the slot recorded by a prior cache-routing dispatch.
     index_t flat = args.dispDestTokIdMap[tokenExpertId];
@@ -466,8 +663,9 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs& args) {
     int destNode = destPe / config.gpuPerNode;
 
     int lanePe = -1;
+    index_t laneExpert = -1;
     if (laneId < numExpertPerToken) {
-      index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + laneId];
+      laneExpert = args.tokenIndices[tokenId * numExpertPerToken + laneId];
       // Sentinel lanes get a unique impossible destPe so dedup cannot false-match.
       lanePe = (laneExpert < 0) ? (-1 - static_cast<int>(laneId))
                                 : (laneExpert / config.numExpertPerRank);
@@ -481,7 +679,7 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs& args) {
           args.dispDestTokIdMap[expertOffset] = NullFlatTokenIndex(config);
         continue;
       }
-      DispatchIntraNodeBlock<kConfig, T>(args, tokenId, inTokenExpertId, destPe);
+      DispatchIntraNodeBlock<kConfig, T>(args, tokenId, inTokenExpertId, destPe, laneExpert);
     }
   }
 }
@@ -756,6 +954,24 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
           laneDestTokId = LocalTokIdFromFlatTokenIndex(config, *mapSlot);
         }
       }
+      if constexpr (kConfig.moeSort) {
+        // Every local expert slot of this token, at the row its PE's valid lane took.
+        int rep = 0;
+        for (int e = 0; e < config.numExpertPerToken; e++) {
+          const int peOfE = __shfl(lanePe, e);
+          if (__shfl(static_cast<int>(laneValid), e) && peOfE == lanePe) rep = e;
+        }
+        const int row = __shfl(laneDestTokId, rep);
+        if (laneId < config.numExpertPerToken && !args.replayMode && lanePe >= 0 &&
+            lanePe < config.worldSize && lanePe / config.gpuPerNode == myNode) {
+          const MoeSortLane sort = MoeSortPrepare<kConfig>(
+              args, lanePe, indices[laneId], laneId,
+              reinterpret_cast<const float*>(stagingPtr + tokIdx * xferBytes + hiddenBytes +
+                                             indexBytes) +
+                  laneId);
+          MoeSortPut<kConfig>(sort, atomicAdd(sort.counter, 1), row);
+        }
+      }
 
       for (int e = 0; e < config.numExpertPerToken; e++) {
         if (!__shfl(static_cast<int>(laneValid), e)) continue;
@@ -896,6 +1112,18 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
       args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>(destPe)[destTokId] = srcTokId;
     }
     destTokId = __shfl(destTokId, 0);
+    if constexpr (kConfig.moeSort) {
+      // Every expert slot of this token on destPe; this path is not latency-critical.
+      if (laneId < config.numExpertPerToken && indices[laneId] >= 0 &&
+          indices[laneId] / config.numExpertPerRank == destPe) {
+        const MoeSortLane sort = MoeSortPrepare<kConfig>(
+            args, destPe, indices[laneId], laneId,
+            reinterpret_cast<const float*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes +
+                                           indexBytes) +
+                laneId);
+        MoeSortPut<kConfig>(sort, atomicAdd(sort.counter, 1), destTokId);
+      }
+    }
     core::WarpCopy<uint8_t, 4>(
         args.reg(args.offDispatchOut)->template GetAs<uint8_t*>(destPe) + destTokId * hiddenBytes,
         stagingPtr + globalTokenId * xferBytes, hiddenBytes);
@@ -982,23 +1210,52 @@ inline __device__ void DispatchInterNodeLLRecvTok(EpDispatchCombineArgs& args) {
     // Lane e < topk is expert e. A representative lane is the first expert of a local PE;
     // sentinel (-1) experts get a unique impossible PE, as in DispatchInterNodeLLRecv.
     int lanePe = -1;
+    index_t laneExpert = -1;
     if (laneId < kTopk) {
-      index_t laneExpert = reinterpret_cast<const index_t*>(slot + kH)[laneId];
+      laneExpert = reinterpret_cast<const index_t*>(slot + kH)[laneId];
       lanePe = (laneExpert < 0) ? (-1 - static_cast<int>(laneId))
                                 : (laneExpert / config.numExpertPerRank);
     }
     const index_t srcTokId = reinterpret_cast<const index_t*>(slot + kH + kI + kW + kS)[0];
     bool isRep = (laneId < kTopk) && (lanePe >= 0) && (lanePe < config.worldSize) &&
                  (lanePe / config.gpuPerNode == myNode);
+    // moeSort: lane kTopk + j buckets expert slot j on its PE; sortRep is that PE's rep lane.
+    [[maybe_unused]] MoeSortLane sort;
+    [[maybe_unused]] int sortPe = -1, sortRep = 0;
+    if constexpr (kConfig.moeSort) {
+      const int j = MoeSortSlot<kConfig>(laneId);
+      const index_t e = __shfl(laneExpert, (j >= 0 && j < kTopk) ? j : 0);
+      const int pe = e / config.numExpertPerRank;
+      if (j >= 0 && j < kTopk && e >= 0 && pe < config.worldSize &&
+          pe / config.gpuPerNode == myNode) {
+        sortPe = pe;
+        sort = MoeSortPrepare<kConfig>(args, pe, e, j,
+                                       reinterpret_cast<const float*>(slot + kH + kI) + j);
+      }
+      sortRep = -1;
+    }
 #pragma unroll
     for (int j = 0; j < kTopk; j++) {
       const int pj = __shfl(lanePe, j);
       if (j < laneId && pj == lanePe) isRep = false;
+      if constexpr (kConfig.moeSort) {
+        if (sortRep < 0 && pj == sortPe) sortRep = j;
+      }
     }
 
     int destTokId = 0;
+    if constexpr (kConfig.moeSort) {
+      index_t* counter =
+          isRep ? args.reg(args.offDispTokOffset)->template GetAs<index_t*>(lanePe) : sort.counter;
+      int got = 0;
+      if (counter) got = atomicAdd(counter, 1);
+      const int row = __shfl(got, sortRep < 0 ? 0 : sortRep);
+      if (sort.counter) MoeSortPut<kConfig>(sort, got, row);
+      destTokId = got;
+    }
     if (isRep) {
-      destTokId = atomicAdd(args.reg(args.offDispTokOffset)->template GetAs<index_t*>(lanePe), 1);
+      if constexpr (!kConfig.moeSort)
+        destTokId = atomicAdd(args.reg(args.offDispTokOffset)->template GetAs<index_t*>(lanePe), 1);
       assert(destTokId < config.MaxNumTokensToRecv() &&
              "Total recv token overflow: increase maxTotalRecvTokens");
       args.interNodeDispDestTokIdMap[globalTokenId * kTopk + laneId] =
@@ -1034,10 +1291,16 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
   // at the peer because the window is uncached.
   EpInterNodeWaitStores();
   __syncthreads();
+  // moeSort: the received rows in the last block, -1 in the others, and the finalize's tables.
+  [[maybe_unused]] __shared__ int sLastRecv;
+  [[maybe_unused]] __shared__ MoeSortShared<kConfig.moeSort ? kConfig.numExpertPerRank : 1> sSort;
   if (warpId == 0) {
     int finishedBlock = 0;
     if (laneId == 0) finishedBlock = atomicAdd(args.dispatchGridBarrier, 1);
     finishedBlock = __shfl(finishedBlock, 0);
+    if constexpr (kConfig.moeSort) {
+      if (laneId == 0) sLastRecv = -1;
+    }
     if ((finishedBlock + 1) == blockNum) {
       const int nodePeOffset = myNode * config.gpuPerNode;
       index_t* doneFlags = args.reg(args.offRecvTokenNum)->template GetAs<index_t*>();
@@ -1055,13 +1318,18 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
         __hip_atomic_store(done, index_t{0}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       }
       // Read after every local PE said it is done (the wave reconverges past the waits).
+      [[maybe_unused]] int sortCount = 0, total = 0;
+      if constexpr (kConfig.moeSort) sortCount = MoeSortLoadCount<kConfig>(args, laneId);
       if (laneId == 0) {
         index_t* slots = args.reg(args.offDispTokOffset)->template GetAs<index_t*>();
-        args.totalRecvTokenNum[0] =
-            __hip_atomic_load(slots, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        total = __hip_atomic_load(slots, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        args.totalRecvTokenNum[0] = total;
         __hip_atomic_store(slots, index_t{0}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         atomicAdd(args.crossDeviceBarrierFlag, 1);
+        if constexpr (kConfig.moeSort) sLastRecv = total;
       }
+      if constexpr (kConfig.moeSort)
+        MoeSortLayout<kConfig>(args, laneId, sortCount, __shfl(total, 0), sSort);
     }
   }
 
@@ -1076,6 +1344,12 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
     int proxyPe = node * config.gpuPerNode + (myPe % config.gpuPerNode);
     EpInterNodeQuiet(comm, proxyPe, pair % drainQps);
   }
+
+  // After the drain, so the warps draining do not first wait out warp 0's done-wait.
+  if constexpr (kConfig.moeSort) {
+    __syncthreads();
+    if (sLastRecv >= 0) MoeSortGather<kConfig, T>(args, sLastRecv, sSort);
+  }
 }
 
 }  // namespace internode
@@ -1089,6 +1363,9 @@ __device__ void EpDispatchInterNodeV2_body(EpDispatchCombineArgs args,
     internode::DispatchInterNodeRecv<kConfig, T>(args);
   } else {
     internode::DispatchIntraNode<kConfig, T>(args);
+    if constexpr (kConfig.moeSort) {
+      if (args.sortZeroRowBytes > 0) internode::MoeSortZeroRows<kConfig, T>(args);
+    }
   }
   internode::DispatchSync<kConfig, T>(args, comm);
 }
@@ -1151,6 +1428,9 @@ __device__ void EpDispatchInterNodeV2LL_body(EpDispatchCombineArgs args,
   } else {
     internode::WaitLLPostsIssued<kConfig, T>(args);
     internode::DispatchIntraNode<kConfig, T>(args);
+    if constexpr (kConfig.moeSort) {
+      if (args.sortZeroRowBytes > 0) internode::MoeSortZeroRows<kConfig, T>(args);
+    }
   }
   internode::DispatchSync<kConfig, T>(args, comm);
 }

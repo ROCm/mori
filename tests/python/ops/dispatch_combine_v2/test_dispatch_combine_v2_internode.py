@@ -329,6 +329,11 @@ def _parse_args(argv):
         "--kernel-type", default="auto", choices=["auto", "v2", "v2_ll", "asyncll"]
     )
     parser.add_argument("--auto-ll-max-tokens", type=int, default=512)
+    # Dispatch also builds aiter's moe_sorting tables with this block_size_M; --cmd
+    # test checks them against a torch reference and checks the expert-output zeroing.
+    parser.add_argument("--moe-sort-block-m", type=int, default=0)
+    # Rank 0 saves round 0's received rows and sort tables here, to check against aiter.
+    parser.add_argument("--moe-sort-dump", default=None)
     return parser.parse_args(argv)
 
 
@@ -476,6 +481,62 @@ def _golden(cfg, args, inp, idx, wts=None):
         None if wts is None else unique * wts.float(),
         None if wts is None else 2e-3 * unique,
     )
+
+
+def _check_moe_sort(op, cfg, recv_i, recv_w, total_recv):
+    """op.moe_sort() against aiter's moe_sorting contract, built here in torch from
+    the rows dispatch delivered. Order within an expert is not part of it (the
+    rows are placed by atomics), so each expert's entries compare as a set."""
+    bm, epr, topk = (
+        cfg.moe_sort_block_m,
+        cfg.num_experts_per_rank,
+        cfg.num_experts_per_token,
+    )
+    ids, weights, expert_ids, num_valid, _ = op.moe_sort()
+    recv = int(total_recv.item())
+    idx = recv_i[:recv].long()
+    mine = (idx >= 0) & (idx // epr == cfg.rank)
+    rows, slots = mine.nonzero(as_tuple=True)
+    local = idx[rows, slots] % epr
+    want_ids = rows | (slots << 24)
+    want_w = recv_w[:recv][rows, slots].float()
+    counts = torch.bincount(local, minlength=epr)
+    padded = (counts + bm - 1) // bm * bm
+    off = torch.cumsum(padded, 0) - padded
+    total = int(padded.sum())
+    problems = []
+    if num_valid.tolist() != [total, recv]:
+        problems.append(f"num_valid_ids={num_valid.tolist()} want {[total, recv]}")
+    else:
+        want_eids = torch.repeat_interleave(
+            torch.arange(epr, device=idx.device), padded // bm
+        )
+        if not torch.equal(expert_ids[: total // bm].long(), want_eids):
+            problems.append("sorted_expert_ids differ")
+        # Per expert: its count of real rows (any order), then the padding.
+        pos = torch.arange(total, device=idx.device)
+        expert_of = torch.repeat_interleave(
+            torch.arange(epr, device=idx.device), padded
+        )
+        real = (pos - off[expert_of]) < counts[expert_of]
+        got_ids, got_w = ids[:total].long(), weights[:total].float()
+        pad_id = recv | (topk << 24)
+        if not (
+            bool((got_ids[~real] == pad_id).all()) and bool((got_w[~real] == 0).all())
+        ):
+            problems.append("padding rows differ")
+        key_got = expert_of[real] * (1 << 40) + got_ids[real]
+        key_want = local * (1 << 40) + want_ids
+        order_got, order_want = key_got.argsort(), key_want.argsort()
+        if not torch.equal(key_got[order_got], key_want[order_want]):
+            problems.append(
+                f"sorted ids differ ({int(real.sum())} vs {key_want.numel()} rows)"
+            )
+        elif not torch.equal(got_w[real][order_got], want_w[order_want]):
+            problems.append("sorted weights differ")
+    if problems:
+        print(f"#   rank {cfg.rank} moe_sort: {'; '.join(problems)}", flush=True)
+    return not problems
 
 
 def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
@@ -2262,6 +2323,7 @@ def main(argv):
             ),
             internode_auto_ll_max_tokens=args.auto_ll_max_tokens,
             kernel_backend="hip",
+            moe_sort_block_m=args.moe_sort_block_m,
         )
         op = EpDispatchCombineOp(cfg, comm)
         comm.barrier()
@@ -2288,6 +2350,7 @@ def main(argv):
 
         qp_schedule = _active_qp_schedule(cfg)
         rng = torch.Generator(device=device)
+        prev_sort_rows = 0
         for round_index in range(args.rounds):
             rng.manual_seed(1234 + round_index * 977 + rank)
             num_tokens = max_tokens
@@ -2297,11 +2360,40 @@ def main(argv):
 
             if qp_schedule:
                 op.set_active_qps(_active_qp_for(qp_schedule, round_index, cfg, 0))
+            if args.moe_sort_block_m:
+                # Stand in for the last FC2: dirty every row it could have written,
+                # the received rows plus the one its padding rows land on.
+                moe_out = op.moe_sort()[4]
+                moe_out[:prev_sort_rows] = 1
             recv_x, recv_w, recv_s, recv_i, total_recv, routing = op.dispatch(
                 inp, wts, sc, idx, return_routing=True
             )
             torch.cuda.synchronize()
             comm.barrier()
+            sort_ok = True
+            if args.moe_sort_block_m:
+                sort_ok = _check_moe_sort(op, cfg, recv_i, recv_w, total_recv)
+                prev_sort_rows = int(total_recv.item()) + 1
+                if args.moe_sort_dump and rank == 0 and round_index == 0:
+                    tables = op.moe_sort()
+                    torch.save(
+                        dict(
+                            recv_i=recv_i.cpu(),
+                            recv_w=recv_w.cpu(),
+                            total_recv=int(total_recv.item()),
+                            block_m=args.moe_sort_block_m,
+                            epr=cfg.num_experts_per_rank,
+                            rank=rank,
+                            tables=[t.cpu() for t in tables[:4]],
+                        ),
+                        args.moe_sort_dump,
+                    )
+                if bool(moe_out.any()):
+                    print(
+                        f"#   rank {rank} moe_sort: expert output not zeroed",
+                        flush=True,
+                    )
+                    sort_ok = False
 
             # Identity expert: recv_x already holds the dispatched tokens.
             #
@@ -2432,7 +2524,7 @@ def main(argv):
                         flush=True,
                     )
             failed_ranks = dist_handle.allreduce_sum(
-                0 if (hidden_ok and weights_ok) else 1
+                0 if (hidden_ok and weights_ok and sort_ok) else 1
             )
             failures += failed_ranks
             if rank == 0:

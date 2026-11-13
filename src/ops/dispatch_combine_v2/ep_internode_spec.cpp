@@ -101,6 +101,9 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   // other passes share one compiled module across load-first and plain buckets.
   cfg.kernelCfg.combineLoadFirst = (kind == EpInterNodeKernel::Combine) && request.combineLoadFirst;
   cfg.kernelCfg.noRdmaAtomics = request.noRdmaAtomics;
+  // Dispatch passes only, so the other passes keep one module with and without it.
+  cfg.kernelCfg.moeSort = request.moeSort && (kind == EpInterNodeKernel::Dispatch ||
+                                              kind == EpInterNodeKernel::DispatchLL);
   cfg.asyncLlMode = request.asyncLlMode;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);
@@ -134,6 +137,9 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   }
   if (request.noRdmaAtomics && family == EpInterNodeFamily::AsyncLL) {
     throw std::runtime_error("mori ep v2: AsyncLL has no write-signalling (noRdmaAtomics) variant");
+  }
+  if (request.moeSort && family == EpInterNodeFamily::AsyncLL) {
+    throw std::runtime_error("mori ep v2: AsyncLL has no moeSort variant");
   }
   if (cfg.asyncLlMode != 0 && family != EpInterNodeFamily::AsyncLL) {
     throw std::runtime_error("mori ep v2: asyncLlMode is only supported by AsyncLL plans");
