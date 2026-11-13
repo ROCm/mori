@@ -112,9 +112,8 @@ class IOEngine {
   // DeregisterRemoteEngine this drops the live connections, not just the address
   // book entry. The peer can come back only by building new connections.
   // Safe to call for an unknown peer; the result then reports nothing fenced. It is still
-  // not ok while a path that cannot be cut may reach this engine's memory: an XGMI mapping
-  // or an OFI key, which any peer may hold. The fabric backend is not covered: memory
-  // exported over fabric must not be reused on the strength of a fence.
+  // not ok while a path that cannot be cut may reach this engine's memory: an XGMI mapping,
+  // a fabric import, or an OFI key, which any peer may hold.
   FenceResult FenceRemoteEngine(const EngineKey& remote);
   // Lets a fenced peer connect again. Until then it is refused, in either direction,
   // so a peer that noticed its connection die cannot quietly rebuild it and land

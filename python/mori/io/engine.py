@@ -254,11 +254,10 @@ class IOEngine:
         Afterwards none of the peer's connections can deliver another write, so
         buffers it was targeting can be reused. Only trust that when the result
         has ``ok`` set; ``endpoints_failed > 0`` means the peer may still write.
-        Paths that cannot be cut count as failed endpoints: an XGMI mapping or an
-        OFI key of memory this engine registered, which any peer may hold,
-        registered with this engine or not. Otherwise fencing a peer this engine
-        has no connection to is ok and a no-op. The fabric backend is not covered:
-        memory exported over fabric must not be reused on the strength of a fence.
+        Paths that cannot be cut count as failed endpoints: an XGMI mapping, a
+        fabric import, or an OFI key of memory this engine registered, which any
+        peer may hold, registered with this engine or not. Otherwise fencing a peer
+        this engine has no connection to is ok and a no-op.
 
         The peer stays fenced: it cannot reconnect, in either direction, until
         ``unfence_remote_engine``. Otherwise a peer that noticed its connection
