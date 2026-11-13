@@ -1,6 +1,6 @@
 # MORI-IO fault catalog: NIC async events (fault simulation part 2/N).
 # Each entry runs an initiator and target on separate GPUs/NICs, as ibverbs.yaml.
-# Checks: ends / honest / recovers / alive, plus optional reported / during.
+# Checks: ends / honest / recovers / alive / stopped, plus optional reported / during.
 # recovers requires both a successful next transfer and session Alive().
 # peer_failure: expected PopPeerFailure reason, or none (no event in 500 ms).
 # during: reject (ERR_RDMA_OP on return), succeed, or fail (error within 5 s).
@@ -43,6 +43,14 @@
   transfer: batch
   peer_failure: LOCAL_QP_ERROR
   during: succeed
+
+# The event retires the small write's QP at once; the transfer must still wait for the
+# other QP's large write before it reports the failure.
+- id: qp_fatal.small_then_large
+  real_world: one local QP dies while the other QP's large write is still on the wire
+  rule: async_event:value=qp_fatal:op=write
+  transfer: small_then_large
+  peer_failure: LOCAL_QP_ERROR
 
 # The FI-only BeforeNotify hook waits for data SUCCESS before killing the QP.
 # The SEND is then flushed; the initiator still reports SUCCESS, so honest fails.

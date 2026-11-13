@@ -227,6 +227,18 @@ def asyncll_regions(cfg):
     order.append("send_count")
     regions["send_count"] = world_size * 2 * _U64
 
+    # The segmented layout (async_ll_recv_layout) lays the dispatch landing and
+    # send staging out per field (see asyncll_seg_layout), lets the expert write
+    # its segmented output into inter_dispatch_staging, and adds its words to
+    # send_count (asyncll_seg_words).
+    # inter_dispatch_staging keeps its compact size: a segmented round's expert
+    # output is world_size * S rows with S <= the receive cap (per_rank above).
+    if cfg.async_ll_segmented:
+        seg_bytes = asyncll_seg_layout(cfg)["bytes"]
+        for name in ("inter_staging", "inter_dispatch_inp"):
+            regions[name] = max(regions[name], seg_bytes)
+        regions["send_count"] += asyncll_seg_words(world_size)["extra"] * _U64
+
     # Combine gets its OWN send staging rather than reusing inter_staging.
     #
     # Sharing one buffer is correct but couples the two phases: dispatch's
@@ -245,3 +257,48 @@ def asyncll_regions(cfg):
     regions["inter_combine_staging"] = send_slots * hidden_bytes
 
     return [(name, regions[name]) for name in order]
+
+
+_SEG_ALIGN = 256
+
+
+def asyncll_seg_words(world_size):
+    """Indices (u64 words) of the segmented layout's words in ``send_count``, past
+    the count/epoch pairs: the mode word each source sent (``mode``, one per
+    source), the local word sent from (``mode_source``), the error counters
+    (``errors``: overflow, mismatch) and this round's per-source row counts
+    (``counts``). ``extra`` is how many words they add. Must match the Seg*Slot
+    helpers in ep_asyncll_kernel.hpp."""
+    w = world_size
+    return {
+        "mode": 2 * w,
+        "mode_source": 3 * w,
+        "errors": 3 * w + 1,
+        "counts": 3 * w + 3,
+        "extra": 2 * w + 3,
+    }
+
+
+def asyncll_seg_layout(cfg):
+    """Byte offsets of the segmented field blocks in ``inter_dispatch_inp`` and
+    ``inter_staging``, plus the bytes they span.
+
+    Each block holds ``world_size * max_num_inp_token_per_rank`` rows; a segmented
+    round with stride S uses rows ``[s * S, s * S + n_s)`` of each for source s.
+    Must match ``asyncll::SegLayoutOf`` in ep_asyncll_kernel.hpp.
+    """
+    rows = cfg.world_size * cfg.max_num_inp_token_per_rank
+    topk = cfg.num_experts_per_token
+
+    def align(x):
+        return -(-x // _SEG_ALIGN) * _SEG_ALIGN
+
+    layout = {"hidden": 0}
+    layout["index"] = align(rows * cfg.token_nbytes)
+    layout["weight"] = align(layout["index"] + rows * topk * _I32)
+    layout["scale"] = align(layout["weight"] + rows * topk * _F32)
+    layout["src_tok"] = align(
+        layout["scale"] + rows * cfg.scale_dim * cfg.scale_type_size
+    )
+    layout["bytes"] = layout["src_tok"] + rows * _I32
+    return layout

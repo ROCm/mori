@@ -175,6 +175,25 @@ _DISPATCH_TABLE: dict = {
             None: ((512, 64, 8), (2048, 64, 16), (None, 128, 16)),
             "fp4": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
         },
+        # hidden 5120 (DeepSeek-V4.1-Flash), topk 6, 96 experts a rank. Swept 64-256 blocks x
+        # 4-16 warps for each dispatch dtype. Graph us, median of 3 rounds, these rows against
+        # 128x8 for bf16 and the 64x16 default for fp8 / fp4:
+        #   ct     bf16 128x8   rows   fp8 64x16   rows   fp4 64x16   rows
+        #   64          24.8    18.8        24.8   19.4        25.8   19.4
+        #   512         27.2    26.2        26.3   23.4        32.1   22.0
+        #   2048        55.9    52.9        46.7   37.5        45.5   29.6
+        #   8192       169.0   165.2       107.8  100.9       100.1   69.2
+        #   16384      321.8   308.8       197.9  195.9       180.4  132.6
+        (4, 5120, 6, 96): {
+            None: ((256, 64, 4), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
+            "bf16": ((256, 64, 4), (512, 128, 4), (2048, 256, 4), (None, 128, 16)),
+        },
+        # Its 128-expert topk-3 draft MoE (32 experts a rank) takes the same rows: at 2048 tokens
+        # bf16 / fp8 / fp4 run 43.0 / 31.6 / 26.1 against 47.1 / 42.5 / 41.2.
+        (4, 5120, 3, 32): {
+            None: ((256, 64, 4), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
+            "bf16": ((256, 64, 4), (512, 128, 4), (2048, 256, 4), (None, 128, 16)),
+        },
         # EP8 on two 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-03; the grid stays at 64 blocks
         # (the rest of the CUs belong to the co-resident GEMM). What wins is one token a warp:
         # past 1024 tokens 64x16 gives some warps a second token, and its metadata split
@@ -297,6 +316,16 @@ _COMBINE_TABLE: dict = {
             (1024, 256, 8),
             (None, 192, 8),
         ),
+        # hidden 5120: 64x8 up to 128 tokens, then 128x8; topk 3 moves to 256x4 past 512 tokens,
+        # where it leads the 128-block grids by 4-10% up to 4096 (128x16 is 6% ahead at 8192).
+        # Graph us, median of 3 rounds, topk 6 | topk 3:
+        #   ct     64x8  128x8 128x16  256x4 |  64x8  128x8 128x16  256x4
+        #   128    13.6   15.0   15.2   14.9 |  13.0   13.9   14.5   13.8
+        #   512    24.4   21.4   20.9   21.2 |  23.0   19.5   18.9   19.4
+        #   2048   65.5   49.1   50.7   48.5 |  54.7   42.8   40.5   39.1
+        #   8192  228.8  163.8  189.7  165.5 | 172.1  131.0  124.4  131.5
+        (4, 5120, 6, 96): ((128, 64, 8), (None, 128, 8)),
+        (4, 5120, 3, 32): ((128, 64, 8), (512, 128, 8), (None, 256, 4)),
     },
     # The gfx1250-strict parts, as their dispatch rows.
     "gfx1250-strict": {
@@ -584,7 +613,9 @@ class ScheduleEntry(NamedTuple):
     combine: KernelConfig
 
 
-def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
+def resolve_schedule(
+    cfg, cu_count=None, kernel_family=None
+) -> tuple[ScheduleEntry, ...]:
     """The HIP V2 schedule consumed by both construction and token selection.
 
     Intra adapts the schedule Config resolved: per phase, the IntraNodeV2 table's
@@ -617,11 +648,10 @@ def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
             for ceiling, db, dw, cb, cw in rows
         )
 
-    geometries = internode_schedule(cfg, cu_count=cu_count)
-    ceilings = [row[0] for row in geometries]
+    family = kernel_family or internode_kernel_family(cfg)
+    geometries = internode_schedule(cfg, cu_count=cu_count, kernel_family=family)
     entries = []
     for ceiling, dispatch, combine, load_first in geometries:
-        family = internode_kernel_family(cfg, _probe(ceiling, ceilings))
         entries.append(
             ScheduleEntry(
                 ceiling,
@@ -643,6 +673,28 @@ def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
             )
         )
     return tuple(entries)
+
+
+def resolve_ll_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
+    """The v2_ll schedule an internode "auto" op runs for calls whose
+    max_num_inp_token_across_ranks is at most internode_auto_ll_max_tokens.
+
+    resolve_schedule() for kernel_family="v2_ll", up to and including the first
+    bucket whose ceiling reaches the crossover, which internode_schedule() makes
+    a bucket edge. Empty for every other op; resolve_schedule() alone serves it.
+    """
+    if (
+        getattr(cfg, "async_ll", False)
+        or not cfg.is_internode
+        or cfg.internode_kernel != "auto"
+    ):
+        return ()
+    rows = []
+    for row in resolve_schedule(cfg, cu_count=cu_count, kernel_family="v2_ll"):
+        rows.append(row)
+        if row.max_tokens is None or row.max_tokens >= cfg.internode_auto_ll_max_tokens:
+            break
+    return tuple(rows)
 
 
 def describe_schedule(cfg, schedule) -> str:
@@ -807,11 +859,13 @@ _INTERNODE_GEOMETRY_FIELDS = (
 )
 
 
-def internode_kernel_family(cfg, num_tokens):
-    """Resolve auto using live tokens, independently of the declared capacity."""
+def internode_kernel_family(cfg, *, max_tokens=None):
+    """Resolve auto from the call's max token count across ranks; v2 without one."""
     if cfg.internode_kernel != "auto":
         return cfg.internode_kernel
-    return "v2_ll" if num_tokens <= cfg.internode_auto_ll_max_tokens else "v2"
+    if max_tokens is not None and max_tokens <= cfg.internode_auto_ll_max_tokens:
+        return "v2_ll"
+    return "v2"
 
 
 def internode_kernel_families(cfg):
@@ -870,7 +924,7 @@ def _geometry_from_env(name, cfg):
     return geometry
 
 
-def internode_schedule(cfg, cu_count=None):
+def internode_schedule(cfg, cu_count=None, kernel_family=None):
     """Resolve (inclusive token ceiling, dispatch B/R/W/QPs, combine B/R/W/QPs,
     combine load-first).
 
@@ -898,8 +952,9 @@ def internode_schedule(cfg, cu_count=None):
         fitted = tuple(fit_internode_geometry(g) for g in overrides)
         return [(ceiling, *fitted, False) for ceiling in _ceilings(extra=crossover)]
 
-    tables = {
-        family: internode_buckets(
+    family = kernel_family or internode_kernel_family(cfg)
+    table = (
+        internode_buckets(
             cfg.world_size,
             cfg.hidden_dim,
             cfg.num_experts_per_token,
@@ -910,16 +965,14 @@ def internode_schedule(cfg, cu_count=None):
             cu_count=cu_count,
         )
         or []
-        for family in internode_kernel_families(cfg)
-    }
-    ceilings = _ceilings(*tables.values(), extra=crossover)
+    )
+    ceilings = _ceilings(table, extra=crossover)
 
     pinned = getattr(cfg, "_pinned_geometry", frozenset())
-    rows, families = [], []
+    rows = []
     for ceiling in ceilings:
         probe = _probe(ceiling, ceilings)
-        family = internode_kernel_family(cfg, probe)
-        tuned = pick_bucket(tables[family], probe)
+        tuned = pick_bucket(table, probe)
         geometries = []
         for index, (fields, fallback) in enumerate(
             zip(_INTERNODE_GEOMETRY_FIELDS, defaults), start=1
@@ -947,14 +1000,11 @@ def internode_schedule(cfg, cu_count=None):
             bool(tuned and tuned[3]) and family == "v2" and overrides[1] is None
         )
         row = (ceiling, *geometries, load_first)
-        # Equal neighbours of one family share a bucket. A family boundary
-        # stays an edge even between equal geometries, so each bucket's family
-        # follows from its ceiling alone (resolve_schedule).
-        if rows and rows[-1][1:] == row[1:] and families[-1] == family:
+        # Equal neighbours share a bucket.
+        if rows and rows[-1][1:] == row[1:]:
             rows[-1] = row
         else:
             rows.append(row)
-            families.append(family)
     return rows
 
 

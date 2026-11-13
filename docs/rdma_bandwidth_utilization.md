@@ -137,10 +137,12 @@ A short `recv` span means the data arrived before or soon after the receiver sta
 
 ### Step 1: Collect a profiler trace
 
-Enable the kernel profiler (requires `ENABLE_PROFILER` build flag) and run:
+Enable the kernel profiler (requires `ENABLE_PROFILER` build flag), run the
+inter-node profiling job from the [MORI-EP Benchmark](MORI-EP-BENCHMARK.md) page
+(`--cmd profile`), and plot one rank's trace:
 
 ```bash
-python analyze_trace_internode.py <trace_rank_0_XXXXXX.json> --out timeline.png
+python tools/profiler/analyze_ep_kernel_trace.py <trace_rank_0_XXXXXX.json> --out timeline.png
 ```
 
 The trace gives wall-clock spans for each kernel on each warp, merged into a
@@ -221,7 +223,7 @@ If you have access to `rocprof` or equivalent:
 ```bash
 rocprof --stats --hip-trace \
   --counter "TCC_EA_RDREQ_sum,TCC_EA_WRREQ_sum" \
-  python run_dispatch_combine.py
+  <your dispatch/combine command>
 ```
 
 Cross-check the `TCC_EA_WRREQ` write request count against

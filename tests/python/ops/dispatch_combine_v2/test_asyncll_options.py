@@ -26,7 +26,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig
 from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+from mori.ops.dispatch_combine_v2.internode_regions import (
+    asyncll_regions,
+    asyncll_seg_layout,
+)
 
 
 class AsyncLLOptionsTest(unittest.TestCase):
@@ -151,6 +156,101 @@ class AsyncLLOptionsTest(unittest.TestCase):
                 self.resolve({"MORI_ASYNCLL_EARLY_NOTIFY": "0", option: "1"})
         with self.assertRaises(ValueError):
             self.resolve({"MORI_ASYNCLL_EARLY_NOTIFY": "yes"})
+
+
+class AsyncLLSegmentedTest(unittest.TestCase):
+    def test_sequences(self):
+        seq = EpDispatchCombineOpHip._asyncll_seg_seq()
+        self.assertEqual(
+            seq["dispatch_send"],
+            (
+                "dispatch_slotassign",
+                "dispatch_sendcopy_seg",
+                "dispatch_sendtransfer_seg",
+            ),
+        )
+        self.assertEqual(
+            seq["dispatch_recv"], ("dispatch_recvtransfer", "dispatch_recvfinalize_seg")
+        )
+        self.assertEqual(seq["combine_send"], ("combine_sendtransfer_seg",))
+        self.assertEqual(
+            seq["combine_recv"], ("combine_recvtransfer", "combine_recvcopy_seg")
+        )
+
+    def test_config_values(self):
+        def cfg(layout, async_ll=True):
+            return EpDispatchCombineConfig(
+                rank=0,
+                world_size=8,
+                hidden_dim=7168,
+                max_num_inp_token_per_rank=64,
+                num_experts_per_rank=48,
+                num_experts_per_token=6,
+                kernel_backend="hip",
+                async_ll=async_ll,
+                async_ll_transport="sdma",
+                async_ll_recv_layout=layout,
+            )
+
+        for value, want in (("compact", False), ("segmented", True)):
+            with self.subTest(value=value):
+                self.assertEqual(cfg(value).async_ll_recv_layout, value)
+                self.assertIs(cfg(value).async_ll_segmented, want)
+        # "auto" stays for the backend to resolve; it is not segmented yet.
+        self.assertEqual(cfg("auto").async_ll_recv_layout, "auto")
+        self.assertIs(cfg("auto").async_ll_segmented, False)
+        # "auto" without async_ll resolves to compact at once; "segmented" there
+        # is an error.
+        self.assertEqual(cfg("auto", async_ll=False).async_ll_recv_layout, "compact")
+        for bad in (True, 1, "on", "zero_copy"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                cfg(bad)
+        with self.assertRaises(ValueError):
+            cfg("segmented", async_ll=False)
+
+    def test_layout_fits_the_regions(self):
+        for scale_dim, token_nbytes, segmented in ((0, 14336, 0), (224, 7168, 1)):
+            cfg = SimpleNamespace(
+                world_size=8,
+                gpu_per_node=8,
+                hidden_dim=7168,
+                max_num_inp_token_per_rank=100,
+                max_total_recv_tokens=0,
+                num_experts_per_rank=32,
+                num_experts_per_token=6,
+                max_token_type_size=2,
+                token_nbytes=token_nbytes,
+                scale_dim=scale_dim,
+                scale_type_size=1,
+                num_qp_per_pe=2,
+                async_ll_segmented=segmented,
+            )
+            layout = asyncll_seg_layout(cfg)
+            offsets = [layout[k] for k in ("hidden", "index", "weight", "scale")]
+            self.assertTrue(
+                all(off % 256 == 0 for off in offsets + [layout["src_tok"]])
+            )
+            regions = dict(asyncll_regions(cfg))
+            # The segmented expert output (world_size * S rows, S <= the receive
+            # cap) fits the compact-sized inter_dispatch_staging.
+            self.assertEqual(
+                regions["inter_dispatch_staging"],
+                cfg.world_size * cfg.max_num_inp_token_per_rank * cfg.hidden_dim * 2,
+            )
+            if segmented:
+                self.assertGreaterEqual(regions["inter_dispatch_inp"], layout["bytes"])
+                self.assertGreaterEqual(regions["inter_staging"], layout["bytes"])
+                # count/epoch pairs, then mode words, mode source, 2 error
+                # counters and per-source counts (asyncll_seg_words).
+                self.assertEqual(regions["send_count"], (8 * 2 + 8 + 1 + 2 + 8) * 8)
+            else:
+                self.assertEqual(regions["send_count"], 8 * 2 * 8)
+
+        # With a receive cap the segmented op keeps the capped staging too, so
+        # the layout costs no extra arena there (and no KV-cache pool).
+        cfg.max_total_recv_tokens = 8 * 50
+        regions = dict(asyncll_regions(cfg))
+        self.assertEqual(regions["inter_dispatch_staging"], 8 * 50 * 7168 * 2)
 
 
 if __name__ == "__main__":

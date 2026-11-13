@@ -98,27 +98,36 @@ std::shared_ptr<CqCallbackMeta> SubmissionLedger::ReleaseByCqe(uint64_t recordId
 }
 
 int SubmissionLedger::ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::vector<std::pair<std::shared_ptr<CqCallbackMeta>, int>> retired;
   int total = 0;
-  // Only erase Orphaned records.  Posted records still have signaled WRs whose
-  // CQEs may arrive later; they must remain so ReleaseByCqe() can update the
-  // corresponding TransferStatus and release sqDepth normally.
-  auto it = records_.begin();
-  while (it != records_.end()) {
-    if (it->second.state == SubmissionState::Orphaned) {
-      total += it->second.postedWr;
-      it = records_.erase(it);
-    } else {
-      ++it;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    // Only erase Orphaned records.  Posted records still have signaled WRs whose
+    // CQEs may arrive later; they must remain so ReleaseByCqe() can update the
+    // corresponding TransferStatus and release sqDepth normally.
+    auto it = records_.begin();
+    while (it != records_.end()) {
+      if (it->second.state == SubmissionState::Orphaned) {
+        total += it->second.postedWr;
+        if (it->second.meta) retired.emplace_back(std::move(it->second.meta), it->second.batchSize);
+        it = records_.erase(it);
+      } else {
+        ++it;
+      }
     }
+    if (sqDepth && total > 0) sqDepth->fetch_sub(total, kSqAdmissionOrder);
   }
-  if (sqDepth && total > 0) sqDepth->fetch_sub(total, kSqAdmissionOrder);
+  for (auto& [meta, credits] : retired) {
+    meta->Account(credits, StatusCode::ERR_RDMA_OP,
+                  "WRs posted without a completion were ended by their QP's error",
+                  /*rootCause=*/false);
+  }
   return total;
 }
 
 int SubmissionLedger::FailAll(StatusCode code, const std::string& message,
                               std::atomic<int>* sqDepth) {
-  std::vector<std::pair<std::shared_ptr<CqCallbackMeta>, TransferStatus*>> claimed;
+  std::vector<std::pair<std::shared_ptr<CqCallbackMeta>, int>> retired;
   int total = 0;
   {
     std::unique_lock<std::mutex> lock(mu_);
@@ -130,11 +139,8 @@ int SubmissionLedger::FailAll(StatusCode code, const std::string& message,
     postingDrained_.wait(lock, [this] { return posting_ == 0; });
     for (auto& [id, rec] : records_) {
       total += rec.postedWr;
-      if (!rec.meta) continue;
-      // Records of one batch share a meta; exchange() makes the first one win and
-      // also stops a racing CQE from reporting a different outcome afterwards.
-      TransferStatus* status = rec.meta->status.exchange(nullptr, std::memory_order_acq_rel);
-      if (status != nullptr) claimed.emplace_back(rec.meta, status);
+      // Erasing the record also stops a racing CQE from accounting it a second time.
+      if (rec.meta) retired.emplace_back(std::move(rec.meta), rec.batchSize);
     }
     records_.clear();
     if (sqDepth && total > 0) sqDepth->fetch_sub(total, kSqAdmissionOrder);
@@ -142,8 +148,11 @@ int SubmissionLedger::FailAll(StatusCode code, const std::string& message,
 
   // Update() wakes WaitFor() sleepers, so run it outside the ledger lock to keep
   // woken threads from contending on a lock this call still holds.
-  for (auto& [meta, status] : claimed) meta->ReportData(status, code, message);
-  return static_cast<int>(claimed.size());
+  int failed = 0;
+  for (auto& [meta, credits] : retired) {
+    if (meta->Account(credits, code, message)) ++failed;
+  }
+  return failed;
 }
 
 bool SubmissionLedger::Closed() const {
