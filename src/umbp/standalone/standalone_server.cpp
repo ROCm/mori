@@ -504,6 +504,196 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
   };
 
+  // The tiers below the L1 pools: this server's own store. A slot's bytes go
+  // in and out through plain host-memory puts and gets, so the store's tier
+  // policy (DRAM, SSD, promotion and demotion between them) and its routing
+  // to other nodes apply to L1 content exactly as to any other object. The
+  // L1 directory is the master's external-KV index at the HBM tier.
+  class L1Store final : public l1::LowerStore {
+   public:
+    explicit L1Store(Impl& server) : server_(server) {}
+
+    bool RegisterHostMemory(void* base, uint64_t bytes) override {
+      return server_.RegisterBackendMemory(base, static_cast<size_t>(bytes));
+    }
+    void DeregisterHostMemory(void* base) override {
+      std::unique_lock<std::shared_mutex> lock(server_.client_mu_);
+      server_.client_->DeregisterMemory(reinterpret_cast<uintptr_t>(base));
+    }
+    std::vector<bool> Exists(const std::vector<std::string>& keys) override {
+      DataPathLock lock(server_.client_mu_, server_.LookupLocking());
+      if (server_.shutdown_.load()) return std::vector<bool>(keys.size(), false);
+      return server_.client_->BatchExists(keys);
+    }
+    std::vector<bool> Put(const std::vector<std::string>& keys,
+                          const std::vector<const void*>& srcs, uint64_t size) override {
+      std::vector<uintptr_t> ptrs;
+      ptrs.reserve(srcs.size());
+      for (const void* src : srcs) ptrs.push_back(reinterpret_cast<uintptr_t>(src));
+      const std::vector<size_t> sizes(keys.size(), static_cast<size_t>(size));
+      DataPathLock lock(server_.client_mu_, server_.WriteLocking());
+      if (server_.shutdown_.load()) return std::vector<bool>(keys.size(), false);
+      return server_.client_->BatchPut(keys, ptrs, sizes);
+    }
+    std::vector<bool> Get(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
+                          uint64_t size) override {
+      std::vector<uintptr_t> ptrs;
+      ptrs.reserve(dsts.size());
+      for (void* dst : dsts) ptrs.push_back(reinterpret_cast<uintptr_t>(dst));
+      const std::vector<size_t> sizes(keys.size(), static_cast<size_t>(size));
+      DataPathLock lock(server_.client_mu_, server_.ReadLocking());
+      if (server_.shutdown_.load()) return std::vector<bool>(keys.size(), false);
+      return server_.client_->BatchGet(keys, ptrs, sizes);
+    }
+    void Publish() override {
+      std::unique_lock<std::shared_mutex> lock(server_.client_mu_);
+      if (!server_.shutdown_.load()) server_.client_->Flush();
+    }
+    void Advertise(const std::vector<std::string>& added,
+                   const std::vector<std::string>& removed) override {
+      if (!server_.BackendIsDistributed()) return;
+      DataPathLock lock(server_.client_mu_, server_.LookupLocking());
+      if (server_.shutdown_.load()) return;
+      ForEachChunk(removed, [&](const std::vector<std::string>& chunk) {
+        server_.client_->RevokeExternalKvBlocks(chunk, TierType::HBM);
+      });
+      ForEachChunk(added, [&](const std::vector<std::string>& chunk) {
+        server_.client_->ReportExternalKvBlocks(chunk, TierType::HBM);
+      });
+    }
+    std::vector<bool> RequestFromPeers(const std::vector<std::string>& names) override {
+      std::vector<bool> stored(names.size(), false);
+      if (!server_.BackendIsDistributed() || !server_.l1_export_port_delta_.has_value()) {
+        return stored;
+      }
+      std::vector<IUMBPClient::ExternalKvMatch> matches;
+      {
+        DataPathLock lock(server_.client_mu_, server_.LookupLocking());
+        if (server_.shutdown_.load()) return stored;
+        matches = server_.client_->MatchExternalKv(names);
+      }
+      std::unordered_map<std::string, size_t> position;
+      for (size_t i = 0; i < names.size(); ++i) position.emplace(names[i], i);
+      const std::string self = server_.backend_config_.distributed->master_config.node_id;
+      for (const auto& match : matches) {
+        if (match.node_id == self) continue;
+        auto hbm = match.hashes_by_tier.find(TierType::HBM);
+        if (hbm == match.hashes_by_tier.end()) continue;
+        // One Export per group; a node's pools of different groups do not mix.
+        std::map<std::string, std::pair<std::vector<std::string>, std::vector<size_t>>> wanted;
+        for (const std::string& name : hbm->second) {
+          auto at = position.find(name);
+          if (at == position.end() || stored[at->second]) continue;
+          std::string group;
+          std::string key;
+          if (!l1::PoolManager::ParseStoreKey(name, &group, &key)) continue;
+          wanted[group].first.push_back(std::move(key));
+          wanted[group].second.push_back(at->second);
+        }
+        if (wanted.empty()) continue;
+        l1::L1Client* peer = PeerFor(match.peer_address);
+        if (peer == nullptr) continue;
+        for (auto& entry : wanted) {
+          l1::ExportResult result = peer->Export(entry.first, entry.second.first);
+          if (!result.status.ok) {
+            MORI_UMBP_WARN("[StandaloneServer] L1 export from node {} failed: {}", match.node_id,
+                           result.status.error);
+            continue;
+          }
+          size_t got = 0;
+          for (size_t k = 0; k < entry.second.second.size(); ++k) {
+            if (!result.stored[k]) continue;
+            stored[entry.second.second[k]] = true;
+            ++got;
+          }
+          MORI_UMBP_INFO("[StandaloneServer] L1 export from node {}: asked={} stored={}",
+                         match.node_id, entry.second.first.size(), got);
+        }
+      }
+      return stored;
+    }
+
+   private:
+    template <typename Fn>
+    static void ForEachChunk(const std::vector<std::string>& keys, Fn&& fn) {
+      constexpr size_t kChunk = 2048;
+      for (size_t begin = 0; begin < keys.size(); begin += kChunk) {
+        const size_t end = std::min(keys.size(), begin + kChunk);
+        fn(std::vector<std::string>(keys.begin() + begin, keys.begin() + end));
+      }
+    }
+
+    // The L1 export port of the node whose peer service is at `peer_address`.
+    // Every node keeps the same distance between the two ports.
+    l1::L1Client* PeerFor(const std::string& peer_address) {
+      const size_t colon = peer_address.rfind(':');
+      if (colon == std::string::npos) return nullptr;
+      char* end = nullptr;
+      const long peer_port = std::strtol(peer_address.c_str() + colon + 1, &end, 10);
+      if (end == nullptr || *end != '\0') return nullptr;
+      const long port = peer_port + *server_.l1_export_port_delta_;
+      if (port <= 0 || port > 65535) return nullptr;
+      const std::string address = peer_address.substr(0, colon + 1) + std::to_string(port);
+      std::lock_guard<std::mutex> lock(peers_mu_);
+      auto& client = peers_[address];
+      if (!client) client = std::make_unique<l1::L1Client>(address);
+      return client.get();
+    }
+
+    Impl& server_;
+    std::mutex peers_mu_;
+    std::map<std::string, std::unique_ptr<l1::L1Client>> peers_;
+  };
+
+  static bool EnvFlag(const char* name, bool fallback) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') return fallback;
+    return !(raw[0] == '0' || raw[0] == 'f' || raw[0] == 'F' || raw[0] == 'n' || raw[0] == 'N');
+  }
+
+  // UMBP_L1_LOWER_TIERS=1 puts this server's store under the L1 pools.
+  void AttachL1LowerTiers() {
+    if (!EnvFlag("UMBP_L1_LOWER_TIERS", false)) return;
+    l1::TierOptions options;
+    if (const char* raw = std::getenv("UMBP_L1_STAGING_BYTES"); raw != nullptr && *raw != '\0') {
+      options.staging_bytes = std::strtoull(raw, nullptr, 10);
+    }
+    if (const char* raw = std::getenv("UMBP_L1_OFFLOAD_AHEAD"); raw != nullptr && *raw != '\0') {
+      options.offload_ahead = std::min(1.0, std::max(0.0, std::strtod(raw, nullptr)));
+    }
+    options.offload_on_evict = EnvFlag("UMBP_L1_OFFLOAD_ON_EVICT", true);
+    options.load = EnvFlag("UMBP_L1_LOAD", true);
+    options.ask_peers = EnvFlag("UMBP_L1_ASK_PEERS", true);
+    l1_manager_->SetLowerStore(std::make_shared<L1Store>(*this), options);
+  }
+
+  // UMBP_L1_EXPORT_PORT: where other nodes ask this one for L1 content.
+  void StartL1ExportListener() {
+    const char* raw = std::getenv("UMBP_L1_EXPORT_PORT");
+    if (raw == nullptr || *raw == '\0') return;
+    const long port = std::strtol(raw, nullptr, 10);
+    if (port <= 0 || port > 65535) {
+      MORI_UMBP_ERROR("[StandaloneServer] UMBP_L1_EXPORT_PORT={} is not a port", raw);
+      return;
+    }
+    grpc::ServerBuilder builder;
+    ApplyGrpcLimits(&builder);
+    builder.AddListeningPort("0.0.0.0:" + std::to_string(port), grpc::InsecureServerCredentials());
+    l1_export_service_ = l1::MakeL1ExportService(l1_manager_);
+    builder.RegisterService(l1_export_service_.get());
+    l1_export_server_ = builder.BuildAndStart();
+    if (!l1_export_server_) {
+      MORI_UMBP_ERROR("[StandaloneServer] could not listen for L1 exports on port {}", port);
+      return;
+    }
+    if (backend_config_.distributed.has_value() &&
+        backend_config_.distributed->peer_service_port != 0) {
+      l1_export_port_delta_ =
+          port - static_cast<long>(backend_config_.distributed->peer_service_port);
+    }
+    MORI_UMBP_INFO("[StandaloneServer] L1 export port {}", port);
+  }
+
  public:
   // `config` must already be normalized (see NormalizeBackendConfig) — the
   // constructor hands it straight to CreateUMBPClient.
@@ -556,6 +746,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     // L1 block pools ride the same socket. Registering costs nothing: no GPU
     // context or memory exists until an engine attaches a pool.
     l1_manager_ = std::make_shared<l1::PoolManager>(l1::MakeHipMemoryApi());
+    AttachL1LowerTiers();
     l1_service_ = l1::MakeL1PoolService(l1_manager_);
     builder.RegisterService(l1_service_.get());
     mode_t old_umask = umask(0077);
@@ -568,6 +759,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
 
     chmod(grpc_path.c_str(), 0600);
+    StartL1ExportListener();
     MORI_UMBP_INFO("[StandaloneServer] listening grpc={} fd_socket={}", address_, fd_socket_path_);
     if (concurrent_backend_) {
       MORI_UMBP_INFO(
@@ -599,6 +791,13 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (server_) {
       server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
     }
+    if (l1_export_server_) {
+      l1_export_server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
+    }
+    // The pools go before the store closes: their worker still talks to it.
+    l1_export_service_.reset();
+    l1_service_.reset();
+    l1_manager_.reset();
     UnregisterAllExternalIdentities();
     {
       std::unique_lock<std::shared_mutex> lock(client_mu_);
@@ -1786,7 +1985,11 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   // until the server is destroyed.
   std::shared_ptr<l1::PoolManager> l1_manager_;
   std::unique_ptr<grpc::Service> l1_service_;
+  std::unique_ptr<grpc::Service> l1_export_service_;
   std::unique_ptr<grpc::Server> server_;
+  std::unique_ptr<grpc::Server> l1_export_server_;
+  // This node's L1 export port minus its peer service port.
+  std::optional<long> l1_export_port_delta_;
   std::atomic<bool> shutdown_{false};
 
   // Data operations acquire client_mu_ before memory_mu_ and keep the client

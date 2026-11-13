@@ -36,6 +36,9 @@ namespace mori::umbp::l1 {
 // The UMBPL1Pool gRPC service over a PoolManager. Returned as a grpc::Service
 // so a host server registers it without seeing the generated types.
 std::unique_ptr<grpc::Service> MakeL1PoolService(std::shared_ptr<PoolManager> manager);
+// The same service answering Export alone, for a port other nodes can reach:
+// a pool is attached and driven only by the engine on this host.
+std::unique_ptr<grpc::Service> MakeL1ExportService(std::shared_ptr<PoolManager> manager);
 
 // A gRPC server hosting only the L1 pool service. umbp_standalone_server hosts
 // the service itself; this is for tests and tools.
@@ -48,6 +51,8 @@ class L1Server {
   L1Server& operator=(const L1Server&) = delete;
 
   bool ok() const;
+  // For a test to attach lower tiers before any pool exists.
+  PoolManager& manager();
 
  private:
   class Impl;
@@ -73,6 +78,8 @@ class L1Client {
   Status Apply(const std::string& pool_id, const std::vector<Op>& ops, uint64_t stamp = 0);
   Status Commit(const std::string& pool_id, uint64_t committed);
   FetchResult Fetch(const std::string& pool_id, const std::vector<std::string>& keys);
+  // Node to node; see PoolManager::Export.
+  ExportResult Export(const std::string& group, const std::vector<std::string>& keys);
   Status Clear(const std::string& pool_id);
   Status Detach(const std::string& pool_id);
   Status Stats(std::vector<PoolStats>* out);

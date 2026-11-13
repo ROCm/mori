@@ -24,8 +24,10 @@
 #include <grpcpp/grpcpp.h>
 
 #include <chrono>
+#include <exception>
 #include <utility>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp_l1.grpc.pb.h"
 
 namespace mori::umbp::l1 {
@@ -41,6 +43,23 @@ template <typename Response>
 void SetStatus(const Status& status, Response* response) {
   response->set_ok(status.ok);
   if (!status.ok) response->set_error(status.error);
+}
+
+// The handlers that reach the lower store run code this file does not own. An
+// exception escaping a handler reaches the caller as "Unexpected error in RPC
+// handling" with nothing in the log, so it is caught, logged and returned.
+template <typename Response, typename Fn>
+grpc::Status Guarded(const char* what, Response* response, Fn&& fn) {
+  try {
+    fn();
+  } catch (const std::exception& e) {
+    MORI_UMBP_ERROR("[L1Pool] {} threw: {}", what, e.what());
+    SetStatus(Status::Error(std::string(what) + " failed: " + e.what()), response);
+  } catch (...) {
+    MORI_UMBP_ERROR("[L1Pool] {} threw an unknown exception", what);
+    SetStatus(Status::Error(std::string(what) + " failed"), response);
+  }
+  return grpc::Status::OK;
 }
 
 class L1PoolService final : public pb::UMBPL1Pool::Service {
@@ -81,12 +100,13 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
 
   grpc::Status Allocate(grpc::ServerContext*, const pb::AllocateRequest* request,
                         pb::AllocateResponse* response) override {
-    AllocateResult result =
-        manager_->Allocate(request->pool_id(), request->count(), request->min_count());
-    SetStatus(result.status, response);
-    for (uint32_t slot : result.slots) response->add_slots(slot);
-    for (std::string& key : result.evicted_keys) response->add_evicted_keys(std::move(key));
-    return grpc::Status::OK;
+    return Guarded("Allocate", response, [&] {
+      AllocateResult result =
+          manager_->Allocate(request->pool_id(), request->count(), request->min_count());
+      SetStatus(result.status, response);
+      for (uint32_t slot : result.slots) response->add_slots(slot);
+      for (std::string& key : result.evicted_keys) response->add_evicted_keys(std::move(key));
+    });
   }
 
   grpc::Status Apply(grpc::ServerContext*, const pb::ApplyRequest* request,
@@ -123,15 +143,29 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
 
   grpc::Status Fetch(grpc::ServerContext*, const pb::FetchRequest* request,
                      pb::FetchResponse* response) override {
-    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    FetchResult result = manager_->Fetch(request->pool_id(), keys);
-    SetStatus(result.status, response);
-    for (uint32_t slot : result.slots) response->add_slots(slot);
-    for (std::string& key : result.evicted_keys) response->add_evicted_keys(std::move(key));
-    response->set_copied_slots(result.copied_slots);
-    response->set_copied_bytes(result.copied_bytes);
-    response->set_copy_micros(result.copy_micros);
-    return grpc::Status::OK;
+    return Guarded("Fetch", response, [&] {
+      std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+      FetchResult result = manager_->Fetch(request->pool_id(), keys);
+      SetStatus(result.status, response);
+      for (uint32_t slot : result.slots) response->add_slots(slot);
+      for (std::string& key : result.evicted_keys) response->add_evicted_keys(std::move(key));
+      response->set_copied_slots(result.copied_slots);
+      response->set_copied_bytes(result.copied_bytes);
+      response->set_copy_micros(result.copy_micros);
+      response->set_loaded_slots(result.loaded_slots);
+      response->set_loaded_bytes(result.loaded_bytes);
+      response->set_load_micros(result.load_micros);
+    });
+  }
+
+  grpc::Status Export(grpc::ServerContext*, const pb::ExportRequest* request,
+                      pb::ExportResponse* response) override {
+    return Guarded("Export", response, [&] {
+      std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+      ExportResult result = manager_->Export(request->group(), keys);
+      SetStatus(result.status, response);
+      for (bool stored : result.stored) response->add_stored(stored);
+    });
   }
 
   grpc::Status Clear(grpc::ServerContext*, const pb::PoolRequest* request,
@@ -163,8 +197,31 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
       out->set_fetched_in_bytes(stats.fetched_in_bytes);
       out->set_served_out_slots(stats.served_out_slots);
       out->set_copy_micros(stats.copy_micros);
+      out->set_offloaded_slots(stats.offloaded_slots);
+      out->set_offload_micros(stats.offload_micros);
+      out->set_loaded_slots(stats.loaded_slots);
+      out->set_load_micros(stats.load_micros);
+      out->set_dropped_slots(stats.dropped_slots);
     }
     return grpc::Status::OK;
+  }
+
+ private:
+  std::shared_ptr<PoolManager> manager_;
+};
+
+class L1ExportService final : public pb::UMBPL1Pool::Service {
+ public:
+  explicit L1ExportService(std::shared_ptr<PoolManager> manager) : manager_(std::move(manager)) {}
+
+  grpc::Status Export(grpc::ServerContext*, const pb::ExportRequest* request,
+                      pb::ExportResponse* response) override {
+    return Guarded("Export", response, [&] {
+      std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+      ExportResult result = manager_->Export(request->group(), keys);
+      SetStatus(result.status, response);
+      for (bool stored : result.stored) response->add_stored(stored);
+    });
   }
 
  private:
@@ -187,6 +244,10 @@ Status FromResponse(const grpc::Status& rpc, const Response& response) {
 
 std::unique_ptr<grpc::Service> MakeL1PoolService(std::shared_ptr<PoolManager> manager) {
   return std::make_unique<L1PoolService>(std::move(manager));
+}
+
+std::unique_ptr<grpc::Service> MakeL1ExportService(std::shared_ptr<PoolManager> manager) {
+  return std::make_unique<L1ExportService>(std::move(manager));
 }
 
 class L1Server::Impl {
@@ -212,6 +273,7 @@ L1Server::L1Server(const std::string& address, std::shared_ptr<MemoryApi> api)
     : impl_(std::make_unique<Impl>(address, std::move(api))) {}
 L1Server::~L1Server() = default;
 bool L1Server::ok() const { return impl_->server_ != nullptr; }
+PoolManager& L1Server::manager() { return *impl_->manager_; }
 
 class L1Client::Impl {
  public:
@@ -335,6 +397,23 @@ FetchResult L1Client::Fetch(const std::string& pool_id, const std::vector<std::s
   result.copied_slots = response.copied_slots();
   result.copied_bytes = response.copied_bytes();
   result.copy_micros = response.copy_micros();
+  result.loaded_slots = response.loaded_slots();
+  result.loaded_bytes = response.loaded_bytes();
+  result.load_micros = response.load_micros();
+  return result;
+}
+
+ExportResult L1Client::Export(const std::string& group, const std::vector<std::string>& keys) {
+  pb::ExportRequest request;
+  request.set_group(group);
+  for (const std::string& key : keys) request.add_keys(key);
+  pb::ExportResponse response;
+  grpc::ClientContext context;
+  Impl::Bound(&context);
+  ExportResult result;
+  result.status = FromResponse(impl_->stub_->Export(&context, request, &response), response);
+  result.stored.assign(response.stored().begin(), response.stored().end());
+  result.stored.resize(keys.size(), false);
   return result;
 }
 
@@ -379,6 +458,11 @@ Status L1Client::Stats(std::vector<PoolStats>* out) {
     stats.fetched_in_bytes = in.fetched_in_bytes();
     stats.served_out_slots = in.served_out_slots();
     stats.copy_micros = in.copy_micros();
+    stats.offloaded_slots = in.offloaded_slots();
+    stats.offload_micros = in.offload_micros();
+    stats.loaded_slots = in.loaded_slots();
+    stats.load_micros = in.load_micros();
+    stats.dropped_slots = in.dropped_slots();
     out->push_back(std::move(stats));
   }
   return Status{};

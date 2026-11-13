@@ -28,6 +28,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -57,6 +58,13 @@ namespace mori::umbp::l1 {
 // releases carry a stamp, the owner reports how far its device has got
 // (Commit), and a slot is touched from outside -- read as a fetch source or
 // filled as a fetch destination -- only once it has settled.
+//
+// Lower tiers: with a LowerStore attached, L1 is the top of a hierarchy this
+// process manages end to end. A cached slot's content is copied into the store
+// before the slot is reused (offload), and a key no L1 pool of this node holds
+// is looked for in the store, and through it on other nodes, before a fetch
+// gives up (load). The store is UMBP's own: host DRAM, SSD and, with a master,
+// the other nodes' stores, moved between by the store's own tier policy.
 
 struct Region {
   uint64_t offset = 0;
@@ -87,6 +95,56 @@ class MemoryApi {
                     std::string* error) = 0;
   // Wait until every copy issued on `device` has landed.
   virtual bool Synchronize(int device, std::string* error) = 0;
+  // Host memory to stage bytes on their way to or from the lower store.
+  virtual void* AllocateHost(uint64_t bytes) = 0;
+  virtual void FreeHost(void* base) = 0;
+  // Device to host, complete on return; host to device, visible after a
+  // Synchronize of the device.
+  virtual bool CopyToHost(int device, const void* src, void* host_dst, uint64_t bytes,
+                          std::string* error) = 0;
+  virtual bool CopyFromHost(int device, void* dst, const void* host_src, uint64_t bytes,
+                            std::string* error) = 0;
+};
+
+// The tiers below L1, reached through this process's UMBP store. Values are
+// whole slots, `size` contiguous bytes of host memory each. Every call may
+// block on I/O or on another node and is made without the pool lock.
+class LowerStore {
+ public:
+  virtual ~LowerStore() = default;
+  // Host memory this store may be handed in Put and Get.
+  virtual bool RegisterHostMemory(void* base, uint64_t bytes) = 0;
+  virtual void DeregisterHostMemory(void* base) = 0;
+  // result[i]: the store can serve keys[i], from this node or another.
+  virtual std::vector<bool> Exists(const std::vector<std::string>& keys) = 0;
+  virtual std::vector<bool> Put(const std::vector<std::string>& keys,
+                                const std::vector<const void*>& srcs, uint64_t size) = 0;
+  virtual std::vector<bool> Get(const std::vector<std::string>& keys,
+                                const std::vector<void*>& dsts, uint64_t size) = 0;
+  // Make what Put stored visible to the other nodes now.
+  virtual void Publish() = 0;
+  // The L1 directory: tell the other nodes which keys this node holds in HBM
+  // only, so they know to ask (RequestFromPeers).
+  virtual void Advertise(const std::vector<std::string>& added,
+                         const std::vector<std::string>& removed) = 0;
+  // Ask the nodes that advertise `keys` to copy them into the store.
+  // result[i]: keys[i] can now be served by Get.
+  virtual std::vector<bool> RequestFromPeers(const std::vector<std::string>& keys) = 0;
+};
+
+struct TierOptions {
+  // Host staging for offload and load; a batch moves at most this many bytes.
+  uint64_t staging_bytes = 1ull << 30;
+  // Copy a cached slot into the store before the slot is reused.
+  bool offload_on_evict = true;
+  // Keep this fraction of every pool's slots either vacant or already
+  // offloaded, by copying the coldest cached slots ahead of need. 0 offloads
+  // only at eviction; 1 offloads everything once it has settled.
+  double offload_ahead = 0.0;
+  // Look in the store for keys no pool of this node holds.
+  bool load = true;
+  // Ask other nodes' L1 for keys neither this node nor the store holds.
+  bool ask_peers = true;
 };
 
 std::shared_ptr<MemoryApi> MakeHipMemoryApi();
@@ -129,9 +187,17 @@ struct FetchResult {
   Status status;
   std::vector<uint32_t> slots;
   std::vector<std::string> evicted_keys;
-  uint32_t copied_slots = 0;
+  uint32_t copied_slots = 0;  // from another pool of this node
   uint64_t copied_bytes = 0;
   uint64_t copy_micros = 0;
+  uint32_t loaded_slots = 0;  // from the lower store
+  uint64_t loaded_bytes = 0;
+  uint64_t load_micros = 0;
+};
+
+struct ExportResult {
+  Status status;
+  std::vector<bool> stored;  // per key: now in the lower store
 };
 
 struct PoolStats {
@@ -148,12 +214,24 @@ struct PoolStats {
   uint64_t fetched_in_bytes = 0;
   uint64_t served_out_slots = 0;
   uint64_t copy_micros = 0;
+  uint64_t offloaded_slots = 0;  // copied into the lower store
+  uint64_t offload_micros = 0;
+  uint64_t loaded_slots = 0;  // filled from the lower store
+  uint64_t load_micros = 0;
+  uint64_t dropped_slots = 0;  // evicted without a copy below
 };
 
 class PoolManager {
  public:
   explicit PoolManager(std::shared_ptr<MemoryApi> api);
   ~PoolManager();
+
+  // Attach the tiers below L1. Call once, before any pool is attached.
+  void SetLowerStore(std::shared_ptr<LowerStore> store, const TierOptions& options);
+  // The name a slot's content has in the lower store.
+  static std::string StoreKey(const std::string& group, const std::string& key);
+  // The inverse; false for a name StoreKey did not produce.
+  static bool ParseStoreKey(const std::string& name, std::string* group, std::string* key);
 
   PoolManager(const PoolManager&) = delete;
   PoolManager& operator=(const PoolManager&) = delete;
@@ -178,10 +256,15 @@ class PoolManager {
   // Every write the owner's device was issued before `committed` has landed.
   Status Commit(const std::string& pool_id, uint64_t committed);
   // For each key in order: already in this pool -> its slot; held, settled,
-  // by another pool of the group -> copied into a settled free slot here,
-  // which becomes cached under that key. Stops at the first key no settled
-  // slot holds or no settled slot is free for.
+  // by another pool of the group -> copied into a settled free slot here; in
+  // the lower store (on this node or another, or in another node's L1 once
+  // that node has been asked) -> loaded into a settled free slot here. A
+  // filled slot becomes cached under that key. Stops at the first key nothing
+  // holds or no settled slot is free for.
   FetchResult Fetch(const std::string& pool_id, const std::vector<std::string>& keys);
+  // Copy what this node's pools of `group` hold of `keys` into the lower
+  // store, for another node to read. The slots stay as they are.
+  ExportResult Export(const std::string& group, const std::vector<std::string>& keys);
   Status Clear(const std::string& pool_id);
   Status Detach(const std::string& pool_id);
   std::vector<PoolStats> Stats() const;
@@ -199,6 +282,9 @@ class PoolManager {
     uint64_t written = 0;
     uint64_t released = 0;
     bool has_key = false;
+    // The lower store was given this content (or it came from there). A hint:
+    // the store may have dropped it since.
+    bool in_store = false;
     std::string key;
     std::list<uint32_t>::iterator lru_it;
   };
@@ -224,6 +310,12 @@ class PoolManager {
     uint64_t fetched_in_bytes = 0;
     uint64_t served_out_slots = 0;
     uint64_t copy_micros = 0;
+    uint64_t offloaded_slots = 0;
+    uint64_t offload_micros = 0;
+    uint64_t loaded_slots = 0;
+    uint64_t load_micros = 0;
+    uint64_t dropped_slots = 0;
+    uint64_t slot_bytes = 0;  // sum of the regions' unit sizes
   };
 
   struct Holder {
@@ -238,10 +330,16 @@ class PoolManager {
   };
 
   struct CopyStep {
-    Pool* src = nullptr;
+    Pool* src = nullptr;  // null: the content comes from the lower store
     uint32_t src_slot = 0;
     uint32_t dst_slot = 0;
     size_t key_index = 0;
+  };
+
+  // A slot whose content should reach the lower store.
+  struct Victim {
+    uint32_t slot = 0;
+    std::string key;
   };
 
   Pool* FindLocked(const std::string& pool_id);
@@ -251,8 +349,19 @@ class PoolManager {
   // A free slot for new content, or false. Appends the key it destroyed; with
   // `evicted` null only a vacant slot is taken. `settled_only` is for a taker
   // other than the owner, which must not write where the owner still may.
+  // When the destroyed content should be offloaded first it is appended to
+  // `victims`, and the caller copies it out before anything writes the slot.
   bool TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::string>* evicted,
-                      bool settled_only = false);
+                      bool settled_only = false, std::vector<Victim>* victims = nullptr);
+  // Copy slots into the lower store / fill slots from it. Called without the
+  // pool lock, on slots nothing else may change meanwhile. result[i] per slot.
+  // `evicting`: the slots are being reused, so a failed copy loses content.
+  std::vector<bool> OffloadSlots(Pool* pool, const std::vector<Victim>& slots, bool evicting);
+  std::vector<bool> LoadSlots(Pool* pool, const std::vector<Victim>& slots, uint64_t* bytes);
+  void QueueAdvertiseLocked(const std::string& group, const std::string& key, bool added);
+  void TierWorker();
+  // One round of offloading ahead of need. True when something was copied.
+  bool OffloadAhead();
   static bool Readable(const Pool& pool, const Slot& slot) {
     return slot.written <= pool.committed;
   }
@@ -268,6 +377,19 @@ class PoolManager {
   std::unordered_map<std::string, std::unique_ptr<Pool>> pools_;
   std::unordered_map<std::string, Group> groups_;
   std::unordered_set<std::string> attaching_;  // pool ids being allocated outside the lock
+
+  std::shared_ptr<LowerStore> store_;
+  TierOptions tier_;
+  // One staging arena; tier transfers take turns on it.
+  std::mutex staging_mutex_;
+  void* staging_ = nullptr;
+  // Directory changes not yet sent: store key -> added (true) or removed.
+  std::unordered_map<std::string, bool> advertise_;
+  // Offloaded copies the other nodes have not been told of yet.
+  bool publish_pending_ = false;
+  std::condition_variable work_;
+  std::thread worker_;
+  bool stopping_ = false;
 };
 
 }  // namespace mori::umbp::l1

@@ -171,11 +171,28 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
               result = client.Fetch(pool_id, keys);
             }
             Check(result.status);
-            return py::make_tuple(result.slots, BytesList(result.evicted_keys), result.copied_slots,
-                                  result.copied_bytes, result.copy_micros);
+            // Totals over both ways a slot can be filled; `stats` tells them apart.
+            return py::make_tuple(result.slots, BytesList(result.evicted_keys),
+                                  result.copied_slots + result.loaded_slots,
+                                  result.copied_bytes + result.loaded_bytes,
+                                  result.copy_micros + result.load_micros);
           },
           py::arg("pool_id"), py::arg("keys"),
-          "Returns (slots, evicted_keys, copied_slots, copied_bytes, copy_micros).")
+          "Returns (slots, evicted_keys, filled_slots, filled_bytes, micros): slots filled from "
+          "another pool of the node or from the tiers below L1.")
+      .def(
+          "export",
+          [](L1Client& client, const std::string& group, const std::vector<std::string>& keys) {
+            ExportResult result;
+            {
+              py::gil_scoped_release release;
+              result = client.Export(group, keys);
+            }
+            Check(result.status);
+            return result.stored;
+          },
+          py::arg("group"), py::arg("keys"),
+          "Copy what the node's pools of `group` hold of `keys` into its store.")
       .def(
           "clear",
           [](L1Client& client, const std::string& pool_id) {
@@ -222,6 +239,11 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           d["fetched_in_bytes"] = stats.fetched_in_bytes;
           d["served_out_slots"] = stats.served_out_slots;
           d["copy_micros"] = stats.copy_micros;
+          d["offloaded_slots"] = stats.offloaded_slots;
+          d["offload_micros"] = stats.offload_micros;
+          d["loaded_slots"] = stats.loaded_slots;
+          d["load_micros"] = stats.load_micros;
+          d["dropped_slots"] = stats.dropped_slots;
           out.append(std::move(d));
         }
         return out;

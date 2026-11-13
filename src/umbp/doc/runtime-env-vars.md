@@ -105,6 +105,26 @@ that has loaded `libmori_umbp_pybinds.so`, i.e. imported `mori.umbp`).
 | `UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA` | `1` | bool | Lay the ranged scratch arenas out by NUMA node: each arena's bytes are split evenly over the nodes that have GPUs, each part bound to its node and registered on its own, and a remote ranged call stages through the part on its caller buffer's node (a GPU's node for device memory). Its RDMA leg then runs on that node's NICs and the copy into the GPU stays on its socket; total memory is unchanged. A node whose part cannot be allocated on it falls back to one arena per direction. `0` keeps one arena per direction. Standalone server binary only. |
 | `UMBP_DISTRIBUTED_MEDIUM` | `DRAM` | enum | The one medium this node serves when no backend policy is given: `DRAM`, `HBM` or `SSD`. Selecting `SSD` is the whole opt-in for a storage node — there is no separate pure-SSD flag. An unknown value is rejected at startup rather than silently defaulting. Ignored once `UMBP_BACKEND_POLICY` names a policy, which describes the backends directly. Standalone server binary only; the SGLang path uses the pybind `medium` field. |
 
+## L1 block pools (standalone server)
+
+Read by `umbp_standalone_server`, which hosts the L1 (HBM) block pools an
+engine attaches (`src/umbp/l1/`). With `UMBP_L1_LOWER_TIERS=1` the server's own
+store sits under those pools: a block evicted from L1 is copied into the store
+first, and a block no L1 pool of the node holds is looked for in the store —
+and through the master on other nodes — before a fetch reports a miss. Which of
+DRAM and SSD holds it, and when it moves between them, is the store's backend
+policy (`UMBP_BACKEND_POLICY`).
+
+| Env var | Default | Unit | Description |
+|---|---|---|---|
+| `UMBP_L1_LOWER_TIERS` | `0` | bool | Put this server's store under the L1 pools. Off, the pools are L1 only and an evicted block is gone. |
+| `UMBP_L1_STAGING_BYTES` | 1 GiB | bytes | Page-locked host memory blocks pass through between a GPU and the store; one offload or load round moves at most this much. It is registered with the store, so on a NIC that limits a region's size (see `UMBP_DRAM_MAX_MR_BYTES`) keep it under that limit. |
+| `UMBP_L1_OFFLOAD_ON_EVICT` | `1` | bool | Copy a cached block into the store before its slot is reused. `0` drops it. |
+| `UMBP_L1_OFFLOAD_AHEAD` | `0` | fraction | Keep this fraction of every pool either vacant or already copied into the store, by offloading the coldest cached blocks in the background, so an eviction does not wait for the copy. `1` offloads every block once the engine's GPU has finished writing it. |
+| `UMBP_L1_LOAD` | `1` | bool | Look in the store for blocks no L1 pool of this node holds. |
+| `UMBP_L1_ASK_PEERS` | `1` | bool | For blocks neither this node nor the store holds, ask the nodes the master lists as holding them in HBM to copy them into their store. Needs a master. |
+| `UMBP_L1_EXPORT_PORT` | unset | port | TCP port where other nodes ask this one for L1 blocks. Every node must keep the same distance between this port and `UMBP_PEER_SERVICE_PORT`: a node finds another's export port from its peer address. Unset, this node's L1 is not readable from other nodes. |
+
 ## SPDK proxy
 
 Read by the **spdk_proxy daemon** (for intervals it emits) and by the

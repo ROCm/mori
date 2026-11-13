@@ -37,6 +37,9 @@ service UMBPL1Pool {
   // Release the pool and its memory.
   rpc Detach(PoolRequest) returns (StatusResponse);
   rpc Stats(StatsRequest) returns (StatsResponse);
+  // Node to node: copy what this node's pools of a group hold of these keys
+  // into this node's store, where the asking node can read them.
+  rpc Export(ExportRequest) returns (ExportResponse);
 }
 
 message StatusResponse {
@@ -146,9 +149,26 @@ message FetchResponse {
   repeated uint32 slots = 3 [packed = true];
   // Keys of this pool destroyed to make room.
   repeated bytes evicted_keys = 4;
+  // Filled from another pool of this node.
   uint32 copied_slots = 5;
   uint64 copied_bytes = 6;
   uint64 copy_micros = 7;
+  // Filled from the tiers below L1 (this node's store or another node).
+  uint32 loaded_slots = 8;
+  uint64 loaded_bytes = 9;
+  uint64 load_micros = 10;
+}
+
+message ExportRequest {
+  string group = 1;
+  repeated bytes keys = 2;
+}
+
+message ExportResponse {
+  bool ok = 1;
+  string error = 2;
+  // stored[i]: keys[i] is now in this node's store.
+  repeated bool stored = 3 [packed = true];
 }
 
 message StatsRequest {}
@@ -167,6 +187,11 @@ message PoolStats {
   uint64 fetched_in_bytes = 11;
   uint64 served_out_slots = 12;
   uint64 copy_micros = 13;
+  uint64 offloaded_slots = 14;
+  uint64 offload_micros = 15;
+  uint64 loaded_slots = 16;
+  uint64 load_micros = 17;
+  uint64 dropped_slots = 18;
 }
 
 message StatsResponse {
