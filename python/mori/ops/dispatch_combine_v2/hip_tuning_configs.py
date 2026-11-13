@@ -512,8 +512,9 @@ _LL128_TABLE: dict = {
 
 # Tuning profiles. "peak" is the tables above. "capped" keeps every grid at or under
 # _CAPPED_BLOCKS, for an op that shares the GPU with the expert GEMMs: a capped lookup takes
-# the shape's _CAPPED_* rows, else its peak rows with each wider bucket replaced by the
-# default (64x16 dispatch, 64x8 combine). The _CAPPED_* tables hold only the rows that differ.
+# the shape's _CAPPED_* rows, else its peak rows with each wider bucket on 64 blocks of the
+# larger of its warp count and the default's (16 dispatch, 8 combine). The _CAPPED_* tables
+# hold only the rows that differ.
 PROFILES = ("peak", "capped")
 _CAPPED_BLOCKS = 64
 
@@ -568,9 +569,10 @@ def _warn_no_capped_rows(phase, shape, key) -> None:
     )
 
 
-def _capped(phase, own, peak, shape, key, default):
+def _capped(phase, own, peak, shape, key, default_warp):
     """A capped phase: its own rows, else the peak rows with every bucket wider than
-    _CAPPED_BLOCKS replaced by ``default`` (block, warp)."""
+    _CAPPED_BLOCKS put on _CAPPED_BLOCKS blocks of max(its warps, ``default_warp``).
+    Keeping the warp count keeps the bucket's LDS, so the geometry stays launchable."""
     if own is not None:
         return own
     if peak is None or all(row[1] <= _CAPPED_BLOCKS for row in peak):
@@ -578,7 +580,10 @@ def _capped(phase, own, peak, shape, key, default):
     _warn_no_capped_rows(phase, shape, key)
     rows = []
     for edge, block, warp in peak:
-        geom = (block, warp) if block <= _CAPPED_BLOCKS else default
+        if block <= _CAPPED_BLOCKS:
+            geom = (block, warp)
+        else:
+            geom = (_CAPPED_BLOCKS, max(warp, default_warp))
         if rows and rows[-1][1:] == geom:
             rows[-1] = (edge, *geom)
         else:
@@ -771,6 +776,11 @@ def describe_schedule(cfg, schedule) -> str:
         f"HIP V2 schedule: {_gpu.arch_name()}/{_gpu.detect_model()} "
         f"ep{cfg.world_size} expert{num_experts} top{cfg.num_experts_per_token} "
         f"hidden{cfg.hidden_dim} dispatch={cfg.dispatch_dtype} combine={cfg.combine_dtype}"
+        + (
+            f" profile={cfg.tuning_profile}"
+            if getattr(cfg, "tuning_profile", None)
+            else ""
+        )
     ]
     if cfg.is_internode:
         families = [_V2_KERNEL_TYPES[f] for f in internode_kernel_families(cfg)]
@@ -881,6 +891,8 @@ def lookup(
     capped_disp = _first_bucket(_CAPPED_DISPATCH_TABLE, devs, *shape)
     if capped_disp is not None:
         capped_disp = capped_disp.get(wire) or capped_disp.get(None)
+    # Combine: the quant type's push rows, else the gather rows; a capped row comes from
+    # the same table as the peak row it stands for, or from its own push table.
     comb = capped_comb = None
     if quant_type in _COMBINE_PUSH_TABLE:
         comb = _first_bucket(_COMBINE_PUSH_TABLE[quant_type], devs, *shape)
@@ -889,7 +901,8 @@ def lookup(
         )
     if comb is None:
         comb = _first_bucket(_COMBINE_TABLE, devs, *shape)
-        capped_comb = _first_bucket(_CAPPED_COMBINE_TABLE, devs, *shape)
+        if capped_comb is None:
+            capped_comb = _first_bucket(_CAPPED_COMBINE_TABLE, devs, *shape)
     if dispatch_dtype is None:
         dispatch_dtype, combine_dtype = _wire_dtypes(wire)
     if dispatch_dtype is not None and quant_type == "none":
@@ -905,12 +918,7 @@ def lookup(
         comb = table_comb or comb
     if profile == "capped":
         disp = _capped(
-            "dispatch",
-            capped_disp,
-            disp,
-            shape,
-            wire,
-            (base["dispatch_block_num"], base["warp_num_per_block"]),
+            "dispatch", capped_disp, disp, shape, wire, base["warp_num_per_block"]
         )
         comb = _capped(
             "combine",
@@ -918,7 +926,7 @@ def lookup(
             comb,
             shape,
             quant_type,
-            (base["combine_block_num"], base["combine_warp_num_per_block"]),
+            base["combine_warp_num_per_block"],
         )
     if disp is None and comb is None:
         return _gpu.fit_blocks_to_cus(base)

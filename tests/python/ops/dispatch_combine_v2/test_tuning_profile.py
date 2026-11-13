@@ -123,6 +123,38 @@ def test_capped_without_rows_keeps_the_buckets_that_fit_and_warns(gfx1250, caplo
     assert "no capped dispatch rows for EP4 hidden 7168 topk 8" in caplog.text
 
 
+def test_capped_keeps_a_fitting_bucket_after_a_wide_one(gfx1250, monkeypatch):
+    shape = (4, 4096, 8, None)
+    peak = ((512, 64, 8), (4096, 256, 8), (8192, 64, 16), (None, 192, 32))
+    monkeypatch.setitem(tc._DISPATCH_TABLE, "gfx1250", {shape: {None: peak}})
+    t = tc.lookup(4, 4096, 8, profile="capped")
+    assert tuple(row[:3] for row in t["schedule"]) == (
+        (512, 64, 8),
+        (8192, 64, 16),
+        (None, 64, 32),
+    )
+
+
+def test_capped_push_buckets_keep_their_warps(gfx1250):
+    kw = dict(dtype="fp4", quant_type="fp4_blockwise")
+    peak = tc.lookup(4, 7168, 6, profile="peak", **kw)["schedule"]
+    capped = tc.lookup(4, 7168, 6, profile="capped", **kw)["schedule"]
+    wide = [(row[0], row[4]) for row in peak if row[3] > tc._CAPPED_BLOCKS]
+    assert wide
+    for ct, warps in wide:
+        assert tc.pick_bucket(capped, ct)[3:] == (tc._CAPPED_BLOCKS, warps)
+
+
+def test_capped_push_row_without_a_peak_push_row(gfx1250, monkeypatch):
+    shape = (4, 4096, 8, None)
+    rows = ((None, 64, 24),)
+    monkeypatch.setitem(
+        tc._CAPPED_COMBINE_PUSH_TABLE, "fp8_blockwise", {"gfx1250": {shape: rows}}
+    )
+    t = tc.lookup(4, 4096, 8, quant_type="fp8_blockwise", profile="capped")
+    assert {row[3:] for row in t["schedule"]} == {(64, 24)}
+
+
 def test_profile_precedence(monkeypatch):
     monkeypatch.delenv("MORI_EP_TUNING_PROFILE", raising=False)
     assert tc.tuning_profile() == "peak"
@@ -173,3 +205,17 @@ def test_op_is_capped_on_gfx1250_unless_told(gfx1250, monkeypatch):
     monkeypatch.setenv("MORI_EP_TUNING_PROFILE", "peak")
     assert config().schedule == peak
     assert config(tuning_profile="capped").schedule == capped
+
+
+def test_asyncll_stays_outside_the_profiles(gfx1250, caplog):
+    tc._warn_no_capped_rows.cache_clear()
+    cfg = config(
+        hidden_dim=7168, num_experts_per_rank=64, num_experts_per_token=8, async_ll=True
+    )
+    assert cfg.tuning_profile is None
+    assert "no capped" not in caplog.text
+
+
+def test_a_bad_profile_is_refused_even_with_pinned_geometry(gfx1250):
+    with pytest.raises(ValueError, match="tuning_profile"):
+        config(tuning_profile="lean", dispatch_block_num=64)

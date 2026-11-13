@@ -241,15 +241,18 @@ An intra auto schedule on the hip backend comes from one of two profiles:
   fastest.
 - `capped`: no grid wider than 64 blocks, which leaves CUs to expert GEMMs sharing
   the GPU. A shape takes its `_CAPPED_*` rows, else its peak rows with every bucket
-  wider than 64 blocks replaced by the 64x16 dispatch / 64x8 combine default (with
-  a warning that the shape has no capped rows).
+  wider than 64 blocks put on 64 blocks of the larger of its warp count and the
+  default's (16 dispatch, 8 combine), with a warning that the shape has no capped
+  rows.
 
 The op takes `EpDispatchCombineConfig.tuning_profile`, else
 `MORI_EP_TUNING_PROFILE`, else `capped` on gfx125x and `peak` elsewhere, and
-stores the profile it resolved in that field. `hip_tuning_configs.lookup()` takes
-a `profile` argument, else `MORI_EP_TUNING_PROFILE`, else `peak`: a caller that
-reads the tables directly, as aiter's MegaMoE does, keeps the peak rows. LL128
-and bf16 push rows are within 64 blocks in both profiles.
+stores the profile it resolved in that field; the schedule dump names it.
+`hip_tuning_configs.lookup()` takes a `profile` argument, else
+`MORI_EP_TUNING_PROFILE`, else `peak`: a caller that reads the tables directly,
+as aiter's MegaMoE does, keeps the peak rows. LL128 and bf16 push rows are within
+64 blocks in both profiles. AsyncLL sizes its grids from the CU count and is
+outside both profiles.
 
 Intra B/W participate in compilation. Inter B/R/W are plan launch settings:
 different geometries can share a compiled module while retaining separate plans
