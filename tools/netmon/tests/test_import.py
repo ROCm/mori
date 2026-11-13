@@ -113,6 +113,53 @@ class ImporterTests(unittest.TestCase):
         )
         self.assertTrue(np.all(np.diff(ts) > 0))
 
+    def test_ethtool_port_statistics_only_without_ipc(self):
+        # NIC n0 has ipc (its ethtool is not imported), n1 has none (ethtool port stats are)
+        n = 400
+        t0, rtt, real, err, _ = steady(n, interval=2 * MS)
+        rd = np.stack([np.arange(n) * 100, np.arange(n) * 50], axis=1).astype(np.uint64)
+        e0, ertt, ereal, eerr, _ = steady(4, interval=1000 * MS)
+        eth = np.stack([np.array([1, 2, 3, 4]) * k for k in (5, 7, 1, 1)], axis=1)
+        eth_names = ["octets_tx_ok", "octets_rx_ok", "frames_tx_ok", "tx_bytes"]
+        streams = []
+        for nd in ("n0", "n1"):
+            streams.append({"netdev": nd, "source": "rdma", "names": [R.RDMA_TX, R.RDMA_RX],
+                            "t0": t0, "rtt": rtt, "real": real, "err": err, "values": rd,
+                            "interval": 2 * MS})  # fmt: skip
+            streams.append({"netdev": nd, "source": "ethtool", "names": eth_names,
+                            "t0": e0, "rtt": ertt, "real": ereal, "err": eerr,
+                            "values": eth.astype(np.uint64), "interval": 1000 * MS})  # fmt: skip
+        streams.append({"netdev": "n0", "source": "ipc", "names": ["octets_tx_ok"],
+                        "t0": t0, "rtt": rtt, "real": real, "err": err,
+                        "values": rd[:, :1], "interval": 2 * MS})  # fmt: skip
+        run = write_run(self.tmp + "/a", streams, host="h")
+        t0_, t1_ = I.Target(run, "n0", "e"), I.Target(run, "n1", "e")
+        self.assertEqual(
+            sorted(s.source for s in t0_.imported_streams()), ["ipc", "rdma"]
+        )
+        self.assertEqual(
+            sorted(s.source for s in t1_.imported_streams()), ["ethtool", "rdma"]
+        )
+        self.assertEqual((t0_.port_stats(), t1_.port_stats()), ("ipc", "ethtool"))
+        es = run.stream("n1", "ethtool")
+        self.assertEqual(
+            I.pick_counters(es, "all"), ["octets_tx_ok", "octets_rx_ok", "frames_tx_ok"]
+        )
+        _, _, infos, _, min_step = I.plan_summary(
+            [t0_, t1_], "key", I.run_window([run])
+        )
+        self.assertEqual(
+            {i["netdev"]: i["port_stats"] for i in infos},
+            {"n0": "ipc", "n1": "ethtool"},
+        )
+        self.assertEqual(
+            min_step, 6
+        )  # ethtool's ~1 s / 5 s intervals never set the step
+        labs = [lab for lab, _, _ in I.iter_series([t1_], "key")]
+        self.assertTrue(any(lab["source"] == "ethtool" for lab in labs))
+        t1_.legacy_no_ethtool = True  # verify of an older import
+        self.assertEqual([s.source for s in t1_.imported_streams()], ["rdma"])
+
     def test_key_counters_are_imported_even_when_zero(self):
         run = rdma_run(self.tmp + "/a", tx_rate=0.0)
         s = run.stream("n0", "rdma")

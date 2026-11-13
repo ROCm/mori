@@ -464,7 +464,7 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
         e.ibdev = n.ibdev;
         e.pci = n.pci;
       }
-      if (e.source != "rdma" && e.source != "ipc") e.names.clear();
+      if (e.source != "rdma" && e.source != "ipc" && e.source != "ethtool") e.names.clear();
       es.push_back(e);
     }
     std::string err;

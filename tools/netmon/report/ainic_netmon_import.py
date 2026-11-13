@@ -76,6 +76,9 @@ KEY_COUNTERS = {
         "tx_rdma_ack_timeout",
     ],
     "ipc": ["octets_tx_ok", "octets_rx_ok", "frames_tx_ok", "frames_rx_ok"],
+    # Only for NICs without an ipc stream (Target.imported_streams), always exactly these
+    # (they also define the refresh rule, so no optional / "all" additions).
+    "ethtool": R.ETHTOOL_PORT_COUNTERS,
 }
 # Imported when they change during the recording (default mode).
 OPTIONAL_PATTERN = re.compile(
@@ -87,6 +90,10 @@ SUMMARY_COUNTERS = {
     "ipc": ["octets_tx_ok", "octets_rx_ok"],
 }
 METRIC_PREFIX = "netmon_"
+# Metadata format of this importer, on netmon_import_info. Imports without it come from an
+# earlier importer (before the NIC display names / ethtool port statistics), which verify
+# accepts in their older format; imports with it must match the current format exactly.
+IMPORT_FORMAT = "3"
 # Start of every VM search over "all" data. Not 0: VM treats start=0 as unset and the
 # label / series APIs then only look at the last day (measured on v1.156.0; some other
 # small epoch values also return nothing), so an older experiment would look absent.
@@ -293,6 +300,30 @@ class Target:
     def meta_labels(self, **extra):
         return dict(self.labels(**extra), **self.nic_labels())
 
+    def imported_streams(self):
+        """This NIC's rdma and ipc streams, and its ethtool port statistics when it has no
+        ipc stream (no firmware IPC, e.g. a VM: NETMON_CUSTOMER_FIXES_DESIGN §2)."""
+        mine = [s for s in self.run.streams if s.netdev == self.netdev]
+        out = [s for s in mine if s.source in ("rdma", "ipc")]
+        # verify on an experiment imported before the ethtool fallback existed
+        if getattr(self, "legacy_no_ethtool", False):
+            return out
+        if not any(s.source == "ipc" for s in out):
+            out += [
+                s
+                for s in mine
+                if s.source == "ethtool"
+                and any(c in s.names for c in R.ETHTOOL_PORT_COUNTERS)
+            ]
+        return out
+
+    def port_stats(self):
+        """Where the port statistics (wire bytes, PFC) come from: ipc, ethtool or none."""
+        sources = {s.source for s in self.imported_streams()}
+        return (
+            "ipc" if "ipc" in sources else "ethtool" if "ethtool" in sources else "none"
+        )
+
 
 def display_labels(host, netdev, ibdev, pci):
     """The dashboards' NIC names (the live exporter builds the same: exporter.cc
@@ -316,6 +347,8 @@ def pick_counters(stream, mode):
     names = stream.names
     key = [c for c in KEY_COUNTERS.get(stream.source, []) if c in names]
     out = list(key)
+    if stream.source == "ethtool":
+        return out
     for c in names:
         if c in out or not len(stream.rec):
             continue
@@ -545,9 +578,7 @@ def iter_series(targets, counters_mode):
     """Every series to import, generated one stream at a time (a long recording has
     hundreds of millions of points; only one stream's arrays are alive at once)."""
     for t in targets:
-        for s in t.run.streams:
-            if s.netdev != t.netdev or s.source not in ("rdma", "ipc"):
-                continue
+        for s in t.imported_streams():
             for counter, r in rate_objects(s, counters_mode):
                 yield from interval_series(t, s, counter, r)
 
@@ -560,10 +591,9 @@ def plan_summary(targets, counters_mode, window):
     min_step = 0
     for t in targets:
         st = t.run.meta.get("run_stats") or {}
-        for s in t.run.streams:
-            if s.netdev != t.netdev or s.source not in ("rdma", "ipc"):
-                continue
-            q = st.get(s.file, {})
+        for s in t.imported_streams():
+            # recording quality: the 2 ms sources only (as before)
+            q = st.get(s.file, {}) if s.source != "ethtool" else {}
             for k in ("samples", "missed_slots", "dropped", "errors"):
                 if k in q:
                     quality.append(
@@ -577,7 +607,9 @@ def plan_summary(targets, counters_mode, window):
             for counter, r in rate_objects(s, counters_mode):
                 for lab, ts, _ in interval_series(t, s, counter, r):
                     want[label_key(lab)] = (len(ts), int(ts[0]), int(ts[-1]))
-                if r.valid.any():
+                if (
+                    r.valid.any() and s.source != "ethtool"
+                ):  # ~5 s refreshes: not a step
                     min_step = max(
                         min_step, int(math.ceil(R.LOWRES_FACTOR * r.base_ns / 1e6))
                     )
@@ -599,6 +631,7 @@ def plan_summary(targets, counters_mode, window):
             t.meta_labels(
                 status=t.run.status,
                 speed_mbps=str(t.run.speed.get(t.netdev, -1)),
+                port_stats=t.port_stats(),
             )
         )
     return want, summaries, infos, quality, max(min_step, 1)
@@ -684,6 +717,7 @@ def cmd_import(args):
                 "experiment": exp,
                 "host": r.host,
                 "state": "complete",
+                "format": IMPORT_FORMAT,
                 "anchor_ms": str(anchor),
                 "min_step_ms": str(min_step),
             },

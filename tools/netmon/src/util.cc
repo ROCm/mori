@@ -154,6 +154,17 @@ std::string LexicalAbsPath(const std::string& path, const std::string& cwd) {
   return out.empty() ? "/" : out;
 }
 
+bool InContainer(const std::string& root) {
+  if (access((root + "/.dockerenv").c_str(), F_OK) == 0) return true;
+  if (access((root + "/run/.containerenv").c_str(), F_OK) == 0) return true;  // Podman
+  std::string cg;
+  if (!ReadTextFile(root + "/proc/1/cgroup", &cg)) return false;
+  for (const char* m : {"docker", "containerd", "kubepods", "libpod"}) {
+    if (cg.find(m) != std::string::npos) return true;
+  }
+  return false;
+}
+
 std::string ParentDirName(const std::string& path, const std::string& cwd) {
   const std::string abs = LexicalAbsPath(path, cwd);
   const std::string parent = abs.substr(0, abs.rfind('/'));

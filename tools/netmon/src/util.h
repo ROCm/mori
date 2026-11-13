@@ -65,5 +65,8 @@ std::string LexicalAbsPath(const std::string& path, const std::string& cwd);
 // Name of the parent directory of `path` (the importer's default experiment name):
 // os.path.basename(os.path.dirname(os.path.abspath(path))).
 std::string ParentDirName(const std::string& path, const std::string& cwd);
+// Whether this process runs in a container (Docker, containerd, Kubernetes, Podman), judged
+// from the usual markers under `root` ("" in production; tests point it at a fake tree).
+bool InContainer(const std::string& root = "");
 
 }  // namespace netmon

@@ -73,6 +73,20 @@ LOWRES_FACTOR = 3.0
 PEAK_WINDOW_NS = 10_000_000
 
 RDMA_TX, RDMA_RX = "tx_rdma_ucast_bytes", "rx_rdma_ucast_bytes"
+# ethtool port statistics used where a NIC has no firmware IPC (e.g. a VM with a VF). The
+# firmware refreshes them only about every 5 s, so their rates are taken between refreshes:
+# a sample is a refresh when any of these changed since the previous sample (the same set
+# on the live side, exporter.cc kEthtoolPortCounters). NETMON_CUSTOMER_FIXES_DESIGN §2.
+ETHTOOL_PORT_COUNTERS = [
+    "octets_tx_ok",
+    "octets_rx_ok",
+    "frames_tx_ok",
+    "frames_rx_ok",
+    "frames_tx_pripause",
+    "frames_rx_pripause",
+    "frames_tx_pause",
+    "frames_rx_pause",
+]
 IPC_TX, IPC_RX = "octets_tx_ok", "octets_rx_ok"
 CONGESTION = [
     "rx_rdma_cnp_pkts",
@@ -117,6 +131,17 @@ class Stream:
         if self._times is None:
             self._times = sample_times(self.rec, self.f)
         return self._times[:3]
+
+    def refresh_mask(self):
+        """ethtool: samples at which the firmware's port statistics were refreshed (any of
+        ETHTOOL_PORT_COUNTERS changed since the previous sample). The first sample is never
+        one: its values may be from before the recording."""
+        cols = [self.col(c) for c in ETHTOOL_PORT_COUNTERS if c in self.names]
+        n = len(self.rec)
+        m = np.zeros(n, dtype=bool)
+        for c in cols:
+            m[1:] |= np.asarray(c[1:]) != np.asarray(c[:-1])
+        return m
 
     def segments(self):
         """Wall-clock segment id per sample (-1: alignment uncertain)."""
@@ -252,6 +277,10 @@ class Rates:
             if forced is not None:
                 dec = dec + forced
             keep = ~slow  # imprecise (slow) samples are skipped, see module doc
+            if stream.source == "ethtool":
+                # Only refreshes are readings; the first one is the base, so the first rate
+                # starts there (the values before it may predate the recording).
+                keep = keep & stream.refresh_mask()
             t, wall, seg, v, dec = t[keep], wall[keep], seg[keep], v[keep], dec[keep]
             resets_between = np.diff(dec) > 0
         n = 0 if v is None else len(v)
@@ -287,6 +316,7 @@ class Rates:
         self.lowres = (
             self.valid & (dt > LOWRES_FACTOR * base)
             if base > 0
+            and stream.source != "ethtool"  # refresh intervals: all "normal"
             else np.zeros_like(valid)
         )
         # Why an interval is not usable (for the importer's gap series): a counter reset /

@@ -19,6 +19,10 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cstdio>
 #include <cstring>
 
 #include "cli.h"
@@ -136,4 +140,36 @@ TEST(DefaultExperimentName) {
   CHECK(ParentDirName("/a/b/../c/d", "/x") == "c");
   CHECK(ParentDirName("/run", "/x").empty());  // parent is "/": no name
   CHECK(LexicalAbsPath("../../..", "/a") == "/");
+}
+
+TEST(ContainerDetection) {
+  char tmpl[] = "/tmp/netmon_ctr_XXXXXX";
+  const std::string root = mkdtemp(tmpl);
+  auto write = [&](const std::string& rel, const std::string& text) {
+    FILE* f = fopen((root + rel).c_str(), "w");
+    CHECK(f != nullptr);
+    if (f) {
+      fputs(text.c_str(), f);
+      fclose(f);
+    }
+  };
+  CHECK(mkdir((root + "/proc").c_str(), 0700) == 0 && mkdir((root + "/proc/1").c_str(), 0700) == 0);
+  write("/proc/1/cgroup", "0::/init.scope\n");  // a host (or a VM)
+  CHECK(!InContainer(root));
+  write("/proc/1/cgroup", "0::/system.slice/docker-0123abcd.scope\n");
+  CHECK(InContainer(root));
+  write("/proc/1/cgroup", "0::/\n");  // cgroup namespace hides the path: markers decide
+  CHECK(!InContainer(root));
+  CHECK(mkdir((root + "/run").c_str(), 0700) == 0);
+  write("/run/.containerenv", "");  // Podman
+  CHECK(InContainer(root));
+  unlink((root + "/run/.containerenv").c_str());
+  write("/.dockerenv", "");
+  CHECK(InContainer(root));
+  unlink((root + "/.dockerenv").c_str());
+  unlink((root + "/proc/1/cgroup").c_str());
+  rmdir((root + "/proc/1").c_str());
+  rmdir((root + "/proc").c_str());
+  rmdir((root + "/run").c_str());
+  rmdir(root.c_str());
 }

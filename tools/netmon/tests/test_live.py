@@ -57,7 +57,7 @@ def replay(stream, names, optional="", cap=1024):
             str(len(names)),
             optional or "0" * len(names),
             str(cap),
-            "1" if stream.source == "ipc" else "0",
+            {"ipc": "1", "ethtool": "2"}.get(stream.source, "0"),
         ],
         input=rec.tobytes(),
         capture_output=True,
@@ -161,7 +161,15 @@ class LiveVsOffline(unittest.TestCase):
                 bool(gaps.get((c, 1))), off_clock, f"{c}: clock gaps differ"
             )
             self.assertEqual(off_clock, clock_expected)
+        self.assert_baseline(s, names, stats)
         return live, gaps, stats
+
+    def assert_baseline(self, s, names, stats):
+        # The live step's baseline is the offline one: max over counters of base_ns, the
+        # live value rounded up to 10 us (CUSTOMER_FIXES_DESIGN §1).
+        want = max(R.Rates(s, c).base_ns for c in names)
+        self.assertGreaterEqual(stats["baseline_ns"], want - 1e-6)
+        self.assertLess(stats["baseline_ns"], want + 10_000)
 
     def test_steady(self):
         _, _, st = self.assert_same(run_of(self.tmp))
@@ -433,6 +441,70 @@ class LiveVsOffline(unittest.TestCase):
             self.assertEqual(live[c], off_iv, c)
             self.assertEqual(gaps.get((c, 0), []), off_resets, c)
 
+    def test_baseline_counts_each_counters_own_intervals(self):
+        # Sample spacing alternates 2 and 6 ms; counter 0 decreases at the end of every 2 ms
+        # interval, so its baseline intervals are the 6 ms ones only (median 6 ms) while
+        # counter 1 sees both (median 4 ms): the step must follow counter 0, as offline.
+        def m(t0, rtt, real, err, v):
+            gaps = np.where(np.arange(len(t0)) % 2 == 0, 2 * MS, 6 * MS)
+            t0[1:] = t0[0] + np.cumsum(gaps[:-1]).astype(np.uint64)
+            real[:] = t0.astype(np.int64) + 1_700_000_000 * 10**9
+            v[:, 0] = np.where(
+                np.arange(len(t0)) % 2 == 1, 0, 10**9 + np.arange(len(t0))
+            )
+            return t0, rtt, real, err, v
+
+        _, _, st = self.assert_same(run_of(self.tmp, n=401, mutate=m))
+        self.assertAlmostEqual(st["baseline_ns"], 6 * MS)
+
+    def test_long_intervals_for_a_while_do_not_raise_the_baseline(self):
+        # 30 s at 2 ms, then 15 s with 6 ms between kept samples (on the customer VMs a stretch
+        # of slow requests did this): the recent-window median goes to 6 ms (the old live
+        # step: 18 ms for the whole run), the whole-run median stays 2 ms, as offline.
+        def m(t0, rtt, real, err, v):
+            gaps = np.where(np.arange(len(t0)) < 15000, 2 * MS, 6 * MS)
+            t0[1:] = t0[0] + np.cumsum(gaps[:-1]).astype(np.uint64)
+            real[:] = t0.astype(np.int64) + 1_700_000_000 * 10**9
+            v[:] = (t0[:, None] - t0[0]) * np.array([10, 17, 24], dtype=np.uint64)
+            return t0, rtt, real, err, v
+
+        _, _, st = self.assert_same(run_of(self.tmp, n=17500, mutate=m))
+        self.assertAlmostEqual(st["baseline_ns"], 2 * MS)
+
+    def test_ethtool_rates_between_refreshes(self):
+        # 1 s reads of port statistics the firmware refreshes every 5 reads: the first change
+        # is only the base (the values before it may be stale), then one interval per refresh;
+        # an idle stretch (nothing changes) is one long interval; a counter reset is a gap.
+        names = R.ETHTOOL_PORT_COUNTERS[:4]
+
+        def m(t0, rtt, real, err, v):
+            n = len(t0)
+            refreshed = (np.arange(n) // 5) * 5  # index of the last refresh
+            refreshed[(np.arange(n) >= 40) & (np.arange(n) < 70)] = 40  # idle 30 s
+            v[:] = (
+                refreshed[:, None] * np.array([1000, 3000, 7, 11]) + 10**9
+            ).astype(np.uint64)
+            v[0:5] = 5  # stale until the first refresh (read 5)
+            v[85:, 1] -= v[85, 1] - 1  # rx bytes reset
+            return t0, rtt, real, err, v
+
+        run = run_of(
+            self.tmp, n=120, interval=1000 * MS, mutate=m, names=names, source="ethtool"
+        )
+        live, gaps, _ = self.assert_same(run, names)
+        iv = live[names[0]]
+        self.assertEqual(iv[0][0] - iv[0][0] % 1000, iv[0][0])  # ends on a refresh read
+        self.assertEqual(sorted({round(d, 6) for *_, d in iv}), [5.0, 30.0])
+        self.assertEqual(
+            iv[0][4], 5.0
+        )  # the first interval starts at the first refresh
+        self.assertFalse(any(low for _, low, *_ in iv))
+        self.assertTrue(gaps.get((names[1], 0)))
+
+    def test_baseline_above_100_ms(self):
+        _, _, st = self.assert_same(run_of(self.tmp, n=200, interval=150 * MS))
+        self.assertAlmostEqual(st["baseline_ns"], 150 * MS)
+
 
 class KeyCountersInSync(unittest.TestCase):
     def test_cpp_lists_equal_the_importer(self):
@@ -443,7 +515,11 @@ class KeyCountersInSync(unittest.TestCase):
 
         with open(os.path.join(HERE, "..", "src", "exporter.cc")) as fh:
             src = fh.read()
-        for source, var in (("rdma", "kKeyCountersRdma"), ("ipc", "kKeyCountersIpc")):
+        for source, var in (
+            ("rdma", "kKeyCountersRdma"),
+            ("ipc", "kKeyCountersIpc"),
+            ("ethtool", "kEthtoolPortCounters"),
+        ):
             body = re.search(var + r"\[\] = \{(.*?)\};", src, re.S).group(1)
             self.assertEqual(
                 re.findall(r'"([a-z_0-9]+)"', body), I.KEY_COUNTERS[source]

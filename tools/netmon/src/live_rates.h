@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <deque>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace netmon {
@@ -54,6 +55,21 @@ class WindowMedian {
   bool dirty_ = true;
   double cached_ = 0;
   std::vector<double> scratch_;
+};
+
+// Median of every value added so far, at 10 us resolution (values rounded up), stored
+// sparsely: interval durations cluster around a few values, so a counter holds tens to
+// hundreds of buckets. No upper bound. Median as numpy (mean of the two middle values).
+class SparseHistogram {
+ public:
+  static constexpr double kBucketNs = 10000;
+  void Add(double ns);
+  uint64_t size() const { return n_; }
+  double Median() const;  // NaN if empty
+
+ private:
+  std::vector<std::pair<uint64_t, uint64_t>> b_;  // (bucket, count), sorted by bucket
+  uint64_t n_ = 0;
 };
 
 class LiveSink {
@@ -85,8 +101,12 @@ class LiveRates {
 
   // `optional[c]`: counter c is emitted only from its first change on (§3.5).
   // `read_anomalies`: apply the IPC read-anomaly rule (offline glitch_mask; IPC streams only).
+  // `refreshes_only`: ethtool port statistics, refreshed by the firmware about every 5 s: only
+  // samples where some counter changed are readings (the first one is the base), and no
+  // interval is low resolution (offline Stream.refresh_mask; CUSTOMER_FIXES_DESIGN §2).
   LiveRates(uint64_t interval_ns, double snapshot_fraction, size_t counters,
-            std::vector<bool> optional, size_t pending_cap, bool read_anomalies = false);
+            std::vector<bool> optional, size_t pending_cap, bool read_anomalies = false,
+            bool refreshes_only = false);
 
   // rec = [t0_mono, t1_mono, real, real_err, v0 .. v(counters-1)].
   void Add(const uint64_t* rec, LiveSink* sink);
@@ -95,7 +115,13 @@ class LiveRates {
   void Finish(LiveSink* sink);
 
   // Largest per-counter baseline (ns) once warmed up, else 0. min_step = ceil(3 x this).
+  // Per counter: max(interval, median of every interval so far) over the same intervals as
+  // the offline Rates.base_ns (NETMON_CUSTOMER_FIXES_DESIGN §1), so a short stretch of slow
+  // samples cannot raise it the way a recent-window median would.
   double BaselineNs();
+  // Intervals behind BaselineNs (largest over counters): the exporter publishes a measured
+  // step only once this is large.
+  uint64_t BaselineIntervals() const;
   bool WarmedUp() const { return stats_.samples >= kWarmupSamples; }
   const LiveStats& stats() const { return stats_; }
 
@@ -123,7 +149,13 @@ class LiveRates {
     int64_t last_end_ms = INT64_MIN;
     int64_t last_seg = -1;  // segment of the last emitted interval end
     int64_t last_gap_ms[2] = {INT64_MIN, INT64_MIN};
-    WindowMedian dt{1024};
+    WindowMedian dt{1024};  // recent intervals: low-resolution threshold
+    // Whole-run baseline (offline base_ns): the last kept (non-slow, non-anomaly) sample,
+    // and whether the full series decreased (or had an anomaly) since.
+    bool h_have = false, h_reset = false;
+    double h_t = 0;
+    uint64_t h_v = 0;
+    SparseHistogram hist;
   };
 
   void Confirm(Sample& s, LiveSink* sink);
@@ -134,6 +166,8 @@ class LiveRates {
   double f_;
   size_t pending_cap_;
   bool read_anomalies_;
+  bool refreshes_only_;
+  std::vector<uint64_t> prev_rec_;  // refreshes_only: the previous sample's values
   std::vector<Counter> ctr_;
   WindowMedian rtt_{1024};
   WindowMedian off_{1024};

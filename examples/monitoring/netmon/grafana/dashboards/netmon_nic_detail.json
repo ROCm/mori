@@ -176,6 +176,7 @@
               "netdev": true,
               "pci": true,
               "Value #B": true,
+              "port_stats": true,
               "status": true,
               "target": true
             },
@@ -185,8 +186,9 @@
               "netdev": 2,
               "pci": 3,
               "Value #B": 4,
-              "status": 5,
-              "target": 6
+              "port_stats": 5,
+              "status": 6,
+              "target": 7
             },
             "renameByName": {
               "host": "Host",
@@ -194,6 +196,7 @@
               "netdev": "netdev",
               "pci": "PCI",
               "Value #B": "Link",
+              "port_stats": "Port stats",
               "status": "Data"
             }
           }
@@ -250,11 +253,47 @@
                       "complete": {
                         "text": "imported"
                       },
+                      "interrupted": {
+                        "text": "imported (stopped by signal)"
+                      },
+                      "failed": {
+                        "text": "imported (recording stopped by an error)"
+                      },
+                      "running": {
+                        "text": "imported (recording was still running)"
+                      },
                       "live": {
                         "text": "live (approximate until imported)"
                       },
                       "partial": {
                         "text": "imported (recording incomplete)"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Port stats"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "ipc": {
+                        "text": "firmware IPC (2 ms)"
+                      },
+                      "ethtool": {
+                        "text": "ethtool (≈5 s)"
+                      },
+                      "none": {
+                        "text": "not available"
                       }
                     }
                   }
@@ -496,7 +535,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "All port traffic (incl. non-RDMA)",
-      "description": "Solid line: average traffic in each time bin. Dashed line: the highest single observation in the bin (a counter read ~2 ms apart), so short spikes stay visible when zoomed out; a single observation has timing jitter and can slightly exceed the link rate. Drag across the chart to zoom in. Gaps: no valid observation (never drawn as 0). Data marked 'live' comes from ainic-netmon record --push: an online approximation; where a push failed the average of that time bin may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
+      "description": "All traffic through the port, including non-RDMA Ethernet. With firmware IPC: solid line = average per time bin, dashed line = highest observation in the bin (counters read ~2 ms apart). Without firmware IPC (e.g. a VM with a VF): only the lines marked '≈5 s, ethtool', points that each average about 5 s (the firmware updates these counters about every 5 s; zoomed in they are sparse points). ethtool gives a point only when the counters changed: no point means no observed change, not a measured zero. Gaps: no valid observation (never drawn as 0). Data marked 'live' comes from ainic-netmon record --push: an online approximation; where a push failed the average of that time bin may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
       "datasource": {
         "type": "prometheus",
         "uid": "netmon-vm"
@@ -576,6 +615,40 @@
             "counter": "octets_rx_ok",
             "scale": 8.0,
             "kind": "max_all"
+          }
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_tx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_tx_ok\"}[$__interval]))) * 8",
+          "legendFormat": "Send (≈5 s, ethtool)",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "ethtool",
+            "counter": "octets_tx_ok",
+            "scale": 8.0,
+            "kind": "mean_all"
+          }
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_rx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_rx_ok\"}[$__interval]))) * 8",
+          "legendFormat": "Receive (≈5 s, ethtool)",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "ethtool",
+            "counter": "octets_rx_ok",
+            "scale": 8.0,
+            "kind": "mean_all"
           }
         }
       ],
@@ -686,6 +759,60 @@
                     4
                   ]
                 }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Send (≈5 s, ethtool)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "always"
+              },
+              {
+                "id": "custom.pointSize",
+                "value": 5
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Receive (≈5 s, ethtool)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "always"
+              },
+              {
+                "id": "custom.pointSize",
+                "value": 5
               }
             ]
           }
@@ -1104,7 +1231,7 @@
           "id": 12,
           "type": "timeseries",
           "title": "PFC pause counters, highest rate per time bin",
-          "description": "Firmware port counters whose meaning has not been validated yet. Only counters that changed during the recording are imported.",
+          "description": "Firmware port counters whose meaning has not been validated yet. Only counters that changed during the recording are imported (ethtool: always). On hosts without firmware IPC (e.g. a VM with a VF) the port statistics come from ethtool instead (lines marked '≈5 s, ethtool'): the firmware updates them about every 5 s, so each point is an average over about 5 s (zoomed in: sparse points). ethtool gives a point only when the counters changed: no point means no observed change, not a measured zero.",
           "datasource": {
             "type": "prometheus",
             "uid": "netmon-vm"
@@ -1134,6 +1261,23 @@
                 "counter_re": ".*pripause.*|rx_pause_1us_count",
                 "scale": 1.0
               }
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "netmon-vm"
+              },
+              "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=~\"frames_(tx|rx)_(pri)?pause\",resolution=\"normal\"}[$__interval])",
+              "legendFormat": "{{counter}} (≈5 s, ethtool)",
+              "range": true,
+              "instant": false,
+              "netmon": {
+                "kind": "max",
+                "source": "ethtool",
+                "counter_re": "frames_(tx|rx)_(pri)?pause",
+                "scale": 1.0
+              }
             }
           ],
           "fieldConfig": {
@@ -1149,7 +1293,24 @@
               },
               "noValue": "No data in this time range"
             },
-            "overrides": []
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": ".*ethtool.*"
+                },
+                "properties": [
+                  {
+                    "id": "custom.showPoints",
+                    "value": "always"
+                  },
+                  {
+                    "id": "custom.pointSize",
+                    "value": 5
+                  }
+                ]
+              }
+            ]
           },
           "options": {
             "legend": {
@@ -1505,6 +1666,30 @@
                   {
                     "id": "displayName",
                     "value": "Port counters: timestamp uncertain"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "ethtool reset"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "Port counters (ethtool): counter reset"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "ethtool clock"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "Port counters (ethtool): timestamp uncertain"
                   }
                 ]
               }

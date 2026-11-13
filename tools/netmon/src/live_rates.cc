@@ -65,6 +65,33 @@ double WindowMedian::Get() {
   return m;
 }
 
+// ------------------------------------------------------------------ SparseHistogram
+
+void SparseHistogram::Add(double ns) {
+  const uint64_t key = static_cast<uint64_t>(std::ceil(ns / kBucketNs));
+  auto it = std::lower_bound(b_.begin(), b_.end(), std::make_pair(key, uint64_t{0}));
+  if (it != b_.end() && it->first == key) {
+    it->second++;
+  } else {
+    b_.insert(it, {key, 1});
+  }
+  n_++;
+}
+
+double SparseHistogram::Median() const {
+  if (n_ == 0) return std::numeric_limits<double>::quiet_NaN();
+  auto at = [&](uint64_t rank) {  // value of the rank-th smallest (0-based)
+    uint64_t seen = 0;
+    for (const auto& [key, count] : b_) {
+      seen += count;
+      if (rank < seen) return static_cast<double>(key) * kBucketNs;
+    }
+    return static_cast<double>(b_.back().first) * kBucketNs;
+  };
+  if (n_ % 2) return at(n_ / 2);
+  return (at(n_ / 2 - 1) + at(n_ / 2)) / 2.0;
+}
+
 // ------------------------------------------------------------------ LiveRates
 
 namespace {
@@ -73,11 +100,13 @@ int64_t RoundMs(double wall_ns) { return static_cast<int64_t>(std::nearbyint(wal
 }  // namespace
 
 LiveRates::LiveRates(uint64_t interval_ns, double snapshot_fraction, size_t counters,
-                     std::vector<bool> optional, size_t pending_cap, bool read_anomalies)
+                     std::vector<bool> optional, size_t pending_cap, bool read_anomalies,
+                     bool refreshes_only)
     : interval_ns_(interval_ns),
       f_(snapshot_fraction),
       pending_cap_(std::max<size_t>(pending_cap, 2)),
       read_anomalies_(read_anomalies),
+      refreshes_only_(refreshes_only),
       ctr_(counters) {
   for (size_t c = 0; c < counters && c < optional.size(); c++) {
     ctr_[c].optional = optional[c];
@@ -97,6 +126,13 @@ void LiveRates::Add(const uint64_t* rec, LiveSink* sink) {
   s.t = t0 + f_ * rtt;
   s.slow = WarmedUp() && med > 0 && rtt > kSlowFactor * med;
   s.v.assign(rec + 4, rec + 4 + ctr_.size());
+  if (refreshes_only_) {
+    // Not a refresh (or the first sample): like a slow sample, part of the series for reset
+    // detection but never a base or an interval end.
+    const bool refresh = !prev_rec_.empty() && prev_rec_ != s.v;
+    prev_rec_ = s.v;
+    if (!refresh) s.slow = true;
+  }
 
   const bool trusted = rec[3] <= kAnchorMaxErrNs;
   if (!trusted) {
@@ -173,9 +209,21 @@ void LiveRates::Step(const Sample& s, const Sample* next, LiveSink* sink) {
       k.have_prev_any = true;
       if (anomaly) {
         if (k.have_raw) k.reset_pending = true;
+        k.h_reset = true;  // offline: the interval bridging an anomaly is a reset
         stats_.glitches++;
         continue;
       }
+    }
+    // Whole-run baseline, the offline base_ns population: intervals between consecutive kept
+    // (non-slow) samples with no decrease on the full series in between, whatever their
+    // wall-clock placement.
+    if (k.have_raw && v < k.raw) k.h_reset = true;
+    if (!s.slow) {
+      if (k.h_have && !k.h_reset && v >= k.h_v && s.t > k.h_t) k.hist.Add(s.t - k.h_t);
+      k.h_have = true;
+      k.h_t = s.t;
+      k.h_v = v;
+      k.h_reset = false;
     }
     if (s.uncertain) {
       // Still part of the full series for reset detection (offline finds decreases on
@@ -236,7 +284,7 @@ void LiveRates::Step(const Sample& s, const Sample* next, LiveSink* sink) {
     }
     k.dt.Add(dt);
     const double base = std::max(static_cast<double>(interval_ns_), k.dt.Get());
-    const bool low = base > 0 && dt > kLowResFactor * base;
+    const bool low = !refreshes_only_ && base > 0 && dt > kLowResFactor * base;
     const double dv = static_cast<double>(v - k.base_v);
     if (k.active) sink->Interval(c, low, end_ms, dv / dt * 1e9, dv, dt / 1e9);
     k.last_end_ms = end_ms;
@@ -260,10 +308,16 @@ double LiveRates::BaselineNs() {
   if (!WarmedUp()) return 0;
   double b = 0;
   for (auto& k : ctr_) {
-    if (k.dt.size() == 0) continue;
-    b = std::max(b, std::max(static_cast<double>(interval_ns_), k.dt.Get()));
+    if (k.hist.size() == 0) continue;
+    b = std::max(b, std::max(static_cast<double>(interval_ns_), k.hist.Median()));
   }
   return b;
+}
+
+uint64_t LiveRates::BaselineIntervals() const {
+  uint64_t n = 0;
+  for (const auto& k : ctr_) n = std::max<uint64_t>(n, k.hist.size());
+  return n;
 }
 
 }  // namespace netmon

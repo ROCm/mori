@@ -65,6 +65,23 @@ TRAFFIC_DESC = (
     "rate. Drag across the chart to zoom in. Gaps: no valid observation (never drawn as 0). "
     + LIVE_NOTE
 )
+ETHTOOL_NOTE = (
+    " On hosts without firmware IPC (e.g. a VM with a VF) the port statistics come from "
+    "ethtool instead (lines marked '≈5 s, ethtool'): the firmware updates them about every "
+    "5 s, so each point is an average over about 5 s (zoomed in: sparse points). ethtool "
+    "gives a point only when the counters changed: no point means no observed change, not a "
+    "measured zero."
+)
+ETHTOOL_SUFFIX = " (≈5 s, ethtool)"
+PORT_TRAFFIC_DESC = (
+    "All traffic through the port, including non-RDMA Ethernet. With firmware IPC: solid "
+    "line = average per time bin, dashed line = highest observation in the bin (counters "
+    "read ~2 ms apart). Without firmware IPC (e.g. a VM with a VF): only the lines marked "
+    "'≈5 s, ethtool', points that each average about 5 s (the firmware updates these "
+    "counters about every 5 s; zoomed in they are sparse points). ethtool gives a point only "
+    "when the counters changed: no point means no observed change, not a measured zero. "
+    "Gaps: no valid observation (never drawn as 0). " + LIVE_NOTE
+)
 DETAIL_URL = (
     "/d/netmon-nic/netmon-nic-detail?var-experiment=${experiment:percentencode}"
     "&var-host=HOST&var-target=TARGET&${__url_time_range}"
@@ -275,6 +292,44 @@ def traffic_panel(
     return p
 
 
+def _line_points(name, color):
+    """ethtool's ~5 s averages: line and points (sparse when zoomed in, never bridged)."""
+    o = _line(name, color, 2)
+    o["properties"] += [
+        {"id": "custom.showPoints", "value": "always"},
+        {"id": "custom.pointSize", "value": 5},
+    ]
+    return o
+
+
+def port_traffic_panel(pid, grid):
+    """IPC wire bytes (2 ms), or ethtool's (~5 s) where a NIC has no IPC: average only."""
+    p = traffic_panel(
+        pid, "All port traffic (incl. non-RDMA)", "ipc", IPC_TX, IPC_RX, grid
+    )
+    for ref, counter, name, color in (
+        ("E", IPC_TX, "Send", SEND_COLOR),
+        ("F", IPC_RX, "Receive", RECV_COLOR),
+    ):
+        legend = name + ETHTOOL_SUFFIX
+        p["targets"].append(
+            target(
+                ref,
+                q_average("ethtool", counter, BITS),
+                legend,
+                {
+                    "source": "ethtool",
+                    "counter": counter,
+                    "scale": BITS,
+                    "kind": "mean_all",
+                },
+            )
+        )
+        p["fieldConfig"]["overrides"].append(_line_points(legend, color))
+    p["description"] = PORT_TRAFFIC_DESC
+    return p
+
+
 def packet_panel(pid, title, counters, grid, unit="pps", desc=""):
     """counters: [(counter, legend)], highest rate per time bin."""
     targets = [
@@ -343,10 +398,22 @@ def _hidden(name):
     return _by_name(name, ("custom.hidden", True))
 
 
+PORT_STATS = {
+    "type": "value",
+    "options": {
+        "ipc": {"text": "firmware IPC (2 ms)"},
+        "ethtool": {"text": "ethtool (≈5 s)"},
+        "none": {"text": "not available"},
+    },
+}
 DATA_STATUS = {
     "type": "value",
     "options": {
         "complete": {"text": "imported"},
+        # stopped by Ctrl-C / SIGTERM: the usual end of a recording without -d
+        "interrupted": {"text": "imported (stopped by signal)"},
+        "failed": {"text": "imported (recording stopped by an error)"},
+        "running": {"text": "imported (recording was still running)"},
         "live": {"text": "live (approximate until imported)"},
         "partial": {"text": "imported (recording incomplete)"},
     },
@@ -564,7 +631,9 @@ def overview():
 
 
 def identity_strip(pid, grid):
-    keep = ["host", "display_nic", "netdev", "pci", "Value #B", "status", "target"]
+    keep = [
+        "host", "display_nic", "netdev", "pci", "Value #B", "port_stats", "status", "target"
+    ]  # fmt: skip
     return table(
         pid,
         "",
@@ -583,6 +652,7 @@ def identity_strip(pid, grid):
                         "netdev": "netdev",
                         "pci": "PCI",
                         "Value #B": "Link",
+                        "port_stats": "Port stats",
                         "status": "Data",
                     },
                 },
@@ -592,16 +662,20 @@ def identity_strip(pid, grid):
             _by_name("Host", ("custom.width", 480)),
             _by_name("Link", ("unit", "bps"), ("decimals", 0)),
             _by_name("Data", ("mappings", [DATA_STATUS])),
+            _by_name("Port stats", ("mappings", [PORT_STATS])),
             _hidden("target"),
         ],
     )
 
 
+ETHTOOL_PFC_RE = "frames_(tx|rx)_(pri)?pause"
 GAP_NAMES = {
     ("rdma", "reset"): "RDMA counters: counter reset or rejected reading",
     ("rdma", "clock"): "RDMA counters: timestamp uncertain",
     ("ipc", "reset"): "Port counters: counter reset or rejected reading",
     ("ipc", "clock"): "Port counters: timestamp uncertain",
+    ("ethtool", "reset"): "Port counters (ethtool): counter reset",
+    ("ethtool", "clock"): "Port counters (ethtool): timestamp uncertain",
 }
 QUALITY_NAMES = {
     "samples": "Samples",
@@ -752,14 +826,7 @@ def nic_detail():
             RDMA_RX,
             {"x": 0, "y": 5, "w": 24, "h": 10},
         ),
-        traffic_panel(
-            4,
-            "All port traffic (incl. non-RDMA)",
-            "ipc",
-            IPC_TX,
-            IPC_RX,
-            {"x": 0, "y": 15, "w": 24, "h": 8},
-        ),
+        port_traffic_panel(4, {"x": 0, "y": 15, "w": 24, "h": 8}),
         row(5, "Retransmissions and congestion", 23),
         packet_panel(
             6,
@@ -840,12 +907,32 @@ def nic_detail():
                     "counter_re": ".*pripause.*|rx_pause_1us_count",
                     "scale": 1.0,
                 },
-            )
+            ),
+            target(
+                "B",
+                f'max_over_time(netmon_rate{{{SEL},source="ethtool",counter=~"{ETHTOOL_PFC_RE}",resolution="normal"}}[$__interval])',
+                "{{counter}}" + ETHTOOL_SUFFIX,
+                {
+                    "kind": "max",
+                    "source": "ethtool",
+                    "counter_re": ETHTOOL_PFC_RE,
+                    "scale": 1.0,
+                },
+            ),
         ],
-        [],
+        [
+            {
+                "matcher": {"id": "byRegexp", "options": ".*ethtool.*"},
+                "properties": [
+                    {"id": "custom.showPoints", "value": "always"},
+                    {"id": "custom.pointSize", "value": 5},
+                ],
+            }
+        ],
         {"x": 0, "y": y + 2, "w": 24, "h": 8},
         desc="Firmware port counters whose meaning has not been validated yet. Only counters "
-        "that changed during the recording are imported.",
+        "that changed during the recording are imported (ethtool: always)."
+        + ETHTOOL_NOTE,
     )
     panels.append(
         row(
@@ -858,9 +945,23 @@ def nic_detail():
     )
     diag, summary = diagnostics(14, y + 3)
     summary["gridPos"] = {"x": 0, "y": y + 4, "w": 24, "h": 5}
-    panels.append(row(17, "Offline report summary (fixed experiment window)", y + 2, True, [summary]))
     panels.append(
-        row(13, "Recording diagnostics (for troubleshooting the monitor itself)", y + 3, True, diag)
+        row(
+            17,
+            "Offline report summary (fixed experiment window)",
+            y + 2,
+            True,
+            [summary],
+        )
+    )
+    panels.append(
+        row(
+            13,
+            "Recording diagnostics (for troubleshooting the monitor itself)",
+            y + 3,
+            True,
+            diag,
+        )
     )
     return dashboard(
         "netmon-nic",

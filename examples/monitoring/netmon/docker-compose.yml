@@ -1,7 +1,8 @@
 # VictoriaMetrics + Grafana for ainic-netmon recordings. Start with ./up.sh (it writes .env
 # with your uid/gid, the data directory and the ports), import with ainic-netmon-import.
 #
-# Both services use the host network and listen on 127.0.0.1 only.
+# Both services use the host network and listen on 127.0.0.1 only. For pushes from other
+# nodes, up.sh can add one more VictoriaMetrics address (NETMON_VM_LISTEN, see README).
 services:
   victoriametrics:
     image: victoriametrics/victoria-metrics:v1.156.0
@@ -12,7 +13,7 @@ services:
       - ${NETMON_DATA}/vm:/storage
     command:
       - -storageDataPath=/storage
-      - -httpListenAddr=127.0.0.1:${NETMON_VM_PORT}
+      - -httpListenAddr=127.0.0.1:${NETMON_VM_PORT}${NETMON_VM_EXTRA_LISTEN}
       # Imported recordings are historical: keep them (VM drops samples older than this).
       - -retentionPeriod=${NETMON_VM_RETENTION}
       # Only imported data: no need to hide the newest 30 s (the VM default).

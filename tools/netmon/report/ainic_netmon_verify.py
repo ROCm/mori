@@ -43,6 +43,9 @@ import urllib.request
 import numpy as np
 
 DISPLAY_LABELS = ("ibdev", "pci", "display_nic", "display_host_nic")
+# Metadata formats of earlier importers, newest first: before the ethtool fallback (no
+# port_stats), and before the NIC display names as well.
+LEGACY_LABELS = (("port_stats",), ("port_stats",) + DISPLAY_LABELS)
 REL_TOL = 1e-9
 ABS_TOL = 1e-9
 
@@ -132,7 +135,7 @@ class Expected:
     def _rates(self, t, source, counter):
         R = self.imp.R
         stream = t.run.stream(t.netdev, source)
-        if stream is None:
+        if stream is None or stream not in t.imported_streams():
             return None
         return (
             R.Rates(stream, counter)
@@ -143,9 +146,7 @@ class Expected:
     def imported(self, t):
         """(source, counter, Rates) of everything imported for a target."""
         out = []
-        for s in t.run.streams:
-            if s.netdev != t.netdev or s.source not in ("rdma", "ipc"):
-                continue
+        for s in t.imported_streams():
             for counter in self.imp.pick_counters(s, t.counters_mode):
                 out.append((s.source, counter, self.rates(t, s.source, counter)))
         return out
@@ -420,6 +421,18 @@ def cmd_verify(args, imp):
             "netmon_(rate|increase|interval_seconds|gap_seconds)", experiment=exp
         )
     )
+    # Imported before the ethtool fallback (NICs without IPC have no ethtool series yet):
+    # accepted as a whole, and only if the metadata is of that older format too (below).
+    eth = {k for k in want if dict(k).get("source") == "ethtool"}
+    legacy_no_ethtool = bool(eth) and not any(
+        dict(k).get("source") == "ethtool" for k in got
+    )
+    if legacy_no_ethtool:
+        for t in targets:
+            t.legacy_no_ethtool = True
+        want, summaries, infos, quality, min_step = imp.plan_summary(
+            targets, args.counters, window
+        )
     if getattr(args, "skip_readback", False):
         print("read-back: skipped")
     else:
@@ -440,12 +453,27 @@ def cmd_verify(args, imp):
             f"experiment {exp!r} has hosts {sorted(hosts)}, these recordings are "
             f"{sorted(r.host for r in runs)}"
         )
-    done = {
-        x["metric"].get("host")
-        for x in vm.instant(
-            f'last_over_time(netmon_import_info{{experiment="{imp.esc(exp)}",state="complete"}}[3650d])'
+    markers = vm.instant(
+        f'last_over_time(netmon_import_info{{experiment="{imp.esc(exp)}",state="complete"}}[3650d])'
+    )
+    done = {x["metric"].get("host") for x in markers}
+    formats = {x["metric"].get("format") for x in markers}
+    if len(formats) > 1:
+        raise Mismatch(
+            f"hosts imported with different importer formats {sorted(map(str, formats))}"
         )
-    }
+    old_importer = formats == {
+        None
+    }  # before IMPORT_FORMAT existed: older formats allowed
+    if not old_importer and formats != {imp.IMPORT_FORMAT}:
+        raise Mismatch(
+            f"import format {formats}, this verifier knows {imp.IMPORT_FORMAT}"
+        )
+    if legacy_no_ethtool and not old_importer:
+        raise Mismatch(
+            "NICs without IPC have no ethtool series in a current-format import: the import "
+            "is incomplete (re-run it with --replace)"
+        )
     if done != hosts:
         raise Mismatch(f"import not complete for hosts {sorted(hosts - done)}")
     want_meta = {}
@@ -466,17 +494,21 @@ def cmd_verify(args, imp):
     )
     have = {imp.label_key(x["metric"]): float(x["value"][1]) for x in res}
     legacy = False
-    if set(have) != set(want_meta):
-        # Imported before the NIC display names existed (ibdev, pci, display_*): the same
-        # metadata without them is accepted as a whole, never mixed with the new format.
+    for drop in LEGACY_LABELS if old_importer and set(have) != set(want_meta) else ():
+        # An earlier importer's metadata (without port_stats, or also without the NIC
+        # display names) is accepted as a whole, never mixed with the current format.
         old = {
-            imp.label_key(
-                {k: v for k, v in dict(key).items() if k not in DISPLAY_LABELS}
-            ): v
+            imp.label_key({k: v for k, v in dict(key).items() if k not in drop}): v
             for key, v in want_meta.items()
         }
         if set(have) == set(old):
-            want_meta, legacy = old, True
+            want_meta, legacy = old, drop
+            break
+    if legacy_no_ethtool and not legacy:
+        raise Mismatch(
+            "NICs without IPC have no ethtool series, but the metadata is of the current "
+            "format: the import is incomplete (re-run it with --replace)"
+        )
     if set(have) != set(want_meta):
         missing = sorted(set(want_meta) - set(have))
         extra = sorted(set(have) - set(want_meta))
@@ -491,7 +523,9 @@ def cmd_verify(args, imp):
         f"metadata: hosts, completion markers and {len(want_meta)} summary / target / "
         "quality values equal the offline report's"
         + (
-            " (imported before NIC display names: re-import with --replace to get them)"
+            " (imported by an earlier importer: re-import with --replace to get "
+            + ("the NIC display names and " if "display_nic" in legacy else "")
+            + "the ethtool port statistics of NICs without IPC)"
             if legacy
             else ""
         )
@@ -587,7 +621,14 @@ def cmd_verify(args, imp):
         + 10
     )
     checks += check_meta_queries(
-        args.grafana, dashboards, exp, targets, infos, meta_at, legacy
+        args.grafana,
+        dashboards,
+        exp,
+        targets,
+        infos,
+        meta_at,
+        bool(legacy and "display_nic" in legacy),
+        old_port_stats=bool(legacy),
     )
     print("tables: NIC names, hosts and link rates equal the recordings' metadata")
 
@@ -628,7 +669,9 @@ def no_frame_margin(from_ms, to_ms, max_points, min_interval):
     return max(floor_ms, 10, 2 * -(-(to_ms - from_ms) // max_points))
 
 
-def check_meta_queries(grafana, dashboards, exp, targets, infos, at_ms, legacy):
+def check_meta_queries(
+    grafana, dashboards, exp, targets, infos, at_ms, legacy, old_port_stats=False
+):
     """Every instant metadata query of the dashboards (no "netmon" spec), run per target:
     target_info rows carry the planned names (legacy imports: display_nic falls back to the
     netdev), host_short is the host's first DNS label, the link rate is speed_mbps * 1e6.
@@ -677,6 +720,13 @@ def check_meta_queries(grafana, dashboards, exp, targets, infos, at_ms, legacy):
                     if lab.get("display_nic") != nic or lab.get("host") != t.host:
                         raise Mismatch(
                             f"{what}: NIC {lab.get('display_nic')!r} host {lab.get('host')!r}, expected {nic!r} {t.host!r}"
+                        )
+                    if not old_port_stats and lab.get("port_stats") != want.get(
+                        "port_stats"
+                    ):
+                        raise Mismatch(
+                            f"{what}: port_stats {lab.get('port_stats')!r}, "
+                            f"expected {want.get('port_stats')!r}"
                         )
                     if (
                         "host_short" in expr
@@ -789,7 +839,11 @@ def check_query(imp, expected, t, spec, frames, rng, margin, what):
         return n
     if "counter_re" in spec:
         stream = t.run.stream(t.netdev, spec["source"])
-        imported = imp.pick_counters(stream, t.counters_mode) if stream else []
+        imported = (
+            imp.pick_counters(stream, t.counters_mode)
+            if stream is not None and stream in t.imported_streams()
+            else []
+        )
         counters = [c for c in imported if re.fullmatch(spec["counter_re"], c)]
     else:
         counters = [spec["counter"]]
@@ -830,7 +884,11 @@ def check_frames(imp, expected, t, spec, frames, what):
         }
     elif "counter_re" in spec:
         stream = t.run.stream(t.netdev, spec["source"])
-        imported = imp.pick_counters(stream, t.counters_mode) if stream else []
+        imported = (
+            imp.pick_counters(stream, t.counters_mode)
+            if stream is not None and stream in t.imported_streams()
+            else []
+        )
         allowed = {
             (spec["source"], c) for c in imported if re.fullmatch(spec["counter_re"], c)
         }

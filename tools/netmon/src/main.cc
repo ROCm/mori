@@ -299,7 +299,12 @@ int CmdRecord(int argc, char** argv) {
       if (!IsRoot()) {
         unavailable(n, "ipc", "not root (use a privileged container, sudo, or --sudo)");
       } else if (n.ipc_dev.empty()) {
-        unavailable(n, "ipc", "no tawk_ipc node (in a container: --privileged or --device)");
+        unavailable(n, "ipc",
+                    InContainer()
+                        ? "no /dev/tawkipcdev* in this container (run it --privileged or "
+                          "with --device /dev/tawkipcdevN)"
+                        : "no /dev/tawkipcdev* on this host (firmware IPC is not exposed here, "
+                          "e.g. a VM with a VF); port statistics come from ethtool every ~5 s");
       } else if (!v && !a.ipc_unverified) {
         unavailable(
             n, "ipc",

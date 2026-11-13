@@ -60,6 +60,7 @@ namespace {
 constexpr uint64_t kSlotsPerStream = 200;
 constexpr uint64_t kMaxRingBytes = 1ull << 30;
 constexpr uint64_t kMaxPendingPoints = 500000;
+constexpr uint64_t kStepMinIntervals = 10000;  // ~20 s at 2 ms (CUSTOMER_FIXES_DESIGN §1)
 constexpr uint64_t kRequestTimeoutNs = 3000000000ull;
 constexpr uint64_t kWarnEveryNs = 10000000000ull;
 constexpr const char* kAllTimeStart = "2000-01-01T00:00:00Z";  // VM: start=0 means "unset"
@@ -143,14 +144,22 @@ std::vector<std::pair<std::string, std::string>> DisplayLabels(const std::string
   return out;
 }
 
+// ethtool port statistics, pushed only for NICs without an ipc stream; also the refresh
+// rule's columns. Must equal ainic_netmon_report.ETHTOOL_PORT_COUNTERS (test_live.py).
+const char* const kEthtoolPortCounters[] = {
+    "octets_tx_ok",    "octets_rx_ok",       "frames_tx_ok",
+    "frames_rx_ok",    "frames_tx_pripause", "frames_rx_pripause",
+    "frames_tx_pause", "frames_rx_pause",    nullptr};
+
 std::vector<size_t> SelectPushCounters(const std::string& source,
                                        const std::vector<std::string>& names, bool all,
                                        std::vector<bool>* optional) {
   static const std::regex kOptional(
       "(pripause_\\d+_1us_count|rx_pause_1us_count|frames_(tx|rx)_pri_\\d)$");
-  const char* const* key = source == "rdma"  ? kKeyCountersRdma
-                           : source == "ipc" ? kKeyCountersIpc
-                                             : nullptr;
+  const char* const* key = source == "rdma"      ? kKeyCountersRdma
+                           : source == "ipc"     ? kKeyCountersIpc
+                           : source == "ethtool" ? kEthtoolPortCounters
+                                                 : nullptr;
   std::vector<size_t> cols;
   optional->clear();
   if (!key) return cols;
@@ -162,6 +171,7 @@ std::vector<size_t> SelectPushCounters(const std::string& source,
       }
     }
   }
+  if (source == "ethtool") return cols;  // exactly these (they define the refresh rule)
   for (size_t i = 0; i < names.size(); i++) {
     if (std::find(cols.begin(), cols.end(), i) != cols.end()) continue;
     if (all || std::regex_search(names[i], kOptional)) {
@@ -221,6 +231,7 @@ struct Exporter::StreamState {
   std::unique_ptr<LiveRates> lr;
   size_t series_base = 0;  // 8 series per counter, see Sink
   size_t counters = 0;
+  bool sets_step = true;  // ethtool (~5 s refreshes) never does
 };
 
 // Series layout per counter: rate/increase/interval x normal/low (0..5), gap reset (6),
@@ -359,10 +370,19 @@ bool Exporter::ConfigureImpl(std::vector<ExportStream> streams, uint64_t start_r
   uint64_t bytes = 0;
   std::vector<std::unique_ptr<Ring>> rings;
   std::vector<std::vector<bool>> optional(streams.size());
+  auto has_ipc = [&](const std::string& netdev) {
+    for (const auto& s : streams) {
+      if (s.netdev == netdev && s.source == "ipc") return true;
+    }
+    return false;
+  };
   for (size_t i = 0; i < streams.size(); i++) {
     auto r = std::make_unique<Ring>();
-    r->cols =
-        SelectPushCounters(streams[i].source, streams[i].names, opt_.all_counters, &optional[i]);
+    // ethtool's port statistics only where the NIC has no ipc stream (CUSTOMER_FIXES §2)
+    if (streams[i].source != "ethtool" || !has_ipc(streams[i].netdev)) {
+      r->cols =
+          SelectPushCounters(streams[i].source, streams[i].names, opt_.all_counters, &optional[i]);
+    }
     r->slots = kSlotsPerStream;
     r->slot_records = std::max<size_t>(streams[i].batch_records, 1);
     r->width = 4 + r->cols.size();
@@ -388,8 +408,10 @@ bool Exporter::ConfigureImpl(std::vector<ExportStream> streams, uint64_t start_r
     st->series_base = series_.size();
     const size_t pending_cap =
         s.interval_ns ? std::max<uint64_t>(1000000000ull / s.interval_ns, 2) : 1024;
-    st->lr = std::make_unique<LiveRates>(s.interval_ns, s.snapshot_fraction, st->counters,
-                                         optional[i], pending_cap, s.source == "ipc");
+    st->lr =
+        std::make_unique<LiveRates>(s.interval_ns, s.snapshot_fraction, st->counters, optional[i],
+                                    pending_cap, s.source == "ipc", s.source == "ethtool");
+    st->sets_step = s.source != "ethtool";
     const std::string base = "\"experiment\":" + Q(opt_.experiment) + ",\"host\":" + Q(host) +
                              ",\"netdev\":" + Q(s.netdev) +
                              ",\"target\":" + Q(host + "/" + s.netdev) +
@@ -417,8 +439,9 @@ bool Exporter::ConfigureImpl(std::vector<ExportStream> streams, uint64_t start_r
   };
   int64_t prelim = 0;
   for (size_t i = 0; i < streams.size(); i++) {
-    if (rings_or_cols_empty(rings, i)) continue;  // not pushed (e.g. ethtool, 1 s)
+    if (rings_or_cols_empty(rings, i)) continue;  // not pushed
     const ExportStream& s = streams[i];
+    if (s.source == "ethtool") continue;  // ~5 s refreshes: never sets the step
     const double ms = std::max<double>(static_cast<double>(s.interval_ns), 2e6) / 1e6;
     prelim = std::max<int64_t>(prelim, static_cast<int64_t>(std::ceil(3 * ms - 1e-9)));
   }
@@ -624,8 +647,12 @@ void Exporter::Run() {
 void Exporter::UpdateStep() {
   int64_t step = 0;
   for (auto& st : streams_) {
+    if (!st->sets_step) continue;
+    // Not before kStepMinIntervals intervals: until then the preliminary step stands, so a
+    // slow stretch at the start cannot raise the (only increasing) step for the whole run.
+    if (st->lr->BaselineIntervals() < kStepMinIntervals) continue;
     const double b = st->lr->BaselineNs();
-    if (b <= 0) continue;  // not warmed up yet
+    if (b <= 0) continue;
     step = std::max<int64_t>(step, static_cast<int64_t>(std::ceil(3 * b / 1e6 - 1e-9)));
   }
   uint64_t unconfirmed = 0, back = 0, anomalies = 0;
@@ -658,6 +685,14 @@ void Exporter::MetaLines(std::string* body) {
       std::string names;
       for (const auto& kv : DisplayLabels(host, s.netdev, s.ibdev, s.pci))
         names += "," + Q(kv.first) + ":" + Q(kv.second);
+      // where the port statistics come from (as the importer's Target.port_stats)
+      std::string port = "none";
+      for (size_t j = 0; j < cfg_.size(); j++) {
+        if (cfg_[j].netdev != s.netdev || rings_[j]->cols.empty()) continue;
+        if (cfg_[j].source == "ipc") port = "ipc";
+        if (cfg_[j].source == "ethtool" && port != "ipc") port = "ethtool";
+      }
+      names += ",\"port_stats\":" + Q(port);
       line("{\"__name__\":\"netmon_target_info\",\"experiment\":" + Q(opt_.experiment) +
                ",\"host\":" + Q(host) + ",\"netdev\":" + Q(s.netdev) +
                ",\"target\":" + Q(host + "/" + s.netdev) + ",\"status\":\"live\",\"speed_mbps\":" +

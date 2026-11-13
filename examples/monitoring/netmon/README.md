@@ -46,6 +46,33 @@ ainic-netmon record -o /shared/exp42/{host} --push http://127.0.0.1:8428
   be off (part of a request can be lost). The offline report summary stays empty while live. When the
   recording ends, import it with `--replace` to replace the live data with the exact numbers.
 
+### Several nodes
+
+Every node pushes to the same VictoriaMetrics; run the stack on one of them (node A here).
+VictoriaMetrics has no authentication, and an open port also accepts deletes, so never expose
+it beyond the nodes that push.
+
+- **Internal network (recommended):** on node A, `NETMON_VM_LISTEN=<A's internal IP> ./up.sh`.
+  VictoriaMetrics then also listens on that address; Grafana stays on 127.0.0.1. Allow only the
+  pushing nodes to reach the port on that interface: first a rule that drops everyone, then
+  one accept rule per pushing node inserted above it, for example (internal interface `eth1`)
+
+  ```
+  iptables -I INPUT 1 -i eth1 -p tcp --dport 8428 -j DROP
+  iptables -I INPUT 1 -i eth1 -p tcp --dport 8428 -s <node B> -j ACCEPT
+  iptables -I INPUT 1 -i eth1 -p tcp --dport 8428 -s <node C> -j ACCEPT
+  ```
+
+  (or an equivalent firewall / security-group rule). Other nodes record with
+  `--push http://<A's internal IP>:8428`.
+- **No firewall control, or no direct route:** keep VictoriaMetrics on 127.0.0.1 and give each
+  other node a tunnel to it, e.g. from a machine that can reach both:
+  `ssh -N -L 18428:127.0.0.1:8428 nodeA` plus `ssh -N -R 8428:127.0.0.1:18428 nodeB`, then on
+  node B `--push http://127.0.0.1:8428`.
+
+To look at the dashboards from your desktop: `ssh -L 3000:127.0.0.1:3000 nodeA`, then open
+http://127.0.0.1:3000.
+
 ## Import and look
 
 ```

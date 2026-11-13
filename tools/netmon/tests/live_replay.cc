@@ -25,6 +25,7 @@
 //
 //   netmon_live_replay INTERVAL_NS SNAPSHOT_FRACTION COUNTERS OPTIONAL_MASK PENDING_CAP [IPC]
 //     IPC = 1: apply the IPC read-anomaly rule (as the live push does for ipc streams)
+//     IPC = 2: ethtool port statistics: rates between refreshes only
 //     stdin:  u64le records [t0, t1, real, real_err, v0 .. v(COUNTERS-1)]
 //     stdout: "I,c,low,end_ms,rate,increase,dt_s" / "G,c,clock,end_ms,dt_s" lines (%.17g),
 //             then
@@ -65,11 +66,19 @@ int main(int argc, char** argv) {
   std::vector<bool> optional(n, false);
   for (size_t c = 0; c < n && c < mask.size(); c++) optional[c] = mask[c] == '1';
   const bool ipc = argc == 7 && argv[6][0] == '1';
-  netmon::LiveRates lr(interval, f, n, optional, cap, ipc);
+  const bool ethtool = argc == 7 && argv[6][0] == '2';
+  netmon::LiveRates lr(interval, f, n, optional, cap, ipc, ethtool);
   Printer p;
   std::vector<uint64_t> rec(4 + n);
+  // NETMON_REPLAY_BASELINE=N: every N samples, "B,samples,baseline_ns" on stderr.
+  const char* every_env = getenv("NETMON_REPLAY_BASELINE");
+  const uint64_t every = every_env ? strtoull(every_env, nullptr, 10) : 0;
+  uint64_t count = 0;
   while (fread(rec.data(), sizeof(uint64_t), rec.size(), stdin) == rec.size()) {
     lr.Add(rec.data(), &p);
+    if (every && ++count % every == 0) {
+      fprintf(stderr, "B,%llu,%.17g\n", static_cast<unsigned long long>(count), lr.BaselineNs());
+    }
   }
   lr.Finish(&p);
   const auto& st = lr.stats();

@@ -22,6 +22,7 @@
 // Live push: HTTP client, counter selection and the exporter against a fake VictoriaMetrics.
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <thread>
 
@@ -88,6 +89,51 @@ bool WaitPhase(Exporter* e, Exporter::Phase want, uint64_t ms) {
     usleep(5000);
   }
   return e->phase() == want;
+}
+
+// Records [first, first + n) at the given sample times (ns from the start), steady traffic.
+Batch MakeBatchAt(size_t first, size_t n, const std::vector<uint64_t>& at) {
+  Batch b(0, 7, n);
+  for (size_t i = 0; i < n; i++) {
+    uint64_t* r = b.Slot();
+    const uint64_t t0 = 1000000000000ull + at[first + i];
+    r[0] = t0;
+    r[1] = t0 + 100000;
+    r[2] = t0 + 1700000000000000000ull;
+    r[3] = 0;
+    r[4] = at[first + i] / 2000;
+    r[5] = at[first + i] / 1000;
+    r[6] = first + i;
+    b.count++;
+  }
+  return b;
+}
+
+// Pushes `at` (sample times) through an exporter and returns every netmon_step_ms value sent.
+std::vector<std::string> StepsPushed(const std::vector<uint64_t>& at) {
+  auto& vm = *new nt::FakeVm();      // its threads outlive the test: never freed
+  auto* e = new Exporter(Opts(vm));  // leaked on purpose, like in the recorder
+  e->Start();
+  CHECK(WaitPhase(e, Exporter::Phase::kReady, 3000));
+  std::string err;
+  CHECK(e->Configure({Stream1()}, 1700001000000000000ull, &err));
+  for (size_t k = 0; k + 25 <= at.size(); k += 25) {
+    e->Offer(MakeBatchAt(k, 25, at));
+    usleep(1000);  // the slot ring holds 200 batches: let the exporter keep up
+  }
+  e->CloseInput();
+  CHECK(e->WaitDone(MonoNs() + 20000000000ull));
+  CHECK(e->Snapshot().dropped_samples == 0);
+  std::vector<std::string> out;
+  for (const auto& body : vm.bodies()) {
+    size_t p = 0;
+    while ((p = body.find("\"__name__\":\"netmon_step_ms\"", p)) != std::string::npos) {
+      const size_t v = body.find("\"values\":[", p) + 10;
+      out.push_back(body.substr(v, body.find(']', v) - v));
+      p = v;
+    }
+  }
+  return out;
 }
 
 }  // namespace
@@ -167,6 +213,10 @@ TEST(PushCounterSelection) {
   CHECK(cols.size() == 2 && cols[0] == 1 && cols[1] == 0 && opt[1]);
   cols = SelectPushCounters("ethtool", {"tx_rdma_ucast_bytes"}, true, &opt);
   CHECK(cols.empty());
+  // ethtool: exactly the port statistics (they define the refresh rule), even with --all
+  cols = SelectPushCounters("ethtool", {"x", "octets_rx_ok", "frames_tx_pri_3", "octets_tx_ok"},
+                            true, &opt);
+  CHECK(cols.size() == 2 && cols[0] == 3 && cols[1] == 1 && !opt[0] && !opt[1]);
   cols = SelectPushCounters("ipc", {"frames_rx_pri_3", "octets_rx_ok"}, false, &opt);
   CHECK(cols.size() == 2 && cols[0] == 1 && opt[1]);
 }
@@ -331,4 +381,69 @@ TEST(HttpClientFallsBackToTheNextAddress) {
   CHECK(c.Resolve(u, &err));
   auto r = c.Request("GET", "/flags", "", nullptr, MonoNs() + 2000000000ull);
   CHECK(r.kind == HttpResult::Kind::kOk && r.status == 200);
+}
+
+// The measured step needs kStepMinIntervals (10000) intervals and follows the whole-run
+// median (CUSTOMER_FIXES_DESIGN §1): a stretch of long intervals at the start, before the
+// threshold, leaves only the preliminary step; 3 ms sampling throughout publishes 9 ms.
+TEST(ExporterStepFollowsTheWholeRun) {
+  std::vector<uint64_t> early;
+  uint64_t t = 0;
+  for (size_t i = 0; i < 13000; i++, t += (i < 3000 ? 6000000 : 2000000)) early.push_back(t);
+  const auto a = StepsPushed(early);
+  CHECK(!a.empty());
+  for (const auto& v : a) CHECK(v == "6");
+
+  std::vector<uint64_t> slow;
+  for (size_t i = 0; i < 12000; i++) slow.push_back(i * 3000000ull);
+  const auto b = StepsPushed(slow);
+  CHECK(std::find(b.begin(), b.end(), "6") != b.end());  // preliminary, at the anchor
+  CHECK(std::find(b.begin(), b.end(), "9") != b.end());  // measured, after 10000 intervals
+
+  std::vector<uint64_t> few;
+  for (size_t i = 0; i < 5000; i++) few.push_back(i * 3000000ull);
+  for (const auto& v : StepsPushed(few)) CHECK(v == "6");  // too few intervals to measure
+}
+
+// netmon_target_info says where each NIC's port statistics come from, as the importer does:
+// ipc where there is an ipc stream, ethtool (pushed) where there is none, else none.
+TEST(ExporterPortStatsLabel) {
+  auto& vm = *new nt::FakeVm();      // its threads outlive the test: never freed
+  auto* e = new Exporter(Opts(vm));  // leaked on purpose, like in the recorder
+  e->Start();
+  CHECK(WaitPhase(e, Exporter::Phase::kReady, 3000));
+  auto stream = [](const char* nd, const char* src, std::vector<std::string> names, uint64_t iv) {
+    ExportStream s;
+    s.netdev = nd;
+    s.source = src;
+    s.interval_ns = iv;
+    s.names = std::move(names);
+    s.record_words = 4 + s.names.size();
+    s.batch_records = 25;
+    return s;
+  };
+  const std::vector<std::string> eth = {"octets_tx_ok", "octets_rx_ok", "tx_bytes"};
+  std::string err;
+  CHECK(e->Configure(
+      {stream("a", "rdma", {"tx_rdma_ucast_bytes"}, 2000000),
+       stream("a", "ipc", {"octets_tx_ok"}, 2000000), stream("a", "ethtool", eth, 1000000000ull),
+       stream("b", "rdma", {"tx_rdma_ucast_bytes"}, 2000000),
+       stream("b", "ethtool", eth, 1000000000ull),
+       stream("c", "rdma", {"tx_rdma_ucast_bytes"}, 2000000),
+       stream("c", "ethtool", {"tx_bytes"}, 1000000000ull)},
+      1700001000000000000ull, &err));
+  e->CloseInput();
+  CHECK(e->WaitDone(MonoNs() + 5000000000ull));
+  std::string all;
+  for (const auto& b : vm.bodies()) all += b;
+  auto label = [&](const char* nd) {
+    const size_t p = all.find("\"netdev\":\"" + std::string(nd) + "\",\"target\"");
+    const size_t q = all.find("\"port_stats\":\"", p);
+    return p == std::string::npos || q == std::string::npos
+               ? std::string()
+               : all.substr(q + 14, all.find('"', q + 14) - q - 14);
+  };
+  CHECK(label("a") == "ipc");
+  CHECK(label("b") == "ethtool");
+  CHECK(label("c") == "none");
 }
