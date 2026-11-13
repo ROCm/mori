@@ -24,6 +24,7 @@
 // MIT License
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
+#include <hip/hip_runtime.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -1180,6 +1181,61 @@ TEST(StandaloneShmIpcTest, BatchTouchCountsTheKeysTheServerHolds) {
   EXPECT_EQ(client->BatchTouch({}), 0u);
   // A touch is not a read and does not change what exists.
   EXPECT_EQ(client->BatchExists({"touch-a", "touch-missing"}), (std::vector<bool>{true, false}));
+
+  client->DeregisterMemory(reinterpret_cast<uintptr_t>(handle.ptr));
+  client->Close();
+  allocator.Free(handle);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
+// A client whose address names {device} reaches the server of its current GPU, so a
+// node can run one server per GPU behind a single configured address.
+TEST(StandaloneShmIpcTest, DeviceInTheAddressNamesTheCallersGpu) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) {
+    GTEST_SKIP() << "needs a GPU to name";
+  }
+  const int device = devices - 1;
+  ASSERT_EQ(hipSetDevice(device), hipSuccess);
+  const std::string prefix = "unix:///tmp/umbp_standalone_dev_" + std::to_string(getpid()) + "_";
+  const std::string address = prefix + std::to_string(device) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  UMBPConfig client_cfg = server_cfg;
+  client_cfg.standalone_process->address = prefix + "{device}.grpc.sock";
+  auto client = CreateUMBPClient(client_cfg);
+
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  opts.prefault = false;
+  HostBufferHandle handle = allocator.Alloc(4096, opts);
+  ASSERT_TRUE(handle.valid());
+  auto* bytes = static_cast<unsigned char*>(handle.ptr);
+  ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(handle.ptr), handle.mapped_size));
+  std::memset(bytes, 0x3c, 32);
+  ASSERT_TRUE(client->Put("dev-a", reinterpret_cast<uintptr_t>(bytes), 32));
+  std::memset(bytes + 64, 0, 32);
+  ASSERT_TRUE(client->Get("dev-a", reinterpret_cast<uintptr_t>(bytes + 64), 32));
+  EXPECT_EQ(std::vector<unsigned char>(bytes + 64, bytes + 96),
+            std::vector<unsigned char>(32, 0x3c));
 
   client->DeregisterMemory(reinterpret_cast<uintptr_t>(handle.ptr));
   client->Close();
