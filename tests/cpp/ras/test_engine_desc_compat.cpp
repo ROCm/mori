@@ -140,11 +140,13 @@ TEST(RasEngineDesc, TheRasFieldIsAppendedAtTheEnd) {
   EXPECT_EQ(back, d);
   EXPECT_EQ(back.ras, SampleRas());
 
-  // The new layout is the legacy one with the array grown by one and the field at its end.
+  // The layout is the legacy 7-field array grown to 11: +ras, +protocolVersion, +agentMode,
+  // +blockSize.  A default-constructed Sample() has all-zero new fields.
   std::vector<uint8_t> empty = Pack(Sample());
   std::vector<uint8_t> expected = kLegacyBytes;
-  expected[0] = 0x98;
-  expected.insert(expected.end(), {0x95, 0xa0, 0x00, 0xa0, 0x00, 0x00});  // ["", 0, "", 0, 0]
+  expected[0] = 0x9b;                                                     // fixarray(11)
+  expected.insert(expected.end(), {0x95, 0xa0, 0x00, 0xa0, 0x00, 0x00});  // ras: ["", 0, "", 0, 0]
+  expected.insert(expected.end(), {0x00, 0x00, 0x00});  // protocolVersion, agentMode, blockSize
   EXPECT_EQ(empty, expected);
 }
 

@@ -124,14 +124,21 @@ struct EngineDesc {
   BackendDescBlobMap backendDescs;
   RasDesc ras;
 
+  uint32_t protocolVersion{0};
+  uint32_t agentMode{0};
+  uint64_t blockSize{0};
+
   bool operator==(const EngineDesc& rhs) const noexcept {
     return (key == rhs.key) && (nodeId == rhs.nodeId) && (hostname == rhs.hostname) &&
            (host == rhs.host) && (port == rhs.port) && (pid == rhs.pid) &&
-           (backendDescs == rhs.backendDescs) && (ras == rhs.ras);
+           (backendDescs == rhs.backendDescs) && (ras == rhs.ras) &&
+           (protocolVersion == rhs.protocolVersion) && (agentMode == rhs.agentMode) &&
+           (blockSize == rhs.blockSize);
   }
 
   // Append-only: new fields MUST go at the end to preserve wire compatibility.
-  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid, backendDescs, ras);
+  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid, backendDescs, ras, protocolVersion,
+                 agentMode, blockSize);
 };
 
 using MemoryUniqueId = uint32_t;
