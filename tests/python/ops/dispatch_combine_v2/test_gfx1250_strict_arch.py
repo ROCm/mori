@@ -23,7 +23,9 @@
 
 import os
 import re
+import signal
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -114,6 +116,49 @@ class TuningKeyTest(unittest.TestCase):
         rev0 = self.lookup(self.REV0, {}, shape)
         self.assertEqual(rev0, self.lookup(self.REV1, {}, shape))
         self.assertIsNotNone(rev0["schedule"])
+
+    def test_ep4_hidden5120_rows(self):
+        # (bound, dispatch block, warp, combine block, warp), both DeepSeek-V4.1-Flash MoEs.
+        topk6_quant = (
+            (128, 64, 4, 64, 8),
+            (256, 64, 4, 128, 8),
+            (512, 64, 8, 128, 8),
+            (1024, 128, 8, 128, 8),
+            (None, 256, 8, 128, 8),
+        )
+        topk3_quant = (
+            (128, 64, 4, 64, 8),
+            (256, 64, 4, 128, 8),
+            (512, 64, 8, 128, 8),
+            (1024, 128, 8, 256, 4),
+            (None, 256, 8, 256, 4),
+        )
+        want = {
+            (6, 96, "bf16"): (
+                (128, 64, 4, 64, 8),
+                (256, 64, 4, 128, 8),
+                (512, 128, 4, 128, 8),
+                (2048, 256, 4, 128, 8),
+                (None, 128, 16, 128, 8),
+            ),
+            (6, 96, "fp8"): topk6_quant,
+            (6, 96, "fp4"): topk6_quant,
+            (3, 32, "bf16"): (
+                (128, 64, 4, 64, 8),
+                (256, 64, 4, 128, 8),
+                (512, 128, 4, 128, 8),
+                (2048, 256, 4, 256, 4),
+                (None, 128, 16, 256, 4),
+            ),
+            (3, 32, "fp8"): topk3_quant,
+            (3, 32, "fp4"): topk3_quant,
+        }
+        for (topk, epr, dtype), schedule in want.items():
+            t = self.lookup(
+                self.REV1, {}, (4, 5120, topk), dtype=dtype, experts_per_rank=epr
+            )
+            with self.subTest(topk=topk, dtype=dtype):
+                self.assertEqual(tuple(map(tuple, t["schedule"])), schedule)
 
     def test_rev0_row_wins(self):
         row = {"gfx1250-strict": {self.SHAPE + (None,): {None: ((None, 32, 4),)}}}
@@ -270,6 +315,82 @@ class DeviceMacroCompileTest(unittest.TestCase):
                 if r.returncode != 0:
                     self.skipTest(f"{arch}: {r.stderr.strip().splitlines()[-1:]}")
                 self.assertEqual(" ".join(r.stdout.split()), want)
+
+
+def _gfx1250_gpus():
+    try:
+        import torch
+    except ImportError:
+        return 0
+    if not torch.cuda.is_available():
+        return 0
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    return torch.cuda.device_count() if arch == "gfx1250" else 0
+
+
+@unittest.skipUnless(_gfx1250_gpus() >= 4, "needs 4 gfx1250 GPUs")
+class Ep4LdsLimitTest(unittest.TestCase):
+    """EP4 hip dispatch/combine at the 64x16 dispatch geometry, eager and graph.
+
+    At hidden 5120 bf16 this launch used to need more LDS than a workgroup has, so it
+    was never scheduled and every rank waited forever; a hang shows up as a timeout.
+    """
+
+    TIMEOUT = 300
+
+    def run_bench(self, hidden, topk, epr):
+        env = dict(
+            os.environ,
+            BACKENDS="hip",
+            DISP="bf16",
+            COMB_MODE="pull",
+            HIDDEN=str(hidden),
+            TOPK=str(topk),
+            EPR=str(epr),
+            DBN="64",
+            DWPB="16",
+            CBN="64",
+            CWPB="8",
+            MODES="eager,graph",
+            SWEEP="64,512",
+            ITERS="5",
+        )
+        cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=4",
+            str(Path(__file__).with_name("bench_ep.py")),
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, _ = proc.communicate(timeout=self.TIMEOUT)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            out, _ = proc.communicate()
+            self.fail(
+                f"hidden {hidden} 64x16 did not finish in {self.TIMEOUT} s:\n{out}"
+            )
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("# PASS: 0 failed", out)
+
+    def test_64x16_dispatch_completes(self):
+        for hidden, topk, epr in (
+            (5120, 6, 96),
+            (5120, 3, 32),
+            (4096, 6, 96),
+            (7168, 6, 96),
+        ):
+            with self.subTest(hidden=hidden, topk=topk):
+                self.run_bench(hidden, topk, epr)
 
 
 if __name__ == "__main__":

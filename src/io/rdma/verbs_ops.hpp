@@ -43,6 +43,8 @@ class VerbsOps {
   virtual int GetAsyncEvent(ibv_context* ctx, ibv_async_event* event) = 0;
   virtual void AckAsyncEvent(ibv_async_event* event) = 0;
   virtual int QueryPort(ibv_context* ctx, uint8_t port, ibv_port_attr* attr) = 0;
+  // State changes the data path makes itself (cutting a QP); QP setup does not come here.
+  virtual int ModifyQp(ibv_qp* qp, ibv_qp_attr* attr, int attrMask) = 0;
   // Optional event source; the owner keeps its fd readable while events remain.
   virtual int WatchAsyncContext(ibv_context* ctx) = 0;
   virtual void UnwatchAsyncContext(ibv_context* ctx) = 0;
@@ -75,6 +77,9 @@ class RealVerbs final : public VerbsOps {
   int QueryPort(ibv_context* ctx, uint8_t port, ibv_port_attr* attr) override {
     return ibv_query_port(ctx, port, attr);
   }
+  int ModifyQp(ibv_qp* qp, ibv_qp_attr* attr, int attrMask) override {
+    return ibv_modify_qp(qp, attr, attrMask);
+  }
   int WatchAsyncContext(ibv_context*) override { return -1; }
   void UnwatchAsyncContext(ibv_context*) override {}
   void ReleaseAsyncContext(ibv_context*) override {}
@@ -88,6 +93,14 @@ VerbsOps& Verbs();
 inline RealVerbs kRealVerbs;
 inline RealVerbs& Verbs() { return kRealVerbs; }
 #endif
+
+// Moves `qp` to Error through `verbs`: each WR on it has then either completed or is
+// flushed without running, as when a fatal event kills a QP. Returns ibv_modify_qp's result.
+inline int ModifyQpToError(VerbsOps& verbs, ibv_qp* qp) {
+  ibv_qp_attr attr{};
+  attr.qp_state = IBV_QPS_ERR;
+  return verbs.ModifyQp(qp, &attr, IBV_QP_STATE);
+}
 
 }  // namespace io
 }  // namespace mori

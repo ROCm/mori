@@ -64,6 +64,16 @@ Three scenarios target the protocol rather than the data path:
     queues are process-wide, so the ops must take different queue offsets or each
     recv's drain also waits for the other op's transfers.
 
+Segmented receive (async_ll_recv_layout; SEGMENTED=0 skips; on other transports
+and with the fused receive it only checks that "segmented" is refused and "auto"
+resolves to "compact") runs bf16 and fp8 with scales, the fp8 op built with
+"auto": every segment holds exactly its source's tokens, every other row is
+invalidated (expert, weight, scales), total_recv is the row count and
+segment_counts() the per-source counts, through stride changes, shrinking counts
+under one stride, a compact round on the same op, refused arguments, a stride one
+rank gets wrong and a round one rank runs compact (both must be counted on every
+rank); then two segmented ops in the TBO order with no host sync.
+
 The swept shapes are chosen for the two things that have actually broken:
 top-k that does not divide the wavefront (64 % 6 == 4, DeepSeek-V4's shape), and
 ranks that are handed no tokens at all.
@@ -864,6 +874,535 @@ def run_call_order(d, comm):
     return failures
 
 
+# --- segmented receive (async_ll_recv_layout) ---------------------------------
+
+
+def _seg_config(d, hidden, topk, epr, m, layout, fp8, own_queue=False):
+    """An SDMA AsyncLL op with the segmented layout ("segmented" or "auto"); fp8
+    adds MXFP8-like scales (one e8m0 byte per 32 elements), the layout sglang
+    dispatches."""
+    extra = {}
+    if fp8:
+        extra.update(
+            dispatch_data_type=torch.float8_e4m3fn,
+            combine_data_type=torch.bfloat16,
+            scale_dim=hidden // 32,
+            scale_type_size=1,
+        )
+    if own_queue:
+        extra["async_ll_own_sdma_queue"] = True
+    return EpDispatchCombineConfig(
+        rank=d.rank,
+        world_size=d.world,
+        hidden_dim=hidden,
+        max_num_inp_token_per_rank=m,
+        num_experts_per_rank=epr,
+        num_experts_per_token=topk,
+        data_type=torch.bfloat16,
+        kernel_backend="hip",
+        async_ll=True,
+        async_ll_transport="sdma",
+        async_ll_recv_layout=layout,
+        **extra,
+    )
+
+
+def _seg_inputs(d, dev, n, hidden, topk, epr, m, fp8, seed, weighted=True):
+    gen = torch.Generator(device=dev).manual_seed(seed)
+    x = torch.randn(n, hidden, generator=gen, device=dev, dtype=torch.bfloat16)
+    if fp8:
+        x = x.to(torch.float8_e4m3fn)
+    w = torch.rand(n, topk, generator=gen, device=dev, dtype=torch.float32)
+    idx = _routing(d.rank, d.world, m, topk, epr, dev, gen, n)
+    scales = None
+    if fp8:
+        scales = torch.randint(
+            0, 255, (n, hidden // 32), generator=gen, device=dev, dtype=torch.uint8
+        )
+    weights = w if weighted else None
+    # (rows, indices, hidden as bytes, weights, scales, hidden as float32): bytes
+    # because CPU torch has few fp8 kernels.
+    local = (
+        n,
+        idx.cpu(),
+        _seg_bytes(x).cpu(),
+        None if weights is None else weights.cpu(),
+        None if scales is None else scales.cpu(),
+        x.float().cpu(),
+    )
+    gathered = [None] * d.world
+    dist.all_gather_object(gathered, local)
+    return x, weights, scales, idx, gathered
+
+
+def _seg_bytes(t):
+    return t.contiguous().view(torch.uint8)
+
+
+def _seg_check_dispatch(d, snap, stride, gathered, m, epr, tag):
+    """The segment layout: rows [s*S, s*S + n_s) are exactly the tokens rank s
+    routed here (any order), field for field, and every other row of the segment
+    points at the next rank's first expert with weight 0, zeroed scales and
+    reverse entry -1. total_recv is the row count, world_size * S, and
+    snap["counts"] (segment_counts()) holds each segment's live rows."""
+    world, rows = d.world, d.world * stride
+    failures = 0
+
+    def fail(msg):
+        nonlocal failures
+        print(f"[rank {d.rank}] {tag}: {msg}", flush=True)
+        failures += 1
+
+    for name in ("out", "indices", "weights"):
+        if snap[name].shape[0] != rows:
+            fail(f"{name} has {snap[name].shape[0]} rows, want {rows}")
+            return failures
+    reverse = snap["reverse"][:rows].cpu().to(torch.int64)
+    hidden = _seg_bytes(snap["out"].cpu())
+    indices, weights = snap["indices"].cpu(), snap["weights"].cpu()
+    scales = None if snap["scales"] is None else _seg_bytes(snap["scales"].cpu())
+    invalid_expert = (d.rank + 1) % world * epr
+    has_weights = gathered[d.rank][3] is not None
+    total = 0
+    for s, (src_n, src_idx, src_x, src_w, src_s, _) in enumerate(gathered):
+        want = sorted(
+            t
+            for t in range(src_n)
+            if d.rank in {int(e) // epr for e in src_idx[t].tolist()}
+        )
+        total += len(want)
+        seg = reverse[s * stride : (s + 1) * stride]
+        n_s = int((seg >= 0).sum().item())
+        if n_s and not bool((seg[:n_s] >= 0).all()):
+            fail(f"segment {s}: live rows are not a prefix")
+            continue
+        origin = seg[:n_s]
+        toks = (origin % m).tolist()
+        if bool((origin // m != s).any()) or sorted(toks) != want:
+            fail(
+                f"segment {s}: {n_s} rows with origins {sorted(toks)[:8]}..., want {len(want)}"
+            )
+            continue
+        live = slice(s * stride, s * stride + n_s)
+        expect = {
+            "hidden": (hidden[live], src_x[toks]),
+            "indices": (indices[live], src_idx[toks]),
+        }
+        if has_weights:
+            expect["weights"] = (weights[live], src_w[toks])
+        if scales is not None:
+            n_scale = src_s.shape[1]
+            expect["scales"] = (scales[live][:, :n_scale], src_s[toks])
+        for field, (got, ref) in expect.items():
+            if n_s and not torch.equal(got, ref):
+                fail(f"segment {s}: {field} mismatch")
+        dead = slice(s * stride + n_s, (s + 1) * stride)
+        if not bool((indices[dead] == invalid_expert).all()):
+            fail(f"segment {s}: empty rows not pointed at expert {invalid_expert}")
+        if not bool((weights[dead] == 0).all()):
+            fail(f"segment {s}: empty rows have nonzero weights")
+        if scales is not None and not bool((scales[dead] == 0).all()):
+            fail(f"segment {s}: empty rows have nonzero scales")
+        if snap.get("counts") is not None and int(snap["counts"][s]) != len(want):
+            fail(f"segment_counts()[{s}]={int(snap['counts'][s])}, want {len(want)}")
+    recv = int(snap["total"][0].item())
+    if recv != rows:
+        fail(f"total_recv={recv}, want the row count {rows} ({total} live)")
+    return failures
+
+
+def _seg_identity_expert(op, out, reverse, rows, separate=False):
+    """Write the identity expert's output in the segment layout, empty rows NaN so
+    a combine that reads one cannot pass. separate=True returns a tensor of its
+    own (combine must then stage it into the arena)."""
+    stage = op.combine_in_view()
+    target = torch.empty_like(stage) if separate else stage
+    target.copy_(out.to(target.dtype))
+    target[reverse[:rows] < 0] = float("nan")
+    return target
+
+
+def _seg_check_combine(d, combined, gathered, epr, tag):
+    n = gathered[d.rank][0]
+    if not n:
+        return 0
+    uniq = torch.tensor(
+        [len({int(e) // epr for e in row.tolist()}) for row in gathered[d.rank][1]],
+        dtype=torch.float32,
+    )
+    want = gathered[d.rank][5] * uniq[:, None]
+    got = combined[:n].cpu().float()
+    if not torch.allclose(got, want, atol=1e-2, rtol=1e-2):
+        diff = (got - want).abs().max().item()
+        print(f"[rank {d.rank}] {tag}: combine max |diff| {diff:.4f}", flush=True)
+        return 1
+    return 0
+
+
+def _seg_flags(d, op, tag, want=0):
+    flags = op.segment_error_flags(clear=True)
+    if (flags != 0) != (want != 0) or (want and not flags & want):
+        print(
+            f"[rank {d.rank}] {tag}: segment error flags {flags}, want {want}",
+            flush=True,
+        )
+        return 1
+    return 0
+
+
+def run_segmented(d, comm, layout, fp8):
+    """One op, rounds checked one at a time: strides that are exact, the full
+    capacity, and change between rounds; a round whose counts shrink under the
+    same stride (the previous round's rows must be invalidated); a compact round
+    in between on the same op; both APIs; refused arguments; and a stride that one
+    rank gets wrong and a round one rank runs compact, which every rank must
+    flag."""
+    hidden, topk, epr, m = 4096, 6, 16, 64
+    rank, world = d.rank, d.world
+    dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
+    # (per-rank counts, stride or None for a compact round, weighted, split API)
+    base = [((r * 7) % (m // 2)) + (r % 3 == 0) * 5 for r in range(world)]
+    base[world // 2] = 0  # a rank with nothing to send still receives
+    full = [min(m, c * 2 + 1) for c in base]
+    small = [c // 3 for c in full]
+    rounds = [
+        (base, max(max(base), 1), True, True),
+        (full, m, True, False),
+        (small, m, False, True),
+        (base, max(base) + 5, True, False),
+        (small, None, True, True),
+        (full, max(full), True, True),
+    ]
+    failures = 0
+    with EpDispatchCombineOp(
+        _seg_config(d, hidden, topk, epr, m, layout, fp8), comm
+    ) as op:
+        if op.cfg.async_ll_recv_layout != "segmented":
+            print(
+                f"[rank {rank}] seg {layout!r}: resolved to "
+                f"{op.cfg.async_ll_recv_layout!r} on a supported config",
+                flush=True,
+            )
+            return 1
+        level = layout
+        for r, (counts, stride, weighted, split) in enumerate(rounds):
+            n = counts[rank]
+            x, weights, scales, idx, gathered = _seg_inputs(
+                d, dev, n, hidden, topk, epr, m, fp8, 2468 + rank * 13 + r, weighted
+            )
+            tag = (
+                f"seg level={level} fp8={fp8} round={r} stride={stride} "
+                f"api={'split' if split else 'ordinary'} weights={weighted}"
+            )
+            dispatch = op.dispatch_send if split else op.dispatch
+            sent = dispatch(
+                x, weights, scales, idx, return_routing=True, segment_stride=stride
+            )
+            if split:
+                op.dispatch_recv()
+            out, out_w, out_s, out_idx, total, routing = sent
+            reverse = routing.disp_tok_id_to_src_tok_id_local
+            torch.cuda.synchronize()
+            dist.barrier()
+            if stride is None:
+                recv, bad = _check_dispatch(
+                    d,
+                    _seg_bytes(out),
+                    out_idx,
+                    out_w,
+                    total,
+                    reverse,
+                    [g[:4] for g in gathered],
+                    m,
+                    epr,
+                    tag,
+                )
+                failures += bad
+                expert = out[:recv].to(torch.bfloat16)
+            else:
+                snap = dict(
+                    out=out,
+                    weights=out_w,
+                    scales=out_s,
+                    indices=out_idx,
+                    total=total,
+                    reverse=reverse,
+                    counts=op.segment_counts().cpu(),
+                )
+                failures += _seg_check_dispatch(d, snap, stride, gathered, m, epr, tag)
+                expert = _seg_identity_expert(
+                    op, out, reverse, world * stride, separate=(r == 3)
+                )
+            combine = op.combine_send if split else op.combine
+            cout, _ = combine(expert, routing=routing)
+            if split:
+                op.combine_recv()
+            torch.cuda.synchronize()
+            dist.barrier()
+            failures += _seg_check_combine(d, cout, gathered, epr, tag)
+            failures += _seg_flags(d, op, tag)
+
+        # Refused on the host before any launch; the op stays usable.
+        def refused(what, fn):
+            nonlocal failures
+            try:
+                fn()
+            except ValueError:
+                return
+            print(f"[rank {rank}] seg level={level}: {what} was accepted", flush=True)
+            failures += 1
+
+        counts = base
+        n = counts[rank]
+        x, weights, scales, idx, gathered = _seg_inputs(
+            d, dev, n, hidden, topk, epr, m, fp8, 97531 + rank, True
+        )
+        # A stride below some rank's tokens is not refused (a host error on that
+        # rank alone would leave the others waiting in the receive). Every rank
+        # runs the round; a rank with more rows for a peer than the stride drops
+        # the rest and counts an overflow, the others stay clean, nobody hangs.
+        small = max(1, max(counts) // 2)
+        dest = (idx.long() // epr).cpu()
+        rows_per_dest = [int((dest == pe).any(dim=1).sum()) for pe in range(world)]
+        want = 1 if max(rows_per_dest, default=0) > small else 0
+        *_, routing = op.dispatch(
+            x, weights, scales, idx, return_routing=True, segment_stride=small
+        )
+        op.combine(op.combine_in_view(), routing=routing)
+        torch.cuda.synchronize()
+        dist.barrier()
+        flags = op.segment_error_flags(clear=True)
+        if flags != want:
+            print(
+                f"[rank {rank}] seg level={level}: stride {small} under rows "
+                f"{rows_per_dest}: flags {flags}, want {want}",
+                flush=True,
+            )
+            failures += 1
+        refused(
+            "stride above the capacity",
+            lambda: op.dispatch(x, weights, scales, idx, segment_stride=m + 1),
+        )
+        stride = max(counts)
+        *_, routing = op.dispatch(
+            x, weights, scales, idx, return_routing=True, segment_stride=stride
+        )
+        refused(
+            "combine with the compact row count",
+            lambda: op.combine(op.combine_in_view()[: stride - 1], routing=routing),
+        )
+        op.combine(op.combine_in_view(), routing=routing)
+        torch.cuda.synchronize()
+        dist.barrier()
+        failures += _seg_flags(d, op, f"seg level={level} after refusals")
+
+        # Rank 0 alone uses a wider stride. Every offset stays inside the buffers
+        # (both strides are within the capacity), so the round only computes
+        # garbage, and every rank must say so.
+        wrong = stride + (8 if rank == 0 else 0)
+        *_, routing = op.dispatch(
+            x, weights, scales, idx, return_routing=True, segment_stride=wrong
+        )
+        op.combine(op.combine_in_view(), routing=routing)
+        torch.cuda.synchronize()
+        dist.barrier()
+        failures += _seg_flags(d, op, f"seg level={level} stride mismatch", want=2)
+
+        # Rank 0 alone runs the round compact (as a rank in a CUDA-graph round
+        # would): it reads segmented landings with the compact layout and its
+        # peers read its compact landing as segments. Every rank must count it,
+        # rank 0 included.
+        _, mismatch0 = op.segment_error_counts()
+        compact = rank == 0
+        sent = op.dispatch(
+            x,
+            weights,
+            scales,
+            idx,
+            return_routing=True,
+            segment_stride=None if compact else stride,
+        )
+        if compact:
+            recv = int(sent[4][0].item())
+            op.combine(sent[0][:recv].to(torch.bfloat16), routing=sent[5])
+        else:
+            op.combine(op.combine_in_view(), routing=sent[5])
+        torch.cuda.synchronize()
+        dist.barrier()
+        tag = f"seg level={level} mode mismatch"
+        if op.segment_error_counts()[1] <= mismatch0:
+            print(f"[rank {rank}] {tag}: mismatch counter did not move", flush=True)
+            failures += 1
+        failures += _seg_flags(d, op, tag, want=2)
+
+        # And the next round is clean again.
+        sent = op.dispatch(
+            x, weights, scales, idx, return_routing=True, segment_stride=stride
+        )
+        reverse = sent[5].disp_tok_id_to_src_tok_id_local
+        torch.cuda.synchronize()
+        dist.barrier()
+        snap = dict(
+            out=sent[0],
+            weights=sent[1],
+            scales=sent[2],
+            indices=sent[3],
+            total=sent[4],
+            reverse=reverse,
+            counts=op.segment_counts().cpu(),
+        )
+        tag = f"seg level={level} after mismatch"
+        failures += _seg_check_dispatch(d, snap, stride, gathered, m, epr, tag)
+        expert = _seg_identity_expert(op, sent[0], reverse, world * stride)
+        cout, _ = op.combine(expert, routing=sent[5])
+        torch.cuda.synchronize()
+        dist.barrier()
+        failures += _seg_check_combine(d, cout, gathered, epr, tag)
+        failures += _seg_flags(d, op, tag)
+
+        # reset() zeroes the device counters, so the flags' baseline must restart
+        # with them: a mismatch right after a reset is flagged, not hidden until
+        # the counters climb past the old baseline.
+        op.reset()
+        torch.cuda.synchronize()
+        dist.barrier()
+        tag = f"seg level={level} mismatch after reset"
+        if op.segment_error_counts() != (0, 0):
+            print(
+                f"[rank {rank}] {tag}: counters {op.segment_error_counts()} after reset",
+                flush=True,
+            )
+            failures += 1
+        *_, routing = op.dispatch(
+            x, weights, scales, idx, return_routing=True, segment_stride=wrong
+        )
+        op.combine(op.combine_in_view(), routing=routing)
+        torch.cuda.synchronize()
+        dist.barrier()
+        failures += _seg_flags(d, op, tag, want=2)
+    return failures
+
+
+def run_segmented_two_ops(d, comm_a, comm_b, layers, fp8):
+    """Two segmented ops (A built "segmented", B "auto") in the
+    single-stream TBO order of run_two_ops_interleaved, no host sync, a different
+    stride per op and per layer and counts that shrink under an unchanged stride."""
+    hidden, topk, epr = 4096, 6, 16
+    caps = (64, 48)
+    modes = ("segmented", "auto")
+    rank, world = d.rank, d.world
+    dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
+
+    plans = []
+    for k, m in enumerate(caps):
+        per_op = []
+        for layer in range(layers):
+            if layer % 2 == 0:
+                counts = [((r + layer + 3 * k) * 5) % (m + 1) for r in range(world)]
+                stride = min(m, max(max(counts), 1) + (layer % 3) * 4)
+            else:
+                # Half the rows under the previous layer's stride.
+                counts = [c // 2 for c in counts]
+            n = counts[rank]
+            x, w, s, idx, gathered = _seg_inputs(
+                d, dev, n, hidden, topk, epr, m, fp8, 13579 + rank * 31 + layer * 7 + k
+            )
+            per_op.append((x, w, s, idx, gathered, stride))
+        plans.append(per_op)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    failures = 0
+    cfgs = [
+        _seg_config(d, hidden, topk, epr, m, mode, fp8, own_queue=True)
+        for m, mode in zip(caps, modes)
+    ]
+    op_a = EpDispatchCombineOp(cfgs[0], comm_a)
+    with op_a, EpDispatchCombineOp(cfgs[1], comm_b) as op_b:
+        ops = (op_a, op_b)
+        kept = [[None] * layers for _ in ops]
+        couts = [None, None]
+
+        def send(k, layer):
+            x, w, s, idx, _, stride = plans[k][layer]
+            return ops[k].dispatch_send(
+                x, w, s, idx, return_routing=True, segment_stride=stride
+            )
+
+        def recv_and_return(k, layer, sent):
+            out, out_w, out_s, out_idx, total, routing = sent
+            ops[k].dispatch_recv()
+            reverse = routing.disp_tok_id_to_src_tok_id_local.clone()
+            kept[k][layer] = {
+                "out": out.clone(),
+                "weights": out_w.clone(),
+                "scales": None if out_s is None else out_s.clone(),
+                "indices": out_idx.clone(),
+                "total": total.clone(),
+                "reverse": reverse,
+                "counts": ops[k].segment_counts().clone(),
+            }
+            stride = plans[k][layer][-1]
+            expert = _seg_identity_expert(ops[k], out, reverse, world * stride)
+            couts[k], _ = ops[k].combine_send(expert, routing=routing)
+
+        def finish_combine(k, layer):
+            ops[k].combine_recv()
+            kept[k][layer]["combined"] = couts[k][: plans[k][layer][0].shape[0]].clone()
+
+        for layer in range(layers):
+            sent_a = send(0, layer)
+            if layer:
+                finish_combine(1, layer - 1)
+            sent_b = send(1, layer)
+            recv_and_return(0, layer, sent_a)
+            recv_and_return(1, layer, sent_b)
+            finish_combine(0, layer)
+        finish_combine(1, layers - 1)
+
+        torch.cuda.synchronize()
+        dist.barrier()
+        for k, m in enumerate(caps):
+            for layer in range(layers):
+                *_, gathered, stride = plans[k][layer]
+                snap = kept[k][layer]
+                tag = f"seg two_ops op={'AB'[k]} layer={layer} stride={stride}"
+                failures += _seg_check_dispatch(d, snap, stride, gathered, m, epr, tag)
+                failures += _seg_check_combine(d, snap["combined"], gathered, epr, tag)
+            failures += _seg_flags(d, ops[k], f"seg two_ops op={'AB'[k]}")
+    return failures
+
+
+def run_segmented_refused(d, comm):
+    """The segmented layout is SDMA on one node without the fused receive;
+    anything else is refused when the op is built "segmented", and "auto"
+    resolves to "compact"."""
+    failures = 0
+    try:
+        cfg = _seg_config(d, 2048, 8, 8, 32, "segmented", False)
+        cfg.async_ll_transport = os.environ.get("TRANSPORT", "sdma")
+        EpDispatchCombineOp(cfg, comm).close()
+    except ValueError:
+        pass
+    else:
+        print(
+            f"[rank {d.rank}] segmented accepted where it must be refused",
+            flush=True,
+        )
+        failures += 1
+    cfg = _seg_config(d, 2048, 8, 8, 32, "auto", False)
+    cfg.async_ll_transport = os.environ.get("TRANSPORT", "sdma")
+    with EpDispatchCombineOp(cfg, comm) as op:
+        if op.cfg.async_ll_recv_layout != "compact":
+            print(
+                f"[rank {d.rank}] segmented 'auto' resolved to "
+                f"{op.cfg.async_ll_recv_layout!r} where it is unsupported",
+                flush=True,
+            )
+            failures += 1
+    return failures
+
+
 def main():
     d = Dist()
     shapes = _shapes()
@@ -877,6 +1416,7 @@ def main():
     two_ops = int(os.environ.get("TWO_OPS", "4"))
     if two_ops < 0:
         raise ValueError("TWO_OPS must be nonnegative")
+    segmented = os.environ.get("SEGMENTED", "1") != "0"
 
     failures = 0
     # One communicator PER SHAPE, each with its own unique id, rather than one for
@@ -948,13 +1488,49 @@ def main():
     if d.rank == 0:
         print("# asyncll call order: done", flush=True)
 
+    seg_runs = "off"
+    if segmented:
+        transport = os.environ.get("TRANSPORT", "sdma")
+        fused = os.environ.get("MORI_ASYNCLL_FUSED_RECV", "0") == "1"
+        if transport != "sdma" or fused:
+            failures += own_comm(lambda c: run_segmented_refused(d, c), 2048, 32)
+            seg_runs = "refused"
+        else:
+            for fp8 in (False, True):
+                mode = "auto" if fp8 else "segmented"
+                failures += own_comm(lambda c: run_segmented(d, c, mode, fp8), 4096, 64)
+                if d.rank == 0:
+                    print(
+                        f"# asyncll segmented mode={mode!r} fp8={fp8}: done",
+                        flush=True,
+                    )
+            if two_ops:
+                failures += own_comm(
+                    lambda ca: own_comm(
+                        lambda cb: run_segmented_two_ops(d, ca, cb, two_ops, True),
+                        4096,
+                        64,
+                    ),
+                    4096,
+                    64,
+                )
+                if d.rank == 0:
+                    print(
+                        f"# asyncll segmented two ops interleaved: {two_ops} layers done",
+                        flush=True,
+                    )
+            seg_runs = "segmented, auto"
+        if d.rank == 0:
+            print(f"# asyncll segmented: {seg_runs}", flush=True)
+
     total = d.allreduce_sum(failures)
     if d.rank == 0:
         print(
             f"# {'PASS' if total == 0 else 'FAIL'}: {total} failed checks across "
             f"{d.world} ranks, {len(shapes)} shapes x {loops} iterations x 2 APIs, "
             f"2 graph scenarios x {graph_replays} replays, "
-            f"{back_to_back} back-to-back rounds, {two_ops} two-op layers, call order",
+            f"{back_to_back} back-to-back rounds, {two_ops} two-op layers, call order, "
+            f"segmented {seg_runs}",
             flush=True,
         )
     dist.destroy_process_group()

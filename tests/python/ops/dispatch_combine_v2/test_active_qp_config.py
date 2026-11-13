@@ -21,14 +21,16 @@
 # SOFTWARE.
 """Active QP bounds, fixed allocation, and precompiled subset selection."""
 
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig
+from mori.ops.dispatch_combine_v2 import EpDispatchRoutingHandle
 from mori.ops.dispatch_combine_v2 import hip_tuning_configs as tuning
-from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+from mori.ops.dispatch_combine_v2.hip_backend import _LL_SPEC, EpDispatchCombineOpHip
 
 
 @pytest.mark.parametrize("allocated", [0, -1, True, 2.0])
@@ -278,8 +280,10 @@ def build(monkeypatch, cfg):
     op._active_qps_override = None
     op._multi_processor_count = 80
     op._schedule = tuning.resolve_schedule(cfg)
-    op._dispatch_specs = tuple(dict.fromkeys(e.dispatch for e in op._schedule))
-    op._combine_specs = tuple(dict.fromkeys(e.combine for e in op._schedule))
+    op._ll_schedule = tuning.resolve_ll_schedule(cfg)
+    rows = op._schedule + op._ll_schedule
+    op._dispatch_specs = tuple(dict.fromkeys(e.dispatch for e in rows))
+    op._combine_specs = tuple(dict.fromkeys(e.combine for e in rows))
     op._plans = []
     op._kernels = op._build_internode_kernels(cfg)
     return op
@@ -300,11 +304,12 @@ def test_every_launch_key_is_built(tables, monkeypatch, family, selectable):
     for override in (None, *(selectable or ())):
         op._active_qps_override = override
         for num_tokens in range(1, cfg.max_num_inp_token_per_rank + 1):
-            dispatch, combine = op._pick(num_tokens)
-            assert dispatch in op._kernels.dispatch
-            assert combine in op._kernels.combine
-            if override is not None:
-                assert dispatch.active_qps == combine.active_qps == override
+            for peak in (None, num_tokens):
+                dispatch, combine = op._pick(num_tokens, max_tokens=peak)
+                assert dispatch in op._kernels.dispatch
+                assert combine in op._kernels.combine
+                if override is not None:
+                    assert dispatch.active_qps == combine.active_qps == override
     op._active_qps_override = None
 
     # Every plan drains the op's largest active count, one op-wide value: the
@@ -313,6 +318,126 @@ def test_every_launch_key_is_built(tables, monkeypatch, family, selectable):
     assert {plan.request["numQpToDrain"] for plan in op._plans} == {expected_drain}
     # And the kernels carry each phase's own count; untuned buckets default to 2.
     assert {plan.request["numQpPerPe"] for plan in op._plans} >= {1, 4, 2}
+
+
+def test_auto_family_follows_the_peak_across_ranks(tables, monkeypatch):
+    op = build(monkeypatch, config(internode_auto_ll_max_tokens=8))
+    for num_tokens in (1, 8):
+        assert op._pick(num_tokens)[0].family == "v2"
+        assert op._pick(num_tokens, max_tokens=8)[0].family == "v2_ll"
+        assert op._pick(num_tokens, max_tokens=9)[0].family == "v2"
+    assert op.kernel_config(64, 128).dispatch.family == "v2"
+
+
+@pytest.mark.parametrize(
+    "low_latency,family", [(None, "auto"), (True, "v2_ll"), (False, "v2")]
+)
+def test_low_latency_names_the_internode_family(low_latency, family):
+    assert config(low_latency=low_latency).internode_kernel == family
+    cfg = config(low_latency=low_latency, internode_kernel=family)
+    assert cfg.internode_kernel == family
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        (dict(low_latency=True, internode_kernel="v2"), "conflicts"),
+        (dict(low_latency=False, internode_kernel="v2_ll"), "conflicts"),
+        (dict(low_latency=1), "low_latency must be"),
+    ],
+)
+def test_reject_invalid_low_latency(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        config(**kwargs)
+
+
+LOG = "mori.ops.dispatch_combine_v2.dispatch_combine_op"
+
+
+def warned(caplog):
+    return [record for record in caplog.records if record.name == LOG]
+
+
+def split_op(low_latency):
+    op = object.__new__(EpDispatchCombineOpHip)
+    op.cfg = config(gpu_per_node=16, low_latency=low_latency)
+    op._ll128_split = {"max_tok": 64}
+    spec = tuning.KernelConfig("intra", 64, 16)
+    op._schedule = (tuning.ScheduleEntry(None, spec, spec),)
+    op._ll_schedule = ()
+    return op
+
+
+@pytest.mark.parametrize("low_latency", [None, True])
+def test_split_ll128_follows_the_peak_only(low_latency):
+    op = split_op(low_latency)
+    assert op._pick(32, max_tokens=64) == (_LL_SPEC, _LL_SPEC)
+    assert op._pick(32, max_tokens=65)[0].family == "intra"
+    assert op._pick(32)[0].family == "intra"
+
+
+@pytest.mark.parametrize("snapshot", [False, True])
+def test_low_latency_true_needs_the_peak_on_a_split_op(snapshot):
+    with pytest.raises(ValueError, match="low_latency=True needs"):
+        split_op(True)._check_no_peak(snapshot)
+
+
+def test_dispatch_without_the_peak_warns_once_where_it_matters(
+    tables, monkeypatch, caplog
+):
+    def warnings_from(op):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=LOG):
+            op._check_no_peak(False)
+            op._check_no_peak(False)
+        return len(warned(caplog))
+
+    auto = config(internode_auto_ll_max_tokens=8)
+    assert warnings_from(build(monkeypatch, auto)) == 1
+    assert warnings_from(split_op(None)) == 1
+    assert warnings_from(build(monkeypatch, replace(auto, rank=1))) == 0
+    assert warnings_from(build(monkeypatch, config(low_latency=False))) == 0
+    assert warnings_from(build(monkeypatch, config(low_latency=True))) == 0
+
+
+def test_a_rebuilt_handle_carries_the_peak_or_is_refused(tables, monkeypatch):
+    import torch
+
+    auto = build(monkeypatch, config(internode_auto_ll_max_tokens=8))
+    fixed = build(monkeypatch, config(internode_kernel="v2"))
+    handle = EpDispatchRoutingHandle(
+        *(torch.zeros(1) for _ in range(5)),
+        cur_rank_num_token=4,
+        max_num_inp_token_across_ranks=8,
+    )
+    peak = auto._routing_peak(handle, False)
+    assert peak == 8 and auto._pick(4, max_tokens=peak)[1].family == "v2_ll"
+    for peak in (None, 8):
+        rebuilt = EpDispatchRoutingHandle.from_tensors(
+            handle.tensors(), cur_rank_num_token=4, max_num_inp_token_across_ranks=peak
+        )
+        assert auto._routing_peak(rebuilt, False) == peak
+    bare = EpDispatchRoutingHandle.from_tensors(handle.tensors(), cur_rank_num_token=4)
+    for routing in (bare, SimpleNamespace(cur_rank_num_token=4)):
+        with pytest.raises(ValueError, match="from_tensors"):
+            auto._routing_peak(routing, False)
+        assert fixed._routing_peak(routing, False) is None
+
+
+def test_internode_kernel_family_takes_the_peak_by_keyword():
+    cfg = config(internode_auto_ll_max_tokens=8)
+    assert tuning.internode_kernel_family(cfg, max_tokens=8) == "v2_ll"
+    with pytest.raises(TypeError):
+        tuning.internode_kernel_family(cfg, 8)
+
+
+@pytest.mark.parametrize("low_latency,expected", [(True, 1), (None, 0), (False, 0)])
+def test_unused_low_latency_is_reported(caplog, low_latency, expected):
+    op = object.__new__(EpDispatchCombineOpHip)
+    op.cfg = config(gpu_per_node=16, low_latency=low_latency)
+    with caplog.at_level(logging.WARNING, logger=LOG):
+        op._warn_unused_low_latency()
+    assert len(warned(caplog)) == expected
 
 
 @pytest.mark.parametrize("capacity,expected", [(64, 2), (65, 4), (128, 4)])

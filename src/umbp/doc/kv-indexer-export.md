@@ -17,14 +17,14 @@ config.kv_indexer = KvIndexerConfig(
 client = UMBPClient(config)
 ```
 
-Each metadata record is `KvBlockMetadata(hash, parent_hash, token_count,
+Each metadata record is `KvBlockMetadata(hash, parent_hash, block_size,
 component_keys)`: signed int64 hash, `None` for a root, and all physical keys for
 FULL=1/SWA=2/MAMBA=4. Records are immutable while tracked; repeats reuse metadata.
 The callback runs before writes, outside storage locks. Indexer outages do not
 fail successful storage writes. Bound
 Python methods are held weakly: keep the adapter alive while using its client.
 
-Pool mode requires [SGLang's shared-pool protocol](../distributed/proto/README.sgl-kv-indexer.md).
+Pool mode requires [SGLang's shared-pool protocol](https://github.com/ROCm/mori/blob/main/src/umbp/distributed/proto/README.sgl-kv-indexer.md).
 Use one owner per pool and compatible model/page/key layouts. All forwarders use
 the same pool configuration; each HBM bridge sets `KV_INDEXER_DRAM_POOL_ID` and
 its own component/window settings. The owner reports DRAM once and the Indexer
