@@ -36,9 +36,11 @@ struct Url {
 bool ParseUrl(const std::string& s, Url* out, std::string* err);
 std::string UrlEncode(const std::string& s);
 
-// Sends one request with a total deadline of `timeout_ms` (connect, send and receive).
+// Sends one request. `idle_ms` bounds the connect and every wait without progress (a slow link
+// that keeps moving data is not cut off); `total_ms` > 0 also bounds the whole request.
 // Returns the HTTP status, or -1 with *err set. The response body is cut at 1 MiB.
 int HttpRequest(const Url& url, const std::string& method, const std::string& path_and_query,
-                const std::string& body, int timeout_ms, std::string* response, std::string* err);
+                const std::string& body, int idle_ms, int total_ms, std::string* response,
+                std::string* err);
 
 }  // namespace xgmi

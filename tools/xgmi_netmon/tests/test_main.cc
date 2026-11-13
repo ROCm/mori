@@ -102,6 +102,7 @@ class FakeVm {
   };
   std::string series_body = R"({"status":"success","data":[]})";
   std::atomic<bool> hang{false};
+  std::atomic<bool> slow{false};  // read 64 KiB every 20 ms
   std::atomic<int> import_status{204};
 
   FakeVm() {
@@ -129,7 +130,7 @@ class FakeVm {
   std::string imported() {
     std::string all;
     for (const Request& r : requests())
-      if (r.path == "/api/v1/import/prometheus") all += r.body;
+      if (r.path == "/api/v1/import") all += r.body;
     return all;
   }
 
@@ -149,6 +150,7 @@ class FakeVm {
     char buf[65536];
     size_t need = std::string::npos;
     while (need == std::string::npos || in.size() < need) {
+      if (slow) std::this_thread::sleep_for(std::chrono::milliseconds(20));
       const ssize_t r = recv(c, buf, sizeof(buf), 0);
       if (r <= 0) return;
       in.append(buf, static_cast<size_t>(r));
@@ -177,7 +179,7 @@ class FakeVm {
       body = "OK";
     } else if (req.path.rfind("/api/v1/series", 0) == 0) {
       body = series_body;
-    } else if (req.path == "/api/v1/import/prometheus") {
+    } else if (req.path == "/api/v1/import") {
       status =
           std::to_string(import_status.load()) + (import_status == 204 ? " No Content" : " Error");
     } else if (req.path.rfind("/api/v1/admin/tsdb/delete_series", 0) == 0) {
@@ -307,44 +309,41 @@ void TestDiscover() {
 void TestRates() {
   int peer[kNumLinks] = {-1, 4, -1, -1, -1, -1, -1, -1};
   RateCalc c("exp\"1", "h1", 0, peer, 72e9);
-  std::string out;
   const uint64_t t = 1000000000123456789ull;
-  c.Add(MakeRecord(t, 1000, 100, 200), &out);
-  CHECK(out.empty());
-
-  c.Add(MakeRecord(t + 2000000, 1000 + 200000, 1100, 200), &out);  // 2 ms, 1000 KB received
-  const std::string L = "{experiment=\"exp\\\"1\",host=\"h1\",gpu=\"0\"";
-  CHECK_STR(out, "xgmi_interval_seconds" + L +
-                     "} 0.002000000 1000000000125\n"
-                     "xgmi_bytes" +
-                     L +
-                     ",peer=\"4\",dir=\"rd\"} 1024000 1000000000125\n"
-                     "xgmi_rate_bytes_per_second" +
-                     L +
-                     ",peer=\"4\",dir=\"rd\"} 5.12e+08 1000000000125\n"
-                     "xgmi_bytes" +
-                     L +
-                     ",peer=\"4\",dir=\"wr\"} 0 1000000000125\n"
-                     "xgmi_rate_bytes_per_second" +
-                     L + ",peer=\"4\",dir=\"wr\"} 0 1000000000125\n");
-
-  out.clear();
-  c.Add(MakeRecord(t + 4000000, 1000 + 200000, 1200, 200), &out);  // same firmware_timestamp
-  CHECK(out.empty() && c.stats().stale == 1);
-
-  out.clear();
-  c.Add(MakeRecord(t + 6000000, 1000 + 400000, 50, 300), &out);  // rd went down
+  c.Add(MakeRecord(t, 1000, 100, 200));
+  CHECK(c.pending() == 0);                                   // first record: no interval
+  c.Add(MakeRecord(t + 2000000, 1000 + 200000, 1100, 200));  // 2 ms, 1000 KB received
+  c.Add(MakeRecord(t + 4000000, 1000 + 200000, 1200, 200));  // same firmware_timestamp
+  CHECK(c.stats().stale == 1);
+  c.Add(MakeRecord(t + 6000000, 1000 + 400000, 50, 300));  // rd went down: no rd point
   CHECK(c.stats().decreases == 1);
-  CHECK(out.find("dir=\"rd\"") == std::string::npos &&
-        out.find("dir=\"wr\"} 102400 ") != std::string::npos);
+  // 2 ms at 2x 72 GB/s = 288 MB = 281250 KB; 400000 KB is not physical: no wr point.
+  c.Add(MakeRecord(t + 8000000, 1000 + 600000, 50, 300 + 400000));
+  CHECK(c.stats().implausible == 1 && c.stats().intervals == 3);
+  CHECK(c.pending() == 3 + 4 + 2 + 2);
 
+  std::string out;
+  c.Flush(&out);
+  CHECK(c.pending() == 0);
+  const std::string M = "{\"metric\":{\"__name__\":\"";
+  const std::string L = "\",\"experiment\":\"exp\\\"1\",\"host\":\"h1\",\"gpu\":\"0\"";
+  const std::string T1 = "1000000000125", T3 = "1000000000129", T4 = "1000000000131";
+  CHECK_STR(out, M + "xgmi_interval_seconds" + L +
+                     "},\"values\":[0.002000000,0.002000000,0.002000000],\"timestamps\":[" + T1 +
+                     "," + T3 + "," + T4 + "]}\n" + M + "xgmi_bytes" + L +
+                     ",\"peer\":\"4\",\"dir\":\"rd\"},\"values\":[1024000,0]," +
+                     "\"timestamps\":[" + T1 + "," + T4 + "]}\n" + M +
+                     "xgmi_rate_bytes_per_second" + L +
+                     ",\"peer\":\"4\",\"dir\":\"rd\"},\"values\":[5.12e+08,0],\"timestamps\":[" +
+                     T1 + "," + T4 + "]}\n" + M + "xgmi_bytes" + L +
+                     ",\"peer\":\"4\",\"dir\":\"wr\"},\"values\":[0,102400]," + "\"timestamps\":[" +
+                     T1 + "," + T3 + "]}\n" + M + "xgmi_rate_bytes_per_second" + L +
+                     ",\"peer\":\"4\",\"dir\":\"wr\"},\"values\":[0,5.12e+07],\"timestamps\":[" +
+                     T1 + "," + T3 + "]}\n");
   out.clear();
-  // 2 ms at 2x 72 GB/s = 288 MB = 281250 KB; 400000 KB is not physical.
-  c.Add(MakeRecord(t + 8000000, 1000 + 600000, 50, 300 + 400000), &out);
-  CHECK(c.stats().implausible == 1);
-  CHECK(out.find("dir=\"wr\"") == std::string::npos &&
-        out.find("dir=\"rd\"} 0 ") != std::string::npos);
-  CHECK(c.stats().intervals == 3);
+  c.Flush(&out);
+  CHECK(out.empty());
+  CHECK(JsonString("a\"b\\c\n") == "\"a\\\"b\\\\c\\u000a\"");
 }
 
 void TestRecordingFile() {
@@ -428,7 +427,7 @@ void TestVmCalls() {
   vm.series_body = R"({"status":"success","data":[{"__name__":"xgmi_interval_seconds"}]})";
   CHECK(VmHasSeries(u, "e", "h", &err) == 1);
   const std::string body = std::string(3 << 20, 'x') + "\n";  // larger than socket buffers
-  CHECK(VmImport(u, body, 5000, &err));
+  CHECK(VmImport(u, body, 5000, 0, &err));
   CHECK(vm.imported() == body);
   CHECK(VmDeleteSeries(u, "e", "h", &err));
   const auto reqs = vm.requests();
@@ -437,11 +436,26 @@ void TestVmCalls() {
             "delete_series?match[]=%7B__name__%3D~%22xgmi_.%2A%22%2Cexperiment%3D%22e%22") !=
             std::string::npos);
   vm.import_status = 400;
-  CHECK(!VmImport(u, "x\n", 2000, &err) && err.find("HTTP 400") != std::string::npos);
+  CHECK(!VmImport(u, "x\n", 2000, 0, &err) && err.find("HTTP 400") != std::string::npos);
+
+  // A slow link that keeps moving: 3 MiB at 64 KiB per 20 ms takes ~1 s, far over the 300 ms
+  // timeout, and must still succeed (the live push through an ssh tunnel looks like this).
+  vm.import_status = 204;
+  vm.slow = true;
+  const auto s0 = std::chrono::steady_clock::now();
+  CHECK(VmImport(u, body, 300, 0, &err));
+  CHECK(std::chrono::steady_clock::now() - s0 > std::chrono::milliseconds(500));
+  // ... unless the total budget is shorter (the live push gives up after 3 s).
+  const auto b0 = std::chrono::steady_clock::now();
+  CHECK(!VmImport(u, body, 300, 400, &err));
+  const double bms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0).count();
+  CHECK(bms >= 350 && bms < 800);
+  vm.slow = false;
 
   vm.hang = true;  // accepts, never answers
   const auto t0 = std::chrono::steady_clock::now();
-  CHECK(!VmImport(u, "x\n", 300, &err));
+  CHECK(!VmImport(u, "x\n", 300, 0, &err));
   const double ms =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   CHECK(ms >= 250 && ms < 1000);
@@ -470,7 +484,8 @@ void TestImport() {
   }
   std::string expect;
   RateCalc c("e1", "h1", 0, g.peer, g.link_max);
-  for (const Record& r : recs) c.Add(r, &expect);
+  for (const Record& r : recs) c.Add(r);
+  c.Flush(&expect);
 
   FakeVm vm;
   ImportOptions o;

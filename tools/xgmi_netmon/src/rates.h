@@ -28,10 +28,13 @@
 //     - a rate above 2x the link max is not physical: no point (counted as implausible)
 // Point time = real_ns of the read that first saw the snapshot, in ms.
 //
-// Series (Prometheus text with timestamps), labels experiment, host, gpu, and peer, dir per link
-// (dir = wr: sent by this GPU on the link, rd: received):
+// Series, labels experiment, host, gpu, and peer, dir per link (dir = wr: sent by this GPU on the
+// link, rd: received):
 //   xgmi_bytes, xgmi_rate_bytes_per_second  per link and direction
 //   xgmi_interval_seconds                   per GPU
+// Output is VictoriaMetrics' /api/v1/import format, one JSON line per series (as ainic-netmon):
+//   {"metric":{"__name__":...,labels},"values":[...],"timestamps":[...]}
+// so the labels are sent once per series and flush, not once per point.
 #pragma once
 
 #include <cstdint>
@@ -43,29 +46,43 @@ namespace xgmi {
 
 struct RateStats {
   uint64_t intervals = 0;
-  uint64_t points = 0;       // lines written
+  uint64_t points = 0;       // points added
   uint64_t stale = 0;        // firmware_timestamp did not advance
   uint64_t decreases = 0;    // link-direction intervals dropped: counter went down
   uint64_t implausible = 0;  // link-direction intervals dropped: rate > 2x link max
 };
 
-// Prometheus label value escaping (\, ", newline).
+// A JSON string literal, with quotes.
+std::string JsonString(const std::string& s);
+// PromQL label value escaping (\, ", newline), for selectors.
 std::string EscapeLabel(const std::string& v);
 
 class RateCalc {
  public:
   RateCalc(const std::string& experiment, const std::string& host, int gpu,
            const int peer[kNumLinks], double link_max);
-  // Appends the lines of the interval ending at `r` (none for the first record).
-  void Add(const Record& r, std::string* out);
+  // Adds the points of the interval ending at `r` (none for the first record).
+  void Add(const Record& r);
+  // Points added since the last Flush.
+  uint64_t pending() const { return pending_; }
+  // Appends one JSON line per series that has pending points, and clears them.
+  void Flush(std::string* out);
   const RateStats& stats() const { return stats_; }
 
  private:
-  std::string gpu_labels_;
-  std::string link_labels_[kNumLinks][2];  // [port][0 = rd, 1 = wr]; empty if not connected
+  struct Series {
+    std::string head;  // {"metric":{...},"values":[
+    std::string values, timestamps;
+  };
+  void Point(Series* s, const char* value, const char* ts);
+
+  Series interval_;
+  Series link_[kNumLinks][2][2];  // [port][0 = rd, 1 = wr][0 = bytes, 1 = rate]
+  bool connected_[kNumLinks] = {};
   double link_max_;
   bool have_prev_ = false;
   Snapshot prev_;
+  uint64_t pending_ = 0;
   RateStats stats_;
 };
 

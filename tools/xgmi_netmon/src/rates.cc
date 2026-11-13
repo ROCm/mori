@@ -25,6 +25,23 @@
 
 namespace xgmi {
 
+std::string JsonString(const std::string& s) {
+  std::string out = "\"";
+  for (unsigned char c : s) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += static_cast<char>(c);
+    } else if (c < 0x20) {
+      char b[8];
+      std::snprintf(b, sizeof(b), "\\u%04x", c);
+      out += b;
+    } else {
+      out += static_cast<char>(c);
+    }
+  }
+  return out + "\"";
+}
+
 std::string EscapeLabel(const std::string& v) {
   std::string out;
   for (char c : v) {
@@ -43,18 +60,35 @@ std::string EscapeLabel(const std::string& v) {
 RateCalc::RateCalc(const std::string& experiment, const std::string& host, int gpu,
                    const int peer[kNumLinks], double link_max)
     : link_max_(link_max) {
-  const std::string base = "experiment=\"" + EscapeLabel(experiment) + "\",host=\"" +
-                           EscapeLabel(host) + "\",gpu=\"" + std::to_string(gpu) + "\"";
-  gpu_labels_ = "{" + base + "}";
+  const std::string base = ",\"experiment\":" + JsonString(experiment) +
+                           ",\"host\":" + JsonString(host) + ",\"gpu\":\"" + std::to_string(gpu) +
+                           "\"";
+  interval_.head = "{\"metric\":{\"__name__\":\"xgmi_interval_seconds\"" + base + "},\"values\":[";
+  static const char* const kDir[2] = {"rd", "wr"};
+  static const char* const kName[2] = {"xgmi_bytes", "xgmi_rate_bytes_per_second"};
   for (int p = 0; p < kNumLinks; ++p) {
     if (peer[p] < 0) continue;
-    const std::string link = "{" + base + ",peer=\"" + std::to_string(peer[p]) + "\",dir=\"";
-    link_labels_[p][0] = link + "rd\"}";
-    link_labels_[p][1] = link + "wr\"}";
+    connected_[p] = true;
+    for (int d = 0; d < 2; ++d)
+      for (int m = 0; m < 2; ++m)
+        link_[p][d][m].head = std::string("{\"metric\":{\"__name__\":\"") + kName[m] + "\"" + base +
+                              ",\"peer\":\"" + std::to_string(peer[p]) + "\",\"dir\":\"" + kDir[d] +
+                              "\"},\"values\":[";
   }
 }
 
-void RateCalc::Add(const Record& r, std::string* out) {
+void RateCalc::Point(Series* s, const char* value, const char* ts) {
+  if (!s->values.empty()) {
+    s->values += ',';
+    s->timestamps += ',';
+  }
+  s->values += value;
+  s->timestamps += ts;
+  ++pending_;
+  ++stats_.points;
+}
+
+void RateCalc::Add(const Record& r) {
   if (!have_prev_) {
     prev_ = r.s;
     have_prev_ = true;
@@ -65,15 +99,13 @@ void RateCalc::Add(const Record& r, std::string* out) {
     return;  // keep prev_: the next advancing snapshot spans from it
   }
   const double dt = static_cast<double>(r.s.fw - prev_.fw) * 1e-8;
-  const unsigned long long ts = r.real_ns / 1000000;
-  char line[320];
+  char ts[24], v[40];
+  std::snprintf(ts, sizeof(ts), "%llu", static_cast<unsigned long long>(r.real_ns / 1000000));
   ++stats_.intervals;
-  std::snprintf(line, sizeof(line), "xgmi_interval_seconds%s %.9f %llu\n", gpu_labels_.c_str(), dt,
-                ts);
-  *out += line;
-  ++stats_.points;
+  std::snprintf(v, sizeof(v), "%.9f", dt);
+  Point(&interval_, v, ts);
   for (int p = 0; p < kNumLinks; ++p) {
-    if (link_labels_[p][0].empty()) continue;
+    if (!connected_[p]) continue;
     const uint64_t cur[2] = {r.s.rd[p], r.s.wr[p]};
     const uint64_t old[2] = {prev_.rd[p], prev_.wr[p]};
     for (int d = 0; d < 2; ++d) {
@@ -87,14 +119,31 @@ void RateCalc::Add(const Record& r, std::string* out) {
         ++stats_.implausible;
         continue;
       }
-      std::snprintf(line, sizeof(line),
-                    "xgmi_bytes%s %llu %llu\nxgmi_rate_bytes_per_second%s %.6g %llu\n",
-                    link_labels_[p][d].c_str(), bytes, ts, link_labels_[p][d].c_str(), rate, ts);
-      *out += line;
-      stats_.points += 2;
+      std::snprintf(v, sizeof(v), "%llu", bytes);
+      Point(&link_[p][d][0], v, ts);
+      std::snprintf(v, sizeof(v), "%.6g", rate);
+      Point(&link_[p][d][1], v, ts);
     }
   }
   prev_ = r.s;
+}
+
+void RateCalc::Flush(std::string* out) {
+  auto emit = [out](Series* s) {
+    if (s->values.empty()) return;
+    *out += s->head;
+    *out += s->values;
+    *out += "],\"timestamps\":[";
+    *out += s->timestamps;
+    *out += "]}\n";
+    s->values.clear();
+    s->timestamps.clear();
+  };
+  emit(&interval_);
+  for (int p = 0; p < kNumLinks; ++p)
+    for (int d = 0; d < 2; ++d)
+      for (int m = 0; m < 2; ++m) emit(&link_[p][d][m]);
+  pending_ = 0;
 }
 
 }  // namespace xgmi

@@ -35,8 +35,8 @@ int VmHasSeries(const Url& url, const std::string& experiment, const std::string
 // Deletes every xgmi_* series of this experiment and host.
 bool VmDeleteSeries(const Url& url, const std::string& experiment, const std::string& host,
                     std::string* err);
-// POSTs Prometheus text with timestamps to /api/v1/import/prometheus.
-bool VmImport(const Url& url, const std::string& body, int timeout_ms, std::string* err);
+// POSTs JSON lines (RateCalc::Flush) to /api/v1/import. `idle_ms` / `total_ms` as HttpRequest.
+bool VmImport(const Url& url, const std::string& body, int idle_ms, int total_ms, std::string* err);
 // Imported historical data is not visible to cached queries until this is called.
 void VmResetCache(const Url& url);
 

@@ -38,12 +38,15 @@ examples/monitoring/xgmi_netmon/down.sh                        # keeps the data 
   The output directory must not exist or be empty: a recording is never overwritten.
 - `--push` refuses to start if VictoriaMetrics is unreachable or already has data for this
   experiment and host. While recording, a slow or failed push only drops points (counted in
-  `meta.json`); the recording is never affected.
+  `meta.json`); the recording is never affected. A push gives up after 2 s without progress or
+  3 s in total. A request that gave up may have been written in part, so it is never resent:
+  re-import the recording with `--replace` for complete data.
+- The live push sends about 2 MB/s for 8 GPUs (17 bytes per point). Run VictoriaMetrics on the
+  same host or network; a push over a slow link (e.g. an ssh tunnel between sites) falls behind
+  and drops points. `record` + `import` works over any link.
 - `import` writes the same points as the live push (same code; checked point by point). It
   refuses an experiment and host that already have data; `--replace` deletes their `xgmi_*`
-  series first. Imported data becomes visible in VictoriaMetrics after a few seconds.
-- Another node: open a reverse tunnel from the Grafana host, `ssh -N -R 28428:127.0.0.1:28428 NODE`,
-  then `record --push http://127.0.0.1:28428` on NODE.
+  series first. Imported data becomes visible in VictoriaMetrics after up to ~10 s.
 - View: `ssh -L 23000:127.0.0.1:23000 <grafana host>`, open `http://localhost:23000`, pick
   experiment, host and the time range.
 
@@ -82,7 +85,8 @@ with a partial record; `import` drops it. A recorder that died leaves `status: r
   direction. One GPU0->GPU1 copy ran at 59.9 GB/s payload; the link max is 72 GB/s per direction.
 - Series: `xgmi_bytes`, `xgmi_rate_bytes_per_second` (labels experiment, host, gpu, peer,
   dir = wr | rd) and `xgmi_interval_seconds` (per GPU). Point time = wall clock of the read
-  that first saw the snapshot.
+  that first saw the snapshot. Both the push and `import` write VictoriaMetrics' `/api/v1/import`
+  format, one JSON line per series (as ainic-netmon), so labels are sent once per request.
 
 ## Dashboard
 
@@ -96,10 +100,11 @@ the same bytes.
 | | |
 |---|---|
 | snapshots per GPU | 489–497 per s (500 is every PMFW snapshot) |
-| intervals > 3 ms | 0.02 %–1.1 % per 6–30 s run |
+| intervals > 3 ms | 0.02 %–1.1 % per 6–30 s run (0.0–0.1 % on Crusoe v3-088, v1.9) |
 | read start after the grid point | ~55 µs on every GPU |
-| CPU | 0.46–0.59 core kernel time (the sysfs reads), 0.05 core user; 0.29 core user with `--push` |
-| live push vs import | 232 series, 2 300 425 points, identical |
+| CPU | 0.46–0.64 core kernel time (the sysfs reads), 0.05 core user; 0.12–0.18 core user with `--push` |
+| live push | 1.97 MB/s, 17.4 bytes per point |
+| live push vs import | 232 series, 3 435 398 points, identical |
 
 ## Known limits
 

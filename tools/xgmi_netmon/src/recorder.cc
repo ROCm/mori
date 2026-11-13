@@ -165,16 +165,20 @@ void PushMain(std::vector<Stream>* streams, const Url& url, const std::string& e
   for (;;) {
     const bool last = stop->load(std::memory_order_acquire);
     body.clear();
+    uint64_t points = 0;
     for (size_t i = 0; i < streams->size(); ++i) {
       size_t n;
       while ((n = (*streams)[i].push_ring->PopMany(buf.data(), buf.size())) > 0)
-        for (size_t k = 0; k < n; ++k) calc[i].Add(buf[k], &body);
+        for (size_t k = 0; k < n; ++k) calc[i].Add(buf[k]);
+      points += calc[i].pending();
+      calc[i].Flush(&body);
     }
     if (!body.empty()) {
-      const uint64_t points = static_cast<uint64_t>(std::count(body.begin(), body.end(), '\n'));
       std::string err;
       ++ps->requests;
-      if (VmImport(url, body, 2000, &err)) {
+      // 2 s without progress or 3 s in total (as ainic-netmon's exporter): a request that may have
+      // reached VictoriaMetrics in part is dropped, never resent.
+      if (VmImport(url, body, 2000, 3000, &err)) {
         ps->pushed_points += points;
       } else {
         ++ps->failed_requests;
@@ -198,23 +202,6 @@ void PushMain(std::vector<Stream>* streams, const Url& url, const std::string& e
     ps->rates.decreases += c.stats().decreases;
     ps->rates.implausible += c.stats().implausible;
   }
-}
-
-std::string JsonString(const std::string& s) {
-  std::string out = "\"";
-  for (unsigned char c : s) {
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += static_cast<char>(c);
-    } else if (c < 0x20) {
-      char b[8];
-      std::snprintf(b, sizeof(b), "\\u%04x", c);
-      out += b;
-    } else {
-      out += static_cast<char>(c);
-    }
-  }
-  return out + "\"";
 }
 
 struct Meta {

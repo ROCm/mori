@@ -23,14 +23,17 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/sockios.h>
 #include <netdb.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 
@@ -55,6 +58,18 @@ bool WaitFd(int fd, short events, int64_t deadline) {
     if (r > 0) return true;
     if (r == 0) return false;
     if (errno != EINTR) return false;
+  }
+}
+
+// WaitFd, but a timeout while the kernel is still sending queued bytes (SIOCOUTQ went down) is
+// progress: on a slow link POLLOUT only comes back once half the send buffer is free.
+bool WaitWithProgress(int fd, short events, int64_t* deadline, int idle_ms, int64_t hard) {
+  for (;;) {
+    int before = 0, after = 0;
+    ioctl(fd, SIOCOUTQ, &before);
+    if (WaitFd(fd, events, *deadline)) return true;
+    if (ioctl(fd, SIOCOUTQ, &after) != 0 || after >= before || NowMs() >= hard) return false;
+    *deadline = std::min(NowMs() + idle_ms, hard);
   }
 }
 
@@ -138,24 +153,28 @@ std::string UrlEncode(const std::string& s) {
 }
 
 int HttpRequest(const Url& url, const std::string& method, const std::string& path_and_query,
-                const std::string& body, int timeout_ms, std::string* response, std::string* err) {
-  const int64_t deadline = NowMs() + timeout_ms;
+                const std::string& body, int idle_ms, int total_ms, std::string* response,
+                std::string* err) {
+  // Inactivity timeout: every byte sent or received moves the deadline, so a slow but working
+  // link (e.g. an ssh tunnel) is not cut off; a stalled one is.
+  const int64_t hard = total_ms > 0 ? NowMs() + total_ms : INT64_MAX;
+  int64_t deadline = std::min(NowMs() + idle_ms, hard);
   const int fd = Connect(url, deadline, err);
   if (fd < 0) return -1;
-  std::string req =
-      method + " " + url.prefix + path_and_query + " HTTP/1.0\r\nHost: " + url.host + ":" +
-      url.port + "\r\nContent-Type: text/plain\r\nContent-Length: " + std::to_string(body.size()) +
-      "\r\n\r\n";
+  std::string req = method + " " + url.prefix + path_and_query + " HTTP/1.0\r\nHost: " + url.host +
+                    ":" + url.port + "\r\nContent-Type: application/json\r\nContent-Length: " +
+                    std::to_string(body.size()) + "\r\n\r\n";
   req += body;
   size_t sent = 0;
   while (sent < req.size()) {
     const ssize_t w = send(fd, req.data() + sent, req.size() - sent, MSG_NOSIGNAL);
     if (w > 0) {
       sent += static_cast<size_t>(w);
+      deadline = std::min(NowMs() + idle_ms, hard);
     } else if (w < 0 && errno == EINTR) {
       continue;
     } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
-               WaitFd(fd, POLLOUT, deadline)) {
+               WaitWithProgress(fd, POLLOUT, &deadline, idle_ms, hard)) {
       continue;
     } else {
       *err = std::string("send: ") + (w < 0 && errno != EAGAIN ? std::strerror(errno) : "timeout");
@@ -168,13 +187,16 @@ int HttpRequest(const Url& url, const std::string& method, const std::string& pa
   for (;;) {
     const ssize_t r = recv(fd, buf, sizeof(buf), 0);
     if (r > 0) {
+      deadline = std::min(NowMs() + idle_ms, hard);
       if (resp.size() < kMaxResponse)
         resp.append(buf, static_cast<size_t>(std::min<ssize_t>(r, kMaxResponse)));
       continue;
     }
     if (r == 0) break;
     if (errno == EINTR) continue;
-    if ((errno == EAGAIN || errno == EWOULDBLOCK) && WaitFd(fd, POLLIN, deadline)) continue;
+    if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+        WaitWithProgress(fd, POLLIN, &deadline, idle_ms, hard))
+      continue;
     *err = std::string("receive: ") +
            (errno == EAGAIN || errno == EWOULDBLOCK ? "timeout" : std::strerror(errno));
     close(fd);

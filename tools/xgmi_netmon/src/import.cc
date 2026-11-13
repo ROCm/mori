@@ -146,12 +146,13 @@ int RunImport(const ImportOptions& opt) {
   }
 
   constexpr size_t kBodyLimit = 16 << 20;
+  constexpr uint64_t kFlushPoints = 1000000;
   RateStats total;
   uint64_t records = 0, first_ns = UINT64_MAX, last_ns = 0;
   std::string body;
   auto flush = [&]() {
     if (body.empty()) return true;
-    if (!VmImport(url, body, 120000, &err)) return false;
+    if (!VmImport(url, body, 120000, 0, &err)) return false;
     body.clear();
     return true;
   };
@@ -159,12 +160,14 @@ int RunImport(const ImportOptions& opt) {
     for (const GpuFile& g : h.gpus) {
       RateCalc calc(experiment, h.host, g.header.gpu_idx, g.header.peer, g.header.link_max);
       for (const Record& r : g.records) {
-        calc.Add(r, &body);
+        calc.Add(r);
+        if (calc.pending() >= kFlushPoints) calc.Flush(&body);
         if (body.size() > kBodyLimit && !flush()) {
           std::fprintf(stderr, "error: import incomplete, rerun with --replace: %s\n", err.c_str());
           return 1;
         }
       }
+      calc.Flush(&body);
       records += g.records.size();
       if (!g.records.empty()) {
         first_ns = std::min(first_ns, g.records.front().real_ns);
