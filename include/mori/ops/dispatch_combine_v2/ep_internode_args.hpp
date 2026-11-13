@@ -364,7 +364,7 @@ struct EpInterNodeArgs {
   ep_index_t* blockFlagCounter{nullptr};
   ep_index_t* totalRecvTokenNum{nullptr};
   uint32_t* dispatchGridBarrier{nullptr};
-  uint32_t* interNodeBlocksBarrier{nullptr};  // v2 / v2_ll use [0] only
+  uint32_t* interNodeBlocksBarrier{nullptr};  // v2 / v2_ll: [0] arrivals, [1] combine release
   uint64_t* crossDeviceBarrierFlag{nullptr};
   // AsyncLL only: recv slot -> the send-buffer slot offset it arrived in, so
   // combine's send leg can put each result back where dispatch took it from.

@@ -1344,6 +1344,56 @@ __forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs& a
   }
 }
 
+// End of the combine's cross-node barrier: once the last local RDMA warp has moved the epoch, one
+// warp per (remote node, QP) posts that QP's mark and waits for the peer's, so the posts go out
+// in parallel rather than one after another from a single lane.
+template <EpInterNodeKernelCfg kConfig, typename T>
+inline __device__ void CombineInterNodeBarrierPosts(EpDispatchCombineArgs& args,
+                                                    const ::mori::cco::ccoDevComm& comm,
+                                                    uint64_t barrierFlag, uint32_t epoch) {
+  DEF_COMMON_VARS;
+  constexpr int kQps =
+      kConfig.noRdmaAtomics ? EpInterNodeBarrierQps<kConfig>() : kConfig.numQpPerPe;
+  const int pairs = (nNodes - 1) * kQps;
+  const int stride = args.rdmaBlockNum * warpNum;
+  if (laneId != 0 || globalWarpId >= pairs) return;
+  auto proxyPeOf = [&](int p) {
+    return ((myNode + 1 + p / kQps) % nNodes) * config.gpuPerNode + (myPe % config.gpuPerNode);
+  };
+  while (__hip_atomic_load(&args.interNodeBlocksBarrier[1], __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT) != epoch) {
+  }
+  // Every pair this warp owns is posted before any is waited on: a peer's mark can sit behind
+  // its own wait on a third node, so post-then-wait per pair deadlocks around the ring.
+  for (int p = globalWarpId; p < pairs; p += stride) {
+    if constexpr (kConfig.noRdmaAtomics) {
+      EpInterNodeWriteValue(
+          comm, args.reg(args.offCrossDeviceBarrier),
+          EpInterNodeBarrierQpSlot<kConfig>(args.rank, p % kQps) * sizeof(uint64_t), barrierFlag,
+          proxyPeOf(p), p % kQps);
+    } else {
+      EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier), args.rank * sizeof(uint64_t),
+                           CombineBarrierMarker(p % kQps, kQps), proxyPeOf(p), p % kQps);
+    }
+  }
+  uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
+  for (int p = globalWarpId; p < pairs; p += stride) {
+    if constexpr (kConfig.noRdmaAtomics) {
+      // A peer cannot write round r+1 before this rank leaves round r, so each slot is exactly
+      // barrierFlag; == turns a desync into a hang instead of an early, silent pass.
+      while (core::AtomicLoadRelaxedSystem(
+                 localBarrierPtr + EpInterNodeBarrierQpSlot<kConfig>(proxyPeOf(p), p % kQps)) !=
+             barrierFlag) {
+      }
+    } else if (p % kQps == 0) {
+      // One wait per peer, for the sum of every QP's marker.
+      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPeOf(p)) !=
+             (barrierFlag * kCombineBarrierMarkerTotal)) {
+      }
+    }
+  }
+}
+
 template <EpInterNodeKernelCfg kConfig, typename TokT, typename T>
 __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& args,
                                                       size_t tokHiddenBytes,
@@ -1494,6 +1544,8 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
   }
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
+  // Each dispatch bumps the flag, so it also numbers this combine's local release.
+  const uint32_t epoch = static_cast<uint32_t>(barrierFlag);
 
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     // Neither dispatch nor this combine reads the count when every slot is flagged; consume it
@@ -1507,43 +1559,14 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
       core::AtomicStoreSeqCstSystem(
           args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>() + laneId, uint64_t{0});
     }
-    if ((laneId < nNodes) &&
-        (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
-      int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      if constexpr (kConfig.noRdmaAtomics) {
-        for (int i = 0; i < EpInterNodeBarrierQps<kConfig>(); i++) {
-          EpInterNodeWriteValue(comm, args.reg(args.offCrossDeviceBarrier),
-                                EpInterNodeBarrierQpSlot<kConfig>(args.rank, i) * sizeof(uint64_t),
-                                barrierFlag, proxyPe, i);
-        }
-      } else {
-        for (int i = 0; i < config.numQpPerPe; i++) {
-          EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
-                               args.rank * sizeof(uint64_t),
-                               CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
-        }
-      }
-    }
-    if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
-
-    uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
-    if ((laneId < nNodes) && (laneId != myNode)) {
-      int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      if constexpr (kConfig.noRdmaAtomics) {
-        // A peer cannot write round r+1 before this rank leaves round r, so each slot is exactly
-        // barrierFlag; == turns a desync into a hang instead of an early, silent pass.
-        for (int i = 0; i < EpInterNodeBarrierQps<kConfig>(); i++) {
-          while (core::AtomicLoadRelaxedSystem(localBarrierPtr + EpInterNodeBarrierQpSlot<kConfig>(
-                                                                     proxyPe, i)) != barrierFlag) {
-          }
-        }
-      } else {
-        while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-               (barrierFlag * kCombineBarrierMarkerTotal)) {
-        }
-      }
+    if (laneId == 0) {
+      args.interNodeBlocksBarrier[0] = 0;
+      __threadfence_system();  // the count resets above, before any barrier post
+      __hip_atomic_store(&args.interNodeBlocksBarrier[1], epoch, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
     }
   }
+  CombineInterNodeBarrierPosts<kConfig, T>(args, comm, barrierFlag, epoch);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename TokT, typename T>
@@ -1672,51 +1695,22 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
   }
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
+  // Each dispatch bumps the flag, so it also numbers this combine's local release.
+  const uint32_t epoch = static_cast<uint32_t>(barrierFlag);
 
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
       core::AtomicStoreSeqCstSystem(
           args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>() + laneId, uint64_t{0});
     }
-    if ((laneId < nNodes) &&
-        (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
-      int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      if constexpr (kConfig.noRdmaAtomics) {
-        for (int i = 0; i < EpInterNodeBarrierQps<kConfig>(); i++) {
-          EpInterNodeWriteValue(comm, args.reg(args.offCrossDeviceBarrier),
-                                EpInterNodeBarrierQpSlot<kConfig>(args.rank, i) * sizeof(uint64_t),
-                                barrierFlag, proxyPe, i);
-        }
-      } else {
-        for (int i = 0; i < config.numQpPerPe; i++) {
-          EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
-                               args.rank * sizeof(uint64_t),
-                               CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
-        }
-      }
-      __threadfence_system();
-    }
-    if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
-
-    // Wait other nodes
-    uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
-    if ((laneId < nNodes) && (laneId != myNode)) {
-      int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      if constexpr (kConfig.noRdmaAtomics) {
-        // A peer cannot write round r+1 before this rank leaves round r, so each slot is exactly
-        // barrierFlag; == turns a desync into a hang instead of an early, silent pass.
-        for (int i = 0; i < EpInterNodeBarrierQps<kConfig>(); i++) {
-          while (core::AtomicLoadRelaxedSystem(localBarrierPtr + EpInterNodeBarrierQpSlot<kConfig>(
-                                                                     proxyPe, i)) != barrierFlag) {
-          }
-        }
-      } else {
-        while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-               (barrierFlag * kCombineBarrierMarkerTotal)) {
-        }
-      }
+    if (laneId == 0) {
+      args.interNodeBlocksBarrier[0] = 0;
+      __threadfence_system();  // the count resets above, before any barrier post
+      __hip_atomic_store(&args.interNodeBlocksBarrier[1], epoch, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
     }
   }
+  CombineInterNodeBarrierPosts<kConfig, T>(args, comm, barrierFlag, epoch);
 }
 
 }  // namespace combine_impl
