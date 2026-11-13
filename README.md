@@ -73,8 +73,6 @@ It is built from [`docs/`](https://github.com/ROCm/mori/tree/main/docs) on every
 | MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](https://rocm.github.io/mori/MORI-IO-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) |
 | MORI-UMBP | Unified memory & bandwidth pool: tiered storage, distributed KV access, transfer simulation | [Single-Node Smoke Test](https://rocm.github.io/mori/MORI-UMBP-SINGLE-NODE-GUIDE.html) · [Simulation](https://rocm.github.io/mori/umbp-simulation.html) · [Calibration](https://rocm.github.io/mori/umbp-calibration.html) · [PD Benchmark](https://rocm.github.io/mori/MORI-UMBP-PD-BENCHMARK.html) · [Tier-Management Benchmark](https://rocm.github.io/mori/UMBP-TIER-MANAGEMENT-BENCHMARK.html) |
 | MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](https://rocm.github.io/mori/PROFILER.html) |
-| API reference | Python APIs of EP, SHMEM, IO and IR; the profiler; the UMBP master client | [Communication](https://rocm.github.io/mori/api/communication.html) · [Profiler](https://rocm.github.io/mori/api/profiler.html) · [UMBP](https://rocm.github.io/mori/api/umbp.html) |
-| Internals | Host pre-compiled + device JIT architecture; the EPv2 HIP backend's JIT | [JIT Architecture](https://rocm.github.io/mori/MORI_JIT_ARCHITECTURE.html) · [JIT v2 Design](https://rocm.github.io/mori/MORI_JIT_V2_DESIGN.html) (Chinese) |
 
 ## Benchmarks
 
@@ -199,22 +197,22 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 
 **GPU**
 
-| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** |
-|---|:---:|:---:|:---:|
-| MI308X | ✅ | ✅ | ✅ |
-| MI300X | ✅ | ✅ | ✅ |
-| MI325X | ✅ | ✅ | ✅ |
-| MI355X | ✅ | ✅ | ✅ |
-| MI450X | 🚧 | 🚧 | 🚧 |
+| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** | **MORI-CCO** |
+|---|:---:|:---:|:---:|:---:|
+| MI308X | ✅ | ✅ | ✅ | ✅ |
+| MI300X | ✅ | ✅ | ✅ | ✅ |
+| MI325X | ✅ | ✅ | ✅ | ✅ |
+| MI355X | ✅ | ✅ | ✅ | ✅ |
+| MI450X | 🚧 | 🚧 | 🚧 | 🚧 |
 
 **NIC**
 
-| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** |
-|---|:---:|:---:|:---:|
-| Pollara | ✅ | ✅ | ✅ |
-| CX7 | ✅ | ✅ | ✅ |
-| Thor2 | ✅ | ✅ | ✅ |
-| Volcano | 🚧 | 🚧 | 🚧 |
+| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** | **MORI-CCO** |
+|---|:---:|:---:|:---:|:---:|
+| Pollara | ✅ | ✅ | ✅ | ✅ |
+| CX7 | ✅ | ✅ | ✅ | ✅ |
+| Thor2 | ✅ | ✅ | ✅ | ✅ |
+| Volcano | 🚧 | 🚧 | 🚧 | 🚧 |
 
 ✅ Supported &emsp; 🚧 Under Development
 
@@ -385,16 +383,6 @@ tools/run_internode_io_benchmark.sh --rank 0 --master-addr "<master_ip>" --ifnam
 ```
 
 See the [MORI-IO benchmark guide](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) for both engines and tuning.
-
-### Test MORI-IR (Triton + shmem integration, [guide](https://github.com/ROCm/mori/blob/main/python/mori/ir/README.md))
-
-```bash
-# Basic shmem put (2 GPUs)
-torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
-
-# Allreduce (8 GPUs)
-torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
-```
 
 ## Contribution Guide
 
