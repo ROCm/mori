@@ -22,7 +22,8 @@
 # SOFTWARE.
 """Known XGMI traffic for checking xgmi-netmon: torch peer copies with exact byte counts.
 
-Run inside a ROCm + torch container on an 8-GPU node while `xgmi_netmon.py push` runs on the host.
+Run inside a ROCm + torch container on an 8-GPU node while `xgmi-netmon record` (with
+--push, or imported afterwards) runs on the host.
 Phases (10 s each, 5 s apart): GPU0->GPU1, GPU1->GPU0, ring i->i+1 on all GPUs.
 Prints one JSON line per phase with wall-clock start/end and the bytes copied per pair; compare
 with sum_over_time(xgmi_bytes{...}[end-start]) at `end`.
