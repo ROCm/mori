@@ -558,7 +558,7 @@ inline __device__ void MoeSortGather(EpDispatchCombineArgs& args, int recvRows,
   DEF_COMMON_VARS;
   constexpr int kEpr = kConfig.numExpertPerRank;
   constexpr int kTopk = kConfig.numExpertPerToken;
-  constexpr int kU = 8;  // rows per thread per pass, loaded before any is stored
+  constexpr int kU = 16;  // rows per thread per pass, loaded before any is stored
   const int bm = args.sortBlockM;
   const int total = sh.off[kEpr];
   auto expertOf = [&](int i) {
