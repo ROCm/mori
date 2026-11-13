@@ -98,6 +98,7 @@ _CASES = {
     ),
     "recv_cap_clamped": _cfg(max_total_recv_tokens=256, num_experts_per_token=4),
     "eight_qps": _cfg(num_qp_per_pe=8),
+    "two_tokens": _cfg(max_num_inp_token_per_rank=2),
 }
 
 
@@ -176,3 +177,14 @@ def test_dispatch_slots_use_the_padded_stride(name):
 def test_gpu_per_node_must_divide_the_world():
     with pytest.raises(ValueError):
         internode_regions(_cfg(world_size=16, gpu_per_node=6))
+
+
+@pytest.mark.parametrize("name", sorted(_CASES))
+def test_chunk_flags_hold_the_piece_flags(name):
+    """``inter_node_chunk_flag`` holds the ``nNodes * c`` chunk flags (c chunks of
+    64 tokens per node), then 3 piece flags per chunk (``EpInterNodePieceFlagSlot``)."""
+    cfg = _CASES[name]
+    sizes = dict(internode_regions(cfg))
+    n_nodes = cfg.world_size // cfg.gpu_per_node
+    chunks = -(-cfg.max_num_inp_token_per_rank // 64)
+    assert sizes["inter_node_chunk_flag"] >= n_nodes * chunks * 4 * 8

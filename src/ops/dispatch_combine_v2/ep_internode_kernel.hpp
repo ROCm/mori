@@ -281,6 +281,48 @@ __device__ __forceinline__ void EpInterNodeCountSignal(const ::mori::cco::ccoDev
   }
 }
 
+// A v2_ll dispatch chunk goes out as one piece per QP, each of at least kDispatchPieceMinTokens
+// tokens. The piece count comes from numQpToDrain, the op's largest active count, so sender and
+// receiver agree on it whatever counts their buckets picked. The chunk flag follows piece 0 and
+// still carries the chunk's token count; each later piece writes its own flag, after the chunk
+// flags, with the dispatch's number + 1, so it never needs clearing.
+constexpr int kMaxDispatchPieces = 4;
+constexpr int kDispatchPieceMinTokens = 32;
+
+template <EpInterNodeKernelCfg kConfig>
+__device__ __forceinline__ int EpInterNodeDispatchPieceTokens(int chunkTokens) {
+  constexpr int kPieces = kConfig.numQpToDrain < 1                    ? 1
+                          : kConfig.numQpToDrain > kMaxDispatchPieces ? kMaxDispatchPieces
+                                                                      : kConfig.numQpToDrain;
+  const int perPiece = (chunkTokens + kPieces - 1) / kPieces;
+  return perPiece > kDispatchPieceMinTokens ? perPiece : kDispatchPieceMinTokens;
+}
+
+__device__ __forceinline__ size_t EpInterNodePieceFlagSlot(int nNodes, int maxChunkNum, int node,
+                                                           int chunk, int piece) {
+  return static_cast<size_t>(nNodes) * maxChunkNum +
+         (static_cast<size_t>(node) * maxChunkNum + chunk) * (kMaxDispatchPieces - 1) + (piece - 1);
+}
+
+// A received token past its chunk's piece 0 waits for its own piece's flag.
+template <EpInterNodeKernelCfg kConfig>
+__device__ __forceinline__ void EpInterNodeWaitPiece(uint64_t* chunkFlag, int nNodes,
+                                                     int maxChunkNum, int node, int chunk,
+                                                     int tokenInChunk, uint64_t chunkTokens,
+                                                     uint64_t* dispatchNumber) {
+  if (tokenInChunk < kDispatchPieceMinTokens) return;  // always in piece 0
+  const int piece =
+      tokenInChunk / EpInterNodeDispatchPieceTokens<kConfig>(static_cast<int>(chunkTokens));
+  if (piece == 0) return;
+  if ((threadIdx.x & (warpSize - 1)) == 0) {
+    const uint64_t pieceTag = core::AtomicLoadRelaxed(dispatchNumber) + 1;
+    uint64_t* flag = chunkFlag + EpInterNodePieceFlagSlot(nNodes, maxChunkNum, node, chunk, piece);
+    while (core::AtomicLoadRelaxedSystem(flag) != pieceTag) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+}
+
 // Atomic-free combine barrier. Writes cannot accumulate, so each (sender, qp) gets its own slot,
 // after the worldSize per-rank slots the intra-node barrier and the atomic path use. Every rank
 // marks the op's largest active count (numQpToDrain), so peers whose buckets picked different
@@ -626,13 +668,27 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
       if (laneId == 0) {
         index_t tokenNum = std::min(tokenId + warpSize, chunkEndTokenIdx) - tokenId;
         size_t stagingTokOffset = tokenId * xferBytes;
-        int qpId = (tokenId / warpSize) % config.numQpPerPe;
-
-        EpInterNodeChunkPut<kConfig.noRdmaAtomics>(
-            comm, args.reg(args.offDispatchInp), remoteIdx * xferBytes,
-            args.reg(args.offDispatchStaging), stagingTokOffset, tokenNum * xferBytes,
-            args.reg(args.offChunkFlag), (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-            tokenNum + 1, proxyPe, qpId);
+        const int pieceTokens = EpInterNodeDispatchPieceTokens<kConfig>(tokenNum);
+        for (int first = 0, piece = 0; first < tokenNum; first += pieceTokens, piece++) {
+          const int count = std::min(pieceTokens, static_cast<int>(tokenNum) - first);
+          const int qpId = (flagSlotId + piece) % config.numQpPerPe;
+          if (piece == 0) {
+            EpInterNodeChunkPut<kConfig.noRdmaAtomics>(
+                comm, args.reg(args.offDispatchInp), remoteIdx * xferBytes,
+                args.reg(args.offDispatchStaging), stagingTokOffset, count * xferBytes,
+                args.reg(args.offChunkFlag), (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
+                tokenNum + 1, proxyPe, qpId);
+          } else {
+            const uint64_t pieceTag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag) + 1;
+            EpInterNodePutThenWrite(
+                comm, args.reg(args.offDispatchInp), (remoteIdx + first) * xferBytes,
+                args.reg(args.offDispatchStaging), stagingTokOffset + first * xferBytes,
+                count * xferBytes, args.reg(args.offChunkFlag),
+                EpInterNodePieceFlagSlot(nNodes, maxChunkNum, myNode, flagSlotId, piece) *
+                    sizeof(uint64_t),
+                pieceTag, proxyPe, qpId);
+          }
+        }
         // Counted once posted: WaitLLPostsIssued waits on it, and whoever posts node i's last
         // chunk sends its token count, so no barrier over every RDMA warp is needed.
         const int posted = atomicAdd(args.blockFlagCounter + i, 1) + 1;
@@ -853,6 +909,8 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
     }
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
     if (tokenId >= endTokenIdx) continue;
+    EpInterNodeWaitPiece<kConfig>(chunkFlag, nNodes, maxChunkNum, node, k, tokenId - startTokenIdx,
+                                  thisChunkTokenNum, args.crossDeviceBarrierFlag);
 
     int globalTokenId = SendBufSlotOffset(config, node, tokenId);
     index_t* indices =
@@ -973,6 +1031,8 @@ inline __device__ void DispatchInterNodeLLRecvTok(EpDispatchCombineArgs& args) {
       continue;
     }
     if (tokenId >= startTokenIdx + static_cast<int>(thisChunkTokenNum)) continue;
+    EpInterNodeWaitPiece<kConfig>(chunkFlag, nNodes, maxChunkNum, node, k, tokenId - startTokenIdx,
+                                  thisChunkTokenNum, args.crossDeviceBarrierFlag);
 
     const int globalTokenId = SendBufSlotOffset(config, node, tokenId);
     const uint8_t* slot = stagingPtr + globalTokenId * xferBytes;
