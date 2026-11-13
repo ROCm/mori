@@ -339,14 +339,18 @@ struct ForwardTokenVec16 {
   static constexpr int kPerLane = (kVecs + warpSize - 1) / warpSize;
   static constexpr bool kUsable = (kHidden % 16 == 0) && (kIndex % 16 == 0) &&
                                   (kWeight % 16 == 0) && (kScale % 16 == 0) && (kPerLane <= 8);
-  uint4 regs[kPerLane];
+  // A native vector, not uint4: HIP's uint4 is a union wrapper copied with memcpy, which keeps
+  // the array out of registers -- AMDGPU then promotes it to LDS and each 16 B load waits for the
+  // previous one's LDS write.
+  using Vec = unsigned int __attribute__((ext_vector_type(4)));
+  Vec regs[kPerLane];
 
   __device__ __forceinline__ void Load(const uint8_t* src) {
     const int lane = threadIdx.x & (warpSize - 1);
 #pragma unroll
     for (int u = 0; u < kPerLane; u++) {
       const int v = lane + u * warpSize;
-      if (v < kVecs) regs[u] = reinterpret_cast<const uint4*>(src)[v];
+      if (v < kVecs) regs[u] = reinterpret_cast<const Vec*>(src)[v];
     }
   }
 
@@ -362,7 +366,7 @@ struct ForwardTokenVec16 {
                      : v < h + ix     ? index + 16 * (v - h)
                      : v < h + ix + w ? weight + 16 * (v - h - ix)
                                       : scale + 16 * (v - h - ix - w);
-      *reinterpret_cast<uint4*>(dst) = regs[u];
+      *reinterpret_cast<Vec*>(dst) = regs[u];
     }
   }
 };
