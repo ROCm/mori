@@ -233,6 +233,24 @@ intra and AsyncLL have `rdma_block_num=None`.
 Intra manual geometry retains its existing fallback behavior; inter supports
 per-field tuning overrides as described above.
 
+### Tuning profiles: peak and capped
+
+An intra auto schedule on the hip backend comes from one of two profiles:
+
+- `peak`: the tuned tables, each bucket the smallest geometry within ~3% of the
+  fastest.
+- `capped`: no grid wider than 64 blocks, which leaves CUs to expert GEMMs sharing
+  the GPU. A shape takes its `_CAPPED_*` rows, else its peak rows with every bucket
+  wider than 64 blocks replaced by the 64x16 dispatch / 64x8 combine default (with
+  a warning that the shape has no capped rows).
+
+The op takes `EpDispatchCombineConfig.tuning_profile`, else
+`MORI_EP_TUNING_PROFILE`, else `capped` on gfx125x and `peak` elsewhere, and
+stores the profile it resolved in that field. `hip_tuning_configs.lookup()` takes
+a `profile` argument, else `MORI_EP_TUNING_PROFILE`, else `peak`: a caller that
+reads the tables directly, as aiter's MegaMoE does, keeps the peak rows. LL128
+and bf16 push rows are within 64 blocks in both profiles.
+
 Intra B/W participate in compilation. Inter B/R/W are plan launch settings:
 different geometries can share a compiled module while retaining separate plans
 for their grid, block size and bound RDMA split. Inter shape/dtype still specialize
@@ -283,6 +301,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_ll128_split.py` | an op past the LL128 table's `max_tok` runs small calls on its LL128 plans and the rest on the schedule's: one call sequence crossing `max_tok` both ways, synced (delivery, reverse map, bf16 sum), back to back eager and graph-replayed, and as snapshot handles, each combine equal to the synced one bit for bit. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` |
 | `test_bf16_push_select.py` | a bf16 op with a push-table entry picks its combine per call: calls crossing LL128's `max_tok` and every push bucket edge both ways, first with one token count on every rank, then above `max_tok` with a different count on each rank. Each call passes its input as a plain tensor, from `combine_in_view()`, from `combine_in_view()` on alternate ranks only, with weights, and through a `snapshot=True` handle. Checks which combine ran (only a push lands rows in `push_landing()`; weights and snapshot handles pull), the bf16 sum, every result equal to the plain one bit for bit, and back to back eager. Under `MORI_EP_BF16_PUSH=0` it checks that no push plan is built. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` (or 8) |
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
+| `test_tuning_profile.py` | peak and capped profiles: capped keeps every gfx125x lookup within 64 blocks, reuses the peak rows that fit and falls back to the default (with a warning) elsewhere; peak is `lookup()`'s default; precedence of the config field, `MORI_EP_TUNING_PROFILE` and the device default. CPU only |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
 | `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMB_MODE=push\|pull` (default `push`, the fp4 combine: hip backend on gfx125x only), `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR`, `ROUTE=rand\|ring\|noself`, `LATE_US` (rank 0 reaches every timed dispatch that many µs after the others) |

@@ -133,6 +133,10 @@ class EpDispatchCombineConfig:
     # distinct (block, warp) variants and picks one at runtime from
     # cur_rank_num_token. None => auto (from tuning_configs) or single-shot fallback.
     schedule: tuple = None
+    # Which hip tuning table an auto schedule comes from: "peak" (fastest within ~3%)
+    # or "capped" (no grid over 64 blocks, leaving CUs to the expert GEMMs). None =
+    # MORI_EP_TUNING_PROFILE, else capped on gfx125x and peak elsewhere; resolved here.
+    tuning_profile: str = None
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
     # --- internode -----------------------------------------------------------
@@ -504,8 +508,11 @@ class EpDispatchCombineConfig:
                 or _default_backend()
             )
             if backend == "hip":
-                from .hip_tuning_configs import lookup
+                from .hip_tuning_configs import default_profile, lookup, tuning_profile
 
+                self.tuning_profile = tuning_profile(
+                    self.tuning_profile, default=default_profile()
+                )
                 # hip keys on the expert count too: it sizes dispatch's per-block
                 # expert counters, so it can move the geometry. FlyDSL's table has no
                 # such axis, hence the split call rather than a shared kwarg.
@@ -518,6 +525,7 @@ class EpDispatchCombineConfig:
                     quant_type=self.quant_type,
                     dispatch_dtype=self.dispatch_dtype,
                     combine_dtype=self.combine_dtype,
+                    profile=self.tuning_profile,
                 )
             else:
                 from .tuning_configs import lookup
