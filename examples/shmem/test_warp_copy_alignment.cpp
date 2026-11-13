@@ -104,6 +104,8 @@ __global__ void BlockCopyKernel(int myPe, int npes, const SymmMemObjPtr srcMemOb
   }
 
   if constexpr (Poison) {
+    // Prevent from infering global memory space from argument types
+    // hence force it to emit flat loads and stores.
     if (npes * bytes == 0xACEBABEFEEDDEADBULL) {
       dst = reinterpret_cast<uint8_t*>(srcMemObj->peerPtrs);
       src = reinterpret_cast<const uint8_t*>(srcMemObj->p2pPeerPtrs);
