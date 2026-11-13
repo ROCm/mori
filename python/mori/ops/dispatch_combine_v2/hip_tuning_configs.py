@@ -298,6 +298,18 @@ _DISPATCH_TABLE: dict = {
             "fp4": ((256, 32, 8), (512, 32, 16), (1024, 64, 16), (None, 128, 16)),
         },
     },
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): {
+            None: ((2048, 64, 16), (None, 128, 16)),
+            "bf16": ((1024, 32, 16), (None, 64, 16)),
+            "fp4": (
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (2048, 64, 32),
+                (None, 128, 16),
+            ),
+        },
+    },
 }
 
 # No dtype axis: combine reduces the bf16 staging region whatever dispatch carried,
@@ -455,7 +467,7 @@ _BF16_PUSH_TABLE: dict = {
         (8, 7168, 6, None): ((192, 64, 8), (512, 64, 16), (None, 64, 24)),
     },
     "gfx1250/96cu": {
-        (8, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
+        (8, 7168, 6, None): ((128, 32, 8), (None, 32, 16)),
     },
 }
 
@@ -510,7 +522,7 @@ _LL128_TABLE: dict = {
         "gfx1250/96cu": {
             (8, 7168, 6, None): {
                 "bf16": dict(
-                    max_tok=176, card_max_tok=160, dispatch=(64, 16), combine=(64, 16)
+                    max_tok=176, card_max_tok=160, dispatch=(32, 16), combine=(32, 16)
                 ),
             },
         },
@@ -566,7 +578,7 @@ def bf16_push(world_size, hidden_dim, topk, experts_per_rank=None):
 
 _CARD_TABLE: dict = {
     "gfx1250/96cu": {
-        (8, 7168, 6, None): dict(pull_blocks=16, pull_launch_max=256),
+        (8, 7168, 6, None): dict(pull_blocks=8, pull_launch_max=256),
     },
 }
 
