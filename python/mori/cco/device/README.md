@@ -127,7 +127,7 @@ export MORI_CCO_GDA_CONN=full          # required for GDA on a single node
 mpirun -n 2 python examples/cco/python/03_flydsl_put/main.py
 ```
 
-See [`examples/cco/README.md`](../../../../examples/cco/README.md) for the full
+See [`examples/cco/README.md`](https://github.com/ROCm/mori/blob/main/examples/cco/README.md) for the full
 run guide (Python + C++), including the two-node (`crossnode`) setup. To skip
 JIT, override with `MORI_CCO_BC=/path/to/libmori_cco_device.bc` or prebuild via
 `tools/build_cco_bitcode.sh`.

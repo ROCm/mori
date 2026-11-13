@@ -120,13 +120,13 @@ is the address each rank advertises to its peer.
 ```bash
 # On the TARGET node (rank 1) — start this FIRST:
 MORI_DISABLE_AUTO_XGMI=1 build/tests/cpp/bench_engine \
-    --rank 1 --master-ip 10.190.162.0 --self-ip 10.190.162.1 --port 18515 \
+    --rank 1 --master-ip <rank0_ip> --self-ip <rank1_ip> --port 18515 \
     --op write --all --sweep-start 1048576 --sweep-max 33554432 --sweep-step 1048576 \
     --iters 500 --warmup-iters 50 --num-qp-per-transfer 4 --enable-sess
 
 # On the INITIATOR node (rank 0) — start this SECOND (prints the results table):
 MORI_DISABLE_AUTO_XGMI=1 build/tests/cpp/bench_engine \
-    --rank 0 --master-ip 10.190.162.0 --self-ip 10.190.162.0 --port 18515 \
+    --rank 0 --master-ip <rank0_ip> --self-ip <rank0_ip> --port 18515 \
     --op write --all --sweep-start 1048576 --sweep-max 33554432 --sweep-step 1048576 \
     --iters 500 --warmup-iters 50 --num-qp-per-transfer 4 --enable-sess
 ```
@@ -222,10 +222,10 @@ cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
 export GLOO_SOCKET_IFNAME=ens14np0  # Set to your NIC interface
 
-# Run on two nodes (replace node_rank and master_addr)
+# Run on two nodes (replace node_rank, master_addr and host)
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.129.65" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.194.129.65"
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>"
 ```
 
 ### Fabric (cross-node scale-up UALink super-node)
@@ -284,8 +284,8 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
 
 ```bash
 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
-    --master_addr="10.235.192.57" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.235.192.60" \
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>" \
     --all --enable-sess --enable-batch-transfer \
     --num-qp-per-transfer 2 --num-target-dev 8 --num-initiator-dev 8
 ```
@@ -326,8 +326,8 @@ torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
 ```bash
 numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 \
     torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.235.192.60" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.235.192.60" \
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>" \
     --enable-batch-transfer --enable-sess --buffer-size 1024 \
     --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1 \
     --num-qp-per-transfer 4 --all --num-worker-threads 1 \
@@ -368,8 +368,8 @@ numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 \
 ```bash
 numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 \
     torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.235.192.60" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.235.192.60" \
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>" \
     --enable-batch-transfer --enable-sess --buffer-size 1024 \
     --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1 \
     --num-qp-per-transfer 16 --all-batch --num-worker-threads 1 \
@@ -409,8 +409,8 @@ numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 \
 
 ```bash
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.132.29" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.194.132.29" \
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>" \
     --transfer-batch-size 1 --all --sweep-start-size=1024 \
     --sweep-max-size=67108864 --op-type write \
     --enable-sess --enable-batch-transfer
@@ -448,8 +448,8 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
 
 ```bash
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.132.29" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.194.132.29" \
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>" \
     --transfer-batch-size 1 --all --sweep-start-size=1024 \
     --sweep-max-size=67108864 --op-type read \
     --enable-sess --enable-batch-transfer
@@ -493,7 +493,7 @@ These workload flags apply to both engines (the C++ default and Python); only th
 launch wrapper differs. Shown against the C++ binary:
 
 ```bash
-tests/cpp/io/bench_engine --op write \
+build/tests/cpp/bench_engine --op write \
     --enable-sess --enable-batch-transfer --batch-contiguous \
     --disable-chunking \
     --num-qp-per-transfer 8 --num-worker-threads 8 \

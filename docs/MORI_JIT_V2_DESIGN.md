@@ -479,7 +479,7 @@ run 新增 16 份而不是 2 份，AOT 也无从谈起。旁证：gfx942 上 8 �
 4096 上 combine 快 12%，差在暂存拷贝：FlyDSL 在 kernel 前单独发一发 311MB 的 torch copy，
 HIP 在 kernel 内做、与 barrier 等待重叠——104µs 变 ~1µs。
 
-4×gfx1250（MI450）EP4，hidden=7168 topk=8，对照 v1 的出厂默认，µs：
+4×gfx1250 EP4，hidden=7168 topk=8，对照 v1 的出厂默认，µs：
 
 | tok/rank | 64 | 512 | 2048 | 4096 | 16384 |
 |---|---|---|---|---|---|

@@ -5,19 +5,23 @@ the flat symmetric LSA VA, and internode (multi-node, e.g. 2×8) over CCO/GDA
 RDMA. One op class, `EpDispatchCombineOp`, behind two interchangeable kernel
 backends:
 
-- **flydsl** (default): FlyDSL device kernels, the full feature set (gather +
-  scatter combine, fp8/fp4, quant, StdMoE, per-token scales, routing replay).
-  Intranode only.
-- **hip**: C++/HIP kernels JIT-compiled by the v2 JIT framework. Gather combine
-  only, in bf16/fp32; the dispatch leg also carries fp8 and fp4 (transport only —
-  it moves an already-quantized payload). A dedicated gfx125x TDM body is selected
-  by arch. **The only backend with an internode path** (bf16/f32/fp8, plus packed
-  fp4 dispatch with bf16/fp32 combine; no quant/StdMoE/scatter). Works on a machine
-  with no FlyDSL. See `docs/MORI_JIT_V2_DESIGN.md`.
+- **flydsl** (the default except on gfx125x): FlyDSL device kernels, the full
+  feature set (gather + scatter combine, fp8/fp4, quant, StdMoE, per-token
+  scales, routing replay). Intranode only.
+- **hip** (the default on gfx125x): C++/HIP kernels JIT-compiled by the v2 JIT
+  framework. Gather combine in bf16/fp32; on gfx125x also the push (scatter)
+  combine with `fp8_blockwise` or fp4 quantization, and on gfx1250 a bf16 push
+  combine (see "HIP V2 configuration interface" below). The dispatch leg also
+  carries fp8 and fp4 (transport only — it moves an already-quantized payload).
+  A dedicated gfx125x TDM body is selected by arch. **The only backend with an
+  internode path** (bf16/f32/fp8, plus packed fp4 dispatch with bf16/fp32
+  combine; no quant/StdMoE/scatter). Works on a machine with no FlyDSL. See
+  `docs/MORI_JIT_V2_DESIGN.md`.
 
-Select with `cfg.kernel_backend` or `MORI_V2_KERNEL_BACKEND`. Same-node peer
-addresses are computed in-kernel over the flat LSA VA, no host P2P tables; a peer
-on another node is reached with GDA RDMA. Reference =
+Select with `cfg.kernel_backend` or `MORI_V2_KERNEL_BACKEND`; unset, it is hip on
+gfx125x and flydsl elsewhere. Same-node peer addresses are computed in-kernel
+over the flat LSA VA, no host P2P tables; a peer on another node is reached with
+GDA RDMA. Reference =
 ROCm/FlyDSL PR #522 (`dispatch_combine_intranode_{kernel,op}.py`).
 
 Supported token dtypes: **bf16**, **f32**, **fp8** (gather-only; OCP e4m3 on
