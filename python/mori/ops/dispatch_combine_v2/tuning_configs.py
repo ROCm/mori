@@ -80,9 +80,135 @@ _MI325X_TABLE = {
     (8, 2048, 8): {"fp8": _MI325X_SCHEDULE},
 }
 
-# ── MI300X (gfx942, 304 CU) — TODO: re-tune. Falls back to CU-scaled default. ──
-_MI300X_DEFAULT = None  # None => derive from CU count (see _cu_scaled_default)
-_MI300X_TABLE = {}
+# ── MI300X (gfx942, 304 CU) — EP8, per bucket from an in-graph sweep of dispatch
+# block {32..304} x warp {4,8,16} and combine block {32..256} x warp {2,4,8,16}.
+# Small tok wants a wide dispatch with warp 4; combine wants block 32 + warp 8-16
+# from T256 up. 384/6 and 256/6 share the topk-6 hidden-7168 key (tuned on 384/6).
+_MI300X_SCHED_H7168_T8_BF16 = (
+    (16, 32, 4, 128, 2),
+    (32, 32, 8, 128, 2),
+    (64, 304, 4, 128, 2),
+    (128, 304, 4, 64, 8),
+    (256, 304, 4, 32, 8),
+    (None, 64, 16, 32, 8),
+)
+_MI300X_SCHED_H7168_T8_FP8 = (
+    (32, 48, 8, 128, 2),
+    (64, 128, 4, 128, 2),
+    (128, 256, 4, 64, 8),
+    (256, 256, 4, 32, 8),
+    (None, 64, 16, 32, 8),
+)
+# DeepSeek-V3/R1 with the shared expert fused in (264/9).
+_MI300X_SCHED_H7168_T9_BF16 = (
+    (32, 96, 4, 128, 2),
+    (64, 228, 8, 128, 2),
+    (128, 228, 8, 64, 8),
+    (None, 152, 8, 32, 8),
+)
+_MI300X_SCHED_H7168_T9_FP8 = (
+    (32, 96, 4, 128, 2),
+    (64, 192, 4, 128, 2),
+    (128, 304, 8, 64, 8),
+    (None, 152, 8, 32, 8),
+)
+_MI300X_SCHED_H6144_T8_BF16 = (
+    (16, 32, 4, 32, 8),
+    (32, 32, 8, 32, 8),
+    (64, 128, 4, 32, 8),
+    (128, 128, 4, 64, 8),
+    (512, 256, 4, 32, 8),
+    (None, 64, 16, 32, 8),
+)
+_MI300X_SCHED_H6144_T8_FP8 = (
+    (32, 64, 4, 32, 8),
+    (64, 256, 4, 32, 8),
+    (128, 256, 4, 64, 8),
+    (512, 256, 4, 32, 8),
+    (None, 64, 16, 32, 8),
+)
+_MI300X_SCHED_H7168_T6_BF16 = (
+    (32, 48, 4, 32, 8),
+    (64, 192, 4, 32, 8),
+    (128, 192, 4, 64, 8),
+    (1024, 192, 4, 32, 16),
+    (None, 192, 4, 32, 8),
+)
+_MI300X_SCHED_H7168_T6_FP8 = (
+    (32, 48, 4, 128, 2),
+    (64, 304, 4, 128, 2),
+    (128, 256, 4, 64, 8),
+    (256, 96, 8, 32, 16),
+    (1024, 64, 16, 32, 16),
+    (None, 64, 16, 32, 8),
+)
+_MI300X_SCHED_H5120_T6_BF16 = (
+    (16, 96, 4, 32, 8),
+    (32, 96, 4, 32, 16),
+    (128, 96, 4, 64, 8),
+    (None, 192, 4, 32, 16),
+)
+_MI300X_SCHED_H5120_T6_FP8 = (
+    (16, 32, 4, 128, 2),
+    (32, 48, 4, 32, 16),
+    (128, 256, 4, 64, 8),
+    (256, 96, 8, 32, 16),
+    (2048, 192, 4, 32, 16),
+    (None, 64, 16, 32, 16),
+)
+# Kimi K3 (896/16, hidden 3584).
+_MI300X_SCHED_H3584_T16_BF16 = (
+    (16, 96, 4, 228, 4),
+    (32, 228, 4, 128, 2),
+    (128, 256, 4, 128, 2),
+    (256, 256, 4, 128, 4),
+    (512, 128, 16, 64, 16),
+    (1024, 96, 16, 152, 8),
+    (2048, 96, 16, 152, 16),
+    (None, 96, 16, 64, 8),
+)
+_MI300X_SCHED_H3584_T16_FP8 = (
+    (32, 128, 4, 128, 2),
+    (128, 256, 4, 128, 2),
+    (256, 64, 16, 128, 4),
+    (512, 128, 16, 64, 16),
+    (1024, 128, 16, 152, 8),
+    (2048, 128, 16, 152, 16),
+    (None, 128, 16, 64, 8),
+)
+_MI300X_DEFAULT = dict(
+    dispatch_block_num=64,
+    combine_block_num=32,
+    warp_num_per_block=16,
+    combine_warp_num_per_block=8,
+    schedule=_MI300X_SCHED_H7168_T8_BF16,
+)
+_MI300X_TABLE = {
+    (8, 7168, 8): {
+        "bf16": _MI300X_SCHED_H7168_T8_BF16,
+        "fp8": _MI300X_SCHED_H7168_T8_FP8,
+    },
+    (8, 7168, 9): {
+        "bf16": _MI300X_SCHED_H7168_T9_BF16,
+        "fp8": _MI300X_SCHED_H7168_T9_FP8,
+    },
+    (8, 6144, 8): {
+        "bf16": _MI300X_SCHED_H6144_T8_BF16,
+        "fp8": _MI300X_SCHED_H6144_T8_FP8,
+    },
+    (8, 7168, 6): {
+        "bf16": _MI300X_SCHED_H7168_T6_BF16,
+        "fp8": _MI300X_SCHED_H7168_T6_FP8,
+    },
+    (8, 5120, 6): {
+        "bf16": _MI300X_SCHED_H5120_T6_BF16,
+        "fp8": _MI300X_SCHED_H5120_T6_FP8,
+    },
+    (8, 3584, 16): {
+        "bf16": _MI300X_SCHED_H3584_T16_BF16,
+        "fp8": _MI300X_SCHED_H3584_T16_FP8,
+    },
+}
 
 # ── MI355X (gfx950, wave64) — EP8, vec4 combine gather. combine wants a small
 # block (32-48) + warp up to 16; dispatch grows block 96->160. wave64 => warp <= 16

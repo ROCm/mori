@@ -52,3 +52,34 @@ def test_max_combine_blocks_matches_kernel_flag_slots():
     from mori.ops.dispatch_combine_v2.intranode_kernels import xdb_flag_slots
 
     assert tc._MAX_COMBINE_BLOCKS == xdb_flag_slots
+
+
+# (CU count, wave size) per device table, for the schedule checks below.
+_DEVICE_LIMITS = {
+    "mi308x": (80, 64),
+    "mi325x": (304, 64),
+    "mi300x": (304, 64),
+    "mi355x": (256, 64),
+    "gfx1250": (256, 32),
+}
+
+
+def _schedules(dev_default, dev_table):
+    if dev_default and dev_default.get("schedule"):
+        yield "default", dev_default["schedule"]
+    for key, by_dtype in dev_table.items():
+        for dtype, schedule in by_dtype.items():
+            yield f"{key} {dtype}", schedule
+
+
+@pytest.mark.parametrize("device", sorted(tc._DEVICES))
+def test_every_schedule_is_well_formed(device):
+    cu, wave = _DEVICE_LIMITS[device]
+    for name, schedule in _schedules(*tc._DEVICES[device]):
+        ceilings = [row[0] for row in schedule[:-1]]
+        assert schedule[-1][0] is None and None not in ceilings, name
+        assert ceilings == sorted(set(ceilings)), name
+        for _, disp_block, disp_warp, comb_block, comb_warp in schedule:
+            assert 1 <= disp_block <= cu, name
+            assert 1 <= comb_block <= min(cu, tc._MAX_COMBINE_BLOCKS), name
+            assert disp_warp * wave <= 1024 and comb_warp * wave <= 1024, name
