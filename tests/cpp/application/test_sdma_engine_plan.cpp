@@ -32,6 +32,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <vector>
 
 #include "mori/application/transport/sdma/sdma_engine_plan.hpp"
@@ -229,7 +230,7 @@ TEST(SdmaEnginePlan, ClassifiesByGfxVersion) {
   EXPECT_EQ(Classify(90010), Arch::Generic);   // gfx90a
   EXPECT_EQ(Classify(120001), Arch::Generic);  // gfx1201
   EXPECT_EQ(SourcePlan(kCpx).Caps().arch, Arch::Generic);
-  EXPECT_EQ(SourcePlan(kQpx).Caps().arch, Arch::Generic);
+  EXPECT_EQ(SourcePlan(kQpx).Caps().arch, Arch::Gfx9Xgmi);
   EXPECT_EQ(SourcePlan(kDpx).Caps().arch, Arch::Gfx9Xgmi);
 }
 
@@ -248,15 +249,6 @@ TEST(SdmaEnginePlan, VfWithOamIsUnchanged) {
 TEST(SdmaEnginePlan, Mi308xIsUnchanged) {
   const std::vector<std::vector<int>> counts = {{1}, {2}, {3}, {4}, {6}, {8}, {2, 3}, {1, 3}};
   EXPECT_GT(ExpectSameAsMain(kMi308x, true, Range(2, 10), Mi308xMask, NoOam, counts), 0);
-}
-
-// Partition modes with under two even xGMI engines keep KFD's mask.
-TEST(SdmaEnginePlan, PartitionModesKeepTheMask) {
-  for (uint32_t pm : {0x3u, 0xcu, 0x4u}) {
-    auto mask = [pm](int s, int d) { return s == d ? 0u : pm; };
-    EXPECT_GT(ExpectSameAsMain(kQpx, false, Range(0, 4), mask, NoOam, kCounts1to8), 0);
-    EXPECT_GT(ExpectSameAsMain(kCpx, false, Range(0, 4), mask, NoOam, kCounts1to8), 0);
-  }
 }
 
 // gfx942/gfx950: peer queues only on even xGMI engines, links balanced, and a
@@ -315,6 +307,22 @@ TEST(SdmaEnginePlan, Mi308xUsesEvenEngines) {
   ExpectGfx9Placement(kMi308x, Range(2, 10), Mi308xMask, NoOam);
 }
 
+// QPX keeps one even xGMI engine, CPX none: KFD's mask folded to even engines.
+TEST(SdmaEnginePlan, PartitionModesUseEvenEngines) {
+  for (uint32_t pm : {0x3u, 0xcu, 0x8u}) {
+    auto mask = [pm](int s, int d) { return s == d ? 0u : pm; };
+    ExpectGfx9Placement(kQpx, Range(0, 4), mask, NoOam);
+    for (const auto& job : Subsets(Range(0, 4))) {
+      for (int n = 1; n <= 8; ++n) {
+        Source s(kCpx);
+        if (!ConnectJob(s, job[0], job, {n}, mask, NoOam)) continue;
+        for (const auto& [dst, engines] : s.ch)
+          for (uint32_t e : engines) EXPECT_EQ(e, 0u) << "mask " << pm;
+      }
+    }
+  }
+}
+
 // gfx1250: a link's queues spread over an aligned block of engines.
 TEST(SdmaEnginePlan, Gfx1250SpreadsLinksOverBlocks) {
   auto mask = [](int, int) { return 0xffffu; };  // peers; loopback spreads over the host link's
@@ -353,6 +361,32 @@ TEST(SdmaEnginePlan, Gfx1250SpreadsLinksOverBlocks) {
   }
 }
 
+// gfx1250, a link asking for more queues later: they wrap over its block, so peers
+// with their own block, or a block as large as the final count, keep distinct
+// AsyncLL engines.
+TEST(SdmaEnginePlan, Gfx1250GrowthStaysInBlock) {
+  auto mask = [](int, int) { return 0xffffu; };
+  const std::vector<std::tuple<int, std::vector<int>, bool>> cases = {
+      {4, {1, 4}, true}, {4, {2, 4}, true},  {8, {2, 8}, true},
+      {8, {8, 2}, true}, {8, {1, 8}, false}, {8, {4, 8}, false}};
+  for (const auto& [w, counts, distinct] : cases) {
+    const int n = *std::max_element(counts.begin(), counts.end());
+    for (int src = 0; src < w; ++src) {
+      Source s(kGfx1250);
+      ASSERT_TRUE(ConnectJob(s, src, Range(0, w), counts, mask, NoOam));
+      for (uint32_t e = 0; e < 32; ++e) EXPECT_LE(s.plan.QueuesOn(e), kGfx1250.cap);
+      for (int o = 0; distinct && o < n; ++o) {
+        std::set<uint32_t> engines;
+        for (int d = 0; d < w; ++d) {
+          if (d == src) continue;
+          EXPECT_TRUE(engines.insert(s.ch[d][(d + o) % n]).second)
+              << w << " GPUs, " << counts.front() << " then " << n << ", src " << src;
+        }
+      }
+    }
+  }
+}
+
 // ROCr or another process holds an engine's slots: the queue goes elsewhere.
 TEST(SdmaEnginePlan, FullEngineIsSkipped) {
   Source s(kMi308x);
@@ -370,6 +404,13 @@ TEST(SdmaEnginePlan, FullEngineIsSkipped) {
   auto from2 = [](uint32_t e) { return e >= 2; };
   ASSERT_TRUE(g.Connect(0, 0, 8, 0xffff, std::nullopt, from2));
   for (uint32_t e : g.ch[0]) EXPECT_GE(e, 2u);
+  for (int dst = 1; dst < 8; ++dst) ASSERT_TRUE(g.Connect(0, dst, 8, 0xffff, std::nullopt, from2));
+  for (uint32_t e = 0; e < 32; ++e) EXPECT_LE(g.plan.QueuesOn(e), kGfx1250.cap);
+
+  Source lb(kMi300x);  // engine 0 full: loopback moves to even xGMI engines
+  auto no0 = [](uint32_t e) { return e != 0; };
+  ASSERT_TRUE(lb.Connect(0, 0, 8, 0, std::nullopt, no0));
+  for (uint32_t e : lb.ch[0]) EXPECT_TRUE(e >= 2 && e % 2 == 0) << e;
 
   Source none(kMi300x);
   EXPECT_FALSE(none.Connect(0, 1, 1, 0xfffc, std::nullopt, [](uint32_t) { return false; }));

@@ -1698,14 +1698,22 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   }
 
   // Comm SDMA queues from reqs.sdmaQueueCount (0 = env default), set up before
-  // anything is allocated. A rank that cannot create them fails, and so does
-  // every other rank, instead of waiting in a later collective.
-  int sdmaOk = ccoSdmaSetupCommQueues(comm, reqs->sdmaQueueCount) == 0 ? 1 : 0;
-  std::vector<int> sdmaOkAll(comm->worldSize, 0);
-  comm->bootNet->Allgather(&sdmaOk, sdmaOkAll.data(), sizeof(int));
+  // anything is allocated. If a rank cannot create them, or a node's ranks end up
+  // with different counts (a retry after such a failure), every rank fails here
+  // instead of in a later collective or signal write.
+  int sdmaQueues =
+      ccoSdmaSetupCommQueues(comm, reqs->sdmaQueueCount) == 0 ? comm->sdmaNumQueue : -1;
+  std::vector<int> sdmaQueuesAll(comm->worldSize, 0);
+  comm->bootNet->Allgather(&sdmaQueues, sdmaQueuesAll.data(), sizeof(int));
   for (int r = 0; r < comm->worldSize; r++) {
-    if (sdmaOkAll[r]) continue;
-    MORI_SHMEM_ERROR("ccoDevCommCreate: rank {} could not create its SDMA queues", r);
+    const bool sameNode = r >= comm->myNodeStart && r < comm->myNodeStart + comm->lsaSize;
+    if (sdmaQueuesAll[r] >= 0 && (!sameNode || sdmaQueuesAll[r] == sdmaQueues)) continue;
+    if (sdmaQueuesAll[r] < 0) {
+      MORI_SHMEM_ERROR("ccoDevCommCreate: rank {} could not create its SDMA queues", r);
+    } else {
+      MORI_SHMEM_ERROR("ccoDevCommCreate: rank {} has {} SDMA queues per peer, rank {} has {}", r,
+                       sdmaQueuesAll[r], comm->rank, sdmaQueues);
+    }
     return -1;
   }
 

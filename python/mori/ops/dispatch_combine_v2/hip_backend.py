@@ -632,16 +632,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # in-order commit chain. Eight is the hardware cap; above it cco
             # clamps with a warning.
             #
-            # The count is a PERFORMANCE knob, not a correctness one, and asking
-            # for more than a pair can hold is fatal rather than degrading:
-            # anvil's queue creation is CHECK_HSAKMT_SUCCESS, which exit()s. On
-            # 8xMI308X, 8 queues per pair gets HSAKMT_STATUS_NO_MEMORY from
-            # hsaKmtCreateQueueExt and every rank leaves the process -- its xGMI
-            # engines fold to the even ids {2,4,6} and ROCr's own blit queues
-            # take part of that, so three is what fits. With <= 3 the whole
-            # AsyncLL suite passes there, which is why this clamps rather than
-            # trying to recover: by the time the request is refused the process
-            # is already gone.
+            # The count is a PERFORMANCE knob, not a correctness one, but asking
+            # for more than a pair can hold fails the init rather than degrading:
+            # once every usable engine is out of KFD queue slots, anvil throws
+            # "SDMA queue exhausted" and ccoDevCommCreate fails on every rank. On
+            # 8xMI308X, 8 queues per pair does not fit -- its peer links share
+            # the even xGMI engines {2,4,6} and ROCr's own blit queues take part
+            # of that, so three is what fits. With <= 3 the whole AsyncLL suite
+            # passes there, which is why this clamps up front.
             requirements.sdma_queue_count = _asyncll_sdma_queues(
                 _gpu.detect_model(), cfg.gpu_per_node
             )

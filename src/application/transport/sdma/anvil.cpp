@@ -384,18 +384,27 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
     if (!mask) mask = getAnyLinkEngineMask(srcNode);
   }
   std::optional<uint32_t> oam;
+  std::string oamError;
   if (!loopback && sp.WantsOam(mask)) {
     try {
       oam = static_cast<uint32_t>(getSdmaEngineId(srcNode, dstNode));
     } catch (const std::exception& ex) {
-      MORI_APP_WARN("SDMA: node {} -> {} has no OAM-table engine: {}", srcNode, dstNode, ex.what());
+      oamError = ex.what();
+      MORI_APP_WARN("SDMA: node {} -> {} has no OAM-table engine: {}", srcNode, dstNode, oamError);
     }
+  }
+
+  if (!sp.HasEngine(loopback, mask, oam)) {
+    throw std::runtime_error(
+        fmt::format("SDMA: no engine for node {} -> {}: KFD mask {:#x}{}", srcNode, dstNode, mask,
+                    oamError.empty() ? "" : ", no OAM-table engine (" + oamError + ")"));
   }
 
   const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
   for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
     std::unique_ptr<SdmaQueue> q;
     std::string tried;
+    bool noSlot = true;  // every refusal was KFD running out of queue slots
     for (uint32_t e : sp.Candidates(dstNode, loopback, c, numChannels, mask, oam)) {
       HSAKMT_STATUS st = HSAKMT_STATUS_SUCCESS;
       q = SdmaQueue::tryCreate(hsakmtNode, e, &st);
@@ -405,9 +414,10 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
         break;
       }
       sp.MarkFull(e);
-      tried += (tried.empty() ? "" : ",") + std::to_string(e);
+      noSlot &= st == HSAKMT_STATUS_NO_MEMORY || st == HSAKMT_STATUS_OUT_OF_RESOURCES;
+      tried += fmt::format("{}{} (status {})", tried.empty() ? "" : ", ", e, static_cast<int>(st));
       MORI_APP_WARN(
-          "SDMA: node {} engine {} has no free queue slot (status {}); node {} -> {} "
+          "SDMA: node {} engine {} refused a queue (status {}); node {} -> {} "
           "channel {} tries another engine",
           srcNode, e, static_cast<int>(st), srcNode, dstNode, c);
     }
@@ -417,9 +427,11 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
         if (sp.QueuesOn(e)) counts += fmt::format(" {}:{}", e, sp.QueuesOn(e));
       throw std::runtime_error(fmt::format(
           "SDMA queue exhausted [anvil.cpp]: node {} -> {} channel {} of {}, KFD mask {:#x}, "
-          "engines tried [{}], this process's queues per engine:{}; request fewer SDMA channels "
-          "per peer (MORI_SDMA_NUM_CHANNELS, sdmaQueueCount)",
-          srcNode, dstNode, c, numChannels, mask, tried, counts));
+          "engines tried [{}], this process's queues per engine:{}{}",
+          srcNode, dstNode, c, numChannels, mask, tried, counts,
+          noSlot ? "; request fewer SDMA channels per peer (MORI_SDMA_NUM_CHANNELS, "
+                   "sdmaQueueCount)"
+                 : ""));
     }
     channels.push_back(std::move(q));
   }

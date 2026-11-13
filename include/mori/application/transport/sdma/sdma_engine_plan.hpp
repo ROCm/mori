@@ -37,12 +37,13 @@
 //   - When KFD lists every xGMI engine for a link (a VF, a hive of another size)
 //     on a 2 + 14 engine part, the static OAM table supplies the preference.
 //   - Loopback stays on engine 0, moving to an xGMI engine only when 0 is full.
+//   - A partition mode without xGMI engines (CPX) uses KFD's mask folded to even ids.
 // Gfx125x (gfx1250): all 16 engines are general and every link may use them all.
 //   One engine cannot fill a link there, so a link's queues spread over
 //   consecutive engines. Links take aligned blocks of bit_ceil(queues) engines, so
 //   AsyncLL's queue (destPe + offset) % n gives distinct peers distinct engines.
-// Generic (any other arch, or a partition mode with under two even xGMI engines):
-//   KFD's mask, channel c on engine c % n, as before.
+//   The block is sized by the link's first connect; queues added later wrap over it.
+// Generic (any other arch): KFD's mask, channel c on engine c % n, as before.
 // In every class a queue that cannot be created marks its engine full and the next
 // candidate is tried; queue counts only order the candidates, because KFD's slots
 // are shared with ROCr and other processes.
@@ -104,8 +105,11 @@ class SourcePlan {
     if (caps_.arch == Arch::Gfx9Xgmi) {
       for (uint32_t e = caps_.nGeneral; e < caps_.nGeneral + caps_.nXgmi && e < kMaxEngines; ++e)
         if (!(e & 1u)) pool_.push_back(e);
-      // A partition mode (CPX, QPX) leaves at most one even xGMI engine: keep KFD's mask.
-      if (pool_.size() < 2) caps_.arch = Arch::Generic;
+      // CPX has no xGMI engine: KFD's mask, folded to even ids.
+      if (pool_.empty()) {
+        caps_.arch = Arch::Generic;
+        evenOnly_ = true;
+      }
     }
   }
 
@@ -137,6 +141,13 @@ class SourcePlan {
     }
   }
 
+  // Whether the link has any engine at all, full or not.
+  bool HasEngine(bool loopback, uint32_t mask, std::optional<uint32_t> oam) const {
+    if (loopback || caps_.arch == Arch::Gfx9Xgmi || (caps_.arch == Arch::Gfx125x && mask))
+      return true;
+    return !GenericEngines(mask, oam).empty();
+  }
+
   // A queue was created on `e` for the link to `dst`.
   void Commit(int dst, bool loopback, uint32_t e) {
     queues_[e]++;
@@ -144,8 +155,9 @@ class SourcePlan {
     auto it = links_.find(dst);
     if (it == links_.end()) return;
     Link& l = it->second;
-    // The home could not take the link's first queue: the link moves where it went.
-    if (l.queues == 0 && e != l.home) {
+    // Gfx9: the home could not take the link's first queue, so the link moves where
+    // it went. A gfx1250 link keeps its aligned block.
+    if (caps_.arch == Arch::Gfx9Xgmi && l.queues == 0 && e != l.home) {
       linksOn_[l.home]--;
       linksOn_[e]++;
       l.home = e;
@@ -168,6 +180,7 @@ class SourcePlan {
   struct Link {
     uint32_t home = 0;
     int queues = 0;
+    size_t block = 1;  // Gfx125x: engines in the link's block
   };
 
   uint32_t XgmiMask() const {
@@ -181,6 +194,9 @@ class SourcePlan {
     if (full_ & (1u << e)) return false;
     return caps_.cap <= 0 || queues_[e] < caps_.cap;
   }
+
+  // Queues on `e`, a full engine counting as at the cap.
+  int Load(uint32_t e) const { return Usable(e) ? queues_[e] : std::max(caps_.cap, queues_[e]); }
 
   // `pool` by fewest queues, then id, keeping usable engines only.
   std::vector<uint32_t> ByLoad(std::vector<uint32_t> pool) const {
@@ -229,26 +245,23 @@ class SourcePlan {
       size_t block = 1;
       while (block < static_cast<size_t>(std::max(1, nRequested))) block <<= 1;
       block = std::min(block, n);
-      // Rank block starts by full engines in the block, the queues already there,
-      // then links homed there.
+      // Rank block starts by the load in the block, then links homed there.
       size_t bestStart = 0;
       auto rank = [&](size_t start) {
-        int full = 0, q = 0;
-        for (size_t i = 0; i < block; ++i) {
-          full += !Usable(ring[(start + i) % n]);
-          q += queues_[ring[(start + i) % n]];
-        }
-        return std::make_tuple(full, q, linksOn_[ring[start]], start);
+        int load = 0;
+        for (size_t i = 0; i < block; ++i) load += Load(ring[(start + i) % n]);
+        return std::make_tuple(load, linksOn_[ring[start]], start);
       };
       for (size_t start = 0; start < n; start += block)
         if (rank(start) < rank(bestStart)) bestStart = start;
       linksOn_[ring[bestStart]]++;
-      it = links_.emplace(dst, Link{ring[bestStart], 0}).first;
+      it = links_.emplace(dst, Link{ring[bestStart], 0, block}).first;
     }
     const size_t homeIdx = std::find(ring.begin(), ring.end(), it->second.home) - ring.begin();
+    const size_t first = homeIdx + static_cast<size_t>(channel) % it->second.block;
     std::vector<uint32_t> out;
     for (size_t i = 0; i < n; ++i) {
-      const uint32_t e = ring[(homeIdx + static_cast<size_t>(channel) + i) % n];
+      const uint32_t e = ring[(first + i) % n];
       if (Usable(e)) out.push_back(e);
     }
     return out;
@@ -271,10 +284,22 @@ class SourcePlan {
     return out;
   }
 
-  std::vector<uint32_t> GenericCandidates(int channel, uint32_t mask,
-                                          std::optional<uint32_t> oam) const {
+  // The engines of a Generic link: KFD's mask, or the OAM engine for an empty mask.
+  std::vector<uint32_t> GenericEngines(uint32_t mask, std::optional<uint32_t> oam) const {
     std::vector<uint32_t> engines = Bits(mask);
     if (engines.empty() && oam) engines.push_back(*oam);
+    if (!evenOnly_) return engines;
+    std::vector<uint32_t> even;
+    for (uint32_t e : engines)
+      if ((e & ~1u) < caps_.nGeneral + caps_.nXgmi &&
+          std::find(even.begin(), even.end(), e & ~1u) == even.end())
+        even.push_back(e & ~1u);
+    return even;
+  }
+
+  std::vector<uint32_t> GenericCandidates(int channel, uint32_t mask,
+                                          std::optional<uint32_t> oam) const {
+    const std::vector<uint32_t> engines = GenericEngines(mask, oam);
     std::vector<uint32_t> out;
     for (size_t i = 0; i < engines.size(); ++i) {
       const uint32_t e = engines[(static_cast<size_t>(channel) + i) % engines.size()];
@@ -285,6 +310,7 @@ class SourcePlan {
 
   NodeCaps caps_;
   std::vector<uint32_t> pool_;  // Gfx9Xgmi: the even xGMI engines
+  bool evenOnly_ = false;       // a gfx9 part without xGMI engines
   std::array<int, kMaxEngines> queues_{};
   std::array<int, kMaxEngines> linksOn_{};
   uint32_t full_ = 0;
