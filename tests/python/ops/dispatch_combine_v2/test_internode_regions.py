@@ -100,6 +100,7 @@ _CASES = {
     "recv_cap_clamped": _cfg(max_total_recv_tokens=256, num_experts_per_token=4),
     "eight_qps": _cfg(num_qp_per_pe=8),
     "moe_sort": _cfg(moe_sort_block_m=32),
+    "two_tokens": _cfg(max_num_inp_token_per_rank=2),
 }
 
 
@@ -191,3 +192,14 @@ def test_moe_sort_holds_a_counter_line_and_a_full_bucket_per_expert(name):
         epr = cfg.num_experts_per_rank
         recv = cfg.world_size * cfg.max_num_inp_token_per_rank
         assert regions["moe_sort"] == epr * 128 + 128 + epr * recv * 8
+
+
+@pytest.mark.parametrize("name", sorted(_CASES))
+def test_chunk_flags_hold_the_piece_flags(name):
+    """``inter_node_chunk_flag`` holds the ``nNodes * c`` chunk flags (c chunks of
+    64 tokens per node), then 3 piece flags per chunk (``EpInterNodePieceFlagSlot``)."""
+    cfg = _CASES[name]
+    sizes = dict(internode_regions(cfg))
+    n_nodes = cfg.world_size // cfg.gpu_per_node
+    chunks = -(-cfg.max_num_inp_token_per_rank // 64)
+    assert sizes["inter_node_chunk_flag"] >= n_nodes * chunks * 4 * 8

@@ -145,7 +145,15 @@ def internode_regions(cfg):
             "cross_device_barrier",
             max(barrier_bytes * 2 * _U64, world_size * (1 + cfg.num_qp_per_pe) * _U64),
         ),
-        ("inter_node_chunk_flag", n_nodes * max_tokens_to_send_per_rank * _U64),
+        # Chunk flags, then the flags of each v2_ll chunk's later pieces (3 per chunk).
+        (
+            "inter_node_chunk_flag",
+            n_nodes
+            * max(
+                max_tokens_to_send_per_rank, 4 * -(-max_tokens_to_send_per_rank // 64)
+            )
+            * _U64,
+        ),
     ]
 
     # Scales are absent, not zero-sized, when the transport is off: the kernel

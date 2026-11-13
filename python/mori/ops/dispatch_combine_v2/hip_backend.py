@@ -782,8 +782,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # Counts completions. NOT the local half of the symmetric chunk-flag
         # region despite the name: that one is written by dispatch and read+
         # cleared by combine, which enumerates its work from dispatch's leftovers.
+        # The v2_ll combine counts one piece per QP of each 64-token chunk.
         self.inter_chunk_flag_combine = torch.zeros(
-            n_nodes * max_tokens_per_rank * 2, **i32
+            n_nodes
+            * max(
+                max_tokens_per_rank * 2,
+                -(-max_tokens_per_rank // 64) * cfg.num_qp_per_pe,
+            ),
+            **i32,
         )
         self.dest_pe_counter = torch.zeros(world_size, **i32)
         self.block_flag_counter = torch.zeros(n_nodes, **i32)
