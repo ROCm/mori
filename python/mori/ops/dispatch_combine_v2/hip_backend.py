@@ -138,11 +138,10 @@ _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 #
 # Keyed on the model (mori.ops.utils.detect_model, i.e. the PCI device id), not
 # the arch: MI300X, MI325X and MI308X are all gfx942, and only MI308X is short of
-# engines. Its xGMI engines fold to the even ids {2,4,6} and ROCr's own blit
-# queues take part of that, so three is what a pair fits -- asking for eight on
-# 8xMI308X returns HSAKMT_STATUS_NO_MEMORY from hsaKmtCreateQueueExt and anvil
-# exit()s the process; with three the AsyncLL suite passes there. anvil singles
-# MI308X out the same way (AnvilLib::isMi308x, DID 0x74A2). Capping all of gfx942
+# engines. Its peer links share three usable xGMI engines {2,4,6} of 8 queues
+# each, and ROCr's own blit queues take part of that, so three is what a pair
+# fits -- asking for eight on 8xMI308X runs out of queue slots and anvil fails
+# the init; with three the AsyncLL suite passes there. Capping all of gfx942
 # would have held MI300X and MI325X, which have the full set, to three as well.
 _ASYNCLL_SDMA_QUEUE_CAP = {"mi308x": 3}
 
@@ -658,16 +657,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # in-order commit chain. Eight is the hardware cap; above it cco
             # clamps with a warning.
             #
-            # The count is a PERFORMANCE knob, not a correctness one, and asking
-            # for more than a pair can hold is fatal rather than degrading:
-            # anvil's queue creation is CHECK_HSAKMT_SUCCESS, which exit()s. On
-            # 8xMI308X, 8 queues per pair gets HSAKMT_STATUS_NO_MEMORY from
-            # hsaKmtCreateQueueExt and every rank leaves the process -- its xGMI
-            # engines fold to the even ids {2,4,6} and ROCr's own blit queues
-            # take part of that, so three is what fits. With <= 3 the whole
-            # AsyncLL suite passes there, which is why this clamps rather than
-            # trying to recover: by the time the request is refused the process
-            # is already gone.
+            # The count is a PERFORMANCE knob, not a correctness one, but asking
+            # for more than a pair can hold fails the init rather than degrading:
+            # once every usable engine is out of KFD queue slots, anvil throws
+            # "SDMA queue exhausted" and ccoDevCommCreate fails on every rank. On
+            # 8xMI308X, 8 queues per pair does not fit -- its peer links share
+            # the even xGMI engines {2,4,6} and ROCr's own blit queues take part
+            # of that, so three is what fits. With <= 3 the whole AsyncLL suite
+            # passes there, which is why this clamps up front.
             requirements.sdma_queue_count = _asyncll_sdma_queues(
                 _gpu.detect_model(), cfg.gpu_per_node
             )

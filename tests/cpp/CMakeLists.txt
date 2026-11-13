@@ -36,6 +36,12 @@ target_include_directories(test_flat_yaml PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_flat_yaml PRIVATE gtest_main)
 add_test(NAME flat_yaml COMMAND test_flat_yaml)
 
+# Host-only SDMA engine plan (anvil/sdma_engine_plan.hpp).
+add_executable(test_sdma_engine_plan application/test_sdma_engine_plan.cpp)
+target_include_directories(test_sdma_engine_plan PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_sdma_engine_plan PRIVATE gtest_main)
+add_test(NAME sdma_engine_plan COMMAND test_sdma_engine_plan)
+
 add_executable(test_transport_tcp application/test_transport_tcp.cpp)
 
 target_include_directories(test_transport_tcp
