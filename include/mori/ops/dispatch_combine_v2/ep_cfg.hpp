@@ -157,6 +157,8 @@ struct EpArgs {
   int* recvIdx = nullptr;
 
   int numTokens = 0;  // tokens this rank contributes this call
+  int cardPull = 0;
+  unsigned long long offFwdMap = 0;
 };
 
 // The wire schema, generated from the field list rather than kept parallel to it.
@@ -192,7 +194,9 @@ struct EpArgs {
   X(stagingBase, "p")          \
   X(recvToSrc, "p")            \
   X(recvIdx, "p")              \
-  X(numTokens, "i32")
+  X(numTokens, "i32")          \
+  X(cardPull, "i32")           \
+  X(offFwdMap, "u64")
 
 #define MORI_EP_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
 // Trailing comma: the binding skips empty items, and a separator rule that does
@@ -215,7 +219,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 28,
+static_assert(detail::kEpArgsFieldCount == 30,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),
@@ -257,6 +261,11 @@ struct EpCfg {
   int callTokMax = 0;
   bool ll128 = false;
   bool ll128CombineOnly = false;
+  bool cardDedup = false;
+  int cardPullBlocks = 0;
+  bool cardFwdMark = false;
+  bool cardCombine = false;
+  bool ll128Dedup = false;
 };
 
 template <typename Self, typename Visit>
@@ -282,10 +291,15 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
   MORI_FIELD(ll128CombineOnly);
+  MORI_FIELD(cardDedup);
+  MORI_FIELD(cardPullBlocks);
+  MORI_FIELD(cardFwdMark);
+  MORI_FIELD(cardCombine);
+  MORI_FIELD(ll128Dedup);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 20, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 25, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -565,6 +579,30 @@ constexpr size_t EpRegionXdbBytes(const EpCfg& c) { return 8 * (size_t)c.worldSi
 constexpr size_t EpRegionOutScalesBytes(const EpCfg& c) {
   return (size_t)EpMaxRecv(c) * EpScaleStride(c);
 }
+constexpr size_t EpCardRevOff(const EpCfg& c) {
+  return EpAlignUp128((size_t)EpMaxRecv(c) * 4 + 64);
+}
+constexpr size_t EpCardFlagOff(const EpCfg& c) {
+  return EpAlignUp128(EpCardRevOff(c) + (size_t)EpMaxRecv(c) * 4);
+}
+constexpr size_t EpRegionFwdMapBytes(const EpCfg& c) {
+  if (c.cardCombine) return EpAlignUp128(EpCardFlagOff(c) + (size_t)EpMaxRecv(c) * 8);
+  return c.cardDedup ? (size_t)EpMaxRecv(c) * 4 + (c.cardPullBlocks > 0 ? 64 : 0) : 0;
+}
+
+constexpr bool EpCardDedupOk(const EpCfg& c) {
+  return c.dtype != EpDType::Fp4x2 && !c.ll128 && c.worldSize % 2 == 0 && c.worldSize < 32 &&
+         c.warpPerBlock > 8 && c.worldSize <= c.warpPerBlock && c.cardPullBlocks >= 0 &&
+         c.cardPullBlocks <= 64;
+}
+
+constexpr int EpCardCombineRowsMax = 2048;
+
+constexpr bool EpCardCombineOk(const EpCfg& c) {
+  return c.combineBf16Push && c.warpPerBlock == 16 && EpCombinePushOvlAny(c) && !c.ll128 &&
+         !c.ll128CombineOnly && c.worldSize >= 8 && c.worldSize % 2 == 0 && c.worldSize < 32 &&
+         (EpMaxRecv(c) + c.blockNum - 1) / c.blockNum <= EpCardCombineRowsMax;
+}
 
 // Per-warp LDS slab. The metadata tile and the payload tile share it (same
 // address, different phases), so its size bounds BOTH -- and the metadata batch
@@ -632,7 +670,10 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          c.scaleBytes >= 0 && (c.scaleBytes % 4) == 0 &&
          // aggReserve: lane p of warp 0 reserves destination p, and the blocks
          // arrived pack into the 12 bits above the 20-bit total of a count word.
-         (!c.aggReserve || (c.worldSize <= c.waveSize && c.blockNum < 4096));
+         (!c.aggReserve || (c.worldSize <= c.waveSize && c.blockNum < 4096)) &&
+         (!c.cardDedup || EpCardDedupOk(c)) && (c.cardDedup || c.cardPullBlocks == 0) &&
+         (!c.cardFwdMark || (c.cardDedup && c.cardPullBlocks == 0)) &&
+         (!c.cardCombine || c.cardDedup || EpCardCombineOk(c));
 }
 
 }  // namespace v2

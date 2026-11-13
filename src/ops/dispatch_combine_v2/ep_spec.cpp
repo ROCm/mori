@@ -110,10 +110,46 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     }
     c.ll128CombineOnly = true;
   }
+  if (req.ll128Dedup && isDispatch) {
+    if (!c.ll128 || c.worldSize % 2 != 0) {
+      throw std::runtime_error(
+          "mori v2 ep: ll128Dedup is the ll128 dispatch's cardDedup, so it needs ll128 and an even "
+          "worldSize (ranks 2c and 2c + 1 being card c's partitions)");
+    }
+    c.ll128Dedup = true;
+  }
   c.combineBf16Push = !isDispatch && req.combineBf16Push && !c.ll128 && !c.ll128CombineOnly;
   if (c.combineBf16Push && c.dtype != EpDType::Bf16) {
     throw std::runtime_error(
         "mori v2 ep: combineBf16Push sums bf16 rows, so it needs a bf16 combine");
+  }
+  if (req.cardDedup && isDispatch) {
+    c.cardDedup = true;
+    c.cardPullBlocks = req.cardPullBlocks;
+    c.cardFwdMark = req.cardFwdMark && req.cardPullBlocks == 0;
+    c.cardCombine = req.cardCombine;
+    if (arch.rfind("gfx125", 0) != 0 || !EpCardDedupOk(c)) {
+      throw std::runtime_error(
+          "mori v2 ep: cardDedup needs gfx125x, a bf16 / fp8 / fp32 dispatch without ll128, an "
+          "even worldSize below 32, more than 8 warps a block and at least one a rank, and 0 to "
+          "64 pull blocks (world=" +
+          std::to_string(c.worldSize) + " warps=" + std::to_string(c.warpPerBlock) +
+          " pullBlocks=" + std::to_string(c.cardPullBlocks) + ")");
+    }
+  } else if (isDispatch && (req.cardPullBlocks != 0 || req.cardFwdMark || req.cardCombine)) {
+    throw std::runtime_error(
+        "mori v2 ep: cardPullBlocks, cardFwdMark and cardCombine need cardDedup");
+  } else if (!isDispatch && req.cardCombine) {
+    c.cardCombine = true;
+    if (arch.rfind("gfx125", 0) != 0 || !EpCardCombineOk(c)) {
+      throw std::runtime_error(
+          "mori v2 ep: cardCombine needs gfx125x, the bf16 push combine without ll128 on 16 "
+          "warps a block, an even worldSize from 8 to 30, and at most " +
+          std::to_string(EpCardCombineRowsMax) +
+          " rows a block (world=" + std::to_string(c.worldSize) +
+          " warps=" + std::to_string(c.warpPerBlock) + " blocks=" + std::to_string(c.blockNum) +
+          " maxRecv=" + std::to_string(EpMaxRecv(c)) + ")");
+    }
   }
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
@@ -234,7 +270,8 @@ std::string EpRegionInfo(const EpCfg& c, EpKernelKind kind) {
          EpKv("region.dispOut", disp ? EpRegionDispOutBytes(c) : 0) +
          EpKv("region.outTok", disp ? 0 : EpRegionOutTokBytes(c)) +
          EpKv("region.xdb", EpRegionXdbBytes(c)) +
-         EpKv("region.outScales", disp ? EpRegionOutScalesBytes(c) : 0);
+         EpKv("region.outScales", disp ? EpRegionOutScalesBytes(c) : 0) +
+         EpKv("region.fwdMap", disp || c.cardCombine ? EpRegionFwdMapBytes(c) : 0);
 }
 
 }  // namespace
@@ -281,7 +318,7 @@ const std::vector<std::string>& EpCombineSpec::SourceDeps() { return EpSourceDep
 
 mori::jit::v2::LaunchGeometry EpDispatchSpec::Geometry(const Cfg& cfg) {
   mori::jit::v2::LaunchGeometry g;
-  g.gridX = static_cast<unsigned>(cfg.blockNum);
+  g.gridX = static_cast<unsigned>(cfg.blockNum + cfg.cardPullBlocks);
   g.blockX = static_cast<unsigned>(EpBlockThreads(cfg));
   // Portable dispatch keeps everything in registers; the gfx1250 TDM dispatch
   // stages one hidden-dim token tile per warp in dynamic LDS.

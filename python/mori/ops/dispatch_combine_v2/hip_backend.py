@@ -86,6 +86,7 @@ _REGIONS = {
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
+    "fwdMap": "fwd_map",
 }
 
 _LL_REGIONS = dict(
@@ -322,6 +323,31 @@ def push_land_rows(cfg) -> int:
     return _combine_info_cached(tuple(sorted(fields)))["pushLandRows"]
 
 
+_CARD_COMBINE_ROWS_MAX = 2048
+
+
+def _card_layout(cfg):
+    if (
+        cfg.is_internode
+        or cfg.async_ll
+        or cfg.quant_type != "none"
+        or cfg.dispatch_dtype is not torch.bfloat16
+        or cfg.combine_dtype is not torch.bfloat16
+        or not cfg.schedule
+        or os.environ.get("MORI_EP_BF16_PUSH", "1") == "0"
+    ):
+        return None
+    shape = (cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token)
+    epr = cfg.num_experts_per_rank
+    push = tuning.bf16_push(*shape, experts_per_rank=epr)
+    rows = cfg.effective_max_recv
+    if push is None or any(
+        b and -(-rows // b) > _CARD_COMBINE_ROWS_MAX for _, b, _ in push
+    ):
+        return None
+    return tuning.card(*shape, experts_per_rank=epr)
+
+
 def ll128_layout(cfg):
     if cfg.is_internode or cfg.async_ll:
         return None
@@ -345,6 +371,7 @@ def ll128_layout(cfg):
         cfg.max_num_inp_token_per_rank,
         experts_per_rank=cfg.num_experts_per_rank,
         quant_type=cfg.quant_type,
+        card_fold=_card_layout(cfg) is not None,
     )
     if geom is None:
         return None
@@ -404,6 +431,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._ll128_split = lay if split else None
         self._ll_recv_cap = cfg.world_size * lay["max_tok"] if split else 0
         self._ll_last = False
+        card = _card_layout(cfg) if self._is1250 else None
+        self._ll128_dedup = card is not None
+        self._card = card if self._ll128_geom is None else None
 
         # Gate FIRST: rejecting a config after taking a symmetric window would
         # leak it (the arena is registered with the communicator), and the whole
@@ -436,7 +466,16 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._combine_specs = tuple(
             dict.fromkeys(row.combine for row in self._schedule)
         )
+        if self._card is not None and any(
+            spec.warp_per_block <= 8
+            or spec.warp_per_block < cfg.world_size
+            or spec.block_num + self._card["pull_blocks"] > self._multi_processor_count
+            for spec in self._dispatch_specs
+        ):
+            self._card = None
         self._bf16_push = self._bf16_push_layout(cfg)
+        if self._bf16_push is None:
+            self._card = None
         self._push_specs = tuple(
             dict.fromkeys(
                 tuning.KernelConfig("intra", b, w) for _, b, w in self._bf16_push or ()
@@ -483,12 +522,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             raise ValueError(f"MORI_EP_BF16_PUSH must be '0' or '1', got {flag!r}")
         if flag == "0":
             return None
-        return tuning.bf16_push(
+        lay = tuning.bf16_push(
             cfg.world_size,
             cfg.hidden_dim,
             cfg.num_experts_per_token,
             experts_per_rank=cfg.num_experts_per_rank,
         )
+        if lay is not None and self._card is not None:
+            lay = tuple((mx, b, 16) for mx, b, _ in lay)
+        return lay
+
+    def _push_card(self):
+        return {} if self._card is None else dict(card_combine=True)
 
     def _build(self, cfg, comm):
         dev = self.dev
@@ -877,13 +922,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return (
             tuple(
                 cb.EpDispatchPlan.describe(
-                    **disp,
+                    **self._variant_request(disp, blocks),
                     block_num=spec.block_num,
                     warp_per_block=spec.warp_per_block,
                     call_tok_max=cap,
                 )
                 for spec in self._dispatch_specs
-                for cap in self._dispatch_caps(cfg, spec)
+                for cap, blocks in self._dispatch_variants(cfg, spec)
             ),
             tuple(
                 cb.EpCombinePlan.describe(
@@ -896,6 +941,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             + tuple(
                 cb.EpCombinePlan.describe(
                     **comb,
+                    **self._push_card(),
                     combine_bf16_push=True,
                     block_num=spec.block_num,
                     warp_per_block=spec.warp_per_block,
@@ -1052,6 +1098,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # rejects a Cfg whose row is not a whole number of them.
             scale_bytes=self._scale_i32(cfg) * 4,
         )
+        if self._card is not None:
+            disp["card_dedup"] = True
+            disp["card_combine"] = True
+            if self._card["pull_blocks"]:
+                disp["card_pull_blocks"] = self._card["pull_blocks"]
         comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
         if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
             comb["combine_fp4"] = True
@@ -1065,6 +1116,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 ll128=True,
                 combine_fp4=comb.get("combine_fp4", False),
                 combine_fp8=comb.get("combine_fp8", False),
+                ll128_dedup=self._ll128_dedup,
             )
             comb["ll128"] = True
         elif geom is not None:
@@ -1083,6 +1135,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dict(
                 disp,
                 **ll,
+                card_dedup=False,
+                card_pull_blocks=0,
+                card_combine=False,
+                ll128_dedup=self._ll128_dedup,
                 combine_fp4=comb.get("combine_fp4", False),
                 combine_fp8=comb.get("combine_fp8", False),
                 call_tok_max=n,
@@ -1685,6 +1741,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             and not (snapshot and self.cfg.quant_type in _PUSH_QUANT_TYPES)
         ):
             return _LL_SPEC, _LL_SPEC
+        if snapshot and self._card is not None:
+            raise ValueError(
+                "snapshot=True on an op whose bf16 push combine folds the rows of each "
+                "card: the fold reads the latest dispatch, so a handle cannot outlive the "
+                "next one; pass snapshot=False, or set MORI_EP_BF16_PUSH=0"
+            )
         selected = self.kernel_config(num_tokens)
         return selected.dispatch, selected.combine
 
@@ -1780,9 +1842,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         dispatch, combine = {}, {}
         for spec in self._dispatch_specs:
             sized = []
-            for cap in self._dispatch_caps(cfg, spec):
+            for cap, blocks in self._dispatch_variants(cfg, spec):
                 plan = cb.EpDispatchPlan(
-                    **disp_req,
+                    **self._variant_request(disp_req, blocks),
                     **bound,
                     block_num=spec.block_num,
                     warp_per_block=spec.warp_per_block,
@@ -1792,7 +1854,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 if self.dispatch_staging is not None:
                     plan.bind(staging_base=self.dispatch_staging)
                 self._plans.append(plan)
-                sized.append((cap, plan))
+                sized.append((cap, plan, self._card is not None and not blocks))
             dispatch[spec] = self._wrap_dispatch(sized)
         for spec in self._combine_specs:
             plan = cb.EpCombinePlan(
@@ -1808,6 +1870,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         for spec in self._push_specs:
             plan = cb.EpCombinePlan(
                 **comb_req,
+                **self._push_card(),
                 **bound,
                 combine_bf16_push=True,
                 block_num=spec.block_num,
@@ -1829,7 +1892,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 plan.bind(staging_base=self.dispatch_staging)
             self._plans.append(plan)
             n = self._ll128_split["max_tok"]
-            dispatch[_LL_SPEC] = self._wrap_dispatch([(n, plan)], ll=True)
+            dispatch[_LL_SPEC] = self._wrap_dispatch([(n, plan, False)], ll=True)
             plan = cb.EpCombinePlan(**ll[1], **ll_bound)
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
@@ -2035,6 +2098,28 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             caps.add(cap)
         return sorted(caps)
 
+    def _dispatch_variants(self, cfg, spec):
+        caps = self._dispatch_caps(cfg, spec)
+        card = self._card or {}
+        blocks = card.get("pull_blocks", 0)
+        edge = card.get("pull_launch_max", 0) if blocks else 0
+        if edge <= 0:
+            return [(cap, blocks) for cap in caps]
+        small = [(cap, 0) for cap in caps if cap <= edge]
+        big = [cap for cap in caps if cap > edge]
+        if big and (not small or small[-1][0] < edge):
+            small.append((edge, 0))
+        return small + [(cap, blocks) for cap in big]
+
+    @staticmethod
+    def _variant_request(req, blocks):
+        out = {k: v for k, v in req.items() if k != "card_pull_blocks"}
+        if blocks:
+            out["card_pull_blocks"] = blocks
+        elif req.get("card_pull_blocks"):
+            out["card_fwd_mark"] = True
+        return out
+
     def _wrap_dispatch(self, sized, ll=False):
         def run(
             *,
@@ -2045,15 +2130,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dest_map,
             num_tokens,
         ):
-            plan = next((p for c, p in sized if num_tokens <= c), None)
+            plan, pull = next(
+                ((p, two) for c, p, two in sized if num_tokens <= c), (None, False)
+            )
             if plan is None:
                 raise ValueError(
                     f"dispatch of {num_tokens} tokens is past this variant's largest "
                     f"call size {sized[-1][0]}"
                 )
             count = self._ll_recv if ll else self._recv
-            plan.launch(
-                stream=torch.cuda.current_stream().cuda_stream,
+            stream = torch.cuda.current_stream().cuda_stream
+            args = dict(
                 token_indices=indices,
                 inp_token_buf=input,
                 weights_buf=weights,
@@ -2064,6 +2151,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 grid_barrier=self.dispatch_barrier,
                 num_tokens=num_tokens,
             )
+            if pull:
+                plan.launch(stream=stream, card_pull=0, **args)
+                plan.launch(stream=stream, card_pull=1, **args)
+            else:
+                plan.launch(stream=stream, **args)
             self.total_recv = count
             self._ll_last = ll
 
@@ -2119,6 +2211,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             (mx, push[tuning.KernelConfig("intra", b, w)])
             for mx, b, w in self._bf16_push
         )
+        marks = ()
+        if self._card is not None:
+            n = self.cfg.effective_max_recv
+            base = self.arena.local_ptr("fwd_map")
+            rev = (4 * n + 64 + 127) // 128 * 128
+            marks = tuple(
+                from_gpu_ptr(base + off, (n,), torch.int32) for off in (0, rev)
+            )
 
         def run(
             *,
@@ -2131,6 +2231,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             recv_idx=None,
         ):
             if want_weights or total_recv is not self._recv:
+                if marks and total_recv is not self._recv:
+                    raise NotImplementedError(
+                        "the bf16 push combine of this op folds the rows of each card "
+                        "from the latest dispatch, so a snapshot handle cannot be "
+                        "combined after it; pass snapshot=False, or set "
+                        "MORI_EP_BF16_PUSH=0"
+                    )
+                for m in marks:
+                    m.zero_()
                 return pull(
                     input=input,
                     dest_map=dest_map,

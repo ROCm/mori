@@ -78,7 +78,8 @@ def _device_keys():
     rev = _gpu.asic_revision()
     if rev == 0 or (rev is None and _detected_arch() == "gfx1250-strict"):
         return ("gfx1250-strict", "gfx1250")
-    return (key,)
+    cu = _gpu.cu_count()
+    return (f"{key}/{cu}cu", key) if cu else (key,)
 
 
 def _first_bucket(table, devs, *shape):
@@ -453,6 +454,9 @@ _BF16_PUSH_TABLE: dict = {
         (4, 7168, 6, None): ((128, 64, 8), (512, 64, 16), (None, 64, 24)),
         (8, 7168, 6, None): ((192, 64, 8), (512, 64, 16), (None, 64, 24)),
     },
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
+    },
 }
 
 _LL128_TABLE: dict = {
@@ -503,6 +507,13 @@ _LL128_TABLE: dict = {
                 "fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
             },
         },
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): {
+                "bf16": dict(
+                    max_tok=176, card_max_tok=160, dispatch=(64, 16), combine=(64, 16)
+                ),
+            },
+        },
     },
 }
 
@@ -515,14 +526,24 @@ def ll128(
     max_tok,
     experts_per_rank=None,
     quant_type="none",
+    card_fold=False,
 ):
-    if _device_keys()[0] == "gfx1250-strict":
+    devs = _device_keys()
+    if devs[0] == "gfx1250-strict":
         return None  # LL128's polls miss peer writes on these parts; use the schedule
-    per_shape = _LL128_TABLE.get(quant_type, {}).get(_device_key(), {})
-    entry = _bucket_key(per_shape, world_size, hidden_dim, topk, experts_per_rank)
-    plan = entry.get(dtype) if entry else None
+    per_device = _LL128_TABLE.get(quant_type, {})
+    plan = None
+    for key in devs:
+        entry = _bucket_key(
+            per_device.get(key, {}), world_size, hidden_dim, topk, experts_per_rank
+        )
+        plan = entry.get(dtype) if entry else None
+        if plan is not None:
+            break
     if plan is None:
         return None
+    if card_fold and "card_max_tok" in plan:
+        plan = dict(plan, max_tok=plan["card_max_tok"])
     if max_tok <= plan["max_tok"]:
         return {"dispatch": plan["dispatch"], "combine": plan["combine"]}
     if max_tok <= plan.get("combine_max_tok", 0):
@@ -535,12 +556,27 @@ def ll128(
 
 
 def bf16_push(world_size, hidden_dim, topk, experts_per_rank=None):
-    return _bucket_key(
-        _BF16_PUSH_TABLE.get(_device_keys()[0], {}),
-        world_size,
-        hidden_dim,
-        topk,
-        experts_per_rank,
+    devs = _device_keys()
+    if devs[0] == "gfx1250-strict":
+        return None
+    return _first_bucket(
+        _BF16_PUSH_TABLE, devs, world_size, hidden_dim, topk, experts_per_rank
+    )
+
+
+_CARD_TABLE: dict = {
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): dict(pull_blocks=16, pull_launch_max=256),
+    },
+}
+
+
+def card(world_size, hidden_dim, topk, experts_per_rank=None):
+    devs = _device_keys()
+    if devs[0] == "gfx1250-strict":
+        return None
+    return _first_bucket(
+        _CARD_TABLE, devs, world_size, hidden_dim, topk, experts_per_rank
     )
 
 

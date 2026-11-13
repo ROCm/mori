@@ -107,6 +107,7 @@ def run(case, cfg, comm, dev, lut, lim, sizes, args):
     rank, world = cfg.rank, cfg.world_size
     push = cfg.quant_type != "none"
     op = EpDispatchCombineOp(cfg, comm)
+    fold = getattr(op, "_card", None) is not None
     checks = {}
 
     def check(name, ok):
@@ -204,6 +205,18 @@ def run(case, cfg, comm, dev, lut, lim, sizes, args):
     pairs = (small[:2], (small[0], large[0]), (large[0], small[0]), large[:2])
     for a, b in () if push else pairs:
         side = "_".join("ll128" if sizes[i] <= lim else "sched" for i in (a, b))
+        if fold and side != "ll128_ll128":
+            i = a if sizes[a] > lim else b
+            x, idx, w, s = args[i]
+            try:
+                op.dispatch(x, w, s, idx, return_routing=True, snapshot=True)
+                refused = False
+            except ValueError:
+                refused = True
+            check(f"snapshot_refused_{side}", refused)
+            check(f"after_refused_snapshot_{side}", torch.equal(pair(i), refs[i]))
+            sync()
+            continue
         ins, handles = [], []
         for i in (a, b):
             x, idx, w, s = args[i]

@@ -290,6 +290,153 @@ def test_every_arena_region_is_reported_in_args_order():
         assert [k[len("region.") :] for k in info if k.startswith("region.")] == stems
 
 
+_CARD_KW = dict(world_size=8, max_tok_per_rank=512, max_recv=4096, warp_per_block=16)
+
+
+def _without_card_dedup(info):
+    return {
+        k: v
+        for k, v in info.items()
+        if k not in ("cardDedup", "region.fwdMap", "cfgText")
+    }
+
+
+def test_card_dedup_adds_a_forward_map_and_nothing_else():
+    off = cb.EpDispatchPlan.describe(**_CARD_KW)
+    if not off["sharedBytes"]:
+        with pytest.raises(RuntimeError, match="cardDedup needs gfx125x"):
+            cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True)
+        return
+    on = cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True)
+    assert (off["cardDedup"], off["region.fwdMap"]) == (False, 0)
+    assert (on["cardDedup"], on["region.fwdMap"]) == (True, 4096 * 4)
+    assert _without_card_dedup(on) == _without_card_dedup(off)
+    assert on["cfgText"] == off["cfgText"][:-1] + ", .cardDedup=true}"
+    comb = cb.EpCombinePlan.describe(**_CARD_KW, card_dedup=True)
+    assert (comb["cardDedup"], comb["region.fwdMap"]) == (False, 0)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(world_size=7),
+        dict(warp_per_block=8),
+        dict(hidden_dim=3584, dtype="fp4x2"),
+        dict(card_pull_blocks=65),
+    ],
+)
+def test_card_dedup_rejects_a_cfg_whose_payload_takes_another_path(kw):
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    with pytest.raises(RuntimeError, match="cardDedup needs"):
+        cb.EpDispatchPlan.describe(**dict(_CARD_KW, card_dedup=True, **kw))
+
+
+def test_card_pull_blocks_run_past_the_senders_and_add_two_words():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    kw = dict(_CARD_KW, card_dedup=True, block_num=64)
+    serial = cb.EpDispatchPlan.describe(**kw)
+    ovl = cb.EpDispatchPlan.describe(**kw, card_pull_blocks=16)
+    assert (serial["blockNum"], serial["gridX"]) == (64, 64)
+    assert (ovl["blockNum"], ovl["gridX"]) == (64, 80)
+    assert ovl["region.fwdMap"] == serial["region.fwdMap"] + 64
+
+
+def test_card_fwd_mark_changes_the_cfg_only_without_pull_blocks():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    kw = dict(_CARD_KW, card_dedup=True, block_num=64)
+    plain = cb.EpDispatchPlan.describe(**kw)
+    mark = cb.EpDispatchPlan.describe(**kw, card_fwd_mark=True)
+    assert (plain["cardFwdMark"], mark["cardFwdMark"]) == (False, True)
+    assert mark["cfgText"] == plain["cfgText"][:-1] + ", .cardFwdMark=true}"
+    for k in ("cardFwdMark", "cfgText"):
+        plain.pop(k), mark.pop(k)
+    assert mark == plain
+    ovl = dict(kw, card_pull_blocks=16)
+    assert cb.EpDispatchPlan.describe(
+        **ovl, card_fwd_mark=True
+    ) == cb.EpDispatchPlan.describe(**ovl)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(card_pull_blocks=16),
+        dict(card_fwd_mark=True),
+        dict(card_combine=True),
+    ],
+)
+def test_card_dedup_knobs_need_card_dedup(kw):
+    with pytest.raises(RuntimeError, match="need cardDedup"):
+        cb.EpDispatchPlan.describe(**_CARD_KW, **kw)
+
+
+_LL128_KW = dict(world_size=8, max_tok_per_rank=128, max_recv=1024, ll128=True)
+
+
+def test_ll128_card_dedup_changes_the_ll128_dispatch_cfg_and_nothing_else():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("ll128 is gfx125x only")
+    off = cb.EpDispatchPlan.describe(**_LL128_KW)
+    on = cb.EpDispatchPlan.describe(**_LL128_KW, ll128_dedup=True)
+    assert (off["ll128Dedup"], on["ll128Dedup"]) == (False, True)
+    assert on["cfgText"] == off["cfgText"][:-1] + ", .ll128Dedup=true}"
+    for k in ("ll128Dedup", "cfgText"):
+        off.pop(k), on.pop(k)
+    assert on == off
+    comb = cb.EpCombinePlan.describe(**_LL128_KW, ll128_dedup=True)
+    assert comb == cb.EpCombinePlan.describe(**_LL128_KW)
+    for kw in (dict(ll128=False), dict(world_size=7)):
+        with pytest.raises(
+            RuntimeError, match="ll128Dedup is the ll128 dispatch's cardDedup"
+        ):
+            cb.EpDispatchPlan.describe(**dict(_LL128_KW, **kw), ll128_dedup=True)
+
+
+_CARD_COMB_KW = dict(_CARD_KW, combine_bf16_push=True)
+
+
+def _up128(n):
+    return (n + 127) // 128 * 128
+
+
+def test_card_combine_lays_out_the_reverse_map_and_flags():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_combine is gfx125x only")
+    rev = _up128(4096 * 4 + 64)
+    size = _up128(_up128(rev + 4096 * 4) + 4096 * 8)
+    disp = cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True, card_combine=True)
+    assert (disp["cardCombine"], disp["region.fwdMap"]) == (True, size)
+    fold = cb.EpCombinePlan.describe(**_CARD_COMB_KW, card_combine=True)
+    assert (fold["cardDedup"], fold["cardCombine"], fold["region.fwdMap"]) == (
+        False,
+        True,
+        size,
+    )
+    plain = cb.EpCombinePlan.describe(**_CARD_COMB_KW)
+    assert (plain["cardCombine"], plain["region.fwdMap"]) == (False, 0)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(combine_bf16_push=False),
+        dict(combine_bf16_push=False, combine_fp8=True),
+        dict(world_size=4),
+        dict(warp_per_block=8),
+        dict(warp_per_block=24),
+        dict(block_num=1),
+    ],
+)
+def test_card_combine_takes_the_bf16_push_on_16_warps(kw):
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_combine is gfx125x only")
+    with pytest.raises(RuntimeError, match="cardCombine needs"):
+        cb.EpCombinePlan.describe(**{**_CARD_COMB_KW, "card_combine": True, **kw})
+
+
 def _reference_regions(
     ws, hidden, max_tok, topk, disp_tok, comb_tok, scale, push, wave, gfx125x
 ):
