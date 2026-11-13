@@ -125,11 +125,10 @@ _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 #
 # Keyed on the model (mori.ops.utils.detect_model, i.e. the PCI device id), not
 # the arch: MI300X, MI325X and MI308X are all gfx942, and only MI308X is short of
-# engines. Its xGMI engines fold to the even ids {2,4,6} and ROCr's own blit
-# queues take part of that, so three is what a pair fits -- asking for eight on
-# 8xMI308X returns HSAKMT_STATUS_NO_MEMORY from hsaKmtCreateQueueExt and anvil
-# exit()s the process; with three the AsyncLL suite passes there. anvil singles
-# MI308X out the same way (AnvilLib::isMi308x, DID 0x74A2). Capping all of gfx942
+# engines. Its peer links share three usable xGMI engines {2,4,6} of 8 queues
+# each, and ROCr's own blit queues take part of that, so three is what a pair
+# fits -- asking for eight on 8xMI308X runs out of queue slots and anvil fails
+# the init; with three the AsyncLL suite passes there. Capping all of gfx942
 # would have held MI300X and MI325X, which have the full set, to three as well.
 _ASYNCLL_SDMA_QUEUE_CAP = {"mi308x": 3}
 

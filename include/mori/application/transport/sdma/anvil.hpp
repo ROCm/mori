@@ -41,24 +41,30 @@
 #include "hsa/hsa_ext_amd.h"
 #include "hsakmt/hsakmt.h"
 #include "hsakmt/hsakmttypes.h"
+#include "mori/application/transport/sdma/sdma_engine_plan.hpp"
 #include "mori/core/transport/sdma/anvil_device.hpp"
 
 namespace anvil {
 
 class SdmaQueue {
  public:
-  // hsakmtNodeId is libhsakmt's node id, not the sysfs one (see connect()).
-  SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId);
+  // A queue on `engineId` of libhsakmt node `hsakmtNodeId` (not the sysfs id, see
+  // connect()), or null with `*status` set when KFD has no queue slot there.
+  static std::unique_ptr<SdmaQueue> tryCreate(uint32_t hsakmtNodeId, uint32_t engineId,
+                                              HSAKMT_STATUS* status);
   ~SdmaQueue();
 
   SdmaQueueDeviceHandle* deviceHandle() const;
 
  private:
-  uint64_t* cachedWptr_;
-  uint64_t* committedWptr_;
-  void* queueBuffer_;
-  HsaQueueResource queue_;
-  SdmaQueueDeviceHandle* deviceHandle_;
+  SdmaQueue() = default;
+
+  uint64_t* cachedWptr_ = nullptr;
+  uint64_t* committedWptr_ = nullptr;
+  void* queueBuffer_ = nullptr;
+  HsaQueueResource queue_{};
+  SdmaQueueDeviceHandle* deviceHandle_ = nullptr;
+  bool created_ = true;
 };
 
 class AnvilLib {
@@ -137,18 +143,9 @@ class AnvilLib {
   // fallback for a gfx1250 GPU that reports no CPU link.
   uint32_t getAnyLinkEngineMask(int srcNode);
 
-  // True for gfx1250 (gfx12.5), the only arch that spreads loopback channels.
-  bool isGfx1250(int node);
-
-  // True for MI308X (PCI device_id 0x74A2), a 4-XCD harvest of the 8-XCD MI300X
-  // whose odd-numbered SDMA engine ids are fused off. connect() folds selected
-  // engine ids down to the backing even engine on this part and balances its
-  // peer links over the xGMI engines.
-  bool isMi308x(int deviceId);
-
-  // MI308X only; see connect(). Both assume channels_mutex_ is held.
-  uint32_t mi308xLinkEngine(int srcNode, int dstNode, const std::vector<uint32_t>& recommended);
-  uint32_t mi308xQueueEngine(int srcNode, int dstNode);
+  // The engine plan of a source node, created from its KFD properties on first use.
+  // Assumes channels_mutex_ is held.
+  plan::SourcePlan& sourcePlan(int srcNode);
 
   struct PairHash {
     std::size_t operator()(const std::pair<int, int>& p) const {
@@ -160,15 +157,9 @@ class AnvilLib {
   std::once_flag init_flag;
   std::mutex channels_mutex_;
   std::unordered_map<std::pair<int, int>, SdmaQueueVector, PairHash> sdma_channels_;
-  // MI308X peer-link balancing state, guarded by channels_mutex_. Per source
-  // node, the peer links and queues on each SDMA engine id; and per (src, dst)
-  // link, the engine all of its queues were given.
-  struct Mi308xEngineUse {
-    std::array<int, 8> links{};
-    std::array<int, 8> queues{};
-  };
-  std::unordered_map<int, Mi308xEngineUse> mi308x_engine_use_;
-  std::unordered_map<std::pair<int, int>, uint32_t, PairHash> mi308x_link_engine_;
+  // Per source node, where its queues went (see sdma_engine_plan.hpp). Guarded by
+  // channels_mutex_.
+  std::unordered_map<int, plan::SourcePlan> plans_;
 };
 
 extern AnvilLib& anvil;
@@ -182,8 +173,8 @@ inline void checkHipError(hipError_t err, const char* msg, const char* file, int
 }
 
 #define CHECK_HIP_ERROR(cmd) anvil::checkHipError((cmd), #cmd, __FILE__, __LINE__)
-// Hardware cap on SDMA channels per GPU pair on CDNA (4 queues/engine ×
-// 2 recommended engines). Requests above this are clamped, not failed.
+// Most SDMA channels per GPU pair: a gfx942/gfx950 engine holds 8 queues and a
+// peer link has one engine. Requests above this are clamped, not failed.
 inline constexpr int kMaxSdmaChannelsPerPair = 8;
 
 inline int GetSdmaNumChannels(int defaultVal = 2) {
