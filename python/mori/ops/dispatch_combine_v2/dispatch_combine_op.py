@@ -1119,6 +1119,15 @@ class EpDispatchCombineOp:
         combines also read routing state the op keeps in the arena, and StdMoE's
         convert reads the op's slot map and forwarded weights.
 
+        max_num_inp_token_across_ranks=: the largest input.shape[0] any rank
+        passes to this call. It picks LL128 on a gfx125x op whose capacity is
+        above the LL128 limit, and the family under internode "auto"; without
+        it those ops run their regular kernels (with low_latency=True the
+        gfx125x one raises). Pass the same value on every rank: only
+        n <= value <= capacity is checked, and ranks that pass different
+        values, or pass it on some ranks only, can pick different kernels and
+        hang. The returned handle keeps it for combine.
+
         out_scales is [max_recv, scale_dim_i32] on both backends but is not always
         CONTIGUOUS -- a backend may lay the rows down wider and return a strided
         view. Read by pointer, stride by scale_stride_bytes(), not by this shape.

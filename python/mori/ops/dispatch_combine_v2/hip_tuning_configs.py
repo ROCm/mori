@@ -647,6 +647,13 @@ def resolve_schedule(
 
 
 def resolve_ll_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
+    """The v2_ll schedule an internode "auto" op runs for calls whose
+    max_num_inp_token_across_ranks is at most internode_auto_ll_max_tokens.
+
+    resolve_schedule() for kernel_family="v2_ll", up to and including the first
+    bucket whose ceiling reaches the crossover, which internode_schedule() makes
+    a bucket edge. Empty for every other op; resolve_schedule() alone serves it.
+    """
     if (
         getattr(cfg, "async_ll", False)
         or not cfg.is_internode
