@@ -1,0 +1,279 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UMBP monitoring &mdash; MORI development (6206eebd) documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=dff4fcea"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="MORI UMBP PD Disaggregation Benchmark" href="MORI-UMBP-PD-BENCHMARK.html" />
+    <link rel="prev" title="UMBP → SGLang KV Indexer" href="umbp-kv-indexer-export.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-EP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">User guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an API and backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">Benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">V1 vs V2 inter-node performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA bandwidth in the kernels</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-FUSED</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ar.html">GEMM + all-reduce</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-rs.html">GEMM + reduce-scatter</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-a2a.html">GEMM + all-to-all</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ag.html">GEMM + all-gather</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-ag-gemm.html">All-gather + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-a2a-gemm.html">All-to-all + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-tests-and-benchmarks.html">Tests and benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-SHMEM</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">SHMEM guide</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-CCO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">CCO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-device-api.html">Device API for FlyDSL and Triton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-examples.html">Examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-benchmarks.html">Benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-IO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">IO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">Benchmark</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-UMBP</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="umbp-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-configuration.html">Configuration and environment variables</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-pure-ssd-mode.html">Pure-SSD mode and multi-drive tiers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-numa-tier-placement.html">NUMA placement for a DRAM tier</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-kv-indexer-export.html">KV indexer export</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Monitoring</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#the-dashboards">The dashboards</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#one-dashboard-for-every-medium">One dashboard for every medium</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#editing-the-dashboards">Editing the dashboards</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#template-variables">Template variables</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">PD disaggregation benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">Tier-management benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">Simulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">Calibration</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Tools</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ kernel profiler</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">Profiler API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP master client</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">JIT compilation framework</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">JIT v2 (in Chinese)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">UMBP single-node smoke test</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">UMBP monitoring</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/umbp-monitoring.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <!-- Rendered from examples/monitoring/README.md. Edit that file, not this one. -->
+<section id="umbp-monitoring">
+<h1>UMBP monitoring<a class="headerlink" href="#umbp-monitoring" title="Link to this heading"></a></h1>
+<p>Prometheus scrape fragments and the Grafana dashboards for a UMBP deployment.
+Point Grafana at <code class="docutils literal notranslate"><span class="pre">grafana/dashboards/</span></code> and Prometheus at
+<code class="docutils literal notranslate"><span class="pre">umbp_master.scrape.yml</span></code>; <code class="docutils literal notranslate"><span class="pre">example/docker-compose.yml</span></code> is a working stack that
+does both.</p>
+<p>Which fragment you want depends on where the metrics come out:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Deployment</p></th>
+<th class="head"><p>Fragment</p></th>
+<th class="head"><p>Port</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>With a master</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">umbp_master.scrape.yml</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">9091</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Masterless (standalone server)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">umbp_standalone.scrape.yml</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">9092</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p>A masterless node has no master to report to, so the standalone server serves
+its own <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> (see <code class="docutils literal notranslate"><span class="pre">UMBP_STANDALONE_METRICS_PORT</span></code>) and stamps the <code class="docutils literal notranslate"><span class="pre">node</span></code>
+label the master used to add on ingest. <strong>The dashboards below are the same
+either way</strong> — they are written against the series, not against the deployment
+that published them.</p>
+<section id="the-dashboards">
+<h2>The dashboards<a class="headerlink" href="#the-dashboards" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Dashboard</p></th>
+<th class="head"><p>Covers</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">umbp_backends.json</span></code></p></td>
+<td><p><strong>Every storage medium and transfer engine</strong>, in shared panels</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">umbp_data_rate_bandwidth.json</span></code></p></td>
+<td><p>Per-client inbound/outbound data rate and BatchPut/BatchGet bandwidth</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">umbp_rpc_call_rates.json</span></code></p></td>
+<td><p>Client capacity, routing and batch API call rates</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">umbp_master_client_rpc_latency.json</span></code></p></td>
+<td><p>Master RPC latency, QPS and error rate by RPC</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">umbp_external_kv.json</span></code></p></td>
+<td><p>The external-KV index: report/revoke/match and live block counts</p></td>
+</tr>
+</tbody>
+</table>
+<p>The last four are backend-agnostic — they measure the client, the master and
+the KV index, which look the same whatever medium is underneath — and are
+unchanged.</p>
+</section>
+<section id="one-dashboard-for-every-medium">
+<h2>One dashboard for every medium<a class="headerlink" href="#one-dashboard-for-every-medium" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">umbp_backends.json</span></code> is the one that got merged. It replaced the per-medium
+dashboards (<code class="docutils literal notranslate"><span class="pre">umbp_ssd_tier.json</span></code>, and whatever the next medium would have
+needed): every storage panel groups by <code class="docutils literal notranslate"><span class="pre">tier</span></code>, and every transfer panel by
+<code class="docutils literal notranslate"><span class="pre">engine</span></code>, so DRAM, HBM and SSD appear as series in the same panel and can be
+read against each other. There is deliberately <strong>no dashboard per medium</strong>.</p>
+<p>That is a property of how the metrics are emitted, not a convention this file
+asks you to follow. A medium does not name its own metrics: <code class="docutils literal notranslate"><span class="pre">InstrumentedBackend</span></code>
+wraps every <code class="docutils literal notranslate"><span class="pre">MediumBackend</span></code> and derives the generic series from the interface
+calls, and <code class="docutils literal notranslate"><span class="pre">CompositeTransferEngine</span></code> does the same for every engine it
+dispatches to. <strong>A backend or engine added to the code shows up in these panels
+with no dashboard change and no metrics code of its own.</strong></p>
+<p>The one thing a component publishes for itself is state its interface cannot
+show from outside — what a device actually did, how full an internal arena is.
+Those ride generic names with the specifics in a label
+(<code class="docutils literal notranslate"><span class="pre">mori_umbp_backend_medium_events_total{tier=&quot;SSD&quot;,</span> <span class="pre">event=&quot;single_flight_dup&quot;}</span></code>),
+so they land in the existing “medium-internal” panels rather than needing new
+ones. See <code class="docutils literal notranslate"><span class="pre">src/umbp/include/umbp/distributed/metrics/component_metrics.h</span></code> for
+the vocabulary and the rule.</p>
+</section>
+<section id="editing-the-dashboards">
+<h2>Editing the dashboards<a class="headerlink" href="#editing-the-dashboards" title="Link to this heading"></a></h2>
+<p>All five are plain Grafana JSON, edited the way Grafana dashboards normally
+are: change the panel in the Grafana UI, export the dashboard, commit the JSON.</p>
+<p>When you add a panel to <code class="docutils literal notranslate"><span class="pre">umbp_backends.json</span></code>, write the query against
+<strong>labels</strong> — <code class="docutils literal notranslate"><span class="pre">sum</span> <span class="pre">by</span> <span class="pre">(tier)</span> <span class="pre">(...)</span></code>, <code class="docutils literal notranslate"><span class="pre">sum</span> <span class="pre">by</span> <span class="pre">(engine,</span> <span class="pre">direction)</span> <span class="pre">(...)</span></code> — never
+against a metric name or a pinned matcher that spells one medium or one
+transport (<code class="docutils literal notranslate"><span class="pre">mori_umbp_ssd_read_total</span></code>, <code class="docutils literal notranslate"><span class="pre">tier=&quot;SSD&quot;</span></code>). A panel written the other
+way stops covering the system the day someone adds a backend, which is exactly
+the failure this dashboard replaced.</p>
+</section>
+<section id="template-variables">
+<h2>Template variables<a class="headerlink" href="#template-variables" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">umbp_backends.json</span></code> uses <code class="docutils literal notranslate"><span class="pre">node</span></code> and <code class="docutils literal notranslate"><span class="pre">tier</span></code>, populated from
+<code class="docutils literal notranslate"><span class="pre">mori_umbp_client_capacity_total_bytes</span></code> — a metric every live deployment
+publishes, so the pickers fill in as soon as one client registers.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="umbp-kv-indexer-export.html" class="btn btn-neutral float-left" title="UMBP → SGLang KV Indexer" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="MORI-UMBP-PD-BENCHMARK.html" class="btn btn-neutral float-right" title="MORI UMBP PD Disaggregation Benchmark" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.
+      <span class="lastupdated">Last updated on 2026-11-13.
+      </span></p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

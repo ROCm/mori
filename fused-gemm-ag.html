@@ -1,0 +1,1113 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GEMM + all-gather &mdash; MORI development (6206eebd) documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=dff4fcea"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="All-gather + GEMM" href="fused-ag-gemm.html" />
+    <link rel="prev" title="GEMM + all-to-all" href="fused-gemm-a2a.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-EP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">User guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an API and backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">Benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">V1 vs V2 inter-node performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA bandwidth in the kernels</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-FUSED</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ar.html">GEMM + all-reduce</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-rs.html">GEMM + reduce-scatter</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-a2a.html">GEMM + all-to-all</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">GEMM + all-gather</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#what-it-computes">1. What it computes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#how-it-works">2. How it works</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#requirements">3. Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#constructor">4. Constructor</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#window-bytes-for">window_bytes_for()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#calling-the-operator">5. Calling the operator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#other-methods">6. Other methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#padded-m">padded_m()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#pad-rows">pad_rows()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#fuses-at">fuses_at()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tile-for">tile_for()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#chunks-for">chunks_for()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#self-test">self_test()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#close-and-the-context-manager">close() and the context manager</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#attributes">Attributes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#supports">supports()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#shape-constraint">shape_constraint()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#preshuffle-b">preshuffle_b()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#kernel-level-exports">Kernel-level exports</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#shapes-and-limits">7. Shapes and limits</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#choosing-settings">8. Choosing settings</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#performance">9. Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#complete-example">10. Complete example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#testing-and-benchmarking">11. Testing and benchmarking</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#troubleshooting">12. Troubleshooting</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#further-reading">Further reading</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="fused-ag-gemm.html">All-gather + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-a2a-gemm.html">All-to-all + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-tests-and-benchmarks.html">Tests and benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-SHMEM</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">SHMEM guide</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-CCO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">CCO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-device-api.html">Device API for FlyDSL and Triton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-examples.html">Examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-benchmarks.html">Benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-IO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">IO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">Benchmark</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-UMBP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="umbp-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-configuration.html">Configuration and environment variables</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-pure-ssd-mode.html">Pure-SSD mode and multi-drive tiers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-numa-tier-placement.html">NUMA placement for a DRAM tier</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-kv-indexer-export.html">KV indexer export</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-monitoring.html">Monitoring</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">PD disaggregation benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">Tier-management benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">Simulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">Calibration</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Tools</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ kernel profiler</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">Profiler API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP master client</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">JIT compilation framework</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">JIT v2 (in Chinese)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">UMBP single-node smoke test</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">GEMM + all-gather</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/fused-gemm-ag.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="gemm-all-gather">
+<h1>GEMM + all-gather<a class="headerlink" href="#gemm-all-gather" title="Link to this heading"></a></h1>
+<p><code class="docutils literal notranslate"><span class="pre">GemmAgOp</span></code> (<code class="docutils literal notranslate"><span class="pre">mori.ops.gemm_ag</span></code>) computes <code class="docutils literal notranslate"><span class="pre">C</span> <span class="pre">=</span> <span class="pre">A</span> <span class="pre">&#64;</span> <span class="pre">B.T</span></code> on each rank’s own rows
+and gathers the results, so every rank gets every rank’s rows, <code class="docutils literal notranslate"><span class="pre">[P*M,</span> <span class="pre">N]</span></code>. It
+serves a projection on a context- or sequence-parallel token shard whose output
+every rank consumes, and was built for DeepSeek-V4’s compressor <code class="docutils literal notranslate"><span class="pre">wkv_gate</span></code>. The
+GEMM writes C into this rank’s receive slot. On the fused path, which the default
+picks at large M, its epilogue pushes each finished chunk of rows to every peer
+over the SDMA copy engines while the GEMM computes the rest.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#quick-reference">Quick Reference</a></p></li>
+<li><p><a class="reference internal" href="#what-it-computes">1. What it computes</a></p></li>
+<li><p><a class="reference internal" href="#how-it-works">2. How it works</a></p></li>
+<li><p><a class="reference internal" href="#requirements">3. Requirements</a></p></li>
+<li><p><a class="reference internal" href="#constructor">4. Constructor</a></p></li>
+<li><p><a class="reference internal" href="#calling-the-operator">5. Calling the operator</a></p></li>
+<li><p><a class="reference internal" href="#other-methods">6. Other methods</a></p></li>
+<li><p><a class="reference internal" href="#shapes-and-limits">7. Shapes and limits</a></p></li>
+<li><p><a class="reference internal" href="#choosing-settings">8. Choosing settings</a></p></li>
+<li><p><a class="reference internal" href="#performance">9. Performance</a></p></li>
+<li><p><a class="reference internal" href="#complete-example">10. Complete example</a></p></li>
+<li><p><a class="reference internal" href="#testing-and-benchmarking">11. Testing and benchmarking</a></p></li>
+<li><p><a class="reference internal" href="#troubleshooting">12. Troubleshooting</a></p></li>
+<li><p><a class="reference internal" href="#further-reading">Further reading</a></p></li>
+</ul>
+</section>
+<section id="quick-reference">
+<h2>Quick Reference<a class="headerlink" href="#quick-reference" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.cco</span><span class="w"> </span><span class="kn">import</span> <span class="n">Communicator</span><span class="p">,</span> <span class="n">UniqueId</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.gemm_ag</span><span class="w"> </span><span class="kn">import</span> <span class="n">GemmAgOp</span>
+
+<span class="n">rank</span><span class="p">,</span> <span class="n">world</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">get_rank</span><span class="p">(),</span> <span class="n">dist</span><span class="o">.</span><span class="n">get_world_size</span><span class="p">()</span>   <span class="c1"># after torch.cuda.set_device()</span>
+<span class="n">uid</span> <span class="o">=</span> <span class="p">[</span><span class="nb">bytes</span><span class="p">(</span><span class="n">Communicator</span><span class="o">.</span><span class="n">get_unique_id</span><span class="p">())</span> <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span><span class="p">]</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">broadcast_object_list</span><span class="p">(</span><span class="n">uid</span><span class="p">,</span> <span class="n">src</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="n">N</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">M_MAX</span> <span class="o">=</span> <span class="mi">2048</span><span class="p">,</span> <span class="mi">7168</span><span class="p">,</span> <span class="mi">16384</span>          <span class="c1"># DeepSeek-V4-Pro wkv_gate; M_MAX is rows per rank</span>
+<span class="n">vmm</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">GemmAgOp</span><span class="o">.</span><span class="n">window_bytes_for</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="n">N</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="n">M_MAX</span><span class="p">,</span> <span class="n">out_dtype</span><span class="o">=</span><span class="s2">"fp32"</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="mi">256</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">)</span>
+<span class="k">with</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">init</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">UniqueId</span><span class="o">.</span><span class="n">from_bytes</span><span class="p">(</span><span class="n">uid</span><span class="p">[</span><span class="mi">0</span><span class="p">]),</span> <span class="n">per_rank_vmm</span><span class="o">=</span><span class="n">vmm</span><span class="p">)</span> <span class="k">as</span> <span class="n">comm</span><span class="p">:</span>
+    <span class="k">with</span> <span class="n">GemmAgOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="n">N</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">K</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="n">M_MAX</span><span class="p">,</span> <span class="n">in_dtype</span><span class="o">=</span><span class="s2">"bf16"</span><span class="p">,</span> <span class="n">out_dtype</span><span class="o">=</span><span class="s2">"fp32"</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>
+        <span class="n">op</span><span class="o">.</span><span class="n">self_test</span><span class="p">()</span>                    <span class="c1"># collective, once</span>
+        <span class="n">m</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">padded_m</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>       <span class="c1"># x: this rank's [rows, K] bf16; the same m on every rank</span>
+        <span class="n">c</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">pad_rows</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">m</span><span class="p">),</span> <span class="n">w</span><span class="p">)</span>      <span class="c1"># w: [N, K] bf16, the same on every rank</span>
+        <span class="c1"># c: [world*m, N] fp32; source s owns rows [s*m, (s+1)*m); padding rows are zero</span>
+</pre></div>
+</div>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>What</p></th>
+<th class="head"><p>Import</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Operator</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops.gemm_ag</span> <span class="pre">import</span> <span class="pre">GemmAgOp</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Shape check</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops.gemm_ag</span> <span class="pre">import</span> <span class="pre">supports</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Why a shape is rejected</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops.gemm_ag.op</span> <span class="pre">import</span> <span class="pre">shape_constraint</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>fp8 weight layout</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops.gemm_ag</span> <span class="pre">import</span> <span class="pre">preshuffle_b</span></code> (the same function as <code class="docutils literal notranslate"><span class="pre">mori.ops.gemm_ar.preshuffle_b</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p>mxfp8 A-scale layout</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops.gemm_ar</span> <span class="pre">import</span> <span class="pre">preshuffle_a_scale</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Communicator</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.cco</span> <span class="pre">import</span> <span class="pre">Communicator,</span> <span class="pre">UniqueId</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Window layout and kernel builders</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops.gemm_ag</span> <span class="pre">import</span> <span class="pre">ag_config,</span> <span class="pre">compile_bf16_gemm_ag,</span> <span class="pre">...</span></code> (<a class="reference internal" href="#kernel-level-exports">section 6</a>)</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="what-it-computes">
+<h2>1. What it computes<a class="headerlink" href="#what-it-computes" title="Link to this heading"></a></h2>
+<p>Every rank <code class="docutils literal notranslate"><span class="pre">r</span></code> passes its own <code class="docutils literal notranslate"><span class="pre">A_r</span> <span class="pre">[M,</span> <span class="pre">K]</span></code> and the same <code class="docutils literal notranslate"><span class="pre">B</span> <span class="pre">[N,</span> <span class="pre">K]</span></code>, and gets
+back <code class="docutils literal notranslate"><span class="pre">C</span> <span class="pre">=</span> <span class="pre">concat(A_0</span> <span class="pre">&#64;</span> <span class="pre">B.T,</span> <span class="pre">...,</span> <span class="pre">A_{P-1}</span> <span class="pre">&#64;</span> <span class="pre">B.T)</span></code>, <code class="docutils literal notranslate"><span class="pre">[P*M,</span> <span class="pre">N]</span></code>, with rank <code class="docutils literal notranslate"><span class="pre">r</span></code>’s
+rows at <code class="docutils literal notranslate"><span class="pre">[r*M,</span> <span class="pre">(r+1)*M)</span></code>, its own included. <code class="docutils literal notranslate"><span class="pre">P</span></code> is the number of ranks and <code class="docutils literal notranslate"><span class="pre">M</span></code>
+the padded rows per rank, the same on every rank. <code class="docutils literal notranslate"><span class="pre">B</span></code> must be the same on every
+rank; the operator does not check it.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">in_dtype</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">a</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">b</span></code></p></th>
+<th class="head"><p>Scales</p></th>
+<th class="head"><p>Result (and wire)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K]</span></code> bf16</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[N,</span> <span class="pre">K]</span></code> bf16, plain row-major</p></td>
+<td><p>none</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[P*M,</span> <span class="pre">N]</span></code> bf16 or fp32 (<code class="docutils literal notranslate"><span class="pre">out_dtype</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;fp8&quot;</span></code> (default)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K]</span></code> <code class="docutils literal notranslate"><span class="pre">float8_e4m3fn</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[N,</span> <span class="pre">K]</span></code> <code class="docutils literal notranslate"><span class="pre">float8_e4m3fn</span></code> through <code class="docutils literal notranslate"><span class="pre">preshuffle_b</span></code></p></td>
+<td><p>by <code class="docutils literal notranslate"><span class="pre">quant</span></code>: <code class="docutils literal notranslate"><span class="pre">ptpc</span></code>, <code class="docutils literal notranslate"><span class="pre">blockscale</span></code> or <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[P*M,</span> <span class="pre">N]</span></code> bf16</p></td>
+</tr>
+</tbody>
+</table>
+<p>The layer is a projection on a context-parallel (CP) or sequence-parallel token
+shard whose output every rank needs: in DeepSeek-V4’s <code class="docutils literal notranslate"><span class="pre">wkv_gate</span></code> each CP rank
+scores its own tokens, then every rank needs every token’s score. The README’s
+model shapes are DeepSeek-V4-Pro’s ratio-4 <code class="docutils literal notranslate"><span class="pre">compressor.wkv_gate</span></code> (K=7168,
+N=2048, bf16 in, fp32 out) and DeepSeek-V4.1-Flash’s ratio-2 KV and gate
+projections (K=5120, N=512 each, or 1024 combined); M is the runtime token count
+per rank. SGLang’s Flash low-ratio CP path currently gathers the hidden states
+before the projection, so for Flash this operator is a reordered candidate.</p>
+</section>
+<section id="how-it-works">
+<h2>2. How it works<a class="headerlink" href="#how-it-works" title="Link to this heading"></a></h2>
+<p>Each call launches two kernels on the current stream. The GEMM writes C
+straight into this rank’s slot of the receive buffer; every peer receives that
+same contiguous slab, so nothing is staged.</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">split</span></code></strong>: a one-block kernel then pushes the slab to every peer, one SDMA
+put each, waits for the copies and runs a cross-rank barrier.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">fused</span></code></strong>: the rows are cut into chunks of whole row tiles, one chunk per
+workgroup round of the GEMM grid, up to <code class="docutils literal notranslate"><span class="pre">max_chunks</span></code>. When a chunk’s last
+tile is stored, the epilogue posts the chunk to every peer. Two chunks for one
+peer use different SDMA queues, so a fused call needs a queue per chunk per
+peer. The second kernel only waits for the queues and runs the barrier.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">auto</span></code></strong> (the default) picks one per M (<a class="reference internal" href="#choosing-settings">section 8</a>).</p></li>
+</ul>
+<p>Fusion hides a chunk’s transfer behind the GEMM rounds still to come. At these
+shapes the transfer is several times the GEMM (Pro M=2048: 69 µs of GEMM
+against about 300 µs of all-gather), so fusion pays only at large M.</p>
+<p><strong>Receive-reuse credit.</strong> The result is the receive buffer, and the next call
+refills it. Each call first tells every peer it has started, and each push
+waits until its destination has started too, so a rank a call ahead never
+overwrites rows a slower rank is still reading. That holds provided whatever
+reads the result is ordered before this rank’s next call.</p>
+<p><strong>The window</strong> holds a few KiB of flags, chunk counters and credits, then the
+receive buffer, <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">*</span> <span class="pre">m_max</span> <span class="pre">*</span> <span class="pre">N</span></code> elements of <code class="docutils literal notranslate"><span class="pre">out_dtype</span></code>; it is allocated once
+and cannot grow. A rank sends <code class="docutils literal notranslate"><span class="pre">(P-1)</span> <span class="pre">*</span> <span class="pre">M</span> <span class="pre">*</span> <span class="pre">N</span> <span class="pre">*</span> <span class="pre">elem_bytes</span></code> per call, 112 MiB at
+Pro M=2048 with fp32 output and P=8. The wire carries the output dtype, so fp32
+doubles the bytes of bf16.</p>
+</section>
+<section id="requirements">
+<h2>3. Requirements<a class="headerlink" href="#requirements" title="Link to this heading"></a></h2>
+<p>The contract every fused operator shares (build and environment, window sizing,
+padding, result aliasing, the collective contract, cleanup, fp8 layouts) is in
+<a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#what-every-operator-has-in-common"><span class="std std-ref">What every operator has in common</span></a>.
+For this operator:</p>
+<ul class="simple">
+<li><p><strong>GPU</strong>: MI355X (gfx950). The GEMMs are FlyDSL kernels written for gfx950 and
+every measurement is on MI355X; the operator does not check the architecture.
+It reads the current device’s CU count, so call <code class="docutils literal notranslate"><span class="pre">torch.cuda.set_device()</span></code>
+before constructing it.</p></li>
+<li><p><strong>FlyDSL</strong>: <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'amd_mori[flydsl]'</span></code>. <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">mori.ops.gemm_ag</span></code>,
+<code class="docutils literal notranslate"><span class="pre">preshuffle_b</span></code> and the layout helpers work without it; <code class="docutils literal notranslate"><span class="pre">GemmAgOp</span></code>,
+<code class="docutils literal notranslate"><span class="pre">supports</span></code> and the kernel builders import it on first use.</p></li>
+<li><p><strong>SDMA</strong>: a MORI built with <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code> (the default), and
+<code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code> in the environment when the communicator is created,
+which is when MORI reads it.</p></li>
+<li><p><strong>SDMA queues</strong>: <code class="docutils literal notranslate"><span class="pre">mode=&quot;auto&quot;</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;fused&quot;</span></code> ask for <code class="docutils literal notranslate"><span class="pre">max_chunks</span></code> per peer
+(default 4), <code class="docutils literal notranslate"><span class="pre">&quot;split&quot;</span></code> for 1. The first device communicator on a communicator
+fixes its queue count, later ones reuse it, and MORI creates at most 8 per
+pair of GPUs. The constructor raises <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> if there are too few.</p></li>
+<li><p><strong>Ranks</strong>: 2 to 8, all in one node (one LSA domain).</p></li>
+<li><p><strong>VMM</strong>: the window comes out of the communicator’s <code class="docutils literal notranslate"><span class="pre">per_rank_vmm</span></code>; size it
+with <code class="docutils literal notranslate"><span class="pre">window_bytes_for</span></code> (<a class="reference internal" href="#window-bytes-for">section 4</a>) plus every other
+window on the communicator. The examples reserve
+<code class="docutils literal notranslate"><span class="pre">2</span> <span class="pre">*</span> <span class="pre">window_bytes_for(...)</span> <span class="pre">+</span> <span class="pre">(256</span> <span class="pre">&lt;&lt;</span> <span class="pre">20)</span></code>, as the overview does.</p></li>
+</ul>
+</section>
+<section id="constructor">
+<h2>4. Constructor<a class="headerlink" href="#constructor" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">GemmAgOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">m_max</span><span class="p">,</span> <span class="n">in_dtype</span><span class="o">=</span><span class="s2">"fp8"</span><span class="p">,</span> <span class="n">quant</span><span class="o">=</span><span class="s2">"ptpc"</span><span class="p">,</span> <span class="n">out_dtype</span><span class="o">=</span><span class="s2">"bf16"</span><span class="p">,</span>
+         <span class="n">mode</span><span class="o">=</span><span class="s2">"auto"</span><span class="p">,</span> <span class="n">max_chunks</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">chunks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">tile</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">fence</span><span class="o">=</span><span class="s2">"release"</span><span class="p">,</span>
+         <span class="n">peer_uncached</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">war_credit</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Collective: every rank constructs with the same arguments. It validates them,
+allocates and zeroes the window, creates a device communicator with its SDMA
+queues, and ends with a barrier.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">comm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mori.cco.Communicator</span></code></p></td>
+<td><p>required</p></td>
+<td><p>Its ranks are the all-gather’s ranks. The only positional argument.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">n</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p>required</p></td>
+<td><p>Output columns N, the weight’s rows. A positive multiple of 256.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">k</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p>required</p></td>
+<td><p>Inner dimension K. fp8: a multiple of 128, at least 256. bf16: a multiple of 64, at least 128.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">m_max</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p>required</p></td>
+<td><p>The most rows per rank any call will pass, at least 1. Rounded up to the M granule (<code class="docutils literal notranslate"><span class="pre">op.m_max</span></code> holds the result); sizes the window.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">in_dtype</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;fp8&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;fp8&quot;</span></code> (<code class="docutils literal notranslate"><span class="pre">float8_e4m3fn</span></code> operands, gemm_ar’s 8-wave fp8 GEMM) or <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">quant</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;ptpc&quot;</span></code></p></td>
+<td><p>fp8 scaling: <code class="docutils literal notranslate"><span class="pre">&quot;ptpc&quot;</span></code> (per token, per channel), <code class="docutils literal notranslate"><span class="pre">&quot;blockscale&quot;</span></code> (A 1x128, B 128x128) or <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8&quot;</span></code> (32-wide ue8m0). With <code class="docutils literal notranslate"><span class="pre">in_dtype=&quot;bf16&quot;</span></code> leave it at <code class="docutils literal notranslate"><span class="pre">&quot;ptpc&quot;</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">out_dtype</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code></p></td>
+<td><p>Result and wire dtype, <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;fp32&quot;</span></code>; <code class="docutils literal notranslate"><span class="pre">&quot;fp32&quot;</span></code> needs <code class="docutils literal notranslate"><span class="pre">in_dtype=&quot;bf16&quot;</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mode</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;fused&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;split&quot;</span></code>, or <code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code>: fused where <code class="docutils literal notranslate"><span class="pre">ceil(M/256)</span> <span class="pre">*</span> <span class="pre">ceil(N/256)</span></code> is at least the device’s CU count.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_chunks</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">4</span></code></p></td>
+<td><p>The most chunks a fused call pushes in, and the SDMA queues per peer that <code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;fused&quot;</span></code> ask for. At least 1. Pass the same value to <code class="docutils literal notranslate"><span class="pre">window_bytes_for</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">chunks</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code> or <code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Pins the fused chunk count instead of one per workgroup round; rounded down to a divisor of the row tiles, capped by <code class="docutils literal notranslate"><span class="pre">max_chunks</span></code>. At least 1.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tile</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tuple[int,</span> <span class="pre">int]</span></code> or <code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Pins <code class="docutils literal notranslate"><span class="pre">(BLOCK_M,</span> <span class="pre">BLOCK_N)</span></code> for every M; M then pads to <code class="docutils literal notranslate"><span class="pre">BLOCK_M</span></code>. bf16: each 128 or 256, <code class="docutils literal notranslate"><span class="pre">BLOCK_N=128</span></code> only with fp32 output. fp8: <code class="docutils literal notranslate"><span class="pre">BLOCK_N=256</span></code>, <code class="docutils literal notranslate"><span class="pre">BLOCK_M</span></code> 128 or 256 (256 under mxfp8).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fence</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;release&quot;</span></code></p></td>
+<td><p>The fused epilogue’s fence before it pushes a chunk: <code class="docutils literal notranslate"><span class="pre">&quot;release&quot;</span></code> (one release-only system fence per workgroup), <code class="docutils literal notranslate"><span class="pre">&quot;leader&quot;</span></code> (a system fence from one wave per workgroup), <code class="docutils literal notranslate"><span class="pre">&quot;all&quot;</span></code> (from every lane) or <code class="docutils literal notranslate"><span class="pre">&quot;none&quot;</span></code> (no fence; gemm_ar measured the copy engine then reading some tiles stale on 8 ranks).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peer_uncached</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">True</span></code></p></td>
+<td><p>Fused calls store C uncached (<code class="docutils literal notranslate"><span class="pre">sc0</span></code>, <code class="docutils literal notranslate"><span class="pre">sc1</span></code>). With <code class="docutils literal notranslate"><span class="pre">fence=&quot;release&quot;</span></code> this is the README’s <code class="docutils literal notranslate"><span class="pre">sc_release</span></code>, used by every fused number there.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">war_credit</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">True</span></code></p></td>
+<td><p>The receive-reuse credit. <code class="docutils literal notranslate"><span class="pre">False</span></code> exists only for the race test; back-to-back calls can then return another call’s rows.</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">chunks</span></code>, <code class="docutils literal notranslate"><span class="pre">fence</span></code> and <code class="docutils literal notranslate"><span class="pre">peer_uncached</span></code> affect fused calls only.</p>
+<section id="window-bytes-for">
+<h3>window_bytes_for()<a class="headerlink" href="#window-bytes-for" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">GemmAgOp</span><span class="o">.</span><span class="n">window_bytes_for</span><span class="p">(</span><span class="n">world_size</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">m_max</span><span class="p">,</span> <span class="n">out_dtype</span><span class="o">=</span><span class="s2">"bf16"</span><span class="p">,</span> <span class="n">max_chunks</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span>
+</pre></div>
+</div>
+<p>Static: the most bytes the constructor will allocate for its window, for sizing
+the communicator’s VMM before the operator exists. <code class="docutils literal notranslate"><span class="pre">world_size</span></code> (2 to 8) is the
+number of ranks; pass <code class="docutils literal notranslate"><span class="pre">n</span></code>, <code class="docutils literal notranslate"><span class="pre">m_max</span></code>, <code class="docutils literal notranslate"><span class="pre">out_dtype</span></code> (<code class="docutils literal notranslate"><span class="pre">&quot;fp32&quot;</span></code> doubles the receive
+buffer) and <code class="docutils literal notranslate"><span class="pre">max_chunks</span></code> (it sizes the chunk counters) as the constructor gets
+them. It rounds <code class="docutils literal notranslate"><span class="pre">m_max</span></code> up to 256, the largest M granule, so the value holds for
+every <code class="docutils literal notranslate"><span class="pre">in_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">quant</span></code>, <code class="docutils literal notranslate"><span class="pre">mode</span></code> and <code class="docutils literal notranslate"><span class="pre">tile</span></code>. Raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> for a world
+size outside 2-8, an <code class="docutils literal notranslate"><span class="pre">m_max</span></code> below 1, or an <code class="docutils literal notranslate"><span class="pre">n</span></code> that is not a positive multiple
+of 256.</p>
+</section>
+</section>
+<section id="calling-the-operator">
+<h2>5. Calling the operator<a class="headerlink" href="#calling-the-operator" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">out</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">a_scale</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">b_scale</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>    <span class="c1"># -&gt; torch.Tensor [P*M, N]</span>
+</pre></div>
+</div>
+<p>One GEMM + all-gather, issued on the current stream; it returns without
+synchronising. <code class="docutils literal notranslate"><span class="pre">M</span> <span class="pre">=</span> <span class="pre">a.shape[0]</span></code> must be a positive multiple of the M granule
+(use <code class="docutils literal notranslate"><span class="pre">padded_m</span></code>), at most <code class="docutils literal notranslate"><span class="pre">op.m_max</span></code>, and the same on every rank. The first
+call at each M compiles that M’s kernels.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Argument</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">in_dtype=&quot;bf16&quot;</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">in_dtype=&quot;fp8&quot;</span></code></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">a</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K]</span></code> <code class="docutils literal notranslate"><span class="pre">torch.bfloat16</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K]</span></code> <code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fn</span></code> (<code class="docutils literal notranslate"><span class="pre">float8_e4m3fnuz</span></code> is rejected)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">b</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[N,</span> <span class="pre">K]</span></code> <code class="docutils literal notranslate"><span class="pre">torch.bfloat16</span></code>, plain row-major</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[N,</span> <span class="pre">K]</span></code> <code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fn</span></code> through <code class="docutils literal notranslate"><span class="pre">preshuffle_b</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">a_scale</span></code>, <code class="docutils literal notranslate"><span class="pre">b_scale</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>required, by <code class="docutils literal notranslate"><span class="pre">quant</span></code> (below)</p></td>
+</tr>
+</tbody>
+</table>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">quant</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">a_scale</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">b_scale</span></code></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;ptpc&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[M]</span></code> fp32, one per row</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[N]</span></code> fp32</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;blockscale&quot;</span></code></p></td>
+<td><p>fp32 per 1x128 block: <code class="docutils literal notranslate"><span class="pre">[K/128,</span> <span class="pre">M]</span></code>, <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K/128]</span></code> column-major, or flat in <code class="docutils literal notranslate"><span class="pre">[K/128,</span> <span class="pre">M]</span></code> order</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[N/128,</span> <span class="pre">K/128]</span></code> fp32</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;mxfp8&quot;</span></code></p></td>
+<td><p>the flat <code class="docutils literal notranslate"><span class="pre">int32</span></code> buffer <code class="docutils literal notranslate"><span class="pre">preshuffle_a_scale(a_exps)</span></code> returns, <code class="docutils literal notranslate"><span class="pre">a_exps</span></code> being the <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K/32]</span></code> ue8m0 bytes</p></td>
+<td><p>the <code class="docutils literal notranslate"><span class="pre">[N/32,</span> <span class="pre">K/32]</span></code> ue8m0 bytes <code class="docutils literal notranslate"><span class="pre">w_exps</span></code> K-block-major, one per <code class="docutils literal notranslate"><span class="pre">int32</span></code>: <code class="docutils literal notranslate"><span class="pre">w_exps.t().contiguous().to(torch.int32).reshape(-1)</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p>All operands must be GPU tensors; <code class="docutils literal notranslate"><span class="pre">a</span></code> and <code class="docutils literal notranslate"><span class="pre">b</span></code> are made contiguous (a copy if
+they are not). A row-major <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K/128]</span></code> blockscale <code class="docutils literal notranslate"><span class="pre">a_scale</span></code> is rejected as
+ambiguous: pass <code class="docutils literal notranslate"><span class="pre">a_scale.reshape(-1)</span></code> if its storage is already <code class="docutils literal notranslate"><span class="pre">[K/128,</span> <span class="pre">M]</span></code>
+(as <code class="docutils literal notranslate"><span class="pre">aiter_per1x128_quant(transpose_scale=True)</span></code> returns it), or <code class="docutils literal notranslate"><span class="pre">a_scale.t()</span></code>
+for a logical <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K/128]</span></code>.</p>
+<p><strong>Return value</strong>: a contiguous <code class="docutils literal notranslate"><span class="pre">[P*M,</span> <span class="pre">N]</span></code> tensor in <code class="docutils literal notranslate"><span class="pre">out_dtype</span></code>, rank <code class="docutils literal notranslate"><span class="pre">s</span></code>’s
+rows at <code class="docutils literal notranslate"><span class="pre">[s*M,</span> <span class="pre">(s+1)*M)</span></code>. Zero-padded input rows come back as zero rows in
+every source’s block; slice them off per source. It is a view of the
+operator’s window, valid until this rank’s next call, <code class="docutils literal notranslate"><span class="pre">self_test()</span></code> or
+<code class="docutils literal notranslate"><span class="pre">close()</span></code>. Order whatever reads it before that call (same stream, or an event
+the next call’s stream waits on), or clone it.</p>
+</section>
+<section id="other-methods">
+<h2>6. Other methods<a class="headerlink" href="#other-methods" title="Link to this heading"></a></h2>
+<section id="padded-m">
+<h3>padded_m()<a class="headerlink" href="#padded-m" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">op.padded_m(m)</span> <span class="pre">-&gt;</span> <span class="pre">int</span></code> rounds a row count up to <code class="docutils literal notranslate"><span class="pre">op.m_granule</span></code>: 128, 256
+under <code class="docutils literal notranslate"><span class="pre">quant=&quot;mxfp8&quot;</span></code>, or <code class="docutils literal notranslate"><span class="pre">BLOCK_M</span></code> when <code class="docutils literal notranslate"><span class="pre">tile</span></code> is pinned. Pad from a count
+that is the same on every rank. <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> if <code class="docutils literal notranslate"><span class="pre">m</span> <span class="pre">&lt;</span> <span class="pre">1</span></code>.</p>
+</section>
+<section id="pad-rows">
+<h3>pad_rows()<a class="headerlink" href="#pad-rows" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">op.pad_rows(x,</span> <span class="pre">m_pad)</span> <span class="pre">-&gt;</span> <span class="pre">torch.Tensor</span></code> zero-extends a 2-D <code class="docutils literal notranslate"><span class="pre">[m,</span> <span class="pre">K]</span></code> tensor to
+<code class="docutils literal notranslate"><span class="pre">[m_pad,</span> <span class="pre">K]</span></code> in a buffer the operator reuses while <code class="docutils literal notranslate"><span class="pre">m_pad</span></code> fits and K, dtype
+and device stay the same, so the next <code class="docutils literal notranslate"><span class="pre">pad_rows</span></code> overwrites it and a CUDA graph
+that reads it sees each refill. Pad before quantising, so fp8 scales cover the
+padded rows. <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> if <code class="docutils literal notranslate"><span class="pre">x</span></code> is not 2-D or <code class="docutils literal notranslate"><span class="pre">m_pad</span></code> is too small.</p>
+</section>
+<section id="fuses-at">
+<h3>fuses_at()<a class="headerlink" href="#fuses-at" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">op.fuses_at(m)</span> <span class="pre">-&gt;</span> <span class="pre">bool</span></code>: whether a call at this M runs the fused path. Under
+<code class="docutils literal notranslate"><span class="pre">mode=&quot;auto&quot;</span></code> that is <code class="docutils literal notranslate"><span class="pre">ceil(M/256)</span> <span class="pre">*</span> <span class="pre">ceil(N/256)</span> <span class="pre">&gt;=</span> <span class="pre">op.cus</span></code>; under <code class="docutils literal notranslate"><span class="pre">&quot;fused&quot;</span></code> or
+<code class="docutils literal notranslate"><span class="pre">&quot;split&quot;</span></code> it is always <code class="docutils literal notranslate"><span class="pre">True</span></code> or <code class="docutils literal notranslate"><span class="pre">False</span></code>. No GPU work.</p>
+</section>
+<section id="tile-for">
+<h3>tile_for()<a class="headerlink" href="#tile-for" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">op.tile_for(m)</span> <span class="pre">-&gt;</span> <span class="pre">tuple[int,</span> <span class="pre">int]</span></code>: the <code class="docutils literal notranslate"><span class="pre">(BLOCK_M,</span> <span class="pre">BLOCK_N)</span></code> a call at this
+padded M uses: the pinned <code class="docutils literal notranslate"><span class="pre">tile</span></code>, else for bf16 the per-shape rule in
+<a class="reference internal" href="#choosing-settings">section 8</a>, else 128x256 (256x256 under mxfp8).</p>
+</section>
+<section id="chunks-for">
+<h3>chunks_for()<a class="headerlink" href="#chunks-for" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">op.chunks_for(m)</span> <span class="pre">-&gt;</span> <span class="pre">int</span></code>: the chunks a call at this padded M pushes in. 1 on
+the split path; otherwise the pinned <code class="docutils literal notranslate"><span class="pre">chunks</span></code> or one per workgroup round of the
+tile, capped at <code class="docutils literal notranslate"><span class="pre">max_chunks</span></code> and rounded down to a divisor of the row tiles.</p>
+</section>
+<section id="self-test">
+<h3>self_test()<a class="headerlink" href="#self-test" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">op.self_test()</span></code> fills this rank’s slot with <code class="docutils literal notranslate"><span class="pre">rank</span> <span class="pre">+</span> <span class="pre">1</span></code>, runs the split push at
+<code class="docutils literal notranslate"><span class="pre">m_max</span></code> and checks every peer’s slot, raising <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> at the first wrong
+one; a put that silently moves nothing fails here. A collective: call it on
+every rank once after construction, before capturing a graph. It synchronises
+the device and overwrites the receive buffer.</p>
+</section>
+<section id="close-and-the-context-manager">
+<h3>close() and the context manager<a class="headerlink" href="#close-and-the-context-manager" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">op.close()</span></code>, or leaving a <code class="docutils literal notranslate"><span class="pre">with</span> <span class="pre">GemmAgOp(...)</span> <span class="pre">as</span> <span class="pre">op:</span></code> block, releases the
+window and drops the compiled plans and the <code class="docutils literal notranslate"><span class="pre">pad_rows</span></code> buffer. Idempotent.
+Synchronise first if a call may still be in flight. Afterwards a call or
+<code class="docutils literal notranslate"><span class="pre">self_test()</span></code> raises <code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">this</span> <span class="pre">GemmAgOp</span> <span class="pre">has</span> <span class="pre">been</span> <span class="pre">closed</span></code>.</p>
+</section>
+<section id="attributes">
+<h3>Attributes<a class="headerlink" href="#attributes" title="Link to this heading"></a></h3>
+<p>The constructor also sets, for reading: <code class="docutils literal notranslate"><span class="pre">m_max</span></code> (rounded up to the granule),
+<code class="docutils literal notranslate"><span class="pre">m_granule</span></code>, <code class="docutils literal notranslate"><span class="pre">window_bytes</span></code> (this window’s size), <code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code> (<code class="docutils literal notranslate"><span class="pre">max_chunks</span></code>,
+or 1 under <code class="docutils literal notranslate"><span class="pre">mode=&quot;split&quot;</span></code>), <code class="docutils literal notranslate"><span class="pre">cus</span></code> (the CU count the <code class="docutils literal notranslate"><span class="pre">auto</span></code>, tile and chunk
+rules use, read at construction), <code class="docutils literal notranslate"><span class="pre">rank</span></code> and <code class="docutils literal notranslate"><span class="pre">world_size</span></code>.</p>
+</section>
+<section id="supports">
+<h3>supports()<a class="headerlink" href="#supports" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">supports(n,</span> <span class="pre">k,</span> <span class="pre">world_size,</span> <span class="pre">**kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">bool</span></code> is <code class="docutils literal notranslate"><span class="pre">True</span></code> when
+<code class="docutils literal notranslate"><span class="pre">2</span> <span class="pre">&lt;=</span> <span class="pre">world_size</span> <span class="pre">&lt;=</span> <span class="pre">8</span></code> and <code class="docutils literal notranslate"><span class="pre">shape_constraint(n,</span> <span class="pre">k,</span> <span class="pre">**kwargs)</span></code> finds nothing;
+<code class="docutils literal notranslate"><span class="pre">kwargs</span></code> are <code class="docutils literal notranslate"><span class="pre">in_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">quant</span></code> and <code class="docutils literal notranslate"><span class="pre">out_dtype</span></code>, with the constructor’s
+defaults. It says whether a shape is expressible, not whether it is faster, and
+looks at neither M, the GPU nor SDMA.</p>
+</section>
+<section id="shape-constraint">
+<h3>shape_constraint()<a class="headerlink" href="#shape-constraint" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">shape_constraint(n,</span> <span class="pre">k,</span> <span class="pre">*,</span> <span class="pre">in_dtype=&quot;fp8&quot;,</span> <span class="pre">quant=&quot;ptpc&quot;,</span> <span class="pre">out_dtype=&quot;bf16&quot;)</span> <span class="pre">-&gt;</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span></code>
+returns why the constructor would reject this N, K and precision (it raises
+<code class="docutils literal notranslate"><span class="pre">ValueError(&quot;unsupported</span> <span class="pre">configuration:</span> <span class="pre">&quot;</span> <span class="pre">+</span> <span class="pre">reason)</span></code>), or <code class="docutils literal notranslate"><span class="pre">None</span></code>. Import it
+from <code class="docutils literal notranslate"><span class="pre">mori.ops.gemm_ag.op</span></code>, which also exports the allowed values as
+<code class="docutils literal notranslate"><span class="pre">IN_DTYPES</span></code>, <code class="docutils literal notranslate"><span class="pre">QUANTS</span></code>, <code class="docutils literal notranslate"><span class="pre">OUT_DTYPES</span></code>, <code class="docutils literal notranslate"><span class="pre">MODES</span></code> and <code class="docutils literal notranslate"><span class="pre">FENCES</span></code>.</p>
+</section>
+<section id="preshuffle-b">
+<h3>preshuffle_b()<a class="headerlink" href="#preshuffle-b" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">preshuffle_b(w)</span> <span class="pre">-&gt;</span> <span class="pre">torch.Tensor</span></code> reorders an fp8 <code class="docutils literal notranslate"><span class="pre">[N,</span> <span class="pre">K]</span></code> weight into the
+order the fp8 GEMM reads; shape and dtype are unchanged. Call it once per
+weight. It needs a 1-byte dtype, N a multiple of 16 and K a multiple of 64
+(<code class="docutils literal notranslate"><span class="pre">ValueError</span></code> otherwise). bf16 weights are not shuffled.</p>
+</section>
+<section id="kernel-level-exports">
+<h3>Kernel-level exports<a class="headerlink" href="#kernel-level-exports" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">mori.ops.gemm_ag</span></code> also exports what <code class="docutils literal notranslate"><span class="pre">GemmAgOp</span></code> is built from. <code class="docutils literal notranslate"><span class="pre">AgConfig</span></code>,
+<code class="docutils literal notranslate"><span class="pre">ag_config</span></code>, <code class="docutils literal notranslate"><span class="pre">counter_chunks</span></code> and <code class="docutils literal notranslate"><span class="pre">MAX_WORLD</span></code> (8) are the window layout and
+launch arithmetic, importable without FlyDSL. <code class="docutils literal notranslate"><span class="pre">compile_bf16_gemm_ag</span></code>,
+<code class="docutils literal notranslate"><span class="pre">compile_fused_gemm_ag</span></code>, <code class="docutils literal notranslate"><span class="pre">compile_gemm_local</span></code>, <code class="docutils literal notranslate"><span class="pre">build_sdma_phases</span></code> and
+<code class="docutils literal notranslate"><span class="pre">build_sdma_chunk_post</span></code> build the kernels. The benchmarks call them directly;
+the operator’s users do not need them. <code class="docutils literal notranslate"><span class="pre">build_sdma_chunk_post</span></code> serves a
+two-stream pipeline experiment and carries no receive-reuse credit.</p>
+</section>
+</section>
+<section id="shapes-and-limits">
+<h2>7. Shapes and limits<a class="headerlink" href="#shapes-and-limits" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Constraint</p></th>
+<th class="head"><p>Value</p></th>
+<th class="head"><p>Error if violated</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">in_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">quant</span></code>, <code class="docutils literal notranslate"><span class="pre">out_dtype</span></code></p></td>
+<td><p>as in <a class="reference internal" href="#constructor">section 4</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">unsupported</span> <span class="pre">configuration:</span> <span class="pre">in_dtype=...</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">one</span> <span class="pre">of</span> <span class="pre">...</span></code> (likewise <code class="docutils literal notranslate"><span class="pre">quant</span></code>, <code class="docutils literal notranslate"><span class="pre">out_dtype</span></code>); <code class="docutils literal notranslate"><span class="pre">...</span> <span class="pre">quant</span> <span class="pre">does</span> <span class="pre">not</span> <span class="pre">apply</span> <span class="pre">to</span> <span class="pre">in_dtype='bf16';</span> <span class="pre">leave</span> <span class="pre">it</span> <span class="pre">at</span> <span class="pre">its</span> <span class="pre">default</span></code>; <code class="docutils literal notranslate"><span class="pre">...</span> <span class="pre">the</span> <span class="pre">fp8</span> <span class="pre">GEMM's</span> <span class="pre">epilogue</span> <span class="pre">only</span> <span class="pre">emits</span> <span class="pre">bf16</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>N</p></td>
+<td><p>a positive multiple of 256</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">unsupported</span> <span class="pre">configuration:</span> <span class="pre">N=...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">positive</span> <span class="pre">multiple</span> <span class="pre">of</span> <span class="pre">256</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>K, fp8</p></td>
+<td><p>a multiple of 128, at least 256</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">unsupported</span> <span class="pre">configuration:</span> <span class="pre">K=...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">multiple</span> <span class="pre">of</span> <span class="pre">128</span> <span class="pre">and</span> <span class="pre">at</span> <span class="pre">least</span> <span class="pre">256</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>K, bf16</p></td>
+<td><p>a multiple of 64, at least 128</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">unsupported</span> <span class="pre">configuration:</span> <span class="pre">K=...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">multiple</span> <span class="pre">of</span> <span class="pre">64</span> <span class="pre">and</span> <span class="pre">at</span> <span class="pre">least</span> <span class="pre">128</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mode</span></code>, <code class="docutils literal notranslate"><span class="pre">fence</span></code></p></td>
+<td><p>the listed values</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">mode=...</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">one</span> <span class="pre">of</span> <span class="pre">...</span></code>, <code class="docutils literal notranslate"><span class="pre">fence=...</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">one</span> <span class="pre">of</span> <span class="pre">...</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">m_max</span></code>, <code class="docutils literal notranslate"><span class="pre">max_chunks</span></code>, <code class="docutils literal notranslate"><span class="pre">chunks</span></code></p></td>
+<td><p>at least 1 (<code class="docutils literal notranslate"><span class="pre">chunks</span></code> may be <code class="docutils literal notranslate"><span class="pre">None</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">m_max</span> <span class="pre">and</span> <span class="pre">max_chunks</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">&gt;=</span> <span class="pre">1;</span> <span class="pre">...</span></code>, <code class="docutils literal notranslate"><span class="pre">chunks</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">&gt;=</span> <span class="pre">1,</span> <span class="pre">got</span> <span class="pre">...</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tile</span></code>, fp8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">BLOCK_N=256</span></code>, <code class="docutils literal notranslate"><span class="pre">BLOCK_M</span></code> 128 or 256 (256 under mxfp8)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">tile=...:</span> <span class="pre">the</span> <span class="pre">fp8</span> <span class="pre">GEMM</span> <span class="pre">takes</span> <span class="pre">BLOCK_N=256</span> <span class="pre">and</span> <span class="pre">BLOCK_M</span> <span class="pre">128</span> <span class="pre">or</span> <span class="pre">256</span> <span class="pre">(256</span> <span class="pre">under</span> <span class="pre">mxfp8)</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tile</span></code>, bf16</p></td>
+<td><p>each 128 or 256, <code class="docutils literal notranslate"><span class="pre">BLOCK_N=128</span></code> only with fp32 output</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code> from the window layout: <code class="docutils literal notranslate"><span class="pre">block_m=...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">positive</span> <span class="pre">multiple</span> <span class="pre">of</span> <span class="pre">128</span> <span class="pre">...</span></code>, <code class="docutils literal notranslate"><span class="pre">block_n</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">128</span> <span class="pre">or</span> <span class="pre">256</span> <span class="pre">...</span></code>, <code class="docutils literal notranslate"><span class="pre">block_n=128</span> <span class="pre">needs</span> <span class="pre">elem_bytes=4</span> <span class="pre">(an</span> <span class="pre">fp32</span> <span class="pre">C)</span> <span class="pre">...</span></code>. A <code class="docutils literal notranslate"><span class="pre">BLOCK_M</span></code> of 384 or more passes construction and fails the first call with <code class="docutils literal notranslate"><span class="pre">BLOCK_M</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">128</span> <span class="pre">or</span> <span class="pre">256</span> <span class="pre">...</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Ranks</p></td>
+<td><p>2 to 8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">world_size</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">in</span> <span class="pre">[2,</span> <span class="pre">8],</span> <span class="pre">got</span> <span class="pre">...</span></code> (also from <code class="docutils literal notranslate"><span class="pre">window_bytes_for</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p>One node</p></td>
+<td><p>every rank in one LSA domain</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">GemmAgOp</span> <span class="pre">needs</span> <span class="pre">every</span> <span class="pre">rank</span> <span class="pre">in</span> <span class="pre">one</span> <span class="pre">LSA</span> <span class="pre">domain</span> <span class="pre">(one</span> <span class="pre">node);</span> <span class="pre">...</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>SDMA queues</p></td>
+<td><p>at least <code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code> per peer</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">GemmAgOp</span> <span class="pre">needs</span> <span class="pre">...</span> <span class="pre">SDMA</span> <span class="pre">queue(s)</span> <span class="pre">per</span> <span class="pre">peer</span> <span class="pre">but</span> <span class="pre">the</span> <span class="pre">communicator</span> <span class="pre">has</span> <span class="pre">...</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Open (each call)</p></td>
+<td><p>not closed</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">this</span> <span class="pre">GemmAgOp</span> <span class="pre">has</span> <span class="pre">been</span> <span class="pre">closed</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>M (each call)</p></td>
+<td><p>a positive multiple of <code class="docutils literal notranslate"><span class="pre">op.m_granule</span></code>, at most <code class="docutils literal notranslate"><span class="pre">op.m_max</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">M=...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">positive</span> <span class="pre">multiple</span> <span class="pre">of</span> <span class="pre">...;</span> <span class="pre">use</span> <span class="pre">padded_m()</span> <span class="pre">and</span> <span class="pre">pad_rows()</span></code>; <code class="docutils literal notranslate"><span class="pre">M=...</span> <span class="pre">exceeds</span> <span class="pre">the</span> <span class="pre">window's</span> <span class="pre">m_max=...</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">a</span></code>, <code class="docutils literal notranslate"><span class="pre">b</span></code> (each call)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K]</span></code> and <code class="docutils literal notranslate"><span class="pre">[N,</span> <span class="pre">K]</span></code>, the dtype of <code class="docutils literal notranslate"><span class="pre">in_dtype</span></code>, on a GPU</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">a</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">(M,</span> <span class="pre">K),</span> <span class="pre">got</span> <span class="pre">...</span></code>; <code class="docutils literal notranslate"><span class="pre">...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">one</span> <span class="pre">of</span> <span class="pre">[...]</span> <span class="pre">for</span> <span class="pre">in_dtype=...,</span> <span class="pre">got</span> <span class="pre">...;</span> <span class="pre">the</span> <span class="pre">launch</span> <span class="pre">reinterprets</span> <span class="pre">it</span> <span class="pre">as</span> <span class="pre">raw</span> <span class="pre">bytes</span></code>; <code class="docutils literal notranslate"><span class="pre">...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">on</span> <span class="pre">a</span> <span class="pre">GPU,</span> <span class="pre">got</span> <span class="pre">...</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Scales (each call)</p></td>
+<td><p>none for bf16; both for fp8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">in_dtype='bf16'</span> <span class="pre">takes</span> <span class="pre">no</span> <span class="pre">scales</span></code>; <code class="docutils literal notranslate"><span class="pre">quant=...</span> <span class="pre">needs</span> <span class="pre">a_scale</span> <span class="pre">and</span> <span class="pre">b_scale</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Scale dtype and size (each call)</p></td>
+<td><p>as in <a class="reference internal" href="#calling-the-operator">section 5</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">a_scale</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">torch.float32,</span> <span class="pre">got</span> <span class="pre">...</span></code>; <code class="docutils literal notranslate"><span class="pre">a_scale</span> <span class="pre">must</span> <span class="pre">have</span> <span class="pre">...</span> <span class="pre">elements,</span> <span class="pre">got</span> <span class="pre">...</span></code>; <code class="docutils literal notranslate"><span class="pre">b_scale</span> <span class="pre">must</span> <span class="pre">have</span> <span class="pre">...</span> <span class="pre">elements,</span> <span class="pre">got</span> <span class="pre">...</span></code>; the layout messages for blockscale and mxfp8</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="choosing-settings">
+<h2>8. Choosing settings<a class="headerlink" href="#choosing-settings" title="Link to this heading"></a></h2>
+<p>The defaults were tuned on MI355X for the bf16-in, fp32-out <code class="docutils literal notranslate"><span class="pre">wkv_gate</span></code> shapes;
+leave them unless a measurement of your own says otherwise.</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">mode=&quot;auto&quot;</span></code></strong> fuses once even the largest tile’s grid covers the CUs,
+<code class="docutils literal notranslate"><span class="pre">ceil(M/256)</span> <span class="pre">*</span> <span class="pre">ceil(N/256)</span> <span class="pre">&gt;=</span> <span class="pre">CUs</span></code>: a GEMM long enough for the transfer to
+hide behind. The rule fits every pair in the README’s results table at 256
+CUs; a GPU with more CUs needs a larger M. Pin <code class="docutils literal notranslate"><span class="pre">&quot;split&quot;</span></code> when M stays small
+or SDMA queues are scarce (it asks for one per peer).</p></li>
+<li><p><strong>bf16 tile</strong>, per M and per path, among 256x256, 128x256, 256x128 and
+128x128. Split: the largest tile whose grid still covers the CUs, else the
+largest grid. Fused: the largest tile other than 256x256 whose grid runs at
+least two workgroup rounds, else the largest grid. fp8 uses 128x256 (256x256
+under mxfp8).</p></li>
+<li><p><strong>Chunks</strong>: one per workgroup round of the fused tile, capped at
+<code class="docutils literal notranslate"><span class="pre">max_chunks</span></code>. The cap defaults to 4 because 4 measured within 2% of 8 where
+the rule would pick 8, and a queue per chunk per peer is what runs out of
+SDMA engine slots first.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">fence</span></code>, <code class="docutils literal notranslate"><span class="pre">peer_uncached</span></code></strong>: the defaults are the README’s <code class="docutils literal notranslate"><span class="pre">sc_release</span></code>. On
+2026-10-29 the benchmark’s default fence (<code class="docutils literal notranslate"><span class="pre">leader</span></code>) measured within 0.2% of it
+at M &gt;= 4096, and 1.3% to 2.5% slower at M=2048. Do not use <code class="docutils literal notranslate"><span class="pre">&quot;none&quot;</span></code>.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">war_credit</span></code></strong>: leave it on.</p></li>
+<li><p><strong>No <code class="docutils literal notranslate"><span class="pre">max_shapes</span></code></strong>: one instance serves any number of distinct M up to
+<code class="docutils literal notranslate"><span class="pre">m_max</span></code>, in any order. Each new M compiles once; warm every M before
+capturing a CUDA graph.</p></li>
+</ul>
+<p>What the defaults pick on MI355X (256 CUs), bf16 in, fp32 out, as <code class="docutils literal notranslate"><span class="pre">fuses_at</span></code>,
+<code class="docutils literal notranslate"><span class="pre">tile_for</span></code> and <code class="docutils literal notranslate"><span class="pre">chunks_for</span></code> report it:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Shape</p></th>
+<th class="head text-right"><p>M</p></th>
+<th class="head"><p>Path</p></th>
+<th class="head"><p>Tile</p></th>
+<th class="head text-right"><p>Chunks</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Pro <code class="docutils literal notranslate"><span class="pre">wkv_gate</span></code>, N=2048</p></td>
+<td class="text-right"><p>2048</p></td>
+<td><p>split</p></td>
+<td><p>128x128</p></td>
+<td class="text-right"><p>1</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td class="text-right"><p>4096</p></td>
+<td><p>split</p></td>
+<td><p>128x256</p></td>
+<td class="text-right"><p>1</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td class="text-right"><p>8192</p></td>
+<td><p>fused</p></td>
+<td><p>128x256</p></td>
+<td class="text-right"><p>2</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td class="text-right"><p>16384</p></td>
+<td><p>fused</p></td>
+<td><p>128x256</p></td>
+<td class="text-right"><p>4</p></td>
+</tr>
+<tr class="row-even"><td><p>Flash combined, N=1024</p></td>
+<td class="text-right"><p>2048</p></td>
+<td><p>split</p></td>
+<td><p>128x128</p></td>
+<td class="text-right"><p>1</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td class="text-right"><p>16384</p></td>
+<td><p>fused</p></td>
+<td><p>128x256</p></td>
+<td class="text-right"><p>2</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Environment variables.</strong> The operator reads none itself. MORI reads
+<code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA</span></code> when the communicator is created; <code class="docutils literal notranslate"><span class="pre">MORI_SOCKET_IFNAME</span></code> names
+the network interface of the communicator’s bootstrap (the tests use <code class="docutils literal notranslate"><span class="pre">lo</span></code>).</p>
+</section>
+<section id="performance">
+<h2>9. Performance<a class="headerlink" href="#performance" title="Link to this heading"></a></h2>
+<p>From the
+<a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/README.md"><code class="docutils literal notranslate"><span class="pre">gemm_ag</span></code> README</a>,
+on MI355X, in µs. Each table is its own session; compare within a table only.</p>
+<p><strong>Through the operator</strong>: Pro <code class="docutils literal notranslate"><span class="pre">wkv_gate</span></code> (N=2048, K=7168), bf16 in, fp32 out,
+graph-timed, maximum over ranks. <code class="docutils literal notranslate"><span class="pre">sc_release</span></code> is the default publication;
+<code class="docutils literal notranslate"><span class="pre">leader</span></code> is the leader fence.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-right"><p>P</p></th>
+<th class="head text-right"><p>M</p></th>
+<th class="head text-right"><p><code class="docutils literal notranslate"><span class="pre">auto</span></code></p></th>
+<th class="head text-right"><p><code class="docutils literal notranslate"><span class="pre">fused</span></code> (sc_release)</p></th>
+<th class="head text-right"><p><code class="docutils literal notranslate"><span class="pre">fused</span></code> (leader)</p></th>
+<th class="head text-right"><p><code class="docutils literal notranslate"><span class="pre">split</span></code></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-right"><p>8</p></td>
+<td class="text-right"><p>2048</p></td>
+<td class="text-right"><p><strong>351.3</strong> (split)</p></td>
+<td class="text-right"><p>362.8</p></td>
+<td class="text-right"><p>361.0</p></td>
+<td class="text-right"><p>351.3</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>8</p></td>
+<td class="text-right"><p>4096</p></td>
+<td class="text-right"><p><strong>666.2</strong> (split)</p></td>
+<td class="text-right"><p>685.5</p></td>
+<td class="text-right"><p>687.6</p></td>
+<td class="text-right"><p>666.1</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>8</p></td>
+<td class="text-right"><p>8192</p></td>
+<td class="text-right"><p><strong>1239.2</strong> (fused)</p></td>
+<td class="text-right"><p>1240.0</p></td>
+<td class="text-right"><p>1240.9</p></td>
+<td class="text-right"><p>1288.7</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>4</p></td>
+<td class="text-right"><p>2048</p></td>
+<td class="text-right"><p><strong>349.1</strong> (split)</p></td>
+<td class="text-right"><p>357.0</p></td>
+<td class="text-right"><p>358.5</p></td>
+<td class="text-right"><p>349.4</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>4</p></td>
+<td class="text-right"><p>4096</p></td>
+<td class="text-right"><p><strong>662.0</strong> (split)</p></td>
+<td class="text-right"><p>682.8</p></td>
+<td class="text-right"><p>683.3</p></td>
+<td class="text-right"><p>661.7</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>4</p></td>
+<td class="text-right"><p>8192</p></td>
+<td class="text-right"><p><strong>1231.3</strong> (fused)</p></td>
+<td class="text-right"><p>1231.3</p></td>
+<td class="text-right"><p>1232.7</p></td>
+<td class="text-right"><p>1282.2</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Against Torch + RCCL</strong>: 2026-10-29, eight MI355X, ROCm
+7.2, PyTorch 2.11.0+rocm7.2, FlyDSL 0.4.0; the benchmark’s modes, bf16 in, fp32
+out, MORI’s GEMM at a fixed 128x128 tile; 50 warm-ups and 101 graph samples,
+maximum over ranks, median of three interleaved rounds. Fused rows use
+<code class="docutils literal notranslate"><span class="pre">sc_release</span></code> at the best chunk count (<code class="docutils literal notranslate"><span class="pre">cN</span></code>).</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Shape</p></th>
+<th class="head text-right"><p>M</p></th>
+<th class="head text-right"><p>Torch + RCCL</p></th>
+<th class="head text-right"><p>MORI GEMM + SDMA</p></th>
+<th class="head text-right"><p>best fused SDMA</p></th>
+<th class="head text-right"><p>best vs Torch + RCCL</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Pro <code class="docutils literal notranslate"><span class="pre">wkv_gate</span></code>, N=2048 K=7168</p></td>
+<td class="text-right"><p>2048</p></td>
+<td class="text-right"><p>415.1</p></td>
+<td class="text-right"><p><strong>373.4</strong></p></td>
+<td class="text-right"><p>376.6 (c1)</p></td>
+<td class="text-right"><p><strong>-10.0%</strong></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td class="text-right"><p>4096</p></td>
+<td class="text-right"><p>823.2</p></td>
+<td class="text-right"><p><strong>705.6</strong></p></td>
+<td class="text-right"><p>716.8 (c2)</p></td>
+<td class="text-right"><p><strong>-14.3%</strong></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td class="text-right"><p>8192</p></td>
+<td class="text-right"><p>1510.5</p></td>
+<td class="text-right"><p>1381.7</p></td>
+<td class="text-right"><p><strong>1314.8</strong> (c4)</p></td>
+<td class="text-right"><p><strong>-13.0%</strong></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td class="text-right"><p>16384</p></td>
+<td class="text-right"><p>3008.2</p></td>
+<td class="text-right"><p>2844.2</p></td>
+<td class="text-right"><p><strong>2527.7</strong> (c8)</p></td>
+<td class="text-right"><p><strong>-16.0%</strong></p></td>
+</tr>
+<tr class="row-even"><td><p>Flash combined, N=1024 K=5120</p></td>
+<td class="text-right"><p>2048</p></td>
+<td class="text-right"><p>227.6</p></td>
+<td class="text-right"><p>213.6</p></td>
+<td class="text-right"><p><strong>213.5</strong> (c1)</p></td>
+<td class="text-right"><p><strong>-6.2%</strong></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td class="text-right"><p>16384</p></td>
+<td class="text-right"><p>1465.9</p></td>
+<td class="text-right"><p>1372.7</p></td>
+<td class="text-right"><p><strong>1309.2</strong> (c4)</p></td>
+<td class="text-right"><p><strong>-10.7%</strong></p></td>
+</tr>
+</tbody>
+</table>
+<p>How to read them:</p>
+<ul class="simple">
+<li><p>Fusion pays from M=8192 on Pro and at M=16384 on Flash N=1024, not below;
+<code class="docutils literal notranslate"><span class="pre">mode=&quot;auto&quot;</span></code> encodes that and takes the faster path in every row of the
+first table. At its own tile (128x256, a chunk per round) the fused path
+measured 3.9%, 7.4% and 2.2% under split SDMA at Pro M=8192, Pro M=16384 and
+Flash M=16384, on the box of the 2026-10-29 table.</p></li>
+<li><p>Against Torch + RCCL the steady part of the gain is the transport: SDMA’s
+all-gather alone is 12.5-13.9% faster than RCCL’s at every shape. The fixed
+128x128 tile falls behind Torch’s GEMM at large M; the per-M tile closes that
+from M=8192.</p></li>
+<li><p>The README’s only fp8 measurement, an earlier protocol at M=N=2048, K=7168,
+has one-chunk fusion behind split SDMA under ptpc, blockscale and mxfp8.</p></li>
+</ul>
+</section>
+<section id="complete-example">
+<h2>10. Complete example<a class="headerlink" href="#complete-example" title="Link to this heading"></a></h2>
+<p>bf16 in, fp32 out, the Pro <code class="docutils literal notranslate"><span class="pre">wkv_gate</span></code> shape, replayed from a CUDA graph:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo torchrun --standalone --nproc_per_node=8 example.py</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.cco</span><span class="w"> </span><span class="kn">import</span> <span class="n">Communicator</span><span class="p">,</span> <span class="n">UniqueId</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.gemm_ag</span><span class="w"> </span><span class="kn">import</span> <span class="n">GemmAgOp</span>
+
+<span class="n">N</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">M_MAX</span> <span class="o">=</span> <span class="mi">2048</span><span class="p">,</span> <span class="mi">7168</span><span class="p">,</span> <span class="mi">16384</span>   <span class="c1"># DeepSeek-V4-Pro wkv_gate; the most rows per rank ever passed</span>
+<span class="n">TOKENS</span> <span class="o">=</span> <span class="mi">3000</span>                     <span class="c1"># rows per rank this step, the same on every rank</span>
+
+<span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">"LOCAL_RANK"</span><span class="p">]))</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">"cpu:gloo"</span><span class="p">)</span>
+<span class="n">rank</span><span class="p">,</span> <span class="n">world</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">get_rank</span><span class="p">(),</span> <span class="n">dist</span><span class="o">.</span><span class="n">get_world_size</span><span class="p">()</span>
+<span class="n">uid</span> <span class="o">=</span> <span class="p">[</span><span class="nb">bytes</span><span class="p">(</span><span class="n">Communicator</span><span class="o">.</span><span class="n">get_unique_id</span><span class="p">())</span> <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span><span class="p">]</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">broadcast_object_list</span><span class="p">(</span><span class="n">uid</span><span class="p">,</span> <span class="n">src</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="n">vmm</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">GemmAgOp</span><span class="o">.</span><span class="n">window_bytes_for</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="n">N</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="n">M_MAX</span><span class="p">,</span> <span class="n">out_dtype</span><span class="o">=</span><span class="s2">"fp32"</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="mi">256</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">)</span>
+<span class="k">with</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">init</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">UniqueId</span><span class="o">.</span><span class="n">from_bytes</span><span class="p">(</span><span class="n">uid</span><span class="p">[</span><span class="mi">0</span><span class="p">]),</span> <span class="n">per_rank_vmm</span><span class="o">=</span><span class="n">vmm</span><span class="p">)</span> <span class="k">as</span> <span class="n">comm</span><span class="p">:</span>
+    <span class="k">with</span> <span class="n">GemmAgOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="n">N</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">K</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="n">M_MAX</span><span class="p">,</span> <span class="n">in_dtype</span><span class="o">=</span><span class="s2">"bf16"</span><span class="p">,</span> <span class="n">out_dtype</span><span class="o">=</span><span class="s2">"fp32"</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>
+        <span class="n">op</span><span class="o">.</span><span class="n">self_test</span><span class="p">()</span>                                     <span class="c1"># collective, once</span>
+
+        <span class="n">g</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>  <span class="c1"># the same weight on every rank</span>
+        <span class="n">w</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span> <span class="o">/</span> <span class="mi">8</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">1</span> <span class="o">+</span> <span class="n">rank</span><span class="p">)</span>                        <span class="c1"># a different shard per rank</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">TOKENS</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span> <span class="o">/</span> <span class="mi">8</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+
+        <span class="n">m</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">padded_m</span><span class="p">(</span><span class="n">TOKENS</span><span class="p">)</span>                            <span class="c1"># 3072</span>
+        <span class="n">a</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">pad_rows</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">m</span><span class="p">)</span>                              <span class="c1"># the buffer the graph reads</span>
+        <span class="nb">print</span><span class="p">(</span><span class="n">rank</span><span class="p">,</span> <span class="n">op</span><span class="o">.</span><span class="n">fuses_at</span><span class="p">(</span><span class="n">m</span><span class="p">),</span> <span class="n">op</span><span class="o">.</span><span class="n">tile_for</span><span class="p">(</span><span class="n">m</span><span class="p">),</span> <span class="n">op</span><span class="o">.</span><span class="n">chunks_for</span><span class="p">(</span><span class="n">m</span><span class="p">))</span>  <span class="c1"># MI355X: False (128, 128) 1</span>
+
+        <span class="n">op</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>                                           <span class="c1"># warm-up: compiles this M</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+        <span class="n">graph</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">()</span>
+        <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph</span><span class="p">(</span><span class="n">graph</span><span class="p">):</span>
+            <span class="n">out</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>                                 <span class="c1"># [world*m, N] fp32, in the window</span>
+
+        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">3</span><span class="p">):</span>                                 <span class="c1"># the same count on every rank</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">TOKENS</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span> <span class="o">/</span> <span class="mi">8</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+            <span class="n">op</span><span class="o">.</span><span class="n">pad_rows</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">m</span><span class="p">)</span>                              <span class="c1"># refills `a` in place</span>
+            <span class="n">graph</span><span class="o">.</span><span class="n">replay</span><span class="p">()</span>
+            <span class="n">result</span> <span class="o">=</span> <span class="n">out</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="n">m</span><span class="p">,</span> <span class="n">N</span><span class="p">)[:,</span> <span class="p">:</span><span class="n">TOKENS</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">world</span> <span class="o">*</span> <span class="n">TOKENS</span><span class="p">,</span> <span class="n">N</span><span class="p">)</span>  <span class="c1"># a copy</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>                           <span class="c1"># nothing in flight at close()</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>fp8 in, bf16 out (the constructor’s default precision) with ptpc scales: as
+above, but size the VMM for bf16 output (<code class="docutils literal notranslate"><span class="pre">window_bytes_for(world,</span> <span class="pre">n=N,</span> <span class="pre">m_max=M_MAX)</span></code>) and replace the operator block with</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.gemm_ag</span><span class="w"> </span><span class="kn">import</span> <span class="n">preshuffle_b</span>
+
+<span class="k">with</span> <span class="n">GemmAgOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="n">N</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">K</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="n">M_MAX</span><span class="p">,</span> <span class="n">quant</span><span class="o">=</span><span class="s2">"ptpc"</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>   <span class="c1"># in_dtype="fp8" by default</span>
+    <span class="n">op</span><span class="o">.</span><span class="n">self_test</span><span class="p">()</span>
+    <span class="n">b</span> <span class="o">=</span> <span class="n">preshuffle_b</span><span class="p">(</span><span class="n">w_fp8</span><span class="p">)</span>                               <span class="c1"># [N, K] float8_e4m3fn, once per weight</span>
+    <span class="n">m</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">padded_m</span><span class="p">(</span><span class="n">TOKENS</span><span class="p">)</span>
+    <span class="n">a</span><span class="p">,</span> <span class="n">a_scale</span> <span class="o">=</span> <span class="n">quantize_per_token</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">pad_rows</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">m</span><span class="p">))</span>    <span class="c1"># your quantiser</span>
+    <span class="n">out</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">a_scale</span><span class="p">,</span> <span class="n">w_scale</span><span class="p">)</span>                      <span class="c1"># [world*m, N] bf16</span>
+</pre></div>
+</div>
+<p>MORI ships no quantiser. <code class="docutils literal notranslate"><span class="pre">quantize_per_token</span></code> must return <code class="docutils literal notranslate"><span class="pre">a</span></code> as <code class="docutils literal notranslate"><span class="pre">[m,</span> <span class="pre">K]</span></code>
+<code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fn</span></code> and <code class="docutils literal notranslate"><span class="pre">a_scale</span></code> as <code class="docutils literal notranslate"><span class="pre">[m]</span></code> fp32, one scale per row including
+the padded rows; <code class="docutils literal notranslate"><span class="pre">w_scale</span></code> is the weight’s <code class="docutils literal notranslate"><span class="pre">[N]</span></code> fp32 scale. For <code class="docutils literal notranslate"><span class="pre">blockscale</span></code>
+and <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code>, produce the layouts in <a class="reference internal" href="#calling-the-operator">section 5</a>.</p>
+</section>
+<section id="testing-and-benchmarking">
+<h2>11. Testing and benchmarking<a class="headerlink" href="#testing-and-benchmarking" title="Link to this heading"></a></h2>
+<p>Run against an installed MORI: the checkout’s <code class="docutils literal notranslate"><span class="pre">python/</span></code> has no compiled
+<code class="docutils literal notranslate"><span class="pre">mori.cco.cco</span></code>, so keep it off <code class="docutils literal notranslate"><span class="pre">PYTHONPATH</span></code>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MORI_ENABLE_SDMA</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">MORI_SOCKET_IFNAME</span><span class="o">=</span>lo
+pytest<span class="w"> </span>tests/python/cco/test_gemm_ag.py<span class="w"> </span>tests/python/cco/test_gemm_ag_op.py
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">test_gemm_ag.py</span></code> covers the layout arithmetic, the tile and chunk rules,
+models of the LDS ordering and SDMA completion, and single-GPU GEMM numerics
+(skipped without gfx950). <code class="docutils literal notranslate"><span class="pre">test_gemm_ag_op.py</span></code> checks the configuration rules,
+then runs one 8-rank <code class="docutils literal notranslate"><span class="pre">torchrun</span></code> of <code class="docutils literal notranslate"><span class="pre">gemm_ag_op_worker.py</span></code>: every precision in
+both modes, every bf16 tile, chunk counts, back-to-back calls with a held
+reader with the credit on and off, alternating M, padding, operand checks,
+<code class="docutils literal notranslate"><span class="pre">self_test</span></code> and <code class="docutils literal notranslate"><span class="pre">close</span></code>. The multi-rank parts need 8 GPUs and FlyDSL.</p>
+<p>The benchmark <code class="docutils literal notranslate"><span class="pre">benchmark/cco/flydsl/gemm_ag/bench_gemm_ag.py</span></code> calls the
+kernels, not <code class="docutils literal notranslate"><span class="pre">GemmAgOp</span></code>, and defaults to the leader fence with cached stores.
+With <code class="docutils literal notranslate"><span class="pre">--block-m</span></code>, <code class="docutils literal notranslate"><span class="pre">--block-n</span></code> and <code class="docutils literal notranslate"><span class="pre">--chunks</span></code> left at 0 it picks the tile and
+chunks by the operator’s rules at 256 CUs, with up to 8 chunks. Fused SDMA at
+the Pro shape, as the operator runs it:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>torch.distributed.run<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>benchmark/cco/flydsl/gemm_ag/bench_gemm_ag.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mode<span class="w"> </span>fused-sdma<span class="w"> </span>--peer-uncached<span class="w"> </span>--fence<span class="w"> </span>release<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--in-dtype<span class="w"> </span>bf16<span class="w"> </span>--out-dtype<span class="w"> </span>fp32<span class="w"> </span>-m<span class="w"> </span><span class="m">8192</span><span class="w"> </span>--out-dim<span class="w"> </span><span class="m">2048</span><span class="w"> </span>-k<span class="w"> </span><span class="m">7168</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--rounds<span class="w"> </span><span class="m">5</span><span class="w"> </span>--warmup<span class="w"> </span><span class="m">50</span><span class="w"> </span>--iters<span class="w"> </span><span class="m">101</span><span class="w"> </span>--tolerance<span class="w"> </span>1e-5
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--mode</span></code> also takes <code class="docutils literal notranslate"><span class="pre">gemm-only</span></code>, <code class="docutils literal notranslate"><span class="pre">gemm-to-window</span></code>, <code class="docutils literal notranslate"><span class="pre">split-rccl</span></code> and
+<code class="docutils literal notranslate"><span class="pre">split-sdma</span></code> (<code class="docutils literal notranslate"><span class="pre">--fence</span> <span class="pre">release</span></code> is refused outside <code class="docutils literal notranslate"><span class="pre">fused-sdma</span></code>). <code class="docutils literal notranslate"><span class="pre">--in-dtype</span></code>
+defaults to <code class="docutils literal notranslate"><span class="pre">fp8</span></code>, with <code class="docutils literal notranslate"><span class="pre">--quant</span> <span class="pre">ptpc|blockscale|mxfp8</span></code> and a default
+<code class="docutils literal notranslate"><span class="pre">--tolerance</span></code> of 3e-3. <code class="docutils literal notranslate"><span class="pre">--torch-gemm</span></code> swaps in <code class="docutils literal notranslate"><span class="pre">torch.mm</span></code> for bf16-in,
+fp32-out <code class="docutils literal notranslate"><span class="pre">gemm-only</span></code>, <code class="docutils literal notranslate"><span class="pre">split-rccl</span></code> and <code class="docutils literal notranslate"><span class="pre">split-sdma</span></code>; <code class="docutils literal notranslate"><span class="pre">--phase-split</span></code> also times
+the GEMM alone. Each run prints <code class="docutils literal notranslate"><span class="pre">RESULT_JSON</span></code> and <code class="docutils literal notranslate"><span class="pre">TIMING_JSON</span></code>; the time is
+the median over rounds of the per-round maximum over ranks. Run one
+configuration at a time on an idle node, and let one process group’s SDMA
+queues tear down before the next. The
+<a class="reference external" href="https://github.com/ROCm/mori/blob/main/benchmark/cco/flydsl/gemm_ag/README.md">benchmark README</a>
+also covers the two-stream pipeline experiment and the GEMM-only comparison.</p>
+</section>
+<section id="troubleshooting">
+<h2>12. Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Error or symptom</p></th>
+<th class="head"><p>What it means</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">GemmAgOp</span> <span class="pre">needs</span> <span class="pre">4</span> <span class="pre">SDMA</span> <span class="pre">queue(s)</span> <span class="pre">per</span> <span class="pre">peer</span> <span class="pre">but</span> <span class="pre">the</span> <span class="pre">communicator</span> <span class="pre">has</span> <span class="pre">0</span></code></p></td>
+<td><p>No SDMA: MORI was built without <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code>, or <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code> was not set when the communicator was created. MORI also logs <code class="docutils literal notranslate"><span class="pre">no</span> <span class="pre">SDMA</span> <span class="pre">queues</span> <span class="pre">will</span> <span class="pre">be</span> <span class="pre">created</span> <span class="pre">(...)</span></code> with the reason.</p></td>
+</tr>
+<tr class="row-odd"><td><p>The same error with a non-zero count</p></td>
+<td><p>An earlier device communicator on this communicator fixed a smaller queue count. Construct the operator that needs the most queues first, lower <code class="docutils literal notranslate"><span class="pre">max_chunks</span></code>, or use <code class="docutils literal notranslate"><span class="pre">mode=&quot;split&quot;</span></code>. More than 8 per peer is never available.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">GemmAgOp</span> <span class="pre">needs</span> <span class="pre">every</span> <span class="pre">rank</span> <span class="pre">in</span> <span class="pre">one</span> <span class="pre">LSA</span> <span class="pre">domain</span> <span class="pre">(one</span> <span class="pre">node)</span></code></p></td>
+<td><p>The ranks span nodes; the operator is single-node.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">gemm_ag</span> <span class="pre">self-test</span> <span class="pre">failed:</span> <span class="pre">the</span> <span class="pre">slot</span> <span class="pre">from</span> <span class="pre">rank</span> <span class="pre">s</span> <span class="pre">holds</span> <span class="pre">...,</span> <span class="pre">expected</span> <span class="pre">...</span></code></p></td>
+<td><p>The puts complete but move nothing. Check <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA</span></code> and <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">ccoMemAlloc</span> <span class="pre">failed:</span> <span class="pre">...</span></code> in the constructor</p></td>
+<td><p>Usually the window does not fit in what is left of <code class="docutils literal notranslate"><span class="pre">per_rank_vmm</span></code>. Size it with <code class="docutils literal notranslate"><span class="pre">window_bytes_for</span></code> for every window on the communicator.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">M=...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">positive</span> <span class="pre">multiple</span> <span class="pre">of</span> <span class="pre">...</span></code></p></td>
+<td><p>Pad with <code class="docutils literal notranslate"><span class="pre">padded_m()</span></code> and <code class="docutils literal notranslate"><span class="pre">pad_rows()</span></code>. Under mxfp8 or a pinned 256-row tile the granule is 256.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">M=...</span> <span class="pre">exceeds</span> <span class="pre">the</span> <span class="pre">window's</span> <span class="pre">m_max=...</span></code></p></td>
+<td><p>Construct with a larger <code class="docutils literal notranslate"><span class="pre">m_max</span></code>, and size the VMM for it.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">a</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">one</span> <span class="pre">of</span> <span class="pre">['torch.float8_e4m3fn']</span> <span class="pre">...</span></code></p></td>
+<td><p>Wrong operand dtype, for example <code class="docutils literal notranslate"><span class="pre">float8_e4m3fnuz</span></code>, or bf16 on an fp8 instance.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">a_scale</span> <span class="pre">is</span> <span class="pre">(M,</span> <span class="pre">K/128)</span> <span class="pre">row-major,</span> <span class="pre">which</span> <span class="pre">is</span> <span class="pre">ambiguous</span> <span class="pre">...</span></code></p></td>
+<td><p>Pass <code class="docutils literal notranslate"><span class="pre">a_scale.reshape(-1)</span></code> for a buffer already in <code class="docutils literal notranslate"><span class="pre">[K/128,</span> <span class="pre">M]</span></code> order, or <code class="docutils literal notranslate"><span class="pre">a_scale.t()</span></code> for a logical <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K/128]</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Wrong numbers, no error</p></td>
+<td><p>An fp8 <code class="docutils literal notranslate"><span class="pre">b</span></code> not passed through <code class="docutils literal notranslate"><span class="pre">preshuffle_b</span></code>, a <code class="docutils literal notranslate"><span class="pre">b</span></code> that differs between ranks, or scales in another layout. None of these shows in the shapes.</p></td>
+</tr>
+<tr class="row-even"><td><p>The result changes after the call</p></td>
+<td><p>It was read after this rank’s next call (or <code class="docutils literal notranslate"><span class="pre">self_test()</span></code>), or on another stream without an event. Order the read before the next call, or clone it.</p></td>
+</tr>
+<tr class="row-odd"><td><p>A hang</p></td>
+<td><p>The ranks disagree on the collective contract: a different number of calls or graph replays, a different M, or only some ranks constructing or calling <code class="docutils literal notranslate"><span class="pre">self_test()</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">hsaKmtCreateQueueExt</span></code> or <code class="docutils literal notranslate"><span class="pre">anvil.cpp</span></code> errors at start-up</p></td>
+<td><p>The SDMA queues of the previous multi-rank run are not released yet. Wait and retry; the tests wait for the previous run’s processes to leave the GPU, then retry once.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="further-reading">
+<h2>Further reading<a class="headerlink" href="#further-reading" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p>The <a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/README.md"><code class="docutils literal notranslate"><span class="pre">gemm_ag</span></code> README</a>,
+next to the code: the full design, every measurement, and what was tried and
+dropped (LSA transports, a short final chunk, smaller tiles, a lossy wire, a
+two-stream pipeline).</p></li>
+<li><p><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html"><span class="std std-doc">MORI-FUSED: Fused GEMM + Collective Operators</span></a>:
+what the six operators share, and performance at a glance.</p></li>
+<li><p><a class="reference internal" href="fused-tests-and-benchmarks.html"><span class="std std-doc">Running the tests and benchmarks</span></a> for every
+fused operator.</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="fused-gemm-a2a.html" class="btn btn-neutral float-left" title="GEMM + all-to-all" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="fused-ag-gemm.html" class="btn btn-neutral float-right" title="All-gather + GEMM" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.
+      <span class="lastupdated">Last updated on 2026-11-13.
+      </span></p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

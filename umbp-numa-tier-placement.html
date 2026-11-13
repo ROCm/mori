@@ -1,0 +1,375 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NUMA placement for a DRAM tier &mdash; MORI development (6206eebd) documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=dff4fcea"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="UMBP → SGLang KV Indexer" href="umbp-kv-indexer-export.html" />
+    <link rel="prev" title="Pure-SSD mode and multi-drive SSD tiers" href="umbp-pure-ssd-mode.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-EP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">User guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an API and backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">Benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">V1 vs V2 inter-node performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA bandwidth in the kernels</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-FUSED</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ar.html">GEMM + all-reduce</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-rs.html">GEMM + reduce-scatter</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-a2a.html">GEMM + all-to-all</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ag.html">GEMM + all-gather</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-ag-gemm.html">All-gather + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-a2a-gemm.html">All-to-all + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-tests-and-benchmarks.html">Tests and benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-SHMEM</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">SHMEM guide</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-CCO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">CCO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-device-api.html">Device API for FlyDSL and Triton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-examples.html">Examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-benchmarks.html">Benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-IO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">IO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">Benchmark</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-UMBP</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="umbp-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-configuration.html">Configuration and environment variables</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-pure-ssd-mode.html">Pure-SSD mode and multi-drive tiers</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">NUMA placement for a DRAM tier</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#configuration">Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#allocation-and-startup">Allocation and startup</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#remote-writes">Remote writes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#ranged-i-o">Ranged I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#measured-effect">Measured effect</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-kv-indexer-export.html">KV indexer export</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-monitoring.html">Monitoring</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">PD disaggregation benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">Tier-management benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">Simulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">Calibration</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Tools</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ kernel profiler</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">Profiler API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP master client</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">JIT compilation framework</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">JIT v2 (in Chinese)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">UMBP single-node smoke test</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">NUMA placement for a DRAM tier</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/umbp-numa-tier-placement.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <!-- Rendered from src/umbp/doc/numa-tier-placement.md. Edit that file, not this one. -->
+<section id="numa-placement-for-a-dram-tier">
+<h1>NUMA placement for a DRAM tier<a class="headerlink" href="#numa-placement-for-a-dram-tier" title="Link to this heading"></a></h1>
+<p>UMBP can split a DRAM tier into one buffer per NUMA node and prefer the writer
+GPU’s local buffer. All buffers remain in one backend and one shared keyspace.
+Readers on any GPU can still access any object.</p>
+<section id="configuration">
+<h2>Configuration<a class="headerlink" href="#configuration" title="Link to this heading"></a></h2>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_DRAM_NUMA_NODE</span><span class="o">=</span><span class="m">0</span>,1
+<span class="c1"># Optional: fail if a mapping cannot be bound, and forbid physical-page spill.</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_DRAM_NUMA_STRICT</span><span class="o">=</span><span class="m">1</span>
+<span class="c1"># Optional: 1 for serial prefault; 0 (default) selects up to 16 workers.</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_DRAM_PREFAULT_THREADS</span><span class="o">=</span><span class="m">0</span>
+</pre></div>
+</div>
+<p>With no NUMA node configured (unset, blank, or <code class="docutils literal notranslate"><span class="pre">-1</span></code>), the tier keeps the original
+single-buffer layout and allocation order. A single node retains <code class="docutils literal notranslate"><span class="pre">MPOL_BIND</span></code>. Multiple nodes
+use <code class="docutils literal notranslate"><span class="pre">MPOL_PREFERRED</span></code> unless strict mode is enabled. Duplicate nodes, negative
+nodes mixed into a list, and capacities too small for one allocator page per
+node are rejected.</p>
+<p>Binding policy and syscall failure handling are separate:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Nodes</p></th>
+<th class="head"><p>STRICT</p></th>
+<th class="head"><p>Policy</p></th>
+<th class="head"><p>If <code class="docutils literal notranslate"><span class="pre">mbind</span></code> fails</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Unset / <code class="docutils literal notranslate"><span class="pre">-1</span></code></p></td>
+<td><p>Either</p></td>
+<td><p>No binding</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mbind</span></code> is not called</p></td>
+</tr>
+<tr class="row-odd"><td><p>One node</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (default)</p></td>
+<td><p>BIND</p></td>
+<td><p>Warn and continue</p></td>
+</tr>
+<tr class="row-even"><td><p>Multiple nodes</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (default)</p></td>
+<td><p>PREFERRED</p></td>
+<td><p>Log degradation and continue</p></td>
+</tr>
+<tr class="row-odd"><td><p>One or multiple nodes</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>BIND</p></td>
+<td><p>Free the mapping and fail allocation</p></td>
+</tr>
+</tbody>
+</table>
+<p>Without STRICT, <code class="docutils literal notranslate"><span class="pre">ENOSYS</span></code> emits one unavailable warning and continues. With
+STRICT, every binding failure, including <code class="docutils literal notranslate"><span class="pre">ENOSYS</span></code>, is fatal: startup must not
+claim strict placement on a system that cannot bind memory. A successful BIND
+still restricts physical pages to the selected node even when STRICT is zero;
+STRICT controls error handling, not whether that policy can spill on a fault.</p>
+<p>In a container, <code class="docutils literal notranslate"><span class="pre">mbind</span></code> needs <code class="docutils literal notranslate"><span class="pre">CAP_SYS_NICE</span></code>: under Docker’s default seccomp
+profile it fails with <code class="docutils literal notranslate"><span class="pre">EPERM</span></code>. Run with <code class="docutils literal notranslate"><span class="pre">--cap-add</span> <span class="pre">SYS_NICE</span></code>, <code class="docutils literal notranslate"><span class="pre">--security-opt</span> <span class="pre">seccomp=unconfined</span></code> or <code class="docutils literal notranslate"><span class="pre">--privileged</span></code>. Without one of them a DRAM tier handles
+the failure as the table above says, and the standalone server’s ranged
+scratch, which requires its binding, falls back to one arena per direction.</p>
+<p>With <code class="docutils literal notranslate"><span class="pre">UMBP_DRAM_USE_HUGEPAGES=1</span></code>, reserve huge pages per node, not only in
+total. The hugetlb reservation made at <code class="docutils literal notranslate"><span class="pre">mmap</span></code> time is global, but a fault under
+BIND takes pages only from the bound node, so a node whose own pool is short
+fails the fault even though the global count looked sufficient. Reserve at
+least each buffer’s size on its node, for example
+<code class="docutils literal notranslate"><span class="pre">echo</span> <span class="pre">N</span> <span class="pre">&gt;</span> <span class="pre">/sys/devices/system/node/node&lt;i&gt;/hugepages/hugepages-2048kB/nr_hugepages</span></code>.</p>
+<p>The capacity is split evenly in whole allocator pages, with the remainder in
+the final buffer. The policy JSON’s DRAM <code class="docutils literal notranslate"><span class="pre">numa_node</span></code> also accepts a list:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"dram"</span><span class="p">,</span><span class="w"> </span><span class="nt">"capacity"</span><span class="p">:</span><span class="w"> </span><span class="s2">"40GiB"</span><span class="p">,</span><span class="w"> </span><span class="nt">"numa_node"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">]}</span>
+</pre></div>
+</div>
+<p>Policy-created DRAM backends inherit the configured hugepage, prefault, strict
+binding, prefault thread and memory-region size options. Python exposes
+<code class="docutils literal notranslate"><span class="pre">dram.numa_nodes</span></code>, <code class="docutils literal notranslate"><span class="pre">dram.numa_strict</span></code>, <code class="docutils literal notranslate"><span class="pre">dram.prefault_threads</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">dram.max_mr_bytes</span></code>. The deprecated <code class="docutils literal notranslate"><span class="pre">dram.numa_node</span></code>
+property reads the first node (or <code class="docutils literal notranslate"><span class="pre">-1</span></code>); assigning it replaces the entire list.
+The standalone client’s child server receives the same configuration.</p>
+<p><code class="docutils literal notranslate"><span class="pre">UMBPHostMemAllocator.alloc(...,</span> <span class="pre">numa_node=...)</span></code>, including SGLang’s HiCache L2
+allocator, keeps its scalar API and existing best-effort <code class="docutils literal notranslate"><span class="pre">MPOL_BIND</span></code> behavior.</p>
+</section>
+<section id="allocation-and-startup">
+<h2>Allocation and startup<a class="headerlink" href="#allocation-and-startup" title="Link to this heading"></a></h2>
+<p>The local write path derives one advisory NUMA hint per ranged batch and one per
+object for whole-object <code class="docutils literal notranslate"><span class="pre">Put</span></code>/<code class="docutils literal notranslate"><span class="pre">BatchPut</span></code>. CPU
+buffers and unknown GPUs have no preference. If the preferred buffer can
+satisfy a request, contiguous pages are preferred over scattered pages within
+that buffer. Otherwise, a global capacity check precedes allocation of the
+local remainder and then pages from other buffers. Insufficient global space
+leaves all bitmaps unchanged. HBM and SSD backends ignore the hint.</p>
+<p>A host buffer larger than <code class="docutils literal notranslate"><span class="pre">UMBP_DRAM_MAX_MR_BYTES</span></code> (default 512 GiB) is
+registered with the NIC as several memory regions of at most that size, in
+whole backing and allocator pages. AMD Pensando AINIC firmware before
+1.117.5-a-190 translates only the first 2^18 page entries of a memory region
+and silently aliases the rest, so the limit must not exceed 2^18 backing
+pages: 512 GiB with 2 MiB pages, 1 GiB with 4 KiB pages. On such a host the
+DRAM tier and the ranged scratch warn at startup about a region with more,
+counted from the pages that actually back it, since a hugepage request that
+fell back to 4 KiB pages has 512 times the entries; the warning names the
+firmware. <code class="docutils literal notranslate"><span class="pre">0</span></code> registers each buffer whole. Each region is its own buffer on
+the same node; a node preference takes the first of that node’s regions that
+holds the request.</p>
+<p>Logical page spill and physical memory spill are distinct: the former uses
+another tier buffer when the local buffer is full; <code class="docutils literal notranslate"><span class="pre">MPOL_PREFERRED</span></code> also lets
+the kernel back a buffer with another node’s physical pages when necessary.
+Startup logs distinguish target placement from sampled physical placement.
+Failure to query placement is logged rather than inferred as success.</p>
+<p>Every tier of at least 64 MiB prefaults in parallel with a total budget of at
+most 16 workers (<code class="docutils literal notranslate"><span class="pre">UMBP_DRAM_PREFAULT_THREADS=1</span></code> restores the serial path).
+Large buffers can subdivide that budget into page-aligned chunks; small chunks
+stay serial. A bound buffer’s workers run on its node’s allowed CPUs. An
+unbound buffer’s workers alternate between nodes in whole rounds, so first
+touch splits it evenly across sockets instead of filling one node first.
+Workers restore their previous affinity. <code class="docutils literal notranslate"><span class="pre">UMBP_DRAM_PREFAULT=0</span></code> disables
+prefault. GPU registration and the transfer path are unchanged.</p>
+<p>This policy favors locality over the opportunity to put an entire object in a
+remote contiguous run. Its net benefit depends on fragmentation and workload.
+It does not migrate existing objects or replicate shared keys across sockets.</p>
+</section>
+<section id="remote-writes">
+<h2>Remote writes<a class="headerlink" href="#remote-writes" title="Link to this heading"></a></h2>
+<p>A write routed to another node carries the same advisory hint in its slot
+request: the node of the writer’s GPU, also when a ranged put stages the bytes
+through the ranged PUT arena, otherwise the node of a registered host source.
+The peer prefers its regions on that node. Without a hint (a CPU caller, or a
+writer that sends none), a tier with buffers on several nodes starts on the node
+with the most free pages instead of the first one, so the nodes fill evenly; a
+tier on one node keeps its order.</p>
+<p>Each side of an RDMA transfer picks its NICs from the node of its own memory, so
+the object then travels between NICs on the same node at both ends when the
+reader is the GPU that wrote it.</p>
+</section>
+<section id="ranged-i-o">
+<h2>Ranged I/O<a class="headerlink" href="#ranged-i-o" title="Link to this heading"></a></h2>
+<p>A remote ranged GET or PUT stages through a host arena, and every GPU on a node
+shares the standalone server’s. In one piece, the arena sits on whichever node
+first touch placed it, so its NUMA node picks the NICs of every rank’s RDMA leg
+and half the GPUs copy across sockets. The standalone server therefore lays each
+arena out by NUMA node (<code class="docutils literal notranslate"><span class="pre">UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA</span></code>): the configured
+bytes are split evenly over the nodes that have GPUs, each part is bound to its
+node and registered on its own, and is cut into one shard per GPU on it unless
+<code class="docutils literal notranslate"><span class="pre">UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS</span></code> sets the arena’s total. A call stages
+through a shard on its caller buffer’s node, or that node’s whole part when it
+needs more than a shard. Memory is the same as one arena per direction. Each
+part is one NIC memory region, so on 4 KiB pages keep a part within 1 GiB, the
+AINIC limit above, or back the arenas with hugepages
+(<code class="docutils literal notranslate"><span class="pre">UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES</span></code>).</p>
+</section>
+<section id="measured-effect">
+<h2>Measured effect<a class="headerlink" href="#measured-effect" title="Link to this heading"></a></h2>
+<p>One MI355X node (two sockets, eight GPUs), DeepSeek-V4-Pro at TP8, SGLang with
+the UMBP linker and an agentx replay. Split tier (<code class="docutils literal notranslate"><span class="pre">UMBP_DRAM_NUMA_NODE=0,1</span></code>)
+against the single-buffer tier:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Concurrency</p></th>
+<th class="head"><p>DRAM tier</p></th>
+<th class="head"><p>Window</p></th>
+<th class="head"><p>Runs (single / split)</p></th>
+<th class="head"><p>Total token throughput</p></th>
+<th class="head"><p>TTFT p50</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>16</p></td>
+<td><p>512 GiB, 4K pages</p></td>
+<td><p>900 s</p></td>
+<td><p>3 / 5</p></td>
+<td><p>within 1%</p></td>
+<td><p>no consistent difference</p></td>
+</tr>
+<tr class="row-odd"><td><p>128</p></td>
+<td><p>740 GB, hugetlb, STRICT</p></td>
+<td><p>3600 s</p></td>
+<td><p>2 / 2</p></td>
+<td><p>+0.2%</p></td>
+<td><p>-0.4%</p></td>
+</tr>
+</tbody>
+</table>
+<p>Placement does not change serving throughput at these points. At concurrency 16
+tier reads overlap compute. At 128 the load wait that reaches the critical path
+is about 1.3% of forward time with or without the split. A hugetlb tier
+reserved to capacity already fills node 0 and then node 1.</p>
+<p>The split does shorten startup. A standalone server with a 740 GB tier is ready
+in 64-81 s with 4K pages and in 10-13 s with hugetlb. A single-buffer tier used
+to take 274 s and 36 s: one thread prefaulted it, which placed the whole tier on
+that thread’s node, and registering a tier packed onto one node for GPU access
+takes several times longer. Its workers now alternate between nodes, and it is
+ready in 79-90 s and 12-14 s.</p>
+<p>Replicating shared keys on both nodes was measured at concurrency 128 and not
+adopted. Throughput fell by 10.9%: storing each shared key twice raised
+recomputed prefill by 25%, and exposed load wait rose by 30%.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="umbp-pure-ssd-mode.html" class="btn btn-neutral float-left" title="Pure-SSD mode and multi-drive SSD tiers" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="umbp-kv-indexer-export.html" class="btn btn-neutral float-right" title="UMBP → SGLang KV Indexer" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.
+      <span class="lastupdated">Last updated on 2026-11-13.
+      </span></p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

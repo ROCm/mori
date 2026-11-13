@@ -1,0 +1,290 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MORI-UMBP Overview &mdash; MORI development (6206eebd) documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=dff4fcea"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="UMBP Runtime-Tunable Environment Variables" href="umbp-configuration.html" />
+    <link rel="prev" title="MORI-IO Benchmark" href="MORI-IO-BENCHMARK.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-EP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">User guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an API and backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">Benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">V1 vs V2 inter-node performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA bandwidth in the kernels</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-FUSED</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ar.html">GEMM + all-reduce</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-rs.html">GEMM + reduce-scatter</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-a2a.html">GEMM + all-to-all</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ag.html">GEMM + all-gather</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-ag-gemm.html">All-gather + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-a2a-gemm.html">All-to-all + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-tests-and-benchmarks.html">Tests and benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-SHMEM</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">SHMEM guide</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-CCO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">CCO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-device-api.html">Device API for FlyDSL and Triton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-examples.html">Examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-benchmarks.html">Benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-IO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">IO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">Benchmark</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-UMBP</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Overview</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#deployment-modes">Deployment modes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#tiers">Tiers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#building">Building</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#configuration-and-observability">Configuration and observability</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#running-and-measuring">Running and measuring</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-configuration.html">Configuration and environment variables</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-pure-ssd-mode.html">Pure-SSD mode and multi-drive tiers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-numa-tier-placement.html">NUMA placement for a DRAM tier</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-kv-indexer-export.html">KV indexer export</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-monitoring.html">Monitoring</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">PD disaggregation benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">Tier-management benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">Simulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">Calibration</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Tools</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ kernel profiler</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">Profiler API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP master client</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">JIT compilation framework</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">JIT v2 (in Chinese)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">UMBP single-node smoke test</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">MORI-UMBP Overview</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/umbp-overview.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="mori-umbp-overview">
+<h1>MORI-UMBP Overview<a class="headerlink" href="#mori-umbp-overview" title="Link to this heading"></a></h1>
+<p>UMBP (Unified Memory and Bandwidth Pool) is a key-value pool for KV cache that
+spans GPU HBM, host DRAM and SSD, on one node or across many. An inference
+engine puts KV blocks in by key and gets them back later from whichever node and
+tier holds them. MORI-IO moves the bytes between nodes over RDMA.</p>
+<p>SGLang uses UMBP as a HiCache storage backend (<code class="docutils literal notranslate"><span class="pre">--hicache-storage-backend</span> <span class="pre">umbp</span></code>),
+including in prefill-decode disaggregated serving.</p>
+<section id="architecture">
+<h2>Architecture<a class="headerlink" href="#architecture" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>Clients</strong> run inside the engine process: <code class="docutils literal notranslate"><span class="pre">mori.umbp.UMBPClient</span></code>, configured
+with a <code class="docutils literal notranslate"><span class="pre">UMBPConfig</span></code>. Data moves through <code class="docutils literal notranslate"><span class="pre">put_from_ptr</span></code> / <code class="docutils literal notranslate"><span class="pre">get_into_ptr</span></code> and
+their batch forms.</p></li>
+<li><p><strong>The master</strong>, <code class="docutils literal notranslate"><span class="pre">umbp_master</span> <span class="pre">&lt;address&gt;</span> <span class="pre">[metrics_port]</span></code>, tracks which node
+holds which block, routes puts to nodes, and answers external-KV queries. It
+keeps that metadata in memory, or in Redis when MORI is built with
+<code class="docutils literal notranslate"><span class="pre">USE_REDIS_BACKEND=ON</span></code> and the master runs with <code class="docutils literal notranslate"><span class="pre">UMBP_METADATA_BACKEND=redis</span></code>
+(see the <a class="reference external" href="https://github.com/ROCm/mori/blob/main/src/umbp/doc/design-redis-metadata-store.md">Redis metadata store design</a>).</p></li>
+<li><p><strong>Peers</strong> are each node’s storage backends (DRAM, HBM, SSD) and the transfer
+engines that move data to and from them: MORI-IO for RDMA between nodes, local
+and HBM copy engines within a node, and POSIX or GDS for SSD.</p></li>
+<li><p><strong>Eviction</strong> is local by default: each node evicts at its own watermarks, by
+its own LRU, without asking the master. <code class="docutils literal notranslate"><span class="pre">UMBP_EVICTION_MODE</span></code> selects the
+master-assisted modes.</p></li>
+</ul>
+</section>
+<section id="deployment-modes">
+<h2>Deployment modes<a class="headerlink" href="#deployment-modes" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Mode</p></th>
+<th class="head"><p>When</p></th>
+<th class="head"><p>What runs</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Embedded</p></td>
+<td><p>The config names no deployment</p></td>
+<td><p>An in-process pool: one DRAM medium and the local copy engines. No master, no peers</p></td>
+</tr>
+<tr class="row-odd"><td><p>Distributed</p></td>
+<td><p>A master address is configured</p></td>
+<td><p>Each client registers with the master, serves its own tier to peers and reads theirs over RDMA</p></td>
+</tr>
+<tr class="row-even"><td><p>Standalone server</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">UMBPConfig.standalone_process</span></code> is set</p></td>
+<td><p>The pool lives in a per-node <code class="docutils literal notranslate"><span class="pre">umbp_standalone_server</span></code> process, which clients reach over gRPC</p></td>
+</tr>
+<tr class="row-odd"><td><p>Simulation</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">UMBPConfig.sim.enabled</span></code> is set</p></td>
+<td><p>Allocation, placement and routing run for real; payloads and transfers are virtual. See <a class="reference internal" href="umbp-simulation.html"><span class="std std-doc">Simulation</span></a></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="tiers">
+<h2>Tiers<a class="headerlink" href="#tiers" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p>A node serves a single medium (<code class="docutils literal notranslate"><span class="pre">distributed.medium</span></code>, or
+<code class="docutils literal notranslate"><span class="pre">UMBP_DISTRIBUTED_MEDIUM</span></code> for the standalone server), or several backends
+described by a tier policy (<code class="docutils literal notranslate"><span class="pre">backend_policy_path</span></code>, or <code class="docutils literal notranslate"><span class="pre">UMBP_BACKEND_POLICY</span></code>
+for the standalone server). The policy format is described on the
+<a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html"><span class="std std-doc">tier-management benchmark</span></a> page.</p></li>
+<li><p>SSD tiers, including multi-drive ones: <a class="reference internal" href="umbp-pure-ssd-mode.html"><span class="std std-doc">Pure-SSD mode</span></a>.</p></li>
+<li><p>DRAM on multi-socket hosts: <a class="reference internal" href="umbp-numa-tier-placement.html"><span class="std std-doc">NUMA placement</span></a>.</p></li>
+</ul>
+</section>
+<section id="building">
+<h2>Building<a class="headerlink" href="#building" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span></code> builds UMBP by default (<code class="docutils literal notranslate"><span class="pre">BUILD_UMBP=ON</span></code>). It needs the gRPC and
+Protobuf development packages; without them the build skips UMBP with a warning
+and installs the rest of MORI. A plain CMake build needs <code class="docutils literal notranslate"><span class="pre">-DBUILD_UMBP=ON</span></code>, which
+is off by default. The wheel ships <code class="docutils literal notranslate"><span class="pre">umbp_master</span></code> and <code class="docutils literal notranslate"><span class="pre">umbp_standalone_server</span></code>,
+and <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">mori.umbp</span></code> points <code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_BIN</span></code> and <code class="docutils literal notranslate"><span class="pre">UMBP_STANDALONE_BIN</span></code> at them
+unless those are already set.</p>
+</section>
+<section id="configuration-and-observability">
+<h2>Configuration and observability<a class="headerlink" href="#configuration-and-observability" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p>Settings are <code class="docutils literal notranslate"><span class="pre">UMBPConfig</span></code> fields; <code class="docutils literal notranslate"><span class="pre">UMBPConfig.from_environment()</span></code> fills them
+from <code class="docutils literal notranslate"><span class="pre">UMBP_*</span></code> environment variables. See
+<a class="reference internal" href="umbp-configuration.html"><span class="std std-doc">Configuration and environment variables</span></a>.</p></li>
+<li><p>The master serves Prometheus metrics on port 9091 (or its second argument). A
+standalone server without a master serves its own on 9092
+(<code class="docutils literal notranslate"><span class="pre">UMBP_STANDALONE_METRICS_PORT</span></code>). Dashboards: <a class="reference internal" href="umbp-monitoring.html"><span class="std std-doc">Monitoring</span></a>.</p></li>
+<li><p>Each client (an engine’s, or the one inside <code class="docutils literal notranslate"><span class="pre">umbp_standalone_server</span></code>) logs a
+one-line activity summary once a minute at INFO (<code class="docutils literal notranslate"><span class="pre">UMBP_SUMMARY_INTERVAL_MS</span></code>);
+<code class="docutils literal notranslate"><span class="pre">umbp_master</span></code> does not. UMBP logs at <code class="docutils literal notranslate"><span class="pre">error</span></code> by default, so set
+<code class="docutils literal notranslate"><span class="pre">MORI_UMBP_LOG_LEVEL=info</span></code> to see it.</p></li>
+<li><p><a class="reference internal" href="umbp-kv-indexer-export.html"><span class="std std-doc">KV indexer export</span></a> reports committed DRAM blocks
+to SGLang’s KV indexer.</p></li>
+<li><p>The control-plane client, <code class="docutils literal notranslate"><span class="pre">UMBPMasterClient</span></code>, is in the
+<a class="reference internal" href="api/umbp.html"><span class="std std-doc">API reference</span></a>.</p></li>
+</ul>
+</section>
+<section id="running-and-measuring">
+<h2>Running and measuring<a class="headerlink" href="#running-and-measuring" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html"><span class="std std-doc">PD disaggregation benchmark</span></a>: SGLang
+prefill-decode serving with UMBP across nodes.</p></li>
+<li><p><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html"><span class="std std-doc">Tier-management benchmark</span></a>:
+<code class="docutils literal notranslate"><span class="pre">umbp_tier_bench</span></code> on synthetic or recorded workloads.</p></li>
+<li><p><a class="reference internal" href="umbp-simulation.html"><span class="std std-doc">Simulation</span></a> and <a class="reference internal" href="umbp-calibration.html"><span class="std std-doc">Calibration</span></a>.</p></li>
+<li><p><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html"><span class="std std-doc">Single-node smoke test</span></a>: the developer
+runbook for an end-to-end SGLang check on one node.</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="MORI-IO-BENCHMARK.html" class="btn btn-neutral float-left" title="MORI-IO Benchmark" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="umbp-configuration.html" class="btn btn-neutral float-right" title="UMBP Runtime-Tunable Environment Variables" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.
+      <span class="lastupdated">Last updated on 2026-11-13.
+      </span></p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

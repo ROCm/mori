@@ -1,0 +1,361 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CCO point-to-point benchmarks &mdash; MORI development (6206eebd) documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=dff4fcea"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="MORI-IO Introduction" href="MORI-IO-GUIDE.html" />
+    <link rel="prev" title="CCO examples" href="cco-examples.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-EP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">User guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an API and backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">Benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">V1 vs V2 inter-node performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA bandwidth in the kernels</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-FUSED</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ar.html">GEMM + all-reduce</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-rs.html">GEMM + reduce-scatter</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-a2a.html">GEMM + all-to-all</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ag.html">GEMM + all-gather</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-ag-gemm.html">All-gather + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-a2a-gemm.html">All-to-all + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-tests-and-benchmarks.html">Tests and benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-SHMEM</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">SHMEM guide</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-CCO</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">CCO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-device-api.html">Device API for FlyDSL and Triton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-examples.html">Examples</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Benchmarks</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#build">Build</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#run">Run</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#triton-benchmark">Triton benchmark</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#automated-triton-vs-c-comparison">Automated Triton vs C++ comparison</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#sdma-specifics">SDMA specifics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#expected-magnitudes">Expected magnitudes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#measurement-notes">Measurement notes</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-IO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">IO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">Benchmark</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-UMBP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="umbp-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-configuration.html">Configuration and environment variables</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-pure-ssd-mode.html">Pure-SSD mode and multi-drive tiers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-numa-tier-placement.html">NUMA placement for a DRAM tier</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-kv-indexer-export.html">KV indexer export</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-monitoring.html">Monitoring</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">PD disaggregation benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">Tier-management benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">Simulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">Calibration</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Tools</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ kernel profiler</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">Profiler API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP master client</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">JIT compilation framework</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">JIT v2 (in Chinese)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">UMBP single-node smoke test</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">CCO point-to-point benchmarks</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/cco-benchmarks.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <!-- Rendered from benchmark/cco/README.md. Edit that file, not this one. -->
+<section id="cco-point-to-point-benchmarks">
+<h1>CCO point-to-point benchmarks<a class="headerlink" href="#cco-point-to-point-benchmarks" title="Link to this heading"></a></h1>
+<p>Four two-rank benchmarks that move data between PE 0 and PE 1 over one of the
+CCO transports:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>binary</p></th>
+<th class="head"><p>measures</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cco_p2p_put_bw</span></code></p></td>
+<td><p>write bandwidth, many ops per timed iteration</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cco_p2p_get_bw</span></code></p></td>
+<td><p>read bandwidth</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cco_p2p_put_latency</span></code></p></td>
+<td><p>write latency, one op + completion per iteration</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cco_p2p_get_latency</span></code></p></td>
+<td><p>read latency</p></td>
+</tr>
+</tbody>
+</table>
+<p>Transports are selected with <code class="docutils literal notranslate"><span class="pre">-t</span></code>:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">lsa</span></code> — intra-node flat-VA loads/stores from the kernel. No copy engine.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">sdma</span></code> — intra-node copy engine, driven from the kernel (<code class="docutils literal notranslate"><span class="pre">ccoSdma</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ibgda</span></code> — cross-node one-sided RDMA.</p></li>
+</ul>
+<p>Run <code class="docutils literal notranslate"><span class="pre">&lt;binary&gt;</span> <span class="pre">-h</span></code> for the full option list.</p>
+<section id="build">
+<h2>Build<a class="headerlink" href="#build" title="Link to this heading"></a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cmake<span class="w"> </span>-S<span class="w"> </span>.<span class="w"> </span>-B<span class="w"> </span>build<span class="w"> </span>-GNinja<span class="w"> </span>-DCMAKE_BUILD_TYPE<span class="o">=</span>Release<span class="w"> </span>-DBUILD_BENCHMARK<span class="o">=</span>ON
+ninja<span class="w"> </span>-C<span class="w"> </span>build<span class="w"> </span>cco_p2p_put_bw<span class="w"> </span>cco_p2p_get_bw<span class="w"> </span>cco_p2p_put_latency<span class="w"> </span>cco_p2p_get_latency
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">BUILD_BENCHMARK=ON</span></code> implies <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code>; the binaries land in
+<code class="docutils literal notranslate"><span class="pre">build/benchmark/</span></code>. <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">.</span></code> with <code class="docutils literal notranslate"><span class="pre">BUILD_BENCHMARK=ON</span></code> also works and
+additionally installs them under <code class="docutils literal notranslate"><span class="pre">python/mori/benchmarks/cco/</span></code>.</p>
+</section>
+<section id="run">
+<h2>Run<a class="headerlink" href="#run" title="Link to this heading"></a></h2>
+<p>Always two ranks:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># SDMA bandwidth, 1MB..1GB</span>
+mpirun<span class="w"> </span>-np<span class="w"> </span><span class="m">2</span><span class="w"> </span>./build/benchmark/cco_p2p_put_bw<span class="w"> </span>-t<span class="w"> </span>sdma<span class="w"> </span>-b<span class="w"> </span>1M<span class="w"> </span>-e<span class="w"> </span>1G<span class="w"> </span>-f<span class="w"> </span><span class="m">4</span><span class="w"> </span>-n<span class="w"> </span><span class="m">20</span><span class="w"> </span>-w<span class="w"> </span><span class="m">5</span>
+
+<span class="c1"># SDMA latency, small messages, engine-drain completion</span>
+mpirun<span class="w"> </span>-np<span class="w"> </span><span class="m">2</span><span class="w"> </span>./build/benchmark/cco_p2p_put_latency<span class="w"> </span>-t<span class="w"> </span>sdma<span class="w"> </span>-C<span class="w"> </span>quiet<span class="w"> </span>-b<span class="w"> </span><span class="m">8</span><span class="w"> </span>-e<span class="w"> </span>64K<span class="w"> </span>-n<span class="w"> </span><span class="m">100</span><span class="w"> </span>-w<span class="w"> </span><span class="m">20</span>
+
+<span class="c1"># Same link with the kernel doing the copy instead, for comparison</span>
+mpirun<span class="w"> </span>-np<span class="w"> </span><span class="m">2</span><span class="w"> </span>./build/benchmark/cco_p2p_put_bw<span class="w"> </span>-t<span class="w"> </span>lsa<span class="w"> </span>-b<span class="w"> </span>1M<span class="w"> </span>-e<span class="w"> </span>1G<span class="w"> </span>-f<span class="w"> </span><span class="m">4</span><span class="w"> </span>-n<span class="w"> </span><span class="m">20</span><span class="w"> </span>-w<span class="w"> </span><span class="m">5</span>
+</pre></div>
+</div>
+</section>
+<section id="triton-benchmark">
+<h2>Triton benchmark<a class="headerlink" href="#triton-benchmark" title="Link to this heading"></a></h2>
+<p>The Triton implementation mirrors the C++ two-window, rank-0-only and
+completion boundaries. It reports one <code class="docutils literal notranslate"><span class="pre">RESULT_JSON</span></code> record per size plus a
+human-readable table.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># LSA put latency: 8B..64KB</span>
+torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>benchmark/cco/triton/bench_p2p.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--transport<span class="w"> </span>lsa<span class="w"> </span>--op<span class="w"> </span>put<span class="w"> </span>--metric<span class="w"> </span>latency
+
+<span class="c1"># SDMA get bandwidth: 64KB..8MB</span>
+<span class="nv">MORI_ENABLE_SDMA</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>benchmark/cco/triton/bench_p2p.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--transport<span class="w"> </span>sdma<span class="w"> </span>--op<span class="w"> </span>get<span class="w"> </span>--metric<span class="w"> </span>bandwidth
+
+<span class="c1"># IBGDA on one AINIC rail</span>
+<span class="nv">MORI_DEVICE_NIC</span><span class="o">=</span>ionic<span class="w"> </span><span class="nv">MORI_DISABLE_TOPO</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">MORI_RDMA_DEVICES</span><span class="o">=</span>rocep9s0<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>benchmark/cco/triton/bench_p2p.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--transport<span class="w"> </span>ibgda<span class="w"> </span>--op<span class="w"> </span>put<span class="w"> </span>--metric<span class="w"> </span>bandwidth
+</pre></div>
+</div>
+<p>Common options are <code class="docutils literal notranslate"><span class="pre">--min-size</span></code>, <code class="docutils literal notranslate"><span class="pre">--max-size</span></code>, <code class="docutils literal notranslate"><span class="pre">--step-factor</span></code>, <code class="docutils literal notranslate"><span class="pre">--iters</span></code>,
+<code class="docutils literal notranslate"><span class="pre">--warmup</span></code>, <code class="docutils literal notranslate"><span class="pre">--grid</span></code>, <code class="docutils literal notranslate"><span class="pre">--threads</span></code>, and <code class="docutils literal notranslate"><span class="pre">--json-out</span></code>. The current fair-comparison
+preset uses block scope: latency and SDMA bandwidth use one program, while
+LSA/IBGDA bandwidth use 32 programs × 256 threads.</p>
+<p>Triton JIT compilation and warmup occur before the timed event. Each timed
+launch loops <code class="docutils literal notranslate"><span class="pre">iters</span></code> times inside the kernel, so Python launch overhead is not
+reported as device latency.</p>
+</section>
+<section id="automated-triton-vs-c-comparison">
+<h2>Automated Triton vs C++ comparison<a class="headerlink" href="#automated-triton-vs-c-comparison" title="Link to this heading"></a></h2>
+<p>Build the four C++ binaries, then run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">BUILD_BENCHMARK</span><span class="o">=</span>ON<span class="w"> </span><span class="nv">BUILD_CCO_SDMA</span><span class="o">=</span>ON<span class="w"> </span><span class="nv">BUILD_UMBP</span><span class="o">=</span>OFF<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
+
+<span class="nv">MORI_CCO_TRITON_GDA_DEVICE</span><span class="o">=</span>rocep9s0<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>python<span class="w"> </span>benchmark/cco/compare_triton_cpp.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cpp-dir<span class="w"> </span>build/benchmark<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--json-out<span class="w"> </span>/tmp/cco_compare.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--markdown-out<span class="w"> </span>/tmp/cco_compare.md
+</pre></div>
+</div>
+<p>The runner executes LSA, SDMA and IBGDA put/get latency and bandwidth with
+identical sizes, block scope, geometry, iterations and warmup. <code class="docutils literal notranslate"><span class="pre">ratio</span></code> is
+<code class="docutils literal notranslate"><span class="pre">Triton/C++</span></code>: greater than one is better for bandwidth and worse for latency.</p>
+<p>The IBGDA run pins all ranks to one HCA because this MI355X setup cannot route
+local GDA traffic across AINIC rails. This is a correctness configuration, not
+a multi-rail peak-bandwidth measurement.</p>
+</section>
+<section id="sdma-specifics">
+<h2>SDMA specifics<a class="headerlink" href="#sdma-specifics" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">MORI_SDMA_NUM_CHANNELS</span></code> sets the queues per GPU pair — default 2, max 8. It is
+not a benchmark flag but it bounds how much of the link one run can use, so set
+it before comparing configurations:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MORI_SDMA_NUM_CHANNELS</span><span class="o">=</span><span class="m">8</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">-c</span></code> (grid) and <code class="docutils literal notranslate"><span class="pre">-T</span></code> (threads per block) select how many <em>issue units</em> split the
+transfer. A unit is a thread, a wavefront or a block, per <code class="docutils literal notranslate"><span class="pre">-s</span></code>. Queues are
+round-robined over the units, so only <code class="docutils literal notranslate"><span class="pre">min(units,</span> <span class="pre">MORI_SDMA_NUM_CHANNELS)</span></code> are
+actually used, and beyond that units share a queue. Omit both flags to get the
+historical geometry: one block, and one unit per queue for <code class="docutils literal notranslate"><span class="pre">-s</span> <span class="pre">thread</span></code>.</p>
+<p>Bandwidth is governed mostly by the size of each individual copy, i.e.
+<code class="docutils literal notranslate"><span class="pre">message</span> <span class="pre">/</span> <span class="pre">units</span></code>. Splitting a transfer over more units than the link needs
+makes each op smaller and costs bandwidth; it also serialises on the queues once
+units exceed the channel count.</p>
+</section>
+<section id="expected-magnitudes">
+<h2>Expected magnitudes<a class="headerlink" href="#expected-magnitudes" title="Link to this heading"></a></h2>
+<p>Rough intra-node put figures, to tell a healthy run from a broken one:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>gfx950 (MI355X)</p></th>
+<th class="head"><p>gfx1250</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>SDMA peak, <code class="docutils literal notranslate"><span class="pre">*_bw</span></code></p></td>
+<td><p>~60 GB/s</p></td>
+<td><p>~1600 GB/s</p></td>
+</tr>
+<tr class="row-odd"><td><p>SDMA 1KB round trip, <code class="docutils literal notranslate"><span class="pre">*_latency</span></code></p></td>
+<td><p>~6 us</p></td>
+<td><p>~8 us</p></td>
+</tr>
+<tr class="row-even"><td><p>SDMA 1KB issue interval, <code class="docutils literal notranslate"><span class="pre">size</span> <span class="pre">/</span> <span class="pre">*_bw</span></code></p></td>
+<td><p>~3 us</p></td>
+<td><p>~4 us</p></td>
+</tr>
+</tbody>
+</table>
+<p>The two latency rows differ because of where the completion wait sits. The
+latency benchmarks quiet after every put, so they report a full round trip. The
+bandwidth benchmarks issue the whole iteration count and quiet once at the end,
+so dividing the message size by their result gives the pipelined issue interval
+instead. Both are useful; quote which one you mean.</p>
+<p>Bandwidth differs by more than an order of magnitude between the two because of
+the interconnect, not the software. On gfx950 a single queue saturates the link
+at a few MB; on gfx1250 the link is fast enough that a single queue needs a much
+larger message, and several queues help in the middle of the range.</p>
+<p>Scope barely moves latency – warp and block issue from a leader, so the extra
+threads do not shorten the path.</p>
+</section>
+<section id="measurement-notes">
+<h2>Measurement notes<a class="headerlink" href="#measurement-notes" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p>Run one benchmark at a time. Concurrent runs contend for the same GPUs and the
+numbers are meaningless.</p></li>
+<li><p>Do a throwaway run first. The first timed run after a cold link reads low.</p></li>
+<li><p>Repeat and take a median. Run-to-run spread is well under 1% for large
+messages but reaches double digits in the steep part of the curve.</p></li>
+<li><p>Check the machine is otherwise idle (<code class="docutils literal notranslate"><span class="pre">rocm-smi</span> <span class="pre">--showpids</span></code>).</p></li>
+<li><p>C++ LSA bandwidth uses a HIP system fence and cross-block sense barrier.
+Triton mirrors both through a CCO fence wrapper and a small fully-resident
+atomic barrier, but generated instruction scheduling is not identical.</p></li>
+<li><p>The comparison intentionally fixes scope to <code class="docutils literal notranslate"><span class="pre">block</span></code>; a Triton scalar extern
+call is executed by every hardware lane and is not equivalent to CCO’s
+one-thread benchmark mode.</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="cco-examples.html" class="btn btn-neutral float-left" title="CCO examples" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="MORI-IO-GUIDE.html" class="btn btn-neutral float-right" title="MORI-IO Introduction" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.
+      <span class="lastupdated">Last updated on 2026-11-13.
+      </span></p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

@@ -6,21 +6,21 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI Fused GEMM + Collective Guide &mdash; MORI development (73c64a22) documentation</title>
+  <title>MORI-FUSED: Fused GEMM + Collective Operators &mdash; MORI development (6206eebd) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=3ea53665"></script>
+      <script src="_static/documentation_options.js?v=dff4fcea"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="MORI-IR Guide" href="MORI-IR-GUIDE.html" />
-    <link rel="prev" title="MORI CCO Guide" href="MORI-CCO-GUIDE.html" /> 
+    <link rel="next" title="GEMM + all-reduce" href="fused-gemm-ar.html" />
+    <link rel="prev" title="RDMA Bandwidth Utilization in Dispatch/Combine Kernels" href="rdma_bandwidth_utilization.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -44,496 +44,77 @@
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
               <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#installation">Installation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="installation.html#prerequisites">Prerequisites</a></li>
-<li class="toctree-l3"><a class="reference internal" href="installation.html#validate-the-environment">Validate the environment</a></li>
-<li class="toctree-l3"><a class="reference internal" href="installation.html#install">Install</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="installation.html#from-pypi-stable-release">From PyPI (stable release)</a></li>
-<li class="toctree-l4"><a class="reference internal" href="installation.html#nightly-pre-built-tested-daily">Nightly (pre-built, tested daily)</a></li>
-<li class="toctree-l4"><a class="reference internal" href="installation.html#from-source">From source</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
 </ul>
-</li>
-<li class="toctree-l3"><a class="reference internal" href="installation.html#verify-installation">Verify installation</a></li>
+<p class="caption" role="heading"><span class="caption-text">MORI-EP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">User guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an API and backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">Benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">V1 vs V2 inter-node performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA bandwidth in the kernels</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#optional-flydsl-integration">Optional FlyDSL integration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#next-steps">Next steps</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#runnable-checks">Runnable checks</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#api-sketches">API sketches</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an EP API and backend</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="ep_backends.html#epv2-configuration-and-lifecycle">EPv2 configuration and lifecycle</a></li>
-<li class="toctree-l2"><a class="reference internal" href="ep_backends.html#validation-before-tuning">Validation before tuning</a></li>
-</ul>
-</li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<p class="caption" role="heading"><span class="caption-text">MORI-FUSED</span></p>
 <ul class="current">
-<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning">10. Tuning</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#overview">Overview</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-config-files">Tuning Config Files</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node-tuning">Intra-node Tuning</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node-tuning">Inter-node Tuning</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-on-a-new-gpu-platform">Tuning on a New GPU Platform</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">11. Profiling with MORI-VIZ</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">12. Framework Integration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#rail-only-connections">Rail-only connections</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">MORI CCO Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#concepts">1. Concepts</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#communicator-ccocomm">Communicator (<code class="docutils literal notranslate"><span class="pre">ccoComm</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#symmetric-memory-and-windows">Symmetric memory and windows</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator-ccodevcomm">Device communicator (<code class="docutils literal notranslate"><span class="pre">ccoDevComm</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#teams">Teams</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#initialization">2. Initialization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#memory-and-windows">3. Memory and Windows</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator">4. Device Communicator</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#host-barrier">5. Host Barrier</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-side-programming">6. Device-Side Programming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#examples">7. Examples</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#c-api">8. C++ API</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#environment-variables">9. Environment Variables</a></li>
-</ul>
-</li>
-<li class="toctree-l1 current"><a class="current reference internal" href="#">MORI Fused GEMM + Collective Guide</a><ul>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Overview</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#performance-at-a-glance">Performance at a glance</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#what-every-operator-has-in-common">What every operator has in common</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#gemm-all-reduce-and-reduce-scatter">GEMM + all-reduce and reduce-scatter</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#gemm-all-to-all">GEMM + all-to-all</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#gemm-all-gather">GEMM + all-gather</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#all-gather-gemm">All-gather + GEMM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#all-to-all-gemm">All-to-all + GEMM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#running-the-tests-and-benchmarks">Running the tests and benchmarks</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ar.html">GEMM + all-reduce</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-rs.html">GEMM + reduce-scatter</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-a2a.html">GEMM + all-to-all</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ag.html">GEMM + all-gather</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-ag-gemm.html">All-gather + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-a2a-gemm.html">All-to-all + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-tests-and-benchmarks.html">Tests and benchmarks</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#simulation-mode">Simulation Mode</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#profiling-mori-io-with-roctx-markers">Profiling MORI-IO with ROCTX Markers</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-GUIDE.html#nic-fault-injection-test-builds">NIC fault injection (test builds)</a></li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">MORI UMBP Single-Node Smoke Test</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#overview">Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#prerequisites">Prerequisites</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#configuration-inputs">Configuration Inputs</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#script-constants">Script constants</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#runtime-environment-variables">Runtime environment variables</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#launch-steps">Launch Steps</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#core-dumps">Core Dumps</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#troubleshooting">Troubleshooting</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">UMBP storage and transfer simulation</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="umbp-simulation.html#enable">Enable</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="umbp-simulation.html#standalone-ci">Standalone / CI</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="umbp-simulation.html#profile-and-model">Profile and model</a></li>
-<li class="toctree-l2"><a class="reference internal" href="umbp-simulation.html#cross-peer-sharing">Cross-peer sharing</a></li>
-<li class="toctree-l2"><a class="reference internal" href="umbp-simulation.html#timing-and-limits">Timing and limits</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">UMBP transfer calibration</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="umbp-calibration.html#sampling">Sampling</a></li>
-<li class="toctree-l2"><a class="reference internal" href="umbp-calibration.html#ssd-configuration-and-preparation">SSD configuration and preparation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="umbp-calibration.html#profiles-and-accuracy">Profiles and accuracy</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
-</ul>
-</li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<p class="caption" role="heading"><span class="caption-text">MORI-SHMEM</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-intranode-kernels">Profiling intranode kernels</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">SHMEM guide</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#bandwidth-computation">Bandwidth Computation</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#rdma-bandwidth">RDMA bandwidth</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="MORI-EP-BENCHMARK.html#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
-</ul>
-</li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nvl-xgmi-bandwidth">NVL / XGMI bandwidth</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#combine">Combine</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-internode-kernels">Profiling Internode Kernels</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">EP V1 vs V2 Inter-node Performance (DeepSeek-R1 on MI308X, MI300X and MI355X)</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="EPv2_PERF.html#test-setup">1. Test setup</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#common-settings">1.1 Common settings</a></li>
-<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#environment-per-gpu">1.2 Environment per GPU</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="EPv2_PERF.html#overall-results">2. Overall results</a></li>
-<li class="toctree-l2"><a class="reference internal" href="EPv2_PERF.html#per-gpu-data">3. Per-GPU data</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#mi308x">3.1 MI308X</a></li>
-<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#mi300x">3.2 MI300X</a></li>
-<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#mi355x">3.3 MI355X</a></li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#which-benchmark-to-use">Which benchmark to use</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#c-benchmark-default-nixlbench-matching">C++ Benchmark (default, nixlbench-matching)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#build">Build</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#run-two-nodes">Run (two nodes)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#sweep-modes">Sweep modes</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#differences-from-the-python-flags">Differences from the Python flags</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#python-benchmark">Python Benchmark</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-tuning-guide">Benchmark Tuning Guide</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#recommended-starting-config">Recommended starting config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#parameters-that-help">Parameters that help</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#the-merged-wr-size-limit">The merged-WR size limit</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#parameters-that-usually-do-not-help-or-can-hurt">Parameters that usually do not help (or can hurt)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#host-cpu-vs-gpu-memory">Host (CPU) vs GPU memory</a></li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">MORI UMBP PD Disaggregation Benchmark</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#prerequisites">Prerequisites</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#topology">Topology</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#configuration">Configuration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-1-start-docker-on-all-nodes">Step 1 — Start Docker on all nodes</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-2-start-grafana-and-prometheus">Step 2 — Start Grafana and Prometheus</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-3-build-mori-on-all-nodes">Step 3 — Build mori on all nodes</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-4-create-launcher-scripts">Step 4 — Create launcher scripts</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-5-kill-stale-processes-and-launch-prefill">Step 5 — Kill stale processes and launch prefill</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-6-wait-for-all-prefills-ready">Step 6 — Wait for ALL prefills ready</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-7-launch-decode-and-benchmark">Step 7 — Launch decode and benchmark</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-8-monitor-decode-and-benchmark">Step 8 — Monitor decode and benchmark</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-9-show-results">Step 9 — Show results</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#teardown">Teardown</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#environment-variable-reference">Environment Variable Reference</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#topology-this-guide-s-wrapper-variables">Topology (this guide’s wrapper variables)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#umbp-mori-consumed-by-run-pd-disagg-bench-dp8ep8-sh">UMBP / mori (consumed by <code class="docutils literal notranslate"><span class="pre">run_pd_disagg_bench_dp8ep8.sh</span></code>)</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#troubleshooting">Troubleshooting</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">UMBP Distributed Tier-Management Benchmark</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#build">Build</a></li>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#run-generate-and-replay">Run, generate, and replay</a></li>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#json-backend-and-tier-policy">JSON backend and tier policy</a></li>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#synthetic-profiles">Synthetic profiles</a></li>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#trace-contract">Trace contract</a></li>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#results">Results</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA Bandwidth Utilization in Dispatch/Combine Kernels</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#overview">Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#kernel-execution-path">Kernel Execution Path</a></li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#what-rdma-actually-transfers">What RDMA Actually Transfers</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#dispatch-send-dispatchinternodesend-dispatchinternodellsend">Dispatch send (<code class="docutils literal notranslate"><span class="pre">DispatchInterNodeSend</span></code> / <code class="docutils literal notranslate"><span class="pre">DispatchInterNodeLLSend</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#combine-send-combineinternodetyped-combineinternodelltyped">Combine send (<code class="docutils literal notranslate"><span class="pre">CombineInterNodeTyped</span></code> / <code class="docutils literal notranslate"><span class="pre">CombineInterNodeLLTyped</span></code>)</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#theoretical-peak-vs-observed-throughput">Theoretical Peak vs. Observed Throughput</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#computing-theoretical-peak">Computing theoretical peak</a></li>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#understanding-the-receive-side-timing">Understanding the receive-side timing</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#how-to-check-rdma-bandwidth-from-the-trace">How to Check RDMA Bandwidth from the Trace</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-1-collect-a-profiler-trace">Step 1: Collect a profiler trace</a></li>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-2-read-key-durations-from-the-text-summary">Step 2: Read key durations from the text summary</a></li>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-3-compute-observed-rdma-bandwidth">Step 3: Compute observed RDMA bandwidth</a></li>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-4-interpret-results">Step 4: Interpret results</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#key-tuning-parameters-that-affect-rdma-utilization">Key Tuning Parameters That Affect RDMA Utilization</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#v1-vs-v1-ll-low-latency-tradeoff">v1 vs. v1_ll (low-latency) tradeoff</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#sanity-checks-from-hardware-counters-optional">Sanity Checks from Hardware Counters (optional)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#summary">Summary</a></li>
-</ul>
-</li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<p class="caption" role="heading"><span class="caption-text">MORI-CCO</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="MORI_IR_INTEGRATION.html">Mori IR Integration</a></li>
-<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">MORI JIT Compilation Framework</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#quick-start">Quick Start</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#architecture-overview">Architecture Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#packaging-how-wheel-installs-support-jit">Packaging: How Wheel Installs Support JIT</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#compilation-split-host-cxx-vs-device-jit">Compilation Split: Host CXX vs Device JIT</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-compiles-as-cxx-at-pip-install-time">What compiles as CXX (at <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span></code> time)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-compiles-as-hip-runtime-jit-only">What compiles as HIP (runtime JIT only)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#template-args-vs-raw-args">Template Args vs Raw Args</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">CCO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-device-api.html">Device API for FlyDSL and Triton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-examples.html">Examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-benchmarks.html">Benchmarks</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-gets-jit-compiled">What Gets JIT-Compiled</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#kernel-launch-flow">Kernel Launch Flow</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#hip-driver-api-python-ctypes">HIP Driver API (Python ctypes)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#triton-integration">Triton Integration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#cache-structure">Cache Structure</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#environment-variables">Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#testing">Testing</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#docker-environment">Docker Environment</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#non-editable-install-wheel">1. Non-Editable Install (Wheel)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#editable-install-development">2. Editable Install (Development)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#pre-compile-all-kernels">3. Pre-compile All Kernels</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#verify-jit-configuration">4. Verify JIT Configuration</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#verify-compilation-separation">5. Verify Compilation Separation</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#dispatch-combine-correctness">6. Dispatch/Combine Correctness</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#dispatch-combine-benchmark">7. Dispatch/Combine Benchmark</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#shmem-api">8. Shmem API</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#id1">9. Triton Integration</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#full-clean-slate-test">10. Full Clean-Slate Test</a></li>
+<p class="caption" role="heading"><span class="caption-text">MORI-IO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">IO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">Benchmark</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#kernel-source-files">Kernel Source Files</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#adding-a-new-kernel">Adding a New Kernel</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#host-device-nic-macro-separation">Host/Device NIC Macro Separation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#rocm-version-compatibility">ROCm Version Compatibility</a></li>
+<p class="caption" role="heading"><span class="caption-text">MORI-UMBP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="umbp-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-configuration.html">Configuration and environment variables</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-pure-ssd-mode.html">Pure-SSD mode and multi-drive tiers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-numa-tier-placement.html">NUMA placement for a DRAM tier</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-kv-indexer-export.html">KV indexer export</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-monitoring.html">Monitoring</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">PD disaggregation benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">Tier-management benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">Simulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">Calibration</a></li>
 </ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">MORI JIT v2</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id1">1. 核心不变量</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id2">2. 分层</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#kernel">3. 一个 kernel 的三件套</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#cfg-c-20-structural-nttp">3.1 Cfg 作为单一模板参数（C++20 structural NTTP）</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id3">3.2 字段列表的完整性是承重的</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id4">3.3 生成的源码</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id5">3.4 缓存</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#host-device-host-hipcc">3.5 host/device 常量只有一份，且 host 不需要 hipcc</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id6">3.6 环境变量</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#dtype">3.7 dtype 是传输属性，不是算术属性</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#op">4. op 层</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id7">5. 两个后端共用一个 op</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#dispatch-combine">5.1 几何调优表：每个后端一份，dispatch 和 combine 再分开</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#python">6. Python 绑定</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id8">7. 几个有证据的决定</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id9">8. 性能</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id10">9. 移植来源与覆盖范围</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id11">10. 测试</a></li>
-</ul>
-</li>
+<p class="caption" role="heading"><span class="caption-text">Tools</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ kernel profiler</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="api/communication.html#asyncll-v2-sdma-overlap">AsyncLL v2 SDMA overlap</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">Profiler API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP master client</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP Master Client</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#starting-the-master-server">Starting the Master Server</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbptiertype">UMBPTierType</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvnodematch">UMBPExternalKvNodeMatch</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpmasterclient">UMBPMasterClient</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#cache-hit-tracking">Cache Hit Tracking</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#finding-hot-kv-blocks-the-typical-workflow">Finding hot KV blocks (the typical workflow)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#lifetime-cumulative-not-a-rate">Lifetime cumulative — not a rate</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvhitcountentry">UMBPExternalKvHitCountEntry</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#usage-examples">Usage Examples</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#end-to-end-example">End-to-End Example</a></li>
-</ul>
-</li>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">JIT compilation framework</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">JIT v2 (in Chinese)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">UMBP single-node smoke test</a></li>
 </ul>
 
         </div>
@@ -550,7 +131,7 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">MORI Fused GEMM + Collective Guide</li>
+      <li class="breadcrumb-item active">MORI-FUSED: Fused GEMM + Collective Operators</li>
       <li class="wy-breadcrumbs-aside">
             <a href="_sources/MORI-CCO-FUSED-OPS-GUIDE.md.txt" rel="nofollow"> View page source</a>
       </li>
@@ -560,8 +141,8 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="mori-fused-gemm-collective-guide">
-<h1>MORI Fused GEMM + Collective Guide<a class="headerlink" href="#mori-fused-gemm-collective-guide" title="Link to this heading"></a></h1>
+  <section id="mori-fused-fused-gemm-collective-operators">
+<h1>MORI-FUSED: Fused GEMM + Collective Operators<a class="headerlink" href="#mori-fused-fused-gemm-collective-operators" title="Link to this heading"></a></h1>
 <p>MORI fuses six collective patterns with the GEMM next to them, in one node,
 over the SDMA copy engines. Each one is a Python operator built on
 <a class="reference internal" href="MORI-CCO-GUIDE.html"><span class="std std-doc">CCO</span></a> and the FlyDSL 8-wave GEMM. The operator overlaps the
@@ -621,29 +202,26 @@ transfer with the GEMM instead of running it before or after.</p>
 </tr>
 </tbody>
 </table>
-<p><code class="docutils literal notranslate"><span class="pre">P</span></code> is the number of ranks and <code class="docutils literal notranslate"><span class="pre">M</span></code> is rows per rank. Every operator also has a
-<code class="docutils literal notranslate"><span class="pre">mode=&quot;split&quot;</span></code> (GEMM and transfer run back to back over the same window) as a
-baseline and a fallback. All measurements are on <strong>MI355X (gfx950)</strong>.</p>
-<p>Each operator’s README, next to its code, has the full design, every
-measurement table and the negative results:
-<a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ar/README.md"><code class="docutils literal notranslate"><span class="pre">gemm_ar</span></code></a>,
-<a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_a2a/README.md"><code class="docutils literal notranslate"><span class="pre">gemm_a2a</span></code></a>,
-<a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ag/README.md"><code class="docutils literal notranslate"><span class="pre">gemm_ag</span></code></a>,
-<a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/ag_gemm/README.md"><code class="docutils literal notranslate"><span class="pre">ag_gemm</span></code></a>,
-<a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/a2a_gemm/README.md"><code class="docutils literal notranslate"><span class="pre">a2a_gemm</span></code></a>.
-This page covers what is common to all six, how to call each one, and the
-headline numbers.</p>
+<p><code class="docutils literal notranslate"><span class="pre">P</span></code> is the number of ranks and <code class="docutils literal notranslate"><span class="pre">M</span></code> is rows per rank. Every operator except
+<code class="docutils literal notranslate"><span class="pre">GemmAllReduceOp</span></code> and <code class="docutils literal notranslate"><span class="pre">GemmReduceScatterOp</span></code> also has a <code class="docutils literal notranslate"><span class="pre">mode=&quot;split&quot;</span></code> (GEMM and
+transfer run back to back over the same window) as a baseline and a fallback.
+All measurements are on <strong>MI355X (gfx950)</strong>.</p>
+<p>This page covers what the six have in common and the headline numbers. Each
+operator has its own page in this section, with how to call it and its
+measurements; its README, next to its code, has the full design, every
+measurement table and the negative results.</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
 <ul class="simple">
 <li><p><a class="reference internal" href="#performance-at-a-glance">Performance at a glance</a></p></li>
 <li><p><a class="reference internal" href="#what-every-operator-has-in-common">What every operator has in common</a></p></li>
-<li><p><a class="reference internal" href="#gemm-all-reduce-and-reduce-scatter">GEMM + all-reduce and reduce-scatter</a></p></li>
-<li><p><a class="reference internal" href="#gemm-all-to-all">GEMM + all-to-all</a></p></li>
-<li><p><a class="reference internal" href="#gemm-all-gather">GEMM + all-gather</a></p></li>
-<li><p><a class="reference internal" href="#all-gather-gemm">All-gather + GEMM</a></p></li>
-<li><p><a class="reference internal" href="#all-to-all-gemm">All-to-all + GEMM</a></p></li>
-<li><p><a class="reference internal" href="#running-the-tests-and-benchmarks">Running the tests and benchmarks</a></p></li>
+<li><p><a class="reference internal" href="fused-gemm-ar.html"><span class="std std-doc">GEMM + all-reduce</span></a></p></li>
+<li><p><a class="reference internal" href="fused-gemm-rs.html"><span class="std std-doc">GEMM + reduce-scatter</span></a></p></li>
+<li><p><a class="reference internal" href="fused-gemm-a2a.html"><span class="std std-doc">GEMM + all-to-all</span></a></p></li>
+<li><p><a class="reference internal" href="fused-gemm-ag.html"><span class="std std-doc">GEMM + all-gather</span></a></p></li>
+<li><p><a class="reference internal" href="fused-ag-gemm.html"><span class="std std-doc">All-gather + GEMM</span></a></p></li>
+<li><p><a class="reference internal" href="fused-a2a-gemm.html"><span class="std std-doc">All-to-all + GEMM</span></a></p></li>
+<li><p><a class="reference internal" href="fused-tests-and-benchmarks.html"><span class="std std-doc">Running the tests and benchmarks</span></a></p></li>
 </ul>
 </section>
 <section id="performance-at-a-glance">
@@ -651,7 +229,7 @@ headline numbers.</p>
 <p>The best fused result at each operator’s largest measured model shape, against
 the unfused path a serving stack runs today: the GEMM, then the RCCL/NCCL
 collective. Each row comes from its own operator’s measurements, on its own
-date and timing method (in the sections below). Read the rows separately and
+date and timing method (on the operator pages). Read the rows separately and
 do not average them. Times in µs; negative is faster.</p>
 <table class="docutils align-default">
 <thead>
@@ -727,12 +305,15 @@ grid covers every CU and splits below that.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">AgGemmOp</span></code> and <code class="docutils literal notranslate"><span class="pre">A2aGemmOp</span></code> pick fewer bands at small M.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">GemmAllReduceOp</span></code> is fused by SGLang only above a per-wire M floor.</p></li>
 </ul>
-<p>The per-operator sections give the small-M numbers.</p>
+<p>The operator pages give the small-M numbers.</p>
 </section>
 <section id="what-every-operator-has-in-common">
 <h2>What every operator has in common<a class="headerlink" href="#what-every-operator-has-in-common" title="Link to this heading"></a></h2>
-<p><strong>Build and environment.</strong> Every operator moves data with the SDMA copy
-engines. That needs:</p>
+<p><strong>Build and environment.</strong> The GEMMs are FlyDSL kernels written for gfx950
+(MI355X), so every operator needs FlyDSL, which is an optional extra
+(<code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'amd_mori[flydsl]'</span></code>). Every operator moves data with the SDMA
+copy engines (one exception: <code class="docutils literal notranslate"><span class="pre">GemmAllReduceOp</span></code>’s fp8 gather is, by default, a
+pull by the CUs over LSA, <code class="docutils literal notranslate"><span class="pre">gather_transport=&quot;lsa&quot;</span></code>). That needs:</p>
 <ul class="simple">
 <li><p>a MORI built with <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code> (the default);</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code> at run time;</p></li>
@@ -742,8 +323,11 @@ engines. That needs:</p>
 that library has no SDMA queues, every put silently does nothing, and the
 result is wrong rather than an error. Each operator’s <code class="docutils literal notranslate"><span class="pre">self_test()</span></code> checks
 this. It is a collective, so call it on every rank once after construction.
-The constructors also refuse a communicator without the SDMA queues they need.
-The standalone <code class="docutils literal notranslate"><span class="pre">Mxfp8GemmOp</span></code> / <code class="docutils literal notranslate"><span class="pre">Mxfp8GemvOp</span></code> move no data and need neither.</p>
+The <code class="docutils literal notranslate"><span class="pre">GemmA2AOp</span></code>, <code class="docutils literal notranslate"><span class="pre">GemmAgOp</span></code>, <code class="docutils literal notranslate"><span class="pre">AgGemmOp</span></code> and <code class="docutils literal notranslate"><span class="pre">A2aGemmOp</span></code> constructors also
+refuse a communicator without the SDMA queues they need; <code class="docutils literal notranslate"><span class="pre">GemmAllReduceOp</span></code>
+and <code class="docutils literal notranslate"><span class="pre">GemmReduceScatterOp</span></code> do not check, so for them <code class="docutils literal notranslate"><span class="pre">self_test()</span></code> is the only
+guard. The standalone <code class="docutils literal notranslate"><span class="pre">Mxfp8GemmOp</span></code> / <code class="docutils literal notranslate"><span class="pre">Mxfp8GemvOp</span></code> move no data and need no
+SDMA.</p>
 <p><strong>A window sized up front.</strong> Each operator owns a symmetric window inside the
 communicator’s VMM reservation, and the window cannot grow. Size the
 reservation from the operator’s static <code class="docutils literal notranslate"><span class="pre">window_bytes_for(...)</span></code>, called with
@@ -757,7 +341,7 @@ largest per-rank M the deployment will see:</p>
 <span class="n">uid</span> <span class="o">=</span> <span class="p">[</span><span class="nb">bytes</span><span class="p">(</span><span class="n">Communicator</span><span class="o">.</span><span class="n">get_unique_id</span><span class="p">())</span> <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span><span class="p">]</span>
 <span class="n">dist</span><span class="o">.</span><span class="n">broadcast_object_list</span><span class="p">(</span><span class="n">uid</span><span class="p">,</span> <span class="n">src</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
 
-<span class="n">vmm</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">Op</span><span class="o">.</span><span class="n">window_bytes_for</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="mi">256</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">)</span>   <span class="c1"># Op: any operator below</span>
+<span class="n">vmm</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">Op</span><span class="o">.</span><span class="n">window_bytes_for</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="mi">256</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">)</span>   <span class="c1"># Op: any of the six operators</span>
 <span class="k">with</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">init</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">UniqueId</span><span class="o">.</span><span class="n">from_bytes</span><span class="p">(</span><span class="n">uid</span><span class="p">[</span><span class="mi">0</span><span class="p">]),</span> <span class="n">per_rank_vmm</span><span class="o">=</span><span class="n">vmm</span><span class="p">)</span> <span class="k">as</span> <span class="n">comm</span><span class="p">:</span>
     <span class="k">with</span> <span class="n">Op</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="o">...</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="n">M_MAX</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>
         <span class="n">op</span><span class="o">.</span><span class="n">self_test</span><span class="p">()</span>
@@ -810,7 +394,9 @@ Synchronise first if a call may still be in flight. The communicator holds a
 reference, so dropping the Python object does not free it.</p>
 <p><strong>fp8 operands.</strong> The fp8 operators take <code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fn</span></code> and reject
 <code class="docutils literal notranslate"><span class="pre">float8_e4m3fnuz</span></code>. The weight goes in once through
-<code class="docutils literal notranslate"><span class="pre">mori.ops.gemm_ar.preshuffle_b</span></code>. Scales follow the <code class="docutils literal notranslate"><span class="pre">quant</span></code> contract:</p>
+<code class="docutils literal notranslate"><span class="pre">mori.ops.gemm_ar.preshuffle_b</span></code>. Quantising the activations is the caller’s
+job: the examples on the operator pages call <code class="docutils literal notranslate"><span class="pre">quantize_*</span></code> functions that stand for your own
+quantiser and are not part of MORI. Scales follow the <code class="docutils literal notranslate"><span class="pre">quant</span></code> contract:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">ptpc</span></code>: <code class="docutils literal notranslate"><span class="pre">a_scale</span> <span class="pre">[M]</span></code> and <code class="docutils literal notranslate"><span class="pre">b_scale</span> <span class="pre">[N]</span></code>, fp32.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">blockscale</span></code>: A 1x128 and B 128x128, fp32. <code class="docutils literal notranslate"><span class="pre">a_scale</span></code> is <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K/128]</span></code>
@@ -819,530 +405,14 @@ column-major, flat, or <code class="docutils literal notranslate"><span class="p
 <code class="docutils literal notranslate"><span class="pre">b_scale</span></code> is the <code class="docutils literal notranslate"><span class="pre">[N/32,</span> <span class="pre">K/32]</span></code> bytes K-block-major as int32.</p></li>
 </ul>
 </section>
-<section id="gemm-all-reduce-and-reduce-scatter">
-<h2>GEMM + all-reduce and reduce-scatter<a class="headerlink" href="#gemm-all-reduce-and-reduce-scatter" title="Link to this heading"></a></h2>
-<p><code class="docutils literal notranslate"><span class="pre">GemmAllReduceOp</span></code> writes the GEMM’s C straight into the window. The copy
-engine pushes each destination’s slice as soon as its last tile is written,
-so the reduce-scatter half of the all-reduce overlaps the rest of the GEMM.
-The reduce and all-gather run after it. <code class="docutils literal notranslate"><span class="pre">GemmReduceScatterOp</span></code> is the same
-pipeline stopped before the gather: rank <code class="docutils literal notranslate"><span class="pre">r</span></code> keeps rows <code class="docutils literal notranslate"><span class="pre">r*M/P</span></code> onward of the
-sum, the dim-0 split <code class="docutils literal notranslate"><span class="pre">reduce_scatter_tensor</span></code> makes.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.gemm_ar</span><span class="w"> </span><span class="kn">import</span> <span class="n">GemmAllReduceOp</span><span class="p">,</span> <span class="n">GemmReduceScatterOp</span><span class="p">,</span> <span class="n">preshuffle_b</span>
-
-<span class="k">with</span> <span class="n">GemmAllReduceOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">7168</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="mi">16384</span><span class="p">,</span> <span class="n">quant</span><span class="o">=</span><span class="s2">"blockscale"</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>
-    <span class="n">b_shuffled</span> <span class="o">=</span> <span class="n">preshuffle_b</span><span class="p">(</span><span class="n">b_fp8</span><span class="p">)</span>                       <span class="c1"># once per weight</span>
-    <span class="n">m_pad</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">padded_m</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
-    <span class="n">a_fp8</span><span class="p">,</span> <span class="n">a_scale</span> <span class="o">=</span> <span class="n">quantize_per_1x128</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">pad_rows</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">m_pad</span><span class="p">))</span>
-    <span class="n">out</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">a_fp8</span><span class="p">,</span> <span class="n">b_shuffled</span><span class="p">,</span> <span class="n">a_scale</span><span class="p">,</span> <span class="n">b_scale</span><span class="p">)[:</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span>   <span class="c1"># [M, N] bf16</span>
-
-<span class="k">with</span> <span class="n">GemmReduceScatterOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">5120</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="mi">16384</span><span class="p">,</span> <span class="n">quant</span><span class="o">=</span><span class="s2">"mxfp8"</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>
-    <span class="n">band</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">a_fp8</span><span class="p">,</span> <span class="n">b_shuffled</span><span class="p">,</span> <span class="n">a_scale</span><span class="p">,</span> <span class="n">b_scale</span><span class="p">)</span>         <span class="c1"># [m_pad / P, N]</span>
-</pre></div>
-</div>
-<ul class="simple">
-<li><p><strong>Quantisation</strong>: <code class="docutils literal notranslate"><span class="pre">quant=&quot;blockscale&quot;</span></code> (the default), <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8&quot;</span></code>,
-<code class="docutils literal notranslate"><span class="pre">&quot;mxfp8_raw&quot;</span></code> (row-major uint8 scales staged through LDS), <code class="docutils literal notranslate"><span class="pre">&quot;ptpc&quot;</span></code>.</p></li>
-<li><p><strong>fp8 on the wire</strong> (all-reduce only): <code class="docutils literal notranslate"><span class="pre">gather_dtype=&quot;fp8&quot;</span></code> sends the
-all-gather leg as e4m3 with one fp32 scale per row, halving its bytes.
-<code class="docutils literal notranslate"><span class="pre">gather_transport=&quot;lsa&quot;</span></code> lets the CUs pull and widen in one step. This is
-lossy: relL2 2.5e-2 against 2.4e-3 with a bf16 wire.</p></li>
-<li><p><strong>Shapes</strong>: K a multiple of 128 and at least 256; N a multiple of 256 (and
-of 1024 with an fp8 gather); 2 to 8 ranks.</p></li>
-<li><p><strong><code class="docutils literal notranslate"><span class="pre">schedule=&quot;wo_b&quot;</span></code></strong> selects the measured padding and chunk profile for the
-two <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> targets below. Pass <code class="docutils literal notranslate"><span class="pre">logical_m=</span></code> to the call when using it.</p></li>
-<li><p><strong>Standalone GEMM</strong>: <code class="docutils literal notranslate"><span class="pre">Mxfp8GemmOp</span></code> and <code class="docutils literal notranslate"><span class="pre">Mxfp8GemvOp</span></code> (decode, M ≤ 32) are
-the same mxfp8 GEMM with nothing fused, for a ColumnParallelLinear that has
-no collective to fuse with.</p></li>
-</ul>
-<p><strong>GEMM + all-reduce</strong>, <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> at M=16384, maximum over ranks. µs. V4-Pro is
-on 8x MI355X, median of 11. V4.1-Flash is on 4x MI355X, from the README’s
-fp8-wire comparison; its fused bf16-wire cell comes from a different run and is
-left out here:</p>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p></p></th>
-<th class="head text-right"><p>DeepSeek-V4-Pro (TP8, blockscale)</p></th>
-<th class="head text-right"><p>DeepSeek-V4.1-Flash (TP4, mxfp8)</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>split SDMA, bf16 wire</p></td>
-<td class="text-right"><p>1472.9</p></td>
-<td class="text-right"><p>1592.5</p></td>
-</tr>
-<tr class="row-odd"><td><p>fused, bf16 wire</p></td>
-<td class="text-right"><p>1148.8</p></td>
-<td class="text-right"><p>—</p></td>
-</tr>
-<tr class="row-even"><td><p>fused, fp8 wire</p></td>
-<td class="text-right"><p><strong>979.3</strong></p></td>
-<td class="text-right"><p><strong>1192.1</strong> (over LSA)</p></td>
-</tr>
-<tr class="row-odd"><td><p>GEMM + NCCL, as the model ships</p></td>
-<td class="text-right"><p>1419.5</p></td>
-<td class="text-right"><p>—</p></td>
-</tr>
-</tbody>
-</table>
-<p>The two models do not reach the same conclusion. On V4-Pro the overlap
-dominates. On V4.1-Flash the GEMM is 178 µs against 1414 µs of communication,
-so most of the gain comes from the fp8 wire (-15.6% on its own) and the mxfp8
-GEMM, not from fusing. In an SGLang server, V4.1-Flash prefill throughput at
-batch 4-16 rises <strong>+5.6% to +6.0%</strong> with the fused <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> on the fp8 wire and
-<strong>+7.4% to +7.7%</strong> with the standalone mxfp8 GEMM added. V4-Pro’s GPU-busy time
-over a profiled prefill falls <strong>5.0%</strong>.</p>
-<p><strong>GEMM + reduce-scatter</strong>, DeepSeek-V4.1-Flash <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> (N=5120, K=2048, mxfp8)
-on 4x MI355X. Graph replay, maximum over ranks, median of 3 interleaved
-rounds. µs:</p>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head text-right"><p>M</p></th>
-<th class="head text-right"><p>GEMM only</p></th>
-<th class="head text-right"><p>GEMM + <code class="docutils literal notranslate"><span class="pre">reduce_scatter_tensor</span></code></p></th>
-<th class="head text-right"><p>split SDMA</p></th>
-<th class="head text-right"><p>fused</p></th>
-<th class="head text-right"><p>vs RCCL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td class="text-right"><p>2048</p></td>
-<td class="text-right"><p>39.6</p></td>
-<td class="text-right"><p>161.7</p></td>
-<td class="text-right"><p>152.8</p></td>
-<td class="text-right"><p>156.6</p></td>
-<td class="text-right"><p>-3.2%</p></td>
-</tr>
-<tr class="row-odd"><td class="text-right"><p>4096</p></td>
-<td class="text-right"><p>66.4</p></td>
-<td class="text-right"><p>295.4</p></td>
-<td class="text-right"><p>269.9</p></td>
-<td class="text-right"><p><strong>262.9</strong></p></td>
-<td class="text-right"><p>-11.0%</p></td>
-</tr>
-<tr class="row-even"><td class="text-right"><p>8192</p></td>
-<td class="text-right"><p>104.4</p></td>
-<td class="text-right"><p>540.5</p></td>
-<td class="text-right"><p>484.2</p></td>
-<td class="text-right"><p><strong>460.2</strong></p></td>
-<td class="text-right"><p>-14.9%</p></td>
-</tr>
-<tr class="row-odd"><td class="text-right"><p>16384</p></td>
-<td class="text-right"><p>174.9</p></td>
-<td class="text-right"><p>1065.3</p></td>
-<td class="text-right"><p>917.3</p></td>
-<td class="text-right"><p><strong>834.5</strong></p></td>
-<td class="text-right"><p><strong>-21.7%</strong></p></td>
-</tr>
-</tbody>
-</table>
-</section>
-<section id="gemm-all-to-all">
-<h2>GEMM + all-to-all<a class="headerlink" href="#gemm-all-to-all" title="Link to this heading"></a></h2>
-<p><code class="docutils literal notranslate"><span class="pre">GemmA2AOp</span></code>: every rank computes the whole <code class="docutils literal notranslate"><span class="pre">C</span> <span class="pre">=</span> <span class="pre">A</span> <span class="pre">&#64;</span> <span class="pre">B.T</span></code> and sends column
-block <code class="docutils literal notranslate"><span class="pre">j</span></code> to rank <code class="docutils literal notranslate"><span class="pre">j</span></code>. Rank <code class="docutils literal notranslate"><span class="pre">d</span></code> gets <code class="docutils literal notranslate"><span class="pre">[P*M,</span> <span class="pre">N/P]</span></code>, source rank <code class="docutils literal notranslate"><span class="pre">r</span></code> at rows
-<code class="docutils literal notranslate"><span class="pre">[r*M,</span> <span class="pre">(r+1)*M)</span></code>. This is a QKV projection under Ulysses sequence
-parallelism: N is the QKV width, <code class="docutils literal notranslate"><span class="pre">N/P</span></code> one rank’s head shard, and <code class="docutils literal notranslate"><span class="pre">M</span> <span class="pre">=</span> <span class="pre">S/P</span></code>.
-The epilogue stages C per destination, and the copy engine pushes each chunk
-as soon as its tiles are done.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.gemm_a2a</span><span class="w"> </span><span class="kn">import</span> <span class="n">GemmA2AOp</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.gemm_ar</span><span class="w"> </span><span class="kn">import</span> <span class="n">preshuffle_b</span>
-
-<span class="k">with</span> <span class="n">GemmA2AOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">10240</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">8192</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="mi">16384</span><span class="p">,</span> <span class="n">quant</span><span class="o">=</span><span class="s2">"ptpc"</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>
-    <span class="n">op</span><span class="o">.</span><span class="n">self_test</span><span class="p">()</span>
-    <span class="n">b_shuffled</span> <span class="o">=</span> <span class="n">preshuffle_b</span><span class="p">(</span><span class="n">w_qkv</span><span class="p">)</span>                       <span class="c1"># [N, K], same on every rank</span>
-    <span class="n">m</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">padded_m</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
-    <span class="n">a_fp8</span><span class="p">,</span> <span class="n">a_scale</span> <span class="o">=</span> <span class="n">quantize_per_token</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">pad_rows</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">m</span><span class="p">))</span>
-    <span class="n">qkv</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">a_fp8</span><span class="p">,</span> <span class="n">b_shuffled</span><span class="p">,</span> <span class="n">a_scale</span><span class="p">,</span> <span class="n">b_scale</span><span class="p">)</span>          <span class="c1"># [P*m, N/P] bf16</span>
-</pre></div>
-</div>
-<ul class="simple">
-<li><p><strong>Quantisation</strong>: <code class="docutils literal notranslate"><span class="pre">ptpc</span></code> or <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code>.</p></li>
-<li><p><strong>Shapes</strong>: N a multiple of <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">*</span> <span class="pre">256</span></code>, so each destination’s columns are
-whole GEMM tiles. At P=8 that is N a multiple of 2048, which Llama-3.1-8B /
-70B / 405B, Qwen2.5-72B and Qwen3-32B satisfy. A model with fewer KV heads
-than ranks (Qwen3-235B at P=8) does not fit.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">chunks=</span></code> pins the number of pushes per destination; the tile and the chunk
-count are otherwise picked from M.</p></li>
-</ul>
-<p>8x MI355X, fp8 ptpc in, bf16 out. Every case ran in one process, with three
-interleaved rounds and a median launch gap, maximum over ranks. µs:</p>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p>Shape</p></th>
-<th class="head text-right"><p>M (S)</p></th>
-<th class="head text-right"><p>GEMM only</p></th>
-<th class="head text-right"><p>split SDMA</p></th>
-<th class="head text-right"><p>split RCCL</p></th>
-<th class="head text-right"><p>best fused</p></th>
-<th class="head text-right"><p>vs split SDMA</p></th>
-<th class="head text-right"><p>vs RCCL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>Llama-3.1-70B, N=10240 K=8192</p></td>
-<td class="text-right"><p>2048 (16k)</p></td>
-<td class="text-right"><p>151</p></td>
-<td class="text-right"><p>244</p></td>
-<td class="text-right"><p>344</p></td>
-<td class="text-right"><p><strong>203</strong></p></td>
-<td class="text-right"><p>-16.6%</p></td>
-<td class="text-right"><p>-40.9%</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td class="text-right"><p>4096 (32k)</p></td>
-<td class="text-right"><p>257</p></td>
-<td class="text-right"><p>441</p></td>
-<td class="text-right"><p>513</p></td>
-<td class="text-right"><p><strong>328</strong></p></td>
-<td class="text-right"><p>-25.5%</p></td>
-<td class="text-right"><p>-36.0%</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td class="text-right"><p>8192 (64k)</p></td>
-<td class="text-right"><p>451</p></td>
-<td class="text-right"><p>813</p></td>
-<td class="text-right"><p>930</p></td>
-<td class="text-right"><p><strong>578</strong></p></td>
-<td class="text-right"><p>-28.8%</p></td>
-<td class="text-right"><p>-37.8%</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td class="text-right"><p>16384 (128k)</p></td>
-<td class="text-right"><p>918</p></td>
-<td class="text-right"><p>1619</p></td>
-<td class="text-right"><p>1824</p></td>
-<td class="text-right"><p><strong>1138</strong></p></td>
-<td class="text-right"><p><strong>-29.7%</strong></p></td>
-<td class="text-right"><p>-37.6%</p></td>
-</tr>
-<tr class="row-even"><td><p>Llama-3.1-405B, N=18432 K=16384</p></td>
-<td class="text-right"><p>2048 (16k)</p></td>
-<td class="text-right"><p>502</p></td>
-<td class="text-right"><p>681</p></td>
-<td class="text-right"><p>738</p></td>
-<td class="text-right"><p><strong>568</strong></p></td>
-<td class="text-right"><p>-16.6%</p></td>
-<td class="text-right"><p>-23.1%</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td class="text-right"><p>16384 (128k)</p></td>
-<td class="text-right"><p>3383</p></td>
-<td class="text-right"><p>4694</p></td>
-<td class="text-right"><p>4998</p></td>
-<td class="text-right"><p><strong>3678</strong></p></td>
-<td class="text-right"><p><strong>-21.6%</strong></p></td>
-<td class="text-right"><p>-26.4%</p></td>
-</tr>
-</tbody>
-</table>
-<p>The mxfp8 path gains 11-24% over split SDMA at the same shapes. On MiniMax-M3’s
-QKV at P=4, the operator’s defaults are 1.6-10.4% ahead of aiter’s fused
-<code class="docutils literal notranslate"><span class="pre">sp_qkv</span></code> kernels.</p>
-</section>
-<section id="gemm-all-gather">
-<h2>GEMM + all-gather<a class="headerlink" href="#gemm-all-gather" title="Link to this heading"></a></h2>
-<p><code class="docutils literal notranslate"><span class="pre">GemmAgOp</span></code>: every rank computes <code class="docutils literal notranslate"><span class="pre">C</span> <span class="pre">=</span> <span class="pre">A</span> <span class="pre">&#64;</span> <span class="pre">B.T</span></code> on its own rows and every rank
-receives <code class="docutils literal notranslate"><span class="pre">[P*M,</span> <span class="pre">N]</span></code>, source rank <code class="docutils literal notranslate"><span class="pre">r</span></code> at rows <code class="docutils literal notranslate"><span class="pre">[r*M,</span> <span class="pre">(r+1)*M)</span></code>. It was built
-for DeepSeek-V4’s compressor <code class="docutils literal notranslate"><span class="pre">wkv_gate</span></code>, a projection on a context-parallel
-token shard whose output every rank consumes. The GEMM writes C into this
-rank’s receive slot, and its epilogue pushes each finished chunk of rows to
-every peer.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.gemm_ag</span><span class="w"> </span><span class="kn">import</span> <span class="n">GemmAgOp</span>
-
-<span class="n">N</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">M_MAX</span> <span class="o">=</span> <span class="mi">2048</span><span class="p">,</span> <span class="mi">7168</span><span class="p">,</span> <span class="mi">16384</span>
-<span class="n">vmm</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">GemmAgOp</span><span class="o">.</span><span class="n">window_bytes_for</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="n">N</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="n">M_MAX</span><span class="p">,</span> <span class="n">out_dtype</span><span class="o">=</span><span class="s2">"fp32"</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="mi">256</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">)</span>
-<span class="k">with</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">init</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">uid</span><span class="p">,</span> <span class="n">per_rank_vmm</span><span class="o">=</span><span class="n">vmm</span><span class="p">)</span> <span class="k">as</span> <span class="n">comm</span><span class="p">:</span>
-    <span class="k">with</span> <span class="n">GemmAgOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="n">N</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">K</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="n">M_MAX</span><span class="p">,</span> <span class="n">in_dtype</span><span class="o">=</span><span class="s2">"bf16"</span><span class="p">,</span> <span class="n">out_dtype</span><span class="o">=</span><span class="s2">"fp32"</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>
-        <span class="n">op</span><span class="o">.</span><span class="n">self_test</span><span class="p">()</span>
-        <span class="n">m</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">padded_m</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
-        <span class="n">c</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">pad_rows</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">m</span><span class="p">),</span> <span class="n">w</span><span class="p">)</span>                       <span class="c1"># [P*m, N] fp32</span>
-</pre></div>
-</div>
-<ul class="simple">
-<li><p><strong>Precisions</strong>: <code class="docutils literal notranslate"><span class="pre">in_dtype=&quot;bf16&quot;</span></code> takes bf16 <code class="docutils literal notranslate"><span class="pre">a</span></code>/<code class="docutils literal notranslate"><span class="pre">b</span></code> (plain row-major
-weight), no scales, and returns bf16 or fp32. <code class="docutils literal notranslate"><span class="pre">in_dtype=&quot;fp8&quot;</span></code> takes
-<code class="docutils literal notranslate"><span class="pre">quant</span></code> = <code class="docutils literal notranslate"><span class="pre">ptpc</span></code> / <code class="docutils literal notranslate"><span class="pre">blockscale</span></code> / <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code> exactly as <code class="docutils literal notranslate"><span class="pre">GemmAllReduceOp</span></code> does,
-and returns bf16.</p></li>
-<li><p><strong><code class="docutils literal notranslate"><span class="pre">mode=&quot;auto&quot;</span></code></strong> (the default) fuses an M once <code class="docutils literal notranslate"><span class="pre">ceil(M/256)</span> <span class="pre">*</span> <span class="pre">ceil(N/256)</span></code>
-is at least the device’s CU count, and splits below that, per M on one
-instance. <code class="docutils literal notranslate"><span class="pre">&quot;fused&quot;</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;split&quot;</span></code> pin a path.</p></li>
-<li><p><strong>Shapes</strong>: N a multiple of 256. K a multiple of 128 (fp8, at least 256) or
-of 64 (bf16, at least 128). M a multiple of 128 (256 under mxfp8).</p></li>
-</ul>
-<p>Through the operator, Pro <code class="docutils literal notranslate"><span class="pre">wkv_gate</span></code> (bf16 in, fp32 out). Graph-timed, maximum
-over ranks. µs:</p>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head text-right"><p>P</p></th>
-<th class="head text-right"><p>M</p></th>
-<th class="head text-right"><p><code class="docutils literal notranslate"><span class="pre">auto</span></code></p></th>
-<th class="head text-right"><p>fused</p></th>
-<th class="head text-right"><p>split</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td class="text-right"><p>8</p></td>
-<td class="text-right"><p>2048</p></td>
-<td class="text-right"><p><strong>351.3</strong> (split)</p></td>
-<td class="text-right"><p>362.8</p></td>
-<td class="text-right"><p>351.3</p></td>
-</tr>
-<tr class="row-odd"><td class="text-right"><p>8</p></td>
-<td class="text-right"><p>4096</p></td>
-<td class="text-right"><p><strong>666.2</strong> (split)</p></td>
-<td class="text-right"><p>685.5</p></td>
-<td class="text-right"><p>666.1</p></td>
-</tr>
-<tr class="row-even"><td class="text-right"><p>8</p></td>
-<td class="text-right"><p>8192</p></td>
-<td class="text-right"><p><strong>1239.2</strong> (fused)</p></td>
-<td class="text-right"><p>1240.0</p></td>
-<td class="text-right"><p>1288.7</p></td>
-</tr>
-<tr class="row-odd"><td class="text-right"><p>4</p></td>
-<td class="text-right"><p>8192</p></td>
-<td class="text-right"><p><strong>1231.3</strong> (fused)</p></td>
-<td class="text-right"><p>1231.3</p></td>
-<td class="text-right"><p>1282.2</p></td>
-</tr>
-</tbody>
-</table>
-<p>Against Torch + RCCL on the same shapes (8x MI355X, three interleaved rounds),
-the best MORI path is 10-16% faster on V4-Pro and 6-11% faster on V4.1-Flash.
-For V4-Pro: M=2048 373.4 against 415.1 µs; M=16384 2527.7 against 3008.2 µs.
-The steady part is the transport: SDMA’s all-gather alone is about 13% faster
-than RCCL’s.</p>
-</section>
-<section id="all-gather-gemm">
-<h2>All-gather + GEMM<a class="headerlink" href="#all-gather-gemm" title="Link to this heading"></a></h2>
-<p><code class="docutils literal notranslate"><span class="pre">AgGemmOp</span></code>: sequence parallelism leaves every rank with its own tokens
-<code class="docutils literal notranslate"><span class="pre">A_r</span> <span class="pre">[M,</span> <span class="pre">K]</span></code>, and a ColumnParallelLinear needs every rank’s tokens times this
-rank’s weight shard: <code class="docutils literal notranslate"><span class="pre">C_r</span> <span class="pre">=</span> <span class="pre">concat_s(A_s)</span> <span class="pre">&#64;</span> <span class="pre">B_r.T</span></code>, <code class="docutils literal notranslate"><span class="pre">[P*M,</span> <span class="pre">N]</span></code>. The copy
-engines push this rank’s rows to every peer in row bands. The GEMM starts on
-its own rows, and each remote tile starts as soon as the band it needs has
-landed.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.ag_gemm</span><span class="w"> </span><span class="kn">import</span> <span class="n">AgGemmOp</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.gemm_ar</span><span class="w"> </span><span class="kn">import</span> <span class="n">preshuffle_b</span>
-
-<span class="n">N</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">M_MAX</span> <span class="o">=</span> <span class="mi">6288</span><span class="p">,</span> <span class="mi">7168</span><span class="p">,</span> <span class="mi">4096</span>
-<span class="n">vmm</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">AgGemmOp</span><span class="o">.</span><span class="n">window_bytes_for</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">K</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="n">M_MAX</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="mi">256</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">)</span>
-<span class="k">with</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">init</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">uid</span><span class="p">,</span> <span class="n">per_rank_vmm</span><span class="o">=</span><span class="n">vmm</span><span class="p">)</span> <span class="k">as</span> <span class="n">comm</span><span class="p">:</span>
-    <span class="k">with</span> <span class="n">AgGemmOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="n">N</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">K</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="n">M_MAX</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>
-        <span class="n">op</span><span class="o">.</span><span class="n">self_test</span><span class="p">()</span>
-        <span class="n">b_shuffled</span> <span class="o">=</span> <span class="n">preshuffle_b</span><span class="p">(</span><span class="n">b_fp8</span><span class="p">)</span>                   <span class="c1"># this rank's [N, K] shard</span>
-        <span class="n">m</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">padded_m</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
-        <span class="n">rows</span><span class="p">,</span> <span class="n">scales</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">local_rows</span><span class="p">(</span><span class="n">m</span><span class="p">)</span>                    <span class="c1"># quantise straight into the window</span>
-        <span class="n">quantize_per_token_into</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">pad_rows</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">m</span><span class="p">),</span> <span class="n">rows</span><span class="p">,</span> <span class="n">scales</span><span class="p">)</span>
-        <span class="n">c</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">rows</span><span class="p">,</span> <span class="n">b_shuffled</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">b_scale</span><span class="p">)</span>          <span class="c1"># [P*m, N] bf16</span>
-</pre></div>
-</div>
-<ul class="simple">
-<li><p><strong>Quantisation</strong>: fp8 ptpc. The per-token A scale travels with its rows.</p></li>
-<li><p><strong>Shapes</strong>: N any multiple of 16. The last column tile is masked, so a
-shard like 6288 goes in without padding the weight. M a multiple of 256.</p></li>
-<li><p><strong>Zero copy</strong>: <code class="docutils literal notranslate"><span class="pre">local_rows(m)</span></code> is this rank’s slot in the window. Quantising
-into it skips the copy into the window, and <code class="docutils literal notranslate"><span class="pre">out=</span></code> skips the copy out.</p></li>
-<li><p><strong>Bands</strong>: by default the most bands per peer, up to 4, that still hold 20
-output tiles each. <code class="docutils literal notranslate"><span class="pre">chunks=</span></code> pins the count.</p></li>
-</ul>
-<p>Kimi-K3 column-parallel projections at TP8 (K=7168), fp8 in, bf16 out, 8x
-MI355X. Median of 2 interleaved rounds, maximum over ranks. µs:</p>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p>Projection</p></th>
-<th class="head text-right"><p>global M</p></th>
-<th class="head text-right"><p>split RCCL</p></th>
-<th class="head text-right"><p>split SDMA</p></th>
-<th class="head text-right"><p>best fused</p></th>
-<th class="head text-right"><p>vs split SDMA</p></th>
-<th class="head text-right"><p>vs RCCL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>KDA, N=6400</p></td>
-<td class="text-right"><p>4096</p></td>
-<td class="text-right"><p>257.5</p></td>
-<td class="text-right"><p>258.7</p></td>
-<td class="text-right"><p><strong>237.9</strong></p></td>
-<td class="text-right"><p>-8.0%</p></td>
-<td class="text-right"><p>-7.6%</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td class="text-right"><p>32768</p></td>
-<td class="text-right"><p>1751.5</p></td>
-<td class="text-right"><p>1693.1</p></td>
-<td class="text-right"><p><strong>1322.3</strong></p></td>
-<td class="text-right"><p>-21.9%</p></td>
-<td class="text-right"><p>-24.5%</p></td>
-</tr>
-<tr class="row-even"><td><p>MLA, N=3840</p></td>
-<td class="text-right"><p>4096</p></td>
-<td class="text-right"><p>188.2</p></td>
-<td class="text-right"><p>178.8</p></td>
-<td class="text-right"><p><strong>176.8</strong></p></td>
-<td class="text-right"><p>-1.1%</p></td>
-<td class="text-right"><p>-6.1%</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td class="text-right"><p>32768</p></td>
-<td class="text-right"><p>1316.6</p></td>
-<td class="text-right"><p>1212.5</p></td>
-<td class="text-right"><p><strong>896.9</strong></p></td>
-<td class="text-right"><p>-26.0%</p></td>
-<td class="text-right"><p><strong>-31.9%</strong></p></td>
-</tr>
-</tbody>
-</table>
-</section>
-<section id="all-to-all-gemm">
-<h2>All-to-all + GEMM<a class="headerlink" href="#all-to-all-gemm" title="Link to this heading"></a></h2>
-<p><code class="docutils literal notranslate"><span class="pre">A2aGemmOp</span></code>: after Ulysses attention every rank holds every token for its own
-head shard, <code class="docutils literal notranslate"><span class="pre">[P*M,</span> <span class="pre">K/P]</span></code>. The o-projection needs this rank’s M tokens over all
-of K. Block 0 of the GEMM posts every band to every peer. The GEMM starts on
-this rank’s own K segment, and each remote segment is read as soon as its band
-of rows has landed. This is the reverse of <code class="docutils literal notranslate"><span class="pre">GemmA2AOp</span></code>.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.a2a_gemm</span><span class="w"> </span><span class="kn">import</span> <span class="n">A2aGemmOp</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.gemm_ar</span><span class="w"> </span><span class="kn">import</span> <span class="n">preshuffle_b</span>
-
-<span class="k">with</span> <span class="n">A2aGemmOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="n">N</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">K</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="n">max_tokens_per_rank</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>
-    <span class="n">op</span><span class="o">.</span><span class="n">self_test</span><span class="p">()</span>
-    <span class="n">b</span> <span class="o">=</span> <span class="n">preshuffle_b</span><span class="p">(</span><span class="n">w_o</span><span class="p">)</span>                                  <span class="c1"># [N, K], same on every rank</span>
-    <span class="n">m</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">padded_m</span><span class="p">(</span><span class="n">tokens_per_rank</span><span class="p">)</span>
-    <span class="n">a</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">send_buffer</span><span class="p">(</span><span class="n">m</span><span class="p">)</span>                                  <span class="c1"># [P*m, K/P] fp8, in the window</span>
-    <span class="n">quantize_attention_output_into</span><span class="p">(</span><span class="n">a</span><span class="p">)</span>
-    <span class="n">c</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">a_scale</span><span class="p">,</span> <span class="n">b_scale</span><span class="p">)</span>                         <span class="c1"># [m, N] bf16</span>
-</pre></div>
-</div>
-<ul class="simple">
-<li><p><strong>Quantisation</strong>: fp8 ptpc. The per-token scale is taken over all heads
-before quantisation, from the row maxima gathered across ranks, so it is
-local and never travels.</p></li>
-<li><p><strong>Shapes</strong>: N a multiple of 256; K a multiple of <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">*</span> <span class="pre">128</span></code>; M a multiple of
-256.</p></li>
-<li><p><strong>Bands and waits</strong> are picked per M from the measurements below (<code class="docutils literal notranslate"><span class="pre">chunks=</span></code>
-and <code class="docutils literal notranslate"><span class="pre">wait=</span></code> override them). <code class="docutils literal notranslate"><span class="pre">send_buffer(m)</span></code> lets attention write its output
-straight into the window.</p></li>
-</ul>
-<p>8x MI355X (4 for M3), fp8 ptpc in, bf16 out. Three interleaved rounds, median
-launch gap, maximum over ranks. µs:</p>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p>Shape</p></th>
-<th class="head text-right"><p>M per rank</p></th>
-<th class="head text-right"><p>GEMM only</p></th>
-<th class="head text-right"><p>split RCCL</p></th>
-<th class="head text-right"><p>split SDMA</p></th>
-<th class="head text-right"><p>best fused</p></th>
-<th class="head text-right"><p>vs split SDMA</p></th>
-<th class="head text-right"><p>vs RCCL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>MiniMax-M3 o-proj, P=4, N=K=6144</p></td>
-<td class="text-right"><p>2048</p></td>
-<td class="text-right"><p>63.0</p></td>
-<td class="text-right"><p>144.0</p></td>
-<td class="text-right"><p>132.9</p></td>
-<td class="text-right"><p><strong>121.7</strong></p></td>
-<td class="text-right"><p>-8.5%</p></td>
-<td class="text-right"><p>-15.5%</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td class="text-right"><p>4096</p></td>
-<td class="text-right"><p>125.1</p></td>
-<td class="text-right"><p>264.9</p></td>
-<td class="text-right"><p>244.0</p></td>
-<td class="text-right"><p><strong>184.1</strong></p></td>
-<td class="text-right"><p>-24.5%</p></td>
-<td class="text-right"><p>-30.5%</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td class="text-right"><p>8192</p></td>
-<td class="text-right"><p>208.6</p></td>
-<td class="text-right"><p>479.0</p></td>
-<td class="text-right"><p>438.7</p></td>
-<td class="text-right"><p><strong>300.2</strong></p></td>
-<td class="text-right"><p>-31.6%</p></td>
-<td class="text-right"><p><strong>-37.3%</strong></p></td>
-</tr>
-<tr class="row-odd"><td><p>Llama-3.1-70B o-proj, P=8, N=K=8192</p></td>
-<td class="text-right"><p>2048</p></td>
-<td class="text-right"><p>94.3</p></td>
-<td class="text-right"><p>156.2</p></td>
-<td class="text-right"><p>145.8</p></td>
-<td class="text-right"><p><strong>134.4</strong></p></td>
-<td class="text-right"><p>-7.8%</p></td>
-<td class="text-right"><p>-14.0%</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td class="text-right"><p>4096</p></td>
-<td class="text-right"><p>182.6</p></td>
-<td class="text-right"><p>294.6</p></td>
-<td class="text-right"><p>269.6</p></td>
-<td class="text-right"><p><strong>258.6</strong></p></td>
-<td class="text-right"><p>-4.1%</p></td>
-<td class="text-right"><p>-12.2%</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td class="text-right"><p>8192</p></td>
-<td class="text-right"><p>356.4</p></td>
-<td class="text-right"><p>552.5</p></td>
-<td class="text-right"><p>506.4</p></td>
-<td class="text-right"><p><strong>435.2</strong></p></td>
-<td class="text-right"><p>-14.0%</p></td>
-<td class="text-right"><p>-21.2%</p></td>
-</tr>
-</tbody>
-</table>
-<p>Through the operator with its defaults, the 70B shape lands within 1.3% of the
-best fused column (136.6 / 262.0 / 430.9 µs). At P=8 the fused path still
-trails the GEMM alone by 40-80 µs. The first wave of tiles needs half of the
-transferred bytes, and they arrive at the link’s rate. Closing that gap needs
-the bands posted before the GEMM starts, from attention’s epilogue.</p>
-</section>
-<section id="running-the-tests-and-benchmarks">
-<h2>Running the tests and benchmarks<a class="headerlink" href="#running-the-tests-and-benchmarks" title="Link to this heading"></a></h2>
-<p>Every operator has a numerics test of its kernels and an 8-rank test of the
-public operator. CI runs both in the CCO job. They need the environment
-described <a class="reference internal" href="#what-every-operator-has-in-common">above</a>:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MORI_ENABLE_SDMA</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">MORI_SOCKET_IFNAME</span><span class="o">=</span>lo
-pytest<span class="w"> </span>tests/python/cco/test_gemm_ar.py<span class="w"> </span>tests/python/cco/test_gemm_ar_op.py
-pytest<span class="w"> </span>tests/python/cco/test_gemm_a2a.py<span class="w"> </span>tests/python/cco/test_gemm_a2a_op.py
-pytest<span class="w"> </span>tests/python/cco/test_gemm_ag.py<span class="w"> </span>tests/python/cco/test_gemm_ag_op.py
-pytest<span class="w"> </span>tests/python/cco/test_ag_gemm.py<span class="w"> </span>tests/python/cco/test_ag_gemm_op.py
-pytest<span class="w"> </span>tests/python/cco/test_a2a_gemm.py<span class="w"> </span>tests/python/cco/test_a2a_gemm_op.py
-</pre></div>
-</div>
-<p>Each benchmark under <code class="docutils literal notranslate"><span class="pre">benchmark/cco/flydsl/&lt;op&gt;/</span></code> runs every mode (<code class="docutils literal notranslate"><span class="pre">gemm-only</span></code>,
-<code class="docutils literal notranslate"><span class="pre">split-rccl</span></code>, <code class="docutils literal notranslate"><span class="pre">split-sdma</span></code>, <code class="docutils literal notranslate"><span class="pre">fused-sdma</span></code>) against a reference and prints one
-<code class="docutils literal notranslate"><span class="pre">RESULT_JSON</span></code> line per configuration. For example:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--mode<span class="w"> </span>fused-sdma<span class="w"> </span>--quant<span class="w"> </span>blockscale<span class="w"> </span>-m<span class="w"> </span><span class="m">16384</span><span class="w"> </span>-n<span class="w"> </span><span class="m">7168</span><span class="w"> </span>-k<span class="w"> </span><span class="m">2048</span>
-</pre></div>
-</div>
-<p>Each operator’s README has the exact commands behind its tables. Before
-trusting a number of your own:</p>
-<ul class="simple">
-<li><p>Keep the node otherwise idle.</p></li>
-<li><p>Interleave the configurations you compare across rounds.</p></li>
-<li><p>Time CUDA-graph replays of many calls, not one.</p></li>
-<li><p>Pin <code class="docutils literal notranslate"><span class="pre">--quant</span></code>.</p></li>
-<li><p>Allow about 10 s between back-to-back 8-rank runs, so the SDMA queues are
-released.</p></li>
-</ul>
-<p>The <code class="docutils literal notranslate"><span class="pre">gemm_ar</span></code> README’s
-<a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ar/README.md#measurement-traps">Measurement traps</a>
-lists the ones that have produced wrong numbers here.</p>
-</section>
 </section>
 
 
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="MORI-CCO-GUIDE.html" class="btn btn-neutral float-left" title="MORI CCO Guide" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="MORI-IR-GUIDE.html" class="btn btn-neutral float-right" title="MORI-IR Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="rdma_bandwidth_utilization.html" class="btn btn-neutral float-left" title="RDMA Bandwidth Utilization in Dispatch/Combine Kernels" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="fused-gemm-ar.html" class="btn btn-neutral float-right" title="GEMM + all-reduce" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

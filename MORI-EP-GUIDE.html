@@ -6,21 +6,21 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI-EP User Guide &mdash; MORI development (73c64a22) documentation</title>
+  <title>MORI-EP User Guide &mdash; MORI development (6206eebd) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=3ea53665"></script>
+      <script src="_static/documentation_options.js?v=dff4fcea"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="MORI Shmem Guide" href="MORI-SHMEM-GUIDE.html" />
-    <link rel="prev" title="Choosing an EP API and backend" href="ep_backends.html" /> 
+    <link rel="next" title="Choosing an EP API and backend" href="ep_backends.html" />
+    <link rel="prev" title="Quickstart" href="quickstart.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -44,51 +44,31 @@
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
               <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#installation">Installation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="installation.html#prerequisites">Prerequisites</a></li>
-<li class="toctree-l3"><a class="reference internal" href="installation.html#validate-the-environment">Validate the environment</a></li>
-<li class="toctree-l3"><a class="reference internal" href="installation.html#install">Install</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="installation.html#from-pypi-stable-release">From PyPI (stable release)</a></li>
-<li class="toctree-l4"><a class="reference internal" href="installation.html#nightly-pre-built-tested-daily">Nightly (pre-built, tested daily)</a></li>
-<li class="toctree-l4"><a class="reference internal" href="installation.html#from-source">From source</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
 </ul>
-</li>
-<li class="toctree-l3"><a class="reference internal" href="installation.html#verify-installation">Verify installation</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#optional-flydsl-integration">Optional FlyDSL integration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#next-steps">Next steps</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#runnable-checks">Runnable checks</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#api-sketches">API sketches</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an EP API and backend</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="ep_backends.html#epv2-configuration-and-lifecycle">EPv2 configuration and lifecycle</a></li>
-<li class="toctree-l2"><a class="reference internal" href="ep_backends.html#validation-before-tuning">Validation before tuning</a></li>
-</ul>
-</li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<p class="caption" role="heading"><span class="caption-text">MORI-EP</span></p>
 <ul class="current">
-<li class="toctree-l1 current"><a class="current reference internal" href="#">MORI-EP User Guide</a><ul>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">User guide</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#kernel-types">1. Kernel Types</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#configuration">2. Configuration</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#quick-reference">Quick Reference</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#epv2-quick-start-8-gpus-one-node">EPv2 quick start (8 GPUs, one node)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#epv1-quick-start">EPv1 quick start</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#choosing-a-generation">1. Choosing a Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#epv2">2. EPv2</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#epv2-paths">EPv2 paths</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#epv2-restrictions">EPv2 restrictions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#validation-before-tuning">Validation before tuning</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#kernel-types">3. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#configuration">4. Configuration</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#operator-api">3. Operator API</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#operator-api">5. Operator API</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#epdispatchcombineop">EpDispatchCombineOp</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#dispatch">dispatch()</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#combine">combine()</a></li>
@@ -98,32 +78,32 @@
 <li class="toctree-l3"><a class="reference internal" href="#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#standard-moe-compatibility-deepep">6. Standard MoE Compatibility (DeepEP)</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#dispatch-standard-moe">dispatch_standard_moe()</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#combine-standard-moe">combine_standard_moe()</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#convert-dispatch-output">convert_dispatch_output()</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#convert-combine-input">convert_combine_input()</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#initialization">5. Initialization</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#initialization">7. Initialization</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#launch-configuration">8. Launch Configuration</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#manual-mode-default">Manual Mode (Default)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#auto-mode">Auto Mode</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#complete-example">7. Complete Example</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#environment-variables">8. Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#complete-example">9. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#environment-variables">10. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#benchmarking">11. Benchmarking</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#intra-node">Intra-node</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#inter-node">Inter-node</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#tuning">10. Tuning</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#tuning">12. Tuning</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#overview">Overview</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#tuning-config-files">Tuning Config Files</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#intra-node-tuning">Intra-node Tuning</a></li>
@@ -131,409 +111,72 @@
 <li class="toctree-l3"><a class="reference internal" href="#tuning-on-a-new-gpu-platform">Tuning on a New GPU Platform</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#profiling-with-mori-viz">11. Profiling with MORI-VIZ</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#framework-integration">12. Framework Integration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#build-options">Build Options</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#profiling-with-mori-viz">13. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#framework-integration">14. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#build-options">15. Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#source-files">16. Source Files</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an API and backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">Benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">V1 vs V2 inter-node performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA bandwidth in the kernels</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#rail-only-connections">Rail-only connections</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">MORI CCO Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#concepts">1. Concepts</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#communicator-ccocomm">Communicator (<code class="docutils literal notranslate"><span class="pre">ccoComm</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#symmetric-memory-and-windows">Symmetric memory and windows</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator-ccodevcomm">Device communicator (<code class="docutils literal notranslate"><span class="pre">ccoDevComm</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#teams">Teams</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#initialization">2. Initialization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#memory-and-windows">3. Memory and Windows</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator">4. Device Communicator</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#host-barrier">5. Host Barrier</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-side-programming">6. Device-Side Programming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#examples">7. Examples</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#c-api">8. C++ API</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#environment-variables">9. Environment Variables</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">MORI Fused GEMM + Collective Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#performance-at-a-glance">Performance at a glance</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#what-every-operator-has-in-common">What every operator has in common</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#gemm-all-reduce-and-reduce-scatter">GEMM + all-reduce and reduce-scatter</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#gemm-all-to-all">GEMM + all-to-all</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#gemm-all-gather">GEMM + all-gather</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#all-gather-gemm">All-gather + GEMM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#all-to-all-gemm">All-to-all + GEMM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#running-the-tests-and-benchmarks">Running the tests and benchmarks</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#simulation-mode">Simulation Mode</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#profiling-mori-io-with-roctx-markers">Profiling MORI-IO with ROCTX Markers</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-GUIDE.html#nic-fault-injection-test-builds">NIC fault injection (test builds)</a></li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">MORI UMBP Single-Node Smoke Test</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#overview">Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#prerequisites">Prerequisites</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#configuration-inputs">Configuration Inputs</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#script-constants">Script constants</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#runtime-environment-variables">Runtime environment variables</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#launch-steps">Launch Steps</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#core-dumps">Core Dumps</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#troubleshooting">Troubleshooting</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">UMBP storage and transfer simulation</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="umbp-simulation.html#enable">Enable</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="umbp-simulation.html#standalone-ci">Standalone / CI</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="umbp-simulation.html#profile-and-model">Profile and model</a></li>
-<li class="toctree-l2"><a class="reference internal" href="umbp-simulation.html#cross-peer-sharing">Cross-peer sharing</a></li>
-<li class="toctree-l2"><a class="reference internal" href="umbp-simulation.html#timing-and-limits">Timing and limits</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">UMBP transfer calibration</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="umbp-calibration.html#sampling">Sampling</a></li>
-<li class="toctree-l2"><a class="reference internal" href="umbp-calibration.html#ssd-configuration-and-preparation">SSD configuration and preparation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="umbp-calibration.html#profiles-and-accuracy">Profiles and accuracy</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
-<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
-</ul>
-</li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<p class="caption" role="heading"><span class="caption-text">MORI-FUSED</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-intranode-kernels">Profiling intranode kernels</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ar.html">GEMM + all-reduce</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-rs.html">GEMM + reduce-scatter</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-a2a.html">GEMM + all-to-all</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ag.html">GEMM + all-gather</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-ag-gemm.html">All-gather + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-a2a-gemm.html">All-to-all + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-tests-and-benchmarks.html">Tests and benchmarks</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#bandwidth-computation">Bandwidth Computation</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#rdma-bandwidth">RDMA bandwidth</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="MORI-EP-BENCHMARK.html#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
-</ul>
-</li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nvl-xgmi-bandwidth">NVL / XGMI bandwidth</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#combine">Combine</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-internode-kernels">Profiling Internode Kernels</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">EP V1 vs V2 Inter-node Performance (DeepSeek-R1 on MI308X, MI300X and MI355X)</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="EPv2_PERF.html#test-setup">1. Test setup</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#common-settings">1.1 Common settings</a></li>
-<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#environment-per-gpu">1.2 Environment per GPU</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="EPv2_PERF.html#overall-results">2. Overall results</a></li>
-<li class="toctree-l2"><a class="reference internal" href="EPv2_PERF.html#per-gpu-data">3. Per-GPU data</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#mi308x">3.1 MI308X</a></li>
-<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#mi300x">3.2 MI300X</a></li>
-<li class="toctree-l3"><a class="reference internal" href="EPv2_PERF.html#mi355x">3.3 MI355X</a></li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#which-benchmark-to-use">Which benchmark to use</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#c-benchmark-default-nixlbench-matching">C++ Benchmark (default, nixlbench-matching)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#build">Build</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#run-two-nodes">Run (two nodes)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#sweep-modes">Sweep modes</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#differences-from-the-python-flags">Differences from the Python flags</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#python-benchmark">Python Benchmark</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-tuning-guide">Benchmark Tuning Guide</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#recommended-starting-config">Recommended starting config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#parameters-that-help">Parameters that help</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#the-merged-wr-size-limit">The merged-WR size limit</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#parameters-that-usually-do-not-help-or-can-hurt">Parameters that usually do not help (or can hurt)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#host-cpu-vs-gpu-memory">Host (CPU) vs GPU memory</a></li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">MORI UMBP PD Disaggregation Benchmark</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#prerequisites">Prerequisites</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#topology">Topology</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#configuration">Configuration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-1-start-docker-on-all-nodes">Step 1 — Start Docker on all nodes</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-2-start-grafana-and-prometheus">Step 2 — Start Grafana and Prometheus</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-3-build-mori-on-all-nodes">Step 3 — Build mori on all nodes</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-4-create-launcher-scripts">Step 4 — Create launcher scripts</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-5-kill-stale-processes-and-launch-prefill">Step 5 — Kill stale processes and launch prefill</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-6-wait-for-all-prefills-ready">Step 6 — Wait for ALL prefills ready</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-7-launch-decode-and-benchmark">Step 7 — Launch decode and benchmark</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-8-monitor-decode-and-benchmark">Step 8 — Monitor decode and benchmark</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-9-show-results">Step 9 — Show results</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#teardown">Teardown</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#environment-variable-reference">Environment Variable Reference</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#topology-this-guide-s-wrapper-variables">Topology (this guide’s wrapper variables)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#umbp-mori-consumed-by-run-pd-disagg-bench-dp8ep8-sh">UMBP / mori (consumed by <code class="docutils literal notranslate"><span class="pre">run_pd_disagg_bench_dp8ep8.sh</span></code>)</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#troubleshooting">Troubleshooting</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">UMBP Distributed Tier-Management Benchmark</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#build">Build</a></li>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#run-generate-and-replay">Run, generate, and replay</a></li>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#json-backend-and-tier-policy">JSON backend and tier policy</a></li>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#synthetic-profiles">Synthetic profiles</a></li>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#trace-contract">Trace contract</a></li>
-<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#results">Results</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA Bandwidth Utilization in Dispatch/Combine Kernels</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#overview">Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#kernel-execution-path">Kernel Execution Path</a></li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#what-rdma-actually-transfers">What RDMA Actually Transfers</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#dispatch-send-dispatchinternodesend-dispatchinternodellsend">Dispatch send (<code class="docutils literal notranslate"><span class="pre">DispatchInterNodeSend</span></code> / <code class="docutils literal notranslate"><span class="pre">DispatchInterNodeLLSend</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#combine-send-combineinternodetyped-combineinternodelltyped">Combine send (<code class="docutils literal notranslate"><span class="pre">CombineInterNodeTyped</span></code> / <code class="docutils literal notranslate"><span class="pre">CombineInterNodeLLTyped</span></code>)</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#theoretical-peak-vs-observed-throughput">Theoretical Peak vs. Observed Throughput</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#computing-theoretical-peak">Computing theoretical peak</a></li>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#understanding-the-receive-side-timing">Understanding the receive-side timing</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#how-to-check-rdma-bandwidth-from-the-trace">How to Check RDMA Bandwidth from the Trace</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-1-collect-a-profiler-trace">Step 1: Collect a profiler trace</a></li>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-2-read-key-durations-from-the-text-summary">Step 2: Read key durations from the text summary</a></li>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-3-compute-observed-rdma-bandwidth">Step 3: Compute observed RDMA bandwidth</a></li>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-4-interpret-results">Step 4: Interpret results</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#key-tuning-parameters-that-affect-rdma-utilization">Key Tuning Parameters That Affect RDMA Utilization</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#v1-vs-v1-ll-low-latency-tradeoff">v1 vs. v1_ll (low-latency) tradeoff</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#sanity-checks-from-hardware-counters-optional">Sanity Checks from Hardware Counters (optional)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#summary">Summary</a></li>
-</ul>
-</li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<p class="caption" role="heading"><span class="caption-text">MORI-SHMEM</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="MORI_IR_INTEGRATION.html">Mori IR Integration</a></li>
-<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">MORI JIT Compilation Framework</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#quick-start">Quick Start</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#architecture-overview">Architecture Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#packaging-how-wheel-installs-support-jit">Packaging: How Wheel Installs Support JIT</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#compilation-split-host-cxx-vs-device-jit">Compilation Split: Host CXX vs Device JIT</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-compiles-as-cxx-at-pip-install-time">What compiles as CXX (at <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span></code> time)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-compiles-as-hip-runtime-jit-only">What compiles as HIP (runtime JIT only)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#template-args-vs-raw-args">Template Args vs Raw Args</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">SHMEM guide</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-gets-jit-compiled">What Gets JIT-Compiled</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#kernel-launch-flow">Kernel Launch Flow</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#hip-driver-api-python-ctypes">HIP Driver API (Python ctypes)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#triton-integration">Triton Integration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#cache-structure">Cache Structure</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#environment-variables">Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#testing">Testing</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#docker-environment">Docker Environment</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#non-editable-install-wheel">1. Non-Editable Install (Wheel)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#editable-install-development">2. Editable Install (Development)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#pre-compile-all-kernels">3. Pre-compile All Kernels</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#verify-jit-configuration">4. Verify JIT Configuration</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#verify-compilation-separation">5. Verify Compilation Separation</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#dispatch-combine-correctness">6. Dispatch/Combine Correctness</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#dispatch-combine-benchmark">7. Dispatch/Combine Benchmark</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#shmem-api">8. Shmem API</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#id1">9. Triton Integration</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#full-clean-slate-test">10. Full Clean-Slate Test</a></li>
+<p class="caption" role="heading"><span class="caption-text">MORI-CCO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">CCO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-device-api.html">Device API for FlyDSL and Triton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-examples.html">Examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-benchmarks.html">Benchmarks</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#kernel-source-files">Kernel Source Files</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#adding-a-new-kernel">Adding a New Kernel</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#host-device-nic-macro-separation">Host/Device NIC Macro Separation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#rocm-version-compatibility">ROCm Version Compatibility</a></li>
+<p class="caption" role="heading"><span class="caption-text">MORI-IO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">IO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">Benchmark</a></li>
 </ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">MORI JIT v2</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id1">1. 核心不变量</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id2">2. 分层</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#kernel">3. 一个 kernel 的三件套</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#cfg-c-20-structural-nttp">3.1 Cfg 作为单一模板参数（C++20 structural NTTP）</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id3">3.2 字段列表的完整性是承重的</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id4">3.3 生成的源码</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id5">3.4 缓存</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#host-device-host-hipcc">3.5 host/device 常量只有一份，且 host 不需要 hipcc</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id6">3.6 环境变量</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#dtype">3.7 dtype 是传输属性，不是算术属性</a></li>
+<p class="caption" role="heading"><span class="caption-text">MORI-UMBP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="umbp-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-configuration.html">Configuration and environment variables</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-pure-ssd-mode.html">Pure-SSD mode and multi-drive tiers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-numa-tier-placement.html">NUMA placement for a DRAM tier</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-kv-indexer-export.html">KV indexer export</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-monitoring.html">Monitoring</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">PD disaggregation benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">Tier-management benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">Simulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">Calibration</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#op">4. op 层</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id7">5. 两个后端共用一个 op</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#dispatch-combine">5.1 几何调优表：每个后端一份，dispatch 和 combine 再分开</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#python">6. Python 绑定</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id8">7. 几个有证据的决定</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id9">8. 性能</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id10">9. 移植来源与覆盖范围</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id11">10. 测试</a></li>
-</ul>
-</li>
+<p class="caption" role="heading"><span class="caption-text">Tools</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ kernel profiler</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="api/communication.html#asyncll-v2-sdma-overlap">AsyncLL v2 SDMA overlap</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">Profiler API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP master client</a></li>
 </ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP Master Client</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#starting-the-master-server">Starting the Master Server</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbptiertype">UMBPTierType</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvnodematch">UMBPExternalKvNodeMatch</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpmasterclient">UMBPMasterClient</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#cache-hit-tracking">Cache Hit Tracking</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#finding-hot-kv-blocks-the-typical-workflow">Finding hot KV blocks (the typical workflow)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#lifetime-cumulative-not-a-rate">Lifetime cumulative — not a rate</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvhitcountentry">UMBPExternalKvHitCountEntry</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#usage-examples">Usage Examples</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#end-to-end-example">End-to-End Example</a></li>
-</ul>
-</li>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">JIT compilation framework</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">JIT v2 (in Chinese)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">UMBP single-node smoke test</a></li>
 </ul>
 
         </div>
@@ -563,13 +206,27 @@
   <section id="mori-ep-user-guide">
 <h1>MORI-EP User Guide<a class="headerlink" href="#mori-ep-user-guide" title="Link to this heading"></a></h1>
 <p>MORI-EP provides high-performance MoE (Mixture of Experts) dispatch and combine kernels for Expert Parallelism. It supports both intra-node (XGMI) and inter-node (RDMA) communication, delivering state-of-the-art bandwidth for token routing in models like DeepSeek V3.</p>
+<p>MORI-EP has two generations, EPv1 and EPv2. <a class="reference internal" href="#choosing-a-generation">Section 1</a> helps you choose one. <a class="reference internal" href="#epv2">Section 2</a> covers EPv2; its package guide is <a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md">here</a>. <strong>Sections 3–14 describe EPv1</strong> (<code class="docutils literal notranslate"><span class="pre">mori.ops</span></code>, built on MORI-SHMEM).</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#quick-reference">Quick Reference</a></p></li>
-<li><p><a class="reference internal" href="#kernel-types">1. Kernel Types</a></p></li>
-<li><p><a class="reference internal" href="#configuration">2. Configuration</a></p></li>
-<li><p><a class="reference internal" href="#operator-api">3. Operator API</a></p>
+<li><p><a class="reference internal" href="#quick-reference">Quick Reference</a></p>
+<ul>
+<li><p><a class="reference internal" href="#epv2-quick-start-8-gpus-one-node">EPv2 quick start (8 GPUs, one node)</a></p></li>
+<li><p><a class="reference internal" href="#epv1-quick-start">EPv1 quick start</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#choosing-a-generation">1. Choosing a Generation</a></p></li>
+<li><p><a class="reference internal" href="#epv2">2. EPv2</a></p>
+<ul>
+<li><p><a class="reference internal" href="#epv2-paths">EPv2 paths</a></p></li>
+<li><p><a class="reference internal" href="#epv2-restrictions">EPv2 restrictions</a></p></li>
+<li><p><a class="reference internal" href="#validation-before-tuning">Validation before tuning</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#kernel-types">3. Kernel Types</a></p></li>
+<li><p><a class="reference internal" href="#configuration">4. Configuration</a></p></li>
+<li><p><a class="reference internal" href="#operator-api">5. Operator API</a></p>
 <ul>
 <li><p><a class="reference internal" href="#dispatch">dispatch()</a></p></li>
 <li><p><a class="reference internal" href="#combine">combine()</a></p></li>
@@ -579,21 +236,54 @@
 <li><p><a class="reference internal" href="#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a></p></li>
-<li><p><a class="reference internal" href="#initialization">5. Initialization</a></p></li>
-<li><p><a class="reference internal" href="#launch-configuration">6. Launch Configuration</a></p></li>
-<li><p><a class="reference internal" href="#complete-example">7. Complete Example</a></p></li>
-<li><p><a class="reference internal" href="#environment-variables">8. Environment Variables</a></p></li>
-<li><p><a class="reference internal" href="#benchmarking">9. Benchmarking</a></p></li>
-<li><p><a class="reference internal" href="#tuning">10. Tuning</a></p></li>
-<li><p><a class="reference internal" href="#profiling-with-mori-viz">11. Profiling with MORI-VIZ</a></p></li>
-<li><p><a class="reference internal" href="#framework-integration">12. Framework Integration</a></p></li>
-<li><p><a class="reference internal" href="#build-options">Build Options</a></p></li>
-<li><p><a class="reference internal" href="#source-files">Source Files</a></p></li>
+<li><p><a class="reference internal" href="#standard-moe-compatibility-deepep">6. Standard MoE Compatibility (DeepEP)</a></p></li>
+<li><p><a class="reference internal" href="#initialization">7. Initialization</a></p></li>
+<li><p><a class="reference internal" href="#launch-configuration">8. Launch Configuration</a></p></li>
+<li><p><a class="reference internal" href="#complete-example">9. Complete Example</a></p></li>
+<li><p><a class="reference internal" href="#environment-variables">10. Environment Variables</a></p></li>
+<li><p><a class="reference internal" href="#benchmarking">11. Benchmarking</a></p></li>
+<li><p><a class="reference internal" href="#tuning">12. Tuning</a></p></li>
+<li><p><a class="reference internal" href="#profiling-with-mori-viz">13. Profiling with MORI-VIZ</a></p></li>
+<li><p><a class="reference internal" href="#framework-integration">14. Framework Integration</a></p></li>
+<li><p><a class="reference internal" href="#build-options">15. Build Options</a></p></li>
+<li><p><a class="reference internal" href="#source-files">16. Source Files</a></p></li>
 </ul>
 </section>
 <section id="quick-reference">
 <h2>Quick Reference<a class="headerlink" href="#quick-reference" title="Link to this heading"></a></h2>
+<section id="epv2-quick-start-8-gpus-one-node">
+<h3>EPv2 quick start (8 GPUs, one node)<a class="headerlink" href="#epv2-quick-start-8-gpus-one-node" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.cco</span><span class="w"> </span><span class="kn">import</span> <span class="n">Communicator</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.dispatch_combine_v2</span><span class="w"> </span><span class="kn">import</span> <span class="n">EpDispatchCombineConfig</span><span class="p">,</span> <span class="n">EpDispatchCombineOp</span>
+
+<span class="c1"># Rank 0 creates the unique id; broadcast it out-of-band (torch.distributed, MPI)</span>
+<span class="n">uid</span> <span class="o">=</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">get_unique_id</span><span class="p">()</span> <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span>
+<span class="n">uid</span> <span class="o">=</span> <span class="n">broadcast</span><span class="p">(</span><span class="n">uid</span><span class="p">)</span>
+
+<span class="k">with</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">init</span><span class="p">(</span><span class="n">world_size</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">uid</span><span class="p">,</span> <span class="n">per_rank_vmm</span><span class="o">=</span><span class="n">per_rank_bytes</span><span class="p">)</span> <span class="k">as</span> <span class="n">comm</span><span class="p">:</span>
+    <span class="n">config</span> <span class="o">=</span> <span class="n">EpDispatchCombineConfig</span><span class="p">(</span>
+        <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span>
+        <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
+        <span class="n">hidden_dim</span><span class="o">=</span><span class="mi">7168</span><span class="p">,</span>
+        <span class="n">max_num_inp_token_per_rank</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+        <span class="n">num_experts_per_rank</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+        <span class="n">num_experts_per_token</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+        <span class="n">data_type</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+        <span class="n">kernel_backend</span><span class="o">=</span><span class="s2">"hip"</span><span class="p">,</span>   <span class="c1"># or "flydsl"; the default is HIP on gfx125x, FlyDSL elsewhere</span>
+    <span class="p">)</span>
+    <span class="n">op</span> <span class="o">=</span> <span class="n">EpDispatchCombineOp</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">comm</span><span class="p">)</span>
+    <span class="n">recv_x</span><span class="p">,</span> <span class="n">recv_w</span><span class="p">,</span> <span class="n">recv_s</span><span class="p">,</span> <span class="n">recv_i</span><span class="p">,</span> <span class="n">total_recv</span><span class="p">,</span> <span class="n">routing</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">dispatch</span><span class="p">(</span>
+        <span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span> <span class="n">return_routing</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="c1"># ... run expert computation on recv_x ...</span>
+    <span class="c1"># No weights: passing them asks for the weight fold, which is for training</span>
+    <span class="c1"># backward and costs more than the token payload on gfx1250.</span>
+    <span class="n">out</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">combine</span><span class="p">(</span><span class="n">expert_output</span><span class="p">,</span> <span class="n">routing</span><span class="o">=</span><span class="n">routing</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>For the full configuration, see the <a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md">EPv2 package guide</a>.</p>
+</section>
+<section id="epv1-quick-start">
+<h3>EPv1 quick start<a class="headerlink" href="#epv1-quick-start" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
 
 <span class="c1"># 1. Initialize shmem (required before any EP operations)</span>
@@ -619,7 +309,7 @@
 <span class="n">dispatch_output</span><span class="p">,</span> <span class="n">dispatch_weights</span><span class="p">,</span> <span class="n">dispatch_scales</span><span class="p">,</span> <span class="n">dispatch_indices</span><span class="p">,</span> <span class="n">recv_num_token</span> <span class="o">=</span> \
     <span class="n">op</span><span class="o">.</span><span class="n">dispatch</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
 <span class="c1"># ... run expert computation on dispatched tokens ...</span>
-<span class="n">combine_output</span><span class="p">,</span> <span class="n">combine_weights</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">combine</span><span class="p">(</span><span class="n">expert_output</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
+<span class="n">combine_output</span><span class="p">,</span> <span class="n">combine_weights</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">combine</span><span class="p">(</span><span class="n">expert_output</span><span class="p">,</span> <span class="n">dispatch_weights</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
 <span class="n">op</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
 </pre></div>
 </div>
@@ -646,10 +336,117 @@
 </tbody>
 </table>
 </section>
+</section>
+<hr class="docutils" />
+<section id="choosing-a-generation">
+<h2>1. Choosing a Generation<a class="headerlink" href="#choosing-a-generation" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>EPv1</p></th>
+<th class="head"><p>EPv2</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Built on</p></td>
+<td><p>MORI-SHMEM (process-global init)</p></td>
+<td><p>MORI-CCO (explicit <code class="docutils literal notranslate"><span class="pre">Communicator</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Import</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mori.ops</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mori.ops.dispatch_combine_v2</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Kernel selection</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EpDispatchCombineKernelType</span></code> (<code class="docutils literal notranslate"><span class="pre">IntraNode</span></code>, <code class="docutils literal notranslate"><span class="pre">InterNode</span></code>, <code class="docutils literal notranslate"><span class="pre">InterNodeV1</span></code>, …)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">config.kernel_backend</span></code>: <code class="docutils literal notranslate"><span class="pre">&quot;flydsl&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;hip&quot;</span></code> (default: HIP on gfx125x, FlyDSL elsewhere). Internode is selected by <code class="docutils literal notranslate"><span class="pre">gpu_per_node</span> <span class="pre">&lt;</span> <span class="pre">world_size</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Intra-node</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-even"><td><p>Inter-node</p></td>
+<td><p>Yes</p></td>
+<td><p>HIP backend only, preview</p></td>
+</tr>
+<tr class="row-odd"><td><p>GPUs</p></td>
+<td><p>gfx942, gfx950</p></td>
+<td><p>gfx942, gfx950, <strong>gfx1250</strong></p></td>
+</tr>
+<tr class="row-even"><td><p>Design target</p></td>
+<td><p>Node-scale and multi-node EP</p></td>
+<td><p>Native design for gfx1250 and rack-scale EP</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Which one to use:</strong></p>
+<ul class="simple">
+<li><p><strong>gfx1250: use EPv2.</strong> gfx1250 supports EPv2 only: EPv1 runs on wave64 GPUs and refuses to start on a wave32 one.</p></li>
+<li><p><strong>gfx942 / gfx950 in production: keep the API you have tested.</strong> EPv1 has the full set of inter-node kernels and tuning tables. Move to EPv2 only after you evaluate it.</p></li>
+<li><p><strong>New work for rack-scale or gfx1250: start with EPv2.</strong></p></li>
+</ul>
+<p>The EPv1 and EPv2 paths use different configuration objects and different initialization. EPv1 needs SHMEM initialization (<a class="reference internal" href="#initialization">Section 7</a>). EPv2 needs an explicit CCO communicator (<a class="reference internal" href="MORI-CCO-GUIDE.html"><span class="std std-doc">CCO Guide</span></a>). EPv2 does not use the process-global SHMEM bootstrap.</p>
+<p>This guide describes the development source. Not all paths are in every published wheel. Check the installed release and its <a class="reference external" href="https://github.com/ROCm/mori/releases">release notes</a>.</p>
+</section>
+<hr class="docutils" />
+<section id="epv2">
+<h2>2. EPv2<a class="headerlink" href="#epv2" title="Link to this heading"></a></h2>
+<p>EPv2 (<code class="docutils literal notranslate"><span class="pre">mori.ops.dispatch_combine_v2</span></code>) is built on MORI-CCO. This section lists its paths, its restrictions and the checks to run before tuning. The <a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md">EPv2 package guide</a> is the full reference, and the <a class="reference internal" href="#epv2-quick-start-8-gpus-one-node">Quick Reference</a> has a minimal example.</p>
+<section id="epv2-paths">
+<h3>EPv2 paths<a class="headerlink" href="#epv2-paths" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Path</p></th>
+<th class="head"><p>Selection</p></th>
+<th class="head"><p>Topology</p></th>
+<th class="head"><p>Scope and restrictions</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>EPv2, FlyDSL</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">kernel_backend=&quot;flydsl&quot;</span></code></p></td>
+<td><p>Intra-node only</p></td>
+<td><p>Gather/scatter combine, quantization, standard-MoE conversion and routing replay, subject to the dtype and architecture restrictions below.</p></td>
+</tr>
+<tr class="row-odd"><td><p>EPv2, HIP</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">kernel_backend=&quot;hip&quot;</span></code></p></td>
+<td><p>Intra-node</p></td>
+<td><p>Gather combine in BF16/FP32. On gfx125x, also a push (scatter) combine with <code class="docutils literal notranslate"><span class="pre">fp8_blockwise</span></code> or FP4 quantization: <code class="docutils literal notranslate"><span class="pre">combine_mode=&quot;scatter&quot;</span></code>, a BF16 combine and a <code class="docutils literal notranslate"><span class="pre">hidden_dim</span></code> that is a multiple of 1024. On gfx1250, a BF16 combine without quantization can also push for the shapes in its push table, picked per call (<code class="docutils literal notranslate"><span class="pre">MORI_EP_BF16_PUSH=0</span></code> turns this off). Dispatch can carry already-quantized FP8/FP4 payloads. No standard-MoE conversion. Does not need FlyDSL.</p></td>
+</tr>
+<tr class="row-even"><td><p>EPv2, HIP internode (preview)</p></td>
+<td><p>HIP backend with <code class="docutils literal notranslate"><span class="pre">gpu_per_node</span> <span class="pre">&lt;</span> <span class="pre">world_size</span></code></p></td>
+<td><p>Multiple physical nodes over CCO/GDA</p></td>
+<td><p>BF16/FP32/FP8 dispatch, plus packed FP4 dispatch with a BF16 or FP32 combine (not with <code class="docutils literal notranslate"><span class="pre">async_ll</span></code>). No FP4 combine, quantization, standard-MoE conversion or scatter combine. The node grouping of the communicator must match the config.</p></td>
+</tr>
+</tbody>
+</table>
+<p>Select the backend with <code class="docutils literal notranslate"><span class="pre">config.kernel_backend</span></code> or <code class="docutils literal notranslate"><span class="pre">MORI_V2_KERNEL_BACKEND</span></code>. The default is the HIP backend on gfx125x and the FlyDSL backend elsewhere. Importing the package does not load a backend. Construction loads the selected one.</p>
+</section>
+<section id="epv2-restrictions">
+<h3>EPv2 restrictions<a class="headerlink" href="#epv2-restrictions" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p>FP4 conversion kernels need gfx950 or gfx1250. gfx942 has no conversion intrinsics. The two targets use different instructions (gfx950: the <code class="docutils literal notranslate"><span class="pre">cvt_scalef32_pk_*_fp4</span></code> pair-at-a-time family; gfx1250: pack-of-8). This is a per-target port, not one shared path.</p></li>
+<li><p>FP8 format depends on the target: OCP E4M3 on gfx950, E4M3FNUZ on gfx942.</p></li>
+<li><p>On the internode path, <code class="docutils literal notranslate"><span class="pre">quant_type</span></code> must be <code class="docutils literal notranslate"><span class="pre">&quot;none&quot;</span></code>. The config rejects anything else when <code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">&gt;</span> <span class="pre">gpu_per_node</span></code>, for any backend. The quantized-combine staging path is incomplete there. HIP is the only backend with an internode path today.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">gpu_per_node</span></code> sets the physical node grouping. One host cannot emulate the two-node internode test by changing <code class="docutils literal notranslate"><span class="pre">world_size</span></code> alone.</p></li>
+<li><p>For internode, <code class="docutils literal notranslate"><span class="pre">internode_kernel</span></code> is <code class="docutils literal notranslate"><span class="pre">&quot;v2&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;v2_ll&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code>. <code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code> chooses by the token count of the current call, not by the buffer capacity.</p></li>
+</ul>
+</section>
+<section id="validation-before-tuning">
+<h3>Validation before tuning<a class="headerlink" href="#validation-before-tuning" title="Link to this heading"></a></h3>
+<p>Run the allocated-node checks in the <a class="reference internal" href="quickstart.html"><span class="std std-doc">Quickstart</span></a> before you measure performance. The source package also has:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">tests/python/ops/dispatch_combine_v2/test_ep_backend_parity.py</span></code>: compare HIP and FlyDSL on the same inputs.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tests/python/ops/dispatch_combine_v2/test_graph_capture.py</span></code>: graph replay.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py</span></code>: real two-node correctness, benchmark, tuning and stress runs.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tests/python/ops/dispatch_combine_v2/bench_ep.py</span></code>: benchmark points with an identity-expert correctness check by default.</p></li>
+</ul>
+<p>Record the MORI and FlyDSL revisions, backend, GPU, NIC, transport, dtype, quantization mode, shape and graph mode with your results. A successful intranode benchmark does not validate an internode configuration.</p>
+</section>
+</section>
 <hr class="docutils" />
 <section id="kernel-types">
-<h2>1. Kernel Types<a class="headerlink" href="#kernel-types" title="Link to this heading"></a></h2>
-<p>MORI-EP provides five kernel types optimized for different network topologies and latency requirements:</p>
+<h2>3. Kernel Types<a class="headerlink" href="#kernel-types" title="Link to this heading"></a></h2>
+<p>MORI-EP provides six kernel types optimized for different network topologies and latency requirements:</p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Kernel Type</p></th>
@@ -689,6 +486,12 @@
 <td><p>Multi-node</p></td>
 <td><p>XGMI + RDMA</p></td>
 <td><p>Async low-latency with pipelined transfers</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">IntraNodeLL</span></code></p></td>
+<td><p>5</p></td>
+<td><p>Single node</p></td>
+<td><p>XGMI (P2P)</p></td>
+<td><p>Low-latency <code class="docutils literal notranslate"><span class="pre">IntraNode</span></code> variant for small token counts</p></td>
 </tr>
 </tbody>
 </table>
@@ -736,7 +539,7 @@
 </section>
 <hr class="docutils" />
 <section id="configuration">
-<h2>2. Configuration<a class="headerlink" href="#configuration" title="Link to this heading"></a></h2>
+<h2>4. Configuration<a class="headerlink" href="#configuration" title="Link to this heading"></a></h2>
 <section id="epdispatchcombineconfig">
 <h3>EpDispatchCombineConfig<a class="headerlink" href="#epdispatchcombineconfig" title="Link to this heading"></a></h3>
 <p>All configuration is specified through the <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineConfig</span></code> dataclass:</p>
@@ -876,7 +679,7 @@
 </section>
 <hr class="docutils" />
 <section id="operator-api">
-<h2>3. Operator API<a class="headerlink" href="#operator-api" title="Link to this heading"></a></h2>
+<h2>5. Operator API<a class="headerlink" href="#operator-api" title="Link to this heading"></a></h2>
 <section id="epdispatchcombineop">
 <h3>EpDispatchCombineOp<a class="headerlink" href="#epdispatchcombineop" title="Link to this heading"></a></h3>
 <p>Create the operator with a config:</p>
@@ -962,7 +765,7 @@
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">weights</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">torch.Tensor</span></code></p></td>
-<td><p>Expert weights for weighted combination</p></td>
+<td><p>The weights <code class="docutils literal notranslate"><span class="pre">dispatch()</span></code> returned for the received tokens, or <code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">indices</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">torch.Tensor</span></code></p></td>
@@ -1031,7 +834,7 @@
 </section>
 <hr class="docutils" />
 <section id="standard-moe-compatibility-deepep">
-<h2>4. Standard MoE Compatibility (DeepEP)<a class="headerlink" href="#standard-moe-compatibility-deepep" title="Link to this heading"></a></h2>
+<h2>6. Standard MoE Compatibility (DeepEP)<a class="headerlink" href="#standard-moe-compatibility-deepep" title="Link to this heading"></a></h2>
 <p>MORI-EP provides DeepEP-compatible APIs for frameworks that use standard 3D MoE tensor layouts. These require building with <code class="docutils literal notranslate"><span class="pre">ENABLE_STANDARD_MOE_ADAPT=ON</span></code>:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ENABLE_STANDARD_MOE_ADAPT</span><span class="o">=</span>ON<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
 </pre></div>
@@ -1071,7 +874,7 @@
 </section>
 <hr class="docutils" />
 <section id="initialization">
-<h2>5. Initialization<a class="headerlink" href="#initialization" title="Link to this heading"></a></h2>
+<h2>7. Initialization<a class="headerlink" href="#initialization" title="Link to this heading"></a></h2>
 <p>MORI-EP requires symmetric memory (shmem) initialization before creating any <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineOp</span></code>. There are two initialization methods:</p>
 <section id="method-1-pytorch-process-group-recommended">
 <h3>Method 1: PyTorch Process Group (Recommended)<a class="headerlink" href="#method-1-pytorch-process-group-recommended" title="Link to this heading"></a></h3>
@@ -1119,11 +922,12 @@
 </section>
 <hr class="docutils" />
 <section id="launch-configuration">
-<h2>6. Launch Configuration<a class="headerlink" href="#launch-configuration" title="Link to this heading"></a></h2>
+<h2>8. Launch Configuration<a class="headerlink" href="#launch-configuration" title="Link to this heading"></a></h2>
 <section id="manual-mode-default">
 <h3>Manual Mode (Default)<a class="headerlink" href="#manual-mode-default" title="Link to this heading"></a></h3>
 <p>Launch parameters are taken from <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineConfig</span></code> defaults or per-call overrides:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Use config defaults (block_num=80, warp_num_per_block=8)</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># No launch arguments: the config's block_num=80 and warp_num_per_block=8, except</span>
+<span class="c1"># IntraNode, which has per-kernel defaults (dispatch: 256x16)</span>
 <span class="n">op</span><span class="o">.</span><span class="n">dispatch</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
 
 <span class="c1"># Override per call</span>
@@ -1137,7 +941,8 @@
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MORI_EP_LAUNCH_CONFIG_MODE</span><span class="o">=</span>AUTO
 </pre></div>
 </div>
-<p>Auto mode selects parameters based on kernel type:</p>
+<p>Auto mode uses the tuned launch rules shipped for the GPU, kernel type and world
+size where there are some, and otherwise falls back by kernel type:</p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Kernel Type</p></th>
@@ -1147,12 +952,17 @@
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p>InterNodeV1, InterNodeV1LL</p></td>
+<tr class="row-even"><td><p>InterNodeV1</p></td>
 <td><p>96</p></td>
 <td><p>64</p></td>
 <td><p>8</p></td>
 </tr>
-<tr class="row-odd"><td><p>IntraNode, InterNode, AsyncLL</p></td>
+<tr class="row-odd"><td><p>InterNodeV1LL</p></td>
+<td><p>256</p></td>
+<td><p>128</p></td>
+<td><p>8</p></td>
+</tr>
+<tr class="row-even"><td><p>All others</p></td>
 <td><p>128</p></td>
 <td><p>0</p></td>
 <td><p>16</p></td>
@@ -1164,7 +974,7 @@
 </section>
 <hr class="docutils" />
 <section id="complete-example">
-<h2>7. Complete Example<a class="headerlink" href="#complete-example" title="Link to this heading"></a></h2>
+<h2>9. Complete Example<a class="headerlink" href="#complete-example" title="Link to this heading"></a></h2>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
@@ -1253,7 +1063,7 @@
 </section>
 <hr class="docutils" />
 <section id="environment-variables">
-<h2>8. Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading"></a></h2>
+<h2>10. Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading"></a></h2>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Variable</p></th>
@@ -1295,7 +1105,7 @@
 </section>
 <hr class="docutils" />
 <section id="benchmarking">
-<h2>9. Benchmarking<a class="headerlink" href="#benchmarking" title="Link to this heading"></a></h2>
+<h2>11. Benchmarking<a class="headerlink" href="#benchmarking" title="Link to this heading"></a></h2>
 <section id="intra-node">
 <h3>Intra-node<a class="headerlink" href="#intra-node" title="Link to this heading"></a></h3>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/path/to/mori
@@ -1310,10 +1120,12 @@ python3<span class="w"> </span>tests/python/ops/bench_dispatch_combine.py
 <span class="nb">export</span><span class="w"> </span><span class="nv">MORI_RDMA_DEVICES</span><span class="o">=</span>^mlx5_0,mlx5_1<span class="w">  </span><span class="c1"># Optional: exclude specific NICs</span>
 
 torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"10.194.129.65"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>examples/ops/dispatch_combine/test_dispatch_combine_internode.py<span class="w"> </span>--bench
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"&lt;master_ip&gt;"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>examples/ops/dispatch_combine/test_dispatch_combine_internode.py<span class="w"> </span>--cmd<span class="w"> </span>bench
 </pre></div>
 </div>
+<p><code class="docutils literal notranslate"><span class="pre">torchrun</span></code> starts one process per node; the script starts the node’s 8 ranks
+(<code class="docutils literal notranslate"><span class="pre">GPU_PER_NODE</span></code>) itself.</p>
 <p>The benchmark output reports total tokens received, RDMA token count, and total bandwidth (XGMI + RDMA). To calculate RDMA-only bandwidth:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span>RDMA BW = Total BW × (RDMA tokens / Total tokens)
 </pre></div>
@@ -1360,7 +1172,7 @@ torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">
 </section>
 <hr class="docutils" />
 <section id="tuning">
-<h2>10. Tuning<a class="headerlink" href="#tuning" title="Link to this heading"></a></h2>
+<h2>12. Tuning<a class="headerlink" href="#tuning" title="Link to this heading"></a></h2>
 <p>Tuning searches for the optimal GPU launch parameters (<code class="docutils literal notranslate"><span class="pre">block_num</span></code>, <code class="docutils literal notranslate"><span class="pre">warp_per_block</span></code>, <code class="docutils literal notranslate"><span class="pre">rdma_block_num</span></code>) for each kernel/dtype/token-count combination. Results are saved to JSON config files that the auto-mode launch configuration reads at runtime.</p>
 <section id="overview">
 <h3>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h3>
@@ -1657,17 +1469,19 @@ non-zero if any shape crashes, hangs, or produces wrong output.</p>
 </section>
 <hr class="docutils" />
 <section id="profiling-with-mori-viz">
-<h2>11. Profiling with MORI-VIZ<a class="headerlink" href="#profiling-with-mori-viz" title="Link to this heading"></a></h2>
-<p>Build with profiling enabled:</p>
+<h2>13. Profiling with MORI-VIZ<a class="headerlink" href="#profiling-with-mori-viz" title="Link to this heading"></a></h2>
+<p>Build with profiling enabled, and keep <code class="docutils literal notranslate"><span class="pre">ENABLE_PROFILER=ON</span></code> set when you run:
+the JIT compiles the instrumented kernels only then.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ENABLE_PROFILER</span><span class="o">=</span>ON<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
 </pre></div>
 </div>
 <p>Capture and export a trace:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.kernel_profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">export_to_perfetto</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.kernel_profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">export_to_perfetto</span>
 
 <span class="c1"># Run dispatch/combine, then:</span>
 <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="p">,</span> <span class="s2">"get_debug_time_buf"</span><span class="p">):</span>
-    <span class="n">trace_buffer</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="o">.</span><span class="n">get_debug_time_buf</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">_handle</span><span class="p">)</span>
+    <span class="n">trace_buffer</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">get_debug_time_buf</span><span class="p">()</span>
     <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">"ep_trace.json"</span><span class="p">)</span>
 </pre></div>
 </div>
@@ -1675,7 +1489,7 @@ non-zero if any shape crashes, hangs, or produces wrong output.</p>
 </section>
 <hr class="docutils" />
 <section id="framework-integration">
-<h2>12. Framework Integration<a class="headerlink" href="#framework-integration" title="Link to this heading"></a></h2>
+<h2>14. Framework Integration<a class="headerlink" href="#framework-integration" title="Link to this heading"></a></h2>
 <p>MORI-EP is integrated in several LLM inference frameworks:</p>
 <table class="docutils align-default">
 <thead>
@@ -1706,7 +1520,7 @@ non-zero if any shape crashes, hangs, or produces wrong output.</p>
 </section>
 <hr class="docutils" />
 <section id="build-options">
-<h2>Build Options<a class="headerlink" href="#build-options" title="Link to this heading"></a></h2>
+<h2>15. Build Options<a class="headerlink" href="#build-options" title="Link to this heading"></a></h2>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>CMake Option</p></th>
@@ -1760,7 +1574,7 @@ non-zero if any shape crashes, hangs, or produces wrong output.</p>
 </section>
 <hr class="docutils" />
 <section id="source-files">
-<h2>Source Files<a class="headerlink" href="#source-files" title="Link to this heading"></a></h2>
+<h2>16. Source Files<a class="headerlink" href="#source-files" title="Link to this heading"></a></h2>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>File</p></th>
@@ -1789,11 +1603,11 @@ non-zero if any shape crashes, hangs, or produces wrong output.</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine/low_latency_async.cpp</span></code></p></td>
 <td><p>AsyncLL kernels</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">src/pybind/pybind.cpp</span></code></p></td>
-<td><p>Python module entry point</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">src/pybind/mori.cpp</span></code></p></td>
+<td><p>Python module entry point (<code class="docutils literal notranslate"><span class="pre">libmori_pybinds</span></code>)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">src/pybind/mori.cpp</span></code></p></td>
-<td><p>Ops/Shmem/IO binding registration</p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">src/pybind/pybind_ops.cpp</span></code></p></td>
+<td><p>Ops binding registration (<code class="docutils literal notranslate"><span class="pre">RegisterMoriOps</span></code>)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">examples/ops/dispatch_combine/test_dispatch_combine.py</span></code></p></td>
 <td><p>Complete Python example</p></td>
@@ -1801,8 +1615,8 @@ non-zero if any shape crashes, hangs, or produces wrong output.</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">examples/ops/dispatch_combine/test_dispatch_combine_internode.py</span></code></p></td>
 <td><p>Inter-node example</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tests/python/ops/test_dispatch_combine.py</span></code></p></td>
-<td><p>Correctness tests</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tests/python/ops/test_dispatch_combine_*.py</span></code></p></td>
+<td><p>Correctness tests (intra-node, inter-node V1, AsyncLL, …)</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tests/python/ops/bench_dispatch_combine.py</span></code></p></td>
 <td><p>Performance benchmarks</p></td>
@@ -1816,8 +1630,8 @@ non-zero if any shape crashes, hangs, or produces wrong output.</p>
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="ep_backends.html" class="btn btn-neutral float-left" title="Choosing an EP API and backend" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="MORI-SHMEM-GUIDE.html" class="btn btn-neutral float-right" title="MORI Shmem Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="quickstart.html" class="btn btn-neutral float-left" title="Quickstart" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="ep_backends.html" class="btn btn-neutral float-right" title="Choosing an EP API and backend" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

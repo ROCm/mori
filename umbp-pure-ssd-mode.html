@@ -1,0 +1,515 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pure-SSD mode and multi-drive SSD tiers &mdash; MORI development (6206eebd) documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=dff4fcea"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="NUMA placement for a DRAM tier" href="umbp-numa-tier-placement.html" />
+    <link rel="prev" title="UMBP Runtime-Tunable Environment Variables" href="umbp-configuration.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-EP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">User guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an API and backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">Benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">V1 vs V2 inter-node performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA bandwidth in the kernels</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-FUSED</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ar.html">GEMM + all-reduce</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-rs.html">GEMM + reduce-scatter</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-a2a.html">GEMM + all-to-all</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ag.html">GEMM + all-gather</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-ag-gemm.html">All-gather + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-a2a-gemm.html">All-to-all + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-tests-and-benchmarks.html">Tests and benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-SHMEM</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">SHMEM guide</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-CCO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">CCO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-device-api.html">Device API for FlyDSL and Triton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-examples.html">Examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-benchmarks.html">Benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-IO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">IO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">Benchmark</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-UMBP</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="umbp-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-configuration.html">Configuration and environment variables</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Pure-SSD mode and multi-drive tiers</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#quick-start">Quick start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#enabling-the-mode">Enabling the mode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#spreading-writes">Spreading writes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#sizing">Sizing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#direct-i-o">Direct I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#storage-only-nodes-no-engine-no-gpu">Storage-only nodes (no engine, no GPU)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#troubleshooting">Troubleshooting</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#measured-l1-vs-l2-vs-l3">Measured: L1 vs L2 vs L3</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#notes">Notes</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-numa-tier-placement.html">NUMA placement for a DRAM tier</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-kv-indexer-export.html">KV indexer export</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-monitoring.html">Monitoring</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">PD disaggregation benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">Tier-management benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">Simulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">Calibration</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Tools</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ kernel profiler</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">Profiler API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP master client</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">JIT compilation framework</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">JIT v2 (in Chinese)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">UMBP single-node smoke test</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Pure-SSD mode and multi-drive SSD tiers</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/umbp-pure-ssd-mode.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <!-- Rendered from src/umbp/doc/pure-ssd-mode.md. Edit that file, not this one. -->
+<section id="pure-ssd-mode-and-multi-drive-ssd-tiers">
+<h1>Pure-SSD mode and multi-drive SSD tiers<a class="headerlink" href="#pure-ssd-mode-and-multi-drive-ssd-tiers" title="Link to this heading"></a></h1>
+<p>Run a UMBP node with <strong>no host-DRAM tier</strong>, SSD carrying the whole cache, with
+one node’s SSD tier spanning <strong>several drives</strong> at once.</p>
+<p>The point of the mode is aggregate NVMe bandwidth: N nodes × M drives all
+writing and reading in parallel. Most of this page is about not accidentally
+giving that up.</p>
+<section id="quick-start">
+<h2>Quick start<a class="headerlink" href="#quick-start" title="Link to this heading"></a></h2>
+<p>Two pieces: the <code class="docutils literal notranslate"><span class="pre">extra_config</span></code> your engine passes to <code class="docutils literal notranslate"><span class="pre">UMBPStore</span></code>, and a handful
+of env vars. This is a validated 2-drive-per-node deployment under SGLang
+HiCache.</p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">extra_config</span></code>, per engine:</strong></p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">"medium"</span><span class="p">:</span><span class="w"> </span><span class="s2">"SSD"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ssd_enabled"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ssd_storage_dir"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/umbp_ssd/drive1,/umbp_ssd/drive2"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ssd_capacity_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">68719476736</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ssd_backend"</span><span class="p">:</span><span class="w"> </span><span class="s2">"file"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ssd_io_backend"</span><span class="p">:</span><span class="w"> </span><span class="s2">"io_uring"</span><span class="p">,</span>
+
+<span class="w">  </span><span class="nt">"master_address"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;UMBP_MASTER&gt;"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"node_address"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;NODE_IP&gt;"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"io_engine_port"</span><span class="p">:</span><span class="w"> </span><span class="s2">"19600"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"peer_service_port"</span><span class="p">:</span><span class="w"> </span><span class="s2">"19700"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"cache_remote_fetches"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"kv_events_subscriber"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"kv_events_endpoint"</span><span class="p">:</span><span class="w"> </span><span class="s2">"tcp://localhost:6557"</span><span class="p">,</span>
+
+<span class="w">  </span><span class="nt">"staging_buffer_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2147483648</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ssd_staging_use_hugepages"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ssd_staging_hugepage_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2097152</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p><strong>Env vars, on each engine:</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_SSD_VERIFY_CRC</span><span class="o">=</span><span class="m">0</span><span class="w">         </span><span class="c1"># skip checksums, matching the DRAM tier</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_SSD_TIER_IO_THREADS</span><span class="o">=</span><span class="m">4</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_SSD_DURABILITY</span><span class="o">=</span>strict<span class="w">    </span><span class="c1"># ~free once direct I/O is on</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_SSD_READ_LEASE_MS</span><span class="o">=</span><span class="m">30000</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_DRAM_USE_HUGEPAGES</span><span class="o">=</span><span class="m">1</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES</span><span class="o">=</span><span class="m">1</span>
+
+<span class="c1"># Only if the engine issues ranged (sub-object) I/O -- the SGLang tree</span>
+<span class="c1"># connector does.  Zero is the default and turns the feature off, and on a</span>
+<span class="c1"># pure-SSD deployment every node is SSD, so leaving it unset costs ranged I/O</span>
+<span class="c1"># cluster-wide.  Size it above the largest object a remote ranged batch moves.</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES</span><span class="o">=</span><span class="m">268435456</span>
+</pre></div>
+</div>
+<p>Ranged I/O on an SSD medium used to be refused outright regardless of this
+variable; that exclusion is gone. Note what it does and does not buy: a ranged
+<strong>put</strong> runs at full speed, while a ranged <strong>get</strong> still reads the whole object
+off the drive and saves only the final copy into the caller’s buffers, because
+a resolve stages the object before the requested ranges are known. See
+<a class="reference external" href="https://github.com/ROCm/mori/blob/main/src/umbp/doc/design-ssd-ranged-io.md">design-ssd-ranged-io.md</a>.</p>
+<p>Deliberately <strong>not</strong> in that list: <code class="docutils literal notranslate"><span class="pre">UMBP_SSD_TIMING=1</span></code>. It is a diagnostic, not a
+production setting — it prints several <code class="docutils literal notranslate"><span class="pre">[SsdPerf/*]</span></code> lines per batch, which on a
+busy node is a lot of log. Turn it on when investigating throughput, off again
+after; see <a class="reference external" href="https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md">runtime-env-vars.md</a> for what it reports.</p>
+<p><strong>Env var, on <code class="docutils literal notranslate"><span class="pre">umbp_master</span></code> — not the engine:</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_ROUTE_PUT_SELECT_ALGO</span><span class="o">=</span>random<span class="w">   </span><span class="c1"># see "Spreading writes"</span>
+</pre></div>
+</div>
+<p><strong>Prerequisite, on every node before launching anything:</strong> reserve hugepages —
+<code class="docutils literal notranslate"><span class="pre">sudo</span> <span class="pre">sysctl</span> <span class="pre">-w</span> <span class="pre">vm.nr_hugepages=350000</span></code> — or engine/worker startup fails with
+<code class="docutils literal notranslate"><span class="pre">RegisterRdmaMemoryRegionAuto</span> <span class="pre">failed</span> <span class="pre">...</span> <span class="pre">errno:12</span> <span class="pre">(Cannot</span> <span class="pre">allocate</span> <span class="pre">memory)</span></code>.</p>
+</section>
+<section id="enabling-the-mode">
+<h2>Enabling the mode<a class="headerlink" href="#enabling-the-mode" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">medium:</span> <span class="pre">SSD</span></code> <strong>is</strong> the switch. A node serves exactly one medium, and naming
+SSD is the whole opt-in: the node registers an <code class="docutils literal notranslate"><span class="pre">SsdBackend</span></code>, advertises SSD
+capacity, and takes puts directly. No separate “pure-SSD” flag and no
+<code class="docutils literal notranslate"><span class="pre">UMBP_ROUTE_PUT_SSD_MODE</span></code> — the routing plane does not rank tiers, so every
+advertised medium is an equally valid put target and an SSD node needs no
+special case (see <code class="docutils literal notranslate"><span class="pre">route_put_strategy.h</span></code>).</p>
+<p>This also means the mode is per node, not per cluster: SSD, DRAM and HBM nodes
+coexist in one pool, and which medium a key lands on is a property of the node
+master chose, not of the key.</p>
+<p>Selecting SSD with <code class="docutils literal notranslate"><span class="pre">ssd.capacity_bytes</span></code> or <code class="docutils literal notranslate"><span class="pre">ssd.segment_size_bytes</span></code> unset is
+rejected at startup rather than silently serving a zero-capacity tier.</p>
+<p><strong>How the selector reaches the node.</strong> <code class="docutils literal notranslate"><span class="pre">UMBPDistributedConfig::medium</span></code> is
+exposed three ways: the pybind field (<code class="docutils literal notranslate"><span class="pre">config.distributed.medium</span></code>), and
+<code class="docutils literal notranslate"><span class="pre">UMBP_DISTRIBUTED_MEDIUM=SSD</span></code> for the standalone server binary. The <code class="docutils literal notranslate"><span class="pre">&quot;medium&quot;</span></code>
+key shown in the <code class="docutils literal notranslate"><span class="pre">extra_config</span></code> above needs a matching entry in sglang’s own
+<code class="docutils literal notranslate"><span class="pre">umbp_store.py</span></code> parser — the same gap <code class="docutils literal notranslate"><span class="pre">single_flight_reads</span></code> has. Until that
+lands, an SGLang engine selects SSD through the pybind field or the env var, not
+through <code class="docutils literal notranslate"><span class="pre">extra_config</span></code> JSON.</p>
+</section>
+<section id="spreading-writes">
+<h2>Spreading writes<a class="headerlink" href="#spreading-writes" title="Link to this heading"></a></h2>
+<p><strong>Set <code class="docutils literal notranslate"><span class="pre">UMBP_ROUTE_PUT_SELECT_ALGO=random</span></code>.</strong> This is the single most important
+knob in the mode, and the default is wrong for it.</p>
+<p>The default, <code class="docutils literal notranslate"><span class="pre">most_available</span></code>, sends each key to the emptiest node. Node capacity
+only refreshes on a heartbeat, so every batch in between sees the same “emptiest”
+node and piles onto it — and concurrent writers herd onto it together. Aggregate
+write bandwidth collapses to one node’s drives. <code class="docutils literal notranslate"><span class="pre">random</span></code> is capacity-weighted
+(a node that cannot fit a block is never chosen), so it still fills evenly
+without the herding.</p>
+<p>Leave <code class="docutils literal notranslate"><span class="pre">UMBP_ROUTE_PUT_NODE_AFFINITY</span></code> at <code class="docutils literal notranslate"><span class="pre">none</span></code>. <code class="docutils literal notranslate"><span class="pre">same</span></code> and <code class="docutils literal notranslate"><span class="pre">local</span></code> trade fan-out
+for locality, which is the opposite of what this mode is for.</p>
+<p>Both are read by the <strong>master process</strong>. Setting them on an engine does nothing.
+The master logs its resolved strategy at startup — check that line if a change
+seems to have no effect.</p>
+</section>
+<section id="sizing">
+<h2>Sizing<a class="headerlink" href="#sizing" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Setting</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ssd_storage_dir</span></code></p></td>
+<td><p>Comma-separated, <strong>one directory per physical drive</strong>. More than one turns on multi-drive: keys are balanced across drives and batch I/O runs on all of them at once.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ssd_capacity_bytes</span></code></p></td>
+<td><p>The <strong>total</strong> across every drive, split evenly — not per drive.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ssd_staging_buffer_slots</span></code></p></td>
+<td><p>Size of the staging arena, in pages (<code class="docutils literal notranslate"><span class="pre">UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS</span></code>). <code class="docutils literal notranslate"><span class="pre">0</span></code>, the default, means 4 GiB worth, capped at the tier’s capacity.</p></td>
+</tr>
+<tr class="row-odd"><td><p>(writes)</p></td>
+<td><p>Remote puts stage through the same arena; local ones do not. There is no separate write-staging region to size.</p></td>
+</tr>
+</tbody>
+</table>
+<p>Only reads and remote writes stage. A read batch that does not fit waits for a
+later round rather than failing: busy resolves are retried for up to
+<code class="docutils literal notranslate"><span class="pre">UMBP_RESOLVE_BUSY_TIMEOUT_MS</span></code> (30 s by default), and only a batch whose own
+working set exceeds the whole arena fails at once. A remote put is not retried:
+when the arena is full the put fails at once (see “Puts fail on an SSD node”
+below).</p>
+<p>Each key lives whole on one drive, so a single-key read costs one drive’s I/O.
+Capacity is charged in <strong>padded on-disk bytes</strong>: values are padded to 4 KiB, so
+a 512 B value occupies 8 KiB. Negligible for multi-MiB KV pages, but size
+<code class="docutils literal notranslate"><span class="pre">ssd_capacity_bytes</span></code> with your real value size in mind if yours are small.</p>
+</section>
+<section id="direct-i-o">
+<h2>Direct I/O<a class="headerlink" href="#direct-i-o" title="Link to this heading"></a></h2>
+<p><strong>Direct I/O is the default.</strong>  Keep it on for any deployment whose numbers you intend to
+believe.** Without it the tier opens buffered, and reads are served from the
+page cache — a whole working set can be served while moving <em>zero</em> bytes to the
+device, which makes drive-count and DRAM-vs-SSD comparisons meaningless.</p>
+<p>Pair it with <code class="docutils literal notranslate"><span class="pre">ssd_io_backend:</span> <span class="pre">io_uring</span></code>; the posix driver on the direct path is
+far slower, and the tier warns about it.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Env var</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_SSD_DIRECT_IO</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">O_DIRECT</span></code>, bypassing the page cache.  On by default; <code class="docutils literal notranslate"><span class="pre">0</span></code> restores buffered</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_SSD_VERIFY_CRC</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code> = skip checksum verification. Checksumming is 51–67% of GET time and the DRAM tier does none, so turn it off to compare the two without that confound.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_SSD_TIER_IO_THREADS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">4</span></code></p></td>
+<td><p>Parallelism <strong>within one drive’s</strong> batch. Worth ~42% on reads versus 1.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_SSD_SHARD_IO_THREADS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Parallelism <strong>across drives</strong>. <code class="docutils literal notranslate"><span class="pre">0</span></code> = one per drive; leave it there unless CPU-bound.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_SSD_DURABILITY</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">strict</span></code></p></td>
+<td><p>With direct I/O on, strict costs ~1.4% instead of 42%. Little reason to relax it.</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Confirm it is on</strong>: run <code class="docutils literal notranslate"><span class="pre">iostat</span> <span class="pre">-x</span> <span class="pre">1</span></code> during a read-heavy phase. Buffered shows
+~1% device utilisation while reporting absurd bandwidth; direct shows the drives
+busy at something near their rating.</p>
+</section>
+<section id="storage-only-nodes-no-engine-no-gpu">
+<h2>Storage-only nodes (no engine, no GPU)<a class="headerlink" href="#storage-only-nodes-no-engine-no-gpu" title="Link to this heading"></a></h2>
+<p>To add SSD capacity to the pool from a node that isn’t running an SGLang
+engine — a dedicated storage box, or extra drives on a node already busy with
+compute — join it as a bare <code class="docutils literal notranslate"><span class="pre">UMBPStore</span></code> client instead:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>tests/python/umbp/umbp_store_node.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--hicache-storage-backend-extra-config<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">'{"master_address": "&lt;UMBP_MASTER&gt;", "node_id": "ssd-node-1",</span>
+<span class="s1">    "node_address": "&lt;NODE_IP&gt;", "medium": "SSD",</span>
+<span class="s1">    "ssd_enabled": true, "ssd_storage_dir": "/mnt/nvme0,/mnt/nvme1",</span>
+<span class="s1">    "ssd_capacity_bytes": 1000000000000}'</span>
+</pre></div>
+</div>
+<p>It registers with <code class="docutils literal notranslate"><span class="pre">umbp_master</span></code>, heartbeats, and idles — same config surface
+(JSON <code class="docutils literal notranslate"><span class="pre">extra_config</span></code> or the matching <code class="docutils literal notranslate"><span class="pre">UMBP_*</span></code> env vars) as an engine’s
+<code class="docutils literal notranslate"><span class="pre">UMBPStore</span></code>, just with <code class="docutils literal notranslate"><span class="pre">mem_pool_host=None</span></code>. Run it in the same
+image/container as the engine (needs sglang + mori importable). Ctrl-C /
+<code class="docutils literal notranslate"><span class="pre">SIGTERM</span></code> flushes and exits cleanly; there is no remote-clear signal wired up,
+so clearing one means restarting the process.</p>
+<p>If you want compute nodes to contribute <em>no</em> cache capacity of their own —
+all SSD capacity coming from dedicated storage nodes instead — set the
+engine’s own <code class="docutils literal notranslate"><span class="pre">ssd_capacity_bytes</span></code> to something unusably tiny (e.g. <code class="docutils literal notranslate"><span class="pre">1048576</span></code>,
+1 MB) rather than disabling its SSD tier: <code class="docutils literal notranslate"><span class="pre">ssd_enabled:</span> <span class="pre">true</span></code> is still needed
+for HiCache’s L3 path to initialize, but <code class="docutils literal notranslate"><span class="pre">random</span></code> routing skips any node that
+“cannot fit a block,” so a 1 MB node is never chosen as a put target.</p>
+</section>
+<section id="troubleshooting">
+<h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Symptom</p></th>
+<th class="head"><p>Likely cause</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Absurd read bandwidth, <code class="docutils literal notranslate"><span class="pre">iostat</span></code> shows ~1% device utilisation</p></td>
+<td><p>You are reading the page cache: either <code class="docutils literal notranslate"><span class="pre">UMBP_SSD_DIRECT_IO=0</span></code>, or the startup probe fell back to buffered (the filesystem rejects <code class="docutils literal notranslate"><span class="pre">O_DIRECT</span></code>).  Check for <code class="docutils literal notranslate"><span class="pre">direct_io=true</span></code> on the <code class="docutils literal notranslate"><span class="pre">[SSDTier]</span></code> init line — requested is not the same as active</p></td>
+</tr>
+<tr class="row-odd"><td><p>Adding drives or nodes doesn’t add bandwidth</p></td>
+<td><p>Writes are skewed. Set <code class="docutils literal notranslate"><span class="pre">UMBP_ROUTE_PUT_SELECT_ALGO=random</span></code>, check <code class="docutils literal notranslate"><span class="pre">UMBP_ROUTE_PUT_NODE_AFFINITY=none</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">random</span></code> set but still skewed</p></td>
+<td><p>It was set on the engine instead of <code class="docutils literal notranslate"><span class="pre">umbp_master</span></code>. Check the master’s startup strategy line</p></td>
+</tr>
+<tr class="row-odd"><td><p>Reads report misses under load</p></td>
+<td><p>Staging stayed full for longer than <code class="docutils literal notranslate"><span class="pre">UMBP_RESOLVE_BUSY_TIMEOUT_MS</span></code>, or a batch’s own working set exceeds the arena. Check <code class="docutils literal notranslate"><span class="pre">staging_slot_full_reject</span></code> in <code class="docutils literal notranslate"><span class="pre">mori_umbp_backend_medium_events_total{tier=&quot;SSD&quot;}</span></code> and raise <code class="docutils literal notranslate"><span class="pre">ssd_staging_buffer_slots</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Puts fail on an SSD node</p></td>
+<td><p>The staging arena is exhausted, so <code class="docutils literal notranslate"><span class="pre">BatchAllocate</span></code> had no page to hand out. Check <code class="docutils literal notranslate"><span class="pre">mori_umbp_backend_medium_events_total{tier=&quot;SSD&quot;,</span> <span class="pre">event=&quot;staging_put_full_reject&quot;}</span></code> (the peer also logs a sampled <code class="docutils literal notranslate"><span class="pre">staging</span> <span class="pre">arena</span> <span class="pre">full</span></code> WARN) and raise <code class="docutils literal notranslate"><span class="pre">ssd_staging_buffer_slots</span></code>. <code class="docutils literal notranslate"><span class="pre">staging_slot_full_reject</span></code> counts the same pressure on reads</p></td>
+</tr>
+<tr class="row-odd"><td><p>Node comes up with an empty cache after an upgrade</p></td>
+<td><p>On-disk record format changed; older records are dropped on version mismatch</p></td>
+</tr>
+<tr class="row-even"><td><p>Tier fills far earlier than expected</p></td>
+<td><p>Capacity is charged in padded bytes — small values pay up to 16×</p></td>
+</tr>
+<tr class="row-odd"><td><p>SSD used is well above the live data</p></td>
+<td><p>Used counts dead records until their segment file empties. Compare <code class="docutils literal notranslate"><span class="pre">mori_umbp_backend_medium_state{state=&quot;live_bytes&quot;}</span></code> with it; <code class="docutils literal notranslate"><span class="pre">medium_events_total{event=&quot;segment_deleted&quot;}</span></code> should grow while the tier evicts</p></td>
+</tr>
+<tr class="row-even"><td><p>Startup rejects <code class="docutils literal notranslate"><span class="pre">medium:</span> <span class="pre">SSD</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ssd.capacity_bytes</span></code> or <code class="docutils literal notranslate"><span class="pre">ssd.segment_size_bytes</span></code> is 0 — the selected medium must be sized</p></td>
+</tr>
+<tr class="row-odd"><td><p>A config key seems to do nothing</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">extra_config</span></code> is an allow-list; unknown or wrong-mode keys are ignored with a warning. Grep the engine log for <code class="docutils literal notranslate"><span class="pre">UMBPStore:</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Reads keep missing after killing/relaunching a node several times</p></td>
+<td><p>The master drops a dead client only after it has missed heartbeats for <code class="docutils literal notranslate"><span class="pre">heartbeat_ttl</span> <span class="pre">×</span> <span class="pre">max_missed_heartbeats</span></code>; until then its entry stays capacity-weighted and <code class="docutils literal notranslate"><span class="pre">random</span></code> can still pick it. Restart <code class="docutils literal notranslate"><span class="pre">umbp_master</span></code> along with every engine/worker whenever node topology (count, capacity, drives) changes</p></td>
+</tr>
+<tr class="row-odd"><td><p>Resend right after a write misses instead of hitting</p></td>
+<td><p>Write-through acks drain asynchronously; a flush/resend that lands before the SSD write actually completes evicts the key with no L3 trace. Give it a moment (scales with value size) before flushing/resending</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="measured-l1-vs-l2-vs-l3">
+<h2>Measured: L1 vs L2 vs L3<a class="headerlink" href="#measured-l1-vs-l2-vs-l3" title="Link to this heading"></a></h2>
+<p>sglang HiCache, Kimi-K2.6-MXFP4, TP8, one fixed-length request per round. “Request
+length” is the <strong>prefix</strong>; every request appends and generates exactly 1 token on
+top, so the number <strong>is</strong> TTFT. Each tier isolated by forcing a resend to hit only
+that tier, verified against <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> per-tier hit counters rather than timing.
+8 physical drives / 4 shards, 2 local + 6 remote across 3 standalone workers on a
+second node. The engine’s own SSD capacity was shrunk to 1 MB so it can never be
+capacity-selected as a put target and leak reads back to its own idle disk.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Request length</p></th>
+<th class="head"><p>Cold recompute</p></th>
+<th class="head"><p>L1 hit</p></th>
+<th class="head"><p>L2 hit</p></th>
+<th class="head"><p>L3 hit</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>4K</p></td>
+<td><p>≈0.18s</p></td>
+<td><p>≈0.10s</p></td>
+<td><p>≈0.20s</p></td>
+<td><p>≈0.14s</p></td>
+</tr>
+<tr class="row-odd"><td><p>16K</p></td>
+<td><p>≈0.73s</p></td>
+<td><p>≈0.12s</p></td>
+<td><p>≈0.20s</p></td>
+<td><p>≈0.20s</p></td>
+</tr>
+<tr class="row-even"><td><p>32K</p></td>
+<td><p>≈1.42s</p></td>
+<td><p>≈0.14s</p></td>
+<td><p>≈0.21s</p></td>
+<td><p>≈0.27s</p></td>
+</tr>
+<tr class="row-odd"><td><p>128K</p></td>
+<td><p>≈7.7s</p></td>
+<td><p>≈0.29s</p></td>
+<td><p>≈0.45s</p></td>
+<td><p>≈0.84s</p></td>
+</tr>
+</tbody>
+</table>
+<p>L1 always wins. L3 closes almost all the way to L2 at small sizes — beating it at
+4K — but the gap widens with length, since an L3 hit still pays an SSD round trip.
+L3 is ~1.3x faster than cold recompute at 4K and ~9x by 128K.</p>
+</section>
+<section id="notes">
+<h2>Notes<a class="headerlink" href="#notes" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>Scope traps.</strong> <code class="docutils literal notranslate"><span class="pre">UMBP_ROUTE_PUT_SELECT_ALGO</span></code> is read by the master.
+<code class="docutils literal notranslate"><span class="pre">UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES</span></code> is read only by the standalone
+server binary — on the SGLang path the <code class="docutils literal notranslate"><span class="pre">ssd_staging_use_hugepages</span></code> JSON key is
+the one that takes effect; setting both covers either launch mode.
+<code class="docutils literal notranslate"><span class="pre">UMBP_DRAM_USE_HUGEPAGES</span></code> does nothing on a node whose medium is SSD — that
+node registers no DRAM pool.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cache_remote_fetches:</span> <span class="pre">false</span></code> keeps remote-fetch cost honest by not re-caching
+whole-object remote reads. It does <strong>not</strong> cover remote <em>ranged</em> reads: those
+land the object in the local medium whenever it is already in hand (the fetch
+brought all of it), which costs nothing on the wire. The extra background
+pull, which does cost a second copy on the wire, is
+<code class="docutils literal notranslate"><span class="pre">ranged_locality_prefetch:</span> <span class="pre">false</span></code>
+locally. Turn it on for a production hit-rate setup.</p></li>
+<li><p><strong>SPDK.</strong> <code class="docutils literal notranslate"><span class="pre">UMBP_SPDK_REACTOR_MASK</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">0x1</span></code> — a single core polling
+all drives. Give it at least one core per drive (<code class="docutils literal notranslate"><span class="pre">0x3</span></code>, <code class="docutils literal notranslate"><span class="pre">0xf</span></code>, …) before
+expecting multi-drive scaling on that path. Multi-drive tiers and SPDK RAID0
+compose; a drive in the list may itself be a RAID0 bdev.</p></li>
+<li><p>Every setting above is also a plain field on <code class="docutils literal notranslate"><span class="pre">UMBPConfig</span></code> / <code class="docutils literal notranslate"><span class="pre">UMBPDistributedConfig</span></code>
+for callers driving the client directly, without SGLang.</p></li>
+</ul>
+<p>Full env-var reference: <a class="reference external" href="https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md">runtime-env-vars.md</a>.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="umbp-configuration.html" class="btn btn-neutral float-left" title="UMBP Runtime-Tunable Environment Variables" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="umbp-numa-tier-placement.html" class="btn btn-neutral float-right" title="NUMA placement for a DRAM tier" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.
+      <span class="lastupdated">Last updated on 2026-11-13.
+      </span></p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

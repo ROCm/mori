@@ -1,0 +1,1167 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GEMM + all-reduce &mdash; MORI development (6206eebd) documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=dff4fcea"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="GEMM + reduce-scatter" href="fused-gemm-rs.html" />
+    <link rel="prev" title="MORI-FUSED: Fused GEMM + Collective Operators" href="MORI-CCO-FUSED-OPS-GUIDE.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-EP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">User guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an API and backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">Benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">V1 vs V2 inter-node performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA bandwidth in the kernels</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-FUSED</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">Overview</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">GEMM + all-reduce</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#what-it-computes">1. What it computes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#how-it-works">2. How it works</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#requirements">3. Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#constructor">4. Constructor</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#window-bytes-for">window_bytes_for()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#calling-the-operator">5. Calling the operator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#other-methods">6. Other methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#padded-m">padded_m()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#pad-rows">pad_rows()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#self-test">self_test()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#close-and-the-context-manager">close() and the context manager</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#attributes">Attributes</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#shapes-and-limits">7. Shapes and limits</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#choosing-settings">8. Choosing settings</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#performance">9. Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#complete-example">10. Complete example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#testing-and-benchmarking">11. Testing and benchmarking</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#troubleshooting">12. Troubleshooting</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#standalone-gemm-and-gemv">Standalone GEMM and GEMV</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#further-reading">Further reading</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-rs.html">GEMM + reduce-scatter</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-a2a.html">GEMM + all-to-all</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ag.html">GEMM + all-gather</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-ag-gemm.html">All-gather + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-a2a-gemm.html">All-to-all + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-tests-and-benchmarks.html">Tests and benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-SHMEM</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">SHMEM guide</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-CCO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">CCO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-device-api.html">Device API for FlyDSL and Triton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-examples.html">Examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-benchmarks.html">Benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-IO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">IO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">Benchmark</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-UMBP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="umbp-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-configuration.html">Configuration and environment variables</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-pure-ssd-mode.html">Pure-SSD mode and multi-drive tiers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-numa-tier-placement.html">NUMA placement for a DRAM tier</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-kv-indexer-export.html">KV indexer export</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-monitoring.html">Monitoring</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">PD disaggregation benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">Tier-management benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">Simulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">Calibration</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Tools</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ kernel profiler</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">Profiler API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP master client</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">JIT compilation framework</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">JIT v2 (in Chinese)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">UMBP single-node smoke test</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">GEMM + all-reduce</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/fused-gemm-ar.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="gemm-all-reduce">
+<h1>GEMM + all-reduce<a class="headerlink" href="#gemm-all-reduce" title="Link to this heading"></a></h1>
+<p><code class="docutils literal notranslate"><span class="pre">GemmAllReduceOp</span></code> (in <code class="docutils literal notranslate"><span class="pre">mori.ops.gemm_ar</span></code>) multiplies each rank’s activations by
+its shard of a row-parallel weight and all-reduces the product, so every rank
+gets the <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">N]</span></code> sum in bf16. It serves a RowParallelLinear under tensor
+parallelism, such as DeepSeek-V4’s attention output projection <code class="docutils literal notranslate"><span class="pre">wo_b</span></code>. The GEMM
+writes its C straight into the operator’s window, and the copy engine pushes
+each destination’s slice as soon as its last tile is written, so the
+reduce-scatter half of the all-reduce overlaps the rest of the GEMM. The reduce
+and all-gather run after it. The same pipeline stopped before the gather is
+<a class="reference internal" href="fused-gemm-rs.html"><span class="std std-doc">GEMM + reduce-scatter</span></a>.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#quick-reference">Quick Reference</a></p></li>
+<li><p><a class="reference internal" href="#what-it-computes">1. What it computes</a></p></li>
+<li><p><a class="reference internal" href="#how-it-works">2. How it works</a></p></li>
+<li><p><a class="reference internal" href="#requirements">3. Requirements</a></p></li>
+<li><p><a class="reference internal" href="#constructor">4. Constructor</a></p></li>
+<li><p><a class="reference internal" href="#calling-the-operator">5. Calling the operator</a></p></li>
+<li><p><a class="reference internal" href="#other-methods">6. Other methods</a></p></li>
+<li><p><a class="reference internal" href="#shapes-and-limits">7. Shapes and limits</a></p></li>
+<li><p><a class="reference internal" href="#choosing-settings">8. Choosing settings</a></p></li>
+<li><p><a class="reference internal" href="#performance">9. Performance</a></p></li>
+<li><p><a class="reference internal" href="#complete-example">10. Complete example</a></p></li>
+<li><p><a class="reference internal" href="#testing-and-benchmarking">11. Testing and benchmarking</a></p></li>
+<li><p><a class="reference internal" href="#troubleshooting">12. Troubleshooting</a></p></li>
+<li><p><a class="reference internal" href="#standalone-gemm-and-gemv">Standalone GEMM and GEMV</a></p></li>
+<li><p><a class="reference internal" href="#further-reading">Further reading</a></p></li>
+</ul>
+</section>
+<section id="quick-reference">
+<h2>Quick Reference<a class="headerlink" href="#quick-reference" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.gemm_ar</span><span class="w"> </span><span class="kn">import</span> <span class="n">GemmAllReduceOp</span><span class="p">,</span> <span class="n">preshuffle_b</span>
+
+<span class="c1"># comm: a mori.cco.Communicator whose per_rank_vmm was sized from</span>
+<span class="c1"># GemmAllReduceOp.window_bytes_for(world, **settings); see section 10.</span>
+<span class="n">settings</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">n</span><span class="o">=</span><span class="mi">7168</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="mi">16384</span><span class="p">,</span> <span class="n">quant</span><span class="o">=</span><span class="s2">"blockscale"</span><span class="p">)</span>  <span class="c1"># V4-Pro wo_b, TP8</span>
+<span class="k">with</span> <span class="n">GemmAllReduceOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="o">**</span><span class="n">settings</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>
+    <span class="n">op</span><span class="o">.</span><span class="n">self_test</span><span class="p">()</span>                                       <span class="c1"># collective, once per op</span>
+    <span class="n">b_shuffled</span> <span class="o">=</span> <span class="n">preshuffle_b</span><span class="p">(</span><span class="n">b_fp8</span><span class="p">)</span>                     <span class="c1"># [N, K] e4m3fn, once per weight</span>
+    <span class="n">m_pad</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">padded_m</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+    <span class="n">a_fp8</span><span class="p">,</span> <span class="n">a_scale</span> <span class="o">=</span> <span class="n">quantize_per_1x128</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">pad_rows</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">m_pad</span><span class="p">))</span>  <span class="c1"># your quantiser</span>
+    <span class="n">out</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">a_fp8</span><span class="p">,</span> <span class="n">b_shuffled</span><span class="p">,</span> <span class="n">a_scale</span><span class="p">,</span> <span class="n">b_scale</span><span class="p">)[:</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>  <span class="c1"># [M, N] bf16</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>                             <span class="c1"># before close() frees the window</span>
+</pre></div>
+</div>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>What</p></th>
+<th class="head"><p>Import</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>The operator</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops.gemm_ar</span> <span class="pre">import</span> <span class="pre">GemmAllReduceOp</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Weight and mxfp8 A-scale layouts</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops.gemm_ar</span> <span class="pre">import</span> <span class="pre">preshuffle_b,</span> <span class="pre">preshuffle_a_scale</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Shape predicate</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops.gemm_ar</span> <span class="pre">import</span> <span class="pre">supports</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Communicator</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.cco</span> <span class="pre">import</span> <span class="pre">Communicator,</span> <span class="pre">UniqueId</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Reduce-scatter variant</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops.gemm_ar</span> <span class="pre">import</span> <span class="pre">GemmReduceScatterOp</span></code> (<a class="reference internal" href="fused-gemm-rs.html"><span class="std std-doc">its page</span></a>)</p></td>
+</tr>
+<tr class="row-odd"><td><p>GEMM and GEMV with nothing fused</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops.gemm_ar</span> <span class="pre">import</span> <span class="pre">Mxfp8GemmOp,</span> <span class="pre">Mxfp8GemvOp</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="what-it-computes">
+<h2>1. What it computes<a class="headerlink" href="#what-it-computes" title="Link to this heading"></a></h2>
+<p>Rank <code class="docutils literal notranslate"><span class="pre">r</span></code> of <code class="docutils literal notranslate"><span class="pre">P</span></code> passes its activations <code class="docutils literal notranslate"><span class="pre">A_r</span></code> and its weight shard <code class="docutils literal notranslate"><span class="pre">B_r</span></code>, and
+every rank receives</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>out [M, N] bf16 = sum over r of  dequant(A_r [M, K]) @ dequant(B_r [N, K])^T
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">K</span></code> is the per-rank K, the slice of the layer’s input this rank holds; <code class="docutils literal notranslate"><span class="pre">N</span></code> is
+not sharded. The GEMM applies the <code class="docutils literal notranslate"><span class="pre">quant</span></code> scales and accumulates in fp32, and
+the reduce adds the <code class="docutils literal notranslate"><span class="pre">P</span></code> partials in fp32 and rounds once to bf16.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>Shape</p></th>
+<th class="head"><p>dtype</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>A (<code class="docutils literal notranslate"><span class="pre">a_fp8</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K]</span></code>, <code class="docutils literal notranslate"><span class="pre">M</span> <span class="pre">=</span> <span class="pre">op.padded_m(rows)</span></code>, the same on every rank</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">float8_e4m3fn</span></code>; bf16 with <code class="docutils literal notranslate"><span class="pre">quant=&quot;bf16&quot;</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>B (<code class="docutils literal notranslate"><span class="pre">b_preshuffled</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[N,</span> <span class="pre">K]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">float8_e4m3fn</span></code> through <code class="docutils literal notranslate"><span class="pre">preshuffle_b</span></code>; with <code class="docutils literal notranslate"><span class="pre">quant=&quot;bf16&quot;</span></code> the row-major bf16 weight</p></td>
+</tr>
+<tr class="row-even"><td><p>Scales</p></td>
+<td><p>per <code class="docutils literal notranslate"><span class="pre">quant</span></code>, see <a class="reference internal" href="#calling-the-operator">section 5</a></p></td>
+<td><p>fp32, int32, uint8, or none</p></td>
+</tr>
+<tr class="row-odd"><td><p>Result</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">N]</span></code> row-major; padded rows are zero</p></td>
+<td><p>bf16</p></td>
+</tr>
+</tbody>
+</table>
+<p>With bf16 wires every rank gets the same bytes; with <code class="docutils literal notranslate"><span class="pre">gather_dtype=&quot;fp8&quot;</span></code> the
+bands a rank receives come through e4m3 and its own band does not. The layer is
+a RowParallelLinear under tensor parallelism: the measured ones are the <code class="docutils literal notranslate"><span class="pre">wo_b</span></code>
+of DeepSeek-V4-Pro (TP8) and DeepSeek-V4.1-Flash (TP4) and Kimi-K3’s MLP
+<code class="docutils literal notranslate"><span class="pre">down_proj</span></code>; <code class="docutils literal notranslate"><span class="pre">quant=&quot;bf16&quot;</span></code> serves layers a checkpoint keeps in BF16, such as
+Kimi-K3’s attention <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>.</p>
+</section>
+<section id="how-it-works">
+<h2>2. How it works<a class="headerlink" href="#how-it-works" title="Link to this heading"></a></h2>
+<p>A call issues four or more kernels on the current stream:</p>
+<ol class="arabic simple">
+<li><p><strong>GEMM + scatter.</strong> The GEMM writes C into the window. Its rows split into
+<code class="docutils literal notranslate"><span class="pre">P</span></code> bands, one per destination, and each band into chunks; when a chunk’s
+last tile is written, the copy engine pushes the chunk into the
+destination’s receive slot. Tiles are walked chunk by chunk with the
+destination rotated by rank, so every link starts early.</p></li>
+<li><p><strong>Drain</strong>: waits for this rank’s pushes to land, then a cross-rank barrier.</p></li>
+<li><p><strong>Reduce</strong>: sums the <code class="docutils literal notranslate"><span class="pre">P</span></code> contributions to this rank’s band.</p></li>
+<li><p><strong>Gather</strong>: sends the reduced band to every peer. An fp8 gather adds a
+quantise kernel, then a CU pull that widens on the way in (<code class="docutils literal notranslate"><span class="pre">&quot;lsa&quot;</span></code>) or a
+copy-engine push and a dequantise kernel (<code class="docutils literal notranslate"><span class="pre">&quot;sdma&quot;</span></code>).</p></li>
+</ol>
+<p>Only the scatter overlaps the GEMM, so the gain depends on how much GEMM there
+is to hide it behind. A destination’s band is <code class="docutils literal notranslate"><span class="pre">M</span> <span class="pre">/</span> <span class="pre">(P</span> <span class="pre">*</span> <span class="pre">block_m)</span></code> tile rows,
+which the default plan pushes in the largest number of chunks, up to 8, that
+divides that count: more chunks start the first push earlier until the copy
+engine’s per-packet cost shows, and 8 is the measured knee. At <code class="docutils literal notranslate"><span class="pre">M</span> <span class="pre">=</span> <span class="pre">P</span> <span class="pre">*</span> <span class="pre">block_m</span></code>
+there is one chunk, pushed after the GEMM, and nothing overlaps.</p>
+<p>The window holds C for <code class="docutils literal notranslate"><span class="pre">m_max</span></code> rows, the <code class="docutils literal notranslate"><span class="pre">[m_max,</span> <span class="pre">N]</span></code> bf16 result, a <code class="docutils literal notranslate"><span class="pre">tmp</span></code> slot
+for this rank’s reduced slice (<code class="docutils literal notranslate"><span class="pre">m_max</span> <span class="pre">/</span> <span class="pre">P</span></code> rows), <code class="docutils literal notranslate"><span class="pre">P</span></code> receive slots of
+<code class="docutils literal notranslate"><span class="pre">m_max</span> <span class="pre">/</span> <span class="pre">P</span></code> rows, an fp8 copy of the result when the gather is fp8,
+and control words (barrier flags, a counter set per distinct M, submit locks),
+all laid out for <code class="docutils literal notranslate"><span class="pre">m_max</span></code>. It is about 700 MiB per rank at <code class="docutils literal notranslate"><span class="pre">m_max=16384</span></code>,
+N=7168, <code class="docutils literal notranslate"><span class="pre">P=8</span></code> with bf16 wires, and 812 MiB with an fp8 gather.</p>
+</section>
+<section id="requirements">
+<h2>3. Requirements<a class="headerlink" href="#requirements" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Requirement</p></th>
+<th class="head"><p>Detail</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>GPU</p></td>
+<td><p>MI355X (gfx950). The GEMM kernels are written for gfx950 only and every measurement is on MI355X. The constructor does not check the GPU; the only architecture check in the code is <code class="docutils literal notranslate"><span class="pre">schedule=&quot;wo_b&quot;</span></code>, which keeps the default plan anywhere else.</p></td>
+</tr>
+<tr class="row-odd"><td><p>FlyDSL</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'amd_mori[flydsl]'</span></code>. <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">mori.ops.gemm_ar</span></code>, <code class="docutils literal notranslate"><span class="pre">preshuffle_b</span></code> and <code class="docutils literal notranslate"><span class="pre">preshuffle_a_scale</span></code> work without it; touching <code class="docutils literal notranslate"><span class="pre">GemmAllReduceOp</span></code> raises <code class="docutils literal notranslate"><span class="pre">ModuleNotFoundError</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p>SDMA</p></td>
+<td><p>MORI built with <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code> (the default) and <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code> at run time. The constructor does not check that the communicator has SDMA queues, so <code class="docutils literal notranslate"><span class="pre">self_test()</span></code> is the only guard.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Ranks</p></td>
+<td><p>One node (one LSA domain), <code class="docutils literal notranslate"><span class="pre">P</span></code> = 2, 4 or 8. Every rank constructs the op and makes every call.</p></td>
+</tr>
+<tr class="row-even"><td><p>Memory</p></td>
+<td><p>A <code class="docutils literal notranslate"><span class="pre">Communicator</span></code> whose <code class="docutils literal notranslate"><span class="pre">per_rank_vmm</span></code> is sized from <code class="docutils literal notranslate"><span class="pre">window_bytes_for</span></code>, called with the constructor’s settings. Each op allocates its own window from that reservation, so add up the windows of every op alive at once.</p></td>
+</tr>
+</tbody>
+</table>
+<p>The rules this op shares with the other fused operators (padding, result
+aliasing, the collective contract, cleanup, fp8 operand and scale layouts) are
+in <a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#what-every-operator-has-in-common"><span class="std std-ref">What every operator has in common</span></a>.</p>
+</section>
+<section id="constructor">
+<h2>4. Constructor<a class="headerlink" href="#constructor" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">GemmAllReduceOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">m_max</span><span class="p">,</span> <span class="n">block_m</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">block_n</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span> <span class="n">sdma_queues</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                <span class="n">gather_dtype</span><span class="o">=</span><span class="s2">"bf16"</span><span class="p">,</span> <span class="n">gather_transport</span><span class="o">=</span><span class="s2">"lsa"</span><span class="p">,</span> <span class="n">quant</span><span class="o">=</span><span class="s2">"blockscale"</span><span class="p">,</span>
+                <span class="n">max_shapes</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">scatter_dtype</span><span class="o">=</span><span class="s2">"bf16"</span><span class="p">,</span> <span class="n">schedule</span><span class="o">=</span><span class="s2">"default"</span><span class="p">)</span>
+</pre></div>
+</div>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">comm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mori.cco.Communicator</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>The communicator; <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">comm.nranks</span></code>. The op does not take ownership.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">n</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Output width N: a multiple of 256, and of 1024 with <code class="docutils literal notranslate"><span class="pre">gather_dtype=&quot;fp8&quot;</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">k</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Per-rank K. fp8 quants: a multiple of 128, at least 256. <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code>: a multiple of 64, at least 128.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">m_max</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Largest per-rank M the op will serve, at least 1. Rounded up to a multiple of <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">*</span> <span class="pre">block_m</span></code> (<code class="docutils literal notranslate"><span class="pre">op.m_max</span></code> holds the rounded value). Sizes the window, which cannot grow.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">block_m</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Tile rows, which are also the padding granule. <code class="docutils literal notranslate"><span class="pre">None</span></code> picks the quant’s tile: 128 for <code class="docutils literal notranslate"><span class="pre">&quot;blockscale&quot;</span></code>, 256 otherwise. <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8&quot;</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8_raw&quot;</span></code> accept only 256, <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code> 128 or 256, and <code class="docutils literal notranslate"><span class="pre">&quot;blockscale&quot;</span></code> any positive multiple of 128, though 128 is its measured tile (256x256 spills registers).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">block_n</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
+<td><p>Tile columns. Only 256 is accepted: the epilogue’s lane transpose pairs exactly two N-tiles.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>SDMA queues per (source, destination) pair, at least 1. One is all the pipeline uses; more only adds idle queues, and in a process that already holds SDMA queues their creation fails. The first dev-comm on a communicator fixes the count.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">gather_dtype</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code></p></td>
+<td><p>Wire dtype of the all-gather leg: <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code> (exact) or <code class="docutils literal notranslate"><span class="pre">&quot;fp8&quot;</span></code> (e4m3 with one fp32 scale per row, half the bytes; relL2 2.5e-2 against 2.4e-3 with a bf16 wire).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gather_transport</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;lsa&quot;</span></code></p></td>
+<td><p>Who moves an fp8 gather: <code class="docutils literal notranslate"><span class="pre">&quot;lsa&quot;</span></code> (the CUs pull each peer’s band over xGMI and widen it, one kernel) or <code class="docutils literal notranslate"><span class="pre">&quot;sdma&quot;</span></code> (the copy engines push, then a dequantise kernel). No effect with a bf16 gather.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">quant</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;blockscale&quot;</span></code></p></td>
+<td><p>Operand contract. <code class="docutils literal notranslate"><span class="pre">&quot;blockscale&quot;</span></code>: fp8, A 1x128 and B 128x128 fp32 scales (DeepSeek-V4-Pro). <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8&quot;</span></code>: fp8, 32-wide ue8m0 scales, A’s through <code class="docutils literal notranslate"><span class="pre">preshuffle_a_scale</span></code> (DeepSeek-V4.1-Flash). <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8_raw&quot;</span></code>: the same numbers with the quantiser’s row-major uint8 scales, staged through LDS. <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code>: bf16 A and B, no scales, bf16 scatter wire. There is no <code class="docutils literal notranslate"><span class="pre">&quot;ptpc&quot;</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_shapes</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Most distinct M plans the instance serves, at least 1; each takes a counter set. <code class="docutils literal notranslate"><span class="pre">None</span></code> reserves one for every padded M up to <code class="docutils literal notranslate"><span class="pre">m_max</span></code>, plus the <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> plans, so a legal call never runs out.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scatter_dtype</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code></p></td>
+<td><p>Wire dtype of the scatter leg: <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;fp8&quot;</span></code>, a lossy opt-in (the epilogue quantises with one fp32 scale per row and 256-column tile). Not with <code class="docutils literal notranslate"><span class="pre">quant=&quot;bf16&quot;</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">schedule</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;default&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;default&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;wo_b&quot;</span></code>, the measured MI355X padding and chunk profile for two <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> targets (<a class="reference internal" href="#choosing-settings">section 8</a>). With <code class="docutils literal notranslate"><span class="pre">&quot;wo_b&quot;</span></code>, pass <code class="docutils literal notranslate"><span class="pre">logical_m=</span></code> on every call.</p></td>
+</tr>
+</tbody>
+</table>
+<p>Construction is collective. It raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> for a setting outside these
+rules (<a class="reference internal" href="#shapes-and-limits">section 7</a>) before allocating anything, and
+<code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> from the communicator if the window does not fit; on failure it
+releases whatever it had acquired.</p>
+<section id="window-bytes-for">
+<h3>window_bytes_for()<a class="headerlink" href="#window-bytes-for" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">GemmAllReduceOp</span><span class="o">.</span><span class="n">window_bytes_for</span><span class="p">(</span><span class="n">world_size</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">m_max</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">block_m</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="n">gather_dtype</span><span class="o">=</span><span class="s2">"bf16"</span><span class="p">,</span> <span class="n">gather_transport</span><span class="o">=</span><span class="s2">"lsa"</span><span class="p">,</span> <span class="n">max_shapes</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="n">quant</span><span class="o">=</span><span class="s2">"blockscale"</span><span class="p">,</span> <span class="n">scatter_dtype</span><span class="o">=</span><span class="s2">"bf16"</span><span class="p">,</span> <span class="n">schedule</span><span class="o">=</span><span class="s2">"default"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span>
+</pre></div>
+</div>
+<p>Static. The bytes the window will take, by the constructor’s own planning rules:
+<code class="docutils literal notranslate"><span class="pre">op.window_bytes</span></code> equals it for the same settings. <code class="docutils literal notranslate"><span class="pre">world_size</span></code> is
+<code class="docutils literal notranslate"><span class="pre">comm.nranks</span></code>; the rest mean what they mean for the constructor, and <code class="docutils literal notranslate"><span class="pre">k</span></code> may be
+omitted except with <code class="docutils literal notranslate"><span class="pre">schedule=&quot;wo_b&quot;</span></code>. <code class="docutils literal notranslate"><span class="pre">block_n</span></code> and <code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code> do not change
+the window. It raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> for an unknown <code class="docutils literal notranslate"><span class="pre">quant</span></code>, a <code class="docutils literal notranslate"><span class="pre">block_m</span></code> the quant
+forbids, a non-positive size, or a world size or fp8-gather N the window cannot
+take; N and K against the GEMM are the constructor’s checks.</p>
+</section>
+</section>
+<section id="calling-the-operator">
+<h2>5. Calling the operator<a class="headerlink" href="#calling-the-operator" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">out</span> <span class="o">=</span> <span class="n">op</span><span class="p">(</span><span class="n">a_fp8</span><span class="p">,</span> <span class="n">b_preshuffled</span><span class="p">,</span> <span class="n">a_scale</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">b_scale</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">logical_m</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+</pre></div>
+</div>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Argument</p></th>
+<th class="head"><p>Shape</p></th>
+<th class="head"><p>dtype</p></th>
+<th class="head"><p>Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">a_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">float8_e4m3fn</span></code> (bf16 with <code class="docutils literal notranslate"><span class="pre">quant=&quot;bf16&quot;</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">M</span> <span class="pre">=</span> <span class="pre">op.padded_m(rows)</span></code>, the same on every rank, at most <code class="docutils literal notranslate"><span class="pre">op.m_max</span></code>. On the GPU; a non-contiguous tensor is copied.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">b_preshuffled</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[N,</span> <span class="pre">K]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">float8_e4m3fn</span></code> (bf16 with <code class="docutils literal notranslate"><span class="pre">quant=&quot;bf16&quot;</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">preshuffle_b(w)</span></code>, once per weight (the byte order of aiter’s <code class="docutils literal notranslate"><span class="pre">shuffle_weight(x,</span> <span class="pre">layout=(16,</span> <span class="pre">16))</span></code>); for <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code> the checkpoint’s row-major weight, not shuffled.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">a_scale</span></code>, <code class="docutils literal notranslate"><span class="pre">b_scale</span></code></p></td>
+<td><p>per <code class="docutils literal notranslate"><span class="pre">quant</span></code>, below</p></td>
+<td><p>per <code class="docutils literal notranslate"><span class="pre">quant</span></code>, below</p></td>
+<td><p>On the GPU; <code class="docutils literal notranslate"><span class="pre">None</span></code> for <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">logical_m</span></code></p></td>
+<td><p></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p>Keyword-only: the rows before padding. Selects the fitted plan with <code class="docutils literal notranslate"><span class="pre">schedule=&quot;wo_b&quot;</span></code>; otherwise optional, and <code class="docutils literal notranslate"><span class="pre">op.padded_m(logical_m)</span></code> must equal M.</p></td>
+</tr>
+</tbody>
+</table>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">quant</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">a_scale</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">b_scale</span></code></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;blockscale&quot;</span></code></p></td>
+<td><p>fp32, <code class="docutils literal notranslate"><span class="pre">M*K/128</span></code> values: <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K/128]</span></code> column-major (stride <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">M)</span></code>), <code class="docutils literal notranslate"><span class="pre">[K/128,</span> <span class="pre">M]</span></code>, or flat with <code class="docutils literal notranslate"><span class="pre">(row,</span> <span class="pre">kb)</span></code> at <code class="docutils literal notranslate"><span class="pre">kb</span> <span class="pre">*</span> <span class="pre">M</span> <span class="pre">+</span> <span class="pre">row</span></code></p></td>
+<td><p>fp32 <code class="docutils literal notranslate"><span class="pre">[N/128,</span> <span class="pre">K/128]</span></code> row-major</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;mxfp8&quot;</span></code></p></td>
+<td><p>int32, flat: <code class="docutils literal notranslate"><span class="pre">preshuffle_a_scale(a_exps)</span></code>, <code class="docutils literal notranslate"><span class="pre">a_exps</span></code> the <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K/32]</span></code> ue8m0 bytes</p></td>
+<td><p>int32, flat: <code class="docutils literal notranslate"><span class="pre">w_exps.t().contiguous().to(torch.int32).reshape(-1)</span></code> from the <code class="docutils literal notranslate"><span class="pre">[N/32,</span> <span class="pre">K/32]</span></code> bytes</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;mxfp8_raw&quot;</span></code></p></td>
+<td><p>uint8 <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K/32]</span></code> as the quantiser emits it, 2-D or flat</p></td>
+<td><p>uint8 <code class="docutils literal notranslate"><span class="pre">[N/32,</span> <span class="pre">K/32]</span></code>, 2-D or flat</p></td>
+</tr>
+</tbody>
+</table>
+<p>A blockscale <code class="docutils literal notranslate"><span class="pre">a_scale</span></code> that is <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K/128]</span></code> row-major is refused as ambiguous:
+pass <code class="docutils literal notranslate"><span class="pre">.reshape(-1)</span></code> for a K/128-major buffer (what
+<code class="docutils literal notranslate"><span class="pre">aiter_per1x128_quant(transpose_scale=True)</span></code> returns) or <code class="docutils literal notranslate"><span class="pre">.t()</span></code> for a logical
+row-major tensor.</p>
+<p><strong>Returns</strong> an <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">N]</span></code> bf16 row-major tensor that is a view of the op’s window,
+holding the result once the work queued on the current stream has run. Every
+M’s result starts at the same address, so this rank’s next call overwrites it
+and <code class="docutils literal notranslate"><span class="pre">close()</span></code> frees it: order its readers before the next call (same stream, or
+an event the next call’s stream waits on), and <code class="docutils literal notranslate"><span class="pre">.clone()</span></code> it to keep it. Padded
+rows are zero; slice <code class="docutils literal notranslate"><span class="pre">[:logical_m]</span></code>. The first call at a new M compiles that M’s
+kernels. One instance is not usable concurrently: the window, the kernel cache
+and the padding buffer are shared.</p>
+</section>
+<section id="other-methods">
+<h2>6. Other methods<a class="headerlink" href="#other-methods" title="Link to this heading"></a></h2>
+<section id="padded-m">
+<h3>padded_m()<a class="headerlink" href="#padded-m" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">op.padded_m(m)</span> <span class="pre">-&gt;</span> <span class="pre">int</span></code>: the physical rows for <code class="docutils literal notranslate"><span class="pre">m</span></code> logical rows, <code class="docutils literal notranslate"><span class="pre">m</span></code> rounded up
+to a multiple of <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">*</span> <span class="pre">block_m</span></code> or, with <code class="docutils literal notranslate"><span class="pre">schedule=&quot;wo_b&quot;</span></code>, the fitted plan’s
+rows at a profiled M (8200 gives 9216 at V4-Pro TP8, 4200 gives 4224 at
+V4.1-Flash TP4). It keeps no state. <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> if <code class="docutils literal notranslate"><span class="pre">m</span> <span class="pre">&lt;</span> <span class="pre">1</span></code>. The module
+function <code class="docutils literal notranslate"><span class="pre">padded_m(m,</span> <span class="pre">world_size,</span> <span class="pre">block_m=128)</span></code> applies the default rule.</p>
+</section>
+<section id="pad-rows">
+<h3>pad_rows()<a class="headerlink" href="#pad-rows" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">op.pad_rows(x,</span> <span class="pre">m_pad)</span> <span class="pre">-&gt;</span> <span class="pre">Tensor</span></code>: zero-extends a 2-D <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K]</span></code> tensor to
+<code class="docutils literal notranslate"><span class="pre">m_pad</span></code> rows in a buffer the op reuses and returns a view of it, which the next
+<code class="docutils literal notranslate"><span class="pre">pad_rows</span></code> overwrites. Pad before quantising. The buffer is reallocated when a
+call needs more rows or a different K, dtype or device, and a captured graph
+keeps the old address, so run the largest M through it before capturing.
+<code class="docutils literal notranslate"><span class="pre">ValueError</span></code> if <code class="docutils literal notranslate"><span class="pre">x</span></code> is not 2-D or <code class="docutils literal notranslate"><span class="pre">m_pad</span> <span class="pre">&lt;</span> <span class="pre">M</span></code>.</p>
+</section>
+<section id="self-test">
+<h3>self_test()<a class="headerlink" href="#self-test" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">op.self_test(m=None)</span></code>, collective: writes <code class="docutils literal notranslate"><span class="pre">rank</span> <span class="pre">+</span> <span class="pre">1</span></code> over the input region,
+runs scatter, reduce and gather without a GEMM, and checks every output element
+is <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">*</span> <span class="pre">(P</span> <span class="pre">+</span> <span class="pre">1)</span> <span class="pre">/</span> <span class="pre">2</span></code> within 1%; otherwise it raises <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> naming
+<code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA</span></code> and <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA</span></code>. The logical <code class="docutils literal notranslate"><span class="pre">m</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">m_max</span></code>,
+which compiles what the first real call needs. Call it once on every rank after
+construction and before any capture; it synchronises and overwrites the window.</p>
+</section>
+<section id="close-and-the-context-manager">
+<h3>close() and the context manager<a class="headerlink" href="#close-and-the-context-manager" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">op.close()</span></code> deregisters the window and frees its memory. It is idempotent, and
+a closed op raises <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code>. Dropping the object is not enough, because
+the communicator holds the handles; the dev-comm and its SDMA queues stay with
+the communicator. Synchronise first if work may be in flight.
+<code class="docutils literal notranslate"><span class="pre">with</span> <span class="pre">GemmAllReduceOp(...)</span> <span class="pre">as</span> <span class="pre">op:</span></code> calls <code class="docutils literal notranslate"><span class="pre">close()</span></code> on exit.</p>
+</section>
+<section id="attributes">
+<h3>Attributes<a class="headerlink" href="#attributes" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">window_bytes</span></code> (equal to <code class="docutils literal notranslate"><span class="pre">window_bytes_for</span></code>), <code class="docutils literal notranslate"><span class="pre">m_max</span></code> (padded) and the
+constructor’s settings are plain attributes, for reading. <code class="docutils literal notranslate"><span class="pre">dev_comm.sdma_num_queue</span></code>
+is the number of SDMA queues per peer the communicator actually connected.</p>
+</section>
+</section>
+<section id="shapes-and-limits">
+<h2>7. Shapes and limits<a class="headerlink" href="#shapes-and-limits" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">supports(m,</span> <span class="pre">n,</span> <span class="pre">k,</span> <span class="pre">world_size,</span> <span class="pre">*,</span> <span class="pre">block_m=None,</span> <span class="pre">block_n=256,</span> <span class="pre">gather_dtype=&quot;bf16&quot;,</span> <span class="pre">gather_transport=&quot;lsa&quot;,</span> <span class="pre">quant=&quot;blockscale&quot;,</span> <span class="pre">scatter_dtype=&quot;bf16&quot;,</span> <span class="pre">schedule=&quot;default&quot;)</span></code> takes a logical M and the constructor’s settings and
+returns <code class="docutils literal notranslate"><span class="pre">False</span></code> where these rules fail, without constructing anything; it does
+not apply the <code class="docutils literal notranslate"><span class="pre">block_n</span> <span class="pre">==</span> <span class="pre">256</span></code> rule or the bf16-scatter rule. It says whether a
+shape is expressible, not whether fusing it is faster.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Constraint</p></th>
+<th class="head"><p>Value</p></th>
+<th class="head"><p>Error if violated</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">quant</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;blockscale&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8_raw&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">quant=...</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">one</span> <span class="pre">of</span> <span class="pre">[...]</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">block_m</span></code></p></td>
+<td><p>256 for the mxfp8 quants; 128 or 256 for <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code>; a positive multiple of 128 for <code class="docutils literal notranslate"><span class="pre">&quot;blockscale&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">quant='mxfp8'</span> <span class="pre">requires</span> <span class="pre">block_m=256</span> <span class="pre">...</span></code>, <code class="docutils literal notranslate"><span class="pre">quant='bf16'</span> <span class="pre">requires</span> <span class="pre">block_m</span> <span class="pre">in</span> <span class="pre">(128,</span> <span class="pre">256)</span></code>, or <code class="docutils literal notranslate"><span class="pre">unsupported</span> <span class="pre">tile:</span> <span class="pre">block_m=...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">positive</span> <span class="pre">multiple</span> <span class="pre">of</span> <span class="pre">128</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">block_n</span></code></p></td>
+<td><p>256</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">block_n=...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">256:</span> <span class="pre">the</span> <span class="pre">permlane</span> <span class="pre">epilogue's</span> <span class="pre">lane</span> <span class="pre">transpose</span> <span class="pre">pairs</span> <span class="pre">exactly</span> <span class="pre">two</span> <span class="pre">N-tiles</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Wire and transport strings</p></td>
+<td><p>dtypes <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;fp8&quot;</span></code>; transports <code class="docutils literal notranslate"><span class="pre">&quot;lsa&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;sdma&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">scatter_dtype=...</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">one</span> <span class="pre">of</span> <span class="pre">...</span></code> (likewise the others)</p></td>
+</tr>
+<tr class="row-even"><td><p>Scatter wire with <code class="docutils literal notranslate"><span class="pre">quant=&quot;bf16&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">quant='bf16'</span> <span class="pre">supports</span> <span class="pre">only</span> <span class="pre">the</span> <span class="pre">bf16</span> <span class="pre">scatter</span> <span class="pre">wire</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">schedule</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;default&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;wo_b&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">unknown</span> <span class="pre">schedule=...;</span> <span class="pre">use</span> <span class="pre">'default'</span> <span class="pre">or</span> <span class="pre">'wo_b'</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">m_max</span></code>, <code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code>, <code class="docutils literal notranslate"><span class="pre">max_shapes</span></code></p></td>
+<td><p>at least 1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">m_max</span> <span class="pre">and</span> <span class="pre">sdma_queues</span> <span class="pre">must</span> <span class="pre">both</span> <span class="pre">be</span> <span class="pre">&gt;=</span> <span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">max_shapes</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">&gt;=</span> <span class="pre">1</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>K, fp8 quants</p></td>
+<td><p>a multiple of 128, at least 256</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">unsupported</span> <span class="pre">shape:</span> <span class="pre">K=...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">multiple</span> <span class="pre">of</span> <span class="pre">128</span> <span class="pre">...</span></code> or <code class="docutils literal notranslate"><span class="pre">...</span> <span class="pre">is</span> <span class="pre">below</span> <span class="pre">the</span> <span class="pre">minimum</span> <span class="pre">256</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>K, <code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code></p></td>
+<td><p>a multiple of 64, at least 128</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">unsupported</span> <span class="pre">shape:</span> <span class="pre">K=...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">multiple</span> <span class="pre">of</span> <span class="pre">64</span> <span class="pre">and</span> <span class="pre">&gt;=</span> <span class="pre">128</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>N</p></td>
+<td><p>a multiple of 256</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">unsupported</span> <span class="pre">shape:</span> <span class="pre">N=...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">multiple</span> <span class="pre">of</span> <span class="pre">block_n=256</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>N, <code class="docutils literal notranslate"><span class="pre">gather_dtype=&quot;fp8&quot;</span></code></p></td>
+<td><p>a multiple of 1024</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">the</span> <span class="pre">fp8</span> <span class="pre">wire</span> <span class="pre">gives</span> <span class="pre">one</span> <span class="pre">wave</span> <span class="pre">one</span> <span class="pre">row</span> <span class="pre">...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">multiple</span> <span class="pre">of</span> <span class="pre">1024</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Ranks <code class="docutils literal notranslate"><span class="pre">P</span></code></p></td>
+<td><p>2, 4 or 8 (in [2, 8] and dividing 512)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">in</span> <span class="pre">[2,</span> <span class="pre">8]</span></code>, <code class="docutils literal notranslate"><span class="pre">threads</span> <span class="pre">(512)</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">divisible</span> <span class="pre">by</span> <span class="pre">world_size</span> <span class="pre">...</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Call M</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">op.padded_m(logical)</span></code>, at most <code class="docutils literal notranslate"><span class="pre">op.m_max</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">M=...</span> <span class="pre">does</span> <span class="pre">not</span> <span class="pre">match</span> <span class="pre">planned</span> <span class="pre">padded</span> <span class="pre">M=...;</span> <span class="pre">use</span> <span class="pre">padded_m()/pad_rows()</span> <span class="pre">and</span> <span class="pre">pass</span> <span class="pre">the</span> <span class="pre">original</span> <span class="pre">logical_m</span></code>, <code class="docutils literal notranslate"><span class="pre">M=...</span> <span class="pre">exceeds</span> <span class="pre">the</span> <span class="pre">window's</span> <span class="pre">m_max=...</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Distinct M plans</p></td>
+<td><p>at most <code class="docutils literal notranslate"><span class="pre">max_shapes</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">this</span> <span class="pre">op</span> <span class="pre">already</span> <span class="pre">serves</span> <span class="pre">...</span> <span class="pre">distinct</span> <span class="pre">M</span> <span class="pre">values</span> <span class="pre">...;</span> <span class="pre">raise</span> <span class="pre">max_shapes,</span> <span class="pre">or</span> <span class="pre">pad</span> <span class="pre">to</span> <span class="pre">fewer</span> <span class="pre">distinct</span> <span class="pre">M</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>A and B</p></td>
+<td><p>exact shape; dtype per <code class="docutils literal notranslate"><span class="pre">quant</span></code> (<code class="docutils literal notranslate"><span class="pre">float8_e4m3fnuz</span></code> refused); on the GPU</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">a_fp8</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">(M,</span> <span class="pre">K),</span> <span class="pre">got</span> <span class="pre">...</span></code>, <code class="docutils literal notranslate"><span class="pre">a_fp8</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">one</span> <span class="pre">of</span> <span class="pre">['torch.float8_e4m3fn'],</span> <span class="pre">got</span> <span class="pre">...</span></code>, <code class="docutils literal notranslate"><span class="pre">...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">on</span> <span class="pre">a</span> <span class="pre">GPU</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Scales</p></td>
+<td><p>dtype, element count and layout per <code class="docutils literal notranslate"><span class="pre">quant</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code>: <code class="docutils literal notranslate"><span class="pre">a_scale</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">torch.float32,</span> <span class="pre">got</span> <span class="pre">...</span></code>, <code class="docutils literal notranslate"><span class="pre">...</span> <span class="pre">must</span> <span class="pre">have</span> <span class="pre">...</span> <span class="pre">elements</span></code>, <code class="docutils literal notranslate"><span class="pre">a_scale</span> <span class="pre">is</span> <span class="pre">(M,</span> <span class="pre">K/128)</span> <span class="pre">row-major,</span> <span class="pre">which</span> <span class="pre">is</span> <span class="pre">ambiguous</span> <span class="pre">...</span></code>, <code class="docutils literal notranslate"><span class="pre">quant='bf16'</span> <span class="pre">takes</span> <span class="pre">no</span> <span class="pre">scales;</span> <span class="pre">pass</span> <span class="pre">None</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Lifetime</p></td>
+<td><p>not closed</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code>: <code class="docutils literal notranslate"><span class="pre">this</span> <span class="pre">GemmAllReduceOp</span> <span class="pre">has</span> <span class="pre">been</span> <span class="pre">closed</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Window</p></td>
+<td><p>fits the free VMM reservation</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code>: <code class="docutils literal notranslate"><span class="pre">ccoMemAlloc</span> <span class="pre">failed:</span> <span class="pre">...</span></code> (logged: <code class="docutils literal notranslate"><span class="pre">slot</span> <span class="pre">exhausted</span> <span class="pre">...</span> <span class="pre">Increase</span> <span class="pre">perRankVmmSize</span></code>)</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="choosing-settings">
+<h2>8. Choosing settings<a class="headerlink" href="#choosing-settings" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Setting</p></th>
+<th class="head"><p>What the default picks</p></th>
+<th class="head"><p>Change it when</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">quant</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;blockscale&quot;</span></code></p></td>
+<td><p>the checkpoint is mxfp8 or BF16. <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8_raw&quot;</span></code> takes the quantiser’s bytes with no shuffle; GEMM-only it measured faster cold and at large M, a few percent slower hot at small M or short K, and the two are not compared at K of 4096 and more</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">block_m</span></code></p></td>
+<td><p>the quant’s tile: 128 for blockscale, 256 otherwise</p></td>
+<td><p>rarely: blockscale takes other granule-legal tiles, and bf16 also takes 128, which doubles the grid at small M; the mxfp8 forms need 256</p></td>
+</tr>
+<tr class="row-even"><td><p>Chunks</p></td>
+<td><p>the largest divisor of the bands per destination, up to 8</p></td>
+<td><p>not a parameter; <code class="docutils literal notranslate"><span class="pre">schedule=&quot;wo_b&quot;</span></code> changes it at measured M</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">schedule</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;default&quot;</span></code>: pad to <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">*</span> <span class="pre">block_m</span></code></p></td>
+<td><p>V4-Pro TP8 or V4.1-Flash TP4 <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> on MI355X (below)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gather_dtype</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code>, exact</p></td>
+<td><p>the accuracy budget allows relL2 about 2.5e-2 for a gather half the size</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">gather_transport</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;lsa&quot;</span></code></p></td>
+<td><p>keep: the pull measured faster than the push on both targets</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scatter_dtype</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;bf16&quot;</span></code></p></td>
+<td><p>V4.1-Flash TP4, once accuracy is checked: faster there, slower on V4-Pro TP8</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code>, <code class="docutils literal notranslate"><span class="pre">max_shapes</span></code></p></td>
+<td><p>1; every padded M up to <code class="docutils literal notranslate"><span class="pre">m_max</span></code></p></td>
+<td><p>keep</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>The fp8 gather</strong> halves the bytes of the leg that runs at the xGMI ceiling. At
+V4-Pro TP8, M=16384, the fused layer measured 957.3 µs with the LSA pull,
+1018.9 µs with the SDMA push and 1150.7 µs on the bf16 wire; relL2 against an
+fp32 reference went from 2.35e-3 to 2.49e-2. At the model output it was not
+detectable: V4-Pro’s perplexity on 10941 tokens was 3.2671, inside the 3.2547 to
+3.2680 of three bf16 runs. No reasoning, code or maths benchmark has been run.</p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">schedule=&quot;wo_b&quot;</span></code></strong> applies only on gfx950, to two targets. At <code class="docutils literal notranslate"><span class="pre">P=8</span></code>, N=7168,
+K=2048, <code class="docutils literal notranslate"><span class="pre">&quot;blockscale&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">block_m=128</span></code>, both wires bf16: logical M=8200 keeps
+9216 rows and pushes two bands at a time, and M=11264 and 13312 push one band
+at a time. At <code class="docutils literal notranslate"><span class="pre">P=4</span></code>, N=5120, K=2048, <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">block_m=256</span></code>: M=4200 and 8200
+pad to a multiple of 64 (4224, 8256) and push one band at a time, with both
+wires bf16, or with <code class="docutils literal notranslate"><span class="pre">scatter_dtype=&quot;fp8&quot;</span></code> and a bf16 gather or an fp8 gather
+over LSA; with both wires bf16, M=11264 also pushes two bands at a time. Every
+other M, shape or setting keeps the default plan: it is a finite measured
+profile, not an interpolation rule.</p>
+<p><strong>Whether to fuse at your M.</strong> At V4.1-Flash TP4 against the model’s unfused
+path (<a class="reference internal" href="#performance">section 9</a>), the fp8 wire is ahead from M=2048 in every
+row, and the bf16 wire is behind at 1024, 2048, 4200 and 4700 and ahead from
+7200. SGLang’s integration fuses that layer from M=8192 on the bf16 wire and
+from M=2048 on the fp8 wire, and V4-Pro’s from M=4096. Below that, run the GEMM
+(or <a class="reference internal" href="#standalone-gemm-and-gemv"><code class="docutils literal notranslate"><span class="pre">Mxfp8GemmOp</span></code></a>) and your usual all-reduce.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Environment variable</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Effect</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Must be <code class="docutils literal notranslate"><span class="pre">1</span></code>. Without it the communicator creates no SDMA queues and every put moves nothing.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_GEMM_AR_PULL_BLOCKS</span></code></p></td>
+<td><p>64</p></td>
+<td><p>Grid of the LSA pull, so only with an fp8 gather over <code class="docutils literal notranslate"><span class="pre">&quot;lsa&quot;</span></code>; read when an M is compiled. At V4-Pro TP8, M=16384, 48 to 80 blocks measured 959 to 963 µs, against 1261 at 16 and 1184 at 512.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SOCKET_IFNAME</span></code></p></td>
+<td><p>first non-loopback NIC</p></td>
+<td><p>Interface the communicator’s bootstrap uses; the tests set <code class="docutils literal notranslate"><span class="pre">lo</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="performance">
+<h2>9. Performance<a class="headerlink" href="#performance" title="Link to this heading"></a></h2>
+<p>All from the <a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ar/README.md">README</a>,
+on MI355X (gfx950), in µs, with the conditions given for each table.</p>
+<p><code class="docutils literal notranslate"><span class="pre">wo_b</span></code> at M=16384, maximum over ranks. V4-Pro is on 8x MI355X, median of 11.
+V4.1-Flash is on 4x MI355X, from the README’s fp8-wire comparison; its fused
+bf16-wire cell comes from a different run and is left out here:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head text-right"><p>DeepSeek-V4-Pro (TP8, blockscale)</p></th>
+<th class="head text-right"><p>DeepSeek-V4.1-Flash (TP4, mxfp8)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>split SDMA, bf16 wire</p></td>
+<td class="text-right"><p>1472.9</p></td>
+<td class="text-right"><p>1592.5</p></td>
+</tr>
+<tr class="row-odd"><td><p>fused, bf16 wire</p></td>
+<td class="text-right"><p>1148.8</p></td>
+<td class="text-right"><p>—</p></td>
+</tr>
+<tr class="row-even"><td><p>fused, fp8 wire</p></td>
+<td class="text-right"><p><strong>979.3</strong></p></td>
+<td class="text-right"><p><strong>1192.1</strong> (over LSA)</p></td>
+</tr>
+<tr class="row-odd"><td><p>GEMM + NCCL, as the model ships</p></td>
+<td class="text-right"><p>1419.5</p></td>
+<td class="text-right"><p>—</p></td>
+</tr>
+</tbody>
+</table>
+<p>At smaller M on V4-Pro the order holds: 398.1 split, 351.0 fused and 329.5
+fused with the fp8 gather at M=4096; 722.0, 621.1 and 539.3 at M=8192.</p>
+<p>V4.1-Flash TP4 against what the model runs today,
+<code class="docutils literal notranslate"><span class="pre">mxfp8_native_blockscaled_linear</span></code> and then an all-reduce (the route is
+<code class="docutils literal notranslate"><span class="pre">dot_scaled</span></code> below M=8192 and <code class="docutils literal notranslate"><span class="pre">hipblaslt_bf16</span></code> above). One M per process, two
+runs; <code class="docutils literal notranslate"><span class="pre">fill</span></code> is M over the padded M; negative is fused faster:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-right"><p>M</p></th>
+<th class="head text-right"><p>padded M</p></th>
+<th class="head text-right"><p>fill</p></th>
+<th class="head text-right"><p>today</p></th>
+<th class="head text-right"><p>fused, bf16 wire</p></th>
+<th class="head text-right"><p>fused, fp8 wire</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-right"><p>1024</p></td>
+<td class="text-right"><p>1024</p></td>
+<td class="text-right"><p>1.000</p></td>
+<td class="text-right"><p>164.6</p></td>
+<td class="text-right"><p>+16.4%</p></td>
+<td class="text-right"><p>+10.3%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>2048</p></td>
+<td class="text-right"><p>2048</p></td>
+<td class="text-right"><p>1.000</p></td>
+<td class="text-right"><p>283.3</p></td>
+<td class="text-right"><p>+1.8%</p></td>
+<td class="text-right"><p>-8.8%</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>4096</p></td>
+<td class="text-right"><p>4096</p></td>
+<td class="text-right"><p>1.000</p></td>
+<td class="text-right"><p>482.8</p></td>
+<td class="text-right"><p>-0.9%</p></td>
+<td class="text-right"><p>-15.4%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>4200</p></td>
+<td class="text-right"><p>5120</p></td>
+<td class="text-right"><p>0.820</p></td>
+<td class="text-right"><p>506.1</p></td>
+<td class="text-right"><p>+17.0%</p></td>
+<td class="text-right"><p>-2.3%</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>4700</p></td>
+<td class="text-right"><p>5120</p></td>
+<td class="text-right"><p>0.918</p></td>
+<td class="text-right"><p>548.3</p></td>
+<td class="text-right"><p>+8.4%</p></td>
+<td class="text-right"><p>-9.3%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>5120</p></td>
+<td class="text-right"><p>5120</p></td>
+<td class="text-right"><p>1.000</p></td>
+<td class="text-right"><p>601.5</p></td>
+<td class="text-right"><p>-5.8%</p></td>
+<td class="text-right"><p>-20.7%</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>7200</p></td>
+<td class="text-right"><p>8192</p></td>
+<td class="text-right"><p>0.879</p></td>
+<td class="text-right"><p>1051.2</p></td>
+<td class="text-right"><p>-17.6%</p></td>
+<td class="text-right"><p>-32.7%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>8192</p></td>
+<td class="text-right"><p>8192</p></td>
+<td class="text-right"><p>1.000</p></td>
+<td class="text-right"><p>1042.5</p></td>
+<td class="text-right"><p>-19.4%</p></td>
+<td class="text-right"><p>-34.1%</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>8200</p></td>
+<td class="text-right"><p>9216</p></td>
+<td class="text-right"><p>0.890</p></td>
+<td class="text-right"><p>1185.1</p></td>
+<td class="text-right"><p>-20.8%</p></td>
+<td class="text-right"><p>-35.7%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>9200</p></td>
+<td class="text-right"><p>9216</p></td>
+<td class="text-right"><p>0.998</p></td>
+<td class="text-right"><p>1157.5</p></td>
+<td class="text-right"><p>-19.2%</p></td>
+<td class="text-right"><p>-34.2%</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>13000</p></td>
+<td class="text-right"><p>13312</p></td>
+<td class="text-right"><p>0.977</p></td>
+<td class="text-right"><p>1547.8</p></td>
+<td class="text-right"><p>-8.5%</p></td>
+<td class="text-right"><p>-25.3%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>16384</p></td>
+<td class="text-right"><p>16384</p></td>
+<td class="text-right"><p>1.000</p></td>
+<td class="text-right"><p>1851.3</p></td>
+<td class="text-right"><p>-16.2%</p></td>
+<td class="text-right"><p>-32.9%</p></td>
+</tr>
+</tbody>
+</table>
+<p>The opt-in settings: prequantised operands, 8 calls per graph, 21 replays, 3
+alternating rounds (5 for the short tails). The 2026-09-29 runs used Torch 2.11,
+ROCm 7.2.4 and FlyDSL 0.2.4; the 2026-09-30 timings are from prototype modules
+since integrated into the op:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Setting</p></th>
+<th class="head"><p>Target</p></th>
+<th class="head"><p>Date</p></th>
+<th class="head"><p>Result</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">schedule=&quot;wo_b&quot;</span></code></p></td>
+<td><p>V4-Pro TP8</p></td>
+<td><p>2026-09-30</p></td>
+<td><p>M=11264 1074.35 → 819.42 (-23.7%); M=13312 1274.86 → 957.80 (-24.9%); M=8200 728.82 → 702.48</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">schedule=&quot;wo_b&quot;</span></code></p></td>
+<td><p>V4.1-Flash TP4</p></td>
+<td><p>2026-09-29</p></td>
+<td><p>reduced padding: M=4200 533.56 → 460.27 (-13.7%); M=8200 894.46 → 830.37 (-7.2%)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scatter_dtype=&quot;fp8&quot;</span></code></p></td>
+<td><p>V4.1-Flash TP4, M=16384</p></td>
+<td><p>2026-09-29</p></td>
+<td><p>-21.1% with a bf16 gather, -26.6% with the fp8 gather over LSA; relL2 2.62% and 3.48%</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scatter_dtype=&quot;fp8&quot;</span></code></p></td>
+<td><p>V4-Pro TP8, M=16384</p></td>
+<td><p>2026-09-29</p></td>
+<td><p>3.0% and 2.5% slower</p></td>
+</tr>
+</tbody>
+</table>
+<ul class="simple">
+<li><p>The two models do not reach the same conclusion. On V4-Pro the overlap
+dominates. On V4.1-Flash the GEMM is 178 µs against 1414 µs of communication,
+so most of the gain comes from the fp8 wire (-15.6% on its own) and the mxfp8
+GEMM, not from fusing.</p></li>
+<li><p>The fused cost follows the padded M while the baseline follows the true M, so
+one padded M can win at full fill and lose at low fill: read the whole curve.
+On Kimi-K3’s MLP <code class="docutils literal notranslate"><span class="pre">down_proj</span></code> (blockscale, bf16 wires, TP8 and TP4, against
+the op’s own split path) fusing loses 2.0-4.0% at M=1024 and gains 9.7-21.6%
+at M=16384.</p></li>
+<li><p>In an SGLang server, V4.1-Flash prefill throughput at batch 4-16 rises
+<strong>+5.6% to +6.0%</strong> with the fused <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> on the fp8 wire and <strong>+7.4% to
++7.7%</strong> with the standalone mxfp8 GEMM added. V4-Pro’s GPU-busy time over a
+profiled prefill falls <strong>5.0%</strong>. Layer gains exceed these because <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> is
+about 12% of the profile.</p></li>
+</ul>
+</section>
+<section id="complete-example">
+<h2>10. Complete example<a class="headerlink" href="#complete-example" title="Link to this heading"></a></h2>
+<p>Run with <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span> <span class="pre">torchrun</span> <span class="pre">--standalone</span> <span class="pre">--nproc_per_node=8</span> <span class="pre">example.py</span></code>.
+<code class="docutils literal notranslate"><span class="pre">quantize_per_1x128</span></code> stands for your quantiser; MORI ships none. It must return
+<code class="docutils literal notranslate"><span class="pre">a_fp8</span></code> as <code class="docutils literal notranslate"><span class="pre">[m_pad,</span> <span class="pre">K]</span></code> <code class="docutils literal notranslate"><span class="pre">float8_e4m3fn</span></code> and <code class="docutils literal notranslate"><span class="pre">a_scale</span></code> as fp32 1x128 block scales:
+<code class="docutils literal notranslate"><span class="pre">[m_pad,</span> <span class="pre">K/128]</span></code> column-major, <code class="docutils literal notranslate"><span class="pre">[K/128,</span> <span class="pre">m_pad]</span></code>, or flat
+(<a class="reference internal" href="#calling-the-operator">section 5</a>).</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.cco</span><span class="w"> </span><span class="kn">import</span> <span class="n">Communicator</span><span class="p">,</span> <span class="n">UniqueId</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.ops.gemm_ar</span><span class="w"> </span><span class="kn">import</span> <span class="n">GemmAllReduceOp</span><span class="p">,</span> <span class="n">preshuffle_b</span>
+
+<span class="c1"># DeepSeek-V4-Pro wo_b at TP8; add gather_dtype="fp8" for the shorter, lossy gather.</span>
+<span class="n">SETTINGS</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">n</span><span class="o">=</span><span class="mi">7168</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">m_max</span><span class="o">=</span><span class="mi">16384</span><span class="p">,</span> <span class="n">quant</span><span class="o">=</span><span class="s2">"blockscale"</span><span class="p">)</span>
+<span class="n">N</span><span class="p">,</span> <span class="n">K</span> <span class="o">=</span> <span class="n">SETTINGS</span><span class="p">[</span><span class="s2">"n"</span><span class="p">],</span> <span class="n">SETTINGS</span><span class="p">[</span><span class="s2">"k"</span><span class="p">]</span>
+
+<span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">"LOCAL_RANK"</span><span class="p">]))</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">"cpu:gloo"</span><span class="p">)</span>  <span class="c1"># only carries the unique id</span>
+<span class="n">rank</span><span class="p">,</span> <span class="n">world</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">get_rank</span><span class="p">(),</span> <span class="n">dist</span><span class="o">.</span><span class="n">get_world_size</span><span class="p">()</span>
+<span class="n">uid</span> <span class="o">=</span> <span class="p">[</span><span class="nb">bytes</span><span class="p">(</span><span class="n">Communicator</span><span class="o">.</span><span class="n">get_unique_id</span><span class="p">())</span> <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span><span class="p">]</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">broadcast_object_list</span><span class="p">(</span><span class="n">uid</span><span class="p">,</span> <span class="n">src</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="n">vmm</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">GemmAllReduceOp</span><span class="o">.</span><span class="n">window_bytes_for</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="o">**</span><span class="n">SETTINGS</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="mi">256</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">)</span>
+<span class="k">with</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">init</span><span class="p">(</span><span class="n">world</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">UniqueId</span><span class="o">.</span><span class="n">from_bytes</span><span class="p">(</span><span class="n">uid</span><span class="p">[</span><span class="mi">0</span><span class="p">]),</span> <span class="n">per_rank_vmm</span><span class="o">=</span><span class="n">vmm</span><span class="p">)</span> <span class="k">as</span> <span class="n">comm</span><span class="p">:</span>
+    <span class="k">with</span> <span class="n">GemmAllReduceOp</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span> <span class="o">**</span><span class="n">SETTINGS</span><span class="p">)</span> <span class="k">as</span> <span class="n">op</span><span class="p">:</span>  <span class="c1"># the same settings as the sizing</span>
+        <span class="n">op</span><span class="o">.</span><span class="n">self_test</span><span class="p">()</span>  <span class="c1"># every rank, once, before any capture</span>
+
+        <span class="c1"># This rank's weight shard; stand-ins for the checkpoint's tensors.</span>
+        <span class="n">w_fp8</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span> <span class="o">/</span> <span class="mi">8</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fn</span><span class="p">)</span>
+        <span class="n">b_scale</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">N</span> <span class="o">//</span> <span class="mi">128</span><span class="p">,</span> <span class="n">K</span> <span class="o">//</span> <span class="mi">128</span><span class="p">),</span> <span class="mf">1e-2</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+        <span class="n">b</span> <span class="o">=</span> <span class="n">preshuffle_b</span><span class="p">(</span><span class="n">w_fp8</span><span class="p">)</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">wo_b</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>  <span class="c1"># x: [M, K] bf16, M &lt;= m_max</span>
+            <span class="n">m</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">a_fp8</span><span class="p">,</span> <span class="n">a_scale</span> <span class="o">=</span> <span class="n">quantize_per_1x128</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">pad_rows</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">op</span><span class="o">.</span><span class="n">padded_m</span><span class="p">(</span><span class="n">m</span><span class="p">)))</span>
+            <span class="k">return</span> <span class="n">op</span><span class="p">(</span><span class="n">a_fp8</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">a_scale</span><span class="p">,</span> <span class="n">b_scale</span><span class="p">)[:</span><span class="n">m</span><span class="p">]</span>
+
+        <span class="c1"># Warm every M you will run (the first call compiles it), largest first.</span>
+        <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">16384</span><span class="p">,</span> <span class="mi">5000</span><span class="p">):</span>
+            <span class="n">y</span> <span class="o">=</span> <span class="n">wo_b</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">))</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+
+        <span class="c1"># CUDA graph: a static input, warm-up on a side stream, then capture.</span>
+        <span class="n">x_static</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">16384</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+        <span class="n">side</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">()</span>
+        <span class="n">side</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">())</span>
+        <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">side</span><span class="p">):</span>
+            <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">3</span><span class="p">):</span>
+                <span class="n">wo_b</span><span class="p">(</span><span class="n">x_static</span><span class="p">)</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">side</span><span class="p">)</span>
+        <span class="n">graph</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">()</span>
+        <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph</span><span class="p">(</span><span class="n">graph</span><span class="p">):</span>
+            <span class="n">y_static</span> <span class="o">=</span> <span class="n">wo_b</span><span class="p">(</span><span class="n">x_static</span><span class="p">)</span>  <span class="c1"># a view of the window</span>
+        <span class="n">x_static</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn_like</span><span class="p">(</span><span class="n">x_static</span><span class="p">))</span>  <span class="c1"># new data, same buffer</span>
+        <span class="n">graph</span><span class="o">.</span><span class="n">replay</span><span class="p">()</span>  <span class="c1"># on every rank, in the same order</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="n">y_static</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>  <span class="c1"># nothing in flight when close() frees the window</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<section id="testing-and-benchmarking">
+<h2>11. Testing and benchmarking<a class="headerlink" href="#testing-and-benchmarking" title="Link to this heading"></a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Host-only, single-GPU, 2-rank (public op), 8-rank (kernels) and TP8/TP4</span>
+<span class="c1"># (wo_b schedule) tests; cases needing more GPUs than the node has are skipped</span>
+<span class="nv">BUILD_CCO_SDMA</span><span class="o">=</span>ON<span class="w"> </span><span class="nv">MORI_ENABLE_SDMA</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">MORI_SOCKET_IFNAME</span><span class="o">=</span>lo<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>pytest<span class="w"> </span>tests/python/cco/test_gemm_ar.py<span class="w"> </span>tests/python/cco/test_flydsl_ar.py<span class="w"> </span><span class="se">\</span>
+<span class="w">         </span>tests/python/cco/test_gemm_ar_op.py<span class="w"> </span>tests/python/cco/test_gemm_ar_schedule.py
+
+<span class="c1"># DeepSeek-V4-Pro, TP8</span>
+<span class="nv">MORI_ENABLE_SDMA</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">MORI_SOCKET_IFNAME</span><span class="o">=</span>lo<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span>benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mode<span class="w"> </span>fused-sdma<span class="w"> </span>--quant<span class="w"> </span>blockscale<span class="w"> </span>-m<span class="w"> </span><span class="m">16384</span><span class="w"> </span>-n<span class="w"> </span><span class="m">7168</span><span class="w"> </span>-k<span class="w"> </span><span class="m">2048</span>
+
+<span class="c1"># DeepSeek-V4.1-Flash, TP4, with the wire that wins there</span>
+<span class="nv">MORI_ENABLE_SDMA</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">MORI_SOCKET_IFNAME</span><span class="o">=</span>lo<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">4</span><span class="w"> </span>benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mode<span class="w"> </span>fused-sdma<span class="w"> </span>--quant<span class="w"> </span>mxfp8<span class="w"> </span>-m<span class="w"> </span><span class="m">16384</span><span class="w"> </span>-n<span class="w"> </span><span class="m">5120</span><span class="w"> </span>-k<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--gather-dtype<span class="w"> </span>fp8<span class="w"> </span>--gather-transport<span class="w"> </span>lsa<span class="w"> </span>--no-fuse-quantize
+
+<span class="c1"># Matrices, one point per process; the exit status counts failed points</span>
+python<span class="w"> </span>benchmark/cco/flydsl/gemm_ar/sweep.py<span class="w"> </span>--list
+python<span class="w"> </span>benchmark/cco/flydsl/gemm_ar/sweep.py<span class="w"> </span>fused<span class="w">      </span><span class="c1"># writes fused.jsonl</span>
+python<span class="w"> </span>benchmark/cco/flydsl/gemm_ar/report.py<span class="w"> </span>fused.jsonl
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">tests/python/cco/test_gemm_ar_bench.py</span></code> runs the benchmark as a test, and
+<code class="docutils literal notranslate"><span class="pre">gemm_ar_schedule_worker.py</span></code> beside it runs the <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> regression directly.
+<code class="docutils literal notranslate"><span class="pre">--mode</span></code> takes <code class="docutils literal notranslate"><span class="pre">gemm-only</span></code>, <code class="docutils literal notranslate"><span class="pre">split-rccl</span></code>, <code class="docutils literal notranslate"><span class="pre">split-sdma</span></code>, <code class="docutils literal notranslate"><span class="pre">fused-sdma</span></code>,
+<code class="docutils literal notranslate"><span class="pre">split-lsa</span></code> or <code class="docutils literal notranslate"><span class="pre">fused-lsa</span></code>; each run prints a <code class="docutils literal notranslate"><span class="pre">RESULT_JSON</span></code> line with
+<code class="docutils literal notranslate"><span class="pre">max_rank_time_us</span></code>, <code class="docutils literal notranslate"><span class="pre">rel_l2</span></code> and <code class="docutils literal notranslate"><span class="pre">validated</span></code>. Pin <code class="docutils literal notranslate"><span class="pre">--quant</span></code> (the default <code class="docutils literal notranslate"><span class="pre">ptpc</span></code>
+is not an op setting), and note <code class="docutils literal notranslate"><span class="pre">--sdma-queues</span> <span class="pre">8</span></code> and <code class="docutils literal notranslate"><span class="pre">--gather-transport</span> <span class="pre">sdma</span></code>
+against the op’s 1 and <code class="docutils literal notranslate"><span class="pre">lsa</span></code>. Allow about 10 s between back-to-back runs, and
+read the README’s
+<a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ar/README.md#measurement-traps">Measurement traps</a>
+before trusting a small-M number of your own.</p>
+</section>
+<section id="troubleshooting">
+<h2>12. Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Symptom</p></th>
+<th class="head"><p>What it means</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">gemm_ar</span> <span class="pre">self-test</span> <span class="pre">failed:</span> <span class="pre">the</span> <span class="pre">all-reduce</span> <span class="pre">returned</span> <span class="pre">...</span> <span class="pre">where</span> <span class="pre">...</span> <span class="pre">was</span> <span class="pre">expected</span></code></p></td>
+<td><p>The SDMA puts moved nothing: MORI was built with <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=OFF</span></code>, or <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code> is not set (the communicator also logs <code class="docutils literal notranslate"><span class="pre">no</span> <span class="pre">SDMA</span> <span class="pre">queues</span> <span class="pre">will</span> <span class="pre">be</span> <span class="pre">created</span></code>), and <code class="docutils literal notranslate"><span class="pre">op.dev_comm.sdma_num_queue</span></code> is 0. Without <code class="docutils literal notranslate"><span class="pre">self_test()</span></code> this is silent: the model still answers fluently and the fused path measures faster than it is.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ModuleNotFoundError:</span> <span class="pre">No</span> <span class="pre">module</span> <span class="pre">named</span> <span class="pre">'flydsl'</span></code> on first use of the op</p></td>
+<td><p>Install the extra: <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'amd_mori[flydsl]'</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">ccoMemAlloc</span> <span class="pre">failed</span></code> while constructing</p></td>
+<td><p>The window does not fit the communicator’s VMM reservation. Size <code class="docutils literal notranslate"><span class="pre">per_rank_vmm</span></code> for every op alive at once, or close ops you no longer need.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">hsaKmtCreateQueueExt</span></code> failures (<code class="docutils literal notranslate"><span class="pre">anvil.cpp</span></code>) at start-up</p></td>
+<td><p>A previous run’s ranks have not released their SDMA queues: wait about 10 s between runs (the tests wait 20 s) and check that no leftover process holds them. Keep <code class="docutils literal notranslate"><span class="pre">sdma_queues=1</span></code> in a process that already uses SDMA.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">M=...</span> <span class="pre">does</span> <span class="pre">not</span> <span class="pre">match</span> <span class="pre">planned</span> <span class="pre">padded</span> <span class="pre">M=...</span></code></p></td>
+<td><p>M is not padded: use <code class="docutils literal notranslate"><span class="pre">op.padded_m()</span></code> and <code class="docutils literal notranslate"><span class="pre">op.pad_rows()</span></code>, and with <code class="docutils literal notranslate"><span class="pre">schedule=&quot;wo_b&quot;</span></code> pass <code class="docutils literal notranslate"><span class="pre">logical_m=</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">a_scale</span> <span class="pre">is</span> <span class="pre">(M,</span> <span class="pre">K/128)</span> <span class="pre">row-major,</span> <span class="pre">which</span> <span class="pre">is</span> <span class="pre">ambiguous</span></code></p></td>
+<td><p>Say which you have: <code class="docutils literal notranslate"><span class="pre">.reshape(-1)</span></code> for a K/128-major buffer, <code class="docutils literal notranslate"><span class="pre">.t()</span></code> for a logical row-major tensor. Guessing wrong pairs every scale with the wrong K block (relL2 0.26).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">...</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">one</span> <span class="pre">of</span> <span class="pre">['torch.float8_e4m3fn'],</span> <span class="pre">got</span> <span class="pre">torch.float8_e4m3fnuz</span></code></p></td>
+<td><p>FNUZ has a different exponent bias; read as OCP e4m3 the product would be 4x too large. Quantise to <code class="docutils literal notranslate"><span class="pre">float8_e4m3fn</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">this</span> <span class="pre">op</span> <span class="pre">already</span> <span class="pre">serves</span> <span class="pre">...</span> <span class="pre">distinct</span> <span class="pre">M</span> <span class="pre">values</span></code></p></td>
+<td><p>An explicit <code class="docutils literal notranslate"><span class="pre">max_shapes</span></code> is too small: leave it at <code class="docutils literal notranslate"><span class="pre">None</span></code>, or pad to fewer distinct M.</p></td>
+</tr>
+<tr class="row-even"><td><p>A call hangs</p></td>
+<td><p>The phases carry device-side barriers: every rank must call with the same M, in the same order. Two unexplained hangs were seen at 8 ranks while a sweep was being set up; use <code class="docutils literal notranslate"><span class="pre">timeout</span></code> when sweeping.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">hipErrorIllegalAddress</span></code> under sustained load</p></td>
+<td><p>Seen once, in one SGLang server out of nine, with the fused <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> and the standalone GEMM both enabled; it has not reproduced and the cause is not established.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="standalone-gemm-and-gemv">
+<h2>Standalone GEMM and GEMV<a class="headerlink" href="#standalone-gemm-and-gemv" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">Mxfp8GemmOp</span></code> is the same mxfp8 GEMM with nothing fused; <code class="docutils literal notranslate"><span class="pre">Mxfp8GemvOp</span></code> is a
+separate skinny kernel for decode. Neither takes a communicator, a window or a
+rank or needs SDMA (both need FlyDSL), and both return an ordinary tensor. They
+are for a ColumnParallelLinear, which has no collective to fuse with, and for a
+RowParallelLinear below the fusion’s useful M.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">Mxfp8GemmOp(*,</span> <span class="pre">n,</span> <span class="pre">k,</span> <span class="pre">block_n=256,</span> <span class="pre">quant=&quot;mxfp8&quot;)</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">Mxfp8GemvOp(*,</span> <span class="pre">n,</span> <span class="pre">k)</span></code></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Call</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">op(a_fp8,</span> <span class="pre">b_preshuffled,</span> <span class="pre">a_scale,</span> <span class="pre">b_scale,</span> <span class="pre">out=None)</span></code>, <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">N]</span></code> bf16</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">op(x_fp8,</span> <span class="pre">w_preshuffled,</span> <span class="pre">x_scale,</span> <span class="pre">w_scale,</span> <span class="pre">out=None)</span></code>, <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">N]</span></code> bf16</p></td>
+</tr>
+<tr class="row-odd"><td><p>M</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;mxfp8&quot;</span></code>: a multiple of 64 (<code class="docutils literal notranslate"><span class="pre">op.padded_m()</span></code>, <code class="docutils literal notranslate"><span class="pre">op.pad_rows()</span></code> before quantising); <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8_raw&quot;</span></code>: any</p></td>
+<td><p>1 to 32; above, <code class="docutils literal notranslate"><span class="pre">ValueError</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Weight</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">preshuffle_b(w)</span></code>, shared with the GEMV, so shuffle once</p></td>
+<td><p>the same tensor</p></td>
+</tr>
+<tr class="row-odd"><td><p>Scales</p></td>
+<td><p>as the fused op’s <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8_raw&quot;</span></code> (<a class="reference internal" href="#calling-the-operator">section 5</a>)</p></td>
+<td><p>uint8 <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">K/32]</span></code> and <code class="docutils literal notranslate"><span class="pre">[N/32,</span> <span class="pre">K/32]</span></code>, 2-D, as the checkpoint stores them</p></td>
+</tr>
+<tr class="row-even"><td><p>Shapes</p></td>
+<td><p>K a multiple of 128, at least 256; N a multiple of 256; <code class="docutils literal notranslate"><span class="pre">block_n</span></code> 256 only; <code class="docutils literal notranslate"><span class="pre">quant</span></code> <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;mxfp8_raw&quot;</span></code></p></td>
+<td><p>K a multiple of 128; N a multiple of 32</p></td>
+</tr>
+<tr class="row-odd"><td><p>Predicate</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">supports_gemm(n,</span> <span class="pre">k,</span> <span class="pre">*,</span> <span class="pre">block_n=256)</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">supports_gemv(n,</span> <span class="pre">k)</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Kernels</p></td>
+<td><p>two: the 256-wide N tile, and a 128-wide one while the wide grid <code class="docutils literal notranslate"><span class="pre">ceil(M/256)</span> <span class="pre">*</span> <span class="pre">N/256</span></code> is under 140 workgroups (<code class="docutils literal notranslate"><span class="pre">op.wants_narrow_n(m)</span></code>)</p></td>
+<td><p>one per M bucket (1, 2, 4, 8, 16, 32); tuned for <code class="docutils literal notranslate"><span class="pre">(8192,</span> <span class="pre">1280)</span></code> and <code class="docutils literal notranslate"><span class="pre">(5120,</span> <span class="pre">2048)</span></code>, a heuristic elsewhere</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">out=</span></code>, if given, must be <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">N]</span></code> bf16. On MI355X at V4.1-Flash <code class="docutils literal notranslate"><span class="pre">wo_b</span></code>
+(N=5120, K=2048), M=16384, bf16 in and out with quantisation, the GEMM measured
+196.0 µs against 281.3 µs for bf16 (fake_quant + hipBLASLt), -30.3%, and 274.9
+µs for SGLang’s mxfp8 route (<code class="docutils literal notranslate"><span class="pre">tl.dot_scaled</span></code>); that was hot, one call per graph,
+and <code class="docutils literal notranslate"><span class="pre">bench_gemm.py</span> <span class="pre">--scope</span> <span class="pre">linear</span></code> puts the comparison at -27%. Cold, across
+V4.1-Flash’s fp8 linear shapes against SGLang’s native mxfp8 linear, what decides
+it is the wide-tile grid <code class="docutils literal notranslate"><span class="pre">ceil(M/256)</span> <span class="pre">*</span> <span class="pre">N/256</span></code>: the median is +246.7% at 1-32
+workgroups, -0.7% at 33-64, -10.2% at 65-128, -26.6% at 129-256 and -26.4%
+above. On its two tuned shapes the GEMV beats SGLang’s <code class="docutils literal notranslate"><span class="pre">mxfp8_gemv</span></code> on the same
+fp8 bytes at M=1, 8 and 32; six untuned shapes land within ±2%, <code class="docutils literal notranslate"><span class="pre">wo_a</span></code> is
+12-16% slower at M=8 and above, and <code class="docutils literal notranslate"><span class="pre">wq_b</span></code> at TP8 is slower at M=32.</p>
+</section>
+<section id="further-reading">
+<h2>Further reading<a class="headerlink" href="#further-reading" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p>The <a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ar/README.md"><code class="docutils literal notranslate"><span class="pre">gemm_ar</span></code> README</a>,
+next to the code, has the full design, every measurement table and the
+negative results.</p></li>
+<li><p><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html"><span class="std std-doc">MORI-FUSED overview</span></a>: what the six operators
+share, and the headline numbers.</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="MORI-CCO-FUSED-OPS-GUIDE.html" class="btn btn-neutral float-left" title="MORI-FUSED: Fused GEMM + Collective Operators" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="fused-gemm-rs.html" class="btn btn-neutral float-right" title="GEMM + reduce-scatter" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.
+      <span class="lastupdated">Last updated on 2026-11-13.
+      </span></p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

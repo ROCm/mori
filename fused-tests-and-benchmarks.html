@@ -1,0 +1,212 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Running the tests and benchmarks &mdash; MORI development (6206eebd) documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=dff4fcea"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="MORI Shmem Guide" href="MORI-SHMEM-GUIDE.html" />
+    <link rel="prev" title="All-to-all + GEMM" href="fused-a2a-gemm.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-EP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">User guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an API and backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">Benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="EPv2_PERF.html">V1 vs V2 inter-node performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA bandwidth in the kernels</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-FUSED</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ar.html">GEMM + all-reduce</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-rs.html">GEMM + reduce-scatter</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-a2a.html">GEMM + all-to-all</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-gemm-ag.html">GEMM + all-gather</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-ag-gemm.html">All-gather + GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fused-a2a-gemm.html">All-to-all + GEMM</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Tests and benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-SHMEM</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">SHMEM guide</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-CCO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">CCO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-device-api.html">Device API for FlyDSL and Triton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-examples.html">Examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cco-benchmarks.html">Benchmarks</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-IO</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">IO guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">Benchmark</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">MORI-UMBP</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="umbp-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-configuration.html">Configuration and environment variables</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-pure-ssd-mode.html">Pure-SSD mode and multi-drive tiers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-numa-tier-placement.html">NUMA placement for a DRAM tier</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-kv-indexer-export.html">KV indexer export</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-monitoring.html">Monitoring</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">PD disaggregation benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">Tier-management benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-simulation.html">Simulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">Calibration</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Tools</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ kernel profiler</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">Profiler API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP master client</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">JIT compilation framework</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">JIT v2 (in Chinese)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">UMBP single-node smoke test</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Running the tests and benchmarks</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/fused-tests-and-benchmarks.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="running-the-tests-and-benchmarks">
+<h1>Running the tests and benchmarks<a class="headerlink" href="#running-the-tests-and-benchmarks" title="Link to this heading"></a></h1>
+<p>Every operator has a numerics test of its kernels and a multi-rank test of the
+public operator (2 ranks for <code class="docutils literal notranslate"><span class="pre">gemm_ar</span></code>, 8 for the others). CI runs both in the CCO job. They need the environment
+described in <a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#what-every-operator-has-in-common"><span class="std std-ref">What every operator has in common</span></a>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MORI_ENABLE_SDMA</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">MORI_SOCKET_IFNAME</span><span class="o">=</span>lo
+pytest<span class="w"> </span>tests/python/cco/test_gemm_ar.py<span class="w"> </span>tests/python/cco/test_gemm_ar_op.py
+pytest<span class="w"> </span>tests/python/cco/test_gemm_a2a.py<span class="w"> </span>tests/python/cco/test_gemm_a2a_op.py
+pytest<span class="w"> </span>tests/python/cco/test_gemm_ag.py<span class="w"> </span>tests/python/cco/test_gemm_ag_op.py
+pytest<span class="w"> </span>tests/python/cco/test_ag_gemm.py<span class="w"> </span>tests/python/cco/test_ag_gemm_op.py
+pytest<span class="w"> </span>tests/python/cco/test_a2a_gemm.py<span class="w"> </span>tests/python/cco/test_a2a_gemm_op.py
+</pre></div>
+</div>
+<p>Each benchmark under <code class="docutils literal notranslate"><span class="pre">benchmark/cco/flydsl/&lt;op&gt;/</span></code> checks its modes against a
+reference and prints one <code class="docutils literal notranslate"><span class="pre">RESULT_JSON</span></code> line per configuration. All of them have
+<code class="docutils literal notranslate"><span class="pre">gemm-only</span></code>, <code class="docutils literal notranslate"><span class="pre">split-rccl</span></code>, <code class="docutils literal notranslate"><span class="pre">split-sdma</span></code> and <code class="docutils literal notranslate"><span class="pre">fused-sdma</span></code>; <code class="docutils literal notranslate"><span class="pre">gemm_ar</span></code> adds
+<code class="docutils literal notranslate"><span class="pre">split-lsa</span></code> and <code class="docutils literal notranslate"><span class="pre">fused-lsa</span></code>, <code class="docutils literal notranslate"><span class="pre">gemm_a2a</span></code> adds <code class="docutils literal notranslate"><span class="pre">gemm-staging</span></code> and <code class="docutils literal notranslate"><span class="pre">gemm-to-window</span></code>,
+and <code class="docutils literal notranslate"><span class="pre">gemm_ag</span></code> adds <code class="docutils literal notranslate"><span class="pre">gemm-to-window</span></code>. Only <code class="docutils literal notranslate"><span class="pre">bench_a2a_gemm.py</span></code> runs all its modes
+by default (<code class="docutils literal notranslate"><span class="pre">--modes</span></code>). The others run one <code class="docutils literal notranslate"><span class="pre">--mode</span></code> per invocation, by default
+<code class="docutils literal notranslate"><span class="pre">fused-sdma</span></code> (<code class="docutils literal notranslate"><span class="pre">gemm_ag</span></code>: <code class="docutils literal notranslate"><span class="pre">split-sdma</span></code>). For example:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mode<span class="w"> </span>fused-sdma<span class="w"> </span>--quant<span class="w"> </span>blockscale<span class="w"> </span>-m<span class="w"> </span><span class="m">16384</span><span class="w"> </span>-n<span class="w"> </span><span class="m">7168</span><span class="w"> </span>-k<span class="w"> </span><span class="m">2048</span>
+</pre></div>
+</div>
+<p>Each operator’s README has the exact commands behind its tables. Before
+trusting a number of your own:</p>
+<ul class="simple">
+<li><p>Keep the node otherwise idle.</p></li>
+<li><p>Interleave the configurations you compare across rounds.</p></li>
+<li><p>Time CUDA-graph replays of many calls, not one.</p></li>
+<li><p>Pin <code class="docutils literal notranslate"><span class="pre">--quant</span></code>.</p></li>
+<li><p>Allow about 10 s between back-to-back 8-rank runs, so the SDMA queues are
+released.</p></li>
+</ul>
+<p>The <code class="docutils literal notranslate"><span class="pre">gemm_ar</span></code> README’s
+<a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ar/README.md#measurement-traps">Measurement traps</a>
+lists the ones that have produced wrong numbers here.</p>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="fused-a2a-gemm.html" class="btn btn-neutral float-left" title="All-to-all + GEMM" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="MORI-SHMEM-GUIDE.html" class="btn btn-neutral float-right" title="MORI Shmem Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.
+      <span class="lastupdated">Last updated on 2026-11-13.
+      </span></p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
