@@ -79,10 +79,9 @@ Current settings:
 - MI355X: a rule sets a count (1, 2 or 4) only where the whole-table A/B kept a
   change. That is 121 of the 233 InterNodeV2 rules and 45 of the 233
   InterNodeV2LL rules. Over all token counts, the largest count for one shape
-  is 4, or 2 for InterNodeV2LL 272/9 and 896/16. Under `auto` with its default
-  crossover of 512, every rule up to T512 comes from InterNodeV2LL and sets at
-  most 2, so an op whose capacity is at most 512 drains at most 2, unless
-  `cfg.active_qps` or `cfg.active_qp_counts` names a larger count.
+  is 4, or 2 for InterNodeV2LL 272/9 and 896/16. An `auto` op can reach the
+  InterNodeV2 rules up to its capacity and the InterNodeV2LL rules up to the
+  crossover (512 by default), so it drains the largest count of both.
 
 ### `combine_load_first`
 

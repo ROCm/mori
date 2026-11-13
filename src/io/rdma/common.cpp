@@ -269,11 +269,12 @@ void NotifySqStateChanged(const EpPair& ep) {
   FutexWakeAll(&event->epoch);
 }
 
-static bool TryReserveSqDepthOnce(const EpPair& ep, int wrCount) {
+// Reserves `wrCount` send-queue slots on `ep` if that keeps its depth within `limit`.
+static bool TryReserveSqDepthOnce(const EpPair& ep, int wrCount, int limit) {
   int observed = ep.sqDepth->load(kSqAdmissionOrder);
   while (true) {
     const int base = std::max(observed, 0);
-    if (base > ep.maxSqDepth - wrCount) return false;
+    if (base > limit - wrCount) return false;
 
     const int desired = base + wrCount;
     if (ep.sqDepth->compare_exchange_weak(observed, desired, kSqAdmissionOrder,
@@ -297,7 +298,7 @@ static bool TryReserveSqDepthSpin(const EpPair& ep, int wrCount, int epId, const
       return false;
     }
 
-    if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+    if (TryReserveSqDepthOnce(ep, wrCount, ep.maxSqDepth)) return true;
 
     if (std::chrono::steady_clock::now() >= deadline) {
       SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
@@ -342,7 +343,7 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
     return false;
   }
 
-  if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+  if (TryReserveSqDepthOnce(ep, wrCount, ep.maxSqDepth)) return true;
 
   auto* event = ep.sqAdmission.get();
   if (!event) {
@@ -371,7 +372,7 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
       return false;
     }
 
-    if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+    if (TryReserveSqDepthOnce(ep, wrCount, ep.maxSqDepth)) return true;
 
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
@@ -410,45 +411,123 @@ static void ReleaseSqDepth(const EpPair& ep, int wrCount) {
   NotifySqStateChanged(ep);
 }
 
-// When a multi-EP post gives up partway, the WRs already posted on the other EPs
-// have no signaled tail behind them, so no CQE will ever release their depth.
-// Park them as orphaned and mark those EPs degraded so the recovery path can
-// reclaim them.
-static void OrphanPendingWrsOnOtherEps(const EpPairVec& eps, int failedEpId, const char* reason,
-                                       const std::vector<int>& epWrsSinceSignal,
-                                       const std::vector<size_t>& epMergedSinceSignal,
-                                       const std::shared_ptr<CqCallbackMeta>& callbackMeta) {
-  for (size_t otherEpId = 0; otherEpId < eps.size(); ++otherEpId) {
-    if (static_cast<int>(otherEpId) == failedEpId) continue;
-    if (epWrsSinceSignal[otherEpId] <= 0) continue;
+// Posts a signaled zero-length WR behind the `pendingWrs` unsignaled WRs `ep` holds for
+// this transfer. An RC send queue completes in order, so the marker's completion
+// (success, error or flush) shows that none of them can still touch memory, and accounts
+// their credits. False if it could not be posted.
+static bool PostCompletionMarker(const EpPair& ep, const application::RdmaMemoryRegion& remoteMr,
+                                 bool isRead, int pendingWrs, int pendingCredits,
+                                 const std::shared_ptr<CqCallbackMeta>& callbackMeta) {
+  if (!ep.ledger) return false;
+  // The marker may use the slots normal admission holds back, and never more than the
+  // send queue really has.
+  if (ep.sqDepth && !TryReserveSqDepthOnce(ep, 1, ep.maxSqDepth + ep.markerSlots)) {
+    return false;
+  }
+  SubmissionLedger::PostGuard guard =
+      ep.ledger->InsertForPost(pendingWrs + 1, callbackMeta, pendingCredits);
+  if (!guard) {
+    ReleaseSqDepth(ep, 1);
+    return false;
+  }
+  struct ibv_send_wr wr{};
+  wr.wr_id = guard.RecordId();
+  wr.opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.wr.rdma.remote_addr = remoteMr.addr;
+  wr.wr.rdma.rkey = remoteMr.rkey;
+  struct ibv_send_wr* badWr = nullptr;
+  if (Verbs().PostSend(ep.local.ibvHandle.qp, &wr, &badWr) != 0) {
+    guard.Commit();  // never reached the wire: drops the record
+    ReleaseSqDepth(ep, 1);
+    return false;
+  }
+  guard.MarkPosted();
+  guard.Commit();
+  return true;
+}
+
+// Moves `ep`'s QP to Error (ModifyQpToError, through Verbs() so a test build can refuse
+// it); false if it has none or that fails.
+static bool CutQp(const EpPair& ep) {
+  ibv_qp* qp = ep.local.ibvHandle.qp;
+  return qp != nullptr && ModifyQpToError(Verbs(), qp) == 0;
+}
+
+// When a post gives up partway, the WRs it already posted on an EP since that EP's last
+// signaled one have nothing behind them to report their completion. Put a completion
+// marker behind them. Where that cannot be posted, cut the QP so they cannot run any
+// longer and account them now; the caller marks the QP failed, so the next transfer
+// replaces it. Unlike a marker's completion, the cut does not wait for the peer: WRITE
+// packets already on the wire can still land remotely, which only a receiver-side
+// fence closes. Only a QP that cannot be cut has them parked as orphaned and the EP
+// degraded, for the recovery path. On a closed ledger the QP is dead, so they are left
+// uncounted as posted and the caller accounts them as never sent.
+// `skipEpId` is an EP the caller has already settled, or -1. Returns the credits it
+// settled (marker, cut or orphaned), which the caller counts as posted, and adds each QP
+// it cut to `cutQps`.
+static int SettlePendingWrs(const EpPairVec& eps,
+                            const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                            bool isRead, int skipEpId, const char* reason,
+                            std::vector<int>& epWrsSinceSignal,
+                            std::vector<size_t>& epMergedSinceSignal,
+                            const std::shared_ptr<CqCallbackMeta>& callbackMeta,
+                            std::vector<ibv_qp*>& cutQps) {
+  int settledCredits = 0;
+  for (size_t epId = 0; epId < eps.size(); ++epId) {
+    if (static_cast<int>(epId) == skipEpId || epWrsSinceSignal[epId] <= 0) continue;
+    const int pendingWrs = epWrsSinceSignal[epId];
+    const int pendingCredits = static_cast<int>(epMergedSinceSignal[epId]);
+    epWrsSinceSignal[epId] = 0;
+    epMergedSinceSignal[epId] = 0;
+    if (PostCompletionMarker(eps[epId], remoteMrPerEp[epId], isRead, pendingWrs, pendingCredits,
+                             callbackMeta)) {
+      MORI_IO_DEBUG("{}: posted a completion marker behind {} pending unsignaled WRs on ep {}",
+                    reason, pendingWrs, epId);
+      settledCredits += pendingCredits;
+      continue;
+    }
+    if (eps[epId].ledger && !eps[epId].ledger->Closed() && CutQp(eps[epId])) {
+      MORI_IO_WARN(
+          "{}: no completion marker could be posted on ep {}; moved its QP to error so its {} "
+          "pending unsignaled WRs cannot run any longer",
+          reason, epId, pendingWrs);
+      ReleaseSqDepth(eps[epId], pendingWrs);
+      settledCredits += pendingCredits;
+      cutQps.push_back(eps[epId].local.ibvHandle.qp);
+      callbackMeta->Account(pendingCredits, StatusCode::ERR_RDMA_OP,
+                            "the QP was cut after a submission gave up", /*rootCause=*/false);
+      continue;
+    }
     MORI_IO_WARN(
-        "{} on ep {}: moving pending unsignaled WRs on ep {} "
-        "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
-        reason, failedEpId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
-    if (eps[otherEpId].ledger) {
-      if (!eps[otherEpId].ledger->InsertOrphaned(
-              epWrsSinceSignal[otherEpId], callbackMeta,
-              static_cast<int>(epMergedSinceSignal[otherEpId]))) {
-        // A fatal event already closed this sibling. FailAll() cannot have
-        // released these WRs -- they were never in its ledger -- so the
-        // reservation is ours to give back, or the depth is lost for good.
+        "{}: moving pending unsignaled WRs on ep {} (wrCount={}, mergedReq={}) to orphaned and "
+        "marking degraded",
+        reason, epId, pendingWrs, pendingCredits);
+    if (eps[epId].ledger) {
+      if (eps[epId].ledger->InsertOrphaned(pendingWrs, callbackMeta, pendingCredits)) {
+        settledCredits += pendingCredits;
+      } else {
+        // A fatal event already closed this EP. FailAll() cannot have released these
+        // WRs -- they were never in its ledger -- so the reservation is ours to give
+        // back, or the depth is lost for good.
         MORI_IO_WARN(
             "EP {} ledger is closed; reclaiming {} pending unsignaled WRs directly instead of "
             "parking them as orphaned",
-            otherEpId, epWrsSinceSignal[otherEpId]);
-        ReleaseSqDepth(eps[otherEpId], epWrsSinceSignal[otherEpId]);
+            epId, pendingWrs);
+        ReleaseSqDepth(eps[epId], pendingWrs);
       }
     } else {
       MORI_IO_WARN(
           "EP {} has pending unsignaled WRs but no submission ledger; "
           "sqDepth may remain stale until endpoint restart",
-          otherEpId);
+          epId);
     }
-    if (eps[otherEpId].degraded) {
-      eps[otherEpId].degraded->store(true, kSqAdmissionOrder);
+    if (eps[epId].degraded) {
+      eps[epId].degraded->store(true, kSqAdmissionOrder);
     }
-    NotifySqStateChanged(eps[otherEpId]);
+    NotifySqStateChanged(eps[epId]);
   }
+  return settledCredits;
 }
 
 namespace detail {
@@ -948,6 +1027,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   // Rotate the starting EP by transfer id so single-segment (single WR)
   // transfers spread evenly across all QPs instead of always landing on eps[0].
   int epStartOffset = static_cast<int>(id % static_cast<uint64_t>(epNum));
+  // Credits put on the wire or settled by this call, returned in every RdmaOpRet below,
+  // and the QPs a give-up had to cut.
+  int postedCredits = 0;
+  std::vector<ibv_qp*> cutQps;
   for (int i = 0; i < numPostBatch; i++) {
     int st = i * postBatchSize;
     int end = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
@@ -960,7 +1043,12 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "batch", &reserveErr, &reserveFailure)) {
       AppendHint(&reserveErr, BuildSqDepthHint(eps[epId], epNum, postBatchSize,
                                                PostSendOpKind::BatchData, reserveFailure));
-      return {StatusCode::ERR_RDMA_OP, reserveErr};
+      // Earlier batches may already be on the wire, this EP's included, without a
+      // signaled WR behind them.
+      postedCredits +=
+          SettlePendingWrs(eps, remoteMrPerEp, isRead, -1, "send queue admission failed",
+                           epWrsSinceSignal, epMergedSinceSignal, callbackMeta, cutQps);
+      return {StatusCode::ERR_RDMA_OP, reserveErr, postedCredits, std::move(cutQps)};
     }
 
     const auto& localMr = localMrPerEp[epId];
@@ -989,7 +1077,16 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     }
 
     bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
-    bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
+    // Signal when this EP's next batch would not fit beside its unsignaled WRs:
+    // only a completion releases their depth, so its reservation could never
+    // succeed. maxSqDepth need not be a multiple of postBatchSize.
+    const size_t nextSt = static_cast<size_t>(i + epNum) * postBatchSize;
+    const int nextBatchWrNum =
+        isLastBatchForEp
+            ? 0
+            : static_cast<int>(std::min<size_t>(postBatchSize, mergedWrCount - nextSt));
+    bool sqNearFull =
+        eps[epId].sqDepth && (epWrsSinceSignal[epId] + nextBatchWrNum > eps[epId].maxSqDepth);
     bool needSignal = isLastBatchForEp || sqNearFull;
 
     struct ibv_send_wr& last = mergedWrs[end - 1].wr;
@@ -1001,7 +1098,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       if (!eps[epId].ledger) {
         ReleaseSqDepth(eps[epId], batchWrNum);
         return {StatusCode::ERR_RDMA_OP,
-                "submission ledger is not initialized for signaled WR tracking"};
+                "submission ledger is not initialized for signaled WR tracking", postedCredits};
       }
       postGuard = eps[epId].ledger->InsertForPost(epWrsSinceSignal[epId], callbackMeta,
                                                   static_cast<int>(epMergedSinceSignal[epId]));
@@ -1015,10 +1112,12 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         ReleaseSqDepth(eps[epId], epWrsSinceSignal[epId]);
         epWrsSinceSignal[epId] = 0;
         epMergedSinceSignal[epId] = 0;
-        OrphanPendingWrsOnOtherEps(eps, epId, "endpoint retired by a fatal async event",
-                                   epWrsSinceSignal, epMergedSinceSignal, callbackMeta);
+        postedCredits += SettlePendingWrs(
+            eps, remoteMrPerEp, isRead, epId, "endpoint retired by a fatal async event",
+            epWrsSinceSignal, epMergedSinceSignal, callbackMeta, cutQps);
         return {StatusCode::ERR_RDMA_OP,
-                "endpoint was failed by a fatal verbs async event; submission rejected"};
+                "endpoint was failed by a fatal verbs async event; submission rejected",
+                postedCredits, std::move(cutQps)};
       }
       last.wr_id = recordId;
       last.send_flags = IBV_SEND_SIGNALED;
@@ -1067,6 +1166,9 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         // Signaled WR was posted; CQ path (ledger->ReleaseByCqe) owns the release.
         postGuard.MarkPosted();
         postGuard.Commit();
+        postedCredits += static_cast<int>(epMergedSinceSignal[epId]);
+        epWrsSinceSignal[epId] = 0;
+        epMergedSinceSignal[epId] = 0;
       } else if (needSignal) {
         // The signaled WR never reached the wire, so no CQE will arrive for it.
         // Committing un-posted drops the record before the orphan bookkeeping
@@ -1079,36 +1181,18 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         }
       }
 
-      if (postedCount > 0 && (!needSignal || !lastWasPosted)) {
-        MORI_IO_WARN(
-            "ibv_post_send partially posted {} / {} WRs without a posted signaled tail; "
-            "marking EP {} as degraded until recovery",
-            postedCount, batchWrNum, epId);
-        if (eps[epId].ledger) {
-          if (!eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
-                                                static_cast<int>(epMergedSinceSignal[epId]))) {
-            // Closed ledger: nothing will ever reclaim these through recovery,
-            // so release the reservation here and stop counting them.
-            ReleaseSqDepth(eps[epId], epWrsSinceSignal[epId]);
-            epWrsSinceSignal[epId] = 0;
-            epMergedSinceSignal[epId] = 0;
-          }
-        }
-        if (eps[epId].degraded) {
-          eps[epId].degraded->store(true, kSqAdmissionOrder);
-        }
-        NotifySqStateChanged(eps[epId]);
-      }
-
-      OrphanPendingWrsOnOtherEps(eps, epId, "ibv_post_send failed", epWrsSinceSignal,
-                                 epMergedSinceSignal, callbackMeta);
+      // What this batch and earlier ones put on the wire without a signaled WR behind
+      // them, on this EP and the others.
+      postedCredits +=
+          SettlePendingWrs(eps, remoteMrPerEp, isRead, -1, "ibv_post_send failed", epWrsSinceSignal,
+                           epMergedSinceSignal, callbackMeta, cutQps);
 
       std::string message = "ibv_post_send failed with " + std::to_string(ret) + ": " +
                             strerror(ret) + " (posted " + std::to_string(postedCount) + "/" +
                             std::to_string(batchWrNum) + " WRs)";
       AppendHint(&message, BuildPostSendFailureHint(ret, eps[epId], epNum, postBatchSize, badWr,
                                                     PostSendOpKind::BatchData));
-      return {StatusCode::ERR_RDMA_OP, std::move(message)};
+      return {StatusCode::ERR_RDMA_OP, std::move(message), postedCredits, std::move(cutQps)};
     }
 
     if (needSignal) {
@@ -1116,13 +1200,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       // sqDepth release. Releasing the guard lets a pending FailAll() proceed.
       postGuard.MarkPosted();
       postGuard.Commit();
+      postedCredits += static_cast<int>(epMergedSinceSignal[epId]);
       epWrsSinceSignal[epId] = 0;
       epMergedSinceSignal[epId] = 0;
       if (roctxTransferEnabled) epBytesSinceSignal[epId] = 0;
     }
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
-  return {StatusCode::IN_PROGRESS, ""};
+  return {StatusCode::IN_PROGRESS, "", postedCredits};
 }
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
