@@ -16,7 +16,7 @@ on:
 
 env:
   IMAGE: rocm/mori:ci-cco
-  BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+  BASE_IMAGE: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
   CONTAINER: mori_cco_ci_${{ github.run_id }}
   CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
 
@@ -80,8 +80,9 @@ jobs:
       - &cco-start
         name: Start container
         run: |
-          # A socket ifname only when the job sets one: an empty MORI_SOCKET_IFNAME
-          # is not unset to cco, which then looks for an interface named "".
+          # A socket ifname, and HSA_USE_SVM, only when the job sets one: an empty
+          # MORI_SOCKET_IFNAME is not unset to cco, which then looks for an
+          # interface named "".
           $CT rm -f $CONTAINER 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
@@ -89,6 +90,7 @@ jobs:
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
             ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
+            ${HSA_USE_SVM:+-e HSA_USE_SVM=$HSA_USE_SVM} \
             ${MORI_CI_FULL:+-e MORI_CI_FULL=$MORI_CI_FULL} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
@@ -615,11 +617,20 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+            # These hosts' amdgpu-dkms lacks 93aa919 ("drm/amdkfd: fix vram
+            # allocation failure for a special case"): hipMemCreate (VRAM with no VA
+            # yet) fails with EADDRINUSE, reported as out of memory, while any SVM
+            # range sits below its size, and libhsakmt registers every pageable
+            # buffer HIP pins for a copy as one. HSA_USE_SVM=0 registers them as
+            # userptr instead. Not in the image: with SVM off every pageable copy is
+            # pinned again. Drop it once the hosts' amdgpu-dkms carries the fix.
+            hsa_use_svm: 0
     env:
       CONTAINER: mori_cco_v2_${{ github.run_id }}
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
     timeout-minutes: 30
     steps:
       - *cco-fix-perms
@@ -684,6 +695,7 @@ jobs:
             rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
             rdma_sl: 3
             rdma_tc: 104
+            hsa_use_svm: 0  # the amdgpu-dkms workaround, see cco-v2-test
     env:
       # Overrides the workflow-level name, which is keyed by run_id alone: sharing
       # it would have this job's cleanup delete the other job's container.
@@ -698,6 +710,7 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
       ENTRY: tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py
     timeout-minutes: 60
     steps:
@@ -725,6 +738,7 @@ jobs:
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            -e HSA_USE_SVM=$HSA_USE_SVM \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -753,6 +767,7 @@ jobs:
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              -e HSA_USE_SVM=$HSA_USE_SVM \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
               -w $GITHUB_WORKSPACE \
               $IMAGE sleep infinity &&

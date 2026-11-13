@@ -1,21 +1,25 @@
 # Tested base images (the apt ROCm install below must match the base's ROCm
-# major; mixing them would end up with two ROCm installs stacked):
-#   rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0  (default)
-#   rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0  (ROCM_APT_* below)
-ARG BASE_IMAGE=rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+# version: the base's rocm_sdk wheels warn on every import of a mori built
+# against another one, and a different major stacks two ROCm installs):
+#   rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0  (default)
+#   rocm/pytorch:rocm10.1.0_ubuntu22.04_py3.10_pytorch_release_2.14.0
+#   rocm/jax:rocm10.1.0_ubuntu24.04_py3.12_jax_release_0.10.2         (JAX CI)
+#   rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0  (ROCM_APT_* below)
+ARG BASE_IMAGE=rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
 FROM ${BASE_IMAGE}
 
 # Space-separated gfx targets to pull ROCm device packages for. The CCO CI
 # image uses "gfx950 gfx1250".
 ARG GPU_ARCHS="gfx942 gfx950"
 # apt ROCm to install when the base image ships no dev stack (see below).
-# 10.0 lives in a different repo than 7.x, so the URLs are args too:
-#   ROCM_APT_VERSION=10.0
-#   ROCM_APT_GPG=https://stable.repo.amd.com/rocm/gpg/packages.gpg
-#   ROCM_APT_LIST="https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main"
-ARG ROCM_APT_VERSION=7.14
-ARG ROCM_APT_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
-ARG ROCM_APT_LIST="https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main"
+# {ubuntu} in ROCM_APT_LIST expands to the base's release (2404, 2204). 7.14
+# lives in a different repo than 10.x, so the URLs are args too:
+#   ROCM_APT_VERSION=7.14
+#   ROCM_APT_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
+#   ROCM_APT_LIST="https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main"
+ARG ROCM_APT_VERSION=10.1
+ARG ROCM_APT_GPG=https://stable.repo.amd.com/rocm/gpg/packages.gpg
+ARG ROCM_APT_LIST="https://stable.repo.amd.com/rocm/core/packages/ubuntu{ubuntu} stable main"
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -27,17 +31,20 @@ RUN apt-get update && \
     cmake && \
     rm -rf /var/lib/apt/lists/*
 
+# The 10.1 torch and jax images run the system Python, which has python3 but no
+# python.
+RUN command -v python >/dev/null || ln -s "$(command -v python3)" /usr/local/bin/python
+
 # ── apt ROCm dev toolchain (only when the base image lacks one) ──
 #
-# The rocm pytorch images have no /opt/rocm: ROCm comes from the pip
+# The rocm pytorch and jax images have no /opt/rocm: ROCm comes from the pip
 # `rocm-sdk-core` wheel, which ships runtime .so files and headers but no CMake
 # package configs, so `project(... HIP)` cannot find hip-lang-config.cmake.
 # The apt ROCm below installs under /opt/rocm/core-${ROCM_APT_VERSION} and
 # registers /opt/rocm/{bin,lib,include,...} via update-alternatives, the layout
 # mori expects.
 #
-# Older base images (the 7.2.4 ones the py3.10 nightly lane still uses) already
-# ship a full ROCm dev stack, and its apt repo is ubuntu2404-only anyway — so
+# Older base images (the 7.2.x ones) already ship a full ROCm dev stack, so
 # probe for the same file mori's CMakeLists checks and skip if it is there.
 RUN set -ex; \
     if [ -e /opt/rocm/lib/cmake/hip-lang/hip-lang-config.cmake ]; then \
@@ -48,29 +55,14 @@ RUN set -ex; \
       mkdir -p --mode=0755 /etc/apt/keyrings; \
       wget -qO - "${ROCM_APT_GPG}" \
         | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg; \
-      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] ${ROCM_APT_LIST}" \
+      ubuntu="$(. /etc/os-release && echo "${VERSION_ID}" | tr -d .)"; \
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] $(echo "${ROCM_APT_LIST}" | sed "s/{ubuntu}/${ubuntu}/g")" \
         > /etc/apt/sources.list.d/amdrocm.list; \
       apt-get update; \
       for arch in ${GPU_ARCHS}; do pkgs="${pkgs} amdrocm-core-dev${ROCM_APT_VERSION}-${arch}"; done; \
       apt-get install -y --no-install-recommends ${pkgs}; \
       rm -rf /var/lib/apt/lists/*; \
     fi
-
-# Works around an amdgpu kernel bug that makes the symmetric heap's hipMemCreate
-# fail with hipErrorOutOfMemory while VRAM is nearly empty. VMM allocations carry
-# no VA yet, so the thunk passes va_addr=0, but kfd_ioctl_alloc_memory_of_gpu
-# still runs its SVM-overlap check over [va_addr, va_addr+size) — with va_addr=0
-# that degenerates into "is anything SVM-registered below <size>?". A pageable
-# host tensor that ROCr registers as SVM for an H2D copy lands on the brk heap at
-# a low VA, hits that window, and the kernel returns EADDRINUSE. Pinning glibc's
-# mmap threshold (i.e. disabling the dynamic one) keeps such buffers in the mmap
-# region, well above any plausible allocation size.
-#
-# Upstream fix is 93aa919 ("drm/amdkfd: fix vram allocation failure for a special
-# case"), in 6.18 and stable 6.17.8 / 6.12.58 / 6.6.117 / 6.1.159. Drop this once
-# the runners' amdgpu-dkms carries it — note the DKMS module overrides the
-# distro kernel's amdgpu, so bumping the Ubuntu kernel alone does nothing.
-ENV MALLOC_MMAP_THRESHOLD_=131072
 
 # Declared here, next to their only use: every RUN after an ARG has it in its
 # cache key, so up top a new FlyDSL version would rebuild the ROCm layers too.
@@ -84,3 +76,10 @@ RUN if [ "${WITH_FLYDSL}" = "1" ]; then pip install --no-cache-dir "flydsl==${FL
 
 # ci_cco.yml's fused GEMM job runs its single-GPU and 2-/4-rank cases under xdist.
 RUN pip install --no-cache-dir "pytest-xdist==3.8.0"
+
+# Last, so adding them does not rebuild the layers above. setup.py compiles
+# through ccache when it is on PATH (ci_run.sh keeps the cache in a volume), and
+# the internode jobs pin ranks with numactl.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ccache numactl && \
+    rm -rf /var/lib/apt/lists/*

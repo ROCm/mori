@@ -1,9 +1,15 @@
-<h1 align="center">MORI</h1>
+<p align="center">
+  <picture>
+    <source type="image/svg+xml" srcset="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo.svg">
+    <img alt="MORI" src="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo.png" width="420">
+  </picture>
+</p>
 
 <p align="center">
   <a href="https://rocm.github.io/mori/"><img alt="Documentation" src="https://img.shields.io/badge/docs-rocm.github.io%2Fmori-C00000"></a>
   <a href="https://pypi.org/project/amd-mori/"><img alt="PyPI" src="https://img.shields.io/pypi/v/amd-mori?label=pypi"></a>
   <a href="https://pypi.org/project/amd-mori-nightly/"><img alt="PyPI nightly" src="https://img.shields.io/pypi/v/amd-mori-nightly?label=nightly"></a>
+  <a href="https://github.com/ROCm/mori/actions/workflows/ci.yml?query=branch%3Amain+event%3Aschedule"><img alt="main CI" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FROCm%2Fmori%2Fbadges%2Fmain-ci.json"></a>
 </p>
 
 <p align="center">

@@ -207,6 +207,13 @@ Both intra and inter follow the same path:
    which `kernel_config()` does not report. A `snapshot=True` dispatch, and the
    combine of its handle, with `quant_type` `fp4_blockwise`,
    `fp4_blockwise_fp32` or `fp8_blockwise` stay on the schedule's plans.
+   A gfx1250 intranode op with a bf16 combine and an entry in
+   `_BF16_PUSH_TABLE` (`hip_tuning_configs.py`; gfx1250-strict parts have
+   none) also builds bf16 push combine plans, and every combine that is not on
+   the LL128 plans runs one, picked by the call's token count from that entry.
+   A combine with weights, or of a `snapshot=True` handle, runs the schedule's
+   combine that `kernel_config()` reports. The push plans add a landing area
+   to the arena; `MORI_EP_BF16_PUSH=0` builds neither.
 
 For configuration reporting, use the same interface on either path:
 
@@ -270,6 +277,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
 | `test_routing_snapshot.py` | `dispatch(..., snapshot=True)` handles outlive later dispatches: combine (twice) and replay with an older handle, both backends. `torchrun --standalone --nproc_per_node=2` |
 | `test_ll128_split.py` | an op past the LL128 table's `max_tok` runs small calls on its LL128 plans and the rest on the schedule's: one call sequence crossing `max_tok` both ways, synced (delivery, reverse map, bf16 sum), back to back eager and graph-replayed, and as snapshot handles, each combine equal to the synced one bit for bit. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` |
+| `test_bf16_push_select.py` | a bf16 op with a push-table entry picks its combine per call: calls crossing LL128's `max_tok` and every push bucket edge both ways, first with one token count on every rank, then above `max_tok` with a different count on each rank. Each call passes its input as a plain tensor, from `combine_in_view()`, from `combine_in_view()` on alternate ranks only, with weights, and through a `snapshot=True` handle. Checks which combine ran (only a push lands rows in `push_landing()`; weights and snapshot handles pull), the bf16 sum, every result equal to the plain one bit for bit, and back to back eager. Under `MORI_EP_BF16_PUSH=0` it checks that no push plan is built. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` (or 8) |
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
@@ -524,7 +532,7 @@ v2_ll's 64-71, so a CQE drain is not what is costing it.
 establishes that TDM reaches the xGMI ceiling (~1640 GB/s one-way) on 512 blocks
 where a CU vector copy needs 8192, so a transport whose whole cost is CU-issued
 peer stores looks like the case for it. Written as a global -> LDS -> peer
-double-buffered copy, following `src/ops/dispatch_combine/intranode_1250x.hpp`,
+double-buffered copy, following v1's gfx1250 kernels,
 which is where the non-obvious part comes from: a TDM store can target a PEER's
 flat address, not only local memory. Measured on an idle gfx1250 node at EP4,
 five interleaved rounds, and it is a wash or slightly negative -- combine +1.6%

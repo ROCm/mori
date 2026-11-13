@@ -436,6 +436,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._combine_specs = tuple(
             dict.fromkeys(row.combine for row in self._schedule)
         )
+        self._bf16_push = self._bf16_push_layout(cfg)
+        self._push_specs = tuple(
+            dict.fromkeys(
+                tuning.KernelConfig("intra", b, w) for _, b, w in self._bf16_push or ()
+            )
+        )
         # What each intranode plan will report, per variant -- its arena regions,
         # staging, push landing -- asked before any of them is built.
         self._disp_infos, self._comb_infos = self._describe(cfg)
@@ -456,6 +462,33 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # call.
         torch.cuda.synchronize(dev)
         comm.barrier()
+
+    def _bf16_push_layout(self, cfg):
+        if (
+            not self._is1250
+            or cfg.is_internode
+            or cfg.async_ll
+            or cfg.quant_type != "none"
+            or (
+                cfg.dispatch_dtype is not torch.bfloat16
+                and cfg.dispatch_dtype not in _FP8_TUNING_DTYPES
+            )
+            or cfg.combine_dtype is not torch.bfloat16
+            or not cfg.schedule
+            or self._ll128_geom is not None
+        ):
+            return None
+        flag = os.environ.get("MORI_EP_BF16_PUSH", "1")
+        if flag not in ("0", "1"):
+            raise ValueError(f"MORI_EP_BF16_PUSH must be '0' or '1', got {flag!r}")
+        if flag == "0":
+            return None
+        return tuning.bf16_push(
+            cfg.world_size,
+            cfg.hidden_dim,
+            cfg.num_experts_per_token,
+            experts_per_rank=cfg.num_experts_per_rank,
+        )
 
     def _build(self, cfg, comm):
         dev = self.dev
@@ -539,7 +572,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # never touches it -> left None (binds as 0).
         self.combine_barrier_fan = None
         if self._is1250:
-            max_comb_blocks = max(spec.block_num for spec in self._combine_specs)
+            max_comb_blocks = max(
+                spec.block_num for spec in (*self._combine_specs, *self._push_specs)
+            )
             if max_comb_blocks > _XDB_FLAG_SLOTS:
                 raise ValueError(
                     f"combine block_num {max_comb_blocks} exceeds the {_XDB_FLAG_SLOTS} "
@@ -857,6 +892,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     warp_per_block=spec.warp_per_block,
                 )
                 for spec in self._combine_specs
+            )
+            + tuple(
+                cb.EpCombinePlan.describe(
+                    **comb,
+                    combine_bf16_push=True,
+                    block_num=spec.block_num,
+                    warp_per_block=spec.warp_per_block,
+                )
+                for spec in self._push_specs
             ),
         )
 
@@ -1760,6 +1804,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
             combine[spec] = self._wrap_combine(plan)
+        push = {}
+        for spec in self._push_specs:
+            plan = cb.EpCombinePlan(
+                **comb_req,
+                **bound,
+                combine_bf16_push=True,
+                block_num=spec.block_num,
+                warp_per_block=spec.warp_per_block,
+            )
+            plan.bind(rank=cfg.rank)
+            self._plans.append(plan)
+            push[spec] = self._wrap_combine(plan)
+        if push:
+            combine = {
+                spec: self._pull_or_push(run, push) for spec, run in combine.items()
+            }
         ll = self._ll128_requests(cfg)
         if ll is not None:
             ll_bound = dict(arena=arena, region_names=self._ll128_split["region_names"])
@@ -2054,8 +2114,43 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         return run
 
+    def _pull_or_push(self, pull, push):
+        routes = tuple(
+            (mx, push[tuning.KernelConfig("intra", b, w)])
+            for mx, b, w in self._bf16_push
+        )
+
+        def run(
+            *,
+            input,
+            dest_map,
+            total_recv,
+            num_tokens,
+            want_weights=False,
+            recv_to_src=None,
+            recv_idx=None,
+        ):
+            if want_weights or total_recv is not self._recv:
+                return pull(
+                    input=input,
+                    dest_map=dest_map,
+                    total_recv=total_recv,
+                    num_tokens=num_tokens,
+                    want_weights=want_weights,
+                    recv_to_src=recv_to_src,
+                    recv_idx=recv_idx,
+                )
+            return tuning.pick_bucket(routes, num_tokens)[1](
+                input=input,
+                dest_map=dest_map,
+                total_recv=total_recv,
+                num_tokens=num_tokens,
+            )
+
+        return run
+
     def push_landing(self):
-        if self.cfg.quant_type not in _PUSH_QUANT_TYPES:
+        if self.cfg.quant_type not in _PUSH_QUANT_TYPES and not self._push_specs:
             raise ValueError(
                 f"no landing rows: quant_type {self.cfg.quant_type!r} is not a push one"
             )

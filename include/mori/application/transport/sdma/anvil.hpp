@@ -142,8 +142,13 @@ class AnvilLib {
 
   // True for MI308X (PCI device_id 0x74A2), a 4-XCD harvest of the 8-XCD MI300X
   // whose odd-numbered SDMA engine ids are fused off. connect() folds selected
-  // engine ids down to the backing even engine on this part.
+  // engine ids down to the backing even engine on this part and balances its
+  // peer links over the xGMI engines.
   bool isMi308x(int deviceId);
+
+  // MI308X only; see connect(). Both assume channels_mutex_ is held.
+  uint32_t mi308xLinkEngine(int srcNode, int dstNode, const std::vector<uint32_t>& recommended);
+  uint32_t mi308xQueueEngine(int srcNode, int dstNode);
 
   struct PairHash {
     std::size_t operator()(const std::pair<int, int>& p) const {
@@ -155,6 +160,15 @@ class AnvilLib {
   std::once_flag init_flag;
   std::mutex channels_mutex_;
   std::unordered_map<std::pair<int, int>, SdmaQueueVector, PairHash> sdma_channels_;
+  // MI308X peer-link balancing state, guarded by channels_mutex_. Per source
+  // node, the peer links and queues on each SDMA engine id; and per (src, dst)
+  // link, the engine all of its queues were given.
+  struct Mi308xEngineUse {
+    std::array<int, 8> links{};
+    std::array<int, 8> queues{};
+  };
+  std::unordered_map<int, Mi308xEngineUse> mi308x_engine_use_;
+  std::unordered_map<std::pair<int, int>, uint32_t, PairHash> mi308x_link_engine_;
 };
 
 extern AnvilLib& anvil;

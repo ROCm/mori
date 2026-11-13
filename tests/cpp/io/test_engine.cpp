@@ -1898,6 +1898,7 @@ void CaseXgmiCrossEngineIpc() {
 
   HIP_RUNTIME_CHECK(hipSetDevice(0));
   HIP_RUNTIME_CHECK(hipMemset(srcMem.ptr, 0xAB, kSize));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   HIP_RUNTIME_CHECK(hipSetDevice(1));
   HIP_RUNTIME_CHECK(hipMemset(dstMem.ptr, 0x00, kSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -2150,6 +2151,35 @@ void CaseXgmiHiddenDeviceImporterNonZeroDevice() {
   RunHiddenDeviceSplitVisibility(totalGpus - 1, "0,1", 1);
 }
 
+// Regression: GPUs outside an XGMI hive (PCIe-only cards) all report KFD hive_id 0,
+// and hidden-device eligibility required a shared non-zero hive, so CreateSession
+// returned nullopt for every pair. This is prefill and decode on adjacent GPUs,
+// one GPU per process.
+void CaseXgmiHiddenDeviceAdjacentGpus() {
+  int totalGpus = GetGpuCount();
+  if (totalGpus < 2) throw TestSkip("requires at least 2 GPUs");
+  RunHiddenDeviceSplitVisibility(0, "1", 0);
+}
+
+// A hidden remote GPU that is neither in the local GPU's hive nor one of its KFD P2P
+// peers must still be rejected.
+void CaseXgmiHiddenDeviceRejectsUnknownPeer() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_hidden_unknown_peer_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  auto local = RegisterGpuMemory(&engine, 4096, 0);
+  MemoryDesc remote = local.desc;
+  remote.deviceBusId = "0000:ff:1f.7";
+  Require(!engine.CreateSession(local.desc, remote).has_value(),
+          "CreateSession should fail for a hidden GPU that is not a P2P peer");
+}
+
 void CaseXgmiInboundNotificationIsUnsupported() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -2211,6 +2241,42 @@ void CaseXgmiConcurrentWaitAndPollIsSafe() {
   Require(status.Succeeded(),
           "xgmi concurrent wait/poll transfer failed: code=" + std::to_string(status.CodeUint32()) +
               ", msg='" + status.Message() + "'");
+}
+
+void CaseXgmiBoundedWaitReturnsOnCompletion() {
+  if (GetGpuCount() < 2) throw TestSkip("requires at least 2 GPUs");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_bounded_wait_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  constexpr size_t kSize = 64 * 1024 * 1024;
+  auto src = RegisterGpuMemory(&engine, kSize, 0);
+  auto dst = RegisterGpuMemory(&engine, kSize, 1);
+
+  // An XGMI status completes only when polled; a bounded wait must poll it rather than sleep to
+  // its deadline.
+  for (bool waitAll : {false, true}) {
+    TransferStatus status;
+    engine.Write(src.desc, 0, dst.desc, 0, kSize, &status, engine.AllocateTransferUniqueId());
+    auto start = std::chrono::steady_clock::now();
+    if (waitAll) {
+      engine.WaitAll({&status}, 10000);
+    } else {
+      status.WaitFor(10000);
+    }
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count();
+    const std::string how = waitAll ? "WaitAll(10000)" : "WaitFor(10000)";
+    Require(status.Succeeded(),
+            how + " transfer failed: code=" + std::to_string(status.CodeUint32()) + ", msg='" +
+                status.Message() + "'");
+    Require(ms < 2000, how + " returned after " + std::to_string(ms) + " ms for a 64 MiB copy");
+  }
 }
 
 struct TestCase {
@@ -2296,8 +2362,11 @@ int main(int argc, char* argv[]) {
       {"xgmi_hidden_device_export_from_nonzero_device",
        CaseXgmiHiddenDeviceExportFromNonZeroDevice},
       {"xgmi_hidden_device_importer_nonzero_device", CaseXgmiHiddenDeviceImporterNonZeroDevice},
+      {"xgmi_hidden_device_adjacent_gpus", CaseXgmiHiddenDeviceAdjacentGpus},
+      {"xgmi_hidden_device_rejects_unknown_peer", CaseXgmiHiddenDeviceRejectsUnknownPeer},
       {"xgmi_inbound_notification_is_unsupported", CaseXgmiInboundNotificationIsUnsupported},
       {"xgmi_concurrent_wait_and_poll_is_safe", CaseXgmiConcurrentWaitAndPollIsSafe},
+      {"xgmi_bounded_wait_returns_on_completion", CaseXgmiBoundedWaitReturnsOnCompletion},
   };
 
   int passed = 0;

@@ -21,17 +21,23 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 
+#include <arpa/inet.h>
 #include <hip/hip_runtime_api.h>
 #include <infiniband/verbs.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
@@ -266,6 +272,129 @@ ibv_mr* Mlx5RegisterControlMr(ibv_context* context, ibv_pd* pd, bool onGpu, void
   MORI_APP_TRACE("MLX5 MR [{}] registered via {}: addr=0x{:x}, size={}", what, how,
                  reinterpret_cast<uintptr_t>(addr), size);
   return mr;
+}
+
+// Normalise an IPv4 GID to ::ffff:a.b.c.d, the only form libibverbs treats as IPv4.
+void HcaGidToIbvGid(const uint8_t raw[16], union ibv_gid* gid) {
+  memcpy(gid->raw, raw, sizeof(gid->raw));
+  bool upperZero = true;
+  for (int i = 0; i < 12; ++i) upperZero = upperZero && raw[i] == 0;
+  if (upperZero && raw[12] != 0) {
+    gid->raw[10] = 0xff;
+    gid->raw[11] = 0xff;
+  }
+}
+
+std::string MacToString(const uint8_t mac[ETHERNET_LL_SIZE]) {
+  char buf[3 * ETHERNET_LL_SIZE];
+  snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3],
+           mac[4], mac[5]);
+  return buf;
+}
+
+// Destination MAC for `remoteGid`: the peer NIC's when it is on our L2 segment, the next hop's when
+// a router is in between. The kernel resolves it from its route and neighbour tables when an
+// address handle is created, as ibv_modify_qp does. Returns 0 on success, an errno value otherwise.
+//
+// Costs about 25 us when the neighbour is reachable, but about 1 s when it is not: the kernel sends
+// an ARP request and waits for it to time out. Every QP to the same peer carries the same GID, so
+// the result is cached per (local device, port, sgid index, remote GID), failures included --
+// otherwise a peer that cannot be resolved would cost ~1 s per QP during setup. The local side is
+// part of the key because each local NIC can have its own next hop on a routed fabric. The cache
+// lives as long as the process, so a peer whose MAC changes underneath us (a migrated VM, say)
+// keeps the old value; MORI_MLX5_RESOLVE_DMAC=0 turns the whole path off.
+int ResolveRoceDmac(ibv_pd* pd, uint32_t portId, int gidIdx, const uint8_t remoteGid[16],
+                    uint8_t dmac[ETHERNET_LL_SIZE]) {
+  struct Entry {
+    int err;
+    uint8_t mac[ETHERNET_LL_SIZE];
+  };
+  // Sorted map: small, and lookups happen once per QP. The device name, unlike the context
+  // pointer, is not recycled when a context is closed and reopened.
+  using Key = std::tuple<std::string, uint32_t, int, std::array<uint8_t, 16>>;
+  static std::mutex cacheMutex;
+  static std::map<Key, Entry> cache;
+  std::array<uint8_t, 16> gid;
+  memcpy(gid.data(), remoteGid, gid.size());
+  const Key key{pd->context->device->name, portId, gidIdx, gid};
+  {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+      int err = it->second.err;
+      if (err == 0) memcpy(dmac, it->second.mac, ETHERNET_LL_SIZE);
+      return err;
+    }
+  }
+
+  ibv_ah_attr attr{};
+  attr.is_global = 1;
+  attr.port_num = static_cast<uint8_t>(portId);
+  attr.grh.sgid_index = static_cast<uint8_t>(gidIdx);
+  attr.grh.hop_limit = 64;
+  HcaGidToIbvGid(remoteGid, &attr.grh.dgid);
+
+  errno = 0;
+  ibv_ah* ah = ibv_create_ah(pd, &attr);
+  if (ah == nullptr) {
+    int err = errno != 0 ? errno : ENOMEM;
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    cache.emplace(key, Entry{err, {}});
+    return err;
+  }
+
+  mlx5dv_ah dvAh{};
+  mlx5dv_obj obj{};
+  obj.ah.in = ah;
+  obj.ah.out = &dvAh;
+  int err = 0;
+  Entry entry{};
+  if (Mlx5DvApi::Instance().init_obj == nullptr) {
+    err = ENOSYS;
+  } else if (Mlx5DvApi::Instance().init_obj(&obj, MLX5DV_OBJ_AH) != 0 || dvAh.av == nullptr) {
+    err = EIO;
+  } else {
+    uint8_t nonZero = 0;
+    for (int i = 0; i < ETHERNET_LL_SIZE; ++i) nonZero |= dvAh.av->rmac[i];
+    if (nonZero == 0) {
+      err = EHOSTUNREACH;
+    } else {
+      memcpy(entry.mac, dvAh.av->rmac, ETHERNET_LL_SIZE);
+    }
+  }
+  ibv_destroy_ah(ah);
+  if (err == 0) memcpy(dmac, entry.mac, ETHERNET_LL_SIZE);
+  entry.err = err;
+  std::lock_guard<std::mutex> lock(cacheMutex);
+  cache.emplace(key, entry);
+  return err;
+}
+
+// One line per process rather than one per QP.
+void LogDmacResolution(int err, const uint8_t remoteGid[16],
+                       const uint8_t peerMac[ETHERNET_LL_SIZE],
+                       const uint8_t dmac[ETHERNET_LL_SIZE]) {
+  static std::atomic<bool> okLogged{false};
+  static std::atomic<bool> errLogged{false};
+  union ibv_gid gid;
+  HcaGidToIbvGid(remoteGid, &gid);
+  char gidStr[INET6_ADDRSTRLEN] = {};
+  inet_ntop(AF_INET6, gid.raw, gidStr, sizeof(gidStr));
+  if (err == 0) {
+    if (!okLogged.exchange(true)) {
+      bool routed = memcmp(dmac, peerMac, ETHERNET_LL_SIZE) != 0;
+      MORI_APP_INFO("MLX5 RoCE destination MAC for {} is {} (peer NIC MAC {}){}", gidStr,
+                    MacToString(dmac), MacToString(peerMac),
+                    routed ? ", peer is behind a router" : "");
+    }
+  } else if (!errLogged.exchange(true)) {
+    // ERROR, not WARN: the application logger defaults to ERROR, and on a routed fabric this is
+    // the one line that explains why the QP then hangs instead of making progress.
+    MORI_APP_ERROR(
+        "MLX5 RoCE cannot resolve the destination MAC for {} ({}); falling back to the peer NIC "
+        "MAC {}, which only works if the peer is on the same L2 segment",
+        gidStr, strerror(err), MacToString(peerMac));
+  }
 }
 
 }  // namespace
@@ -599,8 +728,21 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
     memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rgid_rip), remote_handle.eth.gid,
            sizeof(remote_handle.eth.gid));
 
-    memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rmac_47_32), remote_handle.eth.mac,
-           sizeof(remote_handle.eth.mac));
+    // remote_handle.eth.mac is the peer NIC's own MAC, which only works on the same L2 segment.
+    // A DEVX QP bypasses the kernel's resolution, so resolve the next hop here (cached per local
+    // NIC and peer).
+    // A resolution failure, or MORI_MLX5_RESOLVE_DMAC=0, keeps the old behaviour.
+    uint8_t dmac[ETHERNET_LL_SIZE];
+    memcpy(dmac, remote_handle.eth.mac, sizeof(dmac));
+    static const bool resolveDmac = env::GetInt("MORI_MLX5_RESOLVE_DMAC").value_or(1) != 0;
+    if (resolveDmac) {
+      uint8_t nextHopMac[ETHERNET_LL_SIZE];
+      int err = ResolveRoceDmac(device_context->GetIbvPd(), config.portId, local_handle.eth.gidIdx,
+                                remote_handle.eth.gid, nextHopMac);
+      if (err == 0) memcpy(dmac, nextHopMac, sizeof(dmac));
+      LogDmacResolution(err, remote_handle.eth.gid, remote_handle.eth.mac, dmac);
+    }
+    memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rmac_47_32), dmac, sizeof(dmac));
     DEVX_SET(qpc, qpc, primary_address_path.hop_limit, 64);
     DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, local_handle.eth.gidIdx);
     // UDP sport: default to a single fixed RoCEv2 sport (== 0xC000 on RoCE).

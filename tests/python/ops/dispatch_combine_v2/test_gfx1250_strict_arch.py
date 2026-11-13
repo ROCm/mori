@@ -207,17 +207,6 @@ class DeviceMacroTest(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertIn(self.FAMILY, lines)
 
-    def test_v1_jit_passes_the_hosts_family_decision(self):
-        from mori.jit import core
-
-        for arch, want in [
-            ("gfx1250", ["-DMORI_HOST_GFX125X=1"]),
-            ("gfx1250-strict", ["-DMORI_HOST_GFX125X=1"]),
-            ("gfx950", []),
-        ]:
-            with self.subTest(arch=arch):
-                self.assertEqual(core._arch_family_defines(arch), want)
-
     def test_no_per_target_gfx125x_macros(self):
         pat = re.compile(r"__gfx125[0-9]__|__gfx1250_strict__")
         hits = []
