@@ -578,7 +578,7 @@ def bf16_push(world_size, hidden_dim, topk, experts_per_rank=None):
 
 _CARD_TABLE: dict = {
     "gfx1250/96cu": {
-        (8, 7168, 6, None): dict(pull_blocks=8, pull_launch_max=256),
+        (8, 7168, 6, None): dict(pull_blocks=4, pull_launch_max=256),
     },
 }
 
