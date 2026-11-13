@@ -818,6 +818,7 @@ jobs:
           # shared barrier from their own combine kernel code. Every case
           # allocates the op's default 8 QPs, so no table's count is clamped.
           for CASE in "v2 128 --num-qp 8" "v2 4096 --num-qp 8" "v2_ll 128 --num-qp 8" \
+                      "auto 128 --num-qp 8" \
                       "v2 4096 --num-qp 8 -- --active-qp-counts 1,2,4,8" \
                       "v2_ll 128 --num-qp 8 -- --active-qp-counts 1,2,4,8"; do
             set -- $CASE; KERNEL=$1; TOKENS=$2; shift 2; EXTRA="$*"

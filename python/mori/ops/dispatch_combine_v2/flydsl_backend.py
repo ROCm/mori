@@ -158,6 +158,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         self._gate(
             KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg))
         )
+        self._warn_unused_low_latency()
 
         self.arena = SymmArena(comm, regions)
         self.arena.zero()
