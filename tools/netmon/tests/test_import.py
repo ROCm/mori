@@ -172,6 +172,40 @@ class ImporterTests(unittest.TestCase):
         b2.flush()
         self.assertGreater(b2.requests, 1)  # 600k points > 500k per request
 
+    def test_searches_cover_all_time(self):
+        # VM's default end is "now" in whole seconds: a read-back right after a recording
+        # would miss its newest points (measured), so every search passes an explicit end.
+        seen = []
+
+        class Resp:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return self.body
+
+            def __iter__(self):
+                return iter([])
+
+        vm = I.VM("http://vm")
+        vm._open = lambda req, *a, **k: (
+            seen.append(req.full_url),
+            Resp(b'{"data": []}'),
+        )[1]
+        vm.series('{__name__="x"}')
+        vm.label_values("host", '{__name__="x"}')
+        list(vm.export('{__name__="x"}'))
+        self.assertEqual(len(seen), 3)
+        for url in seen:
+            self.assertIn("start=2000-01-01", url)
+            self.assertIn("end=2100-01-01", url)
+
     def test_selector_escaping(self):
         sel = I.selector("netmon_.+", experiment='a"b\\c', host="h")
         self.assertEqual(
@@ -240,6 +274,52 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(a["max"][2], 3.0)
         self.assertEqual(a["min"][2], 2.0)
         self.assertTrue(np.isnan(a["max"][0]))
+
+    def test_all_valid_intervals_feed_the_average_and_peak_lines(self):
+        # One normal 2 ms interval at 10/s and one long 100 ms interval at 100/s ending in the
+        # same window: the average weighs them by time, the peak is the highest of both
+        # (never below the average); a window with only the long interval has both lines;
+        # an invalid interval adds nothing.
+        class FakeRates:
+            valid = np.array([True, True, True, False])
+            lowres = np.array([False, True, True, False])
+            dt = np.array([2e6, 100e6, 100e6, 1e6])
+            dv = np.array([0.02, 10.0, 5.0, 99.0])
+            rate = dv / dt * 1e9
+            w_end = np.array([95e6, 99e6, 150e6, 160e6])
+
+            def end_ms(self):
+                return np.round(self.w_end / 1e6).astype(np.int64)
+
+        a = R.window_aggregate(FakeRates(), R.epoch_grid(1, 200, 100), 100)
+        self.assertAlmostEqual(a["mean_all"][1], 10.02 / 102e6 * 1e9)
+        self.assertEqual(a["max_all"][1], 100.0)
+        self.assertGreaterEqual(a["max_all"][1], a["mean_all"][1])
+        self.assertEqual(a["mean"][1], 10.0)  # the normal-only rule is unchanged
+        self.assertAlmostEqual(a["mean_all"][2], 50.0)
+        self.assertEqual(a["max_all"][2], 50.0)
+        self.assertTrue(np.isnan(a["mean"][2]))
+        self.assertTrue(np.isnan(a["mean_all"][0]))
+
+
+class DisplayLabelsTest(unittest.TestCase):
+    # Same cases as test_push.cc DisplayLabelsMatchTheImporter (the live exporter's rule).
+    def test_names(self):
+        self.assertEqual(
+            I.display_labels(
+                "n08-25.example.com", "benic3p1", "ionic_3", "0000:79:00.0"
+            ),
+            {
+                "display_nic": "ionic_3 (benic3p1)",
+                "display_host_nic": "n08-25 \u00b7 ionic_3",
+                "ibdev": "ionic_3",
+                "pci": "0000:79:00.0",
+            },
+        )
+        self.assertEqual(
+            I.display_labels("plainhost", "eth9", "", ""),
+            {"display_nic": "eth9", "display_host_nic": "plainhost \u00b7 eth9"},
+        )
 
 
 class VerifierTests(unittest.TestCase):
@@ -346,9 +426,16 @@ class DashboardTests(unittest.TestCase):
             d = json.loads(text)
             self.assertNotIn("insertNulls", text)
             self.assertNotIn("spanNulls", text)
-            for p in d["panels"]:
+            panels = list(V.all_panels(d))
+            for p in panels:
                 for t in p.get("targets", []):
-                    if t.get("instant"):
+                    if t.get("instant") and "netmon" in t:  # selected-range table
+                        self.assertEqual(t["netmon"]["kind"], "range_mean")
+                        self.assertIn(
+                            "[${__range_ms}ms]", t["expr"]
+                        )  # $__range is whole s
+                        self.assertNotIn("[$__range]", t["expr"])
+                    elif t.get("instant"):
                         self.assertIn("last_over_time(", t["expr"])
                         self.assertIn("[3650d]", t["expr"])
                     else:
@@ -362,11 +449,62 @@ class DashboardTests(unittest.TestCase):
             # single-valued ones (not escaped) with =.
             for v in d["templating"]["list"]:
                 multi = v.get("multi") or v.get("includeAll")
-                for p in d["panels"]:
+                for p in panels:
                     for t in p.get("targets", []):
                         if f'"${v["name"]}"' in t["expr"]:
                             op = "=~" if multi else "="
                             self.assertIn(f'{v["name"]}{op}"${v["name"]}"', t["expr"])
+
+    def test_main_views_show_traffic_only(self):
+        # Design v0.3: per direction an average and a peak line, nothing else; the NIC
+        # variable shows names, its value stays the target.
+        for name, text in G.render().items():
+            d = json.loads(text)
+            for p in V.all_panels(d):
+                kinds = {t.get("netmon", {}).get("kind") for t in p.get("targets", [])}
+                self.assertFalse(kinds & {"min", "low"}, f"{name} {p['title']}")
+            nic = next(v for v in d["templating"]["list"] if v["name"] == "target")
+            self.assertEqual(nic["label"], "NIC")
+            self.assertIn('target="(?<value>', nic["regex"])
+            step = next(v for v in d["templating"]["list"] if v["name"] == "min_step")
+            self.assertEqual(step["hide"], 2)
+
+    def test_tables_join_on_target_and_keep_link_fields(self):
+        # A wrong join would put one NIC's numbers next to another NIC's name.
+        for name, text in G.render().items():
+            for p in V.all_panels(json.loads(text)):
+                if p["type"] != "table" or len(p["targets"]) < 2:
+                    continue
+                joins = [x for x in p["transformations"] if x["id"] == "joinByField"]
+                self.assertEqual(
+                    joins,
+                    [
+                        {
+                            "id": "joinByField",
+                            "options": {"byField": "target", "mode": "outer"},
+                        }
+                    ],
+                )
+                for t in p["targets"]:  # every row is keyed by target
+                    self.assertTrue(
+                        "by (target)" in t["expr"]
+                        or "netmon_target_info{" in t["expr"],
+                        t["expr"],
+                    )
+                hidden = {
+                    o["matcher"]["options"]
+                    for o in p["fieldConfig"]["overrides"]
+                    if {"id": "custom.hidden", "value": True} in o["properties"]
+                }
+                self.assertIn("target", hidden)
+                links = json.dumps(p["fieldConfig"]["overrides"])
+                if "__data.fields" in links:
+                    self.assertIn(
+                        "host", hidden
+                    )  # raw host: a mapped/short one breaks links
+                    self.assertIn("${__data.fields.host:percentencode}", links)
+                    self.assertIn("${__data.fields.target:percentencode}", links)
+                    self.assertIn("var-experiment=", links)
 
     def test_interpolate_like_grafana(self):
         multi = {"templating": {"list": [{"name": "x", "multi": True}]}}

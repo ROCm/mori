@@ -58,6 +58,8 @@ ExportStream Stream1() {
   s.record_words = 4 + s.names.size();
   s.batch_records = 25;
   s.speed_mbps = 400000;
+  s.ibdev = "ionic_3";  // not the netdev's number: the name must come from the stream
+  s.pci = "0000:79:00.0";
   return s;
 }
 
@@ -89,6 +91,18 @@ bool WaitPhase(Exporter* e, Exporter::Phase want, uint64_t ms) {
 }
 
 }  // namespace
+
+// Same cases as test_import.py DisplayLabelsTest (the importer's rule).
+TEST(DisplayLabelsMatchTheImporter) {
+  using L = std::vector<std::pair<std::string, std::string>>;
+  CHECK((DisplayLabels("n08-25.example.com", "benic3p1", "ionic_3", "0000:79:00.0") ==
+         L{{"display_nic", "ionic_3 (benic3p1)"},
+           {"display_host_nic", "n08-25 \u00b7 ionic_3"},
+           {"ibdev", "ionic_3"},
+           {"pci", "0000:79:00.0"}}));
+  CHECK((DisplayLabels("plainhost", "eth9", "", "") ==
+         L{{"display_nic", "eth9"}, {"display_host_nic", "plainhost \u00b7 eth9"}}));
+}
 
 TEST(HttpUrlParsing) {
   HttpUrl u;
@@ -182,6 +196,8 @@ TEST(ExporterPushesIntervalsAndMetadata) {
   for (const auto& b : vm.bodies()) all += b;
   CHECK(all.find("\"__name__\":\"netmon_target_info\"") != std::string::npos);
   CHECK(all.find("\"status\":\"live\"") != std::string::npos);
+  CHECK(all.find("\"display_nic\":\"ionic_3 (n0)\"") != std::string::npos);
+  CHECK(all.find("\"ibdev\":\"ionic_3\",\"pci\":\"0000:79:00.0\"") != std::string::npos);
   CHECK(all.find("\"__name__\":\"netmon_import_info\"") != std::string::npos);
   CHECK(all.find("\"__name__\":\"netmon_step_ms\"") != std::string::npos);
   CHECK(all.find("\"counter\":\"tx_rdma_ucast_bytes\",\"resolution\":\"normal\"") !=

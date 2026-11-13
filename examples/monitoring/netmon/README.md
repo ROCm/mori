@@ -3,12 +3,16 @@
 VictoriaMetrics + Grafana with two dashboards for recordings made by
 [`ainic-netmon`](../../../tools/netmon/README.md):
 
-- **netmon overview**: one experiment, every node and NIC (one row per `host/netdev`):
-  RDMA send/receive and port wire bytes as a min–max envelope per window (spikes are kept)
-  with the mean, congestion and retransmission, data quality, and the offline report's
-  summary table.
-- **netmon NIC detail**: one `host/netdev`: the same panels plus raw points (one point per
-  interval when zoomed to a 1 ms step), IPC wire bytes, PFC pause counters and run quality.
+- **netmon overview**: one experiment, every node and NIC. A table of the NICs (host, RDMA
+  device name such as `ionic_0 (benic1p1)`, link rate, average send and receive over the
+  selected time; click a NIC to open its detail page) and one small RDMA traffic chart per NIC.
+- **netmon NIC detail**: one NIC: RDMA traffic, all port traffic, retransmissions and
+  congestion notifications. Collapsed at the bottom: individual observations, PFC pause
+  counters (meaning not yet validated), and recording diagnostics for troubleshooting the
+  monitor itself (gaps, sampling quality, the offline report's fixed-window summary).
+
+How to read the traffic charts: **blue = send, orange = receive; solid = average, dashed =
+observed peak; gaps = data unavailable.** Pick the experiment, then the host, then the NIC.
 
 Data gets there in two ways: live while recording (`ainic-netmon record --push`), and after
 the fact with exact numbers (`ainic-netmon-import`).
@@ -38,8 +42,8 @@ ainic-netmon record -o /shared/exp42/{host} --push http://127.0.0.1:8428
   already pushed to this experiment.
 - Live numbers are an online approximation of the offline rules (slow samples and the
   low-resolution threshold are judged on the last 1024 samples instead of the whole run; in
-  tests 99.95 % of the points are identical). In a window where a push failed, the mean may be
-  off (part of a request can be lost). The summary tables stay empty while live. When the
+  tests 99.95 % of the points are identical). In a window where a push failed, the average may
+  be off (part of a request can be lost). The offline report summary stays empty while live. When the
   recording ends, import it with `--replace` to replace the live data with the exact numbers.
 
 ## Import and look
@@ -50,9 +54,11 @@ ainic-netmon-import /shared/exp42/nodeA /shared/exp42/nodeB
 
 - The experiment name defaults to the recordings' parent directory (`exp42`); `--experiment`
   sets it.
-- The importer prints the two dashboard URLs for the experiment's time range. The `min_step`
-  variable (the low-resolution threshold, e.g. 6 ms for 2 ms sampling) is set automatically
-  from the data.
+- The importer prints the two dashboard URLs for the experiment's time range. The smallest
+  time bin of the charts (3× the sampling interval, e.g. 6 ms for 2 ms sampling) is taken
+  from the data (hidden variable `min_step`).
+- Experiments imported by an older importer have no RDMA device names: their NICs are listed
+  as `host/netdev` until re-imported with `--replace`.
 - An experiment is imported as a whole (its fixed window, `min_step` and time anchor depend
   on every recording). Re-importing needs `--replace` with all of its recordings; it deletes
   only `netmon_*` series of that experiment. Recordings that do not overlap in time are
@@ -63,16 +69,20 @@ ainic-netmon-import /shared/exp42/nodeA /shared/exp42/nodeB
 ## What the panels show (and do not)
 
 - Rates use the offline report's rules: sample time `t0 + f·rtt`, requests slower than 1.5×
-  the median are skipped, counter resets and wall-clock steps cut the series, intervals
-  longer than 3× the baseline are low resolution (shown as separate points, not in the
-  envelope). The same windows are used by the offline report's overview, so both agree.
-- Windows are `(t − step, t]`; a window without a valid interval has no point. Lines break
+  the median are skipped, counter resets and wall-clock steps cut the series. Each
+  observation is the rate between two counter reads (about 2 ms apart).
+- Per time bin `(t − step, t]`: the average (solid) is Σ increase / Σ duration of the valid
+  observations ending in the bin, the peak (dashed) is the highest of them; both include the
+  longer observations around sampling stalls. A single observation has timing jitter and can
+  slightly exceed the link rate. A bin without a valid observation has no point: lines break
   there; nothing is filled with zeros or carried forward.
-- The envelope/mean panels never use a window smaller than `min_step`; zoom in further on the
-  raw-points panel of the NIC detail dashboard.
+- The charts never use a bin smaller than 3× the sampling interval; for single observations
+  open "Inspect individual observations" on the NIC detail page and zoom to 1 ms bins.
+- The overview table averages the observations that end in the selected time range (a long
+  observation crossing its start is counted whole).
 - Only NIC counters are shown; nothing about the workload running over the NICs is
   inferred.
-- The summary table is the offline report's summary for the experiment's fixed common
+- The offline report summary (recording diagnostics) is for the experiment's fixed common
   window; it does not change with zoom.
 
 ## Notes

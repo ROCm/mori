@@ -27,7 +27,7 @@
     "list": [
       {
         "name": "experiment",
-        "label": "experiment",
+        "label": "Experiment",
         "type": "query",
         "datasource": {
           "type": "prometheus",
@@ -42,8 +42,8 @@
         "sort": 1
       },
       {
-        "name": "target",
-        "label": "host/netdev",
+        "name": "host",
+        "label": "Host",
         "type": "query",
         "datasource": {
           "type": "prometheus",
@@ -53,15 +53,33 @@
           "query": "query_result(last_over_time(netmon_target_info{experiment=\"$experiment\"}[3650d]))",
           "refId": "V"
         },
-        "regex": "/target=\"([^\"]+)\"/",
+        "regex": "/host=\"(?<value>(?<text>[^\".]+)[^\"]*)\"/",
         "refresh": 2,
-        "sort": 1,
+        "sort": 7,
+        "multi": true,
+        "includeAll": true
+      },
+      {
+        "name": "target",
+        "label": "NIC",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "netmon-vm"
+        },
+        "query": {
+          "query": "query_result(last_over_time(netmon_target_info{experiment=\"$experiment\",host=~\"$host\"}[3650d]))",
+          "refId": "V"
+        },
+        "regex": "/display_host_nic=\"(?<text>[^\"]+)\"|target=\"(?<value>[^\"]+)\"/g",
+        "refresh": 2,
+        "sort": 7,
         "multi": true,
         "includeAll": true
       },
       {
         "name": "min_step",
-        "label": "min step, ms (low-res threshold)",
+        "label": "min step, ms",
         "type": "query",
         "datasource": {
           "type": "prometheus",
@@ -73,956 +91,42 @@
         },
         "regex": "/\\} ([0-9]+) /",
         "refresh": 2,
-        "description": "Smallest window of the envelope/mean panels: 3 x the sampling baseline, the largest over the experiment's hosts"
+        "hide": 2
       }
     ]
   },
+  "links": [],
   "panels": [
     {
       "id": 1,
-      "type": "table",
-      "title": "Fixed experiment window summary (offline report rules; rates in Gb/s, coverage/above80 as fractions)",
-      "description": "Numbers of the offline report's summary table for the fixed window [window_start, window_end] (the experiment's common window). They do not change with zoom.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "netmon-vm"
-      },
+      "type": "text",
+      "title": "",
+      "transparent": true,
       "gridPos": {
         "x": 0,
         "y": 0,
         "w": 24,
-        "h": 8
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "(last_over_time(netmon_summary{experiment=\"$experiment\",target=~\"$target\",stat=~\"avg|peak10ms|p99\"}[3650d]) * 8 / 1e9) or (last_over_time(netmon_summary{experiment=\"$experiment\",target=~\"$target\",stat=~\"coverage|above80\"}[3650d])) or (last_over_time(netmon_summary{experiment=\"$experiment\",target=~\"$target\",stat=~\"lowres_n|lowres_s\"}[3650d]))",
-          "range": false,
-          "instant": true,
-          "format": "table"
-        }
-      ],
-      "transformations": [
-        {
-          "id": "merge",
-          "options": {}
-        },
-        {
-          "id": "groupingToMatrix",
-          "options": {
-            "columnField": "stat",
-            "rowField": "row",
-            "valueField": "Value"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "decimals": 3
-        },
-        "overrides": []
+        "h": 2
       },
       "options": {
-        "showHeader": true
+        "mode": "markdown",
+        "content": "**<span style='color:#2a78d6'>Blue = send</span>, <span style='color:#eb6834'>orange = receive</span>. Solid = average, dashed = observed peak. Gaps = data unavailable.**"
       }
     },
     {
       "id": 2,
-      "type": "row",
-      "title": "$target",
-      "repeat": "target",
-      "collapsed": false,
-      "gridPos": {
-        "x": 0,
-        "y": 8,
-        "w": 24,
-        "h": 1
-      },
-      "panels": []
-    },
-    {
-      "id": 3,
-      "type": "timeseries",
-      "title": "RDMA payload, Gb/s (envelope = min..max per window, line = mean)",
-      "description": "Data with target status 'live' comes from ainic-netmon record --push: an online approximation of these rules; where a push failed the mean of that window may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "netmon-vm"
-      },
-      "interval": "${min_step}ms",
-      "maxDataPoints": 2000,
-      "gridPos": {
-        "x": 0,
-        "y": 9,
-        "w": 9,
-        "h": 8
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\",resolution=\"normal\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "tx max",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "rdma",
-            "counter": "tx_rdma_ucast_bytes",
-            "scale": 8e-09,
-            "kind": "max"
-          }
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "min_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\",resolution=\"normal\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "tx min",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "rdma",
-            "counter": "tx_rdma_ucast_bytes",
-            "scale": 8e-09,
-            "kind": "min"
-          }
-        },
-        {
-          "refId": "C",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "(sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\",resolution=\"normal\"}[$__interval]) / sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\",resolution=\"normal\"}[$__interval])) * 8 / 1e9",
-          "legendFormat": "tx mean",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "rdma",
-            "counter": "tx_rdma_ucast_bytes",
-            "scale": 8e-09,
-            "kind": "mean"
-          }
-        },
-        {
-          "refId": "D",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\",resolution=\"low\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "tx low-res",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "rdma",
-            "counter": "tx_rdma_ucast_bytes",
-            "scale": 8e-09,
-            "kind": "low"
-          }
-        },
-        {
-          "refId": "E",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\",resolution=\"normal\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "rx max",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "rdma",
-            "counter": "rx_rdma_ucast_bytes",
-            "scale": 8e-09,
-            "kind": "max"
-          }
-        },
-        {
-          "refId": "F",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "min_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\",resolution=\"normal\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "rx min",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "rdma",
-            "counter": "rx_rdma_ucast_bytes",
-            "scale": 8e-09,
-            "kind": "min"
-          }
-        },
-        {
-          "refId": "G",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "(sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\",resolution=\"normal\"}[$__interval]) / sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\",resolution=\"normal\"}[$__interval])) * 8 / 1e9",
-          "legendFormat": "rx mean",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "rdma",
-            "counter": "rx_rdma_ucast_bytes",
-            "scale": 8e-09,
-            "kind": "mean"
-          }
-        },
-        {
-          "refId": "H",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\",resolution=\"low\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "rx low-res",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "rdma",
-            "counter": "rx_rdma_ucast_bytes",
-            "scale": 8e-09,
-            "kind": "low"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "pointSize": 3
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "tx max"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#2a78d6"
-                }
-              },
-              {
-                "id": "custom.fillBelowTo",
-                "value": "tx min"
-              },
-              {
-                "id": "custom.fillOpacity",
-                "value": 25
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 0
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "tx min"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#2a78d6"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 0
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "tx mean"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#2a78d6"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 1.5
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "tx low-res"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#2a78d6"
-                }
-              },
-              {
-                "id": "custom.drawStyle",
-                "value": "points"
-              },
-              {
-                "id": "custom.pointSize",
-                "value": 6
-              },
-              {
-                "id": "custom.showPoints",
-                "value": "always"
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "rx max"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#eb6834"
-                }
-              },
-              {
-                "id": "custom.fillBelowTo",
-                "value": "rx min"
-              },
-              {
-                "id": "custom.fillOpacity",
-                "value": 25
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 0
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "rx min"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#eb6834"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 0
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "rx mean"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#eb6834"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 1.5
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "rx low-res"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#eb6834"
-                }
-              },
-              {
-                "id": "custom.drawStyle",
-                "value": "points"
-              },
-              {
-                "id": "custom.pointSize",
-                "value": 6
-              },
-              {
-                "id": "custom.showPoints",
-                "value": "always"
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "links": [
-        {
-          "title": "NIC detail (this target, this time range)",
-          "url": "/d/netmon-nic/netmon-nic-detail?var-experiment=${experiment}&var-target=${target}&${__url_time_range}"
-        }
-      ]
-    },
-    {
-      "id": 4,
-      "type": "timeseries",
-      "title": "Port wire bytes (IPC), Gb/s, all traffic incl. ACKs",
-      "description": "Data with target status 'live' comes from ainic-netmon record --push: an online approximation of these rules; where a push failed the mean of that window may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "netmon-vm"
-      },
-      "interval": "${min_step}ms",
-      "maxDataPoints": 2000,
-      "gridPos": {
-        "x": 9,
-        "y": 9,
-        "w": 7,
-        "h": 8
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_tx_ok\",resolution=\"normal\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "wire tx max",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "ipc",
-            "counter": "octets_tx_ok",
-            "scale": 8e-09,
-            "kind": "max"
-          }
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "min_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_tx_ok\",resolution=\"normal\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "wire tx min",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "ipc",
-            "counter": "octets_tx_ok",
-            "scale": 8e-09,
-            "kind": "min"
-          }
-        },
-        {
-          "refId": "C",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "(sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_tx_ok\",resolution=\"normal\"}[$__interval]) / sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_tx_ok\",resolution=\"normal\"}[$__interval])) * 8 / 1e9",
-          "legendFormat": "wire tx mean",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "ipc",
-            "counter": "octets_tx_ok",
-            "scale": 8e-09,
-            "kind": "mean"
-          }
-        },
-        {
-          "refId": "D",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_tx_ok\",resolution=\"low\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "wire tx low-res",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "ipc",
-            "counter": "octets_tx_ok",
-            "scale": 8e-09,
-            "kind": "low"
-          }
-        },
-        {
-          "refId": "E",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_rx_ok\",resolution=\"normal\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "wire rx max",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "ipc",
-            "counter": "octets_rx_ok",
-            "scale": 8e-09,
-            "kind": "max"
-          }
-        },
-        {
-          "refId": "F",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "min_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_rx_ok\",resolution=\"normal\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "wire rx min",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "ipc",
-            "counter": "octets_rx_ok",
-            "scale": 8e-09,
-            "kind": "min"
-          }
-        },
-        {
-          "refId": "G",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "(sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_rx_ok\",resolution=\"normal\"}[$__interval]) / sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_rx_ok\",resolution=\"normal\"}[$__interval])) * 8 / 1e9",
-          "legendFormat": "wire rx mean",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "ipc",
-            "counter": "octets_rx_ok",
-            "scale": 8e-09,
-            "kind": "mean"
-          }
-        },
-        {
-          "refId": "H",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_rx_ok\",resolution=\"low\"}[$__interval]) * 8 / 1e9",
-          "legendFormat": "wire rx low-res",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "source": "ipc",
-            "counter": "octets_rx_ok",
-            "scale": 8e-09,
-            "kind": "low"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "pointSize": 3
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "wire tx max"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#2a78d6"
-                }
-              },
-              {
-                "id": "custom.fillBelowTo",
-                "value": "wire tx min"
-              },
-              {
-                "id": "custom.fillOpacity",
-                "value": 25
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 0
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "wire tx min"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#2a78d6"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 0
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "wire tx mean"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#2a78d6"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 1.5
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "wire tx low-res"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#2a78d6"
-                }
-              },
-              {
-                "id": "custom.drawStyle",
-                "value": "points"
-              },
-              {
-                "id": "custom.pointSize",
-                "value": 6
-              },
-              {
-                "id": "custom.showPoints",
-                "value": "always"
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "wire rx max"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#eb6834"
-                }
-              },
-              {
-                "id": "custom.fillBelowTo",
-                "value": "wire rx min"
-              },
-              {
-                "id": "custom.fillOpacity",
-                "value": 25
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 0
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "wire rx min"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#eb6834"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 0
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "wire rx mean"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#eb6834"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 1.5
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "wire rx low-res"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#eb6834"
-                }
-              },
-              {
-                "id": "custom.drawStyle",
-                "value": "points"
-              },
-              {
-                "id": "custom.pointSize",
-                "value": 6
-              },
-              {
-                "id": "custom.showPoints",
-                "value": "always"
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      }
-    },
-    {
-      "id": 5,
-      "type": "timeseries",
-      "title": "Congestion and retransmission, max per window, /s",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "netmon-vm"
-      },
-      "interval": "${min_step}ms",
-      "maxDataPoints": 2000,
-      "gridPos": {
-        "x": 16,
-        "y": 9,
-        "w": 8,
-        "h": 8
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_cnp_pkts\",resolution=\"normal\"}[$__interval])",
-          "legendFormat": "rx_rdma_cnp_pkts",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "kind": "max",
-            "source": "rdma",
-            "counter": "rx_rdma_cnp_pkts",
-            "scale": 1.0
-          }
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_cnp_pkts\",resolution=\"normal\"}[$__interval])",
-          "legendFormat": "tx_rdma_cnp_pkts",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "kind": "max",
-            "source": "rdma",
-            "counter": "tx_rdma_cnp_pkts",
-            "scale": 1.0
-          }
-        },
-        {
-          "refId": "C",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ecn_pkts\",resolution=\"normal\"}[$__interval])",
-          "legendFormat": "rx_rdma_ecn_pkts",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "kind": "max",
-            "source": "rdma",
-            "counter": "rx_rdma_ecn_pkts",
-            "scale": 1.0
-          }
-        },
-        {
-          "refId": "D",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_retx_pkts\",resolution=\"normal\"}[$__interval])",
-          "legendFormat": "tx_rdma_retx_pkts",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "kind": "max",
-            "source": "rdma",
-            "counter": "tx_rdma_retx_pkts",
-            "scale": 1.0
-          }
-        },
-        {
-          "refId": "E",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "netmon-vm"
-          },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ack_timeout\",resolution=\"normal\"}[$__interval])",
-          "legendFormat": "tx_rdma_ack_timeout",
-          "range": true,
-          "instant": false,
-          "netmon": {
-            "kind": "max",
-            "source": "rdma",
-            "counter": "tx_rdma_ack_timeout",
-            "scale": 1.0
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "pointSize": 3
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      }
-    },
-    {
-      "id": 6,
       "type": "table",
-      "title": "Target info (recording status, link speed)",
-      "description": "",
+      "title": "RDMA traffic over the selected time",
+      "description": "One row per NIC. Average send / receive: the average of the observations that end in the selected time range (a long observation crossing the start is counted whole). Click a NIC for its detail page. Data marked 'live' comes from ainic-netmon record --push: an online approximation; where a push failed the average of that time bin may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
       "datasource": {
         "type": "prometheus",
         "uid": "netmon-vm"
       },
       "gridPos": {
         "x": 0,
-        "y": 17,
-        "w": 12,
-        "h": 4
+        "y": 2,
+        "w": 24,
+        "h": 8
       },
       "targets": [
         {
@@ -1031,39 +135,205 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "last_over_time(netmon_target_info{experiment=\"$experiment\",target=~\"$target\"}[3650d])",
+          "expr": "label_replace(last_over_time(netmon_target_info{experiment=\"$experiment\",target=~\"$target\",display_nic!=\"\"}[3650d]) or label_copy(last_over_time(netmon_target_info{experiment=\"$experiment\",target=~\"$target\",display_nic=\"\"}[3650d]), \"netdev\", \"display_nic\"), \"host_short\", \"$1\", \"host\", \"([^.]+).*\")",
           "range": false,
           "instant": true,
           "format": "table"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "sum by (target) (label_value(last_over_time(netmon_target_info{experiment=\"$experiment\",target=~\"$target\"}[3650d]), \"speed_mbps\")) * 1e6 > 0",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum by (target) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[${__range_ms}ms])) / sum by (target) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[${__range_ms}ms]))) * 8",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "netmon": {
+            "source": "rdma",
+            "scale": 8.0,
+            "kind": "range_mean",
+            "counter": "tx_rdma_ucast_bytes"
+          }
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum by (target) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[${__range_ms}ms])) / sum by (target) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[${__range_ms}ms]))) * 8",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "netmon": {
+            "source": "rdma",
+            "scale": 8.0,
+            "kind": "range_mean",
+            "counter": "rx_rdma_ucast_bytes"
+          }
         }
       ],
       "transformations": [
         {
+          "id": "joinByField",
+          "options": {
+            "byField": "target",
+            "mode": "outer"
+          }
+        },
+        {
           "id": "organize",
           "options": {
-            "excludeByName": {
-              "Time": true,
-              "Value": true,
-              "__name__": true
+            "includeByName": {
+              "host_short": true,
+              "display_nic": true,
+              "Value #B": true,
+              "Value #C": true,
+              "Value #D": true,
+              "host": true,
+              "target": true
+            },
+            "indexByName": {
+              "host_short": 0,
+              "display_nic": 1,
+              "Value #B": 2,
+              "Value #C": 3,
+              "Value #D": 4,
+              "host": 5,
+              "target": 6
+            },
+            "renameByName": {
+              "host_short": "Host",
+              "display_nic": "NIC",
+              "Value #B": "Link",
+              "Value #C": "Average send",
+              "Value #D": "Average receive"
             }
           }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "decimals": 3
+          "noValue": "—",
+          "custom": {
+            "align": "auto"
+          }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "NIC"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open NIC detail",
+                    "url": "/d/netmon-nic/netmon-nic-detail?var-experiment=${experiment:percentencode}&var-host=${__data.fields.host:percentencode}&var-target=${__data.fields.target:percentencode}&${__url_time_range}"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Link"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Average send"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Average receive"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "host"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "target"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          }
+        ]
       },
       "options": {
-        "showHeader": true
+        "showHeader": true,
+        "cellHeight": "sm"
       }
     },
     {
-      "id": 7,
+      "id": 3,
       "type": "timeseries",
-      "title": "Data quality: gaps (no valid interval) and their duration, s",
-      "description": "Intervals left out of every rate panel: counter resets and wall-clock uncertainty. Low-resolution intervals are shown as points in the rate panels.",
+      "title": "${target:text}",
+      "description": "",
       "datasource": {
         "type": "prometheus",
         "uid": "netmon-vm"
@@ -1071,10 +341,10 @@
       "interval": "${min_step}ms",
       "maxDataPoints": 2000,
       "gridPos": {
-        "x": 12,
-        "y": 17,
-        "w": 12,
-        "h": 4
+        "x": 0,
+        "y": 10,
+        "w": 6,
+        "h": 7
       },
       "targets": [
         {
@@ -1083,13 +353,15 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "max_over_time(netmon_gap_seconds{experiment=\"$experiment\",target=~\"$target\",reason=\"reset\"}[$__interval])",
-          "legendFormat": "{{source}}.{{counter}} reset",
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval]))) * 8",
+          "legendFormat": "Send",
           "range": true,
           "instant": false,
           "netmon": {
-            "kind": "gap",
-            "reason": "reset"
+            "source": "rdma",
+            "counter": "tx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "mean_all"
           }
         },
         {
@@ -1098,40 +370,184 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "max_over_time(netmon_gap_seconds{experiment=\"$experiment\",target=~\"$target\",reason=\"clock\"}[$__interval])",
-          "legendFormat": "{{source}}.{{counter}} clock",
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) * 8",
+          "legendFormat": "Send peak",
           "range": true,
           "instant": false,
           "netmon": {
-            "kind": "gap",
-            "reason": "clock"
+            "source": "rdma",
+            "counter": "tx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "max_all"
+          }
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval]))) * 8",
+          "legendFormat": "Receive",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "rdma",
+            "counter": "rx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "mean_all"
+          }
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) * 8",
+          "legendFormat": "Receive peak",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "rdma",
+            "counter": "rx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "max_all"
           }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "s",
+          "unit": "bps",
           "custom": {
-            "drawStyle": "points",
+            "drawStyle": "line",
             "lineWidth": 1,
             "fillOpacity": 0,
-            "showPoints": "always",
-            "pointSize": 3
-          }
+            "showPoints": "never",
+            "pointSize": 3,
+            "axisSoftMin": 0
+          },
+          "noValue": "No data in this time range",
+          "links": [
+            {
+              "title": "Open NIC detail",
+              "url": "/d/netmon-nic/netmon-nic-detail?var-experiment=${experiment:percentencode}&var-host=${__field.labels.host:percentencode}&var-target=${__field.labels.target:percentencode}&${__url_time_range}"
+            }
+          ]
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Send"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Send peak"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Receive"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Receive peak"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
           "displayMode": "list",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": false
         },
         "tooltip": {
           "mode": "multi",
           "sort": "none"
         }
-      }
+      },
+      "repeat": "target",
+      "repeatDirection": "h",
+      "maxPerRow": 4
     }
   ]
 }

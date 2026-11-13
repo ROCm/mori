@@ -63,6 +63,7 @@ constexpr uint64_t kMaxPendingPoints = 500000;
 constexpr uint64_t kRequestTimeoutNs = 3000000000ull;
 constexpr uint64_t kWarnEveryNs = 10000000000ull;
 constexpr const char* kAllTimeStart = "2000-01-01T00:00:00Z";  // VM: start=0 means "unset"
+constexpr const char* kAllTimeEnd = "2100-01-01T00:00:00Z";    // VM default: now, whole seconds
 
 void SleepFor(uint64_t ns) {
   timespec ts{static_cast<time_t>(ns / 1000000000ull), static_cast<long>(ns % 1000000000ull)};
@@ -126,6 +127,21 @@ std::string FlagValue(const std::string& flags, const std::string& name) {
 }
 
 }  // namespace
+
+std::vector<std::pair<std::string, std::string>> DisplayLabels(const std::string& host,
+                                                               const std::string& netdev,
+                                                               const std::string& ibdev,
+                                                               const std::string& pci) {
+  const std::string nic = ibdev.empty() ? netdev : ibdev + " (" + netdev + ")";
+  std::vector<std::pair<std::string, std::string>> out = {
+      {"display_nic", nic},
+      {"display_host_nic",
+       host.substr(0, host.find('.')) + " \u00b7 " + (ibdev.empty() ? netdev : ibdev)},
+  };
+  if (!ibdev.empty()) out.emplace_back("ibdev", ibdev);
+  if (!pci.empty()) out.emplace_back("pci", pci);
+  return out;
+}
 
 std::vector<size_t> SelectPushCounters(const std::string& source,
                                        const std::vector<std::string>& names, bool all,
@@ -311,8 +327,8 @@ bool Exporter::Preflight(std::string* error) {
   // limit=1: only "any?" matters, and an experiment can have thousands of series (the full
   // answer would exceed the client's 64 KiB response bound).
   r = http_.Request("GET",
-                    "/api/v1/series?match[]=" + UrlEncode(match) +
-                        "&start=" + UrlEncode(kAllTimeStart) + "&limit=1",
+                    "/api/v1/series?match[]=" + UrlEncode(match) + "&start=" +
+                        UrlEncode(kAllTimeStart) + "&end=" + UrlEncode(kAllTimeEnd) + "&limit=1",
                     "", nullptr, MonoNs() + kRequestTimeoutNs);
   if (r.kind != HttpResult::Kind::kOk || r.status != 200) {
     *error = "VictoriaMetrics series query failed (" +
@@ -639,10 +655,13 @@ void Exporter::MetaLines(std::string* body) {
     for (const auto& s : cfg_) {
       if (std::find(seen.begin(), seen.end(), s.netdev) != seen.end()) continue;
       seen.push_back(s.netdev);
+      std::string names;
+      for (const auto& kv : DisplayLabels(host, s.netdev, s.ibdev, s.pci))
+        names += "," + Q(kv.first) + ":" + Q(kv.second);
       line("{\"__name__\":\"netmon_target_info\",\"experiment\":" + Q(opt_.experiment) +
                ",\"host\":" + Q(host) + ",\"netdev\":" + Q(s.netdev) +
-               ",\"target\":" + Q(host + "/" + s.netdev) +
-               ",\"status\":\"live\",\"speed_mbps\":" + Q(std::to_string(s.speed_mbps)) + "}",
+               ",\"target\":" + Q(host + "/" + s.netdev) + ",\"status\":\"live\",\"speed_mbps\":" +
+               Q(std::to_string(s.speed_mbps)) + names + "}",
            1, anchor_ms_);
     }
     line("{\"__name__\":\"netmon_import_info\",\"experiment\":" + Q(opt_.experiment) +

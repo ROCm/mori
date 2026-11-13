@@ -459,19 +459,13 @@ int RunRecording(std::vector<std::unique_ptr<Stream>>* streams_in, RecordOptions
       e.batch_records = BatchRecordsFor(s->interval_ns);
       e.names = s->src->names();
       for (const auto& n : opt->nics) {
-        if (n.netdev == s->netdev) e.speed_mbps = n.speed_mbps;
+        if (n.netdev != s->netdev) continue;
+        e.speed_mbps = n.speed_mbps;
+        e.ibdev = n.ibdev;
+        e.pci = n.pci;
       }
-      if (e.source == "rdma" || e.source == "ipc")
-        es.push_back(e);
-      else
-        es.push_back(ExportStream{e.netdev,
-                                  e.source,
-                                  e.interval_ns,
-                                  e.snapshot_fraction,
-                                  e.record_words,
-                                  e.batch_records,
-                                  {},
-                                  e.speed_mbps});
+      if (e.source != "rdma" && e.source != "ipc") e.names.clear();
+      es.push_back(e);
     }
     std::string err;
     if (!exporter->Configure(es, mc.start_real, &err)) {

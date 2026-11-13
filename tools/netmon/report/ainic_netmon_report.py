@@ -323,11 +323,15 @@ def epoch_grid(from_ms, to_ms, step_ms):
 
 def window_aggregate(r, grid_ms, w_ms, scale=1.0):
     """Per window ending at grid_ms[i] (window (t - w_ms, t]): max, min, mean over
-    normal-resolution intervals, and the max low-resolution rate. NaN where a window has no
-    such interval (no zero filling)."""
+    normal-resolution intervals, the max low-resolution rate, and max_all / mean_all over
+    every valid interval (normal and low resolution: the dashboards' peak and average
+    lines). NaN where a window has no such interval (no zero filling)."""
     grid_ms = np.asarray(grid_ms, dtype=np.int64)
     n = len(grid_ms)
-    out = {k: np.full(n, np.nan) for k in ("max", "min", "mean", "low")}
+    out = {
+        k: np.full(n, np.nan)
+        for k in ("max", "min", "mean", "low", "max_all", "mean_all")
+    }
     if n == 0 or len(r.valid) == 0:
         return out
     end = r.end_ms()
@@ -353,6 +357,17 @@ def window_aggregate(r, grid_ms, w_ms, scale=1.0):
         out["min"] = np.where(has, mn, np.nan)
         with np.errstate(divide="ignore", invalid="ignore"):
             out["mean"] = np.where(has & (dt > 0), dv / dt * 1e9 * scale, np.nan)
+    every = r.valid & inside
+    if every.any():
+        i = idx[every]
+        mx = np.full(n, -np.inf)
+        np.maximum.at(mx, i, r.rate[every] * scale)
+        dv = np.bincount(i, weights=r.dv[every], minlength=n)
+        dt = np.bincount(i, weights=r.dt[every], minlength=n)
+        has = np.bincount(i, minlength=n) > 0
+        out["max_all"] = np.where(has, mx, np.nan)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out["mean_all"] = np.where(has & (dt > 0), dv / dt * 1e9 * scale, np.nan)
     if low.any():
         lw = np.full(n, -np.inf)
         np.maximum.at(lw, idx[low], r.rate[low] * scale)

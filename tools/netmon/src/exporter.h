@@ -60,7 +60,18 @@ struct ExportStream {
   size_t batch_records = 0;  // the stream's batch capacity
   std::vector<std::string> names;
   int64_t speed_mbps = -1;
+  std::string ibdev, pci;  // empty if unknown
 };
+
+// The dashboards' NIC names on netmon_target_info (same rule as the importer's
+// display_labels; test_push.cc and test_import.py check the same cases): display_nic
+// "ionic_0 (benic1p1)" (the netdev alone without an ibdev), display_host_nic
+// "<host's first DNS label> · ionic_0" for the multi-host overview, plus ibdev and pci when
+// known (VictoriaMetrics drops empty label values).
+std::vector<std::pair<std::string, std::string>> DisplayLabels(const std::string& host,
+                                                               const std::string& netdev,
+                                                               const std::string& ibdev,
+                                                               const std::string& pci);
 
 struct PushStats {
   uint64_t points_sent = 0, requests = 0, failed_points = 0, dropped_samples = 0;

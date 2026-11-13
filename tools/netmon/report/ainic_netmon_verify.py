@@ -42,6 +42,7 @@ import urllib.request
 
 import numpy as np
 
+DISPLAY_LABELS = ("ibdev", "pci", "display_nic", "display_host_nic")
 REL_TOL = 1e-9
 ABS_TOL = 1e-9
 
@@ -155,9 +156,21 @@ def expected_on_grid(imp, r, spec, grid, step):
     kind = spec["kind"]
     if kind in ("max", "raw"):
         return agg["max"]
-    if kind in ("min", "mean", "low"):
+    if kind in ("min", "mean", "low", "max_all", "mean_all"):
         return agg[kind]
     raise ValueError(kind)
+
+
+def expected_range_mean(r, from_ms, to_ms, scale):
+    """The overview table's average over a selected range: Σ increase / Σ duration of the
+    valid intervals (both resolutions) whose end lies in (to - range, to]; NaN if none.
+    """
+    end = r.end_ms()
+    m = r.valid & (end > to_ms - (to_ms - from_ms)) & (end <= to_ms)
+    dt = float(r.dt[m].sum())
+    return (
+        float(r.dv[m].sum()) / dt * 1e9 * scale if m.any() and dt > 0 else float("nan")
+    )
 
 
 def expected_gaps(r, reason, grid, step):
@@ -301,7 +314,11 @@ def load_dashboards(args, gen):
     return deployed
 
 
-QUERY_PANEL_KEYS = ("type", "interval", "maxDataPoints", "datasource", "repeat")
+# transformations / fieldConfig: the tables' joins, renames and hidden link fields decide
+# which number is shown next to which NIC.
+QUERY_PANEL_KEYS = (
+    "type", "interval", "maxDataPoints", "datasource", "repeat", "transformations", "fieldConfig"
+)  # fmt: skip
 QUERY_TARGET_KEYS = (
     "expr", "datasource", "instant", "range", "format", "interval", "netmon"
 )  # fmt: skip
@@ -323,7 +340,7 @@ def query_config(dash):
     data source, min interval, repeat; per target the expression and options; and the
     variables (their multi / All flags decide how values are escaped)."""
     out = {}
-    for p in dash["panels"]:
+    for p in all_panels(dash):
         out[("panel", p.get("id"))] = tuple(
             json.dumps(_canon(p.get(k)), sort_keys=True) for k in QUERY_PANEL_KEYS
         )
@@ -359,8 +376,15 @@ def interpolate(dash, name, value):
     return value.replace("\\", "\\\\").replace("'", "\\\\'")
 
 
-def data_queries(dash):
+def all_panels(dash):
+    """Every panel, including those inside (collapsed) rows."""
     for p in dash["panels"]:
+        yield p
+        yield from p.get("panels", [])
+
+
+def data_queries(dash):
+    for p in all_panels(dash):
         for t in p.get("targets", []):
             if "netmon" in t:
                 yield p, t
@@ -441,6 +465,18 @@ def cmd_verify(args, imp):
         f'experiment="{imp.esc(exp)}"}}[3650d])'
     )
     have = {imp.label_key(x["metric"]): float(x["value"][1]) for x in res}
+    legacy = False
+    if set(have) != set(want_meta):
+        # Imported before the NIC display names existed (ibdev, pci, display_*): the same
+        # metadata without them is accepted as a whole, never mixed with the new format.
+        old = {
+            imp.label_key(
+                {k: v for k, v in dict(key).items() if k not in DISPLAY_LABELS}
+            ): v
+            for key, v in want_meta.items()
+        }
+        if set(have) == set(old):
+            want_meta, legacy = old, True
     if set(have) != set(want_meta):
         missing = sorted(set(want_meta) - set(have))
         extra = sorted(set(have) - set(want_meta))
@@ -454,6 +490,11 @@ def cmd_verify(args, imp):
     print(
         f"metadata: hosts, completion markers and {len(want_meta)} summary / target / "
         "quality values equal the offline report's"
+        + (
+            " (imported before NIC display names: re-import with --replace to get them)"
+            if legacy
+            else ""
+        )
     )
     checks += len(want_meta)
 
@@ -497,6 +538,18 @@ def cmd_verify(args, imp):
                         .replace("$experiment", interpolate(dash, "experiment", exp))
                         .replace("$target", interpolate(dash, "target", t.target))
                     )
+                    if spec["kind"] == "range_mean":
+                        n_points += check_range_mean(
+                            args.grafana,
+                            expected,
+                            t,
+                            spec,
+                            expr,
+                            ranges,
+                            tq.get("datasource") or panel.get("datasource"),
+                            f"{name} '{panel['title'][:40]}' {tq['refId']} {t.target}",
+                        )
+                        continue
                     for label, f, to, width in ranges:
                         min_iv = resolve_interval(panel, ms)
                         frames = ds_query(
@@ -523,6 +576,20 @@ def cmd_verify(args, imp):
             f"panels: every query matches the offline report on the full grid ({n_points} points compared)"
         )
         checks += n_points
+
+    # 3b. the tables' metadata queries (NIC names, short host, link rate) per target, also
+    #     when no recording has a valid interval (then just after the recording start)
+    meta_at = (
+        w1
+        if window is not None
+        else min(int(r.meta.get("start", {}).get("realtime_ns", 0)) for r in runs)
+        // 1_000_000
+        + 10
+    )
+    checks += check_meta_queries(
+        args.grafana, dashboards, exp, targets, infos, meta_at, legacy
+    )
+    print("tables: NIC names, hosts and link rates equal the recordings' metadata")
 
     # 4. through Grafana, the targets (the dashboards' variable) are found when zoomed into
     #    the earliest and latest sub-windows, also when no recording has a valid interval
@@ -561,6 +628,109 @@ def no_frame_margin(from_ms, to_ms, max_points, min_interval):
     return max(floor_ms, 10, 2 * -(-(to_ms - from_ms) // max_points))
 
 
+def check_meta_queries(grafana, dashboards, exp, targets, infos, at_ms, legacy):
+    """Every instant metadata query of the dashboards (no "netmon" spec), run per target:
+    target_info rows carry the planned names (legacy imports: display_nic falls back to the
+    netdev), host_short is the host's first DNS label, the link rate is speed_mbps * 1e6.
+    """
+    plan = {lab["target"]: lab for lab in infos}
+    n = 0
+    for name, dash in dashboards.items():
+        for p in all_panels(dash):
+            for tq in p.get("targets", []):
+                expr = tq.get("expr", "")
+                if (
+                    "netmon" in tq
+                    or not tq.get("instant")
+                    or "netmon_target_info" not in expr
+                ):
+                    continue
+                for t in targets:
+                    e = expr.replace(
+                        "$experiment", interpolate(dash, "experiment", exp)
+                    ).replace("$target", interpolate(dash, "target", t.target))
+                    rows = ds_instant_values(
+                        grafana, e, at_ms, tq.get("datasource") or p.get("datasource")
+                    )
+                    what = (
+                        f"{name} '{p.get('title', '')[:40]}' {tq['refId']} {t.target}"
+                    )
+                    want = plan[t.target]
+                    if any(lab.get("target") != t.target for lab, _, _ in rows):
+                        raise Mismatch(
+                            f"{what}: rows of other targets {[lab for lab, _, _ in rows]}"
+                        )
+                    if "label_value(" in expr:
+                        speed = float(want.get("speed_mbps", -1))
+                        exp_rows = [speed * 1e6] if speed > 0 else []
+                        got = [float(v) for _, v, _ in rows]
+                        if got != exp_rows:
+                            raise Mismatch(
+                                f"{what}: link rate {got}, expected {exp_rows}"
+                            )
+                        n += 1
+                        continue
+                    if len(rows) != 1:
+                        raise Mismatch(f"{what}: {len(rows)} rows, expected 1")
+                    lab = rows[0][0]
+                    nic = t.netdev if legacy else want["display_nic"]
+                    if lab.get("display_nic") != nic or lab.get("host") != t.host:
+                        raise Mismatch(
+                            f"{what}: NIC {lab.get('display_nic')!r} host {lab.get('host')!r}, expected {nic!r} {t.host!r}"
+                        )
+                    if (
+                        "host_short" in expr
+                        and lab.get("host_short") != t.host.split(".")[0]
+                    ):
+                        raise Mismatch(f"{what}: host_short {lab.get('host_short')!r}")
+                    n += 1
+    return n
+
+
+def ds_instant_range(grafana, expr, from_ms, to_ms, ds):
+    """Instant query over a selected time range as a table panel runs it (evaluated at
+    `to`, with Grafana's range variables for [from, to]); [(labels, ts, value)]."""
+    q = {"refId": "A", "datasource": ds, "expr": expr, "range": False, "instant": True}
+    out = []
+    for f in _post_ds_query(grafana, q, from_ms, to_ms).get("frames", []):
+        fields = f["schema"]["fields"]
+        vals = f["data"]["values"]
+        if len(fields) > 1 and vals and vals[0]:
+            out.append((fields[1].get("labels", {}), vals[0][0], vals[1][0]))
+    return out
+
+
+def check_range_mean(grafana, expected, t, spec, expr, ranges, ds, what):
+    """The overview table's per-NIC average over each selected range equals the report's
+    (expected_range_mean); no row when the report has no valid interval in the range."""
+    r = expected.rates(t, spec["source"], spec["counter"])
+    n = 0
+    for label, f, to, _ in ranges:
+        got = ds_instant_range(grafana, expr, f, to, ds)
+        want = (
+            expected_range_mean(r, f, to, spec["scale"])
+            if r is not None
+            else float("nan")
+        )
+        w = f"{what} [{label}]"
+        if any(lab.get("target") != t.target for lab, _, _ in got) or len(got) > 1:
+            raise Mismatch(f"{w}: unexpected rows {[lab for lab, _, _ in got]}")
+        if not got:
+            if np.isfinite(want):
+                raise Mismatch(f"{w}: no value, the report has {want!r}")
+            continue
+        _, ts, v = got[0]
+        if int(ts) != int(to):
+            raise Mismatch(f"{w}: evaluated at {ts}, expected the range end {to}")
+        v = float("nan") if v is None else float(v)
+        if not np.isfinite(want) or not np.isclose(
+            v, want, rtol=REL_TOL, atol=ABS_TOL * max(1.0, abs(want))
+        ):
+            raise Mismatch(f"{w}: grafana {v!r}, report {want!r}")
+        n += 1
+    return n
+
+
 def check_query(imp, expected, t, spec, frames, rng, margin, what):
     from_ms, to_ms = rng
     lo, hi = from_ms + margin, to_ms - margin  # certainly requested when no frame
@@ -588,6 +758,32 @@ def check_query(imp, expected, t, spec, frames, rng, margin, what):
                 f[2] if f else [],
                 f[3] if f else [],
                 f"{what} {source}.{counter}",
+                unc,
+            )
+        return n
+    if kind == "gap_by_source":
+        # max by (source, reason): the longest gap of any imported counter of the source
+        by = {}
+        for source, counter, r in expected.imported(t):
+            for reason in ("reset", "clock"):
+                by.setdefault((source, reason), []).append(r)
+        for (source, reason), rs in by.items():
+            if step is None:
+                if any(_gaps_in_range(r, reason, lo, hi) for r in rs):
+                    raise Mismatch(
+                        f"{what}: no frames, but {source} has {reason} gaps in range"
+                    )
+                continue
+            grid, unc = grafana_grid(from_ms, to_ms, step)
+            with np.errstate(invalid="ignore"):
+                exp = np.fmax.reduce([expected_gaps(r, reason, grid, step) for r in rs])
+            f = frames.get((source, reason))
+            n += compare_series(
+                grid,
+                exp,
+                f[2] if f else [],
+                f[3] if f else [],
+                f"{what} {source} {reason}",
                 unc,
             )
         return n
@@ -626,6 +822,12 @@ def check_frames(imp, expected, t, spec, frames, what):
     Returns {(source, counter): frame}."""
     if spec["kind"] == "gap":
         allowed = {(s, c) for s, c, _ in expected.imported(t)}
+    elif spec["kind"] == "gap_by_source":
+        allowed = {
+            (s, reason)
+            for s, _, _ in expected.imported(t)
+            for reason in ("reset", "clock")
+        }
     elif "counter_re" in spec:
         stream = t.run.stream(t.netdev, spec["source"])
         imported = imp.pick_counters(stream, t.counters_mode) if stream else []
@@ -644,7 +846,11 @@ def check_frames(imp, expected, t, spec, frames, what):
             raise Mismatch(f"{what}: frame of another experiment / target: {lab}")
         if spec["kind"] == "gap" and lab.get("reason") != spec["reason"]:
             raise Mismatch(f"{what}: gap frame with reason {lab.get('reason')!r}")
-        key = (lab.get("source"), lab.get("counter"))
+        key = (
+            (lab.get("source"), lab.get("reason"))
+            if spec["kind"] == "gap_by_source"
+            else (lab.get("source"), lab.get("counter"))
+        )
         if key not in allowed:
             raise Mismatch(f"{what}: unexpected series {key} (labels {lab})")
         if key in out:

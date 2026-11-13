@@ -23,9 +23,14 @@
 """Generate the netmon Grafana dashboards (and the semantics of every query in them).
 
 The dashboards are generated, not hand-edited, so that `ainic-netmon-import verify` can
-check every panel query against the offline report library from the same source of truth
-(SPEC below): each data query is one of a few templates over explicit windows
-`[$__interval]` (NETMON_DASHBOARD_DESIGN §5).
+check every panel query against the offline report library from the same source of truth:
+each data query is one of a few templates over explicit windows `[$__interval]` (or
+`[${__range_ms}ms]` in the overview table: Grafana's `$__range` is rounded to seconds), tagged with a "netmon" spec the verifier reads.
+
+Design: NETMON_DASHBOARD_UX_DESIGN (v0.3). The main views show traffic only: per direction
+an average line and a dashed peak line, both over every valid interval; gaps stay blank.
+Collector details (gaps, sampling quality, the offline report's fixed-window summary) are
+in a collapsed section at the bottom of the NIC detail page.
 
     python3 ainic_netmon_dashboards.py OUT_DIR    # writes netmon_overview.json, netmon_nic_detail.json
 """
@@ -35,46 +40,72 @@ import os
 import sys
 
 DS = {"type": "prometheus", "uid": "netmon-vm"}
-GBPS = 8 / 1e9
+BITS = 8.0  # bytes/s -> bits/s (Grafana's "bps" unit scales to Gb/s itself)
 SEL = 'experiment="$experiment",target="$target"'
 META_LOOKBACK = "3650d"
 
 RDMA_TX, RDMA_RX = "tx_rdma_ucast_bytes", "rx_rdma_ucast_bytes"
 IPC_TX, IPC_RX = "octets_tx_ok", "octets_rx_ok"
-CONGESTION = [
-    "rx_rdma_cnp_pkts",
-    "tx_rdma_cnp_pkts",
-    "rx_rdma_ecn_pkts",
-    "tx_rdma_retx_pkts",
-    "tx_rdma_ack_timeout",
-]
-# Categorical palette in fixed order (same as the offline report): tx blue, rx orange.
-PALETTE = [
-    "#2a78d6",
-    "#eb6834",
-    "#1baf7a",
-    "#eda100",
-    "#e87ba4",
-    "#008300",
-    "#6250d6",
-    "#e34948",
-]
+SEND_COLOR, RECV_COLOR = "#2a78d6", "#eb6834"  # fixed: blue = send, orange = receive
+
+KEY_TEXT = (
+    "**<span style='color:#2a78d6'>Blue = send</span>, "
+    "<span style='color:#eb6834'>orange = receive</span>. "
+    "Solid = average, dashed = observed peak. Gaps = data unavailable.**"
+)
+LIVE_NOTE = (
+    "Data marked 'live' comes from ainic-netmon record --push: an online approximation; "
+    "where a push failed the average of that time bin may be off. Import the recording "
+    "(ainic-netmon-import --replace) for the exact numbers."
+)
+TRAFFIC_DESC = (
+    "Solid line: average traffic in each time bin. Dashed line: the highest single "
+    "observation in the bin (a counter read ~2 ms apart), so short spikes stay visible when "
+    "zoomed out; a single observation has timing jitter and can slightly exceed the link "
+    "rate. Drag across the chart to zoom in. Gaps: no valid observation (never drawn as 0). "
+    + LIVE_NOTE
+)
+DETAIL_URL = (
+    "/d/netmon-nic/netmon-nic-detail?var-experiment=${experiment:percentencode}"
+    "&var-host=HOST&var-target=TARGET&${__url_time_range}"
+)
 
 
-def _scale_suffix(scale):
-    return " * 8 / 1e9" if scale == GBPS else ""
+def detail_url(host, target):
+    return DETAIL_URL.replace("HOST", host).replace("TARGET", target)
 
 
-def q_window(fn, metric, source, counter, resolution, scale):
-    sel = f'{SEL},source="{source}",counter="{counter}",resolution="{resolution}"'
-    return f"{fn}({metric}{{{sel}}}[$__interval]){_scale_suffix(scale)}"
+# --------------------------------------------------------------------------- queries
 
 
-def q_mean(source, counter, scale):
-    sel = f'{SEL},source="{source}",counter="{counter}",resolution="normal"'
+def _sel(source, counter):
+    return f'{SEL},source="{source}",counter="{counter}"'
+
+
+def q_average(source, counter, scale, window="$__interval", sel=None):
+    """Σ increase / Σ duration of every valid interval ending in the window (both
+    resolutions: the labels are combined before dividing)."""
+    s = sel or _sel(source, counter)
     return (
-        f"(sum_over_time(netmon_increase{{{sel}}}[$__interval]) / "
-        f"sum_over_time(netmon_interval_seconds{{{sel}}}[$__interval])){_scale_suffix(scale)}"
+        f"(sum without (resolution) (sum_over_time(netmon_increase{{{s}}}[{window}])) / "
+        f"sum without (resolution) (sum_over_time(netmon_interval_seconds{{{s}}}[{window}])))"
+        f" * {scale:g}"
+    )
+
+
+def q_peak(source, counter, scale):
+    """Highest single-interval rate in the window (both resolutions)."""
+    return (
+        f"max without (resolution) (max_over_time(netmon_rate{{{_sel(source, counter)}}}"
+        f"[$__interval])) * {scale:g}"
+    )
+
+
+def q_max_normal(source, counter):
+    """Packet / event counters: highest rate per window (normal resolution)."""
+    return (
+        f'max_over_time(netmon_rate{{{_sel(source, counter)},resolution="normal"}}'
+        "[$__interval])"
     )
 
 
@@ -90,8 +121,8 @@ def target(ref, expr, legend, spec):
     }
 
 
-def meta_target(ref, expr, fmt="table"):
-    return {
+def instant_target(ref, expr, spec=None, fmt="table"):
+    t = {
         "refId": ref,
         "datasource": DS,
         "expr": expr,
@@ -99,81 +130,51 @@ def meta_target(ref, expr, fmt="table"):
         "instant": True,
         "format": fmt,
     }
+    if spec:
+        t["netmon"] = spec
+    return t
 
 
-LIVE_NOTE = (
-    "Data with target status 'live' comes from ainic-netmon record --push: an online "
-    "approximation of these rules; where a push failed the mean of that window may be off. "
-    "Import the recording (ainic-netmon-import --replace) for the exact numbers."
-)
+def target_info(sel):
+    """netmon_target_info with display_nic; experiments imported before the display names
+    existed get their netdev as the name."""
+    lb = f"[{META_LOOKBACK}]"
+    return (
+        f'last_over_time(netmon_target_info{{{sel},display_nic!=""}}{lb}) or '
+        f'label_copy(last_over_time(netmon_target_info{{{sel},display_nic=""}}{lb}), '
+        '"netdev", "display_nic")'
+    )
 
 
-def envelope_targets(source, counter, label, scale, color_idx, refs):
-    """max / min (filled between) and mean of normal-resolution intervals, plus low-res."""
-    r = iter(refs)
-    spec = {"source": source, "counter": counter, "scale": scale}
-    return [
-        target(
-            next(r),
-            q_window("max_over_time", "netmon_rate", source, counter, "normal", scale),
-            f"{label} max",
-            dict(spec, kind="max"),
-        ),
-        target(
-            next(r),
-            q_window("min_over_time", "netmon_rate", source, counter, "normal", scale),
-            f"{label} min",
-            dict(spec, kind="min"),
-        ),
-        target(
-            next(r),
-            q_mean(source, counter, scale),
-            f"{label} mean",
-            dict(spec, kind="mean"),
-        ),
-        target(
-            next(r),
-            q_window("max_over_time", "netmon_rate", source, counter, "low", scale),
-            f"{label} low-res",
-            dict(spec, kind="low"),
-        ),
-    ], [
-        _override_fill(f"{label} max", f"{label} min", PALETTE[color_idx]),
-        _override_line(f"{label} min", PALETTE[color_idx], width=0),
-        _override_line(f"{label} mean", PALETTE[color_idx], width=1.5),
-        _override_points(f"{label} low-res", PALETTE[color_idx]),
+def link_bps(sel):
+    return (
+        "sum by (target) (label_value(last_over_time(netmon_target_info"
+        f'{{{sel}}}[{META_LOOKBACK}]), "speed_mbps")) * 1e6 > 0'
+    )
+
+
+# --------------------------------------------------------------------------- panels
+
+
+def _line(name, color, width, dashed=False):
+    props = [
+        {"id": "color", "value": {"mode": "fixed", "fixedColor": color}},
+        {"id": "custom.lineWidth", "value": width},
     ]
+    if dashed:
+        props.append(
+            {"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [4, 4]}}
+        )
+    return {"matcher": {"id": "byName", "options": name}, "properties": props}
 
 
-def _override_fill(name, below, color):
-    return {
-        "matcher": {"id": "byName", "options": name},
-        "properties": [
-            {"id": "color", "value": {"mode": "fixed", "fixedColor": color}},
-            {"id": "custom.fillBelowTo", "value": below},
-            {"id": "custom.fillOpacity", "value": 25},
-            {"id": "custom.lineWidth", "value": 0},
-        ],
-    }
-
-
-def _override_line(name, color, width):
-    return {
-        "matcher": {"id": "byName", "options": name},
-        "properties": [
-            {"id": "color", "value": {"mode": "fixed", "fixedColor": color}},
-            {"id": "custom.lineWidth", "value": width},
-        ],
-    }
-
-
-def _override_points(name, color):
+def _points(name, color):
     return {
         "matcher": {"id": "byName", "options": name},
         "properties": [
             {"id": "color", "value": {"mode": "fixed", "fixedColor": color}},
             {"id": "custom.drawStyle", "value": "points"},
-            {"id": "custom.pointSize", "value": 6},
+            {"id": "custom.pointSize", "value": 3},
             {"id": "custom.showPoints", "value": "always"},
         ],
     }
@@ -190,14 +191,19 @@ def timeseries(
     desc="",
     links=None,
     points=False,
+    repeat=None,
 ):
     custom = {
         "drawStyle": "points" if points else "line",
         "lineWidth": 1,
         "fillOpacity": 0,
-        "showPoints": "never" if not points else "always",
+        "showPoints": "always" if points else "never",
         "pointSize": 3,
+        "axisSoftMin": 0,
     }
+    defaults = {"unit": unit, "custom": custom, "noValue": "No data in this time range"}
+    if links:
+        defaults["links"] = links
     p = {
         "id": pid,
         "type": "timeseries",
@@ -208,10 +214,7 @@ def timeseries(
         "maxDataPoints": 2000,
         "gridPos": grid,
         "targets": targets,
-        "fieldConfig": {
-            "defaults": {"unit": unit, "custom": custom},
-            "overrides": overrides,
-        },
+        "fieldConfig": {"defaults": defaults, "overrides": overrides},
         "options": {
             "legend": {
                 "displayMode": "list",
@@ -221,13 +224,84 @@ def timeseries(
             "tooltip": {"mode": "multi", "sort": "none"},
         },
     }
-    if links:
-        p["links"] = links
+    if repeat:
+        p.update(repeat=repeat, repeatDirection="h", maxPerRow=4)
     return p
 
 
-def table(pid, title, targets, grid, transformations=None, desc=""):
+def traffic_panel(
+    pid, title, source, tx, rx, grid, links=None, repeat=None, small=False
+):
+    """Per direction: average (solid) and observed peak (dashed)."""
+    targets, overrides = [], []
+    for refs, counter, name, color in (
+        ("AB", tx, "Send", SEND_COLOR),
+        ("CD", rx, "Receive", RECV_COLOR),
+    ):
+        spec = {"source": source, "counter": counter, "scale": BITS}
+        targets.append(
+            target(
+                refs[0],
+                q_average(source, counter, BITS),
+                name,
+                dict(spec, kind="mean_all"),
+            )
+        )
+        targets.append(
+            target(
+                refs[1],
+                q_peak(source, counter, BITS),
+                f"{name} peak",
+                dict(spec, kind="max_all"),
+            )
+        )
+        overrides += [
+            _line(name, color, 2),
+            _line(f"{name} peak", color, 1, dashed=True),
+        ]
+    p = timeseries(
+        pid,
+        title,
+        targets,
+        overrides,
+        grid,
+        unit="bps",
+        desc="" if small else TRAFFIC_DESC,
+        links=links,
+        repeat=repeat,
+    )
+    if small:  # the key above the charts explains colours and line styles
+        p["options"]["legend"]["showLegend"] = False
+    return p
+
+
+def packet_panel(pid, title, counters, grid, unit="pps", desc=""):
+    """counters: [(counter, legend)], highest rate per time bin."""
+    targets = [
+        target(
+            chr(65 + i),
+            q_max_normal("rdma", c),
+            legend,
+            {"kind": "max", "source": "rdma", "counter": c, "scale": 1.0},
+        )
+        for i, (c, legend) in enumerate(counters)
+    ]
+    return timeseries(pid, title, targets, [], grid, unit=unit, desc=desc)
+
+
+def text_panel(pid, grid, content):
     return {
+        "id": pid,
+        "type": "text",
+        "title": "",
+        "transparent": True,
+        "gridPos": grid,
+        "options": {"mode": "markdown", "content": content},
+    }
+
+
+def table(pid, title, targets, grid, transformations, overrides=(), desc="", sort=None):
+    p = {
         "id": pid,
         "type": "table",
         "title": title,
@@ -235,387 +309,573 @@ def table(pid, title, targets, grid, transformations=None, desc=""):
         "datasource": DS,
         "gridPos": grid,
         "targets": targets,
-        "transformations": transformations or [],
-        "fieldConfig": {"defaults": {"decimals": 3}, "overrides": []},
-        "options": {"showHeader": True},
+        "transformations": transformations,
+        "fieldConfig": {
+            "defaults": {"noValue": "—", "custom": {"align": "auto"}},
+            "overrides": list(overrides),
+        },
+        "options": {"showHeader": True, "cellHeight": "sm"},
+    }
+    if sort:
+        p["options"]["sortBy"] = sort
+    return p
+
+
+def row(pid, title, y, collapsed=False, panels=()):
+    return {
+        "id": pid,
+        "type": "row",
+        "title": title,
+        "collapsed": collapsed,
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 1},
+        "panels": list(panels),
     }
 
 
-def variables(target_multi):
+def _by_name(name, *props):
+    return {
+        "matcher": {"id": "byName", "options": name},
+        "properties": [{"id": k, "value": v} for k, v in props],
+    }
+
+
+def _hidden(name):
+    return _by_name(name, ("custom.hidden", True))
+
+
+DATA_STATUS = {
+    "type": "value",
+    "options": {
+        "complete": {"text": "imported"},
+        "live": {"text": "live (approximate until imported)"},
+        "partial": {"text": "imported (recording incomplete)"},
+    },
+}
+
+
+# --------------------------------------------------------------------------- variables
+
+
+def variables(multi):
+    lb = f"[{META_LOOKBACK}]"
+    info = 'netmon_target_info{experiment="$experiment"%s}'
     v_exp = {
         "name": "experiment",
-        "label": "experiment",
+        "label": "Experiment",
         "type": "query",
         "datasource": DS,
         "query": {
-            "query": f"query_result(last_over_time(netmon_import_info[{META_LOOKBACK}]))",
+            "query": f"query_result(last_over_time(netmon_import_info{lb}))",
             "refId": "V",
         },
         "regex": '/experiment="([^"]+)"/',
         "refresh": 2,
         "sort": 1,
     }
-    v_tgt = {
-        "name": "target",
-        "label": "host/netdev",
+    v_host = {
+        "name": "host",
+        "label": "Host",
         "type": "query",
         "datasource": DS,
         "query": {
-            "query": f'query_result(last_over_time(netmon_target_info{{experiment="$experiment"}}[{META_LOOKBACK}]))',
+            "query": f"query_result(last_over_time({info % ''}{lb}))",
             "refId": "V",
         },
-        "regex": '/target="([^"]+)"/',
+        "regex": '/host="(?<value>(?<text>[^".]+)[^"]*)"/',
         "refresh": 2,
-        "sort": 1,
-        "multi": target_multi,
-        "includeAll": target_multi,
+        "sort": 7,
+        "multi": multi,
+        "includeAll": multi,
     }
-    # Largest safe step over the experiment's hosts (netmon_step_ms: written by the importer,
-    # and by a live push, where it only grows). Panels use ${min_step}ms.
-    v_step = {
-        "name": "min_step",
-        "label": "min step, ms (low-res threshold)",
+    # Value = target (host/netdev, unique); text = the RDMA device name with the netdev as a
+    # note. Experiments imported before the display names existed show their target.
+    display = "display_host_nic" if multi else "display_nic"
+    host_m = ',host=~"$host"' if multi else ',host="$host"'
+    v_nic = {
+        "name": "target",
+        "label": "NIC",
         "type": "query",
         "datasource": DS,
         "query": {
-            "query": f'query_result(max(last_over_time(netmon_step_ms{{experiment="$experiment"}}[{META_LOOKBACK}])))',
+            "query": f"query_result(last_over_time({info % host_m}{lb}))",
+            "refId": "V",
+        },
+        "regex": f'/{display}="(?<text>[^"]+)"|target="(?<value>[^"]+)"/g',
+        "refresh": 2,
+        "sort": 7,
+        "multi": multi,
+        "includeAll": multi,
+    }
+    # Smallest time bin of the traffic charts: 3 x the sampling baseline (largest over the
+    # experiment's hosts), so a bin never is finer than the sampling. Not shown.
+    v_step = {
+        "name": "min_step",
+        "label": "min step, ms",
+        "type": "query",
+        "datasource": DS,
+        "query": {
+            "query": f'query_result(max(last_over_time(netmon_step_ms{{experiment="$experiment"}}{lb})))',
             "refId": "V",
         },
         "regex": "/\\} ([0-9]+) /",
         "refresh": 2,
-        "description": "Smallest window of the envelope/mean panels: 3 x the sampling baseline, the "
-        "largest over the experiment's hosts",
+        "hide": 2,
     }
-    return {"list": [v_exp, v_tgt, v_step]}
+    return {"list": [v_exp, v_host, v_nic, v_step]}
 
 
-def summary_table(pid, grid, sel):
-    rate = f'last_over_time(netmon_summary{{{sel},stat=~"avg|peak10ms|p99"}}[{META_LOOKBACK}]) * 8 / 1e9'
-    ratio = f'last_over_time(netmon_summary{{{sel},stat=~"coverage|above80"}}[{META_LOOKBACK}])'
-    low = f'last_over_time(netmon_summary{{{sel},stat=~"lowres_n|lowres_s"}}[{META_LOOKBACK}])'
+def _multi(panels):
+    """The overview's `target` is multi-valued: Grafana regex-escapes it for Prometheus
+    (`.` -> `\\\\.`), so match with =~ (anchored; the escaping makes it exact)."""
+    for p in panels:
+        for t in p.get("targets", []):
+            t["expr"] = t["expr"].replace('target="$target"', 'target=~"$target"')
+        _multi(p.get("panels", []))
+
+
+def dashboard(uid, title, panels, multi, links=()):
+    return {
+        "uid": uid,
+        "title": title,
+        "tags": ["netmon", "ainic"],
+        "timezone": "utc",
+        "schemaVersion": 39,
+        "editable": True,
+        "graphTooltip": 1,
+        "time": {"from": "now-1h", "to": "now"},
+        "timepicker": {"refresh_intervals": ["2s", "5s", "10s", "30s", "1m", "5m"]},
+        "templating": variables(multi),
+        "links": list(links),
+        "panels": panels,
+    }
+
+
+# --------------------------------------------------------------------------- overview
+
+
+def nic_table(pid, grid):
+    sel = 'experiment="$experiment",target=~"$target"'
+    avg = {"source": "rdma", "scale": BITS, "kind": "range_mean"}
+    targets = [
+        # host_short for display: a value mapping would also change the link's host value
+        instant_target(
+            "A",
+            f'label_replace({target_info(sel)}, "host_short", "$1", "host", "([^.]+).*")',
+        ),
+        instant_target("B", link_bps(sel)),
+        instant_target(
+            "C",
+            q_average(
+                "rdma",
+                RDMA_TX,
+                BITS,
+                "${__range_ms}ms",
+                f'{sel},source="rdma",counter="{RDMA_TX}"',
+            ).replace("sum without (resolution)", "sum by (target)"),
+            dict(avg, counter=RDMA_TX),
+        ),
+        instant_target(
+            "D",
+            q_average(
+                "rdma",
+                RDMA_RX,
+                BITS,
+                "${__range_ms}ms",
+                f'{sel},source="rdma",counter="{RDMA_RX}"',
+            ).replace("sum without (resolution)", "sum by (target)"),
+            dict(avg, counter=RDMA_RX),
+        ),
+    ]
+    keep = [
+        "host_short",
+        "display_nic",
+        "Value #B",
+        "Value #C",
+        "Value #D",
+        "host",
+        "target",
+    ]
+    link = detail_url(
+        "${__data.fields.host:percentencode}", "${__data.fields.target:percentencode}"
+    )
     return table(
         pid,
-        "Fixed experiment window summary (offline report rules; rates in Gb/s, coverage/above80 as fractions)",
-        # One query: groupingToMatrix needs a single "Value" column (several queries
-        # would give "Value #A", "Value #B", ...). The stat label keeps them disjoint.
-        [meta_target("A", f"({rate}) or ({ratio}) or ({low})")],
+        "RDMA traffic over the selected time",
+        targets,
         grid,
         [
-            {"id": "merge", "options": {}},
+            {"id": "joinByField", "options": {"byField": "target", "mode": "outer"}},
+            {
+                "id": "organize",
+                "options": {
+                    "includeByName": {k: True for k in keep},
+                    "indexByName": {k: i for i, k in enumerate(keep)},
+                    "renameByName": {
+                        "host_short": "Host",
+                        "display_nic": "NIC",
+                        "Value #B": "Link",
+                        "Value #C": "Average send",
+                        "Value #D": "Average receive",
+                    },
+                },
+            },
+        ],
+        [
+            _by_name(
+                "NIC",
+                ("links", [{"title": "Open NIC detail", "url": link}]),
+            ),
+            _by_name("Link", ("unit", "bps"), ("decimals", 0)),
+            _by_name("Average send", ("unit", "bps"), ("decimals", 1)),
+            _by_name("Average receive", ("unit", "bps"), ("decimals", 1)),
+            _hidden("host"),
+            _hidden("target"),
+        ],
+        desc="One row per NIC. Average send / receive: the average of the observations that "
+        "end in the selected time range (a long observation crossing the start is counted "
+        "whole). Click a NIC for its detail page. " + LIVE_NOTE,
+    )
+
+
+def overview():
+    panels = [text_panel(1, {"x": 0, "y": 0, "w": 24, "h": 2}, KEY_TEXT)]
+    panels.append(nic_table(2, {"x": 0, "y": 2, "w": 24, "h": 8}))
+    link = detail_url(
+        "${__field.labels.host:percentencode}", "${__field.labels.target:percentencode}"
+    )
+    panels.append(
+        traffic_panel(
+            3,
+            "${target:text}",
+            "rdma",
+            RDMA_TX,
+            RDMA_RX,
+            {"x": 0, "y": 10, "w": 6, "h": 7},
+            links=[{"title": "Open NIC detail", "url": link}],
+            repeat="target",
+            small=True,
+        )
+    )
+    _multi(panels)
+    return dashboard("netmon-overview", "netmon overview", panels, True)
+
+
+# --------------------------------------------------------------------------- NIC detail
+
+
+def identity_strip(pid, grid):
+    keep = ["host", "display_nic", "netdev", "pci", "Value #B", "status", "target"]
+    return table(
+        pid,
+        "",
+        [instant_target("A", target_info(SEL)), instant_target("B", link_bps(SEL))],
+        grid,
+        [
+            {"id": "joinByField", "options": {"byField": "target", "mode": "outer"}},
+            {
+                "id": "organize",
+                "options": {
+                    "includeByName": {k: True for k in keep},
+                    "indexByName": {k: i for i, k in enumerate(keep)},
+                    "renameByName": {
+                        "host": "Host",
+                        "display_nic": "NIC",
+                        "netdev": "netdev",
+                        "pci": "PCI",
+                        "Value #B": "Link",
+                        "status": "Data",
+                    },
+                },
+            },
+        ],
+        [
+            _by_name("Host", ("custom.width", 480)),
+            _by_name("Link", ("unit", "bps"), ("decimals", 0)),
+            _by_name("Data", ("mappings", [DATA_STATUS])),
+            _hidden("target"),
+        ],
+    )
+
+
+GAP_NAMES = {
+    ("rdma", "reset"): "RDMA counters: counter reset or rejected reading",
+    ("rdma", "clock"): "RDMA counters: timestamp uncertain",
+    ("ipc", "reset"): "Port counters: counter reset or rejected reading",
+    ("ipc", "clock"): "Port counters: timestamp uncertain",
+}
+QUALITY_NAMES = {
+    "samples": "Samples",
+    "missed_slots": "Missed sampling slots",
+    "dropped": "Samples lost before saving",
+    "errors": "Read errors",
+}
+SUMMARY_NAMES = {
+    "avg": "Average",
+    "p99": "p99",
+    "peak10ms": "10 ms peak",
+    "above80": "Time above 80 % of link",
+    "coverage": "Time with fine-grained observations",
+    "lowres_n": "Long observations",
+    "lowres_s": "Long-observation time",
+}
+COUNTER_NAMES = {
+    "type": "value",
+    "options": {
+        RDMA_TX: {"text": "RDMA send"},
+        RDMA_RX: {"text": "RDMA receive"},
+        IPC_TX: {"text": "Port send"},
+        IPC_RX: {"text": "Port receive"},
+        "rdma": {"text": "RDMA counters"},
+        "ipc": {"text": "Port counters"},
+    },
+}
+
+
+def diagnostics(pid, y):
+    gaps = timeseries(
+        pid,
+        "Time without a valid observation (each point: one gap, its length)",
+        [
+            target(
+                "A",
+                f"max by (experiment, target, source, reason) (max_over_time(netmon_gap_seconds{{{SEL}}}[$__interval]))",
+                "{{source}} {{reason}}",
+                {"kind": "gap_by_source"},
+            )
+        ],
+        [
+            {
+                "matcher": {"id": "byName", "options": f"{s} {r}"},
+                "properties": [{"id": "displayName", "value": name}],
+            }
+            for (s, r), name in GAP_NAMES.items()
+        ],
+        {"x": 0, "y": y, "w": 24, "h": 7},
+        unit="s",
+        points=True,
+        desc="Collector quality, not network loss: times when a counter could not be turned "
+        "into a rate (a counter went back, an IPC read was rejected, or the wall-clock "
+        "position was uncertain). These times are the gaps in the traffic charts. Gaps of "
+        "different counters are not added up.",
+    )
+    quality = table(
+        pid + 1,
+        "Recording quality",
+        [
+            instant_target(
+                "A", f"last_over_time(netmon_run_quality{{{SEL}}}[{META_LOOKBACK}])"
+            )
+        ],
+        {"x": 0, "y": y + 7, "w": 24, "h": 4},
+        [
             {
                 "id": "groupingToMatrix",
                 "options": {
                     "columnField": "stat",
-                    "rowField": "row",
+                    "rowField": "source",
                     "valueField": "Value",
                 },
             },
-        ],
-        desc="Numbers of the offline report's summary table for the fixed window [window_start, window_end] "
-        "(the experiment's common window). They do not change with zoom.",
-    )
-
-
-def info_table(pid, grid, sel):
-    return table(
-        pid,
-        "Target info (recording status, link speed)",
-        [
-            meta_target(
-                "A", f"last_over_time(netmon_target_info{{{sel}}}[{META_LOOKBACK}])"
-            )
-        ],
-        grid,
-        [
             {
                 "id": "organize",
                 "options": {
-                    "excludeByName": {"Time": True, "Value": True, "__name__": True}
+                    "renameByName": dict(QUALITY_NAMES, **{"source\\stat": "Counters"})
                 },
-            }
+            },
         ],
-    )
-
-
-def quality_panel(pid, grid, interval="${min_step}ms"):
-    return timeseries(
-        pid,
-        "Data quality: gaps (no valid interval) and their duration, s",
         [
-            target(
-                "A",
-                f'max_over_time(netmon_gap_seconds{{{SEL},reason="reset"}}[$__interval])',
-                "{{source}}.{{counter}} reset",
-                {"kind": "gap", "reason": "reset"},
-            ),
-            target(
-                "B",
-                f'max_over_time(netmon_gap_seconds{{{SEL},reason="clock"}}[$__interval])',
-                "{{source}}.{{counter}} clock",
-                {"kind": "gap", "reason": "clock"},
-            ),
+            _by_name("Counters", ("mappings", [COUNTER_NAMES])),
+            {
+                "matcher": {"id": "byType", "options": "number"},
+                "properties": [{"id": "decimals", "value": 0}],
+            },
         ],
-        [],
-        grid,
-        interval=interval,
-        unit="s",
-        points=True,
-        desc="Intervals left out of every rate panel: counter resets and wall-clock uncertainty. "
-        "Low-resolution intervals are shown as points in the rate panels.",
+        desc="Samples: counter reads saved. Missed sampling slots: sampling times skipped "
+        "because a read was late (e.g. a firmware stall). Samples lost before saving: the "
+        "writer could not keep up. Read errors: failed reads.",
     )
-
-
-DETAIL_LINK = [
-    {
-        "title": "NIC detail (this target, this time range)",
-        "url": "/d/netmon-nic/netmon-nic-detail?var-experiment=${experiment}&var-target=${target}&${__url_time_range}",
-    }
-]
-
-
-def multi_target(panels):
-    """The overview's `target` is multi-valued (repeated rows). Grafana regex-escapes
-    multi-valued variables for Prometheus (`.` -> `\\\\.` in the query text), so an equality
-    matcher would never match a host name with dots: match with =~ instead (PromQL regexes
-    are anchored, and the escaping makes it an exact match)."""
-    for p in panels:
-        for t in p.get("targets", []):
-            t["expr"] = t["expr"].replace('target="$target"', 'target=~"$target"')
-
-
-def overview():
-    panels = []
-    pid = 1
-    panels.append(
-        summary_table(
-            pid,
-            {"x": 0, "y": 0, "w": 24, "h": 8},
-            'experiment="$experiment",target=~"$target"',
-        )
+    rate = f'last_over_time(netmon_summary{{{SEL},stat=~"avg|peak10ms|p99"}}[{META_LOOKBACK}]) * 8'
+    other = f'last_over_time(netmon_summary{{{SEL},stat!~"avg|peak10ms|p99"}}[{META_LOOKBACK}])'
+    summary = table(
+        pid + 2,
+        "Offline report summary (fixed experiment window; does not change with zoom)",
+        [instant_target("A", f"({rate}) or ({other})")],
+        {"x": 0, "y": y + 11, "w": 24, "h": 5},
+        [
+            {
+                "id": "groupingToMatrix",
+                "options": {
+                    "columnField": "stat",
+                    "rowField": "counter",
+                    "valueField": "Value",
+                },
+            },
+            {
+                "id": "organize",
+                "options": {
+                    "renameByName": dict(SUMMARY_NAMES, **{"counter\\stat": "Traffic"}),
+                    "indexByName": {
+                        k: i for i, k in enumerate(["counter\\stat", *SUMMARY_NAMES])
+                    },
+                },
+            },
+        ],
+        [
+            _by_name("Traffic", ("mappings", [COUNTER_NAMES])),
+            *[
+                _by_name(SUMMARY_NAMES[k], ("unit", "bps"), ("decimals", 1))
+                for k in ("avg", "p99", "peak10ms")
+            ],
+            *[
+                _by_name(SUMMARY_NAMES[k], ("unit", "percentunit"), ("decimals", 1))
+                for k in ("above80", "coverage")
+            ],
+            _by_name(SUMMARY_NAMES["lowres_n"], ("decimals", 0)),
+            _by_name(SUMMARY_NAMES["lowres_s"], ("unit", "s"), ("decimals", 2)),
+        ],
+        desc="The offline report's numbers for the experiment's common recording window "
+        "(ainic-netmon-report shows the window). p99 and the time above 80 % use fine-grained "
+        "observations only; the average includes long observations.",
     )
-    pid += 1
-    panels.append(
-        {
-            "id": pid,
-            "type": "row",
-            "title": "$target",
-            "repeat": "target",
-            "collapsed": False,
-            "gridPos": {"x": 0, "y": 8, "w": 24, "h": 1},
-            "panels": [],
-        }
-    )
-    pid += 1
-    y = 9
-    t1, o1 = envelope_targets("rdma", RDMA_TX, "tx", GBPS, 0, "ABCD")
-    t2, o2 = envelope_targets("rdma", RDMA_RX, "rx", GBPS, 1, "EFGH")
-    panels.append(
-        timeseries(
-            pid,
-            "RDMA payload, Gb/s (envelope = min..max per window, line = mean)",
-            t1 + t2,
-            o1 + o2,
-            {"x": 0, "y": y, "w": 9, "h": 8},
-            links=DETAIL_LINK,
-            desc=LIVE_NOTE,
-        )
-    )
-    pid += 1
-    t3, o3 = envelope_targets("ipc", IPC_TX, "wire tx", GBPS, 0, "ABCD")
-    t4, o4 = envelope_targets("ipc", IPC_RX, "wire rx", GBPS, 1, "EFGH")
-    panels.append(
-        timeseries(
-            pid,
-            "Port wire bytes (IPC), Gb/s, all traffic incl. ACKs",
-            t3 + t4,
-            o3 + o4,
-            {"x": 9, "y": y, "w": 7, "h": 8},
-            desc=LIVE_NOTE,
-        )
-    )
-    pid += 1
-    tc = [
-        target(
-            chr(65 + i),
-            q_window("max_over_time", "netmon_rate", "rdma", c, "normal", 1.0),
-            c,
-            {"kind": "max", "source": "rdma", "counter": c, "scale": 1.0},
-        )
-        for i, c in enumerate(CONGESTION)
-    ]
-    panels.append(
-        timeseries(
-            pid,
-            "Congestion and retransmission, max per window, /s",
-            tc,
-            [],
-            {"x": 16, "y": y, "w": 8, "h": 8},
-        )
-    )
-    pid += 1
-    panels.append(info_table(pid, {"x": 0, "y": y + 8, "w": 12, "h": 4}, SEL))
-    pid += 1
-    panels.append(quality_panel(pid, {"x": 12, "y": y + 8, "w": 12, "h": 4}))
-    multi_target(panels)
-    return {
-        "uid": "netmon-overview",
-        "title": "netmon overview",
-        "tags": ["netmon", "ainic"],
-        "timezone": "utc",
-        "schemaVersion": 39,
-        "editable": True,
-        "graphTooltip": 1,
-        "time": {"from": "now-1h", "to": "now"},
-        "timepicker": {"refresh_intervals": ["2s", "5s", "10s", "30s", "1m", "5m"]},
-        "templating": variables(True),
-        "panels": panels,
-    }
+    return [gaps, quality], summary
 
 
 def nic_detail():
-    panels = []
-    pid = 1
-    panels.append(info_table(pid, {"x": 0, "y": 0, "w": 12, "h": 4}, SEL))
-    pid += 1
-    panels.append(summary_table(pid, {"x": 12, "y": 0, "w": 12, "h": 6}, SEL))
-    pid += 1
-    y = 6
-    t1, o1 = envelope_targets("rdma", RDMA_TX, "tx", GBPS, 0, "ABCD")
-    t2, o2 = envelope_targets("rdma", RDMA_RX, "rx", GBPS, 1, "EFGH")
-    panels.append(
-        timeseries(
-            pid,
-            "RDMA payload, Gb/s (envelope + mean per window ≥ ${min_step}ms)",
-            t1 + t2,
-            o1 + o2,
-            {"x": 0, "y": y, "w": 24, "h": 8},
-            desc=LIVE_NOTE,
-        )
-    )
-    pid += 1
-    y += 8
-    raw = [
-        target(
-            "A",
-            q_window("max_over_time", "netmon_rate", "rdma", RDMA_TX, "normal", GBPS),
-            "tx",
-            {"kind": "raw", "source": "rdma", "counter": RDMA_TX, "scale": GBPS},
+    panels = [
+        text_panel(1, {"x": 0, "y": 0, "w": 24, "h": 2}, KEY_TEXT),
+        identity_strip(2, {"x": 0, "y": 2, "w": 24, "h": 3}),
+        traffic_panel(
+            3,
+            "RDMA traffic",
+            "rdma",
+            RDMA_TX,
+            RDMA_RX,
+            {"x": 0, "y": 5, "w": 24, "h": 10},
         ),
-        target(
-            "B",
-            q_window("max_over_time", "netmon_rate", "rdma", RDMA_RX, "normal", GBPS),
-            "rx",
-            {"kind": "raw", "source": "rdma", "counter": RDMA_RX, "scale": GBPS},
+        traffic_panel(
+            4,
+            "All port traffic (incl. non-RDMA)",
+            "ipc",
+            IPC_TX,
+            IPC_RX,
+            {"x": 0, "y": 15, "w": 24, "h": 8},
         ),
-    ]
-    panels.append(
-        timeseries(
-            pid,
-            "Raw points, Gb/s (one point per interval when the step is 1 ms; otherwise max per step — step: $__interval)",
-            raw,
-            [_override_points("tx", PALETTE[0]), _override_points("rx", PALETTE[1])],
-            {"x": 0, "y": y, "w": 24, "h": 8},
-            interval="1ms",
-            points=True,
-        )
-    )
-    pid += 1
-    y += 8
-    tc = [
-        target(
-            chr(65 + i),
-            q_window("max_over_time", "netmon_rate", "rdma", c, "normal", 1.0),
-            c,
-            {"kind": "max", "source": "rdma", "counter": c, "scale": 1.0},
-        )
-        for i, c in enumerate(CONGESTION)
-    ]
-    panels.append(
-        timeseries(
-            pid,
-            "Congestion and retransmission, max per window, /s",
-            tc,
-            [],
-            {"x": 0, "y": y, "w": 12, "h": 8},
-        )
-    )
-    pid += 1
-    t5, o5 = envelope_targets("ipc", IPC_TX, "wire tx", GBPS, 0, "ABCD")
-    t6, o6 = envelope_targets("ipc", IPC_RX, "wire rx", GBPS, 1, "EFGH")
-    panels.append(
-        timeseries(
-            pid,
-            "Port wire bytes (IPC), Gb/s, all traffic incl. ACKs",
-            t5 + t6,
-            o5 + o6,
-            {"x": 12, "y": y, "w": 12, "h": 8},
-            desc=LIVE_NOTE,
-        )
-    )
-    pid += 1
-    y += 8
-    pfc = [
-        target(
-            "A",
-            f'max_over_time(netmon_rate{{{SEL},source="ipc",counter=~".*pripause.*|rx_pause_1us_count",resolution="normal"}}[$__interval])',
-            "{{counter}}",
-            {
-                "kind": "max",
-                "source": "ipc",
-                "counter_re": ".*pripause.*|rx_pause_1us_count",
-                "scale": 1.0,
-            },
-        )
-    ]
-    panels.append(
-        timeseries(
-            pid,
-            "PFC pause counter increments, max per window, /s (field semantics unvalidated)",
-            pfc,
-            [],
-            {"x": 0, "y": y, "w": 24, "h": 8},
-        )
-    )
-    pid += 1
-    y += 8
-    panels.append(quality_panel(pid, {"x": 0, "y": y, "w": 24, "h": 6}))
-    pid += 1
-    panels.append(
-        table(
-            pid,
-            "Run quality (samples / missed slots / dropped / errors)",
+        row(5, "Retransmissions and congestion", 23),
+        packet_panel(
+            6,
+            "Retransmitted packets",
+            [("tx_rdma_retx_pkts", "Retransmitted")],
+            {"x": 0, "y": 24, "w": 8, "h": 7},
+            desc="Highest rate per time bin. 0 = observed zero; gaps = no observation.",
+        ),
+        packet_panel(
+            7,
+            "Congestion notifications",
             [
-                meta_target(
-                    "A", f"last_over_time(netmon_run_quality{{{SEL}}}[{META_LOOKBACK}])"
-                )
+                ("rx_rdma_ecn_pkts", "ECN-marked received"),
+                ("rx_rdma_cnp_pkts", "CNP received"),
+                ("tx_rdma_cnp_pkts", "CNP sent"),
             ],
-            {"x": 0, "y": y + 6, "w": 24, "h": 4},
-            [
-                {"id": "merge", "options": {}},
+            {"x": 8, "y": 24, "w": 8, "h": 7},
+            desc="Highest rate per time bin. All zero does not prove the network had no "
+            "pressure: a fabric without ECN marking recovers by drops and retransmission.",
+        ),
+        packet_panel(
+            8,
+            "ACK timeouts",
+            [("tx_rdma_ack_timeout", "ACK timeouts")],
+            {"x": 16, "y": 24, "w": 8, "h": 7},
+            unit="short",
+            desc="Highest rate per time bin, per second.",
+        ),
+    ]
+    y = 31
+    samples = timeseries(
+        10,
+        "Individual observations (at 1 ms bins each point is one observation; otherwise the highest per $__interval)",
+        [
+            target(
+                "A",
+                q_peak("rdma", RDMA_TX, BITS),
+                "Send",
                 {
-                    "id": "groupingToMatrix",
-                    "options": {
-                        "columnField": "stat",
-                        "rowField": "row",
-                        "valueField": "Value",
-                    },
+                    "kind": "max_all",
+                    "source": "rdma",
+                    "counter": RDMA_TX,
+                    "scale": BITS,
                 },
-            ],
+            ),
+            target(
+                "B",
+                q_peak("rdma", RDMA_RX, BITS),
+                "Receive",
+                {
+                    "kind": "max_all",
+                    "source": "rdma",
+                    "counter": RDMA_RX,
+                    "scale": BITS,
+                },
+            ),
+        ],
+        [_points("Send", SEND_COLOR), _points("Receive", RECV_COLOR)],
+        {"x": 0, "y": y + 1, "w": 24, "h": 8},
+        interval="1ms",
+        unit="bps",
+        points=True,
+        desc="RDMA traffic as individual observations. Zoom in until the bin is 1 ms to see "
+        "every observation.",
+    )
+    panels.append(row(9, "Inspect individual observations", y, True, [samples]))
+    pfc = timeseries(
+        12,
+        "PFC pause counters, highest rate per time bin",
+        [
+            target(
+                "A",
+                f'max_over_time(netmon_rate{{{SEL},source="ipc",counter=~".*pripause.*|rx_pause_1us_count",resolution="normal"}}[$__interval])',
+                "{{counter}}",
+                {
+                    "kind": "max",
+                    "source": "ipc",
+                    "counter_re": ".*pripause.*|rx_pause_1us_count",
+                    "scale": 1.0,
+                },
+            )
+        ],
+        [],
+        {"x": 0, "y": y + 2, "w": 24, "h": 8},
+        desc="Firmware port counters whose meaning has not been validated yet. Only counters "
+        "that changed during the recording are imported.",
+    )
+    panels.append(
+        row(
+            11,
+            "PFC pause counters (experimental: meaning not yet validated)",
+            y + 1,
+            True,
+            [pfc],
         )
     )
-    return {
-        "uid": "netmon-nic",
-        "title": "netmon NIC detail",
-        "tags": ["netmon", "ainic"],
-        "timezone": "utc",
-        "schemaVersion": 39,
-        "editable": True,
-        "graphTooltip": 1,
-        "time": {"from": "now-1h", "to": "now"},
-        "timepicker": {"refresh_intervals": ["2s", "5s", "10s", "30s", "1m", "5m"]},
-        "templating": variables(False),
-        "panels": panels,
-    }
+    diag, summary = diagnostics(14, y + 3)
+    summary["gridPos"] = {"x": 0, "y": y + 4, "w": 24, "h": 5}
+    panels.append(row(17, "Offline report summary (fixed experiment window)", y + 2, True, [summary]))
+    panels.append(
+        row(13, "Recording diagnostics (for troubleshooting the monitor itself)", y + 3, True, diag)
+    )
+    return dashboard(
+        "netmon-nic",
+        "netmon NIC detail",
+        panels,
+        False,
+        links=[
+            {
+                "title": "Overview",
+                "type": "link",
+                "url": "/d/netmon-overview/netmon-overview?var-experiment=${experiment:percentencode}",
+                "keepTime": True,
+            }
+        ],
+    )
 
 
 DASHBOARDS = {"netmon_overview.json": overview, "netmon_nic_detail.json": nic_detail}

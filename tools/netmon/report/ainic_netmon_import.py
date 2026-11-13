@@ -91,6 +91,10 @@ METRIC_PREFIX = "netmon_"
 # label / series APIs then only look at the last day (measured on v1.156.0; some other
 # small epoch values also return nothing), so an older experiment would look absent.
 ALL_TIME_START = "2000-01-01T00:00:00Z"
+# ... and its end. Without one VM ends at the current time rounded down to the second, so a
+# read-back right after a recording misses its last fraction of a second (measured).
+ALL_TIME_END = "2100-01-01T00:00:00Z"
+ALL_TIME = {"start": ALL_TIME_START, "end": ALL_TIME_END}
 MAX_REQUEST_BYTES = 8 << 20  # uncompressed
 MAX_REQUEST_POINTS = 500_000
 MAX_LINE_POINTS = 20_000  # keeps one JSON line well under 1 MiB
@@ -182,12 +186,12 @@ class VM:
         return out
 
     def series(self, match):
-        d = self.get_json("/api/v1/series", {"match[]": match, "start": ALL_TIME_START})
+        d = self.get_json("/api/v1/series", {"match[]": match, **ALL_TIME})
         return d.get("data", [])
 
     def label_values(self, label, match):
         d = self.get_json(
-            f"/api/v1/label/{label}/values", {"match[]": match, "start": ALL_TIME_START}
+            f"/api/v1/label/{label}/values", {"match[]": match, **ALL_TIME}
         )
         return set(d.get("data", []))
 
@@ -207,7 +211,7 @@ class VM:
     def export(self, match):
         """Stream /api/v1/export line by line (a long experiment exports hundreds of
         millions of points; never hold the whole response)."""
-        q = urllib.parse.urlencode({"match[]": match, "start": ALL_TIME_START})
+        q = urllib.parse.urlencode({"match[]": match, **ALL_TIME})
         with self._open(urllib.request.Request(f"{self.url}/api/v1/export?{q}")) as r:
             for line in r:
                 if line.strip():
@@ -271,6 +275,41 @@ class Target:
         }
         d.update(extra)
         return d
+
+    def nic_labels(self):
+        """Names for people (metadata series only; the interval series keep their identity)."""
+        nic = next(
+            (
+                n
+                for n in self.run.meta.get("nics", [])
+                if n.get("netdev") == self.netdev
+            ),
+            {},
+        )
+        return display_labels(
+            self.host, self.netdev, nic.get("ibdev", ""), nic.get("pci", "")
+        )
+
+    def meta_labels(self, **extra):
+        return dict(self.labels(**extra), **self.nic_labels())
+
+
+def display_labels(host, netdev, ibdev, pci):
+    """The dashboards' NIC names (the live exporter builds the same: exporter.cc
+    DisplayLabels; test_push.cc checks the same cases): "ionic_0 (benic1p1)", and for the
+    multi-host overview "<host's first DNS label> · ionic_0" (short enough for a chart
+    title; the netdev is in the overview table)."""
+    nic = f"{ibdev} ({netdev})" if ibdev else netdev
+    out = {
+        "display_nic": nic,
+        "display_host_nic": f"{host.split('.')[0]} · {ibdev or netdev}",
+    }
+    # VM drops empty label values: leave unknown ones out instead.
+    if ibdev:
+        out["ibdev"] = ibdev
+    if pci:
+        out["pci"] = pci
+    return out
 
 
 def pick_counters(stream, mode):
@@ -529,7 +568,7 @@ def plan_summary(targets, counters_mode, window):
                 if k in q:
                     quality.append(
                         (
-                            t.labels(
+                            t.meta_labels(
                                 source=s.source, stat=k, row=f"{s.source} {t.target}"
                             ),
                             float(q[k]),
@@ -544,7 +583,7 @@ def plan_summary(targets, counters_mode, window):
                     )
                 if counter in SUMMARY_COUNTERS.get(s.source, []):
                     for stat, v in summary_values(t, s, counter, r, window).items():
-                        lab = t.labels(
+                        lab = t.meta_labels(
                             source=s.source,
                             counter=counter,
                             stat=stat,
@@ -557,7 +596,7 @@ def plan_summary(targets, counters_mode, window):
                             )
                         summaries.append((lab, v))
         infos.append(
-            t.labels(
+            t.meta_labels(
                 status=t.run.status,
                 speed_mbps=str(t.run.speed.get(t.netdev, -1)),
             )
