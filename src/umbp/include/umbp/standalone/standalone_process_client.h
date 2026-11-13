@@ -25,10 +25,12 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <shared_mutex>
 #include <string>
@@ -121,6 +123,15 @@ class StandaloneProcessClient : public IUMBPClient {
   bool RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id);
   bool RegisterHostShmMemory(uintptr_t ptr, size_t size);
 
+  // Makes a data call. A server restarted at the same address answers it with
+  // client_unknown; the regions and KV Indexer configuration are then
+  // registered with it again and the call made once more. Callers hold
+  // op_mutex_ shared.
+  template <typename Method, typename Request, typename Response>
+  grpc::Status CallRegistered(Method method, const Request& req, Response& resp);
+  // False while a failed restore waits to be tried again.
+  bool EnsureRegistrations(uint64_t observed_epoch, bool client_unknown);
+
   class MemoryExporter;
   class RealMemoryExporter;
   class VirtualMemoryExporter;
@@ -148,11 +159,20 @@ class StandaloneProcessClient : public IUMBPClient {
     uintptr_t base = 0;
     size_t size = 0;
     RegionKind kind = RegionKind::kHostShm;
+    int device_id = -1;  // -1 for host memory
   };
 
   mutable std::mutex registration_mu_;
   std::string client_id_;
   std::vector<RegisteredRegion> regions_;
+
+  // A restore runs under replay_mu_. replay_needed_ stays set until one
+  // completes, which also advances the epoch.
+  std::mutex replay_mu_;
+  std::atomic<bool> replay_needed_{false};
+  std::atomic<uint64_t> registration_epoch_{0};
+  std::chrono::steady_clock::time_point next_replay_{};                  // under replay_mu_
+  std::optional<::umbp::StandaloneKvIndexerConfig> kv_indexer_request_;  // under replay_mu_
 
   // The key lists this client has already sent, and the handles the server
   // gave back for them.
