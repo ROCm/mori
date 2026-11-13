@@ -1,6 +1,6 @@
 # MORI Shmem Guide
 
-MORI Shmem provides OpenSHMEM-style symmetric memory APIs for GPU memory management and RDMA communication. The original MORI-EP API (`mori.ops.EpDispatchCombineOp`) and MORI-CCL build on it, so shmem must be initialized before using them; on gfx125x the original EP API defaults to CCO instead (`MORI_EP_COMM`). MORI-IO, MORI-CCO and the CCO-based EPv2 API do not use shmem.
+MORI Shmem provides OpenSHMEM-style symmetric memory APIs for GPU memory management and RDMA communication. The original MORI-EP API (`mori.ops.EpDispatchCombineOp`) builds on it, so shmem must be initialized before that API is used; on gfx125x the original EP API defaults to CCO instead (`MORI_EP_COMM`). MORI-IO, MORI-CCO and the CCO-based EPv2 API do not use shmem.
 
 ## Table of Contents
 
