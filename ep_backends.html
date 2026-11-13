@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Choosing an EP API and backend &mdash; MORI development (57522182) documentation</title>
+  <title>Choosing an EP API and backend &mdash; MORI development (0b50f4c7) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=acb7cfce"></script>
+      <script src="_static/documentation_options.js?v=cd96284e"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -224,7 +224,11 @@ simply the only backend that has an internode path today.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">gpu_per_node</span></code> determines physical node grouping. A single host cannot
 emulate the two-node internode test by changing world size alone.</p></li>
 <li><p>For internode, <code class="docutils literal notranslate"><span class="pre">internode_kernel</span></code> chooses <code class="docutils literal notranslate"><span class="pre">&quot;v2&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;v2_ll&quot;</span></code> or
-<code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code>. Auto chooses by the current call’s token count, not buffer capacity.</p></li>
+<code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code>. Auto chooses by the <code class="docutils literal notranslate"><span class="pre">max_num_inp_token_across_ranks</span></code> passed to
+<code class="docutils literal notranslate"><span class="pre">dispatch</span></code> (the largest token count any rank passes that call), not by
+buffer capacity, and runs <code class="docutils literal notranslate"><span class="pre">&quot;v2&quot;</span></code> when it is not passed. <code class="docutils literal notranslate"><span class="pre">low_latency=True</span></code>
+or <code class="docutils literal notranslate"><span class="pre">False</span></code> selects <code class="docutils literal notranslate"><span class="pre">&quot;v2_ll&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;v2&quot;</span></code>; see the package guide for what
+it does on gfx125x intranode.</p></li>
 </ul>
 </section>
 <section id="validation-before-tuning">

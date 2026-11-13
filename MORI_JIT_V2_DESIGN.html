@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI JIT v2 &mdash; MORI development (57522182) documentation</title>
+  <title>MORI JIT v2 &mdash; MORI development (0b50f4c7) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=acb7cfce"></script>
+      <script src="_static/documentation_options.js?v=cd96284e"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -522,15 +522,17 @@ dispatch 的 dtype</strong>——它只归约 bf16/fp32 的暂存区，不管前
 <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineOpHip</span></code>，HIP 沿用的是 FlyDSL 的几何。单机时只要显式给出 <code class="docutils literal notranslate"><span class="pre">cfg.schedule</span></code> 或任一
 block/warp 字段，整个 op 就不查表，未给的字段取单档默认值（dispatch 64×16、combine 80×4）；跨机忽略
 <code class="docutils literal notranslate"><span class="pre">cfg.schedule</span></code>，只读 CSV 表，不回退到 Python 表。
-<code class="docutils literal notranslate"><span class="pre">op.kernel_config(num_tokens)</span></code> 负责一次选桶，HIP 的 <code class="docutils literal notranslate"><span class="pre">_pick()</span></code> 与报告接口使用同一结果（gfx125x 上
-LL128 分段覆盖的小 token 数除外，<code class="docutils literal notranslate"><span class="pre">_pick()</span></code> 直接返回 LL128 plan）；
+<code class="docutils literal notranslate"><span class="pre">op.kernel_config(num_tokens,</span> <span class="pre">max_tokens)</span></code> 负责一次选桶，HIP 的 <code class="docutils literal notranslate"><span class="pre">_pick()</span></code> 与报告接口使用同一结果
+（gfx125x 上按 <code class="docutils literal notranslate"><span class="pre">low_latency</span></code> 规则走 LL128 的调用除外，<code class="docutils literal notranslate"><span class="pre">_pick()</span></code> 直接返回 LL128 plan，规则见
+dispatch_combine_v2/README.md 的 Low latency 一节）；
 绑定的单 kernel 或 pass group 直接执行，不再另选一遍 family/geometry。</p>
 <p>跨机的数据解析中，<code class="docutils literal notranslate"><span class="pre">internode_schedule(cfg)</span></code> 合并查表结果、手动覆盖和 token 边界，
 <code class="docutils literal notranslate"><span class="pre">internode_buckets()</span></code> 读取单个 family 的规则，
 <code class="docutils literal notranslate"><span class="pre">lookup_internode()</span></code> 解析单个 token 数，<code class="docutils literal notranslate"><span class="pre">save_internode_result()</span></code> 保存调优结果，
-<code class="docutils literal notranslate"><span class="pre">internode_kernel_family()</span></code> 解析本次调用的 kernel family。表的格式由 <code class="docutils literal notranslate"><span class="pre">hip_tuning_configs.py</span></code>
-自己负责：<code class="docutils literal notranslate"><span class="pre">v2_table_filename()</span></code> 决定文件名，<code class="docutils literal notranslate"><span class="pre">read_v2_table()</span></code> 读取并校验，<code class="docutils literal notranslate"><span class="pre">write_v2_table()</span></code>
-按选择键排序写回；<code class="docutils literal notranslate"><span class="pre">MORI_EP_V2_TUNING_DIR</span></code> 可指定表目录。没有匹配规则的相使用配置默认几何。</p>
+<code class="docutils literal notranslate"><span class="pre">internode_kernel_family()</span></code> 按 dispatch 传入的 <code class="docutils literal notranslate"><span class="pre">max_num_inp_token_across_ranks</span></code> 解析本次调用的
+kernel family，<code class="docutils literal notranslate"><span class="pre">resolve_ll_schedule()</span></code> 给 <code class="docutils literal notranslate"><span class="pre">auto</span></code> 另建一份到切换点为止的 <code class="docutils literal notranslate"><span class="pre">v2_ll</span></code> 调度。
+表的格式由 <code class="docutils literal notranslate"><span class="pre">hip_tuning_configs.py</span></code> 自己负责：<code class="docutils literal notranslate"><span class="pre">v2_table_filename()</span></code> 决定文件名，
+<code class="docutils literal notranslate"><span class="pre">read_v2_table()</span></code> 读取并校验，<code class="docutils literal notranslate"><span class="pre">write_v2_table()</span></code> 按选择键排序写回；<code class="docutils literal notranslate"><span class="pre">MORI_EP_V2_TUNING_DIR</span></code> 可指定表目录。没有匹配规则的相使用配置默认几何。</p>
 <p>每个 GPU 型号、kernel（<code class="docutils literal notranslate"><span class="pre">InterNodeV2</span></code>/<code class="docutils literal notranslate"><span class="pre">InterNodeV2LL</span></code>/<code class="docutils literal notranslate"><span class="pre">IntraNodeV2</span></code>）和 EP 一个 CSV，两相都在其中，
 命名为 <code class="docutils literal notranslate"><span class="pre">{arch}_{model}_{kernel}_ep{n}.csv</span></code>，例如 <code class="docutils literal notranslate"><span class="pre">gfx950_mi355x_InterNodeV2_ep16.csv</span></code>。每行一条规则，
 前六列 <code class="docutils literal notranslate"><span class="pre">num_experts,topk,phase,dtype,hidden_dim,num_tokens</span></code> 是选择键，
@@ -545,8 +547,9 @@ CSV（MI350X 与 MI355X 同一颗 die、CU 数相同，读 MI355X 的），不�
 保存结果时按选择键替换或追加一行。V1 的历史通配兼容行为不变。
 两相可分别调优，默认按完整 dispatch+combine 周期评估收益，另一相保持选定几何。</p>
 <p>internode 几何增加了 <code class="docutils literal notranslate"><span class="pre">rdma_block_num</span></code>，把 grid 分成 RDMA 和 node 内两部分。
-<code class="docutils literal notranslate"><span class="pre">internode_schedule()</span></code> 在构建期合并两相和 family 的桶边界，每桶保留独立的 dispatch/combine 几何。
-<code class="docutils literal notranslate"><span class="pre">resolve_schedule()</span></code> 将 family 分界写入统一 schedule；backend 为可选的配置建立 callable，
+<code class="docutils literal notranslate"><span class="pre">internode_schedule()</span></code> 在构建期合并两相的桶边界（<code class="docutils literal notranslate"><span class="pre">auto</span></code> 时再加上切换点），每桶保留独立的
+dispatch/combine 几何。<code class="docutils literal notranslate"><span class="pre">resolve_schedule()</span></code> 给每桶标上同一个 family，<code class="docutils literal notranslate"><span class="pre">auto</span></code> 时是 <code class="docutils literal notranslate"><span class="pre">v2</span></code>，
+<code class="docutils literal notranslate"><span class="pre">resolve_ll_schedule()</span></code> 另给 <code class="docutils literal notranslate"><span class="pre">v2_ll</span></code>；backend 为两份调度里可选的配置建立 callable，
 按 <code class="docutils literal notranslate"><span class="pre">(pass,</span> <span class="pre">geometry,</span> <span class="pre">active</span> <span class="pre">QP</span> <span class="pre">数,</span> <span class="pre">load-first)</span></code> 复用 plan，按阶段和 family 的 pass 顺序建立 launch group。
 shape/dtype、每档的 active QP 数、op 的 drain QP 数和普通 combine 的 load-first 决定编译特化；B/R/W
 只影响 plan 的启动配置，相同源码可以共享编译缓存。
@@ -718,8 +721,9 @@ combinesync + combinesyncbarrier + combine 或 combine_ll + combineall。</p>
 （<code class="docutils literal notranslate"><span class="pre">EpDispatchCombineConfig.is_internode</span></code>）决定，只有 <code class="docutils literal notranslate"><span class="pre">hip</span></code> 后端实现它，FlyDSL 后端在能力门里直接
 报错；走哪一族由 <code class="docutils literal notranslate"><span class="pre">internode_kernel</span> <span class="pre">=</span> <span class="pre">auto</span> <span class="pre">|</span> <span class="pre">v2</span> <span class="pre">|</span> <span class="pre">v2_ll</span></code> 决定。<code class="docutils literal notranslate"><span class="pre">v2</span></code> 和 <code class="docutils literal notranslate"><span class="pre">v2_ll</span></code> 是<strong>两族独立
 kernel</strong>——独立的 JIT 模块、入口符号和缓存 key，不是一个 body 的两个分支——所以点名一族就只编那一族；
-<code class="docutils literal notranslate"><span class="pre">auto</span></code>（默认）两族都编，按 launch 的 token 数在 <code class="docutils literal notranslate"><span class="pre">internode_auto_ll_max_tokens</span></code>（默认 512）处切换，
-也只有它能在运行时切。</p>
+<code class="docutils literal notranslate"><span class="pre">auto</span></code>（默认）两族都编，按 dispatch 传入的 <code class="docutils literal notranslate"><span class="pre">max_num_inp_token_across_ranks</span></code> 在
+<code class="docutils literal notranslate"><span class="pre">internode_auto_ll_max_tokens</span></code>（默认 512）处切换，没传就走 <code class="docutils literal notranslate"><span class="pre">v2</span></code>，也只有它能在运行时切。
+<code class="docutils literal notranslate"><span class="pre">low_latency=True</span></code> / <code class="docutils literal notranslate"><span class="pre">False</span></code> 等同于 <code class="docutils literal notranslate"><span class="pre">v2_ll</span></code> / <code class="docutils literal notranslate"><span class="pre">v2</span></code>。</p>
 </section>
 <section id="id11">
 <h2>10. 测试<a class="headerlink" href="#id11" title="Link to this heading"></a></h2>
