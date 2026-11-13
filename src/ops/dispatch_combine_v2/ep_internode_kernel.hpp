@@ -381,8 +381,33 @@ namespace internode {
 // the same instruction as the row atomic of lane 0 (or of the PE's representative lane).
 //
 // The moe_sort region holds kEpr counters, one per 128 B line so that different experts do not
-// queue on one line at the owner, then kEpr buckets of MaxNumTokensToRecv entries.
+// queue on one line at the owner; a 128 B line of per-same-node-PE dispatch epochs; then kEpr
+// buckets of MaxNumTokensToRecv entries.
 constexpr int kMoeSortCountStride = 128 / sizeof(ep_index_t);
+constexpr int kMoeSortMaxGpuPerNode = 128 / sizeof(uint64_t);
+
+// Slot `localPe` holds how many dispatches that same-node PE has started. One that has started
+// this dispatch no longer reads this PE's combine input -- the expert output, which this dispatch
+// zeroes -- whether or not it ran a combine in between.
+template <int kEpr>
+inline __device__ uint64_t* MoeSortStarted(uint8_t* region) {
+  return reinterpret_cast<uint64_t*>(region + kEpr * 128);
+}
+
+// At the start of a moeSort dispatch: tell the same-node PEs this one has started it.
+template <EpInterNodeKernelCfg kConfig, typename T>
+inline __device__ void MoeSortAnnounce(EpDispatchCombineArgs& args) {
+  DEF_COMMON_VARS;
+  static_assert(kConfig.gpuPerNode <= kMoeSortMaxGpuPerNode, "one epoch slot per same-node PE");
+  if (globalThdId >= config.gpuPerNode) return;
+  // This dispatch bumps the count only in its DispatchSync.
+  const uint64_t started = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag) + 1;
+  uint64_t* slot = MoeSortStarted<kConfig.numExpertPerRank>(
+                       args.reg(args.offMoeSort)
+                           ->template GetAs<uint8_t*>(myNode * config.gpuPerNode + globalThdId)) +
+                   myPe % config.gpuPerNode;
+  core::AtomicStoreRelaxedSystem(slot, started);
+}
 
 template <EpInterNodeKernelCfg kConfig>
 inline __device__ int MoeSortSlot(int laneId) {
@@ -393,7 +418,7 @@ inline __device__ int MoeSortSlot(int laneId) {
 
 template <EpInterNodeKernelCfg kConfig>
 inline __device__ int2* MoeSortBuckets(uint8_t* region) {
-  return reinterpret_cast<int2*>(region + kConfig.numExpertPerRank * 128);
+  return reinterpret_cast<int2*>(region + kConfig.numExpertPerRank * 128 + 128);
 }
 
 // What a lane needs to bucket one expert slot, loaded before the row atomic so that the atomic is
@@ -534,13 +559,21 @@ inline __device__ void MoeSortGather(EpDispatchCombineArgs& args, int recvRows,
   }
 }
 
-// moeSort with zeroing: the intra-node blocks clear the rows of the expert output the last FC2
-// accumulated into (sortZeroState[0], set by MoeSortLayout) while the inter-node leg is still
-// in flight. The buffer is this rank's own; no peer reads it, and the previous combine has
-// already copied it out.
+// moeSort with zeroing: the intra-node blocks clear the rows of the combine input the last FC2
+// accumulated into (sortZeroState[0], set by MoeSortLayout) while the inter-node leg is still in
+// flight -- once every same-node PE has started this dispatch (MoeSortAnnounce) and so has
+// stopped reading them.
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void MoeSortZeroRows(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
+  if (thdId < config.gpuPerNode) {
+    const uint64_t started = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag) + 1;
+    const uint64_t* slots = MoeSortStarted<kConfig.numExpertPerRank>(
+        args.reg(args.offMoeSort)->template GetAs<uint8_t*>());
+    while (core::AtomicLoadRelaxedSystem(slots + thdId) != started) {
+    }
+  }
+  __syncthreads();
   const size_t rowBytes = static_cast<size_t>(args.sortZeroRowBytes);
   const int rowNum = min(args.sortZeroState[0], config.MaxNumTokensToRecv());
   const size_t vecs = static_cast<size_t>(rowNum) * rowBytes / sizeof(uint4);
@@ -1358,6 +1391,7 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchInterNodeV2_body(EpDispatchCombineArgs args,
                                            const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
+  if constexpr (kConfig.moeSort) internode::MoeSortAnnounce<kConfig, T>(args);
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeSend<kConfig, T>(args, comm);
     internode::DispatchInterNodeRecv<kConfig, T>(args);
@@ -1416,6 +1450,7 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchInterNodeV2LL_body(EpDispatchCombineArgs args,
                                              const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
+  if constexpr (kConfig.moeSort) internode::MoeSortAnnounce<kConfig, T>(args);
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeLLSend<kConfig, T>(args, comm);
     constexpr EpInterNodeDeviceCfg kCfg = EpInterNodeDeviceCfgOf(kConfig);

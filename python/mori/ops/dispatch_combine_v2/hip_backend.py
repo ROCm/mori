@@ -793,7 +793,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # more expert than the world has for a trailing mask sentinel).
         bm = cfg.moe_sort_block_m
         self.moe_sort_tables = None
-        self.moe_sort_out = None
         if bm:
             rows = (
                 cfg.effective_max_recv * topk
@@ -806,14 +805,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 torch.empty(rows // bm, **i32),
                 torch.zeros(2, **i32),
             )
-            # The expert output fused_moe accumulates into. Dispatch zeroes the rows
-            # the previous one used; combine copies it in like any other input.
-            self.moe_sort_out = torch.zeros(
-                cfg.effective_max_recv,
-                cfg.hidden_dim,
-                dtype=cfg.combine_dtype,
-                device=dev,
-            )
+            # Rows of the combine input the last FC2 accumulated into; dispatch
+            # zeroes them (the combine input is fused_moe's output here).
             self.moe_sort_zero_rows = torch.zeros(1, **i32)
 
         # Pin everything fixed for the op's lifetime, now that every buffer it
@@ -872,6 +865,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 )
             if cfg.effective_max_recv >= 1 << 24:
                 bad.append("moe_sort_block_m with 2^24 or more receive rows")
+            if cfg.gpu_per_node > 16:
+                bad.append("moe_sort_block_m with more than 16 GPUs per node")
             # The finalize reads one expert's counter per lane.
             if cfg.num_experts_per_rank > WAVE:
                 bad.append(
@@ -1369,7 +1364,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             sortedExpertIds=expert_ids.data_ptr(),
             sortNumValid=num_valid.data_ptr(),
             sortZeroState=self.moe_sort_zero_rows.data_ptr(),
-            sortZeroOut=self.moe_sort_out.data_ptr(),
+            sortZeroOut=self.arena.local_ptr(self._region("out_tok")),
         )
 
     def moe_sort(self, num_rows=None, num_experts=None):
@@ -1380,8 +1375,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         topk_ids of `num_rows` rows (default: every receive row) and an expert
         mask of `num_experts` entries (default: world_size * experts per rank).
         sorted_expert_ids holds local expert ids, as with expert_mask, and
-        num_valid_ids[1] is the received row count. moe_buf is zero in every row
-        fused_moe can write; pass it as fused_moe's output and then to combine().
+        num_valid_ids[1] is the received row count. moe_buf is combine_in_view(),
+        zero in every row fused_moe can write: pass it as fused_moe's output and
+        then to combine(), which then has nothing to copy.
         """
         if getattr(self, "moe_sort_tables", None) is None:
             raise RuntimeError("moe_sort() needs moe_sort_block_m > 0")
@@ -1397,17 +1393,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         rows = m * topk + e * bm - topk
         rows = (rows + bm - 1) // bm * bm
         ids, weights, expert_ids, num_valid = self.moe_sort_tables
-        if rows > ids.numel() or m > self.moe_sort_out.shape[0]:
+        moe_buf = self.combine_in_view()
+        if rows > ids.numel() or m > moe_buf.shape[0]:
             raise ValueError(
                 f"moe_sort(num_rows={m}, num_experts={e}) exceeds the tables "
-                f"allocated for {self.moe_sort_out.shape[0]} rows"
+                f"allocated for {moe_buf.shape[0]} rows"
             )
         return (
             ids[:rows],
             weights[:rows],
             expert_ids[: rows // bm],
             num_valid,
-            self.moe_sort_out[:m],
+            moe_buf[:m],
         )
 
     # -- AsyncLL ---------------------------------------------------------

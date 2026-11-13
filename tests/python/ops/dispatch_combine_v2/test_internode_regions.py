@@ -182,12 +182,12 @@ def test_gpu_per_node_must_divide_the_world():
 
 @pytest.mark.parametrize("name", sorted(_CASES))
 def test_moe_sort_holds_a_counter_line_and_a_full_bucket_per_expert(name):
-    # MoeSortBuckets: kEpr 128 B counter lines, then kEpr buckets of MaxNumTokensToRecv
-    # 8 B entries -- an expert receives a token at most once.
+    # MoeSortBuckets: kEpr 128 B counter lines and one line of dispatch epochs, then
+    # kEpr buckets of MaxNumTokensToRecv 8 B entries -- an expert receives a token once.
     cfg = _CASES[name]
     regions = dict(internode_regions(cfg))
     assert ("moe_sort" in regions) == bool(cfg.moe_sort_block_m)
     if cfg.moe_sort_block_m:
         epr = cfg.num_experts_per_rank
         recv = cfg.world_size * cfg.max_num_inp_token_per_rank
-        assert regions["moe_sort"] == epr * 128 + epr * recv * 8
+        assert regions["moe_sort"] == epr * 128 + 128 + epr * recv * 8

@@ -154,11 +154,14 @@ def internode_regions(cfg):
     if scale_bytes:
         regions.append(("out_scales", max_tokens_to_recv * scale_bytes))
 
-    # moe_sort_block_m: per local expert, a counter on its own 128 B line, then a
-    # bucket of (sorted id, weight) entries; an expert gets a received token once.
+    # moe_sort_block_m: per local expert, a counter on its own 128 B line; one
+    # line of per-same-node-PE dispatch epochs; then per local expert a bucket of
+    # (sorted id, weight) entries -- an expert gets a received token once.
     if getattr(cfg, "moe_sort_block_m", 0):
         epr = cfg.num_experts_per_rank
-        regions.append(("moe_sort", epr * 128 + epr * max_tokens_to_recv * 2 * _I32))
+        regions.append(
+            ("moe_sort", epr * 128 + 128 + epr * max_tokens_to_recv * 2 * _I32)
+        )
 
     return regions
 

@@ -180,8 +180,8 @@ class EpDispatchCombineConfig:
     internode_auto_ll_max_tokens: int = 512
     # Internode only (hip backend, v2 / v2_ll): dispatch also writes aiter's
     # moe_sorting tables for this rank's experts, with block_size_M equal to this
-    # value (0 = off), and keeps a zeroed expert-output buffer for fused_moe to
-    # accumulate into. op.moe_sort() returns both; dispatch must carry weights.
+    # value (0 = off), and zeroes the combine input for fused_moe to accumulate
+    # into. op.moe_sort() returns both; dispatch must carry weights.
     moe_sort_block_m: int = 0
     # Which kernel backend serves this op: "flydsl" (default except on gfx125x,
     # full intranode feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
