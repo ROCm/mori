@@ -54,6 +54,7 @@ FlyDSL is not installed.
 from __future__ import annotations
 
 import collections
+import dataclasses
 import functools
 import logging
 import os
@@ -66,10 +67,22 @@ from mori.tensor_utils import from_gpu_ptr
 from . import ep_plans as cb
 from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
-from .internode_regions import asyncll_regions, internode_regions
+from .internode_regions import (
+    asyncll_regions,
+    asyncll_seg_layout,
+    asyncll_seg_words,
+    internode_regions,
+)
 from .symm_arena import SymmArena
 
 logger = logging.getLogger(__name__)
+
+# segment_error_flags() bits.
+SEGMENT_ERR_OVERFLOW = 1
+SEGMENT_ERR_MISMATCH = 2
+# EpInterNodeArgs.segStride bit 63: the op has the segmented layout, so compact
+# rounds on it still exchange the mode word (asyncll::kSegCapableBit).
+SEG_CAPABLE_BIT = 1 << 63
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
 # after its own EpArgs fields (offTokOff -> "tokOff"); the region names match the
@@ -391,6 +404,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # them per call -- torch.as_tensor + view showed up in the host profile at
         # ~27us a round, on a path where the host already paces the GPU.
         self._views = {}
+        # This round's segmented stride, 0 for the compact layout (see
+        # _set_segment_stride). Combine and the views follow the last dispatch.
+        self._seg_stride = 0
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._arch = _arch.split(":")[0]
@@ -404,6 +420,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._ll128_split = lay if split else None
         self._ll_recv_cap = cfg.world_size * lay["max_tok"] if split else 0
         self._ll_last = False
+
+        # "auto" resolves before the gate and the arena, from the config alone,
+        # so every rank reaches the same answer; the regions depend on it.
+        if cfg.async_ll_recv_layout == "auto":
+            supported = not self._asyncll_segmented_unsupported(cfg)
+            cfg = dataclasses.replace(
+                cfg, async_ll_recv_layout="segmented" if supported else "compact"
+            )
+            self.cfg = cfg
 
         # Gate FIRST: rejecting a config after taking a symmetric window would
         # leak it (the arena is registered with the communicator), and the whole
@@ -1028,6 +1053,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 "it and every AsyncLL transfer would be a no-op (or use "
                 "async_ll_transport='lsa', which needs no engine)"
             )
+        if cfg.async_ll_segmented:
+            bad.extend(self._asyncll_segmented_unsupported(cfg))
         return tuple(bad)
 
     def _plan_requests(self, cfg):
@@ -1091,6 +1118,38 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ),
             dict(comb, **ll, block_num=comb_b, warp_per_block=comb_w),
         )
+
+    def _asyncll_segmented_unsupported(self, cfg) -> list[str]:
+        bad = []
+        if cfg.async_ll_transport != "sdma" or cfg.nodes > 1:
+            bad.append(
+                "async_ll_recv_layout='segmented' needs async_ll_transport='sdma' on one node: its "
+                "transfer posts one SDMA packet per field to each peer"
+            )
+        if cfg.world_size < 2:
+            bad.append(
+                "async_ll_recv_layout='segmented' needs world_size >= 2: an empty row points at "
+                "another rank's expert"
+            )
+        if cfg.world_size > 64:
+            bad.append(
+                "async_ll_recv_layout='segmented' supports world_size <= 64: the receive "
+                "finalize stages one count per source in a 64-entry LDS array"
+            )
+        if (cfg.scale_dim * cfg.scale_type_size) % 4:
+            bad.append(
+                "async_ll_recv_layout='segmented' needs a whole number of dwords per scale row"
+            )
+        try:
+            mode, _ = self._asyncll_options(cfg, self._arch)
+        except ValueError:
+            mode = 0  # reported when the kernels are built
+        if mode == 2:
+            bad.append(
+                "async_ll_recv_layout='segmented' with MORI_ASYNCLL_FUSED_RECV=1: the segmented "
+                "receive keeps the separate RecvTransfer"
+            )
+        return bad
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
@@ -1311,6 +1370,24 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         "dispatch_sendcopy_lsa",
     )
 
+    # Segmented rounds (async_ll_recv_layout, SDMA only): the expert reads the
+    # landing segments, so dispatch's RecvCopy becomes a finalize pass, and the
+    # segmented expert output is sent in place, so combine has no SendCopy.
+    _ASYNCLL_SEG_SEQ = {
+        "dispatch_send": (
+            "dispatch_slotassign",
+            "dispatch_sendcopy_seg",
+            "dispatch_sendtransfer_seg",
+        ),
+        "dispatch_recv": ("dispatch_recvtransfer", "dispatch_recvfinalize_seg"),
+        "combine_send": ("combine_sendtransfer_seg",),
+        "combine_recv": ("combine_recvtransfer", "combine_recvcopy_seg"),
+    }
+
+    @classmethod
+    def _asyncll_seg_seq(cls):
+        return dict(cls._ASYNCLL_SEG_SEQ)
+
     @staticmethod
     def _asyncll_options(cfg, arch):
         # Resolve once per op. Shared copy passes also serve LSA, so topology
@@ -1437,12 +1514,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._asyncll_mode, self._device_index, self._multi_processor_count
         )
         sequences = self._asyncll_seq(cfg, self._asyncll_mode)
-        for group, names in sequences.items():
+        seg_sequences = self._asyncll_seg_seq() if cfg.async_ll_segmented else {}
+        for group, names in [*sequences.items(), *seg_sequences.items()]:
             for name in names:
+                if name in plans_by_pass:
+                    continue
                 request = self._asyncll_request(
                     cfg, leg_dtype[self._asyncll_leg(group)], block_num, warp_per_block
                 )
-                plan = cb.EP_ASYNCLL_PLANS[name](**request)
+                plan = cb.asyncll_plan(name)(**request)
                 # Neither varies for AsyncLL: there is one geometry per op, and
                 # this backend has no replay path. Bound rather than passed so the
                 # value is written into the plan's struct once instead of per
@@ -1454,6 +1534,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             group: plan_api.make_launch_group([plans_by_pass[n] for n in names])
             for group, names in sequences.items()
         }
+        self._asyncll_groups_seg = {
+            group: plan_api.make_launch_group([plans_by_pass[n] for n in names])
+            for group, names in seg_sequences.items()
+        }
+        self._seg_layout = asyncll_seg_layout(cfg) if cfg.async_ll_segmented else None
 
         # AsyncLL compiles one geometry -- its specs derive each pass's grid from
         # mpCount and worldSize, so (block, warp) only sets the block width.
@@ -1497,6 +1582,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         def run(*, input, num_tokens, dest_map, **kwargs):
             phase = "dispatch" if groups[0].startswith("dispatch") else "combine"
+            stride = self._seg_stride
+            if stride and "combine_send" in groups:
+                input = self._seg_combine_input(input, stride)
             if phase == "dispatch":
                 if groups[0] == "dispatch_recv":
                     # dispatch_recv() launches this half with only input/dest_map/
@@ -1558,9 +1646,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     else 0
                 ),
             )
+            if self.cfg.async_ll_segmented:
+                # Bit 63 marks a segmented-capable op, so compact rounds on it
+                # still exchange the mode word (asyncll::SegModeWord).
+                args["segStride"] = SEG_CAPABLE_BIT | stride
+            table = self._asyncll_groups_seg if stride else self._asyncll_groups
             stream = _raw_stream(self._device_index)
             for group in groups:
-                self._asyncll_groups[group].launch(stream, **args)
+                table[group].launch(stream, **args)
 
         return run
 
@@ -1573,6 +1666,111 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             rows.append(row)
             lower = row.max_tokens if row.max_tokens is not None else lower
         return rows
+
+    def _set_segment_stride(self, stride, num_tokens):
+        if not stride:
+            self._seg_stride = 0
+            return
+        cfg = self.cfg
+        if not cfg.async_ll_segmented:
+            raise ValueError(
+                "segment_stride needs an op built with async_ll_recv_layout='segmented'"
+            )
+        # Only the receive cap is checked here. It is the same on every rank, so a
+        # stride past it fails on every rank before any of them launches -- as long
+        # as S itself is the same on every rank, which the contract requires: compute
+        # it from values every rank shares (e.g. the max token count after the DP
+        # all-gather). A rank that alone passes a stride past the cap raises here
+        # while the others enter the round and wait for it. The
+        # field blocks are sized by max_num_inp_token_per_rank rows per source and
+        # the reverse map and the expert output by effective_max_recv_per_rank,
+        # which is at most that, so the cap is the binding bound.
+        #
+        # A stride below this rank's token count is NOT refused: the other ranks
+        # would launch the round and wait in the receive forever. The send pass
+        # drops the rows past the stride instead and counts the round as an
+        # overflow (segment_error_counts()), so the caller sees a wrong round, not
+        # a hang.
+        cap = cfg.effective_max_recv_per_rank
+        if not 0 < stride <= cap:
+            raise ValueError(
+                f"segment_stride={stride} must be positive and within the per-source "
+                f"receive cap {cap}"
+            )
+        self._seg_stride = int(stride)
+
+    def _seg_combine_input(self, input, stride):
+        """The expert output a segmented combine sends: world_size * stride rows
+        in the dispatch's segment layout, sent from the arena view."""
+        rows = self.cfg.world_size * stride
+        if input.shape[0] != rows:
+            raise ValueError(
+                f"a segmented combine takes the segmented expert output: "
+                f"{rows} rows (world_size x stride {stride}), got {input.shape[0]}"
+            )
+        view = self.combine_in_view()
+        if input.data_ptr() != view.data_ptr():
+            view.copy_(input)
+        return view
+
+    def _seg_words_view(self, key, first, n):
+        view = self._views.get(key)
+        if view is None:
+            ptr = self.arena.local_ptr("send_count") + first * 8
+            view = from_gpu_ptr(ptr, (n,), torch.int64)
+            self._views[key] = view
+        return view
+
+    def segment_error_counts(self):
+        """(overflow, mismatch): cumulative counts of each segmented-layout error on
+        this rank since the op was built or last reset(), counted per peer and
+        round.
+
+        overflow: a segmented round where this rank had more rows for a peer than
+        the stride, i.e. it was called with segment_stride below its own token
+        count. The rows past the stride were dropped. Only the rank that dropped
+        rows counts it; its peers see a short segment and count nothing. mismatch: a
+        peer's round, segmented or compact, did not use this rank's mode and stride,
+        so rows were read at the wrong offsets. Every rank counts that.
+
+        So the counts, and segment_error_flags(), differ between ranks: reduce them
+        across ranks (e.g. an all-reduce max) before acting on them, such as
+        falling back to compact, or the ranks diverge in the next round.
+
+        Use this for totals (e.g. a periodic health check that diffs two reads);
+        segment_error_flags() answers "anything new since I last looked". Reads
+        device memory, so it synchronizes."""
+        if not self.cfg.async_ll_segmented:
+            return (0, 0)
+        first = asyncll_seg_words(self.cfg.world_size)["errors"]
+        overflow, mismatch = self._seg_words_view("seg_errors", first, 2).tolist()
+        return (int(overflow), int(mismatch))
+
+    def segment_error_flags(self, clear=False):
+        """Error bits since the last clear, 0 when none: SEGMENT_ERR_OVERFLOW (1)
+        and SEGMENT_ERR_MISMATCH (2), see segment_error_counts(). clear=True
+        moves the baseline to now. The device only ever adds to the counters, so
+        nothing set while this runs is lost. Synchronizes."""
+        counts = self.segment_error_counts()
+        base = getattr(self, "_seg_error_base", (0, 0))
+        flags = 0
+        if counts[0] > base[0]:
+            flags |= SEGMENT_ERR_OVERFLOW
+        if counts[1] > base[1]:
+            flags |= SEGMENT_ERR_MISMATCH
+        if clear:
+            self._seg_error_base = counts
+        return flags
+
+    def segment_counts(self):
+        """Device int64 [world_size]: n_s, the rows source s sent this rank in the
+        last segmented round (valid rows [s * S, s * S + n_s) of the recv views).
+        Meaningful after dispatch_recv() of a segmented round; None on an op
+        without the segmented layout."""
+        if not self.cfg.async_ll_segmented:
+            return None
+        first = asyncll_seg_words(self.cfg.world_size)["counts"]
+        return self._seg_words_view("seg_counts", first, self.cfg.world_size)
 
     def _build_internode_kernels(self, cfg) -> KernelSet:
         from mori.jit.v2 import plan_api
@@ -1852,6 +2050,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._recv.zero_()
         if self._ll_recv is not None:
             self._ll_recv.zero_()
+        # The arena zero above also cleared the segment error counters, so the
+        # segment_error_flags() baseline restarts with them.
+        self._seg_error_base = (0, 0)
 
     def _close_backend(self):
         for plan in getattr(self, "_plans", ()):
@@ -1902,7 +2103,25 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return "ll_" + name, self._ll_recv_cap
         return self._region(name), self._recv_cap
 
+    def _seg_view(self, key, region, offset, cols, dtype, per_source=None):
+        """Rows [0, world_size * stride) of a segmented field block of
+        per_source rows per source (default max_num_inp_token_per_rank)."""
+        view = self._views.get(key)
+        if view is None:
+            per_source = per_source or self.cfg.max_num_inp_token_per_rank
+            rows = self.cfg.world_size * per_source
+            ptr = self.arena.local_ptr(region) + offset
+            view = from_gpu_ptr(ptr, (rows, cols), dtype)
+            self._views[key] = view
+        return view[: self.cfg.world_size * self._seg_stride]
+
     def recv_tokens(self):
+        if self._seg_stride:
+            offset, cols = self._seg_layout["hidden"], self.cfg.hidden_dim
+            dtype = self.cfg.dispatch_dtype
+            return self._seg_view(
+                "seg_tokens", "inter_dispatch_inp", offset, cols, dtype
+            )
         key = "ll_recv_tokens" if self._ll_last else "recv_tokens"
         view = self._views.get(key)
         if view is not None:
@@ -1917,6 +2136,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def combine_in_view(self):
+        if self._seg_stride:
+            cols, dtype = self.cfg.hidden_dim, self.cfg.combine_dtype
+            # inter_dispatch_staging holds effective_max_recv_per_rank rows per
+            # source, the same as on a compact op (internode_regions.py).
+            return self._seg_view(
+                "seg_combine_in",
+                "inter_dispatch_staging",
+                0,
+                cols,
+                dtype,
+                per_source=self.cfg.effective_max_recv_per_rank,
+            )
         view = self._views.get("combine_in")
         if view is None:
             view = from_gpu_ptr(
@@ -1928,6 +2159,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def recv_weights(self):
+        if self._seg_stride:
+            offset, topk = self._seg_layout["weight"], self.cfg.num_experts_per_token
+            region = "inter_dispatch_inp"
+            return self._seg_view("seg_weights", region, offset, topk, torch.float32)
         key = "ll_recv_weights" if self._ll_last else "recv_weights"
         view = self._views.get(key)
         if view is None:
@@ -1941,6 +2176,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def recv_indices(self):
+        if self._seg_stride:
+            offset, topk = self._seg_layout["index"], self.cfg.num_experts_per_token
+            region = "inter_dispatch_inp"
+            return self._seg_view("seg_indices", region, offset, topk, torch.int32)
         key = "ll_recv_indices" if self._ll_last else "recv_indices"
         view = self._views.get(key)
         if view is None:
@@ -1962,13 +2201,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         path, packed on the internode one. Anything reading the region by pointer
         needs that pitch, not this shape.
         """
+        n_i32 = self._scale_i32(self.cfg)
+        if not n_i32:
+            return None
+        if self._seg_stride:
+            # Packed rows, a whole number of dwords (the segmented gate checks).
+            offset = self._seg_layout["scale"]
+            region = "inter_dispatch_inp"
+            return self._seg_view("seg_scales", region, offset, n_i32, torch.int32)
         key = "ll_recv_scales" if self._ll_last else "recv_scales"
         view = self._views.get(key)
         if view is not None:
             return view
-        n_i32 = self._scale_i32(self.cfg)
-        if not n_i32:
-            return None
         stride_i32 = self.scale_stride_bytes() // 4
         region, n = self._recv_region("out_scales")
         rows = from_gpu_ptr(
