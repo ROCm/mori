@@ -176,21 +176,23 @@ _DISPATCH_TABLE: dict = {
             "fp4": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
         },
         # hidden 5120 (DeepSeek-V4.1-Flash), topk 6, 96 experts a rank. Swept 64-256 blocks x
-        # 4-16 warps for each dispatch dtype; 256x4 up to 1024 tokens and 256x8 above win for all
-        # three, within 3% of the best point everywhere. Graph us, median of 3 rounds:
-        #   ct     bf16 128x8  256x4/8   fp8 64x16  256x4/8   fp4 64x16  256x4/8
-        #   64          24.6     18.8         24.9     19.4         25.8     19.5
-        #   512         27.2     26.0         26.4     22.8         32.3     21.2
-        #   2048        56.0     53.5         46.8     37.4         45.3     29.2
-        #   8192       169.3    163.6        107.8    101.5         99.4     69.9
-        #   16384      322.5    316.2        198.5    200.2        180.8    136.1
+        # 4-16 warps for each dispatch dtype. Graph us, median of 3 rounds, these rows against
+        # 128x8 for bf16 and the 64x16 default for fp8 / fp4:
+        #   ct     bf16 128x8   rows   fp8 64x16   rows   fp4 64x16   rows
+        #   64          24.8    18.8        24.8   19.4        25.8   19.4
+        #   512         27.2    26.2        26.3   23.4        32.1   22.0
+        #   2048        55.9    52.9        46.7   37.5        45.5   29.6
+        #   8192       169.0   165.2       107.8  100.9       100.1   69.2
+        #   16384      321.8   308.8       197.9  195.9       180.4  132.6
         (4, 5120, 6, 96): {
-            None: ((1024, 256, 4), (None, 256, 8)),
+            None: ((256, 64, 4), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
+            "bf16": ((256, 64, 4), (512, 128, 4), (2048, 256, 4), (None, 128, 16)),
         },
-        # Its 128-expert topk-3 draft MoE (32 experts a rank): the same rows win (bf16 / fp8 / fp4
-        # at 2048 tokens: 43.7 / 31.5 / 26.1 against 47.3 / 42.6 / 41.4 for 128x8 / 64x16 / 64x16).
+        # Its 128-expert topk-3 draft MoE (32 experts a rank) takes the same rows: at 2048 tokens
+        # bf16 / fp8 / fp4 run 43.0 / 31.6 / 26.1 against 47.1 / 42.5 / 41.2.
         (4, 5120, 3, 32): {
-            None: ((1024, 256, 4), (None, 256, 8)),
+            None: ((256, 64, 4), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
+            "bf16": ((256, 64, 4), (512, 128, 4), (2048, 256, 4), (None, 128, 16)),
         },
         # EP8 on two 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-03; the grid stays at 64 blocks
         # (the rest of the CUs belong to the co-resident GEMM). What wins is one token a warp:
@@ -267,10 +269,6 @@ _DISPATCH_TABLE: dict = {
                 (None, 128, 16),
             ),
         },
-        # hidden 5120 (both MoEs of DeepSeek-V4.1-Flash): the gfx1250 rows capped at 128 blocks.
-        # On rev-1 parts 128x4 is within 3% of 256x4 up to 512 tokens; not timed on these parts.
-        (4, 5120, 6, 96): {None: ((512, 128, 4), (None, 128, 8))},
-        (4, 5120, 3, 32): {None: ((512, 128, 4), (None, 128, 8))},
         (4, 7168, 9, None): {
             None: ((4096, 64, 8), (None, 64, 16)),
             "fp8": ((256, 64, 8), (1024, 64, 16), (1536, 64, 24), (None, 64, 32)),
@@ -318,23 +316,22 @@ _COMBINE_TABLE: dict = {
             (1024, 256, 8),
             (None, 192, 8),
         ),
-        # hidden 5120, both MoEs: 64x8 up to 128 tokens, then 256x4. Graph us, median of 3
-        # rounds, topk 6; at topk 3, 256x4 is within 6% of the best point above 128 tokens:
-        #   ct      64x8   128x8  128x16  256x4
-        #   128     13.6   15.0   15.2    14.9
-        #   512     24.4   21.4   20.9    21.2
-        #   2048    65.5   49.1   50.7    48.5
-        #   8192   228.8  163.8  189.7   165.5
-        (4, 5120, 6, 96): ((128, 64, 8), (None, 256, 4)),
-        (4, 5120, 3, 32): ((128, 64, 8), (None, 256, 4)),
+        # hidden 5120: 64x8 up to 128 tokens, then 128x8; topk 3 moves to 256x4 past 512 tokens,
+        # where it leads the 128-block grids by 4-10% up to 4096 (128x16 is 6% ahead at 8192).
+        # Graph us, median of 3 rounds, topk 6 | topk 3:
+        #   ct     64x8  128x8 128x16  256x4 |  64x8  128x8 128x16  256x4
+        #   128    13.6   15.0   15.2   14.9 |  13.0   13.9   14.5   13.8
+        #   512    24.4   21.4   20.9   21.2 |  23.0   19.5   18.9   19.4
+        #   2048   65.5   49.1   50.7   48.5 |  54.7   42.8   40.5   39.1
+        #   8192  228.8  163.8  189.7  165.5 | 172.1  131.0  124.4  131.5
+        (4, 5120, 6, 96): ((128, 64, 8), (None, 128, 8)),
+        (4, 5120, 3, 32): ((128, 64, 8), (512, 128, 8), (None, 256, 4)),
     },
     # The gfx1250-strict parts, as their dispatch rows.
     "gfx1250-strict": {
         (4, 7168, 8, None): ((128, 64, 4), (512, 128, 8), (None, 64, 8)),
         (4, 7168, 9, None): ((128, 64, 4), (256, 128, 8), (None, 64, 8)),
         (4, 7168, 6, None): ((128, 64, 4), (256, 128, 8), (None, 64, 8)),
-        (4, 5120, 6, 96): ((128, 64, 8), (None, 128, 8)),
-        (4, 5120, 3, 32): ((128, 64, 8), (None, 128, 8)),
     },
 }
 

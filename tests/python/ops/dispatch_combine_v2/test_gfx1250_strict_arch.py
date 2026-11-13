@@ -25,7 +25,6 @@ import os
 import re
 import subprocess
 import unittest
-from itertools import product
 from pathlib import Path
 from unittest.mock import patch
 
@@ -116,23 +115,48 @@ class TuningKeyTest(unittest.TestCase):
         self.assertEqual(rev0, self.lookup(self.REV1, {}, shape))
         self.assertIsNotNone(rev0["schedule"])
 
-    def test_ep4_hidden5120_avoids_the_16_warp_dispatch(self):
-        # The 64x16 single-shot dispatch never completes at hidden 5120.
-        want = {(256, 4, 64, 8), (256, 4, 256, 4), (256, 8, 256, 4)}
-        for (topk, epr), dtype in product(((6, 96), (3, 32)), ("bf16", "fp8", "fp4")):
+    def test_ep4_hidden5120_rows(self):
+        # (bound, dispatch block, warp, combine block, warp), both DeepSeek-V4.1-Flash MoEs.
+        topk6_quant = (
+            (128, 64, 4, 64, 8),
+            (256, 64, 4, 128, 8),
+            (512, 64, 8, 128, 8),
+            (1024, 128, 8, 128, 8),
+            (None, 256, 8, 128, 8),
+        )
+        topk3_quant = (
+            (128, 64, 4, 64, 8),
+            (256, 64, 4, 128, 8),
+            (512, 64, 8, 128, 8),
+            (1024, 128, 8, 256, 4),
+            (None, 256, 8, 256, 4),
+        )
+        want = {
+            (6, 96, "bf16"): (
+                (128, 64, 4, 64, 8),
+                (256, 64, 4, 128, 8),
+                (512, 128, 4, 128, 8),
+                (2048, 256, 4, 128, 8),
+                (None, 128, 16, 128, 8),
+            ),
+            (6, 96, "fp8"): topk6_quant,
+            (6, 96, "fp4"): topk6_quant,
+            (3, 32, "bf16"): (
+                (128, 64, 4, 64, 8),
+                (256, 64, 4, 128, 8),
+                (512, 128, 4, 128, 8),
+                (2048, 256, 4, 256, 4),
+                (None, 128, 16, 256, 4),
+            ),
+            (3, 32, "fp8"): topk3_quant,
+            (3, 32, "fp4"): topk3_quant,
+        }
+        for (topk, epr, dtype), schedule in want.items():
             t = self.lookup(
                 self.REV1, {}, (4, 5120, topk), dtype=dtype, experts_per_rank=epr
             )
             with self.subTest(topk=topk, dtype=dtype):
-                self.assertEqual(
-                    {(b[1], b[2], b[3], b[4]) for b in t["schedule"]}, want
-                )
-
-    def test_ep4_hidden5120_rev0_stays_within_its_cus(self):
-        for topk, epr in ((6, 96), (3, 32)):
-            t = self.lookup(self.REV0, {}, (4, 5120, topk), experts_per_rank=epr)
-            with self.subTest(topk=topk):
-                self.assertLessEqual(max(max(b[1], b[3]) for b in t["schedule"]), 128)
+                self.assertEqual(tuple(map(tuple, t["schedule"])), schedule)
 
     def test_rev0_row_wins(self):
         row = {"gfx1250-strict": {self.SHAPE + (None,): {None: ((None, 32, 4),)}}}
