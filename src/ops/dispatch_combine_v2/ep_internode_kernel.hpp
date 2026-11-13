@@ -281,21 +281,24 @@ __device__ __forceinline__ void EpInterNodeCountSignal(const ::mori::cco::ccoDev
   }
 }
 
-// A v2_ll dispatch chunk goes out as one piece per QP, each of at least kDispatchPieceMinTokens
-// tokens. The piece count comes from numQpToDrain, the op's largest active count, so sender and
-// receiver agree on it whatever counts their buckets picked. The chunk flag follows piece 0 and
-// still carries the chunk's token count; each later piece writes its own flag, after the chunk
-// flags, with the dispatch's number + 1, so it never needs clearing.
+// Atomic-free v2_ll dispatch sends a chunk of at least 2 * kDispatchPieceMinTokens tokens as one
+// piece per QP. The piece count comes from numQpToDrain, the op's largest active count, so sender
+// and receiver agree on it whatever counts their buckets picked. The chunk flag follows piece 0
+// and still carries the chunk's token count; each later piece writes its own flag with the
+// dispatch's number + 1, after the chunk flags, so it never needs clearing. Those flags are
+// WRITEs, which only the atomic-free path may use (it refuses relaxed ordering); with atomics a
+// chunk stays one piece behind its fused atomic.
 constexpr int kMaxDispatchPieces = 4;
 constexpr int kDispatchPieceMinTokens = 32;
 
 template <EpInterNodeKernelCfg kConfig>
 __device__ __forceinline__ int EpInterNodeDispatchPieceTokens(int chunkTokens) {
-  constexpr int kPieces = kConfig.numQpToDrain < 1                    ? 1
-                          : kConfig.numQpToDrain > kMaxDispatchPieces ? kMaxDispatchPieces
-                                                                      : kConfig.numQpToDrain;
-  const int perPiece = (chunkTokens + kPieces - 1) / kPieces;
-  return perPiece > kDispatchPieceMinTokens ? perPiece : kDispatchPieceMinTokens;
+  constexpr int kPieces = !kConfig.noRdmaAtomics || kConfig.numQpToDrain < 1 ? 1
+                          : kConfig.numQpToDrain > kMaxDispatchPieces        ? kMaxDispatchPieces
+                                                                             : kConfig.numQpToDrain;
+  int pieces = chunkTokens / kDispatchPieceMinTokens;
+  pieces = pieces < 1 ? 1 : (pieces > kPieces ? kPieces : pieces);
+  return (chunkTokens + pieces - 1) / pieces;
 }
 
 __device__ __forceinline__ size_t EpInterNodePieceFlagSlot(int nNodes, int maxChunkNum, int node,
