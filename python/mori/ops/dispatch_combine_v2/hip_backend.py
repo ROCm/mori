@@ -1983,7 +1983,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                         plans[key] = plan
                     group_plans.append(plans[key])
                 group = plan_api.make_launch_group(group_plans)
-                kernels[phase][spec] = self._wrap_internode(phase, group)
+                # CombineSync only stages the input and the weights; with the input
+                # already in combine_in_view() and no weight fold it has nothing to do.
+                in_place = (
+                    plan_api.make_launch_group(group_plans[1:])
+                    if phase == "combine"
+                    else None
+                )
+                kernels[phase][spec] = self._wrap_internode(phase, group, in_place)
 
         return KernelSet(
             dispatch=kernels["dispatch"],
@@ -2040,7 +2047,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return self.cfg.internode_auto_ll_max_tokens
         return None
 
-    def _wrap_internode(self, phase, group):
+    def _wrap_internode(self, phase, group, in_place=None):
         """One ABI crossing for the whole pass sequence.
 
         Every pass shares the schema and the same filled struct, so the arguments
@@ -2112,7 +2119,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     else 0
                 ),
             )
-            group.launch(_raw_stream(self._device_index), **args)
+            if (
+                in_place is not None
+                and weights_ptr == 0
+                and input.data_ptr() == self._combine_inp_ptr()
+            ):
+                in_place.launch(_raw_stream(self._device_index), **args)
+            else:
+                group.launch(_raw_stream(self._device_index), **args)
 
         return run
 
@@ -2290,6 +2304,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
         self._views[key] = view
         return view
+
+    def _combine_inp_ptr(self):
+        ptr = getattr(self, "_combine_inp_addr", None)
+        if ptr is None:
+            ptr = self._combine_inp_addr = self.arena.local_ptr("inter_combine_inp")
+        return ptr
 
     def combine_in_view(self):
         if self._seg_stride:

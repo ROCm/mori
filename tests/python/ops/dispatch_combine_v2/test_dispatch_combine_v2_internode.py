@@ -2437,7 +2437,11 @@ def main(argv):
             # metadata to accumulate (v1's AsyncLL is the same). Asking anyway
             # raises; the weight half of the check is skipped for that family
             # rather than compared against a tensor it never writes.
-            wants_weights = not getattr(cfg, "async_ll", False)
+            # Zero-copy rounds alternate with no weight fold, the combine that
+            # skips CombineSync, so both launch paths are checked.
+            wants_weights = not getattr(cfg, "async_ll", False) and not (
+                args.combine_zero_copy and round_index % 2 == 1
+            )
             out, out_w = op.combine(
                 combine_input, wts if wants_weights else None, routing=routing
             )
