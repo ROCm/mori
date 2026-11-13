@@ -174,7 +174,8 @@ Where it is on today (it is off everywhere else):
   See the files.
 - Token ceilings are 64–4096. MI308X, MI355X and MI300X also have ceilings of
   4–32 for inter-node 256/8, 272/9, 896/16, and 384/6 at hidden 5120. The
-  MI300X IntraNodeV2 table also has ceilings of 16 and 32 for every shape.
+  MI300X IntraNodeV2 table also has ceilings of 16, 32, 8192 and 16384 for every
+  shape.
 
 The model behind each shape:
 
