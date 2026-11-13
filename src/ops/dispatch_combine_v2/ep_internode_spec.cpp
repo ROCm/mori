@@ -53,8 +53,6 @@ KernelDescriptor DescriptorFor(EpInterNodeKernel kind) {
       return {"dispatch_ll", "EpDispatchInterNodeV2LL_body", true};
     case EpInterNodeKernel::CombineSync:
       return {"combinesync", "EpCombineSync_body", false};
-    case EpInterNodeKernel::CombineSyncBarrier:
-      return {"combinesyncbarrier", "EpCombineSyncBarrier_body", false};
     case EpInterNodeKernel::Combine:
       return {"combine", "EpCombineInterNodeV2_body", true};
     case EpInterNodeKernel::CombineLL:
@@ -291,12 +289,6 @@ mori::jit::v2::LaunchGeometry EpInterNodeGeometry(const EpInterNodeCfg& cfg,
       geometry.gridX = static_cast<unsigned>(cfg.mpCount);
       geometry.sharedBytes = 0;
       break;
-    case EpInterNodeKernel::CombineSyncBarrier:
-      // One wavefront, by construction: the barrier is a single-block fan-in.
-      geometry.gridX = 1;
-      geometry.blockX = static_cast<unsigned>(cfg.waveSize);
-      geometry.sharedBytes = 0;
-      break;
     case EpInterNodeKernel::Combine:
     case EpInterNodeKernel::CombineLL:
       geometry.gridX = static_cast<unsigned>(cfg.blockNum);
@@ -311,7 +303,7 @@ mori::jit::v2::LaunchGeometry EpInterNodeGeometry(const EpInterNodeCfg& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// The eight Specs. Every one of them is the same three delegations.
+// The seven Specs. Every one of them is the same three delegations.
 // ---------------------------------------------------------------------------
 #define MORI_EP_INTERNODE_DEFINE_SPEC(ClassName, KIND)                \
   std::string ClassName::EntryName(const Cfg& cfg) {                  \
@@ -329,7 +321,6 @@ MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeCopyToStagingSpec, CopyToStaging)
 MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeDispatchSpec, Dispatch)
 MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeDispatchLLSpec, DispatchLL)
 MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeCombineSyncSpec, CombineSync)
-MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeCombineSyncBarrierSpec, CombineSyncBarrier)
 MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeCombineSpec, Combine)
 MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeCombineLLSpec, CombineLL)
 MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeCombineAllSpec, CombineAll)
@@ -341,7 +332,7 @@ MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeCombineAllSpec, CombineAll)
 }  // namespace mori
 
 // ===========================================================================
-// Plan registration. Eight kernels, one Cfg, one Request, one Args schema --
+// Plan registration. Seven kernels, one Cfg, one Request, one Args schema --
 // the only thing that differs is which Spec and which geometry.
 // ===========================================================================
 
@@ -382,8 +373,6 @@ MORI_EP_INTERNODE_DEFINE_PLAN(ep_internode_copystaging, EpInterNodeCopyToStaging
 MORI_EP_INTERNODE_DEFINE_PLAN(ep_internode_dispatch, EpInterNodeDispatchSpec, Dispatch)
 MORI_EP_INTERNODE_DEFINE_PLAN(ep_internode_dispatch_ll, EpInterNodeDispatchLLSpec, DispatchLL)
 MORI_EP_INTERNODE_DEFINE_PLAN(ep_internode_combinesync, EpInterNodeCombineSyncSpec, CombineSync)
-MORI_EP_INTERNODE_DEFINE_PLAN(ep_internode_combinesyncbarrier, EpInterNodeCombineSyncBarrierSpec,
-                              CombineSyncBarrier)
 MORI_EP_INTERNODE_DEFINE_PLAN(ep_internode_combine, EpInterNodeCombineSpec, Combine)
 MORI_EP_INTERNODE_DEFINE_PLAN(ep_internode_combine_ll, EpInterNodeCombineLLSpec, CombineLL)
 MORI_EP_INTERNODE_DEFINE_PLAN(ep_internode_combineall, EpInterNodeCombineAllSpec, CombineAll)

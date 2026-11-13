@@ -1827,10 +1827,36 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs& args,
 }
 }  // namespace internode
 
+// The combine's intra-node barrier, at the start of the combine pass: block 0 tells each
+// same-node PE that this PE's combine input is in place, and every block waits until each of them
+// has said the same, before it reads their inputs.
+template <EpInterNodeKernelCfg kConfig, typename T>
+inline __device__ void CombineIntraNodeBarrier(EpDispatchCombineArgs& args) {
+  DEF_COMMON_VARS;
+  if (warpId == 0) {
+    uint64_t barrierFlag = 0;
+    if (laneId == 0) barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+    barrierFlag = __shfl(barrierFlag, 0);
+    uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
+    if (laneId < config.gpuPerNode) {
+      const int destPe = myNode * config.gpuPerNode + laneId;
+      if (blockId == 0) {
+        core::AtomicStoreRelaxedSystem(
+            args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>(destPe) + args.rank,
+            barrierFlag);
+      }
+      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
+      }
+    }
+  }
+  __syncthreads();
+}
+
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineInterNodeV2_body(EpDispatchCombineArgs args,
                                           const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
+  CombineIntraNodeBarrier<kConfig, T>(args);
 
   if (blockId < args.rdmaBlockNum) {
     internode::CombineInterNode<kConfig, T>(args, comm);
@@ -1915,6 +1941,7 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineInterNodeV2LL_body(EpDispatchCombineArgs args,
                                             const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
+  CombineIntraNodeBarrier<kConfig, T>(args);
 
   if (blockId < args.rdmaBlockNum) {
     internode::CombineInterNodeLL<kConfig, T>(args, comm);
@@ -1927,25 +1954,6 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineSync_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
   internode::CombineSync<kConfig, T>(args);
-}
-
-template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs args) {
-  DEF_COMMON_VARS;
-  uint64_t barrierFlag = 0;
-  if (laneId == 0) {
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
-  }
-  barrierFlag = __shfl(barrierFlag, 0);
-  uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
-  if (laneId < config.gpuPerNode) {
-    int destPe = myNode * config.gpuPerNode + laneId;
-    core::AtomicStoreRelaxedSystem(
-        args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>(destPe) + args.rank,
-        barrierFlag);
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
-    }
-  }
 }
 
 }  // namespace v2
