@@ -1194,6 +1194,14 @@ std::vector<PoolEvictResult> PeerPool::Evict(const std::vector<PoolEvictRequest>
       if (mode == PoolEvictMode::kReclaim) out[i].outcome = PoolEvictOutcome::kInFlight;
       continue;
     }
+    // A commit is between its backend write and recording the placement
+    // (BatchCommit drops this lock for the write). The backend already offers
+    // the key, but with no placement yet a reclaim would not know its tier
+    // has an offload target and would drop the key instead of demoting it.
+    if (mode == PoolEvictMode::kReclaim && pending_keys_.count(request.key) != 0) {
+      out[i].outcome = PoolEvictOutcome::kInFlight;
+      continue;
+    }
     // A discard drops every copy, ignoring scope.
     if (mode == PoolEvictMode::kDiscard) {
       for (auto* backend : backends_->All()) drops.emplace_back(i, backends_->BackendId(backend));
