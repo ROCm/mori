@@ -2799,7 +2799,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
           }
         }
       } else {
-        [[maybe_unused]] EpCardFwd _cardHeld;
+        [[maybe_unused]] std::conditional_t<kCfg.cardDedup, EpCardFwd, int> _cardHeld{};
         if constexpr (kPlainMeta) {
           if (_metaPlain) {
             const int nPay = warpNum - kPM;
