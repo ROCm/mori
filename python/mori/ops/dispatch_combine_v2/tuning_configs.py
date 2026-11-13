@@ -80,10 +80,8 @@ _MI325X_TABLE = {
     (8, 2048, 8): {"fp8": _MI325X_SCHEDULE},
 }
 
-# ── MI300X (gfx942, 304 CU) — EP8, per bucket from an in-graph sweep of dispatch
-# block {32..304} x warp {4,8,16} and combine block {32..256} x warp {2,4,8,16}.
-# Small tok wants a wide dispatch with warp 4; combine wants block 32 + warp 8-16
-# from T256 up. 384/6 and 256/6 share the topk-6 hidden-7168 key (tuned on 384/6).
+# ── MI300X (gfx942, 304 CU) — EP8. 384/6 and 256/6 share the topk-6 hidden-7168
+# key (tuned on 384/6).
 _MI300X_SCHED_H7168_T8_BF16 = (
     (16, 32, 4, 128, 2),
     (32, 32, 8, 128, 2),
@@ -99,7 +97,6 @@ _MI300X_SCHED_H7168_T8_FP8 = (
     (256, 256, 4, 32, 8),
     (None, 64, 16, 32, 8),
 )
-# DeepSeek-V3/R1 with the shared expert fused in (264/9).
 _MI300X_SCHED_H7168_T9_BF16 = (
     (32, 96, 4, 128, 2),
     (64, 228, 8, 128, 2),
@@ -156,7 +153,6 @@ _MI300X_SCHED_H5120_T6_FP8 = (
     (2048, 192, 4, 32, 16),
     (None, 64, 16, 32, 16),
 )
-# Kimi K3 (896/16, hidden 3584).
 _MI300X_SCHED_H3584_T16_BF16 = (
     (16, 96, 4, 228, 4),
     (32, 228, 4, 128, 2),

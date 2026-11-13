@@ -54,7 +54,7 @@ def test_max_combine_blocks_matches_kernel_flag_slots():
     assert tc._MAX_COMBINE_BLOCKS == xdb_flag_slots
 
 
-# (CU count, wave size) per device table, for the schedule checks below.
+# (CU count, wave size) per device table.
 _DEVICE_LIMITS = {
     "mi308x": (80, 64),
     "mi325x": (304, 64),
