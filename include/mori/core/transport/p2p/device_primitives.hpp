@@ -70,7 +70,6 @@ using VecTypeT = std::conditional_t<VecBytes == 1,  uint8_t,
 template <typename T>
 using AccumFp32T = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
 
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Load/Store                                           */
 /* ---------------------------------------------------------------------------------------------- */
@@ -333,27 +332,6 @@ inline __device__ T BlockPrefixSum(T val, size_t thdNum) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        WarpAccumulation                                        */
 /* ---------------------------------------------------------------------------------------------- */
-template <typename T>
-inline __device__ void WarpAccum(T* accum, T* src, size_t nelems) {
-  constexpr int vecSize = 16 / sizeof(T);
-  int laneId = threadIdx.x & (warpSize - 1);
-  int offset = laneId * vecSize;
-
-  while ((offset + vecSize) <= nelems) {
-    uint4 srcVal = reinterpret_cast<uint4*>(src + offset)[0];
-    uint4 accumVal = reinterpret_cast<uint4*>(accum + offset)[0];
-    for (int i = 0; i < vecSize; i++) {
-      reinterpret_cast<T*>(&accumVal)[i] += reinterpret_cast<T*>(&srcVal)[i];
-    }
-    reinterpret_cast<uint4*>(accum + offset)[0] = accumVal;
-    offset += warpSize * vecSize;
-  }
-
-  while (offset < nelems) {
-    accum[offset] += src[offset];
-    offset += 1;
-  }
-}
 
 // E4M3 element types whose float conversions WarpAccumImpl does two at a time with the packed
 // cvt builtins. The per-element conversions of __hip_fp8_e4m3(_fnuz) spend one cvt per byte and
@@ -424,24 +402,24 @@ __device__ __forceinline__ void WarpAccumPackedDecode(AccT* acc, const uint32_t*
 template <typename T, typename AccT>
 __device__ __forceinline__ uint32_t AccumPackedEncodeWord(const AccT* acc) {
   uint32_t word = 0;
-  if constexpr(false) { }
+  if constexpr (false) {
+  }
 #if HIP_FP8_CVT_FAST_PATH
   else if constexpr (kWarpAccumPackedFp8<T>) {
     // Same saturation as the __HIP_SATFINITE float -> fp8 conversion of the HIP type: finite values
-    // clamp to the largest finite fp8, NaN and Inf are passed to the cvt unclamped. Keeping it exact is
-    // what makes the packed path bit-identical to T(float).
+    // clamp to the largest finite fp8, NaN and Inf are passed to the cvt unclamped. Keeping it
+    // exact is what makes the packed path bit-identical to T(float).
     auto SatFinite = [](float v) {
       constexpr float kMax = (T::__default_interpret == __HIP_E4M3_FNUZ) ? 240.0f : 448.0f;
       return (__float_as_uint(v) & 0x7F800000u) != 0x7F800000u
-                 ? __builtin_amdgcn_fmed3f(v, kMax, -kMax) : v;
+                 ? __builtin_amdgcn_fmed3f(v, kMax, -kMax)
+                 : v;
     };
-    word = __builtin_amdgcn_cvt_pk_fp8_f32(SatFinite(acc[0]), SatFinite(acc[1]),
-                                           word, false);
-    word = __builtin_amdgcn_cvt_pk_fp8_f32(SatFinite(acc[2]), SatFinite(acc[3]),
-                                           word, true);
+    word = __builtin_amdgcn_cvt_pk_fp8_f32(SatFinite(acc[0]), SatFinite(acc[1]), word, false);
+    word = __builtin_amdgcn_cvt_pk_fp8_f32(SatFinite(acc[2]), SatFinite(acc[3]), word, true);
   }
 #endif
-#if defined(__gfx950__) // gfx950 has v_cvt_pk_bf16_f32
+#if defined(__gfx950__)  // gfx950 has v_cvt_pk_bf16_f32
   else if constexpr (std::is_same_v<T, hip_bfloat16>) {
     typedef float F32x2 __attribute__((ext_vector_type(2)));
     typedef __bf16 Bf16x2 __attribute__((ext_vector_type(2)));
@@ -489,7 +467,7 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   constexpr int elemsPerWarp = warpSize * vecSize;
   const size_t laneOffset = laneId * vecSize;
 
-  for(; offset + elemsPerWarp <= nelems; offset += elemsPerWarp) {
+  for (; offset + elemsPerWarp <= nelems; offset += elemsPerWarp) {
     AccumFp32T<T> accumValFp32[vecSize] = {AccumFp32T<T>{0}};
     if constexpr (VecBytes <= 8) {
       for (size_t first = 0; first < accumNum; first += kLoadBatch) {
@@ -503,9 +481,8 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
         for (int i = 0; i < kLoadBatch; ++i) {
           if ((first + i >= accumNum) || (srcs[first + i] == nullptr)) continue;
           float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[first + i];
-          WarpAccumPackedDecode<T, VecBytes>(accumValFp32,
-                                             reinterpret_cast<const uint32_t*>(&srcVals[i]),
-                                             srcScale);
+          WarpAccumPackedDecode<T, VecBytes>(
+              accumValFp32, reinterpret_cast<const uint32_t*>(&srcVals[i]), srcScale);
         }
       }
     } else {
@@ -529,7 +506,7 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
     store<VecBytes>(dest + offset + laneOffset, accumVec);
   }
   // remaining size, one element per lane
-  for(offset += laneId; offset < nelems; offset += warpSize) {
+  for (offset += laneId; offset < nelems; offset += warpSize) {
     AccumFp32T<T> accumValFp32 = AccumFp32T<T>{0};
     for (int i = 0; i < accumNum; ++i) {
       const T* srcPtr = srcs[i];
@@ -596,10 +573,10 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
 #pragma unroll AccumNum
         for (int i = 0; i < AccumNum; ++i) {
           if (cached_srcs[i] == nullptr) continue;
-          WarpAccumPackedDecode<T, VecBytes>(
-              acc[u], reinterpret_cast<const uint32_t*>(&vals[u][i]), scales[i]);
+          WarpAccumPackedDecode<T, VecBytes>(acc[u], reinterpret_cast<const uint32_t*>(&vals[u][i]),
+                                             scales[i]);
         }
-      } // for Unroll
+      }  // for Unroll
     } else {
       // Per source: prefetch this source's Unroll vec-chunks, then accumulate them immediately.
 #pragma unroll AccumNum
@@ -613,10 +590,10 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
         if (cached_srcs[i] == nullptr) continue;
 #pragma unroll Unroll
         for (int u = 0; u < Unroll; ++u) {
-          WarpAccumPackedDecode<T, VecBytes>(acc[u], 
-            reinterpret_cast<const uint32_t*>(&vals[u]), scales[i]);
+          WarpAccumPackedDecode<T, VecBytes>(acc[u], reinterpret_cast<const uint32_t*>(&vals[u]),
+                                             scales[i]);
         }
-      } // for AccumNum
+      }  // for AccumNum
     }
 
     union {
@@ -631,8 +608,8 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
       }
       const size_t ofs = offset + (laneId + u * warpSize) * vecSize;
       store<VecBytes>(dest + ofs, outVec[u]);
-    } // for Unroll
-  } // for offset += elemsPerWarp
+    }  // for Unroll
+  }  // for offset += elemsPerWarp
 }
 
 template <typename T, int VecBytes, int AccumNum, int Unroll>
@@ -645,10 +622,10 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
   size_t offset = 0;
 
   // NOTE: the original code does not pass Unroll parameter, so we pass it as 1 here!
-  WarpAccumImpl<T, VecBytes, AccumNum, /*Unroll=*/1, /*LoadFirst=*/false>(
-                                        dest, srcs, srcScales, offset, nelems);
-  
-  for(offset += laneId; offset < nelems; offset += warpSize) {
+  WarpAccumImpl<T, VecBytes, AccumNum, /*Unroll=*/1, /*LoadFirst=*/false>(dest, srcs, srcScales,
+                                                                          offset, nelems);
+
+  for (offset += laneId; offset < nelems; offset += warpSize) {
     AccumFp32T<T> accumValFp32 = AccumFp32T<T>{0};
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
@@ -735,14 +712,14 @@ __forceinline__ __device__ void WarpAccumLF(T* __restrict__ dest, T* const* __re
 
   // Scalar remainder for the tail that doesn't fill Unroll*warpSize*vecSize.
   const int laneId = threadIdx.x & (warpSize - 1);
-  for(offset += laneId; offset < nelems; offset += warpSize) {
+  for (offset += laneId; offset < nelems; offset += warpSize) {
     AccumFp32T<T> accumValFp32 = AccumFp32T<T>{0};
     for (int i = 0; i < static_cast<int>(accumNum); ++i) {
       const T* srcPtr = srcs[i];
-      if (srcPtr == nullptr) continue;  
+      if (srcPtr == nullptr) continue;
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
       accumValFp32 += AccumFp32T<T>(srcPtr[offset]) * srcScale;
-    } 
+    }
     dest[offset] = T(accumValFp32);
   }
 }
