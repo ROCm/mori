@@ -691,6 +691,50 @@ def test_successful_writes_always_have_inbound_notification_under_pressure():
         assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_batch_signals_before_the_next_batch_overflows_the_send_queue():
+    """A post_batch_size that does not divide the admission limit must not
+    leave a QP waiting on its own unsignaled WRs. max_send_wr=16 keeps 4 slots
+    for completion markers, so 12 WRs are admitted: the second batch of 8 fits
+    only after the first one completes, which needs a signaled WR."""
+    config = IOEngineConfig(host="127.0.0.1", port=0)
+    initiator = IOEngine(key="sq_batch_initiator", config=config)
+    target = IOEngine(key="sq_batch_target", config=config)
+    backend = RdmaBackendConfig(
+        qp_per_transfer=1,
+        post_batch_size=8,
+        num_worker_threads=1,
+        enable_notification=False,
+    )
+    backend.max_send_wr = 16
+    with temporary_env("MORI_DISABLE_AUTO_XGMI", "1"):
+        initiator.create_backend(BackendType.RDMA, backend)
+        target.create_backend(BackendType.RDMA, backend)
+    initiator.register_remote_engine(target.get_engine_desc())
+    target.register_remote_engine(initiator.get_engine_desc())
+
+    num_wrs, size = 32, 64
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (2 * num_wrs * size,)
+    )
+    # Every other span, so no two requests merge: 4 batches of 8 WRs on one QP.
+    offsets = [2 * i * size for i in range(num_wrs)]
+    status = initiator.batch_write(
+        [initiator_mem],
+        [offsets],
+        [target_mem],
+        [offsets],
+        [[size] * num_wrs],
+        [initiator.allocate_transfer_uid()],
+    )[0]
+    wait_status(status)
+
+    assert status.Succeeded(), status.Message()
+    for offset in offsets:
+        span = slice(offset, offset + size)
+        assert torch.equal(initiator_tensor[span].cpu(), target_tensor[span].cpu())
+
+
 def test_no_backend():
     config = IOEngineConfig(
         host="127.0.0.1",

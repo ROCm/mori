@@ -2,31 +2,74 @@
 
 MORI-EP provides high-performance MoE (Mixture of Experts) dispatch and combine kernels for Expert Parallelism. It supports both intra-node (XGMI) and inter-node (RDMA) communication, delivering state-of-the-art bandwidth for token routing in models like DeepSeek V3.
 
+MORI-EP has two generations, EPv1 and EPv2. [Section 1](#1-choosing-a-generation) helps you choose one. [Section 2](#2-epv2) covers EPv2; its package guide is [here](https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md). **Sections 3–14 describe EPv1** (`mori.ops`, built on MORI-SHMEM).
+
 ## Table of Contents
 
 - [Quick Reference](#quick-reference)
-- [1. Kernel Types](#1-kernel-types)
-- [2. Configuration](#2-configuration)
-- [3. Operator API](#3-operator-api)
+  - [EPv2 quick start (8 GPUs, one node)](#epv2-quick-start-8-gpus-one-node)
+  - [EPv1 quick start](#epv1-quick-start)
+- [1. Choosing a Generation](#1-choosing-a-generation)
+- [2. EPv2](#2-epv2)
+  - [EPv2 paths](#epv2-paths)
+  - [EPv2 restrictions](#epv2-restrictions)
+  - [Validation before tuning](#validation-before-tuning)
+- [3. Kernel Types](#3-kernel-types)
+- [4. Configuration](#4-configuration)
+- [5. Operator API](#5-operator-api)
   - [dispatch()](#dispatch)
   - [combine()](#combine)
   - [Split dispatch/combine (send + recv)](#split-dispatchcombine-send--recv)
   - [reset()](#reset)
   - [get_dispatch_src_token_pos()](#get_dispatch_src_token_pos)
   - [get_registered_combine_input_buffer()](#get_registered_combine_input_buffer)
-- [4. Standard MoE Compatibility (DeepEP)](#4-standard-moe-compatibility-deepep)
-- [5. Initialization](#5-initialization)
-- [6. Launch Configuration](#6-launch-configuration)
-- [7. Complete Example](#7-complete-example)
-- [8. Environment Variables](#8-environment-variables)
-- [9. Benchmarking](#9-benchmarking)
-- [10. Tuning](#10-tuning)
-- [11. Profiling with MORI-VIZ](#11-profiling-with-mori-viz)
-- [12. Framework Integration](#12-framework-integration)
-- [Build Options](#build-options)
-- [Source Files](#source-files)
+- [6. Standard MoE Compatibility (DeepEP)](#6-standard-moe-compatibility-deepep)
+- [7. Initialization](#7-initialization)
+- [8. Launch Configuration](#8-launch-configuration)
+- [9. Complete Example](#9-complete-example)
+- [10. Environment Variables](#10-environment-variables)
+- [11. Benchmarking](#11-benchmarking)
+- [12. Tuning](#12-tuning)
+- [13. Profiling with MORI-VIZ](#13-profiling-with-mori-viz)
+- [14. Framework Integration](#14-framework-integration)
+- [15. Build Options](#15-build-options)
+- [16. Source Files](#16-source-files)
 
 ## Quick Reference
+
+### EPv2 quick start (8 GPUs, one node)
+
+```python
+from mori.cco import Communicator
+from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
+
+# Rank 0 creates the unique id; broadcast it out-of-band (torch.distributed, MPI)
+uid = Communicator.get_unique_id() if rank == 0 else None
+uid = broadcast(uid)
+
+with Communicator.init(world_size, rank, uid, per_rank_vmm=per_rank_bytes) as comm:
+    config = EpDispatchCombineConfig(
+        rank=rank,
+        world_size=world_size,
+        hidden_dim=7168,
+        max_num_inp_token_per_rank=4096,
+        num_experts_per_rank=32,
+        num_experts_per_token=8,
+        data_type=torch.bfloat16,
+        kernel_backend="hip",   # or "flydsl"; the default is HIP on gfx125x, FlyDSL elsewhere
+    )
+    op = EpDispatchCombineOp(config, comm)
+    recv_x, recv_w, recv_s, recv_i, total_recv, routing = op.dispatch(
+        input, weights, scales, indices, return_routing=True)
+    # ... run expert computation on recv_x ...
+    # No weights: passing them asks for the weight fold, which is for training
+    # backward and costs more than the token payload on gfx1250.
+    out, _ = op.combine(expert_output, routing=routing)
+```
+
+For the full configuration, see the [EPv2 package guide](https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md).
+
+### EPv1 quick start
 
 ```python
 import mori
@@ -54,7 +97,7 @@ op = mori.ops.EpDispatchCombineOp(config)
 dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, recv_num_token = \
     op.dispatch(input, weights, scales, indices)
 # ... run expert computation on dispatched tokens ...
-combine_output, combine_weights = op.combine(expert_output, weights, indices)
+combine_output, combine_weights = op.combine(expert_output, dispatch_weights, indices)
 op.reset()
 ```
 
@@ -69,9 +112,68 @@ op.reset()
 
 ---
 
-## 1. Kernel Types
+## 1. Choosing a Generation
 
-MORI-EP provides five kernel types optimized for different network topologies and latency requirements:
+| | EPv1 | EPv2 |
+|---|---|---|
+| Built on | MORI-SHMEM (process-global init) | MORI-CCO (explicit `Communicator`) |
+| Import | `mori.ops` | `mori.ops.dispatch_combine_v2` |
+| Kernel selection | `EpDispatchCombineKernelType` (`IntraNode`, `InterNode`, `InterNodeV1`, ...) | `config.kernel_backend`: `"flydsl"` or `"hip"` (default: HIP on gfx125x, FlyDSL elsewhere). Internode is selected by `gpu_per_node < world_size` |
+| Intra-node | Yes | Yes |
+| Inter-node | Yes | HIP backend only, preview |
+| GPUs | gfx942, gfx950 | gfx942, gfx950, **gfx1250** |
+| Design target | Node-scale and multi-node EP | Native design for gfx1250 and rack-scale EP |
+
+**Which one to use:**
+
+- **gfx1250: use EPv2.** gfx1250 supports EPv2 only: EPv1 runs on wave64 GPUs and refuses to start on a wave32 one.
+- **gfx942 / gfx950 in production: keep the API you have tested.** EPv1 has the full set of inter-node kernels and tuning tables. Move to EPv2 only after you evaluate it.
+- **New work for rack-scale or gfx1250: start with EPv2.**
+
+The EPv1 and EPv2 paths use different configuration objects and different initialization. EPv1 needs SHMEM initialization ([Section 7](#7-initialization)). EPv2 needs an explicit CCO communicator ([CCO Guide](MORI-CCO-GUIDE.md)). EPv2 does not use the process-global SHMEM bootstrap.
+
+This guide describes the development source. Not all paths are in every published wheel. Check the installed release and its [release notes](https://github.com/ROCm/mori/releases).
+
+---
+
+## 2. EPv2
+
+EPv2 (`mori.ops.dispatch_combine_v2`) is built on MORI-CCO. This section lists its paths, its restrictions and the checks to run before tuning. The [EPv2 package guide](https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md) is the full reference, and the [Quick Reference](#epv2-quick-start-8-gpus-one-node) has a minimal example.
+
+### EPv2 paths
+
+| Path | Selection | Topology | Scope and restrictions |
+|---|---|---|---|
+| EPv2, FlyDSL | `kernel_backend="flydsl"` | Intra-node only | Gather/scatter combine, quantization, standard-MoE conversion and routing replay, subject to the dtype and architecture restrictions below. |
+| EPv2, HIP | `kernel_backend="hip"` | Intra-node | Gather combine in BF16/FP32. On gfx125x, also a push (scatter) combine with `fp8_blockwise` or FP4 quantization: `combine_mode="scatter"`, a BF16 combine and a `hidden_dim` that is a multiple of 1024. On gfx1250, a BF16 combine without quantization can also push for the shapes in its push table, picked per call (`MORI_EP_BF16_PUSH=0` turns this off). Dispatch can carry already-quantized FP8/FP4 payloads. No standard-MoE conversion. Does not need FlyDSL. |
+| EPv2, HIP internode (preview) | HIP backend with `gpu_per_node < world_size` | Multiple physical nodes over CCO/GDA | BF16/FP32/FP8 dispatch, plus packed FP4 dispatch with a BF16 or FP32 combine (not with `async_ll`). No FP4 combine, quantization, standard-MoE conversion or scatter combine. The node grouping of the communicator must match the config. |
+
+Select the backend with `config.kernel_backend` or `MORI_V2_KERNEL_BACKEND`. The default is the HIP backend on gfx125x and the FlyDSL backend elsewhere. Importing the package does not load a backend. Construction loads the selected one.
+
+### EPv2 restrictions
+
+- FP4 conversion kernels need gfx950 or gfx1250. gfx942 has no conversion intrinsics. The two targets use different instructions (gfx950: the `cvt_scalef32_pk_*_fp4` pair-at-a-time family; gfx1250: pack-of-8). This is a per-target port, not one shared path.
+- FP8 format depends on the target: OCP E4M3 on gfx950, E4M3FNUZ on gfx942.
+- On the internode path, `quant_type` must be `"none"`. The config rejects anything else when `world_size > gpu_per_node`, for any backend. The quantized-combine staging path is incomplete there. HIP is the only backend with an internode path today.
+- `gpu_per_node` sets the physical node grouping. One host cannot emulate the two-node internode test by changing `world_size` alone.
+- For internode, `internode_kernel` is `"v2"`, `"v2_ll"` or `"auto"`. `"auto"` chooses by the token count of the current call, not by the buffer capacity.
+
+### Validation before tuning
+
+Run the allocated-node checks in the [Quickstart](quickstart.rst) before you measure performance. The source package also has:
+
+- `tests/python/ops/dispatch_combine_v2/test_ep_backend_parity.py`: compare HIP and FlyDSL on the same inputs.
+- `tests/python/ops/dispatch_combine_v2/test_graph_capture.py`: graph replay.
+- `tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py`: real two-node correctness, benchmark, tuning and stress runs.
+- `tests/python/ops/dispatch_combine_v2/bench_ep.py`: benchmark points with an identity-expert correctness check by default.
+
+Record the MORI and FlyDSL revisions, backend, GPU, NIC, transport, dtype, quantization mode, shape and graph mode with your results. A successful intranode benchmark does not validate an internode configuration.
+
+---
+
+## 3. Kernel Types
+
+MORI-EP provides six kernel types optimized for different network topologies and latency requirements:
 
 | Kernel Type | Value | Topology | Transport | Use Case |
 |-------------|-------|----------|-----------|----------|
@@ -80,6 +182,7 @@ MORI-EP provides five kernel types optimized for different network topologies an
 | `InterNodeV1` | 2 | Multi-node | XGMI + RDMA | Optimized inter-node with higher bandwidth |
 | `InterNodeV1LL` | 3 | Multi-node | XGMI + RDMA | Low-latency variant of InterNodeV1 |
 | `AsyncLL` | 4 | Multi-node | XGMI + RDMA | Async low-latency with pipelined transfers |
+| `IntraNodeLL` | 5 | Single node | XGMI (P2P) | Low-latency `IntraNode` variant for small token counts |
 
 **How to choose:**
 
@@ -103,7 +206,7 @@ Is EP within a single node?
 
 ---
 
-## 2. Configuration
+## 4. Configuration
 
 ### EpDispatchCombineConfig
 
@@ -171,7 +274,7 @@ config = mori.ops.EpDispatchCombineConfig(
 
 ---
 
-## 3. Operator API
+## 5. Operator API
 
 ### EpDispatchCombineOp
 
@@ -222,7 +325,7 @@ combine_output, combine_weights = op.combine(
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `input` | `torch.Tensor` | Expert output tokens |
-| `weights` | `torch.Tensor` | Expert weights for weighted combination |
+| `weights` | `torch.Tensor` | The weights `dispatch()` returned for the received tokens, or `None` |
 | `indices` | `torch.Tensor` | Top-K expert indices (same as dispatch) |
 | `use_external_inp_buf` | `int` | Override `config.use_external_inp_buf`: 0=zero-copy, 1=external buffer |
 | `call_reset` | `bool` | Call `reset()` automatically after combine |
@@ -280,7 +383,7 @@ combine_buf[:recv_num_token, :].copy_(expert_output[:recv_num_token, :])
 
 ---
 
-## 4. Standard MoE Compatibility (DeepEP)
+## 6. Standard MoE Compatibility (DeepEP)
 
 MORI-EP provides DeepEP-compatible APIs for frameworks that use standard 3D MoE tensor layouts. These require building with `ENABLE_STANDARD_MOE_ADAPT=ON`:
 
@@ -325,7 +428,7 @@ converted = op.convert_combine_input(packed_recv_x, packed_recv_src_info, packed
 
 ---
 
-## 5. Initialization
+## 7. Initialization
 
 MORI-EP requires symmetric memory (shmem) initialization before creating any `EpDispatchCombineOp`. There are two initialization methods:
 
@@ -374,14 +477,15 @@ mori.shmem.shmem_init_attr(
 
 ---
 
-## 6. Launch Configuration
+## 8. Launch Configuration
 
 ### Manual Mode (Default)
 
 Launch parameters are taken from `EpDispatchCombineConfig` defaults or per-call overrides:
 
 ```python
-# Use config defaults (block_num=80, warp_num_per_block=8)
+# No launch arguments: the config's block_num=80 and warp_num_per_block=8, except
+# IntraNode, which has per-kernel defaults (dispatch: 256x16)
 op.dispatch(input, weights, scales, indices)
 
 # Override per call
@@ -396,18 +500,20 @@ Set `MORI_EP_LAUNCH_CONFIG_MODE=AUTO` to use pre-tuned launch parameters:
 export MORI_EP_LAUNCH_CONFIG_MODE=AUTO
 ```
 
-Auto mode selects parameters based on kernel type:
+Auto mode uses the tuned launch rules shipped for the GPU, kernel type and world
+size where there are some, and otherwise falls back by kernel type:
 
 | Kernel Type | block_num | rdma_block_num | warp_per_block |
 |-------------|-----------|----------------|----------------|
-| InterNodeV1, InterNodeV1LL | 96 | 64 | 8 |
-| IntraNode, InterNode, AsyncLL | 128 | 0 | 16 |
+| InterNodeV1 | 96 | 64 | 8 |
+| InterNodeV1LL | 256 | 128 | 8 |
+| All others | 128 | 0 | 16 |
 
 When auto mode is active, per-call `block_num`/`rdma_block_num`/`warp_per_block` arguments are ignored.
 
 ---
 
-## 7. Complete Example
+## 9. Complete Example
 
 ```python
 import os
@@ -497,7 +603,7 @@ if __name__ == "__main__":
 
 ---
 
-## 8. Environment Variables
+## 10. Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -511,7 +617,7 @@ if __name__ == "__main__":
 
 ---
 
-## 9. Benchmarking
+## 11. Benchmarking
 
 ### Intra-node
 
@@ -529,9 +635,12 @@ export GLOO_SOCKET_IFNAME=enp81s0f1
 export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # Optional: exclude specific NICs
 
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.129.65" --master_port=1234 \
-    examples/ops/dispatch_combine/test_dispatch_combine_internode.py --bench
+    --master_addr="<master_ip>" --master_port=1234 \
+    examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench
 ```
+
+`torchrun` starts one process per node; the script starts the node's 8 ranks
+(`GPU_PER_NODE`) itself.
 
 The benchmark output reports total tokens received, RDMA token count, and total bandwidth (XGMI + RDMA). To calculate RDMA-only bandwidth:
 
@@ -551,7 +660,7 @@ RDMA BW = Total BW × (RDMA tokens / Total tokens)
 
 ---
 
-## 10. Tuning
+## 12. Tuning
 
 Tuning searches for the optimal GPU launch parameters (`block_num`, `warp_per_block`, `rdma_block_num`) for each kernel/dtype/token-count combination. Results are saved to JSON config files that the auto-mode launch configuration reads at runtime.
 
@@ -785,9 +894,10 @@ python/mori/ops/tuning_configs/
 
 ---
 
-## 11. Profiling with MORI-VIZ
+## 13. Profiling with MORI-VIZ
 
-Build with profiling enabled:
+Build with profiling enabled, and keep `ENABLE_PROFILER=ON` set when you run:
+the JIT compiles the instrumented kernels only then.
 
 ```bash
 ENABLE_PROFILER=ON pip install -e .
@@ -796,11 +906,12 @@ ENABLE_PROFILER=ON pip install -e .
 Capture and export a trace:
 
 ```python
+import mori
 from mori.kernel_profiler import export_to_perfetto
 
 # Run dispatch/combine, then:
 if hasattr(mori.cpp, "get_debug_time_buf"):
-    trace_buffer = mori.cpp.get_debug_time_buf(op._handle)
+    trace_buffer = op.get_debug_time_buf()
     export_to_perfetto(trace_buffer, "ep_trace.json")
 ```
 
@@ -808,7 +919,7 @@ Visualize at [ui.perfetto.dev](https://ui.perfetto.dev/). See [PROFILER.md](PROF
 
 ---
 
-## 12. Framework Integration
+## 14. Framework Integration
 
 MORI-EP is integrated in several LLM inference frameworks:
 
@@ -821,7 +932,7 @@ MORI-EP is integrated in several LLM inference frameworks:
 
 ---
 
-## Build Options
+## 15. Build Options
 
 | CMake Option | Default | Description |
 |-------------|---------|-------------|
@@ -838,7 +949,7 @@ MORI-EP is integrated in several LLM inference frameworks:
 
 ---
 
-## Source Files
+## 16. Source Files
 
 | File | Description |
 |------|-------------|
@@ -849,9 +960,9 @@ MORI-EP is integrated in several LLM inference frameworks:
 | `src/ops/dispatch_combine/dispatch_combine.cpp` | Core dispatch/combine implementation |
 | `src/ops/dispatch_combine/internode_v1.cpp` | InterNodeV1/V1LL kernels |
 | `src/ops/dispatch_combine/low_latency_async.cpp` | AsyncLL kernels |
-| `src/pybind/pybind.cpp` | Python module entry point |
-| `src/pybind/mori.cpp` | Ops/Shmem/IO binding registration |
+| `src/pybind/mori.cpp` | Python module entry point (`libmori_pybinds`) |
+| `src/pybind/pybind_ops.cpp` | Ops binding registration (`RegisterMoriOps`) |
 | `examples/ops/dispatch_combine/test_dispatch_combine.py` | Complete Python example |
 | `examples/ops/dispatch_combine/test_dispatch_combine_internode.py` | Inter-node example |
-| `tests/python/ops/test_dispatch_combine.py` | Correctness tests |
+| `tests/python/ops/test_dispatch_combine_*.py` | Correctness tests (intra-node, inter-node V1, AsyncLL, ...) |
 | `tests/python/ops/bench_dispatch_combine.py` | Performance benchmarks |

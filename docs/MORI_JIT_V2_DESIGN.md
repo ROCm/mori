@@ -363,16 +363,18 @@ HIP V2 的单机和跨机都以 `hip_tuning_configs.resolve_schedule(cfg)` 为 b
 `EpDispatchCombineOpHip`，HIP 沿用的是 FlyDSL 的几何。单机时只要显式给出 `cfg.schedule` 或任一
 block/warp 字段，整个 op 就不查表，未给的字段取单档默认值（dispatch 64×16、combine 80×4）；跨机忽略
 `cfg.schedule`，只读 CSV 表，不回退到 Python 表。
-`op.kernel_config(num_tokens)` 负责一次选桶，HIP 的 `_pick()` 与报告接口使用同一结果（gfx125x 上
-LL128 分段覆盖的小 token 数除外，`_pick()` 直接返回 LL128 plan）；
+`op.kernel_config(num_tokens, max_tokens)` 负责一次选桶，HIP 的 `_pick()` 与报告接口使用同一结果
+（gfx125x 上按 `low_latency` 规则走 LL128 的调用除外，`_pick()` 直接返回 LL128 plan，规则见
+dispatch_combine_v2/README.md 的 Low latency 一节）；
 绑定的单 kernel 或 pass group 直接执行，不再另选一遍 family/geometry。
 
 跨机的数据解析中，`internode_schedule(cfg)` 合并查表结果、手动覆盖和 token 边界，
 `internode_buckets()` 读取单个 family 的规则，
 `lookup_internode()` 解析单个 token 数，`save_internode_result()` 保存调优结果，
-`internode_kernel_family()` 解析本次调用的 kernel family。表的格式由 `hip_tuning_configs.py`
-自己负责：`v2_table_filename()` 决定文件名，`read_v2_table()` 读取并校验，`write_v2_table()`
-按选择键排序写回；`MORI_EP_V2_TUNING_DIR` 可指定表目录。没有匹配规则的相使用配置默认几何。
+`internode_kernel_family()` 按 dispatch 传入的 `max_num_inp_token_across_ranks` 解析本次调用的
+kernel family，`resolve_ll_schedule()` 给 `auto` 另建一份到切换点为止的 `v2_ll` 调度。
+表的格式由 `hip_tuning_configs.py` 自己负责：`v2_table_filename()` 决定文件名，
+`read_v2_table()` 读取并校验，`write_v2_table()` 按选择键排序写回；`MORI_EP_V2_TUNING_DIR` 可指定表目录。没有匹配规则的相使用配置默认几何。
 
 每个 GPU 型号、kernel（`InterNodeV2`/`InterNodeV2LL`/`IntraNodeV2`）和 EP 一个 CSV，两相都在其中，
 命名为 `{arch}_{model}_{kernel}_ep{n}.csv`，例如 `gfx950_mi355x_InterNodeV2_ep16.csv`。每行一条规则，
@@ -389,8 +391,9 @@ CSV（MI350X 与 MI355X 同一颗 die、CU 数相同，读 MI355X 的），不�
 两相可分别调优，默认按完整 dispatch+combine 周期评估收益，另一相保持选定几何。
 
 internode 几何增加了 `rdma_block_num`，把 grid 分成 RDMA 和 node 内两部分。
-`internode_schedule()` 在构建期合并两相和 family 的桶边界，每桶保留独立的 dispatch/combine 几何。
-`resolve_schedule()` 将 family 分界写入统一 schedule；backend 为可选的配置建立 callable，
+`internode_schedule()` 在构建期合并两相的桶边界（`auto` 时再加上切换点），每桶保留独立的
+dispatch/combine 几何。`resolve_schedule()` 给每桶标上同一个 family，`auto` 时是 `v2`，
+`resolve_ll_schedule()` 另给 `v2_ll`；backend 为两份调度里可选的配置建立 callable，
 按 `(pass, geometry, active QP 数, load-first)` 复用 plan，按阶段和 family 的 pass 顺序建立 launch group。
 shape/dtype、每档的 active QP 数、op 的 drain QP 数和普通 combine 的 load-first 决定编译特化；B/R/W
 只影响 plan 的启动配置，相同源码可以共享编译缓存。
@@ -479,7 +482,7 @@ run 新增 16 份而不是 2 份，AOT 也无从谈起。旁证：gfx942 上 8 �
 4096 上 combine 快 12%，差在暂存拷贝：FlyDSL 在 kernel 前单独发一发 311MB 的 torch copy，
 HIP 在 kernel 内做、与 barrier 等待重叠——104µs 变 ~1µs。
 
-4×gfx1250（MI450）EP4，hidden=7168 topk=8，对照 v1 的出厂默认，µs：
+4×gfx1250 EP4，hidden=7168 topk=8，对照 v1 的出厂默认，µs：
 
 | tok/rank | 64 | 512 | 2048 | 4096 | 16384 |
 |---|---|---|---|---|---|
@@ -526,8 +529,9 @@ combinesync + combinesyncbarrier + combine 或 combine_ll + combineall。
 （`EpDispatchCombineConfig.is_internode`）决定，只有 `hip` 后端实现它，FlyDSL 后端在能力门里直接
 报错；走哪一族由 `internode_kernel = auto | v2 | v2_ll` 决定。`v2` 和 `v2_ll` 是**两族独立
 kernel**——独立的 JIT 模块、入口符号和缓存 key，不是一个 body 的两个分支——所以点名一族就只编那一族；
-`auto`（默认）两族都编，按 launch 的 token 数在 `internode_auto_ll_max_tokens`（默认 512）处切换，
-也只有它能在运行时切。
+`auto`（默认）两族都编，按 dispatch 传入的 `max_num_inp_token_across_ranks` 在
+`internode_auto_ll_max_tokens`（默认 512）处切换，没传就走 `v2`，也只有它能在运行时切。
+`low_latency=True` / `False` 等同于 `v2_ll` / `v2`。
 
 ## 10. 测试
 

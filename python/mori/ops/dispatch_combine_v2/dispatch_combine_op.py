@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import logging
 import os
 from dataclasses import dataclass
 from typing import Callable
@@ -59,6 +60,8 @@ import torch
 
 from mori.tensor_utils import from_gpu_ptr
 from mori.jit.config import detect_wave_size
+
+logger = logging.getLogger(__name__)
 
 WAVE = detect_wave_size()
 
@@ -83,6 +86,8 @@ _PUSH_QUANT_TYPES = _FP4_QUANT_TYPES + ("fp8_blockwise",)
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise") + _FP4_QUANT_TYPES
 
 _INTERNODE_KERNELS = ("auto", "v2", "v2_ll")
+
+_UNKNOWN_PEAK = object()
 
 _DT = {
     torch.bfloat16: 2,
@@ -168,12 +173,12 @@ class EpDispatchCombineConfig:
     #   "v2"     the general path: chunked, deduplicating, sized for wide tokens.
     #   "v2_ll"  low latency: no dedup across expert slots, one entry per node
     #            per token, which wins while the wire is not the bottleneck.
-    #   "auto"   compile BOTH and pick per launch from the token count, at
-    #            internode_auto_ll_max_tokens. This is the only mode that can switch
-    #            at runtime, and it is the only one that pays for both compiles.
+    #   "auto"   compile BOTH and pick per launch from max_num_inp_token_across_ranks,
+    #            at internode_auto_ll_max_tokens ("v2" without it). The only mode that
+    #            switches at runtime, and the only one that pays for both compiles.
     internode_kernel: str = "auto"
-    # The "auto" crossover. Compared against THIS CALL's token count -- dispatch
-    # uses input.shape[0], combine routing.cur_rank_num_token -- so one op
+    # The "auto" crossover. Compared against the max_num_inp_token_across_ranks
+    # this call's dispatch is given -- its combine reuses it -- so one op
     # alternates between the families as the batch changes; it is not a property
     # of the shape. Unrelated to max_num_inp_token_per_rank, which is the
     # capacity. Read only when internode_kernel == "auto".
@@ -234,6 +239,50 @@ class EpDispatchCombineConfig:
     # op's send. With the ops on separate streams, a two-op microbenchmark is
     # slower but DeepSeek-V4 prefill was still faster, so measure that case.
     async_ll_own_sdma_queue: bool = False
+    # Receive layout of async_ll over "sdma" on one node: "compact" (default),
+    # "segmented" or "auto".
+    #
+    # "compact" copies every source's rows into a dense prefix [0, total_recv) of
+    # the recv views. On an op built "segmented", a dispatch with
+    # segment_stride=S instead lands source s's rows at [s * S, s * S + n_s) and
+    # the recv views are that landing region (world_size * S rows): no receive
+    # compaction, and combine sends the expert output from the same layout. A
+    # dispatch without segment_stride still runs a compact round on that op
+    # (e.g. under CUDA graphs).
+    #
+    # Contract of a segmented round:
+    #   * all world_size * S rows are input rows, and total_recv reads that count
+    #     (pass it as e.g. aiter fused_moe num_local_tokens; do not truncate the
+    #     views). Rows outside the valid ranges (holes, often most of them) carry
+    #     a non-local expert with weight 0 and zeroed scales, so expert_mask drops
+    #     them; their hidden bytes are stale, so never reduce hidden states across
+    #     rows (per-tensor scale, global absmax). segment_counts() has the n_s.
+    #   * write the expert output into combine_in_view(); any other tensor is
+    #     copied there first.
+    #   * S must be the same on every rank, so compute it from values every rank
+    #     shares (e.g. the max token count after the DP all-gather); so must the
+    #     choice of segmented or compact. S is at least every rank's token count
+    #     and at most effective_max_recv_per_rank.
+    #       - S past that cap is refused on the host before launch. On every rank
+    #         that is fine; a rank that alone passes one leaves the others
+    #         waiting for it.
+    #       - The other violations do not hang; they are counted
+    #         (segment_error_counts()). S below a rank's rows for a peer drops the
+    #         rest and counts an overflow on that rank only; a stride or mode that
+    #         differs between ranks counts a mismatch on every rank.
+    #       - So the error flags differ between ranks: reduce them across ranks
+    #         before acting on them (e.g. falling back to compact).
+    #   * the views' row count follows S, so a CUDA graph needs a fixed S.
+    #
+    # "segmented" is refused on a config that does not support it; "auto" picks
+    # it exactly when supported, and cfg.async_ll_recv_layout reads the outcome.
+    async_ll_recv_layout: str = "compact"
+    low_latency: bool | None = None
+
+    @property
+    def async_ll_segmented(self) -> bool:
+        """Whether this op can run segmented rounds (async_ll_recv_layout)."""
+        return self.async_ll_recv_layout == "segmented"
 
     def __post_init__(self):
         # Node grouping first: is_internode gates checks further down, and the
@@ -279,6 +328,15 @@ class EpDispatchCombineConfig:
                 raise ValueError(
                     "active_qp_counts is only supported by the internode path"
                 )
+        if self.async_ll_recv_layout not in ("compact", "segmented", "auto"):
+            raise ValueError(
+                "async_ll_recv_layout must be 'compact', 'segmented' or 'auto', "
+                f"got {self.async_ll_recv_layout!r}"
+            )
+        if self.async_ll_recv_layout == "auto" and not self.async_ll:
+            self.async_ll_recv_layout = "compact"
+        if self.async_ll_recv_layout == "segmented" and not self.async_ll:
+            raise ValueError("async_ll_recv_layout='segmented' needs async_ll=True")
 
         # all-or-none: setting only one silently defaults the other to data_type.
         if (self.dispatch_data_type is None) != (self.combine_data_type is None):
@@ -315,6 +373,20 @@ class EpDispatchCombineConfig:
                 "internode_auto_ll_max_tokens must be >= 0, got "
                 f"{self.internode_auto_ll_max_tokens}"
             )
+        if self.low_latency is not None:
+            if type(self.low_latency) is not bool:
+                raise ValueError(
+                    "low_latency must be True, False or None, got "
+                    f"{self.low_latency!r}"
+                )
+            if self.is_internode:
+                family = "v2_ll" if self.low_latency else "v2"
+                if self.internode_kernel not in ("auto", family):
+                    raise ValueError(
+                        f"low_latency={self.low_latency} conflicts with "
+                        f"internode_kernel={self.internode_kernel!r}"
+                    )
+                self.internode_kernel = family
         if self.combine_mode not in ("gather", "scatter"):
             raise ValueError(
                 f"combine_mode must be gather|scatter, got {self.combine_mode!r}"
@@ -737,6 +809,7 @@ class EpDispatchRoutingHandle:
         reverse_src_view=None,
         reverse_encode=None,
         recv_maps=None,
+        max_num_inp_token_across_ranks=_UNKNOWN_PEAK,
     ):
         self.disp_dest_tok_id_map = disp_dest_tok_id_map
         self.recv_maps = recv_maps
@@ -744,6 +817,7 @@ class EpDispatchRoutingHandle:
         self.inter_node_disp_send_map = inter_node_disp_send_map
         self.total_recv_token_num = total_recv_token_num
         self.cur_rank_num_token = cur_rank_num_token
+        self.max_num_inp_token_across_ranks = max_num_inp_token_across_ranks
         # Either an already-materialized reverse map (from_tensors round-trip) or
         # a live arena view to clone on first access (dispatch()).
         self._reverse_cache = disp_tok_id_to_src_tok_id_local
@@ -770,8 +844,14 @@ class EpDispatchRoutingHandle:
         )
 
     @classmethod
-    def from_tensors(cls, tensors, cur_rank_num_token=0):
-        return cls(*tensors, cur_rank_num_token=cur_rank_num_token)
+    def from_tensors(
+        cls, tensors, cur_rank_num_token=0, max_num_inp_token_across_ranks=_UNKNOWN_PEAK
+    ):
+        return cls(
+            *tensors,
+            cur_rank_num_token=cur_rank_num_token,
+            max_num_inp_token_across_ranks=max_num_inp_token_across_ranks,
+        )
 
 
 class EpDispatchCombineOp:
@@ -883,6 +963,25 @@ class EpDispatchCombineOp:
         """Reasons this backend cannot serve `cfg`. Empty = it can."""
         return ()
 
+    def _set_segment_stride(self, stride, num_tokens):
+        """Record this round's segment stride (None or 0 = compact). Only the
+        hip backend's AsyncLL has the segmented layout."""
+        if stride:
+            raise NotImplementedError(
+                f"the {self.backend_name} backend has no segmented dispatch"
+            )
+
+    # The segmented layout's introspection (see async_ll_recv_layout). Backends
+    # without it report nothing.
+    def segment_error_counts(self):
+        return (0, 0)
+
+    def segment_error_flags(self, clear=False):
+        return 0
+
+    def segment_counts(self):
+        return None
+
     def _region(self, name):
         """Arena region a shared view should read.
 
@@ -922,7 +1021,7 @@ class EpDispatchCombineOp:
 
     # -- shared: variant selection -----------------------------------------
 
-    def _pick(self, num_tokens, snapshot=False):
+    def _pick(self, num_tokens, snapshot=False, max_tokens=None):
         """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
         count via the per-token schedule; falls back to the single-shot specs
         otherwise. Clamped to variants that were actually built, so the hot path
@@ -948,6 +1047,54 @@ class EpDispatchCombineOp:
         if comb_spec not in self._kernels.combine:
             comb_spec = self._combine_specs[-1]
         return disp_spec, comb_spec
+
+    _warned_no_peak = False
+
+    def _peak_limit(self, snapshot):
+        return None
+
+    def _check_no_peak(self, snapshot):
+        limit = self._peak_limit(snapshot)
+        if limit is None:
+            return
+        if self.cfg.low_latency:
+            raise ValueError(
+                "low_latency=True needs max_num_inp_token_across_ranks on this op: "
+                f"its low-latency kernels serve calls of at most {limit} tokens per "
+                "rank, and every rank must take the same kernels in a call. Pass the "
+                "largest token count across ranks."
+            )
+        if self.cfg.rank == 0 and not self._warned_no_peak:
+            self._warned_no_peak = True
+            logger.warning(
+                "dispatch() without max_num_inp_token_across_ranks runs this op's "
+                "regular kernels. Pass the largest token count across ranks to run "
+                "calls of at most %d tokens per rank on its low-latency kernels, or "
+                "set low_latency=False to keep the regular ones.",
+                limit,
+            )
+
+    def _routing_peak(self, routing, snapshot):
+        peak = getattr(routing, "max_num_inp_token_across_ranks", _UNKNOWN_PEAK)
+        if peak is not _UNKNOWN_PEAK:
+            return peak
+        if self._peak_limit(snapshot) is not None:
+            raise ValueError(
+                "this routing handle does not carry the "
+                "max_num_inp_token_across_ranks its dispatch was given, and this op "
+                "picks the combine kernels from it. Pass it to "
+                "EpDispatchRoutingHandle.from_tensors (None if the dispatch was given "
+                "none)."
+            )
+        return None
+
+    def _warn_unused_low_latency(self):
+        if self.cfg.low_latency and self.cfg.rank == 0:
+            logger.warning(
+                "low_latency=True has no effect on this op: the %s backend has no "
+                "low-latency kernels for this shape, dtype and device.",
+                self.backend_name,
+            )
 
     @staticmethod
     def _specs_from(cfg):
@@ -1024,6 +1171,8 @@ class EpDispatchCombineOp:
         routing=None,
         return_routing=False,
         snapshot=False,
+        segment_stride=None,
+        max_num_inp_token_across_ranks=None,
     ):
         """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
         scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32.
@@ -1042,6 +1191,15 @@ class EpDispatchCombineOp:
         combines also read routing state the op keeps in the arena, and StdMoE's
         convert reads the op's slot map and forwarded weights.
 
+        max_num_inp_token_across_ranks=: the largest input.shape[0] any rank
+        passes to this call. It picks LL128 on a gfx125x op whose capacity is
+        above the LL128 limit, and the family under internode "auto"; without
+        it those ops run their regular kernels (with low_latency=True the
+        gfx125x one raises). Pass the same value on every rank: only
+        n <= value <= capacity is checked, and ranks that pass different
+        values, or pass it on some ranks only, can pick different kernels and
+        hang. The returned handle keeps it for combine.
+
         out_scales is [max_recv, scale_dim_i32] on both backends but is not always
         CONTIGUOUS -- a backend may lay the rows down wider and return a strided
         view. Read by pointer, stride by scale_stride_bytes(), not by this shape.
@@ -1049,6 +1207,11 @@ class EpDispatchCombineOp:
         total_recv is a DEVICE tensor. Reading it on the host is a full sync that
         costs more than the kernel and makes the op uncapturable, so neither
         backend does it.
+
+        segment_stride=S runs a segmented round on an op built with
+        async_ll_recv_layout="segmented"; the returned views then have
+        world_size * S rows and total_recv reads world_size * S. See
+        EpDispatchCombineConfig.async_ll_recv_layout for the contract.
         """
         with self._asyncll_call("dispatch"):
             return self._dispatch_impl(
@@ -1060,6 +1223,8 @@ class EpDispatchCombineOp:
                 return_routing=return_routing,
                 kernels=self._kernels.dispatch,
                 snapshot=snapshot,
+                segment_stride=segment_stride,
+                max_num_inp_token_across_ranks=max_num_inp_token_across_ranks,
             )
 
     def _dispatch_impl(
@@ -1073,6 +1238,8 @@ class EpDispatchCombineOp:
         return_routing,
         kernels,
         snapshot=False,
+        segment_stride=None,
+        max_num_inp_token_across_ranks=None,
     ):
         """The body of dispatch(), parameterised by which kernel table runs.
 
@@ -1113,7 +1280,15 @@ class EpDispatchCombineOp:
         cap = self.cfg.max_num_inp_token_per_rank
         if n > cap:
             raise ValueError(f"{n} tokens exceeds max_num_inp_token_per_rank={cap}")
-        disp_spec, _ = self._pick(n, snapshot)
+        peak = max_num_inp_token_across_ranks
+        if peak is not None and not n <= peak <= cap:
+            raise ValueError(
+                f"max_num_inp_token_across_ranks={peak} must be at least this "
+                f"rank's {n} tokens and at most max_num_inp_token_per_rank={cap}"
+            )
+        if peak is None:
+            self._check_no_peak(snapshot)
+        disp_spec, _ = self._pick(n, snapshot, peak)
 
         recv_views = None
         if routing is not None:
@@ -1135,6 +1310,8 @@ class EpDispatchCombineOp:
             else:
                 dest_map = self.token_dest_map
 
+        # Last check before the launch, so a refused stride leaves no state behind.
+        self._set_segment_stride(segment_stride, n)
         kern(
             input=input,
             indices=indices,
@@ -1179,6 +1356,7 @@ class EpDispatchCombineOp:
             reverse_src_view=reverse if recv_maps is None else recv_maps[0],
             reverse_encode=encode,
             recv_maps=recv_maps,
+            max_num_inp_token_across_ranks=peak,
         )
         return base + (handle,)
 
@@ -1204,9 +1382,8 @@ class EpDispatchCombineOp:
         """The body of combine(), parameterised by which kernel table runs. See
         _dispatch_impl."""
         ct = routing.cur_rank_num_token
-        _, comb_spec = self._pick(
-            ct, routing.total_recv_token_num is not self.total_recv
-        )
+        snapshot = routing.total_recv_token_num is not self.total_recv
+        _, comb_spec = self._pick(ct, snapshot, self._routing_peak(routing, snapshot))
 
         if not self._kernels.stages_in_kernel and not self.cfg.enable_std_moe:
             # StdMoE has already written the weighted-reduced tokens into out_tok;
@@ -1268,7 +1445,9 @@ class EpDispatchCombineOp:
     #
     # The send half returns the same tuple dispatch() does, but the output buffers
     # are NOT populated until the matching recv call has run. Reading them in the
-    # seam reads the previous round.
+    # seam reads stale data: the previous round's on a compact round, and on a
+    # segmented round (async_ll_recv_layout) bytes the engines are still writing,
+    # since those views are the landing region itself.
 
     # The AsyncLL protocol's call order, as a state machine. What each call is
     # allowed to see, and what it leaves behind:
@@ -1366,7 +1545,15 @@ class EpDispatchCombineOp:
         return table
 
     def dispatch_send(
-        self, input, weights, scales, indices, *, routing=None, return_routing=False
+        self,
+        input,
+        weights,
+        scales,
+        indices,
+        *,
+        routing=None,
+        return_routing=False,
+        segment_stride=None,
     ):
         """Enqueue the send half of a dispatch and return immediately.
 
@@ -1382,6 +1569,7 @@ class EpDispatchCombineOp:
                 routing=routing,
                 return_routing=return_routing,
                 kernels=self._async_half("dispatch_send"),
+                segment_stride=segment_stride,
             )
 
     def dispatch_recv(self):

@@ -475,6 +475,17 @@ def _golden(cfg, args, inp, idx, wts=None):
     )
 
 
+def _dispatch(op, inp, wts, sc, idx, peak=None):
+    return op.dispatch(
+        inp,
+        wts,
+        sc,
+        idx,
+        return_routing=True,
+        max_num_inp_token_across_ranks=inp.shape[0] if peak is None else peak,
+    )
+
+
 def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
     """One dispatch+combine against the analytic golden. True if this rank agrees.
 
@@ -483,7 +494,7 @@ def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
     always folded here even when the timed loop will not fold them -- an
     unchecked weight path is how this harness shipped a silent bug twice.
     """
-    dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+    dispatch_out = _dispatch(op, inp, wts, sc, idx)
     torch.cuda.synchronize()
     comm.barrier()
     combine_input = _combine_input(cfg, dispatch_out[0])
@@ -595,7 +606,7 @@ def _report_loop_alignment(args, rank):
 def _geometry_for_report(op, num_tokens):
     """Report the same HIP configuration used to select the launch callable:
     (block, rdma, warp, active_qps) per phase, after any set_active_qps()."""
-    selected = op.kernel_config(num_tokens)
+    selected = op.kernel_config(num_tokens, num_tokens)
     return tuple(
         (spec.block_num, spec.rdma_block_num, spec.warp_per_block, spec.active_qps)
         for spec in (selected.dispatch, selected.combine)
@@ -796,7 +807,7 @@ def _report_tables(
         )
 
 
-def _family_that_ran(op, num_tokens):
+def _family_that_ran(op, num_tokens, max_tokens):
     """Which kernel family served this call, as kernel_config() resolves it.
 
     AsyncLL is reported with its transport: sdma and lsa are different kernels
@@ -804,7 +815,7 @@ def _family_that_ran(op, num_tokens):
     """
     if getattr(op.cfg, "async_ll", False):
         return f"asyncll({op.cfg.async_ll_transport})"
-    return op.kernel_config(num_tokens).dispatch.family
+    return op.kernel_config(num_tokens, max_tokens).dispatch.family
 
 
 def _bench(op, cfg, dist_handle, device, args, comm):
@@ -881,7 +892,7 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     # as slow as every round after it.
     warmup_combine_input = None
     for i in range(args.warmup):
-        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        dispatch_out = _dispatch(op, inp, wts, sc, idx)
         if i == args.warmup - 1:
             # Read it here, not in the timed loop: .item() synchronises.
             torch.cuda.synchronize()
@@ -936,7 +947,7 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     for i in range(num_rounds):
         if print_series:
             round_start[i] = time.perf_counter()
-        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        dispatch_out = _dispatch(op, inp, wts, sc, idx)
         if print_series:
             host_dispatch_us[i] = (time.perf_counter() - round_start[i]) * 1e6
         events[3 * i + 1].record()
@@ -1064,7 +1075,7 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     # Report the family that RAN, not the request: under "auto" the request does
     # not name one, and a number is only comparable to another harness's if the
     # kernel behind it is named.
-    kernel_ran = _family_that_ran(op, num_tokens)
+    kernel_ran = _family_that_ran(op, num_tokens, num_tokens)
     if dist_handle.rank == 0:
         print(
             f"# BENCH tok={num_tokens} "
@@ -1083,7 +1094,10 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     # performance tables. Off with --no-bench-tables; it costs one all_gather
     # after the timed loop and nothing inside it.
     if not args.no_bench_tables:
-        ll = op.kernel_config(args.max_tokens).dispatch.family == "v2_ll"
+        ll = (
+            op.kernel_config(args.max_tokens, args.max_tokens).dispatch.family
+            == "v2_ll"
+        )
         geometry = _geometry_for_report(op, args.max_tokens)
         _report_tables(
             dist_handle,
@@ -1223,7 +1237,7 @@ def _timed_rounds(
     # default --tuning-margin-us of 1.5.
     warmup_combine_input = None
     for _ in range(num_warmup):
-        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        dispatch_out = _dispatch(op, inp, wts, sc, idx)
         warmup_combine_input = convert(dispatch_out[0])
         op.combine(warmup_combine_input, combine_weights, routing=dispatch_out[5])
     del warmup_combine_input
@@ -1232,7 +1246,7 @@ def _timed_rounds(
         dist.barrier()
     events[0].record()
     for i in range(num_rounds):
-        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        dispatch_out = _dispatch(op, inp, wts, sc, idx)
         events[3 * i + 1].record()
         combine_input = convert(dispatch_out[0])
         events[3 * i + 2].record()
@@ -1312,7 +1326,7 @@ def _row_metrics(op, cfg, args, dist_handle, rng_data, convert, ll):
     if args.warmup < 0:
         raise ValueError("Metric warmup must be nonnegative")
     inp, idx, wts, sc, combine_weights = rng_data
-    dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+    dispatch_out = _dispatch(op, inp, wts, sc, idx)
     torch.cuda.synchronize()
     total_recv = int(dispatch_out[4].item())
     combine_input = convert(dispatch_out[0])
@@ -1380,7 +1394,7 @@ def _stress(op, cfg, dist_handle, device, args, comm):
     dataset, so the soak covers what a fixed-size bench cannot: ragged and
     unequal loads, the chunk protocol's empty-chunk path, and -- under
     internode_kernel="auto" -- the per-call switch between the v2 and v2_ll
-    families, since the counts fall on both sides of the crossover.
+    families, since every eighth dataset keeps all ranks at or below the crossover.
 
     By default no per-round verification: this looks for hangs, faults and
     protocol drift over many rounds, and checking every round would hide them
@@ -1402,8 +1416,12 @@ def _stress(op, cfg, dist_handle, device, args, comm):
     counts = torch.randint(
         1, max_tokens + 1, [args.stress_datasets], generator=rng, device=device
     ).tolist()
+    ll = min(cfg.internode_auto_ll_max_tokens, max_tokens)
+    if cfg.internode_kernel == "auto" and not cfg.async_ll and ll > 0:
+        counts = [(n - 1) % ll + 1 if j % 8 == 0 else n for j, n in enumerate(counts)]
     if dist_handle.rank // cfg.gpu_per_node == args.stress_full_node:
         counts = [max_tokens] * len(counts)
+    peaks = dist_handle.all_gather_rows(counts).max(dim=0).values.long().tolist()
     datasets = [
         _generate_round(rng, cfg, int(n), device, cfg.dispatch_dtype, args.routing)
         for n in counts
@@ -1416,7 +1434,7 @@ def _stress(op, cfg, dist_handle, device, args, comm):
             expected.append((golden.hidden, golden.hidden_bound))
     failed_checks = checks = 0
     if dist_handle.rank == 0:
-        families = sorted({_family_that_ran(op, n) for n in set(counts)})
+        families = sorted({_family_that_ran(op, n, p) for n, p in zip(counts, peaks)})
         print(
             f"# STRESS rounds={args.rounds} datasets={args.stress_datasets} "
             f"tokens=[{min(counts)},{max(counts)}] of {max_tokens} "
@@ -1434,7 +1452,7 @@ def _stress(op, cfg, dist_handle, device, args, comm):
         inp, idx, wts, sc = datasets[i % len(datasets)]
         if qp_schedule:
             op.set_active_qps(_active_qp_for(qp_schedule, i, cfg, 0))
-        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        dispatch_out = _dispatch(op, inp, wts, sc, idx, peaks[i % len(datasets)])
         combine_input = _combine_input(cfg, dispatch_out[0])
         if qp_schedule:
             op.set_active_qps(_active_qp_for(qp_schedule, i, cfg, 1))
@@ -1553,7 +1571,9 @@ def _tune(cfg, dist_handle, device, args, comm):
         "combine": DTYPE_TO_CONFIG_STR.get(cfg.combine_dtype),
     }
     kernel_family = (
-        internode_kernel_family(cfg, args.max_tokens) if cfg.is_internode else "intra"
+        internode_kernel_family(cfg, max_tokens=args.max_tokens)
+        if cfg.is_internode
+        else "intra"
     )
     if args.tuning_save or args.tuning_config_dir:
         # Read the incumbent from the SAME table the winner will be written to.
@@ -2288,8 +2308,8 @@ def main(argv):
 
             if qp_schedule:
                 op.set_active_qps(_active_qp_for(qp_schedule, round_index, cfg, 0))
-            recv_x, recv_w, recv_s, recv_i, total_recv, routing = op.dispatch(
-                inp, wts, sc, idx, return_routing=True
+            recv_x, recv_w, recv_s, recv_i, total_recv, routing = _dispatch(
+                op, inp, wts, sc, idx
             )
             torch.cuda.synchronize()
             comm.barrier()
