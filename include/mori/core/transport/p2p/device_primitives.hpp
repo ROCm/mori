@@ -67,6 +67,10 @@ using VecTypeT = std::conditional_t<VecBytes == 1,  uint8_t,
                  std::conditional_t<VecBytes == 16, VecU32x4, void>>>>>;
 // clang-format on
 
+template <typename T>
+using AccumFp32T = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
+
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Load/Store                                           */
 /* ---------------------------------------------------------------------------------------------- */
@@ -351,84 +355,6 @@ inline __device__ void WarpAccum(T* accum, T* src, size_t nelems) {
   }
 }
 
-template <typename T, int VecBytes>
-__forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const* __restrict__ srcs,
-                                                 const float* __restrict__ srcScales,
-                                                 size_t accumNum, size_t nelems) {
-  static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
-
-  constexpr int vecSize = VecBytes / sizeof(T);
-  // With 4 and 8 B vectors a batch's loads are all issued before any of them is
-  // accumulated, so a count without a case of its own keeps up to 8 peer reads in
-  // flight instead of one, at the AccumNum=8 case's footprint. 16 B vectors load one
-  // source at a time: batching them here took the topk-9 LL combine gather from
-  // 82-94 to 123-128 VGPRs, with spills, and 5-6% slower above T512.
-  constexpr int kLoadBatch = 8;
-  const int laneId = threadIdx.x & (warpSize - 1);
-  size_t offset = 0;
-
-  using DataType = VecTypeT<VecBytes>;
-  constexpr int elemsPerWarp = warpSize * vecSize;
-  const size_t laneOffset = laneId * vecSize;
-
-  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
-
-  for(; offset + elemsPerWarp <= nelems; offset += elemsPerWarp) {
-    AccumFp32Type accumValFp32[vecSize] = {AccumFp32Type{0}};
-    if constexpr (VecBytes <= 8) {
-      for (size_t first = 0; first < accumNum; first += kLoadBatch) {
-        DataType srcVals[kLoadBatch];
-#pragma unroll
-        for (int i = 0; i < kLoadBatch; ++i) {
-          if ((first + i < accumNum) && (srcs[first + i] != nullptr))
-            srcVals[i] = load<VecBytes>(srcs[first + i] + offset + laneOffset);
-        }
-#pragma unroll
-        for (int i = 0; i < kLoadBatch; ++i) {
-          if ((first + i >= accumNum) || (srcs[first + i] == nullptr)) continue;
-          float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[first + i];
-#pragma unroll
-          for (int j = 0; j < vecSize; ++j) {
-            accumValFp32[j] += AccumFp32Type(reinterpret_cast<const T*>(&srcVals[i])[j]) * srcScale;
-          }
-        }
-      }
-    } else {
-#pragma unroll
-      for (int i = 0; i < accumNum; ++i) {
-        if (srcs[i] == nullptr) continue;
-        DataType srcVal = load<VecBytes>(srcs[i] + offset + laneOffset);
-        float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
-#pragma unroll
-        for (int j = 0; j < vecSize; ++j) {
-          accumValFp32[j] += AccumFp32Type(VecElem<T>(srcVal, j)) * srcScale;
-        }
-      }
-    }
-    union {
-      DataType accumVec;
-      T accumVal[vecSize];
-    };
-#pragma unroll
-    for (int j = 0; j < vecSize; ++j) {
-      accumVal[j] = T(accumValFp32[j]);
-    }
-    store<VecBytes>(dest + offset + laneOffset, accumVec);
-  }
-  // remaining size, one element per lane
-  for(offset += laneId; offset < nelems; offset += warpSize) {
-    AccumFp32Type accumValFp32 = AccumFp32Type{0};
-    for (int i = 0; i < accumNum; ++i) {
-      const T* srcPtr = srcs[i];
-      if (srcPtr == nullptr) continue;
-
-      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
-      accumValFp32 += AccumFp32Type(srcPtr[offset]) * srcScale;
-    }
-    dest[offset] = T(accumValFp32);
-  }
-}
-
 // E4M3 element types whose float conversions WarpAccumImpl does two at a time with the packed
 // cvt builtins. The per-element conversions of __hip_fp8_e4m3(_fnuz) spend one cvt per byte and
 // then reassemble the bytes, which on gfx950 is ~3x the VALU of the accumulation it feeds.
@@ -543,6 +469,79 @@ __device__ __forceinline__ uint32_t AccumPackedEncodeWord(const AccT* acc) {
   return word;
 }
 
+template <typename T, int VecBytes>
+__forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const* __restrict__ srcs,
+                                                 const float* __restrict__ srcScales,
+                                                 size_t accumNum, size_t nelems) {
+  static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
+
+  constexpr int vecSize = VecBytes / sizeof(T);
+  // With 4 and 8 B vectors a batch's loads are all issued before any of them is
+  // accumulated, so a count without a case of its own keeps up to 8 peer reads in
+  // flight instead of one, at the AccumNum=8 case's footprint. 16 B vectors load one
+  // source at a time: batching them here took the topk-9 LL combine gather from
+  // 82-94 to 123-128 VGPRs, with spills, and 5-6% slower above T512.
+  constexpr int kLoadBatch = 8;
+  const int laneId = threadIdx.x & (warpSize - 1);
+  size_t offset = 0;
+
+  using DataType = VecTypeT<VecBytes>;
+  constexpr int elemsPerWarp = warpSize * vecSize;
+  const size_t laneOffset = laneId * vecSize;
+
+  for(; offset + elemsPerWarp <= nelems; offset += elemsPerWarp) {
+    AccumFp32T<T> accumValFp32[vecSize] = {AccumFp32T<T>{0}};
+    if constexpr (VecBytes <= 8) {
+      for (size_t first = 0; first < accumNum; first += kLoadBatch) {
+        DataType srcVals[kLoadBatch];
+#pragma unroll
+        for (int i = 0; i < kLoadBatch; ++i) {
+          if ((first + i < accumNum) && (srcs[first + i] != nullptr))
+            srcVals[i] = load<VecBytes>(srcs[first + i] + offset + laneOffset);
+        }
+#pragma unroll
+        for (int i = 0; i < kLoadBatch; ++i) {
+          if ((first + i >= accumNum) || (srcs[first + i] == nullptr)) continue;
+          float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[first + i];
+          WarpAccumPackedDecode<T, VecBytes>(accumValFp32,
+                                             reinterpret_cast<const uint32_t*>(&srcVals[i]),
+                                             srcScale);
+        }
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < accumNum; ++i) {
+        if (srcs[i] == nullptr) continue;
+        DataType srcVal = load<VecBytes>(srcs[i] + offset + laneOffset);
+        float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+        WarpAccumPackedDecode<T, VecBytes>(accumValFp32, reinterpret_cast<const uint32_t*>(&srcVal),
+                                           srcScale);
+      }
+    }
+    union {
+      DataType accumVec;
+      uint32_t accumWord[VecBytes / 4];
+    };
+#pragma unroll
+    for (int k = 0; k < VecBytes / 4; ++k) {
+      accumWord[k] = AccumPackedEncodeWord<T>(&accumValFp32[k * (4 / sizeof(T))]);
+    }
+    store<VecBytes>(dest + offset + laneOffset, accumVec);
+  }
+  // remaining size, one element per lane
+  for(offset += laneId; offset < nelems; offset += warpSize) {
+    AccumFp32T<T> accumValFp32 = AccumFp32T<T>{0};
+    for (int i = 0; i < accumNum; ++i) {
+      const T* srcPtr = srcs[i];
+      if (srcPtr == nullptr) continue;
+
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+      accumValFp32 += AccumFp32T<T>(srcPtr[offset]) * srcScale;
+    }
+    dest[offset] = T(accumValFp32);
+  }
+}
+
 // Unroll defaults to 1 (one vec-chunk per source per iteration). Unroll > 1 batches that many
 // consecutive vec-chunks per iteration instead.
 //
@@ -562,7 +561,6 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
                                               size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
   using DataType = VecTypeT<VecBytes>;
-  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
   constexpr int elemsPerWarp = Unroll * warpSize * vecSize;
   const int laneId = threadIdx.x & (warpSize - 1);
 
@@ -575,11 +573,11 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
   }
 
   for (; offset + elemsPerWarp <= nelems; offset += elemsPerWarp) {
-    AccumFp32Type acc[Unroll][vecSize];
+    AccumFp32T<T> acc[Unroll][vecSize];
 #pragma unroll Unroll
     for (int u = 0; u < Unroll; ++u)
 #pragma unroll vecSize
-      for (int j = 0; j < vecSize; ++j) acc[u][j] = AccumFp32Type{0};
+      for (int j = 0; j < vecSize; ++j) acc[u][j] = AccumFp32T<T>{0};
 
     if constexpr (LoadFirst) {
       DataType vals[Unroll][AccumNum];
@@ -615,15 +613,14 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
         if (cached_srcs[i] == nullptr) continue;
 #pragma unroll Unroll
         for (int u = 0; u < Unroll; ++u) {
-          WarpAccumPackedDecode<T, VecBytes>(acc[u], reinterpret_cast<const uint32_t*>(&vals[u]),
-                                             scales[i]);
+          WarpAccumPackedDecode<T, VecBytes>(acc[u], 
+            reinterpret_cast<const uint32_t*>(&vals[u]), scales[i]);
         }
       } // for AccumNum
     }
 
     union {
       DataType outVec[Unroll];
-      T outVal[Unroll][vecSize];
       uint32_t outWord[Unroll][VecBytes / 4];
     };
 #pragma unroll Unroll
@@ -650,18 +647,16 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
   // NOTE: the original code does not pass Unroll parameter, so we pass it as 1 here!
   WarpAccumImpl<T, VecBytes, AccumNum, /*Unroll=*/1, /*LoadFirst=*/false>(
                                         dest, srcs, srcScales, offset, nelems);
-  // remaining size
-  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
-
+  
   for(offset += laneId; offset < nelems; offset += warpSize) {
-    AccumFp32Type accumValFp32 = AccumFp32Type{0};
+    AccumFp32T<T> accumValFp32 = AccumFp32T<T>{0};
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
       const T* srcPtr = srcs[i];
       if (srcPtr == nullptr) continue;
 
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
-      accumValFp32 += AccumFp32Type(srcPtr[offset]) * srcScale;
+      accumValFp32 += AccumFp32T<T>(srcPtr[offset]) * srcScale;
     }
     dest[offset] = T(accumValFp32);
   }
@@ -739,19 +734,16 @@ __forceinline__ __device__ void WarpAccumLF(T* __restrict__ dest, T* const* __re
 #undef WARP_ACCUM_LF_CASE
 
   // Scalar remainder for the tail that doesn't fill Unroll*warpSize*vecSize.
-  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
   const int laneId = threadIdx.x & (warpSize - 1);
-  offset += laneId;
-  while (offset < nelems) {
-    AccumFp32Type accumValFp32 = AccumFp32Type{0};
+  for(offset += laneId; offset < nelems; offset += warpSize) {
+    AccumFp32T<T> accumValFp32 = AccumFp32T<T>{0};
     for (int i = 0; i < static_cast<int>(accumNum); ++i) {
       const T* srcPtr = srcs[i];
-      if (srcPtr == nullptr) continue;
+      if (srcPtr == nullptr) continue;  
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
-      accumValFp32 += AccumFp32Type(srcPtr[offset]) * srcScale;
-    }
+      accumValFp32 += AccumFp32T<T>(srcPtr[offset]) * srcScale;
+    } 
     dest[offset] = T(accumValFp32);
-    offset += warpSize;
   }
 }
 
