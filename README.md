@@ -40,7 +40,7 @@
 
 **MORI** (**Mo**dular **R**DMA **I**nterface) is a **bottom-up, modular, and composable framework** for building high-performance communication applications with a strong focus on **RDMA + GPU integration**. Inspired by the role of MLIR in compiler infrastructure, MORI provides reusable and extensible building blocks that make it **easier for developers to adopt advanced techniques** such as IBGDA (Infiniband GPUDirect Async) and GDS (GPUDirect Storage).
 
-To help developers get started quickly, MORI also includes a suite of optimized libraries—**MORI-EP** (MoE dispatch & combine kernels, in two generations: EPv1 on MORI-SHMEM and EPv2 on MORI-CCO), **MORI-IO** (p2p communication for KVCache transfer), **MORI-CCL** (collective communication), and **MORI-CCO** (Next-Generation Collective Communication Object for GPUs), and **MORI-FUSED** (GEMMs fused with collectives, built on MORI-CCO)—that deliver out-of-the-box performance, with support for AMD `Pensando DSC`, Broadcom `Thor2`, and NVIDIA Mellanox `ConnectX-7` NICs.
+To help developers get started quickly, MORI also includes a suite of optimized libraries—**MORI-EP** (MoE dispatch & combine kernels, in two generations: EPv1 on MORI-SHMEM and EPv2 on MORI-CCO), **MORI-IO** (p2p communication for KVCache transfer), **MORI-CCL** (collective communication), **MORI-CCO** (Next-Generation Collective Communication Object for GPUs) and **MORI-FUSED** (GEMMs fused with collectives, built on MORI-CCO)—that deliver out-of-the-box performance, with support for AMD `Pensando DSC`, Broadcom `Thor2`, and NVIDIA Mellanox `ConnectX-7` NICs.
 
 ## Features summary
 - Applications
@@ -341,12 +341,13 @@ cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
 python -c "import mori; print(mori.__file__)"
 
-# Test correctness (8 GPUs)
+# Test correctness (8 GPUs, gfx942 or gfx950: on gfx125x the default HIP backend
+# rejects some of the cases these run, such as scatter combine and StdMoE)
 pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -q
-pytest tests/python/ops/dispatch_combine_v2/test_ep_backend_parity.py -q
+torchrun --standalone --nproc_per_node=8 tests/python/ops/dispatch_combine_v2/test_ep_backend_parity.py
 
 # Benchmark performance
-python tests/python/ops/dispatch_combine_v2/bench_ep.py
+torchrun --standalone --nproc_per_node=8 tests/python/ops/dispatch_combine_v2/bench_ep.py
 ```
 
 Two-node runs and their restrictions: see the [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html#epv2-restrictions).
@@ -378,12 +379,22 @@ pytest tests/python/io/
 
 # Benchmark performance (two nodes). The runner defaults to the native C++
 # benchmark (tests/cpp/io/bench_engine); pass --engine python for the torchrun path.
-tools/run_internode_io_benchmark.sh --rank 0 --master-addr "10.194.129.65" --ifname ens14np0 \
+tools/run_internode_io_benchmark.sh --rank 0 --master-addr "<master_ip>" --ifname ens14np0 \
   -- --op write --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
 # (run the same command on the second node with --rank 1)
 ```
 
 See the [MORI-IO benchmark guide](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) for both engines and tuning.
+
+### Test MORI-IR (Triton + shmem integration, [guide](https://github.com/ROCm/mori/blob/main/python/mori/ir/README.md))
+
+```bash
+# Basic shmem put (2 GPUs)
+torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
+
+# Allreduce (8 GPUs)
+torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+```
 
 ## Contribution Guide
 

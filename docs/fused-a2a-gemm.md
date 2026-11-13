@@ -413,7 +413,7 @@ per rank.
 ## 10. Complete example
 
 ```python
-# o_proj.py: torchrun --standalone --nproc_per_node=8 o_proj.py
+# o_proj.py: MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 o_proj.py
 import os
 
 import torch
@@ -547,8 +547,8 @@ command.
 | `ValueError: M=... exceeds the window's m_max=...` | M above the window | Construct with a larger `m_max`; the window cannot grow |
 | `ValueError: a_fp8 must be [world*M, ...]` | `a_fp8` is `[M, K]`, or has the wrong width | Pass every token, with this rank's `K/P` columns |
 | `ValueError: a_scale must have M elements, got P*M` | The whole `[P*M]` scale was passed | Pass `scale[rank*M:(rank+1)*M]` |
-| A call never returns | A rank skipped a call, used another M, or was built with another `mode` or `chunks`, so a band or a barrier never arrives | Same arguments and the same calls on every rank |
-| Wrong results, no error | A per-shard A scale; the same scale slice on every rank; different `chunks` on different ranks; a weight not through `preshuffle_b` or not identical on every rank; `acquire="none"` with `CCO_UNCACHED_WINDOW=0`; `c` read after the next call at that M; `send_buffer` written from a stream not ordered after the previous call | See [5. Calling the operator](#5-calling-the-operator) |
+| A call never returns | A rank skipped a call, used another M, or was built with another `mode`, or (fused) a sender splits its slab into fewer `chunks` than its receiver, so a band or a barrier never arrives | Same arguments and the same calls on every rank |
+| Wrong results, no error | A per-shard A scale; the same scale slice on every rank; (fused) a sender with more `chunks` than its receiver, whose band waits then pass before the rows have landed; a weight not through `preshuffle_b` or not identical on every rank; `acquire="none"` with `CCO_UNCACHED_WINDOW=0`; `c` read after the next call at that M; `send_buffer` written from a stream not ordered after the previous call | See [5. Calling the operator](#5-calling-the-operator) |
 | The first call at a new M is slow | It compiles that M's kernels | Warm every M before timing or capturing |
 
 ## Further reading

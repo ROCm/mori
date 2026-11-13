@@ -392,7 +392,7 @@ graph-timed, maximum over ranks. `sc_release` is the default publication;
 | 4 | 4096 | **662.0** (split) | 682.8 | 683.3 | 661.7 |
 | 4 | 8192 | **1231.3** (fused) | 1231.3 | 1232.7 | 1282.2 |
 
-**Against Torch + RCCL**: 2026-10-29, eight MI355X (crsuse2-m2m-v3-054), ROCm
+**Against Torch + RCCL**: 2026-10-29, eight MI355X, ROCm
 7.2, PyTorch 2.11.0+rocm7.2, FlyDSL 0.4.0; the benchmark's modes, bf16 in, fp32
 out, MORI's GEMM at a fixed 128x128 tile; 50 warm-ups and 101 graph samples,
 maximum over ranks, median of three interleaved rounds. Fused rows use

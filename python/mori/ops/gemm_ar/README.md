@@ -590,8 +590,8 @@ load and has not reproduced; what has been ruled out is in that section.
 
 ### Follow-up experiments (2026-09-30)
 
-The same two `wo_b` targets were evaluated on `v2-015` with isolated prototype
-modules. The positive joint profile and relaxed-row FP8 scatter are now
+The same two `wo_b` targets were evaluated on one MI355X node with isolated
+prototype modules. The positive joint profile and relaxed-row FP8 scatter are now
 available through the public op's opt-in settings above; defaults are unchanged.
 All 27 experiment jobs and four strict finite-value rechecks passed their numerical/guard checks,
 including post-graph output checks and mixed-M graph validations. Paired timings use 8 calls per graph and 21 replays:
@@ -621,19 +621,16 @@ The pipeline result applies to the tested macro split with separate queue lanes
 and joined streams; it does not evaluate receiver-ready reduction during one
 monolithic GEMM launch. All timings exclude activation preparation and use equal
 backing capacities with logical tail guards, as in the 2026-09-29 retest.
-Prototype code, patches, paired results and reproduction commands are archived
-outside the repository, in `gemm-ar-followup-20260930`.
 
-Public integration was checked separately on `v2-015`: 65 host checks and all
+Public integration was checked separately on one MI355X node: 65 host checks and all
 six TP8/TP4 public-op jobs passed, covering default/profile scheduling,
 changed-input graph replay, guards, self-test and both FP8 communication legs.
 The kernel timings above remain the prototype measurements; no new latency or
-model-quality claim is added. Integration logs and source hashes are archived
-outside the repository, in `gemm-ar-integration-20260930`.
+model-quality claim is added.
 
 ### Target operator update (2026-09-29)
 
-Measured on `v2-015`, MI355X/gfx950, Torch 2.11 / ROCm 7.2.4 / FlyDSL 0.2.4,
+Measured on one MI355X/gfx950 node, Torch 2.11 / ROCm 7.2.4 / FlyDSL 0.2.4,
 using MORI `fd35a5ec79d8` and SGLang operator source `e29ebcd051`. The published
 runs used GPU-process monitoring; the earlier run with background GPU work was
 excluded. GEMV, model end-to-end and model-quality tests were not rerun.
@@ -675,8 +672,6 @@ TP8 and **522 → 282** for TP4. Those physical allocation deltas and the paired
 latencies are separate measurements; full operator peaks and immediate physical
 reclamation are not established.
 
-Detailed results, commands, runtime/source hashes and failed attempts remain
-outside the repository, in `gemm-ar-v2-015-20260929`.
 These are operator microbenchmarks, not new model end-to-end speedups.
 
 ### The mxfp8 GEMM, on its own
@@ -1281,7 +1276,7 @@ plus a fill guard.
 
 #### Operator phase breakdown (2026-09-30)
 
-Flash TP4 `wo_b`, **M=16384, N=5120, K=2048, MXFP8**, on `v2-015` using
+Flash TP4 `wo_b`, **M=16384, N=5120, K=2048, MXFP8**, on one MI355X node using
 Mori `f3bff0ae`. These are fresh operator measurements; the earlier Pro TP8
 SGLang phase table describes a different workload. All configurations use
 256x256 GEMM tiles, one SDMA queue per peer where applicable, eight fused
@@ -1343,8 +1338,6 @@ at most **0.12%** across these configurations.
 All nine configurations passed independent FP32-reference, changed-input,
 graph-replay and guard checks; FP8 scatter also passed the actual-wire checks.
 Both FP8 legs give about **3.48% relL2**; model quality was not tested.
-Raw timings, 88,704 kernel records, per-rank breakdowns and reproduction commands
-are in the phase archive outside the repository, `gemm-ar-phases-20260930`.
 
 ### Kimi-K3 (blockscale, TP8 and TP4)
 
@@ -1922,7 +1915,7 @@ all-reduce.
 
 ### What gcnasm does differently
 
-`/workspace/gcnasm/opus_gemm_dist/opus_gemm_a2a_lsa` fuses a GEMM with an
+gcnasm's `opus_gemm_dist/opus_gemm_a2a_lsa` fuses a GEMM with an
 all-to-all and gets 16-27% out of it. Reading it explains most of why this does
 not, and one of its lessons was worth ~90us here.
 

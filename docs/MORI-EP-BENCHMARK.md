@@ -55,7 +55,7 @@ export GLOO_SOCKET_IFNAME=enp81s0f1
 export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # Optional: use `^` prefix to exclude specified devices
 
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.129.65" --master_port=1234 \
+    --master_addr="<master_ip>" --master_port=1234 \
     examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench
 ```
 
@@ -409,7 +409,7 @@ export GLOO_SOCKET_IFNAME=enp81s0f1
 export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # optional
 
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.129.65" --master_port=1234 \
+    --master_addr="<master_ip>" --master_port=1234 \
     examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
     --cmd profile --kernel-type v1
 ```

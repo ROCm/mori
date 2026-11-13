@@ -279,7 +279,7 @@ def lsa_copy(dev_comm, win, peer: tl.constexpr, N: tl.constexpr):
 lsa_copy[(1,)](dc.ptr, win.handle, peer=1, N=256, extern_libs=cco.get_extern_libs())
 ```
 
-`cco.DevComm`, `cco.Window`, `cco.Gda` and `cco.Sdma` are namespaces. Each call takes the raw handle as its first argument, for example `cco.Gda.put(dev_comm, peer, ...)`. `cco.GdaDeferred` and `cco.GdaCallerOrdered` are the same for the other doorbell modes.
+`cco.DevComm`, `cco.Window`, `cco.Gda` and `cco.Sdma` are namespaces. Each call takes the raw handle as its first argument, for example `cco.Gda.put(dev_comm, peer, ...)`. `cco.GdaDeferred` is the same for a deferred-doorbell handle. `cco.GdaCallerOrdered`, for a caller-ordered handle, differs: it has no `signal` (put with a `signal_op` instead), and only its own `flush`, `flush_peer` and `flush_async` release its posts.
 
 #### FlyDSL
 
@@ -302,7 +302,7 @@ def put_kernel(dev_comm: fx.Int64, send_win: fx.Int64, recv_win: fx.Int64, nbyte
 #### Requirements
 
 - **SDMA**: build with `BUILD_CCO_SDMA=ON` (the default) and run with `MORI_ENABLE_SDMA=1`.
-- **GDA on one node**: set `MORI_CCO_GDA_CONN=full`.
+- **GDA on one node**: set `gda_connection_type = GDA_CONNECTION_FULL` on the `CCODevCommRequirements` ([4. Device Communicator](#4-device-communicator)). Example 03 exposes this as `MORI_CCO_GDA_CONN=full`; the library does not read that variable.
 - **GDA provider**: fixed at build time, one per NIC, as for the C++ kernels.
 - **FlyDSL**: `pip install flydsl`. Triton needs a Triton install.
 

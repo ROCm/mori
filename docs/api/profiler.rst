@@ -90,6 +90,7 @@ Available via ``mori.cpp`` when built with ``ENABLE_PROFILER=ON``:
      - ``(pointer, length)`` of the per-warp write offsets. Use
        ``op.get_debug_time_offset()`` instead, which wraps it as a ``torch.Tensor``
    * - ``get_cur_device_wall_clock_freq_mhz()``
-     - Get GPU wall clock frequency in MHz
+     - GPU wall-clock frequency. Despite the name, the value is in kHz
+       (``hipDeviceAttributeWallClockRate``); ``kernel_profiler`` divides it by 1e6 to get GHz
 
 See :doc:`PROFILER.md <../PROFILER>` for full profiler documentation.

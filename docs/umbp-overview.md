@@ -61,8 +61,10 @@ unless those are already set.
 - The master serves Prometheus metrics on port 9091 (or its second argument). A
   standalone server without a master serves its own on 9092
   (`UMBP_STANDALONE_METRICS_PORT`). Dashboards: [Monitoring](umbp-monitoring.md).
-- Every process logs a one-line activity summary once a minute
-  (`UMBP_SUMMARY_INTERVAL_MS`). `MORI_UMBP_LOG_LEVEL` sets UMBP's log level.
+- Each client (an engine's, or the one inside `umbp_standalone_server`) logs a
+  one-line activity summary once a minute at INFO (`UMBP_SUMMARY_INTERVAL_MS`);
+  `umbp_master` does not. UMBP logs at `error` by default, so set
+  `MORI_UMBP_LOG_LEVEL=info` to see it.
 - [KV indexer export](umbp-kv-indexer-export.md) reports committed DRAM blocks
   to SGLang's KV indexer.
 - The control-plane client, `UMBPMasterClient`, is in the

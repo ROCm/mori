@@ -291,7 +291,7 @@ This copies the current GPU states to the `globalGpuStates` symbol in the dynami
 
 ## Device Bitcode and IR
 
-MORI-SHMEM device functions can be called from GPU kernels written in Triton, FlyDSL, MLIR or HIP. They are pre-compiled to LLVM bitcode (`libmori_shmem_device.bc`) as `extern "C"` wrappers. The `mori.ir` Python package locates the bitcode and gives the ABI metadata of every device function. Any framework that can link LLVM bitcode can use them. Triton is the reference integration.
+MORI-SHMEM device functions can be called from GPU kernels written in Triton, FlyDSL, MLIR or HIP. They are pre-compiled to LLVM bitcode (`libmori_shmem_device.bc`) as `extern "C"` wrappers. The `mori.ir` Python package locates the bitcode and gives the ABI metadata of every device function. Any framework that can link LLVM bitcode can use them. Triton is the reference integration. The package's own guide, [`python/mori/ir/README.md`](https://github.com/ROCm/mori/blob/main/python/mori/ir/README.md), covers the integration layers and their tests.
 
 For the device API of MORI-CCO (LSA, GDA, SDMA), see [CCO IR](MORI-CCO-GUIDE.md#cco-ir-flydsl-and-triton).
 
@@ -299,7 +299,7 @@ For the device API of MORI-CCO (LSA, GDA, SDMA), see [CCO IR](MORI-CCO-GUIDE.md#
 the shmem runtime (`globalGpuStates`) being initialized on the host. Before any
 device function can be called, the application must:
 
-1. Initialize shmem via `mori.shmem` host APIs (`shmem_torch_process_group_init` or `shmem_init_attr`) — see [Shmem Guide](MORI-SHMEM-GUIDE.md)
+1. Initialize shmem via `mori.shmem` host APIs (`shmem_torch_process_group_init` or `shmem_init_attr`) — see [2. Initialization](#2-initialization)
 2. Allocate symmetric memory via `mori.shmem.shmem_malloc` or `mori_shmem_create_tensor`
 3. For dynamically compiled kernels (e.g. Triton), call `mori.shmem.shmem_module_init(hip_module)` to copy GPU states into the kernel module
 

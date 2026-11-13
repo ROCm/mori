@@ -73,7 +73,8 @@ The operator pages give the small-M numbers.
 **Build and environment.** The GEMMs are FlyDSL kernels written for gfx950
 (MI355X), so every operator needs FlyDSL, which is an optional extra
 (`pip install 'amd_mori[flydsl]'`). Every operator moves data with the SDMA
-copy engines. That needs:
+copy engines (one exception: `GemmAllReduceOp`'s fp8 gather is, by default, a
+pull by the CUs over LSA, `gather_transport="lsa"`). That needs:
 
 - a MORI built with `BUILD_CCO_SDMA=ON` (the default);
 - `MORI_ENABLE_SDMA=1` at run time;

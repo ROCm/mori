@@ -193,7 +193,7 @@ operators can find them in one place.
 
 | Env var | Default | Description |
 |---|---|---|
-| `MORI_UMBP_LOG_LEVEL` | unset | UMBP's log level: `trace`, `debug`, `info`, `warn`, `error` or `critical` (case-insensitive; anything else means `error`). `MORI_GLOBAL_LOG_LEVEL` sets every MORI module. See `include/mori/utils/mori_log.hpp`. |
+| `MORI_UMBP_LOG_LEVEL` | unset, which means `error` | UMBP's log level: `trace`, `debug`, `info`, `warn`, `error` or `critical` (case-insensitive; anything else means `error`). `MORI_GLOBAL_LOG_LEVEL` sets every MORI module. See `include/mori/utils/mori_log.hpp`. |
 
 `MORI_IO_SQ_BACKOFF_TIMEOUT_US` is **not** in the UMBP namespace; it is
 owned by MORI-IO (`src/io/rdma/common.cpp`).

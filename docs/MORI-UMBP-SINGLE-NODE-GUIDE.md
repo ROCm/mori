@@ -39,9 +39,8 @@ Export the variables below to adapt the run to your environment. The script read
 
 | Variable | Default in script | When to change | Example |
 | --- | --- | --- | --- |
-| `MODEL_PATH` | `/apps/data/models/DeepSeek-V3-0324` | Real checkpoint location. | `/apps/data/models/DeepSeek-V3-0324` |
-| `SGLANG_REPO` | `${NFS_BASE}/sglang` | Local SGLang checkout. | `/nfs/sglang` |
-| `MORI_REPO` | `${NFS_BASE}/mori` | Local Mori checkout. | `/nfs/mori` |
+| `MODEL_PATH` | a site-specific path | Real checkpoint location. | `/path/to/DeepSeek-V3-0324` |
+| `MORI_REPO` | `${NFS_BASE}/mori` | Where pip builds Mori. Leave it: the server runs Mori from `${NFS_BASE}/mori` (see below). | `${NFS_BASE}/mori` |
 | `RESULTS_DIR` | `${USER_HOME}/umbp_single_node_results` | Where to store logs. | `/tmp/umbp_results` |
 | `ENABLE_DP` | `false` | Enable DP+EP mode. | `true` |
 | `DP_SIZE` | `8` | Data parallel group size. | `4` |
@@ -56,9 +55,15 @@ Export the variables below to adapt the run to your environment. The script read
 | `MEM_FRACTION_STATIC` | `0.7` | Fraction reserved for static allocations. | `0.6` |
 | `PROBE_MAX_TIME` | `300` | Timeout for probe request in seconds. | `600` |
 
-The script also respects `MORI_PIP_FLAGS` (extra flags for its `pip install` of mori,
-default `--no-build-isolation -v`) and `RUN_GSM8K`: by default it runs two GSM8K
-benchmark rounds after the probe; set `RUN_GSM8K=false` to skip them.
+Keep both checkouts under `NFS_BASE`, as `sglang/` and `mori/`: the server's
+`PYTHONPATH` and the `umbp_master` binary are taken from `${NFS_BASE}/sglang` and
+`${NFS_BASE}/mori` whatever `SGLANG_REPO` and `MORI_REPO` say, so pointing those
+elsewhere builds one checkout and runs another.
+
+The script builds Mori with `pip install . --no-build-isolation -v` inside the
+container; `MORI_PIP_FLAGS` set on the host does not reach that command. By default
+it runs two GSM8K benchmark rounds after the probe; set `RUN_GSM8K=false` to skip
+them.
 
 ## Launch Steps
 

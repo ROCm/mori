@@ -126,7 +126,7 @@ Components
      - Unified memory and bandwidth pool with tiered storage and distributed KV access
      - :doc:`umbp-overview`
    * - **MORI-CCL**
-     - Collective communication over the SDMA copy engines (``mori.ccl``: ``AllgatherSdma``, ``AllreduceSdma``, ``All2allSdma``, ``HierAllGather``, ``AllGatherIntoTensor``), built on MORI-SHMEM
+     - Collective communication (``mori.ccl``: ``AllgatherSdma``, ``AllreduceSdma``, ``All2allSdma``, ``HierAllGather``), built on MORI-SHMEM: over the SDMA copy engines within a node, and ``HierAllGather`` across nodes over an RDMA ring
      - No guide yet
    * - **MORI-VIZ**
      - Warp-level kernel profiler with Perfetto integration

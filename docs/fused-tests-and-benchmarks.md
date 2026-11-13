@@ -1,7 +1,7 @@
 # Running the tests and benchmarks
 
-Every operator has a numerics test of its kernels and an 8-rank test of the
-public operator. CI runs both in the CCO job. They need the environment
+Every operator has a numerics test of its kernels and a multi-rank test of the
+public operator (2 ranks for `gemm_ar`, 8 for the others). CI runs both in the CCO job. They need the environment
 described in [What every operator has in common](MORI-CCO-FUSED-OPS-GUIDE.md#what-every-operator-has-in-common):
 
 ```bash
@@ -13,9 +13,13 @@ pytest tests/python/cco/test_ag_gemm.py tests/python/cco/test_ag_gemm_op.py
 pytest tests/python/cco/test_a2a_gemm.py tests/python/cco/test_a2a_gemm_op.py
 ```
 
-Each benchmark under `benchmark/cco/flydsl/<op>/` runs every mode (`gemm-only`,
-`split-rccl`, `split-sdma`, `fused-sdma`) against a reference and prints one
-`RESULT_JSON` line per configuration. For example:
+Each benchmark under `benchmark/cco/flydsl/<op>/` checks its modes against a
+reference and prints one `RESULT_JSON` line per configuration. All of them have
+`gemm-only`, `split-rccl`, `split-sdma` and `fused-sdma`; `gemm_ar` adds
+`split-lsa` and `fused-lsa`, `gemm_a2a` adds `gemm-staging` and `gemm-to-window`,
+and `gemm_ag` adds `gemm-to-window`. Only `bench_a2a_gemm.py` runs all its modes
+by default (`--modes`). The others run one `--mode` per invocation, by default
+`fused-sdma` (`gemm_ag`: `split-sdma`). For example:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \

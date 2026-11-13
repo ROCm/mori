@@ -77,9 +77,10 @@ source_suffix = {
 # -- Options for HTML output -------------------------------------------------
 html_theme = "sphinx_rtd_theme"
 html_static_path = ["_static"]
-# Copied to the site root as-is. nightly/ is the retired nightly-wheel index,
-# which now points at PyPI; it has to be part of every build because the
-# deploy replaces the whole site.
+# Copied to the site root as-is, and part of every build because the deploy
+# replaces the whole site: nightly/ is the retired nightly-wheel index, which now
+# points at PyPI; MORI-IR-GUIDE.html and MORI_IR_INTEGRATION.html redirect the
+# removed IR pages to the SHMEM guide's IR section.
 html_extra_path = ["_extra"]
 
 html_theme_options = {
@@ -87,8 +88,8 @@ html_theme_options = {
     "prev_next_buttons_location": "bottom",
     "style_external_links": False,
     "style_nav_header_background": "#C00000",  # AMD Red
-    # Expand only the current page's sections; expanding every page's put ~330
-    # entries in the sidebar of every page.
+    # Expand only the current page's sections; expanding every page's sections
+    # put ~330 entries in the sidebar of every page.
     "collapse_navigation": True,
     "sticky_navigation": True,
     "navigation_depth": 4,

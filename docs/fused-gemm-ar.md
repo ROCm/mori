@@ -103,8 +103,9 @@ divides that count: more chunks start the first push earlier until the copy
 engine's per-packet cost shows, and 8 is the measured knee. At `M = P * block_m`
 there is one chunk, pushed after the GEMM, and nothing overlaps.
 
-The window holds C for `m_max` rows, the `[m_max, N]` bf16 result, `P` receive
-slots of `m_max / P` rows, an fp8 copy of the result when the gather is fp8,
+The window holds C for `m_max` rows, the `[m_max, N]` bf16 result, a `tmp` slot
+for this rank's reduced slice (`m_max / P` rows), `P` receive slots of
+`m_max / P` rows, an fp8 copy of the result when the gather is fp8,
 and control words (barrier flags, a counter set per distinct M, submit locks),
 all laid out for `m_max`. It is about 700 MiB per rank at `m_max=16384`,
 N=7168, `P=8` with bf16 wires, and 812 MiB with an fp8 gather.
@@ -278,7 +279,7 @@ shape is expressible, not whether fusing it is faster.
 | Setting | What the default picks | Change it when |
 |---|---|---|
 | `quant` | `"blockscale"` | the checkpoint is mxfp8 or BF16. `"mxfp8_raw"` takes the quantiser's bytes with no shuffle; GEMM-only it measured faster cold and at large M, a few percent slower hot at small M or short K, and the two are not compared at K of 4096 and more |
-| `block_m` | the quant's tile: 128 for blockscale, 256 otherwise | rarely: only blockscale has another legal value |
+| `block_m` | the quant's tile: 128 for blockscale, 256 otherwise | rarely: blockscale takes other granule-legal tiles, and bf16 also takes 128, which doubles the grid at small M; the mxfp8 forms need 256 |
 | Chunks | the largest divisor of the bands per destination, up to 8 | not a parameter; `schedule="wo_b"` changes it at measured M |
 | `schedule` | `"default"`: pad to `P * block_m` | V4-Pro TP8 or V4.1-Flash TP4 `wo_b` on MI355X (below) |
 | `gather_dtype` | `"bf16"`, exact | the accuracy budget allows relL2 about 2.5e-2 for a gather half the size |
@@ -489,7 +490,7 @@ before trusting a small-M number of your own.
 | `RuntimeError: gemm_ar self-test failed: the all-reduce returned ... where ... was expected` | The SDMA puts moved nothing: MORI was built with `BUILD_CCO_SDMA=OFF`, or `MORI_ENABLE_SDMA=1` is not set (the communicator also logs `no SDMA queues will be created`), and `op.dev_comm.sdma_num_queue` is 0. Without `self_test()` this is silent: the model still answers fluently and the fused path measures faster than it is. |
 | `ModuleNotFoundError: No module named 'flydsl'` on first use of the op | Install the extra: `pip install 'amd_mori[flydsl]'`. |
 | `RuntimeError: ccoMemAlloc failed` while constructing | The window does not fit the communicator's VMM reservation. Size `per_rank_vmm` for every op alive at once, or close ops you no longer need. |
-| `hsaKmtCreateQueueExt` failures (`anvil.cpp:237`) at start-up | A previous run's ranks have not released their SDMA queues: wait about 10 s between runs (the tests wait 20 s) and check that no leftover process holds them. Keep `sdma_queues=1` in a process that already uses SDMA. |
+| `hsaKmtCreateQueueExt` failures (`anvil.cpp`) at start-up | A previous run's ranks have not released their SDMA queues: wait about 10 s between runs (the tests wait 20 s) and check that no leftover process holds them. Keep `sdma_queues=1` in a process that already uses SDMA. |
 | `ValueError: M=... does not match planned padded M=...` | M is not padded: use `op.padded_m()` and `op.pad_rows()`, and with `schedule="wo_b"` pass `logical_m=`. |
 | `ValueError: a_scale is (M, K/128) row-major, which is ambiguous` | Say which you have: `.reshape(-1)` for a K/128-major buffer, `.t()` for a logical row-major tensor. Guessing wrong pairs every scale with the wrong K block (relL2 0.26). |
 | `ValueError: ... must be one of ['torch.float8_e4m3fn'], got torch.float8_e4m3fnuz` | FNUZ has a different exponent bias; read as OCP e4m3 the product would be 4x too large. Quantise to `float8_e4m3fn`. |

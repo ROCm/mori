@@ -205,12 +205,13 @@ include/umbp/
 │       ├── router.h
 │       ├── route_get_strategy.h       # TierPriorityRouteGetStrategy (default), RandomRouteGetStrategy
 │       └── route_put_strategy.h       # ConfigurableRoutePutStrategy (most_available/random x none/same/local)
-└── local/                             # Standalone (no-net) DRAM+SSD path
-    ├── standalone_client.h
-    ├── host_mem_allocator.h
-    ├── storage_tier.h
-    ├── block_index/local_block_index.h
-    └── tiers/                         # CopyPipeline, DRAM/SSD/SPDK tiers
+├── local/                             # host memory and the SSD/SPDK tiers
+│   ├── host_mem_allocator.h
+│   ├── storage_tier.h
+│   └── tiers/
+└── standalone/                        # same-host shared pool over UDS
+    ├── standalone_process_client.h    # StandaloneProcessClient
+    └── standalone_server.h            # umbp_standalone_server
 
 distributed/
 ├── proto/umbp.proto                   # UMBPMaster service
@@ -852,24 +853,26 @@ registered descriptor and skips the staging buffer entirely.
 ### 7.6 DistributedClient  (`distributed/distributed_client.h`)
 
 `IUMBPClient` adaptor over `PoolClient`. `CreateUMBPClient(config)`
-returns a `DistributedClient` when `config.distributed.has_value()` and
-a `StandaloneClient` otherwise.
+returns a `StandaloneProcessClient` when `config.standalone_process` is
+set, and otherwise a `DistributedClient` over
+`WithEmbeddedDefaults(config)`, which covers a cluster member, a
+masterless node and a bare config alike (`include/umbp/umbp_client.h`).
 
 ---
 
-## 8. Standalone path (no master)
+## 8. Without a master
 
-`StandaloneClient` (`include/umbp/local/standalone_client.h`) implements
-the same `IUMBPClient` interface but talks to an in-process
-`LocalBlockIndex` + `LocalStorageManager` (DRAM tier, optional
-POSIX/SPDK SSD tier, copy-pipeline worker pool). No gRPC, no networking,
-no master. Used by:
+The in-process `StandaloneClient` (with its `LocalBlockIndex` and
+`LocalStorageManager`) has been removed. A process without a master now
+gets one of two clients from `CreateUMBPClient`:
 
-- single-node smoke tests (`scripts/run_umbp_single_node_hicache.sh`,
-  see `MORI-UMBP-SINGLE-NODE-GUIDE.md`),
-- the legacy "Shared SSD leader/follower" deployment driven by
-  `UMBPRole::SharedSSD{Leader,Follower}` and the `follower_mode` /
-  `force_ssd_copy_on_write` back-compat flags in `UMBPConfig`.
+- a `DistributedClient` over `WithEmbeddedDefaults(config)`: a masterless
+  node that serves its own pool in-process. A bare `UMBPConfig{}` gets
+  this too.
+- a `StandaloneProcessClient` (`include/umbp/standalone/standalone_process_client.h`)
+  when `config.standalone_process` is set: it talks over a Unix socket to
+  a `umbp_standalone_server` that owns the pool, so the processes on one
+  host share one cache. See `design-standalone-process-mode.md`.
 
 ---
 

@@ -129,10 +129,12 @@ seems to have no effect.
 | `ssd_staging_buffer_slots` | Size of the staging arena, in pages (`UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS`). `0`, the default, means 4 GiB worth, capped at the tier's capacity. |
 | (writes) | Remote puts stage through the same arena; local ones do not. There is no separate write-staging region to size. |
 
-Only reads and remote writes stage, and a batch that does not fit waits for a
+Only reads and remote writes stage. A read batch that does not fit waits for a
 later round rather than failing: busy resolves are retried for up to
-`UMBP_RESOLVE_BUSY_TIMEOUT_MS` (30 s by default). Only a batch whose own working
-set exceeds the whole arena fails at once.
+`UMBP_RESOLVE_BUSY_TIMEOUT_MS` (30 s by default), and only a batch whose own
+working set exceeds the whole arena fails at once. A remote put is not retried:
+when the arena is full the put fails at once (see "Puts fail on an SSD node"
+below).
 
 Each key lives whole on one drive, so a single-key read costs one drive's I/O.
 Capacity is charged in **padded on-disk bytes**: values are padded to 4 KiB, so

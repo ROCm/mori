@@ -124,7 +124,7 @@ For this operator:
 | FlyDSL | `pip install 'amd_mori[flydsl]'`. `import mori.ops.gemm_a2a` works without it; importing `GemmA2AOp` raises `ModuleNotFoundError`. |
 | SDMA | MORI built with `BUILD_CCO_SDMA=ON` (the default), and `MORI_ENABLE_SDMA=1` set before the communicator is created. The constructor raises if the communicator has fewer SDMA queues than `sdma_queues`; `self_test()` checks that bytes actually move. |
 | Ranks | P from 2 to 8, all in one node (one LSA domain), one process per GPU. Set the device before constructing: the operator reads its CU count to pick the tile. |
-| Communicator | A `mori.cco.Communicator` whose `per_rank_vmm` holds the window. The overview and the tests use `2 * window_bytes_for(...) + (256 << 20)`; add the windows of any other operator on the same communicator. |
+| Communicator | A `mori.cco.Communicator` whose `per_rank_vmm` holds the window. The overview uses `2 * window_bytes_for(...) + (256 << 20)`; add the windows of any other operator on the same communicator. |
 
 ## 4. Constructor
 
@@ -275,7 +275,7 @@ Ulysses at P=8 would have to replicate KV.
 | `chunks=None` | The largest count up to 8 that divides the row tiles and keeps every put at least 1 MiB, `(M/c) * (N/P) * 2` bytes; else 1. | With ptpc at P=8 the default is the measured best except 70B M=8192, where 4 and 8 are within 1%; with mxfp8, 70B did best with 4 at M=4096 and 8192, where the default is 8. At P=4, M=2048, `chunks=4` measured 231.8 µs against 242.4 µs for the default 8 (MiniMax-M3 dense). A request is capped at one row tile per chunk. |
 | `mode="fused"` | Puts from the epilogue. | Keep it: it beat `split` in every measured cell. `split` is the baseline and a fallback. |
 | `quant="ptpc"` | fp32 per-token and per-channel scales. | Use the format your checkpoint is in. At the same tile, mxfp8's GEMM is 13-22% slower than ptpc's and its best fused path 10-21% slower: its scale loads stall the tile prefetch. `blockscale` is not accepted. |
-| `sdma_queues=1` | One queue per (source, destination) pair, so every peer already has its own. | Leave it. Asking for P makes P per peer and uses one; in a process that already holds SDMA engines, queue creation then fails (`hsaKmtCreateQueueExt`, `anvil.cpp:237`). |
+| `sdma_queues=1` | One queue per (source, destination) pair, so every peer already has its own. | Leave it. Asking for P makes P per peer and uses one; in a process that already holds SDMA engines, queue creation then fails (`hsaKmtCreateQueueExt`, `anvil.cpp`). |
 | `m_max`, `max_shapes=8` | The window is about `4 * m_max * N` bytes and cannot grow; each distinct padded M is one counter set and one compile. | Set `m_max` to the largest S/P you serve. If M varies, pad to a few buckets, or raise `max_shapes`. |
 
 The operator reads no environment variables itself. MORI needs
@@ -470,7 +470,7 @@ on a pure GEMM and changed which chunk count won.
 | `RuntimeError: GemmA2AOp needs every rank in one LSA domain (one node)` | The ranks span nodes. The operator is single-node. |
 | `RuntimeError: ccoMemAlloc failed` at construction, `slot exhausted` in the log | `per_rank_vmm` is too small. Size it from `window_bytes_for` with the constructor's settings, plus other operators' windows. |
 | `ValueError: ... got torch.float8_e4m3fnuz` | The kernel reads OCP `float8_e4m3fn`; the same FNUZ byte means a different value, so FNUZ is rejected. |
-| A launch fails in `hsaKmtCreateQueueExt` (`anvil.cpp:237`) | The previous run's SDMA queues are not reclaimed yet. Wait for its processes to exit and retry. Keep `sdma_queues=1`. |
+| A launch fails in `hsaKmtCreateQueueExt` (`anvil.cpp`) | The previous run's SDMA queues are not reclaimed yet. Wait for its processes to exit and retry. Keep `sdma_queues=1`. |
 | A call hangs, or rows land in the wrong place | The ranks did not make the same calls, with the same M, in the same order. Every call waits on every peer. |
 | The result changes after you read it | It was read after this rank's next call, or on a stream not ordered before it. Read it on the same stream, or clone it. |
 | Wrong values, no error | B differs between ranks; a scale is in the wrong layout (mxfp8 `a_scale` not through `preshuffle_a_scale`, `b_scale` not K-block major); or the scales were computed before padding. |

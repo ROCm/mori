@@ -257,7 +257,7 @@ The ones that differ or matter most here:
 | Setting | What the default picks | Change it when |
 |---|---|---|
 | `quant` | `"blockscale"` | the checkpoint is mxfp8 (`"mxfp8"`, or `"mxfp8_raw"` for the quantiser's row-major bytes) or BF16 |
-| `block_m` | 128 for blockscale, 256 otherwise | rarely: only blockscale has another legal value |
+| `block_m` | 128 for blockscale, 256 otherwise | rarely: blockscale takes other granule-legal tiles, and bf16 also takes 128, which doubles the grid at small M; the mxfp8 forms need 256 |
 | Chunks | the largest divisor of the bands per destination, up to 8: at V4.1-Flash TP4 that is 2 at M=2048, 4 at 4096 and 8 above | not a parameter |
 | Wires | bf16 scatter, no gather | not available |
 | `sdma_queues` | 1 | keep |

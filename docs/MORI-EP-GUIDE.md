@@ -50,7 +50,7 @@ MORI-EP has two generations, EPv1 and EPv2. See [EP Generations](#ep-generations
 
 **Which one to use:**
 
-- **gfx1250: use EPv2.** gfx1250 supports EPv2 only.
+- **gfx1250: use EPv2.** gfx1250 supports EPv2 only: EPv1 runs on wave64 GPUs and refuses to start on a wave32 one.
 - **gfx942 / gfx950 in production: keep the API you have tested.** EPv1 has the full set of inter-node kernels and tuning tables. Move to EPv2 only after you evaluate it.
 - **New work for rack-scale or gfx1250: start with EPv2.**
 
@@ -63,7 +63,7 @@ This guide describes the development source. Not all paths are in every publishe
 | Path | Selection | Topology | Scope and restrictions |
 |---|---|---|---|
 | EPv2, FlyDSL | `kernel_backend="flydsl"` | Intra-node only | Gather/scatter combine, quantization, standard-MoE conversion and routing replay, subject to the dtype and architecture restrictions below. |
-| EPv2, HIP | `kernel_backend="hip"` | Intra-node | Gather combine in BF16/FP32. Dispatch can carry already-quantized FP8/FP4 payloads. Does not need FlyDSL. |
+| EPv2, HIP | `kernel_backend="hip"` | Intra-node | Gather combine in BF16/FP32. On gfx125x, also a push (scatter) combine with `fp8_blockwise` or FP4 quantization: `combine_mode="scatter"`, a BF16 combine and a `hidden_dim` that is a multiple of 1024. On gfx1250, a BF16 combine without quantization can also push for the shapes in its push table, picked per call (`MORI_EP_BF16_PUSH=0` turns this off). Dispatch can carry already-quantized FP8/FP4 payloads. No standard-MoE conversion. Does not need FlyDSL. |
 | EPv2, HIP internode (preview) | HIP backend with `gpu_per_node < world_size` | Multiple physical nodes over CCO/GDA | BF16/FP32/FP8 dispatch, plus packed FP4 dispatch with a BF16 or FP32 combine (not with `async_ll`). No FP4 combine, quantization, standard-MoE conversion or scatter combine. The node grouping of the communicator must match the config. |
 
 Select the backend with `config.kernel_backend` or `MORI_V2_KERNEL_BACKEND`. The default is the HIP backend on gfx125x and the FlyDSL backend elsewhere. Importing the package does not load a backend. Construction loads the selected one.
@@ -93,10 +93,12 @@ with Communicator.init(world_size, rank, uid, per_rank_vmm=per_rank_bytes) as co
     recv_x, recv_w, recv_s, recv_i, total_recv, routing = op.dispatch(
         input, weights, scales, indices, return_routing=True)
     # ... run expert computation on recv_x ...
-    out, out_w = op.combine(expert_output, weights, routing=routing)
+    # No weights: passing them asks for the weight fold, which is for training
+    # backward and costs more than the token payload on gfx1250.
+    out, _ = op.combine(expert_output, routing=routing)
 ```
 
-For `per_rank_vmm` sizing and the full configuration, see the [EPv2 package guide](https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md).
+For the full configuration, see the [EPv2 package guide](https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md).
 
 ### EPv2 restrictions
 
@@ -474,7 +476,7 @@ Launch parameters are taken from `EpDispatchCombineConfig` defaults or per-call 
 
 ```python
 # No launch arguments: the config's block_num=80 and warp_num_per_block=8, except
-# IntraNode, which has per-kernel defaults (dispatch: 256x16, or 64x8 on gfx125x)
+# IntraNode, which has per-kernel defaults (dispatch: 256x16)
 op.dispatch(input, weights, scales, indices)
 
 # Override per call
@@ -624,7 +626,7 @@ export GLOO_SOCKET_IFNAME=enp81s0f1
 export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # Optional: exclude specific NICs
 
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.129.65" --master_port=1234 \
+    --master_addr="<master_ip>" --master_port=1234 \
     examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench
 ```
 
