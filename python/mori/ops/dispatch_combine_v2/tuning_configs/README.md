@@ -165,7 +165,7 @@ Where it is on today (it is off everywhere else):
 | --- | --- | --- | --- |
 | MI355X (gfx950, 256) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168, plus 6144 for 256/8 and 5120 for 384/6; only 3584 for 896/16 | bf16, fp8_e4m3; fp4 for inter 256/8 at hidden 7168 |
 | MI308X (gfx942, 80) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168, plus 6144 for 256/8 and 5120 for 384/6; only 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 at hidden 7168 |
-| MI300X (gfx942, 304) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168, plus 6144 for 256/8 and 5120 for 384/6; only 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 at hidden 7168 |
+| MI300X (gfx942, 304) | 256/8, 256/6, 384/6; 264/9 intra; 272/9 inter; 896/16 intra and inter | 7168, plus 6144 for 256/8 and 5120 for 384/6; only 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 at hidden 7168 |
 
 - Each GPU model has three tables: IntraNodeV2 (EP8), InterNodeV2 (EP16) and
   InterNodeV2LL (EP16).
@@ -173,7 +173,8 @@ Where it is on today (it is off everywhere else):
 - Not every shape is in every table, and not every dtype is in every shape.
   See the files.
 - Token ceilings are 64–4096. MI308X, MI355X and MI300X also have ceilings of
-  4–32 for inter-node 256/8, 272/9, 896/16, and 384/6 at hidden 5120.
+  4–32 for inter-node 256/8, 272/9, 896/16, and 384/6 at hidden 5120. The
+  MI300X IntraNodeV2 table also has ceilings of 16 and 32 for every shape.
 
 The model behind each shape:
 
@@ -184,8 +185,8 @@ The model behind each shape:
 | GLM-5, GLM-5.3 | 256/8 | 6144 | MI355X, MI308X, MI300X: EP8 and EP16 |
 | DeepSeek-V4-Pro | 384/6 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16 |
 | DeepSeek-V4.1-Flash | 384/6 | 5120 | MI355X, MI308X, MI300X: EP8 and EP16 |
-| Kimi K3 | 896/16 | 3584 | MI308X, MI355X, MI300X: EP16 |
-| none known | 256/6 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16; bf16 dispatch only |
+| Kimi K3 | 896/16 | 3584 | MI308X, MI355X: EP16; MI300X: EP8 and EP16 |
+| none known | 256/6 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16; bf16 dispatch only, except MI300X EP8, which also has fp8_e4m3_fnuz |
 
 A shape without rows runs on the default geometry. For example:
 
@@ -307,6 +308,29 @@ What `--cmd tuning` does on its own:
   median is within that margin and whose tail is better than the shipped
   rule's by more than 10% of the shipped median is reported as `TAIL` and
   selected instead. `--tuning-save` writes it as it would write a win.
+
+**MI300X IntraNodeV2: in-graph timing**
+
+Some MI300X IntraNodeV2 rules were selected on in-graph timing instead:
+
+- **Which rules.** Every rule at ceilings 16 and 32, every 896/16 rule, the
+  256/6 FP8 dispatch rules, 384/6 at hidden 5120 (dispatch at T64 and BF16
+  T2048, combine at T64), and 384/6 at hidden 7168 BF16 dispatch at T1024.
+- **Timing.** The timed rounds are captured in one HIP graph, with events
+  recorded inside the graph between the phases. The graph is warmed and
+  replayed, and each round's time is its mean over the replays. Host launch
+  overhead is not in these numbers, so their metrics are not comparable with the
+  other rows.
+- **Screen.** Per bucket and phase, block counts 16, 32, 48, 64, 80, 96, 128,
+  152, 192, 228, 256 and 304 × warps 4, 6, 8, 12 and 16, against the current
+  table, 3 reps.
+- **Acceptance.** An A/B of the old and new table in `bench_ep.py` graph mode,
+  alternated, 2 reps per cell. A changed rule was kept only if D+C was at least
+  2% faster. A rule for a shape that had none was kept if D+C was no more than
+  2% slower than the default geometry.
+- **Combine weights.** The screen times a weighted combine, while `bench_ep.py`
+  times an unweighted one, as aiter calls it. The two disagreed on the 896/16
+  combine at T256 and T512, which keeps the default 64 × 8.
 
 **Metrics**
 
