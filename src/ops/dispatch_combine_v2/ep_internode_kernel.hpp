@@ -1218,6 +1218,8 @@ constexpr size_t kCombineVecBytes = 16;
 // 2 measures faster than 1 at every token count tried, which is a statement
 // about how wide to spread a token, not about the gather's inner loop.
 constexpr int kCombineStepsPerWarpSlice = 2;
+// The smallest piece a v2_ll relay chunk is split into across QPs.
+constexpr int kCombinePieceMinTokens = 8;
 
 inline __device__ bool CombineVecAligned(size_t tokHiddenBytes, size_t tokCombXferBytes) {
   return ((tokHiddenBytes % kCombineVecBytes) == 0) && ((tokCombXferBytes % kCombineVecBytes) == 0);
@@ -1663,33 +1665,35 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
       // Join the producers before the leader's release publishes their stores.
       ::mori::cco::ccoCoopWarp{}.sync();
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      // A chunk goes out as one piece per active QP, each of at least kCombinePieceMinTokens
+      // tokens, and each piece posts once its own items are done: a single post per chunk ran
+      // a whole node's tokens through one QP at that QP's rate.
+      const int chunkTokens = static_cast<int>(thisChunkTokenNum);
+      const int pieceTokens =
+          max(kCombinePieceMinTokens, core::CeilDiv(chunkTokens, config.numQpPerPe));
+      const int piece = (tokenId - startTokenIdx) / pieceTokens;
+      const int pieceStart = startTokenIdx + piece * pieceTokens;
+      const int pieceCount = min(pieceTokens, startTokenIdx + chunkTokens - pieceStart);
+      index_t* pieceDone =
+          args.interNodeChunkFlagCombine + (node * maxChunkNum + k) * config.numQpPerPe + piece;
       index_t finished = 0;
-      if (laneId == 0)
-        finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
+      if (laneId == 0) finished = atomicAdd(pieceDone, 1);
       finished = __shfl(finished, 0);
-      if ((finished + 1) >= (static_cast<int>(thisChunkTokenNum) * warpsPerToken)) {
+      if ((finished + 1) >= (pieceCount * warpsPerToken)) {
         // Acquire all producers through the completion-counter RMW chain.
         if (laneId == 0) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         int proxyPe = node * config.gpuPerNode + (myPe % config.gpuPerNode);
-        int qpId = k % config.numQpPerPe;
+        int qpId = (k + piece) % config.numQpPerPe;
         EpInterNodePut(comm, args.reg(args.offStaging),
-                       SendBufSlotOffset(config, myNode + nNodes, startTokenIdx) * tokCombXferBytes,
+                       SendBufSlotOffset(config, myNode + nNodes, pieceStart) * tokCombXferBytes,
                        args.reg(args.offStaging),
-                       SendBufSlotOffset(config, node, startTokenIdx) * tokCombXferBytes,
-                       thisChunkTokenNum * tokCombXferBytes, proxyPe, qpId);
-        // Cleared after the post; the fence before the end barrier publishes them.
-        if (laneId == 0) {
-          core::AtomicStoreSeqCstSystem(chunkFlag + node * maxChunkNum + k, uint64_t{0});
-          core::AtomicStoreRelaxedSystem(args.interNodeChunkFlagCombine + node * maxChunkNum + k,
-                                         index_t{0});
-        }
+                       SendBufSlotOffset(config, node, pieceStart) * tokCombXferBytes,
+                       pieceCount * tokCombXferBytes, proxyPe, qpId);
+        if (laneId == 0) core::AtomicStoreRelaxedSystem(pieceDone, index_t{0});
       }
     }
   }
 
-  // Ensure all prior writes (in particular zeroing the chunk-flag region) are visible
-  // to other nodes before participating in the cross-device barrier, so a remote node
-  // never observes a non-zero flag that is subsequently overwritten with zero
   __threadfence_system();
   int finishedWarp = 0;
   uint64_t barrierFlag = 0;
@@ -1703,13 +1707,23 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
   const uint32_t epoch = static_cast<uint32_t>(barrierFlag);
 
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
+    // Every item has read its chunk's flag: clear them all here, before the barrier posts let
+    // the next dispatch write them again.
+    for (int n = 0; n < (nNodes - 1); n++) {
+      const int node = (myNode + n + 1) % nNodes;
+      const int chunks =
+          static_cast<int>((core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]) - 1) / warpSize);
+      for (int c = laneId; c < chunks; c += warpSize) {
+        core::AtomicStoreRelaxedSystem(chunkFlag + node * maxChunkNum + c, uint64_t{0});
+      }
+    }
     if (laneId < nNodes) {
       core::AtomicStoreSeqCstSystem(
           args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>() + laneId, uint64_t{0});
     }
     if (laneId == 0) {
       args.interNodeBlocksBarrier[0] = 0;
-      __threadfence_system();  // the count resets above, before any barrier post
+      __threadfence_system();  // the resets above, before any barrier post
       __hip_atomic_store(&args.interNodeBlocksBarrier[1], epoch, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_AGENT);
     }
