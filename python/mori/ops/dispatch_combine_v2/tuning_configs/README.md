@@ -308,29 +308,8 @@ What `--cmd tuning` does on its own:
   median is within that margin and whose tail is better than the shipped
   rule's by more than 10% of the shipped median is reported as `TAIL` and
   selected instead. `--tuning-save` writes it as it would write a win.
-
-**MI300X IntraNodeV2: in-graph timing**
-
-Some MI300X IntraNodeV2 rules were selected on in-graph timing instead:
-
-- **Which rules.** Every rule at ceilings 16 and 32, every 896/16 rule, the
-  256/6 FP8 dispatch rules, 384/6 at hidden 5120 (dispatch at T64 and BF16
-  T2048, combine at T64), and 384/6 at hidden 7168 BF16 dispatch at T1024.
-- **Timing.** The timed rounds are captured in one HIP graph, with events
-  recorded inside the graph between the phases. The graph is warmed and
-  replayed, and each round's time is its mean over the replays. Host launch
-  overhead is not in these numbers, so their metrics are not comparable with the
-  other rows.
-- **Screen.** Per bucket and phase, block counts 16, 32, 48, 64, 80, 96, 128,
-  152, 192, 228, 256 and 304 × warps 4, 6, 8, 12 and 16, against the current
-  table, 3 reps.
-- **Acceptance.** An A/B of the old and new table in `bench_ep.py` graph mode,
-  alternated, 2 reps per cell. A changed rule was kept only if D+C was at least
-  2% faster. A rule for a shape that had none was kept if D+C was no more than
-  2% slower than the default geometry.
-- **Combine weights.** The screen times a weighted combine, while `bench_ep.py`
-  times an unweighted one, as aiter calls it. The two disagreed on the 896/16
-  combine at T256 and T512, which keeps the default 64 × 8.
+- It times a weighted combine, while `bench_ep.py` and aiter time an
+  unweighted one. The two can rank combine geometries differently.
 
 **Metrics**
 
@@ -342,6 +321,8 @@ Some MI300X IntraNodeV2 rules were selected on in-graph timing instead:
   - `InterNodeV2`: RDMA;
   - `InterNodeV2LL`: the LL metric.
 - So these metrics are not comparable between families.
+- Some MI300X IntraNodeV2 rows were timed inside one HIP graph, without host
+  launch overhead, so their latencies read lower than the other rows'.
 
 ## Adding or updating rules
 
