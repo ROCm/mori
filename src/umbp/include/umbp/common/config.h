@@ -486,7 +486,9 @@ struct UMBPDistributedConfig {
 // UMBPConfig::standalone_process to make CreateUMBPClient construct a
 // StandaloneProcessClient that talks to an umbp_standalone_server over UDS.
 struct UMBPStandaloneProcessConfig {
-  std::string address;             // e.g. unix:///run/umbp/standalone/node0.grpc.sock
+  // e.g. unix:///run/umbp/standalone/node0.grpc.sock; a client replaces "{device}" with
+  // its current GPU, to reach one of several servers that each serve one GPU.
+  std::string address;
   bool auto_start = false;         // opt-in fork+exec convenience path
   int startup_timeout_ms = 30000;  // readiness wait bound for auto_start
   // Deadline on Exists/BatchExists/BatchExistsConsecutive. A lookup that gets

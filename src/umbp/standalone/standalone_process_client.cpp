@@ -26,6 +26,7 @@
 
 #include <fcntl.h>
 #include <grpcpp/grpcpp.h>
+#include <hip/hip_runtime.h>
 #include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -51,6 +52,23 @@
 
 namespace mori::umbp::standalone {
 namespace {
+
+// "{device}" in the address names the server of the caller's current GPU, for nodes that
+// run one standalone server per GPU: one server copies for every GPU of the node from a
+// single process, which caps the node's put and get bandwidth.
+std::string ResolveDeviceAddress(const std::string& address) {
+  static const std::string kToken = "{device}";
+  const auto pos = address.find(kToken);
+  if (pos == std::string::npos) return address;
+  int device = -1;
+  if (hipGetDevice(&device) != hipSuccess || device < 0) {
+    throw std::runtime_error("StandaloneProcessClient: address " + address +
+                             " names {device} but the caller has no current GPU");
+  }
+  std::string resolved = address;
+  resolved.replace(pos, kToken.size(), std::to_string(device));
+  return resolved;
+}
 
 std::atomic<uint64_t> g_client_counter{0};
 
@@ -338,7 +356,7 @@ StandaloneProcessClient::StandaloneProcessClient(const UMBPConfig& config) : con
     throw std::runtime_error("invalid UMBP config: " + error_message);
   }
 
-  address_ = standalone_config_.address;
+  address_ = ResolveDeviceAddress(standalone_config_.address);
   fd_socket_path_ = DeriveFdSocketPath(address_);
   channel_ =
       grpc::CreateCustomChannel(address_, grpc::InsecureChannelCredentials(), GrpcChannelArgs());
