@@ -195,8 +195,12 @@ class SourcePlan {
     return caps_.cap <= 0 || queues_[e] < caps_.cap;
   }
 
-  // Queues on `e`, a full engine counting as at the cap.
-  int Load(uint32_t e) const { return Usable(e) ? queues_[e] : std::max(caps_.cap, queues_[e]); }
+  // Queues on `e`; a full engine counts as at the cap, or as far beyond any real
+  // load when the cap is unknown.
+  int Load(uint32_t e) const {
+    if (Usable(e)) return queues_[e];
+    return caps_.cap > 0 ? std::max(caps_.cap, queues_[e]) : (1 << 16);
+  }
 
   // `pool` by fewest queues, then id, keeping usable engines only.
   std::vector<uint32_t> ByLoad(std::vector<uint32_t> pool) const {
@@ -215,7 +219,7 @@ class SourcePlan {
       // Preferred engines: the recommendation folded onto even ids, or the OAM
       // engine when KFD lists them all.
       uint32_t preferred = 0;
-      if (mask == 0 || (WantsOam(mask) && mask == XgmiMask())) {
+      if (WantsOam(mask)) {
         if (oam && *oam < kMaxEngines) preferred = 1u << *oam;
       } else {
         for (uint32_t e : Bits(mask)) preferred |= 1u << (e & ~1u);
@@ -287,7 +291,7 @@ class SourcePlan {
   // The engines of a Generic link: KFD's mask, or the OAM engine for an empty mask.
   std::vector<uint32_t> GenericEngines(uint32_t mask, std::optional<uint32_t> oam) const {
     std::vector<uint32_t> engines = Bits(mask);
-    if (engines.empty() && oam) engines.push_back(*oam);
+    if (engines.empty() && oam && *oam < kMaxEngines) engines.push_back(*oam);
     if (!evenOnly_) return engines;
     std::vector<uint32_t> even;
     for (uint32_t e : engines)

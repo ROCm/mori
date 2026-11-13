@@ -229,7 +229,6 @@ uint32_t hsakmtNodeForKfdNode(int node) {
 
 std::unique_ptr<SdmaQueue> SdmaQueue::tryCreate(uint32_t hsakmtNodeId, uint32_t engineId,
                                                 HSAKMT_STATUS* status) {
-  std::unique_ptr<SdmaQueue> q(new SdmaQueue());
   // Allocate SDMA queue buffer on device side, requires ExecuteAccess
   HsaMemFlags memFlags = {};
   memFlags.ui32.NonPaged = 1;
@@ -242,23 +241,25 @@ std::unique_ptr<SdmaQueue> SdmaQueue::tryCreate(uint32_t hsakmtNodeId, uint32_t 
   // std::cout << "Allocating SDMA Queue Buffer for device: " << hsakmtNodeId << std::endl <<
   // std::flush;
 
-  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &q->queueBuffer_),
+  void* buffer = nullptr;
+  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &buffer),
                        "Failed");
-  CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(q->queueBuffer_, SDMA_QUEUE_SIZE, NULL), "Failed");
+  CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(buffer, SDMA_QUEUE_SIZE, NULL), "Failed");
 
-  memset(&q->queue_, 0, sizeof(HsaQueueResource));
   // Fails when the engine has no free queue slot (KFD's per-engine limit, shared with
   // ROCr and other processes): give the buffer back and let the caller try another.
+  HsaQueueResource resource{};
   *status =
       hsaKmtCreateQueueExt(hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
-                           engineId, q->queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &q->queue_);
+                           engineId, buffer, SDMA_QUEUE_SIZE, nullptr, &resource);
   if (*status != HSAKMT_STATUS_SUCCESS) {
-    CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(q->queueBuffer_), "Failed");
-    CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(q->queueBuffer_, SDMA_QUEUE_SIZE), "Failed");
-    q->queueBuffer_ = nullptr;
-    q->created_ = false;
+    CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(buffer), "Failed");
+    CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(buffer, SDMA_QUEUE_SIZE), "Failed");
     return nullptr;
   }
+  std::unique_ptr<SdmaQueue> q(new SdmaQueue());
+  q->queueBuffer_ = buffer;
+  q->queue_ = resource;
 
   // Populate Device Handle
   // TODO uncached
@@ -289,7 +290,6 @@ std::unique_ptr<SdmaQueue> SdmaQueue::tryCreate(uint32_t hsakmtNodeId, uint32_t 
 }
 
 SdmaQueue::~SdmaQueue() {
-  if (!created_) return;  // tryCreate already gave the buffer back
   CHECK_HSAKMT_SUCCESS(hsaKmtDestroyQueue(queue_.QueueId), "Failed to destroy queue.");
   CHECK_HIP_ERROR(hipFree(deviceHandle_));
   CHECK_HIP_ERROR(hipFree(cachedWptr_));
@@ -429,8 +429,8 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
           "SDMA queue exhausted [anvil.cpp]: node {} -> {} channel {} of {}, KFD mask {:#x}, "
           "engines tried [{}], this process's queues per engine:{}{}",
           srcNode, dstNode, c, numChannels, mask, tried, counts,
-          noSlot ? "; request fewer SDMA channels per peer (MORI_SDMA_NUM_CHANNELS, "
-                   "sdmaQueueCount)"
+          noSlot ? "; restart with fewer SDMA channels per peer (MORI_SDMA_NUM_CHANNELS, "
+                   "sdmaQueueCount): queues are freed only when the process exits"
                  : ""));
     }
     channels.push_back(std::move(q));
@@ -441,11 +441,12 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
 plan::SourcePlan& AnvilLib::sourcePlan(int srcNode) {
   auto it = plans_.find(srcNode);
   if (it != plans_.end()) return it->second;
+  auto props = readKfdProperties(kfdNodePath(srcNode) + "/properties");
   plan::NodeCaps caps;
-  caps.arch = plan::Classify(kfdNodeProperty(srcNode, "gfx_target_version"));
-  caps.nGeneral = static_cast<uint32_t>(kfdNodeProperty(srcNode, "num_sdma_engines"));
-  caps.nXgmi = static_cast<uint32_t>(kfdNodeProperty(srcNode, "num_sdma_xgmi_engines"));
-  caps.cap = static_cast<int>(kfdNodeProperty(srcNode, "num_sdma_queues_per_engine"));
+  caps.arch = plan::Classify(props["gfx_target_version"]);
+  caps.nGeneral = static_cast<uint32_t>(props["num_sdma_engines"]);
+  caps.nXgmi = static_cast<uint32_t>(props["num_sdma_xgmi_engines"]);
+  caps.cap = static_cast<int>(props["num_sdma_queues_per_engine"]);
   it = plans_.emplace(srcNode, plan::SourcePlan(caps)).first;
   const auto& c = it->second.Caps();
   MORI_APP_INFO("SDMA: node {} engine plan {} ({} general + {} xGMI engines, {} queues each)",

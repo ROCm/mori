@@ -312,15 +312,26 @@ TEST(SdmaEnginePlan, PartitionModesUseEvenEngines) {
   for (uint32_t pm : {0x3u, 0xcu, 0x8u}) {
     auto mask = [pm](int s, int d) { return s == d ? 0u : pm; };
     ExpectGfx9Placement(kQpx, Range(0, 4), mask, NoOam);
-    for (const auto& job : Subsets(Range(0, 4))) {
-      for (int n = 1; n <= 8; ++n) {
-        Source s(kCpx);
-        if (!ConnectJob(s, job[0], job, {n}, mask, NoOam)) continue;
-        for (const auto& [dst, engines] : s.ch)
-          for (uint32_t e : engines) EXPECT_EQ(e, 0u) << "mask " << pm;
+  }
+  // CPX: a general-engine mask folds to engine 0; an xGMI one names no engine there.
+  auto general = [](int s, int d) { return s == d ? 0u : 0x3u; };
+  int checked = 0;
+  for (const auto& job : Subsets(Range(0, 4))) {
+    for (int n = 1; n <= 8; ++n) {
+      Source s(kCpx);
+      if (!ConnectJob(s, job[0], job, {n}, general, NoOam)) {
+        EXPECT_GT(static_cast<int>(job.size()) * n, kCpx.cap);
+        continue;
       }
+      ++checked;
+      for (const auto& [dst, engines] : s.ch)
+        for (uint32_t e : engines) EXPECT_EQ(e, 0u);
     }
   }
+  EXPECT_GT(checked, 0);
+  EXPECT_TRUE(SourcePlan(kCpx).HasEngine(false, 0x3, std::nullopt));
+  for (uint32_t pm : {0xcu, 0x8u})
+    EXPECT_FALSE(SourcePlan(kCpx).HasEngine(false, pm, std::nullopt));
 }
 
 // gfx1250: a link's queues spread over an aligned block of engines.

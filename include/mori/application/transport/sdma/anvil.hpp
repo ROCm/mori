@@ -64,7 +64,6 @@ class SdmaQueue {
   void* queueBuffer_ = nullptr;
   HsaQueueResource queue_{};
   SdmaQueueDeviceHandle* deviceHandle_ = nullptr;
-  bool created_ = true;
 };
 
 class AnvilLib {

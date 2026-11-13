@@ -1698,23 +1698,36 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   }
 
   // Comm SDMA queues from reqs.sdmaQueueCount (0 = env default), set up before
-  // anything is allocated. If a rank cannot create them, or a node's ranks end up
-  // with different counts (a retry after such a failure), every rank fails here
-  // instead of in a later collective or signal write.
+  // anything is allocated. When SDMA is in play the ranks then compare counts, and
+  // all fail here if one could not create its queues, a node's ranks differ (a
+  // retry after such a failure), or nodes disagree on having queues at all (the
+  // signal pool below is exchanged over the whole comm).
   int sdmaQueues =
       ccoSdmaSetupCommQueues(comm, reqs->sdmaQueueCount) == 0 ? comm->sdmaNumQueue : -1;
-  std::vector<int> sdmaQueuesAll(comm->worldSize, 0);
-  comm->bootNet->Allgather(&sdmaQueues, sdmaQueuesAll.data(), sizeof(int));
-  for (int r = 0; r < comm->worldSize; r++) {
-    const bool sameNode = r >= comm->myNodeStart && r < comm->myNodeStart + comm->lsaSize;
-    if (sdmaQueuesAll[r] >= 0 && (!sameNode || sdmaQueuesAll[r] == sdmaQueues)) continue;
-    if (sdmaQueuesAll[r] < 0) {
-      MORI_SHMEM_ERROR("ccoDevCommCreate: rank {} could not create its SDMA queues", r);
-    } else {
-      MORI_SHMEM_ERROR("ccoDevCommCreate: rank {} has {} SDMA queues per peer, rank {} has {}", r,
-                       sdmaQueuesAll[r], comm->rank, sdmaQueues);
+  if (reqs->sdmaQueueCount > 0 || comm->ctx->IsSdmaEnabled()) {
+    std::vector<int> sdmaQueuesAll(comm->worldSize, 0);
+    comm->bootNet->Allgather(&sdmaQueues, sdmaQueuesAll.data(), sizeof(int));
+    std::string why;
+    if (sdmaQueues < 0) why = "this rank could not create its SDMA queues";
+    for (int r = 0; why.empty() && r < comm->worldSize; r++) {
+      const int q = sdmaQueuesAll[r];
+      const bool sameNode = r >= comm->myNodeStart && r < comm->myNodeStart + comm->lsaSize;
+      if (q < 0) {
+        why = fmt::format("rank {} could not create its SDMA queues", r);
+      } else if ((q > 0) != (sdmaQueues > 0)) {
+        why = fmt::format(
+            "rank {} has {} SDMA queues per peer and this rank {}; set MORI_ENABLE_SDMA alike on "
+            "every node",
+            r, q, sdmaQueues);
+      } else if (sameNode && q != sdmaQueues) {
+        why = fmt::format("rank {} on this node has {} SDMA queues per peer and this rank {}", r, q,
+                          sdmaQueues);
+      }
     }
-    return -1;
+    if (!why.empty()) {
+      MORI_SHMEM_ERROR("ccoDevCommCreate: rank {}: {}", comm->rank, why);
+      return -1;
+    }
   }
 
   // Resolve connection type. CROSSNODE collapses to NONE on single-node
