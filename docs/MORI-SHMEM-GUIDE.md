@@ -13,9 +13,10 @@ MORI Shmem provides OpenSHMEM-style symmetric memory APIs for GPU memory managem
 - [6. Synchronization](#6-synchronization)
 - [7. HIP Module Init (Triton Integration)](#7-hip-module-init-triton-integration)
 - [8. Initialization Flags](#8-initialization-flags)
-- [Device Bitcode and IR](#device-bitcode-and-ir)
-- [Environment Variables](#environment-variables)
-- [Source Files](#source-files)
+- [9. Device Bitcode and IR](#9-device-bitcode-and-ir)
+- [10. Environment Variables](#10-environment-variables)
+- [11. Rail-only connections](#11-rail-only-connections)
+- [12. Source Files](#12-source-files)
 
 ## Quick Reference
 
@@ -289,7 +290,7 @@ This copies the current GPU states to the `globalGpuStates` symbol in the dynami
 
 ---
 
-## Device Bitcode and IR
+## 9. Device Bitcode and IR
 
 MORI-SHMEM device functions can be called from GPU kernels written in Triton, FlyDSL, MLIR or HIP. They are pre-compiled to LLVM bitcode (`libmori_shmem_device.bc`) as `extern "C"` wrappers. The `mori.ir` Python package locates the bitcode and gives the ABI metadata of every device function. Any framework that can link LLVM bitcode can use them. Triton is the reference integration. The package's own guide, [`python/mori/ir/README.md`](https://github.com/ROCm/mori/blob/main/python/mori/ir/README.md), covers the integration layers and their tests.
 
@@ -574,7 +575,7 @@ cd examples/shmem/ir && bash run.sh 2 gfx942
 
 ---
 
-## Environment Variables
+## 10. Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -591,7 +592,7 @@ cd examples/shmem/ir && bash run.sh 2 gfx942
 | `MORI_RDMA_TC` | RDMA traffic class | Auto |
 | `MORI_MLX5_RESOLVE_DMAC` | mlx5 RoCE only. Resolve the QP's destination MAC through an address handle, so that `ibv_create_ah` / `mlx5dv_init_obj` asks the kernel for the next hop (as `ibv_modify_qp` does) instead of using the peer NIC's own MAC. Required when the peer NICs are reached through a router (RoCE on a routed/L3 fabric); a same-L2 peer resolves to the same MAC either way. Set to `0` to fall back to the peer NIC's MAC, which is also what happens when resolution fails. Resolution is cached per peer for the life of the process. | `1` |
 | `MORI_DISABLE_P2P` | Disable P2P (XGMI) transport, force RDMA | Not set |
-| `MORI_ENABLE_RAIL_ONLY` | Only create RDMA QPs to same-rail peers (same index within their node). For rail-isolated fabrics where cross-rail QPs cannot be established. See [Rail-only connections](#rail-only-connections). | Not set |
+| `MORI_ENABLE_RAIL_ONLY` | Only create RDMA QPs to same-rail peers (same index within their node). For rail-isolated fabrics where cross-rail QPs cannot be established. See [Rail-only connections](#11-rail-only-connections). | Not set |
 | `MORI_DISABLE_TOPO` | Disable topology detection | Not set |
 | `MORI_IGNORE_CPU_AFFINITY` | By default the thread calling `ShmemInit` is pinned to the CPUs local to its GPU (sysfs `local_cpulist`, intersected with the existing cpuset). Within that set the CPUs are grouped into physical cores by `thread_siblings_list` and partitioned into one disjoint slice per GPU on the NUMA node, so two ranks never share the two SMT siblings of one core; the split applies only when the process sees more than one GPU on that NUMA node and there is at least one physical core per GPU, otherwise the whole node is bound. Set to `1` to disable and leave CPU placement to an outer `numactl`/`torchrun`. Works in SPMT (single-process multi-GPU) too: each per-GPU init thread pins to its own GPU's slice. | Not set (binding on) |
 | `MORI_CPU_AFFINITY_NO_SPLIT` | Bind to the whole NUMA node instead of this rank's own slice of it. | Not set (split on) |
@@ -601,7 +602,7 @@ cd examples/shmem/ir && bash run.sh 2 gfx942
 
 ---
 
-## Rail-only connections
+## 11. Rail-only connections
 
 By default `Context` builds a full mesh: every cross-node peer gets
 `MORI_NUM_QP_PER_PE` queue pairs. On a **rail-isolated** fabric only NICs on
@@ -652,7 +653,7 @@ rail-only: rank 3 rail 3 created QPs to 1 peers (4 QPs): 11
 
 ---
 
-## Source Files
+## 12. Source Files
 
 | File | Description |
 |------|-------------|
