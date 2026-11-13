@@ -1168,9 +1168,13 @@ inline __device__ void CombineSync(EpDispatchCombineArgs& args) {
   int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
   int startTokenIdx = blockId * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
-  for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
-    core::WarpCopy(args.reg(args.offCombineInp)->template GetAs<T*>() + tokenId * hiddenDim,
-                   static_cast<const T*>(args.inpTokenBuf) + tokenId * hiddenDim, hiddenDim);
+  T* combineInp = args.reg(args.offCombineInp)->template GetAs<T*>();
+  // A caller that wrote into combine_in_view() already put the rows here.
+  if (args.inpTokenBuf != combineInp) {
+    for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
+      core::WarpCopy(combineInp + tokenId * hiddenDim,
+                     static_cast<const T*>(args.inpTokenBuf) + tokenId * hiddenDim, hiddenDim);
+    }
   }
   if (args.weightsBuf) {
     for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {

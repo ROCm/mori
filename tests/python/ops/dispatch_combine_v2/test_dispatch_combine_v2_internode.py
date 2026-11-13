@@ -311,6 +311,9 @@ def _parse_args(argv):
     # --bench-weights measures the fold when that is what you want. The
     # correctness path always folds -- it is checking the weights.
     parser.add_argument("--bench-weights", action="store_true")
+    # Hand combine the op's combine_in_view(), filled with the expert output (in
+    # bench, inside the untimed conversion window), as a zero-copy caller does.
+    parser.add_argument("--combine-zero-copy", action="store_true")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--drop-rounds", type=int, default=1)
     parser.add_argument("--no-bench-tables", action="store_true")
@@ -858,6 +861,10 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     comm.barrier()
 
     def convert(tensor):
+        if args.combine_zero_copy:
+            zero_copy = op.combine_in_view()
+            zero_copy[: tensor.shape[0]].copy_(_combine_input(cfg, tensor))
+            return zero_copy
         return _combine_input(cfg, tensor)
 
     combine_weights = wts if args.bench_weights else None
@@ -2304,6 +2311,13 @@ def main(argv):
             # and it reads inpTokenBuf as T*, so handing it the fp8 dispatch
             # output unconverted reinterprets fp8 bytes as bf16.
             combine_input = _combine_input(cfg, recv_x)
+            if args.combine_zero_copy:
+                # The expert wrote its received rows into combine_in_view(); combine
+                # has nothing to copy.
+                zero_copy = op.combine_in_view()
+                rows = int(total_recv.item())
+                zero_copy[:rows].copy_(combine_input[:rows])
+                combine_input = zero_copy
             if qp_schedule:
                 op.set_active_qps(_active_qp_for(qp_schedule, round_index, cfg, 1))
             # `wts` is a REQUEST for the weight fold, and AsyncLL cannot serve
