@@ -1610,57 +1610,54 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     nodeCount = __shfl(nodeCount, 0) - 1;
     if (nodeCount == 0) continue;
 
-    // One whole vector step per warp: the split never hands a warp less than one
-    // step, which is where the gather falls back to the scalar tail.
-    //
-    // This has to be a static function of the config: chunkFlag is cleared by
-    // whichever warp completes a chunk, so anything derived from the live counts
-    // can differ between two warps, and they must agree on the completion target.
+    // One vector step per part, so no part falls to the gather's scalar tail and 3584 splits
+    // 1024/1024/1024/512 rather than 2048/1536 and an empty part.
     const size_t vecStep = CombineVecStep<TokT>(warpSize);
-    int warpsPerToken = static_cast<int>(hiddenDim / vecStep);
-    if (warpsPerToken < 1) warpsPerToken = 1;
-    size_t hiddenDimPerWarp = core::CeilDiv(hiddenDim, static_cast<size_t>(warpsPerToken));
-    hiddenDimPerWarp = core::CeilDiv(hiddenDimPerWarp, vecStep) * vecStep;
+    const int warpsPerToken = static_cast<int>(core::CeilDiv(hiddenDim, vecStep));
+    const size_t hiddenDimPerWarp = vecStep;
     const bool vecAligned = CombineVecAligned(tokHiddenBytes, tokCombXferBytes);
 
-    for (int i = globalWarpId; i < (nodeCount * warpsPerToken); i += rdmaWarpNum) {
+    // Each node's items start on a different warp, so a small batch's nodes are gathered by
+    // different warps at once rather than by the same warps one node after another.
+    const int first = (globalWarpId + n * (rdmaWarpNum - rdmaWarpNum / (nNodes - 1))) % rdmaWarpNum;
+    for (int i = first; i < (nodeCount * warpsPerToken); i += rdmaWarpNum) {
       int tokenId = i / warpsPerToken;
       int k = tokenId / warpSize;
       int startTokenIdx = k * warpSize;
       uint64_t thisChunkTokenNum = chunkFlag[node * maxChunkNum + k];
       thisChunkTokenNum -= (thisChunkTokenNum > 0) ? 1 : 0;
-      if ((tokenId - startTokenIdx) < thisChunkTokenNum) {
-        int inTokenPartId = i % warpsPerToken;
-        size_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-        size_t hiddenDimSize = (hiddenDimOffset < hiddenDim)
-                                   ? std::min(hiddenDim - hiddenDimOffset, hiddenDimPerWarp)
-                                   : size_t{0};
+      // Padding (past the chunk's tokens, or the flag already cleared) neither gathers nor
+      // counts: every real item reads the flag before its own increment, so all of them
+      // compute the same completion target.
+      if ((tokenId - startTokenIdx) >= thisChunkTokenNum) continue;
+      int inTokenPartId = i % warpsPerToken;
+      size_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
+      size_t hiddenDimSize = std::min(hiddenDim - hiddenDimOffset, hiddenDimPerWarp);
 
-        int globalTokenId = SendBufSlotOffset(config, node, tokenId);
-        if (laneId < config.numExpertPerToken) {
-          srcPtrs[laneId] = nullptr;
-          srcWeightsPtr[laneId] = nullptr;
-          index_t destTokId =
-              args.interNodeDispDestTokIdMap[globalTokenId * config.numExpertPerToken + laneId];
-          index_t destPe = PeFromFlatTokenIndex(config, destTokId);
-          index_t destNode = destPe / config.gpuPerNode;
-          if (destNode == myNode) {
-            index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
-            srcPtrs[laneId] = args.reg(args.offCombineInp)->template GetAs<TokT*>(destPe) +
-                              destLocalTokId * hiddenDim + hiddenDimOffset;
-            srcWeightsPtr[laneId] = args.reg(args.offInpWeights)->template GetAs<float*>(destPe) +
-                                    destLocalTokId * config.numExpertPerToken;
-          }
+      int globalTokenId = SendBufSlotOffset(config, node, tokenId);
+      if (laneId < config.numExpertPerToken) {
+        srcPtrs[laneId] = nullptr;
+        srcWeightsPtr[laneId] = nullptr;
+        index_t destTokId =
+            args.interNodeDispDestTokIdMap[globalTokenId * config.numExpertPerToken + laneId];
+        index_t destPe = PeFromFlatTokenIndex(config, destTokId);
+        index_t destNode = destPe / config.gpuPerNode;
+        if (destNode == myNode) {
+          index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
+          srcPtrs[laneId] = args.reg(args.offCombineInp)->template GetAs<TokT*>(destPe) +
+                            destLocalTokId * hiddenDim + hiddenDimOffset;
+          srcWeightsPtr[laneId] = args.reg(args.offInpWeights)->template GetAs<float*>(destPe) +
+                                  destLocalTokId * config.numExpertPerToken;
         }
-        CombineGather<TokT>(reinterpret_cast<TokT*>(stagingPtr + globalTokenId * tokCombXferBytes) +
-                                hiddenDimOffset,
-                            srcPtrs, config.numExpertPerToken, hiddenDimSize, vecAligned);
-        if (args.weightsBuf && (inTokenPartId == 0)) {
-          core::WarpAccum<float, 4>(
-              reinterpret_cast<float*>(stagingPtr + globalTokenId * tokCombXferBytes +
-                                       tokHiddenBytes),
-              srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
-        }
+      }
+      CombineGather<TokT>(
+          reinterpret_cast<TokT*>(stagingPtr + globalTokenId * tokCombXferBytes) + hiddenDimOffset,
+          srcPtrs, config.numExpertPerToken, hiddenDimSize, vecAligned);
+      if (args.weightsBuf && (inTokenPartId == warpsPerToken - 1)) {
+        core::WarpAccum<float, 4>(
+            reinterpret_cast<float*>(stagingPtr + globalTokenId * tokCombXferBytes +
+                                     tokHiddenBytes),
+            srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
       }
 
       // Join the producers before the leader's release publishes their stores.
@@ -1670,16 +1667,9 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
       if (laneId == 0)
         finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
       finished = __shfl(finished, 0);
-      if ((finished + 1) >= (warpsPerToken * warpSize)) {
-        if (laneId == 0) {
-          // Acquire all producers through the completion-counter RMW chain.
-          __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-          core::AtomicStoreSeqCstSystem(
-              args.reg(args.offChunkFlag)->template GetAs<uint64_t*>() + node * maxChunkNum + k,
-              uint64_t{0});
-          core::AtomicStoreRelaxedSystem(args.interNodeChunkFlagCombine + node * maxChunkNum + k,
-                                         index_t{0});
-        }
+      if ((finished + 1) >= (static_cast<int>(thisChunkTokenNum) * warpsPerToken)) {
+        // Acquire all producers through the completion-counter RMW chain.
+        if (laneId == 0) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         int proxyPe = node * config.gpuPerNode + (myPe % config.gpuPerNode);
         int qpId = k % config.numQpPerPe;
         EpInterNodePut(comm, args.reg(args.offStaging),
@@ -1687,6 +1677,12 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
                        args.reg(args.offStaging),
                        SendBufSlotOffset(config, node, startTokenIdx) * tokCombXferBytes,
                        thisChunkTokenNum * tokCombXferBytes, proxyPe, qpId);
+        // Cleared after the post; the fence before the end barrier publishes them.
+        if (laneId == 0) {
+          core::AtomicStoreSeqCstSystem(chunkFlag + node * maxChunkNum + k, uint64_t{0});
+          core::AtomicStoreRelaxedSystem(args.interNodeChunkFlagCombine + node * maxChunkNum + k,
+                                         index_t{0});
+        }
       }
     }
   }
@@ -1779,7 +1775,12 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs& args)
   uint8_t* stagingPtr = args.reg(args.offStaging)->template GetAs<uint8_t*>() +
                         SendBufSlotOffset(config, nNodes, 0) * combXferBytes;
 
-  MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
+  // Aligned rows take 16 B loads on slices of whole vector rounds, every node's load in flight;
+  // unsnapped slices left most of each part to the gather's serial scalar tail.
+  const bool vecAligned = internode::combine_impl::CombineVecAligned(hiddenBytes, combXferBytes);
+  MultiWarpIter mwIter(
+      globalWarpNum, args.curRankNumToken, hiddenDim,
+      vecAligned ? warpSize * (internode::combine_impl::kCombineVecBytes / sizeof(T)) : 1);
 
   for (int i = globalWarpId; i < (args.curRankNumToken * mwIter.warpsPerItem); i += globalWarpNum) {
     int tokenId, inTokenPartId;
@@ -1808,9 +1809,9 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs& args)
         srcWeightsPtrs[n] = reinterpret_cast<float*>(base + hiddenBytes);
       }
     }
-    core::WarpAccum<T, 4>(
+    internode::combine_impl::CombineGather<T>(
         args.reg(args.offCombineOut)->template GetAs<T*>() + tokenId * hiddenDim + hiddenDimOffset,
-        srcPtrs, nullptr, nNodes, hiddenDimSize);
+        srcPtrs, nNodes, hiddenDimSize, vecAligned);
     if (args.weightsBuf && (inTokenPartId == mwIter.warpsPerItem - 1)) {
       core::WarpAccum<float, 4>(args.reg(args.offCombineOutWeights)->template GetAs<float*>() +
                                     tokenId * config.numExpertPerToken,
