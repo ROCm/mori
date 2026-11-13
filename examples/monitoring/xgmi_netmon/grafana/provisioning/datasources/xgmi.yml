@@ -1,0 +1,12 @@
+apiVersion: 1
+datasources:
+  - name: xgmi-vm
+    uid: xgmi-vm
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:${XGMI_VM_PORT}
+    isDefault: true
+    editable: false
+    jsonData:
+      # one bin holds at least 3 snapshots (2 ms each)
+      timeInterval: 6ms
