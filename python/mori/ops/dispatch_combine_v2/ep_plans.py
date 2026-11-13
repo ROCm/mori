@@ -264,3 +264,27 @@ EP_ASYNCLL_PLANS = {
         "combine_recvtransfer_lsa",
     )
 }
+
+# The segmented passes (EpDispatchCombineConfig.async_ll_recv_layout), made on first
+# use so a host library built without them still serves every other op.
+_ASYNCLL_SEG_PASSES = frozenset(
+    {
+        "dispatch_sendcopy_seg",
+        "dispatch_sendtransfer_seg",
+        "dispatch_recvfinalize_seg",
+        "combine_sendtransfer_seg",
+        "combine_recvcopy_seg",
+    }
+)
+_asyncll_seg_plans = {}
+
+
+def asyncll_plan(name):
+    """The Plan class of AsyncLL pass `name`."""
+    if name not in _ASYNCLL_SEG_PASSES:
+        return EP_ASYNCLL_PLANS[name]
+    plan = _asyncll_seg_plans.get(name)
+    if plan is None:
+        plan = make_plan(f"ep_asyncll_{name}", enums=_INTERNODE_ENUMS)
+        _asyncll_seg_plans[name] = plan
+    return plan

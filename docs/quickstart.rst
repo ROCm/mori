@@ -1,7 +1,7 @@
 Quickstart
 ==========
 
-Start with :doc:`installation` and choose an API using :doc:`ep_backends`.
+Start with :doc:`installation` and choose an API using :doc:`MORI-EP-GUIDE`.
 The snippets below explain the API flow; variables such as ``input_tokens``,
 ``weights`` and peer descriptors are application-provided, so these are not
 standalone programs.
@@ -27,7 +27,7 @@ The test programs construct inputs, initialize ranks, check results and clean up
 The EPv2 pytest wrapper also checks the runner's printed PASS/FAIL results; a zero
 exit code from the underlying ``test_op.py`` alone is not a correctness gate.
 Run them on an allocated node without competing jobs. For two-node EPv2,
-including its preview restrictions, see :doc:`ep_backends`.
+including its preview restrictions, see :doc:`MORI-EP-GUIDE`.
 
 API sketches
 ------------
@@ -120,8 +120,8 @@ Allocate GPU memory accessible across all ranks:
 
 See the :doc:`Shmem Guide <MORI-SHMEM-GUIDE>` for full API reference.
 
-MORI-IR: Device Bitcode for GPU Kernels
------------------------------------------
+MORI-SHMEM: Device Bitcode for GPU Kernels
+------------------------------------------
 
 Use MORI shmem device functions inside Triton (or any LLVM-based) kernels:
 
@@ -147,19 +147,20 @@ Use MORI shmem device functions inside Triton (or any LLVM-based) kernels:
 
    my_kernel[(grid,)](buf, BLOCK=1024, extern_libs=get_extern_libs())
 
-See :doc:`MORI-IR Guide <MORI-IR-GUIDE>` for full device function table and non-Triton integration.
+See the :doc:`Shmem Guide <MORI-SHMEM-GUIDE>` for the full device function table and non-Triton integration, and the :doc:`CCO Guide <MORI-CCO-GUIDE>` for the CCO device API.
 
 Profiling with MORI-VIZ
 -------------------------
 
-Capture warp-level kernel traces (build with ``ENABLE_PROFILER=ON``):
+Capture warp-level kernel traces. Build with ``ENABLE_PROFILER=ON``, and keep
+it set when you run, so the JIT compiles the instrumented kernels:
 
 .. code-block:: python
 
    from mori.kernel_profiler import export_to_perfetto
 
-   # After running dispatch/combine:
-   trace_buffer = mori.cpp.get_debug_time_buf(op._handle)
+   # After running dispatch/combine with an EpDispatchCombineOp `op`:
+   trace_buffer = op.get_debug_time_buf()
    export_to_perfetto(trace_buffer, "ep_trace.json")
 
    # Visualize at https://ui.perfetto.dev/
@@ -171,6 +172,5 @@ Next Steps
 
 * :doc:`MORI-EP Guide <MORI-EP-GUIDE>` — Full EP API reference and examples
 * :doc:`Shmem Guide <MORI-SHMEM-GUIDE>` — Symmetric memory concepts and APIs
-* :doc:`MORI-IR Guide <MORI-IR-GUIDE>` — Device bitcode integration for Triton
 * :doc:`MORI-IO Guide <MORI-IO-GUIDE>` — IO architecture and Python API
 * :doc:`Profiler <PROFILER>` — Warp-level kernel profiler

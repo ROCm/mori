@@ -73,21 +73,32 @@ enum class EpAsyncLLKernel {
   DispatchRecvTransferLsa,
   CombineSendTransferLsa,
   CombineRecvTransferLsa,
+  // Segmented receive (args.segStride, see asyncll::SegStrideOf): the expert reads
+  // the per-source landing segments in place. SendCopySeg/SendTransferSeg replace the SDMA send
+  // pair, RecvFinalizeSeg replaces DispatchRecvCopy, and CombineSendTransferSeg +
+  // CombineRecvCopySeg send the segmented expert output in place.
+  DispatchSendCopySeg,
+  DispatchSendTransferSeg,
+  DispatchRecvFinalizeSeg,
+  CombineSendTransferSeg,
+  CombineRecvCopySeg,
 };
 
 // True for the passes that take the device communicator, i.e. the ones that
 // touch an engine. The other five are local copies and need no comm.
 bool EpAsyncLLTakesComm(EpAsyncLLKernel kind);
+// True for the segmented-receive passes (async_ll_recv_layout).
+bool EpAsyncLLIsSegmented(EpAsyncLLKernel kind);
 
 std::string EpAsyncLLEntryName(const EpInterNodeCfg& cfg, EpAsyncLLKernel kind);
 std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kind);
 mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsyncLLKernel kind);
 
 // Grids that divide the work per destination rank must be an exact multiple of
-// worldSize: DispatchRecvCopy derives `blocksPerPe = gridDim.x / worldSize` and
-// then `destPe = blockIdx.x / blocksPerPe`, so a remainder leaves the tail blocks
-// decoding to a PE that does not exist. v1 aligns the same way at its launch
-// site (`mp - mp % worldSize`).
+// worldSize: the LSA transfer passes derive `destPe = globalWarpId /
+// (globalWarpNum / worldSize)`, so a remainder leaves the tail warps decoding to
+// a PE that does not exist. v1 aligns the same way at its launch site
+// (`mp - mp % worldSize`).
 constexpr int EpAsyncLLAlignGrid(int grid, int worldSize) {
   const int aligned = grid - (grid % worldSize);
   return aligned > 0 ? aligned : worldSize;
@@ -122,6 +133,14 @@ MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineSendTransferLsaSpec,
                              "ep_asyncll_combine_sendtransfer_lsa");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineRecvTransferLsaSpec,
                              "ep_asyncll_combine_recvtransfer_lsa");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchSendCopySegSpec, "ep_asyncll_dispatch_sendcopy_seg");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchSendTransferSegSpec,
+                             "ep_asyncll_dispatch_sendtransfer_seg");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchRecvFinalizeSegSpec,
+                             "ep_asyncll_dispatch_recvfinalize_seg");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineSendTransferSegSpec,
+                             "ep_asyncll_combine_sendtransfer_seg");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineRecvCopySegSpec, "ep_asyncll_combine_recvcopy_seg");
 
 #undef MORI_EP_ASYNCLL_DECLARE_SPEC
 
