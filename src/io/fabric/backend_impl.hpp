@@ -23,7 +23,6 @@
 
 #include <hip/hip_runtime_api.h>
 
-#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -114,9 +113,6 @@ class FabricBackend : public Backend {
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) override;
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
-  // Cannot fence: a peer writes through its import of our fabric handle, which cannot be
-  // revoked. Reports a registered peer as not cut off while our memory can be exported.
-  FenceResult FenceRemoteEngine(const EngineKey& remote) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
   // JIT-loaded contiguous copy kernel (fabric_copy.hip), one module per device.
@@ -207,9 +203,6 @@ class FabricBackend : public Backend {
 
   std::unordered_map<EngineKey, EngineDesc> remoteEngines;
   mutable std::mutex remoteEnginesMu;
-  // Whether a fabric handle of our memory was ever exported, for FenceRemoteEngine: a peer's
-  // import outlives the deregistration of the memory or of the peer.
-  std::atomic<bool> exportedMemory_{false};
 
   std::string fabricCopyHsacoPath_;
   std::vector<hipModule_t> fabricCopyModules_;
