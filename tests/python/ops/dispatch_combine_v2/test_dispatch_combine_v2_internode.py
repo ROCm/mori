@@ -1394,7 +1394,7 @@ def _stress(op, cfg, dist_handle, device, args, comm):
     dataset, so the soak covers what a fixed-size bench cannot: ragged and
     unequal loads, the chunk protocol's empty-chunk path, and -- under
     internode_kernel="auto" -- the per-call switch between the v2 and v2_ll
-    families, since the rounds' max counts across ranks can straddle the crossover.
+    families, since every eighth dataset keeps all ranks at or below the crossover.
 
     By default no per-round verification: this looks for hangs, faults and
     protocol drift over many rounds, and checking every round would hide them
@@ -1416,6 +1416,9 @@ def _stress(op, cfg, dist_handle, device, args, comm):
     counts = torch.randint(
         1, max_tokens + 1, [args.stress_datasets], generator=rng, device=device
     ).tolist()
+    ll = min(cfg.internode_auto_ll_max_tokens, max_tokens)
+    if cfg.internode_kernel == "auto" and not cfg.async_ll and ll > 0:
+        counts = [(n - 1) % ll + 1 if j % 8 == 0 else n for j, n in enumerate(counts)]
     if dist_handle.rank // cfg.gpu_per_node == args.stress_full_node:
         counts = [max_tokens] * len(counts)
     peaks = dist_handle.all_gather_rows(counts).max(dim=0).values.long().tolist()
@@ -1568,7 +1571,9 @@ def _tune(cfg, dist_handle, device, args, comm):
         "combine": DTYPE_TO_CONFIG_STR.get(cfg.combine_dtype),
     }
     kernel_family = (
-        internode_kernel_family(cfg, args.max_tokens) if cfg.is_internode else "intra"
+        internode_kernel_family(cfg, max_tokens=args.max_tokens)
+        if cfg.is_internode
+        else "intra"
     )
     if args.tuning_save or args.tuning_config_dir:
         # Read the incumbent from the SAME table the winner will be written to.

@@ -26,7 +26,11 @@ import torch
 import torch.distributed as dist
 
 import mori.cco as cco
-from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
+from mori.ops.dispatch_combine_v2 import (
+    EpDispatchCombineConfig,
+    EpDispatchCombineOp,
+    EpDispatchRoutingHandle,
+)
 from mori.ops.dispatch_combine_v2.hip_backend import _LL_SPEC, ll128_layout
 
 HIDDEN = 7168
@@ -238,14 +242,40 @@ def run(case, cfg, comm, dev, lut, lim, sizes, args):
             want = keys(sources(a, sizes[a]))
             check(f"snapshot_own_reverse_map_{side}", sorted(rev.tolist()) == want)
 
+    for i in (small[0], large[0]):
+        side = "ll128" if sizes[i] <= lim else "sched"
+        x, idx, w, s = args[i]
+        out, _, _, _, _, h = op.dispatch(
+            x, w, s, idx, return_routing=True, max_num_inp_token_across_ranks=sizes[i]
+        )
+        sync()
+        y, tensors = expert(out, lut), h.tensors()
+        try:
+            op.combine(
+                y,
+                routing=EpDispatchRoutingHandle.from_tensors(
+                    tensors, cur_rank_num_token=sizes[i]
+                ),
+            )
+            raised = False
+        except ValueError:
+            raised = True
+        check(f"rebuilt_without_peak_raises_{side}", raised)
+        rebuilt = EpDispatchRoutingHandle.from_tensors(
+            tensors,
+            cur_rank_num_token=sizes[i],
+            max_num_inp_token_across_ranks=h.max_num_inp_token_across_ranks,
+        )
+        o, _ = op.combine(y, routing=rebuilt)
+        sync()
+        check(f"rebuilt_combine_{side}", torch.equal(o, refs[i]))
+
     op.close()
 
     def expect(ll, give, shape):
-        if ll is False or shape == "large":
-            return False
-        if shape == "small":
-            return give or ll is True
-        return None if ll is True and not give else False
+        if ll is True and not give:
+            return None
+        return give and ll is not False and shape == "small"
 
     shapes = (
         ("small", [lim] * world),
@@ -259,18 +289,21 @@ def run(case, cfg, comm, dev, lut, lim, sizes, args):
                 peak = max(counts) if give else None
                 tag = f"low_latency_{ll}_{'peak' if give else 'nopeak'}_{shape}"
                 want = expect(ll, give, shape)
-                picked = {sub._pick(c, False, peak)[0] == _LL_SPEC for c in counts}
-                if len(picked) > 1:
-                    check(f"{tag}_not_launched", want is None)
-                    continue
-                check(f"{tag}_agree", want is not None and picked == {want})
-                if want is None:
-                    continue
                 i, n = 1000 + j, counts[rank]
                 x, idx, w, s = (
                     None if t is None else t.to(dev)
                     for t in make_inputs(cfg, i, rank, n)
                 )
+                if want is None:
+                    try:
+                        sub.dispatch(x, w, s, idx, return_routing=True)
+                        raised = False
+                    except ValueError:
+                        raised = True
+                    check(f"{tag}_raises", raised)
+                    continue
+                picked = {sub._pick(c, False, peak)[0] == _LL_SPEC for c in counts}
+                check(f"{tag}_agree", picked == {want})
                 out, ow, osc, oidx, total, h = sub.dispatch(
                     x,
                     w,

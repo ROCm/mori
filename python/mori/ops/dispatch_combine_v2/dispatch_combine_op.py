@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import logging
 import os
 from dataclasses import dataclass
 from typing import Callable
@@ -59,6 +60,8 @@ import torch
 
 from mori.tensor_utils import from_gpu_ptr
 from mori.jit.config import detect_wave_size
+
+logger = logging.getLogger(__name__)
 
 WAVE = detect_wave_size()
 
@@ -83,6 +86,8 @@ _PUSH_QUANT_TYPES = _FP4_QUANT_TYPES + ("fp8_blockwise",)
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise") + _FP4_QUANT_TYPES
 
 _INTERNODE_KERNELS = ("auto", "v2", "v2_ll")
+
+_UNKNOWN_PEAK = object()
 
 _DT = {
     torch.bfloat16: 2,
@@ -178,7 +183,6 @@ class EpDispatchCombineConfig:
     # of the shape. Unrelated to max_num_inp_token_per_rank, which is the
     # capacity. Read only when internode_kernel == "auto".
     internode_auto_ll_max_tokens: int = 512
-    low_latency: bool = None
     # Which kernel backend serves this op: "flydsl" (default except on gfx125x,
     # full intranode feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
     # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
@@ -235,6 +239,7 @@ class EpDispatchCombineConfig:
     # op's send. With the ops on separate streams, a two-op microbenchmark is
     # slower but DeepSeek-V4 prefill was still faster, so measure that case.
     async_ll_own_sdma_queue: bool = False
+    low_latency: bool | None = None
 
     def __post_init__(self):
         # Node grouping first: is_internode gates checks further down, and the
@@ -752,7 +757,7 @@ class EpDispatchRoutingHandle:
         reverse_src_view=None,
         reverse_encode=None,
         recv_maps=None,
-        max_num_inp_token_across_ranks=None,
+        max_num_inp_token_across_ranks=_UNKNOWN_PEAK,
     ):
         self.disp_dest_tok_id_map = disp_dest_tok_id_map
         self.recv_maps = recv_maps
@@ -788,7 +793,7 @@ class EpDispatchRoutingHandle:
 
     @classmethod
     def from_tensors(
-        cls, tensors, cur_rank_num_token=0, max_num_inp_token_across_ranks=None
+        cls, tensors, cur_rank_num_token=0, max_num_inp_token_across_ranks=_UNKNOWN_PEAK
     ):
         return cls(
             *tensors,
@@ -972,6 +977,54 @@ class EpDispatchCombineOp:
             comb_spec = self._combine_specs[-1]
         return disp_spec, comb_spec
 
+    _warned_no_peak = False
+
+    def _peak_limit(self, snapshot):
+        return None
+
+    def _check_no_peak(self, snapshot):
+        limit = self._peak_limit(snapshot)
+        if limit is None:
+            return
+        if self.cfg.low_latency:
+            raise ValueError(
+                "low_latency=True needs max_num_inp_token_across_ranks on this op: "
+                f"its low-latency kernels serve calls of at most {limit} tokens per "
+                "rank, and every rank must take the same kernels in a call. Pass the "
+                "largest token count across ranks."
+            )
+        if self.cfg.rank == 0 and not self._warned_no_peak:
+            self._warned_no_peak = True
+            logger.warning(
+                "dispatch() without max_num_inp_token_across_ranks runs this op's "
+                "regular kernels. Pass the largest token count across ranks to run "
+                "calls of at most %d tokens per rank on its low-latency kernels, or "
+                "set low_latency=False to keep the regular ones.",
+                limit,
+            )
+
+    def _routing_peak(self, routing, snapshot):
+        peak = getattr(routing, "max_num_inp_token_across_ranks", _UNKNOWN_PEAK)
+        if peak is not _UNKNOWN_PEAK:
+            return peak
+        if self._peak_limit(snapshot) is not None:
+            raise ValueError(
+                "this routing handle does not carry the "
+                "max_num_inp_token_across_ranks its dispatch was given, and this op "
+                "picks the combine kernels from it. Pass it to "
+                "EpDispatchRoutingHandle.from_tensors (None if the dispatch was given "
+                "none)."
+            )
+        return None
+
+    def _warn_unused_low_latency(self):
+        if self.cfg.low_latency and self.cfg.rank == 0:
+            logger.warning(
+                "low_latency=True has no effect on this op: the %s backend has no "
+                "low-latency kernels for this shape, dtype and device.",
+                self.backend_name,
+            )
+
     @staticmethod
     def _specs_from(cfg):
         """The (block, warp) variants to build, de-duplicated from the schedule."""
@@ -1145,6 +1198,8 @@ class EpDispatchCombineOp:
                 f"max_num_inp_token_across_ranks={peak} must be at least this "
                 f"rank's {n} tokens and at most max_num_inp_token_per_rank={cap}"
             )
+        if peak is None:
+            self._check_no_peak(snapshot)
         disp_spec, _ = self._pick(n, snapshot, peak)
 
         recv_views = None
@@ -1237,11 +1292,8 @@ class EpDispatchCombineOp:
         """The body of combine(), parameterised by which kernel table runs. See
         _dispatch_impl."""
         ct = routing.cur_rank_num_token
-        _, comb_spec = self._pick(
-            ct,
-            routing.total_recv_token_num is not self.total_recv,
-            routing.max_num_inp_token_across_ranks,
-        )
+        snapshot = routing.total_recv_token_num is not self.total_recv
+        _, comb_spec = self._pick(ct, snapshot, self._routing_peak(routing, snapshot))
 
         if not self._kernels.stages_in_kernel and not self.cfg.enable_std_moe:
             # StdMoE has already written the weighted-reduced tokens into out_tok;

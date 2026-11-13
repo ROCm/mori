@@ -89,14 +89,16 @@ most 8 warps per block, such as EP4's tuned 64 × 8, keep the plain map.
 with the same name and meaning as AITER's v1 flag. `max_num_inp_token_across_ranks`
 (`dispatch` keyword, default `None`) is the largest `input.shape[0]` any rank
 passes to that call. Pass the same value on every rank: the op checks only that
-it lies between this rank's token count and `max_num_inp_token_per_rank`. The
-combine of the returned handle reuses it; `EpDispatchRoutingHandle.from_tensors`
-takes it as a keyword.
+it lies between this rank's token count and `max_num_inp_token_per_rank`, and a
+call where ranks pass different values, or only some pass one, can hang. The
+combine of the returned handle reuses it. `EpDispatchRoutingHandle.from_tensors`
+takes it as a keyword; where the combine depends on it, `combine` refuses a
+rebuilt handle that was not given it (pass `None` for a dispatch without one).
 
 | `low_latency` | `max_num_inp_token_across_ranks` | gfx125x intranode | internode |
 |---|---|---|---|
 | `True` | given | LL128 if it is `<= max_tok` | `v2_ll` |
-| `True` | `None` | LL128 if this rank's tokens are `<= max_tok` | `v2_ll` |
+| `True` | `None` | LL128 when the capacity is `<= max_tok`; otherwise `dispatch` raises | `v2_ll` |
 | `False` | any | the schedule; no LL128 plans are built | `v2` |
 | `None` | given | LL128 if it is `<= max_tok` | `v2_ll` if it is `<= internode_auto_ll_max_tokens` |
 | `None` | `None` | LL128 only when the capacity is `<= max_tok` | `v2` |
@@ -106,12 +108,16 @@ takes it as a keyword.
   below it runs every call on LL128, since no rank can pass more.
 - LL128 and the schedule's kernels keep separate call counters, so every rank
   must take the same one in a call. A call whose ranks fall on both sides of
-  `max_tok` hangs. `True` without `max_num_inp_token_across_ranks` leaves that
-  to the caller.
+  `max_tok` hangs, which is why the choice follows
+  `max_num_inp_token_across_ranks` and never a rank's own token count.
+- A `dispatch` without it on an op that has low-latency kernels for small calls
+  (gfx125x above `max_tok`, internode `auto`) runs the regular ones and logs a
+  warning once per op on rank 0; `low_latency=False` keeps them without it.
 - Internode, `True` and `False` are `internode_kernel="v2_ll"` and `"v2"`;
   combining either with the other family raises.
 - On GPUs without LL128 (all but gfx125x) `low_latency` does not change the
-  intranode kernels; AsyncLL stays behind `async_ll`.
+  intranode kernels, and `True` logs a warning saying so, as it does for a
+  gfx125x op with no LL128 plans; AsyncLL stays behind `async_ll`.
 
 ## Internode config
 
@@ -311,8 +317,8 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank |
 | `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
 | `test_routing_snapshot.py` | `dispatch(..., snapshot=True)` handles outlive later dispatches: combine (twice) and replay with an older handle, both backends. `torchrun --standalone --nproc_per_node=2` |
-| `test_ll128_split.py` | an op past the LL128 table's `max_tok` runs calls whose `max_num_inp_token_across_ranks` is at most `max_tok` on its LL128 plans and the rest on the schedule's: one call sequence crossing `max_tok` both ways, synced (delivery, reverse map, bf16 sum), back to back eager and graph-replayed, and as snapshot handles, each combine equal to the synced one bit for bit; then calls whose ranks fall on both sides of `max_tok`, under each `low_latency`. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` |
-| `test_bf16_push_select.py` | a bf16 op with a push-table entry picks its combine per call: calls crossing LL128's `max_tok` and every push bucket edge both ways, first with one token count on every rank, then above `max_tok` with a different count on each rank, every call passing the largest as `max_num_inp_token_across_ranks`. Each call passes its input as a plain tensor, from `combine_in_view()`, from `combine_in_view()` on alternate ranks only, with weights, and through a `snapshot=True` handle. Checks which combine ran (only a push lands rows in `push_landing()`; weights and snapshot handles pull), the bf16 sum, every result equal to the plain one bit for bit, and back to back eager. Under `MORI_EP_BF16_PUSH=0` it checks that no push plan is built. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` (or 8) |
+| `test_ll128_split.py` | an op past the LL128 table's `max_tok` runs calls whose `max_num_inp_token_across_ranks` is at most `max_tok` on its LL128 plans and the rest on the schedule's: one call sequence crossing `max_tok` both ways, synced (delivery, reverse map, bf16 sum), back to back eager and graph-replayed, as snapshot handles, and through a handle rebuilt with `from_tensors`, each combine equal to the synced one bit for bit (a rebuilt handle without `max_num_inp_token_across_ranks` is refused); then calls whose ranks fall on both sides of `max_tok`, under each `low_latency`, `True` without the value raising at dispatch. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` |
+| `test_bf16_push_select.py` | a bf16 op with a push-table entry picks its combine per call: calls crossing LL128's `max_tok` and every push bucket edge both ways, first with one token count on every rank, then above `max_tok` with a different count on each rank, every call passing the largest as `max_num_inp_token_across_ranks`. Each call passes its input as a plain tensor, from `combine_in_view()`, from `combine_in_view()` on alternate ranks only, with weights, and through a `snapshot=True` handle. Checks which combine ran (only a push lands rows in `push_landing()`; weights and snapshot handles pull), the bf16 sum, every result equal to the plain one bit for bit, and back to back eager. Then the calls at or below `max_tok` again without `max_num_inp_token_across_ranks`, which must push. Under `MORI_EP_BF16_PUSH=0` it checks that no push plan is built. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` (or 8) |
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |

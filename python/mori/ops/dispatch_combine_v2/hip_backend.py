@@ -413,6 +413,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._gate(
             KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg))
         )
+        if lay is None and not cfg.is_internode and not cfg.async_ll:
+            self._warn_unused_low_latency()
         # Active QP counts set_active_qps() may switch to. Each is compiled for
         # every bucket geometry, so a switch never compiles at launch.
         self._selectable_active_qps = tuple(cfg.active_qp_counts or ())
@@ -1673,11 +1675,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         both phases' active count.
         """
         schedule = self._schedule
-        if (
-            self._ll_schedule
-            and tuning.internode_kernel_family(self.cfg, max_tokens) == "v2_ll"
-        ):
-            schedule = self._ll_schedule
+        if self._ll_schedule:
+            family = tuning.internode_kernel_family(self.cfg, max_tokens=max_tokens)
+            if family == "v2_ll":
+                schedule = self._ll_schedule
         selected = tuning.pick_bucket(schedule, num_tokens)
         override = getattr(self, "_active_qps_override", None)
         if override is None:
@@ -1689,16 +1690,25 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _pick(self, num_tokens, snapshot=False, max_tokens=None):
         split = getattr(self, "_ll128_split", None)
+        if (
+            split is not None
+            and max_tokens is not None
+            and max_tokens <= split["max_tok"]
+            and not (snapshot and self.cfg.quant_type in _PUSH_QUANT_TYPES)
+        ):
+            return _LL_SPEC, _LL_SPEC
+        selected = self.kernel_config(num_tokens, max_tokens)
+        return selected.dispatch, selected.combine
+
+    def _peak_limit(self, snapshot):
+        split = getattr(self, "_ll128_split", None)
         if split is not None and not (
             snapshot and self.cfg.quant_type in _PUSH_QUANT_TYPES
         ):
-            bound = max_tokens
-            if bound is None and self.cfg.low_latency:
-                bound = num_tokens
-            if bound is not None and bound <= split["max_tok"]:
-                return _LL_SPEC, _LL_SPEC
-        selected = self.kernel_config(num_tokens, max_tokens)
-        return selected.dispatch, selected.combine
+            return split["max_tok"]
+        if getattr(self, "_ll_schedule", ()):
+            return self.cfg.internode_auto_ll_max_tokens
+        return None
 
     def _wrap_internode(self, phase, group):
         """One ABI crossing for the whole pass sequence.

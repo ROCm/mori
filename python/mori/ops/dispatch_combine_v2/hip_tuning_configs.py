@@ -823,7 +823,7 @@ _INTERNODE_GEOMETRY_FIELDS = (
 )
 
 
-def internode_kernel_family(cfg, max_tokens=None):
+def internode_kernel_family(cfg, *, max_tokens=None):
     """Resolve auto from the call's max token count across ranks; v2 without one."""
     if cfg.internode_kernel != "auto":
         return cfg.internode_kernel
