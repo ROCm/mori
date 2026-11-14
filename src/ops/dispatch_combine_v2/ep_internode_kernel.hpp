@@ -399,6 +399,37 @@ struct ForwardTokenVec16 {
     }
   }
 
+  // The staging direction: gather the parts, then store the token contiguously. A null part
+  // (no weights or no scales) is neither loaded nor stored.
+  __device__ __forceinline__ void LoadParts(const uint8_t* hidden, const uint8_t* index,
+                                            const uint8_t* weight, const uint8_t* scale) {
+    constexpr int h = kHidden / 16, ix = kIndex / 16, w = kWeight / 16;
+    const int lane = threadIdx.x & (warpSize - 1);
+#pragma unroll
+    for (int u = 0; u < kPerLane; u++) {
+      const int v = lane + u * warpSize;
+      const uint8_t* src = v >= kVecs       ? nullptr
+                           : v < h          ? hidden + 16 * v
+                           : v < h + ix     ? index + 16 * (v - h)
+                           : v < h + ix + w ? (weight ? weight + 16 * (v - h - ix) : nullptr)
+                           : scale          ? scale + 16 * (v - h - ix - w)
+                                            : nullptr;
+      if (src) regs[u] = *reinterpret_cast<const Vec*>(src);
+    }
+  }
+
+  __device__ __forceinline__ void StoreContig(uint8_t* dst, bool weight, bool scale) const {
+    constexpr int h = kHidden / 16, ix = kIndex / 16, w = kWeight / 16;
+    const int lane = threadIdx.x & (warpSize - 1);
+#pragma unroll
+    for (int u = 0; u < kPerLane; u++) {
+      const int v = lane + u * warpSize;
+      if (v >= kVecs || (!weight && v >= h + ix && v < h + ix + w) || (!scale && v >= h + ix + w))
+        continue;
+      *reinterpret_cast<Vec*>(dst + 16 * v) = regs[u];
+    }
+  }
+
   __device__ __forceinline__ void Store(uint8_t* hidden, uint8_t* index, uint8_t* weight,
                                         uint8_t* scale) const {
     constexpr int h = kHidden / 16, ix = kIndex / 16, w = kWeight / 16;
@@ -1161,6 +1192,35 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
 
   if (args.curRankNumToken == 0) return;
+
+  // A warp per token, every part's loads in one round: the part-by-part copy below waits on
+  // each load before the next. Needs 16 B-aligned inputs.
+  constexpr EpInterNodeDeviceCfg kCfg = EpInterNodeDeviceCfgOf(kConfig);
+  using Stage = ForwardTokenVec16<kCfg.HiddenBytes(sizeof(T)), kCfg.IndexBytes(),
+                                  kCfg.WeightBytes(), kCfg.ScaleBytes()>;
+  const uintptr_t inputBits = reinterpret_cast<uintptr_t>(args.inpTokenBuf) |
+                              reinterpret_cast<uintptr_t>(args.tokenIndices) |
+                              reinterpret_cast<uintptr_t>(args.weightsBuf) |
+                              reinterpret_cast<uintptr_t>(args.scalesBuf);
+  if (Stage::kUsable && (inputBits % 16) == 0) {
+    uint8_t* stagingPtr = args.reg(args.offDispatchStaging)->template GetAs<uint8_t*>();
+    const bool hasScales = args.scalesBuf && (scaleBytes > 0);
+    for (int tokenId = globalWarpId; tokenId < args.curRankNumToken; tokenId += globalWarpNum) {
+      Stage tok;
+      tok.LoadParts(static_cast<const uint8_t*>(args.inpTokenBuf) + tokenId * hiddenBytes,
+                    reinterpret_cast<const uint8_t*>(args.tokenIndices) + tokenId * indexBytes,
+                    args.weightsBuf
+                        ? reinterpret_cast<const uint8_t*>(args.weightsBuf) + tokenId * weightBytes
+                        : nullptr,
+                    hasScales ? args.scalesBuf + tokenId * scaleBytes : nullptr);
+      uint8_t* dst = stagingPtr + tokenId * xferBytes;
+      tok.StoreContig(dst, args.weightsBuf != nullptr, hasScales);
+      if (laneId == 0)
+        reinterpret_cast<index_t*>(dst + hiddenBytes + indexBytes + weightBytes + scaleBytes)[0] =
+            static_cast<index_t>(FlatTokenIndex(config, myPe, tokenId));
+    }
+    return;
+  }
 
   MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
 
