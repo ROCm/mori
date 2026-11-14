@@ -1680,8 +1680,8 @@ inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, s
   }
 }
 
-// The v2_ll relay's gather: the sources go to the front of srcPtrs and are read kRelayLoadBatch at
-// a time, a batch's loads all in flight before any is accumulated. WarpAccum's 16 B path for topk
+// The relays' gather: the sources go to the front of srcPtrs and are read kRelayLoadBatch at a
+// time, a batch's loads all in flight before any is accumulated. WarpAccum's 16 B path for topk
 // without its own case reads one source at a time. The intra-node gather keeps WarpAccum: batched,
 // its peer reads compete with the relay's, which are on the critical path.
 constexpr int kRelayLoadBatch = 4;
@@ -1981,9 +1981,17 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
                 args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
               }
 
-              CombineGatherNormal<kConfig, TokT>(
-                  reinterpret_cast<TokT*>(stagingPtr + tokIdx * tokCombXferBytes), srcPtrs,
-                  config.numExpertPerToken, hiddenDim);
+              // The batched gather unless the bucket asks for the 4-byte load-first one.
+              if constexpr (kConfig.combineLoadFirst) {
+                CombineGatherNormal<kConfig, TokT>(
+                    reinterpret_cast<TokT*>(stagingPtr + tokIdx * tokCombXferBytes), srcPtrs,
+                    config.numExpertPerToken, hiddenDim);
+              } else {
+                CombineGatherRelay<TokT>(
+                    reinterpret_cast<TokT*>(stagingPtr + tokIdx * tokCombXferBytes), srcPtrs,
+                    config.numExpertPerToken, hiddenDim,
+                    CombineVecAligned(tokHiddenBytes, tokCombXferBytes));
+              }
 
               if (args.weightsBuf) {
                 core::WarpAccum<float, 4>(
