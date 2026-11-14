@@ -227,7 +227,8 @@ __device__ __forceinline__ void EpInterNodePut(const ::mori::cco::ccoDevComm& co
 // Atomic-free counterparts (kConfig.noRdmaAtomics), for NICs whose RDMA atomics cannot target GPU
 // memory. A flag WRITE replaces the add because every flag slot has a single writer per round
 // and its owner zeroes it before the next round, so the add always lands on zero. The flag
-// goes on the same QP after the data, so RC's in-order execution still publishes it last.
+// goes on the same QP after the data: RC executes them in order, so it lands last as long as the
+// NIC's writes reach GPU memory in that order (this mode refuses relaxed ordering).
 __device__ __forceinline__ void EpInterNodeWriteValue(const ::mori::cco::ccoDevComm& comm,
                                                       const EpInterNodeRegion dst, size_t dstOffset,
                                                       uint64_t value, int pe, int qpId = 0) {
@@ -281,12 +282,12 @@ __device__ __forceinline__ void EpInterNodeCountSignal(const ::mori::cco::ccoDev
   }
 }
 
-// Atomic-free v2_ll dispatch sends a chunk of at least 2 * kDispatchPieceMinTokens tokens as one
-// piece per QP. The piece count comes from numQpToDrain, the op's largest active count, so sender
-// and receiver agree on it whatever counts their buckets picked. The chunk flag follows piece 0
-// and still carries the chunk's token count; each later piece writes its own flag with the
-// dispatch's number + 1, after the chunk flags, so it never needs clearing. Those flags are
-// WRITEs, which only the atomic-free path may use (it refuses relaxed ordering); with atomics a
+// Atomic-free v2_ll dispatch splits a chunk into pieces of at least kDispatchPieceMinTokens tokens,
+// one per QP up to numQpToDrain, the op's largest active count, so sender and receiver agree on
+// it whatever counts their buckets picked (two pieces at most for a 64-token chunk). The chunk flag
+// follows piece 0 and still carries the chunk's token count; each later piece writes its own flag
+// with the dispatch's number + 1, after the chunk flags, so it never needs clearing. Those flags
+// are WRITEs, which only the atomic-free path may use (it refuses relaxed ordering); with atomics a
 // chunk stays one piece behind its fused atomic.
 constexpr int kMaxDispatchPieces = 4;
 constexpr int kDispatchPieceMinTokens = 32;
@@ -1838,9 +1839,9 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
       // Join the producers before the leader's release publishes their stores.
       ::mori::cco::ccoCoopWarp{}.sync();
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
-      // A chunk goes out as one piece per active QP, each of at least kCombinePieceMinTokens
-      // tokens, and each piece posts once its own items are done: a single post per chunk ran
-      // a whole node's tokens through one QP at that QP's rate.
+      // A chunk goes out in pieces of max(kCombinePieceMinTokens, chunk / QPs) tokens, piece i on
+      // QP (k + i), each posted once its own items are done: a single post per chunk ran a whole
+      // node's tokens through one QP at that QP's rate.
       const int chunkTokens = static_cast<int>(thisChunkTokenNum);
       const int pieceTokens =
           max(kCombinePieceMinTokens, core::CeilDiv(chunkTokens, config.numQpPerPe));

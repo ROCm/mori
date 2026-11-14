@@ -36,7 +36,8 @@ gpu_per_node; there is no kernel_type enum on the v2 side):
 * internode -- a sequence of separately compiled passes over the
   ``internode_regions`` arena and a device communicator: copystaging +
   dispatch for a round of dispatch, combinesync + combine + combineall for a
-  round of combine. Gather only, bf16/fp32/fp8 on either
+  round of combine (combinesync is skipped when the input already is
+  ``combine_in_view()`` and no weights are folded). Gather only, bf16/fp32/fp8 on either
   leg, plus packed fp4 dispatch with bf16/fp32 combine. FP4 combine is not
   supported. "v2" and "v2_ll" are two distinct kernel families rather than
   a runtime branch: ``cfg.internode_kernel`` (auto | v2 | v2_ll) says which are
@@ -625,7 +626,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     # -- internode -------------------------------------------------------
     #
-    # Multi-node configs run a sequence of passes (2 for dispatch, 4 for
+    # Multi-node configs run a sequence of passes (2 for dispatch, 2-3 for
     # combine) over the internode arena (16 regions, 17 with scales) with a
     # device communicator, instead
     # of two kernels over nine regions. Everything else -- the arena, the plan

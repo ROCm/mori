@@ -56,7 +56,7 @@ mori 特有的简化：走 `.hsaco` + `hipModuleGetFunction` 而非链接，所�
 | | 文件 | 内容 | 谁编译 |
 |---|---|---|---|
 | ① Cfg | `include/mori/ops/dispatch_combine_v2/ep_cfg.hpp`（intranode）<br>`include/mori/ops/dispatch_combine_v2/ep_internode_args.hpp` + `ep_internode_cfg.hpp`（internode） | Cfg + Args + `VisitFields` + 共享几何 constexpr | **两侧**（HIP-free） |
-| ② body | `src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp`（portable）<br>`src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp`（gfx125x TDM）<br>`src/ops/dispatch_combine_v2/ep_internode_kernel.hpp`（internode，八个 pass 各一个 body） | `template <EpCfg kCfg, typename T> __device__ void Body(EpArgs)` | 只有生成的 TU |
+| ② body | `src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp`（portable）<br>`src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp`（gfx125x TDM）<br>`src/ops/dispatch_combine_v2/ep_internode_kernel.hpp`（internode，七个 pass 各一个 body） | `template <EpCfg kCfg, typename T> __device__ void Body(EpArgs)` | 只有生成的 TU |
 | ③ Spec | `ep_spec.hpp` / `ep_spec.cpp`（intranode）<br>`ep_internode_spec.hpp` / `ep_internode_spec.cpp`（internode） | Request + `EntryName` + `RenderSource` + `Geometry` + 注册宏 | host |
 
 新增一个 kernel 就是写这三样。**Python 侧零行**——Plan 类由 C++ 发布的 schema 生成。
@@ -523,7 +523,8 @@ scales 转发、routing replay、`local_expert_count`。这些在 FlyDSL 后端�
 对应 `ep_internode_spec.cpp` 注册的七个 Spec / 七个 plan（`ep_internode_` + `copystaging` /
 `dispatch` / `dispatch_ll` / `combinesync` / `combine` / `combine_ll` / `combineall`）。一轮
 dispatch 发 copystaging + dispatch 或 dispatch_ll，一轮 combine 发 combinesync + combine 或
-combine_ll + combineall（节点内 barrier 在 combine pass 开头）。
+combine_ll + combineall（节点内 barrier 在 combine pass 开头；输入已在 `combine_in_view()` 且不折叠
+weights 时不发 combinesync）。
 
 选择仍然没有 `kernel_type` 枚举，但有两级选择器：走不走 internode 由 `gpu_per_node < world_size`
 （`EpDispatchCombineConfig.is_internode`）决定，只有 `hip` 后端实现它，FlyDSL 后端在能力门里直接
