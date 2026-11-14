@@ -35,8 +35,9 @@ gpu_per_node; there is no kernel_type enum on the v2 side):
   (block, warp) the tuning schedule can select.
 * internode -- a sequence of separately compiled passes over the
   ``internode_regions`` arena and a device communicator: copystaging +
-  dispatch for a round of dispatch, combinesync + combinesyncbarrier + combine
-  + combineall for a round of combine. Gather only, bf16/fp32/fp8 on either
+  dispatch for a round of dispatch, combinesync + combine + combineall for a
+  round of combine (combinesync is skipped when the input already is
+  ``combine_in_view()`` and no weights are folded). Gather only, bf16/fp32/fp8 on either
   leg, plus packed fp4 dispatch with bf16/fp32 combine. FP4 combine is not
   supported. "v2" and "v2_ll" are two distinct kernel families rather than
   a runtime branch: ``cfg.internode_kernel`` (auto | v2 | v2_ll) says which are
@@ -383,6 +384,14 @@ class TokOffExt:
         pass
 
 
+def _relaxed_ordering_enabled():
+    """MORI_IB_ENABLE_RELAXED_ORDERING as rdma.cpp reads it: exactly the value 1."""
+    try:
+        return int(os.environ.get("MORI_IB_ENABLE_RELAXED_ORDERING", "")) == 1
+    except ValueError:
+        return False
+
+
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     """C++/JIT-kernel EP op: gather combine, no quant, no replay.
 
@@ -414,6 +423,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
+        # MORI_EP_DISABLE_RDMA_ATOMICS as the C++ IsEnvVarEnabled reads it: set, and not
+        # 0/false/off/no. Compiled into the v2 / v2_ll plans (kConfig.noRdmaAtomics).
+        _af = os.environ.get("MORI_EP_DISABLE_RDMA_ATOMICS", "")
+        self._no_rdma_atomics = _af.lower() not in ("", "0", "false", "off", "no")
         lay = (
             ll128_layout(cfg) if self._is1250 and cfg.low_latency is not False else None
         )
@@ -613,7 +626,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     # -- internode -------------------------------------------------------
     #
-    # Multi-node configs run a sequence of passes (2 for dispatch, 4 for
+    # Multi-node configs run a sequence of passes (2 for dispatch, 2-3 for
     # combine) over the internode arena (16 regions, 17 with scales) with a
     # device communicator, instead
     # of two kernels over nine regions. Everything else -- the arena, the plan
@@ -770,8 +783,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # Counts completions. NOT the local half of the symmetric chunk-flag
         # region despite the name: that one is written by dispatch and read+
         # cleared by combine, which enumerates its work from dispatch's leftovers.
+        # The v2_ll combine counts one piece per QP of each 64-token chunk.
         self.inter_chunk_flag_combine = torch.zeros(
-            n_nodes * max_tokens_per_rank * 2, **i32
+            n_nodes
+            * max(
+                max_tokens_per_rank * 2,
+                -(-max_tokens_per_rank // 64) * cfg.num_qp_per_pe,
+            ),
+            **i32,
         )
         self.dest_pe_counter = torch.zeros(world_size, **i32)
         self.block_flag_counter = torch.zeros(n_nodes, **i32)
@@ -839,6 +858,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         if cfg.is_scatter:
             bad.append("combine_mode='scatter' (the internode kernels gather)")
+        if getattr(self, "_no_rdma_atomics", False) and _relaxed_ordering_enabled():
+            bad.append(
+                "MORI_EP_DISABLE_RDMA_ATOMICS with MORI_IB_ENABLE_RELAXED_ORDERING=1 "
+                "(with relaxed ordering a WRITE signal may become visible before its data)"
+            )
         if cfg.enable_std_moe:
             bad.append("enable_std_moe (not implemented on the internode path)")
         if cfg.quant_type != "none":
@@ -1038,6 +1062,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append(
                 f"async_ll_transport={cfg.async_ll_transport!r} (have 'sdma', 'lsa')"
             )
+        if cfg.nodes > 1 and getattr(self, "_no_rdma_atomics", False):
+            bad.append(
+                "MORI_EP_DISABLE_RDMA_ATOMICS (cross-node AsyncLL signals with RDMA "
+                "atomics; use v2 / v2_ll)"
+            )
         if cfg.nodes > 1 and cfg.async_ll_transport == "lsa":
             bad.append(
                 "async_ll_transport='lsa' with gpu_per_node="
@@ -1227,18 +1256,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     _INTERNODE_SEQ = {
         ("dispatch", "v2"): ("copystaging", "dispatch"),
         ("dispatch", "v2_ll"): ("copystaging", "dispatch_ll"),
-        ("combine", "v2"): (
-            "combinesync",
-            "combinesyncbarrier",
-            "combine",
-            "combineall",
-        ),
-        ("combine", "v2_ll"): (
-            "combinesync",
-            "combinesyncbarrier",
-            "combine_ll",
-            "combineall",
-        ),
+        ("combine", "v2"): ("combinesync", "combine", "combineall"),
+        ("combine", "v2_ll"): ("combinesync", "combine_ll", "combineall"),
     }
 
     def _internode_request(
@@ -1267,6 +1286,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # The kernel's ACTIVE count; the allocation lives in the DevComm.
             numQpPerPe=active_qps,
             numQpToDrain=num_qp_to_drain,
+            noRdmaAtomics=getattr(self, "_no_rdma_atomics", False),
             quantType=(
                 cfg.quant_type.replace("_", "").lower()
                 if cfg.quant_type != "none"
@@ -1494,6 +1514,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # has to reach them. The internode request never carries it because its
         # geometry table supplies grids directly.
         request["mpCount"] = self._multi_processor_count
+        # AsyncLL has no write-signalling variant; cross-node ones are refused in the gate.
+        request["noRdmaAtomics"] = False
         request["asyncLlMode"] = self._asyncll_mode
         request["asyncLlFusedRecvCtas"] = self._asyncll_fused_ctas
         return request
@@ -1851,7 +1873,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                         plans[key] = plan
                     group_plans.append(plans[key])
                 group = plan_api.make_launch_group(group_plans)
-                kernels[phase][spec] = self._wrap_internode(phase, group)
+                # CombineSync only stages the input and the weights; with the input
+                # already in combine_in_view() and no weight fold it has nothing to do.
+                in_place = (
+                    plan_api.make_launch_group(group_plans[1:])
+                    if phase == "combine"
+                    else None
+                )
+                kernels[phase][spec] = self._wrap_internode(phase, group, in_place)
 
         return KernelSet(
             dispatch=kernels["dispatch"],
@@ -1908,7 +1937,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return self.cfg.internode_auto_ll_max_tokens
         return None
 
-    def _wrap_internode(self, phase, group):
+    def _wrap_internode(self, phase, group, in_place=None):
         """One ABI crossing for the whole pass sequence.
 
         Every pass shares the schema and the same filled struct, so the arguments
@@ -1978,7 +2007,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     else 0
                 ),
             )
-            group.launch(_raw_stream(self._device_index), **args)
+            if (
+                in_place is not None
+                and weights_ptr == 0
+                and input.data_ptr() == self._combine_inp_ptr()
+            ):
+                in_place.launch(_raw_stream(self._device_index), **args)
+            else:
+                group.launch(_raw_stream(self._device_index), **args)
 
         return run
 
@@ -2156,6 +2192,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
         self._views[key] = view
         return view
+
+    def _combine_inp_ptr(self):
+        ptr = getattr(self, "_combine_inp_addr", None)
+        if ptr is None:
+            ptr = self._combine_inp_addr = self.arena.local_ptr("inter_combine_inp")
+        return ptr
 
     def combine_in_view(self):
         if self._seg_stride:

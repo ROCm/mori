@@ -88,7 +88,8 @@ def _cfg(**over):
 
 
 # Chosen to exercise the branches the formulas actually have: scales on/off, one
-# node vs many, and the max_total_recv_tokens clamp.
+# node vs many, the max_total_recv_tokens clamp, and enough QPs that the per-QP
+# barrier slots outgrow the per-rank ones.
 _CASES = {
     "base": _cfg(),
     "single_node": _cfg(world_size=8, gpu_per_node=8),
@@ -96,6 +97,8 @@ _CASES = {
         world_size=8, gpu_per_node=4, scale_dim=0, scale_type_size=0, num_qp_per_pe=1
     ),
     "recv_cap_clamped": _cfg(max_total_recv_tokens=256, num_experts_per_token=4),
+    "eight_qps": _cfg(num_qp_per_pe=8),
+    "two_tokens": _cfg(max_num_inp_token_per_rank=2),
 }
 
 
@@ -140,6 +143,48 @@ def test_staging_holds_every_slot_the_kernel_indexes(name):
     assert sizes["inter_staging"] >= slots * comb_xfer
 
 
+@pytest.mark.parametrize("name", sorted(_CASES))
+def test_barrier_has_a_slot_per_sender_and_qp(name):
+    """The atomic-free combine barrier keeps one u64 slot per (sender, qp) after
+    the world_size per-rank slots (``EpInterNodeBarrierQpSlot``)."""
+    cfg = _CASES[name]
+    sizes = dict(internode_regions(cfg))
+    assert sizes["cross_device_barrier"] >= cfg.world_size * (1 + cfg.num_qp_per_pe) * 8
+
+
+@pytest.mark.parametrize("name", sorted(_CASES))
+def test_dispatch_slots_use_the_padded_stride(name):
+    """``XferBytesPerToken`` pads a slot to 16 B, so the dispatch regions are sized
+    at that stride: ``nNodes * m`` receive slots and ``m`` send slots."""
+    cfg = _CASES[name]
+    sizes = dict(internode_regions(cfg))
+    n_nodes = cfg.world_size // cfg.gpu_per_node
+    m = cfg.max_num_inp_token_per_rank
+    topk = cfg.num_experts_per_token
+    raw = (
+        cfg.hidden_dim * cfg.max_token_type_size
+        + topk * 4
+        + topk * 4
+        + 4
+        + cfg.scale_dim * cfg.scale_type_size
+    )
+    xfer = (raw + 15) // 16 * 16
+    assert sizes["inter_dispatch_inp"] >= n_nodes * m * xfer
+    assert sizes["inter_dispatch_staging"] >= m * xfer
+    assert sizes["inter_staging"] >= n_nodes * m * xfer
+
+
 def test_gpu_per_node_must_divide_the_world():
     with pytest.raises(ValueError):
         internode_regions(_cfg(world_size=16, gpu_per_node=6))
+
+
+@pytest.mark.parametrize("name", sorted(_CASES))
+def test_chunk_flags_hold_the_piece_flags(name):
+    """``inter_node_chunk_flag`` holds the ``nNodes * c`` chunk flags (c chunks of
+    64 tokens per node), then 3 piece flags per chunk (``EpInterNodePieceFlagSlot``)."""
+    cfg = _CASES[name]
+    sizes = dict(internode_regions(cfg))
+    n_nodes = cfg.world_size // cfg.gpu_per_node
+    chunks = -(-cfg.max_num_inp_token_per_rank // 64)
+    assert sizes["inter_node_chunk_flag"] >= n_nodes * chunks * 4 * 8

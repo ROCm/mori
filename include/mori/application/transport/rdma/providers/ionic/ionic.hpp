@@ -167,6 +167,8 @@ class IonicDeviceContext : public RdmaDeviceContext {
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
                                uint32_t qpn = 0) override;
+  bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept override;
+  bool SupportsEndpointDestroy() const override { return true; }
   static void pd_release(ibv_pd* pd, void* pd_context, void* ptr, uint64_t resource_type);
   static void* pd_alloc_device_uncached(ibv_pd* pd, void* pd_context, size_t size, size_t alignment,
                                         uint64_t resource_type);

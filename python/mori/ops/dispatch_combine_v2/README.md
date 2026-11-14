@@ -50,7 +50,7 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 |---|---|
 | `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig`, `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
 | `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
-| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
+| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
 | `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here. A gfx125x `EpDispatchPlan` whose caller binds no `staging_base` gets one at its first launch, shared by the unbound plans of its layout, with a `FutureWarning`; instead, allocate `info["stagingBytes"]` bytes once, keep them alive, and `bind(staging_base=buf)` on every dispatch plan (a tensor is checked against that size and held; an int address is taken on trust). Sizes come from the plans: `EpDispatchPlan.describe(**request)` / `EpCombinePlan.describe(...)` return the info a plan would report without compiling it, and `arena_regions(*infos, region_names=...)` turns their `region.<stem>` keys into a `SymmArena` region list; binding checks an arena that has `size()` |
 | `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
 | `internode_regions.py` | `internode_regions(cfg)`: the internode op's `SymmArena` region list — 17 named `(name, nbytes)` regions (16 plus `out_scales` when scales are on), in v1's allocation order and transcribed from what `EpDispatchCombineHandle` allocated |
@@ -585,8 +585,8 @@ at 2048, dispatch flat, and still a wash after `Unroll=4` removed the real
 bottleneck. Two reasons, and the second is the general one:
 
 * Dispatch never reached the TDM path at all. `XferBytesPerToken` is
-  7168*2 + 32 + 32 + 4 = 14404, so the slot stride is 4-byte aligned and source
-  and destination never share a 128 B phase.
+  7168*2 + 32 + 32 + 4 = 14404, padded to 14416, so the slot stride is 16 B but
+  not 128 B aligned and source and destination never share a 128 B phase.
 * The same ualoe data says TDM's advantage is a *grid-width* one, and below
   about 1 MB neither transport is grid-limited -- there the CU path is often the
   faster of the two. AsyncLL's transfer hands each warp tens of KB, so it sits in
@@ -595,11 +595,10 @@ bottleneck. Two reasons, and the second is the general one:
   transfer pass has none.
 
 **Padding the slot stride to a 128 B row.** The alignment above is real, and
-fixing it (`XferBytesPerToken` rounded up to 128, with `internode_regions.py`
-following) is worth ~3.4% on the dispatch half and ~1% on the pair, measured in
-the same matrix. Not taken here because it changes the arena layout shared with
-the v2 / v2_ll families for a gain that `Unroll=4` dwarfs; it is a reasonable
-separate change.
+fixing it (`XferBytesPerToken` rounded up to 128 rather than 16, with
+`internode_regions.py` following) is worth ~3.4% on the dispatch half and ~1% on
+the pair, measured in the same matrix. Not taken here: the gain is small next to
+`Unroll=4`, and it is a reasonable separate change.
 
 ### Reproducing
 

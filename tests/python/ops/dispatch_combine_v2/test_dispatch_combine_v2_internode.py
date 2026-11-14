@@ -311,6 +311,9 @@ def _parse_args(argv):
     # --bench-weights measures the fold when that is what you want. The
     # correctness path always folds -- it is checking the weights.
     parser.add_argument("--bench-weights", action="store_true")
+    # Hand combine the op's combine_in_view(), filled with the expert output (in
+    # bench, inside the untimed conversion window), as a zero-copy caller does.
+    parser.add_argument("--combine-zero-copy", action="store_true")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--drop-rounds", type=int, default=1)
     parser.add_argument("--no-bench-tables", action="store_true")
@@ -869,6 +872,10 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     comm.barrier()
 
     def convert(tensor):
+        if args.combine_zero_copy:
+            zero_copy = op.combine_in_view()
+            zero_copy[: tensor.shape[0]].copy_(_combine_input(cfg, tensor))
+            return zero_copy
         return _combine_input(cfg, tensor)
 
     combine_weights = wts if args.bench_weights else None
@@ -1752,10 +1759,12 @@ def _tune(cfg, dist_handle, device, args, comm):
     # Otherwise the count is this run's resolved default, and recording it would
     # pin production to it. A pair sweep always measures the counts: it requires
     # --tuning-qps or --tuning-candidate, and either names them.
+    # A bucket can hold one phase's rule before the other is tuned.
     table_names_count = bool(
         table_row
-        and (
-            table_row["dispatch"][3] is not None or table_row["combine"][3] is not None
+        and any(
+            table_row[name] is not None and table_row[name][3] is not None
+            for name in ("dispatch", "combine")
         )
     )
     report_active_qps = (
@@ -2322,6 +2331,13 @@ def main(argv):
             # and it reads inpTokenBuf as T*, so handing it the fp8 dispatch
             # output unconverted reinterprets fp8 bytes as bf16.
             combine_input = _combine_input(cfg, recv_x)
+            if args.combine_zero_copy:
+                # The expert wrote its received rows into combine_in_view(); combine
+                # has nothing to copy.
+                zero_copy = op.combine_in_view()
+                rows = int(total_recv.item())
+                zero_copy[:rows].copy_(combine_input[:rows])
+                combine_input = zero_copy
             if qp_schedule:
                 op.set_active_qps(_active_qp_for(qp_schedule, round_index, cfg, 1))
             # `wts` is a REQUEST for the weight fold, and AsyncLL cannot serve
@@ -2329,7 +2345,11 @@ def main(argv):
             # metadata to accumulate (v1's AsyncLL is the same). Asking anyway
             # raises; the weight half of the check is skipped for that family
             # rather than compared against a tensor it never writes.
-            wants_weights = not getattr(cfg, "async_ll", False)
+            # Zero-copy rounds alternate with no weight fold, the combine that
+            # skips CombineSync, so both launch paths are checked.
+            wants_weights = not getattr(cfg, "async_ll", False) and not (
+                args.combine_zero_copy and round_index % 2 == 1
+            )
             out, out_w = op.combine(
                 combine_input, wts if wants_weights else None, routing=routing
             )

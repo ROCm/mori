@@ -157,11 +157,11 @@ inline constexpr int kCombineBarrierMarkerTotal = 64;
 //   header, because the kernel reads its grid from gridDim/blockDim rather than
 //   from kConfig. See the note there.
 //
-// Three fields are not shape: numQpPerPe (the active QP count) and
-// combineLoadFirst are chosen per token bucket from the tuning table, and
-// numQpToDrain is the op's largest active count. cfg.active_qps, a
-// MORI_EP_*_GEOM override or set_active_qps() replaces the table's QP count;
-// AsyncLL uses one op-wide count.
+// Four fields are not shape: numQpPerPe (the active QP count) and
+// combineLoadFirst are chosen per token bucket from the tuning table,
+// numQpToDrain is the op's largest active count, and noRdmaAtomics is the
+// op-wide signalling choice. cfg.active_qps, a MORI_EP_*_GEOM override or
+// set_active_qps() replaces the table's QP count; AsyncLL uses one op-wide count.
 //
 // Defaults mirror EpDispatchCombineConfig's, except worldSize: 0 there means
 // "not filled in yet", which is nothing that can be compiled for.
@@ -187,6 +187,9 @@ struct EpInterNodeKernelCfg {
   // token bucket by the tuning table (combine_load_first), so it is part of the
   // compiled identity; every other pass is built with the default.
   bool combineLoadFirst{false};
+  // Cross-node flags and barriers as RDMA WRITEs instead of atomics (MORI_EP_DISABLE_RDMA_ATOMICS),
+  // for NICs whose atomics cannot target GPU memory. Op-wide.
+  bool noRdmaAtomics{false};
 };
 
 // The device-side config the bodies read: purely compiled-in constants, so the
@@ -225,11 +228,12 @@ inline void VisitFields(Self& cfg, const EpInterNodeKernelCfg& defaults, Visit&&
   MORI_FIELD(numQpToDrain);
   MORI_FIELD(quantType);
   MORI_FIELD(combineLoadFirst);
+  MORI_FIELD(noRdmaAtomics);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeKernelCfg, 14,
+    EpInterNodeKernelCfg, 15,
     "added an EpInterNodeKernelCfg field -- update VisitFields(EpInterNodeKernelCfg) "
     "too, or the kernel silently compiles against its default");
 

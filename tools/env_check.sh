@@ -1420,7 +1420,7 @@ check_ainic_sysfs_versions() {
                 log_warn "AINIC firmware $v is below the $HOST_VIRT guest minimum (>= $AINIC_KVM_MIN_VER)"
                 log_warn "  RDMA atomics into GPU (dma-buf) memory fail on this firmware in a VM, while"
                 log_warn "  RDMA writes work -- so the bandwidth meshes pass and MORI-EP's atomic"
-                log_warn "  signalling hangs. Upgrade the host firmware, or run MORI-EP (InterNodeV1/V1LL)"
+                log_warn "  signalling hangs. Upgrade the host firmware, or run MORI-EP (InterNodeV1/V1LL, v2/v2_ll)"
                 log_warn "  with MORI_EP_DISABLE_RDMA_ATOMICS=1. The atomic step below tests it directly."
             fi
         done < <(printf '%s\n' "${fws[@]}" | sort -u)
@@ -1943,7 +1943,7 @@ check_atomic() {
     fi
     if (( hdead + hflaky + gfail > 0 )); then
         log_warn "  MORI-EP signals with RDMA atomics by default and hangs on these ${noun}s;"
-        log_warn "  MORI_EP_DISABLE_RDMA_ATOMICS=1 switches InterNodeV1/V1LL to write-based signalling."
+        log_warn "  MORI_EP_DISABLE_RDMA_ATOMICS=1 switches InterNodeV1/V1LL and v2/v2_ll to write-based signalling."
         if [[ "$_dominant_vendor" == "ionic" && -n "$HOST_VIRT" ]]; then
             log_warn "  On an AINIC $HOST_VIRT guest this is the firmware: it needs >= $AINIC_KVM_MIN_VER."
         fi

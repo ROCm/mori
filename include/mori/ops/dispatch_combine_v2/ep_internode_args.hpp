@@ -172,23 +172,28 @@ struct EpInterNodeDeviceCfg {
   // Byte accounting for one transported token. size_t on purpose: these are
   // multiplied by token counts and the int forms overflow at shapes this kernel
   // is expected to run.
-  __host__ __device__ size_t HiddenDimSz() const { return static_cast<size_t>(hiddenDim); }
-  __host__ __device__ size_t HiddenBytes(size_t tokenTypeSize) const {
+  __host__ __device__ constexpr size_t HiddenDimSz() const {
+    return static_cast<size_t>(hiddenDim);
+  }
+  __host__ __device__ constexpr size_t HiddenBytes(size_t tokenTypeSize) const {
     return tokenTypeSize * static_cast<size_t>(hiddenDim);
   }
-  __host__ __device__ size_t IndexBytes() const {
+  __host__ __device__ constexpr size_t IndexBytes() const {
     return static_cast<size_t>(numExpertPerToken) * sizeof(ep_index_t);
   }
-  __host__ __device__ size_t WeightBytes() const {
+  __host__ __device__ constexpr size_t WeightBytes() const {
     return static_cast<size_t>(numExpertPerToken) * sizeof(float);
   }
-  __host__ __device__ size_t SrcTokenIdBytes() const { return sizeof(ep_index_t); }
-  __host__ __device__ size_t ScaleBytes() const {
+  __host__ __device__ constexpr size_t SrcTokenIdBytes() const { return sizeof(ep_index_t); }
+  __host__ __device__ constexpr size_t ScaleBytes() const {
     return static_cast<size_t>(scaleDim) * static_cast<size_t>(scaleTypeSize);
   }
-  __host__ __device__ size_t XferBytesPerToken(size_t tokenTypeSize) const {
-    return HiddenBytes(tokenTypeSize) + IndexBytes() + WeightBytes() + SrcTokenIdBytes() +
-           ScaleBytes();
+  // Padded to 16 B so every slot, and every 16 B vector copy of one, stays aligned
+  // (internode_regions pads its xfer_bytes the same way).
+  __host__ __device__ constexpr size_t XferBytesPerToken(size_t tokenTypeSize) const {
+    return (HiddenBytes(tokenTypeSize) + IndexBytes() + WeightBytes() + SrcTokenIdBytes() +
+            ScaleBytes() + 15) /
+           16 * 16;
   }
 };
 
@@ -356,11 +361,11 @@ struct EpInterNodeArgs {
   ep_index_t* interNodeDispDestTokIdMap{nullptr};
   ep_index_t* interNodeDispSendMap{nullptr};
   ep_index_t* interNodeChunkFlagCombine{nullptr};
-  ep_index_t* destPeTokenCounter{nullptr};
+  ep_index_t* destPeTokenCounter{nullptr};  // AsyncLL only
   ep_index_t* blockFlagCounter{nullptr};
   ep_index_t* totalRecvTokenNum{nullptr};
   uint32_t* dispatchGridBarrier{nullptr};
-  uint32_t* interNodeBlocksBarrier{nullptr};
+  uint32_t* interNodeBlocksBarrier{nullptr};  // v2 / v2_ll: [0] arrivals, [1] combine release
   uint64_t* crossDeviceBarrierFlag{nullptr};
   // AsyncLL only: recv slot -> the send-buffer slot offset it arrived in, so
   // combine's send leg can put each result back where dispatch took it from.
