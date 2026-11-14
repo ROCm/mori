@@ -21,4 +21,4 @@ num_experts,topk,phase,dtype,hidden_dim,num_tokens,block_num,rdma_block_num,warp
 896,16,combine,bf16,3584,512,64,48,8,2,,322.1,182.9,45.62,146.24,182.9,grand_mean
 896,16,combine,bf16,3584,1024,128,96,4,2,,585,178.95,45.01,144.39,178.95,grand_mean
 896,16,combine,bf16,3584,2048,128,96,4,2,,1096,201.32,50.48,161.94,201.32,grand_mean
-896,16,combine,bf16,3584,4096,128,96,4,2,,2194,213.73,53.01,171.77,213.73,grand_mean
+896,16,combine,bf16,3584,4096,160,120,4,2,,2078,225.66,55.97,181.36,225.66,grand_mean
