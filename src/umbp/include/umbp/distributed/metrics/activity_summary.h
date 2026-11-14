@@ -96,11 +96,22 @@ struct ReCacheActivity {
   uint64_t fragmented = 0;       // prefetch slot was not one addressable run
 };
 
+// Remote single-flight for whole-object ranged reads (one pull per key per node).
+struct SingleFlightActivity {
+  uint64_t lead = 0;           // keys this node pulled for every concurrent reader
+  uint64_t joined = 0;         // keys that waited on another call's pull instead
+  uint64_t already_local = 0;  // keys committed locally between the local check and the pull
+  uint64_t served_local = 0;   // waiting keys found local once the pull finished
+  uint64_t refetched = 0;      // waiting keys the pull did not leave local; read again
+  uint64_t timed_out = 0;      // waiting keys whose pull outlived the wait
+};
+
 // Everything one window needs, all cumulative since process start.
 struct ActivitySnapshot {
   std::map<std::string, TierActivity> tiers;  // keyed by TierTypeName
   TierTransitionMetrics transitions;          // intra-pool promote / demote
   ReCacheActivity recache;
+  SingleFlightActivity single_flight;
 };
 
 class ActivitySummary {

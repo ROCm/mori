@@ -160,6 +160,15 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
   const uint64_t rc_fragmented = Delta(rc_now.fragmented, rc_old.fragmented);
   const uint64_t rc_dropped = rc_rejected + rc_queue_full + rc_alloc_failed + rc_install_failed;
 
+  const SingleFlightActivity& sf_now = now.single_flight;
+  const SingleFlightActivity& sf_old = before.single_flight;
+  const uint64_t sf_lead = Delta(sf_now.lead, sf_old.lead);
+  const uint64_t sf_joined = Delta(sf_now.joined, sf_old.joined);
+  const uint64_t sf_already = Delta(sf_now.already_local, sf_old.already_local);
+  const uint64_t sf_local = Delta(sf_now.served_local, sf_old.served_local);
+  const uint64_t sf_refetched = Delta(sf_now.refetched, sf_old.refetched);
+  const uint64_t sf_timed_out = Delta(sf_now.timed_out, sf_old.timed_out);
+
   // Adopt the new baseline only now that every delta above has been reduced to
   // a value: `before` aliases previous_, so assigning earlier would leave the
   // remaining reads pointing at the window that just ended.
@@ -172,7 +181,7 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
   const bool anything = Moved(total) || promoted != 0 || demoted != 0 || moves_failed != 0 ||
                         moves_retried != 0 || moves_dropped != 0 || rc_admitted != 0 ||
                         rc_dropped != 0 || rc_prefetched != 0 || rc_fragmented != 0 ||
-                        rc_already != 0;
+                        rc_already != 0 || sf_lead != 0 || sf_joined != 0 || sf_already != 0;
 
   std::vector<std::string> lines;
 
@@ -250,6 +259,21 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
         static_cast<unsigned long long>(rc_alloc_failed),
         static_cast<unsigned long long>(rc_install_failed),
         static_cast<unsigned long long>(rc_fragmented));
+    lines.emplace_back(buf.data());
+  }
+
+  // ---- remote single-flight ----------------------------------------------
+  // joined - served_local is what concurrent readers still pulled themselves.
+  if (sf_lead != 0 || sf_joined != 0 || sf_already != 0) {
+    std::array<char, 256> buf{};
+    std::snprintf(
+        buf.data(), buf.size(),
+        "[UMBP]   remote single-flight: %llu led, %llu joined, %llu already local; "
+        "after the wait %llu local, %llu refetched (%llu timed out)",
+        static_cast<unsigned long long>(sf_lead), static_cast<unsigned long long>(sf_joined),
+        static_cast<unsigned long long>(sf_already), static_cast<unsigned long long>(sf_local),
+        static_cast<unsigned long long>(sf_refetched),
+        static_cast<unsigned long long>(sf_timed_out));
     lines.emplace_back(buf.data());
   }
 

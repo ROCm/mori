@@ -226,6 +226,8 @@ class PoolClient {
   BackendRegistry& Backends();
   TierTransitionMetrics TransitionMetrics() const;
   LocalEvictionMetrics LocalEvictionStats() const;
+  // Cumulative remote single-flight outcomes (config remote_single_flight).
+  SingleFlightActivity RemoteSingleFlightStats() const;
   std::map<std::string, uint64_t> TierReadHits() const;
   std::string LogicalTierForBackend(uint32_t backend_id) const;
 
@@ -841,6 +843,39 @@ class PoolClient {
     std::atomic<uint64_t> fragmented{0};
   };
   ReCacheCounters recache_stats_;
+
+  // ---- Remote single-flight (config_.remote_single_flight) ----
+  // One whole-object pull per key per node.  The first BatchGetRanges that would
+  // pull a remote key into a local slot leads: it registers an episode, pulls,
+  // commits and then finishes the episode.  A concurrent call that wants the
+  // same key joins instead, waits for the episode AFTER its own work is done
+  // (so it never holds an arena lease or an unfinished episode of its own while
+  // waiting), and then reads the key again, locally if the leader's commit
+  // landed.
+  struct RemoteFetchEpisode {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+  };
+  using LedEpisodes = std::vector<std::pair<std::string, std::shared_ptr<RemoteFetchEpisode>>>;
+  // Caller key indices a BatchGetRanges call left for ServeRangedFollowers,
+  // with the episode each waits on (null: already local, nothing to wait for).
+  struct RangedFollowers {
+    std::vector<size_t> indices;
+    std::vector<std::shared_ptr<RemoteFetchEpisode>> episodes;
+  };
+  struct SingleFlightCounters {
+    std::atomic<uint64_t> lead{0};
+    std::atomic<uint64_t> joined{0};
+    std::atomic<uint64_t> already_local{0};
+    std::atomic<uint64_t> served_local{0};
+    std::atomic<uint64_t> refetched{0};
+    std::atomic<uint64_t> timed_out{0};
+  };
+  std::mutex remote_inflight_mutex_;
+  std::unordered_map<std::string, std::shared_ptr<RemoteFetchEpisode>> remote_inflight_;
+  SingleFlightCounters single_flight_stats_;
+
   struct BatchPutItem {
     size_t index;
     const std::string* key;
@@ -1042,6 +1077,25 @@ class PoolClient {
   std::vector<RangeFetchUnit> ServeWholeObjectUnitsFromMedium(
       const std::vector<std::string>& keys, std::vector<RangeFetchUnit> units,
       std::unordered_map<size_t, bool>* unit_ok, double* remote_bytes);
+
+  // `followers` null disables single-flight for the call (the follower re-read).
+  std::vector<bool> BatchGetRangesImpl(const std::vector<std::string>& keys,
+                                       const std::vector<std::vector<void*>>& dsts,
+                                       const std::vector<std::vector<size_t>>& sizes,
+                                       const std::vector<std::vector<size_t>>& src_offsets,
+                                       RangedFollowers* followers);
+  // Splits whole-object units into leaders (kept, episode registered in `led`)
+  // and keys another call is pulling or that are already local (moved to
+  // `followers` and out of `units` / `unit_ok`).
+  void ClaimRemoteFetches(const std::vector<std::string>& keys, std::vector<RangeFetchUnit>* units,
+                          std::unordered_map<size_t, bool>* unit_ok, LedEpisodes* led,
+                          RangedFollowers* followers);
+  void FinishRemoteEpisodes(LedEpisodes* led);
+  void ServeRangedFollowers(const std::vector<std::string>& keys,
+                            const std::vector<std::vector<void*>>& dsts,
+                            const std::vector<std::vector<size_t>>& sizes,
+                            const std::vector<std::vector<size_t>>& src_offsets,
+                            const RangedFollowers& followers, std::vector<bool>* results);
 
   // Remote-only sibling of PartitionBatchGetTargets for ranged reads.  Each key
   // contributes one item carrying its arena slice, its span list, and the span
