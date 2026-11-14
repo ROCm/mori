@@ -1364,6 +1364,56 @@ inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, s
   }
 }
 
+// The v2_ll relay's gather: the sources go to the front of srcPtrs and are read kRelayLoadBatch at
+// a time, a batch's loads all in flight before any is accumulated. WarpAccum's 16 B path for topk
+// without its own case reads one source at a time. The intra-node gather keeps WarpAccum: batched,
+// its peer reads compete with the relay's, which are on the critical path.
+constexpr int kRelayLoadBatch = 4;
+
+template <typename TokT>
+inline __device__ void CombineGatherRelay(TokT* dest, TokT** srcPtrs, int accumNum, size_t nelems,
+                                          bool vecAligned) {
+  constexpr int kElems = static_cast<int>(kCombineVecBytes / sizeof(TokT));
+  if constexpr (sizeof(TokT) != 2 && sizeof(TokT) != 4) {
+    CombineGather<TokT>(dest, srcPtrs, accumNum, nelems, vecAligned);
+  } else {
+    if (!vecAligned || (nelems % kElems) != 0) {
+      CombineGather<TokT>(dest, srcPtrs, accumNum, nelems, vecAligned);
+      return;
+    }
+    const int laneId = threadIdx.x & (warpSize - 1);
+    TokT* src = (laneId < accumNum) ? srcPtrs[laneId] : nullptr;
+    const uint64_t set = __ballot(src != nullptr);
+    const int count = __popcll(set);
+    if (src != nullptr) srcPtrs[__popcll(set & ((uint64_t{1} << laneId) - 1))] = src;
+    using Vec = unsigned int __attribute__((ext_vector_type(4)));
+    const int vecs = static_cast<int>(nelems / kElems);
+    for (int v = laneId; v < vecs; v += warpSize) {
+      float acc[kElems];
+#pragma unroll
+      for (int j = 0; j < kElems; j++) acc[j] = 0.0f;
+      for (int first = 0; first < count; first += kRelayLoadBatch) {
+        Vec regs[kRelayLoadBatch];
+#pragma unroll
+        for (int u = 0; u < kRelayLoadBatch; u++)
+          if (first + u < count) regs[u] = reinterpret_cast<const Vec*>(srcPtrs[first + u])[v];
+#pragma unroll
+        for (int u = 0; u < kRelayLoadBatch; u++) {
+          if (first + u >= count) continue;
+          const TokT* elems = reinterpret_cast<const TokT*>(&regs[u]);
+#pragma unroll
+          for (int j = 0; j < kElems; j++) acc[j] += float(elems[j]);
+        }
+      }
+      Vec out;
+      TokT* outElems = reinterpret_cast<TokT*>(&out);
+#pragma unroll
+      for (int j = 0; j < kElems; j++) outElems[j] = TokT(acc[j]);
+      reinterpret_cast<Vec*>(dest)[v] = out;
+    }
+  }
+}
+
 // Ordinary gather: load-first or plain, fixed at compile time per token bucket
 // by the tuning table's combine_load_first. The LL gather uses its separate path.
 template <EpInterNodeKernelCfg kConfig, typename TokT>
@@ -1775,7 +1825,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
                                   destLocalTokId * config.numExpertPerToken;
         }
       }
-      CombineGather<TokT>(
+      CombineGatherRelay<TokT>(
           reinterpret_cast<TokT*>(stagingPtr + globalTokenId * tokCombXferBytes) + hiddenDimOffset,
           srcPtrs, config.numExpertPerToken, hiddenDimSize, vecAligned);
       if (args.weightsBuf && (inTokenPartId == warpsPerToken - 1)) {
