@@ -103,7 +103,7 @@
         "x": 0,
         "y": 2,
         "w": 24,
-        "h": 9
+        "h": 12
       },
       "targets": [
         {
@@ -192,6 +192,147 @@
       }
     },
     {
+      "id": 12,
+      "type": "barchart",
+      "title": "Sent and received per GPU (average over selected range, all links)",
+      "description": "Average bandwidth over the selected range: bytes over all links of the GPU / time of its valid intervals. Sent = xgmi_write_data_acc, received = xgmi_read_data_acc. Link bytes, not payload.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "xgmi-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 12
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "expr": "label_replace(sum by (gpu, dir) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__range])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__range])), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "dir",
+            "rowField": "gpu",
+            "valueField": "Value",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "gpu\\dir": "GPU ID",
+              "wr": "sent",
+              "rd": "received"
+            },
+            "indexByName": {
+              "gpu\\dir": 0,
+              "wr": 1,
+              "rd": 2
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "GPU ID"
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "decimals": 1,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 1
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sent"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "received"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "GPU ID"
+            },
+            "properties": [
+              {
+                "id": "custom.axisLabel",
+                "value": "GPU ID"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "xField": "GPU ID",
+        "orientation": "vertical",
+        "groupWidth": 0.7,
+        "barWidth": 0.9,
+        "showValue": "auto",
+        "stacking": "none",
+        "xTickLabelRotation": 0,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
       "id": 11,
       "type": "timeseries",
       "title": "Sent: GPU → GPU over time",
@@ -202,7 +343,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 11,
+        "y": 26,
         "w": 24,
         "h": 10
       },
@@ -260,7 +401,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 21,
+        "y": 36,
         "w": 24,
         "h": 8
       },
@@ -315,7 +456,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 29,
+        "y": 44,
         "w": 24,
         "h": 1
       },
@@ -332,7 +473,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 30,
+        "y": 45,
         "w": 24,
         "h": 8
       },
@@ -421,7 +562,7 @@
       "collapsed": true,
       "gridPos": {
         "x": 0,
-        "y": 38,
+        "y": 53,
         "w": 24,
         "h": 1
       },
@@ -437,7 +578,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 39,
+            "y": 54,
             "w": 24,
             "h": 8
           },
