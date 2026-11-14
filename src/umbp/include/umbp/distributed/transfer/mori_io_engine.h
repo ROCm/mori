@@ -36,9 +36,12 @@
 namespace mori::umbp {
 
 // Shared with the simulator so registration, coalescing and bounce geometry agree.
+// `local_loopback` admits a host <-> GPU pair that is BOTH local (see
+// MoriIoEngine::SetLocalLoopback); the simulator never sets it.
 std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& local_key,
                                                          uint64_t bounce_size,
-                                                         const TransferRef& bounce_ref);
+                                                         const TransferRef& bounce_ref,
+                                                         bool local_loopback = false);
 
 // The mori-io (RDMA) implementation of TransferEngine, and the only place in
 // UMBP that names mori::io::IOEngine.
@@ -64,6 +67,29 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   MoriIoEngine(std::string engine_key, mori::io::IOEngineConfig io_config, uint64_t bounce_bytes);
   ~MoriIoEngine() override;
 
+  // Opt in to NIC-loopback copies between this node's own host memory and its
+  // own GPU memory (a registered host buffer <-> a registered GPU buffer).  The
+  // NIC reads or writes both sides, so the copy costs no GPU compute units.
+  //
+  // Must be called BEFORE Init(): Init registers this engine as its own remote,
+  // which is how mori-io addresses memory it registered itself.  Default off.
+  //
+  // `min_item_bytes`: only items at least this large are taken (CanHandleSized);
+  // smaller ones are left to the copy engine, which beats the NIC on small
+  // fragments.  0 takes every item.
+  //
+  // The GPU side is always the initiator: a host -> GPU pair is a pull
+  // (BatchRead into the GPU), a GPU -> host pair is a push (BatchWrite out of
+  // it).  mori-io merges work requests whose REMOTE offsets are adjacent into
+  // one multi-SGE request, and a KV page is contiguous in host memory but
+  // scattered across the per-layer GPU tensors, so the host must be the remote.
+  void SetLocalLoopback(bool enabled, uint64_t min_item_bytes = 0) {
+    local_loopback_ = enabled;
+    local_loopback_min_bytes_ = min_item_bytes;
+  }
+  bool LocalLoopback() const { return local_loopback_; }
+  uint64_t LocalLoopbackMinBytes() const { return local_loopback_min_bytes_; }
+
   // Create the IOEngine + RDMA backend and register the bounce buffer.
   // Returns false if the engine could not be created; the object is then
   // inert (Active() == false) rather than unusable — a node with no RDMA still
@@ -84,8 +110,14 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
 
   // True iff exactly one endpoint is a registered REMOTE memory and the other
   // is local — either registered (zero copy) or, when a bounce buffer is
-  // configured, merely addressable (staged).
+  // configured, merely addressable (staged).  With SetLocalLoopback(true) it is
+  // also true for a registered local host buffer paired with a registered local
+  // GPU buffer.
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
+  // As CanHandle, except a local loopback pair below the minimum item size is
+  // declined (see SetLocalLoopback).  A remote pair is size-independent.
+  bool CanHandleSized(const TransferRef& src, const TransferRef& dst,
+                      uint64_t item_bytes) const override;
 
   // Group by (src MR id, dst MR id), first-appearance order, coalescing
   // segments that are exactly contiguous on BOTH sides.  Items whose local side
@@ -136,6 +168,8 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   bool RunBouncePlanInline(const TransferPlan& plan, TransferFailure* failure);
 
   std::string local_engine_key_;
+  bool local_loopback_ = false;  // set once, before Init() and before any transfer
+  uint64_t local_loopback_min_bytes_ = 0;
   mori::io::IOEngineConfig io_config_;
   std::unique_ptr<mori::io::IOEngine> io_engine_;
 

@@ -295,6 +295,41 @@ TEST(HbmCopyEngine, BuilderSplitsAtHostRegistrationPieces) {
   ExpectPlanContract(items, planned);
 }
 
+// With the loopback opt-in, a LARGE item between a host and a GPU buffer that
+// are both registered with mori-io belongs to MoriIoEngine; anything else stays
+// with the copy engine.  CanHandle keeps saying yes: the pair is servable.
+TEST(HbmCopyEngine, YieldsLargeRegisteredHostGpuItemsOnlyWhenAsked) {
+  HbmCopyEngine engine;
+  std::vector<char> a(64), b(64);
+  auto registered = [](TransferRef ref, mori::io::MemoryUniqueId id) {
+    ref.mem.engineKey = "local";
+    ref.mem.id = id;
+    ref.mem.size = ref.size;
+    ref.mem.loc = ref.loc;
+    return ref;
+  };
+  const auto host = registered(TransferRef::HostBytes(a.data(), a.size()), 1);
+  const auto gpu = registered(
+      TransferRef::HostBytes(b.data(), b.size(), mori::io::MemoryLocationType::GPU, 0), 2);
+  const auto gpu2 = registered(
+      TransferRef::HostBytes(a.data(), a.size(), mori::io::MemoryLocationType::GPU, 1), 3);
+  const auto unregistered_host = TransferRef::HostBytes(a.data(), a.size());
+
+  EXPECT_TRUE(engine.CanHandleSized(host, gpu, 1 << 20));
+  EXPECT_TRUE(engine.CanHandleSized(gpu, host, 1 << 20));
+
+  engine.YieldRegisteredHostGpuPairs(true, /*min_item_bytes=*/32 << 10);
+  EXPECT_TRUE(engine.CanHandle(host, gpu));                             // servable, size unknown
+  EXPECT_TRUE(engine.CanHandleSized(host, gpu, (32 << 10) - 1));        // below the floor
+  EXPECT_FALSE(engine.CanHandleSized(host, gpu, 32 << 10));             // at the floor
+  EXPECT_FALSE(engine.CanHandleSized(gpu, host, 1 << 20));              // either direction
+  EXPECT_TRUE(engine.CanHandleSized(unregistered_host, gpu, 1 << 20));  // one side unregistered
+  EXPECT_TRUE(engine.CanHandleSized(gpu, gpu2, 1 << 20));               // GPU <-> GPU
+
+  engine.YieldRegisteredHostGpuPairs(true, /*min_item_bytes=*/0);  // 0: every size
+  EXPECT_FALSE(engine.CanHandleSized(host, gpu, 1));
+}
+
 // Gathers submitted from a succession of short-lived threads, the way the
 // standalone server's gRPC pool retires and spawns threads under load, share a
 // pooled stream.  A stream per thread grew until HIP could not create another.
@@ -450,6 +485,48 @@ TEST(MoriIoEngine, GroupsZeroCopyByEndpointsAndCapsSegments) {
   // Merged, 6 GiB would overflow ibv_sge.length.
   EXPECT_EQ(std::vector<size_t>({3ULL << 30, 3ULL << 30}), planned.plans[3].sizes);
   ExpectPlanContract(items, planned);
+}
+
+// Local loopback: a registered host buffer and a registered GPU buffer of this
+// same engine.  Off, the pair is "both local" and rejected.  On, the GPU is the
+// initiator: host -> GPU pulls into it, GPU -> host pushes out of it.
+TEST(MoriIoEngine, LocalLoopbackMakesTheGpuTheInitiator) {
+  MoriIoEngine engine("local", mori::io::IOEngineConfig{}, /*bounce_bytes=*/0);
+  std::vector<char> host_buf(1 << 16), gpu_buf(1 << 16);
+  TransferRef host = LocalRegistered(host_buf.data(), host_buf.size(), 1);
+  TransferRef gpu = LocalRegistered(gpu_buf.data(), gpu_buf.size(), 2);
+  gpu.loc = mori::io::MemoryLocationType::GPU;  // planning only; never dereferenced
+  gpu.mem.loc = mori::io::MemoryLocationType::GPU;
+  TransferRef gpu_other = gpu;
+  gpu_other.mem.id = 3;
+  // Two PEER buffers, one host and one GPU: both remote, so loopback must not flip them.
+  TransferRef peer_host = RemoteRef("peer-a", 7, 1 << 16);
+  TransferRef peer_gpu = RemoteRef("peer-a", 8, 1 << 16);
+  peer_gpu.loc = mori::io::MemoryLocationType::GPU;
+  const std::vector<TransferItem> items{
+      MakeItem(host, 0, gpu, 0, 4096, 0),            // H2D: a pull
+      MakeItem(host, 4096, gpu, 8192, 4096, 1),      // H2D, same pair: joins that plan
+      MakeItem(gpu, 0, host, 16384, 4096, 2),        // D2H: a push
+      MakeItem(gpu, 0, gpu_other, 0, 4096, 3),       // GPU <-> GPU: never ours
+      MakeItem(host, 0, host, 4096, 4096, 4),        // host <-> host: never ours
+      MakeItem(peer_host, 0, peer_gpu, 0, 4096, 5),  // both remote: never ours
+  };
+
+  const TransferPlanSet off = engine.Plan(items);
+  EXPECT_EQ(6u, off.rejected_tags.size());
+  EXPECT_TRUE(off.plans.empty());
+
+  engine.SetLocalLoopback(true);
+  const TransferPlanSet on = engine.Plan(items);
+  EXPECT_EQ(std::vector<size_t>({3, 4, 5}), on.rejected_tags);
+  ASSERT_EQ(2u, on.plans.size());
+  EXPECT_TRUE(on.plans[0].dir == TransferDirection::kPull);
+  EXPECT_EQ(std::vector<size_t>({0, 1}), on.plans[0].tags);
+  EXPECT_EQ(std::vector<size_t>({0, 4096}), on.plans[0].src_offsets);  // host side
+  EXPECT_EQ(std::vector<size_t>({0, 8192}), on.plans[0].dst_offsets);  // GPU side
+  EXPECT_TRUE(on.plans[1].dir == TransferDirection::kPush);
+  EXPECT_EQ(std::vector<size_t>({2}), on.plans[1].tags);
+  ExpectPlanContract(items, on);
 }
 
 // Unregistered memory is staged through the bounce pool; a full pool starts a
@@ -608,6 +685,101 @@ TEST(CompositeTransferEngine, SelectsPerPairAndPlansOncePerEngine) {
   ASSERT_FALSE(planned.plans.empty());
   for (const auto& plan : planned.plans) EXPECT_NE(nullptr, plan.engine);
 }
+// An engine behind the copy engine that only takes large local items, the way
+// MoriIoEngine's loopback does.
+class FloorEngine final : public TransferEngine {
+ public:
+  explicit FloorEngine(uint64_t floor) : floor_(floor) {}
+  const char* Name() const override { return "FloorEngine"; }
+  TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
+                             int device) override {
+    return TransferRef::HostBytes(base, size, loc, device);
+  }
+  void Deregister(const TransferRef&) override {}
+  bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
+    return src.HasMemoryDesc() && dst.HasMemoryDesc();
+  }
+  bool CanHandleSized(const TransferRef& src, const TransferRef& dst,
+                      uint64_t item_bytes) const override {
+    return CanHandle(src, dst) && item_bytes >= floor_;
+  }
+  class Builder final : public TransferPlanBuilder {
+   public:
+    void Add(const TransferItem& item) override {
+      if (plan_.sizes.empty()) {
+        plan_.src = item.src;
+        plan_.dst = item.dst;
+      }
+      plan_.sizes.push_back(item.size);
+      plan_.src_offsets.push_back(item.src_offset);
+      plan_.dst_offsets.push_back(item.dst_offset);
+      plan_.tags.push_back(item.tag);
+    }
+    TransferPlanSet Finish() override {
+      TransferPlanSet out;
+      if (!plan_.sizes.empty()) out.plans.push_back(std::move(plan_));
+      return out;
+    }
+
+   private:
+    TransferPlan plan_;
+  };
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t) const override {
+    return std::make_unique<Builder>();
+  }
+  std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan>) override { return nullptr; }
+
+ private:
+  uint64_t floor_;
+};
+
+// The composite asks every engine about the item's size, so one batch can split
+// across two engines by fragment size: small items to the copy engine, large to
+// the NIC.  Without the size (CanHandle) the first engine still wins.
+TEST(CompositeTransferEngine, RoutesALocalPairBySizeWhenAnEngineSetsAFloor) {
+  constexpr uint64_t kFloor = 32 << 10;
+  CompositeTransferEngine composite;
+  auto hbm_owned = std::make_unique<HbmCopyEngine>();
+  hbm_owned->YieldRegisteredHostGpuPairs(true, kFloor);
+  HbmCopyEngine* hbm = hbm_owned.get();
+  composite.AddEngine(std::move(hbm_owned));
+  auto nic_owned = std::make_unique<FloorEngine>(kFloor);
+  FloorEngine* nic = nic_owned.get();
+  composite.AddEngine(std::move(nic_owned));
+
+  std::vector<char> a(1 << 20), b(1 << 20);
+  auto registered = [](TransferRef ref, mori::io::MemoryUniqueId id) {
+    ref.mem.engineKey = "local";
+    ref.mem.id = id;
+    ref.mem.size = ref.size;
+    ref.mem.loc = ref.loc;
+    return ref;
+  };
+  const auto host = registered(TransferRef::HostBytes(a.data(), a.size()), 1);
+  const auto gpu = registered(
+      TransferRef::HostBytes(b.data(), b.size(), mori::io::MemoryLocationType::GPU, 0), 2);
+
+  EXPECT_EQ(hbm, composite.SelectEngine(host, gpu));  // size unknown: first match
+  EXPECT_EQ(hbm, composite.SelectEngine(host, gpu, kFloor - 1));
+  EXPECT_EQ(nic, composite.SelectEngine(host, gpu, kFloor));
+  EXPECT_EQ(nic, composite.SelectEngine(gpu, host, 1 << 20));
+
+  std::vector<TransferItem> items{
+      MakeItem(host, 0, gpu, 0, 4096, 0),
+      MakeItem(host, 65536, gpu, 65536, 65536, 1),
+      MakeItem(host, 8192, gpu, 8192, 4096, 2),
+  };
+  const TransferPlanSet planned = composite.Plan(items);
+  EXPECT_TRUE(planned.rejected_tags.empty());
+  size_t on_hbm = 0, on_nic = 0;
+  for (const auto& plan : planned.plans) {
+    (plan.engine == hbm ? on_hbm : on_nic) += plan.tags.size();
+    if (plan.engine == nic) EXPECT_EQ(std::vector<size_t>({1}), plan.tags);
+  }
+  EXPECT_EQ(2u, on_hbm);  // the two 4 KiB items
+  EXPECT_EQ(1u, on_nic);  // the 64 KiB item
+}
+
 TEST(CompositeTransferEngine, BuilderGroupsHbmAndBatchesOtherEngines) {
   CompositeTransferEngine composite;
   auto hbm = std::make_unique<HbmCopyEngine>();

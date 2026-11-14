@@ -161,6 +161,18 @@ bool MoriIoEngine::Init() {
   // IO backend user; no UMBP-specific entry points.
   io_engine_->CreateBackend(mori::io::BackendType::RDMA, rdma_cfg);
 
+  if (local_loopback_) {
+    // mori-io addresses registered memory through a remote engine descriptor, so
+    // a copy between two of OUR OWN buffers needs this engine to know itself.
+    try {
+      io_engine_->RegisterRemoteEngine(io_engine_->GetEngineDesc());
+    } catch (const std::exception& e) {
+      MORI_UMBP_ERROR("[MoriIoEngine] local loopback unavailable, self registration failed: {}",
+                      e.what());
+      local_loopback_ = false;
+    }
+  }
+
   if (bounce_size_ > 0) {
     bounce_buffer_ = std::make_unique<char[]>(bounce_size_);
     std::memset(bounce_buffer_.get(), 0, bounce_size_);
@@ -174,8 +186,8 @@ bool MoriIoEngine::Init() {
     }
   }
 
-  MORI_UMBP_INFO("[MoriIoEngine] initialized on {}:{} bounce_bytes={}", io_config_.host,
-                 io_config_.port, bounce_size_);
+  MORI_UMBP_INFO("[MoriIoEngine] initialized on {}:{} bounce_bytes={} local_loopback={}",
+                 io_config_.host, io_config_.port, bounce_size_, local_loopback_);
   return true;
 }
 
@@ -343,6 +355,30 @@ bool IsRemoteMemory(const TransferRef& ref, const std::string& local_key) {
   return ref.HasMemoryDesc() && ref.mem.engineKey != local_key;
 }
 
+// Which endpoints the wire sees as remote.  Normally the ones whose descriptor
+// names another engine.  With local loopback, a registered local host buffer
+// paired with a registered local GPU buffer (the pair HbmCopyEngine normally
+// owns) is carried by the NIC too, the engine being its own remote: the HOST
+// side plays the remote, so the GPU initiates -- host -> GPU is a pull, GPU ->
+// host a push.
+struct WireRoles {
+  bool src_remote;
+  bool dst_remote;
+};
+
+WireRoles ClassifyEndpoints(const TransferRef& src, const TransferRef& dst,
+                            const std::string& local_key, bool local_loopback) {
+  WireRoles roles{IsRemoteMemory(src, local_key), IsRemoteMemory(dst, local_key)};
+  if (!local_loopback || roles.src_remote || roles.dst_remote) return roles;  // not both local
+  const bool src_gpu = src.loc == mori::io::MemoryLocationType::GPU;
+  const bool dst_gpu = dst.loc == mori::io::MemoryLocationType::GPU;
+  if (src.HasMemoryDesc() && dst.HasMemoryDesc() && src_gpu != dst_gpu) {
+    roles.src_remote = !src_gpu;
+    roles.dst_remote = !dst_gpu;
+  }
+  return roles;
+}
+
 // Whether the local endpoint can be staged through the host bounce pool.
 //
 // Addressability is not enough: staging is a std::memcpy in and out of a
@@ -360,12 +396,23 @@ bool IsBounceable(const TransferRef& local) {
 
 bool MoriIoEngine::CanHandle(const TransferRef& src, const TransferRef& dst) const {
   if (io_engine_ == nullptr) return false;
-  const bool src_remote = IsRemoteMemory(src, local_engine_key_);
-  const bool dst_remote = IsRemoteMemory(dst, local_engine_key_);
+  const auto [src_remote, dst_remote] =
+      ClassifyEndpoints(src, dst, local_engine_key_, local_loopback_);
   if (src_remote == dst_remote) return false;  // both local or both remote
   const TransferRef& local = src_remote ? dst : src;
   if (local.HasMemoryDesc()) return true;          // zero copy
   return IsBounceable(local) && bounce_size_ > 0;  // staged through the pool
+}
+
+bool MoriIoEngine::CanHandleSized(const TransferRef& src, const TransferRef& dst,
+                                  uint64_t item_bytes) const {
+  if (!CanHandle(src, dst)) return false;
+  // A loopback pair is two local endpoints; only that kind has a size floor.
+  if (item_bytes < local_loopback_min_bytes_ && !IsRemoteMemory(src, local_engine_key_) &&
+      !IsRemoteMemory(dst, local_engine_key_)) {
+    return false;
+  }
+  return true;
 }
 
 namespace {
@@ -390,13 +437,16 @@ struct PairKeyHash {
 class MoriIoPlanBuilder final : public TransferPlanBuilder {
  public:
   MoriIoPlanBuilder(const std::string& local_key, uint64_t bounce_size,
-                    const TransferRef& bounce_ref)
-      : local_key_(local_key), bounce_size_(bounce_size), bounce_ref_(bounce_ref) {}
+                    const TransferRef& bounce_ref, bool local_loopback)
+      : local_key_(local_key),
+        bounce_size_(bounce_size),
+        bounce_ref_(bounce_ref),
+        local_loopback_(local_loopback) {}
 
   void Add(const TransferItem& item) override {
     if (item.size == 0) return;
-    const bool src_remote = IsRemoteMemory(item.src, local_key_);
-    const bool dst_remote = IsRemoteMemory(item.dst, local_key_);
+    const auto [src_remote, dst_remote] =
+        ClassifyEndpoints(item.src, item.dst, local_key_, local_loopback_);
     if (src_remote == dst_remote) {  // both local or both remote
       out_.rejected_tags.push_back(item.tag);
       return;
@@ -481,6 +531,7 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
   const std::string& local_key_;
   const uint64_t bounce_size_;
   const TransferRef& bounce_ref_;
+  const bool local_loopback_;
   TransferPlanSet out_;
   std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> pair_to_plans_;
   std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> bounce_to_plans_;
@@ -491,13 +542,14 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
 
 std::unique_ptr<TransferPlanBuilder> MoriIoEngine::CreatePlanBuilder(
     size_t /*expected_items*/) const {
-  return MakeRdmaPlanBuilder(local_engine_key_, bounce_size_, bounce_ref_);
+  return MakeRdmaPlanBuilder(local_engine_key_, bounce_size_, bounce_ref_, local_loopback_);
 }
 
 std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& local_key,
                                                          uint64_t bounce_size,
-                                                         const TransferRef& bounce_ref) {
-  return std::make_unique<MoriIoPlanBuilder>(local_key, bounce_size, bounce_ref);
+                                                         const TransferRef& bounce_ref,
+                                                         bool local_loopback) {
+  return std::make_unique<MoriIoPlanBuilder>(local_key, bounce_size, bounce_ref, local_loopback);
 }
 
 // ---------------------------------------------------------------------------

@@ -494,6 +494,14 @@ target_link_libraries(test_transfer_engine PRIVATE umbp_common GTest::gtest_main
 target_compile_features(test_transfer_engine PRIVATE cxx_std_17)
 add_test(NAME test_transfer_engine COMMAND test_transfer_engine)
 
+# test_local_rdma_copy — UMBP_LOCAL_RDMA_COPY end to end: a registered host buffer and
+# a registered GPU buffer copied through the NIC loopback, both ways, bytes checked.
+# Needs a GPU and an RDMA NIC; skips without them.
+add_executable(test_local_rdma_copy test_local_rdma_copy.cpp)
+target_link_libraries(test_local_rdma_copy PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_local_rdma_copy PRIVATE cxx_std_17)
+add_test(NAME test_local_rdma_copy COMMAND test_local_rdma_copy)
+
 # test_component_metrics — the observability seam: MetricPublisher's delta /
 # gauge / baseline rules, InstrumentedBackend deriving the generic backend
 # series from the MediumBackend interface alone (asserted against MockBackend,
