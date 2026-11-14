@@ -1,0 +1,1826 @@
+{
+  "uid": "netmon-nic",
+  "title": "netmon NIC detail",
+  "tags": [
+    "netmon",
+    "ainic"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "2s",
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m"
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "experiment",
+        "label": "Experiment",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "netmon-vm"
+        },
+        "query": {
+          "query": "query_result(last_over_time(netmon_import_info[3650d]))",
+          "refId": "V"
+        },
+        "regex": "/experiment=\"([^\"]+)\"/",
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "netmon-vm"
+        },
+        "query": {
+          "query": "query_result(last_over_time(netmon_target_info{experiment=\"$experiment\"}[3650d]))",
+          "refId": "V"
+        },
+        "regex": "/host=\"(?<value>(?<text>[^\".]+)[^\"]*)\"/",
+        "refresh": 2,
+        "sort": 7,
+        "multi": false,
+        "includeAll": false
+      },
+      {
+        "name": "target",
+        "label": "NIC",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "netmon-vm"
+        },
+        "query": {
+          "query": "query_result(last_over_time(netmon_target_info{experiment=\"$experiment\",host=\"$host\"}[3650d]))",
+          "refId": "V"
+        },
+        "regex": "/display_nic=\"(?<text>[^\"]+)\"|target=\"(?<value>[^\"]+)\"/g",
+        "refresh": 2,
+        "sort": 7,
+        "multi": false,
+        "includeAll": false
+      },
+      {
+        "name": "min_step",
+        "label": "min step, ms",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "netmon-vm"
+        },
+        "query": {
+          "query": "query_result(max(last_over_time(netmon_step_ms{experiment=\"$experiment\"}[3650d])))",
+          "refId": "V"
+        },
+        "regex": "/\\} ([0-9]+) /",
+        "refresh": 2,
+        "hide": 2
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Overview",
+      "type": "link",
+      "url": "/d/netmon-overview/netmon-overview?var-experiment=${experiment:percentencode}",
+      "keepTime": true
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "transparent": true,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 2
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**<span style='color:#2a78d6'>Blue = send</span>, <span style='color:#eb6834'>orange = receive</span>. Solid = average, dashed = observed peak. Gaps = data unavailable.**"
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "netmon-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 2,
+        "w": 24,
+        "h": 3
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "last_over_time(netmon_target_info{experiment=\"$experiment\",target=\"$target\",display_nic!=\"\"}[3650d]) or label_copy(last_over_time(netmon_target_info{experiment=\"$experiment\",target=\"$target\",display_nic=\"\"}[3650d]), \"netdev\", \"display_nic\")",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "sum by (target) (label_value(last_over_time(netmon_target_info{experiment=\"$experiment\",target=\"$target\"}[3650d]), \"speed_mbps\")) * 1e6 > 0",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "target",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "includeByName": {
+              "host": true,
+              "display_nic": true,
+              "netdev": true,
+              "pci": true,
+              "Value #B": true,
+              "port_stats": true,
+              "status": true,
+              "target": true
+            },
+            "indexByName": {
+              "host": 0,
+              "display_nic": 1,
+              "netdev": 2,
+              "pci": 3,
+              "Value #B": 4,
+              "port_stats": 5,
+              "status": 6,
+              "target": 7
+            },
+            "renameByName": {
+              "host": "Host",
+              "display_nic": "NIC",
+              "netdev": "netdev",
+              "pci": "PCI",
+              "Value #B": "Link",
+              "port_stats": "Port stats",
+              "status": "Data"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "—",
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Host"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 480
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Link"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Data"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "complete": {
+                        "text": "imported"
+                      },
+                      "interrupted": {
+                        "text": "imported (stopped by signal)"
+                      },
+                      "failed": {
+                        "text": "imported (recording stopped by an error)"
+                      },
+                      "running": {
+                        "text": "imported (recording was still running)"
+                      },
+                      "live": {
+                        "text": "live (approximate until imported)"
+                      },
+                      "partial": {
+                        "text": "imported (recording incomplete)"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Port stats"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "ipc": {
+                        "text": "firmware IPC (2 ms)"
+                      },
+                      "ethtool": {
+                        "text": "ethtool (≈5 s)"
+                      },
+                      "none": {
+                        "text": "not available"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "target"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "RDMA traffic",
+      "description": "Solid line: average traffic in each time bin. Dashed line: the highest single observation in the bin (a counter read ~2 ms apart), so short spikes stay visible when zoomed out; a single observation has timing jitter and can slightly exceed the link rate. Drag across the chart to zoom in. Gaps: no valid observation (never drawn as 0). Data marked 'live' comes from ainic-netmon record --push: an online approximation; where a push failed the average of that time bin may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "netmon-vm"
+      },
+      "interval": "${min_step}ms",
+      "maxDataPoints": 2000,
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval]))) * 8",
+          "legendFormat": "Send",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "rdma",
+            "counter": "tx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "mean_all"
+          }
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) * 8",
+          "legendFormat": "Send peak",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "rdma",
+            "counter": "tx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "max_all"
+          }
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval]))) * 8",
+          "legendFormat": "Receive",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "rdma",
+            "counter": "rx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "mean_all"
+          }
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) * 8",
+          "legendFormat": "Receive peak",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "rdma",
+            "counter": "rx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "max_all"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "pointSize": 3,
+            "axisSoftMin": 0
+          },
+          "noValue": "No data in this time range"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Send"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Send peak"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Receive"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Receive peak"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "All port traffic (incl. non-RDMA)",
+      "description": "All traffic through the port, including non-RDMA Ethernet. With firmware IPC: solid line = average per time bin, dashed line = highest observation in the bin (counters read ~2 ms apart). Without firmware IPC (e.g. a VM with a VF): only the lines marked '≈5 s, ethtool', points that each average about 5 s (the firmware updates these counters about every 5 s; zoomed in they are sparse points). ethtool gives a point only when the counters changed: no point means no observed change, not a measured zero. Gaps: no valid observation (never drawn as 0). Data marked 'live' comes from ainic-netmon record --push: an online approximation; where a push failed the average of that time bin may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "netmon-vm"
+      },
+      "interval": "${min_step}ms",
+      "maxDataPoints": 2000,
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_tx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_tx_ok\"}[$__interval]))) * 8",
+          "legendFormat": "Send",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "ipc",
+            "counter": "octets_tx_ok",
+            "scale": 8.0,
+            "kind": "mean_all"
+          }
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_tx_ok\"}[$__interval])) * 8",
+          "legendFormat": "Send peak",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "ipc",
+            "counter": "octets_tx_ok",
+            "scale": 8.0,
+            "kind": "max_all"
+          }
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_rx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_rx_ok\"}[$__interval]))) * 8",
+          "legendFormat": "Receive",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "ipc",
+            "counter": "octets_rx_ok",
+            "scale": 8.0,
+            "kind": "mean_all"
+          }
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_rx_ok\"}[$__interval])) * 8",
+          "legendFormat": "Receive peak",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "ipc",
+            "counter": "octets_rx_ok",
+            "scale": 8.0,
+            "kind": "max_all"
+          }
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_tx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_tx_ok\"}[$__interval]))) * 8",
+          "legendFormat": "Send (≈5 s, ethtool)",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "ethtool",
+            "counter": "octets_tx_ok",
+            "scale": 8.0,
+            "kind": "mean_all"
+          }
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_rx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_rx_ok\"}[$__interval]))) * 8",
+          "legendFormat": "Receive (≈5 s, ethtool)",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "ethtool",
+            "counter": "octets_rx_ok",
+            "scale": 8.0,
+            "kind": "mean_all"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "pointSize": 3,
+            "axisSoftMin": 0
+          },
+          "noValue": "No data in this time range"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Send"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Send peak"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Receive"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Receive peak"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Send (≈5 s, ethtool)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "always"
+              },
+              {
+                "id": "custom.pointSize",
+                "value": 5
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Receive (≈5 s, ethtool)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "always"
+              },
+              {
+                "id": "custom.pointSize",
+                "value": 5
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "Retransmissions and congestion",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Retransmitted packets",
+      "description": "Highest rate per time bin. 0 = observed zero; gaps = no observation.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "netmon-vm"
+      },
+      "interval": "${min_step}ms",
+      "maxDataPoints": 2000,
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_retx_pkts\",resolution=\"normal\"}[$__interval])",
+          "legendFormat": "Retransmitted",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "kind": "max",
+            "source": "rdma",
+            "counter": "tx_rdma_retx_pkts",
+            "scale": 1.0
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "pointSize": 3,
+            "axisSoftMin": 0
+          },
+          "noValue": "No data in this time range"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Congestion notifications",
+      "description": "Highest rate per time bin. All zero does not prove the network had no pressure: a fabric without ECN marking recovers by drops and retransmission.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "netmon-vm"
+      },
+      "interval": "${min_step}ms",
+      "maxDataPoints": 2000,
+      "gridPos": {
+        "x": 8,
+        "y": 24,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_ecn_pkts\",resolution=\"normal\"}[$__interval])",
+          "legendFormat": "ECN-marked received",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "kind": "max",
+            "source": "rdma",
+            "counter": "rx_rdma_ecn_pkts",
+            "scale": 1.0
+          }
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_cnp_pkts\",resolution=\"normal\"}[$__interval])",
+          "legendFormat": "CNP received",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "kind": "max",
+            "source": "rdma",
+            "counter": "rx_rdma_cnp_pkts",
+            "scale": 1.0
+          }
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_cnp_pkts\",resolution=\"normal\"}[$__interval])",
+          "legendFormat": "CNP sent",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "kind": "max",
+            "source": "rdma",
+            "counter": "tx_rdma_cnp_pkts",
+            "scale": 1.0
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "pointSize": 3,
+            "axisSoftMin": 0
+          },
+          "noValue": "No data in this time range"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "ACK timeouts",
+      "description": "Highest rate per time bin, per second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "netmon-vm"
+      },
+      "interval": "${min_step}ms",
+      "maxDataPoints": 2000,
+      "gridPos": {
+        "x": 16,
+        "y": 24,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_ack_timeout\",resolution=\"normal\"}[$__interval])",
+          "legendFormat": "ACK timeouts",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "kind": "max",
+            "source": "rdma",
+            "counter": "tx_rdma_ack_timeout",
+            "scale": 1.0
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "pointSize": 3,
+            "axisSoftMin": 0
+          },
+          "noValue": "No data in this time range"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Inspect individual observations",
+      "collapsed": true,
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [
+        {
+          "id": 10,
+          "type": "timeseries",
+          "title": "Individual observations (at 1 ms bins each point is one observation; otherwise the highest per $__interval)",
+          "description": "RDMA traffic as individual observations. Zoom in until the bin is 1 ms to see every observation.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "interval": "1ms",
+          "maxDataPoints": 2000,
+          "gridPos": {
+            "x": 0,
+            "y": 32,
+            "w": 24,
+            "h": 8
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "netmon-vm"
+              },
+              "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) * 8",
+              "legendFormat": "Send",
+              "range": true,
+              "instant": false,
+              "netmon": {
+                "kind": "max_all",
+                "source": "rdma",
+                "counter": "tx_rdma_ucast_bytes",
+                "scale": 8.0
+              }
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "netmon-vm"
+              },
+              "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) * 8",
+              "legendFormat": "Receive",
+              "range": true,
+              "instant": false,
+              "netmon": {
+                "kind": "max_all",
+                "source": "rdma",
+                "counter": "rx_rdma_ucast_bytes",
+                "scale": 8.0
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bps",
+              "custom": {
+                "drawStyle": "points",
+                "lineWidth": 1,
+                "fillOpacity": 0,
+                "showPoints": "always",
+                "pointSize": 3,
+                "axisSoftMin": 0
+              },
+              "noValue": "No data in this time range"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Send"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#2a78d6"
+                    }
+                  },
+                  {
+                    "id": "custom.drawStyle",
+                    "value": "points"
+                  },
+                  {
+                    "id": "custom.pointSize",
+                    "value": 3
+                  },
+                  {
+                    "id": "custom.showPoints",
+                    "value": "always"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Receive"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#eb6834"
+                    }
+                  },
+                  {
+                    "id": "custom.drawStyle",
+                    "value": "points"
+                  },
+                  {
+                    "id": "custom.pointSize",
+                    "value": 3
+                  },
+                  {
+                    "id": "custom.showPoints",
+                    "value": "always"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "PFC pause counters (experimental: meaning not yet validated)",
+      "collapsed": true,
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [
+        {
+          "id": 12,
+          "type": "timeseries",
+          "title": "PFC pause counters, highest rate per time bin",
+          "description": "Firmware port counters whose meaning has not been validated yet. Only counters that changed during the recording are imported (ethtool: always). On hosts without firmware IPC (e.g. a VM with a VF) the port statistics come from ethtool instead (lines marked '≈5 s, ethtool'): the firmware updates them about every 5 s, so each point is an average over about 5 s (zoomed in: sparse points). ethtool gives a point only when the counters changed: no point means no observed change, not a measured zero.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "interval": "${min_step}ms",
+          "maxDataPoints": 2000,
+          "gridPos": {
+            "x": 0,
+            "y": 33,
+            "w": 24,
+            "h": 8
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "netmon-vm"
+              },
+              "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=~\".*pripause.*|rx_pause_1us_count\",resolution=\"normal\"}[$__interval])",
+              "legendFormat": "{{counter}}",
+              "range": true,
+              "instant": false,
+              "netmon": {
+                "kind": "max",
+                "source": "ipc",
+                "counter_re": ".*pripause.*|rx_pause_1us_count",
+                "scale": 1.0
+              }
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "netmon-vm"
+              },
+              "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=~\"frames_(tx|rx)_(pri)?pause\",resolution=\"normal\"}[$__interval])",
+              "legendFormat": "{{counter}} (≈5 s, ethtool)",
+              "range": true,
+              "instant": false,
+              "netmon": {
+                "kind": "max",
+                "source": "ethtool",
+                "counter_re": "frames_(tx|rx)_(pri)?pause",
+                "scale": 1.0
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "pointSize": 3,
+                "axisSoftMin": 0
+              },
+              "noValue": "No data in this time range"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": ".*ethtool.*"
+                },
+                "properties": [
+                  {
+                    "id": "custom.showPoints",
+                    "value": "always"
+                  },
+                  {
+                    "id": "custom.pointSize",
+                    "value": 5
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "row",
+      "title": "Offline report summary (fixed experiment window)",
+      "collapsed": true,
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [
+        {
+          "id": 16,
+          "type": "table",
+          "title": "Offline report summary (fixed experiment window; does not change with zoom)",
+          "description": "The offline report's numbers for the experiment's common recording window (ainic-netmon-report shows the window). p99 and the time above 80 % use fine-grained observations only; the average includes long observations.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 35,
+            "w": 24,
+            "h": 5
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "netmon-vm"
+              },
+              "expr": "(last_over_time(netmon_summary{experiment=\"$experiment\",target=\"$target\",stat=~\"avg|peak10ms|p99\"}[3650d]) * 8) or (last_over_time(netmon_summary{experiment=\"$experiment\",target=\"$target\",stat!~\"avg|peak10ms|p99\"}[3650d]))",
+              "range": false,
+              "instant": true,
+              "format": "table"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "groupingToMatrix",
+              "options": {
+                "columnField": "stat",
+                "rowField": "counter",
+                "valueField": "Value"
+              }
+            },
+            {
+              "id": "organize",
+              "options": {
+                "renameByName": {
+                  "avg": "Average",
+                  "p99": "p99",
+                  "peak10ms": "10 ms peak",
+                  "above80": "Time above 80 % of link",
+                  "coverage": "Time with fine-grained observations",
+                  "lowres_n": "Long observations",
+                  "lowres_s": "Long-observation time",
+                  "counter\\stat": "Traffic"
+                },
+                "indexByName": {
+                  "counter\\stat": 0,
+                  "avg": 1,
+                  "p99": 2,
+                  "peak10ms": 3,
+                  "above80": 4,
+                  "coverage": 5,
+                  "lowres_n": 6,
+                  "lowres_s": 7
+                }
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "—",
+              "custom": {
+                "align": "auto"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Traffic"
+                },
+                "properties": [
+                  {
+                    "id": "mappings",
+                    "value": [
+                      {
+                        "type": "value",
+                        "options": {
+                          "tx_rdma_ucast_bytes": {
+                            "text": "RDMA send"
+                          },
+                          "rx_rdma_ucast_bytes": {
+                            "text": "RDMA receive"
+                          },
+                          "octets_tx_ok": {
+                            "text": "Port send"
+                          },
+                          "octets_rx_ok": {
+                            "text": "Port receive"
+                          },
+                          "rdma": {
+                            "text": "RDMA counters"
+                          },
+                          "ipc": {
+                            "text": "Port counters"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Average"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "bps"
+                  },
+                  {
+                    "id": "decimals",
+                    "value": 1
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "p99"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "bps"
+                  },
+                  {
+                    "id": "decimals",
+                    "value": 1
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "10 ms peak"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "bps"
+                  },
+                  {
+                    "id": "decimals",
+                    "value": 1
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Time above 80 % of link"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "percentunit"
+                  },
+                  {
+                    "id": "decimals",
+                    "value": 1
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Time with fine-grained observations"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "percentunit"
+                  },
+                  {
+                    "id": "decimals",
+                    "value": 1
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Long observations"
+                },
+                "properties": [
+                  {
+                    "id": "decimals",
+                    "value": 0
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Long-observation time"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "s"
+                  },
+                  {
+                    "id": "decimals",
+                    "value": 2
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm"
+          }
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Recording diagnostics (for troubleshooting the monitor itself)",
+      "collapsed": true,
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [
+        {
+          "id": 14,
+          "type": "timeseries",
+          "title": "Time without a valid observation (each point: one gap, its length)",
+          "description": "Collector quality, not network loss: times when a counter could not be turned into a rate (a counter went back, an IPC read was rejected, or the wall-clock position was uncertain). These times are the gaps in the traffic charts. Gaps of different counters are not added up.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "interval": "${min_step}ms",
+          "maxDataPoints": 2000,
+          "gridPos": {
+            "x": 0,
+            "y": 34,
+            "w": 24,
+            "h": 7
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "netmon-vm"
+              },
+              "expr": "max by (experiment, target, source, reason) (max_over_time(netmon_gap_seconds{experiment=\"$experiment\",target=\"$target\"}[$__interval]))",
+              "legendFormat": "{{source}} {{reason}}",
+              "range": true,
+              "instant": false,
+              "netmon": {
+                "kind": "gap_by_source"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "points",
+                "lineWidth": 1,
+                "fillOpacity": 0,
+                "showPoints": "always",
+                "pointSize": 3,
+                "axisSoftMin": 0
+              },
+              "noValue": "No data in this time range"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "rdma reset"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "RDMA counters: counter reset or rejected reading"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "rdma clock"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "RDMA counters: timestamp uncertain"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "ipc reset"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "Port counters: counter reset or rejected reading"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "ipc clock"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "Port counters: timestamp uncertain"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "ethtool reset"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "Port counters (ethtool): counter reset"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "ethtool clock"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "Port counters (ethtool): timestamp uncertain"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          }
+        },
+        {
+          "id": 15,
+          "type": "table",
+          "title": "Recording quality",
+          "description": "Samples: counter reads saved. Missed sampling slots: sampling times skipped because a read was late (e.g. a firmware stall). Samples lost before saving: the writer could not keep up. Read errors: failed reads.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 41,
+            "w": 24,
+            "h": 4
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "netmon-vm"
+              },
+              "expr": "last_over_time(netmon_run_quality{experiment=\"$experiment\",target=\"$target\"}[3650d])",
+              "range": false,
+              "instant": true,
+              "format": "table"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "groupingToMatrix",
+              "options": {
+                "columnField": "stat",
+                "rowField": "source",
+                "valueField": "Value"
+              }
+            },
+            {
+              "id": "organize",
+              "options": {
+                "renameByName": {
+                  "samples": "Samples",
+                  "missed_slots": "Missed sampling slots",
+                  "dropped": "Samples lost before saving",
+                  "errors": "Read errors",
+                  "source\\stat": "Counters"
+                }
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "—",
+              "custom": {
+                "align": "auto"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Counters"
+                },
+                "properties": [
+                  {
+                    "id": "mappings",
+                    "value": [
+                      {
+                        "type": "value",
+                        "options": {
+                          "tx_rdma_ucast_bytes": {
+                            "text": "RDMA send"
+                          },
+                          "rx_rdma_ucast_bytes": {
+                            "text": "RDMA receive"
+                          },
+                          "octets_tx_ok": {
+                            "text": "Port send"
+                          },
+                          "octets_rx_ok": {
+                            "text": "Port receive"
+                          },
+                          "rdma": {
+                            "text": "RDMA counters"
+                          },
+                          "ipc": {
+                            "text": "Port counters"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byType",
+                  "options": "number"
+                },
+                "properties": [
+                  {
+                    "id": "decimals",
+                    "value": 0
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm"
+          }
+        }
+      ]
+    }
+  ]
+}

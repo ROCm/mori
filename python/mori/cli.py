@@ -186,6 +186,28 @@ def _cmd_path(rest: List[str]) -> int:
     return 0
 
 
+def _cmd_netmon(rest: List[str]) -> int:
+    """``mori netmon ...``: the ainic-netmon collector (``mori netmon --path`` prints it)."""
+    from . import netmon_entry
+
+    if rest[:1] == ["--path"]:
+        print(netmon_entry.binary_path())
+        return 0
+    return netmon_entry.run(rest)
+
+
+def _cmd_netmon_report(rest: List[str]) -> int:
+    from . import netmon_entry
+
+    return netmon_entry.report_main(rest)
+
+
+def _cmd_netmon_import(rest: List[str]) -> int:
+    from . import netmon_entry
+
+    return netmon_entry.import_main(rest)
+
+
 def _cmd_version(_rest: List[str]) -> int:
     try:
         from . import __version__  # type: ignore[attr-defined]
@@ -206,6 +228,15 @@ _COMMANDS = {
     ),
     "diagnose": (_cmd_diagnose, "run diagnose_env.sh"),
     "path": (_cmd_path, "print the absolute path of a bundled script"),
+    "netmon": (_cmd_netmon, "AINIC counter collector (same as `ainic-netmon`)"),
+    "netmon-report": (
+        _cmd_netmon_report,
+        "report/CSV for netmon recordings (same as `ainic-netmon-report`)",
+    ),
+    "netmon-import": (
+        _cmd_netmon_import,
+        "import netmon recordings into VictoriaMetrics (same as `ainic-netmon-import`)",
+    ),
     "version": (_cmd_version, "print mori version"),
 }
 
@@ -227,6 +258,7 @@ def _print_usage() -> None:
             "  mori setup                   # configure NICs (env vars do NOT persist in shell)",
             "  source $(mori setup --path)  # configure NICs AND export MORI_RDMA_SL/TC",
             "  mori path check              # print path to env_check.sh",
+            "  mori netmon record -o DIR -d 60s   # record AINIC counters (see tools/netmon)",
         ]
     )
     print("\n".join(lines))
