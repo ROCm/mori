@@ -21,8 +21,10 @@
 // SOFTWARE.
 #include "src/io/rdma/backend_impl.hpp"
 
+#include <arpa/inet.h>
 #include <infiniband/verbs.h>  // dereferences ibvHandle.qp/cq/compCh (forward-declared in core)
 #include <sys/epoll.h>
+#include <sys/socket.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -43,6 +45,47 @@
 #include "src/io/roctx_mori.hpp"  // ADDITIVE: async post-to-completion range stop
 namespace mori {
 namespace io {
+
+TaskPool::TaskPool(int numThreads) {
+  for (int i = 0; i < std::max(1, numThreads); ++i) {
+    threads_.emplace_back([this] {
+      while (true) {
+        std::function<void()> task;
+        {
+          std::unique_lock<std::mutex> lock(mu_);
+          cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+          if (tasks_.empty()) return;
+          task = std::move(tasks_.front());
+          tasks_.pop_front();
+        }
+        task();
+      }
+    });
+  }
+}
+
+TaskPool::~TaskPool() { Shutdown(); }
+
+void TaskPool::Submit(std::function<void()> task) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (stop_) throw std::runtime_error("TaskPool::Submit after Shutdown");
+    tasks_.push_back(std::move(task));
+  }
+  cv_.notify_one();
+}
+
+void TaskPool::Shutdown() {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    stop_ = true;
+  }
+  cv_.notify_all();
+  for (auto& t : threads_) {
+    if (t.joinable()) t.join();
+  }
+  threads_.clear();
+}
 
 static void ValidateRdmaNotificationConfig(const RdmaBackendConfig& config) {
   if (config.enableNotification && config.notifPerQp == 0) {
@@ -1215,6 +1258,11 @@ bool NotifManager::PopInboundTransferStatus(const EngineKey& remote, TransferUni
   return false;
 }
 
+void NotifManager::MarkInboundComplete(const EngineKey& remote, TransferUniqueId id) {
+  std::lock_guard<std::mutex> lock(mu);
+  notifPool[remote][id] = 0;
+}
+
 void NotifManager::Start() {
   if (running.load()) return;
   if (config.pollCqMode == PollCqMode::EVENT) {
@@ -1338,6 +1386,45 @@ application::RdmaMemoryRegion ControlPlaneServer::AskRemoteMemoryRegion(EngineKe
   return msg.mr;
 }
 
+bool ControlPlaneServer::TryGetLocalMemory(MemoryUniqueId id, MemoryDesc* out) const {
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = mems.find(id);
+  if (it == mems.end()) return false;
+  *out = it->second;
+  return true;
+}
+
+void ControlPlaneServer::SetReadViaWriteHandler(ReadViaWriteHandler handler, int serveThreads) {
+  readViaWriteHandler_ = std::move(handler);
+  servePool_ = std::make_unique<TaskPool>(serveThreads);
+}
+
+void ControlPlaneServer::RequestReadViaWrite(const EngineKey& owner, const MessageReadViaWrite& msg,
+                                             int timeoutMs, MessageReadViaWriteReply* reply) {
+  application::TCPEndpointHandle tcph;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    auto engineIt = engines.find(owner);
+    if (engineIt == engines.end()) {
+      throw std::runtime_error("RequestReadViaWrite: remote engine " + owner +
+                               " is not registered");
+    }
+    tcph = ctx->Connect(engineIt->second.host, engineIt->second.port);
+  }
+  TcpEndpointGuard tcpGuard(ctx.get(), tcph);
+  if (timeoutMs > 0) {
+    timeval tv{};
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    setsockopt(tcph.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  }
+  Protocol p(tcph);
+  p.WriteMessageReadViaWrite(msg);
+  MessageHeader hdr = p.ReadMessageHeader();
+  ExpectMessage(hdr, MessageType::ReadViaWriteReply, "RequestReadViaWrite reply from " + owner);
+  *reply = p.ReadMessageReadViaWriteReply(hdr.len);
+}
+
 void ControlPlaneServer::AcceptRemoteEngineConn() {
   application::TCPEndpointHandleVec newEps = ctx->Accept();
   for (auto& ep : newEps) {
@@ -1422,6 +1509,36 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       }
       break;
     }
+    case MessageType::ReadViaWrite: {
+      MessageReadViaWrite msg = p.ReadMessageReadViaWrite(hdr.len);
+      if (!readViaWriteHandler_ || !servePool_) {
+        p.WriteMessageReadViaWriteReply(
+            {static_cast<int>(StatusCode::ERR_BAD_STATE), "read-via-write is not served here"});
+        break;
+      }
+      // The write and its wait run off this thread; the reply closes the connection.
+      if (epfd >= 0) epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+      eps.erase(fd);
+      char ip[INET_ADDRSTRLEN] = {0};
+      inet_ntop(AF_INET, &tcph.peer.sin_addr, ip, sizeof(ip));
+      std::string peerIp(ip);
+      servePool_->Submit([this, tcph, msg = std::move(msg), peerIp]() {
+        MessageReadViaWriteReply reply;
+        try {
+          readViaWriteHandler_(msg, peerIp, &reply);
+        } catch (const std::exception& e) {
+          reply = {static_cast<int>(StatusCode::ERR_BAD_STATE), e.what()};
+        }
+        try {
+          Protocol rp(tcph);
+          rp.WriteMessageReadViaWriteReply(reply);
+        } catch (const std::exception& e) {
+          MORI_IO_WARN("read-via-write reply to {} failed: {}", msg.readerKey, e.what());
+        }
+        ctx->CloseEndpointNoThrow(tcph);
+      });
+      return;
+    }
     default:
       throw ProtocolError("unsupported control-plane message type " +
                           std::to_string(static_cast<int>(hdr.type)));
@@ -1497,6 +1614,7 @@ void ControlPlaneServer::Start() {
 void ControlPlaneServer::Shutdown() {
   running.store(false);
   if (thd.joinable()) thd.join();
+  if (servePool_) servePool_->Shutdown();
   if (epfd >= 0) {
     close(epfd);
     epfd = -1;
@@ -1594,6 +1712,10 @@ static void FinishSubmission(const EpPairVec& eps, const std::shared_ptr<CqCallb
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
+  if (isRead && readRedirect_) {
+    readRedirect_({localOffset}, {remoteOffset}, {size}, status, id);
+    return;
+  }
   status->SetCode(StatusCode::IN_PROGRESS);
   if (rdma_ && rdma_->RejectIfPortDown(eps, status)) return;
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
@@ -1610,6 +1732,16 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
 void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                         const SizeVec& sizes, TransferStatus* status,
                                         TransferUniqueId id, bool isRead) {
+  if (isRead && readRedirect_) {
+    readRedirect_(localOffsets, remoteOffsets, sizes, status, id);
+    return;
+  }
+  PostBatch(localOffsets, remoteOffsets, sizes, status, id, isRead, config.enableNotification);
+}
+
+void RdmaBackendSession::PostBatch(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                   const SizeVec& sizes, TransferStatus* status,
+                                   TransferUniqueId id, bool isRead, bool notify) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   if (rdma_ && rdma_->RejectIfPortDown(eps, status)) return;
@@ -1657,7 +1789,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
 
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
-  callbackMeta->awaitsNotification = config.enableNotification;
+  callbackMeta->awaitsNotification = notify;
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
   RdmaOpRet ret;
   if (canUseWorkerChunking) {
@@ -1696,7 +1828,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, localOffsets, remoteOffsets, sizes,
                              callbackMeta, id, isRead, config.postBatchSize, control);
   }
-  FinishSubmission(eps, callbackMeta, status, id, ret, config.enableNotification);
+  FinishSubmission(eps, callbackMeta, status, id, ret, notify);
 }
 
 bool RdmaBackendSession::Alive() const {
@@ -1747,6 +1879,9 @@ RdmaBackendConfig ResolveRdmaBackendConfig(const RdmaBackendConfig& beConfig) {
   env::Override("MORI_IO_NUM_WORKER_THREADS", config.numWorkerThreads,
                 mori::env::detail::ParsePositiveInt);
   env::Override("MORI_IO_POLL_CQ_MODE", config.pollCqMode, ParsePollCqMode);
+  env::Override("MORI_IO_READ_VIA_WRITE", config.readViaWrite, mori::env::detail::ParseBool);
+  env::Override("MORI_IO_READ_VIA_WRITE_TIMEOUT_MS", config.readViaWriteTimeoutMs,
+                mori::env::detail::ParsePositiveInt);
   ValidateRdmaNotificationConfig(config);
   ValidateRdmaTransferConfig(config);
   return config;
@@ -1764,6 +1899,17 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
 
   server.reset(new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, config, rdma.get(),
                                       notif.get()));
+  // Every engine serves read-via-write requests; only readers need MORI_IO_READ_VIA_WRITE=1.
+  int rvwThreads = 4;
+  env::Override("MORI_IO_READ_VIA_WRITE_THREADS", rvwThreads, mori::env::detail::ParsePositiveInt);
+  server->SetReadViaWriteHandler(
+      [this](const MessageReadViaWrite& msg, const std::string& peerIp,
+             MessageReadViaWriteReply* reply) { ServeReadViaWrite(msg, peerIp, reply); },
+      rvwThreads);
+  if (config.readViaWrite) {
+    readViaWritePool_ = std::make_unique<TaskPool>(rvwThreads);
+    MORI_IO_INFO("RdmaBackend: RDMA reads are served as owner-side writes (read-via-write)");
+  }
   server->Start();
 
   if (config.qpPerTransfer == 1 && rdma->HasIonicDevice()) {
@@ -1792,8 +1938,10 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
 }
 
 RdmaBackend::~RdmaBackend() {
-  notif->Shutdown();
+  // Read-via-write tasks wait on CQEs that the notif thread polls, so they stop first.
+  if (readViaWritePool_) readViaWritePool_->Shutdown();
   server->Shutdown();
+  notif->Shutdown();
   if (executor.get() != nullptr) {
     executor->Shutdown();
   }
@@ -2021,6 +2169,106 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
 
   sess = RdmaBackendSession(config, std::move(localMrPerEp), std::move(remoteMrPerEp), epSet,
                             executor.get(), rdma.get(), local.loc);
+  if (config.readViaWrite) {
+    sess.SetReadRedirect([this, local, remote](const SizeVec& lo, const SizeVec& ro,
+                                               const SizeVec& sz, TransferStatus* st,
+                                               TransferUniqueId id) {
+      SubmitReadViaWrite(local, lo, remote, ro, sz, st, id);
+    });
+  }
+}
+
+void RdmaBackend::SubmitReadViaWrite(const MemoryDesc& local, const SizeVec& localOffsets,
+                                     const MemoryDesc& remote, const SizeVec& remoteOffsets,
+                                     const SizeVec& sizes, TransferStatus* status,
+                                     TransferUniqueId id) {
+  if (localOffsets.size() != remoteOffsets.size() || sizes.size() != remoteOffsets.size()) {
+    status->Update(StatusCode::ERR_INVALID_ARGS,
+                   "lengths of local offsets, remote offsets or sizes mismatch");
+    return;
+  }
+  status->SetCode(StatusCode::IN_PROGRESS);
+  auto task = [this, local, remote, localOffsets, remoteOffsets, sizes, status, id]() {
+    // Keeps each request under kMaxControlMessageBytes (~27 B per entry).
+    constexpr size_t kMaxEntries = 16384;
+    MessageReadViaWrite msg;
+    msg.readerKey = myEngKey;
+    msg.readerHost = server->GetLocalHost();
+    msg.readerPort = server->GetListenPort().value_or(0);
+    msg.readerMem = local;
+    msg.ownerMemId = remote.id;
+    msg.id = id;
+    try {
+      size_t begin = 0;
+      do {
+        const size_t end = std::min(sizes.size(), begin + kMaxEntries);
+        msg.readerOffsets.assign(localOffsets.begin() + begin, localOffsets.begin() + end);
+        msg.ownerOffsets.assign(remoteOffsets.begin() + begin, remoteOffsets.begin() + end);
+        msg.sizes.assign(sizes.begin() + begin, sizes.begin() + end);
+        msg.notify = config.enableNotification && end == sizes.size();
+        MessageReadViaWriteReply reply;
+        server->RequestReadViaWrite(remote.engineKey, msg, config.readViaWriteTimeoutMs, &reply);
+        if (reply.code != static_cast<int>(StatusCode::SUCCESS)) {
+          status->Update(static_cast<StatusCode>(reply.code),
+                         "read-via-write from " + remote.engineKey + ": " + reply.message);
+          return;
+        }
+        begin = end;
+      } while (begin < sizes.size());
+      status->SetCode(StatusCode::SUCCESS);
+    } catch (const std::exception& e) {
+      status->Update(StatusCode::ERR_RDMA_OP,
+                     std::string("read-via-write from ") + remote.engineKey + ": " + e.what());
+    }
+  };
+  try {
+    readViaWritePool_->Submit(std::move(task));
+  } catch (const std::exception& e) {
+    status->Update(StatusCode::ERR_BAD_STATE, e.what());
+  }
+}
+
+void RdmaBackend::ServeReadViaWrite(const MessageReadViaWrite& msg, const std::string& peerIp,
+                                    MessageReadViaWriteReply* reply) {
+  auto fail = [reply](StatusCode code, const std::string& m) {
+    reply->code = static_cast<int>(code);
+    reply->message = m;
+  };
+  MemoryDesc ownerMem;
+  if (!server->TryGetLocalMemory(msg.ownerMemId, &ownerMem)) {
+    return fail(StatusCode::ERR_NOT_FOUND,
+                "memory " + std::to_string(msg.ownerMemId) + " is not registered on " + myEngKey);
+  }
+  const size_t n = msg.sizes.size();
+  if (msg.readerOffsets.size() != n || msg.ownerOffsets.size() != n) {
+    return fail(StatusCode::ERR_INVALID_ARGS, "offset and size vector lengths differ");
+  }
+  for (size_t i = 0; i < n; ++i) {
+    const size_t sz = msg.sizes[i];
+    if (msg.ownerOffsets[i] > ownerMem.size || sz > ownerMem.size - msg.ownerOffsets[i] ||
+        msg.readerOffsets[i] > msg.readerMem.size ||
+        sz > msg.readerMem.size - msg.readerOffsets[i]) {
+      return fail(StatusCode::ERR_INVALID_ARGS,
+                  "entry " + std::to_string(i) + " is out of bounds of the source or destination");
+    }
+  }
+  if (!server->TryGetRemoteEnginePort(msg.readerKey).has_value()) {
+    EngineDesc reader;
+    reader.key = msg.readerKey;
+    reader.host = msg.readerHost.empty() || msg.readerHost == "0.0.0.0" ? peerIp : msg.readerHost;
+    reader.port = msg.readerPort;
+    server->RegisterRemoteEngine(reader);
+  }
+  if (n > 0) {
+    RdmaBackendSession* sess = GetOrCreateSessionCached(ownerMem, msg.readerMem);
+    TransferStatus st;
+    sess->PostBatch(msg.ownerOffsets, msg.readerOffsets, msg.sizes, &st, msg.id,
+                    /*isRead=*/false, /*notify=*/false);
+    st.Wait();
+    if (!st.Succeeded()) return fail(st.Code(), st.Message());
+  }
+  if (msg.notify) notif->MarkInboundComplete(msg.readerKey, msg.id);
+  reply->code = static_cast<int>(StatusCode::SUCCESS);
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,

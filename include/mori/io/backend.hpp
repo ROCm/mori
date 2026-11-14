@@ -72,6 +72,10 @@ struct RdmaBackendConfig : public BackendConfig {
   size_t chunkBytes{65536};
   int maxChunksPerTransfer{64};
   int numNicsPerTransfer{1};
+  // Serve reads as remote-initiated WRITEs (owner writes into the reader's buffer) for NICs
+  // that do not support RDMA READ, e.g. ionic MRC. MORI_IO_READ_VIA_WRITE=1.
+  bool readViaWrite{false};
+  int readViaWriteTimeoutMs{30000};
 
   int maxSendWr{0};
   int maxCqeNum{0};
@@ -84,8 +88,9 @@ inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
             << c.enableNotification << "] notifPerQp[" << c.notifPerQp
             << "] enableTransferChunking[" << c.enableTransferChunking << "] chunkBytes["
             << c.chunkBytes << "] maxChunksPerTransfer[" << c.maxChunksPerTransfer
-            << "] numNicsPerTransfer[" << c.numNicsPerTransfer << "] maxSendWr[" << c.maxSendWr
-            << "] maxCqeNum[" << c.maxCqeNum << "] maxMsgSge[" << c.maxMsgSge << "]";
+            << "] numNicsPerTransfer[" << c.numNicsPerTransfer << "] readViaWrite["
+            << c.readViaWrite << "] maxSendWr[" << c.maxSendWr << "] maxCqeNum[" << c.maxCqeNum
+            << "] maxMsgSge[" << c.maxMsgSge << "]";
 }
 
 struct OfiBackendConfig : public BackendConfig {
