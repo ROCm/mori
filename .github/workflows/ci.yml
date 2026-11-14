@@ -137,6 +137,10 @@ jobs:
         # EP backend was gone from the package.
         run: $CT exec $CONTAINER python tools/verify_install.py
 
+      - name: JIT build lock (CPU)
+        # A build killed while holding the JIT lock must not block later builds.
+        run: $CT exec $CONTAINER bash -c "timeout 120 python -m pytest -v tests/python/jit/"
+
       - name: Cleanup
         if: always()
         run: |

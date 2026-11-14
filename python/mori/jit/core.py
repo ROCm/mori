@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import functools
 import logging
 import os
@@ -64,36 +65,69 @@ __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 class FileBaton:
     """File-based lock for multi-process build safety.
 
+    The lock is an flock(2) on *lock_path*, so the kernel releases it when the
+    holder exits, including a build killed mid-compile. The lock file is left
+    in place: removing it would let a process that opened the old file and one
+    that creates a new file both hold the lock.
+
     When *wait_for* is provided, waiters that see the target file appear
     will return immediately **without** acquiring the lock, setting
     ``self.skipped = True``.  The caller should check this flag and skip
     the build if it is set.
     """
 
+    _WAIT_NOTICE_S = 30.0
+
     def __init__(self, lock_path: str | Path, wait_for: str | Path | None = None):
         self._lock_path = str(lock_path)
         self._wait_for = str(wait_for) if wait_for else None
+        self._fd: int | None = None
         self.skipped = False
 
+    def _open(self) -> int:
+        # NFS emulates flock with byte-range locks, which need a writable fd, so
+        # the file is made writable for every user of a shared cache.
+        try:
+            fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        except PermissionError:
+            return os.open(self._lock_path, os.O_RDONLY)
+        try:
+            os.fchmod(fd, 0o666)
+        except OSError:
+            pass  # not the owner
+        return fd
+
     def __enter__(self):
+        fd = self._open()
+        start = time.monotonic()
+        noticed = False
         while True:
             try:
-                fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.close(fd)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._fd = fd
                 return self
-            except FileExistsError:
-                if self._wait_for and os.path.isfile(self._wait_for):
-                    self.skipped = True
-                    return self
-                time.sleep(0.5)
+            except BlockingIOError:
+                pass
+            if self._wait_for and os.path.isfile(self._wait_for):
+                os.close(fd)
+                self.skipped = True
+                return self
+            if not noticed and time.monotonic() - start > self._WAIT_NOTICE_S:
+                print(
+                    f"[mori-jit] Waiting for another process to finish building "
+                    f"(lock {self._lock_path}) ..."
+                )
+                noticed = True
+            time.sleep(0.5)
 
     def __exit__(self, *exc):
-        if self.skipped:
+        if self._fd is None:
             return
         try:
-            os.remove(self._lock_path)
-        except OSError:
-            pass
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
 
 
 def _hipcc_device_bc(
