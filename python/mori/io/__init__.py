@@ -33,6 +33,7 @@ from mori.cpp import (
     EngineDesc,
     MemoryDesc,
     MemoryLocationType,
+    FenceResult,
     PeerFailureEvent,
     PeerFailureReason,
     PollCqMode,

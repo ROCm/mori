@@ -814,9 +814,29 @@ bool XgmiBackend::IsSameNodeEngine(const EngineKey& engineKey) const {
   return remoteEngine.hostname == myHostname;
 }
 
+FenceResult XgmiBackend::FenceRemoteEngine(const EngineKey& remote) {
+  // Nothing reaches our memory over XGMI unless we exported some, and a peer known to sit on
+  // another node cannot. Any other peer is assumed to be on this node, including one we have
+  // no record of: it may have our memory descriptor from elsewhere, and deregistering it does
+  // not revoke a mapping it holds.
+  if (remote == myEngKey || !exportedMemory_.load(std::memory_order_acquire)) return FenceResult{};
+  {
+    std::lock_guard<std::mutex> lock(remoteEnginesMu);
+    auto it = peerOnThisNodeSeen_.find(remote);
+    if (it != peerOnThisNodeSeen_.end() && !it->second) return FenceResult{};
+  }
+  return UncutPath(remote, "XGMI", "the IPC mapping of our memory it holds cannot be revoked");
+}
+
 void XgmiBackend::RegisterRemoteEngine(const EngineDesc& desc) {
   std::lock_guard<std::mutex> lock(remoteEnginesMu);
   remoteEngines[desc.key] = desc;
+  // Once seen on this node, always: re-registering the key from another node does not
+  // revoke a mapping the earlier incarnation may still hold.
+  bool& onThisNode = peerOnThisNodeSeen_[desc.key];
+  onThisNode =
+      onThisNode || (!myNodeId.empty() && !desc.nodeId.empty() ? desc.nodeId == myNodeId
+                                                               : desc.hostname == myHostname);
   MORI_IO_TRACE("XGMI: Registered remote engine {} hostname {}", desc.key, desc.hostname);
 }
 
@@ -831,6 +851,9 @@ void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
     MORI_IO_TRACE("XGMI: Skipping non-GPU memory registration for id={}", desc.id);
     return;
   }
+  // Reachable even if the IPC export below fails: a peer in this process falls back to the
+  // direct P2P pointer (GetRemappedAddress).
+  exportedMemory_.store(true, std::memory_order_release);
 
   // hipIpcGetMemHandle is keyed to the *base* of the underlying allocation, not
   // to an interior pointer. When `data` is a sub-region (e.g. a per-layer view

@@ -26,11 +26,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "mori/application/topology/topology.hpp"
@@ -66,6 +68,13 @@ EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
                                            const std::vector<int>& localDevOrder,
                                            const std::vector<int>& wantPerRank);
 
+// Connections a fence cut, as parallel lists of QP numbers: the fencing engine's
+// (`localQpns`) and the fenced peer's (`peerQpns`).
+struct CutConnections {
+  std::vector<uint32_t> localQpns;
+  std::vector<uint32_t> peerQpns;
+};
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -90,8 +99,12 @@ class RdmaManager {
   // Remote memory management APIs
   std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,
                                                                MemoryUniqueId);
+  // Bumped by every fence of the peer, which drops its cached memory regions. Read it
+  // before asking the peer for a region and pass it to RegisterRemoteMemory, which then
+  // caches the reply only if no fence came in between.
+  uint64_t RemoteMemoryEpoch(const EngineKey&) const;
   void RegisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId,
-                            application::RdmaMemoryRegion);
+                            application::RdmaMemoryRegion, uint64_t epoch);
   void DeregisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId);
 
   // Endpoint management APIs
@@ -122,6 +135,34 @@ class RdmaManager {
   // of queueing onto a dead QP. Returns the number of transfers this call moved
   // to a failed state.
   int FailInFlightTransfers(const QpErrorEvent& event);
+
+  // Takes every connection to `remoteKey` out of service. Each QP is moved to
+  // Error so the peer can no longer write through it, then removed from the route
+  // table so no new session picks it up, and its in-flight transfers are failed.
+  // The QP objects stay allocated: the CQ poller still drains their flush CQEs, and
+  // freeing them under it would race. Registered memory is left untouched, so the
+  // peer can reconnect through the normal handshake.
+  //
+  // The peer also stays fenced: ConnectEndpoint refuses it, in either direction,
+  // until UnfenceRemoteEngine. Cutting the QPs alone is not enough, because a peer
+  // that notices its connection died would rebuild one and keep writing; whatever
+  // it still had queued for the abandoned transfer would then land in memory that
+  // may already belong to someone else.
+  FenceResult FenceRemoteEngine(const EngineKey& remoteKey);
+
+  // Lets a fenced peer connect again. The caller decides when that is safe, which is
+  // once nothing the peer still has queued can reach buffers that were handed out.
+  // Returns whether the peer was fenced, and fills `cut` with the connections the
+  // fences since the last unfence cut, for the peer to retire its ends of them.
+  bool UnfenceRemoteEngine(const EngineKey& remoteKey, CutConnections* cut);
+  // Whether connections with `remoteKey` are currently refused. Callers use it to
+  // refuse early; ConnectEndpoint still enforces it under the lock.
+  bool IsPeerFenced(const EngineKey& remoteKey) const;
+  // `remoteKey` unfenced this engine after cutting `cut`, given in our terms (`localQpns`
+  // are ours). Marks our ends failed: an idle QP would otherwise look live until its next
+  // transfer failed after the transport's retries. Endpoints built since are not in
+  // `cut`, so they stay. Returns how many were marked.
+  int RetireEndpointsCutByPeer(const EngineKey& remoteKey, const CutConnections& cut);
 
   /* -------------------------------- Peer failure -------------------------------- */
   // Takes the oldest recorded failure; polled by an application thread.
@@ -154,6 +195,20 @@ class RdmaManager {
   std::atomic<EndpointId> nextEndpointId_{1};
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> endpointsById_;
   std::atomic<uint64_t> endpointsEpoch_{0};
+  // Peers fenced and not yet unfenced; guarded by `mu`, like `remotes`, so the
+  // fence and the check in ConnectEndpoint cannot interleave.
+  std::unordered_set<EngineKey> fencedPeers_;
+  // Endpoints a fence took out of the route table but could not move to Error. They
+  // are no longer in rTable, so only this keeps a later fence from reporting the peer
+  // cut off; every fence retries them, and unfencing keeps them, since the peer can
+  // still write through them. Guarded by `mu`.
+  std::unordered_map<EngineKey, EpPairVec> uncutEndpoints_;
+  // Connections cut by fences since the peer was last unfenced. Guarded by `mu`.
+  std::unordered_map<EngineKey, CutConnections> cutConnections_;
+  // Per peer, the number of fences so far: see RemoteMemoryEpoch. Guarded by `mu`.
+  std::unordered_map<EngineKey, uint64_t> remoteMemoryEpochs_;
+  // Serializes fences, so a fence never returns while another one is still cutting.
+  std::mutex fenceMu_;
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};
@@ -182,6 +237,11 @@ class NotifManager {
   void RegisterDevice(int devId);
 
   bool PopInboundTransferStatus(const EngineKey&, TransferUniqueId, TransferStatus*);
+
+  // While a peer is fenced, its notifications are dropped, and fencing forgets those
+  // already counted: a peer that restarts numbers its transfers from zero again, and
+  // an old count must not report one of its new transfers complete.
+  void SetPeerFenced(const EngineKey&, bool fenced);
 
   void MainLoop();
   void Start();
@@ -241,6 +301,7 @@ class NotifManager {
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> registeredRuntimes_;
   std::unordered_map<EndpointId, QpNotifContext> notifCtxById_;
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
+  std::unordered_set<EngineKey> fencedPeers_;
 
   std::unordered_map<TransferStatus*, int> localNotif;
 
@@ -270,6 +331,16 @@ class ControlPlaneServer {
 
   // Endpoint management
   void BuildRdmaConn(EngineKey, TopoKeyPair, int nicRank);
+
+  // Tells `ekey` this engine has unfenced it, and which of its connections were cut.
+  // Best effort: an unreachable peer is only logged, after at most the control-plane
+  // timeout.
+  void NotifyUnfenced(const EngineKey& ekey, const CutConnections& cut) noexcept;
+  // Called with the sender's key, and the connections it cut in our terms (`localQpns`
+  // are ours), when a peer reports it has unfenced this engine. Set before Start().
+  void SetUnfencedHandler(std::function<void(const EngineKey&, const CutConnections&)> handler) {
+    onUnfenced = std::move(handler);
+  }
 
   // MemoryRegion management
   void RegisterMemory(MemoryDesc&);
@@ -302,6 +373,7 @@ class ControlPlaneServer {
   NotifManager* notif{nullptr};
   std::unordered_map<EngineKey, EngineDesc> engines;
   std::unordered_map<MemoryUniqueId, MemoryDesc> mems;
+  std::function<void(const EngineKey&, const CutConnections&)> onUnfenced;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -372,6 +444,8 @@ class RdmaBackend : public Backend {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
   bool PopPeerFailure(PeerFailureEvent* out) override;
+  FenceResult FenceRemoteEngine(const EngineKey& remote) override;
+  bool UnfenceRemoteEngine(const EngineKey& remote) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
  private:
@@ -423,6 +497,9 @@ class RdmaBackend : public Backend {
   // Records a replacement of failed QPs to `key` and returns how long the next one waits;
   // with `enforce`, throws QpReplacementBackoff instead while the last one says to wait.
   std::chrono::milliseconds PaceQpReplacement(const ConnBuildKey& key, bool enforce);
+  // `remote` unfenced this engine: the QP failures toward it were its fence, so replacing
+  // them need not wait out the pacing or a pending retry.
+  void ForgetQpReplacementBackoff(const EngineKey& remote);
   RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
   std::shared_ptr<std::mutex> GetConnBuildLock(const EngineKey& remoteEngineKey,

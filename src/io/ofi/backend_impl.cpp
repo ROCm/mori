@@ -1019,6 +1019,18 @@ bool OfiBackend::PopInboundTransferStatus(EngineKey /*remote*/, TransferUniqueId
   return false;
 }
 
+FenceResult OfiBackend::FenceRemoteEngine(const EngineKey& remote) {
+  // Any peer holding a key of a still-registered MR can write into it, whether or not this
+  // engine registered that peer: the key travels in the MemoryDesc. Deregistering an MR
+  // closes it, which revokes the key.
+  if (remote == myKey_) return FenceResult{};
+  {
+    std::lock_guard<std::mutex> lk(mrMu_);
+    if (localMrs_.empty()) return FenceResult{};
+  }
+  return UncutPath(remote, "OFI", "the OFI backend does not implement fencing");
+}
+
 bool OfiBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
   (void)local;
   // Only route to a peer that advertised OFI endpoints (seeded into the AVs) and
