@@ -30,6 +30,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -2261,10 +2262,17 @@ void RdmaBackend::ServeReadViaWrite(const MessageReadViaWrite& msg, const std::s
   }
   if (n > 0) {
     RdmaBackendSession* sess = GetOrCreateSessionCached(ownerMem, msg.readerMem);
+    // The CQ poller publishes the terminal code before it runs the lifetime
+    // observers, so Wait() can return while it still uses `st`. Destroy `st` only
+    // after the observer below has run.
+    auto released = std::make_shared<std::promise<void>>();
+    std::future<void> pollerDone = released->get_future();
     TransferStatus st;
+    st.AddLifetimeObserver([released](bool) { released->set_value(); });
     sess->PostBatch(msg.ownerOffsets, msg.readerOffsets, msg.sizes, &st, msg.id,
                     /*isRead=*/false, /*notify=*/false);
     st.Wait();
+    pollerDone.wait();
     if (!st.Succeeded()) return fail(st.Code(), st.Message());
   }
   if (msg.notify) notif->MarkInboundComplete(msg.readerKey, msg.id);

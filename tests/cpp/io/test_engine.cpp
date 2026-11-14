@@ -1740,6 +1740,36 @@ void CaseRdmaReadViaWriteBidirectionalConcurrent() {
           "target received wrong bytes");
 }
 
+// Many small reads in flight keep every owner serve thread busy, so one serve call
+// finishes while the CQ poller is still completing another one's status.
+void CaseRdmaReadViaWriteManySingleReads() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ScopedEnvVar failRead("MORI_IO_FAIL_ON_RDMA_READ", "1");
+  ScopedEnvVar readViaWrite("MORI_IO_READ_VIA_WRITE", "1");
+  constexpr size_t kItem = 4096;
+  constexpr int kInFlight = 64;
+  constexpr int kRounds = 400;
+  constexpr size_t kBytes = kItem * kInFlight;
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_rvw_many", true);
+  auto local = RegisterGpuMemory(pair.initiator.get(), kBytes, 0);
+  auto remote = RegisterGpuMemory(pair.target.get(), kBytes, 0);
+  FillDevicePattern(remote.ptr, kBytes, 5);
+
+  auto sess = pair.initiator->CreateSession(local.desc, remote.desc);
+  Require(sess.has_value(), "CreateSession returned no session");
+  for (int r = 0; r < kRounds; ++r) {
+    std::vector<std::unique_ptr<TransferStatus>> st;
+    for (int k = 0; k < kInFlight; ++k) {
+      st.push_back(std::make_unique<TransferStatus>());
+      sess->Read(k * kItem, k * kItem, kItem, st.back().get(), sess->AllocateTransferUniqueId());
+    }
+    for (auto& s : st) RequireSucceeded(s.get(), "single read-via-write");
+  }
+  Require(CopyDeviceToHost(local.ptr, kBytes) == CopyDeviceToHost(remote.ptr, kBytes),
+          "single reads returned wrong bytes");
+}
+
 // Writes kXfer bytes from srcBase + offset to dstBase + offset over the dma-buf
 // registration path and checks the payload landed at dstBase + offset, not at
 // dstBase. Both bases point at allocations of at least allocSize bytes.
@@ -2449,6 +2479,7 @@ int main(int argc, char* argv[]) {
       {"rdma_read_via_write_session_batch_spans_messages",
        CaseRdmaReadViaWriteSessionBatchSpansMessages},
       {"rdma_read_via_write_bidirectional_concurrent", CaseRdmaReadViaWriteBidirectionalConcurrent},
+      {"rdma_read_via_write_many_single_reads", CaseRdmaReadViaWriteManySingleReads},
       {"rdma_dmabuf_interior_range_transfer", CaseRdmaDmabufInteriorRangeTransfer},
       {"rdma_dmabuf_vmm_interior_range_transfer", CaseRdmaDmabufVmmInteriorRangeTransfer},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
