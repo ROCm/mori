@@ -35,13 +35,14 @@
 namespace mori::umbp {
 FabricReadPush::FabricReadPush(TransferEngine* engine, PeerDirectory* peers,
                                BackendRegistry* backends, int device, HostDeviceAddress address,
-                               std::function<void()> quarantine)
+                               std::function<void()> quarantine, bool rdma)
     : engine_(engine),
       peers_(peers),
       backends_(backends),
       device_(device),
       address_(std::move(address)),
-      quarantine_(std::move(quarantine)) {}
+      quarantine_(std::move(quarantine)),
+      rdma_(rdma) {}
 
 FabricReadPush::~FabricReadPush() {
   if (quarantined_) return;
@@ -98,7 +99,7 @@ FabricReadPushResult FabricReadPush::Execute(std::vector<PoolResolvedEntry>* ent
     const uint64_t covered = resolved.covered_size ? resolved.covered_size : resolved.size;
     for (const auto& range : request.ranges[i]) {
       size_t offset = range.source_offset;
-      if (!range.size || range.destination.loc != mori::io::MemoryLocationType::GPU ||
+      if (!range.size || (!rdma_ && range.destination.loc != mori::io::MemoryLocationType::GPU) ||
           !range.destination.HasMemoryDesc() || range.destination.HasHostPtr() ||
           range.destination_offset > range.destination.size ||
           range.size > range.destination.size - range.destination_offset ||
@@ -116,7 +117,9 @@ FabricReadPushResult FabricReadPush::Execute(std::vector<PoolResolvedEntry>* ent
               size_t part = bytes;
               uint64_t source_offset = at;
               TransferRef view = source;
-              if (source.loc == mori::io::MemoryLocationType::CPU) {
+              // RDMA writes straight from the registered source buffer; only
+              // FABRIC needs a GPU address-space alias of pinned host pages.
+              if (!rdma_ && source.loc == mori::io::MemoryLocationType::CPU) {
                 const uintptr_t base = reinterpret_cast<uintptr_t>(source.host_ptr);
                 const size_t chunk = HostRegistrationChunkBytes();
                 const uintptr_t begin = chunk ? std::max(base, (base + at) / chunk * chunk) : base;

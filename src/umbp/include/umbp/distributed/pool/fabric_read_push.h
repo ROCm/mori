@@ -62,10 +62,15 @@ class FabricReadPush {
  public:
   using HostDeviceAddress = std::function<void*(const void*, size_t, int)>;
   FabricReadPush(TransferEngine* engine, PeerDirectory* peers, BackendRegistry* backends,
-                 int device, HostDeviceAddress address, std::function<void()> quarantine);
+                 int device, HostDeviceAddress address, std::function<void()> quarantine,
+                 bool rdma = false);
   ~FabricReadPush();
   FabricReadPushResult Execute(std::vector<PoolResolvedEntry>* entries,
                                const FabricReadPushRequest& request);
+  // RDMA mode: the owner posts RDMA WRITEs from its registered source buffers
+  // straight into the reader's registered destination (host or GPU), so a
+  // remote get never needs RDMA READ.  Otherwise the FABRIC (UALink) path.
+  bool Rdma() const { return rdma_; }
 
  private:
   TransferEngine* engine_;
@@ -74,6 +79,7 @@ class FabricReadPush {
   int device_;
   HostDeviceAddress address_;
   std::function<void()> quarantine_;
+  bool rdma_ = false;
   // Registration metadata only, never payload. Fixed bound; overflow is scoped
   // to the read. Backend allocations/host aliases are stable until shutdown.
   std::atomic<bool> quarantined_{false};

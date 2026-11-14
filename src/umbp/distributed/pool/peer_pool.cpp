@@ -43,6 +43,10 @@
 
 namespace mori::umbp {
 
+bool PeerPool::ReadPushRdma() const {
+  return fabric_read_push_ != nullptr && fabric_read_push_->Rdma();
+}
+
 namespace {
 
 // How long a retryable eviction demotion keeps retrying before its copy is
