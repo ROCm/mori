@@ -510,6 +510,14 @@ void IonicQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
   attr.qp_state = IBV_QPS_RTS;
   attr.timeout = 14;
   attr.retry_cnt = 7;
+  // Local ACK timeout (4.096 us * 2^timeout) and retry count of the ionic EP QPs. The timeout
+  // bounds how long a QP stalls when the last packet of a message is dropped on a lossy fabric.
+  if (const char* v = std::getenv("MORI_IONIC_QP_TIMEOUT")) {
+    attr.timeout = static_cast<uint8_t>(std::atoi(v));
+  }
+  if (const char* v = std::getenv("MORI_IONIC_QP_RETRY_CNT")) {
+    attr.retry_cnt = static_cast<uint8_t>(std::atoi(v));
+  }
   attr.rnr_retry = 7;
   attr.max_rd_atomic = 15;
   attr.sq_psn = remote_handle.psn;
