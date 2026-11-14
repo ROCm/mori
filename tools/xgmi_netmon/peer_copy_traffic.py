@@ -28,8 +28,9 @@ Phases (10 s each, 5 s apart): GPU0->GPU1, GPU1->GPU0, ring i->i+1 on all GPUs.
 Prints one JSON line per phase with wall-clock start/end and the bytes copied per pair; compare
 with sum_over_time(xgmi_bytes{...}[end-start]) at `end`.
 
-Result on MI355X (2026-11-13): sender wr = receiver rd = 1.118x the copied bytes, and 0.569x in
-the opposite direction on both ends.
+Result on MI355X, one pair at a time: sender wr = receiver rd = 1.134x the copied bytes on
+n06-21 (1.118x on Crusoe v3-088), and 0.57x in the opposite direction. With several flows at once
+see the README: only the sender's wr stays exact.
 """
 import json
 import time

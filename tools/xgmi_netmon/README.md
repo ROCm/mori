@@ -80,9 +80,24 @@ with a partial record; `import` drops it. A recorder that died leaves `status: r
   host time. A missed snapshot loses no bytes; the interval just gets longer.
 - No point for an interval where a counter went down (driver reload) or where the rate is above
   2x the link max (not physical); both are counted.
-- Values are link bytes, not payload. With `peer_copy_traffic.py`: a copy shows 1.118x its payload
-  as sent (sender's `xgmi_write`) = received (receiver's `xgmi_read`), and 0.569x in the opposite
-  direction. One GPU0->GPU1 copy ran at 59.9 GB/s payload; the link max is 72 GB/s per direction.
+- `xgmi_write_data_acc` is what a GPU sent on a link, `xgmi_read_data_acc` what it received. Both
+  count link bytes, not payload.
+- Use the sender's `xgmi_write`. Checked with torch peer copies of known size on n06-21, GPUs 4-7,
+  33 isolated random segments of 1-2 s (1-4 pairs at once, 16/64/256 MB blocks):
+
+  | | counter / copied bytes |
+  |---|---|
+  | one-way copy, sender's `xgmi_write` | 1.1343 ± 0.0003, same for every block size |
+  | reverse link of a one-way copy | 0.569 ± 0.001 |
+  | both directions copying at once | 1.14–1.43: no fixed factor |
+  | receiver's `xgmi_read` / sender's `xgmi_write`, same link | 0.70–1.30 per segment |
+
+  The receiver's `xgmi_read` follows the sender within 0-10 ms when one flow arrives, but when a
+  GPU receives several flows at once it can be off by up to 30 % in a 1-2 s window (per link and in
+  total; over 60 s each link stays within 1.6 %). Cause unknown. So "received" is computed as what
+  the peers' `xgmi_write` sent to the GPU.
+- Payload = sent / 1.134 holds only for one-way traffic (1.118 on Crusoe v3-088, a VM with a
+  newer driver). One copy ran at 61 GB/s payload; the link max is 72 GB/s per direction.
 - Series: `xgmi_bytes`, `xgmi_rate_bytes_per_second` (labels experiment, host, gpu, peer,
   dir = wr | rd) and `xgmi_interval_seconds` (per GPU). Point time = wall clock of the read
   that first saw the snapshot. Both the push and `import` write VictoriaMetrics' `/api/v1/import`
@@ -90,10 +105,10 @@ with a partial record; `import` drops it. A recorder that died leaves `status: r
 
 ## Dashboard
 
-Pick experiment, host, GPU. Sent matrix (row GPU -> column GPU, average over the range), sent
-GPU -> GPU over time, sent per GPU, one row per GPU by peer with the 2 ms peak (red dashed),
-and diagnostics (longest sampling interval). Only sent is shown: the receiver's read counter has
-the same bytes.
+Pick experiment, host, GPU. Sent matrix (row GPU -> column GPU, average over the range); sent and
+received per GPU as bars (average GB/s over the range; received = what the peers sent to it); sent
+GPU -> GPU over time; sent per GPU; one row per GPU by peer with the 2 ms peak (red dashed); and
+diagnostics (longest sampling interval). All panels use the senders' `xgmi_write`.
 
 ## Measured on n06-21 (MI355X, 8 GPUs, idle)
 

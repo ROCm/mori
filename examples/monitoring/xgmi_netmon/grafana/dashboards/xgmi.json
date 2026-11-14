@@ -87,7 +87,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "Pick **experiment → host**. **XGMI per link** from `gpu_metrics` (PMFW refreshes it every 2 ms). **Sent** = `xgmi_write_data_acc` of the row GPU; the peer's received counter shows the same bytes (checked on both ends of every link), so only sent is shown. Values are link bytes, not payload: a GPU-to-GPU copy shows ≈1.12× its payload in its direction plus ≈0.57× in the opposite direction (torch peer copies, MI355X). Solid = average per bin, red dashed = highest single 2 ms interval, gaps = no data."
+        "content": "Pick **experiment → host**. **XGMI per link** from `gpu_metrics` (PMFW refreshes it every 2 ms). Everything is computed from the sender's `xgmi_write_data_acc`: sent by the row GPU, and received = what its peers sent to it. Values are link bytes, not payload: a one-way copy shows 1.134× its payload (plus 0.57× on the reverse link); with both directions busy there is no fixed factor (MI355X, measured). Solid = average per bin, red dashed = highest single 2 ms interval, gaps = no data."
       }
     },
     {
@@ -98,7 +98,7 @@
         "type": "prometheus",
         "uid": "xgmi-vm"
       },
-      "description": "Average over the selected time range. Row = GPU, column = peer GPU on the other end of the link. Link bytes (≈1.12× payload, see the note on top).",
+      "description": "Average over the selected time range. Row = sending GPU, column = receiving GPU. Sender's xgmi_write_data_acc; link bytes, not payload.",
       "gridPos": {
         "x": 0,
         "y": 2,
@@ -195,7 +195,7 @@
       "id": 12,
       "type": "barchart",
       "title": "Sent and received per GPU (average over selected range, all links)",
-      "description": "Average bandwidth over the selected range: bytes over all links of the GPU / time of its valid intervals. Sent = xgmi_write_data_acc, received = xgmi_read_data_acc. Link bytes, not payload.",
+      "description": "Average over the selected range, all links. Sent = this GPU's xgmi_write over its links; received = what its peers' xgmi_write sent to it (the receiver's own xgmi_read is not reliable over short windows when several flows arrive at once). Link bytes, not payload.",
       "datasource": {
         "type": "prometheus",
         "uid": "xgmi-vm"
@@ -216,7 +216,7 @@
           "instant": true,
           "range": false,
           "format": "table",
-          "expr": "label_replace(sum by (gpu, dir) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__range])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__range])), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
+          "expr": "label_replace((label_replace(sum by (gpu) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[$__range])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[$__range]))), \"dir\", \"sent\", \"\", \"\")) or (sum by (gpu, dir) (label_replace(label_replace(sum by (peer) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",peer=~\"$gpu\",dir=\"wr\"}[$__range])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[$__range]))), \"gpu\", \"$1\", \"peer\", \"(.*)\"), \"dir\", \"received\", \"\", \"\"))), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
         }
       ],
       "transformations": [
@@ -233,14 +233,12 @@
           "id": "organize",
           "options": {
             "renameByName": {
-              "gpu\\dir": "GPU ID",
-              "wr": "sent",
-              "rd": "received"
+              "gpu\\dir": "GPU ID"
             },
             "indexByName": {
               "gpu\\dir": 0,
-              "wr": 1,
-              "rd": 2
+              "sent": 1,
+              "received": 2
             }
           }
         },
