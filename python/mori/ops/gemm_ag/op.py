@@ -77,6 +77,7 @@ from ._gemm_a16w16_8wave import (
     compile_bf16_gemm_ag,
     pick_chunks,
     pick_tile,
+    tile_constants,
     tile_grid,
 )
 from .kernels_fused import compile_fused_gemm_ag, compile_gemm_local
@@ -206,16 +207,9 @@ class GemmAgOp:
             self.m_granule = M_GRANULE
         self.m_max = self.padded_m(m_max)
         if self.tile is not None:
-            bm, bn = self.tile
-            if self.in_dtype == "fp8" and (
-                bn != N_GRANULE
-                or bm != (MXFP8_BLOCK_M if quant == "mxfp8" else bm)
-                or bm not in (128, 256)
-            ):
-                raise ValueError(
-                    f"tile={self.tile}: the fp8 GEMM takes BLOCK_N=256 and "
-                    f"BLOCK_M 128 or 256 (256 under mxfp8)"
-                )
+            why = _tile_constraint(self.tile, in_dtype, quant, out_dtype)
+            if why is not None:
+                raise ValueError(f"tile={self.tile}: {why}")
         # Validates the tile against the layout before anything is allocated.
         self.window_bytes = self._cfg(self.m_max).window_bytes
         try:
@@ -633,6 +627,34 @@ def shape_constraint(
         return f"K={k} must be a multiple of {step} and at least {min_k}"
     if n < 1 or n % N_GRANULE:
         return f"N={n} must be a positive multiple of {N_GRANULE}"
+    return None
+
+
+def _tile_constraint(
+    tile: tuple[int, int], in_dtype: str, quant: str, out_dtype: str
+) -> str | None:
+    """Why a pinned ``(BLOCK_M, BLOCK_N)`` cannot be built, or None.
+
+    The bf16 rule is the GEMM's own (``tile_constants``). The layout check
+    that follows asks only for a BLOCK_M that is a multiple of 128, so without
+    this a BLOCK_M of 384 constructed and failed when the first call compiled.
+    """
+    bm, bn = tile
+    if in_dtype == "fp8":
+        if (
+            bn != N_GRANULE
+            or bm not in (128, 256)
+            or (quant == "mxfp8" and bm != MXFP8_BLOCK_M)
+        ):
+            return (
+                "the fp8 GEMM takes BLOCK_N=256 and BLOCK_M 128 or 256 "
+                "(256 under mxfp8)"
+            )
+        return None
+    try:
+        tile_constants(bm, bn, out_dtype)
+    except ValueError as e:
+        return str(e)
     return None
 
 
