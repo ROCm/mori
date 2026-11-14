@@ -183,6 +183,11 @@ class EpDispatchCombineConfig:
     # of the shape. Unrelated to max_num_inp_token_per_rank, which is the
     # capacity. Read only when internode_kernel == "auto".
     internode_auto_ll_max_tokens: int = 512
+    # Internode only (hip backend, v2 / v2_ll): dispatch also writes aiter's
+    # moe_sorting tables for this rank's experts, with block_size_M equal to this
+    # value (0 = off), and zeroes the combine input for fused_moe to accumulate
+    # into. op.moe_sort() returns both; dispatch must carry weights.
+    moe_sort_block_m: int = 0
     # Which kernel backend serves this op: "flydsl" (default except on gfx125x,
     # full intranode feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
     # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
@@ -368,6 +373,12 @@ class EpDispatchCombineConfig:
                 f"internode_kernel must be one of {_INTERNODE_KERNELS}, got "
                 f"{self.internode_kernel!r}"
             )
+        if self.moe_sort_block_m < 0:
+            raise ValueError(
+                f"moe_sort_block_m must be >= 0, got {self.moe_sort_block_m}"
+            )
+        if self.moe_sort_block_m and not self.is_internode:
+            raise ValueError("moe_sort_block_m is only supported by the internode path")
         if self.internode_auto_ll_max_tokens < 0:
             raise ValueError(
                 "internode_auto_ll_max_tokens must be >= 0, got "

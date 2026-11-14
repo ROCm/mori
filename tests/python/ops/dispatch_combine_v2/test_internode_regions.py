@@ -66,7 +66,7 @@ _REQUIRED = {
     "cross_device_barrier",
     "inter_node_chunk_flag",
 }
-_OPTIONAL = {"out_scales"}
+_OPTIONAL = {"out_scales", "moe_sort"}
 
 
 def _cfg(**over):
@@ -82,6 +82,7 @@ def _cfg(**over):
         scale_type_size=4,
         num_qp_per_pe=2,
         max_total_recv_tokens=0,
+        moe_sort_block_m=0,
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -98,6 +99,7 @@ _CASES = {
     ),
     "recv_cap_clamped": _cfg(max_total_recv_tokens=256, num_experts_per_token=4),
     "eight_qps": _cfg(num_qp_per_pe=8),
+    "moe_sort": _cfg(moe_sort_block_m=32),
     "two_tokens": _cfg(max_num_inp_token_per_rank=2),
 }
 
@@ -177,6 +179,19 @@ def test_dispatch_slots_use_the_padded_stride(name):
 def test_gpu_per_node_must_divide_the_world():
     with pytest.raises(ValueError):
         internode_regions(_cfg(world_size=16, gpu_per_node=6))
+
+
+@pytest.mark.parametrize("name", sorted(_CASES))
+def test_moe_sort_holds_a_counter_line_and_a_full_bucket_per_expert(name):
+    # MoeSortBuckets: kEpr 128 B counter lines and one line of dispatch epochs, then
+    # kEpr buckets of MaxNumTokensToRecv 8 B entries -- an expert receives a token once.
+    cfg = _CASES[name]
+    regions = dict(internode_regions(cfg))
+    assert ("moe_sort" in regions) == bool(cfg.moe_sort_block_m)
+    if cfg.moe_sort_block_m:
+        epr = cfg.num_experts_per_rank
+        recv = cfg.world_size * cfg.max_num_inp_token_per_rank
+        assert regions["moe_sort"] == epr * 128 + 128 + epr * recv * 8
 
 
 @pytest.mark.parametrize("name", sorted(_CASES))

@@ -824,6 +824,27 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             torch.float32,
         )
 
+        # moe_sort_block_m: aiter's moe_sorting outputs, sized for the largest
+        # tables aiter would allocate for this op (M = every receive row, one
+        # more expert than the world has for a trailing mask sentinel).
+        bm = cfg.moe_sort_block_m
+        self.moe_sort_tables = None
+        if bm:
+            rows = (
+                cfg.effective_max_recv * topk
+                + (cfg.world_size * cfg.num_experts_per_rank + 1) * bm
+            )
+            rows = (rows + bm - 1) // bm * bm
+            self.moe_sort_tables = (
+                torch.empty(rows, **i32),
+                torch.empty(rows, dtype=torch.float32, device=dev),
+                torch.empty(rows // bm, **i32),
+                torch.zeros(2, **i32),
+            )
+            # Rows of the combine input the last FC2 accumulated into; dispatch
+            # zeroes them (the combine input is fused_moe's output here).
+            self.moe_sort_zero_rows = torch.zeros(1, **i32)
+
         # Pin everything fixed for the op's lifetime, now that every buffer it
         # names exists. The launch path re-fills every field passed through
         # `args` on every call -- only bound values reach the plan's cached
@@ -869,6 +890,25 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append(
                 f"quant_type={cfg.quant_type!r} (the internode combine is unquantised)"
             )
+        if cfg.moe_sort_block_m:
+            from .dispatch_combine_op import WAVE
+
+            # Lane topk + j buckets expert slot j; sorted ids keep the row in 24 bits.
+            if 2 * cfg.num_experts_per_token > WAVE:
+                bad.append(
+                    f"moe_sort_block_m with num_experts_per_token="
+                    f"{cfg.num_experts_per_token} (needs 2 * topk <= {WAVE})"
+                )
+            if cfg.effective_max_recv >= 1 << 24:
+                bad.append("moe_sort_block_m with 2^24 or more receive rows")
+            if cfg.gpu_per_node > 16:
+                bad.append("moe_sort_block_m with more than 16 GPUs per node")
+            # The finalize reads one expert's counter per lane.
+            if cfg.num_experts_per_rank > WAVE:
+                bad.append(
+                    f"moe_sort_block_m with num_experts_per_rank="
+                    f"{cfg.num_experts_per_rank} (needs <= {WAVE})"
+                )
         # The internode kernel lays the scale rows down PACKED, and recv_scales()
         # hands them back as an int32 view; a row that is not a whole number of
         # dwords has no such view, and rounding it up runs off the region.
@@ -1035,6 +1075,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """AsyncLL's own range. Checked before the arena or the communicator is
         taken, like every other gate here."""
         bad = []
+        if cfg.moe_sort_block_m:
+            bad.append("moe_sort_block_m (v2 / v2_ll only)")
         # Shares the internode kernels' dtype and feature range -- it reduces the
         # same way and stages through the same slots -- except packed fp4, which
         # only the v2/v2_ll dispatch carries.
@@ -1287,6 +1329,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             numQpPerPe=active_qps,
             numQpToDrain=num_qp_to_drain,
             noRdmaAtomics=getattr(self, "_no_rdma_atomics", False),
+            moeSort=bool(cfg.moe_sort_block_m),
             quantType=(
                 cfg.quant_type.replace("_", "").lower()
                 if cfg.quant_type != "none"
@@ -1361,11 +1404,68 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             interNodeBlocksBarrier=ptr(self.inter_blocks_barrier),
             crossDeviceBarrierFlag=ptr(self.cross_device_flag),
             dispReceiverIdxMap=ptr(self.disp_receiver_idx_map),
+            **self._moe_sort_static_args(),
             # The HOST struct, not DevCommHandle.ptr (the device-side copy): the args
             # embed a ccoDevComm by value, so the binding memcpys from host memory.
             devComm=self._dev_comm._dev_comm.host_ptr,
         )
         return self._internode_static_cache
+
+    def _moe_sort_static_args(self):
+        if getattr(self, "moe_sort_tables", None) is None:
+            return {}
+        ids, weights, expert_ids, num_valid = self.moe_sort_tables
+        return dict(
+            offMoeSort=self.arena.offset("moe_sort"),
+            sortBlockM=self.cfg.moe_sort_block_m,
+            sortZeroRowBytes=self.cfg.hidden_dim * self.cfg.combine_elem_size,
+            sortedTokenIds=ids.data_ptr(),
+            sortedWeights=weights.data_ptr(),
+            sortedExpertIds=expert_ids.data_ptr(),
+            sortNumValid=num_valid.data_ptr(),
+            sortZeroState=self.moe_sort_zero_rows.data_ptr(),
+            sortZeroOut=self.arena.local_ptr(self._region("out_tok")),
+        )
+
+    def moe_sort(self, num_rows=None, num_experts=None):
+        """aiter's moe_sorting outputs for the last dispatch (moe_sort_block_m).
+
+        Returns (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+        moe_buf), each sliced to the size aiter's own sort would allocate for
+        topk_ids of `num_rows` rows (default: every receive row) and an expert
+        mask of `num_experts` entries (default: world_size * experts per rank).
+        sorted_expert_ids holds local expert ids, as with expert_mask, and
+        num_valid_ids[1] is the received row count. moe_buf is combine_in_view(),
+        zero in every row fused_moe can write: pass it as fused_moe's output and
+        then to combine(), which then has nothing to copy.
+        """
+        if getattr(self, "moe_sort_tables", None) is None:
+            raise RuntimeError("moe_sort() needs moe_sort_block_m > 0")
+        cfg = self.cfg
+        bm = cfg.moe_sort_block_m
+        m = cfg.effective_max_recv if num_rows is None else num_rows
+        e = (
+            cfg.world_size * cfg.num_experts_per_rank
+            if num_experts is None
+            else num_experts
+        )
+        topk = cfg.num_experts_per_token
+        rows = m * topk + e * bm - topk
+        rows = (rows + bm - 1) // bm * bm
+        ids, weights, expert_ids, num_valid = self.moe_sort_tables
+        moe_buf = self.combine_in_view()
+        if rows > ids.numel() or m > moe_buf.shape[0]:
+            raise ValueError(
+                f"moe_sort(num_rows={m}, num_experts={e}) exceeds the tables "
+                f"allocated for {moe_buf.shape[0]} rows"
+            )
+        return (
+            ids[:rows],
+            weights[:rows],
+            expert_ids[: rows // bm],
+            num_valid,
+            moe_buf[:m],
+        )
 
     # -- AsyncLL ---------------------------------------------------------
     #
@@ -1516,6 +1616,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         request["mpCount"] = self._multi_processor_count
         # AsyncLL has no write-signalling variant; cross-node ones are refused in the gate.
         request["noRdmaAtomics"] = False
+        request["moeSort"] = False
         request["asyncLlMode"] = self._asyncll_mode
         request["asyncLlFusedRecvCtas"] = self._asyncll_fused_ctas
         return request
@@ -1971,6 +2072,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # number of node slots holding other tokens' weights.
             if phase == "dispatch":
                 weights, indices = kwargs.get("weights"), kwargs.get("indices")
+                if weights is None and self.cfg.moe_sort_block_m:
+                    raise ValueError("moe_sort_block_m needs dispatch weights")
                 self._internode_has_weights = weights is not None
                 # The TENSOR, not just its address: combine dereferences this
                 # pointer on a LATER call, and nothing else keeps the caller's
