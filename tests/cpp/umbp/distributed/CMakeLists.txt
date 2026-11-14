@@ -326,6 +326,10 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_pool_client_ranges COMMAND test_umbp_pool_client_ranges)
 
+add_executable(test_umbp_direct_pool_get test_direct_pool_get.cpp)
+target_link_libraries(test_umbp_direct_pool_get PRIVATE umbp_common GTest::gtest_main)
+add_test(NAME umbp_direct_pool_get COMMAND test_umbp_direct_pool_get)
+
 # test_umbp_ssd_ranged_io — ranged multi-buffer I/O on an SSD-medium node
 # (doc/design-ssd-ranged-io.md, D0): the capability flag now turning on the
 # arena alone, plus local and remote ranged put/get against an SSD-only peer.

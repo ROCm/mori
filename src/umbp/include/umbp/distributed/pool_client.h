@@ -60,6 +60,7 @@ class WorkloadTraceRecorder;
 class PeerServiceServer;
 class PeerPool;
 class KvIndexerReporter;
+class DirectPoolGetCache;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -272,6 +273,7 @@ class PoolClient {
   enum class PutEntryOutcome { kFailed, kSucceeded, kAlreadyExists };
 
  private:
+  friend class DirectPoolGetTest;
   PoolClientConfig config_;
   std::shared_ptr<PoolPlatform> platform_;
   std::atomic<bool> initialized_{false};
@@ -808,6 +810,7 @@ class PoolClient {
     int numa_node_ = -1;
   };
 
+  std::unique_ptr<DirectPoolGetCache> direct_pool_get_cache_;
   // PoolClientConfig::ranged_{get,put}_scratch, held by pointer because an
   // arena owns a mutex.
   std::vector<std::unique_ptr<ScratchArena>> ranged_get_scratch_;
@@ -876,6 +879,10 @@ class PoolClient {
     // and is the only user.
     const TransferRef* dst_ref = nullptr;
     uint64_t dst_ref_offset = 0;
+    // Ranged direct GET maps logical object offsets onto backend pages.
+    MediumBackend* dst_backend = nullptr;
+    const std::vector<PageLocation>* dst_pages = nullptr;
+    size_t dst_page_size = 0;
     RouteGetResult route;
 
     size_t DstBytes() const { return dst_bytes != 0 ? dst_bytes : size; }
@@ -986,6 +993,16 @@ class PoolClient {
   void ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                            const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
                            std::vector<bool>* results, bool recache_remote = true);
+
+  // Fetch missing intervals into private pool slots, then scatter with reader holds.
+  // Return key indices in missed order that need scratch because no private slot was available.
+  std::vector<size_t> ServeRangesFromDirectPool(
+      const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& offsets, const std::vector<size_t>& missed,
+      const std::vector<std::optional<RouteGetResult>>& routes, std::vector<bool>* results,
+      double* remote_bytes,
+      const std::function<void(const BatchGetPlan&, std::vector<bool>*)>& fetch = {});
 
   // The remote half of ExecuteBatchGetPlan: submit every peer, then wait every
   // peer.  Split out for the ranged path, whose plan has no local half by

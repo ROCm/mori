@@ -323,6 +323,9 @@ struct PoolClientConfig {
   // UMBPDistributedConfig::ranged_locality_prefetch for why it is not folded
   // into cache_remote_fetches.
   bool ranged_locality_prefetch = true;
+  // Opt-in DRAM ranged reads: fetch missing intervals into private pool pages.
+  bool direct_pool_get = false;
+  size_t direct_pool_get_cache_bytes = 1ULL << 30;
 
   // Resolve on this node's own media before asking the master to route, and
   // skip the master entirely when the whole batch is local.  See
