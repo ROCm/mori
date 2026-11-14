@@ -212,6 +212,66 @@ TEST(PageBitmapAllocatorTest, AllocateFailsWhenTotalCapacityInsufficient) {
   }
 }
 
+// Fills the first of a pair of 8-page buffers, then frees `free_pages`.
+std::vector<PageLocation> FillThenFree(PageBitmapAllocator& alloc,
+                                       const std::vector<uint32_t>& free_pages) {
+  auto all = alloc.Allocate(8, std::nullopt);
+  EXPECT_TRUE(all.has_value());
+  std::vector<PageLocation> freed;
+  for (uint32_t index : free_pages) freed.push_back((*all)[index]);
+  alloc.Deallocate(freed);
+  return *all;
+}
+
+TEST(PageBitmapAllocatorTest, FailedRunSearchIsRememberedPerBuffer) {
+  auto alloc = MakeAllocator(2, 8);
+  FillThenFree(alloc, {0, 2, 4, 6});
+  EXPECT_EQ(alloc.Buffers()[0].no_run_at_least, UINT32_MAX);
+
+  auto large = alloc.Allocate(3, std::nullopt);
+  ASSERT_TRUE(large.has_value());
+  EXPECT_EQ((*large)[0].buffer_index, 1u);
+  EXPECT_EQ(alloc.Buffers()[0].no_run_at_least, 3u);
+  EXPECT_EQ(alloc.Buffers()[1].no_run_at_least, UINT32_MAX);
+
+  auto smaller = alloc.Allocate(2, std::nullopt);
+  ASSERT_TRUE(smaller.has_value());
+  EXPECT_EQ((*smaller)[0].buffer_index, 1u);
+  EXPECT_EQ(alloc.Buffers()[0].no_run_at_least, 2u);
+}
+
+TEST(PageBitmapAllocatorTest, FailedRunSearchDoesNotHideASmallerRun) {
+  auto alloc = MakeAllocator(2, 8);
+  FillThenFree(alloc, {2, 3, 6});
+
+  auto large = alloc.Allocate(3, std::nullopt);
+  ASSERT_TRUE(large.has_value());
+  EXPECT_EQ((*large)[0].buffer_index, 1u);
+
+  auto run = alloc.Allocate(2, std::nullopt);
+  ASSERT_TRUE(run.has_value());
+  EXPECT_EQ((*run)[0].buffer_index, 0u);
+  EXPECT_EQ((*run)[0].page_index, 2u);
+  EXPECT_EQ((*run)[1].page_index, 3u);
+}
+
+TEST(PageBitmapAllocatorTest, FreeingAPageMakesTheBufferSearchableAgain) {
+  auto alloc = MakeAllocator(2, 8);
+  const auto first_buffer = FillThenFree(alloc, {0, 2, 4, 6});
+
+  auto elsewhere = alloc.Allocate(2, std::nullopt);
+  ASSERT_TRUE(elsewhere.has_value());
+  EXPECT_EQ((*elsewhere)[0].buffer_index, 1u);
+
+  alloc.Deallocate({first_buffer[1]});
+  EXPECT_EQ(alloc.Buffers()[0].no_run_at_least, UINT32_MAX);
+
+  auto run = alloc.Allocate(2, std::nullopt);
+  ASSERT_TRUE(run.has_value());
+  EXPECT_EQ((*run)[0].buffer_index, 0u);
+  EXPECT_EQ((*run)[0].page_index, 0u);
+}
+
 TEST(PageBitmapAllocatorTest, AllocateAllOrNothingPartialFitFails) {
   // Two buffers of 2 pages each (4 total).  Pre-allocate 2 pages so total
   // free drops to 2.  A subsequent request for 3 must fail entirely without

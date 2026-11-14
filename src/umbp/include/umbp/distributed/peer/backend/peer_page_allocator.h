@@ -79,6 +79,11 @@ class PageBitmapAllocator : public PagePool {
     // they find a run exactly when the old scan would have.  Only the CHOSEN
     // run differs, and no caller depends on which free pages it gets.
     uint32_t cursor = 0;
+    // Smallest run proven absent since this buffer last freed a page.  A failed
+    // search leaves the cursor in place, so on a nearly full buffer it would
+    // rescan the whole bitmap for every key of a batch, under the owner's lock.
+    // Allocating cannot create a run, so this stays true until a free.
+    uint32_t no_run_at_least = UINT32_MAX;
   };
 
   // Construct an allocator from a list of per-buffer byte sizes.
@@ -144,6 +149,7 @@ class PageBitmapAllocator : public PagePool {
       if (!buf.bitmap[p.page_index]) continue;  // already free — idempotent no-op
       buf.bitmap[p.page_index] = false;
       ++buf.free_count;
+      buf.no_run_at_least = UINT32_MAX;
     }
   }
 
@@ -180,8 +186,12 @@ class PageBitmapAllocator : public PagePool {
                                                                    bool contiguous) {
     std::optional<uint32_t> start;
     if (contiguous) {
+      if (count >= buf.no_run_at_least) return std::nullopt;
       start = FindContinuousFreeRun(buf, count);
-      if (!start) return std::nullopt;
+      if (!start) {
+        buf.no_run_at_least = count;
+        return std::nullopt;
+      }
     }
     const auto indices = contiguous ? std::vector<uint32_t>{} : CollectFirstNFree(buf, count);
     std::vector<PageLocation> pages;
