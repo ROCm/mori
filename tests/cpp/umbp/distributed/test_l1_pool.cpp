@@ -60,6 +60,14 @@ class RecordingApi final : public MemoryApi {
     return host_->Copy(dst_device, dst, src_device, src, bytes, error);
   }
 
+  bool CopyMany(int dst_device, int src_device, const std::vector<CopyJob>& jobs,
+                std::string* error) override {
+    for (const CopyJob& job : jobs) {
+      ++copy_jobs;
+      max_rows = std::max(max_rows, job.rows);
+    }
+    return MemoryApi::CopyMany(dst_device, src_device, jobs, error);
+  }
   bool Synchronize(int device, std::string* error) override {
     ++synchronizes;
     return host_->Synchronize(device, error);
@@ -77,6 +85,8 @@ class RecordingApi final : public MemoryApi {
 
   std::map<int, uint8_t*> bases;
   int copies = 0;
+  int copy_jobs = 0;
+  uint64_t max_rows = 0;
   int synchronizes = 0;
   bool fail_copies = false;
 
@@ -240,6 +250,66 @@ TEST_F(L1PoolTest, FetchCopiesEveryRegionAndCachesTheSlots) {
   EXPECT_EQ(p1.held, 0u);
   EXPECT_EQ(p1.fetched_in_slots, 3u);
   EXPECT_EQ(StatsOf("p0").served_out_slots, 3u);
+}
+
+// Regions of one size at a constant distance are the rows of one rectangle,
+// so a scattered block costs a copy per rectangle, not per region -- between
+// pools of different sizes too, where the distance differs on the two sides.
+TEST(L1RectangleTest, EquallySpacedRegionsOfOneSizeCopyAsOneRectangle) {
+  constexpr uint64_t kUnit = 8, kTail = 3;
+  auto api = std::make_shared<RecordingApi>();
+  PoolManager manager(api);
+  auto layout = [&](uint32_t slots) {
+    Layout out;
+    out.num_slots = slots;
+    for (uint64_t r = 0; r < 3; ++r) out.regions.push_back(Region{r * slots * kUnit, kUnit});
+    out.regions.push_back(Region{3 * slots * kUnit, kTail});
+    return out;
+  };
+  const uint32_t slots[2] = {8, 6};
+  for (int device : {0, 1}) {
+    const std::string id = "r" + std::to_string(device);
+    const uint64_t bytes = slots[device] * (3 * kUnit + kTail);
+    ASSERT_TRUE(manager.Attach(id, "g", device, bytes).status.ok);
+    ASSERT_TRUE(manager.BindLayout(id, layout(slots[device])).ok);
+    ASSERT_EQ(manager.Open(id).num_slots, slots[device]);
+  }
+  auto piece = [&](int device, uint32_t slot, uint64_t region) {
+    return api->bases[device] + region * slots[device] * kUnit +
+           slot * (region < 3 ? kUnit : kTail);
+  };
+  // Cached as c, a, b, so fetching a, b, c walks slots 1, 2, 0.
+  AllocateResult got = manager.Allocate("r0", 3);
+  ASSERT_EQ(got.slots.size(), 3u);
+  const std::vector<std::string> names = {"c", "a", "b"};
+  std::vector<Op> ops;
+  for (size_t i = 0; i < 3; ++i) {
+    for (uint64_t region = 0; region < 4; ++region) {
+      std::memset(piece(0, got.slots[i], region), static_cast<int>(names[i][0] + region),
+                  region < 3 ? kUnit : kTail);
+    }
+    ops.push_back(Op{OpKind::kPublish, got.slots[i], names[i]});
+  }
+  for (uint32_t slot : got.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
+  ASSERT_TRUE(manager.Apply("r0", ops).ok);
+
+  FetchResult fetched = manager.Fetch("r1", {"a", "b", "c"});
+  ASSERT_TRUE(fetched.status.ok);
+  ASSERT_EQ(fetched.slots.size(), 3u);
+  EXPECT_EQ(fetched.copied_bytes, 3 * (3 * kUnit + kTail));
+  const std::string order = "abc";
+  for (size_t i = 0; i < 3; ++i) {
+    for (uint64_t region = 0; region < 4; ++region) {
+      const uint8_t* at = piece(1, fetched.slots[i], region);
+      for (uint64_t b = 0; b < (region < 3 ? kUnit : kTail); ++b) {
+        ASSERT_EQ(at[b], static_cast<uint8_t>(order[i] + region)) << i << " " << region;
+      }
+    }
+  }
+  // Two runs (a and b follow each other, c does not), each a rectangle of the
+  // three equal regions and the odd one on its own.
+  EXPECT_EQ(api->copy_jobs, 4);
+  EXPECT_EQ(api->max_rows, 3u);
 }
 
 TEST_F(L1PoolTest, FetchStopsAtTheFirstKeyNobodyHolds) {
@@ -880,6 +950,23 @@ TEST_F(L1TierTest, OffloadAheadCopiesColdSlotsBeforeTheyAreNeeded) {
   ASSERT_EQ(node_a->Allocate("p0", 4).slots.size(), 4u);
   EXPECT_EQ(store_a->puts, puts);
   EXPECT_EQ(StatsOf(node_a.get(), "p0").dropped_slots, 0u);
+}
+
+TEST_F(L1TierTest, WithoutPeerCopyPoolsShareOnlyThroughTheStore) {
+  TearDown();
+  TierOptions options;
+  options.staging_bytes = 3 * (kUnitA + kUnitB);
+  options.peer_copy = false;
+  options.offload_ahead = 1.0;  // everything settled goes below
+  Build(options);
+  Cache(node_a.get(), "p0", 0, {"a", "b"}, 10);
+  ASSERT_TRUE(Eventually([&] { return InStore("a") && InStore("b"); }));
+  FetchResult fetched = node_a->Fetch("p1", {"a", "b"});
+  ASSERT_EQ(fetched.slots.size(), 2u);
+  EXPECT_EQ(fetched.copied_slots, 0u);
+  EXPECT_EQ(fetched.loaded_slots, 2u);
+  EXPECT_TRUE(Holds(1, fetched.slots[0], 10));
+  EXPECT_EQ(StatsOf(node_a.get(), "p0").served_out_slots, 0u);
 }
 
 TEST_F(L1TierTest, WithoutLoadingAFetchStaysInL1) {

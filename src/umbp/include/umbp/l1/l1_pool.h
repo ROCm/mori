@@ -93,6 +93,33 @@ class MemoryApi {
   // Synchronize of the destination device.
   virtual bool Copy(int dst_device, void* dst, int src_device, const void* src, uint64_t bytes,
                     std::string* error) = 0;
+  // Many copies into one device from one device. A fetch whose slots are
+  // scattered is hundreds of thousands of small copies; an implementation can
+  // take its locks and select the device once for all of them.
+  // A job is `rows` pieces of `bytes`, `src_pitch` apart at the source and
+  // `dst_pitch` apart at the destination. Regions of one size that follow each
+  // other at a constant distance make one such rectangle out of a block, which
+  // a device copies in one command instead of one per region.
+  struct CopyJob {
+    void* dst = nullptr;
+    const void* src = nullptr;
+    uint64_t bytes = 0;
+    uint64_t rows = 1;
+    uint64_t dst_pitch = 0;
+    uint64_t src_pitch = 0;
+  };
+  virtual bool CopyMany(int dst_device, int src_device, const std::vector<CopyJob>& jobs,
+                        std::string* error) {
+    for (const CopyJob& job : jobs) {
+      for (uint64_t row = 0; row < job.rows; ++row) {
+        if (!Copy(dst_device, static_cast<char*>(job.dst) + row * job.dst_pitch, src_device,
+                  static_cast<const char*>(job.src) + row * job.src_pitch, job.bytes, error)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
   // Wait until every copy issued on `device` has landed.
   virtual bool Synchronize(int device, std::string* error) = 0;
   // Host memory to stage bytes on their way to or from the lower store.
@@ -104,6 +131,32 @@ class MemoryApi {
                           std::string* error) = 0;
   virtual bool CopyFromHost(int device, void* dst, const void* host_src, uint64_t bytes,
                             std::string* error) = 0;
+  // Many copies between one device and host memory, as CopyMany's jobs: a
+  // block leaves for the lower store, or comes back, as one rectangle per
+  // group of like regions, straight into the layout the store keeps.
+  virtual bool CopyManyToHost(int device, const std::vector<CopyJob>& jobs, std::string* error) {
+    for (const CopyJob& job : jobs) {
+      for (uint64_t row = 0; row < job.rows; ++row) {
+        if (!CopyToHost(device, static_cast<const char*>(job.src) + row * job.src_pitch,
+                        static_cast<char*>(job.dst) + row * job.dst_pitch, job.bytes, error)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+  virtual bool CopyManyFromHost(int device, const std::vector<CopyJob>& jobs, std::string* error) {
+    for (const CopyJob& job : jobs) {
+      for (uint64_t row = 0; row < job.rows; ++row) {
+        if (!CopyFromHost(device, static_cast<char*>(job.dst) + row * job.dst_pitch,
+                          static_cast<const char*>(job.src) + row * job.src_pitch, job.bytes,
+                          error)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
 };
 
 // The tiers below L1, reached through this process's UMBP store. Values are
@@ -145,6 +198,10 @@ struct TierOptions {
   bool load = true;
   // Ask other nodes' L1 for keys neither this node nor the store holds.
   bool ask_peers = true;
+  // Copy a block straight from another pool of this node that holds it. Off,
+  // pools of a node share only through the store: what an engine sees when
+  // its ranks exchange KV through DRAM and not through HBM.
+  bool peer_copy = true;
 };
 
 std::shared_ptr<MemoryApi> MakeHipMemoryApi();
@@ -383,6 +440,7 @@ class PoolManager {
   // One staging arena; tier transfers take turns on it.
   std::mutex staging_mutex_;
   void* staging_ = nullptr;
+  // Same size, for regrouping a batch between the store's layout and a pool's.
   // Directory changes not yet sent: store key -> added (true) or removed.
   std::unordered_map<std::string, bool> advertise_;
   // Offloaded copies the other nodes have not been told of yet.

@@ -664,6 +664,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     options.offload_on_evict = EnvFlag("UMBP_L1_OFFLOAD_ON_EVICT", true);
     options.load = EnvFlag("UMBP_L1_LOAD", true);
     options.ask_peers = EnvFlag("UMBP_L1_ASK_PEERS", true);
+    options.peer_copy = EnvFlag("UMBP_L1_PEER_COPY", true);
     l1_manager_->SetLowerStore(std::make_shared<L1Store>(*this), options);
   }
 

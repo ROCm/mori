@@ -123,6 +123,7 @@ policy (`UMBP_BACKEND_POLICY`).
 | `UMBP_L1_OFFLOAD_AHEAD` | `0` | fraction | Keep this fraction of every pool either vacant or already copied into the store, by offloading the coldest cached blocks in the background, so an eviction does not wait for the copy. `1` offloads every block once the engine's GPU has finished writing it. |
 | `UMBP_L1_LOAD` | `1` | bool | Look in the store for blocks no L1 pool of this node holds. |
 | `UMBP_L1_ASK_PEERS` | `1` | bool | For blocks neither this node nor the store holds, ask the nodes the master lists as holding them in HBM to copy them into their store. Needs a master. |
+| `UMBP_L1_PEER_COPY` | `1` | bool | Copy a block straight from another L1 pool of this node that holds it. `0` makes the node's pools share only through the store (DRAM / SSD), which is the arrangement to compare L1 sharing against. Only read with `UMBP_L1_LOWER_TIERS=1`. |
 | `UMBP_L1_EXPORT_PORT` | unset | port | TCP port where other nodes ask this one for L1 blocks. Every node must keep the same distance between this port and `UMBP_PEER_SERVICE_PORT`: a node finds another's export port from its peer address. Unset, this node's L1 is not readable from other nodes. |
 
 ## SPDK proxy

@@ -24,10 +24,13 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <thread>
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
@@ -71,6 +74,55 @@ void GuardedVoid(const char* what, Fn&& fn) {
   } catch (...) {
     MORI_UMBP_ERROR("[L1Pool] lower store {} failed", what);
   }
+}
+
+// Where each region's unit starts inside a stored slot.
+std::vector<uint64_t> RegionStarts(const Layout& layout) {
+  std::vector<uint64_t> starts;
+  uint64_t at = 0;
+  for (const Region& region : layout.regions) {
+    starts.push_back(at);
+    at += region.unit_bytes;
+  }
+  return starts;
+}
+
+// Regions `rows` long, starting at `first_region`, that have one unit size and
+// lie a constant distance apart in both layouts: a slot's pieces in them are
+// the rows of one rectangle.
+struct Rectangle {
+  size_t first_region = 0;
+  uint64_t rows = 1;
+  uint64_t dst_pitch = 0;
+  uint64_t src_pitch = 0;
+};
+
+std::vector<Rectangle> Rectangles(const Layout& dst, const Layout& src) {
+  std::vector<Rectangle> out;
+  const size_t count = dst.regions.size();
+  size_t r = 0;
+  while (r < count) {
+    Rectangle rect;
+    rect.first_region = r;
+    const uint64_t unit = dst.regions[r].unit_bytes;
+    while (r + 1 < count && dst.regions[r + 1].unit_bytes == unit &&
+           dst.regions[r + 1].offset > dst.regions[r].offset &&
+           src.regions[r + 1].offset > src.regions[r].offset) {
+      const uint64_t dst_pitch = dst.regions[r + 1].offset - dst.regions[r].offset;
+      const uint64_t src_pitch = src.regions[r + 1].offset - src.regions[r].offset;
+      if (rect.rows == 1) {
+        rect.dst_pitch = dst_pitch;
+        rect.src_pitch = src_pitch;
+      } else if (dst_pitch != rect.dst_pitch || src_pitch != rect.src_pitch) {
+        break;
+      }
+      ++rect.rows;
+      ++r;
+    }
+    ++r;
+    out.push_back(rect);
+  }
+  return out;
 }
 
 uint64_t MicrosSince(std::chrono::steady_clock::time_point started) {
@@ -170,6 +222,24 @@ class HipMemoryApi final : public MemoryApi {
     return true;
   }
 
+  // A scattered block is one small piece per region (301 of ~30 KB for
+  // MiniMax-M3), and a blocking hipMemcpy costs ~13 us whatever its size, so
+  // one at a time moves 2.2 GiB/s between two MI355X. Two things lift that:
+  // a rectangle job is one 2D copy (41 GiB/s when a block is one rectangle),
+  // and what is left is queued on up to eight streams from eight threads
+  // (~3.5 us a copy, 8 GiB/s). The API lock is held throughout, so nothing
+  // else enters the runtime meanwhile; the workers only queue and wait.
+  bool CopyMany(int dst_device, int /*src_device*/, const std::vector<CopyJob>& jobs,
+                std::string* error) override {
+    return RunJobs(dst_device, jobs, hipMemcpyDeviceToDevice, error);
+  }
+  bool CopyManyToHost(int device, const std::vector<CopyJob>& jobs, std::string* error) override {
+    return RunJobs(device, jobs, hipMemcpyDeviceToHost, error);
+  }
+  bool CopyManyFromHost(int device, const std::vector<CopyJob>& jobs, std::string* error) override {
+    return RunJobs(device, jobs, hipMemcpyHostToDevice, error);
+  }
+
   // A device-to-device copy is not guaranteed to have landed when hipMemcpy
   // returns, and the caller hands these bytes to another process next.
   bool Synchronize(int device, std::string* error) override {
@@ -226,7 +296,62 @@ class HipMemoryApi final : public MemoryApi {
     return true;
   }
 
+  bool RunJobs(int device, const std::vector<CopyJob>& jobs, hipMemcpyKind kind,
+               std::string* error) {
+    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+    ScopedDevice scope(device);
+    if (!scope.ok()) {
+      *error = "hipSetDevice(" + std::to_string(device) + ") failed";
+      return false;
+    }
+    const size_t workers =
+        std::max<size_t>(1, std::min(kDeviceCopyThreads, jobs.size() / kMinJobsPerCopyThread));
+    std::vector<hipStream_t>& streams = copy_streams_[device];
+    while (streams.size() < workers) {
+      hipStream_t stream = nullptr;
+      const hipError_t err = hipStreamCreate(&stream);
+      if (err != hipSuccess) {
+        *error = HipError("hipStreamCreate", err);
+        return false;
+      }
+      streams.push_back(stream);
+    }
+    std::vector<hipError_t> results(workers, hipSuccess);
+    auto work = [&](size_t w, bool set_device) {
+      hipError_t err = set_device ? hipSetDevice(device) : hipSuccess;
+      for (size_t i = w; i < jobs.size() && err == hipSuccess; i += workers) {
+        const CopyJob& job = jobs[i];
+        err = job.rows == 1 ? hipMemcpyAsync(job.dst, job.src, static_cast<size_t>(job.bytes), kind,
+                                             streams[w])
+                            : hipMemcpy2DAsync(job.dst, static_cast<size_t>(job.dst_pitch), job.src,
+                                               static_cast<size_t>(job.src_pitch),
+                                               static_cast<size_t>(job.bytes),
+                                               static_cast<size_t>(job.rows), kind, streams[w]);
+      }
+      // Wait even after a failure: what was queued must not outlive the call.
+      const hipError_t waited = hipStreamSynchronize(streams[w]);
+      results[w] = err != hipSuccess ? err : waited;
+    };
+    std::vector<std::thread> threads;
+    for (size_t w = 1; w < workers; ++w) threads.emplace_back(work, w, true);
+    work(0, false);
+    for (std::thread& thread : threads) thread.join();
+    for (hipError_t err : results) {
+      if (err != hipSuccess) {
+        *error = HipError("hipMemcpyAsync", err);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static constexpr size_t kDeviceCopyThreads = 8;
+  // Under this many copies a thread costs more than it saves.
+  static constexpr size_t kMinJobsPerCopyThread = 256;
+
   std::mutex hip_mutex_;
+  // Streams CopyMany queues on, per destination device; under hip_mutex_.
+  std::map<int, std::vector<hipStream_t>> copy_streams_;
 };
 
 class HostMemoryApi final : public MemoryApi {
@@ -321,9 +446,9 @@ void PoolManager::SetLowerStore(std::shared_ptr<LowerStore> store, const TierOpt
   worker_ = std::thread([this] { TierWorker(); });
   MORI_UMBP_INFO(
       "[L1Pool] lower tiers attached: staging={} B offload_on_evict={} offload_ahead={} load={} "
-      "ask_peers={}",
-      tier_.staging_bytes, tier_.offload_on_evict, tier_.offload_ahead, tier_.load,
-      tier_.ask_peers);
+      "ask_peers={} peer_copy={}",
+      tier_.staging_bytes, tier_.offload_on_evict, tier_.offload_ahead, tier_.load, tier_.ask_peers,
+      tier_.peer_copy);
 }
 
 std::string PoolManager::StoreKey(const std::string& group, const std::string& key) {
@@ -457,35 +582,50 @@ std::vector<bool> PoolManager::OffloadSlots(Pool* pool, const std::vector<Victim
   }
   const auto started = std::chrono::steady_clock::now();
   const size_t per_round = static_cast<size_t>(tier_.staging_bytes / slot_bytes);
+  const std::vector<Region>& regions = pool->layout.regions;
+  const std::vector<uint64_t> starts = RegionStarts(pool->layout);
+  const std::vector<Rectangle> rectangles = Rectangles(pool->layout, pool->layout);
   std::string error;
   uint64_t done = 0;
+  uint64_t wait_micros = 0, read_micros = 0, put_micros = 0;
   for (size_t begin = 0; begin < slots.size(); begin += per_round) {
     const size_t end = std::min(slots.size(), begin + per_round);
+    auto mark = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> staging(staging_mutex_);
+    wait_micros += MicrosSince(mark);
+    mark = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
     std::vector<const void*> srcs;
     std::vector<size_t> which;
+    // A slot goes to the device as one rectangle per group of like regions,
+    // and lands in the layout the store keeps: a slot's units back to back.
+    char* const staging_base = static_cast<char*>(staging_);
+    std::vector<MemoryApi::CopyJob> jobs;
+    jobs.reserve((end - begin) * rectangles.size());
     for (size_t i = begin; i < end; ++i) {
-      char* at = static_cast<char*>(staging_) + (i - begin) * slot_bytes;
-      uint64_t filled = 0;
-      bool ok = true;
-      for (const Region& region : pool->layout.regions) {
-        const void* src = static_cast<const char*>(pool->base) + region.offset +
-                          uint64_t{slots[i].slot} * region.unit_bytes;
-        if (!api_->CopyToHost(pool->device, src, at + filled, region.unit_bytes, &error)) {
-          ok = false;
-          break;
-        }
-        filled += region.unit_bytes;
+      char* const slot_base = staging_base + (i - begin) * slot_bytes;
+      for (const Rectangle& rect : rectangles) {
+        const Region& region = regions[rect.first_region];
+        const uint64_t unit = region.unit_bytes;
+        const void* src =
+            static_cast<const char*>(pool->base) + region.offset + uint64_t{slots[i].slot} * unit;
+        jobs.push_back(MemoryApi::CopyJob{slot_base + starts[rect.first_region], src, unit,
+                                          rect.rows, unit, rect.src_pitch});
       }
-      if (!ok) continue;
-      keys.push_back(StoreKey(pool->group, slots[i].key));
-      srcs.push_back(at);
-      which.push_back(i);
     }
+    if (api_->CopyManyToHost(pool->device, jobs, &error)) {
+      for (size_t i = begin; i < end; ++i) {
+        keys.push_back(StoreKey(pool->group, slots[i].key));
+        srcs.push_back(staging_base + (i - begin) * slot_bytes);
+        which.push_back(i);
+      }
+    }
+    read_micros += MicrosSince(mark);
     if (keys.empty()) continue;
+    mark = std::chrono::steady_clock::now();
     const std::vector<bool> put =
         Guarded("put", keys.size(), [&] { return store_->Put(keys, srcs, slot_bytes); });
+    put_micros += MicrosSince(mark);
     for (size_t j = 0; j < which.size() && j < put.size(); ++j) {
       if (put[j]) {
         stored[which[j]] = true;
@@ -497,8 +637,11 @@ std::vector<bool> PoolManager::OffloadSlots(Pool* pool, const std::vector<Victim
   if (!error.empty()) {
     MORI_UMBP_ERROR("[L1Pool] offload from pool={} read error: {}", pool->id, error);
   }
-  MORI_UMBP_INFO("[L1Pool] offload pool={} slots={} stored={} bytes={} micros={}", pool->id,
-                 slots.size(), done, done * slot_bytes, micros);
+  MORI_UMBP_INFO(
+      "[L1Pool] offload pool={} slots={} stored={} bytes={} micros={} wait={} read={} "
+      "put={}",
+      pool->id, slots.size(), done, done * slot_bytes, micros, wait_micros, read_micros,
+      put_micros);
   std::lock_guard<std::mutex> lock(mutex_);
   pool->offloaded_slots += done;
   // A slot that stays cached here has lost nothing by a failed copy.
@@ -522,12 +665,19 @@ std::vector<bool> PoolManager::LoadSlots(Pool* pool, const std::vector<Victim>& 
     return loaded;
   }
   const size_t per_round = static_cast<size_t>(tier_.staging_bytes / slot_bytes);
+  const std::vector<Region>& regions = pool->layout.regions;
+  const std::vector<uint64_t> starts = RegionStarts(pool->layout);
+  const std::vector<Rectangle> rectangles = Rectangles(pool->layout, pool->layout);
   std::string error;
   // The caller wants a run from the front, so the first failure ends the work.
   bool stop = false;
+  uint64_t wait_micros = 0, get_micros = 0, write_micros = 0;
   for (size_t begin = 0; begin < slots.size() && !stop; begin += per_round) {
     const size_t end = std::min(slots.size(), begin + per_round);
+    auto mark = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> staging(staging_mutex_);
+    wait_micros += MicrosSince(mark);
+    mark = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
     std::vector<void*> dsts;
     for (size_t i = begin; i < end; ++i) {
@@ -536,34 +686,40 @@ std::vector<bool> PoolManager::LoadSlots(Pool* pool, const std::vector<Victim>& 
     }
     const std::vector<bool> got =
         Guarded("get", keys.size(), [&] { return store_->Get(keys, dsts, slot_bytes); });
-    for (size_t i = begin; i < end; ++i) {
-      if (i - begin >= got.size() || !got[i - begin]) {
-        stop = true;
-        break;
+    // The caller wants a run from the front: what follows the first key the
+    // store could not give is not used.
+    get_micros += MicrosSince(mark);
+    mark = std::chrono::steady_clock::now();
+    size_t good = begin;
+    while (good < end && good - begin < got.size() && got[good - begin]) ++good;
+    if (good < end) stop = true;
+    char* const staging_base = static_cast<char*>(staging_);
+    std::vector<MemoryApi::CopyJob> jobs;
+    jobs.reserve((good - begin) * rectangles.size());
+    for (size_t i = begin; i < good; ++i) {
+      const char* const slot_base = staging_base + (i - begin) * slot_bytes;
+      for (const Rectangle& rect : rectangles) {
+        const Region& region = regions[rect.first_region];
+        const uint64_t unit = region.unit_bytes;
+        void* dst = static_cast<char*>(pool->base) + region.offset + uint64_t{slots[i].slot} * unit;
+        jobs.push_back(MemoryApi::CopyJob{dst, slot_base + starts[rect.first_region], unit,
+                                          rect.rows, rect.dst_pitch, unit});
       }
-      const char* at = static_cast<const char*>(dsts[i - begin]);
-      uint64_t taken = 0;
-      bool ok = true;
-      for (const Region& region : pool->layout.regions) {
-        void* dst = static_cast<char*>(pool->base) + region.offset +
-                    uint64_t{slots[i].slot} * region.unit_bytes;
-        if (!api_->CopyFromHost(pool->device, dst, at + taken, region.unit_bytes, &error)) {
-          ok = false;
-          break;
-        }
-        taken += region.unit_bytes;
-      }
-      if (!ok) {
-        stop = true;
-        break;
-      }
-      loaded[i] = true;
-      *bytes += slot_bytes;
     }
+    if (jobs.empty()) continue;
+    if (!api_->CopyManyFromHost(pool->device, jobs, &error)) {
+      stop = true;
+      break;
+    }
+    for (size_t i = begin; i < good; ++i) loaded[i] = true;
+    *bytes += (good - begin) * slot_bytes;
+    write_micros += MicrosSince(mark);
   }
   if (!error.empty()) {
     MORI_UMBP_ERROR("[L1Pool] load into pool={} write error: {}", pool->id, error);
   }
+  MORI_UMBP_INFO("[L1Pool] load pool={} slots={} bytes={} wait={} get={} write={}", pool->id,
+                 slots.size(), *bytes, wait_micros, get_micros, write_micros);
   return loaded;
 }
 
@@ -690,8 +846,8 @@ Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout)
   pool->slots.assign(layout.num_slots, Slot{});
   pool->bound = true;
   ResetSlotsLocked(pool);
-  MORI_UMBP_INFO("[L1Pool] bound pool={} slots={} regions={}", pool_id, layout.num_slots,
-                 layout.regions.size());
+  MORI_UMBP_INFO("[L1Pool] bound pool={} slots={} regions={} rectangles={}", pool_id,
+                 layout.num_slots, layout.regions.size(), Rectangles(layout, layout).size());
   return Status{};
 }
 
@@ -852,6 +1008,7 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
 
   // A settled slot of another pool of this node holding `key`, or null.
   auto find_source = [&](const std::string& key) -> const Holder* {
+    if (!tier_.peer_copy) return nullptr;
     auto holders = group.holders.find(key);
     if (holders == group.holders.end()) return nullptr;
     for (const Holder& h : holders->second) {
@@ -954,6 +1111,23 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   for (size_t i = 0; i < steps.size(); ++i) {
     (steps[i].src != nullptr ? peer_steps : store_steps).push_back(i);
   }
+  std::vector<MemoryApi::CopyJob> jobs;
+  std::vector<Rectangle> rectangles;  // of the source pool `jobs` is for
+  std::vector<size_t> jobs_steps;
+  uint64_t jobs_bytes = 0;
+  Pool* jobs_src = nullptr;
+  auto flush_jobs = [&] {
+    if (jobs.empty()) return;
+    if (!failed && api_->CopyMany(pool->device, jobs_src->device, jobs, &copy_error)) {
+      for (size_t step : jobs_steps) copied[step] = true;
+      result.copied_bytes += jobs_bytes;
+    } else {
+      failed = true;
+    }
+    jobs.clear();
+    jobs_steps.clear();
+    jobs_bytes = 0;
+  };
   size_t run_start = 0;
   while (run_start < peer_steps.size() && !failed) {
     size_t run_end = run_start + 1;
@@ -966,27 +1140,31 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
       }
       ++run_end;
     }
+    // Runs from one source pool that follow each other go to the device as
+    // one list, so scattered slots do not pay a lock and a device switch each.
     const CopyStep& first = steps[peer_steps[run_start]];
     const uint64_t run_slots = run_end - run_start;
-    for (size_t r = 0; r < pool->layout.regions.size(); ++r) {
-      const Region& dst_region = pool->layout.regions[r];
-      const Region& src_region = first.src->layout.regions[r];
+    if (jobs_src != first.src) {
+      flush_jobs();
+      jobs_src = first.src;
+    }
+    if (jobs.empty()) rectangles = Rectangles(pool->layout, first.src->layout);
+    for (const Rectangle& rect : rectangles) {
+      const Region& dst_region = pool->layout.regions[rect.first_region];
+      const Region& src_region = first.src->layout.regions[rect.first_region];
       const uint64_t unit = dst_region.unit_bytes;
       void* dst =
           static_cast<char*>(pool->base) + dst_region.offset + uint64_t{first.dst_slot} * unit;
       const void* src = static_cast<const char*>(first.src->base) + src_region.offset +
                         uint64_t{first.src_slot} * unit;
-      if (!api_->Copy(pool->device, dst, first.src->device, src, run_slots * unit, &copy_error)) {
-        failed = true;
-        break;
-      }
-      result.copied_bytes += run_slots * unit;
+      jobs.push_back(MemoryApi::CopyJob{dst, src, run_slots * unit, rect.rows, rect.dst_pitch,
+                                        rect.src_pitch});
+      jobs_bytes += run_slots * unit * rect.rows;
     }
-    if (!failed) {
-      for (size_t i = run_start; i < run_end; ++i) copied[peer_steps[i]] = true;
-    }
+    for (size_t i = run_start; i < run_end; ++i) jobs_steps.push_back(peer_steps[i]);
     run_start = run_end;
   }
+  flush_jobs();
   result.copy_micros = MicrosSince(started);
 
   const auto load_started = std::chrono::steady_clock::now();
