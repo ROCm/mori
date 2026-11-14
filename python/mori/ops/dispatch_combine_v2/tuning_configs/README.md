@@ -309,8 +309,10 @@ What `--cmd tuning` does on its own:
   median is within that margin and whose tail is better than the shipped
   rule's by more than 10% of the shipped median is reported as `TAIL` and
   selected instead. `--tuning-save` writes it as it would write a win.
-- It times a weighted combine, while `bench_ep.py` and aiter time an
-  unweighted one. The two can rank combine geometries differently.
+- Its combine reads the dispatch output, so the kernel first copies it into
+  the staging rows. A caller that writes the expert output into
+  `combine_in_view()`, as `bench_ep.py` does by default, skips that copy. The
+  two can rank combine geometries differently.
 
 **Metrics**
 
