@@ -80,9 +80,34 @@ _MI325X_TABLE = {
     (8, 2048, 8): {"fp8": _MI325X_SCHEDULE},
 }
 
-# ── MI300X (gfx942, 304 CU) — TODO: re-tune. Falls back to CU-scaled default. ──
-_MI300X_DEFAULT = None  # None => derive from CU count (see _cu_scaled_default)
-_MI300X_TABLE = {}
+# -- MI300X (gfx942, 304 CU, DID 0x74a1 / 0x74a9) -- EP8, measured 2026-10-16 on
+# 8x MI300X HF over xGMI (bench_ep.py, hidden 7168, topk 8, graph mode, tokens
+# 8..8192, block x warp swept per leg, min mean latency per token bucket, winners
+# re-run twice). The gather combine wants the smallest block (32) with warp 8 at
+# every count but 65..128 tokens (64x8); block count is the dominant axis there
+# (32 -> 256 blocks is 2.1 -> 4.3 ms at 8192 tokens). Dispatch is flat across
+# block >= 96 / warp >= 8 (within 1-3 %); 128x8 wins or ties up to 1024 tokens,
+# 128x16 above. The MI325X schedule (64x4 / 152x2 combine) is 13-19 % slower on
+# combine here, so no alias. bf16 and fp8 dispatch pick the same geometry.
+_MI300X_SCHEDULE = (
+    (128, 128, 8, 64, 8),  # <=128:  comb 64x8 (32x8 is +7 % at 128 tok)
+    (1024, 128, 8, 32, 8),  # <=1024: comb 32x8
+    (None, 128, 16, 32, 8),  # >1024:  disp warp 16 (peak)
+)
+_MI300X_DEFAULT = dict(
+    dispatch_block_num=128,
+    combine_block_num=32,
+    warp_num_per_block=16,
+    combine_warp_num_per_block=8,
+    schedule=_MI300X_SCHEDULE,
+)
+# bf16 and fp8 dispatch measured, same schedule. hidden 4096 / 2048 reuse the 7168
+# schedule until separately tuned (as MI325X does).
+_MI300X_TABLE = {
+    (8, 7168, 8): {"bf16": _MI300X_SCHEDULE, "fp8": _MI300X_SCHEDULE},
+    (8, 4096, 8): {"bf16": _MI300X_SCHEDULE, "fp8": _MI300X_SCHEDULE},
+    (8, 2048, 8): {"bf16": _MI300X_SCHEDULE, "fp8": _MI300X_SCHEDULE},
+}
 
 # ── MI355X (gfx950, wave64) — EP8, vec4 combine gather. combine wants a small
 # block (32-48) + warp up to 16; dispatch grows block 96->160. wave64 => warp <= 16
