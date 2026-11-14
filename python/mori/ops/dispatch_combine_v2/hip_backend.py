@@ -35,8 +35,8 @@ gpu_per_node; there is no kernel_type enum on the v2 side):
   (block, warp) the tuning schedule can select.
 * internode -- a sequence of separately compiled passes over the
   ``internode_regions`` arena and a device communicator: copystaging +
-  dispatch for a round of dispatch, combinesync + combinesyncbarrier + combine
-  + combineall for a round of combine. Gather only, bf16/fp32/fp8 on either
+  dispatch for a round of dispatch, combinesync + combine + combineall for a
+  round of combine. Gather only, bf16/fp32/fp8 on either
   leg, plus packed fp4 dispatch with bf16/fp32 combine. FP4 combine is not
   supported. "v2" and "v2_ll" are two distinct kernel families rather than
   a runtime branch: ``cfg.internode_kernel`` (auto | v2 | v2_ll) says which are
@@ -1297,18 +1297,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     _INTERNODE_SEQ = {
         ("dispatch", "v2"): ("copystaging", "dispatch"),
         ("dispatch", "v2_ll"): ("copystaging", "dispatch_ll"),
-        ("combine", "v2"): (
-            "combinesync",
-            "combinesyncbarrier",
-            "combine",
-            "combineall",
-        ),
-        ("combine", "v2_ll"): (
-            "combinesync",
-            "combinesyncbarrier",
-            "combine_ll",
-            "combineall",
-        ),
+        ("combine", "v2"): ("combinesync", "combine", "combineall"),
+        ("combine", "v2_ll"): ("combinesync", "combine_ll", "combineall"),
     }
 
     def _internode_request(

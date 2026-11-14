@@ -26,7 +26,7 @@
 //
 // Same shape as ep_spec.hpp: a Request, a Cfg, and KernelSpec subclasses that
 // supply RenderSource/Geometry and inherit hashing, caching, module load and
-// launch. Eight entries instead of two, because the dispatch and combine
+// launch. Seven entries instead of two, because the dispatch and combine
 // sequences are several passes each and every pass is its own module, and
 // because v2 and v2_ll are separate kernels rather than one with a branch.
 //
@@ -245,7 +245,6 @@ enum class EpInterNodeKernel {
   Dispatch,
   DispatchLL,
   CombineSync,
-  CombineSyncBarrier,
   Combine,
   CombineLL,
   CombineAll,
@@ -268,18 +267,18 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
                                   EpInterNodeKernel kind,
                                   EpInterNodeFamily family = EpInterNodeFamily::InterNode);
 
-// Rendering, naming and geometry are shared by all eight Specs. Exposed so a
-// test can exercise them per kernel without going through eight class names.
+// Rendering, naming and geometry are shared by all seven Specs. Exposed so a
+// test can exercise them per kernel without going through seven class names.
 std::string EpInterNodeEntryName(const EpInterNodeCfg& cfg, EpInterNodeKernel kind);
 std::string EpInterNodeRenderSource(const EpInterNodeCfg& cfg, EpInterNodeKernel kind);
 mori::jit::v2::LaunchGeometry EpInterNodeGeometry(const EpInterNodeCfg& cfg,
                                                   EpInterNodeKernel kind);
 
 // ---------------------------------------------------------------------------
-// The eight Specs. Same Cfg, same Args; they differ in which *_body the TU
+// The seven Specs. Same Cfg, same Args; they differ in which *_body the TU
 // instantiates and in launch geometry.
 //
-// Declared by macro because the eight are identical: KernelSpec needs kName as a
+// Declared by macro because the seven are identical: KernelSpec needs kName as a
 // constexpr string, so one class template over EpInterNodeKernel would need a
 // parallel constexpr name table -- more machinery than the lines it would save.
 // ---------------------------------------------------------------------------
@@ -298,8 +297,6 @@ MORI_EP_INTERNODE_DECLARE_SPEC(EpInterNodeCopyToStagingSpec, "ep_internode_copys
 MORI_EP_INTERNODE_DECLARE_SPEC(EpInterNodeDispatchSpec, "ep_internode_dispatch");
 MORI_EP_INTERNODE_DECLARE_SPEC(EpInterNodeDispatchLLSpec, "ep_internode_dispatch_ll");
 MORI_EP_INTERNODE_DECLARE_SPEC(EpInterNodeCombineSyncSpec, "ep_internode_combinesync");
-MORI_EP_INTERNODE_DECLARE_SPEC(EpInterNodeCombineSyncBarrierSpec,
-                               "ep_internode_combinesyncbarrier");
 MORI_EP_INTERNODE_DECLARE_SPEC(EpInterNodeCombineSpec, "ep_internode_combine");
 MORI_EP_INTERNODE_DECLARE_SPEC(EpInterNodeCombineLLSpec, "ep_internode_combine_ll");
 MORI_EP_INTERNODE_DECLARE_SPEC(EpInterNodeCombineAllSpec, "ep_internode_combineall");
