@@ -2478,6 +2478,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             for mx, b, w in self._bf16_push
         )
         marks = ()
+        in_view = None
         if self._card is not None:
             n = self.cfg.effective_max_recv
             base = self.arena.local_ptr("fwd_map")
@@ -2485,6 +2486,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             marks = tuple(
                 from_gpu_ptr(base + off, (n,), torch.int32) for off in (0, rev)
             )
+        else:
+            in_view = self.arena.local_ptr(self._region("out_tok"))
 
         def run(
             *,
@@ -2496,7 +2499,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             recv_to_src=None,
             recv_idx=None,
         ):
-            if want_weights or total_recv is not self._recv:
+            if (
+                want_weights
+                or total_recv is not self._recv
+                or input.data_ptr() == in_view
+            ):
                 if marks and total_recv is not self._recv:
                     raise NotImplementedError(
                         "the bf16 push combine of this op folds the rows of each card "

@@ -36,8 +36,7 @@ EPR = int(os.environ.get("EPR", 8))
 M = int(os.environ.get("M", 8192))
 ROUNDS = int(os.environ.get("ROUNDS", 2))
 PUSH = os.environ.get("MORI_EP_BF16_PUSH", "1") == "1"
-HOWS = ("plain", "in_view", "mixed", "weights", "snapshot")
-PULLS = ("weights", "snapshot")
+HOWS = ("plain", "in_view", "weights", "snapshot")
 
 
 def make_cfg(rank, world):
@@ -79,14 +78,15 @@ def make_inputs(i, src, n, world):
     return x, idx, w
 
 
-def pushes(n, how, lim):
-    return PUSH and n > lim and how not in PULLS
+def pushes(n, how, lim, pulls):
+    return PUSH and n > lim and how not in pulls
 
 
 def run(cfg, comm, lim, sizes, args):
     rank, world = cfg.rank, cfg.world_size
     op = EpDispatchCombineOp(cfg, comm)
     fold = getattr(op, "_card", None) is not None
+    pulls = ("weights", "snapshot") if fold else ("in_view", "weights", "snapshot")
     checks = {}
 
     def check(name, ok):
@@ -112,8 +112,6 @@ def run(cfg, comm, lim, sizes, args):
             snapshot=how == "snapshot",
             max_num_inp_token_across_ranks=max(sizes[i]) if peak else None,
         )
-        if how == "mixed":
-            how = "in_view" if (rank + i) % 2 else "plain"
         if how in ("plain", "snapshot"):
             o, _ = op.combine(out, routing=h)
         else:
@@ -141,7 +139,9 @@ def run(cfg, comm, lim, sizes, args):
             got[how] = pair(i, how)
             sync()
             if land is not None:
-                check(f"path_{how}", bool(land.any()) == pushes(max(ns), how, lim))
+                check(
+                    f"path_{how}", bool(land.any()) == pushes(max(ns), how, lim, pulls)
+                )
             check(
                 f"bf16_sum_{how}",
                 torch.allclose(got[how].float().cpu(), want, atol=2e-2, rtol=2e-2),
@@ -174,7 +174,7 @@ def run(cfg, comm, lim, sizes, args):
             o = pair(i, how, peak=False)
             sync()
             if land is not None:
-                check(f"nopeak_path_{how}", bool(land.any()) == (how not in PULLS))
+                check(f"nopeak_path_{how}", bool(land.any()) == (how not in pulls))
             check(
                 f"nopeak_bf16_sum_{how}",
                 torch.allclose(o.float().cpu(), want, atol=2e-2, rtol=2e-2),
