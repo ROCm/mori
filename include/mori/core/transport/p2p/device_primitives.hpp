@@ -309,6 +309,9 @@ inline __device__ void WarpCopyNarrow(T* __restrict__ dst, const T* __restrict__
 
 template <typename T, int Unroll = 1>
 inline __device__ void WarpCopy(T* __restrict__ dst, const T* __restrict__ src, size_t nelems) {
+  constexpr int VecBytes = 16;
+  static_assert(VecBytes % sizeof(T) == 0, "vector tail needs sizeof(T) to divide 16");
+  constexpr int vecSize = VecBytes / sizeof(T);
   int laneId = threadIdx.x & (warpSize - 1);
 
   size_t offset = 0;
@@ -322,6 +325,28 @@ inline __device__ void WarpCopy(T* __restrict__ dst, const T* __restrict__ src, 
   WarpCopyNarrow<T, 8>(dst, src, offset, nelems);
   WarpCopyNarrow<T, 4>(dst, src, offset, nelems);
   WarpCopyNarrow<T, 2>(dst, src, offset, nelems);
+
+  // offset is whole vectors, so dst/src decide the tail's alignment
+  const uintptr_t addrBits = reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src);
+  // < warpSize vectors left: one per lane; unaligned only where the passes above already were
+  if ((offset > 0) || ((addrBits % VecBytes) == 0)) {
+    const size_t tailVecs = (nelems - offset) / vecSize;
+    if (static_cast<size_t>(laneId) < tailVecs) {
+      const size_t i = offset + laneId * vecSize;
+      store<VecBytes>(dst + i, load<VecBytes>(src + i));
+    }
+    offset += tailVecs * vecSize;
+  } else if constexpr (sizeof(T) < 4) {
+    // short unaligned copy: dwords when both ends are 4 B aligned
+    if ((addrBits % 4) == 0) {
+      constexpr int dwSize = 4 / sizeof(T);
+      const size_t dwEnd = nelems / dwSize * dwSize;
+      for (size_t i = laneId * dwSize; i < dwEnd; i += warpSize * dwSize) {
+        store<4>(dst + i, load<4>(src + i));
+      }
+      offset = dwEnd;
+    }
+  }
 
   offset += laneId;
   while (offset < nelems) {
