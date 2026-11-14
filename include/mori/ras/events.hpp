@@ -58,17 +58,34 @@ struct EngineRegistered {
   std::string engineKey;
 };
 
-// A local IOEngine was destroyed.
+// A local IOEngine was destroyed. Its peer relationships end with it.
 struct EngineUnregistered {
   std::string engineKey;
 };
 
-using RasEvent = std::variant<EngineRegistered, EngineUnregistered>;
+// A local engine registered a remote engine (IOEngine::RegisterRemoteEngine).
+struct PeerAdded {
+  std::string localEngine;
+  std::string remoteEngine;
+  std::string remoteNodeId;
+  std::string remoteHostname;
+  int32_t remotePid{0};
+  RasEndpoint endpoint;  // invalid when the remote engine advertises no RAS endpoint
+};
+
+// A local engine deregistered a remote engine (IOEngine::DeregisterRemoteEngine).
+struct PeerRemoved {
+  std::string localEngine;
+  std::string remoteEngine;
+};
+
+using RasEvent = std::variant<EngineRegistered, EngineUnregistered, PeerAdded, PeerRemoved>;
 constexpr size_t kNumEventKinds = std::variant_size_v<RasEvent>;
 
 // "EngineRegistered" and so on, for an index of RasEvent.
 inline const char* EventKindName(size_t kind) {
-  static constexpr const char* kNames[] = {"EngineRegistered", "EngineUnregistered"};
+  static constexpr const char* kNames[] = {"EngineRegistered", "EngineUnregistered", "PeerAdded",
+                                           "PeerRemoved"};
   static_assert(sizeof(kNames) / sizeof(kNames[0]) == kNumEventKinds, "one name per event");
   return kind < kNumEventKinds ? kNames[kind] : "Unknown";
 }
