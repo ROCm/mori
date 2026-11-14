@@ -41,17 +41,19 @@ namespace {
 
 }  // namespace
 
+std::string resolve_device_name(const std::string& device_name) {
+  if (!device_name.empty()) return device_name;
+  if (const char* env = std::getenv("MORI_KIWI_DEVICE_NAME"); env != nullptr && *env != '\0') {
+    return env;
+  }
+  int hip_device = 0;
+  if (hipGetDevice(&hip_device) != hipSuccess) fail("hipGetDevice failed");
+  return application::TopoSystem().MatchGpuAndNic(hip_device);
+}
+
 net_context_t::net_context_t(const std::string& device_name)
     : rdma_(std::make_unique<application::RdmaContext>(application::RdmaBackendType::IBVerbs)) {
-  std::string name = device_name;
-  if (const char* env = std::getenv("MORI_KIWI_DEVICE_NAME"); name.empty() && env != nullptr) {
-    name = env;
-  }
-  if (name.empty()) {
-    int hip_device = 0;
-    if (hipGetDevice(&hip_device) != hipSuccess) fail("hipGetDevice failed");
-    name = application::TopoSystem().MatchGpuAndNic(hip_device);
-  }
+  const std::string name = resolve_device_name(device_name);
   for (const auto& [device, port] :
        application::GetActiveDevicePortList(rdma_->GetRdmaDeviceList())) {
     if (device->Name() != name) continue;

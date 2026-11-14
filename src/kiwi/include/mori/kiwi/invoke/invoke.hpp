@@ -54,7 +54,7 @@ class Context {
     endpoints_.reserve(num_endpoints);
     for (size_t i = 0; i < num_endpoints; ++i) {
       endpoints_.push_back(
-          std::make_unique<internal::Endpoint<QueueType>>(queue_capacity, registry_));
+          std::make_unique<internal::Endpoint<QueueType>>(queue_capacity, *registry_));
     }
 
     // Build device-side handle array
@@ -64,49 +64,30 @@ class Context {
       host_handles.push_back(DeviceHandle{endpoints_[i]->raw_queue()->device_handle()});
     }
 
-    HIP_CHECK(hipMalloc(&device_handles_, num_endpoints * sizeof(DeviceHandle)));
-    HIP_CHECK(hipMemcpy(device_handles_, host_handles.data(), num_endpoints * sizeof(DeviceHandle),
-                        hipMemcpyHostToDevice));
+    DeviceHandle* handles = nullptr;
+    KIWI_HIP_CHECK(hipMalloc(&handles, num_endpoints * sizeof(DeviceHandle)));
+    device_handles_.reset(handles);
+    KIWI_HIP_CHECK(hipMemcpy(device_handles_.get(), host_handles.data(),
+                             num_endpoints * sizeof(DeviceHandle), hipMemcpyHostToDevice));
 
     // Build DeviceContext on host, then copy to device
-    DeviceContext<QueueType> host_ctx(device_handles_, num_endpoints);
-    HIP_CHECK(hipMalloc(&device_context_, sizeof(DeviceContext<QueueType>)));
-    HIP_CHECK(hipMemcpy(device_context_, &host_ctx, sizeof(DeviceContext<QueueType>),
-                        hipMemcpyHostToDevice));
+    DeviceContext<QueueType> host_ctx(device_handles_.get(), num_endpoints);
+    DeviceContext<QueueType>* context = nullptr;
+    KIWI_HIP_CHECK(hipMalloc(&context, sizeof(DeviceContext<QueueType>)));
+    device_context_.reset(context);
+    KIWI_HIP_CHECK(hipMemcpy(device_context_.get(), &host_ctx, sizeof(DeviceContext<QueueType>),
+                             hipMemcpyHostToDevice));
   }
 
-  ~Context() {
-    if (device_context_) (void)hipFree(device_context_);
-    if (device_handles_) (void)hipFree(device_handles_);
-  }
+  ~Context() = default;
 
   // Disable copy (owns GPU resources)
   Context(const Context&) = delete;
   Context& operator=(const Context&) = delete;
 
   // Enable move
-  Context(Context&& other) noexcept
-      : registry_(std::move(other.registry_)),
-        endpoints_(std::move(other.endpoints_)),
-        device_handles_(other.device_handles_),
-        device_context_(other.device_context_) {
-    other.device_handles_ = nullptr;
-    other.device_context_ = nullptr;
-  }
-
-  Context& operator=(Context&& other) noexcept {
-    if (this != &other) {
-      if (device_context_) (void)hipFree(device_context_);
-      if (device_handles_) (void)hipFree(device_handles_);
-      registry_ = std::move(other.registry_);
-      endpoints_ = std::move(other.endpoints_);
-      device_handles_ = other.device_handles_;
-      device_context_ = other.device_context_;
-      other.device_handles_ = nullptr;
-      other.device_context_ = nullptr;
-    }
-    return *this;
-  }
+  Context(Context&&) noexcept = default;
+  Context& operator=(Context&&) noexcept = default;
 
   // Register callback (CPU-side) - global across all endpoints
   // Returns callback ID (0-255)
@@ -126,7 +107,7 @@ class Context {
                                   " queue lines, but the queue capacity is " +
                                   std::to_string(capacity) + " lines");
     }
-    return registry_.register_callback<Args...>(std::move(func));
+    return registry_->register_callback<Args...>(std::move(func));
   }
 
   // Process callbacks from specific endpoint (CPU-side)
@@ -144,7 +125,7 @@ class Context {
   size_t num_endpoints() const { return endpoints_.size(); }
 
   // Get device-side context pointer (pass to kernels, call get_device_handle() inside)
-  DeviceContext<QueueType>* device_context() const { return device_context_; }
+  DeviceContext<QueueType>* device_context() const { return device_context_.get(); }
 
   // Get raw queue pointer for an endpoint (for benchmarking bypass)
   QueueType* raw_queue(size_t endpoint_id) const {
@@ -156,10 +137,17 @@ class Context {
   }
 
  private:
-  internal::CallbackRegistry registry_;
+  struct HipFree {
+    void operator()(void* p) const { (void)hipFree(p); }
+  };
+
+  // Heap-allocated so its address survives moves: each endpoint's
+  // dispatcher holds a reference to it.
+  std::unique_ptr<internal::CallbackRegistry> registry_ =
+      std::make_unique<internal::CallbackRegistry>();
   std::vector<std::unique_ptr<internal::Endpoint<QueueType>>> endpoints_;
-  DeviceHandle* device_handles_ = nullptr;              // device-allocated array
-  DeviceContext<QueueType>* device_context_ = nullptr;  // device-allocated context
+  std::unique_ptr<DeviceHandle, HipFree> device_handles_;              // device-allocated array
+  std::unique_ptr<DeviceContext<QueueType>, HipFree> device_context_;  // device-allocated context
 };
 
 }  // namespace mori::kiwi::invoke

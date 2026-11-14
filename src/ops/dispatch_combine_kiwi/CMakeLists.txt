@@ -8,6 +8,9 @@ set(MORI_OPS_KIWI_SOURCES
     comm/transport_callbacks.hip.cpp
     all2all.hip.cpp
     ep_context.hip.cpp
+    ep_tuning.cpp
+    tuning/gfx942_cx7.cpp
+    tuning/gfx950_pollara.cpp
     dispatch.hip.cpp
     combine.hip.cpp
     ep_op.hip.cpp)

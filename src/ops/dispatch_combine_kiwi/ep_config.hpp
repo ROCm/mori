@@ -26,6 +26,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "ep_tuning.hpp"
+
 #ifndef KIWI_EP_HOST_DEVICE
 #if defined(__HIPCC__) || defined(__HIP_DEVICE_COMPILE__) || defined(__CUDACC__) || \
     (defined(__host__) && defined(__device__))
@@ -49,77 +51,32 @@ inline constexpr int EP_WAVES_PER_BLOCK = 16;
 inline constexpr int EP_THREADS_PER_BLOCK = EP_WAVE_SIZE * EP_WAVES_PER_BLOCK;
 inline constexpr size_t EP_SLOT_ALIGNMENT = 64;
 
+// Payload readiness flags are one byte each, but several source ranks' flags
+// can be written by different QPs at close to the same time (raw RDMA PUTs
+// from different proxy threads/peers, or HIP IPC stores from same-node
+// peers). When flags are packed one byte per slot, several of them share a
+// cache line, and writes from different QPs into that shared line appear to
+// serialize at the NIC/memory controller. Padding every flag out to its own
+// cache line removes that false sharing.
+inline constexpr size_t KIWI_EP_READINESS_FLAG_STRIDE = 64;
+
 enum class quant_format_t : int32_t {
   NONE = 0,
   FP8 = 1,
   FP4 = 2,
 };
 
-// RCOMP payload backend. RDMA_ONLY uses RDMA payloads; HYBRID writes
-// same-node peer payloads through HIP IPC and retains RDMA payloads
-// plus receiver-owned readiness signals for all other peers. AUTO resolves the
-// concrete backend independently for each active-token launch.
-enum class rcomp_backend_t : int32_t {
-  RDMA_ONLY = 0,
-  HYBRID = 1,
-  AUTO = 2,
-};
-
+// Every caller uses this as a byte offset into the flag region: added to a
+// uint8_t* base, or multiplied by sizeof(uint8_t) before being added to a
+// displacement. Scaling the flattened slot index by
+// KIWI_EP_READINESS_FLAG_STRIDE here is what pads each flag to its own cache
+// line; no call site needs to know about the stride separately.
 KIWI_EP_HOST_DEVICE inline size_t payload_readiness_flag_index(int source_rank,
                                                                int source_local_slot,
                                                                int slots_per_rank) {
-  return static_cast<size_t>(source_rank) * static_cast<size_t>(slots_per_rank) +
-         static_cast<size_t>(source_local_slot);
-}
-
-struct runtime_defaults_t {
-  int num_blocks;
-  rcomp_backend_t rcomp_backend;
-};
-
-// Return the measured runtime defaults for a positive per-rank token count and
-// world size. Context construction uses the maximum configured capacity to
-// allocate enough queues and optional hybrid resources. Automatic dispatch
-// and combine policy can then select a smaller launch from the active token
-// count without changing those allocations.
-//
-// The common block bands combine a BF16 single-node (MI300X) one-token result,
-// 1/2/4/8-node small-token sweeps, and the existing high-token bands. ws8 uses its measured backend
-// threshold; every other topology uses the ws16-derived fallback threshold.
-inline runtime_defaults_t recommended_runtime_defaults(int num_tokens, int world_size) {
-  if (num_tokens <= 0) {
-    throw std::invalid_argument(
-        "kiwi::ep::recommended_runtime_defaults: "
-        "num_tokens must be positive");
-  }
-
-  const int num_blocks = num_tokens == 1    ? 12
-                         : num_tokens == 2  ? 20
-                         : num_tokens <= 32 ? 32
-                         : num_tokens <= 64 ? 64
-                                            : 256;
-
-  const int hybrid_min_tokens = world_size == 8 ? 8 : 4;
-  return {
-      num_blocks,
-      num_tokens >= hybrid_min_tokens ? rcomp_backend_t::HYBRID : rcomp_backend_t::RDMA_ONLY,
-  };
-}
-
-inline int recommended_num_blocks(int num_tokens, int world_size) {
-  return recommended_runtime_defaults(num_tokens, world_size).num_blocks;
-}
-
-inline const char* rcomp_backend_name(rcomp_backend_t backend) {
-  switch (backend) {
-    case rcomp_backend_t::RDMA_ONLY:
-      return "rdma-only";
-    case rcomp_backend_t::HYBRID:
-      return "hybrid";
-    case rcomp_backend_t::AUTO:
-      return "auto";
-  }
-  return "unknown";
+  return (static_cast<size_t>(source_rank) * static_cast<size_t>(slots_per_rank) +
+          static_cast<size_t>(source_local_slot)) *
+         KIWI_EP_READINESS_FLAG_STRIDE;
 }
 
 // Wire-format layout for one MORI-style communication slot.  Dispatch and
@@ -231,6 +188,11 @@ struct config_t {
   // Optional RDMA HCA/NIC name. Empty selects MORI_KIWI_DEVICE_NAME, then
   // the NIC nearest the current HIP device.
   std::string device_name;
+  // Hardware key for the automatic num_blocks/rcomp_backend tuning tables
+  // in ep_tuning.hpp. Empty fields, or a pair with no table, select the
+  // generic rule.
+  std::string gpu_arch;
+  std::string nic_family;
   int dispatch_elem_size = 4;  // bytes per dispatch hidden element
   int combine_elem_size = 4;   // bytes per combine hidden element
   quant_format_t dispatch_quant_format = quant_format_t::NONE;
@@ -253,12 +215,14 @@ struct config_t {
                                                                         : recommended;
   }
   // Number of blocks provisioned at construction. Automatic mode derives
-  // this directly from the configured maximum input capacity; explicit mode
-  // keeps its fixed launch count.
+  // this directly from the configured maximum input capacity, which is
+  // enough because recommended num_blocks never decreases with token count;
+  // explicit mode keeps its fixed launch count.
   int provisioned_num_blocks() const {
-    return uses_automatic_num_blocks() ? capped_auto_num_blocks(recommended_num_blocks(
-                                             max_num_inp_token_per_rank, world_size))
-                                       : num_blocks;
+    return uses_automatic_num_blocks()
+               ? capped_auto_num_blocks(recommended_num_blocks(max_num_inp_token_per_rank,
+                                                               world_size, gpu_arch, nic_family))
+               : num_blocks;
   }
   // Number of invoke SPSC queues: one per producer wavefront. Derived
   // from provisioned_num_blocks(), never tuned directly.
@@ -270,8 +234,8 @@ struct config_t {
     return combine_hidden_elems > 0 ? combine_hidden_elems : model_hidden_dim;
   }
   runtime_defaults_t launch_policy_for(int active_num_tokens) const {
-    runtime_defaults_t policy =
-        recommended_runtime_defaults(active_num_tokens > 0 ? active_num_tokens : 1, world_size);
+    runtime_defaults_t policy = recommended_runtime_defaults(
+        active_num_tokens > 0 ? active_num_tokens : 1, world_size, gpu_arch, nic_family);
     policy.num_blocks =
         uses_automatic_num_blocks() ? capped_auto_num_blocks(policy.num_blocks) : num_blocks;
     if (rcomp_backend != rcomp_backend_t::AUTO) {
@@ -281,13 +245,15 @@ struct config_t {
   }
   // Automatic payload routing can select either backend across token
   // buckets. Provision HIP-IPC payload resources whenever any bucket up to
-  // capacity selects hybrid; explicit backend selection remains fixed.
+  // capacity selects hybrid, which the capacity bucket does if any does;
+  // explicit backend selection remains fixed.
   bool rcomp_ipc_resources_required() const {
     if (rcomp_backend != rcomp_backend_t::AUTO) {
       return rcomp_backend == rcomp_backend_t::HYBRID;
     }
-    return recommended_runtime_defaults(max_num_inp_token_per_rank, world_size).rcomp_backend ==
-           rcomp_backend_t::HYBRID;
+    return recommended_runtime_defaults(max_num_inp_token_per_rank, world_size, gpu_arch,
+                                        nic_family)
+               .rcomp_backend == rcomp_backend_t::HYBRID;
   }
 
   // Derived capacities from MORI's max_num_inp_token_per_rank.  This value
@@ -432,15 +398,20 @@ struct config_t {
   // common layout, so imported peer heaps expose payload and readiness state
   // with identical offsets.
   size_t dispatch_readiness_flags_offset() const {
-    return align_up(combine_recv_offset() + combine_recv_size(), alignof(uint8_t));
+    // Align the region start to the flag stride too, so every flag's
+    // address (region start + a stride-scaled index) stays
+    // stride-aligned, and no flag straddles a cache line.
+    return align_up(combine_recv_offset() + combine_recv_size(), KIWI_EP_READINESS_FLAG_STRIDE);
   }
 
   size_t combine_readiness_flags_offset() const {
-    return dispatch_readiness_flags_offset() + payload_readiness_flag_count() * sizeof(uint8_t);
+    return dispatch_readiness_flags_offset() +
+           payload_readiness_flag_count() * KIWI_EP_READINESS_FLAG_STRIDE;
   }
 
   size_t payload_heap_size() const {
-    return combine_readiness_flags_offset() + payload_readiness_flag_count() * sizeof(uint8_t);
+    return combine_readiness_flags_offset() +
+           payload_readiness_flag_count() * KIWI_EP_READINESS_FLAG_STRIDE;
   }
 
   size_t protocol_epoch_offset() const { return align_up(payload_heap_size(), alignof(uint64_t)); }
