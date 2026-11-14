@@ -207,6 +207,7 @@ one link per direction, and transfers queue on it in order.
 | `MORI_IO_SIM_GPU` | The GPU whose catalog entry times XGMI, for example `mi355x`. |
 | `MORI_IO_SIM_NIC` | The NIC whose catalog entries time RDMA and TCP, for example `pollara400`. |
 | `MORI_IO_SIM_CATALOG` | Catalog file(s) to read, comma-separated. An entry replaces an earlier one for the same backend and GPU or NIC. |
+| `MORI_IO_SIM_CATALOG_STRICT` | `1` to reject a catalog field this mori does not know. By default it is skipped with a warning, so a catalog written for a newer mori still runs. |
 | `MORI_IO_SIM_<RDMA\|TCP\|XGMI>_{BW_GBPS,LATENCY_US,SEGMENT_NS,OP_US}` | Override one value. |
 | `MORI_IO_SIM_TIME_SCALE` | Divide every delay by this factor. |
 | `MORI_NODE_ID` | Node identity for XGMI's same-node check, to simulate several nodes on one host. |
