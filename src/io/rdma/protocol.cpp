@@ -75,6 +75,10 @@ const char* MessageTypeName(MessageType type) {
       return "RegEndpoint";
     case MessageType::AskMemoryRegion:
       return "AskMemoryRegion";
+    case MessageType::ReadViaWrite:
+      return "ReadViaWrite";
+    case MessageType::ReadViaWriteReply:
+      return "ReadViaWriteReply";
     default:
       return "Unknown";
   }
@@ -148,6 +152,46 @@ void Protocol::WriteMessageAskMemoryRegion(const MessageAskMemoryRegion& msg) {
   uint32_t len = static_cast<uint32_t>(buf.size());
   WriteMessageHeader({MessageType::AskMemoryRegion, len});
   WriteExact(&ep, buf.data(), buf.size(), "WriteMessageAskMemoryRegion(body)");
+}
+
+MessageReadViaWrite Protocol::ReadMessageReadViaWrite(size_t len) {
+  ValidateControlMessageLength(len, "MessageReadViaWrite");
+  std::vector<char> buf(len);
+  ReadExact(&ep, buf.data(), len, "ReadMessageReadViaWrite(body)");
+  try {
+    auto out = msgpack::unpack(buf.data(), len);
+    return out.get().as<MessageReadViaWrite>();
+  } catch (const std::exception& e) {
+    throw ProtocolError(std::string("failed to decode MessageReadViaWrite: ") + e.what());
+  }
+}
+
+void Protocol::WriteMessageReadViaWrite(const MessageReadViaWrite& msg) {
+  msgpack::sbuffer buf;
+  msgpack::pack(buf, msg);
+  uint32_t len = static_cast<uint32_t>(buf.size());
+  WriteMessageHeader({MessageType::ReadViaWrite, len});
+  WriteExact(&ep, buf.data(), buf.size(), "WriteMessageReadViaWrite(body)");
+}
+
+MessageReadViaWriteReply Protocol::ReadMessageReadViaWriteReply(size_t len) {
+  ValidateControlMessageLength(len, "MessageReadViaWriteReply");
+  std::vector<char> buf(len);
+  ReadExact(&ep, buf.data(), len, "ReadMessageReadViaWriteReply(body)");
+  try {
+    auto out = msgpack::unpack(buf.data(), len);
+    return out.get().as<MessageReadViaWriteReply>();
+  } catch (const std::exception& e) {
+    throw ProtocolError(std::string("failed to decode MessageReadViaWriteReply: ") + e.what());
+  }
+}
+
+void Protocol::WriteMessageReadViaWriteReply(const MessageReadViaWriteReply& msg) {
+  msgpack::sbuffer buf;
+  msgpack::pack(buf, msg);
+  uint32_t len = static_cast<uint32_t>(buf.size());
+  WriteMessageHeader({MessageType::ReadViaWriteReply, len});
+  WriteExact(&ep, buf.data(), buf.size(), "WriteMessageReadViaWriteReply(body)");
 }
 
 }  // namespace io

@@ -25,7 +25,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -46,6 +49,24 @@ namespace mori {
 namespace io {
 
 class RdmaAsyncEventMonitor;
+struct MessageReadViaWrite;
+struct MessageReadViaWriteReply;
+
+// Fixed-size worker pool. Shutdown runs the queued tasks, then joins.
+class TaskPool {
+ public:
+  explicit TaskPool(int numThreads);
+  ~TaskPool();
+  void Submit(std::function<void()> task);
+  void Shutdown();
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> tasks_;
+  bool stop_{false};
+  std::vector<std::thread> threads_;
+};
 
 namespace internal {
 
@@ -182,6 +203,8 @@ class NotifManager {
   void RegisterDevice(int devId);
 
   bool PopInboundTransferStatus(const EngineKey&, TransferUniqueId, TransferStatus*);
+  // Marks an inbound transfer complete without a notification message (read-via-write).
+  void MarkInboundComplete(const EngineKey&, TransferUniqueId);
 
   void MainLoop();
   void Start();
@@ -275,6 +298,16 @@ class ControlPlaneServer {
   void RegisterMemory(MemoryDesc&);
   void DeregisterMemory(const MemoryDesc&);
   application::RdmaMemoryRegion AskRemoteMemoryRegion(EngineKey, int rdevId, MemoryUniqueId);
+  bool TryGetLocalMemory(MemoryUniqueId, MemoryDesc*) const;
+  std::string GetLocalHost() const { return ctx ? ctx->GetHost() : std::string(); }
+
+  // Read-via-write: the reader sends a request and blocks for the reply; the owner runs
+  // `handler` on a serve pool, so its epoll thread keeps serving RegEndpoint/AskMemoryRegion.
+  using ReadViaWriteHandler = std::function<void(
+      const MessageReadViaWrite&, const std::string& peerIp, MessageReadViaWriteReply*)>;
+  void SetReadViaWriteHandler(ReadViaWriteHandler handler, int serveThreads);
+  void RequestReadViaWrite(const EngineKey& owner, const MessageReadViaWrite&, int timeoutMs,
+                           MessageReadViaWriteReply*);
 
   // Server management
   void MainLoop();
@@ -302,6 +335,9 @@ class ControlPlaneServer {
   NotifManager* notif{nullptr};
   std::unordered_map<EngineKey, EngineDesc> engines;
   std::unordered_map<MemoryUniqueId, MemoryDesc> mems;
+
+  ReadViaWriteHandler readViaWriteHandler_;
+  std::unique_ptr<TaskPool> servePool_;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -324,6 +360,14 @@ class RdmaBackendSession : public BackendSession {
                       const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
                       bool isRead);
 
+  // Posts without the read-via-write redirect; `notify` overrides config.enableNotification.
+  void PostBatch(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                 TransferStatus* status, TransferUniqueId id, bool isRead, bool notify);
+
+  using ReadRedirect = std::function<void(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                          const SizeVec& sizes, TransferStatus*, TransferUniqueId)>;
+  void SetReadRedirect(ReadRedirect fn) { readRedirect_ = std::move(fn); }
+
   bool Alive() const;
   bool NeedsQpReplacement() const;
 
@@ -337,6 +381,7 @@ class RdmaBackendSession : public BackendSession {
   // which reports alive because nothing is known to have failed.
   RdmaManager* rdma_{nullptr};
   MemoryLocationType localLoc_{MemoryLocationType::CPU};
+  ReadRedirect readRedirect_;
   std::shared_ptr<std::atomic<bool>> warnedChunkedWorkerFallback_{
       std::make_shared<std::atomic<bool>>(false)};
 };
@@ -425,6 +470,13 @@ class RdmaBackend : public Backend {
   std::chrono::milliseconds PaceQpReplacement(const ConnBuildKey& key, bool enforce);
   RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
+  // Read-via-write, reader side: asks the owner of `remote` to write into `local`.
+  void SubmitReadViaWrite(const MemoryDesc& local, const SizeVec& localOffsets,
+                          const MemoryDesc& remote, const SizeVec& remoteOffsets,
+                          const SizeVec& sizes, TransferStatus* status, TransferUniqueId id);
+  // Read-via-write, owner side.
+  void ServeReadViaWrite(const MessageReadViaWrite&, const std::string& peerIp,
+                         MessageReadViaWriteReply*);
   std::shared_ptr<std::mutex> GetConnBuildLock(const EngineKey& remoteEngineKey,
                                                const TopoKeyPair& topo);
 
@@ -435,6 +487,7 @@ class RdmaBackend : public Backend {
   std::unique_ptr<NotifManager> notif{nullptr};
   std::unique_ptr<ControlPlaneServer> server{nullptr};
   std::unique_ptr<Executor> executor{nullptr};
+  std::unique_ptr<TaskPool> readViaWritePool_{nullptr};
   // session cache
   std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;
