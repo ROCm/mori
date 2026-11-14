@@ -1471,7 +1471,8 @@ def _stress(op, cfg, dist_handle, device, args, comm):
     --stress-check-interval N compares every Nth round's combine output with the
     identity-expert expectation after the round, never between its dispatch and
     combine, so a combine that starts before dispatch state has landed is caught
-    rather than masked. --stress-full-node makes one node a full-capacity sender.
+    rather than masked; with --moe-sort-block-m it also checks that round's moe_sort
+    tables. --stress-full-node makes one node a full-capacity sender.
 
     v1 follows its soak with a CUDA-graph phase. Not reproduced here: graph
     capture over the internode plan sequence is untested, and adding it to a
@@ -1521,6 +1522,14 @@ def _stress(op, cfg, dist_handle, device, args, comm):
         if qp_schedule:
             op.set_active_qps(_active_qp_for(qp_schedule, i, cfg, 0))
         dispatch_out = _dispatch(op, inp, wts, sc, idx, peaks[i % len(datasets)])
+        checked = args.stress_check_interval and i % args.stress_check_interval == 0
+        if checked and args.moe_sort_block_m:
+            # Stream-ordered copies, no sync: combine resets the received count.
+            sort_inputs = (
+                dispatch_out[3].clone(),
+                dispatch_out[1].clone(),
+                dispatch_out[4].clone(),
+            )
         combine_input = _combine_input(cfg, dispatch_out[0])
         if qp_schedule:
             op.set_active_qps(_active_qp_for(qp_schedule, i, cfg, 1))
@@ -1529,12 +1538,15 @@ def _stress(op, cfg, dist_handle, device, args, comm):
         # is now honoured, passing them would make this a different kernel path
         # from the case it is meant to mirror.
         out, _ = op.combine(combine_input, None, routing=dispatch_out[5])
-        if args.stress_check_interval and i % args.stress_check_interval == 0:
+        if checked:
             golden, tolerance = expected[i % len(datasets)]
             checks += 1
             failed_checks += int(
                 not bool(((out.float() - golden).abs() <= tolerance).all())
             )
+            # The tables outlive combine, so they are checked after the round too.
+            if args.moe_sort_block_m:
+                failed_checks += int(not _check_moe_sort(op, cfg, *sort_inputs))
         if i % args.stress_sync_interval == 0:
             torch.cuda.synchronize()
     torch.cuda.synchronize()
