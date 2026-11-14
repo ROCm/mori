@@ -28,6 +28,21 @@
 
 namespace mori::umbp {
 
+enum class DeviceCopyPolicy { Default, LowPriority };
+
+// Applies only to a synchronous call on this thread; restored on exceptions.
+class ScopedDeviceCopyPolicy {
+ public:
+  explicit ScopedDeviceCopyPolicy(DeviceCopyPolicy policy);
+  ~ScopedDeviceCopyPolicy();
+  ScopedDeviceCopyPolicy(const ScopedDeviceCopyPolicy&) = delete;
+  ScopedDeviceCopyPolicy& operator=(const ScopedDeviceCopyPolicy&) = delete;
+
+ private:
+  DeviceCopyPolicy previous_;
+};
+uint64_t DeviceCopyPolicyCount(DeviceCopyPolicy policy);
+
 struct DeviceGatherFragment {
   const void* src;
   void* dst;
