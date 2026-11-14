@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: xgmi
+    folder: xgmi
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards/xgmi

@@ -1,0 +1,629 @@
+{
+  "uid": "xgmi-netmon",
+  "title": "xgmi-netmon",
+  "tags": [
+    "xgmi"
+  ],
+  "editable": true,
+  "schemaVersion": 41,
+  "refresh": "2s",
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "1s",
+      "2s",
+      "5s",
+      "10s",
+      "30s",
+      "1m"
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "experiment",
+        "label": "experiment",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "xgmi-vm"
+        },
+        "refresh": 2,
+        "sort": 0,
+        "query": "label_values(xgmi_interval_seconds, experiment)",
+        "definition": "label_values(xgmi_interval_seconds, experiment)"
+      },
+      {
+        "name": "host",
+        "label": "host",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "xgmi-vm"
+        },
+        "query": "label_values(xgmi_interval_seconds{experiment=\"$experiment\"}, host)",
+        "definition": "label_values(xgmi_interval_seconds{experiment=\"$experiment\"}, host)",
+        "refresh": 2,
+        "sort": 3
+      },
+      {
+        "name": "gpu",
+        "label": "gpu",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "xgmi-vm"
+        },
+        "query": "label_values(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}, gpu)",
+        "definition": "label_values(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}, gpu)",
+        "refresh": 2,
+        "sort": 3,
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 2
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Pick **experiment → host**. **XGMI per link** from `gpu_metrics` (PMFW refreshes it every 2 ms). Everything is computed from the sender's `xgmi_write_data_acc`: sent by the row GPU, and received = what its peers sent to it. Values are link bytes, not payload: a one-way copy shows 1.134× its payload (plus 0.57× on the reverse link); with both directions busy there is no fixed factor (MI355X, measured). Solid = average per bin, red dashed = highest single 2 ms interval, gaps = no data."
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Sent: row GPU → column GPU (average over selected range)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "xgmi-vm"
+      },
+      "description": "Average over the selected time range. Row = sending GPU, column = receiving GPU. Sender's xgmi_write_data_acc; link bytes, not payload.",
+      "gridPos": {
+        "x": 0,
+        "y": 2,
+        "w": 24,
+        "h": 12
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "expr": "sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",dir=\"wr\"}[$__range])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[$__range]))",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "peer",
+            "rowField": "gpu",
+            "valueField": "Value",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "gpu\\peer": "GPU \\ peer"
+            },
+            "indexByName": {
+              "gpu\\peer": 0,
+              "0": 1,
+              "1": 2,
+              "2": 3,
+              "3": 4,
+              "4": 5,
+              "5": 6,
+              "6": 7,
+              "7": 8
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "decimals": 1,
+          "min": 0,
+          "max": 72000000000.0,
+          "color": {
+            "mode": "continuous-GrYlRd"
+          },
+          "custom": {
+            "align": "center",
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "gradient"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "GPU \\ peer"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 12,
+      "type": "barchart",
+      "title": "Sent and received per GPU (average over selected range, all links)",
+      "description": "Average over the selected range, all links. Sent = this GPU's xgmi_write over its links; received = what its peers' xgmi_write sent to it (the receiver's own xgmi_read is not reliable over short windows when several flows arrive at once). Link bytes, not payload.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "xgmi-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 12
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "expr": "label_replace((label_replace(sum by (gpu) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[$__range])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[$__range]))), \"dir\", \"sent\", \"\", \"\")) or (sum by (gpu, dir) (label_replace(label_replace(sum by (peer) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",peer=~\"$gpu\",dir=\"wr\"}[$__range])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[$__range]))), \"gpu\", \"$1\", \"peer\", \"(.*)\"), \"dir\", \"received\", \"\", \"\"))), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "dir",
+            "rowField": "gpu",
+            "valueField": "Value",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "gpu\\dir": "GPU ID"
+            },
+            "indexByName": {
+              "gpu\\dir": 0,
+              "sent": 1,
+              "received": 2
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "GPU ID"
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "decimals": 1,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 1
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sent"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "received"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "GPU ID"
+            },
+            "properties": [
+              {
+                "id": "custom.axisLabel",
+                "value": "GPU ID"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "xField": "GPU ID",
+        "orientation": "vertical",
+        "groupWidth": 0.7,
+        "barWidth": 0.9,
+        "showValue": "auto",
+        "stacking": "none",
+        "xTickLabelRotation": 0,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Sent: GPU → GPU over time",
+      "description": "Same as the matrix above, per time bin: one line per (sending GPU, receiving GPU) link. Legend sorted by mean; click an entry to show only that link.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "xgmi-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 24,
+        "h": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "decimals": 1,
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "legendFormat": "GPU{{gpu}} → GPU{{peer}}",
+          "expr": "sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[$__interval])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__interval]))"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Sent per GPU (all links)",
+      "description": "Solid: average per time bin = bytes / time of the valid intervals in the bin. Gaps: no valid interval (nothing is filled with zeros). Link max is 72 GB/s per direction.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "xgmi-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "decimals": 1,
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "GPU{{gpu}}",
+          "expr": "sum by (gpu) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[$__interval])) / sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__interval]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          }
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "GPU $gpu by link",
+      "repeat": "gpu",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "GPU $gpu sent, by peer",
+      "description": "Solid: average per time bin = bytes / time of the valid intervals in the bin. Gaps: no valid interval (nothing is filled with zeros). Link max is 72 GB/s per direction.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "xgmi-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "decimals": 1,
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "→ GPU{{peer}}",
+          "expr": "sum by (peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=\"$gpu\",dir=\"wr\"}[$__interval])) / on () group_left sum(sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=\"$gpu\"}[$__interval]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          }
+        },
+        {
+          "refId": "B",
+          "legendFormat": "peak (one 2 ms interval, any link)",
+          "expr": "max(max_over_time(xgmi_rate_bytes_per_second{experiment=\"$experiment\",host=\"$host\",gpu=\"$gpu\",dir=\"wr\"}[$__interval]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          }
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Diagnostics",
+      "collapsed": true,
+      "gridPos": {
+        "x": 0,
+        "y": 53,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [
+        {
+          "id": 10,
+          "type": "timeseries",
+          "title": "Longest sampling interval per GPU",
+          "description": "Expected 2 ms. Longer = a snapshot was missed (no bytes lost, the rate just covers a longer interval).",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 54,
+            "w": 24,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "min": 0,
+              "decimals": 1,
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "drawStyle": "line"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "mean",
+                "max"
+              ],
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "legendFormat": "GPU{{gpu}}",
+              "expr": "max by (gpu) (max_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__interval]))",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "xgmi-vm"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
