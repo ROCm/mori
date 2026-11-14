@@ -176,11 +176,12 @@ _MI300X_SCHED_H3584_T16_FP8 = (
     (2048, 128, 16, 152, 16),
     (None, 128, 16, 64, 8),
 )
+# Single-shot fields (scatter combine, StdMoE) keep the untuned CU-scaled values.
 _MI300X_DEFAULT = dict(
-    dispatch_block_num=64,
-    combine_block_num=32,
+    dispatch_block_num=304,
+    combine_block_num=256,
     warp_num_per_block=16,
-    combine_warp_num_per_block=8,
+    combine_warp_num_per_block=4,
     schedule=_MI300X_SCHED_H7168_T8_BF16,
 )
 _MI300X_TABLE = {

@@ -72,14 +72,28 @@ def _schedules(dev_default, dev_table):
             yield f"{key} {dtype}", schedule
 
 
+def _check_geometry(name, cu, wave, disp_block, disp_warp, comb_block, comb_warp):
+    assert 1 <= disp_block <= cu, name
+    assert 1 <= comb_block <= min(cu, tc._MAX_COMBINE_BLOCKS), name
+    assert 1 <= disp_warp and disp_warp * wave <= 1024, name
+    assert 1 <= comb_warp and comb_warp * wave <= 1024, name
+
+
 @pytest.mark.parametrize("device", sorted(tc._DEVICES))
 def test_every_schedule_is_well_formed(device):
     cu, wave = _DEVICE_LIMITS[device]
-    for name, schedule in _schedules(*tc._DEVICES[device]):
+    dev_default, dev_table = tc._DEVICES[device]
+    if dev_default:
+        keys = (
+            "dispatch_block_num",
+            "warp_num_per_block",
+            "combine_block_num",
+            "combine_warp_num_per_block",
+        )
+        _check_geometry("single-shot", cu, wave, *(dev_default[k] for k in keys))
+    for name, schedule in _schedules(dev_default, dev_table):
         ceilings = [row[0] for row in schedule[:-1]]
         assert schedule[-1][0] is None and None not in ceilings, name
-        assert ceilings == sorted(set(ceilings)), name
-        for _, disp_block, disp_warp, comb_block, comb_warp in schedule:
-            assert 1 <= disp_block <= cu, name
-            assert 1 <= comb_block <= min(cu, tc._MAX_COMBINE_BLOCKS), name
-            assert disp_warp * wave <= 1024 and comb_warp * wave <= 1024, name
+        assert ceilings == sorted(set(ceilings)) and min(ceilings, default=1) >= 1, name
+        for row in schedule:
+            _check_geometry(name, cu, wave, *row[1:])
