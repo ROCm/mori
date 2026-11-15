@@ -3406,6 +3406,16 @@ constexpr bool EpFp4Ovl() {
          (kCfg.worldSize >= 8 ? (kCfg.warpPerBlock == 16 || kCfg.warpPerBlock == 24)
                               : kCfg.warpPerBlock == 24);
 }
+template <EpCfg kCfg>
+constexpr bool EpFp4OvlRoles() {
+  if constexpr (EpFp4Ovl<kCfg>() && kCfg.worldSize < 8 && !kCfg.cardCombine)
+    return !EpFp4Wire<kCfg>::kBf16;
+  return false;
+}
+__device__ __forceinline__ int EpFp4OvlRole(const int warpId) {
+  const int quad = warpId >> 2;
+  return quad == 1 || quad == 4 ? warpId ^ 20 : warpId;
+}
 // A token lands one row per distinct destination rank of its top-k experts.
 template <EpCfg kCfg>
 constexpr int EpFp4Rows() {
@@ -3535,7 +3545,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   static_assert(!W::kBf16 || (kOvlp && kSeg), "the bf16 wire runs only the overlapped split send");
 
   const int laneId = threadIdx.x & (WS - 1);
-  const int warpId = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WS));
+  const int warpId = EpFp4OvlRoles<kCfg>()
+                         ? EpFp4OvlRole(__builtin_amdgcn_readfirstlane((int)(threadIdx.x / WS)))
+                         : __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WS));
   const unsigned long long win = args.window;
   extern __shared__ char sharedMem[];
 
@@ -5803,7 +5815,7 @@ __device__ void EpCombine1250xBody(EpArgs args) {
 
   const int thdId = threadIdx.x;
   const int laneId = threadIdx.x & (WS - 1);
-  const int warpId = thdId / WS;
+  const int warpId = EpFp4OvlRoles<kCfg>() ? EpFp4OvlRole(thdId / WS) : thdId / WS;
   const int warpNum = kCfg.warpPerBlock;
   const int globalWarpId = blockIdx.x * warpNum + warpId;
   const int globalWarpNum = (int)gridDim.x * warpNum;
