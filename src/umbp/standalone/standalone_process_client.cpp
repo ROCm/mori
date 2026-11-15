@@ -37,6 +37,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -359,8 +360,13 @@ StandaloneProcessClient::~StandaloneProcessClient() { Close(); }
 std::string StandaloneProcessClient::ClientId() {
   std::lock_guard<std::mutex> lock(registration_mu_);
   if (!client_id_.empty()) return client_id_;
+  // The pid alone repeats: a worker restarted in a fresh PID namespace can
+  // get its predecessor's, whose registrations the server may still hold.
+  static const uint64_t incarnation =
+      (uint64_t{std::random_device{}()} << 32) | std::random_device{}();
   std::ostringstream oss;
-  oss << "umbp-" << getpid() << "-" << g_client_counter.fetch_add(1);
+  oss << "umbp-" << getpid() << "-" << std::hex << incarnation << "-" << std::dec
+      << g_client_counter.fetch_add(1);
   client_id_ = oss.str();
   return client_id_;
 }
