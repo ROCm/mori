@@ -384,7 +384,6 @@ def ll128_layout(cfg):
         cfg.max_num_inp_token_per_rank,
         experts_per_rank=cfg.num_experts_per_rank,
         quant_type=cfg.quant_type,
-        card_fold=_card_layout(cfg) is not None,
     )
     if geom is None:
         return None
