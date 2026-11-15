@@ -608,7 +608,8 @@ add_executable(test_standalone_shm_ipc test_standalone_shm_ipc.cpp)
 target_link_libraries(test_standalone_shm_ipc PRIVATE umbp_common
                                                       GTest::gtest_main)
 target_compile_features(test_standalone_shm_ipc PRIVATE cxx_std_17)
-add_test(NAME test_standalone_shm_ipc COMMAND test_standalone_shm_ipc)
+# Named umbp_* so CI, which runs only those, picks it up.
+add_test(NAME umbp_standalone_shm_ipc COMMAND test_standalone_shm_ipc)
 
 # test_batch_resolve_codec — struct-of-arrays BatchResolveKeysResponse wire
 # codec (batch_resolve_codec.h): encode/decode round-trip, page flattening, desc
