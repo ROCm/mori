@@ -783,20 +783,18 @@ from the local-backend shape: hardcoded stubs, matching
 
 ### 7.6 Known limitations
 
-**No crash/disconnect detection.** The only paths that tear down an
-`ExternalKvIdentityClient` are `DeregisterMemory` (explicit,
-worker-initiated) and full server shutdown. If a worker process
-crashes or is killed without calling `DeregisterMemory`, its
-`ExternalKvIdentityClient`'s heartbeat thread (which lives in the
-server process, unaffected by the worker's death) keeps running
-indefinitely — the Master's `ClientRegistry` entry for that `node_id`
-never expires, and `MatchExternalKv`/`GetExternalKvHitCounts` keep
-returning it for KV blocks that may no longer exist. This is not
-cleaned up until the entire `umbp_standalone_server` process is
-restarted. Fixing this needs a general connection-liveness/crash-detection
-mechanism — the same kind of work needed for
-`StandaloneProcessClient`'s own reconnect handling (§8, item 1) — and
-is a deliberately deferred, tracked limitation.
+**Worker exit.** An `ExternalKvIdentityClient` is torn down by
+`DeregisterMemory`, by full server shutdown, and when its worker's
+process exits, however it exits. Before its first registration a
+`StandaloneProcessClient` opens a lifeline, a connection to the
+fd-handoff socket it holds for its lifetime; when the kernel closes it,
+the server releases the worker's memory and identity as
+`DeregisterMemory` would. Otherwise a crashed worker's identity would
+keep heartbeating, so `MatchExternalKv` would keep returning blocks
+that may no longer exist, and its GPU IPC mappings would keep its KV
+cache allocated on the GPU. A worker that forks after opening its
+lifeline shares it with the child, so its exit is noticed once both
+have exited.
 
 **Lifecycle lock serializes register/deregister across workers.**
 Register, deregister, and shutdown bookkeeping for
@@ -862,11 +860,11 @@ from core memory registration via an async/retry path.
    a longer-lived sidecar that outlives several worker restarts/
    upgrades. No solution beyond the existing binary/version-pinning
    discipline.
-9. **No fd-handoff registration reaper**: if a worker sends its fd via
-   the raw fd-handoff socket and then crashes before issuing the
-   confirming gRPC `RegisterMemory` RPC, the mapping stays live in the
-   server's registry indefinitely — pre-existing, orthogonal to which
-   backend `client_` is.
+9. **fd-handoff registration of a crashed worker**: a worker that sends
+   its fd via the raw fd-handoff socket and crashes before the
+   confirming gRPC `RegisterMemory` RPC leaves a mapping in the
+   server's registry; its lifeline (§7.6), opened before the handoff,
+   releases it.
 10. **Distributed-backend test coverage**: the existing
     `test_standalone_shm_ipc.cpp` suite only exercises the
     `StandaloneClient`-backed path. A `DistributedClient`-backed test

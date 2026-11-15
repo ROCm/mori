@@ -25,6 +25,7 @@
 #include "umbp/standalone/standalone_server.h"
 
 #include <grpcpp/grpcpp.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1004,9 +1005,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status DeregisterMemory(grpc::ServerContext*,
                                 const ::umbp::DeregisterMemoryRequest* request,
                                 ::umbp::Empty*) override {
-    std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
-    RemoveExternalIdentity(request->client_id());
-    UnmapClient(request->client_id());
+    ReleaseClient(request->client_id());
     return grpc::Status::OK;
   }
 
@@ -1275,7 +1274,15 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
   void FdAcceptLoop() {
+    std::vector<pollfd> polled;
     while (fd_running_.load()) {
+      polled.assign(1, pollfd{listen_fd_, POLLIN, 0});
+      for (const auto& lifeline : lifelines_) polled.push_back({lifeline.first, POLLRDHUP, 0});
+      if (poll(polled.data(), polled.size(), -1) < 0) continue;
+      for (size_t i = 1; i < polled.size(); ++i) {
+        if (polled[i].revents != 0) DropLifeline(polled[i].fd);
+      }
+      if (polled[0].revents == 0) continue;
       int client_fd = accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
       if (client_fd < 0) {
         if (fd_running_.load()) {
@@ -1295,27 +1302,60 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
         MORI_UMBP_WARN("[StandaloneServer] failed to set fd socket timeout: {}",
                        std::strerror(errno));
       }
-      HandleFdConnection(client_fd);
+      const bool lifeline = HandleFdConnection(client_fd);
       {
         std::lock_guard<std::mutex> lock(active_fd_mu_);
         active_fd_client_ = -1;
       }
-      close(client_fd);
+      if (!lifeline) close(client_fd);
     }
+    // Shutting down: UnmapAll releases every client's memory.
+    for (const auto& lifeline : lifelines_) close(lifeline.first);
+    lifelines_.clear();
   }
 
-  void HandleFdConnection(int client_fd) {
+  // True for a client's lifeline, which the accept loop then holds.
+  bool HandleFdConnection(int client_fd) {
+    uint32_t magic = 0;
+    if (recv(client_fd, &magic, sizeof(magic), MSG_PEEK) == sizeof(magic) &&
+        magic == kLifelineMagic)
+      return AcceptLifeline(client_fd);
+
     FdRegistrationMessage msg;
     std::string error;
     int fd = RecvFdRegistration(client_fd, &msg, &error);
     if (fd < 0) {
       MORI_UMBP_WARN("[StandaloneServer] fd registration receive failed: {}", error);
       SendStatus(client_fd, -1);
-      return;
+      return false;
     }
 
     int32_t status = RegisterFd(fd, msg) ? 0 : -1;
     SendStatus(client_fd, status);
+    return false;
+  }
+
+  bool AcceptLifeline(int client_fd) {
+    std::string client_id, error;
+    if (!RecvLifeline(client_fd, &client_id, &error)) {
+      MORI_UMBP_WARN("[StandaloneServer] lifeline receive failed: {}", error);
+      SendStatus(client_fd, -1);
+      return false;
+    }
+    if (!SendStatus(client_fd, 0)) return false;
+    lifelines_[client_fd] = std::move(client_id);
+    return true;
+  }
+
+  // The client exited, or closed itself after deregistering.
+  void DropLifeline(int fd) {
+    const std::string client_id = std::move(lifelines_.at(fd));
+    lifelines_.erase(fd);
+    close(fd);
+    if (const size_t regions = ReleaseClient(client_id)) {
+      MORI_UMBP_INFO("[StandaloneServer] client_id={} exited with {} region(s) registered",
+                     client_id, regions);
+    }
   }
 
   bool RegisterFd(int fd, const FdRegistrationMessage& msg) {
@@ -1559,12 +1599,20 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return ipc_maps_.size();
   }
 
-  void UnmapClient(const std::string& client_id) {
+  // Everything a client registered, its external-KV identity included.
+  // Returns how many regions it held.
+  size_t ReleaseClient(const std::string& client_id) {
+    std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
+    RemoveExternalIdentity(client_id);
+    return UnmapClient(client_id);
+  }
+
+  size_t UnmapClient(const std::string& client_id) {
     std::vector<RegisteredMemory> mems;
     {
       std::unique_lock<std::shared_mutex> lock(memory_mu_);
       auto it = memory_.find(client_id);
-      if (it == memory_.end()) return;
+      if (it == memory_.end()) return 0;
       mems.swap(it->second);
       memory_.erase(it);
     }
@@ -1576,6 +1624,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
         "ipc_allocations_remaining={}",
         client_id, mems.size(),
         mappings_before >= mappings_after ? mappings_before - mappings_after : 0, mappings_after);
+    return mems.size();
   }
 
   void UnmapAll() {
@@ -1803,6 +1852,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   int listen_fd_ = -1;
   std::mutex active_fd_mu_;
   int active_fd_client_ = -1;
+  std::map<int, std::string> lifelines_;  // fd -> client_id; the accept loop's alone
   std::thread fd_thread_;
 };
 

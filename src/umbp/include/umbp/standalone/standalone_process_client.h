@@ -117,6 +117,9 @@ class StandaloneProcessClient : public IUMBPClient {
   bool WaitReady(int timeout_ms);
   void MaybeAutoStart();
   std::string ClientId();
+  // Opens the lifeline the server reclaims this client's memory by, or
+  // replaces one the server closed. Callers hold op_mutex_ exclusively.
+  void EnsureLifeline();
   void DeregisterMemoryLocked();
   bool RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id);
   bool RegisterHostShmMemory(uintptr_t ptr, size_t size);
@@ -137,6 +140,7 @@ class StandaloneProcessClient : public IUMBPClient {
   mutable std::shared_mutex op_mutex_;
   std::atomic<bool> closing_{false};
   bool closed_ = false;
+  int lifeline_fd_ = -1;  // under op_mutex_
   UMBPDeploymentMode backend_mode_ = UMBPDeploymentMode::StandaloneProcess;
   bool supports_ranged_io_ = false;
 

@@ -26,6 +26,7 @@
 
 #include <fcntl.h>
 #include <grpcpp/grpcpp.h>
+#include <poll.h>
 #include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -369,6 +370,24 @@ std::string StandaloneProcessClient::ClientId() {
       << g_client_counter.fetch_add(1);
   client_id_ = oss.str();
   return client_id_;
+}
+
+void StandaloneProcessClient::EnsureLifeline() {
+  if (lifeline_fd_ >= 0) {
+    pollfd lifeline{lifeline_fd_, POLLRDHUP, 0};
+    // Still open unless the server that took it is gone.
+    if (poll(&lifeline, 1, 0) == 0) return;
+    close(lifeline_fd_);
+  }
+  std::string error;
+  lifeline_fd_ =
+      OpenLifeline(fd_socket_path_, ClientId(), standalone_config_.startup_timeout_ms, &error);
+  if (lifeline_fd_ < 0) {
+    MORI_UMBP_WARN(
+        "[StandaloneProcessClient] the server at {} will not release this process's memory if it "
+        "exits without Close(): {}",
+        address_, error);
+  }
 }
 
 bool StandaloneProcessClient::WaitReady(int timeout_ms) {
@@ -917,6 +936,8 @@ void StandaloneProcessClient::Close() {
     MORI_UMBP_ERROR("[StandaloneProcessClient] deregistration during close failed");
   }
   closed_ = true;
+  if (lifeline_fd_ >= 0) close(lifeline_fd_);
+  lifeline_fd_ = -1;
   stub_.reset();
   channel_.reset();
 }
@@ -928,6 +949,8 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size,
   if (closing_) return false;
   std::unique_lock lk(op_mutex_);
   if (closed_) return false;
+  // Ahead of the registration, so no exit after it goes unnoticed.
+  EnsureLifeline();
   return call.Result(memory_exporter_->Register(*this, ptr, size, loc, device));
 }
 

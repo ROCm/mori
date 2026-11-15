@@ -52,6 +52,17 @@ int SendFdRegistration(const std::string& socket_path, int fd, const std::string
                        uintptr_t worker_base, size_t size, int timeout_ms, std::string* error);
 int RecvFdRegistration(int socket_fd, FdRegistrationMessage* message, std::string* error);
 
+// A client's lifeline: a connection to the fd socket it holds open for as
+// long as it lives. The server releases the client's memory when it closes,
+// which the kernel does however the client exits. Same message as an fd
+// registration, with this magic and no fd.
+constexpr uint32_t kLifelineMagic = 0x554d424c;  // "UMBL"
+
+// The connected socket, to keep open; -1 if the server refused it.
+int OpenLifeline(const std::string& socket_path, const std::string& client_id, int timeout_ms,
+                 std::string* error);
+bool RecvLifeline(int socket_fd, std::string* client_id, std::string* error);
+
 bool SendStatus(int socket_fd, int32_t status, std::string* error = nullptr);
 bool RecvStatus(int socket_fd, int32_t* status, std::string* error = nullptr);
 

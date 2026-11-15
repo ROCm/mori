@@ -115,6 +115,27 @@ bool SetSocketTimeouts(int fd, int timeout_ms, std::string* error) {
   return true;
 }
 
+int ConnectUds(const std::string& socket_path, int timeout_ms, std::string* error) {
+  int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (sock < 0) {
+    SetError(error, ErrnoMessage("socket"));
+    return -1;
+  }
+  sockaddr_un addr;
+  socklen_t addr_len = 0;
+  if (!SetSocketTimeouts(sock, timeout_ms, error) ||
+      !FillSockaddr(socket_path, &addr, &addr_len, error)) {
+    close(sock);
+    return -1;
+  }
+  if (connect(sock, reinterpret_cast<sockaddr*>(&addr), addr_len) != 0) {
+    SetError(error, ErrnoMessage("connect(" + socket_path + ")"));
+    close(sock);
+    return -1;
+  }
+  return sock;
+}
+
 }  // namespace
 
 std::string UnixPathFromGrpcAddress(const std::string& address) {
@@ -167,27 +188,8 @@ int SendFdRegistration(const std::string& socket_path, int fd, const std::string
     return -1;
   }
 
-  int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (sock < 0) {
-    SetError(error, ErrnoMessage("socket"));
-    return -1;
-  }
-  if (!SetSocketTimeouts(sock, timeout_ms, error)) {
-    close(sock);
-    return -1;
-  }
-
-  sockaddr_un addr;
-  socklen_t addr_len = 0;
-  if (!FillSockaddr(socket_path, &addr, &addr_len, error)) {
-    close(sock);
-    return -1;
-  }
-  if (connect(sock, reinterpret_cast<sockaddr*>(&addr), addr_len) != 0) {
-    SetError(error, ErrnoMessage("connect(" + socket_path + ")"));
-    close(sock);
-    return -1;
-  }
+  const int sock = ConnectUds(socket_path, timeout_ms, error);
+  if (sock < 0) return -1;
 
   FdRegistrationMessage msg;
   std::strncpy(msg.client_id, client_id.c_str(), sizeof(msg.client_id) - 1);
@@ -283,6 +285,39 @@ int RecvFdRegistration(int socket_fd, FdRegistrationMessage* message, std::strin
     return -1;
   }
   return received_fd;
+}
+
+int OpenLifeline(const std::string& socket_path, const std::string& client_id, int timeout_ms,
+                 std::string* error) {
+  if (client_id.empty() || client_id.size() >= kClientIdBytes) {
+    SetError(error, "client_id is empty or too long");
+    return -1;
+  }
+  const int sock = ConnectUds(socket_path, timeout_ms, error);
+  if (sock < 0) return -1;
+  FdRegistrationMessage msg;
+  msg.magic = kLifelineMagic;
+  std::strncpy(msg.client_id, client_id.c_str(), sizeof(msg.client_id) - 1);
+  int32_t status = -1;
+  const bool answered = SendAll(sock, &msg, sizeof(msg), error) && RecvStatus(sock, &status, error);
+  if (!answered || status != 0) {
+    if (answered) SetError(error, "server refused the lifeline");
+    close(sock);
+    return -1;
+  }
+  return sock;
+}
+
+bool RecvLifeline(int socket_fd, std::string* client_id, std::string* error) {
+  FdRegistrationMessage msg;
+  if (!RecvAll(socket_fd, &msg, sizeof(msg), error)) return false;
+  if (msg.magic != kLifelineMagic || msg.version != kFdRegistrationVersion ||
+      msg.client_id[kClientIdBytes - 1] != '\0' || msg.client_id[0] == '\0') {
+    SetError(error, "invalid lifeline payload");
+    return false;
+  }
+  *client_id = msg.client_id;
+  return true;
 }
 
 bool SendStatus(int socket_fd, int32_t status, std::string* error) {

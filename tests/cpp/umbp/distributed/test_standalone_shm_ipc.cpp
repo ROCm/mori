@@ -22,11 +22,14 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+#include <fcntl.h>
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
+#include <spawn.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -34,6 +37,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -46,8 +50,39 @@
 #include "umbp/umbp_client.h"
 #include "umbp_standalone.grpc.pb.h"
 
+extern char** environ;
+
 namespace mori::umbp {
 namespace {
+
+// This test binary again, running only `test`, with `env` added to the
+// environment. For the side of a test that needs a process of its own.
+pid_t SpawnSelf(const std::string& test, const std::vector<std::string>& env) {
+  std::vector<std::string> vars = env;
+  for (char** var = environ; *var != nullptr; ++var) vars.emplace_back(*var);
+  std::vector<char*> envp;
+  for (auto& var : vars) envp.push_back(var.data());
+  envp.push_back(nullptr);
+  std::string exe = "/proc/self/exe", filter = "--gtest_filter=" + test,
+              disabled = "--gtest_also_run_disabled_tests";
+  char* argv[] = {exe.data(), filter.data(), disabled.data(), nullptr};
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+  pid_t pid = -1;
+  if (posix_spawn(&pid, exe.c_str(), &actions, nullptr, argv, envp.data()) != 0) pid = -1;
+  posix_spawn_file_actions_destroy(&actions);
+  return pid;
+}
+
+// How many host buffers this process maps.
+int HostBufferMappings() {
+  std::ifstream maps("/proc/self/maps");
+  int count = 0;
+  for (std::string line; std::getline(maps, line);)
+    count += line.find("memfd:umbp_host_buffer") != std::string::npos;
+  return count;
+}
 
 TEST(StandaloneShmIpcTest, AnonymousShmRegistryLookupMapsSameMemory) {
   HostMemAllocator allocator;
@@ -710,6 +745,51 @@ TEST(StandaloneShmIpcTest, ShutdownDoesNotHangOnHalfOpenFdConnection) {
   server_thread.join();
   unlink(grpc_path.c_str());
   unlink(fd_path.c_str());
+}
+
+// The client process of ServerReleasesTheMemoryOfAClientThatExited.
+TEST(StandaloneShmIpcTest, DISABLED_RegisterThenExit) {
+  const char* address = std::getenv("UMBP_TEST_CLIENT_ADDRESS");
+  if (address == nullptr) GTEST_SKIP() << "started by another test only";
+  UMBPConfig cfg;
+  cfg.dram.capacity_bytes = 1 << 20;
+  cfg.ssd.enabled = false;
+  cfg.standalone_process.emplace().address = address;
+  auto client = CreateUMBPClient(cfg);
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  opts.prefault = false;
+  HostBufferHandle handle = allocator.Alloc(4096, opts);
+  // No Close(), as when a worker crashes.
+  _exit(client->RegisterMemory(reinterpret_cast<uintptr_t>(handle.ptr), handle.mapped_size) ? 0
+                                                                                            : 1);
+}
+
+TEST(StandaloneShmIpcTest, ServerReleasesTheMemoryOfAClientThatExited) {
+  const std::string address =
+      "unix:///tmp/umbp_standalone_exited_" + std::to_string(getpid()) + ".grpc.sock";
+  UMBPConfig cfg;
+  cfg.dram.capacity_bytes = 1 << 20;
+  cfg.ssd.enabled = false;
+  standalone::StandaloneServer server(cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread run([&] { server.Run(); });
+
+  const int before = HostBufferMappings();
+  const pid_t child = SpawnSelf("StandaloneShmIpcTest.DISABLED_RegisterThenExit",
+                                {"UMBP_TEST_CLIENT_ADDRESS=" + address});
+  ASSERT_GT(child, 0);
+  int status = 0;
+  ASSERT_EQ(waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);  // the server mapped its buffer
+  bool released = false;
+  for (int i = 0; i < 200 && !(released = HostBufferMappings() == before); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_TRUE(released);
+
+  server.Shutdown();
+  run.join();
 }
 
 // A layer-wise reader asks about one key set once per layer group, changing
