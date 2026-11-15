@@ -190,8 +190,7 @@
           "instant": true,
           "range": false,
           "format": "time_series",
-          "expr": "sum(sum by (gpu) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[${avg_window}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${avg_window}ms]))))",
-          "legendFormat": "all selected GPUs"
+          "expr": "sum(sum by (gpu) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[${avg_window}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${avg_window}ms]))))"
         }
       ],
       "fieldConfig": {
@@ -224,12 +223,12 @@
         },
         "colorMode": "value",
         "graphMode": "none",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "justifyMode": "center",
         "orientation": "auto",
         "text": {
-          "titleSize": 14,
-          "valueSize": 24
+          "titleSize": 18,
+          "valueSize": 32
         }
       }
     },
@@ -258,8 +257,7 @@
           "instant": true,
           "range": false,
           "format": "time_series",
-          "expr": "sum(sum by (gpu) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[${avg_window}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${avg_window}ms])))) / (sum(max by (gpu) (label_value(last_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[${avg_window}ms]), \"link_max_bytes_per_second\") * label_value(last_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[${avg_window}ms]), \"links\"))) > 0)",
-          "legendFormat": "of capacity"
+          "expr": "sum(sum by (gpu) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[${avg_window}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${avg_window}ms])))) / (sum(max by (gpu) (label_value(last_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[${avg_window}ms]), \"link_max_bytes_per_second\") * label_value(last_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[${avg_window}ms]), \"links\"))) > 0)"
         }
       ],
       "fieldConfig": {
@@ -308,12 +306,12 @@
         },
         "colorMode": "value",
         "graphMode": "none",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "justifyMode": "center",
         "orientation": "auto",
         "text": {
-          "titleSize": 14,
-          "valueSize": 24
+          "titleSize": 18,
+          "valueSize": 32
         }
       }
     },
@@ -380,8 +378,8 @@
         "justifyMode": "center",
         "orientation": "auto",
         "text": {
-          "titleSize": 14,
-          "valueSize": 24
+          "titleSize": 18,
+          "valueSize": 32
         }
       }
     },
@@ -448,8 +446,8 @@
         "justifyMode": "center",
         "orientation": "auto",
         "text": {
-          "titleSize": 14,
-          "valueSize": 24
+          "titleSize": 18,
+          "valueSize": 32
         }
       }
     },
@@ -478,8 +476,7 @@
           "instant": true,
           "range": false,
           "format": "time_series",
-          "expr": "min(lag(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[1h]))",
-          "legendFormat": "since the newest sample"
+          "expr": "min(lag(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[1h]))"
         }
       ],
       "fieldConfig": {
@@ -520,12 +517,12 @@
         },
         "colorMode": "value",
         "graphMode": "none",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "justifyMode": "center",
         "orientation": "auto",
         "text": {
-          "titleSize": 14,
-          "valueSize": 24
+          "titleSize": 18,
+          "valueSize": 32
         }
       }
     },
