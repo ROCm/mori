@@ -24,7 +24,9 @@
 // MIT License
 #include "umbp/standalone/standalone_server.h"
 
+#include <fcntl.h>
 #include <grpcpp/grpcpp.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -538,6 +540,17 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       MORI_UMBP_ERROR("[StandaloneServer] {}", error);
       return false;
     }
+    // Taking the sockets over from a live server would split its clients
+    // between the two. The lock goes away with the process that holds it.
+    const std::string lock_path = grpc_path + ".lock";
+    address_lock_fd_ = open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (address_lock_fd_ < 0 || flock(address_lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+      MORI_UMBP_ERROR("[StandaloneServer] cannot lock {} ({}); is another server serving {}?",
+                      lock_path, std::strerror(errno), address_);
+      if (address_lock_fd_ >= 0) close(address_lock_fd_);
+      address_lock_fd_ = -1;
+      return false;
+    }
 
     unlink(grpc_path.c_str());
     unlink(fd_socket_path_.c_str());
@@ -611,8 +624,13 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       std::unique_lock<std::shared_mutex> lock(client_mu_);
       client_->Close();
     }
+    // The sockets belong to whoever holds the lock, and are gone before it
+    // is released to the next server.
+    if (address_lock_fd_ < 0) return;
     unlink(UnixPathFromGrpcAddress(address_).c_str());
     unlink(fd_socket_path_.c_str());
+    close(address_lock_fd_);
+    address_lock_fd_ = -1;
   }
 
   grpc::Status Ping(grpc::ServerContext*, const ::umbp::Empty*,
@@ -1807,6 +1825,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   KeyHandleTable key_handles_;
   KeyHandleStats key_handle_stats_;
 
+  int address_lock_fd_ = -1;
   std::atomic<bool> fd_running_{false};
   int listen_fd_ = -1;
   std::mutex active_fd_mu_;

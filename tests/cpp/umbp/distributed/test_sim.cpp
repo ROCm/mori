@@ -791,6 +791,26 @@ TEST_F(SimTest, StandaloneShutdownAnswersADataCallThatOutlastsItsDeadline) {
   EXPECT_TRUE(put.get());
 }
 
+TEST_F(SimTest, StandaloneServerRefusesTheAddressOfALiveServer) {
+  const auto address = RankConfig().standalone_process->address;
+  auto first = std::make_unique<standalone::StandaloneServer>(Config(), address);
+  ASSERT_TRUE(first->Start());
+  {
+    standalone::StandaloneServer second(Config(), address);
+    EXPECT_FALSE(second.Start());
+  }  // and leaves the first server's sockets in place on the way out
+  EXPECT_TRUE(std::filesystem::exists(standalone::UnixPathFromGrpcAddress(address)));
+  EXPECT_TRUE(std::filesystem::exists(standalone::DeriveFdSocketPath(address)));
+  auto client = CreateUMBPClient(RankConfig());
+  const auto ptr = Buffer(kPage);
+  ASSERT_TRUE(client->RegisterMemory(ptr, kPage));
+  EXPECT_TRUE(client->Put("k", ptr, kPage));
+  client->Close();
+  first->Shutdown();
+  standalone::StandaloneServer third(Config(), address);
+  EXPECT_TRUE(third.Start());
+}
+
 TEST_F(SimTest, StandaloneRejectsMismatchedModes) {
   for (bool sim : {false, true}) {
     auto config = Config();

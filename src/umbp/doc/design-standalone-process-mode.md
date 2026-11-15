@@ -308,6 +308,11 @@ self-exit**, with idle-self-exit available as an explicit opt-in.
   shared place, computed identically on both sides, and deliberately
   has no independent config field or env var, so it cannot drift out
   of sync between the two processes.
+- One server per address: the server holds an `flock` on
+  `<socket path>.lock` while it serves, and refuses to start while
+  another process holds it, instead of taking the sockets over and
+  splitting the clients between two servers. The lock is released when
+  its holder exits, however it exits.
 - Readiness probe: connect to the UDS and call `Ping`.
 
 ### 5.2 Convenience path: auto-start (opt-in, local-backend only)
