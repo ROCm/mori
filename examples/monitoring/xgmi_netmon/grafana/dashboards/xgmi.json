@@ -454,8 +454,8 @@
     {
       "id": 25,
       "type": "stat",
-      "title": "Data age",
-      "description": "Seconds from the newest sample (looked up over 1 h; none = no data) to the end of the time range. Meaningful in live mode, when the range ends at now: live data is usually 1-6 s old (VictoriaMetrics makes new data searchable after about 5 s); red means the recorder or the push stalled.",
+      "title": "Last data",
+      "description": "Seconds from the newest sample (looked up in the hour before the end of the time range) to now. While recording 1-6 s is normal (VictoriaMetrics makes new data searchable after about 5 s); red means the recorder or the push stalled. For recorded data it shows how old the data is; no sample in that hour = no data.",
       "datasource": {
         "type": "prometheus",
         "uid": "xgmi-vm"
@@ -476,7 +476,7 @@
           "instant": true,
           "range": false,
           "format": "time_series",
-          "expr": "min(lag(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[1h]))"
+          "expr": "now() - max(tlast_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[1h]))"
         }
       ],
       "fieldConfig": {
