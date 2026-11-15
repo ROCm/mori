@@ -426,6 +426,11 @@ void TestVmCalls() {
   CHECK(VmHasSeries(u, "e", "h", &err) == 0);
   vm.series_body = R"({"status":"success","data":[{"__name__":"xgmi_interval_seconds"}]})";
   CHECK(VmHasSeries(u, "e", "h", &err) == 1);
+  {  // must look at all time: VictoriaMetrics' default window is only the last few minutes
+    const std::string path = vm.requests().back().path;
+    CHECK(path.find("start=1&") != std::string::npos &&
+          path.find("end=4102444800&") != std::string::npos);
+  }
   const std::string body = std::string(3 << 20, 'x') + "\n";  // larger than socket buffers
   CHECK(VmImport(u, body, 5000, 0, &err));
   CHECK(vm.imported() == body);

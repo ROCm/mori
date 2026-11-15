@@ -45,7 +45,9 @@ bool VmHealthy(const Url& url, std::string* err) {
 int VmHasSeries(const Url& url, const std::string& experiment, const std::string& host,
                 std::string* err) {
   std::string body;
-  const std::string q = "/api/v1/series?limit=1&match[]=" +
+  // Without start/end VictoriaMetrics only looks at the last few minutes, and start=0 counts as
+  // unset: ask for all time (data stamped a little in the future included).
+  const std::string q = "/api/v1/series?limit=1&start=1&end=4102444800&match[]=" +
                         UrlEncode(Selector("xgmi_interval_seconds", experiment, host));
   const int st = HttpRequest(url, "GET", q, "", 5000, 5000, &body, err);
   if (st != 200) {
