@@ -3434,6 +3434,7 @@ __device__ __forceinline__ int EpFp4LandTo(const EpArgs& args, int npes, int lan
   return laneId < npes ? args.destPeTokenCounter[npes + laneId] : 0;
 }
 constexpr int EpFp4PermMax = 2048;
+constexpr int kEpCardSplitUnits = 8;
 template <EpCfg kCfg>
 constexpr size_t EpFp4PendOff() {
   return (size_t)EpCombine1250xLdsBudget - (size_t)EpFp4PermMax * 2 - (size_t)kCfg.warpPerBlock * 4;
@@ -3521,6 +3522,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   constexpr int kSegL = (kOvlp && kCfg.warpPerBlock == 24) ? 1 : 4;
   constexpr int kSegMin = 64;
   constexpr bool kCard = kCfg.cardCombine;
+  constexpr int kCardWideRows = 96;
   constexpr int kStg = kCard ? 2 : 1;
   constexpr int kSegLds = kOvlp ? (int)EpFp4PendOff<kCfg>() : EpCombine1250xLdsBudget;
   constexpr int kSegStg = W::kBf16 && !kCard ? 0 : kStg * kSegP;
@@ -3719,10 +3721,22 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   const int nbRows = (int)gridDim.x;
   const int stride = nbRows * kCfg.warpPerBlock * C;
   const int rowStep = nbRows * kCfg.warpPerBlock;
-  auto segSend = [&](auto segTot, const int perBlk) {
+  auto segSend = [&](auto segTot, const int perBlk, auto wideTag) {
+    constexpr bool kWide = decltype(wideTag)::value;
     const int tot = segTot;
-    const int rb = (int)blockIdx.x * perBlk;
-    const int re = min(rb + perBlk, tot);
+    [[maybe_unused]] const int nBlk = (int)gridDim.x;
+    const int rb = kWide ? 0 : (int)blockIdx.x * perBlk;
+    const int re = kWide ? (int)((unsigned)(tot - (int)blockIdx.x + nBlk - 1) / (unsigned)nBlk)
+                         : min(rb + perBlk, tot);
+    [[maybe_unused]] const int rot = kWide ? (int)(blockIdx.x * (unsigned)re / (unsigned)nBlk) : 0;
+    auto rowAt = [&](const int p) -> int {
+      if constexpr (kWide) {
+        const int q = p + rot;
+        return (int)blockIdx.x + (q < re ? q : q - re) * nBlk;
+      } else {
+        return p;
+      }
+    };
     int nCh = rb < re ? (re - rb + kSegK - 1) / kSegK : 0;
     int rEnd = re;
     [[maybe_unused]] int nOwn = 0;
@@ -3773,16 +3787,23 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
         const int c1 = min(c0 + per, nIt);
         const float gMul = (float)kG / (float)max(1, args.numTokens);
         int g[kItW];
+        [[maybe_unused]] bool sibOf[kItW];
 #pragma unroll
         for (int j = 0; j < kItW; ++j) {
-          const int r = rb + (c0 + j) * WS + laneId;
-          g[j] = c0 + j < c1 && r < re ? map0[r] : -1;
+          const int q = rb + (c0 + j) * WS + laneId;
+          const int r = rowAt(q);
+          g[j] = c0 + j < c1 && q < re ? map0[r] : -1;
+          if constexpr (kWide) sibOf[j] = false;
           if constexpr (kCard) {
             if (g[j] >= 0) {
-              if (cardFwd[r] < 0)
+              if (cardFwd[r] < 0) {
                 g[j] = -1;
-              else if (cardRev[r] > 0)
-                g[j] = -2;
+              } else if (cardRev[r] > 0) {
+                if constexpr (kWide)
+                  sibOf[j] = true;
+                else
+                  g[j] = -2;
+              }
             }
           }
         }
@@ -3835,7 +3856,8 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           for (int k = 0; k < kGc; ++k) {
             const unsigned long long m = __ballot(g[j] == k);
             if (g[j] == k)
-              perm[off[k] + __popcll(m & below)] = (unsigned short)((c0 + j) * WS + laneId);
+              perm[off[k] + __popcll(m & below)] =
+                  (unsigned short)(((c0 + j) * WS + laneId) | (kWide && sibOf[j] ? 0x8000 : 0));
             off[k] += __popcll(m);
           }
         }
@@ -3843,14 +3865,54 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
     }
     auto rowOf = [&](const int p) -> int {
       if constexpr (kOvlp)
-        return sorted ? rb + (int)perm[p - rb] : p;
+        return sorted ? rowAt(rb + (int)(perm[p - rb] & (kWide ? 0x7fff : 0xffff))) : p;
       else
         return p;
     };
     for (int i = (int)threadIdx.x; i < 2 * kSegNb; i += (int)blockDim.x) rdy[i] = 0;
     __syncthreads();
     if constexpr (kSegWarps < kCfg.warpPerBlock) {
-      if (warpId >= kSegWarps) return;
+      if (warpId >= kSegWarps) {
+        if constexpr (kCard) {
+          constexpr int kHandW = kCfg.warpPerBlock - kSegWarps;
+          const auto* const wdh = reinterpret_cast<const ::mori::cco::ccoWindowDevice*>(win);
+          const uint64_t hStride = (uint64_t)wdh->stride4G << 32;
+          unsigned char* const inBuf = reinterpret_cast<unsigned char*>(
+              wdh->winBase + (uint64_t)wdh->lsaRank * hStride + args.offOutTok);
+          unsigned long long* const sibFlag = reinterpret_cast<unsigned long long*>(
+              wdh->winBase + (uint64_t)(args.rank ^ 1) * hStride + args.offFwdMap +
+              EpCardFlagOff(kCfg));
+          const unsigned long long handEp = args.xdbFlag[blockIdx.x] + 1ull;
+          for (int g = rb + (warpId - kSegWarps) * WS; g < re; g += kHandW * WS) {
+            const int r = g + laneId;
+            const index_t f = r < re ? cardFwd[rowAt(r)] : 0;
+            const unsigned long long m = __ballot(f < 0);
+            if (m == 0ull) continue;
+            if (src != inBuf) {
+              for (unsigned long long mm = m; mm; mm &= mm - 1) {
+                const int l = __ffsll((long long)mm) - 1;
+                const uint4* const s4 =
+                    reinterpret_cast<const uint4*>(src + (size_t)rowAt(g + l) * kTokB);
+                uint4* const d4 = reinterpret_cast<uint4*>(inBuf + (size_t)rowAt(g + l) * kTokB);
+                _mori_v4i v[kLd];
+#pragma unroll
+                for (int k = 0; k < kLd; ++k)
+                  v[k] = reinterpret_cast<const _mori_v4i*>(s4)[k * WS + laneId];
+#pragma unroll
+                for (int k = 0; k < kLd; ++k)
+                  reinterpret_cast<_mori_v4i*>(d4)[k * WS + laneId] = v[k];
+              }
+            }
+            __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            if (f < 0) {
+              __hip_atomic_store(sibFlag + ((f & 0x7fffffff) - 1), handEp, __ATOMIC_RELAXED,
+                                 __HIP_MEMORY_SCOPE_SYSTEM);
+              cardFwd[rowAt(r)] = 0;
+            }
+          }
+        }
+        return;
+      }
     }
     const auto* const wd = reinterpret_cast<const ::mori::cco::ccoWindowDevice*>(win);
     char* const wBase = wd->winBase;
@@ -3900,9 +3962,16 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
                           TdmShape<int>((int)(kTokB / 4)));
       };
       [[maybe_unused]] unsigned char* const stg2 = stgB + (size_t)(kSegP + warpId) * kTokB;
-      auto loadSib = [&](const int p, const int r) {
-        if constexpr (kCard) {
-          if (p < rb + nOwn) return;
+      auto loadSib = [&](const int p, const int r) -> bool {
+        if constexpr (!kCard) {
+          return false;
+        } else {
+          if constexpr (kWide) {
+            if (__builtin_amdgcn_readfirstlane((int)perm[p - rb]) < 0x8000) return false;
+          } else {
+            if (p < rb + nOwn) return false;
+          }
+          const int sv = __builtin_amdgcn_readfirstlane(cardRev[r]);
           EpGU64* const fl =
               (EpGU64*)(EpLocal<unsigned long long>(win, args.offFwdMap + EpCardFlagOff(kCfg)) + r);
           unsigned spin = 0;
@@ -3915,15 +3984,17 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           const unsigned char* const sr =
               reinterpret_cast<const unsigned char*>(wBase + (uint64_t)(args.rank ^ 1) * wStride +
                                                      args.offOutTok) +
-              (size_t)(__builtin_amdgcn_readfirstlane(cardRev[r]) - 1) * kTokB;
+              (size_t)(sv - 1) * kTokB;
           TdmIssueLoad<int>(reinterpret_cast<int*>(stg2), reinterpret_cast<const int*>(sr),
                             TdmShape<int>((int)(kTokB / 4)));
           if (laneId == 0) cardRev[r] = 0;
+          return true;
         }
       };
+      [[maybe_unused]] bool sibNext = false;
       if (warpId < nCh) {
         loadRow(rowOf(rb + warpId * kSegK));
-        loadSib(rb + warpId * kSegK, rowOf(rb + warpId * kSegK));
+        sibNext = loadSib(rb + warpId * kSegK, rowOf(rb + warpId * kSegK));
       }
       for (int c = warpId; c < nCh; c += kSegP) {
         const int r0 = rb + c * kSegK;
@@ -3948,8 +4019,10 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           const uint4* const l = reinterpret_cast<const uint4*>(stg);
 #pragma unroll
           for (int k = 0; k < kLd; ++k) xs[k] = l[k * WS + laneId];
+          [[maybe_unused]] const bool sibNow = sibNext;
+          sibNext = false;
           if constexpr (kCard) {
-            if (r0 + i >= rb + nOwn) {
+            if (sibNow) {
               const uint4* const l2 = reinterpret_cast<const uint4*>(stg2);
 #pragma unroll
               for (int k = 0; k < kLd; ++k) xs[k] = EpBf16x8Add(xs[k], l2[k * WS + laneId]);
@@ -3961,10 +4034,10 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
               loadRow(__builtin_amdgcn_readlane(rw, i + 1));
             else
               loadRow(rowOf(r0 + i + 1));
-            loadSib(r0 + i + 1, rowOf(r0 + i + 1));
+            sibNext = loadSib(r0 + i + 1, rowOf(r0 + i + 1));
           } else if (cNext < nCh) {
             loadRow(rowOf(rb + cNext * kSegK));
-            loadSib(rb + cNext * kSegK, rowOf(rb + cNext * kSegK));
+            sibNext = loadSib(rb + cNext * kSegK, rowOf(rb + cNext * kSegK));
           }
           quantRow(ring + (size_t)i * kWireB, xs);
         }
@@ -4013,47 +4086,6 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
                              __HIP_MEMORY_SCOPE_WORKGROUP);
         ++head;
       };
-      [[maybe_unused]] int cardG = rb + s * WS;
-      auto cardHand = [&]() -> bool {
-        if constexpr (!kCard) {
-          return false;
-        } else {
-          unsigned char* const inBuf = reinterpret_cast<unsigned char*>(
-              wBase + (uint64_t)wd->lsaRank * wStride + args.offOutTok);
-          unsigned long long* const sibFlag = reinterpret_cast<unsigned long long*>(
-              wBase + (uint64_t)(args.rank ^ 1) * wStride + args.offFwdMap + EpCardFlagOff(kCfg));
-          for (; cardG < re; cardG += kSegS * WS) {
-            const int r = cardG + laneId;
-            const index_t f = r < re ? cardFwd[r] : 0;
-            const unsigned long long m = __ballot(f < 0);
-            if (m == 0ull) continue;
-            if (src != inBuf) {
-              for (unsigned long long mm = m; mm; mm &= mm - 1) {
-                const int l = __ffsll((long long)mm) - 1;
-                const uint4* const s4 =
-                    reinterpret_cast<const uint4*>(src + (size_t)(cardG + l) * kTokB);
-                uint4* const d4 = reinterpret_cast<uint4*>(inBuf + (size_t)(cardG + l) * kTokB);
-                _mori_v4i v[kLd];
-#pragma unroll
-                for (int k = 0; k < kLd; ++k)
-                  v[k] = reinterpret_cast<const _mori_v4i*>(s4)[k * WS + laneId];
-#pragma unroll
-                for (int k = 0; k < kLd; ++k)
-                  reinterpret_cast<_mori_v4i*>(d4)[k * WS + laneId] = v[k];
-              }
-            }
-            __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-            if (f < 0) {
-              __hip_atomic_store(sibFlag + ((f & 0x7fffffff) - 1), cardEp, __ATOMIC_RELAXED,
-                                 __HIP_MEMORY_SCOPE_SYSTEM);
-              cardFwd[r] = 0;
-            }
-            cardG += kSegS * WS;
-            return true;
-          }
-          return false;
-        }
-      };
       for (int c = s; c < nCh; c += kSegS, ++x) {
         const int slot = c % kSegNb;
         [[maybe_unused]] int rwN = 0, srcN = 0;
@@ -4069,7 +4101,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
                    rdy + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)) != c + 1) {
           if (head < x) {
             retire();
-          } else if (!cardHand()) {
+          } else {
             __builtin_amdgcn_s_sleep(1);
             if (++spin > kSpinMax) __builtin_trap();
           }
@@ -4118,8 +4150,6 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
         inflight += nops;
       }
       while (head < x) retire();
-      while (cardHand()) {
-      }
       if constexpr (kSegL == 1) __builtin_amdgcn_s_setprio(0);
     }
   };
@@ -4127,7 +4157,13 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
     const int tot = args.totalRecvTokenNum[0];
     const int perBlk = (tot + (int)gridDim.x - 1) / (int)gridDim.x;
     if (kOvlp || perBlk >= kSegMin) {
-      segSend(tot, perBlk);
+      if constexpr (kCard) {
+        if (perBlk >= kCardWideRows) {
+          segSend(tot, perBlk, std::true_type{});
+          return;
+        }
+      }
+      segSend(tot, perBlk, std::false_type{});
       return;
     }
   }
@@ -4663,7 +4699,7 @@ __device__ __forceinline__ void EpFp4CombineReduce(const EpArgs& args,
 
 template <EpCfg kCfg, typename T>
 __device__ __forceinline__ void EpFp4OvlToken(const EpArgs& args, const EpFp4Item<kCfg>& r,
-                                              const int t) {
+                                              const int t, const int p0 = 0, const int pn = 0) {
   using W = EpFp4Wire<kCfg>;
   constexpr int WS = kCfg.waveSize;
   constexpr int kRows = EpFp4Rows<kCfg>();
@@ -4730,7 +4766,7 @@ __device__ __forceinline__ void EpFp4OvlToken(const EpArgs& args, const EpFp4Ite
   constexpr bool kAcross = W::kBf16 && kRows <= 4;
   static_assert(!kAcross || W::kLaneB == 64, "a bf16 lane holds 32 elements, eight 8-byte pieces");
 #pragma unroll 1
-  for (int p = 0; p < kPass; ++p) {
+  for (int p = p0; p < (pn > 0 ? p0 + pn : kPass); ++p) {
     const int g = p * WS + laneId;
     EpFp4Lane<kCfg> pk[kRows];
     unsigned sb[kRows];
@@ -4807,7 +4843,8 @@ __device__ __forceinline__ void EpFp4OvlToken(const EpArgs& args, const EpFp4Ite
 template <EpCfg kCfg, typename T>
 __device__ __forceinline__ unsigned EpFp4OvlRound(const EpArgs& args, const unsigned long long ep,
                                                   const int base, const int nw, const unsigned pend,
-                                                  unsigned* const take, const bool top) {
+                                                  unsigned* const take, const bool top,
+                                                  const bool split = false) {
   const int laneId = threadIdx.x & (kCfg.waveSize - 1);
   constexpr int kMaxRecv = EpMaxRecv(kCfg);
   EpGU64* const flags = (EpGU64*)(reinterpret_cast<unsigned long long*>(
@@ -4821,7 +4858,9 @@ __device__ __forceinline__ unsigned EpFp4OvlRound(const EpArgs& args, const unsi
   while (rest) {
     const int i = top ? 31 - __clz((int)rest) : __ffs((int)rest) - 1;
     rest &= ~(1u << i);
-    const int t = base + i * nw;
+    constexpr int kPassN = kCfg.hiddenDim / (32 * kCfg.waveSize);
+    const int u = base + i * nw;
+    const int t = split ? u / kPassN : u;
     const EpFp4Item<kCfg> r = EpFp4ReducePrep<kCfg, 1>(args, t);
     const bool mine = ((r.mask >> laneId) & 1ull) != 0;
     const bool ok =
@@ -4836,7 +4875,12 @@ __device__ __forceinline__ unsigned EpFp4OvlRound(const EpArgs& args, const unsi
                                        __HIP_MEMORY_SCOPE_WORKGROUP);
         won &= (unsigned)__shfl((int)old, 0);
       }
-      if (won) EpFp4OvlToken<kCfg, T>(args, r, t);
+      if (won) {
+        if (split)
+          EpFp4OvlToken<kCfg, T>(args, r, t, u - t * kPassN, 1);
+        else
+          EpFp4OvlToken<kCfg, T>(args, r, t);
+      }
       in |= 1u << i;
     }
   }
@@ -4845,15 +4889,18 @@ __device__ __forceinline__ unsigned EpFp4OvlRound(const EpArgs& args, const unsi
 
 template <EpCfg kCfg, typename T>
 __device__ __forceinline__ void EpFp4ReduceOvl(const EpArgs& args, const unsigned long long ep,
-                                               const int w0, const int nw, unsigned* const pend0) {
-  for (int base = w0; base < args.numTokens; base += nw * 32) {
+                                               const int w0, const int nw, unsigned* const pend0,
+                                               const bool split = false) {
+  [[maybe_unused]] const int nU =
+      split ? args.numTokens * (kCfg.hiddenDim / (32 * kCfg.waveSize)) : args.numTokens;
+  for (int base = w0; base < (kCfg.cardCombine ? nU : args.numTokens); base += nw * 32) {
     unsigned* const take = base == w0 ? pend0 : nullptr;
     unsigned pend = 0;
     for (int i = 0; i < 32; ++i)
-      if (base + i * nw < args.numTokens) pend |= 1u << i;
+      if (base + i * nw < (kCfg.cardCombine ? nU : args.numTokens)) pend |= 1u << i;
     unsigned spin = 0;
     while (pend) {
-      const unsigned in = EpFp4OvlRound<kCfg, T>(args, ep, base, nw, pend, take, false);
+      const unsigned in = EpFp4OvlRound<kCfg, T>(args, ep, base, nw, pend, take, false, split);
       pend &= ~in;
       if (take)
         pend &= __builtin_amdgcn_readfirstlane(
@@ -4868,13 +4915,14 @@ __device__ __forceinline__ void EpFp4ReduceOvl(const EpArgs& args, const unsigne
 
 template <EpCfg kCfg, typename T>
 __device__ __forceinline__ void EpFp4OvlHelp(const EpArgs& args, const unsigned long long ep,
-                                             const int w0, const int nw, unsigned* const pend0) {
+                                             const int w0, const int nw, unsigned* const pend0,
+                                             const bool split = false) {
   unsigned spin = 0;
   for (;;) {
     const unsigned pend = __builtin_amdgcn_readfirstlane(
         __hip_atomic_load(pend0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP));
     if (!pend) return;
-    if (!EpFp4OvlRound<kCfg, T>(args, ep, w0, nw, pend, pend0, true)) {
+    if (!EpFp4OvlRound<kCfg, T>(args, ep, w0, nw, pend, pend0, true, split)) {
       if (++spin > (1u << 22)) return;
       __builtin_amdgcn_s_sleep(4);
     }
@@ -5782,18 +5830,24 @@ __device__ void EpCombine1250xBody(EpArgs args) {
     const int w0 = (int)blockIdx.x * kOvlR + warpId % kOvlR;
     const int nw = (int)gridDim.x * kOvlR;
     const unsigned long long phase = args.xdbFlag[blockIdx.x];
+    [[maybe_unused]] bool split = false;
+    [[maybe_unused]] int nU = 0;
+    if constexpr (kCfg.cardCombine) {
+      split = args.numTokens * (kCfg.hiddenDim / (32 * WS)) <= nw * kEpCardSplitUnits;
+      nU = split ? args.numTokens * (kCfg.hiddenDim / (32 * WS)) : args.numTokens;
+    }
     if (warpId >= kOvlW && laneId == 0) {
       unsigned m = 0;
       for (int i = 0; i < 32; ++i)
-        if (w0 + i * nw < args.numTokens) m |= 1u << i;
+        if (w0 + i * nw < (kCfg.cardCombine ? nU : args.numTokens)) m |= 1u << i;
       *pend0 = m;
     }
     EpFp4CombineSend<kCfg, T>(args);
     if (warpId < kOvlW) {
       EpFp4OvlArrive<kCfg>(args, phase, kOvlW);
-      EpFp4OvlHelp<kCfg, T>(args, phase, w0, nw, pend0);
+      EpFp4OvlHelp<kCfg, T>(args, phase, w0, nw, pend0, split);
     } else {
-      EpFp4ReduceOvl<kCfg, T>(args, phase, w0, nw, pend0);
+      EpFp4ReduceOvl<kCfg, T>(args, phase, w0, nw, pend0, split);
     }
     EpFp4OvlWait<kCfg>(args, phase);
     __builtin_amdgcn_s_wait_tensorcnt(0);
