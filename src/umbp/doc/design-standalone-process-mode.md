@@ -345,8 +345,12 @@ this restriction.
 
 `SIGTERM`/`SIGINT` triggers, in order:
 
-1. Drain in-flight RPCs (bounded deadline, mirroring
-   `UMBP_GRPC_SHUTDOWN_DEADLINE_SEC`/`MasterServer::Shutdown()`).
+1. Wait for in-flight data calls to finish, then drain the remaining
+   RPCs (bounded deadline, mirroring
+   `UMBP_GRPC_SHUTDOWN_DEADLINE_SEC`/`MasterServer::Shutdown()`). The
+   deadline cancels calls that outlast it, and a cancelled data call
+   looks failed to its client while its handler still copies into the
+   client's memory, so data calls are never left for it to cancel.
 2. **(distributed-backend only)** Unregister all live
    `ExternalKvIdentityClient` instances (§7) — before the shared
    backend is closed, so the Master's `ClientRegistry` doesn't briefly

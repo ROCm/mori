@@ -775,6 +775,22 @@ TEST_F(SimTest, StandaloneLookupsReportMissesOnceTheLookupTimeoutPasses) {
   EXPECT_TRUE(lookups.get());
 }
 
+TEST_F(SimTest, StandaloneShutdownAnswersADataCallThatOutlastsItsDeadline) {
+  // The put's copy takes 2 s; the shutdown's gRPC deadline is 1 s.
+  Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,"bandwidth_bytes_per_second":16384}})");
+  ScopedEnv deadline("UMBP_STANDALONE_GRPC_SHUTDOWN_DEADLINE_SEC", "1");
+  standalone::StandaloneServer server(Config(), RankConfig().standalone_process->address);
+  ASSERT_TRUE(server.Start());
+  auto client = CreateUMBPClient(RankConfig());
+  const auto ptr = Buffer(8 * kPage);
+  ASSERT_TRUE(client->RegisterMemory(ptr, 8 * kPage));
+  auto put = std::async(std::launch::async, [&] { return client->Put("slow", ptr, 8 * kPage); });
+  std::this_thread::sleep_for(200ms);
+  server.Shutdown();
+  // A cancelled put would tell the client to reuse a buffer the copy still reads.
+  EXPECT_TRUE(put.get());
+}
+
 TEST_F(SimTest, StandaloneRejectsMismatchedModes) {
   for (bool sim : {false, true}) {
     auto config = Config();

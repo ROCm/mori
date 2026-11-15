@@ -590,6 +590,14 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     // round numbers would otherwise take its last, most-settled window of
     // measurements with it.
     key_handle_stats_.Report();
+    // The gRPC shutdown below cancels calls that outlast its deadline, and a
+    // cancelled data call looks failed to its client while the handler still
+    // copies into the client's memory, which the client then reuses. Every
+    // data call past its shutdown_ check holds client_mu_, and any later one
+    // returns without touching memory, so taking it waits out the ones that
+    // matter.
+    client_mu_.lock();
+    client_mu_.unlock();
     if (server_) {
       server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
     }
