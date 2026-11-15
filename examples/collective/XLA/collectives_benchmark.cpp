@@ -36,7 +36,7 @@
 //            is size/npes; for collective_permute size is the per-rank buffer;
 //            for ragged_all_to_all it is the per-rank input/output buffer.
 //                                                                      [required]
-//   --dtype  f32|bf16|f16|s32|s64   (reduction collectives)            [f32]
+//   --dtype  f32|bf16|f16|s32|s64|u8                                  [f32]
 //   --op     sum|prod|min|max       (reduction collectives)            [sum]
 //   --mode   push|pull|auto         (reduce_scatter, all_reduce)
 //            omitted: facade default (auto, or MORI_COLL_FORCE_PUSH/PULL)
@@ -158,11 +158,23 @@ __host__ __device__ __forceinline__ float PatternValue(int pe, size_t idx) {
   }
 }
 
+// float -> ElemT. Integers go through int64 and truncate, so out-of-range values
+// (all-to-all tags up to 777, the -1 ragged sentinel, u8 sum/prod) wrap like the
+// device arithmetic instead of hitting an undefined float -> narrow-int cast.
+template <class ElemT>
+__host__ __device__ __forceinline__ ElemT ToElem(float v) {
+  if constexpr (std::is_integral_v<ElemT>) {
+    return static_cast<ElemT>(static_cast<int64_t>(v));
+  } else {
+    return static_cast<ElemT>(v);
+  }
+}
+
 template <class ElemT>
 __global__ void FillCommonKernel(ElemT* buf, size_t numElements, int myPe) {
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < numElements;
        i += (size_t)gridDim.x * blockDim.x) {
-    buf[i] = static_cast<ElemT>(PatternValue<ElemT>(myPe, i));
+    buf[i] = ToElem<ElemT>(PatternValue<ElemT>(myPe, i));
   }
 }
 
@@ -175,7 +187,7 @@ __global__ void FillA2AKernel(ElemT* send, size_t chunkElems, int npes, int myPe
        g += (size_t)gridDim.x * blockDim.x) {
     const int dest = static_cast<int>(g / chunkElems);
     const size_t j = g % chunkElems;
-    send[g] = static_cast<ElemT>(
+    send[g] = ToElem<ElemT>(
         static_cast<float>(myPe * 100 + dest * 10 + static_cast<int>(j % 8)));
   }
 }
@@ -198,7 +210,7 @@ __global__ void VerifyReduceKernel(const ElemT* output, size_t count, size_t glo
         return hipSuccess;
       });
       if (err != hipSuccess) { atomicAdd(errorCount, 1u); break; }
-      acc = static_cast<float>(static_cast<ElemT>(acc));
+      acc = static_cast<float>(ToElem<ElemT>(acc));
     }
     if (fabsf(static_cast<float>(output[i]) - acc) > 1e-3f) {
       atomicAdd(errorCount, 1u);
@@ -232,7 +244,7 @@ __global__ void VerifyA2AKernel(const ElemT* recv, size_t chunkElems, int npes, 
     const int s = static_cast<int>(g / chunkElems);
     const size_t j = g % chunkElems;
     // Round through ElemT like the fill did: bf16 cannot hold e.g. 777 exactly.
-    float expected = static_cast<float>(static_cast<ElemT>(
+    float expected = static_cast<float>(ToElem<ElemT>(
         static_cast<float>(s * 100 + myPe * 10 + static_cast<int>(j % 8))));
     if (fabsf(static_cast<float>(recv[g]) - expected) > 1e-3f) {
       atomicAdd(errorCount, 1u);
@@ -266,8 +278,8 @@ __global__ void FillRaggedKernel(ElemT* input, ElemT* output, size_t rows, size_
   const size_t N = rows * rowElems;
   for (size_t g = blockIdx.x * blockDim.x + threadIdx.x; g < N;
        g += (size_t)gridDim.x * blockDim.x) {
-    input[g] = static_cast<ElemT>(RaggedTag(myPe, g / rowElems, g % rowElems));
-    output[g] = static_cast<ElemT>(kRaggedSentinel);
+    input[g] = ToElem<ElemT>(RaggedTag(myPe, g / rowElems, g % rowElems));
+    output[g] = ToElem<ElemT>(kRaggedSentinel);
   }
 }
 
@@ -280,10 +292,10 @@ __global__ void VerifyRaggedKernel(const ElemT* output, const int64_t* expect, s
   for (size_t g = blockIdx.x * blockDim.x + threadIdx.x; g < N;
        g += (size_t)gridDim.x * blockDim.x) {
     const int64_t e = expect[g / rowElems];
-    const float expected =
+    const float expected = static_cast<float>(ToElem<ElemT>(
         e < 0 ? kRaggedSentinel
               : RaggedTag(static_cast<int>(e / static_cast<int64_t>(rows)),
-                          static_cast<size_t>(e % static_cast<int64_t>(rows)), g % rowElems);
+                          static_cast<size_t>(e % static_cast<int64_t>(rows)), g % rowElems)));
     if (fabsf(static_cast<float>(output[g]) - expected) > 1e-3f) {
       atomicAdd(errorCount, 1u);
     }
@@ -843,6 +855,7 @@ static bool ParseDtype(const char* s, DataType& dt) {
   else if (!std::strcmp(s, "f16")) dt = DataType::F16;
   else if (!std::strcmp(s, "s32")) dt = DataType::S32;
   else if (!std::strcmp(s, "s64")) dt = DataType::S64;
+  else if (!std::strcmp(s, "u8")) dt = DataType::U8;
   else return false;
   return true;
 }
@@ -883,7 +896,7 @@ static const char* ModeName(RsMode m) {
 
 static void Usage(const char* prog) {
   XPUT("Usage: %s --coll <name> --npes <n> --size <num_elems> "
-       "[--dtype f32|bf16|f16|s32|s64] [--op sum|prod|min|max] "
+       "[--dtype f32|bf16|f16|s32|s64|u8] [--op sum|prod|min|max] "
        "[--mode push|pull|auto|alt (alt: flip push/pull every call)] "
        "[--logS <n>, -1 = auto] [--warmup <n>] [--iters <n>] [--sub base:n [--mix]] "
        "[--row <elems>] [--updates <n>] [--zero-frac <f>] [--seed <n>] [--uniform]\n"
