@@ -327,8 +327,10 @@ void TestRates() {
   CHECK(c.pending() == 0);
   const std::string M = "{\"metric\":{\"__name__\":\"";
   const std::string L = "\",\"experiment\":\"exp\\\"1\",\"host\":\"h1\",\"gpu\":\"0\"";
+  // the interval series also carries the link capacity (1 connected link here, 72 GB/s)
+  const std::string LI = L + ",\"links\":\"1\",\"link_max_bytes_per_second\":\"72000000000\"";
   const std::string T1 = "1000000000125", T3 = "1000000000129", T4 = "1000000000131";
-  CHECK_STR(out, M + "xgmi_interval_seconds" + L +
+  CHECK_STR(out, M + "xgmi_interval_seconds" + LI +
                      "},\"values\":[0.002000000,0.002000000,0.002000000],\"timestamps\":[" + T1 +
                      "," + T3 + "," + T4 + "]}\n" + M + "xgmi_bytes" + L +
                      ",\"peer\":\"4\",\"dir\":\"rd\"},\"values\":[1024000,0]," +

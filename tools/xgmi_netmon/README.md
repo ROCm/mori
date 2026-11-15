@@ -99,16 +99,32 @@ with a partial record; `import` drops it. A recorder that died leaves `status: r
 - Payload = sent / 1.134 holds only for one-way traffic (1.118 on Crusoe v3-088, a VM with a
   newer driver). One copy ran at 61 GB/s payload; the link max is 72 GB/s per direction.
 - Series: `xgmi_bytes`, `xgmi_rate_bytes_per_second` (labels experiment, host, gpu, peer,
-  dir = wr | rd) and `xgmi_interval_seconds` (per GPU). Point time = wall clock of the read
+  dir = wr | rd) and `xgmi_interval_seconds` (per GPU, with the labels `links` and
+  `link_max_bytes_per_second`: the link capacity from `gpu_metrics`, for the dashboard's reference
+  lines). Point time = wall clock of the read
   that first saw the snapshot. Both the push and `import` write VictoriaMetrics' `/api/v1/import`
   format, one JSON line per series (as ainic-netmon), so labels are sent once per request.
 
 ## Dashboard
 
-Pick experiment, host, GPU. Sent matrix (row GPU -> column GPU, average over the range); sent and
-received per GPU as bars (average GB/s over the range; received = what the peers sent to it); sent
-GPU -> GPU over time; sent per GPU; one row per GPU by peer with the 2 ms peak (red dashed); and
-diagnostics (longest sampling interval). All panels use the senders' `xgmi_write`.
+Pick experiment, host, GPU and the resolution (the finest bin of the time charts: auto = 6 ms,
+10 ms, 100 ms, 1 s, 5 s; the data itself is 2 ms, coarser bins average more). Top to bottom:
+
+- GPU overview table (like rdmatop's device table): per GPU the average sent and received
+  bandwidth over the range, each also as a bar of the GPU's capacity (links x link max), the
+  highest single 2 ms interval on any link, and a trend of the sent bandwidth.
+- Sent matrix: row GPU -> column GPU, average over the range (colour scale 0-72 GB/s).
+- Sent and received per GPU as bars (average GB/s over the range).
+- Sent GPU -> GPU over time, sent per GPU, and one row per GPU with the sent bandwidth to each
+  peer and the 2 ms peak (red dashed).
+- Diagnostics: the longest sampling interval per GPU.
+
+All panels use the senders' `xgmi_write`; received is what the peers sent to the GPU. The time
+charts are steps: a point is the average of the bin that ends at it, so the value is drawn over
+that bin, not as a slope between points. The grey dashed lines are the capacity of one link and of
+all links of a GPU, read from the `links` / `link_max_bytes_per_second` labels (data recorded
+before they existed has no reference lines and no load bars). The average panels use the exact
+selected range (`${__range_ms}ms`; Grafana's `$__range` is whole seconds and would cut the start).
 
 ## Measured on n06-21 (MI355X, 8 GPUs, idle)
 

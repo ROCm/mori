@@ -31,7 +31,8 @@
 // Series, labels experiment, host, gpu, and peer, dir per link (dir = wr: sent by this GPU on the
 // link, rd: received):
 //   xgmi_bytes, xgmi_rate_bytes_per_second  per link and direction
-//   xgmi_interval_seconds                   per GPU
+//   xgmi_interval_seconds                   per GPU; extra labels links (connected links) and
+//                                           link_max_bytes_per_second (one link, one direction)
 // Output is VictoriaMetrics' /api/v1/import format, one JSON line per series (as ainic-netmon):
 //   {"metric":{"__name__":...,labels},"values":[...],"timestamps":[...]}
 // so the labels are sent once per series and flush, not once per point.

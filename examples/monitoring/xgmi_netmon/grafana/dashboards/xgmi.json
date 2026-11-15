@@ -71,6 +71,46 @@
             "$__all"
           ]
         }
+      },
+      {
+        "name": "resolution",
+        "label": "resolution",
+        "type": "custom",
+        "multi": false,
+        "includeAll": false,
+        "query": "auto : 6ms, 10 ms : 10ms, 100 ms : 100ms, 1 s : 1s, 5 s : 5s",
+        "current": {
+          "text": "auto",
+          "value": "6ms",
+          "selected": true
+        },
+        "options": [
+          {
+            "text": "auto",
+            "value": "6ms",
+            "selected": true
+          },
+          {
+            "text": "10 ms",
+            "value": "10ms",
+            "selected": false
+          },
+          {
+            "text": "100 ms",
+            "value": "100ms",
+            "selected": false
+          },
+          {
+            "text": "1 s",
+            "value": "1s",
+            "selected": false
+          },
+          {
+            "text": "5 s",
+            "value": "5s",
+            "selected": false
+          }
+        ]
       }
     ]
   },
@@ -87,7 +127,280 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "Pick **experiment → host**. **XGMI per link** from `gpu_metrics` (PMFW refreshes it every 2 ms). Everything is computed from the sender's `xgmi_write_data_acc`: sent by the row GPU, and received = what its peers sent to it. Values are link bytes, not payload: a one-way copy shows 1.134× its payload (plus 0.57× on the reverse link); with both directions busy there is no fixed factor (MI355X, measured). Solid = average per bin, red dashed = highest single 2 ms interval, gaps = no data."
+        "content": "Pick **experiment → host**; **resolution** is the finest bin of the time charts (auto = 6 ms, the data itself is 2 ms; coarser values average more). **XGMI per link** from `gpu_metrics`. Everything is computed from the sender's `xgmi_write_data_acc`: sent by the row GPU, and received = what its peers sent to it. Values are link bytes, not payload: a one-way copy shows 1.134× its payload (plus 0.57× on the reverse link); with both directions busy there is no fixed factor (MI355X, measured). Time charts are steps (each value covers the bin ending at its point); red dashed = highest single 2 ms interval, grey dashed = link capacity, gaps = no data."
+      }
+    },
+    {
+      "id": 13,
+      "type": "table",
+      "title": "GPU overview (average over selected range)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "xgmi-vm"
+      },
+      "description": "Per GPU: average bandwidth sent / received over the selected range (all links), the same as a share of the GPU's capacity (links x link max), the highest single 2 ms interval on any of its links, and the trend of the sent bandwidth. Received = what the peers sent to the GPU (see the note on top). Load bars need the link capacity labels (data recorded with this version); older data shows no bar.",
+      "gridPos": {
+        "x": 0,
+        "y": 2,
+        "w": 24,
+        "h": 11
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "expr": "label_replace(sum by (gpu) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[${__range_ms}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${__range_ms}ms]))), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "expr": "label_replace(sum by (gpu) (label_replace(sum by (peer) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",peer=~\"$gpu\",dir=\"wr\"}[${__range_ms}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${__range_ms}ms]))), \"gpu\", \"$1\", \"peer\", \"(.*)\")), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "expr": "label_replace(max by (gpu) (max_over_time(xgmi_rate_bytes_per_second{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[${__range_ms}ms])), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "expr": "label_replace(sum by (gpu) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[${__range_ms}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${__range_ms}ms]))) / on (gpu) (max by (gpu) (label_value(last_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${__range_ms}ms]), \"link_max_bytes_per_second\") * label_value(last_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${__range_ms}ms]), \"links\")) > 0), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "expr": "label_replace(sum by (gpu) (label_replace(sum by (peer) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",peer=~\"$gpu\",dir=\"wr\"}[${__range_ms}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${__range_ms}ms]))), \"gpu\", \"$1\", \"peer\", \"(.*)\")) / on (gpu) (max by (gpu) (label_value(last_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${__range_ms}ms]), \"link_max_bytes_per_second\") * label_value(last_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${__range_ms}ms]), \"links\")) > 0), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "interval": "$resolution",
+          "legendFormat": "GPU{{gpu}}",
+          "expr": "label_replace(sum by (gpu) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[$__interval])) / sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__interval])), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "filter": {
+            "id": "byRefId",
+            "options": "A|B|C|D|E"
+          },
+          "options": {
+            "excludeByName": {
+              "Time": true
+            }
+          }
+        },
+        {
+          "id": "timeSeriesTable",
+          "options": {}
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "gpu",
+            "mode": "outerTabular"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "gpu": 0,
+              "Value #A": 1,
+              "Value #D": 2,
+              "Value #B": 3,
+              "Value #E": 4,
+              "Value #C": 5,
+              "Trend #F": 6
+            },
+            "renameByName": {
+              "gpu": "GPU",
+              "Value #A": "Sent",
+              "Value #D": "Sent load",
+              "Value #B": "Received",
+              "Value #E": "Received load",
+              "Value #C": "Peak link (2 ms)",
+              "Trend #F": "Sent trend"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "GPU"
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "GPU"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(Sent|Received|Peak link \\(2 ms\\))$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "Bps"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(Sent|Received) load$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.5
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.8
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Sent trend"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "sparkline",
+                  "drawStyle": "line",
+                  "lineInterpolation": "stepBefore",
+                  "lineWidth": 1,
+                  "fillOpacity": 20,
+                  "hideValue": true
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "md"
       }
     },
     {
@@ -98,10 +411,10 @@
         "type": "prometheus",
         "uid": "xgmi-vm"
       },
-      "description": "Average over the selected time range. Row = sending GPU, column = receiving GPU. Sender's xgmi_write_data_acc; link bytes, not payload.",
+      "description": "Average over the selected time range. Row = sending GPU, column = receiving GPU. Sender's xgmi_write_data_acc; link bytes, not payload. Colour scale: 0 to 72 GB/s (one MI355X link).",
       "gridPos": {
         "x": 0,
-        "y": 2,
+        "y": 13,
         "w": 24,
         "h": 12
       },
@@ -112,7 +425,7 @@
             "type": "prometheus",
             "uid": "xgmi-vm"
           },
-          "expr": "sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",dir=\"wr\"}[$__range])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[$__range]))",
+          "expr": "sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",dir=\"wr\"}[${__range_ms}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${__range_ms}ms]))",
           "instant": true,
           "range": false,
           "format": "table"
@@ -202,7 +515,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 14,
+        "y": 25,
         "w": 24,
         "h": 12
       },
@@ -216,7 +529,7 @@
           "instant": true,
           "range": false,
           "format": "table",
-          "expr": "label_replace((label_replace(sum by (gpu) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[$__range])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[$__range]))), \"dir\", \"sent\", \"\", \"\")) or (sum by (gpu, dir) (label_replace(label_replace(sum by (peer) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",peer=~\"$gpu\",dir=\"wr\"}[$__range])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[$__range]))), \"gpu\", \"$1\", \"peer\", \"(.*)\"), \"dir\", \"received\", \"\", \"\"))), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
+          "expr": "label_replace((label_replace(sum by (gpu) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[${__range_ms}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${__range_ms}ms]))), \"dir\", \"sent\", \"\", \"\")) or (sum by (gpu, dir) (label_replace(label_replace(sum by (peer) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",peer=~\"$gpu\",dir=\"wr\"}[${__range_ms}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${__range_ms}ms]))), \"gpu\", \"$1\", \"peer\", \"(.*)\"), \"dir\", \"received\", \"\", \"\"))), \"gpu\", \"GPU$1\", \"gpu\", \"(.*)\")"
         }
       ],
       "transformations": [
@@ -334,14 +647,14 @@
       "id": 11,
       "type": "timeseries",
       "title": "Sent: GPU → GPU over time",
-      "description": "Same as the matrix above, per time bin: one line per (sending GPU, receiving GPU) link. Legend sorted by mean; click an entry to show only that link.",
+      "description": "Same as the matrix, per time bin: one line per (sending GPU, receiving GPU) link. Steps: each value covers the bin ending at its point. Dashed grey = link capacity (xgmi link width x speed from gpu_metrics). Legend sorted by mean; click an entry to show only that link.",
       "datasource": {
         "type": "prometheus",
         "uid": "xgmi-vm"
       },
       "gridPos": {
         "x": 0,
-        "y": 26,
+        "y": 37,
         "w": 24,
         "h": 10
       },
@@ -355,10 +668,49 @@
             "fillOpacity": 0,
             "showPoints": "never",
             "spanNulls": false,
-            "drawStyle": "line"
+            "drawStyle": "line",
+            "lineInterpolation": "stepBefore"
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    8
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8c8c8c"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "linear"
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
@@ -384,7 +736,21 @@
             "uid": "xgmi-vm"
           },
           "legendFormat": "GPU{{gpu}} → GPU{{peer}}",
-          "expr": "sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[$__interval])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__interval]))"
+          "expr": "sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[$__interval])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__interval]))",
+          "interval": "$resolution"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "interval": "$resolution",
+          "legendFormat": "link max (one link, one direction)",
+          "expr": "max(label_value(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}, \"link_max_bytes_per_second\"))"
         }
       ]
     },
@@ -392,14 +758,14 @@
       "id": 4,
       "type": "timeseries",
       "title": "Sent per GPU (all links)",
-      "description": "Solid: average per time bin = bytes / time of the valid intervals in the bin. Gaps: no valid interval (nothing is filled with zeros). Link max is 72 GB/s per direction.",
+      "description": "Sent by each GPU over all its links, per time bin (steps). Dashed grey = capacity of all its links in one direction.",
       "datasource": {
         "type": "prometheus",
         "uid": "xgmi-vm"
       },
       "gridPos": {
         "x": 0,
-        "y": 36,
+        "y": 47,
         "w": 24,
         "h": 8
       },
@@ -410,13 +776,52 @@
           "decimals": 1,
           "custom": {
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
             "showPoints": "never",
             "spanNulls": false,
-            "drawStyle": "line"
+            "drawStyle": "line",
+            "lineInterpolation": "stepBefore"
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    8
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8c8c8c"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "linear"
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
@@ -442,7 +847,21 @@
           "datasource": {
             "type": "prometheus",
             "uid": "xgmi-vm"
-          }
+          },
+          "interval": "$resolution"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "interval": "$resolution",
+          "legendFormat": "GPU capacity (links x link max)",
+          "expr": "max(label_value(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}, \"link_max_bytes_per_second\") * label_value(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}, \"links\"))"
         }
       ]
     },
@@ -454,7 +873,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 44,
+        "y": 55,
         "w": 24,
         "h": 1
       },
@@ -471,7 +890,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 45,
+        "y": 56,
         "w": 24,
         "h": 8
       },
@@ -482,10 +901,11 @@
           "decimals": 1,
           "custom": {
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 5,
             "showPoints": "never",
             "spanNulls": false,
-            "drawStyle": "line"
+            "drawStyle": "line",
+            "lineInterpolation": "stepBefore"
           }
         },
         "overrides": [
@@ -511,6 +931,47 @@
                   "mode": "fixed",
                   "fixedColor": "red"
                 }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    8
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8c8c8c"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "linear"
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
               }
             ]
           }
@@ -540,7 +1001,8 @@
           "datasource": {
             "type": "prometheus",
             "uid": "xgmi-vm"
-          }
+          },
+          "interval": "$resolution"
         },
         {
           "refId": "B",
@@ -549,7 +1011,21 @@
           "datasource": {
             "type": "prometheus",
             "uid": "xgmi-vm"
-          }
+          },
+          "interval": "$resolution"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "interval": "$resolution",
+          "legendFormat": "link max (one link, one direction)",
+          "expr": "max(label_value(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=\"$gpu\"}, \"link_max_bytes_per_second\"))"
         }
       ]
     },
@@ -560,7 +1036,7 @@
       "collapsed": true,
       "gridPos": {
         "x": 0,
-        "y": 53,
+        "y": 64,
         "w": 24,
         "h": 1
       },
@@ -576,7 +1052,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 54,
+            "y": 65,
             "w": 24,
             "h": 8
           },
@@ -590,7 +1066,8 @@
                 "fillOpacity": 0,
                 "showPoints": "never",
                 "spanNulls": false,
-                "drawStyle": "line"
+                "drawStyle": "line",
+                "lineInterpolation": "stepBefore"
               }
             },
             "overrides": []
@@ -619,7 +1096,8 @@
               "datasource": {
                 "type": "prometheus",
                 "uid": "xgmi-vm"
-              }
+              },
+              "interval": "$resolution"
             }
           ]
         }

@@ -63,7 +63,14 @@ RateCalc::RateCalc(const std::string& experiment, const std::string& host, int g
   const std::string base = ",\"experiment\":" + JsonString(experiment) +
                            ",\"host\":" + JsonString(host) + ",\"gpu\":\"" + std::to_string(gpu) +
                            "\"";
-  interval_.head = "{\"metric\":{\"__name__\":\"xgmi_interval_seconds\"" + base + "},\"values\":[";
+  // The per-GPU series also carries the link capacity (number of connected links and the
+  // per-direction max of one link, from gpu_metrics), so dashboards draw reference lines
+  // without assuming a GPU model; no extra points are sent.
+  int links = 0;
+  for (int p = 0; p < kNumLinks; ++p) links += peer[p] >= 0;
+  interval_.head = "{\"metric\":{\"__name__\":\"xgmi_interval_seconds\"" + base + ",\"links\":\"" +
+                   std::to_string(links) + "\",\"link_max_bytes_per_second\":\"" +
+                   std::to_string(static_cast<unsigned long long>(link_max)) + "\"},\"values\":[";
   static const char* const kDir[2] = {"rd", "wr"};
   static const char* const kName[2] = {"xgmi_bytes", "xgmi_rate_bytes_per_second"};
   for (int p = 0; p < kNumLinks; ++p) {
