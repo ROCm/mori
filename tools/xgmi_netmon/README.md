@@ -107,24 +107,40 @@ with a partial record; `import` drops it. A recorder that died leaves `status: r
 
 ## Dashboard
 
-Pick experiment, host, GPU and the resolution (the finest bin of the time charts: auto = 6 ms,
-10 ms, 100 ms, 1 s, 5 s; the data itself is 2 ms, coarser bins average more). Top to bottom:
+Pick experiment, host, GPU and two variables:
 
+- **resolution**: the finest bin of the time charts (auto = 6 ms, 10 ms, 100 ms, 1 s, 5 s; the data
+  itself is 2 ms, coarser bins average more).
+- **average window**: what the tiles, tables, matrix and bars average over: the selected range, or
+  only the last 1 s / 10 s / 1 min before its end (for live use, where the range is minutes long).
+
+Top to bottom:
+
+- Tiles: total sent, total load (share of the capacity), busiest GPU, hottest link and data age.
+  *Busiest GPU* is the GPU with the highest average sent bandwidth (its 7 links added) in the
+  window. *Hottest link* is the link with the highest single 2 ms interval in the window, so it is
+  a peak, not an average. *Data age* is the time from the newest sample (within 1 h) to the end of
+  the range: in live mode 1-6 s is normal (VictoriaMetrics makes new data searchable after about
+  5 s), red from 30 s means the recorder or the push stalled.
 - GPU overview table (like rdmatop's device table): per GPU the average sent and received
-  bandwidth over the range, each also as a bar of the GPU's capacity (links x link max), the
-  highest single 2 ms interval on any link, and a trend of the sent bandwidth.
-- Sent matrix: row GPU -> column GPU, average over the range (colour scale 0-72 GB/s).
-- Sent and received per GPU as bars (average GB/s over the range).
-- Sent GPU -> GPU over time, sent per GPU, and one row per GPU with the sent bandwidth to each
-  peer and the 2 ms peak (red dashed).
+  bandwidth, each also as a bar of the GPU's capacity (links x link max), the highest single 2 ms
+  interval on any link, the coverage (the share of the window with valid sampling intervals; below
+  100 % the numbers cover only part of the window) and a trend of the sent bandwidth. Bar colours as
+  in rdmatop: under 5 % grey, 5-40 % dim green, 40-70 % green, 70-85 % yellow, from 85 % red.
+- Sent matrix: row GPU -> column GPU (colour scale 0-72 GB/s).
+- Sent and received per GPU as bars (average GB/s).
+- Sent GPU -> GPU over time, and sent per GPU.
+- One row per GPU: the sent bandwidth to each peer over time with the 2 ms peak (red dashed), and
+  a link table (one row per link: sent, share of one link's capacity, 2 ms peak, trend).
 - Diagnostics: the longest sampling interval per GPU.
 
 All panels use the senders' `xgmi_write`; received is what the peers sent to the GPU. The time
 charts are steps: a point is the average of the bin that ends at it, so the value is drawn over
 that bin, not as a slope between points. The grey dashed lines are the capacity of one link and of
 all links of a GPU, read from the `links` / `link_max_bytes_per_second` labels (data recorded
-before they existed has no reference lines and no load bars). The average panels use the exact
-selected range (`${__range_ms}ms`; Grafana's `$__range` is whole seconds and would cut the start).
+before they existed has no reference lines, no load bars and no total load). The average panels
+use exact milliseconds (`${__range_ms}ms`; Grafana's `$__range` is whole seconds and would cut the
+start).
 
 ## Measured on n06-21 (MI355X, 8 GPUs, idle)
 
