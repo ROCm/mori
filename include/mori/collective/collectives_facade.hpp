@@ -365,8 +365,9 @@ class CollectivesFacade {
   // output is this PE's reduced shard. `count` is the per-rank shard element
   // count (chunk = count); the full input is npes*count. SetReduceMode() selects
   // push|pull; SetPushLogSlices() tunes the push slice count. `dt` and `op`
-  // select the element type and reduction; F32/BF16/F16/S32/S64 support all four
-  // ops (SUM/PRODUCT/MIN/MAX). isAsync always pushes and returns once the SDMA
+  // select the element type and reduction; F32/BF16/F16/S32/S64/U8 support all four
+  // ops (SUM/PRODUCT/MIN/MAX). `count` must be a multiple of the reduce pack
+  // (2 for BF16/F16, 4 for U8). isAsync always pushes and returns once the SDMA
   // scatter is issued; the reduce runs in AsyncDone. Input must stay untouched
   // and output unread until then, and no other collective may run on this
   // communicator in between.
@@ -379,7 +380,7 @@ class CollectivesFacade {
   // count (chunk = numElems / npes). npes in [1,8]. SetReduceMode() selects
   // push (sliced SDMA reduce-scatter + pipelined broadcast) or pull (two-shot:
   // reduce-scatter pull then all-gather pull, no SDMA). `dt`/`op` select the
-  // element type and reduction; F32/BF16/F16/S32/S64 support all four ops.
+  // element type and reduction; F32/BF16/F16/S32/S64/U8 support all four ops.
   hipError_t RunAllReduce(const void* input, void* output, size_t numElems,
                           DataType dt, ReduceOpKind op, hipStream_t stream);
 

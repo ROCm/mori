@@ -147,8 +147,8 @@ struct ProdOp {
 
 // Maps a storage element type to the type used to INSTANTIATE the reduce kernels.
 // float/s32 reduce as themselves; s64 is 8B so vecSize is 2; bf16/f16 reduce as a
-// packed pair so vecSize stays at fp32 parity and the 8x8 accumulator tile does
-// not spill. Data buffers stay physically ElemT; host code reinterpret_casts them
+// packed pair and u8 as a packed quad, so vecSize stays at fp32 parity and the
+// 8x8 accumulator tile does not spill. Data buffers stay physically ElemT; host code reinterpret_casts them
 // to ComputeT and passes counts in packs (kPack = sizeof(ComputeT)/sizeof(ElemT)).
 template <class T>
 struct ReduceComputeType {
@@ -169,6 +169,8 @@ COLL_HOST_DEVICE hipError_t DispatchReduceType(DataType dt, F&& func) {
       return std::forward<F>(func)(int32_t{});
     case DataType::S64:
       return std::forward<F>(func)(int64_t{});
+    case DataType::U8:
+      return std::forward<F>(func)(uint8_t{});
 #endif
     default:
       return hipErrorNotSupported;
@@ -226,6 +228,15 @@ struct ReduceComputeType<hip_bfloat16> {
 template <>
 struct ReduceComputeType<__half> {
   using type = F16Pack;
+};
+
+struct alignas(4) U8Pack {
+  uint8_t v[4];
+};
+static_assert(sizeof(U8Pack) == 4 && alignof(U8Pack) == 4);
+template <>
+struct ReduceComputeType<uint8_t> {
+  using type = U8Pack;
 };
 
 __device__ __forceinline__ float2 UnpackBf16Pack(BF16Pack a) {
@@ -323,6 +334,60 @@ struct MaxOp<F16Pack> {
     const __half2 ha = ToHalf2(a);
     const __half2 hb = ToHalf2(b);
     return FromHalf2(__half2{__hmax(ha.x, hb.x), __hmax(ha.y, hb.y)});
+  }
+};
+
+// u8 ops follow XLA unsigned semantics: SUM and PRODUCT wrap modulo 256.
+// PROD/MIN/MAX split the quad into its even and odd bytes, each widened to a
+// packed u16 pair, so every op is two V_PK_*_U16 instead of four byte extracts
+// per operand (which held ~1.4x the VGPRs in the pull kernels' register tile).
+using U16x2 = uint16_t __attribute__((ext_vector_type(2)));
+
+template <class F>
+__device__ __forceinline__ U8Pack MapU8Pack(U8Pack a, U8Pack b, F f) {
+  constexpr uint32_t kLo = 0x00ff00ffu;
+  const uint32_t x = __builtin_bit_cast(uint32_t, a), y = __builtin_bit_cast(uint32_t, b);
+  const U16x2 even = f(__builtin_bit_cast(U16x2, x & kLo), __builtin_bit_cast(U16x2, y & kLo));
+  const U16x2 odd = f(__builtin_bit_cast(U16x2, (x >> 8) & kLo),
+                      __builtin_bit_cast(U16x2, (y >> 8) & kLo));
+  const uint32_t r = (__builtin_bit_cast(uint32_t, even) & kLo) |
+                     ((__builtin_bit_cast(uint32_t, odd) & kLo) << 8);
+  return __builtin_bit_cast(U8Pack, r);
+}
+
+template <>
+struct SumOp<U8Pack> {
+  using Type = U8Pack;
+  __device__ Type operator()(Type a, Type b) {
+    // SWAR add: sum the low 7 bits of every lane, then xor in the top bits so
+    // no carry crosses a lane boundary.
+    const uint32_t x = __builtin_bit_cast(uint32_t, a), y = __builtin_bit_cast(uint32_t, b);
+    const uint32_t s = ((x & 0x7f7f7f7fu) + (y & 0x7f7f7f7fu)) ^ ((x ^ y) & 0x80808080u);
+    return __builtin_bit_cast(U8Pack, s);
+  }
+};
+
+template <>
+struct ProdOp<U8Pack> {
+  using Type = U8Pack;
+  __device__ Type operator()(Type a, Type b) {
+    return MapU8Pack(a, b, [](U16x2 x, U16x2 y) { return x * y; });
+  }
+};
+
+template <>
+struct MinOp<U8Pack> {
+  using Type = U8Pack;
+  __device__ Type operator()(Type a, Type b) {
+    return MapU8Pack(a, b, [](U16x2 x, U16x2 y) { return __builtin_elementwise_min(x, y); });
+  }
+};
+
+template <>
+struct MaxOp<U8Pack> {
+  using Type = U8Pack;
+  __device__ Type operator()(Type a, Type b) {
+    return MapU8Pack(a, b, [](U16x2 x, U16x2 y) { return __builtin_elementwise_max(x, y); });
   }
 };
 

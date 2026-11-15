@@ -144,6 +144,13 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   using ComputeT = typename detail::ReduceComputeType<T>::type;
   using ReduceOp = Op;
 
+  // Shards are addressed in ComputeT packs, so a shard must hold whole packs.
+  constexpr size_t kPack = sizeof(ComputeT) / sizeof(T);
+  if (count % kPack != 0) {
+    FACADE_PRINTF("ReduceScatter: count %zu must be a multiple of %zu for %zu-byte elements",
+                  count, kPack, sizeof(T));
+    return hipErrorInvalidValue;
+  }
   const size_t chunkElems = count;
   const size_t chunkBytes = chunkElems * sizeof(T);
   // Async always pushes: only the push path splits into start and done.
@@ -224,7 +231,7 @@ bool AsyncDisabled() {
   return disabled;
 }
 
-// Enum entry point: dispatch (dt, op) to reduceScatterImpl for F32/BF16/F16/S32/S64
+// Enum entry point: dispatch (dt, op) to reduceScatterImpl for F32/BF16/F16/S32/S64/U8
 // and all four reduction ops.
 hipError_t CollectivesFacade::RunReduceScatter(const void* input, void* output, size_t count,
                                                DataType dt, ReduceOpKind op, hipStream_t stream,
@@ -343,7 +350,7 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   return hipGetLastError();
 }
 
-// Enum entry point: dispatch (dt, op) to allReduceImpl for F32/BF16/F16/S32/S64
+// Enum entry point: dispatch (dt, op) to allReduceImpl for F32/BF16/F16/S32/S64/U8
 // and all four reduction ops.
 hipError_t CollectivesFacade::RunAllReduce(const void* input, void* output, size_t numElems,
                                            DataType dt, ReduceOpKind op, hipStream_t stream) {
