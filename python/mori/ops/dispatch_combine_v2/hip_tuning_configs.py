@@ -521,7 +521,7 @@ _LL128_TABLE: dict = {
         },
         "gfx1250/96cu": {
             (8, 7168, 6, None): {
-                "bf16": dict(max_tok=127, dispatch=(32, 16), combine=(32, 16)),
+                "bf16": dict(max_tok=63, dispatch=(32, 16), combine=(32, 16)),
             },
         },
     },
