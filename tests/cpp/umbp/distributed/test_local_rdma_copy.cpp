@@ -91,16 +91,30 @@ std::string Build(Fixture* f, uint64_t min_item_bytes) {
     return "allocation failed";
   }
 
-  mori::io::IOEngineConfig io_cfg;
-  io_cfg.host = "127.0.0.1";
-  io_cfg.port = static_cast<uint16_t>(20000 + (getpid() % 2000));
-  auto rdma = std::make_unique<MoriIoEngine>("local-rdma-copy-test", io_cfg, /*bounce_bytes=*/0);
-  rdma->SetLocalLoopback(true, min_item_bytes);
-  try {
-    if (!rdma->Init()) return "MoriIoEngine::Init failed (no RDMA device?)";
-  } catch (const std::exception& e) {
-    return std::string("MoriIoEngine::Init threw: ") + e.what();
+  // The port is derived from the pid, so another process on this machine can
+  // already hold it; Init then fails for a reason that reads exactly like "no
+  // RDMA device".  Try a few ports, and name the last failure if none works.
+  const int first_port = 20000 + (getpid() % 2000);
+  std::unique_ptr<MoriIoEngine> rdma;
+  std::string last_error;
+  for (int port = first_port; port < first_port + 8 && rdma == nullptr; ++port) {
+    mori::io::IOEngineConfig io_cfg;
+    io_cfg.host = "127.0.0.1";
+    io_cfg.port = static_cast<uint16_t>(port);
+    auto candidate = std::make_unique<MoriIoEngine>("local-rdma-copy-test", io_cfg,
+                                                    /*bounce_bytes=*/0);
+    candidate->SetLocalLoopback(true, min_item_bytes);
+    try {
+      if (candidate->Init()) {
+        rdma = std::move(candidate);
+      } else {
+        last_error = "Init failed on port " + std::to_string(port);
+      }
+    } catch (const std::exception& e) {
+      last_error = "Init threw on port " + std::to_string(port) + ": " + e.what();
+    }
   }
+  if (rdma == nullptr) return "no usable MoriIoEngine (no RDMA device?): " + last_error;
   if (!rdma->LocalLoopback()) return "local loopback did not come up";
   f->rdma = rdma.get();
 

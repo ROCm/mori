@@ -208,6 +208,11 @@ class CompositeTransferEngine::PlanBuilder final : public TransferPlanBuilder {
       : owner_(owner), expected_items_(expected_items) {}
   void Add(const TransferItem& item) override {
     TransferEngine* engine = owner_.SelectEngine(item.src, item.dst, item.size);
+    // A size-based decline means "someone behind me should take this", not "no
+    // one can".  If no one did -- two engines configured with floors that do
+    // not meet, say -- fall back to whoever can carry the pair at all, rather
+    // than failing an item every engine is able to move.
+    if (engine == nullptr) engine = owner_.SelectEngine(item.src, item.dst);
     if (engine == nullptr) {
       rejected_.push_back(item.tag);
       owner_.rejected_items_.fetch_add(1, std::memory_order_relaxed);

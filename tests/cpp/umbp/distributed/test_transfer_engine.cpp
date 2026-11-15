@@ -328,6 +328,9 @@ TEST(HbmCopyEngine, YieldsLargeRegisteredHostGpuItemsOnlyWhenAsked) {
 
   engine.YieldRegisteredHostGpuPairs(true, /*min_item_bytes=*/0);  // 0: every size
   EXPECT_FALSE(engine.CanHandleSized(host, gpu, 1));
+  // Except an empty one: the RDMA planner drops a zero-size item, so yielding
+  // it would lose the tag.  It stays a no-op copy here.
+  EXPECT_TRUE(engine.CanHandleSized(host, gpu, 0));
 }
 
 // Gathers submitted from a succession of short-lived threads, the way the
@@ -516,7 +519,7 @@ TEST(MoriIoEngine, LocalLoopbackMakesTheGpuTheInitiator) {
   EXPECT_EQ(6u, off.rejected_tags.size());
   EXPECT_TRUE(off.plans.empty());
 
-  engine.SetLocalLoopback(true);
+  engine.SetLocalLoopback(true, /*min_item_bytes=*/0);
   const TransferPlanSet on = engine.Plan(items);
   EXPECT_EQ(std::vector<size_t>({3, 4, 5}), on.rejected_tags);
   ASSERT_EQ(2u, on.plans.size());
@@ -778,6 +781,39 @@ TEST(CompositeTransferEngine, RoutesALocalPairBySizeWhenAnEngineSetsAFloor) {
   }
   EXPECT_EQ(2u, on_hbm);  // the two 4 KiB items
   EXPECT_EQ(1u, on_nic);  // the 64 KiB item
+}
+
+// Two floors that do not meet: the copy engine yields from 4 KiB up, the NIC
+// takes from 64 KiB up, so nothing claims an 8 KiB item.  A yield says "someone
+// behind me takes this", and when no one does the item must still be carried by
+// an engine that can, not failed.
+TEST(CompositeTransferEngine, FallsBackToAnEngineThatCanCarryTheSizeNobodyClaimed) {
+  CompositeTransferEngine composite;
+  auto hbm_owned = std::make_unique<HbmCopyEngine>();
+  hbm_owned->YieldRegisteredHostGpuPairs(true, /*min_item_bytes=*/4 << 10);
+  HbmCopyEngine* hbm = hbm_owned.get();
+  composite.AddEngine(std::move(hbm_owned));
+  composite.AddEngine(std::make_unique<FloorEngine>(/*floor=*/64 << 10));
+
+  std::vector<char> a(1 << 20), b(1 << 20);
+  auto registered = [](TransferRef ref, mori::io::MemoryUniqueId id) {
+    ref.mem.engineKey = "local";
+    ref.mem.id = id;
+    ref.mem.size = ref.size;
+    ref.mem.loc = ref.loc;
+    return ref;
+  };
+  const auto host = registered(TransferRef::HostBytes(a.data(), a.size()), 1);
+  const auto gpu = registered(
+      TransferRef::HostBytes(b.data(), b.size(), mori::io::MemoryLocationType::GPU, 0), 2);
+
+  EXPECT_EQ(nullptr, composite.SelectEngine(host, gpu, 8 << 10));  // the gap itself
+
+  const TransferPlanSet planned = composite.Plan({MakeItem(host, 0, gpu, 0, 8 << 10, 7)});
+  EXPECT_TRUE(planned.rejected_tags.empty());
+  ASSERT_EQ(1u, planned.plans.size());
+  EXPECT_EQ(hbm, planned.plans[0].engine);
+  EXPECT_EQ(std::vector<size_t>({7}), planned.plans[0].tags);
 }
 
 TEST(CompositeTransferEngine, BuilderGroupsHbmAndBatchesOtherEngines) {

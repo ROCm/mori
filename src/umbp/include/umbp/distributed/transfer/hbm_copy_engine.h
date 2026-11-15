@@ -115,7 +115,11 @@ class HbmCopyEngine final : public TransferEngine {
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
   bool CanHandleSized(const TransferRef& src, const TransferRef& dst,
                       uint64_t item_bytes) const override;
-  void YieldRegisteredHostGpuPairs(bool yield, uint64_t min_item_bytes = 0) {
+  // `min_item_bytes` has no default on purpose: 0 yields every item, which is
+  // the most aggressive setting, not a safe one.  Pass the SAME floor the
+  // engine behind this one was given (MoriIoEngine::LocalLoopbackMinBytes), so
+  // that every item one engine declines the other takes.
+  void YieldRegisteredHostGpuPairs(bool yield, uint64_t min_item_bytes) {
     yield_registered_host_gpu_pairs_ = yield;
     yield_min_item_bytes_ = min_item_bytes;
   }

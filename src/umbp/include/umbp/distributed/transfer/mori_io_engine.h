@@ -76,14 +76,17 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   //
   // `min_item_bytes`: only items at least this large are taken (CanHandleSized);
   // smaller ones are left to the copy engine, which beats the NIC on small
-  // fragments.  0 takes every item.
+  // fragments.  0 takes every item, so there is no default: the caller states
+  // the floor.  The floor is a ROUTING rule, applied by whoever picks the
+  // engine (CompositeTransferEngine); Plan() itself carries a loopback item of
+  // any size, so an engine driven directly is not bound by it.
   //
   // The GPU side is always the initiator: a host -> GPU pair is a pull
   // (BatchRead into the GPU), a GPU -> host pair is a push (BatchWrite out of
   // it).  mori-io merges work requests whose REMOTE offsets are adjacent into
   // one multi-SGE request, and a KV page is contiguous in host memory but
   // scattered across the per-layer GPU tensors, so the host must be the remote.
-  void SetLocalLoopback(bool enabled, uint64_t min_item_bytes = 0) {
+  void SetLocalLoopback(bool enabled, uint64_t min_item_bytes) {
     local_loopback_ = enabled;
     local_loopback_min_bytes_ = min_item_bytes;
   }
