@@ -128,7 +128,9 @@ Top to bottom:
   interval on any link, the coverage (the share of the window with valid sampling intervals; below
   100 % the numbers cover only part of the window) and a trend of the sent bandwidth. Bar colours as
   in rdmatop: under 5 % grey, 5-40 % dim green, 40-70 % green, 70-85 % yellow, from 85 % red.
-- Sent matrix: row GPU -> column GPU (colour scale 0-72 GB/s).
+- Sent matrix: row GPU -> column GPU, coloured in the same five steps as the util bars, as shares
+  of one link's 72 GB/s (xgmi link width 16 x speed 36 Gbps, from `gpu_metrics`): under 5 % grey, up to
+  40 % dim green, 70 % green, 85 % yellow, above that red.
 - Sent and received per GPU as bars (average GB/s).
 - Sent GPU -> GPU over time, and sent per GPU.
 - One row per GPU: the sent bandwidth to each peer over time with the 2 ms peak (red dashed), and

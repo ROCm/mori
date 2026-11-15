@@ -871,7 +871,7 @@
         "type": "prometheus",
         "uid": "xgmi-vm"
       },
-      "description": "Average over the selected time range. Row = sending GPU, column = receiving GPU. Sender's xgmi_write_data_acc; link bytes, not payload. Colour scale: 0 to 72 GB/s (one MI355X link).",
+      "description": "Average over the averaging window. Row = sending GPU, column = receiving GPU. Sender's xgmi_write_data_acc; link bytes, not payload. Colours as in the util bars, as shares of one link's capacity (72 GB/s = xgmi link width 16 x speed 36 Gbps, from gpu_metrics): under 5 % grey (idle), 5-40 % dim green, 40-70 % green, 70-85 % yellow, from 85 % red. The steps are fixed numbers (3.6, 28.8, 50.4, 61.2 GB/s), so they assume a 72 GB/s link.",
       "gridPos": {
         "x": 0,
         "y": 15,
@@ -926,16 +926,40 @@
           "unit": "Bps",
           "decimals": 1,
           "min": 0,
-          "max": 72000000000.0,
           "color": {
-            "mode": "continuous-GrYlRd"
+            "mode": "thresholds"
           },
           "custom": {
             "align": "center",
             "cellOptions": {
               "type": "color-background",
-              "mode": "gradient"
+              "mode": "basic"
             }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#8c8c8c",
+                "value": null
+              },
+              {
+                "color": "semi-dark-green",
+                "value": 3600000000.0
+              },
+              {
+                "color": "green",
+                "value": 28800000000.0
+              },
+              {
+                "color": "yellow",
+                "value": 50400000000.0
+              },
+              {
+                "color": "red",
+                "value": 61200000000.0
+              }
+            ]
           }
         },
         "overrides": [
