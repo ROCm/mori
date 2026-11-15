@@ -116,7 +116,7 @@ Pick experiment, host, GPU and two variables:
 
 Top to bottom:
 
-- Tiles: total sent, total load (share of the capacity), busiest GPU, hottest link and data age.
+- Tiles: total sent, total util (share of the capacity), busiest GPU, hottest link and data age.
   *Busiest GPU* is the GPU with the highest average sent bandwidth (its 7 links added) in the
   window. *Hottest link* is the link with the highest single 2 ms interval in the window, so it is
   a peak, not an average. *Data age* is the time from the newest sample (within 1 h) to the end of
@@ -138,7 +138,7 @@ All panels use the senders' `xgmi_write`; received is what the peers sent to the
 charts are steps: a point is the average of the bin that ends at it, so the value is drawn over
 that bin, not as a slope between points. The grey dashed lines are the capacity of one link and of
 all links of a GPU, read from the `links` / `link_max_bytes_per_second` labels (data recorded
-before they existed has no reference lines, no load bars and no total load). The average panels
+before they existed has no reference lines, no util bars and no total util). The average panels
 use exact milliseconds (`${__range_ms}ms`; Grafana's `$__range` is whole seconds and would cut the
 start).
 
