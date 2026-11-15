@@ -76,17 +76,6 @@ void GuardedVoid(const char* what, Fn&& fn) {
   }
 }
 
-// Where each region's unit starts inside a stored slot.
-std::vector<uint64_t> RegionStarts(const Layout& layout) {
-  std::vector<uint64_t> starts;
-  uint64_t at = 0;
-  for (const Region& region : layout.regions) {
-    starts.push_back(at);
-    at += region.unit_bytes;
-  }
-  return starts;
-}
-
 // Regions `rows` long, starting at `first_region`, that have one unit size and
 // lie a constant distance apart in both layouts: a slot's pieces in them are
 // the rows of one rectangle.
@@ -233,17 +222,19 @@ class HipMemoryApi final : public MemoryApi {
                 std::string* error) override {
     return RunJobs(dst_device, jobs, hipMemcpyDeviceToDevice, error);
   }
-  bool CopyManyToHost(int device, const std::vector<CopyJob>& jobs, std::string* error) override {
-    return RunJobs(device, jobs, hipMemcpyDeviceToHost, error);
-  }
-  bool CopyManyFromHost(int device, const std::vector<CopyJob>& jobs, std::string* error) override {
-    return RunJobs(device, jobs, hipMemcpyHostToDevice, error);
-  }
-
   // A device-to-device copy is not guaranteed to have landed when hipMemcpy
   // returns, and the caller hands these bytes to another process next.
   bool Synchronize(int device, std::string* error) override {
-    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+    DeviceCopies* copies = nullptr;
+    {
+      std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+      std::unique_ptr<DeviceCopies>& slot = copies_[device];
+      if (!slot) slot = std::make_unique<DeviceCopies>();
+      copies = slot.get();
+    }
+    // With the device's copies, not with every other call: the wait can be
+    // long on a busy GPU.
+    std::lock_guard<std::mutex> device_lock(copies->mutex);
     ScopedDevice scope(device);
     const hipError_t err = scope.ok() ? hipDeviceSynchronize() : hipErrorInvalidDevice;
     if (err != hipSuccess) {
@@ -253,71 +244,49 @@ class HipMemoryApi final : public MemoryApi {
     return true;
   }
 
-  // Page-locked, so the copies to and from a device are direct and the lower
-  // store can register it with a NIC.
-  void* AllocateHost(uint64_t bytes) override {
-    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
-    void* ptr = nullptr;
-    if (hipHostMalloc(&ptr, static_cast<size_t>(bytes), hipHostMallocDefault) != hipSuccess) {
-      return nullptr;
-    }
-    return ptr;
-  }
-
-  void FreeHost(void* base) override {
-    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
-    (void)hipHostFree(base);
-  }
-
-  bool CopyToHost(int device, const void* src, void* host_dst, uint64_t bytes,
-                  std::string* error) override {
-    return HostCopy(device, host_dst, src, bytes, hipMemcpyDeviceToHost, error);
-  }
-
-  bool CopyFromHost(int device, void* dst, const void* host_src, uint64_t bytes,
-                    std::string* error) override {
-    return HostCopy(device, dst, host_src, bytes, hipMemcpyHostToDevice, error);
-  }
-
  private:
-  bool HostCopy(int device, void* dst, const void* src, uint64_t bytes, hipMemcpyKind kind,
-                std::string* error) {
-    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
-    ScopedDevice scope(device);
-    if (!scope.ok()) {
-      *error = "hipSetDevice(" + std::to_string(device) + ") failed";
-      return false;
-    }
-    const hipError_t err = hipMemcpy(dst, src, static_cast<size_t>(bytes), kind);
-    if (err != hipSuccess) {
-      *error = HipError("hipMemcpy", err);
-      return false;
-    }
-    return true;
-  }
-
+  // Copies take their device's lock, not the one every other call shares: a
+  // copy that waits for a busy GPU would otherwise hold up the copies of
+  // every other device. The streams are created under the shared lock, with
+  // the calls that have been seen to park when they overlap.
   bool RunJobs(int device, const std::vector<CopyJob>& jobs, hipMemcpyKind kind,
                std::string* error) {
-    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+    const auto started = std::chrono::steady_clock::now();
+    const size_t workers =
+        std::max<size_t>(1, std::min(kDeviceCopyThreads, jobs.size() / kMinJobsPerCopyThread));
+    DeviceCopies* copies = nullptr;
+    {
+      std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+      ScopedDevice scope(device);
+      if (!scope.ok()) {
+        *error = "hipSetDevice(" + std::to_string(device) + ") failed";
+        return false;
+      }
+      std::unique_ptr<DeviceCopies>& slot = copies_[device];
+      if (!slot) slot = std::make_unique<DeviceCopies>();
+      copies = slot.get();
+      while (copies->streams.size() < kDeviceCopyThreads) {
+        hipStream_t stream = nullptr;
+        const hipError_t err = hipStreamCreate(&stream);
+        if (err != hipSuccess) {
+          *error = HipError("hipStreamCreate", err);
+          return false;
+        }
+        copies->streams.push_back(stream);
+      }
+    }
+    std::lock_guard<std::mutex> device_lock(copies->mutex);
+    const uint64_t lock_micros = MicrosSince(started);
     ScopedDevice scope(device);
     if (!scope.ok()) {
       *error = "hipSetDevice(" + std::to_string(device) + ") failed";
       return false;
     }
-    const size_t workers =
-        std::max<size_t>(1, std::min(kDeviceCopyThreads, jobs.size() / kMinJobsPerCopyThread));
-    std::vector<hipStream_t>& streams = copy_streams_[device];
-    while (streams.size() < workers) {
-      hipStream_t stream = nullptr;
-      const hipError_t err = hipStreamCreate(&stream);
-      if (err != hipSuccess) {
-        *error = HipError("hipStreamCreate", err);
-        return false;
-      }
-      streams.push_back(stream);
-    }
+    const std::vector<hipStream_t>& streams = copies->streams;
     std::vector<hipError_t> results(workers, hipSuccess);
+    std::vector<uint64_t> queued_micros(workers, 0);
     auto work = [&](size_t w, bool set_device) {
+      const auto begun = std::chrono::steady_clock::now();
       hipError_t err = set_device ? hipSetDevice(device) : hipSuccess;
       for (size_t i = w; i < jobs.size() && err == hipSuccess; i += workers) {
         const CopyJob& job = jobs[i];
@@ -328,6 +297,7 @@ class HipMemoryApi final : public MemoryApi {
                                                static_cast<size_t>(job.bytes),
                                                static_cast<size_t>(job.rows), kind, streams[w]);
       }
+      queued_micros[w] = MicrosSince(begun);
       // Wait even after a failure: what was queued must not outlive the call.
       const hipError_t waited = hipStreamSynchronize(streams[w]);
       results[w] = err != hipSuccess ? err : waited;
@@ -336,6 +306,14 @@ class HipMemoryApi final : public MemoryApi {
     for (size_t w = 1; w < workers; ++w) threads.emplace_back(work, w, true);
     work(0, false);
     for (std::thread& thread : threads) thread.join();
+    const uint64_t micros = MicrosSince(started);
+    if (micros > kSlowCopyMicros) {
+      MORI_UMBP_WARN(
+          "[L1Pool] slow device copy: device={} kind={} jobs={} threads={} micros={} lock={} "
+          "queue={}",
+          device, static_cast<int>(kind), jobs.size(), workers, micros, lock_micros,
+          *std::max_element(queued_micros.begin(), queued_micros.end()));
+    }
     for (hipError_t err : results) {
       if (err != hipSuccess) {
         *error = HipError("hipMemcpyAsync", err);
@@ -349,9 +327,16 @@ class HipMemoryApi final : public MemoryApi {
   // Under this many copies a thread costs more than it saves.
   static constexpr size_t kMinJobsPerCopyThread = 256;
 
+  // A copy call slower than this is reported, with where its time went.
+  static constexpr uint64_t kSlowCopyMicros = 1000000;
+
+  struct DeviceCopies {
+    std::mutex mutex;                  // one copy call at a time on the device
+    std::vector<hipStream_t> streams;  // created under hip_mutex_, then fixed
+  };
+
   std::mutex hip_mutex_;
-  // Streams CopyMany queues on, per destination device; under hip_mutex_.
-  std::map<int, std::vector<hipStream_t>> copy_streams_;
+  std::map<int, std::unique_ptr<DeviceCopies>> copies_;  // under hip_mutex_
 };
 
 class HostMemoryApi final : public MemoryApi {
@@ -375,18 +360,6 @@ class HostMemoryApi final : public MemoryApi {
     return true;
   }
   bool Synchronize(int /*device*/, std::string* /*error*/) override { return true; }
-  void* AllocateHost(uint64_t bytes) override { return std::malloc(static_cast<size_t>(bytes)); }
-  void FreeHost(void* base) override { std::free(base); }
-  bool CopyToHost(int /*device*/, const void* src, void* host_dst, uint64_t bytes,
-                  std::string* /*error*/) override {
-    std::memcpy(host_dst, src, static_cast<size_t>(bytes));
-    return true;
-  }
-  bool CopyFromHost(int /*device*/, void* dst, const void* host_src, uint64_t bytes,
-                    std::string* /*error*/) override {
-    std::memcpy(dst, host_src, static_cast<size_t>(bytes));
-    return true;
-  }
 };
 
 bool SameLayout(const Layout& a, const Layout& b) {
@@ -416,39 +389,39 @@ PoolManager::~PoolManager() {
   if (worker_.joinable()) worker_.join();
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto& entry : pools_) {
-    api_->Free(entry.second->device, entry.second->base, entry.second->bytes);
+    Pool* pool = entry.second.get();
+    if (pool->in_store)
+      GuardedVoid("deregister", [&] { store_->DeregisterPoolMemory(pool->base); });
+    api_->Free(pool->device, pool->base, pool->bytes);
   }
   pools_.clear();
-  if (staging_ != nullptr) {
-    if (store_) store_->DeregisterHostMemory(staging_);
-    api_->FreeHost(staging_);
-    staging_ = nullptr;
-  }
 }
 
 void PoolManager::SetLowerStore(std::shared_ptr<LowerStore> store, const TierOptions& options) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (store_ || !store) return;
-  void* staging = api_->AllocateHost(options.staging_bytes);
-  if (staging == nullptr) {
-    MORI_UMBP_ERROR("[L1Pool] no lower tiers: could not allocate {} B of staging",
-                    options.staging_bytes);
-    return;
-  }
-  if (!store->RegisterHostMemory(staging, options.staging_bytes)) {
-    MORI_UMBP_ERROR("[L1Pool] no lower tiers: the store refused the staging memory");
-    api_->FreeHost(staging);
-    return;
-  }
-  staging_ = staging;
   tier_ = options;
+  if (tier_.batch_slots == 0) tier_.batch_slots = 1;
   store_ = std::move(store);
+  // Pools attached before the store: it has to know their memory to move
+  // bytes into and out of it.
+  for (auto& entry : pools_) RegisterWithStoreLocked(entry.second.get());
   worker_ = std::thread([this] { TierWorker(); });
   MORI_UMBP_INFO(
-      "[L1Pool] lower tiers attached: staging={} B offload_on_evict={} offload_ahead={} load={} "
+      "[L1Pool] lower tiers attached: batch_slots={} offload_on_evict={} offload_ahead={} load={} "
       "ask_peers={} peer_copy={}",
-      tier_.staging_bytes, tier_.offload_on_evict, tier_.offload_ahead, tier_.load, tier_.ask_peers,
+      tier_.batch_slots, tier_.offload_on_evict, tier_.offload_ahead, tier_.load, tier_.ask_peers,
       tier_.peer_copy);
+}
+
+void PoolManager::RegisterWithStoreLocked(Pool* pool) {
+  if (!store_ || pool->in_store || pool->base == nullptr) return;
+  pool->in_store = Guarded("register", 1, [&] {
+    return std::vector<bool>{store_->RegisterPoolMemory(pool->base, pool->bytes, pool->device)};
+  })[0];
+  if (!pool->in_store) {
+    MORI_UMBP_WARN("[L1Pool] the store refused pool={}: it stays L1 only", pool->id);
+  }
 }
 
 std::string PoolManager::StoreKey(const std::string& group, const std::string& key) {
@@ -572,76 +545,61 @@ bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::st
   return false;
 }
 
+namespace {
+
+// Where the pieces of `slot` are in the pool, one per region.
+template <typename Pointer>
+std::vector<Pointer> PiecesOf(void* base, const Layout& layout, uint32_t slot) {
+  std::vector<Pointer> pieces;
+  pieces.reserve(layout.regions.size());
+  for (const Region& region : layout.regions) {
+    pieces.push_back(static_cast<char*>(base) + region.offset + uint64_t{slot} * region.unit_bytes);
+  }
+  return pieces;
+}
+
+std::vector<uint64_t> PieceBytes(const Layout& layout) {
+  std::vector<uint64_t> bytes;
+  bytes.reserve(layout.regions.size());
+  for (const Region& region : layout.regions) bytes.push_back(region.unit_bytes);
+  return bytes;
+}
+
+}  // namespace
+
+// The store reads the slots out of the pool itself: it is handed where each
+// piece of each slot is, and nothing is staged on the way.
 std::vector<bool> PoolManager::OffloadSlots(Pool* pool, const std::vector<Victim>& slots,
                                             bool evicting) {
   std::vector<bool> stored(slots.size(), false);
   if (slots.empty()) return stored;
   const uint64_t slot_bytes = pool->slot_bytes;
-  if (!store_ || staging_ == nullptr || slot_bytes == 0 || slot_bytes > tier_.staging_bytes) {
-    return stored;
-  }
+  if (!store_ || !pool->in_store || slot_bytes == 0) return stored;
   const auto started = std::chrono::steady_clock::now();
-  const size_t per_round = static_cast<size_t>(tier_.staging_bytes / slot_bytes);
-  const std::vector<Region>& regions = pool->layout.regions;
-  const std::vector<uint64_t> starts = RegionStarts(pool->layout);
-  const std::vector<Rectangle> rectangles = Rectangles(pool->layout, pool->layout);
-  std::string error;
+  const std::vector<uint64_t> piece_bytes = PieceBytes(pool->layout);
   uint64_t done = 0;
-  uint64_t wait_micros = 0, read_micros = 0, put_micros = 0;
-  for (size_t begin = 0; begin < slots.size(); begin += per_round) {
-    const size_t end = std::min(slots.size(), begin + per_round);
-    auto mark = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> staging(staging_mutex_);
-    wait_micros += MicrosSince(mark);
-    mark = std::chrono::steady_clock::now();
+  for (size_t begin = 0; begin < slots.size(); begin += tier_.batch_slots) {
+    const size_t end = std::min(slots.size(), begin + tier_.batch_slots);
     std::vector<std::string> keys;
-    std::vector<const void*> srcs;
-    std::vector<size_t> which;
-    // A slot goes to the device as one rectangle per group of like regions,
-    // and lands in the layout the store keeps: a slot's units back to back.
-    char* const staging_base = static_cast<char*>(staging_);
-    std::vector<MemoryApi::CopyJob> jobs;
-    jobs.reserve((end - begin) * rectangles.size());
+    std::vector<std::vector<const void*>> pieces;
+    keys.reserve(end - begin);
+    pieces.reserve(end - begin);
     for (size_t i = begin; i < end; ++i) {
-      char* const slot_base = staging_base + (i - begin) * slot_bytes;
-      for (const Rectangle& rect : rectangles) {
-        const Region& region = regions[rect.first_region];
-        const uint64_t unit = region.unit_bytes;
-        const void* src =
-            static_cast<const char*>(pool->base) + region.offset + uint64_t{slots[i].slot} * unit;
-        jobs.push_back(MemoryApi::CopyJob{slot_base + starts[rect.first_region], src, unit,
-                                          rect.rows, unit, rect.src_pitch});
-      }
+      keys.push_back(StoreKey(pool->group, slots[i].key));
+      pieces.push_back(PiecesOf<const void*>(pool->base, pool->layout, slots[i].slot));
     }
-    if (api_->CopyManyToHost(pool->device, jobs, &error)) {
-      for (size_t i = begin; i < end; ++i) {
-        keys.push_back(StoreKey(pool->group, slots[i].key));
-        srcs.push_back(staging_base + (i - begin) * slot_bytes);
-        which.push_back(i);
-      }
-    }
-    read_micros += MicrosSince(mark);
-    if (keys.empty()) continue;
-    mark = std::chrono::steady_clock::now();
     const std::vector<bool> put =
-        Guarded("put", keys.size(), [&] { return store_->Put(keys, srcs, slot_bytes); });
-    put_micros += MicrosSince(mark);
-    for (size_t j = 0; j < which.size() && j < put.size(); ++j) {
-      if (put[j]) {
-        stored[which[j]] = true;
+        Guarded("put", keys.size(), [&] { return store_->Put(keys, pieces, piece_bytes); });
+    for (size_t i = begin; i < end; ++i) {
+      if (put[i - begin]) {
+        stored[i] = true;
         ++done;
       }
     }
   }
   const uint64_t micros = MicrosSince(started);
-  if (!error.empty()) {
-    MORI_UMBP_ERROR("[L1Pool] offload from pool={} read error: {}", pool->id, error);
-  }
-  MORI_UMBP_INFO(
-      "[L1Pool] offload pool={} slots={} stored={} bytes={} micros={} wait={} read={} "
-      "put={}",
-      pool->id, slots.size(), done, done * slot_bytes, micros, wait_micros, read_micros,
-      put_micros);
+  MORI_UMBP_INFO("[L1Pool] offload pool={} slots={} stored={} bytes={} micros={}", pool->id,
+                 slots.size(), done, done * slot_bytes, micros);
   std::lock_guard<std::mutex> lock(mutex_);
   pool->offloaded_slots += done;
   // A slot that stays cached here has lost nothing by a failed copy.
@@ -656,70 +614,34 @@ std::vector<bool> PoolManager::OffloadSlots(Pool* pool, const std::vector<Victim
   return stored;
 }
 
+// The store writes the slots into the pool itself.
 std::vector<bool> PoolManager::LoadSlots(Pool* pool, const std::vector<Victim>& slots,
                                          uint64_t* bytes) {
   std::vector<bool> loaded(slots.size(), false);
   if (slots.empty()) return loaded;
   const uint64_t slot_bytes = pool->slot_bytes;
-  if (!store_ || staging_ == nullptr || slot_bytes == 0 || slot_bytes > tier_.staging_bytes) {
-    return loaded;
-  }
-  const size_t per_round = static_cast<size_t>(tier_.staging_bytes / slot_bytes);
-  const std::vector<Region>& regions = pool->layout.regions;
-  const std::vector<uint64_t> starts = RegionStarts(pool->layout);
-  const std::vector<Rectangle> rectangles = Rectangles(pool->layout, pool->layout);
-  std::string error;
-  // The caller wants a run from the front, so the first failure ends the work.
-  bool stop = false;
-  uint64_t wait_micros = 0, get_micros = 0, write_micros = 0;
-  for (size_t begin = 0; begin < slots.size() && !stop; begin += per_round) {
-    const size_t end = std::min(slots.size(), begin + per_round);
-    auto mark = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> staging(staging_mutex_);
-    wait_micros += MicrosSince(mark);
-    mark = std::chrono::steady_clock::now();
+  if (!store_ || !pool->in_store || slot_bytes == 0) return loaded;
+  const std::vector<uint64_t> piece_bytes = PieceBytes(pool->layout);
+  // The caller wants a run from the front: what follows the first key the
+  // store could not give is not used, so the first failure ends the work.
+  for (size_t begin = 0; begin < slots.size(); begin += tier_.batch_slots) {
+    const size_t end = std::min(slots.size(), begin + tier_.batch_slots);
     std::vector<std::string> keys;
-    std::vector<void*> dsts;
+    std::vector<std::vector<void*>> pieces;
+    keys.reserve(end - begin);
+    pieces.reserve(end - begin);
     for (size_t i = begin; i < end; ++i) {
       keys.push_back(StoreKey(pool->group, slots[i].key));
-      dsts.push_back(static_cast<char*>(staging_) + (i - begin) * slot_bytes);
+      pieces.push_back(PiecesOf<void*>(pool->base, pool->layout, slots[i].slot));
     }
     const std::vector<bool> got =
-        Guarded("get", keys.size(), [&] { return store_->Get(keys, dsts, slot_bytes); });
-    // The caller wants a run from the front: what follows the first key the
-    // store could not give is not used.
-    get_micros += MicrosSince(mark);
-    mark = std::chrono::steady_clock::now();
+        Guarded("get", keys.size(), [&] { return store_->Get(keys, pieces, piece_bytes); });
     size_t good = begin;
-    while (good < end && good - begin < got.size() && got[good - begin]) ++good;
-    if (good < end) stop = true;
-    char* const staging_base = static_cast<char*>(staging_);
-    std::vector<MemoryApi::CopyJob> jobs;
-    jobs.reserve((good - begin) * rectangles.size());
-    for (size_t i = begin; i < good; ++i) {
-      const char* const slot_base = staging_base + (i - begin) * slot_bytes;
-      for (const Rectangle& rect : rectangles) {
-        const Region& region = regions[rect.first_region];
-        const uint64_t unit = region.unit_bytes;
-        void* dst = static_cast<char*>(pool->base) + region.offset + uint64_t{slots[i].slot} * unit;
-        jobs.push_back(MemoryApi::CopyJob{dst, slot_base + starts[rect.first_region], unit,
-                                          rect.rows, rect.dst_pitch, unit});
-      }
-    }
-    if (jobs.empty()) continue;
-    if (!api_->CopyManyFromHost(pool->device, jobs, &error)) {
-      stop = true;
-      break;
-    }
+    while (good < end && got[good - begin]) ++good;
     for (size_t i = begin; i < good; ++i) loaded[i] = true;
     *bytes += (good - begin) * slot_bytes;
-    write_micros += MicrosSince(mark);
+    if (good < end) break;
   }
-  if (!error.empty()) {
-    MORI_UMBP_ERROR("[L1Pool] load into pool={} write error: {}", pool->id, error);
-  }
-  MORI_UMBP_INFO("[L1Pool] load pool={} slots={} bytes={} wait={} get={} write={}", pool->id,
-                 slots.size(), *bytes, wait_micros, get_micros, write_micros);
   return loaded;
 }
 
@@ -742,6 +664,7 @@ void PoolManager::DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool) 
   pool = FindLocked(pool_id);
   if (pool == nullptr) return;
   for (uint32_t slot = 0; slot < pool->slots.size(); ++slot) UnindexLocked(pool, slot);
+  if (pool->in_store) GuardedVoid("deregister", [&] { store_->DeregisterPoolMemory(pool->base); });
   api_->Free(pool->device, pool->base, pool->bytes);
   MORI_UMBP_INFO("[L1Pool] destroyed pool={} device={} bytes={}", pool_id, pool->device,
                  pool->bytes);
@@ -793,6 +716,7 @@ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& 
   pool->bytes = bytes;
   pool->exported = exported;
   pools_[pool_id] = std::move(pool);
+  RegisterWithStoreLocked(pools_[pool_id].get());
   MORI_UMBP_INFO("[L1Pool] attached pool={} group={} device={} bytes={}", pool_id, group, device,
                  bytes);
   result.memory = std::move(exported);

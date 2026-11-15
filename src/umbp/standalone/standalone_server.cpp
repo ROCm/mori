@@ -513,10 +513,15 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
    public:
     explicit L1Store(Impl& server) : server_(server) {}
 
-    bool RegisterHostMemory(void* base, uint64_t bytes) override {
-      return server_.RegisterBackendMemory(base, static_cast<size_t>(bytes));
+    // Recorded for the store's local copies only: the pool is this process's
+    // own device allocation, read and written by the store's GPU copy engine,
+    // and a remote object reaches it through the store's own host arena.
+    bool RegisterPoolMemory(void* base, uint64_t bytes, int device) override {
+      return server_.RegisterBackendMemory(base, static_cast<size_t>(bytes),
+                                           mori::io::MemoryLocationType::GPU, device,
+                                           MemoryRegistration::kLocalCopyOnly);
     }
-    void DeregisterHostMemory(void* base) override {
+    void DeregisterPoolMemory(void* base) override {
       std::unique_lock<std::shared_mutex> lock(server_.client_mu_);
       server_.client_->DeregisterMemory(reinterpret_cast<uintptr_t>(base));
     }
@@ -525,25 +530,34 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       if (server_.shutdown_.load()) return std::vector<bool>(keys.size(), false);
       return server_.client_->BatchExists(keys);
     }
+    // A block is the store's ranged object: the pool's pieces tile it.
     std::vector<bool> Put(const std::vector<std::string>& keys,
-                          const std::vector<const void*>& srcs, uint64_t size) override {
-      std::vector<uintptr_t> ptrs;
-      ptrs.reserve(srcs.size());
-      for (const void* src : srcs) ptrs.push_back(reinterpret_cast<uintptr_t>(src));
-      const std::vector<size_t> sizes(keys.size(), static_cast<size_t>(size));
+                          const std::vector<std::vector<const void*>>& pieces,
+                          const std::vector<uint64_t>& piece_bytes) override {
+      const Ranges ranges(piece_bytes, keys.size());
+      std::vector<std::vector<uintptr_t>> ptrs(pieces.size());
+      for (size_t i = 0; i < pieces.size(); ++i) {
+        ptrs[i].reserve(pieces[i].size());
+        for (const void* piece : pieces[i]) ptrs[i].push_back(reinterpret_cast<uintptr_t>(piece));
+      }
+      const std::vector<size_t> object_sizes(keys.size(), ranges.object_bytes);
       DataPathLock lock(server_.client_mu_, server_.WriteLocking());
       if (server_.shutdown_.load()) return std::vector<bool>(keys.size(), false);
-      return server_.client_->BatchPut(keys, ptrs, sizes);
+      return server_.client_->BatchPutRanges(keys, object_sizes, ptrs, ranges.sizes,
+                                             ranges.offsets);
     }
-    std::vector<bool> Get(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
-                          uint64_t size) override {
-      std::vector<uintptr_t> ptrs;
-      ptrs.reserve(dsts.size());
-      for (void* dst : dsts) ptrs.push_back(reinterpret_cast<uintptr_t>(dst));
-      const std::vector<size_t> sizes(keys.size(), static_cast<size_t>(size));
+    std::vector<bool> Get(const std::vector<std::string>& keys,
+                          const std::vector<std::vector<void*>>& pieces,
+                          const std::vector<uint64_t>& piece_bytes) override {
+      const Ranges ranges(piece_bytes, keys.size());
+      std::vector<std::vector<uintptr_t>> ptrs(pieces.size());
+      for (size_t i = 0; i < pieces.size(); ++i) {
+        ptrs[i].reserve(pieces[i].size());
+        for (void* piece : pieces[i]) ptrs[i].push_back(reinterpret_cast<uintptr_t>(piece));
+      }
       DataPathLock lock(server_.client_mu_, server_.ReadLocking());
       if (server_.shutdown_.load()) return std::vector<bool>(keys.size(), false);
-      return server_.client_->BatchGet(keys, ptrs, sizes);
+      return server_.client_->BatchGetRanges(keys, ptrs, ranges.sizes, ranges.offsets);
     }
     void Publish() override {
       std::unique_lock<std::shared_mutex> lock(server_.client_mu_);
@@ -614,6 +628,24 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
 
    private:
+    // The same piece sizes and offsets for every key of a batch.
+    struct Ranges {
+      Ranges(const std::vector<uint64_t>& piece_bytes, size_t keys) {
+        std::vector<size_t> one_sizes;
+        std::vector<size_t> one_offsets;
+        for (uint64_t bytes : piece_bytes) {
+          one_offsets.push_back(object_bytes);
+          one_sizes.push_back(static_cast<size_t>(bytes));
+          object_bytes += static_cast<size_t>(bytes);
+        }
+        sizes.assign(keys, one_sizes);
+        offsets.assign(keys, one_offsets);
+      }
+      size_t object_bytes = 0;
+      std::vector<std::vector<size_t>> sizes;
+      std::vector<std::vector<size_t>> offsets;
+    };
+
     template <typename Fn>
     static void ForEachChunk(const std::vector<std::string>& keys, Fn&& fn) {
       constexpr size_t kChunk = 2048;
@@ -655,8 +687,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   void AttachL1LowerTiers() {
     if (!EnvFlag("UMBP_L1_LOWER_TIERS", false)) return;
     l1::TierOptions options;
-    if (const char* raw = std::getenv("UMBP_L1_STAGING_BYTES"); raw != nullptr && *raw != '\0') {
-      options.staging_bytes = std::strtoull(raw, nullptr, 10);
+    if (const char* raw = std::getenv("UMBP_L1_BATCH_SLOTS"); raw != nullptr && *raw != '\0') {
+      options.batch_slots = static_cast<uint32_t>(std::max(1ull, std::strtoull(raw, nullptr, 10)));
     }
     if (const char* raw = std::getenv("UMBP_L1_OFFLOAD_AHEAD"); raw != nullptr && *raw != '\0') {
       options.offload_ahead = std::min(1.0, std::max(0.0, std::strtod(raw, nullptr)));

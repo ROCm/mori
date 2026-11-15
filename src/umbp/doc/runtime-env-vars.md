@@ -118,7 +118,7 @@ policy (`UMBP_BACKEND_POLICY`).
 | Env var | Default | Unit | Description |
 |---|---|---|---|
 | `UMBP_L1_LOWER_TIERS` | `0` | bool | Put this server's store under the L1 pools. Off, the pools are L1 only and an evicted block is gone. |
-| `UMBP_L1_STAGING_BYTES` | 1 GiB | bytes | Page-locked host memory blocks pass through between a GPU and the store; one offload or load round moves at most this much. It is registered with the store, so on a NIC that limits a region's size (see `UMBP_DRAM_MAX_MR_BYTES`) keep it under that limit. |
+| `UMBP_L1_BATCH_SLOTS` | `128` | count | Slots one call to the store moves when L1 offloads or loads. The store copies between its tiers and the pool directly, so nothing is staged; this only bounds how many ranges one ranged put or get carries. |
 | `UMBP_L1_OFFLOAD_ON_EVICT` | `1` | bool | Copy a cached block into the store before its slot is reused. `0` drops it. |
 | `UMBP_L1_OFFLOAD_AHEAD` | `0` | fraction | Keep this fraction of every pool either vacant or already copied into the store, by offloading the coldest cached blocks in the background, so an eviction does not wait for the copy. `1` offloads every block once the engine's GPU has finished writing it. |
 | `UMBP_L1_LOAD` | `1` | bool | Look in the store for blocks no L1 pool of this node holds. |

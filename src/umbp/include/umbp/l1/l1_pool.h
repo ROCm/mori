@@ -122,58 +122,30 @@ class MemoryApi {
   }
   // Wait until every copy issued on `device` has landed.
   virtual bool Synchronize(int device, std::string* error) = 0;
-  // Host memory to stage bytes on their way to or from the lower store.
-  virtual void* AllocateHost(uint64_t bytes) = 0;
-  virtual void FreeHost(void* base) = 0;
-  // Device to host, complete on return; host to device, visible after a
-  // Synchronize of the device.
-  virtual bool CopyToHost(int device, const void* src, void* host_dst, uint64_t bytes,
-                          std::string* error) = 0;
-  virtual bool CopyFromHost(int device, void* dst, const void* host_src, uint64_t bytes,
-                            std::string* error) = 0;
-  // Many copies between one device and host memory, as CopyMany's jobs: a
-  // block leaves for the lower store, or comes back, as one rectangle per
-  // group of like regions, straight into the layout the store keeps.
-  virtual bool CopyManyToHost(int device, const std::vector<CopyJob>& jobs, std::string* error) {
-    for (const CopyJob& job : jobs) {
-      for (uint64_t row = 0; row < job.rows; ++row) {
-        if (!CopyToHost(device, static_cast<const char*>(job.src) + row * job.src_pitch,
-                        static_cast<char*>(job.dst) + row * job.dst_pitch, job.bytes, error)) {
-          return false;
-        }
-      }
-    }
-    return true;
-  }
-  virtual bool CopyManyFromHost(int device, const std::vector<CopyJob>& jobs, std::string* error) {
-    for (const CopyJob& job : jobs) {
-      for (uint64_t row = 0; row < job.rows; ++row) {
-        if (!CopyFromHost(device, static_cast<char*>(job.dst) + row * job.dst_pitch,
-                          static_cast<const char*>(job.src) + row * job.src_pitch, job.bytes,
-                          error)) {
-          return false;
-        }
-      }
-    }
-    return true;
-  }
 };
 
-// The tiers below L1, reached through this process's UMBP store. Values are
-// whole slots, `size` contiguous bytes of host memory each. Every call may
-// block on I/O or on another node and is made without the pool lock.
+// The tiers below L1, reached through this process's UMBP store. A value is
+// one slot: the pool's pieces of it, stored back to back. Every call may block
+// on the network and must not be made with the pool lock held.
 class LowerStore {
  public:
   virtual ~LowerStore() = default;
-  // Host memory this store may be handed in Put and Get.
-  virtual bool RegisterHostMemory(void* base, uint64_t bytes) = 0;
-  virtual void DeregisterHostMemory(void* base) = 0;
+  // A pool's memory, on GPU `device`, whose pieces Put and Get are handed.
+  // The store moves bytes between its tiers and the pool itself; nothing is
+  // staged on the way.
+  virtual bool RegisterPoolMemory(void* base, uint64_t bytes, int device) = 0;
+  virtual void DeregisterPoolMemory(void* base) = 0;
   // result[i]: the store can serve keys[i], from this node or another.
   virtual std::vector<bool> Exists(const std::vector<std::string>& keys) = 0;
+  // A block is piece_bytes.size() pieces, one per region of the pool, stored
+  // back to back in that order. pieces[i][r] is where piece r of keys[i] is in
+  // the pool, and is piece_bytes[r] long.
   virtual std::vector<bool> Put(const std::vector<std::string>& keys,
-                                const std::vector<const void*>& srcs, uint64_t size) = 0;
+                                const std::vector<std::vector<const void*>>& pieces,
+                                const std::vector<uint64_t>& piece_bytes) = 0;
   virtual std::vector<bool> Get(const std::vector<std::string>& keys,
-                                const std::vector<void*>& dsts, uint64_t size) = 0;
+                                const std::vector<std::vector<void*>>& pieces,
+                                const std::vector<uint64_t>& piece_bytes) = 0;
   // Make what Put stored visible to the other nodes now.
   virtual void Publish() = 0;
   // The L1 directory: tell the other nodes which keys this node holds in HBM
@@ -186,8 +158,8 @@ class LowerStore {
 };
 
 struct TierOptions {
-  // Host staging for offload and load; a batch moves at most this many bytes.
-  uint64_t staging_bytes = 1ull << 30;
+  // Slots one call to the store moves at most.
+  uint32_t batch_slots = 128;
   // Copy a cached slot into the store before the slot is reused.
   bool offload_on_evict = true;
   // Keep this fraction of every pool's slots either vacant or already
@@ -361,6 +333,7 @@ class PoolManager {
     std::unordered_map<std::string, uint32_t> index;
     uint32_t held = 0;
     uint32_t busy = 0;       // in-flight copies into or out of this pool
+    bool in_store = false;   // the lower store has been told of this memory
     uint64_t committed = 0;  // how far the owner's device has got
     uint64_t evicted = 0;
     uint64_t fetched_in_slots = 0;
@@ -415,6 +388,8 @@ class PoolManager {
   // `evicting`: the slots are being reused, so a failed copy loses content.
   std::vector<bool> OffloadSlots(Pool* pool, const std::vector<Victim>& slots, bool evicting);
   std::vector<bool> LoadSlots(Pool* pool, const std::vector<Victim>& slots, uint64_t* bytes);
+  // Tell the lower store of the pool's memory, once.
+  void RegisterWithStoreLocked(Pool* pool);
   void QueueAdvertiseLocked(const std::string& group, const std::string& key, bool added);
   void TierWorker();
   // One round of offloading ahead of need. True when something was copied.
@@ -437,9 +412,6 @@ class PoolManager {
 
   std::shared_ptr<LowerStore> store_;
   TierOptions tier_;
-  // One staging arena; tier transfers take turns on it.
-  std::mutex staging_mutex_;
-  void* staging_ = nullptr;
   // Same size, for regrouping a batch between the store's layout and a pool's.
   // Directory changes not yet sent: store key -> added (true) or removed.
   std::unordered_map<std::string, bool> advertise_;

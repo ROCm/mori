@@ -72,16 +72,6 @@ class RecordingApi final : public MemoryApi {
     ++synchronizes;
     return host_->Synchronize(device, error);
   }
-  void* AllocateHost(uint64_t bytes) override { return host_->AllocateHost(bytes); }
-  void FreeHost(void* base) override { host_->FreeHost(base); }
-  bool CopyToHost(int device, const void* src, void* host_dst, uint64_t bytes,
-                  std::string* error) override {
-    return host_->CopyToHost(device, src, host_dst, bytes, error);
-  }
-  bool CopyFromHost(int device, void* dst, const void* host_src, uint64_t bytes,
-                    std::string* error) override {
-    return host_->CopyFromHost(device, dst, host_src, bytes, error);
-  }
 
   std::map<int, uint8_t*> bases;
   int copies = 0;
@@ -540,13 +530,15 @@ class FakeStore final : public LowerStore {
   FakeStore(std::string node, std::shared_ptr<FakeCluster> cluster)
       : node_(std::move(node)), cluster_(std::move(cluster)) {}
 
-  bool RegisterHostMemory(void* base, uint64_t bytes) override {
-    base_ = static_cast<char*>(base);
-    bytes_ = bytes;
-    return true;
+  bool RegisterPoolMemory(void* base, uint64_t bytes, int device) override {
+    std::lock_guard<std::mutex> lock(cluster_->mutex);
+    pools_[static_cast<char*>(base)] = bytes;
+    devices.insert(device);
+    return !refuse_pools;
   }
-  void DeregisterHostMemory(void* base) override {
-    if (base == base_) base_ = nullptr;
+  void DeregisterPoolMemory(void* base) override {
+    std::lock_guard<std::mutex> lock(cluster_->mutex);
+    pools_.erase(static_cast<char*>(base));
   }
   std::vector<bool> Exists(const std::vector<std::string>& keys) override {
     std::lock_guard<std::mutex> lock(cluster_->mutex);
@@ -554,28 +546,37 @@ class FakeStore final : public LowerStore {
     for (const std::string& key : keys) out.push_back(cluster_->objects.count(key) != 0);
     return out;
   }
-  std::vector<bool> Put(const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
-                        uint64_t size) override {
+  std::vector<bool> Put(const std::vector<std::string>& keys,
+                        const std::vector<std::vector<const void*>>& pieces,
+                        const std::vector<uint64_t>& piece_bytes) override {
     std::lock_guard<std::mutex> lock(cluster_->mutex);
+    max_batch = std::max(max_batch, keys.size());
     std::vector<bool> out;
     for (size_t i = 0; i < keys.size(); ++i) {
-      EXPECT_TRUE(Registered(srcs[i], size));
       if (fail_puts) {
         out.push_back(false);
         continue;
       }
       ++puts;
-      cluster_->objects[keys[i]].assign(static_cast<const char*>(srcs[i]), size);
+      std::string object;
+      for (size_t r = 0; r < piece_bytes.size(); ++r) {
+        EXPECT_TRUE(InAPool(pieces[i][r], piece_bytes[r]));
+        object.append(static_cast<const char*>(pieces[i][r]), piece_bytes[r]);
+      }
+      cluster_->objects[keys[i]] = std::move(object);
       out.push_back(true);
     }
     return out;
   }
-  std::vector<bool> Get(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
-                        uint64_t size) override {
+  std::vector<bool> Get(const std::vector<std::string>& keys,
+                        const std::vector<std::vector<void*>>& pieces,
+                        const std::vector<uint64_t>& piece_bytes) override {
     std::lock_guard<std::mutex> lock(cluster_->mutex);
+    max_batch = std::max(max_batch, keys.size());
+    uint64_t size = 0;
+    for (uint64_t bytes : piece_bytes) size += bytes;
     std::vector<bool> out;
     for (size_t i = 0; i < keys.size(); ++i) {
-      EXPECT_TRUE(Registered(dsts[i], size));
       if (throw_on_get) throw std::runtime_error("peer closed the connection");
       auto found = cluster_->objects.find(keys[i]);
       if (fail_gets || found == cluster_->objects.end() || found->second.size() != size) {
@@ -583,7 +584,12 @@ class FakeStore final : public LowerStore {
         continue;
       }
       ++gets;
-      std::memcpy(dsts[i], found->second.data(), size);
+      uint64_t at = 0;
+      for (size_t r = 0; r < piece_bytes.size(); ++r) {
+        EXPECT_TRUE(InAPool(pieces[i][r], piece_bytes[r]));
+        std::memcpy(pieces[i][r], found->second.data() + at, piece_bytes[r]);
+        at += piece_bytes[r];
+      }
       out.push_back(true);
     }
     return out;
@@ -626,20 +632,26 @@ class FakeStore final : public LowerStore {
   int gets = 0;
   int publishes = 0;
   int peer_requests = 0;
+  size_t max_batch = 0;   // most keys one Put or Get was handed
+  std::set<int> devices;  // of the pools registered
   bool fail_puts = false;
   bool fail_gets = false;
   bool throw_on_get = false;
+  bool refuse_pools = false;
 
  private:
-  bool Registered(const void* ptr, uint64_t size) const {
+  // Every piece the store is handed has to lie in a pool it was told of.
+  bool InAPool(const void* ptr, uint64_t size) const {
     const char* at = static_cast<const char*>(ptr);
-    return base_ != nullptr && at >= base_ && at + size <= base_ + bytes_;
+    for (const auto& pool : pools_) {
+      if (at >= pool.first && at + size <= pool.first + pool.second) return true;
+    }
+    return false;
   }
 
   std::string node_;
   std::shared_ptr<FakeCluster> cluster_;
-  char* base_ = nullptr;
-  uint64_t bytes_ = 0;
+  std::map<char*, uint64_t> pools_;
 };
 
 // Poll for something a background thread does.
@@ -673,7 +685,7 @@ class L1TierTest : public ::testing::Test {
   }
   void SetUp() override {
     TierOptions options;
-    options.staging_bytes = 3 * (kUnitA + kUnitB);  // three slots a round
+    options.batch_slots = 3;  // three slots a call
     Build(options);
   }
   void TearDown() override {
@@ -759,13 +771,17 @@ TEST_F(L1TierTest, StoreKeyRoundTripsBinaryKeys) {
 
 TEST_F(L1TierTest, EvictionOffloadsAndAFetchLoadsItBack) {
   Cache(node_a.get(), "p0", 0, Names("k", kSlots), 10);
-  // Two more slots: the two coldest go below first. More than one staging
-  // round would be needed for four, so take four.
+  // Four more slots: the four coldest go below first, which is more than one
+  // call to the store carries (three).
   AllocateResult more = node_a->Allocate("p0", 4);
   ASSERT_EQ(more.slots.size(), 4u);
   EXPECT_EQ(more.evicted_keys, (std::vector<std::string>{"k0", "k1", "k2", "k3"}));
   for (const char* key : {"k0", "k1", "k2", "k3"}) EXPECT_TRUE(InStore(key)) << key;
   EXPECT_FALSE(InStore("k4"));
+  // The store was handed the pool's own memory, on the pool's device, and
+  // never more slots at once than the options allow.
+  EXPECT_EQ(store_a->max_batch, 3u);
+  EXPECT_EQ(store_a->devices, (std::set<int>{0, 1}));
   EXPECT_EQ(StatsOf(node_a.get(), "p0").offloaded_slots, 4u);
   EXPECT_EQ(StatsOf(node_a.get(), "p0").dropped_slots, 0u);
 
@@ -936,7 +952,7 @@ TEST_F(L1TierTest, ExportRepeatsACopyTheStoreHasLost) {
 TEST_F(L1TierTest, OffloadAheadCopiesColdSlotsBeforeTheyAreNeeded) {
   TearDown();
   TierOptions options;
-  options.staging_bytes = 3 * (kUnitA + kUnitB);
+  options.batch_slots = 3;
   options.offload_ahead = 0.5;  // keep four of the eight slots ready
   Build(options);
   Cache(node_a.get(), "p0", 0, Names("k", kSlots), 10);
@@ -955,7 +971,7 @@ TEST_F(L1TierTest, OffloadAheadCopiesColdSlotsBeforeTheyAreNeeded) {
 TEST_F(L1TierTest, WithoutPeerCopyPoolsShareOnlyThroughTheStore) {
   TearDown();
   TierOptions options;
-  options.staging_bytes = 3 * (kUnitA + kUnitB);
+  options.batch_slots = 3;
   options.peer_copy = false;
   options.offload_ahead = 1.0;  // everything settled goes below
   Build(options);
@@ -969,10 +985,33 @@ TEST_F(L1TierTest, WithoutPeerCopyPoolsShareOnlyThroughTheStore) {
   EXPECT_EQ(StatsOf(node_a.get(), "p0").served_out_slots, 0u);
 }
 
+TEST_F(L1TierTest, APoolTheStoreRefusesStaysL1Only) {
+  TearDown();
+  cluster = std::make_shared<FakeCluster>();
+  auto store = std::make_shared<FakeStore>("a", cluster);
+  store->refuse_pools = true;
+  PoolManager manager(MakeHostMemoryApi());
+  manager.SetLowerStore(store, TierOptions{});
+  ASSERT_TRUE(manager.Attach("p0", "g", 0, kBytes).status.ok);
+  ASSERT_TRUE(manager.BindLayout("p0", TestLayout()).ok);
+  ASSERT_EQ(manager.Open("p0").num_slots, kSlots);
+  AllocateResult got = manager.Allocate("p0", kSlots);
+  std::vector<Op> ops;
+  for (uint32_t i = 0; i < kSlots; ++i) {
+    ops.push_back(Op{OpKind::kPublish, got.slots[i], "k" + std::to_string(i)});
+    ops.push_back(Op{OpKind::kRelease, got.slots[i], ""});
+  }
+  ASSERT_TRUE(manager.Apply("p0", ops).ok);
+  // Eviction still works; what it evicts is dropped, not offloaded.
+  ASSERT_EQ(manager.Allocate("p0", 2).slots.size(), 2u);
+  EXPECT_EQ(store->puts, 0);
+  for (const PoolStats& stats : manager.Stats()) EXPECT_EQ(stats.offloaded_slots, 0u);
+}
+
 TEST_F(L1TierTest, WithoutLoadingAFetchStaysInL1) {
   TearDown();
   TierOptions options;
-  options.staging_bytes = 3 * (kUnitA + kUnitB);
+  options.batch_slots = 3;
   options.load = false;
   Build(options);
   Cache(node_a.get(), "p0", 0, Names("k", kSlots), 10);
@@ -992,7 +1031,7 @@ TEST(L1ServiceTest, ExportCrossesTheSocket) {
     L1Server server(address, MakeHostMemoryApi());
     ASSERT_TRUE(server.ok());
     TierOptions options;
-    options.staging_bytes = 4 * (kUnitA + kUnitB);
+    options.batch_slots = 4;
     server.manager().SetLowerStore(store, options);
     L1Client client(address);
     ASSERT_TRUE(client.Attach("p0", "g", 0, kBytes).status.ok);
