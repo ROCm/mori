@@ -22,11 +22,17 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+#include <fcntl.h>
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
+#include <hip/hip_runtime.h>
+#include <pthread.h>
+#include <signal.h>
+#include <spawn.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -46,8 +52,67 @@
 #include "umbp/umbp_client.h"
 #include "umbp_standalone.grpc.pb.h"
 
+extern char** environ;
+
 namespace mori::umbp {
 namespace {
+
+// This test binary again, running only `test`, with `env` added to the
+// environment. For the side of a test that needs a process of its own.
+pid_t SpawnSelf(const std::string& test, const std::vector<std::string>& env) {
+  std::vector<std::string> vars = env;
+  for (char** var = environ; *var != nullptr; ++var) vars.emplace_back(*var);
+  std::vector<char*> envp;
+  for (auto& var : vars) envp.push_back(var.data());
+  envp.push_back(nullptr);
+  std::string exe = "/proc/self/exe", filter = "--gtest_filter=" + test,
+              disabled = "--gtest_also_run_disabled_tests";
+  char* argv[] = {exe.data(), filter.data(), disabled.data(), nullptr};
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+  pid_t pid = -1;
+  if (posix_spawn(&pid, exe.c_str(), &actions, nullptr, argv, envp.data()) != 0) pid = -1;
+  posix_spawn_file_actions_destroy(&actions);
+  return pid;
+}
+
+// A server in another process, for GPU tests: HIP will not open an IPC handle
+// in the process that exported it.
+class ServerProcess {
+ public:
+  explicit ServerProcess(const std::string& address)
+      : pid_(SpawnSelf("StandaloneShmIpcTest.DISABLED_ServeUntilTerminated",
+                       {"UMBP_TEST_SERVE_ADDRESS=" + address})) {}
+  ~ServerProcess() {
+    if (pid_ <= 0) return;
+    kill(pid_, SIGTERM);
+    waitpid(pid_, nullptr, 0);
+  }
+  bool started() const { return pid_ > 0; }
+
+ private:
+  pid_t pid_;
+};
+
+// The process ServerProcess starts.
+TEST(StandaloneShmIpcTest, DISABLED_ServeUntilTerminated) {
+  const char* address = std::getenv("UMBP_TEST_SERVE_ADDRESS");
+  if (address == nullptr) GTEST_SKIP() << "started by ServerProcess only";
+  sigset_t term;
+  sigemptyset(&term);
+  sigaddset(&term, SIGTERM);
+  // Before the server starts threads, which inherit the mask.
+  ASSERT_EQ(pthread_sigmask(SIG_BLOCK, &term, nullptr), 0);
+  UMBPConfig cfg;
+  cfg.dram.capacity_bytes = 64 << 20;
+  cfg.ssd.enabled = false;
+  standalone::StandaloneServer server(cfg, address);
+  ASSERT_TRUE(server.Start());
+  int signal = 0;
+  sigwait(&term, &signal);
+  server.Shutdown();
+}
 
 TEST(StandaloneShmIpcTest, AnonymousShmRegistryLookupMapsSameMemory) {
   HostMemAllocator allocator;
@@ -227,6 +292,48 @@ TEST(StandaloneShmIpcTest, GpuRegistrationRejectsSsdBackedServer) {
   unlink(grpc_path.c_str());
   unlink(fd_path.c_str());
   std::filesystem::remove_all(ssd_path);
+}
+
+// The next allocation of a freed buffer's size comes back at its address.
+// Registering it must map the new memory, not keep serving the freed one.
+TEST(StandaloneShmIpcTest, GpuRegistrationOfAReallocatedBufferMapsTheNewMemory) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  const std::string address =
+      "unix:///tmp/umbp_standalone_gpu_realloc_" + std::to_string(getpid()) + ".grpc.sock";
+  ServerProcess server(address);
+  ASSERT_TRUE(server.started());
+  UMBPConfig cfg;
+  cfg.dram.capacity_bytes = 1 << 20;
+  cfg.ssd.enabled = false;
+  cfg.standalone_process.emplace().address = address;
+  auto client = CreateUMBPClient(cfg);
+
+  constexpr size_t kBytes = 64 << 20;  // HIP's pool serves smaller sizes, reusing no address
+  constexpr size_t kChunk = 4096;
+  ASSERT_EQ(hipSetDevice(0), hipSuccess);
+  void* first = nullptr;
+  ASSERT_EQ(hipMalloc(&first, kBytes), hipSuccess);
+  ASSERT_EQ(hipMemset(first, 0xa1, kBytes), hipSuccess);
+  const auto base = reinterpret_cast<uintptr_t>(first);
+  ASSERT_TRUE(client->RegisterMemory(base, kBytes, mori::io::MemoryLocationType::GPU, 0));
+  ASSERT_EQ(hipFree(first), hipSuccess);
+  void* second = nullptr;
+  ASSERT_EQ(hipMalloc(&second, kBytes), hipSuccess);
+  std::unique_ptr<void, decltype(&hipFree)> owned(second, hipFree);
+  if (second != first) GTEST_SKIP() << "the allocator did not hand the address out again";
+  auto* bytes = static_cast<unsigned char*>(second);
+  ASSERT_EQ(hipMemset(bytes, 0xb2, kChunk), hipSuccess);
+  ASSERT_EQ(hipMemset(bytes + kChunk, 0, kChunk), hipSuccess);
+  ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+  ASSERT_TRUE(client->RegisterMemory(base, kBytes, mori::io::MemoryLocationType::GPU, 0));
+
+  ASSERT_TRUE(client->Put("realloc", base, kChunk));
+  ASSERT_TRUE(client->Get("realloc", base + kChunk, kChunk));
+  std::vector<unsigned char> read(kChunk);
+  ASSERT_EQ(hipMemcpy(read.data(), bytes + kChunk, kChunk, hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(read, std::vector<unsigned char>(kChunk, 0xb2));
+  client->Close();
 }
 
 TEST(StandaloneShmIpcTest, WorkerRegistrationUsesNonZeroOffsetsAndCanReregister) {

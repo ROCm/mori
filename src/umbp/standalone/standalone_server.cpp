@@ -1102,6 +1102,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     MemoryKind kind = MemoryKind::kHostShm;
     int device_id = -1;
     uint64_t alloc_base = 0;
+    std::string ipc_handle;
     std::string client_id;
   };
 
@@ -1111,14 +1112,19 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     uint64_t size = 0;
   };
 
+  // An address names an allocation only until it is freed: the next
+  // allocation of the same size comes back at the same address, while a
+  // mapping of the freed one still reads the old memory. The IPC handle is
+  // what tells the two apart.
   struct IpcKey {
     std::string client_id;
     int device_id = -1;
     uint64_t alloc_base = 0;
+    std::string ipc_handle;
 
     bool operator<(const IpcKey& other) const {
-      return std::tie(client_id, device_id, alloc_base) <
-             std::tie(other.client_id, other.device_id, other.alloc_base);
+      return std::tie(client_id, device_id, alloc_base, ipc_handle) <
+             std::tie(other.client_id, other.device_id, other.alloc_base, other.ipc_handle);
     }
   };
 
@@ -1360,7 +1366,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
       return mem.kind == MemoryKind::kGpuIpc && mem.worker_base == request.worker_base() &&
              mem.size == request.size() && mem.device_id == request.device_id() &&
-             mem.alloc_base == request.alloc_base();
+             mem.alloc_base == request.alloc_base() && mem.ipc_handle == request.ipc_handle();
     });
   }
 
@@ -1454,7 +1460,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       return;
     }
 
-    const IpcKey key{request.client_id(), request.device_id(), request.alloc_base()};
+    const IpcKey key{request.client_id(), request.device_id(), request.alloc_base(),
+                     request.ipc_handle()};
     ScopedHipDevice device_guard(request.device_id());
     if (!device_guard.IsValid()) {
       SetBool(response, false, "hipSetDevice failed for the requested device_id");
@@ -1497,6 +1504,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     entry.kind = MemoryKind::kGpuIpc;
     entry.device_id = request.device_id();
     entry.alloc_base = request.alloc_base();
+    entry.ipc_handle = request.ipc_handle();
     entry.client_id = request.client_id();
     // Both modes declare the imported mapping to the inner backend; only Local
     // pins it. Ranged distributed I/O stages remote objects through a registered
@@ -1611,7 +1619,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       client_->DeregisterMemory(reinterpret_cast<uintptr_t>(mem.base));
     }
     if (mem.kind == MemoryKind::kGpuIpc) {
-      ReleaseIpcMapping(IpcKey{mem.client_id, mem.device_id, mem.alloc_base});
+      ReleaseIpcMapping(IpcKey{mem.client_id, mem.device_id, mem.alloc_base, mem.ipc_handle});
     } else {
       munmap(mem.base, static_cast<size_t>(mem.size));
     }
