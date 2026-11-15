@@ -521,9 +521,7 @@ _LL128_TABLE: dict = {
         },
         "gfx1250/96cu": {
             (8, 7168, 6, None): {
-                "bf16": dict(
-                    max_tok=176, card_max_tok=160, dispatch=(32, 16), combine=(32, 16)
-                ),
+                "bf16": dict(max_tok=127, dispatch=(32, 16), combine=(32, 16)),
             },
         },
     },
@@ -538,7 +536,6 @@ def ll128(
     max_tok,
     experts_per_rank=None,
     quant_type="none",
-    card_fold=False,
 ):
     devs = _device_keys()
     if devs[0] == "gfx1250-strict":
@@ -554,8 +551,6 @@ def ll128(
             break
     if plan is None:
         return None
-    if card_fold and "card_max_tok" in plan:
-        plan = dict(plan, max_tok=plan["card_max_tok"])
     if max_tok <= plan["max_tok"]:
         return {"dispatch": plan["dispatch"], "combine": plan["combine"]}
     if max_tok <= plan.get("combine_max_tok", 0):
