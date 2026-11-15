@@ -155,7 +155,7 @@
     {
       "id": 21,
       "type": "stat",
-      "title": "Total sent",
+      "title": "Total Sent",
       "description": "Sum over the selected GPUs of the average sent bandwidth (all links) in the averaging window. Link bytes, not payload.",
       "datasource": {
         "type": "prometheus",
@@ -222,7 +222,7 @@
     {
       "id": 22,
       "type": "stat",
-      "title": "Total util",
+      "title": "Total Util",
       "description": "Total sent / total capacity (links x link max) of the selected GPUs: the share of the XGMI sending capacity in use. This is link bandwidth utilisation, not the GPU engine utilisation. Needs the capacity labels (data recorded with this version).",
       "datasource": {
         "type": "prometheus",
@@ -305,8 +305,8 @@
     {
       "id": 23,
       "type": "stat",
-      "title": "Busiest GPU",
-      "description": "The GPU with the highest average sent bandwidth in the averaging window.",
+      "title": "Busiest Sent",
+      "description": "The GPU with the highest average sent bandwidth (its links added) in the averaging window.",
       "datasource": {
         "type": "prometheus",
         "uid": "xgmi-vm"
@@ -371,10 +371,10 @@
       }
     },
     {
-      "id": 24,
+      "id": 26,
       "type": "stat",
-      "title": "Hottest link (2 ms peak)",
-      "description": "The highest single 2 ms interval on any link of the selected GPUs in the averaging window, and which link.",
+      "title": "Busiest Received",
+      "description": "The GPU with the highest average received bandwidth (what the peers sent to it, all links) in the averaging window.",
       "datasource": {
         "type": "prometheus",
         "uid": "xgmi-vm"
@@ -382,7 +382,7 @@
       "gridPos": {
         "x": 14,
         "y": 0,
-        "w": 6,
+        "w": 5,
         "h": 4
       },
       "targets": [
@@ -395,8 +395,8 @@
           "instant": true,
           "range": false,
           "format": "time_series",
-          "expr": "topk(1, max by (gpu, peer) (max_over_time(xgmi_rate_bytes_per_second{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[${avg_window}ms])))",
-          "legendFormat": "GPU{{gpu}} → GPU{{peer}}"
+          "expr": "topk(1, sum by (gpu) (label_replace(sum by (peer) (sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",peer=~\"$gpu\",dir=\"wr\"}[${avg_window}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${avg_window}ms]))), \"gpu\", \"$1\", \"peer\", \"(.*)\")))",
+          "legendFormat": "GPU{{gpu}}"
         }
       ],
       "fieldConfig": {
@@ -441,16 +441,16 @@
     {
       "id": 25,
       "type": "stat",
-      "title": "Last data",
+      "title": "Last Data",
       "description": "Seconds from the newest sample (looked up in the hour before the end of the time range) to now. While recording 1-6 s is normal (VictoriaMetrics makes new data searchable after about 5 s); red means the recorder or the push stalled. For recorded data it shows how old the data is; no sample in that hour = no data.",
       "datasource": {
         "type": "prometheus",
         "uid": "xgmi-vm"
       },
       "gridPos": {
-        "x": 20,
+        "x": 19,
         "y": 0,
-        "w": 4,
+        "w": 5,
         "h": 4
       },
       "targets": [

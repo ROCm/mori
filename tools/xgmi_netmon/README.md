@@ -116,13 +116,12 @@ Pick experiment, host, GPU and two variables:
 
 Top to bottom:
 
-- Tiles: total sent, total util (share of the capacity), busiest GPU, hottest link and last data.
-  *Busiest GPU* is the GPU with the highest average sent bandwidth (its 7 links added) in the
-  window. *Hottest link* is the link with the highest single 2 ms interval in the window, so it is
-  a peak, not an average. *Last data* is the time from the newest sample (within the hour before the
-  end of the range) to now: while recording 1-6 s is normal (VictoriaMetrics makes new data
-  searchable after about 5 s), red from 30 s means the recorder or the push stalled; for a
-  recording it shows how old the data is.
+- Tiles: Total Sent, Total Util (share of the capacity), Busiest Sent and Busiest Received (the GPU
+  with the highest average sent / received bandwidth in the window; received = what the peers sent
+  to it) and Last Data (the time from the newest sample, within the hour before the end of the
+  range, to now: while recording 1-6 s is normal, since VictoriaMetrics makes new data searchable
+  after about 5 s, and red from 30 s means the recorder or the push stalled; for a recording it
+  shows how old the data is).
 - GPU overview table (like rdmatop's device table): per GPU the average sent and received
   bandwidth, each also as a bar of the GPU's capacity (links x link max), the highest single 2 ms
   interval on any link, the coverage (the share of the window with valid sampling intervals; below
