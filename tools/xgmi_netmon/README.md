@@ -125,9 +125,10 @@ Top to bottom:
   every 2 s, so it is not shown as a number; in the first 6-10 s of a recording it shows no data, because VictoriaMetrics needs
   that long to make a new series searchable).
 - GPU overview table (like rdmatop's device table): per GPU the average sent and received
-  bandwidth, each also as a bar of the GPU's capacity (links x link max), the highest single 2 ms
-  interval on any link, the coverage (the share of the window with valid sampling intervals; below
-  100 % the numbers cover only part of the window) and a trend of the sent bandwidth. Bar colours as
+  bandwidth, each also as a bar of the GPU's capacity (links x link max), the coverage (the share
+  of the window with valid sampling intervals; below 100 % the numbers cover only part of the
+  window) and a wide trend of the sent bandwidth (the other columns have a fixed width, the trend
+  takes the rest). Bar colours as
   in rdmatop: under 5 % grey, 5-40 % dim green, 40-70 % green, 70-85 % yellow, from 85 % red.
 - Sent matrix: row GPU -> column GPU, coloured in the same five steps as the util bars, as shares
   of one link's 72 GB/s (xgmi link width 16 x speed 36 Gbps, from `gpu_metrics`): under 5 % grey, up to
