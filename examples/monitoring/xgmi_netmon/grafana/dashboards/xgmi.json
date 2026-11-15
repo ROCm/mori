@@ -442,7 +442,7 @@
       "id": 25,
       "type": "stat",
       "title": "Last Data",
-      "description": "Seconds from the newest sample (looked up in the hour before the end of the time range) to now. While recording 1-6 s is normal (VictoriaMetrics makes new data searchable after about 5 s); red means the recorder or the push stalled. For recorded data it shows how old the data is; no sample in that hour = no data.",
+      "description": "Live = the newest sample is at most 10 s old: the recorder is running and its data arrives. Otherwise the age in seconds (yellow from 10 s, red from 30 s): the recorder or the push stalled, or this is a recording and the number is how old it is. The age is that of the newest sample VictoriaMetrics can search, to now (the looked-up window is the hour before the end of the time range; none = no data). While recording it moves between about 2.6 and 4.4 s: the recorder pushes once per second and VictoriaMetrics makes new data searchable about every 2 s, which is why a number under 10 s is shown as Live. In the first seconds after a recording starts the tile shows no data: a new series takes about 6-10 s to become searchable in VictoriaMetrics (measured 8.9-10.3 s in six runs).",
       "datasource": {
         "type": "prometheus",
         "uid": "xgmi-vm"
@@ -490,7 +490,21 @@
                 "value": 30
               }
             ]
-          }
+          },
+          "mappings": [
+            {
+              "type": "range",
+              "options": {
+                "from": -1000000000.0,
+                "to": 10,
+                "result": {
+                  "text": "Live",
+                  "color": "green",
+                  "index": 0
+                }
+              }
+            }
+          ]
         },
         "overrides": []
       },

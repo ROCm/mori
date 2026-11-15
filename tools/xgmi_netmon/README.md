@@ -118,10 +118,12 @@ Top to bottom:
 
 - Tiles: Total Sent, Total Util (share of the capacity), Busiest Sent and Busiest Received (the GPU
   with the highest average sent / received bandwidth in the window; received = what the peers sent
-  to it) and Last Data (the time from the newest sample, within the hour before the end of the
-  range, to now: while recording 1-6 s is normal, since VictoriaMetrics makes new data searchable
-  after about 5 s, and red from 30 s means the recorder or the push stalled; for a recording it
-  shows how old the data is).
+  to it) and Last Data (Live while the newest sample is at most 10 s old; otherwise its age in
+  seconds, yellow from 10 s and red from 30 s: the recorder or the push stalled, or it is a
+  recording and this is how old it is. While recording the age moves between about 2.6 and 4.4 s,
+  because the recorder pushes once per second and VictoriaMetrics makes new data searchable about
+  every 2 s, so it is not shown as a number; in the first 6-10 s of a recording it shows no data, because VictoriaMetrics needs
+  that long to make a new series searchable).
 - GPU overview table (like rdmatop's device table): per GPU the average sent and received
   bandwidth, each also as a bar of the GPU's capacity (links x link max), the highest single 2 ms
   interval on any link, the coverage (the share of the window with valid sampling intervals; below
