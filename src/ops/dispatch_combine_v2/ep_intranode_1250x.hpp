@@ -6497,8 +6497,7 @@ __device__ void EpCombine1250xBody(EpArgs args) {
         }
       }
       if (!_pullDone) {
-        core::WarpAccum<T, 16, WARP_ACCUM_UNROLL>(outPtr, srcPtrs, nullptr, validAccumCount,
-                                                  hiddenDimSize);
+        core::WarpAccumLF<T, 16>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
       }
 
       if constexpr (kCfg.useWeights) {

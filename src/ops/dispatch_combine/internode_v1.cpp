@@ -870,8 +870,8 @@ namespace combine_impl {
 // loads before accumulating each vector step, putting more bytes in flight than
 // the 4B fallback. Other topk (e.g. 9, 16) go through WarpAccumDynamic, which
 // loads 16B vectors one source at a time. The separate intra-node path in
-// intranode.hpp passes WarpAccum an Unroll of WARP_ACCUM_UNROLL, so each source
-// can load several vector steps before accumulating.
+// intranode.hpp uses WarpAccumLF, which also loads multiple vector steps before
+// accumulating.
 //
 // Alignment and slice sizing matter here:
 //   - Both ends must be 16B-aligned. A combine staging slot interleaves the

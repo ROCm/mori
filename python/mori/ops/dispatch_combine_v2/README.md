@@ -186,9 +186,8 @@ FP4 combine and FP4 dispatch with FP8 combine are unsupported.
 
 For ordinary `internode_kernel="v2"`, a combine rule with
 `combine_load_first` set to 1 compiles that token bucket's combine with
-4-byte-per-lane peer gathers that load two vector steps per source per
-iteration (`WarpAccum<T, 4, 2>`); other buckets use `WarpAccum<T, 4>`, which
-loads one. Both issue every source's loads before accumulating. The choice is per bucket and per GPU model, independent
+4-byte-per-lane load-first peer gathers (`WarpAccumLF<T, 4, 2>`); other buckets
+use `WarpAccum<T, 4>`. The choice is per bucket and per GPU model, independent
 of the declared capacity. Only the combine pass depends on it, and that pass is
 compiled once per pair of active QP count and load-first setting the schedule
 uses. It has no effect on `v2_ll`, which has its own gather.

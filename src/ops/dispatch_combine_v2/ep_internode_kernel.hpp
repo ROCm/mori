@@ -1024,15 +1024,13 @@ inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, s
   }
 }
 
-// Ordinary gather. Both variants issue every source's loads before accumulating;
-// the tuning table's combine_load_first, fixed at compile time per token bucket,
-// selects two vec-chunks per source per iteration instead of one. The LL gather
-// uses its separate path.
+// Ordinary gather: load-first or plain, fixed at compile time per token bucket
+// by the tuning table's combine_load_first. The LL gather uses its separate path.
 template <EpInterNodeKernelCfg kConfig, typename TokT>
 __forceinline__ __device__ void CombineGatherNormal(TokT* dest, TokT** srcPtrs, int accumNum,
                                                     size_t nelems) {
   if constexpr (kConfig.combineLoadFirst) {
-    core::WarpAccum<TokT, 4, 2>(dest, srcPtrs, nullptr, accumNum, nelems);
+    core::WarpAccumLF<TokT, 4, 2>(dest, srcPtrs, nullptr, accumNum, nelems);
   } else {
     core::WarpAccum<TokT, 4>(dest, srcPtrs, nullptr, accumNum, nelems);
   }
