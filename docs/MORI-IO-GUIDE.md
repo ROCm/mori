@@ -111,6 +111,10 @@ from mori.io import (
 | `Message()` | Get status message |
 | `Wait()` | Block until transfer completes |
 
+For FABRIC transfers, `TransferStatus.Message()` reports routing rejection reasons and the
+specific HIP call and error when a remote memory import fails. Registration failures appear
+in logs; when another backend is selected, an INFO log gives the Fabric reason and the fallback.
+
 ## Example: Basic Read/Write
 
 ```python

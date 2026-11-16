@@ -5,6 +5,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -83,6 +84,101 @@ struct Buffers {
     return result;
   }
 };
+std::string Rejected(Pair& p, const MemoryDesc& local, const MemoryDesc& remote,
+                     bool batch = false, bool import = false) {
+  TransferStatus status;
+  auto id = p.a.AllocateTransferUniqueId();
+  if (batch) {
+    TransferStatusPtrVec statuses{&status};
+    TransferUniqueIdVec ids{id};
+    p.a.BatchWrite({local}, {{0}}, {remote}, {{0}}, {{1}}, statuses, ids);
+  } else {
+    p.a.Write(local, 0, remote, 0, 1, &status, id);
+  }
+  Require(status.Code() == StatusCode::ERR_BAD_STATE, "expected rejection: " + status.Message());
+  const std::string prefix = import ? "FABRIC: import of remote memory failed: "
+                                    : "No backend can handle local mem ";
+  Require(status.Message().find(prefix) == 0 &&
+              status.Message().find("FABRIC:") != std::string::npos,
+          "missing Fabric failure reason: " + status.Message());
+  return status.Message();
+}
+
+void PlainRegistration(Pair& p, const std::string& ownerReason,
+                       const std::string& routeReason = "") {
+  void* local = nullptr;
+  void* remote = nullptr;
+  Hip(hipSetDevice(p.local));
+  Hip(hipMalloc(&local, 64));
+  Hip(hipSetDevice(p.remote));
+  Hip(hipMalloc(&remote, 64));
+  auto ld = p.a.RegisterMemory(local, 64, p.local, MemoryLocationType::GPU);
+  auto rd = p.b.RegisterMemory(remote, 64, p.remote, MemoryLocationType::GPU);
+  Require(rd.fabricReason.find(ownerReason) != std::string::npos,
+          "missing owner reason: " + rd.fabricReason);
+  Require(std::all_of(rd.fabricHandle.begin(), rd.fabricHandle.end(),
+                      [](char c) { return c == 0; }),
+          "rejected registration exported a handle");
+  auto message = Rejected(p, ld, rd);
+  Require(message.find(routeReason.empty() ? rd.fabricReason : routeReason) != std::string::npos,
+          "lost reason: " + message);
+  p.a.DeregisterMemory(ld);
+  p.b.DeregisterMemory(rd);
+  Hip(hipSetDevice(p.local));
+  Hip(hipFree(local));
+  Hip(hipSetDevice(p.remote));
+  Hip(hipFree(remote));
+}
+
+void FailureReasons(Pair& p) {
+  PlainRegistration(p, "FabricMalloc");
+  Buffers mem(p, 64);
+  auto local = mem.ld;
+  local.loc = MemoryLocationType::CPU;
+  Require(Rejected(p, local, mem.rd).find("local memory is not GPU memory") != std::string::npos,
+          "missing local CPU reason");
+  auto remote = mem.rd;
+  remote.loc = MemoryLocationType::CPU;
+  Require(Rejected(p, mem.ld, remote).find("remote memory is not GPU memory") != std::string::npos,
+          "missing remote CPU reason");
+
+  remote = mem.rd;
+  remote.vpodId = remote.vpodId == 0 ? 1 : 0;
+  auto key = fabric::ReadVpodKey(p.local);
+  auto message = Rejected(p, mem.ld, remote);
+  Require(message.find("different vPOD: local ppod_id=" + key.ppodId +
+                       " vpod_id=" + std::to_string(key.vpodId)) != std::string::npos &&
+              message.find("remote ppod_id=" + remote.vpodPpodId +
+                           " vpod_id=" + std::to_string(remote.vpodId)) != std::string::npos,
+          "missing vPOD values: " + message);
+
+  // No successful import of this memory has occurred. Both failures must retry.
+  // Which call rejects a corrupted handle is driver-specific: on MI455 (ROCm 10.1)
+  // the import itself succeeds and hipMemSetAccess fails.
+  remote = mem.rd;
+  remote.fabricHandle.fill(static_cast<char>(0xff));
+  for (bool batch : {false, true}) {
+    message = Rejected(p, mem.ld, remote, batch, true);
+    Require(message.find(" failed for remote memory id=") != std::string::npos &&
+                message.find("hipError") != std::string::npos,
+            "missing HIP import error: " + message);
+  }
+}
+
+void DisabledFabric(int local, int remote) {
+  const char* previous = std::getenv("MORI_IO_FABRIC_DISABLE");
+  const std::string saved = previous ? previous : "";
+  const bool hadPrevious = previous != nullptr;
+  setenv("MORI_IO_FABRIC_DISABLE", "1", 1);
+  Pair p(local, remote);  // topology is read at backend initialization
+  if (hadPrevious)
+    setenv("MORI_IO_FABRIC_DISABLE", saved.c_str(), 1);
+  else
+    unsetenv("MORI_IO_FABRIC_DISABLE");
+  PlainRegistration(p, "MORI_IO_FABRIC_DISABLE", "local device " + std::to_string(local) +
+                    " is not on a ready UALink fabric: MORI_IO_FABRIC_DISABLE");
+}
+
 void Submit(IOEngineSession& s, bool read, const SizeVec& local, const SizeVec& remote,
             const SizeVec& sizes, TransferStatus* status) {
   auto id = s.AllocateTransferUniqueId();
@@ -335,6 +431,13 @@ int main(int argc, char** argv) {
     if (hipGetDeviceCount(&count) == hipSuccess)
       for (int i = 0; i < count; ++i)
         if (fabric::DeviceSupportsFabric(i)) capable.push_back(i);
+    if (capable.empty() && count > 0) {
+      Pair p(0, 0);
+      PlainRegistration(p, "device 0 does not support fabric handles",
+                        "local device 0 does not support fabric handles");
+      std::cout << "PASS: non-fabric registration and transfer failure reasons\n";
+      return 0;
+    }
     if (capable.size() < 2) {
       std::cout << "SKIP: requires at least two fabric-capable GPUs\n";
       return 0;
@@ -349,7 +452,9 @@ int main(int argc, char** argv) {
     Require(!hsaco.empty(), "--hsaco must point to the JIT-produced fabric_copy hsaco");
     Require(fabric::VpodKeySame(fabric::ReadVpodKey(first), fabric::ReadVpodKey(second)),
             "devices are not in the same ready fabric vPOD");
+    DisabledFabric(first, second);
     Pair p(first, second);
+    FailureReasons(p);
     Fallback(p);
     p.a.LoadFabricCopyModule(hsaco);
     p.b.LoadFabricCopyModule(hsaco);
