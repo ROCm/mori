@@ -78,10 +78,6 @@ class FabricBackendSession : public BackendSession {
   bool Alive() const override;
 
  private:
-  // Launch the copy kernel over [srcBase+srcOff, dstBase+dstOff) for `size`
-  // bytes on `stream`. Returns hipSuccess or the launch error.
-  hipError_t LaunchCopy(void* dst, const void* src, size_t size, hipStream_t stream);
-
   FabricBackendConfig config{};
   void* localAddr{nullptr};   // local registered pointer
   void* remoteAddr{nullptr};  // imported peer VA (aliases remote HBM over fabric)
@@ -115,9 +111,15 @@ class FabricBackend : public Backend {
                                 TransferStatus* status) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
-  // JIT-loaded contiguous copy kernel (fabric_copy.hip), one module per device.
+  // JIT-loaded batched copy kernels (fabric_copy.hip), one module per device.
   void LoadFabricCopyModule(const std::string& hsacoPath);
-  hipFunction_t GetFabricCopyFunc(int deviceId);
+  struct CopyFunctions {
+    hipFunction_t small{nullptr};
+    hipFunction_t large{nullptr};
+    explicit operator bool() const { return small != nullptr && large != nullptr; }
+  };
+  CopyFunctions GetFabricCopyFunctions(int deviceId);
+  uint32_t FabricCopyMaxBlocks() const { return fabricCopyMaxBlocks_; }
 
  private:
   void Initialize();
@@ -206,7 +208,8 @@ class FabricBackend : public Backend {
 
   std::string fabricCopyHsacoPath_;
   std::vector<hipModule_t> fabricCopyModules_;
-  std::vector<hipFunction_t> fabricCopyFuncs_;
+  std::vector<CopyFunctions> fabricCopyFuncs_;
+  uint32_t fabricCopyMaxBlocks_;
   std::mutex moduleMu_;
 };
 

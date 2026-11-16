@@ -29,18 +29,43 @@
 #include <atomic>
 #include <cassert>
 #include <cctype>
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
-#include <numeric>
 #include <sstream>
 
 #include "mori/io/logging.hpp"
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/host_utils.hpp"
+#include "src/io/fabric/copy_plan.hpp"
+#include "src/io/fabric/copy_test_hooks.hpp"
 
 namespace mori {
 namespace io {
+namespace fabric {
 namespace {
+thread_local CopyTestHooks* copyTestHooks = nullptr;
+}
+void SetCopyTestHooks(CopyTestHooks* hooks) { copyTestHooks = hooks; }
+}  // namespace fabric
+namespace {
+// Provisional MI455 default: 192 CUs x 8; tune only after hardware measurements.
+constexpr uint32_t kDefaultFabricCopyMaxBlocks = 1536;
+uint32_t ReadFabricCopyMaxBlocks() {
+  const char* value = std::getenv("MORI_IO_FABRIC_COPY_MAX_BLOCKS");
+  if (!value) return kDefaultFabricCopyMaxBlocks;
+  uint32_t parsed = 0;
+  const char* end = value + std::strlen(value);
+  auto result = std::from_chars(value, end, parsed);
+  if (result.ec == std::errc{} && result.ptr == end && parsed > 0) return parsed;
+  static std::once_flag warning;
+  std::call_once(warning, [value]() {
+    MORI_IO_WARN("FABRIC: invalid MORI_IO_FABRIC_COPY_MAX_BLOCKS='{}'; using {}", value,
+                 kDefaultFabricCopyMaxBlocks);
+  });
+  return kDefaultFabricCopyMaxBlocks;
+}
 
 // Lowercase a PCI bus ID so HIP (may return uppercase) and sysfs (lowercase)
 // spellings compare equal.
@@ -270,102 +295,39 @@ FabricBackendSession::FabricBackendSession(const FabricBackendConfig& config, vo
       streamPool(streamPool),
       eventPool(eventPool) {}
 
-hipError_t FabricBackendSession::LaunchCopy(void* dst, const void* src, size_t size,
-                                            hipStream_t stream) {
-  if (size == 0) return hipSuccess;
-
-  hipFunction_t fn = backend != nullptr ? backend->GetFabricCopyFunc(localDevice) : nullptr;
-  if (fn == nullptr) {
-    // hipMemcpyAsync livelocks on imported fabric pointers for large payloads
-    // (see fabric_copy.hip); fail fast instead of hanging, only allow it small.
-    constexpr size_t kFabricMemcpyFallbackMax = 4ull * 1024 * 1024;
-    if (size >= kFabricMemcpyFallbackMax) {
-      MORI_IO_WARN(
-          "FABRIC: fabric_copy kernel not loaded; refusing hipMemcpyAsync "
-          "fallback for {} byte transfer (>= {} B may livelock on imported "
-          "fabric pointers). Load the fabric_copy module first.",
-          size, kFabricMemcpyFallbackMax);
-      return hipErrorNotSupported;
-    }
-    return hipMemcpyAsync(dst, src, size, hipMemcpyDefault, stream);
-  }
-
-  char* dstPtr = static_cast<char*>(dst);
-  const char* srcPtr = static_cast<const char*>(src);
-  size_t nbytes = size;
-  void* args[] = {&dstPtr, &srcPtr, &nbytes};
-
-  const int threads = 256;
-  size_t units = (size + 15) / 16;  // 16B chunks (grid-stride handles remainder)
-  long long blocks = static_cast<long long>((units + threads - 1) / threads);
-  if (blocks < 1) blocks = 1;
-  if (blocks > 65535) blocks = 65535;
-
-  return hipModuleLaunchKernel(fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1, 0, stream,
-                               args, nullptr);
-}
-
 void FabricBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                      TransferStatus* status, TransferUniqueId id, bool isRead) {
-  ScopedHipDeviceGuard deviceGuard;
-  hipError_t err = hipSetDevice(localDevice);
-  if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: Failed to set device: ") + hipGetErrorString(err));
-    return;
-  }
-
-  hipStream_t stream = streamPool->GetNextStream(localDevice);
-  hipEvent_t event = eventPool->GetEvent(localDevice);
-  if (stream == nullptr || event == nullptr) {
-    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to get stream or event from pool");
-    if (event != nullptr) eventPool->PutEvent(event, localDevice);
-    return;
-  }
-
-  void* src = isRead ? static_cast<char*>(remoteAddr) + remoteOffset
-                     : static_cast<char*>(localAddr) + localOffset;
-  void* dst = isRead ? static_cast<char*>(localAddr) + localOffset
-                     : static_cast<char*>(remoteAddr) + remoteOffset;
-
-  err = LaunchCopy(dst, src, size, stream);
-  if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: copy launch failed: ") + hipGetErrorString(err));
-    eventPool->PutEvent(event, localDevice);
-    return;
-  }
-
-  err = hipEventRecord(event, stream);
-  if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: hipEventRecord failed: ") + hipGetErrorString(err));
-    eventPool->PutEvent(event, localDevice);
-    return;
-  }
-
-  status->SetCode(StatusCode::IN_PROGRESS);
-  ArmTransferCompletion(status, event, localDevice, eventPool);
-  MORI_IO_TRACE("FABRIC: Transfer issued, id={}, size={}, isRead={}", id, size, isRead);
+  BatchReadWrite({localOffset}, {remoteOffset}, {size}, status, id, isRead);
 }
 
 void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                           const SizeVec& sizes, TransferStatus* status,
                                           TransferUniqueId id, bool isRead) {
+  assert(sizes.size() == localOffsets.size());
+  assert(sizes.size() == remoteOffsets.size());
   ScopedHipDeviceGuard deviceGuard;
-  size_t batchSize = sizes.size();
-  assert(batchSize == localOffsets.size());
-  assert(batchSize == remoteOffsets.size());
-
-  if (batchSize == 0) {
-    status->SetCode(StatusCode::SUCCESS);
-    return;
-  }
-
   hipError_t err = hipSetDevice(localDevice);
   if (err != hipSuccess) {
     status->Update(StatusCode::ERR_GPU_OP,
                    std::string("FABRIC: Failed to set device: ") + hipGetErrorString(err));
+    return;
+  }
+  const auto funcs = backend->GetFabricCopyFunctions(localDevice);
+  std::vector<fabric::CopySegment> segments;
+  segments.reserve(sizes.size());
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    uint64_t local = reinterpret_cast<uintptr_t>(localAddr) + localOffsets[i];
+    uint64_t remote = reinterpret_cast<uintptr_t>(remoteAddr) + remoteOffsets[i];
+    segments.push_back({isRead ? remote : local, isRead ? local : remote, sizes[i]});
+  }
+  auto plan = fabric::PlanCopy(std::move(segments), backend->FabricCopyMaxBlocks(),
+                               static_cast<bool>(funcs), isRead);
+  if (!plan.error.empty()) {
+    status->Update(StatusCode::ERR_GPU_OP, plan.error);
+    return;
+  }
+  if (plan.segments.empty()) {
+    status->SetCode(StatusCode::SUCCESS);
     return;
   }
 
@@ -376,69 +338,80 @@ void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const Siz
     if (event != nullptr) eventPool->PutEvent(event, localDevice);
     return;
   }
-
-  // Sort by remote offset then merge contiguous runs (both sides contiguous) to
-  // cut the number of kernel launches.
-  std::vector<size_t> indices(batchSize);
-  std::iota(indices.begin(), indices.end(), 0);
-  if (!std::is_sorted(remoteOffsets.begin(), remoteOffsets.end())) {
-    std::sort(indices.begin(), indices.end(),
-              [&](size_t a, size_t b) { return remoteOffsets[a] < remoteOffsets[b]; });
-  }
-
-  struct MergedSeg {
-    size_t localOff;
-    size_t remoteOff;
-    size_t sz;
-  };
-  std::vector<MergedSeg> segments;
-  segments.reserve(batchSize);
-  for (size_t i = 0; i < batchSize; ++i) {
-    size_t idx = indices[i];
-    if (sizes[idx] == 0) continue;
-    if (!segments.empty()) {
-      MergedSeg& last = segments.back();
-      bool localContig = (last.localOff + last.sz) == localOffsets[idx];
-      bool remoteContig = (last.remoteOff + last.sz) == remoteOffsets[idx];
-      if (localContig && remoteContig) {
-        last.sz += sizes[idx];
-        continue;
+  auto* hooks = fabric::copyTestHooks;
+  unsigned launches = 0;
+  bool submitted = false;
+  auto fail = [&](const char* operation, hipError_t original) {
+    std::string message =
+        std::string("FABRIC: ") + operation + " failed: " + hipGetErrorString(original);
+    if (submitted) {
+      if (hooks) {
+        ++hooks->drainCalls;
+        if (hooks->onDrain) hooks->onDrain(false, stream);
+      }
+      hipError_t drain = hipStreamSynchronize(stream);
+      if (hooks) {
+        if (hooks->drainError != hipSuccess) drain = hooks->drainError;
+        if (hooks->onDrain) hooks->onDrain(true, stream);
+      }
+      if (drain != hipSuccess) {
+        message += std::string("; hipStreamSynchronize drain failed: ") + hipGetErrorString(drain);
       }
     }
-    segments.push_back({localOffsets[idx], remoteOffsets[idx], sizes[idx]});
-  }
-
-  if (segments.empty()) {
-    status->SetCode(StatusCode::SUCCESS);
+    // Publish only after the drain, preserving the original submission error.
+    status->Update(StatusCode::ERR_GPU_OP, message);
     eventPool->PutEvent(event, localDevice);
-    return;
-  }
-
-  for (const auto& seg : segments) {
-    void* src = isRead ? static_cast<char*>(remoteAddr) + seg.remoteOff
-                       : static_cast<char*>(localAddr) + seg.localOff;
-    void* dst = isRead ? static_cast<char*>(localAddr) + seg.localOff
-                       : static_cast<char*>(remoteAddr) + seg.remoteOff;
-    err = LaunchCopy(dst, src, seg.sz, stream);
-    if (err != hipSuccess) {
-      status->Update(StatusCode::ERR_GPU_OP,
-                     std::string("FABRIC: batch copy launch failed: ") + hipGetErrorString(err));
-      eventPool->PutEvent(event, localDevice);
-      return;
+  };
+  auto submit = [&](auto&& launch) {
+    ++launches;
+    hipError_t result = hooks && hooks->failLaunch == launches ? hooks->launchError : launch();
+    if (result == hipSuccess) {
+      submitted = true;
+      if (hooks) ++hooks->successfulLaunches;
+    }
+    return result;
+  };
+  if (funcs) {
+    for (auto& dispatch : plan.dispatches) {
+      err = submit([&]() {
+        return std::visit(
+            [&](auto& args) {
+              using Args = std::decay_t<decltype(args)>;
+              auto fn = std::is_same_v<Args, fabric::FabricCopyArgs<fabric::kSmallK>> ? funcs.small
+                                                                                      : funcs.large;
+              void* params[] = {&args};
+              return hipModuleLaunchKernel(fn, dispatch.grid, 1, 1, 256, 1, 1, 0, stream, params,
+                                           nullptr);
+            },
+            dispatch.args);
+      });
+      if (err != hipSuccess) {
+        fail("copy launch", err);
+        return;
+      }
+    }
+  } else {
+    for (const auto& seg : plan.segments) {
+      err = submit([&]() {
+        return hipMemcpyAsync(reinterpret_cast<void*>(seg.dst),
+                              reinterpret_cast<const void*>(seg.src), seg.size, hipMemcpyDefault,
+                              stream);
+      });
+      if (err != hipSuccess) {
+        fail("hipMemcpyAsync", err);
+        return;
+      }
     }
   }
-
-  err = hipEventRecord(event, stream);
+  err = hooks && hooks->failEventRecord ? hooks->eventError : hipEventRecord(event, stream);
   if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: hipEventRecord failed: ") + hipGetErrorString(err));
-    eventPool->PutEvent(event, localDevice);
+    fail("hipEventRecord", err);
     return;
   }
 
   status->SetCode(StatusCode::IN_PROGRESS);
   ArmTransferCompletion(status, event, localDevice, eventPool);
-  MORI_IO_TRACE("FABRIC: Batch transfer issued, id={}, segments={}, isRead={}", id, segments.size(),
+  MORI_IO_TRACE("FABRIC: Transfer issued, id={}, segments={}, isRead={}", id, plan.segments.size(),
                 isRead);
 }
 
@@ -449,7 +422,10 @@ bool FabricBackendSession::Alive() const { return true; }
 /* ---------------------------------------------------------------------------------------------- */
 FabricBackend::FabricBackend(EngineKey k, const IOEngineConfig& /*engConfig*/,
                              const FabricBackendConfig& beConfig)
-    : myEngKey(k), config(beConfig), myPid(static_cast<int>(getpid())) {
+    : myEngKey(k),
+      config(beConfig),
+      myPid(static_cast<int>(getpid())),
+      fabricCopyMaxBlocks_(ReadFabricCopyMaxBlocks()) {
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
   myHostname = std::string(hostname);
@@ -458,6 +434,7 @@ FabricBackend::FabricBackend(EngineKey k, const IOEngineConfig& /*engConfig*/,
   streamPool = std::make_unique<StreamPool>(config.numStreams);
   eventPool = std::make_unique<EventPool>(config.numEvents);
 
+  MORI_IO_INFO("FABRIC: effective MORI_IO_FABRIC_COPY_MAX_BLOCKS={}", fabricCopyMaxBlocks_);
   Initialize();
 
   std::stringstream ss;
@@ -526,41 +503,39 @@ fabric::VpodKey FabricBackend::LocalVpodKey(int deviceId) const {
 
 void FabricBackend::LoadFabricCopyModule(const std::string& hsacoPath) {
   std::lock_guard<std::mutex> lock(moduleMu_);
+  ScopedHipDeviceGuard deviceGuard;
+  for (size_t i = 0; i < fabricCopyModules_.size(); ++i) {
+    if (fabricCopyModules_[i] && hipSetDevice(static_cast<int>(i)) == hipSuccess)
+      (void)hipModuleUnload(fabricCopyModules_[i]);
+  }
   fabricCopyHsacoPath_ = hsacoPath;
   fabricCopyModules_.assign(numDevices, nullptr);
-  fabricCopyFuncs_.assign(numDevices, nullptr);
-  MORI_IO_INFO("FABRIC: copy kernel registered from {}", hsacoPath);
+  fabricCopyFuncs_.assign(numDevices, CopyFunctions{});
+  MORI_IO_INFO("FABRIC: copy kernels registered from {}", hsacoPath);
 }
 
-hipFunction_t FabricBackend::GetFabricCopyFunc(int deviceId) {
+FabricBackend::CopyFunctions FabricBackend::GetFabricCopyFunctions(int deviceId) {
   std::lock_guard<std::mutex> lock(moduleMu_);
-  if (fabricCopyHsacoPath_.empty() || deviceId < 0 || deviceId >= numDevices) {
-    return nullptr;
-  }
-  if (fabricCopyFuncs_[deviceId] != nullptr) {
-    return fabricCopyFuncs_[deviceId];
-  }
+  if (fabricCopyHsacoPath_.empty() || deviceId < 0 || deviceId >= numDevices) return {};
+  if (fabricCopyFuncs_[deviceId]) return fabricCopyFuncs_[deviceId];
 
   ScopedHipDeviceGuard deviceGuard;
-  if (hipSetDevice(deviceId) != hipSuccess) return nullptr;
-
-  hipError_t err = hipModuleLoad(&fabricCopyModules_[deviceId], fabricCopyHsacoPath_.c_str());
+  if (hipSetDevice(deviceId) != hipSuccess) return {};
+  hipModule_t module = nullptr;
+  CopyFunctions funcs;
+  hipError_t err = hipModuleLoad(&module, fabricCopyHsacoPath_.c_str());
+  if (err == hipSuccess) err = hipModuleGetFunction(&funcs.small, module, "fabricCopyKernelSmall");
+  if (err == hipSuccess) err = hipModuleGetFunction(&funcs.large, module, "fabricCopyKernelLarge");
   if (err != hipSuccess) {
-    MORI_IO_WARN("FABRIC: Failed to load copy module on device {}: {}", deviceId,
+    MORI_IO_WARN("FABRIC: Failed to load copy kernels on device {}: {}", deviceId,
                  hipGetErrorString(err));
-    return nullptr;
+    if (module) (void)hipModuleUnload(module);
+    return {};
   }
-  err = hipModuleGetFunction(&fabricCopyFuncs_[deviceId], fabricCopyModules_[deviceId],
-                             "fabricCopyKernel");
-  if (err != hipSuccess) {
-    MORI_IO_WARN("FABRIC: Failed to get fabricCopyKernel on device {}: {}", deviceId,
-                 hipGetErrorString(err));
-    (void)hipModuleUnload(fabricCopyModules_[deviceId]);
-    fabricCopyModules_[deviceId] = nullptr;
-    return nullptr;
-  }
-  MORI_IO_INFO("FABRIC: Loaded copy kernel on device {}", deviceId);
-  return fabricCopyFuncs_[deviceId];
+  fabricCopyModules_[deviceId] = module;
+  fabricCopyFuncs_[deviceId] = funcs;
+  MORI_IO_INFO("FABRIC: Loaded small and large copy kernels on device {}", deviceId);
+  return funcs;
 }
 
 void FabricBackend::RegisterRemoteEngine(const EngineDesc& desc) {

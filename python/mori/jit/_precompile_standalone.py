@@ -40,6 +40,7 @@ ALL_KERNELS = [
 
 IO_KERNELS = [
     ("scatter_gather", "src/io/kernels"),
+    ("fabric_copy", "src/io/kernels"),
 ]
 
 

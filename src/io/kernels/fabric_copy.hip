@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Contiguous copy kernel for FabricBackend transfers over a UALink super-node
+// Batched copy kernel for FabricBackend transfers over a UALink super-node
 // fabric. JIT-compiled via hipcc --genco at runtime and loaded as a .hsaco
 // module (same mechanism as the XGMI scatter/gather kernel).
 //
@@ -33,34 +33,73 @@
 
 #include <hip/hip_runtime.h>
 
-#include <cstdint>
+#include "src/io/kernels/fabric_copy_abi.hpp"
 
-// dst/src are byte pointers; either may alias remote (imported) HBM. When both
-// are 16-byte aligned the bulk is copied as uint4 (vectorized); a scalar tail
-// handles the remainder and the fully-unaligned case.
-extern "C" __global__ void fabricCopyKernel(char* __restrict__ dst, const char* __restrict__ src,
-                                            size_t nbytes) {
-  size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  size_t nthreads = static_cast<size_t>(gridDim.x) * blockDim.x;
+using namespace mori::io::fabric;
 
-  uintptr_t s = reinterpret_cast<uintptr_t>(src);
-  uintptr_t d = reinterpret_cast<uintptr_t>(dst);
+namespace {
+// Compile-time memory-level parallelism; keep all U loads ahead of their stores.
+constexpr int kLoadsInFlight = 4;
+// Recursive inlining gives each in-flight vector its own SSA value. A local
+// uint4[U] can be lowered to LDS by the compiler even with unrolled loops.
+template <int U>
+__device__ __forceinline__ void CopyVectors(uint4* dst, const uint4* src, uint64_t index,
+                                            uint64_t vectors) {
+  uint4 value;
+  if (index < vectors) value = src[index];
+  if constexpr (U > 1) CopyVectors<U - 1>(dst, src, index + blockDim.x, vectors);
+  if (index < vectors) dst[index] = value;
+}
 
-  if ((s & 15) == 0 && (d & 15) == 0 && nbytes >= 16) {
-    size_t nvec = nbytes / 16;
-    size_t tailStart = nvec * 16;
+template <int U = kLoadsInFlight>
+__device__ __forceinline__ void CopyChunk(unsigned char* dst, const unsigned char* src,
+                                          uint64_t bytes) {
+  const uint64_t tid = threadIdx.x;
+  if ((reinterpret_cast<uintptr_t>(src) & 15) != (reinterpret_cast<uintptr_t>(dst) & 15)) {
+    for (uint64_t i = tid; i < bytes; i += blockDim.x) dst[i] = src[i];
+    return;
+  }
+  uint64_t head = (16 - (reinterpret_cast<uintptr_t>(src) & 15)) & 15;
+  if (head > bytes) head = bytes;
+  for (uint64_t i = tid; i < head; i += blockDim.x) dst[i] = src[i];
+  src += head;
+  dst += head;
+  bytes -= head;
+  const uint64_t vectors = bytes / 16;
+  auto* vd = reinterpret_cast<uint4*>(dst);
+  const auto* vs = reinterpret_cast<const uint4*>(src);
+  for (uint64_t base = tid; base < vectors; base += uint64_t{U} * blockDim.x) {
+    CopyVectors<U>(vd, vs, base, vectors);
+  }
+  for (uint64_t i = vectors * 16 + tid; i < bytes; i += blockDim.x) dst[i] = src[i];
+}
 
-    const uint4* srcV = reinterpret_cast<const uint4*>(src);
-    uint4* dstV = reinterpret_cast<uint4*>(dst);
-    for (size_t i = tid; i < nvec; i += nthreads) {
-      dstV[i] = srcV[i];
+// Shared template implementation for both exported kernel entry points.
+template <int K>
+__device__ __forceinline__ void FabricCopy(const FabricCopyArgs<K>& a) {
+  const uint64_t chunkBytes = a.chunkShift == 64 ? UINT64_MAX : uint64_t{1} << a.chunkShift;
+  for (uint64_t c = blockIdx.x; c < a.chunkEnd[a.numSegs - 1]; c += gridDim.x) {
+    uint32_t seg = 0;
+    if (a.numSegs != 1) {
+      uint32_t lo = 0, hi = a.numSegs;
+      while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (a.chunkEnd[mid] <= c)
+          lo = mid + 1;
+        else
+          hi = mid;
+      }
+      seg = lo;
     }
-    for (size_t i = tailStart + tid; i < nbytes; i += nthreads) {
-      dst[i] = src[i];
-    }
-  } else {
-    for (size_t i = tid; i < nbytes; i += nthreads) {
-      dst[i] = src[i];
-    }
+    uint64_t first = seg == 0 ? 0 : a.chunkEnd[seg - 1];
+    uint64_t offset = a.chunkShift == 64 ? 0 : (c - first) << a.chunkShift;
+    uint64_t bytes = a.size[seg] - offset;
+    if (bytes > chunkBytes) bytes = chunkBytes;
+    CopyChunk(reinterpret_cast<unsigned char*>(a.dst[seg] + offset),
+              reinterpret_cast<const unsigned char*>(a.src[seg] + offset), bytes);
   }
 }
+}  // namespace
+
+extern "C" __global__ void fabricCopyKernelSmall(FabricCopyArgs<kSmallK> a) { FabricCopy(a); }
+extern "C" __global__ void fabricCopyKernelLarge(FabricCopyArgs<kLargeK> a) { FabricCopy(a); }
