@@ -292,16 +292,25 @@ def _run(d, comm):
                     flush=True,
                 )
             if int(os.environ.get("REPLAY", 0)):
-                ref = recv_x[:total_recv].clone()
+                # Wipe what replay must rewrite, so a replay that writes nothing fails.
+                views = [v for v in (recv_x, disp_w, disp_i, out_s) if v is not None]
+                refs = [v[:total_recv].clone() for v in views]
+                for v in views:
+                    v[:total_recv].zero_()
+                sync()
+                comm.barrier()
                 r2 = op.dispatch(inp[:ct], wts[:ct], sc_in, idx[:ct], routing=routing)
                 sync()
                 comm.barrier()
-                ok_r = torch.equal(r2[0][:total_recv], ref)
+                outs = [v for v in (r2[0], r2[1], r2[3], r2[2]) if v is not None]
+                ok_r = int(r2[4].cpu().item()) == total_recv and all(
+                    torch.equal(o[:total_recv], ref) for o, ref in zip(outs, refs)
+                )
                 errs_r = d.allreduce_sum(0 if ok_r else 1)
                 if rank == 0:
                     print(
                         f"# OP-REPLAY ct={ct_point}: {'PASS' if errs_r == 0 else 'FAIL'} "
-                        f"(replayed layout == original)",
+                        f"(rows, weights, ids and scales rewritten as dispatched)",
                         flush=True,
                     )
             if SCALE_DIM:
