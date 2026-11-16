@@ -153,7 +153,8 @@ Stop and report when any of these holds:
 - the contract's number of rounds passes with no gain above the noise band;
 - the budget (rounds or GPU hours) is spent;
 - the remaining gap to `T_real` is below the noise band;
-- a permission, safety or environment problem needs the owner.
+- a permission, safety or environment problem needs the owner. In an unattended run,
+  write the question to `<records>/<task>/BLOCKED` and end the turn.
 
 Report the best verified result, the negative results with their numbers and retry
 conditions, and the crossover. Do not describe a stopped run as close to the bound
@@ -171,21 +172,64 @@ unless the verifier's numbers show it.
   verdicts/<id>.json       verifier output
   decisions.md             one row per pass through step 4
   report.md                the final table
+  BLOCKED                  unattended runs: the session's question for the owner
+  STOP                     unattended runs: the owner's stop
+  .driver.json             the Stop hook's bookkeeping
 ```
 
 ## Per-run settings
 
 [settings.example.json](settings.example.json) denies outward actions and commands that
-touch other tenants (GPU resets, `pkill`). Load it for a run with
+touch other tenants (GPU resets, `pkill`), and registers the unattended driver's Stop
+hook, which does nothing unless `CCO_FUSION_RECORDS` is set. Load it for a run with
 `claude --settings <path>`; do not merge it into the project-wide settings.
+
+## Unattended runs
+
+To run the loop for hours or days without the owner at the keyboard, point the driver at
+the task and start the session non-interactively:
+
+```bash
+export CCO_FUSION_RECORDS=<records>/<task>     # contract.yaml approved: true
+claude -p "$(cat <kickoff prompt>)" --settings <settings with the Stop hook> \
+    --add-dir "$CCO_FUSION_RECORDS" --permission-mode auto --max-budget-usd <cap> \
+    --output-format stream-json --verbose >"$CCO_FUSION_RECORDS/driver.jsonl" 2>&1
+```
+
+`--add-dir` lets the session write its records when they live outside the checkout;
+without it those writes wait for a permission nobody gives.
+
+- Each time the session would stop, `benchmark/cco/harness/stop_hook.py` asks
+  `benchmark/cco/harness/loop_state.py` where the task stands and, unless it is `done`
+  (`report.md` written), `needs-owner` (`BLOCKED`, or the contract not approved) or
+  `stopped` (`STOP`), sends the session on with the next step. A spent budget sends it
+  to write the report.
+- Brakes: the owner creates `<task>/STOP`; at most `CCO_FUSION_MAX_CONTINUES`
+  continuations per session (100); nothing changed under the task directory across
+  `CCO_FUSION_MAX_FLAT` continuations (3) writes `BLOCKED` and stops; and
+  `--max-budget-usd` caps the spend.
+- When the session needs the owner it writes the question to `BLOCKED` and ends the
+  turn. The owner answers (reserves GPUs, approves, decides), deletes `BLOCKED`, and
+  resumes with `claude -p --resume <session-id> "continue" ...` and the same flags.
+- `python benchmark/cco/harness/loop_state.py <task>` shows the state at any time.
+- `/goal` is the interactive equivalent: `/goal loop_state.py <task> prints a state other
+  than continue; run it at the end of every turn and show its output`. Its evaluator is
+  the small fast model (`ANTHROPIC_DEFAULT_HAIKU_MODEL`), which must be one the provider
+  serves; the Stop hook needs no model.
+- GPUs still come from the owner: a lease that ends or an idle guard that frees the node
+  ends GPU work, and the session writes `BLOCKED`.
 
 ## Evaluation cases
 
 `benchmark/cco/harness/cases/` holds tasks that test this loop itself. A case fixes the
 contract, the operator's interface, a harness that times and checks any implementation
-of it, and a clean-room rule: the implementer may not read the existing implementation,
+of it, and a clean-room rule: nobody in the session reads the existing implementation,
 the session loads the case's settings, and the case's `audit.py` checks the transcripts
-afterwards. Start from the case's README.
+afterwards for hidden text. The rule overrides the reading lists, citations and tools
+named in this skill, its references and the agents; the case's README says what to use
+instead. Start from the case's README, and pass it to every subagent with its task.
+When the run ends, `benchmark/cco/harness/cases/evaluate.py` records it in the case's
+`results.md`.
 
 ## Rules
 

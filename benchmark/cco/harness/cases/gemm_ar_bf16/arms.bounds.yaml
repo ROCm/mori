@@ -1,0 +1,14 @@
+# Step 1's split path at the case's configuration (BF16, LSA gather), run through the
+# existing benchmark as a black box: the end-to-end split time and the GEMM alone.
+# Together with the existing op from arms.dev.yaml and the phase times in G950-GAR-09
+# they give bounds.md its inputs.
+#
+#   python benchmark/cco/harness/run.py --arms <this file> --baseline split-bench \
+#       --rounds 3 --bench-args "-m 16384" --out <run-dir>
+arms:
+  - name: split-bench
+    bench: benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py
+    args: --mode split-sdma --quant bf16 --gather-transport lsa -n 7168 -k 2048
+  - name: gemm-only-bench
+    bench: benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py
+    args: --mode gemm-only --quant bf16 -n 7168 -k 2048

@@ -132,6 +132,17 @@ and must not be used in a bound or a decision. Mechanisms to keep in mind:
 - **Records:** everything goes under the records directory, never into the repository's
   `docs/`.
 
+## Clean room
+
+When the task comes from an evaluation case (`benchmark/cco/harness/cases/<case>/`),
+read the case's README first. Its `hidden_paths.txt` overrides every reading list,
+citation and tool named here and in the skills: do not open a hidden path by any route
+(the Read tool, a shell command, a script, `git show`, a grep over a parent directory)
+or in compiled form (FlyDSL dumps, ISA, IR). Use a fact as written, use the case's
+replacement for a hidden tool, and run hidden code only as a black box through the
+case's files. If the task needs something only a hidden file holds, stop and return
+that as a problem.
+
 ## References in this repo
 
 - `python/mori/ops/{gemm_ar,gemm_ag,gemm_a2a}`: last-finisher posting and a drain kernel.

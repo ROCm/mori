@@ -1,0 +1,11 @@
+# ISA dumps of the candidate alone. run.py --dump-isa dumps every kernel the launch
+# compiles, and the existing op's ISA is as hidden as its source, so never dump from a
+# launch that also runs the existing op (arms.dev.yaml, arms.verify.yaml,
+# arms.bounds.yaml). Fill in the candidate, then
+#
+#   python benchmark/cco/harness/run.py --arms <this file> --dump-isa --rounds 1 \
+#       --bench-args "-m 16384" --out <run-dir>
+arms:
+  - name: candidate
+    bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
+    args: --mode time --impl <path/to/candidate.py>:<Class>

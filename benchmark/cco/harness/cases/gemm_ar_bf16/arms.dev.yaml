@@ -6,7 +6,7 @@
 arms:
   - name: existing
     bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
-    args: --mode time --impl benchmark/cco/harness/cases/gemm_ar_bf16/existing.py:ExistingGemmAllReduce
+    args: --mode time --impl existing
   - name: candidate
     bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
     args: --mode time --impl <path/to/candidate.py>:<Class>

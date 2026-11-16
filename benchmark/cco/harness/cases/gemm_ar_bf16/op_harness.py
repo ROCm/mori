@@ -23,6 +23,10 @@
 
     torchrun --nproc_per_node=8 op_harness.py --impl <file.py:Class> --mode time -m 16384
     torchrun --nproc_per_node=8 op_harness.py --impl <file.py:Class> --mode check
+    torchrun --nproc_per_node=8 op_harness.py --impl existing --mode time -m 16384
+
+``--impl existing`` (and ``existing-q8``, eight SDMA queues per peer) runs the existing
+operator through the case's adapter, so a baseline run never names a hidden file.
 
 It has the shape the FlyDSL benchmarks share (``build_parser()``, ``run(args)``, a
 ``RESULT_JSON`` line from rank 0), so ``run.py --arms`` interleaves it with any other
@@ -58,19 +62,28 @@ import sys
 import time
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[5]
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[4]
+sys.path.insert(0, str(HERE))
 
 import interface  # noqa: E402
 
 TOLERANCE = 6e-3
 WRAP_PRESET = 2**32 - 3
+# The existing operator behind the interface. The adapter is hidden from the implementer
+# (hidden_paths.txt), so baselines name it by alias.
+ALIASES = {
+    "existing": "existing.py:ExistingGemmAllReduce",
+    "existing-q8": "existing.py:ExistingGemmAllReduceQ8",
+}
 
 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument(
-        "--impl", required=True, help="file.py:Class or package.module:Class"
+        "--impl",
+        required=True,
+        help="file.py:Class, package.module:Class, or an alias: " + ", ".join(ALIASES),
     )
     p.add_argument("--mode", choices=("time", "check"), default="time")
     p.add_argument("-m", type=int, default=16384)
@@ -93,7 +106,10 @@ def build_parser():
 
 
 def load_impl(spec):
-    """``path/to/file.py:Class`` (relative to the repository) or ``package.module:Class``."""
+    """``path/to/file.py:Class`` (relative to the repository), ``package.module:Class``,
+    or an alias from ``ALIASES``."""
+    if spec in ALIASES:
+        spec = str(HERE / ALIASES[spec])
     target, _, attr = spec.rpartition(":")
     if not target or not attr:
         raise ValueError(f"--impl {spec!r}: expected <file.py or module>:<Class>")

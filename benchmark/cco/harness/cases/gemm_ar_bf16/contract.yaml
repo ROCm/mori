@@ -35,7 +35,7 @@ clean_room:
     running the existing op as a black-box baseline
 
 baseline:
-  existing: GemmAllReduceOp(quant="bf16") with its defaults, through existing.py
+  existing: GemmAllReduceOp(quant="bf16") with its defaults, as op_harness.py --impl existing
   also_compare: [split path (GEMM then all-reduce), stream-level chunked overlap if built]
 
 correctness:

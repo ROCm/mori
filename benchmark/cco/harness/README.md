@@ -19,8 +19,10 @@ or an `srun` into an allocation the user already holds.
 | `bound.py` | exists | step 1 | split-path phase times to `T_ideal`, `T_real` and go or no-go |
 | `bounds.example.yaml` | exists | step 1 | `bound.py` input: the gemm_ar worked example (`G950-GAR-01`) |
 | `isa_check.py` | exists | steps 3, 4 | the ISA check on a FlyDSL `*_final_isa.s` |
-| `schemas/` | exists | all | JSON schemas for `run.py`'s result, the candidate manifest and the verdict |
-| `cases/` | exists | evaluation | tasks that test the harness itself; `gemm_ar_bf16` re-implements BF16 GEMM + all-reduce in a clean room |
+| `loop_state.py` | exists | all | where a task stands (next step, budget used, done or waiting for the owner), read from its records |
+| `stop_hook.py` | exists | unattended | the Stop hook that keeps a session on the loop until the task is done, needs the owner or is stopped |
+| `schemas/` | exists | all | JSON schemas for `run.py`'s result, the candidate manifest, the verdict and a case's evaluation record |
+| `cases/` | exists | evaluation | tasks that test the harness itself; `gemm_ar_bf16` re-implements BF16 GEMM + all-reduce in a clean room; `evaluate.py` records each run |
 
 ## bound.py
 
@@ -92,7 +94,7 @@ so two implementations run interleaved in the same launch:
 arms:
   - name: existing
     bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
-    args: --mode time --impl benchmark/cco/harness/cases/gemm_ar_bf16/existing.py:ExistingGemmAllReduce
+    args: --mode time --impl existing  # the existing op, by the case's alias
   - name: candidate
     bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
     args: --mode time --impl python/mori/ops/gemm_ar_v2/op.py:FusedGemmAllReduce
@@ -128,14 +130,42 @@ Only `gemm_ar` is registered for `--op`. The other operator benchmarks (`gemm_ag
 `RESULT_JSON` shape and report the maximum over ranks as `us`: run them through `--arms`
 with `time_field: us`, or give each an entry in `OPS`.
 
+## loop_state.py and stop_hook.py
+
+```bash
+python benchmark/cco/harness/loop_state.py <records>/<task> [--json]
+```
+
+`loop_state.py` reads a task's records directory and says where the loop stands:
+`stopped` (the owner created `STOP`), `needs-owner` (`BLOCKED`, or the contract is not
+approved), `done` (`report.md` exists) or `continue`, with the next step (bounds, design,
+a frozen candidate, its verdict, the decision, delivery) and the rounds and GPU hours
+used against the contract's budget. A spent budget is `continue` with "write the report"
+as the next step.
+
+`stop_hook.py` is the unattended driver: a Stop hook, inert unless `CCO_FUSION_RECORDS`
+names the task directory, that blocks the session from stopping while the state is
+`continue` and hands it the next step. It lets the session end after
+`CCO_FUSION_MAX_CONTINUES` continuations (100), or when nothing under the task directory
+changed across `CCO_FUSION_MAX_FLAT` continuations (3), writing `BLOCKED` with the
+reason. The loop skill's "Unattended runs" has the launch command.
+
 ## schemas/
 
-JSON Schema (2020-12) for `run.py`'s `result.json`, the implementer's candidate manifest
-and the verifier's verdict. The templates in `.claude/skills/cco-fusion-loop/templates/`
-carry every field these schemas require; the tests check both.
+JSON Schema (2020-12) for `run.py`'s `result.json`, the implementer's candidate manifest,
+the verifier's verdict and `cases/evaluate.py`'s `evaluation.json`. The templates in
+`.claude/skills/cco-fusion-loop/templates/` carry every field these schemas require; the
+tests check both.
 
 ## cases/
 
 Tasks that evaluate the harness rather than an operator: a fixed contract, an interface,
 a shared harness that times and checks any implementation of it, a clean-room rule with
-its audit, and a recorded baseline. See [cases/gemm_ar_bf16/README.md](cases/gemm_ar_bf16/README.md).
+its guard and audit, and a recorded baseline. See
+[cases/gemm_ar_bf16/README.md](cases/gemm_ar_bf16/README.md).
+
+[cases/evaluate.py](cases/evaluate.py) turns a finished run into `evaluation.json`
+(`schemas/evaluation.schema.json`): the result against the contract's target, rounds, GPU
+hours, the owner's prompts after the kickoff, wall time, tokens and cost, and the audit.
+`--append <case>/results.md` adds the run's row to the case's results, the baseline that
+later changes to the harness are compared against.

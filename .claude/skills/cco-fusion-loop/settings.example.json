@@ -20,5 +20,17 @@
       "Bash(rocm-smi --setsclk:*)",
       "Bash(rocm-smi --setperflevel:*)"
     ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PROJECT_DIR}/benchmark/cco/harness/stop_hook.py\""
+          }
+        ]
+      }
+    ]
   }
 }

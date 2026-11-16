@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cco-fusion/evaluation/v1",
+  "title": "One evaluation-case run, written by cases/evaluate.py",
+  "type": "object",
+  "required": ["schema", "case", "date", "result", "target", "verdict", "rounds", "gpu_hours", "session", "audit"],
+  "properties": {
+    "schema": {"const": "cco-fusion/evaluation/v1"},
+    "case": {"type": "string"},
+    "task": {"type": ["string", "null"]},
+    "date": {"type": "string"},
+    "commit": {"type": ["string", "null"]},
+    "contract": {"type": "string"},
+    "result": {"enum": ["pass", "fail", "incomplete", "unaudited", "pending-review", "void"]},
+    "target": {
+      "type": "object",
+      "required": ["bucket", "within_existing_pct", "candidate_us", "existing_us", "gap_pct", "met"],
+      "properties": {
+        "bucket": {"type": ["integer", "null"]},
+        "within_existing_pct": {"type": ["number", "null"]},
+        "candidate_us": {"type": ["number", "null"]},
+        "existing_us": {"type": ["number", "null"]},
+        "gap_pct": {"type": ["number", "null"]},
+        "met": {"type": ["boolean", "null"]},
+        "source": {"type": ["string", "null"]}
+      }
+    },
+    "verdict": {
+      "type": "object",
+      "required": ["verdict", "verdicts"],
+      "properties": {
+        "file": {"type": ["string", "null"]},
+        "verdict": {"type": ["string", "null"]},
+        "candidate": {"type": ["string", "null"]},
+        "verdicts": {"type": "integer", "minimum": 0}
+      }
+    },
+    "rounds": {"type": ["integer", "null"], "minimum": 0},
+    "gpu_hours": {"type": "number", "minimum": 0},
+    "runpy_launches": {"type": "integer", "minimum": 0},
+    "node_hours": {"type": ["number", "null"]},
+    "budget": {"type": "object"},
+    "session": {
+      "type": "object",
+      "required": ["transcripts", "wall_hours", "owner_prompts", "tokens", "cost_usd", "models"],
+      "properties": {
+        "transcripts": {"type": "array", "items": {"type": "string"}},
+        "wall_hours": {"type": ["number", "null"]},
+        "owner_prompts": {"type": "integer", "minimum": 0},
+        "owner_prompt_times": {"type": "array"},
+        "assistant_messages": {"type": "integer"},
+        "tool_calls": {"type": "integer"},
+        "tokens": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "cost_usd": {"type": ["number", "null"]},
+        "models": {"type": "object", "additionalProperties": {"type": "integer"}}
+      }
+    },
+    "audit": {
+      "type": ["object", "null"],
+      "properties": {
+        "verdict": {"enum": ["clean", "review", "void"]},
+        "counts": {"type": "object"},
+        "base": {"type": ["string", "null"]},
+        "reviewed": {"type": "boolean"}
+      }
+    }
+  }
+}

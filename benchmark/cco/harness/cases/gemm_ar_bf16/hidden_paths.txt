@@ -1,11 +1,15 @@
-# Paths the implementer must not read in the gemm_ar_bf16 case: the existing gemm_ar
-# fusion and everything that documents or exercises it. A line matches any path that
-# contains it, so it also covers the installed copies under site-packages.
+# What nobody in a gemm_ar_bf16 session reads: the existing gemm_ar fusion and
+# everything that documents or exercises it. One path per line, a directory ends in "/".
+# A line matches a path that ends with it, so it also covers the installed copies under
+# site-packages; audit.py also matches the Python files' module names
+# (mori.ops.gemm_ar.op). settings.implementer.json holds the same list as Read denies;
+# guard.py and audit.py read this file.
 #
 # Still readable on purpose: the GEMM building blocks (_gemm_a8w8_8wave.py,
-# _gemm_a16w16_8wave.py), _compat.py, _shuffle.py, _mxfp8_scale_lds.py, the decode
-# GEMV, gemm_ar/__init__.py, the sibling operators, the cco-fusion-facts skill and
-# the harness. Running existing.py as a baseline is allowed; reading it is not.
+# _gemm_a16w16_8wave.py), _compat.py, _shuffle.py, _mxfp8_scale_lds.py, the decode GEMV,
+# gemm_ar/__init__.py, the sibling operators, the cco-fusion-facts skill and the harness.
+# Running hidden code as a black box is allowed: op_harness.py --impl existing, and
+# run.py --arms arms.bounds.yaml.
 mori/ops/gemm_ar/kernels_fused.py
 mori/ops/gemm_ar/kernels_fused_bf16.py
 mori/ops/gemm_ar/kernels_sdma.py
@@ -17,8 +21,13 @@ mori/ops/gemm_ar/_quant_experiment.py
 mori/ops/gemm_ar/README.md
 benchmark/cco/flydsl/gemm_ar/
 benchmark/cco/flydsl/ar/
-tests/python/cco/test_gemm_ar
-tests/python/cco/gemm_ar_
+tests/python/cco/test_gemm_ar.py
+tests/python/cco/test_gemm_ar_bench.py
+tests/python/cco/test_gemm_ar_op.py
+tests/python/cco/test_gemm_ar_schedule.py
+tests/python/cco/gemm_ar_op_worker.py
+tests/python/cco/gemm_ar_schedule_worker.py
+tests/python/cco/gemm_ar_wire_reference.py
 tests/python/cco/test_flydsl_ar.py
 docs/fused-gemm-ar.md
 docs/fused-gemm-rs.md

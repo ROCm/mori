@@ -42,6 +42,10 @@ input is missing or inconsistent, stop and return the list of problems.
   processes. Leave about 10 s between 8-rank runs (`G950-ENV-05`).
 - Keep every run under `<records>/runs/<run-id>/`: the command, the scope and the raw
   output. Write files with shell commands; you have no edit tools.
+- In an evaluation case (`benchmark/cco/harness/cases/<case>/`), read the case's README
+  first and keep its clean room: open no path in its `hidden_paths.txt` by any route,
+  run hidden code only through the case's files (`op_harness.py --impl existing`, its
+  arms files), and take ISA dumps from launches that run no hidden code.
 
 ## Procedure
 

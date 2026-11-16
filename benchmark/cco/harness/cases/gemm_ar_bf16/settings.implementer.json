@@ -2,23 +2,28 @@
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "deny": [
-      "Read(**/mori/ops/gemm_ar/kernels_fused.py*)",
-      "Read(**/mori/ops/gemm_ar/kernels_fused_bf16.py*)",
-      "Read(**/mori/ops/gemm_ar/kernels_sdma.py*)",
-      "Read(**/mori/ops/gemm_ar/kernels_lsa.py*)",
-      "Read(**/mori/ops/gemm_ar/layout.py*)",
-      "Read(**/mori/ops/gemm_ar/op.py*)",
-      "Read(**/mori/ops/gemm_ar/gemm.py*)",
-      "Read(**/mori/ops/gemm_ar/_quant_experiment.py*)",
-      "Read(**/mori/ops/gemm_ar/README.md*)",
-      "Read(**/benchmark/cco/flydsl/gemm_ar/**)",
-      "Read(**/benchmark/cco/flydsl/ar/**)",
-      "Read(**/tests/python/cco/test_gemm_ar*)",
-      "Read(**/tests/python/cco/gemm_ar_*)",
-      "Read(**/tests/python/cco/test_flydsl_ar.py*)",
-      "Read(**/docs/fused-gemm-ar.md*)",
-      "Read(**/docs/fused-gemm-rs.md*)",
-      "Read(**/cases/gemm_ar_bf16/existing.py*)",
+      "Read(//**/mori/ops/gemm_ar/kernels_fused.py)",
+      "Read(//**/mori/ops/gemm_ar/kernels_fused_bf16.py)",
+      "Read(//**/mori/ops/gemm_ar/kernels_sdma.py)",
+      "Read(//**/mori/ops/gemm_ar/kernels_lsa.py)",
+      "Read(//**/mori/ops/gemm_ar/layout.py)",
+      "Read(//**/mori/ops/gemm_ar/op.py)",
+      "Read(//**/mori/ops/gemm_ar/gemm.py)",
+      "Read(//**/mori/ops/gemm_ar/_quant_experiment.py)",
+      "Read(//**/mori/ops/gemm_ar/README.md)",
+      "Read(//**/benchmark/cco/flydsl/gemm_ar/**)",
+      "Read(//**/benchmark/cco/flydsl/ar/**)",
+      "Read(//**/tests/python/cco/test_gemm_ar.py)",
+      "Read(//**/tests/python/cco/test_gemm_ar_bench.py)",
+      "Read(//**/tests/python/cco/test_gemm_ar_op.py)",
+      "Read(//**/tests/python/cco/test_gemm_ar_schedule.py)",
+      "Read(//**/tests/python/cco/gemm_ar_op_worker.py)",
+      "Read(//**/tests/python/cco/gemm_ar_schedule_worker.py)",
+      "Read(//**/tests/python/cco/gemm_ar_wire_reference.py)",
+      "Read(//**/tests/python/cco/test_flydsl_ar.py)",
+      "Read(//**/docs/fused-gemm-ar.md)",
+      "Read(//**/docs/fused-gemm-rs.md)",
+      "Read(//**/cases/gemm_ar_bf16/existing.py)",
       "Bash(git push:*)",
       "Bash(gh pr create:*)",
       "Bash(gh pr merge:*)",
@@ -36,6 +41,29 @@
       "Bash(rocm-smi -r:*)",
       "Bash(rocm-smi --setsclk:*)",
       "Bash(rocm-smi --setperflevel:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PROJECT_DIR}/benchmark/cco/harness/cases/gemm_ar_bf16/guard.py\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PROJECT_DIR}/benchmark/cco/harness/stop_hook.py\""
+          }
+        ]
+      }
     ]
   }
 }
