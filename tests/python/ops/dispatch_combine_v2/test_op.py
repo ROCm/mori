@@ -128,8 +128,8 @@ def _configure():
     # NOSELF=1: no token picks an expert on its own rank, so no rank receives from
     # itself.
     NOSELF = int(os.environ.get("NOSELF", 0))
-    # FRESH=1: read the received rows right after dispatch, before any barrier,
-    # and require them to equal what the same views hold after the barrier.
+    # FRESH=1: copy the received rows and the reverse map in-stream right after
+    # dispatch, and require them to equal what the views hold after the barrier.
     FRESH = int(os.environ.get("FRESH", 0))
 
 
@@ -229,15 +229,20 @@ def _run(d, comm):
             recv_x, disp_w, out_s, disp_i, total_recv_t, routing = op.dispatch(
                 inp[:ct], wts[:ct], sc_in, idx[:ct], return_routing=True
             )
+            if FRESH:
+                # Copies queued right behind the dispatch kernel, before any host sync
+                # or barrier, of every row peers wrote, the reverse map included.
+                views = (recv_x, disp_w, disp_i, out_s, routing._reverse_src_view)
+                views = [v for v in views if v is not None]
+                early = [v.clone() for v in views]
             total_recv = int(total_recv_t.cpu().item())
             sync()
-            if FRESH:
-                views = [v for v in (recv_x, disp_w, disp_i, out_s) if v is not None]
-                early = [v[:total_recv].clone() for v in views]
-                sync()
             comm.barrier()
             if FRESH:
-                ok_f = all(torch.equal(e, v[:total_recv]) for e, v in zip(early, views))
+                ok_f = all(
+                    torch.equal(e[:total_recv], v[:total_recv])
+                    for e, v in zip(early, views)
+                )
                 errs_f = d.allreduce_sum(0 if ok_f else 1)
                 if rank == 0:
                     print(
