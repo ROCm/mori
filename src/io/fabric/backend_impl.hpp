@@ -114,9 +114,12 @@ class FabricBackend : public Backend {
   // JIT-loaded batched copy kernels (fabric_copy.hip), one module per device.
   void LoadFabricCopyModule(const std::string& hsacoPath);
   struct CopyFunctions {
+    hipFunction_t single{nullptr};
     hipFunction_t small{nullptr};
     hipFunction_t large{nullptr};
-    explicit operator bool() const { return small != nullptr && large != nullptr; }
+    explicit operator bool() const {
+      return single != nullptr && small != nullptr && large != nullptr;
+    }
   };
   CopyFunctions GetFabricCopyFunctions(int deviceId);
   uint32_t FabricCopyMaxBlocks() const { return fabricCopyMaxBlocks_; }

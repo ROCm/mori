@@ -26,6 +26,14 @@ CopyDispatch Dispatch(const std::vector<CopySegment>& segs, size_t begin, size_t
                       uint64_t bytes, uint32_t maxBlocks) {
   FabricCopyArgs<K> args{};
   args.numSegs = static_cast<uint32_t>(end - begin);
+  if constexpr (K == kSingleK) {
+    args.src[0] = segs[begin].src;
+    args.dst[0] = segs[begin].dst;
+    args.size[0] = segs[begin].size;
+    // The flat path ignores chunkEnd and the multi-segment maxBlocks setting.
+    uint64_t blocks = CeilDiv(CeilDiv(args.size[0], 16), 256);
+    return {args, static_cast<uint32_t>(std::min<uint64_t>(65535, std::max<uint64_t>(1, blocks)))};
+  }
   args.chunkShift = ChunkShift(bytes, maxBlocks);
   uint64_t chunks = 0;
   for (size_t i = begin; i < end; ++i) {
@@ -86,7 +94,7 @@ CopyPlan PlanCopy(std::vector<CopySegment> segments, uint32_t maxBlocks, bool ke
     }
     // Normally one linear pass per group. Only extreme chunk-count inputs need
     // trimming and a new adaptive chunk calculation for the shortened dispatch.
-    for (;;) {
+    while (end - begin > 1) {
       uint32_t shift = ChunkShift(bytes, maxBlocks);
       uint64_t chunks = 0;
       size_t split = begin;
@@ -95,9 +103,13 @@ CopyPlan PlanCopy(std::vector<CopySegment> segments, uint32_t maxBlocks, bool ke
         if (chunks > kMax32) break;
       }
       if (split == end) break;
+      // A single segment uses the flat path, so it needs no uint32 chunk prefix.
+      split = std::max(split, begin + 1);
       while (end > split) bytes -= plan.segments[--end].size;
     }
-    if (end - begin <= kSmallK) {
+    if (end - begin == 1) {
+      plan.dispatches.push_back(Dispatch<kSingleK>(plan.segments, begin, end, bytes, maxBlocks));
+    } else if (end - begin <= kSmallK) {
       plan.dispatches.push_back(Dispatch<kSmallK>(plan.segments, begin, end, bytes, maxBlocks));
     } else {
       plan.dispatches.push_back(Dispatch<kLargeK>(plan.segments, begin, end, bytes, maxBlocks));

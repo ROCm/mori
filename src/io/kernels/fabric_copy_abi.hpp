@@ -7,6 +7,7 @@
 #include <type_traits>
 
 namespace mori::io::fabric {
+inline constexpr int kSingleK = 1;
 inline constexpr int kSmallK = 16;
 inline constexpr int kLargeK = 512;
 inline constexpr uint64_t kMinChunk = 4096;
@@ -31,9 +32,10 @@ constexpr bool ValidCopyAbi() {
   static_assert(offsetof(A, dst) == 8 + 8 * K);
   static_assert(offsetof(A, size) == 8 + 16 * K);
   static_assert(offsetof(A, chunkEnd) == 8 + 24 * K);
-  static_assert(sizeof(A) == 8 + 28 * K);
+  static_assert(sizeof(A) == (8 + 28 * K + 7) / 8 * 8);
   return true;
 }
+static_assert(ValidCopyAbi<kSingleK>() && sizeof(FabricCopyArgs<kSingleK>) == 40);
 static_assert(ValidCopyAbi<kSmallK>() && sizeof(FabricCopyArgs<kSmallK>) == 456);
 static_assert(ValidCopyAbi<kLargeK>() && sizeof(FabricCopyArgs<kLargeK>) == 14344);
 }  // namespace mori::io::fabric

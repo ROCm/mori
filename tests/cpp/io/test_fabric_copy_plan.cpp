@@ -19,16 +19,24 @@ void CheckCoverage(const CopyPlan& plan, uint32_t maxBlocks) {
   for (const auto& dispatch : plan.dispatches) {
     std::visit(
         [&](const auto& a) {
+          using Args = std::decay_t<decltype(a)>;
+          CHECK(a.numSegs > 0);
+          CHECK((std::is_same_v<Args, FabricCopyArgs<kSingleK>>) == (a.numSegs == 1));
+          CHECK((std::is_same_v<Args, FabricCopyArgs<kSmallK>>) ==
+                (a.numSegs >= 2 && a.numSegs <= 16));
+          CHECK((std::is_same_v<Args, FabricCopyArgs<kLargeK>>) ==
+                (a.numSegs >= 17 && a.numSegs <= 512));
           uint64_t chunks = 0;
           for (uint32_t i = 0; i < a.numSegs; ++i) {
             const auto& seg = plan.segments.at(offset++);
             CHECK(a.src[i] == seg.src && a.dst[i] == seg.dst && a.size[i] == seg.size);
             CHECK(a.size[i] != 0);
+            if (a.numSegs == 1) continue;  // Flat copies have no chunk prefix.
             uint64_t chunk = a.chunkShift == 64 ? UINT64_MAX : uint64_t{1} << a.chunkShift;
             chunks += a.chunkShift == 64 ? 1 : seg.size / chunk + (seg.size % chunk != 0);
             CHECK(chunks <= UINT32_MAX && chunks == a.chunkEnd[i]);
           }
-          CHECK(dispatch.grid == std::min<uint64_t>(chunks, maxBlocks));
+          if (a.numSegs > 1) CHECK(dispatch.grid == std::min<uint64_t>(chunks, maxBlocks));
           CHECK(dispatch.grid > 0);
         },
         dispatch.args);
@@ -41,26 +49,42 @@ int main() {
     CHECK(PlanCopy({}, 1536, true).dispatches.empty());
     CHECK(PlanCopy({{1, 2, 0}, {3, 4, 0}}, 1536, true).segments.empty());
     CHECK(PlanCopy({{1, 2, 0}, {32, 64, 17}}, 1536, true).segments.size() == 1);
-    for (size_t count : {1, 16, 17, 512, 513, 5000}) {
+    for (size_t count : {1, 2, 16, 17, 512, 513, 5000}) {
       std::vector<CopySegment> segs;
       for (size_t i = 0; i < count; ++i) segs.push_back({i * 8192, i * 16384, 4096});
       auto plan = PlanCopy(segs, 1536, true);
       CHECK(plan.dispatches.size() == (count + 511) / 512);
       for (size_t i = 0; i < plan.dispatches.size(); ++i) {
-        bool small = std::min<size_t>(count - i * 512, 512) <= 16;
+        size_t n = std::min<size_t>(count - i * 512, 512);
+        bool small = n >= 2 && n <= 16;
+        CHECK(std::holds_alternative<FabricCopyArgs<kSingleK>>(plan.dispatches[i].args) == (n == 1));
         CHECK(std::holds_alternative<FabricCopyArgs<kSmallK>>(plan.dispatches[i].args) == small);
+        CHECK(std::holds_alternative<FabricCopyArgs<kLargeK>>(plan.dispatches[i].args) == (n > 16));
       }
       CheckCoverage(plan, 1536);
       std::reverse(segs.begin(), segs.end());
       CheckCoverage(PlanCopy(segs, 1536, true), 1536);
     }
-    for (uint64_t size : {1ull, 4095ull, 4096ull, 4097ull, 8193ull, 1ull << 33, 1ull << 40}) {
-      auto plan = PlanCopy({{0, 0, size}}, 1536, true);
-      CheckCoverage(plan, 1536);
+    // Explicit old-kernel grid boundaries, including ceil(size / 16), the cap,
+    // >4 GiB, and UINT64_MAX without overflowing a ceil-division addition.
+    struct GridCase {
+      uint64_t bytes;
+      uint32_t grid;
+    };
+    for (auto test : {GridCase{1, 1}, {15, 1}, {16, 1}, {4095, 1}, {4096, 1}, {4097, 2},
+                      {8192, 2}, {8193, 3}, {65534ull * 4096 + 1, 65535},
+                      {65535ull * 4096, 65535}, {65535ull * 4096 + 1, 65535},
+                      {(1ull << 32) + 1, 65535}, {1ull << 40, 65535}, {UINT64_MAX, 65535}}) {
+      for (uint32_t maxBlocks : {1u, 1536u, UINT32_MAX}) {
+        auto plan = PlanCopy({{17, 19, test.bytes}}, maxBlocks, true);
+        CHECK(plan.dispatches.size() == 1 && plan.dispatches[0].grid == test.grid);
+        CheckCoverage(plan, maxBlocks);
+      }
     }
     constexpr uint64_t boundary = 1536 * kMinChunk;
     for (uint64_t bytes : {boundary - 1, boundary, boundary + 1}) {
-      auto plan = PlanCopy({{0, 0, bytes}}, 1536, true);
+      // Keep two noncontiguous segments to exercise adaptive multi-segment chunks.
+      auto plan = PlanCopy({{0, 0, bytes - 1}, {bytes + 16, bytes + 16, 1}}, 1536, true);
       auto a = std::get<FabricCopyArgs<kSmallK>>(plan.dispatches[0].args);
       CHECK(a.chunkShift == (bytes <= boundary ? 12 : 13));
       CHECK(plan.dispatches[0].grid == (bytes <= boundary ? 1536 : 769));
@@ -80,13 +104,31 @@ int main() {
                  UINT32_MAX, true);
     CHECK(split.dispatches.size() == 2);
     CheckCoverage(split, UINT32_MAX);
+    // Trimming reaches one segment when its rounded chunk count already fills
+    // uint32. Still larger segments must also terminate through the flat path.
+    constexpr uint64_t huge = (uint64_t{UINT32_MAX} - 1) * 4096 + 1;
+    for (uint64_t size : {huge, uint64_t{UINT32_MAX} * 4096 + 1, UINT64_MAX - 1}) {
+      auto single = PlanCopy({{0, 0, size}}, UINT32_MAX, true);
+      CHECK(single.dispatches.size() == 1 && single.dispatches[0].grid == 65535);
+      CheckCoverage(single, UINT32_MAX);
+      auto trimmed = PlanCopy({{0, 0, size}, {1, 1, 1}}, UINT32_MAX, true);
+      CHECK(!trimmed.dispatches.empty());
+      if (size == huge) {
+        CHECK(trimmed.dispatches.size() == 2);
+        CHECK(std::holds_alternative<FabricCopyArgs<kSingleK>>(trimmed.dispatches[0].args));
+      }
+      CheckCoverage(trimmed, UINT32_MAX);
+    }
     // Total bytes can also exceed uint64_t even when individual segments do not.
     auto wide = PlanCopy({{0, 0, UINT64_MAX}, {1, 1, UINT64_MAX}}, 1536, true);
     CHECK(wide.dispatches.size() == 2);
     CheckCoverage(wide, 1536);
     auto maximal = PlanCopy({{0, 0, UINT64_MAX}}, 1, true);
-    CHECK(std::get<FabricCopyArgs<kSmallK>>(maximal.dispatches[0].args).chunkShift == 64);
+    CHECK(std::holds_alternative<FabricCopyArgs<kSingleK>>(maximal.dispatches[0].args));
     CheckCoverage(maximal, 1);
+    auto maximalChunks = PlanCopy({{0, 0, UINT64_MAX - 1}, {1, 1, 1}}, 1, true);
+    CHECK(std::get<FabricCopyArgs<kSmallK>>(maximalChunks.dispatches[0].args).chunkShift == 64);
+    CheckCoverage(maximalChunks, 1);
 
     auto merge = PlanCopy(
         {{32, 132, 8}, {0, 100, 16}, {16, 116, 16}, {40, 200, 8}, {80, 208, 8}, {7, 110, 0}}, 1536,

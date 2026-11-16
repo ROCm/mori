@@ -74,13 +74,40 @@ __device__ __forceinline__ void CopyChunk(unsigned char* dst, const unsigned cha
   for (uint64_t i = vectors * 16 + tid; i < bytes; i += blockDim.x) dst[i] = src[i];
 }
 
-// Shared template implementation for both exported kernel entry points.
+// Whole-segment access pattern matches the original single-copy kernel.
+__device__ __forceinline__ void CopyFlat(unsigned char* dst, const unsigned char* src,
+                                        uint64_t bytes) {
+  const uint64_t tid = uint64_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  const uint64_t stride = uint64_t{gridDim.x} * blockDim.x;
+  if ((reinterpret_cast<uintptr_t>(src) & 15) != (reinterpret_cast<uintptr_t>(dst) & 15)) {
+    for (uint64_t i = tid; i < bytes; i += stride) dst[i] = src[i];
+    return;
+  }
+  uint64_t head = (16 - (reinterpret_cast<uintptr_t>(src) & 15)) & 15;
+  if (head > bytes) head = bytes;
+  for (uint64_t i = tid; i < head; i += stride) dst[i] = src[i];
+  src += head;
+  dst += head;
+  bytes -= head;
+  const uint64_t vectors = bytes / 16;
+  auto* vd = reinterpret_cast<uint4*>(dst);
+  const auto* vs = reinterpret_cast<const uint4*>(src);
+  for (uint64_t i = tid; i < vectors; i += stride) vd[i] = vs[i];
+  for (uint64_t i = vectors * 16 + tid; i < bytes; i += stride) dst[i] = src[i];
+}
+
+// Shared template implementation for all three exported kernel entry points.
 template <int K>
 __device__ __forceinline__ void FabricCopy(const FabricCopyArgs<K>& a) {
+  if (a.numSegs == 1) {
+    CopyFlat(reinterpret_cast<unsigned char*>(a.dst[0]),
+             reinterpret_cast<const unsigned char*>(a.src[0]), a.size[0]);
+    return;
+  }
   const uint64_t chunkBytes = a.chunkShift == 64 ? UINT64_MAX : uint64_t{1} << a.chunkShift;
   for (uint64_t c = blockIdx.x; c < a.chunkEnd[a.numSegs - 1]; c += gridDim.x) {
     uint32_t seg = 0;
-    if (a.numSegs != 1) {
+    {
       uint32_t lo = 0, hi = a.numSegs;
       while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
@@ -101,5 +128,6 @@ __device__ __forceinline__ void FabricCopy(const FabricCopyArgs<K>& a) {
 }
 }  // namespace
 
+extern "C" __global__ void fabricCopyKernelSingle(FabricCopyArgs<kSingleK> a) { FabricCopy(a); }
 extern "C" __global__ void fabricCopyKernelSmall(FabricCopyArgs<kSmallK> a) { FabricCopy(a); }
 extern "C" __global__ void fabricCopyKernelLarge(FabricCopyArgs<kLargeK> a) { FabricCopy(a); }

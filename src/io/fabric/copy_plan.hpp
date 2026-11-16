@@ -15,7 +15,7 @@ struct CopySegment {
   uint64_t size;
 };
 struct CopyDispatch {
-  std::variant<FabricCopyArgs<kSmallK>, FabricCopyArgs<kLargeK>> args;
+  std::variant<FabricCopyArgs<kSingleK>, FabricCopyArgs<kSmallK>, FabricCopyArgs<kLargeK>> args;
   uint32_t grid;
 };
 struct CopyPlan {

@@ -377,8 +377,13 @@ void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const Siz
         return std::visit(
             [&](auto& args) {
               using Args = std::decay_t<decltype(args)>;
-              auto fn = std::is_same_v<Args, fabric::FabricCopyArgs<fabric::kSmallK>> ? funcs.small
-                                                                                      : funcs.large;
+              hipFunction_t fn;
+              if constexpr (std::is_same_v<Args, fabric::FabricCopyArgs<fabric::kSingleK>>)
+                fn = funcs.single;
+              else if constexpr (std::is_same_v<Args, fabric::FabricCopyArgs<fabric::kSmallK>>)
+                fn = funcs.small;
+              else
+                fn = funcs.large;
               void* params[] = {&args};
               return hipModuleLaunchKernel(fn, dispatch.grid, 1, 1, 256, 1, 1, 0, stream, params,
                                            nullptr);
@@ -524,6 +529,7 @@ FabricBackend::CopyFunctions FabricBackend::GetFabricCopyFunctions(int deviceId)
   hipModule_t module = nullptr;
   CopyFunctions funcs;
   hipError_t err = hipModuleLoad(&module, fabricCopyHsacoPath_.c_str());
+  if (err == hipSuccess) err = hipModuleGetFunction(&funcs.single, module, "fabricCopyKernelSingle");
   if (err == hipSuccess) err = hipModuleGetFunction(&funcs.small, module, "fabricCopyKernelSmall");
   if (err == hipSuccess) err = hipModuleGetFunction(&funcs.large, module, "fabricCopyKernelLarge");
   if (err != hipSuccess) {
@@ -534,7 +540,7 @@ FabricBackend::CopyFunctions FabricBackend::GetFabricCopyFunctions(int deviceId)
   }
   fabricCopyModules_[deviceId] = module;
   fabricCopyFuncs_[deviceId] = funcs;
-  MORI_IO_INFO("FABRIC: Loaded small and large copy kernels on device {}", deviceId);
+  MORI_IO_INFO("FABRIC: Loaded single, small and large copy kernels on device {}", deviceId);
   return funcs;
 }
 
