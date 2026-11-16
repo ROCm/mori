@@ -35,6 +35,8 @@ message LogicalTierCapacity {
   // covers every tier it can spill into, so this is the only field a reader can
   // compare against the tier's watermarks.
   double   peak_member_utilization  = 7;
+  // Objects smaller than this would land only under a member's min_object_size.
+  uint64   min_object_bytes         = 8;
 }
 
 // One page slot inside one of a node's DRAM/HBM buffers.  Carried by the

@@ -104,6 +104,7 @@ class SSDTier : public TierBackend {
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
   std::vector<EvictionHint> EvictionOrder(size_t max_keys) override;
+  void Touch(const std::vector<std::string>& keys) override;
   void SetRetiredFileHook(std::function<void(int fd)> on_close,
                           std::chrono::milliseconds grace) override;
 
@@ -115,6 +116,14 @@ class SSDTier : public TierBackend {
   // True when segment I/O is actually bypassing the page cache.  False if
   // direct I/O was never requested, or was requested and the probe failed.
   bool direct_io_active() const { return direct_io_; }
+  bool native_async_io() const { return io_driver_->Capabilities().native_async; }
+
+  // Calibration only: set before I/O with UMBP_SSD_TIMING=1. Reports batch
+  // BatchWrite/ReadBatchIntoPtr payload work, including cleanup but excluding index/locks/planning.
+  // Write batches must fit segment_size(), without the per-key fallback.
+  void SetPayloadTimingObserver(std::function<void(uint64_t)> observer) {
+    payload_timing_observer_ = std::move(observer);
+  }
 
   // The uncommitted prefix goes down at reserve, so the log stays parseable and
   // the scanner skips the record until CommitRecord flips its flag.
@@ -176,6 +185,9 @@ class SSDTier : public TierBackend {
   // direct I/O is on and `dst`/`size` do not meet the alignment rules.
   IoStatus ReadValueInto(int fd, void* dst, size_t size, uint64_t value_offset) const;
   IoStatus WritePrepared(int fd, const segment::PreparedRecord& pr, bool sync) const;
+  // Runs a batch read on a free read ring (io_driver_ under io_mu_ without
+  // read rings); adds the time spent waiting for one to *wait_ms.
+  IoStatus BatchRead(const std::function<IoStatus(StorageIoDriver&)>& read, double* wait_ms) const;
   bool ShouldVerifyCrc(bool crc_valid) const { return ssd_config_.verify_crc && crc_valid; }
   int TierThreads() const;
 
@@ -185,6 +197,7 @@ class SSDTier : public TierBackend {
   SSDAccessMode access_mode_;
   bool direct_io_ = false;
   uint64_t segment_size_ = 0;
+  std::function<void(uint64_t)> payload_timing_observer_;
 
   // Deleted segments whose fds wait out the retired-file grace.
   struct RetiredFd {
@@ -202,6 +215,12 @@ class SSDTier : public TierBackend {
   mutable std::mutex mu_;
   mutable std::mutex io_mu_;
   std::unique_ptr<StorageIoDriver> io_driver_;
+  struct ReadRing {
+    std::mutex mu;
+    std::unique_ptr<StorageIoDriver> driver;
+  };
+  std::vector<std::unique_ptr<ReadRing>> read_rings_;  // empty = reads use io_driver_
+  mutable std::atomic<size_t> next_read_ring_{0};
   segment::Index index_;
   segment::Scanner scanner_;
   std::unique_ptr<segment::Writer> writer_;

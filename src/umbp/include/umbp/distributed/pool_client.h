@@ -82,6 +82,10 @@ inline const char* OutcomeName(::umbp::AllocateSlotOutcome o) {
   }
 }
 
+// The NUMA node of each GPU this process sees, by device ordinal; a GPU with no
+// node is left out.
+std::unordered_map<int, int> GpuNumaNodes();
+
 // In the master-as-advisor design, PoolClient drives the Put/Get
 // pipeline: master gives a routing advisory, then the writer talks
 // directly to the peer (AllocateSlot → RDMA → CommitSlot or
@@ -209,6 +213,11 @@ class PoolClient {
   // Ahead of a read: local SSD keys are copied into DRAM (PeerPool::Prefetch),
   // and keys on peers are pulled into this node's medium in the background.
   size_t BatchPrefetch(const std::vector<std::string>& keys);
+
+  // Recency hint (IUMBPClient::BatchTouch); returns the copies touched on this
+  // node's media.  In the master eviction modes the keys also join the local
+  // reads reported to the master.  Never contacts another peer.
+  size_t BatchTouch(const std::vector<std::string>& keys);
 
   MasterClient& Master();
 
@@ -719,8 +728,12 @@ class PoolClient {
    public:
     // Non-owning: the buffer belongs to the caller (DistributedClient).  A shard
     // count of 0 or 1 keeps the original single-arena behaviour.
-    void Reset(void* base, size_t bytes, size_t shards);
+    void Reset(void* base, size_t bytes, size_t shards, int numa_node = -1);
     size_t ShardBytes() const { return shard_bytes_; }
+    char* Base() const { return base_; }
+    size_t Bytes() const { return bytes_; }
+    // The node the buffer was placed on; -1 when it was not placed by node.
+    int NumaNode() const { return numa_node_; }
 
     // Holds a shard for its lifetime and gives it back on destruction, so every
     // early exit out of an arena loop releases it.
@@ -790,10 +803,20 @@ class PoolClient {
     // the proxy-reference specialisation buys nothing at these sizes.
     std::vector<uint8_t> busy_;
     size_t shard_bytes_ = 0;
+    char* base_ = nullptr;
+    size_t bytes_ = 0;
+    int numa_node_ = -1;
   };
 
-  ScratchArena ranged_get_scratch_;
-  ScratchArena ranged_put_scratch_;
+  // PoolClientConfig::ranged_{get,put}_scratch, held by pointer because an
+  // arena owns a mutex.
+  std::vector<std::unique_ptr<ScratchArena>> ranged_get_scratch_;
+  std::vector<std::unique_ptr<ScratchArena>> ranged_put_scratch_;
+  // The arena a remote ranged call stages through, given its first caller
+  // buffer: the one on that buffer's NUMA node, else the first; null when the
+  // direction has none.  Its RDMA leg then uses that node's NICs, and the copy
+  // between the arena and a GPU stays on the GPU's socket.
+  ScratchArena* RangedArenaFor(bool get, const void* caller_buffer);
   std::condition_variable recache_cv_;
   std::thread recache_worker_;
   bool recache_stop_ = false;

@@ -168,8 +168,8 @@ class TieredPlacementPolicy final : public PoolPolicy {
     }
     if (graph_ == nullptr) return {};
     return request.logical_tier.empty()
-               ? graph_->PutOrder(request.key)
-               : graph_->PutOrderFromTier(request.logical_tier, request.key);
+               ? graph_->PutOrder(request.key, request.size)
+               : graph_->PutOrderFromTier(request.logical_tier, request.key, request.size);
   }
 
   std::vector<uint32_t> ReadOrder(const BackendRegistry&) const override {

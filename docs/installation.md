@@ -24,11 +24,11 @@ pip install 'amd_mori[flydsl]'
 
 The optional dependency is not version-pinned by MORI. When using MORI in a
 framework image, preserve that image's tested FlyDSL version rather than
-upgrading the compiler independently. See [EP backends](ep_backends.rst) for
+upgrading the compiler independently. See the [EP guide](MORI-EP-GUIDE.md#epv2-paths) for
 paths that require FlyDSL and paths that can run with HIP alone.
 
 ## Next steps
 
 * [Quickstart](quickstart.rst) provides runnable checks and API sketches.
-* [EP backends](ep_backends.rst) explains API and backend selection.
+* [EP guide](MORI-EP-GUIDE.md) explains EPv1 and EPv2 and how to choose between them.
 * [CCO guide](MORI-CCO-GUIDE.md) describes communicator setup and transports.

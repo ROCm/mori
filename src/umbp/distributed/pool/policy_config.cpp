@@ -230,7 +230,8 @@ PolicyBackendSpec ParseBackend(const std::string& name, const Value& value) {
       backend.numa_nodes = NormalizeNumaNodes(std::move(backend.numa_nodes));
     }
   } else if (type == "ssd") {
-    RejectUnknownFields(object, {"type", "capacity", "path", "staging_slots"}, context);
+    RejectUnknownFields(object, {"type", "capacity", "path", "staging_slots", "min_object_size"},
+                        context);
     backend.tier = TierType::SSD;
     backend.path = AsString(RequiredField(object, "path", context), context + ".path");
     if (backend.path.empty()) Invalid(context + ".path: must not be empty");
@@ -238,6 +239,10 @@ PolicyBackendSpec ParseBackend(const std::string& name, const Value& value) {
     // default", which is not a thing a written-out field can mean.
     if (const Value* slots = OptionalField(object, "staging_slots")) {
       backend.staging_slots = AsInt(*slots, 1, context + ".staging_slots");
+    }
+    if (const Value* min = OptionalField(object, "min_object_size")) {
+      backend.min_object_bytes =
+          ParseCapacity(AsString(*min, context + ".min_object_size"), context + ".min_object_size");
     }
   } else {
     Invalid(context + ".type: expected 'dram', 'hbm', or 'ssd'");
@@ -590,8 +595,10 @@ bool ApplyBackendPolicy(const BackendPolicyConfig& policy, PoolClientConfig* con
 
     std::vector<BackendInstanceConfig> concrete_backends;
     std::unordered_map<std::string, std::vector<std::string>> expansions;
+    std::unordered_map<std::string, uint64_t> min_object_bytes;
 
     for (const auto& backend : policy.backends) {
+      min_object_bytes[backend.name] = backend.min_object_bytes;
       std::vector<std::string> concrete_names;
       if (backend.tier == TierType::HBM) {
         const uint64_t base = backend.capacity_bytes / backend.devices.size();
@@ -678,7 +685,8 @@ bool ApplyBackendPolicy(const BackendPolicyConfig& policy, PoolClientConfig* con
         }
         const uint32_t concrete_weight = static_cast<uint32_t>(factor * member.weight);
         for (const auto& name : names) {
-          lowered.members.push_back({name, concrete_weight});
+          lowered.members.push_back(
+              {name, concrete_weight, min_object_bytes.at(member.backend_name)});
         }
       }
       for (const auto& target : source.offload_to) {

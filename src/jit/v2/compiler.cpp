@@ -47,12 +47,37 @@ namespace fs = std::filesystem;
 // Module
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Why a load failed, when it is because the code object targets another arch.
+std::string ArchMismatchNote() {
+  int dev = 0;
+  hipDeviceProp_t props{};
+  if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&props, dev) != hipSuccess)
+    return "";
+  std::string devArch(props.gcnArchName);
+  devArch = devArch.substr(0, devArch.find(':'));
+  const std::string& built = GetToolchain().arch;
+  if (devArch == built) return "";
+  std::string note = ". The code object targets " + built + " but device " + std::to_string(dev) +
+                     " is " + devArch;
+  const bool gfx1250Pair = (built == "gfx1250" && devArch == "gfx1250-strict") ||
+                           (built == "gfx1250-strict" && devArch == "gfx1250");
+  if (gfx1250Pair)
+    note +=
+        ": gfx1250 and gfx1250-strict code objects each load only where the runtime "
+        "reports that target";
+  return note + " (MORI_JIT_ARCH or a plan's arch= overrides the device; unset it)";
+}
+
+}  // namespace
+
 Module::Module(const std::string& hsacoPath, std::string entry)
     : path_(hsacoPath), entryName_(std::move(entry)) {
   hipError_t err = hipModuleLoad(&module_, hsacoPath.c_str());
   if (err != hipSuccess) {
     throw std::runtime_error("mori jit: hipModuleLoad(" + hsacoPath +
-                             ") failed: " + hipGetErrorString(err));
+                             ") failed: " + hipGetErrorString(err) + ArchMismatchNote());
   }
   err = hipModuleGetFunction(&entry_, module_, entryName_.c_str());
   if (err != hipSuccess) {

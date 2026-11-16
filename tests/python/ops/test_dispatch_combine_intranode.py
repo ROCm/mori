@@ -210,9 +210,7 @@ def _test_dispatch_combine_ll(
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
 @pytest.mark.parametrize("use_external_inp_buf", (True, False))
-@pytest.mark.parametrize(
-    "quant_type", ("none", "fp8_direct_cast", "fp8_blockwise", "fp4_blockwise")
-)
+@pytest.mark.parametrize("quant_type", ("none", "fp8_blockwise", "fp4_blockwise"))
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,
@@ -226,11 +224,6 @@ def test_dispatch_combine(
     use_external_inp_buf,
     quant_type,
 ):
-    # fp8_direct_cast is not supported in zero-copy mode (use_external_inp_buf=False)
-    if quant_type == "fp8_direct_cast" and not use_external_inp_buf:
-        pytest.skip("fp8_direct_cast is not supported in zero-copy mode")
-    if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
-        pytest.skip("fp8_direct_cast is only supported for bfloat16 data type")
     if quant_type in ("fp8_blockwise", "fp4_blockwise"):
         if data_type is not torch.bfloat16:
             pytest.skip(f"{quant_type} only supports bfloat16 input")
@@ -276,7 +269,6 @@ def _test_dispatch_combine_cross_dtype(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
-    quant_type,
 ):
     dispatch_hidden_dim, combine_hidden_dim, _ = cross_dtype_hidden_dims(
         hidden_dim, data_type, combine_data_type
@@ -290,7 +282,6 @@ def _test_dispatch_combine_cross_dtype(
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
         use_external_inp_buf=True,
-        quant_type=quant_type,
         kernel_type=kernel_type,
         combine_data_type=combine_data_type,
     )
@@ -305,9 +296,8 @@ def _test_dispatch_combine_cross_dtype(
 
 # Cross-dtype coverage: dispatch and combine transport different element types.
 # The quantized serving configurations dispatch narrow (FP4 / FP8) and combine in
-# BF16, optionally casting the BF16 combine payload back down to FP8 on the wire
-# (fp8_direct_cast). The same-dtype tests above cannot reach these cells because
-# they derive the combine type from config.data_type.
+# BF16. The same-dtype tests above cannot reach these cells because they derive
+# the combine type from config.data_type.
 @pytest.mark.parametrize("world_size", (8,))
 @pytest.mark.parametrize(
     "kernel_type",
@@ -323,7 +313,6 @@ def _test_dispatch_combine_cross_dtype(
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (128,))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
-@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast"))
 def test_dispatch_combine_cross_dtype(
     torch_dist_process_manager,
     world_size,
@@ -334,9 +323,8 @@ def test_dispatch_combine_cross_dtype(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
-    quant_type,
 ):
-    skip = cross_dtype_skip_reason(quant_type, data_type, combine_data_type)
+    skip = cross_dtype_skip_reason(data_type, combine_data_type)
     if skip:
         pytest.skip(skip)
     if _is_fp4x2_dtype(data_type) and not _combine_fp4_supported():
@@ -355,7 +343,6 @@ def test_dispatch_combine_cross_dtype(
                     max_num_inp_token_per_rank,
                     num_experts_per_rank,
                     num_experts_per_token,
-                    quant_type,
                 ],
             )
         )
@@ -496,7 +483,7 @@ def test_dispatch_combine_weightless_vec8_fp4_top6(
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
 @pytest.mark.parametrize("use_external_inp_buf", (True, False))
-@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast", "fp8_blockwise"))
+@pytest.mark.parametrize("quant_type", ("none", "fp8_blockwise"))
 def test_dispatch_combine_ll(
     torch_dist_process_manager,
     world_size,
@@ -510,11 +497,6 @@ def test_dispatch_combine_ll(
     use_external_inp_buf,
     quant_type,
 ):
-    # fp8_direct_cast is not supported in zero-copy mode (use_external_inp_buf=False)
-    if quant_type == "fp8_direct_cast" and not use_external_inp_buf:
-        pytest.skip("fp8_direct_cast is not supported in zero-copy mode")
-    if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
-        pytest.skip("fp8_direct_cast is only supported for bfloat16 data type")
     if quant_type in ("fp8_blockwise", "fp4_blockwise"):
         if data_type is not torch.bfloat16:
             pytest.skip(f"{quant_type} only supports bfloat16 input")

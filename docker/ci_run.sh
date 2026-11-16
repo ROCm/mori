@@ -18,6 +18,8 @@ set -euo pipefail
 #                          --privileged. nicctl needs CAP_SYS_ADMIN/SYS_RAWIO
 #                          for PCI config/BAR access, so `mori check` skips its
 #                          firmware/QoS/DCQCN steps under this mode.
+#   MORI_CI_CACHE_VOLUME — Named volume for the build caches that outlive the
+#                          container (default mori_ci_cache); empty disables it.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -199,6 +201,18 @@ if [[ "${MORI_CI_NO_PRIVILEGED:-0}" == "1" ]]; then
     echo "[ci_run] MORI_CI_NO_PRIVILEGED=1 | caps: ${PRIV_ARGS[*]}"
 fi
 
+# Every CI job starts a fresh container and builds mori in it. ccache (setup.py
+# uses it when it is on PATH) and pip's cache (build isolation reinstalls the
+# build requirements on every build) live in one volume per host, so a job reuses
+# what the jobs before it on this runner compiled and downloaded.
+CACHE_VOLUME="${MORI_CI_CACHE_VOLUME-mori_ci_cache}"
+CACHE_ARGS=()
+if [[ -n "$CACHE_VOLUME" ]]; then
+    CACHE_ARGS=(-v "$CACHE_VOLUME:/root/.cache/mori-ci"
+                -e CCACHE_DIR=/root/.cache/mori-ci/ccache
+                -e PIP_CACHE_DIR=/root/.cache/mori-ci/pip)
+fi
+
 exec "$RUNTIME" run \
     --group-add video \
     --network=host \
@@ -208,4 +222,5 @@ exec "$RUNTIME" run \
     -d --ipc=host "${PRIV_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
     "${NIC_MOUNTS[@]}" \
+    "${CACHE_ARGS[@]}" \
     "$@"

@@ -42,7 +42,7 @@ try:
 except ImportError:
     _HAVE_CYTHON = False
 
-_supported_arch_list = ["gfx942", "gfx950", "gfx1250"]
+_supported_arch_list = ["gfx942", "gfx950", "gfx1250", "gfx1250-strict"]
 
 _REQUIRED_SYSTEM_DEPS: list = []
 
@@ -325,10 +325,10 @@ def _get_gpu_archs() -> str:
         if valid_arch_list:
             return ";".join(valid_arch_list)
 
-    print(
-        f"[mori] No GPU arch specified — building fat binary for {_supported_arch_list}"
-    )
-    return ";".join(_supported_arch_list)
+    # gfx1250-strict only by name or detection: older toolchains reject the target.
+    fat = [a for a in _supported_arch_list if not a.endswith("-strict")]
+    print(f"[mori] No GPU arch specified — building fat binary for {fat}")
+    return ";".join(fat)
 
 
 def _copy_jit_sources(root_dir: Path) -> None:
@@ -418,6 +418,9 @@ def _write_cco_build_flags(root_dir: Path, *, sdma: bool) -> None:
 
 
 _ROCM_VERSION_RE = re.compile(r"\b(\d+)\.(\d+)(?:\.\d+)?\b")
+_ROCM_VERSION_HEADER_RE = re.compile(
+    r"^\s*#\s*define\s+ROCM_VERSION_(MAJOR|MINOR|PATCH)\s+(\d+)", re.MULTILINE
+)
 
 
 def _detect_rocm_build_version() -> tuple[str | None, str | None]:
@@ -428,9 +431,28 @@ def _detect_rocm_build_version() -> tuple[str | None, str | None]:
     ).resolve()
     candidates: list[str] = []
 
+    # The ROCm release version, which is what rocm_sdk.__version__ reports.
+    # hipconfig reports HIP's own version, and that stopped tracking the release
+    # in ROCm 10.0 (it ships HIP 7.15), so it is only a last resort.
+    try:
+        header = (rocm_path / "include" / "rocm-core" / "rocm_version.h").read_text(
+            encoding="utf-8"
+        )
+    except OSError:
+        pass
+    else:
+        fields = dict(_ROCM_VERSION_HEADER_RE.findall(header))
+        if "MAJOR" in fields and "MINOR" in fields:
+            candidates.append(
+                ".".join(fields[k] for k in ("MAJOR", "MINOR", "PATCH") if k in fields)
+            )
+
+    # .info/ sits at the root of the classic layout and under core/ in the
+    # multi-arch (7.14+) one.
     for version_file in (
         rocm_path / ".info" / "version",
         rocm_path / ".info" / "version-dev",
+        rocm_path / "core" / ".info" / "version",
     ):
         try:
             candidates.append(version_file.read_text(encoding="utf-8"))
@@ -693,10 +715,12 @@ class CMakeBuild(build_ext):
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
         build_benchmark = os.environ.get("BUILD_BENCHMARK", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
+        build_ras = "ON" if _env_flag("BUILD_RAS", "OFF") else "OFF"
         build_umbp = "ON" if build_umbp_enabled else "OFF"
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
+        build_ops_kiwi_enabled = _env_flag("BUILD_OPS_KIWI", "OFF")
         with_mpi = (
             "ON"
             if (
@@ -751,6 +775,7 @@ class CMakeBuild(build_ext):
             f"-DBUILD_EXAMPLES={build_examples}",
             f"-DBUILD_BENCHMARK={build_benchmark}",
             f"-DBUILD_TESTS={build_tests}",
+            f"-DBUILD_RAS={build_ras}",
             f"-DBUILD_UMBP={build_umbp}",
             f"-DUSE_REDIS_BACKEND={use_redis_backend}",
             f"-DUSE_SPDK={build_umbp_spdk}",
@@ -758,6 +783,7 @@ class CMakeBuild(build_ext):
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
             f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
             f"-DBUILD_OPS_DEVICE={build_ops_device}",
+            f"-DBUILD_OPS_KIWI={'ON' if build_ops_kiwi_enabled else 'OFF'}",
             f"-DBUILD_CCO_SDMA={BUILD_CCO_SDMA}",
             f"-DMORI_MULTITHREAD_SUPPORT={multithread_support}",
             "-B",
@@ -839,6 +865,10 @@ class CMakeBuild(build_ext):
             files_to_copy.append(
                 (collective_so, root_dir / "python/mori/libmori_collective.so")
             )
+        # libmori_io.so needs it beside it unless BUILD_RAS=OFF built RAS out.
+        ras_so = build_dir / "src/ras/libmori_ras.so"
+        if build_ras == "ON":
+            files_to_copy.append((ras_so, root_dir / "python/mori/libmori_ras.so"))
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
@@ -850,6 +880,14 @@ class CMakeBuild(build_ext):
             shutil.copyfile(umbp_pybinds_src, umbp_pybinds_dst)
         elif umbp_pybinds_dst.exists():
             umbp_pybinds_dst.unlink()
+
+        for kiwi_lib in ("libmori_ops_kiwi.so", "libmori_kiwi_ep_pybinds.so"):
+            kiwi_src = build_dir / "src/ops/dispatch_combine_kiwi" / kiwi_lib
+            kiwi_dst = root_dir / "python/mori" / kiwi_lib
+            if build_ops_kiwi_enabled and kiwi_src.exists():
+                shutil.copyfile(kiwi_src, kiwi_dst)
+            elif kiwi_dst.exists():
+                kiwi_dst.unlink()
 
         spdk_proxy_src = build_dir / "src/umbp/spdk_proxy"
         spdk_proxy_dst = root_dir / "python/mori/spdk_proxy"
@@ -1089,9 +1127,12 @@ mori_package_data = [
     "libmori_application.so",
     "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
+    "libmori_ras.so",  # optional: absent when BUILD_RAS=OFF
     "libmori_jit.so",  # JIT v2 C ABI + plan registry
     "libmori_ops_v2.so",  # v2 EP kernels' host side; registers into libmori_jit
     "libmori_umbp_pybinds.so",  # optional: only present when BUILD_UMBP=ON
+    "libmori_ops_kiwi.so",  # optional: only present when BUILD_OPS_KIWI=ON
+    "libmori_kiwi_ep_pybinds.so",  # optional: only present when BUILD_OPS_KIWI=ON
     "umbp_master",
     "umbp_standalone_server",
     "_jit-sources/include/**/*.hpp",
@@ -1105,6 +1146,7 @@ mori_package_data = [
     "_jit-sources/3rdparty/**/*.hpp",
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
+    "ops/dispatch_combine_v2/tuning_configs/*.csv",
     "io/sim_catalog.yaml",  # MORI_IO_SIM_CATALOG timing for measured hardware
     "tools/*.sh",
     "tools/mori.conf",

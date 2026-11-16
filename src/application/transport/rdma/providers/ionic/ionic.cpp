@@ -48,26 +48,21 @@
 namespace mori {
 namespace application {
 /* ---------------------------------------------------------------------------------------------- */
-/*                                        Device Attributes                                       */
+/*                                        Firmware Version                                        */
 /* ---------------------------------------------------------------------------------------------- */
 
-namespace {
-
-using FwVersion = std::tuple<int, int, int, int>;
-constexpr FwVersion kCcqeMinFwVersion{1, 117, 5, 58};
-
 // Parse "1.117.5-a-58" or "1.117.5-a58" into (1,117,5,58).
-std::optional<FwVersion> ParseIonicFwVersion(const char* fw_ver) {
+std::optional<IonicFwVersion> ParseIonicFwVersion(const char* fw_ver) {
   int major, minor, patch, build;
   char tag;
   if (sscanf(fw_ver, "%d.%d.%d-%c-%d", &major, &minor, &patch, &tag, &build) == 5 ||
       sscanf(fw_ver, "%d.%d.%d-%c%d", &major, &minor, &patch, &tag, &build) == 5) {
-    return FwVersion{major, minor, patch, build};
+    return IonicFwVersion{major, minor, patch, build};
   }
   return std::nullopt;
 }
 
-std::optional<FwVersion> ReadIonicFwVersion(const char* dev_name) {
+std::optional<IonicFwVersion> ReadIonicFwVersion(const char* dev_name) {
   char path[256];
   snprintf(path, sizeof(path), "/sys/class/infiniband/%s/fw_ver", dev_name);
 
@@ -83,9 +78,18 @@ std::optional<FwVersion> ReadIonicFwVersion(const char* dev_name) {
   return ParseIonicFwVersion(buf);
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                        Device Attributes                                       */
+/* ---------------------------------------------------------------------------------------------- */
+
+namespace {
+
+constexpr IonicFwVersion kCcqeMinFwVersion{1, 117, 5, 58};
+
 bool IsCcqeSupported(ibv_context* context) {
-  const char* disable_ccqe = std::getenv("MORI_DISABLE_IONIC_CCQE");
-  if (disable_ccqe && std::strcmp(disable_ccqe, "1") == 0) return false;
+  // Only 1/true/on/yes, as mori.jit.core.is_ccqe_enabled and MoriDetectDevice.cmake read it.
+  const char* disable = env::Get("MORI_DISABLE_IONIC_CCQE");
+  if (disable != nullptr && env::detail::ParseBool(disable).value_or(false)) return false;
   if (IonicDvApi::Instance().create_cq_ex == nullptr) return false;
 
   /* Minimum firmware version verified by MORI to support CCQE is 1.117.5-a-58. */

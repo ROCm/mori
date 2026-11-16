@@ -52,7 +52,7 @@ done
 ## Step 1: Start the Docker container
 
 Use the container name from the user's args if provided; ask if not.
-Default image: `rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0`
+Default image: `rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0`
 (use unless the user specifies another) — same base the CI workflows build on.
 
 ```bash
@@ -66,7 +66,7 @@ fi
 Probe optional mount paths on the host, only include ones that exist:
 
 ```bash
-for p in /shared /apps /dev/infiniband /sys/kernel/config /sys/kernel/debug; do
+for p in /shared /apps /boot /dev/infiniband /sys/kernel/config /sys/kernel/debug; do
   [ -e "$p" ] && echo "EXISTS: $p" || echo "MISSING: $p"
 done
 ```
@@ -91,6 +91,7 @@ sudo docker run \
     -v /shared:/shared \         # only if exists
     -v /apps:/apps \             # only if exists
     -v /lib/modules:/lib/modules \
+    -v /boot:/boot:ro \          # only if exists; Step 8 reads the host kernel config from it
     -v /sys/kernel/config:/sys/kernel/config \   # REQUIRED for bnxt DCQCN (configfs)
     -v /sys/kernel/debug:/sys/kernel/debug \     # REQUIRED for bnxt DCQCN (debugfs)
     --rm \
@@ -427,15 +428,20 @@ mst status -v
 
 ## Step 4: Install MORI
 
-### 4.0 — ROCm 7.14 dev toolchain (rocm7.14 base images only)
+### 4.0 — ROCm dev toolchain (rocm10.x / rocm7.14 base images only)
 
 **Skip on pre-7.14 images** — they already ship a full `/opt/rocm` and must not
 get a second ROCm stacked on top.
 
-The rocm7.14 pytorch image has **no `/opt/rocm` at all**: ROCm comes from the pip
-`rocm-sdk-core` wheel, which ships runtime `.so` files and headers but no CMake
-package configs. Without this step the build dies at configure time with
+The rocm10.x and rocm7.14 pytorch images have **no `/opt/rocm` at all**: ROCm
+comes from the pip `rocm-sdk-core` wheel, which ships runtime `.so` files and
+headers but no CMake package configs. Without this step the build dies at
+configure time with
 `does not contain the HIP runtime CMake package ... hip-lang-config.cmake`.
+
+Install the release in the image's tag — mixing them makes every `import mori`
+warn that it was built against another ROCm. For ROCm 10.1 (an Ubuntu 22.04
+image takes `ubuntu2204` in the repo URL):
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c '
@@ -443,19 +449,23 @@ set -e
 [ -d /opt/rocm/bin ] && { echo "/opt/rocm already present — skipping"; exit 0; }
 apt-get install -y --no-install-recommends wget gnupg ca-certificates
 mkdir -p --mode=0755 /etc/apt/keyrings
-wget -qO - https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg \
+wget -qO - https://stable.repo.amd.com/rocm/gpg/packages.gpg \
   | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg
-echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" \
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main" \
   > /etc/apt/sources.list.d/amdrocm.list
 apt-get update
-apt-get install -y --no-install-recommends amdrocm-core-dev7.14-gfx942 amdrocm-core-dev7.14-gfx950
-hipconfig --version
+apt-get install -y --no-install-recommends amdrocm-core-dev10.1-gfx942 amdrocm-core-dev10.1-gfx950
+cat /opt/rocm/core/.info/version
 '
 ```
 
+A rocm7.14 image takes `amdrocm-core-dev7.14-<arch>` from the
+`https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404` repo instead, signed
+by `https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg`.
+
 No environment setup is needed for the rest of the session. CMake resolves ROCm
-as `-DROCM_PATH` → `$ROCM_PATH` → `$HIP_PATH` → `/opt/rocm` (where both the
-7.2.4 and 7.14 stacks live) and pins the compiler to an absolute
+as `-DROCM_PATH` → `$ROCM_PATH` → `$HIP_PATH` → `/opt/rocm` (where the 7.2.4,
+7.14 and 10.x stacks all live) and pins the compiler to an absolute
 `<rocm>/llvm/bin/amdclang++`; mori's libraries carry
 `RUNPATH "$ORIGIN:<rocm>/lib"`, and the JIT builds absolute `<rocm>/bin/...`
 paths off the same default. Set `ROCM_PATH` only for ROCm somewhere else (e.g. a
@@ -521,7 +531,7 @@ ibv_devinfo | head -20
 sudo docker exec $CONTAINER_NAME bash -c "mori check"
 ```
 
-`mori check` validates the RDMA stack in 6 steps (vendor-specific variants,
+`mori check` validates the RDMA stack in these steps (vendor-specific variants,
 same intent):
 
 1. **firmware & driver** — versions consistent. Firmware that is not
@@ -529,17 +539,36 @@ same intent):
    undetectable) **warns** rather than fails: the host-proxy backend
    (`MORI_ENABLE_HOST_PROXY=1`) does cross-node RDMA without IBGDA, so only
    IBGDA needs the minimum.
+   **AINIC without a usable `nicctl`** — it needs root, and inside a VM it sees
+   no card — falls back to sysfs: firmware from `/sys/class/infiniband/*/fw_ver`,
+   driver from `/sys/module/ionic`, both unprivileged. sudo is the default:
+   `nicctl` runs directly as root, else via passwordless sudo, else it asks for
+   the sudo password once when there is a terminal (Ctrl-D declines). Only when
+   none of that works does it go rootless, skipping the QoS/DCQCN steps with the
+   reason (SL/TC then stay 0) instead of aborting the run.
+   **In a KVM guest** the firmware also **warns** below `1.117.5-a-230`, where
+   RDMA atomics into GPU (dma-buf) memory fail while writes still work.
 2. **QoS / SL / TC** — PFC + lossless TC; selects SL/TC for MORI
 3. **DCQCN** — congestion control enabled on all RoCE devices
 4. **intra-node bandwidth** — `ib_write_bw` full mesh, host memory
    (needs `perftest`)
 5. **inter-node bandwidth** — `ib_write_bw` to a peer: `mori check <peer_ip>`
-6. **inter-node latency** — `ib_write_lat` to a peer: same peer IP
+6. **RDMA atomics** — `ib_atomic_bw` per rail, the server (responder) on GPU
+   memory via `--use_rocm_dmabuf`, the client on host memory. With a peer it runs
+   over the rail-aligned pairs from step 5; without one, each local NIC loops
+   back to itself. A host-memory pass runs first, and each pass repeats
+   `MORI_CHECK_ATOMIC_RUNS` times (default 3), because the AINIC failure depends
+   on the QP slot a run lands on. Any failed run **fails** the check: MORI-EP
+   signals with atomics by default and hangs (`MORI_EP_DISABLE_RDMA_ATOMICS=1`
+   switches InterNodeV1/V1LL to write-based signalling).
+7. **inter-node latency** — `ib_write_lat` to a peer: same peer IP
 
-Steps 5/6 are skipped without a peer IP — run from both nodes to test cross-node connectivity.
+Steps 5/7 are skipped without a peer IP — run from both nodes to test cross-node connectivity.
+The `ib_write_bw` meshes cannot stand in for step 6: a host can pass every write
+on GPU memory and fail every atomic into it.
 
-**GPU memory.** Only **Step 5 (inter-node bandwidth)** runs a GPU-memory pass;
-Steps 4 and 6 are host-memory only. Step 5 first runs the host-memory mesh
+**GPU memory.** **Step 5 (inter-node bandwidth)** and **Step 6 (atomics,
+responder side only)** run a GPU-memory pass; Steps 4 and 7 are host-memory only. Step 5 first runs the host-memory mesh
 (reachability across all NIC pairs), then a GPU pass (`--use_rocm`, each NIC on
 its PCIe-closest GPU) over the pairs host memory proved reachable, and finally a
 **serial pass over the rail-aligned pairs** (`local[i]` ↔ `remote[i]`) for the
@@ -625,6 +654,72 @@ only `4: Warm Reboot` supported — a host reboot is the only recovery path.
 
 ---
 
+## Step 8: Check cco P2P support (kernel dma-buf)
+
+`mori-cco` (EPv2, `dispatch_combine_v2`) shares every symmetric window between ranks as a
+dma-buf. On a kernel built without `CONFIG_DMABUF_MOVE_NOTIFY` / `CONFIG_PCI_P2PDMA` the
+peer import is pinned in host memory instead of mapped peer-to-peer: EPv2 is ~9x slower, or
+on some hosts never finishes starting (every rank's KFD queues stay evicted). Nothing
+errors. Check it on every new box that will run EPv2. Details and fixes: the
+`known-issues` skill (Issue 1).
+
+**8a — Read the kernel config.** The container shares the host kernel. Both options must
+print `=y`:
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c "
+R=\$(uname -r)
+for f in /boot/config-\$R /lib/modules/\$R/build/.config; do
+  [ -r \$f ] && { echo \"config: \$f\"; grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' \$f; break; }
+done"
+```
+
+No `config:` line means the container cannot see the config (`/boot` was not mounted in
+Step 1; `/lib/modules/*/build` exists only where the host has its kernel headers). Do not
+stop here:
+
+- Host access given (ssh host, or the user can run commands there): run the same `grep`
+  on the host. The kernel release is the container's `uname -r`.
+- Otherwise ask the user to run `grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)`
+  on the host and paste the output, or go to 8b.
+
+**8b — Without a config.** `CONFIG_PCI_P2PDMA` shows in the symbols (`p2pdma.c` is built
+only with it; a non-root user still sees the names):
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c \
+  "grep -q ' pci_p2pdma_distance_many\$' /proc/kallsyms && echo PCI_P2PDMA=y || echo PCI_P2PDMA=missing"
+```
+
+`CONFIG_DMABUF_MOVE_NOTIFY` leaves no symbol, so test the result instead. `vmm_peer_probe`
+needs `hipcc`, at least 2 GPUs and ~2 GB of VRAM; it allocates VMM memory on one GPU, grants
+peer access from another, and reads whether the buffer stayed in VRAM:
+
+```bash
+sudo docker exec -w "$MORI_REPO_DIR/.claude/skills/known-issues" $CONTAINER_NAME bash -c "
+hipcc -O3 --offload-arch=\$(rocminfo | grep -m1 -o 'gfx[0-9a-f]*') vmm_peer_probe.cpp -o /tmp/vmm_peer_probe &&
+/tmp/vmm_peer_probe 1 0 2"
+```
+
+It needs `/sys/class/drm/card*/device/mem_info_vram_used` to be readable. `VERDICT: OK` means
+the kernel is fine; `VERDICT: AFFECTED` means follow the fix in `known-issues`.
+
+**Reading the result**
+
+| Result | Meaning |
+|---|---|
+| both options `=y`, or probe `VERDICT: OK` | fine |
+| either option missing, or `VERDICT: AFFECTED` | EPv2 will be slow or hang; tell the user, point to `known-issues` Issue 1 |
+| `PCI_P2PDMA=y` from kallsyms only, no probe run | `MOVE_NOTIFY` is unknown, say so; do not report the box as healthy |
+| nothing readable, no `hipcc` or one GPU | unknown; ask the user for the host `grep` |
+
+**MI355X uses the FD path.** `ccoCommCreate` tries a fabric handle first and falls back to
+dma-buf FDs. On MI355X `hipDeviceAttributeHandleTypeFabricSupported` is 0, so the FD path is
+the normal one and the kernel options above are what matter. With
+`MORI_GLOBAL_LOG_LEVEL=info` the log shows `fabric handle probe failed, using FD path`.
+
+---
+
 ## Known environment issues
 
 Some machines are configured in ways that make MORI slow without anything being wrong
@@ -642,7 +737,8 @@ performance problem that only shows up on one machine. The most common one:
   grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)
   ```
 
-  Both must print `=y`. See `.claude/skills/known-issues/SKILL.md`.
+  Both must print `=y`. In a container without the config, see Step 8 above. Details:
+  `.claude/skills/known-issues/SKILL.md`.
 
 ---
 
@@ -654,8 +750,8 @@ performance problem that only shows up on one machine. The most common one:
 - GPU arch and NIC type as reported by MORI
 - Kernels: JIT on first use (`~/.mori/jit/`)
 - `mori check` result — include full output, highlight any `[WARN]` or `[FAIL]`
-- Kernel `CONFIG_PCI_P2PDMA` / `CONFIG_DMABUF_MOVE_NOTIFY` — flag it if either is
-  missing (see Known environment issues above)
+- Kernel `CONFIG_PCI_P2PDMA` / `CONFIG_DMABUF_MOVE_NOTIFY` (Step 8) — flag it if either is
+  missing, and say when one could not be checked
 - Attach command (working directory set to the MORI source tree):
 
 ```bash

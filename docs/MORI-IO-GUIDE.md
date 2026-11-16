@@ -17,7 +17,7 @@ MORI-IO is AMD's point-to-point communication library that leverages GDR (GPU Di
 ## Design & Concepts
 
 - **IOEngine**: The primary interface for interacting with MORI-IO. It abstracts low-level details of P2P communications and provides high-level APIs for engine registration, memory registration, P2P transfer, etc.
-- **Backend**: A backend represents and manages a specific transfer medium (e.g., RDMA, XGMI, TCP). It must be created before any data transfer can occur over that medium.
+- **Backend**: A backend represents and manages a specific transfer medium (e.g., RDMA, XGMI, FABRIC, OFI). It must be created before any data transfer can occur over that medium.
 - **Engine Registration**: Before two engines can communicate, the remote engine must be registered with the local engine. This establishes the necessary context for initiating data transfers between them.
 - **Memory Registration**: Application memory must be registered with a local engine before it can participate in data transfer. This ensures the engine can access and manage the memory efficiently during communication.
 - **Read/Write**: One-sided transfer operations initiated by the initiator engine without active involvement from the target engine. These operations can move data directly between registered memory regions.
@@ -28,7 +28,7 @@ MORI-IO is AMD's point-to-point communication library that leverages GDR (GPU Di
 
 The image below shows a typical workflow of using MORI-IO.
 
-<img src="mori_io_workflow.jpg">
+![MORI-IO workflow](mori_io_workflow.jpg)
 
 ## Architecture
 
@@ -42,11 +42,11 @@ Inside MORI-IO, there are 5 components:
 |-----------|-------------|
 | **Slow Control Plane** | Exchanges metadata such as memory descriptors, RDMA QP numbers, and custom notification messages. Uses a built-in TCP server with a lightweight protocol (no 3rd-party libraries). |
 | **Fast Control Plane** | Exchanges metadata on the critical path of transfers (e.g., remote engine completion notifications). Uses RDMA network to minimize performance penalty. |
-| **Data Plane** | Transfers bulk data. Supported transports: RDMA, XGMI, TCP. |
+| **Data Plane** | Transfers bulk data. Supported transports: RDMA, XGMI, FABRIC, OFI. TCP exists only in [simulation mode](#simulation-mode). |
 | **Metadata Store** | Manages per-engine metadata. Each engine manages its own metadata (no centralized store). |
-| **Transport Store** | Manages multiple transfer backends (RDMA, TCP, XGMI). Provides failover if one backend is in a failure state. |
+| **Transport Store** | Manages multiple transfer backends (RDMA, XGMI, FABRIC, OFI). Provides failover if one backend is in a failure state. |
 
-<img src="mori_io_arch.png">
+![MORI-IO architecture](mori_io_arch.png)
 
 ## Python API Quick Reference
 
@@ -76,7 +76,7 @@ from mori.io import (
 
 | Enum | Values |
 |------|--------|
-| `BackendType` | `Unknown`, `XGMI`, `RDMA`, `TCP` |
+| `BackendType` | `Unknown`, `XGMI`, `RDMA`, `TCP` (simulation mode only), `FABRIC`, `OFI` (needs MORI built with libfabric) |
 | `MemoryLocationType` | `Unknown`, `CPU`, `GPU` |
 | `StatusCode` | `SUCCESS`, `INIT`, `IN_PROGRESS`, `ERR_INVALID_ARGS`, `ERR_NOT_FOUND`, `ERR_RDMA_OP`, `ERR_BAD_STATE`, `ERR_GPU_OP` |
 | `PollCqMode` | `POLLING`, `EVENT` |
@@ -86,7 +86,7 @@ from mori.io import (
 | Method | Description |
 |--------|-------------|
 | `get_engine_desc()` | Get engine descriptor for remote registration |
-| `create_backend(type, config)` | Create RDMA/XGMI/TCP backend |
+| `create_backend(type, config)` | Create an RDMA, XGMI, FABRIC or OFI backend (TCP only in simulation mode) |
 | `remove_backend(type)` | Remove a backend |
 | `register_remote_engine(desc)` | Register a remote engine |
 | `deregister_remote_engine(desc)` | Deregister a remote engine |
@@ -106,7 +106,7 @@ from mori.io import (
 |--------|-------------|
 | `InProgress()` | Transfer still in progress |
 | `Succeeded()` | Transfer completed successfully |
-| `Failed()` | Transfer failed |
+| `Failed()` | Transfer failed. Over RDMA it reports only once none of the transfer's WRs can still move data, so its buffers may then be reused. Exception: when a submission gives up and has to move a QP to the error state, RDMA WRITE packets already on the wire can still land in the remote buffer shortly after; only a fence on the receiving side closes that window |
 | `Code()` | Get status code |
 | `Message()` | Get status message |
 | `Wait()` | Block until transfer completes |
@@ -178,6 +178,7 @@ See `examples/io/example.py` for more complete examples including batch transfer
 | `RdmaBackendConfig.max_chunks_per_transfer` | Cap on chunks per transfer to bound WR/SQ usage (default `64`). Env: `MORI_IO_MAX_CHUNKS` |
 | `RdmaBackendConfig.num_nics_per_transfer` | Stripe a transfer across this many NICs (default `1`). Adaptive by memory type: GPU memory stays single-NIC (PCIe-bound); host memory stripes across NUMA-local NICs. Env: `MORI_IO_NUM_NICS_PER_TRANSFER` |
 | RC retry budget | The RC QP retry attributes applied at RTS, bounded so an out-of-range value is ignored rather than failing QP setup. `MORI_IO_QP_TIMEOUT` (0–31, default `14`; local ACK timeout = `4.096us * 2^timeout`; `0` disables it and lets an unresponsive peer stall indefinitely), `MORI_IO_QP_RETRY_CNT` (0–7, default `7`), `MORI_IO_QP_RNR_RETRY` (0–7, default `7`; `7` = retry RNR NAKs forever), `MORI_IO_QP_MIN_RNR_TIMER` (0–31, default `12`; IB-spec RNR NAK backoff). Each also honors a transport-wide `MORI_RDMA_QP_*` fallback (e.g. `MORI_RDMA_QP_TIMEOUT`) that tunes the shmem/CCO QPs sharing this path. The `MORI_IO_QP_*` name wins whenever it is set, including when its value is out of range — an invalid IO-specific value falls back to the built-in default, never to the `MORI_RDMA_QP_*` value. |
+| `MORI_IO_QP_MAX_RD_ATOMIC` | RDMA READs (and atomics) each QP keeps in flight, applied as `max_rd_atomic` at RTS. Unset (the default) keeps the device limit; a value of `0`, or at or above the device limit, is ignored. The ionic driver rounds the value down to `2^k - 1` (1, 3, 7, 15). On AMD AINIC firmware 1.117.5-a-77, a READ retransmitted while several are in flight can move the QP to the error state without a failed completion, or complete with part of its data missing. With `1` we saw neither the former nor, except under heavy receive backpressure with many QPs per NIC, the latter: it lowers the risk but does not remove it. Also honors the transport-wide `MORI_RDMA_QP_MAX_RD_ATOMIC` fallback, like the RC retry attributes. |
 | `MORI_IO_FAIL_ON_ASYNC_EVENT` | When enabled, a fatal verbs async event (QP/CQ/device fatal) fails every in-flight transfer on the affected endpoints and marks them degraded so later submissions fail fast instead of hanging on a dead QP. Default on; set `0` to disable and restore the previous hang-until-timeout behavior. |
 | `MORI_IO_PORT_DOWN_FAIL_FAST` | Default on. After local PORT_ERR, new transfers using that port fail synchronously until PORT_ACTIVE or a one-second port recheck confirms ACTIVE. Already admitted transfers and their notification SENDs keep their normal retry behavior. Set `0` to disable admission rejection; peer failure reporting remains enabled. Port recovery does not rebuild QPs that exhausted their retry budget. |
 | `IOEngineConfig.port = 0` | Auto-bind to a free port |

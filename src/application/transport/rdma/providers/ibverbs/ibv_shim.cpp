@@ -158,6 +158,16 @@ int ibv_dealloc_pd(struct ibv_pd* pd) {
   return fn ? fn(pd) : IbvUnavailable(-1);
 }
 
+// ---- address handles --------------------------------------------------------
+struct ibv_ah* ibv_create_ah(struct ibv_pd* pd, struct ibv_ah_attr* attr) {
+  MORI_IBV_RESOLVE(ibv_create_ah, "IBVERBS_1.1");
+  return fn ? fn(pd, attr) : IbvUnavailable<struct ibv_ah*>(nullptr);
+}
+int ibv_destroy_ah(struct ibv_ah* ah) {
+  MORI_IBV_RESOLVE(ibv_destroy_ah, "IBVERBS_1.1");
+  return fn ? fn(ah) : IbvUnavailable(-1);
+}
+
 // ---- memory regions ---------------------------------------------------------
 struct ibv_mr* ibv_reg_mr(struct ibv_pd* pd, void* addr, size_t length, int access) {
   MORI_IBV_RESOLVE(ibv_reg_mr, "IBVERBS_1.1");

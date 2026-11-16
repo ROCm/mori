@@ -35,13 +35,15 @@ Example::
 
 from .ops import *  # noqa: F401,F403
 from .ops import __all__ as _ops_all
-from .handles import DevComm, Window, Gda, Sdma
+from .handles import DevComm, Window, Gda, GdaDeferred, GdaCallerOrdered, Sdma
 from .runtime import get_extern_libs, get_cco_extern_libs
 
 __all__ = _ops_all + [
     "DevComm",
     "Window",
     "Gda",
+    "GdaDeferred",
+    "GdaCallerOrdered",
     "Sdma",
     "get_extern_libs",
     "get_cco_extern_libs",
