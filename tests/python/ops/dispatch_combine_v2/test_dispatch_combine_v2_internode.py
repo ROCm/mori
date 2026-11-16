@@ -225,9 +225,8 @@ def _parse_args(argv):
         default=None,
         choices=[name for name in _DTYPES if name != "fp4"],
     )
-    parser.add_argument(
-        "--quant-type", default="none", choices=["none", "fp8_direct_cast"]
-    )
+    # Only "none": the internode combine is unquantized. Kept for CI's callers.
+    parser.add_argument("--quant-type", default="none", choices=["none"])
     # QPs ALLOCATED per peer (num_qp_per_pe). How many a kernel sends on is a
     # separate choice: --active-qps, else the tuning table, else min(2, this).
     parser.add_argument("--num-qp", type=int, default=1)
@@ -464,7 +463,7 @@ def _golden(cfg, args, inp, idx, wts=None):
         .sum(dim=1, keepdim=True)
         .float()
     )
-    eps = 3e-1 if (args.quant_type != "none" or cfg.dispatch_dtype in _FP8) else 8e-3
+    eps = 3e-1 if cfg.dispatch_dtype in _FP8 else 8e-3
     source = _payload_f32(cfg, inp)
     return _Golden(
         unique,

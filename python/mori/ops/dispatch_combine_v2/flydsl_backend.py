@@ -106,7 +106,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         if (is_fp4 or is_fp8) and cfg.is_scatter:
             raise ValueError(
                 "plain fp4/fp8 token dtype is gather-only "
-                "(fp8 quant uses quant_type=fp8_direct_cast, not data_type)"
+                "(fp8 quant uses quant_type=fp8_blockwise, not data_type)"
             )
         topk = cfg.num_experts_per_token
         hidden_dim = cfg.hidden_dim
@@ -259,7 +259,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     off_comb_scales=(
                         arena.offset("comb_scales") if cfg.fp8_blockwise else 0
                     ),
-                    fp8_direct_cast=cfg.fp8_direct_cast,
                     fp8_blockwise=cfg.fp8_blockwise,
                     scale_dim=cfg.combine_scale_dim,
                 )

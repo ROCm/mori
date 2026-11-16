@@ -64,11 +64,11 @@ run_group() {
 }
 
 for EP in 2 4 8; do
-    run_group "EP${EP}: fp4 + fp8_direct_cast + zero-copy" \
-        --world-size "$EP" --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
+    run_group "EP${EP}: fp4 + none + zero-copy" \
+        --world-size "$EP" --dtype fp4 --combine-dtype bf16 --quant-type none
 
-    run_group "EP${EP}: fp4 + fp8_direct_cast + non-zero-copy" \
-        --world-size "$EP" --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast --zero-copy 0
+    run_group "EP${EP}: fp4 + none + non-zero-copy" \
+        --world-size "$EP" --dtype fp4 --combine-dtype bf16 --quant-type none --zero-copy 0
 
     if [[ "$FP8_DTYPE" != "none" ]]; then
         run_group "EP${EP}: ${FP8_DTYPE} + none + zero-copy" \

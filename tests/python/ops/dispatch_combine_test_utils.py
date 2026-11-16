@@ -357,17 +357,11 @@ def cross_dtype_skip_reason(quant_type, data_type, combine_data_type):
     Returns ``None`` when the combination is expected to work. Centralized here
     so every kernel-type test file agrees on which cells of the matrix are
     legitimately out of scope rather than genuine failures.
-
-    Note that the FP8/FP4 quant types constrain the *combine* element type, not
-    the dispatch one: ``fp8_direct_cast`` casts the bf16 combine payload to FP8
-    on the wire and is orthogonal to what dispatch transported.
     """
     if _is_fp4x2_dtype(combine_data_type):
         # unpack-and-compare has no packed-FP4 reference; combine verification
         # early-returns, so such a case would assert nothing.
         return "packed FP4 combine output is not verifiable by this harness"
-    if quant_type == "fp8_direct_cast" and combine_data_type is not torch.bfloat16:
-        return "fp8_direct_cast requires a bfloat16 combine dtype"
     if quant_type in ("fp8_blockwise", "fp4_blockwise") and (
         data_type is not torch.bfloat16 or combine_data_type is not torch.bfloat16
     ):
@@ -816,9 +810,7 @@ class EpDispatchCombineTestCase:
                 result_match = bool((diff <= tol).all())
             else:
                 atol, rtol = 1e-2, 1e-2
-                if quant == "fp8_direct_cast":
-                    atol, rtol = 1e-1, 1e-1
-                elif quant == "fp8_blockwise":
+                if quant == "fp8_blockwise":
                     # FP8 E4M3 quantization can exceed 5% after combine accumulation.
                     atol, rtol = 7e-2, 7e-2
                 result_match = torch.allclose(

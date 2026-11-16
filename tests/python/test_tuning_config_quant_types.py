@@ -50,7 +50,6 @@ from mori.ops.tuning_config import (
     "quant_type,expected",
     [
         (EpDispatchCombineQuantType.None_, "none"),
-        (EpDispatchCombineQuantType.Fp8DirectCast, "fp8_direct_cast"),
         (EpDispatchCombineQuantType.Fp8BlockwiseQuant, "fp8_blockwise"),
         (EpDispatchCombineQuantType.Fp4BlockwiseQuant, "fp4_blockwise"),
     ],
@@ -66,7 +65,6 @@ def test_enum_maps_to_config_str(quant_type, expected):
     [
         ("none", "none"),
         ("none_", "none"),
-        ("fp8_direct_cast", "fp8_direct_cast"),
         ("fp8_blockwise", "fp8_blockwise"),
         ("fp4_blockwise", "fp4_blockwise"),
         ("  FP4_BlockWise  ", "fp4_blockwise"),

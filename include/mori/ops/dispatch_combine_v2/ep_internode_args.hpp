@@ -66,7 +66,7 @@ using ep_index_t = int32_t;
 
 enum class EpQuantType {
   None = 0,
-  Fp8DirectCast = 1,
+  // Value 1 is unused; keep the remaining values stable across the JIT boundary.
   Fp8BlockwiseQuant = 2,
   Fp4BlockwiseQuant = 3,
 };
