@@ -397,7 +397,23 @@ def _cu_scaled_default():
     )
 
 
-def lookup(world_size, hidden_dim, topk, dtype="fp8"):
+# The quantized combine runs as a scatter, which takes one (comb_block, comb_warp)
+# for every call (its barrier counts blocks), per device and shape. EP8, fp8 1x128,
+# 2026-11-16, dispatch 64x16, combine us at 32 / 128 / 512 / 4096 tokens a rank:
+#   MI300X  256x4 (the default) 92.2 / 112.0 / 259.6 / 1770.9
+#           128x8               92.5 / 108.2 / 266.5 / 1907.0
+#           256x8              100.7 / 111.8 / 202.9 / 1122.7
+#   MI355X  48x16 (the default) 92.8 / 111.2 / 404.8 / 2845.1 (op bench, same shape)
+#           256x8               94.3 / 104.3 / 187.0 /  995.1
+#           256x16             107.3 / 109.8 / 144.1 /  825.7
+# fp8 1x32 is within 7% of 1x128 at every point.
+_QUANT_COMBINE = {
+    "mi300x": {(8, 7168, 8): (256, 8)},
+    "mi355x": {(8, 7168, 8): (256, 8)},
+}
+
+
+def lookup(world_size, hidden_dim, topk, dtype="fp8", quant=False):
     """Return {dispatch_block_num, combine_block_num, warp_num_per_block,
     combine_warp_num_per_block, schedule} for the current GPU, shape, and dtype.
 
@@ -411,7 +427,11 @@ def lookup(world_size, hidden_dim, topk, dtype="fp8"):
     buckets, ascending; the op precompiles the distinct (block, warp) variants
     and picks a bucket at runtime from cur_rank_num_token. dispatch_block_num /
     warp_num_per_block / combine_block_num / combine_warp_num_per_block are the
-    single-shot fallback used when schedule is None."""
+    single-shot fallback used when schedule is None.
+
+    `quant` (a quantized combine) takes the scatter's own single-shot combine
+    geometry from _QUANT_COMBINE where it has one; the scatter ignores the
+    schedule's combine half."""
     key = _device_key()
     if key is None or key not in _DEVICES:
         return _cu_scaled_default()
@@ -421,4 +441,7 @@ def lookup(world_size, hidden_dim, topk, dtype="fp8"):
     entry = dev_table.get((world_size, hidden_dim, topk))
     if entry:
         base["schedule"] = entry.get(dtype) or entry.get("fp8") or base["schedule"]
+    comb = _QUANT_COMBINE.get(key, {}).get((world_size, hidden_dim, topk))
+    if quant and comb:
+        base["combine_block_num"], base["combine_warp_num_per_block"] = comb
     return gpu_utils.fit_blocks_to_cus(base)

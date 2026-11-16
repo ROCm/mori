@@ -97,3 +97,20 @@ def test_every_schedule_is_well_formed(device):
         assert ceilings == sorted(set(ceilings)) and min(ceilings, default=1) >= 1, name
         for row in schedule:
             _check_geometry(name, cu, wave, *row[1:])
+
+
+@pytest.mark.parametrize("device", sorted(tc._QUANT_COMBINE))
+def test_quantized_combine_takes_its_own_single_shot_geometry(monkeypatch, device):
+    cu, wave = _DEVICE_LIMITS[device]
+    monkeypatch.setattr(tc, "_device_key", lambda: device)
+    monkeypatch.setattr(tc.gpu_utils, "cu_count", lambda: cu)
+    for shape, (block, warp) in tc._QUANT_COMBINE[device].items():
+        _check_geometry(f"{device} {shape}", cu, wave, 1, 1, block, warp)
+        plain = tc.lookup(*shape, dtype="bf16")
+        quant = tc.lookup(*shape, dtype="bf16", quant=True)
+        got = (quant["combine_block_num"], quant["combine_warp_num_per_block"])
+        assert got == (block, warp)
+        # the dispatch side and the schedule stay the dtype's
+        assert {k: v for k, v in quant.items() if not k.startswith("combine")} == {
+            k: v for k, v in plain.items() if not k.startswith("combine")
+        }
