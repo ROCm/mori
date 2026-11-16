@@ -781,6 +781,149 @@ __device__ void EpCombineScatterBody(EpArgs args) {
   }
 }
 
+// 16 B of T (eight bf16 or four f32) as f32, and back.
+template <typename T>
+__device__ __forceinline__ void EpVecToF32(uint4 v, float (&f)[16 / sizeof(T)]) {
+  if constexpr (sizeof(T) == 2) {
+    EpBf16x8ToF32(v, f);
+  } else {
+    f[0] = __uint_as_float(v.x);
+    f[1] = __uint_as_float(v.y);
+    f[2] = __uint_as_float(v.z);
+    f[3] = __uint_as_float(v.w);
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ uint4 EpF32ToVec(const float (&f)[16 / sizeof(T)]) {
+  if constexpr (sizeof(T) == 2) {
+    unsigned pk[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const unsigned lo = __builtin_bit_cast(unsigned short, T(f[2 * i]));
+      const unsigned hi = __builtin_bit_cast(unsigned short, T(f[2 * i + 1]));
+      pk[i] = lo | (hi << 16);
+    }
+    return make_uint4(pk[0], pk[1], pk[2], pk[3]);
+  } else {
+    return make_uint4(__float_as_uint(f[0]), __float_as_uint(f[1]), __float_as_uint(f[2]),
+                      __float_as_uint(f[3]));
+  }
+}
+
+// The unquantized scatter: each computing rank copies its post-expert rows into the
+// origin rank's landing row (myPe, origin token), and after the barrier the origin
+// rank sums its tokens' rows locally in f32, in top-k order as the gather does.
+template <EpCfg kCfg, typename T>
+__device__ void EpCombineScatterPlainBody(EpArgs args) {
+  constexpr int kNpes = kCfg.worldSize;
+  constexpr int kTopk = kCfg.numExpertPerToken;
+  constexpr int kHidden = kCfg.hiddenDim;
+  constexpr int kM = kCfg.maxTokPerRank;
+  constexpr int kVec = 16 / sizeof(T);
+  constexpr int kChunk = kCfg.waveSize * kVec;
+  constexpr int kSteps = (kHidden + kChunk - 1) / kChunk;
+  constexpr bool kFull = kHidden % kChunk == 0;
+  constexpr int kRowB = EpScatterRowBytes(kCfg);
+  constexpr int kPayB = EpScatterPayloadBytes(kCfg);
+  constexpr size_t kLandOff = EpScatterLandOff(kCfg);
+
+  const int myPe = args.rank;
+  const int laneId = threadIdx.x & (kCfg.waveSize - 1);
+  const int warpId = threadIdx.x / kCfg.waveSize;
+  const int globalWarpId = blockIdx.x * kCfg.warpPerBlock + warpId;
+  const int globalWarpNum = gridDim.x * kCfg.warpPerBlock;
+
+  const unsigned long long win = args.window;
+  const unsigned long long flag = args.xdbFlag[0];
+  const int totalRecv = args.totalRecvTokenNum[0];
+  const T* const inp = reinterpret_cast<const T*>(args.inpTokenBuf);
+  int* const recvToSrc = EpLocal<int>(win, args.offRecvToSrc);
+  float* const recvWts = EpLocal<float>(win, args.offOutWts);
+
+  // Stage 1: copy, one warp per (recv slot, step), two items a pass, loads first.
+  constexpr int kBatch = 2;
+  const int items = totalRecv * kSteps;
+  for (int u0 = globalWarpId; u0 < items; u0 += kBatch * globalWarpNum) {
+    int slot[kBatch], origin[kBatch], e[kBatch];
+    uint4 raw[kBatch];
+#pragma unroll
+    for (int b = 0; b < kBatch; ++b) {
+      const int u = min(u0 + b * globalWarpNum, items - 1);
+      slot[b] = u / kSteps;
+      e[b] = (u % kSteps) * kChunk + laneId * kVec;
+      // Written by the senders' dispatch; read at system scope.
+      origin[b] =
+          __hip_atomic_load(recvToSrc + slot[b], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      raw[b] = make_uint4(0, 0, 0, 0);
+      if (kFull || e[b] < kHidden)
+        raw[b] = *reinterpret_cast<const uint4*>(inp + (size_t)slot[b] * kHidden + e[b]);
+    }
+#pragma unroll
+    for (int b = 0; b < kBatch; ++b) {
+      if (u0 + b * globalWarpNum >= items) break;
+      char* const row = EpPeer<char>(win, origin[b] / kM, args.offOutTok) + kLandOff +
+                        ((size_t)myPe * kM + origin[b] % kM) * kRowB;
+      if (kFull || e[b] < kHidden)
+        *reinterpret_cast<uint4*>(row + (size_t)e[b] * sizeof(T)) = raw[b];
+      if constexpr (kCfg.useWeights) {
+        if (e[b] < kChunk && laneId < kTopk) {
+          reinterpret_cast<float*>(row + kPayB)[laneId] =
+              __hip_atomic_load(recvWts + (size_t)slot[b] * kTopk + laneId, __ATOMIC_RELAXED,
+                                __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+      }
+    }
+  }
+
+  EpCrossDeviceBarrier<kCfg>(args, flag);
+
+  if (args.numTokens == 0) return;
+
+  // Stage 3: sum each token's landed rows, one warp per (token, step).
+  const char* const land = EpLocal<char>(win, args.offOutTok) + kLandOff;
+  T* const out = reinterpret_cast<T*>(args.outTokenBuf);
+  for (int u = globalWarpId; u < args.numTokens * kSteps; u += globalWarpNum) {
+    const int tok = u / kSteps;
+    const int step = u % kSteps;
+    const int e = step * kChunk + laneId * kVec;
+    const bool active = kFull || e < kHidden;
+    int pe[kTopk];
+#pragma unroll
+    for (int j = 0; j < kTopk; ++j)
+      pe[j] = EpPeFromFlat<kCfg>(args.dispDestTokIdMap[tok * kTopk + j]);
+    uint4 q[kTopk];
+    float w[kTopk];
+#pragma unroll
+    for (int j = 0; j < kTopk; ++j) {
+      // An unrouted slot reads PE 0's row and is dropped below.
+      const char* const row = land + ((size_t)(pe[j] < kNpes ? pe[j] : 0) * kM + tok) * kRowB;
+      q[j] = make_uint4(0, 0, 0, 0);
+      w[j] = 0.0f;
+      if (active) q[j] = *reinterpret_cast<const uint4*>(row + (size_t)e * sizeof(T));
+      if constexpr (kCfg.useWeights) {
+        if (step == 0 && laneId < kTopk) w[j] = reinterpret_cast<const float*>(row + kPayB)[laneId];
+      }
+    }
+    float acc[kVec] = {};
+    float wacc = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kTopk; ++j) {
+      if (pe[j] >= kNpes) continue;
+      float f[kVec];
+      EpVecToF32<T>(q[j], f);
+#pragma unroll
+      for (int i = 0; i < kVec; ++i) acc[i] += f[i];
+      wacc += w[j];
+    }
+    if (active) *reinterpret_cast<uint4*>(out + (size_t)tok * kHidden + e) = EpF32ToVec<T>(acc);
+    if constexpr (kCfg.useWeights) {
+      if (args.outWeightsBuf && step == 0 && laneId < kTopk)
+        args.outWeightsBuf[tok * kTopk + laneId] = wacc;
+    }
+  }
+}
+
 }  // namespace v2
 }  // namespace ops
 }  // namespace mori

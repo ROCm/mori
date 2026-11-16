@@ -1183,6 +1183,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             comb["combine_scatter_q_group"] = cfg.quant_group
             if cfg.quant_element == "fp4":
                 comb["combine_scatter_fp4"] = True
+        elif cfg.is_scatter:
+            comb["combine_scatter_plain"] = True
         if self._card is not None and cfg.quant_type in _CARD_QUANT_TYPES:
             comb["card_combine"] = True
         geom = self._ll128_geom
@@ -1285,10 +1287,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         q = cfg.quant_type
         refused = self._quant_refusal(cfg, self._arch)
         bad.extend(refused)
-        if cfg.is_scatter and q == "none":
+        if cfg.is_scatter and q == "none" and self._is1250:
             bad.append(
-                "combine_mode='scatter' (gather only, except the push quant types "
-                f"{_PUSH_QUANT_TYPES})"
+                "combine_mode='scatter' on gfx125x (gather only, except the push quant "
+                f"types {_PUSH_QUANT_TYPES})"
             )
         if q != "none" and not refused:
             if cfg.combine_dtype != torch.bfloat16:

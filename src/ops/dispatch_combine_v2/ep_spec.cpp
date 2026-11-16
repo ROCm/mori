@@ -75,8 +75,7 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         req.cardCombine) {
       throw std::runtime_error(
           "mori v2 ep: combineScatterQGroup is the gfx942/gfx950 quantized scatter combine: 32 or "
-          "128, "
-          "a bf16 combine, and no push, ll128 or card combine beside it");
+          "128, a bf16 combine, and no push, ll128 or card combine beside it");
     }
     c.combineScatterQGroup = req.combineScatterQGroup;
     if (req.combineScatterFp4 && arch.rfind("gfx950", 0) != 0) {
@@ -86,6 +85,18 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     c.combineScatterFp4 = req.combineScatterFp4;
   } else if (kind == EpKernelKind::Combine && req.combineScatterFp4) {
     throw std::runtime_error("mori v2 ep: combineScatterFp4 needs combineScatterQGroup");
+  }
+
+  if (req.combineScatterPlain) {
+    if (kind != EpKernelKind::Combine || arch.rfind("gfx125", 0) == 0 ||
+        (req.dtype != EpDType::Bf16 && req.dtype != EpDType::Fp32) ||
+        req.combineScatterQGroup != 0 || req.combineFp4 || req.combineFp8 || req.combineBf16Push ||
+        req.ll128 || req.ll128CombineOnly || req.cardCombine) {
+      throw std::runtime_error(
+          "mori v2 ep: combineScatterPlain is the gfx942/gfx950 unquantized scatter combine: a "
+          "bf16 or fp32 combine, no quant group, and no push, ll128 or card combine beside it");
+    }
+    c.combineScatterPlain = true;
   }
 
   if (req.replay) {
@@ -337,6 +348,7 @@ std::string EpDispatchSpec::EntryName(const Cfg& cfg) {
   return EpEntryName(cfg, cfg.replay ? "dispatch_replay" : "dispatch");
 }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
+  if (cfg.combineScatterPlain) return EpEntryName(cfg, "combine_scatter");
   if (cfg.combineScatterQGroup) {
     const bool g32 = cfg.combineScatterQGroup == 32;
     if (cfg.combineScatterFp4) return EpEntryName(cfg, g32 ? "combine_fp4x32" : "combine_fp4x128");
@@ -358,7 +370,9 @@ std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
         "mori v2 ep: the push combine is gfx125x only (it moves every token through TDM)");
   }
   return RenderEpSource(cfg, EntryName(cfg),
-                        EpCombineScatter(cfg) ? "EpCombineScatterBody" : "EpCombineBody",
+                        !EpCombineScatter(cfg)    ? "EpCombineBody"
+                        : cfg.combineScatterPlain ? "EpCombineScatterPlainBody"
+                                                  : "EpCombineScatterBody",
                         "EpCombine1250xBody");
 }
 
