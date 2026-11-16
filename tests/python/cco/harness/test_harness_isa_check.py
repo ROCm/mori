@@ -317,3 +317,41 @@ def test_non_gfx950_target_warns(tmp_path):
     path.write_text(path.read_text().replace("gfx950", "gfx1250"))
     status, report = check(path)
     assert status == 0 and "target" in codes(report, "WARN")
+
+
+def unrolled(early_wait=False):
+    """K fully unrolled, as FlyDSL emits it for a compile-time K: no back edge at all."""
+    lines = []
+    for step in range(2):
+        lines += k_loop(f".LBB0_{step}", early_wait=early_wait)[1:-3]
+    return lines
+
+
+def test_unrolled_k_loop_is_measured_over_the_mfma_span(tmp_path):
+    status, report = check(dump(tmp_path, unrolled() + EPILOGUE))
+    assert status == 0
+    kloop = report["kernels"][0]["k_loop"]
+    assert (
+        kloop["kind"] == "unrolled" and kloop["mfma"] == 16 and kloop["header"] is None
+    )
+    assert report["kernels"][0]["loops"] == []
+
+
+def test_unrolled_latency_loss_against_the_baseline_fails(tmp_path):
+    base = dump(tmp_path, unrolled(), name="comm_off")
+    fused = dump(tmp_path, unrolled(early_wait=True) + EPILOGUE, name="fused")
+    status, report = check(fused, "--baseline", str(base))
+    assert status == 1 and "k-loop-latency-hiding" in codes(report, "FAIL")
+
+
+def test_loop_against_unrolled_baseline_is_not_compared(tmp_path):
+    base = dump(tmp_path, unrolled(), name="comm_off")
+    fused = dump(tmp_path, k_loop(".LBB0_1"), name="fused")
+    status, report = check(fused, "--baseline", str(base))
+    assert status == 0 and codes(report, "WARN") == ["k-loop-shape"]
+
+
+def test_acquire_in_a_poll_loop_says_how_to_fix_it(tmp_path):
+    body = poll_loop(".LBB0_3", extra=["\tbuffer_inv sc1"])
+    _, report = check(dump(tmp_path, body))
+    assert "spin with relaxed" in report["findings"][0]["message"]

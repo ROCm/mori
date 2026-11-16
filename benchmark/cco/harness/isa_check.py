@@ -35,7 +35,9 @@ FLYDSL_DUMP_DIR=<dir>`` writes and reports, per kernel:
   (``nt``) or plain;
 * the main K loop: its MFMA count and mnemonics, the position of its first MFMA,
   and the mean distance, in instructions, from a vector-memory load to the
-  ``s_waitcnt`` that covers it.
+  ``s_waitcnt`` that covers it. When K is a compile-time constant FlyDSL unrolls the
+  loop and there is no back edge; the same metrics are then taken over the span from
+  the first to the last MFMA.
 
 With ``--baseline`` (the same kernel compiled with the communication code off) it
 also compares the resources and the K loop.
@@ -309,8 +311,12 @@ def waitcnt_vmcnt(ins):
     return None
 
 
-def kloop_metrics(func, loop):
-    body = func.instrs[loop.start : loop.end + 1]
+def stream_metrics(body, cyclic):
+    """MFMA count and order, and how far each vector-memory load is from the wait that covers it.
+
+    ``cyclic`` treats ``body`` as a loop body (a load may be waited for on the next
+    trip); otherwise the stream is scanned once, as straight-line code.
+    """
     size = len(body)
     mfma_ops = [ins.op for ins in body if MFMA_RE.match(ins.op)]
     first = next((k for k, ins in enumerate(body) if MFMA_RE.match(ins.op)), None)
@@ -319,8 +325,9 @@ def kloop_metrics(func, loop):
         if not LOAD_RE.match(ins.op):
             continue
         issued_after, found = 0, None
-        for step in range(1, 2 * size + 1):
-            nxt = body[(k + step) % size]
+        steps = range(1, 2 * size + 1) if cyclic else range(1, size - k)
+        for step in steps:
+            nxt = body[(k + step) % size] if cyclic else body[k + step]
             if VMEM_RE.match(nxt.op):
                 issued_after += 1
                 continue
@@ -333,8 +340,6 @@ def kloop_metrics(func, loop):
         else:
             distances.append(found)
     return {
-        "header": loop.header,
-        "line": loop.line,
         "instructions": size,
         "mfma": len(mfma_ops),
         "mfma_ops": mfma_ops,
@@ -343,6 +348,26 @@ def kloop_metrics(func, loop):
         "mean_load_wait": sum(distances) / len(distances) if distances else None,
         "loads_not_waited_in_loop": unresolved,
     }
+
+
+def kloop_metrics(func, loop):
+    metrics = stream_metrics(func.instrs[loop.start : loop.end + 1], cyclic=True)
+    return {"kind": "loop", "header": loop.header, "line": loop.line, **metrics}
+
+
+def region_metrics(func):
+    """The same metrics over the span from the first to the last MFMA, for a fully unrolled K loop.
+
+    FlyDSL unrolls the main loop when K is a compile-time constant, which leaves no back
+    edge to find. ``first_mfma`` then counts from the start of the kernel.
+    """
+    at = [i for i, ins in enumerate(func.instrs) if MFMA_RE.match(ins.op)]
+    if not at:
+        return None
+    body = func.instrs[at[0] : at[-1] + 1]
+    metrics = stream_metrics(body, cyclic=False)
+    metrics["first_mfma"] = at[0]
+    return {"kind": "unrolled", "header": None, "line": body[0].line, **metrics}
 
 
 def resources(dump, name):
@@ -390,6 +415,12 @@ class Report:
 
 
 def _cache_op_level(op, loop):
+    if op == "buffer_inv" and loop.kind == "poll":
+        return (
+            "FAIL",
+            "an acquire on every trip of a poll loop: spin with relaxed loads or atomics, "
+            "then acquire once (G950-SYNC-03)",
+        )
     if op == "buffer_inv":
         return "FAIL", "an acquire inside a loop runs once per iteration (G950-SYNC-03)"
     if loop.kind in ("k-loop", "poll") or loop.mfma:
@@ -586,7 +617,7 @@ def analyze_kernel(dump, name, report, require_write_through):
         "calls": calls,
         "cache_ops": cache_ops,
         "stores": stores,
-        "k_loop": kloop_metrics(func, kloop) if kloop else None,
+        "k_loop": kloop_metrics(func, kloop) if kloop else region_metrics(func),
     }
 
 
@@ -607,7 +638,15 @@ def compare(cur, base, report, max_drop):
         report.add(
             "WARN",
             "k-loop-missing",
-            "no K loop on one side; the K-loop comparison is skipped",
+            "no MFMA on one side; the K-loop comparison is skipped",
+            where,
+        )
+        return delta
+    if k["kind"] != kb["kind"]:
+        report.add(
+            "WARN",
+            "k-loop-shape",
+            f"the K loop is {k['kind']} here and {kb['kind']} in the baseline; the comparison is skipped",
             where,
         )
         return delta
@@ -678,13 +717,23 @@ def _text_report(dump, kernels, base_dump, deltas, report):
                 if kl["mean_load_wait"] is not None
                 else "n/a"
             )
+            if kl["kind"] == "loop":
+                where_text = f"{kl['header']} (line {kl['line']})"
+                first_text = f"first MFMA at +{kl['first_mfma']}"
+                after = "the loop"
+            else:
+                where_text = f"unrolled, MFMA span from line {kl['line']}"
+                first_text = (
+                    f"first MFMA at instruction {kl['first_mfma']} of the kernel"
+                )
+                after = "the span"
             out.append(
-                f"  K loop     {kl['header']} (line {kl['line']}): {kl['instructions']} instructions, "
-                f"{kl['mfma']} MFMA, first MFMA at +{kl['first_mfma']}, {kl['loads']} loads, "
-                f"mean load-to-wait {mean} ({kl['loads_not_waited_in_loop']} waited after the loop)"
+                f"  K loop     {where_text}: {kl['instructions']} instructions, {kl['mfma']} MFMA, "
+                f"{first_text}, {kl['loads']} loads, mean load-to-wait {mean} "
+                f"({kl['loads_not_waited_in_loop']} waited after {after})"
             )
         else:
-            out.append("  K loop     none found")
+            out.append("  K loop     no MFMA")
     if base_dump is not None:
         out.append(f"baseline: {base_dump.path}")
         if deltas:

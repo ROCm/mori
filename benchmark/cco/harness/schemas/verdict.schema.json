@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cco-fusion/verdict/v1",
+  "title": "Verifier verdict",
+  "description": "Written by the cco-fusion-verifier agent. See .claude/skills/cco-fusion-loop/templates/verdict.example.json.",
+  "type": "object",
+  "required": [
+    "task",
+    "candidate",
+    "commit",
+    "identity",
+    "environment",
+    "correctness",
+    "verdict"
+  ],
+  "properties": {
+    "task": {
+      "type": "string"
+    },
+    "candidate": {
+      "type": "string"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "verifier": {
+      "type": "object"
+    },
+    "identity": {
+      "type": "object",
+      "required": [
+        "code_objects_match"
+      ],
+      "properties": {
+        "code_objects_match": {
+          "type": "boolean"
+        },
+        "mismatches": {
+          "type": "array"
+        }
+      }
+    },
+    "environment": {
+      "type": "object"
+    },
+    "isa_check": {
+      "type": "object",
+      "properties": {
+        "result": {
+          "enum": [
+            "PASS",
+            "FAIL"
+          ]
+        },
+        "report": {
+          "type": "string"
+        }
+      }
+    },
+    "correctness": {
+      "type": "object",
+      "required": [
+        "rule",
+        "fused_path_ran",
+        "failures"
+      ],
+      "properties": {
+        "rule": {
+          "type": "string"
+        },
+        "held_out": {
+          "type": "object"
+        },
+        "fused_path_ran": {
+          "type": "boolean"
+        },
+        "timeouts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "timing": {
+      "type": "object"
+    },
+    "not_covered": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "verdict": {
+      "enum": [
+        "meets-contract",
+        "fails-correctness",
+        "slower",
+        "inconclusive"
+      ]
+    },
+    "runs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

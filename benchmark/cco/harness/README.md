@@ -13,12 +13,12 @@ or an `srun` into an allocation the user already holds.
 | File | Status | Used in | Purpose |
 |---|---|---|---|
 | `contract.example.yaml` | exists | step 0 | template for a task's contract |
-| `preflight.py` | planned | every run | record the environment, refuse a run that cannot be valid |
-| `run.py` | planned | steps 1, 3, 4 | one measurement entry for every operator: runs the benchmark on the user's GPUs with an idle check, a timeout and cleanup of its own processes, and writes one result schema |
+| `preflight.py` | exists | every run | record the environment, refuse a run that cannot be valid |
+| `run.py` | exists | steps 1, 3, 4 | one measurement entry: modes interleaved in one launch on the user's GPUs, with preflight, a timeout and cleanup of its own processes; gemm_ar for now |
 | `bound.py` | exists | step 1 | split-path phase times to `T_ideal`, `T_real` and go or no-go |
 | `bounds.example.yaml` | exists | step 1 | `bound.py` input: the gemm_ar worked example (`G950-GAR-01`) |
 | `isa_check.py` | exists | steps 3, 4 | the ISA check on a FlyDSL `*_final_isa.s` |
-| `schemas/` | planned | all | JSON schemas for result, candidate and verdict files |
+| `schemas/` | exists | all | JSON schemas for `run.py`'s result, the candidate manifest and the verdict |
 
 ## bound.py
 
@@ -48,8 +48,10 @@ Per kernel, from a FlyDSL `*_final_isa.s`: resources from the `amdhsa.kernels` m
 `s_sleep`), K loop (own MFMAs), outer or other; every `buffer_wbl2` / `buffer_inv` with
 the loop around it, following calls the dump resolves (`@rel32` / `@gotpcrel32`
 symbols); stores by cache policy; and the main K loop's MFMA count, first-MFMA position
-and mean load-to-`s_waitcnt` distance. With `--baseline` it compares resources and the K
-loop.
+and mean load-to-`s_waitcnt` distance. FlyDSL fully unrolls the K loop when K is a
+compile-time constant (the gemm_ar kernels at K=2048 have no back edge); the same metrics
+are then taken over the span from the first to the last MFMA. With `--baseline` it
+compares resources and the K loop.
 
 | Verdict | When |
 |---|---|
@@ -61,34 +63,55 @@ the dump cannot be read with confidence. It does not know which stores write a c
 window, and the distance assumes in-order completion of vector-memory operations: use it
 to compare two builds of one kernel.
 
-## Planned interfaces
+## preflight.py
 
-### preflight.py
+`python preflight.py [--out env.json] [--repo <mori checkout>] [--require-arch gfx950] [--allow-busy] [--no-require-sdma]`
 
-`python preflight.py --out <run-dir>/env.json`
+Never initialises HIP: it finds `mori`, `torch` and `flydsl` without importing them and
+asks the GPUs through `rocminfo` and `rocm-smi`. It records the host, the repository
+commit, where the three packages load from and their versions, the `BUILD_CCO_SDMA` flag
+baked into the installed mori (`mori/cco/device/_build_flags.py`), the ROCm version, the
+GPUs, the processes on them, the link types and `CONFIG_DMABUF_MOVE_NOTIFY`.
 
-Records the mori commit and build flags, `MORI_ENABLE_SDMA`, ROCm, torch, FlyDSL, the
-GPU model and gfx architecture, the node, the image, the xGMI topology and the processes
-on each GPU. Exits non-zero when the architecture is not the one the facts cover, when
-SDMA is not built or not enabled (`G950-ENV-01`), or when a GPU is in use. Warns on the
-environment issues in `.claude/skills/known-issues` (`G950-ENV-03`, `G950-ENV-04`).
+| Verdict | When |
+|---|---|
+| FAIL (exit 1) | no GPU, or a GPU of another architecture; a process on a GPU, or `rocm-smi` unreadable (unknown is not idle; `--allow-busy` makes it a WARN); mori not built with SDMA or `MORI_ENABLE_SDMA` not `1` (`G950-ENV-01`); mori not importable |
+| WARN | ROCm 7.2.x (`G950-ENV-04`); `CONFIG_DMABUF_MOVE_NOTIFY` off or unknown (`G950-ENV-03`); a link that is not xGMI; mori loaded from outside `--repo`; uncommitted changes |
 
-### run.py
+## run.py
 
-`python run.py --contract <contract.yaml> --op gemm_ar --mode <mode> --m <M> [--set key=value ...] --out <run-dir>`
+`python run.py --op gemm_ar --modes <m1,m2,...> [--baseline <mode>] [--rounds 3] [--aa] [--bench-args "<shape and switches>"] [--nproc 8] [--timeout 1800] [--launcher "<prefix>"] [--dump-isa] --out <run-dir>`
 
-Wraps the operator's benchmark (`benchmark/cco/flydsl/<op>/bench_*.py --json-out`), one
-shape per process, with interleaved rounds and the maximum over ranks. Writes
-`result.json` with the command, the scope (commit, versions, node), the switches, the
-code-object hashes, the correctness verdict, the per-round times, the median and the
-spread. Modes follow the benchmark (`gemm-only`, `split-sdma`, `split-lsa`, `split-rccl`,
-`fused-sdma`, ...) plus `concurrent`: the GEMM and the collective on two streams on
-independent buffers, for the contention measurement in step 1. gemm_ar first; other
-operators as their benchmarks gain the same modes.
+One invocation is one shape (`G950-MEAS-03`): `--bench-args` sets it, and the record keeps
+the benchmark's own report of it. It launches `torchrun` once, through
+`tests/python/cco/bench_runs.py`, so every mode runs in the same processes, interleaved
+round by round; every mode is compared with `--baseline` (default: the first), and `--aa`
+runs the baseline again at the end of each round for the noise band. Times are each
+run's maximum over ranks; the summary gives the median, min, max and spread per mode.
 
-It runs each command where the session runs, or behind `environment.launcher` from the
-contract, unchanged. Before an 8-rank run it checks that the GPUs are idle
-(`preflight.py`) and waits about 10 s after the previous one (`G950-ENV-05`). Each command
-runs in its own process group with a timeout and its output logged; on timeout it
-terminates that process group only. It never allocates nodes, never kills by name and
-never resets a GPU.
+Before the launch it runs `preflight.py` and stops on a refusal, and for multi-rank runs it
+waits until 10 s have passed since the previous one it started on this host
+(`G950-ENV-05`). The launch runs in its own process group, under coreutils `timeout` on the
+executing side and a timeout here; on timeout it terminates that group and every process
+it started, including those in other sessions. It never allocates nodes.
+
+`--launcher` is a prefix such as `docker exec <container>`: the command names the
+repository by absolute path, so the repository must sit at the same path on both sides,
+and cleanup on timeout is left to the `timeout` it runs there. `--dump-isa` makes FlyDSL
+write every kernel's final ISA into `<run-dir>/isa` (with a fresh runtime cache) and
+records each with its sha256 and the result of `isa_check.py`.
+
+It writes `result.json` (`schemas/result.schema.json`), `env.json`, `stdout.log` and
+`stderr.log`, and refuses to overwrite an existing `result.json` without `--force`. Exit
+status: 0 when every run completed and validated, 1 when a run failed validation, 2 for a
+usage error or a preflight refusal, 3 for a timeout or missing results.
+
+Only `gemm_ar` is registered. The other operator benchmarks (`gemm_ag`, `gemm_a2a`,
+`ag_gemm`, `a2a_gemm`) have the same `build_parser()` / `run()` / `RESULT_JSON` shape and
+report the maximum over ranks as `us`; each needs one entry in `OPS` and a run on GPUs.
+
+## schemas/
+
+JSON Schema (2020-12) for `run.py`'s `result.json`, the implementer's candidate manifest
+and the verifier's verdict. The templates in `.claude/skills/cco-fusion-loop/templates/`
+carry every field these schemas require; the tests check both.

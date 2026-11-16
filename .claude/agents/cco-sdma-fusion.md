@@ -26,7 +26,8 @@ the least code. You do not accept your own candidate; a separate verifier measur
   `.claude/skills/cco-fusion-loop/reference/design-checklist.md`, each with a predicted
   time per bucket and the measurement that would falsify it.
 - **Step 3:** build the chosen candidate behind switches, then run the correctness gate,
-  the ISA check (`benchmark/cco/harness/isa_check.py`), the measurement and the gap
+  the ISA check (`benchmark/cco/harness/isa_check.py`), the measurement
+  (`benchmark/cco/harness/run.py`) and the gap
   decomposition in
   `.claude/skills/cco-fusion-loop/reference/diagnosis.md`. One change per iteration,
   each recorded in `<records>/decisions.md`.

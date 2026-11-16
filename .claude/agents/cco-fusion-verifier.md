@@ -68,7 +68,8 @@ input is missing or inconsistent, stop and return the list of problems.
 4. **Timing.**
    - Measure the contract's baseline and the candidate in the same session, interleaved,
      maximum over ranks, with an A/A run for the noise band, cold or hot as the contract
-     says.
+     says: `benchmark/cco/harness/run.py --baseline <baseline mode> --aa --rounds 3`,
+     one invocation per shape, its `result.json` kept under `<records>/runs/`.
    - Cover every target bucket, plus the M points around the crossover.
    - Compute the speedup and `η_ideal`, `η_real` from `<records>/bounds.md`. If today's
      split-path components differ from those in `bounds.md` by more than the noise band,

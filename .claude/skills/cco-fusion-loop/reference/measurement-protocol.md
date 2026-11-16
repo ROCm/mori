@@ -4,6 +4,11 @@ Used by the implementer for development runs and by the verifier for acceptance 
 Each rule below once produced a confident wrong number; the gemm_ar README's
 "Measurement traps" section tells those stories.
 
+`benchmark/cco/harness/run.py` applies the launch-side rules: modes interleaved in one
+process, the maximum over ranks, an A/A pair (`--aa`), one shape per invocation, the 10 s
+gap, a timeout with cleanup, and `preflight.py` before the launch. Cold or hot, eager or
+graph, and the M grid are chosen by the caller through the modes and `--bench-args`.
+
 - **Graph replay, several calls per graph.** A single-call graph has a floor of about
   13.4 µs (`G950-MEAS-01`). Use `benchmark/cco/flydsl/gemm_ar/timing.py`.
 - **Maximum over ranks** for each iteration. Do not align the ranks' start times with an

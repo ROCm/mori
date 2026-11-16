@@ -74,7 +74,8 @@ shapes, baseline, correctness rule, targets, budget or protocol needs approval a
 ### Step 1. Baseline and bounds
 
 Measure the fastest GEMM, the fastest collective, the split path end to end with its
-in-pipeline phase times, and the GEMM and collective running concurrently. Compute
+in-pipeline phase times, and the GEMM and collective running concurrently
+(`benchmark/cco/harness/run.py` for the end-to-end modes). Compute
 `T_ideal` and `T_real` per bucket (with an `n` sweep), estimate the other levers
 (a narrower wire, another collective, a faster GEMM), and decide go or no-go. Method and
 a worked example: [reference/bounds.md](reference/bounds.md);
