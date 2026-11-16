@@ -1,0 +1,104 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+"""The combine quant types a config accepts, and the wire format each one names.
+
+A quantized combine sends each expert row as fp8 or fp4 elements plus per-group
+scales. The explicit names say the element and the group:
+
+  fp8_blockwise_1x32   fp8 elements, one E8M0 scale per 32 elements (MXFP8)
+  fp4_blockwise_1x32   e2m1 elements, one E8M0 scale per 32 elements (MXFP4)
+  fp8_blockwise_1x128  fp8 elements, one f32 scale per 128 elements
+  fp4_blockwise_1x128  e2m1 elements, one f32 scale per 128 elements
+
+fp8 is the arch's own fp8 (e4m3fnuz on gfx942, e4m3fn on gfx950 and gfx125x).
+
+``fp8_blockwise`` and ``fp4_blockwise`` name the arch's default group: 1x32 on
+gfx125x and 1x128 elsewhere, which is what each meant before the explicit names
+existed. ``fp4_blockwise_fp32`` is the old name of fp4_blockwise_1x128.
+
+Light on purpose (no torch, no JIT): the config and the tuning tables both resolve
+names through it.
+"""
+
+from __future__ import annotations
+
+# Explicit name -> (element, group size). 1x32 groups carry an E8M0 scale, 1x128
+# blocks an f32 one.
+QUANT_FORMATS = {
+    "fp8_blockwise_1x32": ("fp8", 32),
+    "fp4_blockwise_1x32": ("fp4", 32),
+    "fp8_blockwise_1x128": ("fp8", 128),
+    "fp4_blockwise_1x128": ("fp4", 128),
+}
+# Names that always mean one explicit format.
+_ALIASES = {"fp4_blockwise_fp32": "fp4_blockwise_1x128"}
+# Names whose group follows the arch.
+_ARCH_DEFAULT = {"fp8_blockwise": "fp8", "fp4_blockwise": "fp4"}
+
+QUANT_TYPES = ("none", *_ARCH_DEFAULT, *QUANT_FORMATS, *_ALIASES)
+
+
+def default_group(gfx125x: bool) -> int:
+    """The group fp8_blockwise / fp4_blockwise resolve to on this arch."""
+    return 32 if gfx125x else 128
+
+
+def resolve_quant_type(name: str, gfx125x: bool) -> str:
+    """The explicit name (or "none") that ``name`` means on this arch."""
+    if name == "none" or name in QUANT_FORMATS:
+        return name
+    if name in _ALIASES:
+        return _ALIASES[name]
+    if name in _ARCH_DEFAULT:
+        return f"{name}_1x{default_group(gfx125x)}"
+    raise ValueError(f"quant_type must be one of {QUANT_TYPES}, got {name!r}")
+
+
+def names_for(formats, gfx125x: bool) -> dict[str, str]:
+    """Every accepted name that resolves to one of ``formats`` (plus "none"),
+    mapped to what it resolves to on this arch."""
+    served = set(formats) | {"none"}
+    return {
+        name: resolve_quant_type(name, gfx125x)
+        for name in QUANT_TYPES
+        if resolve_quant_type(name, gfx125x) in served
+    }
+
+
+def quant_element(name: str) -> str | None:
+    """ "fp8" / "fp4" for an explicit name, None for "none"."""
+    return QUANT_FORMATS[name][0] if name in QUANT_FORMATS else None
+
+
+def quant_group(name: str) -> int:
+    """Elements per scale for an explicit name, 0 for "none"."""
+    return QUANT_FORMATS[name][1] if name in QUANT_FORMATS else 0
+
+
+def is_gfx125x() -> bool:
+    """Whether the JIT targets gfx125x; False when the arch cannot be read."""
+    try:
+        from mori.jit.core import _FASTPATH_ARCH_PREFIX, _target_arch
+
+        return _target_arch().startswith(_FASTPATH_ARCH_PREFIX)
+    except Exception:
+        return False

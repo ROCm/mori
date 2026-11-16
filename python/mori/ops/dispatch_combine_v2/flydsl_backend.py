@@ -28,6 +28,7 @@ device tensors surfaced to the caller via from_gpu_ptr.
 import torch
 
 import flydsl.expr as fx
+from mori.jit.core import _target_arch
 from mori.tensor_utils import from_gpu_ptr
 
 from .intranode_kernels import (
@@ -56,6 +57,11 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
     """FlyDSL-kernel EP op. The full v2 feature set: gather + scatter combine,
     fp8/fp4, quant, StdMoE, per-token scales, routing replay."""
 
+    @classmethod
+    def _quant_formats(cls, arch):
+        # The scatter combine's fp8 codec is wave64-only.
+        return () if arch.startswith("gfx125") else ("fp8_blockwise_1x128",)
+
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """This backend has no cross-node path.
 
@@ -69,13 +75,11 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 "selects the internode path, which only the 'hip' backend "
                 "implements; pass kernel_backend='hip'",
             )
-        if cfg.quant_type in _FP4_QUANT_TYPES:
-            return (
-                f"quant_type={cfg.quant_type!r} is the hip backend's gfx125x combine; "
-                "pass kernel_backend='hip'",
-            )
-        # The config lets an asymmetric dtype through with fp8_blockwise for the
-        # hip push combine; this backend's fp8_blockwise scatter has no such path.
+        refused = self._quant_refusal(cfg, _target_arch())
+        if refused:
+            return refused
+        # The config lets an asymmetric dtype through with a quantized combine
+        # for the hip push combine; this backend's quantized scatter has no such path.
         if cfg.is_asymmetric_dtype and cfg.quant_type != "none":
             return (
                 f"quant_type={cfg.quant_type!r} with an asymmetric dtype is the hip "

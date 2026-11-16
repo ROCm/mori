@@ -67,6 +67,7 @@ from mori.tensor_utils import from_gpu_ptr
 from . import ep_plans as cb
 from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
+from .quant_types import resolve_quant_type
 from .internode_regions import (
     asyncll_regions,
     asyncll_seg_layout,
@@ -305,20 +306,32 @@ def _combine_info_cached(fields: tuple) -> dict:
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
-PUSH_QGROUP = {"fp4_blockwise": 32, "fp4_blockwise_fp32": 128, "fp8_blockwise": 32}
+PUSH_QGROUP = {
+    "fp4_blockwise_1x32": 32,
+    "fp4_blockwise_1x128": 128,
+    "fp8_blockwise_1x32": 32,
+}
 # The combine request fields each push quant type turns on.
 _PUSH_REQUEST = {
-    "fp4_blockwise": (("combine_fp4", 1),),
-    "fp4_blockwise_fp32": (("combine_fp4", 1), ("combine_fp4_f32_scale", 1)),
-    "fp8_blockwise": (("combine_fp8", 1),),
+    "fp4_blockwise_1x32": (("combine_fp4", 1),),
+    "fp4_blockwise_1x128": (("combine_fp4", 1), ("combine_fp4_f32_scale", 1)),
+    "fp8_blockwise_1x32": (("combine_fp8", 1),),
 }
+
+
+def _push_quant(name):
+    """The explicit push quant type `name` means; the push combine is gfx125x."""
+    return resolve_quant_type(name, gfx125x=True)
 
 
 def push_wire_nbytes(cfg) -> int:
     """Bytes of one landed row of the push combine (EpCombinePushWireBytes): the
     plan's info["pushWireBytes"], asked of describe(). Reads cfg.hidden_dim and
     cfg.quant_type; the push combine, and so this, is gfx125x only."""
-    fields = (("hidden_dim", int(cfg.hidden_dim)), *_PUSH_REQUEST[cfg.quant_type])
+    fields = (
+        ("hidden_dim", int(cfg.hidden_dim)),
+        *_PUSH_REQUEST[_push_quant(cfg.quant_type)],
+    )
     return _combine_info_cached(tuple(sorted(fields)))["pushWireBytes"]
 
 
@@ -331,7 +344,7 @@ def push_land_rows(cfg) -> int:
         ("world_size", int(cfg.world_size)),
         ("max_tok_per_rank", int(cfg.max_num_inp_token_per_rank)),
         ("num_expert_per_token", int(cfg.num_experts_per_token)),
-        *_PUSH_REQUEST["fp4_blockwise"],
+        *_PUSH_REQUEST["fp4_blockwise_1x32"],
     )
     return _combine_info_cached(tuple(sorted(fields)))["pushLandRows"]
 
@@ -339,7 +352,7 @@ def push_land_rows(cfg) -> int:
 _CARD_COMBINE_ROWS_MAX = 2048
 
 
-_CARD_QUANT_TYPES = ("fp8_blockwise", "fp4_blockwise")
+_CARD_QUANT_TYPES = ("fp8_blockwise_1x32", "fp4_blockwise_1x32")
 
 
 def _card_layout(cfg):
@@ -1159,12 +1172,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             if self._card["pull_blocks"]:
                 disp["card_pull_blocks"] = self._card["pull_blocks"]
         comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
-        if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
-            comb["combine_fp4"] = True
-        if cfg.quant_type == "fp4_blockwise_fp32":
-            comb["combine_fp4_f32_scale"] = True
-        if cfg.quant_type == "fp8_blockwise":
-            comb["combine_fp8"] = True
+        for field, on in _PUSH_REQUEST.get(cfg.quant_type, ()):
+            comb[field] = bool(on)
         if self._card is not None and cfg.quant_type in _CARD_QUANT_TYPES:
             comb["card_combine"] = True
         geom = self._ll128_geom
@@ -1242,6 +1251,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         return bad
 
+    @classmethod
+    def _quant_formats(cls, arch):
+        # The push combine is gfx125x's; the gfx942/gfx950 combine is unquantized.
+        return _PUSH_QUANT_TYPES if arch.startswith("gfx125") else ()
+
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
         if cfg.async_ll:
@@ -1256,17 +1270,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if cfg.combine_dtype not in _COMBINE_DTYPES:
             bad.append(f"combine dtype {cfg.combine_dtype} (have bf16, fp32)")
         q = cfg.quant_type
-        push = q in _PUSH_QUANT_TYPES
-        if cfg.is_scatter and not push:
+        refused = self._quant_refusal(cfg, self._arch)
+        bad.extend(refused)
+        if cfg.is_scatter and q == "none":
             bad.append(
                 "combine_mode='scatter' (gather only, except the push quant types "
                 f"{_PUSH_QUANT_TYPES})"
             )
-        if q != "none" and not push:
-            bad.append(f"quant_type={q!r}")
-        if push:
-            if not self._is1250:
-                bad.append(f"quant_type={q!r} (the push combine is gfx125x only)")
+        if q != "none" and not refused:
             if cfg.combine_dtype != torch.bfloat16:
                 bad.append(
                     f"quant_type={q!r} with combine dtype {cfg.combine_dtype} "

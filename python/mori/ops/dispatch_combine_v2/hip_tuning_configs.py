@@ -41,6 +41,8 @@ from typing import NamedTuple
 
 from mori.ops import utils as _gpu
 
+from .quant_types import resolve_quant_type
+
 logger = logging.getLogger(__name__)
 
 # Models with no table of their own that reuse a tuned sibling's key.
@@ -348,7 +350,7 @@ _COMBINE_TABLE: dict = {
 }
 
 _COMBINE_PUSH_TABLE: dict = {
-    "fp4_blockwise": {
+    "fp4_blockwise_1x32": {
         "gfx1250/96cu": {
             (8, 7168, 6, None): ((None, 32, 16),),
         },
@@ -416,7 +418,7 @@ _COMBINE_PUSH_TABLE: dict = {
             ),
         },
     },
-    "fp4_blockwise_fp32": {
+    "fp4_blockwise_1x128": {
         "gfx1250": {
             (4, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
         },
@@ -430,7 +432,7 @@ _COMBINE_PUSH_TABLE: dict = {
             ),
         },
     },
-    "fp8_blockwise": {
+    "fp8_blockwise_1x32": {
         "gfx1250/96cu": {
             (8, 7168, 6, None): ((None, 32, 16),),
         },
@@ -477,7 +479,7 @@ _BF16_PUSH_TABLE: dict = {
 }
 
 _LL128_TABLE: dict = {
-    "fp4_blockwise": {
+    "fp4_blockwise_1x32": {
         "gfx1250/96cu": {
             (8, 7168, 6, None): {
                 "fp4": dict(max_tok=128, dispatch=(32, 16), combine=(32, 8))
@@ -498,7 +500,7 @@ _LL128_TABLE: dict = {
             },
         },
     },
-    "fp8_blockwise": {
+    "fp8_blockwise_1x32": {
         "gfx1250/96cu": {
             (8, 7168, 6, None): {
                 "fp8": dict(max_tok=64, dispatch=(32, 16), combine=(32, 8))
@@ -624,6 +626,13 @@ def _capped(phase, own, peak, shape, key, default_warp):
     return tuple(rows)
 
 
+def _resolve_quant(quant_type, devs):
+    """The explicit name of `quant_type`; fp8_blockwise / fp4_blockwise take the
+    group of the device the tables are read for."""
+    gfx125x = bool(devs[0]) and devs[0].startswith("gfx1250")
+    return resolve_quant_type(quant_type, gfx125x)
+
+
 def ll128(
     world_size,
     hidden_dim,
@@ -634,6 +643,7 @@ def ll128(
     quant_type="none",
 ):
     devs = _device_keys()
+    quant_type = _resolve_quant(quant_type, devs)
     if devs[0] == "gfx1250-strict":
         return None  # LL128's polls miss peer writes on these parts; use the schedule
     per_device = _LL128_TABLE.get(quant_type, {})
@@ -960,6 +970,7 @@ def lookup(
     profile = tuning_profile(profile)
     base = _hip_default()
     devs = _device_keys()
+    quant_type = _resolve_quant(quant_type, devs)
     shape = (world_size, hidden_dim, topk, experts_per_rank)
     wire = _DISPATCH_DTYPE_ALIAS.get(dtype, dtype)
     disp = _first_bucket(_DISPATCH_TABLE, devs, *shape)

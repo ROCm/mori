@@ -62,6 +62,7 @@ import torch.distributed as dist
 
 import mori.cco as cco
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
+from mori.ops.dispatch_combine_v2.quant_types import resolve_quant_type
 
 import _data
 import _report
@@ -104,15 +105,17 @@ ASYNC_LL_TRANSPORT = os.environ.get("ASYNC_LL_TRANSPORT", "sdma")
 if COMB_MODE not in ("pull", "push"):
     raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
 _PUSH = COMB_MODE == "push"
-PUSH_QUANT = os.environ.get("PUSH_QUANT") or "fp4_blockwise"
-if PUSH_QUANT not in ("fp4_blockwise", "fp4_blockwise_fp32", "fp8_blockwise"):
-    raise ValueError(
-        f"PUSH_QUANT={PUSH_QUANT!r}: want fp4_blockwise|fp4_blockwise_fp32|fp8_blockwise"
-    )
-_PUSH_FP8 = PUSH_QUANT == "fp8_blockwise"
+# The push combine is gfx125x's, so the bare names take its 1x32 group.
+PUSH_QUANT = resolve_quant_type(
+    os.environ.get("PUSH_QUANT") or "fp4_blockwise", gfx125x=True
+)
+_PUSH_QUANTS = ("fp4_blockwise_1x32", "fp4_blockwise_1x128", "fp8_blockwise_1x32")
+if PUSH_QUANT not in _PUSH_QUANTS:
+    raise ValueError(f"PUSH_QUANT={PUSH_QUANT!r}: want one of {_PUSH_QUANTS}")
+_PUSH_FP8 = PUSH_QUANT == "fp8_blockwise_1x32"
 PUSH_QRULE = os.environ.get("PUSH_QRULE")
 if not PUSH_QRULE:
-    PUSH_QRULE = "blk" if PUSH_QUANT == "fp4_blockwise_fp32" else "mx"
+    PUSH_QRULE = "blk" if PUSH_QUANT == "fp4_blockwise_1x128" else "mx"
 if PUSH_QRULE not in ("mx", "blk") or (_PUSH_FP8 and PUSH_QRULE != "mx"):
     raise ValueError(
         f"PUSH_QRULE={PUSH_QRULE!r}: want mx|blk (mx only for {PUSH_QUANT})"

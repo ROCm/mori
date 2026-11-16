@@ -139,9 +139,9 @@ jobs:
         run: |
           # No GPU needed: arch-string matching, the ASIC-revision table keys and their
           # CU fit, the per-target macro guard, the FlyDSL schedules' bounds, the AsyncLL
-          # defaults per arch, and the peak / capped tuning profiles. The tables load
-          # from the installed package, so a build that ships no tables, or a table that
-          # fails to parse, fails here.
+          # defaults per arch, the peak / capped tuning profiles, and the combine quant
+          # type names. The tables load from the installed package, so a build that
+          # ships no tables, or a table that fails to parse, fails here.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 120 python -m pytest -v \
@@ -149,7 +149,8 @@ jobs:
               tests/python/ops/dispatch_combine_v2/test_v2_tuning_tables.py \
               tests/python/ops/dispatch_combine_v2/test_tuning_configs.py \
               tests/python/ops/dispatch_combine_v2/test_asyncll_options.py \
-              tests/python/ops/dispatch_combine_v2/test_tuning_profile.py"
+              tests/python/ops/dispatch_combine_v2/test_tuning_profile.py \
+              tests/python/ops/dispatch_combine_v2/test_quant_types.py"
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         if: contains(fromJSON(inputs.groups), 'cco')

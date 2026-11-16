@@ -52,6 +52,7 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 | `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
 | `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
 | `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here. A gfx125x `EpDispatchPlan` whose caller binds no `staging_base` gets one at its first launch, shared by the unbound plans of its layout, with a `FutureWarning`; instead, allocate `info["stagingBytes"]` bytes once, keep them alive, and `bind(staging_base=buf)` on every dispatch plan (a tensor is checked against that size and held; an int address is taken on trust). Sizes come from the plans: `EpDispatchPlan.describe(**request)` / `EpCombinePlan.describe(...)` return the info a plan would report without compiling it, and `arena_regions(*infos, region_names=...)` turns their `region.<stem>` keys into a `SymmArena` region list; binding checks an arena that has `size()` |
+| `quant_types.py` | the combine quant type names, what each resolves to on this arch, and the format each names (see "Combine quant types") |
 | `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
 | `internode_regions.py` | `internode_regions(cfg)`: the internode op's `SymmArena` region list — 17 named `(name, nbytes)` regions (16 plus `out_scales` when scales are on), in v1's allocation order and transcribed from what `EpDispatchCombineHandle` allocated |
 | `flydsl_prims.py` | FlyDSL device primitives: system atomics / ordered stores / fences / volatile-spin waits |
@@ -59,6 +60,39 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 | `tuning_configs.py` | **flydsl** kernel geometry: per-(world,hidden,topk) block/warp lookup |
 | `hip_tuning_configs.py` | **hip** configuration selection: `resolve_schedule(cfg)` returns `ScheduleEntry` rows for both intra and inter. Each phase has a `KernelConfig(family, block_num, warp_per_block, rdma_block_num, load_first, active_qps)`. Inter reads its CSV table; intra reads the `IntraNodeV2` table first and falls back to Python tables per phase, whose dispatch half is keyed by `dispatch_dtype_str` (bf16/fp8/fp4) and combine half by `quant_type`. File names come from `v2_table_filename()`; `read_v2_table()` / `write_v2_table()` parse, check and write the tables, and `save_internode_result()` merges a tuning result by selector |
 | `tuning_configs/*.csv` | V2 rules, one CSV per GPU model, kernel and EP size holding both phases: `{arch}_{model}_{kernel}_ep{n}.csv`, e.g. `gfx950_mi355x_InterNodeV2_ep16.csv`. Kernels are `InterNodeV2`, `InterNodeV2LL` and `IntraNodeV2`; `--cmd tuning --tuning-save` merges a rule into them. Columns and how the shipped rows were measured: [tuning_configs/README.md](tuning_configs/README.md) |
+
+## Combine quant types
+
+A quantized combine sends each expert row as fp8 or e2m1 elements plus
+per-group scales. `quant_type` names the format:
+
+| `quant_type` | elements | scale |
+|---|---|---|
+| `fp8_blockwise_1x32` | fp8 | one E8M0 per 32 elements (MXFP8) |
+| `fp4_blockwise_1x32` | e2m1 | one E8M0 per 32 elements (MXFP4) |
+| `fp8_blockwise_1x128` | fp8 | one f32 per 128 elements |
+| `fp4_blockwise_1x128` | e2m1 | one f32 per 128 elements |
+| `fp8_blockwise` / `fp4_blockwise` | as above | the arch's default group: 1x32 on gfx125x, 1x128 elsewhere |
+| `fp4_blockwise_fp32` | | the old name of `fp4_blockwise_1x128` |
+
+fp8 is the arch's own: e4m3fnuz on gfx942, e4m3fn on gfx950 and gfx125x. The
+config stores the explicit name: after construction `cfg.quant_type` reads
+`fp8_blockwise_1x128` on a gfx942 config built with `fp8_blockwise`.
+
+A backend that does not serve the resolved format refuses the config when the
+op is built, naming the arch and what it serves; nothing falls back to another
+format. `supported_quant_types(backend=None, arch=None)` returns the names a
+backend accepts on an arch, each mapped to its explicit format, without building
+an op. What each backend serves:
+
+| backend | gfx942 / gfx950 | gfx125x |
+|---|---|---|
+| flydsl | `fp8_blockwise_1x128` (scatter) | none |
+| hip | none | `fp8_blockwise_1x32`, `fp4_blockwise_1x32`, `fp4_blockwise_1x128` (push) |
+
+Plan requests name the format with fields, not these strings: `combine_fp8` and
+`combine_fp4` select the 1x32 push combine, and `combine_fp4_f32_scale` turns
+the fp4 one into 1x128.
 
 ## gfx125x dispatch: slot reservation
 
