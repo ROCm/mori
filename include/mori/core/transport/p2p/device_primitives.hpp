@@ -547,8 +547,8 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
 // peer-read latency that caps the intra-node combine gather. Mirrors the v2/FlyDSL vec
 // gather schedule.
 // Accumulate/encode through WarpAccumPackedDecode / AccumPackedEncodeWord, so
-// fp8/fp4/bf16 sources get the gfx950 packed-convert fast path in either mode; other T fall back
-// to the same scalar VecElem/T(float) math in both modes too.
+// fp8/fp4/bf16 sources get the gfx950 packed-convert fast path; other T fall back
+// to the scalar VecElem/T(float) math.
 template <typename T, int VecBytes, int AccumNum, int Unroll>
 __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __restrict__ srcs,
                                               const float* __restrict__ srcScales, size_t& offset,
@@ -613,52 +613,6 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
 #define WARP_ACCUM_UNROLL 2
 #endif
 
-template <typename T, int VecBytes>
-__forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __restrict__ srcs,
-                                          const float* __restrict__ srcScales, size_t accumNum,
-                                          size_t nelems) {
-  size_t offset = 0;
-#define WARP_ACCUM_CASE(AccumNum)                                                          \
-  case AccumNum:                                                                           \
-    WarpAccumImpl<T, VecBytes, AccumNum, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, offset, \
-                                                            nelems);                       \
-    break;
-
-  switch (accumNum) {
-    WARP_ACCUM_CASE(1)
-    WARP_ACCUM_CASE(2)
-    WARP_ACCUM_CASE(4)
-    WARP_ACCUM_CASE(6)
-    WARP_ACCUM_CASE(8)
-    WARP_ACCUM_CASE(10)
-    default:
-      // 9 (topk 8 plus a fused shared expert) only with narrow vectors, for the
-      // register reason WarpAccumDynamic batches only narrow vectors.
-      if constexpr (VecBytes <= 8) {
-        if (accumNum == 9) {
-          WarpAccumImpl<T, VecBytes, 9, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, offset, nelems);
-          break;
-        }
-      }
-      WarpAccumDynamic<T, VecBytes>(dest, srcs, srcScales, accumNum, nelems);
-      return;
-  }
-#undef WARP_ACCUM_CASE
-
-  const int laneId = threadIdx.x & (warpSize - 1);
-  for (offset += laneId; offset < nelems; offset += warpSize) {
-    AccumFp32T<T> accumValFp32 = AccumFp32T<T>{0};
-    for (int i = 0; i < accumNum; ++i) {
-      const T* srcPtr = srcs[i];
-      if (srcPtr == nullptr) continue;
-
-      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
-      accumValFp32 += AccumFp32T<T>(srcPtr[offset]) * srcScale;
-    }
-    dest[offset] = T(accumValFp32);
-  }
-}
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                        Load-first + unroll combine gather (v2-style)                           */
 /* ---------------------------------------------------------------------------------------------- */
@@ -706,6 +660,15 @@ __forceinline__ __device__ void WarpAccumLF(T* __restrict__ dest, T* const* __re
     }
     dest[offset] = T(accumValFp32);
   }
+}
+
+// One vec-chunk per source per iteration, whatever WARP_ACCUM_UNROLL is (the JIT build leaves it
+// at 2): unrolled, the internode V1 LL combine kernels spill heavily.
+template <typename T, int VecBytes>
+__forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __restrict__ srcs,
+                                          const float* __restrict__ srcScales, size_t accumNum,
+                                          size_t nelems) {
+  WarpAccumLF<T, VecBytes, /*Unroll=*/1>(dest, srcs, srcScales, accumNum, nelems);
 }
 
 #if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
