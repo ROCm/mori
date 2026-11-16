@@ -1817,7 +1817,15 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                               : _payRow ? kSlabBytes - kTokB
                                         : kSlabBytes;
       const int perTokM = tkM * 4 + tkM * 4 + 4 + EpScaleStride(kCfg);
-      const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 128 * kMetaFields) / perTokM) : 0;
+      constexpr bool kMetaAl =
+          kMetaDtOk && kEpScaleBytes > 0 && !kPlainMeta && kCfg.warpPerBlock >= 4 * npes;
+      constexpr int kMetaEndInts = 96;
+      const int tokCapEnds =
+          (perTokM > 0) ? ((mtileBytesM - 128 * kMetaFields - 8 * 4 * kMetaEndInts) / perTokM) : 0;
+      const bool _metaAl = kMetaAl && tokCapEnds >= 16 && (int)args.numTokens > 2 * aWarps;
+      const int tokCapM = _metaAl
+                              ? tokCapEnds
+                              : ((perTokM > 0) ? ((mtileBytesM - 128 * kMetaFields) / perTokM) : 0);
       if (tokCapM > 0) {
         uint8_t* _m4 =
             _pmTile ? (reinterpret_cast<uint8_t*>(_tdmBatchSmem) +
@@ -2045,9 +2053,30 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
             index_t q = cntAll / split, rm = cntAll - q * split;
             index_t myBeg = (index_t)part * q + ((part < rm) ? part : rm);
             index_t myCnt = q + ((part < rm) ? 1 : 0);
+            [[maybe_unused]] index_t alN = 0, al0 = 0;
+            if constexpr (kMetaAl) {
+              if (_metaAl && cntAll >= 40) {
+                const index_t last = baseAll + cntAll - 1;
+                alN = 16;
+                while (2 * alN <= (index_t)tokCapM &&
+                       last / alN - baseAll / alN + 1 > (index_t)split)
+                  alN *= 2;
+                al0 = (baseAll / alN) * alN;
+                const index_t pieces = last / alN - baseAll / alN + 1;
+                myCnt = (part < pieces) ? ((pieces - part + split - 1) / split) * tokCapM : 0;
+              }
+            }
             for (index_t cs = 0; cs < myCnt; cs += tokCapM) {
               int cc = (int)((cs + tokCapM <= myCnt) ? tokCapM : (myCnt - cs));
               index_t ab = baseAll + myBeg + cs;
+              if constexpr (kMetaAl) {
+                if (alN > 0) {
+                  const index_t s0 = al0 + ((index_t)part + (cs / tokCapM) * split) * alN;
+                  const index_t hi = baseAll + cntAll;
+                  ab = (s0 < baseAll) ? baseAll : s0;
+                  cc = (int)(((s0 + alN < hi) ? s0 + alN : hi) - ab);
+                }
+              }
               if (ab + cc > recvCapM) continue;
               if (ab + cc > _stgCapM) continue;
               const int nIdxB = cc * tkM, nWtB = cc * tkM;
@@ -2145,21 +2174,48 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                 if (laneId + 2 * WS < nV) _cuS2 = qS[laneId + 2 * WS];
                 if (laneId + 3 * WS < nV) _cuS3 = qS[laneId + 3 * WS];
               }
-#define _MHT_REM(dstp, glbp, hd, bd, ntot)                                         \
-  do {                                                                             \
-    for (int i = laneId; i < (hd); i += WS) (dstp)[i] = (glbp)[i];                 \
-    for (int i = (hd) + (bd) + laneId; i < (ntot); i += WS) (dstp)[i] = (glbp)[i]; \
+              [[maybe_unused]] int* const tE = tS + ((spS.body + 31) & ~31);
+              [[maybe_unused]] gfx1250_TDM_GROUP1 _endG[kMetaAl ? 8 : 1];
+              [[maybe_unused]] int _endN[kMetaAl ? 8 : 1];
+              [[maybe_unused]] int* _endD[kMetaAl ? 8 : 1];
+              [[maybe_unused]] bool _endAny = false;
+              if constexpr (kMetaAl) {
+#pragma unroll
+                for (int k = 0; k < 8; ++k) _endN[k] = 0;
+              }
+              auto _endLd = [&](int k, int* d, int* g, int lo, int hi) {
+                const int len = hi - lo;
+                const int ev = (alN > 0 && len >= 4 && len <= kMetaEndInts) ? (len & ~1) : 0;
+                _endN[k] = ev;
+                _endD[k] = d + lo;
+                if (ev > 0) {
+                  _endG[k] = TdmSplitShape(TdmSplit128{0, ev, 0, ev / 2, 2});
+                  TdmIssueLoad<int>(tE + k * kMetaEndInts, g + lo, _endG[k]);
+                  _endAny = true;
+                }
+                for (int i = lo + ev + laneId; i < hi; i += WS) d[i] = g[i];
+              };
+#define _MHT_REM(k, dstp, glbp, hd, bd, ntot)                                                  \
+  do {                                                                                         \
+    if constexpr (kMetaAl) {                                                                   \
+      _endLd((k), reinterpret_cast<int*>(dstp), reinterpret_cast<int*>(glbp), 0, (hd));        \
+      _endLd((k) + 1, reinterpret_cast<int*>(dstp), reinterpret_cast<int*>(glbp), (hd) + (bd), \
+             (ntot));                                                                          \
+    } else {                                                                                   \
+      for (int i = laneId; i < (hd); i += WS) (dstp)[i] = (glbp)[i];                           \
+      for (int i = (hd) + (bd) + laneId; i < (ntot); i += WS) (dstp)[i] = (glbp)[i];           \
+    }                                                                                          \
   } while (0)
               if (!_cu)
-                _MHT_REM(reinterpret_cast<int*>(dI), reinterpret_cast<int*>(sI), spI.head, spI.body,
-                         nIdxB);
+                _MHT_REM(0, reinterpret_cast<int*>(dI), reinterpret_cast<int*>(sI), spI.head,
+                         spI.body, nIdxB);
               if (!_cu && dW)
-                _MHT_REM(reinterpret_cast<int*>(dW), reinterpret_cast<int*>(sW), spW.head, spW.body,
-                         nWtB);
-              if (!_cu) _MHT_REM(dR, sR, spR.head, spR.body, cc);
+                _MHT_REM(2, reinterpret_cast<int*>(dW), reinterpret_cast<int*>(sW), spW.head,
+                         spW.body, nWtB);
+              if (!_cu) _MHT_REM(4, dR, sR, spR.head, spR.body, cc);
               if (dS && !_scu)
-                _MHT_REM(reinterpret_cast<int*>(dS), reinterpret_cast<int*>(sS), spS.head, spS.body,
-                         nScB);
+                _MHT_REM(6, reinterpret_cast<int*>(dS), reinterpret_cast<int*>(sS), spS.head,
+                         spS.body, nScB);
 #undef _MHT_REM
               if (_cu) {
                 int* const eI = reinterpret_cast<int*>(dI);
@@ -2181,13 +2237,18 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                 }
                 _mDirect = true;
               }
-              if (spI.body || spW.body || spR.body || spS.body ||
+              if (spI.body || spW.body || spR.body || spS.body || (kMetaAl && _endAny) ||
                   (_cu && !_pfSent && _pfN > 0 && _pfDst != nullptr)) {
                 __builtin_amdgcn_s_wait_tensorcnt(0);
                 if (spI.body) TdmIssueStore<int>(reinterpret_cast<int*>(dI + spI.head), tI, gI);
                 if (spW.body) TdmIssueStore<int>(reinterpret_cast<int*>(dW + spW.head), tW, gW);
                 if (spR.body) TdmIssueStore<int>(reinterpret_cast<int*>(dR + spR.head), tR, gR);
                 if (spS.body) TdmIssueStore<int>(reinterpret_cast<int*>(dS + spS.head), tS, gS);
+                if constexpr (kMetaAl) {
+#pragma unroll
+                  for (int k = 0; k < 8; ++k)
+                    if (_endN[k] > 0) TdmIssueStore<int>(_endD[k], tE + k * kMetaEndInts, _endG[k]);
+                }
                 if (!_pfSent && _pfN > 0 && _pfDst != nullptr) {
                   const int _mTokB = (int)(hiddenDim * sizeof(T));
                   TdmIssueStore<int>(reinterpret_cast<int*>(_pfDst + (size_t)_pfSlot0 * hiddenDim),
