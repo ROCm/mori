@@ -55,6 +55,7 @@ constexpr size_t kMaxPendingInbound = 64;
 constexpr size_t kMaxSendBuffer = 256 * 1024;
 constexpr size_t kMaxReadPerWakeup = 64 * 1024;
 constexpr size_t kMaxTransitions = 8;
+constexpr size_t kMaxRetiredLinks = 64;
 
 template <class... Fs>
 struct Overloaded : Fs... {
@@ -136,13 +137,19 @@ const char* StatusName(proto::HelloStatus s) {
   return "unknown";
 }
 
-// Errors worth an INFO line the first time a link hits them: the peer is gone, it closed the
-// link without LEAVE, went silent, or refused the reconnect, or something is misconfigured.
-// Racing and backing off stay at DEBUG.
+// Errors worth a warning the first time a link hits them: the peer closed the link without
+// LEAVE, went silent, or refused the reconnect, or something is misconfigured. Racing and
+// backing off stay at debug.
 bool Noteworthy(LinkError e) {
   return e == LinkError::kLinkClosed || e == LinkError::kHeartbeatTimeout ||
          e == LinkError::kRasEndpointUnavailable || e == LinkError::kTokenMismatch ||
          e == LinkError::kVersionMismatch || e == LinkError::kEndpointReused;
+}
+
+// Rejections that can't change for the runtime that gave them, so a retry can only repeat it.
+bool CantHeal(LinkError e) {
+  return e == LinkError::kTokenMismatch || e == LinkError::kVersionMismatch ||
+         e == LinkError::kEndpointReused;
 }
 
 }  // namespace
@@ -287,6 +294,9 @@ void LinkManager::RunOnce(int maxWaitMs) {
 
   epoll_event evs[64];
   int n = epoll_wait(epollFd_, evs, 64, timeout);
+  // A process resumed after a stop gets EINTR here, even without a signal handler. Look again
+  // without waiting, so the timers below see what arrived while it was stopped.
+  if (n < 0 && errno == EINTR) n = epoll_wait(epollFd_, evs, 64, 0);
   if (n < 0) {
     if (errno != EINTR && !(Degraded() & kDegradedLoopError)) {
       AddDegraded(kDegradedLoopError);
@@ -356,6 +366,10 @@ void LinkManager::RunTimers(uint64_t now) {
     auto cit = conns_.find(id);
     if (cit == conns_.end()) continue;
     Conn* c = cit->second.get();
+    if (c->phase != Phase::kTcpConnecting) {
+      if (!ReadBeforeJudging(c, now)) continue;
+      if (c->phase == Phase::kEstablished || now < c->deadlineNs) continue;
+    }
     Link* l = c->phase == Phase::kClosing ? nullptr : LinkOf(c);
     if (l == nullptr) {
       CloseConn(c);
@@ -376,7 +390,16 @@ void LinkManager::RunTimers(uint64_t now) {
   }
   for (const RuntimeUuid& peer : silent) {
     auto it = links_.find(peer);
-    if (it == links_.end()) continue;
+    if (it == links_.end() || it->second.conn == nullptr ||
+        !ReadBeforeJudging(it->second.conn, now)) {
+      continue;
+    }
+    it = links_.find(peer);
+    if (it == links_.end() || it->second.conn == nullptr ||
+        it->second.conn->phase != Phase::kEstablished ||
+        now < it->second.lastRxNs + opts_.config.HeartbeatTimeoutNs()) {
+      continue;
+    }
     std::string detail =
         "nothing from the peer for " + std::to_string((now - it->second.lastRxNs) / kMs) + " ms";
     LinkDown(it, LinkError::kHeartbeatTimeout, detail, now, /*retryNow=*/true);
@@ -637,6 +660,12 @@ void LinkManager::OnReadable(Conn* c, uint64_t now) {
     if (eof) CloseConn(c);
     return;
   }
+  // The peer gave up on this connection before its HELLO was read, as when this process was
+  // stopped; bringing the link up would only take it down again.
+  if (eof && c->phase == Phase::kAwaitingHello) {
+    CloseConn(c);
+    return;
+  }
   if (rxMono != 0 && !ProcessFrames(c, rxMono)) return;
   if (!eof) return;
   Link* l = LinkOf(c);
@@ -648,6 +677,12 @@ void LinkManager::OnReadable(Conn* c, uint64_t now) {
   std::string detail = err != 0 ? std::strerror(err) : "closed by the peer";
   LinkDown(links_.find(l->peer), wasUp ? LinkError::kLinkClosed : LinkError::kConnectFailed,
            wasUp ? detail : detail + " before its HELLO", now, wasUp);
+}
+
+bool LinkManager::ReadBeforeJudging(Conn* c, uint64_t now) {
+  uint64_t id = c->id;
+  OnReadable(c, now);
+  return conns_.count(id) != 0;
 }
 
 bool LinkManager::ProcessFrames(Conn* c, uint64_t rxMonoNs) {
@@ -855,7 +890,11 @@ bool LinkManager::OnLinkMessage(Conn* c, Link& l, const proto::Message& m, uint6
               l.connectScheduled = false;
               SetState(l, LinkState::kPeerLeft, LinkError::kNone, now);
               RAS_LOG_INFO("RAS peer {} ({}) left", l.peer.ToString(), l.peerHostname);
-              if (l.relations.empty()) links_.erase(it);
+              if (l.relations.empty()) {
+                links_.erase(it);
+              } else {
+                Retire(l.peer);
+              }
             } else {
               LinkDown(it, LinkError::kLinkReleased, "the peer released the link", now, true);
             }
@@ -908,6 +947,11 @@ void LinkManager::AddRelation(const PeerAdded& e, uint64_t now) {
   l.endpoint = e.endpoint;
   if (l.peerHostname.empty()) l.peerHostname = e.remoteHostname;
   if (l.peerPid == 0) l.peerPid = e.remotePid;
+  // A new registration is new information, so a link that gave up tries again.
+  if (l.state == LinkState::kGaveUp) {
+    l.refusedSinceNs = 0;
+    SetState(l, LinkState::kDisconnected, LinkError::kNone, now);
+  }
   if (l.state != LinkState::kPeerLeft && l.conn == nullptr && !l.connectScheduled) {
     ScheduleConnect(l, now, /*immediate=*/true);
   }
@@ -992,6 +1036,7 @@ void LinkManager::Establish(Link& l, Conn* c, uint16_t version, const proto::Hel
   l.peerDegraded = hello.status == proto::HelloStatus::kDegraded;
   l.connectScheduled = false;
   l.backoffNs = 0;
+  l.refusedSinceNs = 0;
   ++l.connects;
   l.lastRxNs = now;
   l.nextHeartbeatNs = now;
@@ -1010,10 +1055,22 @@ bool LinkManager::LinkDown(LinkMap::iterator it, LinkError error, const std::str
   }
   bool changed = l.lastError != error;
   l.lastErrorDetail = detail;
-  SetState(l, LinkState::kDisconnected, error, now);
-  if (changed && Noteworthy(error)) {
-    RAS_LOG_INFO("RAS link to runtime {} ({}): {}: {}", l.peer.ToString(), l.peerHostname,
-                 ToString(error), detail);
+  if (error != LinkError::kRasEndpointUnavailable) {
+    l.refusedSinceNs = 0;
+  } else if (l.refusedSinceNs == 0) {
+    l.refusedSinceNs = now;
+  }
+  bool refusedTooLong =
+      l.refusedSinceNs != 0 && now - l.refusedSinceNs >= opts_.config.PeerGoneTimeoutNs();
+  bool giveUp = !l.relations.empty() && (CantHeal(error) || refusedTooLong);
+  SetState(l, giveUp ? LinkState::kGaveUp : LinkState::kDisconnected, error, now);
+  if (refusedTooLong && giveUp) {
+    RAS_LOG_WARN("RAS link to runtime {} ({}): {} for {} s, giving up: its process is gone",
+                 l.peer.ToString(), l.peerHostname, ToString(error),
+                 (now - l.refusedSinceNs) / (1000 * kMs));
+  } else if (changed && Noteworthy(error)) {
+    RAS_LOG_WARN("RAS link to runtime {} ({}): {}: {}{}", l.peer.ToString(), l.peerHostname,
+                 ToString(error), detail, giveUp ? ", giving up" : "");
   } else {
     RAS_LOG_DEBUG("RAS link to runtime {} ({}): {}: {}", l.peer.ToString(), l.peerHostname,
                   ToString(error), detail);
@@ -1023,12 +1080,37 @@ bool LinkManager::LinkDown(LinkMap::iterator it, LinkError error, const std::str
     links_.erase(it);
     return false;
   }
-  ScheduleConnect(l, now, retryNow);
+  if (giveUp) {
+    l.connectScheduled = false;
+    Retire(l.peer);
+  } else {
+    ScheduleConnect(l, now, retryNow);
+  }
   return true;
 }
 
+void LinkManager::Retire(const RuntimeUuid& peer) {
+  retired_.push_back(peer);
+  while (retired_.size() > kMaxRetiredLinks) {
+    LinkMap::iterator it = links_.find(retired_.front());
+    retired_.pop_front();
+    // Skips a link that came back, or one retired again and so queued twice.
+    if (it == links_.end() || it->second.conn != nullptr ||
+        (it->second.state != LinkState::kPeerLeft && it->second.state != LinkState::kGaveUp)) {
+      continue;
+    }
+    for (const auto& key : it->second.relations) {
+      auto rit = relations_.find(key);
+      if (rit != relations_.end() && rit->second == it->first) relations_.erase(rit);
+    }
+    links_.erase(it);
+    MarkDirty();
+  }
+}
+
 void LinkManager::ScheduleConnect(Link& l, uint64_t now, bool immediate) {
-  if (l.state == LinkState::kPeerLeft || l.relations.empty() || !l.endpoint.Valid()) {
+  if (l.state == LinkState::kPeerLeft || l.state == LinkState::kGaveUp || l.relations.empty() ||
+      !l.endpoint.Valid()) {
     l.connectScheduled = false;
     return;
   }

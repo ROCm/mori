@@ -32,7 +32,8 @@
 //   if (ras::RasRuntime* rt = ras::RasRuntime::Get()) rt->Enqueue(ras::EngineRegistered{...});
 //
 // Lifecycle:
-// - Off unless MORI_RAS_ENABLE=1.
+// - Off unless MORI_RAS_ENABLE=1. When it is set, RAS logs warnings as well as errors, unless
+//   MORI_RAS_LOG_LEVEL or MORI_GLOBAL_LOG_LEVEL chooses a level.
 // - EnsureStarted() starts the runtime once per process, from the first IOEngine. It binds the
 //   peer listener before returning, so the engine can advertise it in EngineDesc. The RAS
 //   thread runs at nice 19 and on MORI_RAS_CPU_AFFINITY's CPUs, if set.

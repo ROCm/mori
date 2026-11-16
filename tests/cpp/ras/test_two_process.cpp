@@ -31,6 +31,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -69,8 +70,12 @@ bool ReadExactly(int fd, char* out, size_t n, int timeoutMs) {
                                     deadline - std::chrono::steady_clock::now())
                                     .count());
     pollfd p{fd, POLLIN, 0};
-    if (left <= 0 || poll(&p, 1, left) != 1) return false;
+    if (left <= 0) return false;
+    int ready = poll(&p, 1, left);
+    if (ready < 0 && errno == EINTR) continue;  // resumed after SIGSTOP
+    if (ready != 1) return false;
     ssize_t r = read(fd, out + got, n - got);
+    if (r < 0 && errno == EINTR) continue;
     if (r <= 0) return false;
     got += static_cast<size_t>(r);
   }
@@ -134,6 +139,18 @@ std::string CheckLink(const std::string& cond, const RuntimeUuid& peer) {
   }
   if (cond == "undisturbed") {
     bool ok = l->state == LinkState::kConnected && l->disconnects == 0 && l->connects == 1;
+    return ok ? "" : "link " + state;
+  }
+  if (cond == "resumed") {
+    int closes = 0;
+    for (const LinkTransition& t : l->transitions) {
+      if (t.error == LinkError::kHeartbeatTimeout) return "link " + state + ": HEARTBEAT_TIMEOUT";
+      if (t.state == LinkState::kDisconnected && t.error == LinkError::kLinkClosed) ++closes;
+    }
+    // One close, for the connection the peer timed out; more are connections the peer gave up
+    // on while this process was stopped, brought up only to close.
+    if (closes > 1) return "link " + state + ": " + std::to_string(closes) + " LINK_CLOSED";
+    bool ok = l->state == LinkState::kConnected && l->connects >= 2;
     return ok ? "" : "link " + state;
   }
   if (cond == "left") return l->state == LinkState::kPeerLeft ? "" : "link " + state;
@@ -287,6 +304,22 @@ TEST(RasTwoProcess, AKilledProcessWhoseChildHoldsItsSocketsIsSeenAtTheHeartbeatT
   b->Kill();
   EXPECT_EQ(a->Ask("WAIT heartbeat_timeout"), "OK");
   kill(holder, SIGKILL);
+}
+
+// A process stopped past the heartbeat timeout resumes with nothing read. Its peer rightly
+// timed it out, but it must not blame the peer for its own pause, nor bring the link up on the
+// reconnects the peer gave up on while it was stopped.
+TEST(RasTwoProcess, AProcessResumedFromAStopDoesntTimeOutItsPeer) {
+  setenv("MORI_RAS_TIMEOUT_FACTOR", "0.05", 1);  // a 1 s heartbeat timeout
+  std::unique_ptr<Child> a, b;
+  SpawnLinkedPair(&a, &b);
+  unsetenv("MORI_RAS_TIMEOUT_FACTOR");
+  ASSERT_EQ(b->Ask("WAIT heartbeats"), "OK");
+  ASSERT_EQ(kill(b->pid, SIGSTOP), 0);
+  std::this_thread::sleep_for(std::chrono::seconds(3));
+  ASSERT_EQ(kill(b->pid, SIGCONT), 0);
+  EXPECT_EQ(b->Ask("WAIT resumed"), "OK");
+  EXPECT_EQ(a->Ask("WAIT heartbeats"), "OK");
 }
 
 // A forked child's exit runs the atexit handler it inherited, which must leave the parent's

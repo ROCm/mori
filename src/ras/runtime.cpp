@@ -101,6 +101,18 @@ std::string InterfaceAddress(const std::string& ifname) {
   return v4.empty() ? v6 : v4;
 }
 
+// MORI's default level, error, hides the link warnings that RAS is turned on to see. So when
+// MORI_RAS_ENABLE asks for RAS, RAS logs warnings too, unless MORI_RAS_LOG_LEVEL,
+// MORI_GLOBAL_LOG_LEVEL, or the logging API chose a level.
+void ShowWarningsWhenRequested() {
+  ModuleLogger& logs = ModuleLogger::GetInstance();
+  if (logs.HasEnvOverride(modules::RAS) || logs.IsGlobalLevelSet()) return;
+  spdlog::logger* logger = RasLogger();
+  if (logger != nullptr && logger->level() == spdlog::level::err) {
+    logger->set_level(spdlog::level::warn);
+  }
+}
+
 }  // namespace
 
 spdlog::logger* RasLogger() {
@@ -262,6 +274,7 @@ RasRuntime* RasRuntime::EnsureStarted(const StartParams& params) {
   if (status.state != RunState::kNotStarted) return nullptr;
 
   RasConfig config = ConfigFromEnv();
+  if (config.requested) ShowWarningsWhenRequested();
   for (const std::string& w : config.warnings) {
     if (config.requested) {
       RAS_LOG_ERROR("{}", w);

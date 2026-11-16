@@ -120,6 +120,7 @@ enum class LinkState : uint8_t {
   kConnected,     // HELLO done; heartbeats flow
   kDisconnected,  // no connection; a reconnect is scheduled
   kPeerLeft,      // the peer sent LEAVE for its exit; its runtime UUID is gone for good
+  kGaveUp,        // no more reconnects: refused for too long, or rejected for good
 };
 
 inline const char* ToString(LinkState s) {
@@ -134,6 +135,8 @@ inline const char* ToString(LinkState s) {
       return "DISCONNECTED";
     case LinkState::kPeerLeft:
       return "PEER_LEFT";
+    case LinkState::kGaveUp:
+      return "GAVE_UP";
   }
   return "UNKNOWN";
 }

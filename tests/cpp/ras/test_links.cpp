@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <functional>
@@ -188,21 +189,27 @@ TEST(RasLinks, CrossingConnectionsKeepTheOneTheLowerUuidOpened) {
   }
 }
 
-TEST(RasLinks, ATokenMismatchIsRejected) {
+TEST(RasLinks, ATokenMismatchIsRejectedAndNotRetried) {
   auto a = StartCore("a");
   auto b = StartCore("b");
   RasEndpoint wrong = b->Endpoint();
   wrong.token = "00000000000000000000000000000000";
   Register(*a, "engine-a", "engine-b", wrong);
   ASSERT_TRUE(WaitLink(*a, wrong.uuid, [](const LinkInfo& l) {
-    return l.lastError == LinkError::kTokenMismatch && l.connectAttempts >= 2;
+    return l.state == LinkState::kGaveUp && l.lastError == LinkError::kTokenMismatch;
   }));
+  // That runtime's token can't change, so a retry could only be rejected again.
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
   LinkInfo l = *Link(*a, wrong.uuid);
-  EXPECT_NE(l.state, LinkState::kConnected);
+  EXPECT_EQ(l.state, LinkState::kGaveUp);
+  EXPECT_EQ(l.connectAttempts, 1u);
   EXPECT_EQ(l.heartbeatsReceived, 0u);
   EXPECT_EQ(l.connects, 0u);
-  EXPECT_TRUE(WaitFor([&] { return b->Snapshot().inboundRejected >= 2; }, 2000));
+  EXPECT_EQ(b->Snapshot().inboundRejected, 1u);
   EXPECT_FALSE(Link(*b, a->Endpoint().uuid).has_value());
+  // A new registration is new information: with the right token, the link comes up.
+  Register(*a, "engine-a", "engine-b", b->Endpoint());
+  EXPECT_TRUE(WaitLink(*a, wrong.uuid, Connected));
 }
 
 TEST(RasLinks, AnEndpointNowHeldByAnotherRuntimeIsReported) {
@@ -214,7 +221,10 @@ TEST(RasLinks, AnEndpointNowHeldByAnotherRuntimeIsReported) {
   Register(*a, "engine-a", "engine-old", stale);
   ASSERT_TRUE(WaitLink(
       *a, stale.uuid, [](const LinkInfo& l) { return l.lastError == LinkError::kEndpointReused; }));
-  EXPECT_NE(Link(*a, stale.uuid)->state, LinkState::kConnected);
+  // The runtime it names can't come back on an endpoint another one holds.
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  EXPECT_EQ(Link(*a, stale.uuid)->state, LinkState::kGaveUp);
+  EXPECT_EQ(Link(*a, stale.uuid)->connectAttempts, 1u);
 }
 
 TEST(RasLinks, ANewerOnlyPeerIsRejectedForItsVersion) {
@@ -246,7 +256,7 @@ TEST(RasLinks, ANewerOnlyPeerIsRejectedForItsVersion) {
   rejection.maxVersion = 3;
   ASSERT_TRUE(fake.Send(fromCore, 1, rejection, /*version=*/2));
   EXPECT_TRUE(WaitLink(*core, fake.identity.uuid, [](const LinkInfo& l) {
-    return l.lastError == LinkError::kVersionMismatch;
+    return l.lastError == LinkError::kVersionMismatch && l.state == LinkState::kGaveUp;
   }));
 }
 
@@ -298,6 +308,52 @@ TEST(RasLinks, ARefusedConnectIsRasEndpointUnavailableAndRetriedWithBackoff) {
   uint64_t after = Link(*a, dead.uuid)->connectAttempts;
   EXPECT_LE(after - before, 4u);
   EXPECT_NE(Link(*a, dead.uuid)->state, LinkState::kConnected);
+}
+
+// RAS keeps its listener open while its process lives, so reconnects refused for the
+// peer-gone timeout, 60 s scaled by StartCore's 0.05 to 3 s, mean the process is gone. A
+// framework that never deregisters the peer, as SGLang doesn't, would otherwise keep retrying
+// for the life of the process.
+TEST(RasLinks, ALinkRefusedForThePeerGoneTimeoutGivesUp) {
+  auto a = StartCore("a");
+  int held = -1;
+  uint16_t port = ras_test::HoldPort("127.0.0.1", &held);
+  close(held);
+  RasEndpoint dead{"127.0.0.1", port, "0123456789abcdef0123456789abcdef",
+                   UuidBeside(a->Endpoint().uuid, true)};
+  auto registered = std::chrono::steady_clock::now();
+  Register(*a, "engine-a", "engine-dead", dead);
+  ASSERT_TRUE(WaitLink(
+      *a, dead.uuid, [](const LinkInfo& l) { return l.state == LinkState::kGaveUp; }, 8000));
+  EXPECT_GE(std::chrono::steady_clock::now() - registered, std::chrono::milliseconds(2900));
+  LinkInfo l = *Link(*a, dead.uuid);
+  EXPECT_EQ(l.lastError, LinkError::kRasEndpointUnavailable);
+  EXPECT_EQ(l.relations, 1u);                            // kept for STATUS
+  std::this_thread::sleep_for(std::chrono::seconds(2));  // past the 1.5 s backoff cap
+  EXPECT_EQ(Link(*a, dead.uuid)->connectAttempts, l.connectAttempts);
+}
+
+TEST(RasLinks, OnlyTheNewestRetiredLinksAreKept) {
+  auto a = StartCore("a");
+  auto b = StartCore("b");
+  // Stale EngineDescs naming runtimes that are gone, all at B's endpoint: each link gives up
+  // at its first reply, as ENDPOINT_REUSED, and keeps its relation.
+  constexpr uint64_t kStale = 70;
+  RasEndpoint eb = b->Endpoint();
+  for (uint64_t i = 1; i <= kStale; ++i) {
+    RasEndpoint stale = eb;
+    stale.uuid.lo += 2 * i;
+    Register(*a, "engine-a", "engine-old-" + std::to_string(i), stale);
+  }
+  ASSERT_TRUE(WaitFor([&] { return b->Snapshot().inboundRejected >= kStale; }, 5000));
+  EXPECT_TRUE(WaitFor(
+      [&] {
+        RuntimeSnapshot s = a->Snapshot();
+        return s.links.size() == 64 &&
+               std::all_of(s.links.begin(), s.links.end(),
+                           [](const LinkInfo& l) { return l.state == LinkState::kGaveUp; });
+      },
+      2000));
 }
 
 TEST(RasLinks, LeaveAtStopRetiresThePeer) {

@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "mori/ras/ras.hpp"
+#include "mori/utils/mori_log.hpp"
 #include "src/ras/logging.hpp"
 #include "src/ras/runtime.hpp"
 #include "tests/cpp/ras/ras_test_util.hpp"
@@ -297,6 +298,49 @@ TEST(RasRuntime, ProblemsShowAtTheDefaultLogLevelOnlyWhenRasWasAskedFor) {
         << " MORI_RAS_PORT=" << (c.port ? c.port : "(unset)");
   }
   for (int fd : held) close(fd);
+}
+
+// A lost peer is what RAS is turned on to see, so when MORI_RAS_ENABLE asks for RAS it shows
+// at MORI's default level, unless a level was chosen.
+TEST(RasRuntime, ALostPeerShowsAtTheDefaultLogLevelWhenRasWasAskedFor) {
+  int held = -1;
+  uint16_t dead = ras_test::HoldPort("127.0.0.1", &held);
+  close(held);  // nothing listens there now
+  const char* const chosen[] = {nullptr, "MORI_RAS_LOG_LEVEL", "MORI_GLOBAL_LOG_LEVEL"};
+  for (const char* var : chosen) {
+    EXPECT_EQ(RunInChild([dead, var] {
+                setenv("MORI_RAS_ENABLE", "1", 1);
+                unsetenv("MORI_RAS_LOG_LEVEL");
+                unsetenv("MORI_GLOBAL_LOG_LEVEL");
+                if (var != nullptr) setenv(var, "error", 1);
+                mori::InitializeLoggingFromEnv();  // as for a variable set at startup
+                bool refused = false;
+                std::string log = RasLogAtDefaultLevel([dead, &refused] {
+                  RasRuntime* rt = RasRuntime::EnsureStarted(Params());
+                  if (rt == nullptr) return;
+                  PeerAdded peer;
+                  peer.localEngine = "local";
+                  peer.remoteEngine = "gone";
+                  peer.endpoint = RasEndpoint{"127.0.0.1", dead, "0123456789abcdef0123456789abcdef",
+                                              RuntimeUuid{1, 0x8000000000000001ull}};
+                  rt->Enqueue(std::move(peer));
+                  refused = WaitFor(
+                      [rt] {
+                        for (const LinkInfo& l : rt->Snapshot().links) {
+                          if (l.lastError == LinkError::kRasEndpointUnavailable) return true;
+                        }
+                        return false;
+                      },
+                      2000);
+                });
+                CHILD_CHECK(refused);
+                bool shown = log.find("RAS_ENDPOINT_UNAVAILABLE") != std::string::npos;
+                CHILD_CHECK(shown == (var == nullptr));
+                return 0;
+              }),
+              0)
+        << (var != nullptr ? var : "no level") << " set";
+  }
 }
 
 TEST(RasRuntime, TheRasThreadRunsAtLowPriorityWhereItIsPinned) {

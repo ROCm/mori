@@ -47,6 +47,14 @@
 // without exec holds its sockets. Telling a slow peer from a stuck one is P3's connectivity
 // machine.
 //
+// Giving up. Reconnects refused for the peer-gone timeout (60 s, scaled) mean the peer's
+// process is gone, since RAS keeps its listener open while its process lives; a token,
+// version, or reused-endpoint rejection can't change for that runtime at all. Either retires
+// the link as GAVE_UP: no more reconnects, as after LEAVE. A timeout keeps retrying, because a
+// stopped or partitioned peer comes back under the same UUID. A given-up link comes back if
+// the peer connects to us, or if an engine registers it again. Frameworks such as SGLang
+// never deregister a peer, so only the newest kMaxRetiredLinks retired links are kept.
+//
 // Every timer reads CLOCK_MONOTONIC, so an NTP step can't fire or suppress one.
 
 #include <atomic>
@@ -155,6 +163,7 @@ class LinkManager {
     uint64_t backoffNs{0};
     uint64_t nextHeartbeatNs{0};
     uint64_t lastRxNs{0};
+    uint64_t refusedSinceNs{0};  // the first of the reconnects refused in a row, or 0
     uint64_t connectAttempts{0};
     uint64_t connects{0};
     uint64_t disconnects{0};
@@ -208,9 +217,18 @@ class LinkManager {
   void OnConnected(Conn* c, uint64_t now);
   void Establish(Link& l, Conn* c, uint16_t version, const proto::Hello& hello, uint64_t now);
   // The link lost its connection. Reconnects if this side still has relations, now if
-  // `retryNow`; otherwise the link is forgotten. Returns false if it was forgotten.
+  // `retryNow`, unless the error says the peer is gone for good; otherwise the link is
+  // forgotten. Returns false if it was forgotten.
   bool LinkDown(LinkMap::iterator it, LinkError error, const std::string& detail, uint64_t now,
                 bool retryNow);
+  // A link that left (PEER_LEFT) or gave up (GAVE_UP) but still has relations. Only the
+  // newest kMaxRetiredLinks stay, with their relations, since a framework that never
+  // deregisters would otherwise keep one per lost peer for the life of the process.
+  void Retire(const RuntimeUuid& peer);
+  // Reads what `c` has queued before a timer judges it. A process resumed after a stop sees
+  // EINTR with nothing read, and would otherwise blame its peers for its own pause. False if
+  // the read closed `c`.
+  bool ReadBeforeJudging(Conn* c, uint64_t now);
   void ScheduleConnect(Link& l, uint64_t now, bool immediate);
   void SendHeartbeat(Link& l, uint64_t now);
   void SetState(Link& l, LinkState state, LinkError error, uint64_t now);
@@ -223,6 +241,7 @@ class LinkManager {
   RasProcessId self_;
   std::set<std::string> localEngines_;
   LinkMap links_;
+  std::deque<RuntimeUuid> retired_;  // oldest first
   std::unordered_map<uint64_t, std::unique_ptr<Conn>> conns_;
   uint64_t nextConnId_{1};
   std::map<std::pair<std::string, std::string>, RuntimeUuid> relations_;

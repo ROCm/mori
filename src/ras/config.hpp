@@ -51,10 +51,12 @@ struct RasConfig {
 
   uint64_t HeartbeatNs() const { return uint64_t{heartbeatMs} * 1000000; }
   // An established link that hears nothing from its peer this long is down: RCCL's 20 s
-  // keep-alive timeout, or three heartbeats if those take longer.
-  uint64_t HeartbeatTimeoutNs() const {
-    return ScaledMs(std::max<uint64_t>(20000, uint64_t{heartbeatMs} * 3));
-  }
+  // keep-alive timeout, scaled, but never under three heartbeats, which the factor doesn't
+  // scale.
+  uint64_t HeartbeatTimeoutNs() const { return std::max(ScaledMs(20000), 3 * HeartbeatNs()); }
+  // Reconnects refused this long mean the peer's process is gone: RCCL's 60 s peer-dead
+  // timeout. RAS keeps its listener open while its process lives.
+  uint64_t PeerGoneTimeoutNs() const { return ScaledMs(60000); }
   // Connect plus HELLO, in either direction: RCCL's 5 s connect warning.
   uint64_t HandshakeTimeoutNs() const { return ScaledMs(5000); }
   uint64_t ReconnectBackoffInitialNs() const { return ScaledMs(1000); }
