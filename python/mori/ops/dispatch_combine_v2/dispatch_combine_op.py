@@ -207,9 +207,10 @@ class EpDispatchCombineConfig:
     # capacity. Read only when internode_kernel == "auto".
     internode_auto_ll_max_tokens: int = 512
     # Which kernel backend serves this op: "flydsl" (default except on gfx125x,
-    # full intranode feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
-    # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
-    # in bf16/fp32). "hip" is the only backend with an internode path -- flydsl's
+    # full intranode feature set) or "hip" (HIP/JIT: gather, the quantized combine,
+    # and on gfx942/gfx950 the recv cap and routing replay; dispatch transports
+    # bf16/fp32/fp8/fp4 and combine reduces in bf16/fp32; see the README for what
+    # it lacks). "hip" is the only backend with an internode path -- flydsl's
     # _unsupported rejects any config whose gpu_per_node < world_size -- so a
     # multi-node config must name it. None = MORI_V2_KERNEL_BACKEND, else the
     # default. Only consulted when constructing the BASE class; naming a

@@ -188,6 +188,20 @@ def _cases():
     # feature paths
     yield "bf16-gather-tuned", {"DTYPE": "bf16", "COMBINE": "gather", "TUNED": 1}
     yield "bf16-gather-replay", {"DTYPE": "bf16", "COMBINE": "gather", "REPLAY": 1}
+    for extra in (
+        {},
+        {"SCALE_DIM": 32},
+        {"TOPK": 9, "RAGGED": 1, "NOSELF": 1},
+        {"MAXRECV": 1024},
+    ):
+        tag = "".join(f"-{k.lower()}" for k in extra)
+        yield f"hip-bf16-gather-replay{tag}", {
+            "MORI_V2_KERNEL_BACKEND": "hip",
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "REPLAY": 1,
+            **extra,
+        }
     yield "bf16-stdmoe", {"DTYPE": "bf16", "COMBINE": "gather", "STDMOE": 1}
 
 

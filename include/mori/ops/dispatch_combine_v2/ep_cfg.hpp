@@ -261,6 +261,7 @@ struct EpCfg {
   // or 128 (f32); 0 = off. Each sender quantizes into the origin's landing row.
   int combineScatterQGroup = 0;
   bool combineScatterFp4 = false;  // e2m1 instead of fp8 on that wire (gfx950)
+  bool replay = false;             // dispatch sends to the slots a handle's dest map names
   bool aggReserve = false;
   int callTokMax = 0;
   bool ll128 = false;
@@ -293,6 +294,7 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(combineBf16Push);
   MORI_FIELD(combineScatterQGroup);
   MORI_FIELD(combineScatterFp4);
+  MORI_FIELD(replay);
   MORI_FIELD(aggReserve);
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
@@ -305,7 +307,7 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 27, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 28, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};

@@ -166,6 +166,46 @@ struct EpMultiWarpIter {
 /* ------------------------------------------------------------------------- */
 /*                                  Dispatch                                  */
 /* ------------------------------------------------------------------------- */
+// One routed slot's weights, expert ids, payload and scale row, sent to its
+// destination slot. The routing pass and the replay pass share it.
+template <EpCfg kCfg, typename T>
+__device__ __forceinline__ void EpPublishSlot(EpArgs args, int laneId, int destPe, int destTokId,
+                                              int srcTokId) {
+  constexpr int kTopk = kCfg.numExpertPerToken;
+  constexpr size_t kHidden = static_cast<size_t>(kCfg.hiddenDim);
+  const unsigned long long win = args.window;
+  if (laneId < kTopk) {
+    if constexpr (kCfg.useWeights) {
+      if (args.weightsBuf) {
+        EpPeer<float>(win, destPe, args.offOutWts)[destTokId * kTopk + laneId] =
+            args.weightsBuf[srcTokId * kTopk + laneId];
+      }
+    }
+    EpPeer<int>(win, destPe, args.offOutIdx)[destTokId * kTopk + laneId] =
+        args.tokenIndices[srcTokId * kTopk + laneId];
+  }
+
+  core::WarpCopy(EpPeer<T>(win, destPe, args.offDispOut) + destTokId * kHidden,
+                 reinterpret_cast<const T*>(args.inpTokenBuf) + srcTokId * kHidden, kHidden);
+  // The scale row follows its token to the same slot. No staging detour like the
+  // gfx1250 body needs: this body already copies straight to the peer per token,
+  // and on these parts a peer vector store is not the slow path TDM exists for.
+  // Laid out at EpScaleStride even here, where the alignment buys nothing:
+  // one layout per consumer, whatever arch produced it.
+  if constexpr (kCfg.scaleBytes > 0) {
+    constexpr int kSrcDw = kCfg.scaleBytes / 4;
+    constexpr int kDstDw = EpScaleStride(kCfg) / 4;
+    if (args.scalesBuf) {
+      unsigned int* dstS =
+          EpPeer<unsigned int>(win, destPe, args.offOutScales) + (size_t)destTokId * kDstDw;
+      core::WarpCopy(
+          dstS, reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)srcTokId * kSrcDw,
+          kSrcDw);
+      for (int e = kSrcDw + laneId; e < kDstDw; e += kCfg.waveSize) dstS[e] = 0u;
+    }
+  }
+}
+
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatchBody(EpArgs args) {
   constexpr int kNpes = kCfg.worldSize;
@@ -189,7 +229,24 @@ __device__ void EpDispatchBody(EpArgs args) {
   if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
 
   // Phase 1: route and send. One warp per (token, top-k slot).
-  if (args.tokenIndices && args.inpTokenBuf) {
+  if constexpr (kCfg.replay) {
+    // Replay: the handle's dest map names every slot, so nothing is claimed.
+    if (args.tokenIndices && args.inpTokenBuf) {
+      for (int i = globalWarpId; i < args.numTokens * kTopk; i += globalWarpNum) {
+        const int flat = args.dispDestTokIdMap[i];
+        const int destPe = EpPeFromFlat<kCfg>(flat);
+        if (flat < 0 || destPe >= kNpes) continue;
+        const int destTokId = EpLocalTokFromFlat<kCfg>(flat);
+        const int srcTokId = i / kTopk;
+        if (laneId == 0) {
+          atomicAdd(args.destPeTokenCounter + destPe, 1);
+          EpPeer<int>(win, destPe, args.offRecvToSrc)[destTokId] =
+              EpSrcTokIndex<kCfg>(myPe, srcTokId);
+        }
+        EpPublishSlot<kCfg, T>(args, laneId, destPe, destTokId, srcTokId);
+      }
+    }
+  } else if (args.tokenIndices && args.inpTokenBuf) {
     for (int i = globalWarpId; i < args.numTokens * kTopk; i += globalWarpNum) {
       const int srcTokId = i / kTopk;
       int destPe;
@@ -246,37 +303,7 @@ __device__ void EpDispatchBody(EpArgs args) {
         if (destTokId < 0) continue;
       }
 
-      if (laneId < kTopk) {
-        if constexpr (kCfg.useWeights) {
-          if (args.weightsBuf) {
-            EpPeer<float>(win, destPe, args.offOutWts)[destTokId * kTopk + laneId] =
-                args.weightsBuf[srcTokId * kTopk + laneId];
-          }
-        }
-        EpPeer<int>(win, destPe, args.offOutIdx)[destTokId * kTopk + laneId] =
-            args.tokenIndices[srcTokId * kTopk + laneId];
-      }
-
-      core::WarpCopy(EpPeer<T>(win, destPe, args.offDispOut) + destTokId * kHidden,
-                     reinterpret_cast<const T*>(args.inpTokenBuf) + srcTokId * kHidden, kHidden);
-      // The scale row follows its token to the same slot. No staging detour like the
-      // gfx1250 body needs: this body already copies straight to the peer per token,
-      // and on these parts a peer vector store is not the slow path TDM exists for.
-      // Laid out at EpScaleStride even here, where the alignment buys nothing:
-      // one layout per consumer, whatever arch produced it.
-      if constexpr (kCfg.scaleBytes > 0) {
-        constexpr int kSrcDw = kCfg.scaleBytes / 4;
-        constexpr int kDstDw = EpScaleStride(kCfg) / 4;
-        if (args.scalesBuf) {
-          unsigned int* dstS =
-              EpPeer<unsigned int>(win, destPe, args.offOutScales) + (size_t)destTokId * kDstDw;
-          core::WarpCopy(
-              dstS,
-              reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)srcTokId * kSrcDw,
-              kSrcDw);
-          for (int e = kSrcDw + laneId; e < kDstDw; e += kCfg.waveSize) dstS[e] = 0u;
-        }
-      }
+      EpPublishSlot<kCfg, T>(args, laneId, destPe, destTokId, srcTokId);
     }
   }
 

@@ -59,6 +59,7 @@ struct EpRequest {
   bool combineBf16Push = false;
   int combineScatterQGroup = 0;    // gfx942/gfx950 fp8 scatter combine: 32 or 128; 0 = off
   bool combineScatterFp4 = false;  // e2m1 on that wire instead (gfx950)
+  bool replay = false;             // dispatch: reuse a handle's slots (portable body)
   int callTokMax = 0;
   bool ll128 = false;
   bool ll128CombineOnly = false;
@@ -90,6 +91,7 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(combineBf16Push);
   MORI_FIELD(combineScatterQGroup);
   MORI_FIELD(combineScatterFp4);
+  MORI_FIELD(replay);
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
   MORI_FIELD(ll128CombineOnly);
@@ -101,7 +103,7 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 26,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 27,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();

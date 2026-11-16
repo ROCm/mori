@@ -275,7 +275,7 @@ def _run(d, comm):
                     f"(sum={lec_total} exp={lec_exp})",
                     flush=True,
                 )
-            if int(os.environ.get("REPLAY", 0)) and cap is None:
+            if int(os.environ.get("REPLAY", 0)):
                 ref = recv_x[:total_recv].clone()
                 r2 = op.dispatch(inp[:ct], wts[:ct], sc_in, idx[:ct], routing=routing)
                 sync()

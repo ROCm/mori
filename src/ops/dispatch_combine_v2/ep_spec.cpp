@@ -88,6 +88,14 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     throw std::runtime_error("mori v2 ep: combineScatterFp4 needs combineScatterQGroup");
   }
 
+  if (req.replay) {
+    if (kind != EpKernelKind::Dispatch || arch.rfind("gfx125", 0) == 0) {
+      throw std::runtime_error(
+          "mori v2 ep: replay is a dispatch of the portable body; the gfx125x body has none");
+    }
+    c.replay = true;
+  }
+
   // Defaults for the bare C++ caller only -- the Python path uses the tuning
   // table (hip_tuning_configs) and never sees these. Split by kernel because
   // dispatch is copy-bound and wants warps while combine's reduction saturates
@@ -325,7 +333,9 @@ std::string EpCombineInfo(const EpCfg& c) {
   return s + EpRegionInfo(c, EpKernelKind::Combine);
 }
 
-std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
+std::string EpDispatchSpec::EntryName(const Cfg& cfg) {
+  return EpEntryName(cfg, cfg.replay ? "dispatch_replay" : "dispatch");
+}
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
   if (cfg.combineScatterQGroup) {
     const bool g32 = cfg.combineScatterQGroup == 32;
