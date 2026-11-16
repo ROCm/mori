@@ -265,14 +265,19 @@ void Concurrent(Pair& p, bool read, bool quick) {
   Require(mem.Download(bytes, read) == expected, "concurrent kernarg/payload mismatch");
 }
 
-void Large(Pair& p, bool read) {
+void Large(Pair& p, bool read, int alignment) {
   // Stream host initialization/verification in 16 MiB windows, keeping host RAM bounded.
   constexpr size_t bytes = (size_t{1} << 32) + 4097;
+  constexpr size_t allocationBytes = bytes + 64;
   constexpr size_t window = 16 * 1024 * 1024;
-  Buffers mem(p, bytes + 32);
+  const size_t localOffset = alignment == 0 ? 16 : 17;
+  const size_t remoteOffset = alignment == 0 ? 16 : (alignment == 1 ? 17 : 19);
+  const size_t srcOffset = read ? remoteOffset : localOffset;
+  const size_t dstOffset = read ? localOffset : remoteOffset;
+  Buffers mem(p, allocationBytes);
   std::vector<unsigned char> source(window), sentinel(window, kSentinel), result(window);
-  for (size_t off = 0; off < bytes + 32; off += window) {
-    size_t n = std::min(window, bytes + 32 - off);
+  for (size_t off = 0; off < allocationBytes; off += window) {
+    size_t n = std::min(window, allocationBytes - off);
     for (size_t j = 0; j < n; ++j) source[j] = Pattern(78, off + j);
     Hip(hipSetDevice(read ? p.remote : p.local));
     Hip(hipMemcpy(static_cast<char*>(read ? mem.remote : mem.local) + off, source.data(), n,
@@ -284,17 +289,19 @@ void Large(Pair& p, bool read) {
   auto s = mem.Session();
   TransferStatus status;
   if (read)
-    s.Read(16, 16, bytes, &status, s.AllocateTransferUniqueId());
+    s.Read(localOffset, remoteOffset, bytes, &status, s.AllocateTransferUniqueId());
   else
-    s.Write(16, 16, bytes, &status, s.AllocateTransferUniqueId());
+    s.Write(localOffset, remoteOffset, bytes, &status, s.AllocateTransferUniqueId());
   Success(status);
   Hip(hipSetDevice(read ? p.local : p.remote));
-  for (size_t off = 0; off < bytes + 32; off += window) {
-    size_t n = std::min(window, bytes + 32 - off);
+  for (size_t off = 0; off < allocationBytes; off += window) {
+    size_t n = std::min(window, allocationBytes - off);
     Hip(hipMemcpy(result.data(), static_cast<char*>(read ? mem.local : mem.remote) + off, n,
                   hipMemcpyDeviceToHost));
     for (size_t j = 0; j < n; ++j) {
-      auto want = off + j >= 16 && off + j < bytes + 16 ? Pattern(78, off + j) : kSentinel;
+      auto want = off + j >= dstOffset && off + j < bytes + dstOffset
+                      ? Pattern(78, off + j - dstOffset + srcOffset)
+                      : kSentinel;
       if (result[j] != want)
         throw std::runtime_error(">4 GiB copy mismatch at " + std::to_string(off + j));
     }
@@ -348,7 +355,7 @@ int main(int argc, char** argv) {
     p.b.LoadFabricCopyModule(hsaco);
     std::mt19937 rng(17);
     for (bool read : {false, true}) {
-      for (size_t n : {1, 7, 16, 17, 512, 513, 1000, 5000}) {
+      for (size_t n : {1, 2, 7, 16, 17, 512, 513, 1000, 5000}) {
         for (int alignment : {0, 1, 2}) {
           SizeVec sizes;
           const size_t choices[] = {1, 15, 16, 656, 4095, 4096, 4097};
@@ -368,7 +375,8 @@ int main(int argc, char** argv) {
       Failure(p, true, false, read);
       Failure(p, true, true, read);
       Concurrent(p, read, quick);
-      if (!quick) Large(p, read);
+      if (!quick)
+        for (int alignment : {0, 1, 2}) Large(p, read, alignment);
     }
     std::cout << "PASS: Fabric batch copy"
               << (quick ? " (quick; >4 GiB and full stress omitted)" : "") << '\n';
