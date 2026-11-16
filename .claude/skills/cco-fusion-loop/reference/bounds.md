@@ -100,6 +100,11 @@ saved.
 Across M on this model, fusing collects about half of the ideal ceiling
 (`G950-GAR-03`).
 
+`bound.py` on this input (`benchmark/cco/harness/bounds.example.yaml`) gives, for the
+whole call, 1534.9-1569.9 µs at `n` = 8 against the measured 1549.6 µs, and prefers 4
+to 6 chunks: a 5.3-6.4% saving, go at a 5% threshold. That fewer chunks would beat the
+8 in use is inferred from the model and has not been measured.
+
 ## Go or no-go
 
 Do not fuse when the realistic saving is below the noise band or below the contract's
@@ -110,6 +115,16 @@ Fusion can also remove work: an intermediate write and read of HBM, staging copi
 launches. A fused result can therefore beat a bound derived from the split path. Treat
 that as a finding to explain (check correctness first, then the measurement, then the
 model), not as a win.
+
+## Running it
+
+`python benchmark/cco/harness/bound.py <input> --out-md <records>/bounds.md --out-json <records>/bounds.json`
+
+The input lists each bucket's phases with a role (`compute`, `overlap` or `serial`),
+plus the optional whole-call time, contention run and tile count; the format is in
+`benchmark/cco/harness/README.md`. It sweeps `n`, uses the exact two-stage pipeline (the
+two formulas above are its limits), and decides with the high `t0` and the best `n` for
+it.
 
 ## bounds.md
 

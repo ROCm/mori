@@ -48,7 +48,10 @@ input is missing or inconsistent, stop and return the list of problems.
 1. **Identity.** Check out the commit (for example `git worktree add <tmp> <commit>`),
    build it, compile the candidate's kernels with a fresh `FLYDSL_RUNTIME_CACHE_DIR` and
    `FLYDSL_DUMP_IR=1`, and compare each code object's sha256 with the manifest. On a
-   mismatch, the verdict is `inconclusive`; stop.
+   mismatch, the verdict is `inconclusive`; stop. Then run
+   `benchmark/cco/harness/isa_check.py` on the dump (with the communication-off dump as
+   `--baseline` when the manifest names one) and record its result; a FAIL there is
+   reported, not fixed.
 2. **Environment.** Record the mori, FlyDSL, ROCm and torch versions, the image and the
    node. Run the operator's `self_test()` (`G950-ENV-01`).
 3. **Correctness,** on the contract's shapes and on held-out shapes:

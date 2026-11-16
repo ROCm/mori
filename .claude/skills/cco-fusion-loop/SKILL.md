@@ -77,7 +77,8 @@ Measure the fastest GEMM, the fastest collective, the split path end to end with
 in-pipeline phase times, and the GEMM and collective running concurrently. Compute
 `T_ideal` and `T_real` per bucket (with an `n` sweep), estimate the other levers
 (a narrower wire, another collective, a faster GEMM), and decide go or no-go. Method and
-a worked example: [reference/bounds.md](reference/bounds.md). Write `bounds.md`.
+a worked example: [reference/bounds.md](reference/bounds.md);
+`benchmark/cco/harness/bound.py` computes them from a phase list. Write `bounds.md`.
 
 ### Step 2. Design
 
@@ -90,7 +91,8 @@ time per bucket. Rank the candidates by expected gain and risk and choose the ne
 ### Step 3. Build, check, diagnose
 
 The implementer builds the chosen candidate behind switches, passes its own
-correctness gate and ISA check, measures the variants, decomposes the gap and iterates
+correctness gate and ISA check (`benchmark/cco/harness/isa_check.py`), measures the
+variants, decomposes the gap and iterates
 one change at a time ([reference/diagnosis.md](reference/diagnosis.md)). When it
 considers the candidate ready, it freezes it: a commit plus a candidate manifest
 ([templates/candidate.example.json](templates/candidate.example.json)). Its numbers are

@@ -24,6 +24,7 @@
   "self_check": {
     "correctness": "pass | fail",
     "isa_check": "pass | fail",
+    "isa_check_report": "<records>/runs/<run-id>/isa.json",
     "notes": "<anything the verifier should know about how to run it, not conclusions>"
   },
   "prediction": [

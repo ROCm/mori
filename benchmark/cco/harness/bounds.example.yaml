@@ -1,0 +1,24 @@
+# Input to bound.py: the gemm_ar worked example (G950-GAR-01).
+#
+# DeepSeek-V4.1-Flash wo_b, TP4, M=16384, N=5120, K=2048, MXFP8 GEMM, BF16 scatter
+# and gather. Phase times are split-SDMA, measured inside the pipeline, max over
+# ranks; split_us is the whole call with tracing off.
+#
+#   python bound.py bounds.example.yaml
+
+t0_us: [4, 9]            # fixed cost of one extra put (G950-SDMA-01, G950-SDMA-02)
+n_max: 16                # sweep n = 1..16 chunks per destination
+noise_band_pct: 1.0      # A/A spread measured in the same session
+min_gain_pct: 5.0        # the contract's targets.min_gain_pct
+cus: 256                 # MI355X
+
+buckets:
+  - m: 16384
+    split_us: 1638.8
+    tiles: 1280          # ceil(16384/256) * ceil(5120/256)
+    phases:
+      - {name: gemm, us: 149.9, role: compute}
+      - {name: scatter, us: 728.0, role: overlap}
+      - {name: reduce, us: 32.4, role: serial}
+      - {name: gather, us: 727.8, role: serial}
+    # concurrent_us: <GEMM and scatter on two streams, independent buffers>

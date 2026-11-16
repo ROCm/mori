@@ -18,6 +18,12 @@ the measurement again, independently, at step 4.
 
 ## ISA check (after every kernel change, before timing)
 
+Run `python benchmark/cco/harness/isa_check.py <dump-dir> --baseline <comm-off-dump-dir>`.
+It checks the resources, where every cache operation sits (following calls), the store
+cache policy and the K loop against the communication-off build, and exits 1 on a FAIL.
+It cannot tell which stores write a cco window, and it does not inspect poll-loop loads;
+read those in the ISA yourself. The list below is what it automates and what to read.
+
 Dump with `FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=<dir>` and a fresh
 `FLYDSL_RUNTIME_CACHE_DIR`, then read `*_final_isa.s`. Compare it against the previous
 version and against the same kernel with communication off.

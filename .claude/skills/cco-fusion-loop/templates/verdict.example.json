@@ -19,6 +19,10 @@
     "torch": "<version>",
     "self_test": "pass"
   },
+  "isa_check": {
+    "result": "PASS | FAIL",
+    "report": "<records>/runs/<run-id>/isa.json"
+  },
   "correctness": {
     "rule": "bit-exact | rel_l2 <= <bound>",
     "contract_shapes": "pass",
