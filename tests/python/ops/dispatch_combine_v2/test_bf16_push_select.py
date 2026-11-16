@@ -98,10 +98,16 @@ def run(cfg, comm, lim, sizes, args):
     def hows(i):
         return [h for h in HOWS if h != "snapshot" or min(sizes[i]) > lim]
 
-    def pair(i, how):
+    def pair(i, how, peak=True):
         x, idx, w = args[i]
         out, _, _, _, _, h = op.dispatch(
-            x, w, None, idx, return_routing=True, snapshot=how == "snapshot"
+            x,
+            w,
+            None,
+            idx,
+            return_routing=True,
+            snapshot=how == "snapshot",
+            max_num_inp_token_across_ranks=max(sizes[i]) if peak else None,
         )
         if how == "mixed":
             how = "in_view" if (rank + i) % 2 else "plain"
@@ -113,15 +119,17 @@ def run(cfg, comm, lim, sizes, args):
             o, _ = op.combine(view, weights=w if how == "weights" else None, routing=h)
         return o.clone()
 
+    def summed(i):
+        x, idx, _ = (t.cpu() for t in args[i])
+        u = torch.zeros(sizes[i][rank], world).scatter_(1, idx.long() // EPR, 1.0)
+        return u.sum(1, keepdim=True) * x.float()
+
     built = bool(op._push_specs)
     check("push_plans_built" if PUSH else "no_push_plans", built == PUSH)
     land = op.push_landing() if built else None
     refs = []
     for i, ns in enumerate(sizes):
-        n = ns[rank]
-        x, idx, _ = (t.cpu() for t in args[i])
-        u = torch.zeros(n, world).scatter_(1, idx.long() // EPR, 1.0)
-        want = u.sum(1, keepdim=True) * x.float()
+        want = summed(i)
         got = {}
         for how in hows(i):
             if land is not None:
@@ -130,7 +138,7 @@ def run(cfg, comm, lim, sizes, args):
             got[how] = pair(i, how)
             sync()
             if land is not None:
-                check(f"path_{how}", bool(land.any()) == pushes(n, how, lim))
+                check(f"path_{how}", bool(land.any()) == pushes(max(ns), how, lim))
             check(
                 f"bf16_sum_{how}",
                 torch.allclose(got[how].float().cpu(), want, atol=2e-2, rtol=2e-2),
@@ -142,6 +150,23 @@ def run(cfg, comm, lim, sizes, args):
     got = [pair(i, how) for i in range(len(sizes)) for how in hows(i)]
     sync()
     check("eager_back_to_back", all(map(torch.equal, got, refs)))
+
+    for i, ns in enumerate(sizes):
+        if max(ns) > lim:
+            continue
+        want = summed(i)
+        for how in hows(i):
+            if land is not None:
+                land.zero_()
+            sync()
+            o = pair(i, how, peak=False)
+            sync()
+            if land is not None:
+                check(f"nopeak_path_{how}", bool(land.any()) == (how not in PULLS))
+            check(
+                f"nopeak_bf16_sum_{how}",
+                torch.allclose(o.float().cpu(), want, atol=2e-2, rtol=2e-2),
+            )
 
     op.close()
     failures = 0

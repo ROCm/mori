@@ -77,7 +77,11 @@ the following important restrictions:
 * ``gpu_per_node`` determines physical node grouping. A single host cannot
   emulate the two-node internode test by changing world size alone.
 * For internode, ``internode_kernel`` chooses ``"v2"``, ``"v2_ll"`` or
-  ``"auto"``. Auto chooses by the current call's token count, not buffer capacity.
+  ``"auto"``. Auto chooses by the ``max_num_inp_token_across_ranks`` passed to
+  ``dispatch`` (the largest token count any rank passes that call), not by
+  buffer capacity, and runs ``"v2"`` when it is not passed. ``low_latency=True``
+  or ``False`` selects ``"v2_ll"`` or ``"v2"``; see the package guide for what
+  it does on gfx125x intranode.
 
 Validation before tuning
 ------------------------
