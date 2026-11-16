@@ -32,6 +32,7 @@ import json
 import os
 import sys
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -133,8 +134,8 @@ def _configure():
     # NOSELF=1: no token picks an expert on its own rank, so no rank receives from
     # itself.
     NOSELF = int(os.environ.get("NOSELF", 0))
-    # FRESH=1: read the received rows right after dispatch, before any barrier,
-    # and require them to equal what the same views hold after the barrier.
+    # FRESH=1: copy the received rows and the reverse map in-stream right after
+    # dispatch, and require them to equal what the views hold after the barrier.
     FRESH = int(os.environ.get("FRESH", 0))
     # REROUTE=N: N more rounds per SWEEP point with new routing, each reading
     # local_expert_count straight after dispatch.
@@ -240,15 +241,20 @@ def _run(d, comm):
             # Read straight after dispatch, no sync or barrier, as SGLang does.
             has_lec = "local_expert_count" in getattr(op, "capabilities", frozenset())
             lec_now = op.local_expert_count().clone() if has_lec else None
+            if FRESH:
+                # Copies queued right behind the dispatch kernel, before any host sync
+                # or barrier, of every row peers wrote, the reverse map included.
+                views = (recv_x, disp_w, disp_i, out_s, routing._reverse_src_view)
+                views = [v for v in views if v is not None]
+                early = [v.clone() for v in views]
             total_recv = int(total_recv_t.cpu().item())
             sync()
-            if FRESH:
-                views = [v for v in (recv_x, disp_w, disp_i, out_s) if v is not None]
-                early = [v[:total_recv].clone() for v in views]
-                sync()
             comm.barrier()
             if FRESH:
-                ok_f = all(torch.equal(e, v[:total_recv]) for e, v in zip(early, views))
+                ok_f = all(
+                    torch.equal(e[:total_recv], v[:total_recv])
+                    for e, v in zip(early, views)
+                )
                 errs_f = d.allreduce_sum(0 if ok_f else 1)
                 if rank == 0:
                     print(
@@ -256,14 +262,24 @@ def _run(d, comm):
                         f"(rows read before the barrier == after; recv={total_recv})",
                         flush=True,
                     )
-            # Slots a token kept, from the dest map: a dup or a dropped slot is null.
+            # The PEs each token reaches: from the routing alone, or under a cap from
+            # the dest map (a dup or dropped slot is null; gfx125x never caps, and its
+            # LL128 map is not flat-encoded).
+            idx_cpu = idx[:ct].cpu()
+            pes = torch.where(idx_cpu >= 0, idx_cpu // EPR, -1)
+            reach = [{int(p) for p in row if p >= 0} for row in pes]
             stride = cfg.effective_max_recv
-            dmap = routing.disp_dest_tok_id_map[: ct * K].cpu().view(ct, K)
-            kept = dmap < npes * stride
-            kept_pe = torch.where(kept, dmap // stride, -1)
-            # each kept row carries every k whose expert lives on its PE
-            on_kept = (idx[:ct].cpu() // EPR).unsqueeze(2) == kept_pe.unsqueeze(1)
-            lec_mine = int((on_kept.any(dim=2) & (idx[:ct].cpu() >= 0)).sum())
+            if cap is not None:
+                dmap = routing.disp_dest_tok_id_map[: ct * K].cpu().view(ct, K)
+                kept = dmap < npes * stride
+                reach = [
+                    {int(f) // stride for f in row[k]} for row, k in zip(dmap, kept)
+                ]
+            # each reached row carries every k whose expert lives on its PE
+            lec_mine = sum(
+                sum(1 for p in pes[t].tolist() if p >= 0 and p in reach[t])
+                for t in range(ct)
+            )
             # Exact per-expert reference from every rank's routing (from the rows
             # kept, under a cap); the global sum counts the (token,k) assignments
             # whose PE kept the token. Capability-gated: a backend without it says so.
@@ -293,16 +309,25 @@ def _run(d, comm):
                     flush=True,
                 )
             if int(os.environ.get("REPLAY", 0)):
-                ref = recv_x[:total_recv].clone()
+                # Wipe what replay must rewrite, so a replay that writes nothing fails.
+                views = [v for v in (recv_x, disp_w, disp_i, out_s) if v is not None]
+                refs = [v[:total_recv].clone() for v in views]
+                for v in views:
+                    v[:total_recv].zero_()
+                sync()
+                comm.barrier()
                 r2 = op.dispatch(inp[:ct], wts[:ct], sc_in, idx[:ct], routing=routing)
                 sync()
                 comm.barrier()
-                ok_r = torch.equal(r2[0][:total_recv], ref)
+                outs = [v for v in (r2[0], r2[1], r2[3], r2[2]) if v is not None]
+                ok_r = int(r2[4].cpu().item()) == total_recv and all(
+                    torch.equal(o[:total_recv], ref) for o, ref in zip(outs, refs)
+                )
                 errs_r = d.allreduce_sum(0 if ok_r else 1)
                 if rank == 0:
                     print(
                         f"# OP-REPLAY ct={ct_point}: {'PASS' if errs_r == 0 else 'FAIL'} "
-                        f"(replayed layout == original)",
+                        f"(rows, weights, ids and scales rewritten as dispatched)",
                         flush=True,
                     )
             if SCALE_DIM:
@@ -360,23 +385,43 @@ def _run(d, comm):
                         f"wts={'ok' if ok_dw else 'BAD'})",
                         flush=True,
                     )
-            if cap is not None:
+            # Every rank receives min(demand, capacity): all of it without a cap.
+            demand = sum(
+                sum(
+                    1
+                    for row in other.tolist()
+                    if rank in {e // EPR for e in row if e >= 0}
+                )
+                for other in d.allgather(idx_cpu)
+            )
+            ok_recv = total_recv == min(demand, stride)
+            if cap is None:
+                errs = d.allreduce_sum(0 if ok_recv else 1)
+                if rank == 0:
+                    print(
+                        f"# OP-RECV ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
+                        f"(recv={total_recv} == demand)",
+                        flush=True,
+                    )
+            else:
                 # Drops depend on atomic order, so check invariants, not which tokens.
                 maps, revs = d.allgather(dmap), d.allgather(
                     routing.disp_tok_id_to_src_tok_id_local[:total_recv].cpu()
                 )
-                idxs = d.allgather(idx[:ct].cpu())
-                demand = sum(
-                    len({int(e) // EPR for e in row if e >= 0} & {rank})
-                    for other in idxs
-                    for row in other
-                )
-                ok = total_recv == min(demand, cap)
+                ok = ok_recv
                 for src, m in enumerate(maps):
-                    for t, k in (m < npes * stride).nonzero().tolist():
-                        pe, slot = divmod(int(m[t, k]), stride)
-                        ok &= pe < npes and slot < len(revs[pe])
-                        ok &= pe < npes and int(revs[pe][slot]) == src * M + t
+                    t, k = (m < npes * stride).nonzero(as_tuple=True)
+                    pe, slot = m[t, k] // stride, m[t, k] % stride
+                    for p in range(npes):
+                        sel = pe == p
+                        if not bool(sel.any()):
+                            continue
+                        s_ = slot[sel].long()
+                        ok &= bool((s_ < len(revs[p])).all())
+                        if ok:
+                            got = revs[p][s_]
+                            ok &= torch.equal(got, (src * M + t[sel]).to(got.dtype))
+                    ok &= bool((pe < npes).all())
                 sent = d.allreduce_sum(int(kept.sum()))
                 ok &= d.allreduce_sum(total_recv) == sent
                 errs = d.allreduce_sum(0 if ok else 1)
@@ -415,8 +460,8 @@ def _run(d, comm):
                 out, out_w = op.combine(recv_x, wts[:ct], routing=routing)
                 sync()
                 comm.barrier()
-                # unique destination PEs the token kept (all of them unless capped)
-                U = kept.sum(dim=1).numpy()
+                # unique destination PEs the token reached (all of them unless capped)
+                U = np.array([len(r) for r in reach])
                 exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
                 if _IS_FP4:
                     # fp4 combine is too lossy for a numeric hidden check (mirror v1);

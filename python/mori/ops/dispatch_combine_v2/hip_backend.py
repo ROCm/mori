@@ -30,8 +30,9 @@ at launch.
 Two paths live here, selected by ``cfg.is_internode`` (world_size larger than
 gpu_per_node; there is no kernel_type enum on the v2 side):
 
-* intranode -- one dispatch kernel and one combine kernel, gather only, a
-  bf16/fp32/fp8/fp4 dispatch and a bf16/fp32 combine, one plan compiled per
+* intranode -- one dispatch kernel and one combine kernel (a gather; on
+  gfx942/gfx950 also the quantized and unquantized scatters, on gfx125x the push),
+  a bf16/fp32/fp8/fp4 dispatch and a bf16/fp32 combine, one plan compiled per
   (block, warp) the tuning schedule can select. On gfx942/gfx950 it also serves
   local_expert_count.
 * internode -- a sequence of separately compiled passes over the

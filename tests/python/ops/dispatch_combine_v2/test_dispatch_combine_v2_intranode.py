@@ -147,6 +147,19 @@ def _cases():
             "DTYPE": dt,
             "COMBINE": "scatter",
         }
+    # a partial last step (hidden 2304), and a recv cap
+    yield "hip-bf16-scatter-h2304", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "HIDDEN": 2304,
+    }
+    yield "hip-bf16-scatter-cap", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "MAXRECV": 1024,
+    }
     yield "hip-bf16-scatter-scales-ragged", {
         "MORI_V2_KERNEL_BACKEND": "hip",
         "DTYPE": "bf16",
@@ -202,6 +215,14 @@ def _cases():
         yield f"bf16-gather-topk{k}", {"DTYPE": "bf16", "COMBINE": "gather", "TOPK": k}
     # feature paths
     yield "bf16-gather-tuned", {"DTYPE": "bf16", "COMBINE": "gather", "TUNED": 1}
+    # rows and reverse map read in-stream right after dispatch, before any barrier
+    yield "bf16-gather-fresh", {"DTYPE": "bf16", "COMBINE": "gather", "FRESH": 1}
+    yield "hip-bf16-gather-fresh", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "gather",
+        "FRESH": 1,
+    }
     yield "bf16-gather-replay", {"DTYPE": "bf16", "COMBINE": "gather", "REPLAY": 1}
     for extra in (
         {},
