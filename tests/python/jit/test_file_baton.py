@@ -19,15 +19,20 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""The JIT build lock: a holder that dies must not leave the lock held. CPU only."""
+"""The JIT build lock and outputs: a build that dies must not leave the lock held
+or a partial output behind. CPU only."""
 
+import errno
 import multiprocessing as mp
 import os
 import signal
 import threading
 import time
 
-from mori.jit.core import FileBaton
+import pytest
+
+import mori.jit.core as jit_core
+from mori.jit.core import FileBaton, _atomic_output
 
 _CTX = mp.get_context("fork")
 
@@ -119,3 +124,35 @@ def test_waiter_skips_once_the_target_exists(tmp_path):
     finally:
         release.set()
         holder.join(30)
+
+
+def test_lock_error_names_the_lock_file_and_closes_it(tmp_path, monkeypatch):
+    # What NFS returns for an exclusive lock on the read-only fallback descriptor.
+    def flock(fd, op):
+        raise OSError(errno.EBADF, os.strerror(errno.EBADF))
+
+    monkeypatch.setattr(jit_core.fcntl, "flock", flock)
+    lock = tmp_path / ".kernel.lock"
+    fds = len(os.listdir("/proc/self/fd"))
+    with pytest.raises(OSError, match=str(lock)):
+        FileBaton(lock).__enter__()
+    assert len(os.listdir("/proc/self/fd")) == fds
+
+
+def test_failed_build_leaves_no_output(tmp_path):
+    out = tmp_path / "kernel.hsaco"
+    with pytest.raises(RuntimeError):
+        with _atomic_output(out) as tmp:
+            tmp.write_bytes(b"partial")
+            raise RuntimeError("build killed")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_output_appears_only_when_complete(tmp_path):
+    out = tmp_path / "kernel.hsaco"
+    with _atomic_output(out) as tmp:
+        tmp.write_bytes(b"part")
+        assert not out.exists()
+        tmp.write_bytes(b"complete")
+    assert out.read_bytes() == b"complete"
+    assert list(tmp_path.iterdir()) == [out]

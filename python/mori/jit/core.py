@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import functools
 import logging
@@ -101,24 +102,35 @@ class FileBaton:
         fd = self._open()
         start = time.monotonic()
         noticed = False
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._fd = fd
-                return self
-            except BlockingIOError:
-                pass
-            if self._wait_for and os.path.isfile(self._wait_for):
-                os.close(fd)
-                self.skipped = True
-                return self
-            if not noticed and time.monotonic() - start > self._WAIT_NOTICE_S:
-                print(
-                    f"[mori-jit] Waiting for another process to finish building "
-                    f"(lock {self._lock_path}) ..."
-                )
-                noticed = True
-            time.sleep(0.5)
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self._fd = fd
+                    return self
+                except BlockingIOError:
+                    pass
+                except OSError as e:
+                    # e.g. EBADF: NFS cannot lock the read-only fallback descriptor.
+                    raise OSError(
+                        e.errno,
+                        f"cannot lock {self._lock_path} ({e.strerror}); make it "
+                        "writable by this user or remove it",
+                    ) from e
+                if self._wait_for and os.path.isfile(self._wait_for):
+                    os.close(fd)
+                    self.skipped = True
+                    return self
+                if not noticed and time.monotonic() - start > self._WAIT_NOTICE_S:
+                    print(
+                        f"[mori-jit] Waiting for another process to finish building "
+                        f"(lock {self._lock_path}) ..."
+                    )
+                    noticed = True
+                time.sleep(0.5)
+        except BaseException:
+            os.close(fd)
+            raise
 
     def __exit__(self, *exc):
         if self._fd is None:
@@ -128,6 +140,21 @@ class FileBaton:
         finally:
             os.close(self._fd)
             self._fd = None
+
+
+@contextlib.contextmanager
+def _atomic_output(path: Path):
+    """Yield a temporary path beside *path*, moved onto *path* only on success.
+
+    Waiters and later processes use *path* as soon as it exists, so a build
+    killed mid-write must not leave a partial file under that name.
+    """
+    tmp = path.with_name(f".{path.stem}.{os.getpid()}.tmp{path.suffix}")
+    try:
+        yield tmp
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _hipcc_device_bc(
@@ -467,7 +494,8 @@ def _build_bitcode(
         output.parent.mkdir(parents=True, exist_ok=True)
         import shutil
 
-        shutil.copy2(stripped_bc, output)
+        with _atomic_output(output) as tmp_out:
+            shutil.copy2(stripped_bc, tmp_out)
 
     print(f"[mori-jit] Cached: {output}")
 
@@ -513,9 +541,9 @@ def _hipcc_genco(
 
     for d in include_dirs:
         cmd.extend(["-I", str(d)])
-    cmd.extend([str(source), "-o", str(output)])
-
-    subprocess.check_call(cmd, stderr=subprocess.STDOUT)
+    with _atomic_output(output) as tmp_out:
+        cmd.extend([str(source), "-o", str(tmp_out)])
+        subprocess.check_call(cmd, stderr=subprocess.STDOUT)
 
 
 _PARALLEL_KERNEL_GROUPS: dict[str, list[str]] = {
