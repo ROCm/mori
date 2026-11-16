@@ -320,7 +320,7 @@ ctypes plan 的关键字参数各自在 `_wrap_*` 里适配。
 
 **特性面是真包含不是交集**：HIP 后端做 gather combine，dispatch 收 bf16/fp32/fp8/fp4、combine 出
 bf16/fp32（§3.7）；带 `quant_type` 时做量化 scatter combine（gfx942/gfx950 是逐源 token 落地一行、
-本地反量化累加，gfx125x 是 push）。其余一概不接：非量化 scatter、StdMoE、per-token scales、routing replay、
+本地反量化累加，gfx125x 是 push）。其余一概不接：非量化 scatter、StdMoE、routing replay、
 `local_expert_count`。能力门在**构造期**跑、且在分配 arena
 之前——问它要 scatter 会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
 再失败。

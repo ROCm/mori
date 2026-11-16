@@ -220,3 +220,17 @@ def test_scatter_rows_serve_every_format(monkeypatch, name, model):
     got = tc.lookup(8, 7168, 8, dtype="bf16", experts_per_rank=32, quant_type=name)
     for edge, block, warp in tc._SCATTER_COMBINE_TABLE[model][8, 7168, 8, None]:
         assert tc.pick_bucket(got["schedule"], edge or 1 << 20)[3:5] == (block, warp)
+
+
+def test_flydsl_refuses_a_quantized_combine_that_is_not_bf16(monkeypatch):
+    try:
+        cls = EpDispatchCombineOp._resolve_backend("flydsl")
+    except ImportError as e:
+        pytest.skip(str(e))
+    from mori.ops.dispatch_combine_v2 import flydsl_backend
+
+    monkeypatch.setattr(flydsl_backend, "_target_arch", lambda: "gfx942")
+    op = object.__new__(cls)
+    cfg = _cfg("fp8_blockwise_1x128", data_type=torch.float32)
+    assert any("bf16 only" in r for r in op._unsupported(cfg))
+    assert not op._unsupported(_cfg("fp8_blockwise_1x128"))

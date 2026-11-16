@@ -795,7 +795,8 @@ def resolve_schedule(
     """The HIP V2 schedule consumed by both construction and token selection.
 
     Intra adapts the schedule Config resolved: per phase, the IntraNodeV2 table's
-    rules when quant_type is "none", else the Python table's; an explicit
+    rules (its dispatch rules unless the op is quantized on gfx125x, its combine
+    rules only for an unquantized combine), else the Python table's; an explicit
     cfg.schedule is taken as given, and pinned or untuned geometry is one bucket.
     Inter names each bucket of internode_schedule() with its kernel family; tuned
     grids are clamped to ``cu_count``, the backend's own CU count. Loading and
