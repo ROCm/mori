@@ -563,6 +563,7 @@ class EpDispatchCombineConfig:
                     dispatch_dtype=self.dispatch_dtype,
                     combine_dtype=self.combine_dtype,
                     profile="peak" if self.async_ll else self.tuning_profile,
+                    scatter=self.is_scatter,
                 )
             else:
                 from .tuning_configs import lookup
