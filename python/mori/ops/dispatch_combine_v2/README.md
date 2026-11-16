@@ -98,8 +98,8 @@ an op. What each backend serves:
 
 The scatter combines quantize each expert row on the rank that computed it and
 write it into a landing row on the token's own rank; after one barrier that rank
-dequantizes and sums its rows. Both need a `hidden_dim` that is a multiple of
-128, and the HIP one a bf16 combine.
+dequantizes and sums its rows. Both need a bf16 combine and a `hidden_dim` that
+is a multiple of 128.
 
 Plan requests name the format with fields, not these strings: `combine_fp8` and
 `combine_fp4` select the 1x32 push combine, and `combine_fp4_f32_scale` turns
