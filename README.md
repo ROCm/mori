@@ -187,14 +187,6 @@ blockscale) at TP8 on 8x MI355X.
 
 </details>
 
-The bf16 wire is the default. The fp8 gather (`gather_dtype="fp8"`) is opt-in: it sends the
-all-reduce's gather leg in fp8. relL2 against an fp32 reference is 4.0e-3 for GEMM + RCCL, 2.4e-3
-for the bf16 wire and 2.5e-2 for the fp8 gather. Measured with
-`benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py --quant blockscale -n 7168 -k 2048` in
-`--mode split-rccl`, `--mode fused-sdma` and `--mode fused-sdma --gather-dtype fp8 --gather-transport lsa`:
-one M per process, graph replay, max over ranks, median of 3 rounds interleaved with the GEMM + RCCL runs
-(FlyDSL 0.4.0).
-
 The other fused operators (GEMM + reduce-scatter, GEMM + all-to-all, GEMM + all-gather, all-gather +
 GEMM and all-to-all + GEMM) are measured in the
 [MORI-FUSED guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html#performance-at-a-glance).
