@@ -91,7 +91,8 @@ VpodKey ReadVpodKey(int hipDevice) {
 
   const char* disable = std::getenv("MORI_IO_FABRIC_DISABLE");
   if (disable != nullptr && std::atoi(disable) != 0) {
-    return key;  // forced invalid
+    key.invalidReason = "MORI_IO_FABRIC_DISABLE is set";
+    return key;
   }
 
   // Manual override: every engine that sets the same value is treated as one
@@ -106,15 +107,33 @@ VpodKey ReadVpodKey(int hipDevice) {
   }
 
   std::string bdf = DeviceBdfLower(hipDevice);
-  if (bdf.empty()) return key;
+  if (bdf.empty()) {
+    key.invalidReason = "cannot query PCI BDF";
+    return key;
+  }
   std::string dir = std::string("/sys/bus/pci/devices/") + bdf + "/ualink";
 
   std::string link, state, ppod;
-  if (!ReadSysfsLine(dir + "/link_type", link)) return key;  // not a UALink GPU
-  if (link != "UALoE" && link != "UALLink") return key;
-  if (!ReadSysfsLine(dir + "/accel_state", state)) return key;
-  if (state != "active" && state != "ready") return key;  // not usable yet
-  if (!ReadSysfsLine(dir + "/ppod_id", ppod) || ppod.empty()) return key;
+  if (!ReadSysfsLine(dir + "/link_type", link)) {
+    key.invalidReason = "no readable ualink/link_type in sysfs (not a UALink GPU)";
+    return key;
+  }
+  if (link != "UALoE" && link != "UALLink") {
+    key.invalidReason = "link_type=" + link;
+    return key;
+  }
+  if (!ReadSysfsLine(dir + "/accel_state", state)) {
+    key.invalidReason = "cannot read accel_state";
+    return key;
+  }
+  if (state != "active" && state != "ready") {
+    key.invalidReason = "accel_state=" + state;
+    return key;
+  }
+  if (!ReadSysfsLine(dir + "/ppod_id", ppod) || ppod.empty()) {
+    key.invalidReason = "ppod_id is empty or unreadable";
+    return key;
+  }
 
   std::string tmp;
   key.ppodId = ppod;

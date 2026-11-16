@@ -223,6 +223,11 @@ class Backend {
 
   virtual bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const { return true; }
 
+  // Empty means this backend can handle the pair. Reasons exclude memory ids.
+  virtual std::string RejectReason(const MemoryDesc& local, const MemoryDesc& remote) const {
+    return CanHandle(local, remote) ? "" : "cannot handle this memory pair";
+  }
+
   // Backend-specific descriptor bytes advertised to peers via EngineDesc.
   // Default is empty; backends override to publish their own metadata.
   virtual DescBlob GetEngineDescBlob() const { return {}; }

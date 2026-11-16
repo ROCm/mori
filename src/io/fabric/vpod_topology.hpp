@@ -37,6 +37,7 @@ struct VpodKey {
   std::string ppodId;  // physical pod UUID (empty in manual-override mode)
   int vpodId{-1};      // virtual pod id within the ppod
   int vpodSize{0};     // number of GPUs in the vPOD (0 if unknown)
+  std::string invalidReason;  // why this device is not on a ready fabric
 };
 
 // Does the device advertise VMM + fabric-handle export capability

@@ -71,6 +71,28 @@ inline void LogTransferFailure(const std::shared_ptr<internal::IoCallDiagnostics
   }
 }
 
+std::string NoBackendReason(
+    const std::unordered_map<BackendType, std::unique_ptr<Backend>>& backends,
+    const MemoryDesc& local, const MemoryDesc& remote) {
+  if (backends.empty()) return "No backend created, create a backend first";
+  const char* location = local.loc == MemoryLocationType::GPU   ? "GPU"
+                         : local.loc == MemoryLocationType::CPU ? "CPU"
+                                                                : "Unknown";
+  std::string message = "No backend can handle local mem " + std::to_string(local.id) +
+                        " (" + location + " " + std::to_string(local.deviceId) + ") -> engine " +
+                        remote.engineKey + " mem " + std::to_string(remote.id) + ": ";
+  const char* separator = "";
+  for (auto type : {BackendType::XGMI, BackendType::FABRIC, BackendType::RDMA,
+                    BackendType::OFI, BackendType::TCP}) {
+    auto it = backends.find(type);
+    if (it == backends.end()) continue;
+    message += separator + sim::BackendTypeName(type) + ": " +
+               it->second->RejectReason(local, remote);
+    separator = "; ";
+  }
+  return message;
+}
+
 std::string QueryDeviceBusId(int deviceId) {
   if (deviceId < 0) {
     return "";
@@ -541,30 +563,27 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
 
   // Next prefer FABRIC: cross-node GPU pairs in the same scale-up domain (vPOD)
   // reachable over the UALink super-node fabric, which is faster than RDMA.
+  std::string fabricReason;
   auto fabricIt = backends.find(BackendType::FABRIC);
-  if (fabricIt != backends.end() && fabricIt->second->CanHandle(local, remote)) {
-    UpdateRouteCache(routeKey, BackendType::FABRIC);
-    return fabricIt->second.get();
+  if (fabricIt != backends.end()) {
+    fabricReason = fabricIt->second->RejectReason(local, remote);
+    if (fabricReason.empty()) {
+      UpdateRouteCache(routeKey, BackendType::FABRIC);
+      return fabricIt->second.get();
+    }
   }
 
-  auto rdmaIt = backends.find(BackendType::RDMA);
-  if (rdmaIt != backends.end() && rdmaIt->second->CanHandle(local, remote)) {
-    UpdateRouteCache(routeKey, BackendType::RDMA);
-    return rdmaIt->second.get();
-  }
-
-#ifdef MORI_USE_LIBFABRIC
-  auto ofiIt = backends.find(BackendType::OFI);
-  if (ofiIt != backends.end() && ofiIt->second->CanHandle(local, remote)) {
-    UpdateRouteCache(routeKey, BackendType::OFI);
-    return ofiIt->second.get();
-  }
-#endif
-
-  auto tcpIt = backends.find(BackendType::TCP);
-  if (tcpIt != backends.end() && tcpIt->second->CanHandle(local, remote)) {
-    UpdateRouteCache(routeKey, BackendType::TCP);
-    return tcpIt->second.get();
+  for (auto type : {BackendType::RDMA, BackendType::OFI, BackendType::TCP}) {
+    auto it = backends.find(type);
+    if (it != backends.end() && it->second->CanHandle(local, remote)) {
+      UpdateRouteCache(routeKey, type);
+      if (!fabricReason.empty()) {
+        MORI_IO_INFO("FABRIC not used for local mem {} -> engine {} mem {}: {}; using {}",
+                     local.id, remote.engineKey, remote.id, fabricReason,
+                     sim::BackendTypeName(type));
+      }
+      return it->second.get();
+    }
   }
 
   // No backend can handle this pair (e.g. cross-node under XGMI-only fallback).
@@ -590,15 +609,15 @@ std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) c
   return it->second;
 }
 
-#define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend)     \
-  backend = SelectBackend(local, remote);                                     \
-  if (backend == nullptr) {                                                   \
-    if (status != nullptr) {                                                  \
-      status->Update(StatusCode::ERR_BAD_STATE,                               \
-                     "No available backend found, create backend first");     \
-    }                                                                         \
-    MORI_IO_ERROR("No available backend found, please create backend first"); \
-    return;                                                                   \
+#define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend)   \
+  backend = SelectBackend(local, remote);                                   \
+  if (backend == nullptr) {                                                 \
+    const std::string reason = NoBackendReason(backends, local, remote);    \
+    if (status != nullptr) {                                                \
+      status->Update(StatusCode::ERR_BAD_STATE, reason);                    \
+    }                                                                       \
+    MORI_IO_ERROR("{}", reason);                                            \
+    return;                                                                 \
   }
 
 void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
@@ -693,6 +712,7 @@ std::optional<IOEngineSession> IOEngine::CreateSession(const MemoryDesc& local,
 
   Backend* backend = SelectBackend(local, remote);
   if (backend == nullptr) {
+    MORI_IO_WARN("{}", NoBackendReason(backends, local, remote));
     return std::nullopt;
   }
   sess.backendSess.reset(backend->CreateSession(local, remote));

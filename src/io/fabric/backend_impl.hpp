@@ -29,6 +29,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "mori/io/backend.hpp"
@@ -110,6 +111,7 @@ class FabricBackend : public Backend {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
+  std::string RejectReason(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
   // JIT-loaded batched copy kernels (fabric_copy.hip), loaded lazily per device.
   // Reloading retains prior modules until backend destruction.
@@ -128,12 +130,11 @@ class FabricBackend : public Backend {
  private:
   void Initialize();
   std::optional<int> LookupVisibleDevice(const std::string& busId) const;
-  fabric::VpodKey LocalVpodKey(int deviceId) const;
 
   // Import a peer's fabric handle and map it into a fresh local VA; cached per
   // (remote engine, remote mem id, local device). Returns the mapped pointer, or
   // the local pointer directly when the memory is owned by this engine.
-  void* GetImportedAddress(const MemoryDesc& desc, int localDeviceId);
+  void* GetImportedAddress(const MemoryDesc& desc, int localDeviceId, std::string* error);
 
   struct SessionCacheKey {
     EngineKey remoteEngineKey;
@@ -156,7 +157,8 @@ class FabricBackend : public Backend {
       return seed;
     }
   };
-  FabricBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
+  FabricBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote,
+                                                std::string* error);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
 
   struct ImportedRegion {
@@ -199,6 +201,9 @@ class FabricBackend : public Backend {
   std::vector<char> deviceSupportsFabric;       // indexed by device id
   std::vector<fabric::VpodKey> deviceVpodKeys;  // indexed by device id
   std::unordered_map<std::string, int> localDeviceByBusId;
+
+  std::mutex registrationReasonsMu;
+  std::unordered_set<std::string> registrationReasons;
 
   mutable std::shared_mutex importMutex;
   std::unordered_map<ImportCacheKey, ImportedRegion, ImportCacheKeyHash> importedRegions;
