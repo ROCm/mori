@@ -111,19 +111,52 @@ def _cases():
     # plain fp8 token dtype (gather-only), any arch (fnuz on gfx942, OCP on gfx950)
     yield "fp8-gather", {"DTYPE": "fp8", "COMBINE": "gather"}
     yield "fp8-gather-tuned", {"DTYPE": "fp8", "COMBINE": "gather", "TUNED": 1}
-    # quant paths (scatter-only, compress-on-write)
+    # quant paths (scatter-only); bare fp8_blockwise is 1x128 off gfx125x
     yield "bf16-scatter-fp8blockwise", {
         "DTYPE": "bf16",
         "COMBINE": "scatter",
         "QUANT": "fp8_blockwise",
     }
-    # blockwise with INSCALE>fp8_max so amax exceeds the fp8 range -> exercises the
-    # per-block scaling branch (the plain case above never triggers it).
+    # blockwise with INSCALE>fp8_max so amax exceeds the fp8 range
     yield "bf16-scatter-fp8blockwise-scaled", {
         "DTYPE": "bf16",
         "COMBINE": "scatter",
         "QUANT": "fp8_blockwise",
         "INSCALE": 200,
+    }
+    # each explicit fp8 format at unit scale, past the fp8 max and below its normals
+    for group in (32, 128):
+        for inscale in (1, 200, 0.001):
+            yield f"bf16-scatter-fp8-1x{group}-x{inscale:g}", {
+                "DTYPE": "bf16",
+                "COMBINE": "scatter",
+                "QUANT": f"fp8_blockwise_1x{group}",
+                "INSCALE": inscale,
+            }
+    # 1x32 groups 2^12 apart in magnitude: each must get its own scale
+    yield "bf16-scatter-fp8-1x32-spread", {
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "QUANT": "fp8_blockwise_1x32",
+        "SPREAD": 6,
+    }
+    # the HIP backend's quantized scatter combine, every format at the three scales
+    for elem in ("fp8", "fp4"):
+        for group in (32, 128):
+            for inscale in (1, 200, 0.001):
+                yield f"hip-bf16-scatter-{elem}-1x{group}-x{inscale:g}", {
+                    "MORI_V2_KERNEL_BACKEND": "hip",
+                    "DTYPE": "bf16",
+                    "COMBINE": "scatter",
+                    "QUANT": f"{elem}_blockwise_1x{group}",
+                    "INSCALE": inscale,
+                }
+    yield "hip-bf16-scatter-fp8-1x32-spread", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "QUANT": "fp8_blockwise_1x32",
+        "SPREAD": 6,
     }
     # per-token scale forwarding (v1 uses scale_dim=32), on both combine modes
     yield "bf16-gather-scales", {"DTYPE": "bf16", "COMBINE": "gather", "SCALE_DIM": 32}
@@ -145,10 +178,24 @@ _CASES = dict(_cases())
 _GFX950_ONLY = {"fp4-gather"}
 
 
+def _refused_quant(case):
+    """The case's quant type when its backend refuses it on this arch."""
+    from mori.ops.dispatch_combine_v2 import supported_quant_types
+
+    env = _CASES[case]
+    quant = env.get("QUANT", "none")
+    served = supported_quant_types(env.get("MORI_V2_KERNEL_BACKEND"))
+    return None if quant in served else quant
+
+
 @pytest.fixture(scope="module")
 def case_output():
     """{id: (output, finished)} for every mode this arch runs, from one launch."""
-    ids = [c for c in _CASES if _IS_GFX950 or c not in _GFX950_ONLY]
+    ids = [
+        c
+        for c in _CASES
+        if (_IS_GFX950 or c not in _GFX950_ONLY) and not _refused_quant(c)
+    ]
     rc, out = _run({"CASES": json.dumps([_CASES[c] for c in ids])}, timeout=1800)
     parts = {c: ([], False) for c in ids}
     current = None
@@ -172,6 +219,9 @@ def case_output():
     [pytest.param(c, marks=_skip_fp4) if c in _GFX950_ONLY else c for c in _CASES],
 )
 def test_dispatch_combine_v2_intranode(case, case_output):
+    refused = _refused_quant(case)
+    if refused:
+        pytest.skip(f"quant_type={refused} is not served on this arch")
     rc, out, crashed, parts = case_output
     assert case != crashed, f"the launch failed in {case} (rc={rc}); output:\n{out}"
     text, finished = parts[case]

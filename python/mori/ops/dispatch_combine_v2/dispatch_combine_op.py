@@ -640,6 +640,13 @@ class EpDispatchCombineConfig:
         return self.hidden_dim // self.quant_group if self.fp8_blockwise else 0
 
     @property
+    def combine_scale_bytes(self):
+        """Per-token scale bytes of the fp8 combine wire: one E8M0 byte per 1x32
+        group, one f32 per 1x128 block, rounded up to a dword."""
+        size = 1 if self.quant_group == 32 else 4
+        return (self.combine_scale_dim * size + 3) // 4 * 4
+
+    @property
     def wire_elem_size(self):
         """comb_inp transport element size: 1 byte for fp8_blockwise, else elem_size."""
         return 1 if self.fp8_blockwise else self.elem_size

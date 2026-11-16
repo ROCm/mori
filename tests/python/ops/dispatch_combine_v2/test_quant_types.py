@@ -22,6 +22,7 @@
 """Combine quant type names: resolution per arch, refusal per backend. No GPU."""
 
 import pytest
+import torch
 
 from mori.ops.dispatch_combine_v2 import (
     EpDispatchCombineConfig,
@@ -33,6 +34,8 @@ from mori.ops.dispatch_combine_v2 import hip_tuning_configs as tc
 from mori.ops.dispatch_combine_v2.quant_types import (
     QUANT_FORMATS,
     QUANT_TYPES,
+    e8m0_round_up,
+    fp8_max,
     resolve_quant_type,
 )
 
@@ -95,20 +98,47 @@ def test_config_holds_the_explicit_name(monkeypatch, name, gfx125x):
 
 
 @pytest.mark.parametrize(
-    "name, element, group, scales",
+    "name, element, group, scales, scale_bytes",
     [
-        ("none", None, 0, 0),
-        ("fp8_blockwise_1x32", "fp8", 32, 7168 // 32),
-        ("fp8_blockwise_1x128", "fp8", 128, 7168 // 128),
-        ("fp4_blockwise_1x32", "fp4", 32, 0),
-        ("fp4_blockwise_1x128", "fp4", 128, 0),
+        ("none", None, 0, 0, 0),
+        ("fp8_blockwise_1x32", "fp8", 32, 7168 // 32, 7168 // 32),
+        ("fp8_blockwise_1x128", "fp8", 128, 7168 // 128, 7168 // 128 * 4),
+        ("fp4_blockwise_1x32", "fp4", 32, 0, 0),
+        ("fp4_blockwise_1x128", "fp4", 128, 0, 0),
     ],
 )
-def test_format_properties(name, element, group, scales):
+def test_format_properties(name, element, group, scales, scale_bytes):
     cfg = _cfg(name)
     assert (cfg.quant_element, cfg.quant_group) == (element, group)
     assert cfg.fp8_blockwise == (element == "fp8")
     assert cfg.combine_scale_dim == scales
+    assert cfg.combine_scale_bytes == scale_bytes
+
+
+@pytest.mark.parametrize(
+    "arch, fmax",
+    [("gfx942", 240.0), ("gfx950", 448.0), ("gfx1250", 448.0), ("", 240.0)],
+)
+def test_fp8_max(arch, fmax):
+    assert fp8_max(arch) == fmax
+
+
+@pytest.mark.parametrize("fmax", [240.0, 448.0])
+def test_e8m0_round_up_is_the_smallest_power_of_two(fmax):
+    # Every positive finite bf16, the values a group amax can take.
+    bits = torch.arange(1, 0x7F80, dtype=torch.int32).to(torch.int16)
+    amax = bits.view(torch.bfloat16).double()
+    top = torch.full_like(amax, fmax)
+    # Smallest k with amax <= fmax * 2^k, exact in f64 after a one-step fix-up.
+    k = torch.ceil(torch.log2(amax / fmax))
+    k = torch.where(amax > torch.ldexp(top, k), k + 1, k)
+    k = torch.where(amax <= torch.ldexp(top, k - 1), k - 1, k)
+    want = (k + 127).clamp(1, 254).long()
+    got = torch.tensor([e8m0_round_up(a, fmax) for a in amax.tolist()])
+    assert torch.equal(got, want)
+    # amax / scale never exceeds fmax, so the quantized group needs no clamp.
+    assert bool((amax <= torch.ldexp(top, got.double() - 127)).all())
+    assert e8m0_round_up(0.0, fmax) == 1  # an all-zero group
 
 
 _SERVED = {
@@ -117,11 +147,16 @@ _SERVED = {
         "fp4_blockwise_1x32",
         "fp4_blockwise_1x128",
     },
-    ("hip", "gfx942"): set(),
-    ("hip", "gfx950"): set(),
+    ("hip", "gfx942"): {"fp8_blockwise_1x32", "fp8_blockwise_1x128"},
+    ("hip", "gfx950"): {
+        "fp8_blockwise_1x32",
+        "fp8_blockwise_1x128",
+        "fp4_blockwise_1x32",
+        "fp4_blockwise_1x128",
+    },
     ("flydsl", "gfx1250"): set(),
-    ("flydsl", "gfx942"): {"fp8_blockwise_1x128"},
-    ("flydsl", "gfx950"): {"fp8_blockwise_1x128"},
+    ("flydsl", "gfx942"): {"fp8_blockwise_1x32", "fp8_blockwise_1x128"},
+    ("flydsl", "gfx950"): {"fp8_blockwise_1x32", "fp8_blockwise_1x128"},
 }
 
 
@@ -174,3 +209,14 @@ def test_lookup_resolves_the_arch_default_name(gfx1250):
 def test_push_tables_use_explicit_names():
     for table in (tc._COMBINE_PUSH_TABLE, tc._LL128_TABLE):
         assert set(table) - {"none"} <= set(QUANT_FORMATS)
+
+
+@pytest.mark.parametrize("model", ["mi300x", "mi355x"])
+@pytest.mark.parametrize("name", sorted(QUANT_FORMATS))
+def test_scatter_rows_serve_every_format(monkeypatch, name, model):
+    monkeypatch.delenv("MORI_EP_TUNING_PROFILE", raising=False)
+    monkeypatch.setattr(tc, "_device_key", lambda: model)
+    monkeypatch.setattr(tc._gpu, "cu_count", lambda: 0)  # 0: no CU clamp
+    got = tc.lookup(8, 7168, 8, dtype="bf16", experts_per_rank=32, quant_type=name)
+    for edge, block, warp in tc._SCATTER_COMBINE_TABLE[model][8, 7168, 8, None]:
+        assert tc.pick_bucket(got["schedule"], edge or 1 << 20)[3:5] == (block, warp)

@@ -9,9 +9,10 @@ backends:
   feature set (gather + scatter combine, fp8/fp4, quant, StdMoE, per-token
   scales, routing replay). Intranode only.
 - **hip** (the default on gfx125x): C++/HIP kernels JIT-compiled by the v2 JIT
-  framework. Gather combine in bf16/fp32; on gfx125x also the push (scatter)
-  combine with `fp8_blockwise` or fp4 quantization, and on gfx1250 a bf16 push
-  combine (see "HIP V2 configuration interface" below). The dispatch leg also
+  framework. Gather combine in bf16/fp32. With a `quant_type`, a quantized
+  combine: a scatter combine on gfx942/gfx950 and the push combine on gfx125x
+  (see "Combine quant types"). On gfx1250 also a bf16 push combine (see "HIP V2
+  configuration interface" below). The dispatch leg also
   carries fp8 and fp4 (transport only — it moves an already-quantized payload).
   A dedicated gfx125x TDM body is selected by arch. **The only backend with an
   internode path** (bf16/f32/fp8, plus packed fp4 dispatch with bf16/fp32
@@ -75,7 +76,11 @@ per-group scales. `quant_type` names the format:
 | `fp8_blockwise` / `fp4_blockwise` | as above | the arch's default group: 1x32 on gfx125x, 1x128 elsewhere |
 | `fp4_blockwise_fp32` | | the old name of `fp4_blockwise_1x128` |
 
-fp8 is the arch's own: e4m3fnuz on gfx942, e4m3fn on gfx950 and gfx125x. The
+fp8 is the arch's own: e4m3fnuz on gfx942 (largest value 240), e4m3fn on gfx950
+and gfx125x (448); e2m1's largest value is 6. A 1x128 scale is the block's amax
+over the element's largest value, so every block spans the whole element range; a
+1x32 E8M0 scale is the smallest power of two that brings the group's amax within
+it (`quant_types.e8m0_round_up`). The
 config stores the explicit name: after construction `cfg.quant_type` reads
 `fp8_blockwise_1x128` on a gfx942 config built with `fp8_blockwise`.
 
@@ -85,14 +90,20 @@ format. `supported_quant_types(backend=None, arch=None)` returns the names a
 backend accepts on an arch, each mapped to its explicit format, without building
 an op. What each backend serves:
 
-| backend | gfx942 / gfx950 | gfx125x |
-|---|---|---|
-| flydsl | `fp8_blockwise_1x128` (scatter) | none |
-| hip | none | `fp8_blockwise_1x32`, `fp4_blockwise_1x32`, `fp4_blockwise_1x128` (push) |
+| backend | gfx942 | gfx950 | gfx125x |
+|---|---|---|---|
+| flydsl | `fp8_blockwise_1x32`, `fp8_blockwise_1x128` (scatter) | as gfx942 | none |
+| hip | `fp8_blockwise_1x32`, `fp8_blockwise_1x128` (scatter) | as gfx942, plus `fp4_blockwise_1x32`, `fp4_blockwise_1x128` | `fp8_blockwise_1x32`, `fp4_blockwise_1x32`, `fp4_blockwise_1x128` (push) |
+
+The scatter combines quantize each expert row on the rank that computed it and
+write it into a landing row on the token's own rank; after one barrier that rank
+dequantizes and sums its rows. Both need a `hidden_dim` that is a multiple of
+128, and the HIP one a bf16 combine.
 
 Plan requests name the format with fields, not these strings: `combine_fp8` and
 `combine_fp4` select the 1x32 push combine, and `combine_fp4_f32_scale` turns
-the fp4 one into 1x128.
+the fp4 one into 1x128. `combine_scatter_q_group` (32 or 128) selects the
+gfx942/gfx950 scatter combine, and `combine_scatter_fp4` makes its elements e2m1.
 
 ## gfx125x dispatch: slot reservation
 

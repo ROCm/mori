@@ -353,6 +353,9 @@ _CARD_COMBINE_ROWS_MAX = 2048
 
 
 _CARD_QUANT_TYPES = ("fp8_blockwise_1x32", "fp4_blockwise_1x32")
+# The gfx942/gfx950 scatter combine's wires (combine_scatter_q_group); e2m1 needs gfx950.
+_SCATTER_QUANT_TYPES = ("fp8_blockwise_1x32", "fp8_blockwise_1x128")
+_SCATTER_FP4_QUANT_TYPES = ("fp4_blockwise_1x32", "fp4_blockwise_1x128")
 
 
 def _card_layout(cfg):
@@ -1172,8 +1175,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             if self._card["pull_blocks"]:
                 disp["card_pull_blocks"] = self._card["pull_blocks"]
         comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
-        for field, on in _PUSH_REQUEST.get(cfg.quant_type, ()):
-            comb[field] = bool(on)
+        if self._is1250:
+            for field, on in _PUSH_REQUEST.get(cfg.quant_type, ()):
+                comb[field] = bool(on)
+        elif cfg.quant_type != "none":
+            comb["combine_scatter_q_group"] = cfg.quant_group
+            if cfg.quant_element == "fp4":
+                comb["combine_scatter_fp4"] = True
         if self._card is not None and cfg.quant_type in _CARD_QUANT_TYPES:
             comb["card_combine"] = True
         geom = self._ll128_geom
@@ -1253,8 +1261,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     @classmethod
     def _quant_formats(cls, arch):
-        # The push combine is gfx125x's; the gfx942/gfx950 combine is unquantized.
-        return _PUSH_QUANT_TYPES if arch.startswith("gfx125") else ()
+        # gfx125x pushes; gfx942/gfx950 scatter an fp8 wire, and gfx950 an e2m1 one too.
+        if arch.startswith("gfx125"):
+            return _PUSH_QUANT_TYPES
+        if arch.startswith("gfx950"):
+            return _SCATTER_QUANT_TYPES + _SCATTER_FP4_QUANT_TYPES
+        return _SCATTER_QUANT_TYPES
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
@@ -1283,10 +1295,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"quant_type={q!r} with combine dtype {cfg.combine_dtype} "
                     "(bf16 only)"
                 )
-            elif cfg.hidden_dim % 1024:
+            elif cfg.hidden_dim % (1024 if self._is1250 else 128):
                 bad.append(
                     f"quant_type={q!r} with hidden_dim={cfg.hidden_dim} "
-                    "(needs a multiple of 1024)"
+                    f"(needs a multiple of {1024 if self._is1250 else 128})"
                 )
         if cfg.enable_std_moe:
             bad.append("enable_std_moe")
@@ -2169,7 +2181,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # when the caller already wrote there), so the op must not do it.
             stages_in_kernel=True,
             capabilities=frozenset(
-                {"gather", "scales"} | ({"scatter"} if cfg.is_scatter else set())
+                {"gather", "scales"}
+                | ({"scatter"} if cfg.is_scatter else set())
+                | ({"quant"} if cfg.quant_type != "none" else set())
             ),
         )
 
@@ -2471,7 +2485,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def _wrap_combine(self, plan, ll=False):
-        push = self.cfg.quant_type in _PUSH_QUANT_TYPES
+        push = self._is1250 and self.cfg.quant_type in _PUSH_QUANT_TYPES
         src_ptr = self.arena.local_ptr(
             "ll_recv_to_src_token" if ll else "recv_to_src_token"
         )
@@ -2575,7 +2589,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def push_landing(self):
-        if self.cfg.quant_type not in _PUSH_QUANT_TYPES and not self._push_specs:
+        if not self._is1250 or (
+            self.cfg.quant_type not in _PUSH_QUANT_TYPES and not self._push_specs
+        ):
             raise ValueError(
                 f"no landing rows: quant_type {self.cfg.quant_type!r} is not a push one"
             )

@@ -41,6 +41,8 @@ names through it.
 
 from __future__ import annotations
 
+import struct
+
 # Explicit name -> (element, group size). 1x32 groups carry an E8M0 scale, 1x128
 # blocks an f32 one.
 QUANT_FORMATS = {
@@ -92,6 +94,27 @@ def quant_element(name: str) -> str | None:
 def quant_group(name: str) -> int:
     """Elements per scale for an explicit name, 0 for "none"."""
     return QUANT_FORMATS[name][1] if name in QUANT_FORMATS else 0
+
+
+def fp8_max(arch: str) -> float:
+    """Largest finite fp8 on `arch`: 448 for OCP e4m3fn (gfx950, gfx125x), 240 for
+    gfx942's e4m3fnuz and for an unknown arch, where 240 is safe on both."""
+    return 448.0 if arch.startswith(("gfx95", "gfx12")) else 240.0
+
+
+def _f32(x: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def e8m0_round_up(amax: float, fmax: float) -> int:
+    """Biased exponent e of a 1x32 group's E8M0 scale 2^(e-127): the smallest power
+    of two with amax / scale <= fmax, clamped to [1, 254]. Bit-exact with the
+    kernels, which compute it in f32 as t = amax * (1/fmax) and round t's exponent
+    up past any mantissa bits."""
+    t = _f32(amax * _f32(1.0 / fmax))  # an f32 product is exact in double
+    bits = struct.unpack("<I", struct.pack("<f", t))[0]
+    e = ((bits & 0x7FFFFFFF) + 0x7FFFFF) >> 23
+    return min(max(e, 1), 254)
 
 
 def is_gfx125x() -> bool:
