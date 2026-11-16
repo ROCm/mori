@@ -363,11 +363,14 @@ constexpr int EpBlockThreads(const EpCfg& c) { return c.warpPerBlock * c.waveSiz
 // and need the multi-iteration-safe code path. Compile-time via the Cfg NTTP.
 constexpr bool EpIsWideEp(const EpCfg& c) { return c.worldSize > c.waveSize; }
 
-// Recv-slot capacity. The flat token index encodes (pe, localTokId) with this
-// stride, so host and device must agree exactly.
+// Recv-slot capacity, and the bound on every published slot. The flat token
+// index encodes (pe, localTokId) with this stride, so host and device must agree.
 constexpr int EpMaxRecv(const EpCfg& c) {
   return c.maxRecv > 0 ? c.maxRecv : c.worldSize * c.maxTokPerRank;
 }
+
+// A capacity below the worst case: dispatch drops the slots past it.
+constexpr bool EpRecvCapped(const EpCfg& c) { return EpMaxRecv(c) < c.worldSize * c.maxTokPerRank; }
 
 constexpr int EpCallTok(const EpCfg& c) {
   return c.callTokMax > 0 && c.callTokMax < c.maxTokPerRank ? c.callTokMax : c.maxTokPerRank;
@@ -681,11 +684,6 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          c.numExpertPerToken > 0 && c.numExpertPerRank > 0 && c.blockNum > 0 &&
          (c.waveSize == 32 || c.waveSize == 64) && c.warpPerBlock > 0 &&
          EpBlockThreads(c) <= 1024 &&
-         // The recv capacity must cover the worst case: the device slot counter is
-         // unbounded, and since EpMaxRecv is also the flat-index stride an overflow
-         // re-encodes to the next peer and combine folds in a stranger's token.
-         // Token dropping is not implemented, so reject the cap at construction.
-         EpMaxRecv(c) >= c.worldSize * c.maxTokPerRank &&
          // The dedup ballot assumes one lane per top-k slot within a wavefront.
          // worldSize may exceed waveSize (wide EP) but must fit within one
          // block so the combine XDB barrier's thdId < npes poll covers all peers.

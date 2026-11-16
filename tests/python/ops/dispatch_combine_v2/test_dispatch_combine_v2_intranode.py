@@ -158,6 +158,23 @@ def _cases():
         "QUANT": "fp8_blockwise_1x32",
         "SPREAD": 6,
     }
+    # recv cap: drops at 512 tokens a rank (demand ~2700 > 1024), none at 128
+    for backend in ("", "hip"):
+        env = {"MORI_V2_KERNEL_BACKEND": backend} if backend else {}
+        pre = f"{backend}-" if backend else ""
+        yield f"{pre}bf16-gather-cap", {
+            **env,
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "MAXRECV": 1024,
+        }
+    yield "hip-bf16-scatter-fp8-1x128-cap", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "QUANT": "fp8_blockwise_1x128",
+        "MAXRECV": 1024,
+    }
     # per-token scale forwarding (v1 uses scale_dim=32), on both combine modes
     yield "bf16-gather-scales", {"DTYPE": "bf16", "COMBINE": "gather", "SCALE_DIM": 32}
     yield "bf16-scatter-scales", {

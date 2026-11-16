@@ -183,6 +183,13 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "fp8/fp4 are dispatch-transport only (pair them with a bf16/fp32 combine)");
   }
 
+  // Only the portable body guards its slot encodes against the recv cap.
+  if (EpRecvCapped(c) && arch.rfind("gfx125", 0) == 0) {
+    throw std::runtime_error(
+        "mori v2 ep: maxRecv below worldSize*maxTokPerRank (token dropping) needs the portable "
+        "body; the gfx125x body does not drop");
+  }
+
   if (!EpCfgIsValid(c)) {
     throw std::runtime_error(
         "mori v2 ep: inconsistent config (world=" + std::to_string(c.worldSize) +

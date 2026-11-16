@@ -104,9 +104,9 @@ __device__ __forceinline__ T EpWaitGt(T* addr, T val) {
   return got;
 }
 
-// (pe, localTokId) <-> flat index. The stride must be at least the recv-slot
-// capacity, NOT the per-rank send capacity: the local id being encoded is a slot
-// index handed out by the destination's tokOff counter, which runs to EpMaxRecv.
+// (pe, localTokId) <-> flat index. The stride must be at least every PUBLISHED
+// slot index, NOT the per-rank send capacity; dispatch publishes slots below
+// EpMaxRecv only (a capped config drops the rest), so the capacity is the stride.
 // A smaller stride aliases peer p slot s onto peer p+1 slot s-stride.
 template <EpCfg kCfg>
 __device__ __forceinline__ int EpFlatStride() {
@@ -228,14 +228,23 @@ __device__ void EpDispatchBody(EpArgs args) {
         // peer's copy of tokOff; SYSTEM scope because it crosses devices.
         destTokId = __hip_atomic_fetch_add(EpPeer<int>(win, destPe, args.offTokOff), 1,
                                            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        atomicAdd(args.destPeTokenCounter + destPe, 1);
-        args.dispDestTokIdMap[i] = EpFlatIndex<kCfg>(destPe, destTokId);
-        // Tell the destination which global source token owns that slot, so
-        // combine can route the reduction back.
-        EpPeer<int>(win, destPe, args.offRecvToSrc)[destTokId] =
-            EpSrcTokIndex<kCfg>(myPe, srcTokId);
+        // Under a recv cap a slot past it is dropped: null in the map, nothing sent.
+        if (!EpRecvCapped(kCfg) || destTokId < EpMaxRecv(kCfg)) {
+          atomicAdd(args.destPeTokenCounter + destPe, 1);
+          args.dispDestTokIdMap[i] = EpFlatIndex<kCfg>(destPe, destTokId);
+          // Tell the destination which global source token owns that slot, so
+          // combine can route the reduction back.
+          EpPeer<int>(win, destPe, args.offRecvToSrc)[destTokId] =
+              EpSrcTokIndex<kCfg>(myPe, srcTokId);
+        } else {
+          args.dispDestTokIdMap[i] = kNullFlat;
+          destTokId = -1;
+        }
       }
       destTokId = __shfl(destTokId, 0);
+      if constexpr (EpRecvCapped(kCfg)) {
+        if (destTokId < 0) continue;
+      }
 
       if (laneId < kTopk) {
         if constexpr (kCfg.useWeights) {

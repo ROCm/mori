@@ -1313,14 +1313,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 f"(scale_dim={cfg.scale_dim} x {cfg.scale_type_size}); "
                 "the row must be a whole number of dwords"
             )
-        # The C++ validator rejects a shrunk cap: the recv capacity is also the
-        # flat-index stride, so an overflow re-encodes to the next peer instead
-        # of merely overrunning the region.
+        # Only the portable body drops the slots past a shrunk cap; the gfx125x
+        # body would encode them onto the next peer.
         worst = cfg.world_size * cfg.max_num_inp_token_per_rank
-        if cfg.effective_max_recv < worst:
+        if self._is1250 and cfg.effective_max_recv < worst:
             bad.append(
                 f"max_total_recv_tokens below the worst case "
-                f"({cfg.effective_max_recv} < {worst}); token dropping is not implemented"
+                f"({cfg.effective_max_recv} < {worst}); token dropping is not "
+                "implemented on gfx125x"
             )
         return tuple(bad)
 
@@ -2184,6 +2184,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 {"gather", "scales"}
                 | ({"scatter"} if cfg.is_scatter else set())
                 | ({"quant"} if cfg.quant_type != "none" else set())
+                | (set() if self._is1250 else {"recv_cap"})
             ),
         )
 

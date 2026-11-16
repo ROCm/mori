@@ -1017,3 +1017,15 @@ def test_scatter_combine_refuses_a_push_beside_it():
         )
     with pytest.raises(RuntimeError, match="needs combineScatterQGroup"):
         cb.EpCombinePlan.describe(**_SCATTER_KW, combine_scatter_fp4=True)
+
+
+def test_a_recv_cap_below_the_worst_case_drops_on_the_portable_body():
+    capped = dict(world_size=8, max_tok_per_rank=128, max_recv=512)
+    if cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        with pytest.raises(RuntimeError, match="token dropping"):
+            cb.EpDispatchPlan.describe(**capped)
+        return
+    info = cb.EpDispatchPlan.describe(**capped)
+    full = cb.EpDispatchPlan.describe(**{**capped, "max_recv": 1024})
+    for region in ("recvToSrc", "outIdx", "outWts", "dispOut"):
+        assert info[f"region.{region}"] < full[f"region.{region}"], region
