@@ -80,6 +80,12 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         refused = self._quant_refusal(cfg, _target_arch())
         if refused:
             return refused
+        # The fp8 codec reads and writes bf16 rows.
+        if cfg.fp8_blockwise and cfg.combine_dtype != torch.bfloat16:
+            return (
+                f"quant_type={cfg.quant_type!r} with combine dtype {cfg.combine_dtype} "
+                "(bf16 only)",
+            )
         # The fp8 codec quantizes a token in 128-element chunks, one per wave load.
         if cfg.fp8_blockwise and cfg.hidden_dim % 128:
             return (
@@ -296,6 +302,9 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 for (b, w) in combine_specs
             }
 
+        if cfg.enable_std_moe:
+            # before the packed buffers are sized in the configured dtype
+            assert elem_size == 2, "StdMoE convert path is bf16-only"
         self._alloc_local_buffers(cfg)
         self._local_expert_count = make_local_expert_count(
             rank=cfg.rank,
@@ -306,7 +315,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         )
 
         if cfg.enable_std_moe:
-            assert elem_size == 2, "StdMoE convert path is bf16-only"
             experts_per_rank = cfg.num_experts_per_rank
             max_tok_per_expert = self._max_tok_per_expert
             self._convert_dispatch = make_convert_dispatch_output(

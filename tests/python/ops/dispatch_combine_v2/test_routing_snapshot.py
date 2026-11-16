@@ -21,7 +21,7 @@
 # SOFTWARE.
 """Regression test (#715): dispatch(return_routing=True, snapshot=True) handles
 own their routing, so several can be held at once -- one per MoE layer, then the
-backward in reverse -- and each still combines (and, on flydsl, replays) correctly
+backward in reverse -- and each still combines (and, where the op has replay, replays) correctly
 after later dispatches on the same op. Also: a handle combines more than once, the
 default (snapshot=False) handle still aliases the op's buffers, and the weight fold
 is correct when the arena holds the handle's weights (latest dispatch, or replay).

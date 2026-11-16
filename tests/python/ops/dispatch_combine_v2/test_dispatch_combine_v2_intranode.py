@@ -147,6 +147,19 @@ def _cases():
             "DTYPE": dt,
             "COMBINE": "scatter",
         }
+    # a partial last step (hidden 2304), and a recv cap
+    yield "hip-bf16-scatter-h2304", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "HIDDEN": 2304,
+    }
+    yield "hip-bf16-scatter-cap", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "MAXRECV": 1024,
+    }
     yield "hip-bf16-scatter-scales-ragged", {
         "MORI_V2_KERNEL_BACKEND": "hip",
         "DTYPE": "bf16",
@@ -202,6 +215,14 @@ def _cases():
         yield f"bf16-gather-topk{k}", {"DTYPE": "bf16", "COMBINE": "gather", "TOPK": k}
     # feature paths
     yield "bf16-gather-tuned", {"DTYPE": "bf16", "COMBINE": "gather", "TUNED": 1}
+    # rows and reverse map read in-stream right after dispatch, before any barrier
+    yield "bf16-gather-fresh", {"DTYPE": "bf16", "COMBINE": "gather", "FRESH": 1}
+    yield "hip-bf16-gather-fresh", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "gather",
+        "FRESH": 1,
+    }
     yield "bf16-gather-replay", {"DTYPE": "bf16", "COMBINE": "gather", "REPLAY": 1}
     for extra in (
         {},
@@ -317,6 +338,9 @@ def test_op_lifecycle(backend):
     assert "# LIFECYCLE: PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout}"
 
 
+@pytest.mark.skipif(
+    _arch().startswith("gfx125"), reason="HIP local kernels are gfx942/gfx950"
+)
 @pytest.mark.parametrize("knobs", [{"LEC": 1}, {"LEC": 1, "STDMOE": 1}])
 def test_graph_capture_hip_local_kernels(knobs):
     """local_expert_count and the StdMoE converts inside a captured, replayed step."""

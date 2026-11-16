@@ -78,8 +78,13 @@ def main():
         base = len(comm._resources)
         ok = True
         # explicit close(): each op adds mem+win (2), close() returns to base.
+        # gfx125x serves no StdMoE on either backend
+        std_moe_ok = not torch.cuda.get_device_properties(0).gcnArchName.startswith(
+            "gfx125"
+        )
         for i in range(ITERS):
-            op = EpDispatchCombineOp(_cfg(rank, npes, std_moe=bool(i % 2)), comm)
+            std_moe = bool(i % 2) and std_moe_ok
+            op = EpDispatchCombineOp(_cfg(rank, npes, std_moe=std_moe), comm)
             grew = len(comm._resources) - base
             op.close()
             op.close()  # idempotent

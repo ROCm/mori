@@ -165,7 +165,7 @@ Run the allocated-node checks in the [Quickstart](quickstart.rst) before you mea
 - `tests/python/ops/dispatch_combine_v2/test_ep_backend_parity.py`: compare HIP and FlyDSL on the same inputs.
 - `tests/python/ops/dispatch_combine_v2/test_graph_capture.py`: graph replay.
 - `tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py`: real two-node correctness, benchmark, tuning and stress runs.
-- `tests/python/ops/dispatch_combine_v2/bench_ep.py`: benchmark points with an identity-expert correctness check by default.
+- `tests/python/ops/dispatch_combine_v2/bench_ep.py`: benchmark points with an identity-expert correctness check by default (not for the gfx942/gfx950 scatter combines, which `test_op.py` checks).
 
 Record the MORI and FlyDSL revisions, backend, GPU, NIC, transport, dtype, quantization mode, shape and graph mode with your results. A successful intranode benchmark does not validate an internode configuration.
 

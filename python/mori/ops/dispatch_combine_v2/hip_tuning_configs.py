@@ -800,7 +800,8 @@ def resolve_schedule(
     """The HIP V2 schedule consumed by both construction and token selection.
 
     Intra adapts the schedule Config resolved: per phase, the IntraNodeV2 table's
-    rules when quant_type is "none", else the Python table's; an explicit
+    rules (its dispatch rules unless the op is quantized on gfx125x, its combine
+    rules only for an unquantized gather combine), else the Python table's; an explicit
     cfg.schedule is taken as given, and pinned or untuned geometry is one bucket.
     Inter names each bucket of internode_schedule() with its kernel family; tuned
     grids are clamped to ``cu_count``, the backend's own CU count. Loading and
@@ -988,8 +989,8 @@ def lookup(
     ``dtype`` is the dispatch wire ("bf16" / "fp8" / "fp4") and picks the dispatch
     half; ``quant_type`` picks the combine half. Each half is built independently,
     so either can be re-tuned without touching the other: its IntraNodeV2 table
-    rules when it has any (not for a quantized combine half, nor a quantized
-    dispatch half on gfx125x), else the Python table's,
+    rules when it has any (not for a quantized or scatter combine half, nor a
+    quantized dispatch half on gfx125x), else the Python table's,
     else the HIP single-shot default. A shape with neither half tuned gets the
     default and no schedule.
 
