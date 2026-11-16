@@ -463,8 +463,9 @@ FabricBackend::~FabricBackend() {
   }
 
   std::lock_guard<std::mutex> lock(moduleMu_);
-  for (auto& mod : fabricCopyModules_) {
-    if (mod != nullptr) (void)hipModuleUnload(mod);
+  ScopedHipDeviceGuard deviceGuard;
+  for (const auto& loaded : fabricCopyModules_) {
+    if (hipSetDevice(loaded.device) == hipSuccess) (void)hipModuleUnload(loaded.module);
   }
   fabricCopyModules_.clear();
   fabricCopyFuncs_.clear();
@@ -508,13 +509,9 @@ fabric::VpodKey FabricBackend::LocalVpodKey(int deviceId) const {
 
 void FabricBackend::LoadFabricCopyModule(const std::string& hsacoPath) {
   std::lock_guard<std::mutex> lock(moduleMu_);
-  ScopedHipDeviceGuard deviceGuard;
-  for (size_t i = 0; i < fabricCopyModules_.size(); ++i) {
-    if (fabricCopyModules_[i] && hipSetDevice(static_cast<int>(i)) == hipSuccess)
-      (void)hipModuleUnload(fabricCopyModules_[i]);
-  }
+  // Old kernels may still be queued/running, and callers can hold copied function
+  // handles outside moduleMu_. Keep every loaded generation until destruction.
   fabricCopyHsacoPath_ = hsacoPath;
-  fabricCopyModules_.assign(numDevices, nullptr);
   fabricCopyFuncs_.assign(numDevices, CopyFunctions{});
   MORI_IO_INFO("FABRIC: copy kernels registered from {}", hsacoPath);
 }
@@ -538,7 +535,7 @@ FabricBackend::CopyFunctions FabricBackend::GetFabricCopyFunctions(int deviceId)
     if (module) (void)hipModuleUnload(module);
     return {};
   }
-  fabricCopyModules_[deviceId] = module;
+  fabricCopyModules_.push_back({deviceId, module});
   fabricCopyFuncs_[deviceId] = funcs;
   MORI_IO_INFO("FABRIC: Loaded single, small and large copy kernels on device {}", deviceId);
   return funcs;

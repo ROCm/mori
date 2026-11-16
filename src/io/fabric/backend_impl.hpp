@@ -111,7 +111,8 @@ class FabricBackend : public Backend {
                                 TransferStatus* status) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
-  // JIT-loaded batched copy kernels (fabric_copy.hip), one module per device.
+  // JIT-loaded batched copy kernels (fabric_copy.hip), loaded lazily per device.
+  // Reloading retains prior modules until backend destruction.
   void LoadFabricCopyModule(const std::string& hsacoPath);
   struct CopyFunctions {
     hipFunction_t single{nullptr};
@@ -210,7 +211,11 @@ class FabricBackend : public Backend {
   mutable std::mutex remoteEnginesMu;
 
   std::string fabricCopyHsacoPath_;
-  std::vector<hipModule_t> fabricCopyModules_;
+  struct CopyModule {
+    int device;
+    hipModule_t module;
+  };
+  std::vector<CopyModule> fabricCopyModules_;  // all generations, with their owning device
   std::vector<CopyFunctions> fabricCopyFuncs_;
   uint32_t fabricCopyMaxBlocks_;
   std::mutex moduleMu_;
