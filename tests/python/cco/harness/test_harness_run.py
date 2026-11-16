@@ -21,7 +21,8 @@
 # SOFTWARE.
 """benchmark/cco/harness/run.py on the CPU, with a stand-in for the torchrun launch.
 
-The GPU path itself (torchrun, bench_runs.py, the benchmark) is not exercised here.
+The GPU path itself (torchrun, bench_driver.py, the benchmarks) is not exercised here;
+bench_driver.py is run in-process against two stand-in benchmarks.
 """
 
 import importlib.util
@@ -46,7 +47,12 @@ def _load(name):
 
 
 run = _load("run")
+driver = _load("bench_driver")
 SPEC = run.OPS["gemm_ar"]
+
+
+def arms(*modes):
+    return run.arms_from_op("gemm_ar", list(modes))
 
 
 def record(mode, us, validated=True):
@@ -63,7 +69,7 @@ def record(mode, us, validated=True):
 def fake_launch(times, validated=True, drop=0):
     """A build_command stand-in whose 'launch' prints one RESULT_JSON per planned run."""
 
-    def build(spec, plan, nproc, timeout_s, launcher, python, env):
+    def build(plan, nproc, timeout_s, launcher, python, env):
         lines = [
             "RESULT_JSON " + json.dumps(record(p["mode"], times(p), validated))
             for p in plan[: len(plan) - drop]
@@ -80,7 +86,7 @@ def split_fused(p):
 
 
 def test_plan_interleaves_rounds_and_repeats_the_baseline():
-    plan = run.plan_runs(["split-sdma", "fused-sdma"], 2, True, ["-m", "64"])
+    plan = run.plan_runs(arms("split-sdma", "fused-sdma"), 2, True, ["-m", "64"])
     assert [(p["round"], p["mode"], p["repeat"]) for p in plan] == [
         (1, "split-sdma", False),
         (1, "fused-sdma", False),
@@ -93,9 +99,9 @@ def test_plan_interleaves_rounds_and_repeats_the_baseline():
 
 
 def test_command_shape():
-    plan = run.plan_runs(["split-sdma"], 1, False, [])
+    plan = run.plan_runs(arms("split-sdma"), 1, False, [])
     cmd = run.build_command(
-        SPEC, plan, 8, 900, ["docker", "exec", "c"], "python3", {"B": "2", "A": "1"}
+        plan, 8, 900, ["docker", "exec", "c"], "python3", {"B": "2", "A": "1"}
     )
     assert cmd[:3] == ["docker", "exec", "c"]
     assert cmd[3:8] == ["timeout", "--signal=TERM", "--kill-after=30", "900", "env"]
@@ -107,15 +113,16 @@ def test_command_shape():
         "--standalone",
         "--nproc_per_node=8",
     ]
-    assert cmd[15:17] == [str(run.REPO / run.DRIVER), str(run.REPO / SPEC["bench"])]
-    assert json.loads(cmd[17]) == [["--mode", "split-sdma"]]
-    assert (run.REPO / run.DRIVER).is_file() and (run.REPO / SPEC["bench"]).is_file()
+    assert cmd[15] == str(run.REPO / run.DRIVER) and (run.REPO / run.DRIVER).is_file()
+    assert json.loads(cmd[16]) == [
+        {"bench": str(run.REPO / SPEC["bench"]), "args": ["--mode", "split-sdma"]}
+    ]
 
 
 def test_aggregate_medians_noise_and_comparison():
-    plan = run.plan_runs(["split-sdma", "fused-sdma"], 3, True, [])
+    plan = run.plan_runs(arms("split-sdma", "fused-sdma"), 3, True, [])
     records = [record(p["mode"], split_fused(p)) for p in plan]
-    rows, summary, noise, comparisons = run.aggregate(SPEC, plan, records, True)
+    rows, summary, noise, comparisons = run.aggregate(plan, records, True)
     assert (
         summary["split-sdma"]["median_us"] == 102.0
         and summary["split-sdma"]["rounds"] == 3
@@ -131,13 +138,13 @@ def test_aggregate_medians_noise_and_comparison():
 
 
 def test_aggregate_without_aa_uses_the_baseline_spread_and_flags_missing_records():
-    plan = run.plan_runs(["split-sdma", "fused-sdma"], 2, False, [])
+    plan = run.plan_runs(arms("split-sdma", "fused-sdma"), 2, False, [])
     records = [
         record("split-sdma", 100.0),
         record("fused-sdma", 90.0),
         record("split-sdma", 104.0),
     ]
-    rows, summary, noise, _ = run.aggregate(SPEC, plan, records, False)
+    rows, summary, noise, _ = run.aggregate(plan, records, False)
     assert noise["source"].startswith("spread of split-sdma") and noise[
         "pct"
     ] == pytest.approx(100 * 4 / 102)
@@ -364,7 +371,7 @@ def test_templates_carry_every_required_field():
 
 def test_baseline_need_not_be_the_first_mode(tmp_path, monkeypatch):
     plan = run.plan_runs(
-        ["gemm-only", "split-sdma", "fused-sdma"], 1, True, [], "split-sdma"
+        arms("gemm-only", "split-sdma", "fused-sdma"), 1, True, [], "split-sdma"
     )
     assert [(p["mode"], p["repeat"]) for p in plan][-1] == ("split-sdma", True)
 
@@ -374,7 +381,7 @@ def test_baseline_need_not_be_the_first_mode(tmp_path, monkeypatch):
         ] + p["round"]
 
     records = [record(p["mode"], times(p)) for p in plan]
-    _, _, noise, comparisons = run.aggregate(SPEC, plan, records, True, "split-sdma")
+    _, _, noise, comparisons = run.aggregate(plan, records, True, "split-sdma")
     assert {c["candidate"]: round(c["speedup"], 3) for c in comparisons} == {
         "gemm-only": round(1467 / 359, 3),
         "fused-sdma": round(1467 / 1163, 3),
@@ -401,3 +408,137 @@ def test_baseline_need_not_be_the_first_mode(tmp_path, monkeypatch):
         run.main([*args[:4], "--baseline", "fused-lsa", "--out", str(tmp_path / "x")])
         == 2
     )
+
+
+STAND_IN = """
+import argparse, json
+
+
+def build_parser():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", default="{mode}")
+    p.add_argument("-m", type=int, default=1)
+    return p
+
+
+def run(args):
+    print("RESULT_JSON " + json.dumps({{"mode": args.mode, "us": {us} + args.m, "validated": True}}))
+    return 0
+"""
+
+
+def stand_in(tmp_path, name, mode, us):
+    path = tmp_path / f"{name}.py"
+    path.write_text(STAND_IN.format(mode=mode, us=us))
+    return path
+
+
+def test_driver_runs_two_benchmarks_interleaved_in_one_process(tmp_path, capsys):
+    a, b = stand_in(tmp_path, "old", "fused", 100), stand_in(
+        tmp_path, "new", "cand", 90
+    )
+    runs = [
+        {"bench": str(a), "args": ["--mode", "fused", "-m", "4"]},
+        {"bench": str(b), "args": ["-m", "4"]},
+        {"bench": str(a), "args": ["--mode", "fused", "-m", "4"]},
+    ]
+    assert driver.main([json.dumps(runs)]) == 0
+    got = run.parse_results(capsys.readouterr().out)
+    assert [(r["mode"], r["us"]) for r in got] == [
+        ("fused", 104),
+        ("cand", 94),
+        ("fused", 104),
+    ]
+
+
+def test_arms_file_and_end_to_end(tmp_path, monkeypatch):
+    a, b = stand_in(tmp_path, "old", "fused", 100), stand_in(
+        tmp_path, "new", "cand", 90
+    )
+    arms_file = tmp_path / "arms.json"
+    arms_file.write_text(
+        json.dumps(
+            {
+                "arms": [
+                    {
+                        "name": "existing",
+                        "bench": str(a),
+                        "args": "--mode fused",
+                        "time_field": "us",
+                    },
+                    {
+                        "name": "candidate",
+                        "bench": str(b),
+                        "time_field": "us",
+                        "sdma": False,
+                    },
+                ]
+            }
+        )
+    )
+    loaded = run.load_arms(arms_file)
+    assert [x["args"] for x in loaded] == [["--mode", "fused"], []]
+    plan = run.plan_runs(loaded, 2, True, ["-m", "4"])
+    assert [p["expect_mode"] for p in plan] == ["fused", None, "fused"] * 2
+
+    def times(p):
+        return 100.0 if p["mode"] == "existing" else 95.0
+
+    def build(plan, nproc, timeout_s, launcher, python, env):
+        lines = []
+        for p in plan:
+            mode = "fused" if p["mode"] == "existing" else "cand"
+            lines.append(
+                "RESULT_JSON "
+                + json.dumps({"mode": mode, "us": times(p), "validated": True})
+            )
+        text = "\n".join(lines) + "\n"
+        return [sys.executable, "-c", f"import sys; sys.stdout.write({text!r})"]
+
+    monkeypatch.setattr(run, "build_command", build)
+    monkeypatch.setattr(run, "GAP_FILE", tmp_path / "gap")
+    out = tmp_path / "r"
+    argv = [
+        "--arms",
+        str(arms_file),
+        "--aa",
+        "--no-preflight",
+        "--bench-args",
+        "-m 4",
+        "--out",
+        str(out),
+    ]
+    assert run.main(argv) == 0
+    result = json.loads((out / "result.json").read_text())
+    assert (
+        result["status"] == "ok"
+        and result["op"] is None
+        and result["modes"] == ["existing", "candidate"]
+    )
+    assert result["comparisons"][0]["speedup"] == pytest.approx(100 / 95)
+    jsonschema = pytest.importorskip("jsonschema")
+    jsonschema.validate(
+        result, json.loads((HARNESS / "schemas" / "result.schema.json").read_text())
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--modes", "split-sdma"],
+        ["--op", "gemm_ar"],
+        ["--op", "gemm_ar", "--modes", "split-sdma", "--arms", "x.json"],
+        ["--arms", "missing.json"],
+    ],
+)
+def test_op_and_arms_are_exclusive(tmp_path, argv):
+    assert run.main([*argv, "--out", str(tmp_path / "r")]) == 2
+
+
+def test_arms_need_existing_benchmarks(tmp_path):
+    bad = tmp_path / "arms.json"
+    bad.write_text(
+        json.dumps({"arms": [{"name": "x", "bench": str(tmp_path / "nope.py")}]})
+    )
+    with pytest.raises(run.UsageError):
+        run.load_arms(bad)

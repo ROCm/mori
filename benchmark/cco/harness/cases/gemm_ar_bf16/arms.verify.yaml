@@ -1,0 +1,17 @@
+# The verifier's acceptance timing (step 4). Besides the two op_harness arms, the
+# existing benchmark runs the same op configuration (BF16, LSA gather, one SDMA queue
+# per peer) as a cross-check
+# that op_harness times it the way the benchmark does. Fill in the candidate, then
+#
+#   python benchmark/cco/harness/run.py --arms <this file> --baseline existing --aa \
+#       --rounds 3 --bench-args "-m 16384" --out <run-dir>
+arms:
+  - name: existing
+    bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
+    args: --mode time --impl benchmark/cco/harness/cases/gemm_ar_bf16/existing.py:ExistingGemmAllReduce
+  - name: candidate
+    bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
+    args: --mode time --impl <path/to/candidate.py>:<Class>
+  - name: existing-bench
+    bench: benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py
+    args: --mode fused-sdma --quant bf16 --gather-transport lsa --sdma-queues 1 -n 7168 -k 2048

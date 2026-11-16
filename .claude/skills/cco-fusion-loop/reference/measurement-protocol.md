@@ -8,6 +8,8 @@ Each rule below once produced a confident wrong number; the gemm_ar README's
 process, the maximum over ranks, an A/A pair (`--aa`), one shape per invocation, the 10 s
 gap, a timeout with cleanup, and `preflight.py` before the launch. Cold or hot, eager or
 graph, and the M grid are chosen by the caller through the modes and `--bench-args`.
+To compare two implementations, give each an arm (`--arms`) so they run interleaved in
+the same launch, timed by the same code.
 
 - **Graph replay, several calls per graph.** A single-call graph has a floor of about
   13.4 µs (`G950-MEAS-01`). Use `benchmark/cco/flydsl/gemm_ar/timing.py`.

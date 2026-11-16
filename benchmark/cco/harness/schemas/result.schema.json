@@ -7,6 +7,7 @@
   "required": [
     "schema",
     "op",
+    "arms",
     "modes",
     "baseline",
     "rounds",
@@ -23,7 +24,10 @@
       "const": "cco-fusion/result/v1"
     },
     "op": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "modes": {
       "type": "array",
@@ -40,7 +44,10 @@
       "type": "boolean"
     },
     "bench": {
-      "type": "string"
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "bench_args": {
       "type": "array",
@@ -305,6 +312,42 @@
     },
     "baseline": {
       "type": "string"
+    },
+    "arms": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "bench",
+          "args",
+          "time_field"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "bench": {
+            "type": "string"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "time_field": {
+            "type": "string"
+          },
+          "per_rank_field": {
+            "type": "string"
+          },
+          "sdma": {
+            "type": "boolean"
+          }
+        }
+      }
     }
   }
 }

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Read(**/mori/ops/gemm_ar/kernels_fused.py*)",
+      "Read(**/mori/ops/gemm_ar/kernels_fused_bf16.py*)",
+      "Read(**/mori/ops/gemm_ar/kernels_sdma.py*)",
+      "Read(**/mori/ops/gemm_ar/kernels_lsa.py*)",
+      "Read(**/mori/ops/gemm_ar/layout.py*)",
+      "Read(**/mori/ops/gemm_ar/op.py*)",
+      "Read(**/mori/ops/gemm_ar/gemm.py*)",
+      "Read(**/mori/ops/gemm_ar/_quant_experiment.py*)",
+      "Read(**/mori/ops/gemm_ar/README.md*)",
+      "Read(**/benchmark/cco/flydsl/gemm_ar/**)",
+      "Read(**/benchmark/cco/flydsl/ar/**)",
+      "Read(**/tests/python/cco/test_gemm_ar*)",
+      "Read(**/tests/python/cco/gemm_ar_*)",
+      "Read(**/tests/python/cco/test_flydsl_ar.py*)",
+      "Read(**/docs/fused-gemm-ar.md*)",
+      "Read(**/docs/fused-gemm-rs.md*)",
+      "Read(**/cases/gemm_ar_bf16/existing.py*)",
+      "Bash(git push:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(gh pr close:*)",
+      "Bash(gh pr comment:*)",
+      "Bash(gh pr review:*)",
+      "Bash(gh issue create:*)",
+      "Bash(gh issue comment:*)",
+      "Bash(pkill:*)",
+      "Bash(killall:*)",
+      "Bash(amd-smi reset:*)",
+      "Bash(amd-smi set:*)",
+      "Bash(rocm-smi --gpureset:*)",
+      "Bash(rocm-smi -r:*)",
+      "Bash(rocm-smi --setsclk:*)",
+      "Bash(rocm-smi --setperflevel:*)"
+    ]
+  }
+}

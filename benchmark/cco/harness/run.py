@@ -26,8 +26,11 @@ Used in steps 1 and 3 of the ``cco-fusion-loop`` skill and by the verifier in st
     python run.py --op gemm_ar --modes split-sdma,fused-sdma --rounds 3 --aa \\
         --bench-args "-m 16384 -n 7168 -k 2048 --quant blockscale" --out <run-dir>
 
-It launches ``torchrun`` once, through ``tests/python/cco/bench_runs.py``, so every mode
-runs in the same processes, interleaved round by round: A, B, A, B, ... Every mode is
+It launches ``torchrun`` once, through ``bench_driver.py``, so every arm runs in the same
+processes, interleaved round by round: A, B, A, B, ... An arm is a benchmark file plus
+its arguments: ``--op``/``--modes`` gives one arm per mode of a registered benchmark, and
+``--arms <file>`` lists arms that may each name a different benchmark (the existing
+operator against a candidate, say). Every mode is
 compared with ``--baseline`` (default: the first mode); with ``--aa`` the baseline runs
 again at the end of each round and the A/A difference is the noise band. One invocation is one shape (G950-MEAS-03): ``--bench-args`` sets it,
 and the record keeps the benchmark's own report of it.
@@ -74,7 +77,7 @@ import isa_check  # noqa: E402
 import preflight  # noqa: E402
 
 SCHEMA = "cco-fusion/result/v1"
-DRIVER = "tests/python/cco/bench_runs.py"
+DRIVER = "benchmark/cco/harness/bench_driver.py"
 GAP_FILE = Path(os.environ.get("TMPDIR", "/tmp")) / "cco_fusion_last_multirank_run"
 GAP_S = 10.0
 ENV_DEFAULTS = {"MORI_ENABLE_SDMA": "1", "MORI_SOCKET_IFNAME": "lo"}
@@ -105,26 +108,101 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def plan_runs(modes, rounds, aa, bench_args, baseline=None):
-    """The runs in launch order: every round runs every mode, plus the baseline again with ``aa``."""
-    baseline = baseline or modes[0]
+def arms_from_op(op, modes):
+    """``--op``/``--modes`` as arms: one benchmark, one arm per ``--mode``."""
+    spec = OPS[op]
+    return [
+        {
+            "name": mode,
+            "bench": spec["bench"],
+            "args": ["--mode", mode],
+            "time_field": spec["time_field"],
+            "per_rank_field": spec["per_rank_field"],
+            "sdma": mode in spec["sdma_modes"],
+        }
+        for mode in modes
+    ]
+
+
+def load_arms(path):
+    """Arms from a JSON or YAML file: ``{"arms": [{"name", "bench", "args", ...}]}``."""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+        if path.suffix in (".yaml", ".yml"):
+            try:
+                import yaml
+            except ImportError:
+                raise UsageError(f"{path}: reading YAML needs PyYAML") from None
+            data = yaml.safe_load(text)
+        else:
+            data = json.loads(text)
+    except (OSError, ValueError) as e:
+        raise UsageError(f"{path}: cannot read the arms: {e}") from None
+    items = data.get("arms") if isinstance(data, dict) else data
+    if not isinstance(items, list) or not items:
+        raise UsageError(f"{path}: needs a non-empty 'arms' list")
+    arms = []
+    for item in items:
+        if not isinstance(item, dict) or not item.get("name") or not item.get("bench"):
+            raise UsageError(f"{path}: every arm needs a name and a bench: {item!r}")
+        bench = Path(item["bench"])
+        if not (bench if bench.is_absolute() else REPO / bench).is_file():
+            raise UsageError(f"{path}: arm {item['name']}: no benchmark at {bench}")
+        args = item.get("args", [])
+        if isinstance(args, str):
+            args = shlex.split(args)
+        arms.append(
+            {
+                "name": str(item["name"]),
+                "bench": str(bench),
+                "args": [str(a) for a in args],
+                "time_field": item.get("time_field", "max_rank_time_us"),
+                "per_rank_field": item.get("per_rank_field", "per_rank_time_us"),
+                "sdma": bool(item.get("sdma", True)),
+            }
+        )
+    return arms
+
+
+def _mode_arg(args):
+    for flag, value in zip(args, args[1:]):
+        if flag == "--mode":
+            return value
+    return None
+
+
+def plan_runs(arms, rounds, aa, bench_args, baseline=None):
+    """The runs in launch order: every round runs every arm, plus the baseline again with ``aa``."""
+    by_name = {a["name"]: a for a in arms}
+    baseline = baseline or arms[0]["name"]
     plan = []
     for r in range(1, rounds + 1):
-        order = [(m, False) for m in modes] + ([(baseline, True)] if aa else [])
-        for mode, repeat in order:
+        order = [(a["name"], False) for a in arms] + ([(baseline, True)] if aa else [])
+        for name, repeat in order:
+            arm = by_name[name]
             plan.append(
                 {
                     "round": r,
-                    "mode": mode,
+                    "mode": name,
                     "repeat": repeat,
-                    "args": ["--mode", mode, *bench_args],
+                    "bench": arm["bench"],
+                    "args": [*arm["args"], *bench_args],
+                    "expect_mode": _mode_arg(arm["args"]),
+                    "time_field": arm["time_field"],
+                    "per_rank_field": arm["per_rank_field"],
                 }
             )
     return plan
 
 
-def build_command(spec, plan, nproc, timeout_s, launcher, python, env):
-    runs = json.dumps([p["args"] for p in plan])
+def _abs(path):
+    path = Path(path)
+    return str(path if path.is_absolute() else REPO / path)
+
+
+def build_command(plan, nproc, timeout_s, launcher, python, env):
+    runs = json.dumps([{"bench": _abs(p["bench"]), "args": p["args"]} for p in plan])
     return [
         *launcher,
         "timeout",
@@ -139,7 +217,6 @@ def build_command(spec, plan, nproc, timeout_s, launcher, python, env):
         "--standalone",
         f"--nproc_per_node={nproc}",
         str(REPO / DRIVER),
-        str(REPO / spec["bench"]),
         runs,
     ]
 
@@ -232,21 +309,23 @@ def parse_results(text):
     return records
 
 
-def aggregate(spec, plan, records, aa, baseline=None):
+def _matches(record, p):
+    if not record:
+        return False
+    return p.get("expect_mode") is None or record.get("mode") == p["expect_mode"]
+
+
+def aggregate(plan, records, aa, baseline=None):
     rows = []
     for i, p in enumerate(plan):
-        rec = (
-            records[i]
-            if i < len(records) and records[i] and records[i].get("mode") == p["mode"]
-            else None
-        )
+        rec = records[i] if i < len(records) and _matches(records[i], p) else None
         rows.append(
             {
                 "round": p["round"],
                 "mode": p["mode"],
                 "repeat": p["repeat"],
-                "time_us": rec.get(spec["time_field"]) if rec else None,
-                "per_rank_us": rec.get(spec["per_rank_field"]) if rec else None,
+                "time_us": rec.get(p["time_field"]) if rec else None,
+                "per_rank_us": rec.get(p["per_rank_field"]) if rec else None,
                 "critical_rank": rec.get("critical_rank") if rec else None,
                 "validated": rec.get("validated") if rec else None,
                 "rel_l2": rec.get("rel_l2") if rec else None,
@@ -412,11 +491,20 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         description="Run one shape of a fused-operator benchmark, modes interleaved."
     )
-    parser.add_argument("--op", required=True, choices=sorted(OPS))
-    parser.add_argument("--modes", required=True, help="comma-separated modes")
+    parser.add_argument("--op", choices=sorted(OPS), help="a registered operator")
+    parser.add_argument("--modes", help="with --op: comma-separated modes")
+    parser.add_argument(
+        "--arms",
+        help="instead of --op/--modes: a JSON or YAML file of arms, each with its own benchmark",
+    )
     parser.add_argument(
         "--baseline",
-        help="the mode every other mode is compared with (default: the first)",
+        help="the arm every other arm is compared with (default: the first)",
+    )
+    parser.add_argument(
+        "--no-require-sdma",
+        action="store_true",
+        help="do not require SDMA in preflight",
     )
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument(
@@ -457,19 +545,28 @@ def parse_args(argv):
     parser.add_argument("--out", required=True, help="run directory")
     args = parser.parse_args(argv)
 
-    spec = OPS[args.op]
-    args.mode_list = [m.strip() for m in args.modes.split(",") if m.strip()]
-    unknown = [m for m in args.mode_list if m not in spec["modes"]]
-    if not args.mode_list or unknown:
-        raise UsageError(
-            f"modes for {args.op}: {', '.join(spec['modes'])}; unknown: {', '.join(unknown) or 'none given'}"
-        )
+    if bool(args.arms) == bool(args.op or args.modes):
+        raise UsageError("give either --op with --modes, or --arms")
+    if args.arms:
+        args.arm_list = load_arms(args.arms)
+    else:
+        if not (args.op and args.modes):
+            raise UsageError("--op needs --modes")
+        spec = OPS[args.op]
+        modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+        unknown = [m for m in modes if m not in spec["modes"]]
+        if not modes or unknown:
+            raise UsageError(
+                f"modes for {args.op}: {', '.join(spec['modes'])}; unknown: {', '.join(unknown) or 'none given'}"
+            )
+        args.arm_list = arms_from_op(args.op, modes)
+    args.mode_list = [a["name"] for a in args.arm_list]
     if len(set(args.mode_list)) != len(args.mode_list):
-        raise UsageError("a mode is listed twice; use --aa for an A/A pair")
+        raise UsageError("an arm is listed twice; use --aa for an A/A pair")
     if args.baseline is None:
         args.baseline = args.mode_list[0]
     elif args.baseline not in args.mode_list:
-        raise UsageError(f"--baseline {args.baseline} is not one of --modes")
+        raise UsageError(f"--baseline {args.baseline} is not one of the arms")
     if args.rounds < 1 or args.nproc < 1 or args.timeout <= 0:
         raise UsageError("--rounds, --nproc and --timeout must be positive")
     if args.python is None:
@@ -483,11 +580,10 @@ def main(argv=None):
     except UsageError as e:
         print(f"run.py: {e}", file=sys.stderr)
         return 2
-    spec = OPS[args.op]
     out_dir = Path(args.out).resolve()
     launcher = shlex.split(args.launcher)
     bench_args = shlex.split(args.bench_args)
-    plan = plan_runs(args.mode_list, args.rounds, args.aa, bench_args, args.baseline)
+    plan = plan_runs(args.arm_list, args.rounds, args.aa, bench_args, args.baseline)
     env = dict(ENV_DEFAULTS)
     if args.dump_isa:
         env.update(
@@ -497,9 +593,7 @@ def main(argv=None):
                 "FLYDSL_RUNTIME_CACHE_DIR": str(out_dir / "flydsl-cache"),
             }
         )
-    cmd = build_command(
-        spec, plan, args.nproc, args.timeout, launcher, args.python, env
-    )
+    cmd = build_command(plan, args.nproc, args.timeout, launcher, args.python, env)
     if args.dry_run:
         print(json.dumps({"plan": plan, "command": cmd}, indent=2))
         return 0
@@ -521,11 +615,12 @@ def main(argv=None):
     result = {
         "schema": SCHEMA,
         "op": args.op,
+        "arms": args.arm_list,
         "modes": args.mode_list,
         "baseline": args.baseline,
         "rounds": args.rounds,
         "aa": args.aa,
-        "bench": spec["bench"],
+        "bench": sorted({a["bench"] for a in args.arm_list}),
         "bench_args": bench_args,
         "nproc": args.nproc,
         "launcher": launcher,
@@ -538,7 +633,9 @@ def main(argv=None):
         if args.no_preflight:
             result["preflight"] = "skipped"
         else:
-            require_sdma = any(m in spec["sdma_modes"] for m in args.mode_list)
+            require_sdma = not args.no_require_sdma and any(
+                a["sdma"] for a in args.arm_list
+            )
             record = run_preflight(args, launcher, require_sdma, out_dir)
             result["preflight"] = record["result"]
             info = record.get("info", {})
@@ -576,9 +673,7 @@ def main(argv=None):
     result["leftover_pids"] = leftover
 
     records = parse_results((out_dir / "stdout.log").read_text(errors="replace"))
-    rows, summary, noise, comparisons = aggregate(
-        spec, plan, records, args.aa, args.baseline
-    )
+    rows, summary, noise, comparisons = aggregate(plan, records, args.aa, args.baseline)
     complete = all(r["record"] is not None for r in rows)
     if status == "timeout":
         result["status"] = "timeout"

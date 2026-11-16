@@ -179,6 +179,14 @@ unless the verifier's numbers show it.
 touch other tenants (GPU resets, `pkill`). Load it for a run with
 `claude --settings <path>`; do not merge it into the project-wide settings.
 
+## Evaluation cases
+
+`benchmark/cco/harness/cases/` holds tasks that test this loop itself. A case fixes the
+contract, the operator's interface, a harness that times and checks any implementation
+of it, and a clean-room rule: the implementer may not read the existing implementation,
+the session loads the case's settings, and the case's `audit.py` checks the transcripts
+afterwards. Start from the case's README.
+
 ## Rules
 
 - Correctness before timing.

@@ -1,0 +1,12 @@
+# The implementer's development comparison: candidate against the existing op, both
+# through op_harness.py. Fill in the candidate's --impl, then
+#
+#   python benchmark/cco/harness/run.py --arms <this file> --baseline existing --aa \
+#       --bench-args "-m 16384" --out <run-dir>
+arms:
+  - name: existing
+    bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
+    args: --mode time --impl benchmark/cco/harness/cases/gemm_ar_bf16/existing.py:ExistingGemmAllReduce
+  - name: candidate
+    bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
+    args: --mode time --impl <path/to/candidate.py>:<Class>

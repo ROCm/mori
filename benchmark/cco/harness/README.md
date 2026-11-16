@@ -14,11 +14,13 @@ or an `srun` into an allocation the user already holds.
 |---|---|---|---|
 | `contract.example.yaml` | exists | step 0 | template for a task's contract |
 | `preflight.py` | exists | every run | record the environment, refuse a run that cannot be valid |
-| `run.py` | exists | steps 1, 3, 4 | one measurement entry: modes interleaved in one launch on the user's GPUs, with preflight, a timeout and cleanup of its own processes; gemm_ar for now |
+| `run.py` | exists | steps 1, 3, 4 | one measurement entry: modes or arms interleaved in one launch on the user's GPUs, with preflight, a timeout and cleanup of its own processes |
+| `bench_driver.py` | exists | (run.py) | runs several benchmarks, each from its own file, in one torchrun launch |
 | `bound.py` | exists | step 1 | split-path phase times to `T_ideal`, `T_real` and go or no-go |
 | `bounds.example.yaml` | exists | step 1 | `bound.py` input: the gemm_ar worked example (`G950-GAR-01`) |
 | `isa_check.py` | exists | steps 3, 4 | the ISA check on a FlyDSL `*_final_isa.s` |
 | `schemas/` | exists | all | JSON schemas for `run.py`'s result, the candidate manifest and the verdict |
+| `cases/` | exists | evaluation | tasks that test the harness itself; `gemm_ar_bf16` re-implements BF16 GEMM + all-reduce in a clean room |
 
 ## bound.py
 
@@ -80,13 +82,28 @@ GPUs, the processes on them, the link types and `CONFIG_DMABUF_MOVE_NOTIFY`.
 
 ## run.py
 
-`python run.py --op gemm_ar --modes <m1,m2,...> [--baseline <mode>] [--rounds 3] [--aa] [--bench-args "<shape and switches>"] [--nproc 8] [--timeout 1800] [--launcher "<prefix>"] [--dump-isa] --out <run-dir>`
+`python run.py (--op gemm_ar --modes <m1,m2,...> | --arms <arms.yaml>) [--baseline <arm>] [--rounds 3] [--aa] [--bench-args "<shape and switches>"] [--nproc 8] [--timeout 1800] [--launcher "<prefix>"] [--dump-isa] [--no-require-sdma] --out <run-dir>`
 
-One invocation is one shape (`G950-MEAS-03`): `--bench-args` sets it, and the record keeps
-the benchmark's own report of it. It launches `torchrun` once, through
-`tests/python/cco/bench_runs.py`, so every mode runs in the same processes, interleaved
-round by round; every mode is compared with `--baseline` (default: the first), and `--aa`
-runs the baseline again at the end of each round for the noise band. Times are each
+An arm is a benchmark file and its arguments. `--op`/`--modes` makes one arm per mode of
+a registered benchmark; `--arms` reads them from a file, each arm with its own benchmark,
+so two implementations run interleaved in the same launch:
+
+```yaml
+arms:
+  - name: existing
+    bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
+    args: --mode time --impl benchmark/cco/harness/cases/gemm_ar_bf16/existing.py:ExistingGemmAllReduce
+  - name: candidate
+    bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
+    args: --mode time --impl python/mori/ops/gemm_ar_v2/op.py:FusedGemmAllReduce
+    time_field: max_rank_time_us      # default; the benchmark's maximum over ranks
+```
+
+One invocation is one shape (`G950-MEAS-03`): `--bench-args` sets it for every arm, and
+the record keeps the benchmark's own report of it. It launches `torchrun` once, through
+`bench_driver.py`, so every arm runs in the same processes, interleaved round by round;
+every arm is compared with `--baseline` (default: the first), and `--aa` runs the
+baseline again at the end of each round for the noise band. Times are each
 run's maximum over ranks; the summary gives the median, min, max and spread per mode.
 
 Before the launch it runs `preflight.py` and stops on a refusal, and for multi-rank runs it
@@ -106,12 +123,19 @@ It writes `result.json` (`schemas/result.schema.json`), `env.json`, `stdout.log`
 status: 0 when every run completed and validated, 1 when a run failed validation, 2 for a
 usage error or a preflight refusal, 3 for a timeout or missing results.
 
-Only `gemm_ar` is registered. The other operator benchmarks (`gemm_ag`, `gemm_a2a`,
-`ag_gemm`, `a2a_gemm`) have the same `build_parser()` / `run()` / `RESULT_JSON` shape and
-report the maximum over ranks as `us`; each needs one entry in `OPS` and a run on GPUs.
+Only `gemm_ar` is registered for `--op`. The other operator benchmarks (`gemm_ag`,
+`gemm_a2a`, `ag_gemm`, `a2a_gemm`) have the same `build_parser()` / `run()` /
+`RESULT_JSON` shape and report the maximum over ranks as `us`: run them through `--arms`
+with `time_field: us`, or give each an entry in `OPS`.
 
 ## schemas/
 
 JSON Schema (2020-12) for `run.py`'s `result.json`, the implementer's candidate manifest
 and the verifier's verdict. The templates in `.claude/skills/cco-fusion-loop/templates/`
 carry every field these schemas require; the tests check both.
+
+## cases/
+
+Tasks that evaluate the harness rather than an operator: a fixed contract, an interface,
+a shared harness that times and checks any implementation of it, a clean-room rule with
+its audit, and a recorded baseline. See [cases/gemm_ar_bf16/README.md](cases/gemm_ar_bf16/README.md).
