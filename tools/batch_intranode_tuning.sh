@@ -12,8 +12,7 @@ set -euo pipefail
 #   bash tools/batch_intranode_tuning.sh --world-size 8 --dtype bf16
 #   bash tools/batch_intranode_tuning.sh --tokens-list "128,512,4096"
 #   bash tools/batch_intranode_tuning.sh --hidden-dims "2048,7168"
-#   bash tools/batch_intranode_tuning.sh --dtype fp4 --combine-dtype bf16 \
-#        --quant-type fp8_direct_cast
+#   bash tools/batch_intranode_tuning.sh --dtype fp4 --combine-dtype bf16
 #   bash tools/batch_intranode_tuning.sh --config-output /path/to/out.json
 #
 # Results are saved to a JSON config file (auto-named or --config-output).
@@ -34,7 +33,7 @@ HIDDEN_DIMS="7168"
 DTYPE=fp4
 COMBINE_DTYPE=bf16
 ZERO_COPY=1
-QUANT_TYPE=fp8_direct_cast
+QUANT_TYPE=none
 CONFIG_OUTPUT=auto
 GPUS=""
 SHMEM_MODE=""
@@ -43,15 +42,15 @@ TUNING_SCOPE=full
 
 # Typical tuning matrix (run each separately):
 #
-#   EP2/4/8, fp4 dispatch + bf16 combine + fp8 quant, zero-copy (default):
-#     bash tools/batch_intranode_tuning.sh --world-size 2 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
-#     bash tools/batch_intranode_tuning.sh --world-size 4 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
-#     bash tools/batch_intranode_tuning.sh --world-size 8 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
+#   EP2/4/8, fp4 dispatch + bf16 combine, zero-copy (default):
+#     bash tools/batch_intranode_tuning.sh --world-size 2 --dtype fp4 --combine-dtype bf16 --quant-type none
+#     bash tools/batch_intranode_tuning.sh --world-size 4 --dtype fp4 --combine-dtype bf16 --quant-type none
+#     bash tools/batch_intranode_tuning.sh --world-size 8 --dtype fp4 --combine-dtype bf16 --quant-type none
 #
-#   EP2/4/8, fp4 dispatch + bf16 combine + fp8 quant, non-zero-copy (P2P write):
-#     bash tools/batch_intranode_tuning.sh --world-size 2 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast --zero-copy 0
-#     bash tools/batch_intranode_tuning.sh --world-size 4 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast --zero-copy 0
-#     bash tools/batch_intranode_tuning.sh --world-size 8 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast --zero-copy 0
+#   EP2/4/8, fp4 dispatch + bf16 combine, non-zero-copy (P2P write):
+#     bash tools/batch_intranode_tuning.sh --world-size 2 --dtype fp4 --combine-dtype bf16 --quant-type none --zero-copy 0
+#     bash tools/batch_intranode_tuning.sh --world-size 4 --dtype fp4 --combine-dtype bf16 --quant-type none --zero-copy 0
+#     bash tools/batch_intranode_tuning.sh --world-size 8 --dtype fp4 --combine-dtype bf16 --quant-type none --zero-copy 0
 #
 #   EP2/4/8, fp8 dispatch + bf16 combine, zero-copy:
 #     bash tools/batch_intranode_tuning.sh --world-size 2 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none

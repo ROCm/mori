@@ -50,7 +50,6 @@ from mori.ops.tuning_config import (
     "quant_type,expected",
     [
         (EpDispatchCombineQuantType.None_, "none"),
-        (EpDispatchCombineQuantType.Fp8DirectCast, "fp8_direct_cast"),
         (EpDispatchCombineQuantType.Fp8BlockwiseQuant, "fp8_blockwise"),
         (EpDispatchCombineQuantType.Fp4BlockwiseQuant, "fp4_blockwise"),
     ],
@@ -66,7 +65,6 @@ def test_enum_maps_to_config_str(quant_type, expected):
     [
         ("none", "none"),
         ("none_", "none"),
-        ("fp8_direct_cast", "fp8_direct_cast"),
         ("fp8_blockwise", "fp8_blockwise"),
         ("fp4_blockwise", "fp4_blockwise"),
         ("  FP4_BlockWise  ", "fp4_blockwise"),
@@ -99,3 +97,24 @@ def test_unknown_quant_types_still_raise(bad):
     lookup on a string no table contains."""
     with pytest.raises(ValueError):
         quant_type_to_config_str(bad)
+
+
+def test_removed_quant_type_names_its_replacement():
+    """A removed quant type fails with the type to use instead, on V1 and V2."""
+    from mori.ops.dispatch_combine import _normalize_quant_type
+    from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig
+
+    with pytest.raises(ValueError, match="was removed; use 'fp8_blockwise'"):
+        _normalize_quant_type("fp8_direct_cast")
+    with pytest.raises(ValueError, match="was removed; use 'fp8_blockwise'"):
+        EpDispatchCombineConfig(
+            rank=0,
+            world_size=8,
+            gpu_per_node=8,
+            hidden_dim=1024,
+            max_num_inp_token_per_rank=128,
+            num_experts_per_rank=4,
+            num_experts_per_token=4,
+            kernel_backend="hip",
+            quant_type="fp8_direct_cast",
+        )

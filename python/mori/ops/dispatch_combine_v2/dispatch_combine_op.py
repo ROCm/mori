@@ -83,7 +83,9 @@ _FP4_QUANT_TYPES = ("fp4_blockwise", "fp4_blockwise_fp32")
 # The quant types the hip backend runs as its gfx125x push combine: the sender
 # quantizes into the destination's landing rows and the destination reduces them.
 _PUSH_QUANT_TYPES = _FP4_QUANT_TYPES + ("fp8_blockwise",)
-_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise") + _FP4_QUANT_TYPES
+_QUANT_TYPES = ("none", "fp8_blockwise") + _FP4_QUANT_TYPES
+# Removed quant types and their replacement, named in the error.
+_REMOVED_QUANT_TYPES = {"fp8_direct_cast": "fp8_blockwise"}
 
 _INTERNODE_KERNELS = ("auto", "v2", "v2_ll")
 
@@ -117,7 +119,8 @@ class EpDispatchCombineConfig:
     scale_type_size: int = 0
     # "gather" (UseP2PRead) or "scatter" (mori _nop2p, fp8 compression home).
     combine_mode: str = "gather"
-    quant_type: str = "none"  # none | fp8_direct_cast | fp8_blockwise
+    # none | fp8_blockwise | fp4_blockwise | fp4_blockwise_fp32
+    quant_type: str = "none"
     # Geometry: None => the tuned schedule for this device/shape/dtype; pin any of
     # these to opt out. Combine keeps its own warp count -- its K-deep per-lane MLP
     # saturates sooner than dispatch's copy.
@@ -352,6 +355,11 @@ class EpDispatchCombineConfig:
                 "Set data_type alone for a symmetric op, or set both explicitly for "
                 "asymmetric dispatch/combine dtypes."
             )
+        if self.quant_type in _REMOVED_QUANT_TYPES:
+            raise ValueError(
+                f"quant_type {self.quant_type!r} was removed; use "
+                f"{_REMOVED_QUANT_TYPES[self.quant_type]!r}"
+            )
         if self.quant_type not in _QUANT_TYPES:
             raise ValueError(
                 f"quant_type must be one of {_QUANT_TYPES}, got {self.quant_type!r}"
@@ -399,21 +407,14 @@ class EpDispatchCombineConfig:
         # A quantised combine scatters: each destination writes its own partial
         # back. That is intranode-only, and it is what kept quant off the
         # internode path -- the backend would accept the quant type and then
-        # reject the scatter this rule had just set.
-        #
-        # The internode kernels do carry an fp8 staging path
-        # (EpCombineAllInternalFp8 reduces nNodes fp8 slots into one bf16
-        # output), but it does not produce correct tokens: measured on 2x8
-        # MI308X, weights are exact while ~51% of hidden elements are outside a
-        # 30% tolerance and some are exactly zero. Rejecting here rather than
-        # relying on the scatter rule to reject by accident, because an accepted
-        # config that returns corrupt data is the worst of the three outcomes.
+        # reject the scatter this rule had just set. The internode combine is
+        # unquantized, so reject here rather than rely on the scatter rule.
         if self.quant_type != "none":
             if self.is_internode:
                 raise ValueError(
                     f"quant_type={self.quant_type!r} is not supported on the "
-                    "internode path (world_size > gpu_per_node): the fp8 combine "
-                    "staging path there is incomplete and returns wrong tokens. "
+                    "internode path (world_size > gpu_per_node): the internode "
+                    "combine is unquantized. "
                     "Use quant_type='none', or an intranode config."
                 )
             self.combine_mode = "scatter"
@@ -616,10 +617,6 @@ class EpDispatchCombineConfig:
         return self.combine_mode == "scatter"
 
     @property
-    def fp8_direct_cast(self):
-        return self.quant_type == "fp8_direct_cast"
-
-    @property
     def fp8_blockwise(self):
         return self.quant_type == "fp8_blockwise"
 
@@ -630,12 +627,8 @@ class EpDispatchCombineConfig:
 
     @property
     def wire_elem_size(self):
-        """comb_inp transport element size: 1 byte for fp8 paths, else elem_size."""
-        return (
-            1
-            if self.quant_type in ("fp8_direct_cast", "fp8_blockwise")
-            else self.elem_size
-        )
+        """comb_inp transport element size: 1 byte for fp8_blockwise, else elem_size."""
+        return 1 if self.fp8_blockwise else self.elem_size
 
     @property
     def dispatch_dtype(self):

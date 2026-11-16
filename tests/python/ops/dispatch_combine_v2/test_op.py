@@ -108,7 +108,7 @@ def _configure():
         os.environ.get("SCALE_DIM", 0)
     )  # >0 = also verify per-token scales forwarding
     COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
-    QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwise
+    QUANT = os.environ.get("QUANT", "none")  # none | fp8_blockwise
     # Scale the input up so per-token/-block amax exceeds the fp8 max -> exercises the
     # fp8_blockwise per-block scaling branch (randn ~N(0,1) never triggers it).
     INSCALE = float(os.environ.get("INSCALE", 1))

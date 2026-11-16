@@ -33,9 +33,9 @@ intrinsics don't exist on gfx942. The two differ: gfx950 uses the pair-at-a-time
 transport only and also runs on gfx942).
 Combine: gather (UseP2PRead) **and** scatter (`_nop2p`); weighted combine
 (`out_weights`); StdMoE (ConvertDispatchOutput / ConvertCombineInput, standalone
-+ wired into the op); fp8 combine-wire **quant** (`fp8_direct_cast` **and**
-`fp8_blockwise`, scatter-only — distinct from the plain fp8 token dtype, which
-keeps a bf16 external payload); per-token scales forwarding;
++ wired into the op); fp8 combine-wire **quant** (`fp8_blockwise`,
+scatter-only — distinct from the plain fp8 token dtype, which keeps a bf16
+external payload); per-token scales forwarding;
 `max_total_recv_tokens` cap; mori-parity host op-layer + per-device,
 dtype-aware tuning table. Not done: `skip_stage1` (FlyDSL-only).
 
@@ -172,9 +172,9 @@ rank. Both families exchange the same chunk flags, node counts and send-slot
 layout and share the combine barrier.
 
 Two further internode-only rules `__post_init__` applies: `quant_type` must be
-`"none"` (the internode combine's fp8 staging path is incomplete and returns
-wrong tokens), and `max_num_inp_token_per_rank` is rounded up to a multiple of
-the wavefront width, because send slots are handed out in whole wavefronts.
+`"none"` (the internode combine is unquantized), and `max_num_inp_token_per_rank`
+is rounded up to a multiple of the wavefront width, because send slots are
+handed out in whole wavefronts.
 
 Internode FP4 dispatch accepts real `torch.float4_e2m1fn_x2` tensors of shape
 `[tokens, hidden_dim / 2]`: each byte stores two E2M1 values, with the even
