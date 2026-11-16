@@ -32,6 +32,7 @@ from __future__ import annotations
 import csv
 import functools
 import io
+import logging
 import numbers
 import os
 import tempfile
@@ -39,6 +40,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 from mori.ops import utils as _gpu
+
+logger = logging.getLogger(__name__)
 
 # Models with no table of their own that reuse a tuned sibling's key.
 _MODEL_ALIAS = {"mi350x": "mi355x"}  # same die / CU count
@@ -507,6 +510,87 @@ _LL128_TABLE: dict = {
 }
 
 
+# Tuning profiles. "peak" is the tables above. "capped" keeps every grid at or under
+# _CAPPED_BLOCKS, for an op that shares the GPU with the expert GEMMs: a capped lookup takes
+# the shape's _CAPPED_* rows, else its peak rows with each wider bucket on 64 blocks of the
+# larger of its warp count and the default's (16 dispatch, 8 combine). The _CAPPED_* tables
+# hold only the rows that differ.
+PROFILES = ("peak", "capped")
+_CAPPED_BLOCKS = 64
+
+_CAPPED_DISPATCH_TABLE: dict = {
+    "gfx1250": {
+        # hidden 5120, both DeepSeek-V4.1-Flash MoEs, every dispatch dtype. Graph us, one
+        # run, topk 6 bf16 / fp8 / fp4:
+        #   ct     64x4   64x8  64x16 |  64x4   64x8  64x16 |  64x4   64x8  64x16
+        #   256    21.8   24.3   25.6 |  20.7   22.0   24.3 |  20.3   20.4   32.6
+        #   1024   42.5   39.4   39.9 |  40.9   32.7   33.5 |  42.8   32.5   32.5
+        #   2048   70.5   59.6   59.3 |  72.0   46.8   45.2 |  73.7   44.6   43.6
+        #   8192  233.5  184.5  170.6 | 253.6  142.3  107.8 | 236.8  130.0   99.6
+        (4, 5120, 6, 96): {None: ((256, 64, 4), (1024, 64, 8), (None, 64, 16))},
+        (4, 5120, 3, 32): {None: ((256, 64, 4), (1024, 64, 8), (None, 64, 16))},
+    },
+}
+
+_CAPPED_COMBINE_TABLE: dict = {
+    "gfx1250": {
+        # hidden 5120: 64x16 past 128 tokens (topk 6: 16.2 / 36.7 / 197.4 at 256 / 1024 /
+        # 8192 against 16.6 / 38.0 / 228.6 for 64x8; topk 3 the same way).
+        (4, 5120, 6, 96): ((128, 64, 8), (None, 64, 16)),
+        (4, 5120, 3, 32): ((128, 64, 8), (None, 64, 16)),
+    },
+}
+
+_CAPPED_COMBINE_PUSH_TABLE: dict = {}
+
+
+def tuning_profile(profile=None, default="peak"):
+    """``profile``, else MORI_EP_TUNING_PROFILE, else ``default``."""
+    profile = profile or os.environ.get("MORI_EP_TUNING_PROFILE") or default
+    if profile not in PROFILES:
+        raise ValueError(f"tuning profile {profile!r}: want one of {PROFILES}")
+    return profile
+
+
+def default_profile():
+    """The op's default: capped on gfx125x parts, peak elsewhere."""
+    return "capped" if "gfx1250" in _device_keys() else "peak"
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_no_capped_rows(phase, shape, key) -> None:
+    logger.warning(
+        "no capped %s rows for EP%d hidden %d topk %d (experts per rank %s, %s); its peak "
+        "buckets wider than %d blocks run the default geometry",
+        phase,
+        *shape,
+        key,
+        _CAPPED_BLOCKS,
+    )
+
+
+def _capped(phase, own, peak, shape, key, default_warp):
+    """A capped phase: its own rows, else the peak rows with every bucket wider than
+    _CAPPED_BLOCKS put on _CAPPED_BLOCKS blocks of max(its warps, ``default_warp``).
+    Keeping the warp count keeps the bucket's LDS, so the geometry stays launchable."""
+    if own is not None:
+        return own
+    if peak is None or all(row[1] <= _CAPPED_BLOCKS for row in peak):
+        return peak
+    _warn_no_capped_rows(phase, shape, key)
+    rows = []
+    for edge, block, warp in peak:
+        if block <= _CAPPED_BLOCKS:
+            geom = (block, warp)
+        else:
+            geom = (_CAPPED_BLOCKS, max(warp, default_warp))
+        if rows and rows[-1][1:] == geom:
+            rows[-1] = (edge, *geom)
+        else:
+            rows.append((edge, *geom))
+    return tuple(rows)
+
+
 def ll128(
     world_size,
     hidden_dim,
@@ -715,6 +799,11 @@ def describe_schedule(cfg, schedule) -> str:
         f"HIP V2 schedule: {_gpu.arch_name()}/{_gpu.detect_model()} "
         f"ep{cfg.world_size} expert{num_experts} top{cfg.num_experts_per_token} "
         f"hidden{cfg.hidden_dim} dispatch={cfg.dispatch_dtype} combine={cfg.combine_dtype}"
+        + (
+            f" profile={cfg.tuning_profile}"
+            if getattr(cfg, "tuning_profile", None)
+            else ""
+        )
     ]
     if cfg.is_internode:
         families = [_V2_KERNEL_TYPES[f] for f in internode_kernel_families(cfg)]
@@ -794,6 +883,7 @@ def lookup(
     quant_type="none",
     dispatch_dtype=None,
     combine_dtype=None,
+    profile=None,
 ) -> dict:
     """HIP geometry for this device/shape/dtype, composed from HIP's own two tables.
 
@@ -807,7 +897,12 @@ def lookup(
     The table is matched with the legs' torch dtypes; a caller that passes only
     ``dtype`` gets the ones it names (_wire_dtypes), so both ways of calling read
     the same rules.
+
+    ``profile`` ("peak" / "capped", see PROFILES) defaults to MORI_EP_TUNING_PROFILE,
+    else "peak": these are the tuned tables, and the op layer picks the deployment
+    profile (default_profile()).
     """
+    profile = tuning_profile(profile)
     base = _hip_default()
     devs = _device_keys()
     shape = (world_size, hidden_dim, topk, experts_per_rank)
@@ -816,11 +911,21 @@ def lookup(
     if disp is not None:
         # None is the "every dtype measured the same" key; an exact dtype overrides it.
         disp = disp.get(wire) or disp.get(None)
-    comb = None
+    capped_disp = _first_bucket(_CAPPED_DISPATCH_TABLE, devs, *shape)
+    if capped_disp is not None:
+        capped_disp = capped_disp.get(wire) or capped_disp.get(None)
+    # Combine: the quant type's push rows, else the gather rows; a capped row comes from
+    # the same table as the peak row it stands for, or from its own push table.
+    comb = capped_comb = None
     if quant_type in _COMBINE_PUSH_TABLE:
         comb = _first_bucket(_COMBINE_PUSH_TABLE[quant_type], devs, *shape)
+        capped_comb = _first_bucket(
+            _CAPPED_COMBINE_PUSH_TABLE.get(quant_type, {}), devs, *shape
+        )
     if comb is None:
         comb = _first_bucket(_COMBINE_TABLE, devs, *shape)
+        if capped_comb is None:
+            capped_comb = _first_bucket(_CAPPED_COMBINE_TABLE, devs, *shape)
     if dispatch_dtype is None:
         dispatch_dtype, combine_dtype = _wire_dtypes(wire)
     if dispatch_dtype is not None and quant_type == "none":
@@ -834,6 +939,18 @@ def lookup(
         )
         disp = table_disp or disp
         comb = table_comb or comb
+    if profile == "capped":
+        disp = _capped(
+            "dispatch", capped_disp, disp, shape, wire, base["warp_num_per_block"]
+        )
+        comb = _capped(
+            "combine",
+            capped_comb,
+            comb,
+            shape,
+            quant_type,
+            base["combine_warp_num_per_block"],
+        )
     if disp is None and comb is None:
         return _gpu.fit_blocks_to_cus(base)
     disp = disp or ((None, base["dispatch_block_num"], base["warp_num_per_block"]),)
