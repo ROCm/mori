@@ -1,0 +1,39 @@
+{
+  "task": "<task>",
+  "candidate": "<candidate-id>",
+  "contract_revision": "<rev>",
+  "commit": "<40-hex commit that builds this candidate>",
+  "branch": "<branch>",
+  "switches": {
+    "chunks": 8,
+    "tile_order": "rotated"
+  },
+  "code_objects": [
+    {
+      "kernel": "<kernel name, which encodes the switches>",
+      "sha256": "<hex of the code object>",
+      "isa": "<records>/runs/<run-id>/isa/<kernel>_final_isa.s"
+    }
+  ],
+  "build": {
+    "mori": "<commit>",
+    "flydsl": "<commit or version>",
+    "rocm": "<version>",
+    "torch": "<version>"
+  },
+  "self_check": {
+    "correctness": "pass | fail",
+    "isa_check": "pass | fail",
+    "notes": "<anything the verifier should know about how to run it, not conclusions>"
+  },
+  "prediction": [
+    {
+      "bucket_m": 16384,
+      "t_real_us": [775.0, 810.0],
+      "t_fused_predicted_us": 790.0
+    }
+  ],
+  "design_note": "<records>/design/<candidate-id>.md",
+  "run_command": "<exact command that runs the candidate for one shape>",
+  "baseline_command": "<exact command that runs the contract's baseline for one shape>"
+}

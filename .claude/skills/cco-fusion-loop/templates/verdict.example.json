@@ -1,0 +1,57 @@
+{
+  "task": "<task>",
+  "candidate": "<candidate-id>",
+  "commit": "<40-hex>",
+  "verifier": {
+    "agent": "cco-fusion-verifier",
+    "model": "<model actually used>"
+  },
+  "identity": {
+    "code_objects_match": true,
+    "mismatches": []
+  },
+  "environment": {
+    "node": "<host>",
+    "image": "<tag>",
+    "rocm": "<version>",
+    "flydsl": "<commit or version>",
+    "mori": "<commit>",
+    "torch": "<version>",
+    "self_test": "pass"
+  },
+  "correctness": {
+    "rule": "bit-exact | rel_l2 <= <bound>",
+    "contract_shapes": "pass",
+    "held_out": {
+      "seed": 0,
+      "shapes": [{"m": 0, "n": 0, "k": 0}],
+      "result": "pass"
+    },
+    "repeated_calls": "pass",
+    "graph_replay": "pass",
+    "wrap_preset": "pass | not covered (no hook in this operator)",
+    "rank_skew": "pass",
+    "fused_path_ran": true,
+    "timeouts": 0,
+    "failures": [
+      {"case": "<shape and switches>", "what": "<first mismatch or hang>", "reproducer": "<command>"}
+    ]
+  },
+  "timing": {
+    "protocol": {"calls_per_graph": 8, "replays": 21, "rounds": 3, "max_over_ranks": true, "cache": "cold | hot | both"},
+    "noise_band_pct": 0.0,
+    "buckets": [
+      {
+        "m": 16384,
+        "fused_us": {"median": 0.0, "spread": 0.0},
+        "baseline": {"impl": "<fastest baseline, e.g. split-sdma>", "median": 0.0, "spread": 0.0},
+        "speedup": 0.0,
+        "eta_ideal": 0.0,
+        "eta_real": 0.0
+      }
+    ]
+  },
+  "not_covered": ["<anything the verifier could not check, and why>"],
+  "verdict": "meets-contract | fails-correctness | slower | inconclusive",
+  "runs": ["<records>/runs/<run-id>"]
+}
