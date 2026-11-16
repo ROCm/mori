@@ -159,9 +159,10 @@ class EpDispatchCombineConfig:
     tuning_profile: str = None
     enable_std_moe: bool = False
     # Recv slots a rank holds (mori maxTotalRecvTokens); 0 = the worst case ws*M.
-    # Below it, one pool per receiving rank, first come first served: a slot past
-    # it is dropped (null in the dest map, adds nothing to combine), and
-    # total_recv = min(demand, cap). total_recv == effective_max_recv means full.
+    # The capacity is effective_max_recv: this rounded up to a multiple of
+    # world_size, at most ws*M. One pool per receiving rank, first come first
+    # served: a slot past it is dropped (null in the dest map, adds nothing to
+    # combine), and total_recv = min(demand, capacity); equal means full.
     max_total_recv_tokens: int = 0
     # --- internode -----------------------------------------------------------
     # GPUs per physical node. None => one node (== world_size), which is what
