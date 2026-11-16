@@ -55,6 +55,8 @@ CT = int(os.environ.get("CT", 512))  # one token count: a graph is a fixed shape
 REPLAYS = int(os.environ.get("REPLAYS", 5))
 # LEC=1: local_expert_count() between dispatch and combine, as SGLang's recorder.
 LEC = int(os.environ.get("LEC", 0))
+# STDMOE=1: convert_dispatch_output -> identity -> convert_combine_input in the step.
+STDMOE = int(os.environ.get("STDMOE", 0))
 
 
 class Dist:
@@ -109,6 +111,7 @@ def main():
             num_experts_per_rank=EPR,
             num_experts_per_token=K,
             data_type=torch.bfloat16,
+            enable_std_moe=bool(STDMOE),
         )
         op = EpDispatchCombineOp(cfg, comm)
         comm.barrier()
@@ -122,6 +125,9 @@ def main():
                 inp, wts, None, idx, return_routing=True
             )
             lec = op.local_expert_count() if LEC else None
+            if STDMOE:
+                op.convert_dispatch_output()
+                op.convert_combine_input(routing)
             out, _ow = op.combine(recv_x, routing=routing)
             return out, lec
 
@@ -132,10 +138,14 @@ def main():
         sync()
         comm.barrier()
 
-        U = [len({int(i) // EPR for i in idx[t].cpu().tolist()}) for t in range(CT)]
-        scale = torch.tensor(U, dtype=torch.float32).view(CT, 1)
+        if STDMOE:
+            # The identity expert telescopes to (sum_k w) * x.
+            scale = wts.float().cpu().sum(dim=1, keepdim=True)
+        else:
+            U = [len({int(i) // EPR for i in idx[t].cpu().tolist()}) for t in range(CT)]
+            scale = torch.tensor(U, dtype=torch.float32).view(CT, 1)
         exp = (scale * inp.float().cpu()).to(torch.bfloat16)
-        tol = dict(atol=1e-2, rtol=1e-2)
+        tol = dict(atol=5e-2, rtol=5e-2) if STDMOE else dict(atol=1e-2, rtol=1e-2)
         ok_eager = torch.allclose(out_eager.float().cpu(), exp.float(), **tol)
         lec_exp = None
         if LEC:
@@ -192,7 +202,7 @@ def main():
             print(
                 f"# GRAPH-CAPTURE: {'PASS' if errs == 0 else 'FAIL'} "
                 f"(capture ok, {REPLAYS} replays, ct={CT} hidden={HIDDEN} "
-                f"backend={op.backend_name} lec={LEC}; "
+                f"backend={op.backend_name} lec={LEC} stdmoe={STDMOE}; "
                 f"eager={'ok' if ok_eager else 'BAD'})",
                 flush=True,
             )

@@ -33,7 +33,7 @@ gpu_per_node; there is no kernel_type enum on the v2 side):
 * intranode -- one dispatch kernel and one combine kernel, gather only, a
   bf16/fp32/fp8/fp4 dispatch and a bf16/fp32 combine, one plan compiled per
   (block, warp) the tuning schedule can select. On gfx942/gfx950 it also serves
-  local_expert_count.
+  local_expert_count and bf16 StdMoE.
 * internode -- a sequence of separately compiled passes over the
   ``internode_regions`` arena and a device communicator: copystaging +
   dispatch for a round of dispatch, combinesync + combinesyncbarrier + combine
@@ -1305,7 +1305,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"(needs a multiple of {1024 if self._is1250 else 128})"
                 )
         if cfg.enable_std_moe:
-            bad.append("enable_std_moe")
+            if self._is1250:
+                bad.append("enable_std_moe (gfx942/gfx950 only)")
+            elif (
+                cfg.dispatch_dtype is not torch.bfloat16
+                or cfg.combine_dtype is not torch.bfloat16
+            ):
+                bad.append(
+                    f"enable_std_moe with dtype {cfg.dispatch_dtype} (bf16 only)"
+                )
+            elif cfg.is_scatter:
+                bad.append("enable_std_moe with combine_mode='scatter' (gather only)")
+            elif cb.local_plan("ep_convert_dispatch") is None:
+                bad.append(
+                    "enable_std_moe (libmori_ops_v2.so predates the StdMoE kernels; "
+                    "rebuild it)"
+                )
         # The kernel walks the source scale rows with the PADDED dword stride, so
         # a caller row that is not itself a whole number of dwords would be read
         # at the wrong pitch. _scale_i32 rounds up, which hides that from the Cfg
@@ -2210,7 +2225,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
 
     def _local_kernels(self, cfg):
-        """local_expert_count: gfx942/gfx950 intranode."""
+        """local_expert_count and the StdMoE converts: gfx942/gfx950 intranode."""
         if self._is1250 or cb.local_plan("ep_local_expert_count") is None:
             return {}
         self._alloc_local_buffers(cfg)
@@ -2245,7 +2260,40 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 expert_count=out.data_ptr(),
             )
 
-        return dict(local_expert_count=local_expert_count)
+        kernels = dict(local_expert_count=local_expert_count)
+        if not cfg.enable_std_moe:
+            return kernels
+        # Latency-bound local row copies: two 8-warp blocks a CU, not the comm grids.
+        conv = (2 * self._multi_processor_count, 8)
+        tok = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.dispatch_dtype)
+        packed = dict(
+            packed_x=self.packed_x.data_ptr(), slot_map=self.slot_map.data_ptr()
+        )
+        disp = plan("ep_convert_dispatch", *conv, **tok)
+        disp.bind(
+            expert_count=self.packed_count.data_ptr(),
+            disp_out=arena.local_ptr("disp_out"),
+            recv_to_src=arena.local_ptr("recv_to_src_token"),
+            packed_src=self.packed_src.data_ptr(),
+            **packed,
+        )
+        comb = plan("ep_convert_combine", *conv, **tok)
+        comb.bind(
+            out_wts=arena.local_ptr("out_wts"),
+            out_tok=arena.local_ptr("out_tok"),
+            **packed,
+        )
+
+        def convert_dispatch(*, total_recv):
+            disp.launch(stream=stream(), total_recv=total_recv.data_ptr())
+
+        def convert_combine(*, total_recv):
+            comb.launch(stream=stream(), total_recv=total_recv.data_ptr())
+
+        kernels.update(
+            convert_dispatch=convert_dispatch, convert_combine=convert_combine
+        )
+        return kernels
 
     def reset(self):
         super().reset()
@@ -2426,12 +2474,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._views[key] = view
         return view
 
-    def convert_dispatch_output(self):
-        raise NotImplementedError("StdMoE is flydsl-only; use backend='flydsl'")
-
-    def convert_combine_input(self, routing):
-        raise NotImplementedError("StdMoE is flydsl-only; use backend='flydsl'")
-
     # -- ops ---------------------------------------------------------------
 
     def set_active_qps(self, active_qps):
@@ -2499,6 +2541,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return out
 
     def _wrap_dispatch(self, sized, ll=False):
+        std_moe = self.cfg.enable_std_moe
+
         def run(
             *,
             input,
@@ -2508,6 +2552,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dest_map,
             num_tokens,
         ):
+            if std_moe and weights is None:
+                raise ValueError(
+                    "enable_std_moe: dispatch needs weights, convert_combine_input "
+                    "folds the forwarded ones"
+                )
             plan, pull = next(
                 ((p, two) for c, p, two in sized if num_tokens <= c), (None, False)
             )

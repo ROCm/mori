@@ -208,9 +208,10 @@ class EpDispatchCombineConfig:
     internode_auto_ll_max_tokens: int = 512
     # Which kernel backend serves this op: "flydsl" (default except on gfx125x,
     # full intranode feature set) or "hip" (HIP/JIT: gather, the quantized combine,
-    # and on gfx942/gfx950 the recv cap and routing replay; dispatch transports
-    # bf16/fp32/fp8/fp4 and combine reduces in bf16/fp32; see the README for what
-    # it lacks). "hip" is the only backend with an internode path -- flydsl's
+    # and on gfx942/gfx950 the recv cap, routing replay, the unquantized scatter,
+    # local_expert_count and bf16 StdMoE; dispatch transports bf16/fp32/fp8/fp4
+    # and combine reduces in bf16/fp32). "hip" is the only backend with an
+    # internode path -- flydsl's
     # _unsupported rejects any config whose gpu_per_node < world_size -- so a
     # multi-node config must name it. None = MORI_V2_KERNEL_BACKEND, else the
     # default. Only consulted when constructing the BASE class; naming a
@@ -777,8 +778,10 @@ class KernelSet:
 
     # Local kernels over the last dispatch's recv rows; None = not served, and the
     # capability follows. The base owns the methods and buffers; each callable
-    # takes total_recv= (and out=) and runs on the current stream.
+    # takes total_recv= (local_expert_count also out=), on the current stream.
     local_expert_count: Callable | None = None
+    convert_dispatch: Callable | None = None
+    convert_combine: Callable | None = None
 
     # The AsyncLL split (HIP only). Each is keyed like `dispatch` (KernelConfig),
     # but launches only half the pass sequence, so the caller can put its own work
@@ -1085,6 +1088,8 @@ class EpDispatchCombineOp:
     def capabilities(self) -> frozenset[str]:
         k = self._kernels
         derived = {"local_expert_count"} if k.local_expert_count else set()
+        if k.convert_dispatch and k.convert_combine:
+            derived.add("std_moe")
         return k.capabilities | derived
 
     def scale_stride_bytes(self) -> int:
@@ -1244,10 +1249,26 @@ class EpDispatchCombineOp:
     # -- shared: the local kernels ------------------------------------------
 
     def _alloc_local_buffers(self, cfg):
-        """The local kernels' op-owned outputs."""
-        self._local_expert_count_buf = torch.zeros(
-            cfg.num_experts_per_rank, dtype=torch.int32, device=self.dev
+        """The local kernels' op-owned outputs: the count, and StdMoE's packed layout."""
+        dev = self.dev
+        epr = cfg.num_experts_per_rank
+        self._local_expert_count_buf = torch.zeros(epr, dtype=torch.int32, device=dev)
+        if not cfg.enable_std_moe:
+            return
+        bucket = cfg.world_size * cfg.max_num_inp_token_per_rank
+        self._max_tok_per_expert = bucket
+        self.packed_x = torch.zeros(
+            epr * bucket * cfg.hidden_dim, dtype=cfg.dispatch_dtype, device=dev
         )
+        self.packed_count = torch.zeros(epr, dtype=torch.int32, device=dev)
+        self.packed_src = torch.zeros(epr * bucket, dtype=torch.int32, device=dev)
+        self.slot_map = torch.full(
+            (self._recv_cap * cfg.num_experts_per_token,),
+            -1,
+            dtype=torch.int64,
+            device=dev,
+        )
+        self._packed_x_view = self.packed_x.view(epr, bucket, cfg.hidden_dim)
 
     def local_expert_count(self):
         """[num_experts_per_rank] int32: how many (row, k) of the last dispatch's
@@ -1267,6 +1288,38 @@ class EpDispatchCombineOp:
         out.zero_()
         kern(total_recv=self.total_recv, out=out)
         return out
+
+    def convert_dispatch_output(self):
+        """StdMoE: pack the last dispatch's recv rows per local expert.
+
+        Returns (packed_x [num_experts_per_rank, world_size * max_tokens, hidden],
+        packed_count [num_experts_per_rank] int32, packed_src [num_experts_per_rank *
+        world_size * max_tokens] int32 = src_rank * max_tokens + src_token). The
+        expert GEMM writes over packed_x in place. Row order within a bucket is not
+        deterministic. Persistent buffers, rewritten by every call.
+        """
+        kern = self._std_moe_kernel("convert_dispatch")
+        self.packed_count.zero_()
+        self.slot_map.fill_(-1)
+        kern(total_recv=self.total_recv)
+        return self._packed_x_view, self.packed_count, self.packed_src
+
+    def convert_combine_input(self, routing):
+        """StdMoE: weighted-reduce packed_x back into the combine input,
+        combine_in_view()[r] = sum over the local k of w[r, k] * packed_x[row of
+        (r, k)], with the forwarded weights. combine() then ignores its `input`."""
+        kern = self._std_moe_kernel("convert_combine")
+        kern(total_recv=routing.total_recv_token_num)
+
+    def _std_moe_kernel(self, name):
+        if not self.cfg.enable_std_moe:
+            raise ValueError("op built without enable_std_moe")
+        kern = getattr(self._kernels, name)
+        if kern is None:
+            raise NotImplementedError(
+                f"the {self.backend_name} backend has no StdMoE for this op"
+            )
+        return kern
 
     # -- shared: the ops ---------------------------------------------------
 
@@ -1494,9 +1547,12 @@ class EpDispatchCombineOp:
         snapshot = routing.total_recv_token_num is not self.total_recv
         _, comb_spec = self._pick(ct, snapshot, self._routing_peak(routing, snapshot))
 
-        if not self._kernels.stages_in_kernel and not self.cfg.enable_std_moe:
-            # StdMoE has already written the weighted-reduced tokens into out_tok;
-            # copying `input` over them would clobber that result.
+        if self.cfg.enable_std_moe:
+            # convert_combine_input already wrote the combine input to out_tok; a
+            # kernel that stages `input` itself must be pointed at it.
+            if self._kernels.stages_in_kernel:
+                input = self.combine_in_view()
+        elif not self._kernels.stages_in_kernel:
             out_tok_ptr = self.arena.local_ptr(self._region("out_tok"))
             if input.data_ptr() != out_tok_ptr:
                 dst = self.combine_in_view().view(-1)[: input.numel()]

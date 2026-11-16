@@ -227,6 +227,12 @@ def _cases():
     )
     yield "hip-bf16-gather-topk9", dict(hip, DTYPE="bf16", TOPK=9)
     yield "hip-bf16-gather-reroute", dict(hip, DTYPE="bf16", REROUTE=8)
+    yield "hip-bf16-stdmoe", dict(hip, DTYPE="bf16", STDMOE=1)
+    # Few experts a rank: one token often lands on several of them.
+    yield "hip-bf16-stdmoe-epr4-ragged", dict(
+        hip, DTYPE="bf16", STDMOE=1, EPR=4, RAGGED=1, NOSELF=1
+    )
+    yield "hip-bf16-stdmoe-reroute", dict(hip, DTYPE="bf16", STDMOE=1, REROUTE=8)
 
 
 _CASES = dict(_cases())
@@ -311,9 +317,9 @@ def test_op_lifecycle(backend):
     assert "# LIFECYCLE: PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout}"
 
 
-@pytest.mark.parametrize("knobs", [{"LEC": 1}])
+@pytest.mark.parametrize("knobs", [{"LEC": 1}, {"LEC": 1, "STDMOE": 1}])
 def test_graph_capture_hip_local_kernels(knobs):
-    """local_expert_count inside a captured, replayed step."""
+    """local_expert_count and the StdMoE converts inside a captured, replayed step."""
     script = os.path.join(_HERE, "test_graph_capture.py")
     env = os.environ.copy()
     env.update({k: str(v) for k, v in knobs.items()})
