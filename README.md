@@ -160,6 +160,45 @@ Benchmark on DeepSeek V3 model configurations:
 
 \* Stale data from previous kernel version; updated numbers pending re-benchmarking.
 
+### MORI-FUSED
+
+MORI-FUSED overlaps a collective with the GEMM next to it over the SDMA copy engines. The chart
+compares GEMM + all-reduce (`GemmAllReduceOp`) with what a serving stack runs when nothing is fused:
+the GEMM, then an RCCL all-reduce. The layer is DeepSeek-V4-Pro `wo_b` (`[M, 7168]`, K=2048, fp8
+blockscale) at TP8 on 8x MI355X.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/fused-gemm-ar-vs-rccl-dark.png">
+    <img alt="Speedup of MORI's fused GEMM + all-reduce over GEMM + RCCL on DeepSeek-V4-Pro wo_b, 8x MI355X: 1.05x to 1.32x with the bf16 wire and 1.11x to 1.57x with the fp8 gather, for M from 1,024 to 16,384" src="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/fused-gemm-ar-vs-rccl.png" width="900">
+  </picture>
+</p>
+
+<details>
+<summary>Time per call (µs)</summary>
+
+| M | GEMM + RCCL | MORI fused, bf16 wire | MORI fused, fp8 gather |
+|---:|---:|---:|---:|
+| 1,024 | 135.9 | 129.9 (1.05x) | 122.4 (1.11x) |
+| 2,048 | 234.4 | 199.0 (1.18x) | 176.4 (1.33x) |
+| 4,096 | 440.1 | 333.8 (1.32x) | 280.7 (1.57x) |
+| 8,192 | 736.2 | 601.4 (1.22x) | 497.4 (1.48x) |
+| 16,384 | 1454.1 | 1128.3 (1.29x) | 934.3 (1.56x) |
+
+</details>
+
+The bf16 wire is the default. The fp8 gather (`gather_dtype="fp8"`) is opt-in: it sends the
+all-reduce's gather leg in fp8. relL2 against an fp32 reference is 4.0e-3 for GEMM + RCCL, 2.4e-3
+for the bf16 wire and 2.5e-2 for the fp8 gather. Measured with
+`benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py --quant blockscale -n 7168 -k 2048` in
+`--mode split-rccl`, `--mode fused-sdma` and `--mode fused-sdma --gather-dtype fp8 --gather-transport lsa`:
+one M per process, graph replay, max over ranks, median of 3 rounds interleaved with the GEMM + RCCL runs
+(FlyDSL 0.4.0).
+
+The other fused operators (GEMM + reduce-scatter, GEMM + all-to-all, GEMM + all-gather, all-gather +
+GEMM and all-to-all + GEMM) are measured in the
+[MORI-FUSED guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html#performance-at-a-glance).
+
 ### MORI-IO
 
 **NOTE:** This is the preview version of MORI-IO benchmark performance.
