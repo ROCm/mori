@@ -220,8 +220,8 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
 ```
 
 `MakeEpCfg` 也是拒绝非法组合的地方：`EpCfgIsValid` 不过就抛（token 字节数必须 16B 对齐、
-topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏情况），combine 那条腿上的字节类型
-单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。
+topk 和 worldSize 必须装进一个 wavefront），低于最坏情况的 recv 容量只在 gfx125x 上拒绝（那里的 body
+不丢 token），combine 那条腿上的字节类型单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。
 
 ### 3.6 环境变量
 
@@ -320,7 +320,7 @@ ctypes plan 的关键字参数各自在 `_wrap_*` 里适配。
 
 **特性面是真包含不是交集**：HIP 后端做 gather combine，dispatch 收 bf16/fp32/fp8/fp4、combine 出
 bf16/fp32（§3.7）；带 `quant_type` 时做量化 scatter combine（gfx942/gfx950 是逐源 token 落地一行、
-本地反量化累加，gfx125x 是 push）。其余一概不接：非量化 scatter、StdMoE、per-token scales、routing replay、
+本地反量化累加，gfx125x 是 push）。其余一概不接：非量化 scatter、StdMoE、routing replay、
 `local_expert_count`。能力门在**构造期**跑、且在分配 arena
 之前——问它要 scatter 会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
 再失败。
