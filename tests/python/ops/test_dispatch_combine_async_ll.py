@@ -279,7 +279,6 @@ def _test_dispatch_combine_cross_dtype(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
-    quant_type,
 ):
     dispatch_hidden_dim, combine_hidden_dim, _ = cross_dtype_hidden_dims(
         hidden_dim, data_type, combine_data_type
@@ -292,7 +291,6 @@ def _test_dispatch_combine_cross_dtype(
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
-        quant_type=quant_type,
         combine_data_type=combine_data_type,
     )
     run_ep_dispatch_combine_test(
@@ -315,7 +313,6 @@ def _test_dispatch_combine_cross_dtype(
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (128,))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
-@pytest.mark.parametrize("quant_type", ("none",))
 def test_dispatch_combine_cross_dtype(
     torch_dist_process_manager,
     world_size,
@@ -325,9 +322,8 @@ def test_dispatch_combine_cross_dtype(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
-    quant_type,
 ):
-    skip = cross_dtype_skip_reason(quant_type, data_type, combine_data_type)
+    skip = cross_dtype_skip_reason(data_type, combine_data_type)
     if skip:
         pytest.skip(skip)
 
@@ -343,7 +339,6 @@ def test_dispatch_combine_cross_dtype(
                     max_num_inp_token_per_rank,
                     num_experts_per_rank,
                     num_experts_per_token,
-                    quant_type,
                 ],
             )
         )

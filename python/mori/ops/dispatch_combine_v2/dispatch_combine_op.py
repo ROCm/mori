@@ -84,6 +84,8 @@ _FP4_QUANT_TYPES = ("fp4_blockwise", "fp4_blockwise_fp32")
 # quantizes into the destination's landing rows and the destination reduces them.
 _PUSH_QUANT_TYPES = _FP4_QUANT_TYPES + ("fp8_blockwise",)
 _QUANT_TYPES = ("none", "fp8_blockwise") + _FP4_QUANT_TYPES
+# Removed quant types and their replacement, named in the error.
+_REMOVED_QUANT_TYPES = {"fp8_direct_cast": "fp8_blockwise"}
 
 _INTERNODE_KERNELS = ("auto", "v2", "v2_ll")
 
@@ -347,6 +349,11 @@ class EpDispatchCombineConfig:
                 f"{self.dispatch_data_type}, combine_data_type={self.combine_data_type}. "
                 "Set data_type alone for a symmetric op, or set both explicitly for "
                 "asymmetric dispatch/combine dtypes."
+            )
+        if self.quant_type in _REMOVED_QUANT_TYPES:
+            raise ValueError(
+                f"quant_type {self.quant_type!r} was removed; use "
+                f"{_REMOVED_QUANT_TYPES[self.quant_type]!r}"
             )
         if self.quant_type not in _QUANT_TYPES:
             raise ValueError(

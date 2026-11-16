@@ -78,6 +78,10 @@ _FP4_COMBINE_KERNELS = frozenset(
 )
 
 
+# Removed quant types and their replacement, named in the error.
+_REMOVED_QUANT_TYPES = {"fp8_direct_cast": "fp8_blockwise"}
+
+
 def _normalize_quant_type(quant_type):
     if isinstance(quant_type, EpDispatchCombineQuantType):
         return quant_type
@@ -85,6 +89,10 @@ def _normalize_quant_type(quant_type):
         key = quant_type.strip().lower()
         if key in _QUANT_TYPE_MAP:
             return _QUANT_TYPE_MAP[key]
+        if key in _REMOVED_QUANT_TYPES:
+            raise ValueError(
+                f"quant_type '{key}' was removed; use '{_REMOVED_QUANT_TYPES[key]}'"
+            )
     raise ValueError(
         f"invalid quant_type '{quant_type}', expected one of {list(_QUANT_TYPE_MAP.keys())}"
     )

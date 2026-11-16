@@ -351,8 +351,8 @@ def cross_dtype_hidden_dims(logical_hidden_dim, data_type, combine_data_type):
     )
 
 
-def cross_dtype_skip_reason(quant_type, data_type, combine_data_type):
-    """Return why a (quant, dispatch dtype, combine dtype) triple is unsupported.
+def cross_dtype_skip_reason(data_type, combine_data_type):
+    """Return why a (dispatch dtype, combine dtype) pair is unsupported.
 
     Returns ``None`` when the combination is expected to work. Centralized here
     so every kernel-type test file agrees on which cells of the matrix are
@@ -362,10 +362,6 @@ def cross_dtype_skip_reason(quant_type, data_type, combine_data_type):
         # unpack-and-compare has no packed-FP4 reference; combine verification
         # early-returns, so such a case would assert nothing.
         return "packed FP4 combine output is not verifiable by this harness"
-    if quant_type in ("fp8_blockwise", "fp4_blockwise") and (
-        data_type is not torch.bfloat16 or combine_data_type is not torch.bfloat16
-    ):
-        return f"{quant_type} requires bfloat16 dispatch and combine dtypes"
     return None
 
 
