@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI UMBP PD Disaggregation Benchmark &mdash; MORI development (e57a3d4e) documentation</title>
+  <title>MORI UMBP PD Disaggregation Benchmark &mdash; MORI development (9abbe3fc) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=fc5874eb"></script>
+      <script src="_static/documentation_options.js?v=59e27408"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -475,7 +475,6 @@ emit_prefill_launcher<span class="o">()</span><span class="w"> </span><span clas
 <span class="s">export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800</span>
 <span class="s">export SGLANG_MORI_FP4_DISP=false</span>
 <span class="s">export SGLANG_MORI_FP8_DISP=true</span>
-<span class="s">export SGLANG_MORI_FP8_COMB=true</span>
 <span class="s">export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048</span>
 <span class="s">export NCCL_IB_HCA=${NCCL_IB_HCA}</span>
 <span class="s">export GLOO_SOCKET_IFNAME=${NET_IFNAME}</span>
@@ -522,7 +521,6 @@ cat<span class="w"> </span>&gt;<span class="w"> </span>/tmp/launch_pd_decode.sh<
 <span class="s">export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800</span>
 <span class="s">export SGLANG_MORI_FP4_DISP=false</span>
 <span class="s">export SGLANG_MORI_FP8_DISP=true</span>
-<span class="s">export SGLANG_MORI_FP8_COMB=true</span>
 <span class="s">export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048</span>
 <span class="s">export NCCL_IB_HCA=${NCCL_IB_HCA}</span>
 <span class="s">export GLOO_SOCKET_IFNAME=${NET_IFNAME}</span>
@@ -861,43 +859,40 @@ find<span class="w"> </span><span class="si">${</span><span class="nv">RESULTS_B
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SGLANG_MORI_FP8_DISP</span></code></p></td>
 <td><p>Enable FP8 dispatch (reduces transfer size)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SGLANG_MORI_FP8_COMB</span></code></p></td>
-<td><p>Enable FP8 combine</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES</span></code></p></td>
 <td><p>RDMA devices to use; prefix <code class="docutils literal notranslate"><span class="pre">^</span></code> to exclude (e.g., <code class="docutils literal notranslate"><span class="pre">^mlx5_8</span></code>)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SOCKET_IFNAME</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SOCKET_IFNAME</span></code></p></td>
 <td><p>Network interface for mori’s TCP socket</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KV_CACHE_DTYPE</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KV_CACHE_DTYPE</span></code></p></td>
 <td><p>KV cache dtype; <code class="docutils literal notranslate"><span class="pre">fp8_e4m3</span></code> recommended for transfer efficiency</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KV_EVENTS_PUBLISHER</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KV_EVENTS_PUBLISHER</span></code></p></td>
 <td><p>KV event publisher backend (<code class="docutils literal notranslate"><span class="pre">zmq</span></code>)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KV_EVENTS_ENDPOINT</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KV_EVENTS_ENDPOINT</span></code></p></td>
 <td><p>ZMQ endpoint for KV events (e.g., <code class="docutils literal notranslate"><span class="pre">tcp://*:5557</span></code>)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ENABLE_KV_EVENTS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ENABLE_KV_EVENTS</span></code></p></td>
 <td><p>Enable KV event publishing</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">USE_DUMMY_WEIGHTS</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">USE_DUMMY_WEIGHTS</span></code></p></td>
 <td><p>Skip loading real model weights (for throughput benchmarking)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MEM_FRACTION_STATIC</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MEM_FRACTION_STATIC</span></code></p></td>
 <td><p>Fraction of GPU memory reserved for static KV cache</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">OUTPUT_LENGTH</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">OUTPUT_LENGTH</span></code></p></td>
 <td><p>Number of decode output tokens per request (decode node only)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PREFILL_URLS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PREFILL_URLS</span></code></p></td>
 <td><p>Space-separated prefill URLs for the decode node’s <code class="docutils literal notranslate"><span class="pre">sglang_router</span></code> (e.g. <code class="docutils literal notranslate"><span class="pre">&quot;http://10.0.0.1:30000</span> <span class="pre">http://10.0.0.2:30000&quot;</span></code>); the bench script fans out one <code class="docutils literal notranslate"><span class="pre">--prefill</span></code> per entry</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PREFILL_URL</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PREFILL_URL</span></code></p></td>
 <td><p>[DEPRECATED] Single-prefill shortcut (1P1D back-compat); folded into <code class="docutils literal notranslate"><span class="pre">PREFILL_URLS</span></code> if set</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ROUTER_WORKER_READY_TIMEOUT_SECS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ROUTER_WORKER_READY_TIMEOUT_SECS</span></code></p></td>
 <td><p>Max seconds the wrapper waits for all <code class="docutils literal notranslate"><span class="pre">N+1</span></code> workers to report <code class="docutils literal notranslate"><span class="pre">load</span> <span class="pre">&gt;=</span> <span class="pre">0</span></code> on <code class="docutils literal notranslate"><span class="pre">/get_loads</span></code> after the router is ready. Default <code class="docutils literal notranslate"><span class="pre">180</span></code>.</p></td>
 </tr>
 </tbody>

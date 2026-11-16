@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>EP V1 vs V2 Inter-node Performance (DeepSeek-R1 on MI308X, MI300X and MI355X) &mdash; MORI development (e57a3d4e) documentation</title>
+  <title>EP V1 vs V2 Inter-node Performance (DeepSeek-R1 on MI308X, MI300X and MI355X) &mdash; MORI development (9abbe3fc) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=fc5874eb"></script>
+      <script src="_static/documentation_options.js?v=59e27408"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -1367,9 +1367,7 @@ does for FP8 dispatch and BF16 combine. Of the buckets measured here, BF16
 dispatch has rules only for LL T64 and T128 and normal-kernel T4096, and AUTO
 uses the next larger rule for the rest: LL T4–T32 use T64’s 128/64/8, LL T256
 and T512 use the LL table’s T2048 rule (256/170/16), and normal-kernel T1024
-and T2048 use T4096’s 256/128/16. V1’s combine tables also have
-<code class="docutils literal notranslate"><span class="pre">fp8_direct_cast</span></code> rules (combine sent as FP8) for T64–T4096, which are faster
-but do not apply to the BF16 combine here.</p></li>
+and T2048 use T4096’s 256/128/16.</p></li>
 <li><p><strong>Both sides’ measurements match their own tuning tables.</strong> With the same
 rule, V1’s measurement in every bucket is within −6% to +13% of its table
 record, and V2’s within −10% to +1%.</p></li>

@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Choosing an EP API and backend &mdash; MORI development (e57a3d4e) documentation</title>
+  <title>Choosing an EP API and backend &mdash; MORI development (9abbe3fc) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=fc5874eb"></script>
+      <script src="_static/documentation_options.js?v=59e27408"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -217,10 +217,10 @@ intrinsics. The two supported targets use different instructions (gfx950 the
 <code class="docutils literal notranslate"><span class="pre">cvt_scalef32_pk_*_fp4</span></code> pair-at-a-time family, gfx1250 a pack-of-8), so this
 is a per-target port rather than one shared path.</p></li>
 <li><p>FP8 representation differs by target: OCP E4M3 on gfx950 and E4M3FNUZ on gfx942.</p></li>
-<li><p>On the internode path, <code class="docutils literal notranslate"><span class="pre">quant_type</span></code> must be <code class="docutils literal notranslate"><span class="pre">&quot;none&quot;</span></code>. The config rejects
-anything else whenever <code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">&gt;</span> <span class="pre">gpu_per_node</span></code>, independently of the
-backend – the quantized-combine staging path there is incomplete. HIP is
-simply the only backend that has an internode path today.</p></li>
+<li><p>On the internode path, <code class="docutils literal notranslate"><span class="pre">quant_type</span></code> must be <code class="docutils literal notranslate"><span class="pre">&quot;none&quot;</span></code>, because the
+internode combine is unquantized. The config rejects anything else whenever
+<code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">&gt;</span> <span class="pre">gpu_per_node</span></code>, independently of the backend. HIP is simply the
+only backend that has an internode path today.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">gpu_per_node</span></code> determines physical node grouping. A single host cannot
 emulate the two-node internode test by changing world size alone.</p></li>
 <li><p>For internode, <code class="docutils literal notranslate"><span class="pre">internode_kernel</span></code> chooses <code class="docutils literal notranslate"><span class="pre">&quot;v2&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;v2_ll&quot;</span></code> or

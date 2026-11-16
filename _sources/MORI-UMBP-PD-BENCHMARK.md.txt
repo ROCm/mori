@@ -303,7 +303,6 @@ export MORI_ENABLE_SDMA=0
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800
 export SGLANG_MORI_FP4_DISP=false
 export SGLANG_MORI_FP8_DISP=true
-export SGLANG_MORI_FP8_COMB=true
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048
 export NCCL_IB_HCA=${NCCL_IB_HCA}
 export GLOO_SOCKET_IFNAME=${NET_IFNAME}
@@ -350,7 +349,6 @@ export MORI_ENABLE_SDMA=0
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800
 export SGLANG_MORI_FP4_DISP=false
 export SGLANG_MORI_FP8_DISP=true
-export SGLANG_MORI_FP8_COMB=true
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048
 export NCCL_IB_HCA=${NCCL_IB_HCA}
 export GLOO_SOCKET_IFNAME=${NET_IFNAME}
@@ -650,7 +648,6 @@ wait
 | `UMBP_PEER_SERVICE_PORT` | Port for peer-to-peer service; required when `UMBP_MASTER_ADDRESS` is set |
 | `UMBP_CACHE_REMOTE_FETCHES` | Set `false` to disable remote fetch caching during benchmarking |
 | `SGLANG_MORI_FP8_DISP` | Enable FP8 dispatch (reduces transfer size) |
-| `SGLANG_MORI_FP8_COMB` | Enable FP8 combine |
 | `MORI_RDMA_DEVICES` | RDMA devices to use; prefix `^` to exclude (e.g., `^mlx5_8`) |
 | `MORI_SOCKET_IFNAME` | Network interface for mori's TCP socket |
 | `KV_CACHE_DTYPE` | KV cache dtype; `fp8_e4m3` recommended for transfer efficiency |
