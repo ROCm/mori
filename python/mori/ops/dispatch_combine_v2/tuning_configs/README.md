@@ -88,13 +88,15 @@ Current settings:
 `InterNodeV2` combine rules may set `combine_load_first` to 1. An empty cell
 means 0.
 
-- With 1, that bucket's combine pass is compiled with the load-first peer
-  gather (`WarpAccumLF`).
+- With 1, that bucket's combine pass is compiled with a peer gather that loads
+  two vector steps per source per iteration (`WarpAccum<T, 4, 2>`) instead of
+  one. Both gathers issue every source's loads before accumulating; the name
+  predates that.
 - It is set per bucket. The declared capacity does not choose it.
 - Other tables may not set it.
-- It has no effect at a top-k that the load-first gather has no case for, such
-  as 16. Both gathers then fall back to the same `WarpAccumDynamic`. So no
-  896/16 rule sets it.
+- It has no effect at a top-k that `WarpAccum` has no case for, such as 16.
+  Both gathers then fall back to the same `WarpAccumDynamic`. So no 896/16
+  rule sets it.
 
 Where it is on today (it is off everywhere else):
 

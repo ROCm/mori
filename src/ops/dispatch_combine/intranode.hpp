@@ -668,7 +668,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
       // 16B vec load + load-first/unroll gather: keep AccumNum*Unroll remote peer reads in flight
       // to hide the interconnect latency.
-      core::WarpAccumLF<T, 16>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
+      core::WarpAccum<T, 16, WARP_ACCUM_UNROLL>(outPtr, srcPtrs, nullptr, validAccumCount,
+                                                hiddenDimSize);
     }
 
     if constexpr (UseWeights) {
