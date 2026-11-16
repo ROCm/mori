@@ -271,6 +271,9 @@ __device__ void EpDispatchBody(EpArgs args) {
     }
   }
 
+  // Drain this block's peer stores before it arrives, as FlyDSL does: the signal
+  // fence below covers warp 0's stores only.
+  __builtin_amdgcn_s_waitcnt(0);
   __syncthreads();
   if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
 
@@ -296,6 +299,7 @@ __device__ void EpDispatchBody(EpArgs args) {
     for (int srcPe = laneId; srcPe < kNpes; srcPe += kCfg.waveSize) {
       int* signal = recvTokenNums + srcPe;
       const int recvTokenNum = EpWaitGt(signal, 0) - 1;
+      __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
       __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
       args.destPeTokenCounter[srcPe] = 0;

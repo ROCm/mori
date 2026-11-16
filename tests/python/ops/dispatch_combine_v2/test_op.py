@@ -96,7 +96,7 @@ _FP8_DT = (
 def _configure():
     """Read the knobs below from the environment (again for every CASES entry)."""
     global HIDDEN, K, EPR, DTYPE, _IS_FP4, _IS_FP8, STDMOE, SCALE_DIM, COMBINE
-    global QUANT, INSCALE, SPREAD, SWEEP, RAGGED, NOSELF
+    global QUANT, INSCALE, SPREAD, SWEEP, RAGGED, NOSELF, FRESH
     HIDDEN = int(os.environ.get("HIDDEN", 7168))
     K = int(os.environ.get("TOPK", 8))
     EPR = int(os.environ.get("EPR", 32))
@@ -128,6 +128,9 @@ def _configure():
     # NOSELF=1: no token picks an expert on its own rank, so no rank receives from
     # itself.
     NOSELF = int(os.environ.get("NOSELF", 0))
+    # FRESH=1: read the received rows right after dispatch, before any barrier,
+    # and require them to equal what the same views hold after the barrier.
+    FRESH = int(os.environ.get("FRESH", 0))
 
 
 _configure()
@@ -228,7 +231,20 @@ def _run(d, comm):
             )
             total_recv = int(total_recv_t.cpu().item())
             sync()
+            if FRESH:
+                views = [v for v in (recv_x, disp_w, disp_i, out_s) if v is not None]
+                early = [v[:total_recv].clone() for v in views]
+                sync()
             comm.barrier()
+            if FRESH:
+                ok_f = all(torch.equal(e, v[:total_recv]) for e, v in zip(early, views))
+                errs_f = d.allreduce_sum(0 if ok_f else 1)
+                if rank == 0:
+                    print(
+                        f"# OP-FRESH ct={ct_point}: {'PASS' if errs_f == 0 else 'FAIL'} "
+                        f"(rows read before the barrier == after; recv={total_recv})",
+                        flush=True,
+                    )
             idx_c = idx[:ct].cpu().numpy()
             # local_expert_count: global sum over ranks == world*ct*K (every
             # (token,k) assignment is recorded on exactly the rank owning it).
