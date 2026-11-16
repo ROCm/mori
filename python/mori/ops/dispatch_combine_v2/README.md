@@ -54,7 +54,7 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 |---|---|
 | `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig`, `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
 | `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
-| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
+| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding (gather; scatter and push combines per arch); rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
 | `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here. A gfx125x `EpDispatchPlan` whose caller binds no `staging_base` gets one at its first launch, shared by the unbound plans of its layout, with a `FutureWarning`; instead, allocate `info["stagingBytes"]` bytes once, keep them alive, and `bind(staging_base=buf)` on every dispatch plan (a tensor is checked against that size and held; an int address is taken on trust). Sizes come from the plans: `EpDispatchPlan.describe(**request)` / `EpCombinePlan.describe(...)` return the info a plan would report without compiling it, and `arena_regions(*infos, region_names=...)` turns their `region.<stem>` keys into a `SymmArena` region list; binding checks an arena that has `size()` |
 | `quant_types.py` | the combine quant type names, what each resolves to on this arch, and the format each names (see "Combine quant types") |
 | `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
@@ -100,13 +100,14 @@ an op. What each backend serves:
 
 The scatter combines quantize each expert row on the rank that computed it and
 write it into a landing row on the token's own rank; after one barrier that rank
-dequantizes and sums its rows. Both need a `hidden_dim` that is a multiple of
-128, and the HIP one a bf16 combine.
+dequantizes and sums its rows. Both need a bf16 combine and a `hidden_dim` that
+is a multiple of 128.
 
 Plan requests name the format with fields, not these strings: `combine_fp8` and
 `combine_fp4` select the 1x32 push combine, and `combine_fp4_f32_scale` turns
 the fp4 one into 1x128. `combine_scatter_q_group` (32 or 128) selects the
-gfx942/gfx950 scatter combine, and `combine_scatter_fp4` makes its elements e2m1.
+gfx942/gfx950 scatter combine, and `combine_scatter_fp4` makes its elements e2m1;
+`combine_scatter_plain` selects the unquantized one.
 
 ## gfx125x dispatch: slot reservation
 
