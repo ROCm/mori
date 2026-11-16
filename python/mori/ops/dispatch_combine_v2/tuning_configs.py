@@ -397,20 +397,43 @@ def _cu_scaled_default():
     )
 
 
-# The quantized combine runs as a scatter, which takes one (comb_block, comb_warp)
-# for every call (its barrier counts blocks), per device and shape. EP8, fp8 1x128,
-# 2026-11-16, dispatch 64x16, combine us at 32 / 128 / 512 / 4096 tokens a rank:
-#   MI300X  256x4 (the default) 92.2 / 112.0 / 259.6 / 1770.9
-#           128x8               92.5 / 108.2 / 266.5 / 1907.0
-#           256x8              100.7 / 111.8 / 202.9 / 1122.7
-#   MI355X  48x16 (the default) 92.8 / 111.2 / 404.8 / 2845.1 (op bench, same shape)
-#           256x8               94.3 / 104.3 / 187.0 /  995.1
-#           256x16             107.3 / 109.8 / 144.1 /  825.7
+# The quantized combine (FlyDSL runs it as a scatter): its own (max_tok_inclusive |
+# None, comb_block, comb_warp) buckets per device and shape, in place of the
+# schedule's combine half. EP8, fp8 1x128, 2026-11-16, dispatch 64x16, min of 2
+# rounds, combine us at 32 / 128 / 512 / 4096 tokens a rank:
+#   MI300X  256x4 (the old single geometry) 92.2 / 112.0 / 259.6 / 1770.9
+#           128x4                           90.1 / 169.9 / 467.3 / 3395.0
+#           128x8                           92.5 / 108.2 / 266.5 / 1907.0
+#           256x8                          100.7 / 111.8 / 202.9 / 1122.7
+#   MI355X  48x16 (the old single geometry) 92.8 / 111.2 / 404.8 / 2845.1 (op bench)
+#           128x8                           89.6 / 105.5 / 260.6 / 1913.0
+#           128x16                          93.5 / 100.6 / 184.2 / 1069.3
+#           256x16                         107.3 / 109.8 / 144.1 /  825.7
 # fp8 1x32 is within 7% of 1x128 at every point.
 _QUANT_COMBINE = {
-    "mi300x": {(8, 7168, 8): (256, 8)},
-    "mi355x": {(8, 7168, 8): (256, 8)},
+    "mi300x": {(8, 7168, 8): ((32, 128, 4), (128, 128, 8), (None, 256, 8))},
+    "mi355x": {(8, 7168, 8): ((32, 128, 8), (128, 128, 16), (None, 256, 16))},
 }
+
+
+def _with_combine(schedule, base, comb):
+    """`schedule` with its combine half replaced by the `comb` buckets."""
+    disp = (
+        [row[:3] for row in schedule]
+        if schedule
+        else [(None, base["dispatch_block_num"], base["warp_num_per_block"])]
+    )
+    edges = sorted({r[0] for r in (*disp, *comb) if r[0] is not None})
+
+    def pick(rows, tok):
+        for row in rows:
+            if row[0] is None or (tok is not None and tok <= row[0]):
+                return row
+        return rows[-1]
+
+    return tuple(
+        (edge,) + pick(disp, edge)[1:] + pick(comb, edge)[1:] for edge in (*edges, None)
+    )
 
 
 def lookup(world_size, hidden_dim, topk, dtype="fp8", quant=False):
@@ -429,9 +452,8 @@ def lookup(world_size, hidden_dim, topk, dtype="fp8", quant=False):
     warp_num_per_block / combine_block_num / combine_warp_num_per_block are the
     single-shot fallback used when schedule is None.
 
-    `quant` (a quantized combine) takes the scatter's own single-shot combine
-    geometry from _QUANT_COMBINE where it has one; the scatter ignores the
-    schedule's combine half."""
+    `quant` (a quantized combine) takes its combine buckets from _QUANT_COMBINE
+    where it has them; the single-shot combine fallback becomes the last bucket."""
     key = _device_key()
     if key is None or key not in _DEVICES:
         return _cu_scaled_default()
@@ -443,5 +465,6 @@ def lookup(world_size, hidden_dim, topk, dtype="fp8", quant=False):
         base["schedule"] = entry.get(dtype) or entry.get("fp8") or base["schedule"]
     comb = _QUANT_COMBINE.get(key, {}).get((world_size, hidden_dim, topk))
     if quant and comb:
-        base["combine_block_num"], base["combine_warp_num_per_block"] = comb
+        base["schedule"] = _with_combine(base["schedule"], base, comb)
+        base["combine_block_num"], base["combine_warp_num_per_block"] = comb[-1][1:]
     return gpu_utils.fit_blocks_to_cus(base)
