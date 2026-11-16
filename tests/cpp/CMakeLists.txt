@@ -61,6 +61,10 @@ target_include_directories(test_fabric_copy_plan PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME fabric_copy_plan COMMAND test_fabric_copy_plan)
 
 if(BUILD_IO)
+  add_executable(test_fabric_batch_copy io/test_fabric_batch_copy.cpp)
+  target_link_libraries(test_fabric_batch_copy PRIVATE mori_io)
+  # Deliberately not a ctest: requires a JIT-produced hsaco and fabric GPUs.
+
   add_executable(test_protocol io/test_protocol.cpp)
 
   target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR}/include)
