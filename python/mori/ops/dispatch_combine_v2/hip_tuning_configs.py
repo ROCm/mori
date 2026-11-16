@@ -81,7 +81,8 @@ def _device_keys():
     rev = _gpu.asic_revision()
     if rev == 0 or (rev is None and _detected_arch() == "gfx1250-strict"):
         return ("gfx1250-strict", "gfx1250")
-    return (key,)
+    cu = _gpu.cu_count()
+    return (f"{key}/{cu}cu", key) if cu else (key,)
 
 
 def _first_bucket(table, devs, *shape):
@@ -300,6 +301,11 @@ _DISPATCH_TABLE: dict = {
             "fp4": ((256, 32, 8), (512, 32, 16), (1024, 64, 16), (None, 128, 16)),
         },
     },
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): {
+            None: ((None, 32, 16),),
+        },
+    },
 }
 
 # No dtype axis: combine reduces the bf16 staging region whatever dispatch carried,
@@ -310,6 +316,9 @@ _DISPATCH_TABLE: dict = {
 # been tuned per bucket in its IntraNodeV2 table. On gfx1250, 128x4 never wins and
 # 256x8 collapses 2x at 16384.
 _COMBINE_TABLE: dict = {
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): ((None, 32, 8),),
+    },
     "gfx1250": {
         # topk 9 = 8 routed + 1 shared.
         (4, 7168, 9, None): (
@@ -340,6 +349,9 @@ _COMBINE_TABLE: dict = {
 
 _COMBINE_PUSH_TABLE: dict = {
     "fp4_blockwise": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): ((None, 32, 16),),
+        },
         "gfx1250": {
             # EP4 64x24 runs the overlapped path too; from 2048 tokens a rank it is ahead of 64x16
             # (-1.9 at 2048, -17 at 4096, -46 at 8192, -109 at 16384: 361.9 -> 252.4) and below it
@@ -419,6 +431,9 @@ _COMBINE_PUSH_TABLE: dict = {
         },
     },
     "fp8_blockwise": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): ((None, 32, 16),),
+        },
         "gfx1250": {
             # 128x16 is ahead of 64x16 from 512 to 1536 tokens a rank (-3.6, -7.0, -14.6 at topk 6).
             # It stays ahead of 128x24 through 2048 at topk 6 (-3.5) but only through 1792 at topk 9
@@ -456,10 +471,18 @@ _BF16_PUSH_TABLE: dict = {
         (4, 7168, 6, None): ((128, 64, 8), (512, 64, 16), (None, 64, 24)),
         (8, 7168, 6, None): ((192, 64, 8), (512, 64, 16), (None, 64, 24)),
     },
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): ((128, 32, 8), (None, 32, 16)),
+    },
 }
 
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): {
+                "fp4": dict(max_tok=128, dispatch=(32, 16), combine=(32, 8))
+            },
+        },
         "gfx1250": {
             (4, 7168, 6, None): {
                 "fp4": dict(max_tok=256, dispatch=(64, 16), combine=(64, 16))
@@ -476,6 +499,11 @@ _LL128_TABLE: dict = {
         },
     },
     "fp8_blockwise": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): {
+                "fp8": dict(max_tok=64, dispatch=(32, 16), combine=(32, 8))
+            },
+        },
         "gfx1250": {
             (4, 7168, 6, None): {
                 "fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))
@@ -504,6 +532,11 @@ _LL128_TABLE: dict = {
             (16, 7168, 6, None): {
                 "bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
                 "fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
+            },
+        },
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): {
+                "bf16": dict(max_tok=63, dispatch=(32, 16), combine=(32, 16)),
             },
         },
     },
@@ -600,11 +633,18 @@ def ll128(
     experts_per_rank=None,
     quant_type="none",
 ):
-    if _device_keys()[0] == "gfx1250-strict":
+    devs = _device_keys()
+    if devs[0] == "gfx1250-strict":
         return None  # LL128's polls miss peer writes on these parts; use the schedule
-    per_shape = _LL128_TABLE.get(quant_type, {}).get(_device_key(), {})
-    entry = _bucket_key(per_shape, world_size, hidden_dim, topk, experts_per_rank)
-    plan = entry.get(dtype) if entry else None
+    per_device = _LL128_TABLE.get(quant_type, {})
+    plan = None
+    for key in devs:
+        entry = _bucket_key(
+            per_device.get(key, {}), world_size, hidden_dim, topk, experts_per_rank
+        )
+        plan = entry.get(dtype) if entry else None
+        if plan is not None:
+            break
     if plan is None:
         return None
     if max_tok <= plan["max_tok"]:
@@ -619,12 +659,27 @@ def ll128(
 
 
 def bf16_push(world_size, hidden_dim, topk, experts_per_rank=None):
-    return _bucket_key(
-        _BF16_PUSH_TABLE.get(_device_keys()[0], {}),
-        world_size,
-        hidden_dim,
-        topk,
-        experts_per_rank,
+    devs = _device_keys()
+    if devs[0] == "gfx1250-strict":
+        return None
+    return _first_bucket(
+        _BF16_PUSH_TABLE, devs, world_size, hidden_dim, topk, experts_per_rank
+    )
+
+
+_CARD_TABLE: dict = {
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): dict(pull_blocks=8, pull_launch_max=256),
+    },
+}
+
+
+def card(world_size, hidden_dim, topk, experts_per_rank=None):
+    devs = _device_keys()
+    if devs[0] == "gfx1250-strict":
+        return None
+    return _first_bucket(
+        _CARD_TABLE, devs, world_size, hidden_dim, topk, experts_per_rank
     )
 
 
