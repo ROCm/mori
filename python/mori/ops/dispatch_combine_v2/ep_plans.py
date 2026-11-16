@@ -23,8 +23,8 @@
 
 The only EP-specific part of the C++/JIT binding: load ``libmori_ops_v2.so`` so
 its kernels register into the shared JIT registry, then expose the Plan classes:
-the intranode ``EpDispatchPlan`` / ``EpCombinePlan``, plus the eight internode
-passes in ``EP_INTERNODE_PLANS``. Everything else -- the ABI, the Plan factory,
+the intranode ``EpDispatchPlan`` / ``EpCombinePlan``, the local kernels through
+``local_plan()``, plus the eight internode passes in ``EP_INTERNODE_PLANS``. Everything else -- the ABI, the Plan factory,
 schema-driven arg structs -- is generic and lives in ``mori.jit.v2.plan_api``.
 
 Importing this module loads the library (raising OSError if it is not built),
@@ -206,6 +206,18 @@ def _caller_stacklevel() -> int:
 
 
 EpCombinePlan = make_plan("ep_combine")
+
+# The local kernels (local_expert_count), made on first use so a library built
+# without them still serves dispatch and combine.
+LOCAL_PLANS = ("ep_local_expert_count",)
+_local_plans = {}
+
+
+def local_plan(name):
+    """The Plan class of local kernel `name`, or None if the library lacks it."""
+    if name not in _local_plans:
+        _local_plans[name] = make_plan(name) if name in registered_plans() else None
+    return _local_plans[name]
 
 
 # The internode sequence. Eight plans rather than two: its dispatch and combine

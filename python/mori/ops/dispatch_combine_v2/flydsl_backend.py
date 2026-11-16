@@ -296,9 +296,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 for (b, w) in combine_specs
             }
 
-        self._local_expert_count_buf = torch.zeros(
-            cfg.num_experts_per_rank, dtype=torch.int32, device=device
-        )
+        self._alloc_local_buffers(cfg)
         self._local_expert_count = make_local_expert_count(
             rank=cfg.rank,
             experts_per_rank=cfg.num_experts_per_rank,
@@ -356,6 +354,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             dispatch_replay={
                 k: self._wrap_dispatch(k, replay=True) for k in self._dispatch_variants
             },
+            local_expert_count=self._run_local_expert_count,
             # FlyDSL stages combine's input on the host (see combine()).
             stages_in_kernel=False,
             capabilities=frozenset(
@@ -366,7 +365,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     "std_moe",
                     "scales",
                     "replay",
-                    "local_expert_count",
                     "asymmetric_dtype",
                     "recv_cap",
                 }
@@ -540,15 +538,10 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
 
         return run
 
-    def local_expert_count(self):
-        """[num_experts_per_rank] i32: recv tokens per local expert. Call after
-        dispatch."""
-        self._local_expert_count_buf.zero_()
-        stream = fx.Stream(torch.cuda.current_stream())
+    def _run_local_expert_count(self, *, total_recv, out):
         self._local_expert_count(
             self.arena.local_ptr("out_idx"),
-            self.total_recv.data_ptr(),
-            self._local_expert_count_buf.data_ptr(),
-            stream,
+            total_recv.data_ptr(),
+            out.data_ptr(),
+            fx.Stream(torch.cuda.current_stream()),
         )
-        return self._local_expert_count_buf

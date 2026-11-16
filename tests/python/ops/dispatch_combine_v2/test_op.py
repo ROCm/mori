@@ -101,7 +101,7 @@ _FP8_DT = (
 def _configure():
     """Read the knobs below from the environment (again for every CASES entry)."""
     global HIDDEN, K, EPR, DTYPE, _IS_FP4, _IS_FP8, STDMOE, SCALE_DIM, COMBINE
-    global QUANT, INSCALE, SPREAD, SWEEP, RAGGED, NOSELF, FRESH
+    global QUANT, INSCALE, SPREAD, SWEEP, RAGGED, NOSELF, FRESH, REROUTE
     HIDDEN = int(os.environ.get("HIDDEN", 7168))
     K = int(os.environ.get("TOPK", 8))
     EPR = int(os.environ.get("EPR", 32))
@@ -136,6 +136,9 @@ def _configure():
     # FRESH=1: read the received rows right after dispatch, before any barrier,
     # and require them to equal what the same views hold after the barrier.
     FRESH = int(os.environ.get("FRESH", 0))
+    # REROUTE=N: N more rounds per SWEEP point with new routing, each reading
+    # local_expert_count straight after dispatch.
+    REROUTE = int(os.environ.get("REROUTE", 0))
 
 
 _configure()
@@ -234,6 +237,9 @@ def _run(d, comm):
             recv_x, disp_w, out_s, disp_i, total_recv_t, routing = op.dispatch(
                 inp[:ct], wts[:ct], sc_in, idx[:ct], return_routing=True
             )
+            # Read straight after dispatch, no sync or barrier, as SGLang does.
+            has_lec = "local_expert_count" in getattr(op, "capabilities", frozenset())
+            lec_now = op.local_expert_count().clone() if has_lec else None
             total_recv = int(total_recv_t.cpu().item())
             sync()
             if FRESH:
@@ -258,21 +264,32 @@ def _run(d, comm):
             # each kept row carries every k whose expert lives on its PE
             on_kept = (idx[:ct].cpu() // EPR).unsqueeze(2) == kept_pe.unsqueeze(1)
             lec_mine = int((on_kept.any(dim=2) & (idx[:ct].cpu() >= 0)).sum())
-            # local_expert_count: global sum over ranks == the (token,k) assignments
-            # whose PE kept the token (world*ct*K uncapped).
-            # Capability-gated: a backend that does not implement this says so
-            # through op.capabilities rather than by failing at the call.
-            has_lec = "local_expert_count" in getattr(op, "capabilities", frozenset())
-            lec_sum = int(op.local_expert_count().sum().cpu().item()) if has_lec else 0
+            # Exact per-expert reference from every rank's routing (from the rows
+            # kept, under a cap); the global sum counts the (token,k) assignments
+            # whose PE kept the token. Capability-gated: a backend without it says so.
+            if cap is None:
+                lec_ref = _lec_ref(d, idx, ct_point)
+            else:
+                lec_ref = _bincount_local(disp_i[:total_recv].cpu(), rank)
+            if has_lec:
+                lec_late = op.local_expert_count().cpu()
+                ok_lec = torch.equal(lec_now.cpu(), lec_ref) and torch.equal(
+                    lec_late, lec_ref
+                )
+                lec_sum = int(lec_late.sum())
+            else:
+                ok_lec, lec_sum = True, 0
             sync()
             comm.barrier()
+            lec_errs = d.allreduce_sum(0 if ok_lec else 1)
             lec_total = d.allreduce_sum(lec_sum)
             lec_exp = d.allreduce_sum(lec_mine)
             if rank == 0 and has_lec:
-                ok_lec = lec_total == lec_exp
+                ok_lec = lec_total == lec_exp and lec_errs == 0
                 print(
                     f"# OP-LEC ct={ct_point}: {'PASS' if ok_lec else 'FAIL'} "
-                    f"(sum={lec_total} exp={lec_exp})",
+                    f"(sum={lec_total} exp={lec_exp}, per-expert mismatches on "
+                    f"{lec_errs} ranks)",
                     flush=True,
                 )
             if int(os.environ.get("REPLAY", 0)):
@@ -436,6 +453,66 @@ def _run(d, comm):
                     f"recv={total_recv}{quant_err})",
                     flush=True,
                 )
+            if REROUTE and has_lec:
+                _reroute_rounds(
+                    d,
+                    comm,
+                    op,
+                    inp,
+                    wts,
+                    sc_in,
+                    ct,
+                    ct_point,
+                    num_experts,
+                    cap is not None,
+                )
+
+
+def _lec_ref(d, idx, ct_point):
+    """This rank's expected local_expert_count: its experts' ids over every rank's
+    routed tokens."""
+    rank, npes = d.rank, d.world
+    all_i = [torch.empty_like(idx.cpu()) for _ in range(npes)]
+    dist.all_gather(all_i, idx.cpu().contiguous())
+    ids = torch.cat(
+        [
+            all_i[r][: (ct_point * (r % 3) // 2 if RAGGED else ct_point)].flatten()
+            for r in range(npes)
+        ]
+    ).long()
+    return _bincount_local(ids, rank)
+
+
+def _bincount_local(ids, rank):
+    ids = ids.flatten().long() - rank * EPR
+    ids = ids[(ids >= 0) & (ids < EPR)]
+    return torch.bincount(ids, minlength=EPR).to(torch.int32)
+
+
+def _reroute_rounds(d, comm, op, inp, wts, sc_in, ct, ct_point, num_experts, capped):
+    """REROUTE rounds of new routing; every read is launched straight after dispatch."""
+    dev = inp.device
+    g = torch.Generator(device="cpu").manual_seed(4321 + d.rank * 1000 + ct_point)
+    bad = 0
+    for _ in range(REROUTE):
+        idx = torch.randint(0, num_experts, (inp.shape[0], K), generator=g)
+        idx = idx.to(torch.int32)
+        out = op.dispatch(inp[:ct], wts[:ct], sc_in, idx[:ct].to(dev))
+        lec_now = op.local_expert_count().clone()
+        # Every rank's reads are done before any rank's next dispatch writes.
+        sync()
+        # under a cap, from the rows this rank kept, read before peers move on
+        kept = out[3][: int(out[4].cpu().item())].cpu() if capped else None
+        comm.barrier()
+        ref = _bincount_local(kept, d.rank) if capped else _lec_ref(d, idx, ct_point)
+        bad += 0 if torch.equal(lec_now.cpu(), ref) else 1
+    errs = d.allreduce_sum(bad)
+    if d.rank == 0:
+        print(
+            f"# OP-REROUTE ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
+            f"({REROUTE} rounds, {errs} stale reads)",
+            flush=True,
+        )
 
 
 @contextlib.contextmanager

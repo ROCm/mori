@@ -32,7 +32,8 @@ gpu_per_node; there is no kernel_type enum on the v2 side):
 
 * intranode -- one dispatch kernel and one combine kernel, gather only, a
   bf16/fp32/fp8/fp4 dispatch and a bf16/fp32 combine, one plan compiled per
-  (block, warp) the tuning schedule can select.
+  (block, warp) the tuning schedule can select. On gfx942/gfx950 it also serves
+  local_expert_count.
 * internode -- a sequence of separately compiled passes over the
   ``internode_regions`` arena and a device communicator: copystaging +
   dispatch for a round of dispatch, combinesync + combinesyncbarrier + combine
@@ -2195,6 +2196,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dispatch=dispatch,
             combine=combine,
             dispatch_replay=replay or None,  # gfx125x has no replay body
+            **self._local_kernels(cfg),
             # The combine kernel stages into out_tok itself (and skips the copy
             # when the caller already wrote there), so the op must not do it.
             stages_in_kernel=True,
@@ -2206,6 +2208,44 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 | ({"replay"} if replay else set())
             ),
         )
+
+    def _local_kernels(self, cfg):
+        """local_expert_count: gfx942/gfx950 intranode."""
+        if self._is1250 or cb.local_plan("ep_local_expert_count") is None:
+            return {}
+        self._alloc_local_buffers(cfg)
+        arena = self.arena
+        shape = dict(
+            world_size=cfg.world_size,
+            max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+            num_expert_per_rank=cfg.num_experts_per_rank,
+            num_expert_per_token=cfg.num_experts_per_token,
+            max_recv=self._recv_cap,
+        )
+
+        def plan(name, block_num, warp_per_block, **kw):
+            p = cb.local_plan(name)(
+                **shape, **kw, block_num=block_num, warp_per_block=warp_per_block
+            )
+            p.bind(rank=cfg.rank, out_idx=arena.local_ptr("out_idx"))
+            self._plans.append(p)
+            return p
+
+        def stream():
+            return torch.cuda.current_stream().cuda_stream
+
+        count = plan(
+            "ep_local_expert_count", cfg.dispatch_block_num, cfg.warp_num_per_block
+        )
+
+        def local_expert_count(*, total_recv, out):
+            count.launch(
+                stream=stream(),
+                total_recv=total_recv.data_ptr(),
+                expert_count=out.data_ptr(),
+            )
+
+        return dict(local_expert_count=local_expert_count)
 
     def reset(self):
         super().reset()
@@ -2385,11 +2425,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         view = rows[:, :n_i32]
         self._views[key] = view
         return view
-
-    def local_expert_count(self):
-        raise NotImplementedError(
-            "local_expert_count is flydsl-only; use backend='flydsl'"
-        )
 
     def convert_dispatch_output(self):
         raise NotImplementedError("StdMoE is flydsl-only; use backend='flydsl'")
