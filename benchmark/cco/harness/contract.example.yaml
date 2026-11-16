@@ -57,4 +57,6 @@ environment:
   torch: <version>
   flydsl: <commit or version>
   mori: <commit>
-  allocation: <the site's rule for getting GPUs, for example a fresh allocation per run>
+  launcher: ""             # optional prefix the user supplies to reach the GPUs, such as a
+                           # container exec or an srun into an allocation the user holds;
+                           # empty means run here. The harness never allocates GPUs.

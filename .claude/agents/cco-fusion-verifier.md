@@ -35,10 +35,11 @@ input is missing or inconsistent, stop and return the list of problems.
 - Measure under `.claude/skills/cco-fusion-loop/reference/measurement-protocol.md`.
 - Cite numbers by their IDs in `.claude/skills/cco-fusion-facts`. These facts are for
   gfx950; on any other architecture, stop and return.
-- GPUs: follow the site's allocation rules and never use a GPU another job holds. Check
-  that the node is idle, run one job per node, put a timeout on every run, and on
-  timeout dump each rank's flags and counters, then kill only your own processes. Leave
-  about 10 s between 8-rank runs (`G950-ENV-05`).
+- GPUs: use only the GPUs the user provided (where the session runs, or behind the
+  contract's `environment.launcher`); never allocate nodes and never use a GPU another
+  job holds. Check that the node is idle, run one job per node, put a timeout on every
+  run, and on timeout dump each rank's flags and counters, then kill only your own
+  processes. Leave about 10 s between 8-rank runs (`G950-ENV-05`).
 - Keep every run under `<records>/runs/<run-id>/`: the command, the scope and the raw
   output. Write files with shell commands; you have no edit tools.
 

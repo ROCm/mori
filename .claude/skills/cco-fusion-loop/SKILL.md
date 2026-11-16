@@ -43,9 +43,12 @@ verifier). If you change one, keep them different.
   there is measured in this task or labelled `inferred`.
 - **FlyDSL skills.** `isa-resource-diff` and the other FlyDSL skills live in the FlyDSL
   repository. If they are not visible, link them into `~/.claude/skills/`.
-- **GPUs.** Follow the site's allocation rules and never use a GPU another job holds.
-  Multi-GPU jobs and profiling take the whole node. One job per node, a timeout on
-  every run, and about 10 s between 8-rank runs (`G950-ENV-05`).
+- **GPUs come from the user.** The session runs on a node or in a container that already
+  has the GPUs, or the contract names a launcher prefix (`environment.launcher`). The
+  harness never allocates or reserves nodes; if no GPU environment is available, stop
+  and ask the owner. Never use a GPU another job holds. Multi-GPU jobs and profiling
+  take the whole node. One job per node, a timeout on every run, and about 10 s between
+  8-rank runs (`G950-ENV-05`).
 - **Architecture.** This loop and its facts are for gfx950. On any other architecture,
   stop and tell the owner; the facts and the ISA rules do not carry over.
 

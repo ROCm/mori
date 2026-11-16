@@ -122,10 +122,11 @@ and must not be used in a bound or a decision. Mechanisms to keep in mind:
   a same-session A/A run rather than a fixed percentage.
 - **Correctness:** the contract's rule. Bit-exact needs a reference with the same
   reduction order and wire precision.
-- **GPUs:** follow the site's allocation rules and never use a GPU another job holds.
-  Check that the node is idle, run one job per node, put a timeout on every run, and on
-  timeout dump flags and counters, then kill only your own processes. Leave about 10 s
-  between 8-rank runs (`G950-ENV-05`).
+- **GPUs:** use only the GPUs the user provided (where the session runs, or behind the
+  contract's `environment.launcher`); never allocate nodes and never use a GPU another
+  job holds. Check that the node is idle, run one job per node, put a timeout on every
+  run, and on timeout dump flags and counters, then kill only your own processes. Leave
+  about 10 s between 8-rank runs (`G950-ENV-05`).
 - **Records:** everything goes under the records directory, never into the repository's
   `docs/`.
 
