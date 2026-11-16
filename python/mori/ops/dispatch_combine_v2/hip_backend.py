@@ -339,24 +339,42 @@ def push_land_rows(cfg) -> int:
 _CARD_COMBINE_ROWS_MAX = 2048
 
 
+_CARD_QUANT_TYPES = ("fp8_blockwise", "fp4_blockwise")
+
+
 def _card_layout(cfg):
     if (
         cfg.is_internode
         or cfg.async_ll
-        or cfg.quant_type != "none"
-        or cfg.dispatch_dtype is not torch.bfloat16
         or cfg.combine_dtype is not torch.bfloat16
         or not cfg.schedule
-        or os.environ.get("MORI_EP_BF16_PUSH", "1") == "0"
     ):
         return None
     shape = (cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token)
     epr = cfg.num_experts_per_rank
-    push = tuning.bf16_push(*shape, experts_per_rank=epr)
     rows = cfg.effective_max_recv
-    if push is None or any(
-        b and -(-rows // b) > _CARD_COMBINE_ROWS_MAX for _, b, _ in push
-    ):
+    if cfg.quant_type == "none":
+        if (
+            cfg.dispatch_dtype is not torch.bfloat16
+            or os.environ.get("MORI_EP_BF16_PUSH", "1") == "0"
+        ):
+            return None
+        push = tuning.bf16_push(*shape, experts_per_rank=epr)
+        if push is None or any(
+            b and -(-rows // b) > _CARD_COMBINE_ROWS_MAX for _, b, _ in push
+        ):
+            return None
+    elif cfg.quant_type in _CARD_QUANT_TYPES:
+        if not (
+            cfg.dispatch_dtype is torch.bfloat16
+            or cfg.dispatch_dtype in _FP8_TUNING_DTYPES
+            or cfg.is_fp4
+        ) or any(
+            cw != 16 or -(-rows // cb) > _CARD_COMBINE_ROWS_MAX
+            for _, _, _, cb, cw in cfg.schedule
+        ):
+            return None
+    else:
         return None
     return tuning.card(*shape, experts_per_rank=epr)
 
@@ -498,11 +516,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             spec.warp_per_block <= 8
             or spec.warp_per_block < cfg.world_size
             or spec.block_num + self._card["pull_blocks"] > self._multi_processor_count
+            or (
+                cfg.is_fp4
+                and (cfg.world_size <= 4 or spec.warp_per_block == cfg.world_size)
+            )
             for spec in self._dispatch_specs
         ):
             self._card = None
         self._bf16_push = self._bf16_push_layout(cfg)
-        if self._bf16_push is None:
+        self._card_quant = (
+            self._card is not None and cfg.quant_type in _CARD_QUANT_TYPES
+        )
+        if self._bf16_push is None and not self._card_quant:
             self._card = None
         self._push_specs = tuple(
             dict.fromkeys(
@@ -1140,6 +1165,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             comb["combine_fp4_f32_scale"] = True
         if cfg.quant_type == "fp8_blockwise":
             comb["combine_fp8"] = True
+        if self._card is not None and cfg.quant_type in _CARD_QUANT_TYPES:
+            comb["card_combine"] = True
         geom = self._ll128_geom
         if geom is not None and "dispatch" in geom:
             disp.update(
@@ -1175,7 +1202,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 block_num=disp_b,
                 warp_per_block=disp_w,
             ),
-            dict(comb, **ll, block_num=comb_b, warp_per_block=comb_w),
+            dict(
+                {k: v for k, v in comb.items() if k != "card_combine"},
+                **ll,
+                block_num=comb_b,
+                warp_per_block=comb_w,
+            ),
         )
 
     def _asyncll_segmented_unsupported(self, cfg) -> list[str]:
@@ -1952,9 +1984,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return _LL_SPEC, _LL_SPEC
         if snapshot and self._card is not None:
             raise ValueError(
-                "snapshot=True on an op whose bf16 push combine folds the rows of each "
+                "snapshot=True on an op whose push combine folds the rows of each "
                 "card: the fold reads the latest dispatch, so a handle cannot outlive the "
-                "next one; pass snapshot=False, or set MORI_EP_BF16_PUSH=0"
+                "next one; pass snapshot=False (or, with quant_type none, set "
+                "MORI_EP_BF16_PUSH=0)"
             )
         selected = self.kernel_config(num_tokens, max_tokens)
         return selected.dispatch, selected.combine

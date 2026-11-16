@@ -300,14 +300,7 @@ _DISPATCH_TABLE: dict = {
     },
     "gfx1250/96cu": {
         (8, 7168, 6, None): {
-            None: ((2048, 64, 16), (None, 128, 16)),
-            "bf16": ((1024, 32, 16), (None, 64, 16)),
-            "fp4": (
-                (1024, 64, 16),
-                (1536, 64, 24),
-                (2048, 64, 32),
-                (None, 128, 16),
-            ),
+            None: ((None, 32, 16),),
         },
     },
 }
@@ -320,6 +313,9 @@ _DISPATCH_TABLE: dict = {
 # been tuned per bucket in its IntraNodeV2 table. On gfx1250, 128x4 never wins and
 # 256x8 collapses 2x at 16384.
 _COMBINE_TABLE: dict = {
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): ((None, 32, 8),),
+    },
     "gfx1250": {
         # topk 9 = 8 routed + 1 shared.
         (4, 7168, 9, None): (
@@ -350,6 +346,9 @@ _COMBINE_TABLE: dict = {
 
 _COMBINE_PUSH_TABLE: dict = {
     "fp4_blockwise": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): ((None, 32, 16),),
+        },
         "gfx1250": {
             # EP4 64x24 runs the overlapped path too; from 2048 tokens a rank it is ahead of 64x16
             # (-1.9 at 2048, -17 at 4096, -46 at 8192, -109 at 16384: 361.9 -> 252.4) and below it
@@ -429,6 +428,9 @@ _COMBINE_PUSH_TABLE: dict = {
         },
     },
     "fp8_blockwise": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): ((None, 32, 16),),
+        },
         "gfx1250": {
             # 128x16 is ahead of 64x16 from 512 to 1536 tokens a rank (-3.6, -7.0, -14.6 at topk 6).
             # It stays ahead of 128x24 through 2048 at topk 6 (-3.5) but only through 1792 at topk 9
@@ -473,6 +475,11 @@ _BF16_PUSH_TABLE: dict = {
 
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): {
+                "fp4": dict(max_tok=128, dispatch=(32, 16), combine=(32, 8))
+            },
+        },
         "gfx1250": {
             (4, 7168, 6, None): {
                 "fp4": dict(max_tok=256, dispatch=(64, 16), combine=(64, 16))
@@ -489,6 +496,11 @@ _LL128_TABLE: dict = {
         },
     },
     "fp8_blockwise": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): {
+                "fp8": dict(max_tok=64, dispatch=(32, 16), combine=(32, 8))
+            },
+        },
         "gfx1250": {
             (4, 7168, 6, None): {
                 "fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))

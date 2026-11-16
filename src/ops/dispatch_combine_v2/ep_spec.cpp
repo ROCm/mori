@@ -130,9 +130,9 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     c.cardCombine = req.cardCombine;
     if (arch.rfind("gfx125", 0) != 0 || !EpCardDedupOk(c)) {
       throw std::runtime_error(
-          "mori v2 ep: cardDedup needs gfx125x, a bf16 / fp8 / fp32 dispatch without ll128, an "
-          "even worldSize below 32, more than 8 warps a block and at least one a rank, and 0 to "
-          "64 pull blocks (world=" +
+          "mori v2 ep: cardDedup needs gfx125x, a bf16 / fp8 / fp32 dispatch, or an fp4 one past "
+          "four ranks with more warps a block than ranks, without ll128, an even worldSize below "
+          "32, more than 8 warps a block and at least one a rank, and 0 to 64 pull blocks (world=" +
           std::to_string(c.worldSize) + " warps=" + std::to_string(c.warpPerBlock) +
           " pullBlocks=" + std::to_string(c.cardPullBlocks) + ")");
     }
@@ -143,8 +143,9 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     c.cardCombine = true;
     if (arch.rfind("gfx125", 0) != 0 || !EpCardCombineOk(c)) {
       throw std::runtime_error(
-          "mori v2 ep: cardCombine needs gfx125x, the bf16 push combine without ll128 on 16 "
-          "warps a block, an even worldSize from 8 to 30, and at most " +
+          "mori v2 ep: cardCombine needs gfx125x, the bf16 / fp8 / fp4 push combine with e8m0 "
+          "scales, without ll128, on 16 warps a block, an even worldSize from 8 to 30, and at "
+          "most " +
           std::to_string(EpCardCombineRowsMax) +
           " rows a block (world=" + std::to_string(c.worldSize) +
           " warps=" + std::to_string(c.warpPerBlock) + " blocks=" + std::to_string(c.blockNum) +

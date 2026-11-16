@@ -591,16 +591,17 @@ constexpr size_t EpRegionFwdMapBytes(const EpCfg& c) {
 }
 
 constexpr bool EpCardDedupOk(const EpCfg& c) {
-  return c.dtype != EpDType::Fp4x2 && !c.ll128 && c.worldSize % 2 == 0 && c.worldSize < 32 &&
-         c.warpPerBlock > 8 && c.worldSize <= c.warpPerBlock && c.cardPullBlocks >= 0 &&
-         c.cardPullBlocks <= 64;
+  return (c.dtype != EpDType::Fp4x2 || (c.worldSize > 4 && c.warpPerBlock != c.worldSize)) &&
+         !c.ll128 && c.worldSize % 2 == 0 && c.worldSize < 32 && c.warpPerBlock > 8 &&
+         c.worldSize <= c.warpPerBlock && c.cardPullBlocks >= 0 && c.cardPullBlocks <= 64;
 }
 
 constexpr int EpCardCombineRowsMax = 2048;
 
 constexpr bool EpCardCombineOk(const EpCfg& c) {
-  return c.combineBf16Push && c.warpPerBlock == 16 && EpCombinePushOvlAny(c) && !c.ll128 &&
-         !c.ll128CombineOnly && c.worldSize >= 8 && c.worldSize % 2 == 0 && c.worldSize < 32 &&
+  return (c.combineBf16Push || EpCombinePush(c)) && c.warpPerBlock == 16 &&
+         EpCombinePushOvlAny(c) && !c.ll128 && !c.ll128CombineOnly && c.worldSize >= 8 &&
+         c.worldSize % 2 == 0 && c.worldSize < 32 &&
          (EpMaxRecv(c) + c.blockNum - 1) / c.blockNum <= EpCardCombineRowsMax;
 }
 

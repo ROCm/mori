@@ -321,7 +321,8 @@ def test_card_dedup_adds_a_forward_map_and_nothing_else():
     [
         dict(world_size=7),
         dict(warp_per_block=8),
-        dict(hidden_dim=3584, dtype="fp4x2"),
+        dict(hidden_dim=3584, dtype="fp4x2", world_size=16),
+        dict(hidden_dim=3584, dtype="fp4x2", world_size=4, max_recv=2048),
         dict(card_pull_blocks=65),
     ],
 )
@@ -423,18 +424,40 @@ def test_card_combine_lays_out_the_reverse_map_and_flags():
     "kw",
     [
         dict(combine_bf16_push=False),
-        dict(combine_bf16_push=False, combine_fp8=True),
+        dict(combine_bf16_push=False, combine_fp4=True, combine_fp4_f32_scale=True),
+        dict(combine_bf16_push=False, combine_fp8=True, warp_per_block=8),
         dict(world_size=4),
         dict(warp_per_block=8),
         dict(warp_per_block=24),
         dict(block_num=1),
     ],
 )
-def test_card_combine_takes_the_bf16_push_on_16_warps(kw):
+def test_card_combine_takes_a_push_combine_on_16_warps(kw):
     if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
         pytest.skip("card_combine is gfx125x only")
     with pytest.raises(RuntimeError, match="cardCombine needs"):
         cb.EpCombinePlan.describe(**{**_CARD_COMB_KW, "card_combine": True, **kw})
+
+
+@pytest.mark.parametrize("quant", ["combine_fp8", "combine_fp4"])
+def test_card_combine_folds_the_quantized_push_too(quant):
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_combine is gfx125x only")
+    kw = {**_CARD_KW, quant: True}
+    fold = cb.EpCombinePlan.describe(**kw, card_combine=True)
+    plain = cb.EpCombinePlan.describe(**kw)
+    assert (plain["cardCombine"], fold["cardCombine"]) == (False, True)
+    bf16 = cb.EpCombinePlan.describe(**_CARD_COMB_KW, card_combine=True)
+    assert fold["region.fwdMap"] == bf16["region.fwdMap"]
+    assert fold["cfgText"] == plain["cfgText"][:-1] + ", .cardCombine=true}"
+
+
+def test_card_dedup_takes_an_fp4_dispatch_past_its_packed_paths():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    kw = dict(_CARD_KW, hidden_dim=3584, dtype="fp4x2")
+    on = cb.EpDispatchPlan.describe(**kw, card_dedup=True, card_pull_blocks=8)
+    assert (on["cardDedup"], on["gridX"]) == (True, on["blockNum"] + 8)
 
 
 def _reference_regions(
