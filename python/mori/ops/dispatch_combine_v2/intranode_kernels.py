@@ -326,8 +326,8 @@ def make_dispatch(
             # ── Phase 2: grid barrier + per-peer count signal ──
             # s_barrier only syncs wavefronts; drain memory counters first so the
             # token/count stores above are complete before the grid barrier makes
-            # them visible to peers (unlike HIP __syncthreads, gpu.barrier has no
-            # implicit s_waitcnt).
+            # them visible to peers (neither gpu.barrier nor HIP __syncthreads waits
+            # for vector-memory stores).
             P.waitcnt_all()
             fx.barrier()
             if tid == 0:

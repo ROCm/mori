@@ -80,6 +80,12 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         refused = self._quant_refusal(cfg, _target_arch())
         if refused:
             return refused
+        # The fp8 codec reads and writes bf16 rows.
+        if cfg.fp8_blockwise and cfg.combine_dtype != torch.bfloat16:
+            return (
+                f"quant_type={cfg.quant_type!r} with combine dtype {cfg.combine_dtype} "
+                "(bf16 only)",
+            )
         # The fp8 codec quantizes a token in 128-element chunks, one per wave load.
         if cfg.fp8_blockwise and cfg.hidden_dim % 128:
             return (
