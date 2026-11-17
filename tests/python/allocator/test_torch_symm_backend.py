@@ -415,6 +415,39 @@ def _run_two_comms(rank, world_size, port):
         dist.barrier()
 
 
+def _run_pg_rendezvous(rank, world_size, port):
+    """use_pg_for_symm_mem_rendezvous moves the exchange off the Store onto the group."""
+    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
+        device = torch.device("cuda", rank)
+        symm_mem.set_backend("MORI")
+        store = dist.distributed_c10d._get_default_store()
+        pg = dist.new_group(list(range(world_size)))
+        # The group's own communicator is set up (through the Store) before counting.
+        dist.all_reduce(torch.ones(1, device=device), group=pg)
+        a = symm_mem.empty(1024, dtype=torch.float32, device=device).fill_(rank + 1)
+        b = symm_mem.empty(1024, dtype=torch.float32, device=device).fill_(rank + 1)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        keys = store.num_keys()
+        pg.use_pg_for_symm_mem_rendezvous = True
+        try:
+            hdl = symm_mem.rendezvous(a, pg.group_name)
+        finally:
+            pg.use_pg_for_symm_mem_rendezvous = False
+        dist.barrier()
+        assert store.num_keys() == keys, "rendezvous went through the Store"
+        for peer in range(world_size):
+            got = hdl.get_buffer(peer, (1024,), torch.float32)
+            assert got.eq(peer + 1).all()
+
+        # Control: without the flag the same exchange does use the Store.
+        symm_mem.rendezvous(b, pg.group_name)
+        dist.barrier()
+        assert store.num_keys() > keys
+        dist.barrier()
+
+
 def _run_restart(rank, world_size, port, tmpdir):
     """A communicator goes with its process group, and a successor reusing the
     group's name gets a working one (torch's NCCL Restart test, for this backend)."""
@@ -506,6 +539,15 @@ def test_symm_overlapping_devices():
 @pytest.mark.skipif(torch.cuda.device_count() < 3, reason="needs at least 3 GPUs")
 def test_one_allocation_two_comms():
     _spawn(_run_two_comms, 3)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs at least 2 GPUs")
+@pytest.mark.skipif(
+    not hasattr(dist.ProcessGroup, "use_pg_for_symm_mem_rendezvous"),
+    reason="torch has no use_pg_for_symm_mem_rendezvous",
+)
+def test_symm_pg_rendezvous():
+    _spawn(_run_pg_rendezvous, 2)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs at least 2 GPUs")

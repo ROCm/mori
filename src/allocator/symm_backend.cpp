@@ -66,6 +66,7 @@
 #include <set>
 #include <string>
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 #include <type_traits>
@@ -238,6 +239,85 @@ class StoreExchange {
   const std::string prefix_;
   std::mutex mu_;
   std::unordered_map<uintptr_t, Entry> seqs_;
+};
+
+// Backend::use_pg_for_symm_mem_rendezvous (absent in older torch): exchange over the group.
+template <typename B, typename = void>
+struct HasPgRendezvousFlag : std::false_type {};
+template <typename B>
+struct HasPgRendezvousFlag<
+    B, std::void_t<decltype(std::declval<const B&>().getUsePgForSymmMemRendezvous())>>
+    : std::true_type {};
+
+template <typename B>
+bool PgRendezvousRequested(const B& backend) {
+  if constexpr (HasPgRendezvousFlag<B>::value) {
+    return backend.getUsePgForSymmMemRendezvous();
+  } else {
+    return false;
+  }
+}
+
+// Asked of the group's CUDA backend, which is set even when the default backend is not.
+bool UsePgForRendezvous(const c10::intrusive_ptr<c10d::ProcessGroup>& pg) {
+  try {
+    return PgRendezvousRequested(*pg->getBackend(c10::DeviceType::CUDA));
+  } catch (const std::exception&) {
+    return false;  // the group has no CUDA backend
+  }
+}
+
+// all_gather_single replaced the deprecated _allgather_base; same op, same trace entry.
+template <typename P, typename = void>
+struct HasAllGatherSingle : std::false_type {};
+template <typename P>
+struct HasAllGatherSingle<P, std::void_t<decltype(std::declval<P&>().all_gather_single(
+                                 std::declval<at::Tensor&>(), std::declval<at::Tensor&>()))>>
+    : std::true_type {};
+
+template <typename P>
+c10::intrusive_ptr<c10d::Work> AllGatherSingle(P& pg, at::Tensor& out, at::Tensor& in) {
+  if constexpr (HasAllGatherSingle<P>::value) {
+    return pg.all_gather_single(out, in);
+  } else {
+    return pg._allgather_base(out, in);
+  }
+}
+
+// One rendezvous' all-gathers: the Store by default, the group's own collective on request.
+class RendezvousExchange {
+ public:
+  RendezvousExchange(StoreExchange& store_exchange, c10::intrusive_ptr<c10d::ProcessGroup> pg,
+                     int dev)
+      : store_exchange_(store_exchange),
+        pg_(std::move(pg)),
+        dev_(dev),
+        via_pg_(UsePgForRendezvous(pg_)) {}
+
+  template <typename T>
+  std::vector<T> all_gather(const T& val) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    const int world_size = pg_->getSize();
+    if (!via_pg_) {
+      return store_exchange_.all_gather(pg_->getStore(), pg_->getRank(), world_size, val);
+    }
+    const auto opts = at::TensorOptions().dtype(at::kByte).device(
+        c10::Device(c10::DeviceType::CUDA, static_cast<c10::DeviceIndex>(dev_)));
+    at::Tensor in = at::empty({static_cast<int64_t>(sizeof(T))}, opts);
+    in.copy_(at::from_blob(const_cast<T*>(&val), {static_cast<int64_t>(sizeof(T))}, at::kByte));
+    at::Tensor out = at::empty({static_cast<int64_t>(sizeof(T)) * world_size}, opts);
+    AllGatherSingle(*pg_, out, in)->wait();
+    const at::Tensor host = out.cpu();
+    std::vector<T> res(world_size);
+    std::memcpy(res.data(), host.data_ptr(), sizeof(T) * world_size);
+    return res;
+  }
+
+ private:
+  StoreExchange& store_exchange_;
+  c10::intrusive_ptr<c10d::ProcessGroup> pg_;
+  int dev_;
+  bool via_pg_;
 };
 
 // Per-rank flat VA of a comm (cco reserves lsaSize x this): device memory, capped for big teams.
@@ -845,7 +925,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     auto pg = c10d::resolve_process_group(name);
     const int rank = pg->getRank();
     const int world_size = pg->getSize();
-    auto store = pg->getStore();
+    RendezvousExchange exchange(store_exchange_, pg, dev);
 
     auto cached = LookupGroup(name, dev);
     if (cached && (cached->rank != rank || cached->world_size != world_size)) cached = nullptr;
@@ -861,7 +941,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     local.global_rank = GlobalRank();
     local.fabric = block.handle_type == hipMemHandleTypeFabricCompat ? 1 : 0;
     (void)gethostname(local.host, HOST_NAME_MAX);
-    auto infos = store_exchange_.all_gather(store, rank, world_size, local);
+    auto infos = exchange.all_gather(local);
 
     // torch's contract is that every rank hands in the same size. cco's register is
     // collective and would deadlock or mismap on a mismatch, so say so first.
@@ -884,14 +964,14 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     bool reuse = cached != nullptr;
     for (const auto& info : infos) reuse = reuse && info.comm_epoch == cached->epoch;
     if (!reuse) cached.reset();  // let CreateGroup release it first
-    auto group = reuse ? cached : CreateGroup(name, dev, store, rank, world_size, infos);
+    auto group = reuse ? cached : CreateGroup(name, dev, exchange, rank, world_size, infos);
     return MapBlock(group, block);
   }
 
   // Collective: a new comm for (name, dev), replacing this rank's cached one.
   std::shared_ptr<CcoGroup> CreateGroup(const std::string& name, int dev,
-                                        const c10::intrusive_ptr<c10d::Store>& store, int rank,
-                                        int world_size, const std::vector<RendezvousInfo>& infos) {
+                                        RendezvousExchange& exchange, int rank, int world_size,
+                                        const std::vector<RendezvousInfo>& infos) {
     {
       // Released first so its VA is back before the new reservation, if nothing holds it.
       std::shared_ptr<CcoGroup> old;
@@ -928,8 +1008,8 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       std::random_device rd;
       mine.epoch = ((static_cast<uint64_t>(rd()) << 32) | rd()) | 1;  // never 0
     }
-    // The uid rides torch's own Store, so cco's rendezvous needs no second channel.
-    auto ids = store_exchange_.all_gather(store, rank, world_size, mine);
+    // The uid rides torch's own channel, so cco's rendezvous needs no second one.
+    auto ids = exchange.all_gather(mine);
 
     auto group = std::make_shared<CcoGroup>();
     group->name = name;
@@ -941,9 +1021,8 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     mori::cco::ccoCommConfig config = CCO_COMM_CONFIG_INITIALIZER;
     config.cpuAffinity = 0;
     config.lsaOnly = 1;
-    MORI_CCO_CHECK(mori::cco::ccoCommCreate(ids[0].uid, world_size, rank,
-                                            PerRankVa(device_mem, lsa_bound), &config,
-                                            &group->comm));
+    MORI_CCO_CHECK(mori::cco::ccoCommCreate(
+        ids[0].uid, world_size, rank, PerRankVa(device_mem, lsa_bound), &config, &group->comm));
     g_live_comms.fetch_add(1);
     // ccoCommCreate leaves a tolerated probe failure latched in HIP's per-thread
     // sticky slot. torch checks that slot around every launch, so without this the
