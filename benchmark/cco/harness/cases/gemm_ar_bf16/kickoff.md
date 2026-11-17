@@ -8,9 +8,9 @@ Fill in the placeholders, then pass this file as the prompt.
   the case's files. Give the README to every subagent with its task.
 - Run the cco-fusion-loop skill from step 1: bounds, design and build (the cco-sdma-fusion
   agent), verification (a fresh cco-fusion-verifier), decisions, and the report.
-- GPUs: <where GPU commands run, e.g. "on this machine", or "through
-  `~/.claude/skills/crusoe-gpu-nodes/scripts/mori-env.sh exec <node> --`, records mirrored
-  with MORI_ENV_RECORDS=<records>/<task>">. Do not reserve or release nodes.
+- GPUs: <where GPU commands run, e.g. "on this machine", or "through <your site's
+  launcher> on <node>, with the records mirrored there">. Do not reserve or release nodes
+  unless this prompt says how.
 - When you need the owner (GPUs gone, a decision, a permission), write the question to
   <records>/<task>/BLOCKED and end the turn.
 - When the loop ends, by acceptance or by a stop rule, write <records>/<task>/report.md.

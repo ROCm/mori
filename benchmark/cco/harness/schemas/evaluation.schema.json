@@ -36,6 +36,7 @@
       }
     },
     "rounds": {"type": ["integer", "null"], "minimum": 0},
+    "dev_rows": {"type": "integer", "minimum": 0},
     "gpu_hours": {"type": "number", "minimum": 0},
     "runpy_launches": {"type": "integer", "minimum": 0},
     "node_hours": {"type": ["number", "null"]},

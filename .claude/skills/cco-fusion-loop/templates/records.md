@@ -3,8 +3,9 @@
 ## decisions.md
 
 One row per pass through step 4 (and per development iteration, if the implementer keeps
-its own log). Numbers are the median and spread, maximum over ranks, with the run IDs
-that produced them.
+its own log). Number the passes through step 4 (1, 2, ...): the contract's round budget
+counts those rows. Label the implementer's rows otherwise (dev-1, freeze). Numbers are
+the median and spread, maximum over ranks, with the run IDs that produced them.
 
 | Round | Candidate | Hypothesis | Change | Predicted | Measured | Decision | Reason | Runs |
 |---|---|---|---|---|---|---|---|---|

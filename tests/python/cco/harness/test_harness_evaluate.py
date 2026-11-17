@@ -41,7 +41,9 @@ spec.loader.exec_module(ev)
 DECISIONS = """# decisions
 | Round | Candidate | Hypothesis | Change | Predicted | Measured | Decision | Reason | Runs |
 |---|---|---|---|---|---|---|---|---|
+| dev-1 | c1 | first build | | 1300 | 1310 | keep | | r0 |
 | 1 | c1 | overlap the gather | chunks | 1250 | 1290 | revise | | r1 |
+| freeze | c2 | | | | | freeze | | |
 | 2 | c2 | fewer puts | 8 chunks | 1200 | 1195 | keep | | r2 |
 | 3 | | | | | | | | |
 """
@@ -156,7 +158,8 @@ def test_a_passing_run_is_recorded(task, tmp_path):
         and t["met"] is True
         and t["gap_pct"] == pytest.approx(2.14)
     )
-    assert out["rounds"] == 2 and out["gpu_hours"] == pytest.approx(0.3)
+    assert out["rounds"] == 2 and out["dev_rows"] == 2
+    assert out["gpu_hours"] == pytest.approx(0.3)
     assert out["runpy_launches"] == 2 and out["commit"] == "a" * 40
     s = out["session"]
     assert s["owner_prompts"] == 2 and s["wall_hours"] == 3.0 and s["tool_calls"] == 1

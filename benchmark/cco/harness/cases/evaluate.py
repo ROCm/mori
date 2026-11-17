@@ -33,7 +33,8 @@ It reads:
 * the verifier's verdicts (``verdicts/*.json``, the newest decides): the verdict and the
   target bucket's timing, candidate against the existing op; when a verdict holds no
   timing for that bucket, the run it lists whose arms include ``existing`` and ``candidate``;
-* ``decisions.md`` for the rounds, and every ``runs/**/result.json`` for the GPU time
+* ``decisions.md`` for the rounds (its numbered rows; ``dev-1`` and the like are the
+  implementer's log, counted apart), and every ``runs/**/result.json`` for the GPU time
   spent in run.py launches (duration times ranks);
 * the session's transcripts, the main one first: wall time, the owner's prompts after the
   first one (interventions), tool calls, tokens by kind, cost, models;
@@ -56,6 +57,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from loop_state import gpu_hours as gpu_time  # noqa: E402
+from loop_state import decision_rows  # noqa: E402
 from loop_state import rounds_used as rounds_of  # noqa: E402
 
 SCHEMA = "cco-fusion/evaluation/v1"
@@ -275,6 +277,10 @@ def evaluate(args):
             "verdicts": len(verdicts),
         },
         "rounds": rounds_of(Path(records) / "decisions.md"),
+        "dev_rows": sum(
+            not r[0].isdigit()
+            for r in decision_rows(Path(records) / "decisions.md") or []
+        ),
         "gpu_hours": gpu_hours,
         "runpy_launches": launches,
         "node_hours": args.node_hours,

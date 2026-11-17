@@ -13,4 +13,6 @@ prompts, or a pass where there was a fail.
   when the owner gave it.
 - **Owner prompts:** the owner's messages after the kickoff.
 
-No run yet.
+| Date | Commit | Models | Result | Candidate (µs) | Existing (µs) | Gap | Rounds | GPU h | Owner prompts | Wall h | Cost (USD) | Audit |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 2026-11-17 | 30eaaa79a2 | claude-opus-5-5, claude-sonnet-4-6 | pass | 1167.2 | 1169.3 | -0.2% | 1 | 2.47 | 0 | 1.6 | 31.60 | clean (1 blocked) |

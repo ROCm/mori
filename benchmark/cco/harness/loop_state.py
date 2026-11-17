@@ -46,39 +46,38 @@ from pathlib import Path
 TERMINAL = ("stopped", "needs-owner", "done")
 
 
-def rounds_used(decisions):
-    """Rows of decisions.md that name a candidate; None without the file."""
+def decision_rows(decisions):
+    """(round, candidate, decision) for every row of decisions.md that names a candidate;
+    None without the file."""
     if not decisions.is_file():
         return None
-    rows = 0
-    for line in decisions.read_text(encoding="utf-8").splitlines():
-        if not line.strip().startswith("|"):
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) < 2 or cells[0].lower() == "round" or not cells[0].strip("-: "):
-            continue
-        rows += bool(cells[1])
-    return rows
-
-
-def last_decision(decisions):
-    """The Decision cell of the last row that names a candidate, lower case."""
-    if not decisions.is_file():
-        return None
-    header, last = None, None
+    header, rows = None, []
     for line in decisions.read_text(encoding="utf-8").splitlines():
         if not line.strip().startswith("|"):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if cells and cells[0].lower() == "round":
             header = [c.lower() for c in cells]
-        elif header and len(cells) == len(header) and cells[1]:
-            last = (
-                cells[header.index("decision")].lower()
-                if "decision" in header
-                else None
-            )
-    return last
+        elif len(cells) >= 2 and cells[0].strip("-: ") and cells[1]:
+            decision = None
+            if header and "decision" in header and len(cells) == len(header):
+                decision = cells[header.index("decision")].lower()
+            rows.append((cells[0], cells[1], decision))
+    return rows
+
+
+def rounds_used(decisions):
+    """Numbered rows of decisions.md, one per pass through step 4. Rows labelled otherwise
+    (dev-1, freeze) are the implementer's log and do not count. None without the file.
+    """
+    rows = decision_rows(decisions)
+    return None if rows is None else sum(r[0].isdigit() for r in rows)
+
+
+def last_decision(decisions):
+    """The Decision cell of the last numbered row, lower case."""
+    numbered = [r for r in decision_rows(decisions) or [] if r[0].isdigit()]
+    return numbered[-1][2] if numbered else None
 
 
 def gpu_hours(task):

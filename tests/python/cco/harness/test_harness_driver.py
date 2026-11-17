@@ -71,6 +71,7 @@ def _touch(path, text="x", age=0):
 def _decisions(*rows):
     head = "| Round | Candidate | Hypothesis | Change | Predicted | Measured | Decision | Reason | Runs |\n"
     head += "|---|---|---|---|---|---|---|---|---|\n"
+    head += "| dev-1 | c0 | | | | | keep | | |\n"  # the implementer's log: not a round
     return head + "".join(
         f"| {i} | c{i} | | | | | {d} | | |\n" for i, d in enumerate(rows, 1)
     )
