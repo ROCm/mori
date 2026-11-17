@@ -244,10 +244,19 @@ Registry& Reg() {
   return *r;
 }
 
-// Switches to a device for one call and restores the caller's on exit.
+// One entry's HIP calls: switches to a device and restores the caller's on exit.
+// Leaves HIP's last error as the caller had it: an error this entry hit is cleared
+// unless one was already pending.
 class DeviceScope {
  public:
+  // Call before the entry's first HIP call.
+  void Begin() {
+    if (begun_) return;
+    begun_ = true;
+    callerError_ = hipPeekAtLastError() != hipSuccess;
+  }
   hipError_t Enter(int dev) {
+    Begin();
     hipError_t err = hipGetDevice(&prev_);
     if (err != hipSuccess) return err;
     if (prev_ == dev) return hipSuccess;
@@ -257,11 +266,14 @@ class DeviceScope {
   }
   ~DeviceScope() {
     if (restore_) (void)hipSetDevice(prev_);
+    if (begun_ && !callerError_) (void)hipGetLastError();
   }
 
  private:
   int prev_ = -1;
   bool restore_ = false;
+  bool begun_ = false;
+  bool callerError_ = false;
 };
 
 // A comm call in progress: the comm is alive and locked, and its device current.
@@ -347,6 +359,8 @@ int CommCreate(const moriCcoUniqueId_t* uniqueId, int nRanks, int rank,
                   fmt::format("rank {} is not in [0, nRanks={})", rank, nRanks));
     }
 
+    DeviceScope scope;
+    scope.Begin();
     int device = cfg.device;
     if (device == -1) {
       const hipError_t err = hipGetDevice(&device);
@@ -360,7 +374,6 @@ int CommCreate(const moriCcoUniqueId_t* uniqueId, int nRanks, int rank,
                     fmt::format("config->device {} is not in [0, {})", device, count));
       }
     }
-    DeviceScope scope;
     if (const hipError_t err = scope.Enter(device); err != hipSuccess) {
       return HipFail(kEntry, "hipSetDevice", err);
     }
@@ -371,8 +384,6 @@ int CommCreate(const moriCcoUniqueId_t* uniqueId, int nRanks, int rank,
     commConfig.cpuAffinity = (cfg.flags & MORI_CCO_COMM_NO_CPU_AFFINITY) ? 0 : 1;
     commConfig.lsaOnly = (cfg.flags & MORI_CCO_COMM_LSA_ONLY) ? 1 : 0;
     const int rc = ccoCommCreate(id, nRanks, rank, cfg.perRankVaBytes, &commConfig, &comm);
-    // cco tolerates a failed handle-type probe; keep it out of HIP's sticky error.
-    (void)hipGetLastError();
     if (rc != 0 || comm == nullptr) return CcoFail(kEntry, "ccoCommCreate");
 
     auto state = std::make_shared<CommState>();

@@ -377,7 +377,7 @@ static int run_rank(int rank, int nranks, const moriCcoUniqueId_t* uid) {
     EXPECT_ERR(MORI_CCO_ERROR_INTERNAL, api.windowImport(comm, plain, bytes, 0, &win, NULL));
     if (!strstr(api.getLastError(), "hipMemRetainAllocationHandle"))
       FAIL("last error does not name the cause: %s", api.getLastError());
-    (void)hipGetLastError();
+    if (hipPeekAtLastError() != hipSuccess) FAIL("failed windowImport left a HIP error pending");
     HIP(hipFree(plain));
   }
 
@@ -454,7 +454,11 @@ static int run_rank(int rank, int nranks, const moriCcoUniqueId_t* uid) {
   }
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.devCommDestroy(comm, buf));
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.devCommGetInfo(comm, buf, &dinfo));
+  // A HIP error the caller has pending stays for the caller.
+  if (hipSetDevice(-1) == hipSuccess) FAIL("hipSetDevice(-1) succeeded");
   OK(api.devCommDestroy(comm, dev));
+  if (hipGetLastError() != hipErrorInvalidDevice)
+    FAIL("devCommDestroy took the caller's HIP error");
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.devCommDestroy(comm, dev));
 
   // The owner lets go of its handle first, then the window (see cco_c.h, Lifetime).
