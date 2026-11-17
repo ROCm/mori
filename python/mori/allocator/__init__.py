@@ -71,10 +71,11 @@ The signal pad is always there, as its own CCO allocation and window rather than
 appended to the buffer -- the same split NCCL's backend uses. torch's own ``symm_mem``
 collectives synchronise through it, so they work without any build flag.
 
-``barrier()`` runs over CCO's host barrier, which means the current stream is drained
-first: stronger than the device-side barrier torch asks for, and heavier.
-``put_signal``/``wait_signal`` still raise -- point-to-point signalling needs a
-``ccoDevComm``, which this backend does not create yet.
+``barrier()``, ``put_signal()`` and ``wait_signal()`` are kernels on the caller's current
+stream that follow torch's signal-pad protocol, so they mix with torch's own ``symm_mem``
+ops, capture into HIP graphs, and on torch >= 2.15 join its per-group stream ordering.
+A timeout traps the kernel as torch's backends do: the next synchronisation raises, and
+the process's GPU state is unusable from then on.
 
 ``rendezvous()`` takes the tensor's *storage* base, so ``get_offset()`` is 0 by
 construction: every ``alloc()`` is its own VMM allocation. Handing it a view
