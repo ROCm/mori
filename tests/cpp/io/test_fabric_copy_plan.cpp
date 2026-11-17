@@ -1,5 +1,24 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// SPDX-License-Identifier: MIT
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // CPU-only: also runnable with c++ -std=c++17 -I. this.cpp copy_plan.cpp.
 #include <algorithm>
 #include <iostream>
@@ -57,7 +76,8 @@ int main() {
       for (size_t i = 0; i < plan.dispatches.size(); ++i) {
         size_t n = std::min<size_t>(count - i * 512, 512);
         bool small = n >= 2 && n <= 16;
-        CHECK(std::holds_alternative<FabricCopyArgs<kSingleK>>(plan.dispatches[i].args) == (n == 1));
+        CHECK(std::holds_alternative<FabricCopyArgs<kSingleK>>(plan.dispatches[i].args) ==
+              (n == 1));
         CHECK(std::holds_alternative<FabricCopyArgs<kSmallK>>(plan.dispatches[i].args) == small);
         CHECK(std::holds_alternative<FabricCopyArgs<kLargeK>>(plan.dispatches[i].args) == (n > 16));
       }
@@ -71,10 +91,20 @@ int main() {
       uint64_t bytes;
       uint32_t grid;
     };
-    for (auto test : {GridCase{1, 1}, {15, 1}, {16, 1}, {4095, 1}, {4096, 1}, {4097, 2},
-                      {8192, 2}, {8193, 3}, {65534ull * 4096 + 1, 65535},
-                      {65535ull * 4096, 65535}, {65535ull * 4096 + 1, 65535},
-                      {(1ull << 32) + 1, 65535}, {1ull << 40, 65535}, {UINT64_MAX, 65535}}) {
+    for (auto test : {GridCase{1, 1},
+                      {15, 1},
+                      {16, 1},
+                      {4095, 1},
+                      {4096, 1},
+                      {4097, 2},
+                      {8192, 2},
+                      {8193, 3},
+                      {65534ull * 4096 + 1, 65535},
+                      {65535ull * 4096, 65535},
+                      {65535ull * 4096 + 1, 65535},
+                      {(1ull << 32) + 1, 65535},
+                      {1ull << 40, 65535},
+                      {UINT64_MAX, 65535}}) {
       for (uint32_t maxBlocks : {1u, 1536u, UINT32_MAX}) {
         auto plan = PlanCopy({{17, 19, test.bytes}}, maxBlocks, true);
         CHECK(plan.dispatches.size() == 1 && plan.dispatches[0].grid == test.grid);

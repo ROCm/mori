@@ -158,7 +158,7 @@ class FabricBackend : public Backend {
     }
   };
   FabricBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote,
-                                                std::string* error);
+                                                 std::string* error);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
 
   struct ImportedRegion {

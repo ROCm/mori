@@ -523,7 +523,8 @@ FabricBackend::CopyFunctions FabricBackend::GetFabricCopyFunctions(int deviceId)
   hipModule_t module = nullptr;
   CopyFunctions funcs;
   hipError_t err = hipModuleLoad(&module, fabricCopyHsacoPath_.c_str());
-  if (err == hipSuccess) err = hipModuleGetFunction(&funcs.single, module, "fabricCopyKernelSingle");
+  if (err == hipSuccess)
+    err = hipModuleGetFunction(&funcs.single, module, "fabricCopyKernelSingle");
   if (err == hipSuccess) err = hipModuleGetFunction(&funcs.small, module, "fabricCopyKernelSmall");
   if (err == hipSuccess) err = hipModuleGetFunction(&funcs.large, module, "fabricCopyKernelLarge");
   if (err != hipSuccess) {
@@ -564,11 +565,11 @@ void FabricBackend::RegisterMemory(MemoryDesc& desc) {
       first = registrationReasons.insert(desc.fabricReason).second;
     }
     if (first) {
-      MORI_IO_WARN("FABRIC: memory id={} device={} size={}: {}", desc.id, desc.deviceId,
-                   desc.size, desc.fabricReason);
+      MORI_IO_WARN("FABRIC: memory id={} device={} size={}: {}", desc.id, desc.deviceId, desc.size,
+                   desc.fabricReason);
     } else {
-      MORI_IO_DEBUG("FABRIC: memory id={} device={} size={}: {}", desc.id, desc.deviceId,
-                    desc.size, desc.fabricReason);
+      MORI_IO_DEBUG("FABRIC: memory id={} device={} size={}: {}", desc.id, desc.deviceId, desc.size,
+                    desc.fabricReason);
     }
   };
   int dev = desc.deviceId;
@@ -578,8 +579,8 @@ void FabricBackend::RegisterMemory(MemoryDesc& desc) {
   }
   const auto& key = deviceVpodKeys[dev];
   if (!key.valid) {
-    reject("device " + std::to_string(dev) + " is not on a ready UALink fabric: " +
-           key.invalidReason);
+    reject("device " + std::to_string(dev) +
+           " is not on a ready UALink fabric: " + key.invalidReason);
     return;
   }
   desc.vpodId = key.vpodId;
@@ -854,10 +855,9 @@ std::string FabricBackend::RejectReason(const MemoryDesc& local, const MemoryDes
     return "remote device has no UALink vPOD identity";
   }
   if (key.vpodId != remote.vpodId || key.ppodId != remote.vpodPpodId) {
-    std::string reason = "different vPOD: local ppod_id=" + key.ppodId +
-                         " vpod_id=" + std::to_string(key.vpodId) +
-                         ", remote ppod_id=" + remote.vpodPpodId +
-                         " vpod_id=" + std::to_string(remote.vpodId);
+    std::string reason =
+        "different vPOD: local ppod_id=" + key.ppodId + " vpod_id=" + std::to_string(key.vpodId) +
+        ", remote ppod_id=" + remote.vpodPpodId + " vpod_id=" + std::to_string(remote.vpodId);
     if (key.ppodId.empty() != remote.vpodPpodId.empty()) {
       reason += " (one side uses MORI_IO_FABRIC_VPOD_ID, the other reads sysfs)";
     }

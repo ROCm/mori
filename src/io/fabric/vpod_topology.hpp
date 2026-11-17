@@ -33,10 +33,10 @@ namespace fabric {
 // ppod_id (a UUID) makes the key globally unique, since hive_id collides across
 // hosts.
 struct VpodKey {
-  bool valid{false};   // true only when the fabric is present and ACTIVE/READY
-  std::string ppodId;  // physical pod UUID (empty in manual-override mode)
-  int vpodId{-1};      // virtual pod id within the ppod
-  int vpodSize{0};     // number of GPUs in the vPOD (0 if unknown)
+  bool valid{false};          // true only when the fabric is present and ACTIVE/READY
+  std::string ppodId;         // physical pod UUID (empty in manual-override mode)
+  int vpodId{-1};             // virtual pod id within the ppod
+  int vpodSize{0};            // number of GPUs in the vPOD (0 if unknown)
   std::string invalidReason;  // why this device is not on a ready fabric
 };
 

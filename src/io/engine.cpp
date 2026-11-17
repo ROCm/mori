@@ -78,16 +78,16 @@ std::string NoBackendReason(
   const char* location = local.loc == MemoryLocationType::GPU   ? "GPU"
                          : local.loc == MemoryLocationType::CPU ? "CPU"
                                                                 : "Unknown";
-  std::string message = "No backend can handle local mem " + std::to_string(local.id) +
-                        " (" + location + " " + std::to_string(local.deviceId) + ") -> engine " +
+  std::string message = "No backend can handle local mem " + std::to_string(local.id) + " (" +
+                        location + " " + std::to_string(local.deviceId) + ") -> engine " +
                         remote.engineKey + " mem " + std::to_string(remote.id) + ": ";
   const char* separator = "";
-  for (auto type : {BackendType::XGMI, BackendType::FABRIC, BackendType::RDMA,
-                    BackendType::OFI, BackendType::TCP}) {
+  for (auto type : {BackendType::XGMI, BackendType::FABRIC, BackendType::RDMA, BackendType::OFI,
+                    BackendType::TCP}) {
     auto it = backends.find(type);
     if (it == backends.end()) continue;
-    message += separator + sim::BackendTypeName(type) + ": " +
-               it->second->RejectReason(local, remote);
+    message +=
+        separator + sim::BackendTypeName(type) + ": " + it->second->RejectReason(local, remote);
     separator = "; ";
   }
   return message;
@@ -578,9 +578,8 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
     if (it != backends.end() && it->second->CanHandle(local, remote)) {
       UpdateRouteCache(routeKey, type);
       if (!fabricReason.empty()) {
-        MORI_IO_INFO("FABRIC not used for local mem {} -> engine {} mem {}: {}; using {}",
-                     local.id, remote.engineKey, remote.id, fabricReason,
-                     sim::BackendTypeName(type));
+        MORI_IO_INFO("FABRIC not used for local mem {} -> engine {} mem {}: {}; using {}", local.id,
+                     remote.engineKey, remote.id, fabricReason, sim::BackendTypeName(type));
       }
       return it->second.get();
     }
@@ -609,15 +608,15 @@ std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) c
   return it->second;
 }
 
-#define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend)   \
-  backend = SelectBackend(local, remote);                                   \
-  if (backend == nullptr) {                                                 \
-    const std::string reason = NoBackendReason(backends, local, remote);    \
-    if (status != nullptr) {                                                \
-      status->Update(StatusCode::ERR_BAD_STATE, reason);                    \
-    }                                                                       \
-    MORI_IO_ERROR("{}", reason);                                            \
-    return;                                                                 \
+#define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend) \
+  backend = SelectBackend(local, remote);                                 \
+  if (backend == nullptr) {                                               \
+    const std::string reason = NoBackendReason(backends, local, remote);  \
+    if (status != nullptr) {                                              \
+      status->Update(StatusCode::ERR_BAD_STATE, reason);                  \
+    }                                                                     \
+    MORI_IO_ERROR("{}", reason);                                          \
+    return;                                                               \
   }
 
 void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
