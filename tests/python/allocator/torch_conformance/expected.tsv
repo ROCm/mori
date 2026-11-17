@@ -1,0 +1,25 @@
+# Documented exceptions for test_symmetric_memory.py on the MORI backend (see README.md).
+# status	torch	test	cause	category	note
+#
+# Skips no backend can lift on ROCm.
+SKIP	*	*	multicast support is not available|only with multicast	rocm-no-multicast	ROCm has no multicast objects: the multimem_* ops and multicast barriers
+SKIP	*	*	cuda.bindings|cuda-python	rocm-no-cuda-python	drives CUDA driver calls through cuda-python, which ROCm builds turn off
+SKIP	*	*	NCCL symmetric memory is not supported on ROCm	rocm-no-nccl-symm	torch's NCCL symmetric memory backend is not built for ROCm
+SKIP	*	*	device-side assertions are not enabled	rocm-no-device-assert	ROCm builds do not enable device-side assertions
+SKIP	*	*	torchcomms	rocm-no-torchcomms	the torchcomms NCCL backend is not built for ROCm
+SKIP	*	*	rocSHMEM	rocshmem-only	tests of torch's rocSHMEM backend
+SKIP	*	*	native caching allocator	not-native-allocator	counts blocks of torch's native caching allocator
+SKIP	*	*	world sizes 2, 4 and 8	world-size	reduce_scatter_out supports world sizes 2, 4 and 8
+SKIP	*	*	async_mm|async mm	rocm-no-async-mm	this torch build has no ROCm async matmul
+#
+# Tests torch gates on the name of its own backend. --as-cuda runs the generic ones on MORI.
+SKIP	*	*	applies to the CUDA( and XPU)? symm mem backend|implemented in the CUDA backend	gated-on-backend-name	run with --as-cuda (stream serialization, slot layout, capture guard, current-stream alloc)
+SKIP	*	SymmMemIpcSocketTest::*	Fabric handles do not use the IPC socket	cuda-backend-internal	pins TORCH_SYMMMEM=CUDA and tests its IPC socket under a long TMPDIR
+SKIP	*	*	Gloo and Linux descriptor inventory required	gated-on-fd-inventory	needs a Gloo default group and /proc fd inventory
+#
+# Failures that need a change outside MORI.
+FAIL	*	SymmetricMemoryTest::test_get	unsupported backend: MORI	torch-name-dispatch	symm_mem.get picks its implementation by backend name and rejects any other
+FAIL	*	SymmetricMemoryTest::test_cuda_nvlink_connectivity_detection	.	cuda-only-api	tests torch's DMA connectivity detector, which exists for CUDA over NVLink only
+FAIL	2.15.*	AsyncTPTest::test_fused_all_gather_matmul_native_*	async_input_mm is not currently supported	torch-build	the 2.15 ROCm wheel has no async_input_mm
+FAIL	*	SymmMemCleanupTestCUDA::test_cuda_peer_pointer_tables_cleanup_*	.	cuda-backend-internal	counts the caching-allocator blocks torch's CUDA backend keeps its peer tables in
+FAIL	*	SymmetricMemoryTest::test_alloc_rendezvous_on_current_stream	0 not greater than 0	cuda-backend-internal	with --as-cuda: finds the barrier in the profile by the CUDA backend's kernel name
