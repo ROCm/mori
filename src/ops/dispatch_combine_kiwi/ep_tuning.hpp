@@ -133,8 +133,10 @@ inline int recommended_num_blocks(int num_tokens, int world_size, std::string_vi
 // "gfx942". Returns an empty string if the device cannot be queried.
 std::string current_gpu_arch();
 
-// NIC family of an RDMA device: "pollara" for ionic_*, "cx7" for ConnectX-7,
-// otherwise the device-name prefix (e.g. "mlx5"). Empty for an empty name.
+// NIC family of an RDMA device, from its PCI IDs under `sysfs_root` so that
+// renamed devices (e.g. rocep9s0) still match: "pollara" for AMD Pensando,
+// "cx7" for ConnectX-7. Otherwise "pollara" for ionic_*, else the device-name
+// prefix (e.g. "mlx5"). Empty for an empty name.
 std::string nic_family_for_hca(const std::string& hca_name,
                                const std::string& sysfs_root = "/sys/class/infiniband");
 

@@ -30,6 +30,7 @@
 #include "ep_context.hip.hpp"
 #include "ep_tuning.hpp"
 #include "hip_check.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori::kiwi::ep {
 
@@ -84,6 +85,12 @@ config_t make_config(const ep_op_config_t& in) {
   cfg.device_name = rdma::resolve_device_name(in.device_name);
   cfg.gpu_arch = current_gpu_arch();
   cfg.nic_family = nic_family_for_hca(cfg.device_name);
+  if (find_runtime_tuning_table(cfg.gpu_arch, cfg.nic_family) == nullptr) {
+    MORI_OPS_DEBUG(
+        "kiwi-ep: no tuning table for gpu_arch '{}' and NIC '{}' (family '{}'); "
+        "using the generic launch defaults",
+        cfg.gpu_arch, cfg.device_name, cfg.nic_family);
+  }
   cfg.dispatch_elem_size = in.dispatch_elem_size;
   cfg.combine_elem_size = in.combine_elem_size;
   cfg.dispatch_quant_format = parse_quant_format(in.dispatch_quant_format);

@@ -76,18 +76,20 @@ std::string nic_family_for_hca(const std::string& hca_name, const std::string& s
   if (hca_name.empty()) {
     return {};
   }
+  // PCI IDs, not ibv_device_attr: mlx5 reports its OUI (0x02c9) as vendor_id.
+  const std::string device_dir = sysfs_root + "/" + hca_name + "/device/";
+  const std::string vendor = read_lowercase_token(device_dir + "vendor");
+  if (vendor == "0x1dd8") {
+    return "pollara";
+  }
+  if (vendor == "0x15b3" && read_lowercase_token(device_dir + "device") == "0x1021") {
+    return "cx7";
+  }
   std::string prefix = hca_name.substr(0, hca_name.find('_'));
   std::transform(prefix.begin(), prefix.end(), prefix.begin(),
                  [](unsigned char c) { return std::tolower(c); });
   if (prefix == "ionic") {
     return "pollara";
-  }
-  if (prefix == "mlx5") {
-    const std::string device_dir = sysfs_root + "/" + hca_name + "/device/";
-    if (read_lowercase_token(device_dir + "vendor") == "0x15b3" &&
-        read_lowercase_token(device_dir + "device") == "0x1021") {
-      return "cx7";
-    }
   }
   return prefix;
 }
