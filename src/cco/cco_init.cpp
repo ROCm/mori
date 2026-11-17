@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -287,18 +288,50 @@ int ccoGetUniqueId(ccoUniqueId* uniqueId) {
 // — the ccoUniqueId overload below builds the built-in socket bootstrap and
 // delegates here.
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
-                             ccoComm** outComm);
+                             const ccoCommConfig& config, ccoComm** outComm);
+
+// Caller's config over the defaults; fields past an older caller's `size` keep defaults.
+static bool CcoResolveCommConfig(const ccoCommConfig* in, ccoCommConfig* out) {
+  const ccoCommConfig defaults = CCO_COMM_CONFIG_INITIALIZER;
+  *out = defaults;
+  if (in == nullptr) return true;
+  if (in->magic != CCO_API_MAGIC) {
+    MORI_SHMEM_ERROR(
+        "ccoCommCreate: config->magic mismatch (got {:#x}, expect {:#x}) — "
+        "must initialize via CCO_COMM_CONFIG_INITIALIZER",
+        in->magic, CCO_API_MAGIC);
+    return false;
+  }
+  if (in->version > CCO_API_VERSION) {
+    MORI_SHMEM_WARN("ccoCommCreate: config->version={} > runtime CCO_API_VERSION={}", in->version,
+                    CCO_API_VERSION);
+  }
+  constexpr size_t kHead = offsetof(ccoCommConfig, cpuAffinity);
+  const size_t n = std::min(in->size, sizeof(ccoCommConfig));
+  if (n > kHead) {
+    std::memcpy(reinterpret_cast<char*>(out) + kHead, reinterpret_cast<const char*>(in) + kHead,
+                n - kHead);
+  }
+  return true;
+}
+
+int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
+                  ccoComm** outComm) {
+  return ccoCommCreate(uniqueId, nRanks, rank, perRankVmmSize, nullptr, outComm);
+}
 
 // Self-contained overload: build cco's built-in socket bootstrap from the id and
 // delegate to the internal helper, which takes ownership (the socket bootstrap is
 // Finalize()d + deleted in ccoCommDestroy).
 int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
-                  ccoComm** outComm) {
+                  const ccoCommConfig* config, ccoComm** outComm) {
   if (!outComm || nRanks <= 0 || rank < 0 || rank >= nRanks) return -1;
+  ccoCommConfig resolved;
+  if (!CcoResolveCommConfig(config, &resolved)) return -1;
   application::UniqueId appUid;
   std::memcpy(&appUid, &uniqueId, sizeof(appUid));
   auto* boot = new application::SocketBootstrapNetwork(appUid, rank, nRanks);
-  return ccoCommCreateImpl(boot, perRankVmmSize, outComm);
+  return ccoCommCreateImpl(boot, perRankVmmSize, resolved, outComm);
 }
 
 // The LSA team is always the contiguous rank range [myNodeStart, myNodeStart+
@@ -512,8 +545,18 @@ static void CcoWarnIfNoDmabufP2P() {
   }
 }
 
+// Unwinds a ccoCommCreateImpl that failed before the flat VA was reserved.
+static int CcoCommCreateFail(ccoComm* comm, ccoComm** outComm) {
+  delete comm->ctx;
+  comm->bootNet->Finalize();
+  delete comm->bootNet;
+  delete comm;
+  *outComm = nullptr;
+  return -1;
+}
+
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
-                             ccoComm** outComm) {
+                             const ccoCommConfig& config, ccoComm** outComm) {
   // Pin this thread to its GPU's NUMA-local CPUs before the bootstrap, the
   // Context and any worker thread below (new threads inherit the affinity).
   // This is the bind site for the CCO path; src/shmem/init.cpp binds the shmem
@@ -521,11 +564,12 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // per-node ranks can land on the two SMT siblings of one core and both run at
   // half speed. Requires the caller to have
   // hipSetDevice()'d, the same contract step 2 below relies on when it caches
-  // comm->hipDev. MORI_IGNORE_CPU_AFFINITY=1 disables.
-  application::BindCallingThreadToGpuNumaOnce();
+  // comm->hipDev. config.cpuAffinity=0 or MORI_IGNORE_CPU_AFFINITY=1 disables.
+  if (config.cpuAffinity) application::BindCallingThreadToGpuNumaOnce();
 
   auto* comm = new ccoComm();
   *outComm = comm;
+  comm->lsaOnly = config.lsaOnly != 0;
 
   // Step 1: bootstrap
   comm->bootNet = bootNet;
@@ -544,8 +588,23 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   MORI_SHMEM_TRACE("ccoCommCreate: rank={} worldSize={} groupId={}", comm->rank, comm->worldSize,
                    comm->groupId);
 
-  // Step 2: context (RDMA endpoints + transport-type negotiation).
-  comm->ctx = new application::Context(*comm->bootNet);
+  // lsaOnly decides which collectives later calls run, so all ranks must agree.
+  {
+    int mine = comm->lsaOnly ? 1 : 0;
+    std::vector<int> all(comm->worldSize);
+    comm->bootNet->Allgather(&mine, all.data(), sizeof(int));
+    const int nLsaOnly = static_cast<int>(std::count(all.begin(), all.end(), 1));
+    if (nLsaOnly != 0 && nLsaOnly != comm->worldSize) {
+      MORI_SHMEM_ERROR("ccoCommCreate: lsaOnly set on {}/{} ranks — must match on all ranks",
+                       nLsaOnly, comm->worldSize);
+      return CcoCommCreateFail(comm, outComm);
+    }
+  }
+
+  // Step 2: context (RDMA endpoints + transport-type negotiation); lsaOnly opens no NIC.
+  application::ContextOptions ctxOpts;
+  ctxOpts.rdma = !comm->lsaOnly;
+  comm->ctx = new application::Context(*comm->bootNet, ctxOpts);
   comm->defaultNumQpPerPe = comm->ctx->GetNumQpPerPe();
 
   // Cache the bound device once (used by topology detection below and later by
@@ -589,11 +648,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
           "ccoCommCreate: MORI_VPOD_ID set on {}/{} ranks — manual vPOD grouping must "
           "be all-or-none across the job.",
           manualCnt, comm->worldSize);
-      delete comm->ctx;
-      comm->bootNet->Finalize();
-      delete comm;
-      *outComm = nullptr;
-      return -1;
+      return CcoCommCreateFail(comm, outComm);
     }
     vpodMode = true;
   } else if (fabricCnt == comm->worldSize) {
@@ -630,11 +685,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
           "launch (mpirun -host A:N,B:N or equivalent), or align MORI_VPOD_ID "
           "with contiguous rank blocks.",
           comm->rank, firstInTeam, lastInTeam, lsaCount);
-      delete comm->ctx;
-      comm->bootNet->Finalize();
-      delete comm;
-      *outComm = nullptr;
-      return -1;
+      return CcoCommCreateFail(comm, outComm);
     }
 
     std::vector<int> allLsaSizes(comm->worldSize);
@@ -646,11 +697,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
             "(my rank {} sees lsaSize={}, rank {} sees lsaSize={}). "
             "CCO requires uniform LSA-team size across all ranks.",
             comm->rank, lsaCount, r, allLsaSizes[r]);
-        delete comm->ctx;
-        comm->bootNet->Finalize();
-        delete comm;
-        *outComm = nullptr;
-        return -1;
+        return CcoCommCreateFail(comm, outComm);
       }
     }
 
@@ -738,11 +785,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
           "handle support is unavailable — cannot map peer VAs across nodes. Fix the "
           "fabric/driver, or scope MORI_VPOD_ID to a single host.",
           comm->lsaSize);
-      delete comm->ctx;
-      comm->bootNet->Finalize();
-      delete comm;
-      *outComm = nullptr;
-      return -1;
+      return CcoCommCreateFail(comm, outComm);
     }
     comm->fabricCrossNodeLsa = true;
     MORI_SHMEM_INFO("ccoCommCreate: cross-node vPOD LSA enabled (lsaSize={} spans hosts)",
@@ -787,7 +830,8 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // QP state.
 
   // Every peer is LSA-mapped on a single node, so windows need no MR until a FULL DevComm.
-  comm->windowMrsEnabled = comm->lsaSize < comm->worldSize;
+  // An lsaOnly comm has no NIC to register them with.
+  comm->windowMrsEnabled = !comm->lsaOnly && comm->lsaSize < comm->worldSize;
 
   MORI_SHMEM_INFO(
       "ccoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
@@ -1725,6 +1769,15 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   if (reqs->version > CCO_API_VERSION) {
     MORI_SHMEM_WARN("ccoDevCommCreate: reqs->version={} > runtime CCO_API_VERSION={}",
                     reqs->version, CCO_API_VERSION);
+  }
+  // lsaOnly has no NIC: FULL always needs QPs, CROSSNODE/RAIL only across LSA teams.
+  if (comm->lsaOnly && reqs->gdaConnectionType != CCO_GDA_CONNECTION_NONE &&
+      (reqs->gdaConnectionType == CCO_GDA_CONNECTION_FULL || comm->lsaSize < comm->worldSize)) {
+    MORI_SHMEM_ERROR(
+        "ccoDevCommCreate: gdaConnectionType {} needs RDMA, which an lsaOnly comm does not open "
+        "(lsaSize={} worldSize={})",
+        static_cast<int>(reqs->gdaConnectionType), comm->lsaSize, comm->worldSize);
+    return -1;
   }
 
   // Resolve connection type. CROSSNODE collapses to NONE on single-node

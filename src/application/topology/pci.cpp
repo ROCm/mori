@@ -41,6 +41,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "mori/utils/mori_log.hpp"
+
 namespace mori {
 namespace application {
 
@@ -141,6 +143,12 @@ bool IsUnderRootComplex(const SysfsPciDev& dev) {
   strcpy(parent, dirname(link));
   const char* last = basename(parent);
   return strncmp(last, "pci", 3) == 0;
+}
+
+// A bridge forwards [secondary, subordinate] only when that range sits below its own bus. An
+// unprogrammed bridge (e.g. a Pensando port reading 00/00/00) forwards nothing.
+bool ForwardsBuses(const SysfsPciDev& dev) {
+  return dev.secondaryBus > dev.bus && dev.subordinateBus >= dev.secondaryBus;
 }
 
 }  // namespace
@@ -338,7 +346,7 @@ bool TopoPathPci::CrossMultipleNuma() const {
 
 TopoSystemPci::TopoSystemPci() : pathCache() {
   Load();
-  Validate();
+  valid = Validate();
 }
 
 TopoSystemPci::~TopoSystemPci() {}
@@ -382,20 +390,25 @@ void TopoSystemPci::Load() {
     domains.insert(dev.domain);
     pcis.emplace(node->BusId().packed, node);
 
-    if (dev.headerType == kHeaderTypeBridge) {
-      // Use a wider counter than the bus numbers themselves: a bridge may report
-      // a subordinate bus of 0xff (e.g. empty downstream ports on some NICs), and
-      // a uint8_t loop variable would wrap from 0xff back to 0 and spin forever.
-      uint32_t secondary = dev.secondaryBus;
-      uint32_t subordinate = dev.subordinateBus;
-      for (uint32_t i = secondary; i <= subordinate; i++) {
-        uint64_t dspBusId = PciBusId(dev.domain, i, 0, 0).packed;
-        if (dsp2dev.find(dspBusId) != dsp2dev.end()) {
-          const SysfsPciDev* lastDev = dsp2dev[dspBusId];
-          if (dev.primaryBus < lastDev->primaryBus) continue;
+    if (dev.headerType == kHeaderTypeBridge && node->Type() == TopoNodePciType::Bridge) {
+      if (!ForwardsBuses(dev)) {
+        MORI_APP_DEBUG(
+            "PCI topology: bridge {} forwards no buses (pri {:02x} sec {:02x} sub {:02x})",
+            dev.BusId().String(), static_cast<int>(dev.primaryBus),
+            static_cast<int>(dev.secondaryBus), static_cast<int>(dev.subordinateBus));
+      } else {
+        // Use a wider counter than the bus numbers themselves: a bridge may report
+        // a subordinate bus of 0xff (e.g. empty downstream ports on some NICs), and
+        // a uint8_t loop variable would wrap from 0xff back to 0 and spin forever.
+        uint32_t secondary = dev.secondaryBus;
+        uint32_t subordinate = dev.subordinateBus;
+        for (uint32_t i = secondary; i <= subordinate; i++) {
+          uint64_t dspBusId = PciBusId(dev.domain, i, 0, 0).packed;
+          // Nested ranges: the deepest bridge, i.e. the one on the highest bus, is the parent.
+          auto prev = dsp2dev.find(dspBusId);
+          if (prev != dsp2dev.end() && prev->second->bus > dev.bus) continue;
+          dsp2dev[dspBusId] = &dev;
         }
-        dsp2dev[dspBusId] = &dev;
-        assert(dev.bus == dev.primaryBus);
       }
     }
 
@@ -427,27 +440,35 @@ void TopoSystemPci::Load() {
       continue;
 
     uint64_t parentDsp = PciBusId(busId.Domain(), busId.Bus(), 0, 0).packed;
-    uint64_t parentBus = 0;
-    if (dsp2dev.find(parentDsp) == dsp2dev.end()) {
-      assert(IsUnderRootComplex(*bus2dev[busId.packed]));
-      parentBus = PciBusId(busId.Domain(), 0, 0, 0).packed;
-    } else {
-      parentBus = dsp2dev[parentDsp]->BusId().packed;
+    uint64_t parentBus = PciBusId(busId.Domain(), 0, 0, 0).packed;
+    auto dsp = dsp2dev.find(parentDsp);
+    if (dsp != dsp2dev.end()) {
+      parentBus = dsp->second->BusId().packed;
+    } else if (!IsUnderRootComplex(*bus2dev[busId.packed])) {
+      MORI_APP_DEBUG(
+          "PCI topology: no scanned bridge forwards to {}; placing it under its domain root",
+          busId.String());
     }
 
     // Prevent loopback to self, this could happen in SR-IOV mode where all devices directly connect
     // to root complex
     if (parentBus == node->BusId().packed) continue;
 
-    assert(pcis.find(parentBus) != pcis.end());
-    TopoNodePci* parent = pcis[parentBus].get();
+    auto parentIt = pcis.find(parentBus);
+    TopoNodePci* parent = parentIt == pcis.end() ? root : parentIt->second.get();
+    // Endpoints take no children; hang the node off the virtual root instead.
+    if (parent->Type() == TopoNodePciType::Gpu || parent->Type() == TopoNodePciType::Net) {
+      MORI_APP_WARN("PCI topology: endpoint {} would parent {}; placing it under the root",
+                    parent->BusId().String(), busId.String());
+      parent = root;
+    }
 
     node->SetUpstreamPort(parent);
     parent->AddDownstreamPort(node);
   }
 }
 
-void TopoSystemPci::Validate() {
+bool TopoSystemPci::Validate() {
   std::unordered_set<uint64_t> seen;
 
   // Make sure every node can be reached from root and no cycles
@@ -455,27 +476,25 @@ void TopoSystemPci::Validate() {
   nodes.push(root);
 
   while (!nodes.empty()) {
-    size_t nnodes = nodes.size();
-
-    while (nnodes > 0) {
-      TopoNodePci* cur = nodes.front();
-      nodes.pop();
-
-      assert(seen.find(cur->BusId().packed) == seen.end());
-      seen.insert(cur->BusId().packed);
-
-      for (auto* child : cur->DownstreamPort()) {
-        nodes.push(child);
-      }
-
-      nnodes--;
+    TopoNodePci* cur = nodes.front();
+    nodes.pop();
+    if (!seen.insert(cur->BusId().packed).second) {
+      MORI_APP_WARN("PCI topology: {} is reached twice from the root", cur->BusId().String());
+      return false;
     }
+    for (auto* child : cur->DownstreamPort()) nodes.push(child);
   }
 
-  assert(seen.size() == pcis.size());
+  if (seen.size() != pcis.size()) {
+    MORI_APP_WARN("PCI topology: {} of {} nodes are not reachable from the root",
+                  pcis.size() - seen.size(), pcis.size());
+    return false;
+  }
+  return true;
 }
 
 TopoPathPci* TopoSystemPci::Path(PciBusId head, PciBusId tail) {
+  if (!valid) return nullptr;
   if (pcis.find(head.packed) == pcis.end()) return nullptr;
   if (pcis.find(tail.packed) == pcis.end()) return nullptr;
 

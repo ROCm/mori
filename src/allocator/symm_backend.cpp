@@ -937,8 +937,13 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     group->rank = rank;
     group->world_size = world_size;
     group->epoch = ids[0].epoch;
+    // Keep the caller's CPU affinity; load/store peers need no NIC or GPU-NIC topology.
+    mori::cco::ccoCommConfig config = CCO_COMM_CONFIG_INITIALIZER;
+    config.cpuAffinity = 0;
+    config.lsaOnly = 1;
     MORI_CCO_CHECK(mori::cco::ccoCommCreate(ids[0].uid, world_size, rank,
-                                            PerRankVa(device_mem, lsa_bound), &group->comm));
+                                            PerRankVa(device_mem, lsa_bound), &config,
+                                            &group->comm));
     g_live_comms.fetch_add(1);
     // ccoCommCreate leaves a tolerated probe failure latched in HIP's per-thread
     // sticky slot. torch checks that slot around every launch, so without this the

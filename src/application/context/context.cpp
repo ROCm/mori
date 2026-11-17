@@ -48,7 +48,8 @@
 namespace mori {
 namespace application {
 
-Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
+Context::Context(BootstrapNetwork& bootNet, const ContextOptions& opts)
+    : bootNet(bootNet), rdmaEnabled(opts.rdma) {
   // Snapshot env vars once at construction. Every subsequent decision (transport
   // selection, hipMalloc vs hipExtMallocWithFlags(uncached), etc.) must read
   // from this cached state, not getenv. Otherwise late env mutations -- e.g.
@@ -287,10 +288,7 @@ bool Context::RailOnlyEligible() const {
 // / Context::IsP2PDisabled() instead of getenv anywhere outside the
 // constructor.
 
-void Context::InitializeTopologyAndTransports() {
-  // Local rank within this host. Already derived in CollectHostNames from the
-  // exchanged nodeId ordering (seenPerNode), so reuse it instead of recounting.
-  int rankInNode = peerInfos[LocalRank()].rankInNode;
+int Context::SelectRdmaDevice(int rankInNode) {
   assert(rankInNode < 8);
 
   // Init rdma context — proxy uses vendor-agnostic IBVerbs, IBGDA uses DirectVerbs
@@ -313,34 +311,40 @@ void Context::InitializeTopologyAndTransports() {
   }
 
   // Match gpu and nic
-  bool disableTopo = env::IsEnvVarEnabled("MORI_DISABLE_TOPO");
+  bool staticMatch = env::IsEnvVarEnabled("MORI_DISABLE_TOPO");
   int portId = -1;
   int devicePortId = -1;
   RdmaDevice* device = nullptr;
 
-  if (disableTopo) {
+  if (staticMatch) {
     std::cout << "MORI Topology detection is disabled, use static matching" << std::endl;
-    if (!activeDevicePortList.empty()) {
-      devicePortId = (rankInNode % activeDevicePortList.size());
-      std::tie(device, portId) = activeDevicePortList[devicePortId];
-      rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
-    }
   } else {
     int deviceId = -1;
     HIP_RUNTIME_CHECK(hipGetDevice(&deviceId));
     topo.reset(new TopoSystem());
-    std::string nicName = topo->MatchGpuAndNic(deviceId);
-    MORI_APP_TRACE("rank {} rankInNode {} matched nic {} for gpu {}", LocalRank(), rankInNode,
-                   nicName, deviceId);
-    for (int i = 0; i < activeDevicePortList.size(); i++) {
-      auto& dp = activeDevicePortList[i];
-      if (dp.first->Name() != nicName) continue;
-      device = dp.first;
-      portId = activeDevicePortList[i].second;
-      rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
-      devicePortId = i;
-      break;
+    if (!topo->GetTopoSystemPci()->Valid()) {
+      MORI_APP_WARN("rank {}: PCI topology is inconsistent; matching NICs statically", LocalRank());
+      staticMatch = true;
+    } else {
+      std::string nicName = topo->MatchGpuAndNic(deviceId);
+      MORI_APP_TRACE("rank {} rankInNode {} matched nic {} for gpu {}", LocalRank(), rankInNode,
+                     nicName, deviceId);
+      for (int i = 0; i < activeDevicePortList.size(); i++) {
+        auto& dp = activeDevicePortList[i];
+        if (dp.first->Name() != nicName) continue;
+        device = dp.first;
+        portId = activeDevicePortList[i].second;
+        rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
+        devicePortId = i;
+        break;
+      }
     }
+  }
+
+  if (staticMatch && !activeDevicePortList.empty()) {
+    devicePortId = (rankInNode % activeDevicePortList.size());
+    std::tie(device, portId) = activeDevicePortList[devicePortId];
+    rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
   }
 
   if (device == nullptr) {
@@ -364,6 +368,21 @@ void Context::InitializeTopologyAndTransports() {
     }
     MORI_APP_INFO("rank {} allRdmaDeviceContexts size: {}", LocalRank(),
                   allRdmaDeviceContexts.size());
+  }
+  return portId;
+}
+
+void Context::InitializeTopologyAndTransports() {
+  // Local rank within this host. Already derived in CollectHostNames from the
+  // exchanged nodeId ordering (seenPerNode), so reuse it instead of recounting.
+  int rankInNode = peerInfos[LocalRank()].rankInNode;
+
+  int portId = -1;
+  if (rdmaEnabled) {
+    portId = SelectRdmaDevice(rankInNode);
+  } else {
+    MORI_APP_INFO("rank {} rankInNode {} RDMA off for this context; no NIC opened", LocalRank(),
+                  rankInNode);
   }
 
   int numQpPerPe = 4;

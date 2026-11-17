@@ -55,6 +55,13 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
     cdef struct ccoUniqueId:
         char internal[128]
 
+    cdef struct ccoCommConfig:
+        size_t size
+        uint32_t magic
+        uint32_t version
+        int cpuAffinity
+        int lsaOnly
+
     cdef struct ccoDevResourceRequirements:
         pass
 
@@ -119,6 +126,9 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
     int ccoGetUniqueId(ccoUniqueId* uniqueId) nogil
     int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank,
                       size_t perRankVmmSize, ccoComm** outComm) nogil
+    int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank,
+                      size_t perRankVmmSize, const ccoCommConfig* config,
+                      ccoComm** outComm) nogil
     int ccoCommDestroy(ccoComm* comm) nogil
     int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) nogil
     int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) nogil

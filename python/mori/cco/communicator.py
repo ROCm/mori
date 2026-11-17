@@ -378,11 +378,24 @@ class Communicator:
         rank: int,
         unique_id: UniqueId,
         per_rank_vmm: int = DEFAULT_PER_RANK_VMM,
+        cpu_affinity: bool = True,
+        lsa_only: bool = False,
     ) -> Communicator:
-        """Collective: create a CCO communicator."""
+        """Collective: create a CCO communicator.
+
+        cpu_affinity=False leaves the calling thread's CPU affinity alone.
+        lsa_only=True opens no RDMA device; only LSA-team peers are reachable.
+        """
         comm = cls()
         uid = unique_id.ptr if isinstance(unique_id, UniqueId) else unique_id
-        comm._raw = _cco.comm_create(uid, nranks, rank, per_rank_vmm)
+        comm._raw = _cco.comm_create(
+            uid,
+            nranks,
+            rank,
+            per_rank_vmm,
+            cpu_affinity=cpu_affinity,
+            lsa_only=lsa_only,
+        )
         comm._rank = rank
         comm._nranks = nranks
         return comm

@@ -63,8 +63,11 @@ def _run(rank, world_size, port):
         t.fill_(float(rank + 1))
         torch.cuda.synchronize()
 
+        cpus = os.sched_getaffinity(0)
         hdl = symm_mem.rendezvous(t, group_name)
         assert hdl.world_size == world_size and hdl.rank == rank
+        # The backend's comm must leave the caller's CPU affinity alone.
+        assert os.sched_getaffinity(0) == cpus, "rendezvous rebound the calling thread"
 
         # Peers come back the torch way, as one base address per rank; this rank's own
         # entry is the tensor itself rather than cco's alias of it.

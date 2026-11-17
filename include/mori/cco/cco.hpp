@@ -875,6 +875,8 @@ struct ccoComm {
   bool iovaZeroMode{true};
   // Whether windows carry an RDMA MR. Off on a single-node comm until a FULL DevComm needs one.
   bool windowMrsEnabled{false};
+  // Created with ccoCommConfig::lsaOnly: ctx has no RDMA device.
+  bool lsaOnly{false};
 
   // Handle type for VMM allocations. Fabric (0x8) when the runtime supports it
   // (probed at CommCreate); falls back to PosixFileDescriptor (0x1).
@@ -954,9 +956,47 @@ struct ccoUniqueId {
   char internal[128];
 };
 
+// Per-comm options. Start from the INITIALIZER and override fields:
+//
+//   ccoCommConfig config = CCO_COMM_CONFIG_INITIALIZER;
+//   config.cpuAffinity = 0;
+//   config.lsaOnly = 1;
+//   ccoCommCreate(id, nRanks, rank, vmm, &config, &comm);
+//
+// {size, magic, version} work as in ccoDevCommRequirements: fields past an older
+// caller's `size` keep their INITIALIZER defaults.
+struct ccoCommConfig {
+  // Forward-compat triplet (set by INITIALIZER, do not touch).
+  size_t size;
+  uint32_t magic;
+  uint32_t version;
+
+  // 1: pin the calling thread to its GPU's NUMA-local CPU slice (once per thread;
+  // MORI_IGNORE_CPU_AFFINITY=1 also turns it off). 0: leave the caller's affinity alone.
+  int cpuAffinity;
+
+  // 1: open no RDMA device and read no GPU-NIC topology. Only LSA-team peers are
+  // reachable; a DevComm that needs GDA QPs fails (FULL always, CROSSNODE/RAIL when
+  // ranks span LSA teams). Must match on all ranks.
+  int lsaOnly;
+};
+
+#define CCO_COMM_CONFIG_INITIALIZER       \
+  {                                       \
+      sizeof(::mori::cco::ccoCommConfig), \
+      ::mori::cco::CCO_API_MAGIC,         \
+      ::mori::cco::CCO_API_VERSION,       \
+      1, /* cpuAffinity */                \
+      0, /* lsaOnly     */                \
+  }
+
 int ccoGetUniqueId(ccoUniqueId* uniqueId);
+// Same as the config overload with config == NULL (all defaults).
 int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
                   ccoComm** comm);
+// config may be NULL (all defaults); a non-NULL config must carry the INITIALIZER's magic.
+int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
+                  const ccoCommConfig* config, ccoComm** comm);
 int ccoCommDestroy(ccoComm* comm);
 
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──
