@@ -1087,7 +1087,21 @@ def _torch_symm_extension():
                 "BUILD_TORCH_SYMM=ON but torch is not importable at build time"
             )
         return []
-    rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    import importlib.util
+
+    import torch
+    from torch.utils import cpp_extension
+
+    # Shared with the JIT loader; loaded by path because mori is not installed yet.
+    spec = importlib.util.spec_from_file_location(
+        "_mori_symm_build", _root_dir / "python" / "mori" / "allocator" / "_build.py"
+    )
+    symm_build = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(symm_build)
+    rocm = symm_build.rocm_home(cpp_extension)
+    # By file: records the SONAME of the HIP runtime torch uses.
+    hip = symm_build.hip_runtime_library(rocm)
+    fingerprint = symm_build.torch_fingerprint(torch)
     # Absolute: torch's ninja compiler writes its build file into build_temp and runs
     # ninja from there, so a relative -I would resolve against the wrong directory.
     ext = _TorchCppExtension(
@@ -1096,8 +1110,12 @@ def _torch_symm_extension():
         include_dirs=[str(_root_dir.resolve() / "include"), f"{rocm}/include"],
         # libmori_cco is the peer-exchange half of the backend; it lands next to this
         # module in the package, hence the $ORIGIN runpath.
-        library_dirs=[f"{rocm}/lib", str(_root_dir.resolve() / "python" / "mori")],
-        libraries=["amdhip64", "c10_hip", "torch_hip", "mori_cco"],
+        library_dirs=([] if hip else [f"{rocm}/lib"])
+        + [str(_root_dir.resolve() / "python" / "mori")],
+        libraries=([] if hip else ["amdhip64"]) + ["c10_hip", "torch_hip", "mori_cco"],
+        extra_link_args=[hip] if hip else [],
+        # The loader refuses this module under any other torch build.
+        define_macros=[("MORI_TORCH_FINGERPRINT", fingerprint)],
         runtime_library_dirs=["$ORIGIN"],
         # No -std here: torch's BuildExtension adds the standard its headers need.
     )

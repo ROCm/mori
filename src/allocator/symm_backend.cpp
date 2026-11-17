@@ -76,6 +76,13 @@
   (TORCH_VERSION_MAJOR > (major) ||       \
    (TORCH_VERSION_MAJOR == (major) && TORCH_VERSION_MINOR >= (minor)))
 
+// The torch build this module was compiled against; the loader refuses a mismatch.
+#ifndef MORI_TORCH_FINGERPRINT
+#define MORI_TORCH_FINGERPRINT unknown
+#endif
+#define MORI_STR_IMPL(x) #x
+#define MORI_STR(x) MORI_STR_IMPL(x)
+
 namespace mori {
 namespace allocator {
 namespace {
@@ -722,9 +729,7 @@ std::string HandleTypeName(int dev) {
   return ProbeHandleType(dev) == hipMemHandleTypeFabricCompat ? "fabric" : "posix_fd";
 }
 
-}  // namespace
-
-// Idempotent.
+// Idempotent; not run at import, so a module built for another torch never registers.
 void RegisterTorchSymmBackend() {
   static bool registered = [] {
     c10d::symmetric_memory::register_availability("MORI", AllocatorSingleton());
@@ -733,14 +738,13 @@ void RegisterTorchSymmBackend() {
   (void)registered;
 }
 
+}  // namespace
 }  // namespace allocator
 }  // namespace mori
 
-// Importing the extension registers the backend.
 namespace py = pybind11;
 
 PYBIND11_MODULE(mori_torch_symm, m) {
-  mori::allocator::RegisterTorchSymmBackend();
   m.def("register_backend", &mori::allocator::RegisterTorchSymmBackend,
         "Register the MORI symmetric memory backend with torch (idempotent)");
   m.def("shutdown", &mori::allocator::Shutdown,
@@ -748,6 +752,7 @@ PYBIND11_MODULE(mori_torch_symm, m) {
   m.def("handle_type", &mori::allocator::HandleTypeName,
         "'fabric' or 'posix_fd' -- what this device can export");
   m.attr("backend_name") = "MORI";
+  m.attr("torch_fingerprint") = MORI_STR(MORI_TORCH_FINGERPRINT);
   // Whether the window carries torch's signal pad. False by default, and then anything
   // that synchronises on the device -- barrier(), put/wait_signal(), and torch's own
   // symm_mem collectives, which barrier internally -- raises instead.

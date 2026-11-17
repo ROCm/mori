@@ -20,12 +20,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import gc
+import importlib.machinery
+import logging
+import os
+import sys
+import types
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 import torch.multiprocessing as mp
+import mori.allocator as mori_allocator
 from mori.allocator import (  # importing registers "MORI"
     handle_type,
     signal_pad_supported,
@@ -178,3 +184,64 @@ def test_symm_release():
     world_size = 4
     port = get_free_port()
     mp.spawn(_run_release, args=(world_size, port), nprocs=world_size, join=True)
+
+
+def test_torch_fingerprint_tracks_build():
+    from mori.allocator._build import torch_fingerprint
+
+    def fake(version, git, hip="7.14", abi=True):
+        return types.SimpleNamespace(
+            __version__=version,
+            version=types.SimpleNamespace(git_version=git, hip=hip),
+            _C=types.SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=abi),
+        )
+
+    base = torch_fingerprint(fake("2.16.0", "a"))
+    assert base == torch_fingerprint(fake("2.16.0", "a"))
+    assert base != torch_fingerprint(fake("2.16.0", "b"))
+    assert base != torch_fingerprint(fake("2.15.0", "a"))
+    assert base != torch_fingerprint(fake("2.16.0", "a", hip="10.0"))
+    assert base.isalnum()
+
+
+def test_build_links_loaded_hip_runtime(tmp_path, monkeypatch):
+    from mori.allocator._build import hip_runtime_library, rocm_home
+
+    lib = hip_runtime_library("/nonexistent")
+    assert lib is not None and os.path.basename(lib).startswith("libamdhip64.so")
+
+    # A ROCM_HOME without HIP headers (a venv's hipcc wrapper) falls through.
+    good = tmp_path / "rocm"
+    (good / "include" / "hip").mkdir(parents=True)
+    (good / "include" / "hip" / "hip_runtime_api.h").touch()
+    monkeypatch.setenv("ROCM_PATH", str(good))
+    assert rocm_home(types.SimpleNamespace(ROCM_HOME=str(tmp_path))) == str(good)
+
+
+def test_prebuilt_for_other_torch_is_refused(monkeypatch, caplog):
+    import mori
+
+    fake = types.ModuleType("mori.mori_torch_symm")
+    fake.__spec__ = importlib.machinery.ModuleSpec("mori.mori_torch_symm", None)
+    fake.torch_fingerprint = "0123456789abcdef"
+    monkeypatch.setitem(sys.modules, "mori.mori_torch_symm", fake)
+    monkeypatch.setattr(mori, "mori_torch_symm", fake, raising=False)
+    with caplog.at_level(logging.INFO, logger="mori.allocator"):
+        ext, reason = mori_allocator._prebuilt_ext("fedcba9876543210")
+    assert ext is None and "another torch build" in str(reason)
+    assert any("another torch build" in r.getMessage() for r in caplog.records)
+    ext, reason = mori_allocator._prebuilt_ext("0123456789abcdef")
+    assert ext is fake and reason is None
+
+
+def test_registration_failure_warns(monkeypatch, caplog):
+    def broken():
+        raise ImportError("no compiler")
+
+    monkeypatch.setattr(mori_allocator, "_ext", broken)
+    with caplog.at_level(logging.WARNING, logger="mori.allocator"):
+        mori_allocator._register_on_import()
+    assert any(
+        r.levelno == logging.WARNING and "no compiler" in r.getMessage()
+        for r in caplog.records
+    )
