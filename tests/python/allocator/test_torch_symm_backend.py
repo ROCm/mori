@@ -135,11 +135,12 @@ def _run_release(rank, world_size, port):
 
         mib = 1 << 20
         rounds = 4
+        size = 16 * mib
         # Same ranks, second communicator: each group imports the allocation separately.
         groups = [group_name, dist.new_group(list(range(world_size))).group_name]
 
         def cycle(ngroups):
-            t = symm_mem.empty(16 * mib // 4, dtype=torch.float32, device=device)
+            t = symm_mem.empty(size // 4, dtype=torch.float32, device=device)
             hdls = [symm_mem.rendezvous(t, g) for g in groups[:ngroups]]
             assert all(h.world_size == world_size for h in hdls)
             dist.barrier()
@@ -148,11 +149,28 @@ def _run_release(rank, world_size, port):
             torch.cuda.synchronize()
             dist.barrier()
 
-        def measure(ngroups):
-            cycle(ngroups)  # first cycle also pays any one-off context growth
+        def cycle_tensor_first(_):
+            # torch frees the tensor under a live handle: the handle keeps the memory.
+            t = symm_mem.empty(size // 4, dtype=torch.float32, device=device)
+            t.fill_(float(rank + 1))
+            hdl = symm_mem.rendezvous(t, group_name)
+            dist.barrier()
+            del t
+            gc.collect()
+            for pe in range(world_size):
+                got = hdl.get_buffer(pe, (4,), torch.float32)[0].item()
+                assert got == pe + 1, f"[rank {rank}] peer {pe} reads {got} after free"
+            dist.barrier()
+            del hdl
+            gc.collect()
+            torch.cuda.synchronize()
+            dist.barrier()
+
+        def measure(ngroups, fn=cycle):
+            fn(ngroups)  # first cycle also pays any one-off context growth
             settled = torch.cuda.mem_get_info(device)[0]
             for _ in range(rounds):
-                cycle(ngroups)
+                fn(ngroups)
             return settled - torch.cuda.mem_get_info(device)[0]
 
         # The control isolates who is at fault. Plain alloc/free exercises only
@@ -162,19 +180,24 @@ def _run_release(rank, world_size, port):
         plain = measure(0)
         shared = measure(1)
         two = measure(2)
+        held = measure(1, cycle_tensor_first)
 
         # mem_get_info is device-wide, so anything else sharing the GPU moves it too.
         # Leaking would cost rounds * 16 MiB; half of one window is a wide enough margin
         # to stay clear of that noise while still failing loudly on a real leak.
         report = (
             f"[rank {rank}] hip={torch.version.hip} world={world_size} "
-            f"lost over {rounds} x 16 MiB cycles: alloc/free only={plain / mib:.1f} MiB, "
-            f"with rendezvous={shared / mib:.1f} MiB, with two groups={two / mib:.1f} MiB"
+            f"lost over {rounds} x {size // mib} MiB cycles: "
+            f"alloc/free only={plain / mib:.1f} MiB, "
+            f"with rendezvous={shared / mib:.1f} MiB, with two groups={two / mib:.1f} MiB, "
+            f"tensor freed before its handle={held / mib:.1f} MiB"
         )
         print(report, flush=True)
-        assert plain < 8 * mib, f"plain alloc/free leaks, before any sharing. {report}"
-        assert shared < 8 * mib, f"the rendezvous'd window leaks. {report}"
-        assert two < 8 * mib, f"a second group's import leaks. {report}"
+        half = size // 2
+        assert plain < half, f"plain alloc/free leaks, before any sharing. {report}"
+        assert shared < half, f"the rendezvous'd window leaks. {report}"
+        assert two < half, f"a second group's import leaks. {report}"
+        assert held < half, f"a handle outliving its tensor leaks. {report}"
 
 
 def _run_contract(rank, world_size, port):

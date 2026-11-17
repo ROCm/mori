@@ -398,8 +398,11 @@ struct CcoGroup {
 
 void SweepDeadGroups() noexcept;
 
+struct Block;
+
 // One (allocation, group) rendezvous: windows, own signal pad, peer tables; shared by its handles.
 struct PeerAlloc {
+  std::shared_ptr<Block> block;     // this rank's own mapping, released after the windows
   std::shared_ptr<CcoGroup> group;  // keeps the communicator alive for these windows
   ccoWindow_t win{};
   void* alias = nullptr;  // cco's flat-VA alias of the tensor, what ccoMemFree takes
@@ -488,6 +491,21 @@ struct Block {
   std::optional<std::string> default_group_name;
   // Group name -> its rendezvous of this block. Guarded by the allocator's mutex.
   std::unordered_map<std::string, std::shared_ptr<PeerAlloc>> peers;
+
+  // Unmaps this rank's view and drops the allocation, once. Handles hold the block, so a
+  // tensor freed under a live handle keeps its memory until the last handle goes.
+  void Release() noexcept {
+    if (ptr == nullptr) return;
+    void* p = std::exchange(ptr, nullptr);
+    if (!RuntimeUsable()) return;  // leak rather than crash on the way out
+    DeviceGuard guard(device_idx);
+    // Unmapping a range a kernel is still writing is a page fault, not a stale read.
+    (void)hipDeviceSynchronize();
+    (void)hipMemUnmap(p, alloc_size);
+    (void)hipMemAddressFree(p, alloc_size);
+    (void)hipMemRelease(handle);
+  }
+  ~Block() { Release(); }
 };
 
 // No 'override' on has_allocation (virtual from 2.12), get_group_name (2.16) and
@@ -693,30 +711,25 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     return ptr;
   }
 
-  // Teardown order for free() and Shutdown(): our mapping first, then each group's window.
-  static void ReleaseBlock(Block& block) {
-    (void)hipMemUnmap(block.ptr, block.alloc_size);
-    (void)hipMemAddressFree(block.ptr, block.alloc_size);
-    (void)hipMemRelease(block.handle);
-    block.peers.clear();
-  }
-
+  // Live handles keep the memory, as torch's backends do: the last of tensor and handles frees it.
   void free(void* ptr) override {
     std::shared_ptr<Block> block;
+    std::unordered_map<std::string, std::shared_ptr<PeerAlloc>> peers;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       auto it = blocks_.find(reinterpret_cast<uintptr_t>(ptr));
       if (it == blocks_.end()) return;
       block = std::move(it->second);
       blocks_.erase(it);
+      peers.swap(block->peers);
+      held_.erase(std::remove_if(held_.begin(), held_.end(),
+                                 [](const std::weak_ptr<Block>& b) { return b.expired(); }),
+                  held_.end());
+      held_.push_back(block);  // for Shutdown(), should a handle outlive this call
     }
-    if (!RuntimeUsable()) return;
-    // Unmapping a range a kernel is still writing is a page fault, not a stale read, and
-    // torch's contract lets a symmetric tensor die with work outstanding. Sync here
-    // rather than in the window's destructor, which a never-rendezvous'd block has none of.
-    DeviceGuard guard(block->device_idx);
-    (void)hipDeviceSynchronize();
-    ReleaseBlock(*block);
+    // Torch's contract lets a symmetric tensor die with work outstanding; each release syncs.
+    peers.clear();
+    block.reset();
     SweepDeadGroups();
   }
 
@@ -756,6 +769,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       }
     }
     auto peer = FirstRendezvous(*block, name);
+    peer->block = block;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       block->peers.emplace(name, peer);
@@ -773,16 +787,21 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
   void Shutdown() {
     std::map<uintptr_t, std::shared_ptr<Block>> blocks;
     std::map<GroupKey, std::shared_ptr<CcoGroup>> groups;
+    std::vector<std::weak_ptr<Block>> held;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       blocks.swap(blocks_);
       groups.swap(groups_);
+      held.swap(held_);
     }
     if (!RuntimeUsable()) return;
+    // Our mapping first, then each group's window; freed tensors a handle still holds too.
     for (auto& [addr, block] : blocks) {
-      DeviceGuard guard(block->device_idx);
-      (void)hipDeviceSynchronize();
-      ReleaseBlock(*block);
+      block->Release();
+      block->peers.clear();
+    }
+    for (auto& weak : held) {
+      if (auto block = weak.lock()) block->Release();
     }
   }
 
@@ -1111,6 +1130,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
 
   std::mutex mutex_;
   std::map<uintptr_t, std::shared_ptr<Block>> blocks_;  // ordered for covering lookups
+  std::vector<std::weak_ptr<Block>> held_;              // freed by torch, still held by a handle
   std::map<GroupKey, std::shared_ptr<CcoGroup>> groups_;
   StoreExchange store_exchange_{"mori_symm_backend"};
 };
