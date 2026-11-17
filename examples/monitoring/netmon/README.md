@@ -6,13 +6,16 @@ VictoriaMetrics + Grafana with two dashboards for recordings made by
 - **netmon overview**: one experiment, every node and NIC. A table of the NICs (host, RDMA
   device name such as `ionic_0 (benic1p1)`, link rate, average send and receive over the
   selected time; click a NIC to open its detail page) and one small RDMA traffic chart per NIC.
-- **netmon NIC detail**: one NIC: RDMA traffic, all port traffic, retransmissions and
-  congestion notifications. Collapsed at the bottom: individual observations, PFC pause
+- **netmon NIC detail**: RDMA traffic, all port traffic, retransmissions and congestion
+  notifications of one NIC, of several, or of all of them (Host and NIC offer "All"). Every
+  chart is drawn once per selected NIC: the traffic charts side by side, the congestion
+  charts as one line per NIC. Collapsed at the bottom: individual observations, PFC pause
   counters (meaning not yet validated), and recording diagnostics for troubleshooting the
   monitor itself (gaps, sampling quality, the offline report's fixed-window summary).
 
 How to read the traffic charts: **blue = send, orange = receive; solid = average, dashed =
-observed peak; gaps = data unavailable.** Pick the experiment, then the host, then the NIC.
+observed peak; gaps = data unavailable.** Pick the experiment, then the hosts, then the NICs.
+With many NICs selected the page is long: charts load as you scroll to them.
 
 Data gets there in two ways: live while recording (`ainic-netmon record --push`), and after
 the fact with exact numbers (`ainic-netmon-import`).

@@ -32,6 +32,11 @@ an average line and a dashed peak line, both over every valid interval; gaps sta
 Collector details (gaps, sampling quality, the offline report's fixed-window summary) are
 in a collapsed section at the bottom of the NIC detail page.
 
+The NIC detail page takes one NIC, several, or all of them (Host and NIC offer "All"): every
+chart is drawn once per selected NIC with Grafana's repeat, so each query still is about one
+NIC and the verifier checks it per target, exactly like the overview's charts. With one NIC
+selected the page looks as it did when it only took one.
+
     python3 ainic_netmon_dashboards.py OUT_DIR    # writes netmon_overview.json, netmon_nic_detail.json
 """
 
@@ -90,6 +95,14 @@ DETAIL_URL = (
 
 def detail_url(host, target):
     return DETAIL_URL.replace("HOST", host).replace("TARGET", target)
+
+
+# NIC detail: every chart is repeated once per selected NIC, its title starts with the NIC.
+PER_NIC = "target"
+
+
+def per_nic(title):
+    return "${target:text}: " + title
 
 
 # --------------------------------------------------------------------------- queries
@@ -209,6 +222,7 @@ def timeseries(
     links=None,
     points=False,
     repeat=None,
+    per_row=4,
 ):
     custom = {
         "drawStyle": "points" if points else "line",
@@ -242,7 +256,7 @@ def timeseries(
         },
     }
     if repeat:
-        p.update(repeat=repeat, repeatDirection="h", maxPerRow=4)
+        p.update(repeat=repeat, repeatDirection="h", maxPerRow=per_row)
     return p
 
 
@@ -302,11 +316,9 @@ def _line_points(name, color):
     return o
 
 
-def port_traffic_panel(pid, grid):
+def port_traffic_panel(pid, title, grid, repeat=None):
     """IPC wire bytes (2 ms), or ethtool's (~5 s) where a NIC has no IPC: average only."""
-    p = traffic_panel(
-        pid, "All port traffic (incl. non-RDMA)", "ipc", IPC_TX, IPC_RX, grid
-    )
+    p = traffic_panel(pid, title, "ipc", IPC_TX, IPC_RX, grid, repeat=repeat)
     for ref, counter, name, color in (
         ("E", IPC_TX, "Send", SEND_COLOR),
         ("F", IPC_RX, "Receive", RECV_COLOR),
@@ -355,7 +367,18 @@ def text_panel(pid, grid, content):
     }
 
 
-def table(pid, title, targets, grid, transformations, overrides=(), desc="", sort=None):
+def table(
+    pid,
+    title,
+    targets,
+    grid,
+    transformations,
+    overrides=(),
+    desc="",
+    sort=None,
+    repeat=None,
+    per_row=2,
+):
     p = {
         "id": pid,
         "type": "table",
@@ -373,11 +396,13 @@ def table(pid, title, targets, grid, transformations, overrides=(), desc="", sor
     }
     if sort:
         p["options"]["sortBy"] = sort
+    if repeat:
+        p.update(repeat=repeat, repeatDirection="h", maxPerRow=per_row)
     return p
 
 
-def row(pid, title, y, collapsed=False, panels=()):
-    return {
+def row(pid, title, y, collapsed=False, panels=(), repeat=None):
+    r = {
         "id": pid,
         "type": "row",
         "title": title,
@@ -385,6 +410,9 @@ def row(pid, title, y, collapsed=False, panels=()):
         "gridPos": {"x": 0, "y": y, "w": 24, "h": 1},
         "panels": list(panels),
     }
+    if repeat:  # the row and the panels below it, once per value
+        r["repeat"] = repeat
+    return r
 
 
 def _by_name(name, *props):
@@ -492,7 +520,7 @@ def variables(multi):
 
 
 def _multi(panels):
-    """The overview's `target` is multi-valued: Grafana regex-escapes it for Prometheus
+    """`target` is multi-valued on both dashboards: Grafana regex-escapes it for Prometheus
     (`.` -> `\\\\.`), so match with =~ (anchored; the escaping makes it exact)."""
     for p in panels:
         for t in p.get("targets", []):
@@ -708,7 +736,7 @@ COUNTER_NAMES = {
 def diagnostics(pid, y):
     gaps = timeseries(
         pid,
-        "Time without a valid observation (each point: one gap, its length)",
+        per_nic("time without a valid observation (each point: one gap, its length)"),
         [
             target(
                 "A",
@@ -727,6 +755,8 @@ def diagnostics(pid, y):
         {"x": 0, "y": y, "w": 24, "h": 7},
         unit="s",
         points=True,
+        repeat=PER_NIC,
+        per_row=2,
         desc="Collector quality, not network loss: times when a counter could not be turned "
         "into a rate (a counter went back, an IPC read was rejected, or the wall-clock "
         "position was uncertain). These times are the gaps in the traffic charts. Gaps of "
@@ -734,7 +764,7 @@ def diagnostics(pid, y):
     )
     quality = table(
         pid + 1,
-        "Recording quality",
+        per_nic("recording quality"),
         [
             instant_target(
                 "A", f"last_over_time(netmon_run_quality{{{SEL}}}[{META_LOOKBACK}])"
@@ -767,12 +797,15 @@ def diagnostics(pid, y):
         desc="Samples: counter reads saved. Missed sampling slots: sampling times skipped "
         "because a read was late (e.g. a firmware stall). Samples lost before saving: the "
         "writer could not keep up. Read errors: failed reads.",
+        repeat=PER_NIC,
     )
     rate = f'last_over_time(netmon_summary{{{SEL},stat=~"avg|peak10ms|p99"}}[{META_LOOKBACK}]) * 8'
     other = f'last_over_time(netmon_summary{{{SEL},stat!~"avg|peak10ms|p99"}}[{META_LOOKBACK}])'
     summary = table(
         pid + 2,
-        "Offline report summary (fixed experiment window; does not change with zoom)",
+        per_nic(
+            "offline report summary (fixed experiment window; does not change with zoom)"
+        ),
         [instant_target("A", f"({rate}) or ({other})")],
         {"x": 0, "y": y + 11, "w": 24, "h": 5},
         [
@@ -810,29 +843,39 @@ def diagnostics(pid, y):
         desc="The offline report's numbers for the experiment's common recording window "
         "(ainic-netmon-report shows the window). p99 and the time above 80 % use fine-grained "
         "observations only; the average includes long observations.",
+        repeat=PER_NIC,
     )
     return [gaps, quality], summary
 
 
 def nic_detail():
+    # One NIC, several or all. The two traffic charts repeat side by side (a single NIC gets
+    # the full width); the three congestion charts stay in one line per NIC (a repeated row),
+    # so several NICs read as a table: one row per NIC, one column per signal.
     panels = [
         text_panel(1, {"x": 0, "y": 0, "w": 24, "h": 2}, KEY_TEXT),
-        identity_strip(2, {"x": 0, "y": 2, "w": 24, "h": 3}),
+        identity_strip(2, {"x": 0, "y": 2, "w": 24, "h": 5}),
         traffic_panel(
             3,
-            "RDMA traffic",
+            per_nic("RDMA traffic"),
             "rdma",
             RDMA_TX,
             RDMA_RX,
-            {"x": 0, "y": 5, "w": 24, "h": 10},
+            {"x": 0, "y": 7, "w": 24, "h": 10},
+            repeat=PER_NIC,
         ),
-        port_traffic_panel(4, {"x": 0, "y": 15, "w": 24, "h": 8}),
-        row(5, "Retransmissions and congestion", 23),
+        port_traffic_panel(
+            4,
+            per_nic("all port traffic (incl. non-RDMA)"),
+            {"x": 0, "y": 17, "w": 24, "h": 8},
+            repeat=PER_NIC,
+        ),
+        row(5, per_nic("retransmissions and congestion"), 25, repeat=PER_NIC),
         packet_panel(
             6,
             "Retransmitted packets",
             [("tx_rdma_retx_pkts", "Retransmitted")],
-            {"x": 0, "y": 24, "w": 8, "h": 7},
+            {"x": 0, "y": 26, "w": 8, "h": 7},
             desc="Highest rate per time bin. 0 = observed zero; gaps = no observation.",
         ),
         packet_panel(
@@ -843,7 +886,7 @@ def nic_detail():
                 ("rx_rdma_cnp_pkts", "CNP received"),
                 ("tx_rdma_cnp_pkts", "CNP sent"),
             ],
-            {"x": 8, "y": 24, "w": 8, "h": 7},
+            {"x": 8, "y": 26, "w": 8, "h": 7},
             desc="Highest rate per time bin. All zero does not prove the network had no "
             "pressure: a fabric without ECN marking recovers by drops and retransmission.",
         ),
@@ -851,15 +894,18 @@ def nic_detail():
             8,
             "ACK timeouts",
             [("tx_rdma_ack_timeout", "ACK timeouts")],
-            {"x": 16, "y": 24, "w": 8, "h": 7},
+            {"x": 16, "y": 26, "w": 8, "h": 7},
             unit="short",
             desc="Highest rate per time bin, per second.",
         ),
     ]
-    y = 31
+    y = 33
     samples = timeseries(
         10,
-        "Individual observations (at 1 ms bins each point is one observation; otherwise the highest per $__interval)",
+        per_nic(
+            "individual observations (at 1 ms bins each point is one observation; "
+            "otherwise the highest per $__interval)"
+        ),
         [
             target(
                 "A",
@@ -889,13 +935,15 @@ def nic_detail():
         interval="1ms",
         unit="bps",
         points=True,
+        repeat=PER_NIC,
+        per_row=2,
         desc="RDMA traffic as individual observations. Zoom in until the bin is 1 ms to see "
         "every observation.",
     )
     panels.append(row(9, "Inspect individual observations", y, True, [samples]))
     pfc = timeseries(
         12,
-        "PFC pause counters, highest rate per time bin",
+        per_nic("PFC pause counters, highest rate per time bin"),
         [
             target(
                 "A",
@@ -930,6 +978,8 @@ def nic_detail():
             }
         ],
         {"x": 0, "y": y + 2, "w": 24, "h": 8},
+        repeat=PER_NIC,
+        per_row=2,
         desc="Firmware port counters whose meaning has not been validated yet. Only counters "
         "that changed during the recording are imported (ethtool: always)."
         + ETHTOOL_NOTE,
@@ -963,11 +1013,12 @@ def nic_detail():
             diag,
         )
     )
+    _multi(panels)
     return dashboard(
         "netmon-nic",
         "netmon NIC detail",
         panels,
-        False,
+        True,
         links=[
             {
                 "title": "Overview",

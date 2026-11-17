@@ -516,6 +516,30 @@ class DashboardTests(unittest.TestCase):
             step = next(v for v in d["templating"]["list"] if v["name"] == "min_step")
             self.assertEqual(step["hide"], 2)
 
+    def test_nic_detail_takes_one_nic_or_all(self):
+        # Host and NIC offer "All"; every data panel then is drawn once per NIC (its own
+        # repeat, or the repeat of the open row it is under), so no chart mixes NICs. The
+        # identity table is the exception: one row per NIC, keyed by target (join test).
+        d = json.loads(G.render()["netmon_nic_detail.json"])
+        for name in ("host", "target"):
+            v = next(v for v in d["templating"]["list"] if v["name"] == name)
+            self.assertTrue(v["multi"] and v["includeAll"], name)
+        row_repeat = None
+        for p in d["panels"]:
+            if p["type"] == "row":
+                row_repeat = p.get("repeat")
+            for q in p["panels"] if p["type"] == "row" else [p]:
+                if not q.get("targets"):
+                    continue
+                if q["type"] == "table" and len(q["targets"]) > 1:
+                    continue
+                self.assertEqual(q.get("repeat") or row_repeat, "target", q["title"])
+        for p in V.all_panels(d):  # whatever repeats says which NIC it shows
+            if p.get("repeat"):
+                self.assertIn("${target:text}", p["title"])
+        # the overview's links still open one NIC
+        self.assertIn("var-target=TARGET", G.DETAIL_URL)
+
     def test_tables_join_on_target_and_keep_link_fields(self):
         # A wrong join would put one NIC's numbers next to another NIC's name.
         for name, text in G.render().items():

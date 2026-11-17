@@ -56,8 +56,8 @@
         "regex": "/host=\"(?<value>(?<text>[^\".]+)[^\"]*)\"/",
         "refresh": 2,
         "sort": 7,
-        "multi": false,
-        "includeAll": false
+        "multi": true,
+        "includeAll": true
       },
       {
         "name": "target",
@@ -68,14 +68,14 @@
           "uid": "netmon-vm"
         },
         "query": {
-          "query": "query_result(last_over_time(netmon_target_info{experiment=\"$experiment\",host=\"$host\"}[3650d]))",
+          "query": "query_result(last_over_time(netmon_target_info{experiment=\"$experiment\",host=~\"$host\"}[3650d]))",
           "refId": "V"
         },
-        "regex": "/display_nic=\"(?<text>[^\"]+)\"|target=\"(?<value>[^\"]+)\"/g",
+        "regex": "/display_host_nic=\"(?<text>[^\"]+)\"|target=\"(?<value>[^\"]+)\"/g",
         "refresh": 2,
         "sort": 7,
-        "multi": false,
-        "includeAll": false
+        "multi": true,
+        "includeAll": true
       },
       {
         "name": "min_step",
@@ -133,7 +133,7 @@
         "x": 0,
         "y": 2,
         "w": 24,
-        "h": 3
+        "h": 5
       },
       "targets": [
         {
@@ -142,7 +142,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "last_over_time(netmon_target_info{experiment=\"$experiment\",target=\"$target\",display_nic!=\"\"}[3650d]) or label_copy(last_over_time(netmon_target_info{experiment=\"$experiment\",target=\"$target\",display_nic=\"\"}[3650d]), \"netdev\", \"display_nic\")",
+          "expr": "last_over_time(netmon_target_info{experiment=\"$experiment\",target=~\"$target\",display_nic!=\"\"}[3650d]) or label_copy(last_over_time(netmon_target_info{experiment=\"$experiment\",target=~\"$target\",display_nic=\"\"}[3650d]), \"netdev\", \"display_nic\")",
           "range": false,
           "instant": true,
           "format": "table"
@@ -153,7 +153,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "sum by (target) (label_value(last_over_time(netmon_target_info{experiment=\"$experiment\",target=\"$target\"}[3650d]), \"speed_mbps\")) * 1e6 > 0",
+          "expr": "sum by (target) (label_value(last_over_time(netmon_target_info{experiment=\"$experiment\",target=~\"$target\"}[3650d]), \"speed_mbps\")) * 1e6 > 0",
           "range": false,
           "instant": true,
           "format": "table"
@@ -323,7 +323,7 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "RDMA traffic",
+      "title": "${target:text}: RDMA traffic",
       "description": "Solid line: average traffic in each time bin. Dashed line: the highest single observation in the bin (a counter read ~2 ms apart), so short spikes stay visible when zoomed out; a single observation has timing jitter and can slightly exceed the link rate. Drag across the chart to zoom in. Gaps: no valid observation (never drawn as 0). Data marked 'live' comes from ainic-netmon record --push: an online approximation; where a push failed the average of that time bin may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
       "datasource": {
         "type": "prometheus",
@@ -333,7 +333,7 @@
       "maxDataPoints": 2000,
       "gridPos": {
         "x": 0,
-        "y": 5,
+        "y": 7,
         "w": 24,
         "h": 10
       },
@@ -344,7 +344,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval]))) * 8",
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval]))) * 8",
           "legendFormat": "Send",
           "range": true,
           "instant": false,
@@ -361,7 +361,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) * 8",
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) * 8",
           "legendFormat": "Send peak",
           "range": true,
           "instant": false,
@@ -378,7 +378,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval]))) * 8",
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval]))) * 8",
           "legendFormat": "Receive",
           "range": true,
           "instant": false,
@@ -395,7 +395,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) * 8",
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) * 8",
           "legendFormat": "Receive peak",
           "range": true,
           "instant": false,
@@ -529,12 +529,15 @@
           "mode": "multi",
           "sort": "none"
         }
-      }
+      },
+      "repeat": "target",
+      "repeatDirection": "h",
+      "maxPerRow": 4
     },
     {
       "id": 4,
       "type": "timeseries",
-      "title": "All port traffic (incl. non-RDMA)",
+      "title": "${target:text}: all port traffic (incl. non-RDMA)",
       "description": "All traffic through the port, including non-RDMA Ethernet. With firmware IPC: solid line = average per time bin, dashed line = highest observation in the bin (counters read ~2 ms apart). Without firmware IPC (e.g. a VM with a VF): only the lines marked '≈5 s, ethtool', points that each average about 5 s (the firmware updates these counters about every 5 s; zoomed in they are sparse points). ethtool gives a point only when the counters changed: no point means no observed change, not a measured zero. Gaps: no valid observation (never drawn as 0). Data marked 'live' comes from ainic-netmon record --push: an online approximation; where a push failed the average of that time bin may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
       "datasource": {
         "type": "prometheus",
@@ -544,7 +547,7 @@
       "maxDataPoints": 2000,
       "gridPos": {
         "x": 0,
-        "y": 15,
+        "y": 17,
         "w": 24,
         "h": 8
       },
@@ -555,7 +558,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_tx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_tx_ok\"}[$__interval]))) * 8",
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_tx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_tx_ok\"}[$__interval]))) * 8",
           "legendFormat": "Send",
           "range": true,
           "instant": false,
@@ -572,7 +575,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_tx_ok\"}[$__interval])) * 8",
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_tx_ok\"}[$__interval])) * 8",
           "legendFormat": "Send peak",
           "range": true,
           "instant": false,
@@ -589,7 +592,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_rx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_rx_ok\"}[$__interval]))) * 8",
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_rx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_rx_ok\"}[$__interval]))) * 8",
           "legendFormat": "Receive",
           "range": true,
           "instant": false,
@@ -606,7 +609,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=\"octets_rx_ok\"}[$__interval])) * 8",
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=\"octets_rx_ok\"}[$__interval])) * 8",
           "legendFormat": "Receive peak",
           "range": true,
           "instant": false,
@@ -623,7 +626,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_tx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_tx_ok\"}[$__interval]))) * 8",
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"ethtool\",counter=\"octets_tx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"ethtool\",counter=\"octets_tx_ok\"}[$__interval]))) * 8",
           "legendFormat": "Send (≈5 s, ethtool)",
           "range": true,
           "instant": false,
@@ -640,7 +643,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_rx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=\"octets_rx_ok\"}[$__interval]))) * 8",
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"ethtool\",counter=\"octets_rx_ok\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"ethtool\",counter=\"octets_rx_ok\"}[$__interval]))) * 8",
           "legendFormat": "Receive (≈5 s, ethtool)",
           "range": true,
           "instant": false,
@@ -828,20 +831,24 @@
           "mode": "multi",
           "sort": "none"
         }
-      }
+      },
+      "repeat": "target",
+      "repeatDirection": "h",
+      "maxPerRow": 4
     },
     {
       "id": 5,
       "type": "row",
-      "title": "Retransmissions and congestion",
+      "title": "${target:text}: retransmissions and congestion",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 23,
+        "y": 25,
         "w": 24,
         "h": 1
       },
-      "panels": []
+      "panels": [],
+      "repeat": "target"
     },
     {
       "id": 6,
@@ -856,7 +863,7 @@
       "maxDataPoints": 2000,
       "gridPos": {
         "x": 0,
-        "y": 24,
+        "y": 26,
         "w": 8,
         "h": 7
       },
@@ -867,7 +874,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_retx_pkts\",resolution=\"normal\"}[$__interval])",
+          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_retx_pkts\",resolution=\"normal\"}[$__interval])",
           "legendFormat": "Retransmitted",
           "range": true,
           "instant": false,
@@ -919,7 +926,7 @@
       "maxDataPoints": 2000,
       "gridPos": {
         "x": 8,
-        "y": 24,
+        "y": 26,
         "w": 8,
         "h": 7
       },
@@ -930,7 +937,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_ecn_pkts\",resolution=\"normal\"}[$__interval])",
+          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ecn_pkts\",resolution=\"normal\"}[$__interval])",
           "legendFormat": "ECN-marked received",
           "range": true,
           "instant": false,
@@ -947,7 +954,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_cnp_pkts\",resolution=\"normal\"}[$__interval])",
+          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_cnp_pkts\",resolution=\"normal\"}[$__interval])",
           "legendFormat": "CNP received",
           "range": true,
           "instant": false,
@@ -964,7 +971,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_cnp_pkts\",resolution=\"normal\"}[$__interval])",
+          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_cnp_pkts\",resolution=\"normal\"}[$__interval])",
           "legendFormat": "CNP sent",
           "range": true,
           "instant": false,
@@ -1016,7 +1023,7 @@
       "maxDataPoints": 2000,
       "gridPos": {
         "x": 16,
-        "y": 24,
+        "y": 26,
         "w": 8,
         "h": 7
       },
@@ -1027,7 +1034,7 @@
             "type": "prometheus",
             "uid": "netmon-vm"
           },
-          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_ack_timeout\",resolution=\"normal\"}[$__interval])",
+          "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ack_timeout\",resolution=\"normal\"}[$__interval])",
           "legendFormat": "ACK timeouts",
           "range": true,
           "instant": false,
@@ -1073,7 +1080,7 @@
       "collapsed": true,
       "gridPos": {
         "x": 0,
-        "y": 31,
+        "y": 33,
         "w": 24,
         "h": 1
       },
@@ -1081,7 +1088,7 @@
         {
           "id": 10,
           "type": "timeseries",
-          "title": "Individual observations (at 1 ms bins each point is one observation; otherwise the highest per $__interval)",
+          "title": "${target:text}: individual observations (at 1 ms bins each point is one observation; otherwise the highest per $__interval)",
           "description": "RDMA traffic as individual observations. Zoom in until the bin is 1 ms to see every observation.",
           "datasource": {
             "type": "prometheus",
@@ -1091,7 +1098,7 @@
           "maxDataPoints": 2000,
           "gridPos": {
             "x": 0,
-            "y": 32,
+            "y": 34,
             "w": 24,
             "h": 8
           },
@@ -1102,7 +1109,7 @@
                 "type": "prometheus",
                 "uid": "netmon-vm"
               },
-              "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) * 8",
+              "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) * 8",
               "legendFormat": "Send",
               "range": true,
               "instant": false,
@@ -1119,7 +1126,7 @@
                 "type": "prometheus",
                 "uid": "netmon-vm"
               },
-              "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) * 8",
+              "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) * 8",
               "legendFormat": "Receive",
               "range": true,
               "instant": false,
@@ -1211,7 +1218,10 @@
               "mode": "multi",
               "sort": "none"
             }
-          }
+          },
+          "repeat": "target",
+          "repeatDirection": "h",
+          "maxPerRow": 2
         }
       ]
     },
@@ -1222,7 +1232,7 @@
       "collapsed": true,
       "gridPos": {
         "x": 0,
-        "y": 32,
+        "y": 34,
         "w": 24,
         "h": 1
       },
@@ -1230,7 +1240,7 @@
         {
           "id": 12,
           "type": "timeseries",
-          "title": "PFC pause counters, highest rate per time bin",
+          "title": "${target:text}: PFC pause counters, highest rate per time bin",
           "description": "Firmware port counters whose meaning has not been validated yet. Only counters that changed during the recording are imported (ethtool: always). On hosts without firmware IPC (e.g. a VM with a VF) the port statistics come from ethtool instead (lines marked '≈5 s, ethtool'): the firmware updates them about every 5 s, so each point is an average over about 5 s (zoomed in: sparse points). ethtool gives a point only when the counters changed: no point means no observed change, not a measured zero.",
           "datasource": {
             "type": "prometheus",
@@ -1240,7 +1250,7 @@
           "maxDataPoints": 2000,
           "gridPos": {
             "x": 0,
-            "y": 33,
+            "y": 35,
             "w": 24,
             "h": 8
           },
@@ -1251,7 +1261,7 @@
                 "type": "prometheus",
                 "uid": "netmon-vm"
               },
-              "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"ipc\",counter=~\".*pripause.*|rx_pause_1us_count\",resolution=\"normal\"}[$__interval])",
+              "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"ipc\",counter=~\".*pripause.*|rx_pause_1us_count\",resolution=\"normal\"}[$__interval])",
               "legendFormat": "{{counter}}",
               "range": true,
               "instant": false,
@@ -1268,7 +1278,7 @@
                 "type": "prometheus",
                 "uid": "netmon-vm"
               },
-              "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=\"$target\",source=\"ethtool\",counter=~\"frames_(tx|rx)_(pri)?pause\",resolution=\"normal\"}[$__interval])",
+              "expr": "max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"ethtool\",counter=~\"frames_(tx|rx)_(pri)?pause\",resolution=\"normal\"}[$__interval])",
               "legendFormat": "{{counter}} (≈5 s, ethtool)",
               "range": true,
               "instant": false,
@@ -1322,7 +1332,10 @@
               "mode": "multi",
               "sort": "none"
             }
-          }
+          },
+          "repeat": "target",
+          "repeatDirection": "h",
+          "maxPerRow": 2
         }
       ]
     },
@@ -1333,7 +1346,7 @@
       "collapsed": true,
       "gridPos": {
         "x": 0,
-        "y": 33,
+        "y": 35,
         "w": 24,
         "h": 1
       },
@@ -1341,7 +1354,7 @@
         {
           "id": 16,
           "type": "table",
-          "title": "Offline report summary (fixed experiment window; does not change with zoom)",
+          "title": "${target:text}: offline report summary (fixed experiment window; does not change with zoom)",
           "description": "The offline report's numbers for the experiment's common recording window (ainic-netmon-report shows the window). p99 and the time above 80 % use fine-grained observations only; the average includes long observations.",
           "datasource": {
             "type": "prometheus",
@@ -1349,7 +1362,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 35,
+            "y": 37,
             "w": 24,
             "h": 5
           },
@@ -1360,7 +1373,7 @@
                 "type": "prometheus",
                 "uid": "netmon-vm"
               },
-              "expr": "(last_over_time(netmon_summary{experiment=\"$experiment\",target=\"$target\",stat=~\"avg|peak10ms|p99\"}[3650d]) * 8) or (last_over_time(netmon_summary{experiment=\"$experiment\",target=\"$target\",stat!~\"avg|peak10ms|p99\"}[3650d]))",
+              "expr": "(last_over_time(netmon_summary{experiment=\"$experiment\",target=~\"$target\",stat=~\"avg|peak10ms|p99\"}[3650d]) * 8) or (last_over_time(netmon_summary{experiment=\"$experiment\",target=~\"$target\",stat!~\"avg|peak10ms|p99\"}[3650d]))",
               "range": false,
               "instant": true,
               "format": "table"
@@ -1558,7 +1571,10 @@
           "options": {
             "showHeader": true,
             "cellHeight": "sm"
-          }
+          },
+          "repeat": "target",
+          "repeatDirection": "h",
+          "maxPerRow": 2
         }
       ]
     },
@@ -1569,7 +1585,7 @@
       "collapsed": true,
       "gridPos": {
         "x": 0,
-        "y": 34,
+        "y": 36,
         "w": 24,
         "h": 1
       },
@@ -1577,7 +1593,7 @@
         {
           "id": 14,
           "type": "timeseries",
-          "title": "Time without a valid observation (each point: one gap, its length)",
+          "title": "${target:text}: time without a valid observation (each point: one gap, its length)",
           "description": "Collector quality, not network loss: times when a counter could not be turned into a rate (a counter went back, an IPC read was rejected, or the wall-clock position was uncertain). These times are the gaps in the traffic charts. Gaps of different counters are not added up.",
           "datasource": {
             "type": "prometheus",
@@ -1587,7 +1603,7 @@
           "maxDataPoints": 2000,
           "gridPos": {
             "x": 0,
-            "y": 34,
+            "y": 36,
             "w": 24,
             "h": 7
           },
@@ -1598,7 +1614,7 @@
                 "type": "prometheus",
                 "uid": "netmon-vm"
               },
-              "expr": "max by (experiment, target, source, reason) (max_over_time(netmon_gap_seconds{experiment=\"$experiment\",target=\"$target\"}[$__interval]))",
+              "expr": "max by (experiment, target, source, reason) (max_over_time(netmon_gap_seconds{experiment=\"$experiment\",target=~\"$target\"}[$__interval]))",
               "legendFormat": "{{source}} {{reason}}",
               "range": true,
               "instant": false,
@@ -1705,12 +1721,15 @@
               "mode": "multi",
               "sort": "none"
             }
-          }
+          },
+          "repeat": "target",
+          "repeatDirection": "h",
+          "maxPerRow": 2
         },
         {
           "id": 15,
           "type": "table",
-          "title": "Recording quality",
+          "title": "${target:text}: recording quality",
           "description": "Samples: counter reads saved. Missed sampling slots: sampling times skipped because a read was late (e.g. a firmware stall). Samples lost before saving: the writer could not keep up. Read errors: failed reads.",
           "datasource": {
             "type": "prometheus",
@@ -1718,7 +1737,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 41,
+            "y": 43,
             "w": 24,
             "h": 4
           },
@@ -1729,7 +1748,7 @@
                 "type": "prometheus",
                 "uid": "netmon-vm"
               },
-              "expr": "last_over_time(netmon_run_quality{experiment=\"$experiment\",target=\"$target\"}[3650d])",
+              "expr": "last_over_time(netmon_run_quality{experiment=\"$experiment\",target=~\"$target\"}[3650d])",
               "range": false,
               "instant": true,
               "format": "table"
@@ -1818,7 +1837,10 @@
           "options": {
             "showHeader": true,
             "cellHeight": "sm"
-          }
+          },
+          "repeat": "target",
+          "repeatDirection": "h",
+          "maxPerRow": 2
         }
       ]
     }
