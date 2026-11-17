@@ -273,7 +273,7 @@ bool WriteMeta(const std::string& dir, const Meta& m, const std::vector<Stream>&
   j += "  \"cpu_user_s\": " + std::to_string(m.cpu_user_s) +
        ",\n  \"cpu_sys_s\": " + std::to_string(m.cpu_sys_s) + ",\n";
   j += "  \"error\": " + JsonString(m.error) + "\n}\n";
-  const std::string tmp = dir + "/meta.json.tmp";
+  const std::string tmp = dir + "/xgmi_meta.json.tmp";
   const int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd < 0) {
     *err = tmp + ": " + std::strerror(errno);
@@ -282,21 +282,21 @@ bool WriteMeta(const std::string& dir, const Meta& m, const std::vector<Stream>&
   const bool ok = WriteAll(fd, j.data(), j.size(), err);
   close(fd);
   if (!ok) return false;
-  if (rename(tmp.c_str(), (dir + "/meta.json").c_str()) != 0) {
-    *err = std::string("rename meta.json: ") + std::strerror(errno);
+  if (rename(tmp.c_str(), (dir + "/xgmi_meta.json").c_str()) != 0) {
+    *err = std::string("rename xgmi_meta.json: ") + std::strerror(errno);
     return false;
   }
   return true;
 }
 
-std::string ShortHostname() {
+std::string Hostname() {
   char h[256] = {};
   gethostname(h, sizeof(h) - 1);
-  std::string s = h;
-  return s.substr(0, s.find('.'));
+  return h;
 }
 
-// mkdir -p; the leaf must not exist or be empty (a recording is never overwritten).
+// mkdir -p; the leaf may hold files of other tools (ainic-netmon's nic_*), but no xgmi_* file
+// (a recording is never overwritten).
 bool PrepareDir(const std::string& dir, std::string* err) {
   for (size_t i = 1; i <= dir.size(); ++i) {
     if (i < dir.size() && dir[i] != '/') continue;
@@ -308,9 +308,9 @@ bool PrepareDir(const std::string& dir, std::string* err) {
   }
   if (DIR* d = opendir(dir.c_str())) {
     while (dirent* e = readdir(d)) {
-      if (std::strcmp(e->d_name, ".") != 0 && std::strcmp(e->d_name, "..") != 0) {
+      if (std::strncmp(e->d_name, "xgmi", 4) == 0) {
         closedir(d);
-        *err = dir + " is not empty (a recording is never overwritten)";
+        *err = dir + " has xgmi-netmon files already (a recording is never overwritten)";
         return false;
       }
     }
@@ -328,7 +328,7 @@ std::string Replace(std::string s, const std::string& from, const std::string& t
 }  // namespace
 
 int RunRecord(const RecordOptions& opt) {
-  const std::string host = opt.host_id.empty() ? ShortHostname() : opt.host_id;
+  const std::string host = opt.host_id.empty() ? Hostname() : opt.host_id;
   if (host.empty() || host.size() > kMaxHostLen) {
     std::fprintf(stderr, "error: host id must be 1..%zu characters\n", kMaxHostLen);
     return 1;
@@ -389,9 +389,10 @@ int RunRecord(const RecordOptions& opt) {
     }
   }
 
-  const int lock = open((dir + "/.lock").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+  const int lock =
+      open((dir + "/xgmi.lock").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
   if (lock < 0) {
-    std::fprintf(stderr, "error: %s/.lock: %s\n", dir.c_str(), std::strerror(errno));
+    std::fprintf(stderr, "error: %s/xgmi.lock: %s\n", dir.c_str(), std::strerror(errno));
     return 1;
   }
   const std::string lock_text = "pid " + std::to_string(getpid()) + "\nhost " + host +
@@ -403,7 +404,7 @@ int RunRecord(const RecordOptions& opt) {
   for (size_t i = 0; i < gpus.size(); ++i) {
     Stream& s = streams[i];
     s.gpu = gpus[i];
-    s.file = "gpu" + std::to_string(s.gpu.idx) + ".bin";
+    s.file = "xgmi_gpu" + std::to_string(s.gpu.idx) + ".bin";
     s.sys_fd = open(s.gpu.metrics_path.c_str(), O_RDONLY | O_CLOEXEC);
     s.out_fd = open((dir + "/" + s.file).c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
     if (s.sys_fd < 0 || s.out_fd < 0) {

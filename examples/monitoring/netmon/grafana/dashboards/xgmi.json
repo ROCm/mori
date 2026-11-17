@@ -29,7 +29,7 @@
         "type": "query",
         "datasource": {
           "type": "prometheus",
-          "uid": "xgmi-vm"
+          "uid": "netmon-vm"
         },
         "refresh": 2,
         "sort": 0,
@@ -42,7 +42,7 @@
         "type": "query",
         "datasource": {
           "type": "prometheus",
-          "uid": "xgmi-vm"
+          "uid": "netmon-vm"
         },
         "query": "label_values(xgmi_interval_seconds{experiment=\"$experiment\"}, host)",
         "definition": "label_values(xgmi_interval_seconds{experiment=\"$experiment\"}, host)",
@@ -55,7 +55,7 @@
         "type": "query",
         "datasource": {
           "type": "prometheus",
-          "uid": "xgmi-vm"
+          "uid": "netmon-vm"
         },
         "query": "label_values(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}, gpu)",
         "definition": "label_values(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}, gpu)",
@@ -159,7 +159,7 @@
       "description": "Sum over the selected GPUs of the average sent bandwidth (all links) in the averaging window. Link bytes, not payload.",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "gridPos": {
         "x": 0,
@@ -172,7 +172,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -226,7 +226,7 @@
       "description": "Total sent / total capacity (links x link max) of the selected GPUs: the share of the XGMI sending capacity in use. This is link bandwidth utilisation, not the GPU engine utilisation. Needs the capacity labels (data recorded with this version).",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "gridPos": {
         "x": 4,
@@ -239,7 +239,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -309,7 +309,7 @@
       "description": "The GPU with the highest average sent bandwidth (its links added) in the averaging window.",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "gridPos": {
         "x": 8,
@@ -322,7 +322,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -377,7 +377,7 @@
       "description": "The GPU with the highest average received bandwidth (what the peers sent to it, all links) in the averaging window.",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "gridPos": {
         "x": 12,
@@ -390,7 +390,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -445,7 +445,7 @@
       "description": "Live = the newest sample is at most 10 s old: the recorder is running and its data arrives. Otherwise the age in seconds (yellow from 10 s, red from 30 s): the recorder or the push stalled, or this is a recording and the number is how old it is. The age is that of the newest sample VictoriaMetrics can search, to now (looked up over the hour or the selected range before its end, whichever is longer; none = no data). While recording it moves between about 2.6 and 4.4 s: the recorder pushes once per second and VictoriaMetrics makes new data searchable about every 2 s, which is why a number under 10 s is shown as Live. In the first seconds after a recording starts the tile shows no data: a new series takes about 6-10 s to become searchable in VictoriaMetrics (measured 8.9-10.3 s in six runs).",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "gridPos": {
         "x": 20,
@@ -458,7 +458,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -533,7 +533,7 @@
       "title": "GPU overview (average over ${avg_window:text})",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "description": "Per GPU: average bandwidth sent / received over the averaging window (all links), each also as a share of the GPU's capacity (links x link max), the coverage and the trend of the sent bandwidth. Received = what the peers sent to the GPU (the receiver's own counter is not reliable when several flows arrive at once). Values are link bytes, not payload: a one-way copy shows 1.134x its payload. Coverage = the share of the window that has valid sampling intervals; below 100 % the numbers cover only part of the window (under 1 % is shown as <1 %, not 0 %). Util bars need the link capacity labels (data recorded with this version); older data shows no bar.",
       "gridPos": {
@@ -547,7 +547,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -558,7 +558,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -569,7 +569,7 @@
           "refId": "D",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -580,7 +580,7 @@
           "refId": "E",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -591,7 +591,7 @@
           "refId": "G",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -602,7 +602,7 @@
           "refId": "F",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": false,
           "range": true,
@@ -899,7 +899,7 @@
       "title": "Sent: row GPU → column GPU (average over ${avg_window:text})",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "description": "Average over the averaging window. Row = sending GPU, column = receiving GPU. Sender's xgmi_write_data_acc; link bytes, not payload. Colours as in the util bars, as shares of one link's capacity (72 GB/s = xgmi link width 16 x speed 36 Gbps, from gpu_metrics): under 5 % grey (idle), 5-40 % dim green, 40-70 % green, 70-85 % yellow, from 85 % red. The steps are fixed numbers (3.6, 28.8, 50.4, 61.2 GB/s), so they assume a 72 GB/s link.",
       "gridPos": {
@@ -913,7 +913,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "expr": "sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",dir=\"wr\"}[${avg_window}ms])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\"}[${avg_window}ms]))",
           "instant": true,
@@ -1025,7 +1025,7 @@
       "description": "Average over the selected range, all links. Sent = this GPU's xgmi_write over its links; received = what its peers' xgmi_write sent to it (the receiver's own xgmi_read is not reliable over short windows when several flows arrive at once). Link bytes, not payload.",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "gridPos": {
         "x": 0,
@@ -1038,7 +1038,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -1164,7 +1164,7 @@
       "description": "Same as the matrix, per time bin: one line per (sending GPU, receiving GPU) link. Steps: each value covers the bin ending at its point. Dashed grey = link capacity (xgmi link width x speed from gpu_metrics). Legend sorted by mean; click an entry to show only that link.",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "gridPos": {
         "x": 0,
@@ -1247,7 +1247,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "legendFormat": "GPU{{gpu}} → GPU{{peer}}",
           "expr": "sum by (gpu, peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[$__interval])) / on (gpu) group_left sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__interval]))",
@@ -1257,7 +1257,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": false,
           "range": true,
@@ -1275,7 +1275,7 @@
       "description": "Sent by each GPU over all its links, per time bin (steps). Dashed grey = capacity of all its links in one direction.",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "gridPos": {
         "x": 0,
@@ -1360,7 +1360,7 @@
           "expr": "sum by (gpu) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\",dir=\"wr\"}[$__interval])) / sum by (gpu) (sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__interval]))",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "interval": "$resolution"
         },
@@ -1368,7 +1368,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": false,
           "range": true,
@@ -1400,7 +1400,7 @@
       "description": "Solid: average per time bin = bytes / time of the valid intervals in the bin. Gaps: no valid interval (nothing is filled with zeros). Link max is 72 GB/s per direction.",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "gridPos": {
         "x": 0,
@@ -1514,7 +1514,7 @@
           "expr": "sum by (peer) (sum_over_time(xgmi_bytes{experiment=\"$experiment\",host=\"$host\",gpu=\"$gpu\",dir=\"wr\"}[$__interval])) / on () group_left sum(sum_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=\"$gpu\"}[$__interval]))",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "interval": "$resolution"
         },
@@ -1524,7 +1524,7 @@
           "expr": "max(max_over_time(xgmi_rate_bytes_per_second{experiment=\"$experiment\",host=\"$host\",gpu=\"$gpu\",dir=\"wr\"}[$__interval]))",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "interval": "$resolution"
         },
@@ -1532,7 +1532,7 @@
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": false,
           "range": true,
@@ -1549,7 +1549,7 @@
       "title": "GPU $gpu links (average over ${avg_window:text})",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "description": "One row per link of the GPU: average sent bandwidth, its share of one link's capacity, the highest single 2 ms interval and the trend.",
       "gridPos": {
@@ -1563,7 +1563,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -1574,7 +1574,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -1585,7 +1585,7 @@
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,
@@ -1596,7 +1596,7 @@
           "refId": "D",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": false,
           "range": true,
@@ -1817,7 +1817,7 @@
           "description": "Expected 2 ms. Longer = a snapshot was missed (no bytes lost, the rate just covers a longer interval).",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "gridPos": {
             "x": 0,
@@ -1864,7 +1864,7 @@
               "expr": "max by (gpu) (max_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[$__interval]))",
               "datasource": {
                 "type": "prometheus",
-                "uid": "xgmi-vm"
+                "uid": "netmon-vm"
               },
               "interval": "$resolution"
             }
@@ -1879,7 +1879,7 @@
       "description": "The GPU with the highest average PCIe traffic in the averaging window. Reads and writes are added: gpu_metrics has one total (pcie_bandwidth_inst, refreshed every 2 ms), no direction. It counts the GPU's PCIe link (host copies, NIC DMA, peer traffic over PCIe), not XGMI. The unit of the raw value is not documented; it is taken as 0.1 MB/s per count, an estimate (about 6 % error), so read it as an order of magnitude. N/A: this recording has no PCIe data (recorded with an older version) or the GPU does not report it.",
       "datasource": {
         "type": "prometheus",
-        "uid": "xgmi-vm"
+        "uid": "netmon-vm"
       },
       "gridPos": {
         "x": 16,
@@ -1892,7 +1892,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "xgmi-vm"
+            "uid": "netmon-vm"
           },
           "instant": true,
           "range": false,

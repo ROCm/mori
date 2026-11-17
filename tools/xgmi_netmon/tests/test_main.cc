@@ -378,7 +378,7 @@ void TestRecordingFile() {
   const FileHeader h = MakeHeader(g, "n06-21", "exp42", 2000000);
   std::vector<Record> recs = {MakeRecord(1, 2, 3, 4), MakeRecord(5, 6, 7, 8),
                               MakeRecord(9, 10, 11, 12)};
-  const std::string path = (t.path / "gpu3.bin").string();
+  const std::string path = (t.path / "xgmi_gpu3.bin").string();
   {
     std::ofstream f(path, std::ios::binary);
     f.write(reinterpret_cast<const char*>(&h), sizeof(h));
@@ -523,7 +523,7 @@ void TestImport() {
         MakeRecord(1000000000000000000ull + i * 2000000, 1000 + i * 200000, i * 10, i * 20));
   fs::create_directories(t.path / "e1" / "h1");
   {
-    std::ofstream f(t.path / "e1" / "h1" / "gpu0.bin", std::ios::binary);
+    std::ofstream f(t.path / "e1" / "h1" / "xgmi_gpu0.bin", std::ios::binary);
     f.write(reinterpret_cast<const char*>(&h), sizeof(h));
     f.write(reinterpret_cast<const char*>(recs.data()), recs.size() * sizeof(Record));
   }
@@ -546,6 +546,14 @@ void TestImport() {
   bool deleted = false;
   for (const auto& r : vm.requests()) deleted |= r.path.find("delete_series") != std::string::npos;
   CHECK(deleted);
+
+  // files of the first version are named gpu<N>.bin
+  fs::rename(t.path / "e1" / "h1" / "xgmi_gpu0.bin", t.path / "e1" / "h1" / "gpu0.bin");
+  FakeVm vm2;
+  o.url = vm2.url();
+  o.replace = false;
+  CHECK(RunImport(o) == 0);
+  CHECK(vm2.imported() == expect);
 }
 
 void TestRecordEndToEnd() {
@@ -561,7 +569,7 @@ void TestRecordEndToEnd() {
   o.drm_root = (t.path / "drm").string();
   CHECK(RunRecord(o) == 0);
   const fs::path dir = t.path / "exp7" / "nodeA";
-  for (const char* f : {"gpu0.bin", "gpu1.bin"}) {
+  for (const char* f : {"xgmi_gpu0.bin", "xgmi_gpu1.bin"}) {
     FileHeader h;
     std::vector<Record> recs;
     size_t partial = 0;
@@ -573,12 +581,19 @@ void TestRecordEndToEnd() {
     if (!recs.empty())
       CHECK(recs[0].s.fw == 189831201677852ull && recs[0].t1_mono_ns >= recs[0].t0_mono_ns);
   }
-  const std::string meta = ReadFile((dir / "meta.json").string());
+  const std::string meta = ReadFile((dir / "xgmi_meta.json").string());
   CHECK(meta.find("\"status\": \"complete\"") != std::string::npos);
   CHECK(meta.find("\"peers\": {\"5\": 1}") != std::string::npos);
-  CHECK(fs::exists(dir / ".lock"));
+  CHECK(fs::exists(dir / "xgmi.lock"));
   // A recording is never overwritten.
   CHECK(RunRecord(o) == 1);
+  // A directory with files of another tool (ainic-netmon) is fine.
+  fs::create_directories(t.path / "exp8" / "nodeA");
+  std::ofstream(t.path / "exp8" / "nodeA" / "nic_meta.json") << "{}";
+  o.out = (t.path / "exp8" / "{host}").string();
+  CHECK(RunRecord(o) == 0);
+  CHECK(fs::exists(t.path / "exp8" / "nodeA" / "xgmi_gpu0.bin") &&
+        fs::exists(t.path / "exp8" / "nodeA" / "nic_meta.json"));
 }
 
 }  // namespace

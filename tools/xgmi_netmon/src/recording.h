@@ -21,8 +21,9 @@
 // SOFTWARE.
 // On-disk recording: one file per GPU, a 512-byte header followed by fixed-size records.
 //
-//   DIR/meta.json    status, host, experiment, GPUs, statistics (for people; tools use the headers)
-//   DIR/gpu<N>.bin   FileHeader, then Record... (little-endian)
+//   DIR/xgmi.lock         exists while a recorder runs
+//   DIR/xgmi_meta.json    status, host, experiment, GPUs, statistics (for people; tools use the
+//   headers) DIR/xgmi_gpu<N>.bin   FileHeader, then Record... (little-endian)
 //
 // A record is written only when firmware_timestamp changed, i.e. once per PMFW snapshot that was
 // read. A recording killed mid-write may end with a partial record; ReadRecording drops it.
@@ -79,7 +80,7 @@ FileHeader MakeHeader(const Gpu& gpu, const std::string& host, const std::string
 // write() until done; false with *err on failure.
 bool WriteAll(int fd, const void* data, size_t n, std::string* err);
 
-// Reads a whole gpu<N>.bin. *partial_bytes is the size of a trailing partial record (dropped).
+// Reads a whole xgmi_gpu<N>.bin. *partial_bytes is the size of a trailing partial record (dropped).
 bool ReadRecording(const std::string& path, FileHeader* header, std::vector<Record>* records,
                    size_t* partial_bytes, std::string* err);
 

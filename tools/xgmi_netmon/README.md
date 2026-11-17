@@ -9,7 +9,7 @@ NICs. A standalone C++17 tool: libc only, no root, no dependency on the rest of 
 | `src/` | the `xgmi-netmon` binary: `list`, `record`, `import` |
 | `tests/` | unit tests (no GPU needed), `gpu_metrics` captures from MI355X |
 | `peer_copy_traffic.py` | torch peer copies with known byte counts, to check the numbers |
-| `../../examples/monitoring/xgmi_netmon/` | VictoriaMetrics (:28428) + Grafana (:23000) and the dashboard |
+| `../../examples/monitoring/netmon/` | the VictoriaMetrics + Grafana stack shared with ainic-netmon; `grafana/dashboards/xgmi.json` is this tool's dashboard (data source `netmon-vm`) |
 
 ## Build
 
@@ -24,21 +24,23 @@ ctest --test-dir build-xgmi          # -DXGMI_NETMON_TSAN=ON for a ThreadSanitiz
 ## Use
 
 ```
-examples/monitoring/xgmi_netmon/up.sh /tmp/xgmi-netmon-data    # local disk, not NFS
+examples/monitoring/netmon/up.sh /tmp/netmon-data    # shared stack, :8428 + :3000; local disk, not NFS
 xgmi-netmon list                                     # GPUs, XGMI port -> peer GPU, link max
 xgmi-netmon record -o /shared/exp42/{host} -d 60s    # record only
-xgmi-netmon record -o /shared/exp42/{host} --push http://127.0.0.1:28428   # and show live
+xgmi-netmon record -o /shared/exp42/{host} --push http://127.0.0.1:8428   # and show live
 xgmi-netmon import /shared/exp42/nodeA /shared/exp42/nodeB [--replace]
-examples/monitoring/xgmi_netmon/down.sh                        # keeps the data directory
+examples/monitoring/netmon/down.sh                         # keeps the data directory
 ```
 
 - Run the recorder on the host, not in a container (it reads `/sys/class/drm`). No root needed.
-- `{host}` expands to the host id (first DNS label of the hostname, or `--host-id`). The
+- `{host}` expands to the host id (the full hostname, or `--host-id`). The
   experiment defaults to the name of the parent directory (`exp42`); `--experiment` sets it.
-  The output directory must not exist or be empty: a recording is never overwritten.
+  The output directory may hold the files of other tools (ainic-netmon writes `nic_*`), so both
+  tools can record into `-o exp42/{host}`. It must not have `xgmi_*` files: a recording is never
+  overwritten.
 - `--push` refuses to start if VictoriaMetrics is unreachable or already has data for this
   experiment and host. While recording, a slow or failed push only drops points (counted in
-  `meta.json`); the recording is never affected. A push gives up after 2 s without progress or
+  `xgmi_meta.json`); the recording is never affected. A push gives up after 2 s without progress or
   3 s in total. A request that gave up may have been written in part, so it is never resent:
   re-import the recording with `--replace` for complete data.
 - The live push sends about 2 MB/s for 8 GPUs (17 bytes per point). Run VictoriaMetrics on the
@@ -47,20 +49,20 @@ examples/monitoring/xgmi_netmon/down.sh                        # keeps the data 
 - `import` writes the same points as the live push (same code; checked point by point). It
   refuses an experiment and host that already have data; `--replace` deletes their `xgmi_*`
   series first. Imported data becomes visible in VictoriaMetrics after up to ~10 s.
-- View: `ssh -L 23000:127.0.0.1:23000 <grafana host>`, open `http://localhost:23000`, pick
+- View: `ssh -L 3000:127.0.0.1:3000 <grafana host>`, open `http://localhost:3000`, pick
   experiment, host and the time range.
 
 ## Output
 
 ```
-DIR/.lock          created exclusively: pid, host, start time
-DIR/meta.json      status (running | complete | failed), host, experiment, GPUs and peers,
-                   per-GPU statistics, push statistics, CPU time
-DIR/gpu<N>.bin     512-byte header (magic XGMINM01, GPU, peers, link max, host, experiment),
-                   then records of 22 little-endian u64 (format 2):
-                   t0_mono_ns, t1_mono_ns, real_ns, real_err_ns, firmware_timestamp (10 ns),
-                   xgmi_read_data_acc[8], xgmi_write_data_acc[8] (KB), pcie_bandwidth_inst
-                   (raw; 0 if the GPU has none). Format 1 files (21 u64, no PCIe) can still be imported.
+DIR/xgmi.lock         created exclusively: pid, host, start time
+DIR/xgmi_meta.json    status (running | complete | failed), host, experiment, GPUs and peers,
+                      per-GPU statistics, push statistics, CPU time
+DIR/xgmi_gpu<N>.bin   512-byte header (magic XGMINM01, GPU, peers, link max, host, experiment),
+                      then records of 22 little-endian u64 (format 2):
+                      t0_mono_ns, t1_mono_ns, real_ns, real_err_ns, firmware_timestamp (10 ns),
+                      xgmi_read_data_acc[8], xgmi_write_data_acc[8] (KB), pcie_bandwidth_inst
+                      (raw; 0 if the GPU has none). Format 1 files (21 u64, no PCIe) can still be imported.
 ```
 
 A record is written only when `firmware_timestamp` changed. A recording killed mid-write may end
@@ -170,7 +172,7 @@ start).
 - PCIe: `pcie_bandwidth_inst` is a total of both directions, with no H2D / D2H split, and its unit is
   not documented (0.1 MB/s per count is an estimate from three points, about 6 % error). An idle GPU
   shows about 7 MB/s. Recordings made before this field was added show N/A.
-- Deployment uses `docker run`, not compose (the `docker-compose` 1.29 on n06-21 is broken).
-  Both services listen on 127.0.0.1 only; Grafana allows anonymous admin, do not expose it.
-  `up.sh` copies the Grafana files into the data directory, because the docker daemon cannot read
-  an NFS home with root squash; copy `xgmi.json` there again after editing it.
+- The stack (`examples/monitoring/netmon`, from the ainic-netmon change) uses `docker run`, listens
+  on 127.0.0.1 only, and Grafana allows anonymous admin: do not expose it. `up.sh` copies the
+  Grafana files into the data directory, so copy `xgmi.json` there again after editing it.
+- `import` also reads `gpu<N>.bin`, the file name of the first version.

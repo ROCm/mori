@@ -34,7 +34,7 @@ namespace xgmi {
 
 struct ImportOptions {
   std::vector<std::string> dirs;
-  std::string url = "http://127.0.0.1:28428";
+  std::string url = "http://127.0.0.1:8428";
   std::string experiment;  // empty: the one stored in the recordings
   bool replace = false;
 };

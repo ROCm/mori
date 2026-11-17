@@ -56,12 +56,14 @@ bool LoadDir(const std::string& dir, HostRecording* out, std::string* err) {
   std::vector<std::string> files;
   while (dirent* e = readdir(d)) {
     const std::string n = e->d_name;
-    if (n.size() > 7 && n.compare(0, 3, "gpu") == 0 && n.compare(n.size() - 4, 4, ".bin") == 0)
+    // xgmi_gpu<N>.bin; gpu<N>.bin is the name of the first version
+    const size_t skip = n.compare(0, 8, "xgmi_gpu") == 0 ? 8 : n.compare(0, 3, "gpu") == 0 ? 3 : 0;
+    if (skip && n.size() > skip + 4 && n.compare(n.size() - 4, 4, ".bin") == 0)
       files.push_back(dir + "/" + n);
   }
   closedir(d);
   if (files.empty()) {
-    *err = dir + ": no gpu<N>.bin files";
+    *err = dir + ": no xgmi_gpu<N>.bin files";
     return false;
   }
   std::sort(files.begin(), files.end());

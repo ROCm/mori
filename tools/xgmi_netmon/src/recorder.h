@@ -25,7 +25,7 @@
 // ainic-netmon) with clock_nanosleep(TIMER_ABSTIME), preads gpu_metrics and, when
 // firmware_timestamp changed, offers the record to the writer ring and the push ring. It never
 // blocks and never allocates: a full ring drops the record and counts it.
-// Writer: drains the rings into DIR/gpu<N>.bin every 100 ms.
+// Writer: drains the rings into DIR/xgmi_gpu<N>.bin every 100 ms.
 // Push: every 1 s turns new records into interval points (rates.h) and POSTs them; a failed POST
 // drops its points (counted) and is never resent.
 #pragma once
@@ -41,7 +41,7 @@ struct RecordOptions {
   uint64_t period_ns = 2000000;
   std::string push_url;    // empty: no live push
   std::string experiment;  // empty: name of the output's parent directory
-  std::string host_id;     // empty: first DNS label of the hostname
+  std::string host_id;     // empty: the hostname
   std::string drm_root = "/sys/class/drm";
 };
 
