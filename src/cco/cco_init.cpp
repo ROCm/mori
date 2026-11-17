@@ -794,6 +794,7 @@ static int CcoCommCreateSteps(ccoComm* comm, size_t perRankVmmSize, const ccoCom
   perRankVmmSize = AlignUp(perRankVmmSize, 1ULL << 32);
   comm->perRankSize = perRankVmmSize;
 
+  bool anySpansHosts = false;  // some rank's LSA team spans hosts
   // Probe fabric handle support: try to allocate + export with the fabric
   // handle type. If it works, all subsequent allocations use fabric handles
   // (64-byte tokens exchangeable via Allgather) instead of dma-buf FDs
@@ -825,6 +826,26 @@ static int CcoCommCreateSteps(ccoComm* comm, size_t perRankVmmSize, const ccoCom
         }
       }
     }
+    // The handle type picks ccoWindowRegister's collectives, so all ranks must share it:
+    // fabric only if every rank's probe succeeded.
+    struct Probe {
+      int fabric;
+      int spansHosts;
+    };
+    Probe mine = {comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat) ? 1 : 0,
+                  lsaSpansHosts ? 1 : 0};
+    std::vector<Probe> allProbes(comm->worldSize);
+    comm->bootNet->Allgather(&mine, allProbes.data(), sizeof(Probe));
+    int nFabric = 0;
+    for (const Probe& p : allProbes) {
+      nFabric += p.fabric;
+      anySpansHosts = anySpansHosts || p.spansHosts;
+    }
+    if (mine.fabric && nFabric != comm->worldSize) {
+      MORI_SHMEM_INFO("ccoCommCreate: fabric handles on only {}/{} ranks; using the FD path",
+                      nFabric, comm->worldSize);
+      comm->handleType = static_cast<int>(hipMemHandleTypePosixFileDescriptor);
+    }
     if (comm->handleType != static_cast<int>(hipMemHandleTypeFabricCompat)) {
       // A failed probe is an expected fallback, but it leaves the runtime's sticky
       // last-error set; the next framework call that checks hipGetLastError()
@@ -841,15 +862,15 @@ static int CcoCommCreateSteps(ccoComm* comm, size_t perRankVmmSize, const ccoCom
   // already describe the (contiguous) team; here we just require fabric and flag
   // that peer mapping must go cross-node (fabric import, no hipDeviceEnablePeer-
   // Access). A scale-up fabric is mandatory — fail loudly if it's missing.
+  // Every rank fails together, so none is left waiting in a later collective.
+  if (anySpansHosts && comm->handleType != static_cast<int>(hipMemHandleTypeFabricCompat)) {
+    MORI_SHMEM_ERROR(
+        "ccoCommCreate: an LSA team spans hosts (cross-node vPOD) but fabric handle support "
+        "is missing on some rank — cannot map peer VAs across nodes. Fix the fabric/driver, "
+        "or scope MORI_VPOD_ID to a single host.");
+    return -1;
+  }
   if (lsaSpansHosts) {
-    if (comm->handleType != static_cast<int>(hipMemHandleTypeFabricCompat)) {
-      MORI_SHMEM_ERROR(
-          "ccoCommCreate: LSA team spans hosts (cross-node vPOD, lsaSize={}) but fabric "
-          "handle support is unavailable — cannot map peer VAs across nodes. Fix the "
-          "fabric/driver, or scope MORI_VPOD_ID to a single host.",
-          comm->lsaSize);
-      return -1;
-    }
     comm->fabricCrossNodeLsa = true;
     MORI_SHMEM_INFO("ccoCommCreate: cross-node vPOD LSA enabled (lsaSize={} spans hosts)",
                     comm->lsaSize);
