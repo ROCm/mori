@@ -370,9 +370,7 @@ std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
         "mori v2 ep: the push combine is gfx125x only (it moves every token through TDM)");
   }
   return RenderEpSource(cfg, EntryName(cfg),
-                        !EpCombineScatter(cfg)    ? "EpCombineBody"
-                        : cfg.combineScatterPlain ? "EpCombineScatterPlainBody"
-                                                  : "EpCombineScatterBody",
+                        EpCombineScatter(cfg) ? "EpCombineScatterBody" : "EpCombineBody",
                         "EpCombine1250xBody");
 }
 
