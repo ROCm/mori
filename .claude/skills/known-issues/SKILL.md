@@ -442,6 +442,16 @@ number of peer-memory MRs on it:
 | In-tree amdgpu without the fix: mainline 6.9 – 7.3, and stable / longterm kernels without the backport | −S (dma-buf only; in-tree amdgpu has no peer-memory client) | −S | OOM |
 | amdgpu-dkms 31.40.1.1 (6.19.14.31400101, AMD internal); Linux 7.4-rc1+, 7.3.4+, 6.18.63+ | Exact | Exact | Fine |
 
+**30.x vs 31.x:** `hipMemGetInfo` is computed the same way on both; the allocation limit
+is what changed.
+
+- **30.x:** the limit uses the same count as `hipMemGetInfo`, credit included. Only
+  dma-buf registration breaks allocations, and `hipMemGetInfo` shows it. Registering
+  through peer memory, or adding an anchor MR, avoids it.
+- **31.x:** the limit no longer credits pins, so any registration breaks allocations,
+  through peer memory as well. With peer memory, `hipMemGetInfo` still looks normal and
+  hides the problem. Nothing on the registration side helps.
+
 Measured: on 6.16.6, registering 32 GiB through dma-buf lowers `hipMemGetInfo` by 32 GiB
 and a later 239 GiB allocation fails; on 6.19.14.31400100, registering 40 GiB lowers the
 largest accepted allocation by 80 GiB through dma-buf and through peer memory alike
