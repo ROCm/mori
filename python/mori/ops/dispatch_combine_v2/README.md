@@ -11,8 +11,9 @@ backends:
 - **hip** (the default on gfx125x): C++/HIP kernels JIT-compiled by the v2 JIT
   framework. Gather combine in bf16/fp32. With a `quant_type`, a quantized
   combine: a scatter combine on gfx942/gfx950 and the push combine on gfx125x
-  (see "Combine quant types"). On gfx1250 also a bf16 push combine (see "HIP V2
-  configuration interface" below). The dispatch leg also
+  (see "Combine quant types"). On gfx942/gfx950 a `max_total_recv_tokens` below
+  the worst case drops the slots past it, as FlyDSL does. On gfx1250 also a bf16
+  push combine (see "HIP V2 configuration interface" below). The dispatch leg also
   carries fp8 and fp4 (transport only — it moves an already-quantized payload).
   A dedicated gfx125x TDM body is selected by arch. **The only backend with an
   internode path** (bf16/f32/fp8, plus packed fp4 dispatch with bf16/fp32

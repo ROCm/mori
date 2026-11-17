@@ -159,7 +159,12 @@ class EpDispatchCombineConfig:
     # resolved in _resolve_geometry. AsyncLL sizes its grids from the CU count instead.
     tuning_profile: str = None
     enable_std_moe: bool = False
-    max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
+    # Recv slots a rank holds (mori maxTotalRecvTokens); 0 = the worst case ws*M.
+    # The capacity is effective_max_recv: this rounded up to a multiple of
+    # world_size, at most ws*M. One pool per receiving rank, first come first
+    # served: a slot past it is dropped (null in the dest map, adds nothing to
+    # combine), and total_recv = min(demand, capacity); equal means full.
+    max_total_recv_tokens: int = 0
     # --- internode -----------------------------------------------------------
     # GPUs per physical node. None => one node (== world_size), which is what
     # every intranode config is and keeps their behaviour unchanged. Setting it
@@ -737,7 +742,8 @@ class EpDispatchCombineConfig:
 
     @property
     def max_recv(self):
-        """Sentinel / sender-side atomic-add allocation bound (always ws*M)."""
+        """The worst-case recv count ws*M. The dest-map null is
+        ws*effective_max_recv, not this."""
         return self.world_size * self.max_num_inp_token_per_rank
 
     @property

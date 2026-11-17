@@ -78,6 +78,12 @@ class Dist:
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
         return float(t.item())
 
+    def allgather(self, t):
+        """Every rank's CPU tensor; shapes may differ between ranks."""
+        objs = [None] * self.world
+        dist.all_gather_object(objs, t.cpu())
+        return objs
+
     def shutdown(self):
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -258,9 +264,26 @@ def _run(d, comm):
                         f"(rows read before the barrier == after; recv={total_recv})",
                         flush=True,
                     )
-            idx_c = idx[:ct].cpu().numpy()
-            # local_expert_count: global sum over ranks == world*ct*K (every
-            # (token,k) assignment is recorded on exactly the rank owning it).
+            # The PEs each token reaches: from the routing alone, or under a cap from
+            # the dest map (a dup or dropped slot is null; gfx125x never caps, and its
+            # LL128 map is not flat-encoded).
+            idx_cpu = idx[:ct].cpu()
+            pes = torch.where(idx_cpu >= 0, idx_cpu // EPR, -1)
+            reach = [{int(p) for p in row if p >= 0} for row in pes]
+            stride = cfg.effective_max_recv
+            if cap is not None:
+                dmap = routing.disp_dest_tok_id_map[: ct * K].cpu().view(ct, K)
+                kept = dmap < npes * stride
+                reach = [
+                    {int(f) // stride for f in row[k]} for row, k in zip(dmap, kept)
+                ]
+            # each reached row carries every k whose expert lives on its PE
+            lec_mine = sum(
+                sum(1 for p in pes[t].tolist() if p >= 0 and p in reach[t])
+                for t in range(ct)
+            )
+            # local_expert_count: global sum over ranks == the (token,k) assignments
+            # whose PE kept the token (world*ct*K uncapped).
             # Capability-gated: a backend that does not implement this says so
             # through op.capabilities rather than by failing at the call.
             has_lec = "local_expert_count" in getattr(op, "capabilities", frozenset())
@@ -268,7 +291,7 @@ def _run(d, comm):
             sync()
             comm.barrier()
             lec_total = d.allreduce_sum(lec_sum)
-            lec_exp = d.allreduce_sum(ct) * K
+            lec_exp = d.allreduce_sum(lec_mine)
             if rank == 0 and has_lec:
                 ok_lec = lec_total == lec_exp
                 print(
@@ -344,22 +367,55 @@ def _run(d, comm):
                         f"wts={'ok' if ok_dw else 'BAD'})",
                         flush=True,
                     )
-            if cap is not None:
-                # Capped run: over-cap tokens are intentionally dropped (mori
-                # parity), so identity-verify won't hold. Validate the cap is
-                # respected and nothing OOB/crashed.
-                op.combine(recv_x, routing=routing)
-                sync()
-                comm.barrier()
-                ok = total_recv <= cap
+            # Every rank receives min(demand, capacity): all of it without a cap.
+            demand = sum(
+                sum(
+                    1
+                    for row in other.tolist()
+                    if rank in {e // EPR for e in row if e >= 0}
+                )
+                for other in d.allgather(idx_cpu)
+            )
+            ok_recv = total_recv == min(demand, stride)
+            if cap is None:
+                errs = d.allreduce_sum(0 if ok_recv else 1)
+                if rank == 0:
+                    print(
+                        f"# OP-RECV ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
+                        f"(recv={total_recv} == demand)",
+                        flush=True,
+                    )
+            else:
+                # Drops depend on atomic order, so check invariants, not which tokens.
+                maps, revs = d.allgather(dmap), d.allgather(
+                    routing.disp_tok_id_to_src_tok_id_local[:total_recv].cpu()
+                )
+                ok = ok_recv
+                for src, m in enumerate(maps):
+                    t, k = (m < npes * stride).nonzero(as_tuple=True)
+                    pe, slot = m[t, k] // stride, m[t, k] % stride
+                    for p in range(npes):
+                        sel = pe == p
+                        if not bool(sel.any()):
+                            continue
+                        s_ = slot[sel].long()
+                        ok &= bool((s_ < len(revs[p])).all())
+                        if ok:
+                            got = revs[p][s_]
+                            ok &= torch.equal(got, (src * M + t[sel]).to(got.dtype))
+                    ok &= bool((pe < npes).all())
+                sent = d.allreduce_sum(int(kept.sum()))
+                ok &= d.allreduce_sum(total_recv) == sent
                 errs = d.allreduce_sum(0 if ok else 1)
                 if rank == 0:
                     print(
                         f"# OP-CAP ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
-                        f"(recv={total_recv} <= cap={cap}, no OOB)",
+                        f"(recv={total_recv} = min(demand, cap={cap}); kept slots "
+                        f"{sent} match the recv sum and the reverse maps)",
                         flush=True,
                     )
-                continue
+                if STDMOE:
+                    continue
             rel = 0.0  # relative L2 error of a quantized combine
             if STDMOE:
                 op.convert_dispatch_output()  # identity GEMM: packed_x = token
@@ -386,12 +442,8 @@ def _run(d, comm):
                 out, out_w = op.combine(recv_x, wts[:ct], routing=routing)
                 sync()
                 comm.barrier()
-                U = np.array(
-                    [
-                        len({int(idx_c[t, j]) // EPR for j in range(K)})
-                        for t in range(ct)
-                    ]
-                )
+                # unique destination PEs the token reached (all of them unless capped)
+                U = np.array([len(r) for r in reach])
                 exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
                 if _IS_FP4:
                     # fp4 combine is too lossy for a numeric hidden check (mirror v1);

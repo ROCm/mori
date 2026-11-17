@@ -220,8 +220,8 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
 ```
 
 `MakeEpCfg` 也是拒绝非法组合的地方：`EpCfgIsValid` 不过就抛（token 字节数必须 16B 对齐、
-topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏情况），combine 那条腿上的字节类型
-单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。
+topk 和 worldSize 必须装进一个 wavefront），低于最坏情况的 recv 容量只在 gfx125x 上拒绝（那里的 body
+不丢 token），combine 那条腿上的字节类型单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。
 
 ### 3.6 环境变量
 
