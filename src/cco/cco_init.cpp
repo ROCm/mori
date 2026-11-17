@@ -63,19 +63,17 @@ namespace cco {
 
 namespace detail {
 namespace {
-thread_local std::string tlsErrors;
-constexpr size_t kMaxErrorText = 2048;
+thread_local TlsText<2048> tlsErrors;
 }  // namespace
 
 void RecordError(const std::string& msg) {
-  if (tlsErrors.size() >= kMaxErrorText) return;
-  if (!tlsErrors.empty()) tlsErrors += "; ";
-  tlsErrors += msg;
+  if (tlsErrors.len != 0) tlsErrors.Append("; ", 2);
+  tlsErrors.Append(msg);
 }
 
 std::string TakeErrors() {
-  std::string out;
-  out.swap(tlsErrors);
+  std::string out(tlsErrors.text, tlsErrors.len);
+  tlsErrors.Clear();
   return out;
 }
 }  // namespace detail

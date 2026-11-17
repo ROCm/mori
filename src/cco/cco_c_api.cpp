@@ -70,14 +70,13 @@ constexpr uint64_t kKnownCommFlags = MORI_CCO_COMM_NO_CPU_AFFINITY | MORI_CCO_CO
  * Errors
  * ------------------------------------------------------------------------- */
 
-thread_local std::string tlsLastError;
+thread_local detail::TlsText<4096> tlsLastError;
 
 int Fail(int code, const char* entry, const char* msg) noexcept {
-  try {
-    tlsLastError = std::string(entry) + ": " + msg;
-  } catch (...) {
-    tlsLastError.clear();
-  }
+  tlsLastError.Clear();
+  tlsLastError.Append(entry, std::strlen(entry));
+  tlsLastError.Append(": ", 2);
+  tlsLastError.Append(msg, std::strlen(msg));
   return code;
 }
 
@@ -101,7 +100,7 @@ int HipFail(const char* entry, const char* call, hipError_t err) {
 // Runs one entry: clears the last error, and turns any exception into a code.
 template <typename Body>
 int Guard(const char* entry, Body&& body) noexcept {
-  tlsLastError.clear();
+  tlsLastError.Clear();
   try {
     (void)detail::TakeErrors();
     return body();
@@ -239,7 +238,7 @@ class Registry {
   std::unordered_map<uintptr_t, std::shared_ptr<WindowState>> windows_;
 };
 
-// Never destroyed: handles may be released from atexit hooks after static teardown.
+// Never destroyed, like the error text: handles may be released from atexit hooks.
 Registry& Reg() {
   static Registry* r = new Registry();
   return *r;
@@ -302,14 +301,14 @@ int ReleaseWindowLocked(ccoComm* comm, WindowState& w) {
  * ------------------------------------------------------------------------- */
 
 int GetVersion(int* abiMajor, int* abiMinor, const char** libraryVersion) {
-  tlsLastError.clear();
+  tlsLastError.Clear();
   if (abiMajor) *abiMajor = MORI_CCO_ABI_MAJOR;
   if (abiMinor) *abiMinor = MORI_CCO_ABI_MINOR;
   if (libraryVersion) *libraryVersion = MORI_VERSION_STRING;
   return MORI_CCO_SUCCESS;
 }
 
-const char* GetLastError() { return tlsLastError.c_str(); }
+const char* GetLastError() { return tlsLastError.text; }
 
 int GetUniqueId(moriCcoUniqueId_t* uniqueId) {
   constexpr const char* kEntry = "getUniqueId";

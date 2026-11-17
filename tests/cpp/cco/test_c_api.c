@@ -204,6 +204,39 @@ static int test_bad_args(void) {
   return 0;
 }
 
+// ---- the ABI from an atexit hook (no GPU) ----
+
+// By now exit() has destroyed the C++ thread_locals; the error text must outlive them.
+static void exit_hook(void) {
+  for (int i = 0; i < 4; i++) {
+    if (api.commDestroy((moriCcoComm_t)(uintptr_t)0xdead0000) != MORI_CCO_ERROR_INVALID_ARGUMENT ||
+        strcmp(api.getLastError(), "commDestroy: unknown comm handle") != 0)
+      _exit(3);
+    if (api.windowRelease((moriCcoWindow_t)(uintptr_t)0xdead0001) !=
+            MORI_CCO_ERROR_INVALID_ARGUMENT ||
+        strcmp(api.getLastError(), "windowRelease: unknown or released window") != 0)
+      _exit(4);
+  }
+  if (api.getVersion(NULL, NULL, NULL) != MORI_CCO_SUCCESS || api.getLastError()[0] != '\0')
+    _exit(5);
+}
+
+static int test_exit_hook(void) {
+  pid_t pid = fork();
+  if (pid < 0) FAIL("fork");
+  if (pid == 0) {
+    // Leave error text too long for the small-string buffer on this thread.
+    (void)api.commDestroy((moriCcoComm_t)(uintptr_t)0xdead0000);
+    if (atexit(exit_hook) != 0) _exit(2);
+    exit(0);
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid) FAIL("waitpid");
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    FAIL("C ABI called from an atexit hook: child status %#x", status);
+  return 0;
+}
+
 // ---- one rank ----
 
 static int fill(void* dst, uint32_t value, size_t bytes) {
@@ -477,7 +510,7 @@ int main(int argc, char** argv) {
 
   if (get(MORI_CCO_ABI_MAJOR, &api, sizeof(api)) != MORI_CCO_SUCCESS) FAIL("moriCcoGetApi");
   if (api.size != sizeof(api) || api.abiMajor != MORI_CCO_ABI_MAJOR) FAIL("table header");
-  if (test_table(get) || test_bad_args()) return 1;
+  if (test_table(get) || test_bad_args() || test_exit_hook()) return 1;
   printf("=== table and argument checks PASSED ===\n");
 
   moriCcoUniqueId_t uid;

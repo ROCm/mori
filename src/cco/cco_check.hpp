@@ -27,8 +27,11 @@
 // kept per thread, so the C ABI (cco_c_api.cpp) can return them as text.
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <string>
+#include <type_traits>
 
 #include "hip/hip_runtime_api.h"
 #include "mori/utils/mori_log.hpp"
@@ -36,6 +39,28 @@
 namespace mori {
 namespace cco {
 namespace detail {
+
+// Per-thread error text with no destructor. exit() destroys C++ thread_locals
+// before it runs atexit hooks and static destructors, and the C ABI may be
+// called from those, so this storage must outlive them. Truncates.
+template <size_t N>
+struct TlsText {
+  char text[N];
+  size_t len;
+
+  void Clear() {
+    len = 0;
+    text[0] = '\0';
+  }
+  void Append(const char* s, size_t n) {
+    n = std::min(n, N - 1 - len);
+    std::memcpy(text + len, s, n);
+    len += n;
+    text[len] = '\0';
+  }
+  void Append(const std::string& s) { Append(s.data(), s.size()); }
+};
+static_assert(std::is_trivially_destructible_v<TlsText<2>>, "TlsText must have no destructor");
 
 // Appends to this thread's error text (the first error is usually the cause).
 void RecordError(const std::string& msg);
