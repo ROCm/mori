@@ -129,8 +129,9 @@ class LinkManager {
     uint64_t id{0};
     int fd{-1};
     bool outbound{false};
-    bool pending{false};  // inbound before its HELLO; counts against kMaxPendingInbound
-    bool broken{false};   // a send failed; closed at the end of the loop iteration
+    bool pending{false};     // inbound before its HELLO; counts against kMaxPendingInbound
+    bool broken{false};      // a send failed; closed at the end of the loop iteration
+    bool peerClosed{false};  // the peer's close came with the bytes being processed
     bool inEpoll{false};
     Phase phase{Phase::kAwaitingHello};
     RuntimeUuid peer;     // expected for outbound, from the HELLO for inbound

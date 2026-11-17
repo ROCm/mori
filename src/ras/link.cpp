@@ -660,12 +660,7 @@ void LinkManager::OnReadable(Conn* c, uint64_t now) {
     if (eof) CloseConn(c);
     return;
   }
-  // The peer gave up on this connection before its HELLO was read, as when this process was
-  // stopped; bringing the link up would only take it down again.
-  if (eof && c->phase == Phase::kAwaitingHello) {
-    CloseConn(c);
-    return;
-  }
+  c->peerClosed = eof;
   if (rxMono != 0 && !ProcessFrames(c, rxMono)) return;
   if (!eof) return;
   Link* l = LinkOf(c);
@@ -810,6 +805,12 @@ bool LinkManager::OnHelloRequest(Conn* c, const proto::RasHeader& h, const proto
     RAS_LOG_DEBUG("RAS refused a HELLO from runtime {} on {}: {}", peer.ToString(),
                   req.identity.hostname, StatusName(reject));
     RejectHello(c, reject, now);
+    return false;
+  }
+  // The peer closed this connection with its HELLO, so it gave up on it, as when this process
+  // was stopped. Bringing the link up would only take it down again.
+  if (c->peerClosed) {
+    CloseConn(c);
     return false;
   }
   if (it == links_.end()) {

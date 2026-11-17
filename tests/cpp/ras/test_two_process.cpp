@@ -28,6 +28,7 @@
 #include <gtest/gtest.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -43,9 +44,12 @@
 
 #include "mori/io/engine.hpp"
 #include "mori/ras/ras.hpp"
+#include "tests/cpp/ras/fake_peer.hpp"
 
 using namespace mori::io;
 using namespace mori::ras;
+using ras_test::FakePeer;
+namespace proto = mori::ras::proto;
 
 namespace {
 
@@ -140,6 +144,14 @@ std::string CheckLink(const std::string& cond, const RuntimeUuid& peer) {
   if (cond == "undisturbed") {
     bool ok = l->state == LinkState::kConnected && l->disconnects == 0 && l->connects == 1;
     return ok ? "" : "link " + state;
+  }
+  if (cond == "up_once") {
+    return l->state == LinkState::kConnected && l->connects == 1 ? "" : "link " + state;
+  }
+  if (cond == "read_whole") {
+    if (s.protocolErrors < 1) return "the garbage wasn't a protocol error";
+    bool ok = l->state == LinkState::kConnected && l->connects == 1 && l->disconnects == 0;
+    return ok ? "" : "link " + state + ", connects " + std::to_string(l->connects);
   }
   if (cond == "resumed") {
     int closes = 0;
@@ -320,6 +332,49 @@ TEST(RasTwoProcess, AProcessResumedFromAStopDoesntTimeOutItsPeer) {
   ASSERT_EQ(kill(b->pid, SIGCONT), 0);
   EXPECT_EQ(b->Ask("WAIT resumed"), "OK");
   EXPECT_EQ(a->Ask("WAIT heartbeats"), "OK");
+}
+
+// Connections that open and close while a process is stopped are read whole when it resumes,
+// bytes and close together. Garbage must still count as a protocol error, and a peer's HELLO
+// must not replace the live link only to close it.
+TEST(RasTwoProcess, ConnectionsThatCloseWhileStoppedAreReadWhole) {
+  std::unique_ptr<Child> a = Spawn("a");
+  ASSERT_TRUE(a);
+  EngineDesc fakeDesc = UnpackDesc(a->desc);
+  RasEndpoint ea{fakeDesc.ras.host, fakeDesc.ras.port, fakeDesc.ras.token,
+                 RuntimeUuid{fakeDesc.ras.uuidHi, fakeDesc.ras.uuidLo}};
+  // Below A's UUID, so the fake's HELLO would win over the connection A opened.
+  FakePeer fake(RuntimeUuid{ea.uuid.hi, ea.uuid.lo - 1}, "fake-token");
+  RasEndpoint ef = fake.Endpoint();
+  fakeDesc.key = "engine-fake";
+  fakeDesc.pid = getpid();
+  fakeDesc.backendDescs.clear();
+  fakeDesc.ras.port = ef.port;
+  fakeDesc.ras.token = ef.token;
+  fakeDesc.ras.uuidHi = ef.uuid.hi;
+  fakeDesc.ras.uuidLo = ef.uuid.lo;
+  ASSERT_EQ(a->Ask("REGISTER " + PackDesc(fakeDesc)), "OK");
+  int link = fake.Accept(5000);
+  ASSERT_GE(link, 0);
+  ASSERT_TRUE(fake.Recv(link, 5000).has_value());  // A's HELLO request
+  ASSERT_TRUE(fake.Send(link, 1, fake.Reply(proto::HelloStatus::kOk)));
+  ASSERT_EQ(a->Ask("WAIT up_once"), "OK");
+
+  ASSERT_EQ(kill(a->pid, SIGSTOP), 0);
+  int garbage = fake.Connect(ea.port);
+  ASSERT_GE(garbage, 0);
+  ASSERT_TRUE(FakePeer::SendRaw(garbage, std::vector<uint8_t>(64, 'x')));
+  shutdown(garbage, SHUT_WR);
+  int hello = fake.Connect(ea.port);
+  ASSERT_GE(hello, 0);
+  ASSERT_TRUE(fake.Send(hello, 1, fake.RequestTo(ea)));
+  shutdown(hello, SHUT_WR);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ASSERT_EQ(kill(a->pid, SIGCONT), 0);
+  EXPECT_EQ(a->Ask("WAIT read_whole"), "OK");
+  // A HELLO that brought the link up would show as a second connect, so look again later.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_EQ(a->Ask("WAIT read_whole"), "OK");
 }
 
 // A forked child's exit runs the atexit handler it inherited, which must leave the parent's
