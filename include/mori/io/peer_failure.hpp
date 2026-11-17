@@ -116,7 +116,9 @@ class PeerFailureTracker {
   // pending event stays drainable after the endpoint is gone.
   void ForgetQp(const QpKey& qp);
   // The QP was destroyed, so its number can name a new QP: drops its association and
-  // its failure records too. Pending events are copies and stay drainable.
+  // its failure records too, and its CQ's once no registered QP uses that CQ, as it was
+  // destroyed with it and its address can name a new CQ. Pending events are copies and
+  // stay drainable.
   void ReleaseQp(const QpKey& qp);
 
   // Records a failure, or clears one on recovery. Repeats fold into the first.

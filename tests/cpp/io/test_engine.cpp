@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1948,6 +1949,75 @@ void CaseRdmaDeregisterRacesTransfersAndRegistration() {
   a.backend->DeregisterMemory(srcDesc);
 }
 
+// A connection the peer asked for that is still being accepted when a deregistration of
+// that peer begins is waited out and torn down with the rest: the deregistration neither
+// detaches it halfway, which left the server publishing an endpoint already gone, nor
+// lets it outlive the teardown.
+void CaseRdmaDeregisterWaitsOutAnIncomingConnection() {
+#ifndef MORI_IO_FAULT_INJECTION
+  throw TestSkip("requires a build with ENABLE_IO_FAULT_INJECTION");
+#else
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+  if (!RdmaBackend::HasActiveDevices()) throw TestSkip("requires at least one active RDMA device");
+  ScopedEnvVar qps("MORI_IO_QP_PER_TRANSFER", "1");
+  constexpr size_t kSize = 64 * 1024;
+  constexpr auto kHold = std::chrono::milliseconds(300);
+  // Destroyed after the backends, so their server threads are gone when the hook goes.
+  struct ClearHookOnExit {
+    ~ClearHookOnExit() { ControlPlaneServer::testIncomingConnected = nullptr; }
+  } clearHookOnExit;
+
+  DirectRdmaBackend a = MakeDirectRdmaBackend("incoming_initiator");
+  DirectRdmaBackend b = MakeDirectRdmaBackend("incoming_target");
+  a.backend->RegisterRemoteEngine(b.desc);
+  b.backend->RegisterRemoteEngine(a.desc);
+  RegisteredGpuMem src = AllocGpu(kSize, 0xF6);
+  RegisteredGpuMem dst = AllocGpu(kSize, 0x00);
+  MemoryDesc srcDesc = RegisterOnBackend(a, src, kSize);
+  MemoryDesc dstDesc = RegisterOnBackend(b, dst, kSize);
+
+  // The target holds the first connection the initiator asks for between connecting its
+  // endpoint and publishing it.
+  std::promise<void> connected;
+  std::atomic<bool> fired{false};
+  ControlPlaneServer::testIncomingConnected = [&](const EngineKey& ekey) {
+    if (ekey != a.desc.key || fired.exchange(true)) return;
+    connected.set_value();
+    std::this_thread::sleep_for(kHold);
+  };
+  std::unique_ptr<BackendSession> sess;
+  std::string buildError;
+  std::thread builder([&] {
+    try {
+      sess.reset(a.backend->CreateSession(srcDesc, dstDesc));
+    } catch (const std::exception& e) {
+      buildError = e.what();
+    }
+  });
+  const bool held =
+      connected.get_future().wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+  const auto start = std::chrono::steady_clock::now();
+  if (held) b.backend->DeregisterRemoteEngine(a.desc);
+  const auto waited = std::chrono::steady_clock::now() - start;
+  builder.join();
+  Require(held, "the initiator's connection never reached the target: " + buildError);
+  Require(buildError.empty(), "the connection the target accepted failed: " + buildError);
+  Require(waited >= kHold / 2,
+          "the deregistration did not wait for the connection being accepted (" +
+              std::to_string(
+                  std::chrono::duration_cast<std::chrono::milliseconds>(waited).count()) +
+              " ms)");
+  Require(b.backend->NumConnectedEndpoints() == 0,
+          std::to_string(b.backend->NumConnectedEndpoints()) +
+              " target QP(s) outlived the deregistration that began while accepting them");
+
+  sess.reset();
+  a.backend->DeregisterRemoteEngine(b.desc);
+  b.backend->DeregisterMemory(dstDesc);
+  a.backend->DeregisterMemory(srcDesc);
+#endif
+}
+
 // Writes kXfer bytes from srcBase + offset to dstBase + offset over the dma-buf
 // registration path and checks the payload landed at dstBase + offset, not at
 // dstBase. Both bases point at allocations of at least allocSize bytes.
@@ -2725,6 +2795,8 @@ int main(int argc, char* argv[]) {
       {"rdma_deregister_leaves_an_uncut_qp_running", CaseRdmaDeregisterLeavesAnUncutQpRunning},
       {"rdma_deregister_races_transfers_and_registration",
        CaseRdmaDeregisterRacesTransfersAndRegistration},
+      {"rdma_deregister_waits_out_an_incoming_connection",
+       CaseRdmaDeregisterWaitsOutAnIncomingConnection},
       {"rdma_dmabuf_interior_range_transfer", CaseRdmaDmabufInteriorRangeTransfer},
       {"rdma_dmabuf_vmm_interior_range_transfer", CaseRdmaDmabufVmmInteriorRangeTransfer},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},

@@ -362,6 +362,29 @@ void CaseReleaseQpForgetsFailure() {
   Require(event.remoteEngineKey == "decode-0", "attribution happens at record time");
 }
 
+// A failed CQ stays failed while a QP on it is left, and is forgotten with the last one:
+// a new CQ allocated at its address must not inherit the failure.
+void CaseReleaseQpForgetsItsCqFailure() {
+  PeerFailureTracker tracker;
+  tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
+  tracker.RegisterQp(Qp(11), "decode-0", kPort1, kCqA);
+  tracker.RegisterQp(Qp(12, "mlx5_1"), "decode-0", kPort1, kCqA);
+  tracker.Report(CqFailure("mlx5_0", kCqA));
+  tracker.Report(CqFailure("mlx5_1", kCqA));
+
+  tracker.ReleaseQp(Qp(10));
+  Require(tracker.NeedsQpReplacement(Qp(11)), "a QP still on the failed CQ must stay condemned");
+  tracker.ReleaseQp(Qp(11));
+  tracker.RegisterQp(Qp(13), "decode-1", kPort1, kCqA);
+  Require(tracker.IsQpAlive(Qp(13)), "a QP on a new CQ at a released CQ's address must be alive");
+  Require(tracker.NeedsQpReplacement(Qp(12, "mlx5_1")),
+          "the same address on another device is another CQ, still failed");
+
+  PeerFailureEvent event;
+  Require(tracker.Pop(&event) && tracker.Pop(&event),
+          "the CQ failures already queued must survive ReleaseQp");
+}
+
 // A deregistered engine's queued failures go; another engine's stay, in order.
 void CaseDropPendingForgetsOneEngine() {
   PeerFailureTracker tracker;
@@ -482,6 +505,7 @@ int main() {
       {"LateRegistrationCannotAttribute", CaseLateRegistrationCannotAttribute},
       {"ForgetQpKeepsFailure", CaseForgetQpKeepsFailure},
       {"ReleaseQpForgetsFailure", CaseReleaseQpForgetsFailure},
+      {"ReleaseQpForgetsItsCqFailure", CaseReleaseQpForgetsItsCqFailure},
       {"DropPendingForgetsOneEngine", CaseDropPendingForgetsOneEngine},
       {"FifoOrder", CaseFifoOrder},
       {"BoundedQueueDropsNewest", CaseBoundedQueueDropsNewest},

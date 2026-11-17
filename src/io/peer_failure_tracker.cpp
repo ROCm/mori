@@ -40,7 +40,17 @@ void PeerFailureTracker::ForgetQp(const QpKey& qp) {
 
 void PeerFailureTracker::ReleaseQp(const QpKey& qp) {
   std::lock_guard<std::mutex> lock(mu_);
-  qpOwners_.erase(qp);
+  auto it = qpOwners_.find(qp);
+  if (it != qpOwners_.end()) {
+    const void* cq = it->second.cqHandle;
+    qpOwners_.erase(it);
+    // The CQ goes with the last QP on it, and a new CQ can be allocated at its address.
+    const bool cqInUse =
+        std::any_of(qpOwners_.begin(), qpOwners_.end(), [&](const auto& owner) {
+          return owner.second.cqHandle == cq && owner.first.deviceName == qp.deviceName;
+        });
+    if (cq != nullptr && !cqInUse) failedCqs_.erase(CqKey{qp.deviceName, cq});
+  }
   failedQps_.erase(qp);
   erroredQps_.erase(qp);
 }

@@ -997,7 +997,7 @@ void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) 
   // Its remote engine may have been deregistered since the endpoint was connected. Checked
   // under mu, which UnregisterEndpoints takes only after RemoveEndpoints, so it cannot be
   // missed.
-  if (rdma->GetEndpointRuntime(rt->id) == nullptr) return;
+  if (rt == nullptr || rdma->GetEndpointRuntime(rt->id) == nullptr) return;
 
   if (config.pollCqMode == PollCqMode::EVENT) {
     epoll_event ev;
@@ -1436,6 +1436,47 @@ std::optional<int> ControlPlaneServer::TryGetRemoteEnginePort(const EngineKey& e
   return it->second.port;
 }
 
+#ifdef MORI_IO_FAULT_INJECTION
+std::function<void(const EngineKey&)> ControlPlaneServer::testIncomingConnected;
+#endif
+
+class ControlPlaneServer::IncomingConn {
+ public:
+  IncomingConn(ControlPlaneServer& server, const EngineKey& ekey) : server_(server), ekey_(ekey) {
+    std::lock_guard<std::mutex> lock(server_.incomingMu_);
+    if (server_.incomingBlocked_.count(ekey_) != 0) {
+      throw std::runtime_error("RegEndpoint: remote engine " + ekey_ +
+                               " is being deregistered; refusing its connection");
+    }
+    server_.incomingInFlight_[ekey_]++;
+  }
+  ~IncomingConn() {
+    std::lock_guard<std::mutex> lock(server_.incomingMu_);
+    auto it = server_.incomingInFlight_.find(ekey_);
+    if (--it->second > 0) return;
+    server_.incomingInFlight_.erase(it);
+    server_.incomingDone_.notify_all();
+  }
+
+  IncomingConn(const IncomingConn&) = delete;
+  IncomingConn& operator=(const IncomingConn&) = delete;
+
+ private:
+  ControlPlaneServer& server_;
+  EngineKey ekey_;
+};
+
+void ControlPlaneServer::BlockIncoming(const EngineKey& ekey) {
+  std::unique_lock<std::mutex> lock(incomingMu_);
+  incomingBlocked_.insert(ekey);
+  incomingDone_.wait(lock, [&] { return incomingInFlight_.count(ekey) == 0; });
+}
+
+void ControlPlaneServer::AllowIncoming(const EngineKey& ekey) {
+  std::lock_guard<std::mutex> lock(incomingMu_);
+  incomingBlocked_.erase(ekey);
+}
+
 void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nicRank) {
   application::TCPEndpointHandle tcph;
   {
@@ -1538,6 +1579,9 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
     case MessageType::RegEndpoint: {
       MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
       int rdevId = msg.devId;
+      // Held until the endpoint is published, so a deregistration of msg.ekey either
+      // finds it or refuses it, never detaches it halfway.
+      IncomingConn incoming(*this, msg.ekey);
 
       // Rail affinity: if the sender provided a valid railId, use the same
       // availDevices index so that both endpoints sit on the same network rail
@@ -1570,6 +1614,9 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       EndpointId eid =
           rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
       pendingEndpoint.Commit();
+#ifdef MORI_IO_FAULT_INJECTION
+      if (testIncomingConnected) testIncomingConnected(msg.ekey);
+#endif
       auto ert = rdma->GetEndpointRuntime(eid);
       notif->RegisterEndpoint(ert);
       p.WriteMessageRegEndpoint(
@@ -2007,6 +2054,13 @@ void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   // Unregistered first, so no new connection to it can start; then wait out the ones
   // already being built, so none lands after the endpoints are detached.
   server->DeregisterRemoteEngine(rdesc);
+  // Likewise for the connections it asks this engine for, until the teardown is done.
+  server->BlockIncoming(ekey);
+  struct AllowIncomingOnExit {
+    ControlPlaneServer* server;
+    const EngineKey& ekey;
+    ~AllowIncomingOnExit() { server->AllowIncoming(ekey); }
+  } allowIncomingOnExit{server.get(), ekey};
   std::vector<std::shared_ptr<std::mutex>> buildLocks;
   {
     std::lock_guard<std::mutex> guard(connBuildMapMu_);

@@ -25,12 +25,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "mori/application/topology/topology.hpp"
@@ -319,6 +322,16 @@ class ControlPlaneServer {
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
   std::optional<int> TryGetRemoteEnginePort(const EngineKey&) const;
+  // Refuses the connections a remote engine asks for until AllowIncoming, and waits out
+  // the one being accepted, so none is published while that engine is being torn down.
+  // Not to be called on the server thread.
+  void BlockIncoming(const EngineKey&);
+  void AllowIncoming(const EngineKey&);
+#ifdef MORI_IO_FAULT_INJECTION
+  // Tests only: runs on the server thread between connecting the endpoint a remote engine
+  // asked for and publishing it.
+  static std::function<void(const EngineKey&)> testIncomingConnected;
+#endif
 
   // Endpoint management
   void BuildRdmaConn(EngineKey, TopoKeyPair, int nicRank);
@@ -334,6 +347,10 @@ class ControlPlaneServer {
   void Shutdown();
 
  private:
+  // Counts a connection a remote engine asked for while its endpoint is created and
+  // published; refuses it while that engine is blocked.
+  class IncomingConn;
+
   void AcceptRemoteEngineConn();
   void HandleControlPlaneProtocol(int fd);
   void DropConnection(int fd) noexcept;
@@ -354,6 +371,11 @@ class ControlPlaneServer {
   NotifManager* notif{nullptr};
   std::unordered_map<EngineKey, EngineDesc> engines;
   std::unordered_map<MemoryUniqueId, MemoryDesc> mems;
+
+  std::mutex incomingMu_;
+  std::condition_variable incomingDone_;
+  std::unordered_set<EngineKey> incomingBlocked_;
+  std::unordered_map<EngineKey, int> incomingInFlight_;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
