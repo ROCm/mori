@@ -567,6 +567,7 @@ class EpDispatchCombineConfig:
                     self.hidden_dim,
                     self.num_experts_per_token,
                     dtype=self.dtype_str,
+                    quant=self.quant_type != "none",
                 )
             self.dispatch_block_num = t["dispatch_block_num"]
             self.combine_block_num = t["combine_block_num"]
@@ -1166,7 +1167,9 @@ class EpDispatchCombineOp:
     @staticmethod
     def _specs_from(cfg):
         """The (block, warp) variants to build, de-duplicated from the schedule."""
-        if cfg.schedule and not cfg.is_scatter:
+        # A plain scatter keeps one combine geometry; the gather's buckets are not
+        # tuned for it. A quantized one takes the buckets lookup(quant=True) gave.
+        if cfg.schedule and (not cfg.is_scatter or cfg.quant_type != "none"):
             disp = sorted({(db, dw) for (_, db, dw, _, _) in cfg.schedule})
             comb = sorted({(cb, cw) for (_, _, _, cb, cw) in cfg.schedule})
         elif cfg.schedule:

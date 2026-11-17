@@ -97,3 +97,24 @@ def test_every_schedule_is_well_formed(device):
         assert ceilings == sorted(set(ceilings)) and min(ceilings, default=1) >= 1, name
         for row in schedule:
             _check_geometry(name, cu, wave, *row[1:])
+
+
+@pytest.mark.parametrize("device", sorted(tc._QUANT_COMBINE))
+def test_quantized_combine_takes_its_own_buckets(monkeypatch, device):
+    cu, wave = _DEVICE_LIMITS[device]
+    monkeypatch.setattr(tc, "_device_key", lambda: device)
+    monkeypatch.setattr(tc.gpu_utils, "cu_count", lambda: cu)
+    for shape, buckets in tc._QUANT_COMBINE[device].items():
+        assert buckets[-1][0] is None
+        plain = tc.lookup(*shape, dtype="bf16")
+        quant = tc.lookup(*shape, dtype="bf16", quant=True)
+        for edge, block, warp in buckets:
+            _check_geometry(f"{device} {shape}", cu, wave, 1, 1, block, warp)
+            tok = edge or 1 << 20
+            row = next(r for r in quant["schedule"] if r[0] is None or tok <= r[0])
+            assert row[3:] == (block, warp)
+            # the dispatch half stays the dtype's
+            ref = next(r for r in plain["schedule"] if r[0] is None or tok <= r[0])
+            assert row[1:3] == ref[1:3]
+        got = (quant["combine_block_num"], quant["combine_warp_num_per_block"])
+        assert got == buckets[-1][1:]
