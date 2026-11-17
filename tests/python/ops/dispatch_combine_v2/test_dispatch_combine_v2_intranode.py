@@ -258,6 +258,15 @@ def _cases():
             **extra,
         }
     yield "bf16-stdmoe", {"DTYPE": "bf16", "COMBINE": "gather", "STDMOE": 1}
+    # The hip backend's gather path; OP-LEC runs in every case. No TUNED here: it
+    # injects FlyDSL's table, and hip resolves its own.
+    hip = {"MORI_V2_KERNEL_BACKEND": "hip", "COMBINE": "gather"}
+    yield "hip-bf16-gather", dict(hip, DTYPE="bf16")
+    yield "hip-bf16-gather-scales-ragged", dict(
+        hip, DTYPE="bf16", SCALE_DIM=32, RAGGED=1, NOSELF=1
+    )
+    yield "hip-bf16-gather-topk9", dict(hip, DTYPE="bf16", TOPK=9)
+    yield "hip-bf16-gather-reroute", dict(hip, DTYPE="bf16", REROUTE=8)
 
 
 _CASES = dict(_cases())
@@ -282,7 +291,7 @@ def case_output():
         for c in _CASES
         if (_IS_GFX950 or c not in _GFX950_ONLY) and not _refused_quant(c)
     ]
-    rc, out = _run({"CASES": json.dumps([_CASES[c] for c in ids])}, timeout=1800)
+    rc, out = _run({"CASES": json.dumps([_CASES[c] for c in ids])}, timeout=3600)
     parts = {c: ([], False) for c in ids}
     current = None
     for ln in out.splitlines():
@@ -315,9 +324,13 @@ def test_dispatch_combine_v2_intranode(case, case_output):
     _assert_all_pass(0, text)
 
 
-def test_op_lifecycle():
+@pytest.mark.parametrize("backend", ["default", "hip"])
+def test_op_lifecycle(backend):
     """Repeated op build/close on one comm must not leak (see test_op_lifecycle.py)."""
     script = os.path.join(_HERE, "test_op_lifecycle.py")
+    env = os.environ.copy()
+    if backend != "default":
+        env["MORI_V2_KERNEL_BACKEND"] = backend
     cmd = [
         sys.executable,
         "-m",
@@ -329,10 +342,39 @@ def test_op_lifecycle():
     proc = subprocess.run(
         cmd,
         cwd=_HERE,
-        env=os.environ.copy(),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        timeout=300,
+        timeout=600,
     )
     assert "# LIFECYCLE: PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout}"
+
+
+@pytest.mark.parametrize("knobs", [{"LEC": 1}])
+def test_graph_capture_hip_local_kernels(knobs):
+    """local_expert_count inside a captured, replayed step."""
+    script = os.path.join(_HERE, "test_graph_capture.py")
+    env = os.environ.copy()
+    env.update({k: str(v) for k, v in knobs.items()})
+    env["MORI_V2_KERNEL_BACKEND"] = "hip"
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={_NPROC}",
+        script,
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=_HERE,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=900,
+    )
+    assert (
+        "# GRAPH-CAPTURE: PASS" in proc.stdout
+    ), f"rc={proc.returncode}\n{proc.stdout}"

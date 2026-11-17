@@ -1089,3 +1089,128 @@ def test_plain_scatter_lands_one_unquantized_row_per_source_token(dtype, elem):
     )
     with pytest.raises(RuntimeError, match="combineScatter"):
         cb.EpCombinePlan.describe(**kw, combine_scatter_q_group=128)
+
+
+# --------------------------------------------------------------------------
+# The local kernels
+# --------------------------------------------------------------------------
+
+_LOCAL_KW = dict(
+    world_size=2,
+    hidden_dim=1024,
+    max_tok_per_rank=64,
+    num_expert_per_rank=4,
+    num_expert_per_token=4,
+    block_num=8,
+    warp_per_block=4,
+)
+
+
+def _local(name):
+    cls = cb.local_plan(name)
+    assert cls is not None, f"{name} is not registered"
+    return cls
+
+
+def _stream():
+    return torch.cuda.current_stream().cuda_stream
+
+
+def test_registry_lists_the_local_kernels():
+    plans = cb.registered_plans()
+    for name in cb.LOCAL_PLANS:
+        assert name in plans
+
+
+@pytest.mark.parametrize("name", cb.LOCAL_PLANS)
+def test_local_plans_bind_no_arena_region(name):
+    # Every pointer is local: a `window` or off<Region> field would be bound from
+    # an arena the op never passes.
+    names = _local(name)._arg_names
+    assert "window" not in names
+    assert not [n for n in names if n.startswith("off") and n[3:4].isupper()]
+
+
+@pytest.mark.parametrize("name", cb.LOCAL_PLANS)
+def test_local_describe_matches_the_built_plan(name):
+    cls = _local(name)
+    described = cls.describe(**_LOCAL_KW)
+    assert described["sharedBytes"] == 0 and described["gridX"] == 8
+    assert described["recvRows"] == 128
+    assert not [k for k in described if k.startswith("region.")]
+    p = cls(**_LOCAL_KW)
+    built = p.info
+    p.close()
+    assert described.pop("cacheDir") == ""
+    built.pop("cacheDir")
+    assert described == built
+
+
+def test_local_count_ignores_the_token_dtype():
+    _local("ep_local_expert_count").describe(**dict(_LOCAL_KW, dtype="fp8"))
+
+
+@pytest.mark.parametrize("name", cb.LOCAL_PLANS)
+@pytest.mark.parametrize(
+    "kw", [dict(num_expert_per_token=65), dict(num_expert_per_rank=8193)]
+)
+def test_local_plans_refuse_what_they_cannot_hold(name, kw):
+    # top-k past the wave; experts past the LDS histogram
+    with pytest.raises(RuntimeError, match="inconsistent config"):
+        _local(name).describe(**dict(_LOCAL_KW, **kw))
+
+
+def _count(idx, rank, epr, rows):
+    ids = idx[:rows].flatten().long() - rank * epr
+    ids = ids[(ids >= 0) & (ids < epr)]
+    return torch.bincount(ids, minlength=epr).to(torch.int32)
+
+
+@pytest.mark.parametrize(
+    "epr,topk,total,rank",
+    [(4, 4, 100, 1), (1, 1, 128, 0), (4, 8, 1000, 1), (16, 8, 0, 0), (300, 2, 128, 1)],
+)
+def test_local_expert_count_counts_this_ranks_ids(epr, topk, total, rank):
+    kw = dict(_LOCAL_KW, num_expert_per_rank=epr, num_expert_per_token=topk)
+    p = _local("ep_local_expert_count")(**kw)
+    dev = torch.device("cuda", torch.cuda.current_device())
+    rows = p.info["recvRows"]
+    g = torch.Generator().manual_seed(epr * 100 + topk)
+    # Negative and past-the-end ids are skipped; a total past the rows is clamped.
+    idx = torch.randint(-3, 2 * epr + 3, (rows, topk), generator=g, dtype=torch.int32)
+    out = torch.full((epr,), -1, dtype=torch.int32, device=dev)
+    out.zero_()
+    p.launch(
+        stream=_stream(),
+        out_idx=idx.to(dev),
+        total_recv=torch.tensor([total], dtype=torch.int32, device=dev),
+        expert_count=out,
+        rank=rank,
+    )
+    torch.cuda.synchronize()
+    p.close()
+    assert torch.equal(out.cpu(), _count(idx, rank, epr, min(total, rows)))
+
+
+def _bare_op(backend_cls, **kernels):
+    from mori.ops.dispatch_combine_v2.dispatch_combine_op import KernelSet
+
+    op = object.__new__(backend_cls)
+    op._kernels = KernelSet(dispatch={}, combine={}, **kernels)
+    return op
+
+
+def test_local_expert_count_without_a_kernel_raises_and_is_not_advertised():
+    from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+
+    op = _bare_op(EpDispatchCombineOpHip)
+    assert "local_expert_count" not in op.capabilities
+    with pytest.raises(NotImplementedError, match="local_expert_count"):
+        op.local_expert_count()
+
+
+def test_local_expert_count_capability_follows_the_kernel():
+    from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+
+    op = _bare_op(EpDispatchCombineOpHip, local_expert_count=lambda **_: None)
+    assert "local_expert_count" in op.capabilities

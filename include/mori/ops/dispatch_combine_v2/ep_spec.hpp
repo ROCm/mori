@@ -32,6 +32,7 @@
 
 #include "mori/jit/v2/spec.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_cfg.hpp"
+#include "mori/ops/dispatch_combine_v2/ep_local_cfg.hpp"
 
 namespace mori {
 namespace ops {
@@ -167,6 +168,27 @@ class EpCombineSpec : public mori::jit::v2::KernelSpec<EpCombineSpec, EpCfg> {
   static mori::jit::v2::LaunchGeometry Geometry(const Cfg& cfg);
   static const std::vector<std::string>& SourceDeps();
 };
+
+// ---------------------------------------------------------------------------
+// The local kernels (ep_local_cfg.hpp): their own Cfg, no arena.
+// ---------------------------------------------------------------------------
+EpLocalCfg MakeEpLocalCfg(const std::string& arch, const EpLocalRequest& req);
+std::string EpLocalRequestSchema();
+std::string EpLocalInfo(const EpLocalCfg& cfg);
+
+#define MORI_EP_LOCAL_SPEC(CLASS, NAME)                               \
+  class CLASS : public mori::jit::v2::KernelSpec<CLASS, EpLocalCfg> { \
+   public:                                                            \
+    using Args = EpLocalArgs;                                         \
+    static constexpr const char* kName = NAME;                        \
+    static std::string EntryName(const Cfg& cfg);                     \
+    static std::string RenderSource(const Cfg& cfg);                  \
+    static mori::jit::v2::LaunchGeometry Geometry(const Cfg& cfg);    \
+    static const std::vector<std::string>& SourceDeps();              \
+  };
+
+MORI_EP_LOCAL_SPEC(EpLocalExpertCountSpec, "ep_local_expert_count")
+#undef MORI_EP_LOCAL_SPEC
 
 }  // namespace v2
 }  // namespace ops

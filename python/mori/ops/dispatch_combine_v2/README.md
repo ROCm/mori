@@ -17,7 +17,8 @@ backends:
   a quant type runs an unquantized bf16/fp32 scatter combine. On gfx1250 also a bf16
   push combine (see "HIP V2 configuration interface" below). The dispatch leg also
   carries fp8 and fp4 (transport only — it moves an already-quantized payload).
-  A dedicated gfx125x TDM body is selected by arch. **The only backend with an
+  A dedicated gfx125x TDM body is selected by arch. On gfx942/gfx950 it also
+  serves `local_expert_count()`. **The only backend with an
   internode path** (bf16/f32/fp8, plus packed fp4 dispatch with bf16/fp32
   combine; no quant/StdMoE/scatter). Works on a machine with no FlyDSL. See
   `docs/MORI_JIT_V2_DESIGN.md`.

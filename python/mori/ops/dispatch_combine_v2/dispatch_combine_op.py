@@ -777,6 +777,11 @@ class KernelSet:
     # Replay-routing dispatch. None = this backend has no replay.
     dispatch_replay: dict[tuple, Callable] | None = None
 
+    # Local kernels over the last dispatch's recv rows; None = not served, and the
+    # capability follows. The base owns the methods and buffers; each callable
+    # takes total_recv= (and out=) and runs on the current stream.
+    local_expert_count: Callable | None = None
+
     # The AsyncLL split (HIP only). Each is keyed like `dispatch` (KernelConfig),
     # but launches only half the pass sequence, so the caller can put its own work
     # between the two. None = this backend runs send and recv in one launch and
@@ -1080,7 +1085,9 @@ class EpDispatchCombineOp:
 
     @property
     def capabilities(self) -> frozenset[str]:
-        return self._kernels.capabilities
+        k = self._kernels
+        derived = {"local_expert_count"} if k.local_expert_count else set()
+        return k.capabilities | derived
 
     def scale_stride_bytes(self) -> int:
         """Bytes between consecutive out_scales rows, 0 when off.
@@ -1237,6 +1244,33 @@ class EpDispatchCombineOp:
             )
             self._reverse_view = reverse
         return reverse, None
+
+    # -- shared: the local kernels ------------------------------------------
+
+    def _alloc_local_buffers(self, cfg):
+        """The local kernels' op-owned outputs."""
+        self._local_expert_count_buf = torch.zeros(
+            cfg.num_experts_per_rank, dtype=torch.int32, device=self.dev
+        )
+
+    def local_expert_count(self):
+        """[num_experts_per_rank] int32: how many (row, k) of the last dispatch's
+        recv_indices()[:total_recv] name each of this rank's experts. Other ranks',
+        negative and out-of-range ids are skipped; a repeated id counts twice.
+
+        Valid after a dispatch until the next one (call it before combine to stay
+        backend independent). Returns one persistent buffer, rewritten by every
+        call. No host sync and no allocation, so it can be graph-captured.
+        """
+        kern = self._kernels.local_expert_count
+        if kern is None:
+            raise NotImplementedError(
+                f"the {self.backend_name} backend has no local_expert_count for this op"
+            )
+        out = self._local_expert_count_buf
+        out.zero_()
+        kern(total_recv=self.total_recv, out=out)
+        return out
 
     # -- shared: the ops ---------------------------------------------------
 

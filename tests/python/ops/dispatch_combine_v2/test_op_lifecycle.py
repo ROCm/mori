@@ -57,6 +57,11 @@ def _cfg(rank, npes):
     )
 
 
+def _plans_closed(op):
+    # hip keeps its JIT plans in op._plans; flydsl has none.
+    return all(p._handle is None for p in getattr(op, "_plans", ()))
+
+
 def main():
     rank = int(os.environ["RANK"])
     npes = int(os.environ["WORLD_SIZE"])
@@ -77,7 +82,7 @@ def main():
             grew = len(comm._resources) - base
             op.close()
             op.close()  # idempotent
-            if grew != 2 or len(comm._resources) != base:
+            if grew != 2 or len(comm._resources) != base or not _plans_closed(op):
                 ok = False
         # context manager exercises __enter__/__exit__.
         with EpDispatchCombineOp(_cfg(rank, npes), comm):
