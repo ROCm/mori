@@ -54,6 +54,12 @@ graph capture as in ``time``, then ``--timeline-calls`` replays, reading the dev
 after each. The events of every call on every rank go to ``--timeline-out``; the result
 holds the phase summary of ``benchmark/cco/harness/timeline.py``. One more call is checked.
 
+``trace``: the same replays under ``torch.profiler``, for any implementation, the existing
+operator included: every kernel's name, start and duration, call by call on every rank,
+written to ``--timeline-out`` in ``timeline.py``'s format (``<kernel>:start@<n>``,
+``<kernel>:end@<n>`` for its n-th launch in the call). What runs on the copy engines does
+not show; the kernels that post and wait for it do.
+
 ``--impl-kwargs '{"mode": "fused"}'`` passes keyword switches to the implementation's
 constructor, and the ones it declares to ``window_bytes_for``, so a variant needs no class
 of its own.
@@ -65,6 +71,8 @@ import importlib
 import importlib.util
 import inspect
 import json
+import tempfile
+from collections import Counter
 import os
 import random
 import statistics
@@ -106,7 +114,9 @@ def build_parser():
         required=True,
         help="file.py:Class, package.module:Class, or an alias: " + ", ".join(ALIASES),
     )
-    p.add_argument("--mode", choices=("time", "check", "timeline"), default="time")
+    p.add_argument(
+        "--mode", choices=("time", "check", "timeline", "trace"), default="time"
+    )
     p.add_argument(
         "--impl-kwargs",
         default="{}",
@@ -128,7 +138,9 @@ def build_parser():
     p.add_argument("--skew-ms", type=float, default=5.0)
     p.add_argument("--call-timeout", type=float, default=120.0)
     p.add_argument("--timeline-calls", type=int, default=10)
-    p.add_argument("--timeline-out", help="where --mode timeline writes every event")
+    p.add_argument(
+        "--timeline-out", help="where --mode timeline or trace writes every event"
+    )
     p.add_argument("--json-out")
     return p
 
@@ -150,6 +162,72 @@ def accepted(fn, kwargs):
     if any(p.kind is p.VAR_KEYWORD for p in params.values()):
         return dict(kwargs)
     return {k: v for k, v in kwargs.items() if k in params}
+
+
+def _ts(e):
+    return float(e.get("ts", 0.0))
+
+
+def kernel_calls(trace, calls):
+    """A chrome trace's kernels as ``calls`` lists of timeline events, one per replay.
+
+    Kernels are grouped by the graph launch they were correlated with when the trace
+    says so, and otherwise split at the ``calls - 1`` largest gaps between kernels.
+    """
+    events = trace.get("traceEvents", []) if isinstance(trace, dict) else trace
+    kernels = sorted(
+        (
+            e
+            for e in events
+            if e.get("ph") == "X" and str(e.get("cat", "")).lower() == "kernel"
+        ),
+        key=_ts,
+    )
+    if not kernels:
+        return []
+    launches = sorted(
+        (
+            e
+            for e in events
+            if e.get("ph") == "X"
+            and "graphlaunch" in str(e.get("name", "")).lower()
+            and "correlation" in (e.get("args") or {})
+        ),
+        key=_ts,
+    )
+    index = {e["args"]["correlation"]: i for i, e in enumerate(launches)}
+    groups = {}
+    if index and all(
+        (k.get("args") or {}).get("correlation") in index for k in kernels
+    ):
+        for k in kernels:
+            groups.setdefault(index[k["args"]["correlation"]], []).append(k)
+        split = [groups[i] for i in sorted(groups)]
+    else:
+        gaps = sorted(
+            range(1, len(kernels)),
+            key=lambda i: _ts(kernels[i])
+            - _ts(kernels[i - 1])
+            - kernels[i - 1].get("dur", 0),
+        )
+        cuts = sorted(gaps[-(calls - 1) :]) if calls > 1 else []
+        split, last = [], 0
+        for c in cuts + [len(kernels)]:
+            split.append(kernels[last:c])
+            last = c
+    out = []
+    for group in split:
+        t0 = min(_ts(k) for k in group)
+        seen, rows = Counter(), []
+        for k in group:
+            name = str(k.get("name", "?")).replace("@", "_")
+            i = seen[name]
+            seen[name] += 1
+            start = _ts(k) - t0
+            rows.append([f"{name}:start@{i}", round(start, 3)])
+            rows.append([f"{name}:end@{i}", round(start + float(k.get("dur", 0.0)), 3)])
+        out.append(rows)
+    return out
 
 
 def normalize_events(events, ticks_per_us):
@@ -421,6 +499,41 @@ class _Run:
         self.finish("checked call")
         return statistics.median(samples), self.case(op, "time", a.m, 0, out.clone())
 
+    def trace(self, op):
+        torch, a = self.torch, self.args
+        from torch.profiler import ProfilerActivity, profile
+
+        x = activation(a.seed, self.rank, 0, a.m, a.k, self.device)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(a.warmup):
+                op(x)
+        torch.cuda.current_stream().wait_stream(side)
+        self.finish("trace warm-up")
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            op(x)
+        for _ in range(a.warmup):
+            g.replay()
+        self.finish("graph warm-up")
+        activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        with profile(activities=activities) as prof:
+            for _ in range(a.timeline_calls):
+                g.replay()
+                self.finish("traced replay")
+        fd, path = tempfile.mkstemp(suffix=".json", prefix=f"op_harness_r{self.rank}_")
+        os.close(fd)
+        try:
+            prof.export_chrome_trace(path)
+            calls = kernel_calls(json.loads(Path(path).read_text()), a.timeline_calls)
+        finally:
+            os.unlink(path)
+        del g
+        out = op(x)
+        self.finish("checked call")
+        return calls, self.case(op, "trace", a.m, 0, out.clone())
+
     def timeline(self, op):
         torch, a = self.torch, self.args
         x = activation(a.seed, self.rank, 0, a.m, a.k, self.device)
@@ -471,11 +584,10 @@ def run(args):
     args.m_max = args.m_max or args.m
     impl = load_impl(args.impl)
     kwargs = impl_kwargs(args.impl_kwargs)
-    if args.mode == "timeline":
-        if not hasattr(impl, "timeline_read"):
-            raise SystemExit("op_harness: --mode timeline needs timeline_read()")
-        if not args.timeline_out:
-            raise SystemExit("op_harness: --mode timeline needs --timeline-out")
+    if args.mode == "timeline" and not hasattr(impl, "timeline_read"):
+        raise SystemExit("op_harness: --mode timeline needs timeline_read()")
+    if args.mode in ("timeline", "trace") and not args.timeline_out:
+        raise SystemExit(f"op_harness: --mode {args.mode} needs --timeline-out")
     rank, world, uid = _setup_distributed()
     window = impl.window_bytes_for(
         world,
@@ -509,8 +621,8 @@ def run(args):
                     "validated": cases[0]["pass"],
                     "timing": "graph",
                 }
-            elif args.mode == "timeline":
-                calls, case = r.timeline(op)
+            elif args.mode in ("timeline", "trace"):
+                calls, case = (r.timeline if args.mode == "timeline" else r.trace)(op)
                 per_rank = [None] * world
                 dist.all_gather_object(per_rank, (calls, case))
                 cases = merge([[c] for _, c in per_rank])
@@ -524,6 +636,7 @@ def run(args):
                 }
                 if rank == 0:
                     data = {
+                        "source": "kernel trace" if args.mode == "trace" else "stamps",
                         "impl": args.impl,
                         "impl_kwargs": kwargs,
                         "m": args.m,

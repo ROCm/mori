@@ -34,6 +34,7 @@ which keep hidden paths off the command line:
 | `bench_gemm_ar.py --stop-after` times a prefix of the pipeline (`diagnosis.md`) | add a switch of your own to the candidate |
 | a CI ordering test in the style of `test_gemm_ar_bench.py` (step 5) | hidden; write your own: fused and split timed in one process, fused faster |
 | `run.py --dump-isa` | it dumps every kernel the launch compiles, the existing op's too: dump with [arms.isa.yaml](arms.isa.yaml), the candidate alone |
+| a kernel trace of the existing op (`op_harness.py --mode trace --impl existing`) | not in this case: its phase times are the facts' (`G950-GAR-09`). The black-box level is [gemm_ar_bf16_fused_opt](../gemm_ar_bf16_fused_opt/README.md)'s |
 
 `op_harness.py` times one call per CUDA graph, as the gemm_ar benchmark does. A
 single-call graph costs up to 13.4 µs more than its kernels (`G950-MEAS-01`), the same for
@@ -71,7 +72,7 @@ How the rule is kept:
 |---|---|---|
 | [contract.yaml](contract.yaml) | owner, main session | the task, targets, budget |
 | [interface.py](interface.py) | everyone | what an implementation exposes |
-| [op_harness.py](op_harness.py) | implementer (development), verifier (acceptance) | `--mode time`, `--mode check` and `--mode timeline` for any implementation of the interface; `--impl existing` for the existing op; `--impl-kwargs` for a variant's switches |
+| [op_harness.py](op_harness.py) | implementer (development), verifier (acceptance) | `--mode time`, `--mode check`, `--mode timeline` and `--mode trace` for any implementation of the interface; `--impl existing` for the existing op; `--impl-kwargs` for a variant's switches |
 | [existing.py](existing.py) | `op_harness.py --impl existing` | the existing op behind the interface (hidden: run it, do not read it) |
 | [arms.bounds.yaml](arms.bounds.yaml) | implementer | step 1: the split path and the GEMM alone, through the existing benchmark |
 | [arms.dev.yaml](arms.dev.yaml) | implementer | candidate against the existing op, interleaved |

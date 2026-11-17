@@ -180,3 +180,8 @@ its guard and audit, and a recorded baseline. See
 hours, the owner's prompts after the kickoff, wall time, tokens and cost, and the audit.
 `--append <case>/results.md` adds the run's row to the case's results, the baseline that
 later changes to the harness are compared against.
+
+| Case | Kind | Reference access | Question |
+|---|---|---|---|
+| [gemm_ar_bf16](cases/gemm_ar_bf16/README.md) | new | clean | build a BF16 GEMM + all-reduce within 5% of the existing op without its code |
+| [gemm_ar_bf16_fused_opt](cases/gemm_ar_bf16_fused_opt/README.md) | optimize | blackbox | bring the first run's fused candidate to the existing op without leaving its structure |

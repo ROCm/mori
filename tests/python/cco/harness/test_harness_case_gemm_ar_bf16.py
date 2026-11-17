@@ -570,3 +570,85 @@ def test_timeline_events_are_normalized_per_call():
     ]
     assert harness.normalize_events([], 100.0) == []
     assert hasattr(harness._harness_module("timeline"), "summarize")
+
+
+def _kernel(name, ts, dur, corr=None):
+    e = {"ph": "X", "cat": "kernel", "name": name, "ts": ts, "dur": dur}
+    if corr is not None:
+        e["args"] = {"correlation": corr}
+    return e
+
+
+def test_kernel_traces_split_into_calls():
+    launches = [
+        {
+            "ph": "X",
+            "cat": "cuda_runtime",
+            "name": "hipGraphLaunch",
+            "ts": t,
+            "dur": 5,
+            "args": {"correlation": c},
+        }
+        for t, c in ((0.0, 7), (1000.0, 9))
+    ]
+    kernels = [
+        _kernel("gemm@chunk", 10.0, 50.0, 7),
+        _kernel("gemm@chunk", 62.0, 50.0, 7),
+        _kernel("drain", 115.0, 300.0, 7),
+        _kernel("gemm@chunk", 1010.0, 52.0, 9),
+        _kernel("drain", 1070.0, 310.0, 9),
+    ]
+    calls = harness.kernel_calls({"traceEvents": launches + kernels}, 2)
+    assert calls[0] == [
+        ["gemm_chunk:start@0", 0.0],
+        ["gemm_chunk:end@0", 50.0],
+        ["gemm_chunk:start@1", 52.0],
+        ["gemm_chunk:end@1", 102.0],
+        ["drain:start@0", 105.0],
+        ["drain:end@0", 405.0],
+    ]
+    assert calls[1][-1] == ["drain:end@0", 370.0]
+    # without correlations: cut at the largest gaps
+    bare = [_kernel(k["name"], k["ts"], k["dur"]) for k in kernels]
+    assert harness.kernel_calls(bare, 2) == calls
+    assert harness.kernel_calls({"traceEvents": []}, 3) == []
+    summary = harness._harness_module("timeline").summarize({"ranks": [calls]})
+    assert [p["group"] for p in summary["phases"]][:2] == ["gemm_chunk", "(gap)"]
+
+
+FUSED_OPT = REPO / "benchmark" / "cco" / "harness" / "cases" / "gemm_ar_bf16_fused_opt"
+
+
+def test_fused_opt_case_is_an_optimization_task(monkeypatch, tmp_path):
+    yaml = pytest.importorskip("yaml")
+    contract = yaml.safe_load((FUSED_OPT / "contract.yaml").read_text())
+    assert contract["kind"] == "optimize" and contract["reference_access"] == "blackbox"
+    start = contract["start_from"]
+    assert start["impl"] == "mori.ops.gemm_ar_v2.op:GemmArV2Fused"
+    assert set(start["measured_us"]) >= set(contract["workload"]["target_buckets"])
+    assert contract["targets"] == {
+        "reference": "existing",
+        "within_pct": 0,
+        "no_regression": [8192, 4096],
+    }
+    assert (REPO / contract["interface"]).is_file()
+    for key in ("hidden", "settings", "audit"):
+        assert (REPO / contract["clean_room"][key]).is_file(), key
+    monkeypatch.setenv("CANDIDATE", start["impl"])
+    for name in ("arms.dev.yaml", "arms.verify.yaml"):
+        arms = run.load_arms(FUSED_OPT / name)
+        assert [a["name"] for a in arms][:3] == ["existing", "candidate", "stream"]
+        assert arms[1]["args"][-1] == start["impl"]
+        assert all((REPO / a["bench"]).is_file() for a in arms)
+    task = tmp_path / "task"
+    task.mkdir()
+    text = (FUSED_OPT / "contract.yaml").read_text()
+    (task / "contract.yaml").write_text(
+        text.replace("approved: false", "approved: true")
+    )
+    loop_state = harness._harness_module("loop_state")
+    s = loop_state.state(task)
+    assert (
+        s["state"] == "continue"
+        and "re-baseline v2-fused against existing" in s["next"]
+    )
