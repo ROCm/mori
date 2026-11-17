@@ -342,6 +342,26 @@ void CaseForgetQpKeepsFailure() {
   Require(event.remoteEngineKey == "decode-0", "attribution happens at record time");
 }
 
+// A destroyed QP's number can name a new QP, which must not inherit the old failure;
+// the event already queued for the old one stays drainable.
+void CaseReleaseQpForgetsFailure() {
+  PeerFailureTracker tracker;
+  tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
+  tracker.Report(QpFailure(10));
+  tracker.RegisterQp(Qp(11), "decode-0", kPort1, kCqA);
+  tracker.MarkQpFailed(Qp(11));
+  tracker.ReleaseQp(Qp(10));
+  tracker.ReleaseQp(Qp(11));
+
+  tracker.RegisterQp(Qp(10), "decode-1", kPort1, kCqA);
+  Require(tracker.IsQpAlive(Qp(10)), "a new QP reusing a released number must be alive");
+  Require(!tracker.NeedsQpReplacement(Qp(11)), "a released errored QP must not stay condemned");
+
+  PeerFailureEvent event;
+  Require(tracker.Pop(&event), "the old QP's pending failure must survive ReleaseQp");
+  Require(event.remoteEngineKey == "decode-0", "attribution happens at record time");
+}
+
 // Events are drained oldest-first so the first cause is seen before its fallout.
 void CaseFifoOrder() {
   PeerFailureTracker tracker;
@@ -444,6 +464,7 @@ int main() {
       {"RepeatFailuresFoldIntoFirst", CaseRepeatFailuresFoldIntoFirst},
       {"LateRegistrationCannotAttribute", CaseLateRegistrationCannotAttribute},
       {"ForgetQpKeepsFailure", CaseForgetQpKeepsFailure},
+      {"ReleaseQpForgetsFailure", CaseReleaseQpForgetsFailure},
       {"FifoOrder", CaseFifoOrder},
       {"BoundedQueueDropsNewest", CaseBoundedQueueDropsNewest},
       {"PopNullptrIsSafe", CasePopNullptrIsSafe},

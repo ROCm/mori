@@ -43,6 +43,7 @@ class IBVerbsDeviceContext : public RdmaDeviceContext {
     void* buf;
     uint32_t lkey;
     uint32_t count;
+    ibv_mr* mr{nullptr};
   };
   ProxyRecvInfo GetProxyRecvInfo(uint32_t qpn) const;
 

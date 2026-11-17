@@ -89,7 +89,7 @@ from mori.io import (
 | `create_backend(type, config)` | Create an RDMA, XGMI, FABRIC or OFI backend (TCP only in simulation mode) |
 | `remove_backend(type)` | Remove a backend |
 | `register_remote_engine(desc)` | Register a remote engine |
-| `deregister_remote_engine(desc)` | Deregister a remote engine |
+| `deregister_remote_engine(desc)` | Deregister a remote engine. Over RDMA this tears down every QP to it: transfers still in flight fail, sessions to it report `alive()` False and fail new transfers, and each QP is freed once no session holds it. To reconnect, for example after the peer restarted or a QP failed, register the engine again and create new sessions; they get new QPs. The peer is not told: its own QPs to this engine fail on their next transfer |
 | `register_memory(ptr, size, device_id, mem_loc)` | Register memory by raw pointer |
 | `register_torch_tensor(tensor)` | Register a PyTorch tensor |
 | `deregister_memory(mem_desc)` | Deregister memory |

@@ -444,6 +444,8 @@ struct SqAdmissionEvent {
   std::atomic<uint32_t> waiters{0};
 };
 
+struct EndpointResources;
+
 struct EpPair {
   int weight;
   int ldevId;
@@ -463,6 +465,9 @@ struct EpPair {
   // queue really has beyond admission (kCompletionMarkerSlots, or 0 when it is too small
   // to spare them).
   int markerSlots{0};
+  // The QP's verbs objects, shared across EpPair copies that refer to the same QP. They
+  // are destroyed only after the last copy is gone, so no copy can reach a freed QP.
+  std::shared_ptr<EndpointResources> resources;
 };
 
 // Which endpoints a fatal async event takes down with it. A QP event hits one
@@ -477,11 +482,10 @@ struct EndpointRuntime {
 
   EndpointId id{0};
   EpPair ep;
-  // Cached pointer to this endpoint's NotifManager::QpNotifContext, published once
-  // at registration. Lets the hot CQ poller resolve the notif context without
-  // locking NotifManager::mu on every poll. Type-erased (void*) to avoid a header
-  // dependency on the NotifManager-private struct; nullptr until registered.
-  std::atomic<void*> notifCtx{nullptr};
+  // ep.resources once NotifManager has posted its notification buffer, published once
+  // at registration. Lets the hot CQ poller read the buffer without locking
+  // NotifManager::mu on every poll; nullptr until registered.
+  std::atomic<EndpointResources*> notifCtx{nullptr};
 };
 
 using EpPairVec = std::vector<EpPair>;

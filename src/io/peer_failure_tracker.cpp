@@ -37,6 +37,13 @@ void PeerFailureTracker::ForgetQp(const QpKey& qp) {
   qpOwners_.erase(qp);
 }
 
+void PeerFailureTracker::ReleaseQp(const QpKey& qp) {
+  std::lock_guard<std::mutex> lock(mu_);
+  qpOwners_.erase(qp);
+  failedQps_.erase(qp);
+  erroredQps_.erase(qp);
+}
+
 void PeerFailureTracker::Enqueue(PeerFailureEvent event) {
   if (pending_.size() >= kMaxPending) {
     dropped_++;
