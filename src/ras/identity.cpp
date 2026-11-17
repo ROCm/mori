@@ -28,6 +28,8 @@
 #include <fstream>
 #include <sstream>
 
+#include "src/ras/protocol.hpp"
+
 namespace mori {
 namespace ras {
 namespace {
@@ -37,6 +39,11 @@ std::string FirstLine(const std::string& path) {
   std::string line;
   std::getline(in, line);
   return line;
+}
+
+std::string Clip(std::string s) {
+  if (s.size() > proto::kMaxIdentityString) s.resize(proto::kMaxIdentityString);
+  return s;
 }
 
 // Requests are at most 16 bytes, which getrandom returns in full once the kernel's pool is
@@ -68,7 +75,7 @@ ProcessFacts ReadProcessFacts() {
   char link[64];
   ssize_t n = readlink("/proc/self/ns/pid", link, sizeof(link) - 1);
   if (n > 0) f.pidNamespace = InodeFromNsLink(std::string(link, static_cast<size_t>(n)));
-  f.bootId = FirstLine("/proc/sys/kernel/random/boot_id");
+  f.bootId = Clip(FirstLine("/proc/sys/kernel/random/boot_id"));
   return f;
 }
 
@@ -76,9 +83,9 @@ RasProcessId CollectIdentity(const std::string& nodeId, const std::string& hostn
                              const std::string& host, int32_t pid, RuntimeUuid uuid) {
   RasProcessId id;
   id.uuid = uuid;
-  id.nodeId = nodeId;
-  id.hostname = hostname;
-  id.host = host;
+  id.nodeId = Clip(nodeId);
+  id.hostname = Clip(hostname);
+  id.host = Clip(host);
   id.pid = pid;
   ProcessFacts facts = ReadProcessFacts();
   id.pidNamespace = facts.pidNamespace;

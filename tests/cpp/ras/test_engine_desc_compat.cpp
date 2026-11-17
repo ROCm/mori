@@ -156,23 +156,28 @@ TEST(RasEngineDesc, AnEngineAdvertisesItsRuntimesEndpointOnlyWhenRasRuns) {
               return 0;
             }),
             0);
-  EXPECT_EQ(ras_test::RunInChild([] {
-              setenv("MORI_RAS_ENABLE", "1", 1);
-              IOEngine a("engine-on-a", IOEngineConfig{"127.0.0.1", 0});
-              IOEngine b("engine-on-b", IOEngineConfig{"127.0.0.1", 0});
-              mori::ras::RasRuntime* rt = mori::ras::RasRuntime::Get();
-              CHILD_CHECK(rt != nullptr);
-              mori::ras::RasEndpoint ep = rt->Endpoint();
-              for (const IOEngine* e : {&a, &b}) {
-                const RasDesc& r = e->GetEngineDesc().ras;
-                CHILD_CHECK(r.host == "127.0.0.1");
-                CHILD_CHECK(r.port == ep.port);
-                CHILD_CHECK(r.token == ep.token);
-                CHILD_CHECK(r.uuidHi == ep.uuid.hi && r.uuidLo == ep.uuid.lo);
-              }
-              return 0;
-            }),
-            0);
+  EXPECT_EQ(
+      ras_test::RunInChild([] {
+        setenv("MORI_RAS_ENABLE", "1", 1);
+        IOEngine a("engine-on-a", IOEngineConfig{"127.0.0.1", 0});
+        IOEngine b("engine-on-b", IOEngineConfig{"127.0.0.1", 0});
+        mori::ras::RasRuntime* rt = mori::ras::RasRuntime::Get();
+        CHILD_CHECK(rt != nullptr);
+        mori::ras::RasEndpoint ep = rt->Endpoint();
+        for (const IOEngine* e : {&a, &b}) {
+          const RasDesc& r = e->GetEngineDesc().ras;
+          CHILD_CHECK(r.host == "127.0.0.1");
+          CHILD_CHECK(r.port == ep.port);
+          CHILD_CHECK(r.token == ep.token);
+          CHILD_CHECK(r.uuidHi == ep.uuid.hi && r.uuidLo == ep.uuid.lo);
+        }
+        // Engines in one process are one runtime: registering each other links nothing.
+        a.RegisterRemoteEngine(b.GetEngineDesc());
+        CHILD_CHECK(ras_test::WaitFor([&] { return rt->Snapshot().sameProcessPeers == 1; }, 2000));
+        CHILD_CHECK(rt->Snapshot().links.empty());
+        return 0;
+      }),
+      0);
   EXPECT_EQ(ras_test::RunInChild([] {
               std::vector<int> held;
               uint16_t port = ras_test::HoldPorts("0.0.0.0", mori::ras::kRasPortSpan, &held);
