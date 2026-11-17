@@ -36,6 +36,12 @@ target_include_directories(test_flat_yaml PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_flat_yaml PRIVATE gtest_main)
 add_test(NAME flat_yaml COMMAND test_flat_yaml)
 
+# PCI tree rules on synthetic sysfs functions: no GPU or host PCI bus needed.
+add_executable(test_pci_tree application/test_pci_tree.cpp)
+target_include_directories(test_pci_tree PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_pci_tree PRIVATE mori_application gtest_main)
+add_test(NAME pci_tree COMMAND test_pci_tree)
+
 add_executable(test_transport_tcp application/test_transport_tcp.cpp)
 
 target_include_directories(test_transport_tcp
