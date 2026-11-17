@@ -81,7 +81,7 @@ typedef struct {
   int count;
   int generation;
   int failed;
-  moriCcoUniqueId_t uid2;  // rank 0's id for the second comm
+  moriCcoUniqueId_t uid2, uid3;  // rank 0's ids for the later comms
 } Barrier;
 
 static Barrier* g_bar;
@@ -160,9 +160,15 @@ static int test_bad_args(void) {
   cfg.size = sizeof(size_t);
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.commCreate(&uid, 2, 0, &cfg, &comm));
   cfg.size = sizeof(cfg);
-  cfg.flags = (uint64_t)1 << 40;
+  cfg.flags = MORI_CCO_COMM_DEFAULT_FLAGS | ((uint64_t)1 << 40);
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.commCreate(&uid, 2, 0, &cfg, &comm));
+  // ABI 1.0 has no RDMA comm.
+  cfg.flags = MORI_CCO_COMM_NO_CPU_AFFINITY;
+  EXPECT_ERR(MORI_CCO_ERROR_NOT_SUPPORTED, api.commCreate(&uid, 2, 0, &cfg, &comm));
+  if (!strstr(api.getLastError(), "MORI_CCO_COMM_LSA_ONLY")) FAIL("%s", api.getLastError());
   cfg.flags = 0;
+  EXPECT_ERR(MORI_CCO_ERROR_NOT_SUPPORTED, api.commCreate(&uid, 2, 0, &cfg, &comm));
+  cfg.flags = MORI_CCO_COMM_DEFAULT_FLAGS;
   cfg.bootstrap = (const struct moriCcoBootstrap*)&cfg;
   EXPECT_ERR(MORI_CCO_ERROR_NOT_SUPPORTED, api.commCreate(&uid, 2, 0, &cfg, &comm));
   cfg.bootstrap = NULL;
@@ -276,22 +282,36 @@ static int rdma_loaded(void) {
   return found;
 }
 
-// A second comm with the default config: it pins this thread unless
-// MORI_IGNORE_CPU_AFFINITY is set, which shows the check above has teeth.
-static int default_comm(int rank, int nranks) {
-  if (rank == 0) OK(api.getUniqueId(&g_bar->uid2));
+// Comms with a NULL config and with pinning asked for. Neither maps an RDMA library.
+static int default_comms(int rank, int nranks) {
+  if (rank == 0) {
+    OK(api.getUniqueId(&g_bar->uid2));
+    OK(api.getUniqueId(&g_bar->uid3));
+  }
   BARRIER();
   cpu_set_t before, after;
   if (sched_getaffinity(0, sizeof(before), &before) != 0) FAIL("sched_getaffinity");
   moriCcoComm_t comm = NULL;
   OK(api.commCreate(&g_bar->uid2, nranks, rank, NULL, &comm));
   if (sched_getaffinity(0, sizeof(after), &after) != 0) FAIL("sched_getaffinity");
-  printf("[rank %d] default config: %d -> %d CPUs\n", rank, CPU_COUNT(&before), CPU_COUNT(&after));
+  if (!CPU_EQUAL(&before, &after))
+    FAIL("NULL config: %d CPUs became %d", CPU_COUNT(&before), CPU_COUNT(&after));
   moriCcoCommInfo_t info;
   info.size = sizeof(info);
   OK(api.commGetInfo(comm, &info));
-  if (info.flags != 0 || info.nRanks != nranks) FAIL("default comm info");
+  if (info.flags != MORI_CCO_COMM_DEFAULT_FLAGS || info.nRanks != nranks)
+    FAIL("NULL-config comm: flags %#llx", (unsigned long long)info.flags);
   OK(api.commDestroy(comm));
+
+  // Pins this thread unless MORI_IGNORE_CPU_AFFINITY is set, which shows the
+  // affinity checks have teeth.
+  moriCcoCommConfig_t cfg = MORI_CCO_COMM_CONFIG_INIT;
+  cfg.flags = MORI_CCO_COMM_LSA_ONLY;
+  OK(api.commCreate(&g_bar->uid3, nranks, rank, &cfg, &comm));
+  if (sched_getaffinity(0, sizeof(after), &after) != 0) FAIL("sched_getaffinity");
+  printf("[rank %d] pinning config: %d -> %d CPUs\n", rank, CPU_COUNT(&before), CPU_COUNT(&after));
+  OK(api.commDestroy(comm));
+  if (rdma_loaded() != 0) FAIL("an LSA-only comm mapped libibverbs");
   return 0;
 }
 
@@ -311,8 +331,7 @@ static int run_rank(int rank, int nranks, const moriCcoUniqueId_t* uid) {
   if (sched_getaffinity(0, sizeof(cpusAfter), &cpusAfter) != 0) FAIL("sched_getaffinity");
   if (!CPU_EQUAL(&cpusBefore, &cpusAfter))
     FAIL("NO_CPU_AFFINITY: %d CPUs became %d", CPU_COUNT(&cpusBefore), CPU_COUNT(&cpusAfter));
-  // Informational: with LSA_ONLY honoured, no RDMA library is loaded.
-  printf("[rank %d] LSA_ONLY comm: libibverbs %s\n", rank, rdma_loaded() ? "mapped" : "not mapped");
+  if (rdma_loaded() != 0) FAIL("LSA_ONLY comm mapped libibverbs");
 
   moriCcoCommInfo_t info;
   info.size = sizeof(info);
@@ -479,7 +498,7 @@ static int run_rank(int rank, int nranks, const moriCcoUniqueId_t* uid) {
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.windowRelease(win2));
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.devCommDestroy(comm, dev2));
 
-  if (default_comm(rank, nranks)) return 1;
+  if (default_comms(rank, nranks)) return 1;
 
   size_t freeAfter = 0;
   HIP(hipMemGetInfo(&freeAfter, &total));

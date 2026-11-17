@@ -351,6 +351,10 @@ int CommCreate(const moriCcoUniqueId_t* uniqueId, int nRanks, int rank,
       return Fail(MORI_CCO_ERROR_INVALID_ARGUMENT, kEntry,
                   fmt::format("unknown config->flags bits {:#x}", cfg.flags & ~kKnownCommFlags));
     }
+    if (!(cfg.flags & MORI_CCO_COMM_LSA_ONLY)) {
+      return Fail(MORI_CCO_ERROR_NOT_SUPPORTED, kEntry,
+                  "ABI 1.0 comms are LSA-only: config->flags must include MORI_CCO_COMM_LSA_ONLY");
+    }
     if (uniqueId == nullptr) {
       return Fail(MORI_CCO_ERROR_INVALID_ARGUMENT, kEntry, "uniqueId is NULL");
     }
@@ -382,7 +386,7 @@ int CommCreate(const moriCcoUniqueId_t* uniqueId, int nRanks, int rank,
     const ccoUniqueId& id = *reinterpret_cast<const ccoUniqueId*>(uniqueId);
     ccoCommConfig commConfig = CCO_COMM_CONFIG_INITIALIZER;
     commConfig.cpuAffinity = (cfg.flags & MORI_CCO_COMM_NO_CPU_AFFINITY) ? 0 : 1;
-    commConfig.lsaOnly = (cfg.flags & MORI_CCO_COMM_LSA_ONLY) ? 1 : 0;
+    commConfig.lsaOnly = 1;
     const int rc = ccoCommCreate(id, nRanks, rank, cfg.perRankVaBytes, &commConfig, &comm);
     if (rc != 0 || comm == nullptr) return CcoFail(kEntry, "ccoCommCreate");
 
