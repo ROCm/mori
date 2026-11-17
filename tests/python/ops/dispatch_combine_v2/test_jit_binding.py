@@ -1057,3 +1057,19 @@ def test_a_recv_cap_below_the_worst_case_drops_on_the_portable_body():
     full = cb.EpDispatchPlan.describe(**{**capped, "max_recv": 1024})
     for region in ("recvToSrc", "outIdx", "outWts", "dispOut"):
         assert info[f"region.{region}"] < full[f"region.{region}"], region
+
+
+def test_replay_is_its_own_dispatch_binary():
+    if cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        with pytest.raises(RuntimeError, match="replay"):
+            cb.EpDispatchPlan.describe(**_SMALL, replay=True)
+        return
+    info = cb.EpDispatchPlan.describe(**_SMALL, replay=True)
+    plain = cb.EpDispatchPlan.describe(**_SMALL)
+    assert (info["replay"], plain["replay"]) == (True, False)
+    # same arena: replay writes the regions the routing pass wrote
+    assert {k: v for k, v in info.items() if k.startswith("region.")} == {
+        k: v for k, v in plain.items() if k.startswith("region.")
+    }
+    with pytest.raises(RuntimeError, match="replay"):
+        cb.EpCombinePlan.describe(**_SMALL, replay=True)

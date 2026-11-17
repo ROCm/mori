@@ -444,7 +444,8 @@ class TokOffExt:
 
 
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
-    """C++/JIT-kernel EP op: gather combine, no quant, no replay.
+    """C++/JIT-kernel EP op: gather combine, the quantized combine, and on
+    gfx942/gfx950 the recv cap and routing replay.
 
     Dispatch transports bf16/fp32/fp8/fp4, combine reduces in bf16/fp32, and the
     two need not match -- an fp8-in/bf16-out op is just two plans with different
@@ -2115,9 +2116,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         bound = dict(arena=arena, region_names=_REGIONS)
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
-        dispatch, combine = {}, {}
+        dispatch, combine, replay = {}, {}, {}
         for spec in self._dispatch_specs:
-            sized = []
+            sized, replayed = [], []
             for cap, blocks in self._dispatch_variants(cfg, spec):
                 plan = cb.EpDispatchPlan(
                     **self._variant_request(disp_req, blocks),
@@ -2131,7 +2132,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     plan.bind(staging_base=self.dispatch_staging)
                 self._plans.append(plan)
                 sized.append((cap, plan, self._card is not None and not blocks))
+                # Built eagerly, so a first replay inside a graph capture compiles nothing.
+                if not self._is1250:
+                    plan = cb.EpDispatchPlan(
+                        **disp_req,
+                        **bound,
+                        block_num=spec.block_num,
+                        warp_per_block=spec.warp_per_block,
+                        call_tok_max=cap,
+                        replay=True,
+                    )
+                    plan.bind(rank=cfg.rank)
+                    self._plans.append(plan)
+                    replayed.append((cap, plan, False))
             dispatch[spec] = self._wrap_dispatch(sized)
+            if replayed:
+                replay[spec] = self._wrap_dispatch(replayed)
         for spec in self._combine_specs:
             plan = cb.EpCombinePlan(
                 **comb_req,
@@ -2177,7 +2193,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return KernelSet(
             dispatch=dispatch,
             combine=combine,
-            dispatch_replay=None,  # no replay path in this backend
+            dispatch_replay=replay or None,  # gfx125x has no replay body
             # The combine kernel stages into out_tok itself (and skips the copy
             # when the caller already wrote there), so the op must not do it.
             stages_in_kernel=True,
@@ -2186,6 +2202,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 | ({"scatter"} if cfg.is_scatter else set())
                 | ({"quant"} if cfg.quant_type != "none" else set())
                 | (set() if self._is1250 else {"recv_cap"})
+                | ({"replay"} if replay else set())
             ),
         )
 
