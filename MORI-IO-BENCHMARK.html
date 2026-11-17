@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI-IO Benchmark &mdash; MORI development (350600f9) documentation</title>
+  <title>MORI-IO Benchmark &mdash; MORI development (eba92ef6) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=6072e477"></script>
+      <script src="_static/documentation_options.js?v=b1ebeedc"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -400,7 +400,7 @@ memory region. No RDMA payload crosses it.</p>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--backend</span> <span class="pre">rdma|xgmi|fabric</span></code></p></td>
 <td><p>same</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">--num-streams</span></code> / <code class="docutils literal notranslate"><span class="pre">--num-events</span></code> size the XGMI <strong>and</strong> FABRIC HIP pools, as in Python. <code class="docutils literal notranslate"><span class="pre">fabric</span></code> (UALink scale-up, GPU memory only) needs a host whose GPUs expose <code class="docutils literal notranslate"><span class="pre">/sys/bus/pci/devices/*/ualink</span></code>; on RoCE-only hardware the engine reports <code class="docutils literal notranslate"><span class="pre">No</span> <span class="pre">available</span> <span class="pre">backend</span> <span class="pre">found</span></code> at the first transfer.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--num-streams</span></code> / <code class="docutils literal notranslate"><span class="pre">--num-events</span></code> size the XGMI <strong>and</strong> FABRIC HIP pools, as in Python. <code class="docutils literal notranslate"><span class="pre">fabric</span></code> (UALink scale-up, GPU memory only) needs a host whose GPUs expose <code class="docutils literal notranslate"><span class="pre">/sys/bus/pci/devices/*/ualink</span></code>; on RoCE-only hardware the first transfer fails with <code class="docutils literal notranslate"><span class="pre">No</span> <span class="pre">backend</span> <span class="pre">can</span> <span class="pre">handle</span> <span class="pre">...</span></code>, followed by the reason Fabric rejected the pair.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--xgmi-multiprocess</span></code> (default OFF)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">--xgmi-single-process</span></code> (default OFF, i.e. multiprocess)</p></td>
