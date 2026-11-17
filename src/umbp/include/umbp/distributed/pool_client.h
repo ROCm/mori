@@ -126,6 +126,12 @@ class PoolClient {
   // endpoint -- it still has to be recorded, because a range that misses this
   // table is described by its own address rather than its region base and so
   // becomes its own transfer plan.
+  // Bytes of remote writes the owner's GPU read straight from this node's
+  // HBM (owner pull), and of remote reads the owner's GPU wrote straight into
+  // it (owner push). Neither passes through this node's transfer engine.
+  uint64_t OwnerPullBytes() const { return owner_pull_bytes_.load(std::memory_order_relaxed); }
+  uint64_t OwnerPushBytes() const { return owner_push_bytes_.load(std::memory_order_relaxed); }
+
   bool RegisterMemory(void* ptr, size_t size,
                       mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
                       int device = -1, MemoryRegistration mode = MemoryRegistration::kPinned);
@@ -260,6 +266,9 @@ class PoolClient {
     // backend-local buffer_index does not name a buffer (see
     // BufferMemoryDescBytes).
     uint32_t backend_id = 0;
+    // A write slot with no pages: the owner's GPU reads the source ranges
+    // named in the commit straight into its tier.
+    bool owner_pull = false;
   };
 
   // Per-entry outcome inside the Put pipeline; projected to `bool` at
@@ -433,7 +442,23 @@ class PoolClient {
     void* base;
     size_t size;
     TransferRef ref;
+    // This registration made the host region addressable from a GPU, and so
+    // must take that back when it ends.
+    bool host_gather = false;
   };
+  // Whether caller host memory is made GPU-addressable so the UALink fabric
+  // can carry it.
+  bool FabricHostEndpoints() const;
+  // The fabric is the only transport: no arena and no RDMA to fall back on.
+  bool FabricStrict() const;
+  // Whether a range is registered memory the fabric carries directly, with no
+  // bounce or assembly copy on this node.
+  bool RangeGoesDirect(const void* ptr, size_t size) const;
+  // Whether a range is registered, fabric-exportable HBM, which a GPU on
+  // another tray can read or write with no copy on this one.
+  bool RangeIsExportable(const void* ptr, size_t size) const;
+  std::atomic<uint64_t> owner_pull_bytes_{0};
+  std::atomic<uint64_t> owner_push_bytes_{0};
   mutable std::shared_mutex registered_mem_mutex_;
   std::vector<RegisteredRegion> registered_regions_;
 
@@ -850,7 +875,12 @@ class PoolClient {
     // The writer's NUMA node when `src` is a staging copy; -1 lets the slot
     // request derive it from `src`.
     int numa_hint = -1;
+    // Set instead of `src` for a ranged write sent straight from the caller's
+    // own ranges, which tile the object: no assembly copy on this node.
+    const std::vector<ObjectRange>* ranges = nullptr;
   };
+  // Whether everything this write sends is fabric-exportable HBM.
+  bool SourceIsExportable(const BatchPutItem& item) const;
   // One byte range of a stored object, named by the caller.
   struct ByteSpan {
     size_t object_offset = 0;
@@ -876,6 +906,9 @@ class PoolClient {
     // and is the only user.
     const TransferRef* dst_ref = nullptr;
     uint64_t dst_ref_offset = 0;
+    // Set with `spans` for a ranged read that lands each span straight in the
+    // caller's own range, one destination per span, instead of packed at `dst`.
+    const std::vector<void*>* range_dsts = nullptr;
     RouteGetResult route;
 
     size_t DstBytes() const { return dst_bytes != 0 ? dst_bytes : size; }
@@ -1097,6 +1130,22 @@ class PoolClient {
   // sized once and never moved, drained by the destructor — moved into the
   // engine's TransferHandle, which is where the raw TransferStatus* the RDMA
   // backend holds actually live.
+  // Asks the owner to copy these keys' ranges straight into the caller's
+  // exportable HBM. True when the batch was settled that way (results
+  // written); false when owner push does not apply and the caller should
+  // resolve and pull as usual.
+  bool TryOwnerPush(const std::vector<BatchGetItem>& items, ::umbp::UMBPPeer::Stub* stub,
+                    std::vector<bool>* results);
+  // Remote ranged reads that land straight in the caller's ranges. Returns the
+  // subset of `missed` it did not take, for the arena path.
+  std::vector<size_t> GetRangesDirect(const std::vector<std::string>& keys,
+                                      const std::vector<std::vector<void*>>& dsts,
+                                      const std::vector<std::vector<size_t>>& sizes,
+                                      const std::vector<std::vector<size_t>>& src_offsets,
+                                      const std::vector<size_t>& missed,
+                                      const std::vector<std::optional<RouteGetResult>>& preroutes,
+                                      std::vector<bool>* results, double* remote_bytes);
+
   struct RemoteGetInFlight {
     PeerConnection* peer = nullptr;
     std::vector<RemoteGetEntry> entries;

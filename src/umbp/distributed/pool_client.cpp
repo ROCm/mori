@@ -722,6 +722,7 @@ PoolClient::SlotPlan FromAllocateSlotResponse(const ::umbp::AllocateSlotResponse
   p.slot_id = resp.slot_id();
   p.page_size = resp.page_size();
   p.backend_id = resp.backend_id();
+  p.owner_pull = resp.owner_pull();
   p.pages.reserve(resp.pages_size());
   for (const auto& pp : resp.pages()) p.pages.push_back({pp.buffer_index(), pp.page_index()});
   p.descs.reserve(resp.descs_size());
@@ -971,6 +972,12 @@ bool PoolClient::Init() {
   }
   default_pool_ =
       std::make_unique<PeerPool>(&registry_, std::move(placement_policy), transfer_engine_.get());
+  // With the fabric enabled this node's GPU serves its host-resident tiers to
+  // other trays in one hop: owner pull for writes, owner push for reads.
+  if (config_.io_engine.mode != UMBPTransferMode::kRdma && peer_directory_ != nullptr &&
+      !config_.sim.enabled) {
+    default_pool_->EnableFabricDirect(peer_directory_);
+  }
 
   // Local watermark eviction, for every medium unless a master's rounds own
   // DRAM/HBM (eviction_mode kMaster; SSD always evicts locally).  A node that
@@ -1443,8 +1450,21 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
       transfer_engine_->Deregister(ref);
       return false;
     }
+    // A host buffer is a fabric endpoint only through the address a GPU sees
+    // it at. The scratch arenas were declared at Init; declaring one twice
+    // would register the same pages twice.
+    bool host_gather = false;
+    if (loc == mori::io::MemoryLocationType::CPU && FabricHostEndpoints()) {
+      bool declared = false;
+      for (const auto* arenas : {&config_.ranged_get_scratch, &config_.ranged_put_scratch})
+        for (const auto& arena : *arenas) declared = declared || arena.buffer == ptr;
+      if (!declared) {
+        platform_->AddHostGatherRegion(ptr, size);
+        host_gather = true;
+      }
+    }
     // Inserted in place rather than appended: lookups binary-search this.
-    registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref)});
+    registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref), host_gather});
   } catch (const std::exception& error) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory failed for ptr={}, size={}: {}", ptr, size,
                     error.what());
@@ -1464,9 +1484,52 @@ void PoolClient::DeregisterMemory(void* ptr) {
       registered_regions_.begin(), registered_regions_.end(), ptr,
       [](const RegisteredRegion& r, const void* p) { return std::less<const void*>{}(r.base, p); });
   if (it != registered_regions_.end() && it->base == ptr) {
+    if (it->host_gather) platform_->RemoveHostGatherRegion(it->base, it->size);
     if (transfer_engine_) transfer_engine_->Deregister(it->ref);
     registered_regions_.erase(it);
   }
+}
+
+bool PoolClient::FabricHostEndpoints() const {
+  // The simulator models host memory by cost, not by GPU address.
+  return config_.io_engine.mode != UMBPTransferMode::kRdma &&
+         config_.io_engine.fabric_host_endpoints && !config_.sim.enabled;
+}
+
+bool PoolClient::FabricStrict() const {
+  return config_.io_engine.mode == UMBPTransferMode::kFabricStrict && !config_.sim.enabled;
+}
+
+bool PoolClient::RangeGoesDirect(const void* ptr, size_t size) const {
+  if (ptr == nullptr || size == 0) return false;
+  std::shared_lock<std::shared_mutex> lock(registered_mem_mutex_);
+  const RegisteredRegion* region = FindRegisteredRegionLocked(ptr, size);
+  if (region == nullptr) return false;
+  // A GPU range needs its own descriptor. A host range rides the address a
+  // local GPU sees it at, which exists only once its pages are registered
+  // with that GPU -- a large buffer gets there piece by piece.
+  if (region->ref.loc == mori::io::MemoryLocationType::GPU) return region->ref.HasMemoryDesc();
+  return region->ref.loc == mori::io::MemoryLocationType::CPU && FabricHostEndpoints() &&
+         platform_->HostFabricAddressable(ptr, size);
+}
+
+bool PoolClient::RangeIsExportable(const void* ptr, size_t size) const {
+  if (ptr == nullptr || size == 0) return false;
+  std::shared_lock<std::shared_mutex> lock(registered_mem_mutex_);
+  const RegisteredRegion* region = FindRegisteredRegionLocked(ptr, size);
+  if (region == nullptr || region->ref.loc != mori::io::MemoryLocationType::GPU ||
+      !region->ref.HasMemoryDesc())
+    return false;
+  const auto& handle = region->ref.mem.fabricHandle;
+  return !std::all_of(handle.begin(), handle.end(), [](char byte) { return byte == 0; });
+}
+
+bool PoolClient::SourceIsExportable(const BatchPutItem& item) const {
+  if (item.ranges == nullptr) return RangeIsExportable(item.src, item.size);
+  return !item.ranges->empty() &&
+         std::all_of(item.ranges->begin(), item.ranges->end(), [this](const auto& range) {
+           return RangeIsExportable(range.user, range.size);
+         });
 }
 
 const PoolClient::RegisteredRegion* PoolClient::FindRegisteredRegionLocked(const void* ptr,
@@ -2742,7 +2805,12 @@ std::unique_ptr<PoolClient::RemotePutInFlight> PoolClient::SubmitRemoteBatchPut(
   for (auto& item : transfer_items) {
     if (!inflight->entries[item.tag].failed) active.push_back(std::move(item));
   }
+  // An owner-pull slot posts nothing here: its work is the commit, where the
+  // owner's GPU reads the source. Such a batch stays in flight with no handle.
+  const bool any_pull = std::any_of(inflight->entries.begin(), inflight->entries.end(),
+                                    [](const auto& entry) { return entry.plan.owner_pull; });
   if (active.empty()) {
+    if (any_pull) return inflight;
     abort_everything();
     return nullptr;
   }
@@ -2750,6 +2818,7 @@ std::unique_ptr<PoolClient::RemotePutInFlight> PoolClient::SubmitRemoteBatchPut(
   TransferPlanSet planned = transfer_engine_->Plan(active);
   ApplyRejectedTags(inflight->entries, planned.rejected_tags, "RemotePut");
   if (planned.plans.empty()) {
+    if (any_pull) return inflight;  // the rejected entries are aborted at wait time
     abort_everything();
     return nullptr;
   }
@@ -2757,6 +2826,11 @@ std::unique_ptr<PoolClient::RemotePutInFlight> PoolClient::SubmitRemoteBatchPut(
   // staged through the engine's bounce pool — is owned by the returned handle.
   inflight->handle = transfer_engine_->Submit(std::move(planned.plans));
   if (inflight->handle == nullptr) {
+    if (any_pull) {
+      // Nothing was posted for the pushed entries; the pulled ones still commit.
+      for (auto& entry : inflight->entries) entry.failed = entry.failed || !entry.plan.owner_pull;
+      return inflight;
+    }
     abort_everything();
     return nullptr;
   }
@@ -2785,8 +2859,15 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
     entry->set_tier(static_cast<::umbp::TierType>(item.route.tier));
     entry->set_key(*item.key);
     entry->set_logical_tier(item.route.logical_tier);
-    const int numa = item.numa_hint >= 0 ? item.numa_hint : SourceNumaHint(item.src, item.size);
+    const int numa = item.numa_hint >= 0 || item.src == nullptr
+                         ? item.numa_hint
+                         : SourceNumaHint(item.src, item.size);
     if (numa >= 0) entry->set_preferred_numa_node(numa);
+    entry->set_require_fabric(FabricStrict());
+    // Exportable HBM is something the owner's GPU can read itself: a
+    // host-resident tier then takes it in one copy, with nothing staged.
+    entry->set_offer_owner_pull(config_.io_engine.mode != UMBPTransferMode::kRdma &&
+                                !config_.sim.enabled && SourceIsExportable(item));
   }
 
   ::umbp::BatchAllocateSlotsResponse alloc_resp;
@@ -2830,7 +2911,9 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
     }
 
     PoolClient::SlotPlan plan = FromAllocateSlotResponse(resp_entry);
-    if (!SizeMatchesAllocation(item.size, plan.pages.size(), plan.page_size)) {
+    // An owner-pull slot publishes no pages, and is valid only when offered.
+    if (plan.owner_pull ? !alloc_req.entries(static_cast<int>(i)).offer_owner_pull()
+                        : !SizeMatchesAllocation(item.size, plan.pages.size(), plan.page_size)) {
       MORI_UMBP_ERROR("[PoolClient] BatchPut: malformed slot for key='{}'", *item.key);
       abort_slots->push_back(plan.slot_id);
       (*results)[item.index] = PutEntryOutcome::kFailed;
@@ -2895,13 +2978,54 @@ bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries,
 
   for (size_t idx = 0; idx < entries.size(); ++idx) {
     auto& entry = entries[idx];
+    // Nothing leaves this node for an owner-pull slot: the commit names the
+    // source and the owner's GPU reads it.
+    if (entry.plan.owner_pull) continue;
+    const std::vector<TransferRef>& remote = buffers_for(entry.plan.backend_id);
+    std::vector<TransferItem> entry_items;
+
+    if (entry.item->ranges != nullptr) {
+      // Each caller range goes straight to the pages it covers: one item per
+      // (range x page); the engine's planner merges what runs on.
+      for (const auto& range : *entry.item->ranges) {
+        const auto [range_src, range_base] = UserBufferRef(range.user, range.size);
+        const bool walked = ForEachRangePageFragment(
+            entry.plan.pages, entry.plan.page_size, entry.item->size, range.object_offset,
+            range.size,
+            [&](size_t page_index, uint64_t tier_offset, size_t fragment, size_t copied) {
+              const auto& page = entry.plan.pages[page_index];
+              if (page.buffer_index >= remote.size() || !remote[page.buffer_index].HasMemoryDesc())
+                return false;
+              TransferItem item;
+              item.tag = idx;
+              item.src = range_src;
+              item.src_offset = range_base + copied;
+              item.dst = remote[page.buffer_index];
+              item.dst_offset = tier_offset;
+              item.size = fragment;
+              entry_items.push_back(std::move(item));
+              return true;
+            });
+        if (!walked) {
+          MORI_UMBP_ERROR(
+              "[PoolClient] BuildRemotePutTransfers: range [{},{}) has no published page, "
+              "key='{}' backend={}",
+              range.object_offset, range.object_offset + range.size,
+              entry.item->key ? *entry.item->key : std::string{"<null>"}, entry.plan.backend_id);
+          entry.failed = true;
+          entry_items.clear();
+          break;
+        }
+      }
+      items->insert(items->end(), std::make_move_iterator(entry_items.begin()),
+                    std::make_move_iterator(entry_items.end()));
+      continue;
+    }
+
     // Whether this goes zero-copy or through the engine's bounce pool is the
     // engine's decision; this only names the endpoint.
     const auto [src, src_base] =
         UserBufferRef(const_cast<void*>(entry.item->src), entry.item->size);
-    const std::vector<TransferRef>& remote = buffers_for(entry.plan.backend_id);
-
-    std::vector<TransferItem> entry_items;
     entry_items.reserve(entry.plan.pages.size());
     for (size_t p = 0; p < entry.plan.pages.size(); ++p) {
       const auto& page = entry.plan.pages[p];
@@ -2941,6 +3065,8 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
   ::umbp::BatchCommitSlotsRequest commit_req;
   std::vector<size_t> commit_indices;
   commit_indices.reserve(entries.size());
+  bool any_pull = false;
+  std::unordered_map<mori::io::MemoryUniqueId, std::string> packed_sources;
 
   for (size_t idx = 0; idx < entries.size(); ++idx) {
     auto& entry = entries[idx];
@@ -2953,6 +3079,35 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
     commit->set_slot_id(entry.slot_id);
     commit->set_key(*entry.item->key);
     commit_indices.push_back(idx);
+    if (!entry.plan.owner_pull) continue;
+    // Name the source: the owner's GPU reads it inside this commit, so it
+    // stays untouched until the reply (the call below has no deadline).
+    any_pull = true;
+    auto add_range = [&](const void* ptr, size_t size, size_t object_offset) {
+      const auto [ref, offset] = UserBufferRef(const_cast<void*>(ptr), size);
+      auto& packed = packed_sources[ref.mem.id];
+      if (packed.empty()) {
+        msgpack::sbuffer buffer;
+        msgpack::pack(buffer, ref.mem);
+        packed.assign(buffer.data(), buffer.size());
+      }
+      auto* range = commit->add_pull();
+      range->set_object_offset(object_offset);
+      range->set_length(size);
+      range->set_offset(offset);
+      range->set_desc(packed);
+    };
+    if (entry.item->ranges != nullptr) {
+      for (const auto& range : *entry.item->ranges)
+        add_range(range.user, range.size, range.object_offset);
+    } else {
+      add_range(entry.item->src, entry.item->size, 0);
+    }
+  }
+  if (any_pull) {
+    commit_req.set_writer_id(config_.master_config.node_id);
+    const auto engine_desc = peer_directory_->PackedLocalEngineDesc();
+    commit_req.set_engine_desc(engine_desc.data(), engine_desc.size());
   }
 
   if (!commit_indices.empty()) {
@@ -2978,6 +3133,8 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
                       MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
                       {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
           (*results)[entry.result_index] = PutEntryOutcome::kSucceeded;
+          if (entry.plan.owner_pull)
+            owner_pull_bytes_.fetch_add(entry.item->size, std::memory_order_relaxed);
         } else {
           // Peer allocator already logged the reason (SLOT_GONE / PRE_CLEAR).
           abort_slots.push_back(entry.slot_id);
@@ -3692,6 +3849,18 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // cache miss would report itself as a scratch-arena error.
   if (!HasMaster()) return results;
 
+  // ---- Phase 2a: straight into the caller's ranges ----
+  //
+  // Over the fabric a registered range is itself an endpoint: remote HBM is
+  // read into it in one copy, and a host-resident tier is pushed into it by
+  // its owner. Strict mode only, where the arena's remote leg has no other
+  // transport to ride. What does not qualify keeps the arena path below.
+  if (FabricStrict()) {
+    missed =
+        GetRangesDirect(keys, dsts, sizes, src_offsets, missed, preroutes, &results, &remote_bytes);
+    if (missed.empty()) return results;
+  }
+
   // ---- Phase 2: the rest, through the GET scratch arena ----
   //
   // Only the requested spans cross the wire, packed back-to-back into the
@@ -4149,6 +4318,53 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   }
   if (remote.empty()) return results;
 
+  // Over the fabric a range needs no assembly: registered memory, GPU or host,
+  // is an endpoint the fabric copy reads, so each range goes to the owner's
+  // pages in one copy -- or, for a host-resident tier, is named for the owner
+  // to read. Strict mode only, where no other transport could have carried the
+  // assembled object anyway. What does not qualify keeps the arena path below.
+  if (FabricStrict()) {
+    std::vector<std::vector<ObjectRange>> direct_ranges(remote.size());
+    std::vector<size_t> staged;
+    std::vector<PutEntryOutcome> outcomes(n, PutEntryOutcome::kFailed);
+    BatchPutPlan plan;
+    for (size_t k = 0; k < remote.size(); ++k) {
+      const size_t original = valid[remote[k]];
+      direct_ranges[k] = MakeWriteRanges(srcs[original], sizes[original], dst_offsets[original]);
+      const bool direct =
+          !direct_ranges[k].empty() &&
+          std::all_of(direct_ranges[k].begin(), direct_ranges[k].end(), [this](const auto& range) {
+            return RangeGoesDirect(range.user, range.size);
+          });
+      if (!direct) {
+        staged.push_back(remote[k]);
+        continue;
+      }
+      const auto& route = *routes[remote[k]];
+      plan.remote_groups[route.node_id].push_back(
+          BatchPutItem{.index = original,
+                       .key = &keys[original],
+                       .src = nullptr,
+                       .size = object_sizes[original],
+                       .route = route,
+                       .numa_hint = SourceNumaHint(srcs[original].front(), sizes[original].front()),
+                       .ranges = &direct_ranges[k]});
+    }
+    if (!plan.remote_groups.empty()) {
+      PhaseTimer remote_timer(dbg ? &dbg->remote : nullptr);
+      ExecuteBatchPutPlan(plan, &outcomes);
+      for (const auto& [node, items] : plan.remote_groups) {
+        for (const auto& item : items) {
+          results[item.index] = outcomes[item.index] != PutEntryOutcome::kFailed;
+          if (outcomes[item.index] == PutEntryOutcome::kSucceeded)
+            remote_bytes += static_cast<double>(item.size);
+        }
+      }
+    }
+    remote = std::move(staged);
+    if (remote.empty()) return results;
+  }
+
   // A key routed to another node has to be one contiguous object on the wire,
   // so this is the one direction that needs the arena.  PUT has its own arena,
   // so it overlaps a concurrent remote GET (which uses the separate GET arena).
@@ -4558,6 +4774,141 @@ void PoolClient::NoteRangedInstallFailure(size_t count) {
               static_cast<double>(count));
 }
 
+bool PoolClient::TryOwnerPush(const std::vector<BatchGetItem>& items, ::umbp::UMBPPeer::Stub* stub,
+                              std::vector<bool>* results) {
+  if (config_.io_engine.mode == UMBPTransferMode::kRdma || config_.sim.enabled) return false;
+  // One destination list per key: its own ranges, or the whole object at dst.
+  // Owner push is for a batch made entirely of host-resident-tier keys bound
+  // for exportable HBM; anything else resolves and pulls as before.
+  ::umbp::BatchPushKeysRequest request;
+  std::unordered_map<mori::io::MemoryUniqueId, std::string> packed;
+  for (const auto& item : items) {
+    if (item.route.tier == TierType::HBM || item.dst_ref != nullptr) return false;
+    auto* key = request.add_keys();
+    key->set_key(*item.key);
+    auto add = [&](void* ptr, size_t size, size_t object_offset) {
+      if (!RangeIsExportable(ptr, size)) return false;
+      const auto [ref, offset] = UserBufferRef(ptr, size);
+      auto& desc = packed[ref.mem.id];
+      if (desc.empty()) {
+        msgpack::sbuffer buffer;
+        msgpack::pack(buffer, ref.mem);
+        desc.assign(buffer.data(), buffer.size());
+      }
+      auto* range = key->add_ranges();
+      range->set_object_offset(object_offset);
+      range->set_length(size);
+      range->set_offset(offset);
+      range->set_desc(desc);
+      return true;
+    };
+    if (item.range_dsts != nullptr) {
+      if (!item.Ranged() || item.range_dsts->size() != item.spans->size()) return false;
+      for (size_t r = 0; r < item.spans->size(); ++r)
+        if (!add((*item.range_dsts)[r], (*item.spans)[r].size, (*item.spans)[r].object_offset))
+          return false;
+    } else if (item.Ranged() || !add(item.dst, item.size, 0)) {
+      // Spans packed into an arena slice are host memory: not a push target.
+      return false;
+    }
+  }
+  request.set_reader_id(config_.master_config.node_id);
+  const auto engine_desc = peer_directory_->PackedLocalEngineDesc();
+  request.set_engine_desc(engine_desc.data(), engine_desc.size());
+
+  // No deadline: the owner's GPU writes this node's memory until it replies.
+  ::umbp::BatchPushKeysResponse response;
+  grpc::ClientContext context;
+  const auto status = stub->BatchPushKeys(&context, request, &response);
+  if (!status.ok() || response.success_size() != static_cast<int>(items.size())) {
+    // An owner without owner push answers UNIMPLEMENTED before touching
+    // anything; the keys go through the ordinary path.
+    return false;
+  }
+  std::vector<BatchGetItem> unpushed;
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (!response.success(static_cast<int>(i))) {
+      unpushed.push_back(items[i]);
+      continue;
+    }
+    const double moved = static_cast<double>(items[i].DstBytes());
+    CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP, {{"traffic", "remote"}},
+                moved);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP, {{"traffic", "remote"}},
+                moved);
+    owner_push_bytes_.fetch_add(items[i].DstBytes(), std::memory_order_relaxed);
+    (*results)[items[i].index] = true;
+  }
+  if (unpushed.empty()) return true;
+  // A key the owner could not push is gone, busy, or not addressable by its
+  // GPU yet. With another transport the whole batch takes the ordinary path
+  // (re-reading what was pushed is harmless); with the fabric alone there is
+  // no other path and those keys are misses.
+  if (!FabricStrict()) return false;
+  for (const auto& item : unpushed) (*results)[item.index] = false;
+  return true;
+}
+
+std::vector<size_t> PoolClient::GetRangesDirect(
+    const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets, const std::vector<size_t>& missed,
+    const std::vector<std::optional<RouteGetResult>>& preroutes, std::vector<bool>* results,
+    double* remote_bytes) {
+  std::vector<size_t> direct, staged;
+  for (size_t index : missed) {
+    bool all = !dsts[index].empty();
+    for (size_t r = 0; all && r < dsts[index].size(); ++r)
+      all = RangeGoesDirect(dsts[index][r], sizes[index][r]);
+    (all ? direct : staged).push_back(index);
+  }
+  if (direct.empty()) return staged;
+
+  std::vector<std::string> route_keys;
+  route_keys.reserve(direct.size());
+  for (size_t index : direct) route_keys.push_back(keys[index]);
+  std::vector<std::optional<RouteGetResult>> routes;
+  if (!RouteMissedRanges(route_keys, direct, preroutes, nullptr, &routes)) return staged;
+
+  std::vector<std::vector<ByteSpan>> spans(direct.size());
+  BatchGetPlan plan;
+  for (size_t r = 0; r < direct.size(); ++r) {
+    const size_t original = direct[r];
+    if (!routes[r].has_value()) continue;  // genuinely nowhere in the cluster
+    const auto& route = *routes[r];
+    if (route.node_id == config_.master_config.node_id || route.size == 0 ||
+        route.size > std::numeric_limits<size_t>::max() ||
+        !RangesAreDisjointAndInBounds(static_cast<size_t>(route.size), sizes[original],
+                                      src_offsets[original])) {
+      MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: invalid route/ranges for key='{}' size={}",
+                      keys[original], route.size);
+      continue;
+    }
+    size_t total = 0;
+    for (size_t j = 0; j < sizes[original].size(); ++j) {
+      spans[r].push_back({src_offsets[original][j], sizes[original][j]});
+      total += sizes[original][j];
+    }
+    plan.remote_groups[route.node_id].push_back(
+        BatchGetItem{.index = original,
+                     .key = &keys[original],
+                     .dst = nullptr,
+                     .size = static_cast<size_t>(route.size),
+                     .dst_bytes = total,
+                     .spans = &spans[r],
+                     .range_dsts = &dsts[original],
+                     .route = route});
+  }
+  // No re-cache: the caller's ranges hold only the spans it asked for.
+  ExecuteRemoteBatchGetPlan(plan, results, /*recache_remote=*/false, {});
+  for (const auto& [node, items] : plan.remote_groups)
+    for (const auto& item : items)
+      if ((*results)[item.index]) *remote_bytes += static_cast<double>(item.dst_bytes);
+  return staged;
+}
+
 std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
     const std::vector<BatchGetItem>& items, std::vector<bool>* results) {
   if (items.empty()) return nullptr;
@@ -4585,6 +4936,10 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
     return nullptr;
   }
   auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+
+  // A host-resident tier into exportable HBM: the owner's GPU writes it
+  // straight here, and nothing is left in flight.
+  if (TryOwnerPush(items, stub, results)) return nullptr;
 
   auto inflight = std::make_unique<RemoteGetInFlight>();
   inflight->peer = &peer;
@@ -4820,7 +5175,9 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
     // one instead of failing.
     TransferRef dst;
     uint64_t dst_base = 0;
-    if (entry.item->dst_ref != nullptr) {
+    if (entry.item->range_dsts != nullptr) {
+      // Each span below resolves its own registered destination.
+    } else if (entry.item->dst_ref != nullptr) {
       dst = *entry.item->dst_ref;
       dst_base = entry.item->dst_ref_offset;
     } else {
@@ -4855,7 +5212,19 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
       // the bound.
       entry_items.reserve(entry.item->spans->size() + entry.plan.pages.size());
       size_t packed_cursor = 0;
-      for (const auto& span : *entry.item->spans) {
+      for (size_t r = 0; r < entry.item->spans->size(); ++r) {
+        const auto& span = (*entry.item->spans)[r];
+        TransferRef span_dst = dst;
+        uint64_t span_base = dst_base + packed_cursor;
+        if (entry.item->range_dsts != nullptr) {
+          // Straight into the caller's own range rather than packed at `dst`.
+          if (r >= entry.item->range_dsts->size()) {
+            entry.failed = true;
+            entry_items.clear();
+            break;
+          }
+          std::tie(span_dst, span_base) = UserBufferRef((*entry.item->range_dsts)[r], span.size);
+        }
         const bool walked = ForEachRangePageFragment(
             entry.plan.pages, entry.plan.page_size, entry.item->size, span.object_offset, span.size,
             [&](size_t page_index, uint64_t tier_offset, size_t fragment, size_t copied) {
@@ -4865,8 +5234,8 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
               item.tag = idx;
               item.src = *buf;
               item.src_offset = tier_offset;
-              item.dst = dst;
-              item.dst_offset = dst_base + packed_cursor + copied;
+              item.dst = span_dst;
+              item.dst_offset = span_base + copied;
               item.size = fragment;
               entry_items.push_back(std::move(item));
               return true;

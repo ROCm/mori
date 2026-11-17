@@ -45,6 +45,7 @@
 
 #include "umbp/distributed/pool/pool_policy.h"
 #include "umbp/distributed/pool/tier_transition.h"
+#include "umbp/distributed/transfer/transfer_engine.h"
 
 namespace mori::umbp {
 
@@ -53,6 +54,26 @@ struct PoolAllocateResult {
   AllocateResult allocation;
   // Failed because another writer is storing this key right now.
   bool in_flight = false;
+  // No pages are handed out: the slot is in a host-resident tier the writer
+  // cannot name, and the writer's source is exportable HBM, so this node's GPU
+  // copies it straight into the tier when the write commits.
+  bool owner_pull = false;
+};
+
+// One byte range of an object and where it lives in a remote node's
+// exportable HBM: the source of an owner-pull write, or the destination of an
+// owner-push read.
+struct FabricDirectRange {
+  uint64_t object_offset = 0;
+  uint64_t size = 0;
+  TransferRef remote;
+  uint64_t remote_offset = 0;
+};
+
+// The node on the other end of an owner-pull or owner-push.
+struct FabricDirectPeer {
+  std::string node_id;
+  std::string engine_desc;
 };
 
 struct PoolSlotRef {
@@ -63,6 +84,8 @@ struct PoolSlotRef {
 struct PoolCommitRequest {
   PoolSlotRef slot;
   std::string key;
+  // Owner-pull slots only: ranges of the writer's HBM that tile the object.
+  std::vector<FabricDirectRange> pull;
 };
 
 struct PoolCommitResult {
@@ -121,8 +144,45 @@ class PeerPool {
 
   BackendRegistry* Backends() const { return backends_; }
 
+  // ---- One-hop UALink paths for a host-resident tier ----
+  //
+  // Host memory cannot be exported to the fabric, so a GPU on another tray
+  // cannot name this node's DRAM. This node's own GPU can address both its
+  // DRAM and exportable HBM on the other tray, so it does the copy:
+  //  * owner pull: a remote write commits by this node reading the writer's
+  //    HBM straight into the tier (see PoolAllocateResult::owner_pull);
+  //  * owner push: a remote read is served by this node writing the tier's
+  //    bytes straight into the reader's HBM (PushToReader).
+  // `peers` registers the other node's engine and must outlive the pool.
+  void EnableFabricDirect(PeerDirectory* peers) { fabric_peers_ = peers; }
+  bool FabricDirectEnabled() const {
+    return fabric_peers_ != nullptr && transfer_engine_ != nullptr;
+  }
+  // Copies the requested ranges of each key into the reader's HBM. One entry
+  // per key: false for a key that is missing, busy, not directly addressable,
+  // or whose copy failed. Returns only when every posted copy has finished.
+  std::vector<bool> PushToReader(const std::vector<std::string>& keys,
+                                 const std::vector<std::vector<FabricDirectRange>>& ranges,
+                                 const FabricDirectPeer& reader);
+  struct FabricDirectStats {
+    uint64_t pulled_writes = 0;
+    uint64_t pulled_bytes = 0;
+    uint64_t pushed_reads = 0;
+    uint64_t pushed_bytes = 0;
+    uint64_t failures = 0;
+  };
+  FabricDirectStats GetFabricDirectStats() const {
+    return {pulled_writes_.load(std::memory_order_relaxed),
+            pulled_bytes_.load(std::memory_order_relaxed),
+            pushed_reads_.load(std::memory_order_relaxed),
+            pushed_bytes_.load(std::memory_order_relaxed),
+            fabric_direct_failures_.load(std::memory_order_relaxed)};
+  }
+
   std::vector<PoolAllocateResult> BatchAllocate(const std::vector<PoolPlacementRequest>& requests);
-  std::vector<PoolCommitResult> BatchCommit(const std::vector<PoolCommitRequest>& requests);
+  // `writer` names the remote node when any request carries pull ranges.
+  std::vector<PoolCommitResult> BatchCommit(const std::vector<PoolCommitRequest>& requests,
+                                            const FabricDirectPeer* writer = nullptr);
   std::vector<bool> BatchAbort(const std::vector<PoolSlotRef>& slots);
   // `reader` and `extents` (parallel to `keys`, or null) are passed to every
   // backend asked (see MediumBackend::BatchResolve).
@@ -185,11 +245,41 @@ class PeerPool {
   void SetEvictionCandidateSource(EvictionCandidateSource source);
 
  private:
+  // The tier pages of an owner-pull slot, withheld from the writer and filled
+  // by this node when the write commits.
+  struct PullSlot {
+    std::vector<PageLocation> pages;
+    uint64_t page_size = 0;
+    uint64_t size = 0;
+  };
   struct PendingPlacement {
     uint32_t backend_id = BackendRegistry::kMaxBackends;
     uint64_t local_slot_id = 0;
     std::chrono::steady_clock::time_point expires_at = std::chrono::steady_clock::time_point::max();
+    std::shared_ptr<const PullSlot> pull;
   };
+  // Whether a fresh remote allocation should be filled by owner pull, and if
+  // so withholds its pages.
+  std::shared_ptr<const PullSlot> PlanOwnerPull(const PoolPlacementRequest& request,
+                                                PoolAllocateResult* result) const;
+  // Reads the writer's ranges into `slot`'s tier pages. Runs without
+  // operation_mutex_. False when anything was refused or failed; nothing of
+  // the object is then published.
+  bool PullIntoSlot(uint32_t backend_id, const PullSlot& slot,
+                    const std::vector<FabricDirectRange>& ranges);
+  // Makes the other node's mori-io engine known to this one, under a name of
+  // its own so it never collides with that node's entry as a storage peer.
+  bool KnowsFabricPeer(const char* role, const FabricDirectPeer& peer) const;
+  PeerDirectory* fabric_peers_ = nullptr;
+  // One owner-side copy at a time, and an abort or a repeated commit waits
+  // for it: both would otherwise answer while this node's GPU is still
+  // reading the writer's memory or writing pages the abort is about to free.
+  std::mutex fabric_direct_mutex_;
+  std::atomic<uint64_t> pulled_writes_{0};
+  std::atomic<uint64_t> pulled_bytes_{0};
+  std::atomic<uint64_t> pushed_reads_{0};
+  std::atomic<uint64_t> pushed_bytes_{0};
+  std::atomic<uint64_t> fabric_direct_failures_{0};
 
   struct TransitionJob {
     TierTransitionKind kind = TierTransitionKind::kOffload;

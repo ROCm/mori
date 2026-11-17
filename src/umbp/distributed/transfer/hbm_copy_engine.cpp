@@ -420,6 +420,30 @@ void HbmCopyEngine::ClearHostGatherRegions() {
   host_regions_.clear();
 }
 
+void HbmCopyEngine::RemoveHostGatherRegion(const void* base) {
+  if (base == nullptr) return;
+  std::unique_ptr<HostTierRegistration> removed;
+  {
+    std::lock_guard<std::mutex> lock(host_regions_mutex_);
+    for (auto it = host_regions_.begin(); it != host_regions_.end(); ++it) {
+      if (*it == nullptr || (*it)->Base() != base) continue;
+      removed = std::move(*it);
+      host_regions_.erase(it);
+      break;
+    }
+  }
+  // Unregistered outside the lock: it joins the registration worker.
+}
+
+bool HbmCopyEngine::HostRegionDevicePiece(const void* ptr, int device_id,
+                                          HostDevicePiece* out) const {
+  std::lock_guard<std::mutex> lock(host_regions_mutex_);
+  for (const auto& region : host_regions_) {
+    if (region != nullptr && region->DevicePiece(ptr, device_id, out)) return true;
+  }
+  return false;
+}
+
 void* HbmCopyEngine::HostRegionDeviceAddress(const void* ptr, size_t size, int device_id) const {
   std::lock_guard<std::mutex> lock(host_regions_mutex_);
   for (const auto& region : host_regions_) {

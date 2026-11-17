@@ -23,6 +23,8 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -30,6 +32,8 @@
 #include <vector>
 
 #include "mori/io/engine.hpp"
+#include "umbp/common/config.h"
+#include "umbp/common/host_registration.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
 
@@ -40,8 +44,38 @@ std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& loca
                                                          uint64_t bounce_size,
                                                          const TransferRef& bounce_ref);
 
-// The mori-io (RDMA) implementation of TransferEngine, and the only place in
-// UMBP that names mori::io::IOEngine.
+// One registered piece of host memory as a fabric endpoint: `ref` names the
+// address a local GPU sees the piece at, registered with mori-io as GPU
+// memory. It is a local kernel operand and is never exported.
+struct HostFabricView {
+  uintptr_t host_base = 0;
+  size_t bytes = 0;
+  TransferRef ref;
+};
+
+// How a planner turns a local host endpoint into a fabric one.
+struct HostFabricViews {
+  // The view holding `address`, or null when no GPU can address it.
+  std::function<std::shared_ptr<const HostFabricView>(uintptr_t address)> find;
+  // With no other transport, a host endpoint the fabric cannot carry is rejected.
+  bool required = false;
+};
+
+// Whether the UALink fabric carries a copy between local GPU-addressable
+// memory and `remote`: the remote side is exportable HBM in the same vPOD.
+// The same test FabricBackend::CanHandle applies, from the descriptors alone.
+bool FabricReaches(const mori::io::MemoryDesc& local, const mori::io::MemoryDesc& remote);
+
+// The planner MoriIoEngine uses, exposed so it can be driven without hardware.
+// `local_key` and `bounce_ref` are borrowed for the builder's lifetime.
+std::unique_ptr<TransferPlanBuilder> MakeFabricPlanBuilder(const std::string& local_key,
+                                                           uint64_t bounce_size,
+                                                           const TransferRef& bounce_ref,
+                                                           bool fabric_strict,
+                                                           const HostFabricViews* host_views);
+
+// The mori-io (RDMA and UALink fabric) implementation of TransferEngine, and
+// the only place in UMBP that names mori::io::IOEngine.
 //
 // Everything moved here from PoolClient in Phase 6 is something that had to
 // know about the wire:
@@ -61,7 +95,8 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   // `bounce_bytes` sizes the single staging region used when a caller's buffer
   // is not registered.  Zero disables staging: an unregistered endpoint is then
   // rejected by Plan rather than bounced.
-  MoriIoEngine(std::string engine_key, mori::io::IOEngineConfig io_config, uint64_t bounce_bytes);
+  MoriIoEngine(std::string engine_key, mori::io::IOEngineConfig io_config, uint64_t bounce_bytes,
+               UMBPIoEngineConfig transport = {});
   ~MoriIoEngine() override;
 
   // Create the IOEngine + RDMA backend and register the bounce buffer.
@@ -115,6 +150,26 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   std::vector<TransferRef> RemoteBufferSnapshot(const std::string& node_id,
                                                 uint32_t backend_id) const override;
 
+  // ---- Host memory as a fabric endpoint ----
+  //
+  // Host memory cannot go on the fabric, but a local GPU that can address it
+  // (hipHostRegister) can run the fabric copy against it: one copy between
+  // host memory here and exportable HBM on another tray. `lookup` reports the
+  // registered piece holding an address as a device sees it; whoever owns
+  // those registrations calls DropHostViews() before releasing them. Planning
+  // then substitutes the view for any local host endpoint the fabric reaches.
+  using HostPieceLookup = std::function<bool(const void* ptr, int device, HostDevicePiece* out)>;
+  void SetHostPieceLookup(HostPieceLookup lookup);
+  // Forget the views inside [base, base + bytes); everything when base is null.
+  void DropHostViews(const void* base = nullptr, size_t bytes = 0);
+  // Whether every byte of [ptr, ptr + bytes) lies in a registered piece the
+  // host-endpoint GPU addresses, i.e. whether the fabric can carry it now.
+  bool HostRangeAddressable(const void* ptr, size_t bytes) const;
+  UMBPTransferMode Mode() const { return transport_.mode; }
+  // Whether the fabric backend is up; false in rdma mode and after an `auto`
+  // start on a machine without one.
+  bool FabricEnabled() const { return fabric_enabled_; }
+
  private:
   class RdmaHandle;
 
@@ -135,9 +190,22 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   // (kPull), release.  Returns false and fills `failure` on any error.
   bool RunBouncePlanInline(const TransferPlan& plan, TransferFailure* failure);
 
+  std::shared_ptr<const HostFabricView> HostViewFor(uintptr_t address) const;
+
   std::string local_engine_key_;
   mori::io::IOEngineConfig io_config_;
   std::unique_ptr<mori::io::IOEngine> io_engine_;
+  UMBPIoEngineConfig transport_;
+  bool fabric_enabled_ = false;
+  bool rdma_enabled_ = false;
+
+  // Host views, keyed by the host base of the registered piece. Planning is
+  // still free of IO: a view is created on first use and then only read.
+  int host_view_device_ = -1;
+  HostFabricViews host_views_api_;
+  mutable std::mutex host_views_mutex_;
+  mutable HostPieceLookup host_piece_lookup_;
+  mutable std::map<uintptr_t, std::shared_ptr<const HostFabricView>> host_views_;
 
   mutable std::mutex remotes_mutex_;
   std::unordered_map<std::string, RemoteNode> remotes_;

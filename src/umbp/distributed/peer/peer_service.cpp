@@ -23,8 +23,10 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
+#include <msgpack.hpp>
 #include <string>
 #include <utility>
 #include <vector>
@@ -104,6 +106,40 @@ void FillPagesAndDescs(Response* resp, const std::vector<PageLocation>& pages, u
   }
 }
 
+// Unpacks the ranges of an owner-pull or owner-push request. This peer's GPU
+// is about to read or write them, so each must be fabric-exportable HBM that
+// belongs to the engine the requester named, and lie inside its registration.
+template <typename WireRanges>
+bool DecodeFabricRanges(const WireRanges& wire, const FabricDirectPeer& peer,
+                        std::vector<FabricDirectRange>* out) {
+  if (peer.node_id.empty() || peer.engine_desc.empty()) return false;
+  try {
+    mori::io::EngineDesc engine;
+    msgpack::unpack(peer.engine_desc.data(), peer.engine_desc.size()).get().convert(engine);
+    for (const auto& entry : wire) {
+      FabricDirectRange range;
+      range.object_offset = entry.object_offset();
+      range.size = entry.length();
+      range.remote_offset = entry.offset();
+      auto& ref = range.remote;
+      msgpack::unpack(entry.desc().data(), entry.desc().size()).get().convert(ref.mem);
+      ref.loc = ref.mem.loc;
+      ref.size = ref.mem.size;
+      ref.device = ref.mem.deviceId;
+      if (ref.mem.engineKey != engine.key || ref.loc != mori::io::MemoryLocationType::GPU ||
+          range.size == 0 || range.remote_offset > ref.size ||
+          range.size > ref.size - range.remote_offset ||
+          std::all_of(ref.mem.fabricHandle.begin(), ref.mem.fabricHandle.end(),
+                      [](char byte) { return byte == 0; }))
+        return false;
+      out->push_back(std::move(range));
+    }
+  } catch (...) {
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Service {
@@ -180,6 +216,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     entry.logical_tier = request->logical_tier();
     if (request->has_preferred_numa_node())
       entry.preferred_numa_node = request->preferred_numa_node();
+    entry.remote_writer = true;
+    entry.writer_requires_fabric = request->require_fabric();
+    entry.writer_offers_pull = request->offer_owner_pull();
     auto pool_result = pool_->BatchAllocate({entry}).front();
     auto* backend = Backend(pool_result.backend_id);
     const auto& result = pool_result.allocation;
@@ -205,6 +244,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     response->set_slot_id(TagSlotId(pool_result.backend_id, result.slot_id));
     FillPagesAndDescs(response, result.pages, result.page_size, result.descs,
                       pool_result.backend_id);
+    response->set_owner_pull(pool_result.owner_pull);
     response->set_pending_ttl_ms(result.pending_ttl_ms);
     return grpc::Status::OK;
   }
@@ -298,6 +338,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       if (request->entries(i).has_preferred_numa_node()) {
         entry.preferred_numa_node = request->entries(i).preferred_numa_node();
       }
+      entry.remote_writer = true;
+      entry.writer_requires_fabric = request->entries(i).require_fabric();
+      entry.writer_offers_pull = request->entries(i).offer_owner_pull();
       entries.push_back(std::move(entry));
     }
     auto results = pool_->BatchAllocate(entries);
@@ -321,6 +364,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
       out->set_slot_id(TagSlotId(results[i].backend_id, result.slot_id));
       FillPagesAndDescs(out, result.pages, result.page_size, result.descs, results[i].backend_id);
+      out->set_owner_pull(results[i].owner_pull);
       out->set_pending_ttl_ms(result.pending_ttl_ms);
     }
     return grpc::Status::OK;
@@ -335,16 +379,24 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 
     std::vector<PoolCommitRequest> entries;
     entries.reserve(n);
+    const FabricDirectPeer writer{request->writer_id(), request->engine_desc()};
+    bool any_pull = false;
     for (int i = 0; i < n; ++i) {
       PoolCommitRequest entry;
       entry.slot.backend_id = BackendIdFromSlotId(request->entries(i).slot_id());
       entry.slot.local_slot_id = LocalSlotId(request->entries(i).slot_id());
       entry.key = request->entries(i).key();
+      if (request->entries(i).pull_size() > 0) {
+        // This peer's GPU will read these ranges.
+        if (!DecodeFabricRanges(request->entries(i).pull(), writer, &entry.pull))
+          return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid pull source");
+        any_pull = true;
+      }
       entries.push_back(std::move(entry));
     }
 
     uint64_t total_committed = 0;
-    auto results = pool_->BatchCommit(entries);
+    auto results = pool_->BatchCommit(entries, any_pull ? &writer : nullptr);
     for (size_t i = 0; i < results.size() && i < static_cast<size_t>(n); ++i) {
       response->set_success(static_cast<int>(i), results[i].commit.success);
       if (results[i].commit.success) total_committed += results[i].commit.bytes_committed;
@@ -373,6 +425,33 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     for (size_t i = 0; i < results.size() && i < static_cast<size_t>(n); ++i) {
       response->set_success(static_cast<int>(i), results[i]);
     }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchPushKeys(grpc::ServerContext* /*ctx*/,
+                             const ::umbp::BatchPushKeysRequest* request,
+                             ::umbp::BatchPushKeysResponse* response) override {
+    const int n = request->keys_size();
+    for (int i = 0; i < n; ++i) response->add_success(false);
+    if (pool_ == nullptr || n == 0) return grpc::Status::OK;
+    const FabricDirectPeer reader{request->reader_id(), request->engine_desc()};
+    std::vector<std::string> keys;
+    std::vector<std::vector<FabricDirectRange>> ranges(n);
+    keys.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      keys.push_back(request->keys(i).key());
+      // This peer's GPU will write these ranges.
+      if (!DecodeFabricRanges(request->keys(i).ranges(), reader, &ranges[i]))
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid push destination");
+    }
+    uint64_t total_bytes = 0;
+    const auto pushed = pool_->PushToReader(keys, ranges, reader);
+    for (int i = 0; i < n && static_cast<size_t>(i) < pushed.size(); ++i) {
+      response->set_success(i, pushed[i]);
+      if (!pushed[i]) continue;
+      for (const auto& range : ranges[i]) total_bytes += range.size;
+    }
+    if (total_bytes > 0) RecordInboundGet(total_bytes, "remote");
     return grpc::Status::OK;
   }
 

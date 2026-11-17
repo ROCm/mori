@@ -24,6 +24,7 @@
 // MIT License
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -44,6 +45,7 @@
 #include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
+#include "umbp/distributed/transfer/plan_builder.h"
 
 namespace mori::umbp {
 namespace {
@@ -1712,6 +1714,344 @@ TEST(PeerPoolLocalEviction, RejectsBadConfigAndLeavesAnUnorderedMediumAlone) {
   ASSERT_TRUE(pool.EnableLocalEviction(id, 0.9, 0.5));
   pool.RunLocalEvictionOnceForTest();
   EXPECT_TRUE(registry.Get("dram")->Contains("k"));
+}
+
+// The fabric_strict shape of a node: host memory gets no descriptor (nothing
+// can export it), GPU memory does. Copies are memcpy so the bytes are real.
+class FabricShapedEngine final : public TransferEngine {
+ public:
+  const char* Name() const override { return "fabric-direct-test-copy"; }
+  TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
+                             int device) override {
+    auto ref = TransferRef::HostBytes(base, size, loc, device);
+    if (loc != mori::io::MemoryLocationType::GPU && !describe_host) return ref;
+    ref.mem.size = size;
+    ref.mem.data = reinterpret_cast<uintptr_t>(base);
+    ref.mem.loc = loc;
+    ref.mem.deviceId = device;
+    return ref;
+  }
+  void Deregister(const TransferRef&) override {}
+  bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
+    return src.HasHostPtr() && dst.HasHostPtr();
+  }
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t) const override {
+    return MakePairPlanBuilder(*this, [](TransferPlan* plan, const TransferItem& item) {
+      AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
+    });
+  }
+  // The `auto` shape instead: RDMA is there too, so host memory is described.
+  bool describe_host = false;
+  std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
+    class Handle final : public TransferHandle {
+     public:
+      Handle(std::vector<TransferPlan> plans, FabricShapedEngine* owner)
+          : plans_(std::move(plans)), owner_(owner) {}
+      void Wait(std::vector<TransferFailure>* failures) override {
+        if (owner_->before_copy) owner_->before_copy();
+        if (owner_->fail) {
+          TransferFailure failure;
+          for (const auto& plan : plans_)
+            failure.tags.insert(failure.tags.end(), plan.tags.begin(), plan.tags.end());
+          failures->push_back(std::move(failure));
+          return;
+        }
+        for (const auto& plan : plans_)
+          for (size_t i = 0; i < plan.sizes.size(); ++i)
+            std::memcpy(static_cast<char*>(plan.dst.host_ptr) + plan.dst_offsets[i],
+                        static_cast<const char*>(plan.src.host_ptr) + plan.src_offsets[i],
+                        plan.sizes[i]);
+        ++owner_->copies;
+      }
+
+     private:
+      std::vector<TransferPlan> plans_;
+      FabricShapedEngine* owner_;
+    };
+    return std::make_unique<Handle>(std::move(plans), this);
+  }
+  bool fail = false;
+  std::function<void()> before_copy;
+  std::atomic<int> copies{0};
+};
+
+// Every remote node is reachable: these tests are about what the pool does.
+class KnownPeers final : public PeerDirectory {
+ public:
+  std::vector<uint8_t> PackedLocalEngineDesc() const override { return {}; }
+  bool EnsureRemoteEngine(const std::string& node, const std::string&) override {
+    if (reachable) ensured.push_back(node);
+    return reachable;
+  }
+  bool HasRemoteEngine(const std::string& node) const override {
+    return std::find(ensured.begin(), ensured.end(), node) != ensured.end();
+  }
+  void ForgetRemote(const std::string&) override {}
+  void CacheRemoteBuffers(const std::string&, const std::vector<BufferMemoryDescBytes>&) override {}
+  bool HasRemoteBuffers(const std::string&) const override { return true; }
+  std::vector<TransferRef> RemoteBufferSnapshot(const std::string&, uint32_t) const override {
+    return {};
+  }
+  bool reachable = true;
+  std::vector<std::string> ensured;
+};
+
+// A node whose only tier is host memory, with a GPU that can copy for it, and
+// another tray's exportable HBM as that GPU sees it.
+struct FabricDirectNode {
+  explicit FabricDirectNode(uint64_t tier_pages = 4, size_t remote_bytes = 256)
+      : remote_bytes_(remote_bytes) {
+    RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kPage, tier_pages);
+    pool = std::make_unique<PeerPool>(&registry, MakeSingleBackendPolicy(), &engine);
+    pool->EnableFabricDirect(&peers);
+    total_bytes = registry.Get("dram")->Capacity().total_bytes;
+    for (size_t i = 0; i < remote_bytes; ++i) remote_bytes_[i] = static_cast<char>(40 + i);
+    remote = engine.RegisterMemory(remote_bytes_.data(), remote_bytes,
+                                   mori::io::MemoryLocationType::GPU, 0);
+  }
+  PoolPlacementRequest Write(const std::string& key, uint64_t size, bool offer = true) const {
+    auto request = PutRequest(key, "dram");
+    request.size = size;
+    request.remote_writer = true;
+    request.writer_requires_fabric = true;
+    request.writer_offers_pull = offer;
+    return request;
+  }
+  FabricDirectRange Range(uint64_t object_offset, uint64_t size, uint64_t remote_offset) const {
+    return {object_offset, size, remote, remote_offset};
+  }
+  static PoolCommitRequest Commit(const PoolAllocateResult& allocation, const std::string& key,
+                                  std::vector<FabricDirectRange> pull) {
+    return {{allocation.backend_id, allocation.allocation.slot_id}, key, std::move(pull)};
+  }
+  // The key's bytes as stored in the tier, read through its own pages.
+  std::vector<char> Stored(const std::string& key) {
+    auto* backend = registry.Get("dram");
+    const auto resolved = backend->BatchResolve({key}, false, false, ResolveReader::kLocal).front();
+    std::vector<char> out;
+    if (!resolved.found) return out;
+    for (const auto& page : resolved.pages) {
+      const auto* base = static_cast<const char*>(backend->BufferRef(page.buffer_index).host_ptr);
+      const uint64_t count = std::min<uint64_t>(kPage, resolved.size - out.size());
+      out.insert(out.end(), base + page.page_index * kPage, base + page.page_index * kPage + count);
+    }
+    return out;
+  }
+  static constexpr uint64_t kPage = 64;
+  FabricShapedEngine engine;
+  BackendRegistry registry;
+  KnownPeers peers;
+  std::unique_ptr<PeerPool> pool;
+  uint64_t total_bytes = 0;
+  std::vector<char> remote_bytes_;
+  TransferRef remote;
+  const FabricDirectPeer other{"tray-b", "engine-desc"};
+};
+
+TEST(PeerPoolFabricDirect, OwnerPullReadsTheWritersHbmStraightIntoAHostTier) {
+  FabricDirectNode node;
+  const auto request = node.Write("kv", 100);
+  const auto allocation = node.pool->BatchAllocate({request}).front();
+  ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  // No pages are handed out: the writer could not reach them anyway.
+  EXPECT_TRUE(allocation.owner_pull);
+  EXPECT_TRUE(allocation.allocation.pages.empty());
+  EXPECT_TRUE(allocation.allocation.descs.empty());
+
+  // The object is two source ranges, named out of order and cut off a page
+  // boundary: bytes [0,70) live at source offset 30, bytes [70,100) at 0.
+  const auto commit =
+      FabricDirectNode::Commit(allocation, "kv", {node.Range(70, 30, 0), node.Range(0, 70, 30)});
+  EXPECT_TRUE(node.pool->BatchCommit({commit}, &node.other).front().commit.success);
+  EXPECT_EQ(node.peers.ensured, (std::vector<std::string>{"pull:tray-b"}));
+  const auto stored = node.Stored("kv");
+  ASSERT_EQ(stored.size(), 100u);
+  for (size_t i = 0; i < 70; ++i) ASSERT_EQ(stored[i], node.remote_bytes_[30 + i]) << i;
+  for (size_t i = 70; i < 100; ++i) ASSERT_EQ(stored[i], node.remote_bytes_[i - 70]) << i;
+  const auto stats = node.pool->GetFabricDirectStats();
+  EXPECT_EQ(stats.pulled_writes, 1u);
+  EXPECT_EQ(stats.pulled_bytes, 100u);
+  EXPECT_EQ(stats.failures, 0u);
+  EXPECT_EQ(node.engine.copies, 1);
+  // A repeated commit finds the slot gone; the source is not read again.
+  EXPECT_FALSE(node.pool->BatchCommit({commit}, &node.other).front().commit.success);
+  EXPECT_EQ(node.engine.copies, 1);
+}
+
+TEST(PeerPoolFabricDirect, OwnerPullIsOnlyForWritesThatNeedAndOfferIt) {
+  FabricDirectNode node;
+  // No offer: the source is not exportable, so there is nothing to read.
+  const auto plain = node.pool->BatchAllocate({node.Write("plain", 64, /*offer=*/false)}).front();
+  EXPECT_FALSE(plain.owner_pull);
+  EXPECT_FALSE(plain.allocation.pages.empty());
+  // A writer in this process copies into the tier itself.
+  auto local = node.Write("local", 64);
+  local.remote_writer = false;
+  EXPECT_FALSE(node.pool->BatchAllocate({local}).front().owner_pull);
+  // Without the fabric enabled on this node there is no GPU to copy with.
+  node.pool->EnableFabricDirect(nullptr);
+  EXPECT_FALSE(node.pool->BatchAllocate({node.Write("off", 64)}).front().owner_pull);
+
+  // A tier whose pages carry a descriptor is reachable by a writer with
+  // another transport, but not by one that has the fabric alone.
+  FabricShapedEngine registering;
+  registering.describe_host = true;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &registering, "dram", TierType::DRAM, 64, 4);
+  ASSERT_TRUE(registry.Get("dram")->BufferRef(0).HasMemoryDesc());
+  KnownPeers peers;
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &registering);
+  pool.EnableFabricDirect(&peers);
+  auto mixed = node.Write("mixed", 64);
+  mixed.writer_requires_fabric = false;
+  const auto reachable = pool.BatchAllocate({mixed}).front();
+  EXPECT_FALSE(reachable.owner_pull);
+  EXPECT_FALSE(reachable.allocation.pages.empty());
+  EXPECT_TRUE(pool.BatchAllocate({node.Write("strict", 64)}).front().owner_pull);
+}
+
+TEST(PeerPoolFabricDirect, OwnerPullPublishesNothingItDidNotFill) {
+  FabricDirectNode node;
+  // A gap, an overlap, a short tail or no ranges would publish bytes nobody
+  // wrote. Each is refused before any copy is posted and returns the pages.
+  const std::vector<std::vector<FabricDirectRange>> bad{
+      {},
+      {node.Range(0, 60, 0), node.Range(70, 30, 60)},
+      {node.Range(0, 70, 0), node.Range(60, 40, 0)},
+      {node.Range(0, 99, 0)},
+      {node.Range(0, 100, 0), node.Range(100, 1, 0)},
+  };
+  for (size_t attempt = 0; attempt < bad.size(); ++attempt) {
+    SCOPED_TRACE(attempt);
+    const auto allocation = node.pool->BatchAllocate({node.Write("kv", 100)}).front();
+    ASSERT_TRUE(allocation.owner_pull);
+    EXPECT_FALSE(
+        node.pool
+            ->BatchCommit({FabricDirectNode::Commit(allocation, "kv", bad[attempt])}, &node.other)
+            .front()
+            .commit.success);
+    EXPECT_FALSE(node.registry.Get("dram")->Contains("kv"));
+    EXPECT_EQ(node.registry.Get("dram")->Capacity().available_bytes, node.total_bytes);
+  }
+  EXPECT_EQ(node.engine.copies, 0);
+
+  // A copy that fails, or a writer whose engine cannot be registered, also
+  // publishes nothing.
+  for (const bool unreachable : {false, true}) {
+    SCOPED_TRACE(unreachable);
+    node.engine.fail = !unreachable;
+    node.peers.reachable = !unreachable;
+    node.peers.ensured.clear();
+    const auto allocation = node.pool->BatchAllocate({node.Write("kv", 64)}).front();
+    ASSERT_TRUE(allocation.owner_pull);
+    EXPECT_FALSE(
+        node.pool
+            ->BatchCommit({FabricDirectNode::Commit(allocation, "kv", {node.Range(0, 64, 0)})},
+                          &node.other)
+            .front()
+            .commit.success);
+    EXPECT_FALSE(node.registry.Get("dram")->Contains("kv"));
+    EXPECT_EQ(node.registry.Get("dram")->Capacity().available_bytes, node.total_bytes);
+  }
+  EXPECT_EQ(node.pool->GetFabricDirectStats().failures, bad.size() + 2);
+}
+
+TEST(PeerPoolFabricDirect, AbortAndRepeatedCommitWaitForTheCopyInFlight) {
+  FabricDirectNode node;
+  const auto allocation = node.pool->BatchAllocate({node.Write("kv", 64)}).front();
+  ASSERT_TRUE(allocation.owner_pull);
+  const auto commit = FabricDirectNode::Commit(allocation, "kv", {node.Range(0, 64, 0)});
+  // While this node's GPU is reading the writer's memory, neither an abort nor
+  // a repeated commit may answer: the writer takes either as leave to reuse it.
+  std::promise<void> entered, release;
+  auto released = release.get_future().share();
+  node.engine.before_copy = [&] {
+    entered.set_value();
+    released.wait();
+  };
+  auto committing = std::async(std::launch::async, [&] {
+    return node.pool->BatchCommit({commit}, &node.other).front().commit.success;
+  });
+  entered.get_future().wait();
+  node.engine.before_copy = nullptr;
+  auto aborting = std::async(std::launch::async, [&] {
+    return node.pool->BatchAbort({{allocation.backend_id, allocation.allocation.slot_id}});
+  });
+  auto repeating = std::async(std::launch::async, [&] {
+    return node.pool->BatchCommit({commit}, &node.other).front().commit.success;
+  });
+  EXPECT_EQ(aborting.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+  EXPECT_EQ(repeating.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+  release.set_value();
+  EXPECT_TRUE(committing.get());
+  (void)aborting.get();
+  EXPECT_FALSE(repeating.get());
+  EXPECT_EQ(node.Stored("kv").front(), node.remote_bytes_[0]);
+  EXPECT_EQ(node.engine.copies, 1);
+}
+
+TEST(PeerPoolFabricDirect, OwnerPushWritesAHostTierStraightIntoTheReadersHbm) {
+  FabricDirectNode node;
+  // Two keys in the tier, written through their own pages.
+  for (const std::string key : {"a", "b"}) {
+    auto request = PutRequest(key, "dram");
+    request.size = 100;
+    const auto allocation = node.pool->BatchAllocate({request}).front();
+    ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+    auto* backend = node.registry.Get("dram");
+    for (uint64_t i = 0; i < 100; ++i) {
+      const auto& page = allocation.allocation.pages[i / FabricDirectNode::kPage];
+      static_cast<char*>(
+          backend->BufferRef(page.buffer_index)
+              .host_ptr)[page.page_index * FabricDirectNode::kPage + i % FabricDirectNode::kPage] =
+          static_cast<char>((key == "a" ? 1 : 101) + i);
+    }
+    ASSERT_TRUE(node.pool
+                    ->BatchCommit({PoolCommitRequest{
+                        {allocation.backend_id, allocation.allocation.slot_id}, key}})
+                    .front()
+                    .commit.success);
+  }
+  std::fill(node.remote_bytes_.begin(), node.remote_bytes_.end(), char{0x5A});
+
+  // Ranges that cross a page boundary, land out of order in the reader's
+  // memory, and leave the rest of it untouched. "gone" is not in the tier.
+  const auto pushed = node.pool->PushToReader({"a", "gone", "b"},
+                                              {{node.Range(60, 30, 100), node.Range(0, 10, 0)},
+                                               {node.Range(0, 8, 200)},
+                                               {node.Range(90, 10, 50)}},
+                                              node.other);
+  EXPECT_EQ(pushed, (std::vector<bool>{true, false, true}));
+  EXPECT_EQ(node.peers.ensured, (std::vector<std::string>{"push:tray-b"}));
+  for (size_t i = 0; i < node.remote_bytes_.size(); ++i) {
+    char want = 0x5A;
+    if (i < 10) want = static_cast<char>(1 + i);
+    if (i >= 100 && i < 130) want = static_cast<char>(1 + 60 + (i - 100));
+    if (i >= 50 && i < 60) want = static_cast<char>(101 + 90 + (i - 50));
+    ASSERT_EQ(node.remote_bytes_[i], want) << i;
+  }
+  const auto stats = node.pool->GetFabricDirectStats();
+  EXPECT_EQ(stats.pushed_reads, 2u);
+  EXPECT_EQ(stats.pushed_bytes, 50u);
+
+  // A range past the object, or past the reader's registration, is refused
+  // whole: nothing of that key is written.
+  std::fill(node.remote_bytes_.begin(), node.remote_bytes_.end(), char{0x5A});
+  EXPECT_EQ(node.pool->PushToReader({"a", "b"},
+                                    {{node.Range(0, 10, 0), node.Range(95, 10, 20)},
+                                     {node.Range(0, 10, node.remote_bytes_.size() - 5)}},
+                                    node.other),
+            (std::vector<bool>{false, false}));
+  for (char byte : node.remote_bytes_) ASSERT_EQ(byte, 0x5A);
+  // A failed copy is a failed read, and a reader that cannot be registered
+  // is not written at all.
+  node.engine.fail = true;
+  EXPECT_EQ(node.pool->PushToReader({"a"}, {{node.Range(0, 10, 0)}}, node.other),
+            (std::vector<bool>{false}));
+  node.engine.fail = false;
+  node.peers.reachable = false;
+  EXPECT_EQ(node.pool->PushToReader({"a"}, {{node.Range(0, 10, 0)}}, {"tray-c", "engine-desc"}),
+            (std::vector<bool>{false}));
 }
 
 }  // namespace

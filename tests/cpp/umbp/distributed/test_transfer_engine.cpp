@@ -420,6 +420,180 @@ TransferRef LocalRegistered(void* base, uint64_t size, mori::io::MemoryUniqueId 
   return ref;
 }
 
+// Exportable HBM on another tray, in UALink vPOD `vpod`.
+TransferRef ExportableRef(const std::string& engine_key, mori::io::MemoryUniqueId id, uint64_t size,
+                          int vpod) {
+  TransferRef ref = RemoteRef(engine_key, id, size);
+  ref.loc = ref.mem.loc = mori::io::MemoryLocationType::GPU;
+  ref.mem.fabricHandle[0] = 1;
+  ref.mem.vpodId = vpod;
+  return ref;
+}
+
+// Host memory in 4 KiB "registered pieces", each seen by a GPU in vPOD 1 at its
+// own address, so a test can tell which piece and which offset a segment names.
+struct FakeHostViews {
+  static constexpr size_t kPiece = 4096;
+  FakeHostViews(char* base, size_t pieces, bool required) {
+    for (size_t i = 0; i < pieces; ++i) {
+      auto view = std::make_shared<HostFabricView>();
+      view->host_base = reinterpret_cast<uintptr_t>(base) + i * kPiece;
+      view->bytes = kPiece;
+      view->ref =
+          TransferRef::HostBytes(reinterpret_cast<void*>(0x7000000000ull + i * (1ull << 30)),
+                                 kPiece, mori::io::MemoryLocationType::GPU, 0);
+      view->ref.mem.engineKey = "local";
+      view->ref.mem.id = 100 + i;
+      view->ref.mem.size = kPiece;
+      view->ref.mem.loc = mori::io::MemoryLocationType::GPU;
+      view->ref.mem.vpodId = 1;
+      views.push_back(std::move(view));
+    }
+    api.find = [this](uintptr_t address) -> std::shared_ptr<const HostFabricView> {
+      ++lookups;
+      for (const auto& view : views)
+        if (address >= view->host_base && address - view->host_base < view->bytes) return view;
+      return nullptr;
+    };
+    api.required = required;
+  }
+  std::vector<std::shared_ptr<const HostFabricView>> views;
+  size_t lookups = 0;
+  HostFabricViews api;
+};
+
+TEST(MoriIoEngine, FabricReachesExportableHbmInTheSameVpodOnly) {
+  mori::io::MemoryDesc local;
+  local.loc = mori::io::MemoryLocationType::GPU;
+  local.vpodId = 1;
+  const auto remote = ExportableRef("peer", 2, 4096, 1).mem;
+  EXPECT_TRUE(FabricReaches(local, remote));
+  // Another vPOD, memory that was not allocated exportable, host memory on
+  // either side, and a GPU that sits in no vPOD: none is a fabric pair.
+  EXPECT_FALSE(FabricReaches(local, ExportableRef("peer", 2, 4096, 2).mem));
+  auto plain = remote;
+  plain.fabricHandle = {};
+  EXPECT_FALSE(FabricReaches(local, plain));
+  auto host = remote;
+  host.loc = mori::io::MemoryLocationType::CPU;
+  EXPECT_FALSE(FabricReaches(local, host));
+  EXPECT_FALSE(FabricReaches(host, remote));
+  auto nowhere = local;
+  nowhere.vpodId = -1;
+  EXPECT_FALSE(FabricReaches(nowhere, remote));
+  // A vPOD named by UUID rather than id still has to match.
+  local.vpodPpodId = "pod-a";
+  auto named = remote;
+  named.vpodPpodId = "pod-a";
+  EXPECT_TRUE(FabricReaches(local, named));
+  named.vpodPpodId = "pod-b";
+  EXPECT_FALSE(FabricReaches(local, named));
+}
+
+TEST(MoriIoEngine, FabricPlannerCarriesHostEndpointsThroughDeviceViews) {
+  std::vector<char> host(3 * FakeHostViews::kPiece);
+  FakeHostViews views(host.data(), 3, /*required=*/true);
+  const std::string key = "local";  // borrowed by every builder below
+  const TransferRef none;
+  const auto local = TransferRef::HostBytes(host.data(), host.size());
+  const auto peer = ExportableRef("peer", 2, 1 << 20, 1);
+
+  // A pull that starts inside piece 0 and ends inside piece 2: one segment per
+  // piece, each at its offset inside that piece's device view.
+  auto pull = MakeFabricPlanBuilder(key, 0, none, /*fabric_strict=*/true, &views.api);
+  pull->Add(MakeItem(peer, 500, local, 4000, 5000, 7));
+  const auto pulled = pull->Finish();
+  EXPECT_TRUE(pulled.rejected_tags.empty());
+  ASSERT_EQ(pulled.plans.size(), 3u);
+  const uint64_t want_dst[] = {4000, 0, 0}, want_src[] = {500, 596, 4692},
+                 want_size[] = {96, 4096, 808};
+  for (size_t i = 0; i < 3; ++i) {
+    const auto& plan = pulled.plans[i];
+    EXPECT_EQ(plan.dir, TransferDirection::kPull);
+    EXPECT_EQ(plan.dst.mem.id, views.views[i]->ref.mem.id);
+    EXPECT_EQ(plan.dst.loc, mori::io::MemoryLocationType::GPU);
+    EXPECT_FALSE(plan.uses_bounce);
+    ASSERT_EQ(plan.sizes.size(), 1u);
+    EXPECT_EQ(plan.dst_offsets[0], want_dst[i]);
+    EXPECT_EQ(plan.src_offsets[0], want_src[i]);
+    EXPECT_EQ(plan.sizes[0], want_size[i]);
+    EXPECT_EQ(plan.tags, (std::vector<size_t>{7}));
+  }
+
+  // A push from host memory names the view as the source; adjacent ranges in
+  // one piece still merge into one segment.
+  auto push = MakeFabricPlanBuilder(key, 0, none, true, &views.api);
+  push->Add(MakeItem(local, 4096, peer, 0, 1000, 1));
+  push->Add(MakeItem(local, 5096, peer, 1000, 1000, 1));
+  const auto pushed = push->Finish();
+  ASSERT_EQ(pushed.plans.size(), 1u);
+  EXPECT_EQ(pushed.plans[0].dir, TransferDirection::kPush);
+  EXPECT_EQ(pushed.plans[0].src.mem.id, views.views[1]->ref.mem.id);
+  EXPECT_EQ(pushed.plans[0].src_offsets, (std::vector<size_t>{0}));
+  EXPECT_EQ(pushed.plans[0].sizes, (std::vector<size_t>{2000}));
+
+  // Consecutive items in one piece ask the engine once.
+  views.lookups = 0;
+  auto many = MakeFabricPlanBuilder(key, 0, none, true, &views.api);
+  for (size_t i = 0; i < 8; ++i) many->Add(MakeItem(peer, i * 64, local, i * 100, 64, i));
+  EXPECT_EQ(many->Finish().rejected_tags.size(), 0u);
+  EXPECT_EQ(views.lookups, 1u);
+}
+
+TEST(MoriIoEngine, FabricPlannerRejectsOrFallsBackWhenTheFabricCannotCarryAPair) {
+  std::vector<char> host(3 * FakeHostViews::kPiece);
+  const std::string key = "local";  // borrowed by every builder below
+  const TransferRef none;
+  const auto peer = ExportableRef("peer", 2, 1 << 20, 1);
+  const auto elsewhere = ExportableRef("peer", 3, 1 << 20, 2);  // another vPOD
+  const auto local = TransferRef::HostBytes(host.data(), host.size());
+
+  // Strict: the last piece is not registered, so an item reaching into it is
+  // rejected whole and leaves nothing behind for the pieces it did resolve.
+  FakeHostViews strict(host.data(), 2, /*required=*/true);
+  auto builder = MakeFabricPlanBuilder(key, 0, none, true, &strict.api);
+  builder->Add(MakeItem(peer, 0, local, 4096, 8192, 3));
+  builder->Add(MakeItem(peer, 0, local, 0, 4096, 4));
+  auto out = builder->Finish();
+  EXPECT_EQ(out.rejected_tags, (std::vector<size_t>{3}));
+  ASSERT_EQ(out.plans.size(), 1u);
+  EXPECT_EQ(out.plans[0].tags, (std::vector<size_t>{4}));
+
+  // Strict: memory the fabric cannot reach has no other way across, whether
+  // the local end is host memory or a registered GPU buffer.
+  builder = MakeFabricPlanBuilder(key, 0, none, true, &strict.api);
+  builder->Add(MakeItem(local, 0, elsewhere, 0, 4096, 5));
+  TransferRef gpu = LocalRegistered(host.data(), host.size(), 9);
+  gpu.loc = gpu.mem.loc = mori::io::MemoryLocationType::GPU;
+  gpu.mem.vpodId = 1;
+  builder->Add(MakeItem(gpu, 0, elsewhere, 0, 4096, 6));
+  builder->Add(MakeItem(gpu, 0, RemoteRef("peer", 4, 1 << 20), 0, 4096, 7));  // a peer's DRAM
+  builder->Add(MakeItem(gpu, 0, peer, 0, 4096, 8));
+  out = builder->Finish();
+  EXPECT_EQ(out.rejected_tags, (std::vector<size_t>{5, 6, 7}));
+  ASSERT_EQ(out.plans.size(), 1u);
+  EXPECT_EQ(out.plans[0].tags, (std::vector<size_t>{8}));
+
+  // With RDMA beside the fabric the same host endpoint keeps its registered
+  // path to a peer the fabric cannot reach...
+  FakeHostViews mixed(host.data(), 3, /*required=*/false);
+  const auto registered = LocalRegistered(host.data(), host.size(), 1);
+  builder = MakeFabricPlanBuilder(key, 0, none, /*fabric_strict=*/false, &mixed.api);
+  builder->Add(MakeItem(registered, 0, elsewhere, 0, 4096, 6));
+  out = builder->Finish();
+  EXPECT_TRUE(out.rejected_tags.empty());
+  ASSERT_EQ(out.plans.size(), 1u);
+  EXPECT_EQ(out.plans[0].src.mem.id, 1u);
+  EXPECT_EQ(out.plans[0].src.loc, mori::io::MemoryLocationType::CPU);
+
+  // ...and takes the fabric to one it can.
+  builder = MakeFabricPlanBuilder(key, 0, none, false, &mixed.api);
+  builder->Add(MakeItem(registered, 0, peer, 0, 4096, 6));
+  out = builder->Finish();
+  ASSERT_EQ(out.plans.size(), 1u);
+  EXPECT_EQ(out.plans[0].src.mem.id, mixed.views[0]->ref.mem.id);
+}
+
 TEST(MoriIoEngine, GroupsZeroCopyByEndpointsAndCapsSegments) {
   MoriIoEngine engine("local", mori::io::IOEngineConfig{}, /*bounce_bytes=*/0);
   std::vector<char> buf(1 << 16);
