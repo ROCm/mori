@@ -55,6 +55,11 @@ class ExportHook {
   virtual void Offer(const Batch& b) = 0;
 };
 
+// Whether a file name in a recording directory belongs to ainic-netmon: .lock, meta.json (and
+// its temporary meta.json.tmp), <netdev>.<rdma|ipc|ethtool>.bin. Everything else (e.g.
+// xgmi-netmon's xgmi_* files in the same directory) is left alone.
+bool IsRecordingFile(const std::string& name);
+
 class Writer {
  public:
   // Test hook: replaces ::write for record and meta writes.

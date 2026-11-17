@@ -416,17 +416,46 @@ TEST(RecorderRequiredProbeFailureAborts) {
   CHECK(!Exists(dir));
 }
 
-TEST(RecorderRefusesNonEmptyDirectory) {
+// Another tool (xgmi-netmon) records into the same directory with its own file names: the
+// recording goes ahead and never touches them (NETMON_SHARED_STACK_DESIGN §1).
+TEST(RecorderSharesTheDirectoryWithOtherTools) {
   TempDir tmp;
   auto dir = tmp.path();
-  {
-    std::ofstream(dir + "/precious.txt") << "keep";
-  }
+  const char* foreign[] = {"xgmi_meta.json", "xgmi.lock", "xgmi_gpu0.bin", "precious.txt"};
+  for (const char* f : foreign) std::ofstream(dir + "/" + f) << "keep " << f;
   int code = RunCase("short", dir);
+  CHECK_EQ(code, 0);
+  for (const char* f : foreign) CHECK(ReadAll(dir + "/" + f) == std::string("keep ") + f);
+  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"complete\"") != std::string::npos);
+  CHECK(Exists(dir + "/fake0.rdma.bin"));
+}
+
+TEST(RecorderRefusesADirectoryWithItsOwnFiles) {
+  for (const char* own : {"meta.json", ".lock", "eth2.rdma.bin", "x.ethtool.bin"}) {
+    TempDir tmp;
+    auto dir = tmp.path();
+    std::ofstream(dir + "/" + own) << "keep";
+    std::ofstream(dir + "/xgmi_meta.json") << "keep";
+    int code = RunCase("short", dir);
+    CHECK_EQ(code, 1);
+    CHECK(ReadAll(dir + "/" + own) == "keep");
+    CHECK(ReadAll(dir + "/xgmi_meta.json") == "keep");
+    CHECK(!Exists(dir + "/fake0.rdma.bin"));
+  }
+  CHECK(IsRecordingFile("eth2.ipc.bin") && IsRecordingFile("meta.json.tmp"));
+  CHECK(!IsRecordingFile("xgmi_gpu0.bin") && !IsRecordingFile("xgmi_meta.json"));
+  CHECK(!IsRecordingFile("xgmi.lock") && !IsRecordingFile(".rdma.bin"));
+}
+
+// A failed start in a shared directory removes only what it created, never the directory.
+TEST(RecorderFailureInASharedDirectoryKeepsOthersFiles) {
+  TempDir tmp;
+  auto dir = tmp.path();
+  std::ofstream(dir + "/xgmi_gpu0.bin") << "keep";
+  int code = RunCase("required_probe_fails", dir);
   CHECK_EQ(code, 1);
-  CHECK(ReadAll(dir + "/precious.txt") == "keep");
-  CHECK(!Exists(dir + "/.lock"));
-  CHECK(!Exists(dir + "/meta.json"));
+  CHECK(ReadAll(dir + "/xgmi_gpu0.bin") == "keep");
+  CHECK(!Exists(dir + "/.lock") && !Exists(dir + "/meta.json"));
 }
 
 TEST(RecorderWriteFailure) {

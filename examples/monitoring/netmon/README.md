@@ -1,7 +1,8 @@
-# netmon dashboards: ainic-netmon recordings in Grafana
+# netmon dashboards: NIC (and XGMI) recordings in Grafana
 
-VictoriaMetrics + Grafana with two dashboards for recordings made by
-[`ainic-netmon`](../../../tools/netmon/README.md):
+One VictoriaMetrics + Grafana for the cluster monitoring tools: NIC counters from
+[`ainic-netmon`](../../../tools/netmon/README.md), and other tools that add their dashboard to
+`grafana/dashboards/` (see "Other tools" below). The two NIC dashboards:
 
 - **netmon overview**: one experiment, every node and NIC. A table of the NICs (host, RDMA
   device name such as `ionic_0 (benic1p1)`, link rate, average send and receive over the
@@ -23,13 +24,40 @@ the fact with exact numbers (`ainic-netmon-import`).
 ## Start
 
 ```
-./up.sh                    # data in ./data; or ./up.sh /scratch/netmon
+./up.sh                    # data in ./data; or ./up.sh /scratch/netmon (local disk)
 NETMON_VM_PORT=18428 NETMON_GRAFANA_PORT=13000 ./up.sh   # other ports
 ```
 
-`up.sh` writes `.env` (your uid/gid, the data directory, ports, retention) and runs
-`docker compose up -d`. Both containers run as you and listen on 127.0.0.1 only; Grafana
-allows anonymous admin access, so do not expose it. `./down.sh` stops them and keeps the data.
+`up.sh` starts two containers with `docker run`, `netmon-<you>-vm` and `netmon-<you>-grafana`
+(so several people can each run one on a shared host, on different ports). Both run as you and
+listen on 127.0.0.1 only; Grafana allows anonymous admin access, so do not expose it. Grafana
+gets a copy of `grafana/` in the data directory (the docker daemon may not see an NFS home),
+refreshed on every start. `./down.sh` stops them and keeps the data.
+
+Moving from the earlier docker-compose version of this stack (`netmon-victoriametrics-1`,
+`netmon-grafana-1`): run the new `./down.sh` first (it stops those two containers if they run as
+you), then `./up.sh` with the same data directory and ports. `up.sh` refuses to start while that
+stack runs or while a port is taken.
+
+### One stack for several tools
+
+The NIC dashboards and the XGMI dashboard of `xgmi-netmon` share this VictoriaMetrics and
+Grafana: push and import both tools to the same URL. Their metrics do not collide
+(`netmon_*`, `xgmi_*`), and each tool only replaces or refuses its own series. A tool adds its
+dashboard as a JSON file in `grafana/dashboards/`, using the data source uid `netmon-vm`; all
+of them appear in Grafana's `netmon` folder. For example, with the default ports:
+
+```
+ainic-netmon record -o /shared/exp42/{host} --push http://127.0.0.1:8428
+xgmi-netmon  record -o /shared/exp42/{host} --push http://127.0.0.1:8428
+ainic-netmon-import /shared/exp42/* --url http://127.0.0.1:8428
+xgmi-netmon  import /shared/exp42/*     # with its option for the VictoriaMetrics URL
+```
+
+Both tools can also record into the same directory (`-o /shared/exp42/{host}`, so the default
+experiment name is the same): each one writes and refuses only its own files (ainic-netmon:
+`.lock`, `meta.json`, `<netdev>.<source>.bin`; xgmi-netmon: `xgmi_*`), and each importer reads
+only its own. `{host}` is the full host name in both (`--host-id` to override).
 
 ## Live view while recording
 

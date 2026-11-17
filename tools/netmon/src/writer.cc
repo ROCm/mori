@@ -32,6 +32,15 @@
 
 namespace netmon {
 
+bool IsRecordingFile(const std::string& name) {
+  if (name == ".lock" || name == "meta.json" || name == "meta.json.tmp") return true;
+  for (const char* src : {".rdma.bin", ".ipc.bin", ".ethtool.bin"}) {
+    const size_t n = strlen(src);
+    if (name.size() > n && name.compare(name.size() - n, n, src) == 0) return true;
+  }
+  return false;
+}
+
 static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
               "record files are little-endian; batches are written as-is");
 
@@ -176,18 +185,21 @@ Status Writer::DoPrepare() {
     created_dir_ = true;
   } else {
     if (!S_ISDIR(sb.st_mode)) return Status::Error(dir_ + " exists and is not a directory");
+    // Other tools may record into the same directory (xgmi-netmon writes xgmi_* files):
+    // refuse only if one of ours is already there (NETMON_SHARED_STACK_DESIGN §1).
     DIR* d = opendir(dir_.c_str());
     if (!d) return Status::Errno("opendir " + dir_, errno);
-    bool empty = true;
+    std::string ours;
     while (dirent* e = readdir(d)) {
-      if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) {
-        empty = false;
+      if (IsRecordingFile(e->d_name)) {
+        ours = e->d_name;
         break;
       }
     }
     closedir(d);
-    if (!empty) {
-      return Status::Error(dir_ + " is not empty; refusing to overwrite an existing recording");
+    if (!ours.empty()) {
+      return Status::Error(dir_ + " already holds an ainic-netmon recording (" + ours +
+                           "); refusing to overwrite it");
     }
   }
   const std::string lock = dir_ + "/.lock";
