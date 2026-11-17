@@ -844,9 +844,10 @@ struct ccoComm {
   application::BootstrapNetwork* bootNet{nullptr};
   application::Context* ctx{nullptr};
 
-  // rank 0's pid, gathered via Allgather. Disambiguates LocalBootstrap socket
-  // paths across independent comm groups in the same process tree.
+  // rank 0's (pid, per-process comm count): unique per comm, names LocalBootstrap sockets.
   int64_t groupId{0};
+  // Count of ccoWindowRegister calls. Collective, so equal on every rank, unlike slot offsets.
+  uint64_t windowSeq{0};
 
   // Local HIP device this comm is bound to. Cached at CommCreate so we
   // don't call hipGetDevice() on the hot path (per-MemAlloc / per-Window).

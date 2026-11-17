@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstdio>
@@ -544,11 +545,13 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   comm->rank = comm->bootNet->GetLocalRank();
   comm->worldSize = comm->bootNet->GetWorldSize();
 
-  // Derive a shared group ID (rank 0's pid) for unique LocalBootstrap socket paths
-  int64_t myPid = static_cast<int64_t>(getpid());
-  std::vector<int64_t> allPids(comm->worldSize);
-  comm->bootNet->Allgather(&myPid, allPids.data(), sizeof(int64_t));
-  comm->groupId = allPids[0];
+  // Socket-path group ID: rank 0's pid plus a per-process comm count, unique per comm.
+  static std::atomic<uint32_t> commSeq{0};
+  int64_t myId = (static_cast<int64_t>(getpid()) << 24) |
+                 static_cast<int64_t>(commSeq.fetch_add(1) & 0xFFFFFFu);
+  std::vector<int64_t> allIds(comm->worldSize);
+  comm->bootNet->Allgather(&myId, allIds.data(), sizeof(int64_t));
+  comm->groupId = allIds[0];
 
   MORI_SHMEM_TRACE("ccoCommCreate: rank={} worldSize={} groupId={}", comm->rank, comm->worldSize,
                    comm->groupId);
@@ -1272,6 +1275,8 @@ static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh, bool isFabric,
 }
 
 int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin) {
+  // Names this register's socket rendezvous; slot offsets differ across ranks once frees diverge.
+  const uint64_t windowSeq = comm->windowSeq++;
   auto it = comm->allocTable.find(ptr);
   if (it == comm->allocTable.end()) {
     MORI_SHMEM_ERROR("ccoWindowRegister: ptr {} not in allocTable", ptr);
@@ -1459,7 +1464,7 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
       int p2pWorldSize = static_cast<int>(sortedGroup.size());
 
       std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" +
-                               std::to_string(slotOffset) + "_g" + std::to_string(sortedGroup[0]) +
+                               std::to_string(windowSeq) + "_g" + std::to_string(sortedGroup[0]) +
                                "_";
 
       application::LocalBootstrapNetwork localBoot(myPeerRank, p2pWorldSize, socketPath);
