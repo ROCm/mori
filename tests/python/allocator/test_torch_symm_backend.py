@@ -78,7 +78,7 @@ def _run(rank, world_size, port):
         torch.cuda.synchronize()
         assert abs(out[0].item() - expect) < 1e-3
 
-        # The backend's own barrier, over cco's host barrier.
+        # The backend's own barrier, a kernel on the current stream.
         hdl.barrier(0)
 
         # Backend-specific escape hatch: the cco window a kernel can address through.

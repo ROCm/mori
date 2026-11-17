@@ -228,7 +228,6 @@ this backend exposes the pointer array anyway, kernels would not notice.
 ## Notes
 
 `dist.barrier()` is used between the kernel and the reads because the examples predate the
-backend's own `barrier()`, which now runs over cco's host barrier. The signal pad is always
-present -- its own cco window rather than a tail on the buffer -- so torch's `symm_mem`
-collectives work without a build flag. `put_signal`/`wait_signal` still raise: they need a
-`ccoDevComm`, which the backend does not create yet.
+backend's own `barrier()`, which is now a device-side kernel on the current stream, as are
+`put_signal`/`wait_signal`. The signal pad is always present -- its own cco window rather
+than a tail on the buffer -- so torch's `symm_mem` collectives work without a build flag.

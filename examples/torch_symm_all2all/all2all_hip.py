@@ -177,7 +177,7 @@ def main():
     def run_once():
         push(send, peers_dev, chunk_bytes, rank_id, world_size)
         torch.cuda.synchronize()
-        dist.barrier()  # no device-side barrier in the backend yet
+        dist.barrier()  # host-side, so the reads below see every peer
 
     # Peers write into this window, so everyone must finish clearing before anyone pushes.
     dist.barrier()
