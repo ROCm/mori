@@ -118,6 +118,13 @@ comm.destroy()   # or use `with Communicator.init(...) as comm:`
 The rendezvous network interface is selected via `MORI_SOCKET_IFNAME`
 (see [Environment Variables](#9-environment-variables)).
 
+`init` takes two per-communicator options; `lsa_only` must match on every rank.
+
+| Option | Default | Effect |
+|---|---|---|
+| `cpu_affinity` | `True` | Pin the calling thread to its GPU's NUMA-local CPUs (see [Environment Variables](#9-environment-variables)). `False` leaves the thread's affinity alone. |
+| `lsa_only` | `False` | Open no RDMA device and skip GPU-NIC topology matching. Only LSA-team peers are reachable. A device communicator that needs GDA QPs is rejected: `FULL` always, and `CROSSNODE`/`RAIL` when the ranks span more than one LSA team. |
+
 ## 3. Memory and Windows
 
 ```python
@@ -352,6 +359,11 @@ if (rank == 0) ccoGetUniqueId(&id);
 /* broadcast id to all ranks */
 ccoComm* comm;
 ccoCommCreate(id, nRanks, rank, perRankVmmSize, &comm);
+// or, with per-communicator options:
+//   ccoCommConfig config = CCO_COMM_CONFIG_INITIALIZER;
+//   config.cpuAffinity = 0;   // leave the calling thread's CPU affinity alone
+//   config.lsaOnly = 1;       // no RDMA device, no GPU-NIC topology
+//   ccoCommCreate(id, nRanks, rank, perRankVmmSize, &config, &comm);
 
 void* ptr;
 ccoMemAlloc(comm, size, &ptr);
@@ -379,11 +391,12 @@ ccoCommDestroy(comm);
 | `MORI_RDMA_DEVICES` | Comma-separated RDMA devices to use (GDA) |
 | `MORI_RDMA_TC` | RDMA traffic class (GDA) |
 | `MORI_RDMA_SL` | RDMA service level (GDA) |
-| `MORI_IGNORE_CPU_AFFINITY` | `1` skips the CPU bind done at communicator creation, leaving placement to an outer `numactl`/`torchrun` |
+| `MORI_IGNORE_CPU_AFFINITY` | `1` skips the CPU bind done at communicator creation, leaving placement to an outer `numactl`/`torchrun`. `ccoCommConfig::cpuAffinity = 0` does the same for one communicator |
 | `MORI_CPU_AFFINITY_NO_SPLIT` | `1` binds to the whole NUMA node instead of this rank's own slice of it |
 
 Communicator creation (`ccoCommCreate`) pins the calling thread to the CPUs
-local to its current HIP device before the bootstrap and any worker thread, so
+local to its current HIP device (once per thread, unless `cpuAffinity` is 0)
+before the bootstrap and any worker thread, so
 new threads inherit the affinity. The GPU-local CPU list (sysfs
 `local_cpulist`) is intersected with the existing cpuset, so cgroup limits and
 an outer binding are respected. Within that set the CPUs are grouped into
