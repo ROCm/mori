@@ -176,6 +176,8 @@ class PeerPool {
   // Test seam: one synchronous pass.  Returns keys dropped or queued.
   size_t RunLocalEvictionOnceForTest() { return LocalEvictionPass(); }
   // UMBP_EVICT_DEMOTION_RETRY_MS override; set it before queueing work.
+  void SetDropLowClassOnEvictForTest(bool drop) { drop_low_class_on_evict_ = drop; }
+  void SetLowClassLookupHoldForTest(std::chrono::milliseconds hold) { low_class_lookup_hold_ = hold; }
   void SetEvictDemotionRetryBudgetForTest(std::chrono::milliseconds budget) {
     evict_demotion_retry_budget_ = budget;
   }
@@ -334,6 +336,12 @@ class PeerPool {
   bool stop_transition_worker_ = false;
   std::thread transition_worker_;
   std::chrono::milliseconds evict_demotion_retry_budget_{30000};  // transition worker only
+  // UMBP_LOW_CLASS_NO_DEMOTE=1: an evicted eviction-class-1 key is deleted, not
+  // demoted, so short-lived hints never take the lower tier's room.
+  bool drop_low_class_on_evict_ = false;
+  // UMBP_LOW_CLASS_LOOKUP_HOLD_MS: a lookup leases the class-1 keys it finds for
+  // this long (0: off), so a fast-aging key outlives the wait before its load.
+  std::chrono::milliseconds low_class_lookup_hold_{0};
 
   // Local watermark eviction.  local_evict_mutex_ guards local_evict_,
   // stop_local_evict_ and the worker's start.

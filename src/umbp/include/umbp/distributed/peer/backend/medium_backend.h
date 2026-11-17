@@ -22,6 +22,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -332,6 +333,18 @@ class MediumBackend : public MetricSource {
   // that keeps no order ignores it and returns 0.
   virtual size_t SetEvictionClass(const std::vector<std::string>& /*keys*/,
                                   int /*eviction_class*/) {
+    return 0;
+  }
+
+  // The eviction class of a held key (0 if not held, or for a medium that keeps
+  // no order).
+  virtual int EvictionClassOf(const std::string& /*key*/) const { return 0; }
+
+  // Give the held class-1 keys among `keys` a read lease of `ttl`, so local
+  // eviction passes them over until the load that follows a lookup has run.
+  // Returns how many were held; a medium that keeps no order returns 0.
+  virtual size_t HoldLowClass(const std::vector<std::string>& /*keys*/,
+                              std::chrono::milliseconds /*ttl*/) {
     return 0;
   }
 

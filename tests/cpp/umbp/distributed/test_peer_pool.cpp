@@ -25,6 +25,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -900,6 +901,79 @@ TEST(PeerPool, ReclaimDemotesOnAWatermarkTierToo) {
   ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "k"));
   EXPECT_TRUE(registry.Get("cold")->Contains("k"))
       << "a watermark tier deleted instead of demoting";
+}
+
+TEST(PeerPool, LowClassKeysAreDeletedNotDemotedWhenAsked) {
+  // UMBP_LOW_CLASS_NO_DEMOTE: an evicted class-1 key leaves the pool; a class-0
+  // key is still demoted.  Off, both are demoted.
+  for (bool drop : {false, true}) {
+    constexpr uint64_t kPageSize = 64;
+    LocalCopyEngine engine;
+    BackendRegistry registry;
+    RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 16);
+    RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 16);
+    auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+    ASSERT_TRUE(compiled.ok()) << compiled.error;
+    PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+    pool.SetDropLowClassOnEvictForTest(drop);
+    // Tracking the eviction order is what lets a backend keep a class.
+    ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("hot")), 0.99, 0.98));
+    CommitKey(&pool, "hint");
+    CommitKey(&pool, "kv");
+    ASSERT_EQ(pool.BatchSetEvictionClass({"hint"}, 1), 1u);
+    EXPECT_EQ(registry.Get("hot")->EvictionClassOf("hint"), 1);
+    EXPECT_EQ(registry.Get("hot")->EvictionClassOf("kv"), 0);
+
+    auto evicted = pool.Evict({PoolEvictRequest{"hint", TierType::DRAM},
+                               PoolEvictRequest{"kv", TierType::DRAM}},
+                              PoolEvictMode::kReclaim);
+    EXPECT_EQ(evicted[1].outcome, PoolEvictOutcome::kDemotionQueued);
+    ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "kv"));
+    EXPECT_TRUE(registry.Get("cold")->Contains("kv")) << "drop=" << drop;
+    if (drop) {
+      EXPECT_EQ(evicted[0].outcome, PoolEvictOutcome::kFreed);
+      EXPECT_GT(evicted[0].bytes_freed, 0u);
+      EXPECT_FALSE(registry.Get("hot")->Contains("hint"));
+      EXPECT_FALSE(registry.Get("cold")->Contains("hint")) << "a class-1 key was demoted";
+      EXPECT_FALSE(pool.BatchResolve({"hint"}, false).front().resolved.found);
+    } else {
+      EXPECT_EQ(evicted[0].outcome, PoolEvictOutcome::kDemotionQueued);
+      ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "hint"));
+      EXPECT_TRUE(registry.Get("cold")->Contains("hint"));
+    }
+  }
+}
+
+TEST(PeerPool, LookupHoldsLowClassKeysUntilTheirLoad) {
+  // UMBP_LOW_CLASS_LOOKUP_HOLD_MS: a lookup leases the class-1 keys it finds,
+  // so local eviction skips them; an unlooked class-1 key and class-0 keys are
+  // still offered.  Off, the looked-up key is offered too.
+  for (bool hold : {false, true}) {
+    constexpr uint64_t kPageSize = 64;
+    LocalCopyEngine engine;
+    BackendRegistry registry;
+    RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 16);
+    RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 16);
+    auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+    ASSERT_TRUE(compiled.ok()) << compiled.error;
+    PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+    pool.SetLowClassLookupHoldForTest(std::chrono::milliseconds(hold ? 60000 : 0));
+    ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("hot")), 0.99, 0.98));
+    CommitKey(&pool, "looked");
+    CommitKey(&pool, "idle");
+    CommitKey(&pool, "kv");
+    ASSERT_EQ(pool.BatchSetEvictionClass({"looked", "idle"}, 1), 2u);
+    ASSERT_EQ(pool.BatchContains({"looked", "kv"}), (std::vector<bool>{true, true}));
+
+    std::vector<std::string> offered;
+    for (const auto& offer : registry.Get("hot")->EvictionCandidates(16)) offered.push_back(offer.key);
+    const auto has = [&](const std::string& k) {
+      return std::find(offered.begin(), offered.end(), k) != offered.end();
+    };
+    EXPECT_TRUE(has("idle")) << "hold=" << hold;
+    EXPECT_TRUE(has("kv")) << "a class-0 key was held, hold=" << hold;
+    EXPECT_EQ(has("looked"), !hold) << "hold=" << hold;
+  }
 }
 
 TEST(PeerPool, DemotionWithNoRoomDownstreamDropsTheCopy) {

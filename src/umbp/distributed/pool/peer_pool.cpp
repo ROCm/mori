@@ -25,6 +25,7 @@
 #include "umbp/distributed/pool/peer_pool.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iterator>
 #include <map>
 #include <numeric>
@@ -40,6 +41,18 @@
 namespace mori::umbp {
 
 namespace {
+
+// UMBP_LOW_CLASS_NO_DEMOTE: free eviction-class-1 keys on eviction instead of
+// demoting them to the next tier.
+bool DropLowClassOnEvict() {
+  const char* raw = std::getenv("UMBP_LOW_CLASS_NO_DEMOTE");
+  return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+}
+
+std::chrono::milliseconds LowClassLookupHold() {
+  return GetEnvMilliseconds("UMBP_LOW_CLASS_LOOKUP_HOLD_MS", std::chrono::milliseconds(0),
+                            /*min_allowed=*/0);
+}
 
 // How long a retryable eviction demotion keeps retrying before its copy is
 // dropped.  Time, not a count: the faults it rides out last a wall-clock
@@ -96,6 +109,11 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
       transfer_engine_(transfer_engine),
       tier_graph_(policy_ == nullptr ? nullptr : policy_->TierGraph()),
       transition_executor_(backends, transfer_engine) {
+  low_class_lookup_hold_ = LowClassLookupHold();
+  if (low_class_lookup_hold_.count() > 0) {
+    MORI_UMBP_INFO("[PeerPool] a lookup holds the eviction-class-1 keys it finds for {} ms",
+                   low_class_lookup_hold_.count());
+  }
   if (tier_graph_ != nullptr) {
     // A tier graph without an engine would accept offload and promotion rules
     // and then silently fail every one of them, leaving the topology looking
@@ -115,6 +133,10 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
       }
     }
     evict_demotion_retry_budget_ = EvictDemotionRetryBudget();
+    drop_low_class_on_evict_ = DropLowClassOnEvict();
+    if (drop_low_class_on_evict_) {
+      MORI_UMBP_INFO("[PeerPool] evicted eviction-class-1 keys are deleted, not demoted");
+    }
     transition_worker_ = std::thread(&PeerPool::TransitionWorkerLoop, this);
   }
 }
@@ -1088,7 +1110,10 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
         still_missing.push_back(pending[j]);
       }
     }
-    if (!found.empty()) backend->Touch(found);
+    if (!found.empty()) {
+      backend->Touch(found);
+      if (low_class_lookup_hold_.count() > 0) backend->HoldLowClass(found, low_class_lookup_hold_);
+    }
     pending.swap(still_missing);
   }
   if (track_access_order_) {
@@ -1232,6 +1257,10 @@ std::vector<PoolEvictResult> PeerPool::Evict(const std::vector<PoolEvictRequest>
       const auto tier_index = tier_graph_->TierIndexForBackendId(source_id);
       demote = placement != placements_.end() && placement->second == source_id &&
                tier_index.has_value() && !tier_graph_->NodeAt(*tier_index).offload_to.empty();
+      if (demote && drop_low_class_on_evict_) {
+        auto* source = backends_->Get(source_id);
+        demote = source == nullptr || source->EvictionClassOf(request.key) == 0;
+      }
     }
     if (demote) {
       demotions.emplace_back(i, source_id);

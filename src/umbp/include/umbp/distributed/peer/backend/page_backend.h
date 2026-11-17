@@ -331,6 +331,9 @@ class PageBackend : public MediumBackend {
   // times (UMBP_LOW_CLASS_AGE_WEIGHT, default 1: one plain LRU order).  Returns
   // how many are held; 0 until TrackEvictionOrder().
   size_t SetEvictionClass(const std::vector<std::string>& keys, int eviction_class) override;
+  int EvictionClassOf(const std::string& key) const override;
+  size_t HoldLowClass(const std::vector<std::string>& keys,
+                      std::chrono::milliseconds ttl) override;
   void SetLowClassAgeWeightForTest(double weight);
 
   // ==================== Reaper ====================

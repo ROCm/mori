@@ -951,6 +951,32 @@ size_t PageBackend::SetEvictionClass(const std::vector<std::string>& keys, int e
   return held.size();
 }
 
+int PageBackend::EvictionClassOf(const std::string& key) const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto it = owned_.find(key);
+  if (it == owned_.end()) return 0;
+  // SetEvictionClass writes it under lru_mutex_.
+  std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+  return it->second.eviction_class;
+}
+
+size_t PageBackend::HoldLowClass(const std::vector<std::string>& keys,
+                                 std::chrono::milliseconds ttl) {
+  if (keys.empty() || ttl.count() <= 0) return 0;
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  if (!track_eviction_order_) return 0;
+  const int64_t deadline = SteadyNs(std::chrono::steady_clock::now() + ttl);
+  size_t held = 0;
+  std::lock_guard<std::mutex> lru_lock(lru_mutex_);  // eviction_class
+  for (const auto& key : keys) {
+    auto it = owned_.find(key);
+    if (it == owned_.end() || it->second.eviction_class == 0) continue;
+    RenewLeaseAtomic(it->second, deadline);
+    ++held;
+  }
+  return held;
+}
+
 void PageBackend::InsertByAgeLocked(const std::string& key, OwnedSlot& slot) {
   auto& order = slot.eviction_class != 0 ? lru_low_ : lru_;
   // From the recent end: a class is usually set right after the commit, so the
