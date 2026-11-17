@@ -505,8 +505,10 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
     if (peerNode < 0 || localNode < 0) {
       MORI_APP_WARN("Local or peer {} KFD node id unresolved for rank {}", i, LocalRank());
       peerCaps[i].canSDMA = false;
-      transportTypes[i] =
-          (!IsP2PDisabled() && peerCaps[i].canP2P) ? TransportType::P2P : TransportType::RDMA;
+      // Empty unless BuildInitialEndpoints ran (cco never calls it).
+      if (i < static_cast<int>(transportTypes.size()))
+        transportTypes[i] =
+            (!IsP2PDisabled() && peerCaps[i].canP2P) ? TransportType::P2P : TransportType::RDMA;
       continue;
     }
     anvil::anvil.connect(localNode, peerNode, sdmaNumChannels);

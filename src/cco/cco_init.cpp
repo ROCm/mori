@@ -137,7 +137,14 @@ int ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
 
   // requestedChannels: reqs.sdmaQueueCount, 0 = env default. Adopt the count
   // actually connected so device-side indexing stays in bounds.
-  comm->ctx->EnsureSdmaTransport(requestedChannels);
+  try {
+    comm->ctx->EnsureSdmaTransport(requestedChannels);
+  } catch (const std::exception& e) {
+    // e.g. KFD refusing a queue because the engine's slots are taken.
+    MORI_SHMEM_ERROR("SDMA queue setup failed: {}", e.what());
+    comm->sdmaNumQueue = 0;
+    return -1;
+  }
   comm->sdmaNumQueue = comm->ctx->SdmaChannels();
 
   // sdmaDevHandles is lsaSize × sdmaNumQueue, indexed by lsaRank (kernel-facing
