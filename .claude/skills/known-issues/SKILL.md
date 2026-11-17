@@ -12,7 +12,11 @@ description: >-
   bug or an environment/toolchain problem. Also: (2) on ROCm 7.0-7.2.x a clr
   hipMemSetAccess sub-buffer bug makes mori-cco 2-node ccoDevCommCreate fail with
   "hipMemSetAccess ... invalid argument"; (3) on ROCm 7.2.x clr routes uncached VMM
-  allocations to the coarse-grained pool, making cco combine ~10-15us slower.
+  allocations to the coarse-grained pool, making cco combine ~10-15us slower; (4) amdgpu
+  miscounts VRAM registered with a NIC (MoRI-IO, UMBP, Mooncake): later allocations, kernel
+  loads or new streams fail with OOM, HIP error 209 or a segfault in HIPStream::stream()
+  although VRAM is free, or hipMemGetInfo exceeds the card. It behaves differently on
+  amdgpu-dkms 30.x and 31.x, and no public amdgpu-dkms release has the fix yet.
 ---
 
 # MORI Known Issues
@@ -401,3 +405,101 @@ the uncached flag into `deviceVmemAlloc` (it is hard-coded to `0`), and in
 `gpu_ext_fine_grained_segment_` when the uncached flag is set and that pool exists, else
 fall back to `gpuvm_segment_` (unchanged for every non-uncached allocation). Both Issue 2
 and Issue 3 ship in a single rebuilt `libamdhip64.so`.
+
+---
+
+## Issue 4 — amdgpu miscounts RDMA-registered VRAM: OOM while VRAM is free
+
+**Affects:** anything that registers HIP VRAM with a NIC (MoRI-IO, UMBP, shmem / cco
+proxy heaps, Mooncake) on every public amdgpu-dkms release so far (checked through 31.60,
+7.1.9) and on in-tree amdgpu without the upstream fix. Only the KFD free-VRAM count is
+wrong; physical usage (`mem_info_vram_used`) is right. ROCm/mori#721.
+
+**Symptoms**, after the first MoRI-IO transfer (it registers lazily) or after a KV cache is
+registered:
+
+- Later allocations, kernel loads or new streams fail although VRAM is free:
+  `hipErrorOutOfMemory`, `HSA_STATUS_ERROR_OUT_OF_RESOURCES`, Triton
+  `HIP error 209: no kernel image is available`, or a segfault in
+  `c10::hip::HIPStream::stream()` at the first new stream (ROCm 7.2).
+- `hipMemGetInfo` drops by the registered size, or stays normal while allocations fail
+  (31.x with peer memory), or reports more free VRAM than the card has (several
+  peer-memory MRs on one buffer).
+
+**Root cause:** KFD counts a `hipMalloc` buffer once as used (`kfd.vram_used`) and again
+as pinned (`vram_pin_size`) once a NIC pins it. A credit, `kfd.vram_pinned`, is meant to
+cancel the second count, but only the amdgpu peer-memory client (`ibv_reg_mr`, DKMS only)
+adds it, once per MR; dma-buf pins (`ibv_reg_dmabuf_mr`) never do. The 31.x allocation
+limit, `amdgpu_amdkfd_reserve_mem_limit()`, does not read the credit at all.
+
+With S the size of the registered allocation (the whole `hipMalloc` buffer) and N the
+number of peer-memory MRs on it:
+
+| amdgpu | `hipMemGetInfo` | Allocation limit | Result |
+|---|---|---|---|
+| amdgpu-dkms 30.10 – 30.30.4 (6.14.14, 6.16.6, 6.16.13) | dma-buf −S; peer memory +(N−1)·S | Same as `hipMemGetInfo` | dma-buf: OOM. Peer memory: fine; N > 1 over-reports, harmless unless something sizes allocations from it |
+| amdgpu-dkms 31.10 – 31.60 (6.18.4 – 7.1.9, incl. 6.19.14.31400000 / .31400100) | dma-buf −S; peer memory +(N−1)·S | −S for either path | OOM for either path; with peer memory `hipMemGetInfo` looks normal |
+| In-tree amdgpu without the fix: mainline 6.9 – 7.3, and stable / longterm kernels without the backport | −S (dma-buf only; in-tree amdgpu has no peer-memory client) | −S | OOM |
+| amdgpu-dkms 31.40.1.1 (6.19.14.31400101, AMD internal); Linux 7.4-rc1+, 7.3.4+, 6.18.63+ | Exact | Exact | Fine |
+
+Measured: on 6.16.6, registering 32 GiB through dma-buf lowers `hipMemGetInfo` by 32 GiB
+and a later 239 GiB allocation fails; on 6.19.14.31400100, registering 40 GiB lowers the
+largest accepted allocation by 80 GiB through dma-buf and through peer memory alike
+(kvcache-ai/Mooncake#5583). The other rows come from the driver sources.
+
+Related, but not a driver-version issue: if a process is killed while its MRs pin a
+buffer and the kernel logs `WARNING ... ttm_bo_release`, the BO was freed still pinned
+and the counts stay wrong on that GPU until reboot (seen once on 6.16.13, ROCm/mori#721).
+
+**Which path MoRI takes:** `RegisterRdmaMemoryRegionAuto` tries `ibv_reg_mr` (peer memory)
+first and falls back to dma-buf; `MORI_ENABLE_DMABUF_REG=1` puts dma-buf first. Peer memory
+needs amdgpu-dkms plus a NIC stack that provides `ib_peer_mem` (`lsmod | grep ib_peer_mem`).
+VMM memory (`hipMemCreate`, e.g. vLLM sleep mode or PyTorch `expandable_segments`) cannot
+be registered through peer memory (`ibv_reg_mr` fails with ENOMEM), so it always ends up
+on dma-buf. With `MORI_APP_LOG_LEVEL=warn` a fallback shows as
+`RegisterRdmaMemoryRegionAuto ibv_reg_mr registration failed`.
+
+**Detection:** `cat /sys/module/amdgpu/version`, compared in full: 31.40.1 and 31.40.1.1
+are both 6.19.14, and only `.31400101` is fixed. Without that file the driver is in-tree;
+check `uname -r`. Then compare `hipMemGetInfo` with
+`/sys/class/drm/card*/device/mem_info_vram_used` before and after registration.
+
+**Fix:** two upstream commits. amdgpu-dkms has carried 1/2 since at least 6.14, so a DKMS
+build needs only 2/2.
+
+- 1/2 [amdkfd: Fix memory availability double accounting of kfd pinned objects](https://github.com/torvalds/linux/commit/16df12d7158fb55f20d6e985abd1996cbabab9f8)
+  adds the `kfd.vram_pinned` credit, to `hipMemGetInfo` only.
+- 2/2 [drm/amdkfd: correct vram_available calculation](https://github.com/torvalds/linux/commit/9131cc85d0dedd8ba4cae60dbe5985d081551f30)
+  makes the allocation limit use the same count, and credits each KFD BO once at its
+  first pin, dma-buf included.
+
+They were posted to amd-gfx as v6
+[1/2](https://lists.freedesktop.org/archives/amd-gfx/2026-September/153709.html) and
+[2/2](https://lists.freedesktop.org/archives/amd-gfx/2026-September/153710.html); the
+archived mails are whitespace-damaged, so take the commits.
+
+- **amdgpu-dkms:** no public release has 2/2 yet (checked through 31.60, 7.1.9.31600000).
+  The internal 31.40.1.1 build (6.19.14.31400101) is public 31.40.1 plus 2/2:
+  https://osibuilds.amd.com/dashboard/#/job/2410696 (AMD network only). Only the kernel
+  driver changes; ROCm user space can stay, since 31.40.x supports ROCm 7.0 – 7.2, 7.14,
+  10.0 and 10.1.
+- **In-tree:** mainline 7.4-rc1, stable 7.3.4 and longterm 6.18.63 onwards. Not yet in
+  7.2.y, 6.12.y or 6.6.y, which are still affected (as of 2026-11-17).
+
+**Workarounds** until the driver is fixed:
+
+| Workaround | 30.x | 31.x and in-tree | Notes |
+|---|---|---|---|
+| Register through peer memory, mori's default: leave `MORI_ENABLE_DMABUF_REG` unset and keep the KV cache in `hipMalloc` memory | Works | No help | Needs `ib_peer_mem`; impossible for VMM memory |
+| Run amdgpu-dkms 30.x (downgrade from 31.x, or instead of in-tree amdgpu) and register through peer memory | — | Works | Same conditions as the row above |
+| A page-sized peer-memory "anchor" MR per allocation: Mooncake `MC_HIP_KFD_PIN_FIX` (kvcache-ai/Mooncake#4657, merged), mori `MORI_KFD_PIN_FIX=1` (ROCm/mori#869, not merged) | Fixes the dma-buf path; #869 also stops the over-report | Fixes only what `hipMemGetInfo` reports; allocations still fail | Needs peer memory and non-VMM memory |
+| Leave headroom: non-KV usage + 2 × registered size ≤ VRAM | Works | Works | Costs about half of the KV capacity |
+| Allocate the KV cache outside KFD, as an amdgpu GEM BO imported into HIP: Mooncake `HipGemAllocator` (kvcache-ai/Mooncake#5584, open) | Works | Works | Register only through the BO's dma-buf (warning below). MoRI does not support it |
+
+**Warning:** never register memory that KFD did not allocate (e.g. a GEM BO imported with
+`hipImportExternalMemory`) through `ibv_reg_mr` on a host with the amdgpu peer-memory
+client. Its `amd_acquire()` (`kfd_peerdirect.c`) dereferences the BO's `kfd_bo`, which is
+NULL for such BOs, and the kernel oopses. MoRI-IO registers through `ibv_reg_mr` first, and
+its dma-buf export cannot export these buffers, so do not hand them to MoRI. A probe that
+registered a GEM BO through dma-buf and then through `ibv_reg_mr` on 6.16.6 + ionic
+crashed its node.
