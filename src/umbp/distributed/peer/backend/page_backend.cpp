@@ -875,6 +875,24 @@ std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
   return out;
 }
 
+size_t PageBackend::Touch(const std::vector<std::string>& keys) {
+  if (keys.empty()) return 0;
+  // Shared, like the resolve paths: only the LRU position changes, and the LRU
+  // has its own lock.  Collect first so lru_mutex_ is taken once.
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  if (!track_eviction_order_) return 0;
+  std::vector<std::pair<const std::string*, OwnedSlot*>> held;
+  held.reserve(keys.size());
+  for (const auto& key : keys) {
+    auto it = owned_.find(key);
+    if (it != owned_.end()) held.emplace_back(&key, &it->second);
+  }
+  if (held.empty()) return 0;
+  std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+  for (auto& [key, slot] : held) TouchLruLocked(*key, *slot);
+  return held.size();
+}
+
 void PageBackend::TouchLruLocked(const std::string& key, OwnedSlot& slot) {
   if (!track_eviction_order_) return;
   if (slot.in_lru) {
@@ -896,16 +914,6 @@ void PageBackend::TouchLru(const std::string& key, OwnedSlot& slot) {
   if (!track_eviction_order_) return;
   std::lock_guard<std::mutex> lru_lock(lru_mutex_);
   TouchLruLocked(key, slot);
-}
-
-void PageBackend::Touch(const std::vector<std::string>& keys) {
-  if (!track_eviction_order_) return;
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  std::lock_guard<std::mutex> lru_lock(lru_mutex_);
-  for (const auto& key : keys) {
-    auto it = owned_.find(key);
-    if (it != owned_.end()) TouchLruLocked(key, it->second);
-  }
 }
 
 void PageBackend::RemoveFromLru(OwnedSlot& slot) {

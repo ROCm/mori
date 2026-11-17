@@ -17,7 +17,7 @@ MORI-IO is AMD's point-to-point communication library that leverages GDR (GPU Di
 ## Design & Concepts
 
 - **IOEngine**: The primary interface for interacting with MORI-IO. It abstracts low-level details of P2P communications and provides high-level APIs for engine registration, memory registration, P2P transfer, etc.
-- **Backend**: A backend represents and manages a specific transfer medium (e.g., RDMA, XGMI, TCP). It must be created before any data transfer can occur over that medium.
+- **Backend**: A backend represents and manages a specific transfer medium (e.g., RDMA, XGMI, FABRIC, OFI). It must be created before any data transfer can occur over that medium.
 - **Engine Registration**: Before two engines can communicate, the remote engine must be registered with the local engine. This establishes the necessary context for initiating data transfers between them.
 - **Memory Registration**: Application memory must be registered with a local engine before it can participate in data transfer. This ensures the engine can access and manage the memory efficiently during communication.
 - **Read/Write**: One-sided transfer operations initiated by the initiator engine without active involvement from the target engine. These operations can move data directly between registered memory regions.
@@ -28,7 +28,7 @@ MORI-IO is AMD's point-to-point communication library that leverages GDR (GPU Di
 
 The image below shows a typical workflow of using MORI-IO.
 
-<img src="mori_io_workflow.jpg">
+![MORI-IO workflow](mori_io_workflow.jpg)
 
 ## Architecture
 
@@ -42,11 +42,11 @@ Inside MORI-IO, there are 5 components:
 |-----------|-------------|
 | **Slow Control Plane** | Exchanges metadata such as memory descriptors, RDMA QP numbers, and custom notification messages. Uses a built-in TCP server with a lightweight protocol (no 3rd-party libraries). |
 | **Fast Control Plane** | Exchanges metadata on the critical path of transfers (e.g., remote engine completion notifications). Uses RDMA network to minimize performance penalty. |
-| **Data Plane** | Transfers bulk data. Supported transports: RDMA, XGMI, TCP. |
+| **Data Plane** | Transfers bulk data. Supported transports: RDMA, XGMI, FABRIC, OFI. TCP exists only in [simulation mode](#simulation-mode). |
 | **Metadata Store** | Manages per-engine metadata. Each engine manages its own metadata (no centralized store). |
-| **Transport Store** | Manages multiple transfer backends (RDMA, TCP, XGMI). Provides failover if one backend is in a failure state. |
+| **Transport Store** | Manages multiple transfer backends (RDMA, XGMI, FABRIC, OFI). Provides failover if one backend is in a failure state. |
 
-<img src="mori_io_arch.png">
+![MORI-IO architecture](mori_io_arch.png)
 
 ## Python API Quick Reference
 
@@ -76,7 +76,7 @@ from mori.io import (
 
 | Enum | Values |
 |------|--------|
-| `BackendType` | `Unknown`, `XGMI`, `RDMA`, `TCP` |
+| `BackendType` | `Unknown`, `XGMI`, `RDMA`, `TCP` (simulation mode only), `FABRIC`, `OFI` (needs MORI built with libfabric) |
 | `MemoryLocationType` | `Unknown`, `CPU`, `GPU` |
 | `StatusCode` | `SUCCESS`, `INIT`, `IN_PROGRESS`, `ERR_INVALID_ARGS`, `ERR_NOT_FOUND`, `ERR_RDMA_OP`, `ERR_BAD_STATE`, `ERR_GPU_OP` |
 | `PollCqMode` | `POLLING`, `EVENT` |
@@ -86,7 +86,7 @@ from mori.io import (
 | Method | Description |
 |--------|-------------|
 | `get_engine_desc()` | Get engine descriptor for remote registration |
-| `create_backend(type, config)` | Create RDMA/XGMI/TCP backend |
+| `create_backend(type, config)` | Create an RDMA, XGMI, FABRIC or OFI backend (TCP only in simulation mode) |
 | `remove_backend(type)` | Remove a backend |
 | `register_remote_engine(desc)` | Register a remote engine |
 | `deregister_remote_engine(desc)` | Deregister a remote engine |
@@ -106,7 +106,7 @@ from mori.io import (
 |--------|-------------|
 | `InProgress()` | Transfer still in progress |
 | `Succeeded()` | Transfer completed successfully |
-| `Failed()` | Transfer failed |
+| `Failed()` | Transfer failed. Over RDMA it reports only once none of the transfer's WRs can still move data, so its buffers may then be reused. Exception: when a submission gives up and has to move a QP to the error state, RDMA WRITE packets already on the wire can still land in the remote buffer shortly after; only a fence on the receiving side closes that window |
 | `Code()` | Get status code |
 | `Message()` | Get status message |
 | `Wait()` | Block until transfer completes |

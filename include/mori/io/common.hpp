@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -266,9 +267,18 @@ struct TransferStatus {
 
     std::unique_lock<std::mutex> lock(msgMu);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    // A status that completes only when polled (XGMI, FABRIC) is never notified, so wake up to
+    // poll it, backing off from 50 us to 1 ms. Others are completed by a thread that notifies cv_.
+    auto pollInterval = std::chrono::microseconds(50);
     while (code.load(std::memory_order_acquire) == StatusCode::IN_PROGRESS) {
-      if (std::chrono::steady_clock::now() >= deadline) break;
-      cv_.wait_until(lock, deadline);
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) break;
+      if (progressCallback) {
+        cv_.wait_until(lock, std::min(deadline, now + pollInterval));
+        pollInterval = std::min(pollInterval * 2, std::chrono::microseconds(1000));
+      } else {
+        cv_.wait_until(lock, deadline);
+      }
       lock.unlock();
       PollProgress();
       lock.lock();

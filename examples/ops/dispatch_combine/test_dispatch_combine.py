@@ -34,13 +34,9 @@ def _is_fp4x2_dtype(dtype):
 
 
 class EpDispatchCombineTestCase:
-    def __init__(
-        self, rank, world_size, dtype=torch.bfloat16, quant_type="none", hidden_dim=7168
-    ):
+    def __init__(self, rank, world_size, dtype=torch.bfloat16, hidden_dim=7168):
         self.rank = rank
         self.world_size = world_size
-        # fp8_direct_cast requires use_external_inp_buf=True (not zero-copy)
-        use_external_inp_buf = quant_type == "fp8_direct_cast"
         cfg_hidden_dim = hidden_dim // 2 if _is_fp4x2_dtype(dtype) else hidden_dim
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
@@ -56,8 +52,7 @@ class EpDispatchCombineTestCase:
             max_num_inp_token_per_rank=4096,
             num_experts_per_rank=32,
             num_experts_per_token=8,
-            use_external_inp_buf=use_external_inp_buf,
-            quant_type=quant_type,
+            use_external_inp_buf=False,
         )
 
     def setup(self):
@@ -325,8 +320,6 @@ class EpDispatchCombineTestCase:
             )
 
             atol, rtol = 1e-2, 1e-2
-            if self.config.quant_type == "fp8_direct_cast":
-                atol, rtol = 1e-1, 1e-1
             result_match = torch.allclose(
                 got.float(), expected.float(), atol=atol, rtol=rtol
             )
@@ -378,9 +371,9 @@ class EpDispatchCombineTestCase:
         del op
 
 
-def test_dispatch_combine(rank, world_size, dtype, quant_type="none"):
+def test_dispatch_combine(rank, world_size, dtype):
     # test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
-    test_case = EpDispatchCombineTestCase(rank, world_size, dtype, quant_type)
+    test_case = EpDispatchCombineTestCase(rank, world_size, dtype)
     test_case.setup()
     test_case.test_dispatch_combine()
     test_case.cleanup()
@@ -397,29 +390,17 @@ if __name__ == "__main__":
         choices=["bf16", "fp4"],
         help="Data type of dispatch / combine",
     )
-    parser.add_argument(
-        "--quant-type",
-        type=str,
-        default="none",
-        choices=["none", "fp8_direct_cast"],
-        help="Quantization method used inside Combine.",
-    )
     args = parser.parse_args()
 
     _DATA_TYPE_MAP = {
         "bf16": torch.bfloat16,
         "fp4": torch.float4_e2m1fn_x2,
     }
-    if (
-        args.quant_type == "fp8_direct_cast"
-        and _DATA_TYPE_MAP[args.dtype] is torch.float4_e2m1fn_x2
-    ):
-        raise ValueError("fp8_direct_cast is not supported for fp4 data type")
 
     world_size = 8
     torch.multiprocessing.spawn(
         test_dispatch_combine,
-        args=(world_size, _DATA_TYPE_MAP[args.dtype], args.quant_type),
+        args=(world_size, _DATA_TYPE_MAP[args.dtype]),
         nprocs=world_size,
         join=True,
     )

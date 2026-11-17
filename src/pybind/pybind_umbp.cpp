@@ -288,6 +288,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("address", &UMBPStandaloneProcessConfig::address)
       .def_readwrite("auto_start", &UMBPStandaloneProcessConfig::auto_start)
       .def_readwrite("startup_timeout_ms", &UMBPStandaloneProcessConfig::startup_timeout_ms)
+      .def_readwrite("lookup_timeout_ms", &UMBPStandaloneProcessConfig::lookup_timeout_ms)
       .def_readwrite("worker_node_id", &UMBPStandaloneProcessConfig::worker_node_id)
       .def_readwrite("worker_node_address", &UMBPStandaloneProcessConfig::worker_node_address)
       .def_readwrite("tags", &UMBPStandaloneProcessConfig::tags);
@@ -372,6 +373,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("batch_prefetch", &IUMBPClient::BatchPrefetch, py::arg("keys"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("batch_touch", &IUMBPClient::BatchTouch, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())

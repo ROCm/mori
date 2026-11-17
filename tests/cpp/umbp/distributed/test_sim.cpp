@@ -25,10 +25,13 @@
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -731,6 +734,45 @@ TEST_F(SimTest, StandaloneRanksShareCapacityLruAndRegistrationLifetime) {
   EXPECT_FALSE(rank1->Get("a", ptr, 8 * kPage));
   EXPECT_TRUE(rank1->Clear());
   EXPECT_FALSE(rank1->Exists("c"));
+}
+
+TEST_F(SimTest, StandaloneLookupsReportMissesOnceTheLookupTimeoutPasses) {
+  const auto address = RankConfig().standalone_process->address;
+  auto server = std::make_unique<standalone::StandaloneServer>(Config(), address);
+  ASSERT_TRUE(server->Start());
+  auto rank = RankConfig();
+  rank.standalone_process->lookup_timeout_ms = 200;
+  auto client = CreateUMBPClient(rank);
+  const auto ptr = Buffer(kPage);
+  ASSERT_TRUE(client->RegisterMemory(ptr, kPage));
+  ASSERT_TRUE(client->Put("k", ptr, kPage));
+  EXPECT_TRUE(client->Exists("k"));
+  EXPECT_EQ(client->BatchExists({"k", "x"}), std::vector<bool>({true, false}));
+  EXPECT_EQ(client->BatchExistsConsecutive({"k", "x"}), 1u);
+
+  // In the server's place, a socket that takes connections and never answers.
+  server->Shutdown();
+  const auto path = standalone::UnixPathFromGrpcAddress(address);
+  unlink(path.c_str());
+  const int silent = socket(AF_UNIX, SOCK_STREAM, 0);
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+  ASSERT_EQ(bind(silent, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+  ASSERT_EQ(listen(silent, 16), 0);
+  auto lookups = std::async(std::launch::async, [&] {
+    // The first RPC after Shutdown fails on the old connection without
+    // waiting; spend it so each lookup below meets the silent socket.
+    client->Exists("k");
+    return !client->Exists("k") && client->BatchExists({"k"}) == std::vector<bool>({false}) &&
+           client->BatchExistsConsecutive({"k"}) == 0;
+  });
+  // Closing the socket ends a lookup the deadline did not, so a regression
+  // fails here rather than hanging.
+  const bool in_time = lookups.wait_for(2s) == std::future_status::ready;
+  close(silent);
+  EXPECT_TRUE(in_time);
+  EXPECT_TRUE(lookups.get());
 }
 
 TEST_F(SimTest, StandaloneRejectsMismatchedModes) {
