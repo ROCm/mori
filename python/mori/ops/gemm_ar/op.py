@@ -313,10 +313,8 @@ def _option_constraint(
 ) -> str | None:
     """Why the constructor rejects these options, or None.
 
-    One copy for the constructor and ``supports``: the predicate used to skip
-    the permlane epilogue's block_n rule and the bf16 quantisation's wire
-    rule, and answered True where construction raised. ``quant`` must already
-    be one of ``QUANTS``.
+    The constructor's option checks, shared with ``supports`` so the two
+    cannot disagree. ``quant`` must already be one of ``QUANTS``.
     """
     # mxfp8 takes exactly one BLOCK_M and bf16 only those in BF16_BLOCK_MS
     # (see _quant_tile_constraint). Reject a mismatch loudly rather than
@@ -336,6 +334,10 @@ def _option_constraint(
             f"gather_transport={gather_transport!r} is not one of "
             f"{sorted(GATHER_TRANSPORTS)}"
         )
+    # Stricter than the mainloop granule checked below: the permlane store
+    # needs block_n == 256 exactly, so the wider multiples _tile_constraints
+    # admits never get past here. _tile_constraints keeps them because it
+    # describes the mainloop, which does build them.
     why = permlane_tile_constraint(block_n)
     if why is not None:
         return why
