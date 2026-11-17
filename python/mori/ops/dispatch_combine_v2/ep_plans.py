@@ -207,9 +207,9 @@ def _caller_stacklevel() -> int:
 
 EpCombinePlan = make_plan("ep_combine")
 
-# The local kernels (local_expert_count), made on first use so a library built
-# without them still serves dispatch and combine.
-LOCAL_PLANS = ("ep_local_expert_count",)
+# The local kernels (local_expert_count, the StdMoE converts), made on first use so
+# a library built without them still serves dispatch and combine.
+LOCAL_PLANS = ("ep_local_expert_count", "ep_convert_dispatch", "ep_convert_combine")
 _local_plans = {}
 
 

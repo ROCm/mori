@@ -401,7 +401,7 @@ mori::jit::v2::LaunchGeometry EpCombineSpec::Geometry(const Cfg& cfg) {
 // ---------------------------------------------------------------------------
 // Local kernels.
 // ---------------------------------------------------------------------------
-EpLocalCfg MakeEpLocalCfg(const std::string& arch, const EpLocalRequest& req) {
+EpLocalCfg MakeEpLocalCfg(const std::string& arch, const EpLocalRequest& req, EpLocalKind kind) {
   EpLocalCfg c;
   c.worldSize = req.worldSize;
   c.hiddenDim = req.hiddenDim;
@@ -413,6 +413,9 @@ EpLocalCfg MakeEpLocalCfg(const std::string& arch, const EpLocalRequest& req) {
   c.blockNum = req.blockNum;
   c.warpPerBlock = req.warpPerBlock;
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
+  if (kind != EpLocalKind::ExpertCount && c.dtype != EpDType::Bf16) {
+    throw std::runtime_error("mori v2 ep: the StdMoE convert kernels are bf16 only");
+  }
   if (!EpLocalCfgIsValid(c)) {
     throw std::runtime_error(
         "mori v2 ep local: inconsistent config (world=" + std::to_string(c.worldSize) +
@@ -434,27 +437,40 @@ std::string EpLocalRequestSchema() {
 }
 
 std::string EpLocalInfo(const EpLocalCfg& c) {
-  return Describe(c) + EpKv("recvRows", EpLocalMaxRecv(c));
+  return Describe(c) + EpKv("recvRows", EpLocalMaxRecv(c)) + EpKv("bucketRows", EpLocalBucket(c));
 }
 
 namespace {
 
-std::string EpLocalEntryName(const EpLocalCfg& c, const char* kind) {
-  return std::string("mori_ep_") + kind + "_ws" + std::to_string(c.worldSize) + "_k" +
-         std::to_string(c.numExpertPerToken) + "_e" + std::to_string(c.numExpertPerRank) + '_' +
-         std::to_string(c.blockNum) + 'x' + std::to_string(c.warpPerBlock);
+std::string EpLocalEntryName(const EpLocalCfg& c, const char* kind, bool typed) {
+  std::string s = std::string("mori_ep_") + kind + '_';
+  if (typed) s += std::string(EpDTypeTag(c.dtype)) + '_';
+  s += "ws" + std::to_string(c.worldSize);
+  if (typed) s += "_h" + std::to_string(c.hiddenDim);
+  s += "_k" + std::to_string(c.numExpertPerToken) + "_e" + std::to_string(c.numExpertPerRank);
+  s += '_' + std::to_string(c.blockNum) + 'x' + std::to_string(c.warpPerBlock);
+  return s;
 }
 
-std::string RenderEpLocalSource(const EpLocalCfg& c, const std::string& entry, const char* body) {
-  return std::string(
-             "// mori jit v2 — generated, do not edit.\n"
-             "#include \"src/ops/dispatch_combine_v2/ep_local_kernels.hpp\"\n"
-             "using namespace mori::ops::v2;\n"
-             "constexpr EpLocalCfg kCfg = ") +
-         Render(c) +
-         ";\n"
-         "extern \"C\" __global__ void __launch_bounds__(EpLocalBlockThreads(kCfg))\n" +
-         entry + "(EpLocalArgs args) { " + body + "<kCfg>(args); }\n";
+std::string RenderEpLocalSource(const EpLocalCfg& c, const std::string& entry, const char* body,
+                                bool typed) {
+  std::string s =
+      "// mori jit v2 — generated, do not edit.\n"
+      "#include \"src/ops/dispatch_combine_v2/ep_local_kernels.hpp\"\n"
+      "using namespace mori::ops::v2;\n"
+      "constexpr EpLocalCfg kCfg = " +
+      Render(c) + ";\n";
+  if (typed) s += std::string("using TokT = ") + EpDTypeName(c.dtype) + ";\n";
+  return s + "extern \"C\" __global__ void __launch_bounds__(EpLocalBlockThreads(kCfg))\n" + entry +
+         "(EpLocalArgs args) { " + body + (typed ? "<kCfg, TokT>" : "<kCfg>") + "(args); }\n";
+}
+
+mori::jit::v2::LaunchGeometry EpLocalGeometry(const EpLocalCfg& c) {
+  mori::jit::v2::LaunchGeometry g;
+  g.gridX = static_cast<unsigned>(c.blockNum);
+  g.blockX = static_cast<unsigned>(EpLocalBlockThreads(c));
+  g.sharedBytes = 0;  // convert-combine's pointer arrays are static LDS
+  return g;
 }
 
 const std::vector<std::string>& EpLocalSourceDeps() {
@@ -465,21 +481,38 @@ const std::vector<std::string>& EpLocalSourceDeps() {
 }  // namespace
 
 std::string EpLocalExpertCountSpec::EntryName(const Cfg& c) {
-  return EpLocalEntryName(c, "local_expert_count");
+  return EpLocalEntryName(c, "local_expert_count", false);
+}
+std::string EpConvertDispatchSpec::EntryName(const Cfg& c) {
+  return EpLocalEntryName(c, "convert_dispatch", true);
+}
+std::string EpConvertCombineSpec::EntryName(const Cfg& c) {
+  return EpLocalEntryName(c, "convert_combine", true);
 }
 
 std::string EpLocalExpertCountSpec::RenderSource(const Cfg& c) {
-  return RenderEpLocalSource(c, EntryName(c), "EpLocalExpertCountBody");
+  return RenderEpLocalSource(c, EntryName(c), "EpLocalExpertCountBody", false);
+}
+std::string EpConvertDispatchSpec::RenderSource(const Cfg& c) {
+  return RenderEpLocalSource(c, EntryName(c), "EpConvertDispatchBody", true);
+}
+std::string EpConvertCombineSpec::RenderSource(const Cfg& c) {
+  return RenderEpLocalSource(c, EntryName(c), "EpConvertCombineBody", true);
 }
 
 mori::jit::v2::LaunchGeometry EpLocalExpertCountSpec::Geometry(const Cfg& c) {
-  mori::jit::v2::LaunchGeometry g;
-  g.gridX = static_cast<unsigned>(c.blockNum);
-  g.blockX = static_cast<unsigned>(EpLocalBlockThreads(c));
-  return g;
+  return EpLocalGeometry(c);
+}
+mori::jit::v2::LaunchGeometry EpConvertDispatchSpec::Geometry(const Cfg& c) {
+  return EpLocalGeometry(c);
+}
+mori::jit::v2::LaunchGeometry EpConvertCombineSpec::Geometry(const Cfg& c) {
+  return EpLocalGeometry(c);
 }
 
 const std::vector<std::string>& EpLocalExpertCountSpec::SourceDeps() { return EpLocalSourceDeps(); }
+const std::vector<std::string>& EpConvertDispatchSpec::SourceDeps() { return EpLocalSourceDeps(); }
+const std::vector<std::string>& EpConvertCombineSpec::SourceDeps() { return EpLocalSourceDeps(); }
 
 }  // namespace v2
 }  // namespace ops
@@ -516,13 +549,24 @@ mori::ops::v2::EpCfg EpCombineFromFields(const mori::jit::v2::FieldBag& f) {
 // cache means constructing the op once at build time, which needs no table here.
 int EpNoPrecompile(const std::string&) { return 0; }
 
-mori::ops::v2::EpLocalCfg EpLocalFromFields(const mori::jit::v2::FieldBag& f) {
+mori::ops::v2::EpLocalCfg EpLocalFromFields(const mori::jit::v2::FieldBag& f,
+                                            mori::ops::v2::EpLocalKind kind) {
   using namespace mori::ops::v2;
   EpLocalRequest req;
   EpApplyFields(
       req, /*prefix=*/"", [&](const std::string& n) { return f.Has(n.c_str()); },
       [&](const std::string& n) { return f.Get(n.c_str(), 0); });
-  return MakeEpLocalCfg(mori::jit::v2::GetToolchain().arch, req);
+  return MakeEpLocalCfg(mori::jit::v2::GetToolchain().arch, req, kind);
+}
+
+mori::ops::v2::EpLocalCfg EpLocalCountFromFields(const mori::jit::v2::FieldBag& f) {
+  return EpLocalFromFields(f, mori::ops::v2::EpLocalKind::ExpertCount);
+}
+mori::ops::v2::EpLocalCfg EpConvertDispatchFromFields(const mori::jit::v2::FieldBag& f) {
+  return EpLocalFromFields(f, mori::ops::v2::EpLocalKind::ConvertDispatch);
+}
+mori::ops::v2::EpLocalCfg EpConvertCombineFromFields(const mori::jit::v2::FieldBag& f) {
+  return EpLocalFromFields(f, mori::ops::v2::EpLocalKind::ConvertCombine);
 }
 
 }  // namespace
@@ -537,8 +581,18 @@ MORI_JIT_DEFINE_PLAN(ep_combine, mori::ops::v2::EpCombineSpec, EpCombineFromFiel
                      mori::ops::v2::EpRequestSchema, mori::ops::v2::EpCombineInfo, EpNoPrecompile,
                      mori::ops::v2::EpArgs, MORI_EP_ARGS_SCHEMA)
 
-// The local kernels: their own Request and Args schema.
+// The local kernels: one Request and one Args schema, three bodies.
 MORI_JIT_DEFINE_PLAN(ep_local_expert_count, mori::ops::v2::EpLocalExpertCountSpec,
-                     EpLocalFromFields, mori::ops::v2::EpLocalRequestSchema,
+                     EpLocalCountFromFields, mori::ops::v2::EpLocalRequestSchema,
+                     mori::ops::v2::EpLocalInfo, EpNoPrecompile, mori::ops::v2::EpLocalArgs,
+                     MORI_EP_LOCAL_ARGS_SCHEMA)
+
+MORI_JIT_DEFINE_PLAN(ep_convert_dispatch, mori::ops::v2::EpConvertDispatchSpec,
+                     EpConvertDispatchFromFields, mori::ops::v2::EpLocalRequestSchema,
+                     mori::ops::v2::EpLocalInfo, EpNoPrecompile, mori::ops::v2::EpLocalArgs,
+                     MORI_EP_LOCAL_ARGS_SCHEMA)
+
+MORI_JIT_DEFINE_PLAN(ep_convert_combine, mori::ops::v2::EpConvertCombineSpec,
+                     EpConvertCombineFromFields, mori::ops::v2::EpLocalRequestSchema,
                      mori::ops::v2::EpLocalInfo, EpNoPrecompile, mori::ops::v2::EpLocalArgs,
                      MORI_EP_LOCAL_ARGS_SCHEMA)

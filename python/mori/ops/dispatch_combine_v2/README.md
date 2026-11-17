@@ -18,7 +18,7 @@ backends:
   push combine (see "HIP V2 configuration interface" below). The dispatch leg also
   carries fp8 and fp4 (transport only — it moves an already-quantized payload).
   A dedicated gfx125x TDM body is selected by arch. On gfx942/gfx950 it also
-  serves `local_expert_count()`. **The only backend with an
+  serves `local_expert_count()` and bf16 StdMoE (gather combine). **The only backend with an
   internode path** (bf16/f32/fp8, plus packed fp4 dispatch with bf16/fp32
   combine; no quant/StdMoE/scatter). Works on a machine with no FlyDSL. See
   `docs/MORI_JIT_V2_DESIGN.md`.
@@ -402,7 +402,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_tuning_profile.py` | peak and capped profiles: capped keeps every gfx125x lookup within 64 blocks, reuses the peak rows that fit and falls back to the default (with a warning) elsewhere; peak is `lookup()`'s default; precedence of the config field, `MORI_EP_TUNING_PROFILE` and the device default. CPU only |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
-| `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure. Every rank sends the point's token count and passes it as `max_num_inp_token_across_ranks`. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMB_MODE=push\|pull` (default `push`, the fp4 combine: hip backend on gfx125x only), `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR`, `ROUTE=rand\|ring\|noself`, `LATE_US` (rank 0 reaches every timed dispatch that many µs after the others) |
+| `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure (except the scatter combines on gfx942/gfx950, which `test_op.py` checks). Every rank sends the point's token count and passes it as `max_num_inp_token_across_ranks`. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMB_MODE=push\|pull\|scatter` (default `push`: the quantized combine `PUSH_QUANT`, the push on gfx125x and the scatter on gfx942/gfx950; `scatter`: the unquantized scatter), `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR`, `ROUTE=rand\|ring\|noself`, `LATE_US` (rank 0 reaches every timed dispatch that many µs after the others) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
 

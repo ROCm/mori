@@ -170,9 +170,11 @@ class EpCombineSpec : public mori::jit::v2::KernelSpec<EpCombineSpec, EpCfg> {
 };
 
 // ---------------------------------------------------------------------------
-// The local kernels (ep_local_cfg.hpp): their own Cfg, no arena.
+// The local kernels (ep_local_cfg.hpp): one Cfg, three bodies, no arena.
 // ---------------------------------------------------------------------------
-EpLocalCfg MakeEpLocalCfg(const std::string& arch, const EpLocalRequest& req);
+enum class EpLocalKind { ExpertCount, ConvertDispatch, ConvertCombine };
+
+EpLocalCfg MakeEpLocalCfg(const std::string& arch, const EpLocalRequest& req, EpLocalKind kind);
 std::string EpLocalRequestSchema();
 std::string EpLocalInfo(const EpLocalCfg& cfg);
 
@@ -188,6 +190,8 @@ std::string EpLocalInfo(const EpLocalCfg& cfg);
   };
 
 MORI_EP_LOCAL_SPEC(EpLocalExpertCountSpec, "ep_local_expert_count")
+MORI_EP_LOCAL_SPEC(EpConvertDispatchSpec, "ep_convert_dispatch")
+MORI_EP_LOCAL_SPEC(EpConvertCombineSpec, "ep_convert_combine")
 #undef MORI_EP_LOCAL_SPEC
 
 }  // namespace v2

@@ -44,7 +44,7 @@ from mori.cco import Communicator  # noqa: E402
 HIDDEN, M, EPR, K, ITERS = 1024, 64, 8, 2, 5
 
 
-def _cfg(rank, npes):
+def _cfg(rank, npes, std_moe=False):
     return EpDispatchCombineConfig(
         rank=rank,
         world_size=npes,
@@ -54,6 +54,7 @@ def _cfg(rank, npes):
         num_experts_per_token=K,
         data_type=torch.bfloat16,
         combine_mode="gather",
+        enable_std_moe=std_moe,
     )
 
 
@@ -77,8 +78,13 @@ def main():
         base = len(comm._resources)
         ok = True
         # explicit close(): each op adds mem+win (2), close() returns to base.
-        for _ in range(ITERS):
-            op = EpDispatchCombineOp(_cfg(rank, npes), comm)
+        # gfx125x serves no StdMoE on either backend
+        std_moe_ok = not torch.cuda.get_device_properties(0).gcnArchName.startswith(
+            "gfx125"
+        )
+        for i in range(ITERS):
+            std_moe = bool(i % 2) and std_moe_ok
+            op = EpDispatchCombineOp(_cfg(rank, npes, std_moe=std_moe), comm)
             grew = len(comm._resources) - base
             op.close()
             op.close()  # idempotent

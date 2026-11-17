@@ -143,7 +143,7 @@ def _configure():
     # dispatch, and require them to equal what the views hold after the barrier.
     FRESH = int(os.environ.get("FRESH", 0))
     # REROUTE=N: N more rounds per SWEEP point with new routing, each reading
-    # local_expert_count straight after dispatch.
+    # local_expert_count (and StdMoE's packing) straight after dispatch.
     REROUTE = int(os.environ.get("REROUTE", 0))
 
 
@@ -249,6 +249,10 @@ def _run(d, comm):
             # Read straight after dispatch, no sync or barrier, as SGLang does.
             has_lec = "local_expert_count" in getattr(op, "capabilities", frozenset())
             lec_now = op.local_expert_count().clone() if has_lec else None
+            packed = None
+            if STDMOE and cap is None:
+                px, pc, ps = op.convert_dispatch_output()
+                packed = (px, pc.clone(), ps.clone())
             if FRESH:
                 # Copies queued right behind the dispatch kernel, before any host sync
                 # or barrier, of every row peers wrote, the reverse map included.
@@ -444,9 +448,18 @@ def _run(d, comm):
                     continue
             rel = 0.0  # relative L2 error of a quantized combine
             if STDMOE:
-                op.convert_dispatch_output()  # identity GEMM: packed_x = token
-                sync()
-                comm.barrier()
+                # Identity GEMM: packed_x keeps the tokens convert_dispatch_output put there.
+                ok_pk = _check_packed(
+                    packed, lec_ref, routing, recv_x, disp_i, total_recv
+                )
+                errs = d.allreduce_sum(0 if ok_pk else 1)
+                if rank == 0:
+                    print(
+                        f"# OP-STDMOE-PACK ct={ct_point}: "
+                        f"{'PASS' if errs == 0 else 'FAIL'} (count, src, rows; "
+                        f"recv={total_recv})",
+                        flush=True,
+                    )
                 op.convert_combine_input(routing)
                 sync()
                 comm.barrier()
@@ -542,6 +555,29 @@ def _bincount_local(ids, rank):
     return torch.bincount(ids, minlength=EPR).to(torch.int32)
 
 
+def _check_packed(packed, lec_ref, routing, recv_x, recv_i, total_recv):
+    """StdMoE packing: per-expert counts, the multiset of sources each bucket holds,
+    and each packed row equal to the recv row of its source."""
+    px, pc, ps = packed
+    if not torch.equal(pc.cpu(), lec_ref):
+        return False
+    bucket = px.shape[1]
+    tis = routing.disp_tok_id_to_src_tok_id_local[:total_recv].long()
+    ids = recv_i[:total_recv].long() - int(os.environ["RANK"]) * EPR
+    inv = torch.full((bucket,), -1, dtype=torch.long, device=tis.device)
+    inv[tis] = torch.arange(total_recv, device=tis.device)
+    for e in range(EPR):
+        n = int(pc[e])
+        src = ps[e * bucket : e * bucket + n].long()
+        rows_exp = (ids == e).nonzero(as_tuple=True)[0]
+        if not torch.equal(src.sort().values, tis[rows_exp].sort().values):
+            return False
+        rows = inv[src]
+        if bool((rows < 0).any()) or not torch.equal(px[e, :n], recv_x[rows]):
+            return False
+    return True
+
+
 def _reroute_rounds(d, comm, op, inp, wts, sc_in, ct, ct_point, num_experts, capped):
     """REROUTE rounds of new routing; every read is launched straight after dispatch."""
     dev = inp.device
@@ -552,13 +588,17 @@ def _reroute_rounds(d, comm, op, inp, wts, sc_in, ct, ct_point, num_experts, cap
         idx = idx.to(torch.int32)
         out = op.dispatch(inp[:ct], wts[:ct], sc_in, idx[:ct].to(dev))
         lec_now = op.local_expert_count().clone()
+        pc_now = op.convert_dispatch_output()[1].clone() if STDMOE else None
         # Every rank's reads are done before any rank's next dispatch writes.
         sync()
         # under a cap, from the rows this rank kept, read before peers move on
         kept = out[3][: int(out[4].cpu().item())].cpu() if capped else None
         comm.barrier()
         ref = _bincount_local(kept, d.rank) if capped else _lec_ref(d, idx, ct_point)
-        bad += 0 if torch.equal(lec_now.cpu(), ref) else 1
+        ok = torch.equal(lec_now.cpu(), ref)
+        if STDMOE:
+            ok = ok and torch.equal(pc_now.cpu(), ref)
+        bad += 0 if ok else 1
     errs = d.allreduce_sum(bad)
     if d.rank == 0:
         print(

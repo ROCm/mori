@@ -21,8 +21,8 @@
 // SOFTWARE.
 //
 // The EP local kernels: post-dispatch passes over this rank's own arena rows
-// (local_expert_count). No window, no peer: every pointer is local, so they get
-// their own small Cfg and Args instead of EpCfg/EpArgs.
+// (local_expert_count, the StdMoE converts). No window, no peer: every pointer
+// is local, so they get their own small Cfg and Args instead of EpCfg/EpArgs.
 //
 // HIP-free and attribute-free, like ep_cfg.hpp.
 
@@ -127,7 +127,14 @@ MORI_JIT_ASSERT_FIELD_COUNT(EpLocalRequest, 9,
 struct EpLocalArgs {
   const int* outIdx = nullptr;     // [maxRecv * topk] forwarded expert ids
   const int* totalRecv = nullptr;  // [1] rows dispatch delivered
-  int* expertCount = nullptr;      // [numExpertPerRank] per-expert counts
+  int* expertCount = nullptr;      // [numExpertPerRank] counts / packed_count
+  const void* dispOut = nullptr;   // [maxRecv * hidden] dispatched tokens
+  const int* recvToSrc = nullptr;  // [maxRecv] recv row -> source token
+  const float* outWts = nullptr;   // [maxRecv * topk] forwarded weights
+  void* outTok = nullptr;          // [maxRecv * hidden] combine input
+  void* packedX = nullptr;         // [numExpertPerRank * EpLocalBucket * hidden]
+  int* packedSrc = nullptr;        // [numExpertPerRank * EpLocalBucket]
+  long long* slotMap = nullptr;    // [maxRecv * topk] packed row, -1 = not local
   int rank = 0;
 };
 
@@ -135,6 +142,13 @@ struct EpLocalArgs {
   X(outIdx, "p")                     \
   X(totalRecv, "p")                  \
   X(expertCount, "p")                \
+  X(dispOut, "p")                    \
+  X(recvToSrc, "p")                  \
+  X(outWts, "p")                     \
+  X(outTok, "p")                     \
+  X(packedX, "p")                    \
+  X(packedSrc, "p")                  \
+  X(slotMap, "p")                    \
   X(rank, "i32")
 
 #define MORI_EP_LOCAL_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
@@ -158,7 +172,7 @@ constexpr bool EpLocalArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpLocalArgsFieldCount == 4,
+static_assert(detail::kEpLocalArgsFieldCount == 11,
               "added an EpLocalArgs field -- add it to MORI_EP_LOCAL_ARGS_FIELDS and bump this");
 static_assert(detail::EpLocalArgsOffsetsAscend(),
               "MORI_EP_LOCAL_ARGS_FIELDS is not in EpLocalArgs declaration order");
@@ -166,6 +180,9 @@ static_assert(detail::EpLocalArgsOffsetsAscend(),
 constexpr int EpLocalMaxRecv(const EpLocalCfg& c) {
   return c.maxRecv > 0 ? c.maxRecv : c.worldSize * c.maxTokPerRank;
 }
+
+// Rows of one StdMoE expert bucket: every token of every rank, FlyDSL's layout.
+constexpr int EpLocalBucket(const EpLocalCfg& c) { return c.worldSize * c.maxTokPerRank; }
 
 constexpr int EpLocalBlockThreads(const EpLocalCfg& c) { return c.warpPerBlock * c.waveSize; }
 
@@ -175,6 +192,7 @@ constexpr bool EpLocalCfgIsValid(const EpLocalCfg& c) {
   return c.worldSize > 0 && c.hiddenDim > 0 && c.maxTokPerRank > 0 && c.numExpertPerRank > 0 &&
          c.numExpertPerToken > 0 && c.maxRecv >= 0 && c.blockNum > 0 && c.warpPerBlock > 0 &&
          (c.waveSize == 32 || c.waveSize == 64) && EpLocalBlockThreads(c) <= 1024 &&
+         // One lane per top-k slot fills the per-warp source pointers.
          c.numExpertPerToken <= c.waveSize &&
          // The count's per-block histogram lives in LDS.
          c.numExpertPerRank <= EpLocalMaxExperts &&
