@@ -18,6 +18,10 @@ description: >-
   although VRAM is free, or hipMemGetInfo exceeds the card. It behaves differently on
   amdgpu-dkms 30.x and 31.10-31.60. The fix is upstream and in an internal amdgpu-dkms
   build; no public amdgpu-dkms release has it, but the upstream patch applies to DKMS.
+  (5) AMD Pollara (AINIC) 1.117.5 firmware after a-45 can mishandle retransmitted
+  RDMA READs, so MORI-IO / UMBP transfers fail with flush errors and no root cause, or
+  report success with data missing or landing late. Use when MORI-IO or UMBP reads fail
+  or return wrong data on AINIC.
 ---
 
 # MORI Known Issues
@@ -541,3 +545,37 @@ client. Its `amd_acquire()` (`kfd_peerdirect.c`, untouched by the fix) dereferen
 `ibv_reg_mr` first, and its dma-buf export cannot export these buffers, so do not hand them
 to MoRI. A probe that registered a GEM BO through dma-buf and then through `ibv_reg_mr` on
 6.16.6 + ionic crashed its node.
+
+---
+
+## Issue 5 — AINIC firmware: retransmitted RDMA READs lose data or fail the QP
+
+**Affects:** MORI-IO RDMA READ transfers, and so UMBP remote reads, on AMD Pollara (AINIC)
+1.117.5 firmware after a-45. Seen on 1.117.5-a-77 (bare metal) and 1.117.5-a-196 (KVM
+guest, SR-IOV VF); not seen on 1.117.5-a-45. Until a build with the fix is known, treat
+every later 1.117.5 build as affected. A firmware bug: a libibverbs-only test reproduces
+it without MORI.
+
+**Symptoms** (only while READs are being retransmitted, i.e. the reader is backpressured):
+
+- A transfer fails with `Work Request Flushed Error`, the log has `CQ poll round summary:
+  N flush errors` and no `[ROOT CAUSE]` line before it, and no async event arrives. The
+  firmware disabled the QP itself: `sudo nicctl show rdma queue-pair --state error
+  --detail -j` shows requester_rx `error_disabled_reason_bitmap` 512 (a-77).
+- Byte mismatches with no error at all: whole 4 KiB packets of a READ never written
+  (a-77), or the tail of a READ written up to ~2 s after it completed, occasionally after
+  the buffer was reused for the next transfer (a-196).
+
+**Detection:**
+
+```bash
+for d in /sys/class/infiniband/*; do echo "${d##*/} $(cat $d/fw_ver)"; done   # AINIC: 1.117.5-a-N, N > 45
+grep . /sys/class/infiniband/*/ports/1/hw_counters/{tx_rdma_ack_timeout,req_rx_cqe_err} 2>/dev/null
+```
+
+Both counters grow while it can happen; without READ timeouts it does not. MORI-IO also
+logs `Known issue: RDMA READ over AINIC firmware ...` once per process at the first READ
+over such firmware.
+
+**Workaround:** `MORI_IO_QP_MAX_RD_ATOMIC=1` (one READ in flight per QP). Effect and cost:
+[Known Issues in the MORI-IO guide](../../../docs/MORI-IO-GUIDE.md#known-issues).
