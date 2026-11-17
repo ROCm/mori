@@ -52,6 +52,42 @@ std::chrono::milliseconds EvictDemotionRetryBudget() {
 // Pause before a lone retry, so waiting out pressure does not spin the worker.
 constexpr std::chrono::milliseconds kEvictRetryIdlePause{20};
 
+// Keys written by ATOM's umbp_store follow the convention
+//   {namespace}/w{rank}of{world}/{digest}
+// When any rank's copy is evicted, sibling copies are collected here so the
+// caller can cascade-evict them without an explicit LinkGroup registration.
+bool FindPatternSiblings(const std::string& key, std::unordered_set<std::string>* cascade_out) {
+  auto last_slash = key.rfind('/');
+  if (last_slash == std::string::npos || last_slash == 0) return false;
+  const std::string digest = key.substr(last_slash + 1);
+
+  auto second_slash = key.rfind('/', last_slash - 1);
+  if (second_slash == std::string::npos) return false;
+  const std::string rank_world = key.substr(second_slash + 1, last_slash - second_slash - 1);
+
+  if (rank_world.empty() || rank_world[0] != 'w') return false;
+  auto of_pos = rank_world.find("of");
+  if (of_pos == std::string::npos || of_pos < 2) return false;
+
+  int rank = 0;
+  int world = 0;
+  try {
+    rank = std::stoi(rank_world.substr(1, of_pos - 1));
+    world = std::stoi(rank_world.substr(of_pos + 2));
+  } catch (...) {
+    return false;
+  }
+  if (world <= 1 || rank < 0 || rank >= world) return false;
+
+  const std::string prefix = key.substr(0, second_slash);
+  for (int r = 0; r < world; ++r) {
+    if (r == rank) continue;
+    cascade_out->insert(prefix + "/w" + std::to_string(r) + "of" + std::to_string(world) + "/" +
+                        digest);
+  }
+  return true;
+}
+
 // One tier over one backend that never offloads or promotes (pure SSD): no
 // transition to plan, so a resolve can take the policy-free direct path.
 bool TrivialTierGraph(const LogicalTierGraph& graph) {
@@ -1276,6 +1312,8 @@ std::vector<PoolEvictResult> PeerPool::Evict(const std::vector<PoolEvictRequest>
       // If the key is now fully gone, dissolve its eviction group.
       if (placements_.count(requests[index].key) == 0) {
         ForgetGroupMemberLocked(requests[index].key, &cascade_evict);
+        // Also cascade sibling copies by key-name pattern (umbp_store convention).
+        FindPatternSiblings(requests[index].key, &cascade_evict);
       }
     }
   }
