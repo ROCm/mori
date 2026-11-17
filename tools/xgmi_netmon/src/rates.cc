@@ -102,7 +102,17 @@ void RateCalc::Add(const Record& r) {
     have_prev_ = true;
     return;
   }
-  if (r.s.fw <= prev_.fw) {
+  if (r.s.fw ==
+      UINT64_MAX) {  // a failed read returns all ones; as prev_ it would block every later record
+    ++stats_.stale;
+    return;
+  }
+  if (r.s.fw < prev_.fw) {  // the timestamp went back (PMFW restart): new baseline
+    ++stats_.stale;
+    prev_ = r.s;
+    return;
+  }
+  if (r.s.fw == prev_.fw) {
     ++stats_.stale;
     return;  // keep prev_: the next advancing snapshot spans from it
   }

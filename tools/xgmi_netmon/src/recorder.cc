@@ -117,6 +117,10 @@ void SamplerMain(Stream* s, uint64_t first, uint64_t period, const std::atomic<b
       continue;
     }
     const uint64_t fw = ReadFirmwareTimestamp(buf, s->gpu.layout);
+    if (fw == UINT64_MAX) {  // seen once on n06-21: a read that returned all ones
+      ++st.read_errors;
+      continue;
+    }
     if (have && fw == last_fw) continue;
     ReadSnapshot(buf, s->gpu.layout, &r.s);
     if (have && fw > last_fw) {

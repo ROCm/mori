@@ -352,6 +352,20 @@ void TestRates() {
   CHECK(JsonString("a\"b\\c\n") == "\"a\\\"b\\\\c\\u000a\"");
 }
 
+void TestRatesBadSnapshots() {
+  int peer[kNumLinks] = {-1, 4, -1, -1, -1, -1, -1, -1};
+  RateCalc c("e", "h", 0, peer, 72e9, false);
+  const uint64_t t = 1000000000123456789ull;
+  c.Add(MakeRecord(t, 1000, 100, 200));
+  Record bad = MakeRecord(t + 2000000, UINT64_MAX, UINT64_MAX, UINT64_MAX);  // a read that failed
+  c.Add(bad);
+  c.Add(MakeRecord(t + 4000000, 1000 + 200000, 1100, 200));
+  CHECK(c.stats().intervals == 1 && c.stats().stale == 1 && c.stats().decreases == 0);
+  c.Add(MakeRecord(t + 6000000, 500, 1100, 200));  // timestamp went back: new baseline
+  c.Add(MakeRecord(t + 8000000, 500 + 200000, 1200, 200));
+  CHECK(c.stats().intervals == 2 && c.stats().stale == 2);
+}
+
 void TestRecordingFile() {
   TempDir t;
   Gpu g;
@@ -577,6 +591,7 @@ int main() {
       {"xgmi_port_num", TestPortNum},
       {"discover", TestDiscover},
       {"rates", TestRates},
+      {"rates bad snapshots", TestRatesBadSnapshots},
       {"recording file", TestRecordingFile},
       {"ring", TestRing},
       {"url", TestUrl},
