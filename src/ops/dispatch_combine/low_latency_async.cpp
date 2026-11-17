@@ -445,16 +445,13 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
 /*                                EpCombineLowLatencyAsyncSendCopy                                */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant = false>
+template <typename T, bool UseFp8BlockwiseQuant = false>
 __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncSendCopy);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
-  const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
+  const size_t tokHiddenBytes = hiddenDim * sizeof(T);
 
   // Copy token onto staging buffer for later IBGDA transfer
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
@@ -465,8 +462,7 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
     stagingTokId = __shfl(stagingTokId, 0);
     if constexpr (UseFp8BlockwiseQuant) {
       // Blockwise-FP8 (E4M3) combine: per-128-elem block max-scale, staged as [fp8 token | f32
-      // scales]. Accurate fp8 combine for the AsyncLL path (matches intranode blockwise), unlike
-      // the lossy direct-cast. Only instantiated for bf16 T.
+      // scales]. Matches intranode blockwise. Only instantiated for bf16 T.
       if constexpr (std::is_same_v<T, hip_bfloat16>) {
         const int _sd = args.fp8BlockwiseCombineScaleDim;
         const size_t _slotB =
@@ -477,10 +473,6 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
             reinterpret_cast<float*>(_slot + hiddenDim * sizeof(core::CombineInternalFp8)),
             args.inpTokenBuf + tokenId * hiddenDim, hiddenDim, _sd);
       }
-    } else if constexpr (UseFp8DirectCast) {
-      core::WarpCastBf16ToCombineInternalFp8<T>(
-          reinterpret_cast<TokT*>(stagingPtr + stagingTokId * tokHiddenBytes),
-          args.inpTokenBuf + tokenId * hiddenDim, hiddenDim, laneId);
     } else {
       core::WarpCopy<uint8_t, 4>(
           stagingPtr + stagingTokId * tokHiddenBytes,
@@ -493,16 +485,13 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
 /*                              EpCombineLowLatencyAsyncSendTransfer                              */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant = false>
+template <typename T, bool UseFp8BlockwiseQuant = false>
 __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncSendTransfer);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
-  size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
+  size_t tokHiddenBytes = hiddenDim * sizeof(T);
   if constexpr (UseFp8BlockwiseQuant)
     tokHiddenBytes = hiddenDim * sizeof(core::CombineInternalFp8) +
                      (size_t)args.fp8BlockwiseCombineScaleDim * sizeof(float);
@@ -559,16 +548,12 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
 /*                              EpCombineLowLatencyAsyncRecvTransfer                              */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast>
+template <typename T>
 __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncRecvTransfer);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
-  (void)sizeof(TokT);
   uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
 
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
@@ -609,18 +594,15 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
 /*                                EpCombineLowLatencyAsyncRecvCopy                                */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant = false>
+template <typename T, bool UseFp8BlockwiseQuant = false>
 __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncRecvCopy);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
 
   extern __shared__ char sharedMem[];
-  TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
+  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
   // Blockwise-FP8 combine: per-expert block-scale pointer array, laid right after srcPtrs.
   float** srcScalePtrs = reinterpret_cast<float**>(sharedMem) + warpNum * config.numExpertPerToken +
                          warpId * config.numExpertPerToken;
@@ -638,15 +620,14 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
         index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
         index_t destPe = PeFromSendBufSlotOffset(config, destTokId);
 
-        TokT* stagingPtr = (destPe != myPe)
-                               ? args.interNodeTokBufs.combineInp->template GetAs<TokT*>()
-                               : args.interNodeTokBufs.staging->template GetAs<TokT*>();
+        T* stagingPtr = (destPe != myPe) ? args.interNodeTokBufs.combineInp->template GetAs<T*>()
+                                         : args.interNodeTokBufs.staging->template GetAs<T*>();
         if (destPe < npes) {
           if constexpr (UseFp8BlockwiseQuant) {
             const size_t _slotB = hiddenDim * sizeof(core::CombineInternalFp8) +
                                   (size_t)args.fp8BlockwiseCombineScaleDim * sizeof(float);
             uint8_t* _base = reinterpret_cast<uint8_t*>(stagingPtr) + (size_t)destTokId * _slotB;
-            srcPtrs[j] = reinterpret_cast<TokT*>(_base + hiddenDimOffset);
+            srcPtrs[j] = reinterpret_cast<T*>(_base + hiddenDimOffset);
             float* _sc =
                 reinterpret_cast<float*>(_base + hiddenDim * sizeof(core::CombineInternalFp8));
             srcScalePtrs[j] = (_sc[0] < 0.0f) ? _sc : nullptr;
@@ -693,10 +674,6 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
                 outPtr, _S, _SC, _an, hiddenDimOffset, hiddenDimSize, hiddenDim,
                 args.fp8BlockwiseCombineScaleDim);
         }
-      } else if constexpr (UseFp8DirectCast) {
-        core::WarpAccumCombineInternalFp8ToBf16(outPtr,
-                                                reinterpret_cast<const TokT* const*>(srcPtrs),
-                                                config.numExpertPerToken, laneId, hiddenDimSize);
       } else {
         core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
       }

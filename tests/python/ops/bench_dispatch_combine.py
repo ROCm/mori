@@ -1049,11 +1049,6 @@ def _bench_dispatch_combine(
     }
     kernel_type_enum = _kernel_type_map[kernel_type_str]
 
-    if quant_type == "fp8_direct_cast" and combine_data_type is not torch.bfloat16:
-        raise ValueError(
-            "fp8_direct_cast quant requires combine dtype to be bfloat16, "
-            f"got {combine_data_type}"
-        )
     if quant_type == "fp8_blockwise":
         if data_type is not torch.bfloat16 or combine_data_type is not torch.bfloat16:
             raise ValueError(
@@ -1509,10 +1504,9 @@ if __name__ == "__main__":
         "--quant-type",
         type=str,
         default="none",
-        choices=["none", "fp8_direct_cast", "fp8_blockwise"],
+        choices=["none", "fp8_blockwise"],
         help=(
             "Quantization method used inside Combine. "
-            "'fp8_direct_cast' is the BF16<->FP8 direct cast path; "
             "'fp8_blockwise' is the BF16<->FP8 blockwise quant path."
         ),
     )

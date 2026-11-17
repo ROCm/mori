@@ -43,7 +43,6 @@ import os
 import time
 from prettytable import PrettyTable
 
-
 # --- Minimal HIP memcpy helpers (fabric buffers are raw VMM allocations, not
 # --- torch tensors, so we fill/verify them directly via the HIP runtime).
 _hip_lib = None
@@ -199,6 +198,11 @@ def parse_args():
         help="Use contiguous offsets so transfers may be merged. Default is non-contiguous (strided offsets, each transfer is a separate WR). Don't enable this when stress SQ / reproduce ENOMEM on notify due to merged wr",
     )
     parser.add_argument(
+        "--batch-aligned-stride",
+        action="store_true",
+        help="Use a non-contiguous stride rounded up from msg+1 to 16 bytes; default remains msg+1",
+    )
+    parser.add_argument(
         "--enable-sess",
         action="store_true",
         help="Whether to use session, default: False",
@@ -331,6 +335,7 @@ class MoriIoBenchmark:
         transfer_batch_size: int,
         enable_batch_transfer: bool = False,
         batch_contiguous: bool = False,
+        batch_aligned_stride: bool = False,
         enable_sess: bool = False,
         iters: int = 128,
         sweep: bool = False,
@@ -369,6 +374,7 @@ class MoriIoBenchmark:
         self.transfer_batch_size = transfer_batch_size
         self.enable_batch_transfer = enable_batch_transfer
         self.batch_contiguous = batch_contiguous
+        self.batch_aligned_stride = batch_aligned_stride
         self.enable_sess = enable_sess
         self.iters = iters
         self.sweep = sweep
@@ -439,7 +445,7 @@ class MoriIoBenchmark:
 
         # When not batch_contiguous, use strided offsets so buffer must fit (buffer_size+1)*transfer_batch_size
         total_elements = (
-            (self.buffer_size + 1) * self.transfer_batch_size
+            self._batch_stride(self.buffer_size) * self.transfer_batch_size
             if not self.batch_contiguous
             else self.buffer_size * self.transfer_batch_size
         )
@@ -470,7 +476,7 @@ class MoriIoBenchmark:
                 self.device = torch.device("cuda", self.dst_gpu)
 
             total_elements = (
-                (self.buffer_size + 1) * self.transfer_batch_size
+                self._batch_stride(self.buffer_size) * self.transfer_batch_size
                 if not self.batch_contiguous
                 else self.buffer_size * self.transfer_batch_size
             )
@@ -483,7 +489,7 @@ class MoriIoBenchmark:
             self.dst_device = torch.device("cuda", self.dst_gpu)
 
             total_elements = (
-                (self.buffer_size + 1) * self.transfer_batch_size
+                self._batch_stride(self.buffer_size) * self.transfer_batch_size
                 if not self.batch_contiguous
                 else self.buffer_size * self.transfer_batch_size
             )
@@ -511,7 +517,7 @@ class MoriIoBenchmark:
 
         # 1 byte per element (matches the fp8/uint8 sizing used by the other paths).
         total_elements = (
-            (self.buffer_size + 1) * self.transfer_batch_size
+            self._batch_stride(self.buffer_size) * self.transfer_batch_size
             if not self.batch_contiguous
             else self.buffer_size * self.transfer_batch_size
         )
@@ -579,13 +585,18 @@ class MoriIoBenchmark:
         print(f"  transfer_batch_size: {self.transfer_batch_size}")
         print(f"  enable_batch_transfer: {self.enable_batch_transfer}")
         print(f"  batch_contiguous: {self.batch_contiguous}")
+        print(f"  batch_aligned_stride: {self.batch_aligned_stride}")
         print(f"  enable_sess: {self.enable_sess}")
         print(f"  iters: {self.iters}")
         print()
 
+    def _batch_stride(self, buffer_size):
+        stride = buffer_size + 1
+        return ((stride + 15) // 16) * 16 if self.batch_aligned_stride else stride
+
     def _get_transfer_offsets(self, buffer_size, transfer_batch_size, batched):
         if batched and not self.batch_contiguous:
-            stride = buffer_size + 1
+            stride = self._batch_stride(buffer_size)
             return [i * stride for i in range(transfer_batch_size)]
         return [i * buffer_size for i in range(transfer_batch_size)]
 
@@ -690,7 +701,7 @@ class MoriIoBenchmark:
             dist.recv(recv_tensor, src=self.num_initiator_dev + self.role_rank)
             if not self.batch_contiguous:
                 # Received data is packed (contiguous); compare to packed view of self.tensor
-                stride = self.buffer_size + 1
+                stride = self._batch_stride(self.buffer_size)
                 expected = torch.empty(
                     self.buffer_size * self.transfer_batch_size,
                     device=self.device,
@@ -710,7 +721,7 @@ class MoriIoBenchmark:
             # Without batch_contiguous, tensor has (buffer_size+1)*transfer_batch_size
             # elements; Gloo send size must match initiator recv (buffer_size*transfer_batch_size).
             if not self.batch_contiguous:
-                stride = self.buffer_size + 1
+                stride = self._batch_stride(self.buffer_size)
                 packed = torch.empty(
                     self.buffer_size * self.transfer_batch_size,
                     device=self.device,
@@ -943,7 +954,7 @@ class MoriIoBenchmark:
 
         func, arg_list = None, []
         if not self.batch_contiguous:
-            stride = buffer_size + 1
+            stride = self._batch_stride(buffer_size)
             offsets = [i * stride for i in range(transfer_batch_size)]
         else:
             offsets = [i * buffer_size for i in range(transfer_batch_size)]
@@ -1299,6 +1310,7 @@ def benchmark_xgmi_worker(local_rank, node_rank, args):
         transfer_batch_size=max_transfer_batch_size,
         enable_batch_transfer=args.enable_batch_transfer,
         batch_contiguous=args.batch_contiguous,
+        batch_aligned_stride=args.batch_aligned_stride,
         enable_sess=args.enable_sess,
         iters=args.iters,
         sweep=args.all,
@@ -1334,6 +1346,7 @@ def benchmark_engine(local_rank, node_rank, args):
         transfer_batch_size=max_transfer_batch_size,
         enable_batch_transfer=args.enable_batch_transfer,
         batch_contiguous=args.batch_contiguous,
+        batch_aligned_stride=args.batch_aligned_stride,
         enable_sess=args.enable_sess,
         iters=args.iters,
         sweep=args.all,
@@ -1408,6 +1421,7 @@ def benchmark_xgmi(args):
             transfer_batch_size=max_transfer_batch_size,
             enable_batch_transfer=args.enable_batch_transfer,
             batch_contiguous=args.batch_contiguous,
+            batch_aligned_stride=args.batch_aligned_stride,
             enable_sess=args.enable_sess,
             iters=args.iters,
             sweep=args.all,

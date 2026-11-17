@@ -50,7 +50,6 @@ class EpDispatchCombineQuantType(mori_cpp.EpDispatchCombineQuantType):
 
 _QUANT_TYPE_MAP = {
     "none": EpDispatchCombineQuantType.None_,
-    "fp8_direct_cast": EpDispatchCombineQuantType.Fp8DirectCast,
     "fp8_blockwise": EpDispatchCombineQuantType.Fp8BlockwiseQuant,
     # Blockwise FP4 (E2M1) combine is its own quant type. It shares the blockwise staging/scale
     # layout with FP8 but transports packed FP4 (0.5 byte/elem) and uses half-sized staging slots.
@@ -79,6 +78,10 @@ _FP4_COMBINE_KERNELS = frozenset(
 )
 
 
+# Removed quant types and their replacement, named in the error.
+_REMOVED_QUANT_TYPES = {"fp8_direct_cast": "fp8_blockwise"}
+
+
 def _normalize_quant_type(quant_type):
     if isinstance(quant_type, EpDispatchCombineQuantType):
         return quant_type
@@ -86,6 +89,10 @@ def _normalize_quant_type(quant_type):
         key = quant_type.strip().lower()
         if key in _QUANT_TYPE_MAP:
             return _QUANT_TYPE_MAP[key]
+        if key in _REMOVED_QUANT_TYPES:
+            raise ValueError(
+                f"quant_type '{key}' was removed; use '{_REMOVED_QUANT_TYPES[key]}'"
+            )
     raise ValueError(
         f"invalid quant_type '{quant_type}', expected one of {list(_QUANT_TYPE_MAP.keys())}"
     )
@@ -176,7 +183,7 @@ class EpDispatchCombineConfig:
         rdma_block_num: Number of RDMA blocks for inter-node kernels.
         num_qp_per_pe: Number of queue pairs per processing element.
         quant_type: Quantization mode. Supported string values are ``"none"``,
-            ``"fp8_direct_cast"``, and ``"fp8_blockwise"``.
+            ``"fp8_blockwise"``, and ``"fp4_blockwise"``.
     """
 
     data_type: (
@@ -1277,27 +1284,14 @@ class EpDispatchCombineOp:
                     args_ptr,
                 )
             elif actual_use_ext:
-                if (
-                    sfx == "bf16"
-                    and quant_type == EpDispatchCombineQuantType.Fp8DirectCast
-                ):
-                    self._launch(
-                        "EpCombineIntraNodeKernel_bf16_nop2p_fp8cast",
-                        grid,
-                        block,
-                        shared_mem,
-                        stream,
-                        args_ptr,
-                    )
-                else:
-                    self._launch(
-                        f"EpCombineIntraNodeKernel_{sfx}_nop2p",
-                        grid,
-                        block,
-                        shared_mem,
-                        stream,
-                        args_ptr,
-                    )
+                self._launch(
+                    f"EpCombineIntraNodeKernel_{sfx}_nop2p",
+                    grid,
+                    block,
+                    shared_mem,
+                    stream,
+                    args_ptr,
+                )
             else:
                 self._launch(
                     f"EpCombineIntraNodeKernel_{sfx}_p2p",
@@ -1310,19 +1304,7 @@ class EpDispatchCombineOp:
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
-            if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
-                self._launch_multi(
-                    [
-                        "EpCombineLowLatencyAsyncSendCopy_bf16_fp8cast",
-                        "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8cast",
-                    ],
-                    [mp_aligned, self.config.world_size],
-                    [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
-                    [0, 0],
-                    stream,
-                    args_ptr,
-                )
-            elif quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+            if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
                 self._launch_multi(
                     [
                         "EpCombineLowLatencyAsyncSendCopy_bf16_fp8_blockwise",
@@ -1412,19 +1394,7 @@ class EpDispatchCombineOp:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
             quant_type = _normalize_quant_type(self.config.quant_type)
-            if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
-                self._launch_multi(
-                    [
-                        "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8cast",
-                        "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8cast",
-                    ],
-                    [self.config.world_size, mp_aligned],
-                    [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
-                    [0, shared_mem],
-                    stream,
-                    args_ptr,
-                )
-            elif quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+            if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
                 self._launch_multi(
                     [
                         "EpCombineLowLatencyAsyncRecvTransfer_bf16",
