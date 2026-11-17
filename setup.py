@@ -1101,8 +1101,10 @@ def _torch_symm_extension():
         symm_build = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(symm_build)
         rocm = symm_build.rocm_home(cpp_extension)
-        # By file: records the SONAME of the HIP runtime torch uses.
-        hip = symm_build.hip_runtime_library(rocm)
+        # Listed first, so the -lamdhip64 torch adds resolves to the runtime torch uses.
+        hip_dir = symm_build.hip_link_dir(
+            rocm, str(_root_dir.resolve() / "build" / "mori_torch_symm_hip")
+        )
         fingerprint = symm_build.torch_fingerprint(torch)
         archs = re.findall(r"gfx[0-9a-f]+(?:-strict)?", _get_gpu_archs())
         # Absolute: torch's ninja compiler writes its build file into build_temp and
@@ -1115,9 +1117,8 @@ def _torch_symm_extension():
             sources=["src/allocator/symm_backend.cpp", "src/allocator/symm_signal.hip"],
             # libmori_cco is the peer-exchange half of the backend; it lands next to
             # this module in the package, hence the $ORIGIN runpath. torch adds its libs.
-            library_dirs=[f"{rocm}/lib", str(_root_dir.resolve() / "python" / "mori")],
+            library_dirs=[hip_dir or f"{rocm}/lib", str(_root_dir.resolve() / "python" / "mori")],
             libraries=["mori_cco"],
-            extra_link_args=[hip] if hip else [],
             # The loader refuses this module under any other torch build.
             define_macros=[("MORI_TORCH_FINGERPRINT", fingerprint)],
             runtime_library_dirs=["$ORIGIN"],

@@ -533,10 +533,15 @@ def test_torch_fingerprint_tracks_build():
 
 
 def test_build_links_loaded_hip_runtime(tmp_path, monkeypatch):
-    from mori.allocator._build import hip_runtime_library, rocm_home
+    from mori.allocator._build import hip_link_dir, hip_runtime_library, rocm_home
 
     lib = hip_runtime_library("/nonexistent")
     assert lib is not None and os.path.basename(lib).startswith("libamdhip64.so")
+    # torch's own -lamdhip64 must resolve to that runtime, also where only .so.N ships.
+    for _ in range(2):  # rebuilds reuse the directory
+        link_dir = hip_link_dir("/nonexistent", str(tmp_path / "hip"))
+        link = os.path.join(link_dir, "libamdhip64.so")
+        assert os.path.realpath(link) == os.path.realpath(lib)
 
     # A ROCM_HOME without HIP headers (a venv's hipcc wrapper) falls through.
     good = tmp_path / "rocm"

@@ -95,3 +95,23 @@ def hip_runtime_library(rocm: str) -> str | None:
         glob.glob(os.path.join(rocm, "lib", "libamdhip64.so*")), key=len
     )
     return candidates[0] if candidates else None
+
+
+def hip_link_dir(rocm: str, out_dir: str) -> str | None:
+    """A directory whose ``libamdhip64.so`` is the HIP runtime torch uses, for ``-L``.
+
+    torch's HIP extensions add ``-lamdhip64`` themselves, which pip ROCm (only
+    ``libamdhip64.so.N``) cannot satisfy; searched first, this link resolves it to the
+    runtime already in the process and records that runtime's SONAME.
+    """
+    hip = hip_runtime_library(rocm)
+    if hip is None:
+        return None
+    os.makedirs(out_dir, exist_ok=True)
+    link = os.path.join(out_dir, "libamdhip64.so")
+    tmp = f"{link}.{os.getpid()}"
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(hip, tmp)
+    os.replace(tmp, link)  # atomic: ranks building at once may race here
+    return out_dir

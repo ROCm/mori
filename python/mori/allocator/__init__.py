@@ -143,7 +143,7 @@ def _jit_ext(fingerprint: str):
     from torch.utils import cpp_extension
 
     from ..jit.config import get_mori_source_root
-    from ._build import hip_runtime_library, rocm_home
+    from ._build import hip_link_dir, rocm_home
 
     # Checked before ninja, not after: on torch < 2.9 the SymmetricMemory interface this
     # implements does not exist, so the compile is a guaranteed minute-long failure whose
@@ -169,9 +169,6 @@ def _jit_ext(fingerprint: str):
         raise ImportError(f"mori_torch_symm sources missing: {missing}")
 
     rocm = rocm_home(cpp_extension)
-    # By file: records the SONAME, and pip ROCm has no libamdhip64.so for -l.
-    hip = hip_runtime_library(rocm)
-    hip_link = [hip] if hip else [f"-L{rocm}/lib", "-lamdhip64"]
     # -I as flags, not extra_include_paths: load() hipifies every header under those,
     # writing *_hip copies into the package and the ROCm tree.
     includes = [f"-I{root / 'include'}", f"-I{rocm}/include"]
@@ -188,6 +185,9 @@ def _jit_ext(fingerprint: str):
         build_dir = cpp_extension._get_build_directory(f"{name}_{fingerprint}", False)
     except AttributeError:  # pragma: no cover - private helper, present since torch 1.x
         build_dir = None
+    hip_dir = hip_link_dir(rocm, os.path.join(build_dir, "hip")) if build_dir else None
+    # Searched before torch's own -L, so its -lamdhip64 also resolves to torch's runtime.
+    hip_link = [f"-L{hip_dir or rocm + '/lib'}", "-lamdhip64"]
     logger.info(
         "compiling %s for torch %s from %s", name, torch.__version__, sources[0].parent
     )
