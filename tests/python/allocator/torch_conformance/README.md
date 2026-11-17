@@ -94,14 +94,16 @@ The exit status is 1 when either unexpected list is non-empty.
 
 ## expected.tsv
 
-One line per documented exception, six tab-separated fields:
+One line per documented exception, seven tab-separated fields:
 
 ```
-status  torch  test  cause  category  note
+status  torch  view  test  cause  category  note
 ```
 
 - `status`: `FAIL` (failed or errored), `SKIP`, `TIMEOUT` or `ANY`.
 - `torch`: glob on `torch.__version__`, e.g. `2.15.*` or `*`.
+- `view`: the views the line applies to, e.g. `AB`, or `*` for all. A line never excuses
+  a result in a view it does not name.
 - `test`: glob on `Class::test_name`.
 - `cause`: regular expression searched in the error line or skip reason (`.` for any).
 - `category` and `note`: why, for the report.
@@ -113,7 +115,7 @@ failure.
 
 | category | what it covers |
 |---|---|
-| `kept-by-view` | torch's own ROCm skips that views A and B keep (none appear in view C) |
+| `kept-by-view` | torch's own ROCm skips that views A and B keep, scoped to those views by the `view` field |
 | `rocm-no-*` | features ROCm builds of torch do not have: multicast, cuda-python, NCCL symmetric memory, torchcomms, device-side assertions, async matmul |
 | `gated-on-backend-name` | tests that skip unless the backend is named `"CUDA"`; `--as-cuda` runs the generic ones on MORI |
 | `cuda-backend-internal` | tests that pin `TORCH_SYMMMEM=CUDA` or assert how torch's own backend allocates its tables |

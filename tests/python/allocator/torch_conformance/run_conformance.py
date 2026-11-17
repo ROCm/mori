@@ -349,11 +349,15 @@ def run_all(args, ids, out):
 
 
 class Rule:
-    """One line of expected.tsv: status, torch, test, cause, category, note."""
+    """One line of expected.tsv: status, torch, view, test, cause, category, note."""
 
     def __init__(self, fields):
-        self.status, self.torch, self.test, cause, self.category, self.note = fields
+        self.status, self.torch, self.view, self.test, cause = fields[:5]
+        self.category, self.note = fields[5:]
         self.cause = re.compile(cause)
+
+    def applies(self, view):
+        return self.view == "*" or view in self.view
 
     def matches(self, row):
         test = row["id"].split("::", 1)[1]
@@ -375,10 +379,14 @@ def load_expected(path, torch_version):
         if not line.strip() or line.startswith("#"):
             continue
         fields = line.split("\t")
-        if len(fields) != 6:
-            sys.exit(f"{path}:{n}: expected 6 tab-separated fields, got {len(fields)}")
+        if len(fields) != 7:
+            sys.exit(f"{path}:{n}: expected 7 tab-separated fields, got {len(fields)}")
         if fields[0] not in ("FAIL", "SKIP", "TIMEOUT", "ANY"):
             sys.exit(f"{path}:{n}: unknown status {fields[0]!r}")
+        if fields[2] != "*" and (not fields[2] or set(fields[2]) - set("ABC")):
+            sys.exit(
+                f"{path}:{n}: view must be '*' or letters of ABC, got {fields[2]!r}"
+            )
         if fnmatch.fnmatch(torch_version, fields[1]):
             rules.append(Rule(fields))
     return rules
@@ -409,7 +417,10 @@ def report(args, out, info):
     rows = read_summary(out / "summary.tsv")
     if args.report_only:
         reparse(out, rows)
-    rules = load_expected(args.expected, info["version"])
+    # A rule scoped to other views must not excuse a skip in this one.
+    rules = [
+        r for r in load_expected(args.expected, info["version"]) if r.applies(args.view)
+    ]
     views = {args.view: {i: r["status"] for i, r in rows.items()}}
     if args.view == "C":
         # View B differs from C only by the skips C lifts, which the tests recorded.
