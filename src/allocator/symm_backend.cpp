@@ -183,6 +183,22 @@ hipStream_t CurrentStream(int dev) {
   return c10::hip::getCurrentHIPStream(static_cast<c10::DeviceIndex>(dev)).stream();
 }
 
+// Zeroes VMM memory on `stream` and waits for it. hipMemset returns hipErrorOutOfMemory on
+// UALink fabric-exportable pools (ROCm 7.15; cco's CcoZeroWindowMem), so those get copies.
+void ZeroAndSync(void* ptr, size_t bytes, bool fabric, hipStream_t stream) {
+  if (!fabric) {
+    MORI_HIP_CHECK(hipMemsetAsync(ptr, 0, bytes, stream));
+  } else if (bytes > 0) {
+    const size_t chunk = std::min<size_t>(bytes, size_t{4} << 20);
+    const std::vector<char> zeros(chunk, 0);
+    for (size_t off = 0; off < bytes; off += chunk) {
+      MORI_HIP_CHECK(hipMemcpyAsync(static_cast<char*>(ptr) + off, zeros.data(),
+                                    std::min(chunk, bytes - off), hipMemcpyHostToDevice, stream));
+    }
+  }
+  MORI_HIP_CHECK(hipStreamSynchronize(stream));
+}
+
 // alloc() and a first rendezvous() sync the stream and use the Store; neither can be captured.
 void CheckNotCapturing(int dev, const char* op, const char* hint) {
   hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
@@ -712,9 +728,8 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       mapped = true;
       SetRwAccess(ptr, alloc_size, device_idx);
       // On the caller's stream, and complete before a rendezvous can expose it to peers.
-      const hipStream_t stream = CurrentStream(device_idx);
-      MORI_HIP_CHECK(hipMemsetAsync(ptr, 0, alloc_size, stream));
-      MORI_HIP_CHECK(hipStreamSynchronize(stream));
+      ZeroAndSync(ptr, alloc_size, handle_type == hipMemHandleTypeFabricCompat,
+                  CurrentStream(device_idx));
     } catch (...) {
       if (mapped) (void)hipMemUnmap(ptr, alloc_size);
       if (reserved) (void)hipMemAddressFree(ptr, alloc_size);
@@ -1114,17 +1129,9 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     // user's buffer, and one per (allocation, group) so groups never see each other's
     // signals. cco owns this one outright, so it is overload B.
     MORI_CCO_CHECK(mori::cco::ccoMemAlloc(group->comm, peer->pad_size, &peer->pad_ptr));
-    // Not hipMemset: ccoMemAlloc memory is fabric-exportable, and hipMemset returns
-    // hipErrorOutOfMemory on UALink fabric pools (ROCm 7.15). cco hit this first and
-    // routes its own DevComm resource window around it -- see CcoZeroWindowMem in
-    // src/cco/cco_init.cpp. The pad must be zero before the collective register below
-    // lets a peer write to it, hence the sync.
-    {
-      const std::vector<char> zeros(peer->pad_size, 0);
-      MORI_HIP_CHECK(hipMemcpyAsync(peer->pad_ptr, zeros.data(), peer->pad_size,
-                                    hipMemcpyHostToDevice, stream));
-      MORI_HIP_CHECK(hipStreamSynchronize(stream));
-    }
+    // Zero before the collective register below lets a peer write to it. cco picks the
+    // pad's handle type itself, so it is zeroed the way that works for fabric too.
+    ZeroAndSync(peer->pad_ptr, peer->pad_size, /*fabric=*/true, stream);
     MORI_CCO_CHECK(
         mori::cco::ccoWindowRegister(group->comm, peer->pad_ptr, peer->pad_size, &peer->pad_win));
 
