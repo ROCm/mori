@@ -113,6 +113,7 @@ failure.
 
 | category | what it covers |
 |---|---|
+| `kept-by-view` | torch's own ROCm skips that views A and B keep (none appear in view C) |
 | `rocm-no-*` | features ROCm builds of torch do not have: multicast, cuda-python, NCCL symmetric memory, torchcomms, device-side assertions, async matmul |
 | `gated-on-backend-name` | tests that skip unless the backend is named `"CUDA"`; `--as-cuda` runs the generic ones on MORI |
 | `cuda-backend-internal` | tests that pin `TORCH_SYMMMEM=CUDA` or assert how torch's own backend allocates its tables |

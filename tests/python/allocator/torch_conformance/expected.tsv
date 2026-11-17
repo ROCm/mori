@@ -12,6 +12,10 @@ SKIP	*	*	native caching allocator	not-native-allocator	counts blocks of torch's 
 SKIP	*	*	world sizes 2, 4 and 8	world-size	reduce_scatter_out supports world sizes 2, 4 and 8
 SKIP	*	*	async_mm|async mm	rocm-no-async-mm	this torch build has no ROCm async matmul
 #
+# ROCm skips a view keeps on purpose (README "Views"); view C lifts the first, B and C the rest.
+SKIP	*	*	^Test skipped for ROCm$	kept-by-view	skip_if_rocm_multiprocess, run in view C
+SKIP	*	*	skip_if_rocm_ver_lessthan_multiprocess|skip_if_rocm_arch_multiprocess|on MI350 CI runners|ROCm 10\.1	kept-by-view	ROCm version and MI350 gates, run in views B and C
+#
 # Tests torch gates on the name of its own backend. --as-cuda runs the generic ones on MORI.
 SKIP	*	*	applies to the CUDA( and XPU)? symm mem backend|implemented in the CUDA backend	gated-on-backend-name	run with --as-cuda (stream serialization, slot layout, capture guard, current-stream alloc)
 SKIP	*	SymmMemIpcSocketTest::*	Fabric handles do not use the IPC socket	cuda-backend-internal	pins TORCH_SYMMMEM=CUDA and tests its IPC socket under a long TMPDIR
