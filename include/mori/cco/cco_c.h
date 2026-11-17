@@ -55,10 +55,9 @@
 // any that remain. Nothing may be released while GPU work that uses it is in
 // flight. A dev comm's window table is fixed when it is created, so release dev
 // comms that might look a window up before releasing that window. A window holds
-// its own reference to the memory it imports, so the owner may unmap and release
-// its VMM handle first. On ROCm 7.14 it should: the fd the window closes must
-// outlive every hipMemRelease of the allocation, or its pages are not returned.
-// A forked child must not use handles created by its parent.
+// its own reference to the memory it imports, so the owner's unmap and release of
+// its VMM handle and windowRelease may come in either order. A forked child must
+// not use handles created by its parent.
 #ifndef MORI_CCO_CCO_C_H_
 #define MORI_CCO_CCO_C_H_
 
@@ -177,7 +176,7 @@ typedef struct moriCcoApi {
   // Call on rank 0 only. Uses MORI_SOCKET_IFNAME, else the first non-loopback NIC.
   int (*getUniqueId)(moriCcoUniqueId_t* uniqueId);
 
-  // Collective. config may be NULL for defaults.
+  // Collective. A NULL config means MORI_CCO_COMM_CONFIG_INIT.
   int (*commCreate)(const moriCcoUniqueId_t* uniqueId, int nRanks, int rank,
                     const moriCcoCommConfig_t* config, moriCcoComm_t* comm);
   // Local. Also releases the comm's remaining windows and dev comms.
