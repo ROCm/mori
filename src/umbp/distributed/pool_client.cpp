@@ -679,6 +679,25 @@ TransferRef ClassifiedUserBytes(void* ptr, uint64_t size) {
   return TransferRef::HostBytes(ptr, size, mori::io::MemoryLocationType::GPU, location.device_id);
 }
 
+// What the local copy engines read of an endpoint: they plan and copy from the
+// host pointer, location and device alone.  A registered ref also carries the
+// mori-io MemoryDesc -- strings and a map of backend blobs -- that only a
+// remote transfer needs.
+TransferRef LocalEndpoint(const TransferRef& ref) {
+  return TransferRef::HostBytes(ref.host_ptr, ref.size, ref.loc, ref.device);
+}
+
+// Items ForEachRangePageFragment emits for `ranges`: one per page each touches.
+size_t RangePageFragments(const std::vector<PoolClient::ObjectRange>& ranges, uint64_t page_size) {
+  size_t fragments = 0;
+  for (const auto& range : ranges) {
+    if (range.size == 0) continue;
+    fragments +=
+        (range.object_offset + range.size - 1) / page_size - range.object_offset / page_size + 1;
+  }
+  return fragments;
+}
+
 // Read-side range validity: inside the object and non-overlapping.  Weaker than
 // RangesTileObject, which the write side needs — a read may take any subset of
 // an object, but a write must account for every byte it commits.
@@ -1839,7 +1858,7 @@ bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
     for (const auto& range : ranges) {
       if (range.user == nullptr) return false;
       if (const RegisteredRegion* reg = FindRegisteredRegionLocked(range.user, range.size)) {
-        user_refs.push_back(reg->ref);
+        user_refs.push_back(LocalEndpoint(reg->ref));
         user_offsets.push_back(reinterpret_cast<uintptr_t>(range.user) -
                                reinterpret_cast<uintptr_t>(reg->base));
       } else {
@@ -1847,6 +1866,16 @@ bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
         user_offsets.push_back(0);
       }
     }
+  }
+
+  // Each fragment's item holds both endpoints by value, and a batch can emit
+  // hundreds of thousands of fragments.  Copying the registered refs whole
+  // copied their MemoryDescs too -- several heap allocations per fragment, and
+  // items large enough that the list for one put batch ran to hundreds of
+  // megabytes -- so every item gets the local endpoints only.
+  std::vector<TransferRef> buffer_refs(backend->BufferCount());
+  for (size_t i = 0; i < buffer_refs.size(); ++i) {
+    buffer_refs[i] = LocalEndpoint(backend->BufferRef(static_cast<uint32_t>(i)));
   }
 
   for (size_t r = 0; r < ranges.size(); ++r) {
@@ -1859,13 +1888,14 @@ bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
     const bool walked = ForEachRangePageFragment(
         pages, page_size, stored_size, range.object_offset, range.size,
         [&](size_t page_index, uint64_t tier_offset, size_t fragment, size_t copied) {
-          TransferRef buf = backend->BufferRef(pages[page_index].buffer_index);
-          if (!buf.HasHostPtr()) {
+          const uint32_t buffer = pages[page_index].buffer_index;
+          if (buffer >= buffer_refs.size() || !buffer_refs[buffer].HasHostPtr()) {
             MORI_UMBP_WARN(
                 "[PoolClient] ranged transfer: tier={} publishes no endpoint for buffer {}",
-                static_cast<int>(backend->Tier()), pages[page_index].buffer_index);
+                static_cast<int>(backend->Tier()), buffer);
             return false;
           }
+          const TransferRef& buf = buffer_refs[buffer];
           TransferItem item;
           item.size = fragment;
           item.tag = tag;
@@ -1877,10 +1907,10 @@ bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
           if (to_backend) {
             item.src = user_ref;
             item.src_offset = user_offset;
-            item.dst = std::move(buf);
+            item.dst = buf;
             item.dst_offset = tier_offset;
           } else {
-            item.src = std::move(buf);
+            item.src = buf;
             item.src_offset = tier_offset;
             item.dst = user_ref;
             item.dst_offset = user_offset;
@@ -2025,13 +2055,16 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
   };
   std::vector<PoolSlotRef> to_abort;
   std::vector<PendingWrite> pending;
-  std::vector<TransferItem> items;
   pending.reserve(requests.size());
-  {
-    size_t range_total = 0;
-    for (const auto& request : requests) range_total += request.ranges.size();
-    items.reserve(range_total);
-  }
+  // Planned object by object, as the ranged get is.  An item is close to a
+  // kilobyte and an object emits one per page fragment, so a single list for
+  // the whole batch reached hundreds of megabytes on a fine-paged pool, mapped
+  // and faulted in again by every concurrent put.  The plans keep only offsets.
+  size_t range_total = 0;
+  for (const auto& request : requests) range_total += request.ranges.size();
+  auto plan_builder = transfer_engine_->CreatePlanBuilder(range_total);
+  std::vector<TransferItem> request_items;
+  size_t item_count = 0;
 
   for (size_t r = 0; r < requests.size(); ++r) {
     MediumBackend* const backend = backend_of[r];
@@ -2051,25 +2084,30 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
 
     // tag = index into `requests`, so the engine's failed tags map straight
     // back to the slot that has to be aborted.
-    const size_t before = items.size();
+    request_items.clear();
+    request_items.reserve(RangePageFragments(request.ranges, alloc_res.page_size));
     bool built = false;
     {
       PhaseTimer build_timer(sinks.build);
       built = BuildLocalRangeTransfers(backend, alloc_res.pages, alloc_res.page_size,
                                        request.object_size, request.ranges, /*to_backend=*/true,
-                                       /*tag=*/r, &items, sinks.classify);
+                                       /*tag=*/r, &request_items, sinks.classify);
     }
     if (!built) {
-      items.resize(before);
       to_abort.push_back(slot);
       continue;
     }
+    {
+      PhaseTimer plan_timer(sinks.steps != nullptr ? sinks.steps->plan : nullptr);
+      for (const auto& item : request_items) plan_builder->Add(item);
+    }
+    item_count += request_items.size();
     pending.push_back({r, slot});
   }
   // Classification is timed inside the build window; subtract it so the phases
   // stay disjoint.
   if (sinks.build != nullptr && sinks.classify != nullptr) *sinks.build -= *sinks.classify;
-  if (sinks.items != nullptr) *sinks.items += items.size();
+  if (sinks.items != nullptr) *sinks.items += item_count;
   auto flush_aborts = [this, &to_abort] {
     if (to_abort.empty()) return;
     default_pool_->BatchAbort(to_abort);
@@ -2081,8 +2119,13 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
     return;
   }
 
+  TransferPlanSet planned;
+  {
+    PhaseTimer plan_timer(sinks.steps != nullptr ? sinks.steps->plan : nullptr);
+    planned = plan_builder->Finish();
+  }
   std::vector<size_t> failed_tags;
-  transfer_engine_->Transfer(items, &failed_tags, sinks.steps);
+  transfer_engine_->Transfer(std::move(planned), &failed_tags, sinks.steps);
   const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
 
   // Commit is still strictly after the transfer, and a slot that fails either
