@@ -134,6 +134,8 @@ size_t SignalPadBytes() {
 
 size_t RoundUp(size_t v, size_t m) { return ((v + m - 1) / m) * m; }
 
+constexpr size_t k4GiB = size_t{1} << 32;
+
 bool EnvFlag(const char* name) {
   const char* v = std::getenv(name);
   if (v == nullptr) return false;
@@ -229,16 +231,18 @@ class StoreExchange {
   std::unordered_map<uintptr_t, Entry> seqs_;
 };
 
-// cco reserves its flat VA once per communicator and quantises the per-rank stride
-// up to 4 GiB, so this is a floor rather than a budget: any request at or below
-// 4 GiB produces the same reservation. It bounds live symmetric memory per rank,
-// not the number of allocations over time -- slots are recycled on free.
-size_t PerRankVmmSize() {
-  static const size_t v = [] {
-    const char* e = getenv("MORI_SYMM_PER_RANK_VMM");
-    return e ? static_cast<size_t>(std::strtoull(e, nullptr, 0)) : (size_t{4} << 30);
-  }();
-  return v;
+// Per-rank flat VA of a comm (cco reserves lsaSize x this): device memory, capped for big teams.
+size_t PerRankVa(size_t device_mem, int lsa_bound) {
+  if (const char* e = std::getenv("MORI_SYMM_PER_RANK_VMM")) {
+    return static_cast<size_t>(std::strtoull(e, nullptr, 0));  // 0: cco uses device memory
+  }
+  constexpr int kUncappedTeam = 8;
+  constexpr size_t kFlatVaBudget = size_t{4} << 40;  // per communicator, past kUncappedTeam
+  size_t v = device_mem;
+  if (lsa_bound > kUncappedTeam) {
+    v = std::min(v, std::max(k4GiB, kFlatVaBudget / lsa_bound / k4GiB * k4GiB));
+  }
+  return RoundUp(std::max(v, k4GiB), k4GiB);
 }
 
 // What every rank publishes on the first rendezvous of an allocation with a group.
@@ -246,8 +250,10 @@ struct RendezvousInfo {
   uint64_t alloc_size;
   uint64_t buffer_size;
   uint64_t comm_epoch;  // this rank's communicator for the group, 0 if it has none
+  uint64_t device_mem;
   int32_t device_idx;
   int32_t global_rank;  // rank in the default group, -1 if there is none
+  int32_t fabric;
   char host[HOST_NAME_MAX + 1];
 };
 
@@ -812,8 +818,12 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     local.alloc_size = block.alloc_size;
     local.buffer_size = block.buffer_size;
     local.comm_epoch = cached ? cached->epoch : 0;
+    size_t device_mem = 0;
+    MORI_HIP_CHECK(hipDeviceTotalMem(&device_mem, dev));
+    local.device_mem = device_mem;
     local.device_idx = dev;
     local.global_rank = GlobalRank();
+    local.fabric = block.handle_type == hipMemHandleTypeFabricCompat ? 1 : 0;
     (void)gethostname(local.host, HOST_NAME_MAX);
     auto infos = store_exchange_.all_gather(store, rank, world_size, local);
 
@@ -857,6 +867,21 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       }
     }
 
+    // Bound the LSA team by ranks per host, or by the group where a fabric (vPOD) spans hosts.
+    size_t device_mem = 0;
+    std::map<std::string, int> per_host;
+    bool fabric = false;
+    for (const auto& info : infos) {
+      device_mem = std::max<size_t>(device_mem, info.device_mem);
+      per_host[info.host]++;
+      fabric = fabric || info.fabric != 0;
+    }
+    int lsa_bound = world_size;
+    if (!fabric) {
+      lsa_bound = 0;
+      for (const auto& [host, n] : per_host) lsa_bound = std::max(lsa_bound, n);
+    }
+
     struct CommId {
       mori::cco::ccoUniqueId uid;
       uint64_t epoch;
@@ -876,8 +901,8 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     group->rank = rank;
     group->world_size = world_size;
     group->epoch = ids[0].epoch;
-    MORI_CCO_CHECK(
-        mori::cco::ccoCommCreate(ids[0].uid, world_size, rank, PerRankVmmSize(), &group->comm));
+    MORI_CCO_CHECK(mori::cco::ccoCommCreate(ids[0].uid, world_size, rank,
+                                            PerRankVa(device_mem, lsa_bound), &group->comm));
     g_live_comms.fetch_add(1);
     // ccoCommCreate leaves a tolerated probe failure latched in HIP's per-thread
     // sticky slot. torch checks that slot around every launch, so without this the

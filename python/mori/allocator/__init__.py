@@ -64,9 +64,11 @@ The handle type is probed per device: fabric where supported, POSIX fd otherwise
 supported" -- so those fall back to fd, which needs no configuration. The allocation and
 CCO's own export have to agree on that type, since CCO re-exports what it imports.
 
-``MORI_SYMM_PER_RANK_VMM`` sizes the communicator's flat VA reservation (default 4 GiB).
-It is a floor rather than a budget -- CCO quantises it up to 4 GiB -- and it bounds live
-symmetric memory per rank, not allocations over time, because slots are recycled on free.
+Each communicator reserves flat VA for (LSA team size) x (per-rank size) once. The
+per-rank size bounds live symmetric memory per rank in that group, not allocations over
+time (slots are recycled on free). It defaults to device memory when the LSA team can
+have at most 8 ranks, and is capped so a communicator takes at most about 4 TiB of VA
+beyond that. ``MORI_SYMM_PER_RANK_VMM`` overrides it (bytes; CCO rounds up to 4 GiB).
 
 The signal pad is always there, as its own CCO allocation and window rather than a tail
 appended to the buffer -- the same split NCCL's backend uses. torch's own ``symm_mem``

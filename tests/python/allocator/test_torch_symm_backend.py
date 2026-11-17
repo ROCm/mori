@@ -44,6 +44,10 @@ from tests.python.utils import TorchDistContext, get_free_port
 GiB = 1 << 30
 
 
+def _round_up(v, m):
+    return (v + m - 1) // m * m
+
+
 def _run(rank, world_size, port):
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         device = torch.device("cuda", rank)
@@ -206,6 +210,14 @@ def _run_contract(rank, world_size, port):
         dist.barrier()
         for pe in range(world_size):
             assert hdl.get_buffer(pe, (4,), torch.float32)[0].item() == pe + 1
+
+        # A small team maps device memory per rank, which shows as the peer stride.
+        peers = [r for r in range(world_size) if r != rank]
+        stride = (hdl.buffer_ptrs[peers[1]] - hdl.buffer_ptrs[peers[0]]) // (
+            peers[1] - peers[0]
+        )
+        total = torch.cuda.get_device_properties(device).total_memory
+        assert stride == _round_up(total, 4 * GiB), (stride, total)
 
         # Another group over the same ranks: its own handle, pad and window, cached per
         # group rather than per allocation.
