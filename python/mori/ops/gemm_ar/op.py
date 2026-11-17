@@ -318,9 +318,10 @@ def _option_constraint(
     rule, and answered True where construction raised. ``quant`` must already
     be one of ``QUANTS``.
     """
-    # Each quantisation has exactly one legal BLOCK_M (see _quant_block_m).
-    # Reject a mismatch loudly rather than compiling a kernel whose scale
-    # indexing does not match the operand handed in.
+    # mxfp8 takes exactly one BLOCK_M and bf16 only those in BF16_BLOCK_MS
+    # (see _quant_tile_constraint). Reject a mismatch loudly rather than
+    # compiling a kernel whose scale indexing does not match the operand
+    # handed in.
     why = _quant_tile_constraint(quant, block_m)
     if why is not None:
         return why
@@ -739,7 +740,7 @@ class GemmAllReduceOp:
 
         if quant not in QUANTS:
             raise ValueError(f"quant={quant!r} is not one of {sorted(QUANTS)}")
-        # Default block_m to the quantisation's one legal BLOCK_M.
+        # Default block_m to the quantisation's own (see _default_block_m).
         if block_m is None:
             block_m = _default_block_m(quant)
         why = _option_constraint(
