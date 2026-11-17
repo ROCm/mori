@@ -6,14 +6,18 @@ description: >-
   and write pressure, attributes it to one mechanism, maps that mechanism to a
   lever, and verifies the change. Use when the user asks why a UMBP pool is
   slower than expected or than another pool, wants to tune or size a UMBP tier,
-  or wants to plan a tuning experiment. Tier-specific mechanics live in tiers/
-  (SSD is written; the others are not yet).
+  wants to choose what cache state a model stores and where, or wants to plan
+  a tuning experiment. Model-architecture placement is in architectures.md;
+  tier-specific mechanics live in tiers/ (SSD is written; the others are not
+  yet).
 ---
 
 # UMBP tuning framework
 
 A method, not a list of results. It works on any model, engine (vLLM, SGLang) or cluster.
 Follow the stages in order; do not jump to a knob before stage 2 names a mechanism.
+
+Two axes sit beside this core: `architectures.md` (what the model needs stored, and where) and `tiers/` (the medium). Placement comes first: if the hit an unlimited cache would reach under the current placement is already low, no pool setting recovers it.
 
 ## Ground rules
 
@@ -76,7 +80,7 @@ Caveat: compute rate depends on *which* tokens are computed (deep tokens cost mo
 
 ### 2A. Hit loss
 
-First get the ceiling: what an unlimited cache would have hit on this workload (replay the request log). Loss is ceiling minus measured. Then, for each lost span, ask what the pool held *at lookup time*:
+First get the ceiling: what an unlimited cache would have hit on this workload under the current placement (replay the request log). If that ceiling is itself low, the problem is placement: go to `architectures.md`. Loss is ceiling minus measured. Then, for each lost span, ask what the pool held *at lookup time*:
 
 | Class | Meaning | Lever family |
 |---|---|---|
@@ -125,7 +129,7 @@ Pick the family the class points to, then the concrete knob from the tier module
 | Capacity | tier size; pooling more nodes or drives |
 | Eviction unit and order | granularity of reclaim, recency hints, watermarks |
 | Residence time and classes | entry-tier size, per-class aging, demote or drop |
-| Store policy | what is stored, how often, dedup, retiring dead data (cuts inflow, so acts like capacity) |
+| Store policy | what is stored, how often, dedup, retiring dead data (cuts inflow, so acts like capacity). See `architectures.md`. |
 | Placement and promotion | which tier or node takes a put; whether a read moves data up |
 | Read path | concurrency, staging, ranged vs whole-object reads, coalescing, prefetch, load model |
 | Integrity overhead | checksums, sync-on-write |
@@ -168,7 +172,8 @@ Authoritative knob list and defaults: `src/umbp/doc/runtime-env-vars.md`. Read i
 
 Lead with the branch and class found, then: evidence (file and line or counter), the lever proposed, the prediction, what is still inferred, and the run that would confirm it.
 
-## Tier modules
+## Modules
 
+- `architectures.md` — tuning for the model architecture: inventory, bound, candidate placements, offline search, verification.
 - `tiers/ssd.md` — SSD-specific classes, levers, signals and sizing.
 - HBM, DRAM and remote modules are not written. For those tiers apply the stages above and say which tier-specific mechanics you had to work out from the source.
