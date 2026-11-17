@@ -31,9 +31,10 @@ from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
 try:
-    from torch.utils.cpp_extension import CppExtension as _TorchCppExtension
+    # On a ROCm torch this is the HIP extension: hipcc for .hip, the host compiler for .cpp.
+    from torch.utils.cpp_extension import CUDAExtension as _TorchHipExtension
 except ImportError:  # torch is optional at build time
-    _TorchCppExtension = None
+    _TorchHipExtension = None
 
 try:
     from Cython.Build import cythonize as _cythonize
@@ -377,12 +378,10 @@ def _copy_jit_sources(root_dir: Path) -> None:
 
     # torch SymmetricMemory backend — compiled on first import when the prebuilt
     # extension is missing or was built against a different torch. Headers come from
-    # the include/ copy above.
-    symm_src = root_dir / "src" / "allocator" / "symm_backend.cpp"
-    if symm_src.is_file():
-        symm_dst = jit_dir / "src" / "allocator"
-        symm_dst.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(symm_src, symm_dst / "symm_backend.cpp")
+    # the include/ copy above; the whole directory ships, host and kernel sources alike.
+    symm_src = root_dir / "src" / "allocator"
+    if symm_src.is_dir():
+        _copytree(symm_src, jit_dir / "src" / "allocator")
 
     # cco device-API wrapper — JIT-compiled to libmori_cco_device.bc on first use
     # (mori.cco.device.bitcode). Headers come from the include/ copy above.
@@ -1081,7 +1080,7 @@ def _torch_symm_extension():
     # control whether libmori_cco is built. A build that really has no libmori_cco
     # -- CMAKE_ARGS="-DBUILD_CCO=OFF" -- fails at link, which AUTO already reports
     # and skips, and which BUILD_TORCH_SYMM=ON already turns into a hard error.
-    if _TorchCppExtension is None:
+    if _TorchHipExtension is None:
         if mode == "ON":
             raise RuntimeError(
                 "BUILD_TORCH_SYMM=ON but torch is not importable at build time"
@@ -1089,36 +1088,50 @@ def _torch_symm_extension():
         return []
     import importlib.util
 
-    import torch
-    from torch.utils import cpp_extension
+    try:
+        import torch
+        from torch.utils import cpp_extension
 
-    # Shared with the JIT loader; loaded by path because mori is not installed yet.
-    spec = importlib.util.spec_from_file_location(
-        "_mori_symm_build", _root_dir / "python" / "mori" / "allocator" / "_build.py"
-    )
-    symm_build = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(symm_build)
-    rocm = symm_build.rocm_home(cpp_extension)
-    # By file: records the SONAME of the HIP runtime torch uses.
-    hip = symm_build.hip_runtime_library(rocm)
-    fingerprint = symm_build.torch_fingerprint(torch)
-    # Absolute: torch's ninja compiler writes its build file into build_temp and runs
-    # ninja from there, so a relative -I would resolve against the wrong directory.
-    ext = _TorchCppExtension(
-        name="mori.mori_torch_symm",
-        sources=["src/allocator/symm_backend.cpp"],
-        include_dirs=[str(_root_dir.resolve() / "include"), f"{rocm}/include"],
-        # libmori_cco is the peer-exchange half of the backend; it lands next to this
-        # module in the package, hence the $ORIGIN runpath.
-        library_dirs=([] if hip else [f"{rocm}/lib"])
-        + [str(_root_dir.resolve() / "python" / "mori")],
-        libraries=([] if hip else ["amdhip64"]) + ["c10_hip", "torch_hip", "mori_cco"],
-        extra_link_args=[hip] if hip else [],
-        # The loader refuses this module under any other torch build.
-        define_macros=[("MORI_TORCH_FINGERPRINT", fingerprint)],
-        runtime_library_dirs=["$ORIGIN"],
-        # No -std here: torch's BuildExtension adds the standard its headers need.
-    )
+        if torch.version.hip is None:
+            raise RuntimeError(f"torch {torch.__version__} is not a ROCm build")
+        # Shared with the JIT loader; loaded by path because mori is not installed yet.
+        spec = importlib.util.spec_from_file_location(
+            "_mori_symm_build", _root_dir / "python" / "mori" / "allocator" / "_build.py"
+        )
+        symm_build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(symm_build)
+        rocm = symm_build.rocm_home(cpp_extension)
+        # By file: records the SONAME of the HIP runtime torch uses.
+        hip = symm_build.hip_runtime_library(rocm)
+        fingerprint = symm_build.torch_fingerprint(torch)
+        archs = re.findall(r"gfx[0-9a-f]+(?:-strict)?", _get_gpu_archs())
+        # Absolute: torch's ninja compiler writes its build file into build_temp and
+        # runs ninja from there, so a relative -I would resolve against the wrong
+        # directory. Passed as flags, not include_dirs: construction hipifies the
+        # sources and would follow headers found there, writing *_hip copies.
+        includes = [f"-I{_root_dir.resolve() / 'include'}", f"-I{rocm}/include"]
+        ext = _TorchHipExtension(
+            name="mori.mori_torch_symm",
+            sources=["src/allocator/symm_backend.cpp", "src/allocator/symm_signal.hip"],
+            # libmori_cco is the peer-exchange half of the backend; it lands next to
+            # this module in the package, hence the $ORIGIN runpath. torch adds its libs.
+            library_dirs=[f"{rocm}/lib", str(_root_dir.resolve() / "python" / "mori")],
+            libraries=["mori_cco"],
+            extra_link_args=[hip] if hip else [],
+            # The loader refuses this module under any other torch build.
+            define_macros=[("MORI_TORCH_FINGERPRINT", fingerprint)],
+            runtime_library_dirs=["$ORIGIN"],
+            # No -std here: torch's BuildExtension adds the standard its headers need.
+            extra_compile_args={
+                "cxx": includes,
+                "nvcc": ["-O3"] + includes + [f"--offload-arch={a}" for a in archs],
+            },
+        )
+    except Exception as exc:  # same AUTO/ON contract as a failed compile
+        if mode == "ON":
+            raise
+        print(f"[mori] torch SymmetricMemory backend not prebuilt ({exc}).")
+        return []
     ext._mori_torch_ext = True
     return [ext]
 

@@ -74,6 +74,15 @@
 #include <vector>
 
 #include "mori/utils/hip_compat.hpp"
+#include "symm_signal.hpp"
+
+// torch >= 2.15 orders every signal-pad op of a group across streams; join it when present.
+#if __has_include(<torch/csrc/distributed/c10d/symm_mem/GroupStreamGuard.hpp>)
+#include <torch/csrc/distributed/c10d/symm_mem/GroupStreamGuard.hpp>
+#define MORI_HAVE_GROUP_STREAM_GUARD 1
+#else
+#define MORI_HAVE_GROUP_STREAM_GUARD 0
+#endif
 
 // The SymmetricMemory interface is not stable across torch minors -- methods move
 // between pure virtual, virtual-with-default and non-virtual, and new virtuals appear --
@@ -153,7 +162,7 @@ bool RuntimeUsable() {
   return hipGetDevice(&dev) == hipSuccess;
 }
 
-// Raw HIP: torch ships both c10::cuda and c10::hip; the wrong one pulls cuda_runtime_api.h.
+// Raw HIP: torch ships both c10::cuda and c10::hip; the wrong one pulls in CUDA's runtime header.
 class DeviceGuard {
  public:
   explicit DeviceGuard(int dev) {
@@ -455,32 +464,31 @@ class MoriSymmetricMemory : public SymmetricMemory {
     return true;
   }
 
-  // cco's barrier is a host collective, while torch's is meant to be stream-ordered,
-  // so the current stream is drained first. That makes this stronger than asked for --
-  // every rank's prior GPU work is complete before any rank returns -- and heavier.
-  // A device-side barrier belongs with a DevComm, which this backend does not own yet.
-  void barrier(int channel, size_t /*timeout_ms*/) override {
-    TORCH_CHECK(channel == 0,
-                "mori symm backend: only channel 0 exists; cco's barrier is comm-wide");
-    TORCH_CHECK(group_ && group_->comm, "mori symm backend: window has no communicator");
+  // Stream-ordered device kernels on the signal pad, same protocol as torch's backends.
+  void barrier(int channel, size_t timeout_ms) override {
+    CheckChannel(channel);
     DeviceGuard guard(device_.index());
-    // Same invariant as everywhere else in this file: one thread at a time in this
-    // comm. ccoBarrierAll goes through the socket bootstrap, whose unexpected-message
-    // list is not itself synchronised, so two threads barriering the same group can
-    // drop a queued connection and wait forever.
-    std::lock_guard<std::mutex> lock(group_->mu);
-    MORI_HIP_CHECK(hipStreamSynchronize(c10::hip::getCurrentHIPStream()));
-    MORI_CCO_CHECK(mori::cco::ccoBarrierAll(group_->comm));
+    SignalPadStreamGuard order(group_->name);
+    MORI_HIP_CHECK(LaunchSignalPadBarrier(PadsDev(), channel, rank_, world_size_, timeout_ms,
+                                          c10::hip::getCurrentHIPStream().stream()));
   }
 
-  // Point-to-point signalling needs cco signals, which live on a ccoDevComm that this
-  // backend does not create yet. torch's own collectives do not call these -- they
-  // synchronise through the signal pad above.
-  void put_signal(int, int, size_t) override {
-    TORCH_CHECK(false, "mori symm backend: put_signal is not implemented yet");
+  void put_signal(int dst_rank, int channel, size_t timeout_ms) override {
+    CheckChannel(channel);
+    CheckRank(dst_rank);
+    DeviceGuard guard(device_.index());
+    SignalPadStreamGuard order(group_->name);
+    MORI_HIP_CHECK(LaunchSignalPadPut(PadsDev(), dst_rank, channel, rank_, world_size_, timeout_ms,
+                                      c10::hip::getCurrentHIPStream().stream()));
   }
-  void wait_signal(int, int, size_t) override {
-    TORCH_CHECK(false, "mori symm backend: wait_signal is not implemented yet");
+
+  void wait_signal(int src_rank, int channel, size_t timeout_ms) override {
+    CheckChannel(channel);
+    CheckRank(src_rank);
+    DeviceGuard guard(device_.index());
+    SignalPadStreamGuard order(group_->name);
+    MORI_HIP_CHECK(LaunchSignalPadWait(PadsDev(), src_rank, channel, rank_, world_size_, timeout_ms,
+                                       c10::hip::getCurrentHIPStream().stream()));
   }
 
   // Backend-specific, deliberately not part of torch's interface -- the same shape as
@@ -490,6 +498,34 @@ class MoriSymmetricMemory : public SymmetricMemory {
   ccoWindow_t get_signal_pad_window() const { return pad_win_; }
 
  private:
+#if MORI_HAVE_GROUP_STREAM_GUARD
+  using SignalPadStreamGuard = c10d::symmetric_memory::GroupStreamGuard;
+#else
+  // Older torch orders nothing across streams, its own backends included.
+  struct SignalPadStreamGuard {
+    explicit SignalPadStreamGuard(const std::string&) {}
+  };
+#endif
+
+  uint32_t** PadsDev() const { return reinterpret_cast<uint32_t**>(signal_pads_dev_); }
+
+  // Bounded by the pad actually allocated, and worded like torch's check_channel().
+  void CheckChannel(int channel) const {
+    TORCH_CHECK(channel >= 0,
+                "channel for barrier(), put_signal() and wait_signal() must be non-negative (got ",
+                channel, ")");
+    const size_t num_channels = pad_size_ / (sizeof(uint32_t) * world_size_);
+    TORCH_CHECK(static_cast<size_t>(channel) < num_channels,
+                "The maximum supported channel for barrier(), put_signal() and wait_signal() is ",
+                static_cast<int64_t>(num_channels) - 1, " (got ", channel, ")");
+  }
+
+  // Worded like torch's check_rank(), which torch < 2.14 does not have.
+  void CheckRank(int rank) const {
+    TORCH_CHECK(rank >= 0 && rank < world_size_, "rank must be in [0, ", world_size_, ") (got ",
+                rank, ")");
+  }
+
   std::shared_ptr<PeerAlloc> peer_;  // owns everything below
   std::shared_ptr<CcoGroup> group_;
   ccoWindow_t win_;

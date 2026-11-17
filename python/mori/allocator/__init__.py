@@ -74,17 +74,18 @@ The signal pad is always there, as its own CCO allocation and window rather than
 appended to the buffer -- the same split NCCL's backend uses. torch's own ``symm_mem``
 collectives synchronise through it, so they work without any build flag.
 
-``barrier()`` runs over CCO's host barrier, which means the current stream is drained
-first: stronger than the device-side barrier torch asks for, and heavier.
-``put_signal``/``wait_signal`` still raise -- point-to-point signalling needs a
-``ccoDevComm``, which this backend does not create yet.
+``barrier()``, ``put_signal()`` and ``wait_signal()`` are kernels on the caller's current
+stream that follow torch's signal-pad protocol, so they mix with torch's own ``symm_mem``
+ops, capture into HIP graphs, and on torch >= 2.15 join its per-group stream ordering.
+A timeout traps the kernel as torch's backends do: the next synchronisation raises, and
+the process's GPU state is unusable from then on.
 
 The extension is optional and its ABI tracks the installed torch, so it is a plugin:
 ``pip install`` prebuilds it when it can (``BUILD_TORCH_SYMM=AUTO``, the default; ``ON``
 makes a failure fatal, ``OFF`` skips it). A prebuilt module made for a different torch
-build is refused before it can register, and the backend is then compiled on first import
-from the sources shipped in ``_jit-sources`` -- against torch's own ROCm, into a cache
-directory per torch build. So switching torch does not require reinstalling mori.
+build is refused before it can register, and the backend is then compiled on first import,
+with hipcc, from the sources shipped in ``_jit-sources`` -- against torch's own ROCm, into
+a cache directory per torch build. So switching torch does not require reinstalling mori.
 ``MORI_SYMM_FORCE_JIT=1`` ignores the prebuilt module. If neither works, importing
 ``mori.allocator`` logs a warning and ``set_backend("MORI")`` reports the backend as
 unknown.
@@ -118,6 +119,19 @@ _atexit_registered = False
 
 _ext_cache = None
 
+# Host half and signal-pad kernels; setup.py builds the same pair.
+_SOURCES = ("symm_backend.cpp", "symm_signal.hip")
+
+
+def _offload_arch_flags() -> list:
+    """Target the GPU mori detects; with no flag, torch picks from the visible devices."""
+    from ..jit.config import detect_gpu_arch
+
+    try:
+        return [f"--offload-arch={detect_gpu_arch()}"]
+    except RuntimeError:
+        return []
+
 
 def _jit_ext(fingerprint: str):
     """Compile the backend against the torch that is actually loaded.
@@ -149,34 +163,41 @@ def _jit_ext(fingerprint: str):
             "mori_torch_symm is not built and its sources were not found. Reinstall "
             "mori from a source tree or a wheel that ships _jit-sources."
         )
-    source = root / "src" / "allocator" / "symm_backend.cpp"
-    if not source.is_file():
-        raise ImportError(f"mori_torch_symm sources missing at {source}")
+    sources = [root / "src" / "allocator" / name for name in _SOURCES]
+    missing = [str(s) for s in sources if not s.is_file()]
+    if missing:
+        raise ImportError(f"mori_torch_symm sources missing: {missing}")
 
     rocm = rocm_home(cpp_extension)
     # By file: records the SONAME, and pip ROCm has no libamdhip64.so for -l.
     hip = hip_runtime_library(rocm)
     hip_link = [hip] if hip else [f"-L{rocm}/lib", "-lamdhip64"]
+    # -I as flags, not extra_include_paths: load() hipifies every header under those,
+    # writing *_hip copies into the package and the ROCm tree.
+    includes = [f"-I{root / 'include'}", f"-I{rocm}/include"]
     # No -std here: load() already passes the standard torch's headers need.
     flags = [
         "-O3",
         "-D__HIP_PLATFORM_AMD__=1",
         "-DUSE_ROCM=1",
         f"-DMORI_TORCH_FINGERPRINT={fingerprint}",
+        *includes,
     ]
     name = "mori_torch_symm"
     try:
         build_dir = cpp_extension._get_build_directory(f"{name}_{fingerprint}", False)
     except AttributeError:  # pragma: no cover - private helper, present since torch 1.x
         build_dir = None
-    logger.info("compiling %s for torch %s from %s", name, torch.__version__, source)
+    logger.info(
+        "compiling %s for torch %s from %s", name, torch.__version__, sources[0].parent
+    )
     # libmori_cco sits in the package directory, wherever mori was installed.
     pkg = str(Path(__file__).resolve().parent.parent)
     return cpp_extension.load(
         name=name,
-        sources=[str(source)],
-        extra_include_paths=[str(root / "include"), f"{rocm}/include"],
+        sources=[str(s) for s in sources],
         extra_cflags=flags,
+        extra_cuda_cflags=["-O3", *includes, *_offload_arch_flags()],
         extra_ldflags=hip_link
         + ["-lc10_hip", f"-L{pkg}", "-lmori_cco", f"-Wl,-rpath,{pkg}"],
         build_directory=build_dir,
