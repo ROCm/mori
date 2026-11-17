@@ -82,8 +82,10 @@ are open.
    and the same with `--impl mori.ops.gemm_ar_v2.op:GemmArV2Fused`. The trace shows
    kernels, not the copy engines; what happens inside the fused GEMM (when each chunk is
    posted) needs the candidate's own stamps (`--mode timeline`, see the loop skill's
-   `reference/diagnosis.md`). `bounds.md` holds the ledger: the gap to the existing op,
-   split by phase, largest first.
+   `reference/diagnosis.md`). A candidate whose kernels run on several streams (v2-stream)
+   needs `--trace-eager`: in a multi-stream graph the profiler can attach names to the
+   wrong kernels. `bounds.md` holds the ledger: the gap to the existing op, split by
+   phase, largest first.
 4. **Rounds (steps 2 and 3).** `hypotheses.md`, then one change per round behind a switch,
    timed with `arms.dev.yaml` plus variant arms of your own (`--impl-kwargs`,
    `validate: false` for cut-off variants), and frozen when it pays.

@@ -104,7 +104,12 @@ switch, run an interleaved A/B, and record keep, revise or reject with the numbe
   passes constructor switches. In a `run.py --arms` file give every variant an arm, and
   mark one whose output is wrong by design (a phase cut off, puts suppressed) with
   `validate: false`: it is timed, and its failed check does not fail the run.
-- Kernel trace for phase times and gaps: `rocprofv3 --kernel-trace`. Profiling a
-  multi-GPU job takes the whole node.
+- **Kernel trace** for phase times and gaps, of a candidate or (where the case allows
+  it) of a black-box reference: `op_harness.py --mode trace --timeline-out <file>`, read
+  with `timeline.py`. It sees kernels, not the copy engines. In a graph whose kernels
+  run on more than one stream, the profiler can attach names to the wrong kernels (the
+  times stay right); trace eager calls there (`--trace-eager`). `rocprofv3
+  --kernel-trace` is the alternative outside the case's harness; profiling a multi-GPU
+  job takes the whole node.
 - GEMM counters and roofline: rocprofv3 counters and rocprof-compute; ATT for the K loop.
 - ISA comparison: the FlyDSL `isa-resource-diff` skill.

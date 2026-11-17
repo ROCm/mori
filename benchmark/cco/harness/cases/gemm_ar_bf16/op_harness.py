@@ -58,7 +58,10 @@ holds the phase summary of ``benchmark/cco/harness/timeline.py``. One more call 
 operator included: every kernel's name, start and duration, call by call on every rank,
 written to ``--timeline-out`` in ``timeline.py``'s format (``<kernel>:start@<n>``,
 ``<kernel>:end@<n>`` for its n-th launch in the call). What runs on the copy engines does
-not show; the kernels that post and wait for it do.
+not show; the kernels that post and wait for it do. In a graph whose kernels run on more
+than one stream the profiler matches names to kernels by order and can mix them up (the
+times stay right); ``--trace-eager`` traces eager calls instead, where every launch is
+matched by its own correlation.
 
 ``--impl-kwargs '{"mode": "fused"}'`` passes keyword switches to the implementation's
 constructor, and the ones it declares to ``window_bytes_for``, so a variant needs no class
@@ -138,6 +141,11 @@ def build_parser():
     p.add_argument("--skew-ms", type=float, default=5.0)
     p.add_argument("--call-timeout", type=float, default=120.0)
     p.add_argument("--timeline-calls", type=int, default=10)
+    p.add_argument(
+        "--trace-eager",
+        action="store_true",
+        help="--mode trace: trace eager calls, not graph replays",
+    )
     p.add_argument(
         "--timeline-out", help="where --mode timeline or trace writes every event"
     )
@@ -511,17 +519,22 @@ class _Run:
                 op(x)
         torch.cuda.current_stream().wait_stream(side)
         self.finish("trace warm-up")
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            op(x)
-        for _ in range(a.warmup):
-            g.replay()
-        self.finish("graph warm-up")
+        g = None
+        if not a.trace_eager:
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                op(x)
+            for _ in range(a.warmup):
+                g.replay()
+            self.finish("graph warm-up")
         activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
         with profile(activities=activities) as prof:
             for _ in range(a.timeline_calls):
-                g.replay()
-                self.finish("traced replay")
+                if g is None:
+                    op(x)
+                else:
+                    g.replay()
+                self.finish("traced call")
         fd, path = tempfile.mkstemp(suffix=".json", prefix=f"op_harness_r{self.rank}_")
         os.close(fd)
         try:
@@ -636,7 +649,12 @@ def run(args):
                 }
                 if rank == 0:
                     data = {
-                        "source": "kernel trace" if args.mode == "trace" else "stamps",
+                        "source": (
+                            "stamps"
+                            if args.mode == "timeline"
+                            else "kernel trace, "
+                            + ("eager" if args.trace_eager else "graph")
+                        ),
                         "impl": args.impl,
                         "impl_kwargs": kwargs,
                         "m": args.m,
