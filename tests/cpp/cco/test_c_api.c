@@ -27,6 +27,7 @@
 //
 //   test_c_api [nranks]   (default 2; rank r uses HIP device r)
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <hip/hip_runtime_api.h>
 #include <sched.h>
@@ -81,7 +82,7 @@ typedef struct {
   int count;
   int generation;
   int failed;
-  moriCcoUniqueId_t uid2, uid3;  // rank 0's ids for the later comms
+  moriCcoUniqueId_t uids[2];  // rank 0's ids for the later comms
 } Barrier;
 
 static Barrier* g_bar;
@@ -243,6 +244,80 @@ static int test_exit_hook(void) {
   return 0;
 }
 
+// ---- VMM buffers, and what a process holds ----
+
+typedef struct {
+  hipMemGenericAllocationHandle_t handle;
+  void* ptr;
+  size_t bytes;
+} VmmBuf;
+
+// A VMM allocation the way torch.symm_mem makes one.
+static int vmm_alloc(const hipMemAllocationProp* prop, size_t bytes, VmmBuf* b) {
+  b->bytes = bytes;
+  HIP(hipMemCreate(&b->handle, bytes, prop, 0));
+  HIP(hipMemAddressReserve(&b->ptr, bytes, 0, NULL, 0));
+  HIP(hipMemMap(b->ptr, bytes, 0, b->handle, 0));
+  hipMemAccessDesc access;
+  memset(&access, 0, sizeof(access));
+  access.location = prop->location;
+  access.flags = hipMemAccessFlagsProtReadWrite;
+  HIP(hipMemSetAccess(b->ptr, bytes, &access, 1));
+  return 0;
+}
+
+static int vmm_free(VmmBuf* b) {
+  HIP(hipMemUnmap(b->ptr, b->bytes));
+  HIP(hipMemAddressFree(b->ptr, b->bytes));
+  HIP(hipMemRelease(b->handle));
+  return 0;
+}
+
+// This process's VRAM in KiB from its amdgpu DRM fdinfo, which other users of
+// the GPU do not move; -1 if the kernel does not report it.
+static long long vram_kib(void) {
+  DIR* dir = opendir("/proc/self/fdinfo");
+  if (!dir) return -1;
+  long long total = -1;
+  unsigned long long seen[64];
+  int nseen = 0;
+  struct dirent* e;
+  while ((e = readdir(dir)) != NULL) {
+    char path[300], line[256], unit[8];
+    snprintf(path, sizeof(path), "/proc/self/fdinfo/%s", e->d_name);
+    FILE* f = e->d_name[0] == '.' ? NULL : fopen(path, "r");
+    if (!f) continue;
+    int amdgpu = 0, have = 0, dup = 0;
+    unsigned long long client = 0, n = 0, bytes = 0;
+    while (fgets(line, sizeof(line), f)) {
+      if (strncmp(line, "drm-driver:", 11) == 0) amdgpu = strstr(line, "amdgpu") != NULL;
+      (void)sscanf(line, "drm-client-id: %llu", &client);
+      unit[0] = '\0';
+      if (sscanf(line, "drm-memory-vram: %llu %7s", &n, unit) >= 1) {
+        have = 1;
+        bytes = n << (strcmp(unit, "KiB") == 0 ? 10 : strcmp(unit, "MiB") == 0 ? 20 : 0);
+      }
+    }
+    fclose(f);
+    if (!amdgpu || !have) continue;
+    for (int i = 0; i < nseen; i++) dup |= seen[i] == client;
+    if (dup) continue;
+    if (nseen < 64) seen[nseen++] = client;
+    total = (total < 0 ? 0 : total) + (long long)(bytes >> 10);
+  }
+  closedir(dir);
+  return total;
+}
+
+static int open_fds(void) {
+  DIR* dir = opendir("/proc/self/fd");
+  int n = 0;
+  if (!dir) return -1;
+  while (readdir(dir) != NULL) n++;
+  closedir(dir);
+  return n;
+}
+
 // ---- one rank ----
 
 static int fill(void* dst, uint32_t value, size_t bytes) {
@@ -285,14 +360,14 @@ static int rdma_loaded(void) {
 // Comms with a NULL config and with pinning asked for. Neither maps an RDMA library.
 static int default_comms(int rank, int nranks) {
   if (rank == 0) {
-    OK(api.getUniqueId(&g_bar->uid2));
-    OK(api.getUniqueId(&g_bar->uid3));
+    OK(api.getUniqueId(&g_bar->uids[0]));
+    OK(api.getUniqueId(&g_bar->uids[1]));
   }
   BARRIER();
   cpu_set_t before, after;
   if (sched_getaffinity(0, sizeof(before), &before) != 0) FAIL("sched_getaffinity");
   moriCcoComm_t comm = NULL;
-  OK(api.commCreate(&g_bar->uid2, nranks, rank, NULL, &comm));
+  OK(api.commCreate(&g_bar->uids[0], nranks, rank, NULL, &comm));
   if (sched_getaffinity(0, sizeof(after), &after) != 0) FAIL("sched_getaffinity");
   if (!CPU_EQUAL(&before, &after))
     FAIL("NULL config: %d CPUs became %d", CPU_COUNT(&before), CPU_COUNT(&after));
@@ -307,11 +382,43 @@ static int default_comms(int rank, int nranks) {
   // affinity checks have teeth.
   moriCcoCommConfig_t cfg = MORI_CCO_COMM_CONFIG_INIT;
   cfg.flags = MORI_CCO_COMM_LSA_ONLY;
-  OK(api.commCreate(&g_bar->uid3, nranks, rank, &cfg, &comm));
+  OK(api.commCreate(&g_bar->uids[1], nranks, rank, &cfg, &comm));
   if (sched_getaffinity(0, sizeof(after), &after) != 0) FAIL("sched_getaffinity");
   printf("[rank %d] pinning config: %d -> %d CPUs\n", rank, CPU_COUNT(&before), CPU_COUNT(&after));
   OK(api.commDestroy(comm));
   if (rdma_loaded() != 0) FAIL("an LSA-only comm mapped libibverbs");
+  return 0;
+}
+
+// Import/release cycles in both teardown orders. A window holds its own
+// reference, so neither order may leave VRAM or fds behind in this process.
+static int teardown_orders(moriCcoComm_t comm, const hipMemAllocationProp* prop, size_t bytes) {
+  enum { kCycles = 8 };
+  const long long kib = (long long)(bytes >> 10);
+  for (int windowFirst = 0; windowFirst <= 1; windowFirst++) {
+    const char* order = windowFirst ? "window first" : "owner first";
+    BARRIER();
+    const long long vram0 = vram_kib();
+    const int fds0 = open_fds();
+    long long seen = 0;  // what one allocation adds, to know fdinfo counts it
+    for (int i = 0; i < kCycles; i++) {
+      VmmBuf b;
+      moriCcoWindow_t w = NULL;
+      if (vmm_alloc(prop, bytes, &b)) return 1;
+      if (i == 0 && vram0 >= 0) seen = vram_kib() - vram0;
+      OK(api.windowImport(comm, b.ptr, bytes, 0, &w, NULL));
+      if (windowFirst) OK(api.windowRelease(w));
+      if (vmm_free(&b)) return 1;
+      if (!windowFirst) OK(api.windowRelease(w));
+    }
+    BARRIER();  // peers have released their imports of this rank's buffers
+    const long long grew = vram_kib() - vram0;
+    const int fdsLeft = open_fds() - fds0;
+    printf("[rank %d] %s x%d: VRAM %+lld KiB (one allocation shows as %lld), fds %+d\n", g_rank,
+           order, kCycles, grew, seen, fdsLeft);
+    if (fdsLeft > 0) FAIL("%s: %d fds left open", order, fdsLeft);
+    if (seen >= kib && grew >= kib) FAIL("%s: %lld KiB of VRAM not returned", order, grew);
+  }
   return 0;
 }
 
@@ -480,7 +587,9 @@ static int run_rank(int rank, int nranks, const moriCcoUniqueId_t* uid) {
     FAIL("devCommDestroy took the caller's HIP error");
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.devCommDestroy(comm, dev));
 
-  // The owner lets go of its handle first, then the window (see cco_c.h, Lifetime).
+  if (teardown_orders(comm, &prop, bytes)) return 1;
+
+  // The owner lets go of its handle first, then the window.
   BARRIER();
   HIP(hipDeviceSynchronize());
   HIP(hipMemUnmap(buf, bytes));

@@ -523,36 +523,27 @@ static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
   return hipSuccess;
 }
 
-// ROCm 7.14 returns one exported fd per allocation and closes it at the last release (an early
-// close strands the memory); ROCm 10 returns a new caller-owned fd per export. Tell them apart.
-static bool CcoRuntimeOwnsExportedFd(int hipDev) {
-  static std::once_flag once;
-  static bool owned = false;
-  std::call_once(once, [hipDev] {
-    hipMemAllocationProp prop = {};
-    prop.type = hipMemAllocationTypePinned;
-    prop.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
-    prop.location.type = hipMemLocationTypeDevice;
-    prop.location.id = hipDev;
-    vmmProcessLock vmmLock;
-    size_t gran = 0;
-    hipMemGenericAllocationHandle_t h = 0;
-    if (hipMemGetAllocationGranularity(&gran, &prop, hipMemAllocationGranularityMinimum) ==
-            hipSuccess &&
-        hipMemCreate(&h, gran, &prop, 0) == hipSuccess) {
-      int a = -1, b = -1;
-      (void)hipMemExportToShareableHandle(&a, h, hipMemHandleTypePosixFileDescriptor, 0);
-      (void)hipMemExportToShareableHandle(&b, h, hipMemHandleTypePosixFileDescriptor, 0);
-      owned = a >= 0 && a == b;
-      if (!owned) {
-        if (a >= 0) close(a);
-        if (b >= 0) close(b);
-      }
-      (void)hipMemRelease(h);
-    }
+// Exports h as a POSIX fd. ROCm 7.14 returns one fd per allocation and closes it at the last
+// release (an early close strands the memory); ROCm 10 returns a new caller-owned fd per export.
+// A second export of h tells them apart. If that fails the fd is treated as the runtime's: a
+// leaked fd is safer than closing a number the runtime closes again.
+static hipError_t CcoExportShareFd(hipMemGenericAllocationHandle_t h, int* fd, bool* owns) {
+  *fd = -1;
+  *owns = false;
+  const hipError_t err =
+      hipMemExportToShareableHandle(fd, h, hipMemHandleTypePosixFileDescriptor, 0);
+  if (err != hipSuccess) return err;
+  int again = -1;
+  if (hipMemExportToShareableHandle(&again, h, hipMemHandleTypePosixFileDescriptor, 0) !=
+          hipSuccess ||
+      again < 0) {
     (void)hipGetLastError();
-  });
-  return owned;
+    MORI_SHMEM_WARN("cco: second fd export failed; leaving fd {} to the runtime", *fd);
+  } else if (again != *fd) {
+    close(again);
+    *owns = true;
+  }
+  return hipSuccess;
 }
 
 // Warn when the kernel lacks CONFIG_PCI_P2PDMA: a peer window import is then pinned in
@@ -1050,10 +1041,7 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
     err = hipMemExportToShareableHandle(&meta.fabricHandle, physHandle,
                                         hipMemHandleTypeFabricCompat, 0);
   } else {
-    meta.shareFd = -1;
-    meta.ownsShareFd = !CcoRuntimeOwnsExportedFd(comm->hipDev);
-    err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&meta.shareFd), physHandle,
-                                        hipMemHandleTypePosixFileDescriptor, 0);
+    err = CcoExportShareFd(physHandle, &meta.shareFd, &meta.ownsShareFd);
   }
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("ccoMemAlloc: hipMemExportToShareableHandle failed: {} ({})",
@@ -1203,10 +1191,7 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
     err = hipMemExportToShareableHandle(&meta.fabricHandle, physHandle,
                                         hipMemHandleTypeFabricCompat, 0);
   } else {
-    meta.shareFd = -1;
-    meta.ownsShareFd = !CcoRuntimeOwnsExportedFd(comm->hipDev);
-    err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&meta.shareFd), physHandle,
-                                        hipMemHandleTypePosixFileDescriptor, 0);
+    err = CcoExportShareFd(physHandle, &meta.shareFd, &meta.ownsShareFd);
   }
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR(
