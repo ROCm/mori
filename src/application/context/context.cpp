@@ -313,34 +313,40 @@ void Context::InitializeTopologyAndTransports() {
   }
 
   // Match gpu and nic
-  bool disableTopo = env::IsEnvVarEnabled("MORI_DISABLE_TOPO");
+  bool staticMatch = env::IsEnvVarEnabled("MORI_DISABLE_TOPO");
   int portId = -1;
   int devicePortId = -1;
   RdmaDevice* device = nullptr;
 
-  if (disableTopo) {
+  if (staticMatch) {
     std::cout << "MORI Topology detection is disabled, use static matching" << std::endl;
-    if (!activeDevicePortList.empty()) {
-      devicePortId = (rankInNode % activeDevicePortList.size());
-      std::tie(device, portId) = activeDevicePortList[devicePortId];
-      rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
-    }
   } else {
     int deviceId = -1;
     HIP_RUNTIME_CHECK(hipGetDevice(&deviceId));
     topo.reset(new TopoSystem());
-    std::string nicName = topo->MatchGpuAndNic(deviceId);
-    MORI_APP_TRACE("rank {} rankInNode {} matched nic {} for gpu {}", LocalRank(), rankInNode,
-                   nicName, deviceId);
-    for (int i = 0; i < activeDevicePortList.size(); i++) {
-      auto& dp = activeDevicePortList[i];
-      if (dp.first->Name() != nicName) continue;
-      device = dp.first;
-      portId = activeDevicePortList[i].second;
-      rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
-      devicePortId = i;
-      break;
+    if (!topo->GetTopoSystemPci()->Valid()) {
+      MORI_APP_WARN("rank {}: PCI topology is inconsistent; matching NICs statically", LocalRank());
+      staticMatch = true;
+    } else {
+      std::string nicName = topo->MatchGpuAndNic(deviceId);
+      MORI_APP_TRACE("rank {} rankInNode {} matched nic {} for gpu {}", LocalRank(), rankInNode,
+                     nicName, deviceId);
+      for (int i = 0; i < activeDevicePortList.size(); i++) {
+        auto& dp = activeDevicePortList[i];
+        if (dp.first->Name() != nicName) continue;
+        device = dp.first;
+        portId = activeDevicePortList[i].second;
+        rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
+        devicePortId = i;
+        break;
+      }
     }
+  }
+
+  if (staticMatch && !activeDevicePortList.empty()) {
+    devicePortId = (rankInNode % activeDevicePortList.size());
+    std::tie(device, portId) = activeDevicePortList[devicePortId];
+    rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
   }
 
   if (device == nullptr) {
