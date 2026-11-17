@@ -118,7 +118,8 @@ Top to bottom:
 
 - Tiles: Total Sent, Total Util (share of the capacity), Busiest Sent and Busiest Received (the GPU
   with the highest average sent / received bandwidth in the window; received = what the peers sent
-  to it) and Last Data (Live while the newest sample is at most 10 s old; otherwise its age in
+  to it) and Last Data (the newest sample within the hour or the selected range before its end, whichever is
+  longer; Live while it is at most 10 s old; otherwise its age in
   seconds, yellow from 10 s and red from 30 s: the recorder or the push stalled, or it is a
   recording and this is how old it is. While recording the age moves between about 2.6 and 4.4 s,
   because the recorder pushes once per second and VictoriaMetrics makes new data searchable about
@@ -127,7 +128,7 @@ Top to bottom:
 - GPU overview table (like rdmatop's device table): per GPU the average sent and received
   bandwidth, each also as a bar of the GPU's capacity (links x link max), the coverage (the share
   of the window with valid sampling intervals; below 100 % the numbers cover only part of the
-  window) and a wide trend of the sent bandwidth (the other columns have a fixed width, the trend
+  window; under 1 % is shown as <1 %) and a wide trend of the sent bandwidth (the other columns have a fixed width, the trend
   takes the rest). Bar colours as
   in rdmatop: under 5 % grey, 5-40 % dim green, 40-70 % green, 70-85 % yellow, from 85 % red.
 - Sent matrix: row GPU -> column GPU, coloured in the same five steps as the util bars, as shares

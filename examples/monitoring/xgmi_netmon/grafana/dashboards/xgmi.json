@@ -442,7 +442,7 @@
       "id": 25,
       "type": "stat",
       "title": "Last Data",
-      "description": "Live = the newest sample is at most 10 s old: the recorder is running and its data arrives. Otherwise the age in seconds (yellow from 10 s, red from 30 s): the recorder or the push stalled, or this is a recording and the number is how old it is. The age is that of the newest sample VictoriaMetrics can search, to now (the looked-up window is the hour before the end of the time range; none = no data). While recording it moves between about 2.6 and 4.4 s: the recorder pushes once per second and VictoriaMetrics makes new data searchable about every 2 s, which is why a number under 10 s is shown as Live. In the first seconds after a recording starts the tile shows no data: a new series takes about 6-10 s to become searchable in VictoriaMetrics (measured 8.9-10.3 s in six runs).",
+      "description": "Live = the newest sample is at most 10 s old: the recorder is running and its data arrives. Otherwise the age in seconds (yellow from 10 s, red from 30 s): the recorder or the push stalled, or this is a recording and the number is how old it is. The age is that of the newest sample VictoriaMetrics can search, to now (looked up over the hour or the selected range before its end, whichever is longer; none = no data). While recording it moves between about 2.6 and 4.4 s: the recorder pushes once per second and VictoriaMetrics makes new data searchable about every 2 s, which is why a number under 10 s is shown as Live. In the first seconds after a recording starts the tile shows no data: a new series takes about 6-10 s to become searchable in VictoriaMetrics (measured 8.9-10.3 s in six runs).",
       "datasource": {
         "type": "prometheus",
         "uid": "xgmi-vm"
@@ -463,7 +463,7 @@
           "instant": true,
           "range": false,
           "format": "time_series",
-          "expr": "now() - max(tlast_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[1h]))"
+          "expr": "(now() - max(tlast_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[1h]))) or (now() - max(tlast_over_time(xgmi_interval_seconds{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[${__range_ms}ms])))"
         }
       ],
       "fieldConfig": {
@@ -535,7 +535,7 @@
         "type": "prometheus",
         "uid": "xgmi-vm"
       },
-      "description": "Per GPU: average bandwidth sent / received over the averaging window (all links), each also as a share of the GPU's capacity (links x link max), the coverage and the trend of the sent bandwidth. Received = what the peers sent to the GPU (the receiver's own counter is not reliable when several flows arrive at once). Values are link bytes, not payload: a one-way copy shows 1.134x its payload. Coverage = the share of the window that has valid sampling intervals; below 100 % the numbers cover only part of the window. Util bars need the link capacity labels (data recorded with this version); older data shows no bar.",
+      "description": "Per GPU: average bandwidth sent / received over the averaging window (all links), each also as a share of the GPU's capacity (links x link max), the coverage and the trend of the sent bandwidth. Received = what the peers sent to the GPU (the receiver's own counter is not reliable when several flows arrive at once). Values are link bytes, not payload: a one-way copy shows 1.134x its payload. Coverage = the share of the window that has valid sampling intervals; below 100 % the numbers cover only part of the window (under 1 % is shown as <1 %, not 0 %). Util bars need the link capacity labels (data recorded with this version); older data shows no bar.",
       "gridPos": {
         "x": 0,
         "y": 4,
@@ -866,6 +866,23 @@
               {
                 "id": "custom.width",
                 "value": 100
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "range",
+                    "options": {
+                      "from": 1e-09,
+                      "to": 0.00999999,
+                      "result": {
+                        "text": "<1%",
+                        "color": "red",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
               }
             ]
           }
