@@ -118,7 +118,7 @@ set_target_properties(
              C_EXTENSIONS OFF
              BUILD_RPATH "$<TARGET_FILE_DIR:mori_cco>")
 target_include_directories(test_c_api PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(test_c_api PRIVATE hip::host ${CMAKE_DL_LIBS})
+target_link_libraries(test_c_api PRIVATE hip::host ${CMAKE_DL_LIBS} pthread)
 add_dependencies(test_c_api mori_cco)
 add_test(NAME cco_c_api COMMAND test_c_api 2)
 set_tests_properties(cco_c_api PROPERTIES TIMEOUT ${CCO_TEST_TIMEOUT_SECONDS})

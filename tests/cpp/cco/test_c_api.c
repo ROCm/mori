@@ -30,6 +30,7 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <hip/hip_runtime_api.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdint.h>
@@ -82,7 +83,7 @@ typedef struct {
   int count;
   int generation;
   int failed;
-  moriCcoUniqueId_t uids[2];  // rank 0's ids for the later comms
+  moriCcoUniqueId_t uids[4];  // rank 0's ids for the later comms
 } Barrier;
 
 static Barrier* g_bar;
@@ -422,6 +423,95 @@ static int teardown_orders(moriCcoComm_t comm, const hipMemAllocationProp* prop,
   return 0;
 }
 
+// Ranks release different windows, so their next imports land at different
+// slot offsets; the import's rendezvous must still meet.
+static int divergent_release(moriCcoComm_t comm, const hipMemAllocationProp* prop, size_t bytes) {
+  VmmBuf b[3];
+  moriCcoWindow_t w[3];
+  for (int i = 0; i < 2; i++) {
+    if (vmm_alloc(prop, bytes, &b[i])) return 1;
+    OK(api.windowImport(comm, b[i].ptr, bytes, 0, &w[i], NULL));
+  }
+  const int gone = g_rank % 2;
+  OK(api.windowRelease(w[gone]));
+  if (vmm_free(&b[gone])) return 1;
+  if (vmm_alloc(prop, bytes, &b[2])) return 1;
+  if (fill(b[2].ptr, 0x3000u + (uint32_t)g_rank, bytes)) return 1;
+  OK(api.windowImport(comm, b[2].ptr, bytes, 0, &w[2], NULL));
+  for (int p = 0; p < g_nranks; p++) {
+    void* peer = NULL;
+    OK(api.windowPeerPtr(w[2], p, &peer));
+    if (check(peer, 0x3000u + (uint32_t)p, bytes, "after divergent release")) return 1;
+  }
+  BARRIER();
+  for (int i = 0; i < 3; i++) {
+    if (i == gone) continue;
+    OK(api.windowRelease(w[i]));
+    if (vmm_free(&b[i])) return 1;
+  }
+  return 0;
+}
+
+// Two live comms that share rank 0, importing windows at the same time from two
+// threads of each rank. Their rendezvous must not cross.
+typedef struct {
+  int rank, idx, rc;
+  hipMemAllocationProp prop;
+  size_t bytes;
+} PairArg;
+
+static int pair_comm(PairArg* a) {
+  HIP(hipSetDevice(a->rank));
+  moriCcoCommConfig_t cfg = MORI_CCO_COMM_CONFIG_INIT;
+  cfg.perRankVaBytes = (size_t)4 << 30;
+  moriCcoComm_t comm = NULL;
+  OK(api.commCreate(&g_bar->uids[2 + a->idx], g_nranks, a->rank, &cfg, &comm));
+  for (int i = 0; i < 16; i++) {
+    const uint32_t tag = 0x40000000u | ((uint32_t)a->idx << 16) | ((uint32_t)i << 8);
+    VmmBuf b;
+    moriCcoWindow_t w = NULL;
+    if (vmm_alloc(&a->prop, a->bytes, &b)) return 1;
+    if (fill(b.ptr, tag | (uint32_t)a->rank, a->bytes)) return 1;
+    OK(api.windowImport(comm, b.ptr, a->bytes, 0, &w, NULL));
+    for (int p = 0; p < g_nranks; p++) {
+      void* peer = NULL;
+      OK(api.windowPeerPtr(w, p, &peer));
+      if (check(peer, tag | (uint32_t)p, a->bytes, "comm pair")) return 1;
+    }
+    OK(api.windowRelease(w));
+    if (vmm_free(&b)) return 1;
+  }
+  OK(api.commDestroy(comm));
+  return 0;
+}
+
+static void* pair_thread(void* p) {
+  PairArg* a = (PairArg*)p;
+  a->rc = pair_comm(a);
+  return NULL;
+}
+
+static int comm_pair(int rank, const hipMemAllocationProp* prop, size_t bytes) {
+  if (rank == 0) {
+    OK(api.getUniqueId(&g_bar->uids[2]));
+    OK(api.getUniqueId(&g_bar->uids[3]));
+  }
+  BARRIER();
+  PairArg args[2];
+  pthread_t threads[2];
+  for (int t = 0; t < 2; t++) {
+    args[t].rank = rank;
+    args[t].idx = t;
+    args[t].rc = 1;
+    args[t].prop = *prop;
+    args[t].bytes = bytes;
+    if (pthread_create(&threads[t], NULL, pair_thread, &args[t]) != 0) FAIL("pthread_create");
+  }
+  for (int t = 0; t < 2; t++) pthread_join(threads[t], NULL);
+  if (args[0].rc || args[1].rc) FAIL("comm pair: thread rc %d %d", args[0].rc, args[1].rc);
+  return 0;
+}
+
 static int run_rank(int rank, int nranks, const moriCcoUniqueId_t* uid) {
   g_rank = rank;
   HIP(hipSetDevice(rank));
@@ -587,7 +677,7 @@ static int run_rank(int rank, int nranks, const moriCcoUniqueId_t* uid) {
     FAIL("devCommDestroy took the caller's HIP error");
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.devCommDestroy(comm, dev));
 
-  if (teardown_orders(comm, &prop, bytes)) return 1;
+  if (teardown_orders(comm, &prop, bytes) || divergent_release(comm, &prop, bytes)) return 1;
 
   // The owner lets go of its handle first, then the window.
   BARRIER();
@@ -607,7 +697,7 @@ static int run_rank(int rank, int nranks, const moriCcoUniqueId_t* uid) {
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.windowRelease(win2));
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.devCommDestroy(comm, dev2));
 
-  if (default_comms(rank, nranks)) return 1;
+  if (default_comms(rank, nranks) || comm_pair(rank, &prop, bytes)) return 1;
 
   size_t freeAfter = 0;
   HIP(hipMemGetInfo(&freeAfter, &total));
