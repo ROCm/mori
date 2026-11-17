@@ -906,6 +906,8 @@ struct ccoComm {
       ccoFabricHandle_t fabricHandle;
     };
     bool isFabric{false};
+    // False when the runtime closes shareFd itself at the last hipMemRelease.
+    bool ownsShareFd{true};
     size_t slotOffset{0};
     size_t size{0};
     // Key pointer minus the mapping start: nonzero only for an import from inside an allocation.

@@ -492,6 +492,38 @@ static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
   return hipSuccess;
 }
 
+// ROCm 7.14 returns one exported fd per allocation and closes it at the last release (an early
+// close strands the memory); ROCm 10 returns a new caller-owned fd per export. Tell them apart.
+static bool CcoRuntimeOwnsExportedFd(int hipDev) {
+  static std::once_flag once;
+  static bool owned = false;
+  std::call_once(once, [hipDev] {
+    hipMemAllocationProp prop = {};
+    prop.type = hipMemAllocationTypePinned;
+    prop.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
+    prop.location.type = hipMemLocationTypeDevice;
+    prop.location.id = hipDev;
+    vmmProcessLock vmmLock;
+    size_t gran = 0;
+    hipMemGenericAllocationHandle_t h = 0;
+    if (hipMemGetAllocationGranularity(&gran, &prop, hipMemAllocationGranularityMinimum) ==
+            hipSuccess &&
+        hipMemCreate(&h, gran, &prop, 0) == hipSuccess) {
+      int a = -1, b = -1;
+      (void)hipMemExportToShareableHandle(&a, h, hipMemHandleTypePosixFileDescriptor, 0);
+      (void)hipMemExportToShareableHandle(&b, h, hipMemHandleTypePosixFileDescriptor, 0);
+      owned = a >= 0 && a == b;
+      if (!owned) {
+        if (a >= 0) close(a);
+        if (b >= 0) close(b);
+      }
+      (void)hipMemRelease(h);
+    }
+    (void)hipGetLastError();
+  });
+  return owned;
+}
+
 // Warn when the kernel lacks CONFIG_PCI_P2PDMA: a peer window import is then pinned in
 // system memory instead of mapped peer-to-peer, and KFD may keep every rank's queues
 // evicted. p2pdma.c is built only with that option, so its symbol in
@@ -845,7 +877,7 @@ int ccoCommDestroy(ccoComm* comm) {
     vmmProcessLock vmmLock;
     (void)hipMemUnmap(static_cast<char*>(ptr) - meta.dataOffset, meta.size);
     (void)hipMemRelease(meta.physHandle);
-    if (!meta.isFabric && meta.shareFd >= 0) close(meta.shareFd);
+    if (!meta.isFabric && meta.shareFd >= 0 && meta.ownsShareFd) close(meta.shareFd);
   }
   comm->allocTable.clear();
 
@@ -985,6 +1017,7 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
                                         hipMemHandleTypeFabricCompat, 0);
   } else {
     meta.shareFd = -1;
+    meta.ownsShareFd = !CcoRuntimeOwnsExportedFd(comm->hipDev);
     err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&meta.shareFd), physHandle,
                                         hipMemHandleTypePosixFileDescriptor, 0);
   }
@@ -1137,6 +1170,7 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
                                         hipMemHandleTypeFabricCompat, 0);
   } else {
     meta.shareFd = -1;
+    meta.ownsShareFd = !CcoRuntimeOwnsExportedFd(comm->hipDev);
     err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&meta.shareFd), physHandle,
                                         hipMemHandleTypePosixFileDescriptor, 0);
   }
@@ -1208,7 +1242,7 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
     }
   }
 
-  if (!meta.isFabric && meta.shareFd >= 0) close(meta.shareFd);
+  if (!meta.isFabric && meta.shareFd >= 0 && meta.ownsShareFd) close(meta.shareFd);
 
   return 0;
 }
