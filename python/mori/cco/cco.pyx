@@ -8,7 +8,7 @@ from libc.stddef cimport size_t
 from libc.string cimport memcpy
 
 from .cco cimport (
-    ccoComm, ccoUniqueId, ccoDevCommRequirements, ccoDevComm, ccoWindow_t,
+    ccoComm, ccoUniqueId, ccoCommConfig, ccoDevCommRequirements, ccoDevComm, ccoWindow_t,
     ccoGdaConnectionType,
     CCO_API_MAGIC, CCO_API_VERSION,
     CCO_GDA_CONNECTION_NONE, CCO_GDA_CONNECTION_FULL,
@@ -264,18 +264,28 @@ def get_unique_id():
     return UniqueId.create()
 
 
-def comm_create(UniqueId uid, int n_ranks, int rank, size_t per_rank_vmm_size):
+def comm_create(UniqueId uid, int n_ranks, int rank, size_t per_rank_vmm_size,
+                bint cpu_affinity=True, bint lsa_only=False):
     """
     Create a communicator.  All ranks call with the same uid (broadcast from
     rank 0) and their own rank index.
 
     per_rank_vmm_size: bytes of flat VA reserved per rank for symmetric memory.
+    cpu_affinity: pin the calling thread to its GPU's NUMA-local CPU slice.
+    lsa_only: open no RDMA device and read no GPU-NIC topology; only LSA-team
+        peers are reachable.  Must match on all ranks.
     """
     cdef Comm comm = Comm.__new__(Comm)
     cdef ccoComm* out_comm = NULL
+    cdef ccoCommConfig config
     cdef int ret
+    config.size = sizeof(ccoCommConfig)
+    config.magic = CCO_API_MAGIC
+    config.version = CCO_API_VERSION
+    config.cpuAffinity = 1 if cpu_affinity else 0
+    config.lsaOnly = 1 if lsa_only else 0
     with nogil:
-        ret = ccoCommCreate(uid._uid, n_ranks, rank, per_rank_vmm_size, &out_comm)
+        ret = ccoCommCreate(uid._uid, n_ranks, rank, per_rank_vmm_size, &config, &out_comm)
     if ret != 0:
         raise RuntimeError(f"ccoCommCreate failed: {ret}")
     comm._ptr = out_comm

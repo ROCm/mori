@@ -71,9 +71,14 @@ struct PeerCapabilities {
   bool canRDMA{false};      // NIC reachable for this Context (host or cross)
 };
 
+struct ContextOptions {
+  // false: open no NIC and skip GPU-NIC matching; canRDMA is false for every peer.
+  bool rdma{true};
+};
+
 class Context {
  public:
-  Context(BootstrapNetwork& bootNet);
+  Context(BootstrapNetwork& bootNet, const ContextOptions& opts = {});
   ~Context();
 
   int LocalRank() const { return bootNet.GetLocalRank(); }
@@ -185,6 +190,8 @@ class Context {
  private:
   void CollectHostNames();
   void InitializeTopologyAndTransports();
+  // Opens the RDMA devices and picks this rank's NIC; returns its port (-1 if none).
+  int SelectRdmaDevice(int rankInNode);
 
   // Apply Context's built-in policy to derive a single TransportType from a
   // PeerCapabilities entry. Preference: P2P > SDMA > RDMA. Self always P2P.
@@ -208,6 +215,7 @@ class Context {
   bool p2pDisabled{false};
   bool proxyEnabled{false};
   bool railOnly{false};
+  bool rdmaEnabled{true};
   std::string myHostname;
   std::vector<PeerInfo> peerInfos;
   std::vector<PeerCapabilities> peerCaps;

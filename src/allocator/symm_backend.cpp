@@ -676,8 +676,12 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     auto group = std::make_shared<CcoGroup>();
     group->rank = rank;
     group->world_size = world_size;
-    MORI_CCO_CHECK(
-        mori::cco::ccoCommCreate(ids[0], world_size, rank, PerRankVmmSize(), &group->comm));
+    // Keep the caller's CPU affinity; load/store peers need no NIC or GPU-NIC topology.
+    mori::cco::ccoCommConfig config = CCO_COMM_CONFIG_INITIALIZER;
+    config.cpuAffinity = 0;
+    config.lsaOnly = 1;
+    MORI_CCO_CHECK(mori::cco::ccoCommCreate(ids[0], world_size, rank, PerRankVmmSize(), &config,
+                                            &group->comm));
     // Mark this incarnation, after the create so a failure leaves nothing behind.
     store->set(kGroupMarker, std::vector<uint8_t>{1});
     // ccoCommCreate leaves a tolerated probe failure latched in HIP's per-thread
