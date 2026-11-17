@@ -55,8 +55,8 @@ xgmi-netmon  import /shared/exp42/*     # with its option for the VictoriaMetric
 ```
 
 Both tools can also record into the same directory (`-o /shared/exp42/{host}`, so the default
-experiment name is the same): each one writes and refuses only its own files (ainic-netmon:
-`.lock`, `meta.json`, `<netdev>.<source>.bin`; xgmi-netmon: `xgmi_*`), and each importer reads
+experiment name is the same): each tool's files start with its own prefix (`nic_*`,
+`xgmi_*`), each refuses a directory only if its own files are there, and each importer reads
 only its own. `{host}` is the full host name in both (`--host-id` to override).
 
 ## Live view while recording
@@ -68,7 +68,7 @@ ainic-netmon record -o /shared/exp42/{host} --push http://127.0.0.1:8428
 - The recorder prints two dashboard links (last 5 minutes, refreshing every 2 s). Each node
   pushes its own NICs; nodes recording into the same experiment appear together.
 - The recording itself is never affected: if VictoriaMetrics is slow or goes away, points are
-  dropped and counted (`push` in `meta.json`, warnings on stderr), and pushing resumes when it
+  dropped and counted (`push` in `nic_meta.json`, warnings on stderr), and pushing resumes when it
   is back. The recorder refuses to start if VictoriaMetrics is unreachable, or if this host
   already pushed to this experiment.
 - Live numbers are an online approximation of the offline rules (slow samples and the

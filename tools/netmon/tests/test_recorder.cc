@@ -171,7 +171,7 @@ ssize_t FailAfterBudget(int fd, const void* p, size_t n) {
   if (static_cast<long>(n) > left) n = static_cast<size_t>(left);  // short write, then ENOSPC
   return ::write(fd, p, n);
 }
-// Blocks only the second write to meta.json.tmp (the final meta); records and the initial
+// Blocks only the second write to nic_meta.json.tmp (the final meta); records and the initial
 // meta are written normally.
 std::atomic<int> g_meta_writes{0};
 ssize_t BlockFinalMeta(int fd, const void* p, size_t n) {
@@ -361,12 +361,12 @@ TEST(RecorderNormalRun) {
   auto dir = tmp.path() + "/run";  // does not exist yet: created with parents
   int code = RunCase("normal", dir);
   CHECK_EQ(code, 0);
-  std::string meta = ReadAll(dir + "/meta.json");
+  std::string meta = ReadAll(dir + "/nic_meta.json");
   CHECK(meta.find("\"status\": \"complete\"") != std::string::npos);
   CHECK(meta.find("\"format_version\": 2") != std::string::npos);
-  CHECK(Exists(dir + "/.lock"));
-  CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
-  CheckRecordFile(dir + "/fake1.ipc.bin", 7, true);
+  CHECK(Exists(dir + "/nic.lock"));
+  CheckRecordFile(dir + "/nic_fake0.rdma.bin", 7, true);
+  CheckRecordFile(dir + "/nic_fake1.ipc.bin", 7, true);
 }
 
 TEST(RecorderSigintIsInterrupted) {
@@ -374,8 +374,8 @@ TEST(RecorderSigintIsInterrupted) {
   auto dir = tmp.path() + "/run";
   int code = RunCase("until_signal", dir, 400);
   CHECK_EQ(code, 0);
-  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"interrupted\"") != std::string::npos);
-  CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
+  CHECK(ReadAll(dir + "/nic_meta.json").find("\"status\": \"interrupted\"") != std::string::npos);
+  CheckRecordFile(dir + "/nic_fake0.rdma.bin", 7, true);
 }
 
 TEST(RecorderStuckSamplerIsAbandoned) {
@@ -383,11 +383,11 @@ TEST(RecorderStuckSamplerIsAbandoned) {
   auto dir = tmp.path() + "/run";
   int code = RunCase("stuck_sampler", dir);
   CHECK_EQ(code, 4);
-  std::string meta = ReadAll(dir + "/meta.json");
-  CHECK(meta.find("\"abandoned\": [\"fake1.ipc.bin\"]") != std::string::npos);
+  std::string meta = ReadAll(dir + "/nic_meta.json");
+  CHECK(meta.find("\"abandoned\": [\"nic_fake1.ipc.bin\"]") != std::string::npos);
   CHECK(meta.find("\"status\": \"complete\"") != std::string::npos);
-  CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
-  CheckRecordFile(dir + "/fake1.ipc.bin", 7, false);
+  CheckRecordFile(dir + "/nic_fake0.rdma.bin", 7, true);
+  CheckRecordFile(dir + "/nic_fake1.ipc.bin", 7, false);
 }
 
 TEST(RecorderStuckProbeLeavesNothing) {
@@ -403,9 +403,9 @@ TEST(RecorderOptionalProbeFailureDegrades) {
   auto dir = tmp.path() + "/run";
   int code = RunCase("optional_probe_fails", dir);
   CHECK_EQ(code, 0);
-  std::string meta = ReadAll(dir + "/meta.json");
+  std::string meta = ReadAll(dir + "/nic_meta.json");
   CHECK(meta.find("fake probe failure") != std::string::npos);  // listed under degraded
-  CHECK(!Exists(dir + "/fake1.ipc.bin"));
+  CHECK(!Exists(dir + "/nic_fake1.ipc.bin"));
 }
 
 TEST(RecorderRequiredProbeFailureAborts) {
@@ -426,12 +426,14 @@ TEST(RecorderSharesTheDirectoryWithOtherTools) {
   int code = RunCase("short", dir);
   CHECK_EQ(code, 0);
   for (const char* f : foreign) CHECK(ReadAll(dir + "/" + f) == std::string("keep ") + f);
-  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"complete\"") != std::string::npos);
-  CHECK(Exists(dir + "/fake0.rdma.bin"));
+  CHECK(ReadAll(dir + "/nic_meta.json").find("\"status\": \"complete\"") != std::string::npos);
+  CHECK(Exists(dir + "/nic_fake0.rdma.bin"));
 }
 
 TEST(RecorderRefusesADirectoryWithItsOwnFiles) {
-  for (const char* own : {"meta.json", ".lock", "eth2.rdma.bin", "x.ethtool.bin"}) {
+  for (const char* own : {"nic_meta.json", "nic.lock", "nic_eth2.rdma.bin",
+                          // earlier recordings (before the nic_ prefix)
+                          "meta.json", ".lock", "eth2.rdma.bin", "x.ethtool.bin"}) {
     TempDir tmp;
     auto dir = tmp.path();
     std::ofstream(dir + "/" + own) << "keep";
@@ -440,8 +442,9 @@ TEST(RecorderRefusesADirectoryWithItsOwnFiles) {
     CHECK_EQ(code, 1);
     CHECK(ReadAll(dir + "/" + own) == "keep");
     CHECK(ReadAll(dir + "/xgmi_meta.json") == "keep");
-    CHECK(!Exists(dir + "/fake0.rdma.bin"));
+    CHECK(!Exists(dir + "/nic_fake0.rdma.bin"));
   }
+  CHECK(IsRecordingFile("nic_eth2.ipc.bin") && IsRecordingFile("nic_meta.json.tmp"));
   CHECK(IsRecordingFile("eth2.ipc.bin") && IsRecordingFile("meta.json.tmp"));
   CHECK(!IsRecordingFile("xgmi_gpu0.bin") && !IsRecordingFile("xgmi_meta.json"));
   CHECK(!IsRecordingFile("xgmi.lock") && !IsRecordingFile(".rdma.bin"));
@@ -455,7 +458,7 @@ TEST(RecorderFailureInASharedDirectoryKeepsOthersFiles) {
   int code = RunCase("required_probe_fails", dir);
   CHECK_EQ(code, 1);
   CHECK(ReadAll(dir + "/xgmi_gpu0.bin") == "keep");
-  CHECK(!Exists(dir + "/.lock") && !Exists(dir + "/meta.json"));
+  CHECK(!Exists(dir + "/nic.lock") && !Exists(dir + "/nic_meta.json"));
 }
 
 TEST(RecorderWriteFailure) {
@@ -463,10 +466,10 @@ TEST(RecorderWriteFailure) {
   auto dir = tmp.path() + "/run";
   int code = RunCase("enospc", dir);
   CHECK_EQ(code, 3);
-  CheckRecordFile(dir + "/fake0.rdma.bin", 7, false);  // truncated to whole records
+  CheckRecordFile(dir + "/nic_fake0.rdma.bin", 7, false);  // truncated to whole records
   // The final meta cannot be written either (no space): it stays "running", which the
   // report treats as an unfinished recording.
-  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"running\"") != std::string::npos);
+  CHECK(ReadAll(dir + "/nic_meta.json").find("\"status\": \"running\"") != std::string::npos);
 }
 
 TEST(RecorderWriteFailureWithAbandonedThread) {
@@ -501,8 +504,8 @@ TEST(RecorderFinalMetaBlocks) {
   int code = RunCase("final_meta_blocks", dir);
   CHECK_EQ(code, 3);
   // The records were all written; only the final meta is missing (still "running").
-  CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
-  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"running\"") != std::string::npos);
+  CheckRecordFile(dir + "/nic_fake0.rdma.bin", 7, true);
+  CHECK(ReadAll(dir + "/nic_meta.json").find("\"status\": \"running\"") != std::string::npos);
 }
 
 TEST(RecorderAbandonedExitWithFullStderr) {
@@ -514,7 +517,7 @@ TEST(RecorderAbandonedExitWithFullStderr) {
   int code = RunCase("stuck_sampler_full_stderr", dir, -1, true);
   CHECK_EQ(code, 4);
   CHECK(MonoNs() - t0 < 20000000000ull);
-  CHECK(ReadAll(dir + "/meta.json").find("\"abandoned\": [\"fake1.ipc.bin\"]") !=
+  CHECK(ReadAll(dir + "/nic_meta.json").find("\"abandoned\": [\"nic_fake1.ipc.bin\"]") !=
         std::string::npos);
 }
 
@@ -535,12 +538,12 @@ TEST(RecorderPushNormal) {
   auto dir = tmp.path() + "/run";
   int code = RunCase("push_ok", dir);
   CHECK_EQ(code, 0);
-  const std::string meta = ReadAll(dir + "/meta.json");
+  const std::string meta = ReadAll(dir + "/nic_meta.json");
   CHECK(meta.find("\"status\": \"complete\"") != std::string::npos);
   CHECK(meta.find("\"push\": {") != std::string::npos);
   CHECK(meta.find("\"failed_points\": 0") != std::string::npos);
   CHECK(meta.find("\"abandoned\": false") != std::string::npos);
-  CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
+  CheckRecordFile(dir + "/nic_fake0.rdma.bin", 7, true);
 }
 
 TEST(RecorderPushUnreachableFailsAtStartup) {
@@ -560,10 +563,10 @@ TEST(RecorderPushBlackHoleDoesNotChangeTheRecording) {
   int code = RunCase("push_black_hole", dir);
   CHECK_EQ(code, 0);
   CHECK(MonoNs() - t0 < 15000000000ull);
-  const std::string meta = ReadAll(dir + "/meta.json");
+  const std::string meta = ReadAll(dir + "/nic_meta.json");
   CHECK(meta.find("\"status\": \"complete\"") != std::string::npos);
   CHECK(meta.find("\"push\": {") != std::string::npos);
-  CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
+  CheckRecordFile(dir + "/nic_fake0.rdma.bin", 7, true);
 }
 
 TEST(RecorderPushBlackHoleWithFullStderr) {
@@ -573,7 +576,7 @@ TEST(RecorderPushBlackHoleWithFullStderr) {
   int code = RunCase("push_black_hole_full_stderr", dir, -1, true);
   CHECK_EQ(code, 0);
   CHECK(MonoNs() - t0 < 20000000000ull);
-  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"complete\"") != std::string::npos);
+  CHECK(ReadAll(dir + "/nic_meta.json").find("\"status\": \"complete\"") != std::string::npos);
 }
 
 TEST(RecorderPushWaitHasItsOwnBudget) {
@@ -583,7 +586,7 @@ TEST(RecorderPushWaitHasItsOwnBudget) {
   auto dir = tmp.path() + "/run";
   int code = RunCase("push_black_hole_slow_meta", dir);
   CHECK_EQ(code, 0);
-  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"complete\"") != std::string::npos);
+  CHECK(ReadAll(dir + "/nic_meta.json").find("\"status\": \"complete\"") != std::string::npos);
 }
 
 TEST(RecorderPushNormalWithFullStderr) {
@@ -595,7 +598,7 @@ TEST(RecorderPushNormalWithFullStderr) {
   int code = RunCase("push_ok_full_stderr", dir, -1, true);
   CHECK_EQ(code, 0);
   CHECK(MonoNs() - t0 < 20000000000ull);
-  CHECK(ReadAll(dir + "/meta.json").find("\"status\": \"complete\"") != std::string::npos);
+  CHECK(ReadAll(dir + "/nic_meta.json").find("\"status\": \"complete\"") != std::string::npos);
 }
 
 TEST(RecorderPushExporterExceptionOnlyStopsThePush) {
@@ -603,8 +606,8 @@ TEST(RecorderPushExporterExceptionOnlyStopsThePush) {
   auto dir = tmp.path() + "/run";
   int code = RunCase("push_exporter_throws", dir);
   CHECK_EQ(code, 0);
-  const std::string meta = ReadAll(dir + "/meta.json");
+  const std::string meta = ReadAll(dir + "/nic_meta.json");
   CHECK(meta.find("\"status\": \"complete\"") != std::string::npos);
   CHECK(meta.find("internal error") != std::string::npos);
-  CheckRecordFile(dir + "/fake0.rdma.bin", 7, true);
+  CheckRecordFile(dir + "/nic_fake0.rdma.bin", 7, true);
 }

@@ -23,7 +23,8 @@
 """ainic-netmon-report: offline report (HTML) and CSV export for ainic-netmon recordings.
 
 Reads recording directories written by `ainic-netmon record` (format_version 2):
-  meta.json + <netdev>.<source>.bin, records of little-endian u64
+  nic_meta.json + nic_<netdev>.<source>.bin (earlier recordings: meta.json +
+  <netdev>.<source>.bin), records of little-endian u64
   [t0_mono_ns, t1_mono_ns, real_ns, real_err_ns, values...].
 
 Rules (tools/netmon README, design §7.4 / §9):
@@ -72,6 +73,7 @@ CLOCK_STEP_NS = 1_000_000
 LOWRES_FACTOR = 3.0
 PEAK_WINDOW_NS = 10_000_000
 
+META_FILE = "nic_meta.json"  # the recorder's file names all start with nic_
 RDMA_TX, RDMA_RX = "tx_rdma_ucast_bytes", "rx_rdma_ucast_bytes"
 # ethtool port statistics used where a NIC has no firmware IPC (e.g. a VM with a VF). The
 # firmware refreshes them only about every 5 s, so their rates are taken between refreshes:
@@ -152,7 +154,10 @@ class Stream:
 class Run:
     def __init__(self, run_dir):
         self.dir = run_dir
-        with open(os.path.join(run_dir, "meta.json")) as fh:
+        meta = os.path.join(run_dir, META_FILE)
+        if not os.path.exists(meta):  # recorded before the nic_ prefix
+            meta = os.path.join(run_dir, "meta.json")
+        with open(meta) as fh:
             self.meta = json.load(fh)
         if self.meta.get("format_version") != 2:
             raise SystemExit(

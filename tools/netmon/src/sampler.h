@@ -89,7 +89,8 @@ struct Stream {
   bool ipc_unverified = false;  // ipc enabled on a firmware outside the verified list
   int cpu = -1;
 
-  std::string file() const { return netdev + "." + src->kind() + ".bin"; }
+  // nic_ prefix: other tools (xgmi-netmon: xgmi_*) can record into the same directory.
+  std::string file() const { return "nic_" + netdev + "." + src->kind() + ".bin"; }
   size_t record_words() const { return kRecordHeaderWords + src->names().size(); }
 
   // Probe result, guarded by Control::mu.

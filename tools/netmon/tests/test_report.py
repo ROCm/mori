@@ -95,6 +95,20 @@ class ReportTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
+    def test_nic_meta_file_name(self):
+        # Recordings name their metadata nic_meta.json (other tools share the directory);
+        # earlier ones meta.json. nic_meta.json wins when both exist.
+        t0, rtt, real, err, v = steady(20)
+        spec = {"netdev": "n0", "source": "rdma", "names": [R.RDMA_TX], "t0": t0, "rtt": rtt,
+                "real": real, "err": err, "values": v[:, None], "interval": 2 * MS}  # fmt: skip
+        d = self.tmp + "/run"
+        write_run(d, [spec])
+        os.rename(d + "/meta.json", d + "/" + R.META_FILE)
+        self.assertEqual(len(R.Run(d).stream("n0", "rdma").rec), 20)
+        with open(d + "/meta.json", "w") as fh:
+            fh.write("{not json")  # would fail if it were read
+        self.assertEqual(len(R.Run(d).stream("n0", "rdma").rec), 20)
+
     def one(self, t0, rtt, real, err, v, interval=2 * MS, name="x"):
         run = write_run(
             self.tmp + "/" + name,

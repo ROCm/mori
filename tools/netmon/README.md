@@ -89,7 +89,7 @@ Multi-node: run one recorder per node with a shared output path, e.g.
 ainic-netmon record -o /shared/exp42/{host} -d 120s     # on every node
 ```
 
-`--tag KEY=VALUE` stores free-form labels in `meta.json`; the tools do not interpret them.
+`--tag KEY=VALUE` stores free-form labels in `nic_meta.json`; the tools do not interpret them.
 
 `{host}` expands to the host id (hostname, or `--host-id`). Sampling is aligned to the
 wall-clock grid on every node; nodes need NTP/PTP for millisecond alignment across hosts.
@@ -105,7 +105,7 @@ ainic-netmon record -o /shared/exp42/{host} --push http://127.0.0.1:8428
 
 The push runs on its own thread and never slows the samplers or the writer: when
 VictoriaMetrics is slow or unreachable, points are dropped and counted (`push` in
-`meta.json`). Live values are an online approximation; afterwards
+`nic_meta.json`). Live values are an online approximation; afterwards
 `ainic-netmon-import --replace` replaces them with the offline report's exact numbers.
 
 ### Notes and limits
@@ -124,11 +124,11 @@ VictoriaMetrics is slow or unreachable, points are dropped and counted (`push` i
 ## Output format
 
 ```
-DIR/.lock                       created exclusively; pid, host, start time
-DIR/meta.json                   status (running|complete|interrupted|failed), host, NIC map,
+DIR/nic.lock                    created exclusively; pid, host, start time
+DIR/nic_meta.json               status (running|complete|interrupted|failed), host, NIC map,
                                 streams (file, source, interval, counter names), degraded
                                 sources, run statistics
-DIR/<netdev>.<source>.bin       fixed-size records of little-endian u64:
+DIR/nic_<netdev>.<source>.bin   fixed-size records of little-endian u64:
                                 [t0_mono_ns, t1_mono_ns, real_ns, real_err_ns, v0 .. v(n-1)]
 ```
 
@@ -136,9 +136,14 @@ DIR/<netdev>.<source>.bin       fixed-size records of little-endian u64:
 `t0`, and `real_err` is the time it took to read it (an error bound for wall-clock
 alignment). A recording killed mid-write may end with a partial record; readers drop it.
 
+Every file starts with `nic_`, so other tools can record into the same directory (xgmi-netmon
+writes `xgmi_*`); the recorder refuses a directory only if it already holds ainic-netmon files.
+Recordings made before the prefix (`.lock`, `meta.json`, `<netdev>.<source>.bin`) are still
+read.
+
 ```python
 import json, numpy as np
-m = json.load(open("DIR/meta.json")); s = m["streams"][0]
+m = json.load(open("DIR/nic_meta.json")); s = m["streams"][0]
 rec = np.memmap(f"DIR/{s['file']}", dtype="<u8", mode="r").reshape(-1, s["record_words"])
 tx = rec[:, 4 + s["names"].index("tx_rdma_ucast_bytes")]
 ```

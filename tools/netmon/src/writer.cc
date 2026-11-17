@@ -33,6 +33,9 @@
 namespace netmon {
 
 bool IsRecordingFile(const std::string& name) {
+  if (name == kLockFile || name == kMetaFile || name == std::string(kMetaFile) + ".tmp")
+    return true;
+  // names of recordings made before the nic_ prefix
   if (name == ".lock" || name == "meta.json" || name == "meta.json.tmp") return true;
   for (const char* src : {".rdma.bin", ".ipc.bin", ".ethtool.bin"}) {
     const size_t n = strlen(src);
@@ -202,7 +205,7 @@ Status Writer::DoPrepare() {
                            "); refusing to overwrite it");
     }
   }
-  const std::string lock = dir_ + "/.lock";
+  const std::string lock = dir_ + "/" + kLockFile;
   int fd = open(lock.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
   if (fd < 0) {
     // Another recorder got here first: do not touch anything it owns.
@@ -320,7 +323,7 @@ void Writer::Summary(const Batch& b) {
 }
 
 Status Writer::WriteMetaAtomic(const std::string& text) {
-  const std::string tmp = dir_ + "/meta.json.tmp";
+  const std::string tmp = dir_ + "/" + kMetaFile + ".tmp";
   int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd < 0) return Status::Errno("create " + tmp, errno);
   Status st = WriteAll(fd, text.data(), text.size());
@@ -329,8 +332,8 @@ Status Writer::WriteMetaAtomic(const std::string& text) {
     unlink(tmp.c_str());
     return st;
   }
-  if (rename(tmp.c_str(), (dir_ + "/meta.json").c_str()) != 0) {
-    st = Status::Errno("rename meta.json", errno);
+  if (rename(tmp.c_str(), (dir_ + "/" + kMetaFile).c_str()) != 0) {
+    st = Status::Errno(std::string("rename ") + kMetaFile, errno);
     unlink(tmp.c_str());
   }
   return st;
@@ -366,8 +369,8 @@ void Writer::DoAbort() {
     if (fds_[i] >= 0) close(fds_[i]);
     if (created_files_[i]) unlink((dir_ + "/" + streams_[i].file).c_str());
   }
-  if (created_meta_) unlink((dir_ + "/meta.json").c_str());
-  if (created_lock_) unlink((dir_ + "/.lock").c_str());
+  if (created_meta_) unlink((dir_ + "/" + kMetaFile).c_str());
+  if (created_lock_) unlink((dir_ + "/" + kLockFile).c_str());
   if (created_dir_) rmdir(dir_.c_str());  // only removes it if it is still empty
 }
 
