@@ -61,14 +61,27 @@ namespace {
 // hsaKmtAllocMemory leaked the first block, hsaKmtFreeMemory double-freed,
 // hsaKmtCreateQueueExt asked for a second queue, and the code printed was the
 // RETRY's, which need not equal the one that actually failed.
-#define CHECK_HSAKMT_SUCCESS(call, msg)                                                   \
-  do {                                                                                    \
-    const HSAKMT_STATUS _st = (call);                                                     \
-    if (_st != HSAKMT_STATUS_SUCCESS) {                                                   \
-      std::cout << "ERROR code: " << std::dec << _st << " " << msg << " (File: " __FILE__ \
-                << ", Line: " << __LINE__ << ")" << std::endl;                            \
-      exit(EXIT_FAILURE);                                                                 \
-    }                                                                                     \
+// Throws, so a caller such as cco's devCommCreate can return the error.
+#define CHECK_HSAKMT_SUCCESS(call, msg)                                                           \
+  do {                                                                                            \
+    const HSAKMT_STATUS _st = (call);                                                             \
+    if (_st != HSAKMT_STATUS_SUCCESS) {                                                           \
+      throw std::runtime_error("SDMA: " #call " failed with code " + std::to_string(_st) + ": " + \
+                               (msg));                                                            \
+    }                                                                                             \
+  } while (0)
+
+#define CHECK_HIP_OR_THROW(cmd)                                                                 \
+  do {                                                                                          \
+    if (const hipError_t _e = (cmd); _e != hipSuccess) {                                        \
+      throw std::runtime_error(std::string("SDMA: " #cmd " failed: ") + hipGetErrorString(_e)); \
+    }                                                                                           \
+  } while (0)
+
+// For teardown, which must not throw: logs and goes on.
+#define WARN_IF_FAILED(ok, what)                                \
+  do {                                                          \
+    if (!(ok)) MORI_APP_WARN("SDMA teardown: {} failed", what); \
   } while (0)
 
 // MI308X xGMI SDMA engines; 0 is the general engine and keeps loopback and host
@@ -126,7 +139,7 @@ uint32_t getBusId(int deviceId, uint32_t* pdomain = nullptr) {
   // format. Still need to allocate proper space in case PCI domain goes
   // higher.
   char busId[] = "00000000:00:00.0";
-  CHECK_HIP_ERROR(hipDeviceGetPCIBusId(busId, sizeof(busId), deviceId));
+  CHECK_HIP_OR_THROW(hipDeviceGetPCIBusId(busId, sizeof(busId), deviceId));
   uint32_t domain = 0, bus = 0, dev = 0, func = 0;
   if (std::sscanf(busId, "%x:%x:%x.%x", &domain, &bus, &dev, &func) != 4) {
     MORI_APP_ERROR("Failed to parse PCI bus ID for device {}", deviceId);
@@ -224,15 +237,14 @@ uint32_t hsakmtNodeForKfdNode(int node) {
         return n;
     }
   }
-  // Exit like a failed hsaKmt call in SdmaQueue: shmem would catch an exception
-  // and blame the network, and cco cannot propagate one into Python.
-  MORI_APP_ERROR("SDMA: no libhsakmt node has the gpu_id of KFD node {}", node);
-  exit(EXIT_FAILURE);
+  throw std::runtime_error("SDMA: no libhsakmt node has the gpu_id of KFD node " +
+                           std::to_string(node));
 }
 
 }  // namespace
 
-SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
+SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId)
+    : cachedWptr_(nullptr), committedWptr_(nullptr), queueBuffer_(nullptr), deviceHandle_(nullptr) {
   // Allocate SDMA queue buffer on device side, requires ExecuteAccess
   HsaMemFlags memFlags = {};
   memFlags.ui32.NonPaged = 1;
@@ -241,57 +253,67 @@ SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
   memFlags.ui32.NoNUMABind = 1;
   memFlags.ui32.ExecuteAccess = 1;
   memFlags.ui32.Uncached = 1;
-
-  // std::cout << "Allocating SDMA Queue Buffer for device: " << hsakmtNodeId << std::endl <<
-  // std::flush;
-
-  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
-                       "Failed");
-  CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL), "Failed");
-
-  // Create SDMA Queue
-  // TODO needed here?
   memset(&queue_, 0, sizeof(HsaQueueResource));
 
-  CHECK_HSAKMT_SUCCESS(
-      hsaKmtCreateQueueExt(hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
-                           engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
-      "Failed");
+  // A failed step releases what the earlier ones made, then throws.
+  bool mapped = false, created = false;
+  try {
+    CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
+                         "queue buffer");
+    CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL), "queue buffer");
+    mapped = true;
+    // KFD refuses a queue when the engine's slots are taken.
+    CHECK_HSAKMT_SUCCESS(hsaKmtCreateQueueExt(hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100,
+                                              HSA_QUEUE_PRIORITY_MAXIMUM, engineId, queueBuffer_,
+                                              SDMA_QUEUE_SIZE, nullptr, &queue_),
+                         "SDMA engine " + std::to_string(engineId));
+    created = true;
 
-  // Populate Device Handle
-  // TODO uncached
-  CHECK_HIP_ERROR(hipMalloc(&deviceHandle_, sizeof(SdmaQueueDeviceHandle)));
-  CHECK_HIP_ERROR(
-      hipExtMallocWithFlags((void**)&cachedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
-  CHECK_HIP_ERROR(
-      hipExtMallocWithFlags((void**)&committedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
+    CHECK_HIP_OR_THROW(hipMalloc(&deviceHandle_, sizeof(SdmaQueueDeviceHandle)));
+    CHECK_HIP_OR_THROW(
+        hipExtMallocWithFlags((void**)&cachedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
+    CHECK_HIP_OR_THROW(
+        hipExtMallocWithFlags((void**)&committedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
 
-  uint64_t cachedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
-  uint64_t committedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
-  SdmaQueueDeviceHandle handle = {
-      .queueBuf = static_cast<uint32_t*>(queueBuffer_),
-      .rptr = queue_.Queue_read_ptr_aql,
-      .wptr = queue_.Queue_write_ptr_aql,
-      .doorbell = queue_.Queue_DoorBell_aql,
-      .cachedWptr = cachedWptr_,
-      .committedWptr = committedWptr_,
-      .cachedHwReadIndex = (uint64_t)*(queue_.Queue_read_ptr_aql),
-  };
+    uint64_t cachedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
+    uint64_t committedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
+    SdmaQueueDeviceHandle handle = {
+        .queueBuf = static_cast<uint32_t*>(queueBuffer_),
+        .rptr = queue_.Queue_read_ptr_aql,
+        .wptr = queue_.Queue_write_ptr_aql,
+        .doorbell = queue_.Queue_DoorBell_aql,
+        .cachedWptr = cachedWptr_,
+        .committedWptr = committedWptr_,
+        .cachedHwReadIndex = (uint64_t)*(queue_.Queue_read_ptr_aql),
+    };
 
-  CHECK_HIP_ERROR(
-      hipMemcpy(deviceHandle_, &handle, sizeof(SdmaQueueDeviceHandle), hipMemcpyHostToDevice));
-  CHECK_HIP_ERROR(hipMemcpy(cachedWptr_, &cachedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
-  CHECK_HIP_ERROR(
-      hipMemcpy(committedWptr_, &committedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
+    CHECK_HIP_OR_THROW(
+        hipMemcpy(deviceHandle_, &handle, sizeof(SdmaQueueDeviceHandle), hipMemcpyHostToDevice));
+    CHECK_HIP_OR_THROW(
+        hipMemcpy(cachedWptr_, &cachedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
+    CHECK_HIP_OR_THROW(
+        hipMemcpy(committedWptr_, &committedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
+  } catch (...) {
+    if (created) (void)hsaKmtDestroyQueue(queue_.QueueId);
+    (void)hipFree(deviceHandle_);
+    (void)hipFree(cachedWptr_);
+    (void)hipFree(committedWptr_);
+    if (mapped) (void)hsaKmtUnmapMemoryToGPU(queueBuffer_);
+    if (queueBuffer_) (void)hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE);
+    (void)hipGetLastError();
+    throw;
+  }
 }
 
 SdmaQueue::~SdmaQueue() {
-  CHECK_HSAKMT_SUCCESS(hsaKmtDestroyQueue(queue_.QueueId), "Failed to destroy queue.");
-  CHECK_HIP_ERROR(hipFree(deviceHandle_));
-  CHECK_HIP_ERROR(hipFree(cachedWptr_));
-  CHECK_HIP_ERROR(hipFree(committedWptr_));
-  CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(queueBuffer_), "Failed");
-  CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE), "Failed");
+  WARN_IF_FAILED(hsaKmtDestroyQueue(queue_.QueueId) == HSAKMT_STATUS_SUCCESS, "hsaKmtDestroyQueue");
+  WARN_IF_FAILED(hipFree(deviceHandle_) == hipSuccess, "hipFree");
+  WARN_IF_FAILED(hipFree(cachedWptr_) == hipSuccess, "hipFree");
+  WARN_IF_FAILED(hipFree(committedWptr_) == hipSuccess, "hipFree");
+  WARN_IF_FAILED(hsaKmtUnmapMemoryToGPU(queueBuffer_) == HSAKMT_STATUS_SUCCESS,
+                 "hsaKmtUnmapMemoryToGPU");
+  WARN_IF_FAILED(hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE) == HSAKMT_STATUS_SUCCESS,
+                 "hsaKmtFreeMemory");
 }
 
 SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const { return deviceHandle_; }
@@ -493,7 +515,7 @@ uint32_t AnvilLib::mi308xLinkEngine(int srcNode, int dstNode,
 
 // The engine of one more queue on a MI308X peer link: the link's engine, or the
 // xGMI engine with the fewest queues once that one is full. KFD rejects the
-// ninth queue on an engine, and SdmaQueue's constructor would then exit().
+// ninth queue on an engine, and SdmaQueue's constructor would then throw.
 uint32_t AnvilLib::mi308xQueueEngine(int srcNode, int dstNode) {
   auto& use = mi308x_engine_use_[srcNode];
   uint32_t e = mi308x_link_engine_.at(std::make_pair(srcNode, dstNode));

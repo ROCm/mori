@@ -4,6 +4,7 @@
 # mori::shmem         — shmem host library (link for host code)
 # mori::application   — application/transport library mori::ops           — EP
 # dispatch/combine host library mori::io            — IO engine library
+# mori::cco           — CCO host library (cco.hpp C++ API, cco_c.h C ABI)
 #
 # And the following functions: mori_detect_device_config()  — detect GPU arch +
 # NIC on the current machine mori_add_device_target(tgt)  — apply detected
@@ -56,6 +57,26 @@ _mori_import_library(application)
 _mori_import_library(shmem)
 _mori_import_library(ops)
 _mori_import_library(io)
+# Absent when MORI was built with BUILD_CCO=OFF. libmori_cco.so is the link-time
+# name of libmori_cco.so.1; dlopen users want MORI_CCO_LIBRARY_SONAME (cco_c.h).
+if(EXISTS "${MORI_LIB_DIR}/libmori_cco.so.1")
+  _mori_import_library(cco)
+  set_target_properties(mori::cco PROPERTIES IMPORTED_SONAME "libmori_cco.so.1")
+  # cco.hpp lays out its SDMA state by BUILD_CCO_SDMA; match the library.
+  include("${_mori_cmake_dir}/mori-build-options.cmake" OPTIONAL)
+  if(DEFINED MORI_BUILD_CCO_SDMA)
+    if(MORI_BUILD_CCO_SDMA)
+      set(_mori_cco_sdma 1)
+    else()
+      set(_mori_cco_sdma 0)
+    endif()
+    set_property(
+      TARGET mori::cco
+      APPEND
+      PROPERTY INTERFACE_COMPILE_DEFINITIONS BUILD_CCO_SDMA=${_mori_cco_sdma})
+    unset(_mori_cco_sdma)
+  endif()
+endif()
 # Absent when MORI was built with BUILD_RAS=OFF.
 if(EXISTS "${MORI_LIB_DIR}/libmori_ras.so")
   _mori_import_library(ras)

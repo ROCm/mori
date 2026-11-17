@@ -107,3 +107,18 @@ foreach(_src ${CCO_TEST_SOURCES})
   endif()
   add_cco_test("${_src}")
 endforeach()
+
+# The C ABI test is plain C and does not link mori_cco: it dlopens
+# libmori_cco.so.1 by SONAME, found through the build RPATH.
+add_executable(test_c_api test_c_api.c)
+set_target_properties(
+  test_c_api
+  PROPERTIES C_STANDARD 99
+             C_STANDARD_REQUIRED ON
+             C_EXTENSIONS OFF
+             BUILD_RPATH "$<TARGET_FILE_DIR:mori_cco>")
+target_include_directories(test_c_api PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_c_api PRIVATE hip::host ${CMAKE_DL_LIBS} pthread)
+add_dependencies(test_c_api mori_cco)
+add_test(NAME cco_c_api COMMAND test_c_api 2)
+set_tests_properties(cco_c_api PROPERTIES TIMEOUT ${CCO_TEST_TIMEOUT_SECONDS})

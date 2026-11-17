@@ -1,0 +1,13 @@
+/* Exports of libmori_cco.so.1. moriCcoGetApi is the stable C ABI (cco_c.h). The
+   mori::cco C++ API is for mori's own bindings and tests and carries no ABI
+   promise. Everything else stays local, including the weak template and inline
+   code (spdlog, fmt, std, mori::application) that the static archives bring in. */
+MORI_CCO_1.0 {
+  global:
+    moriCcoGetApi;
+    extern "C++" {
+      mori::cco::cco*;
+    };
+  local:
+    *;
+};

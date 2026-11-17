@@ -22,6 +22,25 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
+# Version. setup.py passes MORI_VERSION, the package version (e.g. 1.2.6.dev67+gabc);
+# a plain cmake build falls back to git describe. MORI_VERSION is what libmori_cco
+# reports; its X.Y.Z is what find_package(mori) checks.
+if(NOT MORI_VERSION)
+  execute_process(
+    COMMAND git describe --tags --dirty --match "v[0-9]*"
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE MORI_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" MORI_VERSION_XYZ "${MORI_VERSION}")
+if(NOT MORI_VERSION_XYZ)
+  message(WARNING "No MORI_VERSION given and git describe found no vX.Y.Z tag; "
+                  "versioning this build 0.0.0")
+  set(MORI_VERSION 0.0.0)
+  set(MORI_VERSION_XYZ 0.0.0)
+endif()
+message(STATUS "MORI version: ${MORI_VERSION}")
+
 option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
 option(USE_IONIC "Whether to use IONIC" OFF)
@@ -423,8 +442,18 @@ endif()
 # Public headers
 install(DIRECTORY include/mori DESTINATION include)
 
-# CMake package config (enables find_package(mori) for external C++ users)
+# CMake package config (enables find_package(mori) for external C++ users).
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/mori-config-version.cmake
+  VERSION ${MORI_VERSION_XYZ}
+  COMPATIBILITY SameMajorVersion)
+# Build options that code compiled against the installed headers must match.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/mori-build-options.cmake
+     "set(MORI_BUILD_CCO_SDMA ${BUILD_CCO_SDMA})\n")
 install(FILES cmake/mori-config.cmake cmake/MoriDetectDevice.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/mori-config-version.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/mori-build-options.cmake
         DESTINATION lib/cmake/mori)
 
 # Logging (spdlog is statically linked, but install the shared lib if built)

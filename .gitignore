@@ -14,6 +14,7 @@ python/mori/_version.py
 python/mori/_rocm_build_info.py
 python/mori/_jit-sources/
 python/mori/*.so
+python/mori/*.so.[0-9]*
 python/mori/cco/*.so
 examples/**/*.so
 python/mori/cco/cco.cpp

@@ -375,6 +375,10 @@ struct ccoSdmaContext {
   uint64_t** peerSignalPtrs;  // [lsaSize], peer signalBuf base via IPC
 };
 
+// Bump on any change to ccoDevComm or a struct it embeds. The C ABI reports it,
+// so device code built apart from the host library can check that both agree.
+static constexpr uint32_t CCO_DEV_COMM_LAYOUT_VERSION = 1;
+
 struct ccoDevComm {
   // World / topology
   int rank;
@@ -844,9 +848,10 @@ struct ccoComm {
   application::BootstrapNetwork* bootNet{nullptr};
   application::Context* ctx{nullptr};
 
-  // rank 0's pid, gathered via Allgather. Disambiguates LocalBootstrap socket
-  // paths across independent comm groups in the same process tree.
+  // rank 0's (pid, per-process comm count): unique per comm, names LocalBootstrap sockets.
   int64_t groupId{0};
+  // Count of ccoWindowRegister calls. Collective, so equal on every rank, unlike slot offsets.
+  uint64_t windowSeq{0};
 
   // Local HIP device this comm is bound to. Cached at CommCreate so we
   // don't call hipGetDevice() on the hot path (per-MemAlloc / per-Window).
@@ -905,6 +910,8 @@ struct ccoComm {
       ccoFabricHandle_t fabricHandle;
     };
     bool isFabric{false};
+    // False when the runtime closes shareFd itself at the last hipMemRelease.
+    bool ownsShareFd{true};
     size_t slotOffset{0};
     size_t size{0};
     // Key pointer minus the mapping start: nonzero only for an import from inside an allocation.
