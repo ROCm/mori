@@ -241,6 +241,11 @@ message BatchResolveKeysResponse {
   // clients derive FOUND/MISSING from `found` when talking to an old peer that
   // omits this field.
   repeated ResolveStatus resolve_status = 10;
+  // Optional for wire compatibility.  How long key i's location stays valid,
+  // counted from when the peer served this resolve; a reader must discard a
+  // read that finishes later.  0, or an old peer that omits the field: no
+  // bound published.
+  repeated uint32 read_lease_ms = 12;
   // Flattened page locations across all keys: key i owns the next page_count[i]
   // (buffer_index, page_index) pairs, walking keys in order.
   repeated uint32 buffer_index = 7;

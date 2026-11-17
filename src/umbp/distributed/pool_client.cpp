@@ -4661,9 +4661,33 @@ void PoolClient::WaitRemoteBatchGet(RemoteGetInFlight& f, std::vector<bool>* res
   }
   PhaseTimer final_timer(t_remote_leg ? t_remote_leg->final_ : nullptr);
   ApplyTransferFailures(f.entries, failures, "RemoteGet");
+  ExpireRemoteGetLeases(f.entries, std::chrono::steady_clock::now());
   // Nothing to copy out here even for a staged read: the engine owns its bounce
   // pool and lands the bytes in the user's dst before its Wait returns.
   FinalizeRemoteGetEntries(f.entries, results, recache_remote);
+}
+
+void PoolClient::ExpireRemoteGetLeases(std::vector<RemoteGetEntry>& entries,
+                                       std::chrono::steady_clock::time_point settled) {
+  // The peer protects a resolved location for its read lease only.  Past it the
+  // key may be evicted and its pages reused, and the read still succeeds on the
+  // wire -- with another key's bytes.  lease_deadline started no later than the
+  // peer's lease, so a read settled before it finished inside the lease.  One
+  // settled later cannot be told from a stale read, so it is a miss.
+  size_t expired = 0;
+  for (auto& entry : entries) {
+    if (entry.failed || settled < entry.lease_deadline) continue;
+    entry.failed = true;
+    ++expired;
+  }
+  if (expired == 0) return;
+  MORI_UMBP_WARN(
+      "[PoolClient] RemoteGet: {} of {} keys settled after the peer's read lease; treated as "
+      "misses",
+      expired, entries.size());
+  CountMetric(MORI_UMBP_METRIC_REMOTE_GET_LEASE_EXPIRED_TOTAL,
+              MORI_UMBP_METRIC_REMOTE_GET_LEASE_EXPIRED_TOTAL_HELP, {},
+              static_cast<double>(expired));
 }
 
 bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
@@ -4688,10 +4712,14 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
   const auto retry_deadline = std::chrono::steady_clock::now() + retry_timeout;
   std::chrono::milliseconds backoff{1};
   size_t busy_attempts = 0;
+  // Taken before the resolve that is kept goes out, so it is never later than
+  // the moment the peer starts that resolve's read lease.
+  std::chrono::steady_clock::time_point resolve_sent;
   while (true) {
     ::umbp::BatchResolveKeysResponse resolve_resp;
     grpc::ClientContext resolve_ctx;
-    const auto remaining = retry_deadline - std::chrono::steady_clock::now();
+    resolve_sent = std::chrono::steady_clock::now();
+    const auto remaining = retry_deadline - resolve_sent;
     if (remaining <= std::chrono::steady_clock::duration::zero()) {
       MORI_UMBP_WARN("[PoolClient] BatchResolveKeys BUSY timeout on {} after {} attempts",
                      items.front().route.node_id, busy_attempts);
@@ -4777,6 +4805,9 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     // once; the pages below are indices into THIS backend's buffers.
     entry.plan.backend_id = key.backend_id;
     entry.plan.pages = std::move(decoded.keys[i].pages);
+    if (key.read_lease_ms != 0) {
+      entry.lease_deadline = resolve_sent + std::chrono::milliseconds(key.read_lease_ms);
+    }
     // Descriptors were hydrated batch-level above; the per-entry plan carries
     // none (BuildRemoteGetTransfers' EnsureBufferDescsCached call is a no-op on
     // an empty list and the read path resolves descriptors by buffer_index).
@@ -5380,6 +5411,8 @@ void PoolClient::SeedEventCounters() {
   }
   CountMetric(MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL,
               MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP, {}, 0.0);
+  CountMetric(MORI_UMBP_METRIC_REMOTE_GET_LEASE_EXPIRED_TOTAL,
+              MORI_UMBP_METRIC_REMOTE_GET_LEASE_EXPIRED_TOTAL_HELP, {}, 0.0);
 }
 
 // ---------------------------------------------------------------------------

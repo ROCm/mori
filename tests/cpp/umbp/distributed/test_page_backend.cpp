@@ -597,6 +597,21 @@ TEST(PageBackend, ALocalHoldFencesEvictionUntilDropped) {
   EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
 }
 
+// A remote reader gets the lease length as its deadline; a local one has a hold instead.
+TEST(PageBackend, OnlyARemoteResolvePublishesTheReadLease) {
+  auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
+                                         /*pending_ttl=*/std::chrono::milliseconds{5000},
+                                         /*read_lease_ttl=*/std::chrono::milliseconds{200});
+  auto p = AllocateOk(*a, "k", kPageSize);
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
+
+  EXPECT_EQ(a->Resolve("k").read_lease_ms, 200u);
+  EXPECT_EQ(a->BatchResolve({"k"}, false)[0].read_lease_ms, 200u);
+  EXPECT_EQ(a->BatchResolve({"k"}, false, false, ResolveReader::kLocal)[0].read_lease_ms, 0u);
+  EXPECT_EQ(a->BatchResolve({"missing"}, false)[0].read_lease_ms, 0u);
+}
+
 // ---- Full-sync snapshot -----------------------------------------------------
 
 TEST(PageBackend, SnapshotOwnedKeysReturnsEveryAdd) {

@@ -22,10 +22,12 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -200,12 +202,25 @@ struct ResolvedEntry {
   // kLocal only: the published bytes stay put while any copy of this lives.
   std::shared_ptr<const void> hold;
 
+  // kRemote only: how long the published location is guaranteed to keep this
+  // key's bytes, counted from when the backend served the resolve.  A remote
+  // reader must discard a read that finishes later.  0 = no bound published.
+  uint32_t read_lease_ms = 0;
+
   // Nonzero covered_size: `pages` tile only object bytes [covered_offset,
   // covered_offset + covered_size), so readers subtract covered_offset first.
   // `size` stays the object's.  In-process only; not carried on the wire.
   uint64_t covered_offset = 0;
   uint64_t covered_size = 0;
 };
+
+// A backend's read-lease length as ResolvedEntry::read_lease_ms carries it.
+inline uint32_t ReadLeaseMs(std::chrono::milliseconds ttl) {
+  const auto ms = ttl.count();
+  if (ms <= 0) return 0;
+  return ms > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max()
+                                                   : static_cast<uint32_t>(ms);
+}
 
 inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
   return entry.found ? ResolveOutcome::kFound : entry.outcome;

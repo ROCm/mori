@@ -58,6 +58,7 @@ std::vector<ResolvedKeyEntry> SampleEntries() {
   entries[0].tier = TierType::HBM;
   entries[0].size = 3 * 4096;
   entries[0].pages = {{0, 10}, {1, 11}, {0, 12}};
+  entries[0].read_lease_ms = 500;
 
   entries[1].found = false;  // miss: no tier / size / pages
 
@@ -65,6 +66,7 @@ std::vector<ResolvedKeyEntry> SampleEntries() {
   entries[2].tier = TierType::DRAM;
   entries[2].size = 4096;
   entries[2].pages = {{2, 7}};
+  entries[2].read_lease_ms = 3000;
 
   entries[3].found = true;
   entries[3].tier = TierType::SSD;
@@ -73,6 +75,7 @@ std::vector<ResolvedKeyEntry> SampleEntries() {
 
   entries[4].outcome = ResolveOutcome::kBusy;
   entries[4].tier = TierType::SSD;
+  entries[4].read_lease_ms = 3000;  // only a found key carries one
 
   return entries;
 }
@@ -80,6 +83,7 @@ std::vector<ResolvedKeyEntry> SampleEntries() {
 void ExpectKeyMatches(const ResolvedKeyEntry& src, const DecodedResolveKey& dec) {
   EXPECT_EQ(src.found, dec.found);
   EXPECT_EQ(src.found ? ResolveOutcome::kFound : src.outcome, dec.outcome);
+  EXPECT_EQ(src.found ? src.read_lease_ms : 0u, dec.read_lease_ms);
   if (!src.found) return;
   EXPECT_EQ(src.tier, dec.tier);
   EXPECT_EQ(src.size, dec.size);
@@ -198,6 +202,15 @@ TEST(BatchResolveCodec, DecodesLegacyFoundOnlyResponse) {
   ASSERT_EQ(decoded.keys.size(), 1u);
   EXPECT_TRUE(decoded.keys[0].found);
   EXPECT_EQ(decoded.keys[0].outcome, ResolveOutcome::kFound);
+  EXPECT_EQ(decoded.keys[0].read_lease_ms, 0u);  // an old peer publishes no read lease
+}
+
+TEST(BatchResolveCodec, MalformedReadLeaseArrayRejected) {
+  ::umbp::BatchResolveKeysResponse resp;
+  EncodeBatchResolveResponse(SampleEntries(), 4096, {}, &resp);
+  resp.add_read_lease_ms(500);  // one more than there are keys
+
+  EXPECT_TRUE(DecodeBatchResolveResponse(resp).keys.empty());
 }
 
 TEST(BatchResolveCodec, MalformedMismatchedArraysRejected) {
