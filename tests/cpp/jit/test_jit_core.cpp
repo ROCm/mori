@@ -846,6 +846,64 @@ TEST(Describe, FailsWhereCreateWould) {
 }
 
 // --------------------------------------------------------------------------
+// arch= retargets one plan call and is gone when it returns.
+// --------------------------------------------------------------------------
+
+extern "C" const char* mori_jit_plan_describe(const char*, const char*, const char* const*,
+                                              const long long*, int);
+
+namespace {
+std::string CacheDirNow() {
+  return Compiler::Instance().CacheDirFor("combine_reduce", "constexpr int x = 1;", {});
+}
+}  // namespace
+
+TEST(Arch, ScopedArchRetargetsOnlyItsScope) {
+  ToolchainOverride guard(FakeToolchain("gfx950", "mlx5"));
+  const std::string base = CacheDirNow();
+  {
+    ScopedArch scope("gfx1250");
+    EXPECT_EQ(ActiveArch(), "gfx1250");
+    EXPECT_EQ(ActiveArchSource(), "arch=");
+    EXPECT_NE(CacheDirNow().find("/gfx1250_mlx5/"), std::string::npos);
+    {
+      ScopedArch keep(nullptr);
+      EXPECT_EQ(ActiveArch(), "gfx1250");
+    }
+    {
+      ScopedArch inner("gfx942");
+      EXPECT_EQ(ActiveArch(), "gfx942");
+    }
+    EXPECT_EQ(ActiveArch(), "gfx1250");
+  }
+  EXPECT_EQ(ActiveArch(), "gfx950");
+  EXPECT_EQ(CacheDirNow(), base);
+}
+
+TEST(Arch, ScopedArchIsThreadLocal) {
+  ToolchainOverride guard(FakeToolchain("gfx950", "mlx5"));
+  ScopedArch scope("gfx1250");
+  std::string seen;
+  std::thread([&seen] { seen = ActiveArch(); }).join();
+  EXPECT_EQ(seen, "gfx950");
+}
+
+TEST(Arch, DescribeArchDoesNotOutliveTheCall) {
+  // Two arch= in a row used to throw "toolchain already resolved", and the first
+  // one stuck: every later plan in the process compiled for it.
+  ToolchainOverride guard(FakeToolchain("gfx1250", "mlx5"));
+  const char* text = mori_jit_plan_describe("ep_dispatch", "gfx942", nullptr, nullptr, 0);
+  ASSERT_NE(text, nullptr) << PlanError();
+  EXPECT_EQ(ParseInfo(text)["stagingBytes"], "0");
+  ASSERT_NE(mori_jit_plan_describe("ep_dispatch", "gfx950", nullptr, nullptr, 0), nullptr)
+      << PlanError();
+  EXPECT_EQ(ActiveArch(), "gfx1250");
+  text = mori_jit_plan_describe("ep_dispatch", nullptr, nullptr, nullptr, 0);
+  ASSERT_NE(text, nullptr) << PlanError();
+  EXPECT_NE(ParseInfo(text)["stagingBytes"], "0");
+}
+
+// --------------------------------------------------------------------------
 // gfx1250-strict is a gfx125x target of its own.
 // --------------------------------------------------------------------------
 

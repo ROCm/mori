@@ -191,7 +191,7 @@ std::string EpRequestSchema() {
 namespace {
 
 // gfx125x -> the TDM body + its LDS geometry.
-bool EpArchIs1250() { return mori::jit::v2::GetToolchain().arch.rfind("gfx125", 0) == 0; }
+bool EpArchIs1250() { return mori::jit::v2::ActiveArch().rfind("gfx125", 0) == 0; }
 
 // The exported symbol, and the name a profile shows: which kernel, which body,
 // the transported dtype, the shape, the launch geometry. The tuning schedule
@@ -210,7 +210,7 @@ std::string EpEntryName(const EpCfg& cfg, const char* kind) {
 }
 
 // Arch routing: gfx125x renders the TDM body, every other arch the portable one.
-// The render-time arch is the same GetToolchain().arch the compile uses
+// The render-time arch is the same ActiveArch() the compile uses
 // (--offload-arch), so host and device cannot disagree, and the choice is in the
 // rendered text and therefore in the cache key.
 std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const char* portableBody,
@@ -358,7 +358,7 @@ mori::ops::v2::EpCfg EpCfgFromFields(const mori::jit::v2::FieldBag& f,
   EpApplyFields(
       req, /*prefix=*/"", [&](const std::string& n) { return f.Has(n.c_str()); },
       [&](const std::string& n) { return f.Get(n.c_str(), 0); });
-  return MakeEpCfg(mori::jit::v2::GetToolchain().arch, req, kind);
+  return MakeEpCfg(mori::jit::v2::ActiveArch(), req, kind);
 }
 
 mori::ops::v2::EpCfg EpDispatchFromFields(const mori::jit::v2::FieldBag& f) {

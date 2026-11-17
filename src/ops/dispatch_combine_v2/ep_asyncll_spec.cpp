@@ -339,8 +339,8 @@ mori::ops::v2::EpInterNodeCfg EpAsyncLLCfgFromFields(const mori::jit::v2::FieldB
     using mori::jit::v2::WireAssign;
     if (fields.Has(name)) WireAssign(slot, fields.Get(name, 0));
   });
-  return MakeEpInterNodeCfg(mori::jit::v2::GetToolchain().arch, request,
-                            EpInterNodeKernel::Dispatch, EpInterNodeFamily::AsyncLL);
+  return MakeEpInterNodeCfg(mori::jit::v2::ActiveArch(), request, EpInterNodeKernel::Dispatch,
+                            EpInterNodeFamily::AsyncLL);
 }
 
 int EpAsyncLLNoPrecompile(const std::string&) { return 0; }
