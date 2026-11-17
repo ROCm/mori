@@ -96,7 +96,7 @@ _FP8_DT = (
 def _configure():
     """Read the knobs below from the environment (again for every CASES entry)."""
     global HIDDEN, K, EPR, DTYPE, _IS_FP4, _IS_FP8, STDMOE, SCALE_DIM, COMBINE
-    global QUANT, INSCALE, SPREAD, TINY, SWEEP, RAGGED, NOSELF
+    global QUANT, INSCALE, SPREAD, TINY, SWEEP, RAGGED, NOSELF, FRESH
     HIDDEN = int(os.environ.get("HIDDEN", 7168))
     K = int(os.environ.get("TOPK", 8))
     EPR = int(os.environ.get("EPR", 32))
@@ -133,6 +133,9 @@ def _configure():
     # NOSELF=1: no token picks an expert on its own rank, so no rank receives from
     # itself.
     NOSELF = int(os.environ.get("NOSELF", 0))
+    # FRESH=1: copy the received rows and the reverse map in-stream right after
+    # dispatch, and require them to equal what the views hold after the barrier.
+    FRESH = int(os.environ.get("FRESH", 0))
 
 
 _configure()
@@ -234,9 +237,27 @@ def _run(d, comm):
             recv_x, disp_w, out_s, disp_i, total_recv_t, routing = op.dispatch(
                 inp[:ct], wts[:ct], sc_in, idx[:ct], return_routing=True
             )
+            if FRESH:
+                # Copies queued right behind the dispatch kernel, before any host sync
+                # or barrier, of every row peers wrote, the reverse map included.
+                views = (recv_x, disp_w, disp_i, out_s, routing._reverse_src_view)
+                views = [v for v in views if v is not None]
+                early = [v.clone() for v in views]
             total_recv = int(total_recv_t.cpu().item())
             sync()
             comm.barrier()
+            if FRESH:
+                ok_f = all(
+                    torch.equal(e[:total_recv], v[:total_recv])
+                    for e, v in zip(early, views)
+                )
+                errs_f = d.allreduce_sum(0 if ok_f else 1)
+                if rank == 0:
+                    print(
+                        f"# OP-FRESH ct={ct_point}: {'PASS' if errs_f == 0 else 'FAIL'} "
+                        f"(rows read before the barrier == after; recv={total_recv})",
+                        flush=True,
+                    )
             idx_c = idx[:ct].cpu().numpy()
             # local_expert_count: global sum over ranks == world*ct*K (every
             # (token,k) assignment is recorded on exactly the rank owning it).

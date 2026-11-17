@@ -271,6 +271,10 @@ __device__ void EpDispatchBody(EpArgs args) {
     }
   }
 
+  // Drain this block's peer stores before it arrives, as FlyDSL does: the signal
+  // fence below covers warp 0's stores only. A drain is enough because the window
+  // is uncached (cco's default); a cached window would need a release per block.
+  __builtin_amdgcn_s_waitcnt(0);
   __syncthreads();
   if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
 
