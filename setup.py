@@ -263,8 +263,12 @@ def _invalidate_cmake_cache_if_changed(cmake_cache: "Path", cmake_args: list) ->
         key = key_type.split(":")[0]
         cached_opts[key] = _normalize(val)
 
+    # Changes with every commit, and a new value needs no fresh cache.
+    volatile = {"MORI_VERSION"}
     changed = [
-        k for k, v in new_opts.items() if k in cached_opts and cached_opts[k] != v
+        k
+        for k, v in new_opts.items()
+        if k in cached_opts and cached_opts[k] != v and k not in volatile
     ]
 
     # Also check stale CMAKE_MAKE_PROGRAM path
@@ -786,6 +790,8 @@ class CMakeBuild(build_ext):
             f"-DBUILD_OPS_KIWI={'ON' if build_ops_kiwi_enabled else 'OFF'}",
             f"-DBUILD_CCO_SDMA={BUILD_CCO_SDMA}",
             f"-DMORI_MULTITHREAD_SUPPORT={multithread_support}",
+            # The package version, so the CMake config and libmori_cco report it too.
+            f"-DMORI_VERSION={self.distribution.get_version()}",
             "-B",
             str(build_dir),
             "-S",
