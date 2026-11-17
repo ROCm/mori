@@ -84,6 +84,23 @@ struct PciBusId {
 
 PciBusId PackPciBusId(uint16_t domain, uint8_t bus, uint8_t);
 
+// One PCI function as described by sysfs.
+struct SysfsPciDev {
+  uint16_t domain{0};
+  uint8_t bus{0};
+  uint8_t dev{0};
+  uint8_t func{0};
+  uint16_t deviceClass{0};  // class code without the programming interface byte
+  NumaNodeId numaNode{-1};
+  uint8_t headerType{0};  // without the multi-function bit
+  uint8_t primaryBus{0};
+  uint8_t secondaryBus{0};
+  uint8_t subordinateBus{0};
+  bool underRootComplex{false};  // sysfs parent is a host bridge (pciDDDD:BB)
+
+  PciBusId BusId() const { return PciBusId(domain, bus, dev, func); }
+};
+
 enum class TopoNodePciType {
   VirtualRoot = 0,  // A virtual root to traverse pci tree
   RootComplex = 1,
@@ -149,22 +166,21 @@ class TopoPathPci {
 
 class TopoSystemPci {
  public:
+  // Scans /sys/bus/pci/devices.
   TopoSystemPci();
+  // Builds the tree from these functions; reads nothing from sysfs.
+  explicit TopoSystemPci(const std::vector<SysfsPciDev>& devs);
   ~TopoSystemPci();
 
   TopoPathPci* Path(PciBusId, PciBusId);
   TopoNodePci* Node(PciBusId);
-  // False if the scanned tree is inconsistent; Path() then returns nullptr.
-  bool Valid() const { return valid; }
 
  private:
-  void Load();
-  bool Validate();
+  void Load(const std::vector<SysfsPciDev>& devs);
 
  private:
   std::unordered_map<uint64_t, std::unique_ptr<TopoNodePci>> pcis;
   TopoNodePci* root{nullptr};
-  bool valid{false};
 
   using PathKey = std::pair<uint64_t, uint64_t>;
   using PathCache = std::unordered_map<PathKey, std::unique_ptr<TopoPathPci>>;

@@ -34,7 +34,6 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <queue>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -62,29 +61,25 @@ constexpr uint8_t kHeaderTypeBridge = 0x01;
 constexpr uint16_t kClassBridgePci = 0x0604;
 constexpr uint8_t kBaseClassNetwork = 0x02;
 
-// One PCI function as described by sysfs. Unprivileged readers of sysfs
-// "config" only see the first 64 bytes of configuration space, which covers
-// every field read here.
-struct SysfsPciDev {
-  uint16_t domain{0};
-  uint8_t bus{0};
-  uint8_t dev{0};
-  uint8_t func{0};
-  uint16_t deviceClass{0};  // class code without the programming interface byte
-  NumaNodeId numaNode{-1};
-  uint8_t headerType{0};
-  uint8_t primaryBus{0};
-  uint8_t secondaryBus{0};
-  uint8_t subordinateBus{0};
-
-  PciBusId BusId() const { return PciBusId(domain, bus, dev, func); }
-};
-
 bool ReadSysfsLine(const std::string& path, std::string& out) {
   std::ifstream f(path);
   return static_cast<bool>(std::getline(f, out));
 }
 
+// True when the sysfs parent of `devpath` is a host bridge (pciDDDD:BB).
+bool IsUnderRootComplex(const std::string& devpath) {
+  char link[256], parent[256];
+  ssize_t len = readlink(devpath.c_str(), link, sizeof(link) - 1);
+  if (len < 0) return false;
+  link[len] = '\0';
+
+  strcpy(parent, dirname(link));
+  const char* last = basename(parent);
+  return strncmp(last, "pci", 3) == 0;
+}
+
+// Unprivileged readers of sysfs "config" only see the first 64 bytes of configuration space,
+// which covers every field read here.
 bool ReadSysfsPciDev(const std::string& name, SysfsPciDev& out) {
   std::vector<uint64_t> bdf = ParseBdfFromString(name);
   if (bdf.size() != 4) return false;
@@ -113,6 +108,7 @@ bool ReadSysfsPciDev(const std::string& name, SysfsPciDev& out) {
   out.primaryBus = cfg[kCfgPrimaryBus];
   out.secondaryBus = cfg[kCfgSecondaryBus];
   out.subordinateBus = cfg[kCfgSubordinateBus];
+  out.underRootComplex = IsUnderRootComplex(dir);
   return true;
 }
 
@@ -130,19 +126,6 @@ std::vector<SysfsPciDev> ScanSysfsPci() {
     return a.BusId().packed < b.BusId().packed;
   });
   return devs;
-}
-
-bool IsUnderRootComplex(const SysfsPciDev& dev) {
-  const std::string devpath = std::string(kSysfsPciDevices) + "/" + dev.BusId().String();
-
-  char link[256], parent[256];
-  ssize_t len = readlink(devpath.c_str(), link, sizeof(link) - 1);
-  if (len < 0) return false;
-  link[len] = '\0';
-
-  strcpy(parent, dirname(link));
-  const char* last = basename(parent);
-  return strncmp(last, "pci", 3) == 0;
 }
 
 // A bridge forwards [secondary, subordinate] only when that range sits below its own bus. An
@@ -344,10 +327,9 @@ bool TopoPathPci::CrossMultipleNuma() const {
 /*                                          TopoSystemPci                                         */
 /* ---------------------------------------------------------------------------------------------- */
 
-TopoSystemPci::TopoSystemPci() : pathCache() {
-  Load();
-  valid = Validate();
-}
+TopoSystemPci::TopoSystemPci() : TopoSystemPci(ScanSysfsPci()) {}
+
+TopoSystemPci::TopoSystemPci(const std::vector<SysfsPciDev>& devs) : pathCache() { Load(devs); }
 
 TopoSystemPci::~TopoSystemPci() {}
 
@@ -370,9 +352,7 @@ static TopoNodePci* CreateTopoNodePciFrom(const SysfsPciDev& dev) {
   return nullptr;
 }
 
-void TopoSystemPci::Load() {
-  const std::vector<SysfsPciDev> devs = ScanSysfsPci();
-
+void TopoSystemPci::Load(const std::vector<SysfsPciDev>& devs) {
   std::unordered_map<uint64_t, const SysfsPciDev*> dsp2dev;
   std::unordered_map<uint64_t, const SysfsPciDev*> bus2dev;
   std::unordered_set<uint32_t> domains;
@@ -444,7 +424,7 @@ void TopoSystemPci::Load() {
     auto dsp = dsp2dev.find(parentDsp);
     if (dsp != dsp2dev.end()) {
       parentBus = dsp->second->BusId().packed;
-    } else if (!IsUnderRootComplex(*bus2dev[busId.packed])) {
+    } else if (!bus2dev[busId.packed]->underRootComplex) {
       MORI_APP_DEBUG(
           "PCI topology: no scanned bridge forwards to {}; placing it under its domain root",
           busId.String());
@@ -468,33 +448,7 @@ void TopoSystemPci::Load() {
   }
 }
 
-bool TopoSystemPci::Validate() {
-  std::unordered_set<uint64_t> seen;
-
-  // Make sure every node can be reached from root and no cycles
-  std::queue<TopoNodePci*> nodes;
-  nodes.push(root);
-
-  while (!nodes.empty()) {
-    TopoNodePci* cur = nodes.front();
-    nodes.pop();
-    if (!seen.insert(cur->BusId().packed).second) {
-      MORI_APP_WARN("PCI topology: {} is reached twice from the root", cur->BusId().String());
-      return false;
-    }
-    for (auto* child : cur->DownstreamPort()) nodes.push(child);
-  }
-
-  if (seen.size() != pcis.size()) {
-    MORI_APP_WARN("PCI topology: {} of {} nodes are not reachable from the root",
-                  pcis.size() - seen.size(), pcis.size());
-    return false;
-  }
-  return true;
-}
-
 TopoPathPci* TopoSystemPci::Path(PciBusId head, PciBusId tail) {
-  if (!valid) return nullptr;
   if (pcis.find(head.packed) == pcis.end()) return nullptr;
   if (pcis.find(tail.packed) == pcis.end()) return nullptr;
 

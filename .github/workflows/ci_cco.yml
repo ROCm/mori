@@ -151,6 +151,15 @@ jobs:
               tests/python/ops/dispatch_combine_v2/test_asyncll_options.py \
               tests/python/ops/dispatch_combine_v2/test_tuning_profile.py"
 
+      - name: Check PCI tree building
+        if: contains(fromJSON(inputs.groups), 'cco')
+        run: |
+          # No GPU: synthetic sysfs functions that no runner's own PCI bus has, such as an
+          # unprogrammed bridge. Every Context with topology on builds this tree.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/build && \
+            timeout 120 ctest --output-on-failure -R '^pci_tree$'"
+
       - name: Run CCO unit tests (fork mode, 4 ranks)
         if: contains(fromJSON(inputs.groups), 'cco')
         run: |

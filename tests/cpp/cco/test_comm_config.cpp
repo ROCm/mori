@@ -24,13 +24,15 @@
 //
 //   1. A config without the INITIALIZER's magic is rejected before any collective.
 //   2. cpuAffinity=0 + lsaOnly=1 on one LSA team: the thread's CPU affinity is
-//      untouched, windows get no MR, peers read each other through the flat VA, a
-//      default (CROSSNODE) DevComm resolves to NONE and FULL is refused.
+//      untouched, the Context opens no RDMA device, windows get no MR, peers read
+//      each other through the flat VA, a default (CROSSNODE) DevComm resolves to
+//      NONE and FULL is refused.
 //   3. lsaOnly=1 across two LSA teams (MORI_VPOD_ID splits the host): the comm
-//      is created, the other team has no peer pointer, CROSSNODE is refused and
-//      NONE works.
+//      is created without RDMA, the other team has no peer pointer, CROSSNODE is
+//      refused and NONE works.
 //   4. A config from an older caller (size ends before lsaOnly) keeps the lsaOnly
-//      default even when the bytes past `size` say otherwise.
+//      default even when the bytes past `size` say otherwise, so its Context does
+//      open RDMA.
 
 #include <sched.h>
 #include <stdlib.h>
@@ -41,6 +43,7 @@
 #include <vector>
 
 #include "cco_test_harness.hpp"
+#include "mori/application/context/context.hpp"
 #include "mori/cco/cco.hpp"
 
 using namespace mori::cco;
@@ -63,6 +66,15 @@ static bool AffinityUnchanged(const cpu_set_t& before) {
   cpu_set_t now;
   CPU_ZERO(&now);
   return sched_getaffinity(0, sizeof(now), &now) == 0 && CPU_EQUAL(&before, &now);
+}
+
+// No RDMA context, no NIC, and no peer reachable over RDMA.
+static bool OpensNoRdma(const ccoComm* comm) {
+  const mori::application::Context* ctx = comm->ctx;
+  if (ctx->GetRdmaContext() != nullptr || ctx->RdmaTransportEnabled()) return false;
+  for (int i = 0; i < comm->worldSize; i++)
+    if (ctx->GetPeerCapabilities(i).canRDMA) return false;
+  return true;
 }
 
 static int DevCommRc(ccoComm* comm, ccoGdaConnectionType type, ccoGdaConnectionType* resolved) {
@@ -108,6 +120,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   if (!comm->lsaOnly || comm->lsaSize != nranks || comm->windowMrsEnabled)
     FAIL("lsaOnly comm state: lsaOnly=%d lsaSize=%d windowMrs=%d", comm->lsaOnly, comm->lsaSize,
          comm->windowMrsEnabled);
+  if (!OpensNoRdma(comm)) FAIL("lsaOnly comm opened RDMA");
 
   void* buf = nullptr;
   ccoWindow_t win = nullptr;
@@ -155,6 +168,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
     if (split->lsaSize != half || split->windowMrsEnabled)
       FAIL("split comm: lsaSize=%d (want %d) windowMrs=%d", split->lsaSize, half,
            split->windowMrsEnabled);
+    if (!OpensNoRdma(split)) FAIL("lsaOnly comm over two teams opened RDMA");
     void* b = nullptr;
     ccoWindow_t w = nullptr;
     if (ccoWindowRegister(split, WINDOW_SIZE, &w, &b) != 0) FAIL("split ccoWindowRegister");
@@ -181,6 +195,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
     FAIL("ccoCommCreate with an older config");
   if (!AffinityUnchanged(before)) FAIL("older config: cpuAffinity=0 changed the affinity");
   if (comm2->lsaOnly) FAIL("lsaOnly past the caller's size was read");
+  if (comm2->ctx->GetRdmaContext() == nullptr) FAIL("a comm without lsaOnly opened no RDMA");
   ccoCommDestroy(comm2);
 
   printf("[rank %d] PASS\n", rank);
