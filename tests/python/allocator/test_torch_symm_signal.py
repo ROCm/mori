@@ -170,6 +170,31 @@ def _run_two_streams(rank, world_size, port):
             dist.barrier()
 
 
+def _run_unreachable(rank, world_size, port):
+    """Two LSA teams on one host (MORI_VPOD_ID) stand in for peers on another host."""
+    os.environ["MORI_VPOD_ID"] = str(rank // 2)
+    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
+        n = 1024
+        _, t, hdl = _setup(rank, n)
+        mate, other = rank ^ 1, (rank + 2) % world_size
+        assert hdl.buffer_ptrs[other] == 0 and hdl.buffer_ptrs[mate] != 0
+        peer = hdl.get_buffer(mate, (n,), torch.float32)
+
+        # Every rank meets on the host, after its stream's work.
+        for it in range(3):
+            t.fill_(rank * 10.0 + it)
+            hdl.barrier(channel=it)
+            assert torch.all(peer == mate * 10.0 + it)
+            hdl.barrier()
+
+        hdl.put_signal(mate)
+        hdl.wait_signal(mate)
+        for op in (hdl.put_signal, hdl.wait_signal):
+            with pytest.raises(RuntimeError, match="not load/store reachable"):
+                op(other)
+        _assert_pad_zero(hdl, rank)
+
+
 def _run_timeout(rank, world_size, port, op):
     """Rank 0 times out on a peer that never answers; rank 1 stays alive meanwhile."""
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -229,6 +254,11 @@ def test_signal_graph_capture():
 )
 def test_signal_two_streams():
     _spawn(_run_two_streams, 2)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs at least 4 GPUs")
+def test_signal_unreachable_peers():
+    _spawn(_run_unreachable, 4)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs at least 2 GPUs")

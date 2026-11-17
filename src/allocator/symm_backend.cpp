@@ -563,9 +563,11 @@ class MoriSymmetricMemory : public SymmetricMemory {
   }
 
   // Stream-ordered device kernels on the signal pad, same protocol as torch's backends.
+  // Peers outside the LSA team have no pad: barrier() meets them on the host, signals refuse.
   void barrier(int channel, size_t timeout_ms) override {
     CheckChannel(channel);
     DeviceGuard guard(device_.index());
+    if (!AllPadsMapped()) return HostBarrier();
     SignalPadStreamGuard order(group_->name);
     MORI_HIP_CHECK(LaunchSignalPadBarrier(PadsDev(), channel, rank_, world_size_, timeout_ms,
                                           c10::hip::getCurrentHIPStream().stream()));
@@ -574,6 +576,7 @@ class MoriSymmetricMemory : public SymmetricMemory {
   void put_signal(int dst_rank, int channel, size_t timeout_ms) override {
     CheckChannel(channel);
     CheckRank(dst_rank);
+    CheckPadMapped(dst_rank, "put_signal");
     DeviceGuard guard(device_.index());
     SignalPadStreamGuard order(group_->name);
     MORI_HIP_CHECK(LaunchSignalPadPut(PadsDev(), dst_rank, channel, rank_, world_size_, timeout_ms,
@@ -583,6 +586,7 @@ class MoriSymmetricMemory : public SymmetricMemory {
   void wait_signal(int src_rank, int channel, size_t timeout_ms) override {
     CheckChannel(channel);
     CheckRank(src_rank);
+    CheckPadMapped(src_rank, "wait_signal");
     DeviceGuard guard(device_.index());
     SignalPadStreamGuard order(group_->name);
     MORI_HIP_CHECK(LaunchSignalPadWait(PadsDev(), src_rank, channel, rank_, world_size_, timeout_ms,
@@ -622,6 +626,27 @@ class MoriSymmetricMemory : public SymmetricMemory {
   void CheckRank(int rank) const {
     TORCH_CHECK(rank >= 0 && rank < world_size_, "rank must be in [0, ", world_size_, ") (got ",
                 rank, ")");
+  }
+
+  // A null pad is a peer outside the LSA team: a kernel would fault on it or wait forever.
+  bool AllPadsMapped() const {
+    return std::all_of(signal_pads_.begin(), signal_pads_.end(),
+                       [](void* p) { return p != nullptr; });
+  }
+
+  void CheckPadMapped(int peer, const char* op) const {
+    TORCH_CHECK(signal_pads_[peer] != nullptr, "mori symm backend: ", op, "() with rank ", peer,
+                ", which is not load/store reachable from rank ", rank_,
+                " (outside its LSA team; see world_within_direct_access())");
+  }
+
+  // cco's host barrier spans the comm, so a group with unreachable peers still meets.
+  void HostBarrier() {
+    CheckNotCapturing(device_.index(), "barrier() on a group with peers outside the LSA team",
+                      "Those peers have no signal pad mapping, so the barrier runs on the host.");
+    std::lock_guard<std::mutex> lock(group_->mu);  // the socket bootstrap is not thread-safe
+    MORI_HIP_CHECK(hipStreamSynchronize(c10::hip::getCurrentHIPStream().stream()));
+    MORI_CCO_CHECK(mori::cco::ccoBarrierAll(group_->comm));
   }
 
   std::shared_ptr<PeerAlloc> peer_;  // owns everything below

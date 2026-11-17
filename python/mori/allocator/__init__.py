@@ -78,7 +78,10 @@ collectives synchronise through it, so they work without any build flag.
 stream that follow torch's signal-pad protocol, so they mix with torch's own ``symm_mem``
 ops, capture into HIP graphs, and on torch >= 2.15 join its per-group stream ordering.
 A timeout traps the kernel as torch's backends do: the next synchronisation raises, and
-the process's GPU state is unusable from then on.
+the process's GPU state is unusable from then on. A peer outside the LSA team (another
+host without a fabric; its ``buffer_ptrs`` entry is 0) has no signal pad mapping:
+``barrier()`` then syncs the stream and meets on the host, and ``put_signal()`` or
+``wait_signal()`` with that peer raises.
 
 The extension is optional and its ABI tracks the installed torch, so it is a plugin:
 ``pip install`` prebuilds it when it can (``BUILD_TORCH_SYMM=AUTO``, the default; ``ON``
