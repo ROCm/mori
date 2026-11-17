@@ -333,13 +333,20 @@ bool PeerSsdManager::OrdersEviction() const {
   return backend_ != nullptr && backend_->Capabilities().orders_eviction;
 }
 
-void PeerSsdManager::Touch(const std::vector<std::string>& keys) {
-  if (backend_ == nullptr) return;
+size_t PeerSsdManager::Touch(const std::vector<std::string>& keys) {
+  if (backend_ == nullptr) return 0;
+  std::vector<std::string> held;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& key : keys) TouchLocked(key);
+    for (const auto& key : keys) {
+      if (owned_.find(key) == owned_.end() || evicting_.count(key) != 0) continue;
+      TouchLocked(key);
+      held.push_back(key);
+    }
   }
-  backend_->Touch(keys);
+  // The tier looks every key up under its own lock: hand it only the held ones.
+  if (!held.empty()) backend_->Touch(held);
+  return held.size();
 }
 
 void PeerSsdManager::SetRetiredFileHook(std::function<void(int fd)> on_close,

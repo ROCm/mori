@@ -16,7 +16,7 @@ on:
 
 env:
   IMAGE: rocm/mori:ci-cco
-  BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+  BASE_IMAGE: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
   CONTAINER: mori_cco_ci_${{ github.run_id }}
   CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
 
@@ -30,8 +30,7 @@ jobs:
       matrix:
         include:
           # Single node, so it shares ci.yml's intranode runner. MI355X-AINIC
-          # keeps the two internode jobs, which need that pair, cco-fused-test
-          # and cco-v2-test.
+          # keeps the two internode jobs, which need that pair, and cco-v2-test.
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
@@ -81,8 +80,9 @@ jobs:
       - &cco-start
         name: Start container
         run: |
-          # A socket ifname only when the job sets one: an empty MORI_SOCKET_IFNAME
-          # is not unset to cco, which then looks for an interface named "".
+          # A socket ifname, and HSA_USE_SVM, only when the job sets one: an empty
+          # MORI_SOCKET_IFNAME is not unset to cco, which then looks for an
+          # interface named "".
           $CT rm -f $CONTAINER 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
@@ -90,6 +90,7 @@ jobs:
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
             ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
+            ${HSA_USE_SVM:+-e HSA_USE_SVM=$HSA_USE_SVM} \
             ${MORI_CI_FULL:+-e MORI_CI_FULL=$MORI_CI_FULL} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
@@ -121,27 +122,34 @@ jobs:
         # plain wheel install, for PRs that do not run ci.yml's build job.
         run: |
           $CT exec $CONTAINER bash -c "cd $GITHUB_WORKSPACE && python -c \"import sys, runpy; sys.modules['flydsl'] = None; runpy.run_path('tools/verify_install.py', run_name='__main__')\""
-      - name: Check internode arena region invariants
+      - name: Check internode arena region and active QP invariants
         if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
-          # Pure function of the config: no GPU, no process group, no RDMA, so it
-          # runs here rather than in the two-node job -- the only place the
-          # internode region sizes are checked at all.
+          # Pure functions of the config: no GPU, no process group, no RDMA, so
+          # they run here rather than in the two-node job -- the only place the
+          # internode region sizes and the active QP resolution are checked.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 120 python -m pytest -v \
-              tests/python/ops/dispatch_combine_v2/test_internode_regions.py"
+              tests/python/ops/dispatch_combine_v2/test_internode_regions.py \
+              tests/python/ops/dispatch_combine_v2/test_active_qp_config.py"
 
-      - name: Check arch detection, tuning keys and AsyncLL options
+      - name: Check arch detection, tuning tables and AsyncLL options
         if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           # No GPU needed: arch-string matching, the ASIC-revision table keys and their
-          # CU fit, the per-target macro guard, and the AsyncLL defaults per arch.
+          # CU fit, the per-target macro guard, the FlyDSL schedules' bounds, the AsyncLL
+          # defaults per arch, and the peak / capped tuning profiles. The tables load
+          # from the installed package, so a build that ships no tables, or a table that
+          # fails to parse, fails here.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 120 python -m pytest -v \
               tests/python/ops/dispatch_combine_v2/test_gfx1250_strict_arch.py \
-              tests/python/ops/dispatch_combine_v2/test_asyncll_options.py"
+              tests/python/ops/dispatch_combine_v2/test_v2_tuning_tables.py \
+              tests/python/ops/dispatch_combine_v2/test_tuning_configs.py \
+              tests/python/ops/dispatch_combine_v2/test_asyncll_options.py \
+              tests/python/ops/dispatch_combine_v2/test_tuning_profile.py"
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         if: contains(fromJSON(inputs.groups), 'cco')
@@ -257,6 +265,13 @@ jobs:
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
+
+      - name: Run SdmaAllGatherOp tests (spawn, 2/4/8 GPUs)
+        if: contains(fromJSON(inputs.groups), 'cco')
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd /tmp && \
+            timeout 600 python -m pytest -v $GITHUB_WORKSPACE/tests/python/cco/test_sdma_allgather_op.py"
 
       - name: Run CCO FlyDSL buffer cache-policy check
         if: contains(fromJSON(inputs.groups), 'cco')
@@ -411,6 +426,24 @@ jobs:
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
 
+      - name: Run ops-v2 routing snapshot handles (EP8, both backends)
+        if: contains(fromJSON(inputs.groups), 'epv2')
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            timeout 900 torchrun --standalone --nproc_per_node=8 test_routing_snapshot.py"
+
+      - name: Run ops-v2 dispatch/combine bench (EP8 smoke, both backends)
+        if: contains(fromJSON(inputs.groups), 'epv2')
+        run: |
+          # bench_ep.py gates every point on an identity-expert check and exits
+          # non-zero if one fails, so this is a smoke test as well as a bench.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            BACKENDS=flydsl,hip COMB_MODE=pull MODES=graph SWEEP=128,512,4096,8192 \
+            ITERS=20 WARMUP=10 \
+            torchrun --standalone --nproc_per_node=8 bench_ep.py"
+
       - &cco-cleanup
         name: Cleanup
         if: always()
@@ -425,8 +458,8 @@ jobs:
 
   cco-fused-test:
     name: CCO fused GEMM test (${{ matrix.platform }})
-    # The fused GEMM + collective ops use SDMA over loopback only. Their own runner
-    # takes them off the CCO unit test's critical path.
+    # The fused GEMM + collective ops use SDMA over loopback only, so they need no
+    # NIC and leave MI355X-AINIC to the jobs that need its two nodes.
     if: contains(fromJSON(inputs.groups), 'fused')
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -434,11 +467,12 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC]
+            runner: [self-hosted, MI355X-AINIC-PIT-G17]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
     env:
+      CT: docker
       CONTAINER: mori_cco_fused_${{ github.run_id }}
       # 0 skips the ci_full cases (tests/python/cco/conftest.py).
       MORI_CI_FULL: ${{ (github.event_name != 'pull_request' || inputs.full) && '1' || '0' }}
@@ -569,9 +603,10 @@ jobs:
 
   cco-v2-test:
     name: CCO EPv2 single-node test (${{ matrix.platform }})
-    # The EPv2 AsyncLL, routing-snapshot and bench steps, on the runner and in the
-    # configuration they always passed in as part of the CCO unit test. On
-    # MI355X-AINIC-PIT-G17, test_asyncll's back_to_back check fails.
+    # The EPv2 AsyncLL step alone, on the runner and in the configuration it always
+    # passed in as part of the CCO unit test: on MI355X-AINIC-PIT-G17,
+    # test_asyncll's back_to_back check fails. The other EPv2 steps run in
+    # cco-unit-test.
     if: contains(fromJSON(inputs.groups), 'epv2')
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -585,11 +620,20 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+            # These hosts' amdgpu-dkms lacks 93aa919 ("drm/amdkfd: fix vram
+            # allocation failure for a special case"): hipMemCreate (VRAM with no VA
+            # yet) fails with EADDRINUSE, reported as out of memory, while any SVM
+            # range sits below its size, and libhsakmt registers every pageable
+            # buffer HIP pins for a copy as one. HSA_USE_SVM=0 registers them as
+            # userptr instead. Not in the image: with SVM off every pageable copy is
+            # pinned again. Drop it once the hosts' amdgpu-dkms carries the fix.
+            hsa_use_svm: 0
     env:
       CONTAINER: mori_cco_v2_${{ github.run_id }}
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
     timeout-minutes: 30
     steps:
       - *cco-fix-perms
@@ -629,22 +673,6 @@ jobs:
               case \"\$out\" in *'# PASS:'*) ;; *) echo 'no PASS line: nothing ran'; exit 1;; esac" || exit 1
           done
 
-      - name: Run ops-v2 routing snapshot handles (EP8, both backends)
-        run: |
-          $CT exec $CONTAINER bash -c "\
-            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            timeout 900 torchrun --standalone --nproc_per_node=8 test_routing_snapshot.py"
-
-      - name: Run ops-v2 dispatch/combine bench (EP8 smoke, both backends)
-        run: |
-          # bench_ep.py gates every point on an identity-expert check and exits
-          # non-zero if one fails, so this is a smoke test as well as a bench.
-          $CT exec $CONTAINER bash -c "\
-            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            BACKENDS=flydsl,hip COMB_MODE=pull MODES=graph SWEEP=128,512,4096,8192 \
-            ITERS=20 WARMUP=10 \
-            torchrun --standalone --nproc_per_node=8 bench_ep.py"
-
       - *cco-cleanup
 
   cco-internode-test:
@@ -670,6 +698,7 @@ jobs:
             rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
             rdma_sl: 3
             rdma_tc: 104
+            hsa_use_svm: 0  # the amdgpu-dkms workaround, see cco-v2-test
     env:
       # Overrides the workflow-level name, which is keyed by run_id alone: sharing
       # it would have this job's cleanup delete the other job's container.
@@ -684,6 +713,7 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
       ENTRY: tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py
     timeout-minutes: 60
     steps:
@@ -711,6 +741,7 @@ jobs:
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            -e HSA_USE_SVM=$HSA_USE_SVM \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -739,6 +770,7 @@ jobs:
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              -e HSA_USE_SVM=$HSA_USE_SVM \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
               -w $GITHUB_WORKSPACE \
               $IMAGE sleep infinity &&
@@ -751,13 +783,22 @@ jobs:
           # prettytable is not optional here: the bench prints its results through
           # it on the last rank, after the work is done, so a missing package fails
           # the run as a rendezvous timeout on the peer rather than an ImportError.
+          #
+          # Builds the wheel node2 installs as well, instead of node2 building its
+          # own. MORI_SKIP_PRECOMPILE: setup.py's background precompile would import
+          # mori while the wheel is still being built.
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && pip install . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && rm -rf dist_ci && MORI_SKIP_PRECOMPILE=1 pip wheel --no-deps -w dist_ci . && pip install dist_ci/*.whl && pip install prettytable"
 
       - name: Install mori (node2)
         run: |
+          # The wheel goes over the same ssh session that installs it: node2's sshd
+          # can refuse a new connection (see ci.yml's SSH_OPTS), so this opens no
+          # more of them than building there did.
+          WHEEL=$(basename $GITHUB_WORKSPACE/dist_ci/*.whl)
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && pip install . && pip install prettytable'"
+            "rm -rf $GITHUB_WORKSPACE/dist_ci && mkdir -p $GITHUB_WORKSPACE/dist_ci && cat > $GITHUB_WORKSPACE/dist_ci/$WHEEL && $CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && pip install dist_ci/$WHEEL && pip install prettytable'" \
+            < $GITHUB_WORKSPACE/dist_ci/$WHEEL
 
       - name: MORI-EP internode CCO kernel test
         run: |
@@ -771,15 +812,26 @@ jobs:
           # config compiles only that one, so a job that never names v2_ll never
           # even compiles it. 128 is the LL band and 4096 the wide one, so each
           # family is exercised where it is the one a real caller would get.
-          for CASE in "v2 128" "v2 4096" "v2_ll 128"; do
-            set -- $CASE; KERNEL=$1; TOKENS=$2
-            echo "=== cco test kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+          #
+          # The last two cases also compile active counts 1,2,4,8 and switch
+          # among them every round, with the two nodes deliberately out of step
+          # and each combine one step ahead of its own dispatch: the cases the
+          # combine barrier must tolerate, which the fixed-count cases above
+          # never reach. One per family, because v2 and v2_ll each run the
+          # shared barrier from their own combine kernel code. Every case
+          # allocates the op's default 8 QPs, so no table's count is clamped.
+          for CASE in "v2 128 --num-qp 8" "v2 4096 --num-qp 8" "v2_ll 128 --num-qp 8" \
+                      "auto 128 --num-qp 8" \
+                      "v2 4096 --num-qp 8 -- --active-qp-counts 1,2,4,8" \
+                      "v2_ll 128 --num-qp 8 -- --active-qp-counts 1,2,4,8"; do
+            set -- $CASE; KERNEL=$1; TOKENS=$2; shift 2; EXTRA="$*"
+            echo "=== cco test kernel=$KERNEL max-tokens=$TOKENS $EXTRA port=$PORT ==="
             NODE2_CMD=(
               $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
               --rank 1 --master-addr $NODE1_HOST --master-port $PORT
               --ifname $NODE2_IFNAME --entry $ENTRY
               --cmd test --kernel-type $KERNEL --quant-type none --dtype bf16
-              --max-tokens $TOKENS
+              --max-tokens $TOKENS $EXTRA
             )
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
             NODE2_PID=$!
@@ -787,7 +839,7 @@ jobs:
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
               --ifname $NODE1_IFNAME --entry $ENTRY \
               --cmd test --kernel-type $KERNEL --quant-type none --dtype bf16 \
-              --max-tokens $TOKENS
+              --max-tokens $TOKENS $EXTRA
             # With a pid, not bare: bare `wait` reaps every child and returns 0,
             # so node2 could fail its check and the job still pass on node1's
             # status alone. Half of EP16 lives over there.
@@ -812,14 +864,14 @@ jobs:
               $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
               --rank 1 --master-addr $NODE1_HOST --master-port $PORT
               --ifname $NODE2_IFNAME --entry $ENTRY
-              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS
+              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS --num-qp 8
             )
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
             NODE2_PID=$!
             $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
               --ifname $NODE1_IFNAME --entry $ENTRY \
-              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS
+              --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS --num-qp 8
             wait "$NODE2_PID"
             sleep 1
             PORT=$((PORT + 1))
@@ -843,14 +895,14 @@ jobs:
             $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME --entry $ENTRY
-            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096
+            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096 --num-qp 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
           NODE2_PID=$!
           $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME --entry $ENTRY \
-            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096
+            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096 --num-qp 8
           wait "$NODE2_PID"
 
       - name: Cleanup node1

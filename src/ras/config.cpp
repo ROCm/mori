@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "src/ras/config.hpp"
 
+#include <cerrno>
+#include <cstdlib>
 #include <optional>
 
 #include "mori/utils/cpu_list.hpp"
@@ -56,6 +58,26 @@ RasConfig ConfigFromEnv() {
           "MORI_RAS_PORT=28028 is RCCL RAS's client port; using an ephemeral port");
     } else {
       c.port = static_cast<uint16_t>(*port);
+    }
+  }
+
+  if (std::optional<std::string> v = env::GetString("MORI_RAS_TIMEOUT_FACTOR")) {
+    errno = 0;
+    char* end = nullptr;
+    double f = std::strtod(v->c_str(), &end);
+    if (errno != 0 || *end != '\0' || !(f > 0.0) || f > 100.0) {
+      invalid("MORI_RAS_TIMEOUT_FACTOR", *v, "1.0");
+    } else {
+      c.timeoutFactor = f;
+    }
+  }
+
+  if (std::optional<std::string> v = env::GetString("MORI_RAS_HEARTBEAT_MS")) {
+    std::optional<int> ms = env::GetInt("MORI_RAS_HEARTBEAT_MS");
+    if (!ms.has_value() || *ms < 10 || *ms > 600000) {
+      invalid("MORI_RAS_HEARTBEAT_MS", *v, "1000");
+    } else {
+      c.heartbeatMs = static_cast<uint32_t>(*ms);
     }
   }
 

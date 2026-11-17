@@ -489,6 +489,9 @@ struct UMBPStandaloneProcessConfig {
   std::string address;             // e.g. unix:///run/umbp/standalone/node0.grpc.sock
   bool auto_start = false;         // opt-in fork+exec convenience path
   int startup_timeout_ms = 30000;  // readiness wait bound for auto_start
+  // Deadline on Exists/BatchExists/BatchExistsConsecutive. A lookup that gets
+  // no answer within it reports a miss. 0 waits for ever.
+  int lookup_timeout_ms = 0;
 
   // Optional distributed identity for external-KV reports routed through a
   // distributed-backed standalone server. Empty means external-KV identity is
@@ -693,6 +696,10 @@ struct UMBPConfig {
       }
       if (sp.startup_timeout_ms <= 0) {
         if (error_message) *error_message = "standalone_process.startup_timeout_ms must be > 0";
+        return false;
+      }
+      if (sp.lookup_timeout_ms < 0) {
+        if (error_message) *error_message = "standalone_process.lookup_timeout_ms must be >= 0";
         return false;
       }
     }

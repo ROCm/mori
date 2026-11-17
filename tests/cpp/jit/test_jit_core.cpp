@@ -186,6 +186,34 @@ TEST(Geometry, CombineSharedMemCoversOnePointerArrayPerWarp) {
   EXPECT_EQ(EpCombineSharedBytes(c), int(sizeof(void*)) * 8 * 8);
 }
 
+TEST(Geometry, WorkgroupLdsOverTheLimitIsRefused) {
+  EXPECT_NO_THROW(CheckWorkgroupLds("k", 0, 327680, 327680));
+  EXPECT_NO_THROW(CheckWorkgroupLds("k", 48, 327680, 0));  // limit unknown
+  try {
+    CheckWorkgroupLds("k", 48, 327680, 327680);
+    FAIL() << "48 B over the limit was accepted";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("48 B static + 327680 B dynamic"), std::string::npos)
+        << e.what();
+  }
+}
+
+TEST(Geometry, Dispatch1250xSlabsLeaveRoomForTheStaticLds) {
+  EpCfg c;
+  c.worldSize = 4;
+  c.numExpertPerToken = 6;
+  c.waveSize = 32;
+  c.warpPerBlock = 16;
+  // 5120 used to take the metadata slab too: 16 x 2 x 10240 B, all of the LDS.
+  const std::pair<int, int> want[] = {
+      {4096, 262144}, {5120, 163840}, {6144, 196608}, {7168, 229376}};
+  for (const auto& [hidden, bytes] : want) {
+    c.hiddenDim = hidden;
+    EXPECT_EQ(EpDispatch1250xLdsBytes(c), bytes) << hidden;
+    EXPECT_LE(EpDispatch1250xLdsBytes(c) + EpDispatch1250xStaticLdsBytes, Ep1250xLdsBytes);
+  }
+}
+
 TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
   EpCfg ok;
   EXPECT_TRUE(EpCfgIsValid(ok));

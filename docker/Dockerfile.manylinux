@@ -5,8 +5,12 @@
 # libstdc++ instead (manylinux_2_35 on Ubuntu 22.04, _2_39 on 24.04).
 # tools/build_manylinux_wheel.py is the build entry point.
 #
-# ROCm comes from AMD's RHEL 8 repos. The defaults install the 7.14 multi-arch
-# packages; the classic 7.2.x releases need:
+# ROCm comes from AMD's RHEL 8 repos. The defaults install the 10.1 packages;
+# the 7.14 multi-arch release needs:
+#   ROCM_VERSION=7.14
+#   ROCM_REPO=https://repo.amd.com/rocm/packages-multi-arch/rhel8/x86_64
+#   ROCM_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
+# and the classic 7.2.x releases:
 #   ROCM_VERSION=7.2.4
 #   ROCM_REPO=https://repo.radeon.com/rocm/rhel8/7.2.4/main
 #   ROCM_GPG=https://repo.radeon.com/rocm/rocm.gpg.key
@@ -18,9 +22,9 @@ FROM ${BASE_IMAGE}
 # serve ROCm's own libraries, which mori does not link. The archs mori compiles
 # for come from MORI_GPU_ARCHS (see setup.py), so gfx1250 builds without them.
 ARG GPU_ARCHS="gfx942 gfx950"
-ARG ROCM_VERSION=7.14
-ARG ROCM_REPO=https://repo.amd.com/rocm/packages-multi-arch/rhel8/x86_64
-ARG ROCM_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
+ARG ROCM_VERSION=10.1
+ARG ROCM_REPO=https://stable.repo.amd.com/rocm/core/packages/rhel8/x86_64
+ARG ROCM_GPG=https://stable.repo.amd.com/rocm/gpg/packages.gpg
 # Space-separated; {version} expands to ROCM_VERSION, {arch} to each GPU_ARCHS entry.
 ARG ROCM_PACKAGES="amdrocm-core-devel{version}-{arch}"
 # Still protobuf 21.12, the 3.21 line UMBP builds against on Ubuntu 24.04, and past
