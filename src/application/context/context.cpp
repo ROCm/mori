@@ -60,7 +60,9 @@ Context::Context(BootstrapNetwork& bootNet, const ContextOptions& opts)
   p2pDisabled = env::IsEnvVarEnabled("MORI_DISABLE_P2P");
   proxyEnabled = env::IsEnvVarEnabled("MORI_ENABLE_HOST_PROXY");
   CollectHostNames();
-  if (env::IsEnvVarEnabled("MORI_ENABLE_RAIL_ONLY") || env::IsEnvVarEnabled("MORI_ENABLE_RAIL")) {
+  // Rails place RDMA traffic; a Context without RDMA has none.
+  if (rdmaEnabled &&
+      (env::IsEnvVarEnabled("MORI_ENABLE_RAIL_ONLY") || env::IsEnvVarEnabled("MORI_ENABLE_RAIL"))) {
     railOnly = RailOnlyEligible();
     if (!railOnly)
       MORI_APP_ERROR("MORI_ENABLE_RAIL_ONLY requested but not eligible; using full mesh");
@@ -242,7 +244,7 @@ void Context::CollectHostNames() {
     peerInfos[i].sameProcess = peerInfos[i].sameHost && (other.pid == my.pid);
     peerInfos[i].rankInNode = seenPerNode[peerNodeId]++;
     peerInfos[i].kfdNodeId = other.kfdNodeId;
-    if (other.railFlag != my.railFlag) {
+    if (rdmaEnabled && other.railFlag != my.railFlag) {
       MORI_APP_ERROR("MORI_ENABLE_RAIL_ONLY mismatch: rank {} has {}={}, this rank ({}) has {}", i,
                      other.railFlag ? "on" : "off", other.railFlag, LocalRank(),
                      my.railFlag ? "on" : "off");

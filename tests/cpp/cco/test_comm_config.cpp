@@ -33,6 +33,8 @@
 //   4. A config from an older caller (size ends before lsaOnly) keeps the lsaOnly
 //      default even when the bytes past `size` say otherwise, so its Context does
 //      open RDMA.
+//   5. lsaOnly=1 with MORI_ENABLE_RAIL_ONLY set on rank 0 only: rails mean nothing
+//      without RDMA, so the mismatch is not an error.
 
 #include <sched.h>
 #include <stdlib.h>
@@ -50,8 +52,8 @@ using namespace mori::cco;
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 static const size_t WINDOW_SIZE = 4096;
-// Rank 0 hands out the ids for comms 3 and 4 through its window in comm 2.
-static const size_t kUidSlots = 2;
+// Rank 0 hands out the ids for comms 3 to 5 through its window in comm 2.
+static const size_t kUidSlots = 3;
 static const size_t kPatternOffset = kUidSlots * sizeof(ccoUniqueId);
 
 #define FAIL(...)                                \
@@ -197,6 +199,14 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   if (comm2->lsaOnly) FAIL("lsaOnly past the caller's size was read");
   if (comm2->ctx->GetRdmaContext() == nullptr) FAIL("a comm without lsaOnly opened no RDMA");
   ccoCommDestroy(comm2);
+
+  // 5. Rail flags that differ across ranks, on a comm without RDMA.
+  if (rank == 0) setenv("MORI_ENABLE_RAIL_ONLY", "1", 1);
+  ccoComm* comm3 = nullptr;
+  int rc3 = ccoCommCreate(ids[2], nranks, rank, PER_RANK_VMM_SIZE, &config, &comm3);
+  unsetenv("MORI_ENABLE_RAIL_ONLY");
+  if (rc3 != 0) FAIL("lsaOnly ccoCommCreate with MORI_ENABLE_RAIL_ONLY on rank 0 only");
+  ccoCommDestroy(comm3);
 
   printf("[rank %d] PASS\n", rank);
   return 0;

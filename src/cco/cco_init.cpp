@@ -361,7 +361,13 @@ int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perR
   if (!CcoResolveCommConfig(config, &resolved)) return -1;
   application::UniqueId appUid;
   std::memcpy(&appUid, &uniqueId, sizeof(appUid));
-  auto* boot = new application::SocketBootstrapNetwork(appUid, rank, nRanks);
+  application::SocketBootstrapNetwork* boot = nullptr;
+  try {
+    boot = new application::SocketBootstrapNetwork(appUid, rank, nRanks);
+  } catch (const std::exception& e) {
+    MORI_SHMEM_ERROR("ccoCommCreate: bootstrap: {}", e.what());
+    return -1;
+  }
   return ccoCommCreateImpl(boot, perRankVmmSize, resolved, outComm);
 }
 
@@ -567,18 +573,56 @@ static void CcoWarnIfNoDmabufP2P() {
   }
 }
 
-// Unwinds a ccoCommCreateImpl that failed before the flat VA was reserved.
-static int CcoCommCreateFail(ccoComm* comm, ccoComm** outComm) {
+// Frees what a failed ccoCommCreateImpl built, at whatever step it stopped.
+static void CcoCommCreateUnwind(ccoComm* comm) {
+  if (comm->flatBase) {
+    vmmProcessLock vmmLock;
+    (void)hipMemAddressFree(comm->flatBase, static_cast<size_t>(comm->lsaSize) * comm->perRankSize);
+  }
+  comm->vaManager.reset();
   delete comm->ctx;
-  comm->bootNet->Finalize();
-  delete comm->bootNet;
+  if (comm->bootNet) {
+    try {
+      comm->bootNet->Finalize();
+    } catch (...) {
+    }
+    delete comm->bootNet;
+  }
   delete comm;
-  *outComm = nullptr;
-  return -1;
 }
+
+// ccoCommCreateImpl's steps; comm already owns its bootstrap. Returns -1 or throws on failure.
+static int CcoCommCreateSteps(ccoComm* comm, size_t perRankVmmSize, const ccoCommConfig& config);
 
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
                              const ccoCommConfig& config, ccoComm** outComm) {
+  *outComm = nullptr;
+  ccoComm* comm = nullptr;
+  int rc = -1;
+  try {
+    comm = new ccoComm();
+    comm->bootNet = bootNet;
+    bootNet = nullptr;
+    rc = CcoCommCreateSteps(comm, perRankVmmSize, config);
+  } catch (const std::exception& e) {
+    // e.g. a peer that died during the bootstrap's collectives.
+    MORI_SHMEM_ERROR("ccoCommCreate: {}", e.what());
+  } catch (...) {
+    MORI_SHMEM_ERROR("ccoCommCreate: unknown exception");
+  }
+  if (rc == 0) {
+    *outComm = comm;
+    return 0;
+  }
+  if (comm) {
+    CcoCommCreateUnwind(comm);
+  } else if (bootNet) {
+    delete bootNet;
+  }
+  return -1;
+}
+
+static int CcoCommCreateSteps(ccoComm* comm, size_t perRankVmmSize, const ccoCommConfig& config) {
   // Pin this thread to its GPU's NUMA-local CPUs before the bootstrap, the
   // Context and any worker thread below (new threads inherit the affinity).
   // This is the bind site for the CCO path; src/shmem/init.cpp binds the shmem
@@ -589,12 +633,9 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // comm->hipDev. config.cpuAffinity=0 or MORI_IGNORE_CPU_AFFINITY=1 disables.
   if (config.cpuAffinity) application::BindCallingThreadToGpuNumaOnce();
 
-  auto* comm = new ccoComm();
-  *outComm = comm;
   comm->lsaOnly = config.lsaOnly != 0;
 
   // Step 1: bootstrap
-  comm->bootNet = bootNet;
   comm->bootNet->Initialize();
   comm->rank = comm->bootNet->GetLocalRank();
   comm->worldSize = comm->bootNet->GetWorldSize();
@@ -619,7 +660,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
     if (nLsaOnly != 0 && nLsaOnly != comm->worldSize) {
       MORI_SHMEM_ERROR("ccoCommCreate: lsaOnly set on {}/{} ranks — must match on all ranks",
                        nLsaOnly, comm->worldSize);
-      return CcoCommCreateFail(comm, outComm);
+      return -1;
     }
   }
 
@@ -632,7 +673,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // Cache the bound device once (used by topology detection below and later by
   // ccoMemAlloc / ccoWindowRegister). Callers MUST keep the calling thread bound
   // to this device for any later CCO API on this comm.
-  if (!CCO_HIP_OK(hipGetDevice(&comm->hipDev))) return CcoCommCreateFail(comm, outComm);
+  if (!CCO_HIP_OK(hipGetDevice(&comm->hipDev))) return -1;
   comm->peerHipDevs.assign(comm->worldSize, comm->hipDev);
   comm->bootNet->Allgather(&comm->hipDev, comm->peerHipDevs.data(), sizeof(int));
 
@@ -670,7 +711,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
           "ccoCommCreate: MORI_VPOD_ID set on {}/{} ranks — manual vPOD grouping must "
           "be all-or-none across the job.",
           manualCnt, comm->worldSize);
-      return CcoCommCreateFail(comm, outComm);
+      return -1;
     }
     vpodMode = true;
   } else if (fabricCnt == comm->worldSize) {
@@ -707,7 +748,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
           "launch (mpirun -host A:N,B:N or equivalent), or align MORI_VPOD_ID "
           "with contiguous rank blocks.",
           comm->rank, firstInTeam, lastInTeam, lsaCount);
-      return CcoCommCreateFail(comm, outComm);
+      return -1;
     }
 
     std::vector<int> allLsaSizes(comm->worldSize);
@@ -719,7 +760,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
             "(my rank {} sees lsaSize={}, rank {} sees lsaSize={}). "
             "CCO requires uniform LSA-team size across all ranks.",
             comm->rank, lsaCount, r, allLsaSizes[r]);
-        return CcoCommCreateFail(comm, outComm);
+        return -1;
       }
     }
 
@@ -747,7 +788,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // is lossless. perRankVmmSize == 0 defaults to GPU total memory.
   if (perRankVmmSize == 0) {
     size_t freeMem = 0, totalMem = 0;
-    if (!CCO_HIP_OK(hipMemGetInfo(&freeMem, &totalMem))) return CcoCommCreateFail(comm, outComm);
+    if (!CCO_HIP_OK(hipMemGetInfo(&freeMem, &totalMem))) return -1;
     perRankVmmSize = totalMem;
   }
   perRankVmmSize = AlignUp(perRankVmmSize, 1ULL << 32);
@@ -807,7 +848,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
           "handle support is unavailable — cannot map peer VAs across nodes. Fix the "
           "fabric/driver, or scope MORI_VPOD_ID to a single host.",
           comm->lsaSize);
-      return CcoCommCreateFail(comm, outComm);
+      return -1;
     }
     comm->fabricCrossNodeLsa = true;
     MORI_SHMEM_INFO("ccoCommCreate: cross-node vPOD LSA enabled (lsaSize={} spans hosts)",
@@ -830,7 +871,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
     if (!CCO_HIP_OK(hipMemGetAllocationGranularity(&granularity, &allocProp,
                                                    hipMemAllocationGranularityRecommended)) ||
         !CCO_HIP_OK(hipMemAddressReserve(&comm->flatBase, totalVaSize, granularity, nullptr, 0)))
-      return CcoCommCreateFail(comm, outComm);
+      return -1;
     comm->vmmGranularity = granularity;
   }
   MORI_SHMEM_TRACE(
