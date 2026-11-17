@@ -577,6 +577,56 @@ TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {
   unlink(path.c_str());
 }
 
+TEST(L1ServiceTest, SetGroupPolicyRoundTripsAndTriggersGroupEviction) {
+  const std::string path = "/tmp/umbp_l1_sgp_" + std::to_string(getpid()) + ".sock";
+  unlink(path.c_str());
+  const std::string address = "unix://" + path;
+  {
+    L1Server server(address, MakeHostMemoryApi());
+    ASSERT_TRUE(server.ok());
+    L1Client client(address);
+    for (int device : {0, 1}) {
+      const std::string id = "p" + std::to_string(device);
+      ASSERT_TRUE(client.Attach(id, "g", device, kBytes).status.ok);
+      ASSERT_TRUE(client.BindLayout(id, TestLayout()).ok);
+      ASSERT_EQ(client.Open(id).num_slots, kSlots);
+    }
+    ASSERT_TRUE(client.SetGroupEvictionPolicy("g", true).ok);
+
+    // Both pools hold "a"; p0 is full so allocating one more evicts "a" and
+    // the cascade clears p1's copy too.
+    AllocateResult a0 = client.Allocate("p0", 1, 1);
+    ASSERT_EQ(a0.slots.size(), 1u);
+    ASSERT_TRUE(client
+                    .Apply("p0", {Op{OpKind::kPublish, a0.slots[0], "a"},
+                                  Op{OpKind::kRelease, a0.slots[0], ""}})
+                    .ok);
+    // Copy "a" into p1 so both groups hold it.
+    FetchResult fetched = client.Fetch("p1", {"a"});
+    ASSERT_EQ(fetched.slots.size(), 1u);
+    // Fill p0 completely with other keys.
+    for (uint32_t i = 0; i < kSlots - 1; ++i) {
+      AllocateResult s = client.Allocate("p0", 1, 1);
+      ASSERT_EQ(s.slots.size(), 1u);
+      ASSERT_TRUE(client
+                      .Apply("p0", {Op{OpKind::kPublish, s.slots[0], "fill" + std::to_string(i)},
+                                    Op{OpKind::kRelease, s.slots[0], ""}})
+                      .ok);
+    }
+    // One more allocation evicts "a" from p0 and cascades to p1.
+    AllocateResult evicted = client.Allocate("p0", 1, 1);
+    ASSERT_EQ(evicted.evicted_keys, (std::vector<std::string>{"a"}));
+    // p1's "a" must be gone: Fetch should find nothing.
+    EXPECT_TRUE(client.Fetch("p1", {"a"}).slots.empty());
+
+    std::vector<PoolStats> stats;
+    ASSERT_TRUE(client.Stats(&stats).ok);
+    // Both pools must report exactly one eviction.
+    for (const PoolStats& s : stats) EXPECT_EQ(s.evicted, 1u) << s.pool_id;
+  }
+  unlink(path.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // Lower tiers. The store is faked: what matters here is what the pool manager
 // asks of it, and that the bytes survive the round trip.
