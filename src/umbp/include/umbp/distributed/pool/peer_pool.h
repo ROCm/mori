@@ -169,6 +169,10 @@ class PeerPool {
   // its coldest keys down to `low`.  Puts only wake the worker.  False for an
   // unknown backend or watermarks outside 0 < low < high <= 1.
   bool EnableLocalEviction(uint32_t backend_id, double high_watermark, double low_watermark);
+
+  // Group eviction: associate keys as a unit.  Evicting any member evicts all.
+  // Idempotent; a key may belong to at most one group at a time.
+  void LinkGroup(const std::string& group_id, const std::vector<std::string>& keys);
   LocalEvictionMetrics LocalEvictionStats() const;
   // Test seam: one synchronous pass.  Returns keys dropped or queued.
   size_t RunLocalEvictionOnceForTest() { return LocalEvictionPass(); }
@@ -231,6 +235,11 @@ class PeerPool {
 
   void TouchLocked(const std::string& key);
   void ForgetAccessLocked(const std::string& key);
+  // Remove ``key`` from its eviction group.  If the group still has members,
+  // collects them into ``cascade_out`` and dissolves the group so cascaded
+  // evictions do not re-trigger further cascades.  No-op if key has no group.
+  void ForgetGroupMemberLocked(const std::string& key,
+                               std::unordered_set<std::string>* cascade_out);
   // Whether this read should promote the key out of `source_tier`, per that
   // tier's trigger. Counts the read for an kOnHits tier, so call it once per read.
   bool PromoteOnReadLocked(const std::string& key, LogicalTierGraph::TierIndex source_tier);
@@ -331,6 +340,11 @@ class PeerPool {
   bool stop_transition_worker_ = false;
   std::thread transition_worker_;
   std::chrono::milliseconds evict_demotion_retry_budget_{30000};  // transition worker only
+
+  // Group eviction maps.  Guarded by operation_mutex_.
+  // group_id  -> member keys; key -> group_id (reverse index).
+  std::unordered_map<std::string, std::unordered_set<std::string>> evict_groups_;
+  std::unordered_map<std::string, std::string> key_to_group_;
 
   // Local watermark eviction.  local_evict_mutex_ guards local_evict_,
   // stop_local_evict_ and the worker's start.

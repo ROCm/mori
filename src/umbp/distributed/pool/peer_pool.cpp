@@ -1277,10 +1277,69 @@ std::vector<PoolEvictResult> PeerPool::Evict(const std::vector<PoolEvictRequest>
   operation_lock.lock();
 
   std::unordered_set<std::string> repaired;
+  std::unordered_set<std::string> cascade_evict;
   for (const auto& [index, backend_id] : drops) {
-    if (repaired.insert(requests[index].key).second) RepairAfterDropLocked(requests[index].key);
+    if (repaired.insert(requests[index].key).second) {
+      RepairAfterDropLocked(requests[index].key);
+      // If the key is now fully gone, dissolve its eviction group.
+      if (placements_.count(requests[index].key) == 0) {
+        ForgetGroupMemberLocked(requests[index].key, &cascade_evict);
+      }
+    }
+  }
+  operation_lock.unlock();
+  lifecycle_lock.unlock();
+
+  // Cascade: evict all co-members of dissolved groups.  Each cascade call
+  // re-enters Evict, which is safe because we released both locks above.
+  if (!cascade_evict.empty()) {
+    std::vector<std::string> cascade_keys(cascade_evict.begin(), cascade_evict.end());
+    Evict(cascade_keys, mode);
   }
   return out;
+}
+
+// ---- Group eviction ----
+
+void PeerPool::LinkGroup(const std::string& group_id, const std::vector<std::string>& keys) {
+  std::unique_lock<std::mutex> lock(operation_mutex_);
+  for (const auto& key : keys) {
+    auto it = key_to_group_.find(key);
+    if (it != key_to_group_.end()) {
+      if (it->second == group_id) continue;  // already in this group
+      // Remove from old group.
+      auto git = evict_groups_.find(it->second);
+      if (git != evict_groups_.end()) {
+        git->second.erase(key);
+        if (git->second.empty()) evict_groups_.erase(git);
+      }
+    }
+    key_to_group_[key] = group_id;
+    evict_groups_[group_id].insert(key);
+  }
+}
+
+// Called under operation_mutex_.  Removes ``key`` from its group and, if the
+// group had other members, collects them into ``cascade_out`` for eviction and
+// dissolves the group so cascaded evictions do not re-trigger.
+void PeerPool::ForgetGroupMemberLocked(const std::string& key,
+                                       std::unordered_set<std::string>* cascade_out) {
+  auto kit = key_to_group_.find(key);
+  if (kit == key_to_group_.end()) return;
+  const std::string gid = kit->second;
+  key_to_group_.erase(kit);
+
+  auto git = evict_groups_.find(gid);
+  if (git == evict_groups_.end()) return;
+  git->second.erase(key);
+
+  if (cascade_out) {
+    for (const auto& member : git->second) {
+      cascade_out->insert(member);
+      key_to_group_.erase(member);  // prevent re-cascade when member is evicted
+    }
+  }
+  evict_groups_.erase(git);  // group dissolved
 }
 
 // ---- Local watermark eviction: picks when and what, then calls Evict(). ----

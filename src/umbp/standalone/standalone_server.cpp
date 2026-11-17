@@ -1200,6 +1200,18 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return grpc::Status::OK;
   }
 
+  grpc::Status LinkGroup(grpc::ServerContext*, const ::umbp::LinkGroupRequest* request,
+                         ::umbp::BoolResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    DataPathLock lock(client_mu_, LookupLocking());
+    if (shutdown_.load()) {
+      SetBool(response, false, "server is shutting down");
+      return grpc::Status::OK;
+    }
+    SetBool(response, client_->LinkGroup(request->group_id(), keys));
+    return grpc::Status::OK;
+  }
+
   grpc::Status Clear(grpc::ServerContext*, const ::umbp::Empty*,
                      ::umbp::BoolResponse* response) override {
     std::unique_lock<std::shared_mutex> lock(client_mu_);
