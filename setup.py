@@ -871,12 +871,14 @@ class CMakeBuild(build_ext):
             files_to_copy.append((ras_so, root_dir / "python/mori/libmori_ras.so"))
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
-        # The link-time name, for -lmori_cco (Cython and torch extensions, the JIT).
-        # Binaries record the SONAME, so they load libmori_cco.so.1 at run time.
+        # The link-time name, for -lmori_cco (Cython and torch extensions, the JIT). A
+        # linker script rather than a symlink, which a wheel cannot hold: binaries still
+        # record the SONAME libmori_cco.so.1, and a dlopen of this name fails instead of
+        # loading a second libmori_cco into the process.
         cco_dev_link = root_dir / "python/mori/libmori_cco.so"
         if cco_dev_link.is_symlink() or cco_dev_link.exists():
             cco_dev_link.unlink()
-        cco_dev_link.symlink_to("libmori_cco.so.1")
+        cco_dev_link.write_text("INPUT(libmori_cco.so.1)\n")
 
         # UMBP bindings are their own module (it links gRPC); mori.cpp loads it lazily.
         # Keyed on the flag, not the file: CMake leaves a stale one in a reused build dir.
@@ -1126,8 +1128,7 @@ extensions = (
 
 mori_package_data = [
     "libmori_cco.so.1",
-    # A wheel cannot hold the symlink, so this ships as a copy; only linkers use it.
-    "libmori_cco.so",
+    "libmori_cco.so",  # linker script naming libmori_cco.so.1; only linkers use it
     "libmori_pybinds.so",
     "libmori_shmem.so",
     "libmori_ops.so",
