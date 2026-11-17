@@ -240,12 +240,15 @@ def test_push_tables_use_explicit_names():
 
 
 @pytest.mark.parametrize("model", ["mi300x", "mi355x"])
-@pytest.mark.parametrize("name", sorted(QUANT_FORMATS))
+@pytest.mark.parametrize("name", [*sorted(QUANT_FORMATS), "none"])
 def test_scatter_rows_serve_every_format(monkeypatch, name, model):
     monkeypatch.delenv("MORI_EP_TUNING_PROFILE", raising=False)
     monkeypatch.setattr(tc, "_device_key", lambda: model)
     monkeypatch.setattr(tc._gpu, "cu_count", lambda: 0)  # 0: no CU clamp
-    got = tc.lookup(8, 7168, 8, dtype="bf16", experts_per_rank=32, quant_type=name)
+    # "none" is the unquantized scatter
+    got = tc.lookup(
+        8, 7168, 8, dtype="bf16", experts_per_rank=32, quant_type=name, scatter=True
+    )
     for edge, block, warp in tc._SCATTER_COMBINE_TABLE[model][8, 7168, 8, None]:
         assert tc.pick_bucket(got["schedule"], edge or 1 << 20)[3:5] == (block, warp)
 

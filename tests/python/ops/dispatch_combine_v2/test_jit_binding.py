@@ -1073,3 +1073,19 @@ def test_replay_is_its_own_dispatch_binary():
     }
     with pytest.raises(RuntimeError, match="replay"):
         cb.EpCombinePlan.describe(**_SMALL, replay=True)
+
+
+@pytest.mark.parametrize("dtype, elem", [(torch.bfloat16, 2), (torch.float32, 4)])
+def test_plain_scatter_lands_one_unquantized_row_per_source_token(dtype, elem):
+    kw = dict(_SCATTER_KW, combine_scatter_plain=True, dtype=dtype)
+    if cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        with pytest.raises(RuntimeError, match="combineScatterPlain"):
+            cb.EpCombinePlan.describe(**kw)
+        return
+    info = cb.EpCombinePlan.describe(**kw)
+    assert info["scatterRowBytes"] == _up128(7168 * elem + 4 * 8)
+    assert info["region.outTok"] == info["scatterLandOff"] + 8 * 128 * (
+        info["scatterRowBytes"]
+    )
+    with pytest.raises(RuntimeError, match="combineScatter"):
+        cb.EpCombinePlan.describe(**kw, combine_scatter_q_group=128)

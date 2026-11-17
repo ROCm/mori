@@ -140,6 +140,34 @@ def _cases():
         "QUANT": "fp8_blockwise_1x32",
         "SPREAD": 6,
     }
+    # the HIP backend's unquantized scatter combine
+    for dt in ("bf16", "f32"):
+        yield f"hip-{dt}-scatter", {
+            "MORI_V2_KERNEL_BACKEND": "hip",
+            "DTYPE": dt,
+            "COMBINE": "scatter",
+        }
+    # a partial last step (hidden 2304), and a recv cap
+    yield "hip-bf16-scatter-h2304", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "HIDDEN": 2304,
+    }
+    yield "hip-bf16-scatter-cap", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "MAXRECV": 1024,
+    }
+    yield "hip-bf16-scatter-scales-ragged", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "SCALE_DIM": 32,
+        "RAGGED": 1,
+        "TOPK": 9,
+    }
     # the HIP backend's quantized scatter combine, every format at the three scales
     for elem in ("fp8", "fp4"):
         for group in (32, 128):

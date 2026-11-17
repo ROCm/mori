@@ -30,8 +30,9 @@ at launch.
 Two paths live here, selected by ``cfg.is_internode`` (world_size larger than
 gpu_per_node; there is no kernel_type enum on the v2 side):
 
-* intranode -- one dispatch kernel and one combine kernel, gather only, a
-  bf16/fp32/fp8/fp4 dispatch and a bf16/fp32 combine, one plan compiled per
+* intranode -- one dispatch kernel and one combine kernel (a gather; on
+  gfx942/gfx950 also the quantized and unquantized scatters, on gfx125x the push),
+  a bf16/fp32/fp8/fp4 dispatch and a bf16/fp32 combine, one plan compiled per
   (block, warp) the tuning schedule can select.
 * internode -- a sequence of separately compiled passes over the
   ``internode_regions`` arena and a device communicator: copystaging +
@@ -1183,6 +1184,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             comb["combine_scatter_q_group"] = cfg.quant_group
             if cfg.quant_element == "fp4":
                 comb["combine_scatter_fp4"] = True
+        elif cfg.is_scatter:
+            comb["combine_scatter_plain"] = True
         if self._card is not None and cfg.quant_type in _CARD_QUANT_TYPES:
             comb["card_combine"] = True
         geom = self._ll128_geom
@@ -1285,11 +1288,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         q = cfg.quant_type
         refused = self._quant_refusal(cfg, self._arch)
         bad.extend(refused)
-        if cfg.is_scatter and q == "none":
-            served = "the push" if self._is1250 else "the scatter"
+        if cfg.is_scatter and q == "none" and self._is1250:
             bad.append(
                 f"combine_mode='scatter' without a quant type on {self._arch} (gather "
-                f"only, or {served} quant types {self._quant_formats(self._arch)})"
+                f"only, or the push quant types {self._quant_formats(self._arch)})"
             )
         if q != "none" and not refused:
             if cfg.combine_dtype != torch.bfloat16:

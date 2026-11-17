@@ -260,8 +260,9 @@ struct EpCfg {
   // gfx942/gfx950 scatter combine with an fp8 wire: elements per scale, 32 (E8M0)
   // or 128 (f32); 0 = off. Each sender quantizes into the origin's landing row.
   int combineScatterQGroup = 0;
-  bool combineScatterFp4 = false;  // e2m1 instead of fp8 on that wire (gfx950)
-  bool replay = false;             // dispatch sends to the slots a handle's dest map names
+  bool combineScatterFp4 = false;    // e2m1 instead of fp8 on that wire (gfx950)
+  bool replay = false;               // dispatch sends to the slots a handle's dest map names
+  bool combineScatterPlain = false;  // the unquantized scatter combine (bf16/fp32 rows)
   bool aggReserve = false;
   int callTokMax = 0;
   bool ll128 = false;
@@ -295,6 +296,7 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(combineScatterQGroup);
   MORI_FIELD(combineScatterFp4);
   MORI_FIELD(replay);
+  MORI_FIELD(combineScatterPlain);
   MORI_FIELD(aggReserve);
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
@@ -307,7 +309,7 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 28, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 29, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -583,11 +585,15 @@ constexpr size_t EpRegionDispOutBytes(const EpCfg& c) {
 // rank, origin token) holding the fp8 / e2m1 payload, its scales (an E8M0 byte a
 // 32-element group, or an f32 a 128-element block) and the token's topk weights,
 // padded to 128 B.
-constexpr bool EpCombineScatter(const EpCfg& c) { return c.combineScatterQGroup != 0; }
+constexpr bool EpCombineScatter(const EpCfg& c) {
+  return c.combineScatterQGroup != 0 || c.combineScatterPlain;
+}
 constexpr int EpScatterScaleBytes(const EpCfg& c) {
+  if (c.combineScatterPlain) return 0;
   return c.combineScatterQGroup == 32 ? c.hiddenDim / 32 : c.hiddenDim / 128 * 4;
 }
 constexpr int EpScatterPayloadBytes(const EpCfg& c) {
+  if (c.combineScatterPlain) return EpTokenBytes(c);
   return c.combineScatterFp4 ? c.hiddenDim / 2 : c.hiddenDim;
 }
 constexpr int EpScatterRowBytes(const EpCfg& c) {
@@ -700,13 +706,16 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          (!c.cardDedup || EpCardDedupOk(c)) && (c.cardDedup || c.cardPullBlocks == 0) &&
          (!c.cardFwdMark || (c.cardDedup && c.cardPullBlocks == 0)) &&
          (!c.cardCombine || c.cardDedup || EpCardCombineOk(c)) &&
-         // The scatter combine quantizes whole 128-element blocks with 8 lanes a 64-wide
-         // wave, and is the portable body's: no push, ll128 or card mode beside it.
+         // The quantized scatter combine quantizes whole 128-element blocks with 8 lanes
+         // a 64-wide wave; either scatter is the portable body's: no push, ll128 or card
+         // mode beside it.
          (EpCombineScatter(c) || !c.combineScatterFp4) &&
-         (!EpCombineScatter(c) ||
-          ((c.combineScatterQGroup == 32 || c.combineScatterQGroup == 128) &&
-           c.hiddenDim % 128 == 0 && c.waveSize == 64 && !EpCombinePush(c) && !c.combineBf16Push &&
-           !c.ll128 && !c.ll128CombineOnly && !c.cardCombine));
+         (!c.combineScatterPlain || (c.combineScatterQGroup == 0 && !c.combineScatterFp4)) &&
+         (!EpCombineScatter(c) || ((c.combineScatterPlain || ((c.combineScatterQGroup == 32 ||
+                                                               c.combineScatterQGroup == 128) &&
+                                                              c.hiddenDim % 128 == 0)) &&
+                                   c.waveSize == 64 && !EpCombinePush(c) && !c.combineBf16Push &&
+                                   !c.ll128 && !c.ll128CombineOnly && !c.cardCombine));
 }
 
 }  // namespace v2
