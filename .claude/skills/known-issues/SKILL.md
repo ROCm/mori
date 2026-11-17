@@ -425,6 +425,9 @@ registered:
 - `hipMemGetInfo` drops by the registered size, or stays normal while allocations fail
   (31.x with peer memory), or reports more free VRAM than the card has (several
   peer-memory MRs on one buffer).
+- Once a GPU is past the limit, a process started afterwards may fail to initialize any
+  GPU on the host, not only that one: `rocminfo` lists no GPU agents and
+  `hipGetDeviceCount` returns `hipErrorNoDevice` (seen with 31.40 on MI355X VFs).
 
 **Root cause:** KFD counts a `hipMalloc` buffer once as used (`kfd.vram_used`) and again
 as pinned (`vram_pin_size`) once a NIC pins it. A credit, `kfd.vram_pinned`, is meant to
@@ -452,18 +455,35 @@ is what changed.
   through peer memory as well. With peer memory, `hipMemGetInfo` still looks normal and
   hides the problem. Nothing on the registration side helps.
 
-Measured: on 6.16.6, registering 32 GiB through dma-buf lowers `hipMemGetInfo` by 32 GiB
-and a later 239 GiB allocation fails; on 6.19.14.31400100, registering 40 GiB lowers the
-largest accepted allocation by 80 GiB through dma-buf and through peer memory alike
-(kvcache-ai/Mooncake#5583). The other rows come from the driver sources.
+Measured:
+
+- **6.16.6:** registering 32 GiB through dma-buf lowers `hipMemGetInfo` by 32 GiB, and a
+  later 239 GiB allocation fails.
+- **6.19.14.31400000** (MI355X VF, 308.9 GB of VRAM): allocations fail once used plus
+  registered VRAM exceeds 308.9 GB. 161 GB used + 150 GB registered fails; 146 + 135 GB
+  works.
+- **6.19.14.31400100:** registering 40 GiB lowers the largest accepted allocation by
+  80 GiB, through dma-buf and through peer memory alike (kvcache-ai/Mooncake#5583).
+
+The other rows come from the driver sources.
 
 Related, but not a driver-version issue: if a process is killed while its MRs pin a
 buffer and the kernel logs `WARNING ... ttm_bo_release`, the BO was freed still pinned
 and the counts stay wrong on that GPU until reboot (seen once on 6.16.13, ROCm/mori#721).
 
 **Which path MoRI takes:** `RegisterRdmaMemoryRegionAuto` tries `ibv_reg_mr` (peer memory)
-first and falls back to dma-buf; `MORI_ENABLE_DMABUF_REG=1` puts dma-buf first. Peer memory
-needs amdgpu-dkms plus a NIC stack that provides `ib_peer_mem` (`lsmod | grep ib_peer_mem`).
+first and falls back to dma-buf; `MORI_ENABLE_DMABUF_REG=1` puts dma-buf first.
+
+Peer memory needs two things:
+
+- amdgpu-dkms, whose PeerDirect client registers itself with the kernel;
+- a kernel that exports the peer-memory API, either through the NIC package's
+  `ib_peer_mem` module or through MLNX OFED's `ib_uverbs` / `ib_core`.
+
+With MLNX OFED 24.10 there is no `ib_peer_mem` module and no `/sys/kernel/mm/memory_peers`,
+yet peer memory works. Check `grep ib_register_peer_memory_client /proc/kallsyms` instead of
+`lsmod`.
+
 VMM memory (`hipMemCreate`, e.g. vLLM sleep mode or PyTorch `expandable_segments`) cannot
 be registered through peer memory (`ibv_reg_mr` fails with ENOMEM), so it always ends up
 on dma-buf. With `MORI_APP_LOG_LEVEL=warn` a fallback shows as
@@ -500,7 +520,7 @@ archived mails are whitespace-damaged, so take the commits.
 
 | Workaround | 30.x | 31.x and in-tree | Notes |
 |---|---|---|---|
-| Register through peer memory, mori's default: leave `MORI_ENABLE_DMABUF_REG` unset and keep the KV cache in `hipMalloc` memory | Works | No help | Needs `ib_peer_mem`; impossible for VMM memory |
+| Register through peer memory, mori's default: leave `MORI_ENABLE_DMABUF_REG` unset and keep the KV cache in `hipMalloc` memory | Works | No help | Needs peer memory (see above); impossible for VMM memory |
 | Run amdgpu-dkms 30.x (downgrade from 31.x, or instead of in-tree amdgpu) and register through peer memory | — | Works | Same conditions as the row above |
 | A page-sized peer-memory "anchor" MR per allocation: Mooncake `MC_HIP_KFD_PIN_FIX` (kvcache-ai/Mooncake#4657, merged), mori `MORI_KFD_PIN_FIX=1` (ROCm/mori#869, not merged) | Fixes the dma-buf path; #869 also stops the over-report | Fixes only what `hipMemGetInfo` reports; allocations still fail | Needs peer memory and non-VMM memory |
 | Leave headroom: non-KV usage + 2 × registered size ≤ VRAM | Works | Works | Costs about half of the KV capacity |
