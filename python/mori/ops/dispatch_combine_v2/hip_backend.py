@@ -471,6 +471,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # 0/false/off/no. Compiled into the v2 / v2_ll plans (kConfig.noRdmaAtomics).
         _af = os.environ.get("MORI_EP_DISABLE_RDMA_ATOMICS", "")
         self._no_rdma_atomics = _af.lower() not in ("", "0", "false", "off", "no")
+        # Whether cco allocated its windows uncached, so a combine relay's staging stores bypass
+        # L2 (kConfig.windowUncached); the kernel also requires gfx942/gfx950 for that.
+        from mori.cco import cco as _cco
+
+        self._window_uncached = _cco.window_uncached()
         lay = (
             ll128_layout(cfg) if self._is1250 and cfg.low_latency is not False else None
         )
@@ -1374,6 +1379,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             numQpPerPe=active_qps,
             numQpToDrain=num_qp_to_drain,
             noRdmaAtomics=getattr(self, "_no_rdma_atomics", False),
+            windowUncached=getattr(self, "_window_uncached", False),
             quantType=(
                 cfg.quant_type.replace("_", "").lower()
                 if cfg.quant_type != "none"
@@ -1603,6 +1609,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         request["mpCount"] = self._multi_processor_count
         # AsyncLL has no write-signalling variant; cross-node ones are refused in the gate.
         request["noRdmaAtomics"] = False
+        request["windowUncached"] = False
         request["asyncLlMode"] = self._asyncll_mode
         request["asyncLlFusedRecvCtas"] = self._asyncll_fused_ctas
         return request

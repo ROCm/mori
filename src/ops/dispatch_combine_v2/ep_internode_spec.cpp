@@ -99,6 +99,8 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   // other passes share one compiled module across load-first and plain buckets.
   cfg.kernelCfg.combineLoadFirst = (kind == EpInterNodeKernel::Combine) && request.combineLoadFirst;
   cfg.kernelCfg.noRdmaAtomics = request.noRdmaAtomics;
+  cfg.kernelCfg.windowUncached = request.windowUncached && (kind == EpInterNodeKernel::Combine ||
+                                                            kind == EpInterNodeKernel::CombineLL);
   cfg.asyncLlMode = request.asyncLlMode;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);
