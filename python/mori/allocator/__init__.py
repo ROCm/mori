@@ -23,10 +23,11 @@
 
 torch owns the allocation and its lifetime; CCO owns the peer addressing. ``alloc`` is
 plain HIP VMM, and ``rendezvous`` hands that allocation to ``ccoWindowRegister``, which
-aliases it into CCO's flat LSA space -- so ``buffer_ptrs`` are ``ccoGetPeerPtr`` results
-and agree with the device-side ``Window.lsa_ptr`` by construction. CCO's communicator is
-created on the first rendezvous of a process group and its unique id travels over torch's
-own Store, so there is no second bootstrap channel to configure::
+aliases it into CCO's flat LSA space -- so peer ``buffer_ptrs`` are ``ccoGetPeerPtr``
+results and agree with the device-side ``Window.lsa_ptr`` by construction. This rank's own
+entry is the tensor's address. CCO's communicator is created on the first rendezvous of a
+process group and its unique id travels over torch's own Store, so there is no second
+bootstrap channel to configure::
 
     import torch.distributed._symmetric_memory as symm_mem
     from mori.allocator import register_symm_backend
@@ -41,22 +42,22 @@ own Store, so there is no second bootstrap channel to configure::
 ``resolve_process_group()``, the way torch's own CUDA and NCCL backends do it, rather
 than through the ``GroupInfo`` registry that only that deprecated call populates.
 
-Known constraint on the POSIX-fd path (gfx9, i.e. MI300/MI355): CCO names its rendezvous
-socket after the local slot offset, and freeing a window returns that slot to a per-rank
-allocator. Ranks that free symmetric tensors in *different* orders therefore get different
-offsets, and a later ``rendezvous()`` fails with a P2P fd exchange timeout. Free order is
-unconstrained as far as torch is concerned, so keep it uniform across ranks until that
-naming changes. The fabric path is unaffected -- peer addressing is computed from each
-rank's own offset.
+State follows torch's model. There is one CCO communicator per (process group, device)
+and one window plus signal pad per (allocation, group), so a tensor rendezvous'd with two
+groups gets two independent handles. ``rendezvous`` accepts any pointer inside a
+symmetric allocation (a MemPool tensor) and reports where it starts via ``get_offset()``;
+``buffer_ptrs`` stay the allocation bases. A pointer this backend did not allocate gives
+``None``, and ``is_symm_mem_tensor`` reflects the same lookup. ``alloc`` and a first
+rendezvous refuse to run under graph capture, and do their device work on the caller's
+current stream. A communicator is released once its process group is destroyed and no
+handle on it is left.
 
 Peers are exposed the way torch's model expects, as the ``buffer_ptrs`` /
 ``buffer_ptrs_dev`` array -- one base address per rank, same as every other backend.
-
-Internally the ranks are mapped into one flat span, so those pointers happen to be evenly
-strided (``buffer_ptrs[r] == buffer_ptrs[0] + r*stride``). That is deliberately not public
-yet: exposing it belongs with mori's cco window, whose ``ccoWindowDevice`` already defines
-the layout (``winBase``, 4 GiB-quantised ``stride4G``, LSA-rank indexing). See ROCm/mori#557
-for the staged plan.
+Internally the peers are mapped into one flat span, so they happen to be evenly strided.
+That is deliberately not public yet: exposing it belongs with mori's cco window, whose
+``ccoWindowDevice`` already defines the layout (``winBase``, 4 GiB-quantised
+``stride4G``, LSA-rank indexing). See ROCm/mori#557 for the staged plan.
 
 The handle type is probed per device: fabric where supported, POSIX fd otherwise. gfx9
 (MI300/MI355) has no fabric support -- ``hipMemCreate`` itself reports "operation not
@@ -75,12 +76,6 @@ collectives synchronise through it, so they work without any build flag.
 first: stronger than the device-side barrier torch asks for, and heavier.
 ``put_signal``/``wait_signal`` still raise -- point-to-point signalling needs a
 ``ccoDevComm``, which this backend does not create yet.
-
-``rendezvous()`` takes the tensor's *storage* base, so ``get_offset()`` is 0 by
-construction: every ``alloc()`` is its own VMM allocation. Handing it a view
-(``rendezvous(t[512:])``) therefore describes the whole storage, and ``get_remote_tensor``
-answers for the storage base -- pass ``storage_offset`` to ``get_buffer`` to address a
-slice. That is torch's model, not something this backend narrows.
 
 The extension is optional and its ABI tracks the installed torch, so it is a plugin:
 ``pip install`` prebuilds it when it can (``BUILD_TORCH_SYMM=AUTO``, the default; ``ON``
@@ -273,7 +268,7 @@ def signal_pad_supported() -> bool:
     return bool(_ext().signal_pad_supported)
 
 
-def window_handle(tensor, signal_pad: bool = False) -> int:
+def window_handle(tensor, signal_pad: bool = False, group=None) -> int:
     """The cco window backing a rendezvous'd tensor, as an integer handle.
 
     Backend-specific on purpose: torch's ``SymmetricMemory`` has nowhere to carry a
@@ -284,10 +279,14 @@ def window_handle(tensor, signal_pad: bool = False) -> int:
     ``rendezvous(t[512:])`` registers the whole storage, so a view has to resolve to the
     same window rather than to "pointer is not a mori allocation".
 
+    Each group a tensor is rendezvous'd with has its own window; ``group`` (a process
+    group or its name) picks one and is required once there is more than one.
+
     Pass the result to a kernel that addresses peers with cco's device API
     (``mori.ir.triton.cco.Window.lsa_ptr``) instead of walking ``buffer_ptrs``.
     """
-    return _ext().window_handle(tensor.untyped_storage().data_ptr(), signal_pad)
+    name = getattr(group, "group_name", group) or ""
+    return _ext().window_handle(tensor.untyped_storage().data_ptr(), signal_pad, name)
 
 
 def dev_comm(group_name: str, key: str = "default", lsa_barrier_count: int = 1) -> int:
