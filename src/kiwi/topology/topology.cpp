@@ -34,6 +34,7 @@
 #ifdef __linux__
 #include <errno.h>
 #include <sched.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #endif
 
@@ -170,7 +171,7 @@ void bind_current_thread_to_cpus(const std::vector<int>& cpus) {
     CPU_ZERO(&actual);
     sched_getaffinity(0, sizeof(actual), &actual);
     std::fprintf(stderr, "KIWI_PROXY_AFFINITY_DEBUG pid=%ld tid=%ld bound=%s\n",
-                 static_cast<long>(getpid()), static_cast<long>(gettid()),
+                 static_cast<long>(getpid()), static_cast<long>(syscall(SYS_gettid)),
                  summarize_cpus(cpus_in_set(actual)).c_str());
   }
 #else
