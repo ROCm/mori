@@ -34,7 +34,13 @@ one of four states, the reasons, the next step, and the budget used:
   no frozen candidate, a candidate without a verdict, a verdict without a decision, the
   last decision. A spent budget (rounds or GPU hours from the contract) is ``continue``
   too, with "write report.md and stop" as the next step, so that the run ends with its
-  report.
+  report; so is ``budget.stop_after_flat_rounds`` verdicts in a row without a gain above
+  the noise band at the target bucket.
+
+A contract with ``kind: optimize`` improves ``start_from`` instead of designing anew: the
+steps are the re-baseline with its gap ledger (``bounds.md``), the hypotheses
+(``hypotheses.md``), one change per round, verification, and delivery once a verdict
+meets ``targets.within_pct`` against ``targets.reference``.
 """
 
 import argparse
@@ -106,6 +112,43 @@ def _contract(task):
         return {}
 
 
+def _verdict_times(task, bucket):
+    """[(candidate us, reference us, noise %)] at the bucket, oldest verdict first."""
+    out = []
+    for p in sorted(
+        Path(task).glob("verdicts/*.json"), key=lambda p: p.stat().st_mtime
+    ):
+        try:
+            v = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        timing = v.get("timing") or {}
+        for b in timing.get("buckets") or []:
+            if b.get("m") == bucket and (b.get("fused_us") or {}).get("median"):
+                ref = (b.get("baseline") or {}).get("median")
+                out.append((b["fused_us"]["median"], ref, timing.get("noise_band_pct")))
+                break
+    return out
+
+
+def flat_rounds(times):
+    """Verdicts at the end of the list that did not beat every earlier one by more than
+    the noise band (0.1% when the verdict gives none)."""
+    flat = 0
+    for i in range(1, len(times)):
+        best = min(t for t, _, _ in times[:i])
+        noise = times[i][2] if times[i][2] is not None else 0.1
+        flat = flat + 1 if times[i][0] > best * (1 - noise / 100.0) else 0
+    return flat
+
+
+def target_met(times, within_pct):
+    """Whether the newest verdict meets ``within_pct`` against its reference."""
+    if not times or within_pct is None or times[-1][1] is None:
+        return False
+    return times[-1][0] <= times[-1][1] * (1 + within_pct / 100.0)
+
+
 def _newest(paths):
     paths = list(paths)
     return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
@@ -159,6 +202,26 @@ def state(task):
             "stop rule: write report.md with the best verified result, then stop"
         )
         return out
+    bucket = ((contract.get("workload") or {}).get("target_buckets") or [None])[0]
+    targets = contract.get("targets") or {}
+    within = targets.get("within_pct", targets.get("within_existing_pct"))
+    times = _verdict_times(task, bucket)
+    flat = flat_rounds(times)
+    out["budget"]["flat_rounds"] = flat
+    if (
+        budget.get("stop_after_flat_rounds")
+        and flat >= budget["stop_after_flat_rounds"]
+    ):
+        out["reasons"].append(
+            f"{flat} verified rounds in a row without a gain above the noise band"
+        )
+        out["next"] = (
+            "stop rule: write report.md with the best verified result, then stop"
+        )
+        return out
+    if contract.get("kind") == "optimize":
+        out["next"] = _next_optimize(task, contract, times, within)
+        return out
 
     bounds = task / "bounds.md"
     candidates = list((task / "candidates").glob("*.json"))
@@ -195,6 +258,40 @@ def state(task):
     else:
         out["next"] = f"route the last decision ({decision or 'none'}): step 2 or 3"
     return out
+
+
+def _next_optimize(task, contract, times, within):
+    start = (contract.get("start_from") or {}).get("candidate") or "the start candidate"
+    reference = (contract.get("targets") or {}).get("reference") or "the reference"
+    candidates = list((task / "candidates").glob("*.json"))
+    verdicts = list((task / "verdicts").glob("*.json"))
+    newest_candidate, newest_verdict = _newest(candidates), _newest(verdicts)
+    if not (task / "bounds.md").is_file():
+        return (
+            f"step 1 (optimize): re-baseline {start} against {reference} in one launch "
+            "and write the gap ledger in bounds.md"
+        )
+    if not (task / "hypotheses.md").is_file():
+        return (
+            "step 2 (optimize): hypotheses.md, one change per item of the gap ledger "
+            "with its predicted saving and what would refute it"
+        )
+    if not candidates:
+        return "step 3 (optimize): make the first change behind a switch and freeze it"
+    if (
+        not verdicts
+        or newest_candidate.stat().st_mtime > newest_verdict.stat().st_mtime
+    ):
+        return f"step 4: verify the frozen candidate {newest_candidate.stem}"
+    if (rounds_used(task / "decisions.md") or 0) < len(verdicts):
+        return (
+            f"step 4: decide on verdict {newest_verdict.stem} (a row in decisions.md)"
+        )
+    if last_decision(task / "decisions.md") == "stop":
+        return "the last decision is stop: write report.md, then stop"
+    if target_met(times, within):
+        return "step 5: deliver: the newest verdict meets the target"
+    return "next round: the largest open item of the gap ledger (hypotheses.md)"
 
 
 def summary(s):

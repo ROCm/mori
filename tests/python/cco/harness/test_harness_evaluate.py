@@ -224,3 +224,24 @@ def test_rounds_count_only_rows_with_a_candidate(tmp_path):
     assert ev.rounds_of(p) is None
     p.write_text(DECISIONS)
     assert ev.rounds_of(p) == 2
+
+
+def test_an_optimization_task_reports_its_starting_point(task, tmp_path):
+    records, main, session, audit = task
+    text = (records / "contract.yaml").read_text()
+    text = text.replace(
+        "within_existing_pct: 5", "reference: existing\n  within_pct: 0"
+    )
+    text += "\nkind: optimize\nstart_from: {measured_us: {16384: 1208.2}}\n"
+    (records / "contract.yaml").write_text(text)
+    (records / "verdicts" / "c2.json").write_text(json.dumps(_verdict(fused=1160.0)))
+    out = _run(*task)
+    t = out["target"]
+    assert (
+        out["result"] == "pass"
+        and t["reference"] == "existing"
+        and t["within_pct"] == 0
+    )
+    assert t["start_us"] == 1208.2 and t["improvement_pct"] == pytest.approx(3.99)
+    (records / "verdicts" / "c2.json").write_text(json.dumps(_verdict(fused=1171.0)))
+    assert _run(*task)["result"] == "fail"  # any distance above the reference fails

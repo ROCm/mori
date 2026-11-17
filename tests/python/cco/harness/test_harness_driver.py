@@ -198,3 +198,67 @@ def test_the_hook_speaks_the_protocol_and_is_registered(task):
         assert entry["hooks"][0]["command"].endswith(
             '/benchmark/cco/harness/stop_hook.py"'
         )
+
+
+OPTIMIZE = """task: t
+kind: optimize
+approved: true
+start_from: {candidate: v2-fused, measured_us: {16384: 1208.2}}
+workload: {target_buckets: [16384]}
+targets: {reference: existing, within_pct: 0}
+budget: {rounds: 6, gpu_hours: 12, stop_after_flat_rounds: 2}
+"""
+
+
+def _verdict(task, name, us, ref=1165.0, noise=0.1, age=0):
+    v = {
+        "verdict": "meets-contract",
+        "timing": {
+            "noise_band_pct": noise,
+            "buckets": [
+                {
+                    "m": 16384,
+                    "fused_us": {"median": us},
+                    "baseline": {"impl": "existing", "median": ref},
+                }
+            ],
+        },
+    }
+    _touch(task / "verdicts" / f"{name}.json", json.dumps(v), age=age)
+
+
+def test_an_optimization_task_follows_its_own_steps(task):
+    (task / "contract.yaml").write_text(OPTIMIZE)
+    assert _next(task).startswith(
+        "step 1 (optimize): re-baseline v2-fused against existing"
+    )
+    _touch(task / "bounds.md", "gap ledger")
+    assert _next(task).startswith("step 2 (optimize): hypotheses.md")
+    _touch(task / "hypotheses.md")
+    assert _next(task).startswith("step 3 (optimize)")
+    _touch(task / "candidates" / "r1.json", age=100)
+    assert _next(task) == "step 4: verify the frozen candidate r1"
+    _verdict(task, "r1", 1190.0, age=90)
+    assert _next(task).startswith("step 4: decide on verdict r1")
+    _touch(task / "decisions.md", _decisions("keep"), age=80)
+    assert _next(task).startswith("next round")  # 1190 > 1165: not there yet
+    _touch(task / "candidates" / "r2.json", age=70)
+    _verdict(task, "r2", 1164.0, age=60)
+    _touch(task / "decisions.md", _decisions("keep", "keep"), age=50)
+    assert _next(task) == "step 5: deliver: the newest verdict meets the target"
+
+
+def test_rounds_without_a_gain_above_the_noise_stop_the_loop(task):
+    (task / "contract.yaml").write_text(OPTIMIZE)
+    _touch(task / "bounds.md")
+    _touch(task / "hypotheses.md")
+    for i, us in enumerate((1200.0, 1199.5, 1199.9)):  # inside 0.1% of the best
+        _touch(task / "candidates" / f"r{i}.json", age=100 - 20 * i)
+        _verdict(task, f"r{i}", us, age=95 - 20 * i)
+    _touch(task / "decisions.md", _decisions("keep", "keep", "keep"))
+    s = loop_state.state(task)
+    assert s["budget"]["flat_rounds"] == 2 and "without a gain" in s["reasons"][0]
+    assert "write report.md" in s["next"]
+    assert loop_state.flat_rounds([(100.0, None, 1.0), (98.0, None, 1.0)]) == 0
+    assert loop_state.target_met([(100.0, 100.0, None)], 0) is True
+    assert loop_state.target_met([(100.1, 100.0, None)], 0) is False

@@ -6,9 +6,23 @@
 # gemm_ar on DeepSeek-V4.1-Flash wo_b at TP4.
 
 task: gemm_ar-v41flash-wo_b-tp4
+kind: new                  # new: design candidates from step 2 | optimize: improve start_from
 owner: <name>
 revision: 1
 approved: false            # set by the owner, never by an agent
+
+# kind: optimize only. Step 2 becomes the gap ledger and its hypotheses, and every round
+# makes one change to start_from (cco-fusion-loop, "Optimization tasks").
+# start_from:
+#   candidate: <id>                 # the candidate to improve
+#   commit: <40-hex>                # where its code is
+#   impl: <module>:<Class>          # how the harnesses construct it
+#   records: <path>                 # its design notes, runs and decisions: inputs to re-check
+#   measured_us: {16384: <us>}      # its time at the target buckets when the task starts
+# keep:                             # what every round preserves: the structure under study
+#   - <constraint>
+# reference_access: clean           # clean | blackbox | open: what the session may learn of
+#                                   # the reference implementation (the case's README says how)
 
 workload:
   op: gemm_ar              # gemm_ar | gemm_rs | gemm_ag | ag_gemm | gemm_a2a | a2a_gemm | moe_dispatch | moe_combine
@@ -45,6 +59,9 @@ protocol:
 targets:
   eta_real: 0.8            # attainment against the realistic bound, in each target bucket
   min_gain_pct: 5          # below this, or below the noise band, step 1 says no-go
+  # reference: existing    # an arm to match or beat in the same launch (optimize tasks)
+  # within_pct: 0          # candidate <= (1 + within_pct/100) x reference at the target buckets
+  # no_regression: [4096]  # other buckets that must not get slower than the reference
 
 budget:
   rounds: 6

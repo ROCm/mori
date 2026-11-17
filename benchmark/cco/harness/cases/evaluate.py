@@ -28,8 +28,9 @@
 
 It reads:
 
-* the contract: the approved copy in the task directory, else the case's (the target bucket,
-  ``targets.within_existing_pct``, the budget);
+* the contract: the approved copy in the task directory, else the case's (the target
+  bucket, ``targets.within_pct`` against ``targets.reference``, or the older
+  ``within_existing_pct``; the budget; for ``kind: optimize``, ``start_from.measured_us``);
 * the verifier's verdicts (``verdicts/*.json``, the newest decides): the verdict and the
   target bucket's timing, candidate against the existing op; when a verdict holds no
   timing for that bucket, the run it lists whose arms include ``existing`` and ``candidate``;
@@ -222,7 +223,9 @@ def evaluate(args):
     contract, contract_path = contract_of(case, records)
     targets = contract.get("targets") or {}
     bucket = ((contract.get("workload") or {}).get("target_buckets") or [None])[0]
-    pct = targets.get("within_existing_pct")
+    pct = targets.get("within_pct", targets.get("within_existing_pct"))
+    reference = targets.get("reference", "existing")
+    start_us = ((contract.get("start_from") or {}).get("measured_us") or {}).get(bucket)
 
     verdicts = sorted(
         Path(records).glob("verdicts/*.json"), key=lambda p: (p.stat().st_mtime, p.name)
@@ -263,11 +266,18 @@ def evaluate(args):
         "result": result,
         "target": {
             "bucket": bucket,
-            "within_existing_pct": pct,
+            "reference": reference,
+            "within_pct": pct,
             "candidate_us": timing and timing["candidate_us"],
             "existing_us": timing and timing["existing_us"],
             "gap_pct": None if gap is None else round(gap, 2),
             "met": met,
+            "start_us": start_us,
+            "improvement_pct": (
+                round(100.0 * (1 - timing["candidate_us"] / start_us), 2)
+                if start_us and timing and timing["candidate_us"]
+                else None
+            ),
             "source": timing and timing["source"],
         },
         "verdict": {

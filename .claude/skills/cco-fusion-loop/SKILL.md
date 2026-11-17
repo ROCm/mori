@@ -145,6 +145,31 @@ Every pass through step 4 adds a row to `decisions.md`
   corrected facts in `cco-fusion-facts`.
 - Push, pull request and review comments only after the owner approves them.
 
+## Optimization tasks
+
+A contract with `kind: optimize` improves an existing candidate (`start_from`) instead of
+designing new ones. It keeps the structure its `keep` list names and runs until the
+candidate reaches `targets.reference` within `targets.within_pct` at the target buckets,
+measured in the same launch, or a stop rule fires.
+
+| Step | Output | Leave when |
+|---|---|---|
+| 1. Re-baseline and gap ledger | `bounds.md`: the start candidate, the reference and the bound measured in one launch, and the gap between them split by phase (`reference/diagnosis.md`), largest first | every item has a number or is marked unattributed |
+| 2. Hypotheses | `hypotheses.md`: per item of the ledger, the change, its predicted saving and the measurement that would refute it | the next change is chosen |
+| 3. One change per round | the change behind a switch, measured interleaved against the previous candidate and the reference, then frozen | it pays above the noise band, or it is reverted |
+| 4. Verify | as for a new task | |
+| 5. Deliver | as for a new task, with the trajectory: each round's change and saving | |
+
+- The records of `start_from` are inputs: its design notes, its runs and its negative
+  results. Re-measure before relying on its numbers.
+- A round keeps one change; two changes measured together cannot be attributed.
+- `reference_access` says what the session may learn about the reference implementation:
+  `clean` (nothing beyond the facts), `blackbox` (its kernel trace and its phase times,
+  never its source or ISA) or `open` (anything). A case's README says how.
+- `benchmark/cco/harness/loop_state.py` follows these steps for `kind: optimize`. For both
+  kinds it stops the loop after `budget.stop_after_flat_rounds` verdicts in a row without
+  a gain above the noise band at the target bucket.
+
 ## Stop rules
 
 Stop and report when any of these holds:
@@ -167,6 +192,7 @@ unless the verifier's numbers show it.
   contract.yaml            approved by the owner
   bounds.md                step 1
   design/<candidate>.md    step 2, one per candidate
+  hypotheses.md            optimization tasks: step 2, one change per item of the gap ledger
   runs/<run-id>/           result.json, timeline, ISA summary, log (development and verification)
   candidates/<id>.json     frozen candidate manifests
   verdicts/<id>.json       verifier output

@@ -24,7 +24,9 @@ the least code. You do not accept your own candidate; a separate verifier measur
 - **Step 2:** one design note per candidate
   (`.claude/skills/cco-fusion-loop/templates/design-note.md`), following
   `.claude/skills/cco-fusion-loop/reference/design-checklist.md`, each with a predicted
-  time per bucket and the measurement that would falsify it.
+  time per bucket and the measurement that would falsify it. In an optimization task
+  (`kind: optimize`) the start candidate's design stands: write `hypotheses.md` from the
+  gap ledger instead, and change one thing per round behind a switch.
 - **Step 3:** build the chosen candidate behind switches, then run the correctness gate,
   the ISA check (`benchmark/cco/harness/isa_check.py`), the measurement
   (`benchmark/cco/harness/run.py`) and the gap
