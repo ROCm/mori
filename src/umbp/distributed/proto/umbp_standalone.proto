@@ -19,6 +19,9 @@ service UMBPStandalone {
   rpc BatchPrefetch(BatchKeysRequest) returns (CountResponse);
   // IUMBPClient::BatchTouch; a server without it answers UNIMPLEMENTED.
   rpc BatchTouch(BatchKeysRequest) returns (CountResponse);
+  // IUMBPClient::LinkGroup; a server without it answers UNIMPLEMENTED.
+  // Associates keys as a group: evicting any member evicts all members.
+  rpc LinkGroup(LinkGroupRequest) returns (BoolResponse);
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);
@@ -230,4 +233,12 @@ message StandaloneExternalKvHitCountEntry {
 
 message StandaloneExternalKvHitCountsResponse {
   repeated StandaloneExternalKvHitCountEntry entries = 1;
+}
+
+// LinkGroup: associates a set of keys as an eviction group.
+// Evicting any member key evicts all other members in the group.
+// Idempotent: re-linking the same keys to the same group_id is safe.
+message LinkGroupRequest {
+  string group_id = 1;
+  repeated string keys = 2;
 }

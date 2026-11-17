@@ -361,6 +361,15 @@ size_t DistributedClient::BatchTouch(const std::vector<std::string>& keys) {
   return pool_client_->BatchTouch(keys);
 }
 
+bool DistributedClient::LinkGroup(const std::string& group_id,
+                                  const std::vector<std::string>& keys) {
+  if (closing_ || keys.empty()) return true;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return true;
+  pool_client_->LinkGroup(group_id, keys);
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // RegisterMemory / DeregisterMemory
 // ---------------------------------------------------------------------------

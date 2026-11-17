@@ -873,6 +873,29 @@ size_t StandaloneProcessClient::BatchTouch(const std::vector<std::string>& keys)
   return status.ok() ? static_cast<size_t>(resp.count()) : 0;
 }
 
+bool StandaloneProcessClient::LinkGroup(const std::string& group_id,
+                                        const std::vector<std::string>& keys) {
+  if (closing_ || keys.empty()) return true;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return true;
+  grpc::ClientContext ctx;
+  ::umbp::LinkGroupRequest req;
+  req.set_group_id(group_id);
+  for (const auto& key : keys) req.add_keys(key);
+  ::umbp::BoolResponse resp;
+  const grpc::Status status = stub_->LinkGroup(&ctx, req, &resp);
+  if (status.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
+    static std::once_flag warned;
+    std::call_once(warned, [this] {
+      MORI_UMBP_WARN(
+          "[StandaloneProcessClient] server {} predates LinkGroup; group eviction disabled",
+          address_);
+    });
+    return true;  // best-effort: older server, no group eviction
+  }
+  return status.ok() && resp.ok();
+}
+
 bool StandaloneProcessClient::Clear() {
   SimCall call(sim_trace_.get(), "clear", 0, 0);
   if (closing_) return call.Result(true);
