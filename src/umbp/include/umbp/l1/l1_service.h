@@ -80,6 +80,7 @@ class L1Client {
   FetchResult Fetch(const std::string& pool_id, const std::vector<std::string>& keys);
   // Node to node; see PoolManager::Export.
   ExportResult Export(const std::string& group, const std::vector<std::string>& keys);
+  Status SetGroupEvictionPolicy(const std::string& group, bool evict_as_unit);
   Status Clear(const std::string& pool_id);
   Status Detach(const std::string& pool_id);
   Status Stats(std::vector<PoolStats>* out);

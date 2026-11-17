@@ -467,6 +467,71 @@ TEST_F(L1PoolTest, DetachRemovesThePoolAsASource) {
   EXPECT_FALSE(manager->Allocate("p0", 1).status.ok);
 }
 
+// Group eviction: when evict_as_unit is set, evicting a key from one pool in
+// the group also evicts it from every other pool that holds a releasable copy.
+
+TEST_F(L1PoolTest, GroupEvictAsUnitEvictsPeersOnAllocate) {
+  ASSERT_TRUE(manager->SetGroupEvictionPolicy("g", true).ok);
+  // Both pools hold the same key "a".
+  Cache(0, {"a"}, 10);
+  Cache(1, {"a"}, 10);
+  EXPECT_EQ(StatsOf("p0").cached, 1u);
+  EXPECT_EQ(StatsOf("p1").cached, 1u);
+
+  // Fill p0 to capacity (kSlots-1 more keys so it has to evict "a" next).
+  std::vector<std::string> fill_keys;
+  for (int i = 0; i < static_cast<int>(kSlots) - 1; ++i)
+    fill_keys.push_back("fill" + std::to_string(i));
+  Cache(0, fill_keys, 20);
+
+  // Allocating one more from p0 must evict "a" from p0 AND from p1.
+  AllocateResult res = manager->Allocate("p0", 1);
+  ASSERT_EQ(res.evicted_keys, (std::vector<std::string>{"a"}));
+
+  // p1's copy of "a" must be gone too.
+  EXPECT_EQ(StatsOf("p1").evicted, 1u);
+  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
+}
+
+TEST_F(L1PoolTest, GroupEvictAsUnitSkipsHeldPeerCopy) {
+  ASSERT_TRUE(manager->SetGroupEvictionPolicy("g", true).ok);
+  Cache(0, {"a"}, 10);
+  Cache(1, {"a"}, 10);
+
+  // Hold p1's slot for "a" so it cannot be cascade-evicted.
+  FetchResult held = manager->Fetch("p1", {"a"});
+  ASSERT_EQ(held.slots.size(), 1u);
+  ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kHold, held.slots[0], ""}}).ok);
+
+  // Fill p0 to force eviction of "a".
+  std::vector<std::string> fill_keys;
+  for (int i = 0; i < static_cast<int>(kSlots) - 1; ++i)
+    fill_keys.push_back("fill" + std::to_string(i));
+  Cache(0, fill_keys, 20);
+  AllocateResult res = manager->Allocate("p0", 1);
+  ASSERT_EQ(res.evicted_keys, (std::vector<std::string>{"a"}));
+
+  // p1's held slot must still be there.
+  EXPECT_EQ(StatsOf("p1").evicted, 0u);
+}
+
+TEST_F(L1PoolTest, GroupEvictAsUnitOffByDefaultLeavesOrphanCopy) {
+  // Default: evict_as_unit is off; peer copy survives.
+  Cache(0, {"a"}, 10);
+  Cache(1, {"a"}, 10);
+
+  std::vector<std::string> fill_keys;
+  for (int i = 0; i < static_cast<int>(kSlots) - 1; ++i)
+    fill_keys.push_back("fill" + std::to_string(i));
+  Cache(0, fill_keys, 20);
+  AllocateResult res = manager->Allocate("p0", 1);
+  ASSERT_EQ(res.evicted_keys, (std::vector<std::string>{"a"}));
+
+  // p1 still holds its copy.
+  EXPECT_EQ(StatsOf("p1").evicted, 0u);
+  EXPECT_EQ(StatsOf("p1").cached, 1u);
+}
+
 TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {
   const std::string path = "/tmp/umbp_l1_test_" + std::to_string(getpid()) + ".sock";
   unlink(path.c_str());

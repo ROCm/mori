@@ -40,6 +40,10 @@ service UMBPL1Pool {
   // Node to node: copy what this node's pools of a group hold of these keys
   // into this node's store, where the asking node can read them.
   rpc Export(ExportRequest) returns (ExportResponse);
+  // Set the eviction policy for a group. When evict_as_unit is true, evicting
+  // a key from any pool in the group also evicts it from every other pool in
+  // the group whose copy is releasable (kCached, settled, unpinned).
+  rpc SetGroupPolicy(SetGroupPolicyRequest) returns (StatusResponse);
 }
 
 message StatusResponse {
@@ -169,6 +173,13 @@ message ExportResponse {
   string error = 2;
   // stored[i]: keys[i] is now in this node's store.
   repeated bool stored = 3 [packed = true];
+}
+
+message SetGroupPolicyRequest {
+  string group = 1;
+  // When true, evicting a key from any pool in the group also evicts it from
+  // every other pool in the group whose copy is kCached, settled, and unpinned.
+  bool evict_as_unit = 2;
 }
 
 message StatsRequest {}

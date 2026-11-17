@@ -194,6 +194,20 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           py::arg("group"), py::arg("keys"),
           "Copy what the node's pools of `group` hold of `keys` into its store.")
       .def(
+          "set_group_eviction_policy",
+          [](L1Client& client, const std::string& group, bool evict_as_unit) {
+            Status status;
+            {
+              py::gil_scoped_release release;
+              status = client.SetGroupEvictionPolicy(group, evict_as_unit);
+            }
+            Check(status);
+          },
+          py::arg("group"), py::arg("evict_as_unit"),
+          "When evict_as_unit=True, evicting a key from any pool in the group also evicts it "
+          "from every other pool in the group whose copy is cached, settled, and unpinned. "
+          "Use for TP: a logical block needs ALL rank shards to hit.")
+      .def(
           "clear",
           [](L1Client& client, const std::string& pool_id) {
             Status status;

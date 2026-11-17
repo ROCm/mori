@@ -294,6 +294,11 @@ class PoolManager {
   // Copy what this node's pools of `group` hold of `keys` into the lower
   // store, for another node to read. The slots stay as they are.
   ExportResult Export(const std::string& group, const std::vector<std::string>& keys);
+  // Set the eviction policy for a group. When evict_as_unit is true, evicting a
+  // key from any pool in the group also evicts it from every other pool in the
+  // group whose copy is kCached, settled, and unpinned (best-effort). The group
+  // need not exist yet; the flag is recorded and applies once pools join it.
+  Status SetGroupEvictionPolicy(const std::string& group, bool evict_as_unit);
   Status Clear(const std::string& pool_id);
   Status Detach(const std::string& pool_id);
   std::vector<PoolStats> Stats() const;
@@ -355,6 +360,11 @@ class PoolManager {
 
   struct Group {
     bool has_layout = false;
+    // When true, evicting a key from one pool in this group also evicts it from
+    // every other pool in the group that holds a kCached, settled, unpinned copy.
+    // Use for TP: a logical block needs ALL rank shards to produce a cache hit,
+    // so evicting one shard makes the rest useless.
+    bool evict_as_unit = false;
     std::vector<uint64_t> unit_bytes;
     std::unordered_map<std::string, std::vector<Holder>> holders;
   };
@@ -375,6 +385,10 @@ class PoolManager {
   Pool* FindLocked(const std::string& pool_id);
   // Stop advertising `slot`'s key. The slot keeps its state.
   void UnindexLocked(Pool* pool, uint32_t slot);
+  // If evict_as_unit is set on the group, evict `key` from every other pool in
+  // the group that holds a kCached, settled, unpinned copy. Called after the
+  // triggering pool has already unindexed its own copy.
+  void GroupEvictPeersLocked(Pool* evicting_pool, const std::string& key);
   void ResetSlotsLocked(Pool* pool);
   // A free slot for new content, or false. Appends the key it destroyed; with
   // `evicted` null only a vacant slot is taken. `settled_only` is for a taker

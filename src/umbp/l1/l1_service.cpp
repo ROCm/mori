@@ -168,6 +168,13 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
     });
   }
 
+  grpc::Status SetGroupPolicy(grpc::ServerContext*, const pb::SetGroupPolicyRequest* request,
+                              pb::StatusResponse* response) override {
+    SetStatus(manager_->SetGroupEvictionPolicy(request->group(), request->evict_as_unit()),
+              response);
+    return grpc::Status::OK;
+  }
+
   grpc::Status Clear(grpc::ServerContext*, const pb::PoolRequest* request,
                      pb::StatusResponse* response) override {
     SetStatus(manager_->Clear(request->pool_id()), response);
@@ -415,6 +422,16 @@ ExportResult L1Client::Export(const std::string& group, const std::vector<std::s
   result.stored.assign(response.stored().begin(), response.stored().end());
   result.stored.resize(keys.size(), false);
   return result;
+}
+
+Status L1Client::SetGroupEvictionPolicy(const std::string& group, bool evict_as_unit) {
+  pb::SetGroupPolicyRequest request;
+  request.set_group(group);
+  request.set_evict_as_unit(evict_as_unit);
+  pb::StatusResponse response;
+  grpc::ClientContext context;
+  Impl::Bound(&context);
+  return FromResponse(impl_->stub_->SetGroupPolicy(&context, request, &response), response);
 }
 
 Status L1Client::Clear(const std::string& pool_id) {

@@ -538,6 +538,7 @@ bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::st
         }
       }
       UnindexLocked(pool, *slot);
+      GroupEvictPeersLocked(pool, evicted->back());
       ++pool->evicted;
     }
     return true;
@@ -1343,6 +1344,33 @@ void PoolManager::TierWorker() {
       std::lock_guard<std::mutex> lock(mutex_);
       if (stopping_) return;
     }
+  }
+}
+
+Status PoolManager::SetGroupEvictionPolicy(const std::string& group, bool evict_as_unit) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  groups_[group].evict_as_unit = evict_as_unit;
+  return Status{};
+}
+
+void PoolManager::GroupEvictPeersLocked(Pool* evicting_pool, const std::string& key) {
+  auto git = groups_.find(evicting_pool->group);
+  if (git == groups_.end() || !git->second.evict_as_unit) return;
+  auto hit = git->second.holders.find(key);
+  if (hit == git->second.holders.end()) return;
+  // Snapshot: UnindexLocked mutates holders->second during iteration.
+  const std::vector<Holder> peers = hit->second;
+  for (const Holder& h : peers) {
+    if (h.pool == evicting_pool) continue;
+    Slot& s = h.pool->slots[h.slot];
+    if (s.state != SlotState::kCached) continue;
+    if (s.pins != 0) continue;
+    if (!Fillable(*h.pool, s)) continue;
+    h.pool->lru.erase(s.lru_it);
+    UnindexLocked(h.pool, h.slot);
+    s.state = SlotState::kVacant;
+    h.pool->vacant.insert(h.slot);
+    ++h.pool->evicted;
   }
 }
 
