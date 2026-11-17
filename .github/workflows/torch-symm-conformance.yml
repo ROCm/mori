@@ -1,0 +1,22 @@
+name: torch symm_mem conformance
+
+# PyTorch's test_symmetric_memory.py on the MORI backend, for the image's torch, the
+# latest release and the nightly. Not part of PR or main CI: the job lives in
+# ci_cco.yml and runs only for the group passed here.
+on:
+  schedule:
+    - cron: '0 23 * * *'  # daily 07:00 Beijing (UTC+8), after the nightly wheel build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: torch-symm-conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    uses: ./.github/workflows/ci_cco.yml
+    with:
+      groups: '["torch-conformance"]'

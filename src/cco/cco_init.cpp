@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstdio>
@@ -491,6 +492,38 @@ static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
   return hipSuccess;
 }
 
+// ROCm 7.14 returns one exported fd per allocation and closes it at the last release (an early
+// close strands the memory); ROCm 10 returns a new caller-owned fd per export. Tell them apart.
+static bool CcoRuntimeOwnsExportedFd(int hipDev) {
+  static std::once_flag once;
+  static bool owned = false;
+  std::call_once(once, [hipDev] {
+    hipMemAllocationProp prop = {};
+    prop.type = hipMemAllocationTypePinned;
+    prop.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
+    prop.location.type = hipMemLocationTypeDevice;
+    prop.location.id = hipDev;
+    vmmProcessLock vmmLock;
+    size_t gran = 0;
+    hipMemGenericAllocationHandle_t h = 0;
+    if (hipMemGetAllocationGranularity(&gran, &prop, hipMemAllocationGranularityMinimum) ==
+            hipSuccess &&
+        hipMemCreate(&h, gran, &prop, 0) == hipSuccess) {
+      int a = -1, b = -1;
+      (void)hipMemExportToShareableHandle(&a, h, hipMemHandleTypePosixFileDescriptor, 0);
+      (void)hipMemExportToShareableHandle(&b, h, hipMemHandleTypePosixFileDescriptor, 0);
+      owned = a >= 0 && a == b;
+      if (!owned) {
+        if (a >= 0) close(a);
+        if (b >= 0) close(b);
+      }
+      (void)hipMemRelease(h);
+    }
+    (void)hipGetLastError();
+  });
+  return owned;
+}
+
 // Warn when the kernel lacks CONFIG_PCI_P2PDMA: a peer window import is then pinned in
 // system memory instead of mapped peer-to-peer, and KFD may keep every rank's queues
 // evicted. p2pdma.c is built only with that option, so its symbol in
@@ -544,11 +577,13 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   comm->rank = comm->bootNet->GetLocalRank();
   comm->worldSize = comm->bootNet->GetWorldSize();
 
-  // Derive a shared group ID (rank 0's pid) for unique LocalBootstrap socket paths
-  int64_t myPid = static_cast<int64_t>(getpid());
-  std::vector<int64_t> allPids(comm->worldSize);
-  comm->bootNet->Allgather(&myPid, allPids.data(), sizeof(int64_t));
-  comm->groupId = allPids[0];
+  // Socket-path group ID: rank 0's pid plus a per-process comm count, unique per comm.
+  static std::atomic<uint32_t> commSeq{0};
+  int64_t myId = (static_cast<int64_t>(getpid()) << 24) |
+                 static_cast<int64_t>(commSeq.fetch_add(1) & 0xFFFFFFu);
+  std::vector<int64_t> allIds(comm->worldSize);
+  comm->bootNet->Allgather(&myId, allIds.data(), sizeof(int64_t));
+  comm->groupId = allIds[0];
 
   MORI_SHMEM_TRACE("ccoCommCreate: rank={} worldSize={} groupId={}", comm->rank, comm->worldSize,
                    comm->groupId);
@@ -842,7 +877,7 @@ int ccoCommDestroy(ccoComm* comm) {
     vmmProcessLock vmmLock;
     (void)hipMemUnmap(static_cast<char*>(ptr) - meta.dataOffset, meta.size);
     (void)hipMemRelease(meta.physHandle);
-    if (!meta.isFabric && meta.shareFd >= 0) close(meta.shareFd);
+    if (!meta.isFabric && meta.shareFd >= 0 && meta.ownsShareFd) close(meta.shareFd);
   }
   comm->allocTable.clear();
 
@@ -982,6 +1017,7 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
                                         hipMemHandleTypeFabricCompat, 0);
   } else {
     meta.shareFd = -1;
+    meta.ownsShareFd = !CcoRuntimeOwnsExportedFd(comm->hipDev);
     err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&meta.shareFd), physHandle,
                                         hipMemHandleTypePosixFileDescriptor, 0);
   }
@@ -1134,6 +1170,7 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
                                         hipMemHandleTypeFabricCompat, 0);
   } else {
     meta.shareFd = -1;
+    meta.ownsShareFd = !CcoRuntimeOwnsExportedFd(comm->hipDev);
     err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&meta.shareFd), physHandle,
                                         hipMemHandleTypePosixFileDescriptor, 0);
   }
@@ -1205,7 +1242,7 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
     }
   }
 
-  if (!meta.isFabric && meta.shareFd >= 0) close(meta.shareFd);
+  if (!meta.isFabric && meta.shareFd >= 0 && meta.ownsShareFd) close(meta.shareFd);
 
   return 0;
 }
@@ -1272,6 +1309,8 @@ static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh, bool isFabric,
 }
 
 int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin) {
+  // Names this register's socket rendezvous; slot offsets differ across ranks once frees diverge.
+  const uint64_t windowSeq = comm->windowSeq++;
   auto it = comm->allocTable.find(ptr);
   if (it == comm->allocTable.end()) {
     MORI_SHMEM_ERROR("ccoWindowRegister: ptr {} not in allocTable", ptr);
@@ -1459,7 +1498,7 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
       int p2pWorldSize = static_cast<int>(sortedGroup.size());
 
       std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" +
-                               std::to_string(slotOffset) + "_g" + std::to_string(sortedGroup[0]) +
+                               std::to_string(windowSeq) + "_g" + std::to_string(sortedGroup[0]) +
                                "_";
 
       application::LocalBootstrapNetwork localBoot(myPeerRank, p2pWorldSize, socketPath);

@@ -933,3 +933,86 @@ jobs:
             test -n '$ROOTLESS' || $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
             cd $GITHUB_WORKSPACE && CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
           " || true
+
+  torch-symm-conformance:
+    name: torch symm_mem conformance (torch ${{ matrix.torch }})
+    # PyTorch's own test_symmetric_memory.py with every symm_mem call on the MORI
+    # backend (tests/python/allocator/torch_conformance). Hours of GPU time, so no PR
+    # or main scope asks for it: ci_scope.py never emits this group, and only
+    # torch-symm-conformance.yml (nightly and on demand) passes it.
+    if: contains(fromJSON(inputs.groups), 'torch-conformance')
+    runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The image's own torch, the latest release, and the nightly.
+          - torch: image
+            index: ""
+            spec: ""
+          - torch: "2.15"
+            index: https://download.pytorch.org/whl/rocm7.14
+            spec: torch==2.15.0
+          - torch: nightly
+            index: https://download.pytorch.org/whl/nightly/rocm10.0
+            spec: --pre torch
+    env:
+      CT: docker
+      CONTAINER: mori_torch_conformance_${{ github.run_id }}_${{ strategy.job-index }}
+      OUT: ${{ github.workspace }}/torch-conformance
+      # Every first rendezvous creates a cco comm over MORI's socket bootstrap; pinned
+      # for the same reason as ci.yml's intranode-test socket_ifname (eno1 refuses local TCP).
+      MORI_SOCKET_IFNAME: eno0
+      NCCL_SOCKET_IFNAME: eno0
+    timeout-minutes: 180
+    steps:
+      - *cco-fix-perms
+      - *cco-checkout
+      - *cco-build-image
+      - *cco-start
+
+      - name: Build mori and pick the torch under test
+        run: |
+          # The JIT path compiles the backend for whichever torch is loaded, so one
+          # wheel serves every matrix entry.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && rm -rf /tmp/mori-dist && \
+            BUILD_UMBP=OFF pip wheel . --no-deps -w /tmp/mori-dist"
+          # Other torches go in a venv; the system pip installs into it (--python), as
+          # the image's Python may have no ensurepip.
+          if [ -z "${{ matrix.spec }}" ]; then
+            PY=python PIP="python -m pip"
+          else
+            PY=/tmp/torch-venv/bin/python PIP="python -m pip --python /tmp/torch-venv/bin/python"
+            $CT exec $CONTAINER bash -c "\
+              python -m venv --without-pip /tmp/torch-venv && \
+              $PIP install --index-url ${{ matrix.index }} ${{ matrix.spec }} && \
+              $PIP install numpy"
+          fi
+          $CT exec $CONTAINER bash -c "\
+            $PIP install pytest pytest-timeout expecttest /tmp/mori-dist/amd_mori-*.whl && \
+            $PY -c 'import torch, mori; print(torch.__version__, torch.version.git_version)'"
+          echo "PY=$PY" >> $GITHUB_ENV
+
+      - name: Run test_symmetric_memory.py on the MORI backend (two lanes of world 4)
+        run: |
+          # Exit status 1 means a failure or skip that expected.tsv does not document;
+          # report.txt lists them.
+          $CT exec -e MORI_SYMM_FORCE_JIT=1 $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && rm -rf $OUT && \
+            $PY tests/python/allocator/torch_conformance/run_conformance.py \
+              --python $PY --fetch --out $OUT --gpus 0,1,2,3 --gpus 4,5,6,7"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: torch-symm-conformance-${{ matrix.torch }}-${{ github.run_id }}
+          path: |
+            ${{ env.OUT }}/report.txt
+            ${{ env.OUT }}/summary.tsv
+            ${{ env.OUT }}/torch.json
+            ${{ env.OUT }}/logs
+          if-no-files-found: warn
+
+      - *cco-cleanup

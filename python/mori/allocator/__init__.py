@@ -23,10 +23,11 @@
 
 torch owns the allocation and its lifetime; CCO owns the peer addressing. ``alloc`` is
 plain HIP VMM, and ``rendezvous`` hands that allocation to ``ccoWindowRegister``, which
-aliases it into CCO's flat LSA space -- so ``buffer_ptrs`` are ``ccoGetPeerPtr`` results
-and agree with the device-side ``Window.lsa_ptr`` by construction. CCO's communicator is
-created on the first rendezvous of a process group and its unique id travels over torch's
-own Store, so there is no second bootstrap channel to configure::
+aliases it into CCO's flat LSA space -- so peer ``buffer_ptrs`` are ``ccoGetPeerPtr``
+results and agree with the device-side ``Window.lsa_ptr`` by construction. This rank's own
+entry is the tensor's address. CCO's communicator is created on the first rendezvous of a
+process group and its unique id travels over torch's own Store, so there is no second
+bootstrap channel to configure::
 
     import torch.distributed._symmetric_memory as symm_mem
     from mori.allocator import register_symm_backend
@@ -41,53 +42,58 @@ own Store, so there is no second bootstrap channel to configure::
 ``resolve_process_group()``, the way torch's own CUDA and NCCL backends do it, rather
 than through the ``GroupInfo`` registry that only that deprecated call populates.
 
-Known constraint on the POSIX-fd path (gfx9, i.e. MI300/MI355): CCO names its rendezvous
-socket after the local slot offset, and freeing a window returns that slot to a per-rank
-allocator. Ranks that free symmetric tensors in *different* orders therefore get different
-offsets, and a later ``rendezvous()`` fails with a P2P fd exchange timeout. Free order is
-unconstrained as far as torch is concerned, so keep it uniform across ranks until that
-naming changes. The fabric path is unaffected -- peer addressing is computed from each
-rank's own offset.
+State follows torch's model. There is one CCO communicator per (process group, device)
+and one window plus signal pad per (allocation, group), so a tensor rendezvous'd with two
+groups gets two independent handles. ``rendezvous`` accepts any pointer inside a
+symmetric allocation (a MemPool tensor) and reports where it starts via ``get_offset()``;
+``buffer_ptrs`` stay the allocation bases. A pointer this backend did not allocate gives
+``None``, and ``is_symm_mem_tensor`` reflects the same lookup. ``alloc`` and a first
+rendezvous refuse to run under graph capture. ``alloc`` zeroes the memory on the caller's
+current stream; a first rendezvous does its own copies there too, but CCO's window
+registration (and, for a new group, communicator creation) still issues synchronous copies
+on the null stream, so it waits for work queued there. A communicator is released once its
+process group is destroyed and no handle on it is left.
 
 Peers are exposed the way torch's model expects, as the ``buffer_ptrs`` /
 ``buffer_ptrs_dev`` array -- one base address per rank, same as every other backend.
-
-Internally the ranks are mapped into one flat span, so those pointers happen to be evenly
-strided (``buffer_ptrs[r] == buffer_ptrs[0] + r*stride``). That is deliberately not public
-yet: exposing it belongs with mori's cco window, whose ``ccoWindowDevice`` already defines
-the layout (``winBase``, 4 GiB-quantised ``stride4G``, LSA-rank indexing). See ROCm/mori#557
-for the staged plan.
+Internally the peers are mapped into one flat span, so they happen to be evenly strided.
+That is deliberately not public yet: exposing it belongs with mori's cco window, whose
+``ccoWindowDevice`` already defines the layout (``winBase``, 4 GiB-quantised
+``stride4G``, LSA-rank indexing). See ROCm/mori#557 for the staged plan.
 
 The handle type is probed per device: fabric where supported, POSIX fd otherwise. gfx9
 (MI300/MI355) has no fabric support -- ``hipMemCreate`` itself reports "operation not
 supported" -- so those fall back to fd, which needs no configuration. The allocation and
 CCO's own export have to agree on that type, since CCO re-exports what it imports.
 
-``MORI_SYMM_PER_RANK_VMM`` sizes the communicator's flat VA reservation (default 4 GiB).
-It is a floor rather than a budget -- CCO quantises it up to 4 GiB -- and it bounds live
-symmetric memory per rank, not allocations over time, because slots are recycled on free.
+Each communicator reserves flat VA for (LSA team size) x (per-rank size) once. The
+per-rank size bounds live symmetric memory per rank in that group, not allocations over
+time (slots are recycled on free). It defaults to device memory when the LSA team can
+have at most 8 ranks, and is capped so a communicator takes at most about 4 TiB of VA
+beyond that. ``MORI_SYMM_PER_RANK_VMM`` overrides it (bytes; CCO rounds up to 4 GiB).
 
 The signal pad is always there, as its own CCO allocation and window rather than a tail
 appended to the buffer -- the same split NCCL's backend uses. torch's own ``symm_mem``
 collectives synchronise through it, so they work without any build flag.
 
-``barrier()`` runs over CCO's host barrier, which means the current stream is drained
-first: stronger than the device-side barrier torch asks for, and heavier.
-``put_signal``/``wait_signal`` still raise -- point-to-point signalling needs a
-``ccoDevComm``, which this backend does not create yet.
-
-``rendezvous()`` takes the tensor's *storage* base, so ``get_offset()`` is 0 by
-construction: every ``alloc()`` is its own VMM allocation. Handing it a view
-(``rendezvous(t[512:])``) therefore describes the whole storage, and ``get_remote_tensor``
-answers for the storage base -- pass ``storage_offset`` to ``get_buffer`` to address a
-slice. That is torch's model, not something this backend narrows.
+``barrier()``, ``put_signal()`` and ``wait_signal()`` are kernels on the caller's current
+stream that follow torch's signal-pad protocol, so they mix with torch's own ``symm_mem``
+ops, capture into HIP graphs, and on torch >= 2.15 join its per-group stream ordering.
+A timeout traps the kernel as torch's backends do: the next synchronisation raises, and
+the process's GPU state is unusable from then on. A peer outside the LSA team (another
+host without a fabric; its ``buffer_ptrs`` entry is 0) has no signal pad mapping:
+``barrier()`` then syncs the stream and meets on the host, and ``put_signal()`` or
+``wait_signal()`` with that peer raises.
 
 The extension is optional and its ABI tracks the installed torch, so it is a plugin:
 ``pip install`` prebuilds it when it can (``BUILD_TORCH_SYMM=AUTO``, the default; ``ON``
-makes a failure fatal, ``OFF`` skips it), and a build that did not happen or no longer
-loads is compiled here on first import from the sources shipped in ``_jit-sources``. So
-switching torch does not require reinstalling mori. ``MORI_SYMM_FORCE_JIT=1`` ignores the
-prebuilt module.
+makes a failure fatal, ``OFF`` skips it). A prebuilt module made for a different torch
+build is refused before it can register, and the backend is then compiled on first import,
+with hipcc, from the sources shipped in ``_jit-sources`` -- against torch's own ROCm, into
+a cache directory per torch build. So switching torch does not require reinstalling mori.
+``MORI_SYMM_FORCE_JIT=1`` ignores the prebuilt module. If neither works, importing
+``mori.allocator`` logs a warning and ``set_backend("MORI")`` reports the backend as
+unknown.
 """
 
 import atexit
@@ -118,16 +124,31 @@ _atexit_registered = False
 
 _ext_cache = None
 
+# Host half and signal-pad kernels; setup.py builds the same pair.
+_SOURCES = ("symm_backend.cpp", "symm_signal.hip")
 
-def _jit_ext():
+
+def _offload_arch_flags() -> list:
+    """Target the GPU mori detects; with no flag, torch picks from the visible devices."""
+    from ..jit.config import detect_gpu_arch
+
+    try:
+        return [f"--offload-arch={detect_gpu_arch()}"]
+    except RuntimeError:
+        return []
+
+
+def _jit_ext(fingerprint: str):
     """Compile the backend against the torch that is actually loaded.
 
-    torch caches the result under TORCH_EXTENSIONS_DIR keyed by the build flags, so this
-    costs a compile once per (torch, flag) combination, not once per process."""
+    Built in a directory of its own per torch build, so processes on different torch
+    builds sharing TORCH_EXTENSIONS_DIR neither reuse each other's module nor keep
+    rebuilding over it."""
     import torch
-    from torch.utils.cpp_extension import load
+    from torch.utils import cpp_extension
 
     from ..jit.config import get_mori_source_root
+    from ._build import hip_link_dir, rocm_home
 
     # Checked before ninja, not after: on torch < 2.9 the SymmetricMemory interface this
     # implements does not exist, so the compile is a guaranteed minute-long failure whose
@@ -147,30 +168,69 @@ def _jit_ext():
             "mori_torch_symm is not built and its sources were not found. Reinstall "
             "mori from a source tree or a wheel that ships _jit-sources."
         )
-    source = root / "src" / "allocator" / "symm_backend.cpp"
-    if not source.is_file():
-        raise ImportError(f"mori_torch_symm sources missing at {source}")
+    sources = [root / "src" / "allocator" / name for name in _SOURCES]
+    missing = [str(s) for s in sources if not s.is_file()]
+    if missing:
+        raise ImportError(f"mori_torch_symm sources missing: {missing}")
 
-    rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    rocm = rocm_home(cpp_extension)
+    # -I as flags, not extra_include_paths: load() hipifies every header under those,
+    # writing *_hip copies into the package and the ROCm tree.
+    includes = [f"-I{root / 'include'}", f"-I{rocm}/include"]
     # No -std here: load() already passes the standard torch's headers need.
-    flags = ["-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1"]
-    logger.info("compiling mori_torch_symm from %s", source)
+    flags = [
+        "-O3",
+        "-D__HIP_PLATFORM_AMD__=1",
+        "-DUSE_ROCM=1",
+        f"-DMORI_TORCH_FINGERPRINT={fingerprint}",
+        *includes,
+    ]
+    name = "mori_torch_symm"
+    try:
+        build_dir = cpp_extension._get_build_directory(f"{name}_{fingerprint}", False)
+    except AttributeError:  # pragma: no cover - private helper, present since torch 1.x
+        build_dir = None
+    hip_dir = hip_link_dir(rocm, os.path.join(build_dir, "hip")) if build_dir else None
+    # Searched before torch's own -L, so its -lamdhip64 also resolves to torch's runtime.
+    hip_link = [f"-L{hip_dir or rocm + '/lib'}", "-lamdhip64"]
+    logger.info(
+        "compiling %s for torch %s from %s", name, torch.__version__, sources[0].parent
+    )
     # libmori_cco sits in the package directory, wherever mori was installed.
     pkg = str(Path(__file__).resolve().parent.parent)
-    return load(
-        name="mori_torch_symm",
-        sources=[str(source)],
-        extra_include_paths=[str(root / "include"), f"{rocm}/include"],
+    return cpp_extension.load(
+        name=name,
+        sources=[str(s) for s in sources],
         extra_cflags=flags,
-        extra_ldflags=[
-            f"-L{rocm}/lib",
-            "-lamdhip64",
-            "-lc10_hip",
-            f"-L{pkg}",
-            "-lmori_cco",
-            f"-Wl,-rpath,{pkg}",
-        ],
+        extra_cuda_cflags=["-O3", *includes, *_offload_arch_flags()],
+        extra_ldflags=hip_link
+        + ["-lc10_hip", f"-L{pkg}", "-lmori_cco", f"-Wl,-rpath,{pkg}"],
+        build_directory=build_dir,
     )
+
+
+def _prebuilt_ext(fingerprint: str):
+    """The module ``pip install`` built, if it exists and was built for this torch."""
+    import importlib.util
+
+    if (
+        importlib.util.find_spec(f"{__package__.rsplit('.', 1)[0]}.mori_torch_symm")
+        is None
+    ):
+        return None, "not built"
+    try:
+        from .. import mori_torch_symm as ext
+    # The .so is there but does not load, e.g. a symbol of another torch is gone.
+    except (ImportError, OSError) as exc:  # pragma: no cover - build dependent
+        logger.warning("prebuilt mori_torch_symm does not load, rebuilding: %s", exc)
+        return None, exc
+    built = getattr(ext, "torch_fingerprint", "unknown")
+    if built != fingerprint:
+        # Loading is harmless (registration is explicit); registering it would not be.
+        reason = f"built for another torch build ({built}, running {fingerprint})"
+        logger.info("prebuilt mori_torch_symm %s, rebuilding", reason)
+        return None, reason
+    return ext, None
 
 
 def _ext():
@@ -180,29 +240,25 @@ def _ext():
     if _ext_cache is not None:
         return _ext_cache
     try:
-        import torch  # noqa: F401
+        import torch
     except ImportError as exc:
         raise ImportError("mori.allocator requires torch") from exc
+    from ._build import torch_fingerprint
 
-    prebuilt_error = None
+    fingerprint = torch_fingerprint(torch)
+    prebuilt_error = "ignored (MORI_SYMM_FORCE_JIT)"
     if os.environ.get("MORI_SYMM_FORCE_JIT", "0").strip() not in {"1", "ON", "on"}:
-        try:
-            from .. import mori_torch_symm
-
-            _ext_cache = mori_torch_symm
+        ext, prebuilt_error = _prebuilt_ext(fingerprint)
+        if ext is not None:
+            _ext_cache = ext
             return _ext_cache
-        # ImportError also covers the interesting case: the .so is there but was linked
-        # against a different torch, so a symbol it needs is gone.
-        except (ImportError, OSError) as exc:  # pragma: no cover - build dependent
-            prebuilt_error = exc
-            logger.debug("prebuilt mori_torch_symm unusable, rebuilding: %s", exc)
 
     try:
-        _ext_cache = _jit_ext()
+        _ext_cache = _jit_ext(fingerprint)
     except Exception as exc:
         raise ImportError(
-            f"mori_torch_symm could not be loaded ({prebuilt_error}) and rebuilding it "
-            f"from source failed ({exc})."
+            f"mori_torch_symm: prebuilt module {prebuilt_error}, and building it for "
+            f"torch {torch.__version__} failed ({exc})."
         ) from exc
     return _ext_cache
 
@@ -240,7 +296,7 @@ def signal_pad_supported() -> bool:
     return bool(_ext().signal_pad_supported)
 
 
-def window_handle(tensor, signal_pad: bool = False) -> int:
+def window_handle(tensor, signal_pad: bool = False, group=None) -> int:
     """The cco window backing a rendezvous'd tensor, as an integer handle.
 
     Backend-specific on purpose: torch's ``SymmetricMemory`` has nowhere to carry a
@@ -251,10 +307,14 @@ def window_handle(tensor, signal_pad: bool = False) -> int:
     ``rendezvous(t[512:])`` registers the whole storage, so a view has to resolve to the
     same window rather than to "pointer is not a mori allocation".
 
+    Each group a tensor is rendezvous'd with has its own window; ``group`` (a process
+    group or its name) picks one and is required once there is more than one.
+
     Pass the result to a kernel that addresses peers with cco's device API
     (``mori.ir.triton.cco.Window.lsa_ptr``) instead of walking ``buffer_ptrs``.
     """
-    return _ext().window_handle(tensor.untyped_storage().data_ptr(), signal_pad)
+    name = getattr(group, "group_name", group) or ""
+    return _ext().window_handle(tensor.untyped_storage().data_ptr(), signal_pad, name)
 
 
 def dev_comm(group_name: str, key: str = "default", lsa_barrier_count: int = 1) -> int:
@@ -285,7 +345,9 @@ def _register_on_import() -> None:
         ImportError,
         RuntimeError,
     ) as exc:  # pragma: no cover - build/runtime dependent
-        logger.debug("%s backend not registered: %s", SYMM_BACKEND_NAME, exc)
+        logger.warning(
+            "%s symmetric memory backend not registered: %s", SYMM_BACKEND_NAME, exc
+        )
 
 
 _register_on_import()
