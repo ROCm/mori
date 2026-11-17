@@ -625,9 +625,15 @@ __forceinline__ __device__ void WarpAccumLF(T* __restrict__ dest, T* const* __re
   static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
   static_assert(Unroll >= 1);
   size_t offset = 0;
+// After the full-width pass, mop up whatever did not fill its Unroll*warpSize*vecSize step
+// with a dword-wide (VecBytes=4) pass that still runs through WarpAccumPackedDecode /
+// AccumPackedEncodeWord, so the tail keeps the gfx950 packed-convert fast path instead of
+// dropping to the per-element scalar loop. Continues from the same (by-ref) offset.
 #define WARP_ACCUM_LF_CASE(AccumNum)                                                     \
   case AccumNum:                                                                         \
     WarpAccumImpl<T, VecBytes, AccumNum, Unroll>(dest, srcs, srcScales, offset, nelems); \
+    if constexpr (VecBytes > 4)                                                          \
+      WarpAccumImpl<T, 4, AccumNum, 1>(dest, srcs, srcScales, offset, nelems);           \
     break;
   switch (accumNum) {
     WARP_ACCUM_LF_CASE(1)
@@ -640,6 +646,8 @@ __forceinline__ __device__ void WarpAccumLF(T* __restrict__ dest, T* const* __re
       if constexpr (VecBytes <= 8) {
         if (accumNum == 9) {
           WarpAccumImpl<T, VecBytes, 9, Unroll>(dest, srcs, srcScales, offset, nelems);
+          if constexpr (VecBytes > 4)
+            WarpAccumImpl<T, 4, 9, 1>(dest, srcs, srcScales, offset, nelems);
           break;
         }
       }
