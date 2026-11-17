@@ -1,6 +1,19 @@
-set(MORI_CCO_SOURCES cco_init.cpp)
+set(MORI_CCO_SOURCES cco_init.cpp cco_c_api.cpp)
 
 add_library(mori_cco SHARED ${MORI_CCO_SOURCES})
+
+# Reported by the C ABI's getVersion.
+execute_process(
+  COMMAND git describe --tags --always --dirty
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  OUTPUT_VARIABLE MORI_CCO_VERSION_STRING
+  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT MORI_CCO_VERSION_STRING)
+  set(MORI_CCO_VERSION_STRING "unknown")
+endif()
+set_source_files_properties(
+  cco_c_api.cpp PROPERTIES COMPILE_DEFINITIONS
+                           "MORI_VERSION_STRING=\"${MORI_CCO_VERSION_STRING}\"")
 
 target_include_directories(mori_cco PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_cco PUBLIC ${CMAKE_SOURCE_DIR})

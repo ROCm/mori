@@ -375,6 +375,10 @@ struct ccoSdmaContext {
   uint64_t** peerSignalPtrs;  // [lsaSize], peer signalBuf base via IPC
 };
 
+// Bump on any change to ccoDevComm or a struct it embeds. The C ABI reports it,
+// so device code built apart from the host library can check that both agree.
+static constexpr uint32_t CCO_DEV_COMM_LAYOUT_VERSION = 1;
+
 struct ccoDevComm {
   // World / topology
   int rank;
