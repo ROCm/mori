@@ -48,9 +48,11 @@ groups gets two independent handles. ``rendezvous`` accepts any pointer inside a
 symmetric allocation (a MemPool tensor) and reports where it starts via ``get_offset()``;
 ``buffer_ptrs`` stay the allocation bases. A pointer this backend did not allocate gives
 ``None``, and ``is_symm_mem_tensor`` reflects the same lookup. ``alloc`` and a first
-rendezvous refuse to run under graph capture, and do their device work on the caller's
-current stream. A communicator is released once its process group is destroyed and no
-handle on it is left.
+rendezvous refuse to run under graph capture. ``alloc`` zeroes the memory on the caller's
+current stream; a first rendezvous does its own copies there too, but CCO's window
+registration (and, for a new group, communicator creation) still issues synchronous copies
+on the null stream, so it waits for work queued there. A communicator is released once its
+process group is destroyed and no handle on it is left.
 
 Peers are exposed the way torch's model expects, as the ``buffer_ptrs`` /
 ``buffer_ptrs_dev`` array -- one base address per rank, same as every other backend.

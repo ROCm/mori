@@ -110,9 +110,10 @@ __device__ __forceinline__ uint32_t* Slot(uint32_t** pads, int owner, int channe
   return pads[owner] + static_cast<size_t>(world_size) * channel + sender;
 }
 
+// Kernels carry torch's names, so profiles and tests that look for torch's find these.
 // One thread per peer: signal it, then wait for its signal.
-__global__ void BarrierKernel(uint32_t** pads, int channel, int rank, int world_size,
-                              uint64_t timeout_ticks, unsigned long timeout_ms) {
+__global__ void barrier_kernel(uint32_t** pads, int channel, int rank, int world_size,
+                               uint64_t timeout_ticks, unsigned long timeout_ms) {
   const int peer = static_cast<int>(threadIdx.x);
   if (peer >= world_size || peer == rank) return;
   if (!TryPut(Slot(pads, peer, channel, rank, world_size), timeout_ticks)) {
@@ -131,8 +132,9 @@ __global__ void BarrierKernel(uint32_t** pads, int channel, int rank, int world_
   }
 }
 
-__global__ void PutSignalKernel(uint32_t** pads, int dst_rank, int channel, int rank,
-                                int world_size, uint64_t timeout_ticks, unsigned long timeout_ms) {
+__global__ void put_signal_kernel(uint32_t** pads, int dst_rank, int channel, int rank,
+                                  int world_size, uint64_t timeout_ticks,
+                                  unsigned long timeout_ms) {
   if (!TryPut(Slot(pads, dst_rank, channel, rank, world_size), timeout_ticks)) {
     printf(
         "[FATAL] SymmetricMemory::put_signal: rank %d failed to send signal to rank %d on channel "
@@ -142,8 +144,9 @@ __global__ void PutSignalKernel(uint32_t** pads, int dst_rank, int channel, int 
   }
 }
 
-__global__ void WaitSignalKernel(uint32_t** pads, int src_rank, int channel, int rank,
-                                 int world_size, uint64_t timeout_ticks, unsigned long timeout_ms) {
+__global__ void wait_signal_kernel(uint32_t** pads, int src_rank, int channel, int rank,
+                                   int world_size, uint64_t timeout_ticks,
+                                   unsigned long timeout_ms) {
   if (!TryWait(Slot(pads, rank, channel, src_rank, world_size), timeout_ticks)) {
     printf(
         "[FATAL] SymmetricMemory::wait_signal: rank %d failed to receive signal from rank %d on "
@@ -181,7 +184,7 @@ hipError_t LaunchSignalPadBarrier(uint32_t** pads_dev, int channel, int rank, in
   uint64_t ticks = 0;
   hipError_t err = TimeoutTicks(timeout_ms, &ticks);
   if (err != hipSuccess) return err;
-  hipLaunchKernelGGL(BarrierKernel, dim3(1), dim3(world_size), 0, stream, pads_dev, channel, rank,
+  hipLaunchKernelGGL(barrier_kernel, dim3(1), dim3(world_size), 0, stream, pads_dev, channel, rank,
                      world_size, ticks, static_cast<unsigned long>(timeout_ms));
   return hipGetLastError();
 }
@@ -191,7 +194,7 @@ hipError_t LaunchSignalPadPut(uint32_t** pads_dev, int dst_rank, int channel, in
   uint64_t ticks = 0;
   hipError_t err = TimeoutTicks(timeout_ms, &ticks);
   if (err != hipSuccess) return err;
-  hipLaunchKernelGGL(PutSignalKernel, dim3(1), dim3(1), 0, stream, pads_dev, dst_rank, channel,
+  hipLaunchKernelGGL(put_signal_kernel, dim3(1), dim3(1), 0, stream, pads_dev, dst_rank, channel,
                      rank, world_size, ticks, static_cast<unsigned long>(timeout_ms));
   return hipGetLastError();
 }
@@ -201,7 +204,7 @@ hipError_t LaunchSignalPadWait(uint32_t** pads_dev, int src_rank, int channel, i
   uint64_t ticks = 0;
   hipError_t err = TimeoutTicks(timeout_ms, &ticks);
   if (err != hipSuccess) return err;
-  hipLaunchKernelGGL(WaitSignalKernel, dim3(1), dim3(1), 0, stream, pads_dev, src_rank, channel,
+  hipLaunchKernelGGL(wait_signal_kernel, dim3(1), dim3(1), 0, stream, pads_dev, src_rank, channel,
                      rank, world_size, ticks, static_cast<unsigned long>(timeout_ms));
   return hipGetLastError();
 }

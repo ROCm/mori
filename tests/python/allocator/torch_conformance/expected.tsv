@@ -26,4 +26,3 @@ FAIL	*	SymmetricMemoryTest::test_get	unsupported backend: MORI	torch-name-dispat
 FAIL	*	SymmetricMemoryTest::test_cuda_nvlink_connectivity_detection	.	cuda-only-api	tests torch's DMA connectivity detector, which exists for CUDA over NVLink only
 FAIL	2.15.*	AsyncTPTest::test_fused_all_gather_matmul_native_*	async_input_mm is not currently supported	torch-build	the 2.15 ROCm wheel has no async_input_mm
 FAIL	*	SymmMemCleanupTestCUDA::test_cuda_peer_pointer_tables_cleanup_*	.	cuda-backend-internal	counts the caching-allocator blocks torch's CUDA backend keeps its peer tables in
-FAIL	*	SymmetricMemoryTest::test_alloc_rendezvous_on_current_stream	0 not greater than 0	cuda-backend-internal	with --as-cuda: finds the barrier in the profile by the CUDA backend's kernel name
