@@ -71,7 +71,7 @@ How the rule is kept:
 |---|---|---|
 | [contract.yaml](contract.yaml) | owner, main session | the task, targets, budget |
 | [interface.py](interface.py) | everyone | what an implementation exposes |
-| [op_harness.py](op_harness.py) | implementer (development), verifier (acceptance) | `--mode time` and `--mode check` for any implementation of the interface; `--impl existing` for the existing op |
+| [op_harness.py](op_harness.py) | implementer (development), verifier (acceptance) | `--mode time`, `--mode check` and `--mode timeline` for any implementation of the interface; `--impl existing` for the existing op; `--impl-kwargs` for a variant's switches |
 | [existing.py](existing.py) | `op_harness.py --impl existing` | the existing op behind the interface (hidden: run it, do not read it) |
 | [arms.bounds.yaml](arms.bounds.yaml) | implementer | step 1: the split path and the GEMM alone, through the existing benchmark |
 | [arms.dev.yaml](arms.dev.yaml) | implementer | candidate against the existing op, interleaved |
@@ -117,7 +117,8 @@ How the rule is kept:
    Development timing:
 
    ```bash
-   python benchmark/cco/harness/run.py --arms <arms.dev.yaml with --impl filled in> \
+   CANDIDATE=<file.py or module>:<Class> python benchmark/cco/harness/run.py \
+       --arms benchmark/cco/harness/cases/gemm_ar_bf16/arms.dev.yaml \
        --baseline existing --aa --bench-args "-m 16384" --out <records>/runs/<id>
    ```
 
@@ -126,8 +127,13 @@ How the rule is kept:
    ```bash
    torchrun --standalone --nproc_per_node=8 \
        benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py \
-       --mode check --impl <path/to/candidate.py>:<Class>
+       --mode check --impl <file.py or module>:<Class>
    ```
+
+   Variants: `--impl-kwargs '{"<switch>": <value>}'` passes constructor switches; an
+   arms file of your own can hold one arm per variant, with `validate: false` on those
+   that are wrong by design. Phase times: `--mode timeline` (see `interface.py` and the
+   loop skill's `reference/diagnosis.md`).
 
 5. **Verify (step 4).** A fresh `cco-fusion-verifier` runs `--mode check` with a seed
    of its own (`--seed`, so the held-out M differ from any the implementer saw) and the

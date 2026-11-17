@@ -542,3 +542,83 @@ def test_arms_need_existing_benchmarks(tmp_path):
     )
     with pytest.raises(run.UsageError):
         run.load_arms(bad)
+
+
+def test_arms_take_variables_from_the_environment(tmp_path, monkeypatch):
+    bench = stand_in(tmp_path, "new", "cand", 90)
+    arms_file = tmp_path / "arms.yaml.json"
+    arms_file.write_text(
+        json.dumps(
+            {
+                "arms": [
+                    {
+                        "name": "candidate",
+                        "bench": "${BENCH_DIR}/" + bench.name,
+                        "args": "--impl ${CANDIDATE} --tag $TAG",
+                    },
+                    {"name": "listed", "bench": str(bench), "args": ["${CANDIDATE}"]},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("BENCH_DIR", str(bench.parent))
+    monkeypatch.setenv("CANDIDATE", "pkg.mod:Fast")
+    monkeypatch.setenv("TAG", "t1")
+    arms = run.load_arms(arms_file)
+    assert arms[0]["bench"] == str(bench)
+    assert arms[0]["args"] == ["--impl", "pkg.mod:Fast", "--tag", "t1"]
+    assert arms[1]["args"] == ["pkg.mod:Fast"] and arms[0]["validate"] is True
+    monkeypatch.delenv("CANDIDATE")
+    with pytest.raises(run.UsageError, match=r"\$\{CANDIDATE\} is not set"):
+        run.load_arms(arms_file)
+
+
+def test_diagnostic_arms_are_timed_but_do_not_fail_the_run(tmp_path, monkeypatch):
+    a, b = stand_in(tmp_path, "old", "fused", 100), stand_in(tmp_path, "new", "cut", 60)
+    arms_file = tmp_path / "arms.json"
+    arms_file.write_text(
+        json.dumps(
+            {
+                "arms": [
+                    {"name": "existing", "bench": str(a), "time_field": "us"},
+                    {
+                        "name": "stop-after-gemm",
+                        "bench": str(b),
+                        "time_field": "us",
+                        "validate": False,
+                    },
+                ]
+            }
+        )
+    )
+    checked = {"existing": True}
+
+    def build(plan, nproc, timeout_s, launcher, python, env):
+        lines = [
+            "RESULT_JSON "
+            + json.dumps(
+                {
+                    "us": 100.0 if p["mode"] == "existing" else 60.0,
+                    "validated": checked.get(p["mode"], False),
+                }
+            )
+            for p in plan
+        ]
+        text = "\n".join(lines) + "\n"
+        return [sys.executable, "-c", f"import sys; sys.stdout.write({text!r})"]
+
+    monkeypatch.setattr(run, "build_command", build)
+    monkeypatch.setattr(run, "GAP_FILE", tmp_path / "gap")
+    monkeypatch.setattr(run, "GAP_S", 0.0)
+    argv = ["--arms", str(arms_file), "--rounds", "2", "--no-preflight", "--out"]
+    assert run.main(argv + [str(tmp_path / "ok")]) == 0
+    result = json.loads((tmp_path / "ok" / "result.json").read_text())
+    diag = result["summary"]["stop-after-gemm"]
+    assert result["status"] == "ok" and diag["diagnostic"] is True
+    assert diag["validated"] is None and diag["median_us"] == 60.0
+    jsonschema = pytest.importorskip("jsonschema")
+    jsonschema.validate(
+        result, json.loads((HARNESS / "schemas" / "result.schema.json").read_text())
+    )
+    checked["existing"] = False  # a checked arm that fails still fails the run
+    assert run.main(argv + [str(tmp_path / "bad")]) == 1

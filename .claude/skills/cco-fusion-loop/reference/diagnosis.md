@@ -80,9 +80,30 @@ switch, run an interleaved A/B, and record keep, revise or reject with the numbe
 
 ## Tools
 
-- Timeline stamps: `python/mori/ops/gemm_a2a/timeline.py` (device `s_memrealtime`
-  stamps; compare stamps only within one rank) and
-  `benchmark/cco/flydsl/a2a_gemm/timeline_a2a_gemm.py`. Other operators have none yet.
+- **Device timeline.** Stamp `s_memrealtime` (a 100 MHz clock, constant across DVFS)
+  from one thread into a u64 slot of the rank's own window at the points the
+  decomposition needs: a block's first and last tile, an election, a put posted, a
+  drain's quiet and flag. Expose the stamps through the operator's `timeline_read()`,
+  named as `benchmark/cco/harness/timeline.py` expects (`phase:start` and `phase:end`,
+  `name@key` for one per block or per destination), behind a switch that is off by
+  default. Collect them with `op_harness.py --mode timeline --impl-kwargs
+  '{"stamps": true}' --timeline-out <file>` and read `timeline.py <file>`: the phase
+  table of the slowest rank, with the gaps where nothing ran. Compare stamps only
+  within a rank. The device side is a few lines:
+
+  ```python
+  i64 = ir.IntegerType.get_signless(64)
+  now = fx.Int64(llvm.call_intrinsic(i64, "llvm.amdgcn.s.memrealtime", [], [], []))
+  llvm.store(now.ir_value(), signal_ptr(base + slot * 8), alignment=8, volatile_=True)
+  ```
+
+  `python/mori/ops/gemm_a2a/timeline.py` is a worked example (and
+  `benchmark/cco/flydsl/a2a_gemm/timeline_a2a_gemm.py` its reader). In a case's clean
+  room copy it rather than import it: importing `mori.ops.gemm_a2a` loads gemm_ar.
+- **Variants without new classes.** `op_harness.py --impl-kwargs '{"mode": "fused"}'`
+  passes constructor switches. In a `run.py --arms` file give every variant an arm, and
+  mark one whose output is wrong by design (a phase cut off, puts suppressed) with
+  `validate: false`: it is timed, and its failed check does not fail the run.
 - Kernel trace for phase times and gaps: `rocprofv3 --kernel-trace`. Profiling a
   multi-GPU job takes the whole node.
 - GEMM counters and roofline: rocprofv3 counters and rocprof-compute; ATT for the K loop.

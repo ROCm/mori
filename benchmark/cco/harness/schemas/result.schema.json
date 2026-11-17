@@ -184,6 +184,9 @@
               "object",
               "null"
             ]
+          },
+          "validate": {
+            "type": "boolean"
           }
         }
       }
@@ -214,6 +217,12 @@
             "type": "number"
           },
           "validated": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "diagnostic": {
             "type": "boolean"
           }
         }
@@ -344,6 +353,9 @@
             "type": "string"
           },
           "sdma": {
+            "type": "boolean"
+          },
+          "validate": {
             "type": "boolean"
           }
         }

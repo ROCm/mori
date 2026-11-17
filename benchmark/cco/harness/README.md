@@ -19,6 +19,7 @@ or an `srun` into an allocation the user already holds.
 | `bound.py` | exists | step 1 | split-path phase times to `T_ideal`, `T_real` and go or no-go |
 | `bounds.example.yaml` | exists | step 1 | `bound.py` input: the gemm_ar worked example (`G950-GAR-01`) |
 | `isa_check.py` | exists | steps 3, 4 | the ISA check on a FlyDSL `*_final_isa.s` |
+| `timeline.py` | exists | step 3 | the phase table, per rank, from an operator's device timestamps (`op_harness.py --mode timeline`) |
 | `loop_state.py` | exists | all | where a task stands (next step, budget used, done or waiting for the owner), read from its records |
 | `stop_hook.py` | exists | unattended | the Stop hook that keeps a session on the loop until the task is done, needs the owner or is stopped |
 | `schemas/` | exists | all | JSON schemas for `run.py`'s result, the candidate manifest, the verdict and a case's evaluation record |
@@ -97,9 +98,19 @@ arms:
     args: --mode time --impl existing  # the existing op, by the case's alias
   - name: candidate
     bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
-    args: --mode time --impl python/mori/ops/gemm_ar_v2/op.py:FusedGemmAllReduce
+    args: --mode time --impl ${CANDIDATE}   # from the environment
     time_field: max_rank_time_us      # default; the benchmark's maximum over ranks
+  - name: candidate-stop-gemm
+    bench: benchmark/cco/harness/cases/gemm_ar_bf16/op_harness.py
+    args: --mode time --impl ${CANDIDATE} --impl-kwargs '{"stop_after": "gemm"}'
+    validate: false                   # wrong by design: timed, not checked
 ```
+
+`${VAR}` in `bench` and `args` comes from the environment (`CANDIDATE=pkg.mod:Class
+python run.py --arms ...`), and an unset variable is an error, so nobody has to write a
+copy of the file with the candidate filled in. An arm with `validate: false` is a
+diagnostic variant: it is timed and reported (`diagnostic: true` in the summary), but its
+failed check does not fail the run.
 
 One invocation is one shape (`G950-MEAS-03`): `--bench-args` sets it for every arm, and
 the record keeps the benchmark's own report of it. It launches `torchrun` once, through

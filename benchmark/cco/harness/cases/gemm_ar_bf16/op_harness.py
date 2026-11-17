@@ -48,12 +48,22 @@ copied in before each replay. A random per-rank delay of up to ``--skew-ms`` pre
 every call. With ``debug_preset_counters`` the same runs again with every counter preset
 just below 2^32. Every call has a watchdog (``--call-timeout``); a call that does not
 finish ends the process with status 3.
+
+``timeline``: for an implementation with ``timeline_read()`` (``interface.py``): warm-up and
+graph capture as in ``time``, then ``--timeline-calls`` replays, reading the device stamps
+after each. The events of every call on every rank go to ``--timeline-out``; the result
+holds the phase summary of ``benchmark/cco/harness/timeline.py``. One more call is checked.
+
+``--impl-kwargs '{"mode": "fused"}'`` passes keyword switches to the implementation's
+constructor, and the ones it declares to ``window_bytes_for``, so a variant needs no class
+of its own.
 """
 
 import argparse
 import hashlib
 import importlib
 import importlib.util
+import inspect
 import json
 import os
 import random
@@ -67,6 +77,17 @@ REPO = HERE.parents[4]
 sys.path.insert(0, str(HERE))
 
 import interface  # noqa: E402
+
+
+def _harness_module(name):
+    """A module of benchmark/cco/harness, loaded under a name of its own."""
+    path = HERE.parents[1] / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"cco_harness_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
 
 TOLERANCE = 6e-3
 WRAP_PRESET = 2**32 - 3
@@ -85,7 +106,12 @@ def build_parser():
         required=True,
         help="file.py:Class, package.module:Class, or an alias: " + ", ".join(ALIASES),
     )
-    p.add_argument("--mode", choices=("time", "check"), default="time")
+    p.add_argument("--mode", choices=("time", "check", "timeline"), default="time")
+    p.add_argument(
+        "--impl-kwargs",
+        default="{}",
+        help="JSON object of keyword switches for the implementation",
+    )
     p.add_argument("-m", type=int, default=16384)
     p.add_argument("-n", type=int, default=7168)
     p.add_argument("-k", type=int, default=2048)
@@ -101,8 +127,51 @@ def build_parser():
     p.add_argument("--replays", type=int, default=20)
     p.add_argument("--skew-ms", type=float, default=5.0)
     p.add_argument("--call-timeout", type=float, default=120.0)
+    p.add_argument("--timeline-calls", type=int, default=10)
+    p.add_argument("--timeline-out", help="where --mode timeline writes every event")
     p.add_argument("--json-out")
     return p
+
+
+def impl_kwargs(text):
+    """``--impl-kwargs`` as a dict."""
+    try:
+        kwargs = json.loads(text or "{}")
+    except ValueError as e:
+        raise ValueError(f"--impl-kwargs: not JSON: {e}") from None
+    if not isinstance(kwargs, dict):
+        raise ValueError("--impl-kwargs: needs a JSON object")
+    return kwargs
+
+
+def accepted(fn, kwargs):
+    """The part of ``kwargs`` that ``fn`` takes by keyword."""
+    params = inspect.signature(fn).parameters
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
+def normalize_events(events, ticks_per_us):
+    """One call's stamps as ``[name, us]`` from the call's first stamp.
+
+    ``events`` holds ``(name, ticks)`` pairs, or dicts with ``event`` and either ``us`` or
+    ``ticks``; unset stamps (None, 0) are dropped.
+    """
+    rows = []
+    for e in events:
+        if isinstance(e, dict):
+            name = e.get("event") or e.get("name")
+            us = e.get("us")
+            if us is None and e.get("ticks"):
+                us = e["ticks"] / ticks_per_us
+        else:
+            name, ticks = e
+            us = ticks / ticks_per_us if ticks else None
+        if name and us is not None:
+            rows.append([str(name), float(us)])
+    t0 = min((us for _, us in rows), default=0.0)
+    return [[name, round(us - t0, 3)] for name, us in rows]
 
 
 def load_impl(spec):
@@ -352,6 +421,33 @@ class _Run:
         self.finish("checked call")
         return statistics.median(samples), self.case(op, "time", a.m, 0, out.clone())
 
+    def timeline(self, op):
+        torch, a = self.torch, self.args
+        x = activation(a.seed, self.rank, 0, a.m, a.k, self.device)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(a.warmup):
+                op(x)
+        torch.cuda.current_stream().wait_stream(side)
+        self.finish("timeline warm-up")
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            op(x)
+        for _ in range(a.warmup):
+            g.replay()
+        self.finish("graph warm-up")
+        ticks = float(getattr(op, "TIMELINE_TICKS_PER_US", 100.0))
+        calls = []
+        for _ in range(a.timeline_calls):
+            g.replay()
+            self.finish("timeline replay")
+            calls.append(normalize_events(op.timeline_read(), ticks))
+        del g
+        out = op(x)
+        self.finish("checked call")
+        return calls, self.case(op, "timeline", a.m, 0, out.clone())
+
 
 def _setup_distributed():
     import torch
@@ -374,13 +470,24 @@ def run(args):
 
     args.m_max = args.m_max or args.m
     impl = load_impl(args.impl)
+    kwargs = impl_kwargs(args.impl_kwargs)
+    if args.mode == "timeline":
+        if not hasattr(impl, "timeline_read"):
+            raise SystemExit("op_harness: --mode timeline needs timeline_read()")
+        if not args.timeline_out:
+            raise SystemExit("op_harness: --mode timeline needs --timeline-out")
     rank, world, uid = _setup_distributed()
-    vmm = 2 * impl.window_bytes_for(world, m_max=args.m_max, n=args.n, k=args.k) + (
-        256 << 20
+    window = impl.window_bytes_for(
+        world,
+        m_max=args.m_max,
+        n=args.n,
+        k=args.k,
+        **accepted(impl.window_bytes_for, kwargs),
     )
+    vmm = 2 * window + (256 << 20)
     result = None
     with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
-        op = impl(comm, n=args.n, k=args.k, m_max=args.m_max)
+        op = impl(comm, n=args.n, k=args.k, m_max=args.m_max, **kwargs)
         try:
             op.set_weight(weight(args.seed, rank, args.n, args.k, "cuda"))
             if hasattr(op, "self_test"):
@@ -402,6 +509,33 @@ def run(args):
                     "validated": cases[0]["pass"],
                     "timing": "graph",
                 }
+            elif args.mode == "timeline":
+                calls, case = r.timeline(op)
+                per_rank = [None] * world
+                dist.all_gather_object(per_rank, (calls, case))
+                cases = merge([[c] for _, c in per_rank])
+                record = {
+                    "timeline_calls": len(calls),
+                    "timeline_out": args.timeline_out,
+                    "rel_l2": cases[0]["rel_l2"],
+                    "fused_path_ran": cases[0]["fused_path_ran"],
+                    "validated": cases[0]["pass"],
+                    "max_rank_time_us": None,
+                }
+                if rank == 0:
+                    data = {
+                        "impl": args.impl,
+                        "impl_kwargs": kwargs,
+                        "m": args.m,
+                        "n": args.n,
+                        "k": args.k,
+                        "ranks": [c for c, _ in per_rank],
+                    }
+                    Path(args.timeline_out).write_text(json.dumps(data) + "\n")
+                    summary = _harness_module("timeline").summarize(data)
+                    record["call_us"] = summary["call_us"]
+                    record["critical_rank"] = summary["critical_rank"]
+                    record["phases"] = summary["phases"]
             else:
                 ms, mine, wrap = r.check(op)
                 per_rank = [None] * world
@@ -425,6 +559,7 @@ def run(args):
                 result = {
                     "mode": args.mode,
                     "impl": args.impl,
+                    "impl_kwargs": kwargs,
                     "world_size": world,
                     "m": args.m,
                     "n": args.n,

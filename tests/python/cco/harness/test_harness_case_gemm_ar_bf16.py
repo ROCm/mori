@@ -412,7 +412,8 @@ def test_baselines_run_by_alias():
     assert cls.__name__ == "ExistingGemmAllReduce"
 
 
-def test_arms_and_contract_point_at_real_files():
+def test_arms_and_contract_point_at_real_files(monkeypatch):
+    monkeypatch.setenv("CANDIDATE", "mori.ops.gemm_ar_v2.op:GemmArV2")
     patterns = audit.read_patterns(CASE / "hidden_paths.txt")
     for name in ("arms.dev.yaml", "arms.verify.yaml"):
         arms = run.load_arms(CASE / name)
@@ -535,3 +536,37 @@ def test_guard_speaks_the_hook_protocol():
     (entry,) = settings["hooks"]["PreToolUse"]
     assert entry["matcher"] == "Bash"
     assert entry["hooks"][0]["command"].endswith('/gemm_ar_bf16/guard.py"')
+
+
+def test_impl_kwargs_reach_the_constructor_and_the_window_sizer():
+    assert harness.impl_kwargs("") == {} and harness.impl_kwargs(
+        '{"mode": "fused"}'
+    ) == {"mode": "fused"}
+    for bad in ("[1]", "mode=fused"):
+        with pytest.raises(ValueError, match="--impl-kwargs"):
+            harness.impl_kwargs(bad)
+
+    def sizer(world, *, m_max, n, k, mode="stream"):
+        return 0
+
+    def anything(world, **kw):
+        return 0
+
+    switches = {"mode": "fused", "ctr_order": "release"}
+    assert harness.accepted(sizer, switches) == {"mode": "fused"}
+    assert harness.accepted(anything, switches) == switches
+    assert "timeline_read" in interface.OPTIONAL
+
+
+def test_timeline_events_are_normalized_per_call():
+    events = [("gemm:start@b0", 1000), ("gemm:end@b0", 6000), ("unset", 0), ("x", None)]
+    events.append({"event": "drain:end", "ticks": 9000})
+    events.append({"event": "host", "us": 95.0})
+    assert harness.normalize_events(events, 100.0) == [
+        ["gemm:start@b0", 0.0],
+        ["gemm:end@b0", 50.0],
+        ["drain:end", 80.0],
+        ["host", 85.0],
+    ]
+    assert harness.normalize_events([], 100.0) == []
+    assert hasattr(harness._harness_module("timeline"), "summarize")

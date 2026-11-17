@@ -60,10 +60,21 @@ Optional, used when present:
     Set every running counter, flag and epoch the implementation keeps on the device to
     ``value``, so the harness can run calls across a 2^32 wrap. Without it the wrap
     test is reported "not covered".
+``timeline_read() -> list``
+    The device timestamps of the last call on this rank, as ``(name, ticks)`` pairs or
+    dicts with ``event`` and ``ticks`` or ``us``; ``TIMELINE_TICKS_PER_US`` (default 100,
+    ``s_memrealtime``) converts ticks. Names follow ``benchmark/cco/harness/timeline.py``
+    (``phase:start``, ``phase:end``, ``name@key``). Used by ``op_harness.py --mode
+    timeline``; stamping may be a switch that is off by default.
+
+Extra keyword switches: ``__init__`` may take more keywords than the required ones, and
+``window_bytes_for`` too when they change the window; ``op_harness.py --impl-kwargs``
+passes them (to ``window_bytes_for`` only the ones it declares). Defaults must give the
+implementation's best configuration.
 """
 
 REQUIRED = ("window_bytes_for", "set_weight", "__call__", "close")
-OPTIONAL = ("self_test", "debug_preset_counters")
+OPTIONAL = ("self_test", "debug_preset_counters", "timeline_read")
 
 
 def missing(cls):

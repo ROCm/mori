@@ -35,6 +35,12 @@ compared with ``--baseline`` (default: the first mode); with ``--aa`` the baseli
 again at the end of each round and the A/A difference is the noise band. One invocation is one shape (G950-MEAS-03): ``--bench-args`` sets it,
 and the record keeps the benchmark's own report of it.
 
+An arms file may use ``${VAR}`` in ``bench`` and ``args``, expanded from the environment
+(``CANDIDATE=pkg.mod:Class run.py --arms ...``); an unset variable is an error. An arm with
+``validate: false`` is a diagnostic variant whose result is wrong by design (a phase cut
+off, puts suppressed): it is timed and reported, but its failed check does not fail the
+run.
+
 Before the launch it runs ``preflight.py`` and stops on a refusal (busy GPUs, mori
 without SDMA, another architecture). For multi-rank runs it waits until 10 s have
 passed since the previous one it started on this host (G950-ENV-05). The launch runs in
@@ -60,6 +66,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import signal
 import statistics
@@ -124,6 +131,18 @@ def arms_from_op(op, modes):
     ]
 
 
+_VAR = re.compile(r"\$(\{\w+\}|\w+)")
+
+
+def _expand(text, where):
+    """``text`` with ``${VAR}`` and ``$VAR`` taken from the environment; none may be unset."""
+    out = os.path.expandvars(text)
+    left = _VAR.search(out)
+    if left:
+        raise UsageError(f"{where}: {left.group(0)} is not set in the environment")
+    return out
+
+
 def load_arms(path):
     """Arms from a JSON or YAML file: ``{"arms": [{"name", "bench", "args", ...}]}``."""
     path = Path(path)
@@ -146,12 +165,15 @@ def load_arms(path):
     for item in items:
         if not isinstance(item, dict) or not item.get("name") or not item.get("bench"):
             raise UsageError(f"{path}: every arm needs a name and a bench: {item!r}")
-        bench = Path(item["bench"])
+        where = f"{path}: arm {item['name']}"
+        bench = Path(_expand(str(item["bench"]), where))
         if not (bench if bench.is_absolute() else REPO / bench).is_file():
-            raise UsageError(f"{path}: arm {item['name']}: no benchmark at {bench}")
+            raise UsageError(f"{where}: no benchmark at {bench}")
         args = item.get("args", [])
         if isinstance(args, str):
-            args = shlex.split(args)
+            args = shlex.split(_expand(args, where))
+        else:
+            args = [_expand(str(a), where) for a in args]
         arms.append(
             {
                 "name": str(item["name"]),
@@ -160,6 +182,7 @@ def load_arms(path):
                 "time_field": item.get("time_field", "max_rank_time_us"),
                 "per_rank_field": item.get("per_rank_field", "per_rank_time_us"),
                 "sdma": bool(item.get("sdma", True)),
+                "validate": bool(item.get("validate", True)),
             }
         )
     return arms
@@ -191,6 +214,7 @@ def plan_runs(arms, rounds, aa, bench_args, baseline=None):
                     "expect_mode": _mode_arg(arm["args"]),
                     "time_field": arm["time_field"],
                     "per_rank_field": arm["per_rank_field"],
+                    "validate": arm.get("validate", True),
                 }
             )
     return plan
@@ -328,6 +352,7 @@ def aggregate(plan, records, aa, baseline=None):
                 "per_rank_us": rec.get(p["per_rank_field"]) if rec else None,
                 "critical_rank": rec.get("critical_rank") if rec else None,
                 "validated": rec.get("validated") if rec else None,
+                "validate": p.get("validate", True),
                 "rel_l2": rec.get("rel_l2") if rec else None,
                 "record": rec,
             }
@@ -337,8 +362,9 @@ def aggregate(plan, records, aa, baseline=None):
     for mode in modes:
         mine = [r for r in rows if r["mode"] == mode and not r["repeat"]]
         times = [r["time_us"] for r in mine if isinstance(r["time_us"], (int, float))]
+        checked = all(r["validate"] for r in mine)
         if not times:
-            summary[mode] = {"rounds": 0, "validated": False}
+            summary[mode] = {"rounds": 0, "validated": False if checked else None}
             continue
         median = statistics.median(times)
         summary[mode] = {
@@ -347,8 +373,10 @@ def aggregate(plan, records, aa, baseline=None):
             "min_us": min(times),
             "max_us": max(times),
             "spread_pct": 100.0 * (max(times) - min(times)) / median,
-            "validated": all(r["validated"] is True for r in mine),
+            "validated": all(r["validated"] is True for r in mine) if checked else None,
         }
+        if not checked:
+            summary[mode]["diagnostic"] = True
 
     noise = {"source": None, "pct": None}
     base = baseline or modes[0]
@@ -679,7 +707,7 @@ def main(argv=None):
         result["status"] = "timeout"
     elif not complete:
         result["status"] = "incomplete"
-    elif any(r["validated"] is not True for r in rows):
+    elif any(r["validated"] is not True for r in rows if r["validate"]):
         result["status"] = "validation-failed"
     else:
         result["status"] = "ok"
@@ -695,7 +723,12 @@ def main(argv=None):
         if s.get("rounds"):
             print(
                 f"{mode:12} median {s['median_us']:.1f} us  spread {s['spread_pct']:.1f}%  "
-                f"rounds {s['rounds']}  validated {s['validated']}"
+                f"rounds {s['rounds']}  "
+                + (
+                    "diagnostic"
+                    if s.get("diagnostic")
+                    else f"validated {s['validated']}"
+                )
             )
     for c in comparisons:
         print(
