@@ -1096,7 +1096,8 @@ def _torch_symm_extension():
             raise RuntimeError(f"torch {torch.__version__} is not a ROCm build")
         # Shared with the JIT loader; loaded by path because mori is not installed yet.
         spec = importlib.util.spec_from_file_location(
-            "_mori_symm_build", _root_dir / "python" / "mori" / "allocator" / "_build.py"
+            "_mori_symm_build",
+            _root_dir / "python" / "mori" / "allocator" / "_build.py",
         )
         symm_build = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(symm_build)
@@ -1117,7 +1118,10 @@ def _torch_symm_extension():
             sources=["src/allocator/symm_backend.cpp", "src/allocator/symm_signal.hip"],
             # libmori_cco is the peer-exchange half of the backend; it lands next to
             # this module in the package, hence the $ORIGIN runpath. torch adds its libs.
-            library_dirs=[hip_dir or f"{rocm}/lib", str(_root_dir.resolve() / "python" / "mori")],
+            library_dirs=[
+                hip_dir or f"{rocm}/lib",
+                str(_root_dir.resolve() / "python" / "mori"),
+            ],
             libraries=["mori_cco"],
             # The loader refuses this module under any other torch build.
             define_macros=[("MORI_TORCH_FINGERPRINT", fingerprint)],
