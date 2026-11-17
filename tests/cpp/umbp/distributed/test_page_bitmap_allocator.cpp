@@ -114,7 +114,7 @@ TEST(PageBitmapAllocatorTest, NumaNoSpaceDoesNotConsumeLocalRemainder) {
   const auto before = alloc.Buffers();
   EXPECT_FALSE(alloc.Allocate(6, 1));
   for (size_t i = 0; i < before.size(); ++i) {
-    EXPECT_EQ(alloc.Buffers()[i].bitmap, before[i].bitmap);
+    EXPECT_EQ(alloc.Buffers()[i].words, before[i].words);
     EXPECT_EQ(alloc.Buffers()[i].free_count, before[i].free_count);
     EXPECT_EQ(alloc.Buffers()[i].cursor, before[i].cursor);
   }
@@ -208,7 +208,7 @@ TEST(PageBitmapAllocatorTest, AllocateFailsWhenTotalCapacityInsufficient) {
   EXPECT_EQ(alloc.UsedBytes(), 0u);
   for (const auto& b : alloc.Buffers()) {
     EXPECT_EQ(b.free_count, b.total_pages);
-    for (bool bit : b.bitmap) EXPECT_FALSE(bit);
+    for (uint32_t page = 0; page < b.total_pages; ++page) EXPECT_FALSE(b.allocated(page));
   }
 }
 
@@ -318,7 +318,7 @@ TEST(PageBitmapAllocatorTest, DeallocateIdempotent) {
   EXPECT_EQ(alloc.AvailableBytes(), avail_after_first_free);
   for (const auto& b : alloc.Buffers()) {
     EXPECT_EQ(b.free_count, b.total_pages);
-    for (bool bit : b.bitmap) EXPECT_FALSE(bit);
+    for (uint32_t page = 0; page < b.total_pages; ++page) EXPECT_FALSE(b.allocated(page));
   }
 }
 
@@ -361,6 +361,74 @@ TEST(PageBitmapAllocatorTest, AllocateExhaustionThenSuccess) {
   auto b = alloc.Allocate(1);
   ASSERT_TRUE(b.has_value());
   EXPECT_EQ((*b)[0], (*a)[1]);
+}
+
+std::vector<PageLocation> Pages(uint32_t first, uint32_t last, uint32_t step = 1) {
+  std::vector<PageLocation> pages;
+  for (uint32_t page = first; page <= last; page += step) pages.push_back({0, page});
+  return pages;
+}
+
+TEST(PageBitmapAllocatorTest, ContinuousRunSpansWordBoundary) {
+  auto alloc = MakeAllocator(1, 192);
+  ASSERT_TRUE(alloc.Allocate(192).has_value());
+  alloc.Deallocate(Pages(40, 109));  // the only 70-page run, across words 0 and 1
+  alloc.Deallocate(Pages(150, 159));
+  auto r = alloc.Allocate(70);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(*r, Pages(40, 109));
+}
+
+TEST(PageBitmapAllocatorTest, PagesPastTheLastPartialWordAreNeverHandedOut) {
+  auto alloc = MakeAllocator(1, 130);
+  auto all = alloc.Allocate(130);
+  ASSERT_TRUE(all.has_value());
+  EXPECT_EQ(all->back().page_index, 129u);
+  EXPECT_FALSE(alloc.Allocate(1).has_value());
+  alloc.Deallocate(Pages(129, 129));
+  auto r = alloc.Allocate(1);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(*r, Pages(129, 129));
+  EXPECT_FALSE(alloc.Allocate(1).has_value());
+}
+
+TEST(PageBitmapAllocatorTest, DiscretePagesComeInOrderAcrossWords) {
+  auto alloc = MakeAllocator(1, 200);
+  ASSERT_TRUE(alloc.Allocate(200).has_value());
+  alloc.Deallocate(Pages(2, 199, 3));  // every third page: no run longer than one
+  auto r = alloc.Allocate(40);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(*r, Pages(2, 119, 3));
+}
+
+TEST(PageBitmapAllocatorTest, LongRunIncludesTheFreeTopOfThePrecedingWord) {
+  auto alloc = MakeAllocator(1, 512);
+  ASSERT_TRUE(alloc.Allocate(512).has_value());
+  alloc.Deallocate(Pages(100, 299));  // starts 36 pages into word 1
+  auto r = alloc.Allocate(150);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(*r, Pages(100, 249));
+}
+
+TEST(PageBitmapAllocatorTest, LongRequestFallsBackToScatteredPages) {
+  auto alloc = MakeAllocator(1, 512);
+  ASSERT_TRUE(alloc.Allocate(512).has_value());
+  alloc.Deallocate(Pages(0, 510, 2));  // no two free pages adjacent
+  auto r = alloc.Allocate(200);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(*r, Pages(0, 398, 2));
+}
+
+TEST(PageBitmapAllocatorTest, RunStraddlingTheCursorIsFoundOnTheWrapPass) {
+  auto alloc = MakeAllocator(1, 128);
+  ASSERT_TRUE(alloc.Allocate(128).has_value());
+  alloc.Deallocate(Pages(60, 69));
+  ASSERT_EQ(alloc.Allocate(2), Pages(60, 61));  // cursor now at 62
+  alloc.Deallocate(Pages(60, 61));
+  // From the cursor only 62..69 is free; the wrap pass scans [0, 72).
+  auto r = alloc.Allocate(10);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(*r, Pages(60, 69));
 }
 
 }  // namespace
