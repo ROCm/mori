@@ -3504,9 +3504,13 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   // kSegMin rows a block, fewer warps quantizing costs more than the merged stores save, and the
   // per-warp runs below take over.
   constexpr bool kOvlp = EpFp4Ovl<kCfg>();
+  constexpr int kSegChunkB = 32768;
+  constexpr int kSegFit = kSegChunkB / kWireB;
   constexpr int kSegK =
       (kOvlp || (kCfg.worldSize >= 8 && (kCfg.warpPerBlock == 8 || kCfg.warpPerBlock == 16)))
-          ? (W::kBf16 && kCfg.cardCombine ? 2 : 6)
+          ? (W::kBf16 && kCfg.cardCombine                       ? 2
+             : (kCfg.worldSize < 8 && !W::kBf16 && kSegFit < 6) ? kSegFit
+                                                                : 6)
           : 0;
   // The overlapped path sends with half the block, four of them store waves: a 24-warp block runs
   // a second producer on every SIMD -- a producer is bound by its own dependent chains and LDS
