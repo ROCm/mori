@@ -679,6 +679,30 @@ def test_deregister_remote_engine_tears_down_its_sessions():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_deregister_drops_the_engines_queued_peer_failures():
+    """Each QP to a dead peer queues its own failure. Once the peer is deregistered they
+    describe connections that are gone, and a caller that reconnects on a failure must
+    not take them for failures of the new connection."""
+    initiator, target = create_connected_engine_pair(
+        "dereg_failures", qp_per_transfer=2, post_batch_size=-1, num_worker_threads=1
+    )
+    initiator_tensor, _, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, 4096)
+    )
+    sess = initiator.create_session(initiator_mem, target_mem)
+    target_desc = target.get_engine_desc()
+    del target
+    gc.collect()
+
+    # The failure is reported before the transfer's status turns failed.
+    status = sess.batch_write([0, 2048], [0, 2048], [2048, 2048], 1)
+    wait_status(status)
+    assert status.Failed()
+    initiator.deregister_remote_engine(target_desc)
+    assert initiator.pop_peer_failure() is None
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
 def test_engine_replaced_under_the_same_key_gets_the_writes():
     """A restarted peer comes back under the same key and numbers its memory as before.
     Once the old engine is deregistered and the new one registered, writes reach the

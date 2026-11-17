@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <algorithm>
 #include <utility>
 
 #include "mori/io/peer_failure.hpp"
@@ -103,6 +104,17 @@ bool PeerFailureTracker::Pop(PeerFailureEvent* out) {
   *out = std::move(pending_.front());
   pending_.pop_front();
   return true;
+}
+
+size_t PeerFailureTracker::DropPending(const std::string& remoteEngineKey) {
+  std::lock_guard<std::mutex> lock(mu_);
+  const size_t before = pending_.size();
+  pending_.erase(std::remove_if(pending_.begin(), pending_.end(),
+                                [&](const PeerFailureEvent& event) {
+                                  return event.remoteEngineKey == remoteEngineKey;
+                                }),
+                 pending_.end());
+  return before - pending_.size();
 }
 
 bool PeerFailureTracker::IsQpAlive(const QpKey& qp) const {

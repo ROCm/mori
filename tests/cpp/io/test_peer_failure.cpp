@@ -362,6 +362,23 @@ void CaseReleaseQpForgetsFailure() {
   Require(event.remoteEngineKey == "decode-0", "attribution happens at record time");
 }
 
+// A deregistered engine's queued failures go; another engine's stay, in order.
+void CaseDropPendingForgetsOneEngine() {
+  PeerFailureTracker tracker;
+  tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
+  tracker.RegisterQp(Qp(11), "decode-1", kPort1, kCqA);
+  tracker.RegisterQp(Qp(12), "decode-0", kPort1, kCqA);
+  tracker.Report(QpFailure(10));
+  tracker.Report(QpFailure(11));
+  tracker.Report(QpFailure(12));
+
+  Require(tracker.DropPending("decode-0") == 2, "both decode-0 failures must be dropped");
+  PeerFailureEvent event;
+  Require(tracker.Pop(&event) && event.remoteEngineKey == "decode-1",
+          "the other engine's failure must stay");
+  Require(!tracker.Pop(&event), "nothing else may be left");
+}
+
 // Events are drained oldest-first so the first cause is seen before its fallout.
 void CaseFifoOrder() {
   PeerFailureTracker tracker;
@@ -465,6 +482,7 @@ int main() {
       {"LateRegistrationCannotAttribute", CaseLateRegistrationCannotAttribute},
       {"ForgetQpKeepsFailure", CaseForgetQpKeepsFailure},
       {"ReleaseQpForgetsFailure", CaseReleaseQpForgetsFailure},
+      {"DropPendingForgetsOneEngine", CaseDropPendingForgetsOneEngine},
       {"FifoOrder", CaseFifoOrder},
       {"BoundedQueueDropsNewest", CaseBoundedQueueDropsNewest},
       {"PopNullptrIsSafe", CasePopNullptrIsSafe},

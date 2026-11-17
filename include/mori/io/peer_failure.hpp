@@ -129,6 +129,9 @@ class PeerFailureTracker {
 
   // Takes the oldest pending failure. False when none is pending.
   bool Pop(PeerFailureEvent* out);
+  // Drops the pending failures attributed to `remoteEngineKey`, e.g. once that engine was
+  // deregistered. Returns how many.
+  size_t DropPending(const std::string& remoteEngineKey);
 
   // False once this QP, or the port, CQ or device it uses, has been seen to fail.
   bool IsQpAlive(const QpKey& qp) const;

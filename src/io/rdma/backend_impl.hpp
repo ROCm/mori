@@ -135,13 +135,17 @@ class RdmaManager {
                              int weight);
   std::shared_ptr<EndpointRuntime> GetEndpointRuntime(EndpointId id);
   void SnapshotEndpointRuntimes(SnapshotVector& result);
-  // Removes every endpoint to `remote` from the route table and the poller's set, and
-  // forgets the remote engine's memory regions, so no new session can reach them.
+  // Removes every endpoint to `remote` from the route table and forgets the remote
+  // engine's memory regions, so no new session can reach them. Returns them, along with
+  // those an earlier call could not cut; they are still polled.
   SnapshotVector DetachRemoteEngine(const EngineKey& remote);
-  // For endpoints already detached: cuts every QP, then fails what is still in flight on
-  // them with `message`. Sessions that still hold them reject new submissions, and
-  // Alive() reports them dead.
-  void RetireEndpoints(const SnapshotVector& runtimes, const std::string& message);
+  // Cuts every endpoint's QP, then fails what is still in flight on the ones it cut with
+  // `message`. All of them reject new submissions, and Alive() reports them dead. A QP
+  // that could not be cut can still complete work, so its transfers are left to their
+  // completions. Returns the endpoints it cut.
+  SnapshotVector RetireEndpoints(const SnapshotVector& runtimes, const std::string& message);
+  // Stops polling endpoints, once nothing posted on them can complete any more.
+  void RemoveEndpoints(const SnapshotVector& runtimes);
   // Destroys the endpoints no EpPair copy refers to any more.
   void DestroyReleasedEndpoints();
   // QPs connected and not destroyed yet, including detached ones a session still holds.
@@ -168,6 +172,8 @@ class RdmaManager {
   /* -------------------------------- Peer failure -------------------------------- */
   // Takes the oldest recorded failure; polled by an application thread.
   bool PopPeerFailure(PeerFailureEvent* out);
+  // Drops the queued failures of `remote`. Returns how many.
+  size_t DropPeerFailures(const EngineKey& remote);
   // False once a failure covering this QP is observed; a slow QP stays alive.
   bool IsQpAlive(int devId, uint32_t qpNum) const;
   bool NeedsQpReplacement(int devId, uint32_t qpNum) const;
@@ -182,7 +188,6 @@ class RdmaManager {
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
-  void DestroyReleasedEndpointsLocked();
 
  private:
   RdmaBackendConfig config;
@@ -493,6 +498,11 @@ class RdmaBackend : public Backend {
   std::unordered_map<ConnBuildKey, std::chrono::steady_clock::time_point, ConnBuildKeyHash>
       replaceRetryAt;
   std::mutex sessionCacheMu;
+  // Serializes registering and deregistering one remote engine key. Per key, because a
+  // deregistration can wait out a connection build to a dead peer.
+  std::shared_ptr<std::mutex> GetPeerLock(const EngineKey& remoteEngineKey);
+  std::mutex peerLocksMu_;
+  std::unordered_map<EngineKey, std::shared_ptr<std::mutex>> peerLocks_;
   std::mutex connBuildMapMu_;
   std::unordered_map<ConnBuildKey, std::shared_ptr<std::mutex>, ConnBuildKeyHash> connBuildMu_;
   // Failed QPs stay allocated until their remote engine is deregistered, so QPs that fail
