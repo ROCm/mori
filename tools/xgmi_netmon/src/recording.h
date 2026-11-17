@@ -43,10 +43,14 @@ struct Record {
   uint64_t real_err_ns;  // time taken to read CLOCK_REALTIME (wall-clock error bound)
   Snapshot s;  // firmware_timestamp (10 ns), xgmi_read_data_acc[8], xgmi_write_data_acc[8] (KB)
 };
-static_assert(sizeof(Record) == 21 * 8, "Record must be 21 packed u64");
+static_assert(sizeof(Record) == 22 * 8, "Record must be 22 packed u64");
+// Format version 1 had 21 words (no pcie_inst); ReadRecording still reads it, with pcie_inst 0.
+constexpr uint32_t kRecordBytesV1 = 21 * 8;
 
 constexpr char kMagic[8] = {'X', 'G', 'M', 'I', 'N', 'M', '0', '1'};
-constexpr uint32_t kFormatVersion = 1;
+constexpr uint32_t kFormatVersion = 2;
+constexpr uint32_t kFlagPcie =
+    1;  // FileHeader::flags: the GPU's gpu_metrics has pcie_bandwidth_inst
 
 struct FileHeader {
   char magic[8];
@@ -54,7 +58,7 @@ struct FileHeader {
   uint32_t record_bytes;
   int32_t gpu_idx;
   int32_t peer[kNumLinks];  // port -> peer GPU idx, -1 if not connected
-  uint32_t reserved0;
+  uint32_t flags;
   double link_max;  // bytes/s per direction
   uint64_t period_ns;
   char card[16];

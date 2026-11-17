@@ -158,7 +158,8 @@ int RunImport(const ImportOptions& opt) {
   };
   for (const HostRecording& h : hosts) {
     for (const GpuFile& g : h.gpus) {
-      RateCalc calc(experiment, h.host, g.header.gpu_idx, g.header.peer, g.header.link_max);
+      RateCalc calc(experiment, h.host, g.header.gpu_idx, g.header.peer, g.header.link_max,
+                    (g.header.flags & kFlagPcie) != 0);
       for (const Record& r : g.records) {
         calc.Add(r);
         if (calc.pending() >= kFlushPoints) calc.Flush(&body);

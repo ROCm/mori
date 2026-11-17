@@ -158,7 +158,7 @@ void PushMain(std::vector<Stream>* streams, const Url& url, const std::string& e
               const std::string& host, const std::atomic<bool>* stop, PushStats* ps) {
   std::vector<RateCalc> calc;
   for (Stream& s : *streams)
-    calc.emplace_back(experiment, host, s.gpu.idx, s.gpu.peer, s.gpu.link_max);
+    calc.emplace_back(experiment, host, s.gpu.idx, s.gpu.peer, s.gpu.link_max, s.gpu.has_pcie);
   std::vector<Record> buf(4096);
   std::string body;
   uint64_t last_warn = 0;
@@ -235,7 +235,8 @@ bool WriteMeta(const std::string& dir, const Meta& m, const std::vector<Stream>&
     j += "    {\"gpu\": " + std::to_string(s.gpu.idx) + ", \"card\": " + JsonString(s.gpu.card) +
          ", \"pci\": " + JsonString(s.gpu.pci) + ", \"file\": " + JsonString(s.file) +
          ", \"link_max_bytes_per_second\": " +
-         std::to_string(static_cast<uint64_t>(s.gpu.link_max)) + ", \"peers\": {";
+         std::to_string(static_cast<uint64_t>(s.gpu.link_max)) +
+         ", \"pcie\": " + (s.gpu.has_pcie ? "true" : "false") + ", \"peers\": {";
     bool first = true;
     for (int p = 0; p < kNumLinks; ++p) {
       if (s.gpu.peer[p] < 0) continue;

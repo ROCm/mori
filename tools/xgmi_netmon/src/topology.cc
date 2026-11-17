@@ -115,6 +115,7 @@ bool Discover(const std::string& drm_root, std::vector<Gpu>* gpus, std::string* 
       return false;
     }
     g.link_max = LinkMaxBytesPerSecond(reinterpret_cast<const uint8_t*>(raw.data()), g.layout);
+    g.has_pcie = g.layout.pcie_inst != 0;
     gpus->push_back(g);
   }
   for (size_t i = 0; i < gpus->size(); ++i) {

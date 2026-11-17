@@ -37,6 +37,7 @@ T Load(const uint8_t* p) {
 // v1.9 attribute ids (enum amdgpu_metrics_attr_id) and types (enum amdgpu_metrics_attr_type).
 constexpr unsigned kIdXgmiLinkWidth = 18;
 constexpr unsigned kIdXgmiLinkSpeed = 19;
+constexpr unsigned kIdPcieBandwidthInst = 23;
 constexpr unsigned kIdXgmiReadDataAcc = 29;
 constexpr unsigned kIdXgmiWriteDataAcc = 30;
 constexpr unsigned kIdFirmwareTimestamp = 32;
@@ -56,13 +57,15 @@ bool ParseV19(const uint8_t* raw, size_t n, Layout* out, std::string* err) {
     unsigned count;
     size_t* off;
     const char* name;
+    bool optional;
     bool found;
   } want[] = {
-      {kIdXgmiReadDataAcc, kTypeU64, kNumLinks, &out->rd, "xgmi_read_data_acc", false},
-      {kIdXgmiWriteDataAcc, kTypeU64, kNumLinks, &out->wr, "xgmi_write_data_acc", false},
-      {kIdFirmwareTimestamp, kTypeU64, 1, &out->fw, "firmware_timestamp", false},
-      {kIdXgmiLinkWidth, kTypeU16, 1, &out->width, "xgmi_link_width", false},
-      {kIdXgmiLinkSpeed, kTypeU16, 1, &out->speed, "xgmi_link_speed", false},
+      {kIdXgmiReadDataAcc, kTypeU64, kNumLinks, &out->rd, "xgmi_read_data_acc", false, false},
+      {kIdXgmiWriteDataAcc, kTypeU64, kNumLinks, &out->wr, "xgmi_write_data_acc", false, false},
+      {kIdFirmwareTimestamp, kTypeU64, 1, &out->fw, "firmware_timestamp", false, false},
+      {kIdXgmiLinkWidth, kTypeU16, 1, &out->width, "xgmi_link_width", false, false},
+      {kIdXgmiLinkSpeed, kTypeU16, 1, &out->speed, "xgmi_link_speed", false, false},
+      {kIdPcieBandwidthInst, kTypeU64, 1, &out->pcie_inst, "pcie_bandwidth_inst", true, false},
   };
   size_t off = 8;
   for (int i = 0; i < count; ++i) {
@@ -98,7 +101,7 @@ bool ParseV19(const uint8_t* raw, size_t n, Layout* out, std::string* err) {
     off += size;
   }
   for (const Want& w : want) {
-    if (!w.found) {
+    if (!w.found && !w.optional) {
       *err = std::string("gpu_metrics v1.9: no ") + w.name;
       return false;
     }
@@ -121,6 +124,7 @@ bool ParseLayout(const uint8_t* raw, size_t n, Layout* out, std::string* err) {
     l.fw = 288;
     l.width = 72;
     l.speed = 74;
+    l.pcie_inst = 96;
   } else if (frev == 1 && crev == 9) {
     if (!ParseV19(raw, n, &l, err)) return false;
   } else {
@@ -138,7 +142,8 @@ bool ParseLayout(const uint8_t* raw, size_t n, Layout* out, std::string* err) {
 }
 
 size_t RequiredSize(const Layout& l) {
-  return std::max({l.rd + 8 * kNumLinks, l.wr + 8 * kNumLinks, l.fw + 8, l.width + 2, l.speed + 2});
+  return std::max({l.rd + 8 * kNumLinks, l.wr + 8 * kNumLinks, l.fw + 8, l.width + 2, l.speed + 2,
+                   l.pcie_inst ? l.pcie_inst + 8 : 0});
 }
 
 uint64_t ReadFirmwareTimestamp(const uint8_t* raw, const Layout& l) {
@@ -151,6 +156,7 @@ void ReadSnapshot(const uint8_t* raw, const Layout& l, Snapshot* out) {
     out->rd[i] = Load<uint64_t>(raw + l.rd + 8 * i);
     out->wr[i] = Load<uint64_t>(raw + l.wr + 8 * i);
   }
+  out->pcie_inst = l.pcie_inst ? Load<uint64_t>(raw + l.pcie_inst) : 0;
 }
 
 double LinkMaxBytesPerSecond(const uint8_t* raw, const Layout& l) {

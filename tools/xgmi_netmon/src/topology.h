@@ -35,8 +35,9 @@ struct Gpu {
   std::string pci;           // "0000:15:00.0"
   std::string metrics_path;  // .../device/gpu_metrics
   Layout layout;
-  double link_max = 0;  // bytes/s per direction
-  int peer[kNumLinks];  // XGMI port -> peer GPU idx, -1 if the port is not connected
+  double link_max = 0;    // bytes/s per direction
+  bool has_pcie = false;  // gpu_metrics has pcie_bandwidth_inst
+  int peer[kNumLinks];    // XGMI port -> peer GPU idx, -1 if the port is not connected
 };
 
 struct PortLine {

@@ -57,9 +57,10 @@ DIR/.lock          created exclusively: pid, host, start time
 DIR/meta.json      status (running | complete | failed), host, experiment, GPUs and peers,
                    per-GPU statistics, push statistics, CPU time
 DIR/gpu<N>.bin     512-byte header (magic XGMINM01, GPU, peers, link max, host, experiment),
-                   then records of 21 little-endian u64:
+                   then records of 22 little-endian u64 (format 2):
                    t0_mono_ns, t1_mono_ns, real_ns, real_err_ns, firmware_timestamp (10 ns),
-                   xgmi_read_data_acc[8], xgmi_write_data_acc[8] (KB)
+                   xgmi_read_data_acc[8], xgmi_write_data_acc[8] (KB), pcie_bandwidth_inst
+                   (raw; 0 if the GPU has none). Format 1 files (21 u64, no PCIe) can still be imported.
 ```
 
 A record is written only when `firmware_timestamp` changed. A recording killed mid-write may end
@@ -101,8 +102,8 @@ with a partial record; `import` drops it. A recorder that died leaves `status: r
 - Series: `xgmi_bytes`, `xgmi_rate_bytes_per_second` (labels experiment, host, gpu, peer,
   dir = wr | rd) and `xgmi_interval_seconds` (per GPU, with the labels `links` and
   `link_max_bytes_per_second`: the link capacity from `gpu_metrics`, for the dashboard's reference
-  lines). Point time = wall clock of the read
-  that first saw the snapshot. Both the push and `import` write VictoriaMetrics' `/api/v1/import`
+  lines) and `xgmi_pcie_inst` (per GPU: the raw `pcie_bandwidth_inst` at the end of each interval).
+  Point time = wall clock of the read that first saw the snapshot. Both the push and `import` write VictoriaMetrics' `/api/v1/import`
   format, one JSON line per series (as ainic-netmon), so labels are sent once per request.
 
 ## Dashboard
@@ -118,7 +119,9 @@ Top to bottom:
 
 - Tiles: Total Sent, Total Util (share of the capacity), Busiest Sent and Busiest Received (the GPU
   with the highest average sent / received bandwidth in the window; received = what the peers sent
-  to it) and Last Data (the newest sample within the hour or the selected range before its end, whichever is
+  to it), Busiest PCIe (the GPU with the highest average PCIe traffic; reads and writes added,
+  because `gpu_metrics` has one total; the unit of the raw value is not documented and is taken
+  as 0.1 MB/s per count, an estimate, so it is an order of magnitude) and Last Data (the newest sample within the hour or the selected range before its end, whichever is
   longer; Live while it is at most 10 s old; otherwise its age in
   seconds, yellow from 10 s and red from 30 s: the recorder or the push stalled, or it is a
   recording and this is how old it is. While recording the age moves between about 2.6 and 4.4 s,
@@ -164,6 +167,9 @@ start).
 - KB = 1024 bytes is assumed; it cannot be separated from the 1.12x link overhead with this test.
 - The effect of reading `gpu_metrics` every 2 ms on a running workload is not measured yet.
 - Point times are read times: up to ~2 ms after the snapshot.
+- PCIe: `pcie_bandwidth_inst` is a total of both directions, with no H2D / D2H split, and its unit is
+  not documented (0.1 MB/s per count is an estimate from three points, about 6 % error). An idle GPU
+  shows about 7 MB/s. Recordings made before this field was added show N/A.
 - Deployment uses `docker run`, not compose (the `docker-compose` 1.29 on n06-21 is broken).
   Both services listen on 127.0.0.1 only; Grafana allows anonymous admin, do not expose it.
   `up.sh` copies the Grafana files into the data directory, because the docker daemon cannot read

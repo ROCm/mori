@@ -31,6 +31,9 @@
 // Series, labels experiment, host, gpu, and peer, dir per link (dir = wr: sent by this GPU on the
 // link, rd: received):
 //   xgmi_bytes, xgmi_rate_bytes_per_second  per link and direction
+//   xgmi_pcie_inst                          per GPU, if gpu_metrics has it: raw pcie_bandwidth_inst
+//   at the
+//                                           end of each interval (PCIe traffic of both directions)
 //   xgmi_interval_seconds                   per GPU; extra labels links (connected links) and
 //                                           link_max_bytes_per_second (one link, one direction)
 // Output is VictoriaMetrics' /api/v1/import format, one JSON line per series (as ainic-netmon):
@@ -61,7 +64,7 @@ std::string EscapeLabel(const std::string& v);
 class RateCalc {
  public:
   RateCalc(const std::string& experiment, const std::string& host, int gpu,
-           const int peer[kNumLinks], double link_max);
+           const int peer[kNumLinks], double link_max, bool has_pcie);
   // Adds the points of the interval ending at `r` (none for the first record).
   void Add(const Record& r);
   // Points added since the last Flush.
@@ -78,6 +81,8 @@ class RateCalc {
   void Point(Series* s, const char* value, const char* ts);
 
   Series interval_;
+  Series pcie_;
+  bool has_pcie_;
   Series link_[kNumLinks][2][2];  // [port][0 = rd, 1 = wr][0 = bytes, 1 = rate]
   bool connected_[kNumLinks] = {};
   double link_max_;

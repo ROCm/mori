@@ -58,8 +58,8 @@ std::string EscapeLabel(const std::string& v) {
 }
 
 RateCalc::RateCalc(const std::string& experiment, const std::string& host, int gpu,
-                   const int peer[kNumLinks], double link_max)
-    : link_max_(link_max) {
+                   const int peer[kNumLinks], double link_max, bool has_pcie)
+    : has_pcie_(has_pcie), link_max_(link_max) {
   const std::string base = ",\"experiment\":" + JsonString(experiment) +
                            ",\"host\":" + JsonString(host) + ",\"gpu\":\"" + std::to_string(gpu) +
                            "\"";
@@ -71,6 +71,7 @@ RateCalc::RateCalc(const std::string& experiment, const std::string& host, int g
   interval_.head = "{\"metric\":{\"__name__\":\"xgmi_interval_seconds\"" + base + ",\"links\":\"" +
                    std::to_string(links) + "\",\"link_max_bytes_per_second\":\"" +
                    std::to_string(static_cast<unsigned long long>(link_max)) + "\"},\"values\":[";
+  pcie_.head = "{\"metric\":{\"__name__\":\"xgmi_pcie_inst\"" + base + "},\"values\":[";
   static const char* const kDir[2] = {"rd", "wr"};
   static const char* const kName[2] = {"xgmi_bytes", "xgmi_rate_bytes_per_second"};
   for (int p = 0; p < kNumLinks; ++p) {
@@ -111,6 +112,10 @@ void RateCalc::Add(const Record& r) {
   ++stats_.intervals;
   std::snprintf(v, sizeof(v), "%.9f", dt);
   Point(&interval_, v, ts);
+  if (has_pcie_) {
+    std::snprintf(v, sizeof(v), "%llu", static_cast<unsigned long long>(r.s.pcie_inst));
+    Point(&pcie_, v, ts);
+  }
   for (int p = 0; p < kNumLinks; ++p) {
     if (!connected_[p]) continue;
     const uint64_t cur[2] = {r.s.rd[p], r.s.wr[p]};
@@ -147,6 +152,7 @@ void RateCalc::Flush(std::string* out) {
     s->timestamps.clear();
   };
   emit(&interval_);
+  emit(&pcie_);
   for (int p = 0; p < kNumLinks; ++p)
     for (int d = 0; d < 2; ++d)
       for (int m = 0; m < 2; ++m) emit(&link_[p][d][m]);

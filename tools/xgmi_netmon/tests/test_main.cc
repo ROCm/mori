@@ -204,6 +204,7 @@ Record MakeRecord(uint64_t real_ns, uint64_t fw, uint64_t rd1, uint64_t wr1) {
   r.s.fw = fw;
   r.s.rd[1] = rd1;
   r.s.wr[1] = wr1;
+  r.s.pcie_inst = rd1 + 7;
   return r;
 }
 
@@ -236,10 +237,11 @@ void TestLayoutV18() {
   Layout l;
   std::string err;
   CHECK(ParseLayout(U8(raw), raw.size(), &l, &err));
-  CHECK(l.rd == 136 && l.wr == 200 && l.fw == 288 && l.width == 72 && l.speed == 74);
+  CHECK(l.rd == 136 && l.wr == 200 && l.fw == 288 && l.width == 72 && l.speed == 74 &&
+        l.pcie_inst == 96);
   Snapshot s;
   ReadSnapshot(U8(raw), l, &s);
-  CHECK(s.fw == 243647961296168ull);
+  CHECK(s.fw == 243647961296168ull && s.pcie_inst == 18);
   CHECK(s.rd[0] == 0 && s.rd[1] == 1233066902317ull && s.rd[7] == 1237512831488ull);
   CHECK(s.wr[5] == 1851049654948ull);
   CHECK(LinkMaxBytesPerSecond(U8(raw), l) == 72e9);
@@ -250,10 +252,11 @@ void TestLayoutV19() {
   Layout l;
   std::string err;
   CHECK(ParseLayout(U8(raw), raw.size(), &l, &err));
-  CHECK(l.rd == 376 && l.wr == 448 && l.fw == 544 && l.width == 228 && l.speed == 238);
+  CHECK(l.rd == 376 && l.wr == 448 && l.fw == 544 && l.width == 228 && l.speed == 238 &&
+        l.pcie_inst != 0);
   Snapshot s;
   ReadSnapshot(U8(raw), l, &s);
-  CHECK(s.fw == 189831201677852ull);
+  CHECK(s.fw == 189831201677852ull && s.pcie_inst == 18);
   CHECK(s.rd[3] == 1366248931244ull);
   CHECK(s.wr[1] == 541954904484ull && s.wr[7] == 541451658948ull);
   CHECK(LinkMaxBytesPerSecond(U8(raw), l) == 72e9);
@@ -308,7 +311,7 @@ void TestDiscover() {
 
 void TestRates() {
   int peer[kNumLinks] = {-1, 4, -1, -1, -1, -1, -1, -1};
-  RateCalc c("exp\"1", "h1", 0, peer, 72e9);
+  RateCalc c("exp\"1", "h1", 0, peer, 72e9, true);
   const uint64_t t = 1000000000123456789ull;
   c.Add(MakeRecord(t, 1000, 100, 200));
   CHECK(c.pending() == 0);                                   // first record: no interval
@@ -320,7 +323,7 @@ void TestRates() {
   // 2 ms at 2x 72 GB/s = 288 MB = 281250 KB; 400000 KB is not physical: no wr point.
   c.Add(MakeRecord(t + 8000000, 1000 + 600000, 50, 300 + 400000));
   CHECK(c.stats().implausible == 1 && c.stats().intervals == 3);
-  CHECK(c.pending() == 3 + 4 + 2 + 2);
+  CHECK(c.pending() == 3 + 3 + 4 + 2 + 2);
 
   std::string out;
   c.Flush(&out);
@@ -330,18 +333,19 @@ void TestRates() {
   // the interval series also carries the link capacity (1 connected link here, 72 GB/s)
   const std::string LI = L + ",\"links\":\"1\",\"link_max_bytes_per_second\":\"72000000000\"";
   const std::string T1 = "1000000000125", T3 = "1000000000129", T4 = "1000000000131";
-  CHECK_STR(out, M + "xgmi_interval_seconds" + LI +
-                     "},\"values\":[0.002000000,0.002000000,0.002000000],\"timestamps\":[" + T1 +
-                     "," + T3 + "," + T4 + "]}\n" + M + "xgmi_bytes" + L +
-                     ",\"peer\":\"4\",\"dir\":\"rd\"},\"values\":[1024000,0]," +
-                     "\"timestamps\":[" + T1 + "," + T4 + "]}\n" + M +
-                     "xgmi_rate_bytes_per_second" + L +
-                     ",\"peer\":\"4\",\"dir\":\"rd\"},\"values\":[5.12e+08,0],\"timestamps\":[" +
-                     T1 + "," + T4 + "]}\n" + M + "xgmi_bytes" + L +
-                     ",\"peer\":\"4\",\"dir\":\"wr\"},\"values\":[0,102400]," + "\"timestamps\":[" +
-                     T1 + "," + T3 + "]}\n" + M + "xgmi_rate_bytes_per_second" + L +
-                     ",\"peer\":\"4\",\"dir\":\"wr\"},\"values\":[0,5.12e+07],\"timestamps\":[" +
-                     T1 + "," + T3 + "]}\n");
+  CHECK_STR(out,
+            M + "xgmi_interval_seconds" + LI +
+                "},\"values\":[0.002000000,0.002000000,0.002000000],\"timestamps\":[" + T1 + "," +
+                T3 + "," + T4 + "]}\n" + M + "xgmi_pcie_inst" + L +
+                "},\"values\":[1107,57,57],\"timestamps\":[" + T1 + "," + T3 + "," + T4 + "]}\n" +
+                M + "xgmi_bytes" + L + ",\"peer\":\"4\",\"dir\":\"rd\"},\"values\":[1024000,0]," +
+                "\"timestamps\":[" + T1 + "," + T4 + "]}\n" + M + "xgmi_rate_bytes_per_second" + L +
+                ",\"peer\":\"4\",\"dir\":\"rd\"},\"values\":[5.12e+08,0],\"timestamps\":[" + T1 +
+                "," + T4 + "]}\n" + M + "xgmi_bytes" + L +
+                ",\"peer\":\"4\",\"dir\":\"wr\"},\"values\":[0,102400]," + "\"timestamps\":[" + T1 +
+                "," + T3 + "]}\n" + M + "xgmi_rate_bytes_per_second" + L +
+                ",\"peer\":\"4\",\"dir\":\"wr\"},\"values\":[0,5.12e+07],\"timestamps\":[" + T1 +
+                "," + T3 + "]}\n");
   out.clear();
   c.Flush(&out);
   CHECK(out.empty());
@@ -355,6 +359,7 @@ void TestRecordingFile() {
   g.card = "card24";
   g.pci = "0000:75:00.0";
   g.link_max = 72e9;
+  g.has_pcie = true;
   for (int i = 0; i < kNumLinks; ++i) g.peer[i] = i == 0 ? -1 : 7 - i;
   const FileHeader h = MakeHeader(g, "n06-21", "exp42", 2000000);
   std::vector<Record> recs = {MakeRecord(1, 2, 3, 4), MakeRecord(5, 6, 7, 8),
@@ -377,6 +382,24 @@ void TestRecordingFile() {
   CHECK_STR(rh.host, "n06-21");
   CHECK_STR(rh.experiment, "exp42");
   CHECK_STR(rh.pci, "0000:75:00.0");
+  CHECK(rh.version == kFormatVersion && (rh.flags & kFlagPcie) != 0);
+  CHECK(got[2].s.pcie_inst == 18);
+
+  // a version 1 file (21-word records, no pcie_inst) stays readable
+  {
+    FileHeader h1 = h;
+    h1.version = 1;
+    h1.record_bytes = kRecordBytesV1;
+    h1.flags = 0;
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(&h1), sizeof(h1));
+    for (const Record& r : recs) f.write(reinterpret_cast<const char*>(&r), kRecordBytesV1);
+    f.write("01234", 5);
+  }
+  std::vector<Record> old;
+  CHECK(ReadRecording(path, &rh, &old, &partial, &err));
+  CHECK(old.size() == 3 && partial == 5 && rh.version == 1 && (rh.flags & kFlagPcie) == 0);
+  CHECK(old[1].s.fw == 6 && old[1].s.rd[1] == 7 && old[1].s.wr[1] == 8 && old[1].s.pcie_inst == 0);
 
   std::ofstream(path, std::ios::binary) << std::string(600, 'x');
   CHECK(!ReadRecording(path, &rh, &got, &partial, &err) &&
@@ -477,6 +500,7 @@ void TestImport() {
   g.idx = 0;
   g.card = "card0";
   g.link_max = 72e9;
+  g.has_pcie = true;
   for (int i = 0; i < kNumLinks; ++i) g.peer[i] = i == 1 ? 4 : -1;
   const FileHeader h = MakeHeader(g, "h1", "e1", 2000000);
   std::vector<Record> recs;
@@ -490,7 +514,7 @@ void TestImport() {
     f.write(reinterpret_cast<const char*>(recs.data()), recs.size() * sizeof(Record));
   }
   std::string expect;
-  RateCalc c("e1", "h1", 0, g.peer, g.link_max);
+  RateCalc c("e1", "h1", 0, g.peer, g.link_max, true);
   for (const Record& r : recs) c.Add(r);
   c.Flush(&expect);
 

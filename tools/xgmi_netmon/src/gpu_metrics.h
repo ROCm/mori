@@ -41,6 +41,8 @@ struct Layout {
   size_t fw = 0;     // firmware_timestamp, u64, 10 ns
   size_t width = 0;  // xgmi_link_width, u16, lanes
   size_t speed = 0;  // xgmi_link_speed, u16, Gbps
+  size_t pcie_inst =
+      0;  // pcie_bandwidth_inst, u64, PCIe traffic of both directions; 0: not in this layout
 };
 
 // Fills *out; on failure returns false and sets *err.
@@ -50,6 +52,7 @@ struct Snapshot {
   uint64_t fw = 0;
   uint64_t rd[kNumLinks] = {};
   uint64_t wr[kNumLinks] = {};
+  uint64_t pcie_inst = 0;  // raw pcie_bandwidth_inst; 0 if the layout has none
 };
 
 // `raw` must hold at least RequiredSize(layout) bytes.

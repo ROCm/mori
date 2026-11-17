@@ -52,6 +52,7 @@ FileHeader MakeHeader(const Gpu& gpu, const std::string& host, const std::string
   h.gpu_idx = gpu.idx;
   for (int i = 0; i < kNumLinks; ++i) h.peer[i] = gpu.peer[i];
   h.link_max = gpu.link_max;
+  h.flags = gpu.has_pcie ? kFlagPcie : 0;
   h.period_ns = period_ns;
   CopyString(h.card, gpu.card);
   CopyString(h.pci, gpu.pci);
@@ -106,16 +107,21 @@ bool ReadRecording(const std::string& path, FileHeader* header, std::vector<Reco
     *err = path + ": not an xgmi-netmon recording";
     return false;
   }
-  if (header->version != kFormatVersion || header->record_bytes != sizeof(Record)) {
+  const bool v1 = header->version == 1 && header->record_bytes == kRecordBytesV1;
+  const bool v2 = header->version == kFormatVersion && header->record_bytes == sizeof(Record);
+  if (!v1 && !v2) {
     *err = path + ": format version " + std::to_string(header->version) + " / record size " +
            std::to_string(header->record_bytes) + " not supported";
     return false;
   }
   const size_t body = got - sizeof(FileHeader);
-  const size_t n = body / sizeof(Record);
-  *partial_bytes = body % sizeof(Record);
-  records->resize(n);
-  if (n) std::memcpy(records->data(), buf.data() + sizeof(FileHeader), n * sizeof(Record));
+  const size_t stride =
+      header->record_bytes;  // pcie_inst is the last word: a v1 record is a prefix
+  const size_t n = body / stride;
+  *partial_bytes = body % stride;
+  records->assign(n, Record{});
+  for (size_t i = 0; i < n; ++i)
+    std::memcpy(&(*records)[i], buf.data() + sizeof(FileHeader) + i * stride, stride);
   return true;
 }
 

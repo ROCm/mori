@@ -164,7 +164,7 @@
       "gridPos": {
         "x": 0,
         "y": 0,
-        "w": 5,
+        "w": 4,
         "h": 4
       },
       "targets": [
@@ -229,7 +229,7 @@
         "uid": "xgmi-vm"
       },
       "gridPos": {
-        "x": 5,
+        "x": 4,
         "y": 0,
         "w": 4,
         "h": 4
@@ -312,9 +312,9 @@
         "uid": "xgmi-vm"
       },
       "gridPos": {
-        "x": 9,
+        "x": 8,
         "y": 0,
-        "w": 5,
+        "w": 4,
         "h": 4
       },
       "targets": [
@@ -380,9 +380,9 @@
         "uid": "xgmi-vm"
       },
       "gridPos": {
-        "x": 14,
+        "x": 12,
         "y": 0,
-        "w": 5,
+        "w": 4,
         "h": 4
       },
       "targets": [
@@ -448,9 +448,9 @@
         "uid": "xgmi-vm"
       },
       "gridPos": {
-        "x": 19,
+        "x": 20,
         "y": 0,
-        "w": 5,
+        "w": 4,
         "h": 4
       },
       "targets": [
@@ -1871,6 +1871,74 @@
           ]
         }
       ]
+    },
+    {
+      "id": 27,
+      "type": "stat",
+      "title": "Busiest PCIe",
+      "description": "The GPU with the highest average PCIe traffic in the averaging window. Reads and writes are added: gpu_metrics has one total (pcie_bandwidth_inst, refreshed every 2 ms), no direction. It counts the GPU's PCIe link (host copies, NIC DMA, peer traffic over PCIe), not XGMI. The unit of the raw value is not documented; it is taken as 0.1 MB/s per count, an estimate (about 6 % error), so read it as an order of magnitude. N/A: this recording has no PCIe data (recorded with an older version) or the GPU does not report it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "xgmi-vm"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "xgmi-vm"
+          },
+          "instant": true,
+          "range": false,
+          "format": "time_series",
+          "expr": "topk(1, sum by (gpu) (avg_over_time(xgmi_pcie_inst{experiment=\"$experiment\",host=\"$host\",gpu=~\"$gpu\"}[${avg_window}ms])) * 1e5)",
+          "legendFormat": "GPU{{gpu}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "decimals": 1,
+          "noValue": "N/A",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "text": {
+          "titleSize": 18,
+          "valueSize": 32
+        }
+      }
     }
   ]
 }
