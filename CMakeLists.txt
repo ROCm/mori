@@ -423,8 +423,30 @@ endif()
 # Public headers
 install(DIRECTORY include/mori DESTINATION include)
 
-# CMake package config (enables find_package(mori) for external C++ users)
+# CMake package config (enables find_package(mori) for external C++ users).
+# Version: MORI_VERSION if given, else the last vX.Y.Z tag.
+if(NOT MORI_VERSION)
+  execute_process(
+    COMMAND git describe --tags --abbrev=0 --match "v[0-9]*"
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE _mori_tag
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" MORI_VERSION "${_mori_tag}")
+  if(NOT MORI_VERSION)
+    set(MORI_VERSION 0.0.0)
+  endif()
+endif()
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/mori-config-version.cmake
+  VERSION ${MORI_VERSION}
+  COMPATIBILITY SameMajorVersion)
+# Build options that code compiled against the installed headers must match.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/mori-build-options.cmake
+     "set(MORI_BUILD_CCO_SDMA ${BUILD_CCO_SDMA})\n")
 install(FILES cmake/mori-config.cmake cmake/MoriDetectDevice.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/mori-config-version.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/mori-build-options.cmake
         DESTINATION lib/cmake/mori)
 
 # Logging (spdlog is statically linked, but install the shared lib if built)

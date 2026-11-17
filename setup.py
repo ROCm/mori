@@ -820,8 +820,8 @@ class CMakeBuild(build_ext):
 
         files_to_copy = [
             (
-                build_dir / "src/cco/libmori_cco.so",
-                root_dir / "python/mori/libmori_cco.so",
+                build_dir / "src/cco/libmori_cco.so.1",
+                root_dir / "python/mori/libmori_cco.so.1",
             ),
             (
                 build_dir / "src/pybind/libmori_pybinds.so",
@@ -871,6 +871,12 @@ class CMakeBuild(build_ext):
             files_to_copy.append((ras_so, root_dir / "python/mori/libmori_ras.so"))
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
+        # The link-time name, for -lmori_cco (Cython and torch extensions, the JIT).
+        # Binaries record the SONAME, so they load libmori_cco.so.1 at run time.
+        cco_dev_link = root_dir / "python/mori/libmori_cco.so"
+        if cco_dev_link.is_symlink() or cco_dev_link.exists():
+            cco_dev_link.unlink()
+        cco_dev_link.symlink_to("libmori_cco.so.1")
 
         # UMBP bindings are their own module (it links gRPC); mori.cpp loads it lazily.
         # Keyed on the flag, not the file: CMake leaves a stale one in a reused build dir.
@@ -1119,6 +1125,8 @@ extensions = (
 )
 
 mori_package_data = [
+    "libmori_cco.so.1",
+    # A wheel cannot hold the symlink, so this ships as a copy; only linkers use it.
     "libmori_cco.so",
     "libmori_pybinds.so",
     "libmori_shmem.so",

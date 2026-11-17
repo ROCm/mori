@@ -30,16 +30,25 @@ endif()
 
 # Absorb the application layer statically so libmori_cco.so has NO runtime
 # dependency on libmori_application.so: --whole-archive pulls in the full
-# archive. --exclude-libs,ALL then marks every symbol coming from a static
-# archive (mori_application_static, plus the absorbed hsakmt / spdlog / builtins)
-# as local, so none are re-exported (no symbol leakage / interposition). cco's
-# own cco* symbols live in this target's object file, not an archive, so they
-# stay exported. The static archive's INTERFACE brings the external link deps
-# (hip/dl/hsa/hsakmt[/mpi]); the ibverbs dlopen shim is embedded, so cco
-# links neither libmori_application.so nor libibverbs directly.
+# archive. --exclude-libs,ALL marks every symbol defined in a static archive
+# (mori_application_static, plus the absorbed hsakmt / spdlog / builtins) as
+# local. Weak template and inline code instantiated in this target's own objects
+# is not covered by that; the version script below hides it. The static
+# archive's INTERFACE brings the external link deps (hip/dl/hsa/hsakmt[/mpi]);
+# the ibverbs dlopen shim is embedded, so cco links neither
+# libmori_application.so nor libibverbs directly.
 target_link_libraries(mori_cco PRIVATE
                       -Wl,--whole-archive mori_application_static -Wl,--no-whole-archive)
 target_link_options(mori_cco PRIVATE LINKER:--exclude-libs,ALL)
+
+# libmori_cco.so.1, with libmori_cco.so as the link-time name. The SONAME
+# changes only when the C ABI major in cco_c.h does. The version script exports
+# the C ABI entry and the mori::cco C++ API, and nothing else.
+set(MORI_CCO_VERSION_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/mori_cco.map)
+set_target_properties(mori_cco PROPERTIES SOVERSION 1 LINK_DEPENDS
+                                                     ${MORI_CCO_VERSION_SCRIPT})
+target_link_options(mori_cco PRIVATE
+                    LINKER:--version-script=${MORI_CCO_VERSION_SCRIPT})
 
 target_link_libraries(mori_cco PUBLIC mori_logging hip::host)
 
