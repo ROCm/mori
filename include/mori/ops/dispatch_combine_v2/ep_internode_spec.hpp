@@ -190,6 +190,8 @@ struct EpInterNodeRequest {
   bool noRdmaAtomics = false;
   // See EpInterNodeKernelCfg::moeSort; applied to the dispatch passes only. Not for AsyncLL.
   bool moeSort = false;
+  // See EpInterNodeKernelCfg::windowUncached.
+  bool windowUncached = false;
   // AsyncLL only; the host resolves transport/env policy before constructing a plan.
   int asyncLlMode = 0;
   // geometry; 0 = the placeholder MakeEpInterNodeCfg picks
@@ -221,6 +223,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
   MORI_FIELD(combineLoadFirst);
   MORI_FIELD(noRdmaAtomics);
   MORI_FIELD(moeSort);
+  MORI_FIELD(windowUncached);
   MORI_FIELD(asyncLlMode);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
@@ -231,7 +234,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeRequest, 23,
+    EpInterNodeRequest, 24,
     "added an EpInterNodeRequest field -- update VisitFields(EpInterNodeRequest) too");
 
 std::string EpInterNodeRequestSchema();

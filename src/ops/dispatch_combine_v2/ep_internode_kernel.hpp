@@ -369,6 +369,20 @@ __device__ __forceinline__ int32_t EpInterNodeWaitGt(int32_t* addr, int32_t val)
 }
 
 // Wait until this wave's stores have completed (gfx9's vmcnt counts them; gfx12 has storecnt).
+// A combine relay publishes its staging stores to the poster, whose RDMA read must see them. In an
+// uncached cco window they bypass L2, so completing them is enough; otherwise each producer
+// writes back its own XCD's L2, which the poster's cannot do for it.
+template <EpInterNodeKernelCfg kConfig>
+__device__ __forceinline__ void EpInterNodePublishStaging() {
+#if defined(__gfx942__) || defined(__gfx950__)
+  if constexpr (kConfig.windowUncached) {
+    __asm__ volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    return;
+  }
+#endif
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+}
+
 __device__ __forceinline__ void EpInterNodeWaitStores() {
 #if defined(MORI_GFX125X) || defined(__GFX12__)
   __asm__ volatile("s_wait_storecnt 0x0" ::: "memory");
@@ -2003,7 +2017,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
 
             // Join the producers before the leader's release publishes their stores.
             ::mori::cco::ccoCoopWarp{}.sync();
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+            EpInterNodePublishStaging<kConfig>();
             index_t finished = 0;
             if (laneId == 0)
               finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
@@ -2161,7 +2175,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
 
       // Join the producers before the leader's release publishes their stores.
       ::mori::cco::ccoCoopWarp{}.sync();
-      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      EpInterNodePublishStaging<kConfig>();
       // A chunk goes out in pieces of max(kCombinePieceMinTokens, chunk / QPs) tokens, piece i on
       // QP (k + i), each posted once its own items are done: a single post per chunk ran a whole
       // node's tokens through one QP at that QP's rate.

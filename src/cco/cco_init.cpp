@@ -827,6 +827,8 @@ int ccoCommDestroy(ccoComm* comm) {
 /*                              ccoMemAlloc                                */
 /* ========================================================================== */
 
+int ccoWindowUncached() { return CcoWindowAllocType() != hipMemAllocationTypePinned ? 1 : 0; }
+
 int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   if (outPtr == nullptr) {
     MORI_SHMEM_ERROR("ccoMemAlloc: outPtr is NULL");

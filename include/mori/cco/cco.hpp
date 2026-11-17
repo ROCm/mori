@@ -958,6 +958,9 @@ int ccoCommDestroy(ccoComm* comm);
 
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──
 int ccoMemAlloc(ccoComm* comm, size_t size, void** ptr);
+// 1 if ccoMemAlloc / ccoWindowRegister memory is allocated uncached (the default; see
+// CCO_UNCACHED_WINDOW), so device stores to it bypass L2; 0 if it falls back to pinned memory.
+int ccoWindowUncached();
 int ccoMemFree(ccoComm* comm, void* ptr);
 // Like ccoMemAlloc, but aliases an EXTERNAL HIP VMM allocation (e.g. a
 // torch.symm_mem buffer) into the flat-VA slot instead of allocating: retains its

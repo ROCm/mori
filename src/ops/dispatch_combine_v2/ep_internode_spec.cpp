@@ -102,6 +102,8 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   // Dispatch passes only, so the other passes keep one module with and without it.
   cfg.kernelCfg.moeSort = request.moeSort && (kind == EpInterNodeKernel::Dispatch ||
                                               kind == EpInterNodeKernel::DispatchLL);
+  cfg.kernelCfg.windowUncached = request.windowUncached && (kind == EpInterNodeKernel::Combine ||
+                                                            kind == EpInterNodeKernel::CombineLL);
   cfg.asyncLlMode = request.asyncLlMode;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);

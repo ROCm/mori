@@ -14,7 +14,7 @@ from .cco cimport (
     CCO_GDA_CONNECTION_NONE, CCO_GDA_CONNECTION_FULL,
     CCO_GDA_CONNECTION_CROSSNODE, CCO_GDA_CONNECTION_RAIL,
     ccoGetUniqueId, ccoCommCreate, ccoCommDestroy,
-    ccoMemAlloc, ccoMemImport, ccoMemFree,
+    ccoMemAlloc, ccoMemImport, ccoMemFree, ccoWindowUncached,
     ccoWindowDeregister, ccoDevCommCreate, ccoDevCommDestroy,
     ccoDevCommCopyToDevice, ccoDevCommFreeDeviceCopy,
     ccoBarrierAll, ccoWindowRegister,
@@ -292,6 +292,11 @@ def comm_destroy(Comm comm):
     comm._ptr = NULL
     if ret != 0:
         raise RuntimeError(f"ccoCommDestroy failed: {ret}")
+
+
+def window_uncached():
+    """True if cco windows are allocated uncached (device stores bypass L2)."""
+    return bool(ccoWindowUncached())
 
 
 def mem_alloc(Comm comm, size_t size):
