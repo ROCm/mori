@@ -48,7 +48,8 @@
 namespace mori {
 namespace application {
 
-Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
+Context::Context(BootstrapNetwork& bootNet, const ContextOptions& opts)
+    : bootNet(bootNet), rdmaEnabled(opts.rdma) {
   // Snapshot env vars once at construction. Every subsequent decision (transport
   // selection, hipMalloc vs hipExtMallocWithFlags(uncached), etc.) must read
   // from this cached state, not getenv. Otherwise late env mutations -- e.g.
@@ -287,10 +288,7 @@ bool Context::RailOnlyEligible() const {
 // / Context::IsP2PDisabled() instead of getenv anywhere outside the
 // constructor.
 
-void Context::InitializeTopologyAndTransports() {
-  // Local rank within this host. Already derived in CollectHostNames from the
-  // exchanged nodeId ordering (seenPerNode), so reuse it instead of recounting.
-  int rankInNode = peerInfos[LocalRank()].rankInNode;
+int Context::SelectRdmaDevice(int rankInNode) {
   assert(rankInNode < 8);
 
   // Init rdma context — proxy uses vendor-agnostic IBVerbs, IBGDA uses DirectVerbs
@@ -370,6 +368,21 @@ void Context::InitializeTopologyAndTransports() {
     }
     MORI_APP_INFO("rank {} allRdmaDeviceContexts size: {}", LocalRank(),
                   allRdmaDeviceContexts.size());
+  }
+  return portId;
+}
+
+void Context::InitializeTopologyAndTransports() {
+  // Local rank within this host. Already derived in CollectHostNames from the
+  // exchanged nodeId ordering (seenPerNode), so reuse it instead of recounting.
+  int rankInNode = peerInfos[LocalRank()].rankInNode;
+
+  int portId = -1;
+  if (rdmaEnabled) {
+    portId = SelectRdmaDevice(rankInNode);
+  } else {
+    MORI_APP_INFO("rank {} rankInNode {} RDMA off for this context; no NIC opened", LocalRank(),
+                  rankInNode);
   }
 
   int numQpPerPe = 4;
