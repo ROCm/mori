@@ -367,8 +367,11 @@ int CommCreate(const moriCcoUniqueId_t* uniqueId, int nRanks, int rank,
     }
 
     ccoComm* comm = nullptr;
-    const int rc = ccoCommCreate(*reinterpret_cast<const ccoUniqueId*>(uniqueId), nRanks, rank,
-                                 cfg.perRankVaBytes, &comm);
+    const ccoUniqueId& id = *reinterpret_cast<const ccoUniqueId*>(uniqueId);
+    ccoCommConfig commConfig = CCO_COMM_CONFIG_INITIALIZER;
+    commConfig.cpuAffinity = (cfg.flags & MORI_CCO_COMM_NO_CPU_AFFINITY) ? 0 : 1;
+    commConfig.lsaOnly = (cfg.flags & MORI_CCO_COMM_LSA_ONLY) ? 1 : 0;
+    const int rc = ccoCommCreate(id, nRanks, rank, cfg.perRankVaBytes, &commConfig, &comm);
     // cco tolerates a failed handle-type probe; keep it out of HIP's sticky error.
     (void)hipGetLastError();
     if (rc != 0 || comm == nullptr) return CcoFail(kEntry, "ccoCommCreate");

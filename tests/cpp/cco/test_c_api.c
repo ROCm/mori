@@ -81,6 +81,7 @@ typedef struct {
   int count;
   int generation;
   int failed;
+  moriCcoUniqueId_t uid2;  // rank 0's id for the second comm
 } Barrier;
 
 static Barrier* g_bar;
@@ -231,9 +232,41 @@ static int check(const void* src, uint32_t value, size_t bytes, const char* what
   return 0;
 }
 
+// Whether this process has an RDMA library mapped.
+static int rdma_loaded(void) {
+  FILE* f = fopen("/proc/self/maps", "r");
+  char line[512];
+  int found = 0;
+  if (!f) return -1;
+  while (!found && fgets(line, sizeof(line), f)) found = strstr(line, "libibverbs") != NULL;
+  fclose(f);
+  return found;
+}
+
+// A second comm with the default config: it pins this thread unless
+// MORI_IGNORE_CPU_AFFINITY is set, which shows the check above has teeth.
+static int default_comm(int rank, int nranks) {
+  if (rank == 0) OK(api.getUniqueId(&g_bar->uid2));
+  BARRIER();
+  cpu_set_t before, after;
+  if (sched_getaffinity(0, sizeof(before), &before) != 0) FAIL("sched_getaffinity");
+  moriCcoComm_t comm = NULL;
+  OK(api.commCreate(&g_bar->uid2, nranks, rank, NULL, &comm));
+  if (sched_getaffinity(0, sizeof(after), &after) != 0) FAIL("sched_getaffinity");
+  printf("[rank %d] default config: %d -> %d CPUs\n", rank, CPU_COUNT(&before), CPU_COUNT(&after));
+  moriCcoCommInfo_t info;
+  info.size = sizeof(info);
+  OK(api.commGetInfo(comm, &info));
+  if (info.flags != 0 || info.nRanks != nranks) FAIL("default comm info");
+  OK(api.commDestroy(comm));
+  return 0;
+}
+
 static int run_rank(int rank, int nranks, const moriCcoUniqueId_t* uid) {
   g_rank = rank;
   HIP(hipSetDevice(rank));
+  cpu_set_t cpusBefore, cpusAfter;
+  if (sched_getaffinity(0, sizeof(cpusBefore), &cpusBefore) != 0) FAIL("sched_getaffinity");
 
   moriCcoCommConfig_t cfg = MORI_CCO_COMM_CONFIG_INIT;
   cfg.flags = MORI_CCO_COMM_LSA_ONLY | MORI_CCO_COMM_NO_CPU_AFFINITY;
@@ -242,6 +275,11 @@ static int run_rank(int rank, int nranks, const moriCcoUniqueId_t* uid) {
   OK(api.commCreate(uid, nranks, rank, &cfg, &comm));
   if (comm == NULL) FAIL("NULL comm");
   if (hipPeekAtLastError() != hipSuccess) FAIL("commCreate left a sticky HIP error");
+  if (sched_getaffinity(0, sizeof(cpusAfter), &cpusAfter) != 0) FAIL("sched_getaffinity");
+  if (!CPU_EQUAL(&cpusBefore, &cpusAfter))
+    FAIL("NO_CPU_AFFINITY: %d CPUs became %d", CPU_COUNT(&cpusBefore), CPU_COUNT(&cpusAfter));
+  // Informational: with LSA_ONLY honoured, no RDMA library is loaded.
+  printf("[rank %d] LSA_ONLY comm: libibverbs %s\n", rank, rdma_loaded() ? "mapped" : "not mapped");
 
   moriCcoCommInfo_t info;
   info.size = sizeof(info);
@@ -403,6 +441,8 @@ static int run_rank(int rank, int nranks, const moriCcoUniqueId_t* uid) {
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.windowPeerPtr(win2, rank, &self));
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.windowRelease(win2));
   EXPECT_ERR(MORI_CCO_ERROR_INVALID_ARGUMENT, api.devCommDestroy(comm, dev2));
+
+  if (default_comm(rank, nranks)) return 1;
 
   size_t freeAfter = 0;
   HIP(hipMemGetInfo(&freeAfter, &total));
