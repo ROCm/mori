@@ -28,10 +28,92 @@
 #include <vector>
 
 #include "mori/application/transport/tcp/tcp.hpp"
+#include "mori/io/engine.hpp"
 #include "src/io/rdma/protocol.hpp"
 
 using namespace mori::application;
 using namespace mori::io;
+
+// The pre-fabricReason wire layout. Keep this list independent of MemoryDesc.
+struct OldMemoryDesc {
+  EngineKey engineKey;
+  MemoryUniqueId id{0};
+  int deviceId{-1};
+  std::string deviceBusId;
+  uintptr_t data{0};
+  size_t size{0};
+  MemoryLocationType loc{MemoryLocationType::Unknown};
+  std::array<char, kIpcHandleSize> ipcHandle{};
+  int numaNode{-1};
+  uintptr_t ipcOffset{0};
+  std::array<char, kFabricHandleSize> fabricHandle{};
+  int vpodId{-1};
+  std::string vpodPpodId;
+  uint64_t fabricOffset{0};
+  uint64_t fabricAllocSize{0};
+  BackendDescBlobMap backendDescs;
+
+  MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode,
+                 ipcOffset, fabricHandle, vpodId, vpodPpodId, fabricOffset, fabricAllocSize,
+                 backendDescs);
+};
+
+void TestMemoryDescWireCompatibility() {
+  OldMemoryDesc old{};
+  old.engineKey = "old-engine";
+  old.id = 42;
+  old.deviceId = 3;
+  old.deviceBusId = "0000:03:00.0";
+  old.data = 0x123400;
+  old.size = 4096;
+  old.loc = MemoryLocationType::GPU;
+  old.ipcHandle.fill('i');
+  old.numaNode = 2;
+  old.ipcOffset = 64;
+  old.fabricHandle.fill('f');
+  old.vpodId = 7;
+  old.vpodPpodId = "ppod";
+  old.fabricOffset = 128;
+  old.fabricAllocSize = 8192;
+  old.backendDescs[BackendType::OFI] = {1, 2, 3};
+
+  msgpack::sbuffer oldWire;
+  msgpack::pack(oldWire, old);
+  auto current = msgpack::unpack(oldWire.data(), oldWire.size()).get().as<MemoryDesc>();
+  if (!current.fabricReason.empty()) throw std::runtime_error("old wire must default fabricReason");
+  current.fabricReason = "device 3 does not support fabric handles";
+  msgpack::sbuffer newWire;
+  msgpack::pack(newWire, current);
+  auto decoded = msgpack::unpack(newWire.data(), newWire.size()).get().as<OldMemoryDesc>();
+  msgpack::sbuffer roundTrip;
+  msgpack::pack(roundTrip, decoded);
+  if (std::string(oldWire.data(), oldWire.size()) !=
+      std::string(roundTrip.data(), roundTrip.size())) {
+    throw std::runtime_error("MemoryDesc common fields changed across wire versions");
+  }
+  auto restored = msgpack::unpack(newWire.data(), newWire.size()).get().as<MemoryDesc>();
+  if (restored.fabricReason != current.fabricReason) {
+    throw std::runtime_error("fabricReason did not round-trip");
+  }
+  auto same = current;
+  same.fabricReason.clear();
+  if (!(same == current)) throw std::runtime_error("fabricReason must not affect equality");
+  printf("  PASS: TestMemoryDescWireCompatibility (both directions)\n");
+}
+
+void TestNoBackendReason() {
+  IOEngine engine("no-backend", {"127.0.0.1", 0});
+  MemoryDesc local{}, remote{};
+  local.loc = remote.loc = MemoryLocationType::CPU;
+  TransferStatus status;
+  engine.Write(local, 0, remote, 0, 1, &status, engine.AllocateTransferUniqueId());
+  if (status.Code() != StatusCode::ERR_BAD_STATE ||
+      status.Message() != "No backend created, create a backend first" ||
+      engine.CreateSession(local, remote).has_value()) {
+    throw std::runtime_error("missing no-backend diagnostic");
+  }
+  printf("  PASS: TestNoBackendReason\n");
+}
 
 using TCPInfo = std::pair<TCPContext*, TCPEndpointHandle>;
 using TCPInfoPair = std::pair<TCPInfo, TCPInfo>;
@@ -317,6 +399,8 @@ void TestOversizedControlMessageRejectedBeforeRead() {
 
 int main() {
   printf("Running protocol tests...\n");
+  TestMemoryDescWireCompatibility();
+  TestNoBackendReason();
   TestMessageRegEndpointRailId();
   TestMessageRegEndpointBackwardCompat();
   TestMessageRegEndpointMsgpackRoundTrip();

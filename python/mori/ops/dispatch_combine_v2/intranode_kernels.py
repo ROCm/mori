@@ -426,7 +426,7 @@ def _V1I32():
     return T.VectorType.get([1], T.i32())
 
 
-def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
+def _accum_funcs(hidden_elem_size, fp8_to_bf16=False, fp4=False):
     if fp4:  # fp4 e2m1: i32 = 8 packed fp4 -> v8f32
         if WAVE == 32:
             # gfx1250: one pack-8 instr converts all 8 fp4/i32 at once. The
@@ -488,10 +488,10 @@ def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
             return arith.constant_vector(0.0, _V8F32())
 
         return to_accum, from_accum, zero_accum
-    return _accum_funcs_int(hidden_elem_size, fp8_direct_cast)
+    return _accum_funcs_int(hidden_elem_size, fp8_to_bf16)
 
 
-def _accum_funcs_int(hidden_elem_size, fp8_direct_cast=False):
+def _accum_funcs_int(hidden_elem_size, fp8_to_bf16=False):
     """Return (to_accum, from_accum, zero_accum) for one i32 'unit' of the
     transport dtype, mirroring the FlyDSL reference's per-dtype branches.
 
@@ -535,7 +535,7 @@ def _accum_funcs_int(hidden_elem_size, fp8_direct_cast=False):
             f1 = vector.extract(acc, static_position=[1])
             f2 = vector.extract(acc, static_position=[2])
             f3 = vector.extract(acc, static_position=[3])
-            if fp8_direct_cast:  # wire fp8 -> external bf16: v4f32 -> v4bf16 -> 2 i32
+            if fp8_to_bf16:  # wire fp8 -> external bf16: v4f32 -> v4bf16 -> 2 i32
                 v4bf16 = acc.truncf(T.VectorType.get([4], T.bf16()))
                 return vector.bitcast(T.VectorType.get([2], T.i32()), v4bf16)
             zero = arith.constant(0, type=T.i32())
@@ -576,7 +576,6 @@ def make_combine(
     off_xdb_mem,
     off_out_wts=0,
     enable_weights=True,
-    fp8_direct_cast=False,
     fp4=False,
     _s3_cache=2,
     _unroll=4,
@@ -585,18 +584,12 @@ def make_combine(
         f"combine block_num {block_num} exceeds xdb_flag_slots {xdb_flag_slots}: "
         f"the per-block xdb flag array would overflow"
     )
-    # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
-    # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit). fp4: i32 = 8 fp4.
-    _to_accum2, _from_accum2, _zero_accum = _accum_funcs(
-        hidden_elem_size, fp8_direct_cast, fp4
-    )
+    # Transport dtype = external dtype. fp4: i32 = 8 fp4.
+    _to_accum2, _from_accum2, _zero_accum = _accum_funcs(hidden_elem_size, fp4=fp4)
     nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
     n_i32 = hidden_dim // 8 if fp4 else nbytes // 4
-    # fp8_direct_cast: output stride is bf16 (2 i32 per fp8 unit) vs input fp8.
-    out_n_i32 = (hidden_dim * 2) // 4 if fp8_direct_cast else n_i32
-    # vec4 gather: 4 i32 per load (global_load_dwordx4) when output is 1:1.
-    _use_vec4 = (n_i32 % 4 == 0) and not fp8_direct_cast
-    out_step_mult = 2 if fp8_direct_cast else 1
+    # vec4 gather: 4 i32 per load (global_load_dwordx4).
+    _use_vec4 = n_i32 % 4 == 0
 
     @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
     def ep_combine(
@@ -768,7 +761,7 @@ def make_combine(
             eff = arith.select(
                 rem < units_per_warp, rem, units_per_warp
             )  # i32 units this warp
-            out_base = tok_id * out_n_i32
+            out_base = tok_id * n_i32
 
             # Nested fn: closure over expert_bases/valids (lists can't be loop-carried).
             def _one(off):  # reduce k contributions for one i32 unit
@@ -781,9 +774,7 @@ def make_combine(
                 acc = _zero_accum()
                 for k_slot in range_constexpr(experts_per_token):
                     acc = acc + _to_accum2(vals[k_slot])
-                buffer_store(
-                    _from_accum2(acc), rsrc_out, out_base + off * out_step_mult
-                )
+                buffer_store(_from_accum2(acc), rsrc_out, out_base + off)
 
             if const_expr(_use_vec4):
                 # Vec4 path: load 4 i32 (16B, global_load_dwordx4) per expert
@@ -855,11 +846,7 @@ def make_combine(
                             acc = _zero_accum()
                             for k_slot in range_constexpr(experts_per_token):
                                 acc = acc + _to_accum2(pre_vals[r][k_slot])
-                            buffer_store(
-                                _from_accum2(acc),
-                                rsrc_out,
-                                out_base + off * out_step_mult,
-                            )
+                            buffer_store(_from_accum2(acc), rsrc_out, out_base + off)
                     for u in range(main_end + lane, eff, WAVE):
                         _one(unit_base + u)
 
@@ -945,7 +932,6 @@ def make_combine_scatter(
     off_comb_wts=0,
     off_comb_scales=0,
     enable_weights=True,
-    fp8_direct_cast=False,
     fp8_blockwise=False,
     scale_dim=0,
     _s3_cache=2,
@@ -954,28 +940,27 @@ def make_combine_scatter(
 
     Stage 1  each computing rank P2P-WRITES its post-expert tokens back to the
              ORIGIN rank's comb_inp[computing_rank*M + origin_lid] (origin from
-             tis); under fp8_direct_cast the bf16 token is cast to fp8 on write.
+             tis); under fp8_blockwise the bf16 token is quantized to fp8 on write.
     Stage 2  cross-device barrier.
     Stage 3  origin rank LOCAL-reads comb_inp[dest_pe*M + tok] for its token's k
-             expert PEs (from tok_map) and reduces (fp8->bf16 dequant if cast).
+             expert PEs (from tok_map) and reduces (fp8->bf16 dequant if quantized).
 
     vs the gather path: 2 passes (remote write + local read) but compresses the
-    transport to fp8; the natural home for fp8_direct_cast (gather has no
+    transport to fp8; the natural home for fp8_blockwise (gather has no
     Stage-1 writer to compress at)."""
     if fp8_blockwise and WAVE != 64:
         raise NotImplementedError(
             "fp8_blockwise combine's coalesced path assumes wave64 (one wave == one "
             "128-elem block); wave32 (gfx12) port is TODO"
         )
-    # blockwise reuses the fp8->bf16 accum (output bf16, wire fp8) + per-block scale.
-    _fp8_out = fp8_direct_cast or fp8_blockwise
-    wire_elem_size = 1 if _fp8_out else hidden_elem_size
-    to_acc, from_acc, zero_acc = _accum_funcs(wire_elem_size, _fp8_out)
+    # blockwise uses the fp8->bf16 accum (output bf16, wire fp8) + per-block scale.
+    wire_elem_size = 1 if fp8_blockwise else hidden_elem_size
+    to_acc, from_acc, zero_acc = _accum_funcs(wire_elem_size, fp8_blockwise)
     inp_nbytes = hidden_dim * hidden_elem_size  # source out_tok (bf16/f32)
     wire_nbytes = hidden_dim * wire_elem_size  # comb_inp transport
     wire_n_i32 = wire_nbytes // 4
-    out_n_i32 = (hidden_dim * 2) // 4 if _fp8_out else wire_n_i32
-    out_step_mult = 2 if _fp8_out else 1
+    out_n_i32 = (hidden_dim * 2) // 4 if fp8_blockwise else wire_n_i32
+    out_step_mult = 2 if fp8_blockwise else 1
     if fp8_blockwise:
         block_elems = hidden_dim // scale_dim
         assert (
@@ -1105,25 +1090,6 @@ def make_combine_scatter(
                     if lane == 0:
                         s0 = buffer_load(rsrc_scales, 0, vec_width=1, dtype=T.f32())
                         buffer_store(arith.negf(s0), rsrc_scales, 0)
-            elif const_expr(fp8_direct_cast):
-                # 2 bf16 i32 -> v4f32 -> cvt_pk_fp8 x2 -> 1 fp8 i32
-                for elem in range(lane, wire_n_i32, WAVE):
-                    bf = buffer_load(rsrc_src, elem * 2, vec_width=2, dtype=T.i32())
-                    v4 = vector.bitcast(T.VectorType.get([4], T.bf16()), bf).extf(
-                        _V4F32()
-                    )
-                    f0 = vector.extract(v4, static_position=[0])
-                    f1 = vector.extract(v4, static_position=[1])
-                    f2 = vector.extract(v4, static_position=[2])
-                    f3 = vector.extract(v4, static_position=[3])
-                    z = arith.constant(0, type=T.i32())
-                    lo = cvt_pk_fp8_f32(
-                        res=T.i32(), src_a=f0, src_b=f1, old=z, word_sel=False
-                    )
-                    fp8 = cvt_pk_fp8_f32(
-                        res=T.i32(), src_a=f2, src_b=f3, old=lo, word_sel=True
-                    )
-                    buffer_store(fp8, rsrc_dst, elem)
             else:
                 for elem in range(lane, wire_n_i32, WAVE):
                     v = buffer_load(rsrc_src, elem, vec_width=1, dtype=T.i32())

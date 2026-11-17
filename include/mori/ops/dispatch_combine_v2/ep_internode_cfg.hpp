@@ -61,8 +61,6 @@ namespace v2 {
 // mori::ops::v2 now that EpQuantType is v2's own enum rather than v1's.
 inline std::string RenderValue(EpQuantType quantType) {
   switch (quantType) {
-    case EpQuantType::Fp8DirectCast:
-      return "::mori::ops::v2::EpQuantType::Fp8DirectCast";
     case EpQuantType::Fp8BlockwiseQuant:
       return "::mori::ops::v2::EpQuantType::Fp8BlockwiseQuant";
     case EpQuantType::Fp4BlockwiseQuant:

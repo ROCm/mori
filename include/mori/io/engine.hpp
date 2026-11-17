@@ -58,6 +58,8 @@ class IOEngineSession {
   void Write(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
              TransferUniqueId id);
 
+  // Fabric batches require disjoint destination intervals across the entire batch:
+  // local intervals for reads, remote intervals for writes. Sources may overlap.
   void BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
                  TransferStatus* status, TransferUniqueId id);
   void BatchWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
@@ -95,6 +97,8 @@ class IOEngine {
   void Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
              size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
 
+  // Fabric batches require disjoint destination intervals across the entire batch:
+  // local intervals for reads, remote intervals for writes. Sources may overlap.
   void BatchRead(const MemDescVec& localDest, const BatchSizeVec& localOffsets,
                  const MemDescVec& remoteSrc, const BatchSizeVec& remoteOffsets,
                  const BatchSizeVec& sizes, TransferStatusPtrVec& status, TransferUniqueIdVec& ids);

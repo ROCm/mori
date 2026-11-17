@@ -60,6 +60,11 @@ struct EpRequest {
   int callTokMax = 0;
   bool ll128 = false;
   bool ll128CombineOnly = false;
+  bool cardDedup = false;
+  int cardPullBlocks = 0;
+  bool cardFwdMark = false;
+  bool cardCombine = false;
+  bool ll128Dedup = false;
 };
 
 template <typename Self, typename Visit>
@@ -84,10 +89,15 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
   MORI_FIELD(ll128CombineOnly);
+  MORI_FIELD(cardDedup);
+  MORI_FIELD(cardPullBlocks);
+  MORI_FIELD(cardFwdMark);
+  MORI_FIELD(cardCombine);
+  MORI_FIELD(ll128Dedup);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 19,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 24,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();

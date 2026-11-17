@@ -1545,7 +1545,7 @@ void CaseSelectBackendReturnsNullForCrossNodeUnderXgmiOnly() {
   Require(status.Code() == StatusCode::ERR_BAD_STATE,
           "cross-node transfer under XGMI-only fallback should return ERR_BAD_STATE; got " +
               std::to_string(status.CodeUint32()) + ", msg='" + status.Message() + "'");
-  Require(status.Message().find("No available backend") != std::string::npos,
+  Require(status.Message().find("No backend can handle") != std::string::npos,
           "cross-node transfer under XGMI-only fallback should be rejected by route layer; got: " +
               status.Message());
 }
@@ -1598,7 +1598,7 @@ void CaseRdmaBackendCanHandleRejectsSentinelPortRemote() {
   Require(status.Code() == StatusCode::ERR_BAD_STATE,
           "RDMA backend must reject sentinel-port remote before Connect; got " +
               std::to_string(status.CodeUint32()) + ", msg='" + status.Message() + "'");
-  Require(status.Message().find("No available backend") != std::string::npos,
+  Require(status.Message().find("No backend can handle") != std::string::npos,
           "sentinel-port remote should be rejected by route layer; got: " + status.Message());
 }
 

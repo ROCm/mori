@@ -932,8 +932,6 @@ class EpDispatchCombineTestCase:
         )
 
         atol, rtol = 1e-2, 1e-2
-        if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
-            atol, rtol = 1e-1, 1e-1
         tol = torch.full((n,), atol, device=self.device)
         if combine_data_type in (
             torch.float8_e4m3fn,
@@ -1291,8 +1289,6 @@ class EpDispatchCombineTestCase:
 
         # Same tolerances as run_test_once, including the per-token widening for fp8 combine.
         atol, rtol = 1e-2, 1e-2
-        if getattr(cfg, "quant_type", "none") == "fp8_direct_cast":
-            atol, rtol = 1e-1, 1e-1
         fp8_combine = self.combine_data_type in (
             torch.float8_e4m3fn,
             torch.float8_e4m3fnuz,
@@ -2618,11 +2614,8 @@ parser.add_argument(
     "--quant-type",
     type=str,
     default="none",
-    choices=["none", "fp8_direct_cast"],
-    help=(
-        "Quantization method used inside Combine. "
-        "'fp8_direct_cast' is the current BF16<->FP8 direct cast path."
-    ),
+    choices=["none"],
+    help="Quantization method used inside Combine.",
 )
 # Launch geometry for bench mode. Tuning selects dispatch and combine
 # independently and saves a separate block/warp/rdma triple for each, so bench

@@ -154,7 +154,7 @@ Select the backend with `config.kernel_backend` or `MORI_V2_KERNEL_BACKEND`. The
 
 - FP4 conversion kernels need gfx950 or gfx1250. gfx942 has no conversion intrinsics. The two targets use different instructions (gfx950: the `cvt_scalef32_pk_*_fp4` pair-at-a-time family; gfx1250: pack-of-8). This is a per-target port, not one shared path.
 - FP8 format depends on the target: OCP E4M3 on gfx950, E4M3FNUZ on gfx942.
-- On the internode path, `quant_type` must be `"none"`. The config rejects anything else when `world_size > gpu_per_node`, for any backend. The quantized-combine staging path is incomplete there. HIP is the only backend with an internode path today.
+- On the internode path, `quant_type` must be `"none"`, because the internode combine is unquantized. The config rejects anything else when `world_size > gpu_per_node`, for any backend. HIP is the only backend with an internode path today.
 - `gpu_per_node` sets the physical node grouping. One host cannot emulate the two-node internode test by changing `world_size` alone.
 - For internode, `internode_kernel` is `"v2"`, `"v2_ll"` or `"auto"`. `"auto"` chooses by the token count of the current call, not by the buffer capacity.
 
@@ -726,14 +726,14 @@ New tuning results replace the matching rule unconditionally, printing the old a
 
 Intra-node tuning runs on a single node. No SSH or multi-node setup required.
 
-**Tuning matrix** (EP2 / EP4 / EP8, 4 dtype/quant combos each = 12 groups):
+**Tuning matrix** (EP2 / EP4 / EP8, 4 dtype/zero-copy combos each = 12 groups):
 
-| EP | Dispatch dtype | Combine dtype | Quant type | Zero-copy |
-|----|---------------|---------------|------------|-----------|
-| 2, 4, 8 | fp4 | bf16 | fp8_direct_cast | yes |
-| 2, 4, 8 | fp4 | bf16 | fp8_direct_cast | no |
-| 2, 4, 8 | fp8_e4m3_fnuz | bf16 | none | yes |
-| 2, 4, 8 | fp8_e4m3_fnuz | bf16 | none | no |
+| EP | Dispatch dtype | Combine dtype | Zero-copy |
+|----|---------------|---------------|-----------|
+| 2, 4, 8 | fp4 | bf16 | yes |
+| 2, 4, 8 | fp4 | bf16 | no |
+| 2, 4, 8 | fp8_e4m3_fnuz | bf16 | yes |
+| 2, 4, 8 | fp8_e4m3_fnuz | bf16 | no |
 
 **Step 1: Calibrate** (optional but recommended on a new platform)
 
@@ -743,7 +743,6 @@ Run full-scope tuning on 128 and 4096 tokens to verify quick mode covers the opt
 # Full scope on 2 representative token counts
 bash tools/batch_intranode_tuning.sh \
     --world-size 8 --dtype fp4 --combine-dtype bf16 \
-    --quant-type fp8_direct_cast \
     --tokens-list "128,4096" --tuning-scope full
 ```
 
@@ -754,8 +753,7 @@ Compare the best config from full mode with a quick run on the same tokens. If t
 ```bash
 # Single group
 bash tools/batch_intranode_tuning.sh \
-    --world-size 8 --dtype fp4 --combine-dtype bf16 \
-    --quant-type fp8_direct_cast --tuning-scope quick
+    --world-size 8 --dtype fp4 --combine-dtype bf16 --tuning-scope quick
 
 # All 12 groups at once
 bash tools/run_all_intranode_tuning.sh --tuning-scope quick
@@ -782,14 +780,14 @@ Inter-node tuning requires two nodes with passwordless SSH between them.
 
 **Tuning matrix** (3 kernel types × 2 dtype combos = 6 groups):
 
-| Kernel | Dispatch dtype | Combine dtype | Quant type | BW metric for selection |
-|--------|---------------|---------------|------------|------------------------|
-| v1 | fp4 | bf16 | fp8_direct_cast | RDMA BW |
-| v1 | fp8_e4m3_fnuz | bf16 | none | RDMA BW |
-| v1_ll | fp4 | bf16 | fp8_direct_cast | LL BW |
-| v1_ll | fp8_e4m3_fnuz | bf16 | none | LL BW |
-| async_ll | fp4 | bf16 | fp8_direct_cast | LL BW |
-| async_ll | fp8_e4m3_fnuz | bf16 | none | LL BW |
+| Kernel | Dispatch dtype | Combine dtype | BW metric for selection |
+|--------|---------------|---------------|------------------------|
+| v1 | fp4 | bf16 | RDMA BW |
+| v1 | fp8_e4m3_fnuz | bf16 | RDMA BW |
+| v1_ll | fp4 | bf16 | LL BW |
+| v1_ll | fp8_e4m3_fnuz | bf16 | LL BW |
+| async_ll | fp4 | bf16 | LL BW |
+| async_ll | fp8_e4m3_fnuz | bf16 | LL BW |
 
 **Step 1: Calibrate** (on a new platform)
 
@@ -797,7 +795,6 @@ Inter-node tuning requires two nodes with passwordless SSH between them.
 bash tools/batch_internode_tuning.sh \
     --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
     --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16 \
-    --quant-type fp8_direct_cast \
     --tokens-list "128,4096" --tuning-scope full
 ```
 
@@ -807,8 +804,7 @@ bash tools/batch_internode_tuning.sh \
 # Single group
 bash tools/batch_internode_tuning.sh \
     --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
-    --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16 \
-    --quant-type fp8_direct_cast
+    --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16
 
 # All 6 groups at once
 bash tools/run_all_internode_tuning.sh \
@@ -860,7 +856,7 @@ non-zero if any shape crashes, hangs, or produces wrong output.
 
 | Script | Purpose |
 |--------|---------|
-| `tools/batch_internode_tuning.sh` | Sweep one (kernel, dtype, quant) group across all token sizes |
+| `tools/batch_internode_tuning.sh` | Sweep one (kernel, dtype) group across all token sizes |
 | `tools/run_all_internode_tuning.sh` | Run all 6 inter-node groups sequentially |
 | `tools/verify_tuned_config.sh` | Correctness-check the saved configs before committing them |
 
