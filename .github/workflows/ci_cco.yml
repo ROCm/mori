@@ -951,6 +951,10 @@ jobs:
       CT: docker
       CONTAINER: mori_torch_conformance_${{ github.run_id }}_${{ strategy.job-index }}
       OUT: ${{ github.workspace }}/torch-conformance
+      # Every first rendezvous creates a cco comm over MORI's socket bootstrap; pinned
+      # for the same reason as ci.yml's intranode-test socket_ifname (eno1 refuses local TCP).
+      MORI_SOCKET_IFNAME: eno0
+      NCCL_SOCKET_IFNAME: eno0
     timeout-minutes: 180
     steps:
       - *cco-fix-perms
