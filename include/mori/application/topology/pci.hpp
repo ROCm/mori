@@ -154,17 +154,13 @@ class TopoSystemPci {
 
   TopoPathPci* Path(PciBusId, PciBusId);
   TopoNodePci* Node(PciBusId);
-  // False if the scanned tree is inconsistent; Path() then returns nullptr.
-  bool Valid() const { return valid; }
 
  private:
   void Load();
-  bool Validate();
 
  private:
   std::unordered_map<uint64_t, std::unique_ptr<TopoNodePci>> pcis;
   TopoNodePci* root{nullptr};
-  bool valid{false};
 
   using PathKey = std::pair<uint64_t, uint64_t>;
   using PathCache = std::unordered_map<PathKey, std::unique_ptr<TopoPathPci>>;

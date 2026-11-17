@@ -34,7 +34,6 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <queue>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -344,10 +343,7 @@ bool TopoPathPci::CrossMultipleNuma() const {
 /*                                          TopoSystemPci                                         */
 /* ---------------------------------------------------------------------------------------------- */
 
-TopoSystemPci::TopoSystemPci() : pathCache() {
-  Load();
-  valid = Validate();
-}
+TopoSystemPci::TopoSystemPci() : pathCache() { Load(); }
 
 TopoSystemPci::~TopoSystemPci() {}
 
@@ -468,33 +464,7 @@ void TopoSystemPci::Load() {
   }
 }
 
-bool TopoSystemPci::Validate() {
-  std::unordered_set<uint64_t> seen;
-
-  // Make sure every node can be reached from root and no cycles
-  std::queue<TopoNodePci*> nodes;
-  nodes.push(root);
-
-  while (!nodes.empty()) {
-    TopoNodePci* cur = nodes.front();
-    nodes.pop();
-    if (!seen.insert(cur->BusId().packed).second) {
-      MORI_APP_WARN("PCI topology: {} is reached twice from the root", cur->BusId().String());
-      return false;
-    }
-    for (auto* child : cur->DownstreamPort()) nodes.push(child);
-  }
-
-  if (seen.size() != pcis.size()) {
-    MORI_APP_WARN("PCI topology: {} of {} nodes are not reachable from the root",
-                  pcis.size() - seen.size(), pcis.size());
-    return false;
-  }
-  return true;
-}
-
 TopoPathPci* TopoSystemPci::Path(PciBusId head, PciBusId tail) {
-  if (!valid) return nullptr;
   if (pcis.find(head.packed) == pcis.end()) return nullptr;
   if (pcis.find(tail.packed) == pcis.end()) return nullptr;
 
