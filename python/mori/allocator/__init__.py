@@ -85,9 +85,9 @@ slice. That is torch's model, not something this backend narrows.
 The extension is optional and its ABI tracks the installed torch, so it is a plugin:
 ``pip install`` prebuilds it when it can (``BUILD_TORCH_SYMM=AUTO``, the default; ``ON``
 makes a failure fatal, ``OFF`` skips it), and a build that did not happen or no longer
-loads is compiled here on first import from the sources shipped in ``_jit-sources``. So
-switching torch does not require reinstalling mori. ``MORI_SYMM_FORCE_JIT=1`` ignores the
-prebuilt module.
+loads is compiled here on first import, with hipcc, from the sources shipped in
+``_jit-sources``. So switching torch does not require reinstalling mori.
+``MORI_SYMM_FORCE_JIT=1`` ignores the prebuilt module.
 """
 
 import atexit
@@ -118,6 +118,19 @@ _atexit_registered = False
 
 _ext_cache = None
 
+# Host half and signal-pad kernels; setup.py builds the same pair.
+_SOURCES = ("symm_backend.cpp", "symm_signal.hip")
+
+
+def _offload_arch_flags() -> list:
+    """Target the GPU mori detects; with no flag, torch picks from the visible devices."""
+    from ..jit.config import detect_gpu_arch
+
+    try:
+        return [f"--offload-arch={detect_gpu_arch()}"]
+    except RuntimeError:
+        return []
+
 
 def _jit_ext():
     """Compile the backend against the torch that is actually loaded.
@@ -147,21 +160,25 @@ def _jit_ext():
             "mori_torch_symm is not built and its sources were not found. Reinstall "
             "mori from a source tree or a wheel that ships _jit-sources."
         )
-    source = root / "src" / "allocator" / "symm_backend.cpp"
-    if not source.is_file():
-        raise ImportError(f"mori_torch_symm sources missing at {source}")
+    sources = [root / "src" / "allocator" / name for name in _SOURCES]
+    missing = [str(s) for s in sources if not s.is_file()]
+    if missing:
+        raise ImportError(f"mori_torch_symm sources missing: {missing}")
 
     rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    # -I as flags, not extra_include_paths: load() hipifies every header under those,
+    # writing *_hip copies into the package and the ROCm tree.
+    includes = [f"-I{root / 'include'}", f"-I{rocm}/include"]
     # No -std here: load() already passes the standard torch's headers need.
-    flags = ["-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1"]
-    logger.info("compiling mori_torch_symm from %s", source)
+    flags = ["-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1", *includes]
+    logger.info("compiling mori_torch_symm from %s", sources[0].parent)
     # libmori_cco sits in the package directory, wherever mori was installed.
     pkg = str(Path(__file__).resolve().parent.parent)
     return load(
         name="mori_torch_symm",
-        sources=[str(source)],
-        extra_include_paths=[str(root / "include"), f"{rocm}/include"],
+        sources=[str(s) for s in sources],
         extra_cflags=flags,
+        extra_cuda_cflags=["-O3", *includes, *_offload_arch_flags()],
         extra_ldflags=[
             f"-L{rocm}/lib",
             "-lamdhip64",

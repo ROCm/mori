@@ -171,7 +171,7 @@ bool RuntimeUsable() {
   return hipGetDevice(&dev) == hipSuccess;
 }
 
-// Raw HIP: torch ships both c10::cuda and c10::hip; the wrong one pulls cuda_runtime_api.h.
+// Raw HIP: torch ships both c10::cuda and c10::hip; the wrong one pulls in CUDA's runtime header.
 class DeviceGuard {
  public:
   explicit DeviceGuard(int dev) {
