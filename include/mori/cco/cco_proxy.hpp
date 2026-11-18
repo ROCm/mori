@@ -310,6 +310,19 @@ __device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, 
   return s;
 }
 
+// Traps on device targets that cannot push (not wave64 gfx942/gfx950);
+// ccoDevCommCreate rejects proxy queues on such GPUs.
+__device__ inline void proxyCheckTarget() {
+#ifdef MORI_CCO_PROXY_PUSH_UNSUPPORTED
+#ifndef NDEBUG  // see the file comment
+  if (proxyLinearTid() == 0) {
+    printf("ccoProxy: unsupported GPU target; ccoProxy needs a wave64 gfx942/gfx950 GPU\n");
+  }
+#endif
+  __builtin_trap();
+#endif
+}
+
 }  // namespace impl
 
 // ccoProxy's per-thread Coop for put / putValue / signal: all 64 lanes of the
@@ -620,6 +633,7 @@ struct ccoProxy {
   // NDEBUG, not kLaneMasked) on lanes passing differing descriptors.
   template <bool kLaneMasked, typename... Desc>
   __device__ inline void invoke([[maybe_unused]] bool active, ccoProxyOp op, const Desc&... desc) {
+    impl::proxyCheckTarget();  // before the exec check, which misfires on wave32
     const uint64_t exec = __builtin_amdgcn_read_exec();
     if (__builtin_expect(exec != ~uint64_t{0}, 0)) {
 #ifndef NDEBUG  // see the file comment
@@ -762,6 +776,7 @@ __device__ inline ccoProxy<Queue, Fence>::ccoProxy(ccoDevComm const& comm_, int 
       flushTicket(nullptr),
       dirty(false),
       unflushed(false) {
+  impl::proxyCheckTarget();
   switch (comm.gdaConnType) {
     case CCO_GDA_CONNECTION_FULL:
       rank = comm.rank;

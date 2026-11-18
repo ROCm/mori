@@ -1759,11 +1759,21 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     // that disagree all fail here instead of some waiting in the engine's QP
     // exchange.
     struct ProxyReq {
-      int32_t spsc, mpsc, threads, rdmaReady, disabled, qpsPerPeer, proxyOnly, gdaBarriers;
+      int32_t spsc, mpsc, threads, rdmaReady, disabled, qpsPerPeer, proxyOnly, gdaBarriers,
+          targetOk;
     };
     // GDA barriers signal through GDA QPs, which a proxy-only DevComm lacks.
     const bool gdaBarriers = connType != CCO_GDA_CONNECTION_NONE && nNodes > 1 &&
                              (reqs->railGdaBarrierCount > 0 || reqs->barrierCount > 0);
+    // Pushes only run on wave64 gfx942/gfx950; a multi-arch build reaches here on others too.
+    bool targetOk = true;
+    if (proxyQueues > 0) {
+      hipDeviceProp_t prop;
+      HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, comm->hipDev));
+      const std::string arch(prop.gcnArchName, std::strcspn(prop.gcnArchName, ":"));
+      targetOk = arch == "gfx942" || arch == "gfx950";
+      if (!targetOk) MORI_SHMEM_ERROR("ccoDevCommCreate: ccoProxy does not support {}", arch);
+    }
     ProxyReq mine{proxySpsc,
                   proxyMpsc,
                   proxyThreads,
@@ -1771,7 +1781,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
                   env::IsEnvVarEnabled("MORI_CCO_DISABLE_PROXY"),
                   proxyQueues > 0 ? proxyQpsPerPeer : 0,  // no QPs, nothing to agree on
                   proxyOnly,
-                  gdaBarriers};
+                  gdaBarriers,
+                  targetOk};
     std::vector<ProxyReq> all(comm->worldSize);
     comm->bootNet->Allgather(&mine, all.data(), sizeof(ProxyReq));
     for (int r = 0; r < comm->worldSize && proxyError.empty(); r++) {
@@ -1787,6 +1798,9 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
             "ranks disagree on the ccoProxy requirements (proxyQpsPerPeer includes "
             "MORI_CCO_PROXY_QPS_PER_PEER): rank 0 asks for " +
             describe(all[0]) + ", rank " + std::to_string(r) + " for " + describe(all[r]);
+      } else if (proxyQueues > 0 && !all[r].targetOk) {
+        proxyError = "ccoProxy queues need a gfx942/gfx950 GPU on every rank; rank " +
+                     std::to_string(r) + " has another";
       } else if (proxyQueues > 0 && all[r].disabled) {
         proxyError = "ccoProxy queues requested but MORI_CCO_DISABLE_PROXY is set on rank " +
                      std::to_string(r);
