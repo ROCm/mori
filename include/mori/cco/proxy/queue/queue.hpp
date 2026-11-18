@@ -37,6 +37,12 @@
  * - Lap epochs instead of clearing; cached producer/consumer progress to
  *   reduce PCIe traffic
  *
+ * Copied from AMDResearch/kiwi d7bb0d1 (include/kiwi -> include/mori/cco/proxy,
+ * src/queue -> src/cco/proxy). Local changes: namespace mori::cco::proxy,
+ * KIWI_* macros renamed CCO_PROXY_*, only the device-to-host SPSC/MPSC queues
+ * and invoke kept, and pushes on non-gfx942/gfx950 targets trap
+ * (MORI_CCO_PROXY_PUSH_UNSUPPORTED) instead of failing the build.
+ *
  * Quick Start:
  * @code
  * #include "mori/cco/proxy/queue/queue.hpp"
