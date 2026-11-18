@@ -115,9 +115,9 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 #ifdef MORI_CCO_PROXY
 // Proxy: the ibgda kernel's geometry and completion. A unit puts its slice every
 // iteration, then a flush waits until its puts completed (remote ack) -- the
-// counterpart of ibgda's trailing flush. SPSC: unit u of block b owns
-// queue b * nunits + u, except that with ccoCoopLaneMasked (unit = thread) each
-// wavefront of 64 units owns one; MPSC: the block's units share queue b.
+// counterpart of ibgda's trailing flush. SPSC: each wavefront owns a queue
+// (ccoProxyQueuePerWave), or each block with ccoCoopBlock
+// (ccoProxyQueuePerBlock); MPSC: the block's wavefronts share queue b.
 // ccoProxyFenceCaller: one fence() before the loop (the source never changes).
 template <typename Q, ccoProxyFenceMode F, typename Coop>
 __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
@@ -137,9 +137,9 @@ __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const size_t bytes = per_unit * sizeof(double);
 
   constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
-  const int unitsPerQueue = kLaneMasked ? __builtin_amdgcn_wavefrontsize() : 1;  // SPSC
-  const int spscQueue = bid * (nunits / unitsPerQueue) + unit / unitsPerQueue;
-  ccoProxy<Q, F> proxy{devComm, ccoProxy<Q, F>::kSpsc ? spscQueue : bid};
+  using Selector = std::conditional_t<ccoProxy<Q, F>::kSpsc && !std::is_same_v<Coop, ccoCoopBlock>,
+                                      ccoProxyQueuePerWave_t, ccoProxyQueuePerBlock_t>;
+  ccoProxy<Q, F> proxy{devComm, Selector{}};
   if constexpr (F == ccoProxyFenceCaller) proxy.fence(coop);
   for (int i = 0; i < iter; i++) {
     proxy.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), off_bytes,

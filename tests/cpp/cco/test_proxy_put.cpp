@@ -89,6 +89,9 @@
 //                  ccoCoopWarp, ccoCoopBlock, and MPSC (4 blocks per queue)
 //   counter,       the same puts, then counter(CounterInc{unit}) and
 //   mpsc_counter   waitCounter: the counter reads exactly 1 (SPSC flushDone +1)
+//   selector_wave, ccoProxyQueuePerWave with ccoCoopWarp (2 blocks of 32x4) and
+//   selector_block ccoProxyQueuePerBlock with ccoCoopBlock (2x2 blocks): the
+//                  handle's queue is the unit's linear id; put + SignalSet
 //   small_spsc,    on a second DevComm whose rings hold kSmallCapacity lines:
 //   small_mpsc     each unit sends its chunk as kPieces puts per peer (the
 //                  last carrying the signal), so every ring wraps many times
@@ -134,7 +137,7 @@
 //                  kThreadCapacity lines: rings wrap, SPSC lane-masked pushes
 //                  retry for credit, MPSC claims wait
 //
-// The atomic-free cases (value_set .. mpsc_counter) run first.
+// The atomic-free cases (value_set .. selector_block) run first.
 // MORI_CCO_PROXY_TEST_CASES=<list> runs only the listed positive cases, where
 // "atomic_free" stands for all of them: for NICs whose atomics into GPU memory
 // fail (the first atomic case would fail the shared DevComm and trap).
@@ -873,6 +876,46 @@ __global__ void ProxyBlockFlushKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
   }
 }
 
+// Queue selectors: unit u is a wavefront (ccoProxyQueuePerWave) or a block
+// (ccoProxyQueuePerBlock), counted by linear id over a 2-D grid of 2-D blocks.
+// The handle's queue must be u; then the unit puts its chunk to every peer
+// carrying SignalSet{Slot(me, u), 1} (atomic-free) and waits for every sender's.
+template <typename Coop, bool kPerWave>
+__global__ void ProxySelectorKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
+                                    size_t chunk, int nUnits, int* err) {
+  const int me = dc.rank;
+  const int n = dc.worldSize;
+  const int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+  const int nThreads = blockDim.x * blockDim.y * blockDim.z;
+  const int block = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+  const int u = kPerWave ? block * ((nThreads + 63) / 64) + tid / 64 : block;
+  auto body = [&](auto& proxy) {
+    if (proxy.queueId != static_cast<uint32_t>(u)) {
+      if (tid % 64 == 0) {
+        printf("[rank %d] selector: unit %d got queue %u\n", me, u, proxy.queueId);
+        atomicExch(err, 1);
+      }
+      return;
+    }
+    const size_t dstOff = (static_cast<size_t>(me) * nUnits + u) * chunk;
+    for (int p = 0; p < n; p++) {
+      if (p == me) continue;
+      proxy.put(p, recvWin, dstOff, sendWin, (static_cast<size_t>(p) * nUnits + u) * chunk, chunk,
+                ccoGda_SignalSet{Slot(me, u), 1}, Coop{});
+    }
+    for (int s = 0; s < n; s++) {
+      if (s != me) proxy.waitSignal(Slot(s, u), 1, Coop{});
+    }
+  };
+  if constexpr (kPerWave) {
+    ccoProxy<> proxy{dc, ccoProxyQueuePerWave};
+    body(proxy);
+  } else {
+    ccoProxy<> proxy{dc, ccoProxyQueuePerBlock};
+    body(proxy);
+  }
+}
+
 // Long enough for any proxy answer, short enough not to hang.
 static constexpr uint64_t kNegTimeoutCycles = 40ull * 1000 * 1000 * 1000;
 
@@ -1029,7 +1072,7 @@ __global__ void ProxyResetKernel(ccoDevComm dc, int nSlots) {
 static const char* const kAtomicFreeCases[] = {
     "value_set",  "block_value_set", "lane_value_set", "mpsc_lane_value_set", "set_put",
     "set_signal", "set_window",      "mpsc_set_put",   "async_reverse",       "block_async",
-    "mpsc_async", "counter",         "mpsc_counter"};
+    "mpsc_async", "counter",         "mpsc_counter",   "selector_wave",       "selector_block"};
 
 // MORI_CCO_PROXY_TEST_CASES (same on every rank): unset runs every positive
 // case; else a comma-separated list of case names, where "atomic_free" stands
@@ -1208,6 +1251,18 @@ static int RunBlockFlushCase(Ctx& c, const char* name, uint32_t salt) {
       c.dc, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf), kChunk, c.dErr);
   c.Sync();
   return c.Verify(name, salt, kChunk, kBlockFlushWaves);
+}
+
+template <typename Coop, bool kPerWave>
+static int RunSelectorCase(Ctx& c, const char* name, uint32_t salt, dim3 grid, dim3 block) {
+  if (!CaseSelected(name)) return 0;
+  const int nUnits = static_cast<int>(grid.x * grid.y * grid.z) *
+                     (kPerWave ? static_cast<int>(block.x * block.y * block.z + 63) / 64 : 1);
+  c.Fresh(c.dc, salt, kChunk, nUnits);
+  ProxySelectorKernel<Coop, kPerWave>
+      <<<grid, block, 0, c.stream>>>(c.dc, c.sendWin, c.recvWin, kChunk, nUnits, c.dErr);
+  c.Sync();
+  return c.Verify(name, salt, kChunk, nUnits);
 }
 
 template <typename Q, typename Coop, int Mode>
@@ -1487,6 +1542,9 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
       RunAsyncCase<SPSCD2HQueue, ccoCoopWarp, kAsyncCounter>(c, "counter", 51, kSpscQueues, 64);
   fails += RunAsyncCase<MPSCD2HQueue, ccoCoopBlock, kAsyncCounter>(c, "mpsc_counter", 52, kMaxUnits,
                                                                    256);
+  // 2 blocks of 2 wavefronts (32x4), and 2x2 blocks: kSpscQueues units each.
+  fails += RunSelectorCase<ccoCoopWarp, true>(c, "selector_wave", 53, dim3(1, 2), dim3(32, 4));
+  fails += RunSelectorCase<ccoCoopBlock, false>(c, "selector_block", 54, dim3(2, 2), dim3(256));
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "put_sig_warp", 1, kChunk,
                                                              kSpscQueues, 64);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutThenSignal>(c, "put_then_sig", 2, kChunk,

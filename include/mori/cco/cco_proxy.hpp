@@ -37,7 +37,9 @@
 // with a zero proxySpscQueueCount / proxyMpscQueueCount). An MPSC queueIndex is
 // taken modulo the pool size, like ccoGda's contextIndex. An SPSC queueIndex
 // must be in [0, proxySpscQueueCount) and traps otherwise: wrapping would let
-// two wavefronts share an SPSC queue, which silently corrupts it.
+// two wavefronts share an SPSC queue, which silently corrupts it. The
+// selectors ccoProxyQueuePerWave / ccoProxyQueuePerBlock compute the index
+// from the wavefront's or block's linear id.
 //
 // Usage errors trap instead of corrupting a queue or faulting: a ccoProxy<Q>
 // on an empty pool, an SPSC queueIndex out of range, and a push from a partial
@@ -246,6 +248,26 @@ __device__ inline unsigned proxyLinearTid() {
               __builtin_amdgcn_workgroup_size_y() * __builtin_amdgcn_workitem_id_z());
 }
 
+// Linear block id in the grid (x fastest).
+__device__ inline unsigned proxyLinearBlockId() {
+  const unsigned nx = (__builtin_amdgcn_grid_size_x() + __builtin_amdgcn_workgroup_size_x() - 1) /
+                      __builtin_amdgcn_workgroup_size_x();
+  const unsigned ny = (__builtin_amdgcn_grid_size_y() + __builtin_amdgcn_workgroup_size_y() - 1) /
+                      __builtin_amdgcn_workgroup_size_y();
+  return __builtin_amdgcn_workgroup_id_x() +
+         nx * (__builtin_amdgcn_workgroup_id_y() + ny * __builtin_amdgcn_workgroup_id_z());
+}
+
+// ccoProxyQueuePerWave's index: linear block id * wavefronts per block +
+// this wavefront's index in the block.
+__device__ inline unsigned proxyWaveQueue() {
+  const unsigned wave = static_cast<unsigned>(__builtin_amdgcn_wavefrontsize());
+  const unsigned threads = __builtin_amdgcn_workgroup_size_x() *
+                           __builtin_amdgcn_workgroup_size_y() *
+                           __builtin_amdgcn_workgroup_size_z();
+  return proxyLinearBlockId() * ((threads + wave - 1) / wave) + proxyLinearTid() / wave;
+}
+
 // Resolve a remote action to a signal descriptor, as ccoGda::put does.
 template <typename RemoteAction>
 __device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, int worldPeer,
@@ -300,6 +322,20 @@ struct ccoCoopLaneMasked {
   __device__ void sync() {}
 };
 
+// Queue selectors for the ccoProxy constructor, in place of a queue index:
+//   ccoProxyQueuePerWave:  linear block id * wavefronts per block + the
+//                          wavefront's index in the block, so every wavefront
+//                          owns an SPSC queue; needs proxySpscQueueCount =
+//                          blocks * wavefronts per block.
+//   ccoProxyQueuePerBlock: linear block id, for blocks whose ops are all
+//                          ccoCoopBlock; needs proxySpscQueueCount = blocks.
+// Linear ids count x fastest (2-D and 3-D grids and blocks). The index is
+// then checked as an explicit one: SPSC traps out of range, MPSC wraps.
+struct ccoProxyQueuePerWave_t {};
+struct ccoProxyQueuePerBlock_t {};
+inline constexpr ccoProxyQueuePerWave_t ccoProxyQueuePerWave{};
+inline constexpr ccoProxyQueuePerBlock_t ccoProxyQueuePerBlock{};
+
 // When put / putValue / signal make the caller's earlier stores (the data a
 // put sends, or that a signal publishes) visible to the NIC: the handle's
 // second template argument, like ccoGdaDoorbellMode, so it is fixed for every
@@ -342,6 +378,11 @@ struct ccoProxy {
   // size, like ccoGda's contextIndex. Traps if this pool is empty or (SPSC) the
   // index is out of range.
   __device__ inline ccoProxy(ccoDevComm const& comm_, int queueIndex);
+  // The queue a selector picks (see ccoProxyQueuePerWave).
+  __device__ inline ccoProxy(ccoDevComm const& comm_, ccoProxyQueuePerWave_t)
+      : ccoProxy(comm_, static_cast<int>(impl::proxyWaveQueue())) {}
+  __device__ inline ccoProxy(ccoDevComm const& comm_, ccoProxyQueuePerBlock_t)
+      : ccoProxy(comm_, static_cast<int>(impl::proxyLinearBlockId())) {}
   __device__ inline ~ccoProxy() { release(); }
   ccoProxy(const ccoProxy&) = delete;
   ccoProxy& operator=(const ccoProxy&) = delete;

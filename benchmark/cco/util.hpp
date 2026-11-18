@@ -132,10 +132,13 @@ struct PerfArgs {
 };
 
 // SPSC proxy queues needed so that every issuing wavefront owns one: per block,
-// its wavefronts with warp or thread scope (a thread-scope wavefront pushes its
-// lanes' puts together), else 1; times blocks.
+// its wavefronts with warp or thread scope (ccoProxyQueuePerWave; a thread-scope
+// wavefront pushes its lanes' puts together), else 1 (ccoProxyQueuePerBlock);
+// times blocks.
 inline int ProxyUnitsPerBlock(PutScope scope, int threads_per_block, int warp_size) {
-  return scope == PutScope::kWarp || scope == PutScope::kThread ? threads_per_block / warp_size : 1;
+  return scope == PutScope::kWarp || scope == PutScope::kThread
+             ? (threads_per_block + warp_size - 1) / warp_size
+             : 1;
 }
 
 // Holds MPI + CCO state for the lifetime of a benchmark run. PerfInit registers
