@@ -64,18 +64,10 @@
 namespace mori {
 namespace ccl {
 namespace detail {
-// Device-wide barrier: dummy no-op. The old shmem device barrier
-// (ShmemBarrierAllThread) assumed shmem init, which is incompatible with the
-// CCO-backed facade. Callers currently barrier host-side via ccoBarrierAll; a
-// device-side CCO barrier can be wired here later if RunBarrier is needed.
-__global__ void BarrierKernel() {}
 
 // The pull kernels take the peer count as a template argument so their
 // per-peer register tile (M positions x NPES peers) stays in VGPRs, so the
-// runtime npes has to be turned into a compile-time constant. Only the team
-// sizes that actually ship are instantiated; any other count is REJECTED
-// rather than rounded up to the nearest instantiation, which would silently
-// read past the end of the team.
+// runtime npes has to be turned into a compile-time constant. 
 template <class F>
 hipError_t DispatchNpes(int npes, F&& f) {
 #define FACADE_NPES_CASE(n) \
@@ -379,8 +371,8 @@ hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size
   const size_t totalBytes = chunkBytes * nPes_;
   // Pull needs every peer slot (output + peer*chunkBytes) 16B-aligned, i.e.
   // chunkBytes and both bases 16B-aligned; otherwise fall through to push.
-  const uintptr_t bits = chunkBytes | reinterpret_cast<uintptr_t>(input) |
-                         reinterpret_cast<uintptr_t>(output);
+  const uintptr_t bits = chunkBytes/* | reinterpret_cast<uintptr_t>(input) |
+                         reinterpret_cast<uintptr_t>(output)*/;
   if (resolveCopyMode(totalBytes, kAutoPullMaxBytesAg) == RsMode::kPull &&
       PullCopy16Aligned(bits) && PullNpesSupported(nPes_)) {
     constexpr int kPullThreads = 256;
@@ -452,12 +444,7 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
     pairs.p[p].source = addrs[p].first;
     pairs.p[p].dest = addrs[p].second;
   }
-  const size_t totalBytes = chunkBytes * nPes_;
-  uintptr_t bits = chunkBytes;
-  for (int p = 0; p < nPes_; ++p) {
-    bits |= reinterpret_cast<uintptr_t>(addrs[p].first) |
-            reinterpret_cast<uintptr_t>(addrs[p].second);
-  }
+
   constexpr int kThreads = 64;
   if (isAsync) {
     // Start only: issue the SDMA scatter and exit; AsyncDone waits for it.
@@ -468,6 +455,13 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
     if (err == hipSuccess) pending_ = {AsyncOp::kAllToAll};
     return err;
   }
+
+  const size_t totalBytes = chunkBytes * nPes_;
+  uintptr_t bits = chunkBytes;
+  // for (int p = 0; p < nPes_; ++p) {
+  //   bits |= reinterpret_cast<uintptr_t>(addrs[p].first) |
+  //           reinterpret_cast<uintptr_t>(addrs[p].second);
+  // }
   // Pull needs every send/recv slot 16B-aligned; otherwise fall through to push.
   if (resolveCopyMode(totalBytes, kAutoPullMaxBytesA2a) == RsMode::kPull &&
       PullCopy16Aligned(bits) && PullNpesSupported(nPes_)) {
@@ -518,8 +512,7 @@ hipError_t CollectivesFacade::RunRaggedAllToAll(const void* input, void* output,
 }
 
 hipError_t CollectivesFacade::RunBarrier(hipStream_t stream) {
-  detail::BarrierKernel<<<1, 1, 0, stream>>>();
-  return hipGetLastError();
+  return hipErrorNotSupported;
 }
 
 hipError_t CollectivesFacade::RunSend(const void* /*sendBuf*/, size_t /*numBytes*/,
