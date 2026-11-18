@@ -35,6 +35,14 @@ namespace mori::umbp {
 namespace {
 constexpr uint32_t kStagingBufferIndex = 0;
 
+// The staging lease that is still the copy stamped `generation`, or end().  A
+// lease under the same key with another generation is a later copy.
+template <typename Leases>
+auto LeaseOfCopy(Leases& leases, const std::string& key, uint64_t generation) {
+  auto it = leases.find(key);
+  return it != leases.end() && it->second.generation == generation ? it : leases.end();
+}
+
 uint32_t SizeToPages(uint64_t size, uint64_t page_size) {
   if (size == 0 || page_size == 0) return 0;
   const uint64_t pages = 1 + (size - 1) / page_size;
@@ -991,12 +999,7 @@ std::vector<bool> SsdBackend::BatchStillHolds(const std::vector<std::string>& ke
   std::lock_guard<std::mutex> lk(mutex_);
   for (size_t i = 0; i < keys.size(); ++i) {
     const uint64_t gen = i < generations.size() ? generations[i] : 0;
-    if (gen == 0) {
-      out[i] = true;
-      continue;
-    }
-    auto it = read_leases_.find(keys[i]);
-    out[i] = it != read_leases_.end() && it->second.generation == gen;
+    out[i] = gen == 0 || LeaseOfCopy(read_leases_, keys[i], gen) != read_leases_.end();
   }
   return out;
 }
@@ -1017,9 +1020,9 @@ std::vector<bool> SsdBackend::BatchFinishReads(const std::vector<std::string>& k
       out[i] = true;
       continue;
     }
-    auto it = read_leases_.find(keys[i]);
-    // Another generation is another copy, with readers of its own.
-    if (it == read_leases_.end() || it->second.generation != gen) continue;
+    // The same check as BatchStillHolds; a later copy has readers of its own.
+    auto it = LeaseOfCopy(read_leases_, keys[i], gen);
+    if (it == read_leases_.end()) continue;
     out[i] = true;
     ReadLease& lease = it->second;
     if (lease.remote_readers == 0 || --lease.remote_readers != 0) continue;
