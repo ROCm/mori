@@ -46,6 +46,11 @@
 //   kernel_payload every wavefront of a 4-wavefront block writes part of the
 //                  chunk, then the block puts it (ccoCoopBlock): the put's
 //                  fence must publish stores of the non-issuing wavefronts
+//   caller_fence,  ccoProxyFenceCaller handles (SPSC ccoCoopBlock, MPSC
+//   mpsc_caller    ccoCoopWarp): the block writes the chunk as in
+//                  kernel_payload, calls fence() once, then puts it as
+//                  kFencePieces puts per peer (the last carrying SignalInc)
+//                  and flushes
 //   sq_full        one queue puts its chunk kSqRepeats times per peer with no
 //                  flush in between, more WRs than a proxy QP's SQ holds, so
 //                  the proxy waits for SQ credit
@@ -145,6 +150,7 @@ static constexpr size_t kStressChunk = 16 * 1024;
 static constexpr int kSmallCapacity = 16;  // ring lines: a put + signal takes 2
 static constexpr int kPieces = 64;         // puts per chunk in the small-ring cases
 static constexpr int kSqRepeats = 2048;    // puts per peer in sq_full (SQ depth: 512)
+static constexpr int kFencePieces = 4;     // puts per chunk in the caller-fenced cases
 static constexpr uint32_t kClobber = 0xdeadbeefu;
 
 enum PutMode {
@@ -155,7 +161,8 @@ enum PutMode {
   kPutFlushClobber,   // put, flush, overwrite the source, signal()
   kPutKernelPayload,  // the block writes the source, then put carrying SignalInc
   kPutRepeat,         // kSqRepeats puts of the same chunk, the last carrying SignalInc
-  kPutPieces          // kPieces puts per chunk, the last carrying SignalInc
+  kPutPieces,         // kPieces puts per chunk, the last carrying SignalInc
+  kPutCallerFence     // the block writes the source, fence(), kFencePieces puts, flush
 };
 
 __host__ __device__ inline uint32_t Pattern(uint32_t salt, int src, int dst, int u, size_t i) {
@@ -170,18 +177,18 @@ __host__ __device__ inline ccoGdaSignal_t Slot(int src, int unit) {
 
 // Block u = unit u on queue u (MPSC: modulo the pool). Sends one chunk to every peer,
 // then waits for every sender's chunk on this unit (signal slot or flag word).
-template <typename Q, typename Coop, int Mode>
+template <typename Q, typename Coop, int Mode, ccoProxyFenceMode F = ccoProxyFenceEachOp>
 __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
                                ccoWindow_t flagWin, uint32_t* sendLocal, uint64_t* flagLocal,
                                uint32_t salt, size_t chunk, int nUnits, int* err) {
   const int u = blockIdx.x;
   const int me = dc.rank;
   const int n = dc.worldSize;
-  ccoProxy<Q> proxy{dc, u};
+  ccoProxy<Q, F> proxy{dc, u};
   auto srcOff = [&](int p) { return (static_cast<size_t>(p) * nUnits + u) * chunk; };
   const size_t dstOff = (static_cast<size_t>(me) * nUnits + u) * chunk;
-  if constexpr (Mode == kPutKernelPayload) {
-    // Every thread of the block writes the chunks; put() publishes them.
+  if constexpr (Mode == kPutKernelPayload || Mode == kPutCallerFence) {
+    // Every thread of the block writes the chunks; put() (or fence()) publishes them.
     for (int p = 0; p < n; p++) {
       if (p == me) continue;
       uint32_t* src = sendLocal + srcOff(p) / sizeof(uint32_t);
@@ -189,6 +196,7 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
         src[i] = Pattern(salt, me, p, u, i);
       }
     }
+    if constexpr (Mode == kPutCallerFence) proxy.fence(Coop{});
   }
   for (int p = 0; p < n; p++) {
     if (p == me) continue;
@@ -204,13 +212,14 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
       }
       proxy.put(p, recvWin, dstOff, sendWin, srcOff(p), chunk, ccoGda_SignalInc{Slot(me, u)},
                 Coop{});
-    } else if constexpr (Mode == kPutPieces) {
-      const size_t piece = chunk / kPieces;
-      for (int k = 0; k < kPieces - 1; k++) {
+    } else if constexpr (Mode == kPutPieces || Mode == kPutCallerFence) {
+      constexpr int kN = Mode == kPutPieces ? kPieces : kFencePieces;
+      const size_t piece = chunk / kN;
+      for (int k = 0; k < kN - 1; k++) {
         proxy.put(p, recvWin, dstOff + k * piece, sendWin, srcOff(p) + k * piece, piece,
                   ccoGda_NoSignal{}, Coop{});
       }
-      const size_t last = (kPieces - 1) * piece;
+      const size_t last = (kN - 1) * piece;
       proxy.put(p, recvWin, dstOff + last, sendWin, srcOff(p) + last, chunk - last,
                 ccoGda_SignalInc{Slot(me, u)}, Coop{});
     } else {
@@ -220,6 +229,7 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
       }
     }
   }
+  if constexpr (Mode == kPutCallerFence) proxy.flush(Coop{});
   if constexpr (Mode == kPutFlushCount) {
     uint64_t before = 0;
     if constexpr (ccoProxy<Q>::kSpsc) {
@@ -701,13 +711,14 @@ struct Ctx {
 
 // maxPutBytes != 0 lowers the DevComm's put split size (a kernel-argument copy;
 // the proxy posts any size up to the real limit), so put() splits.
-template <typename Q, typename Coop, int Mode>
+template <typename Q, typename Coop, int Mode, ccoProxyFenceMode F = ccoProxyFenceEachOp>
 static int RunPutCase(Ctx& c, const char* name, uint32_t salt, size_t chunk, int nUnits,
                       int blockDim, bool smallRings = false, uint64_t maxPutBytes = 0) {
   ccoDevComm d = smallRings ? c.dcSmall : c.dc;
   if (maxPutBytes != 0) d.proxy.maxPutBytes = maxPutBytes;
-  c.Fresh(d, salt, chunk, nUnits, /*fillSend=*/Mode != kPutKernelPayload);
-  ProxyPutKernel<Q, Coop, Mode><<<nUnits, blockDim, 0, c.stream>>>(
+  c.Fresh(d, salt, chunk, nUnits,
+          /*fillSend=*/Mode != kPutKernelPayload && Mode != kPutCallerFence);
+  ProxyPutKernel<Q, Coop, Mode, F><<<nUnits, blockDim, 0, c.stream>>>(
       d, c.sendWin, c.recvWin, c.flagWin, static_cast<uint32_t*>(c.sendBuf),
       static_cast<uint64_t*>(c.flagBuf), salt, chunk, nUnits, c.dErr);
   c.Sync();
@@ -972,6 +983,10 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
                                                                     kSpscQueues, 256);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutKernelPayload>(c, "kernel_payload", 11,
                                                                      kChunk, kSpscQueues, 256);
+  fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutCallerFence, ccoProxyFenceCaller>(
+      c, "caller_fence", 27, kChunk, kSpscQueues, 256);
+  fails += RunPutCase<MPSCD2HQueue, ccoCoopWarp, kPutCallerFence, ccoProxyFenceCaller>(
+      c, "mpsc_caller", 28, kChunk, kMaxUnits, 64);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutRepeat>(c, "sq_full", 12, kChunk, 1, 64);
   // kMaxUnits blocks over kMpscQueues MPSC queues: several concurrent producers per queue.
   fails += RunPutCase<MPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "mpsc_put_sig", 7, kChunk,

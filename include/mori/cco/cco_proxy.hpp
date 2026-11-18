@@ -86,6 +86,14 @@
 // for a peer that died while this DevComm posted nothing to it.
 // MORI_CCO_PROXY_ABORT_ON_ERROR=1 aborts the process at the first error instead.
 //
+// Fences: by default (ccoProxyFenceEachOp) each put / signal does a
+// system-scope release fence before its push, so the data it sends (and every
+// earlier store) is visible to the NIC. ccoProxy<Q, ccoProxyFenceCaller> skips
+// it; the caller then calls fence() after writing data the next puts read or
+// signals publish. Reads of NIC-written memory need an acquire: waitSignal()
+// and flush() end with a system-scope one; after readSignal() or a poll of a
+// caller window, issue it yourself.
+//
 // Calling convention: put / signal / flush are called by the whole Coop group
 // from converged code, and the issuing wavefront (the calling wavefront for
 // ccoCoopWarp and ccoCoopLaneMasked, wavefront 0 for ccoCoopBlock) must have
@@ -231,11 +239,25 @@ struct ccoCoopLaneMasked {
   __device__ void sync() {}
 };
 
+// When put / signal make the caller's earlier stores (the data a put sends, or
+// that a signal publishes) visible to the NIC: the handle's second template
+// argument, like ccoGdaDoorbellMode, so it is fixed for every op on the handle.
+enum ccoProxyFenceMode : uint32_t {
+  // Default: every put / signal does a system-scope release fence before its push.
+  ccoProxyFenceEachOp = 0,
+  // put / signal push without a fence. Contract, unchecked: call fence() after
+  // writing data that the next puts read or signals publish; puts of data
+  // already fenced (e.g. resending an unchanged buffer) need none.
+  ccoProxyFenceCaller = 1,
+};
+
 // Device-side transport handle. Construct per thread; call put / signal /
 // flush from the whole Coop group. Not copyable: an SPSC handle writes its
 // producer state back exactly once.
-template <typename Queue = mori::cco::proxy::queue::SPSCD2HQueue>
+template <typename Queue = mori::cco::proxy::queue::SPSCD2HQueue,
+          ccoProxyFenceMode Fence = ccoProxyFenceEachOp>
 struct ccoProxy {
+  static_assert(Fence <= ccoProxyFenceCaller, "unknown ccoProxyFenceMode");
   static constexpr bool kSpsc = std::is_same_v<Queue, mori::cco::proxy::queue::SPSCD2HQueue>;
   static_assert(kSpsc || std::is_same_v<Queue, mori::cco::proxy::queue::MPSCD2HQueue>,
                 "ccoProxy queue must be mori::cco::proxy::queue::SPSCD2HQueue or MPSCD2HQueue");
@@ -323,6 +345,16 @@ struct ccoProxy {
   __device__ inline void flush(int peer, Coop coop = Coop{}) {
     (void)peer;
     flush(coop);
+  }
+
+  // Make the group's earlier stores visible to the NIC before the next put /
+  // signal pushes (system-scope release from the issuing wavefront). Needed
+  // in ccoProxyFenceCaller mode only. Coop as in put().
+  template <typename Coop = ccoCoopWarp>
+  __device__ inline void fence(Coop coop = Coop{}) {
+    coop.sync();
+    if (issuingWave<Coop>()) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+    coop.sync();
   }
 
   // Local signal slots: identical to ccoGda (remote NIC atomics land there).
@@ -467,18 +499,19 @@ struct ccoProxy {
 
   __device__ inline void waitSignalOrTrap(ccoGdaSignal_t signalId, uint64_t least, int bits);
 
-  // invoke() for a data-carrying op: first make the source data (and any earlier
-  // stores the peer will read) visible to the NIC, since the proxy may post the
-  // WR as soon as the descriptor lands.
+  // invoke() for a data-carrying op. ccoProxyFenceEachOp: first make the source
+  // data (and any earlier stores the peer will read) visible to the NIC, since
+  // the proxy may post the WR as soon as the descriptor lands. Release only:
+  // nothing here reads NIC-written memory (waitSignal and flush acquire).
   template <bool kLaneMasked, typename Desc>
   __device__ inline void fenceAndInvoke(bool active, ccoProxyOp op, const Desc& desc) {
-    impl::threadFenceSystem();
+    if constexpr (Fence == ccoProxyFenceEachOp) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
     invoke<kLaneMasked>(active, op, desc);
   }
 };
 
-template <typename Queue>
-__device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIndex)
+template <typename Queue, ccoProxyFenceMode Fence>
+__device__ inline ccoProxy<Queue, Fence>::ccoProxy(ccoDevComm const& comm_, int queueIndex)
     : comm(comm_),
       maxPutBytes(comm_.proxy.maxPutBytes),
       ctx(nullptr),
@@ -537,11 +570,12 @@ __device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIn
   flushTicket = comm.proxy.flushTicket + pool + queueId;
 }
 
-template <typename Queue>
+template <typename Queue, ccoProxyFenceMode Fence>
 template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename RemoteAction, typename Coop>
-__device__ inline void ccoProxy<Queue>::put(int peer, ccoWindow_t dstWin, size_t dstOffset,
-                                            ccoWindow_t srcWin, size_t srcOffset, size_t bytes,
-                                            RemoteAction remoteAction, Coop coop) {
+__device__ inline void ccoProxy<Queue, Fence>::put(int peer, ccoWindow_t dstWin, size_t dstOffset,
+                                                   ccoWindow_t srcWin, size_t srcOffset,
+                                                   size_t bytes, RemoteAction remoteAction,
+                                                   Coop coop) {
   constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
   coop.sync();
   const bool on = laneActive(coop);  // constant true unless kLaneMasked
@@ -584,9 +618,10 @@ __device__ inline void ccoProxy<Queue>::put(int peer, ccoWindow_t dstWin, size_t
   coop.sync();
 }
 
-template <typename Queue>
+template <typename Queue, ccoProxyFenceMode Fence>
 template <ccoTeamMode TeamMode, typename RemoteAction, typename Coop>
-__device__ inline void ccoProxy<Queue>::signal(int peer, RemoteAction remoteAction, Coop coop) {
+__device__ inline void ccoProxy<Queue, Fence>::signal(int peer, RemoteAction remoteAction,
+                                                      Coop coop) {
   static_assert(!std::is_same_v<RemoteAction, ccoGda_NoSignal>, "signal() needs a remote action");
   constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
   coop.sync();
@@ -599,9 +634,9 @@ __device__ inline void ccoProxy<Queue>::signal(int peer, RemoteAction remoteActi
   coop.sync();
 }
 
-template <typename Queue>
+template <typename Queue, ccoProxyFenceMode Fence>
 template <bool kTimeout>
-__device__ inline int ccoProxy<Queue>::flushIssue(uint64_t timeoutCycles) {
+__device__ inline int ccoProxy<Queue, Fence>::flushIssue(uint64_t timeoutCycles) {
   // Lane 0 picks the flushDone value that proves our FLUSH (or a later one
   // that covers it) is satisfied.
   uint64_t target = 0;
@@ -662,9 +697,9 @@ __device__ inline int ccoProxy<Queue>::flushIssue(uint64_t timeoutCycles) {
   return __builtin_amdgcn_readfirstlane(result);
 }
 
-template <typename Queue>
+template <typename Queue, ccoProxyFenceMode Fence>
 template <typename Coop, std::enable_if_t<!std::is_integral_v<Coop>, int>>
-__device__ inline void ccoProxy<Queue>::flush(Coop coop) {
+__device__ inline void ccoProxy<Queue, Fence>::flush(Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopLaneMasked>,
                 "ccoProxy::flush takes ccoCoopWarp or ccoCoopBlock: after lane-masked put/signal, "
                 "call flush() (ccoCoopWarp) from all 64 lanes");
@@ -683,9 +718,9 @@ __device__ inline void ccoProxy<Queue>::flush(Coop coop) {
   coop.sync();
 }
 
-template <typename Queue>
+template <typename Queue, ccoProxyFenceMode Fence>
 template <typename Coop, std::enable_if_t<!std::is_integral_v<Coop>, int>>
-__device__ inline int ccoProxy<Queue>::flush(Coop coop, uint64_t timeoutCycles) {
+__device__ inline int ccoProxy<Queue, Fence>::flush(Coop coop, uint64_t timeoutCycles) {
   static_assert(!std::is_same_v<Coop, ccoCoopLaneMasked>,
                 "ccoProxy::flush takes ccoCoopWarp or ccoCoopBlock: after lane-masked put/signal, "
                 "call flush() (ccoCoopWarp) from all 64 lanes");
@@ -700,9 +735,9 @@ __device__ inline int ccoProxy<Queue>::flush(Coop coop, uint64_t timeoutCycles) 
   return result;
 }
 
-template <typename Queue>
-__device__ inline void ccoProxy<Queue>::waitSignalOrTrap(ccoGdaSignal_t signalId, uint64_t least,
-                                                         int bits) {
+template <typename Queue, ccoProxyFenceMode Fence>
+__device__ inline void ccoProxy<Queue, Fence>::waitSignalOrTrap(ccoGdaSignal_t signalId,
+                                                                uint64_t least, int bits) {
   volatile uint64_t* signalBuf = comm.ibgda.signalBuf;
   volatile uint64_t* signalShadows = comm.ibgda.signalShadows;
   const uint64_t mask = (bits >= 64) ? UINT64_MAX : ((1ULL << bits) - 1);
@@ -724,8 +759,8 @@ __device__ inline void ccoProxy<Queue>::waitSignalOrTrap(ccoGdaSignal_t signalId
     }
     asm volatile("" ::: "memory");
   }
-  // Data the signal covers is read after it.
-  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  // Data the signal covers is read after it (system scope: the NIC wrote it).
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
 }
 
 #endif  // defined(__HIPCC__)

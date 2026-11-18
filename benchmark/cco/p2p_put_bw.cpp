@@ -118,7 +118,8 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 // counterpart of ibgda's trailing flush. SPSC: unit u of block b owns
 // queue b * nunits + u, except that with ccoCoopLaneMasked (unit = thread) each
 // wavefront of 64 units owns one; MPSC: the block's units share queue b.
-template <typename Q, typename Coop>
+// ccoProxyFenceCaller: one fence() before the loop (the source never changes).
+template <typename Q, ccoProxyFenceMode F, typename Coop>
 __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
   Coop coop;
@@ -138,7 +139,8 @@ __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
   const int unitsPerQueue = kLaneMasked ? __builtin_amdgcn_wavefrontsize() : 1;  // SPSC
   const int spscQueue = bid * (nunits / unitsPerQueue) + unit / unitsPerQueue;
-  ccoProxy<Q> proxy{devComm, ccoProxy<Q>::kSpsc ? spscQueue : bid};
+  ccoProxy<Q, F> proxy{devComm, ccoProxy<Q, F>::kSpsc ? spscQueue : bid};
+  if constexpr (F == ccoProxyFenceCaller) proxy.fence(coop);
   for (int i = 0; i < iter; i++) {
     proxy.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), off_bytes,
               reinterpret_cast<ccoWindow_t>(sendWin), off_bytes, bytes, ccoGda_NoSignal{}, coop);
@@ -150,18 +152,32 @@ __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   }
 }
 
-template <typename Q>
-static void launch_proxy(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,
-                         ccoWindow_t recvWin, size_t len_doubles, ccoDevComm devComm, int count) {
+template <typename Q, ccoProxyFenceMode F>
+static void launch_proxy_fence(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,
+                               ccoWindow_t recvWin, size_t len_doubles, ccoDevComm devComm,
+                               int count) {
   if (scope == PutScope::kWarp) {
-    hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopWarp>), grid, block, 0, 0, sendWin, recvWin,
+    hipLaunchKernelGGL((proxy_put_bw<Q, F, ccoCoopWarp>), grid, block, 0, 0, sendWin, recvWin,
                        len_doubles, devComm, count);
   } else if (scope == PutScope::kThread) {
-    hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopLaneMasked>), grid, block, 0, 0, sendWin, recvWin,
+    hipLaunchKernelGGL((proxy_put_bw<Q, F, ccoCoopLaneMasked>), grid, block, 0, 0, sendWin, recvWin,
                        len_doubles, devComm, count);
   } else {
-    hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopBlock>), grid, block, 0, 0, sendWin, recvWin,
+    hipLaunchKernelGGL((proxy_put_bw<Q, F, ccoCoopBlock>), grid, block, 0, 0, sendWin, recvWin,
                        len_doubles, devComm, count);
+  }
+}
+
+template <typename Q>
+static void launch_proxy(bool callerFence, PutScope scope, dim3 grid, dim3 block,
+                         ccoWindow_t sendWin, ccoWindow_t recvWin, size_t len_doubles,
+                         ccoDevComm devComm, int count) {
+  if (callerFence) {
+    launch_proxy_fence<Q, ccoProxyFenceCaller>(scope, grid, block, sendWin, recvWin, len_doubles,
+                                               devComm, count);
+  } else {
+    launch_proxy_fence<Q, ccoProxyFenceEachOp>(scope, grid, block, sendWin, recvWin, len_doubles,
+                                               devComm, count);
   }
 }
 #endif  // MORI_CCO_PROXY
@@ -343,13 +359,13 @@ int main(int argc, char** argv) {
         if (proxy) {
 #ifdef MORI_CCO_PROXY
           if (args.proxy_mpsc) {
-            launch_proxy<mori::cco::proxy::queue::MPSCD2HQueue>(args.put_scope, grid, block,
-                                                                ctx.send_win, ctx.recv_win,
-                                                                len_doubles, ctx.devComm, count);
+            launch_proxy<mori::cco::proxy::queue::MPSCD2HQueue>(
+                args.proxy_caller_fence, args.put_scope, grid, block, ctx.send_win, ctx.recv_win,
+                len_doubles, ctx.devComm, count);
           } else {
-            launch_proxy<mori::cco::proxy::queue::SPSCD2HQueue>(args.put_scope, grid, block,
-                                                                ctx.send_win, ctx.recv_win,
-                                                                len_doubles, ctx.devComm, count);
+            launch_proxy<mori::cco::proxy::queue::SPSCD2HQueue>(
+                args.proxy_caller_fence, args.put_scope, grid, block, ctx.send_win, ctx.recv_win,
+                len_doubles, ctx.devComm, count);
           }
 #endif
         } else if (args.transport == Transport::kSdma) {

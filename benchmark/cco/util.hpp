@@ -125,6 +125,8 @@ struct PerfArgs {
   // shared by its wavefronts.
   int proxy_threads = kDefaultProxyThreads;
   bool proxy_mpsc = false;
+  // proxy put_bw (-F): ccoProxyFenceCaller, one fence() per kernel instead of one per put.
+  bool proxy_caller_fence = false;
 };
 
 // SPSC proxy queues needed so that every issuing wavefront owns one: per block,
