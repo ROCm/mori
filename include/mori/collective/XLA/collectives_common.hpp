@@ -910,20 +910,28 @@ __device__ __forceinline__ void WaitArrivedAndDelivered(const uint64_t* arrived,
 #if MORI_PUSH_TIMING
 // Timed variants of the three waits above (MORI_PT_ARGS call sites): lane q
 // also stores wall_clock64() into seen[q] in the poll round that saw its slot
-// land. It must happen inside the loop -- after it, the wave has reconverged
-// and every lane would read the slowest lane's time. Null arrays record nothing.
+// land. The loops exit wave-uniformly so that store stays in the loop body: on
+// a per-lane exit edge the compiler sinks it past the reconvergence point and
+// every lane records the slowest lane's time. Null arrays record nothing.
+__device__ __forceinline__ void WaitPollTimed(const uint64_t* addr, bool active, uint64_t gen,
+                                              uint64_t* seen) {
+  const int lane = __lane_id();
+  bool done = !active;
+  while (true) {
+    if (!done && AtomicLoad<ESystemScope>(addr) >= gen) {
+      done = true;
+      if (seen != nullptr) seen[lane] = wall_clock64();
+    }
+    if (__all(done)) break;
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+
 __device__ __forceinline__ void WaitArrived(const uint64_t* arrived, int slot, uint64_t gen,
                                             int myPe, int npes, bool skipSelf, uint64_t* seen) {
   const int lane = __lane_id();
   const bool active = lane < npes && !(skipSelf && lane == myPe);
-  const uint64_t* addr = arrived + lane * kArrivedStride + slot;
-  while (active) {
-    if (AtomicLoad<ESystemScope>(addr) >= gen) {
-      if (seen != nullptr) seen[lane] = wall_clock64();
-      break;
-    }
-    __builtin_amdgcn_s_sleep(1);
-  }
+  WaitPollTimed(arrived + lane * kArrivedStride + slot, active, gen, seen);
 }
 
 template <class ActiveFn>
@@ -931,15 +939,9 @@ __device__ __forceinline__ void WaitDelivered(const uint64_t* arrived, int slot,
                                               int myPe, int npes, uint32_t stride4G,
                                               ActiveFn active, uint64_t* seen) {
   const int lane = __lane_id();
-  if (lane >= npes || !active(lane)) return;
-  const uint64_t* addr = PeerPtr(arrived + myPe * kArrivedStride + slot, lane, myPe, stride4G);
-  while (true) {
-    if (AtomicLoad<ESystemScope>(addr) >= gen) {
-      if (seen != nullptr) seen[lane] = wall_clock64();
-      break;
-    }
-    __builtin_amdgcn_s_sleep(1);
-  }
+  const bool on = lane < npes && active(lane);
+  WaitPollTimed(PeerPtr(arrived + myPe * kArrivedStride + slot, lane, myPe, stride4G), on, gen,
+                seen);
 }
 
 __device__ __forceinline__ void WaitArrivedAndDelivered(const uint64_t* arrived, int slot,
