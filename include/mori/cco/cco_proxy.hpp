@@ -371,7 +371,7 @@ struct ccoProxy {
                              size_t srcOffset, size_t bytes, RemoteAction remoteAction = {},
                              Coop coop = Coop{});
 
-  // Inline RDMA write of `value` (sizeof(T) <= 8 bytes) to peer's
+  // Inline RDMA write of `value` (sizeof(T) <= 8 bytes, no padding) to peer's
   // [dstWin+dstOffset, ...), optionally followed by a remote signal, as put().
   // Template parameters follow ccoGda::putValue; Coop as in put().
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
@@ -723,6 +723,10 @@ __device__ inline void ccoProxy<Queue, Fence>::putValue(int peer, ccoWindow_t ds
                                                         RemoteAction remoteAction, Coop coop) {
   static_assert(sizeof(T) >= 1 && sizeof(T) <= 8 && std::is_trivially_copyable_v<T>,
                 "putValue only supports trivially copyable types of 1..8 bytes");
+  // Padding bytes would be sent, and fail the uniform-argument check.
+  static_assert(std::is_arithmetic_v<T> || std::is_enum_v<T> || std::is_pointer_v<T> ||
+                    std::has_unique_object_representations_v<T>,
+                "putValue does not take types with padding bytes");
   constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
   coop.sync();
   const bool on = laneActive(coop);  // constant true unless kLaneMasked
