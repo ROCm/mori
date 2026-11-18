@@ -917,8 +917,9 @@ class Proxy:
     Each call builds a C++ ``ccoProxy`` on its queue and drops it at return:
 
     * SPSC: one wavefront must own the queue across calls and launches
-      (``coop=BLOCK``: wavefront 0), so give each concurrent block its own
-      queue. Out of range traps. MPSC queues wrap and may be shared.
+      (``coop=BLOCK``: wavefront 0), so give each block of a launch its own
+      queue, even blocks that run one after another. Out of range traps. MPSC
+      queues wrap and may be shared.
     * ``coop`` is WARP or BLOCK (no THREAD). BLOCK: wavefront 0 issues one op.
       WARP: every wavefront issues it, so use it with one-wavefront blocks.
     * ``flush`` covers every earlier op on its queue; a BLOCK flush covers

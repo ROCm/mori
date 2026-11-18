@@ -30,8 +30,9 @@ Every call names a queue: ``queue`` indexes the DevComm's SPSC pool
   push, so successive calls on one queue continue it, within a kernel and
   across launches. One wavefront must own an SPSC queue: with
   ``coop=CoopScope.BLOCK`` that is wavefront 0 of the program, so give every
-  program that runs at the same time its own queue (e.g.
-  ``queue=tl.program_id(0)`` with one SPSC queue per program). Out of range
+  program of a launch its own queue (e.g. ``queue=tl.program_id(0)`` with one
+  SPSC queue per program); programs of one launch must not share one, even if
+  they run one after another (no hand-off ordering between them). Out of range
   traps. MPSC queues wrap and may be shared by programs.
 * ``coop=CoopScope.BLOCK`` (default): the program issues one op from
   wavefront 0. ``coop=CoopScope.WARP``: every wavefront of the program issues
