@@ -27,11 +27,12 @@
 // queues (SPSC and MPSC; it is their only consumer) and min(qpsPerPeer, its
 // queue count) host-posted RC QPs, each with its own CQ, per peer. Each owned
 // queue is bound to one QP slot (round robin over the thread's queues), so a
-// queue's ops to one peer share a QP and stay in order. Each queue pool is one KIWI invoke context: a
-// thread drains its queues with Context::progress(), which runs one registered
-// callback (ProxyWorker::On*) per descriptor on that thread. The QPs live on
-// the PD of the comm's RDMA device context, which owns the cco window MRs, so
-// the lkeys/rkeys kernels resolve from ccoWindowDevice are valid on them as-is.
+// queue's ops to one peer share a QP and stay in order. Each queue pool is one
+// KIWI invoke context: a thread drains its queues with Context::progress(),
+// which runs one registered callback (ProxyWorker::On*) per descriptor on that
+// thread. The QPs live on the PD of the comm's RDMA device context, which owns
+// the cco window MRs, so the lkeys/rkeys kernels resolve from ccoWindowDevice
+// are valid on them as-is.
 //
 // Per-QP work-request sequence numbers: the k-th WR posted on a QP has wr_id k.
 // RC completes WRs in order, so a CQE for WR k retires every WR <= k
@@ -1018,8 +1019,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
         engine->ibv->RegisterRdmaMemoryRegion(engine->scratch, kScratchStride * numThreads);
 
     for (int t = 0; t < numThreads; t++) {
-      auto w =
-          std::make_unique<ProxyWorker>(t, worldSize, threadQps[t], rank, &engine->err, abortOnError);
+      auto w = std::make_unique<ProxyWorker>(t, worldSize, threadQps[t], rank, &engine->err,
+                                             abortOnError);
       w->scratchAddr = reinterpret_cast<uint64_t>(engine->scratch) + t * kScratchStride;
       w->scratchLkey = scratchMr.lkey;
       engine->workers.push_back(std::move(w));
