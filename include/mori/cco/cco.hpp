@@ -1097,6 +1097,11 @@ struct ccoDevCommError {
 static_assert(std::is_trivially_copyable<ccoDevCommError>::value,
               "ccoDevCommError is copied out by value");
 
+// 1 = devComm failed (*err filled), 0 = healthy or no ccoProxy queues (*err
+// zeroed), -1 = bad arguments. Local and HIP-free: safe from any thread while
+// kernels run and during stream capture.
+int ccoDevCommGetError(ccoComm* comm, const ccoDevComm* devComm, ccoDevCommError* err);
+
 // Upload a host-side DevComm shadow to device memory so kernels can take a
 // pointer to it (host memory is not GPU-accessible).  Returns a hipMalloc'd
 // device pointer; must be freed with ccoDevCommFreeDeviceCopy once the DevComm

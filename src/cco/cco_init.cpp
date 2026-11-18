@@ -2192,6 +2192,21 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
 }
 
 /* ========================================================================== */
+/*                           ccoDevCommGetError                            */
+/* ========================================================================== */
+
+int ccoDevCommGetError(ccoComm* comm, const ccoDevComm* devComm, ccoDevCommError* err) {
+  if (comm == nullptr || devComm == nullptr || err == nullptr) return -1;
+  *err = ccoDevCommError{};
+#ifdef MORI_CCO_PROXY
+  if (devComm->proxy.engine != nullptr) {
+    return ccoProxyEngineGetError(static_cast<const ccoProxyEngine*>(devComm->proxy.engine), err);
+  }
+#endif
+  return 0;
+}
+
+/* ========================================================================== */
 /*                           ccoDevCommDestroy                             */
 /* ========================================================================== */
 
