@@ -348,6 +348,13 @@ class MediumBackend : public MetricSource {
   // counted each time; a medium that keeps no order returns 0.
   virtual size_t Touch(const std::vector<std::string>& /*keys*/) { return 0; }
 
+  // Keep these keys from eviction until `ttl` from now, leaving their recency
+  // alone: a client looked them up and loads some of them next.  A medium that
+  // keeps no leases renews their recency instead.
+  virtual void Lease(const std::vector<std::string>& keys, std::chrono::milliseconds /*ttl*/) {
+    Touch(keys);
+  }
+
   // ---- observability ----
   //
   // A backend does NOT report its own operation counts, byte volumes or

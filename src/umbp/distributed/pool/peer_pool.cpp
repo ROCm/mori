@@ -52,6 +52,14 @@ std::chrono::milliseconds EvictDemotionRetryBudget() {
 // Pause before a lone retry, so waiting out pressure does not spin the worker.
 constexpr std::chrono::milliseconds kEvictRetryIdlePause{20};
 
+// How long a lookup keeps the keys it finds from eviction, so the load that
+// follows it still finds them.
+std::chrono::milliseconds LookupLeaseTtl() {
+  static const auto v = GetEnvMilliseconds("UMBP_LOOKUP_LEASE_MS", std::chrono::milliseconds(5000),
+                                           /*min_allowed=*/0);
+  return v;
+}
+
 // One tier over one backend that never offloads or promotes (pure SSD): no
 // transition to plan, so a resolve can take the policy-free direct path.
 bool TrivialTierGraph(const LogicalTierGraph& graph) {
@@ -1115,14 +1123,8 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
         still_missing.push_back(pending[j]);
       }
     }
-    if (!found.empty()) backend->Touch(found);
+    if (!found.empty()) backend->Lease(found, LookupLeaseTtl());
     pending.swap(still_missing);
-  }
-  if (track_access_order_) {
-    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
-    for (size_t i = 0; i < keys.size(); ++i) {
-      if (out[i]) TouchLocked(keys[i]);
-    }
   }
   return out;
 }
