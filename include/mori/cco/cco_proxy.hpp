@@ -83,6 +83,11 @@
 // handles of their own (e.g. ccoCoopWarp ops on per-wavefront SPSC queues) it
 // covers all of them.
 //
+// flushAsync() pushes the same FLUSH without waiting and returns a request
+// (queue, ticket); wait(request) waits for it later, so requests may be waited
+// in any order. counter() is flush() and then a local add to a counter slot
+// (gdaCounterCount), which waitCounter() polls.
+//
 // Flush counting: the proxy satisfies each queue's FLUSHes in queue order and
 // adds 1 to that queue's flushDone per FLUSH satisfied (it is the only writer).
 // A flush never needs its FLUSH's ring position: the caller takes a ticket t
@@ -91,10 +96,11 @@
 //
 // Failure: the DevComm fails for good at the first proxy error (see
 // ccoDevCommGetError): the proxy drops every later op and sets
-// ccoProxyFailedBit in each queue's flushDone. flush() then traps (printing
-// the reason first in builds without NDEBUG), flush(coop, timeoutCycles)
-// returns 2, waitSignal() traps within 256 polls, an SPSC push waiting for
-// ring space drops its op, and failed() returns true. Not covered: an MPSC
+// ccoProxyFailedBit in each queue's flushDone. flush(), wait() and counter()
+// then trap (printing the reason first in builds without NDEBUG),
+// flush(coop, timeoutCycles) and wait(request, coop, timeoutCycles) return 2,
+// waitSignal() and waitCounter() trap within 256 polls, an SPSC push waiting
+// for ring space drops its op, and failed() returns true. Not covered: an MPSC
 // push waiting for ring space (only after a corrupted ring), and waitSignal()
 // for a peer that died while this DevComm posted nothing to it.
 // MORI_CCO_PROXY_ABORT_ON_ERROR=1 aborts the process at the first error instead.
@@ -103,17 +109,18 @@
 // system-scope release fence before its push, so the data it sends (and every
 // earlier store) is visible to the NIC. ccoProxy<Q, ccoProxyFenceCaller> skips
 // it; the caller then calls fence() after writing data the next puts read or
-// signals publish. Reads of NIC-written memory need an acquire: waitSignal()
-// and flush() end with a system-scope one; after readSignal() or a poll of a
-// caller window, issue it yourself.
+// signals publish. Reads of NIC-written memory need an acquire: waitSignal(),
+// flush() and wait() end with a system-scope one; after readSignal() or a poll
+// of a caller window, issue it yourself.
 //
-// Calling convention: put / putValue / signal / flush are called by the whole
-// Coop group from converged code, and the issuing wavefront (the calling
-// wavefront for ccoCoopWarp and ccoCoopLaneMasked, wavefront 0 -- linear
-// thread ids 0..63, also in 2-D and 3-D blocks -- for ccoCoopBlock) must have
-// all 64 lanes active: a KIWI push is wavefront-collective. A push from a
-// partial wavefront traps (a compare per push), so does a ccoCoopLaneMasked
-// call from a divergent branch such as `if (i < n) put(..., ccoCoopLaneMasked{})`.
+// Calling convention: put / putValue / signal / flush / flushAsync / wait /
+// counter are called by the whole Coop group from converged code, and the
+// issuing wavefront (the calling wavefront for ccoCoopWarp and
+// ccoCoopLaneMasked, wavefront 0 -- linear thread ids 0..63, also in 2-D and
+// 3-D blocks -- for ccoCoopBlock) must have all 64 lanes active: a KIWI push
+// is wavefront-collective. A push from a partial wavefront traps (a compare
+// per push), so does a ccoCoopLaneMasked call from a divergent branch such as
+// `if (i < n) put(..., ccoCoopLaneMasked{})`.
 // ccoCoopThread is rejected at compile time.
 //
 // ccoCoopWarp / ccoCoopBlock: the group issues one op. Every issuing lane must
@@ -415,6 +422,52 @@ struct ccoProxy {
     flush(coop);
   }
 
+  // Push a FLUSH as flush(coop) does, without waiting: *outRequest gets its
+  // {queue, ticket} for wait(). Covers every peer (peer is ignored). Every
+  // thread of the group writes its own request, so pass a per-thread variable:
+  // with ccoCoopBlock each flushing wavefront gets its own queue's, the others
+  // an empty one. Requests are valid on any ccoProxy of this DevComm, in any
+  // order, but not on ccoGda. Coop: ccoCoopWarp or ccoCoopBlock, and the same
+  // for wait().
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
+  __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest, Coop coop = Coop{});
+
+  // Wait until the request's FLUSH is satisfied, then acquire: the sources of
+  // the puts before its flushAsync are reusable. Traps once the DevComm failed,
+  // as flush().
+  template <typename Coop = ccoCoopWarp>
+  __device__ inline void wait(ccoGdaRequest_t& request, Coop coop = Coop{});
+
+  // wait() that never traps; returns as flush(coop, timeoutCycles).
+  template <typename Coop>
+  __device__ inline int wait(ccoGdaRequest_t& request, Coop coop, uint64_t timeoutCycles);
+
+  // flush(coop), then the group's leader adds 1 to counter
+  // localAction.counterId (agent-scope release, after the flush's wait), so a
+  // kernel on this GPU that sees the count may reuse the flushed sources.
+  // LocalAction: ccoGda_CounterInc. Traps as flush(), or if the id is not below
+  // gdaCounterCount.
+  template <typename LocalAction, typename Coop = ccoCoopWarp>
+  __device__ inline void counter(LocalAction localAction, Coop coop = Coop{});
+
+  // Local counter slots, as ccoGda's; trap if counterId >= gdaCounterCount.
+  __device__ inline uint64_t readCounter(ccoGdaCounter_t counterId, int bits = 56) {
+    return impl::readCounterImpl<CCO_GDA_BUILD_PROVIDER>(comm.ibgda.counterBuf,
+                                                         checkCounter(counterId), bits);
+  }
+  // As ccoGda::waitCounter, but traps once the DevComm failed, and acquires.
+  // One thread of the group waits, as in waitSignal().
+  template <typename Coop = ccoCoopThread>
+  __device__ inline void waitCounter(ccoGdaCounter_t counterId, uint64_t least, Coop coop = Coop{},
+                                     int bits = 56) {
+    coop.sync();
+    if (groupLeader(coop)) waitCounterOrTrap(checkCounter(counterId), least, bits);
+    coop.sync();
+  }
+  __device__ inline void resetCounter(ccoGdaCounter_t counterId) {
+    impl::resetCounterImpl<CCO_GDA_BUILD_PROVIDER>(comm.ibgda.counterBuf, checkCounter(counterId));
+  }
+
   // Make the group's earlier stores visible to the NIC before the next put /
   // signal pushes (system-scope release from the issuing wavefront). Needed
   // in ccoProxyFenceCaller mode only. Coop as in put().
@@ -590,9 +643,45 @@ struct ccoProxy {
   // Push a FLUSH and wait for it (issuing wavefront, all 64 lanes). Returns 0
   // done, 1 timed out (kTimeout only), 2 failed; the same in every lane.
   template <bool kTimeout>
-  __device__ inline int flushIssue(uint64_t timeoutCycles);
+  __device__ inline int flushIssue(uint64_t timeoutCycles) {
+    return flushWait<kTimeout>(flushDone, flushPush(), timeoutCycles);
+  }
+
+  // Take a ticket and push a FLUSH (issuing wavefront, all 64 lanes). Returns,
+  // in lane 0, the flushDone value that proves it satisfied.
+  __device__ inline uint64_t flushPush();
+
+  // Lane 0 waits until *done >= target, then the wavefront acquires. Returns
+  // as flushIssue.
+  template <bool kTimeout>
+  __device__ static inline int flushWait(uint64_t* done, uint64_t target, uint64_t timeoutCycles);
+
+  // flushWait() for a flushAsync request of this wavefront (none: 0).
+  template <bool kTimeout>
+  __device__ inline int waitRequest(const ccoGdaRequest_t& request, uint64_t timeoutCycles) const {
+    const int queue = __builtin_amdgcn_readfirstlane(request.qpIdx);  // wave-uniform
+    if (queue < 0) return 0;
+    return flushWait<kTimeout>(comm.proxy.flushDone + queue, request.postIdx, timeoutCycles);
+  }
+
+  // counterId, after trapping unless it is below gdaCounterCount.
+  __device__ inline ccoGdaCounter_t checkCounter(ccoGdaCounter_t counterId) const {
+    if (__builtin_expect(counterId >= static_cast<uint32_t>(comm.ibgda.counterCount), 0)) {
+#ifndef NDEBUG  // see the file comment
+      if (__lane_id() == static_cast<unsigned>(__builtin_ctzll(__builtin_amdgcn_read_exec()))) {
+        printf(
+            "ccoProxy: counter %u out of range [0, %d) (set gdaCounterCount in "
+            "ccoDevCommRequirements)\n",
+            counterId, comm.ibgda.counterCount);
+      }
+#endif
+      __builtin_trap();  // counter id out of range
+    }
+    return counterId;
+  }
 
   __device__ inline void waitSignalOrTrap(ccoGdaSignal_t signalId, uint64_t least, int bits);
+  __device__ inline void waitCounterOrTrap(ccoGdaCounter_t counterId, uint64_t least, int bits);
 
   // invoke() for a data-carrying op. ccoProxyFenceEachOp: first make the source
   // data (and any earlier stores the peer will read) visible to the NIC, since
@@ -770,8 +859,7 @@ __device__ inline void ccoProxy<Queue, Fence>::signal(int peer, RemoteAction rem
 }
 
 template <typename Queue, ccoProxyFenceMode Fence>
-template <bool kTimeout>
-__device__ inline int ccoProxy<Queue, Fence>::flushIssue(uint64_t timeoutCycles) {
+__device__ inline uint64_t ccoProxy<Queue, Fence>::flushPush() {
   // Lane 0 picks the flushDone value that proves our FLUSH (or a later one
   // that covers it) is satisfied.
   uint64_t target = 0;
@@ -808,14 +896,20 @@ __device__ inline int ccoProxy<Queue, Fence>::flushIssue(uint64_t timeoutCycles)
     }
   }
   invoke</*kLaneMasked=*/false>(true, ccoProxyOpFlush);
+  return target;
+}
+
+template <typename Queue, ccoProxyFenceMode Fence>
+template <bool kTimeout>
+__device__ inline int ccoProxy<Queue, Fence>::flushWait(uint64_t* done, uint64_t target,
+                                                        uint64_t timeoutCycles) {
   int result = 0;
   if (__lane_id() == 0) {
     [[maybe_unused]] uint64_t start = 0;
     if constexpr (kTimeout) start = static_cast<uint64_t>(impl::clock64());
     // The failed bit is above any target, so it also ends the wait.
     uint64_t v;
-    while ((v = __hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)) <
-           target) {
+    while ((v = __hip_atomic_load(done, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)) < target) {
       if constexpr (kTimeout) {
         if (static_cast<uint64_t>(impl::clock64()) - start >= timeoutCycles) {
           result = 1;
@@ -872,6 +966,95 @@ __device__ inline int ccoProxy<Queue, Fence>::flush(Coop coop, uint64_t timeoutC
     if (__syncthreads_or(result != 0)) result = __syncthreads_or(result == 2) ? 2 : 1;
   }
   return result;
+}
+
+template <typename Queue, ccoProxyFenceMode Fence>
+template <ccoTeamMode TeamMode, typename Coop>
+__device__ inline void ccoProxy<Queue, Fence>::flushAsync(int peer, ccoGdaRequest_t* outRequest,
+                                                          Coop coop) {
+  static_assert(std::is_same_v<Coop, ccoCoopWarp> || std::is_same_v<Coop, ccoCoopBlock>,
+                "ccoProxy::flushAsync takes ccoCoopWarp or ccoCoopBlock");
+  (void)peer;
+  coop.sync();
+  ccoGdaRequest_t request{-1, 0};  // empty: nothing to wait for
+  if (flushingWave<Coop>()) {
+    // unflushed stays set: a later block flush still covers this wavefront.
+    const uint64_t target = flushPush();
+    request.qpIdx = static_cast<int>(flushDone - comm.proxy.flushDone);
+    request.postIdx =
+        (static_cast<uint64_t>(__builtin_amdgcn_readfirstlane(static_cast<uint32_t>(target >> 32)))
+         << 32) |
+        static_cast<uint32_t>(__builtin_amdgcn_readfirstlane(static_cast<uint32_t>(target)));
+  }
+  *outRequest = request;
+  coop.sync();
+}
+
+template <typename Queue, ccoProxyFenceMode Fence>
+template <typename Coop>
+__device__ inline void ccoProxy<Queue, Fence>::wait(ccoGdaRequest_t& request, Coop coop) {
+  static_assert(std::is_same_v<Coop, ccoCoopWarp> || std::is_same_v<Coop, ccoCoopBlock>,
+                "ccoProxy::wait takes ccoCoopWarp or ccoCoopBlock (flushAsync's Coop)");
+  coop.sync();
+  if (__builtin_expect(waitRequest</*kTimeout=*/false>(request, 0) != 0, 0)) {
+#ifndef NDEBUG  // see the file comment
+    if (__lane_id() == 0) {
+      printf("ccoProxy: wait: the DevComm failed; see the host's stderr or ccoDevCommGetError\n");
+    }
+#endif
+    __builtin_trap();  // the DevComm failed
+  }
+  coop.sync();
+}
+
+template <typename Queue, ccoProxyFenceMode Fence>
+template <typename Coop>
+__device__ inline int ccoProxy<Queue, Fence>::wait(ccoGdaRequest_t& request, Coop coop,
+                                                   uint64_t timeoutCycles) {
+  static_assert(std::is_same_v<Coop, ccoCoopWarp> || std::is_same_v<Coop, ccoCoopBlock>,
+                "ccoProxy::wait takes ccoCoopWarp or ccoCoopBlock (flushAsync's Coop)");
+  coop.sync();
+  int result = waitRequest</*kTimeout=*/true>(request, timeoutCycles);
+  coop.sync();
+  if constexpr (std::is_same_v<Coop, ccoCoopBlock>) {
+    if (__syncthreads_or(result != 0)) result = __syncthreads_or(result == 2) ? 2 : 1;
+  }
+  return result;
+}
+
+template <typename Queue, ccoProxyFenceMode Fence>
+template <typename LocalAction, typename Coop>
+__device__ inline void ccoProxy<Queue, Fence>::counter(LocalAction localAction, Coop coop) {
+  static_assert(std::is_same_v<LocalAction, ccoGda_CounterInc>,
+                "ccoProxy::counter takes ccoGda_CounterInc");
+  const ccoGdaCounter_t id = checkCounter(localAction.counterId);
+  flush(coop);  // ends with coop.sync()
+  if (groupLeader(coop)) {
+    __hip_atomic_fetch_add(&comm.ibgda.counterBuf[id], uint64_t{1}, __ATOMIC_RELEASE,
+                           __HIP_MEMORY_SCOPE_AGENT);
+  }
+  coop.sync();
+}
+
+template <typename Queue, ccoProxyFenceMode Fence>
+__device__ inline void ccoProxy<Queue, Fence>::waitCounterOrTrap(ccoGdaCounter_t counterId,
+                                                                 uint64_t least, int bits) {
+  const uint64_t mask = (bits >= 64) ? UINT64_MAX : ((1ULL << bits) - 1);
+  for (uint32_t polls = 1;; polls++) {
+    const uint64_t val = __hip_atomic_load(&comm.ibgda.counterBuf[counterId], __ATOMIC_RELAXED,
+                                           __HIP_MEMORY_SCOPE_SYSTEM);
+    if ((val & mask) >= least) break;
+    if (polls % 256 == 0 && failed()) {
+#ifndef NDEBUG  // see the file comment
+      printf(
+          "ccoProxy: waitCounter: the DevComm failed; see the host's stderr or "
+          "ccoDevCommGetError\n");
+#endif
+      __builtin_trap();  // the DevComm failed
+    }
+  }
+  // Pairs with counter()'s release.
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
 }
 
 template <typename Queue, ccoProxyFenceMode Fence>
