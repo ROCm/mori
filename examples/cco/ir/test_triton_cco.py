@@ -1478,7 +1478,42 @@ def test_proxy(comm, dc, win, rank, world_size, extern_libs):
         torch.cuda.synchronize()
         assert value.item() == expected, f"Proxy read_signal: {value.item()}"
     comm.barrier()
+    err = dc.get_error()
+    assert err is None, f"Proxy DevComm reports an error: {err}"
     print(f"[rank {rank}] Proxy PASS", flush=True)
+
+
+def test_proxy_error(comm, reqs, rank, world_size, extern_libs):
+    # A SignalSet far past the signal slots fails on the NIC: flush_timeout
+    # returns 2, failed() is 1 and get_error() names the completion error.
+    peer = (rank + 1) % world_size
+    dc = comm.create_dev_comm(reqs)
+    try:
+        out = torch.zeros(2, dtype=torch.int32, device="cuda")
+        proxy_signal_kernel[(1,)](
+            dc.ptr,
+            out,
+            peer,
+            sig_base=1 << 20,
+            value=1,
+            timeout_cycles=PROXY_TIMEOUT_CYCLES,
+            num_queues=1,
+            signal_op=cco.SignalOp.SET,
+            do_wait=False,
+            coop=cco.CoopScope.BLOCK,
+            pool=cco.ProxyPool.SPSC,
+            extern_libs=extern_libs,
+            num_warps=4,
+        )
+        torch.cuda.synchronize()
+        assert out.tolist() == [2, 1], f"Proxy error: flush/failed {out.tolist()}"
+        err = dc.get_error()
+        assert err is not None and err["code"] == 3, f"Proxy error: {err}"
+        assert err["peer"] == peer and err["rank"] == rank, f"Proxy error: {err}"
+    finally:
+        dc.close()
+    comm.barrier()
+    print(f"[rank {rank}] Proxy error PASS", flush=True)
 
 
 def main():
@@ -1541,6 +1576,7 @@ def main():
                 test_gda(comm, dc, win, rank, world_size, extern_libs)
             if proxy_enabled:
                 test_proxy(comm, dc, win, rank, world_size, extern_libs)
+                test_proxy_error(comm, reqs, rank, world_size, extern_libs)
             comm.barrier()
             if rank == 0:
                 print(

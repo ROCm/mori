@@ -149,6 +149,23 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
     int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs,
                          ccoDevComm* outDevComm) nogil
     int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) nogil
+    cdef struct ccoDevCommError:
+        int code
+        int rank
+        int peer
+        int queue
+        int op
+        int wcStatus
+        uint32_t vendorErr
+        int sysErrno
+        uint64_t wrId
+        uint64_t raddr
+        uint32_t rkey
+        uint32_t len
+        uint64_t suppressed
+        char message[160]
+    int ccoDevCommGetError(ccoComm* comm, const ccoDevComm* devComm,
+                           ccoDevCommError* err) nogil
     ccoDevComm* ccoDevCommCopyToDevice(const ccoDevComm* host) nogil
     void ccoDevCommFreeDeviceCopy(ccoDevComm* devicePtr) nogil
     int ccoBarrierAll(ccoComm* comm) nogil

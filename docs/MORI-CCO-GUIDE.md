@@ -364,7 +364,8 @@ the kernel from the DevComm and a queue: an index, or a selector.
   forms return 2, and `failed()` returns true. On the host,
   `ccoDevCommGetError(comm, &dc, &err)` returns 1 and the first error (code,
   peer, queue, op, completion status, message); it is safe to call while
-  kernels run.
+  kernels run. From Python: `DevCommHandle.get_error()` or
+  `mori.cco.dev_comm_get_error(comm, dc)` (None while healthy, else a dict).
 
 ### Example
 

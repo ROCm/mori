@@ -16,6 +16,7 @@ from .cco cimport (
     ccoGetUniqueId, ccoCommCreate, ccoCommDestroy,
     ccoMemAlloc, ccoMemImport, ccoMemFree,
     ccoWindowDeregister, ccoDevCommCreate, ccoDevCommDestroy,
+    ccoDevCommError, ccoDevCommGetError,
     ccoDevCommCopyToDevice, ccoDevCommFreeDeviceCopy,
     ccoBarrierAll, ccoWindowRegister,
 )
@@ -474,6 +475,30 @@ def dev_comm_destroy(Comm comm, DevComm dev_comm):
         ret = ccoDevCommDestroy(comm._ptr, &dev_comm._dc)
     if ret != 0:
         raise RuntimeError(f"ccoDevCommDestroy failed: {ret}")
+
+
+def dev_comm_get_error(Comm comm, DevComm dev_comm):
+    """First ccoProxy error of a DevComm, or None while it is healthy.
+
+    Returns a dict (code, rank, peer, queue, op, wc_status, vendor_err, sys_errno,
+    wr_id, raddr, rkey, len, suppressed, message). Local and HIP-free, so it is
+    safe while kernels run. code: 1 bad request, 2 post, 3 completion, 4 internal.
+    """
+    cdef ccoDevCommError err
+    cdef int ret
+    with nogil:
+        ret = ccoDevCommGetError(comm._ptr, &dev_comm._dc, &err)
+    if ret < 0:
+        raise RuntimeError(f"ccoDevCommGetError failed: {ret}")
+    if ret == 0:
+        return None
+    return {
+        "code": err.code, "rank": err.rank, "peer": err.peer, "queue": err.queue,
+        "op": err.op, "wc_status": err.wcStatus, "vendor_err": err.vendorErr,
+        "sys_errno": err.sysErrno, "wr_id": err.wrId, "raddr": err.raddr,
+        "rkey": err.rkey, "len": err.len, "suppressed": err.suppressed,
+        "message": (<bytes>err.message).decode(errors="replace"),
+    }
 
 
 def barrier_all(Comm comm):
