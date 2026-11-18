@@ -84,6 +84,7 @@
 // ring space drops its op, and failed() returns true. Not covered: an MPSC
 // push waiting for ring space (only after a corrupted ring), and waitSignal()
 // for a peer that died while this DevComm posted nothing to it.
+// MORI_CCO_PROXY_ABORT_ON_ERROR=1 aborts the process at the first error instead.
 //
 // Calling convention: put / signal / flush are called by the whole Coop group
 // from converged code, and the issuing wavefront (the calling wavefront for

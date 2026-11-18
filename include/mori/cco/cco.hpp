@@ -1068,7 +1068,8 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
 
 // A DevComm fails for good at its first ccoProxy error: the process survives,
 // ccoProxy::flush traps (or returns 2), and the DevComm must be destroyed and
-// created again. Other DevComms are unaffected.
+// created again. Other DevComms are unaffected. MORI_CCO_PROXY_ABORT_ON_ERROR=1
+// aborts the process at the first error instead.
 enum ccoDevCommErrorCode {
   CCO_DEVCOMM_OK = 0,
   CCO_PROXY_ERR_BAD_REQUEST = 1,  // an op the proxy cannot post (no QP to the peer, bad descriptor)
