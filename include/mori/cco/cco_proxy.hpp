@@ -69,7 +69,8 @@
 // increasing values) are 8-byte inline RDMA writes, for platforms where NIC
 // atomics into GPU memory fail; like any write-then-flag protocol they rely on
 // the NIC and PCIe placing one QP's writes in order (no relaxed ordering on the
-// windows).
+// windows: ccoDevCommCreate warns once per process if
+// MORI_IB_ENABLE_RELAXED_ORDERING=1).
 //
 // putValue() writes 1..8 bytes carried in the descriptor (an inline RDMA
 // write, no source buffer), optionally followed by a signal as put().

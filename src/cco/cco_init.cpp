@@ -1970,6 +1970,18 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
         std::lock_guard<std::mutex> lock(comm->allocMutex);
         comm->proxyEngines.push_back(engine);
       }
+      // SignalSet and a putValue flag rely on one QP's writes landing in
+      // order, which relaxed-ordering window MRs do not promise.
+      static std::once_flag relaxedWarned;
+      if (engine != nullptr && application::MaybeAddRelaxedOrderingFlag(0) != 0) {
+        std::call_once(relaxedWarned, [] {
+          std::fprintf(stderr,
+                       "[mori cco] WARNING: ccoProxy: MORI_IB_ENABLE_RELAXED_ORDERING=1 registers "
+                       "the windows with relaxed ordering, so a SignalSet / WindowSignalSet or a "
+                       "putValue used as a flag may land before the data it follows; signal "
+                       "with SignalInc / SignalAdd instead, or turn relaxed ordering off\n");
+        });
+      }
     }
   }
 #else
