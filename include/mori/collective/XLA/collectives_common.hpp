@@ -59,6 +59,20 @@ static_assert((kRaggedMaxUpdates + 1) * kSDMACopySignalPkt < cco::CCO_SDMA_QUEUE
 static constexpr int kCCLMaxPeers = 16;
 static constexpr int kPushMaxSlices = 8;
 
+// Push-kernel phase timing (debug, see push_timing.hpp). MORI_PT(stmts) and
+// MORI_PT_ARGS(args) (appended to a call's argument list) vanish unless
+// MORI_PUSH_TIMING is non-zero, so the default build carries none of it.
+#ifndef MORI_PUSH_TIMING
+#define MORI_PUSH_TIMING 0
+#endif
+#if MORI_PUSH_TIMING
+#define MORI_PT(...) __VA_ARGS__
+#define MORI_PT_ARGS(...) , __VA_ARGS__
+#else
+#define MORI_PT(...)
+#define MORI_PT_ARGS(...)
+#endif
+
 // Phases a push-collective launch runs: kAsyncStart issues the SDMA copies and
 // returns, kAsyncDone waits for them and advances the generation; kSync is both.
 enum PhaseFlags : int {
@@ -892,6 +906,65 @@ __device__ __forceinline__ void WaitArrivedAndDelivered(const uint64_t* arrived,
     if (in || out) __builtin_amdgcn_s_sleep(1);
   }
 }
+
+#if MORI_PUSH_TIMING
+// Timed variants of the three waits above (MORI_PT_ARGS call sites): lane q
+// also stores wall_clock64() into seen[q] in the poll round that saw its slot
+// land. The loops exit wave-uniformly so that store stays in the loop body: on
+// a per-lane exit edge the compiler sinks it past the reconvergence point and
+// every lane records the slowest lane's time. Null arrays record nothing.
+__device__ __forceinline__ void WaitPollTimed(const uint64_t* addr, bool active, uint64_t gen,
+                                              uint64_t* seen) {
+  const int lane = __lane_id();
+  bool done = !active;
+  while (true) {
+    if (!done && AtomicLoad<ESystemScope>(addr) >= gen) {
+      done = true;
+      if (seen != nullptr) seen[lane] = wall_clock64();
+    }
+    if (__all(done)) break;
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+
+__device__ __forceinline__ void WaitArrived(const uint64_t* arrived, int slot, uint64_t gen,
+                                            int myPe, int npes, bool skipSelf, uint64_t* seen) {
+  const int lane = __lane_id();
+  const bool active = lane < npes && !(skipSelf && lane == myPe);
+  WaitPollTimed(arrived + lane * kArrivedStride + slot, active, gen, seen);
+}
+
+template <class ActiveFn>
+__device__ __forceinline__ void WaitDelivered(const uint64_t* arrived, int slot, uint64_t gen,
+                                              int myPe, int npes, uint32_t stride4G,
+                                              ActiveFn active, uint64_t* seen) {
+  const int lane = __lane_id();
+  const bool on = lane < npes && active(lane);
+  WaitPollTimed(PeerPtr(arrived + myPe * kArrivedStride + slot, lane, myPe, stride4G), on, gen,
+                seen);
+}
+
+__device__ __forceinline__ void WaitArrivedAndDelivered(const uint64_t* arrived, int slot,
+                                                        uint64_t gen, int myPe, int npes,
+                                                        uint32_t stride4G, uint64_t* inSeen,
+                                                        uint64_t* outSeen) {
+  const int lane = __lane_id();
+  bool in = lane < npes, out = in && lane != myPe;
+  const uint64_t* inAddr = arrived + lane * kArrivedStride + slot;
+  const uint64_t* outAddr = PeerPtr(arrived + myPe * kArrivedStride + slot, lane, myPe, stride4G);
+  while (in || out) {
+    if (in && AtomicLoad<ESystemScope>(inAddr) >= gen) {
+      in = false;
+      if (inSeen != nullptr) inSeen[lane] = wall_clock64();
+    }
+    if (out && AtomicLoad<ESystemScope>(outAddr) >= gen) {
+      out = false;
+      if (outSeen != nullptr) outSeen[lane] = wall_clock64();
+    }
+    if (in || out) __builtin_amdgcn_s_sleep(1);
+  }
+}
+#endif  // MORI_PUSH_TIMING
 
 // Push-collective launch generation, derived from the gen-barrier flags like the
 // pull kernels' gen: a push launch enters with gen+1 (odd, posted by block 0)

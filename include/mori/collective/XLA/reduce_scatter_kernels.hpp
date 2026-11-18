@@ -40,6 +40,7 @@
 #include <cstdint>
 
 #include "mori/collective/XLA/collectives_common.hpp"
+#include "mori/collective/XLA/push_timing.hpp"
 #include "mori/collective/XLA/reduce_ops.hpp"
 
 namespace mori {
@@ -182,7 +183,8 @@ __device__ __forceinline__ void WaitAndReduceSlice(
   // wave of every block polls them itself (one lane per sender); self-copy is
   // skipped, so row myPe is not waited on. At npes==1 there is nothing to wait for.
   if (threadIdx.x < warpSize) {
-    WaitArrived(arrived, static_cast<int>(slice), gen, myPe, npes, /*skipSelf=*/true);
+    WaitArrived(arrived, static_cast<int>(slice), gen, myPe, npes, /*skipSelf=*/true
+                MORI_PT_ARGS(blockIdx.x == PtArrBlock() ? PT().arr[slice] : nullptr));
   }
   __syncthreads();
   // System-scope ACQUIRE (not the full seq_cst __threadfence_system): the staging
@@ -190,6 +192,7 @@ __device__ __forceinline__ void WaitAndReduceSlice(
   // device's writes -- scope "" (system) is required -- but only the acquire half
   // is needed here (we publish nothing at this point), so drop the release/waitcnt.
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+  MORI_PT(if (PtTimedBlock() && threadIdx.x == 0) PT().t3[blockIdx.x][slice] = wall_clock64();)
 
   // === Phase 3: grid-strided vectorized reduce over this slice =================
   // Streaming reduction over the slice only, strided over the whole grid. Uses
@@ -229,6 +232,11 @@ __device__ __forceinline__ void WaitAndReduceSlice(
     V = __builtin_bit_cast(Vec, DowncastF<T>(a));
     StreamStore<EAgentScope, sizeof(T)>(shardOut + v, V);
   }
+  // Block-uniform: only the timed blocks pay the extra barrier.
+  MORI_PT(if (PtTimedBlock()) {
+    __syncthreads();
+    if (threadIdx.x == 0) PT().t4[blockIdx.x][slice] = wall_clock64();
+  })
 }
 
 // Load M output positions x NPES peers ALL up front into distinct registers, then
@@ -365,6 +373,11 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
 //   }
 // }
 
+  // An async start recorded the shape with its own 1-block grid.
+  MORI_PT(if (PtTimedBlock() && threadIdx.x == 0) {
+    PT().t0[blockIdx.x] = wall_clock64();
+    if (blockIdx.x == 0) PT().grid = gridDim.x;
+  })
   // Every block reads the launch generation before counting in; only the last
   // block out advances it, after every block has counted in.
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
@@ -372,11 +385,15 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
   // Phase 1: scatter the input to the staging buffer (already done by
   // ReduceScatterPushStart when doScatter is false)
   if (doScatter && blockIdx.x == 0) {
+    MORI_PT(if (threadIdx.x == 0) {
+      PtShape(PushTimingKind::kReduceScatter, npes, 1u << logS, chunkElems * sizeof(T), false);
+    })
     // Finishing the previous launch only proves peers SENT to us, not that they
     // are done reducing what we sent them: each peer's queue polls for its
     // arrival in this launch before writing into its staging.
     PostArrival(barrierCtr, pushGen - 1, myPe, npes, stride4G);
     __syncthreads();
+    MORI_PT(if (threadIdx.x == 0) PT().tPost = wall_clock64();)
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
     // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a
@@ -393,6 +410,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
               reinterpret_cast<uint8_t*>(stagingP), arrivedP,
               BarrierGate(barrierCtr, peer), static_cast<uint32_t>(pushGen - 1)};
         });
+    MORI_PT(if (threadIdx.x == 0) PT().tIssue = wall_clock64();)
   }
   
   // Phase 2-3: walk all S slices in the order the senders queued them, reducing
@@ -414,7 +432,8 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
   // at every peer, so "kernel done" means input is reusable.
   if (blockIdx.x == 0 && threadIdx.x < warpSize) {
     WaitDelivered(arrived, static_cast<int>(S - 1), pushGen, myPe, npes, stride4G,
-                  [=](int peer) { return peer != myPe; });
+                  [=](int peer) { return peer != myPe; } MORI_PT_ARGS(PT().dlv));
+    MORI_PT(if (threadIdx.x == 0) PT().tDlv = wall_clock64();)
   }
 
   // === Gen bump: the last block of the grid advances the push generation =======
@@ -437,10 +456,15 @@ __global__ void ReduceScatterPushStart(int myPe, int npes, int logS, size_t chun
                                          T* __restrict__ staging,
                                          uint64_t* __restrict__ barrierCtr,
                                          uint64_t* __restrict__ arrived) {
+  MORI_PT(if (threadIdx.x == 0) {
+    PT().tStart = wall_clock64();
+    PtShape(PushTimingKind::kReduceScatter, npes, 1u << logS, chunkElems * sizeof(T), true);
+  })
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
   const uint32_t stride4G = heapWin->stride4G;
   PostArrival(barrierCtr, pushGen - 1, myPe, npes, stride4G);
   __syncthreads();
+  MORI_PT(if (threadIdx.x == 0) PT().tPost = wall_clock64();)
   StartSdmaScatter<sizeof(T), /*AlwaysGated=*/true>(
       devComm.sdma, npes, logS, pushGen,
       [=](int peer) {
@@ -453,6 +477,7 @@ __global__ void ReduceScatterPushStart(int myPe, int npes, int logS, size_t chun
             reinterpret_cast<uint8_t*>(stagingP), arrivedP,
             BarrierGate(barrierCtr, peer), static_cast<uint32_t>(pushGen - 1)};
       });
+  MORI_PT(if (threadIdx.x == 0) PT().tIssue = wall_clock64();)
 }
 
 // ---------------------------------------------------------------------------
