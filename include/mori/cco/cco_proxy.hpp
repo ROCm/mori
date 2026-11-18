@@ -76,7 +76,12 @@
 // before that FLUSH has completed (remote ack), on every peer, so the source
 // buffers of earlier puts are reusable -- what ccoGda's flush() gives for its
 // context. It waits only for this queue. flush(peer) is flush() (covers every
-// peer).
+// peer). flush(ccoCoopBlock) flushes from wavefront 0 and from every other
+// wavefront whose handle pushed since its last completed flush, each on its
+// own handle's queue, then syncs the block: so after ccoCoopBlock ops (only
+// wavefront 0 pushes) it is one flush, and after wavefronts pushed through
+// handles of their own (e.g. ccoCoopWarp ops on per-wavefront SPSC queues) it
+// covers all of them.
 //
 // Flush counting: the proxy satisfies each queue's FLUSHes in queue order and
 // adds 1 to that queue's flushDone per FLUSH satisfied (it is the only writer).
@@ -322,6 +327,7 @@ struct ccoProxy {
   uint64_t* flushDone;    // this queue's satisfied-FLUSH count (fine-grained device memory)
   uint64_t* flushTicket;  // this queue's flush ticket counter (device memory)
   bool dirty;             // SPSC: pushed since the handle was loaded / saved
+  bool unflushed;         // pushed since the last completed flush (or construction)
   typename DeviceContext::DeviceHandle handle;
 
   // SPSC: queueIndex must be in [0, numSpscQueues); MPSC: taken modulo the pool
@@ -380,15 +386,18 @@ struct ccoProxy {
 
   // Push a FLUSH and wait until every work request this queue posted before it
   // has completed, on every peer: the sources of earlier puts are reusable
-  // (see the file comment). Waits only for this queue. Coop: ccoCoopWarp or
-  // ccoCoopBlock (after lane-masked ops, flush() from all 64 lanes).
+  // (see the file comment). Waits only for this queue; with ccoCoopBlock, also
+  // for the queue of every wavefront whose handle pushed since its last
+  // completed flush. Coop: ccoCoopWarp or ccoCoopBlock (after lane-masked ops,
+  // flush() from all 64 lanes).
   template <typename Coop = ccoCoopWarp, std::enable_if_t<!std::is_integral_v<Coop>, int> = 0>
   __device__ inline void flush(Coop coop = Coop{});
 
   // flush() that never traps: 0 = done, 1 = timed out after timeoutCycles
   // (impl::clock64 cycles; earlier puts may still be in flight, and a later
   // flush covers them), 2 = the DevComm failed. Every thread of the Coop gets
-  // the same value.
+  // the same value (ccoCoopBlock: 2 if any flushing wavefront got 2, else 1 if
+  // any got 1).
   template <typename Coop = ccoCoopWarp, std::enable_if_t<!std::is_integral_v<Coop>, int> = 0>
   __device__ inline int flush(Coop coop, uint64_t timeoutCycles);
 
@@ -452,6 +461,17 @@ struct ccoProxy {
       return impl::proxyLinearTid() < static_cast<unsigned>(__builtin_amdgcn_wavefrontsize());
     } else {
       return true;  // the calling wavefront
+    }
+  }
+
+  // Whether this wavefront flushes for a flush(Coop): wavefront 0 of a block,
+  // plus any other wavefront that pushed since its last completed flush.
+  template <typename Coop>
+  __device__ inline bool flushingWave() const {
+    if constexpr (std::is_same_v<Coop, ccoCoopBlock>) {
+      return issuingWave<Coop>() || unflushed;  // wave-uniform
+    } else {
+      return issuingWave<Coop>();
     }
   }
 
@@ -581,6 +601,7 @@ struct ccoProxy {
   __device__ inline void fenceAndInvoke(bool active, ccoProxyOp op, const Desc& desc) {
     if constexpr (Fence == ccoProxyFenceEachOp) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
     invoke<kLaneMasked>(active, op, desc);
+    unflushed = true;
   }
 };
 
@@ -591,7 +612,8 @@ __device__ inline ccoProxy<Queue, Fence>::ccoProxy(ccoDevComm const& comm_, int 
       ctx(nullptr),
       flushDone(nullptr),
       flushTicket(nullptr),
-      dirty(false) {
+      dirty(false),
+      unflushed(false) {
   switch (comm.gdaConnType) {
     case CCO_GDA_CONNECTION_FULL:
       rank = comm.rank;
@@ -812,7 +834,7 @@ __device__ inline void ccoProxy<Queue, Fence>::flush(Coop coop) {
                 "ccoProxy::flush takes ccoCoopWarp or ccoCoopBlock: after lane-masked put/signal, "
                 "call flush() (ccoCoopWarp) from all 64 lanes");
   coop.sync();
-  if (issuingWave<Coop>()) {
+  if (flushingWave<Coop>()) {
     if (__builtin_expect(flushIssue</*kTimeout=*/false>(0) != 0, 0)) {
 #ifndef NDEBUG  // see the file comment
       if (__lane_id() == 0) {
@@ -822,6 +844,7 @@ __device__ inline void ccoProxy<Queue, Fence>::flush(Coop coop) {
 #endif
       __builtin_trap();  // the DevComm failed
     }
+    unflushed = false;
   }
   coop.sync();
 }
@@ -834,10 +857,13 @@ __device__ inline int ccoProxy<Queue, Fence>::flush(Coop coop, uint64_t timeoutC
                 "call flush() (ccoCoopWarp) from all 64 lanes");
   coop.sync();
   int result = 0;
-  if (issuingWave<Coop>()) result = flushIssue</*kTimeout=*/true>(timeoutCycles);
+  if (flushingWave<Coop>()) {
+    result = flushIssue</*kTimeout=*/true>(timeoutCycles);
+    if (result == 0) unflushed = false;  // else a later flush must still cover it
+  }
   coop.sync();
   if constexpr (std::is_same_v<Coop, ccoCoopBlock>) {
-    // Wavefront 0's result to the whole block.
+    // The flushing wavefronts' worst result to the whole block.
     if (__syncthreads_or(result != 0)) result = __syncthreads_or(result == 2) ? 2 : 1;
   }
   return result;

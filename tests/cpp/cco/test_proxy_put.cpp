@@ -76,6 +76,10 @@
 //                  constructs a ccoProxy on the same queue, puts the other half
 //                  carrying SignalInc and flushes; flushDone must advance by
 //                  exactly 2
+//   block_flush    one block of 4 wavefronts, wavefront w on SPSC queue w:
+//                  ccoCoopWarp puts on per-wavefront handles, one
+//                  flush(ccoCoopBlock) (flushDone +1 on every queue), then the
+//                  block overwrites every source before the signals
 //   small_spsc,    on a second DevComm whose rings hold kSmallCapacity lines:
 //   small_mpsc     each unit sends its chunk as kPieces puts per peer (the
 //                  last carrying the signal), so every ring wraps many times
@@ -729,6 +733,56 @@ __global__ void ProxyHandoffKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow
   }
 }
 
+// One block of kBlockFlushWaves wavefronts; wavefront w is unit w on SPSC
+// queue w. Each puts its chunk to every peer (ccoCoopWarp, own handle), then
+// the block calls flush(ccoCoopBlock) once: every wavefront's queue must be
+// flushed (flushDone +1 each), so the block may overwrite all the sources
+// before each wavefront signals its peers.
+static constexpr int kBlockFlushWaves = 4;
+static_assert(kBlockFlushWaves <= kSpscQueues, "a queue per wavefront");
+
+__global__ void ProxyBlockFlushKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
+                                      uint32_t* sendLocal, size_t chunk, int* err) {
+  const int w = threadIdx.x / 64;
+  const int me = dc.rank;
+  const int n = dc.worldSize;
+  ccoProxy<> proxy{dc, w};
+  auto srcOff = [&](int p, int u) {
+    return (static_cast<size_t>(p) * kBlockFlushWaves + u) * chunk;
+  };
+  const uint64_t before =
+      __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  for (int p = 0; p < n; p++) {
+    if (p == me) continue;
+    proxy.put(p, recvWin, srcOff(me, w), sendWin, srcOff(p, w), chunk, ccoGda_NoSignal{},
+              ccoCoopWarp{});
+  }
+  proxy.flush(ccoCoopBlock{});
+  const uint64_t after =
+      __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  if (__lane_id() == 0 && after != before + 1) {
+    printf("[rank %d] block_flush: wave %d flushDone %llu -> %llu\n", me, w,
+           (unsigned long long)before, (unsigned long long)after);
+    atomicExch(err, 1);
+  }
+  // Every wavefront's puts completed: overwrite all of the block's sources.
+  for (int p = 0; p < n; p++) {
+    if (p == me) continue;
+    for (int u = 0; u < kBlockFlushWaves; u++) {
+      uint32_t* src = sendLocal + srcOff(p, u) / sizeof(uint32_t);
+      for (size_t i = threadIdx.x; i < chunk / sizeof(uint32_t); i += blockDim.x) src[i] = kClobber;
+    }
+  }
+  __threadfence_system();
+  __syncthreads();
+  for (int p = 0; p < n; p++) {
+    if (p != me) proxy.signal(p, ccoGda_SignalInc{Slot(me, w)}, ccoCoopWarp{});
+  }
+  for (int s = 0; s < n; s++) {
+    if (s != me) proxy.waitSignal(Slot(s, w), 1, ccoCoopWarp{});
+  }
+}
+
 // Negative cases: long enough for any proxy answer, short enough not to hang.
 static constexpr uint64_t kNegTimeoutCycles = 40ull * 1000 * 1000 * 1000;
 
@@ -938,6 +992,14 @@ static int RunStressCase(Ctx& c) {
       static_cast<ccoGdaSignal_t>(c.nSlots - 1), c.dErr);
   c.Sync();
   return c.Verify("mpsc_stress", 10, kStressChunk, nUnits);
+}
+
+static int RunBlockFlushCase(Ctx& c) {
+  c.Fresh(c.dc, /*salt=*/40, kChunk, kBlockFlushWaves);
+  ProxyBlockFlushKernel<<<1, kBlockFlushWaves * 64, 0, c.stream>>>(
+      c.dc, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf), kChunk, c.dErr);
+  c.Sync();
+  return c.Verify("block_flush", 40, kChunk, kBlockFlushWaves);
 }
 
 static int RunHandoffCase(Ctx& c) {
@@ -1219,6 +1281,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunStressCase(c);
   fails += RunSignalCase(c);
   fails += RunHandoffCase(c);
+  fails += RunBlockFlushCase(c);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutPieces>(c, "small_spsc", 14, kChunk,
                                                              kSpscQueues, 64, &c.dcSmall);
   // kQpsPerPeer QPs per (thread, peer): each of a thread's 3 queues on its own QP.
