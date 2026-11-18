@@ -59,10 +59,18 @@
 // order -- the same guarantee ccoGda gives within one context. Different queues
 // are unordered, as different ccoGda contexts are.
 //
-// Remote signals are NIC atomic fetch-adds into the same slots ccoGda uses, so
-// readSignal/waitSignal/resetSignal read devComm.ibgda.signalBuf and need a
-// DevComm whose gdaConnectionType resolves to non-NONE (FULL / RAIL /
-// CROSSNODE).
+// Remote signals land in the same slots ccoGda uses, so readSignal /
+// waitSignal / resetSignal read devComm.ibgda.signalBuf and need a DevComm
+// whose gdaConnectionType resolves to non-NONE (FULL / RAIL / CROSSNODE).
+// SignalInc / SignalAdd / WindowSignalAdd are NIC atomic fetch-adds.
+// SignalSet / WindowSignalSet (see ccoGda_SignalSet: one writer per slot,
+// increasing values) are 8-byte inline RDMA writes, for platforms where NIC
+// atomics into GPU memory fail; like any write-then-flag protocol they rely on
+// the NIC and PCIe placing one QP's writes in order (no relaxed ordering on the
+// windows).
+//
+// putValue() writes 1..8 bytes carried in the descriptor (an inline RDMA
+// write, no source buffer), optionally followed by a signal as put().
 //
 // flush() pushes a FLUSH and waits until every work request the queue posted
 // before that FLUSH has completed (remote ack), on every peer, so the source
@@ -86,7 +94,7 @@
 // for a peer that died while this DevComm posted nothing to it.
 // MORI_CCO_PROXY_ABORT_ON_ERROR=1 aborts the process at the first error instead.
 //
-// Fences: by default (ccoProxyFenceEachOp) each put / signal does a
+// Fences: by default (ccoProxyFenceEachOp) each put / putValue / signal does a
 // system-scope release fence before its push, so the data it sends (and every
 // earlier store) is visible to the NIC. ccoProxy<Q, ccoProxyFenceCaller> skips
 // it; the caller then calls fence() after writing data the next puts read or
@@ -94,8 +102,8 @@
 // and flush() end with a system-scope one; after readSignal() or a poll of a
 // caller window, issue it yourself.
 //
-// Calling convention: put / signal / flush are called by the whole Coop group
-// from converged code, and the issuing wavefront (the calling wavefront for
+// Calling convention: put / putValue / signal / flush are called by the whole
+// Coop group from converged code, and the issuing wavefront (the calling wavefront for
 // ccoCoopWarp and ccoCoopLaneMasked, wavefront 0 for ccoCoopBlock) must have
 // all 64 lanes active: a KIWI push is wavefront-collective. A push from a
 // partial wavefront traps (a compare per push), so does a ccoCoopLaneMasked
@@ -110,8 +118,8 @@
 // ccoCoopBlock the other wavefronts' arguments are not read). (ccoGda only
 // reads thread_rank 0's arguments.)
 //
-// ccoCoopLaneMasked{active} (put / signal only; defined below): per-thread
-// ops. Each lane with `active` true issues its own op with its own arguments;
+// ccoCoopLaneMasked{active} (put / putValue / signal only; defined below):
+// per-thread ops. Each lane with `active` true issues its own op with its own arguments;
 // a lane with `active` false issues nothing, and its other arguments are not
 // read. The wavefront hands all of its lanes' ops to KIWI in one lane-masked
 // push, so they enter the queue in lane order (one queue for the wavefront, so
@@ -145,16 +153,18 @@ namespace cco {
  *  Wire format (shared by the device API and the host proxy engine)
  *
  *  Each op is one KIWI invoke callback: the op is the callback id and the
- *  descriptor below its single argument (FLUSH has none). The host engine registers the
- *  callbacks in enum order, so the ids match; the op enum stays open for later
- *  ops (e.g. write-flag signals).
+ *  descriptor below its single argument (FLUSH has none). The host engine
+ *  registers the callbacks in enum order, so the ids match; the op enum stays
+ *  open for later ops.
  * ──────────────────────────────────────────────────────────────────────────── */
 
 enum ccoProxyOp : uint8_t {
-  ccoProxyOpPut = 0,        // ccoProxyPutDesc: RDMA write
-  ccoProxyOpPutSignal = 1,  // ccoProxyPutSignalDesc: RDMA write + atomic add, same QP
-  ccoProxyOpSignal = 2,     // ccoProxySignalDesc: atomic add
-  ccoProxyOpFlush = 3,      // no arguments: flushDone += 1 once satisfied
+  ccoProxyOpPut = 0,             // ccoProxyPutDesc: RDMA write
+  ccoProxyOpPutSignal = 1,       // ccoProxyPutSignalDesc: RDMA write + signal, same QP
+  ccoProxyOpSignal = 2,          // ccoProxySignalDesc: signal
+  ccoProxyOpFlush = 3,           // no arguments: flushDone += 1 once satisfied
+  ccoProxyOpPutValue = 4,        // ccoProxyPutValueDesc: inline RDMA write
+  ccoProxyOpPutValueSignal = 5,  // ccoProxyPutValueSignalDesc: inline RDMA write + signal
   ccoProxyOpCount
 };
 
@@ -169,9 +179,11 @@ struct ccoProxyPutDesc {
 
 struct ccoProxySignalDesc {
   uint64_t raddr;  // remote signal slot (window offset, iova=0)
-  uint64_t value;  // atomic add operand
+  uint64_t value;  // atomic add operand, or the value written (set)
   uint32_t rkey;
   uint32_t peer;  // world rank
+  uint32_t set;   // 0: atomic fetch-add; 1: 8-byte inline write of value
+  uint32_t pad;
 };
 
 struct ccoProxyPutSignalDesc {
@@ -179,9 +191,25 @@ struct ccoProxyPutSignalDesc {
   ccoProxySignalDesc signal;  // signal.peer == put.peer
 };
 
+struct ccoProxyPutValueDesc {
+  uint64_t raddr;  // remote window offset (iova=0)
+  uint64_t value;  // the low `bytes` bytes are written (little endian)
+  uint32_t rkey;
+  uint32_t bytes;  // 1..8
+  uint32_t peer;   // world rank
+  uint32_t pad;
+};
+
+struct ccoProxyPutValueSignalDesc {
+  ccoProxyPutValueDesc put;
+  ccoProxySignalDesc signal;  // signal.peer == put.peer
+};
+
 static_assert(sizeof(ccoProxyPutDesc) == 32, "one queue line");
-static_assert(sizeof(ccoProxySignalDesc) == 24, "one queue line");
-static_assert(sizeof(ccoProxyPutSignalDesc) == 56, "two queue lines");
+static_assert(sizeof(ccoProxySignalDesc) == 32, "one queue line");
+static_assert(sizeof(ccoProxyPutSignalDesc) == 64, "two queue lines");
+static_assert(sizeof(ccoProxyPutValueDesc) == 32, "one queue line");
+static_assert(sizeof(ccoProxyPutValueSignalDesc) == 64, "two queue lines");
 
 // Upper bound on the bytes of one RDMA write a descriptor carries. The engine
 // lowers it to the port's max_msg_sz (ccoProxyContext::maxPutBytes), and put()
@@ -215,16 +243,27 @@ __device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, 
     s.raddr = action.offset;
     s.rkey = reinterpret_cast<ccoWindowDevice*>(action.win)->ibgdaWin.peerRkeys[worldPeer];
     s.value = action.value;
+  } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalSet>) {
+    s.raddr = static_cast<uint64_t>(action.signalId) * sizeof(uint64_t);
+    s.rkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
+    s.value = action.value;
+    s.set = 1;
+  } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalSet>) {
+    s.raddr = action.offset;
+    s.rkey = reinterpret_cast<ccoWindowDevice*>(action.win)->ibgdaWin.peerRkeys[worldPeer];
+    s.value = action.value;
+    s.set = 1;
   } else {
     static_assert(std::is_same_v<RemoteAction, ccoGda_NoSignal>,
-                  "ccoProxy supports ccoGda_NoSignal / SignalInc / SignalAdd / WindowSignalAdd");
+                  "ccoProxy supports ccoGda_NoSignal / SignalInc / SignalAdd / WindowSignalAdd / "
+                  "SignalSet / WindowSignalSet");
   }
   return s;
 }
 
 }  // namespace impl
 
-// ccoProxy's per-thread Coop for put / signal: all 64 lanes of the wavefront
+// ccoProxy's per-thread Coop for put / putValue / signal: all 64 lanes of the wavefront
 // call from converged code, and each lane with `active` true issues its own op
 // with its own arguments (see the file comment), e.g.
 //   proxy.put(peer, dstWin, dstOff, srcWin, srcOff, bytes, ccoGda_NoSignal{},
@@ -239,13 +278,13 @@ struct ccoCoopLaneMasked {
   __device__ void sync() {}
 };
 
-// When put / signal make the caller's earlier stores (the data a put sends, or
+// When put / putValue / signal make the caller's earlier stores (the data a put sends, or
 // that a signal publishes) visible to the NIC: the handle's second template
 // argument, like ccoGdaDoorbellMode, so it is fixed for every op on the handle.
 enum ccoProxyFenceMode : uint32_t {
-  // Default: every put / signal does a system-scope release fence before its push.
+  // Default: every op does a system-scope release fence before its push.
   ccoProxyFenceEachOp = 0,
-  // put / signal push without a fence. Contract, unchecked: call fence() after
+  // Ops push without a fence. Contract, unchecked: call fence() after
   // writing data that the next puts read or signals publish; puts of data
   // already fenced (e.g. resending an unchanged buffer) need none.
   ccoProxyFenceCaller = 1,
@@ -304,7 +343,7 @@ struct ccoProxy {
   }
 
   // RDMA write of [srcWin+srcOffset, +bytes) to peer's [dstWin+dstOffset, ...),
-  // optionally followed (same QP, so after the data) by a remote atomic signal.
+  // optionally followed (same QP, so after the data) by a remote signal.
   // Template parameters follow ccoGda::put; ThreadMode has no effect. Coop:
   // ccoCoopWarp, ccoCoopBlock, or ccoCoopLaneMasked (per-thread puts; see the
   // file comment).
@@ -315,7 +354,16 @@ struct ccoProxy {
                              size_t srcOffset, size_t bytes, RemoteAction remoteAction = {},
                              Coop coop = Coop{});
 
-  // Remote atomic signal only. Coop as in put().
+  // Inline RDMA write of `value` (sizeof(T) <= 8 bytes) to peer's
+  // [dstWin+dstOffset, ...), optionally followed by a remote signal, as put().
+  // Template parameters follow ccoGda::putValue; Coop as in put().
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
+            ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename T,
+            typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopWarp>
+  __device__ inline void putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
+                                  RemoteAction remoteAction = {}, Coop coop = Coop{});
+
+  // Remote signal only. Coop as in put().
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename RemoteAction = ccoGda_SignalInc,
             typename Coop = ccoCoopWarp>
   __device__ inline void signal(int peer, RemoteAction remoteAction, Coop coop = Coop{});
@@ -357,7 +405,7 @@ struct ccoProxy {
     coop.sync();
   }
 
-  // Local signal slots: identical to ccoGda (remote NIC atomics land there).
+  // Local signal slots: identical to ccoGda (remote signals land there).
   __device__ inline uint64_t readSignal(ccoGdaSignal_t signalId, int bits = 64) {
     return impl::readSignalImpl<CCO_GDA_BUILD_PROVIDER>(comm.ibgda.signalBuf,
                                                         comm.ibgda.signalShadows, signalId, bits);
@@ -613,6 +661,40 @@ __device__ inline void ccoProxy<Queue, Fence>::put(int peer, ccoWindow_t dstWin,
       ds.put = d;
       if (on) ds.signal = impl::proxyResolveSignal(comm, worldPeer, remoteAction);
       fenceAndInvoke<kLaneMasked>(on, ccoProxyOpPutSignal, ds);
+    }
+  }
+  coop.sync();
+}
+
+template <typename Queue, ccoProxyFenceMode Fence>
+template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename T, typename RemoteAction,
+          typename Coop>
+__device__ inline void ccoProxy<Queue, Fence>::putValue(int peer, ccoWindow_t dstWin,
+                                                        size_t dstOffset, T value,
+                                                        RemoteAction remoteAction, Coop coop) {
+  static_assert(sizeof(T) >= 1 && sizeof(T) <= 8 && std::is_trivially_copyable_v<T>,
+                "putValue only supports trivially copyable types of 1..8 bytes");
+  constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
+  coop.sync();
+  const bool on = laneActive(coop);  // constant true unless kLaneMasked
+  if (issuingWave<Coop>()) {
+    int worldPeer = 0;
+    ccoProxyPutValueDesc d{};
+    if (on) {  // an inactive lane's arguments are not read
+      worldPeer = resolveWorldPeer<TeamMode>(peer);
+      d.raddr = dstOffset;
+      d.rkey = reinterpret_cast<ccoWindowDevice*>(dstWin)->ibgdaWin.peerRkeys[worldPeer];
+      __builtin_memcpy(&d.value, &value, sizeof(T));
+      d.bytes = sizeof(T);
+      d.peer = static_cast<uint32_t>(worldPeer);
+    }
+    if constexpr (std::is_same_v<RemoteAction, ccoGda_NoSignal>) {
+      fenceAndInvoke<kLaneMasked>(on, ccoProxyOpPutValue, d);
+    } else {
+      ccoProxyPutValueSignalDesc ds{};
+      ds.put = d;
+      if (on) ds.signal = impl::proxyResolveSignal(comm, worldPeer, remoteAction);
+      fenceAndInvoke<kLaneMasked>(on, ccoProxyOpPutValueSignal, ds);
     }
   }
   coop.sync();

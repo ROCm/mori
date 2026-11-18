@@ -153,6 +153,27 @@ struct ccoGda_WindowSignalAdd {
       : win(w), offset(off), value(val) {}
 };
 
+// Atomic-free signal (ccoProxy only; ccoGda rejects it at compile time): an
+// 8-byte RDMA write of `value` into the signal slot, after the data on the same
+// QP. Contract: one writer per slot, values only increase, and no SignalInc /
+// SignalAdd to the same slot. The slot then reads the last value set (minus
+// what waitSignal consumed): on a reset slot, waitSignal(id, v) waits for v.
+struct ccoGda_SignalSet {
+  ccoGdaSignal_t signalId;
+  uint64_t value;
+  __device__ inline ccoGda_SignalSet(ccoGdaSignal_t id, uint64_t val) : signalId(id), value(val) {}
+};
+
+// ccoGda_SignalSet into a caller window at a window-relative offset (as
+// ccoGda_WindowSignalAdd); the caller polls it.
+struct ccoGda_WindowSignalSet {
+  ccoWindow_t win;
+  size_t offset;
+  uint64_t value;
+  __device__ inline ccoGda_WindowSignalSet(ccoWindow_t w, size_t off, uint64_t val)
+      : win(w), offset(off), value(val) {}
+};
+
 struct ccoGda_CounterInc {
   ccoGdaCounter_t counterId;
   __device__ inline ccoGda_CounterInc(ccoGdaCounter_t id) : counterId(id) {}
@@ -321,6 +342,27 @@ __device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda, ccoGdaBar
 // dedicated `impl` namespace so the public surface stays clean and these
 // helpers don't leak into ADL or autocomplete.
 namespace impl {
+
+// RemoteActions ccoGda's put / putValue / signal resolve (any other type would
+// post an atomic to address 0).
+template <typename RemoteAction>
+inline constexpr bool kGdaRemoteAction = std::is_same_v<RemoteAction, ccoGda_NoSignal> ||
+                                         std::is_same_v<RemoteAction, ccoGda_SignalInc> ||
+                                         std::is_same_v<RemoteAction, ccoGda_SignalAdd> ||
+                                         std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>;
+template <typename RemoteAction>
+inline constexpr bool kSignalSet = std::is_same_v<RemoteAction, ccoGda_SignalSet> ||
+                                   std::is_same_v<RemoteAction, ccoGda_WindowSignalSet>;
+
+template <typename RemoteAction>
+__device__ inline void checkGdaRemoteAction() {
+  static_assert(!kSignalSet<RemoteAction>,
+                "ccoGda does not take ccoGda_SignalSet / ccoGda_WindowSignalSet (ccoProxy only): "
+                "use ccoGda_SignalAdd / ccoGda_WindowSignalAdd");
+  static_assert(kSignalSet<RemoteAction> || kGdaRemoteAction<RemoteAction>,
+                "ccoGda RemoteAction must be ccoGda_NoSignal, ccoGda_SignalInc, ccoGda_SignalAdd "
+                "or ccoGda_WindowSignalAdd");
+}
 
 // Poll the CQ until wq.doneIdx reaches targetIdx. Collapsed-CQ model:
 // reconstruct the completed WQE count directly from the CQE counter (no
@@ -1333,6 +1375,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::put(int peer, ccoWindow_t dst
                                                        size_t dstOffset, ccoWindow_t srcWin,
                                                        size_t srcOffset, size_t bytes,
                                                        RemoteAction remoteAction, Coop coop) {
+  impl::checkGdaRemoteAction<RemoteAction>();
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1413,6 +1456,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::putValue(int peer, ccoWindow_
                                                             size_t dstOffset, T value,
                                                             RemoteAction remoteAction, Coop coop) {
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
+  impl::checkGdaRemoteAction<RemoteAction>();
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1535,6 +1579,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::signal(int peer, RemoteAction
                 "signal() rings on its own, which a CallerOrdered QP does not allow: use put / "
                 "putValue with a RemoteAction signal, or flush this handle first and then "
                 "signal through an Immediate handle");
+  impl::checkGdaRemoteAction<RemoteAction>();
   coop.sync();
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);

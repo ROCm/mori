@@ -81,6 +81,14 @@
 //   qps_put_sig,   put_sig_warp, flush_reuse and mpsc_flush on a DevComm with
 //   qps_flush,     proxyQpsPerPeer = kQpsPerPeer: each proxy thread owns 3
 //   qps_mpsc_flush queues (2 SPSC + 1 MPSC), each bound to its own QP per peer
+//   put_value,     putValue of 1, 2, 4 and 8 bytes to every peer, the second
+//   mpsc_put_value half carrying SignalInc; the receiver checks each value
+//                  and that the bytes past it are untouched (MPSC: 4 blocks
+//                  per queue)
+//   set_put,       the chunk as kSetRounds pieces, piece r followed by a
+//   set_signal,    SignalSet of r + 1 (carried by the put, a separate
+//   set_window,    signal(), or WindowSignalSet into the flag window); the
+//   mpsc_set_put   receiver waits for each value and checks that piece
 //   split_warp     put_sig_warp with the put split size lowered to 4 KiB
 //                  (16 pieces per put)
 //   thr_*          ccoCoopLaneMasked, one wavefront per unit: lane L puts its own
@@ -428,6 +436,156 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
   proxy.flush();
 }
 
+// putValue: unit u sends kValueSlots values to every peer, slot k of
+// ((me * nUnits + u) * kValueSlots + k) * 8 holding ValueBytes(k) bytes; slots
+// below kValueSlots / 2 carry no signal, the others SignalInc{Slot(me, u)}.
+// After the signals, each receiver checks every slot of every sender: its low
+// bytes hold the value, the rest keep the 0xff fill.
+static constexpr int kValueSlots = 8;
+
+__host__ __device__ inline int ValueBytes(int k) { return 1 << (k % 4); }  // 1, 2, 4, 8
+
+__host__ __device__ inline uint64_t ValueOf(uint32_t salt, int src, int dst, int u, int k) {
+  return (static_cast<uint64_t>(Pattern(salt, src, dst, u, k)) << 32) |
+         Pattern(salt, src, dst, u, k + kValueSlots);
+}
+
+template <typename Q, typename RemoteAction>
+__device__ inline void PutValueSized(ccoProxy<Q>& proxy, int peer, ccoWindow_t win, size_t off,
+                                     uint64_t v, int bytes, RemoteAction ra) {
+  switch (bytes) {
+    case 1:
+      proxy.putValue(peer, win, off, static_cast<uint8_t>(v), ra, ccoCoopWarp{});
+      break;
+    case 2:
+      proxy.putValue(peer, win, off, static_cast<uint16_t>(v), ra, ccoCoopWarp{});
+      break;
+    case 4:
+      proxy.putValue(peer, win, off, static_cast<uint32_t>(v), ra, ccoCoopWarp{});
+      break;
+    default:
+      proxy.putValue(peer, win, off, v, ra, ccoCoopWarp{});
+      break;
+  }
+}
+
+template <typename Q>
+__global__ void ProxyValueKernel(ccoDevComm dc, ccoWindow_t recvWin, const uint64_t* recvLocal,
+                                 uint32_t salt, int nUnits, int* err) {
+  const int u = blockIdx.x;
+  const int me = dc.rank;
+  const int n = dc.worldSize;
+  ccoProxy<Q> proxy{dc, u};
+  auto slotOff = [&](int src, int k) {
+    return ((static_cast<size_t>(src) * nUnits + u) * kValueSlots + k) * sizeof(uint64_t);
+  };
+  for (int p = 0; p < n; p++) {
+    if (p == me) continue;
+    for (int k = 0; k < kValueSlots; k++) {
+      const uint64_t v = ValueOf(salt, me, p, u, k);
+      if (k < kValueSlots / 2) {
+        PutValueSized(proxy, p, recvWin, slotOff(me, k), v, ValueBytes(k), ccoGda_NoSignal{});
+      } else {
+        PutValueSized(proxy, p, recvWin, slotOff(me, k), v, ValueBytes(k),
+                      ccoGda_SignalInc{Slot(me, u)});
+      }
+    }
+  }
+  for (int s = 0; s < n; s++) {
+    if (s == me) continue;
+    proxy.waitSignal(Slot(s, u), kValueSlots / 2, ccoCoopWarp{});
+    for (int k = 0; k < kValueSlots && __lane_id() == 0; k++) {
+      const uint64_t got = __hip_atomic_load(recvLocal + slotOff(s, k) / sizeof(uint64_t),
+                                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      const uint64_t mask =
+          ValueBytes(k) == 8 ? ~uint64_t{0} : (uint64_t{1} << (8 * ValueBytes(k))) - 1;
+      const uint64_t want = (ValueOf(salt, s, me, u, k) & mask) | ~mask;
+      if (got != want) {
+        printf("[rank %d] putValue: src=%d unit=%d slot %d (%d B): got %016llx want %016llx\n", me,
+               s, u, k, ValueBytes(k), (unsigned long long)got, (unsigned long long)want);
+        atomicExch(err, 1);
+      }
+    }
+  }
+}
+
+// SignalSet: unit u sends its chunk to every peer as kSetRounds pieces, piece
+// r followed on the same queue by a set of Slot(me, u) to r + 1: carried by the
+// put (kSetSlot), a separate signal() (kSetSignal), or a WindowSignalSet into
+// the flag window (kSetWindow). The receiver waits for each value in turn and
+// checks that piece right away; at the end the slot holds exactly kSetRounds.
+static constexpr int kSetRounds = 8;
+
+enum SetMode { kSetSlot, kSetSignal, kSetWindow };
+
+template <typename Q, int Mode>
+__global__ void ProxySetKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
+                               ccoWindow_t flagWin, const uint32_t* recvLocal,
+                               const uint64_t* flagLocal, uint32_t salt, size_t chunk, int nUnits,
+                               int* err) {
+  const int u = blockIdx.x;
+  const int lane = __lane_id();
+  const int me = dc.rank;
+  const int n = dc.worldSize;
+  const size_t piece = chunk / kSetRounds;
+  ccoProxy<Q> proxy{dc, u};
+  for (int r = 0; r < kSetRounds; r++) {
+    const uint64_t value = r + 1;
+    for (int p = 0; p < n; p++) {
+      if (p == me) continue;
+      const size_t src = (static_cast<size_t>(p) * nUnits + u) * chunk + r * piece;
+      const size_t dst = (static_cast<size_t>(me) * nUnits + u) * chunk + r * piece;
+      if constexpr (Mode == kSetSlot) {
+        proxy.put(p, recvWin, dst, sendWin, src, piece, ccoGda_SignalSet{Slot(me, u), value},
+                  ccoCoopWarp{});
+      } else if constexpr (Mode == kSetSignal) {
+        proxy.put(p, recvWin, dst, sendWin, src, piece, ccoGda_NoSignal{}, ccoCoopWarp{});
+        proxy.signal(p, ccoGda_SignalSet{Slot(me, u), value}, ccoCoopWarp{});
+      } else {
+        proxy.put(p, recvWin, dst, sendWin, src, piece,
+                  ccoGda_WindowSignalSet{flagWin, Slot(me, u) * sizeof(uint64_t), value},
+                  ccoCoopWarp{});
+      }
+    }
+  }
+  for (int s = 0; s < n; s++) {
+    if (s == me) continue;
+    for (int r = 0; r < kSetRounds; r++) {
+      if constexpr (Mode == kSetWindow) {
+        if (lane == 0) {
+          while (__hip_atomic_load(&flagLocal[Slot(s, u)], __ATOMIC_RELAXED,
+                                   __HIP_MEMORY_SCOPE_SYSTEM) < static_cast<uint64_t>(r + 1)) {
+          }
+        }
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+      } else {
+        proxy.waitSignal(Slot(s, u), 1, ccoCoopWarp{});  // consumed r so far: the slot is >= r + 1
+      }
+      const size_t w0 = ((static_cast<size_t>(s) * nUnits + u) * chunk + r * piece) / 4;
+      for (size_t i = lane; i < piece / 4; i += 64) {
+        const size_t word = r * piece / 4 + i;
+        const uint32_t got = recvLocal[w0 + i];
+        if (got != Pattern(salt, s, me, u, word)) {
+          printf("[rank %d] signal set: src=%d unit=%d round %d word %zu: got %08x\n", me, s, u, r,
+                 word, got);
+          atomicExch(err, 1);
+          break;
+        }
+      }
+    }
+    const uint64_t left = Mode == kSetWindow
+                              ? __hip_atomic_load(&flagLocal[Slot(s, u)], __ATOMIC_RELAXED,
+                                                  __HIP_MEMORY_SCOPE_SYSTEM) -
+                                    kSetRounds
+                              : proxy.readSignal(Slot(s, u));
+    if (lane == 0 && left != 0) {
+      printf("[rank %d] signal set: src=%d unit=%d slot is %llu past the last value\n", me, s, u,
+             (unsigned long long)left);
+      atomicExch(err, 1);
+    }
+  }
+}
+
 // Every signal slot must read 0: every signal sent was consumed by a wait.
 __global__ void ProxyCheckSignalsKernel(ccoDevComm dc, int nSlots, int* err) {
   ccoProxy<> proxy{dc, 0};  // no push: reads the slots' signal state only
@@ -746,6 +904,25 @@ static int RunThreadCase(Ctx& c, const char* name, uint32_t salt, int nUnits,
   return c.Verify(name, salt, kChunk, nUnits * rounds, /*laneSlices=*/true);
 }
 
+template <typename Q>
+static int RunValueCase(Ctx& c, const char* name, uint32_t salt, int nUnits) {
+  c.Fresh(c.dc, salt, kChunk, nUnits);
+  ProxyValueKernel<Q><<<nUnits, 64, 0, c.stream>>>(
+      c.dc, c.recvWin, static_cast<const uint64_t*>(c.recvBuf), salt, nUnits, c.dErr);
+  c.Sync();
+  return c.Harvest(name, 0);
+}
+
+template <typename Q, int Mode>
+static int RunSetCase(Ctx& c, const char* name, uint32_t salt, int nUnits) {
+  c.Fresh(c.dc, salt, kChunk, nUnits);
+  ProxySetKernel<Q, Mode><<<nUnits, 64, 0, c.stream>>>(
+      c.dc, c.sendWin, c.recvWin, c.flagWin, static_cast<const uint32_t*>(c.recvBuf),
+      static_cast<const uint64_t*>(c.flagBuf), salt, kChunk, nUnits, c.dErr);
+  c.Sync();
+  return c.Verify(name, salt, kChunk, nUnits);
+}
+
 static int RunStressCase(Ctx& c) {
   const int nWaves = kStressBlocks * kStressWarps;
   const int nUnits = nWaves * kStressRounds;
@@ -1021,6 +1198,13 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
                                                          true);
   fails +=
       RunThreadCase<MPSCD2HQueue, kThreadPutSignal>(c, "thr_small_mpsc", 25, kMaxUnits, 256, true);
+  // putValue (1/2/4/8 bytes, with and without SignalInc) and SignalSet.
+  fails += RunValueCase<SPSCD2HQueue>(c, "put_value", 32, kSpscQueues);
+  fails += RunValueCase<MPSCD2HQueue>(c, "mpsc_put_value", 33, kMaxUnits);
+  fails += RunSetCase<SPSCD2HQueue, kSetSlot>(c, "set_put", 34, kSpscQueues);
+  fails += RunSetCase<SPSCD2HQueue, kSetSignal>(c, "set_signal", 35, kSpscQueues);
+  fails += RunSetCase<SPSCD2HQueue, kSetWindow>(c, "set_window", 36, kSpscQueues);
+  fails += RunSetCase<MPSCD2HQueue, kSetSlot>(c, "mpsc_set_put", 37, kMaxUnits);
   fails += RunStressCase(c);
   fails += RunSignalCase(c);
   fails += RunHandoffCase(c);

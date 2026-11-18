@@ -101,6 +101,7 @@ constexpr uint32_t kSqDepth = 512;  // WRs per QP
 constexpr int kPopBatch = 64;       // callbacks run per queue per pass
 constexpr int kCqPollBatch = 32;
 constexpr size_t kScratchStride = 64;  // per-thread atomic fetch-result slot
+constexpr uint32_t kInlineBytes = 8;   // putValue and SignalSet write inline
 
 // First error of an engine, shared by its workers.
 struct ProxyErrorState {
@@ -131,6 +132,10 @@ const char* OpName(const ccoDevCommError& e) {
         return "signal";
       case ccoProxyOpFlush:
         return "flush";
+      case ccoProxyOpPutValue:
+        return "put value";
+      case ccoProxyOpPutValueSignal:
+        return "put value+signal";
       default:
         return nullptr;
     }
@@ -353,6 +358,9 @@ struct ProxyQp {
   // seqs are assigned when built: postedSeq + index + 1.
   std::vector<ibv_send_wr> wrs;
   std::vector<ibv_sge> sges;
+  // Inline payload of wrs[i] (IBV_SEND_INLINE); copied by ibv_post_send, so it
+  // only lives until the chain is posted.
+  std::vector<uint64_t> inl;
   // [kSqDepth] by seq % kSqDepth; Reserve keeps every tracked seq in one window.
   std::vector<WrShadow> shadow;
 };
@@ -388,6 +396,7 @@ class ProxyWorker {
         qp.peer = peer;
         qp.wrs.reserve(kSqDepth);
         qp.sges.reserve(kSqDepth);
+        qp.inl.reserve(kSqDepth);
         qp.shadow.resize(kSqDepth);
       }
     }
@@ -421,6 +430,9 @@ class ProxyWorker {
     const uint8_t flushId =
         ctx.register_callback(std::function<void()>([] { current_->OnFlush(); }));
     if (flushId != ccoProxyOpFlush) throw std::runtime_error("ccoProxy callback id mismatch");
+    Register(ctx, ccoProxyOpPutValue, &ProxyWorker::OnPutValue);
+    Register(ctx, ccoProxyOpPutValueSignal, &ProxyWorker::OnPutValueSignal);
+    static_assert(ccoProxyOpCount == 6, "register every ccoProxyOp");
   }
 
   std::vector<ProxyQp> qps;  // [worldSize * qpsPerPeer] by (peer, slot); active for masked peers
@@ -539,6 +551,7 @@ class ProxyWorker {
     for (int i : activeQps_) {
       qps[i].wrs.clear();
       qps[i].sges.clear();
+      qps[i].inl.clear();
     }
     for (OwnedQueue* oq : queues) oq->pending.clear();
     Poison();
@@ -568,7 +581,19 @@ class ProxyWorker {
     return nullptr;
   }
 
-  // NIC atomics need an 8-byte aligned target; raises BAD_REQUEST otherwise.
+  // putValue writes 1..8 bytes; raises BAD_REQUEST otherwise.
+  bool ValueSized(const ccoProxyPutValueDesc& d, ccoProxyOp op) {
+    if (d.bytes >= 1 && d.bytes <= kInlineBytes) return true;
+    ccoDevCommError e =
+        MakeError(CCO_PROXY_ERR_BAD_REQUEST, static_cast<int>(d.peer), cur_->index, op);
+    e.raddr = d.raddr;
+    e.rkey = d.rkey;
+    e.len = d.bytes;
+    Raise(e, "putValue size not in 1..8 bytes");
+    return false;
+  }
+
+  // Signal slots (atomic or set) are 8-byte aligned; raises BAD_REQUEST otherwise.
   bool SignalAligned(const ccoProxySignalDesc& d, ccoProxyOp op) {
     if ((d.raddr & 7) == 0) return true;
     ccoDevCommError e =
@@ -595,14 +620,32 @@ class ProxyWorker {
       return;
     }
     AddWrite(*qp, d.put);
-    cur_->lastSeq[d.put.peer] = AddAtomic(*qp, d.signal);
+    cur_->lastSeq[d.put.peer] = AddSignal(*qp, d.signal);
   }
 
   void OnSignal(const ccoProxySignalDesc& d) {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.peer, ccoProxyOpSignal);
     if (qp == nullptr || !SignalAligned(d, ccoProxyOpSignal) || !Reserve(*qp, 1)) return;
-    cur_->lastSeq[d.peer] = AddAtomic(*qp, d);
+    cur_->lastSeq[d.peer] = AddSignal(*qp, d);
+  }
+
+  void OnPutValue(const ccoProxyPutValueDesc& d) {
+    if (failed_) return;
+    ProxyQp* qp = PeerQp(d.peer, ccoProxyOpPutValue);
+    if (qp == nullptr || !ValueSized(d, ccoProxyOpPutValue) || !Reserve(*qp, 1)) return;
+    cur_->lastSeq[d.peer] = AddInline(*qp, d.raddr, d.rkey, d.value, d.bytes);
+  }
+
+  void OnPutValueSignal(const ccoProxyPutValueSignalDesc& d) {
+    if (failed_) return;
+    ProxyQp* qp = PeerQp(d.put.peer, ccoProxyOpPutValueSignal);
+    if (qp == nullptr || !ValueSized(d.put, ccoProxyOpPutValueSignal) ||
+        !SignalAligned(d.signal, ccoProxyOpPutValueSignal) || !Reserve(*qp, 2)) {
+      return;
+    }
+    AddInline(*qp, d.put.raddr, d.put.rkey, d.put.value, d.put.bytes);
+    cur_->lastSeq[d.put.peer] = AddSignal(*qp, d.signal);
   }
 
   void OnFlush() {
@@ -665,10 +708,12 @@ class ProxyWorker {
     return true;
   }
 
-  // Append a WR to qp's pending chain; returns its sequence number.
-  uint64_t Append(ProxyQp& qp, const ibv_send_wr& wr, const ibv_sge& sge) {
+  // Append a WR to qp's pending chain; returns its sequence number. `inl` is
+  // the payload of an IBV_SEND_INLINE WR.
+  uint64_t Append(ProxyQp& qp, const ibv_send_wr& wr, const ibv_sge& sge, uint64_t inl = 0) {
     qp.wrs.push_back(wr);
     qp.sges.push_back(sge);
+    qp.inl.push_back(inl);
     return qp.postedSeq + qp.wrs.size();
   }
 
@@ -702,6 +747,27 @@ class ProxyWorker {
     return seq;
   }
 
+  // RDMA write of the low `bytes` bytes of `value`, inline (no local MR).
+  uint64_t AddInline(ProxyQp& qp, uint64_t raddr, uint32_t rkey, uint64_t value, uint32_t bytes) {
+    ibv_send_wr wr{};
+    ibv_sge sge{};
+    sge.length = bytes;  // addr: the chain's inline slot, set in PostChain
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.num_sge = 1;
+    wr.send_flags = IBV_SEND_INLINE;
+    wr.wr.rdma.remote_addr = raddr;
+    wr.wr.rdma.rkey = rkey;
+    const uint64_t seq = Append(qp, wr, sge, value);
+    qp.shadow[seq % kSqDepth] = WrShadow{raddr, rkey, bytes, cur_->index, IBV_WR_RDMA_WRITE};
+    return seq;
+  }
+
+  // A signal: an 8-byte inline write (set) or an atomic fetch-add.
+  uint64_t AddSignal(ProxyQp& qp, const ccoProxySignalDesc& d) {
+    if (d.set) return AddInline(qp, d.raddr, d.rkey, d.value, sizeof(uint64_t));
+    return AddAtomic(qp, d);
+  }
+
   uint64_t AddAtomic(ProxyQp& qp, const ccoProxySignalDesc& d) {
     ibv_send_wr wr{};
     ibv_sge sge{};
@@ -726,9 +792,12 @@ class ProxyWorker {
     for (size_t i = 0; i < n; i++) {
       ibv_send_wr& wr = qp.wrs[i];
       wr.wr_id = qp.postedSeq + i + 1;
+      if (wr.send_flags & IBV_SEND_INLINE) {
+        qp.sges[i].addr = reinterpret_cast<uintptr_t>(&qp.inl[i]);
+      }
       wr.sg_list = wr.num_sge ? &qp.sges[i] : nullptr;
       wr.next = (i + 1 < n) ? &qp.wrs[i + 1] : nullptr;
-      wr.send_flags = IBV_SEND_SIGNALED;
+      wr.send_flags |= IBV_SEND_SIGNALED;
     }
     ibv_send_wr* bad = nullptr;
     const int ret = ibv_post_send(qp.ep.ibvHandle.qp, qp.wrs.data(), &bad);
@@ -743,6 +812,7 @@ class ProxyWorker {
     qp.postedSeq += n;
     qp.wrs.clear();
     qp.sges.clear();
+    qp.inl.clear();
   }
 
   // Returns true if any CQE was polled. An error CQE raises COMPLETION.
@@ -829,6 +899,19 @@ class ccoProxyEngine {
 
 namespace {
 
+// Throws unless qp accepts kInlineBytes of inline data (putValue, SignalSet).
+void CheckInlineCap(ibv_qp* qp) {
+  ibv_qp_attr attr{};
+  ibv_qp_init_attr init{};
+  const int ret = ibv_query_qp(qp, &attr, IBV_QP_CAP, &init);
+  if (ret != 0) throw std::runtime_error(std::string("ibv_query_qp failed: ") + strerror(ret));
+  if (attr.cap.max_inline_data < kInlineBytes) {
+    throw std::runtime_error("proxy QP max_inline_data " +
+                             std::to_string(attr.cap.max_inline_data) + " < " +
+                             std::to_string(kInlineBytes) + " (putValue / SignalSet)");
+  }
+}
+
 // Per-rank setup result, Allgather'd before the QP exchange.
 struct ProxyCreateInfo {
   int32_t ok;  // this rank's local setup succeeded
@@ -906,7 +989,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     epConfig.maxMsgsNum = kSqDepth;
     epConfig.maxCqeNum = kSqDepth;
     epConfig.maxRecvWr = 1;
-    epConfig.maxInlineData = 0;
+    epConfig.maxInlineData = kInlineBytes;  // putValue, SignalSet
     epConfig.onGpu = false;
     epConfig.withCompChannel = false;
     epConfig.enableSrq = false;
@@ -1035,6 +1118,11 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       for (int i = 0; i < numThreads * qpsPerPeer; i++) {
         const size_t h = static_cast<size_t>(peer) * numThreads * qpsPerPeer + i;
         engine->ibv->ConnectEndpoint(local[h], remote[h], i);
+      }
+      for (int t = 0; t < numThreads; t++) {
+        for (int slot = 0; slot < qpsPerPeer; slot++) {
+          CheckInlineCap(engine->workers[t]->Qp(peer, slot).ep.ibvHandle.qp);
+        }
       }
     }
 
