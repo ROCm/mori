@@ -2004,7 +2004,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       comm->proxyEngines.push_back(engine);
     }
     // SignalSet and a putValue flag rely on one QP's writes landing in
-    // order, which relaxed-ordering window MRs do not promise.
+    // order, which relaxed-ordering window MRs do not promise. Asks the MR
+    // registration itself, not the env: a build may ignore the env.
     static std::once_flag relaxedWarned;
     if (engine != nullptr && application::MaybeAddRelaxedOrderingFlag(0) != 0) {
       std::call_once(relaxedWarned, [] {
