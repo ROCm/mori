@@ -33,6 +33,34 @@
 
 namespace mori::cco::benchmark {
 
+namespace {
+
+// Launch without MPI (one process per node from any launcher): MORI_BENCH_UID_FILE
+// names a ccoUniqueId file minted beforehand (e.g. `test_gda_put --gen-uid`), and
+// MORI_BENCH_RANK / MORI_BENCH_WORLD / MORI_BENCH_LOCAL_RANK place this process.
+const char* BenchUidFile() {
+  const char* f = std::getenv("MORI_BENCH_UID_FILE");
+  return (f != nullptr && f[0] != '\0') ? f : nullptr;
+}
+
+int BenchEnvInt(const char* name) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') {
+    std::fprintf(stderr, "%s must be set with MORI_BENCH_UID_FILE\n", name);
+    std::exit(1);
+  }
+  return std::atoi(v);
+}
+
+void FinalizeMpi() {
+  int initialized = 0, finalized = 0;
+  MPI_Initialized(&initialized);
+  MPI_Finalized(&finalized);
+  if (initialized && !finalized) MPI_Finalize();
+}
+
+}  // namespace
+
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [options]\n"
@@ -72,7 +100,9 @@ void PrintUsage(const char* program) {
                "  -q kind        proxy, put_bw: spsc (default; one queue per block, or\n"
                "                 per wavefront with -s warp|thread) | mpsc (one queue per\n"
                "                 block)\n"
-               "  -h             this help\n",
+               "  -h             this help\n"
+               "Launch: mpirun, or one process per rank with MORI_BENCH_UID_FILE (a\n"
+               "ccoUniqueId file) + MORI_BENCH_RANK / MORI_BENCH_WORLD / MORI_BENCH_LOCAL_RANK\n",
                program != nullptr ? program : "program");
 }
 
@@ -291,8 +321,13 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
   ctx->send_buf = nullptr;
   ctx->recv_buf = nullptr;
 
-  MPI_Init(&argc, &argv);
-  MPI_Comm_rank(MPI_COMM_WORLD, &ctx->world_rank);
+  const char* uidFile = BenchUidFile();
+  if (uidFile != nullptr) {
+    ctx->world_rank = BenchEnvInt("MORI_BENCH_RANK");
+  } else {
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &ctx->world_rank);
+  }
 
   PerfArgs& args = ctx->args;
   int rc = ParseArgs(argc, argv, &args);
@@ -300,7 +335,7 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     if (ctx->world_rank == 0) {
       PrintUsage(argv[0]);
     }
-    MPI_Finalize();
+    FinalizeMpi();
     return rc;  // 2 = help, 1 = bad args; caller must NOT call PerfFinalize
   }
 
@@ -311,7 +346,7 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
                    "Invalid arguments (need iters >= 1, nblocks/threads >= 1, step >= 2, "
                    "agg_depth >= 1, proxy threads >= 1).\n");
     }
-    MPI_Finalize();
+    FinalizeMpi();
     return 1;
   }
   if (args.min_size % sizeof(double) != 0) {
@@ -357,8 +392,12 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
 
   // Local communicator → local rank → device binding. CCO pins the device at
   // ccoCommCreate, so hipSetDevice must happen first.
-  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &ctx->local_comm);
-  MPI_Comm_rank(ctx->local_comm, &ctx->local_rank);
+  if (uidFile != nullptr) {
+    ctx->local_rank = BenchEnvInt("MORI_BENCH_LOCAL_RANK");
+  } else {
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &ctx->local_comm);
+    MPI_Comm_rank(ctx->local_comm, &ctx->local_rank);
+  }
 
   HIP_RUNTIME_CHECK(hipGetDeviceCount(&ctx->device_count));
   assert(ctx->device_count);
@@ -376,17 +415,29 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
   }
 
   // CCO comm via the cco-native uniqueId API: rank 0 mints the id (its socket
-  // rendezvous), MPI broadcasts the POD, all ranks create the comm.
+  // rendezvous), MPI broadcasts the POD, all ranks create the comm. Without MPI
+  // every rank reads the id from MORI_BENCH_UID_FILE.
   int world_size = 0;
-  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
   ccoUniqueId uid;
-  if (ctx->world_rank == 0) {
+  if (uidFile != nullptr) {
+    world_size = BenchEnvInt("MORI_BENCH_WORLD");
+    FILE* f = std::fopen(uidFile, "rb");
+    const bool ok = f != nullptr && std::fread(&uid, sizeof(uid), 1, f) == 1;
+    if (f != nullptr) std::fclose(f);
+    if (!ok) {
+      std::fprintf(stderr, "cannot read a ccoUniqueId from %s\n", uidFile);
+      return 1;
+    }
+  } else {
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+  }
+  if (uidFile == nullptr && ctx->world_rank == 0) {
     if (ccoGetUniqueId(&uid) != 0) {
       std::fprintf(stderr, "ccoGetUniqueId failed (set MORI_SOCKET_IFNAME=<iface>)\n");
       MPI_Abort(MPI_COMM_WORLD, 1);
     }
   }
-  MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
+  if (uidFile == nullptr) MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
   const std::size_t per_rank_vmm = 2 * args.max_size + kVmmSlack;
   if (ccoCommCreate(uid, world_size, ctx->world_rank, per_rank_vmm, &ctx->comm) != 0) {
     if (ctx->world_rank == 0) std::fprintf(stderr, "ccoCommCreate failed\n");
@@ -557,9 +608,7 @@ void PerfFinalize(PerfContext* ctx) {
     ctx->comm = nullptr;
   }
   // We own MPI now (uniqueId bootstrap); finalize it ourselves.
-  int finalized = 0;
-  MPI_Finalized(&finalized);
-  if (!finalized) MPI_Finalize();
+  FinalizeMpi();
 }
 
 void PerfResAlloc(PerfRes* res) {
