@@ -87,8 +87,13 @@
 //   mpsc_async     timeout, must return 0); SPSC flushDone +2. Then the
 //                  sources are overwritten and a SignalSet tells the peer.
 //                  ccoCoopWarp, ccoCoopBlock, and MPSC (4 blocks per queue)
+//   async_forward, the same puts and requests, but wait for the first request
+//   mpsc_async_forward  and overwrite only the first half's sources while the
+//                  second FLUSH may be outstanding, then the second
 //   counter,       the same puts, then counter(CounterInc{unit}) and
 //   mpsc_counter   waitCounter: the counter reads exactly 1 (SPSC flushDone +1)
+//   counter_wave   counter with wavefront 0 doing the puts and counter() while
+//                  wavefront 1 waits for the count and overwrites the sources
 //   selector_wave, ccoProxyQueuePerWave with ccoCoopWarp (2 blocks of 32x4) and
 //   selector_block ccoProxyQueuePerBlock with ccoCoopBlock (2x2 blocks): the
 //                  handle's queue is the unit's linear id; put + SignalSet
@@ -931,22 +936,34 @@ static constexpr uint64_t kNegTimeoutCycles = 40ull * 1000 * 1000 * 1000;
 
 // flushAsync / wait and counter(). Unit u (queue u; MPSC: modulo the pool)
 // puts the first half of its chunk to every peer, then
-//   kAsyncReverse: flushAsync (r1), the second half, flushAsync (r2), wait(r2),
-//                  then wait(r1, coop, timeout), which must return 0;
-//   kAsyncCounter: the second half, counter(CounterInc{u}), waitCounter(u, 1),
-//                  and the counter must read exactly 1.
-// SPSC: flushDone advances by exactly 2 (1 for counter). The block then
-// overwrites its sources and sets Slot(me, u) to 1 on every peer (SignalSet,
-// atomic-free); the host checks that the original data arrived.
-enum AsyncMode { kAsyncReverse, kAsyncCounter };
+//   kAsyncReverse:     flushAsync (r1), the second half, flushAsync (r2),
+//                      wait(r2), then wait(r1, coop, timeout), which must
+//                      return 0;
+//   kAsyncForward:     flushAsync (r1), the second half, flushAsync (r2),
+//                      wait(r1) and overwrite only the first half's sources,
+//                      then wait(r2) and overwrite the second half's;
+//   kAsyncCounter:     the second half, counter(CounterInc{u}), waitCounter(u,
+//                      1), and the counter must read exactly 1;
+//   kAsyncCounterWave: as kAsyncCounter in wavefront 0 (ccoCoopWarp, 128-thread
+//                      blocks), while wavefront 1 does the waitCounter and
+//                      overwrites the sources, without a block barrier between.
+// SPSC: flushDone advances by exactly 2 (1 for the counter modes). The sources
+// are then overwritten (if not yet) and Slot(me, u) set to 1 on every peer
+// (SignalSet, atomic-free); the host checks that the original data arrived.
+enum AsyncMode { kAsyncReverse, kAsyncForward, kAsyncCounter, kAsyncCounterWave };
 
 template <typename Q, typename Coop, int Mode>
 __global__ void ProxyAsyncKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
                                  uint32_t* sendLocal, size_t chunk, int nUnits, int* err) {
+  static_assert(Mode != kAsyncCounterWave || std::is_same_v<Coop, ccoCoopWarp>,
+                "kAsyncCounterWave: one wavefront pushes");
+  constexpr bool kCounter = Mode == kAsyncCounter || Mode == kAsyncCounterWave;
   const int u = blockIdx.x;
   const int me = dc.rank;
   const int n = dc.worldSize;
   const int tid = threadIdx.x;
+  // kAsyncCounterWave: only wavefront 0 pushes (wavefront 1's handle stays clean).
+  const bool pusher = Mode != kAsyncCounterWave || tid < 64;
   ccoProxy<Q> proxy{dc, u};
   auto srcOff = [&](int p) { return (static_cast<size_t>(p) * nUnits + u) * chunk; };
   const size_t dstOff = (static_cast<size_t>(me) * nUnits + u) * chunk;
@@ -955,7 +972,7 @@ __global__ void ProxyAsyncKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t
   if constexpr (ccoProxy<Q>::kSpsc) {
     before = __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
   }
-  if constexpr (Mode == kAsyncCounter) {
+  if constexpr (kCounter) {
     if (tid == 0) proxy.resetCounter(u);
     __syncthreads();
   }
@@ -967,48 +984,77 @@ __global__ void ProxyAsyncKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t
       }
     }
   };
-  putHalf(0, half);
-  if constexpr (Mode == kAsyncReverse) {
+  // Overwrite [at, at + bytes) of every peer's source, threads first..blockDim-1.
+  auto clobber = [&](size_t at, size_t bytes, int first) {
+    for (int p = 0; p < n; p++) {
+      if (p == me) continue;
+      uint32_t* src = sendLocal + (srcOff(p) + at) / sizeof(uint32_t);
+      for (size_t i = tid - first; i < bytes / sizeof(uint32_t); i += blockDim.x - first) {
+        src[i] = kClobber;
+      }
+    }
+  };
+  auto checkCounter = [&] {
+    if (__lane_id() == 0 && proxy.readCounter(u) != 1) {
+      printf("[rank %d] counter: unit %d reads %llu, want 1\n", me, u,
+             (unsigned long long)proxy.readCounter(u));
+      atomicExch(err, 1);
+    }
+  };
+  if (pusher) putHalf(0, half);
+  if constexpr (Mode == kAsyncReverse || Mode == kAsyncForward) {
     ccoGdaRequest_t r1, r2;
     proxy.flushAsync(0, &r1, Coop{});
     putHalf(half, chunk - half);
     proxy.flushAsync(0, &r2, Coop{});
-    proxy.wait(r2, Coop{});
-    const int rc = proxy.wait(r1, Coop{}, kNegTimeoutCycles);
-    if (tid == 0 && rc != 0) {
-      printf("[rank %d] async: unit %d wait(r1) returned %d\n", me, u, rc);
-      atomicExch(err, 1);
+    if constexpr (Mode == kAsyncReverse) {
+      proxy.wait(r2, Coop{});
+      const int rc = proxy.wait(r1, Coop{}, kNegTimeoutCycles);
+      if (tid == 0 && rc != 0) {
+        printf("[rank %d] async: unit %d wait(r1) returned %d\n", me, u, rc);
+        atomicExch(err, 1);
+      }
+      clobber(0, chunk, 0);
+    } else {
+      // The second half may still be in flight: only the first half is reusable.
+      proxy.wait(r1, Coop{});
+      clobber(0, half, 0);
+      proxy.wait(r2, Coop{});
+      clobber(half, chunk - half, 0);
     }
-  } else {
+  } else if constexpr (Mode == kAsyncCounter) {
     putHalf(half, chunk - half);
     proxy.counter(ccoGda_CounterInc{static_cast<ccoGdaCounter_t>(u)}, Coop{});
     proxy.waitCounter(u, 1, Coop{});
-    if (tid == 0 && proxy.readCounter(u) != 1) {
-      printf("[rank %d] counter: unit %d reads %llu, want 1\n", me, u,
-             (unsigned long long)proxy.readCounter(u));
-      atomicExch(err, 1);
+    if (tid < 64) checkCounter();
+    clobber(0, chunk, 0);
+  } else {
+    if (pusher) {
+      putHalf(half, chunk - half);
+      proxy.counter(ccoGda_CounterInc{static_cast<ccoGdaCounter_t>(u)}, ccoCoopWarp{});
+    } else {
+      // The documented consumer: another wavefront sees the count, then reuses.
+      proxy.waitCounter(u, 1, ccoCoopWarp{});
+      checkCounter();
+      clobber(0, chunk, 64);
     }
   }
   if constexpr (ccoProxy<Q>::kSpsc) {
     const uint64_t after =
         __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    const uint64_t want = before + (Mode == kAsyncReverse ? 2 : 1);
+    const uint64_t want = before + (kCounter ? 1 : 2);
     if (tid == 0 && after != want) {
       printf("[rank %d] async: unit %d flushDone %llu -> %llu, want %llu\n", me, u,
              (unsigned long long)before, (unsigned long long)after, (unsigned long long)want);
       atomicExch(err, 1);
     }
   }
-  // Every put of this unit completed: its sources may be reused right away.
-  for (int p = 0; p < n; p++) {
-    if (p == me) continue;
-    uint32_t* src = sendLocal + srcOff(p) / sizeof(uint32_t);
-    for (size_t i = tid; i < chunk / sizeof(uint32_t); i += blockDim.x) src[i] = kClobber;
-  }
   __threadfence_system();
   __syncthreads();
-  for (int p = 0; p < n; p++) {
-    if (p != me) proxy.signal(p, ccoGda_SignalSet{Slot(me, u), 1}, Coop{});
+  if (pusher) {
+    for (int p = 0; p < n; p++) {
+      if (p != me) proxy.signal(p, ccoGda_SignalSet{Slot(me, u), 1}, Coop{});
+    }
   }
   for (int s = 0; s < n; s++) {
     if (s != me) proxy.waitSignal(Slot(s, u), 1, Coop{});
@@ -1080,10 +1126,13 @@ __global__ void ProxyResetKernel(ccoDevComm dc, int nSlots) {
 
 // Positive cases that use no NIC atomics (MORI_CCO_PROXY_TEST_CASES=atomic_free).
 static const char* const kAtomicFreeCases[] = {
-    "value_set",     "block_value_set", "lane_value_set", "mpsc_lane_value_set",
-    "set_put",       "set_signal",      "set_window",     "mpsc_set_put",
-    "async_reverse", "block_async",     "mpsc_async",     "counter",
-    "mpsc_counter",  "selector_wave",   "selector_block", "only_set_put"};
+    "value_set",           "block_value_set", "lane_value_set",
+    "mpsc_lane_value_set", "set_put",         "set_signal",
+    "set_window",          "mpsc_set_put",    "async_reverse",
+    "block_async",         "mpsc_async",      "async_forward",
+    "mpsc_async_forward",  "counter",         "mpsc_counter",
+    "counter_wave",        "selector_wave",   "selector_block",
+    "only_set_put"};
 
 // MORI_CCO_PROXY_TEST_CASES (same on every rank): unset runs every positive
 // case; else a comma-separated list of case names, where "atomic_free" stands
@@ -1579,6 +1628,12 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
       RunAsyncCase<SPSCD2HQueue, ccoCoopWarp, kAsyncCounter>(c, "counter", 51, kSpscQueues, 64);
   fails += RunAsyncCase<MPSCD2HQueue, ccoCoopBlock, kAsyncCounter>(c, "mpsc_counter", 52, kMaxUnits,
                                                                    256);
+  fails += RunAsyncCase<SPSCD2HQueue, ccoCoopWarp, kAsyncForward>(c, "async_forward", 57,
+                                                                  kSpscQueues, 64);
+  fails += RunAsyncCase<MPSCD2HQueue, ccoCoopBlock, kAsyncForward>(c, "mpsc_async_forward", 58,
+                                                                   kMaxUnits, 256);
+  fails += RunAsyncCase<SPSCD2HQueue, ccoCoopWarp, kAsyncCounterWave>(c, "counter_wave", 59,
+                                                                      kSpscQueues, 128);
   // 2 blocks of 2 wavefronts (32x4), and 2x2 blocks: kSpscQueues units each.
   fails += RunSelectorCase<ccoCoopWarp, true>(c, "selector_wave", 53, dim3(1, 2), dim3(32, 4));
   fails += RunSelectorCase<ccoCoopBlock, false>(c, "selector_block", 54, dim3(2, 2), dim3(256));
