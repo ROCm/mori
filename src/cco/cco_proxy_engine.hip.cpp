@@ -24,10 +24,10 @@
 // cco_proxy_engine.hip.cpp — host proxy engine behind ccoProxy.
 //
 // A fixed set of proxy threads. Each owns a subset of the KIWI device-to-host
-// queues (SPSC and MPSC; it is their only consumer) and qpsPerPeer host-posted
-// RC QPs, each with its own CQ, per peer. Each owned queue is bound to one QP
-// slot (round robin over the thread's queues), so a queue's ops to one peer
-// share a QP and stay in order. Each queue pool is one KIWI invoke context: a
+// queues (SPSC and MPSC; it is their only consumer) and min(qpsPerPeer, its
+// queue count) host-posted RC QPs, each with its own CQ, per peer. Each owned
+// queue is bound to one QP slot (round robin over the thread's queues), so a
+// queue's ops to one peer share a QP and stay in order. Each queue pool is one KIWI invoke context: a
 // thread drains its queues with Context::progress(), which runs one registered
 // callback (ProxyWorker::On*) per descriptor on that thread. The QPs live on
 // the PD of the comm's RDMA device context, which owns the cco window MRs, so
@@ -939,8 +939,13 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   // Never more threads than queues: a thread without a queue would only spin.
   const int numThreads =
       std::min(config.numThreads > 0 ? config.numThreads : kDefaultMaxThreads, numQueues);
-  // QPs per (thread, peer); never more than a thread's queues can use.
-  int qpsPerPeer = 1;
+  // QPs per peer of thread t: threadQps[t] = min(config.qpsPerPeer, t's queue
+  // count), so no QP lacks a queue. Handle (peer, t, slot) sits at
+  // local[peer * qpsPerRank + qpBase[t] + slot]; every rank computes the same
+  // layout from the agreed counts.
+  std::vector<int> threadQps;
+  std::vector<int> qpBase;
+  int qpsPerRank = 0;  // QPs to one peer, summed over the threads
 
   // Local setup: everything up to the QP handle exchange. A failure here is
   // reported to every rank by the Allgather below, so all ranks fail together.
@@ -961,8 +966,13 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     if (config.qpsPerPeer < 1) {
       throw std::runtime_error("bad qpsPerPeer " + std::to_string(config.qpsPerPeer));
     }
-    qpsPerPeer = std::min(config.qpsPerPeer, (numQueues + numThreads - 1) / numThreads);
-    local.resize(static_cast<size_t>(worldSize) * numThreads * qpsPerPeer);
+    for (int t = 0; t < numThreads; t++) {
+      const int owned = numQueues / numThreads + (t < numQueues % numThreads ? 1 : 0);
+      threadQps.push_back(std::min(config.qpsPerPeer, owned));
+      qpBase.push_back(qpsPerRank);
+      qpsPerRank += threadQps.back();
+    }
+    local.resize(static_cast<size_t>(worldSize) * qpsPerRank);
     const size_t capacity = config.queueCapacity ? config.queueCapacity : kDefaultQueueCapacity;
     if ((capacity & (capacity - 1)) != 0 ||
         capacity < mori::cco::proxy::queue::message_lines(sizeof(ccoProxyPutSignalDesc))) {
@@ -1009,7 +1019,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
 
     for (int t = 0; t < numThreads; t++) {
       auto w =
-          std::make_unique<ProxyWorker>(t, worldSize, qpsPerPeer, rank, &engine->err, abortOnError);
+          std::make_unique<ProxyWorker>(t, worldSize, threadQps[t], rank, &engine->err, abortOnError);
       w->scratchAddr = reinterpret_cast<uint64_t>(engine->scratch) + t * kScratchStride;
       w->scratchLkey = scratchMr.lkey;
       engine->workers.push_back(std::move(w));
@@ -1058,16 +1068,15 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       engine->queues.push_back(std::move(oq));
     }
 
-    // qpsPerPeer RC QPs per (proxy thread, masked peer); handle (peer, t, slot)
-    // at local[(peer * numThreads + t) * qpsPerPeer + slot].
+    // threadQps[t] RC QPs per (proxy thread t, masked peer).
     for (int peer = 0; peer < worldSize; peer++) {
       if (peer == rank || !config.peerMask[peer]) continue;
       for (int t = 0; t < numThreads; t++) {
-        for (int slot = 0; slot < qpsPerPeer; slot++) {
+        for (int slot = 0; slot < threadQps[t]; slot++) {
           ProxyQp& qp = engine->workers[t]->Qp(peer, slot);
           qp.ep = engine->ibv->CreateRdmaEndpoint(epConfig);
           qp.active = true;
-          local[(static_cast<size_t>(peer) * numThreads + t) * qpsPerPeer + slot] = qp.ep.handle;
+          local[static_cast<size_t>(peer) * qpsPerRank + qpBase[t] + slot] = qp.ep.handle;
         }
       }
     }
@@ -1077,9 +1086,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
 
   // Every rank must have set up before the exchange. All ranks see the same
   // table, so they all fail or all go on. (The caller has already checked that
-  // every rank passed the same queue, thread and QP counts, so numThreads *
-  // qpsPerPeer, the handles sent per peer, matches.) One RDMA write must fit
-  // every port.
+  // every rank passed the same queue, thread and QP counts, so qpsPerRank,
+  // the handles sent per peer, matches.) One RDMA write must fit every port.
   mine.ok = error.empty() ? 1 : 0;
   std::vector<ProxyCreateInfo> all(worldSize);
   bootNet->Allgather(&mine, all.data(), sizeof(ProxyCreateInfo));
@@ -1101,7 +1109,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   std::vector<application::RdmaEndpointHandle> remote(local.size());
   try {
     bootNet->AllToAll(local.data(), remote.data(),
-                      sizeof(application::RdmaEndpointHandle) * numThreads * qpsPerPeer);
+                      sizeof(application::RdmaEndpointHandle) * qpsPerRank);
   } catch (const std::exception& e) {
     MORI_SHMEM_ERROR("ccoProxyEngineCreate: rank={} failed: {}", rank, e.what());
     return nullptr;  // engine destructor releases what was built
@@ -1115,12 +1123,12 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     }
     for (int peer = 0; peer < worldSize; peer++) {
       if (peer == rank || !config.peerMask[peer]) continue;
-      for (int i = 0; i < numThreads * qpsPerPeer; i++) {
-        const size_t h = static_cast<size_t>(peer) * numThreads * qpsPerPeer + i;
+      for (int i = 0; i < qpsPerRank; i++) {
+        const size_t h = static_cast<size_t>(peer) * qpsPerRank + i;
         engine->ibv->ConnectEndpoint(local[h], remote[h], i);
       }
       for (int t = 0; t < numThreads; t++) {
-        for (int slot = 0; slot < qpsPerPeer; slot++) {
+        for (int slot = 0; slot < threadQps[t]; slot++) {
           CheckInlineCap(engine->workers[t]->Qp(peer, slot).ep.ibvHandle.qp);
         }
       }
@@ -1168,8 +1176,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   MORI_SHMEM_INFO(
       "ccoProxyEngineCreate: rank={} spscQueues={} mpscQueues={} threads={} qpsPerPeer={} "
       "(requested {}) peers={} QPs={} sqDepth={} maxPutBytes={}",
-      rank, numSpsc, numMpsc, numThreads, qpsPerPeer, config.qpsPerPeer, numPeers,
-      numThreads * qpsPerPeer * numPeers, kSqDepth, maxMsgBytes);
+      rank, numSpsc, numMpsc, numThreads, threadQps[0], config.qpsPerPeer, numPeers,
+      qpsPerRank * numPeers, kSqDepth, maxMsgBytes);
   out->numSpscQueues = numSpsc;
   out->numMpscQueues = numMpsc;
   out->spscContext = engine->spsc ? engine->spsc->device_context() : nullptr;

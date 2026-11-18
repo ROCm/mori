@@ -546,7 +546,7 @@ struct ccoDevCommRequirements {
                             // put+signal); smaller rings trap.
   // RC QPs per (proxy thread, peer); 0 = MORI_CCO_PROXY_QPS_PER_PEER, else 1.
   // Each queue posts on one of its thread's QPs per peer (round robin over the
-  // thread's queues), so at most the thread's queue count is used. NICs that
+  // thread's queues); a thread creates no more than it owns queues. NICs that
   // process each QP serially (e.g. ionic, ~1-2 Mpps per QP for small writes)
   // want several. Same on every rank.
   int proxyQpsPerPeer;
