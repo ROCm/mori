@@ -1063,8 +1063,14 @@ __global__ void ProxyAsyncKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t
       if (p != me) proxy.signal(p, ccoGda_SignalSet{Slot(me, u), 1}, Coop{});
     }
   }
+  // waitSignal consumes: with two wavefronts (kAsyncCounterWave) one waiter per block.
   for (int s = 0; s < n; s++) {
-    if (s != me) proxy.waitSignal(Slot(s, u), 1, Coop{});
+    if (s == me) continue;
+    if constexpr (Mode == kAsyncCounterWave) {
+      proxy.waitSignal(Slot(s, u), 1, ccoCoopBlock{});
+    } else {
+      proxy.waitSignal(Slot(s, u), 1, Coop{});
+    }
   }
 }
 
