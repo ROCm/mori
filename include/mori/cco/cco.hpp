@@ -448,6 +448,13 @@ struct ccoDevComm {
 typedef ccoDevComm* ccoDevComm_t;
 static_assert(std::is_trivially_copyable<ccoDevComm>::value,
               "ccoDevComm must be trivially copyable for hipMemcpy");
+// Kernels, JIT bitcode and python/mori/cco/cco.pxd snapshot this layout.
+static_assert(sizeof(ccoProxyContext) == 56 && offsetof(ccoProxyContext, flushDone) == 24 &&
+                  offsetof(ccoProxyContext, flushTicket) == 32 &&
+                  offsetof(ccoProxyContext, engine) == 48,
+              "ccoProxyContext layout is ABI");
+static_assert(sizeof(ccoDevComm) == 256 && offsetof(ccoDevComm, proxy) == 200,
+              "ccoDevComm layout is ABI");
 
 // Look up a registered window by a local pointer that lies within it. Backend-
 // agnostic accessor over the window table built into ccoDevComm above.
