@@ -155,21 +155,28 @@
 // "n1,n3"). They run after the positive cases, each on a DevComm of its own,
 // and put_sig_after (a put_sig_warp case) then runs on the first DevComm:
 //   n1  rank 0 puts past the end of peer 1's window, then flush(coop,
-//       timeout) returns 2 twice and failed() is true; ccoDevCommGetError
+//       timeout) returns 2 twice, failed() is true, and a flushAsync +
+//       wait(request, coop, timeout) returns 2; ccoDevCommGetError
 //       reports COMPLETION / IBV_WC_REM_ACCESS_ERR for peer 1, stderr gets
 //       exactly one error line, and ccoDevCommDestroy returns 0
 //   n2  every rank puts to itself, which has no proxy QP: as n1, but
 //       BAD_REQUEST naming the rank itself
 //   n3  put to every peer, then flush(coop, 100 cycles) returns 1, a void
-//       flush still completes, and flush(coop, long timeout) returns 0; SPSC
-//       flushDone advances by exactly 3 (ccoCoopBlock), MPSC with 4 blocks
-//       per queue (ccoCoopWarp), where flush(coop, 100 cycles) may also
-//       return 0 (a later ticket's FLUSH can cover it first)
+//       flush still completes, and flush(coop, long timeout) returns 0; then
+//       a second put round and flushAsync: wait(request, coop, 100 cycles)
+//       returns 1 and wait(request, coop, long timeout) 0. SPSC flushDone
+//       advances by exactly 4 (ccoCoopBlock), MPSC with 4 blocks per queue
+//       (ccoCoopWarp), where the 100-cycle flush or wait may also return 0
+//       (a later ticket's FLUSH can cover it first)
 //   n4  MORI_CCO_PROXY_TEST_FAIL_CONNECT=1: ccoDevCommCreate fails on every
 //       rank, and the comm still works afterwards
 //   n5  MORI_CCO_PROXY_QPS_PER_PEER differs between ranks (1 on rank 0, 2
 //       elsewhere): ccoDevCommCreate fails on every rank, and the comm still
 //       works afterwards
+//   n6  proxyOnly on rank 0 only: fails on every rank, as n5
+//   n7  proxyOnly without proxy queues: fails on every rank, as n5
+//   n8  proxyOnly with barrierCount 1: fails on every rank with cross-node
+//       peers (no GDA QPs for the barrier), succeeds on a single node
 //
 // Launch: `mpirun -np N test_proxy_put` (one rank per MPI process, any number
 // of nodes; built with MORI_WITH_MPI when WITH_MPI=ON), or `test_proxy_put [N]`
@@ -1062,23 +1069,29 @@ __global__ void ProxyAsyncKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t
 }
 
 // n1 / n2: one wavefront puts `bytes` to `peer`, then flushes twice with a
-// timeout. res = {first flush, second flush, failed()}.
+// timeout, then flushAsync + wait with a timeout.
+// res = {first flush, second flush, failed(), wait}.
 __global__ void ProxyFailKernel(ccoDevComm dc, int peer, ccoWindow_t dstWin, size_t dstOffset,
                                 ccoWindow_t srcWin, size_t bytes, int* res) {
   ccoProxy<> proxy{dc, 0};
   proxy.put(peer, dstWin, dstOffset, srcWin, 0, bytes, ccoGda_NoSignal{}, ccoCoopWarp{});
   const int first = proxy.flush(ccoCoopWarp{}, kNegTimeoutCycles);
   const int second = proxy.flush(ccoCoopWarp{}, kNegTimeoutCycles);
+  ccoGdaRequest_t req;
+  proxy.flushAsync(0, &req, ccoCoopWarp{});
+  const int waited = proxy.wait(req, ccoCoopWarp{}, kNegTimeoutCycles);
   if (__lane_id() == 0) {
     res[0] = first;
     res[1] = second;
     res[2] = proxy.failed() ? 1 : 0;
+    res[3] = waited;
   }
 }
 
 // n3: block u (queue u, MPSC: modulo the pool) puts its chunk to every peer,
 // then flushes with a timeout the proxy cannot meet, without one, and with a
-// long one. Every thread checks the results it got.
+// long one; then puts again and waits a flushAsync request with the short and
+// the long timeout. Every thread checks the results it got.
 template <typename Q, typename Coop>
 __global__ void ProxyTimeoutKernel(ccoDevComm dc, ccoWindow_t dstWin, ccoWindow_t srcWin,
                                    size_t chunk, int* err) {
@@ -1097,20 +1110,31 @@ __global__ void ProxyTimeoutKernel(ccoDevComm dc, ccoWindow_t dstWin, ccoWindow_
   const int timedOut = proxy.flush(Coop{}, 100);
   proxy.flush(Coop{});
   const int done = proxy.flush(Coop{}, kNegTimeoutCycles);
+  for (int p = 0; p < n; p++) {
+    if (p != me) proxy.put(p, dstWin, off, srcWin, off, chunk, ccoGda_NoSignal{}, Coop{});
+  }
+  ccoGdaRequest_t req;
+  proxy.flushAsync(0, &req, Coop{});
+  const int waitTimedOut = proxy.wait(req, Coop{}, 100);
+  const int waitDone = proxy.wait(req, Coop{}, kNegTimeoutCycles);
   // MPSC: another block's later-ticket FLUSH may already cover ours.
-  const bool timedOutOk = timedOut == 1 || (!ccoProxy<Q>::kSpsc && timedOut == 0);
-  if (!timedOutOk || done != 0 || proxy.failed()) {
+  auto shortOk = [](int rc) { return rc == 1 || (!ccoProxy<Q>::kSpsc && rc == 0); };
+  if (!shortOk(timedOut) || done != 0 || !shortOk(waitTimedOut) || waitDone != 0 ||
+      proxy.failed()) {
     if (__lane_id() == 0) {
-      printf("[rank %d] n3: unit %d wave %d: flush(100) = %d, flush(long) = %d, failed %d\n", me, u,
-             static_cast<int>(threadIdx.x) / 64, timedOut, done, proxy.failed() ? 1 : 0);
+      printf(
+          "[rank %d] n3: unit %d wave %d: flush(100) = %d, flush(long) = %d, wait(100) = %d, "
+          "wait(long) = %d, failed %d\n",
+          me, u, static_cast<int>(threadIdx.x) / 64, timedOut, done, waitTimedOut, waitDone,
+          proxy.failed() ? 1 : 0);
     }
     atomicExch(err, 1);
   }
   if constexpr (ccoProxy<Q>::kSpsc) {
     const uint64_t after =
         __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    if (threadIdx.x == 0 && after != before + 3) {
-      printf("[rank %d] n3: unit %d flushDone %llu -> %llu, want +3\n", me, u,
+    if (threadIdx.x == 0 && after != before + 4) {
+      printf("[rank %d] n3: unit %d flushDone %llu -> %llu, want +4\n", me, u,
              (unsigned long long)before, (unsigned long long)after);
       atomicExch(err, 1);
     }
@@ -1424,8 +1448,8 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
   }
   const bool fails = selfPut || c.rank == 0;  // ranks whose DevComm must fail
   int* dRes = nullptr;
-  HIP_CHECK(hipMalloc(&dRes, 3 * sizeof(int)));
-  HIP_CHECK(hipMemset(dRes, 0xff, 3 * sizeof(int)));
+  HIP_CHECK(hipMalloc(&dRes, 4 * sizeof(int)));
+  HIP_CHECK(hipMemset(dRes, 0xff, 4 * sizeof(int)));
   StderrCapture capture;
   if (fails) capture.Start();
   ccoBarrierAll(c.comm);
@@ -1435,7 +1459,7 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
     ProxyFailKernel<<<1, 64, 0, c.stream>>>(d, 1, c.recvWin, c.bufSize, c.sendWin, 4096, dRes);
   }
   HIP_CHECK(hipStreamSynchronize(c.stream));
-  int res[3];
+  int res[4];
   HIP_CHECK(hipMemcpy(res, dRes, sizeof(res), hipMemcpyDeviceToHost));
   HIP_CHECK(hipFree(dRes));
   ccoDevCommError e{};
@@ -1444,7 +1468,7 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
   if (fails) {
     PrintError(c.rank, name, got, e);
     const int wantPeer = selfPut ? c.rank : 1;
-    bad |= res[0] != 2 || res[1] != 2 || res[2] != 1;
+    bad |= res[0] != 2 || res[1] != 2 || res[2] != 1 || res[3] != 2;
     bad |= got != 1 || e.rank != c.rank || e.peer != wantPeer || e.queue != 0;
     if (selfPut) {
       bad |= e.code != CCO_PROXY_ERR_BAD_REQUEST || e.op != ccoProxyOpPut;
@@ -1453,8 +1477,8 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
              e.op != IBV_WR_RDMA_WRITE || e.raddr != c.bufSize || e.len != 4096;
     }
     if (bad) {
-      printf("[rank %d]   %s: flush returned %d then %d, failed() %d\n", c.rank, name, res[0],
-             res[1], res[2]);
+      printf("[rank %d]   %s: flush returned %d then %d, failed() %d, wait %d\n", c.rank, name,
+             res[0], res[1], res[2], res[3]);
     }
   } else if (got != 0) {
     PrintError(c.rank, name, got, e);  // e.g. a responder-side error; not checked
@@ -1531,6 +1555,45 @@ static bool NegativeSelected(const char* name) {
   if (!strcmp(env, "all")) return true;
   const std::string list = std::string(",") + env + ",";
   return list.find(std::string(",") + name + ",") != std::string::npos;
+}
+
+// n6..n8: ccoDevCommCreate with r must fail on every rank (n8 on a single
+// node: succeed); Harvest's barrier checks the comm still works.
+static int RunCreateFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r,
+                             bool wantFail) {
+  ccoDevComm d{};
+  const int rc = ccoDevCommCreate(c.comm, &r, &d);
+  if (rc == 0) {
+    if (wantFail) fprintf(stderr, "[rank %d] %s: DevCommCreate succeeded\n", c.rank, name);
+    if (ccoDevCommDestroy(c.comm, &d) != 0) return c.Harvest(name, 1);
+  } else if (!wantFail) {
+    fprintf(stderr, "[rank %d] %s: DevCommCreate failed\n", c.rank, name);
+  }
+  return c.Harvest(name, (rc != 0) != wantFail);
+}
+
+static int RunProxyOnlyNegativeCases(Ctx& c, const ccoDevCommRequirements& reqs) {
+  int fails = 0;
+  if (NegativeSelected("n6")) {
+    ccoDevCommRequirements r = reqs;
+    r.proxyOnly = c.rank == 0 ? 1 : 0;
+    fails += RunCreateFailCase(c, "n6_only_mismatch", r, true);
+  }
+  if (NegativeSelected("n7")) {
+    ccoDevCommRequirements r = reqs;
+    r.proxyOnly = 1;
+    r.proxySpscQueueCount = 0;
+    r.proxyMpscQueueCount = 0;
+    fails += RunCreateFailCase(c, "n7_only_no_queues", r, true);
+  }
+  if (NegativeSelected("n8")) {
+    ccoDevCommRequirements r = reqs;
+    r.proxyOnly = 1;
+    r.barrierCount = 1;
+    const bool crossNode = c.dc.lsaSize < c.dc.worldSize;
+    fails += RunCreateFailCase(c, "n8_only_barrier", r, crossNode);
+  }
+  return fails;
 }
 
 static int RunSignalCase(Ctx& c) {
@@ -1728,6 +1791,10 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   if (NegativeSelected("n5")) {
     anyNegative = true;
     fails += RunQpsMismatchCase(c, reqs);
+  }
+  if (NegativeSelected("n6") || NegativeSelected("n7") || NegativeSelected("n8")) {
+    anyNegative = true;
+    fails += RunProxyOnlyNegativeCases(c, reqs);
   }
   if (anyNegative) {
     fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "put_sig_after", 26, kChunk,
