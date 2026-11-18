@@ -225,8 +225,9 @@ def _proxy_wait_signal(
 ):
     """Wait until local slot ``signal_id`` has gained ``least`` since the
     last wait (consuming it), then acquire. One thread of the group waits
-    (WARP: one per wavefront, each consuming). Traps once the DevComm
-    failed."""
+    and consumes once. WARP is valid only with num_warps=1: several
+    wavefronts would race on the consumed count; use BLOCK instead. Traps
+    once the DevComm failed."""
     raw._proxy("wait_signal", coop, 0, pool, dev_comm, queue, signal_id, least, bits)
 
 
