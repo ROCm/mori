@@ -96,6 +96,8 @@ void PrintUsage(const char* program) {
                "  -P             latency: ping-pong put + SignalInc, both PEs run,\n"
                "                 latency = round trip / 2 (ibgda, proxy)\n"
                "  -S             latency: signal-only ping-pong (ibgda, proxy)\n"
+               "  -V             latency: time putValue of 8 bytes instead of an 8-byte\n"
+               "                 put, alone (put + flush) or with -P (ibgda, proxy)\n"
                "  -Q threads     proxy: host proxy threads (default 4)\n"
                "  -K qps         proxy: RC QPs per (proxy thread, peer) (default:\n"
                "                 MORI_CCO_PROXY_QPS_PER_PEER, else 4)\n"
@@ -137,7 +139,7 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   };
 
   int opt = 0;
-  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:PSQ:q:F:K:")) != -1) {
+  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:PSVQ:q:F:K:")) != -1) {
     switch (opt) {
       case 'h':
         return 2;
@@ -153,6 +155,9 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
       case 'S':
         out_args->pingpong = true;
         out_args->signal_only = true;
+        break;
+      case 'V':
+        out_args->put_value = true;
         break;
       case 'Q':
         out_args->proxy_threads = std::atoi(optarg);
