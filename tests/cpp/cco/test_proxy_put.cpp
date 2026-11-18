@@ -89,9 +89,13 @@
 //   qps_flush,     proxyQpsPerPeer = kQpsPerPeer: each proxy thread owns 3
 //   qps_mpsc_flush queues (2 SPSC + 1 MPSC), each bound to its own QP per peer
 //   put_value,     putValue of 1, 2, 4 and 8 bytes to every peer, the second
-//   mpsc_put_value half carrying SignalInc; the receiver checks each value
-//                  and that the bytes past it are untouched (MPSC: 4 blocks
-//                  per queue)
+//   mpsc_put_value half carrying SignalInc; the receiver checks each value,
+//                  that the bytes past it are untouched and that the signal
+//                  slot is fully consumed (MPSC: 4 blocks per queue)
+//   value_set,     put_value with the second half carrying SignalSet of 1..4
+//   block_value_set  (atomic-free): ccoCoopWarp, ccoCoopBlock, and
+//   lane_value_set,  ccoCoopLaneMasked where lane j of one call sends to the
+//   mpsc_lane_value_set  j-th next rank (SPSC, and MPSC with 4 blocks per queue)
 //   set_put,       the chunk as kSetRounds pieces, piece r followed by a
 //   set_signal,    SignalSet of r + 1 (carried by the put, a separate
 //   set_window,    signal(), or WindowSignalSet into the flag window); the
@@ -120,6 +124,11 @@
 //                  destination, on a third DevComm whose rings hold
 //                  kThreadCapacity lines: rings wrap, SPSC lane-masked pushes
 //                  retry for credit, MPSC claims wait
+//
+// The atomic-free cases (value_set .. mpsc_set_put) run first.
+// MORI_CCO_PROXY_TEST_CASES=<list> runs only the listed positive cases, where
+// "atomic_free" stands for all of them: for NICs whose atomics into GPU memory
+// fail (the first atomic case would fail the shared DevComm and trap).
 //
 // Negative cases, only with MORI_CCO_PROXY_TEST_NEGATIVE=all (or a list such as
 // "n1,n3"). They run after the positive cases, each on a DevComm of its own,
@@ -192,6 +201,24 @@ __host__ __device__ inline uint32_t Pattern(uint32_t salt, int src, int dst, int
 
 __host__ __device__ inline ccoGdaSignal_t Slot(int src, int unit) {
   return static_cast<ccoGdaSignal_t>(src * kMaxUnits + unit);
+}
+
+// Lane 0 waits until the caller-window flag reaches `least`, polling the
+// DevComm's failed bit. Returns false on every lane if the DevComm failed.
+template <typename P>
+__device__ inline bool WaitFlag(P& proxy, const uint64_t* flag, uint64_t least) {
+  int ok = 1;
+  if (__lane_id() == 0) {
+    for (uint32_t polls = 1;
+         __hip_atomic_load(flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < least; polls++) {
+      if (polls % 256 == 0 && proxy.failed()) {
+        ok = 0;
+        break;
+      }
+    }
+  }
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");  // the data the flag covers
+  return __builtin_amdgcn_readfirstlane(ok) != 0;
 }
 
 // Block u = unit u on queue u (MPSC: modulo the pool). Sends one chunk to every peer,
@@ -287,10 +314,12 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
   for (int s = 0; s < n; s++) {
     if (s == me) continue;
     if constexpr (Mode == kPutWindowSignal) {
-      if (tid == 0) {
-        while (__hip_atomic_load(&flagLocal[Slot(s, u)], __ATOMIC_RELAXED,
-                                 __HIP_MEMORY_SCOPE_SYSTEM) < 1) {
+      if (tid < 64 && !WaitFlag(proxy, &flagLocal[Slot(s, u)], 1)) {  // wavefront 0
+        if (tid == 0) {
+          printf("[rank %d] win_signal: DevComm failed\n", me);
+          atomicExch(err, 1);
         }
+        return;
       }
     } else {
       proxy.waitSignal(Slot(s, u), 1, Coop{});  // one waiter per group
@@ -448,9 +477,12 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
 
 // putValue: unit u sends kValueSlots values to every peer, slot k of
 // ((me * nUnits + u) * kValueSlots + k) * 8 holding ValueBytes(k) bytes; slots
-// below kValueSlots / 2 carry no signal, the others SignalInc{Slot(me, u)}.
-// After the signals, each receiver checks every slot of every sender: its low
-// bytes hold the value, the rest keep the 0xff fill.
+// below kValueSlots / 2 carry no signal, the others signal Slot(me, u):
+// SignalInc, or (kSet, atomic-free) SignalSet of 1, 2, ... in slot order.
+// ccoCoopWarp / ccoCoopBlock send slot by slot to each peer in turn;
+// ccoCoopLaneMasked sends each slot to every peer in one call, lane j to the
+// j-th next rank. After the signals, each receiver checks every slot of every
+// sender: its low bytes hold the value, the rest keep the 0xff fill.
 static constexpr int kValueSlots = 8;
 
 __host__ __device__ inline int ValueBytes(int k) { return 1 << (k % 4); }  // 1, 2, 4, 8
@@ -460,28 +492,67 @@ __host__ __device__ inline uint64_t ValueOf(uint32_t salt, int src, int dst, int
          Pattern(salt, src, dst, u, k + kValueSlots);
 }
 
-template <typename Q, typename RemoteAction>
-__device__ inline void PutValueSized(ccoProxy<Q>& proxy, int peer, ccoWindow_t win, size_t off,
-                                     uint64_t v, int bytes, RemoteAction ra) {
+template <typename P, typename RemoteAction, typename Coop>
+__device__ inline void PutValueSized(P& proxy, int peer, ccoWindow_t win, size_t off, uint64_t v,
+                                     int bytes, RemoteAction ra, Coop coop) {
   switch (bytes) {
     case 1:
-      proxy.putValue(peer, win, off, static_cast<uint8_t>(v), ra, ccoCoopWarp{});
+      proxy.putValue(peer, win, off, static_cast<uint8_t>(v), ra, coop);
       break;
     case 2:
-      proxy.putValue(peer, win, off, static_cast<uint16_t>(v), ra, ccoCoopWarp{});
+      proxy.putValue(peer, win, off, static_cast<uint16_t>(v), ra, coop);
       break;
     case 4:
-      proxy.putValue(peer, win, off, static_cast<uint32_t>(v), ra, ccoCoopWarp{});
+      proxy.putValue(peer, win, off, static_cast<uint32_t>(v), ra, coop);
       break;
     default:
-      proxy.putValue(peer, win, off, v, ra, ccoCoopWarp{});
+      proxy.putValue(peer, win, off, v, ra, coop);
       break;
   }
 }
 
-template <typename Q>
+template <bool kSet>
+__device__ inline auto ValueSignal(int me, int u, int k) {
+  if constexpr (kSet) {
+    return ccoGda_SignalSet{Slot(me, u), static_cast<uint64_t>(k - kValueSlots / 2 + 1)};
+  } else {
+    return ccoGda_SignalInc{Slot(me, u)};
+  }
+}
+
+// Unit u's slots from sender s (one thread, after the signal wait): values,
+// untouched high bytes, and the signal slot fully consumed.
+template <typename P>
+__device__ inline void CheckValues(const ccoDevComm& dc, P& proxy, const uint64_t* recvLocal,
+                                   uint32_t salt, int s, int u, int nUnits, int* err) {
+  const int me = dc.rank;
+  for (int k = 0; k < kValueSlots; k++) {
+    const size_t w = (static_cast<size_t>(s) * nUnits + u) * kValueSlots + k;
+    const uint64_t got =
+        __hip_atomic_load(recvLocal + w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    const uint64_t mask =
+        ValueBytes(k) == 8 ? ~uint64_t{0} : (uint64_t{1} << (8 * ValueBytes(k))) - 1;
+    const uint64_t want = (ValueOf(salt, s, me, u, k) & mask) | ~mask;
+    if (got != want) {
+      printf("[rank %d] putValue: src=%d unit=%d slot %d (%d B): got %016llx want %016llx\n", me, s,
+             u, k, ValueBytes(k), (unsigned long long)got, (unsigned long long)want);
+      atomicExch(err, 1);
+    }
+  }
+  const uint64_t left = proxy.readSignal(Slot(s, u));
+  if (left != 0) {
+    printf("[rank %d] putValue: src=%d unit=%d signal %llu past the expected value\n", me, s, u,
+           (unsigned long long)left);
+    atomicExch(err, 1);
+  }
+}
+
+template <typename Q, typename Coop, bool kSet>
 __global__ void ProxyValueKernel(ccoDevComm dc, ccoWindow_t recvWin, const uint64_t* recvLocal,
                                  uint32_t salt, int nUnits, int* err) {
+  constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
+  using WaitCoop =
+      std::conditional_t<std::is_same_v<Coop, ccoCoopBlock>, ccoCoopBlock, ccoCoopWarp>;
   const int u = blockIdx.x;
   const int me = dc.rank;
   const int n = dc.worldSize;
@@ -489,33 +560,32 @@ __global__ void ProxyValueKernel(ccoDevComm dc, ccoWindow_t recvWin, const uint6
   auto slotOff = [&](int src, int k) {
     return ((static_cast<size_t>(src) * nUnits + u) * kValueSlots + k) * sizeof(uint64_t);
   };
-  for (int p = 0; p < n; p++) {
-    if (p == me) continue;
-    for (int k = 0; k < kValueSlots; k++) {
-      const uint64_t v = ValueOf(salt, me, p, u, k);
-      if (k < kValueSlots / 2) {
-        PutValueSized(proxy, p, recvWin, slotOff(me, k), v, ValueBytes(k), ccoGda_NoSignal{});
-      } else {
-        PutValueSized(proxy, p, recvWin, slotOff(me, k), v, ValueBytes(k),
-                      ccoGda_SignalInc{Slot(me, u)});
-      }
+  auto send = [&](int p, int k, auto coop) {
+    const uint64_t v = ValueOf(salt, me, p, u, k);
+    if (k < kValueSlots / 2) {
+      PutValueSized(proxy, p, recvWin, slotOff(me, k), v, ValueBytes(k), ccoGda_NoSignal{}, coop);
+    } else {
+      PutValueSized(proxy, p, recvWin, slotOff(me, k), v, ValueBytes(k),
+                    ValueSignal<kSet>(me, u, k), coop);
+    }
+  };
+  if constexpr (kLaneMasked) {
+    for (int base = 0; base < n - 1; base += 64) {
+      const int j = base + __lane_id();
+      const bool active = j < n - 1;
+      const int p = active ? (me + 1 + j) % n : me;  // an idle lane's peer is not read
+      for (int k = 0; k < kValueSlots; k++) send(p, k, ccoCoopLaneMasked{active});
+    }
+  } else {
+    for (int p = 0; p < n; p++) {
+      if (p == me) continue;
+      for (int k = 0; k < kValueSlots; k++) send(p, k, Coop{});
     }
   }
   for (int s = 0; s < n; s++) {
     if (s == me) continue;
-    proxy.waitSignal(Slot(s, u), kValueSlots / 2, ccoCoopWarp{});
-    for (int k = 0; k < kValueSlots && __lane_id() == 0; k++) {
-      const uint64_t got = __hip_atomic_load(recvLocal + slotOff(s, k) / sizeof(uint64_t),
-                                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      const uint64_t mask =
-          ValueBytes(k) == 8 ? ~uint64_t{0} : (uint64_t{1} << (8 * ValueBytes(k))) - 1;
-      const uint64_t want = (ValueOf(salt, s, me, u, k) & mask) | ~mask;
-      if (got != want) {
-        printf("[rank %d] putValue: src=%d unit=%d slot %d (%d B): got %016llx want %016llx\n", me,
-               s, u, k, ValueBytes(k), (unsigned long long)got, (unsigned long long)want);
-        atomicExch(err, 1);
-      }
-    }
+    proxy.waitSignal(Slot(s, u), kValueSlots / 2, WaitCoop{});  // acquires on thread 0
+    if (threadIdx.x == 0) CheckValues(dc, proxy, recvLocal, salt, s, u, nUnits, err);
   }
 }
 
@@ -562,12 +632,13 @@ __global__ void ProxySetKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
     if (s == me) continue;
     for (int r = 0; r < kSetRounds; r++) {
       if constexpr (Mode == kSetWindow) {
-        if (lane == 0) {
-          while (__hip_atomic_load(&flagLocal[Slot(s, u)], __ATOMIC_RELAXED,
-                                   __HIP_MEMORY_SCOPE_SYSTEM) < static_cast<uint64_t>(r + 1)) {
+        if (!WaitFlag(proxy, &flagLocal[Slot(s, u)], static_cast<uint64_t>(r + 1))) {
+          if (lane == 0) {
+            printf("[rank %d] set_window: DevComm failed\n", me);
+            atomicExch(err, 1);
           }
+          return;
         }
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
       } else {
         proxy.waitSignal(Slot(s, u), 1, ccoCoopWarp{});  // consumed r so far: the slot is >= r + 1
       }
@@ -849,6 +920,30 @@ __global__ void ProxyResetKernel(ccoDevComm dc, int nSlots) {
   }
 }
 
+// Positive cases that use no NIC atomics (MORI_CCO_PROXY_TEST_CASES=atomic_free).
+static const char* const kAtomicFreeCases[] = {
+    "value_set", "block_value_set", "lane_value_set", "mpsc_lane_value_set",
+    "set_put",   "set_signal",      "set_window",     "mpsc_set_put"};
+
+// MORI_CCO_PROXY_TEST_CASES (same on every rank): unset runs every positive
+// case; else a comma-separated list of case names, where "atomic_free" stands
+// for kAtomicFreeCases (e.g. on platforms whose NIC atomics into GPU memory
+// fail, which would fail the DevComm the other cases share).
+static bool CaseSelected(const char* name) {
+  const char* env = getenv("MORI_CCO_PROXY_TEST_CASES");
+  if (env == nullptr || env[0] == '\0') return true;
+  const std::string list = std::string(",") + env + ",";
+  auto listed = [&](const char* n) {
+    return list.find(std::string(",") + n + ",") != std::string::npos;
+  };
+  if (listed(name)) return true;
+  if (!listed("atomic_free")) return false;
+  for (const char* n : kAtomicFreeCases) {
+    if (!strcmp(n, name)) return true;
+  }
+  return false;
+}
+
 struct Ctx {
   ccoComm* comm;
   ccoDevComm dc;        // default rings
@@ -937,6 +1032,7 @@ struct Ctx {
 template <typename Q, typename Coop, int Mode, ccoProxyFenceMode F = ccoProxyFenceEachOp>
 static int RunPutCase(Ctx& c, const char* name, uint32_t salt, size_t chunk, int nUnits,
                       dim3 blockDim, const ccoDevComm* dev = nullptr, uint64_t maxPutBytes = 0) {
+  if (!CaseSelected(name)) return 0;
   ccoDevComm d = dev ? *dev : c.dc;
   if (maxPutBytes != 0) d.proxy.maxPutBytes = maxPutBytes;
   c.Fresh(d, salt, chunk, nUnits,
@@ -951,6 +1047,7 @@ static int RunPutCase(Ctx& c, const char* name, uint32_t salt, size_t chunk, int
 template <typename Q, int Mode>
 static int RunThreadCase(Ctx& c, const char* name, uint32_t salt, int nUnits,
                          uint64_t maxPutBytes = 0, bool smallRings = false) {
+  if (!CaseSelected(name)) return 0;
   ccoDevComm d = smallRings ? c.dcThread : c.dc;
   if (maxPutBytes != 0) d.proxy.maxPutBytes = maxPutBytes;
   const int rounds = smallRings ? kThreadRounds : 1;
@@ -964,10 +1061,11 @@ static int RunThreadCase(Ctx& c, const char* name, uint32_t salt, int nUnits,
   return c.Verify(name, salt, kChunk, nUnits * rounds, /*laneSlices=*/true);
 }
 
-template <typename Q>
-static int RunValueCase(Ctx& c, const char* name, uint32_t salt, int nUnits) {
+template <typename Q, typename Coop, bool kSet>
+static int RunValueCase(Ctx& c, const char* name, uint32_t salt, int nUnits, int blockDim = 64) {
+  if (!CaseSelected(name)) return 0;
   c.Fresh(c.dc, salt, kChunk, nUnits);
-  ProxyValueKernel<Q><<<nUnits, 64, 0, c.stream>>>(
+  ProxyValueKernel<Q, Coop, kSet><<<nUnits, blockDim, 0, c.stream>>>(
       c.dc, c.recvWin, static_cast<const uint64_t*>(c.recvBuf), salt, nUnits, c.dErr);
   c.Sync();
   return c.Harvest(name, 0);
@@ -975,6 +1073,7 @@ static int RunValueCase(Ctx& c, const char* name, uint32_t salt, int nUnits) {
 
 template <typename Q, int Mode>
 static int RunSetCase(Ctx& c, const char* name, uint32_t salt, int nUnits) {
+  if (!CaseSelected(name)) return 0;
   c.Fresh(c.dc, salt, kChunk, nUnits);
   ProxySetKernel<Q, Mode><<<nUnits, 64, 0, c.stream>>>(
       c.dc, c.sendWin, c.recvWin, c.flagWin, static_cast<const uint32_t*>(c.recvBuf),
@@ -984,6 +1083,7 @@ static int RunSetCase(Ctx& c, const char* name, uint32_t salt, int nUnits) {
 }
 
 static int RunStressCase(Ctx& c) {
+  if (!CaseSelected("mpsc_stress")) return 0;
   const int nWaves = kStressBlocks * kStressWarps;
   const int nUnits = nWaves * kStressRounds;
   c.Fresh(c.dc, /*salt=*/10, kStressChunk, nUnits);
@@ -995,6 +1095,7 @@ static int RunStressCase(Ctx& c) {
 }
 
 static int RunBlockFlushCase(Ctx& c) {
+  if (!CaseSelected("block_flush")) return 0;
   c.Fresh(c.dc, /*salt=*/40, kChunk, kBlockFlushWaves);
   ProxyBlockFlushKernel<<<1, kBlockFlushWaves * 64, 0, c.stream>>>(
       c.dc, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf), kChunk, c.dErr);
@@ -1003,6 +1104,7 @@ static int RunBlockFlushCase(Ctx& c) {
 }
 
 static int RunHandoffCase(Ctx& c) {
+  if (!CaseSelected("spsc_handoff")) return 0;
   c.Fresh(c.dc, /*salt=*/16, kChunk, /*nUnits=*/1);
   ProxyHandoffKernel<<<1, 128, 0, c.stream>>>(c.dc, c.sendWin, c.recvWin, kChunk, c.dErr);
   c.Sync();
@@ -1153,6 +1255,7 @@ static bool NegativeSelected(const char* name) {
 }
 
 static int RunSignalCase(Ctx& c) {
+  if (!CaseSelected("signal_only")) return 0;
   c.Fresh(c.dc, /*salt=*/0, kChunk, kSpscQueues);
   const ccoGdaSignal_t slot = static_cast<ccoGdaSignal_t>(c.nSlots - 1);
   ProxySignalKernel<<<kSpscQueues, 64, 0, c.stream>>>(c.dc, slot, c.dErr);
@@ -1223,6 +1326,19 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   ccoBarrierAll(c.comm);
 
   int fails = 0;
+  // Atomic-free cases first: on platforms where NIC atomics fail, they still
+  // run before the first atomic fails the shared DevComm.
+  fails += RunValueCase<SPSCD2HQueue, ccoCoopWarp, true>(c, "value_set", 44, kSpscQueues);
+  fails +=
+      RunValueCase<SPSCD2HQueue, ccoCoopBlock, true>(c, "block_value_set", 45, kSpscQueues, 256);
+  fails +=
+      RunValueCase<SPSCD2HQueue, ccoCoopLaneMasked, true>(c, "lane_value_set", 46, kSpscQueues);
+  fails +=
+      RunValueCase<MPSCD2HQueue, ccoCoopLaneMasked, true>(c, "mpsc_lane_value_set", 47, kMaxUnits);
+  fails += RunSetCase<SPSCD2HQueue, kSetSlot>(c, "set_put", 34, kSpscQueues);
+  fails += RunSetCase<SPSCD2HQueue, kSetSignal>(c, "set_signal", 35, kSpscQueues);
+  fails += RunSetCase<SPSCD2HQueue, kSetWindow>(c, "set_window", 36, kSpscQueues);
+  fails += RunSetCase<MPSCD2HQueue, kSetSlot>(c, "mpsc_set_put", 37, kMaxUnits);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "put_sig_warp", 1, kChunk,
                                                              kSpscQueues, 64);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutThenSignal>(c, "put_then_sig", 2, kChunk,
@@ -1271,13 +1387,9 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
                                                          true);
   fails +=
       RunThreadCase<MPSCD2HQueue, kThreadPutSignal>(c, "thr_small_mpsc", 25, kMaxUnits, 256, true);
-  // putValue (1/2/4/8 bytes, with and without SignalInc) and SignalSet.
-  fails += RunValueCase<SPSCD2HQueue>(c, "put_value", 32, kSpscQueues);
-  fails += RunValueCase<MPSCD2HQueue>(c, "mpsc_put_value", 33, kMaxUnits);
-  fails += RunSetCase<SPSCD2HQueue, kSetSlot>(c, "set_put", 34, kSpscQueues);
-  fails += RunSetCase<SPSCD2HQueue, kSetSignal>(c, "set_signal", 35, kSpscQueues);
-  fails += RunSetCase<SPSCD2HQueue, kSetWindow>(c, "set_window", 36, kSpscQueues);
-  fails += RunSetCase<MPSCD2HQueue, kSetSlot>(c, "mpsc_set_put", 37, kMaxUnits);
+  // putValue (1/2/4/8 bytes, with and without SignalInc).
+  fails += RunValueCase<SPSCD2HQueue, ccoCoopWarp, false>(c, "put_value", 32, kSpscQueues);
+  fails += RunValueCase<MPSCD2HQueue, ccoCoopWarp, false>(c, "mpsc_put_value", 33, kMaxUnits);
   fails += RunStressCase(c);
   fails += RunSignalCase(c);
   fails += RunHandoffCase(c);
