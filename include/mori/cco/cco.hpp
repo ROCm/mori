@@ -558,7 +558,18 @@ struct ccoDevCommRequirements {
   // railGdaBarrierCount / barrierCount must be 0 when there are cross-node
   // peers. Same on every rank.
   int proxyOnly;
+  // 0. Moves the struct's end past the previous version's sizeof, so `size`
+  // tells whether the caller has proxyOnly (it sits in the old tail padding).
+  int reserved0;
 };
+
+// The previous version (proxyQpsPerPeer last) ended at proxyQpsPerPeer's end
+// rounded up to the alignment; a caller of it passes that size.
+static_assert(offsetof(ccoDevCommRequirements, reserved0) + sizeof(int) >
+                  (offsetof(ccoDevCommRequirements, proxyQpsPerPeer) + sizeof(int) +
+                   alignof(ccoDevCommRequirements) - 1) /
+                      alignof(ccoDevCommRequirements) * alignof(ccoDevCommRequirements),
+              "proxyOnly must be detectable from ccoDevCommRequirements::size");
 
 #define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                   \
   {                                                                             \
@@ -582,6 +593,7 @@ struct ccoDevCommRequirements {
       0,                                         /* proxyQueueCapacity */       \
       0,                                         /* proxyQpsPerPeer    */       \
       0,                                         /* proxyOnly          */       \
+      0,                                         /* reserved0          */       \
   }
 
 /* ════════════════════════════════════════════════════════════════════════════
