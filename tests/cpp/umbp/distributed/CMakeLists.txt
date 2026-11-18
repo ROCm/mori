@@ -14,6 +14,16 @@
 # --------------------------------------------------------------------------
 
 find_library(_TEST_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
+# Manual two-tray UALink validation: every DRAM/HBM combination with the fabric
+# as the only transport. Needs fabric-ready GPUs on two trays of one vPOD, so
+# it is built but not registered with add_test.
+add_executable(umbp_ualink_direct_driver ualink_direct_driver.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(umbp_ualink_direct_driver PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(umbp_ualink_direct_driver PRIVATE umbp_core umbp_common
+                      ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})
+
 add_executable(test_kv_indexer_reporter test_kv_indexer_reporter.cpp)
 target_link_libraries(test_kv_indexer_reporter PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_kv_indexer_reporter PRIVATE cxx_std_17)

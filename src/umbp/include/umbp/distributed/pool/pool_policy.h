@@ -48,6 +48,13 @@ struct PoolPlacementRequest {
   std::string backend_name;
   std::string logical_tier;
   int preferred_numa_node = -1;
+  // The writer is another node: its bytes arrive over the transport, so the
+  // pages it is given must be ones that transport can reach.
+  bool remote_writer = false;
+  // ...and the UALink fabric is the only transport that writer has.
+  bool writer_requires_fabric = false;
+  // ...and its source is exportable HBM this node's GPU can read directly.
+  bool writer_offers_pull = false;
 };
 
 // Decision-only interface. A policy returns backend ids; PeerPool owns slot

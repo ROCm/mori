@@ -27,6 +27,13 @@
 
 #include "mori/utils/mori_log.hpp"
 
+namespace mori::io {
+// The fabric allocator (src/io/fabric/backend_impl.cpp). Declared here rather
+// than pulling an internal backend header into UMBP.
+void* FabricMalloc(size_t size, int device);
+void FabricFree(void* ptr);
+}  // namespace mori::io
+
 namespace mori::umbp {
 
 namespace {
@@ -65,24 +72,45 @@ class ScopedDevice {
 bool HbmPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vector<Buffer>* out) {
   ScopedDevice scope(device_);
 
-  std::vector<void*> taken;
+  std::vector<Owned> taken;
   std::vector<Buffer> staged;
+  const auto release = [](const Owned& owned) {
+    if (owned.fabric) {
+      mori::io::FabricFree(owned.ptr);
+    } else {
+      (void)hipFree(owned.ptr);
+    }
+  };
   for (uint64_t size : sizes) {
     if (size == 0) continue;
-    void* ptr = nullptr;
-    const hipError_t err = hipMalloc(&ptr, static_cast<size_t>(size));
-    if (err != hipSuccess || ptr == nullptr) {
-      MORI_UMBP_ERROR("[HbmPageMemorySource] hipMalloc({}) on device {} failed: {}", size, device_,
-                      hipGetErrorString(err));
+    Owned owned;
+    if (allocation_ != Allocation::kHip) {
+      owned.ptr = mori::io::FabricMalloc(static_cast<size_t>(size), device_);
+      owned.fabric = owned.ptr != nullptr;
+      if (owned.ptr == nullptr && allocation_ == Allocation::kFabricOrHip) {
+        MORI_UMBP_WARN(
+            "[HbmPageMemorySource] no fabric-exportable allocation on device {}; the pool is "
+            "plain HBM and other trays reach it over RDMA only",
+            device_);
+      }
+    }
+    hipError_t err = hipSuccess;
+    if (owned.ptr == nullptr && allocation_ != Allocation::kFabric) {
+      err = hipMalloc(&owned.ptr, static_cast<size_t>(size));
+    }
+    if (err != hipSuccess || owned.ptr == nullptr) {
+      MORI_UMBP_ERROR("[HbmPageMemorySource] {}({}) on device {} failed: {}",
+                      allocation_ == Allocation::kFabric ? "FabricMalloc" : "hipMalloc", size,
+                      device_, hipGetErrorString(err));
       // All-or-nothing, matching the PageMemorySource contract: unwind only
       // what this call took, leaving `out` and any earlier pool untouched.
-      for (void* p : taken) (void)hipFree(p);
+      for (const Owned& p : taken) release(p);
       return false;
     }
-    // hipMalloc returns exactly the requested size — no rounding to report, in
-    // contrast to the host source's hugepage mapped_size.
-    staged.push_back(Buffer{ptr, size});
-    taken.push_back(ptr);
+    // The requested size is what is advertised: the fabric allocator may round
+    // its mapping up to the device's granularity, and that slack is not ours.
+    staged.push_back(Buffer{owned.ptr, size});
+    taken.push_back(owned);
   }
 
   ptrs_.insert(ptrs_.end(), taken.begin(), taken.end());
@@ -94,8 +122,12 @@ bool HbmPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vect
 void HbmPageMemorySource::Release() {
   if (ptrs_.empty()) return;
   ScopedDevice scope(device_);
-  for (void* p : ptrs_) {
-    const hipError_t err = hipFree(p);
+  for (const Owned& owned : ptrs_) {
+    if (owned.fabric) {
+      mori::io::FabricFree(owned.ptr);
+      continue;
+    }
+    const hipError_t err = hipFree(owned.ptr);
     if (err != hipSuccess) {
       MORI_UMBP_ERROR("[HbmPageMemorySource] hipFree on device {} failed: {}", device_,
                       hipGetErrorString(err));
@@ -107,9 +139,10 @@ void HbmPageMemorySource::Release() {
 std::unique_ptr<MediumBackend> MakeHbmBackend(uint64_t page_size, int device,
                                               std::vector<uint64_t> buffer_sizes,
                                               std::chrono::milliseconds pending_ttl,
-                                              std::chrono::milliseconds read_lease_ttl) {
+                                              std::chrono::milliseconds read_lease_ttl,
+                                              HbmPageMemorySource::Allocation allocation) {
   return std::make_unique<PageBackend>(TierType::HBM, page_size,
-                                       std::make_unique<HbmPageMemorySource>(device),
+                                       std::make_unique<HbmPageMemorySource>(device, allocation),
                                        std::move(buffer_sizes), pending_ttl, read_lease_ttl);
 }
 

@@ -48,10 +48,17 @@ namespace mori::umbp {
 // pool land on whichever thread happened to allocate first.
 class HbmPageMemorySource final : public PageMemorySource {
  public:
-  explicit HbmPageMemorySource(int device) : device_(device) {}
+  // How the pool is allocated. kHip is a plain hipMalloc. The two fabric
+  // modes allocate through mori-io's fabric allocator, so the pool can be
+  // exported over a UALink scale-up fabric and read by a GPU on another tray;
+  // kFabricOrHip falls back to hipMalloc on a machine without one.
+  enum class Allocation { kHip, kFabric, kFabricOrHip };
+
+  explicit HbmPageMemorySource(int device, Allocation allocation = Allocation::kHip)
+      : device_(device), allocation_(allocation) {}
   ~HbmPageMemorySource() override { Release(); }
 
-  // hipMalloc one buffer per size, on device_.  All-or-nothing.
+  // One buffer per size, on device_.  All-or-nothing.
   bool Allocate(const std::vector<uint64_t>& sizes, std::vector<Buffer>* out) override;
   void Release() override;
 
@@ -62,8 +69,13 @@ class HbmPageMemorySource final : public PageMemorySource {
   const char* Name() const override { return "HbmPageMemorySource"; }
 
  private:
+  struct Owned {
+    void* ptr = nullptr;
+    bool fabric = false;
+  };
   int device_ = 0;
-  std::vector<void*> ptrs_;
+  Allocation allocation_ = Allocation::kHip;
+  std::vector<Owned> ptrs_;
 };
 
 // The one place a caller outside this file obtains an HBM backend — the
@@ -72,9 +84,9 @@ class HbmPageMemorySource final : public PageMemorySource {
 //
 // `device` is the GPU ordinal the pool is allocated on.  `buffer_sizes` is one
 // hipMalloc per entry, in bytes.
-std::unique_ptr<MediumBackend> MakeHbmBackend(uint64_t page_size, int device,
-                                              std::vector<uint64_t> buffer_sizes,
-                                              std::chrono::milliseconds pending_ttl,
-                                              std::chrono::milliseconds read_lease_ttl);
+std::unique_ptr<MediumBackend> MakeHbmBackend(
+    uint64_t page_size, int device, std::vector<uint64_t> buffer_sizes,
+    std::chrono::milliseconds pending_ttl, std::chrono::milliseconds read_lease_ttl,
+    HbmPageMemorySource::Allocation allocation = HbmPageMemorySource::Allocation::kHip);
 
 }  // namespace mori::umbp

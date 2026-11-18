@@ -100,6 +100,13 @@ class HbmCopyEngine final : public TransferEngine {
   // is the only layer that sees the segment shape a copy actually decomposes
   // into, which is what decides whether a kernel beats the copy engine.
   void AddHostGatherRegion(void* base, size_t bytes);
+  // Releases the region added at `base`; the caller has drained every copy
+  // that could still name it.
+  void RemoveHostGatherRegion(const void* base);
+  // The registered piece holding `ptr` as `device_id` sees it, or false when
+  // no registered region covers it or that device cannot address the one that
+  // does. What a transport needs to treat the piece as an endpoint.
+  bool HostRegionDevicePiece(const void* ptr, int device_id, HostDevicePiece* out) const;
   void ClearHostGatherRegions();
 
   // Both endpoints addressable in this process, at least one of them GPU.

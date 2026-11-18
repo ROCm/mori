@@ -130,22 +130,65 @@ class MoriIoEngine::RdmaHandle final : public TransferHandle {
 // ---------------------------------------------------------------------------
 
 MoriIoEngine::MoriIoEngine(std::string engine_key, mori::io::IOEngineConfig io_config,
-                           uint64_t bounce_bytes)
+                           uint64_t bounce_bytes, UMBPIoEngineConfig transport)
     : local_engine_key_(std::move(engine_key)),
       io_config_(std::move(io_config)),
+      transport_(std::move(transport)),
       bounce_size_(bounce_bytes) {}
 
 MoriIoEngine::~MoriIoEngine() { Shutdown(); }
 
 bool MoriIoEngine::Init() {
   if (io_engine_ != nullptr) return true;
-  if (io_config_.host.empty()) return false;
+  const bool strict = transport_.mode == UMBPTransferMode::kFabricStrict;
+  const bool fabric = transport_.mode != UMBPTransferMode::kRdma;
+  // The fabric has no listener: peers learn everything from the gRPC handshake.
+  if (io_config_.host.empty()) {
+    if (!strict) return false;
+    io_config_.host = "127.0.0.1";
+  }
+  if (strict && transport_.fabric_kernel_path.empty()) {
+    MORI_UMBP_ERROR("[MoriIoEngine] fabric_strict requires UMBP_FABRIC_KERNEL_PATH");
+    return false;
+  }
 
   io_engine_ = std::make_unique<mori::io::IOEngine>(local_engine_key_, io_config_);
   // Adopt whatever key the engine actually published: IsRemoteMemory compares
   // a descriptor's engineKey against this, so a transformed key here would make
   // every local buffer look remote.
   local_engine_key_ = io_engine_->GetEngineDesc().key;
+
+  if (fabric && !transport_.fabric_kernel_path.empty()) {
+    // mori-io prefers FABRIC over RDMA for every pair it can carry, so adding
+    // the backend is all `auto` needs. Without the copy kernel the backend
+    // would claim pairs it cannot serve, so `auto` leaves it out instead.
+    try {
+      io_engine_->CreateBackend(mori::io::BackendType::FABRIC, mori::io::FabricBackendConfig{});
+      io_engine_->LoadFabricCopyModule(transport_.fabric_kernel_path);
+      fabric_enabled_ = true;
+    } catch (const std::exception& e) {
+      MORI_UMBP_ERROR("[MoriIoEngine] fabric backend unavailable: {}", e.what());
+      if (strict) {
+        io_engine_.reset();
+        return false;
+      }
+      io_engine_->RemoveBackend(mori::io::BackendType::FABRIC);
+    }
+  } else if (fabric) {
+    MORI_UMBP_WARN("[MoriIoEngine] UMBP_FABRIC_KERNEL_PATH is unset; transfers stay on RDMA");
+  }
+  if (fabric_enabled_ && transport_.fabric_host_endpoints) {
+    host_view_device_ = transport_.fabric_host_device;
+    host_views_api_.find = [this](uintptr_t address) { return HostViewFor(address); };
+    host_views_api_.required = strict;
+  }
+  if (strict) {
+    // No RDMA backend and so no bounce pool: an endpoint is fabric or nothing.
+    bounce_size_ = 0;
+    MORI_UMBP_INFO("[MoriIoEngine] initialized key={} mode=fabric_strict host_view_device={}",
+                   local_engine_key_, host_view_device_);
+    return true;
+  }
 
   mori::io::RdmaBackendConfig rdma_cfg;
   rdma_cfg.qpPerTransfer = 4;
@@ -160,6 +203,7 @@ bool MoriIoEngine::Init() {
   // are overridable via MORI_IO_* env in the RDMA backend ctor, shared by every
   // IO backend user; no UMBP-specific entry points.
   io_engine_->CreateBackend(mori::io::BackendType::RDMA, rdma_cfg);
+  rdma_enabled_ = true;
 
   if (bounce_size_ > 0) {
     bounce_buffer_ = std::make_unique<char[]>(bounce_size_);
@@ -184,6 +228,14 @@ void MoriIoEngine::Shutdown() {
     std::lock_guard<std::mutex> lock(remotes_mutex_);
     remotes_.clear();
   }
+  DropHostViews();
+  {
+    std::lock_guard<std::mutex> lock(host_views_mutex_);
+    host_piece_lookup_ = nullptr;
+  }
+  host_view_device_ = -1;
+  fabric_enabled_ = false;
+  rdma_enabled_ = false;
   if (io_engine_ != nullptr && bounce_buffer_ != nullptr) {
     io_engine_->DeregisterMemory(bounce_ref_.mem);
   }
@@ -201,6 +253,10 @@ TransferRef MoriIoEngine::RegisterMemory(void* base, size_t size, mori::io::Memo
                                          int device) {
   TransferRef ref = TransferRef::HostBytes(base, size, loc, device);
   if (io_engine_ == nullptr || base == nullptr || size == 0) return ref;
+  // Host memory has nothing to register with the fabric: it cannot be
+  // exported, and locally it is reached through a host view. Leaving it
+  // without a descriptor is what tells a peer it cannot name these bytes.
+  if (!rdma_enabled_ && loc != mori::io::MemoryLocationType::GPU) return ref;
   ref.mem = io_engine_->RegisterMemory(base, size, device, loc);
   return ref;
 }
@@ -208,6 +264,106 @@ TransferRef MoriIoEngine::RegisterMemory(void* base, size_t size, mori::io::Memo
 void MoriIoEngine::Deregister(const TransferRef& ref) {
   if (io_engine_ == nullptr || !ref.HasMemoryDesc()) return;
   io_engine_->DeregisterMemory(ref.mem);
+}
+
+// ---------------------------------------------------------------------------
+//  Host memory as a fabric endpoint
+// ---------------------------------------------------------------------------
+
+bool FabricReaches(const mori::io::MemoryDesc& local, const mori::io::MemoryDesc& remote) {
+  if (local.loc != mori::io::MemoryLocationType::GPU ||
+      remote.loc != mori::io::MemoryLocationType::GPU)
+    return false;
+  if (std::all_of(remote.fabricHandle.begin(), remote.fabricHandle.end(),
+                  [](char byte) { return byte == 0; }))
+    return false;
+  const bool local_domain = local.vpodId >= 0 || !local.vpodPpodId.empty();
+  const bool remote_domain = remote.vpodId >= 0 || !remote.vpodPpodId.empty();
+  return local_domain && remote_domain && local.vpodId == remote.vpodId &&
+         local.vpodPpodId == remote.vpodPpodId;
+}
+
+void MoriIoEngine::SetHostPieceLookup(HostPieceLookup lookup) {
+  std::lock_guard<std::mutex> lock(host_views_mutex_);
+  host_piece_lookup_ = std::move(lookup);
+}
+
+bool MoriIoEngine::HostRangeAddressable(const void* ptr, size_t bytes) const {
+  if (io_engine_ == nullptr || host_view_device_ < 0 || ptr == nullptr || bytes == 0) return false;
+  std::lock_guard<std::mutex> lock(host_views_mutex_);
+  if (!host_piece_lookup_) return false;
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
+  for (uintptr_t at = begin; at - begin < bytes;) {
+    HostDevicePiece piece;
+    if (!host_piece_lookup_(reinterpret_cast<const void*>(at), host_view_device_, &piece) ||
+        piece.bytes == 0)
+      return false;
+    at = reinterpret_cast<uintptr_t>(piece.host_base) + piece.bytes;
+  }
+  return true;
+}
+
+void MoriIoEngine::DropHostViews(const void* base, size_t bytes) {
+  std::vector<std::shared_ptr<const HostFabricView>> dropped;
+  {
+    std::lock_guard<std::mutex> lock(host_views_mutex_);
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
+    for (auto it = host_views_.begin(); it != host_views_.end();) {
+      // A view is one whole registered piece, so any overlap retires it.
+      const bool inside = base == nullptr || (it->second->host_base < begin + bytes &&
+                                              begin < it->second->host_base + it->second->bytes);
+      if (!inside) {
+        ++it;
+        continue;
+      }
+      dropped.push_back(std::move(it->second));
+      it = host_views_.erase(it);
+    }
+  }
+  if (io_engine_ == nullptr) return;
+  for (const auto& view : dropped) {
+    try {
+      io_engine_->DeregisterMemory(view->ref.mem);
+    } catch (const std::exception& e) {
+      MORI_UMBP_WARN("[MoriIoEngine] host view deregistration failed: {}", e.what());
+    }
+  }
+}
+
+std::shared_ptr<const HostFabricView> MoriIoEngine::HostViewFor(uintptr_t address) const {
+  if (io_engine_ == nullptr || host_view_device_ < 0) return nullptr;
+  std::lock_guard<std::mutex> lock(host_views_mutex_);
+  auto after = host_views_.upper_bound(address);
+  if (after != host_views_.begin()) {
+    const auto& held = std::prev(after)->second;
+    if (address - held->host_base < held->bytes) return held;
+  }
+  if (!host_piece_lookup_) return nullptr;
+  HostDevicePiece piece;
+  if (!host_piece_lookup_(reinterpret_cast<const void*>(address), host_view_device_, &piece) ||
+      piece.device_base == nullptr || piece.bytes == 0) {
+    return nullptr;
+  }
+  auto view = std::make_shared<HostFabricView>();
+  view->host_base = reinterpret_cast<uintptr_t>(piece.host_base);
+  view->bytes = piece.bytes;
+  view->ref = TransferRef::HostBytes(piece.device_base, piece.bytes,
+                                     mori::io::MemoryLocationType::GPU, host_view_device_);
+  try {
+    // Registered as GPU memory: the fabric backend records the device's vPOD
+    // and finds nothing to export, which is right -- this is a local operand.
+    // RDMA registration is lazy, and the fabric is chosen first for every
+    // pair this view is planned into, so no NIC region is ever made for it.
+    view->ref.mem = io_engine_->RegisterMemory(piece.device_base, piece.bytes, host_view_device_,
+                                               mori::io::MemoryLocationType::GPU);
+  } catch (const std::exception& e) {
+    MORI_UMBP_WARN("[MoriIoEngine] host view registration failed for {} MiB at {}: {}",
+                   piece.bytes >> 20, piece.host_base, e.what());
+    return nullptr;
+  }
+  if (!view->ref.HasMemoryDesc()) return nullptr;
+  host_views_[view->host_base] = view;
+  return view;
 }
 
 std::vector<uint8_t> MoriIoEngine::PackedLocalEngineDesc() const {
@@ -364,6 +520,13 @@ bool MoriIoEngine::CanHandle(const TransferRef& src, const TransferRef& dst) con
   const bool dst_remote = IsRemoteMemory(dst, local_engine_key_);
   if (src_remote == dst_remote) return false;  // both local or both remote
   const TransferRef& local = src_remote ? dst : src;
+  const TransferRef& remote = src_remote ? src : dst;
+  // Host memory a local GPU can address goes over the fabric in one copy.
+  // Asked by the endpoint's base: every piece of one registration is alike.
+  if (IsBounceable(local)) {
+    const auto view = HostViewFor(reinterpret_cast<uintptr_t>(local.host_ptr));
+    if (view != nullptr && FabricReaches(view->ref.mem, remote.mem)) return true;
+  }
   if (local.HasMemoryDesc()) return true;          // zero copy
   return IsBounceable(local) && bounce_size_ > 0;  // staged through the pool
 }
@@ -390,8 +553,13 @@ struct PairKeyHash {
 class MoriIoPlanBuilder final : public TransferPlanBuilder {
  public:
   MoriIoPlanBuilder(const std::string& local_key, uint64_t bounce_size,
-                    const TransferRef& bounce_ref)
-      : local_key_(local_key), bounce_size_(bounce_size), bounce_ref_(bounce_ref) {}
+                    const TransferRef& bounce_ref, bool fabric_strict = false,
+                    const HostFabricViews* host_views = nullptr)
+      : local_key_(local_key),
+        bounce_size_(bounce_size),
+        bounce_ref_(bounce_ref),
+        fabric_strict_(fabric_strict),
+        host_views_(host_views) {}
 
   void Add(const TransferItem& item) override {
     if (item.size == 0) return;
@@ -401,11 +569,76 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
       out_.rejected_tags.push_back(item.tag);
       return;
     }
+    const TransferRef& local = src_remote ? item.dst : item.src;
+    if (host_views_ != nullptr && host_views_->find && IsBounceable(local)) {
+      // A local host endpoint goes over the fabric through the address a local
+      // GPU sees it at. One view is one registered piece, so an item that
+      // crosses a piece boundary becomes one item per piece. Resolve every
+      // part before adding any: an item is carried whole or rejected whole.
+      const TransferRef& remote = src_remote ? item.src : item.dst;
+      const uintptr_t first = reinterpret_cast<uintptr_t>(local.host_ptr) +
+                              (src_remote ? item.dst_offset : item.src_offset);
+      std::vector<TransferItem> parts;
+      bool carried = true;
+      for (uint64_t done = 0; carried && done < item.size;) {
+        const auto view = HostView(first + done);
+        if (view == nullptr || !FabricReaches(view->ref.mem, remote.mem)) {
+          carried = false;
+          break;
+        }
+        const uint64_t in_view = first + done - view->host_base;
+        const uint64_t bytes = std::min<uint64_t>(item.size - done, view->bytes - in_view);
+        TransferItem part = item;
+        part.size = bytes;
+        if (src_remote) {
+          part.src_offset = item.src_offset + done;
+          part.dst = view->ref;
+          part.dst_offset = in_view;
+        } else {
+          part.src = view->ref;
+          part.src_offset = in_view;
+          part.dst_offset = item.dst_offset + done;
+        }
+        parts.push_back(std::move(part));
+        done += bytes;
+      }
+      if (carried) {
+        for (const auto& part : parts) AddResolved(part, src_remote, dst_remote);
+        return;
+      }
+      if (host_views_->required) {
+        out_.rejected_tags.push_back(item.tag);
+        return;
+      }
+    }
+    AddResolved(item, src_remote, dst_remote);
+  }
+
+  TransferPlanSet Finish() override { return std::move(out_); }
+
+ private:
+  // The view holding `address`. Consecutive items usually share a piece, so
+  // the last one answers without asking the engine.
+  std::shared_ptr<const HostFabricView> HostView(uintptr_t address) {
+    if (last_view_ == nullptr || address < last_view_->host_base ||
+        address - last_view_->host_base >= last_view_->bytes) {
+      last_view_ = host_views_->find(address);
+    }
+    return last_view_;
+  }
+
+  void AddResolved(const TransferItem& item, bool src_remote, bool dst_remote) {
     const TransferDirection dir = dst_remote ? TransferDirection::kPush : TransferDirection::kPull;
     const TransferRef& local = src_remote ? item.dst : item.src;
     const TransferRef& remote = src_remote ? item.src : item.dst;
     const uint64_t local_off = src_remote ? item.dst_offset : item.src_offset;
     const uint64_t remote_off = src_remote ? item.src_offset : item.dst_offset;
+    // With the fabric as the only transport, a pair it cannot carry has no
+    // other way across: say so at planning rather than fail the copy later.
+    if (fabric_strict_ && !FabricReaches(local.mem, remote.mem)) {
+      out_.rejected_tags.push_back(item.tag);
+      return;
+    }
 
     if (local.HasMemoryDesc()) {
       auto& candidates = pair_to_plans_[PairKey{item.src.mem.id, item.dst.mem.id}];
@@ -473,14 +706,14 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
         static_cast<char*>(local.host_ptr) + local_off, bounce_off, item.size});
   }
 
-  TransferPlanSet Finish() override { return std::move(out_); }
-
- private:
   static constexpr size_t kMaxSgeBytes = std::numeric_limits<uint32_t>::max();
 
   const std::string& local_key_;
   const uint64_t bounce_size_;
   const TransferRef& bounce_ref_;
+  const bool fabric_strict_;
+  const HostFabricViews* const host_views_;
+  std::shared_ptr<const HostFabricView> last_view_;
   TransferPlanSet out_;
   std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> pair_to_plans_;
   std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> bounce_to_plans_;
@@ -491,7 +724,18 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
 
 std::unique_ptr<TransferPlanBuilder> MoriIoEngine::CreatePlanBuilder(
     size_t /*expected_items*/) const {
-  return MakeRdmaPlanBuilder(local_engine_key_, bounce_size_, bounce_ref_);
+  return std::make_unique<MoriIoPlanBuilder>(local_engine_key_, bounce_size_, bounce_ref_,
+                                             transport_.mode == UMBPTransferMode::kFabricStrict,
+                                             host_view_device_ >= 0 ? &host_views_api_ : nullptr);
+}
+
+std::unique_ptr<TransferPlanBuilder> MakeFabricPlanBuilder(const std::string& local_key,
+                                                           uint64_t bounce_size,
+                                                           const TransferRef& bounce_ref,
+                                                           bool fabric_strict,
+                                                           const HostFabricViews* host_views) {
+  return std::make_unique<MoriIoPlanBuilder>(local_key, bounce_size, bounce_ref, fabric_strict,
+                                             host_views);
 }
 
 std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& local_key,

@@ -28,6 +28,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -264,10 +265,48 @@ struct UMBPMasterClientConfig {
   std::vector<std::string> tags;
 };
 
-// RDMA IO-engine endpoint parameters.
+// Which MORI-IO backends carry bytes between nodes.
+enum class UMBPTransferMode : int {
+  kRdma = 0,          // RDMA only: the default, and unchanged
+  kAuto = 1,          // RDMA, plus the UALink fabric for every pair it can reach
+  kFabricStrict = 2,  // UALink fabric only; needs no RDMA device
+};
+
+// UMBP_TRANSFER_MODE = rdma | auto | fabric_strict.
+inline UMBPTransferMode TransferModeFromEnvironment() {
+  const char* value = std::getenv("UMBP_TRANSFER_MODE");
+  const std::string text = value ? value : "rdma";
+  if (text == "rdma") return UMBPTransferMode::kRdma;
+  if (text == "auto") return UMBPTransferMode::kAuto;
+  if (text == "fabric_strict") return UMBPTransferMode::kFabricStrict;
+  throw std::invalid_argument("UMBP_TRANSFER_MODE must be rdma, auto or fabric_strict");
+}
+
+// IO-engine endpoint and transport parameters.
 struct UMBPIoEngineConfig {
   std::string host;   // RDMA engine hostname (formerly UMBPDistributedConfig::io_engine_host)
   uint16_t port = 0;  // RDMA engine port; 0 = OS-assigned ephemeral port (formerly io_engine_port)
+
+  UMBPTransferMode mode = TransferModeFromEnvironment();
+  // The compiled src/io/kernels/fabric_copy.hip the fabric backend launches.
+  // Required by fabric_strict; without it `auto` stays on RDMA.
+  std::string fabric_kernel_path = [] {
+    const char* value = std::getenv("UMBP_FABRIC_KERNEL_PATH");
+    return value ? std::string(value) : std::string{};
+  }();
+  // Registered host memory (DRAM tier buffers, scratch arenas, registered
+  // caller buffers) may stand as the local end of a fabric copy through the
+  // address a local GPU sees it at. Host memory is never exported, so the
+  // other end is still exportable HBM. UMBP_FABRIC_HOST_ENDPOINTS=0 turns it off.
+  bool fabric_host_endpoints = [] {
+    const char* value = std::getenv("UMBP_FABRIC_HOST_ENDPOINTS");
+    return value == nullptr || std::string(value) != "0";
+  }();
+  // The GPU whose copy kernel serves host endpoints (UMBP_FABRIC_HOST_DEVICE).
+  int fabric_host_device = [] {
+    const char* value = std::getenv("UMBP_FABRIC_HOST_DEVICE");
+    return value && *value ? std::atoi(value) : 0;
+  }();
 };
 
 // Admission policy for re-caching remotely-fetched blocks locally.

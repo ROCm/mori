@@ -214,4 +214,17 @@ void* HostTierRegistration::DeviceAddress(const void* host_ptr, size_t size, int
   return alias + (reinterpret_cast<uintptr_t>(host_ptr) - reinterpret_cast<uintptr_t>(piece->base));
 }
 
+bool HostTierRegistration::DevicePiece(const void* host_ptr, int device_id,
+                                       HostDevicePiece* out) const {
+  const Piece* piece = FindPiece(host_ptr, 1);
+  if (piece == nullptr || out == nullptr || device_id < 0 ||
+      static_cast<size_t>(device_id) >= piece->aliases.size()) {
+    return false;
+  }
+  char* const alias = piece->aliases[static_cast<size_t>(device_id)];
+  if (alias == nullptr) return false;
+  *out = HostDevicePiece{piece->base, piece->bytes, alias};
+  return true;
+}
+
 }  // namespace mori::umbp

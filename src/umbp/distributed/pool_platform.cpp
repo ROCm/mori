@@ -77,18 +77,26 @@ class RealPoolPlatform final : public PoolPlatform {
     }
 #endif
     PeerDirectory* peers = nullptr;
-    if (!config.io_engine.host.empty()) {
+    // The fabric needs no listener, so fabric_strict runs without an RDMA host.
+    if (!config.io_engine.host.empty() ||
+        config.io_engine.mode == UMBPTransferMode::kFabricStrict) {
       mori::io::IOEngineConfig io_cfg;
       io_cfg.host = config.io_engine.host;
       io_cfg.port = config.io_engine.port;
       auto rdma = std::make_unique<MoriIoEngine>(config.master_config.node_id, io_cfg,
-                                                 config.staging_buffer_size);
+                                                 config.staging_buffer_size, config.io_engine);
       if (!rdma->Init()) {
         MORI_UMBP_ERROR("[PoolClient] MoriIoEngine init failed on {}:{}", config.io_engine.host,
                         config.io_engine.port);
         return {};
       }
+      // Host memory the gather kernel can address is also what a fabric copy
+      // can address, so the same registrations serve both.
+      rdma->SetHostPieceLookup([hbm_observer](const void* ptr, int device, HostDevicePiece* out) {
+        return hbm_observer->HostRegionDevicePiece(ptr, device, out);
+      });
       peers = rdma.get();
+      io_engine_ = rdma.get();
       composite->AddEngine(std::move(rdma));
     }
     hbm_engine_ = hbm_observer;
@@ -113,10 +121,18 @@ class RealPoolPlatform final : public PoolPlatform {
                                /*pending_ttl=*/std::chrono::milliseconds{30000},
                                /*read_lease_ttl=*/DramReadLeaseTtl());
       }
-      case TierType::HBM:
+      case TierType::HBM: {
+        // With the fabric in play the pool is allocated exportable, so a GPU
+        // on another tray can read and write it directly.
+        using Allocation = HbmPageMemorySource::Allocation;
+        const auto mode = pool_config.io_engine.mode;
+        const Allocation allocation = mode == UMBPTransferMode::kFabricStrict ? Allocation::kFabric
+                                      : mode == UMBPTransferMode::kAuto ? Allocation::kFabricOrHip
+                                                                        : Allocation::kHip;
         return MakeHbmBackend(page_size, config.hbm.device, config.hbm.buffer_sizes,
                               /*pending_ttl=*/std::chrono::milliseconds{30000},
-                              /*read_lease_ttl=*/DramReadLeaseTtl());
+                              /*read_lease_ttl=*/DramReadLeaseTtl(), allocation);
+      }
       case TierType::SSD: {
         SsdBackend::Config ssd_cfg;
         ssd_cfg.page_size = page_size;
@@ -148,13 +164,25 @@ class RealPoolPlatform final : public PoolPlatform {
   void AddHostGatherRegion(void* ptr, size_t size) override {
     if (hbm_engine_) hbm_engine_->AddHostGatherRegion(ptr, size);
   }
+  void RemoveHostGatherRegion(void* ptr, size_t size) override {
+    // The transport's view of the region goes first: it names the device
+    // address the registration is about to give up.
+    if (io_engine_) io_engine_->DropHostViews(ptr, size);
+    if (hbm_engine_) hbm_engine_->RemoveHostGatherRegion(ptr);
+  }
+  bool HostFabricAddressable(const void* ptr, size_t size) const override {
+    return io_engine_ != nullptr && io_engine_->HostRangeAddressable(ptr, size);
+  }
   void ClearHostGatherRegions() override {
+    if (io_engine_) io_engine_->DropHostViews();
+    io_engine_ = nullptr;
     if (hbm_engine_) hbm_engine_->ClearHostGatherRegions();
     hbm_engine_ = nullptr;
   }
 
  private:
   HbmCopyEngine* hbm_engine_ = nullptr;
+  MoriIoEngine* io_engine_ = nullptr;
 };
 
 }  // namespace

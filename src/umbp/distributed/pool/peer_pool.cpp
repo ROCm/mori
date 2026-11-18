@@ -36,6 +36,7 @@
 
 #include "umbp/common/env_time.h"
 #include "umbp/common/parallel_for.h"
+#include "umbp/distributed/range_map.h"
 
 namespace mori::umbp {
 
@@ -665,7 +666,8 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
             const auto expires_at =
                 ttl_ms == 0 ? std::chrono::steady_clock::time_point::max()
                             : std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms);
-            pending_keys_[requests[index].key] = PendingPlacement{backend_id, slot_id, expires_at};
+            pending_keys_[requests[index].key] = PendingPlacement{
+                backend_id, slot_id, expires_at, PlanOwnerPull(requests[index], &out[index])};
             pending_slots_[{backend_id, slot_id}] = requests[index].key;
             break;
           }
@@ -688,13 +690,205 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
   return out;
 }
 
-std::vector<PoolCommitResult> PeerPool::BatchCommit(
-    const std::vector<PoolCommitRequest>& requests) {
+std::shared_ptr<const PeerPool::PullSlot> PeerPool::PlanOwnerPull(
+    const PoolPlacementRequest& request, PoolAllocateResult* result) const {
+  auto& allocation = result->allocation;
+  if (!request.remote_writer || !request.writer_offers_pull || !FabricDirectEnabled() ||
+      allocation.pages.empty() || allocation.file_ref.IsFile())
+    return nullptr;
+  auto* backend = backends_->Get(result->backend_id);
+  if (backend == nullptr) return nullptr;
+  // Pages the writer can name need no help: HBM, or host memory another
+  // transport registered -- unless the fabric is all the writer has.
+  const TransferRef storage = backend->BufferRef(allocation.pages.front().buffer_index);
+  if (storage.loc != mori::io::MemoryLocationType::CPU ||
+      (storage.HasMemoryDesc() && !request.writer_requires_fabric))
+    return nullptr;
+  auto slot = std::make_shared<PullSlot>();
+  slot->pages = std::move(allocation.pages);
+  slot->page_size = allocation.page_size;
+  slot->size = request.size;
+  allocation.pages.clear();
+  allocation.descs.clear();
+  result->owner_pull = true;
+  return slot;
+}
+
+namespace {
+
+// A local buffer as a bare copy endpoint: the planner needs the address, not
+// the registration a remote peer would use to reach it.
+TransferRef LocalBytes(const TransferRef& buffer) {
+  return TransferRef::HostBytes(buffer.host_ptr, buffer.size, buffer.loc, buffer.device);
+}
+
+// Plans, posts and waits. Tags that were rejected or failed are marked.
+void RunDirectCopies(TransferEngine* engine, const std::vector<TransferItem>& items,
+                     std::vector<char>* failed) {
+  if (items.empty()) return;
+  auto planned = engine->Plan(items);
+  for (size_t tag : planned.rejected_tags) (*failed)[tag] = 1;
+  // A rejected object posts nothing: drop the plans that carry only it.
+  planned.plans.erase(std::remove_if(planned.plans.begin(), planned.plans.end(),
+                                     [&](const TransferPlan& plan) {
+                                       return std::all_of(
+                                           plan.tags.begin(), plan.tags.end(),
+                                           [&](size_t tag) { return (*failed)[tag] != 0; });
+                                     }),
+                      planned.plans.end());
+  if (planned.plans.empty()) return;
+  auto handle = engine->Submit(std::move(planned.plans));
+  if (handle == nullptr) {
+    std::fill(failed->begin(), failed->end(), 1);
+    return;
+  }
+  std::vector<TransferFailure> failures;
+  handle->Wait(&failures);
+  for (const auto& failure : failures)
+    for (size_t tag : failure.tags)
+      if (tag < failed->size()) (*failed)[tag] = 1;
+}
+
+}  // namespace
+
+bool PeerPool::KnowsFabricPeer(const char* role, const FabricDirectPeer& peer) const {
+  if (fabric_peers_ == nullptr || peer.node_id.empty()) return false;
+  // Registered once: a repeat would only reset the engine's routing cache.
+  const std::string name = role + peer.node_id;
+  return fabric_peers_->HasRemoteEngine(name) ||
+         fabric_peers_->EnsureRemoteEngine(name, peer.engine_desc);
+}
+
+bool PeerPool::PullIntoSlot(uint32_t backend_id, const PullSlot& slot,
+                            const std::vector<FabricDirectRange>& wanted) {
+  auto* backend = backends_ == nullptr ? nullptr : backends_->Get(backend_id);
+  if (backend == nullptr) return false;
+  // The ranges must account for every byte the commit will publish.
+  auto ranges = wanted;
+  std::sort(ranges.begin(), ranges.end(),
+            [](const auto& a, const auto& b) { return a.object_offset < b.object_offset; });
+  uint64_t covered = 0;
+  for (const auto& range : ranges) {
+    if (range.size == 0 || range.object_offset != covered || range.size > slot.size - covered)
+      return false;
+    covered += range.size;
+  }
+  if (covered != slot.size) return false;
+
+  std::vector<TransferItem> items;
+  for (const auto& range : ranges) {
+    const bool walked = ForEachRangePageFragment(
+        slot.pages, slot.page_size, slot.size, range.object_offset, range.size,
+        [&](size_t page, uint64_t tier_offset, size_t fragment, size_t copied) {
+          TransferItem item;
+          item.tag = 0;
+          item.src = range.remote;
+          item.src_offset = range.remote_offset + copied;
+          item.dst = LocalBytes(backend->BufferRef(slot.pages[page].buffer_index));
+          item.dst_offset = tier_offset;
+          item.size = fragment;
+          if (!item.dst.HasHostPtr() || tier_offset > item.dst.size ||
+              fragment > item.dst.size - tier_offset)
+            return false;
+          items.push_back(std::move(item));
+          return true;
+        });
+    if (!walked) return false;
+  }
+  std::vector<char> failed(1, 0);
+  RunDirectCopies(transfer_engine_, items, &failed);
+  return failed[0] == 0;
+}
+
+std::vector<bool> PeerPool::PushToReader(const std::vector<std::string>& keys,
+                                         const std::vector<std::vector<FabricDirectRange>>& ranges,
+                                         const FabricDirectPeer& reader) {
+  std::vector<bool> out(keys.size(), false);
+  if (!FabricDirectEnabled() || ranges.size() != keys.size() || !KnowsFabricPeer("push:", reader))
+    return out;
+  // A local resolve: every hit carries a hold that keeps its pages where they
+  // are until this function drops it, which is after the copies finish.
+  auto resolved =
+      BatchResolve(keys, /*include_descs=*/false, /*allow_file_refs=*/false, ResolveReader::kLocal);
+  std::lock_guard<std::mutex> direct_lock(fabric_direct_mutex_);
+  std::vector<TransferItem> items;
+  std::vector<char> failed(keys.size(), 1);
+  std::vector<uint64_t> bytes(keys.size(), 0);
+  for (size_t i = 0; i < keys.size() && i < resolved.size(); ++i) {
+    const auto& entry = resolved[i];
+    const auto& found = entry.resolved;
+    auto* backend = backends_->Get(entry.backend_id);
+    if (!found.found || backend == nullptr || found.pages.empty() || found.page_size == 0 ||
+        found.file_ref.IsFile() || ranges[i].empty())
+      continue;
+    // A staged medium may publish only a window of the object.
+    const uint64_t window_begin = found.covered_size == 0 ? 0 : found.covered_offset;
+    const uint64_t window_bytes = found.covered_size == 0 ? found.size : found.covered_size;
+    const size_t first_item = items.size();
+    bool ok = true;
+    for (const auto& range : ranges[i]) {
+      if (range.size == 0 || range.object_offset < window_begin ||
+          range.object_offset - window_begin > window_bytes ||
+          range.size > window_bytes - (range.object_offset - window_begin) ||
+          range.remote_offset > range.remote.size ||
+          range.size > range.remote.size - range.remote_offset) {
+        ok = false;
+        break;
+      }
+      ok = ForEachRangePageFragment(
+          found.pages, found.page_size, window_bytes, range.object_offset - window_begin,
+          range.size, [&](size_t page, uint64_t tier_offset, size_t fragment, size_t copied) {
+            TransferItem item;
+            item.tag = i;
+            item.src = LocalBytes(backend->BufferRef(found.pages[page].buffer_index));
+            item.src_offset = tier_offset;
+            item.dst = range.remote;
+            item.dst_offset = range.remote_offset + copied;
+            item.size = fragment;
+            if (!item.src.HasHostPtr() || tier_offset > item.src.size ||
+                fragment > item.src.size - tier_offset)
+              return false;
+            items.push_back(std::move(item));
+            return true;
+          });
+      if (!ok) break;
+      bytes[i] += range.size;
+    }
+    if (!ok) {
+      items.resize(first_item);
+      continue;
+    }
+    failed[i] = 0;
+  }
+  RunDirectCopies(transfer_engine_, items, &failed);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    out[i] = failed[i] == 0;
+    if (out[i]) {
+      pushed_reads_.fetch_add(1, std::memory_order_relaxed);
+      pushed_bytes_.fetch_add(bytes[i], std::memory_order_relaxed);
+    } else if (i < resolved.size() && resolved[i].resolved.found) {
+      fabric_direct_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  return out;
+}
+
+std::vector<PoolCommitResult> PeerPool::BatchCommit(const std::vector<PoolCommitRequest>& requests,
+                                                    const FabricDirectPeer* writer) {
   // Backend commits run without operation_mutex_; this keeps ClearLocal out meanwhile.
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  // A commit that carries pull ranges has this node's GPU read the writer's
+  // memory. Taken before the slot is claimed, so a repeated commit of the same
+  // slot answers only once the first one's copy has finished.
+  const bool pulling = std::any_of(requests.begin(), requests.end(),
+                                   [](const auto& request) { return !request.pull.empty(); });
+  std::unique_lock<std::mutex> direct_lock(fabric_direct_mutex_, std::defer_lock);
+  if (pulling) direct_lock.lock();
   std::unique_lock<std::mutex> operation_lock(operation_mutex_);
   std::vector<PoolCommitResult> out(requests.size());
   if (backends_ == nullptr) return out;
+  // Owner-pull slots claimed below: request index -> the pages to fill.
+  std::map<size_t, std::shared_ptr<const PullSlot>> to_pull;
 
   const auto release_pending = [&](const PoolSlotRef& slot) {
     auto pending = pending_slots_.find({slot.backend_id, slot.local_slot_id});
@@ -728,6 +922,24 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
     }
     // Claimed: a second commit of this slot finds nothing, and the key stays
     // reserved so racing puts see it in flight. No expiry: a hung commit pins it.
+    if (pending->second.pull != nullptr) {
+      // The backend reaps an uncommitted slot at its own deadline, whatever
+      // this pool has claimed. Start the copy only with that deadline far
+      // enough away that the reaper cannot hand these pages to someone else
+      // underneath it; a writer commits an owner-pull slot at once, so a slot
+      // this close to expiry is one whose writer stalled.
+      const auto budget =
+          std::chrono::seconds(5) + std::chrono::milliseconds(pending->second.pull->size >> 20);
+      if (pending->second.expires_at != std::chrono::steady_clock::time_point::max() &&
+          pending->second.expires_at - std::chrono::steady_clock::now() < budget) {
+        auto* backend = backends_->Get(requests[i].slot.backend_id);
+        if (backend != nullptr) backend->BatchAbort({requests[i].slot.local_slot_id});
+        release_pending(requests[i].slot);
+        fabric_direct_failures_.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      to_pull.emplace(i, pending->second.pull);
+    }
     accepted_slots.insert(slot_key);
     pending_slots_.erase(slot);
     pending->second.expires_at = std::chrono::steady_clock::time_point::max();
@@ -737,17 +949,47 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
   // Unlocked: an SSD commit is the device write, and every lookup and read
   // needs this lock.
   operation_lock.unlock();
+  // Fill the owner-pull slots first: the backend commit below publishes the
+  // key, and until this copy has finished its pages hold nothing.
+  std::set<size_t> unfilled;
+  if (!to_pull.empty()) {
+    const bool writer_known = writer != nullptr && KnowsFabricPeer("pull:", *writer);
+    for (const auto& [index, slot] : to_pull) {
+      if (writer_known &&
+          PullIntoSlot(requests[index].slot.backend_id, *slot, requests[index].pull)) {
+        pulled_writes_.fetch_add(1, std::memory_order_relaxed);
+        pulled_bytes_.fetch_add(slot->size, std::memory_order_relaxed);
+        continue;
+      }
+      unfilled.insert(index);
+      fabric_direct_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   std::map<uint32_t, std::vector<CommitResult>> results;
-  for (const auto& [backend_id, indices] : by_backend) {
+  for (auto& [backend_id, indices] : by_backend) {
     auto* backend = backends_->Get(backend_id);
     if (backend == nullptr) continue;
     std::vector<CommitRequest> backend_requests;
+    std::vector<uint64_t> abandoned;
+    std::vector<CommitResult> backend_results(indices.size());
+    std::vector<size_t> committed;
     backend_requests.reserve(indices.size());
-    for (size_t index : indices) {
+    for (size_t i = 0; i < indices.size(); ++i) {
+      const size_t index = indices[i];
+      if (unfilled.count(index) != 0) {
+        // Never published: the pages go back, and the commit reports failure.
+        abandoned.push_back(requests[index].slot.local_slot_id);
+        continue;
+      }
+      committed.push_back(i);
       backend_requests.push_back(
           CommitRequest{requests[index].slot.local_slot_id, requests[index].key});
     }
-    results[backend_id] = backend->BatchCommit(backend_requests);
+    if (!abandoned.empty()) backend->BatchAbort(abandoned);
+    auto done = backend->BatchCommit(backend_requests);
+    for (size_t k = 0; k < committed.size() && k < done.size(); ++k)
+      backend_results[committed[k]] = done[k];
+    results[backend_id] = std::move(backend_results);
   }
   operation_lock.lock();
 
@@ -776,6 +1018,11 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
 }
 
 std::vector<bool> PeerPool::BatchAbort(const std::vector<PoolSlotRef>& slots) {
+  // An abort answers "these pages are free again". Wait out an owner-pull
+  // copy first: it may be the one writing them, and the writer takes this
+  // answer as leave to reuse the memory that copy is reading.
+  std::unique_lock<std::mutex> direct_lock(fabric_direct_mutex_, std::defer_lock);
+  if (FabricDirectEnabled()) direct_lock.lock();
   std::lock_guard<std::mutex> operation_lock(operation_mutex_);
   std::vector<bool> out(slots.size(), true);
   if (backends_ == nullptr) return out;

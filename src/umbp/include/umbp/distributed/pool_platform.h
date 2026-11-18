@@ -52,7 +52,11 @@ class PoolPlatform {
   virtual HostBufferHandle AllocateHost(size_t size, const HostBufferOptions& options = {}) = 0;
   virtual void FreeHost(HostBufferHandle& buffer) = 0;
   virtual void AddHostGatherRegion(void*, size_t) {}
+  // Undoes AddHostGatherRegion for one region, including any transport view of it.
+  virtual void RemoveHostGatherRegion(void*, size_t) {}
   virtual void ClearHostGatherRegions() {}
+  // Whether the fabric can carry this host range now, through a local GPU.
+  virtual bool HostFabricAddressable(const void*, size_t) const { return false; }
 };
 
 std::shared_ptr<PoolPlatform> MakePoolPlatform(const UMBPSimConfig& sim);

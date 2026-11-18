@@ -24,6 +24,10 @@ service UMBPPeer {
   rpc BatchCommitSlots  (BatchCommitSlotsRequest)   returns (BatchCommitSlotsResponse);
   rpc BatchAbortSlots   (BatchAbortSlotsRequest)    returns (BatchAbortSlotsResponse);
   rpc BatchResolveKeys  (BatchResolveKeysRequest)   returns (BatchResolveKeysResponse);
+  // Owner push: this peer's GPU copies the requested ranges straight into the
+  // reader's fabric-exportable HBM. The one-hop way to read a host-resident
+  // tier over a UALink fabric, which cannot name host memory.
+  rpc BatchPushKeys     (BatchPushKeysRequest)      returns (BatchPushKeysResponse);
 }
 
 // ============================================================
@@ -77,6 +81,13 @@ message AllocateSlotRequest {
   // buffer on that node, so the reader that wrote the object fetches it through
   // NICs on the same node index at both ends.  Absent: no preference.
   optional int32 preferred_numa_node = 6;
+  // The writer reaches this node over the UALink fabric only. It cannot use a
+  // descriptor that only another transport can carry.
+  bool require_fabric = 7;
+  // The writer's source is fabric-exportable HBM. An owner whose slot is in a
+  // host-resident tier may then copy the source itself, in one hop, when the
+  // write commits: see AllocateSlotResponse.owner_pull.
+  bool offer_owner_pull = 8;
 }
 // AllocateSlot / BatchAllocateSlots per-entry outcome.
 // FAILED_NO_SPACE is split out so the writer can keep retrying with
@@ -104,6 +115,10 @@ message AllocateSlotResponse {
   // Which backend `pages` index into.  One per response, not one per page: a
   // slot lives entirely in one medium.
   uint32              backend_id     = 7;
+  // No pages are published. The writer sends nothing itself and names its
+  // source ranges in the commit; the owner's GPU reads them over the fabric
+  // straight into the tier before publishing the key.
+  bool                owner_pull     = 8;
 }
 
 // Commit moves pending → owned.  After a successful commit the peer
@@ -169,12 +184,43 @@ message BatchAllocateSlotsResponse {
   repeated AllocateSlotResponse entries = 1;
 }
 
+// One byte range of an object and where it lives in the requester's
+// fabric-exportable HBM: `desc` is that memory's packed mori-io descriptor.
+message FabricDirectRange {
+  uint64 object_offset = 1;
+  uint64 length        = 2;
+  bytes  desc          = 3;
+  uint64 offset        = 4;
+}
 message BatchCommitSlotEntry {
   uint64 slot_id = 1;
   string key     = 2;
+  // Owner-pull slots only: source ranges that tile the object. The source
+  // must stay unchanged until this commit, or an abort of the slot, replies.
+  repeated FabricDirectRange pull = 3;
 }
 message BatchCommitSlotsRequest {
   repeated BatchCommitSlotEntry entries = 1;
+  // Set with any `pull`: who the owner reads from.
+  string writer_id   = 2;
+  bytes  engine_desc = 3;
+}
+
+message PushKey {
+  string key = 1;
+  // Destination ranges. The reader keeps them valid until the reply arrives.
+  repeated FabricDirectRange ranges = 2;
+}
+message BatchPushKeysRequest {
+  string reader_id   = 1;
+  bytes  engine_desc = 2;
+  repeated PushKey keys = 3;
+}
+message BatchPushKeysResponse {
+  // Per key: every requested byte has landed. False covers a miss, a tier
+  // this peer cannot address directly, and a failed copy alike; the reader
+  // falls back to whatever other path it has.
+  repeated bool success = 1;
 }
 message BatchCommitSlotsResponse {
   repeated bool success = 1;

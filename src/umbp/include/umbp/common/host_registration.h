@@ -39,6 +39,15 @@ bool HostRegistrationEnabled();
 // region whole.
 size_t HostRegistrationChunkBytes();
 
+// One registered piece of host memory as one device addresses it. A copy that
+// runs on that device may name any range inside the piece by offset from
+// `device_base`; nothing outside the piece is reachable through it.
+struct HostDevicePiece {
+  void* host_base = nullptr;
+  size_t bytes = 0;
+  void* device_base = nullptr;
+};
+
 // Makes a host region addressable from GPU kernels via hipHostRegister.
 //
 // Two things depend on this. A gather kernel cannot dereference plain mmap
@@ -88,6 +97,15 @@ class HostTierRegistration {
   // null when that range is not inside one registered piece or the device has
   // no alias, in which case the caller must stay on the copy-engine path.
   void* DeviceAddress(const void* host_ptr, size_t size, int device_id) const;
+
+  // The whole registered piece holding `host_ptr` as `device_id` sees it, or
+  // false under the conditions DeviceAddress() returns null for. A transport
+  // that registers the device view once per piece needs the piece, not a
+  // translated range.
+  bool DevicePiece(const void* host_ptr, int device_id, HostDevicePiece* out) const;
+
+  // The address this registration was created for.
+  const void* Base() const { return base_; }
 
  private:
   struct Piece {
