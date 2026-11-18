@@ -262,6 +262,11 @@ message ValidateReadsRequest {
   repeated string keys       = 1;
   repeated uint32 backend_id = 2;
   repeated uint64 generation = 3;
+  // The reader is done with every copy listed, read or not: the peer may stop
+  // holding them for it now rather than when the read lease runs out.  Each
+  // resolve answer a reader keeps is listed once.  An old reader never sets
+  // this, and what it resolved waits out the lease as before.
+  bool release = 4;
 }
 
 message ValidateReadsResponse {

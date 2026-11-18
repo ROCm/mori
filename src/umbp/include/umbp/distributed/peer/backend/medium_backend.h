@@ -465,6 +465,17 @@ class MediumBackend : public MetricSource {
     return std::vector<bool>(keys.size(), true);
   }
 
+  // BatchStillHolds from a remote reader that is now done with these copies:
+  // the same answers, and the medium may stop holding for that reader what a
+  // read lease would otherwise keep until its timer runs out.  Called once per
+  // resolve answer the reader was given, whether or not its read landed.  A
+  // reader that never calls leaves the lease to the timer.  The default suits
+  // a medium with nothing to give back early.
+  virtual std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                             const std::vector<uint64_t>& generations) {
+    return BatchStillHolds(keys, generations);
+  }
+
   // The medium's only eviction path, reached via PeerPool::Evict: frees keys a
   // lease or pin doesn't protect and queues a REMOVE for each.  Idempotent.
   virtual std::vector<EvictResult> Evict(const std::vector<std::string>& keys) = 0;

@@ -677,7 +677,10 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
     for (size_t i = 0; i < keys.size(); ++i) {
       auto it = read_leases_.find(keys[i]);
       if (it != read_leases_.end()) {  // a whole-object lease serves any extent too
-        if (!local) it->second.expires_at = now + cfg_.read_lease_ttl;
+        if (!local) {
+          it->second.expires_at = now + cfg_.read_lease_ttl;
+          ++it->second.remote_readers;
+        }
         publish(results[i], it->second);
         continue;
       }
@@ -880,6 +883,8 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       ReleaseStagingSpanLocked(read.span);
       if (!local) it->second.expires_at = lease_deadline;
     }
+    // One per answer: a key asked twice in a batch is finished twice.
+    if (!local) it->second.remote_readers += static_cast<uint32_t>(read.results.size());
     for (size_t index : read.results) publish(results[index], it->second);
     finish_stage(read, ResolveOutcome::kFound, it->second.span, it->second.size, it->second.hold);
   }
@@ -993,6 +998,37 @@ std::vector<bool> SsdBackend::BatchStillHolds(const std::vector<std::string>& ke
     auto it = read_leases_.find(keys[i]);
     out[i] = it != read_leases_.end() && it->second.generation == gen;
   }
+  return out;
+}
+
+// The timer exists because a one-sided read never says when it is done.  Here
+// the reader says so.  The lease is expired, not freed: a resolve that arrives
+// before the span is reclaimed still finds it staged, and a local reader's hold
+// still keeps it, both exactly as for a lease whose timer ran out.
+std::vector<bool> SsdBackend::BatchFinishReads(const std::vector<std::string>& keys,
+                                               const std::vector<uint64_t>& generations) {
+  std::vector<bool> out(keys.size(), false);
+  const auto now = std::chrono::steady_clock::now();
+  uint64_t released = 0;
+  std::lock_guard<std::mutex> lk(mutex_);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    const uint64_t gen = i < generations.size() ? generations[i] : 0;
+    if (gen == 0) {
+      out[i] = true;
+      continue;
+    }
+    auto it = read_leases_.find(keys[i]);
+    // Another generation is another copy, with readers of its own.
+    if (it == read_leases_.end() || it->second.generation != gen) continue;
+    out[i] = true;
+    ReadLease& lease = it->second;
+    if (lease.remote_readers == 0 || --lease.remote_readers != 0) continue;
+    if (lease.expires_at > now) {
+      lease.expires_at = now;
+      ++released;
+    }
+  }
+  staging_reader_releases_.fetch_add(released, std::memory_order_relaxed);
   return out;
 }
 
@@ -1245,6 +1281,8 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
   // The put side of the same pressure: allocations refused for lack of a span.
   event("staging_put_full_reject", put_full_rejects_.load(std::memory_order_relaxed));
   event("staging_expired_reclaim", staging_expired_reclaims_.load(std::memory_order_relaxed));
+  // Leases ended by their readers (ValidateReads with release) ahead of the timer.
+  event("staging_reader_release", staging_reader_releases_.load(std::memory_order_relaxed));
   // Reads that staged only an extent (D1), and their bytes.
   event("extent_stage", extent_stages_total_.load(std::memory_order_relaxed));
   bytes("extent_stage", extent_stage_bytes_.load(std::memory_order_relaxed));

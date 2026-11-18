@@ -4779,6 +4779,13 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
   if (!PrepareRemoteGetEntries(items, peer, stub, &inflight->entries, results)) {
     return nullptr;
   }
+  // A batch given up between here and the post never reaches
+  // WaitRemoteBatchGet, where the peer is told its copies are no longer needed.
+  // Tell it on the way out, so they do not wait for their read leases.
+  auto abandon = [&] {
+    for (auto& entry : inflight->entries) entry.failed = true;
+    ValidateRemoteGetEntries(peer, inflight->entries);
+  };
 
   // Everything between the resolve reply and the RDMA being in flight.
   PhaseTimer build_timer(t_remote_leg ? t_remote_leg->build : nullptr);
@@ -4789,6 +4796,7 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
         "[PoolClient] SubmitRemoteBatchGet: BuildRemoteGetTransfers failed, node='{}' entries={}",
         first.route.node_id, inflight->entries.size());
     for (auto& entry : inflight->entries) (*results)[entry.result_index] = false;
+    abandon();
     return nullptr;
   }
 
@@ -4802,6 +4810,7 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
     for (auto& entry : inflight->entries) {
       if (entry.failed) (*results)[entry.result_index] = false;
     }
+    abandon();
     return nullptr;
   }
 
@@ -4822,6 +4831,7 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
     for (auto& entry : inflight->entries) {
       if (entry.failed) (*results)[entry.result_index] = false;
     }
+    abandon();
     return nullptr;
   }
   // POST; do NOT wait.  Everything the post references is owned by the returned
@@ -4831,6 +4841,7 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
   inflight->handle = transfer_engine_->Submit(std::move(planned.plans));
   if (inflight->handle == nullptr) {
     for (auto& entry : inflight->entries) (*results)[entry.result_index] = false;
+    abandon();
     return nullptr;
   }
   return inflight;
@@ -5148,20 +5159,27 @@ void PoolClient::ValidateRemoteGetEntries(PeerConnection& peer,
                                           std::vector<RemoteGetEntry>& entries) {
   if (!RemoteReadValidateEnabled()) return;
 
-  // Ask only about reads that landed and carry a generation.  0 means the
-  // medium does not stamp copies, or the peer predates the field and so has no
-  // ValidateReads to call either.
+  // Name every entry that carries a generation.  0 means the medium does not
+  // stamp copies, or the peer predates the field and so has no ValidateReads to
+  // call either.  The answer matters only for reads that landed (`asked`); a
+  // read that already failed is listed so the peer can stop holding its copy
+  // for us, which is what `release` asks for the whole list.
   ::umbp::ValidateReadsRequest req;
-  std::vector<size_t> asked;
+  req.set_release(true);
+  std::vector<size_t> asked;    // entries whose answer is used
+  std::vector<int> asked_slot;  // their position in the request
   for (size_t i = 0; i < entries.size(); ++i) {
     const auto& entry = entries[i];
-    if (entry.failed || entry.generation == 0) continue;
+    if (entry.generation == 0) continue;
+    if (!entry.failed) {
+      asked.push_back(i);
+      asked_slot.push_back(req.keys_size());
+    }
     req.add_keys(*entry.item->key);
     req.add_backend_id(entry.plan.backend_id);
     req.add_generation(entry.generation);
-    asked.push_back(i);
   }
-  if (asked.empty()) return;
+  if (req.keys_size() == 0) return;
 
   auto drop = [&](const std::vector<size_t>& which, const char* reason) {
     for (size_t i : which) entries[i].failed = true;
@@ -5181,7 +5199,9 @@ void PoolClient::ValidateRemoteGetEntries(PeerConnection& peer,
     ctx.set_deadline(std::chrono::system_clock::now() + ResolveBusyRetryTimeout());
     status = stub->ValidateReads(&ctx, req, &resp);
   }
-  if (!status.ok() || resp.still_valid_size() != static_cast<int>(asked.size())) {
+  if (!status.ok() || resp.still_valid_size() != req.keys_size()) {
+    // Nothing landed: the call was only a release, and the leases time out.
+    if (asked.empty()) return;
     MORI_UMBP_WARN("[PoolClient] ValidateReads failed on {} ({} keys): {}", peer.node_id,
                    asked.size(), status.ok() ? "answer count mismatch" : status.error_message());
     drop(asked, "unverified");
@@ -5190,7 +5210,7 @@ void PoolClient::ValidateRemoteGetEntries(PeerConnection& peer,
 
   std::vector<size_t> stale;
   for (size_t j = 0; j < asked.size(); ++j) {
-    if (!resp.still_valid(static_cast<int>(j))) stale.push_back(asked[j]);
+    if (!resp.still_valid(asked_slot[j])) stale.push_back(asked[j]);
   }
   if (stale.empty()) return;
   MORI_UMBP_WARN(

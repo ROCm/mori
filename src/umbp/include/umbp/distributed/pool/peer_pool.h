@@ -152,9 +152,12 @@ class PeerPool {
   // resolved against still the copy here?  False when the backend is gone or
   // the copy was freed or replaced since, so the reader drops what it read.
   // The three vectors are parallel; one answer per key, in order.
+  // `release`: the reader is also done with every copy named, so each backend
+  // may stop holding it for that reader (MediumBackend::BatchFinishReads).
   std::vector<bool> ValidateResolved(const std::vector<uint32_t>& backend_ids,
                                      const std::vector<std::string>& keys,
-                                     const std::vector<uint64_t>& generations);
+                                     const std::vector<uint64_t>& generations,
+                                     bool release = false);
 
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
