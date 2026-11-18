@@ -12,7 +12,12 @@ description: >-
   bug or an environment/toolchain problem. Also: (2) on ROCm 7.0-7.2.x a clr
   hipMemSetAccess sub-buffer bug makes mori-cco 2-node ccoDevCommCreate fail with
   "hipMemSetAccess ... invalid argument"; (3) on ROCm 7.2.x clr routes uncached VMM
-  allocations to the coarse-grained pool, making cco combine ~10-15us slower.
+  allocations to the coarse-grained pool, making cco combine ~10-15us slower; (4) amdgpu
+  miscounts VRAM registered with a NIC (MoRI-IO, UMBP, Mooncake): later allocations, kernel
+  loads or new streams fail with OOM, HIP error 209 or a segfault in HIPStream::stream()
+  although VRAM is free, or hipMemGetInfo exceeds the card. It behaves differently on
+  amdgpu-dkms 30.x and 31.10-31.60. The fix is upstream and in an internal amdgpu-dkms
+  build; no public amdgpu-dkms release has it, but the upstream patch applies to DKMS.
 ---
 
 # MORI Known Issues
@@ -401,3 +406,138 @@ the uncached flag into `deviceVmemAlloc` (it is hard-coded to `0`), and in
 `gpu_ext_fine_grained_segment_` when the uncached flag is set and that pool exists, else
 fall back to `gpuvm_segment_` (unchanged for every non-uncached allocation). Both Issue 2
 and Issue 3 ship in a single rebuilt `libamdhip64.so`.
+
+---
+
+## Issue 4 — amdgpu miscounts RDMA-registered VRAM: OOM while VRAM is free
+
+**Affects:** anything that registers HIP VRAM with a NIC (MoRI-IO, UMBP, shmem / cco
+proxy heaps, Mooncake) on every public amdgpu-dkms release (checked through 31.60, 7.1.9)
+and on in-tree amdgpu without the upstream fix. Only the KFD free-VRAM count is wrong;
+physical usage (`mem_info_vram_used`) is right. ROCm/mori#721.
+
+**Symptoms**, after the first MoRI-IO transfer (it registers lazily) or after a KV cache is
+registered:
+
+- Later allocations, kernel loads or new streams fail although VRAM is free:
+  `hipErrorOutOfMemory`, `HSA_STATUS_ERROR_OUT_OF_RESOURCES`, Triton
+  `HIP error 209: no kernel image is available`, or a segfault in
+  `c10::hip::HIPStream::stream()` at the first new stream (ROCm 7.2).
+- `hipMemGetInfo` drops by the registered size, or stays normal while allocations fail
+  (31.10 – 31.60 with peer memory), or reports more free VRAM than the card has (several
+  peer-memory MRs on one buffer).
+- Once a GPU is past the limit, a process started afterwards may fail to initialize any
+  GPU on the host, not only that one: `rocminfo` lists no GPU agents and
+  `hipGetDeviceCount` returns `hipErrorNoDevice` (seen with 31.40 on MI355X VFs).
+
+**Root cause:** KFD counts a `hipMalloc` buffer once as used (`kfd.vram_used`) and again
+as pinned (`vram_pin_size`) once a NIC pins it. A credit, `kfd.vram_pinned`, is meant to
+cancel the second count, but only the amdgpu peer-memory client (`ibv_reg_mr`, DKMS only)
+adds it, once per MR; dma-buf pins (`ibv_reg_dmabuf_mr`) never do. On 31.10 – 31.60 the
+allocation limit, `amdgpu_amdkfd_reserve_mem_limit()`, does not read the credit at all.
+
+With S the size of the registered allocation (the whole `hipMalloc` buffer) and N the
+number of peer-memory MRs on it:
+
+| amdgpu | `hipMemGetInfo` | Allocation limit | Result |
+|---|---|---|---|
+| amdgpu-dkms 30.10 – 30.30.4 (6.14.14, 6.16.6, 6.16.13) | dma-buf −S; peer memory +(N−1)·S | Same as `hipMemGetInfo` | dma-buf: OOM. Peer memory: fine; N > 1 over-reports, harmless unless something sizes allocations from it |
+| amdgpu-dkms 31.10 – 31.60 (6.18.4 – 7.1.9, incl. 6.19.14.31400000 / .31400100) | dma-buf −S; peer memory +(N−1)·S | −S for either path | OOM for either path; with peer memory `hipMemGetInfo` looks normal |
+| In-tree amdgpu without the fix: mainline 6.9 – 7.3, and stable / longterm kernels without the backport | −S (dma-buf only; in-tree amdgpu has no peer-memory client) | −S | OOM |
+| amdgpu-dkms 31.40.1.1 (6.19.14.31400101, AMD internal) or rebuilt with 2/2; Linux 7.4-rc1+, 7.3.4+, 6.18.63+, 6.12.118+ | Exact | Exact | Fine |
+
+**30.x vs 31.10 – 31.60:** `hipMemGetInfo` is computed the same way on both; the
+allocation limit is what changed.
+
+- **30.x:** the limit uses the same count as `hipMemGetInfo`, credit included. Only
+  dma-buf registration breaks allocations, and `hipMemGetInfo` shows it. Registering
+  through peer memory, or adding an anchor MR, avoids it.
+- **31.10 – 31.60:** the limit no longer credits pins, so any registration breaks
+  allocations, through peer memory as well. With peer memory, `hipMemGetInfo` still looks
+  normal and hides the problem. Nothing on the registration side helps.
+
+Measured:
+
+- **6.16.6:** registering 32 GiB through dma-buf lowers `hipMemGetInfo` by 32 GiB, and a
+  later 239 GiB allocation fails.
+- **6.19.14.31400000** (MI355X VF, 308.9 GB of VRAM): allocations fail once used plus
+  registered VRAM exceeds 308.9 GB. 161 GB used + 150 GB registered fails; 146 + 135 GB
+  works.
+- **6.19.14.31400100:** registering 40 GiB lowers the largest accepted allocation by
+  80 GiB, through dma-buf and through peer memory alike (kvcache-ai/Mooncake#5583).
+
+The other rows come from the driver sources.
+
+Related, but not a driver-version issue: if a process is killed while its MRs pin a
+buffer and the kernel logs `WARNING ... ttm_bo_release`, the BO was freed still pinned
+and the counts stay wrong on that GPU until reboot (seen once on 6.16.13, ROCm/mori#721).
+
+**Which path MoRI takes:** `RegisterRdmaMemoryRegionAuto` tries `ibv_reg_mr` (peer memory)
+first and falls back to dma-buf; `MORI_ENABLE_DMABUF_REG=1` puts dma-buf first.
+
+Peer memory needs two things:
+
+- amdgpu-dkms, whose PeerDirect client registers itself with the kernel;
+- a kernel that exports the peer-memory API, either through the NIC package's
+  `ib_peer_mem` module or through MLNX OFED's `ib_uverbs` / `ib_core`.
+
+With MLNX OFED 24.10 there is no `ib_peer_mem` module and no `/sys/kernel/mm/memory_peers`,
+yet peer memory works. Check `grep ib_register_peer_memory_client /proc/kallsyms` instead of
+`lsmod`.
+
+VMM memory (`hipMemCreate`, e.g. vLLM sleep mode or PyTorch `expandable_segments`) cannot
+be registered through peer memory (`ibv_reg_mr` fails with ENOMEM), so it always ends up
+on dma-buf. With `MORI_APP_LOG_LEVEL=warn` a fallback shows as
+`RegisterRdmaMemoryRegionAuto ibv_reg_mr registration failed`.
+
+**Detection:** `cat /sys/module/amdgpu/version`, compared in full: 31.40.1 and the internal
+31.40.1.1 are both 6.19.14, and only `.31400101` is fixed. A DKMS rebuilt with 2/2 keeps
+its original version string. Without that file the driver is in-tree; check `uname -r`.
+Then compare `hipMemGetInfo` with `/sys/class/drm/card*/device/mem_info_vram_used` before
+and after registration.
+
+**Fix:** two upstream commits. amdgpu-dkms has carried 1/2 since at least 6.14, so a DKMS
+build needs only 2/2.
+
+- 1/2 [amdkfd: Fix memory availability double accounting of kfd pinned objects](https://github.com/torvalds/linux/commit/16df12d7158fb55f20d6e985abd1996cbabab9f8)
+  adds the `kfd.vram_pinned` credit, to `hipMemGetInfo` only.
+- 2/2 [drm/amdkfd: correct vram_available calculation](https://github.com/torvalds/linux/commit/9131cc85d0dedd8ba4cae60dbe5985d081551f30)
+  makes the allocation limit use the same count, and credits each KFD BO once at its
+  first pin, dma-buf included.
+
+They were posted to amd-gfx as v6
+[1/2](https://lists.freedesktop.org/archives/amd-gfx/2026-September/153709.html) and
+[2/2](https://lists.freedesktop.org/archives/amd-gfx/2026-September/153710.html); the
+archived mails are whitespace-damaged, so take the commits.
+
+- **amdgpu-dkms:** no public release has 2/2 (checked through 31.60). It is in the internal
+  31.40.1.1 build (6.19.14.31400101), which is public 31.40.1 plus 2/2:
+  https://osibuilds.amd.com/dashboard/#/job/2410696 (AMD network only). Only the kernel
+  driver changes; ROCm user space can stay, since 31.40.x supports ROCm 7.0 – 7.2, 7.14,
+  10.0 and 10.1.
+- **Without access to that build:** rebuild amdgpu-dkms with 2/2 as a
+  [patch from kernel.org](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/patch/?id=9131cc85d0dedd8ba4cae60dbe5985d081551f30).
+  In the 31.40.1 and 31.60 DKMS sources it applies with `patch -p4 -l`: DKMS keeps `amd/`
+  at the top and indents part of 1/2 with spaces. On 31.40.1 the result matches 31.40.1.1.
+  On 30.x the `amdgpu_amdkfd_reserve_mem_limit()` hunk fails and has to be ported by hand,
+  since 30.x already credits pins there. A self-built module is not supported by AMD.
+- **In-tree:** mainline 7.4-rc1, stable 7.3.4, longterm 6.18.63 and 6.12.118 onwards. Not
+  yet in 7.2.y or 6.6.y, which are still affected (as of 2026-11-18).
+
+**Workarounds** without a fixed driver:
+
+| Workaround | 30.x | 31.10 – 31.60 and in-tree | Notes |
+|---|---|---|---|
+| Register through peer memory, mori's default: leave `MORI_ENABLE_DMABUF_REG` unset and keep the KV cache in `hipMalloc` memory | Works | No help | Needs peer memory (see above); impossible for VMM memory |
+| Run amdgpu-dkms 30.x (downgrade from 31.10 – 31.60, or instead of in-tree amdgpu) and register through peer memory | — | Works | Same conditions as the row above |
+| A page-sized peer-memory "anchor" MR per allocation: Mooncake `MC_HIP_KFD_PIN_FIX` (kvcache-ai/Mooncake#4657, merged), mori `MORI_KFD_PIN_FIX=1` (ROCm/mori#869, not merged) | Fixes the dma-buf path; #869 also stops the over-report | Fixes only what `hipMemGetInfo` reports; allocations still fail | Needs peer memory and non-VMM memory |
+| Leave headroom: non-KV usage + 2 × registered size ≤ VRAM | Works | Works | Costs about half of the KV capacity |
+| Allocate the KV cache outside KFD, as an amdgpu GEM BO imported into HIP: Mooncake `HipGemAllocator` (kvcache-ai/Mooncake#5584, open) | Works | Works | Register only through the BO's dma-buf (warning below). MoRI does not support it |
+
+**Warning:** never register memory that KFD did not allocate (e.g. a GEM BO imported with
+`hipImportExternalMemory`) through `ibv_reg_mr` on a host with the amdgpu peer-memory
+client. Its `amd_acquire()` (`kfd_peerdirect.c`, untouched by the fix) dereferences the BO's
+`kfd_bo`, which is NULL for such BOs, and the kernel oopses. MoRI-IO registers through
+`ibv_reg_mr` first, and its dma-buf export cannot export these buffers, so do not hand them
+to MoRI. A probe that registered a GEM BO through dma-buf and then through `ibv_reg_mr` on
+6.16.6 + ionic crashed its node.
