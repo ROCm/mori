@@ -815,13 +815,29 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
     //
     // hipMemcpy is BLOCKING, so this loop is already launch-to-completion and
     // the debug clock below needs no synchronize of its own.
+    //
+    // Coalesce adjacent segments before issuing hipMemcpy.  When DRAM pages are
+    // sequential in both source and destination (the common case: a key's pages
+    // occupy a contiguous run in both the DRAM pool buffer and the caller's GPU
+    // buffer) each run merges into one large call.  This is critical on the H2D
+    // pageable path: hipMemcpy without hipHostRegister allocates a temporary
+    // pinned staging buffer per call, and the per-call overhead dominates for
+    // small (e.g. 64 KiB) pages — 32,000 calls × ~50 µs ≈ 1.6 s for 500 keys.
     size_t plan_bytes = 0;
     const auto started = std::chrono::steady_clock::now();
     hipError_t err = hipSuccess;
-    for (size_t i = 0; i < plan.sizes.size(); ++i) {
-      err = hipMemcpy(dst + plan.dst_offsets[i], src + plan.src_offsets[i], plan.sizes[i], kind);
+    for (size_t i = 0; i < plan.sizes.size();) {
+      size_t coalesced = plan.sizes[i];
+      size_t j = i + 1;
+      while (j < plan.sizes.size() && plan.src_offsets[j] == plan.src_offsets[i] + coalesced &&
+             plan.dst_offsets[j] == plan.dst_offsets[i] + coalesced) {
+        coalesced += plan.sizes[j];
+        ++j;
+      }
+      err = hipMemcpy(dst + plan.dst_offsets[i], src + plan.src_offsets[i], coalesced, kind);
       if (err != hipSuccess) break;
-      plan_bytes += plan.sizes[i];
+      plan_bytes += coalesced;
+      i = j;
     }
     if (debug && err == hipSuccess) {
       const double seconds = Seconds(started, std::chrono::steady_clock::now());
