@@ -741,9 +741,9 @@ performance problem that only shows up on one machine. The two most common:
   `.claude/skills/known-issues/SKILL.md`.
 
 - **amdgpu miscounts VRAM registered with a NIC** (MoRI-IO, UMBP): after registration,
-  allocations and kernel loads fail with OOM although VRAM is free. Every public
-  amdgpu-dkms release is affected in some way, and 30.x and 31.x behave differently.
-  Check `cat /sys/module/amdgpu/version` against Issue 4 of the same skill.
+  allocations and kernel loads fail with OOM although VRAM is free. Every amdgpu-dkms
+  release before 31.70 is affected, and 30.x and 31.10 – 31.60 behave differently. Check
+  `cat /sys/module/amdgpu/version` against Issue 4 of the same skill.
 
 ---
 

@@ -16,7 +16,7 @@ description: >-
   miscounts VRAM registered with a NIC (MoRI-IO, UMBP, Mooncake): later allocations, kernel
   loads or new streams fail with OOM, HIP error 209 or a segfault in HIPStream::stream()
   although VRAM is free, or hipMemGetInfo exceeds the card. It behaves differently on
-  amdgpu-dkms 30.x and 31.x, and no public amdgpu-dkms release has the fix yet.
+  amdgpu-dkms 30.x and 31.10-31.60; amdgpu-dkms 31.70 fixes it.
 ---
 
 # MORI Known Issues
@@ -411,9 +411,9 @@ and Issue 3 ship in a single rebuilt `libamdhip64.so`.
 ## Issue 4 — amdgpu miscounts RDMA-registered VRAM: OOM while VRAM is free
 
 **Affects:** anything that registers HIP VRAM with a NIC (MoRI-IO, UMBP, shmem / cco
-proxy heaps, Mooncake) on every public amdgpu-dkms release so far (checked through 31.60,
-7.1.9) and on in-tree amdgpu without the upstream fix. Only the KFD free-VRAM count is
-wrong; physical usage (`mem_info_vram_used`) is right. ROCm/mori#721.
+proxy heaps, Mooncake) on every amdgpu-dkms release before 31.70 (7.2.3) and on in-tree
+amdgpu without the upstream fix. Only the KFD free-VRAM count is wrong; physical usage
+(`mem_info_vram_used`) is right. ROCm/mori#721.
 
 **Symptoms**, after the first MoRI-IO transfer (it registers lazily) or after a KV cache is
 registered:
@@ -423,7 +423,7 @@ registered:
   `HIP error 209: no kernel image is available`, or a segfault in
   `c10::hip::HIPStream::stream()` at the first new stream (ROCm 7.2).
 - `hipMemGetInfo` drops by the registered size, or stays normal while allocations fail
-  (31.x with peer memory), or reports more free VRAM than the card has (several
+  (31.10 – 31.60 with peer memory), or reports more free VRAM than the card has (several
   peer-memory MRs on one buffer).
 - Once a GPU is past the limit, a process started afterwards may fail to initialize any
   GPU on the host, not only that one: `rocminfo` lists no GPU agents and
@@ -432,8 +432,8 @@ registered:
 **Root cause:** KFD counts a `hipMalloc` buffer once as used (`kfd.vram_used`) and again
 as pinned (`vram_pin_size`) once a NIC pins it. A credit, `kfd.vram_pinned`, is meant to
 cancel the second count, but only the amdgpu peer-memory client (`ibv_reg_mr`, DKMS only)
-adds it, once per MR; dma-buf pins (`ibv_reg_dmabuf_mr`) never do. The 31.x allocation
-limit, `amdgpu_amdkfd_reserve_mem_limit()`, does not read the credit at all.
+adds it, once per MR; dma-buf pins (`ibv_reg_dmabuf_mr`) never do. On 31.10 – 31.60 the
+allocation limit, `amdgpu_amdkfd_reserve_mem_limit()`, does not read the credit at all.
 
 With S the size of the registered allocation (the whole `hipMalloc` buffer) and N the
 number of peer-memory MRs on it:
@@ -443,17 +443,17 @@ number of peer-memory MRs on it:
 | amdgpu-dkms 30.10 – 30.30.4 (6.14.14, 6.16.6, 6.16.13) | dma-buf −S; peer memory +(N−1)·S | Same as `hipMemGetInfo` | dma-buf: OOM. Peer memory: fine; N > 1 over-reports, harmless unless something sizes allocations from it |
 | amdgpu-dkms 31.10 – 31.60 (6.18.4 – 7.1.9, incl. 6.19.14.31400000 / .31400100) | dma-buf −S; peer memory +(N−1)·S | −S for either path | OOM for either path; with peer memory `hipMemGetInfo` looks normal |
 | In-tree amdgpu without the fix: mainline 6.9 – 7.3, and stable / longterm kernels without the backport | −S (dma-buf only; in-tree amdgpu has no peer-memory client) | −S | OOM |
-| amdgpu-dkms 31.40.1.1 (6.19.14.31400101, AMD internal); Linux 7.4-rc1+, 7.3.4+, 6.18.63+ | Exact | Exact | Fine |
+| amdgpu-dkms 31.70+ (7.2.3.31700000), 31.40.1.1 (6.19.14.31400101, AMD internal); Linux 7.4-rc1+, 7.3.4+, 6.18.63+, 6.12.118+ | Exact | Exact | Fine |
 
-**30.x vs 31.x:** `hipMemGetInfo` is computed the same way on both; the allocation limit
-is what changed.
+**30.x vs 31.10 – 31.60:** `hipMemGetInfo` is computed the same way on both; the
+allocation limit is what changed.
 
 - **30.x:** the limit uses the same count as `hipMemGetInfo`, credit included. Only
   dma-buf registration breaks allocations, and `hipMemGetInfo` shows it. Registering
   through peer memory, or adding an anchor MR, avoids it.
-- **31.x:** the limit no longer credits pins, so any registration breaks allocations,
-  through peer memory as well. With peer memory, `hipMemGetInfo` still looks normal and
-  hides the problem. Nothing on the registration side helps.
+- **31.10 – 31.60:** the limit no longer credits pins, so any registration breaks
+  allocations, through peer memory as well. With peer memory, `hipMemGetInfo` still looks
+  normal and hides the problem. Nothing on the registration side helps.
 
 Measured:
 
@@ -489,9 +489,10 @@ be registered through peer memory (`ibv_reg_mr` fails with ENOMEM), so it always
 on dma-buf. With `MORI_APP_LOG_LEVEL=warn` a fallback shows as
 `RegisterRdmaMemoryRegionAuto ibv_reg_mr registration failed`.
 
-**Detection:** `cat /sys/module/amdgpu/version`, compared in full: 31.40.1 and 31.40.1.1
-are both 6.19.14, and only `.31400101` is fixed. Without that file the driver is in-tree;
-check `uname -r`. Then compare `hipMemGetInfo` with
+**Detection:** `cat /sys/module/amdgpu/version`, compared in full: 7.2.3.31700000 (31.70)
+and later are fixed. Of the 6.19.14 builds only `.31400101` (31.40.1.1) is fixed;
+`.31400000` (31.40) and `.31400100` (31.40.1) are not. Without that file the driver is
+in-tree; check `uname -r`. Then compare `hipMemGetInfo` with
 `/sys/class/drm/card*/device/mem_info_vram_used` before and after registration.
 
 **Fix:** two upstream commits. amdgpu-dkms has carried 1/2 since at least 6.14, so a DKMS
@@ -508,28 +509,29 @@ They were posted to amd-gfx as v6
 [2/2](https://lists.freedesktop.org/archives/amd-gfx/2026-September/153710.html); the
 archived mails are whitespace-damaged, so take the commits.
 
-- **amdgpu-dkms:** no public release has 2/2 yet (checked through 31.60, 7.1.9.31600000).
-  The internal 31.40.1.1 build (6.19.14.31400101) is public 31.40.1 plus 2/2:
-  https://osibuilds.amd.com/dashboard/#/job/2410696 (AMD network only). Only the kernel
-  driver changes; ROCm user space can stay, since 31.40.x supports ROCm 7.0 – 7.2, 7.14,
-  10.0 and 10.1.
-- **In-tree:** mainline 7.4-rc1, stable 7.3.4 and longterm 6.18.63 onwards. Not yet in
-  7.2.y, 6.12.y or 6.6.y, which are still affected (as of 2026-11-17).
+- **amdgpu-dkms:** 31.70 (7.2.3.31700000) is the first public release with 2/2; upgrade
+  to it, checking AMD's compatibility matrix for the ROCm versions it supports. Hosts that
+  must stay on 6.19.14 can use the internal 31.40.1.1 build (6.19.14.31400101), which is
+  public 31.40.1 plus 2/2: https://osibuilds.amd.com/dashboard/#/job/2410696 (AMD network
+  only); 31.40.x supports ROCm 7.0 – 7.2, 7.14, 10.0 and 10.1. Either way only the kernel
+  driver changes.
+- **In-tree:** mainline 7.4-rc1, stable 7.3.4, longterm 6.18.63 and 6.12.118 onwards. Not
+  yet in 7.2.y or 6.6.y, which are still affected (as of 2026-11-18).
 
-**Workarounds** until the driver is fixed:
+**Workarounds**, where the driver cannot be upgraded yet:
 
-| Workaround | 30.x | 31.x and in-tree | Notes |
+| Workaround | 30.x | 31.10 – 31.60 and in-tree | Notes |
 |---|---|---|---|
 | Register through peer memory, mori's default: leave `MORI_ENABLE_DMABUF_REG` unset and keep the KV cache in `hipMalloc` memory | Works | No help | Needs peer memory (see above); impossible for VMM memory |
-| Run amdgpu-dkms 30.x (downgrade from 31.x, or instead of in-tree amdgpu) and register through peer memory | — | Works | Same conditions as the row above |
+| Run amdgpu-dkms 30.x (downgrade from 31.10 – 31.60, or instead of in-tree amdgpu) and register through peer memory | — | Works | Same conditions as the row above |
 | A page-sized peer-memory "anchor" MR per allocation: Mooncake `MC_HIP_KFD_PIN_FIX` (kvcache-ai/Mooncake#4657, merged), mori `MORI_KFD_PIN_FIX=1` (ROCm/mori#869, not merged) | Fixes the dma-buf path; #869 also stops the over-report | Fixes only what `hipMemGetInfo` reports; allocations still fail | Needs peer memory and non-VMM memory |
 | Leave headroom: non-KV usage + 2 × registered size ≤ VRAM | Works | Works | Costs about half of the KV capacity |
 | Allocate the KV cache outside KFD, as an amdgpu GEM BO imported into HIP: Mooncake `HipGemAllocator` (kvcache-ai/Mooncake#5584, open) | Works | Works | Register only through the BO's dma-buf (warning below). MoRI does not support it |
 
 **Warning:** never register memory that KFD did not allocate (e.g. a GEM BO imported with
 `hipImportExternalMemory`) through `ibv_reg_mr` on a host with the amdgpu peer-memory
-client. Its `amd_acquire()` (`kfd_peerdirect.c`) dereferences the BO's `kfd_bo`, which is
-NULL for such BOs, and the kernel oopses. MoRI-IO registers through `ibv_reg_mr` first, and
-its dma-buf export cannot export these buffers, so do not hand them to MoRI. A probe that
-registered a GEM BO through dma-buf and then through `ibv_reg_mr` on 6.16.6 + ionic
-crashed its node.
+client. Its `amd_acquire()` (`kfd_peerdirect.c`, unchanged in 31.70) dereferences the BO's
+`kfd_bo`, which is NULL for such BOs, and the kernel oopses. MoRI-IO registers through
+`ibv_reg_mr` first, and its dma-buf export cannot export these buffers, so do not hand them
+to MoRI. A probe that registered a GEM BO through dma-buf and then through `ibv_reg_mr` on
+6.16.6 + ionic crashed its node.
