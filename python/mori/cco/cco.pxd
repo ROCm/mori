@@ -111,7 +111,6 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
         int proxyQueueCapacity
         int proxyQpsPerPeer
         int proxyOnly
-        int reserved0
 
     cdef struct ccoDevComm:
         int rank

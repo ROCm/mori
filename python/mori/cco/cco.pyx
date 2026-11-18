@@ -116,7 +116,6 @@ cdef class DevCommRequirements:
         self._reqs.proxyQueueCapacity = 0
         self._reqs.proxyQpsPerPeer = 0
         self._reqs.proxyOnly = 0
-        self._reqs.reserved0 = 0
 
     @property
     def gda_connection_type(self):

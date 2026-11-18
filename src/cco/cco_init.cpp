@@ -1663,11 +1663,13 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   hostShadow.flatBase = comm->flatBase;
   hostShadow.perRankSize = comm->perRankSize;
 
-  // Fresh QP set per DevComm; none for a proxy-only DevComm (reqs tail, agreed
-  // on below before any QP is made). Gated on reserved0: an older caller's
-  // size covers proxyOnly's bytes as padding.
-  const bool proxyOnly =
-      reqs->size >= offsetof(ccoDevCommRequirements, reserved0) + sizeof(int) && reqs->proxyOnly;
+  // The proxy fields sit at the tail of reqs; read them only when the
+  // caller's struct has them.
+  const bool reqsHaveProxy =
+      reqs->size >= offsetof(ccoDevCommRequirements, proxyOnly) + sizeof(int);
+  // Fresh QP set per DevComm; none for a proxy-only DevComm (agreed on below
+  // before any QP is made).
+  const bool proxyOnly = reqsHaveProxy && reqs->proxyOnly;
   ccoIbgdaContext& ibgda = hostShadow.ibgda;
   int numQpPerPe = proxyOnly                   ? 0
                    : reqs->gdaContextCount > 0 ? reqs->gdaContextCount
@@ -1738,17 +1740,12 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   }
 
   // ccoProxy requirements, agreed on before the GDA QPs (collective) since a
-  // proxy-only DevComm makes none. The proxy fields sit at the tail of reqs;
-  // read them only when the caller's struct has them.
-  const bool reqsHaveProxy =
-      reqs->size >= offsetof(ccoDevCommRequirements, proxyQueueCapacity) + sizeof(int);
+  // proxy-only DevComm makes none.
   const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
   const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
   const int proxyThreads = reqsHaveProxy ? std::max(reqs->proxyThreadCount, 0) : 0;
   // QPs per (proxy thread, peer): the field, else MORI_CCO_PROXY_QPS_PER_PEER, else 4.
-  const bool reqsHaveQps =
-      reqs->size >= offsetof(ccoDevCommRequirements, proxyQpsPerPeer) + sizeof(int);
-  const int proxyQpsPerPeer = (reqsHaveQps && reqs->proxyQpsPerPeer > 0)
+  const int proxyQpsPerPeer = (reqsHaveProxy && reqs->proxyQpsPerPeer > 0)
                                   ? reqs->proxyQpsPerPeer
                                   : env::GetPositiveIntOr("MORI_CCO_PROXY_QPS_PER_PEER", 4);
   const int64_t proxyQueues = int64_t{proxySpsc} + int64_t{proxyMpsc};  // may exceed INT_MAX
