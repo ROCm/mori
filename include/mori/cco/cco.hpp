@@ -548,9 +548,9 @@ struct ccoDevCommRequirements {
                             // put+signal); smaller rings trap.
   // RC QPs per (proxy thread, peer); 0 = MORI_CCO_PROXY_QPS_PER_PEER, else 4.
   // Each queue posts on one of its thread's QPs per peer (round robin over the
-  // thread's queues); a thread creates no more than it owns queues. NICs that
-  // process each QP serially (e.g. ionic, ~1-2 Mpps per QP for small writes)
-  // need several; 4 costs mlx5 nothing. Same on every rank.
+  // thread's queues); a thread creates no more than it owns queues. Several QPs
+  // let NICs that serve each QP serially (e.g. ionic) run a thread's queues in
+  // parallel; the default 4 does no harm on mlx5. Same on every rank.
   int proxyQpsPerPeer;
   // 1: a proxy-only DevComm. No GDA QPs are created (gdaContextCount is
   // ignored, ibgda.numQpPerPe = 0); the peer set, signal / counter slots and
