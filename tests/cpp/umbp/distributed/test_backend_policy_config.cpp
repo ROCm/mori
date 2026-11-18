@@ -26,6 +26,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <utility>
 
 #include "umbp/common/config.h"
 #include "umbp/distributed/config.h"
@@ -56,6 +57,71 @@ TEST(BackendPolicyConfig, BlankNumaEnvironmentMeansNoBinding) {
   ASSERT_EQ(setenv("UMBP_DRAM_NUMA_NODE", "0,", 1), 0);
   EXPECT_THROW(UMBPConfig::FromEnvironment(), std::invalid_argument);
   unsetenv("UMBP_DRAM_NUMA_NODE");
+}
+
+TEST(DistributedConfigEnvironment, VariablesSetOnlyWhatTheyName) {
+  const UMBPDistributedConfig defaults;
+  const UMBPDistributedConfig unset = UMBPDistributedConfig::FromEnvironment();
+  EXPECT_EQ(unset.ranged_scratch_size, defaults.ranged_scratch_size);
+  EXPECT_EQ(unset.staging_buffer_size, defaults.staging_buffer_size);
+  EXPECT_EQ(unset.medium, defaults.medium);
+
+  ASSERT_EQ(setenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", "268435456", 1), 0);
+  ASSERT_EQ(setenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES", "on", 1), 0);
+  ASSERT_EQ(setenv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS", "64", 1), 0);
+  ASSERT_EQ(setenv("UMBP_DISTRIBUTED_MEDIUM", "ssd", 1), 0);
+  ASSERT_EQ(setenv("UMBP_DISTRIBUTED_LOCAL_FIRST", "0", 1), 0);
+  ASSERT_EQ(setenv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", "2097152", 1), 0);
+  ASSERT_EQ(setenv("UMBP_DISTRIBUTED_STAGING_BUFFER_SIZE", "", 1), 0);
+  ASSERT_EQ(setenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA", "1", 1), 0);
+  ASSERT_EQ(setenv("UMBP_IO_ENGINE_PORT", "25192,25193", 1), 0);
+  const UMBPDistributedConfig set = UMBPDistributedConfig::FromEnvironment();
+  EXPECT_EQ(set.ranged_scratch_size, 268435456u);
+  EXPECT_TRUE(set.ranged_scratch_use_hugepages);
+  EXPECT_EQ(set.ssd_staging_buffer_slots, 64);
+  EXPECT_EQ(set.medium, UMBPMedium::SSD);
+  EXPECT_FALSE(set.local_first);
+  EXPECT_EQ(set.dram_page_size, 2097152u);
+  // Blank is unset, and the NUMA layout and the ports are the caller's: an
+  // sglang rank list in UMBP_IO_ENGINE_PORT must not fail here.
+  EXPECT_EQ(set.staging_buffer_size, defaults.staging_buffer_size);
+  EXPECT_FALSE(set.ranged_scratch_numa_layout);
+  EXPECT_EQ(set.io_engine.port, defaults.io_engine.port);
+
+  // Over a config a caller already filled, only the variables apply.
+  UMBPDistributedConfig explicit_config;
+  explicit_config.staging_buffer_size = 1 << 20;
+  std::string error;
+  ASSERT_TRUE(explicit_config.ApplyEnvironment(&error)) << error;
+  EXPECT_EQ(explicit_config.staging_buffer_size, 1u << 20);
+  EXPECT_EQ(explicit_config.ranged_scratch_size, 268435456u);
+
+  for (const char* name :
+       {"UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", "UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES",
+        "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS", "UMBP_DISTRIBUTED_MEDIUM",
+        "UMBP_DISTRIBUTED_LOCAL_FIRST", "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE",
+        "UMBP_DISTRIBUTED_STAGING_BUFFER_SIZE", "UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA",
+        "UMBP_IO_ENGINE_PORT"}) {
+    unsetenv(name);
+  }
+}
+
+TEST(DistributedConfigEnvironment, MalformedValuesAreRejected) {
+  const std::pair<const char*, const char*> bad[] = {
+      {"UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", "lots"},
+      {"UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES", "maybe"},
+      {"UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS", "-1"},
+      {"UMBP_DISTRIBUTED_MEDIUM", "nvme"},
+  };
+  for (const auto& [name, value] : bad) {
+    ASSERT_EQ(setenv(name, value, 1), 0);
+    UMBPDistributedConfig cfg;
+    std::string error;
+    EXPECT_FALSE(cfg.ApplyEnvironment(&error)) << name << "=" << value;
+    EXPECT_NE(error.find(name), std::string::npos) << error;
+    EXPECT_THROW(UMBPDistributedConfig::FromEnvironment(), std::invalid_argument) << name;
+    unsetenv(name);
+  }
 }
 
 TEST(BackendPolicyConfig, NumaPolicyPreservesHostOptionsAndSplitsBothNodes) {
