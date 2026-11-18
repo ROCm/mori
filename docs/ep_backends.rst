@@ -70,14 +70,18 @@ the following important restrictions:
   ``cvt_scalef32_pk_*_fp4`` pair-at-a-time family, gfx1250 a pack-of-8), so this
   is a per-target port rather than one shared path.
 * FP8 representation differs by target: OCP E4M3 on gfx950 and E4M3FNUZ on gfx942.
-* On the internode path, ``quant_type`` must be ``"none"``. The config rejects
-  anything else whenever ``world_size > gpu_per_node``, independently of the
-  backend -- the quantized-combine staging path there is incomplete. HIP is
-  simply the only backend that has an internode path today.
+* On the internode path, ``quant_type`` must be ``"none"``, because the
+  internode combine is unquantized. The config rejects anything else whenever
+  ``world_size > gpu_per_node``, independently of the backend. HIP is simply the
+  only backend that has an internode path today.
 * ``gpu_per_node`` determines physical node grouping. A single host cannot
   emulate the two-node internode test by changing world size alone.
 * For internode, ``internode_kernel`` chooses ``"v2"``, ``"v2_ll"`` or
-  ``"auto"``. Auto chooses by the current call's token count, not buffer capacity.
+  ``"auto"``. Auto chooses by the ``max_num_inp_token_across_ranks`` passed to
+  ``dispatch`` (the largest token count any rank passes that call), not by
+  buffer capacity, and runs ``"v2"`` when it is not passed. ``low_latency=True``
+  or ``False`` selects ``"v2_ll"`` or ``"v2"``; see the package guide for what
+  it does on gfx125x intranode.
 
 Validation before tuning
 ------------------------

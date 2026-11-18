@@ -96,6 +96,15 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
       transfer_engine_(transfer_engine),
       tier_graph_(policy_ == nullptr ? nullptr : policy_->TierGraph()),
       transition_executor_(backends, transfer_engine) {
+  if (backends_ != nullptr) {
+    uint64_t keys = 0;
+    for (uint32_t id = 0; id < BackendRegistry::kMaxBackends; ++id) {
+      auto* backend = backends_->Get(id);
+      if (backend == nullptr || backend->Tier() == TierType::SSD) continue;
+      keys += KeyIndexReserve(backend->Capacity().total_bytes, backend->PageSize());
+    }
+    placements_.reserve(keys);
+  }
   if (tier_graph_ != nullptr) {
     // A tier graph without an engine would accept offload and promotion rules
     // and then silently fail every one of them, leaving the topology looking
@@ -1095,6 +1104,37 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
     std::lock_guard<std::mutex> operation_lock(operation_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
       if (out[i]) TouchLocked(keys[i]);
+    }
+  }
+  return out;
+}
+
+std::vector<bool> PeerPool::ValidateResolved(const std::vector<uint32_t>& backend_ids,
+                                             const std::vector<std::string>& keys,
+                                             const std::vector<uint64_t>& generations) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  std::vector<bool> out(keys.size(), false);
+  if (keys.empty() || backends_ == nullptr) return out;
+  if (backend_ids.size() != keys.size() || generations.size() != keys.size()) return out;
+
+  // One call per backend named, not one per key.
+  std::unordered_map<uint32_t, std::vector<size_t>> by_backend;
+  for (size_t i = 0; i < keys.size(); ++i) by_backend[backend_ids[i]].push_back(i);
+
+  std::vector<std::string> batch_keys;
+  std::vector<uint64_t> batch_generations;
+  for (const auto& [backend_id, indices] : by_backend) {
+    auto* backend = backends_->Get(backend_id);
+    if (backend == nullptr) continue;  // nothing to have read from: stays false
+    batch_keys.clear();
+    batch_generations.clear();
+    for (size_t i : indices) {
+      batch_keys.push_back(keys[i]);
+      batch_generations.push_back(generations[i]);
+    }
+    const auto holds = backend->BatchStillHolds(batch_keys, batch_generations);
+    for (size_t j = 0; j < indices.size(); ++j) {
+      out[indices[j]] = j < holds.size() && holds[j];
     }
   }
   return out;

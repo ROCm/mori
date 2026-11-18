@@ -23,7 +23,7 @@
 
     MORI_SOCKET_IFNAME=lo MORI_ENABLE_SDMA=1 \\
     torchrun --standalone --nproc_per_node=8 bench_ag_gemm.py \\
-        --mode fused-sdma -m 512 -n 6400 -k 7168 --chunks 2
+        --mode fused-sdma -m 512 -N 6400 -k 7168 --chunks 2
 
 ``-m`` is rows **per rank**: every rank ends with ``[world*m, n]``, its own
 weight shard applied to every rank's tokens. Modes, all ending in that state:

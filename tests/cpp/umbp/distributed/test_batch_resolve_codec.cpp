@@ -58,6 +58,7 @@ std::vector<ResolvedKeyEntry> SampleEntries() {
   entries[0].tier = TierType::HBM;
   entries[0].size = 3 * 4096;
   entries[0].pages = {{0, 10}, {1, 11}, {0, 12}};
+  entries[0].generation = 0x9e3779b97f4a7c15ull;  // uses the full 64 bits
 
   entries[1].found = false;  // miss: no tier / size / pages
 
@@ -65,6 +66,7 @@ std::vector<ResolvedKeyEntry> SampleEntries() {
   entries[2].tier = TierType::DRAM;
   entries[2].size = 4096;
   entries[2].pages = {{2, 7}};
+  entries[2].generation = 7;
 
   entries[3].found = true;
   entries[3].tier = TierType::SSD;
@@ -83,6 +85,7 @@ void ExpectKeyMatches(const ResolvedKeyEntry& src, const DecodedResolveKey& dec)
   if (!src.found) return;
   EXPECT_EQ(src.tier, dec.tier);
   EXPECT_EQ(src.size, dec.size);
+  EXPECT_EQ(src.generation, dec.generation);
   ASSERT_EQ(src.pages.size(), dec.pages.size());
   for (size_t p = 0; p < src.pages.size(); ++p) {
     EXPECT_EQ(src.pages[p].buffer_index, dec.pages[p].buffer_index);
@@ -198,6 +201,30 @@ TEST(BatchResolveCodec, DecodesLegacyFoundOnlyResponse) {
   ASSERT_EQ(decoded.keys.size(), 1u);
   EXPECT_TRUE(decoded.keys[0].found);
   EXPECT_EQ(decoded.keys[0].outcome, ResolveOutcome::kFound);
+  // A peer that predates `generation` reads as "unstamped": the reader has
+  // nothing to check, and never calls a ValidateReads that peer lacks.
+  EXPECT_EQ(decoded.keys[0].generation, 0u);
+}
+
+TEST(BatchResolveCodec, MalformedGenerationLengthRejected) {
+  // generation is all-or-nothing: one value per key, or none (old peer).
+  std::vector<ResolvedKeyEntry> entries(2);
+  entries[0].found = true;
+  entries[0].size = 4096;
+  entries[0].pages = {{0, 1}};
+  entries[0].generation = 11;
+  entries[1].found = true;
+  entries[1].size = 4096;
+  entries[1].pages = {{0, 2}};
+  entries[1].generation = 12;
+
+  ::umbp::BatchResolveKeysResponse resp;
+  EncodeBatchResolveResponse(entries, 4096, {}, &resp);
+  ASSERT_EQ(resp.generation_size(), 2);
+  resp.mutable_generation()->RemoveLast();
+
+  DecodedBatchResolve decoded = DecodeBatchResolveResponse(resp);
+  EXPECT_TRUE(decoded.keys.empty());  // not a silent 0 for the key left out
 }
 
 TEST(BatchResolveCodec, MalformedMismatchedArraysRejected) {

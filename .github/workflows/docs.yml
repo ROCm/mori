@@ -65,10 +65,12 @@ jobs:
           name: documentation
           path: ./html
 
+      # Replace the whole site, so a page whose source is removed or renamed
+      # stops being served. nightly/ is built from docs/_extra (html_extra_path).
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./html
-          keep_files: true
+          keep_files: false
           commit_message: 'docs: deploy documentation'

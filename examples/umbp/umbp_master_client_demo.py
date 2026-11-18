@@ -67,7 +67,7 @@ MASTER_BIN = _parse_args()
 if not MASTER_BIN.is_file():
     sys.exit(
         f"[ERROR] umbp_master binary not found at {MASTER_BIN}\n"
-        "Build it with:  mkdir -p build && cd build && cmake .. -DUMBP=ON && make -j umbp_master\n"
+        "Build it with:  mkdir -p build && cd build && cmake .. -DBUILD_UMBP=ON && make -j umbp_master\n"
         "Or pass the path directly:  python examples/umbp/umbp_master_client_demo.py /path/to/umbp_master"
     )
 

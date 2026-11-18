@@ -35,7 +35,8 @@ struct DeviceGatherFragment {
 };
 
 // Copies `count` independent fragments between a HostTierRegistration-covered
-// region and one GPU in a single kernel launch, in either direction.
+// region and one GPU in a single kernel launch, in either direction, or between
+// two buffers on that GPU.
 //
 // This exists because the DRAM tier's copy path is scatter-gather by nature:
 // reading one layer out of page-granular objects means dozens of small strided
@@ -49,8 +50,9 @@ struct DeviceGatherFragment {
 // Only worth it below roughly 128 KiB per fragment. Above that the copy engine
 // wins, because one large hipMemcpyAsync already amortizes its submission.
 //
-// The host side must be inside a HostTierRegistration-covered range: a kernel
-// cannot dereference plain mmap memory at all, it faults. Returns false before
+// A host side must be inside a HostTierRegistration-covered range: a kernel
+// cannot dereference plain mmap memory at all, it faults. Fragments are copied
+// concurrently, so no fragment may read what another writes. Returns false before
 // enqueueing any work when the launch could not be issued, so the caller can
 // fall back to hipMemcpy.
 //

@@ -304,18 +304,15 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
-          bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
+          bool UseFp8BlockwiseQuant = false, bool UseWeights = true, int Vec8Top8BlockElems = 0,
+          int Vec8AccumNum = 8, bool UseFp4Combine = false>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
-  using TokT =
-      std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
+  using TokT = std::conditional_t<UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
   // UseFp4Combine reuses the FP8-blockwise staging/scale layout but transports each element as
   // packed FP4 (E2M1, 2/byte -> half the combine bytes). It is a variant of blockwise combine.
   static_assert(!UseFp4Combine || UseFp8BlockwiseQuant,
                 "UseFp4Combine builds on the FP8-blockwise combine path");
-  static_assert(!(UseFp8DirectCast && UseFp8BlockwiseQuant),
-                "Fp8 direct cast and blockwise quant are mutually exclusive");
-  static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) || std::is_same_v<T, hip_bfloat16>,
+  static_assert(!UseFp8BlockwiseQuant || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 combine quant currently only supports bf16 input");
   static_assert((Vec8Top8BlockElems & (Vec8Top8BlockElems - 1)) == 0,
                 "Vec8Top8BlockElems must be 0 or a power of two");
@@ -369,11 +366,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               args.shmemInpScalesMemObj->template GetAs<float*>() +
                   i * args.fp8BlockwiseCombineScaleDim,
               args.inpTokenBuf + i * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
-        } else if constexpr (!std::is_same_v<T, TokT> &&
-                             std::is_same_v<TokT, core::CombineInternalFp8>) {
-          core::WarpCastBf16ToCombineInternalFp8<T>(
-              args.intraNodeTokBufs.combineInp->template GetAs<TokT*>() + i * hiddenDim,
-              args.inpTokenBuf + i * hiddenDim, hiddenDim, laneId);
         } else {
           core::WarpCopy(args.intraNodeTokBufs.combineInp->template GetAs<T*>() + i * hiddenDim,
                          args.inpTokenBuf + i * hiddenDim, hiddenDim);
@@ -411,11 +403,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
             reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
             args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
-      } else if constexpr (!std::is_same_v<T, TokT> &&
-                           std::is_same_v<TokT, core::CombineInternalFp8>) {
-        core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
-                                                  args.inpTokenBuf + tokenIdx * hiddenDim,
-                                                  hiddenDim, laneId);
       } else {
         core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
                        args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
@@ -449,11 +436,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
             reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
             args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
-      } else if constexpr (!std::is_same_v<T, TokT> &&
-                           std::is_same_v<TokT, core::CombineInternalFp8>) {
-        core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
-                                                  args.inpTokenBuf + tokenIdx * hiddenDim,
-                                                  hiddenDim, laneId);
       } else {
         core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
                        args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
@@ -682,11 +664,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               hiddenDimSize, hiddenDim, args.fp8BlockwiseCombineScaleDim);
         }
       }
-    } else if constexpr (!std::is_same_v<T, TokT> &&
-                         std::is_same_v<TokT, core::CombineInternalFp8>) {
-      MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
-      core::WarpAccumCombineInternalFp8ToBf16(outPtr, reinterpret_cast<const TokT* const*>(srcPtrs),
-                                              validAccumCount, laneId, hiddenDimSize);
     } else {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
       // 16B vec load + load-first/unroll gather: keep AccumNum*Unroll remote peer reads in flight
