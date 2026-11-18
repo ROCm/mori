@@ -47,9 +47,10 @@
 // peer-memory client dereferences the NULL kfd_bo of a GEM BO. HIP has no IPC
 // handle for them, so they cannot go through XGMI or IPC transports either.
 //
-// Freeing a buffer unpins it, so KFD's counts drop right away, but HIP before
-// ROCm 10 keeps imported memory mapped until the process exits: the VRAM itself
-// only comes back then. Allocate long-lived buffers (a KV pool) with it.
+// Freeing a buffer unpins it, so KFD's counts drop right away. Whether the VRAM
+// itself comes back before the process exits depends on HIP and the driver: ROCm
+// 7.2.4 on amdgpu 31.40 keeps imported memory mapped until then, on 30.x and with
+// ROCm 10.0 it comes back on free. Allocate long-lived buffers (a KV pool) with it.
 //
 // The C functions below are a torch.cuda.memory.CUDAPluggableAllocator backend
 // (mori.io.HipGemAllocator). MORI_HIP_GEM_PIN_DEVICE names the RDMA device used
