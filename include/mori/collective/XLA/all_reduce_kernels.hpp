@@ -116,6 +116,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     const size_t ofs = p * strideElems;
     return min(totalElems - ofs, strideElems);
   };
+  MORI_PT(if (PtTimedBlock() && threadIdx.x == 0) PT().t0[blockIdx.x] = wall_clock64();)
   // Every block reads the launch generation before counting in at Phase 4; only
   // the tail owner (the last b=1 count) advances it.
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
@@ -124,6 +125,9 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
 
   // Phase 1: scatter the input to the staging buffer
   if (blockIdx.x == 0) {
+    MORI_PT(if (threadIdx.x == 0) {
+      PtShape(PushTimingKind::kAllReduce, npes, S, shardLen(myPe) * sizeof(T), false);
+    })
     __shared__ uint32_t flagEpoch[2];
     if (threadIdx.x == 0) {
       // Read the counters BEFORE arriving: no block of this launch can count in
@@ -148,6 +152,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // it. Lane 0 posts after its stores above, in program order.
     PostArrival(barrierCtr, pushGen - 1, myPe, npes, stride4G);
     __syncthreads();
+    MORI_PT(if (threadIdx.x == 0) PT().tPost = wall_clock64();)
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
     // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a
@@ -166,6 +171,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
               peer != myPe, len, reinterpret_cast<const uint8_t*>(input + peer * strideElems),
               dstP, sigP, BarrierGate(barrierCtr, peer), static_cast<uint32_t>(pushGen - 1)};
         });
+    MORI_PT(if (threadIdx.x == 0) PT().tIssue = wall_clock64();)
 
     // Pre-post both broadcasts of my reduced shard (output slot myPe) behind the
     // scatter, each parked on its counter until every block has counted in at
@@ -186,6 +192,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
                                 peer, myPe, stride4G);
           return ScatterPeer{peer != myPe, 0, myShard, dstP, sigP};
         });
+    MORI_PT(if (threadIdx.x == 0) PT().tBPost = wall_clock64();)
   }
 
   // Whether this block's count released b=1, so it owes the generation bump and
@@ -224,9 +231,14 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       // count releases the pre-posted copy with no further step. System scope:
       // the SDMA engine must observe the RMW.
       if (threadIdx.x == 0) {
+        MORI_PT(if (PtTimedBlock()) PT().tCount[b][blockIdx.x] = wall_clock64();)
         uint32_t old = AtomicAdd<ESystemScope>(&groupCtr[kBcastFlagIdx + b], 1u);
         if (b == 1) {
           ownsTail = (old + 1 == AtomicLoad<EAgentScope>(&groupCtr[kBcastTargetIdx]));
+          MORI_PT(if (ownsTail) {
+            PT().tOwn = wall_clock64();
+            PT().ownBlk = blockIdx.x;
+          })
         }
       }
     }
@@ -248,14 +260,19 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   // No acquire closes the kernel -- no thread here reads the slices peers DMA'd
   // into output, and whoever consumes them acquires at its own kernel boundary.
   if (threadIdx.x < warpSize && BroadcastLane0(ownsTail)) {
-    WaitArrived(arrived, kBcastArrived + 1, pushGen, myPe, npes, /*skipSelf=*/true);
+    WaitArrived(arrived, kBcastArrived + 1, pushGen, myPe, npes, /*skipSelf=*/true
+                MORI_PT_ARGS(PT().bArr[1]));
+    MORI_PT(if (threadIdx.x == 0) PT().tBDone[1] = wall_clock64();)
     if (S > 1) {
-      WaitArrived(arrived, kBcastArrived, pushGen, myPe, npes, /*skipSelf=*/true);
+      WaitArrived(arrived, kBcastArrived, pushGen, myPe, npes, /*skipSelf=*/true
+                  MORI_PT_ARGS(PT().bArr[0]));
+      MORI_PT(if (threadIdx.x == 0) PT().tBDone[0] = wall_clock64();)
     }
     WaitDelivered(arrived, kBcastArrived + 1, pushGen, myPe, npes, heapWin->stride4G,
-                  [=](int peer) { return peer != myPe; });
+                  [=](int peer) { return peer != myPe; } MORI_PT_ARGS(PT().bDlv));
     if (threadIdx.x == 0) {
       AtomicStore<ESystemScope>(&barrierCtr[myPe], pushGen);
+      MORI_PT(PT().tEnd = wall_clock64();)
     }
   }
 }
