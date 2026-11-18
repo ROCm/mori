@@ -76,6 +76,15 @@
 // from the queue's flushTicket counter right before pushing, and waits for
 // flushDone >= t (see flush()). An earlier FLUSH need not have been waited for.
 //
+// Failure: the DevComm fails for good at the first proxy error (see
+// ccoDevCommGetError): the proxy drops every later op and sets
+// ccoProxyFailedBit in each queue's flushDone. flush() then traps (printing
+// the reason first in builds without NDEBUG), flush(coop, timeoutCycles)
+// returns 2, waitSignal() traps within 256 polls, an SPSC push waiting for
+// ring space drops its op, and failed() returns true. Not covered: an MPSC
+// push waiting for ring space (only after a corrupted ring), and waitSignal()
+// for a peer that died while this DevComm posted nothing to it.
+//
 // Calling convention: put / signal / flush are called by the whole Coop group
 // from converged code, and the issuing wavefront (the calling wavefront for
 // ccoCoopWarp and ccoCoopLaneMasked, wavefront 0 for ccoCoopBlock) must have
@@ -295,6 +304,19 @@ struct ccoProxy {
   template <typename Coop = ccoCoopWarp, std::enable_if_t<!std::is_integral_v<Coop>, int> = 0>
   __device__ inline void flush(Coop coop = Coop{});
 
+  // flush() that never traps: 0 = done, 1 = timed out after timeoutCycles
+  // (impl::clock64 cycles; earlier puts may still be in flight, and a later
+  // flush covers them), 2 = the DevComm failed. Every thread of the Coop gets
+  // the same value.
+  template <typename Coop = ccoCoopWarp, std::enable_if_t<!std::is_integral_v<Coop>, int> = 0>
+  __device__ inline int flush(Coop coop, uint64_t timeoutCycles);
+
+  // Whether the DevComm has failed (one load).
+  __device__ inline bool failed() const {
+    return (__hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) &
+            ccoProxyFailedBit) != 0;
+  }
+
   // v1: identical to flush() -- covers every peer.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
   __device__ inline void flush(int peer, Coop coop = Coop{}) {
@@ -307,14 +329,12 @@ struct ccoProxy {
     return impl::readSignalImpl<CCO_GDA_BUILD_PROVIDER>(comm.ibgda.signalBuf,
                                                         comm.ibgda.signalShadows, signalId, bits);
   }
+  // As ccoGda::waitSignal, but traps once the DevComm failed, and acquires.
   template <typename Coop = ccoCoopThread>
   __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop = Coop{},
                                     int bits = 64) {
     coop.sync();
-    if (coop.thread_rank() == 0) {
-      impl::waitSignalImpl<CCO_GDA_BUILD_PROVIDER>(comm.ibgda.signalBuf, comm.ibgda.signalShadows,
-                                                   signalId, least, bits);
-    }
+    if (coop.thread_rank() == 0) waitSignalOrTrap(signalId, least, bits);
     coop.sync();
   }
   __device__ inline void resetSignal(ccoGdaSignal_t signalId) {
@@ -367,10 +387,10 @@ struct ccoProxy {
   // kLaneMasked (ccoCoopLaneMasked): every lane with `active` sends its own
   // descriptor; otherwise the wavefront sends one, and `active` is true. An
   // SPSC push on a full ring retries (a lane-masked push writes all of the
-  // active lanes' messages or none); an MPSC push waits inside KIWI (and
-  // always succeeds). Traps on a partial wavefront, which KIWI does not check
-  // in release builds, and (builds without NDEBUG, not kLaneMasked) on lanes
-  // passing differing descriptors.
+  // active lanes' messages or none), and drops the op once the DevComm failed;
+  // an MPSC push waits inside KIWI (and always succeeds). Traps on a partial
+  // wavefront, which KIWI does not check in release builds, and (builds without
+  // NDEBUG, not kLaneMasked) on lanes passing differing descriptors.
   template <bool kLaneMasked, typename... Desc>
   __device__ inline void invoke([[maybe_unused]] bool active, ccoProxyOp op, const Desc&... desc) {
     const uint64_t exec = __builtin_amdgcn_read_exec();
@@ -397,6 +417,8 @@ struct ccoProxy {
     };
     if constexpr (kSpsc) {
       while (!push()) {
+        // A failed proxy may have stopped popping: drop the op.
+        if (__builtin_amdgcn_readfirstlane(failed() ? 1 : 0)) return;
         __builtin_amdgcn_s_sleep(1);
       }
       dirty = true;
@@ -436,6 +458,13 @@ struct ccoProxy {
     }
   }
 #endif
+
+  // Push a FLUSH and wait for it (issuing wavefront, all 64 lanes). Returns 0
+  // done, 1 timed out (kTimeout only), 2 failed; the same in every lane.
+  template <bool kTimeout>
+  __device__ inline int flushIssue(uint64_t timeoutCycles);
+
+  __device__ inline void waitSignalOrTrap(ccoGdaSignal_t signalId, uint64_t least, int bits);
 
   // invoke() for a data-carrying op: first make the source data (and any earlier
   // stores the peer will read) visible to the NIC, since the proxy may post the
@@ -570,6 +599,69 @@ __device__ inline void ccoProxy<Queue>::signal(int peer, RemoteAction remoteActi
 }
 
 template <typename Queue>
+template <bool kTimeout>
+__device__ inline int ccoProxy<Queue>::flushIssue(uint64_t timeoutCycles) {
+  // Lane 0 picks the flushDone value that proves our FLUSH (or a later one
+  // that covers it) is satisfied.
+  uint64_t target = 0;
+  if (__lane_id() == 0) {
+    if constexpr (kSpsc) {
+      // Tickets follow FLUSH order in the ring: one producer at a time, and a
+      // handoff's release/acquire orders the old owner's tickets first.
+      target = __hip_atomic_fetch_add(flushTicket, uint64_t{1}, __ATOMIC_RELAXED,
+                                      __HIP_MEMORY_SCOPE_AGENT) +
+               1;
+    } else {
+      // Ticket t: we wait for flushDone >= t, i.e. for the first t FLUSHes of
+      // this queue (in queue order) to be satisfied. Those t FLUSHes hold t
+      // distinct tickets, so at least one of them holds a ticket t' >= t: ours
+      // (t' == t), or one whose caller took its ticket after us (t' > t).
+      // That FLUSH was claimed after our puts, so it covers them: the proxy
+      // pops the queue in order, so it has posted our puts by the time it
+      // pops that FLUSH, and the FLUSH waits for the queue's last WR per QP
+      // as of that pop.
+      //
+      // Why that FLUSH was claimed after our puts: every ticket fetch-add is
+      // acq_rel (agent scope: all producers of a queue run on this GPU). The
+      // later caller's fetch-add reads ours (or a later RMW of the same
+      // release sequence), so our release synchronizes with its acquire:
+      // our put claims (relaxed fetch-adds on the ring's producer index,
+      // earlier in program order) happen before its ticket, which comes
+      // before its FLUSH claim in program order (and, by the acquire, is
+      // complete before that claim issues). Coherence on the producer index
+      // then puts our puts earlier in the ring. seq_cst would add nothing:
+      // the argument uses only this one release/acquire pair per caller.
+      target = __hip_atomic_fetch_add(flushTicket, uint64_t{1}, __ATOMIC_ACQ_REL,
+                                      __HIP_MEMORY_SCOPE_AGENT) +
+               1;
+    }
+  }
+  invoke</*kLaneMasked=*/false>(true, ccoProxyOpFlush);
+  int result = 0;
+  if (__lane_id() == 0) {
+    [[maybe_unused]] uint64_t start = 0;
+    if constexpr (kTimeout) start = static_cast<uint64_t>(impl::clock64());
+    // The failed bit is above any target, so it also ends the wait.
+    uint64_t v;
+    while ((v = __hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)) <
+           target) {
+      if constexpr (kTimeout) {
+        if (static_cast<uint64_t>(impl::clock64()) - start >= timeoutCycles) {
+          result = 1;
+          break;
+        }
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+    // Exact: a FLUSH satisfied before the failure still succeeds.
+    if (result == 0 && (v & ~ccoProxyFailedBit) < target) result = 2;
+  }
+  // Later stores (e.g. overwriting a source buffer) stay after the wait.
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  return __builtin_amdgcn_readfirstlane(result);
+}
+
+template <typename Queue>
 template <typename Coop, std::enable_if_t<!std::is_integral_v<Coop>, int>>
 __device__ inline void ccoProxy<Queue>::flush(Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopLaneMasked>,
@@ -577,51 +669,62 @@ __device__ inline void ccoProxy<Queue>::flush(Coop coop) {
                 "call flush() (ccoCoopWarp) from all 64 lanes");
   coop.sync();
   if (issuingWave<Coop>()) {
-    // Lane 0 picks the flushDone value that proves our FLUSH (or a later one
-    // that covers it) is satisfied.
-    uint64_t target = 0;
-    if (__lane_id() == 0) {
-      if constexpr (kSpsc) {
-        // Tickets follow FLUSH order in the ring: one producer at a time, and a
-        // handoff's release/acquire orders the old owner's tickets first.
-        target = __hip_atomic_fetch_add(flushTicket, uint64_t{1}, __ATOMIC_RELAXED,
-                                        __HIP_MEMORY_SCOPE_AGENT) +
-                 1;
-      } else {
-        // Ticket t: we wait for flushDone >= t, i.e. for the first t FLUSHes of
-        // this queue (in queue order) to be satisfied. Those t FLUSHes hold t
-        // distinct tickets, so at least one of them holds a ticket t' >= t: ours
-        // (t' == t), or one whose caller took its ticket after us (t' > t).
-        // That FLUSH was claimed after our puts, so it covers them: the proxy
-        // pops the queue in order, so it has posted our puts by the time it
-        // pops that FLUSH, and the FLUSH waits for the queue's last WR per QP
-        // as of that pop.
-        //
-        // Why that FLUSH was claimed after our puts: every ticket fetch-add is
-        // acq_rel (agent scope: all producers of a queue run on this GPU). The
-        // later caller's fetch-add reads ours (or a later RMW of the same
-        // release sequence), so our release synchronizes with its acquire:
-        // our put claims (relaxed fetch-adds on the ring's producer index,
-        // earlier in program order) happen before its ticket, which comes
-        // before its FLUSH claim in program order (and, by the acquire, is
-        // complete before that claim issues). Coherence on the producer index
-        // then puts our puts earlier in the ring. seq_cst would add nothing:
-        // the argument uses only this one release/acquire pair per caller.
-        target = __hip_atomic_fetch_add(flushTicket, uint64_t{1}, __ATOMIC_ACQ_REL,
-                                        __HIP_MEMORY_SCOPE_AGENT) +
-                 1;
+    if (__builtin_expect(flushIssue</*kTimeout=*/false>(0) != 0, 0)) {
+#ifndef NDEBUG  // see the file comment
+      if (__lane_id() == 0) {
+        printf(
+            "ccoProxy: flush: the DevComm failed; see the host's stderr or ccoDevCommGetError\n");
       }
+#endif
+      __builtin_trap();  // the DevComm failed
     }
-    invoke</*kLaneMasked=*/false>(true, ccoProxyOpFlush);
-    if (__lane_id() == 0) {
-      while (__hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < target) {
-        __builtin_amdgcn_s_sleep(1);
-      }
-    }
-    // Later stores (e.g. overwriting a source buffer) stay after the wait.
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
   }
   coop.sync();
+}
+
+template <typename Queue>
+template <typename Coop, std::enable_if_t<!std::is_integral_v<Coop>, int>>
+__device__ inline int ccoProxy<Queue>::flush(Coop coop, uint64_t timeoutCycles) {
+  static_assert(!std::is_same_v<Coop, ccoCoopLaneMasked>,
+                "ccoProxy::flush takes ccoCoopWarp or ccoCoopBlock: after lane-masked put/signal, "
+                "call flush() (ccoCoopWarp) from all 64 lanes");
+  coop.sync();
+  int result = 0;
+  if (issuingWave<Coop>()) result = flushIssue</*kTimeout=*/true>(timeoutCycles);
+  coop.sync();
+  if constexpr (std::is_same_v<Coop, ccoCoopBlock>) {
+    // Wavefront 0's result to the whole block.
+    if (__syncthreads_or(result != 0)) result = __syncthreads_or(result == 2) ? 2 : 1;
+  }
+  return result;
+}
+
+template <typename Queue>
+__device__ inline void ccoProxy<Queue>::waitSignalOrTrap(ccoGdaSignal_t signalId, uint64_t least,
+                                                         int bits) {
+  volatile uint64_t* signalBuf = comm.ibgda.signalBuf;
+  volatile uint64_t* signalShadows = comm.ibgda.signalShadows;
+  const uint64_t mask = (bits >= 64) ? UINT64_MAX : ((1ULL << bits) - 1);
+  const uint64_t shadow = signalShadows[signalId];
+  for (uint32_t polls = 1;; polls++) {
+    const uint64_t val =
+        __hip_atomic_load(&signalBuf[signalId], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (((val - shadow) & mask) >= least) {
+      signalShadows[signalId] = (shadow + least) & mask;  // consume
+      break;
+    }
+    if (polls % 256 == 0 && failed()) {
+#ifndef NDEBUG  // see the file comment
+      printf(
+          "ccoProxy: waitSignal: the DevComm failed; see the host's stderr or "
+          "ccoDevCommGetError\n");
+#endif
+      __builtin_trap();  // the DevComm failed
+    }
+    asm volatile("" ::: "memory");
+  }
+  // Data the signal covers is read after it.
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
 }
 
 #endif  // defined(__HIPCC__)
