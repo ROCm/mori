@@ -33,6 +33,7 @@ examples.
 import ctypes
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 
@@ -114,15 +115,30 @@ def run_triton_example(transport: str, timeout: int = 240) -> str:
         "--transport",
         transport,
     ]
-    result = subprocess.run(
+    # Own session so a timeout also reaps ranks stuck in a signal wait.
+    proc = subprocess.Popen(
         command,
         cwd=repo_root,
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=timeout,
+        start_new_session=True,
     )
-    output = result.stdout + result.stderr
+    try:
+        output, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            output, _ = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            output, _ = proc.communicate()
+        raise AssertionError(
+            f"CCO Triton {transport} example timed out after {timeout} s:\n{output}"
+        )
+    result = subprocess.CompletedProcess(command, proc.returncode, output, "")
+    output = result.stdout
     if result.returncode != 0:
         raise AssertionError(
             f"CCO Triton {transport} example failed ({result.returncode}):\n{output}"
