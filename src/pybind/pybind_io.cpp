@@ -248,8 +248,10 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("GetEngineDesc", &mori::io::IOEngine::GetEngineDesc)
       .def("CreateBackend", &mori::io::IOEngine::CreateBackend)
       .def("RemoveBackend", &mori::io::IOEngine::RemoveBackend)
-      .def("RegisterRemoteEngine", &mori::io::IOEngine::RegisterRemoteEngine)
-      .def("DeregisterRemoteEngine", &mori::io::IOEngine::DeregisterRemoteEngine)
+      .def("RegisterRemoteEngine", &mori::io::IOEngine::RegisterRemoteEngine,
+           py::call_guard<py::gil_scoped_release>())
+      .def("DeregisterRemoteEngine", &mori::io::IOEngine::DeregisterRemoteEngine,
+           py::call_guard<py::gil_scoped_release>())
       .def("RegisterMemory", &mori::io::IOEngine::RegisterMemory)
       .def("DeregisterMemory", &mori::io::IOEngine::DeregisterMemory)
       .def("AllocateTransferUniqueId", &mori::io::IOEngine::AllocateTransferUniqueId,

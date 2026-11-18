@@ -191,6 +191,9 @@ class RdmaManager {
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
+  // Held across destroying QPs and CQs; see RdmaAsyncEventMonitor::HoldEvents. Empty
+  // when the monitor is off. Taken before mu, never under it.
+  std::unique_lock<std::mutex> HoldAsyncEvents();
 
  private:
   RdmaBackendConfig config;
@@ -448,6 +451,10 @@ class RdmaBackend : public Backend {
   bool PopPeerFailure(PeerFailureEvent* out) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
   size_t NumConnectedEndpoints() const { return rdma->NumConnectedEndpoints(); }
+#ifdef MORI_IO_FAULT_INJECTION
+  // Tests only: runs between building a session for the engine-level path and caching it.
+  static std::function<void(const EngineKey&)> testSessionBuilt;
+#endif
 
  private:
   // With paceQpReplacement, building QPs in place of failed ones is refused with
@@ -519,6 +526,10 @@ class RdmaBackend : public Backend {
   // replacement backed off), when to try again. Guarded by sessionCacheMu.
   std::unordered_map<ConnBuildKey, std::chrono::steady_clock::time_point, ConnBuildKeyHash>
       replaceRetryAt;
+  // Deregistrations of each remote engine so far, so a session whose build a
+  // deregistration overtook is not cached. Guarded by sessionCacheMu.
+  std::unordered_map<EngineKey, uint64_t> deregistrations_;
+  uint64_t DeregistrationsLocked(const EngineKey& remoteEngineKey) const;
   std::mutex sessionCacheMu;
   // Serializes registering and deregistering one remote engine key. Per key, because a
   // deregistration can wait out a connection build to a dead peer.

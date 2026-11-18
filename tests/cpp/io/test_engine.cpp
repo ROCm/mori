@@ -50,6 +50,7 @@
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/rdma/common.hpp"
 #ifdef MORI_IO_FAULT_INJECTION
+#include "src/io/rdma/async_event_monitor.hpp"
 #include "src/io/rdma/fault_injector.hpp"
 #endif
 
@@ -131,6 +132,17 @@ bool WaitTransferDone(TransferStatus* status, int timeoutMs, std::string* err) {
            status->Message() + "'";
   }
   return false;
+}
+
+// For a transfer whose status and buffers the caller owns: one still running at the
+// timeout keeps using them, so the run stops here instead of unwinding and freeing them
+// under it.
+void WaitOrAbort(TransferStatus* status, int timeoutMs, const std::string& what) {
+  std::string err;
+  if (WaitTransferDone(status, timeoutMs, &err)) return;
+  std::fprintf(stderr, "FATAL: %s still running after %d ms (%s); aborting\n", what.c_str(),
+               timeoutMs, err.c_str());
+  std::abort();
 }
 
 bool WaitInboundStatusWithTimeout(IOEngine* engine, const EngineKey& remoteKey, TransferUniqueId id,
@@ -1686,8 +1698,7 @@ bool GpuBufferIs(const RegisteredGpuMem& m, size_t size, uint8_t value) {
 void WriteAndWait(BackendSession* sess, size_t size, TransferUniqueId id, const std::string& what) {
   TransferStatus status;
   sess->Write(0, 0, size, &status, id);
-  std::string err;
-  Require(WaitTransferDone(&status, 5000, &err), what + ": " + err);
+  WaitOrAbort(&status, 5000, what);
   Require(status.Succeeded(), what + " failed: code=" + std::to_string(status.CodeUint32()) +
                                   ", msg='" + status.Message() + "'");
 }
@@ -1721,9 +1732,7 @@ void CaseRdmaDeregisterFreesQpsAndRebuilds() {
   Require(!held->Alive(), "a session to a deregistered engine must report dead");
   TransferStatus status;
   held->Write(0, 0, kSize, &status, 2);
-  std::string err;
-  Require(WaitTransferDone(&status, 1000, &err),
-          "a write on a deregistered engine's session must end at once: " + err);
+  WaitOrAbort(&status, 1000, "a write on a deregistered engine's session");
   Require(status.Failed(), "a write on a deregistered engine's session must fail, got code=" +
                                std::to_string(status.CodeUint32()));
   Require(a.backend->NumConnectedEndpoints() == kQps,
@@ -1832,15 +1841,14 @@ void CaseRdmaDeregisterLeavesAnUncutQpRunning() {
   FaultInjector::Instance().Arm(ParseFaultRule("qp_stuck:value=5"));
   TransferStatus refused;
   sess->Write(0, 0, 4096, &refused, 1);
-  std::string err;
-  Require(WaitTransferDone(&refused, 5000, &err) && refused.Failed(),
-          "the injected post failure must fail the first write: " + err);
+  WaitOrAbort(&refused, 5000, "the write refused by the injected post failure");
+  Require(refused.Failed(), "the injected post failure must fail the first write");
 
   TransferStatus status;
   sess->Write(0, 0, kSize, &status, 2);
   if (!status.InProgress()) throw TestSkip("the write ended before the deregistration");
   a.backend->DeregisterRemoteEngine(b.desc);
-  Require(WaitTransferDone(&status, 10000, &err), "the write on the uncut QP hung: " + err);
+  WaitOrAbort(&status, 10000, "the write on the uncut QP");
   Require(status.Succeeded(),
           "a write on a QP that could not be cut must run to completion, got: " + status.Message());
   Require(GpuBufferIs(dst, kSize, 0xD4), "the write did not land");
@@ -1877,7 +1885,7 @@ void CaseRdmaDeregisterRacesTransfersAndRegistration() {
   MemoryDesc dstDesc = RegisterOnBackend(b, dst, kSize);
 
   std::atomic<bool> stop{false};
-  std::atomic<int> succeeded{0}, failed{0}, refused{0}, hung{0};
+  std::atomic<int> succeeded{0}, failed{0}, refused{0};
   std::mutex reasonsMu;
   std::set<std::string> refusalReasons;
   auto writer = [&](TransferUniqueId firstId) {
@@ -1898,10 +1906,7 @@ void CaseRdmaDeregisterRacesTransfersAndRegistration() {
       for (int i = 0; i < 4 && !stop.load(); ++i) {
         TransferStatus status;
         sess->Write(0, 0, kSize, &status, id++);
-        if (!WaitTransferDone(&status, 10000, nullptr)) {
-          hung++;
-          return;
-        }
+        WaitOrAbort(&status, 10000, "a write during the race");
         (status.Succeeded() ? succeeded : failed)++;
       }
     }
@@ -1926,7 +1931,6 @@ void CaseRdmaDeregisterRacesTransfersAndRegistration() {
   std::printf("  race: %d succeeded, %d failed, %d session builds refused\n", succeeded.load(),
               failed.load(), refused.load());
   for (const auto& reason : refusalReasons) std::printf("  race: refused: %s\n", reason.c_str());
-  Require(hung.load() == 0, std::to_string(hung.load()) + " transfer(s) never ended");
   Require(succeeded.load() > 0, "no transfer got through between deregistrations");
 
   a.backend->DeregisterRemoteEngine(b.desc);
@@ -2002,11 +2006,11 @@ void CaseRdmaDeregisterWaitsOutAnIncomingConnection() {
   builder.join();
   Require(held, "the initiator's connection never reached the target: " + buildError);
   Require(buildError.empty(), "the connection the target accepted failed: " + buildError);
-  Require(waited >= kHold / 2,
-          "the deregistration did not wait for the connection being accepted (" +
-              std::to_string(
-                  std::chrono::duration_cast<std::chrono::milliseconds>(waited).count()) +
-              " ms)");
+  Require(
+      waited >= kHold / 2,
+      "the deregistration did not wait for the connection being accepted (" +
+          std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(waited).count()) +
+          " ms)");
   Require(b.backend->NumConnectedEndpoints() == 0,
           std::to_string(b.backend->NumConnectedEndpoints()) +
               " target QP(s) outlived the deregistration that began while accepting them");
@@ -2014,6 +2018,147 @@ void CaseRdmaDeregisterWaitsOutAnIncomingConnection() {
   sess.reset();
   a.backend->DeregisterRemoteEngine(b.desc);
   b.backend->DeregisterMemory(dstDesc);
+  a.backend->DeregisterMemory(srcDesc);
+#endif
+}
+
+// A verbs async event already acknowledged when a deregistration begins is reported
+// before the deregistration destroys the QP and CQ it is about. Reported after, it could
+// match a new QP or CQ that took the old one's number or address, and fail transfers the
+// NIC is still running.
+void CaseRdmaDeregisterWaitsOutAnAsyncEvent() {
+#ifndef MORI_IO_FAULT_INJECTION
+  throw TestSkip("requires a build with ENABLE_IO_FAULT_INJECTION");
+#else
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+  if (!RdmaBackend::HasActiveDevices()) throw TestSkip("requires at least one active RDMA device");
+  ScopedEnvVar qps("MORI_IO_QP_PER_TRANSFER", "1");
+  constexpr size_t kSize = 64 * 1024;
+  constexpr auto kHold = std::chrono::milliseconds(300);
+  // Destroyed after the backends, so their monitor threads are gone when the hook goes.
+  struct ClearOnExit {
+    ~ClearOnExit() {
+      RdmaAsyncEventMonitor::testEventAcked = nullptr;
+      FaultInjector::Instance().Disarm();
+    }
+  } clearOnExit;
+
+  DirectRdmaBackend a = MakeDirectRdmaBackend("async_initiator");
+  DirectRdmaBackend b = MakeDirectRdmaBackend("async_target");
+  a.backend->RegisterRemoteEngine(b.desc);
+  RegisteredGpuMem src = AllocGpu(kSize, 0xA7);
+  RegisteredGpuMem dst = AllocGpu(kSize, 0x00);
+  MemoryDesc srcDesc = RegisterOnBackend(a, src, kSize);
+  MemoryDesc dstDesc = RegisterOnBackend(b, dst, kSize);
+  std::unique_ptr<BackendSession> sess(a.backend->CreateSession(srcDesc, dstDesc));
+
+  // The initiator's monitor holds the event between acknowledging and reporting it.
+  std::promise<void> acked;
+  std::atomic<bool> fired{false}, reported{false};
+  RdmaAsyncEventMonitor::testEventAcked = [&] {
+    if (fired.exchange(true)) return;
+    acked.set_value();
+    std::this_thread::sleep_for(kHold);
+    reported.store(true);
+  };
+  FaultInjector::Instance().Arm(ParseFaultRule("async_event:value=cq_err:op=write:count=1"));
+  TransferStatus status;
+  sess->Write(0, 0, kSize, &status, 1);
+  const bool held =
+      acked.get_future().wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+  FaultInjector::Instance().Disarm();
+  if (!held) WaitOrAbort(&status, 10000, "the write the async event was injected on");
+  Require(held, "the injected async event never reached the monitor");
+  sess.reset();
+  a.backend->DeregisterRemoteEngine(b.desc);
+  WaitOrAbort(&status, 10000, "the write the async event was injected on");
+  Require(reported.load(),
+          "the deregistration destroyed the QP and CQ before the async event about them was "
+          "reported");
+  Require(a.backend->NumConnectedEndpoints() == 0,
+          std::to_string(a.backend->NumConnectedEndpoints()) + " QP(s) left");
+
+  a.backend->RegisterRemoteEngine(b.desc);
+  HIP_RUNTIME_CHECK(hipMemset(dst.ptr, 0x00, kSize));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  sess.reset(a.backend->CreateSession(srcDesc, dstDesc));
+  WriteAndWait(sess.get(), kSize, 2, "write after the deregistration");
+  Require(GpuBufferIs(dst, kSize, 0xA7), "the write after the deregistration did not land");
+  sess.reset();
+  a.backend->DeregisterRemoteEngine(b.desc);
+  b.backend->DeregisterMemory(dstDesc);
+  a.backend->DeregisterMemory(srcDesc);
+#endif
+}
+
+// A session whose build a deregistration overtakes, between building it and caching it,
+// serves its transfer and is not cached: cached, it would keep the QPs the deregistration
+// cut allocated until that pair of memories is used again.
+void CaseRdmaDeregisterOvertakingASessionBuild() {
+#ifndef MORI_IO_FAULT_INJECTION
+  throw TestSkip("requires a build with ENABLE_IO_FAULT_INJECTION");
+#else
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+  if (!RdmaBackend::HasActiveDevices()) throw TestSkip("requires at least one active RDMA device");
+  ScopedEnvVar qps("MORI_IO_QP_PER_TRANSFER", "1");
+  constexpr size_t kSize = 64 * 1024;
+  struct ClearHookOnExit {
+    ~ClearHookOnExit() { RdmaBackend::testSessionBuilt = nullptr; }
+  } clearHookOnExit;
+
+  DirectRdmaBackend a = MakeDirectRdmaBackend("overtaken_initiator");
+  DirectRdmaBackend b = MakeDirectRdmaBackend("overtaken_target");
+  DirectRdmaBackend c = MakeDirectRdmaBackend("overtaken_other");
+  a.backend->RegisterRemoteEngine(b.desc);
+  a.backend->RegisterRemoteEngine(c.desc);
+  RegisteredGpuMem src = AllocGpu(kSize, 0xB8);
+  RegisteredGpuMem dstB = AllocGpu(kSize, 0x00);
+  RegisteredGpuMem dstC = AllocGpu(kSize, 0x00);
+  MemoryDesc srcDesc = RegisterOnBackend(a, src, kSize);
+  MemoryDesc dstBDesc = RegisterOnBackend(b, dstB, kSize);
+  MemoryDesc dstCDesc = RegisterOnBackend(c, dstC, kSize);
+
+  // The engine-level write holds its new session between building and caching it until
+  // the deregistration is done.
+  std::promise<void> built;
+  std::promise<void> deregistered;
+  std::shared_future<void> deregisteredDone = deregistered.get_future().share();
+  std::atomic<bool> fired{false};
+  RdmaBackend::testSessionBuilt = [&](const EngineKey& ekey) {
+    if (ekey != b.desc.key || fired.exchange(true)) return;
+    built.set_value();
+    deregisteredDone.wait();
+  };
+  TransferStatus status;
+  std::thread writer(
+      [&] { a.backend->ReadWrite(srcDesc, 0, dstBDesc, 0, kSize, &status, 1, /*isRead=*/false); });
+  const bool held =
+      built.get_future().wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+  if (held) a.backend->DeregisterRemoteEngine(b.desc);
+  deregistered.set_value();
+  writer.join();
+  WaitOrAbort(&status, 10000, "the write on the overtaken session");
+  Require(held, "the session build never finished");
+  Require(status.Failed(), "a write on QPs the deregistration cut must fail");
+
+  // A first session to another engine destroys the endpoints released by then.
+  std::unique_ptr<BackendSession> other(a.backend->CreateSession(srcDesc, dstCDesc));
+  Require(a.backend->NumConnectedEndpoints() == 1,
+          std::to_string(a.backend->NumConnectedEndpoints()) +
+              " QPs connected; the overtaken session's QP must be gone, the new one left");
+
+  a.backend->RegisterRemoteEngine(b.desc);
+  TransferStatus again;
+  a.backend->ReadWrite(srcDesc, 0, dstBDesc, 0, kSize, &again, 2, /*isRead=*/false);
+  WaitOrAbort(&again, 5000, "the write after re-registering");
+  Require(again.Succeeded(), "the write after re-registering failed: " + again.Message());
+  Require(GpuBufferIs(dstB, kSize, 0xB8), "the write after re-registering did not land");
+
+  other.reset();
+  a.backend->DeregisterRemoteEngine(b.desc);
+  a.backend->DeregisterRemoteEngine(c.desc);
+  c.backend->DeregisterMemory(dstCDesc);
+  b.backend->DeregisterMemory(dstBDesc);
   a.backend->DeregisterMemory(srcDesc);
 #endif
 }
@@ -2797,6 +2942,8 @@ int main(int argc, char* argv[]) {
        CaseRdmaDeregisterRacesTransfersAndRegistration},
       {"rdma_deregister_waits_out_an_incoming_connection",
        CaseRdmaDeregisterWaitsOutAnIncomingConnection},
+      {"rdma_deregister_waits_out_an_async_event", CaseRdmaDeregisterWaitsOutAnAsyncEvent},
+      {"rdma_deregister_overtaking_a_session_build", CaseRdmaDeregisterOvertakingASessionBuild},
       {"rdma_dmabuf_interior_range_transfer", CaseRdmaDmabufInteriorRangeTransfer},
       {"rdma_dmabuf_vmm_interior_range_transfer", CaseRdmaDmabufVmmInteriorRangeTransfer},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},

@@ -22,6 +22,7 @@
 #pragma once
 
 #include <mutex>
+#include <utility>
 
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/rdma.hpp"
@@ -53,6 +54,8 @@ class IBVerbsDeviceContext : public RdmaDeviceContext {
   std::unordered_map<uint32_t, ibv_qp*> qpPool;
   std::vector<ibv_comp_channel*> compChPool;
   std::unordered_map<uint32_t, ProxyRecvInfo> proxyRecvInfo;
+  // Atomic internal buffer of each QP that has one, freed with the QP.
+  std::unordered_map<uint32_t, std::pair<void*, ibv_mr*>> atomicIbufs;
 };
 
 class IBVerbsDevice : public RdmaDevice {
