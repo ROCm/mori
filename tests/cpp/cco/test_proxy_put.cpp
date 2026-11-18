@@ -801,6 +801,14 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
 }
 
 int main(int argc, char** argv) {
+  // MORI_CCO_SKIP_GDA_FULL marks runners without intranode cross-rail RDMA; the
+  // single-node (fork) run needs FULL connections, so skip it there.
+  bool singleRank = false;
+  for (int i = 1; i < argc; i++) singleRank |= !strcmp(argv[i], "--rank");
+  if (getenv("MORI_CCO_SKIP_GDA_FULL") != nullptr && !singleRank) {
+    printf("=== CCO proxy put: SKIPPED (MORI_CCO_SKIP_GDA_FULL) ===\n");
+    return 0;
+  }
   const int rc = ccoTestMain(argc, argv, "CCO proxy put", "/tmp/cco_proxy_put_uid", 19890);
 #ifdef MORI_WITH_MPI
   int initialized = 0, finalized = 0;
