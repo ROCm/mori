@@ -105,6 +105,13 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   `signal_slot(<sender lsa rank>, qid)` -- ours for `local_signal`, the peer's
   for `remote_signal` -- which `wait_signal` polls; `quiet / quiet_queue` drain
   regardless. See example 07.
+- **ccoProxy** (host-proxy RDMA, gfx942/gfx950): raw externs
+  `cco_proxy_<op>__<coop>[__<sig>]__<pool>` (put / put_value / signal / flush /
+  flush_timeout / wait_signal / read_signal / reset_signal / failed; coop warp /
+  block, pool spsc / mpsc) and the Triton facade `mori.ir.triton.cco.Proxy`.
+  Each call builds the C++ handle on the given queue and drops it at return, so
+  one wavefront must own an SPSC queue across calls, and a block flush covers
+  only that queue.
 
 ## Build & run
 
@@ -188,7 +195,7 @@ beyond the method names.
 | `04_flydsl_lsa_put` | LSA direct peer-pointer store in the kernel |
 | `05_flydsl_lsa_allreduce` | LSA custom all-reduce: peer pointers + device signal barrier |
 | `06_flydsl_gda_modes` | GDA template matrix: (thread_mode,coop) {indep×thread/warp/block, aggr×thread} × signal {inc,add}; deferred and caller-ordered puts + flush_async/wait per team |
-| `examples/cco/ir/test_triton_cco.py` | Triton DevComm queries plus LSA, SDMA, and GDA |
+| `examples/cco/ir/test_triton_cco.py` | Triton DevComm queries plus LSA, SDMA, GDA, and ccoProxy (`--transport proxy`) |
 
 ## FlyDSL kernel-author gotchas
 

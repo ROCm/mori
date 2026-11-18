@@ -25,7 +25,7 @@
 mori.ir.triton — Triton integration for MORI device APIs.
 
 The package-level functions expose shmem. The :mod:`mori.ir.triton.cco`
-submodule exposes CCO LSA, SDMA, and GDA functions.
+submodule exposes CCO LSA, SDMA, GDA, and ccoProxy functions.
 
 Quick start::
 

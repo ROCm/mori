@@ -54,6 +54,9 @@
 //   SDMA put/get on resolved addresses — coop tag only; their other axes ride
 //   in a `flags` argument (SdmaWithFlags). Either `flags` constant-folds once
 //   the wrapper is inlined.
+//   ccoProxy — cco_proxy_<op>__<coop>[__<sig>]__<pool>: coop warp / block, sig
+//   none / inc / add / set, pool spsc / mpsc (the handle's queue type). Each
+//   call builds a ccoProxy on `queue` and drops it at return (see below).
 //   Side-effect-only wrappers return int status 0 rather than void. Triton's
 //   extern_elementwise requires a concrete return element type; FlyDSL ignores
 //   the status.
@@ -93,6 +96,8 @@ using Const = std::integral_constant<T, v>;
   ccoGda_SignalInc { AsSig(sid) }
 #define CCO_RA_add \
   ccoGda_SignalAdd { AsSig(sid), sv }
+#define CCO_RA_set \
+  ccoGda_SignalSet { AsSig(sid), sv }
 
 // Valid (tag, ThreadMode, Coop) combos for the data path.
 #define CCO_TC_LIST(X)                          \
@@ -695,6 +700,131 @@ CCO_COOP_LIST(CCO_DEF_FLUSH_ASYNC_MODES)
   }
 CCO_COOP_LIST(CCO_DEF_WAIT_REQUEST)
 #undef CCO_DEF_WAIT_REQUEST
+
+// ── ccoProxy: cco_proxy_<op>__<coop>[__<sig>]__<pool> ──
+// Each call constructs ccoProxy<Q> on (dc, queue) and destroys it at return.
+// SPSC: the constructor loads the queue's producer state and the destructor
+// saves it after a push, so calls on one queue continue where the last left
+// off, provided one wavefront owns the queue across calls (ccoCoopBlock:
+// wavefront 0; handing it to another wavefront needs the release/acquire in
+// cco_proxy.hpp). MPSC keeps no producer state. A flush takes its ticket from
+// the queue's counter, so it covers every earlier op on the queue, whichever
+// call pushed it. Block flush: the "pushed since its last flush" mark lives in
+// the handle and starts clear, so __block flushes only `queue`, from
+// wavefront 0; after __warp ops on per-wavefront queues, flush each with __warp.
+// put / put_value / signal take a trailing GdaFlags word (team only). Signal
+// wait / read / reset use the ccoGda signal slots; the handle adds the failure
+// check. Traps on targets without a KIWI push (gfx1250: wave32).
+namespace {
+using ProxySpsc = ccoProxy<mori::cco::proxy::queue::SPSCD2HQueue>;
+using ProxyMpsc = ccoProxy<mori::cco::proxy::queue::MPSCD2HQueue>;
+}  // namespace
+
+// (coop tag, Coop, pool tag, handle type). X gets the caller's args first.
+#define CCO_PROXY_LIST(X, ...)                         \
+  X(__VA_ARGS__, warp, ccoCoopWarp, spsc, ProxySpsc)   \
+  X(__VA_ARGS__, block, ccoCoopBlock, spsc, ProxySpsc) \
+  X(__VA_ARGS__, warp, ccoCoopWarp, mpsc, ProxyMpsc)   \
+  X(__VA_ARGS__, block, ccoCoopBlock, mpsc, ProxyMpsc)
+#define CCO_PROXY_POOL_LIST(X) \
+  X(spsc, ProxySpsc)           \
+  X(mpsc, ProxyMpsc)
+
+// put: cco_proxy_put__<coop>__<sig>__<pool>
+#define CCO_DEF_PROXY_PUT(SIG, TAG, COOP, POOL, PROXY)                                         \
+  CCO_DEV int cco_proxy_put__##TAG##__##SIG##__##POOL(                                         \
+      uint64_t dc, int queue, int peer, uint64_t dW, uint64_t dO, uint64_t sW, uint64_t sO,    \
+      uint64_t n, int sid, uint64_t sv, int flags) {                                           \
+    PROXY proxy{*AsDevComm(dc), queue};                                                        \
+    GdaWithTeam(flags, [&](auto team) {                                                        \
+      proxy.put<decltype(team)::value, ccoGdaThreadIndependent, decltype(CCO_RA_##SIG), COOP>( \
+          peer, AsWindow(dW), dO, AsWindow(sW), sO, n, CCO_RA_##SIG, COOP{});                  \
+    });                                                                                        \
+    return 0;                                                                                  \
+  }
+CCO_PROXY_LIST(CCO_DEF_PROXY_PUT, none)
+CCO_PROXY_LIST(CCO_DEF_PROXY_PUT, inc)
+CCO_PROXY_LIST(CCO_DEF_PROXY_PUT, add)
+CCO_PROXY_LIST(CCO_DEF_PROXY_PUT, set)
+#undef CCO_DEF_PROXY_PUT
+
+// put_value (uint64, 8 bytes): cco_proxy_put_value__<coop>__<none|set>__<pool>
+#define CCO_DEF_PROXY_PUTV(SIG, TAG, COOP, POOL, PROXY)                                         \
+  CCO_DEV int cco_proxy_put_value__##TAG##__##SIG##__##POOL(                                    \
+      uint64_t dc, int queue, int peer, uint64_t dW, uint64_t dO, uint64_t value, int sid,      \
+      uint64_t sv, int flags) {                                                                 \
+    PROXY proxy{*AsDevComm(dc), queue};                                                         \
+    GdaWithTeam(flags, [&](auto team) {                                                         \
+      proxy.putValue<decltype(team)::value, ccoGdaThreadIndependent, uint64_t,                  \
+                     decltype(CCO_RA_##SIG), COOP>(peer, AsWindow(dW), dO, value, CCO_RA_##SIG, \
+                                                   COOP{});                                     \
+    });                                                                                         \
+    return 0;                                                                                   \
+  }
+CCO_PROXY_LIST(CCO_DEF_PROXY_PUTV, none)
+CCO_PROXY_LIST(CCO_DEF_PROXY_PUTV, set)
+#undef CCO_DEF_PROXY_PUTV
+
+// signal: cco_proxy_signal__<coop>__<inc|add|set>__<pool>
+#define CCO_DEF_PROXY_SIGNAL(SIG, TAG, COOP, POOL, PROXY)                                   \
+  CCO_DEV int cco_proxy_signal__##TAG##__##SIG##__##POOL(uint64_t dc, int queue, int peer,  \
+                                                         int sid, uint64_t sv, int flags) { \
+    PROXY proxy{*AsDevComm(dc), queue};                                                     \
+    GdaWithTeam(flags, [&](auto team) {                                                     \
+      proxy.signal<decltype(team)::value, decltype(CCO_RA_##SIG), COOP>(peer, CCO_RA_##SIG, \
+                                                                        COOP{});            \
+    });                                                                                     \
+    return 0;                                                                               \
+  }
+CCO_PROXY_LIST(CCO_DEF_PROXY_SIGNAL, inc)
+CCO_PROXY_LIST(CCO_DEF_PROXY_SIGNAL, add)
+CCO_PROXY_LIST(CCO_DEF_PROXY_SIGNAL, set)
+#undef CCO_DEF_PROXY_SIGNAL
+
+// flush: cco_proxy_flush__<coop>__<pool> traps once the DevComm failed;
+// cco_proxy_flush_timeout__<coop>__<pool> returns 0 done, 1 timed out after
+// `cycles` clock64 cycles, 2 failed (the same in every thread of the group).
+// wait_signal: cco_proxy_wait_signal__<coop>__<pool>, one thread waits.
+#define CCO_DEF_PROXY_FLUSH(UNUSED, TAG, COOP, POOL, PROXY)                                       \
+  CCO_DEV int cco_proxy_flush__##TAG##__##POOL(uint64_t dc, int queue) {                          \
+    PROXY proxy{*AsDevComm(dc), queue};                                                           \
+    proxy.flush(COOP{});                                                                          \
+    return 0;                                                                                     \
+  }                                                                                               \
+  CCO_DEV int cco_proxy_flush_timeout__##TAG##__##POOL(uint64_t dc, int queue, uint64_t cycles) { \
+    PROXY proxy{*AsDevComm(dc), queue};                                                           \
+    return proxy.flush(COOP{}, cycles);                                                           \
+  }                                                                                               \
+  CCO_DEV int cco_proxy_wait_signal__##TAG##__##POOL(uint64_t dc, int queue, int sid,             \
+                                                     uint64_t least, int bits) {                  \
+    PROXY proxy{*AsDevComm(dc), queue};                                                           \
+    proxy.waitSignal(AsSig(sid), least, COOP{}, bits);                                            \
+    return 0;                                                                                     \
+  }
+CCO_PROXY_LIST(CCO_DEF_PROXY_FLUSH, _)
+#undef CCO_DEF_PROXY_FLUSH
+
+// Per-thread, no push: cco_proxy_{read_signal,reset_signal,failed}__<pool>.
+// failed returns 1 once the DevComm failed, else 0.
+#define CCO_DEF_PROXY_LOCAL(POOL, PROXY)                                                      \
+  CCO_DEV uint64_t cco_proxy_read_signal__##POOL(uint64_t dc, int queue, int sid, int bits) { \
+    PROXY proxy{*AsDevComm(dc), queue};                                                       \
+    return proxy.readSignal(AsSig(sid), bits);                                                \
+  }                                                                                           \
+  CCO_DEV int cco_proxy_reset_signal__##POOL(uint64_t dc, int queue, int sid) {               \
+    PROXY proxy{*AsDevComm(dc), queue};                                                       \
+    proxy.resetSignal(AsSig(sid));                                                            \
+    return 0;                                                                                 \
+  }                                                                                           \
+  CCO_DEV int cco_proxy_failed__##POOL(uint64_t dc, int queue) {                              \
+    PROXY proxy{*AsDevComm(dc), queue};                                                       \
+    return proxy.failed() ? 1 : 0;                                                            \
+  }
+CCO_PROXY_POOL_LIST(CCO_DEF_PROXY_LOCAL)
+#undef CCO_DEF_PROXY_LOCAL
+
+#undef CCO_PROXY_POOL_LIST
+#undef CCO_PROXY_LIST
 
 #undef CCO_FLUSH_DOORBELL_LIST
 #undef CCO_DOORBELL_LIST
