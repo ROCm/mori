@@ -697,7 +697,7 @@ class CMakeBuild(build_ext):
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
-        build_cco_proxy_enabled = _env_flag("BUILD_CCO_PROXY", "OFF")
+        build_cco_proxy_enabled = _env_flag("BUILD_CCO_PROXY", "ON")
         with_mpi = (
             "ON"
             if (

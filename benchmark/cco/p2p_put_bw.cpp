@@ -44,9 +44,6 @@
 #include "hip/hip_runtime.h"
 #include "mori/application/utils/check.hpp"
 #include "mori/cco/cco_scale_out.hpp"
-#ifdef MORI_CCO_PROXY
-#include "mori/cco/cco_proxy.hpp"
-#endif
 #include "util.hpp"
 
 namespace mori::cco::benchmark {
@@ -346,11 +343,13 @@ int main(int argc, char** argv) {
         if (proxy) {
 #ifdef MORI_CCO_PROXY
           if (args.proxy_mpsc) {
-            launch_proxy<kiwi::queue::MPSCD2HQueue>(args.put_scope, grid, block, ctx.send_win,
-                                                    ctx.recv_win, len_doubles, ctx.devComm, count);
+            launch_proxy<mori::cco::proxy::queue::MPSCD2HQueue>(args.put_scope, grid, block,
+                                                                ctx.send_win, ctx.recv_win,
+                                                                len_doubles, ctx.devComm, count);
           } else {
-            launch_proxy<kiwi::queue::SPSCD2HQueue>(args.put_scope, grid, block, ctx.send_win,
-                                                    ctx.recv_win, len_doubles, ctx.devComm, count);
+            launch_proxy<mori::cco::proxy::queue::SPSCD2HQueue>(args.put_scope, grid, block,
+                                                                ctx.send_win, ctx.recv_win,
+                                                                len_doubles, ctx.devComm, count);
           }
 #endif
         } else if (args.transport == Transport::kSdma) {

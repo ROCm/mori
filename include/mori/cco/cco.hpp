@@ -386,8 +386,10 @@ struct ccoSdmaContext {
 struct ccoProxyContext {
   int numSpscQueues;
   int numMpscQueues;
-  void* spscContext;  // GPU kiwi::invoke::DeviceContext<SPSCD2HQueue>*; null if no SPSC queues
-  void* mpscContext;  // GPU kiwi::invoke::DeviceContext<MPSCD2HQueue>*; null if no MPSC queues
+  void* spscContext;  // GPU mori::cco::proxy::invoke::DeviceContext<SPSCD2HQueue>*; null if no SPSC
+                      // queues
+  void* mpscContext;  // GPU mori::cco::proxy::invoke::DeviceContext<MPSCD2HQueue>*; null if no MPSC
+                      // queues
   // [numSpscQueues + numMpscQueues] (SPSC pool, then MPSC pool) FLUSHes the
   // proxy has satisfied per queue. Fine-grained device memory, written only by
   // the proxy, never decreases.
@@ -517,7 +519,8 @@ struct ccoDevCommRequirements {
   // hybridLsaBarrier and hybridRailGdaBarrier with the same N.
   int barrierCount;
 
-  // ccoProxy (host-proxy RDMA, needs a BUILD_CCO_PROXY build). Separate SPSC and
+  // ccoProxy (host-proxy RDMA; the host engine is built by default for gfx942/gfx950
+  // and MORI_CCO_DISABLE_PROXY=1 turns it off at run time). Separate SPSC and
   // MPSC queue pools (ccoProxy<SPSCD2HQueue> / ccoProxy<MPSCD2HQueue> index their
   // own pool), polled by proxyThreadCount host threads. Uses the GDA peer set and
   // signal slots, so gdaConnectionType must resolve to non-NONE. Every rank must

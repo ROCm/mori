@@ -118,9 +118,9 @@
 #include "mori/cco/cco_scale_out.hpp"
 
 #if defined(__HIPCC__)
-#include "kiwi/invoke/device_context.hip.hpp"
-#include "kiwi/queue/device_to_host_queue.hip.hpp"
-#include "kiwi/queue/mpsc_device_to_host_queue.hip.hpp"
+#include "mori/cco/proxy/invoke/device_context.hip.hpp"
+#include "mori/cco/proxy/queue/device_to_host_queue.hip.hpp"
+#include "mori/cco/proxy/queue/mpsc_device_to_host_queue.hip.hpp"
 #endif
 
 namespace mori {
@@ -223,13 +223,13 @@ struct ccoCoopLaneMasked {
 // Device-side transport handle. Construct per thread; call put / signal /
 // flush from the whole Coop group. Not copyable: an SPSC handle writes its
 // producer state back exactly once.
-template <typename Queue = kiwi::queue::SPSCD2HQueue>
+template <typename Queue = mori::cco::proxy::queue::SPSCD2HQueue>
 struct ccoProxy {
-  static constexpr bool kSpsc = std::is_same_v<Queue, kiwi::queue::SPSCD2HQueue>;
-  static_assert(kSpsc || std::is_same_v<Queue, kiwi::queue::MPSCD2HQueue>,
-                "ccoProxy queue must be kiwi::queue::SPSCD2HQueue or MPSCD2HQueue");
+  static constexpr bool kSpsc = std::is_same_v<Queue, mori::cco::proxy::queue::SPSCD2HQueue>;
+  static_assert(kSpsc || std::is_same_v<Queue, mori::cco::proxy::queue::MPSCD2HQueue>,
+                "ccoProxy queue must be mori::cco::proxy::queue::SPSCD2HQueue or MPSCD2HQueue");
 
-  using DeviceContext = kiwi::invoke::DeviceContext<Queue>;
+  using DeviceContext = mori::cco::proxy::invoke::DeviceContext<Queue>;
 
   ccoDevComm const& comm;
   int rank;    // my index in the GDA team [0, nRanks)

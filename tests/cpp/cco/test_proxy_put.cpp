@@ -103,11 +103,11 @@
 // to fork N local ranks.
 
 #include "cco_test_harness.hpp"
-#include "mori/cco/cco_proxy.hpp"
+#include "mori/cco/cco_scale_out.hpp"
 
 using namespace mori::cco;
-using kiwi::queue::MPSCD2HQueue;
-using kiwi::queue::SPSCD2HQueue;
+using mori::cco::proxy::queue::MPSCD2HQueue;
+using mori::cco::proxy::queue::SPSCD2HQueue;
 
 static const size_t PER_RANK_VMM_SIZE = 512ULL * 1024 * 1024;
 static constexpr int kSpscQueues = 4;

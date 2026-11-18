@@ -50,7 +50,7 @@
 // clang-format off
 #include "cco_proxy_engine.hpp"
 #include "hip/hip_runtime.h"
-#include "kiwi/invoke/invoke.hpp"
+#include "mori/cco/proxy/invoke/invoke.hpp"
 #include "mori/application/bootstrap/base_bootstrap.hpp"
 #include "mori/application/context/context.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
@@ -116,8 +116,8 @@ std::vector<int> ChooseProxyCpus(int numThreads, std::string* source) {
   if (const char* env = std::getenv("MORI_CCO_PROXY_CPUS"); env != nullptr && env[0] != '\0') {
     order = application::detail::ParseCpuList(env);
     if (order.empty()) {
-      MORI_SHMEM_WARN("ccoProxy: MORI_CCO_PROXY_CPUS=\"{}\" names no CPUs; using the default choice",
-                      env);
+      MORI_SHMEM_WARN(
+          "ccoProxy: MORI_CCO_PROXY_CPUS=\"{}\" names no CPUs; using the default choice", env);
     } else {
       *source = "MORI_CCO_PROXY_CPUS";
     }
@@ -194,14 +194,14 @@ void HipOrThrow(hipError_t err, const char* what) {
 class HostQueue {
  public:
   virtual ~HostQueue() = default;
-  virtual bool Ready() = 0;            // hint: the next message has started to arrive
+  virtual bool Ready() = 0;              // hint: the next message has started to arrive
   virtual size_t Progress(int max) = 0;  // runs up to `max` callbacks; returns how many
 };
 
 template <typename Q>
 class HostQueueImpl final : public HostQueue {
  public:
-  HostQueueImpl(kiwi::invoke::Context<Q>& ctx, size_t endpoint)
+  HostQueueImpl(mori::cco::proxy::invoke::Context<Q>& ctx, size_t endpoint)
       : ctx_(ctx), endpoint_(endpoint), poll_(ctx.raw_queue(endpoint)->host_poll_state()) {}
   bool Ready() override { return poll_.ready(); }
   size_t Progress(int max) override {
@@ -211,7 +211,7 @@ class HostQueueImpl final : public HostQueue {
   }
 
  private:
-  kiwi::invoke::Context<Q>& ctx_;
+  mori::cco::proxy::invoke::Context<Q>& ctx_;
   size_t endpoint_;
   typename Q::HostPollState poll_;
 };
@@ -269,7 +269,7 @@ class ProxyWorker {
   // Registers the ccoProxyOp callbacks on a pool's invoke context, in op order
   // so the callback ids are the ops.
   template <typename Q>
-  static void RegisterCallbacks(kiwi::invoke::Context<Q>& ctx) {
+  static void RegisterCallbacks(mori::cco::proxy::invoke::Context<Q>& ctx) {
     Register(ctx, ccoProxyOpPut, &ProxyWorker::OnPut);
     Register(ctx, ccoProxyOpPutSignal, &ProxyWorker::OnPutSignal);
     Register(ctx, ccoProxyOpSignal, &ProxyWorker::OnSignal);
@@ -287,7 +287,7 @@ class ProxyWorker {
   // A callback runs on the proxy thread that called progress(), for the queue
   // in its cur_.
   template <typename Q, typename Desc>
-  static void Register(kiwi::invoke::Context<Q>& ctx, ccoProxyOp op,
+  static void Register(mori::cco::proxy::invoke::Context<Q>& ctx, ccoProxyOp op,
                        void (ProxyWorker::*fn)(const Desc&)) {
     const uint8_t id =
         ctx.register_callback(std::function<void(Desc)>([fn](Desc d) { (current_->*fn)(d); }));
@@ -512,8 +512,10 @@ class ccoProxyEngine {
 
   application::BootstrapNetwork* bootNet{nullptr};
   std::unique_ptr<application::IBVerbsDeviceContext> ibv;
-  std::unique_ptr<kiwi::invoke::Context<kiwi::queue::SPSCD2HQueue>> spsc;  // SPSC pool
-  std::unique_ptr<kiwi::invoke::Context<kiwi::queue::MPSCD2HQueue>> mpsc;  // MPSC pool
+  std::unique_ptr<mori::cco::proxy::invoke::Context<mori::cco::proxy::queue::SPSCD2HQueue>>
+      spsc;  // SPSC pool
+  std::unique_ptr<mori::cco::proxy::invoke::Context<mori::cco::proxy::queue::MPSCD2HQueue>>
+      mpsc;                                         // MPSC pool
   std::vector<std::unique_ptr<OwnedQueue>> queues;  // SPSC pool, then MPSC pool
   std::vector<std::unique_ptr<ProxyWorker>> workers;
   void* scratch{nullptr};
@@ -569,7 +571,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     }
     const size_t capacity = config.queueCapacity ? config.queueCapacity : kDefaultQueueCapacity;
     if ((capacity & (capacity - 1)) != 0 ||
-        capacity < kiwi::queue::message_lines(sizeof(ccoProxyPutSignalDesc))) {
+        capacity < mori::cco::proxy::queue::message_lines(sizeof(ccoProxyPutSignalDesc))) {
       throw std::runtime_error("queue capacity must be a power of two >= the largest descriptor");
     }
     // The proxy threads store the flush counters into fine-grained VRAM, so the
@@ -636,23 +638,26 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     // One invoke context per pool. Queues: SPSC pool [0, numSpsc), MPSC pool
     // [numSpsc, numQueues); queue g is consumed by thread g % numThreads.
     if (numSpsc > 0) {
-      engine->spsc =
-          std::make_unique<kiwi::invoke::Context<kiwi::queue::SPSCD2HQueue>>(numSpsc, capacity);
+      engine->spsc = std::make_unique<
+          mori::cco::proxy::invoke::Context<mori::cco::proxy::queue::SPSCD2HQueue>>(numSpsc,
+                                                                                    capacity);
       ProxyWorker::RegisterCallbacks(*engine->spsc);
     }
     if (numMpsc > 0) {
-      engine->mpsc =
-          std::make_unique<kiwi::invoke::Context<kiwi::queue::MPSCD2HQueue>>(numMpsc, capacity);
+      engine->mpsc = std::make_unique<
+          mori::cco::proxy::invoke::Context<mori::cco::proxy::queue::MPSCD2HQueue>>(numMpsc,
+                                                                                    capacity);
       ProxyWorker::RegisterCallbacks(*engine->mpsc);
     }
     for (int g = 0; g < numQueues; g++) {
       auto oq = std::make_unique<OwnedQueue>();
       oq->flushDone = engine->flushDone + g;
       if (g < numSpsc) {
-        oq->queue = std::make_unique<HostQueueImpl<kiwi::queue::SPSCD2HQueue>>(*engine->spsc, g);
+        oq->queue = std::make_unique<HostQueueImpl<mori::cco::proxy::queue::SPSCD2HQueue>>(
+            *engine->spsc, g);
       } else {
-        oq->queue =
-            std::make_unique<HostQueueImpl<kiwi::queue::MPSCD2HQueue>>(*engine->mpsc, g - numSpsc);
+        oq->queue = std::make_unique<HostQueueImpl<mori::cco::proxy::queue::MPSCD2HQueue>>(
+            *engine->mpsc, g - numSpsc);
       }
       oq->lastSeq.assign(worldSize, 0);
       engine->workers[g % numThreads]->queues.push_back(oq.get());

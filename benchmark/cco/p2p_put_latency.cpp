@@ -39,9 +39,6 @@
 #include "hip/hip_runtime.h"
 #include "mori/application/utils/check.hpp"
 #include "mori/cco/cco_scale_out.hpp"
-#ifdef MORI_CCO_PROXY
-#include "mori/cco/cco_proxy.hpp"
-#endif
 #include "util.hpp"
 
 namespace mori::cco::benchmark {

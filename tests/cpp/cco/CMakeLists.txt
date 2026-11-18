@@ -105,7 +105,7 @@ foreach(_src ${CCO_TEST_SOURCES})
   if(NOT BUILD_CCO_SDMA AND _src MATCHES "test_sdma_")
     continue()
   endif()
-  # ccoProxy tests need the KIWI-queue host proxy (BUILD_CCO_PROXY=ON).
+  # ccoProxy tests need the ccoProxy host engine (BUILD_CCO_PROXY=ON).
   if(NOT BUILD_CCO_PROXY AND _src MATCHES "test_proxy_")
     continue()
   endif()

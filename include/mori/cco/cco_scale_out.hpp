@@ -1826,3 +1826,6 @@ __device__ inline void ccoGdaBarrier(Coop, ccoGda<PrvdType, Doorbell>&, ccoGdaBa
 
 }  // namespace cco
 }  // namespace mori
+
+// ccoProxy: the host-proxy RDMA transport with the ccoGda window API.
+#include "mori/cco/cco_proxy.hpp"
