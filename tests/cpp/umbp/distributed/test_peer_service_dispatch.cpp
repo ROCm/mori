@@ -46,6 +46,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -697,10 +698,33 @@ class StampingMockBackend final : public MockBackend {
     auto out = MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
     std::lock_guard<std::mutex> lock(gen_mutex_);
     for (size_t i = 0; i < keys.size() && i < out.size(); ++i) {
+      if (busy_.count(keys[i]) != 0) {  // held here, no staging to read it through
+        out[i] = ResolvedEntry{};
+        out[i].outcome = ResolveOutcome::kBusy;
+        continue;
+      }
       auto it = generations_.find(keys[i]);
       if (out[i].found && it != generations_.end()) out[i].generation = it->second;
     }
     return out;
+  }
+
+  std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations) override {
+    {
+      std::lock_guard<std::mutex> lock(gen_mutex_);
+      finished_.insert(finished_.end(), keys.begin(), keys.end());
+    }
+    return BatchStillHolds(keys, generations);
+  }
+
+  void AnswerBusyFor(const std::string& key) {
+    std::lock_guard<std::mutex> lock(gen_mutex_);
+    busy_.insert(key);
+  }
+  std::vector<std::string> Finished() const {
+    std::lock_guard<std::mutex> lock(gen_mutex_);
+    return finished_;
   }
 
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override {
@@ -726,6 +750,8 @@ class StampingMockBackend final : public MockBackend {
  private:
   mutable std::mutex gen_mutex_;
   std::map<std::string, uint64_t> generations_;
+  std::set<std::string> busy_;
+  std::vector<std::string> finished_;
 };
 
 class PeerServiceValidateReadsTest : public PeerServiceDispatchTest {
@@ -734,9 +760,14 @@ class PeerServiceValidateReadsTest : public PeerServiceDispatchTest {
     return std::make_unique<StampingMockBackend>(tier);
   }
 
+  StampingMockBackend* Stamping(TierType tier) {
+    return static_cast<StampingMockBackend*>(Mock(tier));
+  }
+
   std::vector<bool> Validate(const ::umbp::BatchResolveKeysResponse& resolved,
-                             const std::vector<std::string>& keys) {
+                             const std::vector<std::string>& keys, bool release = false) {
     ::umbp::ValidateReadsRequest req;
+    req.set_release(release);
     for (size_t i = 0; i < keys.size(); ++i) {
       req.add_keys(keys[i]);
       req.add_backend_id(resolved.backend_id(static_cast<int>(i)));
@@ -773,6 +804,58 @@ TEST_F(PeerServiceValidateReadsTest, AReadIsVouchedForUntilItsCopyIsReplaced) {
   ASSERT_EQ(Backend(kFirstByTier)->Evict({"a"})[0].bytes_freed, 8u);
   SeedKey(kFirstByTier, "a", 8);  // same key, new copy: a key check alone says "fine"
   EXPECT_EQ(Validate(resolved, {"a", "b"}), (std::vector<bool>{false, true}));
+}
+
+// The reader's report is also when it is done.  Only a request that says so
+// reaches the media as a finished read; an older reader's check stays a check.
+TEST_F(PeerServiceValidateReadsTest, ReleaseTellsEachMediumItsReaderIsDone) {
+  Mock(kFirstByTier)->PublishBuffers(1, 0xA1);
+  Mock(kSecondByTier)->PublishBuffers(1, 0xB2);
+  SeedKey(kFirstByTier, "a", 8);
+  SeedKey(kSecondByTier, "b", 8);
+
+  ::umbp::BatchResolveKeysRequest req;
+  req.add_keys("a");
+  req.add_keys("b");
+  ::umbp::BatchResolveKeysResponse resolved;
+  grpc::ClientContext ctx;
+  ASSERT_TRUE(stub_->BatchResolveKeys(&ctx, req, &resolved).ok());
+
+  EXPECT_EQ(Validate(resolved, {"a", "b"}), (std::vector<bool>{true, true}));
+  EXPECT_TRUE(Stamping(kFirstByTier)->Finished().empty());
+  EXPECT_TRUE(Stamping(kSecondByTier)->Finished().empty());
+
+  EXPECT_EQ(Validate(resolved, {"a", "b"}, /*release=*/true), (std::vector<bool>{true, true}));
+  EXPECT_EQ(Stamping(kFirstByTier)->Finished(), std::vector<std::string>{"a"});
+  EXPECT_EQ(Stamping(kSecondByTier)->Finished(), std::vector<std::string>{"b"});
+}
+
+// A reader discards an answer with any BUSY key and resolves again, so it never
+// reports on what that answer leased.  The peer counts it out itself; a clean
+// answer is left for the reader to finish.
+TEST_F(PeerServiceValidateReadsTest, ABusyAnswerIsFinishedByThePeer) {
+  Mock(kFirstByTier)->PublishBuffers(1, 0xA1);
+  Mock(kSecondByTier)->PublishBuffers(1, 0xB2);
+  SeedKey(kFirstByTier, "a", 8);
+  SeedKey(kSecondByTier, "b", 8);
+
+  ::umbp::BatchResolveKeysRequest req;
+  req.add_keys("a");
+  req.add_keys("b");
+  {
+    ::umbp::BatchResolveKeysResponse resolved;
+    grpc::ClientContext ctx;
+    ASSERT_TRUE(stub_->BatchResolveKeys(&ctx, req, &resolved).ok());
+    EXPECT_TRUE(Stamping(kFirstByTier)->Finished().empty());
+  }
+
+  Stamping(kSecondByTier)->AnswerBusyFor("b");
+  ::umbp::BatchResolveKeysResponse resolved;
+  grpc::ClientContext ctx;
+  ASSERT_TRUE(stub_->BatchResolveKeys(&ctx, req, &resolved).ok());
+  ASSERT_EQ(resolved.resolve_status_size(), 2);
+  EXPECT_EQ(Stamping(kFirstByTier)->Finished(), std::vector<std::string>{"a"});
+  EXPECT_TRUE(Stamping(kSecondByTier)->Finished().empty()) << "b was never handed out";
 }
 
 TEST_F(PeerServiceValidateReadsTest, RejectsArraysOfDifferentLengths) {

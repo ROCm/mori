@@ -735,6 +735,105 @@ TEST_F(SsdBackendTest, StillHoldsTracksTheStagingLeaseNotTheDrive) {
   EXPECT_EQ(backend->BatchStillHolds({"key-a"}, {again[0].generation}), std::vector<bool>{false});
 }
 
+// The other half of #749: a staging span stayed claimed for the whole read
+// lease however fast the read was.  A remote reader that reports back
+// (ValidateReads with release) ends its lease there and then.  The leases here
+// are a minute long, so only the report can free the one staging page.
+TEST_F(SsdBackendTest, ARemoteReaderThatReportsBackFreesItsStagingAtOnce) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
+
+  const auto first = backend->BatchResolve({"key-a"}, false);
+  ASSERT_TRUE(first[0].found);
+  const uint64_t gen = first[0].generation;
+  EXPECT_EQ(backend->BatchResolve({"key-b"}, false)[0].outcome, ResolveOutcome::kBusy)
+      << "the only staging page is leased to key-a's reader";
+
+  EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {gen}), std::vector<bool>{true})
+      << "the copy was still in place when the reader finished";
+
+  // No reaper sweep and no wait: the span search that finds no room takes it.
+  const auto other = backend->BatchResolve({"key-b"}, false);
+  ASSERT_TRUE(other[0].found);
+  EXPECT_EQ(other[0].pages[0].page_index, first[0].pages[0].page_index);
+  EXPECT_EQ(backend->BatchStillHolds({"key-a"}, {gen}), std::vector<bool>{false});
+}
+
+// A lease is shared by every remote reader of the key, and a key asked twice
+// in one batch is two answers.  The span goes back only when all are done.
+TEST_F(SsdBackendTest, ASharedStagingLeaseWaitsForItsLastRemoteReader) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
+
+  const auto twice = backend->BatchResolve({"key-a", "key-a"}, false);
+  ASSERT_TRUE(twice[0].found);
+  ASSERT_TRUE(twice[1].found);
+  const uint64_t gen = twice[0].generation;
+  ASSERT_EQ(twice[1].generation, gen);
+  ASSERT_EQ(backend->BatchResolve({"key-a"}, false)[0].generation, gen) << "a second reader";
+
+  EXPECT_EQ(backend->BatchFinishReads({"key-a", "key-a"}, {gen, gen}),
+            (std::vector<bool>{true, true}));
+  EXPECT_EQ(backend->BatchResolve({"key-b"}, false)[0].outcome, ResolveOutcome::kBusy)
+      << "freed under the second reader";
+
+  EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {gen}), std::vector<bool>{true});
+  EXPECT_TRUE(backend->BatchResolve({"key-b"}, false)[0].found);
+}
+
+// A report that names another copy ends nothing, and one that arrives when no
+// remote reader is counted leaves the count at zero for the next reader.
+TEST_F(SsdBackendTest, AStrayFinishDoesNotEndAnotherReadersLease) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
+
+  const uint64_t gen = backend->BatchResolve({"key-a"}, false)[0].generation;
+  ASSERT_NE(gen, 0u);
+  EXPECT_EQ(backend->BatchFinishReads({"key-a", "key-b"}, {gen + 1, gen}),
+            (std::vector<bool>{false, false}))
+      << "not this copy; no lease at all";
+  EXPECT_EQ(backend->BatchResolve({"key-b"}, false)[0].outcome, ResolveOutcome::kBusy)
+      << "a finish for another generation ended this lease";
+
+  {
+    // A local hold keeps the span staged whatever the timer says, so the lease
+    // below stays the same copy while its remote readers come and go.
+    const auto local = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+    ASSERT_TRUE(local[0].found);
+    EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {gen}), std::vector<bool>{true});
+    EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {gen}), std::vector<bool>{true})
+        << "still the same copy, with no remote reader left to count out";
+    ASSERT_EQ(backend->BatchResolve({"key-a"}, false)[0].generation, gen) << "a new remote reader";
+  }
+  EXPECT_EQ(backend->BatchResolve({"key-b"}, false)[0].outcome, ResolveOutcome::kBusy)
+      << "the extra finish counted the new reader out in advance";
+  EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {gen}), std::vector<bool>{true});
+  EXPECT_TRUE(backend->BatchResolve({"key-b"}, false)[0].found);
+}
+
+// A local reader holds its bytes by refcount (#762); a remote reader's report
+// ends the timer, not that hold.
+TEST_F(SsdBackendTest, ALocalHoldOutlivesTheRemoteReadersReport) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
+
+  const auto remote = backend->BatchResolve({"key-a"}, false);
+  ASSERT_TRUE(remote[0].found);
+  {
+    const auto local = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+    ASSERT_TRUE(local[0].found);
+    EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {remote[0].generation}),
+              std::vector<bool>{true});
+    EXPECT_EQ(backend->BatchResolve({"key-b"}, false)[0].outcome, ResolveOutcome::kBusy)
+        << "freed under a local reader";
+  }
+  EXPECT_TRUE(backend->BatchResolve({"key-b"}, false)[0].found);
+}
+
 // ---------------------------------------------------------------------------
 //  Eviction and Clear
 // ---------------------------------------------------------------------------

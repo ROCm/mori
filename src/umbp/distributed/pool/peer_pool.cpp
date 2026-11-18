@@ -1111,7 +1111,8 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
 
 std::vector<bool> PeerPool::ValidateResolved(const std::vector<uint32_t>& backend_ids,
                                              const std::vector<std::string>& keys,
-                                             const std::vector<uint64_t>& generations) {
+                                             const std::vector<uint64_t>& generations,
+                                             bool release) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   std::vector<bool> out(keys.size(), false);
   if (keys.empty() || backends_ == nullptr) return out;
@@ -1132,7 +1133,8 @@ std::vector<bool> PeerPool::ValidateResolved(const std::vector<uint32_t>& backen
       batch_keys.push_back(keys[i]);
       batch_generations.push_back(generations[i]);
     }
-    const auto holds = backend->BatchStillHolds(batch_keys, batch_generations);
+    const auto holds = release ? backend->BatchFinishReads(batch_keys, batch_generations)
+                               : backend->BatchStillHolds(batch_keys, batch_generations);
     for (size_t j = 0; j < indices.size(); ++j) {
       out[indices[j]] = j < holds.size() && holds[j];
     }
