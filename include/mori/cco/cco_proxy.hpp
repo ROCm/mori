@@ -27,9 +27,9 @@
 // layer on the KIWI device-to-host queues): each op is one fixed-size
 // descriptor; host proxy threads run the callbacks, which post ibverbs work
 // requests on host-created RC QPs, proxyQpsPerPeer per (proxy thread, peer),
-// on the PD that owns the cco window MRs. Keys and remote addresses are resolved on the GPU
-// exactly like ccoGda (iova=0: raddr = window offset), so the proxy needs no key
-// tables.
+// on the PD that owns the cco window MRs. Keys and remote addresses are
+// resolved on the GPU exactly like ccoGda (iova=0: raddr = window offset), so
+// the proxy needs no key tables.
 //
 // Queues: ccoProxy<SPSCD2HQueue> (default) indexes the DevComm's SPSC pool,
 // ccoProxy<MPSCD2HQueue> its MPSC pool; each pool is one KIWI invoke context.
@@ -125,20 +125,20 @@
 // reads thread_rank 0's arguments.)
 //
 // ccoCoopLaneMasked{active} (put / putValue / signal only; defined below):
-// per-thread ops. Each lane with `active` true issues its own op with its own arguments;
-// a lane with `active` false issues nothing, and its other arguments are not
-// read. The wavefront hands all of its lanes' ops to KIWI in one lane-masked
-// push, so they enter the queue in lane order (one queue for the wavefront, so
-// ordering is per wavefront as above). A put larger than maxPutBytes is split
-// as with the other Coops; the wavefront pushes the pieces while any lane has
-// more than one piece left, so lanes with smaller puts sit those pushes out.
-// One push of 64 put + signal ops takes 128 ring lines; a push that needs more
-// lines than the ring holds traps (KIWI), so rings for lane-masked put +
-// signal need proxyQueueCapacity >= 2 lines per active lane (the default holds
-// 4096). ThreadMode (ccoGda's per-thread aggregation hint) has no effect: the
-// push already batches the wavefront. flush takes no ccoCoopLaneMasked: call
-// flush() (ccoCoopWarp) from all 64 lanes; it does one flush for the
-// wavefront, which covers every lane's earlier ops.
+// per-thread ops. Each lane with `active` true issues its own op with its own
+// arguments; a lane with `active` false issues nothing, and its other arguments
+// are not read. The wavefront hands all of its lanes' ops to KIWI in one
+// lane-masked push, so they enter the queue in lane order (one queue for the
+// wavefront, so ordering is per wavefront as above). A put larger than
+// maxPutBytes is split as with the other Coops; the wavefront pushes the pieces
+// while any lane has more than one piece left, so lanes with smaller puts sit
+// those pushes out. One push of 64 put + signal ops takes 128 ring lines; a
+// push that needs more lines than the ring holds traps (KIWI), so rings for
+// lane-masked put + signal need proxyQueueCapacity >= 2 lines per active lane
+// (the default holds 4096). ThreadMode (ccoGda's per-thread aggregation hint)
+// has no effect: the push already batches the wavefront. flush takes no
+// ccoCoopLaneMasked: call flush() (ccoCoopWarp) from all 64 lanes; it does one
+// flush for the wavefront, which covers every lane's earlier ops.
 //
 // Requires a BUILD_CCO_PROXY build and a wave64 GFX9 target (KIWI push).
 
@@ -278,9 +278,9 @@ __device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, 
 
 }  // namespace impl
 
-// ccoProxy's per-thread Coop for put / putValue / signal: all 64 lanes of the wavefront
-// call from converged code, and each lane with `active` true issues its own op
-// with its own arguments (see the file comment), e.g.
+// ccoProxy's per-thread Coop for put / putValue / signal: all 64 lanes of the
+// wavefront call from converged code, and each lane with `active` true issues
+// its own op with its own arguments (see the file comment), e.g.
 //   proxy.put(peer, dstWin, dstOff, srcWin, srcOff, bytes, ccoGda_NoSignal{},
 //             ccoCoopLaneMasked{i < n});
 // As a group it is a single thread (thread_rank 0, size 1, no-op sync).
@@ -293,9 +293,10 @@ struct ccoCoopLaneMasked {
   __device__ void sync() {}
 };
 
-// When put / putValue / signal make the caller's earlier stores (the data a put sends, or
-// that a signal publishes) visible to the NIC: the handle's second template
-// argument, like ccoGdaDoorbellMode, so it is fixed for every op on the handle.
+// When put / putValue / signal make the caller's earlier stores (the data a
+// put sends, or that a signal publishes) visible to the NIC: the handle's
+// second template argument, like ccoGdaDoorbellMode, so it is fixed for every
+// op on the handle.
 enum ccoProxyFenceMode : uint32_t {
   // Default: every op does a system-scope release fence before its push.
   ccoProxyFenceEachOp = 0,

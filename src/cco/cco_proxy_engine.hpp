@@ -52,15 +52,15 @@ struct ccoProxyEngineConfig {
 
 class ccoProxyEngine;
 
-// Collective over `bootNet`; every rank must pass the same queue, thread and
-// QP counts (ccoDevCommCreate checks that first). Call with the comm's HIP device
+// Collective over `bootNet`; every rank must pass the same queue, thread and QP
+// counts (ccoDevCommCreate checks that first). Call with the comm's HIP device
 // current (the queues and flush counters are allocated on it). Builds the
 // queues, the host-posted RC QPs (on ctx's RDMA device and PD, so cco window
 // MRs are valid on them) and starts the proxy threads. Fills `out` on success;
 // returns nullptr on failure. A failure in any rank's local setup (before the
 // QP exchange) or in connecting and starting makes every rank fail.
-// MORI_CCO_PROXY_TEST_FAIL_CONNECT=<rank> makes that rank fail to connect
-// (test hook).
+// MORI_CCO_PROXY_TEST_FAIL_CONNECT=<rank> makes that rank fail to connect (test
+// hook).
 ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
                                      application::BootstrapNetwork* bootNet,
                                      const ccoProxyEngineConfig& config, ccoProxyContext* out);
