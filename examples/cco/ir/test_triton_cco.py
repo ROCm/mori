@@ -20,7 +20,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""End-to-end Triton tests for the CCO LSA, SDMA, and GDA device APIs.
+"""End-to-end Triton tests for the CCO LSA, SDMA, GDA, and ccoProxy device APIs.
 
 Examples::
 
@@ -35,6 +35,11 @@ Examples::
     MORI_DEVICE_NIC=ionic MORI_DISABLE_TOPO=1 MORI_RDMA_DEVICES=rocep9s0 \
       torchrun --standalone --nproc_per_node=2 \
         test_triton_cco.py --transport gda
+
+    # ccoProxy (host-proxy RDMA; gfx942/gfx950 and a ccoProxy build). Not
+    # part of 'all'. Each rank uses its own NICs: keep the topology on.
+    MORI_RDMA_DEVICES=mlx5_0,mlx5_1 torchrun --standalone --nproc_per_node=2 \
+        test_triton_cco.py --transport proxy
 
 CCO does not need the shmem post-compile hook.  The device communicator and
 window cross the Triton boundary explicitly as ``dc.ptr`` and ``win.handle``.
@@ -75,8 +80,19 @@ SDMA_MATRIX_OFF = SDMA_PTR_RECV_OFF + NBYTES
 GDA_RECV_OFF = SDMA_MATRIX_OFF + NBYTES
 GDA_GET_OFF = GDA_RECV_OFF + 2 * NBYTES
 GDA_VALUE_OFF = GDA_GET_OFF + NBYTES
-WINDOW_BYTES = GDA_VALUE_OFF + 8
+PROXY_RECV_OFF = GDA_VALUE_OFF + 8
+PROXY_VALUE_OFF = PROXY_RECV_OFF + 2 * NBYTES
+WINDOW_BYTES = PROXY_VALUE_OFF + 16 * 8
 GDA_BATCH_DOORBELLS = (cco.GdaDoorbell.DEFERRED, cco.GdaDoorbell.CALLER_ORDERED)
+
+# ccoProxy: one SPSC queue per program, one shared MPSC queue. Every program
+# moves one chunk of the payload; each run gets fresh signal slots.
+PROXY_PROGRAMS = 4
+PROXY_MPSC_QUEUES = 1
+PROXY_CHUNK = NBYTES // PROXY_PROGRAMS
+PROXY_ITERS = 3
+PROXY_SIGNALS = 8 * PROXY_PROGRAMS
+PROXY_TIMEOUT_CYCLES = 1 << 36
 
 _H2D, _D2H = 1, 2
 _TRUE_VALUES = {"1", "on", "true", "yes"}
@@ -657,6 +673,153 @@ def gda_read_signal_kernel(
     tl.store(out, cco.Gda.read_signal(dev_comm, signal_id))
 
 
+@triton.jit
+def proxy_put_kernel(
+    dev_comm,
+    window,
+    out,
+    peer,
+    source,
+    dst_base,
+    src_base,
+    recv_base,
+    sig_base,
+    chunk: tl.constexpr,
+    iters: tl.constexpr,
+    num_queues: tl.constexpr,
+    signal_op: tl.constexpr,
+    coop: tl.constexpr,
+    pool: tl.constexpr,
+):
+    # Program p puts chunk p to the peer with a signal on slot sig_base + p,
+    # flushes and waits for the peer's matching signal, `iters` times. SET
+    # writes 1, 2, ... so each wait is for 1 more. Then it checks the chunk
+    # the peer sent here.
+    pid = tl.program_id(0)
+    queue = pid % num_queues
+    off = pid * chunk
+    sig = sig_base + pid
+    for it in range(iters):
+        cco.Proxy.put(
+            dev_comm,
+            queue,
+            peer,
+            window,
+            dst_base + off,
+            window,
+            src_base + off,
+            chunk,
+            signal_op=signal_op,
+            signal_id=sig,
+            signal_val=it + 1,
+            coop=coop,
+            pool=pool,
+        )
+        cco.Proxy.flush(dev_comm, queue, coop=coop, pool=pool)
+        cco.Proxy.wait_signal(dev_comm, queue, sig, 1, coop=coop, pool=pool)
+    words: tl.constexpr = chunk // 4
+    idx = tl.arange(0, words)
+    recv = cco.local_ptr(window, recv_base + off)
+    got = tl.load(recv.to(tl.pointer_type(tl.uint32), bitcast=True) + idx)
+    expected = source * 1000 + pid * words + idx
+    tl.store(out + pid, tl.sum((got != expected).to(tl.int32), axis=0))
+
+
+@triton.jit
+def proxy_put_value_kernel(
+    dev_comm,
+    window,
+    out,
+    peer,
+    rank,
+    source,
+    value_off,
+    sig_base,
+    num_queues: tl.constexpr,
+    coop: tl.constexpr,
+    pool: tl.constexpr,
+):
+    # A plain putValue, then one with a SET signal; the signal covers both
+    # (same queue, same QP).
+    pid = tl.program_id(0)
+    queue = pid % num_queues
+    sig = sig_base + pid
+    tag = (0xAB00 + pid).to(tl.uint64)
+    value = (tl.cast(rank, tl.uint64) << 32) | tag
+    cco.Proxy.put_value(
+        dev_comm,
+        queue,
+        peer,
+        window,
+        value_off + pid * 8,
+        value,
+        coop=coop,
+        pool=pool,
+    )
+    cco.Proxy.put_value(
+        dev_comm,
+        queue,
+        peer,
+        window,
+        value_off + (8 + pid) * 8,
+        value + 1,
+        signal_op=cco.SignalOp.SET,
+        signal_id=sig,
+        signal_val=1,
+        coop=coop,
+        pool=pool,
+    )
+    cco.Proxy.flush(dev_comm, queue, coop=coop, pool=pool)
+    cco.Proxy.wait_signal(dev_comm, queue, sig, 1, coop=coop, pool=pool)
+    expected = (tl.cast(source, tl.uint64) << 32) | tag
+    base = cco.local_ptr(window, value_off).to(tl.pointer_type(tl.uint64), bitcast=True)
+    bad = (tl.load(base + pid) != expected).to(tl.int32)
+    bad += (tl.load(base + 8 + pid) != expected + 1).to(tl.int32)
+    tl.store(out + pid, bad)
+
+
+@triton.jit
+def proxy_signal_kernel(
+    dev_comm,
+    out,
+    peer,
+    sig_base,
+    value,
+    timeout_cycles,
+    num_queues: tl.constexpr,
+    signal_op: tl.constexpr,
+    do_wait: tl.constexpr,
+    coop: tl.constexpr,
+    pool: tl.constexpr,
+):
+    # A bare signal, a flush that reports instead of trapping, and failed().
+    pid = tl.program_id(0)
+    queue = pid % num_queues
+    sig = sig_base + pid
+    cco.Proxy.signal(
+        dev_comm,
+        queue,
+        peer,
+        signal_op=signal_op,
+        signal_id=sig,
+        signal_val=value,
+        coop=coop,
+        pool=pool,
+    )
+    rc = cco.Proxy.flush_timeout(dev_comm, queue, timeout_cycles, coop=coop, pool=pool)
+    if do_wait:
+        cco.Proxy.wait_signal(dev_comm, queue, sig, value, coop=coop, pool=pool)
+    tl.store(out + 2 * pid, rc)
+    tl.store(out + 2 * pid + 1, cco.Proxy.failed(dev_comm, queue, pool=pool))
+
+
+@triton.jit
+def proxy_read_reset_kernel(dev_comm, out, signal_id, reset: tl.constexpr):
+    if reset:
+        cco.Proxy.reset_signal(dev_comm, 0, signal_id)
+    tl.store(out, cco.Proxy.read_signal(dev_comm, 0, signal_id))
+
+
 def setup_distributed():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
@@ -1081,11 +1244,234 @@ def test_gda(comm, dc, win, rank, world_size, extern_libs):
     print(f"[rank {rank}] GDA PASS", flush=True)
 
 
+def proxy_put(comm, dc, win, rank, world_size, extern_libs, label, **kw):
+    """Run proxy_put_kernel on both ranks, then check the chunks the peer
+    sent, as the kernel saw them and from the host."""
+    peer = (rank + 1) % world_size
+    source = (rank - 1 + world_size) % world_size
+    zero(win.local_ptr + PROXY_RECV_OFF, 2 * NBYTES)
+    comm.barrier()
+    out = torch.full((PROXY_PROGRAMS,), -1, dtype=torch.int32, device="cuda")
+    proxy_put_kernel[(PROXY_PROGRAMS,)](
+        dc.ptr,
+        win.handle,
+        out,
+        peer,
+        source,
+        dst_base=PROXY_RECV_OFF + rank * NBYTES,
+        src_base=SEND_OFF,
+        recv_base=PROXY_RECV_OFF + source * NBYTES,
+        chunk=PROXY_CHUNK,
+        iters=PROXY_ITERS,
+        extern_libs=extern_libs,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    assert out.tolist() == [0] * PROXY_PROGRAMS, f"{label}: {out.tolist()}"
+    check_payload(win, PROXY_RECV_OFF + source * NBYTES, source, label)
+    comm.barrier()
+
+
+def test_proxy(comm, dc, win, rank, world_size, extern_libs):
+    peer = (rank + 1) % world_size
+    source = (rank - 1 + world_size) % world_size
+    p = PROXY_PROGRAMS
+    spsc, mpsc = cco.ProxyPool.SPSC, cco.ProxyPool.MPSC
+    block, warp = cco.CoopScope.BLOCK, cco.CoopScope.WARP
+    scratch = torch.zeros(2 * p, dtype=torch.int32, device="cuda")
+    signal_ops = (
+        cco.SignalOp.NONE,
+        cco.SignalOp.INC,
+        cco.SignalOp.ADD,
+        cco.SignalOp.SET,
+    )
+
+    # Link every op for both pools and coops.
+    for pool, queues in ((spsc, p), (mpsc, PROXY_MPSC_QUEUES)):
+        for coop in (warp, block):
+            for signal_op in signal_ops:
+                proxy_put_kernel.warmup(
+                    dc.ptr,
+                    win.handle,
+                    scratch,
+                    peer,
+                    source,
+                    dst_base=0,
+                    src_base=0,
+                    recv_base=0,
+                    sig_base=0,
+                    chunk=PROXY_CHUNK,
+                    iters=1,
+                    num_queues=queues,
+                    signal_op=signal_op,
+                    coop=coop,
+                    pool=pool,
+                    grid=(1,),
+                    extern_libs=extern_libs,
+                )
+                if signal_op == cco.SignalOp.NONE:
+                    continue  # signal needs a remote action
+                proxy_signal_kernel.warmup(
+                    dc.ptr,
+                    scratch,
+                    peer,
+                    sig_base=0,
+                    value=1,
+                    timeout_cycles=PROXY_TIMEOUT_CYCLES,
+                    num_queues=queues,
+                    signal_op=signal_op,
+                    do_wait=True,
+                    coop=coop,
+                    pool=pool,
+                    grid=(1,),
+                    extern_libs=extern_libs,
+                )
+            proxy_put_value_kernel.warmup(
+                dc.ptr,
+                win.handle,
+                scratch,
+                peer,
+                rank,
+                source,
+                value_off=PROXY_VALUE_OFF,
+                sig_base=0,
+                num_queues=queues,
+                coop=coop,
+                pool=pool,
+                grid=(1,),
+                extern_libs=extern_libs,
+            )
+
+    # SPSC, block coop over 4 wavefronts: atomic-free SET, then INC in a
+    # second launch that continues the saved queue state.
+    for i, signal_op in enumerate((cco.SignalOp.SET, cco.SignalOp.INC)):
+        proxy_put(
+            comm,
+            dc,
+            win,
+            rank,
+            world_size,
+            extern_libs,
+            f"Proxy put spsc signal_op={signal_op}",
+            sig_base=i * p,
+            num_queues=p,
+            signal_op=signal_op,
+            coop=block,
+            pool=spsc,
+            num_warps=4,
+        )
+    # SPSC, warp coop: one wavefront per program.
+    proxy_put(
+        comm,
+        dc,
+        win,
+        rank,
+        world_size,
+        extern_libs,
+        "Proxy put spsc warp",
+        sig_base=2 * p,
+        num_queues=p,
+        signal_op=cco.SignalOp.SET,
+        coop=warp,
+        pool=spsc,
+        num_warps=1,
+    )
+    # MPSC: every program on one shared queue.
+    proxy_put(
+        comm,
+        dc,
+        win,
+        rank,
+        world_size,
+        extern_libs,
+        "Proxy put mpsc",
+        sig_base=3 * p,
+        num_queues=PROXY_MPSC_QUEUES,
+        signal_op=cco.SignalOp.INC,
+        coop=block,
+        pool=mpsc,
+        num_warps=4,
+    )
+
+    zero(win.local_ptr + PROXY_VALUE_OFF, 16 * 8)
+    comm.barrier()
+    out = torch.full((p,), -1, dtype=torch.int32, device="cuda")
+    proxy_put_value_kernel[(p,)](
+        dc.ptr,
+        win.handle,
+        out,
+        peer,
+        rank,
+        source,
+        value_off=PROXY_VALUE_OFF,
+        sig_base=4 * p,
+        num_queues=p,
+        coop=block,
+        pool=spsc,
+        extern_libs=extern_libs,
+        num_warps=4,
+    )
+    torch.cuda.synchronize()
+    assert out.tolist() == [0] * p, f"Proxy put_value: {out.tolist()}"
+
+    # ADD 3 per program, waited for; flush_timeout returns 0 and failed() 0.
+    out = torch.full((2 * p,), -1, dtype=torch.int32, device="cuda")
+    proxy_signal_kernel[(p,)](
+        dc.ptr,
+        out,
+        peer,
+        sig_base=5 * p,
+        value=3,
+        timeout_cycles=PROXY_TIMEOUT_CYCLES,
+        num_queues=p,
+        signal_op=cco.SignalOp.ADD,
+        do_wait=True,
+        coop=block,
+        pool=spsc,
+        extern_libs=extern_libs,
+        num_warps=4,
+    )
+    torch.cuda.synchronize()
+    assert out.tolist() == [0] * (2 * p), f"Proxy signal: {out.tolist()}"
+
+    # An INC nobody waits for reads 1 once the sender's flush has returned;
+    # after reset_signal it reads 0.
+    sig = 6 * p
+    comm.barrier()
+    proxy_signal_kernel[(1,)](
+        dc.ptr,
+        out,
+        peer,
+        sig_base=sig,
+        value=1,
+        timeout_cycles=PROXY_TIMEOUT_CYCLES,
+        num_queues=p,
+        signal_op=cco.SignalOp.INC,
+        do_wait=False,
+        coop=block,
+        pool=spsc,
+        extern_libs=extern_libs,
+        num_warps=4,
+    )
+    torch.cuda.synchronize()
+    assert out[:2].tolist() == [0, 0], f"Proxy signal flush: {out[:2].tolist()}"
+    comm.barrier()
+    value = torch.full((1,), -1, dtype=torch.int64, device="cuda")
+    for reset, expected in ((False, 1), (True, 0)):
+        proxy_read_reset_kernel[(1,)](
+            dc.ptr, value, sig, reset=reset, extern_libs=extern_libs, num_warps=1
+        )
+        torch.cuda.synchronize()
+        assert value.item() == expected, f"Proxy read_signal: {value.item()}"
+    comm.barrier()
+    print(f"[rank {rank}] Proxy PASS", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--transport",
-        choices=("lsa", "sdma", "gda", "all"),
+        choices=("lsa", "sdma", "gda", "proxy", "all"),
         default="lsa",
     )
     args = parser.parse_args()
@@ -1101,6 +1487,8 @@ def main():
     extern_libs = cco.get_extern_libs()
     gda_enabled = args.transport in ("gda", "all")
     sdma_enabled = args.transport in ("sdma", "all")
+    # Not in 'all': ccoProxy needs gfx942/gfx950 and the caller's NICs.
+    proxy_enabled = args.transport == "proxy"
 
     try:
         with Communicator.init(
@@ -1113,10 +1501,18 @@ def main():
 
             reqs = CCODevCommRequirements()
             reqs.gda_connection_type = (
-                GDA_CONNECTION_FULL if gda_enabled else GDA_CONNECTION_NONE
+                GDA_CONNECTION_FULL
+                if gda_enabled or proxy_enabled
+                else GDA_CONNECTION_NONE
             )
             reqs.gda_context_count = 1 if gda_enabled else 0
             reqs.gda_signal_count = world_size if gda_enabled else 0
+            if proxy_enabled:
+                # Proxy-only: signal slots and window MRs, no GDA QPs.
+                reqs.gda_signal_count = PROXY_SIGNALS
+                reqs.proxy_spsc_queue_count = PROXY_PROGRAMS
+                reqs.proxy_mpsc_queue_count = PROXY_MPSC_QUEUES
+                reqs.proxy_only = 1
             reqs.gda_counter_count = 0
             reqs.sdma_queue_count = SDMA_QUEUE_COUNT if sdma_enabled else 0
             dc = comm.create_dev_comm(reqs)
@@ -1129,6 +1525,8 @@ def main():
                 test_sdma(comm, dc, win, rank, world_size, extern_libs)
             if gda_enabled:
                 test_gda(comm, dc, win, rank, world_size, extern_libs)
+            if proxy_enabled:
+                test_proxy(comm, dc, win, rank, world_size, extern_libs)
             comm.barrier()
             if rank == 0:
                 print(

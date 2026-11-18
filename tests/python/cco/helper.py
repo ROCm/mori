@@ -92,6 +92,18 @@ def run_triton_example(transport: str, timeout: int = 240) -> str:
         env["MORI_RDMA_DEVICES"] = devices.split(",", 1)[0]
         env["MORI_DISABLE_TOPO"] = "1"
 
+    if transport == "proxy":
+        # The caller's device list and topology as given: a GPU may not reach
+        # another GPU's NIC (e.g. across PCIe switches on MI300X).
+        devices = env.get("MORI_CCO_TRITON_PROXY_DEVICE") or env.get(
+            "MORI_RDMA_DEVICES", ""
+        )
+        if not devices:
+            raise RuntimeError(
+                "Proxy test needs MORI_CCO_TRITON_PROXY_DEVICE or MORI_RDMA_DEVICES"
+            )
+        env["MORI_RDMA_DEVICES"] = devices
+
     command = [
         sys.executable,
         "-m",
