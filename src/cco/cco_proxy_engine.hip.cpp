@@ -116,8 +116,10 @@ std::vector<int> ChooseProxyCpus(int numThreads, std::string* source) {
   if (const char* env = std::getenv("MORI_CCO_PROXY_CPUS"); env != nullptr && env[0] != '\0') {
     order = application::detail::ParseCpuList(env);
     if (order.empty()) {
-      MORI_SHMEM_WARN(
-          "ccoProxy: MORI_CCO_PROXY_CPUS=\"{}\" names no CPUs; using the default choice", env);
+      std::fprintf(stderr,
+                   "[mori cco] WARNING: ccoProxy: MORI_CCO_PROXY_CPUS=\"%s\" names no CPUs; "
+                   "using the default choice\n",
+                   env);
     } else {
       *source = "MORI_CCO_PROXY_CPUS";
     }
@@ -178,8 +180,10 @@ void PinCallingThread(int worker, int cpu) {
   CPU_ZERO(&target);
   CPU_SET(cpu, &target);
   if (sched_setaffinity(0, sizeof(target), &target) != 0) {
-    MORI_SHMEM_WARN("ccoProxy worker {}: cannot pin to CPU {}: {}; running unpinned", worker, cpu,
-                    strerror(errno));
+    std::fprintf(stderr,
+                 "[mori cco] WARNING: ccoProxy worker %d: cannot pin to CPU %d: %s; running "
+                 "unpinned\n",
+                 worker, cpu, strerror(errno));
   }
 }
 
@@ -720,6 +724,18 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     }
     MORI_SHMEM_INFO("ccoProxy: rank={} {} proxy threads on CPUs [{}] (from {})", rank, numThreads,
                     cpuList, cpuSource);
+    std::vector<int> sortedCpus = cpus;
+    std::sort(sortedCpus.begin(), sortedCpus.end());
+    if (!sortedCpus.empty() && sortedCpus.front() >= 0 &&
+        std::adjacent_find(sortedCpus.begin(), sortedCpus.end()) != sortedCpus.end()) {
+      // Busy-polling threads sharing a CPU cut the message rate ~100x; stderr so
+      // it shows at the default log level.
+      std::fprintf(stderr,
+                   "[mori cco] WARNING: ccoProxy rank %d: %d proxy threads share CPUs [%s] (from "
+                   "%s); widen the affinity mask (e.g. mpirun --bind-to none), set "
+                   "MORI_CCO_PROXY_CPUS, or use fewer threads\n",
+                   rank, numThreads, cpuList.c_str(), cpuSource.c_str());
+    }
   } catch (const std::exception& e) {
     MORI_SHMEM_ERROR("ccoProxyEngineCreate: rank={} failed: {}", rank, e.what());
     return nullptr;  // engine destructor stops threads and releases what was built
