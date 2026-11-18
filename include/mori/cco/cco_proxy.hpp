@@ -42,8 +42,8 @@
 // from the wavefront's or block's linear id.
 //
 // Usage errors trap instead of corrupting a queue or faulting: a ccoProxy<Q>
-// on an empty pool, an SPSC queueIndex out of range, and a push from a partial
-// wavefront (below). Builds without NDEBUG also print the reason first; release
+// on an empty pool, an SPSC queueIndex out of range, and a push or a wait()
+// from a partial wavefront (below). Builds without NDEBUG also print the reason first; release
 // builds only trap, since an inlined device printf would add registers to every
 // kernel using ccoProxy.
 // Only one wavefront may use an SPSC queue at a time: its producer state lives
@@ -125,7 +125,8 @@
 // 3-D blocks -- for ccoCoopBlock) must have all 64 lanes active: a KIWI push
 // is wavefront-collective. A push from a partial wavefront traps (a compare
 // per push), so does a ccoCoopLaneMasked call from a divergent branch such as
-// `if (i < n) put(..., ccoCoopLaneMasked{})`.
+// `if (i < n) put(..., ccoCoopLaneMasked{})`, and a wait() on a request from
+// one (its lane 0 does the wait).
 // ccoCoopThread is rejected at compile time.
 //
 // ccoCoopWarp / ccoCoopBlock: the group issues one op. Every issuing lane must
@@ -705,6 +706,18 @@ struct ccoProxy {
   __device__ inline int waitRequest(const ccoGdaRequest_t& request, uint64_t timeoutCycles) const {
     const int queue = __builtin_amdgcn_readfirstlane(request.qpIdx);  // wave-uniform
     if (queue < 0) return 0;
+    const uint64_t exec = __builtin_amdgcn_read_exec();
+    if (__builtin_expect(exec != ~uint64_t{0}, 0)) {
+#ifndef NDEBUG  // see the file comment
+      if (__lane_id() == static_cast<unsigned>(__builtin_ctzll(exec))) {
+        printf(
+            "ccoProxy: wait called with a partial wavefront (exec 0x%llx); all 64 lanes of "
+            "the wavefront holding the request must call it\n",
+            static_cast<unsigned long long>(exec));
+      }
+#endif
+      __builtin_trap();  // partial wavefront: lane 0 waits
+    }
     return flushWait<kTimeout>(comm.proxy.flushDone + queue, request.postIdx, timeoutCycles);
   }
 
