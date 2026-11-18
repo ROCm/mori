@@ -544,11 +544,11 @@ struct ccoDevCommRequirements {
                             // ccoProxy lane-masked ops (ccoCoopLaneMasked) need up to 2
                             // lines per active lane (128 for a full wavefront of
                             // put+signal); smaller rings trap.
-  // RC QPs per (proxy thread, peer); 0 = MORI_CCO_PROXY_QPS_PER_PEER, else 1.
+  // RC QPs per (proxy thread, peer); 0 = MORI_CCO_PROXY_QPS_PER_PEER, else 4.
   // Each queue posts on one of its thread's QPs per peer (round robin over the
   // thread's queues); a thread creates no more than it owns queues. NICs that
   // process each QP serially (e.g. ionic, ~1-2 Mpps per QP for small writes)
-  // want several. Same on every rank.
+  // need several; 4 costs mlx5 nothing. Same on every rank.
   int proxyQpsPerPeer;
 };
 

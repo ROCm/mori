@@ -1904,12 +1904,12 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
   const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
   const int proxyThreads = reqsHaveProxy ? std::max(reqs->proxyThreadCount, 0) : 0;
-  // QPs per (proxy thread, peer): the field, else MORI_CCO_PROXY_QPS_PER_PEER, else 1.
+  // QPs per (proxy thread, peer): the field, else MORI_CCO_PROXY_QPS_PER_PEER, else 4.
   const bool reqsHaveQps =
       reqs->size >= offsetof(ccoDevCommRequirements, proxyQpsPerPeer) + sizeof(int);
   const int proxyQpsPerPeer = (reqsHaveQps && reqs->proxyQpsPerPeer > 0)
                                   ? reqs->proxyQpsPerPeer
-                                  : env::GetPositiveIntOr("MORI_CCO_PROXY_QPS_PER_PEER", 1);
+                                  : env::GetPositiveIntOr("MORI_CCO_PROXY_QPS_PER_PEER", 4);
   const int64_t proxyQueues = int64_t{proxySpsc} + int64_t{proxyMpsc};  // may exceed INT_MAX
   std::string proxyError;
 #ifdef MORI_CCO_PROXY
