@@ -420,6 +420,7 @@ class PoolClient {
   std::pair<TransferRef, uint64_t> UserBufferRef(void* ptr, size_t size) const;
   TransferRef LocalUserBytes(void* ptr, size_t size) const;
   int PreferredNumaNodeFor(void* ptr, size_t size) const;
+  int SourceDeviceFor(const void* ptr, size_t size) const;
   // The NUMA node a write's source lives on: its GPU's, or the node its registered
   // host region was placed on; -1 when unknown.
   int SourceNumaHint(const void* src, size_t size) const;

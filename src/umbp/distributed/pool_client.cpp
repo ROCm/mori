@@ -1526,6 +1526,16 @@ PoolClient::ScratchArena* PoolClient::RangedArenaFor(bool get, const void* calle
   return arenas.front().get();
 }
 
+// The GPU a registered device buffer lives on, or -1.
+int PoolClient::SourceDeviceFor(const void* ptr, size_t size) const {
+  if (ptr == nullptr || size == 0) return -1;
+  std::shared_lock<std::shared_mutex> lock(registered_mem_mutex_);
+  const RegisteredRegion* region = FindRegisteredRegionLocked(ptr, size);
+  return region != nullptr && region->ref.loc == mori::io::MemoryLocationType::GPU
+             ? region->ref.device
+             : -1;
+}
+
 int PoolClient::PreferredNumaNodeFor(void* ptr, size_t size) const {
   if (gpu_to_numa_.empty()) return -1;
   const auto ref = UserBufferRef(ptr, size).first;
@@ -1599,6 +1609,7 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   request.tier = tier;
   request.logical_tier = logical_tier;
   request.preferred_numa_node = PreferredNumaNodeFor(const_cast<void*>(src), size);
+  request.preferred_device = SourceDeviceFor(src, size);
   auto pool_alloc = default_pool_->BatchAllocate({request}).front();
   if (pool_alloc.in_flight) return PutAttemptOutcome::kSuccessAlreadyExists;
   auto* backend = registry_.Get(pool_alloc.backend_id);
@@ -1978,9 +1989,14 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
     const auto& first_range = requests.front().ranges.front();
     const int preferred_node = PreferredNumaNodeFor(first_range.user, first_range.size);
     for (const auto& request : requests) {
+      // Each key goes to the HBM pool on the GPU its own data is on.
+      const int source_device =
+          request.ranges.empty()
+              ? -1
+              : SourceDeviceFor(request.ranges.front().user, request.ranges.front().size);
       asks.push_back(PoolPlacementRequest{*request.key, request.object_size, request.tier,
-                                          /*backend_name=*/{}, request.logical_tier,
-                                          preferred_node});
+                                          /*backend_name=*/{}, request.logical_tier, preferred_node,
+                                          source_device});
     }
     allocations = default_pool_->BatchAllocate(asks);
     allocations.resize(requests.size());

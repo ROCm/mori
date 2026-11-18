@@ -152,7 +152,8 @@ class HbmCopyEngine final : public TransferEngine {
     kUnrecorded,                  // debug mode off, or a plan the pass never classified
     kDisabled,                    // UMBP_DRAM_GATHER_KERNEL=0, or latched off by a failure
     kHostToHost,                  // no GPU endpoint; never reaches this engine
-    kAcrossDevices,               // D2D between two GPUs, or an endpoint without a device
+    kAcrossDevices,               // D2D between two GPUs without peer access, or an
+                                  // endpoint without a device
     kEndpointsOverlap,            // D2D whose source and destination buffers overlap
     kNoDevice,                    // neither endpoint named a device
     kHostNotGatherable,           // host side outside every HostTierRegistration, or

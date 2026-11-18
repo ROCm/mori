@@ -508,20 +508,25 @@ TEST(HbmCopyEngine, SameGpuPlansShareOneGatherLaunch) {
   second.ExpectCopied({items[1]});
 }
 
-// Between two GPUs the kernel on one would have to dereference the other's
-// memory, so those copies keep hipMemcpy.
-TEST(HbmCopyEngine, FragmentsBetweenTwoGpusKeepHipMemcpy) {
+// Between two GPUs the destination's kernel reads the source's memory through
+// peer access, so the batch is still one launch. Either direction.
+TEST(HbmCopyEngine, FragmentsBetweenTwoGpusTakeOneGatherLaunch) {
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || devices < 2) GTEST_SKIP() << "needs two GPUs";
   if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
 
-  DevicePair pair(0, 1);
-  HbmCopyEngine engine;
-  const auto items = ScatteredItems(pair.Src(), pair.Dst());
-  const uint64_t launches_before = DeviceGatherLaunchCount();
-  EXPECT_TRUE(SubmitAndWait(engine, items).empty());
-  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before);
-  pair.ExpectCopied(items);
+  for (const auto& [src_device, dst_device] : {std::pair{0, 1}, std::pair{1, 0}}) {
+    DevicePair pair(src_device, dst_device);
+    HbmCopyEngine engine;
+    const auto items = ScatteredItems(pair.Src(), pair.Dst());
+    const uint64_t launches_before = DeviceGatherLaunchCount();
+    EXPECT_TRUE(SubmitAndWait(engine, items).empty());
+    pair.ExpectCopied(items);
+    if (DeviceGatherLaunchCount() == launches_before) {
+      GTEST_SKIP() << "no peer access between GPU " << src_device << " and " << dst_device;
+    }
+    EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + 1);
+  }
 }
 
 // The kernel copies all fragments at once, so a copy inside one buffer keeps
