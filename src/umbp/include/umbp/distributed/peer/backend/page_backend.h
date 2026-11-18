@@ -411,8 +411,8 @@ class PageBackend : public MediumBackend {
     }
   }
 
-  AllocateResult AllocateLocked(const std::string& key, uint64_t size,
-                                int preferred_numa_node = -1);
+  AllocateResult AllocateLocked(const std::string& key, uint64_t size, int preferred_numa_node = -1,
+                                bool local_lifetime = false);
   bool CommitLocked(uint64_t slot_id, const std::string& key, uint64_t& bytes_committed);
   bool AbortLocked(uint64_t slot_id);
 

@@ -51,6 +51,8 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
   if (!config.backend_policy_path.empty()) dc.backend_policy_path = config.backend_policy_path;
   if (config.page_size.has_value()) dc.dram_page_size = *config.page_size;
   local_only_ = dc.master_config.master_address.empty();
+  const char* direct_get = std::getenv("UMBP_DIRECT_POOL_GET");
+  direct_pool_get_ = dc.medium == UMBPMedium::DRAM && direct_get && std::string(direct_get) == "1";
 
   // All three ownership blocks are lowered unconditionally; dc.medium selects
   // the one PoolClient::Init actually builds a backend from (exactly one medium
@@ -101,6 +103,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
   // Zero-sized is the default and means "this deployment does not do ranged
   // I/O": no arena, no registration, and SupportsRangedIO() reports false, so
   // a client that never issues ranged operations stops paying for the arena.
+  // Retain GET scratch for direct reads that cannot reserve a private pool slot.
   if (dc.ranged_scratch_size > 0) AllocateRangedScratch(dc);
 
   auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership),
@@ -108,6 +111,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config)
   pc_config.ranged_get_scratch = ranged_get_scratch_;
   pc_config.ranged_put_scratch = ranged_put_scratch_;
   pc_config.copy_pipeline = config_.copy_pipeline;
+  pc_config.direct_pool_get = direct_pool_get_;
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config), platform_);
   if (!pool_client_->Init()) {
@@ -534,10 +538,7 @@ void DistributedClient::FreeRangedScratch() {
 bool DistributedClient::IsDistributed() const { return true; }
 
 bool DistributedClient::SupportsRangedIO() const {
-  // The scratch arenas are the whole opt-in.  They are purely a remote-path
-  // resource -- remote gets are staged in them, remote puts assembled in them --
-  // and they default to zero, so a deployment that never issues ranged I/O
-  // allocates and registers nothing.
+  // Remote ranged PUT needs an arena; GET uses its own arena or direct pool pages.
   //
   // Deliberately NOT gated on the medium.  SSD used to be excluded here on the
   // reasoning that its bytes are not addressable by the transfer layer, but
@@ -560,7 +561,7 @@ bool DistributedClient::SupportsRangedIO() const {
   // either report ranged I/O as unsupported or allocate two arenas it cannot
   // use.
   if (local_only_) return true;
-  return !ranged_get_scratch_.empty() && !ranged_put_scratch_.empty();
+  return (direct_pool_get_ || !ranged_get_scratch_.empty()) && !ranged_put_scratch_.empty();
 }
 
 bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,

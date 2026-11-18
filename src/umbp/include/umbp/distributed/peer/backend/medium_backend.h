@@ -128,6 +128,8 @@ struct AllocateRequest {
   // The writer is a local file engine: a file-backed medium may hand out a
   // file range (AllocateResult::file_ref) instead of staged pages.
   bool allow_file_ref = false;
+  // In-process owner drains transfers and explicitly commits or aborts this slot.
+  bool local_lifetime = false;
 };
 
 // Populated fields below `outcome` are meaningful ONLY when

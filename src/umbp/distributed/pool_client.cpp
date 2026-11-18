@@ -51,6 +51,7 @@
 #include "umbp/common/parallel_for.h"
 #include "umbp/common/range_utils.h"
 #include "umbp/distributed/benchmark/workload_trace_recorder.h"
+#include "umbp/distributed/direct_pool_get.h"
 #include "umbp/distributed/indexer/kv_indexer_reporter.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
@@ -870,6 +871,16 @@ bool PoolClient::Init() {
   }
 
   auto backend_configs = EffectiveBackendConfigs(config_);
+  if (config_.direct_pool_get && !backend_configs.empty() &&
+      backend_configs.front().tier != TierType::DRAM) {
+    MORI_UMBP_ERROR("[PoolClient] direct pool GET requires a primary DRAM backend");
+    Shutdown();
+    return false;
+  }
+  if (config_.direct_pool_get) {
+    direct_pool_get_cache_ =
+        std::make_unique<DirectPoolGetCache>(config_.direct_pool_get_cache_bytes);
+  }
   // No address, no master.  Everything below -- backends, transfer engine, peer
   // service -- is built either way; only routing, registration and the
   // heartbeat are skipped.  That is what lets one binary be a single node or a
@@ -1213,6 +1224,10 @@ bool PoolClient::Init() {
 void PoolClient::Shutdown() {
   if (!initialized_) return;
   initialized_ = false;
+  if (direct_pool_get_cache_) {
+    direct_pool_get_cache_->Clear();
+    direct_pool_get_cache_.reset();
+  }
 
   if (kv_indexer_) {
     for (auto* backend : registry_.All()) backend->SetChangeHook({});
@@ -1336,6 +1351,7 @@ bool PoolClient::Clear() {
   // clear and no master to notify.  Treat as success so callers in
   // shutdown / teardown paths do not surface a spurious error.
   if (!initialized_.load()) return true;
+  if (direct_pool_get_cache_) direct_pool_get_cache_->Clear();
   // Clear physical state and the default Pool's logical placement index before
   // the full-sync empty snapshot goes out.
   if (default_pool_ != nullptr) default_pool_->ClearLocal();
@@ -3692,6 +3708,27 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // cache miss would report itself as a scratch-arena error.
   if (!HasMaster()) return results;
 
+  std::vector<std::optional<RouteGetResult>> routes;
+  if (config_.direct_pool_get) {
+    std::vector<std::string> route_keys;
+    for (size_t i : missed) route_keys.push_back(keys[i]);
+    if (!RouteMissedRanges(route_keys, missed, preroutes, dbg ? &dbg->route : nullptr, &routes)) {
+      return results;
+    }
+    auto fallback = ServeRangesFromDirectPool(keys, dsts, sizes, src_offsets, missed, routes,
+                                              &results, &remote_bytes);
+    if (fallback.empty()) return results;
+    // Fallback keys retain missed order; compact their routes instead of routing again.
+    size_t kept = 0;
+    for (size_t r = 0; r < missed.size() && kept < fallback.size(); ++r) {
+      if (missed[r] != fallback[kept]) continue;
+      if (kept != r) routes[kept] = std::move(routes[r]);
+      ++kept;
+    }
+    routes.resize(fallback.size());
+    missed = std::move(fallback);
+  }
+
   // ---- Phase 2: the rest, through the GET scratch arena ----
   //
   // Only the requested spans cross the wire, packed back-to-back into the
@@ -3751,12 +3788,13 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
 
   // Routing is a master RPC that never touches the arena, so it runs before a
   // shard is taken rather than holding every other arena user behind it.
-  std::vector<std::string> route_keys;
-  route_keys.reserve(missed.size());
-  for (size_t index : missed) route_keys.push_back(keys[index]);
-  std::vector<std::optional<RouteGetResult>> routes;
-  if (!RouteMissedRanges(route_keys, missed, preroutes, dbg ? &dbg->route : nullptr, &routes)) {
-    return results;
+  if (!config_.direct_pool_get) {
+    std::vector<std::string> route_keys;
+    route_keys.reserve(missed.size());
+    for (size_t index : missed) route_keys.push_back(keys[index]);
+    if (!RouteMissedRanges(route_keys, missed, preroutes, dbg ? &dbg->route : nullptr, &routes)) {
+      return results;
+    }
   }
 
   // No tier filter here.  Upstream restricts remote ranged reads to DRAM/HBM
@@ -4348,6 +4386,188 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
   return plan;
 }
 
+std::vector<size_t> PoolClient::ServeRangesFromDirectPool(
+    const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes, const std::vector<std::vector<size_t>>& offsets,
+    const std::vector<size_t>& missed, const std::vector<std::optional<RouteGetResult>>& routes,
+    std::vector<bool>* results, double* remote_bytes,
+    const std::function<void(const BatchGetPlan&, std::vector<bool>*)>& fetch) {
+  auto* backend = registry_.Get(medium_);
+  if (!backend || backend->Tier() != TierType::DRAM || !direct_pool_get_cache_) return missed;
+  std::vector<size_t> unavailable;
+  using Entry = DirectPoolGetCache::Entry;
+  using Interval = DirectPoolGetCache::Interval;
+  struct Work {
+    size_t original;
+    const RouteGetResult* route;
+    std::shared_ptr<Entry> entry;
+    std::vector<Interval> wanted;
+    std::vector<Interval> missing;
+    std::vector<ByteSpan> spans;
+    bool owner = false;
+    bool done = false;
+    bool ok = false;
+  };
+  // Bound active allocations within one batch. Idle partial replicas can be
+  // reclaimed between rounds; large batches do not pin the entire DRAM pool.
+  constexpr size_t kRoundBytes = 64ULL * 1024 * 1024;
+  size_t next = 0;
+  while (next < missed.size()) {
+    direct_pool_get_cache_->Trim();
+    std::vector<Work> work;
+    size_t round_bytes = 0;
+    while (next < missed.size()) {
+      const size_t r = next;
+      const size_t i = missed[r];
+      if (r >= routes.size() || !routes[r] || routes[r]->size == 0 ||
+          !RangesAreDisjointAndInBounds(routes[r]->size, sizes[i], offsets[i])) {
+        ++next;
+        continue;
+      }
+      const size_t object_size = routes[r]->size;
+      if (!work.empty() && object_size > kRoundBytes - std::min(round_bytes, kRoundBytes)) break;
+      ++next;
+      auto entry = direct_pool_get_cache_->Acquire(backend, keys[i], object_size);
+      if (!entry) {
+        // A concurrent writer may have committed between the initial local
+        // lookup and allocation. Keep the local hold until scatter completes.
+        const auto resolved = backend->BatchResolve({keys[i]}, false, false, ResolveReader::kLocal);
+        if (!resolved.empty() && resolved[0].found && resolved[0].size == object_size) {
+          std::vector<ObjectRange> ranges;
+          FillReadRanges(dsts[i], sizes[i], offsets[i], &ranges);
+          std::vector<TransferItem> copies;
+          if (BuildLocalRangeTransfers(backend, resolved[0].pages, resolved[0].page_size,
+                                       object_size, ranges, false, 0, &copies)) {
+            std::vector<size_t> failed;
+            (*results)[i] = transfer_engine_->Transfer(copies, &failed) && failed.empty();
+          }
+        } else {
+          // Pool budget or allocation pressure must not fail a valid remote GET.
+          // Leave this key for the bounded scratch path after releasing this round.
+          unavailable.push_back(i);
+        }
+        continue;
+      }
+      Work w{};
+      w.original = i;
+      w.route = &*routes[r];
+      w.entry = std::move(entry);
+      for (size_t j = 0; j < sizes[i].size(); ++j)
+        w.wanted.emplace_back(offsets[i][j], offsets[i][j] + sizes[i][j]);
+      Entry::Normalize(&w.wanted);
+      round_bytes += w.entry->slot.pages.size() * w.entry->slot.page_size;
+      work.push_back(std::move(w));
+    }
+    // On any exception, wake dependents with failure. Remote handles must
+    // drain before unwinding here (ExecuteRemoteBatchGetPlan owns those).
+    ScopeExit wake_on_error{[&] {
+      for (auto& w : work) {
+        if (!w.owner) continue;
+        {
+          std::lock_guard<std::mutex> lock(w.entry->mutex);
+          w.entry->failed = true;
+          w.entry->fetching = false;
+        }
+        w.entry->changed.notify_all();
+      }
+    }};
+    for (;;) {
+      BatchGetPlan plan;
+      std::shared_ptr<Entry> waiting;
+      for (size_t j = 0; j < work.size(); ++j) {
+        auto& w = work[j];
+        if (w.done) continue;
+        std::lock_guard<std::mutex> lock(w.entry->mutex);
+        if (w.entry->failed) {
+          w.done = true;
+          continue;
+        }
+        w.missing = w.entry->Missing(w.wanted);
+        if (w.missing.empty()) {
+          w.done = w.ok = true;
+          continue;
+        }
+        if (w.entry->fetching) {
+          waiting = w.entry;
+          continue;
+        }
+        w.entry->fetching = w.owner = true;
+        w.spans.clear();
+        size_t bytes = 0;
+        for (const auto& range : w.missing) {
+          w.spans.push_back({range.first, range.second - range.first});
+          bytes += range.second - range.first;
+        }
+        BatchGetItem item{};
+        item.index = j;
+        item.key = &keys[w.original];
+        item.size = w.entry->slot.size;
+        item.dst_bytes = bytes;
+        item.spans = &w.spans;
+        item.dst_backend = backend;
+        item.dst_pages = &w.entry->slot.pages;
+        item.dst_page_size = w.entry->slot.page_size;
+        item.route = *w.route;
+        plan.remote_groups[item.route.node_id].push_back(std::move(item));
+      }
+      if (plan.remote_groups.empty() && !waiting) break;
+      if (!plan.remote_groups.empty()) {
+        std::vector<bool> fetched(work.size(), false);
+        // Always submit owned work BEFORE waiting on another call's entries.
+        // Opposite key ordering across TP ranks otherwise creates a cycle.
+        if (fetch)
+          fetch(plan, &fetched);
+        else
+          ExecuteRemoteBatchGetPlan(plan, &fetched, /*recache_remote=*/false);
+        for (size_t j = 0; j < work.size(); ++j) {
+          auto& w = work[j];
+          if (!w.owner) continue;
+          {
+            std::lock_guard<std::mutex> lock(w.entry->mutex);
+            if (fetched[j]) {
+              w.entry->MarkReady(w.missing);
+              for (const auto& span : w.spans) *remote_bytes += span.size;
+            } else {
+              w.entry->failed = true;
+            }
+            w.entry->fetching = w.owner = false;
+          }
+          w.entry->changed.notify_all();
+        }
+      } else if (waiting) {
+        std::unique_lock<std::mutex> lock(waiting->mutex);
+        waiting->changed.wait(lock, [&] { return !waiting->fetching; });
+      }
+    }
+    // A single batch scatter for all ready entries, retaining their shared
+    // allocation references until the engine's Wait completes.
+    std::vector<TransferItem> copies;
+    for (size_t j = 0; j < work.size(); ++j) {
+      auto& w = work[j];
+      if (!w.ok) continue;
+      std::vector<ObjectRange> ranges;
+      FillReadRanges(dsts[w.original], sizes[w.original], offsets[w.original], &ranges);
+      const size_t before = copies.size();
+      if (!BuildLocalRangeTransfers(backend, w.entry->slot.pages, w.entry->slot.page_size,
+                                    w.entry->slot.size, ranges, false, j, &copies)) {
+        copies.resize(before);
+        w.ok = false;
+      }
+    }
+    std::vector<size_t> failed;
+    if (!copies.empty()) {
+      const bool ok = transfer_engine_->Transfer(copies, &failed);
+      const std::unordered_set<size_t> bad(failed.begin(), failed.end());
+      for (size_t j = 0; j < work.size(); ++j)
+        if (work[j].ok) (*results)[work[j].original] = bad.count(j) == 0 && (ok || !failed.empty());
+    }
+    // No entry is published until all concurrent copy-outs drop their refs.
+    work.clear();
+    direct_pool_get_cache_->Trim();
+  }
+  return unavailable;
+}
+
 std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMedium(
     const std::vector<std::string>& keys, std::vector<RangeFetchUnit> units,
     std::unordered_map<size_t, bool>* unit_ok, double* remote_bytes) {
@@ -4823,7 +5043,7 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
     if (entry.item->dst_ref != nullptr) {
       dst = *entry.item->dst_ref;
       dst_base = entry.item->dst_ref_offset;
-    } else {
+    } else if (entry.item->dst_pages == nullptr) {
       std::tie(dst, dst_base) = UserBufferRef(entry.item->dst, entry.item->DstBytes());
     }
     const std::vector<TransferRef>& remote = buffers_for(entry.plan.backend_id);
@@ -4865,6 +5085,21 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
               item.tag = idx;
               item.src = *buf;
               item.src_offset = tier_offset;
+              if (entry.item->dst_pages != nullptr) {
+                return ForEachRangePageFragment(
+                    *entry.item->dst_pages, entry.item->dst_page_size, entry.item->size,
+                    span.object_offset + copied, fragment,
+                    [&](size_t page, uint64_t offset, size_t bytes, size_t source_offset) {
+                      TransferItem part = item;
+                      part.src_offset += source_offset;
+                      part.dst = entry.item->dst_backend->BufferRef(
+                          (*entry.item->dst_pages)[page].buffer_index);
+                      part.dst_offset = offset;
+                      part.size = bytes;
+                      entry_items.push_back(std::move(part));
+                      return entry_items.back().dst.Valid();
+                    });
+              }
               item.dst = dst;
               item.dst_offset = dst_base + packed_cursor + copied;
               item.size = fragment;
