@@ -100,7 +100,7 @@
 //
 // Negative cases, only with MORI_CCO_PROXY_TEST_NEGATIVE=all (or a list such as
 // "n1,n3"). They run after the positive cases, each on a DevComm of its own,
-// and put_sig_warp then runs again on the first DevComm:
+// and put_sig_after (a put_sig_warp case) then runs on the first DevComm:
 //   n1  rank 0 puts past the end of peer 1's window, then flush(coop,
 //       timeout) returns 2 twice and failed() is true; ccoDevCommGetError
 //       reports COMPLETION / IBV_WC_REM_ACCESS_ERR for peer 1, stderr gets
@@ -110,7 +110,8 @@
 //   n3  put to every peer, then flush(coop, 100 cycles) returns 1, a void
 //       flush still completes, and flush(coop, long timeout) returns 0; SPSC
 //       flushDone advances by exactly 3 (ccoCoopBlock), MPSC with 4 blocks
-//       per queue (ccoCoopWarp)
+//       per queue (ccoCoopWarp), where flush(coop, 100 cycles) may also
+//       return 0 (a later ticket's FLUSH can cover it first)
 //   n4  MORI_CCO_PROXY_TEST_FAIL_CONNECT=1: ccoDevCommCreate fails on every
 //       rank, and the comm still works afterwards
 //
@@ -589,7 +590,9 @@ __global__ void ProxyTimeoutKernel(ccoDevComm dc, ccoWindow_t dstWin, ccoWindow_
   const int timedOut = proxy.flush(Coop{}, 100);
   proxy.flush(Coop{});
   const int done = proxy.flush(Coop{}, kNegTimeoutCycles);
-  if (timedOut != 1 || done != 0 || proxy.failed()) {
+  // MPSC: another block's later-ticket FLUSH may already cover ours.
+  const bool timedOutOk = timedOut == 1 || (!ccoProxy<Q>::kSpsc && timedOut == 0);
+  if (!timedOutOk || done != 0 || proxy.failed()) {
     if (__lane_id() == 0) {
       printf("[rank %d] n3: unit %d wave %d: flush(100) = %d, flush(long) = %d, failed %d\n", me, u,
              static_cast<int>(threadIdx.x) / 64, timedOut, done, proxy.failed() ? 1 : 0);
