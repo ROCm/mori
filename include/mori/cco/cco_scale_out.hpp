@@ -155,9 +155,13 @@ struct ccoGda_WindowSignalAdd {
 
 // Atomic-free signal (ccoProxy only; ccoGda rejects it at compile time): an
 // 8-byte RDMA write of `value` into the signal slot, after the data on the same
-// QP. Contract: one writer per slot, values only increase, and no SignalInc /
-// SignalAdd to the same slot. The slot then reads the last value set (minus
-// what waitSignal consumed): on a reset slot, waitSignal(id, v) waits for v.
+// QP. Writes are ordered only within one queue, so the contract is: every set
+// of a slot goes through one queue (one ccoProxy handle, or SPSC handles
+// handed off in turn), values only increase in that queue's order, and no
+// SignalInc / SignalAdd to the same slot. Sets of one slot through two queues
+// can land out of order and move it back. The slot then reads the last value
+// set (minus what waitSignal consumed): on a reset slot, waitSignal(id, v)
+// waits for v.
 struct ccoGda_SignalSet {
   ccoGdaSignal_t signalId;
   uint64_t value;

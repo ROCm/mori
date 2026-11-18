@@ -63,7 +63,7 @@
 // waitSignal / resetSignal read devComm.ibgda.signalBuf and need a DevComm
 // whose gdaConnectionType resolves to non-NONE (FULL / RAIL / CROSSNODE).
 // SignalInc / SignalAdd / WindowSignalAdd are NIC atomic fetch-adds.
-// SignalSet / WindowSignalSet (see ccoGda_SignalSet: one writer per slot,
+// SignalSet / WindowSignalSet (see ccoGda_SignalSet: one queue per slot,
 // increasing values) are 8-byte inline RDMA writes, for platforms where NIC
 // atomics into GPU memory fail; like any write-then-flag protocol they rely on
 // the NIC and PCIe placing one QP's writes in order (no relaxed ordering on the
