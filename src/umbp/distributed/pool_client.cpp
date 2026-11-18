@@ -252,6 +252,7 @@ struct RangedPhases {
   double rmt_sub = 0.0;          // per-group sub_* vectors + PartitionBatchGetRangeTargets
   double rmt_items_build = 0.0;  // BuildContiguousToRangesItems for the scatter
   double rmt_final = 0.0;        // ApplyTransferFailures + FinalizeRemoteGetEntries
+  double rmt_check = 0.0;        // ValidateReads round trip after the RDMA read
   double rmt_medium = 0.0;       // ServeWholeObjectUnitsFromMedium
   double rmt_install = 0.0;      // install-from-arena / background prefetch
   double rmt_scatter = 0.0;      // arena -> caller buffers
@@ -327,6 +328,7 @@ struct RemoteLegSinks {
   double* peer = nullptr;
   double* decode = nullptr;
   double* final_ = nullptr;
+  double* check = nullptr;
   double* wait = nullptr;
 };
 thread_local RemoteLegSinks* t_remote_leg = nullptr;
@@ -373,6 +375,7 @@ class RangedStats {
     t.rmt_sub += p.rmt_sub;
     t.rmt_items_build += p.rmt_items_build;
     t.rmt_final += p.rmt_final;
+    t.rmt_check += p.rmt_check;
     t.rmt_medium += p.rmt_medium;
     t.rmt_install += p.rmt_install;
     t.rmt_scatter += p.rmt_scatter;
@@ -430,8 +433,8 @@ class RangedStats {
            xfer = 0, xfer_plan = 0, xfer_submit = 0, xfer_wait = 0, lock = 0, remote = 0,
            rmt_resolve = 0, rmt_build = 0, rmt_bld_items = 0, rmt_bld_plan = 0, rmt_bld_post = 0,
            rmt_peer = 0, rmt_decode = 0, rmt_sub = 0, rmt_items_build = 0, rmt_final = 0,
-           rmt_medium = 0, rmt_install = 0, rmt_wait = 0, rmt_scatter = 0, scat_plan = 0,
-           scat_submit = 0, scat_wait = 0, bytes = 0;
+           rmt_check = 0, rmt_medium = 0, rmt_install = 0, rmt_wait = 0, rmt_scatter = 0,
+           scat_plan = 0, scat_submit = 0, scat_wait = 0, bytes = 0;
   };
   struct Component {
     uint64_t calls = 0;
@@ -450,8 +453,8 @@ class RangedStats {
         "resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
         "commit={:.1f}% route={:.1f}% xfer={:.1f}%(plan={:.1f}% submit={:.1f}% wait={:.1f}%) "
         "lock={:.1f}% remote={:.1f}%(rslv={:.1f}% bld={:.1f}%[it={:.1f}% pl={:.1f}% "
-        "po={:.1f}%] peer={:.1f}% dec={:.1f}% sub={:.1f}% ib={:.1f}% fin={:.1f}% med={:.1f}% "
-        "inst={:.1f}% rdma={:.1f}% "
+        "po={:.1f}%] peer={:.1f}% dec={:.1f}% sub={:.1f}% ib={:.1f}% fin={:.1f}% chk={:.1f}% "
+        "med={:.1f}% inst={:.1f}% rdma={:.1f}% "
         "scat={:.1f}%[pl={:.1f}% sub={:.1f}% wt={:.1f}%]) "
         "other={:.1f}% | xfer_only={:.2f}GiB/s end2end={:.2f}GiB/s",
         name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
@@ -462,9 +465,9 @@ class RangedStats {
         share(t.xfer_plan), share(t.xfer_submit), share(t.xfer_wait), share(t.lock),
         share(t.remote), share(t.rmt_resolve), share(t.rmt_build), share(t.rmt_bld_items),
         share(t.rmt_bld_plan), share(t.rmt_bld_post), share(t.rmt_peer), share(t.rmt_decode),
-        share(t.rmt_sub), share(t.rmt_items_build), share(t.rmt_final), share(t.rmt_medium),
-        share(t.rmt_install), share(t.rmt_wait), share(t.rmt_scatter), share(t.scat_plan),
-        share(t.scat_submit), share(t.scat_wait), share(other),
+        share(t.rmt_sub), share(t.rmt_items_build), share(t.rmt_final), share(t.rmt_check),
+        share(t.rmt_medium), share(t.rmt_install), share(t.rmt_wait), share(t.rmt_scatter),
+        share(t.scat_plan), share(t.scat_submit), share(t.scat_wait), share(other),
         t.xfer > 0 ? (t.bytes / t.xfer) / (1024.0 * 1024 * 1024) : 0.0,
         t.total > 0 ? (t.bytes / t.total) / (1024.0 * 1024 * 1024) : 0.0);
   }
@@ -616,6 +619,17 @@ inline std::chrono::milliseconds ResolveBusyRetryTimeout() {
     if (end != value && *end == '\0' && parsed > 0) ms = parsed;
   }
   return std::chrono::milliseconds(std::min<uint64_t>(ms, 300000));
+}
+
+// Check-after-read for remote readers (#749).  On by default;
+// UMBP_REMOTE_READ_VALIDATE=0 turns it off for an A/B of its cost, which also
+// reopens the window where a read returns another key's bytes as a hit.
+inline bool RemoteReadValidateEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("UMBP_REMOTE_READ_VALIDATE");
+    return value == nullptr || std::string_view(value) != "0";
+  }();
+  return enabled;
 }
 
 std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(
@@ -1065,8 +1079,10 @@ bool PoolClient::Init() {
   // plausible numbers, and local_first in particular changes whether the master
   // is consulted at all -- it is worth 30% of a fully-local call.
   MORI_UMBP_INFO(
-      "[PoolClient] routing: local_first={} cache_remote_fetches={} ranged_locality_prefetch={}",
-      config_.local_first, config_.cache_remote_fetches, config_.ranged_locality_prefetch);
+      "[PoolClient] routing: local_first={} cache_remote_fetches={} ranged_locality_prefetch={} "
+      "remote_single_flight={} (wait {} ms)",
+      config_.local_first, config_.cache_remote_fetches, config_.ranged_locality_prefetch,
+      config_.remote_single_flight, config_.remote_single_flight_wait_ms);
 
   if (master_client_) master_client_->SetBackendRegistry(&registry_);
 
@@ -3482,6 +3498,21 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
                                              const std::vector<std::vector<void*>>& dsts,
                                              const std::vector<std::vector<size_t>>& sizes,
                                              const std::vector<std::vector<size_t>>& src_offsets) {
+  RangedFollowers followers;
+  std::vector<bool> results = BatchGetRangesImpl(
+      keys, dsts, sizes, src_offsets, config_.remote_single_flight ? &followers : nullptr);
+  // After the call above has returned: its arena lease is released and its own
+  // episodes are finished, so waiting here cannot hold up the call we wait on.
+  if (!followers.indices.empty()) {
+    ServeRangedFollowers(keys, dsts, sizes, src_offsets, followers, &results);
+  }
+  return results;
+}
+
+std::vector<bool> PoolClient::BatchGetRangesImpl(
+    const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets, RangedFollowers* followers) {
   const size_t n = keys.size();
   std::vector<bool> results(n, false);
   if (!initialized_ || n == 0 || !RangeBatchShapeValid(n, dsts, sizes, src_offsets)) {
@@ -3855,12 +3886,25 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::unordered_map<size_t, bool> unit_ok;
   for (const auto& unit : units) unit_ok.emplace(unit.original, true);
 
+  // Single-flight: a whole-object unit another call is already pulling (or that
+  // has landed locally since phase 1) is left to ServeRangedFollowers instead
+  // of being pulled a second time.  Whatever this call leads is finished once
+  // its slots are committed, and on every exit after this point.
+  LedEpisodes led;
+  ScopeExit finish_led{[this, &led] { FinishRemoteEpisodes(&led); }};
+  if (followers != nullptr && CanInstallLocally()) {
+    ClaimRemoteFetches(keys, &units, &unit_ok, &led, followers);
+  }
+
   // Whole-object units skip the arena entirely when a slot can be had; what
   // comes back is everything that still needs one.
   {
     PhaseTimer medium_timer(dbg ? &dbg->rmt_medium : nullptr);
     units = ServeWholeObjectUnitsFromMedium(keys, std::move(units), &unit_ok, &remote_bytes);
   }
+  // Committed or given up: either way the joiners can stop waiting now, before
+  // this call spends time on its arena units.
+  FinishRemoteEpisodes(&led);
   if (units.empty()) {
     for (const auto& [original, ok] : unit_ok) results[original] = ok;
     return results;
@@ -3899,6 +3943,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
            .peer = &dbg->rmt_peer,
            .decode = &dbg->rmt_decode,
            .final_ = &dbg->rmt_final,
+           .check = &dbg->rmt_check,
            .wait = &dbg->rmt_wait};
   }
   ScopedRemoteLeg leg_scope(dbg ? &leg : nullptr);
@@ -4348,6 +4393,147 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
   return plan;
 }
 
+void PoolClient::ClaimRemoteFetches(const std::vector<std::string>& keys,
+                                    std::vector<RangeFetchUnit>* units,
+                                    std::unordered_map<size_t, bool>* unit_ok, LedEpisodes* led,
+                                    RangedFollowers* followers) {
+  // Only whole-object units: they are the ones the slot path pulls AND commits,
+  // so they are the ones a second reader can be served from afterwards.
+  std::vector<size_t> candidates;
+  for (size_t u = 0; u < units->size(); ++u) {
+    if ((*units)[u].holds_whole_object) candidates.push_back(u);
+  }
+  if (candidates.empty()) return;
+  auto* backend = registry_.Get(medium_);
+  if (backend == nullptr) return;
+  std::vector<std::string> candidate_keys;
+  candidate_keys.reserve(candidates.size());
+  for (size_t u : candidates) candidate_keys.push_back(keys[(*units)[u].original]);
+
+  std::vector<char> follows(units->size(), 0);
+  {
+    // Under this lock a key being pulled always has its episode registered: the
+    // leader commits before FinishRemoteEpisodes, which takes this lock to
+    // retire the episode.  So "no episode and not committed" means nobody is
+    // pulling it, and this call takes it.
+    std::lock_guard<std::mutex> lock(remote_inflight_mutex_);
+    const std::vector<bool> present = backend->BatchContains(candidate_keys);
+    for (size_t c = 0; c < candidates.size(); ++c) {
+      const size_t u = candidates[c];
+      const std::string& key = candidate_keys[c];
+      const auto it = remote_inflight_.find(key);
+      if (it != remote_inflight_.end()) {
+        followers->indices.push_back((*units)[u].original);
+        followers->episodes.push_back(it->second);
+        follows[u] = 1;
+        single_flight_stats_.joined.fetch_add(1, std::memory_order_relaxed);
+      } else if (c < present.size() && present[c]) {
+        followers->indices.push_back((*units)[u].original);
+        followers->episodes.push_back(nullptr);
+        follows[u] = 1;
+        single_flight_stats_.already_local.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        auto episode = std::make_shared<RemoteFetchEpisode>();
+        remote_inflight_.emplace(key, episode);
+        led->emplace_back(key, std::move(episode));
+        single_flight_stats_.lead.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  // A whole-object unit is its key's only unit, so its key leaves unit_ok too.
+  std::vector<RangeFetchUnit> kept;
+  kept.reserve(units->size());
+  for (size_t u = 0; u < units->size(); ++u) {
+    if (follows[u]) {
+      unit_ok->erase((*units)[u].original);
+    } else {
+      kept.push_back(std::move((*units)[u]));
+    }
+  }
+  *units = std::move(kept);
+}
+
+SingleFlightActivity PoolClient::RemoteSingleFlightStats() const {
+  SingleFlightActivity out;
+  out.lead = single_flight_stats_.lead.load(std::memory_order_relaxed);
+  out.joined = single_flight_stats_.joined.load(std::memory_order_relaxed);
+  out.already_local = single_flight_stats_.already_local.load(std::memory_order_relaxed);
+  out.served_local = single_flight_stats_.served_local.load(std::memory_order_relaxed);
+  out.refetched = single_flight_stats_.refetched.load(std::memory_order_relaxed);
+  out.timed_out = single_flight_stats_.timed_out.load(std::memory_order_relaxed);
+  return out;
+}
+
+void PoolClient::FinishRemoteEpisodes(LedEpisodes* led) {
+  if (led->empty()) return;
+  {
+    std::lock_guard<std::mutex> lock(remote_inflight_mutex_);
+    for (const auto& [key, episode] : *led) {
+      const auto it = remote_inflight_.find(key);
+      if (it != remote_inflight_.end() && it->second == episode) remote_inflight_.erase(it);
+    }
+  }
+  for (const auto& [key, episode] : *led) {
+    {
+      std::lock_guard<std::mutex> lock(episode->mutex);
+      episode->done = true;
+    }
+    episode->cv.notify_all();
+  }
+  led->clear();
+}
+
+void PoolClient::ServeRangedFollowers(const std::vector<std::string>& keys,
+                                      const std::vector<std::vector<void*>>& dsts,
+                                      const std::vector<std::vector<size_t>>& sizes,
+                                      const std::vector<std::vector<size_t>>& src_offsets,
+                                      const RangedFollowers& followers,
+                                      std::vector<bool>* results) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(config_.remote_single_flight_wait_ms);
+  uint64_t timed_out = 0;
+  for (const auto& episode : followers.episodes) {
+    if (episode == nullptr) continue;
+    std::unique_lock<std::mutex> lock(episode->mutex);
+    if (!episode->cv.wait_until(lock, deadline, [&episode] { return episode->done; })) {
+      ++timed_out;
+    }
+  }
+
+  const size_t m = followers.indices.size();
+  std::vector<std::string> sub_keys;
+  std::vector<std::vector<void*>> sub_dsts;
+  std::vector<std::vector<size_t>> sub_sizes;
+  std::vector<std::vector<size_t>> sub_offsets;
+  sub_keys.reserve(m);
+  sub_dsts.reserve(m);
+  sub_sizes.reserve(m);
+  sub_offsets.reserve(m);
+  for (size_t index : followers.indices) {
+    sub_keys.push_back(keys[index]);
+    sub_dsts.push_back(dsts[index]);
+    sub_sizes.push_back(sizes[index]);
+    sub_offsets.push_back(src_offsets[index]);
+  }
+  // Counted before the re-read, so a key evicted in between counts as local
+  // here and is still read correctly (remotely) below.
+  if (auto* backend = registry_.Get(medium_); backend != nullptr) {
+    const std::vector<bool> present = backend->BatchContains(sub_keys);
+    uint64_t local = 0;
+    for (bool hit : present) local += hit ? 1 : 0;
+    single_flight_stats_.served_local.fetch_add(local, std::memory_order_relaxed);
+    single_flight_stats_.refetched.fetch_add(m - local, std::memory_order_relaxed);
+  }
+  single_flight_stats_.timed_out.fetch_add(timed_out, std::memory_order_relaxed);
+
+  // Single-flight off for the re-read: a key the leader did not leave local is
+  // pulled by this call itself, exactly as it would have been without the wait.
+  const std::vector<bool> again =
+      BatchGetRangesImpl(sub_keys, sub_dsts, sub_sizes, sub_offsets, /*followers=*/nullptr);
+  for (size_t j = 0; j < m; ++j) (*results)[followers.indices[j]] = again[j];
+}
+
 std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMedium(
     const std::vector<std::string>& keys, std::vector<RangeFetchUnit> units,
     std::unordered_map<size_t, bool>* unit_ok, double* remote_bytes) {
@@ -4659,10 +4845,20 @@ void PoolClient::WaitRemoteBatchGet(RemoteGetInFlight& f, std::vector<bool>* res
     PhaseTimer wait_timer(t_remote_leg ? t_remote_leg->wait : nullptr);
     if (f.handle != nullptr) f.handle->Wait(&failures);
   }
-  PhaseTimer final_timer(t_remote_leg ? t_remote_leg->final_ : nullptr);
-  ApplyTransferFailures(f.entries, failures, "RemoteGet");
+  {
+    PhaseTimer final_timer(t_remote_leg ? t_remote_leg->final_ : nullptr);
+    ApplyTransferFailures(f.entries, failures, "RemoteGet");
+  }
+  // Before anything is reported or re-cached: a read the peer cannot vouch for
+  // must not become a hit, nor be installed locally under the key.  Timed on
+  // its own, outside `final_`, because it is a network round trip.
+  if (f.peer != nullptr) {
+    PhaseTimer check_timer(t_remote_leg ? t_remote_leg->check : nullptr);
+    ValidateRemoteGetEntries(*f.peer, f.entries);
+  }
   // Nothing to copy out here even for a staged read: the engine owns its bounce
   // pool and lands the bytes in the user's dst before its Wait returns.
+  PhaseTimer final_timer(t_remote_leg ? t_remote_leg->final_ : nullptr);
   FinalizeRemoteGetEntries(f.entries, results, recache_remote);
 }
 
@@ -4777,6 +4973,7 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     // once; the pages below are indices into THIS backend's buffers.
     entry.plan.backend_id = key.backend_id;
     entry.plan.pages = std::move(decoded.keys[i].pages);
+    entry.generation = key.generation;
     // Descriptors were hydrated batch-level above; the per-entry plan carries
     // none (BuildRemoteGetTransfers' EnsureBufferDescsCached call is a no-op on
     // an empty list and the read path resolves descriptors by buffer_index).
@@ -4945,6 +5142,62 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
       MaybeReCacheAfterRemote(*entry.item->key, entry.item->dst, entry.item->size);
     }
   }
+}
+
+void PoolClient::ValidateRemoteGetEntries(PeerConnection& peer,
+                                          std::vector<RemoteGetEntry>& entries) {
+  if (!RemoteReadValidateEnabled()) return;
+
+  // Ask only about reads that landed and carry a generation.  0 means the
+  // medium does not stamp copies, or the peer predates the field and so has no
+  // ValidateReads to call either.
+  ::umbp::ValidateReadsRequest req;
+  std::vector<size_t> asked;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& entry = entries[i];
+    if (entry.failed || entry.generation == 0) continue;
+    req.add_keys(*entry.item->key);
+    req.add_backend_id(entry.plan.backend_id);
+    req.add_generation(entry.generation);
+    asked.push_back(i);
+  }
+  if (asked.empty()) return;
+
+  auto drop = [&](const std::vector<size_t>& which, const char* reason) {
+    for (size_t i : which) entries[i].failed = true;
+    CountMetric(MORI_UMBP_METRIC_CLIENT_REMOTE_GET_DROPPED_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_REMOTE_GET_DROPPED_TOTAL_HELP, {{"reason", reason}},
+                static_cast<double>(which.size()));
+  };
+
+  // Fail closed.  A peer that stamped a generation is new enough to answer, so
+  // any error here (UNIMPLEMENTED included) means the bytes are unconfirmed,
+  // and an unconfirmed read is exactly what this check exists to refuse.
+  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+  ::umbp::ValidateReadsResponse resp;
+  grpc::Status status(grpc::StatusCode::UNAVAILABLE, "no peer stub");
+  if (stub != nullptr) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + ResolveBusyRetryTimeout());
+    status = stub->ValidateReads(&ctx, req, &resp);
+  }
+  if (!status.ok() || resp.still_valid_size() != static_cast<int>(asked.size())) {
+    MORI_UMBP_WARN("[PoolClient] ValidateReads failed on {} ({} keys): {}", peer.node_id,
+                   asked.size(), status.ok() ? "answer count mismatch" : status.error_message());
+    drop(asked, "unverified");
+    return;
+  }
+
+  std::vector<size_t> stale;
+  for (size_t j = 0; j < asked.size(); ++j) {
+    if (!resp.still_valid(static_cast<int>(j))) stale.push_back(asked[j]);
+  }
+  if (stale.empty()) return;
+  MORI_UMBP_WARN(
+      "[PoolClient] BatchGet: {} of {} remote reads from {} changed under the read, returned "
+      "as misses (first key='{}')",
+      stale.size(), asked.size(), peer.node_id, *entries[stale.front()].item->key);
+  drop(stale, "stale");
 }
 
 // ---------------------------------------------------------------------------
@@ -5488,6 +5741,7 @@ ActivitySnapshot PoolClient::CollectActivitySnapshot() const {
   snap.recache.install_failed = recache_stats_.install_failed.load(std::memory_order_relaxed);
   snap.recache.prefetched = recache_stats_.prefetched.load(std::memory_order_relaxed);
   snap.recache.fragmented = recache_stats_.fragmented.load(std::memory_order_relaxed);
+  snap.single_flight = RemoteSingleFlightStats();
   return snap;
 }
 
