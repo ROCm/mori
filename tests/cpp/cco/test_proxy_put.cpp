@@ -884,6 +884,8 @@ __global__ void ProxyBlockFlushKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
 // (ccoProxyQueuePerBlock), counted by linear id over a 2-D grid of 2-D blocks.
 // The handle's queue must be u; then the unit puts its chunk to every peer
 // carrying SignalSet{Slot(me, u), 1} (atomic-free) and waits for every sender's.
+// A unit given the wrong queue reports it and only sends the SignalSets, on a
+// handle of queue u, so its peers do not hang.
 template <typename Coop, bool kPerWave>
 __global__ void ProxySelectorKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
                                     size_t chunk, int nUnits, int* err) {
@@ -899,13 +901,17 @@ __global__ void ProxySelectorKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindo
         printf("[rank %d] selector: unit %d got queue %u\n", me, u, proxy.queueId);
         atomicExch(err, 1);
       }
-      return;
-    }
-    const size_t dstOff = (static_cast<size_t>(me) * nUnits + u) * chunk;
-    for (int p = 0; p < n; p++) {
-      if (p == me) continue;
-      proxy.put(p, recvWin, dstOff, sendWin, (static_cast<size_t>(p) * nUnits + u) * chunk, chunk,
-                ccoGda_SignalSet{Slot(me, u), 1}, Coop{});
+      ccoProxy<> own{dc, u};  // the wrong handle never pushes
+      for (int p = 0; p < n; p++) {
+        if (p != me) own.signal(p, ccoGda_SignalSet{Slot(me, u), 1}, Coop{});
+      }
+    } else {
+      const size_t dstOff = (static_cast<size_t>(me) * nUnits + u) * chunk;
+      for (int p = 0; p < n; p++) {
+        if (p == me) continue;
+        proxy.put(p, recvWin, dstOff, sendWin, (static_cast<size_t>(p) * nUnits + u) * chunk, chunk,
+                  ccoGda_SignalSet{Slot(me, u), 1}, Coop{});
+      }
     }
     for (int s = 0; s < n; s++) {
       if (s != me) proxy.waitSignal(Slot(s, u), 1, Coop{});
