@@ -814,10 +814,12 @@ def proxy_signal_kernel(
 
 
 @triton.jit
-def proxy_read_reset_kernel(dev_comm, out, signal_id, reset: tl.constexpr):
+def proxy_read_reset_kernel(
+    dev_comm, out, signal_id, reset: tl.constexpr, pool: tl.constexpr
+):
     if reset:
-        cco.Proxy.reset_signal(dev_comm, 0, signal_id)
-    tl.store(out, cco.Proxy.read_signal(dev_comm, 0, signal_id))
+        cco.Proxy.reset_signal(dev_comm, 0, signal_id, pool=pool)
+    tl.store(out, cco.Proxy.read_signal(dev_comm, 0, signal_id, pool=pool))
 
 
 def setup_distributed():
@@ -1286,7 +1288,8 @@ def test_proxy(comm, dc, win, rank, world_size, extern_libs):
         cco.SignalOp.SET,
     )
 
-    # Link every op for both pools and coops.
+    # Link put / signal / put_value for both pools and coops; read / reset
+    # run for both pools below.
     for pool, queues in ((spsc, p), (mpsc, PROXY_MPSC_QUEUES)):
         for coop in (warp, block):
             for signal_op in signal_ops:
@@ -1435,7 +1438,7 @@ def test_proxy(comm, dc, win, rank, world_size, extern_libs):
     assert out.tolist() == [0] * (2 * p), f"Proxy signal: {out.tolist()}"
 
     # An INC nobody waits for reads 1 once the sender's flush has returned;
-    # after reset_signal it reads 0.
+    # after reset_signal it reads 0. Both pools see the same slots.
     sig = 6 * p
     comm.barrier()
     proxy_signal_kernel[(1,)](
@@ -1457,9 +1460,20 @@ def test_proxy(comm, dc, win, rank, world_size, extern_libs):
     assert out[:2].tolist() == [0, 0], f"Proxy signal flush: {out[:2].tolist()}"
     comm.barrier()
     value = torch.full((1,), -1, dtype=torch.int64, device="cuda")
-    for reset, expected in ((False, 1), (True, 0)):
+    for pool, reset, expected in (
+        (spsc, False, 1),
+        (mpsc, False, 1),
+        (mpsc, True, 0),
+        (spsc, True, 0),
+    ):
         proxy_read_reset_kernel[(1,)](
-            dc.ptr, value, sig, reset=reset, extern_libs=extern_libs, num_warps=1
+            dc.ptr,
+            value,
+            sig,
+            reset=reset,
+            pool=pool,
+            extern_libs=extern_libs,
+            num_warps=1,
         )
         torch.cuda.synchronize()
         assert value.item() == expected, f"Proxy read_signal: {value.item()}"

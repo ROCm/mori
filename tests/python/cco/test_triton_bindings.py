@@ -516,6 +516,16 @@ def test_flydsl_gda_doorbell_picks_symbols(monkeypatch):
                 gda.signal(1)
         else:
             gda.signal(1)
+    # SET has no Gda symbol; it is ccoProxy only.
+    set_op = handles.SignalOp.SET
+    gda = FakeGda(GdaDoorbell.IMMEDIATE)
+    for call in (
+        lambda: gda.put(1, 0, 0, 0, 0, 64, signal_op=set_op),
+        lambda: gda.put_value(1, 0, 0, 7, signal_op=set_op),
+        lambda: gda.signal(1, signal_op=set_op),
+    ):
+        with pytest.raises(ValueError, match="SET is ccoProxy only"):
+            call()
     with pytest.raises(ValueError, match="doorbell must be"):
         handles.DevComm.gda(None, 0, doorbell=3)
 

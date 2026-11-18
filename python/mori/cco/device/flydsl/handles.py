@@ -83,6 +83,16 @@ def _const(value, name):
     return value
 
 
+def _gda_sig(signal_op):
+    """SignalOp -> Gda signal tag; SET has no Gda wrapper."""
+    tag = _SIG_TAG.get(_const(signal_op, "signal_op"))
+    if tag is None:
+        raise ValueError(
+            "cco: Gda signal_op must be NONE/INC/ADD (SET is ccoProxy only)"
+        )
+    return tag
+
+
 def _tc(coop, thread_mode):
     """(ThreadMode, Coop) -> data-path tag; rejects the invalid aggregate combos."""
     _const(coop, "coop")
@@ -252,7 +262,7 @@ class Gda:
         team=Team.WORLD,
         ctx=None,
     ):
-        sig = _SIG_TAG[_const(signal_op, "signal_op")]
+        sig = _gda_sig(signal_op)
         sym = raw.PUT[f"{_tc(coop, thread_mode)}__{sig}{self._db()}"]
         sym(
             self.dev_comm,
@@ -283,7 +293,7 @@ class Gda:
         team=Team.WORLD,
         ctx=None,
     ):
-        sig = _SIG_TAG[_const(signal_op, "signal_op")]
+        sig = _gda_sig(signal_op)
         sym = raw.PUT_VALUE[f"{_tc(coop, thread_mode)}__{sig}{self._db()}"]
         sym(
             self.dev_comm,
@@ -345,7 +355,7 @@ class Gda:
                 "signal_op, or flush this handle first and then signal through an "
                 "IMMEDIATE one"
             )
-        raw.SIGNAL[f"{_COOP_TAG[coop]}__{_SIG_TAG[signal_op]}"](
+        raw.SIGNAL[f"{_COOP_TAG[coop]}__{_gda_sig(signal_op)}"](
             self.dev_comm, self._ctx(ctx), peer, signal_id, signal_val, _gda_flags(team)
         )
 

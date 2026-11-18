@@ -35,6 +35,15 @@ def test_triton_cco_proxy():
         pytest.skip(
             "Proxy test needs MORI_CCO_TRITON_PROXY_DEVICE or MORI_RDMA_DEVICES"
         )
+    from mori.jit.config import detect_gpu_arch
+
+    try:
+        arch = detect_gpu_arch()
+    except RuntimeError as e:
+        pytest.skip(f"Proxy test needs a GPU: {e}")
+    # The ccoProxy host engine only accepts queues on wave64 gfx942/gfx950.
+    if arch not in ("gfx942", "gfx950"):
+        pytest.skip(f"ccoProxy needs gfx942/gfx950, not {arch}")
     output = run_triton_example("proxy", timeout=300)
     assert output.count("Proxy PASS") == 2
     assert "All CCO Triton proxy tests PASSED" in output

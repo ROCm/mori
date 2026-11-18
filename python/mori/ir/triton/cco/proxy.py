@@ -59,7 +59,6 @@ from mori.cco.device.ops import CoopScope, GdaFlags, ProxyPool, SignalOp, Team
 
 from . import ops as raw
 
-_COOP_WARP = tl.constexpr(CoopScope.WARP)
 _COOP_BLOCK = tl.constexpr(CoopScope.BLOCK)
 _SIGNAL_NONE = tl.constexpr(SignalOp.NONE)
 _SIGNAL_INC = tl.constexpr(SignalOp.INC)
