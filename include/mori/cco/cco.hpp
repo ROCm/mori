@@ -392,7 +392,7 @@ struct ccoProxyContext {
                       // queues
   // [numSpscQueues + numMpscQueues] (SPSC pool, then MPSC pool) FLUSHes the
   // proxy has satisfied per queue. Fine-grained device memory, written only by
-  // the proxy, never decreases.
+  // the proxy, never decreases; bit 63 (ccoProxyFailedBit) = DevComm failed.
   uint64_t* flushDone;
   // [numSpscQueues + numMpscQueues] (indexed like flushDone) flush tickets taken
   // per queue. Device memory, written only by kernels (atomic fetch-add), never
@@ -1065,6 +1065,37 @@ void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe);
 // collective when the DevComm has ccoProxy queues.
 int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm);
 int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
+
+// A DevComm fails for good at its first ccoProxy error: the process survives,
+// ccoProxy::flush traps (or returns 2), and the DevComm must be destroyed and
+// created again. Other DevComms are unaffected.
+enum ccoDevCommErrorCode {
+  CCO_DEVCOMM_OK = 0,
+  CCO_PROXY_ERR_BAD_REQUEST = 1,  // an op the proxy cannot post (no QP to the peer, bad descriptor)
+  CCO_PROXY_ERR_POST = 2,         // ibv_post_send failed
+  CCO_PROXY_ERR_COMPLETION = 3,   // a work request completed with an error
+  CCO_PROXY_ERR_INTERNAL = 4,     // CQ poll failure, corrupted queue, proxy thread exception
+};
+
+// The first error of a DevComm. Unknown int fields are -1.
+struct ccoDevCommError {
+  int code;            // ccoDevCommErrorCode
+  int rank;            // reporting rank
+  int peer;            // world rank of the failed op's target
+  int queue;           // proxy queue (SPSC pool, then MPSC pool)
+  int op;              // BAD_REQUEST: ccoProxyOp; POST / COMPLETION: ibv_wr_opcode of the WR
+  int wcStatus;        // COMPLETION: ibv_wc_status
+  uint32_t vendorErr;  // COMPLETION: ibv_wc::vendor_err
+  int sysErrno;        // POST / INTERNAL: errno, or 0
+  uint64_t wrId;       // per-QP WR sequence number, or 0
+  uint64_t raddr;      // remote window offset of the failed WR
+  uint32_t rkey;
+  uint32_t len;
+  uint64_t suppressed;  // later errors, not reported
+  char message[160];
+};
+static_assert(std::is_trivially_copyable<ccoDevCommError>::value,
+              "ccoDevCommError is copied out by value");
 
 // Upload a host-side DevComm shadow to device memory so kernels can take a
 // pointer to it (host memory is not GPU-accessible).  Returns a hipMalloc'd

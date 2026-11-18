@@ -170,6 +170,10 @@ static_assert(sizeof(ccoProxyPutSignalDesc) == 56, "two queue lines");
 // splits larger transfers into pieces of that size.
 inline constexpr uint64_t ccoProxyMaxPutBytes = 1ull << 30;
 
+// Set in every flushDone word once the DevComm has failed (see
+// ccoDevCommGetError); the low bits keep the satisfied-FLUSH count.
+inline constexpr uint64_t ccoProxyFailedBit = 1ull << 63;
+
 #if defined(__HIPCC__)
 
 namespace impl {

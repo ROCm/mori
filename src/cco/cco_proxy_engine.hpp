@@ -62,9 +62,14 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
                                      application::BootstrapNetwork* bootNet,
                                      const ccoProxyEngineConfig& config, ccoProxyContext* out);
 
+// 1 and *err filled once the engine has failed (sticky), else 0. Lock-free and
+// HIP-free: safe from any thread while kernels run.
+int ccoProxyEngineGetError(const ccoProxyEngine* engine, ccoDevCommError* err);
+
 // Collective: drains and stops the proxy threads, barriers so no peer still has
 // WRs in flight to our QPs, then releases QPs, queues and device copies. No
-// kernel using the engine may still be running.
+// kernel using the engine may still be running. A failed engine stops without
+// waiting for its outstanding WRs.
 void ccoProxyEngineDestroy(ccoProxyEngine* engine);
 
 }  // namespace cco

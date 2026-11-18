@@ -43,6 +43,13 @@
 // for less than an earlier one), and each retired FLUSH adds 1 to
 // flushDone[q]. The GPU side turns that count into "my FLUSH is satisfied"
 // (see cco_proxy.hpp).
+//
+// Failure: the first error (a descriptor the proxy cannot post, a failed post
+// or completion, a corrupted queue) is recorded once per engine and printed on
+// stderr. Every worker then drains and drops: it keeps popping its queues so
+// producers never wedge, posts nothing more, and sets ccoProxyFailedBit in its
+// queues' flushDone words, so a waiting flush returns or traps. The DevComm
+// stays failed until it is destroyed (see ccoDevCommGetError).
 
 // cco headers first: core/utils.hpp (pulled in by the application headers)
 // defines a `warpSize` macro that would break cco.hpp's impl::warpSize().
@@ -56,6 +63,7 @@
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/utils/cpu_affinity.hpp"
+#include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 // clang-format on
 
@@ -72,6 +80,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -90,9 +99,90 @@ constexpr int kPopBatch = 64;       // callbacks run per queue per pass
 constexpr int kCqPollBatch = 32;
 constexpr size_t kScratchStride = 64;  // per-thread atomic fetch-result slot
 
-[[noreturn]] void ProxyFatal(int worker, const std::string& what) {
-  MORI_SHMEM_ERROR("ccoProxy worker {}: {}", worker, what);
-  std::abort();
+// First error of an engine, shared by its workers.
+struct ProxyErrorState {
+  std::atomic<int> state{0};  // 0 none, 1 claiming, 2 published
+  ccoDevCommError info{};     // written once, before state = 2
+  std::atomic<uint64_t> suppressed{0};
+};
+
+ccoDevCommError MakeError(int code, int peer, int queue, int op) {
+  ccoDevCommError e{};
+  e.code = code;
+  e.rank = -1;
+  e.peer = peer;
+  e.queue = queue;
+  e.op = op;
+  e.wcStatus = -1;
+  return e;
+}
+
+const char* OpName(const ccoDevCommError& e) {
+  if (e.code == CCO_PROXY_ERR_BAD_REQUEST) {
+    switch (e.op) {
+      case ccoProxyOpPut:
+        return "put";
+      case ccoProxyOpPutSignal:
+        return "put+signal";
+      case ccoProxyOpSignal:
+        return "signal";
+      case ccoProxyOpFlush:
+        return "flush";
+      default:
+        return nullptr;
+    }
+  }
+  switch (e.op) {
+    case IBV_WR_RDMA_WRITE:
+      return "RDMA_WRITE";
+    case IBV_WR_ATOMIC_FETCH_AND_ADD:
+      return "ATOMIC_FETCH_AND_ADD";
+    default:
+      return nullptr;
+  }
+}
+
+// One stderr line: what failed, the known fields, then `tail`.
+std::string DescribeError(const ccoDevCommError& e, const char* tail) {
+  std::string fields;
+  char buf[160];
+  auto add = [&](const char* part) {
+    fields += fields.empty() ? "" : ", ";
+    fields += part;
+  };
+  if (e.peer >= 0) {
+    std::snprintf(buf, sizeof(buf), "peer %d", e.peer);
+    add(buf);
+  }
+  if (e.queue >= 0) {
+    std::snprintf(buf, sizeof(buf), "queue %d", e.queue);
+    add(buf);
+  }
+  if (const char* name = OpName(e)) {
+    std::snprintf(buf, sizeof(buf), "op %s", name);
+    add(buf);
+  } else if (e.op >= 0) {
+    std::snprintf(buf, sizeof(buf), "op %d", e.op);
+    add(buf);
+  }
+  if (e.raddr != 0 || e.rkey != 0 || e.len != 0) {
+    std::snprintf(buf, sizeof(buf), "raddr 0x%llx rkey 0x%x len %u",
+                  static_cast<unsigned long long>(e.raddr), e.rkey, e.len);
+    add(buf);
+  }
+  if (e.code == CCO_PROXY_ERR_COMPLETION) {
+    std::snprintf(buf, sizeof(buf), "wc %s vendor_err 0x%x wr_id %llu",
+                  ibv_wc_status_str(static_cast<ibv_wc_status>(e.wcStatus)), e.vendorErr,
+                  static_cast<unsigned long long>(e.wrId));
+    add(buf);
+  }
+  if (e.sysErrno != 0) {
+    std::snprintf(buf, sizeof(buf), "errno %d", e.sysErrno);
+    add(buf);
+  }
+  std::string line = "[mori cco] ERROR: ccoProxy rank " + std::to_string(e.rank) + ": " + e.message;
+  if (!fields.empty()) line += " (" + fields + ")";
+  return line + "; " + tail;
 }
 
 // Proxy thread CPU placement. Each proxy thread busy-polls, so it gets a core of
@@ -209,7 +299,13 @@ class HostQueueImpl final : public HostQueue {
       : ctx_(ctx), endpoint_(endpoint), poll_(ctx.raw_queue(endpoint)->host_poll_state()) {}
   bool Ready() override { return poll_.ready(); }
   size_t Progress(int max) override {
-    const size_t n = ctx_.progress(endpoint_, max);
+    size_t n = 0;
+    try {
+      n = ctx_.progress(endpoint_, max);
+    } catch (...) {
+      poll_.refresh();  // the failing message was popped; Ready() must not stay stale
+      throw;
+    }
     if (n > 0) poll_.refresh();
     return n;
   }
@@ -226,33 +322,50 @@ struct PendingFlush {
 
 struct OwnedQueue {
   std::unique_ptr<HostQueue> queue;
+  int index{0};                           // in flushDone (SPSC pool, then MPSC pool)
   volatile uint64_t* flushDone{nullptr};  // fine-grained device memory, host-written
-  uint64_t flushed{0};                    // FLUSHes retired (the value of *flushDone)
+  uint64_t flushed{0};                    // FLUSHes retired (*flushDone without the failed bit)
   std::vector<uint64_t> lastSeq;          // [worldSize] seq of the last WR this queue produced
   std::deque<PendingFlush> pending;
+  bool broken{false};  // corrupted ring: never read again
+};
+
+// What a WR targeted, kept for error reports.
+struct WrShadow {
+  uint64_t raddr;
+  uint32_t rkey;
+  uint32_t len;
+  int queue;
+  int opcode;  // ibv_wr_opcode
 };
 
 struct ProxyQp {
   application::RdmaEndpoint ep;
   bool active{false};
+  int peer{-1};
   uint64_t postedSeq{0};     // WRs posted so far (wr_id of the last one)
   uint64_t completedSeq{0};  // every WR <= this has completed
   // WRs built during the current pass, posted as one chain at its end. Their
   // seqs are assigned when built: postedSeq + index + 1.
   std::vector<ibv_send_wr> wrs;
   std::vector<ibv_sge> sges;
+  // [kSqDepth] by seq % kSqDepth; Reserve keeps every tracked seq in one window.
+  std::vector<WrShadow> shadow;
 };
 
 class ProxyWorker {
  public:
-  ProxyWorker(int id, int worldSize) : qps(worldSize), id_(id) {}
+  ProxyWorker(int id, int worldSize, int rank, ProxyErrorState* err, bool abortOnError)
+      : qps(worldSize), id_(id), rank_(rank), err_(err), abortOnError_(abortOnError) {}
 
   void Start(int cpu, const std::atomic<bool>* stop) {
     for (int peer = 0; peer < static_cast<int>(qps.size()); peer++) {
       if (qps[peer].active) {
         activePeers_.push_back(peer);
+        qps[peer].peer = peer;
         qps[peer].wrs.reserve(kSqDepth);
         qps[peer].sges.reserve(kSqDepth);
+        qps[peer].shadow.resize(kSqDepth);
       }
     }
     thread_ = std::thread([this, cpu, stop] {
@@ -260,9 +373,14 @@ class ProxyWorker {
       current_ = this;
       try {
         Run(stop);
-      } catch (const std::exception& e) {  // e.g. KIWI invoke: unknown callback, bad size
-        ProxyFatal(id_, e.what());
+      } catch (const std::exception& e) {
+        Raise(MakeError(CCO_PROXY_ERR_INTERNAL, -1, -1, -1),
+              std::string("proxy thread failed: ") + e.what());
+      } catch (...) {
+        Raise(MakeError(CCO_PROXY_ERR_INTERNAL, -1, -1, -1), "proxy thread failed");
       }
+      // A kernel still flushing (e.g. during destroy) traps instead of spinning.
+      Poison();
     });
   }
 
@@ -300,31 +418,35 @@ class ProxyWorker {
 
   void Run(const std::atomic<bool>* stop) {
     for (;;) {
+      if (!failed_ && err_->state.load(std::memory_order_relaxed) != 0) EnterFailed();
       size_t popped = 0;
       for (OwnedQueue* oq : queues) {
-        if (!oq->queue->Ready()) continue;
+        if (oq->broken || !oq->queue->Ready()) continue;
         cur_ = oq;
-        popped += oq->queue->Progress(kPopBatch);
+        popped += Progress(*oq);
       }
       bool inFlight = false;
-      bool completed = false;
-      for (int peer : activePeers_) {
-        ProxyQp& qp = qps[peer];
-        PostChain(qp);
-        if (qp.completedSeq < qp.postedSeq) {
-          completed = PollCq(qp) || completed;
-          inFlight = inFlight || qp.completedSeq < qp.postedSeq;
+      bool flushPending = false;
+      if (!failed_) {
+        bool completed = false;
+        for (int peer : activePeers_) {
+          ProxyQp& qp = qps[peer];
+          PostChain(qp);
+          if (!failed_ && qp.completedSeq < qp.postedSeq) {
+            completed = PollCq(qp) || completed;
+            inFlight = inFlight || qp.completedSeq < qp.postedSeq;
+          }
+        }
+        for (OwnedQueue* oq : queues) {
+          if (completed) RetireFlushes(*oq);
+          flushPending = flushPending || !oq->pending.empty();
         }
       }
-      bool flushPending = false;
-      for (OwnedQueue* oq : queues) {
-        if (completed) RetireFlushes(*oq);
-        flushPending = flushPending || !oq->pending.empty();
-      }
       if (popped == 0) {
-        // Stop only once drained: nothing waiting, every WR completed, every
-        // FLUSH answered.
-        if (!inFlight && !flushPending && stop->load(std::memory_order_acquire) && !AnyReady()) {
+        // Stop only once drained: nothing waiting and, unless failed, every WR
+        // completed and every FLUSH answered (a failed QP may never complete).
+        if (stop->load(std::memory_order_acquire) && !AnyReady() &&
+            (failed_ || (!inFlight && !flushPending))) {
           break;
         }
         _mm_pause();
@@ -334,53 +456,143 @@ class ProxyWorker {
 
   bool AnyReady() {
     for (OwnedQueue* oq : queues) {
-      if (oq->queue->Ready()) return true;
+      if (!oq->broken && oq->queue->Ready()) return true;
     }
     return false;
   }
 
-  ProxyQp& PeerQp(uint32_t peer) {
-    if (peer >= qps.size() || !qps[peer].active) {
-      ProxyFatal(id_, "descriptor for peer " + std::to_string(peer) +
-                          " without a proxy QP (check gdaConnectionType)");
+  // Runs up to kPopBatch of oq's callbacks; nonzero if it made progress.
+  size_t Progress(OwnedQueue& oq) {
+    try {
+      return oq.queue->Progress(kPopBatch);
+    } catch (const mori::cco::proxy::queue::queue_error& e) {
+      oq.broken = true;
+      Raise(MakeError(CCO_PROXY_ERR_INTERNAL, -1, oq.index, -1),
+            std::string("corrupted queue: ") + e.what());
+    } catch (const std::bad_alloc&) {
+      Raise(MakeError(CCO_PROXY_ERR_INTERNAL, -1, oq.index, -1), "out of host memory");
+    } catch (const std::exception& e) {
+      // KIWI invoke: unknown callback id or argument size; the message is popped.
+      Raise(MakeError(CCO_PROXY_ERR_BAD_REQUEST, -1, oq.index, -1),
+            std::string("bad descriptor: ") + e.what());
     }
-    return qps[peer];
+    return 1;
+  }
+
+  // Records the engine's first error (later ones only count as suppressed),
+  // prints it, and switches this worker to drain-and-drop.
+  void Raise(ccoDevCommError e, const std::string& what) {
+    e.rank = rank_;
+    std::snprintf(e.message, sizeof(e.message), "%s", what.c_str());
+    if (abortOnError_) {
+      std::fprintf(stderr, "%s\n",
+                   DescribeError(e, "aborting (MORI_CCO_PROXY_ABORT_ON_ERROR)").c_str());
+      std::abort();
+    }
+    int expected = 0;
+    if (err_->state.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
+      err_->info = e;
+      err_->state.store(2, std::memory_order_release);
+      std::fprintf(
+          stderr, "%s\n",
+          DescribeError(e, "DevComm failed: flush traps or returns 2; destroy and recreate it")
+              .c_str());
+    } else {
+      err_->suppressed.fetch_add(1, std::memory_order_relaxed);
+    }
+    EnterFailed();
+  }
+
+  // Drain-and-drop from now on: keep popping so producers never wedge, post
+  // nothing, and answer every FLUSH, pending or later, with failure.
+  void EnterFailed() {
+    if (failed_) return;
+    for (OwnedQueue* oq : queues) RetireFlushes(*oq);  // satisfied FLUSHes still succeed
+    failed_ = true;
+    for (int peer : activePeers_) {
+      qps[peer].wrs.clear();
+      qps[peer].sges.clear();
+    }
+    for (OwnedQueue* oq : queues) oq->pending.clear();
+    Poison();
+  }
+
+  // Sets ccoProxyFailedBit in every owned queue's flushDone (this worker is its
+  // only writer).
+  void Poison() {
+    for (OwnedQueue* oq : queues) {
+      __atomic_store_n(oq->flushDone, oq->flushed | ccoProxyFailedBit, __ATOMIC_RELEASE);
+    }
+    _mm_sfence();  // drain the write-combining buffer toward the device
+  }
+
+  // Null, after raising BAD_REQUEST, if the peer has no proxy QP.
+  ProxyQp* PeerQp(uint32_t peer, ccoProxyOp op) {
+    if (peer < qps.size() && qps[peer].active) return &qps[peer];
+    const int p =
+        peer > static_cast<uint32_t>(std::numeric_limits<int>::max()) ? -1 : static_cast<int>(peer);
+    Raise(MakeError(CCO_PROXY_ERR_BAD_REQUEST, p, cur_->index, op),
+          "descriptor for peer " + std::to_string(peer) +
+              " without a proxy QP (check gdaConnectionType)");
+    return nullptr;
+  }
+
+  // NIC atomics need an 8-byte aligned target; raises BAD_REQUEST otherwise.
+  bool SignalAligned(const ccoProxySignalDesc& d, ccoProxyOp op) {
+    if ((d.raddr & 7) == 0) return true;
+    ccoDevCommError e =
+        MakeError(CCO_PROXY_ERR_BAD_REQUEST, static_cast<int>(d.peer), cur_->index, op);
+    e.raddr = d.raddr;
+    e.rkey = d.rkey;
+    e.len = sizeof(uint64_t);
+    Raise(e, "signal address not 8-byte aligned");
+    return false;
   }
 
   void OnPut(const ccoProxyPutDesc& d) {
-    ProxyQp& qp = PeerQp(d.peer);
-    Reserve(qp, 1);
-    cur_->lastSeq[d.peer] = AddWrite(qp, d);
+    if (failed_) return;
+    ProxyQp* qp = PeerQp(d.peer, ccoProxyOpPut);
+    if (qp == nullptr || !Reserve(*qp, 1)) return;
+    cur_->lastSeq[d.peer] = AddWrite(*qp, d);
   }
 
   void OnPutSignal(const ccoProxyPutSignalDesc& d) {
-    ProxyQp& qp = PeerQp(d.put.peer);
-    Reserve(qp, 2);  // both in one chain: data, then the atomic, on the same QP
-    AddWrite(qp, d.put);
-    cur_->lastSeq[d.put.peer] = AddAtomic(qp, d.signal);
+    if (failed_) return;
+    ProxyQp* qp = PeerQp(d.put.peer, ccoProxyOpPutSignal);
+    // Both in one chain: data, then the atomic, on the same QP.
+    if (qp == nullptr || !SignalAligned(d.signal, ccoProxyOpPutSignal) || !Reserve(*qp, 2)) {
+      return;
+    }
+    AddWrite(*qp, d.put);
+    cur_->lastSeq[d.put.peer] = AddAtomic(*qp, d.signal);
   }
 
   void OnSignal(const ccoProxySignalDesc& d) {
-    ProxyQp& qp = PeerQp(d.peer);
-    Reserve(qp, 1);
-    cur_->lastSeq[d.peer] = AddAtomic(qp, d);
+    if (failed_) return;
+    ProxyQp* qp = PeerQp(d.peer, ccoProxyOpSignal);
+    if (qp == nullptr || !SignalAligned(d, ccoProxyOpSignal) || !Reserve(*qp, 1)) return;
+    cur_->lastSeq[d.peer] = AddAtomic(*qp, d);
   }
 
   void OnFlush() {
+    if (failed_) return;  // the poisoned flushDone answers it
     OwnedQueue& oq = *cur_;
     // Everything before the FLUSH is popped; post it, then wait for this
     // queue's last WR on every peer that still has one outstanding.
     PendingFlush f;
     for (int p : activePeers_) {
       PostChain(qps[p]);
+      if (failed_) return;
       if (oq.lastSeq[p] > qps[p].completedSeq) f.waits.emplace_back(p, oq.lastSeq[p]);
     }
     oq.pending.push_back(std::move(f));
     RetireFlushes(oq);
   }
 
-  // Retire satisfied flushes in FIFO order and publish the new count.
+  // Retire satisfied flushes in FIFO order and publish the new count. Never
+  // once failed: that would clear the failed bit.
   void RetireFlushes(OwnedQueue& oq) {
+    if (failed_) return;
     uint64_t retired = 0;
     while (!oq.pending.empty()) {
       const PendingFlush& f = oq.pending.front();
@@ -398,14 +610,25 @@ class ProxyWorker {
     }
   }
 
-  // Make room for n more WRs in qp's SQ (posted + pending chain).
-  void Reserve(ProxyQp& qp, size_t n) {
+  // Make room for n more WRs in qp's SQ (posted + pending chain). While it is
+  // full, posts every peer's chain and polls every CQ, so other peers' work
+  // and flushes keep moving. False if the DevComm failed meanwhile.
+  bool Reserve(ProxyQp& qp, size_t n) {
     while (qp.postedSeq + qp.wrs.size() + n - qp.completedSeq > kSqDepth) {
-      PostChain(qp);
-      if (PollCq(qp)) {
+      if (err_->state.load(std::memory_order_relaxed) != 0) EnterFailed();
+      bool completed = false;
+      for (int peer : activePeers_) {
+        if (failed_) return false;
+        ProxyQp& q = qps[peer];
+        PostChain(q);
+        if (!failed_ && q.completedSeq < q.postedSeq) completed = PollCq(q) || completed;
+      }
+      if (failed_) return false;
+      if (completed) {
         for (OwnedQueue* oq : queues) RetireFlushes(*oq);
       }
     }
+    return true;
   }
 
   // Append a WR to qp's pending chain; returns its sequence number.
@@ -413,6 +636,21 @@ class ProxyWorker {
     qp.wrs.push_back(wr);
     qp.sges.push_back(sge);
     return qp.postedSeq + qp.wrs.size();
+  }
+
+  // Error for WR `seq` of qp, with its target if the seq is still tracked.
+  static ccoDevCommError WrError(int code, const ProxyQp& qp, uint64_t seq) {
+    ccoDevCommError e = MakeError(code, qp.peer, -1, -1);
+    e.wrId = seq;
+    if (seq > qp.completedSeq && seq <= qp.postedSeq + qp.wrs.size()) {
+      const WrShadow& w = qp.shadow[seq % kSqDepth];
+      e.queue = w.queue;
+      e.op = w.opcode;
+      e.raddr = w.raddr;
+      e.rkey = w.rkey;
+      e.len = w.len;
+    }
+    return e;
   }
 
   uint64_t AddWrite(ProxyQp& qp, const ccoProxyPutDesc& d) {
@@ -425,7 +663,9 @@ class ProxyWorker {
     wr.num_sge = d.bytes ? 1 : 0;
     wr.wr.rdma.remote_addr = d.raddr;
     wr.wr.rdma.rkey = d.rkey;
-    return Append(qp, wr, sge);
+    const uint64_t seq = Append(qp, wr, sge);
+    qp.shadow[seq % kSqDepth] = WrShadow{d.raddr, d.rkey, d.bytes, cur_->index, IBV_WR_RDMA_WRITE};
+    return seq;
   }
 
   uint64_t AddAtomic(ProxyQp& qp, const ccoProxySignalDesc& d) {
@@ -439,7 +679,10 @@ class ProxyWorker {
     wr.wr.atomic.remote_addr = d.raddr;
     wr.wr.atomic.rkey = d.rkey;
     wr.wr.atomic.compare_add = d.value;
-    return Append(qp, wr, sge);
+    const uint64_t seq = Append(qp, wr, sge);
+    qp.shadow[seq % kSqDepth] =
+        WrShadow{d.raddr, d.rkey, sizeof(uint64_t), cur_->index, IBV_WR_ATOMIC_FETCH_AND_ADD};
+    return seq;
   }
 
   // Post the pending chain with one ibv_post_send. Every WR is signaled (v1).
@@ -456,22 +699,35 @@ class ProxyWorker {
     ibv_send_wr* bad = nullptr;
     const int ret = ibv_post_send(qp.ep.ibvHandle.qp, qp.wrs.data(), &bad);
     if (ret != 0) {
-      ProxyFatal(id_, "ibv_post_send failed: " + std::string(strerror(ret)));
+      // The WRs before `bad` were posted.
+      if (bad >= qp.wrs.data() && bad < qp.wrs.data() + n) qp.postedSeq += bad - qp.wrs.data();
+      ccoDevCommError e = WrError(CCO_PROXY_ERR_POST, qp, qp.postedSeq + 1);
+      e.sysErrno = ret;
+      Raise(e, std::string("ibv_post_send failed: ") + strerror(ret));  // drops the chain
+      return;
     }
     qp.postedSeq += n;
     qp.wrs.clear();
     qp.sges.clear();
   }
 
-  // Returns true if completedSeq advanced.
+  // Returns true if any CQE was polled. An error CQE raises COMPLETION.
   bool PollCq(ProxyQp& qp) {
     ibv_wc wc[kCqPollBatch];
     const int n = ibv_poll_cq(qp.ep.ibvHandle.cq, kCqPollBatch, wc);
-    if (n < 0) ProxyFatal(id_, "ibv_poll_cq failed");
+    if (n < 0) {
+      ccoDevCommError e = MakeError(CCO_PROXY_ERR_INTERNAL, qp.peer, -1, -1);
+      e.sysErrno = -n;
+      Raise(e, "ibv_poll_cq failed");
+      return false;
+    }
     for (int i = 0; i < n; i++) {
       if (wc[i].status != IBV_WC_SUCCESS) {
-        ProxyFatal(id_, std::string("WR failed: ") + ibv_wc_status_str(wc[i].status) + " (wr_id " +
-                            std::to_string(wc[i].wr_id) + ")");
+        ccoDevCommError e = WrError(CCO_PROXY_ERR_COMPLETION, qp, wc[i].wr_id);
+        e.wcStatus = wc[i].status;
+        e.vendorErr = wc[i].vendor_err;
+        Raise(e, "work request failed");
+        return true;
       }
       if (wc[i].wr_id > qp.completedSeq) qp.completedSeq = wc[i].wr_id;
     }
@@ -481,6 +737,10 @@ class ProxyWorker {
   static inline thread_local ProxyWorker* current_ = nullptr;  // set on each proxy thread
 
   int id_;
+  int rank_;
+  ProxyErrorState* err_;      // the engine's
+  bool abortOnError_;         // MORI_CCO_PROXY_ABORT_ON_ERROR: abort at the first error
+  bool failed_{false};        // drain-and-drop
   OwnedQueue* cur_{nullptr};  // queue whose callbacks are running
   std::vector<int> activePeers_;
   std::thread thread_;
@@ -522,6 +782,8 @@ class ccoProxyEngine {
       mpsc;                                         // MPSC pool
   std::vector<std::unique_ptr<OwnedQueue>> queues;  // SPSC pool, then MPSC pool
   std::vector<std::unique_ptr<ProxyWorker>> workers;
+  ProxyErrorState err;
+  int rank{0};
   void* scratch{nullptr};
   uint64_t* flushDone{nullptr};    // fine-grained device [numSpsc + numMpsc]
   uint64_t* flushTicket{nullptr};  // device [numSpsc + numMpsc]
@@ -546,6 +808,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   engine->bootNet = bootNet;
   const int worldSize = bootNet->GetWorldSize();
   const int rank = bootNet->GetLocalRank();
+  engine->rank = rank;
+  const bool abortOnError = env::IsEnvVarEnabled("MORI_CCO_PROXY_ABORT_ON_ERROR");
   const int numSpsc = config.numSpscQueues;
   const int numMpsc = config.numMpscQueues;
   // Summed in 64 bits and validated below before any use as an int.
@@ -618,7 +882,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
         engine->ibv->RegisterRdmaMemoryRegion(engine->scratch, kScratchStride * numThreads);
 
     for (int t = 0; t < numThreads; t++) {
-      auto w = std::make_unique<ProxyWorker>(t, worldSize);
+      auto w = std::make_unique<ProxyWorker>(t, worldSize, rank, &engine->err, abortOnError);
       w->scratchAddr = reinterpret_cast<uint64_t>(engine->scratch) + t * kScratchStride;
       w->scratchLkey = scratchMr.lkey;
       engine->workers.push_back(std::move(w));
@@ -653,6 +917,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     }
     for (int g = 0; g < numQueues; g++) {
       auto oq = std::make_unique<OwnedQueue>();
+      oq->index = g;
       oq->flushDone = engine->flushDone + g;
       if (g < numSpsc) {
         oq->queue = std::make_unique<HostQueueImpl<mori::cco::proxy::queue::SPSCD2HQueue>>(
@@ -754,9 +1019,23 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   return engine.release();
 }
 
+int ccoProxyEngineGetError(const ccoProxyEngine* engine, ccoDevCommError* err) {
+  if (engine == nullptr || engine->err.state.load(std::memory_order_acquire) != 2) return 0;
+  *err = engine->err.info;
+  err->suppressed = engine->err.suppressed.load(std::memory_order_relaxed);
+  return 1;
+}
+
 void ccoProxyEngineDestroy(ccoProxyEngine* engine) {
   if (engine == nullptr) return;
-  engine->StopAndJoin();       // drain: every WR we posted completed, every FLUSH answered
+  engine->StopAndJoin();  // drain: every WR we posted completed, every FLUSH answered
+  ccoDevCommError err;
+  if (ccoProxyEngineGetError(engine, &err)) {
+    std::fprintf(stderr,
+                 "[mori cco] ccoProxy rank %d: destroying a failed DevComm (error code %d, %llu "
+                 "later errors suppressed)\n",
+                 engine->rank, err.code, static_cast<unsigned long long>(err.suppressed));
+  }
   engine->bootNet->Barrier();  // ... and every peer's WRs to our QPs too
   delete engine;
 }
