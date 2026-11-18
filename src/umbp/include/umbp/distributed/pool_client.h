@@ -1068,6 +1068,10 @@ class PoolClient {
     const BatchGetItem* item;
     SlotPlan plan;
     bool failed = false;
+    // A read that settles at or after this may have read pages the peer already
+    // evicted and reused.  max() = the peer published no read lease.
+    std::chrono::steady_clock::time_point lease_deadline =
+        std::chrono::steady_clock::time_point::max();
   };
 
   bool AllocateRemotePutEntries(const std::vector<BatchPutItem>& items,
@@ -1089,6 +1093,9 @@ class PoolClient {
                                std::vector<bool>* results);
   bool BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, const std::string& node_id,
                                std::vector<TransferItem>* items);
+  // Fail every entry whose read settled at or after its lease_deadline.
+  void ExpireRemoteGetLeases(std::vector<RemoteGetEntry>& entries,
+                             std::chrono::steady_clock::time_point settled);
   void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results,
                                 bool recache_remote);
 

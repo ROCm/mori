@@ -613,6 +613,7 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
   // this key.  CAS-max rather than a plain store: with a shared lock two
   // readers can renew the same key at once, and neither may shorten it.
   RenewLeaseAtomic(it->second, SteadyNs(std::chrono::steady_clock::now() + read_lease_ttl_));
+  r.read_lease_ms = ReadLeaseMs(read_lease_ttl_);
   TouchLru(key, it->second);
   return r;
 }
@@ -651,6 +652,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
       entry.hold = it->second.hold;
     } else {
       RenewLeaseAtomic(it->second, lease_deadline);
+      entry.read_lease_ms = ReadLeaseMs(read_lease_ttl_);
     }
     if (track_eviction_order_) touched.emplace_back(&keys[i], &it->second);
   }

@@ -406,6 +406,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       entries[i].backend_id = result.backend_id;
       entries[i].size = r.size;
       entries[i].pages = std::move(r.pages);
+      entries[i].read_lease_ms = r.read_lease_ms;
       total_bytes += r.size;
 
       if (omit_descs) continue;

@@ -628,7 +628,11 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // `window` is the object bytes the span holds when it is not all of them.
   auto publish_span = [&](ResolvedEntry& out, StagingSpan span, uint64_t size,
                           const std::shared_ptr<const void>& hold, ObjectExtent window) {
-    if (local) out.hold = hold;
+    if (local) {
+      out.hold = hold;
+    } else {
+      out.read_lease_ms = ReadLeaseMs(cfg_.read_lease_ttl);
+    }
     out.outcome = ResolveOutcome::kFound;
     out.found = true;
     out.pages.reserve(span.page_count);

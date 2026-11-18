@@ -236,6 +236,16 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_cross_node_smoke COMMAND test_umbp_cross_node_smoke)
 
+add_executable(test_umbp_remote_read_lease test_remote_read_lease.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_remote_read_lease PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_remote_read_lease
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_remote_read_lease COMMAND test_umbp_remote_read_lease)
+
 add_executable(test_umbp_pool_client_batch_put test_pool_client_batch_put.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(test_umbp_pool_client_batch_put PRIVATE
@@ -349,7 +359,8 @@ add_executable(test_umbp_range_map test_range_map.cpp)
 target_link_libraries(test_umbp_range_map PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_range_map COMMAND test_umbp_range_map)
 
-set_tests_properties(umbp_cross_node_smoke umbp_pool_client_batch_put
+set_tests_properties(umbp_cross_node_smoke umbp_remote_read_lease
+                     umbp_pool_client_batch_put
                      umbp_medium_selection umbp_tier_benchmark
                      umbp_client_metrics_pool_bytes umbp_tags_real_master
                      umbp_pool_client_ranges umbp_ssd_ranged_io

@@ -50,6 +50,8 @@ struct ResolvedKeyEntry {
   // key; `pages` carries backend-local buffer indices and is meaningless
   // without it.
   uint32_t backend_id = 0;
+  // See ResolvedEntry::read_lease_ms.
+  uint32_t read_lease_ms = 0;
 };
 
 // One key decoded out of the SoA response (page_size and descs are batch-level
@@ -61,6 +63,8 @@ struct DecodedResolveKey {
   uint64_t size = 0;
   std::vector<PageLocation> pages;
   uint32_t backend_id = 0;
+  // 0 when the peer published no bound (including an old peer).
+  uint32_t read_lease_ms = 0;
 };
 
 // Whole-batch decode result.
@@ -125,6 +129,7 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
   resp->mutable_page_count()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_backend_id()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_resolve_status()->Reserve(static_cast<int>(keys.size()));
+  resp->mutable_read_lease_ms()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_buffer_index()->Reserve(static_cast<int>(total_pages));
   resp->mutable_page_index()->Reserve(static_cast<int>(total_pages));
 
@@ -135,6 +140,7 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
     resp->add_tier(TierToProto(k.tier));
     resp->add_size(k.size);
     resp->add_backend_id(k.backend_id);
+    resp->add_read_lease_ms(outcome == ResolveOutcome::kFound ? k.read_lease_ms : 0);
     resp->add_page_count(static_cast<uint32_t>(k.pages.size()));
     for (const auto& p : k.pages) {
       resp->add_buffer_index(p.buffer_index);
@@ -177,6 +183,7 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
     return out;
   }
   if (resp.resolve_status_size() != 0 && resp.resolve_status_size() != n) return out;
+  if (resp.read_lease_ms_size() != 0 && resp.read_lease_ms_size() != n) return out;
 
   size_t total_pages = 0;
   for (int i = 0; i < n; ++i) total_pages += resp.page_count(i);
@@ -195,6 +202,7 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
     k.tier = TierFromProto(resp.tier(i));
     k.size = resp.size(i);
     k.backend_id = resp.backend_id(i);
+    k.read_lease_ms = resp.read_lease_ms_size() == n ? resp.read_lease_ms(i) : 0;
     const uint32_t pc = resp.page_count(i);
     k.pages.reserve(pc);
     for (uint32_t p = 0; p < pc; ++p) {

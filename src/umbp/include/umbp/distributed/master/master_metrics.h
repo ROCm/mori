@@ -253,6 +253,10 @@
 #define MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP \
   "Remote ranged objects that could not be synchronously installed in the local medium"
 
+#define MORI_UMBP_METRIC_REMOTE_GET_LEASE_EXPIRED_TOTAL "mori_umbp_remote_get_lease_expired_total"
+#define MORI_UMBP_METRIC_REMOTE_GET_LEASE_EXPIRED_TOTAL_HELP \
+  "Remote reads discarded because they settled after the owning peer's read lease"
+
 // --- Heartbeat / event-shipping counters (master-as-advisor) ----------------
 
 #define MORI_UMBP_METRIC_HEARTBEAT_EVENTS_APPLIED_TOTAL "mori_umbp_heartbeat_events_applied_total"
