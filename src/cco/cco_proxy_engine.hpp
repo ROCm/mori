@@ -57,7 +57,9 @@ class ccoProxyEngine;
 // queues, the host-posted RC QPs (on ctx's RDMA device and PD, so cco window
 // MRs are valid on them) and starts the proxy threads. Fills `out` on success;
 // returns nullptr on failure. A failure in any rank's local setup (before the
-// QP exchange) makes every rank fail.
+// QP exchange) or in connecting and starting makes every rank fail.
+// MORI_CCO_PROXY_TEST_FAIL_CONNECT=<rank> makes that rank fail to connect
+// (test hook).
 ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
                                      application::BootstrapNetwork* bootNet,
                                      const ccoProxyEngineConfig& config, ccoProxyContext* out);
@@ -69,8 +71,9 @@ int ccoProxyEngineGetError(const ccoProxyEngine* engine, ccoDevCommError* err);
 // Collective: drains and stops the proxy threads, barriers so no peer still has
 // WRs in flight to our QPs, then releases QPs, queues and device copies. No
 // kernel using the engine may still be running. A failed engine stops without
-// waiting for its outstanding WRs.
-void ccoProxyEngineDestroy(ccoProxyEngine* engine);
+// waiting for its outstanding WRs. Never throws: if the barrier fails (a peer
+// died), it reports that on stderr and tears down locally.
+void ccoProxyEngineDestroy(ccoProxyEngine* engine) noexcept;
 
 }  // namespace cco
 }  // namespace mori

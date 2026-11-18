@@ -965,11 +965,23 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     return nullptr;  // engine destructor releases what was built
   }
 
+  // Exchange QP handles the way Context does. A broken bootstrap leaves nothing
+  // to agree on.
+  std::vector<application::RdmaEndpointHandle> remote(local.size());
   try {
-    // Exchange QP handles the way Context does, then connect and start.
-    std::vector<application::RdmaEndpointHandle> remote(local.size());
     bootNet->AllToAll(local.data(), remote.data(),
                       sizeof(application::RdmaEndpointHandle) * numThreads);
+  } catch (const std::exception& e) {
+    MORI_SHMEM_ERROR("ccoProxyEngineCreate: rank={} failed: {}", rank, e.what());
+    return nullptr;  // engine destructor releases what was built
+  }
+
+  // Connect and start, then agree: a rank going on with QPs whose peer failed
+  // would hang in later collectives or fail its first put.
+  try {
+    if (env::GetInt("MORI_CCO_PROXY_TEST_FAIL_CONNECT") == rank) {
+      throw std::runtime_error("MORI_CCO_PROXY_TEST_FAIL_CONNECT");  // test hook
+    }
     for (int peer = 0; peer < worldSize; peer++) {
       if (peer == rank || !config.peerMask[peer]) continue;
       for (int t = 0; t < numThreads; t++) {
@@ -1000,8 +1012,18 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
                    rank, numThreads, cpuList.c_str(), cpuSource.c_str());
     }
   } catch (const std::exception& e) {
-    MORI_SHMEM_ERROR("ccoProxyEngineCreate: rank={} failed: {}", rank, e.what());
-    return nullptr;  // engine destructor stops threads and releases what was built
+    error = e.what();
+  }
+  int32_t connected = error.empty() ? 1 : 0;
+  std::vector<int32_t> allConnected(worldSize);
+  bootNet->Allgather(&connected, allConnected.data(), sizeof(int32_t));
+  for (int r = 0; r < worldSize && error.empty(); r++) {
+    if (!allConnected[r]) error = "rank " + std::to_string(r) + " failed to connect or start";
+  }
+  if (!error.empty()) {
+    MORI_SHMEM_ERROR("ccoProxyEngineCreate: rank={} failed: {}", rank, error);
+    engine->StopAndJoin();  // the threads have posted nothing
+    return nullptr;         // engine destructor releases what was built
   }
 
   MORI_SHMEM_INFO(
@@ -1026,7 +1048,7 @@ int ccoProxyEngineGetError(const ccoProxyEngine* engine, ccoDevCommError* err) {
   return 1;
 }
 
-void ccoProxyEngineDestroy(ccoProxyEngine* engine) {
+void ccoProxyEngineDestroy(ccoProxyEngine* engine) noexcept {
   if (engine == nullptr) return;
   engine->StopAndJoin();  // drain: every WR we posted completed, every FLUSH answered
   ccoDevCommError err;
@@ -1036,7 +1058,14 @@ void ccoProxyEngineDestroy(ccoProxyEngine* engine) {
                  "later errors suppressed)\n",
                  engine->rank, err.code, static_cast<unsigned long long>(err.suppressed));
   }
-  engine->bootNet->Barrier();  // ... and every peer's WRs to our QPs too
+  try {
+    engine->bootNet->Barrier();  // ... and every peer's WRs to our QPs too
+  } catch (const std::exception& e) {
+    std::fprintf(stderr,
+                 "[mori cco] ERROR: ccoProxy rank %d: destroy barrier failed (%s); tearing down "
+                 "locally\n",
+                 engine->rank, e.what());
+  }
   delete engine;
 }
 

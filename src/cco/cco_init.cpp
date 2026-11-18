@@ -2220,7 +2220,7 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
   // ccoProxy first: its threads post against the windows, MRs and QPs freed below.
 #ifdef MORI_CCO_PROXY
   if (hostShadow.proxy.engine) {
-    {
+    if (comm) {
       std::lock_guard<std::mutex> lock(comm->allocMutex);
       auto& engines = comm->proxyEngines;
       engines.erase(std::remove(engines.begin(), engines.end(), hostShadow.proxy.engine),
