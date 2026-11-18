@@ -1349,6 +1349,10 @@ __device__ inline int ccoGda<PrvdType, Doorbell>::resolveWorldPeer(int peer) con
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 __device__ inline ccoGda<PrvdType, Doorbell>::ccoGda(ccoDevComm const& comm_, int contextIndex)
     : comm(comm_), contextId(contextIndex) {
+  // A proxy-only DevComm (ccoDevCommRequirements::proxyOnly) has no GDA QPs:
+  // trap rather than index a null endpoint table (no printf: the JIT bitcode
+  // includes this header).
+  if (__builtin_expect(comm.ibgda.numQpPerPe <= 0, 0)) __builtin_trap();
   this->_gdaHandle = (void*)&comm.ibgda;
   switch (comm.gdaConnType) {
     case CCO_GDA_CONNECTION_FULL:

@@ -64,6 +64,8 @@
 // Remote signals land in the same slots ccoGda uses, so readSignal /
 // waitSignal / resetSignal read devComm.ibgda.signalBuf and need a DevComm
 // whose gdaConnectionType resolves to non-NONE (FULL / RAIL / CROSSNODE).
+// ccoDevCommRequirements::proxyOnly keeps those slots but creates no GDA QPs,
+// for a DevComm only ccoProxy uses (ccoGda traps on it).
 // SignalInc / SignalAdd / WindowSignalAdd are NIC atomic fetch-adds.
 // SignalSet / WindowSignalSet (see ccoGda_SignalSet: one queue per slot,
 // increasing values) are 8-byte inline RDMA writes, for platforms where NIC

@@ -515,7 +515,7 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
       PerfFinalize(ctx);
       return 1;
 #endif
-      reqs.gdaContextCount = 1;  // GDA QPs unused; ccoProxy only borrows the signal slots
+      reqs.proxyOnly = 1;  // no GDA QPs: ccoProxy only borrows the signal slots
       if (args.proxy_mpsc) {
         reqs.proxyMpscQueueCount = args.nblocks;
       } else {

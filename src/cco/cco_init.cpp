@@ -1663,9 +1663,14 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   hostShadow.flatBase = comm->flatBase;
   hostShadow.perRankSize = comm->perRankSize;
 
-  // Fresh QP set per DevComm.
+  // Fresh QP set per DevComm; none for a proxy-only DevComm (reqs tail, agreed
+  // on below before any QP is made).
+  const bool proxyOnly =
+      reqs->size >= offsetof(ccoDevCommRequirements, proxyOnly) + sizeof(int) && reqs->proxyOnly;
   ccoIbgdaContext& ibgda = hostShadow.ibgda;
-  int numQpPerPe = reqs->gdaContextCount > 0 ? reqs->gdaContextCount : comm->defaultNumQpPerPe;
+  int numQpPerPe = proxyOnly                   ? 0
+                   : reqs->gdaContextCount > 0 ? reqs->gdaContextCount
+                                               : comm->defaultNumQpPerPe;
   ibgda.numQpPerPe = numQpPerPe;
 
   size_t numEps = static_cast<size_t>(comm->worldSize) * numQpPerPe;
@@ -1731,7 +1736,92 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     }
   }
 
-  if (connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled()) {
+  // ccoProxy requirements, agreed on before the GDA QPs (collective) since a
+  // proxy-only DevComm makes none. The proxy fields sit at the tail of reqs;
+  // read them only when the caller's struct has them.
+  const bool reqsHaveProxy =
+      reqs->size >= offsetof(ccoDevCommRequirements, proxyQueueCapacity) + sizeof(int);
+  const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
+  const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
+  const int proxyThreads = reqsHaveProxy ? std::max(reqs->proxyThreadCount, 0) : 0;
+  // QPs per (proxy thread, peer): the field, else MORI_CCO_PROXY_QPS_PER_PEER, else 4.
+  const bool reqsHaveQps =
+      reqs->size >= offsetof(ccoDevCommRequirements, proxyQpsPerPeer) + sizeof(int);
+  const int proxyQpsPerPeer = (reqsHaveQps && reqs->proxyQpsPerPeer > 0)
+                                  ? reqs->proxyQpsPerPeer
+                                  : env::GetPositiveIntOr("MORI_CCO_PROXY_QPS_PER_PEER", 4);
+  const int64_t proxyQueues = int64_t{proxySpsc} + int64_t{proxyMpsc};  // may exceed INT_MAX
+  // GDA-Rail barriers are only usable with cross-node peers AND RDMA QPs.
+  const int nNodes = comm->worldSize / comm->lsaSize;
+  const bool gdaRailUsable = (connType != CCO_GDA_CONNECTION_NONE) && (nNodes > 1) && !proxyOnly;
+  std::string proxyError;
+#ifdef MORI_CCO_PROXY
+  {
+    // Collective in every proxy build, whatever this rank requested, so ranks
+    // that disagree all fail here instead of some waiting in the engine's QP
+    // exchange.
+    struct ProxyReq {
+      int32_t spsc, mpsc, threads, rdmaReady, disabled, qpsPerPeer, proxyOnly, gdaBarriers;
+    };
+    // GDA barriers signal through GDA QPs, which a proxy-only DevComm lacks.
+    const bool gdaBarriers = connType != CCO_GDA_CONNECTION_NONE && nNodes > 1 &&
+                             (reqs->railGdaBarrierCount > 0 || reqs->barrierCount > 0);
+    ProxyReq mine{proxySpsc,
+                  proxyMpsc,
+                  proxyThreads,
+                  connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled(),
+                  env::IsEnvVarEnabled("MORI_CCO_DISABLE_PROXY"),
+                  proxyQueues > 0 ? proxyQpsPerPeer : 0,  // no QPs, nothing to agree on
+                  proxyOnly,
+                  gdaBarriers};
+    std::vector<ProxyReq> all(comm->worldSize);
+    comm->bootNet->Allgather(&mine, all.data(), sizeof(ProxyReq));
+    for (int r = 0; r < comm->worldSize && proxyError.empty(); r++) {
+      if (all[r].spsc != all[0].spsc || all[r].mpsc != all[0].mpsc ||
+          all[r].threads != all[0].threads || all[r].qpsPerPeer != all[0].qpsPerPeer ||
+          all[r].proxyOnly != all[0].proxyOnly) {
+        auto describe = [](const ProxyReq& q) {
+          return std::to_string(q.spsc) + " SPSC + " + std::to_string(q.mpsc) + " MPSC queues, " +
+                 std::to_string(q.threads) + " threads and " + std::to_string(q.qpsPerPeer) +
+                 " QPs per peer" + (q.proxyOnly ? ", proxy-only" : "");
+        };
+        proxyError =
+            "ranks disagree on the ccoProxy requirements (proxyQpsPerPeer includes "
+            "MORI_CCO_PROXY_QPS_PER_PEER): rank 0 asks for " +
+            describe(all[0]) + ", rank " + std::to_string(r) + " for " + describe(all[r]);
+      } else if (proxyQueues > 0 && all[r].disabled) {
+        proxyError = "ccoProxy queues requested but MORI_CCO_DISABLE_PROXY is set on rank " +
+                     std::to_string(r);
+      } else if (proxyQueues > 0 && !all[r].rdmaReady) {
+        proxyError =
+            "ccoProxy queues need RDMA and a gdaConnectionType that resolves to non-NONE "
+            "on every rank (ccoProxy uses the GDA peer set and signal slots); rank " +
+            std::to_string(r) + " lacks one";
+      } else if (all[r].proxyOnly && all[r].gdaBarriers) {
+        proxyError = "a proxy-only DevComm has no GDA QPs for GDA barriers, but rank " +
+                     std::to_string(r) + " asks for railGdaBarrierCount / barrierCount";
+      }
+    }
+    if (proxyError.empty() && proxyOnly && proxyQueues == 0) {
+      proxyError = "proxyOnly needs proxy queues (proxySpscQueueCount / proxyMpscQueueCount)";
+    }
+    if (proxyError.empty() && proxyQueues > std::numeric_limits<int>::max()) {
+      proxyError = "proxySpscQueueCount + proxyMpscQueueCount exceeds INT_MAX";
+    }
+  }
+#else
+  if (proxyQueues > 0 || proxyOnly) {
+    proxyError =
+        "ccoProxy queues requested but mori was built without the ccoProxy host engine "
+        "(BUILD_CCO_PROXY=OFF, or no gfx942/gfx950 in GPU_TARGETS)";
+  }
+#endif
+  if (!proxyError.empty()) {
+    MORI_SHMEM_ERROR("ccoDevCommCreate: {}", proxyError);
+    return -1;
+  }
+
+  if (connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled() && !proxyOnly) {
     // Collective: every rank must call CreateAdditionalEndpoints together.
     auto newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe, peerMask);
     comm->ctx->ConnectAdditionalEndpoints(newEps, numQpPerPe, peerMask);
@@ -1783,10 +1873,6 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   // signal/shadows/counter pool, LSA barrier inbox+state). signalBufOffset is
   // pinned to 0 so a peer's RDMA atomic-add uses raddr = signal_slot_id * 8.
   // Allocated before the windowTable build below so findWindow() sees it.
-  // GDA-Rail barriers are only usable with cross-node peers AND RDMA QPs.
-  int nNodes = comm->worldSize / comm->lsaSize;
-  bool gdaRailUsable = (connType != CCO_GDA_CONNECTION_NONE) && (nNodes > 1);
-
   int signalCountUser = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaSignalCount;
   int counterCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaCounterCount;
   int lsaBarrierCount = reqs->lsaBarrierCount;
@@ -1897,98 +1983,37 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   hostShadow.resourceWindow = resourceWindow;
 
   // ccoProxy: proxy threads + host-posted QPs to the GDA peer set, sharing the
-  // GDA signal slots. The proxy fields sit at the tail of reqs; read them only
-  // when the caller's struct has them.
-  const bool reqsHaveProxy =
-      reqs->size >= offsetof(ccoDevCommRequirements, proxyQueueCapacity) + sizeof(int);
-  const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
-  const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
-  const int proxyThreads = reqsHaveProxy ? std::max(reqs->proxyThreadCount, 0) : 0;
-  // QPs per (proxy thread, peer): the field, else MORI_CCO_PROXY_QPS_PER_PEER, else 4.
-  const bool reqsHaveQps =
-      reqs->size >= offsetof(ccoDevCommRequirements, proxyQpsPerPeer) + sizeof(int);
-  const int proxyQpsPerPeer = (reqsHaveQps && reqs->proxyQpsPerPeer > 0)
-                                  ? reqs->proxyQpsPerPeer
-                                  : env::GetPositiveIntOr("MORI_CCO_PROXY_QPS_PER_PEER", 4);
-  const int64_t proxyQueues = int64_t{proxySpsc} + int64_t{proxyMpsc};  // may exceed INT_MAX
-  std::string proxyError;
+  // GDA signal slots (requirements agreed on above).
 #ifdef MORI_CCO_PROXY
-  {
-    // Collective in every proxy build, whatever this rank requested, so ranks
-    // that disagree all fail here instead of some waiting in the engine's QP
-    // exchange.
-    struct ProxyReq {
-      int32_t spsc, mpsc, threads, rdmaReady, disabled, qpsPerPeer;
-    };
-    ProxyReq mine{proxySpsc,
-                  proxyMpsc,
-                  proxyThreads,
-                  connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled(),
-                  env::IsEnvVarEnabled("MORI_CCO_DISABLE_PROXY"),
-                  proxyQueues > 0 ? proxyQpsPerPeer : 0};  // no QPs, nothing to agree on
-    std::vector<ProxyReq> all(comm->worldSize);
-    comm->bootNet->Allgather(&mine, all.data(), sizeof(ProxyReq));
-    for (int r = 0; r < comm->worldSize && proxyError.empty(); r++) {
-      if (all[r].spsc != all[0].spsc || all[r].mpsc != all[0].mpsc ||
-          all[r].threads != all[0].threads || all[r].qpsPerPeer != all[0].qpsPerPeer) {
-        auto describe = [](const ProxyReq& q) {
-          return std::to_string(q.spsc) + " SPSC + " + std::to_string(q.mpsc) + " MPSC queues, " +
-                 std::to_string(q.threads) + " threads and " + std::to_string(q.qpsPerPeer) +
-                 " QPs per peer";
-        };
-        proxyError =
-            "ranks disagree on the ccoProxy requirements (proxyQpsPerPeer includes "
-            "MORI_CCO_PROXY_QPS_PER_PEER): rank 0 asks for " +
-            describe(all[0]) + ", rank " + std::to_string(r) + " for " + describe(all[r]);
-      } else if (proxyQueues > 0 && all[r].disabled) {
-        proxyError = "ccoProxy queues requested but MORI_CCO_DISABLE_PROXY is set on rank " +
-                     std::to_string(r);
-      } else if (proxyQueues > 0 && !all[r].rdmaReady) {
-        proxyError =
-            "ccoProxy queues need RDMA and a gdaConnectionType that resolves to non-NONE "
-            "on every rank (ccoProxy uses the GDA peer set and signal slots); rank " +
-            std::to_string(r) + " lacks one";
-      }
-    }
-    if (proxyError.empty() && proxyQueues > std::numeric_limits<int>::max()) {
-      proxyError = "proxySpscQueueCount + proxyMpscQueueCount exceeds INT_MAX";
-    }
-    if (proxyError.empty() && proxyQueues > 0) {
-      ccoProxyEngineConfig proxyConfig;
-      proxyConfig.numSpscQueues = proxySpsc;
-      proxyConfig.numMpscQueues = proxyMpsc;
-      proxyConfig.numThreads = proxyThreads;
-      proxyConfig.queueCapacity =
-          reqs->proxyQueueCapacity > 0 ? static_cast<size_t>(reqs->proxyQueueCapacity) : 0;
-      proxyConfig.qpsPerPeer = proxyQpsPerPeer;
-      proxyConfig.peerMask = peerMask;
-      ccoProxyEngine* engine =
-          ccoProxyEngineCreate(comm->ctx, comm->bootNet, proxyConfig, &hostShadow.proxy);
-      if (engine == nullptr) {
-        proxyError = "ccoProxy engine creation failed";
-      } else {
-        std::lock_guard<std::mutex> lock(comm->allocMutex);
-        comm->proxyEngines.push_back(engine);
-      }
-      // SignalSet and a putValue flag rely on one QP's writes landing in
-      // order, which relaxed-ordering window MRs do not promise.
-      static std::once_flag relaxedWarned;
-      if (engine != nullptr && application::MaybeAddRelaxedOrderingFlag(0) != 0) {
-        std::call_once(relaxedWarned, [] {
-          std::fprintf(stderr,
-                       "[mori cco] WARNING: ccoProxy: MORI_IB_ENABLE_RELAXED_ORDERING=1 registers "
-                       "the windows with relaxed ordering, so a SignalSet / WindowSignalSet or a "
-                       "putValue used as a flag may land before the data it follows; signal "
-                       "with SignalInc / SignalAdd instead, or turn relaxed ordering off\n");
-        });
-      }
-    }
-  }
-#else
   if (proxyQueues > 0) {
-    proxyError =
-        "ccoProxy queues requested but mori was built without the ccoProxy host engine "
-        "(BUILD_CCO_PROXY=OFF, or no gfx942/gfx950 in GPU_TARGETS)";
+    ccoProxyEngineConfig proxyConfig;
+    proxyConfig.numSpscQueues = proxySpsc;
+    proxyConfig.numMpscQueues = proxyMpsc;
+    proxyConfig.numThreads = proxyThreads;
+    proxyConfig.queueCapacity =
+        reqs->proxyQueueCapacity > 0 ? static_cast<size_t>(reqs->proxyQueueCapacity) : 0;
+    proxyConfig.qpsPerPeer = proxyQpsPerPeer;
+    proxyConfig.peerMask = peerMask;
+    ccoProxyEngine* engine =
+        ccoProxyEngineCreate(comm->ctx, comm->bootNet, proxyConfig, &hostShadow.proxy);
+    if (engine == nullptr) {
+      proxyError = "ccoProxy engine creation failed";
+    } else {
+      std::lock_guard<std::mutex> lock(comm->allocMutex);
+      comm->proxyEngines.push_back(engine);
+    }
+    // SignalSet and a putValue flag rely on one QP's writes landing in
+    // order, which relaxed-ordering window MRs do not promise.
+    static std::once_flag relaxedWarned;
+    if (engine != nullptr && application::MaybeAddRelaxedOrderingFlag(0) != 0) {
+      std::call_once(relaxedWarned, [] {
+        std::fprintf(stderr,
+                     "[mori cco] WARNING: ccoProxy: MORI_IB_ENABLE_RELAXED_ORDERING=1 registers "
+                     "the windows with relaxed ordering, so a SignalSet / WindowSignalSet or a "
+                     "putValue used as a flag may land before the data it follows; signal "
+                     "with SignalInc / SignalAdd instead, or turn relaxed ordering off\n");
+      });
+    }
   }
 #endif
   if (!proxyError.empty()) {
