@@ -92,8 +92,9 @@
 //   selector_wave, ccoProxyQueuePerWave with ccoCoopWarp (2 blocks of 32x4) and
 //   selector_block ccoProxyQueuePerBlock with ccoCoopBlock (2x2 blocks): the
 //                  handle's queue is the unit's linear id; put + SignalSet
-//   only_set_put,  set_put and put_sig_warp on a proxy-only DevComm (no GDA
-//   only_put_sig   QPs: numQpPerPe 0, no endpoints)
+//   only_set_put,  set_put and put_sig_warp on a proxy-only DevComm
+//   only_put_sig   (ccoDevCommRequirements::proxyOnly) created for them, which
+//                  must have no GDA QPs (numQpPerPe 0, no endpoints)
 //   small_spsc,    on a second DevComm whose rings hold kSmallCapacity lines:
 //   small_mpsc     each unit sends its chunk as kPieces puts per peer (the
 //                  last carrying the signal), so every ring wraps many times
@@ -139,7 +140,8 @@
 //                  kThreadCapacity lines: rings wrap, SPSC lane-masked pushes
 //                  retry for credit, MPSC claims wait
 //
-// The atomic-free cases (value_set .. selector_block, only_set_put) run first.
+// The atomic-free cases (value_set .. selector_block, only_set_put) run first;
+// only_put_sig runs right after only_set_put.
 // MORI_CCO_PROXY_TEST_CASES=<list> runs only the listed positive cases, where
 // "atomic_free" stands for all of them: for NICs whose atomics into GPU memory
 // fail (the first atomic case would fail the shared DevComm and trap).
@@ -1102,7 +1104,6 @@ struct Ctx {
   ccoDevComm dcSmall;   // kSmallCapacity-line rings
   ccoDevComm dcThread;  // kThreadCapacity-line rings
   ccoDevComm dcQps;     // kQpsPerPeer QPs per (proxy thread, peer)
-  ccoDevComm dcOnly;    // proxy-only: no GDA QPs
   hipStream_t stream;
   int rank;
   int nranks;
@@ -1279,6 +1280,30 @@ static int RunAsyncCase(Ctx& c, const char* name, uint32_t salt, int nUnits, int
       c.dc, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf), kChunk, nUnits, c.dErr);
   c.Sync();
   return c.Verify(name, salt, kChunk, nUnits);
+}
+
+// only_*: on a proxy-only DevComm of their own, live for these cases only (its
+// proxy threads would otherwise poll through every other case).
+static int RunProxyOnlyCases(Ctx& c, const ccoDevCommRequirements& reqs) {
+  if (!CaseSelected("only_set_put") && !CaseSelected("only_put_sig")) return 0;
+  ccoDevCommRequirements onlyReqs = reqs;
+  onlyReqs.proxyOnly = 1;
+  ccoDevComm d{};
+  if (ccoDevCommCreate(c.comm, &onlyReqs, &d) != 0) {
+    fprintf(stderr, "[rank %d] proxy-only DevCommCreate failed\n", c.rank);
+    return c.Harvest("only_create", 1);
+  }
+  const bool noQps = d.ibgda.numQpPerPe == 0 && d.ibgda.endpoints == nullptr;
+  if (!noQps) {
+    fprintf(stderr, "[rank %d] proxy-only DevComm has GDA QPs (numQpPerPe %d)\n", c.rank,
+            d.ibgda.numQpPerPe);
+  }
+  int fails = c.Harvest("only_no_qps", !noQps);
+  fails += RunSetCase<SPSCD2HQueue, kSetSlot>(c, "only_set_put", 55, kSpscQueues, &d);
+  fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "only_put_sig", 56, kChunk,
+                                                             kSpscQueues, 64, &d);
+  if (ccoDevCommDestroy(c.comm, &d) != 0) fails += c.Harvest("only_destroy", 1);
+  return fails;
 }
 
 static int RunHandoffCase(Ctx& c) {
@@ -1504,22 +1529,14 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   threadReqs.proxyQueueCapacity = kThreadCapacity;
   ccoDevCommRequirements qpsReqs = reqs;
   qpsReqs.proxyQpsPerPeer = kQpsPerPeer;
-  ccoDevCommRequirements onlyReqs = reqs;
-  onlyReqs.proxyOnly = 1;
   if (ccoDevCommCreate(c.comm, &reqs, &c.dc) != 0 ||
       ccoDevCommCreate(c.comm, &smallReqs, &c.dcSmall) != 0 ||
       ccoDevCommCreate(c.comm, &threadReqs, &c.dcThread) != 0 ||
-      ccoDevCommCreate(c.comm, &qpsReqs, &c.dcQps) != 0 ||
-      ccoDevCommCreate(c.comm, &onlyReqs, &c.dcOnly) != 0) {
+      ccoDevCommCreate(c.comm, &qpsReqs, &c.dcQps) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate failed\n", rank);
     return 1;
   }
-  if (c.dcOnly.ibgda.numQpPerPe != 0 || c.dcOnly.ibgda.endpoints != nullptr) {
-    fprintf(stderr, "[rank %d] proxy-only DevComm has GDA QPs (numQpPerPe=%d)\n", rank,
-            c.dcOnly.ibgda.numQpPerPe);
-    return 1;
-  }
-  for (const ccoDevComm* d : {&c.dc, &c.dcSmall, &c.dcThread, &c.dcQps, &c.dcOnly}) {
+  for (const ccoDevComm* d : {&c.dc, &c.dcSmall, &c.dcThread, &c.dcQps}) {
     if (d->gdaConnType == CCO_GDA_CONNECTION_NONE || d->proxy.numSpscQueues != kSpscQueues ||
         d->proxy.numMpscQueues != kMpscQueues) {
       fprintf(stderr, "[rank %d] proxy queues missing (gdaConnType=%d spsc=%d mpsc=%d)\n", rank,
@@ -1546,7 +1563,6 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunSetCase<SPSCD2HQueue, kSetSignal>(c, "set_signal", 35, kSpscQueues);
   fails += RunSetCase<SPSCD2HQueue, kSetWindow>(c, "set_window", 36, kSpscQueues);
   fails += RunSetCase<MPSCD2HQueue, kSetSlot>(c, "mpsc_set_put", 37, kMaxUnits);
-  fails += RunSetCase<SPSCD2HQueue, kSetSlot>(c, "only_set_put", 55, kSpscQueues, &c.dcOnly);
   fails += RunAsyncCase<SPSCD2HQueue, ccoCoopWarp, kAsyncReverse>(c, "async_reverse", 48,
                                                                   kSpscQueues, 64);
   fails += RunAsyncCase<SPSCD2HQueue, ccoCoopBlock, kAsyncReverse>(c, "block_async", 49,
@@ -1560,10 +1576,9 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   // 2 blocks of 2 wavefronts (32x4), and 2x2 blocks: kSpscQueues units each.
   fails += RunSelectorCase<ccoCoopWarp, true>(c, "selector_wave", 53, dim3(1, 2), dim3(32, 4));
   fails += RunSelectorCase<ccoCoopBlock, false>(c, "selector_block", 54, dim3(2, 2), dim3(256));
+  fails += RunProxyOnlyCases(c, reqs);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "put_sig_warp", 1, kChunk,
                                                              kSpscQueues, 64);
-  fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "only_put_sig", 56, kChunk,
-                                                             kSpscQueues, 64, &c.dcOnly);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutThenSignal>(c, "put_then_sig", 2, kChunk,
                                                                   kSpscQueues, 256);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutWindowSignal>(c, "win_signal", 3, kChunk,
@@ -1660,7 +1675,6 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
 
   HIP_CHECK(hipStreamDestroy(c.stream));
   HIP_CHECK(hipFree(c.dErr));
-  ccoDevCommDestroy(c.comm, &c.dcOnly);
   ccoDevCommDestroy(c.comm, &c.dcQps);
   ccoDevCommDestroy(c.comm, &c.dcThread);
   ccoDevCommDestroy(c.comm, &c.dcSmall);
