@@ -146,6 +146,9 @@
 //       return 0 (a later ticket's FLUSH can cover it first)
 //   n4  MORI_CCO_PROXY_TEST_FAIL_CONNECT=1: ccoDevCommCreate fails on every
 //       rank, and the comm still works afterwards
+//   n5  MORI_CCO_PROXY_QPS_PER_PEER differs between ranks (1 on rank 0, 2
+//       elsewhere): ccoDevCommCreate fails on every rank, and the comm still
+//       works afterwards
 //
 // Launch: `mpirun -np N test_proxy_put` (one rank per MPI process, any number
 // of nodes; built with MORI_WITH_MPI when WITH_MPI=ON), or `test_proxy_put [N]`
@@ -1245,6 +1248,27 @@ static int RunFailConnectCase(Ctx& c, const ccoDevCommRequirements& reqs) {
   return c.Harvest("n4_fail_connect", rc == 0);  // its barrier checks the comm still works
 }
 
+// n5: ranks disagree on QPs per peer through the env (the field is 0).
+static int RunQpsMismatchCase(Ctx& c, const ccoDevCommRequirements& reqs) {
+  const char* prev = getenv("MORI_CCO_PROXY_QPS_PER_PEER");
+  const std::string saved = prev ? prev : "";
+  setenv("MORI_CCO_PROXY_QPS_PER_PEER", c.rank == 0 ? "1" : "2", 1);
+  ccoDevCommRequirements r = reqs;
+  r.proxyQpsPerPeer = 0;
+  ccoDevComm d{};
+  const int rc = ccoDevCommCreate(c.comm, &r, &d);
+  if (prev) {
+    setenv("MORI_CCO_PROXY_QPS_PER_PEER", saved.c_str(), 1);
+  } else {
+    unsetenv("MORI_CCO_PROXY_QPS_PER_PEER");
+  }
+  if (rc == 0) {
+    fprintf(stderr, "[rank %d] n5_qps_mismatch: DevCommCreate succeeded\n", c.rank);
+    ccoDevCommDestroy(c.comm, &d);
+  }
+  return c.Harvest("n5_qps_mismatch", rc == 0);  // its barrier checks the comm still works
+}
+
 // MORI_CCO_PROXY_TEST_NEGATIVE: "all" or a comma-separated list of case names.
 static bool NegativeSelected(const char* name) {
   const char* env = getenv("MORI_CCO_PROXY_TEST_NEGATIVE");
@@ -1424,6 +1448,10 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   if (NegativeSelected("n4")) {
     anyNegative = true;
     fails += RunFailConnectCase(c, reqs);
+  }
+  if (NegativeSelected("n5")) {
+    anyNegative = true;
+    fails += RunQpsMismatchCase(c, reqs);
   }
   if (anyNegative) {
     fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "put_sig_after", 26, kChunk,
