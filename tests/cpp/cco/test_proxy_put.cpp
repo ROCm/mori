@@ -24,8 +24,10 @@
 // test: ccoProxy (host-proxy RDMA over the KIWI queue) put / signal / flush.
 //
 // FULL connectivity; kSpscQueues SPSC + kMpscQueues MPSC proxy queues polled by
-// kProxyThreads proxy threads. Block u of a put kernel is a "unit": it uses
-// queue u (MPSC: modulo the pool size) and sends a distinct chunk to every peer:
+// kProxyThreads proxy threads, each thread's 3 queues sharing one QP per peer
+// (proxyQpsPerPeer = 1) except in the qps_* cases. Block u of a put kernel is a
+// "unit": it uses queue u (MPSC: modulo the pool size) and sends a distinct
+// chunk to every peer:
 //   recv[(src * nUnits + u) * chunk + i] = Pattern(salt, src, dst, u, i)
 // Signal slot (src * kMaxUnits + u) on the receiver counts that chunk's arrival
 // (put-carried or a trailing signal on the same queue, hence after the data).
@@ -106,8 +108,9 @@
 //                  and producers wait for ring space (SPSC: 1 producer per
 //                  queue; MPSC: 4)
 //   qps_put_sig,   put_sig_warp, flush_reuse and mpsc_flush on a DevComm with
-//   qps_flush,     proxyQpsPerPeer = kQpsPerPeer: each proxy thread owns 3
-//   qps_mpsc_flush queues (2 SPSC + 1 MPSC), each bound to its own QP per peer
+//   qps_flush,     proxyQpsPerPeer = kQpsPerPeer (3, as the default 4 resolves
+//   qps_mpsc_flush to): each of a proxy thread's 3 queues (2 SPSC + 1 MPSC) on
+//                  its own QP per peer
 //   put_value,     putValue of 1, 2, 4 and 8 bytes to every peer, the second
 //   mpsc_put_value half carrying SignalInc; the receiver checks each value,
 //                  that the bytes past it are untouched and that the signal
@@ -209,7 +212,7 @@ static constexpr int kSmallCapacity = 16;  // ring lines: a put + signal takes 2
 static constexpr int kPieces = 64;         // puts per chunk in the small-ring cases
 static constexpr int kSqRepeats = 2048;    // puts per peer in sq_full (SQ depth: 512)
 static constexpr int kFencePieces = 4;     // puts per chunk in the caller-fenced cases
-static constexpr int kQpsPerPeer = 3;      // per (proxy thread, peer): one per queue of a thread
+static constexpr int kQpsPerPeer = 3;      // dcQps, per (thread, peer): one per queue of a thread
 static constexpr uint32_t kClobber = 0xdeadbeefu;
 
 enum PutMode {
@@ -1185,7 +1188,7 @@ static bool CaseSelected(const char* name) {
 
 struct Ctx {
   ccoComm* comm;
-  ccoDevComm dc;        // default rings
+  ccoDevComm dc;        // default rings, 1 QP per (proxy thread, peer)
   ccoDevComm dcSmall;   // kSmallCapacity-line rings
   ccoDevComm dcThread;  // kThreadCapacity-line rings
   ccoDevComm dcQps;     // kQpsPerPeer QPs per (proxy thread, peer)
@@ -1647,6 +1650,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   reqs.proxySpscQueueCount = kSpscQueues;
   reqs.proxyMpscQueueCount = kMpscQueues;
   reqs.proxyThreadCount = kProxyThreads;
+  reqs.proxyQpsPerPeer = 1;  // a thread's queues share a QP; dcQps covers one each
   ccoDevCommRequirements smallReqs = reqs;
   smallReqs.proxyQueueCapacity = kSmallCapacity;
   ccoDevCommRequirements threadReqs = reqs;
