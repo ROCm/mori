@@ -91,6 +91,8 @@ config_t make_config(const ep_op_config_t& in) {
         "using the generic launch defaults",
         cfg.gpu_arch, cfg.device_name, cfg.nic_family);
   }
+  cfg.provisioned_defaults = provisioned_runtime_defaults(
+      cfg.max_num_inp_token_per_rank, cfg.world_size, cfg.gpu_arch, cfg.nic_family);
   cfg.dispatch_elem_size = in.dispatch_elem_size;
   cfg.combine_elem_size = in.combine_elem_size;
   cfg.dispatch_quant_format = parse_quant_format(in.dispatch_quant_format);

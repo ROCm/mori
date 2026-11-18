@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -127,6 +128,25 @@ inline runtime_defaults_t recommended_runtime_defaults(int num_tokens, int world
 inline int recommended_num_blocks(int num_tokens, int world_size, std::string_view gpu_arch = {},
                                   std::string_view nic_family = {}) {
   return recommended_runtime_defaults(num_tokens, world_size, gpu_arch, nic_family).num_blocks;
+}
+
+// What a context must provision to launch any token count in
+// [1, max_num_tokens]: the largest recommended num_blocks, and HYBRID if any
+// count selects it. Scans every count, so it holds for tables that are not
+// monotonic. Returns {0, RDMA_ONLY} for a non-positive max_num_tokens.
+inline runtime_defaults_t provisioned_runtime_defaults(int max_num_tokens, int world_size,
+                                                       std::string_view gpu_arch = {},
+                                                       std::string_view nic_family = {}) {
+  runtime_defaults_t provisioned{0, rcomp_backend_t::RDMA_ONLY};
+  for (int num_tokens = 1; num_tokens <= max_num_tokens; ++num_tokens) {
+    const runtime_defaults_t policy =
+        recommended_runtime_defaults(num_tokens, world_size, gpu_arch, nic_family);
+    provisioned.num_blocks = std::max(provisioned.num_blocks, policy.num_blocks);
+    if (policy.rcomp_backend == rcomp_backend_t::HYBRID) {
+      provisioned.rcomp_backend = rcomp_backend_t::HYBRID;
+    }
+  }
+  return provisioned;
 }
 
 // gcnArchName of the current HIP device without feature suffixes, e.g.

@@ -193,6 +193,10 @@ struct config_t {
   // generic rule.
   std::string gpu_arch;
   std::string nic_family;
+  // Automatic-mode provisioning over every token count up to
+  // max_num_inp_token_per_rank; make_config sets it with
+  // provisioned_runtime_defaults().
+  runtime_defaults_t provisioned_defaults{0, rcomp_backend_t::RDMA_ONLY};
   int dispatch_elem_size = 4;  // bytes per dispatch hidden element
   int combine_elem_size = 4;   // bytes per combine hidden element
   quant_format_t dispatch_quant_format = quant_format_t::NONE;
@@ -214,15 +218,12 @@ struct config_t {
     return max_auto_num_blocks > 0 && recommended > max_auto_num_blocks ? max_auto_num_blocks
                                                                         : recommended;
   }
-  // Number of blocks provisioned at construction. Automatic mode derives
-  // this directly from the configured maximum input capacity, which is
-  // enough because recommended num_blocks never decreases with token count;
-  // explicit mode keeps its fixed launch count.
+  // Number of blocks provisioned at construction. Automatic mode uses the
+  // largest count any launch up to the input capacity can select; explicit
+  // mode keeps its fixed launch count.
   int provisioned_num_blocks() const {
-    return uses_automatic_num_blocks()
-               ? capped_auto_num_blocks(recommended_num_blocks(max_num_inp_token_per_rank,
-                                                               world_size, gpu_arch, nic_family))
-               : num_blocks;
+    return uses_automatic_num_blocks() ? capped_auto_num_blocks(provisioned_defaults.num_blocks)
+                                       : num_blocks;
   }
   // Number of invoke SPSC queues: one per producer wavefront. Derived
   // from provisioned_num_blocks(), never tuned directly.
@@ -245,15 +246,12 @@ struct config_t {
   }
   // Automatic payload routing can select either backend across token
   // buckets. Provision HIP-IPC payload resources whenever any bucket up to
-  // capacity selects hybrid, which the capacity bucket does if any does;
-  // explicit backend selection remains fixed.
+  // capacity selects hybrid; explicit backend selection remains fixed.
   bool rcomp_ipc_resources_required() const {
     if (rcomp_backend != rcomp_backend_t::AUTO) {
       return rcomp_backend == rcomp_backend_t::HYBRID;
     }
-    return recommended_runtime_defaults(max_num_inp_token_per_rank, world_size, gpu_arch,
-                                        nic_family)
-               .rcomp_backend == rcomp_backend_t::HYBRID;
+    return provisioned_defaults.rcomp_backend == rcomp_backend_t::HYBRID;
   }
 
   // Derived capacities from MORI's max_num_inp_token_per_rank.  This value
