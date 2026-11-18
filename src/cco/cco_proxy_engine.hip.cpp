@@ -524,7 +524,7 @@ class ccoProxyEngine {
   std::vector<std::unique_ptr<ProxyWorker>> workers;
   void* scratch{nullptr};
   uint64_t* flushDone{nullptr};    // fine-grained device [numSpsc + numMpsc]
-  uint64_t* flushTicket{nullptr};  // device [numMpsc]
+  uint64_t* flushTicket{nullptr};  // device [numSpsc + numMpsc]
   std::atomic<bool> stop{false};
 };
 
@@ -625,18 +625,16 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     }
 
     // flushDone: fine-grained device memory (the GPU polls it locally, the
-    // proxy writes it over PCIe). MPSC flush tickets: plain device memory, only
+    // proxy writes it over PCIe). Flush tickets: plain device memory, only
     // touched by GPU atomics.
     HipOrThrow(hipExtMallocWithFlags(reinterpret_cast<void**>(&engine->flushDone),
                                      sizeof(uint64_t) * numQueues, hipDeviceMallocFinegrained),
                "hipExtMallocWithFlags");
     HipOrThrow(hipMemset(engine->flushDone, 0, sizeof(uint64_t) * numQueues), "hipMemset");
-    if (numMpsc > 0) {
-      HipOrThrow(
-          hipMalloc(reinterpret_cast<void**>(&engine->flushTicket), sizeof(uint64_t) * numMpsc),
-          "hipMalloc");
-      HipOrThrow(hipMemset(engine->flushTicket, 0, sizeof(uint64_t) * numMpsc), "hipMemset");
-    }
+    HipOrThrow(
+        hipMalloc(reinterpret_cast<void**>(&engine->flushTicket), sizeof(uint64_t) * numQueues),
+        "hipMalloc");
+    HipOrThrow(hipMemset(engine->flushTicket, 0, sizeof(uint64_t) * numQueues), "hipMemset");
     HipOrThrow(hipDeviceSynchronize(), "hipDeviceSynchronize");
 
     // One invoke context per pool. Queues: SPSC pool [0, numSpsc), MPSC pool

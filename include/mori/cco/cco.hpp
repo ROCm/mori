@@ -394,8 +394,9 @@ struct ccoProxyContext {
   // proxy has satisfied per queue. Fine-grained device memory, written only by
   // the proxy, never decreases.
   uint64_t* flushDone;
-  // [numMpscQueues] flush tickets taken per MPSC queue. Device memory, written
-  // only by kernels (atomic fetch-add), never decreases.
+  // [numSpscQueues + numMpscQueues] (indexed like flushDone) flush tickets taken
+  // per queue. Device memory, written only by kernels (atomic fetch-add), never
+  // decreases.
   uint64_t* flushTicket;
   // Largest single RDMA write: ccoProxyMaxPutBytes capped at the smallest
   // max_msg_sz of any rank's port. put() splits larger transfers.

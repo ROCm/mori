@@ -72,12 +72,9 @@
 //
 // Flush counting: the proxy satisfies each queue's FLUSHes in queue order and
 // adds 1 to that queue's flushDone per FLUSH satisfied (it is the only writer).
-// A flush never needs its FLUSH's ring position:
-//   SPSC: the calling wavefront owns the queue and every earlier FLUSH on it has
-//     been waited for, so v = flushDone before the push is exact and our FLUSH
-//     is satisfied once flushDone >= v + 1.
-//   MPSC: the caller takes a ticket t from the queue's flushTicket counter right
-//     before pushing, and waits for flushDone >= t (see flush()).
+// A flush never needs its FLUSH's ring position: the caller takes a ticket t
+// from the queue's flushTicket counter right before pushing, and waits for
+// flushDone >= t (see flush()). An earlier FLUSH need not have been waited for.
 //
 // Calling convention: put / signal / flush are called by the whole Coop group
 // from converged code, and the issuing wavefront (the calling wavefront for
@@ -238,7 +235,7 @@ struct ccoProxy {
   uint64_t maxPutBytes;   // largest RDMA write one descriptor carries
   DeviceContext* ctx;     // this pool's invoke context
   uint64_t* flushDone;    // this queue's satisfied-FLUSH count (fine-grained device memory)
-  uint64_t* flushTicket;  // MPSC: this queue's flush ticket counter (device memory)
+  uint64_t* flushTicket;  // this queue's flush ticket counter (device memory)
   bool dirty;             // SPSC: pushed since the handle was loaded / saved
   typename DeviceContext::DeviceHandle handle;
 
@@ -500,9 +497,10 @@ __device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIn
   }
   ctx = static_cast<DeviceContext*>(kSpsc ? comm.proxy.spscContext : comm.proxy.mpscContext);
   handle = ctx->get_device_handle(queueId);
-  // flushDone: SPSC pool, then MPSC pool.
-  flushDone = comm.proxy.flushDone + (kSpsc ? 0 : comm.proxy.numSpscQueues) + queueId;
-  if constexpr (!kSpsc) flushTicket = comm.proxy.flushTicket + queueId;
+  // flushDone and flushTicket: SPSC pool, then MPSC pool.
+  const int pool = kSpsc ? 0 : comm.proxy.numSpscQueues;
+  flushDone = comm.proxy.flushDone + pool + queueId;
+  flushTicket = comm.proxy.flushTicket + pool + queueId;
 }
 
 template <typename Queue>
@@ -580,9 +578,11 @@ __device__ inline void ccoProxy<Queue>::flush(Coop coop) {
     uint64_t target = 0;
     if (__lane_id() == 0) {
       if constexpr (kSpsc) {
-        // Acquire: the load completes before the FLUSH push below, so it cannot
-        // already count our own FLUSH.
-        target = __hip_atomic_load(flushDone, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) + 1;
+        // Tickets follow FLUSH order in the ring: one producer at a time, and a
+        // handoff's release/acquire orders the old owner's tickets first.
+        target = __hip_atomic_fetch_add(flushTicket, uint64_t{1}, __ATOMIC_RELAXED,
+                                        __HIP_MEMORY_SCOPE_AGENT) +
+                 1;
       } else {
         // Ticket t: we wait for flushDone >= t, i.e. for the first t FLUSHes of
         // this queue (in queue order) to be satisfied. Those t FLUSHes hold t
