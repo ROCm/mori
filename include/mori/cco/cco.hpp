@@ -377,8 +377,8 @@ struct ccoSdmaContext {
 // ccoProxy context (host-proxy RDMA; see cco_proxy.hpp). Kernels invoke host
 // callbacks (KIWI invoke) with descriptors, keys already resolved (the same
 // iova=0 window addressing as GDA). A fixed set of host proxy threads polls the
-// queues and posts the RDMA work requests on host-created RC QPs, one
-// per (proxy thread, peer). Two queue pools: SPSC (one wavefront at a time per
+// queues and posts the RDMA work requests on host-created RC QPs,
+// proxyQpsPerPeer per (proxy thread, peer). Two queue pools: SPSC (one wavefront at a time per
 // queue) and MPSC. Empty when both pools are empty.
 //
 // Each pool is one KIWI invoke context; its device context is opaque here so
@@ -532,7 +532,7 @@ struct ccoDevCommRequirements {
   // MPSC queue pools (ccoProxy<SPSCD2HQueue> / ccoProxy<MPSCD2HQueue> index their
   // own pool), polled by proxyThreadCount host threads. Uses the GDA peer set and
   // signal slots, so gdaConnectionType must resolve to non-NONE. Every rank must
-  // pass the same queue and thread counts (checked; creation fails otherwise),
+  // pass the same queue, thread and QP counts (checked; creation fails otherwise),
   // and the GPU's VRAM must be host-mapped (large BAR). Each DevComm with proxy
   // queues starts its own busy-polling threads, pinned by the same policy
   // (MORI_CCO_PROXY_CPUS or the GPU-local cores), so several such DevComms
@@ -544,6 +544,12 @@ struct ccoDevCommRequirements {
                             // ccoProxy lane-masked ops (ccoCoopLaneMasked) need up to 2
                             // lines per active lane (128 for a full wavefront of
                             // put+signal); smaller rings trap.
+  // RC QPs per (proxy thread, peer); 0 = MORI_CCO_PROXY_QPS_PER_PEER, else 1.
+  // Each queue posts on one of its thread's QPs per peer (round robin over the
+  // thread's queues), so at most the thread's queue count is used. NICs that
+  // process each QP serially (e.g. ionic, ~1-2 Mpps per QP for small writes)
+  // want several. Same on every rank.
+  int proxyQpsPerPeer;
 };
 
 #define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                   \
@@ -566,6 +572,7 @@ struct ccoDevCommRequirements {
       0,                                         /* proxyMpscQueueCount*/       \
       0,                                         /* proxyThreadCount   */       \
       0,                                         /* proxyQueueCapacity */       \
+      0,                                         /* proxyQpsPerPeer    */       \
   }
 
 /* ════════════════════════════════════════════════════════════════════════════

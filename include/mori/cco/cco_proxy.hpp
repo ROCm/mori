@@ -26,8 +26,8 @@
 // Kernels invoke host callbacks through KIWI invoke (the GPU->CPU callback
 // layer on the KIWI device-to-host queues): each op is one fixed-size
 // descriptor; host proxy threads run the callbacks, which post ibverbs work
-// requests on host-created RC QPs, one per (proxy thread, peer), on the PD that
-// owns the cco window MRs. Keys and remote addresses are resolved on the GPU
+// requests on host-created RC QPs, proxyQpsPerPeer per (proxy thread, peer),
+// on the PD that owns the cco window MRs. Keys and remote addresses are resolved on the GPU
 // exactly like ccoGda (iova=0: raddr = window offset), so the proxy needs no key
 // tables.
 //

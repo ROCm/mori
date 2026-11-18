@@ -97,6 +97,8 @@ void PrintUsage(const char* program) {
                "                 latency = round trip / 2 (ibgda, proxy)\n"
                "  -S             latency: signal-only ping-pong (ibgda, proxy)\n"
                "  -Q threads     proxy: host proxy threads (default 4)\n"
+               "  -K qps         proxy: RC QPs per (proxy thread, peer) (default:\n"
+               "                 MORI_CCO_PROXY_QPS_PER_PEER, else 1)\n"
                "  -q kind        proxy, put_bw: spsc (default; one queue per block, or\n"
                "                 per wavefront with -s warp|thread) | mpsc (one queue per\n"
                "                 block)\n"
@@ -135,7 +137,7 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   };
 
   int opt = 0;
-  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:PSQ:q:F:")) != -1) {
+  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:PSQ:q:F:K:")) != -1) {
     switch (opt) {
       case 'h':
         return 2;
@@ -154,6 +156,10 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
         break;
       case 'Q':
         out_args->proxy_threads = std::atoi(optarg);
+        break;
+      case 'K':
+        out_args->proxy_qps_per_peer = std::atoi(optarg);
+        if (out_args->proxy_qps_per_peer < 1) return 1;
         break;
       case 'F':
         if (std::strcmp(optarg, "0") == 0) {
@@ -513,6 +519,7 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
             ProxyUnitsPerBlock(args.put_scope, args.threads_per_block, ctx->device_warp_size);
       }
       reqs.proxyThreadCount = args.proxy_threads;
+      reqs.proxyQpsPerPeer = args.proxy_qps_per_peer;
     }
   }
 
@@ -576,9 +583,10 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     } else if (args.transport == Transport::kProxy) {
       std::printf(
           "[cco-bench] transport = PROXY (RDMA via ccoProxy: %d %s KIWI queues, %d host proxy "
-          "threads; fence %s; gdaConnType=%d)\n",
+          "threads; QPs per peer %s; fence %s; gdaConnType=%d)\n",
           ctx->devComm.proxy.numSpscQueues + ctx->devComm.proxy.numMpscQueues,
           args.proxy_mpsc ? "MPSC" : "SPSC", args.proxy_threads,
+          args.proxy_qps_per_peer > 0 ? std::to_string(args.proxy_qps_per_peer).c_str() : "default",
           args.proxy_caller_fence ? "caller" : "each op",
           static_cast<int>(ctx->devComm.gdaConnType));
     } else {

@@ -114,6 +114,7 @@ cdef class DevCommRequirements:
         self._reqs.proxyMpscQueueCount = 0
         self._reqs.proxyThreadCount = 0
         self._reqs.proxyQueueCapacity = 0
+        self._reqs.proxyQpsPerPeer = 0
 
     @property
     def gda_connection_type(self):
@@ -226,6 +227,14 @@ cdef class DevCommRequirements:
     @proxy_queue_capacity.setter
     def proxy_queue_capacity(self, int val):
         self._reqs.proxyQueueCapacity = val
+
+    @property
+    def proxy_qps_per_peer(self):
+        return self._reqs.proxyQpsPerPeer
+
+    @proxy_qps_per_peer.setter
+    def proxy_qps_per_peer(self, int val):
+        self._reqs.proxyQpsPerPeer = val
 
 
 ###############################################################################

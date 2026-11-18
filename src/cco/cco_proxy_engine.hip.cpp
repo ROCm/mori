@@ -24,8 +24,10 @@
 // cco_proxy_engine.hip.cpp — host proxy engine behind ccoProxy.
 //
 // A fixed set of proxy threads. Each owns a subset of the KIWI device-to-host
-// queues (SPSC and MPSC; it is their only consumer) and one host-posted RC QP,
-// with its own CQ, per peer. Each queue pool is one KIWI invoke context: a
+// queues (SPSC and MPSC; it is their only consumer) and qpsPerPeer host-posted
+// RC QPs, each with its own CQ, per peer. Each owned queue is bound to one QP
+// slot (round robin over the thread's queues), so a queue's ops to one peer
+// share a QP and stay in order. Each queue pool is one KIWI invoke context: a
 // thread drains its queues with Context::progress(), which runs one registered
 // callback (ProxyWorker::On*) per descriptor on that thread. The QPs live on
 // the PD of the comm's RDMA device context, which owns the cco window MRs, so
@@ -36,8 +38,9 @@
 // (completedSeq). Every WR is signaled (v1). SQ credit is postedSeq -
 // completedSeq.
 //
-// Flush: each queue tracks, per peer, the sequence of the last WR it produced.
-// A popped FLUSH first posts every pending WR, then becomes a pending flush
+// Flush: each queue tracks, per peer, the sequence of the last WR it produced
+// (on its QP to that peer).
+// A popped FLUSH first posts its QPs' pending WRs, then becomes a pending flush
 // that waits for this queue's last WR on every peer that still has work
 // outstanding. Pending flushes retire in FIFO order (a later FLUSH never waits
 // for less than an earlier one), and each retired FLUSH adds 1 to
@@ -317,15 +320,16 @@ class HostQueueImpl final : public HostQueue {
 };
 
 struct PendingFlush {
-  std::vector<std::pair<int, uint64_t>> waits;  // (peer, WR seq) that must complete
+  std::vector<std::pair<int, uint64_t>> waits;  // (index in qps, WR seq) that must complete
 };
 
 struct OwnedQueue {
   std::unique_ptr<HostQueue> queue;
   int index{0};                           // in flushDone (SPSC pool, then MPSC pool)
+  int qpSlot{0};                          // which of its thread's QPs per peer it posts on
   volatile uint64_t* flushDone{nullptr};  // fine-grained device memory, host-written
   uint64_t flushed{0};                    // FLUSHes retired (*flushDone without the failed bit)
-  std::vector<uint64_t> lastSeq;          // [worldSize] seq of the last WR this queue produced
+  std::vector<uint64_t> lastSeq;          // [worldSize] seq of the last WR on its QP to the peer
   std::deque<PendingFlush> pending;
   bool broken{false};  // corrupted ring: never read again
 };
@@ -355,17 +359,36 @@ struct ProxyQp {
 
 class ProxyWorker {
  public:
-  ProxyWorker(int id, int worldSize, int rank, ProxyErrorState* err, bool abortOnError)
-      : qps(worldSize), id_(id), rank_(rank), err_(err), abortOnError_(abortOnError) {}
+  ProxyWorker(int id, int worldSize, int qpsPerPeer, int rank, ProxyErrorState* err,
+              bool abortOnError)
+      : qps(static_cast<size_t>(worldSize) * qpsPerPeer),
+        worldSize_(worldSize),
+        qpsPerPeer_(qpsPerPeer),
+        id_(id),
+        rank_(rank),
+        err_(err),
+        abortOnError_(abortOnError) {}
+
+  // QP `slot` of this thread to `peer`.
+  ProxyQp& Qp(int peer, int slot) { return qps[static_cast<size_t>(peer) * qpsPerPeer_ + slot]; }
+
+  // Binds the next owned queue to a QP slot, round robin.
+  void AddQueue(OwnedQueue* oq) {
+    oq->qpSlot = static_cast<int>(queues.size() % qpsPerPeer_);
+    queues.push_back(oq);
+  }
 
   void Start(int cpu, const std::atomic<bool>* stop) {
-    for (int peer = 0; peer < static_cast<int>(qps.size()); peer++) {
-      if (qps[peer].active) {
-        activePeers_.push_back(peer);
-        qps[peer].peer = peer;
-        qps[peer].wrs.reserve(kSqDepth);
-        qps[peer].sges.reserve(kSqDepth);
-        qps[peer].shadow.resize(kSqDepth);
+    for (int peer = 0; peer < worldSize_; peer++) {
+      if (!Qp(peer, 0).active) continue;
+      activePeers_.push_back(peer);
+      for (int slot = 0; slot < qpsPerPeer_; slot++) {
+        ProxyQp& qp = Qp(peer, slot);
+        activeQps_.push_back(static_cast<int>(&qp - qps.data()));
+        qp.peer = peer;
+        qp.wrs.reserve(kSqDepth);
+        qp.sges.reserve(kSqDepth);
+        qp.shadow.resize(kSqDepth);
       }
     }
     thread_ = std::thread([this, cpu, stop] {
@@ -400,8 +423,8 @@ class ProxyWorker {
     if (flushId != ccoProxyOpFlush) throw std::runtime_error("ccoProxy callback id mismatch");
   }
 
-  std::vector<ProxyQp> qps;         // [worldSize]; active for masked peers
-  std::vector<OwnedQueue*> queues;  // queues this thread consumes
+  std::vector<ProxyQp> qps;  // [worldSize * qpsPerPeer] by (peer, slot); active for masked peers
+  std::vector<OwnedQueue*> queues;  // queues this thread consumes (AddQueue)
   uint64_t scratchAddr{0};          // 8-byte host slot for atomic fetch results (discarded)
   uint32_t scratchLkey{0};
 
@@ -429,8 +452,8 @@ class ProxyWorker {
       bool flushPending = false;
       if (!failed_) {
         bool completed = false;
-        for (int peer : activePeers_) {
-          ProxyQp& qp = qps[peer];
+        for (int i : activeQps_) {
+          ProxyQp& qp = qps[i];
           PostChain(qp);
           if (!failed_ && qp.completedSeq < qp.postedSeq) {
             completed = PollCq(qp) || completed;
@@ -513,9 +536,9 @@ class ProxyWorker {
     if (failed_) return;
     for (OwnedQueue* oq : queues) RetireFlushes(*oq);  // satisfied FLUSHes still succeed
     failed_ = true;
-    for (int peer : activePeers_) {
-      qps[peer].wrs.clear();
-      qps[peer].sges.clear();
+    for (int i : activeQps_) {
+      qps[i].wrs.clear();
+      qps[i].sges.clear();
     }
     for (OwnedQueue* oq : queues) oq->pending.clear();
     Poison();
@@ -530,9 +553,13 @@ class ProxyWorker {
     _mm_sfence();  // drain the write-combining buffer toward the device
   }
 
-  // Null, after raising BAD_REQUEST, if the peer has no proxy QP.
+  // The current queue's QP to `peer`. Null, after raising BAD_REQUEST, if the
+  // peer has no proxy QP.
   ProxyQp* PeerQp(uint32_t peer, ccoProxyOp op) {
-    if (peer < qps.size() && qps[peer].active) return &qps[peer];
+    if (peer < static_cast<uint32_t>(worldSize_)) {
+      ProxyQp& qp = Qp(static_cast<int>(peer), cur_->qpSlot);
+      if (qp.active) return &qp;
+    }
     const int p =
         peer > static_cast<uint32_t>(std::numeric_limits<int>::max()) ? -1 : static_cast<int>(peer);
     Raise(MakeError(CCO_PROXY_ERR_BAD_REQUEST, p, cur_->index, op),
@@ -585,9 +612,12 @@ class ProxyWorker {
     // queue's last WR on every peer that still has one outstanding.
     PendingFlush f;
     for (int p : activePeers_) {
-      PostChain(qps[p]);
+      ProxyQp& qp = Qp(p, oq.qpSlot);
+      PostChain(qp);
       if (failed_) return;
-      if (oq.lastSeq[p] > qps[p].completedSeq) f.waits.emplace_back(p, oq.lastSeq[p]);
+      if (oq.lastSeq[p] > qp.completedSeq) {
+        f.waits.emplace_back(static_cast<int>(&qp - qps.data()), oq.lastSeq[p]);
+      }
     }
     oq.pending.push_back(std::move(f));
     RetireFlushes(oq);
@@ -615,15 +645,15 @@ class ProxyWorker {
   }
 
   // Make room for n more WRs in qp's SQ (posted + pending chain). While it is
-  // full, posts every peer's chain and polls every CQ, so other peers' work
-  // and flushes keep moving. False if the DevComm failed meanwhile.
+  // full, posts every QP's chain and polls every CQ, so other QPs' work and
+  // flushes keep moving. False if the DevComm failed meanwhile.
   bool Reserve(ProxyQp& qp, size_t n) {
     while (qp.postedSeq + qp.wrs.size() + n - qp.completedSeq > kSqDepth) {
       if (ErrorPublished()) EnterFailed();
       bool completed = false;
-      for (int peer : activePeers_) {
+      for (int i : activeQps_) {
         if (failed_) return false;
-        ProxyQp& q = qps[peer];
+        ProxyQp& q = qps[i];
         PostChain(q);
         if (!failed_ && q.completedSeq < q.postedSeq) completed = PollCq(q) || completed;
       }
@@ -740,13 +770,16 @@ class ProxyWorker {
 
   static inline thread_local ProxyWorker* current_ = nullptr;  // set on each proxy thread
 
+  int worldSize_;
+  int qpsPerPeer_;
   int id_;
   int rank_;
-  ProxyErrorState* err_;      // the engine's
-  bool abortOnError_;         // MORI_CCO_PROXY_ABORT_ON_ERROR: abort at the first error
-  bool failed_{false};        // drain-and-drop
-  OwnedQueue* cur_{nullptr};  // queue whose callbacks are running
-  std::vector<int> activePeers_;
+  ProxyErrorState* err_;          // the engine's
+  bool abortOnError_;             // MORI_CCO_PROXY_ABORT_ON_ERROR: abort at the first error
+  bool failed_{false};            // drain-and-drop
+  OwnedQueue* cur_{nullptr};      // queue whose callbacks are running
+  std::vector<int> activePeers_;  // peers with QPs
+  std::vector<int> activeQps_;    // indices in qps of every active QP
   std::thread thread_;
 };
 
@@ -823,13 +856,14 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   // Never more threads than queues: a thread without a queue would only spin.
   const int numThreads =
       std::min(config.numThreads > 0 ? config.numThreads : kDefaultMaxThreads, numQueues);
+  // QPs per (thread, peer); never more than a thread's queues can use.
+  int qpsPerPeer = 1;
 
   // Local setup: everything up to the QP handle exchange. A failure here is
   // reported to every rank by the Allgather below, so all ranks fail together.
   ProxyCreateInfo mine{};
   std::string error;
-  std::vector<application::RdmaEndpointHandle> local(static_cast<size_t>(worldSize) *
-                                                     std::max(numThreads, 0));
+  std::vector<application::RdmaEndpointHandle> local;
   try {
     application::RdmaDeviceContext* devCtx = ctx->GetRdmaDeviceContext();
     if (devCtx == nullptr) throw std::runtime_error("no RDMA device context");
@@ -841,6 +875,11 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     if (static_cast<int>(config.peerMask.size()) != worldSize) {
       throw std::runtime_error("peerMask size != worldSize");
     }
+    if (config.qpsPerPeer < 1) {
+      throw std::runtime_error("bad qpsPerPeer " + std::to_string(config.qpsPerPeer));
+    }
+    qpsPerPeer = std::min(config.qpsPerPeer, (numQueues + numThreads - 1) / numThreads);
+    local.resize(static_cast<size_t>(worldSize) * numThreads * qpsPerPeer);
     const size_t capacity = config.queueCapacity ? config.queueCapacity : kDefaultQueueCapacity;
     if ((capacity & (capacity - 1)) != 0 ||
         capacity < mori::cco::proxy::queue::message_lines(sizeof(ccoProxyPutSignalDesc))) {
@@ -886,7 +925,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
         engine->ibv->RegisterRdmaMemoryRegion(engine->scratch, kScratchStride * numThreads);
 
     for (int t = 0; t < numThreads; t++) {
-      auto w = std::make_unique<ProxyWorker>(t, worldSize, rank, &engine->err, abortOnError);
+      auto w =
+          std::make_unique<ProxyWorker>(t, worldSize, qpsPerPeer, rank, &engine->err, abortOnError);
       w->scratchAddr = reinterpret_cast<uint64_t>(engine->scratch) + t * kScratchStride;
       w->scratchLkey = scratchMr.lkey;
       engine->workers.push_back(std::move(w));
@@ -931,18 +971,21 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
             *engine->mpsc, g - numSpsc);
       }
       oq->lastSeq.assign(worldSize, 0);
-      engine->workers[g % numThreads]->queues.push_back(oq.get());
+      engine->workers[g % numThreads]->AddQueue(oq.get());
       engine->queues.push_back(std::move(oq));
     }
 
-    // One RC QP per (proxy thread, masked peer).
+    // qpsPerPeer RC QPs per (proxy thread, masked peer); handle (peer, t, slot)
+    // at local[(peer * numThreads + t) * qpsPerPeer + slot].
     for (int peer = 0; peer < worldSize; peer++) {
       if (peer == rank || !config.peerMask[peer]) continue;
       for (int t = 0; t < numThreads; t++) {
-        ProxyQp& qp = engine->workers[t]->qps[peer];
-        qp.ep = engine->ibv->CreateRdmaEndpoint(epConfig);
-        qp.active = true;
-        local[peer * numThreads + t] = qp.ep.handle;
+        for (int slot = 0; slot < qpsPerPeer; slot++) {
+          ProxyQp& qp = engine->workers[t]->Qp(peer, slot);
+          qp.ep = engine->ibv->CreateRdmaEndpoint(epConfig);
+          qp.active = true;
+          local[(static_cast<size_t>(peer) * numThreads + t) * qpsPerPeer + slot] = qp.ep.handle;
+        }
       }
     }
   } catch (const std::exception& e) {
@@ -951,8 +994,9 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
 
   // Every rank must have set up before the exchange. All ranks see the same
   // table, so they all fail or all go on. (The caller has already checked that
-  // every rank passed the same queue and thread counts, so numThreads, the
-  // handles sent per peer, matches.) One RDMA write must fit every port.
+  // every rank passed the same queue, thread and QP counts, so numThreads *
+  // qpsPerPeer, the handles sent per peer, matches.) One RDMA write must fit
+  // every port.
   mine.ok = error.empty() ? 1 : 0;
   std::vector<ProxyCreateInfo> all(worldSize);
   bootNet->Allgather(&mine, all.data(), sizeof(ProxyCreateInfo));
@@ -974,7 +1018,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   std::vector<application::RdmaEndpointHandle> remote(local.size());
   try {
     bootNet->AllToAll(local.data(), remote.data(),
-                      sizeof(application::RdmaEndpointHandle) * numThreads);
+                      sizeof(application::RdmaEndpointHandle) * numThreads * qpsPerPeer);
   } catch (const std::exception& e) {
     MORI_SHMEM_ERROR("ccoProxyEngineCreate: rank={} failed: {}", rank, e.what());
     return nullptr;  // engine destructor releases what was built
@@ -988,9 +1032,9 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     }
     for (int peer = 0; peer < worldSize; peer++) {
       if (peer == rank || !config.peerMask[peer]) continue;
-      for (int t = 0; t < numThreads; t++) {
-        engine->ibv->ConnectEndpoint(local[peer * numThreads + t], remote[peer * numThreads + t],
-                                     t);
+      for (int i = 0; i < numThreads * qpsPerPeer; i++) {
+        const size_t h = static_cast<size_t>(peer) * numThreads * qpsPerPeer + i;
+        engine->ibv->ConnectEndpoint(local[h], remote[h], i);
       }
     }
 
@@ -1030,10 +1074,14 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     return nullptr;         // engine destructor releases what was built
   }
 
+  const int numPeers =
+      static_cast<int>(std::count(config.peerMask.begin(), config.peerMask.end(), true)) -
+      (config.peerMask[rank] ? 1 : 0);
   MORI_SHMEM_INFO(
-      "ccoProxyEngineCreate: rank={} spscQueues={} mpscQueues={} threads={} sqDepth={} "
-      "maxPutBytes={}",
-      rank, numSpsc, numMpsc, numThreads, kSqDepth, maxMsgBytes);
+      "ccoProxyEngineCreate: rank={} spscQueues={} mpscQueues={} threads={} qpsPerPeer={} "
+      "(requested {}) peers={} QPs={} sqDepth={} maxPutBytes={}",
+      rank, numSpsc, numMpsc, numThreads, qpsPerPeer, config.qpsPerPeer, numPeers,
+      numThreads * qpsPerPeer * numPeers, kSqDepth, maxMsgBytes);
   out->numSpscQueues = numSpsc;
   out->numMpscQueues = numMpsc;
   out->spscContext = engine->spsc ? engine->spsc->device_context() : nullptr;

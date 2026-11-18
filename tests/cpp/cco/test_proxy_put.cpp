@@ -78,6 +78,9 @@
 //                  last carrying the signal), so every ring wraps many times
 //                  and producers wait for ring space (SPSC: 1 producer per
 //                  queue; MPSC: 4)
+//   qps_put_sig,   put_sig_warp, flush_reuse and mpsc_flush on a DevComm with
+//   qps_flush,     proxyQpsPerPeer = kQpsPerPeer: each proxy thread owns 3
+//   qps_mpsc_flush queues (2 SPSC + 1 MPSC), each bound to its own QP per peer
 //   split_warp     put_sig_warp with the put split size lowered to 4 KiB
 //                  (16 pieces per put)
 //   thr_*          ccoCoopLaneMasked, one wavefront per unit: lane L puts its own
@@ -151,6 +154,7 @@ static constexpr int kSmallCapacity = 16;  // ring lines: a put + signal takes 2
 static constexpr int kPieces = 64;         // puts per chunk in the small-ring cases
 static constexpr int kSqRepeats = 2048;    // puts per peer in sq_full (SQ depth: 512)
 static constexpr int kFencePieces = 4;     // puts per chunk in the caller-fenced cases
+static constexpr int kQpsPerPeer = 3;      // per (proxy thread, peer): one per queue of a thread
 static constexpr uint32_t kClobber = 0xdeadbeefu;
 
 enum PutMode {
@@ -632,6 +636,7 @@ struct Ctx {
   ccoDevComm dc;        // default rings
   ccoDevComm dcSmall;   // kSmallCapacity-line rings
   ccoDevComm dcThread;  // kThreadCapacity-line rings
+  ccoDevComm dcQps;     // kQpsPerPeer QPs per (proxy thread, peer)
   hipStream_t stream;
   int rank;
   int nranks;
@@ -713,8 +718,8 @@ struct Ctx {
 // the proxy posts any size up to the real limit), so put() splits.
 template <typename Q, typename Coop, int Mode, ccoProxyFenceMode F = ccoProxyFenceEachOp>
 static int RunPutCase(Ctx& c, const char* name, uint32_t salt, size_t chunk, int nUnits,
-                      int blockDim, bool smallRings = false, uint64_t maxPutBytes = 0) {
-  ccoDevComm d = smallRings ? c.dcSmall : c.dc;
+                      int blockDim, const ccoDevComm* dev = nullptr, uint64_t maxPutBytes = 0) {
+  ccoDevComm d = dev ? *dev : c.dc;
   if (maxPutBytes != 0) d.proxy.maxPutBytes = maxPutBytes;
   c.Fresh(d, salt, chunk, nUnits,
           /*fillSend=*/Mode != kPutKernelPayload && Mode != kPutCallerFence);
@@ -950,13 +955,16 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   smallReqs.proxyQueueCapacity = kSmallCapacity;
   ccoDevCommRequirements threadReqs = reqs;
   threadReqs.proxyQueueCapacity = kThreadCapacity;
+  ccoDevCommRequirements qpsReqs = reqs;
+  qpsReqs.proxyQpsPerPeer = kQpsPerPeer;
   if (ccoDevCommCreate(c.comm, &reqs, &c.dc) != 0 ||
       ccoDevCommCreate(c.comm, &smallReqs, &c.dcSmall) != 0 ||
-      ccoDevCommCreate(c.comm, &threadReqs, &c.dcThread) != 0) {
+      ccoDevCommCreate(c.comm, &threadReqs, &c.dcThread) != 0 ||
+      ccoDevCommCreate(c.comm, &qpsReqs, &c.dcQps) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate failed\n", rank);
     return 1;
   }
-  for (const ccoDevComm* d : {&c.dc, &c.dcSmall, &c.dcThread}) {
+  for (const ccoDevComm* d : {&c.dc, &c.dcSmall, &c.dcThread, &c.dcQps}) {
     if (d->gdaConnType == CCO_GDA_CONNECTION_NONE || d->proxy.numSpscQueues != kSpscQueues ||
         d->proxy.numMpscQueues != kMpscQueues) {
       fprintf(stderr, "[rank %d] proxy queues missing (gdaConnType=%d spsc=%d mpsc=%d)\n", rank,
@@ -998,7 +1006,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunPutCase<MPSCD2HQueue, ccoCoopBlock, kPutKernelPayload>(c, "mpsc_payload", 13, kChunk,
                                                                      kMaxUnits, 256);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "split_warp", 17, kChunk,
-                                                             kSpscQueues, 64, false, 4096);
+                                                             kSpscQueues, 64, nullptr, 4096);
   // ccoCoopLaneMasked: per-lane offsets, sizes and signals, idle lanes; 256-byte
   // split pieces in the *_put_sig cases (lanes need 1 to 4 pieces).
   fails += RunThreadCase<SPSCD2HQueue, kThreadPutSignal>(c, "thr_put_sig", 18, kSpscQueues, 256);
@@ -1017,9 +1025,16 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunSignalCase(c);
   fails += RunHandoffCase(c);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutPieces>(c, "small_spsc", 14, kChunk,
-                                                             kSpscQueues, 64, true);
+                                                             kSpscQueues, 64, &c.dcSmall);
+  // kQpsPerPeer QPs per (thread, peer): each of a thread's 3 queues on its own QP.
+  fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "qps_put_sig", 29, kChunk,
+                                                             kSpscQueues, 64, &c.dcQps);
+  fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutFlushClobber>(c, "qps_flush", 30, kChunk,
+                                                                    kSpscQueues, 256, &c.dcQps);
+  fails += RunPutCase<MPSCD2HQueue, ccoCoopBlock, kPutFlushClobber>(c, "qps_mpsc_flush", 31, kChunk,
+                                                                    kMaxUnits, 256, &c.dcQps);
   fails += RunPutCase<MPSCD2HQueue, ccoCoopWarp, kPutPieces>(c, "small_mpsc", 15, kChunk, kMaxUnits,
-                                                             64, true);
+                                                             64, &c.dcSmall);
 
   // Negative cases, each on a DevComm of its own; then dc must still work.
   bool anyNegative = false;
@@ -1047,6 +1062,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
 
   HIP_CHECK(hipStreamDestroy(c.stream));
   HIP_CHECK(hipFree(c.dErr));
+  ccoDevCommDestroy(c.comm, &c.dcQps);
   ccoDevCommDestroy(c.comm, &c.dcThread);
   ccoDevCommDestroy(c.comm, &c.dcSmall);
   ccoDevCommDestroy(c.comm, &c.dc);

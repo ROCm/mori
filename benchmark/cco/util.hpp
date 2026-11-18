@@ -125,6 +125,8 @@ struct PerfArgs {
   // shared by its wavefronts.
   int proxy_threads = kDefaultProxyThreads;
   bool proxy_mpsc = false;
+  // proxy (-K): proxyQpsPerPeer; 0 = the engine default.
+  int proxy_qps_per_peer = 0;
   // proxy put_bw (-F): ccoProxyFenceCaller, one fence() per kernel instead of one per put.
   bool proxy_caller_fence = false;
 };

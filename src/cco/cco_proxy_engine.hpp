@@ -46,13 +46,14 @@ struct ccoProxyEngineConfig {
   int numMpscQueues{0};        // KIWI MPSC device-to-host queues
   int numThreads{0};           // host proxy threads; 0 = 4. Capped at the queue count.
   size_t queueCapacity{0};     // ring lines (power of two); 0 = default
+  int qpsPerPeer{1};           // RC QPs per (thread, peer); capped at a thread's queue count
   std::vector<bool> peerMask;  // [worldSize] peers that get a QP per proxy thread
 };
 
 class ccoProxyEngine;
 
-// Collective over `bootNet`; every rank must pass the same queue and thread
-// counts (ccoDevCommCreate checks that first). Call with the comm's HIP device
+// Collective over `bootNet`; every rank must pass the same queue, thread and
+// QP counts (ccoDevCommCreate checks that first). Call with the comm's HIP device
 // current (the queues and flush counters are allocated on it). Builds the
 // queues, the host-posted RC QPs (on ctx's RDMA device and PD, so cco window
 // MRs are valid on them) and starts the proxy threads. Fills `out` on success;

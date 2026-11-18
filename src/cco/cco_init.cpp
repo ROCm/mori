@@ -1904,6 +1904,12 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
   const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
   const int proxyThreads = reqsHaveProxy ? std::max(reqs->proxyThreadCount, 0) : 0;
+  // QPs per (proxy thread, peer): the field, else MORI_CCO_PROXY_QPS_PER_PEER, else 1.
+  const bool reqsHaveQps =
+      reqs->size >= offsetof(ccoDevCommRequirements, proxyQpsPerPeer) + sizeof(int);
+  const int proxyQpsPerPeer = (reqsHaveQps && reqs->proxyQpsPerPeer > 0)
+                                  ? reqs->proxyQpsPerPeer
+                                  : env::GetPositiveIntOr("MORI_CCO_PROXY_QPS_PER_PEER", 1);
   const int64_t proxyQueues = int64_t{proxySpsc} + int64_t{proxyMpsc};  // may exceed INT_MAX
   std::string proxyError;
 #ifdef MORI_CCO_PROXY
@@ -1912,21 +1918,28 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     // that disagree all fail here instead of some waiting in the engine's QP
     // exchange.
     struct ProxyReq {
-      int32_t spsc, mpsc, threads, rdmaReady, disabled;
+      int32_t spsc, mpsc, threads, rdmaReady, disabled, qpsPerPeer;
     };
-    ProxyReq mine{proxySpsc, proxyMpsc, proxyThreads,
+    ProxyReq mine{proxySpsc,
+                  proxyMpsc,
+                  proxyThreads,
                   connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled(),
-                  env::IsEnvVarEnabled("MORI_CCO_DISABLE_PROXY")};
+                  env::IsEnvVarEnabled("MORI_CCO_DISABLE_PROXY"),
+                  proxyQueues > 0 ? proxyQpsPerPeer : 0};  // no QPs, nothing to agree on
     std::vector<ProxyReq> all(comm->worldSize);
     comm->bootNet->Allgather(&mine, all.data(), sizeof(ProxyReq));
     for (int r = 0; r < comm->worldSize && proxyError.empty(); r++) {
       if (all[r].spsc != all[0].spsc || all[r].mpsc != all[0].mpsc ||
-          all[r].threads != all[0].threads) {
-        proxyError = "ranks disagree on the ccoProxy requirements: rank 0 asks for " +
-                     std::to_string(all[0].spsc) + " SPSC + " + std::to_string(all[0].mpsc) +
-                     " MPSC queues and " + std::to_string(all[0].threads) + " threads, rank " +
-                     std::to_string(r) + " for " + std::to_string(all[r].spsc) + " + " +
-                     std::to_string(all[r].mpsc) + " and " + std::to_string(all[r].threads);
+          all[r].threads != all[0].threads || all[r].qpsPerPeer != all[0].qpsPerPeer) {
+        auto describe = [](const ProxyReq& q) {
+          return std::to_string(q.spsc) + " SPSC + " + std::to_string(q.mpsc) + " MPSC queues, " +
+                 std::to_string(q.threads) + " threads and " + std::to_string(q.qpsPerPeer) +
+                 " QPs per peer";
+        };
+        proxyError =
+            "ranks disagree on the ccoProxy requirements (proxyQpsPerPeer includes "
+            "MORI_CCO_PROXY_QPS_PER_PEER): rank 0 asks for " +
+            describe(all[0]) + ", rank " + std::to_string(r) + " for " + describe(all[r]);
       } else if (proxyQueues > 0 && all[r].disabled) {
         proxyError = "ccoProxy queues requested but MORI_CCO_DISABLE_PROXY is set on rank " +
                      std::to_string(r);
@@ -1947,6 +1960,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       proxyConfig.numThreads = proxyThreads;
       proxyConfig.queueCapacity =
           reqs->proxyQueueCapacity > 0 ? static_cast<size_t>(reqs->proxyQueueCapacity) : 0;
+      proxyConfig.qpsPerPeer = proxyQpsPerPeer;
       proxyConfig.peerMask = peerMask;
       ccoProxyEngine* engine =
           ccoProxyEngineCreate(comm->ctx, comm->bootNet, proxyConfig, &hostShadow.proxy);
