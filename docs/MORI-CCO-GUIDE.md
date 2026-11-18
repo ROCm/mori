@@ -308,6 +308,7 @@ in parallel.
 | `MORI_CCO_PROXY_CPUS` | cpulist for the proxy threads (thread t on entry t mod size); default: GPU-local cores in the affinity mask, one physical core per thread, from the top, skipping the core of CPU 0 |
 | `MORI_CCO_PROXY_QPS_PER_PEER` | QPs per (proxy thread, peer) when `proxyQpsPerPeer` is 0 |
 | `MORI_CCO_PROXY_ABORT_ON_ERROR` | `1` aborts the process at the first proxy error |
+| `MORI_CCO_PROXY_IDLE_SLEEP_US` | proxy threads with nothing in flight sleep this long after ~1-2 ms of empty polling, instead of spinning (default 0: always spin); the first op after an idle spell waits up to that long |
 
 ### Device API
 
