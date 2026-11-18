@@ -262,7 +262,7 @@ Supported GPUs: MI308X / MI300X / MI325X / MI355X. Supported NICs: AMD Pollara
 
 ## 10. ccoProxy (host-proxy RDMA)
 
-`ccoProxy` (`mori/cco/cco_proxy.hpp`) is a cross-node transport with the same
+`ccoProxy` (in `mori/cco/cco_scale_out.hpp`) is a cross-node transport with the same
 window, signal and counter model as GDA, but the GPU does not drive the NIC.
 A kernel pushes each op as a small descriptor into a device-to-host queue
 (KIWI); host proxy threads pop it and post the RDMA work request on
@@ -272,8 +272,8 @@ for GDA, so the same windows and signal slots work for both.
 Use it where GPU-initiated RDMA is unavailable or slow, or where NIC atomics
 into GPU memory fail, e.g. ionic VFs in VMs. Its signal-set ops
 (`ccoGda_SignalSet` / `ccoGda_WindowSignalSet`) are plain RDMA writes, so a
-proxy DevComm can run with no NIC atomics at all. Where GDA works, prefer GDA:
-the proxy adds a host round trip to every op.
+proxy DevComm can run with no NIC atomics at all. Its cost is host CPU: each
+DevComm with proxy queues runs busy-polling proxy threads.
 
 ### Enabling it
 
@@ -368,7 +368,7 @@ the kernel from the DevComm and a queue: an index, or a selector.
 ### Example
 
 ```cpp
-#include "mori/cco/cco_proxy.hpp"
+#include "mori/cco/cco_scale_out.hpp"
 
 // Host: reqs.gdaConnectionType = CCO_GDA_CONNECTION_FULL;
 //       reqs.proxySpscQueueCount = nBlocks; reqs.gdaSignalCount >= nBlocks;
