@@ -83,8 +83,17 @@ void Context::BuildInitialEndpoints() {
     if (t == TransportType::SDMA) anyNeedsSdma = true;
   }
 
-  // (B) Materialize SDMA queues if any peer resolved to SDMA.
-  if (anyNeedsSdma) EnsureSdmaTransport();
+  // (B) Materialize SDMA queues if any peer resolved to SDMA. A failure exits: the
+  // other ranks would otherwise wait in the AllToAll below, and shmem init callers
+  // do not check its result.
+  if (anyNeedsSdma) {
+    try {
+      EnsureSdmaTransport();
+    } catch (const std::exception& e) {
+      MORI_APP_ERROR("{}", e.what());
+      exit(EXIT_FAILURE);
+    }
+  }
 
   // (C) Build & connect the initial QP set (worldSize × numQpPerPe).
   //     Under MORI_ENABLE_RAIL_ONLY, cross-rail cross-node peers get stubs.

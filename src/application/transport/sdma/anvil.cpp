@@ -37,7 +37,9 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 
@@ -70,11 +72,6 @@ namespace {
       exit(EXIT_FAILURE);                                                                 \
     }                                                                                     \
   } while (0)
-
-// MI308X xGMI SDMA engines; 0 is the general engine and keeps loopback and host
-// copies. KFD exposes 8 user-queue slots per engine on gfx942.
-constexpr std::array<uint32_t, 3> kMi308xXgmiEngines = {2u, 4u, 6u};
-constexpr int kMi308xQueuesPerEngine = 8;
 
 // HSA agents
 std::vector<hsa_agent_t> cpuAgents_;
@@ -224,15 +221,14 @@ uint32_t hsakmtNodeForKfdNode(int node) {
         return n;
     }
   }
-  // Exit like a failed hsaKmt call in SdmaQueue: shmem would catch an exception
-  // and blame the network, and cco cannot propagate one into Python.
-  MORI_APP_ERROR("SDMA: no libhsakmt node has the gpu_id of KFD node {}", node);
-  exit(EXIT_FAILURE);
+  throw std::runtime_error("SDMA: no libhsakmt node has the gpu_id of KFD node " +
+                           std::to_string(node));
 }
 
 }  // namespace
 
-SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
+std::unique_ptr<SdmaQueue> SdmaQueue::tryCreate(uint32_t hsakmtNodeId, uint32_t engineId,
+                                                HSAKMT_STATUS* status) {
   // Allocate SDMA queue buffer on device side, requires ExecuteAccess
   HsaMemFlags memFlags = {};
   memFlags.ui32.NonPaged = 1;
@@ -245,44 +241,52 @@ SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
   // std::cout << "Allocating SDMA Queue Buffer for device: " << hsakmtNodeId << std::endl <<
   // std::flush;
 
-  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
+  void* buffer = nullptr;
+  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &buffer),
                        "Failed");
-  CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL), "Failed");
+  CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(buffer, SDMA_QUEUE_SIZE, NULL), "Failed");
 
-  // Create SDMA Queue
-  // TODO needed here?
-  memset(&queue_, 0, sizeof(HsaQueueResource));
-
-  CHECK_HSAKMT_SUCCESS(
+  // Fails when the engine has no free queue slot (KFD's per-engine limit, shared with
+  // ROCr and other processes): give the buffer back and let the caller try another.
+  HsaQueueResource resource{};
+  *status =
       hsaKmtCreateQueueExt(hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
-                           engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
-      "Failed");
+                           engineId, buffer, SDMA_QUEUE_SIZE, nullptr, &resource);
+  if (*status != HSAKMT_STATUS_SUCCESS) {
+    CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(buffer), "Failed");
+    CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(buffer, SDMA_QUEUE_SIZE), "Failed");
+    return nullptr;
+  }
+  std::unique_ptr<SdmaQueue> q(new SdmaQueue());
+  q->queueBuffer_ = buffer;
+  q->queue_ = resource;
 
   // Populate Device Handle
   // TODO uncached
-  CHECK_HIP_ERROR(hipMalloc(&deviceHandle_, sizeof(SdmaQueueDeviceHandle)));
+  CHECK_HIP_ERROR(hipMalloc(&q->deviceHandle_, sizeof(SdmaQueueDeviceHandle)));
   CHECK_HIP_ERROR(
-      hipExtMallocWithFlags((void**)&cachedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
+      hipExtMallocWithFlags((void**)&q->cachedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
   CHECK_HIP_ERROR(
-      hipExtMallocWithFlags((void**)&committedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
+      hipExtMallocWithFlags((void**)&q->committedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
 
-  uint64_t cachedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
-  uint64_t committedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
+  uint64_t cachedWptr = (uint64_t)*(q->queue_.Queue_write_ptr_aql);
+  uint64_t committedWptr = (uint64_t)*(q->queue_.Queue_write_ptr_aql);
   SdmaQueueDeviceHandle handle = {
-      .queueBuf = static_cast<uint32_t*>(queueBuffer_),
-      .rptr = queue_.Queue_read_ptr_aql,
-      .wptr = queue_.Queue_write_ptr_aql,
-      .doorbell = queue_.Queue_DoorBell_aql,
-      .cachedWptr = cachedWptr_,
-      .committedWptr = committedWptr_,
-      .cachedHwReadIndex = (uint64_t)*(queue_.Queue_read_ptr_aql),
+      .queueBuf = static_cast<uint32_t*>(q->queueBuffer_),
+      .rptr = q->queue_.Queue_read_ptr_aql,
+      .wptr = q->queue_.Queue_write_ptr_aql,
+      .doorbell = q->queue_.Queue_DoorBell_aql,
+      .cachedWptr = q->cachedWptr_,
+      .committedWptr = q->committedWptr_,
+      .cachedHwReadIndex = (uint64_t)*(q->queue_.Queue_read_ptr_aql),
   };
 
   CHECK_HIP_ERROR(
-      hipMemcpy(deviceHandle_, &handle, sizeof(SdmaQueueDeviceHandle), hipMemcpyHostToDevice));
-  CHECK_HIP_ERROR(hipMemcpy(cachedWptr_, &cachedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
+      hipMemcpy(q->deviceHandle_, &handle, sizeof(SdmaQueueDeviceHandle), hipMemcpyHostToDevice));
+  CHECK_HIP_ERROR(hipMemcpy(q->cachedWptr_, &cachedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
   CHECK_HIP_ERROR(
-      hipMemcpy(committedWptr_, &committedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
+      hipMemcpy(q->committedWptr_, &committedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
+  return q;
 }
 
 SdmaQueue::~SdmaQueue() {
@@ -357,92 +361,6 @@ void AnvilLib::init() {
 
 bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   std::lock_guard<std::mutex> lock(channels_mutex_);
-  // Spread the channels across the engines recommended for this peer link. On
-  // MI350 the mask typically reports 2 engines per peer; on platforms with a
-  // single recommended engine all channels share it.
-  std::vector<uint32_t> engines;
-  engines.reserve(2);
-  if (srcNode == dstNode) {
-    // Loopback has no self io_link, so KFD recommends no engine. On gfx1250 each
-    // engine holds only 6 queues and ROCr's blit queues already sit on the low
-    // ones, so pinning every loopback channel to engine 0 hits NO_MEMORY at the
-    // sixth channel; spread over the CPU-link engines (all 16 there) instead.
-    // Other archs are not engine-0-bound for loopback (gfx950: 8 queues/engine,
-    // only engines 0-1 general) and regress if a channel lands on a busy engine,
-    // so keep them pinned to engine 0. Some gfx1250 GPUs report no CPU link at all
-    // (two of four on HELIOS), so they take the engines of their peer links instead.
-    if (isGfx1250(srcNode)) {
-      uint32_t mask = getHostLinkEngineMask(srcNode);
-      if (!mask) mask = getAnyLinkEngineMask(srcNode);
-      for (uint32_t b = 0; b < 32; ++b) {
-        if (mask & (1u << b)) engines.push_back(b);
-      }
-    }
-    if (engines.empty()) engines.push_back(0);
-  } else {
-    uint32_t mask = getRecommendedEngineMask(srcNode, dstNode);
-    for (uint32_t b = 0; b < 32; ++b) {
-      if (mask & (1u << b)) engines.push_back(b);
-    }
-    // amdkfd recommends one engine per peer link only on a bare-metal, single-partition,
-    // 8-GPU hive (kfd_set_recommended_sdma_engines). Otherwise (an SR-IOV VF under any
-    // hypervisor, a hive of another size) it reports every xGMI engine: 14 on a GPU with 16
-    // SDMA engines in SPX mode. Round-robin over that puts channel 1 on an odd engine, where
-    // a copy started by a doorbell written from device code never runs. The static OAM table
-    // is the kernel's per-peer table for an 8-GPU hive, so use it for a 14-engine mask and
-    // only if the mask holds the engine it picks; otherwise (other parts, partition modes,
-    // an unreadable or out-of-range xGMI id) keep the KFD mask.
-    if (engines.size() == 14) {
-      try {
-        uint32_t e = static_cast<uint32_t>(getSdmaEngineId(srcNode, dstNode));
-        if (mask & (1u << e)) {
-          engines.assign(1, e);
-          static bool logged = false;  // connect() runs under channels_mutex_
-          if (!logged) {
-            logged = true;
-            MORI_APP_INFO(
-                "SDMA: amdkfd reports 14 engines per xGMI link, using the static OAM table to "
-                "pick one engine per peer");
-          }
-          MORI_APP_DEBUG("SDMA: node {} -> {} uses engine {}", srcNode, dstNode, e);
-        }
-      } catch (const std::exception& ex) {
-        MORI_APP_WARN("SDMA: node {} -> {} keeps the KFD engine mask: {}", srcNode, dstNode,
-                      ex.what());
-      }
-    }
-    // Fall back to the static OAM table if KFD did not report a mask.
-    if (engines.empty()) {
-      int e = getSdmaEngineId(srcNode, dstNode);
-      engines.push_back(e);
-    }
-  }
-
-  // MI308X is a 4-XCD harvest of the 8-XCD MI300X: only 4 physical SDMA engines
-  // exist, exposed at the even KFD logical engine ids (0,2,4,6); the odd ids
-  // (1,3,5,7) name fused-off engines. IP-discovery firmware still advertises the
-  // full MI300X layout (2 general + 6 xGMI = 8) and recommended_sdma_engine_id_mask
-  // points at odd ids for many links (this box lacks the upstream amdkfd
-  // "rec SDMA engines with limited XGMI" fix). Creating a queue on an odd id and
-  // ringing its doorbell hangs, so fold every selected id down to its backing
-  // even engine (id & ~1) and dedup, preserving order, so the per-engine queue
-  // budget is not double-charged.
-  const bool mi308x = isMi308x(srcNode);
-  if (mi308x) {
-    uint32_t seen = 0;
-    std::vector<uint32_t> evenEngines;
-    for (uint32_t e : engines) {
-      uint32_t backing = e & ~1u;
-      if (!(seen & (1u << backing))) {
-        seen |= (1u << backing);
-        evenEngines.push_back(backing);
-      }
-    }
-    engines.swap(evenEngines);
-  }
-
-  const int numEngines = static_cast<int>(engines.size());
-
   // Queues live in this process-global singleton and are shared across every
   // Context/comm for this node pair (getSdmaQueue keys on KFD node ids, not on
   // the comm), and are only reclaimed when the process exits. So create just the
@@ -450,65 +368,90 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // hardware queues (getSdmaQueue only ever indexes the first numChannels) and
   // eventually exhaust the per-engine queue slots.
   auto& channels = sdma_channels_[std::make_pair(srcNode, dstNode)];
-  if (static_cast<int>(channels.size()) < numChannels) {
-    const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
-    // The fold above puts several of a MI308X GPU's peer links on one engine
-    // (masks 0x40 and 0x80 both land on 6), serialising its copies to those
-    // peers, so its peer links are balanced over the xGMI engines instead.
-    const bool balance = mi308x && srcNode != dstNode;
-    if (balance) mi308xLinkEngine(srcNode, dstNode, engines);
-    for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
-      const uint32_t engineId =
-          balance ? mi308xQueueEngine(srcNode, dstNode) : engines[c % numEngines];
-      channels.emplace_back(std::make_unique<SdmaQueue>(hsakmtNode, engineId));
+  if (static_cast<int>(channels.size()) >= numChannels) return true;
+
+  plan::SourcePlan& sp = sourcePlan(srcNode);
+  const bool loopback = srcNode == dstNode;
+  // Loopback has no self io_link, so KFD recommends no engine: engine 0, except on
+  // gfx1250, where each engine holds only 6 queues and ROCr's blit queues sit on
+  // the low ones, so loopback spreads over the CPU-link engines (all 16), or over
+  // the peer-link ones on the GPUs that report no CPU link (two of four on HELIOS).
+  uint32_t mask = 0;
+  if (!loopback) {
+    mask = getRecommendedEngineMask(srcNode, dstNode);
+  } else if (sp.Caps().arch == plan::Arch::Gfx125x) {
+    mask = getHostLinkEngineMask(srcNode);
+    if (!mask) mask = getAnyLinkEngineMask(srcNode);
+  }
+  std::optional<uint32_t> oam;
+  std::string oamError;
+  if (!loopback && sp.WantsOam(mask)) {
+    try {
+      oam = static_cast<uint32_t>(getSdmaEngineId(srcNode, dstNode));
+    } catch (const std::exception& ex) {
+      oamError = ex.what();
+      MORI_APP_WARN("SDMA: node {} -> {} has no OAM-table engine: {}", srcNode, dstNode, oamError);
     }
+  }
+
+  if (!sp.HasEngine(loopback, mask, oam)) {
+    throw std::runtime_error(
+        fmt::format("SDMA: no engine for node {} -> {}: KFD mask {:#x}{}", srcNode, dstNode, mask,
+                    oamError.empty() ? "" : ", no OAM-table engine (" + oamError + ")"));
+  }
+
+  const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
+  for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
+    std::unique_ptr<SdmaQueue> q;
+    std::string tried;
+    bool noSlot = true;  // every refusal was KFD running out of queue slots
+    for (uint32_t e : sp.Candidates(dstNode, loopback, c, numChannels, mask, oam)) {
+      HSAKMT_STATUS st = HSAKMT_STATUS_SUCCESS;
+      q = SdmaQueue::tryCreate(hsakmtNode, e, &st);
+      if (q) {
+        sp.Commit(dstNode, loopback, e);
+        MORI_APP_DEBUG("SDMA: node {} -> {} channel {} on engine {}", srcNode, dstNode, c, e);
+        break;
+      }
+      sp.MarkFull(e);
+      noSlot &= st == HSAKMT_STATUS_NO_MEMORY || st == HSAKMT_STATUS_OUT_OF_RESOURCES;
+      tried += fmt::format("{}{} (status {})", tried.empty() ? "" : ", ", e, static_cast<int>(st));
+      MORI_APP_WARN(
+          "SDMA: node {} engine {} refused a queue (status {}); node {} -> {} "
+          "channel {} tries another engine",
+          srcNode, e, static_cast<int>(st), srcNode, dstNode, c);
+    }
+    if (!q) {
+      std::string counts;
+      for (uint32_t e = 0; e < plan::kMaxEngines; ++e)
+        if (sp.QueuesOn(e)) counts += fmt::format(" {}:{}", e, sp.QueuesOn(e));
+      throw std::runtime_error(fmt::format(
+          "SDMA queue exhausted [anvil.cpp]: node {} -> {} channel {} of {}, KFD mask {:#x}, "
+          "engines tried [{}], this process's queues per engine:{}{}",
+          srcNode, dstNode, c, numChannels, mask, tried, counts,
+          noSlot ? "; restart with fewer SDMA channels per peer (MORI_SDMA_NUM_CHANNELS, "
+                   "sdmaQueueCount): queues are freed only when the process exits"
+                 : ""));
+    }
+    channels.push_back(std::move(q));
   }
   return true;
 }
 
-// The engine of a MI308X peer link: the xGMI engine carrying the fewest of this
-// GPU's peer links, ties to a recommended engine, then the lowest id. Decided
-// once per (src, dst) so every queue of a link shares one engine: AsyncLL uses
-// one queue per peer per op, and a link whose queues were spread over engines
-// measured 28-53% slower.
-uint32_t AnvilLib::mi308xLinkEngine(int srcNode, int dstNode,
-                                    const std::vector<uint32_t>& recommended) {
-  const auto key = std::make_pair(srcNode, dstNode);
-  auto it = mi308x_link_engine_.find(key);
-  if (it != mi308x_link_engine_.end()) return it->second;
-  auto& use = mi308x_engine_use_[srcNode];
-  auto rank = [&](uint32_t e) {
-    const bool notRecommended =
-        std::find(recommended.begin(), recommended.end(), e) == recommended.end();
-    return std::make_tuple(use.links[e], notRecommended, e);
-  };
-  uint32_t best = kMi308xXgmiEngines[0];
-  for (uint32_t e : kMi308xXgmiEngines) {
-    if (rank(e) < rank(best)) best = e;
-  }
-  use.links[best]++;
-  mi308x_link_engine_[key] = best;
-  return best;
-}
-
-// The engine of one more queue on a MI308X peer link: the link's engine, or the
-// xGMI engine with the fewest queues once that one is full. KFD rejects the
-// ninth queue on an engine, and SdmaQueue's constructor would then exit().
-uint32_t AnvilLib::mi308xQueueEngine(int srcNode, int dstNode) {
-  auto& use = mi308x_engine_use_[srcNode];
-  uint32_t e = mi308x_link_engine_.at(std::make_pair(srcNode, dstNode));
-  if (use.queues[e] >= kMi308xQueuesPerEngine) {
-    e = *std::min_element(kMi308xXgmiEngines.begin(), kMi308xXgmiEngines.end(),
-                          [&](uint32_t a, uint32_t b) { return use.queues[a] < use.queues[b]; });
-    if (use.queues[e] >= kMi308xQueuesPerEngine) {
-      throw std::runtime_error("SDMA: KFD node " + std::to_string(srcNode) + " has all " +
-                               std::to_string(kMi308xQueuesPerEngine) +
-                               " queue slots of every xGMI SDMA engine in use; request fewer "
-                               "SDMA channels per peer (MORI_SDMA_NUM_CHANNELS)");
-    }
-  }
-  use.queues[e]++;
-  return e;
+plan::SourcePlan& AnvilLib::sourcePlan(int srcNode) {
+  auto it = plans_.find(srcNode);
+  if (it != plans_.end()) return it->second;
+  auto props = readKfdProperties(kfdNodePath(srcNode) + "/properties");
+  plan::NodeCaps caps;
+  caps.arch = plan::Classify(props["gfx_target_version"]);
+  caps.nGeneral = static_cast<uint32_t>(props["num_sdma_engines"]);
+  caps.nXgmi = static_cast<uint32_t>(props["num_sdma_xgmi_engines"]);
+  caps.cap = static_cast<int>(props["num_sdma_queues_per_engine"]);
+  it = plans_.emplace(srcNode, plan::SourcePlan(caps)).first;
+  const auto& c = it->second.Caps();
+  MORI_APP_INFO("SDMA: node {} engine plan {} ({} general + {} xGMI engines, {} queues each)",
+                srcNode, plan::ArchName(c.arch), c.nGeneral, c.nXgmi, c.cap);
+  return it->second;
 }
 
 uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {
@@ -535,19 +478,6 @@ uint32_t AnvilLib::getAnyLinkEngineMask(int srcNode) {
   for (const auto& link : kfdLinks(srcNode)) mask |= link.recSdmaEngIdMask;
   return mask;
 }
-
-// gfx12.5+ (gfx1250): the only arch whose loopback channels are spread over
-// engines. See connect() for why.
-bool AnvilLib::isGfx1250(int node) {
-  // libhsakmt's EngineId: major = v / 10000 % 100, minor = v / 100 % 100.
-  const uint64_t v = kfdNodeProperty(node, "gfx_target_version");
-  return v / 10000 % 100 == 12 && v / 100 % 100 == 5;
-}
-
-// MI308X (PCI device_id 0x74A2) is a 4-XCD harvest of the 8-XCD MI300X. Both are
-// gfx942, so EngineId cannot tell them apart; match the PCI device id instead.
-// See connect() for why its odd SDMA engine ids must be avoided.
-bool AnvilLib::isMi308x(int node) { return kfdNodeProperty(node, "device_id") == 0x74A2; }
 
 SdmaQueue* AnvilLib::getSdmaQueue(int srcNode, int dstNode, int idx) {
   std::lock_guard<std::mutex> lock(channels_mutex_);

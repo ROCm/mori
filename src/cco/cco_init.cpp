@@ -84,7 +84,9 @@ void ccoSdmaReportNoQueues(bool asked, int requestedChannels, const char* why) {
       why, requestedChannels);
 }
 
-void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
+// 0 on success, -1 if anvil could not create the queues (no slot left on any
+// usable engine); the caller then fails the DevComm on every rank.
+int ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
 #if BUILD_CCO_SDMA
   // Idempotent: first DevComm fixes the channel count; later ones reuse it.
   if (comm->sdmaDevHandles != nullptr) {
@@ -93,7 +95,7 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
       MORI_SHMEM_WARN("sdmaQueueCount {} ignored; comm already has {}", requestedChannels,
                       comm->sdmaNumQueue);
     }
-    return;
+    return 0;
   }
 
   bool anySdmaCapable = false;
@@ -109,12 +111,18 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
         requestedChannels > 0 || envOn, requestedChannels,
         !envOn ? "MORI_ENABLE_SDMA is not enabled" : "no peer reports SDMA capability");
     comm->sdmaNumQueue = 0;
-    return;
+    return 0;
   }
 
   // requestedChannels: reqs.sdmaQueueCount, 0 = env default. Adopt the count
   // actually connected so device-side indexing stays in bounds.
-  comm->ctx->EnsureSdmaTransport(requestedChannels);
+  try {
+    comm->ctx->EnsureSdmaTransport(requestedChannels);
+  } catch (const std::exception& ex) {
+    MORI_SHMEM_ERROR("ccoDevCommCreate: rank {} cannot create its SDMA queues: {}", comm->rank,
+                     ex.what());
+    return -1;
+  }
   comm->sdmaNumQueue = comm->ctx->SdmaChannels();
 
   // sdmaDevHandles is lsaSize × sdmaNumQueue, indexed by lsaRank (kernel-facing
@@ -152,6 +160,7 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
                         "this mori was built BUILD_CCO_SDMA=OFF");
   comm->sdmaNumQueue = 0;
 #endif  // BUILD_CCO_SDMA
+  return 0;
 }
 }  // namespace
 
@@ -1688,6 +1697,39 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
                     reqs->version, CCO_API_VERSION);
   }
 
+  // Comm SDMA queues from reqs.sdmaQueueCount (0 = env default), set up before
+  // anything is allocated. When SDMA is in play the ranks then compare counts, and
+  // all fail here if one could not create its queues, a node's ranks differ (a
+  // retry after such a failure), or nodes disagree on having queues at all (the
+  // signal pool below is exchanged over the whole comm).
+  int sdmaQueues =
+      ccoSdmaSetupCommQueues(comm, reqs->sdmaQueueCount) == 0 ? comm->sdmaNumQueue : -1;
+  if (reqs->sdmaQueueCount > 0 || comm->ctx->IsSdmaEnabled()) {
+    std::vector<int> sdmaQueuesAll(comm->worldSize, 0);
+    comm->bootNet->Allgather(&sdmaQueues, sdmaQueuesAll.data(), sizeof(int));
+    std::string why;
+    if (sdmaQueues < 0) why = "this rank could not create its SDMA queues";
+    for (int r = 0; why.empty() && r < comm->worldSize; r++) {
+      const int q = sdmaQueuesAll[r];
+      const bool sameNode = r >= comm->myNodeStart && r < comm->myNodeStart + comm->lsaSize;
+      if (q < 0) {
+        why = fmt::format("rank {} could not create its SDMA queues", r);
+      } else if ((q > 0) != (sdmaQueues > 0)) {
+        why = fmt::format(
+            "rank {} has {} SDMA queues per peer and this rank {}; set MORI_ENABLE_SDMA alike on "
+            "every node",
+            r, q, sdmaQueues);
+      } else if (sameNode && q != sdmaQueues) {
+        why = fmt::format("rank {} on this node has {} SDMA queues per peer and this rank {}", r, q,
+                          sdmaQueues);
+      }
+    }
+    if (!why.empty()) {
+      MORI_SHMEM_ERROR("ccoDevCommCreate: rank {}: {}", comm->rank, why);
+      return -1;
+    }
+  }
+
   // Resolve connection type. CROSSNODE collapses to NONE on single-node
   // deployments (no cross-node peers exist). RAIL collapses to NONE if it
   // ends up with zero peers (single-node, or self-rail only).
@@ -2001,9 +2043,6 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   // handle was exported by the same process, so for SPMT we Allgather raw
   // VAs alongside IPC handles and pick per-peer based on SameProcessP2P.
   // (See shmem's SymmMemManager::Register for the same pattern.)
-  // Set up comm SDMA queues from reqs.sdmaQueueCount (0 = env default).
-  ccoSdmaSetupCommQueues(comm, reqs != nullptr ? reqs->sdmaQueueCount : 0);
-
   ccoSdmaContext& sdma = hostShadow.sdma;
   sdma.sdmaNumQueue = static_cast<uint32_t>(comm->sdmaNumQueue);
   if (comm->sdmaNumQueue > 0) {
