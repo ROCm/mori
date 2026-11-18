@@ -418,7 +418,7 @@ class ProxyWorker {
 
   void Run(const std::atomic<bool>* stop) {
     for (;;) {
-      if (!failed_ && err_->state.load(std::memory_order_relaxed) != 0) EnterFailed();
+      if (!failed_ && ErrorPublished()) EnterFailed();
       size_t popped = 0;
       for (OwnedQueue* oq : queues) {
         if (oq->broken || !oq->queue->Ready()) continue;
@@ -499,9 +499,13 @@ class ProxyWorker {
               .c_str());
     } else {
       err_->suppressed.fetch_add(1, std::memory_order_relaxed);
+      while (!ErrorPublished()) _mm_pause();  // poison only once GetError can report it
     }
     EnterFailed();
   }
+
+  // True once ccoProxyEngineGetError can report the engine's first error.
+  bool ErrorPublished() const { return err_->state.load(std::memory_order_acquire) == 2; }
 
   // Drain-and-drop from now on: keep popping so producers never wedge, post
   // nothing, and answer every FLUSH, pending or later, with failure.
@@ -615,7 +619,7 @@ class ProxyWorker {
   // and flushes keep moving. False if the DevComm failed meanwhile.
   bool Reserve(ProxyQp& qp, size_t n) {
     while (qp.postedSeq + qp.wrs.size() + n - qp.completedSeq > kSqDepth) {
-      if (err_->state.load(std::memory_order_relaxed) != 0) EnterFailed();
+      if (ErrorPublished()) EnterFailed();
       bool completed = false;
       for (int peer : activePeers_) {
         if (failed_) return false;

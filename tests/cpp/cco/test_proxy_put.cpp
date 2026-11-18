@@ -790,16 +790,6 @@ static void PrintError(int rank, const char* name, int got, const ccoDevCommErro
       (unsigned long long)e.raddr, e.len, (unsigned long long)e.suppressed, e.message);
 }
 
-// The error a failed DevComm publishes, waited for up to 5 s.
-static int WaitForError(Ctx& c, const ccoDevComm& d, ccoDevCommError* e) {
-  for (int i = 0; i < 5000; i++) {
-    const int got = ccoDevCommGetError(c.comm, &d, e);
-    if (got != 0) return got;
-    usleep(1000);
-  }
-  return 0;
-}
-
 // n1 (selfPut false): rank 0 puts past the end of peer 1's receive window.
 // n2 (selfPut true): every rank puts to itself, which has no proxy QP.
 static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& reqs, bool selfPut) {
@@ -825,7 +815,7 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
   HIP_CHECK(hipMemcpy(res, dRes, sizeof(res), hipMemcpyDeviceToHost));
   HIP_CHECK(hipFree(dRes));
   ccoDevCommError e{};
-  const int got = fails ? WaitForError(c, d, &e) : ccoDevCommGetError(c.comm, &d, &e);
+  const int got = ccoDevCommGetError(c.comm, &d, &e);  // published before any flush sees it
   int bad = 0;
   if (fails) {
     PrintError(c.rank, name, got, e);
