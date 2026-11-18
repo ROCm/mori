@@ -389,7 +389,20 @@ def _collect_include_dirs(mori_root: Path) -> list[Path]:
     if is_profiler_enabled():
         dirs.append(_ensure_generated_include(mori_root))
 
+    dirs.extend(_rocm_sysdeps_include_dirs())
+
     return dirs
+
+
+def _rocm_sysdeps_include_dirs() -> list[Path]:
+    """Headers ROCm bundles under lib/rocm_sysdeps (e.g. libdrm in TheRock builds).
+
+    rocm_smi/kfd_ioctl.h includes <libdrm/drm.h>; when ROCm ships libdrm there
+    instead of the system include path, hipcc does not find it on its own.
+    """
+    rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
+    p = Path(rocm_path) / "lib" / "rocm_sysdeps" / "include"
+    return [p] if p.is_dir() else []
 
 
 def _build_bitcode(
