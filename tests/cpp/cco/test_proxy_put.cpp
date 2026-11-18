@@ -51,6 +51,9 @@
 //                  kernel_payload, calls fence() once, then puts it as
 //                  kFencePieces puts per peer (the last carrying SignalInc)
 //                  and flushes
+//   block_2d_flush flush_count and mpsc_payload with ccoCoopBlock in 32x4 blocks
+//   block_2d_payload (wavefront 0 is linear threads 0..63); flushDone advances
+//                  by exactly one per flush
 //   sq_full        one queue puts its chunk kSqRepeats times per peer with no
 //                  flush in between, more WRs than a proxy QP's SQ holds, so
 //                  the proxy waits for SQ credit
@@ -196,6 +199,9 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
   const int u = blockIdx.x;
   const int me = dc.rank;
   const int n = dc.worldSize;
+  // Linear thread id: the block may be 2-D (block_2d_*).
+  const int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+  const int nThreads = blockDim.x * blockDim.y * blockDim.z;
   ccoProxy<Q, F> proxy{dc, u};
   auto srcOff = [&](int p) { return (static_cast<size_t>(p) * nUnits + u) * chunk; };
   const size_t dstOff = (static_cast<size_t>(me) * nUnits + u) * chunk;
@@ -204,7 +210,7 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
     for (int p = 0; p < n; p++) {
       if (p == me) continue;
       uint32_t* src = sendLocal + srcOff(p) / sizeof(uint32_t);
-      for (size_t i = threadIdx.x; i < chunk / sizeof(uint32_t); i += blockDim.x) {
+      for (size_t i = tid; i < chunk / sizeof(uint32_t); i += nThreads) {
         src[i] = Pattern(salt, me, p, u, i);
       }
     }
@@ -252,7 +258,7 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
       // This wavefront owns the queue: its FLUSH is the only one in flight.
       const uint64_t after =
           __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      if (threadIdx.x == 0 && after != before + 1) {
+      if (tid == 0 && after != before + 1) {
         printf("[rank %d] flush_count: unit %d flushDone %llu -> %llu\n", me, u,
                (unsigned long long)before, (unsigned long long)after);
         atomicExch(err, 1);
@@ -264,7 +270,7 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
     for (int p = 0; p < n; p++) {
       if (p == me) continue;
       uint32_t* src = sendLocal + srcOff(p) / sizeof(uint32_t);
-      for (size_t i = threadIdx.x; i < chunk / sizeof(uint32_t); i += blockDim.x) src[i] = kClobber;
+      for (size_t i = tid; i < chunk / sizeof(uint32_t); i += nThreads) src[i] = kClobber;
     }
     __threadfence_system();
     __syncthreads();
@@ -274,16 +280,16 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
       if (p != me) proxy.signal(p, ccoGda_SignalInc{Slot(me, u)}, Coop{});
     }
   }
-  if (threadIdx.x == 0) {
-    for (int s = 0; s < n; s++) {
-      if (s == me) continue;
-      if constexpr (Mode == kPutWindowSignal) {
+  for (int s = 0; s < n; s++) {
+    if (s == me) continue;
+    if constexpr (Mode == kPutWindowSignal) {
+      if (tid == 0) {
         while (__hip_atomic_load(&flagLocal[Slot(s, u)], __ATOMIC_RELAXED,
                                  __HIP_MEMORY_SCOPE_SYSTEM) < 1) {
         }
-      } else {
-        proxy.waitSignal(Slot(s, u), 1);
       }
+    } else {
+      proxy.waitSignal(Slot(s, u), 1, Coop{});  // one waiter per group
     }
   }
 }
@@ -876,7 +882,7 @@ struct Ctx {
 // the proxy posts any size up to the real limit), so put() splits.
 template <typename Q, typename Coop, int Mode, ccoProxyFenceMode F = ccoProxyFenceEachOp>
 static int RunPutCase(Ctx& c, const char* name, uint32_t salt, size_t chunk, int nUnits,
-                      int blockDim, const ccoDevComm* dev = nullptr, uint64_t maxPutBytes = 0) {
+                      dim3 blockDim, const ccoDevComm* dev = nullptr, uint64_t maxPutBytes = 0) {
   ccoDevComm d = dev ? *dev : c.dc;
   if (maxPutBytes != 0) d.proxy.maxPutBytes = maxPutBytes;
   c.Fresh(d, salt, chunk, nUnits,
@@ -1173,6 +1179,11 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunPutCase<MPSCD2HQueue, ccoCoopWarp, kPutCallerFence, ccoProxyFenceCaller>(
       c, "mpsc_caller", 28, kChunk, kMaxUnits, 64);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutRepeat>(c, "sq_full", 12, kChunk, 1, 64);
+  // 32x4 blocks: wavefront 0 is linear threads 0..63 (rows 0 and 1).
+  fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutFlushCount>(c, "block_2d_flush", 38, kChunk,
+                                                                  kSpscQueues, dim3(32, 4));
+  fails += RunPutCase<MPSCD2HQueue, ccoCoopBlock, kPutKernelPayload>(
+      c, "block_2d_payload", 39, kChunk, kMaxUnits, dim3(32, 4));
   // kMaxUnits blocks over kMpscQueues MPSC queues: several concurrent producers per queue.
   fails += RunPutCase<MPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "mpsc_put_sig", 7, kChunk,
                                                              kMaxUnits, 64);

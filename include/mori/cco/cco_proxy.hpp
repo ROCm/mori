@@ -103,8 +103,9 @@
 // caller window, issue it yourself.
 //
 // Calling convention: put / putValue / signal / flush are called by the whole
-// Coop group from converged code, and the issuing wavefront (the calling wavefront for
-// ccoCoopWarp and ccoCoopLaneMasked, wavefront 0 for ccoCoopBlock) must have
+// Coop group from converged code, and the issuing wavefront (the calling
+// wavefront for ccoCoopWarp and ccoCoopLaneMasked, wavefront 0 -- linear
+// thread ids 0..63, also in 2-D and 3-D blocks -- for ccoCoopBlock) must have
 // all 64 lanes active: a KIWI push is wavefront-collective. A push from a
 // partial wavefront traps (a compare per push), so does a ccoCoopLaneMasked
 // call from a divergent branch such as `if (i < n) put(..., ccoCoopLaneMasked{})`.
@@ -223,6 +224,15 @@ inline constexpr uint64_t ccoProxyFailedBit = 1ull << 63;
 #if defined(__HIPCC__)
 
 namespace impl {
+
+// Linear thread id in the block (x fastest): wavefront w holds ids
+// [64w, 64w + 64) in 1-D, 2-D and 3-D blocks alike.
+__device__ inline unsigned proxyLinearTid() {
+  return __builtin_amdgcn_workitem_id_x() +
+         __builtin_amdgcn_workgroup_size_x() *
+             (__builtin_amdgcn_workitem_id_y() +
+              __builtin_amdgcn_workgroup_size_y() * __builtin_amdgcn_workitem_id_z());
+}
 
 // Resolve a remote action to a signal descriptor, as ccoGda::put does.
 template <typename RemoteAction>
@@ -411,11 +421,13 @@ struct ccoProxy {
                                                         comm.ibgda.signalShadows, signalId, bits);
   }
   // As ccoGda::waitSignal, but traps once the DevComm failed, and acquires.
+  // One thread of the group waits (lane 0 / linear thread 0 for ccoCoopWarp /
+  // ccoCoopBlock, also in 2-D and 3-D blocks).
   template <typename Coop = ccoCoopThread>
   __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop = Coop{},
                                     int bits = 64) {
     coop.sync();
-    if (coop.thread_rank() == 0) waitSignalOrTrap(signalId, least, bits);
+    if (groupLeader(coop)) waitSignalOrTrap(signalId, least, bits);
     coop.sync();
   }
   __device__ inline void resetSignal(ccoGdaSignal_t signalId) {
@@ -434,11 +446,25 @@ struct ccoProxy {
                       std::is_same_v<Coop, ccoCoopBlock> || std::is_same_v<Coop, ccoCoopLaneMasked>,
                   "ccoProxy supports ccoCoopWarp, ccoCoopBlock and (put/signal) ccoCoopLaneMasked");
     if constexpr (std::is_same_v<Coop, ccoCoopBlock>) {
-      // Wavefront 0. (Not impl::warpSize(): core/utils.hpp, pulled in by
-      // cco_scale_out.hpp, defines a `warpSize` macro.)
-      return impl::threadIdxX() < static_cast<unsigned>(__builtin_amdgcn_wavefrontsize());
+      // Wavefront 0, by linear id: in a 2-D block threadIdx.x < 64 spans
+      // several wavefronts. (Not impl::warpSize(): core/utils.hpp, pulled in
+      // by cco_scale_out.hpp, defines a `warpSize` macro.)
+      return impl::proxyLinearTid() < static_cast<unsigned>(__builtin_amdgcn_wavefrontsize());
     } else {
       return true;  // the calling wavefront
+    }
+  }
+
+  // The one thread of the group that waits: ccoCoopWarp and ccoCoopBlock
+  // count lanes / threads by threadIdx.x only, wrong in 2-D blocks.
+  template <typename Coop>
+  __device__ static inline bool groupLeader(const Coop& coop) {
+    if constexpr (std::is_same_v<Coop, ccoCoopBlock>) {
+      return impl::proxyLinearTid() == 0;
+    } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
+      return __lane_id() == 0;
+    } else {
+      return coop.thread_rank() == 0;
     }
   }
 
@@ -587,7 +613,7 @@ __device__ inline ccoProxy<Queue, Fence>::ccoProxy(ccoDevComm const& comm_, int 
   const int poolSize = kSpsc ? comm.proxy.numSpscQueues : comm.proxy.numMpscQueues;
   if (__builtin_expect(poolSize <= 0, 0)) {
 #ifndef NDEBUG  // see the file comment
-    if (impl::threadIdxX() == 0) {
+    if (impl::proxyLinearTid() == 0) {
       printf("ccoProxy: the DevComm has no %s proxy queues (set %s in ccoDevCommRequirements)\n",
              kSpsc ? "SPSC" : "MPSC", kSpsc ? "proxySpscQueueCount" : "proxyMpscQueueCount");
     }
