@@ -237,6 +237,48 @@ DATA_PATH_TAG = {
 PROXY_SIGNAL_TAG = {**SIGNAL_TAG, SignalOp.SET: "set"}
 PROXY_POOL_TAG = {ProxyPool.SPSC: "spsc", ProxyPool.MPSC: "mpsc"}
 
+# ccoProxy axes per op: (coop tags, signal tags or None).
+_PROXY_OPS = {
+    "put": (("warp", "block"), ("none", "inc", "add", "set")),
+    "put_value": (("warp", "block"), ("none", "set")),
+    "signal": (("warp", "block"), ("inc", "add", "set")),
+    "flush": (("warp", "block"), None),
+    "flush_timeout": (("warp", "block"), None),
+    "wait_signal": (("warp", "block"), None),
+    "read_signal": (None, None),
+    "reset_signal": (None, None),
+    "failed": (None, None),
+}
+_PROXY_COOP_TAG = {CoopScope.WARP: "warp", CoopScope.BLOCK: "block"}
+
+
+def proxy_op_name(op, coop=None, signal_op=None, pool=ProxyPool.SPSC):
+    """Name of the ccoProxy extern for ``op`` and its axes, e.g.
+    ``("put", CoopScope.WARP, SignalOp.SET, ProxyPool.SPSC)`` ->
+    ``proxy_put_warp_set_spsc``. Axes the op does not have are ignored."""
+    coops, sigs = _PROXY_OPS[op]
+    parts = [f"proxy_{op}"]
+    if coops is not None:
+        tag = _PROXY_COOP_TAG.get(coop) if not isinstance(coop, bool) else None
+        if tag not in coops:
+            raise ValueError(
+                f"cco: Proxy {op} coop must be CoopScope.WARP or BLOCK, not {coop!r}"
+            )
+        parts.append(tag)
+    if sigs is not None:
+        tag = (
+            PROXY_SIGNAL_TAG.get(signal_op) if not isinstance(signal_op, bool) else None
+        )
+        if tag not in sigs:
+            names = ", ".join(f"SignalOp.{t.upper()}" for t in sigs)
+            raise ValueError(f"cco: Proxy {op} signal_op must be one of {names}")
+        parts.append(tag)
+    if isinstance(pool, bool) or pool not in PROXY_POOL_TAG:
+        raise ValueError("cco: Proxy pool must be ProxyPool.SPSC or ProxyPool.MPSC")
+    parts.append(PROXY_POOL_TAG[pool])
+    return "_".join(parts)
+
+
 GDA_DATA_TAGS = tuple(DATA_PATH_TAG.values())
 GDA_SIGNAL_TAGS = tuple(SIGNAL_TAG.values())
 COOP_TAGS = tuple(COOP_TAG.values())
@@ -710,6 +752,7 @@ __all__ = [
     "SIGNAL_TAG",
     "PROXY_SIGNAL_TAG",
     "PROXY_POOL_TAG",
+    "proxy_op_name",
     "COOP_TAG",
     "DATA_PATH_TAG",
     "GDA_DATA_TAGS",

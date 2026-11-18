@@ -530,6 +530,71 @@ def test_flydsl_gda_doorbell_picks_symbols(monkeypatch):
         handles.DevComm.gda(None, 0, doorbell=3)
 
 
+def test_flydsl_proxy_picks_symbols(monkeypatch):
+    pytest.importorskip("flydsl")
+    from mori.cco.device.flydsl import _internal, handles
+
+    called = []
+    monkeypatch.setattr(
+        _internal._LazyExtern,
+        "__call__",
+        lambda self, *args: called.append((self._symbol, args)) or 0,
+    )
+
+    class FakeProxy:  # Proxy's methods on plain attributes; no trace needed
+        dev_comm, queue = 1, 2
+
+        def __init__(self, pool):
+            self.pool = pool
+
+    # Same op names as the Triton facade.
+    names = {k for k in vars(cco.Proxy) if not k.startswith("_")}
+    assert names <= set(vars(handles.Proxy))
+    for name in names | {"_q"}:
+        setattr(FakeProxy, name, getattr(handles.Proxy, name))
+
+    sig, warp = handles.SignalOp, handles.CoopScope.WARP
+    for pool, tag in ((ProxyPool.SPSC, "spsc"), (ProxyPool.MPSC, "mpsc")):
+        called.clear()
+        proxy = FakeProxy(pool)
+        proxy.put(1, 0, 0, 0, 0, 64, signal_op=sig.SET, team=handles.Team.GDA)
+        proxy.put_value(1, 0, 0, 7, coop=warp, queue=5)
+        proxy.signal(1, signal_op=sig.ADD, signal_val=3)
+        proxy.flush(coop=warp)
+        proxy.flush_timeout(100)
+        proxy.wait_signal(0, 1)
+        proxy.read_signal(0)
+        proxy.reset_signal(0)
+        proxy.failed()
+        assert [symbol for symbol, _ in called] == [
+            f"cco_proxy_put__block__set__{tag}",
+            f"cco_proxy_put_value__warp__none__{tag}",
+            f"cco_proxy_signal__block__add__{tag}",
+            f"cco_proxy_flush__warp__{tag}",
+            f"cco_proxy_flush_timeout__block__{tag}",
+            f"cco_proxy_wait_signal__block__{tag}",
+            f"cco_proxy_read_signal__{tag}",
+            f"cco_proxy_reset_signal__{tag}",
+            f"cco_proxy_failed__{tag}",
+        ]
+        # The queue is the second argument: the handle's, or the call's.
+        assert [args[1] for _, args in called] == [2, 5] + [2] * 7
+        assert called[0][1][-1] == GdaFlags.TEAM_GDA
+        assert called[1][1][-1] == 0
+
+    proxy = FakeProxy(ProxyPool.SPSC)
+    with pytest.raises(ValueError, match="coop must be"):
+        proxy.flush(coop=handles.CoopScope.THREAD)
+    with pytest.raises(ValueError, match="signal_op must be"):
+        proxy.put_value(1, 0, 0, 7, signal_op=sig.INC)
+    with pytest.raises(ValueError, match="signal_op must be"):
+        proxy.signal(1, signal_op=sig.NONE)
+    with pytest.raises(TypeError, match="compile-time constant"):
+        proxy.put(1, 0, 0, 0, 0, 64, signal_op=object())
+    with pytest.raises(ValueError, match="pool must be"):
+        handles.DevComm.proxy(None, 0, pool=2)
+
+
 def test_cco_bitcode_cache_key_follows_ccqe(monkeypatch, tmp_path):
     """-DIONIC_CCQE changes the bitcode, so each mode gets its own cache dir."""
     from types import SimpleNamespace
