@@ -55,7 +55,8 @@
 // The C functions below are a torch.cuda.memory.CUDAPluggableAllocator backend
 // (mori.io.HipGemAllocator). MORI_HIP_GEM_PIN_DEVICE names the RDMA device used
 // for the one-page pin; by default it is the first of the devices MORI_RDMA_DEVICES
-// selects (all if unset) that accepts it.
+// selects (all if unset) that accepts it, trying mlx5 devices last: their dma-buf
+// MRs attach dynamically and do not pin the BO (ionic and bnxt_re ones do).
 
 namespace mori {
 namespace application {

@@ -27,7 +27,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -134,9 +136,21 @@ ibv_pd* NicPd(int i) {
   return gNicPd[i];
 }
 
+// Whether a dma-buf MR of RDMA device i pins the BO. mlx5 attaches dma-bufs dynamically
+// and follows moves the way ODP does, so its MRs leave the BO evictable and uncounted by
+// KFD; ionic and bnxt_re pin it.
+bool PinsDmabuf(int i) {
+  std::string link = std::string("/sys/class/infiniband/") + gNics[i]->name + "/device/driver";
+  char target[PATH_MAX];
+  ssize_t n = readlink(link.c_str(), target, sizeof(target) - 1);
+  if (n <= 0) return true;
+  target[n] = '\0';
+  return std::strstr(target, "mlx5") == nullptr;
+}
+
 // Caller holds gMutex. The RDMA devices that may pin buffers, in the order to try them:
 // MORI_HIP_GEM_PIN_DEVICE alone if set, else the ones MORI_RDMA_DEVICES selects (a list,
-// or "^list" to exclude), else all.
+// or "^list" to exclude), else all; devices whose MRs do not pin go last.
 std::vector<int> PinCandidates() {
   std::vector<std::string> listed;
   bool exclude = false;
@@ -171,12 +185,15 @@ std::vector<int> PinCandidates() {
     for (const std::string& name : listed) {
       if (int i = index(name); i >= 0) order.push_back(i);
     }
-    return order;
+  } else {
+    for (int i = 0; i < gNicCount; ++i) {
+      bool skip = false;
+      for (const std::string& name : listed) skip = skip || name == gNics[i]->name;
+      if (!skip) order.push_back(i);
+    }
   }
-  for (int i = 0; i < gNicCount; ++i) {
-    bool skip = false;
-    for (const std::string& name : listed) skip = skip || name == gNics[i]->name;
-    if (!skip) order.push_back(i);
+  if (!mori::env::GetString("MORI_HIP_GEM_PIN_DEVICE")) {
+    std::stable_partition(order.begin(), order.end(), PinsDmabuf);
   }
   return order;
 }
@@ -209,6 +226,13 @@ ibv_mr* PinPage(void* ptr, int dmabufFd) {
     if (ibv_mr* mr = tryNic(i)) {
       if (gPinNic != i) {
         MORI_APP_INFO("HIP GEM allocator: pinning buffers through RDMA device {}", gNics[i]->name);
+        if (!PinsDmabuf(i)) {
+          MORI_APP_WARN(
+              "HIP GEM allocator: {} does not pin dma-buf memory, so buffers stay evictable and "
+              "hipMemGetInfo does not cover them; set MORI_HIP_GEM_PIN_DEVICE to an ionic or "
+              "bnxt_re device",
+              gNics[i]->name);
+        }
       }
       gPinNic = i;
       return mr;
