@@ -130,7 +130,11 @@ controller that computes tables from the counters below, or the engine itself.
   "idle_bucket_upper_s": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
   "pools": {
     "state": {
-      "table": {"policy": "hand-tuned", "version": 1, "default": {...}, "rules": {"2": {...}}},
+      "table": {
+        "policy": "hand-tuned", "version": 1,
+        "default": {"admit": true, "weight": 1, "demote": true, "retain_s": 0, "promote": "tier"},
+        "rules": {"2": {"admit": true, "weight": 8, "demote": false, "retain_s": 0, "promote": "tier"}}
+      },
       "classes": {
         "2": {
           "declared": 5120, "admitted": 5120, "admitted_bytes": 1546188226560,
