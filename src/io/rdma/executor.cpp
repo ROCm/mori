@@ -221,9 +221,13 @@ RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
 
   bool hasFail = false;
   int numSucc = 0;
+  int postedCredits = 0;  // summed over every split, failed ones included
+  std::vector<ibv_qp*> cutQps;
   RdmaOpRet failedRet;
   for (auto& fut : futs) {
     RdmaOpRet ret = fut.get();
+    postedCredits += ret.postedCredits;
+    cutQps.insert(cutQps.end(), ret.cutQps.begin(), ret.cutQps.end());
     if (ret.Failed()) {
       hasFail = true;
       failedRet = ret;
@@ -231,14 +235,18 @@ RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
       numSucc++;
     }
   }
-  if (hasFail) return failedRet;
+  if (hasFail) {
+    failedRet.postedCredits = postedCredits;
+    failedRet.cutQps = std::move(cutQps);
+    return failedRet;
+  }
 
   if (numSucc == numSplits) {
-    return {StatusCode::SUCCESS, ""};
+    return {StatusCode::SUCCESS, "", postedCredits};
   }
 
   MORI_IO_TRACE("MultithreadExecutor submit request for RdmaBatchReadWrite done");
-  return {StatusCode::IN_PROGRESS, ""};
+  return {StatusCode::IN_PROGRESS, "", postedCredits};
 }
 
 void MultithreadExecutor::Start() {

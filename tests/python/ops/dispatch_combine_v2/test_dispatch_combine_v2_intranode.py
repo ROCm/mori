@@ -112,11 +112,6 @@ def _cases():
     yield "fp8-gather", {"DTYPE": "fp8", "COMBINE": "gather"}
     yield "fp8-gather-tuned", {"DTYPE": "fp8", "COMBINE": "gather", "TUNED": 1}
     # quant paths (scatter-only, compress-on-write)
-    yield "bf16-scatter-fp8direct", {
-        "DTYPE": "bf16",
-        "COMBINE": "scatter",
-        "QUANT": "fp8_direct_cast",
-    }
     yield "bf16-scatter-fp8blockwise", {
         "DTYPE": "bf16",
         "COMBINE": "scatter",

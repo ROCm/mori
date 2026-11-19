@@ -64,6 +64,7 @@ option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_XLA_FFI_OPS "Whether to build mori xla ffi python bindings" OFF)
 option(BUILD_UMBP "Whether to build UMBP (Unified Memory/Bandwidth Pool)" OFF)
 option(BUILD_METRICS "Whether to build the Prometheus metrics server module" ON)
+option(BUILD_NETMON "Build ainic-netmon, the AINIC counter collector (tools/netmon)" ON)
 # OFF builds RAS out: every RAS call in the subsystems compiles to a no-op, and nothing links
 # libmori_ras. ON builds the runtime in, still off until MORI_RAS_ENABLE=1.
 option(BUILD_RAS "Whether to build the MORI RAS runtime" OFF)
@@ -387,6 +388,11 @@ endif()
 
 if(BUILD_RAS)
   add_subdirectory(src/ras)
+endif()
+# ainic-netmon is a standalone C++ tool (libc + kernel headers only); it is built here so the
+# wheel can ship it, but it does not link any mori library.
+if(BUILD_NETMON)
+  add_subdirectory(tools/netmon)
 endif()
 
 if(BUILD_TESTS)

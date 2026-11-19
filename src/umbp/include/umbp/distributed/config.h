@@ -324,6 +324,10 @@ struct PoolClientConfig {
   // into cache_remote_fetches.
   bool ranged_locality_prefetch = true;
 
+  // See UMBPDistributedConfig::remote_single_flight.
+  bool remote_single_flight = true;
+  uint32_t remote_single_flight_wait_ms = 30000;
+
   // Resolve on this node's own media before asking the master to route, and
   // skip the master entirely when the whole batch is local.  See
   // UMBPDistributedConfig::local_first for the reasoning and the multi-node
@@ -424,6 +428,8 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.admission_max_block_bytes = dc.admission_max_block_bytes;
   pc.prefetch_budget_bytes = dc.prefetch_budget_bytes;
   pc.ranged_locality_prefetch = dc.ranged_locality_prefetch;
+  pc.remote_single_flight = dc.remote_single_flight;
+  pc.remote_single_flight_wait_ms = dc.remote_single_flight_wait_ms;
   pc.local_first = dc.local_first;
   // 0 propagates through PoolClient -> MasterClient::RegisterSelf ->
   // proto -> ClientRegistry, where it is interpreted as "use the

@@ -30,6 +30,8 @@ dependencies = []
 # with whatever FlyDSL the host environment already provides. Install with:
 #   pip install amd_mori[flydsl]
 flydsl = ["flydsl"]
+# ainic-netmon-report (tools/netmon): pip install amd_mori[netmon]
+netmon = ["numpy", "plotly"]
 
 [project.urls]
 Homepage = "https://github.com/ROCm/mori"
@@ -37,3 +39,6 @@ Repository = "https://github.com/ROCm/mori"
 
 [project.scripts]
 mori = "mori.cli:main"
+ainic-netmon = "mori.netmon_entry:main"
+ainic-netmon-report = "mori.netmon_entry:report_main"
+ainic-netmon-import = "mori.netmon_entry:import_main"

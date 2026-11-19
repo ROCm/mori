@@ -174,6 +174,8 @@ struct MemoryDesc {
   // byte vector). OFI publishes its MR key here so peers skip the control-plane
   // fetch; base/size come from data/size.
   BackendDescBlobMap backendDescs;
+  // Why no fabric handle was exported; empty on success or without a FABRIC backend.
+  std::string fabricReason;
 
   // Not constexpr: comparing backendDescs (unordered_map) is not a constant expr.
   bool operator==(const MemoryDesc& rhs) const noexcept {
@@ -186,7 +188,7 @@ struct MemoryDesc {
   // Append-only: new fields MUST go at the end to preserve wire compatibility.
   MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode,
                  ipcOffset, fabricHandle, vpodId, vpodPpodId, fabricOffset, fabricAllocSize,
-                 backendDescs);
+                 backendDescs, fabricReason);
 };
 
 using TransferUniqueId = uint64_t;

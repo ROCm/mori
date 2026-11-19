@@ -215,7 +215,6 @@ EpCombinePlan = make_plan("ep_combine")
 INTERNODE_DTYPES = {"bf16": 0, "f32": 1, "fp8_fnuz": 2, "fp8_ocp": 3, "fp4": 4}
 INTERNODE_QUANT_TYPES = {
     "none": 0,
-    "fp8directcast": 1,
     "fp8blockwisequant": 2,
     "fp4blockwisequant": 3,
 }

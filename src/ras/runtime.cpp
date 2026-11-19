@@ -75,7 +75,7 @@ void StopAtExit() {
     g_published.store(nullptr, std::memory_order_release);
     if (core != nullptr) StatusLocked().state = RunState::kStopped;
   }
-  if (core != nullptr) core->Stop();
+  if (core != nullptr) core->Stop(/*sendLeave=*/true);
 }
 
 // The first IPv4 address of `ifname`, else its first global IPv6 address.
@@ -101,6 +101,18 @@ std::string InterfaceAddress(const std::string& ifname) {
   return v4.empty() ? v6 : v4;
 }
 
+// MORI's default level, error, hides the link warnings that RAS is turned on to see. So when
+// MORI_RAS_ENABLE asks for RAS, RAS logs warnings too, unless MORI_RAS_LOG_LEVEL,
+// MORI_GLOBAL_LOG_LEVEL, or the logging API chose a level.
+void ShowWarningsWhenRequested() {
+  ModuleLogger& logs = ModuleLogger::GetInstance();
+  if (logs.HasEnvOverride(modules::RAS) || logs.IsGlobalLevelSet()) return;
+  spdlog::logger* logger = RasLogger();
+  if (logger != nullptr && logger->level() == spdlog::level::err) {
+    logger->set_level(spdlog::level::warn);
+  }
+}
+
 }  // namespace
 
 spdlog::logger* RasLogger() {
@@ -120,7 +132,7 @@ RasCore::RasCore(CoreParams params) : params_(std::move(params)) {
 }
 
 RasCore::~RasCore() {
-  Stop();
+  Stop(/*sendLeave=*/true);
   if (thread_ != nullptr) {
     // Abandoned by Stop: it may still be running, so it keeps the link manager and queue.
     (void)queue_.release();
@@ -195,7 +207,7 @@ void RasCore::ThreadMain() {
   links_->SetIdentity(
       CollectIdentity(params_.nodeId, params_.hostname, params_.host, params_.pid, uuid_));
   while (!links_->StopRequested()) links_->RunOnce(1000);
-  links_->Shutdown();
+  links_->Shutdown(sendLeave_.load(std::memory_order_acquire));
   {
     std::lock_guard<std::mutex> lock(doneMu_);
     threadDone_ = true;
@@ -203,10 +215,11 @@ void RasCore::ThreadMain() {
   doneCv_.notify_all();
 }
 
-void RasCore::Stop() {
+void RasCore::Stop(bool sendLeave) {
   bool expected = false;
   if (!stopped_.compare_exchange_strong(expected, true)) return;
   if (!running_.load()) return;
+  sendLeave_.store(sendLeave, std::memory_order_release);
   links_->RequestStop();
   bool done;
   {
@@ -261,6 +274,7 @@ RasRuntime* RasRuntime::EnsureStarted(const StartParams& params) {
   if (status.state != RunState::kNotStarted) return nullptr;
 
   RasConfig config = ConfigFromEnv();
+  if (config.requested) ShowWarningsWhenRequested();
   for (const std::string& w : config.warnings) {
     if (config.requested) {
       RAS_LOG_ERROR("{}", w);

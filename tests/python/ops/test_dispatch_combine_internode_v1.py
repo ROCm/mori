@@ -195,12 +195,11 @@ def test_dispatch_combine(
 # ---------------------------------------------------------------------------
 # Quantized / cross-dtype coverage for the InterNodeV1 kernels.
 #
-# The matrix above sweeps dtypes but leaves quant_type at its default (none)
-# and derives the combine element type from config.data_type, so the quantized
-# internode configurations the tuning matrix actually ships
-# (tools/run_all_internode_tuning.sh pairs v1 and v1_ll with FP4/FP8 dispatch
-# and a BF16 combine) had no correctness coverage at all. These tests add the
-# quant_type axis and an independent combine dtype.
+# The matrix above sweeps dtypes but derives the combine element type from
+# config.data_type, so the internode configurations the tuning matrix actually
+# ships (tools/run_all_internode_tuning.sh pairs v1 and v1_ll with FP4/FP8
+# dispatch and a BF16 combine) had no correctness coverage at all. These tests
+# add an independent combine dtype.
 # ---------------------------------------------------------------------------
 
 
@@ -215,7 +214,6 @@ def _test_dispatch_combine_cross_dtype(
     num_experts_per_rank,
     num_experts_per_token,
     gpu_per_node,
-    quant_type,
 ):
     dispatch_hidden_dim, combine_hidden_dim, _ = cross_dtype_hidden_dims(
         hidden_dim, data_type, combine_data_type
@@ -230,7 +228,6 @@ def _test_dispatch_combine_cross_dtype(
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
         gpu_per_node=gpu_per_node,
-        quant_type=quant_type,
         combine_data_type=combine_data_type,
     )
     run_ep_dispatch_combine_test(
@@ -251,7 +248,6 @@ def _test_dispatch_combine_cross_dtype(
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (128,))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
-@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast"))
 # gpu_per_node=8 keeps this on a single node; gpu_per_node=4 would additionally
 # route half the traffic over RDMA (see the note on test_dispatch_combine).
 @pytest.mark.parametrize("gpu_per_node", (8,))
@@ -265,10 +261,9 @@ def test_dispatch_combine_cross_dtype(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
-    quant_type,
     gpu_per_node,
 ):
-    skip = cross_dtype_skip_reason(quant_type, data_type, combine_data_type)
+    skip = cross_dtype_skip_reason(data_type, combine_data_type)
     if skip:
         pytest.skip(skip)
 
@@ -286,7 +281,6 @@ def test_dispatch_combine_cross_dtype(
                     num_experts_per_rank,
                     num_experts_per_token,
                     gpu_per_node,
-                    quant_type,
                 ],
             )
         )

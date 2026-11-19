@@ -10,6 +10,8 @@ include tools/build_shmem_bitcode.sh
 include tools/env_check.sh
 include tools/env_setup.sh
 include tools/diagnose_env.sh
+graft tools/netmon
+global-exclude __pycache__ *.py[cod]
 recursive-include python *.py *.md *.bc *.json *.sh *.csv
 include pyproject.toml
 include setup.py

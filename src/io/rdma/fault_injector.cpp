@@ -56,6 +56,7 @@ constexpr NamedValue kKinds[] = {
     {"async_event", static_cast<int>(FaultKind::AsyncEvent)},
     {"port_down", static_cast<int>(FaultKind::PortDown)},
     {"port_flap", static_cast<int>(FaultKind::PortFlap)},
+    {"qp_stuck", static_cast<int>(FaultKind::QpStuck)},
 };
 
 constexpr NamedValue kOpcodes[] = {
@@ -175,7 +176,8 @@ FaultRule ParseFaultRule(const std::string& spec) {
   std::vector<std::string> parts = Split(spec, ':');
   FaultRule rule;
   rule.kind = static_cast<FaultKind>(Lookup(kKinds, parts[0], false));
-  if (rule.kind == FaultKind::PostSendFail || rule.kind == FaultKind::PostRecvFail) {
+  if (rule.kind == FaultKind::PostSendFail || rule.kind == FaultKind::PostRecvFail ||
+      rule.kind == FaultKind::QpStuck) {
     rule.value = EIO;
   } else if (rule.kind == FaultKind::CqeError) {
     rule.value = IBV_WC_RETRY_EXC_ERR;
@@ -263,8 +265,11 @@ void FaultInjector::Arm(const FaultRule& rule) {
     triggered_ = 0;
     failed_.store(false, std::memory_order_relaxed);
     qps_.clear();
+    dataWrsInFlight_.clear();
+    stuckQps_.clear();
   }
   fired_.store(0, std::memory_order_relaxed);
+  tracking_.store(true, std::memory_order_release);
   armed_.store(true, std::memory_order_release);
   MORI_IO_WARN("Fault injection armed: kind={} skip={} count={} value={} op={} qpn={}",
                FaultKindName(rule.kind), rule.skip, rule.count, rule.value, rule.wcOpcode,
@@ -274,6 +279,9 @@ void FaultInjector::Arm(const FaultRule& rule) {
 void FaultInjector::Disarm() noexcept try {
   std::lock_guard<std::mutex> lock(mu_);
   armed_.store(false, std::memory_order_release);
+  tracking_.store(false, std::memory_order_release);
+  dataWrsInFlight_.clear();
+  stuckQps_.clear();
   // Rule exhaustion already stopped new triggers. Only port_down uses explicit
   // Disarm as recovery; a flap must finish its timed interval independently.
   for (auto it = downPorts_.begin(); it != downPorts_.end();) {
@@ -331,10 +339,21 @@ void FaultInjector::RememberQp(ibv_qp* qp) {
   qps_[qp->context][qp->qp_num] = qp;
 }
 
+int FaultInjector::ModifyQp(ibv_qp* qp, ibv_qp_attr* attr, int attrMask) {
+  int value = 0;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (stuckQps_.count(qp)) value = rule_.value;
+  }
+  if (value != 0) {
+    RecordInjection(FaultKind::QpStuck, qp->qp_num, -1, value);
+    return value;
+  }
+  return real_.ModifyQp(qp, attr, attrMask);
+}
+
 bool FaultInjector::MoveQpToError(ibv_qp* qp) {
-  ibv_qp_attr attr{};
-  attr.qp_state = IBV_QPS_ERR;
-  int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+  int ret = ModifyQpToError(real_, qp);
   if (ret != 0) FailInjection("ibv_modify_qp(ERR)", ret);
   return ret == 0;
 }
@@ -355,6 +374,15 @@ int FaultInjector::PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) {
         *bad = wr;
         return value;
       }
+      if (ShouldFire(FaultKind::QpStuck, qp->qp_num, -1, &value)) {
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          stuckQps_.insert(qp);
+        }
+        RecordInjection(FaultKind::QpStuck, qp->qp_num, -1, value);
+        *bad = wr;
+        return value;
+      }
       if (ShouldFire(FaultKind::QpError, qp->qp_num, -1, &value) && MoveQpToError(qp)) {
         RecordInjection(FaultKind::QpError, qp->qp_num, -1, value);
       }
@@ -366,9 +394,44 @@ int FaultInjector::PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) {
   } catch (...) {
     FailInjection("preparing send injection");
   }
+  auto trackedData = [](const ibv_send_wr* cur) {
+    const bool data = cur->opcode == IBV_WR_RDMA_WRITE ||
+                      cur->opcode == IBV_WR_RDMA_WRITE_WITH_IMM || cur->opcode == IBV_WR_RDMA_READ;
+    return data && (cur->send_flags & IBV_SEND_SIGNALED);
+  };
+  // Register before posting: once posted, a WR's completion can be polled (and
+  // erased) before this thread runs again.
+  const bool tracking = tracking_.load(std::memory_order_acquire);
+  if (tracking) {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (ibv_send_wr* cur = wr; cur != nullptr; cur = cur->next) {
+      if (trackedData(cur)) dataWrsInFlight_[{qp->context, qp->qp_num, cur->wr_id}] = qp;
+    }
+  }
   int ret = real_.PostSend(qp, wr, bad);
+  if (tracking && ret != 0) {
+    // *bad and the WRs after it were not posted.
+    std::lock_guard<std::mutex> lock(mu_);
+    for (ibv_send_wr* cur = *bad; cur != nullptr; cur = cur->next) {
+      if (trackedData(cur)) dataWrsInFlight_.erase({qp->context, qp->qp_num, cur->wr_id});
+    }
+  }
   if (inject) PublishAsyncEvent(qp, SendOpcode(wr), event);
   return ret;
+}
+
+std::string FaultInjector::DataWrInFlight() {
+  std::lock_guard<std::mutex> lock(mu_);
+  for (const auto& [key, qp] : dataWrsInFlight_) {
+    if (deadDevices_.count(qp->context) || deadCqs_.count(qp->send_cq)) continue;
+    ibv_qp_attr attr{};
+    ibv_qp_init_attr init{};
+    if (ibv_query_qp(qp, &attr, IBV_QP_STATE, &init) == 0 && attr.qp_state == IBV_QPS_ERR) continue;
+    return "qpn=" + std::to_string(std::get<1>(key)) +
+           " wr_id=" + std::to_string(std::get<2>(key)) + " (QP state " +
+           std::to_string(attr.qp_state) + ")";
+  }
+  return "";
 }
 
 int FaultInjector::PostRecv(ibv_qp* qp, ibv_recv_wr* wr, ibv_recv_wr** bad) {
@@ -405,6 +468,10 @@ int FaultInjector::PollCq(ibv_cq* cq, int numEntries, ibv_wc* wc) try {
     if (deadCqs_.count(cq) || deadDevices_.count(cq->context)) return 0;
   }
   int n = real_.PollCq(cq, numEntries, wc);
+  if (n > 0 && tracking_.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (int i = 0; i < n; ++i) dataWrsInFlight_.erase({cq->context, wc[i].qp_num, wc[i].wr_id});
+  }
   // A fatal injection can race a poll already inside the provider.
   if (hasDeadResources_.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lock(mu_);
