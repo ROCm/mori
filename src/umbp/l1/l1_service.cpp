@@ -49,8 +49,9 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
 
   grpc::Status Attach(grpc::ServerContext*, const pb::AttachRequest* request,
                       pb::AttachResponse* response) override {
-    AttachResult result =
-        manager_->Attach(request->pool_id(), request->group(), request->device(), request->bytes());
+    ExternalMemory external{request->external_handle(), request->external_offset()};
+    AttachResult result = manager_->Attach(request->pool_id(), request->group(),
+                                           request->device(), request->bytes(), external);
     SetStatus(result.status, response);
     response->set_handle_kind(result.memory.kind);
     response->set_handle(result.memory.handle);
@@ -124,8 +125,12 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
   grpc::Status Fetch(grpc::ServerContext*, const pb::FetchRequest* request,
                      pb::FetchResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    FetchResult result = manager_->Fetch(request->pool_id(), keys);
+    FetchOptions options;
+    options.dst_slots.assign(request->dst_slots().begin(), request->dst_slots().end());
+    options.probe_only = request->probe_only();
+    FetchResult result = manager_->Fetch(request->pool_id(), keys, options);
     SetStatus(result.status, response);
+    response->set_available(result.available);
     for (uint32_t slot : result.slots) response->add_slots(slot);
     for (std::string& key : result.evicted_keys) response->add_evicted_keys(std::move(key));
     response->set_copied_slots(result.copied_slots);
@@ -230,12 +235,14 @@ L1Client::L1Client(const std::string& address) : impl_(std::make_unique<Impl>(ad
 L1Client::~L1Client() = default;
 
 AttachResult L1Client::Attach(const std::string& pool_id, const std::string& group, int device,
-                              uint64_t bytes) {
+                              uint64_t bytes, const ExternalMemory& external) {
   pb::AttachRequest request;
   request.set_pool_id(pool_id);
   request.set_group(group);
   request.set_device(device);
   request.set_bytes(bytes);
+  request.set_external_handle(external.handle);
+  request.set_external_offset(external.offset);
   pb::AttachResponse response;
   // A long deadline: the server allocates and zero-fills the whole pool.
   grpc::ClientContext context;
@@ -321,10 +328,13 @@ Status L1Client::Apply(const std::string& pool_id, const std::vector<Op>& ops, u
   return FromResponse(impl_->stub_->Apply(&context, request, &response), response);
 }
 
-FetchResult L1Client::Fetch(const std::string& pool_id, const std::vector<std::string>& keys) {
+FetchResult L1Client::Fetch(const std::string& pool_id, const std::vector<std::string>& keys,
+                            const FetchOptions& options) {
   pb::FetchRequest request;
   request.set_pool_id(pool_id);
   for (const std::string& key : keys) request.add_keys(key);
+  for (uint32_t slot : options.dst_slots) request.add_dst_slots(slot);
+  request.set_probe_only(options.probe_only);
   pb::FetchResponse response;
   grpc::ClientContext context;
   Impl::Bound(&context);
@@ -335,6 +345,7 @@ FetchResult L1Client::Fetch(const std::string& pool_id, const std::vector<std::s
   result.copied_slots = response.copied_slots();
   result.copied_bytes = response.copied_bytes();
   result.copy_micros = response.copy_micros();
+  result.available = response.available();
   return result;
 }
 

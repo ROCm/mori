@@ -44,7 +44,20 @@ class RecordingApi final : public MemoryApi {
     bases[device] = static_cast<uint8_t*>(*base);
     return true;
   }
-  void Free(int device, void* base, uint64_t bytes) override { host_->Free(device, base, bytes); }
+  void Free(int device, void* base, uint64_t bytes) override {
+    ++frees;
+    host_->Free(device, base, bytes);
+  }
+  bool Import(int device, const std::string& handle, uint64_t offset, void** base, void** mapped,
+              std::string* error) override {
+    if (!host_->Import(device, handle, offset, base, mapped, error)) return false;
+    bases[device] = static_cast<uint8_t*>(*base);
+    return true;
+  }
+  void Unimport(int device, void* mapped) override {
+    ++unimports;
+    host_->Unimport(device, mapped);
+  }
   bool Copy(int dst_device, void* dst, int src_device, const void* src, uint64_t bytes,
             std::string* error) override {
     ++copies;
@@ -63,6 +76,8 @@ class RecordingApi final : public MemoryApi {
   std::map<int, uint8_t*> bases;
   int copies = 0;
   int synchronizes = 0;
+  int frees = 0;
+  int unimports = 0;
   bool fail_copies = false;
 
  private:
@@ -390,6 +405,29 @@ TEST_F(L1PoolTest, DetachRemovesThePoolAsASource) {
   ASSERT_TRUE(manager->Detach("p0").ok);
   EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
   EXPECT_FALSE(manager->Allocate("p0", 1).status.ok);
+}
+
+TEST_F(L1PoolTest, AdoptedMemoryIsSharedButNeverZeroedOrFreed) {
+  // The owner's allocation: a header before the pool, and content already in it.
+  std::vector<uint8_t> owned(64 + kBytes, 0xEE);
+  const uint64_t address = reinterpret_cast<uint64_t>(owned.data());
+  ExternalMemory external{std::string(reinterpret_cast<const char*>(&address), sizeof(address)),
+                          64};
+  ASSERT_TRUE(manager->Attach("adopted", "g", 2, kBytes, external).status.ok);
+  EXPECT_EQ(api->bases[2], owned.data() + 64);
+  EXPECT_EQ(owned[64], 0xEE);  // not zeroed
+  ASSERT_TRUE(manager->BindLayout("adopted", TestLayout()).ok);
+  ASSERT_EQ(manager->Open("adopted").num_slots, kSlots);
+  // Its blocks are a source for other pools and a destination like any slot.
+  Cache(0, {"k"}, 7);
+  ASSERT_TRUE(manager->Commit("p0", UINT64_MAX).ok);
+  FetchResult got = manager->Fetch("adopted", {"k"});
+  ASSERT_EQ(got.slots.size(), 1u);
+  EXPECT_TRUE(Holds(2, got.slots[0], 7));
+  const int frees = api->frees;
+  ASSERT_TRUE(manager->Detach("adopted").ok);
+  EXPECT_EQ(api->frees, frees);  // the owner frees it
+  EXPECT_EQ(api->unimports, 1);
 }
 
 TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {
