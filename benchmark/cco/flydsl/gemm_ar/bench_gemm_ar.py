@@ -493,6 +493,7 @@ def run(args) -> int:
                 atomic_order=args.atomic,
                 chunk_bands=args.chunk_bands,
                 relaxed_rows=args.relaxed_rows,
+                fp8_lds_epilogue=not args.no_fp8_lds_epilogue,
             )
         if not args.raw_jit:
             gemm = _PinnedLaunch(gemm)
@@ -558,6 +559,7 @@ def run(args) -> int:
                 fuse_quantize=args.fuse_quantize,
                 fuse_reduce_push=args.fuse_reduce_push,
                 publish=args.publish,
+                fp8_wide_reduce=not args.no_fp8_wide_reduce,
             )
             if not args.raw_jit:
                 orders = ("order", "fused_order", "rs_order", "fused_rs_order")
@@ -705,6 +707,8 @@ def run(args) -> int:
                 # record separated from its command line cannot say which ran.
                 "gather_dtype": args.gather_dtype,
                 "scatter_dtype": args.scatter_dtype,
+                "fp8_lds_epilogue": not args.no_fp8_lds_epilogue,
+                "fp8_wide_reduce": not args.no_fp8_wide_reduce,
                 "gather_transport": args.gather_transport,
                 "fuse_quantize": args.fuse_quantize,
                 "fuse_reduce_push": args.fuse_reduce_push,
@@ -931,6 +935,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--scatter-dtype", choices=("bf16", "fp8"), default="bf16")
+    p.add_argument(
+        "--no-fp8-lds-epilogue",
+        action="store_true",
+        help="fp8 scatter: quantise from the window instead of the LDS-staged tile",
+    )
+    p.add_argument(
+        "--no-fp8-wide-reduce",
+        action="store_true",
+        help="fp8 scatter: reduce 8 fp8 elements per lane per load instead of 16",
+    )
     p.add_argument(
         "--raw-jit", action="store_true", help="debug the unpinned JIT call path"
     )

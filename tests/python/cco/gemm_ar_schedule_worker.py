@@ -160,6 +160,31 @@ def main():
                 for m in (4200, 8200):
                     mp = op.padded_m(m)
                     key = op._row_plan(mp, m)
+                    wcfg = op._make_cfg(mp, m)
+
+                    def payload():
+                        return (
+                            from_gpu_ptr(
+                                op.mem.ptr + wcfg.input_off,
+                                (wcfg.m, wcfg.n),
+                                torch.uint8,
+                            ).clone(),
+                            from_gpu_ptr(
+                                op.mem.ptr + wcfg.input_scale_off,
+                                (wcfg.m, wcfg.n // 256),
+                                torch.float32,
+                            ).clone(),
+                        )
+
+                    # The default epilogue quantises from an LDS-staged tile and
+                    # leaves no bf16 partial in the window. Keep its FP8 payload,
+                    # check the window-staged epilogue's quantisation against its
+                    # bf16 partial, and require both payloads to be identical.
+                    calls[m]()
+                    torch.cuda.synchronize()
+                    lds_payload = payload()
+                    lds_epilogue, op.fp8_lds_epilogue = op.fp8_lds_epilogue, False
+                    default_plan = op._cache.pop(key)
                     plan = op._compiled(mp, m)
                     saved = []
 
@@ -169,7 +194,11 @@ def main():
                     op._cache[key] = plan._replace(tail=(save_partial, *plan.tail))
                     output = calls[m]()
                     torch.cuda.synchronize()
-                    op._cache[key] = plan
+                    assert all(
+                        torch.equal(x, y) for x, y in zip(lds_payload, payload())
+                    ), ("FP8 payload differs between epilogues", rank, m)
+                    op.fp8_lds_epilogue = lds_epilogue
+                    op._cache[key] = default_plan
                     wires.append(
                         dict(
                             m=m,
