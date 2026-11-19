@@ -113,6 +113,37 @@ class HipMemoryApi final : public MemoryApi {
     (void)hipFree(base);
   }
 
+  bool Import(int device, const std::string& handle, uint64_t offset, void** base, void** mapped,
+              std::string* error) override {
+    hipIpcMemHandle_t ipc;
+    if (handle.size() != sizeof(ipc.reserved)) {
+      *error = "external handle is not a hip_ipc handle";
+      return false;
+    }
+    std::memcpy(ipc.reserved, handle.data(), sizeof(ipc.reserved));
+    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+    ScopedDevice scope(device);
+    if (!scope.ok()) {
+      *error = "hipSetDevice(" + std::to_string(device) + ") failed";
+      return false;
+    }
+    void* ptr = nullptr;
+    const hipError_t err = hipIpcOpenMemHandle(&ptr, ipc, hipIpcMemLazyEnablePeerAccess);
+    if (err != hipSuccess || ptr == nullptr) {
+      *error = HipError("hipIpcOpenMemHandle", err);
+      return false;
+    }
+    *mapped = ptr;
+    *base = static_cast<char*>(ptr) + offset;
+    return true;
+  }
+
+  void Unimport(int device, void* mapped) override {
+    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+    ScopedDevice scope(device);
+    (void)hipIpcCloseMemHandle(mapped);
+  }
+
   bool Copy(int dst_device, void* dst, int /*src_device*/, const void* src, uint64_t bytes,
             std::string* error) override {
     std::lock_guard<std::mutex> hip_lock(hip_mutex_);
@@ -161,6 +192,21 @@ class HostMemoryApi final : public MemoryApi {
     return true;
   }
   void Free(int /*device*/, void* base, uint64_t /*bytes*/) override { std::free(base); }
+  // In-process stand-in for an exported allocation: the handle carries the
+  // allocation's address (8 bytes, little-endian).
+  bool Import(int /*device*/, const std::string& handle, uint64_t offset, void** base,
+              void** mapped, std::string* error) override {
+    uint64_t address = 0;
+    if (handle.size() != sizeof(address)) {
+      *error = "a host handle is an 8-byte address";
+      return false;
+    }
+    std::memcpy(&address, handle.data(), sizeof(address));
+    *mapped = reinterpret_cast<void*>(address);
+    *base = static_cast<char*>(*mapped) + offset;
+    return true;
+  }
+  void Unimport(int /*device*/, void* /*mapped*/) override {}
   bool Copy(int /*dst_device*/, void* dst, int /*src_device*/, const void* src, uint64_t bytes,
             std::string* /*error*/) override {
     std::memcpy(dst, src, static_cast<size_t>(bytes));
@@ -277,14 +323,19 @@ void PoolManager::DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool) 
   pool = FindLocked(pool_id);
   if (pool == nullptr) return;
   for (uint32_t slot = 0; slot < pool->slots.size(); ++slot) UnindexLocked(pool, slot);
-  api_->Free(pool->device, pool->base, pool->bytes);
-  MORI_UMBP_INFO("[L1Pool] destroyed pool={} device={} bytes={}", pool_id, pool->device,
-                 pool->bytes);
+  if (pool->external) {
+    api_->Unimport(pool->device, pool->mapped);
+  } else {
+    api_->Free(pool->device, pool->base, pool->bytes);
+  }
+  MORI_UMBP_INFO("[L1Pool] destroyed pool={} device={} bytes={}{}", pool_id, pool->device,
+                 pool->bytes, pool->external ? " (adopted, unmapped)" : "");
   pools_.erase(pool_id);
 }
 
 AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& group, int device,
-                                 uint64_t bytes) {
+                                 uint64_t bytes, const ExternalMemory& external) {
+  const bool adopt = !external.handle.empty();
   AttachResult result;
   if (pool_id.empty() || bytes == 0 || device < 0) {
     result.status = Status::Error("attach needs a pool id, a device and a non-zero size");
@@ -296,7 +347,8 @@ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& 
     return result;
   }
   if (Pool* existing = FindLocked(pool_id)) {
-    if (existing->group == group && existing->device == device && existing->bytes == bytes) {
+    if (existing->group == group && existing->device == device && existing->bytes == bytes &&
+        existing->external == adopt && existing->external_handle == external.handle) {
       result.memory = existing->exported;
       result.bytes = existing->bytes;
       result.created = false;
@@ -309,9 +361,12 @@ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& 
   attaching_.insert(pool_id);
   lock.unlock();
   void* base = nullptr;
+  void* mapped = nullptr;
   ExportedMemory exported;
   std::string error;
-  const bool ok = api_->Allocate(device, bytes, &base, &exported, &error);
+  const bool ok = adopt ? api_->Import(device, external.handle, external.offset, &base, &mapped,
+                                       &error)
+                        : api_->Allocate(device, bytes, &base, &exported, &error);
   lock.lock();
   attaching_.erase(pool_id);
   if (!ok) {
@@ -327,9 +382,12 @@ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& 
   pool->base = base;
   pool->bytes = bytes;
   pool->exported = exported;
+  pool->external = adopt;
+  pool->mapped = mapped;
+  pool->external_handle = external.handle;
   pools_[pool_id] = std::move(pool);
-  MORI_UMBP_INFO("[L1Pool] attached pool={} group={} device={} bytes={}", pool_id, group, device,
-                 bytes);
+  MORI_UMBP_INFO("[L1Pool] attached pool={} group={} device={} bytes={}{}", pool_id, group, device,
+                 bytes, adopt ? " (adopted from its owner)" : "");
   result.memory = std::move(exported);
   result.bytes = bytes;
   result.created = true;
@@ -513,7 +571,8 @@ Status PoolManager::Apply(const std::string& pool_id, const std::vector<Op>& ops
   return Status{};
 }
 
-FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std::string>& keys) {
+FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std::string>& keys,
+                               const FetchOptions& options) {
   FetchResult result;
   std::unique_lock<std::mutex> lock(mutex_);
   Pool* pool = FindLocked(pool_id);
@@ -522,13 +581,53 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     return result;
   }
   Group& group = groups_[pool->group];
+  // Another pool's settled copy of `key`, or null.
+  auto source_of = [&](const std::string& key) -> const Holder* {
+    auto holders = group.holders.find(key);
+    if (holders == group.holders.end()) return nullptr;
+    for (const Holder& h : holders->second) {
+      // Not this pool, and not a slot its owner may still be writing.
+      if (h.pool != pool && Readable(*h.pool, h.pool->slots[h.slot])) return &h;
+    }
+    return nullptr;
+  };
+
+  if (options.probe_only) {
+    for (const std::string& key : keys) {
+      if (pool->index.find(key) == pool->index.end() && source_of(key) == nullptr) break;
+      ++result.available;
+    }
+    return result;
+  }
+  const bool into = !options.dst_slots.empty();
+  if (into && options.dst_slots.size() < keys.size()) {
+    result.status = Status::Error("fetch into pool " + pool_id + ": fewer slots than keys");
+    return result;
+  }
 
   // Plan under the lock: pick a source and a destination for every key, pin
-  // the sources, and take the destinations off the free lists.
+  // the sources, and take the destinations off the free lists -- or, copying
+  // into the caller's slots, check that it holds them.
   std::vector<CopyStep> steps;
   std::vector<uint32_t> local_pins;
   for (size_t i = 0; i < keys.size(); ++i) {
     const std::string& key = keys[i];
+    if (into) {
+      const uint32_t dst = options.dst_slots[i];
+      if (dst >= pool->slots.size() || pool->slots[dst].state != SlotState::kHeld) {
+        result.status = Status::Error("fetch into pool " + pool_id + ": slot " +
+                                      std::to_string(dst) + " is not held by its owner");
+        break;
+      }
+      const Holder* source = source_of(key);
+      if (source == nullptr) break;
+      ++source->pool->slots[source->slot].pins;
+      ++source->pool->busy;
+      ++pool->busy;
+      steps.push_back(CopyStep{source->pool, source->slot, dst, i});
+      result.slots.push_back(dst);
+      continue;
+    }
     auto local = pool->index.find(key);
     if (local != pool->index.end()) {
       // Pinned so a later destination in this same call cannot evict it.
@@ -624,6 +723,21 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     Slot& d = pool->slots[step.dst_slot];
     const std::string& key = keys[step.key_index];
     const bool usable = copied[i] && step.key_index < valid_keys;
+    if (into) {
+      // The caller's slot, which it publishes itself: only the count moves.
+      if (usable) {
+        ++step.src->served_out_slots;
+        ++pool->fetched_in_slots;
+        ++result.copied_slots;
+        if (sources.empty() || sources.back().first != step.src->id) {
+          sources.emplace_back(step.src->id, 0u);
+        }
+        ++sources.back().second;
+      } else {
+        valid_keys = std::min(valid_keys, step.key_index);
+      }
+      continue;
+    }
     auto existing = pool->index.find(key);
     if (usable && existing == pool->index.end()) {
       d.has_key = true;
