@@ -471,8 +471,12 @@ and a queue index.
 
 - **Coops:** `ccoCoopWarp` and `ccoCoopBlock` issue one op per group (all lanes
   pass the same arguments); `ccoCoopLaneMasked{active}` issues one op per
-  active lane (`put` / `putValue` / `signal` only). The ops reject
-  `ccoCoopThread` at compile time. The issuing wavefront (wavefront 0 for
+  active lane (`put` / `putValue` / `signal` only). `put`, `putValue` and
+  `signal` have no default Coop, unlike `ccoGda`, whose default is
+  `ccoCoopThread`: per-thread `ccoGda` code becomes `ccoCoopLaneMasked` here.
+  The ops reject `ccoCoopThread` at compile time, and `ccoGda` rejects
+  `ccoCoopLaneMasked`. Builds with `NDEBUG` do not check that the lanes of a
+  group pass the same arguments. The issuing wavefront (wavefront 0 for
   `ccoCoopBlock`) must call with all 64 lanes active from converged code; a
   partial wavefront traps. `flush(ccoCoopBlock)` also flushes every other
   wavefront of the block that pushed through its own handle.

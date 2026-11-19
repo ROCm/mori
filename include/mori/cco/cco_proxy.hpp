@@ -91,10 +91,12 @@
 // wavefront for ccoCoopWarp and ccoCoopLaneMasked, wavefront 0 -- linear
 // thread ids 0..63, also in 2-D and 3-D blocks -- for ccoCoopBlock) must have
 // all 64 lanes active: a KIWI push is wavefront-collective, so a
-// ccoCoopLaneMasked call from a divergent branch traps too. ccoCoopThread is
-// rejected at compile time. With ccoCoopWarp / ccoCoopBlock the group issues
-// one op and every issuing lane must pass identical arguments (lane i writes
-// word i of the descriptor); ccoGda reads only thread_rank 0's.
+// ccoCoopLaneMasked call from a divergent branch traps too. put / putValue /
+// signal take no default Coop (ccoGda's default is ccoCoopThread), and
+// ccoCoopThread is rejected at compile time. With ccoCoopWarp / ccoCoopBlock
+// the group issues one op and every issuing lane must pass identical arguments
+// (lane i writes word i of the descriptor; only builds without NDEBUG check
+// it); ccoGda reads only thread_rank 0's.
 // ccoCoopLaneMasked{active} (put / putValue / signal) issues one op per active
 // lane, all in one lane-masked push, so they enter the queue in lane order; a
 // put larger than maxPutBytes is split as with the other Coops, the wavefront
@@ -268,21 +270,6 @@ __device__ inline bool proxyFirstLane(uint64_t lanes = __builtin_amdgcn_read_exe
 
 }  // namespace impl
 
-// ccoProxy's per-thread Coop for put / putValue / signal: all 64 lanes of the
-// wavefront call from converged code, and each lane with `active` true issues
-// its own op with its own arguments (see the file comment), e.g.
-//   proxy.put(peer, dstWin, dstOff, srcWin, srcOff, bytes, ccoGda_NoSignal{},
-//             ccoCoopLaneMasked{i < n});
-// As a group it is a single thread (thread_rank 0, size 1, no-op sync).
-// ccoProxy only: other transports such as ccoGda accept it as a Coop but
-// ignore `active`, so every lane would issue its op there.
-struct ccoCoopLaneMasked {
-  bool active = true;
-  __device__ int thread_rank() const { return 0; }
-  __device__ int size() const { return 1; }
-  __device__ void sync() {}
-};
-
 // Device-side transport handle. Construct per thread; call put / signal /
 // flush from the whole Coop group. Not copyable: an SPSC handle writes its
 // producer state back exactly once.
@@ -336,29 +323,27 @@ struct ccoProxy {
 
   // RDMA write of [srcWin+srcOffset, +bytes) to peer's [dstWin+dstOffset, ...),
   // optionally followed (same QP, so after the data) by a remote signal.
-  // Template parameters follow ccoGda::put; ThreadMode has no effect. Coop:
-  // ccoCoopWarp, ccoCoopBlock, or ccoCoopLaneMasked (per-thread puts; see the
-  // file comment).
+  // Template parameters follow ccoGda::put; ThreadMode has no effect. Coop has
+  // no default (ccoGda's is ccoCoopThread): pass ccoCoopWarp, ccoCoopBlock, or
+  // ccoCoopLaneMasked (per-lane puts; see the file comment).
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
-            ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent,
-            typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopWarp>
+            ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename RemoteAction,
+            typename Coop>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
-                             size_t srcOffset, size_t bytes, RemoteAction remoteAction = {},
-                             Coop coop = Coop{});
+                             size_t srcOffset, size_t bytes, RemoteAction remoteAction, Coop coop);
 
   // Inline RDMA write of `value` (sizeof(T) <= 8 bytes, no padding) to peer's
   // [dstWin+dstOffset, ...), optionally followed by a remote signal, as put().
   // Template parameters follow ccoGda::putValue; Coop as in put().
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
             ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename T,
-            typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopWarp>
+            typename RemoteAction, typename Coop>
   __device__ inline void putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
-                                  RemoteAction remoteAction = {}, Coop coop = Coop{});
+                                  RemoteAction remoteAction, Coop coop);
 
   // Remote signal only. Coop as in put().
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename RemoteAction = ccoGda_SignalInc,
-            typename Coop = ccoCoopWarp>
-  __device__ inline void signal(int peer, RemoteAction remoteAction, Coop coop = Coop{});
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename RemoteAction, typename Coop>
+  __device__ inline void signal(int peer, RemoteAction remoteAction, Coop coop);
 
   // Push a FLUSH and wait until every work request this queue posted before it
   // has completed, on every peer: the sources of earlier puts are reusable

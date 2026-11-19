@@ -639,7 +639,9 @@ __global__ void ProxySignalKernel(ccoDevComm dc, ccoGdaSignal_t slot, int* err) 
   ccoProxy<> proxy{dc, u};
   for (int k = 0; k < kSignalRounds; k++) {
     for (int p = 0; p < n; p++) {
-      if (p != me) proxy.signal(p, ccoGda_SignalAdd{slot, static_cast<uint64_t>(u + 1)});
+      if (p != me) {
+        proxy.signal(p, ccoGda_SignalAdd{slot, static_cast<uint64_t>(u + 1)}, ccoCoopWarp{});
+      }
     }
   }
   if (u == 0 && threadIdx.x == 0) {
@@ -670,7 +672,10 @@ __global__ void ProxyHandoffKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow
     }
     ccoProxy<> proxy{dc, 0};
     for (int p = 0; p < n; p++) {
-      if (p != me) proxy.put(p, recvWin, me * chunk, sendWin, p * chunk, half);
+      if (p != me) {
+        proxy.put(p, recvWin, me * chunk, sendWin, p * chunk, half, ccoGda_NoSignal{},
+                  ccoCoopWarp{});
+      }
     }
     proxy.flush();
     proxy.release();
@@ -681,7 +686,7 @@ __global__ void ProxyHandoffKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow
     for (int p = 0; p < n; p++) {
       if (p != me) {
         proxy.put(p, recvWin, me * chunk + half, sendWin, p * chunk + half, chunk - half,
-                  ccoGda_SignalInc{Slot(me, 0)});
+                  ccoGda_SignalInc{Slot(me, 0)}, ccoCoopWarp{});
       }
     }
     proxy.flush();

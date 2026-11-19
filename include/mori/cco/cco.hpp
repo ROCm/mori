@@ -637,6 +637,20 @@ struct ccoCoopBlock {
   __device__ void sync() { impl::syncThreads(); }
 };
 
+// ccoProxy's per-lane Coop for put / putValue / signal: all 64 lanes call from
+// converged code and each lane with `active` true issues its own op (see
+// cco_proxy.hpp), e.g.
+//   proxy.put(peer, dstWin, dstOff, srcWin, srcOff, bytes, ccoGda_NoSignal{},
+//             ccoCoopLaneMasked{i < n});
+// As a group it is a single thread (thread_rank 0, size 1, no-op sync).
+// ccoProxy only: ccoGda rejects it at compile time.
+struct ccoCoopLaneMasked {
+  bool active = true;
+  __device__ int thread_rank() const { return 0; }
+  __device__ int size() const { return 1; }
+  __device__ void sync() {}
+};
+
 /* ════════════════════════════════════════════════════════════════════════════
  *  3. Teams — logical rank-subset descriptors used by per-backend sessions
  *     (especially ccoGda) to address peers without leaking topology into kernels.

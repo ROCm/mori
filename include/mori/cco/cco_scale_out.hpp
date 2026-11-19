@@ -368,6 +368,14 @@ __device__ inline void checkGdaRemoteAction() {
                 "or ccoGda_WindowSignalAdd");
 }
 
+// ccoCoopLaneMasked is ccoProxy's: ccoGda would ignore `active`.
+template <typename Coop>
+__device__ inline void checkGdaCoop() {
+  static_assert(!std::is_same_v<Coop, ccoCoopLaneMasked>,
+                "ccoGda does not take ccoCoopLaneMasked (ccoProxy only): it ignores `active`, so "
+                "every lane would issue its op. Call with ccoCoopThread from the active lanes");
+}
+
 // Poll the CQ until wq.doneIdx reaches targetIdx. Collapsed-CQ model:
 // reconstruct the completed WQE count directly from the CQE counter (no
 // outstandingWqe[] table); exits at the caller's targetIdx.
@@ -1388,6 +1396,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::put(int peer, ccoWindow_t dst
                                                        size_t dstOffset, ccoWindow_t srcWin,
                                                        size_t srcOffset, size_t bytes,
                                                        RemoteAction remoteAction, Coop coop) {
+  impl::checkGdaCoop<Coop>();
   impl::checkGdaRemoteAction<RemoteAction>();
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
@@ -1467,6 +1476,7 @@ template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename T, typenam
 __device__ inline void ccoGda<PrvdType, Doorbell>::putValue(int peer, ccoWindow_t dstWin,
                                                             size_t dstOffset, T value,
                                                             RemoteAction remoteAction, Coop coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
   impl::checkGdaRemoteAction<RemoteAction>();
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
@@ -1540,6 +1550,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::get(int peer, ccoWindow_t rem
                                                        size_t remoteOffset, ccoWindow_t localWin,
                                                        size_t localOffset, size_t bytes,
                                                        Coop coop) {
+  impl::checkGdaCoop<Coop>();
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1586,6 +1597,7 @@ template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <ccoTeamMode TeamMode, typename RemoteAction, typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::signal(int peer, RemoteAction remoteAction,
                                                           Coop coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(Doorbell != ccoGdaDoorbellCallerOrdered,
                 "signal() rings on its own, which a CallerOrdered QP does not allow: use put / "
                 "putValue with a RemoteAction signal, or flush this handle first and then "
@@ -1634,6 +1646,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::signal(int peer, RemoteAction
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::flush(Coop coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush() requires at least ccoCoopWarp. "
                 "ccoCoopThread reports size()==1, so every thread walks every peer and "
@@ -1658,6 +1671,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::flush(Coop coop) {
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::flush(int peer, Coop coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush(peer) requires at least ccoCoopWarp. "
                 "With ccoCoopThread every thread runs the body, so two threads passing the "
@@ -1681,6 +1695,7 @@ template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::flushAsync(int peer, ccoGdaRequest_t* outRequest,
                                                               Coop coop) {
+  impl::checkGdaCoop<Coop>();
   coop.sync();
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
@@ -1701,6 +1716,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::flushAsync(int peer, ccoGdaRe
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::wait(ccoGdaRequest_t& request, Coop coop) {
+  impl::checkGdaCoop<Coop>();
   // ccoCoopThread: each lane passes its own request; lanes on one CQ wait for the furthest.
   coop.sync();
   if (coop.thread_rank() == 0) {
@@ -1715,6 +1731,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::wait(ccoGdaRequest_t& request
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename LocalAction, typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::counter(LocalAction localAction, Coop coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "counter() requires at least ccoCoopWarp. "
                 "ccoCoopThread reports size()==1 and makes thread_rank()==0 true for every "
@@ -1759,6 +1776,7 @@ template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::waitSignal(ccoGdaSignal_t signalId,
                                                               uint64_t least, Coop coop, int bits) {
+  impl::checkGdaCoop<Coop>();
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1788,6 +1806,7 @@ template <typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::waitCounter(ccoGdaCounter_t counterId,
                                                                uint64_t least, Coop coop,
                                                                int bits) {
+  impl::checkGdaCoop<Coop>();
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1812,6 +1831,7 @@ __device__ inline ccoGdaBarrierSession<PrvdType, Coop>::ccoGdaBarrierSession(
 
 template <core::ProviderType PrvdType, typename Coop>
 __device__ inline void ccoGdaBarrierSession<PrvdType, Coop>::sync(Coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "GDA barrier requires at least ccoCoopWarp. "
                 "ccoCoopThread reports size()==1, so every thread signals every peer and the "
