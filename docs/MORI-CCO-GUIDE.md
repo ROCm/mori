@@ -422,7 +422,8 @@ DevComm with proxy queues runs busy-polling proxy threads.
   gfx950; at run time `ccoDevCommCreate` accepts proxy queues only on those
   GPUs. `MORI_CCO_PROXY` is defined when the engine is built in.
 - **Requirements:** proxy queues are requested per DevComm. All ranks must pass
-  the same queue, thread and QP counts; creation fails on every rank otherwise.
+  the same queue, thread and QP counts and connection type; creation fails on
+  every rank otherwise.
 
 | Field (C++ / Python) | Meaning |
 |---|---|
@@ -431,10 +432,17 @@ DevComm with proxy queues runs busy-polling proxy threads.
 | `proxyThreadCount` / `proxy_thread_count` | host proxy threads (0 = 4), capped at the queue count |
 | `proxyQueueCapacity` / `proxy_queue_capacity` | ring size in 64-byte lines, power of two (0 = 4096) |
 | `proxyQpsPerPeer` / `proxy_qps_per_peer` | RC QPs per (proxy thread, peer) (0 = 4) |
+| `proxyConnectionType` / `proxy_connection_type` | peers that get proxy QPs, a `CCO_GDA_CONNECTION_*` value (-1 = follow `gdaConnectionType`) |
 
-`gdaConnectionType` must resolve to a non-NONE peer set (the proxy reaches
-those peers and uses the GDA signal slots). The GPU's VRAM must be host-mapped
-(large BAR). Each DevComm with proxy queues starts its own busy-polling
+`proxyConnectionType` picks the proxy's peers independently of the GDA QPs and
+resolves like `gdaConnectionType`: CROSSNODE on a single node, no RDMA or no
+matching peer give NONE, and proxy queues on a NONE connection fail creation.
+The default -1 follows `gdaConnectionType`, so both get QPs to the same peers.
+For a proxy-only DevComm, set `gdaConnectionType = CCO_GDA_CONNECTION_NONE`
+and `proxyConnectionType` to the peers you need; no GDA QPs are created. The
+proxy uses the GDA signal and counter slots (`gdaSignalCount`,
+`gdaCounterCount`), which exist whenever either connection is non-NONE. The
+GPU's VRAM must be host-mapped (large BAR). Each DevComm with proxy queues starts its own busy-polling
 threads, so prefer one per communicator. Several QPs per peer let NICs that
 serve each QP serially run a thread's queues in parallel.
 
@@ -451,6 +459,7 @@ and a queue index.
 | Call | Does |
 |---|---|
 | `ccoProxy<>(dc, i)` / `ccoProxy<MPSCD2HQueue>(dc, i)` | SPSC queue `i` (out of range traps); MPSC queue `i` mod the pool size |
+| `put<CCO_TEAM_GDA>(peer, ...)` etc. | `peer` indexes the team of the proxy's connection type (`dc.proxy.connType`), as `ccoGda` does for `gdaConnectionType`; the default `CCO_TEAM_WORLD` takes world ranks |
 | `put(peer, dstWin, dstOff, srcWin, srcOff, bytes, action, coop)` | RDMA write, optionally followed by a signal on the same QP; split above the port's max message size |
 | `putValue(peer, dstWin, dstOff, value, action, coop)` | inline write of a 1–8 byte value, optionally followed by a signal |
 | `signal(peer, action, coop)` | signal only |
@@ -497,7 +506,8 @@ and a queue index.
 ```cpp
 #include "mori/cco/cco_scale_out.hpp"
 
-// Host: reqs.gdaConnectionType = CCO_GDA_CONNECTION_FULL;
+// Host: reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;  // no GDA QPs
+//       reqs.proxyConnectionType = CCO_GDA_CONNECTION_FULL;
 //       reqs.proxySpscQueueCount = nBlocks; reqs.gdaSignalCount >= nBlocks.
 __global__ void send(ccoDevComm dc, ccoWindow_t dst, ccoWindow_t src, size_t chunk, int peer) {
   ccoProxy<> proxy{dc, static_cast<int>(blockIdx.x)};
