@@ -392,6 +392,9 @@ struct ccoProxy {
   // ccoCoopBlock, also in 2-D and 3-D blocks). Full 64-bit slots (no `bits`).
   template <typename Coop = ccoCoopThread>
   __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop = Coop{}) {
+    static_assert(!std::is_same_v<Coop, ccoCoopLaneMasked>,
+                  "ccoProxy::waitSignal takes ccoCoopThread, ccoCoopWarp or ccoCoopBlock: one "
+                  "waiter per slot, so not every lane of a ccoCoopLaneMasked group");
     coop.sync();
     if (groupLeader(coop) && waitSignalLeader</*kTimeout=*/false>(signalId, least, 0) != 0) {
       CCO_PROXY_TRAP(true,
@@ -866,6 +869,9 @@ template <typename Queue>
 template <typename Coop>
 __device__ inline int ccoProxy<Queue>::waitSignal(ccoGdaSignal_t signalId, uint64_t least,
                                                   Coop coop, uint64_t timeoutCycles) {
+  static_assert(!std::is_same_v<Coop, ccoCoopLaneMasked>,
+                "ccoProxy::waitSignal takes ccoCoopThread, ccoCoopWarp or ccoCoopBlock: one "
+                "waiter per slot, so not every lane of a ccoCoopLaneMasked group");
   coop.sync();
   int result = 0;
   if (groupLeader(coop))
