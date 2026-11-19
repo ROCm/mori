@@ -47,6 +47,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -436,6 +437,10 @@ class CollectivesFacade {
   // push (SDMA) or pull (the receiver reads srcPe's sendBuf over XGMI).
   // isAsync: as for RunAllGather (sendBuf untouched, recvBuf unread until
   // AsyncDone).
+  // Inside a group, consecutive calls are collected into one tuple (at most
+  // kPermuteMaxTuple, all with the same srcPe, dstPes, stream and isAsync, else
+  // hipErrorInvalidValue) and issued together when the group flushes them: a
+  // single call as above, two or more as one SDMA push launch.
   hipError_t RunCollectivePermute(const void* sendBuf, void* recvBuf, size_t numBytes,
                                   int srcPe, const std::vector<int>& dstPes,
                                   hipStream_t stream, bool isAsync = false);
@@ -445,6 +450,32 @@ class CollectivesFacade {
 
   // Memory fence across the device. Dummy no-op.
   hipError_t RunFence();
+
+  // Batches the collectives issued between GroupStart() and the matching
+  // GroupEnd() (groups may nest). Inside a group an async Run* call is held
+  // back: the next async call flushes it synchronously, and the outermost
+  // GroupEnd() issues the last one async, so at most one collective is left
+  // pending for AsyncDone. Sync calls run immediately, except collective-permutes,
+  // which are batched into a tuple (see RunCollectivePermute). GroupEnd(discard=true)
+  // drops the held call instead of issuing it (e.g. when the group failed).
+  hipError_t GroupStart() {
+    ++groupDepth_;
+    return hipSuccess;
+  }
+
+  hipError_t GroupEnd(bool discard = false) {
+    if (groupDepth_ == 0) {
+      FACADE_PRINTF("GroupEnd without a matching GroupStart");
+      return hipErrorInvalidValue;
+    }
+    if (--groupDepth_ > 0 || !deferred_) return hipSuccess;
+    auto last = std::exchange(deferred_, nullptr);
+    if (discard) {
+      permGroup_ = {};
+      return hipSuccess;
+    }
+    return last(/*isAsync=*/true);
+  }
 
  private:
    struct SharedState {
@@ -557,6 +588,28 @@ class CollectivesFacade {
   template <class T, class Op>
   hipError_t allReduceImpl(const void* input, void* output, size_t numElems, hipStream_t stream);
 
+  // A collective-permute launch: srcPe/dstPe are communicator-local ranks (< 0:
+  // none) and tuple holds the buffers. Inside a group, permGroup_ accumulates
+  // the calls until the group flushes them.
+  struct PermuteGroup {
+    PermuteTuple tuple{};
+    int srcPe = -1, dstPe = -1;
+    hipStream_t stream = nullptr;
+    bool isAsync = false;
+  };
+  hipError_t launchPermute(const PermuteGroup& g, bool isAsync);
+
+  // Holds `launch` until the next async call or the outermost GroupEnd(),
+  // first flushing the previously held one synchronously.
+  hipError_t deferAsync(std::function<hipError_t(bool isAsync)> launch) {
+    if (deferred_) {
+      hipError_t err = std::exchange(deferred_, nullptr)(/*isAsync=*/false);
+      if (err != hipSuccess) return err;
+    }
+    deferred_ = std::move(launch);
+    return hipSuccess;
+  }
+
 private:
   SharedState& state_;
   int myPe_, nPes_, peBase_, logS_;
@@ -577,6 +630,11 @@ private:
     ReduceOpKind reduceOp{};
   };
   PendingAsync pending_;
+  // GroupStart nesting depth and the async call held back within the group.
+  int groupDepth_ = 0;
+  std::function<hipError_t(bool isAsync)> deferred_;
+  // Collective-permutes collected in the current group (tuple.n == 0: none).
+  PermuteGroup permGroup_;
 };
 
 }  // namespace ccl

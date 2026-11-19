@@ -77,14 +77,11 @@ enum PhaseFlags : int {
 // 32-bit wrap-safe compare would misread it as reached after 2^31 launches.
 //   [0, kPushMaxSlices) : scatter slice s (all push collectives, launch gen)
 //   kBcastArrived + b     : all-reduce broadcast b (launch gen)
-//   kRaggedScratch        : sink for the swaps of a ragged peer's non-final
-//                           copies; never polled
 enum ArrivedIdx {
   kBcastArrived = kPushMaxSlices,
   kArrivedStride = 16,
-  kRaggedScratch = kArrivedStride - 1,
 };
-static_assert(kBcastArrived + 2 <= kRaggedScratch, "arrived row too small");
+static_assert(kBcastArrived + 2 <= kArrivedStride, "arrived row too small");
 
 // Per-communicator control slot: uint64 barrierCtr[kCCLMaxPeers] (gen-barrier
 // flags, see GenBarrier) followed by arrived[kCCLMaxPeers][kArrivedStride]. Both
@@ -126,6 +123,19 @@ enum PermuteFlagIdx {
   kArrivedFlag,   // push-only completion: the sender's SDMA swap stores its send
                   // count after the copy lands; polled by the receiver.
   kPermuteFlagSlots,
+};
+
+// Maximal number of buffers one (tupled) collective-permute launch moves.
+static constexpr int kPermuteMaxTuple = 8;
+
+// Buffers of one collective-permute launch, entry i copying bytes[i] from
+// send[i] into the destination's recv[i]. Passed BY VALUE as a kernel argument,
+// like AddressPairs.
+struct PermuteTuple {
+  const void* send[kPermuteMaxTuple];
+  void* recv[kPermuteMaxTuple];
+  size_t bytes[kPermuteMaxTuple];
+  int n;
 };
 
 // Per-peer all-to-all endpoints: chunk sent from `source` to peer p / received
@@ -341,6 +351,36 @@ __device__ __forceinline__ void WriteSignalPacket(int lane, const uint64_t* slot
     dw[3] = static_cast<uint32_t>(value);
   } else if (lane == 3) {
     dw[0] = static_cast<uint32_t>(value >> 32);
+  }
+  const cco::ccoUint4 v = {dw[0], dw[1], dw[2], dw[3]};
+  StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
+}
+
+// Two copies in one 64B slot: [NOP][COPY_LINEAR 0][NOP][COPY_LINEAR 1], no
+// signal. Lanes 0/1 write copy 0 and lanes 2/3 copy 1, each pair in
+// WriteFusedPacket's lane 0/1 layout. Both sizes must be in [1, kSdmaMaxCopyBytes].
+__device__ __forceinline__ void WriteTwoCopyPackets(int lane, const void* srcBuf0,
+                                                    const void* dstBuf0, size_t packetSize0,
+                                                    const void* srcBuf1, const void* dstBuf1,
+                                                    size_t packetSize1, uint32_t* outBasePtr) {
+  const bool second = lane >= 2;
+  const uintptr_t src = reinterpret_cast<uintptr_t>(second ? srcBuf1 : srcBuf0);
+  const uintptr_t dst = reinterpret_cast<uintptr_t>(second ? dstBuf1 : dstBuf0);
+  uint32_t dw[4];
+  if ((lane & 1) == 0) {
+    decltype(SDMA_PKT_COPY_LINEAR::HEADER_UNION) cp;
+    cp.DW_0_DATA = 0;
+    cp.op = SDMA_OP_COPY;
+    cp.sub_op = SDMA_SUBOP_COPY_LINEAR;
+    dw[0] = 0;  // single-dword NOP
+    dw[1] = cp.DW_0_DATA;
+    dw[2] = static_cast<uint32_t>(second ? packetSize1 : packetSize0) - 1;
+    dw[3] = 0;  // PARAMETER_UNION (unused)
+  } else {
+    dw[0] = static_cast<uint32_t>(src);
+    dw[1] = static_cast<uint32_t>(src >> 32);
+    dw[2] = static_cast<uint32_t>(dst);
+    dw[3] = static_cast<uint32_t>(dst >> 32);
   }
   const cco::ccoUint4 v = {dw[0], dw[1], dw[2], dw[3]};
   StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
@@ -658,12 +698,69 @@ __device__ __forceinline__ uint32_t NumCopyPackets(size_t bytes) {
   return static_cast<uint32_t>((bytes + kSdmaMaxCopyBytes - 1) / kSdmaMaxCopyBytes);
 }
 
+// Ring bytes a sequence of nPkts copies plus its trailing signal occupies when
+// written by SdmaCopyPacker (nPkts == 0: the signal alone).
+__device__ __forceinline__ uint64_t PackedCopyBytes(uint32_t nPkts) {
+  return static_cast<uint64_t>(nPkts / 2 + 1) * kSDMACopySignalPkt;
+}
+
+// Writes one peer's copies into consecutive 64B ring slots, two per slot
+// (WriteTwoCopyPackets), followed by one swap of `value` into `sig`. The queue
+// is in-order, so that single swap signals every copy: the last copy is fused
+// with it when the copy count is odd, else a signal-only slot follows the last
+// pair. Buffers are split into copies of at most kSdmaMaxCopyBytes; nPkts must
+// be the total NumCopyPackets over every buffer passed to copy(), and the ring
+// space reserved PackedCopyBytes(nPkts). Run by the peer's 4 lanes in lockstep.
+struct SdmaCopyPacker {
+  uint32_t* queueBuf;
+  uint64_t pos;  // ring byte position of the next slot
+  uint32_t nPkts;
+  const uint64_t* sig;
+  uint64_t value;
+  uint32_t k = 0;  // copies written so far
+  // A copy waiting for its partner in the next two-copy slot (heldBytes == 0: none).
+  const uint8_t* heldSrc = nullptr;
+  uint8_t* heldDst = nullptr;
+  size_t heldBytes = 0;
+
+  __device__ __forceinline__ uint32_t* slot() {
+    uint32_t* const p = queueBuf + SdmaCollectiveHandle::WrapIntoRing(pos) / sizeof(uint32_t);
+    pos += kSDMACopySignalPkt;
+    return p;
+  }
+
+  __device__ __forceinline__ void copy(int sub, const uint8_t* src, uint8_t* dst, size_t bytes) {
+    while (bytes > 0) {
+      const size_t sz = bytes < kSdmaMaxCopyBytes ? bytes : kSdmaMaxCopyBytes;
+      const bool last = ++k == nPkts;
+      if (heldBytes != 0) {
+        WriteTwoCopyPackets(sub, heldSrc, heldDst, heldBytes, src, dst, sz, slot());
+        heldBytes = 0;
+        if (last) WriteSignalPacket(sub, sig, value, slot());
+      } else if (last) {
+        WriteFusedPacket(sub, src, dst, sz, sig, value, slot());
+      } else {
+        heldSrc = src;
+        heldDst = dst;
+        heldBytes = sz;
+      }
+      src += sz;
+      dst += sz;
+      bytes -= sz;
+    }
+  }
+
+  // The signal alone, for a peer with no bytes to copy (nPkts == 0).
+  __device__ __forceinline__ void signalOnly(int sub) {
+    WriteSignalPacket(sub, sig, value, slot());
+  }
+};
+
 // One peer of a ragged push scatter (see StartSdmaRaggedScatter).
 struct RaggedPeer {
   const uint8_t* src;   // local input base; update u reads src + inOffs[u]*rowBytes
   uint8_t* dst;         // peer's output base; update u lands at dst + outOffs[u]*rowBytes
   uint64_t* sig;        // peer's copy of my completion slot
-  uint64_t* scratch;    // peer's copy of my kRaggedScratch slot
   const uint32_t* gate = nullptr;  // as ScatterPeer::gate
   uint32_t gateValue = 0;
 };
@@ -672,13 +769,13 @@ struct RaggedPeer {
 // sendSizes[p*U+u] rows from input row inOffs[p*U+u] to the peer's output row
 // outOffs[p*U+u]. The metadata is read here, on the device. Same lane mapping
 // (4 lanes per peer, sub==0 the queue's only producer); one reservation and
-// one doorbell for [POLL] + every packet of the peer.
+// one doorbell for [POLL] + every slot of the peer.
 //
-// The queue is in-order, so only the peer's LAST packet swaps `value` into
-// `sig`; earlier ones swap into `scratch`, otherwise the receiver would see the
-// signal before the later copies landed. Empty updates are skipped, and a peer
-// with no bytes at all still gets its signal through a copy-free packet, so the
-// completion protocol is exactly StartSdmaScatter's at logS = 0.
+// The copies are packed two per slot by SdmaCopyPacker, and one swap of `value`
+// into `sig` after the last copy signals them all (the queue is in-order).
+// Empty updates are skipped, and a peer with no bytes at all still gets its
+// signal through a copy-free slot, so the completion protocol is exactly
+// StartSdmaScatter's at logS = 0.
 template <class PeerFn>
 __device__ __forceinline__ void StartSdmaRaggedScatter(cco::ccoSdmaContext sdma, int npes, int U,
                                                        const int64_t* inOffs,
@@ -699,8 +796,7 @@ __device__ __forceinline__ void StartSdmaRaggedScatter(cco::ccoSdmaContext sdma,
       nPkts += NumCopyPackets(static_cast<size_t>(sizes[u]) * rowBytes);
     }
     const uint32_t pollBytes = p.gate != nullptr ? kSDMACopySignalPkt : 0;
-    const uint64_t totalBytes =
-        pollBytes + static_cast<uint64_t>(nPkts > 0 ? nPkts : 1) * kSDMACopySignalPkt;
+    const uint64_t totalBytes = pollBytes + PackedCopyBytes(nPkts);
 
     SdmaCollectiveHandle h, *shared = nullptr;
     uint32_t* queueBuf = nullptr;
@@ -715,31 +811,18 @@ __device__ __forceinline__ void StartSdmaRaggedScatter(cco::ccoSdmaContext sdma,
     queueBuf = BroadcastQuad(queueBuf);
     pktBase = BroadcastQuad(pktBase);
 
-    uint64_t pos = pktBase;
     if (pollBytes) {
       WritePollPacket(sub, p.gate, p.gateValue,
-                      queueBuf + h.WrapIntoRing(pos) / sizeof(uint32_t));
-      pos += kSDMACopySignalPkt;
+                      queueBuf + h.WrapIntoRing(pktBase) / sizeof(uint32_t));
     }
+    SdmaCopyPacker packer{queueBuf, pktBase + pollBytes, nPkts, p.sig, value};
     if (nPkts == 0) {
-      WriteSignalPacket(sub, p.sig, value, queueBuf + h.WrapIntoRing(pos) / sizeof(uint32_t));
+      packer.signalOnly(sub);
     } else {
-      uint32_t k = 0;
       for (int u = 0; u < U; u++) {
-        size_t bytes = static_cast<size_t>(sizes[u]) * rowBytes;
-        if (bytes == 0) continue;
-        const uint8_t* src = p.src + static_cast<size_t>(ins[u]) * rowBytes;
-        uint8_t* dst = p.dst + static_cast<size_t>(outs[u]) * rowBytes;
-        while (bytes > 0) {
-          const size_t sz = bytes < kSdmaMaxCopyBytes ? bytes : kSdmaMaxCopyBytes;
-          const uint64_t* slot = ++k == nPkts ? p.sig : p.scratch;
-          WriteFusedPacket(sub, src, dst, sz, slot, value,
-                           queueBuf + h.WrapIntoRing(pos) / sizeof(uint32_t));
-          pos += kSDMACopySignalPkt;
-          src += sz;
-          dst += sz;
-          bytes -= sz;
-        }
+        packer.copy(sub, p.src + static_cast<size_t>(ins[u]) * rowBytes,
+                    p.dst + static_cast<size_t>(outs[u]) * rowBytes,
+                    static_cast<size_t>(sizes[u]) * rowBytes);
       }
     }
     cco::ccoSdmaPublishStores();
@@ -749,6 +832,66 @@ __device__ __forceinline__ void StartSdmaRaggedScatter(cco::ccoSdmaContext sdma,
       if (h.cachedHwReadIndex != hint0) {
         AtomicStore<EAgentScope>(&shared->cachedHwReadIndex, h.cachedHwReadIndex);
       }
+    }
+  }
+}
+
+static_assert((kPermuteMaxTuple + 1) * kSDMACopySignalPkt < cco::CCO_SDMA_QUEUE_SIZE,
+              "A tupled permute must fit into the SDMA ring");
+
+// Tupled push copy to one peer, executed by lanes 0..3 of the calling block
+// (lane 0 is the queue's only producer). Entry i of `tuple` goes from
+// tuple.send[i] to dst(i), split into copies of at most kSdmaMaxCopyBytes;
+// empty entries are skipped. One reservation and one doorbell cover [POLL] +
+// every slot. Copies are packed two per slot; the queue is in-order, so one
+// swap of `value` into `sig` after the last copy signals the whole tuple: fused
+// with the last copy when the copy count is odd, else a signal-only slot (also
+// used when the tuple has no bytes at all). `gate`/`gateValue` as in ScatterPeer.
+template <class DstFn>
+__device__ __forceinline__ void StartSdmaTupleCopy(cco::ccoSdmaContext sdma, int peer,
+                                                   const PermuteTuple& tuple, DstFn dstOf,
+                                                   uint64_t* sig, const uint32_t* gate,
+                                                   uint32_t gateValue, uint64_t value) {
+  const int sub = static_cast<int>(threadIdx.x);
+  if (sub >= 4) return;
+
+  uint32_t nPkts = 0;
+  for (int i = 0; i < tuple.n; i++) {
+    nPkts += NumCopyPackets(tuple.bytes[i]);
+  }
+  const uint32_t pollBytes = gate != nullptr ? kSDMACopySignalPkt : 0;
+  const uint64_t totalBytes = pollBytes + PackedCopyBytes(nPkts);
+
+  SdmaCollectiveHandle h, *shared = nullptr;
+  uint32_t* queueBuf = nullptr;
+  uint64_t hint0 = 0, pktBase = 0;
+  if (sub == 0) {
+    shared = GetSharedHandle(sdma.deviceHandles + peer);
+    h = *cco::impl::global(shared);
+    hint0 = h.cachedHwReadIndex;
+    queueBuf = h.queueBuf;
+    pktBase = h.ReserveSingleProducer(totalBytes);
+  }
+  queueBuf = BroadcastQuad(queueBuf);
+  pktBase = BroadcastQuad(pktBase);
+
+  if (pollBytes) {
+    WritePollPacket(sub, gate, gateValue, queueBuf + h.WrapIntoRing(pktBase) / sizeof(uint32_t));
+  }
+  SdmaCopyPacker packer{queueBuf, pktBase + pollBytes, nPkts, sig, value};
+  if (nPkts == 0) {
+    packer.signalOnly(sub);
+  } else {
+    for (int i = 0; i < tuple.n; i++) {
+      packer.copy(sub, static_cast<const uint8_t*>(tuple.send[i]), dstOf(i), tuple.bytes[i]);
+    }
+  }
+  cco::ccoSdmaPublishStores();
+  __builtin_amdgcn_wave_barrier();
+  if (sub == 0) {
+    h.submitPacket(pktBase, pktBase + totalBytes);
+    if (h.cachedHwReadIndex != hint0) {
+      AtomicStore<EAgentScope>(&shared->cachedHwReadIndex, h.cachedHwReadIndex);
     }
   }
 }

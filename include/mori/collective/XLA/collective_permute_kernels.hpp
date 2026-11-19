@@ -26,9 +26,10 @@
 // SDMA-based "push" collective-permute for at most one destination. PE myPe copies
 // sendBuf into peer dstPe's recvBuf (self-copy when dstPe == myPe; dstPe < 0 means
 // no outgoing) and waits for srcPe's copy to land in our recvBuf (srcPe < 0 means
-// no incoming).
+// no incoming). The push kernel moves a tuple of up to kPermuteMaxTuple such
+// buffers in one launch.
 //
-// Compute-free: one block, logS=0, reusing StartSdmaScatter from
+// Compute-free: one block, reusing StartSdmaTupleCopy from
 // collectives_common.hpp. sendBuf and recvBuf must be symmetric-heap pointers
 // so the address-based SDMA put can translate local->peer (offset from
 // heapBaseAddr).
@@ -41,9 +42,10 @@
 namespace mori {
 namespace ccl {
 
-// Single-block, compute-free collective-permute (one destination).
-//   sendBuf  : raw symmetric-heap pointer, numBytes to send
-//   recvBuf  : raw symmetric-heap pointer, numBytes receive slot
+// Single-block, compute-free collective-permute (one destination) of a tuple of
+// up to kPermuteMaxTuple buffers.
+//   tuple    : entry i sends tuple.bytes[i] from tuple.send[i] into the
+//              destination's tuple.recv[i] (raw symmetric-heap pointers)
 //   dstPe    : peer that receives our sendBuf (may be myPe), or -1 if nobody does
 //   srcPe    : peer that sends into our recvBuf, or -1 if nobody does
 //
@@ -63,9 +65,12 @@ namespace ccl {
 // sender's SDMA queue polls (POLL_REGMEM) until its destination's slot equals its
 // own count k before copying, so the GPU never waits. The slot only grows, so
 // nothing is consumed or cleared.
-// Phase 1: SDMA pushes sendBuf into dstPe's recvBuf (self included when
-// dstPe == myPe), trailed by an atomic swap storing my send count k into my
-// kArrivedFlag slot of the receiver's permuteCtr.
+// Phase 1: SDMA pushes every tuple entry into dstPe's recv buffers (self
+// included when dstPe == myPe) on one in-order queue; the last copy is trailed
+// by an atomic swap storing my send count k into my kArrivedFlag slot of the
+// receiver's permuteCtr (earlier copies carry no signal). The whole
+// tuple counts as ONE permute in the handshake, so both sides must launch the
+// same tuple.
 // Phase 2: if srcPe >= 0, thread 0 waits until srcPe's slot reaches my receive
 // count k, then an acquire fence makes the peer SDMA write visible. If I send to
 // a peer, thread 0 then polls my slot in its copy until it reaches my send count,
@@ -80,17 +85,16 @@ namespace ccl {
 //
 // Flags = kSync runs every phase in one launch. Async splits them: a
 // kAsyncStart launch runs Phases 0-1 and exits with the SDMA copy in flight; a
-// later kAsyncDone launch with the same npes/dstPe/srcPe (sendBuf/recvBuf/
-// numBytes unused) reads back the counts the start took and runs Phase 2. In
-// between no other permute may run between the same PE pairs: that keeps the
-// equality poll on kReadyFlag valid. sendBuf must stay untouched and recvBuf
-// unread until the done launch completes.
+// later kAsyncDone launch with the same npes/dstPe/srcPe (tuple unused) reads
+// back the counts the start took and runs Phase 2. In between no other permute
+// may run between the same PE pairs: that keeps the equality poll on kReadyFlag
+// valid. The send buffers must stay untouched and the recv buffers unread until
+// the done launch completes.
 //
 // Launch <<<1, 64>>> with npes <= 8 (SDMA fast path).
 template <int Flags>
 __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
-                                            const void* __restrict__ sendBuf,
-                                            void* __restrict__ recvBuf, size_t numBytes,
+                                            PermuteTuple tuple,
                                             cco::ccoDevComm devComm,
                                             cco::ccoWindow_t heapWin,
                                             uint64_t* __restrict__ permuteCtr,
@@ -137,25 +141,23 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   __syncthreads();
   const bool sendsRemote = dstPe >= 0 && dstPe != myLsa;
 
-  // recvBuf's byte offset within the heap window is identical on every rank
-  // (symmetric layout), so my local recvBuf pointer maps to peer p's copy by the
+  // A recv buffer's byte offset within the heap window is identical on every
+  // rank (symmetric layout), so my local pointer maps to peer p's copy by the
   // flat-VA rank delta (pe - lsaRank)*stride4G<<32 -- the same inline LSA
   // addressing the reduce-scatter/all-reduce push kernels use. winBase cancels
   // out, so this needs no ccoGetLocalPtr/ccoGetLsaPeerPtr round trip.
   if constexpr (Flags & kAsyncStart) {
-    uint8_t* const localDst = reinterpret_cast<uint8_t*>(recvBuf);
-    StartSdmaScatter(
-        devComm.sdma, npes, /*logS=*/0, sendK,
-        [=](int peer) {
-          auto [dstP, sigP] = PeerPtrs(localDst, permSlot(kArrivedFlag, myLsa),
-                                       peer, myLsa, stride4G);
-          return ScatterPeer{
-              peer == dstPe, numBytes, reinterpret_cast<const uint8_t*>(sendBuf),
-              dstP, sigP,
-              sendsRemote ? reinterpret_cast<const uint32_t*>(permSlot(kReadyFlag, dstPe))
-                          : nullptr,
-              static_cast<uint32_t>(sendK)};
-        });
+    if (dstPe >= 0) {
+      StartSdmaTupleCopy(
+          devComm.sdma, dstPe, tuple,
+          [&](int i) {
+            return PeerPtr(static_cast<uint8_t*>(tuple.recv[i]), dstPe, myLsa, stride4G);
+          },
+          PeerPtr(permSlot(kArrivedFlag, myLsa), dstPe, myLsa, stride4G),
+          sendsRemote ? reinterpret_cast<const uint32_t*>(permSlot(kReadyFlag, dstPe))
+                      : nullptr,
+          static_cast<uint32_t>(sendK), sendK);
+    }
   }
   if constexpr ((Flags & kAsyncDone) == 0) return;
 
@@ -220,7 +222,7 @@ __device__ __forceinline__ void PullCopySegments(
 
 // Multi-block, SDMA-free collective-permute (one destination): every PE reads
 // srcPe's sendBuf straight over XGMI into its own recvBuf. Same arguments as
-// CollectivePermutePushKernel. It shares the same permuteCtr buffer and uses
+// CollectivePermutePushKernel, for a single buffer. It shares the same permuteCtr buffer and uses
 // three of its rows (slot [idx][p] written only by PE p):
 //   kReadyFlag     : posted into srcPe's row as the "receiver has entered" token.
 //   kSendReadyFlag : the number of permutes in which p has entered to send to me.

@@ -229,6 +229,11 @@ hipError_t CollectivesFacade::RunReduceScatter(const void* input, void* output, 
                                                DataType dt, ReduceOpKind op, hipStream_t stream,
                                                bool isAsync) {
   isAsync = isAsync && !AsyncDisabled();
+  if (isAsync && groupDepth_ > 0) {
+    return deferAsync([=](bool a) {
+      return RunReduceScatter(input, output, count, dt, op, stream, a);
+    });
+  }
   const int phase = isAsync ? kAsyncStart : kSync;
   auto go = [=](auto typeTag) {
     using T = decltype(typeTag);
@@ -360,6 +365,11 @@ hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size
                                            hipStream_t stream, bool isAsync) {
   constexpr int kThreads = 64;
   isAsync = isAsync && !AsyncDisabled();
+  if (isAsync && groupDepth_ > 0) {
+    return deferAsync([=](bool a) {
+      return RunAllGather(input, output, chunkBytes, stream, a);
+    });
+  }
   if (isAsync) {
     // Start only: issue the SDMA scatter and exit; AsyncDone waits for it.
     AllGatherPushKernel<kAsyncStart><<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output,
@@ -417,7 +427,7 @@ hipError_t CollectivesFacade::AsyncDone(hipStream_t stream) {
       break;
     case AsyncOp::kPermute:
       CollectivePermutePushKernel<kAsyncDone><<<1, kThreads, 0, stream>>>(
-                       p.npes, p.dstPe, p.srcPe, nullptr, nullptr, 0, state_.devComm,
+                       p.npes, p.dstPe, p.srcPe, PermuteTuple{}, state_.devComm,
                        state_.heapWin, state_.permuteCtr, state_.permuteNum);
       break;
     case AsyncOp::kReduceScatter:
@@ -436,6 +446,11 @@ hipError_t CollectivesFacade::AsyncDone(hipStream_t stream) {
 hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chunkBytes,
                                           hipStream_t stream, bool isAsync) {
   isAsync = isAsync && !AsyncDisabled();
+  if (isAsync && groupDepth_ > 0) {
+    return deferAsync([this, addrs, chunkBytes, stream](bool a) {
+      return RunAllToAll(addrs, chunkBytes, stream, a);
+    });
+  }
   assert(static_cast<int>(addrs.size()) == nPes_ && "addrs size must equal npes");
   // The endpoints travel in the launch's kernel arguments, so a later call (or
   // a graph replay) cannot change the pointers a queued launch reads.
@@ -494,6 +509,12 @@ hipError_t CollectivesFacade::RunRaggedAllToAll(const void* input, void* output,
     return hipErrorInvalidValue;
   }
   isAsync = isAsync && !AsyncDisabled();
+  if (isAsync && groupDepth_ > 0) {
+    return deferAsync([=](bool a) {
+      return RunRaggedAllToAll(input, output, inOffs, sendSizes, outOffs, numUpdates,
+                               rowBytes, stream, a);
+    });
+  }
   // 4 issue lanes per peer: nPes_ <= kCCLMaxPeers fills at most one wave.
   constexpr int kThreads = 64;
   static_assert(kCCLMaxPeers * 4 <= kThreads);
@@ -537,7 +558,7 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
     return hipErrorNotSupported;
   }
   // Empty dstPes: receive-only rank (nobody receives from us).
-  int dstPe = dstPes.empty() ? -1 : dstPes[0];
+  const int dstPe = dstPes.empty() ? -1 : dstPes[0];
   if (dstPe < 0 && srcPe < 0) {
     return hipSuccess;
   }
@@ -546,42 +567,88 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
                   dstPe, nPes_);
     return hipErrorInvalidValue;
   }
+
+  if (groupDepth_ == 0) {
+    PermuteGroup g;
+    g.tuple.send[0] = sendBuf;
+    g.tuple.recv[0] = recvBuf;
+    g.tuple.bytes[0] = numBytes;
+    g.tuple.n = 1;
+    g.srcPe = srcPe;
+    g.dstPe = dstPe;
+    g.stream = stream;
+    return launchPermute(g, isAsync);
+  }
+
+  // Inside a group: collect into the tuple, issued when the group flushes it.
+  PermuteGroup& g = permGroup_;
+  if (g.tuple.n == 0) {
+    hipError_t err = deferAsync([this](bool a) {
+      const PermuteGroup tuple = std::exchange(permGroup_, PermuteGroup{});
+      return launchPermute(tuple, a && tuple.isAsync);
+    });
+    if (err != hipSuccess) return err;
+    g.srcPe = srcPe;
+    g.dstPe = dstPe;
+    g.stream = stream;
+    g.isAsync = isAsync;
+  } else if (g.srcPe != srcPe || g.dstPe != dstPe || g.stream != stream ||
+             g.isAsync != isAsync) {
+    FACADE_PRINTF("CollectivePermute: grouped permutes disagree (src %d/%d, dst %d/%d, "
+                  "async %d/%d, or stream)", g.srcPe, srcPe, g.dstPe, dstPe, g.isAsync,
+                  isAsync);
+    return hipErrorInvalidValue;
+  } else if (g.tuple.n == kPermuteMaxTuple) {
+    FACADE_PRINTF("CollectivePermute: at most %d permutes per group", kPermuteMaxTuple);
+    return hipErrorInvalidValue;
+  }
+  g.tuple.send[g.tuple.n] = sendBuf;
+  g.tuple.recv[g.tuple.n] = recvBuf;
+  g.tuple.bytes[g.tuple.n] = numBytes;
+  g.tuple.n++;
+  return hipSuccess;
+}
+
+hipError_t CollectivesFacade::launchPermute(const PermuteGroup& g, bool isAsync) {
+  const PermuteTuple& tuple = g.tuple;
+  hipStream_t stream = g.stream;
   // The permute kernels address peers by global LSA rank (heapWin->lsaRank) with
   // the unshifted devComm, so map the communicator-local ranks to global PEs.
-  if (dstPe >= 0) dstPe += peBase_;
-  if (srcPe >= 0) srcPe += peBase_;
+  const int dstPe = g.dstPe >= 0 ? g.dstPe + peBase_ : -1;
+  const int srcPe = g.srcPe >= 0 ? g.srcPe + peBase_ : -1;
   const int npes = peBase_ + nPes_;
   constexpr int kThreads = 64;
   if (isAsync) {
-    // Start only: issue the SDMA copy and exit; AsyncDone waits for it.
+    // Start only: issue the SDMA copies and exit; AsyncDone waits for them.
     CollectivePermutePushKernel<kAsyncStart><<<1, kThreads, 0, stream>>>(
-                npes, dstPe, srcPe, sendBuf, recvBuf,
-                numBytes, state_.devComm, state_.heapWin, state_.permuteCtr,
-                state_.permuteNum);
+                npes, dstPe, srcPe, tuple, state_.devComm, state_.heapWin,
+                state_.permuteCtr, state_.permuteNum);
     hipError_t err = hipGetLastError();
     if (err == hipSuccess) pending_ = {AsyncOp::kPermute, npes, dstPe, srcPe};
     return err;
   }
-  // Pull needs the buffer bases 16B-aligned; the kernel's byte tail covers a
-  // non-16B numBytes, so the size is not part of the gate. Else fall to push.
+  // A tuple always pushes. Pull needs the buffer bases 16B-aligned; the
+  // kernel's byte tail covers a non-16B numBytes, so the size is not part of
+  // the gate. Else fall to push.
   const uintptr_t bits =
-      reinterpret_cast<uintptr_t>(sendBuf) | reinterpret_cast<uintptr_t>(recvBuf);
-  if (resolveCopyMode(numBytes, kAutoPullMaxBytesPermute) == RsMode::kPull &&
+      reinterpret_cast<uintptr_t>(tuple.send[0]) | reinterpret_cast<uintptr_t>(tuple.recv[0]);
+  if (tuple.n == 1 &&
+      resolveCopyMode(tuple.bytes[0], kAutoPullMaxBytesPermute) == RsMode::kPull &&
       PullCopy16Aligned(bits)) {
     constexpr int kPullThreads = 256;
     // A send-only rank copies nothing: one block runs the handshake.
     const int blocks =
         srcPe < 0 ? 1
-                  : PullCopyBlocks(numBytes, kPullThreads, state_.MP_count, state_.maxNBlocks);
+                  : PullCopyBlocks(tuple.bytes[0], kPullThreads, state_.MP_count,
+                                   state_.maxNBlocks);
     CollectivePermutePullKernel<kPullCopyVecs><<<blocks, kPullThreads, 0, stream>>>(
-        npes, dstPe, srcPe, state_.heapWin, sendBuf, recvBuf, numBytes, state_.permuteCtr,
-        state_.permuteNum, state_.groupCtr);
+        npes, dstPe, srcPe, state_.heapWin, tuple.send[0], tuple.recv[0], tuple.bytes[0],
+        state_.permuteCtr, state_.permuteNum, state_.groupCtr);
     return hipGetLastError();
   }
   CollectivePermutePushKernel<kSync><<<1, kThreads, 0, stream>>>(
-                npes, dstPe, srcPe, sendBuf, recvBuf,
-                numBytes, state_.devComm, state_.heapWin, state_.permuteCtr,
-                state_.permuteNum);
+                npes, dstPe, srcPe, tuple, state_.devComm, state_.heapWin,
+                state_.permuteCtr, state_.permuteNum);
   return hipGetLastError();
 }
 

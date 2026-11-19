@@ -136,7 +136,7 @@ __global__ void RaggedAllToAllPushKernel(int myPe, int npes, const void* input, 
         devComm.sdma, npes, U, inOffs, sendSizes, outOffs, rowBytes, pushGen,
         [=](int peer) {
           auto [dstP, rowP] = PeerPtrs(localDst, myRow, peer, myPe, stride4G);
-          return RaggedPeer{src, dstP, rowP, rowP + kRaggedScratch,
+          return RaggedPeer{src, dstP, rowP,
                             peer != myPe ? BarrierGate(barrierCtr, peer) : nullptr,
                             static_cast<uint32_t>(pushGen - 1)};
         });
