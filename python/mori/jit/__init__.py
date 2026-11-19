@@ -66,6 +66,7 @@ def precompile():
     # IO kernels use a different source directory
     io_kernels = [
         ("scatter_gather", "src/io/kernels"),
+        ("fabric_copy", "src/io/kernels"),
     ]
 
     # CCL kernels

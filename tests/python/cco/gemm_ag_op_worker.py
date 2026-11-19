@@ -393,6 +393,9 @@ def case_operand_checks(comm, rank):
         ("bf16_with_quant", dict(in_dtype="bf16", quant="mxfp8")),
         ("fp8_fp32_out", dict(in_dtype="fp8", out_dtype="fp32")),
         ("n_not_256", dict(n=1000)),
+        # A multiple of 128, which is all the layout asks; the bf16 GEMM takes
+        # BLOCK_M 128 or 256. Refused here, not when the first call compiles.
+        ("bf16_tile_m384", dict(in_dtype="bf16", out_dtype="fp32", tile=(384, 256))),
     ):
         args = dict(n=N, k=K, m_max=M)
         args.update(kw)

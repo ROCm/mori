@@ -293,9 +293,8 @@ self-exit**, with idle-self-exit available as an explicit opt-in.
 
 ### 5.1 Primary path: externally launched
 
-- Launched the same way `run_umbp_single_node_hicache.sh` already
-  launches `umbp_master` (background process, log redirected, `trap
-  cleanup EXIT`) — no new orchestration concept, just a new binary
+- Launched as a background process with log redirected and `trap cleanup EXIT` —
+  no new orchestration concept, just a new binary
   target.
 - Discovery: `UMBP_STANDALONE_ADDRESS` (default
   `unix:///run/umbp/standalone/<node_id>.grpc.sock`), following the
@@ -1038,7 +1037,7 @@ For the distributed backend, `UMBP_DRAM_CAPACITY` sizes the
   `distributed/proto/umbp.proto`, `distributed/proto/umbp_standalone.proto`,
   `standalone/standalone_server.{h,cpp}`, `standalone/bin/standalone_server_main.cpp`,
   `src/pybind/pybind_umbp.cpp`, `src/pybind/CMakeLists.txt`,
-  `doc/runtime-env-vars.md`, `scripts/run_umbp_single_node_hicache.sh`.
+  `doc/runtime-env-vars.md`.
 - SGLang: `sglang/python/sglang/srt/mem_cache/storage/umbp/umbp_store.py`,
   `umbp_host_allocator.py`.
 - Mooncake (`kvcache-ai/Mooncake`): `mooncake-store/src/real_client.cpp`,

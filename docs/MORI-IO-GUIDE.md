@@ -10,6 +10,7 @@ MORI-IO is AMD's point-to-point communication library that leverages GDR (GPU Di
 - [Python API Quick Reference](#python-api-quick-reference)
 - [Example: Basic Read/Write](#example-basic-readwrite)
 - [Environment & Configuration](#environment--configuration)
+- [Known Issues](#known-issues)
 - [Simulation Mode](#simulation-mode)
 - [Profiling MORI-IO with ROCTX Markers](#profiling-mori-io-with-roctx-markers)
 - [Source Files](#source-files)
@@ -111,6 +112,10 @@ from mori.io import (
 | `Message()` | Get status message |
 | `Wait()` | Block until transfer completes |
 
+For FABRIC transfers, `TransferStatus.Message()` reports routing rejection reasons and the
+specific HIP call and error when a remote memory import fails. Registration failures appear
+in logs; when another backend is selected, an INFO log gives the Fabric reason and the fallback.
+
 ## Example: Basic Read/Write
 
 ```python
@@ -178,7 +183,7 @@ See `examples/io/example.py` for more complete examples including batch transfer
 | `RdmaBackendConfig.max_chunks_per_transfer` | Cap on chunks per transfer to bound WR/SQ usage (default `64`). Env: `MORI_IO_MAX_CHUNKS` |
 | `RdmaBackendConfig.num_nics_per_transfer` | Stripe a transfer across this many NICs (default `1`). Adaptive by memory type: GPU memory stays single-NIC (PCIe-bound); host memory stripes across NUMA-local NICs. Env: `MORI_IO_NUM_NICS_PER_TRANSFER` |
 | RC retry budget | The RC QP retry attributes applied at RTS, bounded so an out-of-range value is ignored rather than failing QP setup. `MORI_IO_QP_TIMEOUT` (0–31, default `14`; local ACK timeout = `4.096us * 2^timeout`; `0` disables it and lets an unresponsive peer stall indefinitely), `MORI_IO_QP_RETRY_CNT` (0–7, default `7`), `MORI_IO_QP_RNR_RETRY` (0–7, default `7`; `7` = retry RNR NAKs forever), `MORI_IO_QP_MIN_RNR_TIMER` (0–31, default `12`; IB-spec RNR NAK backoff). Each also honors a transport-wide `MORI_RDMA_QP_*` fallback (e.g. `MORI_RDMA_QP_TIMEOUT`) that tunes the shmem/CCO QPs sharing this path. The `MORI_IO_QP_*` name wins whenever it is set, including when its value is out of range — an invalid IO-specific value falls back to the built-in default, never to the `MORI_RDMA_QP_*` value. |
-| `MORI_IO_QP_MAX_RD_ATOMIC` | RDMA READs (and atomics) each QP keeps in flight, applied as `max_rd_atomic` at RTS. Unset (the default) keeps the device limit; a value of `0`, or at or above the device limit, is ignored. The ionic driver rounds the value down to `2^k - 1` (1, 3, 7, 15). On AMD AINIC firmware 1.117.5-a-77, a READ retransmitted while several are in flight can move the QP to the error state without a failed completion, or complete with part of its data missing. With `1` we saw neither the former nor, except under heavy receive backpressure with many QPs per NIC, the latter: it lowers the risk but does not remove it. Also honors the transport-wide `MORI_RDMA_QP_MAX_RD_ATOMIC` fallback, like the RC retry attributes. |
+| `MORI_IO_QP_MAX_RD_ATOMIC` | RDMA READs (and atomics) each QP keeps in flight, applied as `max_rd_atomic` at RTS. Unset (the default) keeps the device limit; a value of `0`, or at or above the device limit, is ignored. The ionic driver rounds the value down to `2^k - 1` (1, 3, 7, 15). Set it to `1` on AINIC firmware that mishandles retransmitted READs (see [Known Issues](#known-issues)). Also honors the transport-wide `MORI_RDMA_QP_MAX_RD_ATOMIC` fallback, like the RC retry attributes. |
 | `MORI_IO_FAIL_ON_ASYNC_EVENT` | When enabled, a fatal verbs async event (QP/CQ/device fatal) fails every in-flight transfer on the affected endpoints and marks them degraded so later submissions fail fast instead of hanging on a dead QP. Default on; set `0` to disable and restore the previous hang-until-timeout behavior. |
 | `MORI_IO_PORT_DOWN_FAIL_FAST` | Default on. After local PORT_ERR, new transfers using that port fail synchronously until PORT_ACTIVE or a one-second port recheck confirms ACTIVE. Already admitted transfers and their notification SENDs keep their normal retry behavior. Set `0` to disable admission rejection; peer failure reporting remains enabled. Port recovery does not rebuild QPs that exhausted their retry budget. |
 | `IOEngineConfig.port = 0` | Auto-bind to a free port |
@@ -187,6 +192,20 @@ See `examples/io/example.py` for more complete examples including batch transfer
 UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are
 out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md).
+
+## Known Issues
+
+### AINIC firmware: retransmitted RDMA READs lose data or fail the QP
+
+On AMD Pollara (AINIC) 1.117.5 firmware after `a-45`, an RDMA READ that is retransmitted while its QP keeps several READs in flight can go wrong. This was seen on `1.117.5-a-77` and `1.117.5-a-196`, not on `1.117.5-a-45`; until a firmware build with the fix is available, treat every 1.117.5 build after `a-45` as affected. A MORI-IO read, which is an RDMA READ, can then:
+
+- fail with `Work Request Flushed Error` and no `[ROOT CAUSE]` completion before it: the firmware moved the QP to the error state without failing a work request (`a-77`);
+- report success with whole 4 KiB packets of its data never written (`a-77`);
+- report success before all of its data is written, the rest landing up to about 2 s later, occasionally after the buffer has been reused (`a-196`, seen in a KVM guest with SR-IOV VFs).
+
+It happens only when READs are retransmitted, that is when the reader is backpressured (for example READ buffers on the other NUMA node, or many QPs or large READs per NIC); `tx_rdma_ack_timeout` and `req_rx_cqe_err` under `/sys/class/infiniband/<dev>/ports/1/hw_counters/` then grow.
+
+**Workaround:** set `MORI_IO_QP_MAX_RD_ATOMIC=1`, so that each QP keeps one READ in flight. In testing, the `a-196` symptoms did not occur with it; on `a-77` no QP failed silently any more, and data went missing only under heavy receive backpressure with many QPs per NIC. Throughput dropped by about 4% without other load; with small chunks (64 KiB) use more QPs per transfer. Without this setting, MORI-IO logs this known issue once per process, at the first READ over such firmware.
 
 ## Simulation Mode
 

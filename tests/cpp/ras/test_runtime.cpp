@@ -20,8 +20,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <dirent.h>
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sched.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -37,6 +39,7 @@
 #include <vector>
 
 #include "mori/ras/ras.hpp"
+#include "mori/utils/mori_log.hpp"
 #include "src/ras/logging.hpp"
 #include "src/ras/runtime.hpp"
 #include "tests/cpp/ras/ras_test_util.hpp"
@@ -297,6 +300,49 @@ TEST(RasRuntime, ProblemsShowAtTheDefaultLogLevelOnlyWhenRasWasAskedFor) {
   for (int fd : held) close(fd);
 }
 
+// A lost peer is what RAS is turned on to see, so when MORI_RAS_ENABLE asks for RAS it shows
+// at MORI's default level, unless a level was chosen.
+TEST(RasRuntime, ALostPeerShowsAtTheDefaultLogLevelWhenRasWasAskedFor) {
+  int held = -1;
+  uint16_t dead = ras_test::HoldPort("127.0.0.1", &held);
+  close(held);  // nothing listens there now
+  const char* const chosen[] = {nullptr, "MORI_RAS_LOG_LEVEL", "MORI_GLOBAL_LOG_LEVEL"};
+  for (const char* var : chosen) {
+    EXPECT_EQ(RunInChild([dead, var] {
+                setenv("MORI_RAS_ENABLE", "1", 1);
+                unsetenv("MORI_RAS_LOG_LEVEL");
+                unsetenv("MORI_GLOBAL_LOG_LEVEL");
+                if (var != nullptr) setenv(var, "error", 1);
+                mori::InitializeLoggingFromEnv();  // as for a variable set at startup
+                bool refused = false;
+                std::string log = RasLogAtDefaultLevel([dead, &refused] {
+                  RasRuntime* rt = RasRuntime::EnsureStarted(Params());
+                  if (rt == nullptr) return;
+                  PeerAdded peer;
+                  peer.localEngine = "local";
+                  peer.remoteEngine = "gone";
+                  peer.endpoint = RasEndpoint{"127.0.0.1", dead, "0123456789abcdef0123456789abcdef",
+                                              RuntimeUuid{1, 0x8000000000000001ull}};
+                  rt->Enqueue(std::move(peer));
+                  refused = WaitFor(
+                      [rt] {
+                        for (const LinkInfo& l : rt->Snapshot().links) {
+                          if (l.lastError == LinkError::kRasEndpointUnavailable) return true;
+                        }
+                        return false;
+                      },
+                      2000);
+                });
+                CHILD_CHECK(refused);
+                bool shown = log.find("RAS_ENDPOINT_UNAVAILABLE") != std::string::npos;
+                CHILD_CHECK(shown == (var == nullptr));
+                return 0;
+              }),
+              0)
+        << (var != nullptr ? var : "no level") << " set";
+  }
+}
+
 TEST(RasRuntime, TheRasThreadRunsAtLowPriorityWhereItIsPinned) {
   EXPECT_EQ(RunInChild([] {
               cpu_set_t allowed;
@@ -339,19 +385,74 @@ TEST(RasRuntime, EngineEventsReachTheRasThread) {
   EXPECT_EQ(core.Snapshot().events.dropped, 0u);
 }
 
+TEST(RasRuntime, PeerEventsReachTheRasThread) {
+  RasCore core(LocalCore());
+  ASSERT_TRUE(core.Start(nullptr));
+  PeerAdded noRas;
+  noRas.localEngine = "local";
+  noRas.remoteEngine = "remote-without-ras";
+  EXPECT_TRUE(core.Enqueue(std::move(noRas)));
+  PeerAdded self;
+  self.localEngine = "local";
+  self.remoteEngine = "local-twin";
+  self.endpoint = core.Endpoint();
+  EXPECT_TRUE(core.Enqueue(std::move(self)));
+  EXPECT_TRUE(WaitFor(
+      [&] {
+        RuntimeSnapshot s = core.Snapshot();
+        return s.peersWithoutRas == 1 && s.sameProcessPeers == 1;
+      },
+      2000));
+  RuntimeSnapshot s = core.Snapshot();
+  EXPECT_EQ(s.events.enqueued, 2u);
+  EXPECT_EQ(s.events.dropped, 0u);
+  EXPECT_TRUE(s.links.empty());
+}
+
 TEST(RasRuntime, StoppingClosesTheListenerAndRefusesLaterEvents) {
   RasCore core(LocalCore());
   ASSERT_TRUE(core.Start(nullptr));
   uint16_t port = core.Endpoint().port;
   ASSERT_TRUE(ras_test::CanConnect("127.0.0.1", port));
   auto start = std::chrono::steady_clock::now();
-  core.Stop();
+  core.Stop(true);
   EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
   int err = 0;
   EXPECT_LT(ras_test::ConnectTcp("127.0.0.1", port, &err), 0);
   EXPECT_EQ(err, ECONNREFUSED);
   EXPECT_FALSE(core.Enqueue(EngineRegistered{"late"}));
-  core.Stop();  // a second stop is harmless
+  core.Stop(true);  // a second stop is harmless
+}
+
+TEST(RasRuntime, ExitIsCleanWhileTheRasThreadIsLogging) {
+  // Every garbage connection makes the RAS thread log a protocol error, and a helper keeps
+  // sending them while the process exits, so the RAS thread logs as static destructors run.
+  // Run under ASan or TSan, this catches a logger destroyed under the RAS thread.
+  auto start = std::chrono::steady_clock::now();
+  EXPECT_EQ(RunInChild([] {
+              int devnull = open("/dev/null", O_WRONLY);
+              dup2(devnull, STDOUT_FILENO);
+              setenv("MORI_RAS_ENABLE", "1", 1);
+              setenv("MORI_RAS_LOG_LEVEL", "debug", 1);
+              RasRuntime* r = RasRuntime::EnsureStarted(Params());
+              CHILD_CHECK(r != nullptr);
+              uint16_t port = r->Endpoint().port;
+              std::thread([port] {
+                const std::string junk(64, 'x');
+                for (;;) {
+                  int fd = ras_test::ConnectTcp("127.0.0.1", port, nullptr);
+                  if (fd >= 0) {
+                    send(fd, junk.data(), junk.size(), MSG_NOSIGNAL);
+                    close(fd);
+                  }
+                }
+              }).detach();
+              CHILD_CHECK(WaitFor([&] { return r->Snapshot().protocolErrors >= 10; }, 2000));
+              std::exit(0);
+              return 1;
+            }),
+            0);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(5));
 }
 
 TEST(RasRuntime, ExitStopsTheRuntimeWithoutHangingOrLogging) {

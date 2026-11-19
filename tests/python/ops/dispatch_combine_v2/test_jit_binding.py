@@ -279,6 +279,34 @@ def test_describe_rejects_what_the_constructor_rejects():
         cb.EpDispatchPlan.describe(hidden_dim=7)
 
 
+def _device_arch():
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
+def _built_for(plan):
+    """The arch a plan compiled for: its cache directory is <root>/<arch>_<nic>[_ccqe]/<entry>."""
+    return plan.info["cacheDir"].split("/")[-2].split("_", 1)[0]
+
+
+def test_describe_arch_applies_to_that_call_only():
+    # Every arch, one after another, then a plan with none: each arch= is gone
+    # when its call returns, so the plan is built for the device.
+    for arch in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
+        cb.EpDispatchPlan.describe(arch=arch, **_SMALL)
+    p = cb.EpDispatchPlan(**_SMALL)
+    assert _built_for(p) == _device_arch()
+    p.close()
+
+
+def test_create_for_another_arch_fails_before_compiling():
+    other = "gfx950" if _device_arch() == "gfx942" else "gfx942"
+    with pytest.raises(RuntimeError, match=f"building for {other} \\(set by arch=\\)"):
+        cb.EpDispatchPlan(arch=other, **_SMALL)
+    p = cb.EpDispatchPlan(arch=_device_arch(), **_SMALL)
+    assert _built_for(p) == _device_arch()
+    p.close()
+
+
 def test_every_arena_region_is_reported_in_args_order():
     stems = [
         n[3].lower() + n[4:]

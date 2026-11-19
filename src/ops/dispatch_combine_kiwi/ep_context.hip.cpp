@@ -24,6 +24,7 @@
 #include <hip/hip_runtime.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdio>
@@ -183,6 +184,16 @@ ep_context_t::ep_context_t(const config_t& cfg,
           string_from_fixed_buffer(record.node_id, EP_NODE_ID_BYTES);
       peer_hostnames_[static_cast<size_t>(rank)] = hostname_from_fixed_buffer(record.hostname);
     }
+  }
+
+  // The automatic policy depends on each rank's detected hardware, so agree
+  // on whether to provision: every rank must join the setup collectives.
+  {
+    std::vector<char> all_required(static_cast<size_t>(comm_ctx_->rank_n()), 0);
+    char local_required = rcomp_ipc_resources_provisioned_ ? 1 : 0;
+    comm_ctx_->bootstrap().Allgather(&local_required, all_required.data(), 1);
+    rcomp_ipc_resources_provisioned_ =
+        std::find(all_required.begin(), all_required.end(), 1) != all_required.end();
   }
 
   if (rcomp_ipc_resources_provisioned_) {
@@ -532,9 +543,11 @@ void ep_context_t::reset(hipStream_t stream) {
   HIP_CHECK(hipMemsetAsync(workspace.recv_local_slot_map(), 0xFF,
                            cfg_.max_slots() * sizeof(int32_t), stream));
   HIP_CHECK(hipMemsetAsync(d_heap_buf_ + cfg_.dispatch_readiness_flags_offset(), 0,
-                           cfg_.payload_readiness_flag_count() * sizeof(uint8_t), stream));
+                           cfg_.payload_readiness_flag_count() * KIWI_EP_READINESS_FLAG_STRIDE,
+                           stream));
   HIP_CHECK(hipMemsetAsync(d_heap_buf_ + cfg_.combine_readiness_flags_offset(), 0,
-                           cfg_.payload_readiness_flag_count() * sizeof(uint8_t), stream));
+                           cfg_.payload_readiness_flag_count() * KIWI_EP_READINESS_FLAG_STRIDE,
+                           stream));
 }
 
 void ep_all2all_callback(internal::ep_cmd_desc_all2all_t desc) {
