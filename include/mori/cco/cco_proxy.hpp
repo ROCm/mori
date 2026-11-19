@@ -56,12 +56,14 @@
 // order and land on one QP per peer, so a put followed by a signal (or a put
 // carrying a signal) to the same peer through the same queue is delivered in
 // order -- the same guarantee ccoGda gives within one context. Different queues
-// are unordered, as different ccoGda contexts are.
+// are unordered, as different ccoGda contexts are, and so are ccoProxy and
+// ccoGda ops.
 //
 // Proxy QPs go to the peers of proxyConnectionType (ccoDevCommRequirements),
 // independent of the GDA QPs. Signals land in the ccoGda signal slots
 // (devComm.ibgda.signalBuf), which exist when the GDA or the proxy connection
-// resolves to non-NONE. SignalInc / SignalAdd / WindowSignalAdd are NIC atomic
+// resolves to non-NONE; the engine rejects a slot id >= gdaSignalCount
+// (BAD_REQUEST). SignalInc / SignalAdd / WindowSignalAdd are NIC atomic
 // fetch-adds; SignalSet / WindowSignalSet are 8-byte inline RDMA writes for NICs
 // whose atomics into GPU memory fail (see ccoGda_SignalSet), and need window MRs
 // without relaxed ordering.
@@ -157,7 +159,7 @@ struct ccoProxySignalDesc {
   uint32_t rkey;
   uint32_t peer;  // world rank
   uint32_t set;   // 0: atomic fetch-add; 1: 8-byte inline write of value
-  uint32_t pad;
+  uint32_t slot;  // 1: raddr is signal slot raddr / 8; the engine checks it < gdaSignalCount
 };
 
 struct ccoProxyPutSignalDesc {
@@ -230,10 +232,12 @@ __device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, 
     s.raddr = static_cast<uint64_t>(action.signalId) * sizeof(uint64_t);
     s.rkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
     s.value = 1;
+    s.slot = 1;
   } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalAdd>) {
     s.raddr = static_cast<uint64_t>(action.signalId) * sizeof(uint64_t);
     s.rkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
     s.value = action.value;
+    s.slot = 1;
   } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
     // Caller's window: its MR starts at iova iovaBias, as in ccoGda.
     const ccoWindowDevice* w = reinterpret_cast<ccoWindowDevice*>(action.win);
@@ -245,6 +249,7 @@ __device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, 
     s.rkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
     s.value = action.value;
     s.set = 1;
+    s.slot = 1;
   } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalSet>) {
     const ccoWindowDevice* w = reinterpret_cast<ccoWindowDevice*>(action.win);
     s.raddr = action.offset + w->ibgdaWin.iovaBias;

@@ -421,10 +421,17 @@ DevComm with proxy queues runs busy-polling proxy threads.
 - **Build:** `BUILD_CCO_PROXY` (CMake option and `setup.py` env var) is `ON` by
   default. The host engine is built when `GPU_TARGETS` contains gfx942 or
   gfx950; at run time `ccoDevCommCreate` accepts proxy queues only on those
-  GPUs. `MORI_CCO_PROXY` is defined when the engine is built in.
+  GPUs. Targets in mori's own CMake build that link `mori_cco` see
+  `MORI_CCO_PROXY` when the engine is built in; code built against the installed
+  headers or the wheel finds out at run time, when `ccoDevCommCreate` rejects
+  proxy queues.
 - **Requirements:** proxy queues are requested per DevComm. All ranks must pass
-  the same queue, thread and QP counts and connection type; creation fails on
-  every rank otherwise.
+  the same queue, thread and QP counts, connection type and `gdaSignalCount`.
+  A mismatch, a rank that cannot run the proxy, or a proxy engine that fails to
+  set up fails creation on every rank and leaves the communicator usable, so
+  it can be retried with other requirements.
+- **Versions:** kernels must be compiled against the headers of the mori they
+  run with; `ccoDevComm` and the proxy descriptors have no stable layout yet.
 
 | Field (C++ / Python) | Meaning |
 |---|---|
@@ -433,12 +440,13 @@ DevComm with proxy queues runs busy-polling proxy threads.
 | `proxyThreadCount` / `proxy_thread_count` | host proxy threads (0 = 4), capped at the queue count |
 | `proxyQueueCapacity` / `proxy_queue_capacity` | ring size in 64-byte lines, power of two (0 = 4096) |
 | `proxyQpsPerPeer` / `proxy_qps_per_peer` | RC QPs per (proxy thread, peer) (0 = 4) |
-| `proxyConnectionType` / `proxy_connection_type` | peers that get proxy QPs, a `CCO_GDA_CONNECTION_*` value (-1 = follow `gdaConnectionType`) |
+| `proxyConnectionType` / `proxy_connection_type` | peers that get proxy QPs, a `CCO_GDA_CONNECTION_*` value, or `CCO_PROXY_CONNECTION_FOLLOW_GDA` / `PROXY_CONNECTION_FOLLOW_GDA` (-1, the default) to follow `gdaConnectionType` |
 
 `proxyConnectionType` picks the proxy's peers independently of the GDA QPs and
 resolves like `gdaConnectionType`: CROSSNODE on a single node, no RDMA or no
 matching peer give NONE, and proxy queues on a NONE connection fail creation.
-The default -1 follows `gdaConnectionType`, so both get QPs to the same peers.
+The default, `CCO_PROXY_CONNECTION_FOLLOW_GDA`, follows `gdaConnectionType`, so
+both get QPs to the same peers.
 For a proxy-only DevComm, set `gdaConnectionType = CCO_GDA_CONNECTION_NONE`
 and `proxyConnectionType` to the peers you need; no GDA QPs are created. The
 proxy uses the GDA signal slots (`gdaSignalCount`), which exist whenever
@@ -467,8 +475,8 @@ declaration.
 | `putValue(peer, dstWin, dstOff, value, action, coop)` | inline write of a 1–8 byte value, optionally followed by a signal |
 | `signal(peer, action, coop)` | signal only |
 | action | `ccoGda_NoSignal`, `ccoGda_SignalInc` / `SignalAdd` / `WindowSignalAdd` (NIC atomics), `ccoGda_SignalSet` / `WindowSignalSet` (8-byte write, no atomic) |
-| `flush(coop)` | wait until every op this queue pushed before it completed remotely; sources are reusable |
-| `int flush(coop, timeoutCycles)` | never traps: 0 done, 1 timed out, 2 DevComm failed |
+| `flush(coop)` | wait until every op this queue pushed before it completed remotely; sources are reusable. It tells the peer nothing: publish arrival with a signal |
+| `int flush(coop, timeoutCycles)` | never traps: 0 done, 1 timed out, 2 DevComm failed. `timeoutCycles` counts `clock64` cycles, whose rate follows the shader clock |
 | `int waitSignal(id, least, coop, timeoutCycles)` | never traps: 0 consumed, 1 timed out, 2 DevComm failed; consumes only on 0 |
 | `readSignal` / `waitSignal` / `resetSignal` | local signal slots, shared with GDA (see [Signal slots](#signal-slots)) |
 | `failed()` | whether the DevComm has failed |
@@ -511,6 +519,10 @@ have consumed. The semantics are the same as `ccoGda`'s:
   take the same arrival. `waitSignal` does not take `ccoCoopLaneMasked`.
 - `resetSignal(id)` zeroes the slot and its consumed count; no signal to it may
   be in flight.
+- Slot ids run from 0 to `gdaSignalCount - 1`. Unlike `ccoGda`, `ccoProxy`
+  rejects a signal to a larger id on a peer: the DevComm fails with
+  `BAD_REQUEST` before anything is posted. The local `readSignal` /
+  `waitSignal` / `resetSignal` do not check the id, in either transport.
 
 With `SignalInc`, `waitSignal(slot, n)` waits for `n` more signals. With
 `SignalSet`, the sender sets 1, 2, 3, ... (one per round) and the receiver calls
@@ -521,7 +533,7 @@ With `SignalInc`, `waitSignal(slot, n)` waits for `n` more signals. With
 - Ops one wavefront pushes to one queue reach each peer in program order on one
   QP, so a put followed by a signal (or a put carrying a signal) to the same
   peer is delivered data first. Different queues are unordered, as different
-  GDA contexts are.
+  GDA contexts are, and so are `ccoGda` and `ccoProxy` ops, even to the same peer.
 - `SignalSet` / `WindowSignalSet`: every set of a slot goes through one queue,
   values only increase, and the slot gets no `SignalInc` / `SignalAdd`. The
   set is a plain RDMA write, so the data before it is visible first only if

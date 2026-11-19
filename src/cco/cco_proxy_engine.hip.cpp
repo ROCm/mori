@@ -368,10 +368,12 @@ struct ProxyQp {
 
 class ProxyWorker {
  public:
-  ProxyWorker(int id, int worldSize, int qpsPerPeer, int rank, ProxyErrorState* err)
+  ProxyWorker(int id, int worldSize, int qpsPerPeer, int signalCount, int rank,
+              ProxyErrorState* err)
       : qps(static_cast<size_t>(worldSize) * qpsPerPeer),
         worldSize_(worldSize),
         qpsPerPeer_(qpsPerPeer),
+        signalCount_(signalCount),
         id_(id),
         rank_(rank),
         err_(err) {}
@@ -578,15 +580,21 @@ class ProxyWorker {
     return nullptr;
   }
 
-  // Signal slots (atomic or set) are 8-byte aligned; raises BAD_REQUEST otherwise.
-  bool SignalAligned(const ccoProxySignalDesc& d, ccoProxyOp op) {
-    if ((d.raddr & 7) == 0) return true;
+  // A signal targets an 8-byte aligned word and, for a slot, one below
+  // gdaSignalCount: past it lie the peer's consumed counts, counters and barrier
+  // state, which the NIC would write without complaint. Raises BAD_REQUEST otherwise.
+  bool SignalValid(const ccoProxySignalDesc& d, ccoProxyOp op) {
+    const bool aligned = (d.raddr & 7) == 0;
+    const uint64_t slot = d.raddr / sizeof(uint64_t);
+    if (aligned && (d.slot == 0 || slot < static_cast<uint64_t>(signalCount_))) return true;
     ccoDevCommError e =
         MakeError(CCO_PROXY_ERR_BAD_REQUEST, static_cast<int>(d.peer), cur_->index, op);
     e.raddr = d.raddr;
     e.rkey = d.rkey;
     e.len = sizeof(uint64_t);
-    Raise(e, "signal address not 8-byte aligned");
+    Raise(e, aligned ? "signal slot " + std::to_string(slot) + " out of range (gdaSignalCount " +
+                           std::to_string(signalCount_) + ")"
+                     : std::string("signal address not 8-byte aligned"));
     return false;
   }
 
@@ -601,7 +609,7 @@ class ProxyWorker {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.put.peer, ccoProxyOpPutSignal);
     // Both in one chain: data, then the atomic, on the same QP.
-    if (qp == nullptr || !SignalAligned(d.signal, ccoProxyOpPutSignal) || !Reserve(*qp, 2)) {
+    if (qp == nullptr || !SignalValid(d.signal, ccoProxyOpPutSignal) || !Reserve(*qp, 2)) {
       return;
     }
     AddWrite(*qp, d.put);
@@ -611,7 +619,7 @@ class ProxyWorker {
   void OnSignal(const ccoProxySignalDesc& d) {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.peer, ccoProxyOpSignal);
-    if (qp == nullptr || !SignalAligned(d, ccoProxyOpSignal) || !Reserve(*qp, 1)) return;
+    if (qp == nullptr || !SignalValid(d, ccoProxyOpSignal) || !Reserve(*qp, 1)) return;
     cur_->lastSeq[d.peer] = AddSignal(*qp, d);
   }
 
@@ -625,7 +633,7 @@ class ProxyWorker {
   void OnPutValueSignal(const ccoProxyPutValueSignalDesc& d) {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.put.peer, ccoProxyOpPutValueSignal);
-    if (qp == nullptr || !SignalAligned(d.signal, ccoProxyOpPutValueSignal) || !Reserve(*qp, 2)) {
+    if (qp == nullptr || !SignalValid(d.signal, ccoProxyOpPutValueSignal) || !Reserve(*qp, 2)) {
       return;
     }
     AddInline(*qp, d.put.raddr, d.put.rkey, d.put.value, d.put.bytes);
@@ -826,6 +834,7 @@ class ProxyWorker {
 
   int worldSize_;
   int qpsPerPeer_;
+  int signalCount_;  // user signal slots (gdaSignalCount), the same on every rank
   int id_;
   int rank_;
   ProxyErrorState* err_;          // the engine's
@@ -987,7 +996,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
         engine->ibv->RegisterRdmaMemoryRegion(engine->scratch, kScratchStride * numThreads);
 
     for (int t = 0; t < numThreads; t++) {
-      auto w = std::make_unique<ProxyWorker>(t, worldSize, threadQps[t], rank, &engine->err);
+      auto w = std::make_unique<ProxyWorker>(t, worldSize, threadQps[t], config.signalCount, rank,
+                                             &engine->err);
       w->scratchAddr = reinterpret_cast<uint64_t>(engine->scratch) + t * kScratchStride;
       w->scratchLkey = scratchMr.lkey;
       engine->workers.push_back(std::move(w));

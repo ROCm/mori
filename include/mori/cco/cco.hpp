@@ -257,6 +257,9 @@ enum ccoGdaConnectionType {
   CCO_GDA_CONNECTION_RAIL = 3,       // QPs only to same-rail cross-node peers
 };
 
+// proxyConnectionType value that follows gdaConnectionType (the default).
+inline constexpr int CCO_PROXY_CONNECTION_FOLLOW_GDA = -1;
+
 enum ccoTeamMode {
   CCO_TEAM_WORLD = 0,
   CCO_TEAM_LSA = 1,
@@ -554,8 +557,8 @@ struct ccoDevCommRequirements {
   // ccoProxy<mori::cco::proxy::queue::MPSCD2HQueue> index their own pool),
   // polled by proxyThreadCount host threads. Proxy QPs go to the peers
   // of proxyConnectionType; signals use the GDA signal slots (gdaSignalCount).
-  // Every rank must pass the same queue, thread and QP counts and connection
-  // type (checked; creation fails otherwise), and the GPU's VRAM must be
+  // Every rank must pass the same queue, thread and QP counts, connection type
+  // and gdaSignalCount (checked; creation fails otherwise), and the GPU's VRAM must be
   // host-mapped (large BAR). Each DevComm with proxy queues starts its own
   // busy-polling threads, pinned by the same policy (MORI_CCO_PROXY_CPUS or the
   // GPU-local cores), so several such DevComms oversubscribe the same CPUs;
@@ -576,35 +579,36 @@ struct ccoDevCommRequirements {
   int proxyQpsPerPeer;
   // Peers that get proxy QPs, as a ccoGdaConnectionType resolved like
   // gdaConnectionType (CROSSNODE on one node, no RDMA or no matching peer ->
-  // NONE; proxy queues then fail creation). -1 = follow gdaConnectionType.
+  // NONE; proxy queues then fail creation). CCO_PROXY_CONNECTION_FOLLOW_GDA
+  // (-1, the default) follows gdaConnectionType.
   // Independent of the GDA QPs: gdaConnectionType NONE + proxyConnectionType
   // FULL gives a proxy-only DevComm. ccoProxy's CCO_TEAM_GDA peers index this
   // type's team, as ccoGda's index gdaConnectionType's.
   int proxyConnectionType;
 };
 
-#define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                   \
-  {                                                                             \
-      sizeof(::mori::cco::ccoDevCommRequirements),                              \
-      ::mori::cco::CCO_API_MAGIC,                                               \
-      ::mori::cco::CCO_API_VERSION,                                             \
-      nullptr,                                   /* resourceRequirementsList */ \
-      ::mori::cco::CCO_GDA_CONNECTION_CROSSNODE, /* gdaConnectionType */        \
-      4,                                         /* gdaContextCount    */       \
-      16,                                        /* gdaSignalCount     */       \
-      16,                                        /* gdaCounterCount    */       \
-      0,                                         /* gdaQueueDepth      */       \
-      -1,                                        /* gdaTrafficClass    */       \
-      0,                                         /* lsaBarrierCount    */       \
-      0,                                         /* railGdaBarrierCount*/       \
-      0,                                         /* sdmaQueueCount     */       \
-      0,                                         /* barrierCount       */       \
-      0,                                         /* proxySpscQueueCount*/       \
-      0,                                         /* proxyMpscQueueCount*/       \
-      0,                                         /* proxyThreadCount   */       \
-      0,                                         /* proxyQueueCapacity */       \
-      0,                                         /* proxyQpsPerPeer    */       \
-      -1,                                        /* proxyConnectionType*/       \
+#define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                      \
+  {                                                                                \
+      sizeof(::mori::cco::ccoDevCommRequirements),                                 \
+      ::mori::cco::CCO_API_MAGIC,                                                  \
+      ::mori::cco::CCO_API_VERSION,                                                \
+      nullptr,                                      /* resourceRequirementsList */ \
+      ::mori::cco::CCO_GDA_CONNECTION_CROSSNODE,    /* gdaConnectionType */        \
+      4,                                            /* gdaContextCount    */       \
+      16,                                           /* gdaSignalCount     */       \
+      16,                                           /* gdaCounterCount    */       \
+      0,                                            /* gdaQueueDepth      */       \
+      -1,                                           /* gdaTrafficClass    */       \
+      0,                                            /* lsaBarrierCount    */       \
+      0,                                            /* railGdaBarrierCount*/       \
+      0,                                            /* sdmaQueueCount     */       \
+      0,                                            /* barrierCount       */       \
+      0,                                            /* proxySpscQueueCount*/       \
+      0,                                            /* proxyMpscQueueCount*/       \
+      0,                                            /* proxyThreadCount   */       \
+      0,                                            /* proxyQueueCapacity */       \
+      0,                                            /* proxyQpsPerPeer    */       \
+      ::mori::cco::CCO_PROXY_CONNECTION_FOLLOW_GDA, /* proxyConnectionType*/       \
   }
 
 /* ════════════════════════════════════════════════════════════════════════════

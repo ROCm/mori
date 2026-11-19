@@ -1819,7 +1819,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     // of the other collectives here, so ranks that disagree all fail here
     // instead of some waiting in the MR back-fill or the engine's QP exchange.
     struct ProxyReq {
-      int32_t spsc, mpsc, threads, connType, disabled, qpsPerPeer, targetOk;
+      int32_t spsc, mpsc, threads, connType, disabled, qpsPerPeer, targetOk, signalCount;
     };
     // Pushes only run on wave64 gfx942/gfx950; a multi-arch build reaches here on others too.
     bool targetOk = true;
@@ -1830,13 +1830,13 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       targetOk = arch == "gfx942" || arch == "gfx950";
       if (!targetOk) MORI_SHMEM_ERROR("ccoDevCommCreate: ccoProxy does not support {}", arch);
     }
-    ProxyReq mine{proxySpsc,
-                  proxyMpsc,
-                  proxyThreads,
+    ProxyReq mine{proxySpsc, proxyMpsc, proxyThreads,
                   proxyConnValid ? static_cast<int32_t>(proxyConnType) : -1,  // -1 = invalid
                   env::IsEnvVarEnabled("MORI_CCO_DISABLE_PROXY"),
                   proxyQueues > 0 ? proxyQpsPerPeer : 0,  // no QPs, nothing to agree on
-                  targetOk};
+                  targetOk,
+                  // The engine checks slot signals against the sender's count.
+                  proxyQueues > 0 ? reqs->gdaSignalCount : 0};
     std::vector<ProxyReq> all(comm->worldSize);
     comm->bootNet->Allgather(&mine, all.data(), sizeof(ProxyReq));
     for (int r = 0; r < comm->worldSize && proxyError.empty(); r++) {
@@ -1849,6 +1849,13 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
         };
         proxyError = "ranks disagree on the ccoProxy requirements: rank 0 asks for " +
                      describe(all[0]) + ", rank " + std::to_string(r) + " for " + describe(all[r]);
+      } else if (all[r].signalCount < 0) {
+        proxyError = "gdaSignalCount " + std::to_string(all[r].signalCount) +
+                     " is negative with ccoProxy queues (rank " + std::to_string(r) + ")";
+      } else if (all[r].signalCount != all[0].signalCount) {
+        proxyError = "ranks disagree on gdaSignalCount with ccoProxy queues: rank 0 has " +
+                     std::to_string(all[0].signalCount) + ", rank " + std::to_string(r) + " " +
+                     std::to_string(all[r].signalCount);
       } else if (all[r].connType < 0) {
         proxyError = "invalid proxyConnectionType on rank " + std::to_string(r) +
                      " (-1 or a ccoGdaConnectionType)";
@@ -2086,6 +2093,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     proxyConfig.queueCapacity =
         reqs->proxyQueueCapacity > 0 ? static_cast<size_t>(reqs->proxyQueueCapacity) : 0;
     proxyConfig.qpsPerPeer = proxyQpsPerPeer;
+    proxyConfig.signalCount = signalCountUser;
     proxyConfig.peerMask = proxyPeerMask;
     ccoProxyEngine* engine =
         ccoProxyEngineCreate(comm->ctx, comm->bootNet, proxyConfig, &hostShadow.proxy);

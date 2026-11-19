@@ -10,6 +10,7 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
 
     unsigned int CCO_API_MAGIC
     unsigned int CCO_API_VERSION
+    const int CCO_PROXY_CONNECTION_FOLLOW_GDA
 
     ctypedef enum ccoGdaConnectionType:
         CCO_GDA_CONNECTION_NONE

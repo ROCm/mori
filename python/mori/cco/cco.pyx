@@ -13,6 +13,7 @@ from .cco cimport (
     CCO_API_MAGIC, CCO_API_VERSION,
     CCO_GDA_CONNECTION_NONE, CCO_GDA_CONNECTION_FULL,
     CCO_GDA_CONNECTION_CROSSNODE, CCO_GDA_CONNECTION_RAIL,
+    CCO_PROXY_CONNECTION_FOLLOW_GDA,
     ccoGetUniqueId, ccoCommCreate, ccoCommDestroy,
     ccoMemAlloc, ccoMemImport, ccoMemFree,
     ccoWindowDeregister, ccoDevCommCreate, ccoDevCommDestroy,
@@ -29,6 +30,8 @@ GDA_CONNECTION_NONE      = CCO_GDA_CONNECTION_NONE
 GDA_CONNECTION_FULL      = CCO_GDA_CONNECTION_FULL
 GDA_CONNECTION_CROSSNODE = CCO_GDA_CONNECTION_CROSSNODE
 GDA_CONNECTION_RAIL      = CCO_GDA_CONNECTION_RAIL
+# proxy_connection_type value that follows gda_connection_type (the default)
+PROXY_CONNECTION_FOLLOW_GDA = CCO_PROXY_CONNECTION_FOLLOW_GDA
 
 
 ###############################################################################
@@ -115,7 +118,7 @@ cdef class DevCommRequirements:
         self._reqs.proxyThreadCount = 0
         self._reqs.proxyQueueCapacity = 0
         self._reqs.proxyQpsPerPeer = 0
-        self._reqs.proxyConnectionType = -1
+        self._reqs.proxyConnectionType = CCO_PROXY_CONNECTION_FOLLOW_GDA
 
     @property
     def gda_connection_type(self):
@@ -239,7 +242,8 @@ cdef class DevCommRequirements:
 
     @property
     def proxy_connection_type(self):
-        """Proxy QP peer set (a CCO_GDA_CONNECTION_* value); -1 follows gda_connection_type."""
+        """Proxy QP peer set (a GDA_CONNECTION_* value), or PROXY_CONNECTION_FOLLOW_GDA (-1, the
+        default) to follow gda_connection_type."""
         return self._reqs.proxyConnectionType
 
     @proxy_connection_type.setter

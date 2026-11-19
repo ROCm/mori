@@ -36,7 +36,7 @@
 // MORI_CCO_PROXY_TEST_CASES=<list> runs only the listed positive cases, where
 // "atomic_free" stands for kAtomicFreeCases; those run first, for NICs whose
 // atomics into GPU memory fail (the first atomic would fail the shared DevComm).
-// MORI_CCO_PROXY_TEST_NEGATIVE=all (or a list such as "n1,n3") adds n1-n6, each
+// MORI_CCO_PROXY_TEST_NEGATIVE=all (or a list such as "n1,n3") adds n1-n8, each
 // on a DevComm of its own (see their runners); put_sig_after then checks that
 // the first DevComm still works.
 //
@@ -779,6 +779,33 @@ __global__ void ProxyFailKernel(ccoDevComm dc, int peer, ccoWindow_t dstWin, siz
   }
 }
 
+// n7 push shapes: a slot signal past gdaSignalCount through each engine entry
+// (signal, put + signal, putValue + signal), and a window signal at the same
+// offset of a window, which the slot check must not touch.
+enum BadSlotShape { kBadSignalSet, kBadSignalInc, kBadPutAdd, kBadValueInc, kWindowPastSlots };
+
+// n7: one wavefront pushes `Shape` to `peer` with slot (or window offset)
+// `slot`, then flushes with a timeout. res = {flush}.
+template <int Shape>
+__global__ void ProxyBadSlotKernel(ccoDevComm dc, int peer, ccoGdaSignal_t slot,
+                                   ccoWindow_t sendWin, ccoWindow_t recvWin, int* res) {
+  ccoProxy<> proxy{dc, 0};
+  const ccoCoopWarp warp{};
+  if constexpr (Shape == kBadSignalSet) {
+    proxy.signal(peer, ccoGda_SignalSet{slot, 0x5a5a5a5aull}, warp);
+  } else if constexpr (Shape == kBadSignalInc) {
+    proxy.signal(peer, ccoGda_SignalInc{slot}, warp);
+  } else if constexpr (Shape == kBadPutAdd) {
+    proxy.put(peer, recvWin, 0, sendWin, 0, 64, ccoGda_SignalAdd{slot, 1}, warp);
+  } else if constexpr (Shape == kBadValueInc) {
+    proxy.putValue(peer, recvWin, 0, uint64_t{1}, ccoGda_SignalInc{slot}, warp);
+  } else {
+    proxy.signal(peer, ccoGda_WindowSignalSet{recvWin, slot * sizeof(uint64_t), 1}, warp);
+  }
+  const int flushed = proxy.flush(warp, kNegTimeoutCycles);
+  if (__lane_id() == 0) res[0] = flushed;
+}
+
 // n3: block u (SPSC queue u, ccoCoopBlock) puts its chunk to every peer, then
 // flushes with a timeout the proxy cannot meet (returns 1), without one (still
 // completes), and with a long one (returns 0); flushDone advances by exactly 3.
@@ -1163,6 +1190,85 @@ static int RunConnMismatchCase(Ctx& c, const ccoDevCommRequirements& reqs) {
   return c.Harvest("n6_conn_mismatch", rc == 0);
 }
 
+// n7: rank 0 pushes slot gdaSignalCount (one past the last) to peer 1, once per
+// push shape, each on a DevComm of its own (the first error fails it). The
+// engine rejects it before posting: flush(coop, timeout) returns 2 and
+// ccoDevCommGetError reports BAD_REQUEST for that op with raddr
+// gdaSignalCount * 8. No other rank fails, and peer 1's slots read 0 (the write
+// would have landed on its consumed counts). A window signal at that offset of
+// the receive window still succeeds.
+template <int Shape>
+static int RunBadSlotShape(Ctx& c, const ccoDevCommRequirements& reqs, const char* name,
+                           ccoProxyOp wantOp) {
+  ccoDevComm d{};
+  if (ccoDevCommCreate(c.comm, &reqs, &d) != 0) {
+    fprintf(stderr, "[rank %d] %s: DevCommCreate failed\n", c.rank, name);
+    return c.Harvest(name, 1);
+  }
+  ProxyResetKernel<<<1, 256, 0, c.stream>>>(d, c.nSlots);
+  c.Sync();
+  int* dRes = nullptr;
+  HIP_CHECK(hipMalloc(&dRes, sizeof(int)));
+  HIP_CHECK(hipMemset(dRes, 0xff, sizeof(int)));
+  if (c.rank == 0) {
+    ProxyBadSlotKernel<Shape><<<1, 64, 0, c.stream>>>(d, 1, static_cast<ccoGdaSignal_t>(c.nSlots),
+                                                      c.sendWin, c.recvWin, dRes);
+  }
+  c.Sync();
+  int flushed = -1;
+  HIP_CHECK(hipMemcpy(&flushed, dRes, sizeof(int), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipFree(dRes));
+  ProxyCheckSignalsKernel<<<1, 256, 0, c.stream>>>(d, c.nSlots, c.dErr);
+  HIP_CHECK(hipStreamSynchronize(c.stream));
+  ccoDevCommError e{};
+  const int got = ccoDevCommGetError(c.comm, &d, &e);
+  constexpr bool kRejected = Shape != kWindowPastSlots;
+  int bad = 0;
+  if (c.rank == 0 && kRejected) {
+    PrintError(c.rank, name, got, e);
+    bad |= flushed != 2 || got != 1 || e.code != CCO_PROXY_ERR_BAD_REQUEST || e.peer != 1 ||
+           e.queue != 0 || e.op != wantOp ||
+           e.raddr != static_cast<uint64_t>(c.nSlots) * sizeof(uint64_t);
+  } else if (got != 0) {
+    PrintError(c.rank, name, got, e);
+    bad = 1;
+  }
+  if (c.rank == 0 && flushed != (kRejected ? 2 : 0)) {
+    printf("[rank %d]   %s: flush returned %d\n", c.rank, name, flushed);
+    bad = 1;
+  }
+  ccoBarrierAll(c.comm);
+  if (ccoDevCommDestroy(c.comm, &d) != 0) {
+    fprintf(stderr, "[rank %d] %s: DevCommDestroy failed\n", c.rank, name);
+    bad = 1;
+  }
+  return c.Harvest(name, bad);
+}
+
+static int RunBadSlotCase(Ctx& c, const ccoDevCommRequirements& reqs) {
+  int fails = 0;
+  fails += RunBadSlotShape<kBadSignalSet>(c, reqs, "n7_sig_set", ccoProxyOpSignal);
+  fails += RunBadSlotShape<kBadSignalInc>(c, reqs, "n7_sig_inc", ccoProxyOpSignal);
+  fails += RunBadSlotShape<kBadPutAdd>(c, reqs, "n7_put_add", ccoProxyOpPutSignal);
+  fails += RunBadSlotShape<kBadValueInc>(c, reqs, "n7_val_inc", ccoProxyOpPutValueSignal);
+  fails += RunBadSlotShape<kWindowPastSlots>(c, reqs, "n7_win_ok", ccoProxyOpSignal);
+  return fails;
+}
+
+// n8: ranks disagree on gdaSignalCount (one more on rank 0): ccoDevCommCreate
+// fails on every rank.
+static int RunSlotCountMismatchCase(Ctx& c, const ccoDevCommRequirements& reqs) {
+  ccoDevCommRequirements r = reqs;
+  if (c.rank == 0) r.gdaSignalCount += 1;
+  ccoDevComm d{};
+  const int rc = ccoDevCommCreate(c.comm, &r, &d);
+  if (rc == 0) {
+    fprintf(stderr, "[rank %d] n8_slot_count: DevCommCreate succeeded\n", c.rank);
+    ccoDevCommDestroy(c.comm, &d);
+  }
+  return c.Harvest("n8_slot_count", rc == 0);
+}
+
 // MORI_CCO_PROXY_TEST_NEGATIVE: "all" or a comma-separated list of case names.
 static bool NegativeSelected(const char* name) {
   const char* env = getenv("MORI_CCO_PROXY_TEST_NEGATIVE");
@@ -1391,6 +1497,14 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   if (NegativeSelected("n6")) {
     anyNegative = true;
     fails += RunConnMismatchCase(c, reqs);
+  }
+  if (NegativeSelected("n7")) {
+    anyNegative = true;
+    fails += RunBadSlotCase(c, reqs);
+  }
+  if (NegativeSelected("n8")) {
+    anyNegative = true;
+    fails += RunSlotCountMismatchCase(c, reqs);
   }
   if (anyNegative) {
     fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "put_sig_after", 26, kChunk,
