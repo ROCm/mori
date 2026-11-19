@@ -39,9 +39,31 @@ from mori.io import (
     make_hip_gem_mem_pool,
 )
 
+
+def pinning_rdma_devices():
+    """The RDMA devices the allocator may pin buffers through whose dma-buf MRs do pin
+    memory: mlx5 attaches dma-bufs dynamically, which leaves a buffer evictable."""
+    root = "/sys/class/infiniband"
+    names = sorted(os.listdir(root)) if os.path.isdir(root) else []
+    pin = os.environ.get("MORI_HIP_GEM_PIN_DEVICE")
+    selected = os.environ.get("MORI_RDMA_DEVICES", "")
+    if pin:
+        names = [n for n in names if n == pin]
+    elif selected.startswith("^"):
+        excluded = {n.strip() for n in selected[1:].split(",")}
+        names = [n for n in names if n not in excluded]
+    elif selected:
+        names = [n for n in (s.strip() for s in selected.split(",")) if n in names]
+
+    def driver(name):
+        return os.path.basename(os.path.realpath(f"{root}/{name}/device/driver"))
+
+    return [n for n in names if "mlx5" not in driver(n)]
+
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not os.path.isdir("/sys/class/infiniband"),
-    reason="needs a GPU and an RDMA device",
+    not torch.cuda.is_available() or not pinning_rdma_devices(),
+    reason="needs a GPU and an RDMA device whose dma-buf MRs pin memory (not mlx5)",
 )
 
 MiB = 1 << 20
