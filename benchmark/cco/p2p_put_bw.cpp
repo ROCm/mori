@@ -309,11 +309,6 @@ int main(int argc, char** argv) {
     PerfFinalize(&ctx);
     return 1;
   }
-  if (args.put_value) {
-    if (my_pe == 0) std::fprintf(stderr, "-V is cco_p2p_put_latency only\n");
-    PerfFinalize(&ctx);
-    return 1;
-  }
   const bool run_kernels = (my_pe == 0);  // unidirectional: PE 0 issues
 
   const dim3 grid(args.nblocks, 1, 1);

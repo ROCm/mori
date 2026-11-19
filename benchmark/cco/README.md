@@ -65,7 +65,8 @@ of the queue complete.
   in one lane-masked push.
   - `-q spsc` (default) gives every block (`-s block`) or wavefront its own
     SPSC queue; `-q mpsc` shares one MPSC queue per block.
-  - `-Q` sets the number of host proxy threads (default 4).
+  - `-Q` sets the number of host proxy threads (default 4), `-K` the RC QPs
+    per (proxy thread, peer) (default 4).
 - Message rate: run small sizes with `-s warp` or `-s thread` and many
   wavefronts. The `Mpps` column gives the per-message issue rate.
 

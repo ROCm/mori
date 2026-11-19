@@ -120,9 +120,6 @@ struct PerfArgs {
   // -S is signal-only. ibgda and proxy.
   bool pingpong = false;
   bool signal_only = false;
-  // Latency only (-V): the timed op is putValue (8 B) instead of an 8-byte put,
-  // with -P carrying the SignalInc. ibgda and proxy.
-  bool put_value = false;
   // proxy: host proxy threads (-Q) and queue kind (-q). SPSC: one queue per
   // issuing unit (block, or wavefront with -s warp). MPSC: one queue per block,
   // shared by its wavefronts.
