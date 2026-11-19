@@ -27,8 +27,7 @@ set -euo pipefail
 #   bash tools/batch_internode_tuning.sh \
 #       --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
 #       --local-docker <CONTAINER0> --docker <CONTAINER1> \
-#       --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16 \
-#       --quant-type fp8_direct_cast
+#       --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16
 #
 #   # v1_ll, fp8→bf16
 #   bash tools/batch_internode_tuning.sh \
@@ -68,7 +67,7 @@ TOKENS_LIST="64,128,256,512,1024,2048,4096"
 HIDDEN_DIMS="7168"
 DTYPE="fp4"
 COMBINE_DTYPE="bf16"
-QUANT_TYPE="fp8_direct_cast"
+QUANT_TYPE="none"
 CONFIG_OUTPUT="auto"
 GPU_PER_NODE=8
 TIMEOUT_SEC=600

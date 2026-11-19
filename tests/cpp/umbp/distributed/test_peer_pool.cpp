@@ -462,6 +462,50 @@ TEST(PeerPool, ClearDropsPhysicalAndLogicalState) {
   EXPECT_EQ(registry.Get("dram")->OwnedKeyCount(), 0u);
 }
 
+// Answers BatchStillHolds by generation parity and records what it was asked.
+class ParityStillHoldsBackend final : public MockBackend {
+ public:
+  explicit ParityStillHoldsBackend(TierType tier) : MockBackend(tier) {}
+
+  std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& generations) const override {
+    ++calls;
+    asked.insert(asked.end(), keys.begin(), keys.end());
+    std::vector<bool> out(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) out[i] = generations[i] % 2 == 0;
+    return out;
+  }
+
+  mutable int calls = 0;
+  mutable std::vector<std::string> asked;
+};
+
+TEST(PeerPool, ValidateResolvedAsksEachNamedBackendOnce) {
+  BackendRegistry registry;
+  auto a = std::make_unique<ParityStillHoldsBackend>(TierType::DRAM);
+  auto b = std::make_unique<ParityStillHoldsBackend>(TierType::DRAM);
+  auto* pa = a.get();
+  auto* pb = b.get();
+  ASSERT_TRUE(registry.Register("dram_a", std::move(a)));
+  ASSERT_TRUE(registry.Register("dram_b", std::move(b)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  const uint32_t ida = registry.BackendId(pa);
+  const uint32_t idb = registry.BackendId(pb);
+
+  // Answered by the backend the reader read from, not by whichever holds the
+  // key now; a backend this peer does not have cannot vouch for anything.
+  const auto valid = pool.ValidateResolved({ida, idb, ida, BackendRegistry::kMaxBackends, idb},
+                                           {"a1", "b1", "a2", "x", "b2"}, {2, 2, 3, 2, 5});
+  EXPECT_EQ(valid, (std::vector<bool>{true, true, false, false, false}));
+  EXPECT_EQ(pa->calls, 1);
+  EXPECT_EQ(pb->calls, 1);
+  EXPECT_EQ(pa->asked, (std::vector<std::string>{"a1", "a2"}));
+  EXPECT_EQ(pb->asked, (std::vector<std::string>{"b1", "b2"}));
+
+  // Parallel vectors that disagree are a malformed request: nothing is vouched for.
+  EXPECT_EQ(pool.ValidateResolved({ida}, {"a1", "a2"}, {2, 2}), (std::vector<bool>{false, false}));
+}
+
 TEST(PeerPool, BatchResultsRemainPositionalAcrossBackends) {
   BackendRegistry registry;
   ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
@@ -1469,6 +1513,73 @@ TEST(PeerPoolLocalEviction, DrainsAFullBackendColdestFirstToItsLowWatermark) {
   EXPECT_EQ(pool.PlacementCount(), 5u);
   EXPECT_GE(pool.LocalEvictionStats().rounds, 1u);
   EXPECT_EQ(pool.LocalEvictionStats().keys, 4u);
+}
+
+TEST(PeerPoolLocalEviction, TouchedKeysOutliveColderOnesInTheOrderGiven) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10);
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("dram")), 0.9, 0.5));
+
+  for (int i = 0; i < 8; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  // Served from the caller's own cache, so never read here.  A prefix comes
+  // tail first, so that its head is the last of it to go.
+  EXPECT_EQ(pool.BatchTouch({"k5", "k4", "k3", "k2", "k1", "k0", "missing"}), 6u);
+  CommitKey(&pool, "k8");
+
+  // The untouched k6 and k7 go first, then the prefix's tail.
+  auto* dram = registry.Get("dram");
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_EQ(dram->OwnedKeyCount(), 5u);
+  for (int i = 4; i <= 7; ++i) EXPECT_FALSE(dram->Contains("k" + std::to_string(i))) << i;
+  for (int i : {0, 1, 2, 3, 8}) EXPECT_TRUE(dram->Contains("k" + std::to_string(i))) << i;
+  EXPECT_EQ(pool.LocalEvictionStats().keys, 4u);
+}
+
+TEST(PeerPool, ATouchReachesEveryCopyInAMediumThatKeepsAnOrder) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  for (const char* name : {"ordered_a", "ordered_b", "unordered"}) {
+    RegisterPageBackend(&registry, &engine, name, TierType::DRAM, kHostPage, 4);
+  }
+  registry.Get("ordered_a")->TrackEvictionOrder();
+  registry.Get("ordered_b")->TrackEvictionOrder();
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  // A copy in each medium, put there directly rather than through placement.
+  for (const char* name : {"ordered_a", "ordered_b", "unordered"}) {
+    auto* backend = registry.Get(name);
+    auto slot = backend->BatchAllocate({AllocateRequest{"k", 64}}).front();
+    ASSERT_TRUE(backend->BatchCommit({CommitRequest{slot.slot_id, "k"}}).front().success) << name;
+  }
+  EXPECT_EQ(pool.BatchTouch({"k", "missing"}), 2u);
+}
+
+TEST(PeerPool, WatermarkOffloadMovesATouchedKeyLast) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kHostPage, 10);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kHostPage, 40);
+  auto tiers = HotColdTiers(PoolOffloadTrigger::kWatermark);
+  tiers.front().high_watermark = 0.9;
+  tiers.front().low_watermark = 0.5;
+  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+
+  for (int i = 0; i < 8; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  // The oldest key, used from the caller's own cache.  The offload picks from
+  // the pool's own order, not from a medium's.
+  pool.BatchTouch({"k0"});
+  CommitKey(&pool, "k8");  // 9 of 10 pages
+
+  auto* hot = registry.Get("hot");
+  ASSERT_TRUE(WaitUntil([&] { return hot->OwnedKeyCount() <= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_TRUE(registry.Get("cold")->Contains("k1")) << "the coldest key stayed";
+  EXPECT_TRUE(hot->Contains("k0")) << "the touched key was offloaded";
+  EXPECT_FALSE(registry.Get("cold")->Contains("k0"));
 }
 
 TEST(PeerPoolLocalEviction, RankedCandidatesGoFirstAndTheMediumCoversTheRest) {

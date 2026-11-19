@@ -31,13 +31,14 @@ The multi-rank half spawns the benchmark and checks the modes agree.
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import time
 
 import pytest
 
 from mori.ops.gemm_a2a import layout
+
+from . import kfd_settle
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BENCH = REPO_ROOT / "benchmark" / "cco" / "flydsl" / "gemm_a2a" / "bench_gemm_a2a.py"
@@ -326,7 +327,6 @@ def _run_bench(world_size, mode, m, n, k, extra=()):
 
 def _spawn_bench(world_size, mode, m, n, k, extra=(), last=False):
     """One launch. Returns None if it lost the queue race and may be retried."""
-    time.sleep(_SETTLE_SECONDS)
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
@@ -351,7 +351,7 @@ def _spawn_bench(world_size, mode, m, n, k, extra=(), last=False):
         "3",
         *extra,
     ]
-    result = subprocess.run(
+    result = kfd_settle.run(
         command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=1200
     )
     output = result.stdout + result.stderr

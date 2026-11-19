@@ -39,7 +39,6 @@ import importlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import time
 from types import SimpleNamespace
@@ -50,6 +49,8 @@ import torch
 from mori.ops.gemm_ag import layout
 from mori.ops.gemm_ag import _gemm_a16w16_8wave as bf16gemm
 from mori.ops.gemm_ar import _gemm_a8w8_8wave as fp8gemm
+
+from . import kfd_settle
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BENCH = REPO_ROOT / "benchmark" / "cco" / "flydsl" / "gemm_ag" / "bench_gemm_ag.py"
@@ -398,7 +399,6 @@ def _run_bench(world_size, mode, m, n, k, extra=()):
 
 def _spawn_bench(world_size, mode, m, n, k, extra=(), last=False):
     """One launch. Returns None if it lost the queue race and may be retried."""
-    time.sleep(_SETTLE_SECONDS)
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
@@ -423,7 +423,7 @@ def _spawn_bench(world_size, mode, m, n, k, extra=(), last=False):
         "3",
         *extra,
     ]
-    result = subprocess.run(
+    result = kfd_settle.run(
         command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=1200
     )
     output = result.stdout + result.stderr
@@ -440,6 +440,7 @@ def _spawn_bench(world_size, mode, m, n, k, extra=(), last=False):
     return records[0]
 
 
+@pytest.mark.single_gpu
 @pytest.mark.parametrize(
     "bm,bn,out_dtype",
     [
@@ -545,6 +546,7 @@ def test_split_k_rejects_incompatible_output(kwargs, match):
         bf16gemm.compile_bf16_gemm_ag(cfg, 0, **options)
 
 
+@pytest.mark.single_gpu
 @pytest.mark.parametrize("bm,bn", [(128, 128), (256, 256)])
 @pytest.mark.parametrize("splits,k", [(2, 256), (4, 768), (8, 7168)])
 def test_split_k_partials_and_changed_input_graph(bm, bn, splits, k):
@@ -608,6 +610,7 @@ def test_split_k_partials_and_changed_input_graph(bm, bn, splits, k):
         assert torch.equal(partials.sum(dim=0).cpu(), ah @ bh.T)
 
 
+@pytest.mark.ci_full
 @pytest.mark.parametrize("mode", ["gemm-only", "split-rccl"])
 def test_the_benchmark_baselines_validate(mode):
     """The two baselines only the benchmark has -- the GEMM alone, and it

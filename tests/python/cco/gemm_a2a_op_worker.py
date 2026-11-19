@@ -205,7 +205,9 @@ def case_race(op, rank, world, n, k, quant, victim_delay_ms):
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument(
-        "--case", choices=("correct", "race", "self_test", "reject"), required=True
+        "--case",
+        choices=("correct", "race", "self_test", "reject", "all"),
+        required=True,
     )
     p.add_argument("--mode", default="fused")
     p.add_argument("--quant", default="ptpc")
@@ -217,41 +219,58 @@ def main() -> int:
 
     rank, world, uid = _setup()
     m_max = 2048
-    wb = GemmA2AOp.window_bytes_for(world, n=args.n, m_max=m_max, quant=args.quant)
-    with Communicator.init(world, rank, uid, per_rank_vmm=2 * wb + (256 << 20)) as comm:
-        if args.case == "reject":
-            res = case_reject(comm, args.n, args.k)
-            gathered = [None] * world
-            dist.all_gather_object(gathered, res)
-            if rank == 0:
-                print(
-                    "RESULT_JSON " + json.dumps({"case": args.case, "ranks": gathered})
-                )
-            dist.barrier()
-            return 0
-        with GemmA2AOp(
-            comm,
-            n=args.n,
-            k=args.k,
-            m_max=m_max,
-            quant=args.quant,
-            mode=args.mode,
-            war_credit=not args.no_credit,
-        ) as op:
-            if args.case == "self_test":
-                op.self_test()
-                res = {"ok": True}
-            elif args.case == "correct":
-                res = case_correct(op, rank, world, args.n, args.k, args.quant)
-            else:
-                res = case_race(
-                    op, rank, world, args.n, args.k, args.quant, args.victim_delay_ms
-                )
-            torch.cuda.synchronize()
-    gathered = [None] * world
-    dist.all_gather_object(gathered, res)
-    if rank == 0:
-        print("RESULT_JSON " + json.dumps({"case": args.case, "ranks": gathered}))
+    # "all": every case but reject, an op each, keyed case/mode[/quant|/no-credit].
+    # reject stays a launch of its own: it needs the communicator's first dev-comm.
+    if args.case == "all":
+        runs = [("self_test", "fused", "ptpc", False, "self_test")]
+        runs += [
+            ("correct", mode, quant, False, f"correct/{mode}/{quant}")
+            for mode in ("fused", "split")
+            for quant in ("ptpc", "mxfp8")
+        ]
+        runs += [
+            ("race", mode, "ptpc", nc, f"race/{mode}" + ("/no-credit" if nc else ""))
+            for mode in ("fused", "split")
+            for nc in (False, True)
+        ]
+    else:
+        runs = [(args.case, args.mode, args.quant, args.no_credit, args.case)]
+    wb = max(
+        GemmA2AOp.window_bytes_for(world, n=args.n, m_max=m_max, quant=quant)
+        for _, _, quant, _, _ in runs
+    )
+    vmm = (len(runs) + 1) * wb + (256 << 20)
+    results = []
+    with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
+        for case, mode, quant, no_credit, key in runs:
+            if case == "reject":
+                results.append((key, case_reject(comm, args.n, args.k)))
+                continue
+            with GemmA2AOp(
+                comm,
+                n=args.n,
+                k=args.k,
+                m_max=m_max,
+                quant=quant,
+                mode=mode,
+                war_credit=not no_credit,
+            ) as op:
+                if case == "self_test":
+                    op.self_test()
+                    res = {"ok": True}
+                elif case == "correct":
+                    res = case_correct(op, rank, world, args.n, args.k, quant)
+                else:
+                    res = case_race(
+                        op, rank, world, args.n, args.k, quant, args.victim_delay_ms
+                    )
+                torch.cuda.synchronize()
+            results.append((key, res))
+    for key, res in results:
+        gathered = [None] * world
+        dist.all_gather_object(gathered, res)
+        if rank == 0:
+            print("RESULT_JSON " + json.dumps({"case": key, "ranks": gathered}))
     dist.barrier()
     return 0
 

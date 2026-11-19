@@ -1400,8 +1400,8 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::put(int peer, ccoWindow_t dst
     uint32_t srcLkey = srcWinDev->ibgdaWin.lkey;
     uint32_t dstRkey = dstWinDev->ibgdaWin.peerRkeys[worldPeer];
 
-    uintptr_t localAddr = srcOffset;
-    uintptr_t remoteAddr = dstOffset;
+    uintptr_t localAddr = srcOffset + srcWinDev->ibgdaWin.iovaBias;
+    uintptr_t remoteAddr = dstOffset + dstWinDev->ibgdaWin.iovaBias;
 
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
@@ -1425,11 +1425,10 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::put(int peer, ccoWindow_t dst
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
-      // Caller's window, not the resource window: the offset is already
-      // window-relative (iova=0), so it is the raddr as-is.
-      signalRaddr = remoteAction.offset;
-      signalRkey =
-          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
+      // Caller's window, not the resource window: raddr is its offset plus that window's bias.
+      ccoWindowDevice* sigWinDev = reinterpret_cast<ccoWindowDevice*>(remoteAction.win);
+      signalRaddr = remoteAction.offset + sigWinDev->ibgdaWin.iovaBias;
+      signalRkey = sigWinDev->ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }
@@ -1477,7 +1476,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::putValue(int peer, ccoWindow_
 
     ccoWindowDevice* dstWinDev = reinterpret_cast<ccoWindowDevice*>(dstWin);
     uint32_t dstRkey = dstWinDev->ibgdaWin.peerRkeys[worldPeer];
-    uintptr_t remoteAddr = dstOffset;
+    uintptr_t remoteAddr = dstOffset + dstWinDev->ibgdaWin.iovaBias;
 
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
@@ -1501,11 +1500,10 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::putValue(int peer, ccoWindow_
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
-      // Caller's window, not the resource window: the offset is already
-      // window-relative (iova=0), so it is the raddr as-is.
-      signalRaddr = remoteAction.offset;
-      signalRkey =
-          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
+      // Caller's window, not the resource window: raddr is its offset plus that window's bias.
+      ccoWindowDevice* sigWinDev = reinterpret_cast<ccoWindowDevice*>(remoteAction.win);
+      signalRaddr = remoteAction.offset + sigWinDev->ibgdaWin.iovaBias;
+      signalRkey = sigWinDev->ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }
@@ -1552,8 +1550,8 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::get(int peer, ccoWindow_t rem
     uint32_t remoteRkey = remoteWinDev->ibgdaWin.peerRkeys[worldPeer];
     uint32_t localLkey = localWinDev->ibgdaWin.lkey;
 
-    uintptr_t remoteAddr = remoteOffset;
-    uintptr_t localAddr = localOffset;
+    uintptr_t remoteAddr = remoteOffset + remoteWinDev->ibgdaWin.iovaBias;
+    uintptr_t localAddr = localOffset + localWinDev->ibgdaWin.iovaBias;
 
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
@@ -1613,11 +1611,10 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::signal(int peer, RemoteAction
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
-      // Caller's window, not the resource window: the offset is already
-      // window-relative (iova=0), so it is the raddr as-is.
-      signalRaddr = remoteAction.offset;
-      signalRkey =
-          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
+      // Caller's window, not the resource window: raddr is its offset plus that window's bias.
+      ccoWindowDevice* sigWinDev = reinterpret_cast<ccoWindowDevice*>(remoteAction.win);
+      signalRaddr = remoteAction.offset + sigWinDev->ibgdaWin.iovaBias;
+      signalRkey = sigWinDev->ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }

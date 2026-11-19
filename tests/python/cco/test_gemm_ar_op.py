@@ -33,7 +33,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import time
 
@@ -52,6 +51,8 @@ from mori.ops.gemm_ar.op import (  # noqa: E402
     padded_m,
     supports,
 )
+
+from . import kfd_settle  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 WORKER = pathlib.Path(__file__).with_name("gemm_ar_op_worker.py")
@@ -92,6 +93,14 @@ def test_supports_agrees_with_config_validation_on_world_size(world_size):
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_supports_accepts_world_sizes_that_divide_the_block(world_size):
     assert supports(512, 1024, 512, world_size) is True
+
+
+def test_supports_rejects_an_fp8_scatter_under_bf16_quant():
+    """``supports`` said yes to this, and construction raised: the predicate
+    skipped the constructor's option checks, which it now shares through
+    ``_option_constraint``."""
+    assert supports(512, 1024, 512, 2, quant="bf16") is True
+    assert supports(512, 1024, 512, 2, quant="bf16", scatter_dtype="fp8") is False
 
 
 def test_supports_requires_the_fp8_row_multiple():
@@ -245,14 +254,17 @@ def test_supports_rejects_tiles_the_kernel_cannot_build(block_m):
     assert supports(4096, 7168, 2048, 8, block_m=block_m) is False
 
 
-@pytest.mark.parametrize("block_n", [128, 384, 0])
+@pytest.mark.parametrize("block_n", [128, 384, 512, 0])
 def test_supports_rejects_n_tiles_the_kernel_cannot_build(block_n):
+    """512 is a multiple of 256, which is all ``_tile_constraints`` asks, but
+    the permlane store pairs exactly two N tiles (``permlane_tile_constraint``).
+    ``supports`` used to answer True for it, and construction raised."""
     assert supports(4096, 7168, 2048, 8, block_n=block_n) is False
 
 
 def test_supports_accepts_the_legal_tile_multiples():
-    """256x512 is legal even though it is not the default 128x256."""
-    assert supports(4096, 7168, 2048, 8, block_m=256, block_n=512) is True
+    """256x256 is legal even though it is not the default 128x256."""
+    assert supports(4096, 7168, 2048, 8, block_m=256, block_n=256) is True
 
 
 @pytest.mark.parametrize("world_size", [0, -1])
@@ -370,11 +382,10 @@ def _run_worker_multi(world_size: int, case: str, *extra: str, timeout: int = 90
 def _spawn_worker(
     world_size: int, case: str, *extra: str, timeout: int = 900, last: bool = False
 ):
-    time.sleep(_SETTLE_SECONDS)
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
-    result = subprocess.run(
+    result = kfd_settle.run(
         [
             sys.executable,
             "-m",
@@ -458,6 +469,7 @@ def _mxfp8_gemm_rel_l2(
     ).item()
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 @pytest.mark.parametrize("quant", ["mxfp8", "mxfp8_raw"])
 @pytest.mark.parametrize(
@@ -480,6 +492,7 @@ def test_standalone_mxfp8_gemm(n, k, label, m, quant):
     assert _mxfp8_gemm_rel_l2(n, k, m, quant=quant) < FP8_FLOOR
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 @pytest.mark.parametrize("m", [1, 100, 1000])
 def test_standalone_mxfp8_raw_takes_any_m(m):
@@ -495,6 +508,7 @@ def test_standalone_mxfp8_raw_takes_any_m(m):
     assert _mxfp8_gemm_rel_l2(5120, 2048, m, quant="mxfp8_raw") < FP8_FLOOR
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 def test_standalone_mxfp8_gemm_pads_ragged_m():
     """A ragged M is zero-extended to the packed A scale's 64-row group.
@@ -511,6 +525,7 @@ def test_standalone_mxfp8_gemm_pads_ragged_m():
     assert _mxfp8_gemm_rel_l2(5120, 2048, 100, pad=True) < FP8_FLOOR
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 def test_standalone_mxfp8_gemm_refuses_unpadded_m():
     """M not on the group boundary is refused rather than quietly mis-scaled."""
@@ -557,6 +572,7 @@ def _mxfp8_gemv_rel_l2(n: int, k: int, m: int) -> float:
     ).item()
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 @pytest.mark.parametrize("n,k,label", [(8192, 1280, "wq_b"), (5120, 2048, "wo_b")])
 @pytest.mark.parametrize("m", [1, 3, 16, 17, 32])
@@ -570,6 +586,7 @@ def test_standalone_mxfp8_gemv(n, k, label, m):
     assert _mxfp8_gemv_rel_l2(n, k, m) < FP8_FLOOR
 
 
+@pytest.mark.single_gpu
 @requires_gpu
 def test_mxfp8_gemv_refuses_m_above_its_tile():
     """Past 32 tokens it declines rather than silently truncating the batch.
@@ -741,7 +758,8 @@ def test_close_releases_and_is_idempotent(worker_results):
 
 
 @requires_two_gpus
-def test_reduce_scatter_returns_my_band_of_the_sum(worker_results):
+@pytest.mark.parametrize("case", ["reduce_scatter", "bf16_reduce_scatter"])
+def test_reduce_scatter_returns_my_band_of_the_sum(worker_results, case):
     """``GemmReduceScatterOp`` end to end: the all-reduce pipeline minus the gather.
 
     Each rank gets ``[M/P, N]``, rows ``rank*M/P`` onward of the sum, at the fp8
@@ -750,9 +768,11 @@ def test_reduce_scatter_returns_my_band_of_the_sum(worker_results):
     wrong one). The comparison against the *next* rank's band has to fail, or
     the floor check cannot tell a wrong band offset from a right one. Its self-test
     must pass and must catch a scatter that did not happen, like the
-    all-reduce's.
+    all-reduce's. Run for blockscale and for ``quant="bf16"``, whose GEMM is a
+    different kernel feeding the same tail; 3e-3 is the BF16 output's rounding
+    floor as well as fp8's.
     """
-    r = _case(worker_results, "reduce_scatter")
+    r = _case(worker_results, case)
     assert r["self_test_passes"], r
     assert r["detects_missing_scatter"], r
     calls = [key for key in r if key.startswith("call") and key.count("_") == 1]
@@ -764,7 +784,8 @@ def test_reduce_scatter_returns_my_band_of_the_sum(worker_results):
 
 
 @requires_two_gpus
-def test_reduce_scatter_survives_a_slow_reader(worker_results):
+@pytest.mark.parametrize("case", ["reduce_scatter", "bf16_reduce_scatter"])
+def test_reduce_scatter_survives_a_slow_reader(worker_results, case):
     """No rank may push into a peer's recv slot while that peer still reads it.
 
     The reduce reads slots the peers fill and the next call's epilogue refills
@@ -776,7 +797,7 @@ def test_reduce_scatter_survives_a_slow_reader(worker_results):
     relL2 0.71 on one call in an alternating-M run. Every value is the worst
     over all ranks.
     """
-    r = _case(worker_results, "reduce_scatter")
+    r = _case(worker_results, case)
     assert r["slow_peer_order"][-1] == "rs_barrier", r
     # The hold has to have run, on the rank each call names, or every check
     # below passes vacuously (it did: the plan was stored under a key the op
@@ -789,3 +810,19 @@ def test_reduce_scatter_survives_a_slow_reader(worker_results):
     # Negative control: the same schedule without rs_barrier must corrupt a
     # held rank's band.
     assert max(r[f"unbarriered{i}"] for i in range(4)) > 0.5, r
+
+
+@requires_two_gpus
+def test_bf16_all_reduce_lands_at_the_bf16_floor(worker_results):
+    """``quant="bf16"`` through the public op: BF16 A, the checkpoint's
+    row-major weight, no scales -- two M through one instance with fresh
+    operands, then the fp8 gather, whose e4m3 wire costs ~2.5e-2 and must cost
+    something (a gate below 5e-3 would mean the wire stayed bf16). What the
+    launch would reinterpret as int16 is refused."""
+    r = _case(worker_results, "bf16_all_reduce")
+    calls = [key for key in r if key.startswith("call")]
+    assert len(calls) == 3, r
+    for key in calls:
+        assert r[key] < FP8_FLOOR, (key, r)
+    assert 5e-3 < r["fp8_gather"] < 4e-2, r
+    assert r["refuses_fp8_a"] and r["refuses_with_scale"] and r["refuses_wrong_n"], r

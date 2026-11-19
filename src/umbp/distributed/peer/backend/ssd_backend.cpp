@@ -645,6 +645,9 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   };
   auto publish = [&](ResolvedEntry& out, const ReadLease& lease) {
     publish_span(out, lease.span, lease.size, lease.hold, ObjectExtent{});
+    // Only a lease is stamped: it is what a remote reader is resolved against.
+    // An extent or a joined stage is a local reader's, held by refcount.
+    out.generation = lease.generation;
   };
 
   // One device read and the input indices it serves; the first is the one that scheduled it.
@@ -871,8 +874,8 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
     const auto lease_deadline = local ? std::chrono::steady_clock::time_point{}
                                       : std::chrono::steady_clock::now() + cfg_.read_lease_ttl;
     auto [it, inserted] = read_leases_.emplace(
-        keys[read.results.front()],
-        ReadLease{read.span, outcomes[j].size, lease_deadline, std::make_shared<char>()});
+        keys[read.results.front()], ReadLease{read.span, outcomes[j].size, lease_deadline,
+                                              std::make_shared<char>(), NextCopyGeneration()});
     if (!inserted) {
       ReleaseStagingSpanLocked(read.span);
       if (!local) it->second.expires_at = lease_deadline;
@@ -973,6 +976,26 @@ bool SsdBackend::Contains(const std::string& key) const {
   return ssd_ != nullptr && ssd_->Exists(key);
 }
 
+// A remote reader copies out of a staging span, not the drive, so the copy is
+// good only while the lease it resolved is still the one in the table.  Any
+// reclaim drops the lease, and a re-stage of the same key draws a new
+// generation, so an equal generation means the span was never handed out again.
+std::vector<bool> SsdBackend::BatchStillHolds(const std::vector<std::string>& keys,
+                                              const std::vector<uint64_t>& generations) const {
+  std::vector<bool> out(keys.size(), false);
+  std::lock_guard<std::mutex> lk(mutex_);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    const uint64_t gen = i < generations.size() ? generations[i] : 0;
+    if (gen == 0) {
+      out[i] = true;
+      continue;
+    }
+    auto it = read_leases_.find(keys[i]);
+    out[i] = it != read_leases_.end() && it->second.generation == gen;
+  }
+  return out;
+}
+
 std::vector<EvictResult> SsdBackend::Evict(const std::vector<std::string>& keys) {
   std::vector<EvictResult> results;
   results.reserve(keys.size());
@@ -1004,6 +1027,10 @@ std::vector<EvictResult> SsdBackend::Evict(const std::vector<std::string>& keys)
 }
 
 bool SsdBackend::OwnsEvictionOrder() const { return ssd_ != nullptr && ssd_->OrdersEviction(); }
+
+size_t SsdBackend::Touch(const std::vector<std::string>& keys) {
+  return ssd_ == nullptr ? 0 : ssd_->Touch(keys);
+}
 
 std::vector<EvictionOffer> SsdBackend::EvictionCandidates(size_t max_count) {
   if (ssd_ == nullptr || max_count == 0) return {};

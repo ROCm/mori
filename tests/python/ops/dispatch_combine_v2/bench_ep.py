@@ -175,7 +175,7 @@ VERIFY_SCOPE = (
         else ("dispatch_bytes+push_bytes" if _PUSH else "dispatch_bytes+combine")
     )
 )
-# Geometry, same spelling as tools/ep_test.sh. Unset = the backend's tuned default.
+# Geometry. Unset = the backend's tuned default.
 _G = {
     k: (int(os.environ[k]) if os.environ.get(k) else None)
     for k in ("DBN", "DWPB", "CBN", "CWPB")
@@ -269,11 +269,11 @@ def main():
             .to(dev)
         )
     # Unique destination PEs per token: what an identity expert makes combine sum.
-    U = (
-        torch.zeros(M, world, dtype=torch.bool)
-        .scatter_(1, (idx.cpu().long() // EPR), True)
-        .sum(1)
+    hit = torch.zeros(M, world, dtype=torch.bool).scatter_(
+        1, (idx.cpu().long() // EPR), True
     )
+    U = hit.sum(1)
+    X = U - hit[:, rank].long()
 
     def gather_all(t):
         parts = [torch.empty_like(t.cpu()) for _ in range(world)]
@@ -564,6 +564,15 @@ def main():
             )
         return int(n[0]) + int(n[2])
 
+    def bf16_landing(op):
+        get = getattr(op, "push_landing", None)
+        if get is None:
+            return None
+        try:
+            return get()
+        except ValueError:
+            return None
+
     def prime(op, ct, i_, w_, x_, s_=None):
         """One full pair, untimed. Reads total_recv for the host, builds the buffer
         the timed loop will reuse, and with CHECK verifies the result through that
@@ -572,7 +581,8 @@ def main():
         dispatch accumulates into it while only combine clears it, so the next
         combine would stage twice the tokens and run past the arena.
         Returns (total_recv, buf, ok, checked)."""
-        *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+        route = dict(return_routing=True, max_num_inp_token_across_ranks=ct)
+        *_, total_t, r = op.dispatch(i_, w_, s_, x_, **route)
         lockstep()  # the reverse map is only valid after this barrier
         total = int(total_t.cpu().item())
         dispatch_bad = check_dispatch(op, total, r)
@@ -586,6 +596,10 @@ def main():
             checked = False
         if checked:  # identity expert: stage the dispatched tokens unchanged
             stage.copy_(op.recv_tokens()[:total].to(stage.dtype))
+        land = bf16_landing(op) if checked else None
+        if land is not None:
+            land.zero_()
+            lockstep()
         if push_checked:
             stage.copy_(push_quant_rows(total, r))
             op.push_landing().zero_()
@@ -597,7 +611,9 @@ def main():
         else:
             buf = stage
         out, outw = op.combine(
-            buf, weights=w_ if checked and not _PUSH else None, routing=r
+            buf,
+            weights=w_ if checked and not _PUSH and land is None else None,
+            routing=r,
         )
         lockstep()
         if dispatch_bad:
@@ -605,7 +621,7 @@ def main():
         if push_checked:
             ok = check_push_quant(out, ct) == 0
             for k in range(1, CHECK_REPEAT + 1):
-                *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                *_, total_t, r = op.dispatch(i_, w_, s_, x_, **route)
                 lockstep()
                 assert int(total_t.cpu().item()) == total, (
                     int(total_t.cpu().item()),
@@ -633,6 +649,16 @@ def main():
                 f"[{int(U[:ct].min())},{int(U[:ct].max())}])",
                 flush=True,
             )
+        if land is not None:
+            *_, total_t, r = op.dispatch(i_, w_, s_, x_, **route)
+            lockstep()
+            assert int(total_t.cpu().item()) == total, (
+                int(total_t.cpu().item()),
+                total,
+            )
+            stage.copy_(op.recv_tokens()[:total].to(stage.dtype))
+            _, outw = op.combine(stage, weights=w_, routing=r)
+            lockstep()
         w_ref = wts[:ct].float().cpu()
         ew = U[:ct].view(ct, 1).float() * w_ref
         gw = outw.float().cpu()
@@ -1019,6 +1045,7 @@ def main():
     for ct in SWEEP:
         i_, w_, x_ = inp[:ct], wts[:ct], idx[:ct]
         s_ = scales[:ct] if SCALE_DIM else None
+        route = dict(return_routing=True, max_num_inp_token_across_ranks=ct)
         for name, op in ops.items():
             points += 1
             total, buf, ok, was_checked = prime(op, ct, i_, w_, x_, s_)
@@ -1035,7 +1062,7 @@ def main():
 
             def one_pair():
                 """A layer's two all2all legs, in order, nothing in between."""
-                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, **route)
                 op.combine(buf, routing=r)
 
             def capture_pair():
@@ -1044,7 +1071,7 @@ def main():
                 combine graph was captured against that handle."""
                 gd = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gd):
-                    *_, r_cap = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                    *_, r_cap = op.dispatch(i_, w_, s_, x_, **route)
                 lockstep()
                 gc = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gc):
@@ -1055,7 +1082,7 @@ def main():
             held = [None]  # eager's combine needs the handle its dispatch produced
 
             def eager_d():
-                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, **route)
                 held[0] = r
 
             def eager_legs():
@@ -1068,31 +1095,35 @@ def main():
                     capture_pair if mode == "graph" else eager_legs,
                     eager_legs,
                 )
-                got = torch.tensor([d_us, c_us, float(total)], dtype=torch.float64)
+                got = torch.tensor(
+                    [d_us, c_us, float(total), float(X[:ct].sum())],
+                    dtype=torch.float64,
+                )
                 dist.all_reduce(got)
                 n = world
                 d_us_m, c_us_m = float(got[0]) / n, float(got[1]) / n
                 recv_m = float(got[2]) / n
+                switch_m = float(got[3]) / n
                 # Bytes off one rank over that leg's time, BOTH cross-rank means,
                 # so the reported bandwidth follows from the recv_tokens and us
                 # this same row reports. Mixing a local byte count with a mean
                 # time gave a row whose columns did not agree with each other,
                 # and recv counts vary between ranks with the routing. The legs
                 # differ whenever dispatch is narrower than combine.
-                d_bw = (
-                    recv_m
-                    * (HIDDEN * _DISP_NBYTES + SCALE_DIM * SCALE_TS)
-                    / (1000**3)
-                    / (d_us_m / 1e6)
-                )
+                d_row = HIDDEN * _DISP_NBYTES + SCALE_DIM * SCALE_TS
+                d_bw = recv_m * d_row / (1000**3) / (d_us_m / 1e6)
                 c_row = _PUSH_WIRE if _PUSH else HIDDEN * 2
                 c_bw = recv_m * c_row / (1000**3) / (c_us_m / 1e6)
+                d_bus = switch_m * d_row / (1000**3) / (d_us_m / 1e6)
+                c_bus = switch_m * c_row / (1000**3) / (c_us_m / 1e6)
                 if rank == 0:
                     print(
                         f"  ct={ct:<5d} [{name}/{mode}] "
                         f"dispatch {got[0]/n:7.1f} us ({d_bw:6.1f} GB/s)  "
                         f"combine {got[1]/n:7.1f} us ({c_bw:6.1f} GB/s)  "
-                        f"pair {(got[0]+got[1])/n:7.1f} us  recv~{got[2]/n:.0f}",
+                        f"pair {(got[0]+got[1])/n:7.1f} us  recv~{got[2]/n:.0f}  "
+                        f"bus dispatch {d_bus:6.1f} GB/s combine {c_bus:6.1f} GB/s "
+                        f"switch~{switch_m:.0f}",
                         flush=True,
                     )
                 lockstep()
@@ -1114,6 +1145,9 @@ def main():
                             pair_us=round(d_us_m + c_us_m, 2),
                             dispatch_gbps=round(d_bw, 1),
                             combine_gbps=round(c_bw, 1),
+                            switch_tokens=round(switch_m),
+                            dispatch_bus_gbps=round(d_bus, 1),
+                            combine_bus_gbps=round(c_bus, 1),
                             verified=VERIFY_SCOPE,
                             **clocks(smi),
                         )

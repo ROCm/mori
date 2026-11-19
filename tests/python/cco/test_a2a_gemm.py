@@ -139,7 +139,11 @@ def _torchrun(script, *args, timeout=1800):
 
 
 @requires_gpus
-@pytest.mark.parametrize("acquire", ["inv", "none"])
+# A pull request runs "none", the README's variant; "inv" is the op's default,
+# which test_a2a_gemm_op.py runs on every pull request.
+@pytest.mark.parametrize(
+    "acquire", [pytest.param("inv", marks=pytest.mark.ci_full), "none"]
+)
 def test_every_mode_is_exact_to_the_fp8_floor_back_to_back(acquire):
     world, rows = _torchrun(
         BENCH,
@@ -165,16 +169,21 @@ def test_every_mode_is_exact_to_the_fp8_floor_back_to_back(acquire):
         assert r["validated"] and r["rel_l2"] < 3e-3, r
 
 
+@pytest.fixture(scope="module")
+def band_counts():
+    """Every band-count case, keyed case/wait, from one launch."""
+    _, rows = _torchrun(WORKER, "--case", "all", timeout=900)
+    return {r["case"]: r["ranks"] for r in rows}
+
+
 @requires_gpus
 @pytest.mark.parametrize("wait", ["segment", "tile"])
 @pytest.mark.parametrize("case", ["wrap", "mixed"])
-def test_band_counts_survive_the_wrap_and_a_change_of_chunks(case, wait):
+def test_band_counts_survive_the_wrap_and_a_change_of_chunks(case, wait, band_counts):
     """``wrap``: signal counters preset just below 2^32, so the bands of the
     fourth call carry them across -- an unsigned compare against an offset
     target spins forever there. ``mixed``: one arm, then calls alternating
     c4 and c2 -- a target counted as ``epoch * chunks`` reads early or hangs."""
-    _, rows = _torchrun(WORKER, "--case", case, "--wait", wait, timeout=900)
-    (rec,) = rows
-    for verdicts in rec["ranks"]:
+    for verdicts in band_counts[f"{case}/{wait}"]:
         assert len(verdicts) == 6, verdicts
         assert all(v["ok"] for v in verdicts), verdicts

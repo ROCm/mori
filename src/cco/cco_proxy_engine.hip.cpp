@@ -215,7 +215,7 @@ std::string DescribeError(const ccoDevCommError& e, const char* tail) {
 std::vector<int> ChooseProxyCpus(int numThreads, std::string* source) {
   std::vector<int> order;
   if (const char* env = std::getenv("MORI_CCO_PROXY_CPUS"); env != nullptr && env[0] != '\0') {
-    order = application::detail::ParseCpuList(env);
+    order = ::mori::ParseCpuList(env).value_or(std::vector<int>{});
     if (order.empty()) {
       std::fprintf(stderr,
                    "[mori cco] WARNING: ccoProxy: MORI_CCO_PROXY_CPUS=\"%s\" names no CPUs; "
@@ -238,7 +238,7 @@ std::vector<int> ChooseProxyCpus(int numThreads, std::string* source) {
     int dev = -1, numaNode = -1;
     if (hipGetDevice(&dev) == hipSuccess) {
       if (auto list = application::detail::GpuLocalCpuList(dev, numaNode)) {
-        for (int c : application::detail::ParseCpuList(*list)) {
+        for (int c : ::mori::ParseCpuList(*list).value_or(std::vector<int>{})) {
           if (std::find(allowed.begin(), allowed.end(), c) != allowed.end()) {
             candidates.push_back(c);
           }

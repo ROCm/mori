@@ -132,13 +132,27 @@ class PeerPool {
                                               const std::vector<ObjectExtent>* extents = nullptr);
   // Existence only, in request order. Cheaper than BatchResolve, which
   // heap-copies the page vector of every key it finds -- work an existence
-  // check discards. Takes no read lease and does not touch recency: asking
-  // whether a key is here is not a read of it.
+  // check discards. Takes no read lease, but renews recency: a client looks
+  // keys up to load them next, and evicting them in between fails that load.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
   // Copies keys held on SSD into DRAM of the same tier, else of a tier above, so
   // the coming read is served from DRAM. The SSD copy stays, and the oldest
   // prefetched copies are dropped past `budget_bytes`. Returns the keys copied.
   size_t Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes);
+
+  // A caller's recency hint (IUMBPClient::BatchTouch), passed to every medium
+  // that holds the keys: their eviction order is the only thing that changes.
+  // Returns the number of (medium, key) copies touched.
+  size_t BatchTouch(const std::vector<std::string>& keys);
+
+  // After a remote reader's copy: is each (backend, key, generation) it was
+  // resolved against still the copy here?  False when the backend is gone or
+  // the copy was freed or replaced since, so the reader drops what it read.
+  // The three vectors are parallel; one answer per key, in order.
+  std::vector<bool> ValidateResolved(const std::vector<uint32_t>& backend_ids,
+                                     const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations);
+
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
   // request, in order.

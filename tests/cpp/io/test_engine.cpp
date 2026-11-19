@@ -248,6 +248,56 @@ void CaseSubmissionLedgerFailAll() {
   Require(statusA.Code() == StatusCode::ERR_RDMA_OP, "status must stay failed");
 }
 
+// A transfer striped over two QPs: one QP dies while the other still has its WRs on the
+// wire. The transfer must not report failed until the live QP's WRs finish, or a caller
+// freeing its buffers on that failure would let them keep moving data.
+void CaseTransferFailureWaitsForEveryQp() {
+  constexpr uint32_t kNotifPerQp = 16;
+  SubmissionLedger dead(kNotifPerQp);
+  SubmissionLedger live(kNotifPerQp);
+  std::atomic<int> sqDepthDead{2};
+  std::atomic<int> sqDepthLive{2};
+  TransferStatus status;
+  status.SetCode(StatusCode::IN_PROGRESS);
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 701, 4);
+  dead.Insert(2, true, meta, 2);
+  const uint64_t liveId = live.Insert(2, true, meta, 2);
+
+  // The transfer still waits on the live QP, so this FailAll does not fail it yet.
+  Require(dead.FailAll(StatusCode::ERR_RDMA_OP, "qp died", &sqDepthDead) == 0,
+          "FailAll should count only the transfers it turned terminal");
+  Require(status.InProgress(), "a failure must wait for the transfer's WRs on the live QP");
+
+  int credits = 0;
+  auto released = live.ReleaseByCqe(liveId, &sqDepthLive, &credits);
+  Require(released != nullptr, "the live QP's record should still be there");
+  released->Account(credits, StatusCode::SUCCESS, "success");
+  Require(status.Failed(), "once every WR is done, the transfer reports its failure");
+  Require(status.Message() == "qp died", "the failure, not the later success, is reported");
+
+  // A flush cascade is reported only when no root cause was seen.
+  TransferStatus cascaded;
+  cascaded.SetCode(StatusCode::IN_PROGRESS);
+  auto meta2 = std::make_shared<CqCallbackMeta>(&cascaded, 702, 3);
+  meta2->Account(1, StatusCode::ERR_RDMA_OP, "flushed", /*rootCause=*/false);
+  meta2->Account(1, StatusCode::ERR_RDMA_OP, "retry exceeded");
+  meta2->Account(1, StatusCode::ERR_RDMA_OP, "flushed", /*rootCause=*/false);
+  Require(cascaded.Failed() && cascaded.Message() == "retry exceeded",
+          "the root cause should win over flushes on either side of it");
+
+  // A submission that gave up after posting part of the transfer: the unposted credits
+  // are accounted at once, the posted ones only by their completion.
+  TransferStatus partial;
+  partial.SetCode(StatusCode::IN_PROGRESS);
+  auto meta3 = std::make_shared<CqCallbackMeta>(&partial, 703, 5);
+  const int posted = 3;  // RdmaOpRet::postedCredits of the submission that gave up
+  meta3->Account(meta3->totalBatchSize - posted, StatusCode::ERR_RDMA_OP, "post failed");
+  Require(partial.InProgress(), "posted WRs keep the transfer in progress");
+  meta3->Account(3, StatusCode::SUCCESS, "success");
+  Require(partial.Failed() && partial.Message() == "post failed",
+          "the post failure is reported once the posted WRs complete");
+}
+
 void CaseSubmissionLedgerClosedAfterFailAll() {
   constexpr uint32_t kNotifPerQp = 16;
   SubmissionLedger ledger(kNotifPerQp);
@@ -1495,7 +1545,7 @@ void CaseSelectBackendReturnsNullForCrossNodeUnderXgmiOnly() {
   Require(status.Code() == StatusCode::ERR_BAD_STATE,
           "cross-node transfer under XGMI-only fallback should return ERR_BAD_STATE; got " +
               std::to_string(status.CodeUint32()) + ", msg='" + status.Message() + "'");
-  Require(status.Message().find("No available backend") != std::string::npos,
+  Require(status.Message().find("No backend can handle") != std::string::npos,
           "cross-node transfer under XGMI-only fallback should be rejected by route layer; got: " +
               status.Message());
 }
@@ -1548,7 +1598,7 @@ void CaseRdmaBackendCanHandleRejectsSentinelPortRemote() {
   Require(status.Code() == StatusCode::ERR_BAD_STATE,
           "RDMA backend must reject sentinel-port remote before Connect; got " +
               std::to_string(status.CodeUint32()) + ", msg='" + status.Message() + "'");
-  Require(status.Message().find("No available backend") != std::string::npos,
+  Require(status.Message().find("No backend can handle") != std::string::npos,
           "sentinel-port remote should be rejected by route layer; got: " + status.Message());
 }
 
@@ -1898,6 +1948,7 @@ void CaseXgmiCrossEngineIpc() {
 
   HIP_RUNTIME_CHECK(hipSetDevice(0));
   HIP_RUNTIME_CHECK(hipMemset(srcMem.ptr, 0xAB, kSize));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   HIP_RUNTIME_CHECK(hipSetDevice(1));
   HIP_RUNTIME_CHECK(hipMemset(dstMem.ptr, 0x00, kSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -2150,6 +2201,35 @@ void CaseXgmiHiddenDeviceImporterNonZeroDevice() {
   RunHiddenDeviceSplitVisibility(totalGpus - 1, "0,1", 1);
 }
 
+// Regression: GPUs outside an XGMI hive (PCIe-only cards) all report KFD hive_id 0,
+// and hidden-device eligibility required a shared non-zero hive, so CreateSession
+// returned nullopt for every pair. This is prefill and decode on adjacent GPUs,
+// one GPU per process.
+void CaseXgmiHiddenDeviceAdjacentGpus() {
+  int totalGpus = GetGpuCount();
+  if (totalGpus < 2) throw TestSkip("requires at least 2 GPUs");
+  RunHiddenDeviceSplitVisibility(0, "1", 0);
+}
+
+// A hidden remote GPU that is neither in the local GPU's hive nor one of its KFD P2P
+// peers must still be rejected.
+void CaseXgmiHiddenDeviceRejectsUnknownPeer() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_hidden_unknown_peer_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  auto local = RegisterGpuMemory(&engine, 4096, 0);
+  MemoryDesc remote = local.desc;
+  remote.deviceBusId = "0000:ff:1f.7";
+  Require(!engine.CreateSession(local.desc, remote).has_value(),
+          "CreateSession should fail for a hidden GPU that is not a P2P peer");
+}
+
 void CaseXgmiInboundNotificationIsUnsupported() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -2213,6 +2293,42 @@ void CaseXgmiConcurrentWaitAndPollIsSafe() {
               ", msg='" + status.Message() + "'");
 }
 
+void CaseXgmiBoundedWaitReturnsOnCompletion() {
+  if (GetGpuCount() < 2) throw TestSkip("requires at least 2 GPUs");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_bounded_wait_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  constexpr size_t kSize = 64 * 1024 * 1024;
+  auto src = RegisterGpuMemory(&engine, kSize, 0);
+  auto dst = RegisterGpuMemory(&engine, kSize, 1);
+
+  // An XGMI status completes only when polled; a bounded wait must poll it rather than sleep to
+  // its deadline.
+  for (bool waitAll : {false, true}) {
+    TransferStatus status;
+    engine.Write(src.desc, 0, dst.desc, 0, kSize, &status, engine.AllocateTransferUniqueId());
+    auto start = std::chrono::steady_clock::now();
+    if (waitAll) {
+      engine.WaitAll({&status}, 10000);
+    } else {
+      status.WaitFor(10000);
+    }
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count();
+    const std::string how = waitAll ? "WaitAll(10000)" : "WaitFor(10000)";
+    Require(status.Succeeded(),
+            how + " transfer failed: code=" + std::to_string(status.CodeUint32()) + ", msg='" +
+                status.Message() + "'");
+    Require(ms < 2000, how + " returned after " + std::to_string(ms) + " ms for a 64 MiB copy");
+  }
+}
+
 struct TestCase {
   const char* name;
   std::function<void()> run;
@@ -2230,6 +2346,7 @@ int main(int argc, char* argv[]) {
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"submission_ledger_fail_all", CaseSubmissionLedgerFailAll},
+      {"transfer_failure_waits_for_every_qp", CaseTransferFailureWaitsForEveryQp},
       {"submission_ledger_closed_after_fail_all", CaseSubmissionLedgerClosedAfterFailAll},
       {"submission_ledger_notif_disabled", CaseSubmissionLedgerNotifDisabled},
       {"submission_ledger_post_commit_race", CaseSubmissionLedgerPostCommitRace},
@@ -2296,8 +2413,11 @@ int main(int argc, char* argv[]) {
       {"xgmi_hidden_device_export_from_nonzero_device",
        CaseXgmiHiddenDeviceExportFromNonZeroDevice},
       {"xgmi_hidden_device_importer_nonzero_device", CaseXgmiHiddenDeviceImporterNonZeroDevice},
+      {"xgmi_hidden_device_adjacent_gpus", CaseXgmiHiddenDeviceAdjacentGpus},
+      {"xgmi_hidden_device_rejects_unknown_peer", CaseXgmiHiddenDeviceRejectsUnknownPeer},
       {"xgmi_inbound_notification_is_unsupported", CaseXgmiInboundNotificationIsUnsupported},
       {"xgmi_concurrent_wait_and_poll_is_safe", CaseXgmiConcurrentWaitAndPollIsSafe},
+      {"xgmi_bounded_wait_returns_on_completion", CaseXgmiBoundedWaitReturnsOnCompletion},
   };
 
   int passed = 0;

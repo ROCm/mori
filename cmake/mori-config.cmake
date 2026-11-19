@@ -56,8 +56,18 @@ _mori_import_library(application)
 _mori_import_library(shmem)
 _mori_import_library(ops)
 _mori_import_library(io)
+# Absent when MORI was built with BUILD_RAS=OFF.
+if(EXISTS "${MORI_LIB_DIR}/libmori_ras.so")
+  _mori_import_library(ras)
+endif()
 
 # Set inter-library dependencies
+if(TARGET mori::ras AND TARGET mori::io)
+  set_property(
+    TARGET mori::io
+    APPEND
+    PROPERTY INTERFACE_LINK_LIBRARIES mori::ras)
+endif()
 if(TARGET mori::shmem)
   set_property(
     TARGET mori::shmem

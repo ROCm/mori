@@ -258,8 +258,8 @@ class ModuleLogger {
 
   // Known modules created eagerly by the constructor. Kept in sync with the
   // mori::modules namespace below (this class is defined before it).
-  static constexpr const char* kKnownModules[] = {"application", "io",   "shmem",  "core",
-                                                  "ops",         "umbp", "metrics"};
+  static constexpr const char* kKnownModules[] = {"application", "io",   "shmem",   "core",
+                                                  "ops",         "umbp", "metrics", "ras"};
 
   std::unordered_map<std::string, std::shared_ptr<spdlog::logger>> loggers_;
   std::unordered_map<std::string, Level> envOverrides_;  // Track env variable overrides
@@ -295,6 +295,7 @@ constexpr const char* CORE = "core";
 constexpr const char* OPS = "ops";
 constexpr const char* UMBP = "umbp";
 constexpr const char* METRICS = "metrics";
+constexpr const char* RAS = "ras";
 }  // namespace modules
 
 // Macro helpers
@@ -374,6 +375,13 @@ constexpr const char* METRICS = "metrics";
 #define MORI_METRICS_ERROR(...) MORI_ERROR(mori::modules::METRICS, __VA_ARGS__)
 #define MORI_METRICS_CRITICAL(...) MORI_CRITICAL(mori::modules::METRICS, __VA_ARGS__)
 
+#define MORI_RAS_TRACE(...) MORI_TRACE(mori::modules::RAS, __VA_ARGS__)
+#define MORI_RAS_DEBUG(...) MORI_DEBUG(mori::modules::RAS, __VA_ARGS__)
+#define MORI_RAS_INFO(...) MORI_INFO(mori::modules::RAS, __VA_ARGS__)
+#define MORI_RAS_WARN(...) MORI_WARN(mori::modules::RAS, __VA_ARGS__)
+#define MORI_RAS_ERROR(...) MORI_ERROR(mori::modules::RAS, __VA_ARGS__)
+#define MORI_RAS_CRITICAL(...) MORI_CRITICAL(mori::modules::RAS, __VA_ARGS__)
+
 // Scoped Timer class.
 //
 // Hot-path note: the timer only logs at DEBUG level, so on any normal run
@@ -446,6 +454,7 @@ inline void InitializeLogging() {
   logger.InitModule(modules::OPS);
   logger.InitModule(modules::UMBP);
   logger.InitModule(modules::METRICS);
+  logger.InitModule(modules::RAS);
 }
 
 inline void InitializeLogging(const std::string& globalLevel) {
@@ -509,6 +518,13 @@ inline void InitializeLoggingFromEnv() {
     auto level = logger.LevelFromString(umbpLevel);
     logger.SetModuleLevelInternal(modules::UMBP, level, true);
     MORI_UMBP_INFO("Set UMBP log level to {} from MORI_UMBP_LOG_LEVEL", umbpLevel);
+  }
+
+  const char* rasLevel = std::getenv("MORI_RAS_LOG_LEVEL");
+  if (rasLevel) {
+    auto level = logger.LevelFromString(rasLevel);
+    logger.SetModuleLevelInternal(modules::RAS, level, true);
+    MORI_RAS_INFO("Set RAS log level to {} from MORI_RAS_LOG_LEVEL", rasLevel);
   }
 
   // Check for log pattern override

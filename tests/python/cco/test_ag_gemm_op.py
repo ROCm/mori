@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -40,6 +39,8 @@ import torch
 
 from mori.ops.ag_gemm import AgGemmOp, supports
 from mori.ops.ag_gemm.op import shape_constraint
+
+from . import kfd_settle
 
 WORKER = Path(__file__).with_name("ag_gemm_op_worker.py")
 FP8_FLOOR = 3e-3
@@ -99,12 +100,11 @@ requires_gpus = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 
 
 
 def _spawn(last=False):
-    time.sleep(_SETTLE_SECONDS)
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
     world = min(8, torch.cuda.device_count())
-    result = subprocess.run(
+    result = kfd_settle.run(
         [
             sys.executable,
             "-m",

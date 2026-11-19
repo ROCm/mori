@@ -33,6 +33,7 @@
 #include <cstring>
 #include <ctime>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -256,6 +257,19 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_LOCAL_FIRST", &dist.local_first, error)) {
     return false;
   }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_REMOTE_SINGLE_FLIGHT", &dist.remote_single_flight, error)) {
+    return false;
+  }
+  size_t single_flight_wait_ms = dist.remote_single_flight_wait_ms;
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_REMOTE_SINGLE_FLIGHT_WAIT_MS", &single_flight_wait_ms,
+                    error)) {
+    return false;
+  }
+  if (single_flight_wait_ms > std::numeric_limits<uint32_t>::max()) {
+    *error = "UMBP_DISTRIBUTED_REMOTE_SINGLE_FLIGHT_WAIT_MS is out of range";
+    return false;
+  }
+  dist.remote_single_flight_wait_ms = static_cast<uint32_t>(single_flight_wait_ms);
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_PREFETCH_BUDGET_BYTES", &dist.prefetch_budget_bytes, error))
     return false;
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);

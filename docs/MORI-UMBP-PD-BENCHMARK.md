@@ -38,7 +38,8 @@ Every `UMBP_*` env var referenced below is documented in
 - NFS mount shared between all nodes (for logs, results, and mori/sglang source)
 - SSH key access from the local machine to all nodes
 - Docker with ROCm image available on all nodes
-- mori built with `UMBP=ON` (Step 3 below)
+- mori built with UMBP (`BUILD_UMBP=ON`, Step 3 below). UMBP needs the gRPC and
+  Protobuf development packages; without them the build skips UMBP with a warning.
 - SGLang checked out at `$NFS_BASE/sglang` with `benchmark/hicache/run_pd_disagg_bench_dp8ep8.sh`
   supporting both `PREFILL_URLS` (space-separated N prefill URLs) and the
   `wait_for_router_workers` gate (polls `/get_loads` after router is ready)
@@ -246,14 +247,18 @@ echo "=== Prometheus: http://${IP_DECODE}:9090 ==="
 
 ## Step 3 — Build mori on all nodes
 
-Clears the per-node build directory so cmake starts clean, then builds with UMBP enabled.
+Clears the per-node build directory so cmake starts clean, then builds and installs
+mori with UMBP enabled. `MORI_PYBUILD_DIR` keeps each node's build in its own
+directory of the shared checkout, which is where the launchers below find
+`umbp_master` (`build_<hostname>/src/umbp/umbp_master`).
 Builds run in parallel across every prefill node and the decode node.
 
 ```bash
 for NODE in "${ALL_NODES[@]}"; do
   $SSH $NODE "docker exec $CONTAINER bash -c '
     rm -rf ${NFS_BASE}/mori/build_\$(hostname) &&
-    cd ${NFS_BASE}/mori && UMBP=ON bash build.sh'" &
+    cd ${NFS_BASE}/mori &&
+    MORI_PYBUILD_DIR=build_\$(hostname) BUILD_UMBP=ON pip install .'" &
 done
 wait
 echo "mori builds done on ${#ALL_NODES[@]} node(s)"
@@ -298,7 +303,6 @@ export MORI_ENABLE_SDMA=0
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800
 export SGLANG_MORI_FP4_DISP=false
 export SGLANG_MORI_FP8_DISP=true
-export SGLANG_MORI_FP8_COMB=true
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048
 export NCCL_IB_HCA=${NCCL_IB_HCA}
 export GLOO_SOCKET_IFNAME=${NET_IFNAME}
@@ -345,7 +349,6 @@ export MORI_ENABLE_SDMA=0
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800
 export SGLANG_MORI_FP4_DISP=false
 export SGLANG_MORI_FP8_DISP=true
-export SGLANG_MORI_FP8_COMB=true
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048
 export NCCL_IB_HCA=${NCCL_IB_HCA}
 export GLOO_SOCKET_IFNAME=${NET_IFNAME}
@@ -645,7 +648,6 @@ wait
 | `UMBP_PEER_SERVICE_PORT` | Port for peer-to-peer service; required when `UMBP_MASTER_ADDRESS` is set |
 | `UMBP_CACHE_REMOTE_FETCHES` | Set `false` to disable remote fetch caching during benchmarking |
 | `SGLANG_MORI_FP8_DISP` | Enable FP8 dispatch (reduces transfer size) |
-| `SGLANG_MORI_FP8_COMB` | Enable FP8 combine |
 | `MORI_RDMA_DEVICES` | RDMA devices to use; prefix `^` to exclude (e.g., `^mlx5_8`) |
 | `MORI_SOCKET_IFNAME` | Network interface for mori's TCP socket |
 | `KV_CACHE_DTYPE` | KV cache dtype; `fp8_e4m3` recommended for transfer efficiency |

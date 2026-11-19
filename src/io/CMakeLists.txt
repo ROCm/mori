@@ -10,6 +10,7 @@ set(MORI_IO_SOURCES
     sim/backend_impl.cpp
     xgmi/backend_impl.cpp
     xgmi/hip_resource_pool.cpp
+    fabric/copy_plan.cpp
     fabric/backend_impl.cpp
     fabric/vpod_topology.cpp
     fabric/torch_allocator.cpp)
@@ -25,6 +26,10 @@ target_include_directories(
 # so mori_io's own ibv_* references resolve without linking libibverbs.
 target_link_libraries(mori_io mori_application hip::host mori_logging
                       mori_ibv_shim)
+# With BUILD_RAS=OFF, include/mori/ras/ras.hpp compiles every RAS call in engine.cpp away.
+if(BUILD_RAS)
+  target_link_libraries(mori_io mori_ras)
+endif()
 target_compile_definitions(mori_io PUBLIC MSGPACK_NO_BOOST)
 if(ENABLE_IO_FAULT_INJECTION)
   target_sources(mori_io PRIVATE rdma/fault_injector.cpp)

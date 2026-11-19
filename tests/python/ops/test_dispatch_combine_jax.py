@@ -67,20 +67,27 @@ def _jax_worker(
 ):
     """Long-lived JAX worker: init distributed + mori, then serve tasks."""
     gpus_per_proc = total_gpus // world_size
-    os.environ["HIP_VISIBLE_DEVICES"] = ",".join(
-        str(rank * gpus_per_proc + i) for i in range(gpus_per_proc)
-    )
+    local_devices = [rank * gpus_per_proc + i for i in range(gpus_per_proc)]
 
     import jax
 
+    # Every process sees every GPU and JAX takes its own: RCCL on ROCm 10.1 cannot
+    # build its intra-node graph ("TopoPreset: Local rank N not found") when
+    # HIP_VISIBLE_DEVICES leaves each process one GPU, and the first XLA
+    # collective then hangs.
     jax.distributed.initialize(
         coordinator_address=f"localhost:{coordinator_port}",
         num_processes=world_size,
         process_id=rank,
+        local_device_ids=local_devices,
     )
 
     import mori
+    from mori.jit.hip_driver import _check, _get_hip_lib
 
+    # mori runs on the calling thread's HIP device; with every GPU visible, that
+    # has to be this process's own.
+    _check(_get_hip_lib().hipSetDevice(local_devices[0]), "hipSetDevice")
     mori.jax.shmem_init_attr(rank, world_size)
 
     while True:
