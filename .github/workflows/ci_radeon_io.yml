@@ -1,0 +1,214 @@
+name: MoRI-IO Radeon R9700 (gfx1201)
+
+# MORI-IO only, on a 2x Radeon AI Pro R9700S host. The GPUs have no XGMI link:
+# the xgmi backend (HIP IPC + hipMemcpyPeerAsync) runs over PCIe Gen4 P2P, so
+# this lane checks correctness and a PCIe-class bandwidth floor, not XGMI speed.
+# gfx1201 is not in MORI's supported arch list, so only the host-side IO library
+# and its C++ tests are built (GPU_TARGETS pinned, ops/shmem/cco/pybinds off).
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    paths:
+      - ".github/workflows/ci_radeon_io.yml"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "docker/Dockerfile.dev"
+      - "include/mori/application/**"
+      - "include/mori/io/**"
+      - "include/mori/utils/**"
+      - "src/application/**"
+      - "src/io/**"
+      - "tests/cpp/CMakeLists.txt"
+      - "tests/cpp/io/**"
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      min_bw_gbps:
+        description: Minimum 64 MiB write bandwidth (GB/s) each xgmi benchmark must reach
+        default: "20"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_REPO: mori-ci
+  CONTAINER: mori_radeon_io_${{ github.run_id }}
+  GFX: gfx1201
+  # PCIe Gen4 x16 measures 23-27 GB/s at 64 MiB on this host.
+  MIN_BW_GBPS: ${{ inputs.min_bw_gbps || '20' }}
+  # The GPUs are shared with other users; wait this long for them to go idle.
+  GPU_IDLE_WAIT_S: "1800"
+
+jobs:
+  mori-io:
+    name: MORI-IO xgmi over PCIe (gfx1201, Radeon R9700)
+    # Same-repo PRs run on the path filter; fork PRs run only once a maintainer
+    # adds ci:radeon, since this runner executes PR code on a shared host.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+       (github.event.action != 'labeled' || github.event.label.name == 'ci:radeon') &&
+       (github.event.pull_request.head.repo.full_name == github.repository ||
+        contains(github.event.pull_request.labels.*.name, 'ci:radeon')))
+    runs-on: [self-hosted, linux, radeon-r9700]
+    timeout-minutes: 75
+    steps:
+      - name: Fix workspace permissions
+        run: |
+          # Files a previous run's container wrote are root-owned; chown them with
+          # an image already on the host rather than pulling one.
+          WS="${GITHUB_WORKSPACE}"
+          img=$(docker images --format '{{.Repository}}:{{.Tag}}' $IMAGE_REPO | head -1)
+          if [ -d "$WS" ] && [ -n "$img" ]; then
+            docker run --rm -v "$WS:$WS" "$img" chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Wait for idle GPUs
+        run: |
+          deadline=$((SECONDS + GPU_IDLE_WAIT_S))
+          while :; do
+            busy=$(amd-smi process 2>/dev/null | grep -c 'PID:' || true)
+            [ "$busy" -eq 0 ] && break
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::GPUs still in use after ${GPU_IDLE_WAIT_S}s"
+              amd-smi process
+              exit 1
+            fi
+            echo "GPUs busy ($busy processes), waiting..."
+            sleep 30
+          done
+          amd-smi monitor
+
+      - name: Build CI image
+        run: |
+          # A rebuild re-exports ~49 GB (~10 min), so the image is keyed on the
+          # Dockerfile and arch and only built when that key changes.
+          key=$( (cat docker/Dockerfile.dev; echo "$GFX") | sha256sum | cut -c1-12)
+          tag=$IMAGE_REPO:$GFX-$key
+          if ! docker image inspect $tag &>/dev/null; then
+            docker build --network=host --build-arg GPU_ARCHS=$GFX -t $tag -f docker/Dockerfile.dev docker
+            docker images --format '{{.Repository}}:{{.Tag}}' $IMAGE_REPO | grep -vx "$tag" | xargs -r docker rmi || true
+          fi
+          echo "IMAGE=$tag" >> $GITHUB_ENV
+
+      - name: Start container
+        run: |
+          docker rm -f $CONTAINER 2>/dev/null || true
+          docker run -d --name $CONTAINER --network host --ipc host \
+            --device /dev/kfd --device /dev/dri --group-add video \
+            --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          docker exec $CONTAINER git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Build MORI-IO
+        run: |
+          docker exec $CONTAINER bash -c "
+            set -e
+            cmake -S . -B build_io -G Ninja -DCMAKE_BUILD_TYPE=Release -DGPU_TARGETS=$GFX \
+              -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_APPLICATION=ON \
+              -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_CCO_SDMA=OFF \
+              -DBUILD_COLLECTIVE=OFF -DBUILD_PYBINDS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF \
+              -DBUILD_METRICS=OFF -DBUILD_NETMON=OFF -DBUILD_XGMI_NETMON=OFF -DBUILD_UMBP=OFF \
+              -DMORI_USE_LIBFABRIC=OFF
+            cmake --build build_io -j --target test_engine test_transfer_wait bench_engine
+          "
+
+      - name: MORI-IO C++ (test_engine, test_transfer_wait)
+        run: |
+          # The XGMI hidden-device cases re-launch the binary under a narrower
+          # HIP_VISIBLE_DEVICES, so the parent must see both GPUs.
+          docker exec -e MORI_IO_LOG_LEVEL=error $CONTAINER bash -c "
+            set -e
+            timeout 300 ./build_io/tests/cpp/test_engine
+            timeout 120 ./build_io/tests/cpp/test_transfer_wait
+          "
+
+      - name: MORI-IO xgmi benchmark (single process, GPU0 -> GPU1)
+        run: |
+          mkdir -p io-logs
+          docker exec $CONTAINER bash -c "
+            timeout 300 ./build_io/tests/cpp/bench_engine --backend xgmi --xgmi-single-process \
+              --src-gpu 0 --dst-gpu 1 --op write --all --sweep-start 8 --sweep-max 67108864 \
+              --iters 100 --warmup-iters 10
+          " 2>&1 | tee io-logs/xgmi_single.log
+          exit ${PIPESTATUS[0]}
+
+      - name: MORI-IO xgmi benchmark (two processes, hipIpc)
+        run: |
+          docker exec $CONTAINER bash -c '
+            B=./build_io/tests/cpp/bench_engine
+            ARGS="--backend xgmi --master-ip 127.0.0.1 --port 18515 --op write --all --sweep-start 8 --sweep-max 67108864 --iters 100 --warmup-iters 10"
+            timeout 300 $B --rank 1 --gpu 1 $ARGS > io-logs/xgmi_mp_rank1.log 2>&1 &
+            target=$!
+            sleep 2
+            timeout 300 $B --rank 0 --gpu 0 --dst-gpu 1 $ARGS > io-logs/xgmi_mp_rank0.log 2>&1
+            initiator=$?
+            wait $target
+            target=$?
+            cat io-logs/xgmi_mp_rank0.log
+            echo "initiator exit=$initiator target exit=$target"
+            [ $initiator -eq 0 ] && [ $target -eq 0 ]
+          '
+
+      - name: Check validation and bandwidth floor
+        run: |
+          status=0
+          for f in io-logs/xgmi_single.log io-logs/xgmi_mp_rank0.log; do
+            if ! grep -q "validation: OK" "$f"; then
+              echo "::error file=$f::data validation did not report OK"
+              status=1
+            fi
+            bw=$(awk '$1=="67108864" {print $4}' "$f" | tail -1)
+            if ! awk -v b="${bw:-0}" -v m="$MIN_BW_GBPS" 'BEGIN { exit !(b >= m) }'; then
+              echo "::error file=$f::64 MiB write bandwidth ${bw:-n/a} GB/s is below ${MIN_BW_GBPS} GB/s"
+              status=1
+            fi
+            echo "$f: 64 MiB write ${bw:-n/a} GB/s"
+          done
+          exit $status
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## MORI-IO xgmi on Radeon R9700 (PCIe Gen4 P2P)"
+            for f in io-logs/xgmi_single.log io-logs/xgmi_mp_rank0.log; do
+              [ -f "$f" ] || continue
+              echo "### $(basename $f .log)"
+              echo '| MsgSize (B) | AvgBW (GB/s) | AvgLat (us) |'
+              echo '| ---: | ---: | ---: |'
+              awk '$1 ~ /^[0-9]+$/ && NF >= 6 {printf "| %s | %s | %s |\n", $1, $4, $5}' "$f"
+              grep -h "validation:" "$f" || true
+            done
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mori-io-radeon-logs-${{ github.run_id }}
+          path: io-logs/
+          if-no-files-found: ignore
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f $CONTAINER || true
+          img=${IMAGE:-$(docker images --format '{{.Repository}}:{{.Tag}}' $IMAGE_REPO | head -1)}
+          if [ -n "$img" ]; then
+            docker run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $img \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          fi
