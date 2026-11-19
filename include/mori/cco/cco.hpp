@@ -432,7 +432,8 @@ struct ccoDevComm {
   ccoWindowDevice* resourceWindow;         // GPU pointer into windowTable (host bookkeeping)
   ccoWindowDevice resourceWindow_inlined;  // inlined snapshot; kernels read from cmem directly
 
-  // IBGDA context (QP + signal + counter); empty when gdaConnType==NONE.
+  // IBGDA context (QP + signal + counter). No QPs when gdaConnType==NONE;
+  // signal/counter slots also exist when proxy.connType != NONE.
   ccoIbgdaContext ibgda;
   // Standalone barriers:
   //   * lsaBarrier            — intra-node, driven by reqs.lsaBarrierCount

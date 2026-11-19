@@ -440,10 +440,10 @@ matching peer give NONE, and proxy queues on a NONE connection fail creation.
 The default -1 follows `gdaConnectionType`, so both get QPs to the same peers.
 For a proxy-only DevComm, set `gdaConnectionType = CCO_GDA_CONNECTION_NONE`
 and `proxyConnectionType` to the peers you need; no GDA QPs are created. The
-proxy uses the GDA signal and counter slots (`gdaSignalCount`,
-`gdaCounterCount`), which exist whenever either connection is non-NONE. The
-GPU's VRAM must be host-mapped (large BAR). Each DevComm with proxy queues starts its own busy-polling
-threads, so prefer one per communicator. Several QPs per peer let NICs that
+proxy uses the GDA signal slots (`gdaSignalCount`), which exist whenever
+either connection is non-NONE. The GPU's VRAM must be host-mapped (large
+BAR). Each DevComm with proxy queues starts its own busy-polling threads, so
+prefer one per communicator. Several QPs per peer let NICs that
 serve each QP serially run a thread's queues in parallel.
 
 | Variable | Purpose |
