@@ -281,7 +281,7 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 
 | Vendor | Recommendation |
 |--------|-----------------|
-| AMD Pollara (AINIC) | `>= 1.117.5-a-45` (`1.117.1` major lacks IBGDA support) |
+| AMD Pollara (AINIC) | `>= 1.117.5-a-45` (`1.117.1` major lacks IBGDA support); 1.117.5 builds after `a-45` can mishandle retransmitted RDMA READs, see [MORI-IO Known Issues](https://rocm.github.io/mori/MORI-IO-GUIDE.html#known-issues) |
 | Broadcom (Thor2) | `237.1.137.x` / `235.2.86.x`; known bad: `231.x`, `232.x` |
 | Mellanox (ConnectX, mlx5) | No known minimum; tested on `ConnectX-7` |
 
