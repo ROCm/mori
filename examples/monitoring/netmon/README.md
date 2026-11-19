@@ -7,12 +7,17 @@ One VictoriaMetrics + Grafana for the cluster monitoring tools: NIC counters fro
 - **netmon overview**: one experiment, every node and NIC. A table of the NICs (host, RDMA
   device name such as `ionic_0 (benic1p1)`, link rate, average send and receive over the
   selected time; click a NIC to open its detail page) and one small RDMA traffic chart per NIC.
+
+  ![netmon overview: the NIC table and one RDMA traffic chart per NIC, two nodes with 8 NICs each](images/nic_overview.png)
+
 - **netmon NIC detail**: RDMA traffic, all port traffic, retransmissions and congestion
   notifications of one NIC, of several, or of all of them (Host and NIC offer "All"). Every
   chart is drawn once per selected NIC: the traffic charts side by side, the congestion
   charts as one line per NIC. Collapsed at the bottom: individual observations, PFC pause
   counters (meaning not yet validated), and recording diagnostics for troubleshooting the
   monitor itself (gaps, sampling quality, the offline report's fixed-window summary).
+
+  ![netmon NIC detail: RDMA traffic, all port traffic, retransmissions and congestion of one NIC](images/nic_detail.png)
 
 How to read the traffic charts: **blue = send, orange = receive; solid = average, dashed =
 observed peak; gaps = data unavailable.** Pick the experiment, then the hosts, then the NICs.
@@ -23,6 +28,13 @@ the same folder: the sent and received bandwidth of every GPU and every XGMI lin
 and its PCIe traffic. Grafana's home page is the NIC overview and does not link to it: open
 Dashboards, folder `netmon`, `xgmi-netmon`, or `http://127.0.0.1:3000/d/xgmi-netmon`. Its
 experiment list shows the experiments that have XGMI data in the selected time range.
+
+![xgmi-netmon: tiles, GPU overview, the GPU to GPU sent matrix, sent and received per GPU](images/xgmi_summary.png)
+
+The screenshots are from MI355X nodes with 8 GPUs and 8 AINICs each, recorded at 100 ms
+instead of the default 2 ms (`ainic-netmon record --interval rdma=100ms,ethtool=10s`,
+`xgmi-netmon record --interval-ms 100`) and without root, so the port traffic on the NIC
+detail page comes from ethtool, as single points.
 
 Data gets there in two ways: live while recording (`ainic-netmon record --push`), and after
 the fact with exact numbers (`ainic-netmon-import`).
