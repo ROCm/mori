@@ -161,7 +161,9 @@ struct ccoGda_WindowSignalAdd {
 // SignalInc / SignalAdd to the same slot. Sets of one slot through two queues
 // can land out of order and move it back. The slot then reads the last value
 // set (minus what waitSignal consumed): set 1, 2, 3, ... and call
-// waitSignal(id, 1) once per value.
+// waitSignal(id, 1) once per value. Data before the set is visible first only
+// if the NIC-to-GPU path keeps PCIe write order (no relaxed ordering on the
+// MRs, and also under VFs / passthrough).
 struct ccoGda_SignalSet {
   ccoGdaSignal_t signalId;
   uint64_t value;

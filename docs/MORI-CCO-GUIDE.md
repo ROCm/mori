@@ -520,8 +520,12 @@ With `SignalInc`, `waitSignal(slot, n)` waits for `n` more signals. With
   GDA contexts are.
 - `SignalSet` / `WindowSignalSet`: every set of a slot goes through one queue,
   values only increase, and the slot gets no `SignalInc` / `SignalAdd`. The
-  window MRs must not use relaxed ordering; `ccoDevCommCreate` warns when
-  `MORI_IB_ENABLE_RELAXED_ORDERING=1` applies it.
+  set is a plain RDMA write, so the data before it is visible first only if
+  writes reach GPU memory in the order the NIC issued them: the window MRs
+  must not use relaxed ordering (`ccoDevCommCreate` warns when
+  `MORI_IB_ENABLE_RELAXED_ORDERING=1` applies it), and the NIC-to-GPU path
+  must preserve PCIe write order, including under SR-IOV VFs and device
+  passthrough.
 - The first proxy error fails the DevComm for good: later ops are dropped,
   `failed()` returns true, and `flush(coop, timeoutCycles)` and
   `waitSignal(id, least, coop, timeoutCycles)` return 2. On the host,
