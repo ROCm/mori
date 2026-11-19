@@ -380,7 +380,9 @@ struct ccoProxy {
     return impl::readSignalImpl<CCO_GDA_BUILD_PROVIDER>(comm.ibgda.signalBuf,
                                                         comm.ibgda.signalShadows, signalId, bits);
   }
-  // As ccoGda::waitSignal, but traps once the DevComm failed, and acquires.
+  // As ccoGda::waitSignal: waits until `least` more than already consumed have
+  // arrived, then consumes them (readSignal returns the unconsumed amount); one
+  // waiter per slot at a time. Also traps once the DevComm failed, and acquires.
   // One thread of the group waits (lane 0 / linear thread 0 for ccoCoopWarp /
   // ccoCoopBlock, also in 2-D and 3-D blocks).
   template <typename Coop = ccoCoopThread>

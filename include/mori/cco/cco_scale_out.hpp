@@ -160,8 +160,8 @@ struct ccoGda_WindowSignalAdd {
 // handed off in turn), values only increase in that queue's order, and no
 // SignalInc / SignalAdd to the same slot. Sets of one slot through two queues
 // can land out of order and move it back. The slot then reads the last value
-// set (minus what waitSignal consumed): on a reset slot, waitSignal(id, v)
-// waits for v.
+// set (minus what waitSignal consumed): set 1, 2, 3, ... and call
+// waitSignal(id, 1) once per value.
 struct ccoGda_SignalSet {
   ccoGdaSignal_t signalId;
   uint64_t value;
@@ -242,10 +242,13 @@ struct ccoGda {
             typename Coop = ccoCoopThread>
   __device__ inline void signal(int peer, RemoteAction remoteAction, Coop coop = Coop{});
 
-  // readSignal: read the local value of one signal slot.
+  // readSignal: the unconsumed amount of one local signal slot (its value minus
+  // what waitSignal consumed).
   __device__ inline uint64_t readSignal(ccoGdaSignal_t signalId, int bits = 64);
 
-  // waitSignal: block until the local signal slot reaches `least`.
+  // waitSignal: block until `least` more than already consumed have arrived in
+  // the local signal slot, then consume them (not an absolute target). One
+  // waiter per slot at a time.
   template <typename Coop = ccoCoopThread>
   __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop = Coop{},
                                     int bits = 64);
@@ -1763,7 +1766,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::counter(LocalAction localActi
   coop.sync();
 }
 
-// readSignal: read local signal value
+// readSignal: the slot's unconsumed amount
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 __device__ inline uint64_t ccoGda<PrvdType, Doorbell>::readSignal(ccoGdaSignal_t signalId,
                                                                   int bits) {
@@ -1771,7 +1774,7 @@ __device__ inline uint64_t ccoGda<PrvdType, Doorbell>::readSignal(ccoGdaSignal_t
   return impl::readSignalImpl<PrvdType>(ibgda->signalBuf, ibgda->signalShadows, signalId, bits);
 }
 
-// waitSignal: wait until local signal reaches specified value
+// waitSignal: wait for `least` unconsumed, then consume them
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::waitSignal(ccoGdaSignal_t signalId,

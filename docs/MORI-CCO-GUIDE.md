@@ -466,7 +466,7 @@ and a queue index.
 | action | `ccoGda_NoSignal`, `ccoGda_SignalInc` / `SignalAdd` / `WindowSignalAdd` (NIC atomics), `ccoGda_SignalSet` / `WindowSignalSet` (8-byte write, no atomic) |
 | `flush(coop)` | wait until every op this queue pushed before it completed remotely; sources are reusable |
 | `int flush(coop, timeoutCycles)` | never traps: 0 done, 1 timed out, 2 DevComm failed |
-| `readSignal` / `waitSignal` / `resetSignal` | local signal slots, shared with GDA |
+| `readSignal` / `waitSignal` / `resetSignal` | local signal slots, shared with GDA (see [Signal slots](#signal-slots)) |
 | `failed()` | whether the DevComm has failed |
 
 - **Coops:** `ccoCoopWarp` and `ccoCoopBlock` issue one op per group (all lanes
@@ -489,6 +489,27 @@ and a queue index.
   owner's constructor (`__syncthreads()` within a block). Across launches,
   stream order is enough.
 
+### Signal slots
+
+A slot is a 64-bit word that remote signals add to (`SignalInc` /
+`SignalAdd`) or overwrite (`SignalSet`), plus a count of what local waits
+have consumed. The calls are the same as `ccoGda`'s:
+
+- `readSignal(id)` returns the unconsumed amount: the slot's value minus what
+  was consumed.
+- `waitSignal(id, least, coop)` waits until at least `least` is unconsumed,
+  then consumes `least`. It is not an absolute target: a second
+  `waitSignal(id, n)` waits for `n` more. (`ccoSdma::waitSignal` does take an
+  absolute value.)
+- One waiter per slot at a time: two concurrent waiters on one slot can both
+  take the same arrival.
+- `resetSignal(id)` zeroes the slot and its consumed count; no signal to it may
+  be in flight.
+
+With `SignalInc`, `waitSignal(slot, n)` waits for `n` more signals. With
+`SignalSet`, the sender sets 1, 2, 3, ... (one per round) and the receiver calls
+`waitSignal(slot, 1)` once per round.
+
 ### Ordering and failure
 
 - Ops one wavefront pushes to one queue reach each peer in program order on one
@@ -510,18 +531,24 @@ and a queue index.
 ```cpp
 #include "mori/cco/cco_scale_out.hpp"
 
+using namespace mori::cco;
+
 // Host: reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;  // no GDA QPs
 //       reqs.proxyConnectionType = CCO_GDA_CONNECTION_FULL;
 //       reqs.proxySpscQueueCount = nBlocks; reqs.gdaSignalCount >= nBlocks.
-__global__ void send(ccoDevComm dc, ccoWindow_t dst, ccoWindow_t src, size_t chunk, int peer) {
+// Round r = 1, 2, ...: block b sends chunk b and sets slot b to r (no NIC atomics).
+__global__ void send(ccoDevComm dc, ccoWindow_t dst, ccoWindow_t src, size_t chunk, int peer,
+                     uint64_t round) {
   ccoProxy<> proxy{dc, static_cast<int>(blockIdx.x)};
   const size_t off = blockIdx.x * chunk;
-  proxy.put(peer, dst, off, src, off, chunk, ccoGda_SignalInc{blockIdx.x}, ccoCoopBlock{});
+  proxy.put(peer, dst, off, src, off, chunk, ccoGda_SignalSet{blockIdx.x, round},
+            ccoCoopBlock{});
   proxy.flush(ccoCoopBlock{});  // src may be overwritten now
 }
 
-__global__ void recv(ccoDevComm dc, uint64_t round) {
+// Once per round: consumes one, so chunk blockIdx.x of this round has landed.
+__global__ void recv(ccoDevComm dc) {
   ccoProxy<> proxy{dc, static_cast<int>(blockIdx.x)};
-  proxy.waitSignal(blockIdx.x, round, ccoCoopBlock{});  // chunk blockIdx.x has landed
+  proxy.waitSignal(blockIdx.x, 1, ccoCoopBlock{});
 }
 ```
