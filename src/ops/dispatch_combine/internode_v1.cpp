@@ -996,7 +996,10 @@ inline __device__ void GatherCompactedF32(float* dest, float* const* srcs, int n
 }
 
 // Gathers one bf16 slice (and, when doWeights, the token's weights) from compacted sources. Returns
-// false, leaving the sources untouched, for other types, unaligned slices or too many sources.
+// false, leaving the sources untouched, for other types, unaligned slices, too many sources, or a
+// topk with its own WarpAccum case: there CombineGather keeps the source pointers in registers and
+// issues up to topk loads per step, while this loop re-reads them from LDS every step, loads at
+// most 4 at a time and pays two compaction passes per token (topk 8: +10% combine at 1024+ tokens).
 template <typename TokT>
 inline __device__ bool GatherSliceCompacted(TokT* gdest, TokT** srcPtrs, float* wdest,
                                             float** srcWeightsPtr, bool doWeights, int topk,
@@ -1004,6 +1007,7 @@ inline __device__ bool GatherSliceCompacted(TokT* gdest, TokT** srcPtrs, float* 
   if constexpr (!std::is_same_v<TokT, hip_bfloat16>) {
     return false;
   } else {
+    if (topk == 1 || topk == 2 || topk == 4 || topk == 6 || topk == 8 || topk == 10) return false;
     const int nSrc = vecAligned ? CompactGatherSources(srcPtrs, topk, laneId) : -1;
     if (nSrc < 0) return false;
     CompactGatherSources(srcWeightsPtr, topk, laneId);
