@@ -170,8 +170,7 @@ win. Set them before constructing the config — they are read once, there.
 ## Deployment / launcher env vars
 
 Not parsed by the C++ library directly. These are consumed by the
-SGLang / hicache wrappers and `src/umbp/scripts/run_umbp_single_node_hicache.sh`
-to construct the
+SGLang / hicache wrappers to construct the
 `UMBPDistributedConfig` plumbed into the C++ side. Listed here so
 operators can find them in one place.
 

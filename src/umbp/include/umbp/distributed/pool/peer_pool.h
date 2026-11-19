@@ -196,6 +196,8 @@ class PeerPool {
   void SetEvictionCandidateSource(EvictionCandidateSource source);
 
  private:
+  // See the definition: the source GPU's HBM backend first, among equals.
+  void PreferSourceDevice(int device, std::vector<uint32_t>* order) const;
   struct PendingPlacement {
     uint32_t backend_id = BackendRegistry::kMaxBackends;
     uint64_t local_slot_id = 0;

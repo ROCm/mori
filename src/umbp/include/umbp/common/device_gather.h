@@ -36,7 +36,7 @@ struct DeviceGatherFragment {
 
 // Copies `count` independent fragments between a HostTierRegistration-covered
 // region and one GPU in a single kernel launch, in either direction, or between
-// two buffers on that GPU.
+// two GPU buffers: on that GPU, or one of them on a GPU it has peer access to.
 //
 // This exists because the DRAM tier's copy path is scatter-gather by nature:
 // reading one layer out of page-granular objects means dozens of small strided

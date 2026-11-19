@@ -355,6 +355,36 @@ std::atomic<bool>& GatherDisabled() {
   return disabled;
 }
 
+// Whether a kernel on `kernel_device` may dereference memory that lives on
+// `other`. Peer access makes it so, for ordinary and VMM allocations alike and
+// for a buffer another process shared over IPC. It is enabled once per ordered
+// pair, the first time a copy between the two GPUs comes up, and the answer is
+// kept; a pair without it keeps hipMemcpy.
+bool PeerAccessReady(int kernel_device, int other) {
+  static std::mutex* mutex = new std::mutex();
+  static auto* ready = new std::map<std::pair<int, int>, bool>();
+  std::lock_guard<std::mutex> lock(*mutex);
+  const auto key = std::make_pair(kernel_device, other);
+  auto found = ready->find(key);
+  if (found != ready->end()) return found->second;
+  bool ok = false;
+  int previous = -1;
+  (void)hipGetDevice(&previous);
+  if (hipSetDevice(kernel_device) == hipSuccess) {
+    int can = 0;
+    if (hipDeviceCanAccessPeer(&can, kernel_device, other) == hipSuccess && can != 0) {
+      const hipError_t status = hipDeviceEnablePeerAccess(other, 0);
+      ok = status == hipSuccess || status == hipErrorPeerAccessAlreadyEnabled;
+    }
+  }
+  (void)hipGetLastError();
+  if (previous >= 0) (void)hipSetDevice(previous);
+  MORI_UMBP_INFO("[HbmCopyEngine] gather across GPUs {} -> {}: {}", other, kernel_device,
+                 ok ? "enabled" : "unavailable, keeping hipMemcpy");
+  (*ready)[key] = ok;
+  return ok;
+}
+
 // Which device a plan's copies should run on.  A D2D pair between two devices
 // needs a current device with peer access to both; we pick the destination's,
 // which is the one hipMemcpy attributes the copy to.
@@ -496,8 +526,9 @@ void HbmCopyEngine::Prewarm(size_t gather_streams_per_device) {
 // small-fragment batch the kernel wins on.  Direction does not partition the
 // buckets either: once the host side is registered both endpoints are
 // dereferenceable from the device, so one kernel can carry H2D and D2H
-// fragments at once.  D2D within one GPU joins the same bucket with nothing to
-// register: both of its endpoints are device addresses already.
+// fragments at once.  D2D joins the same bucket with nothing to register: both
+// of its endpoints are device addresses already, and between two GPUs peer
+// access lets the destination's kernel read the source's.
 //
 // Never reports a plan it did not fully complete.  Anything declined or failed
 // is left for the hipMemcpy loop, which reaches the same result whether or not
@@ -577,10 +608,12 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     const bool device_to_device = kind == hipMemcpyDeviceToDevice;
     if (device_to_device) {
       // Within one GPU both endpoints are addresses its kernel can use as they
-      // are.  Between two GPUs the kernel on one would have to dereference the
-      // other's memory, which nothing here arranges, so those copies stay with
-      // hipMemcpy.
-      if (plan.src.device < 0 || plan.src.device != plan.dst.device) {
+      // are.  Between two GPUs the kernel runs on the destination's and reads
+      // the source's memory, which peer access allows; without it those copies
+      // stay with hipMemcpy.
+      if (plan.src.device < 0 || plan.dst.device < 0 ||
+          (plan.src.device != plan.dst.device &&
+           !PeerAccessReady(plan.dst.device, plan.src.device))) {
         note(p, GatherSkip::kAcrossDevices);
         continue;
       }
@@ -782,13 +815,29 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
     //
     // hipMemcpy is BLOCKING, so this loop is already launch-to-completion and
     // the debug clock below needs no synchronize of its own.
+    //
+    // Coalesce adjacent segments before issuing hipMemcpy.  When DRAM pages are
+    // sequential in both source and destination (the common case: a key's pages
+    // occupy a contiguous run in both the DRAM pool buffer and the caller's GPU
+    // buffer) each run merges into one large call.  This is critical on the H2D
+    // pageable path: hipMemcpy without hipHostRegister allocates a temporary
+    // pinned staging buffer per call, and the per-call overhead dominates for
+    // small (e.g. 64 KiB) pages — 32,000 calls × ~50 µs ≈ 1.6 s for 500 keys.
     size_t plan_bytes = 0;
     const auto started = std::chrono::steady_clock::now();
     hipError_t err = hipSuccess;
-    for (size_t i = 0; i < plan.sizes.size(); ++i) {
-      err = hipMemcpy(dst + plan.dst_offsets[i], src + plan.src_offsets[i], plan.sizes[i], kind);
+    for (size_t i = 0; i < plan.sizes.size();) {
+      size_t coalesced = plan.sizes[i];
+      size_t j = i + 1;
+      while (j < plan.sizes.size() && plan.src_offsets[j] == plan.src_offsets[i] + coalesced &&
+             plan.dst_offsets[j] == plan.dst_offsets[i] + coalesced) {
+        coalesced += plan.sizes[j];
+        ++j;
+      }
+      err = hipMemcpy(dst + plan.dst_offsets[i], src + plan.src_offsets[i], coalesced, kind);
       if (err != hipSuccess) break;
-      plan_bytes += plan.sizes[i];
+      plan_bytes += coalesced;
+      i = j;
     }
     if (debug && err == hipSuccess) {
       const double seconds = Seconds(started, std::chrono::steady_clock::now());

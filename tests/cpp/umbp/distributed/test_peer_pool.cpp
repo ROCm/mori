@@ -177,6 +177,56 @@ class NoSpaceBackend final : public MockBackend {
   }
 };
 
+// An HBM backend on one GPU. Its buffer is never dereferenced: placement reads
+// only where it lives.
+class GpuBackend : public MockBackend {
+ public:
+  GpuBackend(int device, bool full = false)
+      : MockBackend(TierType::HBM), device_(device), full_(full) {}
+
+  size_t BufferCount() const override { return 1; }
+  TransferRef BufferRef(uint32_t /*buffer_index*/) const override {
+    return TransferRef::HostBytes(const_cast<char*>(&anchor_), 1, mori::io::MemoryLocationType::GPU,
+                                  device_);
+  }
+  std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override {
+    if (!full_) return MockBackend::BatchAllocate(entries);
+    std::vector<AllocateResult> results(entries.size());
+    for (auto& result : results) result.outcome = AllocateOutcome::kFailedNoSpace;
+    return results;
+  }
+
+ private:
+  int device_;
+  bool full_;
+  char anchor_ = 0;
+};
+
+// A policy that returns the same backends, in the order given, for every key.
+class FixedOrderPolicy final : public PoolPolicy {
+ public:
+  explicit FixedOrderPolicy(std::vector<std::string> names) : names_(std::move(names)) {}
+  std::vector<uint32_t> PutOrder(const BackendRegistry& backends,
+                                 const PoolPlacementRequest&) const override {
+    std::vector<uint32_t> order;
+    for (const auto& name : names_) order.push_back(backends.BackendId(backends.Get(name)));
+    return order;
+  }
+  std::vector<uint32_t> ReadOrder(const BackendRegistry& backends) const override {
+    return AllBackendIds(backends);
+  }
+
+ private:
+  std::vector<std::string> names_;
+};
+
+PoolPlacementRequest HbmPutFromGpu(std::string key, int device) {
+  PoolPlacementRequest request = PutRequest(std::move(key));
+  request.tier = TierType::HBM;
+  request.preferred_device = device;
+  return request;
+}
+
 // LocalCopyEngine whose next `failures` copies fail.
 class FailingEngine final : public TransferEngine {
  public:
@@ -677,6 +727,62 @@ TEST(PeerPool, WeightedPolicyPlacesNewKeysOnMultipleBackends) {
   EXPECT_GT(on_a, 0u);
   EXPECT_GT(on_b, 0u);
   pool.BatchAbort(slots);
+}
+
+// One node with an HBM pool on each GPU: a key whose data is on GPU 2 goes to
+// the pool on GPU 2, whatever its hash would have picked.
+TEST(PeerPool, HbmPutGoesToThePoolOnTheSourceGpu) {
+  BackendRegistry registry;
+  for (int device = 0; device < 4; ++device) {
+    ASSERT_TRUE(
+        registry.Register("hbm@" + std::to_string(device), std::make_unique<GpuBackend>(device)));
+  }
+  PeerPool pool(&registry, MakeWeightedPlacementPolicy(
+                               {{"hbm@0", 1}, {"hbm@1", 1}, {"hbm@2", 1}, {"hbm@3", 1}}));
+
+  std::vector<PoolPlacementRequest> from_gpu2, no_preference;
+  for (size_t i = 0; i < 64; ++i) {
+    from_gpu2.push_back(HbmPutFromGpu("on-source-" + std::to_string(i), 2));
+    no_preference.push_back(HbmPutFromGpu("by-hash-" + std::to_string(i), -1));
+  }
+  const uint32_t on_gpu2 = registry.BackendId(registry.Get("hbm@2"));
+  for (const auto& result : pool.BatchAllocate(from_gpu2)) {
+    ASSERT_EQ(result.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+    EXPECT_EQ(result.backend_id, on_gpu2);
+  }
+  // Without a source GPU the keys still spread by hash.
+  size_t elsewhere = 0;
+  for (const auto& result : pool.BatchAllocate(no_preference)) {
+    ASSERT_EQ(result.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+    if (result.backend_id != on_gpu2) ++elsewhere;
+  }
+  EXPECT_GT(elsewhere, 0u);
+}
+
+// The pool on the source GPU is a preference, not a requirement.
+TEST(PeerPool, HbmPutFallsBackWhenThePoolOnTheSourceGpuIsFull) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("hbm@0", std::make_unique<GpuBackend>(0)));
+  ASSERT_TRUE(registry.Register("hbm@1", std::make_unique<GpuBackend>(1, /*full=*/true)));
+  PeerPool pool(&registry, MakeWeightedPlacementPolicy({{"hbm@0", 1}, {"hbm@1", 1}}));
+
+  auto result = pool.BatchAllocate({HbmPutFromGpu("spills", 1)}).front();
+  EXPECT_EQ(result.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_EQ(result.backend_id, registry.BackendId(registry.Get("hbm@0")));
+}
+
+// It reorders equals only: a pool the policy put behind another medium stays
+// behind it.
+TEST(PeerPool, SourceGpuDoesNotLiftAPoolOverAnEarlierMedium) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("hbm@1", std::make_unique<GpuBackend>(1)));
+  PeerPool pool(&registry,
+                std::make_unique<FixedOrderPolicy>(std::vector<std::string>{"dram", "hbm@1"}));
+
+  auto result = pool.BatchAllocate({HbmPutFromGpu("stays", 1)}).front();
+  EXPECT_EQ(result.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_EQ(result.backend_id, registry.BackendId(registry.Get("dram")));
 }
 
 TEST(PeerPool, WeightedPolicyFallsBackWhenPrimaryHasNoSpace) {
