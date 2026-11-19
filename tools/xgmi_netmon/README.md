@@ -21,6 +21,13 @@ ctest --test-dir build-xgmi          # -DXGMI_NETMON_TSAN=ON for a ThreadSanitiz
 
 `build-xgmi/xgmi-netmon` links libstdc++ statically, so it can be copied to other hosts.
 
+Unlike `ainic-netmon`, `xgmi-netmon` is not part of the top-level CMake build, is not in the wheel
+and has no `mori` entry point: build it with the commands above and copy the binary. This is
+standalone for now, not a final decision: shipping it like `ainic-netmon` (a top-level CMake
+option, the binary in the wheel, an entry point) changes the packaging files that #1000 also
+changes, so it is better done once #1000 is merged. CI builds the tool and runs its unit tests
+(`.github/workflows/xgmi-netmon.yml`).
+
 ## Use
 
 ```
@@ -109,6 +116,10 @@ with a partial record; `import` drops it. A recorder that died leaves `status: r
   format, one JSON line per series (as ainic-netmon), so labels are sent once per request.
 
 ## Dashboard
+
+Open it in Grafana through Dashboards, folder `netmon`, `xgmi-netmon` (the home page of the shared
+stack is the NIC overview, which does not link to it). `xgmi.json` is written by hand, not
+generated: edit the JSON itself.
 
 Pick experiment, host, GPU and two variables:
 
