@@ -196,6 +196,16 @@ def _cmd_netmon(rest: List[str]) -> int:
     return netmon_entry.run(rest)
 
 
+def _cmd_xgmi_netmon(rest: List[str]) -> int:
+    """``mori xgmi-netmon ...``: the xgmi-netmon recorder (``--path`` prints its location)."""
+    from . import xgmi_netmon_entry
+
+    if rest[:1] == ["--path"]:
+        print(xgmi_netmon_entry.binary_path())
+        return 0
+    return xgmi_netmon_entry.run(rest)
+
+
 def _cmd_netmon_report(rest: List[str]) -> int:
     from . import netmon_entry
 
@@ -237,6 +247,10 @@ _COMMANDS = {
         _cmd_netmon_import,
         "import netmon recordings into VictoriaMetrics (same as `ainic-netmon-import`)",
     ),
+    "xgmi-netmon": (
+        _cmd_xgmi_netmon,
+        "XGMI bandwidth recorder (same as `xgmi-netmon`)",
+    ),
     "version": (_cmd_version, "print mori version"),
 }
 
@@ -259,6 +273,7 @@ def _print_usage() -> None:
             "  source $(mori setup --path)  # configure NICs AND export MORI_RDMA_SL/TC",
             "  mori path check              # print path to env_check.sh",
             "  mori netmon record -o DIR -d 60s   # record AINIC counters (see tools/netmon)",
+            "  mori xgmi-netmon record -o DIR -d 60s   # record XGMI bandwidth (see tools/xgmi_netmon)",
         ]
     )
     print("\n".join(lines))

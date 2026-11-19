@@ -21,12 +21,12 @@ ctest --test-dir build-xgmi          # -DXGMI_NETMON_TSAN=ON for a ThreadSanitiz
 
 `build-xgmi/xgmi-netmon` links libstdc++ statically, so it can be copied to other hosts.
 
-Unlike `ainic-netmon`, `xgmi-netmon` is not part of the top-level CMake build, is not in the wheel
-and has no `mori` entry point: build it with the commands above and copy the binary. This is
-standalone for now, not a final decision: shipping it like `ainic-netmon` (a top-level CMake
-option, the binary in the wheel, an entry point) changes the packaging files that #1000 also
-changes, so it is better done once #1000 is merged. CI builds the tool and runs its unit tests
-(`.github/workflows/xgmi-netmon.yml`).
+Like `ainic-netmon`, it ships in the mori wheel: the top-level CMake builds it
+(`BUILD_XGMI_NETMON=ON`, the default; `BUILD_XGMI_NETMON=OFF` leaves it out), and the wheel has
+the binary as `mori/bin/xgmi-netmon` with two entry points, `xgmi-netmon ...` and
+`mori xgmi-netmon ...` (`mori xgmi-netmon --path` prints the binary's location). Both run the
+binary built from this directory, so everything below applies to either. The unit tests run in CI
+with those of `ainic-netmon` (`.github/workflows/netmon.yml`).
 
 ## Use
 
