@@ -28,22 +28,14 @@
 // descriptor; host proxy threads run the callbacks, which post ibverbs work
 // requests on host-created RC QPs, proxyQpsPerPeer per (proxy thread, peer),
 // on the PD that owns the cco window MRs. Keys and remote addresses are
-// resolved on the GPU exactly like ccoGda (raddr = window offset + iovaBias), so
-// the proxy needs no key tables.
+// resolved on the GPU exactly like ccoGda (raddr = window offset + iovaBias),
+// so the proxy needs no key tables.
 //
 // Queues: ccoProxy<SPSCD2HQueue> (default) indexes the DevComm's SPSC pool,
 // ccoProxy<MPSCD2HQueue> its MPSC pool; each pool is one KIWI invoke context.
-// Constructing a ccoProxy<Q> whose pool is empty traps (the DevComm was created
-// with a zero proxySpscQueueCount / proxyMpscQueueCount). An MPSC queueIndex is
-// taken modulo the pool size, like ccoGda's contextIndex. An SPSC queueIndex
-// must be in [0, proxySpscQueueCount) and traps otherwise: wrapping would let
-// two wavefronts share an SPSC queue, which silently corrupts it.
-//
-// Usage errors trap instead of corrupting a queue or faulting: a ccoProxy<Q>
-// on an empty pool, an SPSC queueIndex out of range, and a push from a
-// partial wavefront (below). Builds without NDEBUG also print the reason
-// first; release builds only trap, since an inlined device printf would add
-// registers to every kernel using ccoProxy.
+// An MPSC queueIndex is taken modulo the pool size, like ccoGda's
+// contextIndex; an SPSC one must be in [0, proxySpscQueueCount), since
+// wrapping would let two wavefronts share an SPSC queue and corrupt it.
 // Only one wavefront may use an SPSC queue at a time: its producer state lives
 // in the context's device handle, loaded by the constructor and saved back by
 // the destructor (or release()). Handing an SPSC queue to another wavefront of
@@ -53,53 +45,38 @@
 // ccoProxy (__syncthreads() suffices within one block). Across kernel launches
 // stream order is enough.
 //
+// Usage errors trap instead of corrupting a queue or faulting: an empty pool,
+// an SPSC queueIndex out of range, a push from a partial wavefront and (builds
+// without NDEBUG) differing arguments across the issuing lanes. Builds without
+// NDEBUG print the reason first; release builds only trap, since an inlined
+// device printf would add registers to every kernel using ccoProxy.
+//
 // Ordering: ops pushed by one wavefront to one queue are popped in program
 // order and land on one QP per peer, so a put followed by a signal (or a put
 // carrying a signal) to the same peer through the same queue is delivered in
 // order -- the same guarantee ccoGda gives within one context. Different queues
 // are unordered, as different ccoGda contexts are.
 //
-// Remote signals land in the same slots ccoGda uses, so readSignal /
-// waitSignal / resetSignal read devComm.ibgda.signalBuf and need a DevComm
-// whose gdaConnectionType resolves to non-NONE (FULL / RAIL / CROSSNODE).
-// SignalInc / SignalAdd / WindowSignalAdd are NIC atomic fetch-adds.
-// SignalSet / WindowSignalSet (see ccoGda_SignalSet: one queue per slot,
-// increasing values) are 8-byte inline RDMA writes, for platforms where NIC
-// atomics into GPU memory fail; like any write-then-flag protocol they rely on
-// the NIC and PCIe placing one QP's writes in order (no relaxed ordering on the
-// windows: ccoDevCommCreate warns once per process when the window MRs get
-// relaxed ordering, i.e. MORI_IB_ENABLE_RELAXED_ORDERING=1 on a build whose
-// MR registration applies it).
+// Signals land in the ccoGda signal slots (devComm.ibgda.signalBuf), so the
+// DevComm's gdaConnectionType must resolve to non-NONE. SignalInc / SignalAdd /
+// WindowSignalAdd are NIC atomic fetch-adds; SignalSet / WindowSignalSet are
+// 8-byte inline RDMA writes for NICs whose atomics into GPU memory fail (see
+// ccoGda_SignalSet), and need window MRs without relaxed ordering.
 //
-// putValue() writes 1..8 bytes carried in the descriptor (an inline RDMA
-// write, no source buffer), optionally followed by a signal as put().
-//
-// flush() pushes a FLUSH and waits until every work request the queue posted
-// before that FLUSH has completed (remote ack), on every peer, so the source
-// buffers of earlier puts are reusable -- what ccoGda's flush() gives for its
-// context. It waits only for this queue. flush(peer) is flush() (covers every
-// peer). flush(ccoCoopBlock) flushes from wavefront 0 and from every other
-// wavefront whose handle pushed since its last completed flush, each on its
-// own handle's queue, then syncs the block: so after ccoCoopBlock ops (only
-// wavefront 0 pushes) it is one flush, and after wavefronts pushed through
-// handles of their own (e.g. ccoCoopWarp ops on per-wavefront SPSC queues) it
-// covers all of them.
-//
-// Flush counting: the proxy satisfies each queue's FLUSHes in queue order and
-// adds 1 to that queue's flushDone per FLUSH satisfied (it is the only writer).
-// A flush never needs its FLUSH's ring position: the caller takes a ticket t
-// from the queue's flushTicket counter right before pushing, and waits for
-// flushDone >= t (see flush()). An earlier FLUSH need not have been waited for.
+// Flush: the proxy satisfies each queue's FLUSHes in queue order and adds 1 to
+// that queue's flushDone per FLUSH satisfied (it is the only writer). A flush
+// takes a ticket t from the queue's flushTicket counter right before pushing
+// and waits for flushDone >= t, so it never needs its FLUSH's ring position
+// and an earlier FLUSH need not have been waited for.
 //
 // Failure: the DevComm fails for good at the first proxy error (see
 // ccoDevCommGetError): the proxy drops every later op and sets
-// ccoProxyFailedBit in each queue's flushDone. flush() then traps (printing
-// the reason first in builds without NDEBUG), flush(coop, timeoutCycles)
-// returns 2, waitSignal() traps within 256 polls, an SPSC push waiting for
-// ring space drops its op, and failed() returns true. Not covered: an MPSC
-// push waiting for ring space (only after a corrupted ring), and waitSignal()
-// for a peer that died while this DevComm posted nothing to it.
-// MORI_CCO_PROXY_ABORT_ON_ERROR=1 aborts the process at the first error instead.
+// ccoProxyFailedBit in each queue's flushDone. flush() then traps,
+// flush(coop, timeoutCycles) returns 2, waitSignal() traps within 256 polls,
+// an SPSC push waiting for ring space drops its op, and failed() returns true.
+// Not covered: an MPSC push waiting for ring space (only after a corrupted
+// ring), and waitSignal() for a peer that died while this DevComm posted
+// nothing to it.
 //
 // Fences: each put / putValue / signal does a system-scope release fence
 // before its push, so the data it sends (and every earlier store) is visible
@@ -111,34 +88,16 @@
 // Coop group from converged code, and the issuing wavefront (the calling
 // wavefront for ccoCoopWarp and ccoCoopLaneMasked, wavefront 0 -- linear
 // thread ids 0..63, also in 2-D and 3-D blocks -- for ccoCoopBlock) must have
-// all 64 lanes active: a KIWI push is wavefront-collective. A push from a partial wavefront traps (a compare
-// per push), and so does a ccoCoopLaneMasked call from a divergent branch such
-// as `if (i < n) put(..., ccoCoopLaneMasked{})`.
-// ccoCoopThread is rejected at compile time.
-//
-// ccoCoopWarp / ccoCoopBlock: the group issues one op. Every issuing lane must
-// pass identical arguments. Lane i writes word i of the descriptor, so
-// differing arguments would build a descriptor that mixes fields from
-// different lanes; that is a usage error, checked (print + trap) in builds
-// without NDEBUG only, and only across the issuing wavefront's lanes (with
-// ccoCoopBlock the other wavefronts' arguments are not read). (ccoGda only
-// reads thread_rank 0's arguments.)
-//
-// ccoCoopLaneMasked{active} (put / putValue / signal only; defined below):
-// per-thread ops. Each lane with `active` true issues its own op with its own
-// arguments; a lane with `active` false issues nothing, and its other arguments
-// are not read. The wavefront hands all of its lanes' ops to KIWI in one
-// lane-masked push, so they enter the queue in lane order (one queue for the
-// wavefront, so ordering is per wavefront as above). A put larger than
-// maxPutBytes is split as with the other Coops; the wavefront pushes the pieces
-// while any lane has more than one piece left, so lanes with smaller puts sit
-// those pushes out. One push of 64 put + signal ops takes 128 ring lines; a
-// push that needs more lines than the ring holds traps (KIWI), so rings for
-// lane-masked put + signal need proxyQueueCapacity >= 2 lines per active lane
-// (the default holds 4096). ThreadMode (ccoGda's per-thread aggregation hint)
-// has no effect: the push already batches the wavefront. flush takes no
-// ccoCoopLaneMasked: call flush() (ccoCoopWarp) from all 64 lanes; it does one
-// flush for the wavefront, which covers every lane's earlier ops.
+// all 64 lanes active: a KIWI push is wavefront-collective, so a
+// ccoCoopLaneMasked call from a divergent branch traps too. ccoCoopThread is
+// rejected at compile time. With ccoCoopWarp / ccoCoopBlock the group issues
+// one op and every issuing lane must pass identical arguments (lane i writes
+// word i of the descriptor); ccoGda reads only thread_rank 0's.
+// ccoCoopLaneMasked{active} (put / putValue / signal) issues one op per active
+// lane, all in one lane-masked push, so they enter the queue in lane order; a
+// put larger than maxPutBytes is split as with the other Coops, the wavefront
+// pushing while any lane has pieces left. ThreadMode has no effect. After
+// lane-masked ops, call flush() (ccoCoopWarp) from all 64 lanes.
 //
 // Requires a BUILD_CCO_PROXY build and a wave64 GFX9 target (KIWI push).
 
@@ -228,6 +187,18 @@ inline constexpr uint64_t ccoProxyFailedBit = 1ull << 63;
 
 #if defined(__HIPCC__)
 
+// Usage error or failed DevComm: print the message from the lanes where `who`
+// holds (builds without NDEBUG only; see the file comment), then trap.
+#ifndef NDEBUG
+#define CCO_PROXY_TRAP(who, ...)  \
+  do {                            \
+    if (who) printf(__VA_ARGS__); \
+    __builtin_trap();             \
+  } while (0)
+#else
+#define CCO_PROXY_TRAP(who, ...) __builtin_trap()
+#endif
+
 namespace impl {
 
 // Linear thread id in the block (x fastest): wavefront w holds ids
@@ -282,13 +253,14 @@ __device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, 
 // ccoDevCommCreate rejects proxy queues on such GPUs.
 __device__ inline void proxyCheckTarget() {
 #ifdef MORI_CCO_PROXY_PUSH_UNSUPPORTED
-#ifndef NDEBUG  // see the file comment
-  if (proxyLinearTid() == 0) {
-    printf("ccoProxy: unsupported GPU target; ccoProxy needs a wave64 gfx942/gfx950 GPU\n");
-  }
+  CCO_PROXY_TRAP(proxyLinearTid() == 0,
+                 "ccoProxy: unsupported GPU target; ccoProxy needs a wave64 gfx942/gfx950 GPU\n");
 #endif
-  __builtin_trap();
-#endif
+}
+
+// Whether this is the lowest active lane: the one lane that reports.
+__device__ inline bool proxyFirstLane(uint64_t lanes = __builtin_amdgcn_read_exec()) {
+  return __lane_id() == static_cast<unsigned>(__builtin_ctzll(lanes));
 }
 
 }  // namespace impl
@@ -514,15 +486,10 @@ struct ccoProxy {
     impl::proxyCheckTarget();  // before the exec check, which misfires on wave32
     const uint64_t exec = __builtin_amdgcn_read_exec();
     if (__builtin_expect(exec != ~uint64_t{0}, 0)) {
-#ifndef NDEBUG  // see the file comment
-      if (__lane_id() == static_cast<unsigned>(__builtin_ctzll(exec))) {
-        printf(
-            "ccoProxy: put/signal/flush called with a partial wavefront (exec 0x%llx); "
-            "all 64 lanes of the issuing wavefront must call it\n",
-            static_cast<unsigned long long>(exec));
-      }
-#endif
-      __builtin_trap();  // partial wavefront: all 64 lanes must push
+      CCO_PROXY_TRAP(impl::proxyFirstLane(exec),
+                     "ccoProxy: put/signal/flush called with a partial wavefront (exec 0x%llx); "
+                     "all 64 lanes of the issuing wavefront must call it\n",
+                     static_cast<unsigned long long>(exec));
     }
 #ifndef NDEBUG  // see the file comment
     if constexpr (!kLaneMasked) (checkUniformDesc(op, desc), ...);
@@ -567,13 +534,10 @@ struct ccoProxy {
     }
     const uint64_t badLanes = __ballot(badWord >= 0);
     if (__builtin_expect(badLanes != 0, 0)) {
-      if (__lane_id() == static_cast<unsigned>(__builtin_ctzll(badLanes))) {
-        printf(
-            "ccoProxy: op %u: lane %u passed arguments that differ from lane 0's (descriptor "
-            "word %d); every issuing lane must pass identical arguments\n",
-            static_cast<unsigned>(op), __lane_id(), badWord);
-      }
-      __builtin_trap();  // lanes passed differing arguments
+      CCO_PROXY_TRAP(impl::proxyFirstLane(badLanes),
+                     "ccoProxy: op %u: lane %u passed arguments that differ from lane 0's "
+                     "(descriptor word %d); every issuing lane must pass identical arguments\n",
+                     static_cast<unsigned>(op), __lane_id(), badWord);
     }
   }
 #endif
@@ -638,25 +602,18 @@ __device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIn
   }
   const int poolSize = kSpsc ? comm.proxy.numSpscQueues : comm.proxy.numMpscQueues;
   if (__builtin_expect(poolSize <= 0, 0)) {
-#ifndef NDEBUG  // see the file comment
-    if (impl::proxyLinearTid() == 0) {
-      printf("ccoProxy: the DevComm has no %s proxy queues (set %s in ccoDevCommRequirements)\n",
-             kSpsc ? "SPSC" : "MPSC", kSpsc ? "proxySpscQueueCount" : "proxyMpscQueueCount");
-    }
-#endif
-    __builtin_trap();  // this DevComm has no queues in this pool
+    CCO_PROXY_TRAP(impl::proxyLinearTid() == 0,
+                   "ccoProxy: the DevComm has no %s proxy queues (set %s in "
+                   "ccoDevCommRequirements)\n",
+                   kSpsc ? "SPSC" : "MPSC", kSpsc ? "proxySpscQueueCount" : "proxyMpscQueueCount");
   }
   if constexpr (kSpsc) {
     // No wrap: two wavefronts sharing an SPSC queue would write the same ring
     // lines and corrupt it. One unsigned compare also catches a negative index.
     if (__builtin_expect(static_cast<uint32_t>(queueIndex) >= static_cast<uint32_t>(poolSize), 0)) {
-#ifndef NDEBUG  // see the file comment
-      if (__lane_id() == static_cast<unsigned>(__builtin_ctzll(__builtin_amdgcn_read_exec()))) {
-        printf("ccoProxy: SPSC queueIndex %d out of range [0, %d) (proxySpscQueueCount)\n",
-               queueIndex, poolSize);
-      }
-#endif
-      __builtin_trap();  // SPSC queue index out of range
+      CCO_PROXY_TRAP(impl::proxyFirstLane(),
+                     "ccoProxy: SPSC queueIndex %d out of range [0, %d) (proxySpscQueueCount)\n",
+                     queueIndex, poolSize);
     }
     queueId = static_cast<uint32_t>(queueIndex);
   } else {
@@ -849,13 +806,9 @@ __device__ inline void ccoProxy<Queue>::flush(Coop coop) {
   coop.sync();
   if (flushingWave<Coop>()) {
     if (__builtin_expect(flushIssue</*kTimeout=*/false>(0) != 0, 0)) {
-#ifndef NDEBUG  // see the file comment
-      if (__lane_id() == 0) {
-        printf(
-            "ccoProxy: flush: the DevComm failed; see the host's stderr or ccoDevCommGetError\n");
-      }
-#endif
-      __builtin_trap();  // the DevComm failed
+      CCO_PROXY_TRAP(__lane_id() == 0,
+                     "ccoProxy: flush: the DevComm failed; see the host's stderr or "
+                     "ccoDevCommGetError\n");
     }
     unflushed = false;
   }
@@ -897,18 +850,17 @@ __device__ inline void ccoProxy<Queue>::waitSignalOrTrap(ccoGdaSignal_t signalId
       break;
     }
     if (polls % 256 == 0 && failed()) {
-#ifndef NDEBUG  // see the file comment
-      printf(
-          "ccoProxy: waitSignal: the DevComm failed; see the host's stderr or "
-          "ccoDevCommGetError\n");
-#endif
-      __builtin_trap();  // the DevComm failed
+      CCO_PROXY_TRAP(true,
+                     "ccoProxy: waitSignal: the DevComm failed; see the host's stderr or "
+                     "ccoDevCommGetError\n");
     }
     asm volatile("" ::: "memory");
   }
   // Data the signal covers is read after it (system scope: the NIC wrote it).
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
 }
+
+#undef CCO_PROXY_TRAP
 
 #endif  // defined(__HIPCC__)
 

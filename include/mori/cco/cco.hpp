@@ -450,7 +450,7 @@ struct ccoDevComm {
 typedef ccoDevComm* ccoDevComm_t;
 static_assert(std::is_trivially_copyable<ccoDevComm>::value,
               "ccoDevComm must be trivially copyable for hipMemcpy");
-// Kernels, JIT bitcode and python/mori/cco/cco.pxd snapshot this layout.
+// Kernels and the JIT bitcode snapshot this layout.
 static_assert(sizeof(ccoProxyContext) == 56 && offsetof(ccoProxyContext, flushDone) == 24 &&
                   offsetof(ccoProxyContext, flushTicket) == 32 &&
                   offsetof(ccoProxyContext, engine) == 48,
@@ -545,7 +545,7 @@ struct ccoDevCommRequirements {
                             // ccoProxy lane-masked ops (ccoCoopLaneMasked) need up to 2
                             // lines per active lane (128 for a full wavefront of
                             // put+signal); smaller rings trap.
-  // RC QPs per (proxy thread, peer); 0 = MORI_CCO_PROXY_QPS_PER_PEER, else 4.
+  // RC QPs per (proxy thread, peer); 0 = 4.
   // Each queue posts on one of its thread's QPs per peer (round robin over the
   // thread's queues); a thread creates no more than it owns queues. Several QPs
   // let NICs that serve each QP serially (e.g. ionic) run a thread's queues in
@@ -1081,8 +1081,7 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
 
 // A DevComm fails for good at its first ccoProxy error: the process survives,
 // ccoProxy::flush traps (or returns 2), and the DevComm must be destroyed and
-// created again. Other DevComms are unaffected. MORI_CCO_PROXY_ABORT_ON_ERROR=1
-// aborts the process at the first error instead.
+// created again. Other DevComms are unaffected.
 enum ccoDevCommErrorCode {
   CCO_DEVCOMM_OK = 0,
   CCO_PROXY_ERR_BAD_REQUEST = 1,  // an op the proxy cannot post (no QP to the peer, bad descriptor)

@@ -368,15 +368,13 @@ struct ProxyQp {
 
 class ProxyWorker {
  public:
-  ProxyWorker(int id, int worldSize, int qpsPerPeer, int rank, ProxyErrorState* err,
-              bool abortOnError)
+  ProxyWorker(int id, int worldSize, int qpsPerPeer, int rank, ProxyErrorState* err)
       : qps(static_cast<size_t>(worldSize) * qpsPerPeer),
         worldSize_(worldSize),
         qpsPerPeer_(qpsPerPeer),
         id_(id),
         rank_(rank),
-        err_(err),
-        abortOnError_(abortOnError) {}
+        err_(err) {}
 
   // QP `slot` of this thread to `peer`.
   ProxyQp& Qp(int peer, int slot) { return qps[static_cast<size_t>(peer) * qpsPerPeer_ + slot]; }
@@ -520,11 +518,6 @@ class ProxyWorker {
   void Raise(ccoDevCommError e, const std::string& what) {
     e.rank = rank_;
     std::snprintf(e.message, sizeof(e.message), "%s", what.c_str());
-    if (abortOnError_) {
-      std::fprintf(stderr, "%s\n",
-                   DescribeError(e, "aborting (MORI_CCO_PROXY_ABORT_ON_ERROR)").c_str());
-      std::abort();
-    }
     int expected = 0;
     if (err_->state.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
       err_->info = e;
@@ -582,18 +575,6 @@ class ProxyWorker {
     return nullptr;
   }
 
-  // putValue writes 1..8 bytes; raises BAD_REQUEST otherwise.
-  bool ValueSized(const ccoProxyPutValueDesc& d, ccoProxyOp op) {
-    if (d.bytes >= 1 && d.bytes <= kInlineBytes) return true;
-    ccoDevCommError e =
-        MakeError(CCO_PROXY_ERR_BAD_REQUEST, static_cast<int>(d.peer), cur_->index, op);
-    e.raddr = d.raddr;
-    e.rkey = d.rkey;
-    e.len = d.bytes;
-    Raise(e, "putValue size not in 1..8 bytes");
-    return false;
-  }
-
   // Signal slots (atomic or set) are 8-byte aligned; raises BAD_REQUEST otherwise.
   bool SignalAligned(const ccoProxySignalDesc& d, ccoProxyOp op) {
     if ((d.raddr & 7) == 0) return true;
@@ -634,15 +615,14 @@ class ProxyWorker {
   void OnPutValue(const ccoProxyPutValueDesc& d) {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.peer, ccoProxyOpPutValue);
-    if (qp == nullptr || !ValueSized(d, ccoProxyOpPutValue) || !Reserve(*qp, 1)) return;
+    if (qp == nullptr || !Reserve(*qp, 1)) return;
     cur_->lastSeq[d.peer] = AddInline(*qp, d.raddr, d.rkey, d.value, d.bytes);
   }
 
   void OnPutValueSignal(const ccoProxyPutValueSignalDesc& d) {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.put.peer, ccoProxyOpPutValueSignal);
-    if (qp == nullptr || !ValueSized(d.put, ccoProxyOpPutValueSignal) ||
-        !SignalAligned(d.signal, ccoProxyOpPutValueSignal) || !Reserve(*qp, 2)) {
+    if (qp == nullptr || !SignalAligned(d.signal, ccoProxyOpPutValueSignal) || !Reserve(*qp, 2)) {
       return;
     }
     AddInline(*qp, d.put.raddr, d.put.rkey, d.put.value, d.put.bytes);
@@ -846,7 +826,6 @@ class ProxyWorker {
   int id_;
   int rank_;
   ProxyErrorState* err_;          // the engine's
-  bool abortOnError_;             // MORI_CCO_PROXY_ABORT_ON_ERROR: abort at the first error
   bool failed_{false};            // drain-and-drop
   OwnedQueue* cur_{nullptr};      // queue whose callbacks are running
   std::vector<int> activePeers_;  // peers with QPs
@@ -900,19 +879,6 @@ class ccoProxyEngine {
 
 namespace {
 
-// Throws unless qp accepts kInlineBytes of inline data (putValue, SignalSet).
-void CheckInlineCap(ibv_qp* qp) {
-  ibv_qp_attr attr{};
-  ibv_qp_init_attr init{};
-  const int ret = ibv_query_qp(qp, &attr, IBV_QP_CAP, &init);
-  if (ret != 0) throw std::runtime_error(std::string("ibv_query_qp failed: ") + strerror(ret));
-  if (attr.cap.max_inline_data < kInlineBytes) {
-    throw std::runtime_error("proxy QP max_inline_data " +
-                             std::to_string(attr.cap.max_inline_data) + " < " +
-                             std::to_string(kInlineBytes) + " (putValue / SignalSet)");
-  }
-}
-
 // Per-rank setup result, Allgather'd before the QP exchange.
 struct ProxyCreateInfo {
   int32_t ok;  // this rank's local setup succeeded
@@ -930,7 +896,6 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   const int worldSize = bootNet->GetWorldSize();
   const int rank = bootNet->GetLocalRank();
   engine->rank = rank;
-  const bool abortOnError = env::IsEnvVarEnabled("MORI_CCO_PROXY_ABORT_ON_ERROR");
   const int numSpsc = config.numSpscQueues;
   const int numMpsc = config.numMpscQueues;
   // Summed in 64 bits and validated below before any use as an int.
@@ -1019,8 +984,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
         engine->ibv->RegisterRdmaMemoryRegion(engine->scratch, kScratchStride * numThreads);
 
     for (int t = 0; t < numThreads; t++) {
-      auto w = std::make_unique<ProxyWorker>(t, worldSize, threadQps[t], rank, &engine->err,
-                                             abortOnError);
+      auto w = std::make_unique<ProxyWorker>(t, worldSize, threadQps[t], rank, &engine->err);
       w->scratchAddr = reinterpret_cast<uint64_t>(engine->scratch) + t * kScratchStride;
       w->scratchLkey = scratchMr.lkey;
       engine->workers.push_back(std::move(w));
@@ -1127,11 +1091,6 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       for (int i = 0; i < qpsPerRank; i++) {
         const size_t h = static_cast<size_t>(peer) * qpsPerRank + i;
         engine->ibv->ConnectEndpoint(local[h], remote[h], i);
-      }
-      for (int t = 0; t < numThreads; t++) {
-        for (int slot = 0; slot < threadQps[t]; slot++) {
-          CheckInlineCap(engine->workers[t]->Qp(peer, slot).ep.ibvHandle.qp);
-        }
       }
     }
 

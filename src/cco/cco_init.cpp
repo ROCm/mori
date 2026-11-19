@@ -1970,10 +1970,9 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
   const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
   const int proxyThreads = reqsHaveProxy ? std::max(reqs->proxyThreadCount, 0) : 0;
-  // QPs per (proxy thread, peer): the field, else MORI_CCO_PROXY_QPS_PER_PEER, else 4.
-  const int proxyQpsPerPeer = (reqsHaveProxy && reqs->proxyQpsPerPeer > 0)
-                                  ? reqs->proxyQpsPerPeer
-                                  : env::GetPositiveIntOr("MORI_CCO_PROXY_QPS_PER_PEER", 4);
+  // QPs per (proxy thread, peer): the field, else 4.
+  const int proxyQpsPerPeer =
+      (reqsHaveProxy && reqs->proxyQpsPerPeer > 0) ? reqs->proxyQpsPerPeer : 4;
   const int64_t proxyQueues = int64_t{proxySpsc} + int64_t{proxyMpsc};  // may exceed INT_MAX
   std::string proxyError;
 #ifdef MORI_CCO_PROXY
@@ -2010,10 +2009,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
                  std::to_string(q.threads) + " threads and " + std::to_string(q.qpsPerPeer) +
                  " QPs per peer";
         };
-        proxyError =
-            "ranks disagree on the ccoProxy requirements (proxyQpsPerPeer includes "
-            "MORI_CCO_PROXY_QPS_PER_PEER): rank 0 asks for " +
-            describe(all[0]) + ", rank " + std::to_string(r) + " for " + describe(all[r]);
+        proxyError = "ranks disagree on the ccoProxy requirements: rank 0 asks for " +
+                     describe(all[0]) + ", rank " + std::to_string(r) + " for " + describe(all[r]);
       } else if (proxyQueues > 0 && !all[r].targetOk) {
         proxyError = "ccoProxy queues need a gfx942/gfx950 GPU on every rank; rank " +
                      std::to_string(r) + " has another";
