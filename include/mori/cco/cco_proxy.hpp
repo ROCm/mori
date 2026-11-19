@@ -44,7 +44,8 @@
 // destructor) then an agent-scope release (e.g. a flag store) in the old owner,
 // and an agent-scope acquire of it before the new owner constructs its
 // ccoProxy (__syncthreads() suffices within one block). Across kernel launches
-// stream order is enough.
+// stream order is enough; concurrent kernels need different SPSC queues. A
+// handle that never pushes saves nothing, so readers may share a queue index.
 //
 // Usage errors trap instead of corrupting a queue or faulting: an empty pool,
 // an SPSC queueIndex out of range, a push from a partial wavefront and (builds
@@ -65,8 +66,8 @@
 // resolves to non-NONE; the engine rejects a slot id >= gdaSignalCount
 // (BAD_REQUEST). SignalInc / SignalAdd / WindowSignalAdd are NIC atomic
 // fetch-adds; SignalSet / WindowSignalSet are 8-byte inline RDMA writes for NICs
-// whose atomics into GPU memory fail (see ccoGda_SignalSet), and need window MRs
-// without relaxed ordering.
+// whose atomics into GPU memory fail (see ccoGda_SignalSet), and, like a putValue
+// used as a flag, need window MRs without relaxed ordering.
 //
 // Flush: the proxy satisfies each queue's FLUSHes in queue order and adds 1 to
 // that queue's flushDone per FLUSH satisfied (it is the only writer). A flush
@@ -378,7 +379,7 @@ struct ccoProxy {
             ccoProxyFailedBit) != 0;
   }
 
-  // v1: identical to flush() -- covers every peer.
+  // Waits at least for `peer`'s ops; today it waits for every peer, as flush().
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
   __device__ inline void flush(int peer, Coop coop = Coop{}) {
     (void)peer;

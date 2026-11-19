@@ -438,7 +438,7 @@ DevComm with proxy queues runs busy-polling proxy threads.
 | `proxySpscQueueCount` / `proxy_spsc_queue_count` | SPSC queues (one wavefront at a time per queue) |
 | `proxyMpscQueueCount` / `proxy_mpsc_queue_count` | MPSC queues (any number of wavefronts) |
 | `proxyThreadCount` / `proxy_thread_count` | host proxy threads (0 = 4), capped at the queue count |
-| `proxyQueueCapacity` / `proxy_queue_capacity` | ring size in 64-byte lines, power of two (0 = 4096) |
+| `proxyQueueCapacity` / `proxy_queue_capacity` | ring size in 64-byte lines, power of two (0 = 4096); a `ccoCoopLaneMasked` op takes up to 2 lines per active lane, and smaller rings trap |
 | `proxyQpsPerPeer` / `proxy_qps_per_peer` | RC QPs per (proxy thread, peer) (0 = 4) |
 | `proxyConnectionType` / `proxy_connection_type` | peers that get proxy QPs, a `CCO_GDA_CONNECTION_*` value, or `CCO_PROXY_CONNECTION_FOLLOW_GDA` / `PROXY_CONNECTION_FOLLOW_GDA` (-1, the default) to follow `gdaConnectionType` |
 
@@ -450,7 +450,9 @@ both get QPs to the same peers.
 For a proxy-only DevComm, set `gdaConnectionType = CCO_GDA_CONNECTION_NONE`
 and `proxyConnectionType` to the peers you need; no GDA QPs are created. The
 proxy uses the GDA signal slots (`gdaSignalCount`), which exist whenever
-either connection is non-NONE. The GPU's VRAM must be host-mapped (large
+either connection is non-NONE. Of the `gda*` fields it uses only
+`gdaSignalCount`: `gdaContextCount` sizes the GDA QPs, and `gdaCounterCount`
+reserves counter slots ccoProxy does not use. The GPU's VRAM must be host-mapped (large
 BAR). Each DevComm with proxy queues starts its own busy-polling threads, so
 prefer one per communicator. Several QPs per peer let NICs that
 serve each QP serially run a thread's queues in parallel.
@@ -499,7 +501,10 @@ declaration.
   destructor (or `release()`) saves its state; to hand the queue to another
   wavefront in the same kernel, order the old owner's release before the new
   owner's constructor (`__syncthreads()` within a block). Across launches,
-  stream order is enough.
+  stream order is enough; kernels that may run concurrently (other streams)
+  need different SPSC queues. A handle that never pushes (only `readSignal`,
+  `waitSignal`, `resetSignal`, `failed`) saves nothing, so it may use any
+  queue index, including one another wavefront is pushing to.
 
 ### Signal slots
 
@@ -536,7 +541,8 @@ With `SignalInc`, `waitSignal(slot, n)` waits for `n` more signals. With
   GDA contexts are, and so are `ccoGda` and `ccoProxy` ops, even to the same peer.
 - `SignalSet` / `WindowSignalSet`: every set of a slot goes through one queue,
   values only increase, and the slot gets no `SignalInc` / `SignalAdd`. The
-  set is a plain RDMA write, so the data before it is visible first only if
+  set is a plain RDMA write, as is a `putValue` used as a flag, so the data
+  before it is visible first only if
   writes reach GPU memory in the order the NIC issued them: the window MRs
   must not use relaxed ordering (`ccoDevCommCreate` warns when
   `MORI_IB_ENABLE_RELAXED_ORDERING=1` applies it), and the NIC-to-GPU path

@@ -202,6 +202,7 @@ cdef class DevCommRequirements:
 
     @property
     def proxy_spsc_queue_count(self):
+        """SPSC proxy queues (one wavefront at a time per queue); 0 = none."""
         return self._reqs.proxySpscQueueCount
 
     @proxy_spsc_queue_count.setter
@@ -210,6 +211,7 @@ cdef class DevCommRequirements:
 
     @property
     def proxy_mpsc_queue_count(self):
+        """MPSC proxy queues (any number of wavefronts); 0 = none."""
         return self._reqs.proxyMpscQueueCount
 
     @proxy_mpsc_queue_count.setter
@@ -218,6 +220,7 @@ cdef class DevCommRequirements:
 
     @property
     def proxy_thread_count(self):
+        """Host proxy threads (0 = 4), capped at the total queue count."""
         return self._reqs.proxyThreadCount
 
     @proxy_thread_count.setter
@@ -226,6 +229,7 @@ cdef class DevCommRequirements:
 
     @property
     def proxy_queue_capacity(self):
+        """Ring size in 64-byte lines, a power of two (0 = 4096)."""
         return self._reqs.proxyQueueCapacity
 
     @proxy_queue_capacity.setter
@@ -234,6 +238,7 @@ cdef class DevCommRequirements:
 
     @property
     def proxy_qps_per_peer(self):
+        """RC QPs per (proxy thread, peer) (0 = 4)."""
         return self._reqs.proxyQpsPerPeer
 
     @proxy_qps_per_peer.setter
