@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>UMBP Runtime-Tunable Environment Variables &mdash; MORI development (e73ccc53) documentation</title>
+  <title>UMBP Runtime-Tunable Environment Variables &mdash; MORI development (11cb36a3) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=b60e43e2"></script>
+      <script src="_static/documentation_options.js?v=7277af0c"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -314,7 +314,7 @@ that has loaded <code class="docutils literal notranslate"><span class="pre">lib
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_SSD_READ_LEASE_MS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">3000</span></code></p></td>
 <td><p>ms</p></td>
-<td><p>Read lease of an SSD backend. It has to cover an SSD read plus the RDMA, not just the RDMA, and it is also how long a staging page stays claimed, so it sets the backend’s read concurrency against its fixed staging arena: shortening it frees pages sooner and costs read coalescing. Read once per process; <code class="docutils literal notranslate"><span class="pre">min_allowed=1</span></code>.</p></td>
+<td><p>Read lease of an SSD backend. It has to cover an SSD read plus the RDMA, not just the RDMA, and it is also how long a staging page stays claimed, so it sets the backend’s read concurrency against its fixed staging arena: shortening it frees pages sooner and costs read coalescing. It is an upper bound for a remote reader that reports back (<code class="docutils literal notranslate"><span class="pre">UMBP_REMOTE_READ_VALIDATE</span></code>): its staging is released when it reports, and the full lease is spent only on a reader that never does (an older build, a reader that died, validation switched off). Read once per process; <code class="docutils literal notranslate"><span class="pre">min_allowed=1</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_RESOLVE_BUSY_TIMEOUT_MS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">30000</span></code></p></td>
@@ -324,7 +324,7 @@ that has loaded <code class="docutils literal notranslate"><span class="pre">lib
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_REMOTE_READ_VALIDATE</span></code></p></td>
 <td><p>on</p></td>
 <td><p>bool</p></td>
-<td><p>Check-after-read for remote gets (#749). The peer’s read lease (<code class="docutils literal notranslate"><span class="pre">UMBP_DRAM_READ_LEASE_MS</span></code> / <code class="docutils literal notranslate"><span class="pre">UMBP_SSD_READ_LEASE_MS</span></code>) is only a timer, so after each remote batch’s RDMA read the reader sends one <code class="docutils literal notranslate"><span class="pre">ValidateReads</span></code> RPC asking whether every copy it read is still the one the peer resolved; a copy that was freed or refilled meanwhile becomes a miss instead of another key’s bytes, counted in <code class="docutils literal notranslate"><span class="pre">mori_umbp_client_remote_get_dropped_total{reason=&quot;stale&quot;}</span></code>. Fails closed: an RPC error drops the batch’s reads as <code class="docutils literal notranslate"><span class="pre">reason=&quot;unverified&quot;</span></code>. Skipped for a peer that stamps no generations (an older build). The RPC deadline is <code class="docutils literal notranslate"><span class="pre">UMBP_RESOLVE_BUSY_TIMEOUT_MS</span></code>. <code class="docutils literal notranslate"><span class="pre">0</span></code> disables the check — meant for measuring its cost, since it reopens the stale-read window. Read once per process.</p></td>
+<td><p>Check-after-read for remote gets (#749). The peer’s read lease (<code class="docutils literal notranslate"><span class="pre">UMBP_DRAM_READ_LEASE_MS</span></code> / <code class="docutils literal notranslate"><span class="pre">UMBP_SSD_READ_LEASE_MS</span></code>) is only a timer, so after each remote batch’s RDMA read the reader sends one <code class="docutils literal notranslate"><span class="pre">ValidateReads</span></code> RPC asking whether every copy it read is still the one the peer resolved; a copy that was freed or refilled meanwhile becomes a miss instead of another key’s bytes, counted in <code class="docutils literal notranslate"><span class="pre">mori_umbp_client_remote_get_dropped_total{reason=&quot;stale&quot;}</span></code>. Fails closed: an RPC error drops the batch’s reads as <code class="docutils literal notranslate"><span class="pre">reason=&quot;unverified&quot;</span></code>. Skipped for a peer that stamps no generations (an older build). The same RPC tells the peer the reader is done with every copy it resolved, read or not, so an SSD backend expires the staging lease as soon as its last remote reader has reported instead of holding the span for the whole <code class="docutils literal notranslate"><span class="pre">UMBP_SSD_READ_LEASE_MS</span></code> (counted in the SSD medium’s <code class="docutils literal notranslate"><span class="pre">staging_reader_release</span></code> event). The RPC deadline is <code class="docutils literal notranslate"><span class="pre">UMBP_RESOLVE_BUSY_TIMEOUT_MS</span></code>. <code class="docutils literal notranslate"><span class="pre">0</span></code> disables the check and with it the early release — meant for measuring its cost, since it reopens the stale-read window. Read once per process.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_RPC_SHUTDOWN_TIMEOUT_MS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">3000</span></code></p></td>
@@ -744,7 +744,7 @@ entire process.</p></li>
 
   <div role="contentinfo">
     <p>&#169; Copyright 2026, AMD.
-      <span class="lastupdated">Last updated on 2026-11-18.
+      <span class="lastupdated">Last updated on 2026-11-19.
       </span></p>
   </div>
 
