@@ -919,7 +919,7 @@ class CMakeBuild(build_ext):
         # carry an $ORIGIN/../.. rpath (set in examples/CMakeLists.txt) so they
         # resolve libmori_*.so from site-packages/mori/ once installed here.
         cco_examples_dst = root_dir / "python/mori/examples/cco"
-        for _exe in ("cco_lsa_put", "cco_gda_put"):
+        for _exe in ("cco_lsa_put", "cco_gda_put", "cco_proxy_put"):
             src = build_dir / "examples" / _exe
             dst = cco_examples_dst / _exe
             if build_examples.upper() == "ON" and src.exists():

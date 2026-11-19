@@ -127,9 +127,11 @@ target_include_directories(intra_node_benchmark
 
 # --- CCO examples ---
 # The CCO LSA test variants (lsa_barrier / lsa_allreduce / lsa_memcheck) live in
-# tests/cpp/cco/test_cco_lsa_*.cpp (auto-discovery harness). The two C++ examples
+# tests/cpp/cco/test_cco_lsa_*.cpp (auto-discovery harness). The C++ examples
 # below are HIP, MPI-bootstrapped, and link mori_cco. LSA uses only cco.hpp; GDA
 # uses only cco_scale_out.hpp and needs the NIC define for provider dispatch.
+# The ccoProxy one compiles its kernels only when mori_cco has the engine
+# (MORI_CCO_PROXY).
 add_executable(cco_lsa_put cco/cpp/01_lsa_put.cpp)
 set_source_files_properties(cco/cpp/01_lsa_put.cpp PROPERTIES LANGUAGE HIP)
 target_include_directories(cco_lsa_put PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -143,10 +145,15 @@ if(MORI_DEVICE_NIC_DEFINE)
   target_compile_definitions(cco_gda_put PRIVATE ${MORI_DEVICE_NIC_DEFINE})
 endif()
 
+add_executable(cco_proxy_put cco/cpp/03_proxy_put.cpp)
+set_source_files_properties(cco/cpp/03_proxy_put.cpp PROPERTIES LANGUAGE HIP)
+target_include_directories(cco_proxy_put PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(cco_proxy_put mori_cco MPI::MPI_CXX hip::host hip::device)
+
 # Add an $ORIGIN-relative rpath (kept alongside the build-tree rpath) so the
 # binaries still find libmori_*.so after `pip install .` copies them to
 # site-packages/mori/examples/cco/ (the libs live at site-packages/mori/).
-set_target_properties(cco_lsa_put cco_gda_put
+set_target_properties(cco_lsa_put cco_gda_put cco_proxy_put
                       PROPERTIES BUILD_RPATH "$ORIGIN/../..;${ROCM_PATH}/lib")
 
 # --- Application examples ---

@@ -342,6 +342,7 @@ Runnable examples live in [`examples/cco/`](https://github.com/ROCm/mori/blob/ma
 | `python/06_flydsl_gda_modes` | py | FlyDSL GDA (thread_mode, coop) × signal matrix, plus DEFERRED / CALLER_ORDERED handles |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (`cco_scale_out.hpp`) |
+| `cpp/03_proxy_put.cpp` | c++ | ccoProxy put + SignalSet/wait on a proxy-only DevComm, with timeouts |
 
 ## 8. C++ API
 
@@ -564,3 +565,33 @@ __global__ void recv(ccoDevComm dc) {
   proxy.waitSignal(blockIdx.x, 1, ccoCoopBlock{});
 }
 ```
+
+A complete program (host setup, data check, timeouts, `ccoDevCommGetError`) is
+[`examples/cco/cpp/03_proxy_put.cpp`](https://github.com/ROCm/mori/blob/main/examples/cco/cpp/03_proxy_put.cpp).
+
+### Checking it on your platform
+
+Run `tests/cpp/cco/test_proxy_put` (built with `BUILD_TESTS=ON`) before relying
+on ccoProxy on a new platform, with one rank on each of two nodes:
+
+```bash
+# node A: write the bootstrap id, copy it to node B, then start rank 0
+./test_proxy_put --gen-uid <iface> 0 uid.bin
+MORI_CCO_PROXY_TEST_CASES=atomic_free ./test_proxy_put --rank 0 --world 2 --uid-file uid.bin
+# node B
+MORI_CCO_PROXY_TEST_CASES=atomic_free ./test_proxy_put --rank 1 --world 2 --uid-file uid.bin
+```
+
+1. Run the atomic-free cases first (as above), then the full suite (without
+   `MORI_CCO_PROXY_TEST_CASES`). `MORI_CCO_PROXY_TEST_NEGATIVE=all` adds the
+   failure-path cases. Each rank prints `PASSED` at the end. A build with MPI
+   also runs under `mpirun -np 2`.
+2. If the atomic-free cases pass but the `SignalInc` / `SignalAdd` cases fail
+   with a `COMPLETION` error, NIC atomics into GPU memory do not work on this
+   platform: use `SignalSet` / `WindowSignalSet`.
+3. `MORI_SHMEM_LOG_LEVEL=info` prints the engine's setup at `ccoDevCommCreate`:
+   queues, threads, QPs per peer and the CPUs the proxy threads run on.
+4. `cco_p2p_put_bw -t proxy` and `cco_p2p_put_latency -t proxy`
+   ([benchmark/cco](https://github.com/ROCm/mori/blob/main/benchmark/cco/README.md))
+   measure bandwidth and latency but do not check the data; they are no
+   substitute for the test.
