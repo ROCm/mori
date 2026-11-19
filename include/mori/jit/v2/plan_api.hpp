@@ -88,11 +88,6 @@ void RegisterPlan(const char* name, const PlanVTable& vt);
 const PlanVTable* FindPlan(const char* name);
 std::vector<std::string> RegisteredPlans();
 
-// Cross-compiling is a whole-process mode: the toolchain resolves its arch once.
-// An explicit arch is applied before that; disagreeing with an already-resolved
-// toolchain is an error, not a silent "rendered for A, compiled for B".
-std::string ResolveArch(const char* arch);
-
 void SetPlanError(const std::string& what);
 const char* PlanError();
 

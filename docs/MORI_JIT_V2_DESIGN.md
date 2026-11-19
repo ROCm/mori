@@ -137,7 +137,7 @@ mori_ep_dispatch_bf16_ws8_h2048_k8_64x16(EpArgs args) { EpDispatchBody<kCfg, Tok
 - **文本即 key** → 配置不可能不进 key。
 - **`__launch_bounds__` 是表达式不是数字** → 由 host/device 共用的同一个 constexpr 算出。
 - **arch 路由在 host 侧**：include 哪个 body、调哪个函数，由 `RenderSource` 按
-  `GetToolchain().arch` 决定——gfx125x 渲染 `ep_intranode_1250x.hpp` 的 TDM 版本，其余渲染 portable
+  `ActiveArch()` 决定——gfx125x 渲染 `ep_intranode_1250x.hpp` 的 TDM 版本，其余渲染 portable
   版。不是 device `#if`：渲染时看到的 arch 就是 `--offload-arch` 的 arch，两侧不可能不一致；而这个
   选择写在源码文本里，所以自动进 key，两种 body 各有自己的缓存条目。
   host 按前缀判断（`gfx125` 选 TDM body，`gfx12` 定 wave32），所以 `gfx1250-strict` 走的是与
@@ -447,9 +447,12 @@ dtype；launch 参数里 `off<Region>` 是 arena region 偏移，传 `arena=` �
 **为什么是 ctypes**：边界只传指针和标量，没有类型转换可做。pybind11 的代价是编译期（aiter 实测
 libtorch+pybind11 的设备 pass 解析 ~15s）。绑定层里**没有 `import torch`**，靠鸭子类型取 `.data_ptr()`。
 
-**交叉编译是进程级模式**：工具链只解析一次 arch，`arch=` 在那之前经 `SetArchOverride()` 落到一个
-带锁的进程变量（不是 `setenv`——解析侧用 `getenv` 读，两线程并发建 plan 就是 POSIX 数据竞争）；
-`MORI_JIT_ARCH` 仍作为静态覆盖有效。与已解析的不一致会**报错**，不是静默地"按 A 渲染、按 B 编译"。
+**`arch=` 只作用于本次调用**：create / describe / precompile 的 `arch=` 经 `ScopedArch` 落到一个
+thread-local 变量，调用返回即撤销，所以不会带到之后的 plan。不是 `setenv`：解析侧用 `getenv` 读，两线程
+并发建 plan 就是 POSIX 数据竞争。渲染（`ActiveArch()`）和编译（`--offload-arch`、缓存 key）在同一次
+调用里读同一个值，不会"按 A 渲染、按 B 编译"。不传时用工具链的 arch：`MORI_JIT_ARCH`，否则 0 号设备。
+code object 只能在自己的目标上加载，所以编译前若目标与当前设备不同就直接**报错**，并指出 arch 来自
+`arch=` 还是 `MORI_JIT_ARCH`；这两者只对 describe 和 precompile 有意义。
 
 ## 7. 几个有证据的决定
 

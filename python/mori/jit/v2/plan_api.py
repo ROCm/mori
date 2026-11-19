@@ -643,8 +643,9 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
             """The `info` a plan for this request would report, without compiling it.
 
             For sizing what the plan binds -- arena regions, staging -- before the
-            plan exists. Resolving the arch may still query the GPU (or set arch /
-            MORI_JIT_ARCH). cacheDir is empty: nothing was compiled.
+            plan exists. `arch` applies to this call only and touches no GPU;
+            without it the arch is MORI_JIT_ARCH, else the device's. cacheDir is
+            empty: nothing was compiled.
             """
             lib = _load()
             if not hasattr(lib, "mori_jit_plan_describe"):
@@ -951,7 +952,7 @@ def make_launch_group(plans) -> LaunchGroup:
 
 
 def precompile(kernel: str, arch: str | None = None) -> int:
-    """Fill the disk cache for `arch` (None = the local device). No GPU touched."""
+    """Fill the disk cache for `arch` (None = the local device), for this call only."""
     n = _load().mori_jit_precompile(kernel.encode(), arch.encode() if arch else None)
     if n < 0:
         raise RuntimeError(f"mori jit precompile [{kernel}]: {_error()}")
