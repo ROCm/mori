@@ -36,6 +36,7 @@ from mori.ops.dispatch_combine_v2.quant_types import (
     QUANT_TYPES,
     e8m0_round_up,
     fp8_max,
+    is_gfx125x_arch,
     resolve_quant_type,
 )
 
@@ -95,6 +96,33 @@ def test_config_holds_the_explicit_name(monkeypatch, name, gfx125x):
     assert cfg.is_scatter == (want != "none")
     # Rebuilding from the stored name is a no-op.
     assert _cfg(cfg.quant_type).quant_type == want
+
+
+def test_an_unknown_arch_refuses_only_the_arch_default_names(monkeypatch):
+    for name in ("fp8_blockwise", "fp4_blockwise"):
+        with pytest.raises(ValueError, match="could not be read"):
+            resolve_quant_type(name, gfx125x=None)
+    for name in ("none", "fp4_blockwise_fp32", *QUANT_FORMATS):
+        assert resolve_quant_type(name, gfx125x=None) == _RESOLVED[name][1]
+    monkeypatch.setattr(op_mod, "is_gfx125x", lambda: None)
+    with pytest.raises(ValueError, match="could not be read"):
+        _cfg("fp8_blockwise")
+    assert _cfg("fp8_blockwise_1x32").quant_type == "fp8_blockwise_1x32"
+
+
+@pytest.mark.parametrize(
+    "arch, want",
+    [
+        ("gfx1250", True),
+        ("gfx1251", True),
+        ("gfx1250:sramecc+:xnack-", True),
+        ("gfx950", False),
+        ("gfx942:sramecc+:xnack-", False),
+        ("", False),
+    ],
+)
+def test_one_gfx125x_check(arch, want):
+    assert is_gfx125x_arch(arch) is want
 
 
 @pytest.mark.parametrize(

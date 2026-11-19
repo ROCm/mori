@@ -158,6 +158,25 @@ def _cases():
         "QUANT": "fp8_blockwise_1x32",
         "SPREAD": 6,
     }
+    # hidden 2304 is not a multiple of the 512-element step: the partial last step
+    for elem in ("fp8", "fp4"):
+        for group in (32, 128):
+            yield f"hip-bf16-scatter-{elem}-1x{group}-h2304", {
+                "MORI_V2_KERNEL_BACKEND": "hip",
+                "DTYPE": "bf16",
+                "COMBINE": "scatter",
+                "QUANT": f"{elem}_blockwise_1x{group}",
+                "HIDDEN": 2304,
+            }
+    # a 1x128 block whose amax is under the scale's normal range (scale 1, finite)
+    for backend, elem in (("flydsl", "fp8"), ("hip", "fp8"), ("hip", "fp4")):
+        yield f"{backend}-bf16-scatter-{elem}-1x128-tiny", {
+            "MORI_V2_KERNEL_BACKEND": backend,
+            "DTYPE": "bf16",
+            "COMBINE": "scatter",
+            "QUANT": f"{elem}_blockwise_1x128",
+            "TINY": 1,
+        }
     # per-token scale forwarding (v1 uses scale_dim=32), on both combine modes
     yield "bf16-gather-scales", {"DTYPE": "bf16", "COMBINE": "gather", "SCALE_DIM": 32}
     yield "bf16-scatter-scales", {

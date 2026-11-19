@@ -67,7 +67,7 @@ from mori.tensor_utils import from_gpu_ptr
 from . import ep_plans as cb
 from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
-from .quant_types import resolve_quant_type
+from .quant_types import is_gfx125x_arch, resolve_quant_type
 from .internode_regions import (
     asyncll_regions,
     asyncll_seg_layout,
@@ -470,7 +470,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._arch = _arch.split(":")[0]
-        self._is1250 = _arch.split(":")[0].startswith("gfx125")
+        self._is1250 = is_gfx125x_arch(_arch)
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
@@ -1262,7 +1262,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     @classmethod
     def _quant_formats(cls, arch):
         # gfx125x pushes; gfx942/gfx950 scatter an fp8 wire, and gfx950 an e2m1 one too.
-        if arch.startswith("gfx125"):
+        if is_gfx125x_arch(arch):
             return _PUSH_QUANT_TYPES
         if arch.startswith("gfx950"):
             return _SCATTER_QUANT_TYPES + _SCATTER_FP4_QUANT_TYPES
@@ -1285,9 +1285,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         refused = self._quant_refusal(cfg, self._arch)
         bad.extend(refused)
         if cfg.is_scatter and q == "none":
+            served = "the push" if self._is1250 else "the scatter"
             bad.append(
-                "combine_mode='scatter' (gather only, except the push quant types "
-                f"{_PUSH_QUANT_TYPES})"
+                f"combine_mode='scatter' without a quant type on {self._arch} (gather "
+                f"only, or {served} quant types {self._quant_formats(self._arch)})"
             )
         if q != "none" and not refused:
             if cfg.combine_dtype != torch.bfloat16:

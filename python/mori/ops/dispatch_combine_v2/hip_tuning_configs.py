@@ -41,7 +41,7 @@ from typing import NamedTuple
 
 from mori.ops import utils as _gpu
 
-from .quant_types import resolve_quant_type
+from .quant_types import is_gfx125x_arch, resolve_quant_type
 
 logger = logging.getLogger(__name__)
 
@@ -656,7 +656,7 @@ def _capped(phase, own, peak, shape, key, default_warp):
 def _resolve_quant(quant_type, devs):
     """The explicit name of `quant_type`; fp8_blockwise / fp4_blockwise take the
     group of the device the tables are read for."""
-    gfx125x = bool(devs[0]) and devs[0].startswith("gfx1250")
+    gfx125x = bool(devs[0]) and is_gfx125x_arch(devs[0])
     return resolve_quant_type(quant_type, gfx125x)
 
 
@@ -1018,7 +1018,7 @@ def lookup(
         capped_comb = _first_bucket(
             _CAPPED_COMBINE_PUSH_TABLE.get(quant_type, {}), devs, *shape
         )
-    gfx125x = bool(devs[0]) and devs[0].startswith("gfx1250")
+    gfx125x = bool(devs[0]) and is_gfx125x_arch(devs[0])
     if comb is None and quant_type != "none" and not gfx125x:
         comb = _first_bucket(_SCATTER_COMBINE_TABLE, devs, *shape)
     if comb is None:

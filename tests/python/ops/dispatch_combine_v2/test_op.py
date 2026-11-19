@@ -96,7 +96,7 @@ _FP8_DT = (
 def _configure():
     """Read the knobs below from the environment (again for every CASES entry)."""
     global HIDDEN, K, EPR, DTYPE, _IS_FP4, _IS_FP8, STDMOE, SCALE_DIM, COMBINE
-    global QUANT, INSCALE, SPREAD, SWEEP, RAGGED, NOSELF
+    global QUANT, INSCALE, SPREAD, TINY, SWEEP, RAGGED, NOSELF
     HIDDEN = int(os.environ.get("HIDDEN", 7168))
     K = int(os.environ.get("TOPK", 8))
     EPR = int(os.environ.get("EPR", 32))
@@ -120,6 +120,11 @@ def _configure():
     # SPREAD=n: each 32-element group times 2^u, u uniform in [-n, n], so a scale
     # applied to the wrong group shows up as a gross error.
     SPREAD = int(os.environ.get("SPREAD", 0))
+    # TINY=1: every row's first 128 elements are ~1e-37 with a zero among them, under
+    # a 1x128 scale's normal range, where the scale must be 1. Without that rule
+    # max / amax overflows and the zero becomes 0 * inf; the hardware clamp happens
+    # to turn that NaN into a finite value, so this guards the rule, not a crash.
+    TINY = int(os.environ.get("TINY", 0))
     SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512").split(",")]
     # RAGGED=1: rank r sends ct * (r % 3) // 2 tokens of each SWEEP point -- none on
     # ranks 0 and 3, half on 1, all on 2 -- so one call mixes ranks that send nothing
@@ -163,6 +168,9 @@ def _run(d, comm):
             groups = inp.view(M, HIDDEN // 32, 32)
             u = torch.randint(-SPREAD, SPREAD + 1, (M, HIDDEN // 32, 1), generator=g)
             inp = (groups * torch.exp2(u.float())).view(M, HIDDEN)
+        if TINY:
+            inp[:, :128] *= 1e-37
+            inp[:, 0] = 0.0
         inp = inp.to(DTYPE).to(dev)
     if NOSELF:
         idx = torch.randint(

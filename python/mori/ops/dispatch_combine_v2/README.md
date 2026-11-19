@@ -78,11 +78,13 @@ per-group scales. `quant_type` names the format:
 
 fp8 is the arch's own: e4m3fnuz on gfx942 (largest value 240), e4m3fn on gfx950
 and gfx125x (448); e2m1's largest value is 6. A 1x128 scale is the block's amax
-over the element's largest value, so every block spans the whole element range; a
-1x32 E8M0 scale is the smallest power of two that brings the group's amax within
-it (`quant_types.e8m0_round_up`). The
-config stores the explicit name: after construction `cfg.quant_type` reads
-`fp8_blockwise_1x128` on a gfx942 config built with `fp8_blockwise`.
+over the element's largest value, so every block spans the whole element range
+(a block whose amax is below that value times 2^-126 keeps scale 1); a 1x32 E8M0
+scale is the smallest power of two that brings the group's amax within it
+(`quant_types.e8m0_round_up`). The config stores the explicit name: after
+construction `cfg.quant_type` reads `fp8_blockwise_1x128` on a gfx942 config built
+with `fp8_blockwise`. `fp8_blockwise` and `fp4_blockwise` need the GPU arch; when it
+cannot be read, the config refuses them and asks for the explicit name.
 
 A backend that does not serve the resolved format refuses the config when the
 op is built, naming the arch and what it serves; nothing falls back to another

@@ -495,7 +495,9 @@ constexpr float kEpScatterFp4Max = 6.0f;
 
 // The group's scale and its reciprocal. 1x32: E8M0, the smallest power of two that
 // keeps amax within the element max (RoundUp, as the gfx125x push and aiter pick it).
-// 1x128: amax / max exactly, so every block uses the whole element range.
+// 1x128: amax / max exactly, so every block uses the whole element range; a block
+// whose amax is below max * 2^-126 keeps scale 1, since its scale would be subnormal
+// and max / amax can overflow (0 * inf = NaN), as FlyDSL's _block_scale does.
 template <int kGroup, float kMax>
 __device__ __forceinline__ void EpScatterScale(float amax, float& scale, float& inv,
                                                unsigned& e8m0) {
@@ -507,9 +509,9 @@ __device__ __forceinline__ void EpScatterScale(float amax, float& scale, float& 
     scale = __uint_as_float(e << 23);
     inv = __uint_as_float((254u - e) << 23);
   } else {
-    const bool zero = !(amax > 0.0f);
-    scale = zero ? 1.0f : amax * (1.0f / kMax);
-    inv = zero ? 1.0f : kMax / amax;
+    const bool tiny = !(amax >= kMax * 0x1p-126f);
+    scale = tiny ? 1.0f : amax * (1.0f / kMax);
+    inv = tiny ? 1.0f : kMax / amax;
     e8m0 = 0;
   }
 }

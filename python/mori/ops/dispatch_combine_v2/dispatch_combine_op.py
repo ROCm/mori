@@ -64,6 +64,7 @@ from mori.jit.config import detect_wave_size
 from .quant_types import (
     QUANT_TYPES,
     is_gfx125x,
+    is_gfx125x_arch,
     names_for,
     quant_element,
     quant_group,
@@ -896,7 +897,7 @@ def supported_quant_types(backend=None, arch=None) -> dict[str, str]:
         from mori.jit.core import _target_arch
 
         arch = _target_arch()
-    gfx125x = arch.startswith("gfx125")
+    gfx125x = is_gfx125x_arch(arch)
     name = (
         backend
         or os.environ.get("MORI_V2_KERNEL_BACKEND")

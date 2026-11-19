@@ -409,15 +409,20 @@ jobs:
           #
           # This runner has no gfx1250, so what actually runs here is the portable
           # body -- the one that cannot be exercised by hand on the TDM boxes.
+          #
+          # Each dispatch dtype also feeds the HIP quantized scatter combine (the
+          # a4w4 serving shape: fp4/fp8 dispatch, bf16 expert output, quantized wire).
           for disp in fp8 fp4; do
+          for comb in gather:none scatter:fp8_blockwise_1x128 scatter:fp4_blockwise_1x32; do
             $CT exec -e MORI_V2_KERNEL_BACKEND=hip -e SCALE_DIM=224 -e HIDDEN=7168 \
-              -e DISP=$disp $CONTAINER bash -c "\
+              -e DISP=$disp -e COMBINE=${comb%%:*} -e QUANT=${comb#*:} $CONTAINER bash -c "\
               cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
               out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_asym_dtype.py 2>&1) || \
                 { echo \"\$out\"; exit 1; }; \
               echo \"\$out\"; \
               case \"\$out\" in *FAIL*) exit 1;; esac; \
               case \"\$out\" in *ASYM-SCALES*) ;; *) echo 'no ASYM-SCALES line: scales never ran'; exit 1;; esac" || exit 1
+          done
           done
 
       - name: Run ops-v2 backend parity (FlyDSL vs HIP, EP8)

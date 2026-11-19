@@ -64,13 +64,20 @@ def default_group(gfx125x: bool) -> int:
     return 32 if gfx125x else 128
 
 
-def resolve_quant_type(name: str, gfx125x: bool) -> str:
-    """The explicit name (or "none") that ``name`` means on this arch."""
+def resolve_quant_type(name: str, gfx125x: bool | None) -> str:
+    """The explicit name (or "none") that ``name`` means on this arch; ``gfx125x``
+    is None when the arch is unknown, which only an arch-dependent name minds."""
     if name == "none" or name in QUANT_FORMATS:
         return name
     if name in _ALIASES:
         return _ALIASES[name]
     if name in _ARCH_DEFAULT:
+        if gfx125x is None:
+            raise ValueError(
+                f"quant_type={name!r} means {name}_1x32 on gfx125x and {name}_1x128 "
+                "on gfx942/gfx950, and the GPU arch could not be read; pass the "
+                "explicit name"
+            )
         return f"{name}_1x{default_group(gfx125x)}"
     raise ValueError(f"quant_type must be one of {QUANT_TYPES}, got {name!r}")
 
@@ -117,11 +124,18 @@ def e8m0_round_up(amax: float, fmax: float) -> int:
     return min(max(e, 1), 254)
 
 
-def is_gfx125x() -> bool:
-    """Whether the JIT targets gfx125x; False when the arch cannot be read."""
-    try:
-        from mori.jit.core import _FASTPATH_ARCH_PREFIX, _target_arch
+def is_gfx125x_arch(arch: str) -> bool:
+    """Whether ``arch`` (a gcnArchName, features allowed) is gfx125x: the one test
+    every arch check in this package uses, matching the JIT's fast-path prefix."""
+    return arch.split(":")[0].startswith("gfx125")
 
-        return _target_arch().startswith(_FASTPATH_ARCH_PREFIX)
+
+def is_gfx125x() -> bool | None:
+    """Whether the JIT targets gfx125x; None when the arch cannot be read."""
+    try:
+        from mori.jit.core import _target_arch
+
+        arch = _target_arch()
     except Exception:
-        return False
+        return None
+    return is_gfx125x_arch(arch) if arch else None

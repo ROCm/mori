@@ -50,6 +50,7 @@ from .dispatch_combine_op import (  # noqa: F401
     EpDispatchRoutingHandle,
     KernelSet,
 )
+from .quant_types import is_gfx125x_arch
 from .symm_arena import SymmArena  # noqa: F401
 
 
@@ -60,7 +61,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
     @classmethod
     def _quant_formats(cls, arch):
         # The scatter combine's fp8 codec is wave64-only.
-        if arch.startswith("gfx125"):
+        if is_gfx125x_arch(arch):
             return ()
         return ("fp8_blockwise_1x32", "fp8_blockwise_1x128")
 
