@@ -10,7 +10,7 @@ independent communicators and drive them concurrently from multiple threads.
 The fused GEMM + collective operators built on CCO have their own section,
 [MORI-FUSED](MORI-CCO-FUSED-OPS-GUIDE.md).
 
-CCO exposes GPU-initiated one-sided communication over three transports:
+CCO exposes GPU-initiated one-sided communication over four transports:
 
 - **LSA** (Local Symmetric Access) — intra-node peer-to-peer over a flat
   symmetric virtual address space (XGMI). The kernel gets a peer's
@@ -30,17 +30,17 @@ fused GEMM + collective operators (`mori.ops.gemm_ar`, `gemm_a2a`, `gemm_ag`,
 
 ## Table of Contents
 
-1. [Quick Reference](#quick-reference)
-2. [Concepts](#1-concepts)
-3. [Initialization](#2-initialization)
-4. [Memory and Windows](#3-memory-and-windows)
-5. [Device Communicator](#4-device-communicator)
-6. [Host Barrier](#5-host-barrier)
-7. [Device-Side Programming](#6-device-side-programming)
-8. [Examples](#7-examples)
-9. [C++ API](#8-c-api)
-10. [Environment Variables](#9-environment-variables)
-11. [ccoProxy (host-proxy RDMA)](#10-ccoproxy-host-proxy-rdma)
+- [Quick Reference](#quick-reference)
+- [1. Concepts](#1-concepts)
+- [2. Initialization](#2-initialization)
+- [3. Memory and Windows](#3-memory-and-windows)
+- [4. Device Communicator](#4-device-communicator)
+- [5. Host Barrier](#5-host-barrier)
+- [6. Device-Side Programming](#6-device-side-programming)
+- [7. Examples](#7-examples)
+- [8. C++ API](#8-c-api)
+- [9. Environment Variables](#9-environment-variables)
+- [10. ccoProxy (host-proxy RDMA)](#10-ccoproxy-host-proxy-rdma)
 
 ## Quick Reference
 
@@ -347,7 +347,7 @@ Runnable examples live in [`examples/cco/`](https://github.com/ROCm/mori/blob/ma
 ## 8. C++ API
 
 The host control plane and device layer are a self-contained header pair;
-include `cco.hpp` for host + LSA, or `cco_scale_out.hpp` for GDA.
+include `cco.hpp` for host + LSA, or `cco_scale_out.hpp` for GDA and ccoProxy.
 
 ```cpp
 #include "mori/cco/cco.hpp"
@@ -454,12 +454,14 @@ serve each QP serially run a thread's queues in parallel.
 
 ### Device API
 
-`ccoProxy<Queue = SPSCD2HQueue>` is constructed in the kernel from the DevComm
-and a queue index.
+`ccoProxy<Queue>` is constructed in the kernel from the DevComm and a queue
+index. `Queue` is `mori::cco::proxy::queue::SPSCD2HQueue` (the default) or
+`mori::cco::proxy::queue::MPSCD2HQueue`; the short names need a `using`
+declaration.
 
 | Call | Does |
 |---|---|
-| `ccoProxy<>(dc, i)` / `ccoProxy<MPSCD2HQueue>(dc, i)` | SPSC queue `i` (out of range traps); MPSC queue `i` mod the pool size |
+| `ccoProxy<>(dc, i)` / `ccoProxy<mori::cco::proxy::queue::MPSCD2HQueue>(dc, i)` | SPSC queue `i` (out of range traps); MPSC queue `i` mod the pool size |
 | `put<CCO_TEAM_GDA>(peer, ...)` etc. | `peer` indexes the team of the proxy's connection type (`dc.proxy.connType`), as `ccoGda` does for `gdaConnectionType`; the default `CCO_TEAM_WORLD` takes world ranks |
 | `put(peer, dstWin, dstOff, srcWin, srcOff, bytes, action, coop)` | RDMA write, optionally followed by a signal on the same QP; split above the port's max message size |
 | `putValue(peer, dstWin, dstOff, value, action, coop)` | inline write of a 1–8 byte value, optionally followed by a signal |

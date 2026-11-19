@@ -31,8 +31,9 @@
 // resolved on the GPU exactly like ccoGda (raddr = window offset + iovaBias),
 // so the proxy needs no key tables.
 //
-// Queues: ccoProxy<SPSCD2HQueue> (default) indexes the DevComm's SPSC pool,
-// ccoProxy<MPSCD2HQueue> its MPSC pool; each pool is one KIWI invoke context.
+// Queues: ccoProxy<> (mori::cco::proxy::queue::SPSCD2HQueue) indexes the
+// DevComm's SPSC pool, ccoProxy<mori::cco::proxy::queue::MPSCD2HQueue> its MPSC
+// pool; each pool is one KIWI invoke context.
 // An MPSC queueIndex is taken modulo the pool size, like ccoGda's
 // contextIndex; an SPSC one must be in [0, proxySpscQueueCount), since
 // wrapping would let two wavefronts share an SPSC queue and corrupt it.

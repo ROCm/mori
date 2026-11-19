@@ -537,8 +537,9 @@ struct ccoDevCommRequirements {
 
   // ccoProxy (host-proxy RDMA; the host engine is built by default for gfx942/gfx950
   // and MORI_CCO_DISABLE_PROXY=1 turns it off at run time). Separate SPSC and
-  // MPSC queue pools (ccoProxy<SPSCD2HQueue> / ccoProxy<MPSCD2HQueue> index their
-  // own pool), polled by proxyThreadCount host threads. Proxy QPs go to the peers
+  // MPSC queue pools (ccoProxy<> and
+  // ccoProxy<mori::cco::proxy::queue::MPSCD2HQueue> index their own pool),
+  // polled by proxyThreadCount host threads. Proxy QPs go to the peers
   // of proxyConnectionType; signals use the GDA signal slots (gdaSignalCount).
   // Every rank must pass the same queue, thread and QP counts and connection
   // type (checked; creation fails otherwise), and the GPU's VRAM must be
