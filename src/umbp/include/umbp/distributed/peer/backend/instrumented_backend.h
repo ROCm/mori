@@ -83,6 +83,12 @@ class InstrumentedBackend final : public MediumBackend {
                                     const std::vector<uint64_t>& generations) const override {
     return inner_->BatchStillHolds(keys, generations);
   }
+  // Must forward: the default only answers, so the inner medium would never
+  // learn that its readers are done.
+  std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations) override {
+    return inner_->BatchFinishReads(keys, generations);
+  }
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
                             bool allow_file_ref) override {
     return inner_->AcquireMigrationRead(key, resolved, allow_file_ref);

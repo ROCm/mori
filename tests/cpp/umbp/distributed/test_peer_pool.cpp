@@ -476,8 +476,16 @@ class ParityStillHoldsBackend final : public MockBackend {
     return out;
   }
 
+  // Same answers, and a record that the readers said they were done.
+  std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations) override {
+    finished.insert(finished.end(), keys.begin(), keys.end());
+    return BatchStillHolds(keys, generations);
+  }
+
   mutable int calls = 0;
   mutable std::vector<std::string> asked;
+  std::vector<std::string> finished;
 };
 
 TEST(PeerPool, ValidateResolvedAsksEachNamedBackendOnce) {
@@ -504,6 +512,29 @@ TEST(PeerPool, ValidateResolvedAsksEachNamedBackendOnce) {
 
   // Parallel vectors that disagree are a malformed request: nothing is vouched for.
   EXPECT_EQ(pool.ValidateResolved({ida}, {"a1", "a2"}, {2, 2}), (std::vector<bool>{false, false}));
+  EXPECT_TRUE(pa->finished.empty()) << "a plain check must not end anyone's lease";
+  EXPECT_TRUE(pb->finished.empty());
+}
+
+// With `release` the same call also tells each backend its reader is done,
+// stale answers included: a reader is finished with a copy it has to drop too.
+TEST(PeerPool, ValidateResolvedWithReleaseFinishesTheReadsOnEachBackend) {
+  BackendRegistry registry;
+  auto a = std::make_unique<ParityStillHoldsBackend>(TierType::DRAM);
+  auto b = std::make_unique<ParityStillHoldsBackend>(TierType::DRAM);
+  auto* pa = a.get();
+  auto* pb = b.get();
+  ASSERT_TRUE(registry.Register("dram_a", std::move(a)));
+  ASSERT_TRUE(registry.Register("dram_b", std::move(b)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  const uint32_t ida = registry.BackendId(pa);
+  const uint32_t idb = registry.BackendId(pb);
+
+  const auto valid = pool.ValidateResolved({ida, idb, ida}, {"a1", "b1", "a2"}, {2, 2, 3},
+                                           /*release=*/true);
+  EXPECT_EQ(valid, (std::vector<bool>{true, true, false}));
+  EXPECT_EQ(pa->finished, (std::vector<std::string>{"a1", "a2"}));
+  EXPECT_EQ(pb->finished, (std::vector<std::string>{"b1"}));
 }
 
 TEST(PeerPool, BatchResultsRemainPositionalAcrossBackends) {

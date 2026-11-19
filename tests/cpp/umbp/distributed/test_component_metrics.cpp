@@ -577,6 +577,12 @@ class StaleCopyBackend final : public MockBackend {
     for (size_t i = 0; i < keys.size(); ++i) out[i] = generations[i] % 2 == 0;
     return out;
   }
+  std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations) override {
+    finished += keys.size();
+    return BatchStillHolds(keys, generations);
+  }
+  size_t finished = 0;
 };
 
 TEST(InstrumentedBackendStillHolds, AnswersWithTheWrappedMedium) {
@@ -584,6 +590,17 @@ TEST(InstrumentedBackendStillHolds, AnswersWithTheWrappedMedium) {
   ASSERT_NE(backend, nullptr);
   EXPECT_EQ(backend->BatchStillHolds({"a", "b", "c"}, {2, 3, 4}),
             (std::vector<bool>{true, false, true}));
+}
+
+// The base default only answers.  A decorator that used it would leave every
+// staging lease on this peer to its timer.
+TEST(InstrumentedBackendStillHolds, AFinishedReadReachesTheWrappedMedium) {
+  auto inner = std::make_unique<StaleCopyBackend>(TierType::DRAM);
+  auto* raw = inner.get();
+  auto backend = MakeInstrumentedBackend(std::move(inner));
+  ASSERT_NE(backend, nullptr);
+  EXPECT_EQ(backend->BatchFinishReads({"a", "b"}, {2, 3}), (std::vector<bool>{true, false}));
+  EXPECT_EQ(raw->finished, 2u);
 }
 
 }  // namespace
