@@ -233,7 +233,8 @@ enum ccoProviderType {
   CCO_PROVIDER_IBVERBS = 4,
 };
 
-// GDA backend QP allocation strategy.
+// RDMA QP allocation strategy: gdaConnectionType for GDA, proxyConnectionType
+// for ccoProxy.
 enum ccoGdaConnectionType {
   CCO_GDA_CONNECTION_NONE = 0,  // no GDA QPs
   // QPs to every RDMA-capable peer, incl. intra-node. Intra-node QPs are
@@ -401,7 +402,10 @@ struct ccoProxyContext {
   uint64_t* flushTicket;
   // Largest single RDMA write: ccoProxyMaxPutBytes capped at the smallest
   // max_msg_sz of any rank's port. put() splits larger transfers.
-  uint64_t maxPutBytes;
+  uint32_t maxPutBytes;
+  // Resolved proxy connection type (ccoGdaConnectionType): the peers with proxy
+  // QPs and the team CCO_TEAM_GDA peers index. NONE when no proxy queues.
+  int32_t connType;
   void* engine;  // host-only ccoProxyEngine*, opaque to kernels
 };
 
@@ -453,6 +457,8 @@ static_assert(std::is_trivially_copyable<ccoDevComm>::value,
 // Kernels and the JIT bitcode snapshot this layout.
 static_assert(sizeof(ccoProxyContext) == 56 && offsetof(ccoProxyContext, flushDone) == 24 &&
                   offsetof(ccoProxyContext, flushTicket) == 32 &&
+                  offsetof(ccoProxyContext, maxPutBytes) == 40 &&
+                  offsetof(ccoProxyContext, connType) == 44 &&
                   offsetof(ccoProxyContext, engine) == 48,
               "ccoProxyContext layout is ABI");
 static_assert(sizeof(ccoDevComm) == 256 && offsetof(ccoDevComm, proxy) == 200,
@@ -531,13 +537,14 @@ struct ccoDevCommRequirements {
   // ccoProxy (host-proxy RDMA; the host engine is built by default for gfx942/gfx950
   // and MORI_CCO_DISABLE_PROXY=1 turns it off at run time). Separate SPSC and
   // MPSC queue pools (ccoProxy<SPSCD2HQueue> / ccoProxy<MPSCD2HQueue> index their
-  // own pool), polled by proxyThreadCount host threads. Uses the GDA peer set and
-  // signal slots, so gdaConnectionType must resolve to non-NONE. Every rank must
-  // pass the same queue, thread and QP counts (checked; creation fails otherwise),
-  // and the GPU's VRAM must be host-mapped (large BAR). Each DevComm with proxy
-  // queues starts its own busy-polling threads, pinned by the same policy
-  // (MORI_CCO_PROXY_CPUS or the GPU-local cores), so several such DevComms
-  // oversubscribe the same CPUs; prefer one per comm.
+  // own pool), polled by proxyThreadCount host threads. Proxy QPs go to the peers
+  // of proxyConnectionType; signals use the GDA signal slots (gdaSignalCount).
+  // Every rank must pass the same queue, thread and QP counts and connection
+  // type (checked; creation fails otherwise), and the GPU's VRAM must be
+  // host-mapped (large BAR). Each DevComm with proxy queues starts its own
+  // busy-polling threads, pinned by the same policy (MORI_CCO_PROXY_CPUS or the
+  // GPU-local cores), so several such DevComms oversubscribe the same CPUs;
+  // prefer one per comm.
   int proxySpscQueueCount;  // 0 = no SPSC pool
   int proxyMpscQueueCount;  // 0 = no MPSC pool
   int proxyThreadCount;     // host proxy threads (0 = 4), capped at the total queue count
@@ -551,6 +558,13 @@ struct ccoDevCommRequirements {
   // let NICs that serve each QP serially (e.g. ionic) run a thread's queues in
   // parallel; the default 4 does no harm on mlx5. Same on every rank.
   int proxyQpsPerPeer;
+  // Peers that get proxy QPs, as a ccoGdaConnectionType resolved like
+  // gdaConnectionType (CROSSNODE on one node, no RDMA or no matching peer ->
+  // NONE; proxy queues then fail creation). -1 = follow gdaConnectionType.
+  // Independent of the GDA QPs: gdaConnectionType NONE + proxyConnectionType
+  // FULL gives a proxy-only DevComm. ccoProxy's CCO_TEAM_GDA peers index this
+  // type's team, as ccoGda's index gdaConnectionType's.
+  int proxyConnectionType;
 };
 
 #define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                   \
@@ -574,6 +588,7 @@ struct ccoDevCommRequirements {
       0,                                         /* proxyThreadCount   */       \
       0,                                         /* proxyQueueCapacity */       \
       0,                                         /* proxyQpsPerPeer    */       \
+      -1,                                        /* proxyConnectionType*/       \
   }
 
 /* ════════════════════════════════════════════════════════════════════════════

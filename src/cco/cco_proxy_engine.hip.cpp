@@ -571,7 +571,7 @@ class ProxyWorker {
         peer > static_cast<uint32_t>(std::numeric_limits<int>::max()) ? -1 : static_cast<int>(peer);
     Raise(MakeError(CCO_PROXY_ERR_BAD_REQUEST, p, cur_->index, op),
           "descriptor for peer " + std::to_string(peer) +
-              " without a proxy QP (check gdaConnectionType)");
+              " without a proxy QP (check proxyConnectionType)");
     return nullptr;
   }
 
@@ -1144,7 +1144,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   out->mpscContext = engine->mpsc ? engine->mpsc->device_context() : nullptr;
   out->flushDone = engine->flushDone;
   out->flushTicket = engine->flushTicket;
-  out->maxPutBytes = maxMsgBytes;
+  out->maxPutBytes = static_cast<uint32_t>(maxMsgBytes);  // <= ccoProxyMaxPutBytes
   out->engine = engine.get();
   return engine.release();
 }

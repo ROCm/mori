@@ -57,11 +57,13 @@
 // order -- the same guarantee ccoGda gives within one context. Different queues
 // are unordered, as different ccoGda contexts are.
 //
-// Signals land in the ccoGda signal slots (devComm.ibgda.signalBuf), so the
-// DevComm's gdaConnectionType must resolve to non-NONE. SignalInc / SignalAdd /
-// WindowSignalAdd are NIC atomic fetch-adds; SignalSet / WindowSignalSet are
-// 8-byte inline RDMA writes for NICs whose atomics into GPU memory fail (see
-// ccoGda_SignalSet), and need window MRs without relaxed ordering.
+// Proxy QPs go to the peers of proxyConnectionType (ccoDevCommRequirements),
+// independent of the GDA QPs. Signals land in the ccoGda signal slots
+// (devComm.ibgda.signalBuf), which exist when the GDA or the proxy connection
+// resolves to non-NONE. SignalInc / SignalAdd / WindowSignalAdd are NIC atomic
+// fetch-adds; SignalSet / WindowSignalSet are 8-byte inline RDMA writes for NICs
+// whose atomics into GPU memory fail (see ccoGda_SignalSet), and need window MRs
+// without relaxed ordering.
 //
 // Flush: the proxy satisfies each queue's FLUSHes in queue order and adds 1 to
 // that queue's flushDone per FLUSH satisfied (it is the only writer). A flush
@@ -180,6 +182,7 @@ static_assert(sizeof(ccoProxyPutValueSignalDesc) == 64, "two queue lines");
 // lowers it to the port's max_msg_sz (ccoProxyContext::maxPutBytes), and put()
 // splits larger transfers into pieces of that size.
 inline constexpr uint64_t ccoProxyMaxPutBytes = 1ull << 30;
+static_assert(ccoProxyMaxPutBytes <= UINT32_MAX, "ccoProxyContext::maxPutBytes is 32-bit");
 
 // Set in every flushDone word once the DevComm has failed (see
 // ccoDevCommGetError); the low bits keep the satisfied-FLUSH count.
@@ -292,8 +295,8 @@ struct ccoProxy {
   using DeviceContext = mori::cco::proxy::invoke::DeviceContext<Queue>;
 
   ccoDevComm const& comm;
-  int rank;    // my index in the GDA team [0, nRanks)
-  int nRanks;  // GDA team size, as ccoGda
+  int rank;    // my index in the proxy's GDA team (comm.proxy.connType) [0, nRanks)
+  int nRanks;  // that team's size
   uint32_t queueId;
   uint64_t maxPutBytes;   // largest RDMA write one descriptor carries
   DeviceContext* ctx;     // this pool's invoke context
@@ -327,7 +330,7 @@ struct ccoProxy {
     if constexpr (TeamMode == CCO_TEAM_WORLD) {
       return peer;
     } else {
-      return impl::GdaPeerToWorld(comm, peer);
+      return impl::GdaPeerToWorld(comm, comm.proxy.connType, peer);
     }
   }
 
@@ -582,24 +585,7 @@ __device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIn
       dirty(false),
       unflushed(false) {
   impl::proxyCheckTarget();
-  switch (comm.gdaConnType) {
-    case CCO_GDA_CONNECTION_FULL:
-      rank = comm.rank;
-      nRanks = comm.worldSize;
-      break;
-    case CCO_GDA_CONNECTION_RAIL:
-      rank = comm.rank / comm.lsaSize;
-      nRanks = comm.worldSize / comm.lsaSize;
-      break;
-    case CCO_GDA_CONNECTION_CROSSNODE:
-      rank = (comm.rank / comm.lsaSize) * comm.lsaSize;
-      nRanks = comm.worldSize - comm.lsaSize + 1;
-      break;
-    default:
-      rank = 0;
-      nRanks = 0;
-      break;
-  }
+  impl::GdaTeamRankSize(comm, comm.proxy.connType, rank, nRanks);
   const int poolSize = kSpsc ? comm.proxy.numSpscQueues : comm.proxy.numMpscQueues;
   if (__builtin_expect(poolSize <= 0, 0)) {
     CCO_PROXY_TRAP(impl::proxyLinearTid() == 0,

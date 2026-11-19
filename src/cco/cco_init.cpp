@@ -1686,6 +1686,64 @@ int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
 /*                            ccoDevCommCreate                             */
 /* ========================================================================== */
 
+// Resolves a GDA / proxy connection type to the type it gives and its peer mask
+// (empty for NONE). No RDMA, CROSSNODE on a single node, an unknown type or no
+// matching peer resolve to NONE.
+//
+// Layout assumption (HARD CONTRACT enforced at CommCreate): ranks are node-major
+// contiguous and lsaSize is uniform across nodes, so each peer's lsaRank is
+// `peer % comm->lsaSize`.
+static ccoGdaConnectionType CcoResolveConnection(ccoComm* comm, int type,
+                                                 std::vector<bool>* peerMask) {
+  peerMask->clear();
+  if (type == CCO_GDA_CONNECTION_NONE || !comm->ctx->RdmaTransportEnabled()) {
+    return CCO_GDA_CONNECTION_NONE;
+  }
+  if (type == CCO_GDA_CONNECTION_CROSSNODE && comm->lsaSize == comm->worldSize) {
+    MORI_SHMEM_TRACE("ccoDevCommCreate: single-node, CROSSNODE -> NONE");
+    return CCO_GDA_CONNECTION_NONE;
+  }
+  std::vector<bool> mask(comm->worldSize, false);
+  for (int peer = 0; peer < comm->worldSize; peer++) {
+    if (peer == comm->rank) continue;
+    const auto& cap = comm->ctx->GetPeerCapabilities(peer);
+    switch (type) {
+      case CCO_GDA_CONNECTION_FULL:
+        mask[peer] = cap.canRDMA;
+        break;
+      case CCO_GDA_CONNECTION_CROSSNODE:
+        mask[peer] = cap.canRDMA && !cap.sameHost;
+        break;
+      case CCO_GDA_CONNECTION_RAIL:
+        mask[peer] = cap.canRDMA && !cap.sameHost && (peer % comm->lsaSize == comm->lsaRank);
+        break;
+      default:
+        break;
+    }
+  }
+  if (std::none_of(mask.begin(), mask.end(), [](bool b) { return b; })) {
+    MORI_SHMEM_TRACE("ccoDevCommCreate: empty peer mask, connType {} -> NONE", type);
+    return CCO_GDA_CONNECTION_NONE;
+  }
+  *peerMask = std::move(mask);
+  return static_cast<ccoGdaConnectionType>(type);
+}
+
+static const char* CcoConnectionName(int type) {
+  switch (type) {
+    case CCO_GDA_CONNECTION_NONE:
+      return "NONE";
+    case CCO_GDA_CONNECTION_FULL:
+      return "FULL";
+    case CCO_GDA_CONNECTION_CROSSNODE:
+      return "CROSSNODE";
+    case CCO_GDA_CONNECTION_RAIL:
+      return "RAIL";
+    default:
+      return "?";
+  }
+}
+
 int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm) {
   MORI_SHMEM_TRACE("ccoDevCommCreate: rank={}", comm->rank);
 
@@ -1708,14 +1766,9 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
                     reqs->version, CCO_API_VERSION);
   }
 
-  // Resolve connection type. CROSSNODE collapses to NONE on single-node
-  // deployments (no cross-node peers exist). RAIL collapses to NONE if it
-  // ends up with zero peers (single-node, or self-rail only).
-  ccoGdaConnectionType connType = reqs->gdaConnectionType;
-  if (connType == CCO_GDA_CONNECTION_CROSSNODE && comm->lsaSize == comm->worldSize) {
-    MORI_SHMEM_TRACE("ccoDevCommCreate: single-node, CROSSNODE -> NONE");
-    connType = CCO_GDA_CONNECTION_NONE;
-  }
+  // GDA QPs go to gdaPeerMask, proxy QPs to proxyPeerMask (ccoProxy queues only).
+  std::vector<bool> gdaPeerMask;
+  ccoGdaConnectionType connType = CcoResolveConnection(comm, reqs->gdaConnectionType, &gdaPeerMask);
 
   ccoDevComm hostShadow = {};
   hostShadow.rank = comm->rank;
@@ -1735,52 +1788,109 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   size_t numEps = static_cast<size_t>(comm->worldSize) * numQpPerPe;
   core::RdmaEndpointDevice* epsGpu = nullptr;
 
-  // Build the peer mask once based on connType. Context::CreateAdditional /
-  // ConnectAdditional take the same mask. Empty mask if NONE.
-  //
-  // Layout assumption (HARD CONTRACT enforced at CommCreate): ranks are
-  // node-major contiguous and lsaSize is uniform across nodes, so each
-  // peer's lsaRank is `peer % comm->lsaSize`.
-  std::vector<bool> peerMask;
-  if (connType != CCO_GDA_CONNECTION_NONE) {
-    peerMask.assign(comm->worldSize, false);
-    for (int peer = 0; peer < comm->worldSize; peer++) {
-      if (peer == comm->rank) continue;
-      const auto& cap = comm->ctx->GetPeerCapabilities(peer);
-      switch (connType) {
-        case CCO_GDA_CONNECTION_FULL:
-          peerMask[peer] = cap.canRDMA;
-          break;
-        case CCO_GDA_CONNECTION_CROSSNODE:
-          peerMask[peer] = cap.canRDMA && !cap.sameHost;
-          break;
-        case CCO_GDA_CONNECTION_RAIL: {
-          const int myLsaRank = comm->lsaRank;
-          const int peerLsaRank = peer % comm->lsaSize;
-          peerMask[peer] = cap.canRDMA && !cap.sameHost && (peerLsaRank == myLsaRank);
-          break;
-        }
-        default:
-          break;
+  // ccoProxy: proxy threads + host-posted QPs to the proxy peer set, sharing the
+  // GDA signal slots. The proxy fields sit at the tail of reqs; read them only
+  // when the caller's struct has them.
+  const bool reqsHaveProxy =
+      reqs->size >= offsetof(ccoDevCommRequirements, proxyConnectionType) + sizeof(int);
+  const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
+  const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
+  const int proxyThreads = reqsHaveProxy ? std::max(reqs->proxyThreadCount, 0) : 0;
+  // QPs per (proxy thread, peer): the field, else 4.
+  const int proxyQpsPerPeer =
+      (reqsHaveProxy && reqs->proxyQpsPerPeer > 0) ? reqs->proxyQpsPerPeer : 4;
+  const int64_t proxyQueues = int64_t{proxySpsc} + int64_t{proxyMpsc};  // may exceed INT_MAX
+  // Requested proxy connection type: -1 follows gdaConnectionType; NONE without queues.
+  int proxyConnReq = CCO_GDA_CONNECTION_NONE;
+  if (proxyQueues > 0) {
+    proxyConnReq = reqs->proxyConnectionType < 0 ? static_cast<int>(reqs->gdaConnectionType)
+                                                 : reqs->proxyConnectionType;
+  }
+  const bool proxyConnValid =
+      proxyConnReq >= CCO_GDA_CONNECTION_NONE && proxyConnReq <= CCO_GDA_CONNECTION_RAIL;
+  std::vector<bool> proxyPeerMask;
+  const ccoGdaConnectionType proxyConnType =
+      CcoResolveConnection(comm, proxyConnValid ? proxyConnReq : 0, &proxyPeerMask);
+  std::string proxyError;
+#ifdef MORI_CCO_PROXY
+  {
+    // Collective in every proxy build, whatever this rank requested, and ahead
+    // of the other collectives here, so ranks that disagree all fail here
+    // instead of some waiting in the MR back-fill or the engine's QP exchange.
+    struct ProxyReq {
+      int32_t spsc, mpsc, threads, connType, disabled, qpsPerPeer, targetOk;
+    };
+    // Pushes only run on wave64 gfx942/gfx950; a multi-arch build reaches here on others too.
+    bool targetOk = true;
+    if (proxyQueues > 0) {
+      hipDeviceProp_t prop;
+      HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, comm->hipDev));
+      const std::string arch(prop.gcnArchName, std::strcspn(prop.gcnArchName, ":"));
+      targetOk = arch == "gfx942" || arch == "gfx950";
+      if (!targetOk) MORI_SHMEM_ERROR("ccoDevCommCreate: ccoProxy does not support {}", arch);
+    }
+    ProxyReq mine{proxySpsc,
+                  proxyMpsc,
+                  proxyThreads,
+                  proxyConnValid ? static_cast<int32_t>(proxyConnType) : -1,  // -1 = invalid
+                  env::IsEnvVarEnabled("MORI_CCO_DISABLE_PROXY"),
+                  proxyQueues > 0 ? proxyQpsPerPeer : 0,  // no QPs, nothing to agree on
+                  targetOk};
+    std::vector<ProxyReq> all(comm->worldSize);
+    comm->bootNet->Allgather(&mine, all.data(), sizeof(ProxyReq));
+    for (int r = 0; r < comm->worldSize && proxyError.empty(); r++) {
+      if (all[r].spsc != all[0].spsc || all[r].mpsc != all[0].mpsc ||
+          all[r].threads != all[0].threads || all[r].qpsPerPeer != all[0].qpsPerPeer) {
+        auto describe = [](const ProxyReq& q) {
+          return std::to_string(q.spsc) + " SPSC + " + std::to_string(q.mpsc) + " MPSC queues, " +
+                 std::to_string(q.threads) + " threads and " + std::to_string(q.qpsPerPeer) +
+                 " QPs per peer";
+        };
+        proxyError = "ranks disagree on the ccoProxy requirements: rank 0 asks for " +
+                     describe(all[0]) + ", rank " + std::to_string(r) + " for " + describe(all[r]);
+      } else if (all[r].connType < 0) {
+        proxyError = "invalid proxyConnectionType on rank " + std::to_string(r) +
+                     " (-1 or a ccoGdaConnectionType)";
+      } else if (all[r].connType != all[0].connType) {
+        proxyError = "ranks disagree on the ccoProxy connection type: rank 0 resolves it to " +
+                     std::string(CcoConnectionName(all[0].connType)) + ", rank " +
+                     std::to_string(r) + " to " + CcoConnectionName(all[r].connType);
+      } else if (proxyQueues > 0 && !all[r].targetOk) {
+        proxyError = "ccoProxy queues need a gfx942/gfx950 GPU on every rank; rank " +
+                     std::to_string(r) + " has another";
+      } else if (proxyQueues > 0 && all[r].disabled) {
+        proxyError = "ccoProxy queues requested but MORI_CCO_DISABLE_PROXY is set on rank " +
+                     std::to_string(r);
+      } else if (proxyQueues > 0 && all[r].connType == CCO_GDA_CONNECTION_NONE) {
+        proxyError =
+            "ccoProxy queues need RDMA and a proxyConnectionType (or, at -1, "
+            "gdaConnectionType) that resolves to non-NONE on every rank; rank " +
+            std::to_string(r) + " resolves it to NONE";
       }
     }
-    // Collapse to NONE if the resolved mask is empty (e.g. RAIL on single
-    // node, or CROSSNODE that lost all peers).
-    if (std::none_of(peerMask.begin(), peerMask.end(), [](bool b) { return b; })) {
-      MORI_SHMEM_TRACE(
-          "ccoDevCommCreate: resolved peer mask is empty, "
-          "downgrading connType {} -> NONE",
-          static_cast<int>(connType));
-      connType = CCO_GDA_CONNECTION_NONE;
-      peerMask.clear();
+    if (proxyError.empty() && proxyQueues > std::numeric_limits<int>::max()) {
+      proxyError = "proxySpscQueueCount + proxyMpscQueueCount exceeds INT_MAX";
     }
-    hostShadow.gdaConnType = connType;  // may have been collapsed above
+  }
+#else
+  if (proxyQueues > 0) {
+    proxyError =
+        "ccoProxy queues requested but mori was built without the ccoProxy host engine "
+        "(BUILD_CCO_PROXY=OFF, or no gfx942/gfx950 in GPU_TARGETS)";
+  }
+#endif
+  if (!proxyError.empty()) {
+    MORI_SHMEM_ERROR("ccoDevCommCreate: {}", proxyError);
+    return -1;
   }
 
   // First FULL DevComm on a single-node comm: back-fill MRs for windows registered without one.
-  // Keyed on the requested type, not the per-rank resolved one, so every rank runs the same
-  // collectives (only FULL can resolve to non-NONE when lsaSize == worldSize).
-  if (reqs->gdaConnectionType == CCO_GDA_CONNECTION_FULL && !comm->windowMrsEnabled) {
+  // Keyed on the requested GDA type, not the per-rank resolved one, so every rank runs the same
+  // collectives (only FULL can resolve to non-NONE when lsaSize == worldSize); the proxy type
+  // is already agreed on above.
+  if ((reqs->gdaConnectionType == CCO_GDA_CONNECTION_FULL ||
+       proxyConnType == CCO_GDA_CONNECTION_FULL) &&
+      !comm->windowMrsEnabled) {
     comm->windowMrsEnabled = true;
     for (ccoWindowHost* wh : comm->windows) {
       bool isFabric = false;
@@ -1799,8 +1909,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
 
   if (connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled()) {
     // Collective: every rank must call CreateAdditionalEndpoints together.
-    auto newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe, peerMask);
-    comm->ctx->ConnectAdditionalEndpoints(newEps, numQpPerPe, peerMask);
+    auto newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe, gdaPeerMask);
+    comm->ctx->ConnectAdditionalEndpoints(newEps, numQpPerPe, gdaPeerMask);
 
     // Note: post-Connect RTS verification via ibv_query_qp doesn't work for
     // direct-verbs providers (bnxt, mlx5), which keep QPs in their own
@@ -1853,8 +1963,11 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   int nNodes = comm->worldSize / comm->lsaSize;
   bool gdaRailUsable = (connType != CCO_GDA_CONNECTION_NONE) && (nNodes > 1);
 
-  int signalCountUser = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaSignalCount;
-  int counterCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaCounterCount;
+  // GDA and ccoProxy share the user signal / counter slots.
+  const bool anyRdma =
+      connType != CCO_GDA_CONNECTION_NONE || proxyConnType != CCO_GDA_CONNECTION_NONE;
+  int signalCountUser = anyRdma ? reqs->gdaSignalCount : 0;
+  int counterCount = anyRdma ? reqs->gdaCounterCount : 0;
   int lsaBarrierCount = reqs->lsaBarrierCount;
   int railGdaBarrierCount = gdaRailUsable ? reqs->railGdaBarrierCount : 0;
   int hybridBarrierCount = reqs->barrierCount;
@@ -1962,73 +2075,9 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   }
   hostShadow.resourceWindow = resourceWindow;
 
-  // ccoProxy: proxy threads + host-posted QPs to the GDA peer set, sharing the
-  // GDA signal slots. The proxy fields sit at the tail of reqs; read them only
-  // when the caller's struct has them.
-  const bool reqsHaveProxy =
-      reqs->size >= offsetof(ccoDevCommRequirements, proxyQpsPerPeer) + sizeof(int);
-  const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
-  const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
-  const int proxyThreads = reqsHaveProxy ? std::max(reqs->proxyThreadCount, 0) : 0;
-  // QPs per (proxy thread, peer): the field, else 4.
-  const int proxyQpsPerPeer =
-      (reqsHaveProxy && reqs->proxyQpsPerPeer > 0) ? reqs->proxyQpsPerPeer : 4;
-  const int64_t proxyQueues = int64_t{proxySpsc} + int64_t{proxyMpsc};  // may exceed INT_MAX
-  std::string proxyError;
+  // ccoProxy engine: agreed on above, so every rank with queues gets here.
 #ifdef MORI_CCO_PROXY
-  {
-    // Collective in every proxy build, whatever this rank requested, so ranks
-    // that disagree all fail here instead of some waiting in the engine's QP
-    // exchange.
-    struct ProxyReq {
-      int32_t spsc, mpsc, threads, rdmaReady, disabled, qpsPerPeer, targetOk;
-    };
-    // Pushes only run on wave64 gfx942/gfx950; a multi-arch build reaches here on others too.
-    bool targetOk = true;
-    if (proxyQueues > 0) {
-      hipDeviceProp_t prop;
-      HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, comm->hipDev));
-      const std::string arch(prop.gcnArchName, std::strcspn(prop.gcnArchName, ":"));
-      targetOk = arch == "gfx942" || arch == "gfx950";
-      if (!targetOk) MORI_SHMEM_ERROR("ccoDevCommCreate: ccoProxy does not support {}", arch);
-    }
-    ProxyReq mine{proxySpsc,
-                  proxyMpsc,
-                  proxyThreads,
-                  connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled(),
-                  env::IsEnvVarEnabled("MORI_CCO_DISABLE_PROXY"),
-                  proxyQueues > 0 ? proxyQpsPerPeer : 0,  // no QPs, nothing to agree on
-                  targetOk};
-    std::vector<ProxyReq> all(comm->worldSize);
-    comm->bootNet->Allgather(&mine, all.data(), sizeof(ProxyReq));
-    for (int r = 0; r < comm->worldSize && proxyError.empty(); r++) {
-      if (all[r].spsc != all[0].spsc || all[r].mpsc != all[0].mpsc ||
-          all[r].threads != all[0].threads || all[r].qpsPerPeer != all[0].qpsPerPeer) {
-        auto describe = [](const ProxyReq& q) {
-          return std::to_string(q.spsc) + " SPSC + " + std::to_string(q.mpsc) + " MPSC queues, " +
-                 std::to_string(q.threads) + " threads and " + std::to_string(q.qpsPerPeer) +
-                 " QPs per peer";
-        };
-        proxyError = "ranks disagree on the ccoProxy requirements: rank 0 asks for " +
-                     describe(all[0]) + ", rank " + std::to_string(r) + " for " + describe(all[r]);
-      } else if (proxyQueues > 0 && !all[r].targetOk) {
-        proxyError = "ccoProxy queues need a gfx942/gfx950 GPU on every rank; rank " +
-                     std::to_string(r) + " has another";
-      } else if (proxyQueues > 0 && all[r].disabled) {
-        proxyError = "ccoProxy queues requested but MORI_CCO_DISABLE_PROXY is set on rank " +
-                     std::to_string(r);
-      } else if (proxyQueues > 0 && !all[r].rdmaReady) {
-        proxyError =
-            "ccoProxy queues need RDMA and a gdaConnectionType that resolves to non-NONE "
-            "on every rank (ccoProxy uses the GDA peer set and signal slots); rank " +
-            std::to_string(r) + " lacks one";
-      }
-    }
-    if (proxyError.empty() && proxyQueues > std::numeric_limits<int>::max()) {
-      proxyError = "proxySpscQueueCount + proxyMpscQueueCount exceeds INT_MAX";
-    }
-  }
-  if (proxyError.empty() && proxyQueues > 0) {
+  if (proxyQueues > 0) {
     ccoProxyEngineConfig proxyConfig;
     proxyConfig.numSpscQueues = proxySpsc;
     proxyConfig.numMpscQueues = proxyMpsc;
@@ -2036,12 +2085,13 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     proxyConfig.queueCapacity =
         reqs->proxyQueueCapacity > 0 ? static_cast<size_t>(reqs->proxyQueueCapacity) : 0;
     proxyConfig.qpsPerPeer = proxyQpsPerPeer;
-    proxyConfig.peerMask = peerMask;
+    proxyConfig.peerMask = proxyPeerMask;
     ccoProxyEngine* engine =
         ccoProxyEngineCreate(comm->ctx, comm->bootNet, proxyConfig, &hostShadow.proxy);
     if (engine == nullptr) {
       proxyError = "ccoProxy engine creation failed";
     } else {
+      hostShadow.proxy.connType = proxyConnType;
       std::lock_guard<std::mutex> lock(comm->allocMutex);
       comm->proxyEngines.push_back(engine);
     }
@@ -2058,12 +2108,6 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
                      "with SignalInc / SignalAdd instead, or turn relaxed ordering off\n");
       });
     }
-  }
-#else
-  if (proxyQueues > 0) {
-    proxyError =
-        "ccoProxy queues requested but mori was built without the ccoProxy host engine "
-        "(BUILD_CCO_PROXY=OFF, or no gfx942/gfx950 in GPU_TARGETS)";
   }
 #endif
   if (!proxyError.empty()) {
@@ -2218,21 +2262,6 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   // verifying gdaConnectionType behavior end-to-end.
   if (const char* env = std::getenv("MORI_CCO_LOG_TRANSPORT")) {
     if (env[0] != '0') {
-      const char* connTypeStr = "?";
-      switch (connType) {
-        case CCO_GDA_CONNECTION_NONE:
-          connTypeStr = "NONE";
-          break;
-        case CCO_GDA_CONNECTION_FULL:
-          connTypeStr = "FULL";
-          break;
-        case CCO_GDA_CONNECTION_CROSSNODE:
-          connTypeStr = "CROSSNODE";
-          break;
-        case CCO_GDA_CONNECTION_RAIL:
-          connTypeStr = "RAIL";
-          break;
-      }
       const bool sdmaPoolActive =
           (hostShadow.sdma.sdmaNumQueue > 0 && hostShadow.sdma.signalBuf != nullptr);
 
@@ -2242,9 +2271,10 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       buf.reserve(256 + 64 * comm->worldSize);
       char line[160];
       snprintf(line, sizeof(line),
-               "[cco] DevComm rank=%d/%d connType=%s — transport map "
+               "[cco] DevComm rank=%d/%d connType=%s proxyConnType=%s — transport map "
                "(CAP=hardware capability, ACT=materialized by this DevComm):\n",
-               comm->rank, comm->worldSize, connTypeStr);
+               comm->rank, comm->worldSize, CcoConnectionName(connType),
+               CcoConnectionName(proxyConnType));
       buf += line;
       buf += "  peer  | cap                | active\n";
       buf += "  ------+--------------------+--------------------\n";
@@ -2266,8 +2296,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
         const bool actSDMA = sdmaPoolActive && cap.canSDMA;
         bool actRDMA = false;
         if (connType != CCO_GDA_CONNECTION_NONE && rdmaEnabled &&
-            peer < static_cast<int>(peerMask.size())) {
-          actRDMA = peerMask[peer];
+            peer < static_cast<int>(gdaPeerMask.size())) {
+          actRDMA = gdaPeerMask[peer];
         }
 
         auto fmt = [](bool p2p, bool sdma, bool rdma, char* out, size_t n) {

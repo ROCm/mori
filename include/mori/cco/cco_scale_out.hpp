@@ -1292,8 +1292,9 @@ __device__ inline static void resetCounterImpl(volatile uint64_t* counterBuf,
 // RAIL:      teamPeer is node_id; global = teamPeer * lsaSize + lsaRank
 // CROSSNODE: team = [0,nodeStart) ∪ {self at nodeStart} ∪ [nodeStart+lsaSize,worldSize)
 // NONE:      returns -1
-__device__ inline int GdaPeerToWorld(ccoDevComm const& comm, int teamPeer) {
-  switch (comm.gdaConnType) {
+// connType: the team's ccoGdaConnectionType (ccoProxy passes its own).
+__device__ inline int GdaPeerToWorld(ccoDevComm const& comm, int connType, int teamPeer) {
+  switch (connType) {
     case CCO_GDA_CONNECTION_FULL:
       return teamPeer;
     case CCO_GDA_CONNECTION_RAIL:
@@ -1306,6 +1307,33 @@ __device__ inline int GdaPeerToWorld(ccoDevComm const& comm, int teamPeer) {
     }
     default:
       return -1;
+  }
+}
+
+__device__ inline int GdaPeerToWorld(ccoDevComm const& comm, int teamPeer) {
+  return GdaPeerToWorld(comm, comm.gdaConnType, teamPeer);
+}
+
+// My index and the size of the GDA team of connType; 0 and 0 for NONE.
+__device__ inline void GdaTeamRankSize(ccoDevComm const& comm, int connType, int& rank,
+                                       int& nRanks) {
+  switch (connType) {
+    case CCO_GDA_CONNECTION_FULL:
+      rank = comm.rank;
+      nRanks = comm.worldSize;
+      break;
+    case CCO_GDA_CONNECTION_RAIL:
+      rank = comm.rank / comm.lsaSize;
+      nRanks = comm.worldSize / comm.lsaSize;
+      break;
+    case CCO_GDA_CONNECTION_CROSSNODE:
+      rank = (comm.rank / comm.lsaSize) * comm.lsaSize;
+      nRanks = comm.worldSize - comm.lsaSize + 1;
+      break;
+    default:  // CCO_GDA_CONNECTION_NONE
+      rank = 0;
+      nRanks = 0;
+      break;
   }
 }
 
@@ -1350,26 +1378,7 @@ template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 __device__ inline ccoGda<PrvdType, Doorbell>::ccoGda(ccoDevComm const& comm_, int contextIndex)
     : comm(comm_), contextId(contextIndex) {
   this->_gdaHandle = (void*)&comm.ibgda;
-  switch (comm.gdaConnType) {
-    case CCO_GDA_CONNECTION_FULL:
-      this->rank = comm.rank;
-      this->nRanks = comm.worldSize;
-      break;
-    case CCO_GDA_CONNECTION_RAIL:
-      this->rank = comm.rank / comm.lsaSize;
-      this->nRanks = comm.worldSize / comm.lsaSize;
-      break;
-    case CCO_GDA_CONNECTION_CROSSNODE: {
-      int nodeStart = (comm.rank / comm.lsaSize) * comm.lsaSize;
-      this->rank = nodeStart;
-      this->nRanks = comm.worldSize - comm.lsaSize + 1;
-      break;
-    }
-    default:  // CCO_GDA_CONNECTION_NONE
-      this->rank = 0;
-      this->nRanks = 0;
-      break;
-  }
+  impl::GdaTeamRankSize(comm, comm.gdaConnType, this->rank, this->nRanks);
 }
 
 // put: RDMA write with optional signal
