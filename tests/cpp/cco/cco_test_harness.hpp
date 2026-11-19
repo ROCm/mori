@@ -107,11 +107,15 @@ static inline int ccoTestForkMode(int nranks, const char* name, const char* uidP
   for (int r = 0; r < nranks; r++) {
     pid_t pid = fork();
     if (pid == 0) {
+      // Line-buffered, so output survives _exit, traps and kills when piped.
+      setvbuf(stdout, nullptr, _IOLBF, 0);
       mori::cco::ccoUniqueId childUid;
       while (!ccoTestReadFile(uidPath, &childUid, sizeof(childUid))) {
         usleep(10000);
       }
-      _exit(run_test(r, nranks, childUid));
+      const int rc = run_test(r, nranks, childUid);
+      fflush(nullptr);  // _exit skips stdio flushing
+      _exit(rc);
     }
     children.push_back(pid);
   }
