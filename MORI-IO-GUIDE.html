@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI-IO Introduction &mdash; MORI development (baa57164) documentation</title>
+  <title>MORI-IO Introduction &mdash; MORI development (1eb89cc3) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=64c942ee"></script>
+      <script src="_static/documentation_options.js?v=d68a20f8"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -87,6 +87,10 @@
 <li class="toctree-l2"><a class="reference internal" href="#python-api-quick-reference">Python API Quick Reference</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#example-basic-read-write">Example: Basic Read/Write</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#known-issues">Known Issues</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#ainic-firmware-retransmitted-rdma-reads-lose-data-or-fail-the-qp">AINIC firmware: retransmitted RDMA READs lose data or fail the QP</a></li>
+</ul>
+</li>
 <li class="toctree-l2"><a class="reference internal" href="#simulation-mode">Simulation Mode</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#profiling-mori-io-with-roctx-markers">Profiling MORI-IO with ROCTX Markers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a><ul>
@@ -163,6 +167,7 @@
 <li><p><a class="reference internal" href="#python-api-quick-reference">Python API Quick Reference</a></p></li>
 <li><p><a class="reference internal" href="#example-basic-read-write">Example: Basic Read/Write</a></p></li>
 <li><p><a class="reference internal" href="#environment-configuration">Environment &amp; Configuration</a></p></li>
+<li><p><a class="reference internal" href="#known-issues">Known Issues</a></p></li>
 <li><p><a class="reference internal" href="#simulation-mode">Simulation Mode</a></p></li>
 <li><p><a class="reference internal" href="#profiling-mori-io-with-roctx-markers">Profiling MORI-IO with ROCTX Markers</a></p></li>
 <li><p><a class="reference internal" href="#source-files">Source Files</a></p></li>
@@ -453,7 +458,7 @@ in logs; when another backend is selected, an INFO log gives the Fabric reason a
 <td><p>The RC QP retry attributes applied at RTS, bounded so an out-of-range value is ignored rather than failing QP setup. <code class="docutils literal notranslate"><span class="pre">MORI_IO_QP_TIMEOUT</span></code> (0–31, default <code class="docutils literal notranslate"><span class="pre">14</span></code>; local ACK timeout = <code class="docutils literal notranslate"><span class="pre">4.096us</span> <span class="pre">*</span> <span class="pre">2^timeout</span></code>; <code class="docutils literal notranslate"><span class="pre">0</span></code> disables it and lets an unresponsive peer stall indefinitely), <code class="docutils literal notranslate"><span class="pre">MORI_IO_QP_RETRY_CNT</span></code> (0–7, default <code class="docutils literal notranslate"><span class="pre">7</span></code>), <code class="docutils literal notranslate"><span class="pre">MORI_IO_QP_RNR_RETRY</span></code> (0–7, default <code class="docutils literal notranslate"><span class="pre">7</span></code>; <code class="docutils literal notranslate"><span class="pre">7</span></code> = retry RNR NAKs forever), <code class="docutils literal notranslate"><span class="pre">MORI_IO_QP_MIN_RNR_TIMER</span></code> (0–31, default <code class="docutils literal notranslate"><span class="pre">12</span></code>; IB-spec RNR NAK backoff). Each also honors a transport-wide <code class="docutils literal notranslate"><span class="pre">MORI_RDMA_QP_*</span></code> fallback (e.g. <code class="docutils literal notranslate"><span class="pre">MORI_RDMA_QP_TIMEOUT</span></code>) that tunes the shmem/CCO QPs sharing this path. The <code class="docutils literal notranslate"><span class="pre">MORI_IO_QP_*</span></code> name wins whenever it is set, including when its value is out of range — an invalid IO-specific value falls back to the built-in default, never to the <code class="docutils literal notranslate"><span class="pre">MORI_RDMA_QP_*</span></code> value.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_QP_MAX_RD_ATOMIC</span></code></p></td>
-<td><p>RDMA READs (and atomics) each QP keeps in flight, applied as <code class="docutils literal notranslate"><span class="pre">max_rd_atomic</span></code> at RTS. Unset (the default) keeps the device limit; a value of <code class="docutils literal notranslate"><span class="pre">0</span></code>, or at or above the device limit, is ignored. The ionic driver rounds the value down to <code class="docutils literal notranslate"><span class="pre">2^k</span> <span class="pre">-</span> <span class="pre">1</span></code> (1, 3, 7, 15). On AMD AINIC firmware 1.117.5-a-77, a READ retransmitted while several are in flight can move the QP to the error state without a failed completion, or complete with part of its data missing. With <code class="docutils literal notranslate"><span class="pre">1</span></code> we saw neither the former nor, except under heavy receive backpressure with many QPs per NIC, the latter: it lowers the risk but does not remove it. Also honors the transport-wide <code class="docutils literal notranslate"><span class="pre">MORI_RDMA_QP_MAX_RD_ATOMIC</span></code> fallback, like the RC retry attributes.</p></td>
+<td><p>RDMA READs (and atomics) each QP keeps in flight, applied as <code class="docutils literal notranslate"><span class="pre">max_rd_atomic</span></code> at RTS. Unset (the default) keeps the device limit; a value of <code class="docutils literal notranslate"><span class="pre">0</span></code>, or at or above the device limit, is ignored. The ionic driver rounds the value down to <code class="docutils literal notranslate"><span class="pre">2^k</span> <span class="pre">-</span> <span class="pre">1</span></code> (1, 3, 7, 15). Set it to <code class="docutils literal notranslate"><span class="pre">1</span></code> on AINIC firmware that mishandles retransmitted READs (see <a class="reference internal" href="#known-issues">Known Issues</a>). Also honors the transport-wide <code class="docutils literal notranslate"><span class="pre">MORI_RDMA_QP_MAX_RD_ATOMIC</span></code> fallback, like the RC retry attributes.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_FAIL_ON_ASYNC_EVENT</span></code></p></td>
 <td><p>When enabled, a fatal verbs async event (QP/CQ/device fatal) fails every in-flight transfer on the affected endpoints and marks them degraded so later submissions fail fast instead of hanging on a dead QP. Default on; set <code class="docutils literal notranslate"><span class="pre">0</span></code> to disable and restore the previous hang-until-timeout behavior.</p></td>
@@ -472,6 +477,20 @@ in logs; when another backend is selected, an INFO log gives the Fabric reason a
 <p>UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are
 out of scope for MORI-IO; see <a class="reference external" href="https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/runtime-env-vars.md</span></code></a>.</p>
+</section>
+<section id="known-issues">
+<h2>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading"></a></h2>
+<section id="ainic-firmware-retransmitted-rdma-reads-lose-data-or-fail-the-qp">
+<h3>AINIC firmware: retransmitted RDMA READs lose data or fail the QP<a class="headerlink" href="#ainic-firmware-retransmitted-rdma-reads-lose-data-or-fail-the-qp" title="Link to this heading"></a></h3>
+<p>On AMD Pollara (AINIC) 1.117.5 firmware after <code class="docutils literal notranslate"><span class="pre">a-45</span></code>, an RDMA READ that is retransmitted while its QP keeps several READs in flight can go wrong. This was seen on <code class="docutils literal notranslate"><span class="pre">1.117.5-a-77</span></code> and <code class="docutils literal notranslate"><span class="pre">1.117.5-a-196</span></code>, not on <code class="docutils literal notranslate"><span class="pre">1.117.5-a-45</span></code>; until a firmware build with the fix is available, treat every 1.117.5 build after <code class="docutils literal notranslate"><span class="pre">a-45</span></code> as affected. A MORI-IO read, which is an RDMA READ, can then:</p>
+<ul class="simple">
+<li><p>fail with <code class="docutils literal notranslate"><span class="pre">Work</span> <span class="pre">Request</span> <span class="pre">Flushed</span> <span class="pre">Error</span></code> and no <code class="docutils literal notranslate"><span class="pre">[ROOT</span> <span class="pre">CAUSE]</span></code> completion before it: the firmware moved the QP to the error state without failing a work request (<code class="docutils literal notranslate"><span class="pre">a-77</span></code>);</p></li>
+<li><p>report success with whole 4 KiB packets of its data never written (<code class="docutils literal notranslate"><span class="pre">a-77</span></code>);</p></li>
+<li><p>report success before all of its data is written, the rest landing up to about 2 s later, occasionally after the buffer has been reused (<code class="docutils literal notranslate"><span class="pre">a-196</span></code>, seen in a KVM guest with SR-IOV VFs).</p></li>
+</ul>
+<p>It happens only when READs are retransmitted, that is when the reader is backpressured (for example READ buffers on the other NUMA node, or many QPs or large READs per NIC); <code class="docutils literal notranslate"><span class="pre">tx_rdma_ack_timeout</span></code> and <code class="docutils literal notranslate"><span class="pre">req_rx_cqe_err</span></code> under <code class="docutils literal notranslate"><span class="pre">/sys/class/infiniband/&lt;dev&gt;/ports/1/hw_counters/</span></code> then grow.</p>
+<p><strong>Workaround:</strong> set <code class="docutils literal notranslate"><span class="pre">MORI_IO_QP_MAX_RD_ATOMIC=1</span></code>, so that each QP keeps one READ in flight. In testing, the <code class="docutils literal notranslate"><span class="pre">a-196</span></code> symptoms did not occur with it; on <code class="docutils literal notranslate"><span class="pre">a-77</span></code> no QP failed silently any more, and data went missing only under heavy receive backpressure with many QPs per NIC. Throughput dropped by about 4% without other load; with small chunks (64 KiB) use more QPs per transfer. Without this setting, MORI-IO logs this known issue once per process, at the first READ over such firmware.</p>
+</section>
 </section>
 <section id="simulation-mode">
 <h2>Simulation Mode<a class="headerlink" href="#simulation-mode" title="Link to this heading"></a></h2>
