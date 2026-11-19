@@ -43,6 +43,8 @@ including in prefill-decode disaggregated serving.
   [tier-management benchmark](UMBP-TIER-MANAGEMENT-BENCHMARK.md) page.
 - SSD tiers, including multi-drive ones: [Pure-SSD mode](umbp-pure-ssd-mode.md).
 - DRAM on multi-socket hosts: [NUMA placement](umbp-numa-tier-placement.md).
+- Managing groups of keys differently (what to store, what to evict first, what
+  to demote): [Pool rules](umbp-pool-rules.md).
 
 ## Building
 

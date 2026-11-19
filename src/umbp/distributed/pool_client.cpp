@@ -986,6 +986,20 @@ bool PoolClient::Init() {
   default_pool_ =
       std::make_unique<PeerPool>(&registry_, std::move(placement_policy), transfer_engine_.get());
 
+  // Pool rules given at start-up; they can be replaced later (SetPoolRules).
+  // A file that was asked for and cannot be used stops the start: running
+  // with other rules than the operator wrote would be silent misbehaviour.
+  if (const char* rules_path = std::getenv("UMBP_POOL_RULES");
+      rules_path != nullptr && rules_path[0] != '\0') {
+    std::string reason;
+    if (!default_pool_->Rules().LoadFile(rules_path, &reason)) {
+      MORI_UMBP_ERROR("[PoolClient] UMBP_POOL_RULES={} rejected: {}", rules_path, reason);
+      Shutdown();
+      return false;
+    }
+    MORI_UMBP_INFO("[PoolClient] pool rules loaded from {}", rules_path);
+  }
+
   // Local watermark eviction, for every medium unless a master's rounds own
   // DRAM/HBM (eviction_mode kMaster; SSD always evicts locally).  A node that
   // evicts for itself uses a tiered policy's per-tier watermarks when there
@@ -1626,6 +1640,8 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   request.preferred_device = SourceDeviceFor(src, size);
   auto pool_alloc = default_pool_->BatchAllocate({request}).front();
   if (pool_alloc.in_flight) return PutAttemptOutcome::kSuccessAlreadyExists;
+  // Declined by the key's pool rule: final until the rule changes, so no retry.
+  if (pool_alloc.declined) return PutAttemptOutcome::kFatal;
   auto* backend = registry_.Get(pool_alloc.backend_id);
   // A medium that publishes no buffer endpoints cannot be reached in-process at
   // all; route the key elsewhere rather than allocating a slot we cannot fill.
@@ -5329,6 +5345,33 @@ size_t PoolClient::BatchTouch(const std::vector<std::string>& keys) {
   // hears of uses only through these reports.
   if (master_client_ != nullptr) master_client_->NoteLocalReads(keys);
   return default_pool_->BatchTouch(keys);
+}
+
+size_t PoolClient::BatchSetKeyClass(const std::string& pool, const std::vector<std::string>& keys,
+                                    const std::vector<uint32_t>& tags) {
+  if (!initialized_ || default_pool_ == nullptr) return 0;
+  return default_pool_->Rules().SetKeyClass(pool, keys, tags);
+}
+
+bool PoolClient::SetPoolRules(const std::string& pool, const std::string& table_json,
+                              std::string* error) {
+  if (!initialized_ || default_pool_ == nullptr) {
+    if (error != nullptr) *error = "the pool is not initialized";
+    return false;
+  }
+  std::string reason;
+  if (!default_pool_->Rules().SetTableJson(pool, table_json, &reason)) {
+    MORI_UMBP_WARN("[PoolClient] pool rules for '{}' rejected: {}", pool, reason);
+    if (error != nullptr) *error = reason;
+    return false;
+  }
+  MORI_UMBP_INFO("[PoolClient] pool rules for '{}' replaced", pool);
+  return true;
+}
+
+std::string PoolClient::GetPoolRulesState() {
+  if (!initialized_ || default_pool_ == nullptr) return {};
+  return default_pool_->Rules().StateJson();
 }
 
 // ---------------------------------------------------------------------------

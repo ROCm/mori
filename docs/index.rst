@@ -68,6 +68,7 @@ New to MORI? :doc:`Install it <installation>`, then work through the :doc:`quick
    Configuration and environment variables <umbp-configuration>
    Pure-SSD mode and multi-drive tiers <umbp-pure-ssd-mode>
    NUMA placement for a DRAM tier <umbp-numa-tier-placement>
+   Pool rules: per-pool management policy <umbp-pool-rules>
    KV indexer export <umbp-kv-indexer-export>
    Monitoring <umbp-monitoring>
    PD disaggregation benchmark <MORI-UMBP-PD-BENCHMARK>

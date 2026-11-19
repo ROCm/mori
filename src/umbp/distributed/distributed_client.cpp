@@ -361,6 +361,31 @@ size_t DistributedClient::BatchTouch(const std::vector<std::string>& keys) {
   return pool_client_->BatchTouch(keys);
 }
 
+size_t DistributedClient::BatchSetKeyClass(const std::string& pool,
+                                           const std::vector<std::string>& keys,
+                                           const std::vector<uint32_t>& tags) {
+  if (closing_ || keys.empty()) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return 0;
+  return pool_client_->BatchSetKeyClass(pool, keys, tags);
+}
+
+bool DistributedClient::SetPoolRules(const std::string& pool, const std::string& table_json,
+                                     std::string* error) {
+  std::shared_lock lk(op_mutex_);
+  if (closing_ || closed_) {
+    if (error != nullptr) *error = "the client is closed";
+    return false;
+  }
+  return pool_client_->SetPoolRules(pool, table_json, error);
+}
+
+std::string DistributedClient::GetPoolRulesState() {
+  std::shared_lock lk(op_mutex_);
+  if (closing_ || closed_) return {};
+  return pool_client_->GetPoolRulesState();
+}
+
 // ---------------------------------------------------------------------------
 // RegisterMemory / DeregisterMemory
 // ---------------------------------------------------------------------------

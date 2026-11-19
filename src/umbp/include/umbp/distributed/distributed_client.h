@@ -82,6 +82,11 @@ class DistributedClient : public IUMBPClient {
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
   size_t BatchPrefetch(const std::vector<std::string>& keys) override;
   size_t BatchTouch(const std::vector<std::string>& keys) override;
+  size_t BatchSetKeyClass(const std::string& pool, const std::vector<std::string>& keys,
+                          const std::vector<uint32_t>& tags) override;
+  bool SetPoolRules(const std::string& pool, const std::string& table_json,
+                    std::string* error = nullptr) override;
+  std::string GetPoolRulesState() override;
 
   bool Clear() override;
   bool Flush() override;

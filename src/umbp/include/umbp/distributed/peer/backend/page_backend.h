@@ -376,6 +376,9 @@ class PageBackend : public MediumBackend {
     // while holding only a shared lock on mutex_.
     std::list<std::string>::iterator lru_it{};
     bool in_lru = false;
+    // steady_clock nanoseconds of the last LRU touch; reported as an offer's
+    // idle time.  GUARDED BY lru_mutex_, like lru_it.
+    int64_t last_touch_ns = 0;
 
     // std::atomic is neither copyable nor movable, but OwnedSlot is stored by
     // value in owned_ and moved into place on commit, so the moves are spelled
@@ -388,7 +391,8 @@ class PageBackend : public MediumBackend {
           hold(std::move(other.hold)),
           generation(other.generation),
           lru_it(other.lru_it),
-          in_lru(other.in_lru) {}
+          in_lru(other.in_lru),
+          last_touch_ns(other.last_touch_ns) {}
     OwnedSlot& operator=(OwnedSlot&& other) noexcept {
       if (this == &other) return *this;
       pages = std::move(other.pages);
@@ -399,6 +403,7 @@ class PageBackend : public MediumBackend {
       generation = other.generation;
       lru_it = other.lru_it;
       in_lru = other.in_lru;
+      last_touch_ns = other.last_touch_ns;
       return *this;
     }
     OwnedSlot(const OwnedSlot&) = delete;

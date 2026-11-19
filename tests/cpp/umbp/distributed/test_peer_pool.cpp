@@ -22,6 +22,8 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+#include <google/protobuf/struct.pb.h>
+#include <google/protobuf/util/json_util.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -1893,6 +1895,213 @@ TEST(PeerPoolLocalEviction, RejectsBadConfigAndLeavesAnUnorderedMediumAlone) {
   ASSERT_TRUE(pool.EnableLocalEviction(id, 0.9, 0.5));
   pool.RunLocalEvictionOnceForTest();
   EXPECT_TRUE(registry.Get("dram")->Contains("k"));
+}
+
+// ---- Pool rules: the four management decisions follow the key's class ----
+
+// Reads one number out of PoolRules::StateJson() by path, e.g.
+// {"pools", "state", "classes", "7", "declined"}.  -1 when the path is absent.
+double StateNumber(const std::string& json, const std::vector<std::string>& path) {
+  google::protobuf::Struct root;
+  if (!google::protobuf::util::JsonStringToMessage(json, &root).ok()) return -1;
+  const google::protobuf::Struct* node = &root;
+  for (size_t i = 0; i < path.size(); ++i) {
+    auto it = node->fields().find(path[i]);
+    if (it == node->fields().end()) return -1;
+    if (i + 1 == path.size()) {
+      return it->second.kind_case() == google::protobuf::Value::kNumberValue
+                 ? it->second.number_value()
+                 : -1;
+    }
+    if (it->second.kind_case() != google::protobuf::Value::kStructValue) return -1;
+    node = &it->second.struct_value();
+  }
+  return -1;
+}
+
+double ClassNumber(const std::string& json, const std::string& pool, const std::string& tag,
+                   const std::vector<std::string>& field) {
+  std::vector<std::string> path = {"pools", pool, "classes", tag};
+  path.insert(path.end(), field.begin(), field.end());
+  return StateNumber(json, path);
+}
+
+TEST(PeerPoolRules, ADeclinedClassIsNotStoredUntilItsRuleChanges) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10);
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  ASSERT_TRUE(pool.Rules().SetTableJson("state", R"({"rules": {"7": {"admit": false}}})"));
+  ASSERT_EQ(pool.Rules().SetKeyClass("state", {"declined"}, {7}), 1u);
+
+  auto result = pool.BatchAllocate({PutRequest("declined")}).front();
+  EXPECT_TRUE(result.declined);
+  EXPECT_FALSE(result.in_flight);
+  EXPECT_EQ(result.allocation.outcome, AllocateOutcome::kFailed);
+  EXPECT_EQ(registry.Get("dram")->OwnedKeyCount(), 0u);
+  CommitKey(&pool, "unclassified");  // other keys are unaffected
+
+  // Replace the table while the pool runs: the same class is stored from now on.
+  ASSERT_TRUE(pool.Rules().SetTableJson("state", "{}"));
+  ASSERT_EQ(pool.Rules().SetKeyClass("state", {"declined"}, {7}), 1u);
+  CommitKey(&pool, "declined");
+  EXPECT_TRUE(pool.BatchResolve({"declined"}, false).front().resolved.found);
+  EXPECT_TRUE(pool.BatchResolve({"unclassified"}, false).front().resolved.found);
+}
+
+TEST(PeerPoolRules, AFastAgeingClassLeavesBeforeOlderUnclassifiedKeys) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10,
+                      std::chrono::milliseconds(1));
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  auto* dram = registry.Get("dram");
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(dram), 0.9, 0.5));
+  ASSERT_TRUE(pool.Rules().SetTableJson("state", R"({"rules": {"1": {"weight": 1000}}})"));
+
+  for (int i = 0; i < 5; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+  for (int i = 0; i < 3; ++i) {
+    const std::string key = "s" + std::to_string(i);
+    ASSERT_EQ(pool.Rules().SetKeyClass("state", {key}, {1}), 1u);
+    CommitKey(&pool, key);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  CommitKey(&pool, "k5");  // the ninth page crosses the high watermark
+
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_FALSE(dram->Contains("s" + std::to_string(i))) << "younger, but ages 1000x as fast";
+  }
+  EXPECT_FALSE(dram->Contains("k0")) << "then the oldest unclassified key";
+  for (int i = 1; i <= 5; ++i) EXPECT_TRUE(dram->Contains("k" + std::to_string(i))) << i;
+}
+
+TEST(PeerPoolRules, ASlowAgeingClassOutlivesYoungerUnclassifiedKeys) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10,
+                      std::chrono::milliseconds(1));
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  auto* dram = registry.Get("dram");
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(dram), 0.9, 0.5));
+  ASSERT_TRUE(pool.Rules().SetTableJson("kv", R"({"default": {"weight": 0.001}})"));
+
+  for (int i = 0; i < 3; ++i) {
+    const std::string key = "p" + std::to_string(i);
+    ASSERT_EQ(pool.Rules().SetKeyClass("kv", {key}, {0}), 1u);
+    CommitKey(&pool, key);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+  for (int i = 0; i < 6; ++i) {
+    CommitKey(&pool, "k" + std::to_string(i));
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  }
+
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_TRUE(dram->Contains("p" + std::to_string(i))) << "oldest, but ages 1000x slower";
+  }
+  EXPECT_FALSE(dram->Contains("k0"));
+  EXPECT_TRUE(dram->Contains("k5"));
+}
+
+TEST(PeerPoolRules, AClassWithDemoteOffIsDroppedNotWrittenToTheNextTier) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kHostPage, 10,
+                      std::chrono::milliseconds(1));
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kHostPage, 20);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  auto* hot = registry.Get("hot");
+  auto* cold = registry.Get("cold");
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(hot), 0.9, 0.5));
+  ASSERT_TRUE(pool.Rules().SetTableJson("state", R"({"rules": {"1": {"demote": false}}})"));
+
+  for (int i = 0; i < 2; ++i) {
+    const std::string key = "d" + std::to_string(i);
+    ASSERT_EQ(pool.Rules().SetKeyClass("state", {key}, {1}), 1u);
+    CommitKey(&pool, key);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  }
+  for (int i = 0; i < 7; ++i) {
+    CommitKey(&pool, "k" + std::to_string(i));
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  }
+
+  ASSERT_TRUE(WaitUntil([&] { return hot->OwnedKeyCount() <= 5; }));
+  ASSERT_TRUE(WaitForKey(&registry, "cold", "k1"));
+  for (int i = 0; i < 2; ++i) {
+    const std::string key = "d" + std::to_string(i);
+    EXPECT_FALSE(hot->Contains(key)) << key;
+    EXPECT_FALSE(cold->Contains(key)) << key << " was demoted although its rule says drop";
+    EXPECT_FALSE(pool.BatchResolve({key}, false).front().resolved.found) << key;
+  }
+  for (int i = 0; i < 2; ++i) {
+    const std::string key = "k" + std::to_string(i);
+    EXPECT_TRUE(cold->Contains(key)) << key << " should have been demoted as before";
+  }
+  const std::string state = pool.Rules().StateJson();
+  EXPECT_EQ(ClassNumber(state, "state", "1", {"dropped"}), 2) << state;
+  EXPECT_EQ(ClassNumber(state, "state", "1", {"dropped_unread"}), 2) << state;
+  EXPECT_EQ(ClassNumber(state, "state", "1", {"demoted"}), 0) << state;
+}
+
+TEST(PeerPoolRules, APromoteRuleOverridesTheTiersTrigger) {
+  constexpr auto kShortLease = std::chrono::milliseconds(1);
+  for (const bool tier_promotes : {false, true}) {
+    LocalCopyEngine engine;
+    BackendRegistry registry;
+    RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kHostPage, 8, kShortLease);
+    RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kHostPage, 8, kShortLease);
+    auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
+    if (tier_promotes) tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;
+    auto compiled = LogicalTierGraph::Compile(tiers, registry);
+    ASSERT_TRUE(compiled.ok()) << compiled.error;
+    PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+    // The rule says the opposite of the tier.
+    ASSERT_TRUE(pool.Rules().SetTableJson(
+        "state", tier_promotes ? R"({"rules": {"1": {"promote": "never"}}})"
+                               : R"({"rules": {"1": {"promote": "on_read"}}})"));
+    ASSERT_EQ(pool.Rules().SetKeyClass("state", {"ruled"}, {1}), 1u);
+    CommitKey(&pool, "ruled", "cold");
+    CommitKey(&pool, "plain", "cold");
+
+    ASSERT_TRUE(pool.BatchResolve({"ruled", "plain"}, false).front().resolved.found);
+    if (tier_promotes) {
+      ASSERT_TRUE(WaitForKey(&registry, "hot", "plain"));
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      EXPECT_FALSE(registry.Get("hot")->Contains("ruled")) << "its rule says never";
+    } else {
+      ASSERT_TRUE(WaitForKey(&registry, "hot", "ruled")) << "its rule says on_read";
+      EXPECT_FALSE(registry.Get("hot")->Contains("plain"));
+    }
+  }
+}
+
+TEST(PeerPoolRules, CountersSeeStoresReadsAndTouches) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10);
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  ASSERT_EQ(pool.Rules().SetKeyClass("kv", {"a", "b"}, {4}), 2u);
+  CommitKey(&pool, "a");
+  CommitKey(&pool, "b");
+  ASSERT_TRUE(pool.BatchResolve({"a"}, false).front().resolved.found);
+  pool.BatchTouch({"a", "b", "absent"});
+  const std::string state = pool.Rules().StateJson();
+  EXPECT_EQ(ClassNumber(state, "kv", "4", {"admitted"}), 2) << state;
+  EXPECT_EQ(ClassNumber(state, "kv", "4", {"admitted_bytes"}), 2 * kHostPage) << "whole pages";
+  EXPECT_EQ(ClassNumber(state, "kv", "4", {"reads"}), 1) << state;
+  EXPECT_EQ(ClassNumber(state, "kv", "4", {"touches"}), 2) << state;
+  EXPECT_EQ(ClassNumber(state, "kv", "4", {"live", "DRAM", "keys"}), 2) << state;
+
+  pool.ClearLocal();
+  const std::string cleared = pool.Rules().StateJson();
+  EXPECT_EQ(ClassNumber(cleared, "kv", "4", {"admitted"}), 2) << "totals outlive a clear";
+  EXPECT_EQ(ClassNumber(cleared, "kv", "4", {"live", "DRAM", "keys"}), -1) << cleared;
 }
 
 }  // namespace
