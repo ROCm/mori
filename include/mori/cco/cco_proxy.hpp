@@ -772,13 +772,13 @@ __device__ inline int ccoProxy<Queue>::flushWait(uint64_t* done, uint64_t target
                                                  uint64_t timeoutCycles) {
   int result = 0;
   if (__lane_id() == 0) {
-    [[maybe_unused]] uint64_t start = 0;
-    if constexpr (kTimeout) start = static_cast<uint64_t>(impl::clock64());
+    impl::TimeoutClock clk;
+    if constexpr (kTimeout) clk.start();
     // The failed bit is above any target, so it also ends the wait.
     uint64_t v;
     while ((v = __hip_atomic_load(done, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)) < target) {
       if constexpr (kTimeout) {
-        if (static_cast<uint64_t>(impl::clock64()) - start >= timeoutCycles) {
+        if (clk.expired(timeoutCycles)) {
           result = 1;
           break;
         }
@@ -838,8 +838,8 @@ __device__ inline int ccoProxy<Queue>::waitSignalLeader(ccoGdaSignal_t signalId,
   volatile uint64_t* signalBuf = comm.ibgda.signalBuf;
   volatile uint64_t* signalShadows = comm.ibgda.signalShadows;
   const uint64_t shadow = signalShadows[signalId];
-  [[maybe_unused]] uint64_t start = 0;
-  if constexpr (kTimeout) start = static_cast<uint64_t>(impl::clock64());
+  impl::TimeoutClock clk;
+  if constexpr (kTimeout) clk.start();
   int result = 0;
   for (uint32_t polls = 1;; polls++) {
     const uint64_t val =
@@ -853,7 +853,7 @@ __device__ inline int ccoProxy<Queue>::waitSignalLeader(ccoGdaSignal_t signalId,
       break;
     }
     if constexpr (kTimeout) {
-      if (static_cast<uint64_t>(impl::clock64()) - start >= timeoutCycles) {
+      if (clk.expired(timeoutCycles)) {
         result = failed() ? 2 : 1;
         break;
       }

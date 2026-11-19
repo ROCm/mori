@@ -207,6 +207,19 @@ __device__ inline void syncThreads() {
 __device__ inline void threadFenceSystem() { __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, ""); }
 // HIP clock64 (amd_device_functions.h): cycle counter for the barrier timeout.
 __device__ inline long long clock64() { return (long long)__builtin_readcyclecounter(); }
+// Timeout in clock64 cycles. s_memtime can jump ~10^8 cycles either way within a
+// wave (gfx942/gfx950), so `now - start` may underflow; count forward steps only.
+struct TimeoutClock {
+  uint64_t last = 0;
+  uint64_t elapsed = 0;
+  __device__ inline void start() { last = static_cast<uint64_t>(clock64()); }
+  __device__ inline bool expired(uint64_t timeoutCycles) {
+    const uint64_t now = static_cast<uint64_t>(clock64());
+    if (now > last) elapsed += now - last;
+    last = now;
+    return elapsed >= timeoutCycles;
+  }
+};
 }  // namespace impl
 #endif  // defined(__HIPCC__) || defined(__CUDACC__)
 
@@ -862,10 +875,8 @@ __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t ti
   const int myRank = this->team.rank;
   int ret = 0;
 
-  uint64_t startCycle;
-  if constexpr (EnableTimeout) {
-    startCycle = (uint64_t)impl::clock64();
-  }
+  impl::TimeoutClock clk;
+  if constexpr (EnableTimeout) clk.start();
 
   for (int i = this->coop.thread_rank(); i < nranks - 1; i += this->coop.size()) {
     int peer = i + ((i >= myRank) ? 1 : 0);
@@ -878,7 +889,7 @@ __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t ti
       if ((got - (uint32_t)(this->epoch + 1)) <= ((uint32_t)-1 >> 1)) break;
 
       if constexpr (EnableTimeout) {
-        if ((uint64_t)impl::clock64() - startCycle >= timeoutCycles) {
+        if (clk.expired(timeoutCycles)) {
           ret = 1;
           goto done;
         }
