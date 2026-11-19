@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI JIT v2 &mdash; MORI development (d8264c84) documentation</title>
+  <title>MORI JIT v2 &mdash; MORI development (099d4c70) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=286c76f8"></script>
+      <script src="_static/documentation_options.js?v=7dd4e422"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -304,7 +304,7 @@ kernel 安静地读错 buffer。按 schema 顺序取的 offset 序列一旦不�
 <li><p><strong>文本即 key</strong> → 配置不可能不进 key。</p></li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">__launch_bounds__</span></code> 是表达式不是数字</strong> → 由 host/device 共用的同一个 constexpr 算出。</p></li>
 <li><p><strong>arch 路由在 host 侧</strong>：include 哪个 body、调哪个函数，由 <code class="docutils literal notranslate"><span class="pre">RenderSource</span></code> 按
-<code class="docutils literal notranslate"><span class="pre">GetToolchain().arch</span></code> 决定——gfx125x 渲染 <code class="docutils literal notranslate"><span class="pre">ep_intranode_1250x.hpp</span></code> 的 TDM 版本，其余渲染 portable
+<code class="docutils literal notranslate"><span class="pre">ActiveArch()</span></code> 决定——gfx125x 渲染 <code class="docutils literal notranslate"><span class="pre">ep_intranode_1250x.hpp</span></code> 的 TDM 版本，其余渲染 portable
 版。不是 device <code class="docutils literal notranslate"><span class="pre">#if</span></code>：渲染时看到的 arch 就是 <code class="docutils literal notranslate"><span class="pre">--offload-arch</span></code> 的 arch，两侧不可能不一致；而这个
 选择写在源码文本里，所以自动进 key，两种 body 各有自己的缓存条目。
 host 按前缀判断（<code class="docutils literal notranslate"><span class="pre">gfx125</span></code> 选 TDM body，<code class="docutils literal notranslate"><span class="pre">gfx12</span></code> 定 wave32），所以 <code class="docutils literal notranslate"><span class="pre">gfx1250-strict</span></code> 走的是与
@@ -607,9 +607,12 @@ dtype；launch 参数里 <code class="docutils literal notranslate"><span class=
 （同 §7 的那条：独立编号 = 静默给错 kernel）。</p>
 <p><strong>为什么是 ctypes</strong>：边界只传指针和标量，没有类型转换可做。pybind11 的代价是编译期（aiter 实测
 libtorch+pybind11 的设备 pass 解析 ~15s）。绑定层里<strong>没有 <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">torch</span></code></strong>，靠鸭子类型取 <code class="docutils literal notranslate"><span class="pre">.data_ptr()</span></code>。</p>
-<p><strong>交叉编译是进程级模式</strong>：工具链只解析一次 arch，<code class="docutils literal notranslate"><span class="pre">arch=</span></code> 在那之前经 <code class="docutils literal notranslate"><span class="pre">SetArchOverride()</span></code> 落到一个
-带锁的进程变量（不是 <code class="docutils literal notranslate"><span class="pre">setenv</span></code>——解析侧用 <code class="docutils literal notranslate"><span class="pre">getenv</span></code> 读，两线程并发建 plan 就是 POSIX 数据竞争）；
-<code class="docutils literal notranslate"><span class="pre">MORI_JIT_ARCH</span></code> 仍作为静态覆盖有效。与已解析的不一致会<strong>报错</strong>，不是静默地”按 A 渲染、按 B 编译”。</p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">arch=</span></code> 只作用于本次调用</strong>：create / describe / precompile 的 <code class="docutils literal notranslate"><span class="pre">arch=</span></code> 经 <code class="docutils literal notranslate"><span class="pre">ScopedArch</span></code> 落到一个
+thread-local 变量，调用返回即撤销，所以不会带到之后的 plan。不是 <code class="docutils literal notranslate"><span class="pre">setenv</span></code>：解析侧用 <code class="docutils literal notranslate"><span class="pre">getenv</span></code> 读，两线程
+并发建 plan 就是 POSIX 数据竞争。渲染（<code class="docutils literal notranslate"><span class="pre">ActiveArch()</span></code>）和编译（<code class="docutils literal notranslate"><span class="pre">--offload-arch</span></code>、缓存 key）在同一次
+调用里读同一个值，不会”按 A 渲染、按 B 编译”。不传时用工具链的 arch：<code class="docutils literal notranslate"><span class="pre">MORI_JIT_ARCH</span></code>，否则 0 号设备。
+code object 只能在自己的目标上加载，所以编译前若目标与当前设备不同就直接<strong>报错</strong>，并指出 arch 来自
+<code class="docutils literal notranslate"><span class="pre">arch=</span></code> 还是 <code class="docutils literal notranslate"><span class="pre">MORI_JIT_ARCH</span></code>；这两者只对 describe 和 precompile 有意义。</p>
 </section>
 <section id="id8">
 <h2>7. 几个有证据的决定<a class="headerlink" href="#id8" title="Link to this heading"></a></h2>
