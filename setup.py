@@ -717,6 +717,7 @@ class CMakeBuild(build_ext):
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
         build_ras = "ON" if _env_flag("BUILD_RAS", "OFF") else "OFF"
         build_netmon = "ON" if _env_flag("BUILD_NETMON", "ON") else "OFF"
+        build_xgmi_netmon = "ON" if _env_flag("BUILD_XGMI_NETMON", "ON") else "OFF"
         build_umbp = "ON" if build_umbp_enabled else "OFF"
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
@@ -778,6 +779,7 @@ class CMakeBuild(build_ext):
             f"-DBUILD_TESTS={build_tests}",
             f"-DBUILD_RAS={build_ras}",
             f"-DBUILD_NETMON={build_netmon}",
+            f"-DBUILD_XGMI_NETMON={build_xgmi_netmon}",
             f"-DBUILD_UMBP={build_umbp}",
             f"-DUSE_REDIS_BACKEND={use_redis_backend}",
             f"-DUSE_SPDK={build_umbp_spdk}",
@@ -917,6 +919,27 @@ class CMakeBuild(build_ext):
             # Also drop a copy staged by an earlier BUILD_NETMON=ON build in build_lib:
             # setuptools reuses that directory and would ship the stale binary.
             for stale in (netmon_dst, build_lib / "mori/bin/ainic-netmon"):
+                if stale.exists():
+                    stale.unlink()
+
+        # xgmi-netmon (tools/xgmi_netmon): shipped as mori/bin/xgmi-netmon, run through the
+        # `xgmi-netmon` / `mori xgmi-netmon` entry points. Removed again when
+        # BUILD_XGMI_NETMON=OFF.
+        xgmi_src = build_dir / "tools/xgmi_netmon/xgmi-netmon"
+        xgmi_dst = root_dir / "python/mori/bin/xgmi-netmon"
+        if build_xgmi_netmon == "ON":
+            if not xgmi_src.exists():
+                raise RuntimeError(
+                    f"BUILD_XGMI_NETMON=ON but {xgmi_src} was not built; refusing to "
+                    "produce a wheel without xgmi-netmon (set BUILD_XGMI_NETMON=OFF to "
+                    "leave it out)"
+                )
+            xgmi_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(xgmi_src, xgmi_dst)
+            os.chmod(xgmi_dst, 0o755)
+        else:
+            # Also drop a copy staged by an earlier BUILD_XGMI_NETMON=ON build in build_lib.
+            for stale in (xgmi_dst, build_lib / "mori/bin/xgmi-netmon"):
                 if stale.exists():
                     stale.unlink()
 
@@ -1190,6 +1213,7 @@ mori_package_data = [
     "umbp_master",
     "umbp_standalone_server",
     "bin/ainic-netmon",  # optional: absent when BUILD_NETMON=OFF
+    "bin/xgmi-netmon",  # optional: absent when BUILD_XGMI_NETMON=OFF
     "_jit-sources/include/**/*.hpp",
     "_jit-sources/include/**/*.h",
     "_jit-sources/include/**/*.cuh",

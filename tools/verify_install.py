@@ -157,6 +157,7 @@ def check_wheel(path: str) -> None:
             f"{name} ships UMBP but no mori/{_UMBP_PYBINDS}; check setup.py package_data"
         )
     _check_netmon_in_wheel(name, zf_infos(path))
+    _check_xgmi_netmon_in_wheel(name, zf_infos(path))
     print(f"verify_install: {name} carries every required extension")
 
 
@@ -180,6 +181,40 @@ def _check_netmon_in_wheel(name: str, infos: dict) -> None:
     if missing:
         _fail(f"{name} ships {_NETMON_BIN} but not {missing}")
     print(f"verify_install: {name} carries ainic-netmon and its entry points")
+
+
+_XGMI_NETMON_BIN = "mori/bin/xgmi-netmon"
+_XGMI_NETMON_MODULE = "mori/xgmi_netmon_entry.py"
+
+
+def _check_xgmi_netmon_in_wheel(name: str, infos: dict) -> None:
+    """xgmi-netmon (BUILD_XGMI_NETMON, default ON): binary executable, entry module present."""
+    if _XGMI_NETMON_BIN not in infos:
+        print(
+            f"verify_install: {name} ships no xgmi-netmon (BUILD_XGMI_NETMON=OFF build)"
+        )
+        return
+    if not (infos[_XGMI_NETMON_BIN].external_attr >> 16) & 0o111:
+        _fail(f"{name}: {_XGMI_NETMON_BIN} is not executable")
+    if _XGMI_NETMON_MODULE not in infos:
+        _fail(f"{name} ships {_XGMI_NETMON_BIN} but not {_XGMI_NETMON_MODULE}")
+    print(f"verify_install: {name} carries xgmi-netmon and its entry point")
+
+
+def _check_xgmi_netmon_installed(pkg: str) -> None:
+    exe = os.path.join(pkg, "bin", "xgmi-netmon")
+    if not os.path.exists(exe):
+        print("verify_install: xgmi-netmon not installed (BUILD_XGMI_NETMON=OFF build)")
+        return
+    if not os.access(exe, os.X_OK):
+        _fail(f"{exe} is not executable")
+    # `version` needs no GPU, privileges or ROCm.
+    out = subprocess.run([exe, "version"], capture_output=True, text=True, timeout=30)
+    if out.returncode != 0 or not out.stdout.startswith("xgmi-netmon"):
+        _fail(f"{exe} version failed: {out.stderr.strip() or out.stdout.strip()}")
+    import mori.xgmi_netmon_entry  # noqa: F401
+
+    print(f"verify_install: {out.stdout.strip()} runs from {exe}")
 
 
 def _check_netmon_installed(pkg: str) -> None:
@@ -283,6 +318,7 @@ def check_install() -> None:
         "verify_install: mori.ops/io/shmem libraries need none of UMBP's dependencies"
     )
     _check_netmon_installed(pkg)
+    _check_xgmi_netmon_installed(pkg)
 
 
 def main() -> None:
