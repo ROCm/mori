@@ -30,12 +30,13 @@
 // the receiver counts that chunk's arrival. Each block waits for every sender's
 // chunk, then the host verifies the receive window after a barrier. The kernel
 // and run_test comments say what each case adds; dcSmall and dcThread have
-// small rings so producers wait for ring space.
+// small rings so producers wait for ring space. The conn_* cases run on
+// DevComms whose proxy connection type differs from the GDA one.
 //
 // MORI_CCO_PROXY_TEST_CASES=<list> runs only the listed positive cases, where
 // "atomic_free" stands for kAtomicFreeCases; those run first, for NICs whose
 // atomics into GPU memory fail (the first atomic would fail the shared DevComm).
-// MORI_CCO_PROXY_TEST_NEGATIVE=all (or a list such as "n1,n3") adds n1-n5, each
+// MORI_CCO_PROXY_TEST_NEGATIVE=all (or a list such as "n1,n3") adds n1-n6, each
 // on a DevComm of its own (see their runners); put_sig_after then checks that
 // the first DevComm still works.
 //
@@ -563,6 +564,16 @@ __global__ void ProxyCheckSignalsKernel(ccoDevComm dc, int nSlots, int* err) {
   }
 }
 
+// The handle's GDA team is the proxy's (comm.proxy.connType), not the GDA one.
+__global__ void ProxyTeamKernel(ccoDevComm dc, int wantRank, int wantRanks, int* err) {
+  ccoProxy<> proxy{dc, 0};  // no push
+  if (threadIdx.x == 0 && (proxy.rank != wantRank || proxy.nRanks != wantRanks)) {
+    printf("[rank %d] conn_team: proxy team %d/%d, want %d/%d\n", dc.rank, proxy.rank, proxy.nRanks,
+           wantRank, wantRanks);
+    atomicExch(err, 1);
+  }
+}
+
 // Every wavefront w (of kStressBlocks x kStressWarps) shares MPSC queue 0. In
 // round r it puts unit u = w * kStressRounds + r to every peer, then flushes in
 // the last round and in two of every three others. A flush covers every
@@ -801,7 +812,8 @@ __global__ void ProxyResetKernel(ccoDevComm dc, int nSlots) {
 
 // Positive cases that use no NIC atomics (MORI_CCO_PROXY_TEST_CASES=atomic_free).
 static const char* const kAtomicFreeCases[] = {
-    "lane_value_set", "mpsc_lane_value_set", "set_put", "set_signal", "set_window", "mpsc_set_put"};
+    "lane_value_set", "mpsc_lane_value_set", "set_put",     "set_signal",
+    "set_window",     "mpsc_set_put",        "conn_set_put"};
 
 // MORI_CCO_PROXY_TEST_CASES (same on every rank): unset runs every positive
 // case; else a comma-separated list of case names, where "atomic_free" stands
@@ -828,6 +840,8 @@ struct Ctx {
   ccoDevComm dcSmall;   // kSmallCapacity-line rings
   ccoDevComm dcThread;  // kThreadCapacity-line rings
   ccoDevComm dcQps;     // kQpsPerPeer QPs per (proxy thread, peer)
+  ccoDevComm dcNoGda;   // GDA NONE, proxy FULL
+  ccoDevComm dcSplit;   // GDA CROSSNODE (NONE on one node), proxy FULL
   hipStream_t stream;
   int rank;
   int nranks;
@@ -909,7 +923,7 @@ struct Ctx {
 // the proxy posts any size up to the real limit), so put() splits.
 template <typename Q, typename Coop, int Mode>
 static int RunPutCase(Ctx& c, const char* name, uint32_t salt, size_t chunk, int nUnits,
-                      dim3 blockDim, const ccoDevComm* dev = nullptr, uint64_t maxPutBytes = 0) {
+                      dim3 blockDim, const ccoDevComm* dev = nullptr, uint32_t maxPutBytes = 0) {
   if (!CaseSelected(name)) return 0;
   ccoDevComm d = dev ? *dev : c.dc;
   if (maxPutBytes != 0) d.proxy.maxPutBytes = maxPutBytes;
@@ -923,7 +937,7 @@ static int RunPutCase(Ctx& c, const char* name, uint32_t salt, size_t chunk, int
 
 template <typename Q, int Mode>
 static int RunThreadCase(Ctx& c, const char* name, uint32_t salt, int nUnits,
-                         uint64_t maxPutBytes = 0, bool smallRings = false) {
+                         uint32_t maxPutBytes = 0, bool smallRings = false) {
   if (!CaseSelected(name)) return 0;
   ccoDevComm d = smallRings ? c.dcThread : c.dc;
   if (maxPutBytes != 0) d.proxy.maxPutBytes = maxPutBytes;
@@ -949,11 +963,13 @@ static int RunValueCase(Ctx& c, const char* name, uint32_t salt, int nUnits) {
 }
 
 template <typename Q, int Mode>
-static int RunSetCase(Ctx& c, const char* name, uint32_t salt, int nUnits) {
+static int RunSetCase(Ctx& c, const char* name, uint32_t salt, int nUnits,
+                      const ccoDevComm* dev = nullptr) {
   if (!CaseSelected(name)) return 0;
-  c.Fresh(c.dc, salt, kChunk, nUnits);
+  const ccoDevComm& d = dev ? *dev : c.dc;
+  c.Fresh(d, salt, kChunk, nUnits);
   ProxySetKernel<Q, Mode><<<nUnits, 64, 0, c.stream>>>(
-      c.dc, c.sendWin, c.recvWin, c.flagWin, static_cast<const uint32_t*>(c.recvBuf),
+      d, c.sendWin, c.recvWin, c.flagWin, static_cast<const uint32_t*>(c.recvBuf),
       static_cast<const uint64_t*>(c.flagBuf), salt, kChunk, nUnits, c.dErr);
   c.Sync();
   return c.Verify(name, salt, kChunk, nUnits);
@@ -1096,6 +1112,20 @@ static int RunQpsMismatchCase(Ctx& c, const ccoDevCommRequirements& reqs) {
   return c.Harvest("n5_qps_mismatch", rc == 0);  // its barrier checks the comm still works
 }
 
+// n6: ranks disagree on proxyConnectionType (FULL on rank 0, CROSSNODE elsewhere):
+// ccoDevCommCreate fails on every rank.
+static int RunConnMismatchCase(Ctx& c, const ccoDevCommRequirements& reqs) {
+  ccoDevCommRequirements r = reqs;
+  r.proxyConnectionType = c.rank == 0 ? CCO_GDA_CONNECTION_FULL : CCO_GDA_CONNECTION_CROSSNODE;
+  ccoDevComm d{};
+  const int rc = ccoDevCommCreate(c.comm, &r, &d);
+  if (rc == 0) {
+    fprintf(stderr, "[rank %d] n6_conn_mismatch: DevCommCreate succeeded\n", c.rank);
+    ccoDevCommDestroy(c.comm, &d);
+  }
+  return c.Harvest("n6_conn_mismatch", rc == 0);
+}
+
 // MORI_CCO_PROXY_TEST_NEGATIVE: "all" or a comma-separated list of case names.
 static bool NegativeSelected(const char* name) {
   const char* env = getenv("MORI_CCO_PROXY_TEST_NEGATIVE");
@@ -1112,6 +1142,25 @@ static int RunSignalCase(Ctx& c) {
   ProxySignalKernel<<<kSpscQueues, 64, 0, c.stream>>>(c.dc, slot, c.dErr);
   c.Sync();
   return c.Harvest("signal_only", 0);
+}
+
+// Proxy QPs without GDA QPs (dcNoGda) and with a different GDA peer set
+// (dcSplit): put + SignalSet / SignalInc to every peer, and the handle's team.
+static int RunConnCases(Ctx& c) {
+  int fails = 0;
+  fails += RunSetCase<SPSCD2HQueue, kSetSlot>(c, "conn_set_put", 48, kSpscQueues, &c.dcNoGda);
+  fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "conn_put_sig", 49, kChunk,
+                                                             kSpscQueues, 64, &c.dcNoGda);
+  fails += RunPutCase<MPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "conn_split", 50, kChunk, kMaxUnits,
+                                                             64, &c.dcSplit);
+  if (CaseSelected("conn_team")) {
+    for (const ccoDevComm* d : {&c.dcNoGda, &c.dcSplit}) {
+      ProxyTeamKernel<<<1, 64, 0, c.stream>>>(*d, c.rank, c.nranks, c.dErr);  // FULL team
+    }
+    HIP_CHECK(hipStreamSynchronize(c.stream));
+    fails += c.Harvest("conn_team", 0);
+  }
+  return fails;
 }
 
 int run_test(int rank, int nranks, const ccoUniqueId& uid) {
@@ -1156,18 +1205,48 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   threadReqs.proxyQueueCapacity = kThreadCapacity;
   ccoDevCommRequirements qpsReqs = reqs;
   qpsReqs.proxyQpsPerPeer = kQpsPerPeer;
-  if (ccoDevCommCreate(c.comm, &reqs, &c.dc) != 0 ||
+  ccoDevCommRequirements noGdaReqs = reqs;
+  noGdaReqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
+  noGdaReqs.proxyConnectionType = CCO_GDA_CONNECTION_FULL;
+  noGdaReqs.proxyThreadCount = 1;  // fewer busy-polling threads
+  ccoDevCommRequirements splitReqs = noGdaReqs;
+  splitReqs.gdaConnectionType = CCO_GDA_CONNECTION_CROSSNODE;
+  // dcNoGda first: on one node its proxy FULL alone back-fills the window MRs.
+  if (ccoDevCommCreate(c.comm, &noGdaReqs, &c.dcNoGda) != 0 ||
+      ccoDevCommCreate(c.comm, &reqs, &c.dc) != 0 ||
       ccoDevCommCreate(c.comm, &smallReqs, &c.dcSmall) != 0 ||
       ccoDevCommCreate(c.comm, &threadReqs, &c.dcThread) != 0 ||
-      ccoDevCommCreate(c.comm, &qpsReqs, &c.dcQps) != 0) {
+      ccoDevCommCreate(c.comm, &qpsReqs, &c.dcQps) != 0 ||
+      ccoDevCommCreate(c.comm, &splitReqs, &c.dcSplit) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate failed\n", rank);
     return 1;
   }
-  for (const ccoDevComm* d : {&c.dc, &c.dcSmall, &c.dcThread, &c.dcQps}) {
-    if (d->gdaConnType == CCO_GDA_CONNECTION_NONE || d->proxy.numSpscQueues != kSpscQueues ||
-        d->proxy.numMpscQueues != kMpscQueues) {
-      fprintf(stderr, "[rank %d] proxy queues missing (gdaConnType=%d spsc=%d mpsc=%d)\n", rank,
-              (int)d->gdaConnType, d->proxy.numSpscQueues, d->proxy.numMpscQueues);
+  // proxyConnectionType -1 follows gdaConnectionType; the conn_* DevComms resolve their own.
+  const bool multiNode = c.dc.lsaSize < nranks;
+  const struct {
+    const ccoDevComm* d;
+    int gda, proxy;
+  } want[] = {
+      {&c.dc, CCO_GDA_CONNECTION_FULL, CCO_GDA_CONNECTION_FULL},
+      {&c.dcSmall, CCO_GDA_CONNECTION_FULL, CCO_GDA_CONNECTION_FULL},
+      {&c.dcThread, CCO_GDA_CONNECTION_FULL, CCO_GDA_CONNECTION_FULL},
+      {&c.dcQps, CCO_GDA_CONNECTION_FULL, CCO_GDA_CONNECTION_FULL},
+      {&c.dcNoGda, CCO_GDA_CONNECTION_NONE, CCO_GDA_CONNECTION_FULL},
+      {&c.dcSplit, multiNode ? CCO_GDA_CONNECTION_CROSSNODE : CCO_GDA_CONNECTION_NONE,
+       CCO_GDA_CONNECTION_FULL},
+  };
+  for (const auto& w : want) {
+    const ccoDevComm* d = w.d;
+    const bool gdaOk = d->gdaConnType == w.gda &&
+                       (w.gda == CCO_GDA_CONNECTION_NONE) == (d->ibgda.endpoints == nullptr);
+    if (!gdaOk || d->proxy.connType != w.proxy || d->ibgda.signalBuf == nullptr ||
+        d->proxy.numSpscQueues != kSpscQueues || d->proxy.numMpscQueues != kMpscQueues) {
+      fprintf(stderr,
+              "[rank %d] DevComm %d: gdaConnType=%d (want %d) endpoints=%p proxy connType=%d "
+              "(want %d) signalBuf=%p spsc=%d mpsc=%d\n",
+              rank, static_cast<int>(&w - want), (int)d->gdaConnType, w.gda,
+              (void*)d->ibgda.endpoints, d->proxy.connType, w.proxy, (void*)d->ibgda.signalBuf,
+              d->proxy.numSpscQueues, d->proxy.numMpscQueues);
       return 1;
     }
   }
@@ -1248,6 +1327,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
                                                                     kMaxUnits, 256, &c.dcQps);
   fails += RunPutCase<MPSCD2HQueue, ccoCoopWarp, kPutPieces>(c, "small_mpsc", 15, kChunk, kMaxUnits,
                                                              64, &c.dcSmall);
+  fails += RunConnCases(c);
 
   // Negative cases, each on a DevComm of its own; then dc must still work.
   bool anyNegative = false;
@@ -1271,6 +1351,10 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
     anyNegative = true;
     fails += RunQpsMismatchCase(c, reqs);
   }
+  if (NegativeSelected("n6")) {
+    anyNegative = true;
+    fails += RunConnMismatchCase(c, reqs);
+  }
   if (anyNegative) {
     fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "put_sig_after", 26, kChunk,
                                                                kSpscQueues, 64);
@@ -1278,6 +1362,8 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
 
   HIP_CHECK(hipStreamDestroy(c.stream));
   HIP_CHECK(hipFree(c.dErr));
+  ccoDevCommDestroy(c.comm, &c.dcSplit);
+  ccoDevCommDestroy(c.comm, &c.dcNoGda);
   ccoDevCommDestroy(c.comm, &c.dcQps);
   ccoDevCommDestroy(c.comm, &c.dcThread);
   ccoDevCommDestroy(c.comm, &c.dcSmall);
