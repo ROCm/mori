@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -195,8 +196,9 @@ class RdmaManager {
   std::atomic<EndpointId> nextEndpointId_{1};
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> endpointsById_;
   std::atomic<uint64_t> endpointsEpoch_{0};
-  // Peers fenced and not yet unfenced; guarded by `mu`, like `remotes`, so the
-  // fence and the check in ConnectEndpoint cannot interleave.
+  // Peers fenced and not yet unfenced: the one record of it, which both ConnectEndpoint
+  // and the notification path consult. Guarded by `mu`, like `remotes`, so the fence and
+  // the check in ConnectEndpoint cannot interleave.
   std::unordered_set<EngineKey> fencedPeers_;
   // Endpoints a fence took out of the route table but could not move to Error. They
   // are no longer in rTable, so only this keeps a later fence from reporting the peer
@@ -207,8 +209,6 @@ class RdmaManager {
   std::unordered_map<EngineKey, CutConnections> cutConnections_;
   // Per peer, the number of fences so far: see RemoteMemoryEpoch. Guarded by `mu`.
   std::unordered_map<EngineKey, uint64_t> remoteMemoryEpochs_;
-  // Serializes fences, so a fence never returns while another one is still cutting.
-  std::mutex fenceMu_;
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};
@@ -238,10 +238,11 @@ class NotifManager {
 
   bool PopInboundTransferStatus(const EngineKey&, TransferUniqueId, TransferStatus*);
 
-  // While a peer is fenced, its notifications are dropped, and fencing forgets those
-  // already counted: a peer that restarts numbers its transfers from zero again, and
-  // an old count must not report one of its new transfers complete.
-  void SetPeerFenced(const EngineKey&, bool fenced);
+  // Forgets the notifications of `remote` counted so far; called when it is fenced. While
+  // it stays fenced (RdmaManager::IsPeerFenced) its notifications are dropped. A peer that
+  // restarts numbers its transfers from zero again, and an old count must not report one
+  // of its new transfers complete.
+  void ForgetNotifications(const EngineKey& remote);
 
   void MainLoop();
   void Start();
@@ -301,7 +302,6 @@ class NotifManager {
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> registeredRuntimes_;
   std::unordered_map<EndpointId, QpNotifContext> notifCtxById_;
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
-  std::unordered_set<EngineKey> fencedPeers_;
 
   std::unordered_map<TransferStatus*, int> localNotif;
 
@@ -333,8 +333,10 @@ class ControlPlaneServer {
   void BuildRdmaConn(EngineKey, TopoKeyPair, int nicRank);
 
   // Tells `ekey` this engine has unfenced it, and which of its connections were cut.
-  // Best effort: an unreachable peer is only logged, after at most the control-plane
-  // timeout.
+  // Returns at once: a sender thread, started on first use, delivers it best effort, so
+  // an unreachable peer holds up only that thread, for at most the control-plane timeout,
+  // and is then logged. A notice still waiting absorbs a later one to the same peer;
+  // those left at Shutdown are dropped.
   void NotifyUnfenced(const EngineKey& ekey, const CutConnections& cut) noexcept;
   // Called with the sender's key, and the connections it cut in our terms (`localQpns`
   // are ours), when a peer reports it has unfenced this engine. Set before Start().
@@ -356,6 +358,8 @@ class ControlPlaneServer {
   void AcceptRemoteEngineConn();
   void HandleControlPlaneProtocol(int fd);
   void DropConnection(int fd) noexcept;
+  void SendUnfenced(const EngineKey& ekey, const CutConnections& cut) noexcept;
+  void UnfencedSenderLoop();
 
  private:
   EngineKey myEngKey;
@@ -374,6 +378,13 @@ class ControlPlaneServer {
   std::unordered_map<EngineKey, EngineDesc> engines;
   std::unordered_map<MemoryUniqueId, MemoryDesc> mems;
   std::function<void(const EngineKey&, const CutConnections&)> onUnfenced;
+
+  // Unfenced notices waiting for the sender thread, oldest first.
+  std::mutex unfencedMu_;
+  std::condition_variable unfencedCv_;
+  std::vector<std::pair<EngineKey, CutConnections>> unfencedPending_;
+  bool unfencedStop_{false};
+  std::thread unfencedThd_;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -528,6 +539,9 @@ class RdmaBackend : public Backend {
   // Failed QPs stay allocated, so QPs that fail again soon after being replaced, as on a
   // path that stays down, are replaced at a growing interval. Guarded by connBuildMapMu_.
   std::unordered_map<ConnBuildKey, QpReplacementPacing, ConnBuildKeyHash> qpReplacementPacing_;
+  // One fence or unfence at a time, start to end: an unfence between the steps of a fence
+  // would let the peer back in while the fence goes on to treat it as fenced.
+  std::mutex fenceMu_;
 };
 
 }  // namespace io

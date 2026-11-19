@@ -100,6 +100,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("endpoints_fenced", &mori::io::FenceResult::endpointsFenced)
       .def_readonly("endpoints_failed", &mori::io::FenceResult::endpointsFailed)
       .def_readonly("transfers_failed", &mori::io::FenceResult::transfersFailed)
+      .def_readonly("peer_known", &mori::io::FenceResult::peerKnown)
       .def_readonly("message", &mori::io::FenceResult::message)
       .def_property_readonly("ok", &mori::io::FenceResult::Ok);
 

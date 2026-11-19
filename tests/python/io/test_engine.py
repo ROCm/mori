@@ -680,15 +680,18 @@ def _write_eventually(initiator, initiator_mem, target_mem, budget_s=20.0):
 FENCE_RECOVERY_BOUND_S = 1.0
 
 
-def test_fence_unknown_peer_is_ok_but_stays_fenced():
+def test_fence_unknown_peer_is_not_ok_but_stays_fenced():
     initiator, target = create_connected_engine_pair(
         "fence_unknown", qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
     )
     assert not target.unfence_remote_engine(initiator.get_engine_desc().key)
 
+    # A key the engine never saw is most likely a wrong one, which leaves the real peer
+    # unfenced.
     result = target.fence_remote_engine("fence_nobody")
     assert isinstance(result, FenceResult)
-    assert result.ok and result.supported, result.message
+    assert result.supported and not result.peer_known and not result.ok
+    assert "fence_nobody" in result.message
     assert result.endpoints_fenced == 0 and result.endpoints_failed == 0
     # Nothing was cut, but the key is recorded: an engine connecting under it later is
     # refused until it is unfenced.
@@ -738,7 +741,7 @@ def test_fence_blocks_writes_until_unfenced():
     initiator_key = initiator.get_engine_desc().key
 
     result = target.fence_remote_engine(initiator_key)
-    assert result.ok, result.message
+    assert result.ok and result.peer_known, result.message
     assert result.endpoints_fenced >= 1
 
     target_tensor.zero_()

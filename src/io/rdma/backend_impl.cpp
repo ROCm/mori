@@ -824,13 +824,14 @@ int RdmaManager::FailInFlightTransfers(const QpErrorEvent& event) {
 }
 
 FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
-  // One fence at a time: a concurrent one would find the route table already emptied
-  // by this one and report the peer cut off before these QPs are.
-  std::lock_guard<std::mutex> fenceGuard(fenceMu_);
+  // The caller runs one fence or unfence at a time (RdmaBackend::fenceMu_): a concurrent
+  // fence would find the route table already emptied by this one and report the peer cut
+  // off before these QPs are.
   // Detach the peer's endpoints under the lock so no new session can pick one up
   // from here on. The verbs calls below run without it: FailAll() can wait for an
   // in-flight post, and neither step needs the table.
   EpPairVec victims;
+  bool known = false;
   {
     std::unique_lock<std::shared_mutex> lock(mu);
     fencedPeers_.insert(remoteKey);
@@ -839,9 +840,12 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
     if (uncut != uncutEndpoints_.end()) {
       victims = std::move(uncut->second);
       uncutEndpoints_.erase(uncut);
+      known = true;
     }
     auto it = remotes.find(remoteKey);
     if (it != remotes.end()) {
+      // An entry stays after its connections are gone, so the peer is still known.
+      known = true;
       for (auto& [topo, eps] : it->second.rTable) {
         victims.insert(victims.end(), eps.begin(), eps.end());
       }
@@ -856,6 +860,7 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
 
   FenceResult result;
   result.supported = true;
+  result.peerKnown = known;
 
   const std::string message = "peer " + remoteKey + " was fenced; its connection was shut down";
   EpPairVec stillUncut;
@@ -1190,8 +1195,9 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
 
         EngineKey ekey = ep.remoteEngineKey;
         // The fence gave up on this peer's transfers, and its QPs are not used again, so
-        // the receive is neither counted nor replenished.
-        if (fencedPeers_.count(ekey) != 0) continue;
+        // the receive is neither counted nor replenished. Checked under `mu`, so a count
+        // taken before the fence is the one ForgetNotifications erases.
+        if (rdma->IsPeerFenced(ekey)) continue;
         if (notifPool[ekey].find(msg.id) == notifPool[ekey].end()) {
           notifPool[ekey][msg.id] = msg.totalNum;
         }
@@ -1370,14 +1376,9 @@ bool NotifManager::PopInboundTransferStatus(const EngineKey& remote, TransferUni
   return false;
 }
 
-void NotifManager::SetPeerFenced(const EngineKey& remote, bool fenced) {
+void NotifManager::ForgetNotifications(const EngineKey& remote) {
   std::lock_guard<std::mutex> lock(mu);
-  if (fenced) {
-    fencedPeers_.insert(remote);
-    notifPool.erase(remote);
-  } else {
-    fencedPeers_.erase(remote);
-  }
+  notifPool.erase(remote);
 }
 
 void NotifManager::Start() {
@@ -1480,6 +1481,40 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
 }
 
 void ControlPlaneServer::NotifyUnfenced(const EngineKey& ekey, const CutConnections& cut) noexcept {
+  try {
+    std::lock_guard<std::mutex> lock(unfencedMu_);
+    if (unfencedStop_) return;
+    auto it = std::find_if(unfencedPending_.begin(), unfencedPending_.end(),
+                           [&](const auto& notice) { return notice.first == ekey; });
+    if (it == unfencedPending_.end()) {
+      unfencedPending_.emplace_back(ekey, cut);
+    } else {
+      CutConnections& merged = it->second;
+      merged.localQpns.insert(merged.localQpns.end(), cut.localQpns.begin(), cut.localQpns.end());
+      merged.peerQpns.insert(merged.peerQpns.end(), cut.peerQpns.begin(), cut.peerQpns.end());
+    }
+    if (!unfencedThd_.joinable()) unfencedThd_ = std::thread([this] { UnfencedSenderLoop(); });
+    unfencedCv_.notify_one();
+  } catch (const std::exception& e) {
+    // The peer then reconnects once its QP replacement backoff expires, as for a lost notice.
+    MORI_IO_WARN("Could not queue the unfenced notice to engine {}: {}", ekey, e.what());
+  }
+}
+
+void ControlPlaneServer::UnfencedSenderLoop() {
+  std::unique_lock<std::mutex> lock(unfencedMu_);
+  while (true) {
+    unfencedCv_.wait(lock, [this] { return unfencedStop_ || !unfencedPending_.empty(); });
+    if (unfencedStop_) return;
+    auto notice = std::move(unfencedPending_.front());
+    unfencedPending_.erase(unfencedPending_.begin());
+    lock.unlock();
+    SendUnfenced(notice.first, notice.second);
+    lock.lock();
+  }
+}
+
+void ControlPlaneServer::SendUnfenced(const EngineKey& ekey, const CutConnections& cut) noexcept {
   try {
     std::string host;
     int port = 0;
@@ -1714,6 +1749,16 @@ void ControlPlaneServer::Start() {
 }
 
 void ControlPlaneServer::Shutdown() {
+  {
+    std::lock_guard<std::mutex> lock(unfencedMu_);
+    unfencedStop_ = true;
+    if (!unfencedPending_.empty()) {
+      MORI_IO_WARN("Dropping {} unfenced notice(s) at shutdown", unfencedPending_.size());
+      unfencedPending_.clear();
+    }
+  }
+  unfencedCv_.notify_all();
+  if (unfencedThd_.joinable()) unfencedThd_.join();
   running.store(false);
   if (thd.joinable()) thd.join();
   if (epfd >= 0) {
@@ -2266,11 +2311,13 @@ bool RdmaBackend::PopPeerFailure(PeerFailureEvent* out) {
 
 FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
   if (!rdma) return FenceResult{};
+  std::lock_guard<std::mutex> fenceGuard(fenceMu_);
   // Fence before dropping sessions. The other way round, a CreateSession racing
   // with us could still see the old endpoints, cache a session over them, and leave
   // it pointing at dead QPs once the fence lands.
   FenceResult result = rdma->FenceRemoteEngine(remote);
-  notif->SetPeerFenced(remote, true);
+  result.peerKnown = result.peerKnown || server->TryGetRemoteEnginePort(remote).has_value();
+  notif->ForgetNotifications(remote);
 
   std::lock_guard<std::mutex> lock(sessionCacheMu);
   for (auto it = sessionCache.begin(); it != sessionCache.end();) {
@@ -2286,10 +2333,10 @@ FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
 
 bool RdmaBackend::UnfenceRemoteEngine(const EngineKey& remote) {
   if (!rdma) return false;
-  // Take notifications from the peer again before letting it reconnect: a connection it
-  // builds the moment it is let back in must not have its first notification dropped.
-  // Its QPs cut by the fence carry nothing new until then.
-  notif->SetPeerFenced(remote, false);
+  // Not while a fence of the peer is under way: it would go on to treat the peer as fenced
+  // after this let it back in. Connections and notifications are let back in at once, by
+  // the one record RdmaManager keeps.
+  std::lock_guard<std::mutex> fenceGuard(fenceMu_);
   CutConnections cut;
   if (!rdma->UnfenceRemoteEngine(remote, &cut)) return false;
   // Sessions of ours that raced the fence wait to be replaced; they may try again now.

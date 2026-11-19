@@ -83,11 +83,18 @@ struct FenceResult {
   int endpointsFailed{0};
   // Local transfers toward the peer that were failed because their QP was cut.
   int transfersFailed{0};
+  // Whether this engine knows the key: it holds or once held a connection with the peer,
+  // or has the peer registered. A key it does not know is most likely not the peer's,
+  // which then is not fenced at all.
+  bool peerKnown{false};
   std::string message;
 
-  // True only when the peer provably can no longer write into this engine.
-  // Fencing a peer this engine has no connection to is ok: there is nothing to cut.
-  bool Ok() const { return supported && endpointsFailed == 0; }
+  // True only when the peer provably can no longer write into this engine. Fencing a
+  // known peer this engine has no connection to is ok: there is nothing to cut. A key it
+  // does not know is not ok, though it is still fenced. A known key can still be the
+  // wrong peer's, e.g. another rank's: a caller that cannot rule that out must also
+  // expect endpointsFenced > 0.
+  bool Ok() const { return supported && peerKnown && endpointsFailed == 0; }
 };
 
 // Fence result for a backend that has a path from `remote` into this engine and no way
@@ -97,6 +104,7 @@ inline FenceResult UncutPath(const std::string& remote, const std::string& trans
   FenceResult result;
   result.supported = true;
   result.endpointsFailed = 1;
+  result.peerKnown = true;
   result.message = "peer " + remote + " can still write over " + transport + ": " + why;
   return result;
 }

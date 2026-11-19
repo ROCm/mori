@@ -490,14 +490,21 @@ FenceResult IOEngine::FenceRemoteEngine(const EngineKey& remote) {
     total.endpointsFenced += part.endpointsFenced;
     total.endpointsFailed += part.endpointsFailed;
     total.transfersFailed += part.transfersFailed;
+    total.peerKnown = total.peerKnown || part.peerKnown;
     if (!part.message.empty()) {
       if (!total.message.empty()) total.message += "; ";
       total.message += part.message;
     }
   }
-  MORI_IO_INFO("Fence remote engine {}: supported={} fenced={} failed={} transfers_failed={}",
-               remote.c_str(), total.supported, total.endpointsFenced, total.endpointsFailed,
-               total.transfersFailed);
+  if (total.supported && !total.peerKnown) {
+    if (!total.message.empty()) total.message += "; ";
+    total.message += "no connection with engine " + remote +
+                     " was ever seen and it is not registered: is the key right?";
+  }
+  MORI_IO_INFO(
+      "Fence remote engine {}: supported={} known={} fenced={} failed={} transfers_failed={}",
+      remote.c_str(), total.supported, total.peerKnown, total.endpointsFenced,
+      total.endpointsFailed, total.transfersFailed);
   return total;
 }
 

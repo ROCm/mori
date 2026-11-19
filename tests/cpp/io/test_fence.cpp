@@ -35,12 +35,16 @@
 //   1. baseline            an unfenced peer's write lands
 //   2. stale writer        after the fence, the same peer's write must NOT land
 //   3. scoped to one peer  another peer still writes normally
-//   4. unknown / repeated  fencing nobody, or fencing twice, is a harmless no-op
+//   4. unknown / repeated  fencing a key never seen is not ok, though recorded; fencing
+//                          twice is a harmless no-op
 //   5. initiator reconnect a fenced peer is refused in both directions until unfenced
 //   6. live producer       a fenced peer that kept running is refused, then rebuilds
 //                          and writes again once unfenced
 //   7. peer restart        a peer restarted under the same key while fenced is refused,
 //                          and writes once unfenced
+//   8. idle producer       its first write after the unfence rebuilds at once
+//   9. notifications       a fence forgets the peer's completed notifications
+//  10. unresponsive peer   unfence returns without waiting for the peer to take the notice
 //
 // Every case runs over host memory and, when a GPU is visible, again over device
 // memory, so the NIC is also shown to stop writing into VRAM.
@@ -348,13 +352,17 @@ void TestOtherPeersUnaffected(Rig& rig) {
 }
 
 void TestUnknownAndRepeatedFence(Rig& rig) {
+  // A key the receiver never saw is most likely a wrong one, which leaves the real peer
+  // unfenced: not ok. It is recorded all the same.
   FenceResult unknown = rig.receiver->FenceRemoteEngine("fence_nobody");
-  CHECK(unknown.Ok(), "fencing an unknown peer must be ok");
+  CHECK(unknown.supported && !unknown.peerKnown, "a key never seen must be reported unknown");
+  CHECK(!unknown.Ok(), "fencing a key never seen must not be ok: " + unknown.message);
   CHECK(unknown.endpointsFenced == 0, "nothing to cut for an unknown peer");
+  CHECK(rig.receiver->UnfenceRemoteEngine("fence_nobody"), "an unknown key is still fenced");
 
   // `producer` was fenced in an earlier case; its connections are already gone.
   FenceResult again = rig.receiver->FenceRemoteEngine(kProducer);
-  CHECK(again.Ok(), "fencing twice must be ok");
+  CHECK(again.Ok() && again.peerKnown, "fencing twice must be ok: " + again.message);
   CHECK(again.endpointsFenced == 0, "a second fence has no connections left to cut");
 }
 
@@ -474,6 +482,64 @@ void TestFenceForgetsInboundNotifications(Rig& rig) {
   CHECK(rig.receiver->UnfenceRemoteEngine(kProducer), "producer must have been fenced");
 }
 
+// A TCP listener that never accepts, with its queue full: a connect to it hangs until the
+// connecting side gives up, here the control-plane timeout (MORI_IO_CP_TIMEOUT_MS, 5 s).
+struct UnresponsivePeer {
+  UnresponsivePeer() {
+    listenFd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof(addr);
+    CHECK(bind(listenFd, reinterpret_cast<sockaddr*>(&addr), len) == 0 &&
+              listen(listenFd, 0) == 0 &&
+              getsockname(listenFd, reinterpret_cast<sockaddr*>(&addr), &len) == 0,
+          "could not open a listener");
+    port = ntohs(addr.sin_port);
+    // A backlog of 0 still queues a connection or two; fill it so the next SYN is dropped.
+    for (int i = 0; i < 4; ++i) {
+      int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+      connect(fd, reinterpret_cast<sockaddr*>(&addr), len);
+      fillers.push_back(fd);
+    }
+  }
+  ~UnresponsivePeer() {
+    for (int fd : fillers) close(fd);
+    close(listenFd);
+  }
+  int listenFd{-1};
+  int port{0};
+  std::vector<int> fillers;
+};
+
+void TestUnfenceDoesNotWaitForAnUnresponsivePeer(Rig& rig) {
+  UnresponsivePeer peer;
+  EngineDesc desc;
+  desc.key = "fence_unresponsive";
+  desc.nodeId = rig.receiver->GetEngineDesc().nodeId;
+  desc.hostname = rig.receiver->GetEngineDesc().hostname;
+  desc.host = "127.0.0.1";
+  desc.port = peer.port;
+  rig.receiver->RegisterRemoteEngine(desc);
+
+  FenceResult fence = rig.receiver->FenceRemoteEngine(desc.key);
+
+  // The Unfenced notice goes to a peer that takes no connection. Unfencing changes local
+  // state only; the notice must not hold it up.
+  const auto start = std::chrono::steady_clock::now();
+  const bool wasFenced = rig.receiver->UnfenceRemoteEngine(desc.key);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - start)
+                      .count();
+  rig.receiver->DeregisterRemoteEngine(desc);
+  CHECK(ms < 1000, "unfence must not wait for the peer to take the notice; took " +
+                       std::to_string(ms) + " ms");
+  CHECK(wasFenced, "the peer must have been fenced");
+  // Registered but never connected: known, nothing to cut.
+  CHECK(fence.Ok() && fence.peerKnown, "fencing a registered peer must be ok: " + fence.message);
+  CHECK(fence.endpointsFenced == 0, "a peer that never connected has nothing to cut");
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                    Main                                     */
 /* -------------------------------------------------------------------------- */
@@ -507,6 +573,8 @@ int main() {
       {"8. idle producer: its first write after the unfence rebuilds",
        TestIdleProducerRebuildsAtOnceAfterUnfence},
       {"9. fence forgets the peer's completed notifications", TestFenceForgetsInboundNotifications},
+      {"10. unfence does not wait for an unresponsive peer",
+       TestUnfenceDoesNotWaitForAnUnresponsivePeer},
   };
 
   int passed = 0;

@@ -312,7 +312,7 @@ def test_fence_cuts_peer_until_unfenced():
     # b's own write toward a is still on the link when b fences a.
     _, in_flight = write(b, b_mem, a_mem, [512 * MiB])
     result = b.fence_remote_engine(a_key)
-    assert result.ok and result.supported, result.message
+    assert result.ok and result.supported and result.peer_known, result.message
     assert result.endpoints_fenced >= 2  # a's connection into b, and b's own to a
     assert result.transfers_failed == 1
     assert b.wait_all([in_flight]) == StatusCode.ERR_RDMA_OP
@@ -412,6 +412,17 @@ def test_transfer_on_a_cut_connection_fails_after_a_reconnect():
     # new one.
     assert a.wait_all([long_st]) == StatusCode.ERR_RDMA_OP
     assert "connection" in long_st.Message()
+
+
+def test_fence_of_a_key_never_seen_is_not_ok():
+    # A key the engine has no connection with and no registration for is most likely a
+    # wrong one; a registered peer with no connection has nothing to cut and is ok.
+    a, b = make_engine("pf"), make_engine("dc")
+    connect(a, b)
+    unknown = b.fence_remote_engine("nobody")
+    assert unknown.supported and not unknown.peer_known and not unknown.ok
+    known = b.fence_remote_engine(a.get_engine_desc().key)
+    assert known.peer_known and known.ok, known.message
 
 
 def test_fence_unsupported_without_a_network_backend():

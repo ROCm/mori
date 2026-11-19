@@ -556,12 +556,16 @@ FenceResult SimBackend::FenceRemoteEngine(const EngineKey& remote) {
   {
     std::lock_guard<std::mutex> lock(serverConnKeysMu_);
     for (const auto& [fd, key] : serverConnKeys_) {
-      if (key == remote && shutdown(fd, SHUT_RDWR) == 0) ++result.endpointsFenced;
+      if (key != remote) continue;
+      result.peerKnown = true;
+      if (shutdown(fd, SHUT_RDWR) == 0) ++result.endpointsFenced;
     }
   }
   // Our own connections to the peer, and transfers still in flight on them, including those of
   // an incarnation deregistered or replaced while they were.
-  for (const auto& peer : PeerIncarnations(remote)) {
+  const auto incarnations = PeerIncarnations(remote);
+  result.peerKnown = result.peerKnown || !incarnations.empty();
+  for (const auto& peer : incarnations) {
     std::lock_guard<std::mutex> lock(peer->mu);
     peer->fenceEpoch.fetch_add(1);
     result.transfersFailed += peer->inFlight.load();
