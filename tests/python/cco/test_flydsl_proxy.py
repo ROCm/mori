@@ -19,7 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Runs examples/cco/python/13_flydsl_proxy on two ranks."""
+"""Runs examples/cco/python/14_flydsl_proxy on two ranks."""
 
 import importlib.util
 import os
@@ -52,7 +52,7 @@ def test_flydsl_cco_proxy():
         pytest.skip(f"ccoProxy needs gfx942/gfx950, not {arch}")
 
     repo_root = Path(__file__).resolve().parents[3]
-    script = repo_root / "examples" / "cco" / "python" / "13_flydsl_proxy" / "main.py"
+    script = repo_root / "examples" / "cco" / "python" / "14_flydsl_proxy" / "main.py"
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     # Open MPI refuses root without these; others ignore them.

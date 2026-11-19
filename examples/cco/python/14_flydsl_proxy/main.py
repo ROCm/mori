@@ -20,7 +20,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""CCO Example 13 — FlyDSL ccoProxy (host-proxy RDMA)
+"""CCO Example 14 — FlyDSL ccoProxy (host-proxy RDMA)
 
 The FlyDSL ``Proxy`` handle on a proxy-only DevComm: the GPU pushes put /
 signal requests into D2H queues and a host thread posts them to the NIC, so no

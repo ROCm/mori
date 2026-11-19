@@ -1,4 +1,4 @@
-# CCO Example 13 — FlyDSL ccoProxy (host-proxy RDMA)
+# CCO Example 14 — FlyDSL ccoProxy (host-proxy RDMA)
 
 Device-initiated RDMA from a FlyDSL `@flyc.kernel` with no GDA QP: the kernel
 pushes requests into D2H queues through the `Proxy` handle of
@@ -30,7 +30,7 @@ pushes requests into D2H queues through the `Proxy` handle of
 ## Run
 ```
 MORI_RDMA_DEVICES=mlx5_0,mlx5_1 MORI_SOCKET_IFNAME=lo \
-  timeout 300 mpirun -np 2 python3 examples/cco/python/13_flydsl_proxy/main.py
+  timeout 300 mpirun -np 2 python3 examples/cco/python/14_flydsl_proxy/main.py
 ```
 Each rank uses its own local NIC from `MORI_RDMA_DEVICES`; keep the topology
 detection on. Rank 0 prints `All FlyDSL ccoProxy tests PASSED` at the end. The
