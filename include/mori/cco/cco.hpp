@@ -545,7 +545,8 @@ struct ccoDevCommRequirements {
   // host-mapped (large BAR). Each DevComm with proxy queues starts its own
   // busy-polling threads, pinned by the same policy (MORI_CCO_PROXY_CPUS or the
   // GPU-local cores), so several such DevComms oversubscribe the same CPUs;
-  // prefer one per comm.
+  // prefer one per comm. MORI_CCO_PROXY_CPUS applies to the whole process tree:
+  // with several ranks per node, set it per rank.
   int proxySpscQueueCount;  // 0 = no SPSC pool
   int proxyMpscQueueCount;  // 0 = no MPSC pool
   int proxyThreadCount;     // host proxy threads (0 = 4), capped at the total queue count

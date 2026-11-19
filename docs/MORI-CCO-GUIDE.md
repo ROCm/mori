@@ -450,7 +450,7 @@ serve each QP serially run a thread's queues in parallel.
 | Variable | Purpose |
 |---|---|
 | `MORI_CCO_DISABLE_PROXY` | `1` makes `ccoDevCommCreate` reject proxy queues |
-| `MORI_CCO_PROXY_CPUS` | cpulist for the proxy threads (thread t on entry t mod size); default: GPU-local cores in the affinity mask, one physical core per thread, from the top, skipping the core of CPU 0 |
+| `MORI_CCO_PROXY_CPUS` | cpulist for the proxy threads (thread t on entry t mod size); default: GPU-local cores in the affinity mask, one physical core per thread, from the top, skipping the core of CPU 0. It applies to the whole process tree: with several ranks per node, set it per rank to disjoint CPUs, or every rank's busy-polling threads share the same cores |
 
 ### Device API
 

@@ -1115,7 +1115,9 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       std::fprintf(stderr,
                    "[mori cco] WARNING: ccoProxy rank %d: %d proxy threads share CPUs [%s] (from "
                    "%s); widen the affinity mask (e.g. mpirun --bind-to none), set "
-                   "MORI_CCO_PROXY_CPUS, or use fewer threads\n",
+                   "MORI_CCO_PROXY_CPUS per rank (it applies to the whole process tree, so one "
+                   "value for every rank of a node puts their threads on the same CPUs), or use "
+                   "fewer threads\n",
                    rank, numThreads, cpuList.c_str(), cpuSource.c_str());
     }
   } catch (const std::exception& e) {
