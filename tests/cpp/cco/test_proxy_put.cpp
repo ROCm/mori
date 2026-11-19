@@ -949,13 +949,11 @@ static int RunValueCase(Ctx& c, const char* name, uint32_t salt, int nUnits) {
 }
 
 template <typename Q, int Mode>
-static int RunSetCase(Ctx& c, const char* name, uint32_t salt, int nUnits,
-                      const ccoDevComm* dev = nullptr) {
+static int RunSetCase(Ctx& c, const char* name, uint32_t salt, int nUnits) {
   if (!CaseSelected(name)) return 0;
-  const ccoDevComm& d = dev ? *dev : c.dc;
-  c.Fresh(d, salt, kChunk, nUnits);
+  c.Fresh(c.dc, salt, kChunk, nUnits);
   ProxySetKernel<Q, Mode><<<nUnits, 64, 0, c.stream>>>(
-      d, c.sendWin, c.recvWin, c.flagWin, static_cast<const uint32_t*>(c.recvBuf),
+      c.dc, c.sendWin, c.recvWin, c.flagWin, static_cast<const uint32_t*>(c.recvBuf),
       static_cast<const uint64_t*>(c.flagBuf), salt, kChunk, nUnits, c.dErr);
   c.Sync();
   return c.Verify(name, salt, kChunk, nUnits);
