@@ -72,6 +72,8 @@ static constexpr int kPieces = 64;         // puts per chunk in the small-ring c
 static constexpr int kSqRepeats = 2048;    // puts per peer in sq_full (SQ depth: 512)
 static constexpr int kQpsPerPeer = 3;      // dcQps, per (thread, peer): one per queue of a thread
 static constexpr uint32_t kClobber = 0xdeadbeefu;
+// Long enough for any proxy answer, short enough not to hang.
+static constexpr uint64_t kNegTimeoutCycles = 40ull * 1000 * 1000 * 1000;
 
 enum PutMode {
   kPutSignal,         // put carrying SignalInc
@@ -516,16 +518,20 @@ __global__ void ProxySetKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
   for (int s = 0; s < n; s++) {
     if (s == me) continue;
     for (int r = 0; r < kSetRounds; r++) {
+      int waited;  // 0 = arrived, 1 = timed out, 2 = DevComm failed
       if constexpr (Mode == kSetWindow) {
-        if (!WaitFlag(proxy, &flagLocal[Slot(s, u)], static_cast<uint64_t>(r + 1))) {
-          if (lane == 0) {
-            printf("[rank %d] set_window: DevComm failed\n", me);
-            atomicExch(err, 1);
-          }
-          return;
-        }
+        waited = WaitFlag(proxy, &flagLocal[Slot(s, u)], static_cast<uint64_t>(r + 1)) ? 0 : 2;
       } else {
-        proxy.waitSignal(Slot(s, u), 1, ccoCoopWarp{});  // consumed r so far: the slot is >= r + 1
+        // Consumed r so far: the slot is >= r + 1.
+        waited = proxy.waitSignal(Slot(s, u), 1, ccoCoopWarp{}, kNegTimeoutCycles);
+      }
+      if (waited != 0) {
+        if (lane == 0) {
+          printf("[rank %d] signal set: src=%d unit=%d round %d: %s\n", me, s, u, r,
+                 waited == 1 ? "timed out" : "DevComm failed");
+          atomicExch(err, 1);
+        }
+        return;
       }
       const size_t w0 = ((static_cast<size_t>(s) * nUnits + u) * chunk + r * piece) / 4;
       for (size_t i = lane; i < piece / 4; i += 64) {
@@ -755,28 +761,31 @@ __global__ void ProxyBlockFlushKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
   }
 }
 
-// Long enough for any proxy answer, short enough not to hang.
-static constexpr uint64_t kNegTimeoutCycles = 40ull * 1000 * 1000 * 1000;
-
 // n1 / n2: one wavefront puts `bytes` to `peer`, then flushes twice with a
-// timeout. res = {first flush, second flush, failed()}.
+// timeout, then waits with a timeout on slot 0, which nobody signals.
+// res = {first flush, second flush, failed(), waitSignal}.
 __global__ void ProxyFailKernel(ccoDevComm dc, int peer, ccoWindow_t dstWin, size_t dstOffset,
                                 ccoWindow_t srcWin, size_t bytes, int* res) {
   ccoProxy<> proxy{dc, 0};
   proxy.put(peer, dstWin, dstOffset, srcWin, 0, bytes, ccoGda_NoSignal{}, ccoCoopWarp{});
   const int first = proxy.flush(ccoCoopWarp{}, kNegTimeoutCycles);
   const int second = proxy.flush(ccoCoopWarp{}, kNegTimeoutCycles);
+  const int waited = proxy.waitSignal(0, 1, ccoCoopWarp{}, kNegTimeoutCycles);
   if (__lane_id() == 0) {
     res[0] = first;
     res[1] = second;
     res[2] = proxy.failed() ? 1 : 0;
+    res[3] = waited;
   }
 }
 
 // n3: block u (SPSC queue u, ccoCoopBlock) puts its chunk to every peer, then
 // flushes with a timeout the proxy cannot meet (returns 1), without one (still
 // completes), and with a long one (returns 0); flushDone advances by exactly 3.
-// Every thread checks the results it got.
+// Then it sets Slot(me, u) to 1 on every peer and, per sender, waits with a
+// timeout for 2 (returns 1, consumes nothing), for 1 (returns 0) and for 1
+// again (returns 1); the slot is left at 0. Every thread checks the results it
+// got.
 __global__ void ProxyTimeoutKernel(ccoDevComm dc, ccoWindow_t dstWin, ccoWindow_t srcWin,
                                    size_t chunk, int* err) {
   const int u = blockIdx.x;
@@ -806,6 +815,27 @@ __global__ void ProxyTimeoutKernel(ccoDevComm dc, ccoWindow_t dstWin, ccoWindow_
            (unsigned long long)before, (unsigned long long)after);
     atomicExch(err, 1);
   }
+  for (int p = 0; p < n; p++) {
+    if (p != me) proxy.signal(p, ccoGda_SignalSet{Slot(me, u), 1}, ccoCoopBlock{});
+  }
+  for (int s = 0; s < n; s++) {
+    if (s == me) continue;
+    const int early = proxy.waitSignal(Slot(s, u), 2, ccoCoopBlock{}, 100);
+    const int got = proxy.waitSignal(Slot(s, u), 1, ccoCoopBlock{}, kNegTimeoutCycles);
+    const int again = proxy.waitSignal(Slot(s, u), 1, ccoCoopBlock{}, 100);
+    const uint64_t left = proxy.readSignal(Slot(s, u));
+    if (early != 1 || got != 0 || again != 1 || left != 0) {
+      if (__lane_id() == 0) {
+        printf(
+            "[rank %d] n3: unit %d src %d wave %d: waitSignal(2, short) = %d, (1, long) = %d, "
+            "(1, short) = %d, left %llu\n",
+            me, u, s, static_cast<int>(threadIdx.x) / 64, early, got, again,
+            (unsigned long long)left);
+      }
+      atomicExch(err, 1);
+    }
+  }
+  proxy.flush(ccoCoopBlock{});
 }
 
 __global__ void ProxyResetKernel(ccoDevComm dc, int nSlots) {
@@ -1018,8 +1048,9 @@ static void PrintError(int rank, const char* name, int got, const ccoDevCommErro
 }
 
 // n1 (selfPut false): rank 0 puts past the end of peer 1's receive window;
-// flush(coop, timeout) returns 2 twice, failed() is true, and
-// ccoDevCommGetError reports COMPLETION / IBV_WC_REM_ACCESS_ERR for peer 1.
+// flush(coop, timeout) returns 2 twice, failed() is true, waitSignal(...,
+// timeout) returns 2, and ccoDevCommGetError reports COMPLETION /
+// IBV_WC_REM_ACCESS_ERR for peer 1.
 // n2 (selfPut true): every rank puts to itself, which has no proxy QP: as n1,
 // but BAD_REQUEST naming the rank itself. ccoDevCommDestroy must return 0.
 static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& reqs, bool selfPut) {
@@ -1030,8 +1061,8 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
   }
   const bool fails = selfPut || c.rank == 0;  // ranks whose DevComm must fail
   int* dRes = nullptr;
-  HIP_CHECK(hipMalloc(&dRes, 3 * sizeof(int)));
-  HIP_CHECK(hipMemset(dRes, 0xff, 3 * sizeof(int)));
+  HIP_CHECK(hipMalloc(&dRes, 4 * sizeof(int)));
+  HIP_CHECK(hipMemset(dRes, 0xff, 4 * sizeof(int)));
   ccoBarrierAll(c.comm);
   if (selfPut) {
     ProxyFailKernel<<<1, 64, 0, c.stream>>>(d, c.rank, c.recvWin, 0, c.sendWin, 4096, dRes);
@@ -1039,7 +1070,7 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
     ProxyFailKernel<<<1, 64, 0, c.stream>>>(d, 1, c.recvWin, c.bufSize, c.sendWin, 4096, dRes);
   }
   HIP_CHECK(hipStreamSynchronize(c.stream));
-  int res[3];
+  int res[4];
   HIP_CHECK(hipMemcpy(res, dRes, sizeof(res), hipMemcpyDeviceToHost));
   HIP_CHECK(hipFree(dRes));
   ccoDevCommError e{};
@@ -1048,7 +1079,7 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
   if (fails) {
     PrintError(c.rank, name, got, e);
     const int wantPeer = selfPut ? c.rank : 1;
-    bad |= res[0] != 2 || res[1] != 2 || res[2] != 1;
+    bad |= res[0] != 2 || res[1] != 2 || res[2] != 1 || res[3] != 2;
     bad |= got != 1 || e.rank != c.rank || e.peer != wantPeer || e.queue != 0;
     if (selfPut) {
       bad |= e.code != CCO_PROXY_ERR_BAD_REQUEST || e.op != ccoProxyOpPut;
@@ -1057,8 +1088,8 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
              e.op != IBV_WR_RDMA_WRITE || e.raddr != c.bufSize || e.len != 4096;
     }
     if (bad) {
-      printf("[rank %d]   %s: flush returned %d then %d, failed() %d\n", c.rank, name, res[0],
-             res[1], res[2]);
+      printf("[rank %d]   %s: flush returned %d then %d, failed() %d, waitSignal %d\n", c.rank,
+             name, res[0], res[1], res[2], res[3]);
     }
   } else if (got != 0) {
     PrintError(c.rank, name, got, e);  // e.g. a responder-side error; not checked
@@ -1078,7 +1109,8 @@ static int RunTimeoutCase(Ctx& c, const ccoDevCommRequirements& reqs) {
     fprintf(stderr, "[rank %d] %s: DevCommCreate failed\n", c.rank, name);
     return c.Harvest(name, 1);
   }
-  ccoBarrierAll(c.comm);
+  ProxyResetKernel<<<1, 256, 0, c.stream>>>(d, c.nSlots);
+  c.Sync();
   ProxyTimeoutKernel<<<kSpscQueues, 256, 0, c.stream>>>(d, c.recvWin, c.sendWin, kChunk, c.dErr);
   c.Sync();
   ccoDevCommError e{};

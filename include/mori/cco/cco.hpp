@@ -1109,9 +1109,15 @@ void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe);
 int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm);
 int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
 
-// A DevComm fails for good at its first ccoProxy error: the process survives,
-// ccoProxy::flush traps (or returns 2), and the DevComm must be destroyed and
-// created again. Other DevComms are unaffected.
+// A DevComm fails for good at its first ccoProxy error, seen only by the rank
+// that hit it (peers are not told). ccoProxy calls that trap on it (flush(),
+// waitSignal()) end the process: HIP reports the queue error and aborts. To
+// keep the process, wait with ccoProxy::flush(coop, timeoutCycles) /
+// waitSignal(..., timeoutCycles) (2 = failed) or poll failed(), and read the
+// cause with ccoDevCommGetError; receivers need their own timeout, since a
+// failed sender sends nothing more. Recovery: agree out of band, then every
+// rank calls ccoDevCommDestroy (collective) and creates the DevComm again.
+// Other DevComms are unaffected.
 enum ccoDevCommErrorCode {
   CCO_DEVCOMM_OK = 0,
   CCO_PROXY_ERR_BAD_REQUEST = 1,  // an op the proxy cannot post (no QP to the peer, bad descriptor)

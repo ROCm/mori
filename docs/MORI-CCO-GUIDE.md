@@ -466,6 +466,7 @@ and a queue index.
 | action | `ccoGda_NoSignal`, `ccoGda_SignalInc` / `SignalAdd` / `WindowSignalAdd` (NIC atomics), `ccoGda_SignalSet` / `WindowSignalSet` (8-byte write, no atomic) |
 | `flush(coop)` | wait until every op this queue pushed before it completed remotely; sources are reusable |
 | `int flush(coop, timeoutCycles)` | never traps: 0 done, 1 timed out, 2 DevComm failed |
+| `int waitSignal(id, least, coop, timeoutCycles)` | never traps: 0 consumed, 1 timed out, 2 DevComm failed; consumes only on 0 |
 | `readSignal` / `waitSignal` / `resetSignal` | local signal slots, shared with GDA (see [Signal slots](#signal-slots)) |
 | `failed()` | whether the DevComm has failed |
 
@@ -521,10 +522,21 @@ With `SignalInc`, `waitSignal(slot, n)` waits for `n` more signals. With
   window MRs must not use relaxed ordering; `ccoDevCommCreate` warns when
   `MORI_IB_ENABLE_RELAXED_ORDERING=1` applies it.
 - The first proxy error fails the DevComm for good: later ops are dropped,
-  `flush` and `waitSignal` trap, `flush(coop, timeoutCycles)` returns 2, and
-  `failed()` returns true. On the host, `ccoDevCommGetError(comm, &dc, &err)`
-  returns 1 and the first error (code, peer, queue, op, completion status,
-  message); it is safe to call while kernels run.
+  `failed()` returns true, and `flush(coop, timeoutCycles)` and
+  `waitSignal(id, least, coop, timeoutCycles)` return 2. On the host,
+  `ccoDevCommGetError(comm, &dc, &err)` returns 1 and the first error (code,
+  peer, queue, op, completion status, message); it is safe to call while
+  kernels run.
+- A trap ends the process: `flush()` and `waitSignal()` without a timeout trap
+  on a failed DevComm, as do usage errors, and HIP then reports the queue error
+  and aborts. To keep the process, use the timeout overloads or `failed()`.
+- Only the rank that hit the error sees it; peers are not notified. A rank that
+  only receives keeps waiting for data that will not come, so receivers need
+  their own timeout (`waitSignal(..., timeoutCycles)`).
+- Recovery: detect the failure (a 2, `failed()`, or `ccoDevCommGetError`),
+  agree on it across ranks out of band, then every rank calls
+  `ccoDevCommDestroy` (collective when the DevComm has proxy queues) and
+  creates a new DevComm. Other DevComms are unaffected.
 
 ### Example
 

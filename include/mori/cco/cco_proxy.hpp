@@ -73,12 +73,16 @@
 //
 // Failure: the DevComm fails for good at the first proxy error (see
 // ccoDevCommGetError): the proxy drops every later op and sets
-// ccoProxyFailedBit in each queue's flushDone. flush() then traps,
-// flush(coop, timeoutCycles) returns 2, waitSignal() traps within 256 polls,
-// an SPSC push waiting for ring space drops its op, and failed() returns true.
-// Not covered: an MPSC push waiting for ring space (only after a corrupted
-// ring), and waitSignal() for a peer that died while this DevComm posted
-// nothing to it.
+// ccoProxyFailedBit in each queue's flushDone. failed() then returns true,
+// flush(coop, timeoutCycles) and waitSignal(..., timeoutCycles) return 2, an
+// SPSC push waiting for ring space drops its op, and flush() / waitSignal()
+// trap (waitSignal within 256 polls). A trap, like any usage-error trap, ends
+// the process: HIP reports the queue error and aborts. Only this rank sees the
+// failure; peers are not told, so a receiver needs its own timeout
+// (waitSignal(..., timeoutCycles)). Recovery: detect it (2, failed(), or
+// ccoDevCommGetError), agree out of band, then every rank calls
+// ccoDevCommDestroy (collective) and creates a new DevComm. Not covered: an
+// MPSC push waiting for ring space (only after a corrupted ring).
 //
 // Fences: each put / putValue / signal does a system-scope release fence
 // before its push, so the data it sends (and every earlier store) is visible
@@ -384,14 +388,25 @@ struct ccoProxy {
   // arrived, then consumes them (readSignal returns the unconsumed amount); one
   // waiter per slot at a time. Also traps once the DevComm failed, and acquires.
   // One thread of the group waits (lane 0 / linear thread 0 for ccoCoopWarp /
-  // ccoCoopBlock, also in 2-D and 3-D blocks).
+  // ccoCoopBlock, also in 2-D and 3-D blocks). Full 64-bit slots (no `bits`).
   template <typename Coop = ccoCoopThread>
-  __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop = Coop{},
-                                    int bits = 64) {
+  __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop = Coop{}) {
     coop.sync();
-    if (groupLeader(coop)) waitSignalOrTrap(signalId, least, bits);
+    if (groupLeader(coop) && waitSignalLeader</*kTimeout=*/false>(signalId, least, 0) != 0) {
+      CCO_PROXY_TRAP(true,
+                     "ccoProxy: waitSignal: the DevComm failed; see the host's stderr or "
+                     "ccoDevCommGetError\n");
+    }
     coop.sync();
   }
+
+  // waitSignal() that never traps: 0 = consumed, 1 = timed out after
+  // timeoutCycles (impl::clock64 cycles), 2 = the DevComm failed; nothing is
+  // consumed unless it returns 0. Every thread of a ccoCoopWarp / ccoCoopBlock
+  // group gets the same value.
+  template <typename Coop>
+  [[nodiscard]] __device__ inline int waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop,
+                                                 uint64_t timeoutCycles);
   __device__ inline void resetSignal(ccoGdaSignal_t signalId) {
     impl::resetSignalImpl<CCO_GDA_BUILD_PROVIDER>(comm.ibgda.signalBuf, comm.ibgda.signalShadows,
                                                   signalId);
@@ -548,7 +563,11 @@ struct ccoProxy {
   template <bool kTimeout>
   __device__ static inline int flushWait(uint64_t* done, uint64_t target, uint64_t timeoutCycles);
 
-  __device__ inline void waitSignalOrTrap(ccoGdaSignal_t signalId, uint64_t least, int bits);
+  // The group leader's wait. Returns 0 consumed, 1 timed out (kTimeout only),
+  // 2 failed.
+  template <bool kTimeout>
+  __device__ inline int waitSignalLeader(ccoGdaSignal_t signalId, uint64_t least,
+                                         uint64_t timeoutCycles);
 
   // invoke() for a data-carrying op: first make the source data (and any
   // earlier stores the peer will read) visible to the NIC, since the proxy may
@@ -809,28 +828,55 @@ __device__ inline int ccoProxy<Queue>::flush(Coop coop, uint64_t timeoutCycles) 
 }
 
 template <typename Queue>
-__device__ inline void ccoProxy<Queue>::waitSignalOrTrap(ccoGdaSignal_t signalId, uint64_t least,
-                                                         int bits) {
+template <bool kTimeout>
+__device__ inline int ccoProxy<Queue>::waitSignalLeader(ccoGdaSignal_t signalId, uint64_t least,
+                                                        uint64_t timeoutCycles) {
   volatile uint64_t* signalBuf = comm.ibgda.signalBuf;
   volatile uint64_t* signalShadows = comm.ibgda.signalShadows;
-  const uint64_t mask = (bits >= 64) ? UINT64_MAX : ((1ULL << bits) - 1);
   const uint64_t shadow = signalShadows[signalId];
+  [[maybe_unused]] uint64_t start = 0;
+  if constexpr (kTimeout) start = static_cast<uint64_t>(impl::clock64());
+  int result = 0;
   for (uint32_t polls = 1;; polls++) {
     const uint64_t val =
         __hip_atomic_load(&signalBuf[signalId], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    if (((val - shadow) & mask) >= least) {
-      signalShadows[signalId] = (shadow + least) & mask;  // consume
+    if (val - shadow >= least) {
+      signalShadows[signalId] = shadow + least;  // consume
       break;
     }
     if (polls % 256 == 0 && failed()) {
-      CCO_PROXY_TRAP(true,
-                     "ccoProxy: waitSignal: the DevComm failed; see the host's stderr or "
-                     "ccoDevCommGetError\n");
+      result = 2;
+      break;
+    }
+    if constexpr (kTimeout) {
+      if (static_cast<uint64_t>(impl::clock64()) - start >= timeoutCycles) {
+        result = failed() ? 2 : 1;
+        break;
+      }
     }
     asm volatile("" ::: "memory");
   }
   // Data the signal covers is read after it (system scope: the NIC wrote it).
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+  return result;
+}
+
+template <typename Queue>
+template <typename Coop>
+__device__ inline int ccoProxy<Queue>::waitSignal(ccoGdaSignal_t signalId, uint64_t least,
+                                                  Coop coop, uint64_t timeoutCycles) {
+  coop.sync();
+  int result = 0;
+  if (groupLeader(coop))
+    result = waitSignalLeader</*kTimeout=*/true>(signalId, least, timeoutCycles);
+  coop.sync();
+  // The leader's result to the whole group.
+  if constexpr (std::is_same_v<Coop, ccoCoopBlock>) {
+    if (__syncthreads_or(result != 0)) result = __syncthreads_or(result == 2) ? 2 : 1;
+  } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
+    result = __shfl(result, 0);
+  }
+  return result;
 }
 
 #undef CCO_PROXY_TRAP

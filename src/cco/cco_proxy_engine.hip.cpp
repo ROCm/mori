@@ -524,7 +524,10 @@ class ProxyWorker {
       err_->state.store(2, std::memory_order_release);
       std::fprintf(
           stderr, "%s\n",
-          DescribeError(e, "DevComm failed: flush traps or returns 2; destroy and recreate it")
+          DescribeError(e,
+                        "DevComm failed: flush() / waitSignal() now trap and abort the process, "
+                        "their timeout overloads return 2; peers are not told. To recover, every "
+                        "rank destroys and recreates the DevComm")
               .c_str());
     } else {
       err_->suppressed.fetch_add(1, std::memory_order_relaxed);
