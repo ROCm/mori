@@ -103,6 +103,8 @@ Live view in Grafana while recording (VictoriaMetrics + Grafana from
 ainic-netmon record -o /shared/exp42/{host} --push http://127.0.0.1:8428
 ```
 
+![netmon overview dashboard: the NIC table and one RDMA traffic chart per NIC](../../examples/monitoring/netmon/images/nic_overview.png)
+
 The push runs on its own thread and never slows the samplers or the writer: when
 VictoriaMetrics is slow or unreachable, points are dropped and counted (`push` in
 `nic_meta.json`). Live values are an online approximation; afterwards

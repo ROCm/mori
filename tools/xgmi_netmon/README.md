@@ -130,6 +130,8 @@ Pick experiment, host, GPU and two variables:
 
 Top to bottom:
 
+![Tiles, GPU overview table, sent matrix and the bars of sent and received per GPU](../../examples/monitoring/netmon/images/xgmi_summary.png)
+
 - Tiles: Total Sent, Total Util (share of the capacity), Busiest Sent and Busiest Received (the GPU
   with the highest average sent / received bandwidth in the window; received = what the peers sent
   to it), Busiest PCIe (the GPU with the highest average PCIe traffic; reads and writes added,
@@ -151,10 +153,17 @@ Top to bottom:
   of one link's 72 GB/s (xgmi link width 16 x speed 36 Gbps, from `gpu_metrics`): under 5 % grey, up to
   40 % dim green, 70 % green, 85 % yellow, above that red.
 - Sent and received per GPU as bars (average GB/s).
+
+![Sent GPU to GPU over time, sent per GPU, and the row of GPU 0 with its links](../../examples/monitoring/netmon/images/xgmi_links.png)
+
 - Sent GPU -> GPU over time, and sent per GPU.
 - One row per GPU: the sent bandwidth to each peer over time with the 2 ms peak (red dashed), and
   a link table (one row per link: sent, share of one link's capacity, 2 ms peak, trend).
 - Diagnostics: the longest sampling interval per GPU.
+
+The screenshots are from an MI355X node with 8 GPUs, live, recorded with `--interval-ms 100`
+instead of the default 2 ms: the peak there is the highest 100 ms interval, and the dashboard's
+peak labels were changed to say so.
 
 All panels use the senders' `xgmi_write`; received is what the peers sent to the GPU. The time
 charts are steps: a point is the average of the bin that ends at it, so the value is drawn over
