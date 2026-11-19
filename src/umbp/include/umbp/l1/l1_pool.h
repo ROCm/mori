@@ -140,6 +140,9 @@ struct AllocateResult {
 struct FetchOptions {
   // Copy key i into dst_slots[i], a slot the caller holds, rather than into
   // free slots: nothing here is evicted or indexed; the caller publishes.
+  // Regranted destinations must be settled (their old owner's writes
+  // committed). An unsettled destination ends the returned leading prefix;
+  // every supplied destination remains held by the caller, copied or not.
   std::vector<uint32_t> dst_slots;
   // Copy nothing; count the leading keys the group could supply.
   bool probe_only = false;
