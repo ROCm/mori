@@ -42,6 +42,7 @@ import argparse
 import importlib.util
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -155,7 +156,46 @@ def check_wheel(path: str) -> None:
         _fail(
             f"{name} ships UMBP but no mori/{_UMBP_PYBINDS}; check setup.py package_data"
         )
+    _check_netmon_in_wheel(name, zf_infos(path))
     print(f"verify_install: {name} carries every required extension")
+
+
+_NETMON_BIN = "mori/bin/ainic-netmon"
+_NETMON_MODULES = ("mori/netmon_entry.py", "mori/_netmon_report.py")
+
+
+def zf_infos(path: str) -> dict:
+    with zipfile.ZipFile(path) as zf:
+        return {i.filename: i for i in zf.infolist()}
+
+
+def _check_netmon_in_wheel(name: str, infos: dict) -> None:
+    """ainic-netmon (BUILD_NETMON, default ON): binary executable, entry modules present."""
+    if _NETMON_BIN not in infos:
+        print(f"verify_install: {name} ships no ainic-netmon (BUILD_NETMON=OFF build)")
+        return
+    if not (infos[_NETMON_BIN].external_attr >> 16) & 0o111:
+        _fail(f"{name}: {_NETMON_BIN} is not executable")
+    missing = [m for m in _NETMON_MODULES if m not in infos]
+    if missing:
+        _fail(f"{name} ships {_NETMON_BIN} but not {missing}")
+    print(f"verify_install: {name} carries ainic-netmon and its entry points")
+
+
+def _check_netmon_installed(pkg: str) -> None:
+    exe = os.path.join(pkg, "bin", "ainic-netmon")
+    if not os.path.exists(exe):
+        print("verify_install: ainic-netmon not installed (BUILD_NETMON=OFF build)")
+        return
+    if not os.access(exe, os.X_OK):
+        _fail(f"{exe} is not executable")
+    # `version` needs no NIC, privileges or ROCm.
+    out = subprocess.run([exe, "version"], capture_output=True, text=True, timeout=30)
+    if out.returncode != 0 or not out.stdout.startswith("ainic-netmon"):
+        _fail(f"{exe} version failed: {out.stderr.strip() or out.stdout.strip()}")
+    import mori.netmon_entry  # noqa: F401
+
+    print(f"verify_install: {out.stdout.strip()} runs from {exe}")
 
 
 def _drop_accidental_paths() -> str:
@@ -242,6 +282,7 @@ def check_install() -> None:
     print(
         "verify_install: mori.ops/io/shmem libraries need none of UMBP's dependencies"
     )
+    _check_netmon_installed(pkg)
 
 
 def main() -> None:
