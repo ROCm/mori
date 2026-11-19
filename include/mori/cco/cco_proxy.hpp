@@ -28,7 +28,7 @@
 // descriptor; host proxy threads run the callbacks, which post ibverbs work
 // requests on host-created RC QPs, proxyQpsPerPeer per (proxy thread, peer),
 // on the PD that owns the cco window MRs. Keys and remote addresses are
-// resolved on the GPU exactly like ccoGda (iova=0: raddr = window offset), so
+// resolved on the GPU exactly like ccoGda (raddr = window offset + iovaBias), so
 // the proxy needs no key tables.
 //
 // Queues: ccoProxy<SPSCD2HQueue> (default) indexes the DevComm's SPSC pool,
@@ -189,8 +189,8 @@ enum ccoProxyOp : uint8_t {
 };
 
 struct ccoProxyPutDesc {
-  uint64_t laddr;  // local window offset (iova=0)
-  uint64_t raddr;  // remote window offset (iova=0)
+  uint64_t laddr;  // local MR address: window offset + iovaBias
+  uint64_t raddr;  // remote MR address: window offset + iovaBias
   uint32_t lkey;
   uint32_t rkey;
   uint32_t bytes;
@@ -198,7 +198,7 @@ struct ccoProxyPutDesc {
 };
 
 struct ccoProxySignalDesc {
-  uint64_t raddr;  // remote signal slot (window offset, iova=0)
+  uint64_t raddr;  // remote signal slot (MR address, as raddr above)
   uint64_t value;  // atomic add operand, or the value written (set)
   uint32_t rkey;
   uint32_t peer;  // world rank
@@ -212,7 +212,7 @@ struct ccoProxyPutSignalDesc {
 };
 
 struct ccoProxyPutValueDesc {
-  uint64_t raddr;  // remote window offset (iova=0)
+  uint64_t raddr;  // remote MR address: window offset + iovaBias
   uint64_t value;  // the low `bytes` bytes are written (little endian)
   uint32_t rkey;
   uint32_t bytes;  // 1..8
@@ -288,9 +288,10 @@ __device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, 
     s.rkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
     s.value = action.value;
   } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
-    // Caller's window, offset already window-relative (iova=0).
-    s.raddr = action.offset;
-    s.rkey = reinterpret_cast<ccoWindowDevice*>(action.win)->ibgdaWin.peerRkeys[worldPeer];
+    // Caller's window: its MR starts at iova iovaBias, as in ccoGda.
+    const ccoWindowDevice* w = reinterpret_cast<ccoWindowDevice*>(action.win);
+    s.raddr = action.offset + w->ibgdaWin.iovaBias;
+    s.rkey = w->ibgdaWin.peerRkeys[worldPeer];
     s.value = action.value;
   } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalSet>) {
     s.raddr = static_cast<uint64_t>(action.signalId) * sizeof(uint64_t);
@@ -298,8 +299,9 @@ __device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, 
     s.value = action.value;
     s.set = 1;
   } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalSet>) {
-    s.raddr = action.offset;
-    s.rkey = reinterpret_cast<ccoWindowDevice*>(action.win)->ibgdaWin.peerRkeys[worldPeer];
+    const ccoWindowDevice* w = reinterpret_cast<ccoWindowDevice*>(action.win);
+    s.raddr = action.offset + w->ibgdaWin.iovaBias;
+    s.rkey = w->ibgdaWin.peerRkeys[worldPeer];
     s.value = action.value;
     s.set = 1;
   } else {
@@ -843,10 +845,12 @@ __device__ inline void ccoProxy<Queue, Fence>::put(int peer, ccoWindow_t dstWin,
     ccoProxyPutDesc d{};
     if (on) {  // an inactive lane's arguments are not read
       worldPeer = resolveWorldPeer<TeamMode>(peer);
-      d.lkey = reinterpret_cast<ccoWindowDevice*>(srcWin)->ibgdaWin.lkey;
-      d.rkey = reinterpret_cast<ccoWindowDevice*>(dstWin)->ibgdaWin.peerRkeys[worldPeer];
-      d.laddr = srcOffset;
-      d.raddr = dstOffset;
+      const ccoWindowDevice* sw = reinterpret_cast<ccoWindowDevice*>(srcWin);
+      const ccoWindowDevice* dw = reinterpret_cast<ccoWindowDevice*>(dstWin);
+      d.lkey = sw->ibgdaWin.lkey;
+      d.rkey = dw->ibgdaWin.peerRkeys[worldPeer];
+      d.laddr = srcOffset + sw->ibgdaWin.iovaBias;  // MR iova of window offset 0
+      d.raddr = dstOffset + dw->ibgdaWin.iovaBias;
       d.peer = static_cast<uint32_t>(worldPeer);
     } else {
       bytes = 0;
@@ -897,8 +901,9 @@ __device__ inline void ccoProxy<Queue, Fence>::putValue(int peer, ccoWindow_t ds
     ccoProxyPutValueDesc d{};
     if (on) {  // an inactive lane's arguments are not read
       worldPeer = resolveWorldPeer<TeamMode>(peer);
-      d.raddr = dstOffset;
-      d.rkey = reinterpret_cast<ccoWindowDevice*>(dstWin)->ibgdaWin.peerRkeys[worldPeer];
+      const ccoWindowDevice* dw = reinterpret_cast<ccoWindowDevice*>(dstWin);
+      d.raddr = dstOffset + dw->ibgdaWin.iovaBias;
+      d.rkey = dw->ibgdaWin.peerRkeys[worldPeer];
       __builtin_memcpy(&d.value, &value, sizeof(T));
       d.bytes = sizeof(T);
       d.peer = static_cast<uint32_t>(worldPeer);

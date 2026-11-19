@@ -750,7 +750,7 @@ class ProxyWorker {
   uint64_t AddWrite(ProxyQp& qp, const ccoProxyPutDesc& d) {
     ibv_send_wr wr{};
     ibv_sge sge{};
-    sge.addr = d.laddr;  // iova=0 window offset
+    sge.addr = d.laddr;  // MR address (window offset + iovaBias)
     sge.length = d.bytes;
     sge.lkey = d.lkey;
     wr.opcode = IBV_WR_RDMA_WRITE;

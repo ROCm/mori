@@ -377,7 +377,7 @@ struct ccoSdmaContext {
 
 // ccoProxy context (host-proxy RDMA; see cco_proxy.hpp). Kernels invoke host
 // callbacks (KIWI invoke) with descriptors, keys already resolved (the same
-// iova=0 window addressing as GDA). A fixed set of host proxy threads polls the
+// window addressing as GDA, offset + iovaBias). A fixed set of host proxy threads polls the
 // queues and posts the RDMA work requests on host-created RC QPs,
 // proxyQpsPerPeer per (proxy thread, peer). Two queue pools: SPSC (one
 // wavefront at a time per queue) and MPSC. Empty when both pools are empty.
