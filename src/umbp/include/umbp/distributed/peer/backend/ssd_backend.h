@@ -126,11 +126,22 @@ class SsdBackend : public MediumBackend {
                             bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
+  // Checks the staging lease a remote reader read from, not the record on disk:
+  // the reader's pages point into staging.
+  std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& generations) const override;
+  // Also counts the reader out of each staging lease it names.  When the last
+  // remote reader of a lease is out, the lease is expired on the spot, so the
+  // span returns to the arena at the next reap or the next span search that
+  // finds no room, not a full read_lease_ttl later.
+  std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations) override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
   // The manager's order (the file tier's segment order, or its LRU) minus keys
   // a staged or migration read holds.
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
   bool OwnsEvictionOrder() const override;
+  size_t Touch(const std::vector<std::string>& keys) override;
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
 
@@ -172,6 +183,14 @@ class SsdBackend : public MediumBackend {
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
     std::shared_ptr<const void> hold;  // copied into each kLocal hit
+    // ResolvedEntry::generation for this staging span.  The span goes back to
+    // the arena only with the lease, so a lease that still carries it still
+    // holds the bytes a remote reader was told about.
+    uint64_t generation = 0;
+    // Remote resolve answers that named this lease and have not been finished
+    // (BatchFinishReads).  Reaching 0 expires the lease early.  A reader that
+    // never finishes leaves it above 0, and the lease to expires_at.
+    uint32_t remote_readers = 0;
   };
 
   // A lease ClearLocal took while a local reader still held it; freed once
@@ -312,6 +331,8 @@ class SsdBackend : public MediumBackend {
   // the next put the same way, so without this a full arena fails puts silently.
   std::atomic<uint64_t> put_full_rejects_{0};
   std::atomic<uint64_t> staging_expired_reclaims_{0};
+  // Leases their last remote reader ended before the timer did.
+  std::atomic<uint64_t> staging_reader_releases_{0};
   std::atomic<uint64_t> extent_stages_total_{0};  // extent-scoped device reads
   std::atomic<uint64_t> extent_stage_bytes_{0};   // their window bytes
   // Migration pins (a source read, or a target after commit): file range or staging.

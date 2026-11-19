@@ -3,16 +3,19 @@ name: ci-rerun
 # Re-run CI on a PR against the current main, without pushing to the PR
 # branch: comment "/ci-rerun" on the PR, or add the "ci-rerun" label.
 #
-# This re-runs the PR's latest ci.yml and ci_cco.yml runs, the same as their
-# "Re-run all jobs" button, so the results stay in the PR checks. On a re-run
-# those workflows check out refs/pull/N/merge, i.e. the PR merged with the
-# current main. GITHUB_TOKEN can re-run workflows, so no personal token is
-# involved.
+# This re-runs the PR's latest ci.yml run (which calls ci_cco.yml), the same as
+# its "Re-run all jobs" button, so the results stay in the PR checks. On a re-run
+# the jobs check out refs/pull/N/merge, i.e. the PR merged with the current main;
+# the workflow definition stays that of the original run. GITHUB_TOKEN can re-run
+# workflows, so no personal token is involved.
 #
-# Fork PRs: use the comment. A label event on a fork PR gets a read-only
-# GITHUB_TOKEN, so the label path is skipped there. (pull_request_target would
-# have a write token, but GitHub blocks it by default in public repositories
-# from 2026-11-02.)
+# Adding the ci:full or ci:mi300x label re-runs it the same way; the re-run's scope
+# job reads the PR's labels live, so it runs every lane, or adds the MI300X lanes.
+#
+# Fork PRs: use the comment, after adding ci:full or ci:mi300x if wanted. A label
+# event on a fork PR gets a read-only GITHUB_TOKEN, so the label path is skipped
+# there. (pull_request_target would have a write token, but GitHub blocks it by
+# default in public repositories from 2026-11-02.)
 on:
   issue_comment:
     types: [created]
@@ -30,7 +33,8 @@ jobs:
     if: |
       (github.event_name == 'issue_comment' && github.event.issue.pull_request != null &&
        startsWith(github.event.comment.body, '/ci-rerun')) ||
-      (github.event_name == 'pull_request' && github.event.label.name == 'ci-rerun' &&
+      (github.event_name == 'pull_request' &&
+       contains(fromJSON('["ci-rerun", "ci:full", "ci:mi300x"]'), github.event.label.name) &&
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
@@ -76,12 +80,17 @@ jobs:
             }
 
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-            const rerun = [], missing = [];
-            for (const workflow_id of ['ci.yml', 'ci_cco.yml']) {
-              const { data } = await github.rest.actions.listWorkflowRuns({
-                owner, repo, workflow_id, event: 'pull_request', head_sha: pr.head.sha, per_page: 1 });
-              let run = data.workflow_runs[0];
-              if (!run) { missing.push(workflow_id); continue; }
+            const latest = async (workflow_id) => (await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id, event: 'pull_request', head_sha: pr.head.sha, per_page: 1,
+            })).data.workflow_runs[0];
+            // Before CI routing every PR event also started a ci_cco.yml run of its
+            // own; re-run one only next to the ci.yml run it was started with.
+            const ci = await latest('ci.yml'), cco = await latest('ci_cco.yml');
+            const paired = Boolean(ci && cco &&
+              Math.abs(Date.parse(ci.created_at) - Date.parse(cco.created_at)) < 120000);
+            const rerun = [];
+            for (let run of paired ? [ci, cco] : [ci]) {
+              if (!run) continue;
               // A run can only be re-run once it has finished.
               if (run.status !== 'completed') {
                 await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id: run.id }).catch(() => {});
@@ -95,9 +104,15 @@ jobs:
             }
 
             const lines = [];
-            if (rerun.length) lines.push(`Re-running ${rerun.join(' and ')} against the current main.`);
-            if (missing.length) {
-              lines.push(`No \`pull_request\` run of ${missing.join(', ')} exists for the head commit ` +
+            const label = context.eventName === 'pull_request' ? context.payload.label.name : 'ci-rerun';
+            const why = label === 'ci-rerun' ? '' : ` with \`${label}\``;
+            if (rerun.length) lines.push(`Re-running ${rerun.join(' and ')} against the current main${why}.`);
+            if (paired) {
+              lines.push('These runs predate CI routing, so the re-run runs every lane; ' +
+                'push a commit to get a run that picks lanes from the changed files.');
+            }
+            if (!ci) {
+              lines.push(`No \`pull_request\` run of ci.yml exists for the head commit ` +
                 `${pr.head.sha.slice(0, 8)} (e.g. it was pushed by a bot, whose pushes start no CI); ` +
                 'push a commit to start one.');
             }

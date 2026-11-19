@@ -64,10 +64,11 @@ Each path names its source/destination memory type, except the remote paths, whi
 the initiator's read/write direction. Configure every path your workload uses; a missing
 path rejects the transfer. Unused paths may be omitted.
 
-This first version uses manually supplied parameters. Automatic calibration belongs in
-a follow-up PR covering the actual engines (`LocalCopyEngine`, `HbmCopyEngine` and
-`MoriIoEngine`), with reusable profiles for CPU, GPU and RDMA transfers. SSD coefficients
-also need measurements of the actual configured storage path.
+Profiles may use manual estimates or the optional [engine calibration tools](umbp-calibration.md).
+Those tools measure `LocalCopyEngine`, `HbmCopyEngine`, `MoriIoEngine`, `PosixEngine`,
+`GdsEngine` and `SSDTier`, and merge
+measured coefficients with explicitly reported estimates for unmeasured paths.
+Select the paths and SSD settings used by your deployment when calibrating.
 
 For staged SSD load/offload, optional `file_cpu_staged` / `cpu_file_staged` describe storage-path cost;
 normal CPU/GPU/network transfers add their own costs. Fit those SSD coefficients
@@ -89,11 +90,13 @@ The example SSD values are estimates, not calibration results.
 | `channel` | Same names share a service queue within one backend client/server. |
 | `latency_ns` | Nonnegative fixed cost per submitted batch/path. |
 | `copy_latency_ns` | Nonnegative cost per coalesced copy; default 0. |
+| `interleave_copies` | Optional `cpu_gpu` / `gpu_cpu` flag to wait per copy in pure same-device fallback batches, letting concurrent callers interleave; default false. Gather and mixed batches keep batch scheduling. |
 | `registration_latency_ns` | Optional nonnegative first-FD cost for `file_gpu`; default 0. |
 | `log_size_latency_ns` | Optional nonnegative SSD read cost per copy × `log2(max(1, mean copy bytes / 4096))`; default 0. |
 | `batch_log_size_latency_ns` | Optional nonnegative SSD read cost per batch × the same size term; default 0. |
 | `serialize_latency` | Optional SSD read flag to queue latency as well as bytes, for mutually exclusive I/O batches; default false. |
 | `bandwidth_bytes_per_second` | Positive effective bandwidth. |
+| `size_knee_bytes`, `large_size_ns_per_byte` | Optional paired scalar fields for `cpu_staging` / `cpu_staging_read`: a positive byte threshold and nonnegative additional ns/byte above it. Omitted fields add no cost. |
 
 `cpu_cpu` coefficients may be arrays indexed by copy threads minus one, clamped to the last
 entry; other paths use scalars. Existing thread selection/thresholds still apply.

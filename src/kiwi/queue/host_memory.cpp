@@ -82,9 +82,9 @@ hsa_status_t find_gpu(hsa_agent_t agent, void* data) {
 
 hsa_agent_t current_gpu() {
   int device = 0;
-  HIP_CHECK(hipGetDevice(&device));
+  KIWI_HIP_CHECK(hipGetDevice(&device));
   hipDeviceProp_t properties{};
-  HIP_CHECK(hipGetDeviceProperties(&properties, device));
+  KIWI_HIP_CHECK(hipGetDeviceProperties(&properties, device));
 
   GpuLookup lookup{
       properties.pciDomainID,

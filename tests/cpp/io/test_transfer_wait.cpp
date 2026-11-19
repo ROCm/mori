@@ -151,6 +151,57 @@ void CaseWaitForUnboundedHonoursCallback() {
   Require(rc == StatusCode::SUCCESS, "unbounded WaitFor should return callback result");
 }
 
+// Arms `status` as XgmiBackend's ArmTransferCompletion does: nothing notifies it, it completes
+// only when its progress callback finds the transfer done. Returns its poll counter.
+std::shared_ptr<std::atomic<int>> ArmPolledCompletion(TransferStatus* status, int readyAfterMs) {
+  auto polls = std::make_shared<std::atomic<int>>(0);
+  const auto readyAt = Clock::now() + std::chrono::milliseconds(readyAfterMs);
+  SetInProgress(status);
+  status->SetProgressCallback([status, polls, readyAt] {
+    polls->fetch_add(1, std::memory_order_relaxed);
+    if (Clock::now() >= readyAt) status->SetCode(StatusCode::SUCCESS);
+  });
+  return polls;
+}
+
+void CaseWaitForBoundedPollsProgressCallback() {
+  TransferStatus status;
+  ArmPolledCompletion(&status, 50);
+  auto start = Clock::now();
+  StatusCode rc = status.WaitFor(5000);
+  int64_t elapsed = ElapsedMs(start);
+  Require(rc == StatusCode::SUCCESS, "bounded WaitFor should see a polled completion");
+  Require(elapsed >= 40 && elapsed < 1000,
+          "bounded WaitFor should return once polling sees completion, took " +
+              std::to_string(elapsed) + " ms");
+}
+
+void CaseWaitForBoundedPollingStillTimesOut() {
+  TransferStatus status;
+  auto polls = ArmPolledCompletion(&status, 60 * 60 * 1000);
+  auto start = Clock::now();
+  StatusCode rc = status.WaitFor(30);
+  int64_t elapsed = ElapsedMs(start);
+  Require(rc == StatusCode::IN_PROGRESS, "bounded WaitFor should time out");
+  Require(elapsed >= 20 && elapsed < 250, "bounded WaitFor did not respect timeout");
+  Require(polls->load() > 2, "bounded WaitFor should keep polling until the deadline");
+}
+
+void CaseWaitAllBoundedPollsProgressCallbacks() {
+  auto engine = MakeEngine("wait_all_polled");
+  std::array<TransferStatus, 3> statuses;
+  for (size_t i = 0; i < statuses.size(); ++i) {
+    ArmPolledCompletion(&statuses[i], static_cast<int>((i + 1) * 20));
+  }
+  auto ptrs = Ptrs(&statuses);
+  auto start = Clock::now();
+  StatusCode rc = engine->WaitAll(ptrs, 5000);
+  int64_t elapsed = ElapsedMs(start);
+  Require(rc == StatusCode::SUCCESS, "bounded WaitAll should see polled completions");
+  Require(elapsed < 1000, "bounded WaitAll should return once polling sees completion, took " +
+                              std::to_string(elapsed) + " ms");
+}
+
 void CaseWaitForBlockingSuccess() {
   TransferStatus status;
   SetInProgress(&status);
@@ -390,6 +441,9 @@ int main() {
       {"WaitForZeroPollsProgressCallback", CaseWaitForZeroPollsProgressCallback},
       {"WaitForBoundedIgnoresCallback", CaseWaitForBoundedIgnoresCallback},
       {"WaitForUnboundedHonoursCallback", CaseWaitForUnboundedHonoursCallback},
+      {"WaitForBoundedPollsProgressCallback", CaseWaitForBoundedPollsProgressCallback},
+      {"WaitForBoundedPollingStillTimesOut", CaseWaitForBoundedPollingStillTimesOut},
+      {"WaitAllBoundedPollsProgressCallbacks", CaseWaitAllBoundedPollsProgressCallbacks},
       {"WaitForBlockingSuccess", CaseWaitForBlockingSuccess},
       {"WaitForTimeoutNoUpdate", CaseWaitForTimeoutNoUpdate},
       {"WaitForTimeoutThenUpdate", CaseWaitForTimeoutThenUpdate},

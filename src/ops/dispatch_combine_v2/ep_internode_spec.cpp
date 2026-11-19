@@ -93,9 +93,13 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   cfg.kernelCfg.maxTotalRecvTokens = request.maxTotalRecvTokens;
   cfg.kernelCfg.gpuPerNode = request.gpuPerNode;
   cfg.kernelCfg.numQpPerPe = request.numQpPerPe;
+  cfg.kernelCfg.numQpToDrain = request.numQpToDrain;
   cfg.kernelCfg.quantType = request.quantType;
 
   cfg.dtype = request.dtype;
+  // Only the ordinary Combine pass reads it; keeping it false elsewhere lets the
+  // other passes share one compiled module across load-first and plain buckets.
+  cfg.kernelCfg.combineLoadFirst = (kind == EpInterNodeKernel::Combine) && request.combineLoadFirst;
   cfg.asyncLlMode = request.asyncLlMode;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);
@@ -116,7 +120,10 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   if (!EpInterNodeKernelCfgIsValid(cfg.kernelCfg)) {
     throw std::runtime_error(
         "mori ep internode v2: unusable config " + Render(cfg.kernelCfg) +
-        "; every divisor must be positive and worldSize must be a multiple of gpuPerNode");
+        "; every divisor must be positive, worldSize a multiple of gpuPerNode, and "
+        "numQpPerPe / numQpToDrain within [1, " +
+        std::to_string(kCombineBarrierMarkerTotal) + "] / [0, " +
+        std::to_string(kCombineBarrierMarkerTotal) + "]");
   }
 
   if (cfg.asyncLlMode < 0 || cfg.asyncLlMode > 2) {
@@ -347,7 +354,7 @@ mori::ops::v2::EpInterNodeCfg EpInterNodeCfgFromFields(const mori::jit::v2::Fiel
     using mori::jit::v2::WireAssign;
     if (fields.Has(name)) WireAssign(slot, fields.Get(name, 0));
   });
-  return MakeEpInterNodeCfg(mori::jit::v2::GetToolchain().arch, request, kind);
+  return MakeEpInterNodeCfg(mori::jit::v2::ActiveArch(), request, kind);
 }
 
 // No C++-side AOT: a precompiled entry only helps if it renders the Cfg a live

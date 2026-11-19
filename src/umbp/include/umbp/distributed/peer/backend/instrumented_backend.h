@@ -78,6 +78,17 @@ class InstrumentedBackend final : public MediumBackend {
   TierCapacity Capacity() const override { return inner_->Capacity(); }
   uint64_t OwnedKeyCount() const override { return inner_->OwnedKeyCount(); }
   bool Contains(const std::string& key) const override { return inner_->Contains(key); }
+  // Must forward: the default answers true, which would wave every stale read through.
+  std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& generations) const override {
+    return inner_->BatchStillHolds(keys, generations);
+  }
+  // Must forward: the default only answers, so the inner medium would never
+  // learn that its readers are done.
+  std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations) override {
+    return inner_->BatchFinishReads(keys, generations);
+  }
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
                             bool allow_file_ref) override {
     return inner_->AcquireMigrationRead(key, resolved, allow_file_ref);
@@ -105,6 +116,7 @@ class InstrumentedBackend final : public MediumBackend {
     return inner_->EvictionCandidates(max_count);
   }
   bool OwnsEvictionOrder() const override { return inner_->OwnsEvictionOrder(); }
+  size_t Touch(const std::vector<std::string>& keys) override { return inner_->Touch(keys); }
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override {
     inner_->SetAutoFlushHook(threshold, std::move(cb));

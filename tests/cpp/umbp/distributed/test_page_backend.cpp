@@ -597,6 +597,55 @@ TEST(PageBackend, ALocalHoldFencesEvictionUntilDropped) {
   EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
 }
 
+// ---- Check-after-read (remote readers, #749) --------------------------------
+
+// A remote reader's lease is a timer that can lapse mid-read.  BatchStillHolds
+// is how it learns afterwards whether the pages it read were freed and refilled
+// under it — here, by the same key, which is the case a key check alone misses.
+TEST(PageBackend, StillHoldsUntilTheCopyIsFreed) {
+  auto a = MakeAllocator(std::chrono::milliseconds{5000}, std::chrono::milliseconds{1});
+  auto p = AllocateOk(*a, "k", kPageSize);
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
+
+  const uint64_t gen = a->BatchResolve({"k"}, false)[0].generation;
+  ASSERT_NE(gen, 0u) << "a page medium must stamp its copies";
+  EXPECT_EQ(a->Resolve("k").generation, gen) << "same copy, same generation";
+  EXPECT_EQ(a->BatchStillHolds({"k"}, {gen}), std::vector<bool>{true});
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});  // the lease lapses
+  ASSERT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
+  EXPECT_EQ(a->BatchStillHolds({"k"}, {gen}), std::vector<bool>{false});
+
+  auto p2 = AllocateOk(*a, "k", kPageSize);
+  ASSERT_TRUE(p2.has_value());
+  ASSERT_TRUE(a->Commit(p2->slot_id, "k", committed_bytes));
+  const uint64_t gen2 = a->BatchResolve({"k"}, false)[0].generation;
+  EXPECT_NE(gen2, gen);
+  EXPECT_EQ(a->BatchStillHolds({"k", "k"}, {gen, gen2}), (std::vector<bool>{false, true}));
+}
+
+TEST(PageBackend, StillHoldsAfterClearLocalAndForUnstampedReads) {
+  auto a = MakeAllocator(std::chrono::milliseconds{5000}, std::chrono::milliseconds{1});
+  uint64_t committed_bytes = 0;
+  auto pa = AllocateOk(*a, "a", kPageSize);
+  auto pb = AllocateOk(*a, "b", kPageSize);
+  ASSERT_TRUE(a->Commit(pa->slot_id, "a", committed_bytes));
+  ASSERT_TRUE(a->Commit(pb->slot_id, "b", committed_bytes));
+  const auto r = a->BatchResolve({"a", "b"}, false);
+  EXPECT_NE(r[0].generation, r[1].generation) << "one counter, never shared by two copies";
+
+  // Another key's generation does not vouch for this key; 0 is not checkable.
+  EXPECT_EQ(a->BatchStillHolds({"a", "a", "ghost", "ghost"},
+                               {r[0].generation, r[1].generation, r[0].generation, 0}),
+            (std::vector<bool>{true, false, false, true}));
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  a->ClearLocal();
+  EXPECT_EQ(a->BatchStillHolds({"a", "b"}, {r[0].generation, r[1].generation}),
+            (std::vector<bool>{false, false}));
+}
+
 // ---- Full-sync snapshot -----------------------------------------------------
 
 TEST(PageBackend, SnapshotOwnedKeysReturnsEveryAdd) {
@@ -1239,6 +1288,74 @@ TEST(PageBackendAutoFlush, FullSyncSnapshotClearsOutbox) {
   ASSERT_EQ(delta.size(), 1u);
   EXPECT_EQ(delta[0].key, "fs-new");
   EXPECT_EQ(delta[0].kind, KvEvent::Kind::ADD);
+}
+
+// ---- Recency hints (Touch) ------------------------------------------------------
+
+namespace {
+
+// Ordered, with a read lease long enough that a key leased by mistake would be
+// missing from EvictionCandidates.
+std::unique_ptr<PageBackend> MakeOrderedBackend(
+    std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500}) {
+  auto backend = MakeAllocator(std::chrono::milliseconds{5000}, read_lease_ttl);
+  backend->TrackEvictionOrder();
+  return backend;
+}
+
+void PutKey(PageBackend& backend, const std::string& key) {
+  auto slot = AllocateOk(backend, key, kPageSize);
+  ASSERT_TRUE(slot.has_value()) << key;
+  uint64_t bytes = 0;
+  ASSERT_TRUE(backend.Commit(slot->slot_id, key, bytes)) << key;
+}
+
+std::vector<std::string> OfferedOrder(PageBackend& backend) {
+  std::vector<std::string> keys;
+  for (const auto& offer : backend.EvictionCandidates(16)) keys.push_back(offer.key);
+  return keys;
+}
+
+}  // namespace
+
+TEST(PageBackendTouch, MovesRecencyWithoutALease) {
+  auto backend = MakeOrderedBackend();
+  PutKey(*backend, "a");
+  PutKey(*backend, "b");
+  PutKey(*backend, "c");
+  ASSERT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"a", "b", "c"}));
+  EXPECT_EQ(backend->Touch({"a", "missing"}), 1u);
+  // Most recent now, and still offered at once: a touch takes no lease.
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"b", "c", "a"}));
+}
+
+TEST(PageBackendTouch, MovesKeysInTheOrderGiven) {
+  auto backend = MakeOrderedBackend();
+  PutKey(*backend, "a");
+  PutKey(*backend, "b");
+  PutKey(*backend, "c");
+  EXPECT_EQ(backend->Touch({"b", "a"}), 2u);
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"c", "b", "a"}));
+}
+
+TEST(PageBackendTouch, ExistsProbesLeaveTheOrderAlone) {
+  // A 1 ms lease, so the key read below is offered again after the sleep.
+  auto backend = MakeOrderedBackend(std::chrono::milliseconds{1});
+  PutKey(*backend, "a");
+  PutKey(*backend, "b");
+  PutKey(*backend, "c");
+  for (int i = 0; i < 5; ++i) backend->BatchContains({"a", "b", "missing"});
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"a", "b", "c"}));
+  // A read is a use.
+  ASSERT_TRUE(backend->BatchResolve({"a"}, false).front().found);
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"b", "c", "a"}));
+}
+
+TEST(PageBackendTouch, DoesNothingUntilTheOrderIsTracked) {
+  auto backend = MakeAllocator();
+  PutKey(*backend, "a");
+  EXPECT_EQ(backend->Touch({"a"}), 0u);
 }
 
 }  // namespace mori::umbp

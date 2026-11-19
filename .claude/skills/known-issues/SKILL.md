@@ -1,16 +1,27 @@
 ---
 name: known-issues
 description: >-
-  Known environment issues that make MORI slow or behave oddly without being MORI bugs —
-  currently: HIP VMM peer traffic silently falling off XGMI onto PCIe/host memory on Linux
-  kernels built without CONFIG_DMABUF_MOVE_NOTIFY / CONFIG_PCI_P2PDMA, which hits mori-cco
-  (EPv2) but not mori-shmem (EPv1). Use when EPv2 / dispatch_combine_v2 / cco is much slower
-  than expected, when EPv2 is far slower than EPv1 on the same box, when a2a bandwidth does
-  not scale with the number of peers, or when the user asks whether a perf problem is a
-  MORI bug or an environment/toolchain problem. Also: (2) on ROCm 7.0-7.2.x a clr
+  Known environment issues that make MORI slow, hang or behave oddly without being MORI
+  bugs — currently: (1) HIP VMM peer memory pinned into host memory instead of peer VRAM
+  when the kernel lacks CONFIG_DMABUF_MOVE_NOTIFY AND the loaded amdgpu build checks that
+  option (most DKMS builds do), which hits mori-cco (EPv2) but not mori-shmem (EPv1) and
+  shows up as a ~9x slowdown or as EPv2 hanging / never finishing startup. Use when EPv2 /
+  dispatch_combine_v2 / cco is much slower than expected, or hangs on one box but not on
+  another, when EPv2 is far slower than EPv1 on the same box, when a2a bandwidth does not
+  scale with the number of peers, or when the user asks whether a perf problem is a MORI
+  bug or an environment/toolchain problem. Also: (2) on ROCm 7.0-7.2.x a clr
   hipMemSetAccess sub-buffer bug makes mori-cco 2-node ccoDevCommCreate fail with
   "hipMemSetAccess ... invalid argument"; (3) on ROCm 7.2.x clr routes uncached VMM
-  allocations to the coarse-grained pool, making cco combine ~10-15us slower.
+  allocations to the coarse-grained pool, making cco combine ~10-15us slower; (4) amdgpu
+  miscounts VRAM registered with a NIC (MoRI-IO, UMBP, Mooncake): later allocations, kernel
+  loads or new streams fail with OOM, HIP error 209 or a segfault in HIPStream::stream()
+  although VRAM is free, or hipMemGetInfo exceeds the card. It behaves differently on
+  amdgpu-dkms 30.x and 31.10-31.60. The fix is upstream and in an internal amdgpu-dkms
+  build; no public amdgpu-dkms release has it, but the upstream patch applies to DKMS.
+  (5) AMD Pollara (AINIC) 1.117.5 firmware after a-45 can mishandle retransmitted
+  RDMA READs, so MORI-IO / UMBP transfers fail with flush errors and no root cause, or
+  report success with data missing or landing late. Use when MORI-IO or UMBP reads fail
+  or return wrong data on AINIC.
 ---
 
 # MORI Known Issues
@@ -25,17 +36,43 @@ debugging MORI itself when performance is unexpectedly bad on a specific machine
 **Affects:** `mori-cco` (EPv2, `dispatch_combine_v2`) and anything else built on the
 HIP VMM API. **Does not affect** `mori-shmem` (EPv1), which uses IPC handles.
 
-**Root cause:** the Linux kernel was compiled **without**
-`CONFIG_DMABUF_MOVE_NOTIFY=y` (and usually also without `CONFIG_PCI_P2PDMA=y`).
-This is the case for the stock Ubuntu 22.04 GA **5.15** kernel. It is a *kernel build
-configuration* problem, not a kernel version bug and not an amdgpu regression — a 5.15
-rebuilt with those options works fine, and the Ubuntu **6.8 HWE** kernel already has them.
+**Root cause:** two conditions, and a machine is affected only when **both** hold.
 
-**Impact is silent.** Nothing errors, correctness still passes; the a2a path is just
-~9x slower.
+1. **The kernel was compiled without `CONFIG_DMABUF_MOVE_NOTIFY=y`** (and usually also
+   without `CONFIG_PCI_P2PDMA=y`).
+   - Known offenders: the stock Ubuntu 22.04 GA **5.15** kernel, and the Alibaba Cloud
+     Linux 3 **5.10.134-\*.al8** kernels found on MI308X hosts.
+   - It is a *kernel build configuration* problem, not a kernel version bug: a 5.15
+     rebuilt with those options works fine, and the Ubuntu **6.8 HWE** kernel already
+     has them.
+2. **The loaded amdgpu driver refuses to pin a dma-buf in VRAM when that option is off.**
+   - It does so with a compile-time check in `amdgpu_dma_buf_pin()` (see Mechanism).
+   - amdgpu DKMS 6.16.13 has the check (verified on three hosts).
+   - A pre-release amdgpu DKMS 7.2.0 build does not. An MI308X host running it on the
+     same 5.10.134-al8 kernel was **not** affected.
+
+So the verdict belongs to the pair (kernel config, amdgpu build), not to the kernel alone.
+Detection below checks both.
+
+**Impact: slow, or stuck. Nothing reports an error.**
+
+- **Usually slow.** Correctness still passes; the a2a path is just ~9x slower (table
+  below).
+- **It can also stop EPv2 outright.**
+  - [#917](https://github.com/ROCm/mori/issues/917) (8x MI355X, Ubuntu 5.15.0-70, DKMS
+    6.16.13): after window registration, the KFD queues of all ranks were evicted in
+    90–98% of runs, and vLLM never finished starting.
+  - 8x MI308X, 5.10.134-al8, DKMS 6.16.13: `test_asyncll.py` at 8 ranks hangs, on main
+    as well. The same test passes on a 5.10.134-al8 host whose amdgpu build keeps the
+    buffer in VRAM. The two hosts also run different firmware, so treat this as a strong
+    association, not an isolated cause.
 
 ### Symptoms
 
+- EPv2 (AsyncLL in particular) hangs or crawls in its first rounds, or a serving engine
+  never finishes starting, while EPv1 on the same box is fine.
+- The same EPv2 job behaves differently on two hosts with the same kernel. Compare their
+  amdgpu builds (Detection, step 3).
 - EPv2 dispatch/combine bandwidth is a fraction of EPv1's on the same machine.
 - Per-rank bandwidth plateaus at roughly a **single** XGMI link (~55 GB/s on MI355X),
   or below it — even though the box has 7 peers.
@@ -52,36 +89,77 @@ Measured on an 8x MI355X box (`HIDDEN=7168 TOPK=8 EPR=32`, bf16, 4096 tok/rank, 
 | EPv2 (cco / VMM) — **affected kernel** | **36 GB/s** | **54 GB/s** |
 | EPv2 (cco / VMM) — after fixing the kernel | **340 GB/s** | **390 GB/s** |
 
-### Detection (30 seconds, no GPU needed)
+### Detection
 
-```bash
-grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)
-```
+**The runtime probe (step 1) is the verdict.** Steps 2 and 3 explain the result and tell
+you which side to fix; neither decides it alone. In particular, a kernel without
+`CONFIG_DMABUF_MOVE_NOTIFY` does **not** by itself mean the machine is affected.
 
-Both must print `=y`. If either is missing (`# CONFIG_... is not set` or no output),
-the machine is affected.
-
-Also useful:
-
-```bash
-uname -r                                    # 5.15.0-*-generic (Ubuntu GA) is the usual offender
-grep -E 'CONFIG_IOMMU_DEFAULT' /boot/config-$(uname -r)
-```
-
-### Runtime confirmation
-
-`vmm_peer_probe.cpp` in this skill directory gives a direct verdict — it allocates VMM
-memory on one GPU, grants peer access from another, and checks whether the memory stayed
-in VRAM:
+**Step 1: runtime probe.** It needs two GPUs and takes a few seconds.
+`vmm_peer_probe.cpp` in this skill directory allocates VMM memory on one GPU, grants peer
+access from another, and checks whether the memory stayed in VRAM:
 
 ```bash
 hipcc -O3 --offload-arch=$(rocminfo | grep -m1 -o 'gfx[0-9a-f]*') \
       vmm_peer_probe.cpp -o vmm_peer_probe
 ./vmm_peer_probe            # defaults: owner=1 peer=0 size=8GB
+./vmm_peer_probe 7 6 2      # owner=7 peer=6 size=2GB, e.g. on GPUs other jobs leave free
 ```
 
-- `VERDICT: OK` — memory stayed in VRAM, the machine is fine.
-- `VERDICT: AFFECTED` — granting peer access evicted the buffer out of VRAM.
+- `VERDICT: OK`: the memory stayed in VRAM, so the machine is fine.
+- `VERDICT: AFFECTED`: granting peer access evicted the buffer out of VRAM. The probe's
+  message then points at the kernel config only; steps 2 and 3 show which side to change.
+
+**Step 2: kernel config.** No GPU needed.
+
+```bash
+grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)
+```
+
+- If both print `=y`, the kernel side is fine.
+- If either is missing (`# CONFIG_... is not set`, or no output), the result depends on
+  the amdgpu build (step 3).
+
+**Step 3: the amdgpu build.** No GPU needed. On ROCm machines amdgpu normally comes from
+DKMS, with its source under `/usr/src`. Print the pin function of the build that is
+installed for the running kernel:
+
+```bash
+dkms status amdgpu                  # which version is installed for $(uname -r)
+awk '/^static int amdgpu_dma_buf_pin\(/,/^}/' \
+    /usr/src/amdgpu-<version>/amd/amdgpu/amdgpu_dma_buf.c
+```
+
+- **Pick the right tree.** Use the version that `dkms status` reports as installed for the
+  running kernel. A host can carry several `/usr/src/amdgpu-*` trees, and
+  `modinfo -F version amdgpu` may print the version in another format (`7.2.0.0` for an
+  `amdgpu-7.2.0-...` tree).
+- **Read the whole function**, not a single grep hit. DKMS sources can hold `#if` variants
+  of it for different kernels.
+- **No `/usr/src/amdgpu-*` at all** (the in-kernel amdgpu): rely on step 1.
+
+What to look for in `amdgpu_dma_buf_pin()`:
+
+| what the function does | seen in | kernel without the option | kernel with it |
+|---|---|---|---|
+| strips VRAM under `if (!IS_ENABLED(CONFIG_DMABUF_MOVE_NOTIFY))`, otherwise per attachment | DKMS 6.16.13 | **affected** | fine |
+| strips VRAM only for attachments without `peer2peer`; no `IS_ENABLED` branch | pre-release DKMS 7.2.0 | fine | fine |
+| anything else (e.g. pins straight to `AMDGPU_GEM_DOMAIN_GTT`) | — | rely on step 1 | rely on step 1 |
+
+Hosts seen so far:
+
+| host | kernel | amdgpu | probe |
+|---|---|---|---|
+| 8x MI308X (two hosts) | 5.10.134-al8, both options unset | DKMS 6.16.13 (has the check) | AFFECTED |
+| 8x MI308X | 5.10.134-al8, both options unset | pre-release DKMS 7.2.0 (no check) | OK |
+| 8x MI300X | Ubuntu 5.15.0-70 rebuilt with both options `=y` | DKMS 6.16.13 (has the check) | OK |
+
+Also useful:
+
+```bash
+uname -r                                    # 5.15.0-*-generic (Ubuntu GA) and 5.10.134-*.al8 are known offenders
+grep -E 'CONFIG_IOMMU_DEFAULT' /boot/config-$(uname -r)
+```
 
 ### Mechanism (what actually happens)
 
@@ -107,6 +185,11 @@ hipcc -O3 --offload-arch=$(rocminfo | grep -m1 -o 'gfx[0-9a-f]*') \
    `IS_ENABLED()` is a **compile-time** constant taken from the kernel's own
    `autoconf.h`. Without move-notify support the kernel cannot ask an importer to drop
    its mapping when a buffer must move, so amdgpu conservatively refuses to pin in VRAM.
+
+   This is the code in the amdgpu builds that are affected. A build without the
+   `IS_ENABLED` branch keeps only the per-attachment loop. A peer GPU's attachment has
+   `peer2peer` set, so the buffer stays in VRAM even on a kernel without the option. That
+   is why the kernel config alone cannot decide (Detection, step 3).
 
 3. The buffer is therefore **pinned into host system memory**. Note this is stronger than
    "peer access falls back to PCIe": the data is not in peer VRAM at all. Every subsequent
@@ -162,7 +245,8 @@ long-lived.
 enabled alongside it because upstream `HSA_AMD_P2P` depends on both and it costs nothing.
 
 **Third option — one-line amdgpu DKMS patch, no kernel change.** Force the branch that
-keeps VRAM (its per-attachment `peer2peer` check is already satisfied):
+keeps VRAM (its per-attachment `peer2peer` check is already satisfied). This gives the
+same behaviour as the amdgpu builds that have no check at all (Detection, step 3):
 
 ```bash
 S=/usr/src/amdgpu-<version>/amd/amdgpu/amdgpu_dma_buf.c
@@ -181,11 +265,13 @@ Roll back with `sudo cp $S.orig $S` and rebuild.
 ### Verification after the fix
 
 ```bash
-grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)   # both =y
 ./vmm_peer_probe                                                             # VERDICT: OK
+grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)   # both =y,
+# or the installed amdgpu_dma_buf_pin() no longer has the IS_ENABLED branch (Detection, step 3)
 ```
 
-Then re-run the EPv2 kernel bench; per-rank bandwidth should be in the same range as EPv1.
+Then re-run the EPv2 kernel bench: per-rank bandwidth should be in the same range as EPv1,
+and EPv2 tests that hung before should complete.
 
 ---
 
@@ -324,3 +410,172 @@ the uncached flag into `deviceVmemAlloc` (it is hard-coded to `0`), and in
 `gpu_ext_fine_grained_segment_` when the uncached flag is set and that pool exists, else
 fall back to `gpuvm_segment_` (unchanged for every non-uncached allocation). Both Issue 2
 and Issue 3 ship in a single rebuilt `libamdhip64.so`.
+
+---
+
+## Issue 4 — amdgpu miscounts RDMA-registered VRAM: OOM while VRAM is free
+
+**Affects:** anything that registers HIP VRAM with a NIC (MoRI-IO, UMBP, shmem / cco
+proxy heaps, Mooncake) on every public amdgpu-dkms release (checked through 31.60, 7.1.9)
+and on in-tree amdgpu without the upstream fix. Only the KFD free-VRAM count is wrong;
+physical usage (`mem_info_vram_used`) is right. ROCm/mori#721.
+
+**Symptoms**, after the first MoRI-IO transfer (it registers lazily) or after a KV cache is
+registered:
+
+- Later allocations, kernel loads or new streams fail although VRAM is free:
+  `hipErrorOutOfMemory`, `HSA_STATUS_ERROR_OUT_OF_RESOURCES`, Triton
+  `HIP error 209: no kernel image is available`, or a segfault in
+  `c10::hip::HIPStream::stream()` at the first new stream (ROCm 7.2).
+- `hipMemGetInfo` drops by the registered size, or stays normal while allocations fail
+  (31.10 – 31.60 with peer memory), or reports more free VRAM than the card has (several
+  peer-memory MRs on one buffer).
+- Once a GPU is past the limit, a process started afterwards may fail to initialize any
+  GPU on the host, not only that one: `rocminfo` lists no GPU agents and
+  `hipGetDeviceCount` returns `hipErrorNoDevice` (seen with 31.40 on MI355X VFs).
+
+**Root cause:** KFD counts a `hipMalloc` buffer once as used (`kfd.vram_used`) and again
+as pinned (`vram_pin_size`) once a NIC pins it. A credit, `kfd.vram_pinned`, is meant to
+cancel the second count, but only the amdgpu peer-memory client (`ibv_reg_mr`, DKMS only)
+adds it, once per MR; dma-buf pins (`ibv_reg_dmabuf_mr`) never do. On 31.10 – 31.60 the
+allocation limit, `amdgpu_amdkfd_reserve_mem_limit()`, does not read the credit at all.
+
+With S the size of the registered allocation (the whole `hipMalloc` buffer) and N the
+number of peer-memory MRs on it:
+
+| amdgpu | `hipMemGetInfo` | Allocation limit | Result |
+|---|---|---|---|
+| amdgpu-dkms 30.10 – 30.30.4 (6.14.14, 6.16.6, 6.16.13) | dma-buf −S; peer memory +(N−1)·S | Same as `hipMemGetInfo` | dma-buf: OOM. Peer memory: fine; N > 1 over-reports, harmless unless something sizes allocations from it |
+| amdgpu-dkms 31.10 – 31.60 (6.18.4 – 7.1.9, incl. 6.19.14.31400000 / .31400100) | dma-buf −S; peer memory +(N−1)·S | −S for either path | OOM for either path; with peer memory `hipMemGetInfo` looks normal |
+| In-tree amdgpu without the fix: mainline 6.9 – 7.3, and stable / longterm kernels without the backport | −S (dma-buf only; in-tree amdgpu has no peer-memory client) | −S | OOM |
+| amdgpu-dkms 31.40.1.1 (6.19.14.31400101, AMD internal) or rebuilt with 2/2; Linux 7.4-rc1+, 7.3.4+, 6.18.63+, 6.12.118+ | Exact | Exact | Fine |
+
+**30.x vs 31.10 – 31.60:** `hipMemGetInfo` is computed the same way on both; the
+allocation limit is what changed.
+
+- **30.x:** the limit uses the same count as `hipMemGetInfo`, credit included. Only
+  dma-buf registration breaks allocations, and `hipMemGetInfo` shows it. Registering
+  through peer memory, or adding an anchor MR, avoids it.
+- **31.10 – 31.60:** the limit no longer credits pins, so any registration breaks
+  allocations, through peer memory as well. With peer memory, `hipMemGetInfo` still looks
+  normal and hides the problem. Nothing on the registration side helps.
+
+Measured:
+
+- **6.16.6:** registering 32 GiB through dma-buf lowers `hipMemGetInfo` by 32 GiB, and a
+  later 239 GiB allocation fails.
+- **6.19.14.31400000** (MI355X VF, 308.9 GB of VRAM): allocations fail once used plus
+  registered VRAM exceeds 308.9 GB. 161 GB used + 150 GB registered fails; 146 + 135 GB
+  works.
+- **6.19.14.31400100:** registering 40 GiB lowers the largest accepted allocation by
+  80 GiB, through dma-buf and through peer memory alike (kvcache-ai/Mooncake#5583).
+
+The other rows come from the driver sources.
+
+Related, but not a driver-version issue: if a process is killed while its MRs pin a
+buffer and the kernel logs `WARNING ... ttm_bo_release`, the BO was freed still pinned
+and the counts stay wrong on that GPU until reboot (seen once on 6.16.13, ROCm/mori#721).
+
+**Which path MoRI takes:** `RegisterRdmaMemoryRegionAuto` tries `ibv_reg_mr` (peer memory)
+first and falls back to dma-buf; `MORI_ENABLE_DMABUF_REG=1` puts dma-buf first.
+
+Peer memory needs two things:
+
+- amdgpu-dkms, whose PeerDirect client registers itself with the kernel;
+- a kernel that exports the peer-memory API, either through the NIC package's
+  `ib_peer_mem` module or through MLNX OFED's `ib_uverbs` / `ib_core`.
+
+With MLNX OFED 24.10 there is no `ib_peer_mem` module and no `/sys/kernel/mm/memory_peers`,
+yet peer memory works. Check `grep ib_register_peer_memory_client /proc/kallsyms` instead of
+`lsmod`.
+
+VMM memory (`hipMemCreate`, e.g. vLLM sleep mode or PyTorch `expandable_segments`) cannot
+be registered through peer memory (`ibv_reg_mr` fails with ENOMEM), so it always ends up
+on dma-buf. With `MORI_APP_LOG_LEVEL=warn` a fallback shows as
+`RegisterRdmaMemoryRegionAuto ibv_reg_mr registration failed`.
+
+**Detection:** `cat /sys/module/amdgpu/version`, compared in full: 31.40.1 and the internal
+31.40.1.1 are both 6.19.14, and only `.31400101` is fixed. A DKMS rebuilt with 2/2 keeps
+its original version string. Without that file the driver is in-tree; check `uname -r`.
+Then compare `hipMemGetInfo` with `/sys/class/drm/card*/device/mem_info_vram_used` before
+and after registration.
+
+**Fix:** two upstream commits. amdgpu-dkms has carried 1/2 since at least 6.14, so a DKMS
+build needs only 2/2.
+
+- 1/2 [amdkfd: Fix memory availability double accounting of kfd pinned objects](https://github.com/torvalds/linux/commit/16df12d7158fb55f20d6e985abd1996cbabab9f8)
+  adds the `kfd.vram_pinned` credit, to `hipMemGetInfo` only.
+- 2/2 [drm/amdkfd: correct vram_available calculation](https://github.com/torvalds/linux/commit/9131cc85d0dedd8ba4cae60dbe5985d081551f30)
+  makes the allocation limit use the same count, and credits each KFD BO once at its
+  first pin, dma-buf included.
+
+They were posted to amd-gfx as v6
+[1/2](https://lists.freedesktop.org/archives/amd-gfx/2026-September/153709.html) and
+[2/2](https://lists.freedesktop.org/archives/amd-gfx/2026-September/153710.html); the
+archived mails are whitespace-damaged, so take the commits.
+
+- **amdgpu-dkms:** no public release has 2/2 (checked through 31.60). It is in the internal
+  31.40.1.1 build (6.19.14.31400101), which is public 31.40.1 plus 2/2:
+  https://osibuilds.amd.com/dashboard/#/job/2410696 (AMD network only). Only the kernel
+  driver changes; ROCm user space can stay, since 31.40.x supports ROCm 7.0 – 7.2, 7.14,
+  10.0 and 10.1.
+- **Without access to that build:** rebuild amdgpu-dkms with 2/2 as a
+  [patch from kernel.org](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/patch/?id=9131cc85d0dedd8ba4cae60dbe5985d081551f30).
+  In the 31.40.1 and 31.60 DKMS sources it applies with `patch -p4 -l`: DKMS keeps `amd/`
+  at the top and indents part of 1/2 with spaces. On 31.40.1 the result matches 31.40.1.1.
+  On 30.x the `amdgpu_amdkfd_reserve_mem_limit()` hunk fails and has to be ported by hand,
+  since 30.x already credits pins there. A self-built module is not supported by AMD.
+- **In-tree:** mainline 7.4-rc1, stable 7.3.4, longterm 6.18.63 and 6.12.118 onwards. Not
+  yet in 7.2.y or 6.6.y, which are still affected (as of 2026-11-18).
+
+**Workarounds** without a fixed driver:
+
+| Workaround | 30.x | 31.10 – 31.60 and in-tree | Notes |
+|---|---|---|---|
+| Register through peer memory, mori's default: leave `MORI_ENABLE_DMABUF_REG` unset and keep the KV cache in `hipMalloc` memory | Works | No help | Needs peer memory (see above); impossible for VMM memory |
+| Run amdgpu-dkms 30.x (downgrade from 31.10 – 31.60, or instead of in-tree amdgpu) and register through peer memory | — | Works | Same conditions as the row above |
+| A page-sized peer-memory "anchor" MR per allocation: Mooncake `MC_HIP_KFD_PIN_FIX` (kvcache-ai/Mooncake#4657, merged), mori `MORI_KFD_PIN_FIX=1` (ROCm/mori#869, not merged) | Fixes the dma-buf path; #869 also stops the over-report | Fixes only what `hipMemGetInfo` reports; allocations still fail | Needs peer memory and non-VMM memory |
+| Leave headroom: non-KV usage + 2 × registered size ≤ VRAM | Works | Works | Costs about half of the KV capacity |
+| Allocate the KV cache outside KFD, as an amdgpu GEM BO imported into HIP: Mooncake `HipGemAllocator` (kvcache-ai/Mooncake#5584, open) | Works | Works | Register only through the BO's dma-buf (warning below). MoRI does not support it |
+
+**Warning:** never register memory that KFD did not allocate (e.g. a GEM BO imported with
+`hipImportExternalMemory`) through `ibv_reg_mr` on a host with the amdgpu peer-memory
+client. Its `amd_acquire()` (`kfd_peerdirect.c`, untouched by the fix) dereferences the BO's
+`kfd_bo`, which is NULL for such BOs, and the kernel oopses. MoRI-IO registers through
+`ibv_reg_mr` first, and its dma-buf export cannot export these buffers, so do not hand them
+to MoRI. A probe that registered a GEM BO through dma-buf and then through `ibv_reg_mr` on
+6.16.6 + ionic crashed its node.
+
+---
+
+## Issue 5 — AINIC firmware: retransmitted RDMA READs lose data or fail the QP
+
+**Affects:** MORI-IO RDMA READ transfers, and so UMBP remote reads, on AMD Pollara (AINIC)
+1.117.5 firmware after a-45. Seen on 1.117.5-a-77 (bare metal) and 1.117.5-a-196 (KVM
+guest, SR-IOV VF); not seen on 1.117.5-a-45. Until a build with the fix is known, treat
+every later 1.117.5 build as affected. A firmware bug: a libibverbs-only test reproduces
+it without MORI.
+
+**Symptoms** (only while READs are being retransmitted, i.e. the reader is backpressured):
+
+- A transfer fails with `Work Request Flushed Error`, the log has `CQ poll round summary:
+  N flush errors` and no `[ROOT CAUSE]` line before it, and no async event arrives. The
+  firmware disabled the QP itself: `sudo nicctl show rdma queue-pair --state error
+  --detail -j` shows requester_rx `error_disabled_reason_bitmap` 512 (a-77).
+- Byte mismatches with no error at all: whole 4 KiB packets of a READ never written
+  (a-77), or the tail of a READ written up to ~2 s after it completed, occasionally after
+  the buffer was reused for the next transfer (a-196).
+
+**Detection:**
+
+```bash
+for d in /sys/class/infiniband/*; do echo "${d##*/} $(cat $d/fw_ver)"; done   # AINIC: 1.117.5-a-N, N > 45
+grep . /sys/class/infiniband/*/ports/1/hw_counters/{tx_rdma_ack_timeout,req_rx_cqe_err} 2>/dev/null
+```
+
+Both counters grow while it can happen; without READ timeouts it does not. MORI-IO also
+logs `Known issue: RDMA READ over AINIC firmware ...` once per process at the first READ
+over such firmware.
+
+**Workaround:** `MORI_IO_QP_MAX_RD_ATOMIC=1` (one READ in flight per QP). Effect and cost:
+[Known Issues in the MORI-IO guide](../../../docs/MORI-IO-GUIDE.md#known-issues).

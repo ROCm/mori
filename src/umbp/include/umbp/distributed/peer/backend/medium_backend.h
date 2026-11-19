@@ -22,6 +22,8 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -205,7 +207,27 @@ struct ResolvedEntry {
   // `size` stays the object's.  In-process only; not carried on the wire.
   uint64_t covered_offset = 0;
   uint64_t covered_size = 0;
+
+  // Names this copy of the bytes: a medium gives every copy a fresh value, so
+  // once these bytes are freed no later copy, of this key or another, carries
+  // it again.  A remote reader's only protection is a read lease, a timer that
+  // can lapse mid-read, so it hands this back through BatchStillHolds after its
+  // read to learn whether what it read was still this copy.  0: the medium does
+  // not stamp copies.
+  uint64_t generation = 0;
 };
+
+// The next copy generation.  One counter for the whole process, so two media,
+// or a medium rebuilt under the same backend id, never reuse a value; seeded
+// from the wall clock so a restarted peer does not reissue its old ones.
+inline uint64_t NextCopyGeneration() {
+  static std::atomic<uint64_t> next{
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count()) |
+      1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
 
 inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
   return entry.found ? ResolveOutcome::kFound : entry.outcome;
@@ -319,6 +341,13 @@ class MediumBackend : public MetricSource {
   // keys picked by recency alone can leave every segment partly live.
   virtual bool OwnsEvictionOrder() const { return false; }
 
+  // Renew these keys' recency without reading them: a client looked them up to
+  // load next, or used them from a faster cache of its own.  Recency is the
+  // only thing that moves: no lease, no read.  Keys move in the order given, so
+  // the last is the most recent.  Returns how many are held here, a duplicate
+  // counted each time; a medium that keeps no order returns 0.
+  virtual size_t Touch(const std::vector<std::string>& /*keys*/) { return 0; }
+
   // ---- observability ----
   //
   // A backend does NOT report its own operation counts, byte volumes or
@@ -403,6 +432,27 @@ class MediumBackend : public MetricSource {
     std::vector<bool> out(keys.size(), false);
     for (size_t i = 0; i < keys.size(); ++i) out[i] = Contains(keys[i]);
     return out;
+  }
+
+  // For each i: true while keys[i] is still the copy a resolve stamped with
+  // generations[i], i.e. its bytes have not been freed since.  A generation of
+  // 0 cannot be checked and answers true.  The default suits a medium that
+  // stamps nothing; a medium that stamps generations must override it.
+  virtual std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                            const std::vector<uint64_t>& generations) const {
+    (void)generations;
+    return std::vector<bool>(keys.size(), true);
+  }
+
+  // BatchStillHolds from a remote reader that is now done with these copies:
+  // the same answers, and the medium may stop holding for that reader what a
+  // read lease would otherwise keep until its timer runs out.  Called once per
+  // resolve answer the reader was given, whether or not its read landed.  A
+  // reader that never calls leaves the lease to the timer.  The default suits
+  // a medium with nothing to give back early.
+  virtual std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                             const std::vector<uint64_t>& generations) {
+    return BatchStillHolds(keys, generations);
   }
 
   // The medium's only eviction path, reached via PeerPool::Evict: frees keys a

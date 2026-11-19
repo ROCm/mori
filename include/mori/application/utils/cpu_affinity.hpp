@@ -30,10 +30,10 @@
 #include <fstream>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <string>
 #include <vector>
 
+#include "mori/utils/cpu_list.hpp"
 #include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 
@@ -41,28 +41,6 @@ namespace mori {
 namespace application {
 
 namespace detail {
-
-// Parse a Linux cpulist string like "0-3,8,12-15" into individual CPU ids.
-inline std::vector<int> ParseCpuList(const std::string& s) {
-  std::vector<int> cpus;
-  std::stringstream ss(s);
-  std::string tok;
-  while (std::getline(ss, tok, ',')) {
-    if (tok.empty()) continue;
-    size_t dash = tok.find('-');
-    try {
-      if (dash == std::string::npos) {
-        cpus.push_back(std::stoi(tok));
-      } else {
-        int lo = std::stoi(tok.substr(0, dash));
-        int hi = std::stoi(tok.substr(dash + 1));
-        for (int c = lo; c <= hi; ++c) cpus.push_back(c);
-      }
-    } catch (...) {
-    }
-  }
-  return cpus;
-}
 
 // CPUs local to a GPU, from its PCI BDF's sysfs local_cpulist -- the same source
 // NCCL uses. numaNode is filled (for logging) when available.
@@ -110,7 +88,7 @@ inline std::vector<std::vector<int>> GroupBySiblings(const std::vector<int>& cpu
                     "/topology/thread_siblings_list");
     std::string line;
     if (f && std::getline(f, line)) {
-      for (int s : ParseCpuList(line))
+      for (int s : ::mori::ParseCpuList(line).value_or(std::vector<int>{}))
         if (pool.erase(s)) core.push_back(s);
     }
     if (core.empty()) {  // unreadable topology: treat the cpu as its own core
@@ -148,7 +126,7 @@ inline void BindCallingThreadToGpuNumaOnce() {
     MORI_APP_WARN("CPU affinity: cannot read GPU {} local_cpulist; skipping", deviceId);
     return;
   }
-  std::vector<int> localCpus = detail::ParseCpuList(cpulist.value());
+  std::vector<int> localCpus = ::mori::ParseCpuList(cpulist.value()).value_or(std::vector<int>{});
 
   cpu_set_t allowed;
   CPU_ZERO(&allowed);

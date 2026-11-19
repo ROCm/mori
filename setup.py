@@ -418,6 +418,9 @@ def _write_cco_build_flags(root_dir: Path, *, sdma: bool) -> None:
 
 
 _ROCM_VERSION_RE = re.compile(r"\b(\d+)\.(\d+)(?:\.\d+)?\b")
+_ROCM_VERSION_HEADER_RE = re.compile(
+    r"^\s*#\s*define\s+ROCM_VERSION_(MAJOR|MINOR|PATCH)\s+(\d+)", re.MULTILINE
+)
 
 
 def _detect_rocm_build_version() -> tuple[str | None, str | None]:
@@ -428,9 +431,28 @@ def _detect_rocm_build_version() -> tuple[str | None, str | None]:
     ).resolve()
     candidates: list[str] = []
 
+    # The ROCm release version, which is what rocm_sdk.__version__ reports.
+    # hipconfig reports HIP's own version, and that stopped tracking the release
+    # in ROCm 10.0 (it ships HIP 7.15), so it is only a last resort.
+    try:
+        header = (rocm_path / "include" / "rocm-core" / "rocm_version.h").read_text(
+            encoding="utf-8"
+        )
+    except OSError:
+        pass
+    else:
+        fields = dict(_ROCM_VERSION_HEADER_RE.findall(header))
+        if "MAJOR" in fields and "MINOR" in fields:
+            candidates.append(
+                ".".join(fields[k] for k in ("MAJOR", "MINOR", "PATCH") if k in fields)
+            )
+
+    # .info/ sits at the root of the classic layout and under core/ in the
+    # multi-arch (7.14+) one.
     for version_file in (
         rocm_path / ".info" / "version",
         rocm_path / ".info" / "version-dev",
+        rocm_path / "core" / ".info" / "version",
     ):
         try:
             candidates.append(version_file.read_text(encoding="utf-8"))
@@ -693,6 +715,9 @@ class CMakeBuild(build_ext):
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
         build_benchmark = os.environ.get("BUILD_BENCHMARK", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
+        build_ras = "ON" if _env_flag("BUILD_RAS", "OFF") else "OFF"
+        build_netmon = "ON" if _env_flag("BUILD_NETMON", "ON") else "OFF"
+        build_xgmi_netmon = "ON" if _env_flag("BUILD_XGMI_NETMON", "ON") else "OFF"
         build_umbp = "ON" if build_umbp_enabled else "OFF"
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
@@ -752,6 +777,9 @@ class CMakeBuild(build_ext):
             f"-DBUILD_EXAMPLES={build_examples}",
             f"-DBUILD_BENCHMARK={build_benchmark}",
             f"-DBUILD_TESTS={build_tests}",
+            f"-DBUILD_RAS={build_ras}",
+            f"-DBUILD_NETMON={build_netmon}",
+            f"-DBUILD_XGMI_NETMON={build_xgmi_netmon}",
             f"-DBUILD_UMBP={build_umbp}",
             f"-DUSE_REDIS_BACKEND={use_redis_backend}",
             f"-DUSE_SPDK={build_umbp_spdk}",
@@ -841,6 +869,10 @@ class CMakeBuild(build_ext):
             files_to_copy.append(
                 (collective_so, root_dir / "python/mori/libmori_collective.so")
             )
+        # libmori_io.so needs it beside it unless BUILD_RAS=OFF built RAS out.
+        ras_so = build_dir / "src/ras/libmori_ras.so"
+        if build_ras == "ON":
+            files_to_copy.append((ras_so, root_dir / "python/mori/libmori_ras.so"))
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
@@ -868,6 +900,48 @@ class CMakeBuild(build_ext):
             os.chmod(spdk_proxy_dst, 0o700)
         elif spdk_proxy_dst.exists():
             spdk_proxy_dst.unlink()
+
+        # ainic-netmon (tools/netmon): shipped as mori/bin/ainic-netmon, run through the
+        # `ainic-netmon` / `mori netmon` entry points. Removed again when BUILD_NETMON=OFF.
+        netmon_src = build_dir / "tools/netmon/ainic-netmon"
+        netmon_dst = root_dir / "python/mori/bin/ainic-netmon"
+        if build_netmon == "ON":
+            if not netmon_src.exists():
+                raise RuntimeError(
+                    f"BUILD_NETMON=ON but {netmon_src} was not built; refusing to "
+                    "produce a wheel without ainic-netmon (set BUILD_NETMON=OFF to "
+                    "leave it out)"
+                )
+            netmon_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(netmon_src, netmon_dst)
+            os.chmod(netmon_dst, 0o755)
+        else:
+            # Also drop a copy staged by an earlier BUILD_NETMON=ON build in build_lib:
+            # setuptools reuses that directory and would ship the stale binary.
+            for stale in (netmon_dst, build_lib / "mori/bin/ainic-netmon"):
+                if stale.exists():
+                    stale.unlink()
+
+        # xgmi-netmon (tools/xgmi_netmon): shipped as mori/bin/xgmi-netmon, run through the
+        # `xgmi-netmon` / `mori xgmi-netmon` entry points. Removed again when
+        # BUILD_XGMI_NETMON=OFF.
+        xgmi_src = build_dir / "tools/xgmi_netmon/xgmi-netmon"
+        xgmi_dst = root_dir / "python/mori/bin/xgmi-netmon"
+        if build_xgmi_netmon == "ON":
+            if not xgmi_src.exists():
+                raise RuntimeError(
+                    f"BUILD_XGMI_NETMON=ON but {xgmi_src} was not built; refusing to "
+                    "produce a wheel without xgmi-netmon (set BUILD_XGMI_NETMON=OFF to "
+                    "leave it out)"
+                )
+            xgmi_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(xgmi_src, xgmi_dst)
+            os.chmod(xgmi_dst, 0o755)
+        else:
+            # Also drop a copy staged by an earlier BUILD_XGMI_NETMON=ON build in build_lib.
+            for stale in (xgmi_dst, build_lib / "mori/bin/xgmi-netmon"):
+                if stale.exists():
+                    stale.unlink()
 
         umbp_master_src = build_dir / "src/umbp/umbp_master"
         umbp_master_dst = root_dir / "python/mori/umbp_master"
@@ -1003,9 +1077,40 @@ def _sync_bundled_scripts() -> None:
 _sync_bundled_scripts()
 
 
+_NETMON_MODULES = {
+    "ainic_netmon_report.py": "_netmon_report.py",
+    "ainic_netmon_import.py": "_netmon_import.py",
+    "ainic_netmon_verify.py": "_netmon_verify.py",
+    "ainic_netmon_dashboards.py": "_netmon_dashboards.py",
+}
+
+
+def _sync_netmon_report() -> None:
+    """Ship the ainic-netmon report, importer and verifier as ``mori._netmon_*``.
+
+    The single source of truth is ``tools/netmon/report/`` (the scripts must also work on
+    their own, outside mori); the package gets synced copies.
+    """
+    here = Path(__file__).resolve().parent
+    for src_name, dst_name in _NETMON_MODULES.items():
+        src = here / "tools" / "netmon" / "report" / src_name
+        dst = here / "python" / "mori" / dst_name
+        if not src.is_file():
+            continue
+        try:
+            if not dst.is_file() or dst.read_bytes() != src.read_bytes():
+                shutil.copy2(src, dst)
+        except OSError as exc:
+            print(f"[mori] WARN: failed to bundle {src_name}: {exc}")
+
+
+_sync_netmon_report()
+
+
 class CustomBuild(_build):
     def run(self) -> None:
         _sync_bundled_scripts()
+        _sync_netmon_report()
         self.run_command("build_ext")
         super().run()
 
@@ -1099,6 +1204,7 @@ mori_package_data = [
     "libmori_application.so",
     "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
+    "libmori_ras.so",  # optional: absent when BUILD_RAS=OFF
     "libmori_jit.so",  # JIT v2 C ABI + plan registry
     "libmori_ops_v2.so",  # v2 EP kernels' host side; registers into libmori_jit
     "libmori_umbp_pybinds.so",  # optional: only present when BUILD_UMBP=ON
@@ -1106,6 +1212,8 @@ mori_package_data = [
     "libmori_kiwi_ep_pybinds.so",  # optional: only present when BUILD_OPS_KIWI=ON
     "umbp_master",
     "umbp_standalone_server",
+    "bin/ainic-netmon",  # optional: absent when BUILD_NETMON=OFF
+    "bin/xgmi-netmon",  # optional: absent when BUILD_XGMI_NETMON=OFF
     "_jit-sources/include/**/*.hpp",
     "_jit-sources/include/**/*.h",
     "_jit-sources/include/**/*.cuh",
@@ -1117,6 +1225,7 @@ mori_package_data = [
     "_jit-sources/3rdparty/**/*.hpp",
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
+    "ops/dispatch_combine_v2/tuning_configs/*.csv",
     "io/sim_catalog.yaml",  # MORI_IO_SIM_CATALOG timing for measured hardware
     "tools/*.sh",
     "tools/mori.conf",

@@ -28,6 +28,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "mori/io/backend.hpp"
 #include "mori/io/common.hpp"
@@ -147,6 +148,8 @@ class XgmiBackend : public Backend {
   std::vector<std::vector<bool>> p2pMatrix;
   std::unordered_map<std::string, int> localDeviceByBusId;
   std::unordered_map<std::string, uint64_t> gpuTopoByBusId;  // normalized bus ID -> XGMI hive ID
+  // normalized bus ID -> bus IDs of GPUs KFD allows P2P DMA to
+  std::unordered_map<std::string, std::unordered_set<std::string>> gpuPeersByBusId;
 
   struct IpcHandleEntry {
     hipIpcMemHandle_t handle;

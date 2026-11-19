@@ -105,27 +105,12 @@ std::string EnvOr(const char* name, const std::string& fallback) {
   return (v && *v) ? std::string(v) : fallback;
 }
 
-// Programmatic arch override. Read once, under the lock, before the environment.
-std::mutex& ArchOverrideMutex() {
-  static std::mutex m;
-  return m;
-}
-std::string& ArchOverrideStorage() {
-  static std::string s;
-  return s;
-}
+// The live ScopedArch's arch on this thread; "" when none is.
+thread_local std::string t_scopedArch;
 
 std::string DetectArch() {
-  {
-    std::lock_guard<std::mutex> lock(ArchOverrideMutex());
-    if (!ArchOverrideStorage().empty()) return ArchOverrideStorage();
-  }
   if (const char* v = std::getenv("MORI_JIT_ARCH"); v && *v) return v;
-  hipDeviceProp_t props{};
-  if (hipGetDeviceProperties(&props, 0) != hipSuccess) return "";
-  std::string a(props.gcnArchName);
-  auto colon = a.find(':');  // strip ":xnack-" etc; features do not change codegen here
-  return colon == std::string::npos ? a : a.substr(0, colon);
+  return DeviceArch(0);
 }
 
 std::string SelfLibDir() {
@@ -221,9 +206,33 @@ void SetToolchainForTesting(const Toolchain& tc) {
   g_override = &storage;
 }
 
-void SetArchOverride(const std::string& arch) {
-  std::lock_guard<std::mutex> lock(ArchOverrideMutex());
-  ArchOverrideStorage() = arch;
+std::string DeviceArch(int dev) {
+  hipDeviceProp_t props{};
+  if (hipGetDeviceProperties(&props, dev) != hipSuccess) return "";
+  std::string a(props.gcnArchName);
+  return a.substr(0, a.find(':'));  // features do not change codegen here
+}
+
+ScopedArch::ScopedArch(const char* arch) : saved_(t_scopedArch) {
+  if (arch && *arch) t_scopedArch = arch;
+}
+
+ScopedArch::~ScopedArch() { t_scopedArch = std::move(saved_); }
+
+const std::string& ActiveArch() {
+  return t_scopedArch.empty() ? GetToolchain().arch : t_scopedArch;
+}
+
+std::string ActiveArchSource() {
+  if (!t_scopedArch.empty()) return "arch=";
+  if (const char* v = std::getenv("MORI_JIT_ARCH"); v && *v) return "MORI_JIT_ARCH";
+  return "device 0";
+}
+
+Toolchain ActiveToolchain() {
+  Toolchain tc = GetToolchain();
+  tc.arch = ActiveArch();
+  return tc;
 }
 
 const Toolchain& GetToolchain() {

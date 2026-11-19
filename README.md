@@ -1,4 +1,23 @@
-<h1 align="center">MORI</h1>
+<p align="center">
+  <picture>
+    <source type="image/svg+xml" srcset="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo.svg">
+    <img alt="MORI" src="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/mori-logo.png" width="420">
+  </picture>
+</p>
+
+<p align="center">
+  <a href="https://rocm.github.io/mori/"><img alt="Documentation" src="https://img.shields.io/badge/docs-rocm.github.io%2Fmori-C00000"></a>
+  <a href="https://pypi.org/project/amd-mori/"><img alt="PyPI" src="https://img.shields.io/pypi/v/amd-mori?label=pypi"></a>
+  <a href="https://pypi.org/project/amd-mori-nightly/"><img alt="PyPI nightly" src="https://img.shields.io/pypi/v/amd-mori-nightly?label=nightly"></a>
+  <a href="https://github.com/ROCm/mori/actions/workflows/ci.yml?query=branch%3Amain+event%3Aschedule"><img alt="main CI" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FROCm%2Fmori%2Fbadges%2Fmain-ci.json"></a>
+</p>
+
+<p align="center">
+  <a href="https://rocm.github.io/mori/"><b>Documentation</b></a> |
+  <a href="https://rocm.github.io/mori/installation.html"><b>Installation</b></a> |
+  <a href="https://rocm.github.io/mori/quickstart.html"><b>Quickstart</b></a> |
+  <a href="https://rocm.github.io/mori/api/communication.html"><b>API reference</b></a>
+</p>
 
 ## News
 
@@ -17,18 +36,22 @@
 
 ## Introduction
 
-<img src="docs/mori_arch_20260422_v1.jpg">
+<img alt="MORI architecture" src="https://raw.githubusercontent.com/ROCm/mori/main/docs/mori_arch_20260422_v1.jpg">
 
 **MORI** (**Mo**dular **R**DMA **I**nterface) is a **bottom-up, modular, and composable framework** for building high-performance communication applications with a strong focus on **RDMA + GPU integration**. Inspired by the role of MLIR in compiler infrastructure, MORI provides reusable and extensible building blocks that make it **easier for developers to adopt advanced techniques** such as IBGDA (Infiniband GPUDirect Async) and GDS (GPUDirect Storage).
 
-To help developers get started quickly, MORI also includes a suite of optimized libraries—**MORI-EP** (MoE dispatch & combine kernels), **MORI-IO** (p2p communication for KVCache transfer), and **MORI-CCL** (collective communication)—that deliver out-of-the-box performance, with support for AMD `Pensando DSC`, Broadcom `Thor2`, and NVIDIA Mellanox `ConnectX-7` NICs.
+To help developers get started quickly, MORI also includes a suite of optimized libraries—**MORI-EP** (MoE dispatch & combine kernels, in two generations: EPv1 on MORI-SHMEM and EPv2 on MORI-CCO), **MORI-IO** (p2p communication for KVCache transfer), **MORI-CCL** (collective communication), **MORI-CCO** (Next-Generation Collective Communication Object for GPUs) and **MORI-FUSED** (GEMMs fused with collectives, built on MORI-CCO)—that deliver out-of-the-box performance, with support for AMD `Pensando DSC`, Broadcom `Thor2`, and NVIDIA Mellanox `ConnectX-7` NICs.
 
 ## Features summary
 - Applications
-    - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance.
+    - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance. Two generations:
+        - EPv1: built on MORI-SHMEM.
+        - EPv2: built on MORI-CCO. Designed natively for gfx1250 and rack-scale EP.
+    - MORI-FUSED: GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, overlapping the transfer with the GEMM over the SDMA copy engines
     - MORI-IO: point-to-point communication library with ultra-low overhead
     - MORI-CCL: lightweight and flexible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained environment
     - MORI-UMBP: unified memory & bandwidth pool with tiered storage and distributed key-value access for scalable memory management
+    - MORI-CCO: Next-Generation Collective Communication Object for GPUs. Natively designed for compute-communication fusion, with symmetric memory support.
 - Framework
     - High-performance building blocks for IBGDA / P2P and more​
     - Modular & composable components for developing communication applications, such as transport management, topology detection and etc.
@@ -37,13 +60,19 @@ To help developers get started quickly, MORI also includes a suite of optimized 
 
 ## Documentation
 
-| **Topic** | **Description** | **Guide** |
+📖 **<https://rocm.github.io/mori/>** — the full documentation, with navigation and search.
+It is built from [`docs/`](https://github.com/ROCm/mori/tree/main/docs) on every push to
+`main`, so it describes the development tree; each page's title names the commit.
+
+| **Topic** | **Description** | **Docs** |
 |---|---|---|
-| MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples | [EP Guide](docs/MORI-EP-GUIDE.md) |
-| MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](docs/MORI-SHMEM-GUIDE.md) |
-| MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](docs/MORI-IR-GUIDE.md) |
-| MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](docs/MORI-IO-GUIDE.md) |
-| MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](docs/PROFILER.md) |
+| Getting started | Installation, fabric checks and first steps | [Installation](https://rocm.github.io/mori/installation.html) · [Quickstart](https://rocm.github.io/mori/quickstart.html) |
+| MORI-EP (EPv1, EPv2) | EPv1 (built on SHMEM) and EPv2 (built on CCO) dispatch/combine: API, kernel types and backends, configuration, usage examples, how to choose | [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-EP-BENCHMARK.html) · [RDMA bandwidth](https://rocm.github.io/mori/rdma_bandwidth_utilization.html) |
+| MORI-FUSED | GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, built on MORI-CCO | [Guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html) |
+| MORI-CCO | Next-generation collective communication object: communicator, symmetric-memory windows, LSA / GDA / SDMA device APIs | [CCO Guide](https://rocm.github.io/mori/MORI-CCO-GUIDE.html) |
+| MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](https://rocm.github.io/mori/MORI-IO-GUIDE.html) · [Benchmark](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) |
+| MORI-UMBP | Unified memory & bandwidth pool: tiered storage, distributed KV access, transfer simulation | [Single-Node Smoke Test](https://rocm.github.io/mori/MORI-UMBP-SINGLE-NODE-GUIDE.html) · [Simulation](https://rocm.github.io/mori/umbp-simulation.html) · [Calibration](https://rocm.github.io/mori/umbp-calibration.html) · [PD Benchmark](https://rocm.github.io/mori/MORI-UMBP-PD-BENCHMARK.html) · [Tier-Management Benchmark](https://rocm.github.io/mori/UMBP-TIER-MANAGEMENT-BENCHMARK.html) |
+| MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](https://rocm.github.io/mori/PROFILER.html) |
 
 ## Benchmarks
 
@@ -131,6 +160,37 @@ Benchmark on DeepSeek V3 model configurations:
 
 \* Stale data from previous kernel version; updated numbers pending re-benchmarking.
 
+### MORI-FUSED
+
+MORI-FUSED overlaps a collective with the GEMM next to it over the SDMA copy engines. The chart
+compares GEMM + all-reduce (`GemmAllReduceOp`) with what a serving stack runs when nothing is fused:
+the GEMM, then an RCCL all-reduce. The layer is DeepSeek-V4-Pro `wo_b` (`[M, 7168]`, K=2048, fp8
+blockscale) at TP8 on 8x MI355X.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/fused-gemm-ar-vs-rccl-dark.png">
+    <img alt="Speedup of MORI's fused GEMM + all-reduce over GEMM + RCCL on DeepSeek-V4-Pro wo_b, 8x MI355X: 1.05x to 1.32x with the bf16 wire and 1.11x to 1.57x with the fp8 gather, for M from 1,024 to 16,384" src="https://raw.githubusercontent.com/ROCm/mori/main/docs/assets/fused-gemm-ar-vs-rccl.png" width="900">
+  </picture>
+</p>
+
+<details>
+<summary>Time per call (µs)</summary>
+
+| M | GEMM + RCCL | MORI fused, bf16 wire | MORI fused, fp8 gather |
+|---:|---:|---:|---:|
+| 1,024 | 135.9 | 129.9 (1.05x) | 122.4 (1.11x) |
+| 2,048 | 234.4 | 199.0 (1.18x) | 176.4 (1.33x) |
+| 4,096 | 440.1 | 333.8 (1.32x) | 280.7 (1.57x) |
+| 8,192 | 736.2 | 601.4 (1.22x) | 497.4 (1.48x) |
+| 16,384 | 1454.1 | 1128.3 (1.29x) | 934.3 (1.56x) |
+
+</details>
+
+The other fused operators (GEMM + reduce-scatter, GEMM + all-to-all, GEMM + all-gather, all-gather +
+GEMM and all-to-all + GEMM) are measured in the
+[MORI-FUSED guide](https://rocm.github.io/mori/MORI-CCO-FUSED-OPS-GUIDE.html#performance-at-a-glance).
+
 ### MORI-IO
 
 **NOTE:** This is the preview version of MORI-IO benchmark performance.
@@ -168,30 +228,24 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 
 **GPU**
 
-| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** |
-|---|:---:|:---:|:---:|
-| MI308X | ✅ | ✅ | ✅ |
-| MI300X | ✅ | ✅ | ✅ |
-| MI325X | ✅ | ✅ | ✅ |
-| MI355X | ✅ | ✅ | ✅ |
-| MI450X | 🚧 | 🚧 | 🚧 |
+| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** | **MORI-CCO** |
+|---|:---:|:---:|:---:|:---:|
+| MI308X | ✅ | ✅ | ✅ | ✅ |
+| MI300X | ✅ | ✅ | ✅ | ✅ |
+| MI325X | ✅ | ✅ | ✅ | ✅ |
+| MI355X | ✅ | ✅ | ✅ | ✅ |
+| MI450X | 🚧 | 🚧 | 🚧 | 🚧 |
 
 **NIC**
 
-| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** |
-|---|:---:|:---:|:---:|
-| Pollara | ✅ | ✅ | ✅ |
-| CX7 | ✅ | ✅ | ✅ |
-| Thor2 | ✅ | ✅ | ✅ |
-| Volcano | 🚧 | 🚧 | 🚧 |
+| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** | **MORI-CCO** |
+|---|:---:|:---:|:---:|:---:|
+| Pollara | ✅ | ✅ | ✅ | ✅ |
+| CX7 | ✅ | ✅ | ✅ | ✅ |
+| Thor2 | ✅ | ✅ | ✅ | ✅ |
+| Volcano | 🚧 | 🚧 | 🚧 | 🚧 |
 
 ✅ Supported &emsp; 🚧 Under Development
-
-A gfx1250 device can run as `gfx1250` or as `gfx1250-strict`, depending on the runtime.
-MORI JIT-compiles its kernels for whichever target the device reports, so one install
-serves both. The exception is UMBP's prebuilt gather kernel: build with
-`gfx1250-strict` in `MORI_GPU_ARCHS` to use it there (without it UMBP copies through
-the copy engine).
 
 <!-- mori-installation-start -->
 
@@ -227,7 +281,7 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 
 | Vendor | Recommendation |
 |--------|-----------------|
-| AMD Pollara (AINIC) | `>= 1.117.5-a-45` (`1.117.1` major lacks IBGDA support) |
+| AMD Pollara (AINIC) | `>= 1.117.5-a-45` (`1.117.1` major lacks IBGDA support); 1.117.5 builds after `a-45` can mishandle retransmitted RDMA READs, see [MORI-IO Known Issues](https://rocm.github.io/mori/MORI-IO-GUIDE.html#known-issues) |
 | Broadcom (Thor2) | `237.1.137.x` / `235.2.86.x`; known bad: `231.x`, `232.x` |
 | Mellanox (ConnectX, mlx5) | No known minimum; tested on `ConnectX-7` |
 
@@ -239,7 +293,7 @@ Before a cross-node run, check the fabric:
 mori check <peer_ip>          # or: tools/env_check.sh <peer_ip>
 ```
 
-Six steps — NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
+Seven steps — kernel PCI P2PDMA support (`CONFIG_PCI_P2PDMA`, read from `/proc/kallsyms`; warns only), NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
 inter-node bandwidth and latency meshes over every NIC pair, on host memory and
 on GPU memory. Exits non-zero if any check failed, and reports the fabric
 topology, which decides what can run on it.
@@ -309,6 +363,26 @@ python -c "import mori; print(mori.__version__)"
 
 ### Test MORI-EP (dispatch / combine)
 
+#### EPv2 (MORI-CCO)
+
+```bash
+cd /path/to/mori
+export PYTHONPATH=/path/to/mori:$PYTHONPATH
+python -c "import mori; print(mori.__file__)"
+
+# Test correctness (8 GPUs, gfx942 or gfx950: on gfx125x the default HIP backend
+# rejects some of the cases these run, such as scatter combine and StdMoE)
+pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -q
+torchrun --standalone --nproc_per_node=8 tests/python/ops/dispatch_combine_v2/test_ep_backend_parity.py
+
+# Benchmark performance
+torchrun --standalone --nproc_per_node=8 tests/python/ops/dispatch_combine_v2/bench_ep.py
+```
+
+Two-node runs and their restrictions: see the [EP Guide](https://rocm.github.io/mori/MORI-EP-GUIDE.html#epv2-restrictions).
+
+#### EPv1 (MORI-SHMEM)
+
 ```bash
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
@@ -334,22 +408,12 @@ pytest tests/python/io/
 
 # Benchmark performance (two nodes). The runner defaults to the native C++
 # benchmark (tests/cpp/io/bench_engine); pass --engine python for the torchrun path.
-tools/run_internode_io_benchmark.sh --rank 0 --master-addr "10.194.129.65" --ifname ens14np0 \
+tools/run_internode_io_benchmark.sh --rank 0 --master-addr "<master_ip>" --ifname ens14np0 \
   -- --op write --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
 # (run the same command on the second node with --rank 1)
 ```
 
-See [docs/MORI-IO-BENCHMARK.md](docs/MORI-IO-BENCHMARK.md) for both engines and tuning.
-
-### Test MORI-IR (Triton + shmem integration, [guide](python/mori/ir/README.md))
-
-```bash
-# Basic shmem put (2 GPUs)
-torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
-
-# Allreduce (8 GPUs)
-torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
-```
+See the [MORI-IO benchmark guide](https://rocm.github.io/mori/MORI-IO-BENCHMARK.html) for both engines and tuning.
 
 ## Contribution Guide
 
