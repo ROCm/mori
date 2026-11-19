@@ -30,9 +30,7 @@ boundary as ``uint64`` values:
 The C++ wrapper monomorphizes CCO template axes into symbol names.  For example,
 ``gda_put_iw_inc`` calls ``cco_gda_put__iw__inc`` directly, and
 ``gda_put_iw_inc_deferred`` the ``GdaDoorbell.DEFERRED`` handle's
-``cco_gda_put__iw__inc__deferred``. ccoProxy externs end in their pool:
-``proxy_put_warp_set_spsc`` calls ``cco_proxy_put__warp__set__spsc``; the
-``Proxy`` facade in :mod:`.proxy` picks them from its constexpr arguments.
+``cco_gda_put__iw__inc__deferred``.
 """
 
 import triton.language as tl
@@ -43,14 +41,12 @@ from mori.cco.device.ops import (
     CoopScope,
     GdaDoorbell,
     GdaFlags,
-    ProxyPool,
     SignalOp,
     Team,
     ThreadMode,
     SdmaOptFlags,
     SdmaFlags,
     gda_doorbell_tag,
-    proxy_op_name,
 )
 
 _LIB_NAME = "libmori_cco_device"
@@ -149,21 +145,8 @@ def _with_doorbell(name, doorbell, *args, _semantic=None):
     return _all_ops[name + tag[1:]](*args, _semantic=_semantic)
 
 
-@core.extern
-def _proxy(op, coop, signal_op, pool, *args, _semantic=None):
-    """Calls the ccoProxy extern that ``proxy_op_name`` picks (axes constexpr)."""
-    name = proxy_op_name(
-        core._unwrap_if_constexpr(op),
-        core._unwrap_if_constexpr(coop),
-        core._unwrap_if_constexpr(signal_op),
-        core._unwrap_if_constexpr(pool),
-    )
-    return _all_ops[name](*args, _semantic=_semantic)
-
-
 __all__ = list(_all_ops) + [
     "CoopScope",
-    "ProxyPool",
     "SignalOp",
     "ThreadMode",
     "Team",

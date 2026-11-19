@@ -301,14 +301,6 @@ class DevCommHandle(CCOResource):
         self._check_valid()
         return self._dev_comm.ptr
 
-    def get_error(self) -> dict | None:
-        """First ccoProxy error of this DevComm, or None while it is healthy.
-
-        See ``mori.cco.dev_comm_get_error``; safe while kernels run.
-        """
-        self._check_valid()
-        return _cco.dev_comm_get_error(self._comm._raw, self._dev_comm)
-
     @property
     def rank(self) -> int:
         self._check_valid()

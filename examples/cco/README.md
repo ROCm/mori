@@ -25,7 +25,7 @@ examples/cco/
 | `python/11_flydsl_mega_moe_sdma` | py | MegaMoE stage2 + combine (gfx950) with the transfer done by SDMA: GEMM2 writes a rank-sorted send buffer and comm waves (one per peer) inside the GEMM kernel `put` it; `mega_moe_gemm2_with_sdma.py` is the op and its kernels, `gemm2_8wave.py` an 8-wave persistent GEMM2 for it (`--gemm2 8wave`), `main.py` its test and benchmark against aiter (needs aiter) |
 | `python/11_flydsl_mega_moe_sdma/sdma_bandwidth.py` | py | what one cco SDMA channel moves, with no GEMM in the way |
 | `python/12_flydsl_sdma_allgather_engine_wait` | py | In-place all-gather over run-time regions; the recommended `post_wait_mem_put_ptr` use: read each peer's READY once, plain put if it is there, else the copy engine (not a CU) waits for it |
-| `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA/ccoProxy device APIs |
+| `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA device APIs |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (includes only `cco_scale_out.hpp`) |
 

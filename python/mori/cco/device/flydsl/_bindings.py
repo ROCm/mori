@@ -146,10 +146,3 @@ cco_devcomm_lsa_size = _binding("devcomm_lsa_size")
 
 cco_gda_read_signal = _binding("gda_read_signal")
 cco_gda_reset_signal = _binding("gda_reset_signal")
-
-# ── ccoProxy: ALL[proxy_op_name(op, coop, signal_op, pool)] ──
-PROXY = {
-    name: ALL[name]
-    for name, meta in CCO_DEVICE_FUNCTIONS.items()
-    if meta["family"].startswith("proxy_")
-}

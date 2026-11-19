@@ -19,7 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Triton bindings for the CCO LSA, SDMA, GDA, and ccoProxy device APIs.
+"""Triton bindings for the CCO LSA, SDMA, and GDA device APIs.
 
 Example::
 
@@ -36,7 +36,6 @@ Example::
 from .ops import *  # noqa: F401,F403
 from .ops import __all__ as _ops_all
 from .handles import DevComm, Window, Gda, GdaDeferred, GdaCallerOrdered, Sdma
-from .proxy import Proxy
 from .runtime import get_extern_libs, get_cco_extern_libs
 
 __all__ = _ops_all + [
@@ -46,7 +45,6 @@ __all__ = _ops_all + [
     "GdaDeferred",
     "GdaCallerOrdered",
     "Sdma",
-    "Proxy",
     "get_extern_libs",
     "get_cco_extern_libs",
 ]

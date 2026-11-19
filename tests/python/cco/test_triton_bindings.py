@@ -37,10 +37,8 @@ from mori.cco.device.ops import (
     GDA_FLUSH_DOORBELL_TAG,
     GdaDoorbell,
     GdaFlags,
-    ProxyPool,
 )
 from mori.ir.triton import cco
-from mori.ir.triton.cco.ops import proxy_op_name
 from mori.jit.config import detect_build_config
 
 
@@ -224,72 +222,6 @@ def test_triton_gda_namespace_picks_its_doorbell_symbol(mode, op):
     assert base + tags[mode] in called, called
 
 
-@triton.jit
-def proxy_symbol_kernel(dev_comm, win, op: tl.constexpr, pool: tl.constexpr):
-    if op == 0:
-        cco.Proxy.put(
-            dev_comm, 0, 1, win, 0, win, 0, 64, signal_op=cco.SignalOp.SET, pool=pool
-        )
-    elif op == 1:
-        cco.Proxy.put_value(
-            dev_comm, 0, 1, win, 0, 7, coop=cco.CoopScope.WARP, pool=pool
-        )
-    elif op == 2:
-        cco.Proxy.signal(dev_comm, 0, 1, signal_op=cco.SignalOp.ADD, pool=pool)
-    elif op == 3:
-        cco.Proxy.flush(dev_comm, 0, coop=cco.CoopScope.WARP, pool=pool)
-    elif op == 4:
-        cco.Proxy.flush_timeout(dev_comm, 0, 1000, pool=pool)
-    else:
-        cco.Proxy.wait_signal(dev_comm, 0, 0, 1, pool=pool)
-
-
-_PROXY_OPS = [
-    "cco_proxy_put__block__set__",
-    "cco_proxy_put_value__warp__none__",
-    "cco_proxy_signal__block__add__",
-    "cco_proxy_flush__warp__",
-    "cco_proxy_flush_timeout__block__",
-    "cco_proxy_wait_signal__block__",
-]
-
-
-@pytest.mark.parametrize("pool", [ProxyPool.SPSC, ProxyPool.MPSC])
-@pytest.mark.parametrize("op", range(len(_PROXY_OPS)))
-def test_triton_proxy_picks_its_symbol(pool, op):
-    # BLOCK is the default coop; the pool ends the symbol.
-    handle = (1 << 40) + 3
-    compiled = proxy_symbol_kernel.warmup(
-        handle,
-        handle,
-        op=op,
-        pool=pool,
-        grid=(1,),
-        extern_libs=cco.get_extern_libs(),
-        num_warps=1,
-    )
-    called = set(re.findall(r'symbol = "(cco_proxy_[^"]+)"', compiled.asm["ttir"]))
-    assert _PROXY_OPS[op] + ("spsc", "mpsc")[pool] in called, called
-
-
-def test_proxy_op_name_rejects_invalid_axes():
-    warp = cco.CoopScope.WARP
-    assert proxy_op_name("put", warp, cco.SignalOp.SET) == "proxy_put_warp_set_spsc"
-    assert proxy_op_name("failed", pool=ProxyPool.MPSC) == "proxy_failed_mpsc"
-    with pytest.raises(ValueError, match="coop must be"):
-        proxy_op_name("flush", cco.CoopScope.THREAD)
-    with pytest.raises(ValueError, match="signal_op must be"):
-        proxy_op_name("put_value", warp, cco.SignalOp.INC)
-    with pytest.raises(ValueError, match="signal_op must be"):
-        proxy_op_name("signal", warp, cco.SignalOp.NONE)
-    with pytest.raises(ValueError, match="pool must be"):
-        proxy_op_name("flush", warp, pool=2)
-    # Every name it can produce is a registered extern.
-    for name, meta in CCO_DEVICE_FUNCTIONS.items():
-        if meta["family"].startswith("proxy_"):
-            assert callable(getattr(cco, name))
-
-
 def test_gda_doorbell_symbols_are_registered_per_mode():
     by_symbol = CCO_DEVICE_FUNCTIONS_BY_SYMBOL
     data = ("gda_put", "gda_put_value", "gda_get")
@@ -307,7 +239,7 @@ def test_gda_doorbell_symbols_are_registered_per_mode():
 
 
 def test_all_cco_device_symbols_are_exported_to_triton():
-    assert len(CCO_DEVICE_FUNCTIONS) == 225
+    assert len(CCO_DEVICE_FUNCTIONS) == 171
     assert set(CCO_DEVICE_FUNCTIONS).issubset(cco.__all__)
     for name in CCO_DEVICE_FUNCTIONS:
         assert callable(getattr(cco, name))
@@ -346,17 +278,6 @@ def test_triton_facades_match_flydsl_handle_names():
         "wait_signal",
         "signal_slot",
     } <= set(vars(cco.Sdma))
-    assert {
-        "put",
-        "put_value",
-        "signal",
-        "flush",
-        "flush_timeout",
-        "wait_signal",
-        "read_signal",
-        "reset_signal",
-        "failed",
-    } <= set(vars(cco.Proxy))
 
 
 @pytest.mark.parametrize(
@@ -516,83 +437,8 @@ def test_flydsl_gda_doorbell_picks_symbols(monkeypatch):
                 gda.signal(1)
         else:
             gda.signal(1)
-    # SET has no Gda symbol; it is ccoProxy only.
-    set_op = handles.SignalOp.SET
-    gda = FakeGda(GdaDoorbell.IMMEDIATE)
-    for call in (
-        lambda: gda.put(1, 0, 0, 0, 0, 64, signal_op=set_op),
-        lambda: gda.put_value(1, 0, 0, 7, signal_op=set_op),
-        lambda: gda.signal(1, signal_op=set_op),
-    ):
-        with pytest.raises(ValueError, match="SET is ccoProxy only"):
-            call()
     with pytest.raises(ValueError, match="doorbell must be"):
         handles.DevComm.gda(None, 0, doorbell=3)
-
-
-def test_flydsl_proxy_picks_symbols(monkeypatch):
-    pytest.importorskip("flydsl")
-    from mori.cco.device.flydsl import _internal, handles
-
-    called = []
-    monkeypatch.setattr(
-        _internal._LazyExtern,
-        "__call__",
-        lambda self, *args: called.append((self._symbol, args)) or 0,
-    )
-
-    class FakeProxy:  # Proxy's methods on plain attributes; no trace needed
-        dev_comm, queue = 1, 2
-
-        def __init__(self, pool):
-            self.pool = pool
-
-    # Same op names as the Triton facade.
-    names = {k for k in vars(cco.Proxy) if not k.startswith("_")}
-    assert names <= set(vars(handles.Proxy))
-    for name in names | {"_q"}:
-        setattr(FakeProxy, name, getattr(handles.Proxy, name))
-
-    sig, warp = handles.SignalOp, handles.CoopScope.WARP
-    for pool, tag in ((ProxyPool.SPSC, "spsc"), (ProxyPool.MPSC, "mpsc")):
-        called.clear()
-        proxy = FakeProxy(pool)
-        proxy.put(1, 0, 0, 0, 0, 64, signal_op=sig.SET, team=handles.Team.GDA)
-        proxy.put_value(1, 0, 0, 7, coop=warp, queue=5)
-        proxy.signal(1, signal_op=sig.ADD, signal_val=3)
-        proxy.flush(coop=warp)
-        proxy.flush_timeout(100)
-        proxy.wait_signal(0, 1)
-        proxy.read_signal(0)
-        proxy.reset_signal(0)
-        proxy.failed()
-        assert [symbol for symbol, _ in called] == [
-            f"cco_proxy_put__block__set__{tag}",
-            f"cco_proxy_put_value__warp__none__{tag}",
-            f"cco_proxy_signal__block__add__{tag}",
-            f"cco_proxy_flush__warp__{tag}",
-            f"cco_proxy_flush_timeout__block__{tag}",
-            f"cco_proxy_wait_signal__block__{tag}",
-            f"cco_proxy_read_signal__{tag}",
-            f"cco_proxy_reset_signal__{tag}",
-            f"cco_proxy_failed__{tag}",
-        ]
-        # The queue is the second argument: the handle's, or the call's.
-        assert [args[1] for _, args in called] == [2, 5] + [2] * 7
-        assert called[0][1][-1] == GdaFlags.TEAM_GDA
-        assert called[1][1][-1] == 0
-
-    proxy = FakeProxy(ProxyPool.SPSC)
-    with pytest.raises(ValueError, match="coop must be"):
-        proxy.flush(coop=handles.CoopScope.THREAD)
-    with pytest.raises(ValueError, match="signal_op must be"):
-        proxy.put_value(1, 0, 0, 7, signal_op=sig.INC)
-    with pytest.raises(ValueError, match="signal_op must be"):
-        proxy.signal(1, signal_op=sig.NONE)
-    with pytest.raises(TypeError, match="compile-time constant"):
-        proxy.put(1, 0, 0, 0, 0, 64, signal_op=object())
-    with pytest.raises(ValueError, match="pool must be"):
-        handles.DevComm.proxy(None, 0, pool=2)
 
 
 def test_cco_bitcode_cache_key_follows_ccqe(monkeypatch, tmp_path):

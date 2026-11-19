@@ -43,24 +43,11 @@ class CoopScope:
 
 
 class SignalOp:
-    """Remote action attached to a GDA or ccoProxy operation. ``SET`` (an
-    8-byte RDMA write of the value, no NIC atomic) is ccoProxy only."""
+    """Remote action attached to a GDA operation."""
 
     NONE = 0
     INC = 1
     ADD = 2
-    SET = 3
-
-
-class ProxyPool:
-    """The ccoProxy queue pool a call uses (C++ ``ccoProxy<SPSCD2HQueue>`` /
-    ``ccoProxy<MPSCD2HQueue>``), sized by ``proxy_spsc_queue_count`` /
-    ``proxy_mpsc_queue_count``. An SPSC queue index must be below the pool
-    size and one wavefront must own the queue; an MPSC one wraps and may be
-    shared."""
-
-    SPSC = 0
-    MPSC = 1
 
 
 class ThreadMode:
@@ -233,51 +220,6 @@ DATA_PATH_TAG = {
     (ThreadMode.INDEPENDENT, CoopScope.BLOCK): "ib",
     (ThreadMode.AGGREGATE, CoopScope.THREAD): "at",
 }
-
-PROXY_SIGNAL_TAG = {**SIGNAL_TAG, SignalOp.SET: "set"}
-PROXY_POOL_TAG = {ProxyPool.SPSC: "spsc", ProxyPool.MPSC: "mpsc"}
-
-# ccoProxy axes per op: (coop tags, signal tags or None).
-_PROXY_OPS = {
-    "put": (("warp", "block"), ("none", "inc", "add", "set")),
-    "put_value": (("warp", "block"), ("none", "set")),
-    "signal": (("warp", "block"), ("inc", "add", "set")),
-    "flush": (("warp", "block"), None),
-    "flush_timeout": (("warp", "block"), None),
-    "wait_signal": (("warp", "block"), None),
-    "read_signal": (None, None),
-    "reset_signal": (None, None),
-    "failed": (None, None),
-}
-_PROXY_COOP_TAG = {CoopScope.WARP: "warp", CoopScope.BLOCK: "block"}
-
-
-def proxy_op_name(op, coop=None, signal_op=None, pool=ProxyPool.SPSC):
-    """Name of the ccoProxy extern for ``op`` and its axes, e.g.
-    ``("put", CoopScope.WARP, SignalOp.SET, ProxyPool.SPSC)`` ->
-    ``proxy_put_warp_set_spsc``. Axes the op does not have are ignored."""
-    coops, sigs = _PROXY_OPS[op]
-    parts = [f"proxy_{op}"]
-    if coops is not None:
-        tag = _PROXY_COOP_TAG.get(coop) if not isinstance(coop, bool) else None
-        if tag not in coops:
-            raise ValueError(
-                f"cco: Proxy {op} coop must be CoopScope.WARP or BLOCK, not {coop!r}"
-            )
-        parts.append(tag)
-    if sigs is not None:
-        tag = (
-            PROXY_SIGNAL_TAG.get(signal_op) if not isinstance(signal_op, bool) else None
-        )
-        if tag not in sigs:
-            names = ", ".join(f"SignalOp.{t.upper()}" for t in sigs)
-            raise ValueError(f"cco: Proxy {op} signal_op must be one of {names}")
-        parts.append(tag)
-    if isinstance(pool, bool) or pool not in PROXY_POOL_TAG:
-        raise ValueError("cco: Proxy pool must be ProxyPool.SPSC or ProxyPool.MPSC")
-    parts.append(PROXY_POOL_TAG[pool])
-    return "_".join(parts)
-
 
 GDA_DATA_TAGS = tuple(DATA_PATH_TAG.values())
 GDA_SIGNAL_TAGS = tuple(SIGNAL_TAG.values())
@@ -631,101 +573,6 @@ for _coop in COOP_TAGS:
         tag=_coop,
     )
 
-# ccoProxy: cco_proxy_<op>__<coop>[__<sig>]__<pool>, coop warp / block. Each
-# call builds a ccoProxy on `queue` (the second argument) and drops it at
-# return; see the device wrapper for what that means for SPSC queues and block
-# flushes. put / put_value / signal end in a GdaFlags word.
-# (devComm, queue, peer, dstWin, dstOff, srcWin, srcOff, nbytes, sigId, sigVal, flags)
-_proxy_put_args = list(_gda_put_args)
-# (devComm, queue, peer, dstWin, dstOff, value, sigId, sigVal, flags)
-_proxy_put_value_args = list(_gda_put_value_args)
-for _pool in PROXY_POOL_TAG.values():
-    for _coop in ("warp", "block"):
-        for _sig in ("none", "inc", "add", "set"):
-            _tag = f"{_coop}__{_sig}__{_pool}"
-            _add(
-                f"proxy_put_{_coop}_{_sig}_{_pool}",
-                f"cco_proxy_put__{_tag}",
-                _proxy_put_args,
-                _I32,
-                family="proxy_put",
-                tag=_tag,
-            )
-            if _sig in ("none", "set"):
-                _add(
-                    f"proxy_put_value_{_coop}_{_sig}_{_pool}",
-                    f"cco_proxy_put_value__{_tag}",
-                    _proxy_put_value_args,
-                    _I32,
-                    family="proxy_put_value",
-                    tag=_tag,
-                )
-            if _sig != "none":
-                # (devComm, queue, peer, sigId, sigVal, flags)
-                _add(
-                    f"proxy_signal_{_coop}_{_sig}_{_pool}",
-                    f"cco_proxy_signal__{_tag}",
-                    [_U64, _I32, _I32, _I32, _U64, _I32],
-                    _I32,
-                    family="proxy_signal",
-                    tag=_tag,
-                )
-        _tag = f"{_coop}__{_pool}"
-        # (devComm, queue) -> 0; traps once the DevComm failed
-        _add(
-            f"proxy_flush_{_coop}_{_pool}",
-            f"cco_proxy_flush__{_tag}",
-            [_U64, _I32],
-            _I32,
-            family="proxy_flush",
-            tag=_tag,
-        )
-        # (devComm, queue, timeoutCycles) -> 0 done / 1 timed out / 2 failed
-        _add(
-            f"proxy_flush_timeout_{_coop}_{_pool}",
-            f"cco_proxy_flush_timeout__{_tag}",
-            [_U64, _I32, _U64],
-            _I32,
-            family="proxy_flush_timeout",
-            tag=_tag,
-        )
-        # (devComm, queue, sigId, least, bits)
-        _add(
-            f"proxy_wait_signal_{_coop}_{_pool}",
-            f"cco_proxy_wait_signal__{_tag}",
-            [_U64, _I32, _I32, _U64, _I32],
-            _I32,
-            family="proxy_wait_signal",
-            tag=_tag,
-        )
-    # (devComm, queue, sigId, bits) -> value
-    _add(
-        f"proxy_read_signal_{_pool}",
-        f"cco_proxy_read_signal__{_pool}",
-        [_U64, _I32, _I32, _I32],
-        _U64,
-        family="proxy_read_signal",
-        tag=_pool,
-    )
-    # (devComm, queue, sigId)
-    _add(
-        f"proxy_reset_signal_{_pool}",
-        f"cco_proxy_reset_signal__{_pool}",
-        [_U64, _I32, _I32],
-        _I32,
-        family="proxy_reset_signal",
-        tag=_pool,
-    )
-    # (devComm, queue) -> 1 once the DevComm failed, else 0
-    _add(
-        f"proxy_failed_{_pool}",
-        f"cco_proxy_failed__{_pool}",
-        [_U64, _I32],
-        _I32,
-        family="proxy_failed",
-        tag=_pool,
-    )
-
 CCO_DEVICE_FUNCTIONS_BY_SYMBOL = {
     meta["symbol"]: (name, meta) for name, meta in CCO_DEVICE_FUNCTIONS.items()
 }
@@ -735,7 +582,6 @@ __all__ = [
     "CCO_DEVICE_FUNCTIONS_BY_SYMBOL",
     "CoopScope",
     "SignalOp",
-    "ProxyPool",
     "ThreadMode",
     "Team",
     "GdaDoorbell",
@@ -750,9 +596,6 @@ __all__ = [
     "sdma_flags",
     "sdma_signals",
     "SIGNAL_TAG",
-    "PROXY_SIGNAL_TAG",
-    "PROXY_POOL_TAG",
-    "proxy_op_name",
     "COOP_TAG",
     "DATA_PATH_TAG",
     "GDA_DATA_TAGS",

@@ -48,7 +48,6 @@ from .cco import (
     # Device communicator
     dev_comm_create,
     dev_comm_destroy,
-    dev_comm_get_error,
     # Barrier
     barrier_all,
     # GdaConnectionType constants

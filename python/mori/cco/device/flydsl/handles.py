@@ -24,7 +24,7 @@
 # MIT License
 """OO handles + enums for the cco device API (FlyDSL).
 
-``DevComm`` / ``Window`` / ``Gda`` / ``Proxy`` are method-carrying FlyDSL structs (see
+``DevComm`` / ``Window`` / ``Gda`` are method-carrying FlyDSL structs (see
 :func:`._internal.cco_struct`) — first-class DSL values that flow through scf
 control flow. Build once at kernel entry and reuse::
 
@@ -57,14 +57,12 @@ from mori.cco.device.ops import (
     SIGNAL_TAG as _SIG_TAG,
     CoopScope,
     GdaDoorbell,
-    ProxyPool,
     SdmaCmp,
     SignalOp,
     Team,
     ThreadMode,
     gda_doorbell_tag,
     gda_flags,
-    proxy_op_name,
     sdma_flags,
     sdma_signals,
 )
@@ -83,16 +81,6 @@ def _const(value, name):
             "The axis picks a specialized wrapper symbol at trace time."
         )
     return value
-
-
-def _gda_sig(signal_op):
-    """SignalOp -> Gda signal tag; SET has no Gda wrapper."""
-    tag = _SIG_TAG.get(_const(signal_op, "signal_op"))
-    if tag is None:
-        raise ValueError(
-            "cco: Gda signal_op must be NONE/INC/ADD (SET is ccoProxy only)"
-        )
-    return tag
 
 
 def _tc(coop, thread_mode):
@@ -264,7 +252,7 @@ class Gda:
         team=Team.WORLD,
         ctx=None,
     ):
-        sig = _gda_sig(signal_op)
+        sig = _SIG_TAG[_const(signal_op, "signal_op")]
         sym = raw.PUT[f"{_tc(coop, thread_mode)}__{sig}{self._db()}"]
         sym(
             self.dev_comm,
@@ -295,7 +283,7 @@ class Gda:
         team=Team.WORLD,
         ctx=None,
     ):
-        sig = _gda_sig(signal_op)
+        sig = _SIG_TAG[_const(signal_op, "signal_op")]
         sym = raw.PUT_VALUE[f"{_tc(coop, thread_mode)}__{sig}{self._db()}"]
         sym(
             self.dev_comm,
@@ -357,7 +345,7 @@ class Gda:
                 "signal_op, or flush this handle first and then signal through an "
                 "IMMEDIATE one"
             )
-        raw.SIGNAL[f"{_COOP_TAG[coop]}__{_gda_sig(signal_op)}"](
+        raw.SIGNAL[f"{_COOP_TAG[coop]}__{_SIG_TAG[signal_op]}"](
             self.dev_comm, self._ctx(ctx), peer, signal_id, signal_val, _gda_flags(team)
         )
 
@@ -896,164 +884,6 @@ class Sdma:
         return raw.cco_sdma_signal_slot(self.dev_comm, src_lsa_rank, qid)
 
 
-def _proxy_sym(op, pool, coop=None, signal_op=None):
-    """The ccoProxy extern for ``op``; every axis must be a constant."""
-    if coop is not None:
-        _const(coop, "coop")
-    if signal_op is not None:
-        _const(signal_op, "signal_op")
-    return raw.PROXY[proxy_op_name(op, coop, signal_op, _const(pool, "pool"))]
-
-
-@cco_struct
-class Proxy:
-    """ccoProxy handle (host-proxy RDMA, ``cco_proxy.hpp``) on a DevComm's
-    queue pool, the FlyDSL twin of the Triton ``Proxy`` facade.
-
-    ``pool`` (a :class:`ProxyPool`) and ``queue`` are Constexpr fields, so the
-    handle is one IR value across scf.if / scf.for; every op also takes
-    ``queue=``, which may be a runtime ``Int32`` (e.g. the block index).
-
-    Each call builds a C++ ``ccoProxy`` on its queue and drops it at return:
-
-    * SPSC: one wavefront must own the queue across calls and launches
-      (``coop=BLOCK``: wavefront 0), so give each block of a launch its own
-      queue, even blocks that run one after another. Out of range traps. MPSC
-      queues wrap and may be shared.
-    * ``coop`` is WARP or BLOCK (no THREAD). BLOCK: wavefront 0 issues one op.
-      WARP: every wavefront issues it, so use it with one-wavefront blocks.
-    * ``flush`` covers every earlier op on its queue; a BLOCK flush covers
-      only that queue.
-
-    Every thread of the block must make the call. ``SignalOp.SET`` writes the
-    value with an RDMA write: send every set of a slot through one queue, with
-    increasing values and no INC / ADD to that slot. Needs wave64 gfx942 /
-    gfx950 and a DevComm with a non-empty pool (an empty one traps).
-    """
-
-    dev_comm: fx.Int64
-    pool: fx.Constexpr
-    queue: fx.Constexpr
-
-    def _q(self, queue):
-        return self.queue if queue is None else queue
-
-    def put(
-        self,
-        peer,
-        dst_win,
-        dst_off,
-        src_win,
-        src_off,
-        nbytes,
-        *,
-        signal_op=SignalOp.NONE,
-        signal_id=0,
-        signal_val=0,
-        coop=CoopScope.BLOCK,
-        team=Team.WORLD,
-        queue=None,
-    ):
-        """RDMA write to ``peer``, then (same QP) ``signal_op`` NONE / INC /
-        ADD / SET on its slot ``signal_id`` with ``signal_val``."""
-        _proxy_sym("put", self.pool, coop, signal_op)(
-            self.dev_comm,
-            self._q(queue),
-            peer,
-            _win(dst_win),
-            dst_off,
-            _win(src_win),
-            src_off,
-            nbytes,
-            signal_id,
-            signal_val,
-            _gda_flags(team),
-        )
-
-    def put_value(
-        self,
-        peer,
-        dst_win,
-        dst_off,
-        value,
-        *,
-        signal_op=SignalOp.NONE,
-        signal_id=0,
-        signal_val=0,
-        coop=CoopScope.BLOCK,
-        team=Team.WORLD,
-        queue=None,
-    ):
-        """Inline 8-byte write of ``value`` (uint64); signal_op NONE or SET."""
-        _proxy_sym("put_value", self.pool, coop, signal_op)(
-            self.dev_comm,
-            self._q(queue),
-            peer,
-            _win(dst_win),
-            dst_off,
-            value,
-            signal_id,
-            signal_val,
-            _gda_flags(team),
-        )
-
-    def signal(
-        self,
-        peer,
-        *,
-        signal_op=SignalOp.INC,
-        signal_id=0,
-        signal_val=0,
-        coop=CoopScope.BLOCK,
-        team=Team.WORLD,
-        queue=None,
-    ):
-        """INC / ADD / SET on ``peer``'s slot, after earlier puts on the queue."""
-        _proxy_sym("signal", self.pool, coop, signal_op)(
-            self.dev_comm,
-            self._q(queue),
-            peer,
-            signal_id,
-            signal_val,
-            _gda_flags(team),
-        )
-
-    def flush(self, *, coop=CoopScope.BLOCK, queue=None):
-        """Wait until every earlier op on the queue completed on every peer.
-        Traps once the DevComm failed."""
-        _proxy_sym("flush", self.pool, coop)(self.dev_comm, self._q(queue))
-
-    def flush_timeout(self, timeout_cycles, *, coop=CoopScope.BLOCK, queue=None):
-        """``flush`` that never traps: Int32 0 done, 1 timed out after
-        ``timeout_cycles`` clock64 cycles, 2 the DevComm failed."""
-        return _proxy_sym("flush_timeout", self.pool, coop)(
-            self.dev_comm, self._q(queue), timeout_cycles
-        )
-
-    def wait_signal(
-        self, signal_id, least, *, bits=64, coop=CoopScope.BLOCK, queue=None
-    ):
-        """Wait until local slot ``signal_id`` gained ``least`` since the last
-        wait (consuming it), then acquire. Traps once the DevComm failed."""
-        _proxy_sym("wait_signal", self.pool, coop)(
-            self.dev_comm, self._q(queue), signal_id, least, bits
-        )
-
-    def read_signal(self, signal_id, *, bits=64, queue=None):
-        """Local slot minus what waits consumed (uint64); no acquire."""
-        return _proxy_sym("read_signal", self.pool)(
-            self.dev_comm, self._q(queue), signal_id, bits
-        )
-
-    def reset_signal(self, signal_id, *, queue=None):
-        """Zero local slot ``signal_id``; only while no peer signals it."""
-        _proxy_sym("reset_signal", self.pool)(self.dev_comm, self._q(queue), signal_id)
-
-    def failed(self, *, queue=None):
-        """Int32 1 once the DevComm failed, else 0."""
-        return _proxy_sym("failed", self.pool)(self.dev_comm, self._q(queue))
-
-
 @cco_struct
 class DevComm:
     """Handle for a device-resident ``ccoDevComm``."""
@@ -1082,12 +912,6 @@ class DevComm:
         share its QPs, whatever their mode (see :class:`GdaDoorbell`)."""
         gda_doorbell_tag(_const(doorbell, "doorbell"))  # rejects an unknown mode
         return Gda(dev_comm=self.ptr, ctx=ctx, doorbell=doorbell)
-
-    def proxy(self, queue=0, pool=ProxyPool.SPSC) -> Proxy:
-        """Build a ccoProxy handle on ``pool``'s queue ``queue`` (both
-        compile-time; ops may override the queue at run time)."""
-        proxy_op_name("failed", pool=_const(pool, "pool"))  # rejects a bad pool
-        return Proxy(dev_comm=self.ptr, pool=pool, queue=queue)
 
     def sdma(self) -> Sdma:
         """Build an SDMA handle on this devComm (LSA copy-engine put/get)."""

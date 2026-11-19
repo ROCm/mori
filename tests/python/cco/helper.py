@@ -33,7 +33,6 @@ examples.
 import ctypes
 import os
 from pathlib import Path
-import signal
 import subprocess
 import sys
 
@@ -93,18 +92,6 @@ def run_triton_example(transport: str, timeout: int = 240) -> str:
         env["MORI_RDMA_DEVICES"] = devices.split(",", 1)[0]
         env["MORI_DISABLE_TOPO"] = "1"
 
-    if transport == "proxy":
-        # The caller's device list and topology as given: a GPU may not reach
-        # another GPU's NIC (e.g. across PCIe switches on MI300X).
-        devices = env.get("MORI_CCO_TRITON_PROXY_DEVICE") or env.get(
-            "MORI_RDMA_DEVICES", ""
-        )
-        if not devices:
-            raise RuntimeError(
-                "Proxy test needs MORI_CCO_TRITON_PROXY_DEVICE or MORI_RDMA_DEVICES"
-            )
-        env["MORI_RDMA_DEVICES"] = devices
-
     command = [
         sys.executable,
         "-m",
@@ -115,30 +102,15 @@ def run_triton_example(transport: str, timeout: int = 240) -> str:
         "--transport",
         transport,
     ]
-    # Own session so a timeout also reaps ranks stuck in a signal wait.
-    proc = subprocess.Popen(
+    result = subprocess.run(
         command,
         cwd=repo_root,
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        capture_output=True,
         text=True,
-        start_new_session=True,
+        timeout=timeout,
     )
-    try:
-        output, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            output, _ = proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            output, _ = proc.communicate()
-        raise AssertionError(
-            f"CCO Triton {transport} example timed out after {timeout} s:\n{output}"
-        )
-    result = subprocess.CompletedProcess(command, proc.returncode, output, "")
-    output = result.stdout
+    output = result.stdout + result.stderr
     if result.returncode != 0:
         raise AssertionError(
             f"CCO Triton {transport} example failed ({result.returncode}):\n{output}"
