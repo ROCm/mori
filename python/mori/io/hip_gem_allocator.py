@@ -150,7 +150,11 @@ def hip_gem_lookup(ptr: int):
     size = ctypes.c_size_t()
     device = ctypes.c_int()
     rc = _library().mori_hip_gem_lookup(
-        ctypes.c_void_p(ptr), ctypes.byref(base), ctypes.byref(size), None, ctypes.byref(device)
+        ctypes.c_void_p(ptr),
+        ctypes.byref(base),
+        ctypes.byref(size),
+        None,
+        ctypes.byref(device),
     )
     if rc != 0:
         return None

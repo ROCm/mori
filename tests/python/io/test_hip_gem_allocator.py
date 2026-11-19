@@ -108,7 +108,10 @@ def engines():
     initiator = IOEngine(key="hip_gem_initiator", config=config)
     target = IOEngine(key="hip_gem_target", config=config)
     rdma = RdmaBackendConfig(
-        qp_per_transfer=2, post_batch_size=-1, num_worker_threads=1, enable_notification=True
+        qp_per_transfer=2,
+        post_batch_size=-1,
+        num_worker_threads=1,
+        enable_notification=True,
     )
     with temporary_env("MORI_DISABLE_AUTO_XGMI", "1"):
         initiator.create_backend(BackendType.RDMA, rdma)
@@ -122,7 +125,9 @@ def write_and_check(engines, src, dst, nbytes):
     initiator, target = engines
     src_mem = initiator.register_torch_tensor(src)
     dst_mem = target.register_torch_tensor(dst)
-    status = initiator.write(src_mem, 0, dst_mem, 0, nbytes, initiator.allocate_transfer_uid())
+    status = initiator.write(
+        src_mem, 0, dst_mem, 0, nbytes, initiator.allocate_transfer_uid()
+    )
     while status.InProgress():
         pass
     assert status.Succeeded(), status.Message()
@@ -132,9 +137,12 @@ def write_and_check(engines, src, dst, nbytes):
     target.deregister_memory(dst_mem)
 
 
-@pytest.mark.parametrize("src_kind,dst_kind", [("gem", "gem"), ("gem", "plain"), ("plain", "gem")])
+@pytest.mark.parametrize(
+    "src_kind,dst_kind", [("gem", "gem"), ("gem", "plain"), ("plain", "gem")]
+)
 def test_rdma_write(engines, pool, src_kind, dst_kind):
     nbytes = 48 * MiB + 4096
+
     def make(kind):
         if kind == "gem":
             return gem_empty(pool, nbytes)
