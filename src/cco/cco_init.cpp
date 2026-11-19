@@ -1790,7 +1790,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
 
   // ccoProxy: proxy threads + host-posted QPs to the proxy peer set, sharing the
   // GDA signal slots. The proxy fields sit at the tail of reqs; read them only
-  // when the caller's struct has them.
+  // when the caller's struct has them. proxyConnectionType fills tail padding,
+  // so this gate only separates callers that predate all proxy fields.
   const bool reqsHaveProxy =
       reqs->size >= offsetof(ccoDevCommRequirements, proxyConnectionType) + sizeof(int);
   const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
@@ -2291,13 +2292,13 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
         //   P2P  — sameHost peer with capability (LSA flat-VA covers
         //          intra-node; window-level FD exchange happens in WindowRegister).
         //   SDMA — this DevComm allocated an SDMA signal pool AND peer canSDMA.
-        //   RDMA — this DevComm allocated a QP for peer (depends on connType).
+        //   RDMA — this DevComm allocated a GDA or proxy QP for peer.
         const bool actP2P = cap.canP2P && cap.sameHost;
         const bool actSDMA = sdmaPoolActive && cap.canSDMA;
         bool actRDMA = false;
-        if (connType != CCO_GDA_CONNECTION_NONE && rdmaEnabled &&
-            peer < static_cast<int>(gdaPeerMask.size())) {
-          actRDMA = gdaPeerMask[peer];
+        if (rdmaEnabled) {
+          actRDMA = (peer < static_cast<int>(gdaPeerMask.size()) && gdaPeerMask[peer]) ||
+                    (peer < static_cast<int>(proxyPeerMask.size()) && proxyPeerMask[peer]);
         }
 
         auto fmt = [](bool p2p, bool sdma, bool rdma, char* out, size_t n) {
