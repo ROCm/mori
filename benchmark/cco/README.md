@@ -52,7 +52,8 @@ mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t lsa -b 1M -e 1G -f 4 -n 20 -w 5
 
 `-t proxy` runs the ibgda kernels' shape with `ccoProxy`. ibgda's `flush` maps
 to ccoProxy's `flush`, which waits until the proxy has seen every earlier put
-of the queue complete.
+of the queue complete. Its DevComm has proxy QPs to the peers ibgda connects
+(`proxyConnectionType`) and no GDA QPs.
 
 - `cco_p2p_put_latency -t proxy`: one put + flush per iteration.
   - `-P` switches ibgda or proxy to a ping-pong: put + SignalInc, PE 1 echoes,

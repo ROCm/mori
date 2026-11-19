@@ -435,6 +435,11 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     // QP, so blocks are independent — no cross-block barrier, and each block
     // flushes its own QP. gdaContextCount must cover the largest block count.
     reqs.gdaContextCount = args.nblocks;
+    // proxy: the same peers over proxy QPs only, no GDA QPs.
+    if (args.transport == Transport::kProxy) {
+      reqs.proxyConnectionType = reqs.gdaConnectionType;
+      reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
+    }
     // A few slots for the ping-pong latency kernels (kSlotPing).
     reqs.gdaSignalCount = kBenchSignalCount;
     reqs.gdaCounterCount = 0;
@@ -493,7 +498,8 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
       PerfFinalize(ctx);
       return 1;
     }
-    if (ctx->devComm.gdaConnType == CCO_GDA_CONNECTION_NONE) {
+    if (args.transport == Transport::kIbgda &&
+        ctx->devComm.gdaConnType == CCO_GDA_CONNECTION_NONE) {
       if (ctx->my_pe == 0) {
         std::fprintf(stderr,
                      "IBGDA transport collapsed to NONE — RDMA loopback unsupported on a single "
@@ -519,11 +525,11 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     } else if (args.transport == Transport::kProxy) {
       std::printf(
           "[cco-bench] transport = PROXY (RDMA via ccoProxy: %d %s KIWI queues, %d host proxy "
-          "threads; QPs per peer %s; gdaConnType=%d)\n",
+          "threads; QPs per peer %s; proxy connType=%d)\n",
           ctx->devComm.proxy.numSpscQueues + ctx->devComm.proxy.numMpscQueues,
           args.proxy_mpsc ? "MPSC" : "SPSC", args.proxy_threads,
           args.proxy_qps_per_peer > 0 ? std::to_string(args.proxy_qps_per_peer).c_str() : "default",
-          static_cast<int>(ctx->devComm.gdaConnType));
+          ctx->devComm.proxy.connType);
     } else {
       std::printf(
           "[cco-bench] transport = IBGDA (cross-node RDMA via ccoGda; gdaConnType=%d)\n"
