@@ -497,7 +497,7 @@ declaration.
 
 A slot is a 64-bit word that remote signals add to (`SignalInc` /
 `SignalAdd`) or overwrite (`SignalSet`), plus a count of what local waits
-have consumed. The calls are the same as `ccoGda`'s:
+have consumed. The semantics are the same as `ccoGda`'s:
 
 - `readSignal(id)` returns the unconsumed amount: the slot's value minus what
   was consumed.
@@ -505,8 +505,10 @@ have consumed. The calls are the same as `ccoGda`'s:
   then consumes `least`. It is not an absolute target: a second
   `waitSignal(id, n)` waits for `n` more. (`ccoSdma::waitSignal` does take an
   absolute value.)
+- `ccoProxy::waitSignal` has no `bits` argument: a 4th argument is a timeout
+  (`int waitSignal(id, least, coop, timeoutCycles)`).
 - One waiter per slot at a time: two concurrent waiters on one slot can both
-  take the same arrival.
+  take the same arrival. `waitSignal` does not take `ccoCoopLaneMasked`.
 - `resetSignal(id)` zeroes the slot and its consumed count; no signal to it may
   be in flight.
 
@@ -578,9 +580,12 @@ A complete program (host setup, data check, timeouts, `ccoDevCommGetError`) is
 ### Checking it on your platform
 
 Run `tests/cpp/cco/test_proxy_put` (built with `BUILD_TESTS=ON`) before relying
-on ccoProxy on a new platform, with one rank on each of two nodes:
+on ccoProxy on a new platform, with one rank on each of two nodes. Both ranks
+must use GPUs whose NICs are on the same rail (here GPU 0 on both nodes):
 
 ```bash
+# both nodes
+export MORI_SOCKET_IFNAME=<iface> HIP_VISIBLE_DEVICES=0
 # node A: write the bootstrap id, copy it to node B, then start rank 0
 ./test_proxy_put --gen-uid <iface> 0 uid.bin
 MORI_CCO_PROXY_TEST_CASES=atomic_free ./test_proxy_put --rank 0 --world 2 --uid-file uid.bin
