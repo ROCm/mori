@@ -21,7 +21,7 @@
 // SOFTWARE.
 //
 //
-// cco_proxy_engine.hpp — host side of ccoProxy (see include/mori/cco/cco_proxy.hpp).
+// cco_proxy_engine.hpp — host side of ccoProxy (see include/mori/cco/cco_scale_out.hpp, section 6).
 //
 // Plain C++ interface so the host control plane (cco_init.cpp, compiled as CXX
 // where ccoComm is visible) can drive it; the implementation is a HIP TU

@@ -46,7 +46,7 @@
 // outstanding. Pending flushes retire in FIFO order (a later FLUSH never waits
 // for less than an earlier one), and each retired FLUSH adds 1 to
 // flushDone[q]. The GPU side turns that count into "my FLUSH is satisfied"
-// (see cco_proxy.hpp).
+// (see cco_scale_out.hpp section 6).
 //
 // Failure: the first error (a descriptor the proxy cannot post, a failed post
 // or completion, a corrupted queue) is recorded once per engine and printed on
@@ -57,7 +57,7 @@
 
 // cco headers first: core/utils.hpp (pulled in by the application headers)
 // defines a `warpSize` macro that would break cco.hpp's impl::warpSize().
-#include "mori/cco/cco_proxy.hpp"
+#include "mori/cco/cco_scale_out.hpp"
 // clang-format off
 #include "cco_proxy_engine.hpp"
 #include "hip/hip_runtime.h"

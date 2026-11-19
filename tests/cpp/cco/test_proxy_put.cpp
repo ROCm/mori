@@ -663,7 +663,7 @@ __global__ void ProxySignalKernel(ccoDevComm dc, ccoGdaSignal_t slot, int* err) 
 }
 
 // One block of two wavefronts, unit 0 on SPSC queue 0, handed from wavefront 0
-// to wavefront 1 (the release() / __syncthreads() handoff in cco_proxy.hpp).
+// to wavefront 1 (the release() / __syncthreads() handoff in cco_scale_out.hpp section 6).
 __global__ void ProxyHandoffKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
                                    size_t chunk, int* err) {
   __shared__ uint64_t before;

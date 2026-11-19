@@ -392,7 +392,7 @@ struct ccoSdmaContext {
   uint64_t** peerSignalPtrs;  // [lsaSize], peer signalBuf base via IPC
 };
 
-// ccoProxy context (host-proxy RDMA; see cco_proxy.hpp). Kernels invoke host
+// ccoProxy context (host-proxy RDMA; see cco_scale_out.hpp section 6). Kernels invoke host
 // callbacks (KIWI invoke) with descriptors, keys already resolved (the same
 // window addressing as GDA, offset + iovaBias). A fixed set of host proxy threads polls the
 // queues and posts the RDMA work requests on host-created RC QPs,
@@ -400,7 +400,7 @@ struct ccoSdmaContext {
 // wavefront at a time per queue) and MPSC. Empty when both pools are empty.
 //
 // Each pool is one KIWI invoke context; its device context is opaque here so
-// this header stays free of KIWI headers (cco_proxy.hpp casts it back).
+// this header stays free of KIWI headers (cco_scale_out.hpp casts it back).
 struct ccoProxyContext {
   int numSpscQueues;
   int numMpscQueues;
@@ -658,7 +658,7 @@ struct ccoCoopBlock {
 
 // ccoProxy's per-lane Coop for put / putValue / signal: all 64 lanes call from
 // converged code and each lane with `active` true issues its own op (see
-// cco_proxy.hpp), e.g.
+// cco_scale_out.hpp section 6), e.g.
 //   proxy.put(peer, dstWin, dstOff, srcWin, srcOff, bytes, ccoGda_NoSignal{},
 //             ccoCoopLaneMasked{i < n});
 // As a group it is a single thread (thread_rank 0, size 1, no-op sync).
