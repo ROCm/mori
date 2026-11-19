@@ -62,18 +62,23 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
       .def(
           "attach",
           [](L1Client& client, const std::string& pool_id, const std::string& group, int device,
-             uint64_t bytes) {
+             uint64_t bytes, const py::bytes& external_handle, uint64_t external_offset) {
+            ExternalMemory external{std::string(external_handle), external_offset};
             AttachResult result;
             {
               py::gil_scoped_release release;
-              result = client.Attach(pool_id, group, device, bytes);
+              result = client.Attach(pool_id, group, device, bytes, external);
             }
             Check(result.status);
             return py::make_tuple(result.memory.kind, py::bytes(result.memory.handle), result.bytes,
                                   result.created);
           },
           py::arg("pool_id"), py::arg("group"), py::arg("device"), py::arg("bytes"),
-          "Create or re-attach a pool. Returns (handle_kind, handle, bytes, created).")
+          py::arg("external_handle") = py::bytes(), py::arg("external_offset") = 0,
+          "Create or re-attach a pool. Returns (handle_kind, handle, bytes, created). With "
+          "`external_handle` (a hip_ipc handle of the caller's allocation; on the host test "
+          "server, its 8-byte address) the pool adopts that memory at `external_offset` "
+          "instead of allocating: the server neither zeroes nor frees it.")
       .def(
           "bind_layout",
           [](L1Client& client, const std::string& pool_id, uint32_t num_slots,
@@ -164,18 +169,26 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           "The owner's device has finished every write issued before `committed`.")
       .def(
           "fetch",
-          [](L1Client& client, const std::string& pool_id, const std::vector<std::string>& keys) {
+          [](L1Client& client, const std::string& pool_id, const std::vector<std::string>& keys,
+             const std::vector<uint32_t>& dst_slots, bool probe_only) {
+            FetchOptions options;
+            options.dst_slots = dst_slots;
+            options.probe_only = probe_only;
             FetchResult result;
             {
               py::gil_scoped_release release;
-              result = client.Fetch(pool_id, keys);
+              result = client.Fetch(pool_id, keys, options);
             }
             Check(result.status);
             return py::make_tuple(result.slots, BytesList(result.evicted_keys), result.copied_slots,
-                                  result.copied_bytes, result.copy_micros);
+                                  result.copied_bytes, result.copy_micros, result.available);
           },
-          py::arg("pool_id"), py::arg("keys"),
-          "Returns (slots, evicted_keys, copied_slots, copied_bytes, copy_micros).")
+          py::arg("pool_id"), py::arg("keys"), py::arg("dst_slots") = std::vector<uint32_t>{},
+          py::arg("probe_only") = false,
+          "Returns (slots, evicted_keys, copied_slots, copied_bytes, copy_micros, available). "
+          "With `dst_slots` keys land in those held slots and nothing is evicted or "
+          "indexed; with `probe_only` nothing is copied and `available` counts the "
+          "leading keys the group holds.")
       .def(
           "clear",
           [](L1Client& client, const std::string& pool_id) {

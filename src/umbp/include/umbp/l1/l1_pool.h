@@ -81,6 +81,11 @@ class MemoryApi {
   virtual bool Allocate(int device, uint64_t bytes, void** base, ExportedMemory* exported,
                         std::string* error) = 0;
   virtual void Free(int device, void* base, uint64_t bytes) = 0;
+  // Map memory another process allocated and exported (`handle`) on `device`;
+  // the pool starts `offset` bytes into it. `*mapped` is what Unimport takes.
+  virtual bool Import(int device, const std::string& handle, uint64_t offset, void** base,
+                      void** mapped, std::string* error) = 0;
+  virtual void Unimport(int device, void* mapped) = 0;
   // Copy `bytes`. The bytes are only guaranteed visible at `dst` after a
   // Synchronize of the destination device.
   virtual bool Copy(int dst_device, void* dst, int src_device, const void* src, uint64_t bytes,
@@ -107,6 +112,12 @@ struct Op {
   std::string key;  // kPublish only
 };
 
+// Memory a pool adopts rather than allocates (`PoolManager::Attach`).
+struct ExternalMemory {
+  std::string handle;  // empty: the server allocates
+  uint64_t offset = 0;
+};
+
 struct AttachResult {
   Status status;
   ExportedMemory memory;
@@ -125,6 +136,15 @@ struct AllocateResult {
   std::vector<std::string> evicted_keys;
 };
 
+// How a Fetch places what it copies (`PoolManager::Fetch`).
+struct FetchOptions {
+  // Copy key i into dst_slots[i], a slot the caller holds, rather than into
+  // free slots: nothing here is evicted or indexed; the caller publishes.
+  std::vector<uint32_t> dst_slots;
+  // Copy nothing; count the leading keys the group could supply.
+  bool probe_only = false;
+};
+
 struct FetchResult {
   Status status;
   std::vector<uint32_t> slots;
@@ -132,6 +152,8 @@ struct FetchResult {
   uint32_t copied_slots = 0;
   uint64_t copied_bytes = 0;
   uint64_t copy_micros = 0;
+  // probe_only: leading keys this pool or another pool of the group holds.
+  uint32_t available = 0;
 };
 
 struct PoolStats {
@@ -160,8 +182,10 @@ class PoolManager {
 
   // Create the pool, or return the existing one when group, device and size
   // match. A pool with the same id and a different shape is replaced.
+  // With `external.handle` the pool adopts that memory instead: the owner keeps
+  // allocating and freeing it, the server only maps it and manages its slots.
   AttachResult Attach(const std::string& pool_id, const std::string& group, int device,
-                      uint64_t bytes);
+                      uint64_t bytes, const ExternalMemory& external = {});
   // Every pool of a group must declare the same per-region slot sizes.
   Status BindLayout(const std::string& pool_id, const Layout& layout);
   // Reset every slot to vacant and drop the pool's keys.
@@ -181,7 +205,15 @@ class PoolManager {
   // by another pool of the group -> copied into a settled free slot here,
   // which becomes cached under that key. Stops at the first key no settled
   // slot holds or no settled slot is free for.
-  FetchResult Fetch(const std::string& pool_id, const std::vector<std::string>& keys);
+  //
+  // With `options.dst_slots` key i is copied into dst_slots[i] instead, which
+  // the caller must hold; keys already in this pool are not looked up here,
+  // and nothing in this pool is evicted, indexed or changes state, so the
+  // caller may keep allocating and applying while the copy runs. With
+  // `options.probe_only` nothing is copied: `available` counts the leading
+  // keys this pool or another pool of the group holds readable.
+  FetchResult Fetch(const std::string& pool_id, const std::vector<std::string>& keys,
+                    const FetchOptions& options = {});
   Status Clear(const std::string& pool_id);
   Status Detach(const std::string& pool_id);
   std::vector<PoolStats> Stats() const;
@@ -210,6 +242,9 @@ class PoolManager {
     void* base = nullptr;
     uint64_t bytes = 0;
     ExportedMemory exported;
+    bool external = false;   // adopted, not allocated: unmap, never free
+    void* mapped = nullptr;  // what Import returned, for Unimport
+    std::string external_handle;
     Layout layout;
     bool bound = false;
     std::vector<Slot> slots;
