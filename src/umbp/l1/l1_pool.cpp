@@ -364,9 +364,9 @@ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& 
   void* mapped = nullptr;
   ExportedMemory exported;
   std::string error;
-  const bool ok = adopt ? api_->Import(device, external.handle, external.offset, &base, &mapped,
-                                       &error)
-                        : api_->Allocate(device, bytes, &base, &exported, &error);
+  const bool ok =
+      adopt ? api_->Import(device, external.handle, external.offset, &base, &mapped, &error)
+            : api_->Allocate(device, bytes, &base, &exported, &error);
   lock.lock();
   attaching_.erase(pool_id);
   if (!ok) {
@@ -621,6 +621,12 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
       }
       const Holder* source = source_of(key);
       if (source == nullptr) break;
+      if (!Fillable(*pool, pool->slots[dst])) {
+        // Allocate may regrant a slot before its owner's writes complete:
+        // owner-local reuse is ordered on that stream, but this copy is not.
+        // Stop at the landed prefix; the caller still holds every destination.
+        break;
+      }
       ++source->pool->slots[source->slot].pins;
       ++source->pool->busy;
       ++pool->busy;

@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -70,6 +71,7 @@ class RecordingApi final : public MemoryApi {
 
   bool Synchronize(int device, std::string* error) override {
     ++synchronizes;
+    if (on_synchronize) on_synchronize(device);
     return host_->Synchronize(device, error);
   }
 
@@ -79,6 +81,7 @@ class RecordingApi final : public MemoryApi {
   int frees = 0;
   int unimports = 0;
   bool fail_copies = false;
+  std::function<void(int)> on_synchronize;
 
  private:
   std::shared_ptr<MemoryApi> host_ = MakeHostMemoryApi();
@@ -350,6 +353,77 @@ TEST_F(L1PoolTest, FetchDoesNotFillASlotTheOwnerJustReleased) {
   ASSERT_TRUE(manager->Commit("p1", 100).ok);
   FetchResult fetched = manager->Fetch("p1", {"a"});
   EXPECT_EQ(fetched.slots, (std::vector<uint32_t>{all.slots[3]}));
+}
+
+TEST_F(L1PoolTest, FetchIntoDefersUntilPreviousOwnersWritesComplete) {
+  Cache(0, {"a"}, 10);
+  const uint32_t dst = manager->Allocate("p1", 1).slots.at(0);
+  Fill(1, dst, 77);
+  ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kRelease, dst, ""}}, 100).ok);
+  // Regranting is safe for the owner's own stream. It does not settle that
+  // stream for an external background fetch, which is what dst_slots starts.
+  ASSERT_EQ(manager->Allocate("p1", 1).slots, (std::vector<uint32_t>{dst}));
+  FetchOptions options;
+  options.dst_slots = {dst};
+  bool old_write_finished = false;
+  api->on_synchronize = [&](int device) {
+    if (device == 1 && !old_write_finished) {
+      Fill(1, dst, 88);  // the previous owner's queued write lands after Copy
+      old_write_finished = true;
+    }
+  };
+  FetchResult before = manager->Fetch("p1", {"a"}, options);
+  EXPECT_TRUE(before.status.ok);
+  EXPECT_TRUE(before.slots.empty());
+  EXPECT_EQ(before.copied_slots, 0u);
+  EXPECT_EQ(api->copies, 0);
+  EXPECT_FALSE(old_write_finished);
+  EXPECT_TRUE(Holds(1, dst, 77));
+  EXPECT_EQ(StatsOf("p1").held, 1u);
+
+  // Once the actual owner reports completion the caller retries the same
+  // held destination. The service never publishes/releases caller-held slots.
+  Fill(1, dst, 88);
+  old_write_finished = true;
+  ASSERT_TRUE(manager->Commit("p1", 100).ok);
+  FetchResult after = manager->Fetch("p1", {"a"}, options);
+  EXPECT_TRUE(after.status.ok);
+  EXPECT_EQ(after.slots, (std::vector<uint32_t>{dst}));
+  EXPECT_EQ(after.copied_slots, 1u);
+  EXPECT_TRUE(Holds(1, dst, 10));
+  EXPECT_EQ(StatsOf("p1").held, 1u);
+}
+
+TEST_F(L1PoolTest, FetchIntoReturnsOnlyTheLeadingSettledDestinations) {
+  Cache(0, {"a", "b", "c"}, 10);
+  const auto dst = manager->Allocate("p1", 3).slots;
+  ASSERT_EQ(dst.size(), 3u);
+  Fill(1, dst[0], 77);
+  Fill(1, dst[1], 88);
+  Fill(1, dst[2], 99);
+  ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kRelease, dst[1], ""}}, 100).ok);
+  ASSERT_EQ(manager->Allocate("p1", 1).slots, (std::vector<uint32_t>{dst[1]}));
+  FetchOptions options;
+  options.dst_slots = dst;
+  FetchResult partial = manager->Fetch("p1", {"a", "b", "c"}, options);
+  EXPECT_TRUE(partial.status.ok);
+  EXPECT_EQ(partial.slots, (std::vector<uint32_t>{dst[0]}));
+  EXPECT_EQ(partial.copied_slots, 1u);
+  EXPECT_TRUE(Holds(1, dst[0], 10));
+  EXPECT_TRUE(Holds(1, dst[1], 88));
+  // The third destination is settled, but a fetch must not skip the gap.
+  EXPECT_TRUE(Holds(1, dst[2], 99));
+  EXPECT_EQ(StatsOf("p1").held, 3u);
+  // Mirrors ATOM poll_fetches: publish only the landed prefix, release all
+  // grants, and leave the unfilled suffix invisible to prefix lookup.
+  ASSERT_TRUE(manager
+                  ->Apply("p1",
+                          {Op{OpKind::kPublish, dst[0], "a"}, Op{OpKind::kRelease, dst[0], ""},
+                           Op{OpKind::kRelease, dst[1], ""}, Op{OpKind::kRelease, dst[2], ""}},
+                          200)
+                  .ok);
+  EXPECT_EQ(StatsOf("p1").held, 0u);
+  EXPECT_EQ(StatsOf("p1").cached, 1u);
 }
 
 TEST_F(L1PoolTest, FetchedContentIsSettledForTheNextPool) {
