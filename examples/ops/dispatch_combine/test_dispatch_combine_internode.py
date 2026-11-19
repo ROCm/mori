@@ -1334,7 +1334,11 @@ class EpDispatchCombineTestCase:
             )
             d["w"] = torch.zeros(self.world_size, max_tok, k, device=self.device)
             d["s"] = torch.zeros(
-                self.world_size, max_tok, cfg.scale_dim, device=self.device
+                self.world_size,
+                max_tok,
+                cfg.scale_dim,
+                dtype=torch.uint8 if cfg.scale_type_size == 1 else torch.float32,
+                device=self.device,
             )
             recv_cnt = 0
             for r in range(self.world_size):
