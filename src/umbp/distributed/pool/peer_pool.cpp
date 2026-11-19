@@ -52,6 +52,26 @@ std::chrono::milliseconds EvictDemotionRetryBudget() {
 // Pause before a lone retry, so waiting out pressure does not spin the worker.
 constexpr std::chrono::milliseconds kEvictRetryIdlePause{20};
 
+// The most rank copies one chunk's name is expanded into.  A key is client
+// input and its world is a loop bound below, so it is capped well above any
+// TP x PP an engine runs.
+constexpr int kMaxPatternGroupWorld = 1024;
+
+// `text` as the number a client writes into a rank segment: decimal digits
+// only, with no sign, space or leading zero, and at most `limit`.  -1 for
+// anything else, so that only the spelling the siblings are rebuilt in below
+// names a group.
+int ParseRankNumber(const std::string& text, int limit) {
+  if (text.empty() || (text.size() > 1 && text[0] == '0')) return -1;
+  int value = 0;
+  for (const char c : text) {
+    if (c < '0' || c > '9') return -1;
+    value = value * 10 + (c - '0');
+    if (value > limit) return -1;
+  }
+  return value;
+}
+
 // Keys written by ATOM's umbp_store follow the convention
 //   {namespace}/w{rank}of{world}/{digest}
 // When any rank's copy is evicted, sibling copies are collected here so the
@@ -69,14 +89,8 @@ bool FindPatternSiblings(const std::string& key, std::unordered_set<std::string>
   auto of_pos = rank_world.find("of");
   if (of_pos == std::string::npos || of_pos < 2) return false;
 
-  int rank = 0;
-  int world = 0;
-  try {
-    rank = std::stoi(rank_world.substr(1, of_pos - 1));
-    world = std::stoi(rank_world.substr(of_pos + 2));
-  } catch (...) {
-    return false;
-  }
+  const int rank = ParseRankNumber(rank_world.substr(1, of_pos - 1), kMaxPatternGroupWorld);
+  const int world = ParseRankNumber(rank_world.substr(of_pos + 2), kMaxPatternGroupWorld);
   if (world <= 1 || rank < 0 || rank >= world) return false;
 
   const std::string prefix = key.substr(0, second_slash);
@@ -1309,8 +1323,11 @@ std::vector<PoolEvictResult> PeerPool::Evict(const std::vector<PoolEvictRequest>
   for (const auto& [index, backend_id] : drops) {
     if (repaired.insert(requests[index].key).second) {
       RepairAfterDropLocked(requests[index].key);
-      // If the key is now fully gone, dissolve its eviction group.
-      if (placements_.count(requests[index].key) == 0) {
+      // If the key is now fully gone, dissolve its eviction group.  Only for a
+      // copy this call freed: a discard names every backend for a key that is
+      // not stored too, and rank copies cascading from those would name each
+      // other without end.
+      if (out[index].bytes_freed > 0 && placements_.count(requests[index].key) == 0) {
         ForgetGroupMemberLocked(requests[index].key, &cascade_evict);
         // Also cascade sibling copies by key-name pattern (umbp_store convention).
         FindPatternSiblings(requests[index].key, &cascade_evict);
