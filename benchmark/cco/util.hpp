@@ -130,14 +130,11 @@ struct PerfArgs {
   bool proxy_mpsc = false;
   // proxy (-K): proxyQpsPerPeer; 0 = the engine default.
   int proxy_qps_per_peer = 0;
-  // proxy put_bw (-F): ccoProxyFenceCaller, one fence() per kernel instead of one per put.
-  bool proxy_caller_fence = false;
 };
 
 // SPSC proxy queues needed so that every issuing wavefront owns one: per block,
-// its wavefronts with warp or thread scope (ccoProxyQueuePerWave; a thread-scope
-// wavefront pushes its lanes' puts together), else 1 (ccoProxyQueuePerBlock);
-// times blocks.
+// its wavefronts with warp or thread scope (a thread-scope wavefront pushes its
+// lanes' puts together), else 1; times blocks.
 inline int ProxyUnitsPerBlock(PutScope scope, int threads_per_block, int warp_size) {
   return scope == PutScope::kWarp || scope == PutScope::kThread
              ? (threads_per_block + warp_size - 1) / warp_size

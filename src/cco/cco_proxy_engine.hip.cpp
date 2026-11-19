@@ -77,7 +77,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -102,9 +101,8 @@ constexpr int kDefaultMaxThreads = 4;
 constexpr uint32_t kSqDepth = 512;  // WRs per QP
 constexpr int kPopBatch = 64;       // callbacks run per queue per pass
 constexpr int kCqPollBatch = 32;
-constexpr uint32_t kIdlePassesBeforeSleep = 1u << 14;  // ~1-2 ms of empty passes
-constexpr size_t kScratchStride = 64;                  // per-thread atomic fetch-result slot
-constexpr uint32_t kInlineBytes = 8;                   // putValue and SignalSet write inline
+constexpr size_t kScratchStride = 64;  // per-thread atomic fetch-result slot
+constexpr uint32_t kInlineBytes = 8;   // putValue and SignalSet write inline
 
 // First error of an engine, shared by its workers.
 struct ProxyErrorState {
@@ -439,7 +437,6 @@ class ProxyWorker {
   }
 
   std::vector<ProxyQp> qps;  // [worldSize * qpsPerPeer] by (peer, slot); active for masked peers
-  int idleSleepUs{0};        // MORI_CCO_PROXY_IDLE_SLEEP_US; 0 = spin
   std::vector<OwnedQueue*> queues;  // queues this thread consumes (AddQueue)
   uint64_t scratchAddr{0};          // 8-byte host slot for atomic fetch results (discarded)
   uint32_t scratchLkey{0};
@@ -488,18 +485,7 @@ class ProxyWorker {
             (failed_ || (!inFlight && !flushPending))) {
           break;
         }
-        // Nothing in flight for a while: sleep instead of spinning (opt-in).
-        if (idleSleepUs > 0 && !inFlight && !flushPending) {
-          if (++idlePasses_ >= kIdlePassesBeforeSleep) {
-            std::this_thread::sleep_for(std::chrono::microseconds(idleSleepUs));
-            continue;
-          }
-        } else {
-          idlePasses_ = 0;
-        }
         _mm_pause();
-      } else {
-        idlePasses_ = 0;
       }
     }
   }
@@ -862,7 +848,6 @@ class ProxyWorker {
   ProxyErrorState* err_;          // the engine's
   bool abortOnError_;             // MORI_CCO_PROXY_ABORT_ON_ERROR: abort at the first error
   bool failed_{false};            // drain-and-drop
-  uint32_t idlePasses_{0};        // consecutive passes with nothing to do
   OwnedQueue* cur_{nullptr};      // queue whose callbacks are running
   std::vector<int> activePeers_;  // peers with QPs
   std::vector<int> activeQps_;    // indices in qps of every active QP
@@ -946,8 +931,6 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   const int rank = bootNet->GetLocalRank();
   engine->rank = rank;
   const bool abortOnError = env::IsEnvVarEnabled("MORI_CCO_PROXY_ABORT_ON_ERROR");
-  // MORI_CCO_PROXY_IDLE_SLEEP_US: idle threads sleep this long per pass (0 = always spin).
-  const int idleSleepUs = env::GetPositiveIntOr("MORI_CCO_PROXY_IDLE_SLEEP_US", 0);
   const int numSpsc = config.numSpscQueues;
   const int numMpsc = config.numMpscQueues;
   // Summed in 64 bits and validated below before any use as an int.
@@ -1038,7 +1021,6 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     for (int t = 0; t < numThreads; t++) {
       auto w = std::make_unique<ProxyWorker>(t, worldSize, threadQps[t], rank, &engine->err,
                                              abortOnError);
-      w->idleSleepUs = idleSleepUs;
       w->scratchAddr = reinterpret_cast<uint64_t>(engine->scratch) + t * kScratchStride;
       w->scratchLkey = scratchMr.lkey;
       engine->workers.push_back(std::move(w));

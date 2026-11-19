@@ -275,10 +275,10 @@ static bool RunOffset(mori::cco::ccoComm* comm, int dev, int rank, int nranks, s
     void* sigAlias = nullptr;
     ccoDevCommRequirements preqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
     preqs.gdaConnectionType = CCO_GDA_CONNECTION_FULL;
+    preqs.gdaContextCount = 1;
     preqs.gdaSignalCount = nranks;
     preqs.gdaCounterCount = 0;
     preqs.proxySpscQueueCount = 1;
-    preqs.proxyOnly = 1;
     ccoDevComm pdc{};
     if (ccoWindowRegister(comm, sigData, sigBytes, &sigWin, &sigAlias) != 0 ||
         ccoDevCommCreate(comm, &preqs, &pdc) != 0) {

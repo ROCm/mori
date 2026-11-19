@@ -280,8 +280,8 @@ int main(int argc, char** argv) {
     PerfFinalize(&ctx);
     return 1;
   }
-  if (args.proxy_mpsc || args.proxy_caller_fence) {
-    if (my_pe == 0) std::fprintf(stderr, "-q mpsc and -F 1 are cco_p2p_put_bw only\n");
+  if (args.proxy_mpsc) {
+    if (my_pe == 0) std::fprintf(stderr, "-q mpsc is cco_p2p_put_bw only\n");
     PerfFinalize(&ctx);
     return 1;
   }

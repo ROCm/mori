@@ -104,8 +104,6 @@ void PrintUsage(const char* program) {
                "  -q kind        proxy, put_bw: spsc (default; one queue per block, or\n"
                "                 per wavefront with -s warp|thread) | mpsc (one queue per\n"
                "                 block)\n"
-               "  -F fence       proxy, put_bw: 0 = a fence per put (default) | 1 = caller\n"
-               "                 fenced (ccoProxyFenceCaller: one fence() before the loop)\n"
                "  -h             this help\n"
                "Launch: mpirun, or one process per rank with MORI_BENCH_UID_FILE (a\n"
                "ccoUniqueId file) + MORI_BENCH_RANK / MORI_BENCH_WORLD / MORI_BENCH_LOCAL_RANK\n",
@@ -139,7 +137,7 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   };
 
   int opt = 0;
-  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:PSVQ:q:F:K:")) != -1) {
+  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:PSVQ:q:K:")) != -1) {
     switch (opt) {
       case 'h':
         return 2;
@@ -165,15 +163,6 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
       case 'K':
         out_args->proxy_qps_per_peer = std::atoi(optarg);
         if (out_args->proxy_qps_per_peer < 1) return 1;
-        break;
-      case 'F':
-        if (std::strcmp(optarg, "0") == 0) {
-          out_args->proxy_caller_fence = false;
-        } else if (std::strcmp(optarg, "1") == 0) {
-          out_args->proxy_caller_fence = true;
-        } else {
-          return 1;
-        }
         break;
       case 'q':
         if (std::strcmp(optarg, "spsc") == 0) {
@@ -515,7 +504,6 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
       PerfFinalize(ctx);
       return 1;
 #endif
-      reqs.proxyOnly = 1;  // no GDA QPs: ccoProxy only borrows the signal slots
       if (args.proxy_mpsc) {
         reqs.proxyMpscQueueCount = args.nblocks;
       } else {
@@ -588,11 +576,10 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     } else if (args.transport == Transport::kProxy) {
       std::printf(
           "[cco-bench] transport = PROXY (RDMA via ccoProxy: %d %s KIWI queues, %d host proxy "
-          "threads; QPs per peer %s; fence %s; gdaConnType=%d)\n",
+          "threads; QPs per peer %s; gdaConnType=%d)\n",
           ctx->devComm.proxy.numSpscQueues + ctx->devComm.proxy.numMpscQueues,
           args.proxy_mpsc ? "MPSC" : "SPSC", args.proxy_threads,
           args.proxy_qps_per_peer > 0 ? std::to_string(args.proxy_qps_per_peer).c_str() : "default",
-          args.proxy_caller_fence ? "caller" : "each op",
           static_cast<int>(ctx->devComm.gdaConnType));
     } else {
       std::printf(

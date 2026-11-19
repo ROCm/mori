@@ -538,8 +538,6 @@ struct ccoDevCommRequirements {
   // queues starts its own busy-polling threads, pinned by the same policy
   // (MORI_CCO_PROXY_CPUS or the GPU-local cores), so several such DevComms
   // oversubscribe the same CPUs; prefer one per comm.
-  // ccoProxyQueuePerWave needs blocks * wavefronts per block SPSC queues,
-  // ccoProxyQueuePerBlock one per block.
   int proxySpscQueueCount;  // 0 = no SPSC pool
   int proxyMpscQueueCount;  // 0 = no MPSC pool
   int proxyThreadCount;     // host proxy threads (0 = 4), capped at the total queue count
@@ -553,12 +551,6 @@ struct ccoDevCommRequirements {
   // let NICs that serve each QP serially (e.g. ionic) run a thread's queues in
   // parallel; the default 4 does no harm on mlx5. Same on every rank.
   int proxyQpsPerPeer;
-  // 1: a proxy-only DevComm. No GDA QPs are created (gdaContextCount is
-  // ignored, ibgda.numQpPerPe = 0); the peer set, signal / counter slots and
-  // window MRs ccoProxy uses stay. ccoGda on it traps. Needs proxy queues, and
-  // railGdaBarrierCount / barrierCount must be 0 when there are cross-node
-  // peers. Same on every rank.
-  int proxyOnly;
 };
 
 #define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                   \
@@ -582,7 +574,6 @@ struct ccoDevCommRequirements {
       0,                                         /* proxyThreadCount   */       \
       0,                                         /* proxyQueueCapacity */       \
       0,                                         /* proxyQpsPerPeer    */       \
-      0,                                         /* proxyOnly          */       \
   }
 
 /* ════════════════════════════════════════════════════════════════════════════

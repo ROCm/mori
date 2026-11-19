@@ -48,11 +48,6 @@
 //   kernel_payload every wavefront of a 4-wavefront block writes part of the
 //                  chunk, then the block puts it (ccoCoopBlock): the put's
 //                  fence must publish stores of the non-issuing wavefronts
-//   caller_fence,  ccoProxyFenceCaller handles (SPSC ccoCoopBlock, MPSC
-//   mpsc_caller    ccoCoopWarp): the block writes the chunk as in
-//                  kernel_payload, calls fence() once, then puts it as
-//                  kFencePieces puts per peer (the last carrying SignalInc)
-//                  and flushes
 //   block_2d_flush flush_count and mpsc_payload with ccoCoopBlock in 32x4 blocks
 //   block_2d_payload (wavefront 0 is linear threads 0..63); flushDone advances
 //                  by exactly one per flush
@@ -82,26 +77,6 @@
 //                  ccoCoopWarp puts on per-wavefront handles, one
 //                  flush(ccoCoopBlock) (flushDone +1 on every queue), then the
 //                  block overwrites every source before the signals
-//   block_flush_async  block_flush with flushAsync + wait (ccoCoopBlock), each
-//                  wavefront holding its own queue's request
-//   async_reverse, put half the chunk, flushAsync, the other half, flushAsync,
-//   block_async,   wait for the second request and then the first (with a
-//   mpsc_async     timeout, must return 0); SPSC flushDone +2. Then the
-//                  sources are overwritten and a SignalSet tells the peer.
-//                  ccoCoopWarp, ccoCoopBlock, and MPSC (4 blocks per queue)
-//   async_forward, the same puts and requests, but wait for the first request
-//   mpsc_async_forward  and overwrite only the first half's sources while the
-//                  second FLUSH may be outstanding, then the second
-//   counter,       the same puts, then counter(CounterInc{unit}) and
-//   mpsc_counter   waitCounter: the counter reads exactly 1 (SPSC flushDone +1)
-//   counter_wave   counter with wavefront 0 doing the puts and counter() while
-//                  wavefront 1 waits for the count and overwrites the sources
-//   selector_wave, ccoProxyQueuePerWave with ccoCoopWarp (2 blocks of 32x4) and
-//   selector_block ccoProxyQueuePerBlock with ccoCoopBlock (2x2 blocks): the
-//                  handle's queue is the unit's linear id; put + SignalSet
-//   only_set_put,  set_put and put_sig_warp on a proxy-only DevComm
-//   only_put_sig   (ccoDevCommRequirements::proxyOnly) created for them, which
-//                  must have no GDA QPs (numQpPerPe 0, no endpoints)
 //   small_spsc,    on a second DevComm whose rings hold kSmallCapacity lines:
 //   small_mpsc     each unit sends its chunk as kPieces puts per peer (the
 //                  last carrying the signal), so every ring wraps many times
@@ -148,8 +123,7 @@
 //                  kThreadCapacity lines: rings wrap, SPSC lane-masked pushes
 //                  retry for credit, MPSC claims wait
 //
-// The atomic-free cases (value_set .. selector_block, only_set_put) run first;
-// only_put_sig runs right after only_set_put.
+// The atomic-free cases (value_set .. mpsc_set_put) run first.
 // MORI_CCO_PROXY_TEST_CASES=<list> runs only the listed positive cases, where
 // "atomic_free" stands for all of them: for NICs whose atomics into GPU memory
 // fail (the first atomic case would fail the shared DevComm and trap).
@@ -158,28 +132,21 @@
 // "n1,n3"). They run after the positive cases, each on a DevComm of its own,
 // and put_sig_after (a put_sig_warp case) then runs on the first DevComm:
 //   n1  rank 0 puts past the end of peer 1's window, then flush(coop,
-//       timeout) returns 2 twice, failed() is true, and a flushAsync +
-//       wait(request, coop, timeout) returns 2; ccoDevCommGetError
+//       timeout) returns 2 twice and failed() is true; ccoDevCommGetError
 //       reports COMPLETION / IBV_WC_REM_ACCESS_ERR for peer 1, stderr gets
 //       exactly one error line, and ccoDevCommDestroy returns 0
 //   n2  every rank puts to itself, which has no proxy QP: as n1, but
 //       BAD_REQUEST naming the rank itself
 //   n3  put to every peer, then flush(coop, 100 cycles) returns 1, a void
-//       flush still completes, and flush(coop, long timeout) returns 0; then
-//       a second put round and flushAsync: wait(request, coop, 100 cycles)
-//       returns 1 and wait(request, coop, long timeout) 0. SPSC flushDone
-//       advances by exactly 4 (ccoCoopBlock), MPSC with 4 blocks per queue
-//       (ccoCoopWarp), where the 100-cycle flush or wait may also return 0
-//       (a later ticket's FLUSH can cover it first)
+//       flush still completes, and flush(coop, long timeout) returns 0. SPSC
+//       flushDone advances by exactly 3 (ccoCoopBlock), MPSC with 4 blocks per
+//       queue (ccoCoopWarp), where the 100-cycle flush may also return 0 (a
+//       later ticket's FLUSH can cover it first)
 //   n4  MORI_CCO_PROXY_TEST_FAIL_CONNECT=1: ccoDevCommCreate fails on every
 //       rank, and the comm still works afterwards
 //   n5  MORI_CCO_PROXY_QPS_PER_PEER differs between ranks (1 on rank 0, 2
 //       elsewhere): ccoDevCommCreate fails on every rank, and the comm still
 //       works afterwards
-//   n6  proxyOnly on rank 0 only: fails on every rank, as n5
-//   n7  proxyOnly without proxy queues: fails on every rank, as n5
-//   n8  proxyOnly with barrierCount 1: fails on every rank with cross-node
-//       peers (no GDA QPs for the barrier), succeeds on a single node
 //
 // Launch: `mpirun -np N test_proxy_put` (one rank per MPI process, any number
 // of nodes; built with MORI_WITH_MPI when WITH_MPI=ON), or `test_proxy_put [N]`
@@ -211,7 +178,6 @@ static constexpr size_t kStressChunk = 16 * 1024;
 static constexpr int kSmallCapacity = 16;  // ring lines: a put + signal takes 2
 static constexpr int kPieces = 64;         // puts per chunk in the small-ring cases
 static constexpr int kSqRepeats = 2048;    // puts per peer in sq_full (SQ depth: 512)
-static constexpr int kFencePieces = 4;     // puts per chunk in the caller-fenced cases
 static constexpr int kQpsPerPeer = 3;      // dcQps, per (thread, peer): one per queue of a thread
 static constexpr uint32_t kClobber = 0xdeadbeefu;
 
@@ -223,8 +189,7 @@ enum PutMode {
   kPutFlushClobber,   // put, flush, overwrite the source, signal()
   kPutKernelPayload,  // the block writes the source, then put carrying SignalInc
   kPutRepeat,         // kSqRepeats puts of the same chunk, the last carrying SignalInc
-  kPutPieces,         // kPieces puts per chunk, the last carrying SignalInc
-  kPutCallerFence     // the block writes the source, fence(), kFencePieces puts, flush
+  kPutPieces          // kPieces puts per chunk, the last carrying SignalInc
 };
 
 __host__ __device__ inline uint32_t Pattern(uint32_t salt, int src, int dst, int u, size_t i) {
@@ -257,7 +222,7 @@ __device__ inline bool WaitFlag(P& proxy, const uint64_t* flag, uint64_t least) 
 
 // Block u = unit u on queue u (MPSC: modulo the pool). Sends one chunk to every peer,
 // then waits for every sender's chunk on this unit (signal slot or flag word).
-template <typename Q, typename Coop, int Mode, ccoProxyFenceMode F = ccoProxyFenceEachOp>
+template <typename Q, typename Coop, int Mode>
 __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
                                ccoWindow_t flagWin, uint32_t* sendLocal, uint64_t* flagLocal,
                                uint32_t salt, size_t chunk, int nUnits, int* err) {
@@ -267,11 +232,11 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
   // Linear thread id: the block may be 2-D (block_2d_*).
   const int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
   const int nThreads = blockDim.x * blockDim.y * blockDim.z;
-  ccoProxy<Q, F> proxy{dc, u};
+  ccoProxy<Q> proxy{dc, u};
   auto srcOff = [&](int p) { return (static_cast<size_t>(p) * nUnits + u) * chunk; };
   const size_t dstOff = (static_cast<size_t>(me) * nUnits + u) * chunk;
-  if constexpr (Mode == kPutKernelPayload || Mode == kPutCallerFence) {
-    // Every thread of the block writes the chunks; put() (or fence()) publishes them.
+  if constexpr (Mode == kPutKernelPayload) {
+    // Every thread of the block writes the chunks; put() publishes them.
     for (int p = 0; p < n; p++) {
       if (p == me) continue;
       uint32_t* src = sendLocal + srcOff(p) / sizeof(uint32_t);
@@ -279,7 +244,6 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
         src[i] = Pattern(salt, me, p, u, i);
       }
     }
-    if constexpr (Mode == kPutCallerFence) proxy.fence(Coop{});
   }
   for (int p = 0; p < n; p++) {
     if (p == me) continue;
@@ -295,14 +259,13 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
       }
       proxy.put(p, recvWin, dstOff, sendWin, srcOff(p), chunk, ccoGda_SignalInc{Slot(me, u)},
                 Coop{});
-    } else if constexpr (Mode == kPutPieces || Mode == kPutCallerFence) {
-      constexpr int kN = Mode == kPutPieces ? kPieces : kFencePieces;
-      const size_t piece = chunk / kN;
-      for (int k = 0; k < kN - 1; k++) {
+    } else if constexpr (Mode == kPutPieces) {
+      const size_t piece = chunk / kPieces;
+      for (int k = 0; k < kPieces - 1; k++) {
         proxy.put(p, recvWin, dstOff + k * piece, sendWin, srcOff(p) + k * piece, piece,
                   ccoGda_NoSignal{}, Coop{});
       }
-      const size_t last = (kN - 1) * piece;
+      const size_t last = (kPieces - 1) * piece;
       proxy.put(p, recvWin, dstOff + last, sendWin, srcOff(p) + last, chunk - last,
                 ccoGda_SignalInc{Slot(me, u)}, Coop{});
     } else {
@@ -312,7 +275,6 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
       }
     }
   }
-  if constexpr (Mode == kPutCallerFence) proxy.flush(Coop{});
   if constexpr (Mode == kPutFlushCount) {
     uint64_t before = 0;
     if constexpr (ccoProxy<Q>::kSpsc) {
@@ -846,7 +808,6 @@ __global__ void ProxyHandoffKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow
 static constexpr int kBlockFlushWaves = 4;
 static_assert(kBlockFlushWaves <= kSpscQueues, "a queue per wavefront");
 
-template <bool kAsync>
 __global__ void ProxyBlockFlushKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
                                       uint32_t* sendLocal, size_t chunk, int* err) {
   const int w = threadIdx.x / 64;
@@ -863,18 +824,12 @@ __global__ void ProxyBlockFlushKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
     proxy.put(p, recvWin, srcOff(me, w), sendWin, srcOff(p, w), chunk, ccoGda_NoSignal{},
               ccoCoopWarp{});
   }
-  if constexpr (kAsync) {
-    ccoGdaRequest_t req;  // per wavefront: its own queue's
-    proxy.flushAsync(0, &req, ccoCoopBlock{});
-    proxy.wait(req, ccoCoopBlock{});
-  } else {
-    proxy.flush(ccoCoopBlock{});
-  }
+  proxy.flush(ccoCoopBlock{});
   const uint64_t after =
       __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
   if (__lane_id() == 0 && after != before + 1) {
-    printf("[rank %d] block_flush%s: wave %d flushDone %llu -> %llu\n", me, kAsync ? "_async" : "",
-           w, (unsigned long long)before, (unsigned long long)after);
+    printf("[rank %d] block_flush: wave %d flushDone %llu -> %llu\n", me, w,
+           (unsigned long long)before, (unsigned long long)after);
     atomicExch(err, 1);
   }
   // Every wavefront's puts completed: overwrite all of the block's sources.
@@ -895,212 +850,27 @@ __global__ void ProxyBlockFlushKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
   }
 }
 
-// Queue selectors: unit u is a wavefront (ccoProxyQueuePerWave) or a block
-// (ccoProxyQueuePerBlock), counted by linear id over a 2-D grid of 2-D blocks.
-// The handle's queue must be u; then the unit puts its chunk to every peer
-// carrying SignalSet{Slot(me, u), 1} (atomic-free) and waits for every sender's.
-// A unit given the wrong queue reports it and only sends the SignalSets, on a
-// handle of queue u, so its peers do not hang.
-template <typename Coop, bool kPerWave>
-__global__ void ProxySelectorKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
-                                    size_t chunk, int nUnits, int* err) {
-  const int me = dc.rank;
-  const int n = dc.worldSize;
-  const int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
-  const int nThreads = blockDim.x * blockDim.y * blockDim.z;
-  const int block = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
-  const int u = kPerWave ? block * ((nThreads + 63) / 64) + tid / 64 : block;
-  auto body = [&](auto& proxy) {
-    if (proxy.queueId != static_cast<uint32_t>(u)) {
-      if (tid % 64 == 0) {
-        printf("[rank %d] selector: unit %d got queue %u\n", me, u, proxy.queueId);
-        atomicExch(err, 1);
-      }
-      ccoProxy<> own{dc, u};  // the wrong handle never pushes
-      for (int p = 0; p < n; p++) {
-        if (p != me) own.signal(p, ccoGda_SignalSet{Slot(me, u), 1}, Coop{});
-      }
-    } else {
-      const size_t dstOff = (static_cast<size_t>(me) * nUnits + u) * chunk;
-      for (int p = 0; p < n; p++) {
-        if (p == me) continue;
-        proxy.put(p, recvWin, dstOff, sendWin, (static_cast<size_t>(p) * nUnits + u) * chunk, chunk,
-                  ccoGda_SignalSet{Slot(me, u), 1}, Coop{});
-      }
-    }
-    for (int s = 0; s < n; s++) {
-      if (s != me) proxy.waitSignal(Slot(s, u), 1, Coop{});
-    }
-  };
-  if constexpr (kPerWave) {
-    ccoProxy<> proxy{dc, ccoProxyQueuePerWave};
-    body(proxy);
-  } else {
-    ccoProxy<> proxy{dc, ccoProxyQueuePerBlock};
-    body(proxy);
-  }
-}
-
 // Long enough for any proxy answer, short enough not to hang.
 static constexpr uint64_t kNegTimeoutCycles = 40ull * 1000 * 1000 * 1000;
 
-// flushAsync / wait and counter(). Unit u (queue u; MPSC: modulo the pool)
-// puts the first half of its chunk to every peer, then
-//   kAsyncReverse:     flushAsync (r1), the second half, flushAsync (r2),
-//                      wait(r2), then wait(r1, coop, timeout), which must
-//                      return 0;
-//   kAsyncForward:     flushAsync (r1), the second half, flushAsync (r2),
-//                      wait(r1) and overwrite only the first half's sources,
-//                      then wait(r2) and overwrite the second half's;
-//   kAsyncCounter:     the second half, counter(CounterInc{u}), waitCounter(u,
-//                      1), and the counter must read exactly 1;
-//   kAsyncCounterWave: as kAsyncCounter in wavefront 0 (ccoCoopWarp, 128-thread
-//                      blocks), while wavefront 1 does the waitCounter and
-//                      overwrites the sources, without a block barrier between.
-// SPSC: flushDone advances by exactly 2 (1 for the counter modes). The sources
-// are then overwritten (if not yet) and Slot(me, u) set to 1 on every peer
-// (SignalSet, atomic-free); the host checks that the original data arrived.
-enum AsyncMode { kAsyncReverse, kAsyncForward, kAsyncCounter, kAsyncCounterWave };
-
-template <typename Q, typename Coop, int Mode>
-__global__ void ProxyAsyncKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
-                                 uint32_t* sendLocal, size_t chunk, int nUnits, int* err) {
-  static_assert(Mode != kAsyncCounterWave || std::is_same_v<Coop, ccoCoopWarp>,
-                "kAsyncCounterWave: one wavefront pushes");
-  constexpr bool kCounter = Mode == kAsyncCounter || Mode == kAsyncCounterWave;
-  const int u = blockIdx.x;
-  const int me = dc.rank;
-  const int n = dc.worldSize;
-  const int tid = threadIdx.x;
-  // kAsyncCounterWave: only wavefront 0 pushes (wavefront 1's handle stays clean).
-  const bool pusher = Mode != kAsyncCounterWave || tid < 64;
-  ccoProxy<Q> proxy{dc, u};
-  auto srcOff = [&](int p) { return (static_cast<size_t>(p) * nUnits + u) * chunk; };
-  const size_t dstOff = (static_cast<size_t>(me) * nUnits + u) * chunk;
-  const size_t half = chunk / 2;
-  uint64_t before = 0;
-  if constexpr (ccoProxy<Q>::kSpsc) {
-    before = __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-  }
-  if constexpr (kCounter) {
-    if (tid == 0) proxy.resetCounter(u);
-    __syncthreads();
-  }
-  auto putHalf = [&](size_t at, size_t bytes) {
-    for (int p = 0; p < n; p++) {
-      if (p != me) {
-        proxy.put(p, recvWin, dstOff + at, sendWin, srcOff(p) + at, bytes, ccoGda_NoSignal{},
-                  Coop{});
-      }
-    }
-  };
-  // Overwrite [at, at + bytes) of every peer's source, threads first..blockDim-1.
-  auto clobber = [&](size_t at, size_t bytes, int first) {
-    for (int p = 0; p < n; p++) {
-      if (p == me) continue;
-      uint32_t* src = sendLocal + (srcOff(p) + at) / sizeof(uint32_t);
-      for (size_t i = tid - first; i < bytes / sizeof(uint32_t); i += blockDim.x - first) {
-        src[i] = kClobber;
-      }
-    }
-  };
-  auto checkCounter = [&] {
-    if (__lane_id() == 0 && proxy.readCounter(u) != 1) {
-      printf("[rank %d] counter: unit %d reads %llu, want 1\n", me, u,
-             (unsigned long long)proxy.readCounter(u));
-      atomicExch(err, 1);
-    }
-  };
-  if (pusher) putHalf(0, half);
-  if constexpr (Mode == kAsyncReverse || Mode == kAsyncForward) {
-    ccoGdaRequest_t r1, r2;
-    proxy.flushAsync(0, &r1, Coop{});
-    putHalf(half, chunk - half);
-    proxy.flushAsync(0, &r2, Coop{});
-    if constexpr (Mode == kAsyncReverse) {
-      proxy.wait(r2, Coop{});
-      const int rc = proxy.wait(r1, Coop{}, kNegTimeoutCycles);
-      if (tid == 0 && rc != 0) {
-        printf("[rank %d] async: unit %d wait(r1) returned %d\n", me, u, rc);
-        atomicExch(err, 1);
-      }
-      clobber(0, chunk, 0);
-    } else {
-      // The second half may still be in flight: only the first half is reusable.
-      proxy.wait(r1, Coop{});
-      clobber(0, half, 0);
-      proxy.wait(r2, Coop{});
-      clobber(half, chunk - half, 0);
-    }
-  } else if constexpr (Mode == kAsyncCounter) {
-    putHalf(half, chunk - half);
-    proxy.counter(ccoGda_CounterInc{static_cast<ccoGdaCounter_t>(u)}, Coop{});
-    proxy.waitCounter(u, 1, Coop{});
-    if (tid < 64) checkCounter();
-    clobber(0, chunk, 0);
-  } else {
-    if (pusher) {
-      putHalf(half, chunk - half);
-      proxy.counter(ccoGda_CounterInc{static_cast<ccoGdaCounter_t>(u)}, ccoCoopWarp{});
-    } else {
-      // The documented consumer: another wavefront sees the count, then reuses.
-      proxy.waitCounter(u, 1, ccoCoopWarp{});
-      checkCounter();
-      clobber(0, chunk, 64);
-    }
-  }
-  if constexpr (ccoProxy<Q>::kSpsc) {
-    const uint64_t after =
-        __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    const uint64_t want = before + (kCounter ? 1 : 2);
-    if (tid == 0 && after != want) {
-      printf("[rank %d] async: unit %d flushDone %llu -> %llu, want %llu\n", me, u,
-             (unsigned long long)before, (unsigned long long)after, (unsigned long long)want);
-      atomicExch(err, 1);
-    }
-  }
-  __threadfence_system();
-  __syncthreads();
-  if (pusher) {
-    for (int p = 0; p < n; p++) {
-      if (p != me) proxy.signal(p, ccoGda_SignalSet{Slot(me, u), 1}, Coop{});
-    }
-  }
-  // waitSignal consumes: with two wavefronts (kAsyncCounterWave) one waiter per block.
-  for (int s = 0; s < n; s++) {
-    if (s == me) continue;
-    if constexpr (Mode == kAsyncCounterWave) {
-      proxy.waitSignal(Slot(s, u), 1, ccoCoopBlock{});
-    } else {
-      proxy.waitSignal(Slot(s, u), 1, Coop{});
-    }
-  }
-}
-
 // n1 / n2: one wavefront puts `bytes` to `peer`, then flushes twice with a
-// timeout, then flushAsync + wait with a timeout.
-// res = {first flush, second flush, failed(), wait}.
+// timeout. res = {first flush, second flush, failed()}.
 __global__ void ProxyFailKernel(ccoDevComm dc, int peer, ccoWindow_t dstWin, size_t dstOffset,
                                 ccoWindow_t srcWin, size_t bytes, int* res) {
   ccoProxy<> proxy{dc, 0};
   proxy.put(peer, dstWin, dstOffset, srcWin, 0, bytes, ccoGda_NoSignal{}, ccoCoopWarp{});
   const int first = proxy.flush(ccoCoopWarp{}, kNegTimeoutCycles);
   const int second = proxy.flush(ccoCoopWarp{}, kNegTimeoutCycles);
-  ccoGdaRequest_t req;
-  proxy.flushAsync(0, &req, ccoCoopWarp{});
-  const int waited = proxy.wait(req, ccoCoopWarp{}, kNegTimeoutCycles);
   if (__lane_id() == 0) {
     res[0] = first;
     res[1] = second;
     res[2] = proxy.failed() ? 1 : 0;
-    res[3] = waited;
   }
 }
 
 // n3: block u (queue u, MPSC: modulo the pool) puts its chunk to every peer,
 // then flushes with a timeout the proxy cannot meet, without one, and with a
-// long one; then puts again and waits a flushAsync request with the short and
-// the long timeout. Every thread checks the results it got.
+// long one. Every thread checks the results it got.
 template <typename Q, typename Coop>
 __global__ void ProxyTimeoutKernel(ccoDevComm dc, ccoWindow_t dstWin, ccoWindow_t srcWin,
                                    size_t chunk, int* err) {
@@ -1119,31 +889,20 @@ __global__ void ProxyTimeoutKernel(ccoDevComm dc, ccoWindow_t dstWin, ccoWindow_
   const int timedOut = proxy.flush(Coop{}, 100);
   proxy.flush(Coop{});
   const int done = proxy.flush(Coop{}, kNegTimeoutCycles);
-  for (int p = 0; p < n; p++) {
-    if (p != me) proxy.put(p, dstWin, off, srcWin, off, chunk, ccoGda_NoSignal{}, Coop{});
-  }
-  ccoGdaRequest_t req;
-  proxy.flushAsync(0, &req, Coop{});
-  const int waitTimedOut = proxy.wait(req, Coop{}, 100);
-  const int waitDone = proxy.wait(req, Coop{}, kNegTimeoutCycles);
   // MPSC: another block's later-ticket FLUSH may already cover ours.
-  auto shortOk = [](int rc) { return rc == 1 || (!ccoProxy<Q>::kSpsc && rc == 0); };
-  if (!shortOk(timedOut) || done != 0 || !shortOk(waitTimedOut) || waitDone != 0 ||
-      proxy.failed()) {
+  const bool shortOk = timedOut == 1 || (!ccoProxy<Q>::kSpsc && timedOut == 0);
+  if (!shortOk || done != 0 || proxy.failed()) {
     if (__lane_id() == 0) {
-      printf(
-          "[rank %d] n3: unit %d wave %d: flush(100) = %d, flush(long) = %d, wait(100) = %d, "
-          "wait(long) = %d, failed %d\n",
-          me, u, static_cast<int>(threadIdx.x) / 64, timedOut, done, waitTimedOut, waitDone,
-          proxy.failed() ? 1 : 0);
+      printf("[rank %d] n3: unit %d wave %d: flush(100) = %d, flush(long) = %d, failed %d\n", me, u,
+             static_cast<int>(threadIdx.x) / 64, timedOut, done, proxy.failed() ? 1 : 0);
     }
     atomicExch(err, 1);
   }
   if constexpr (ccoProxy<Q>::kSpsc) {
     const uint64_t after =
         __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    if (threadIdx.x == 0 && after != before + 4) {
-      printf("[rank %d] n3: unit %d flushDone %llu -> %llu, want +4\n", me, u,
+    if (threadIdx.x == 0 && after != before + 3) {
+      printf("[rank %d] n3: unit %d flushDone %llu -> %llu, want +3\n", me, u,
              (unsigned long long)before, (unsigned long long)after);
       atomicExch(err, 1);
     }
@@ -1159,13 +918,8 @@ __global__ void ProxyResetKernel(ccoDevComm dc, int nSlots) {
 
 // Positive cases that use no NIC atomics (MORI_CCO_PROXY_TEST_CASES=atomic_free).
 static const char* const kAtomicFreeCases[] = {
-    "value_set",           "block_value_set", "lane_value_set",
-    "mpsc_lane_value_set", "set_put",         "set_signal",
-    "set_window",          "mpsc_set_put",    "async_reverse",
-    "block_async",         "mpsc_async",      "async_forward",
-    "mpsc_async_forward",  "counter",         "mpsc_counter",
-    "counter_wave",        "selector_wave",   "selector_block",
-    "only_set_put"};
+    "value_set", "block_value_set", "lane_value_set", "mpsc_lane_value_set",
+    "set_put",   "set_signal",      "set_window",     "mpsc_set_put"};
 
 // MORI_CCO_PROXY_TEST_CASES (same on every rank): unset runs every positive
 // case; else a comma-separated list of case names, where "atomic_free" stands
@@ -1271,15 +1025,14 @@ struct Ctx {
 
 // maxPutBytes != 0 lowers the DevComm's put split size (a kernel-argument copy;
 // the proxy posts any size up to the real limit), so put() splits.
-template <typename Q, typename Coop, int Mode, ccoProxyFenceMode F = ccoProxyFenceEachOp>
+template <typename Q, typename Coop, int Mode>
 static int RunPutCase(Ctx& c, const char* name, uint32_t salt, size_t chunk, int nUnits,
                       dim3 blockDim, const ccoDevComm* dev = nullptr, uint64_t maxPutBytes = 0) {
   if (!CaseSelected(name)) return 0;
   ccoDevComm d = dev ? *dev : c.dc;
   if (maxPutBytes != 0) d.proxy.maxPutBytes = maxPutBytes;
-  c.Fresh(d, salt, chunk, nUnits,
-          /*fillSend=*/Mode != kPutKernelPayload && Mode != kPutCallerFence);
-  ProxyPutKernel<Q, Coop, Mode, F><<<nUnits, blockDim, 0, c.stream>>>(
+  c.Fresh(d, salt, chunk, nUnits, /*fillSend=*/Mode != kPutKernelPayload);
+  ProxyPutKernel<Q, Coop, Mode><<<nUnits, blockDim, 0, c.stream>>>(
       d, c.sendWin, c.recvWin, c.flagWin, static_cast<uint32_t*>(c.sendBuf),
       static_cast<uint64_t*>(c.flagBuf), salt, chunk, nUnits, c.dErr);
   c.Sync();
@@ -1338,60 +1091,13 @@ static int RunStressCase(Ctx& c) {
   return c.Verify("mpsc_stress", 10, kStressChunk, nUnits);
 }
 
-template <bool kAsync>
-static int RunBlockFlushCase(Ctx& c, const char* name, uint32_t salt) {
-  if (!CaseSelected(name)) return 0;
-  c.Fresh(c.dc, salt, kChunk, kBlockFlushWaves);
-  ProxyBlockFlushKernel<kAsync><<<1, kBlockFlushWaves * 64, 0, c.stream>>>(
+static int RunBlockFlushCase(Ctx& c) {
+  if (!CaseSelected("block_flush")) return 0;
+  c.Fresh(c.dc, /*salt=*/40, kChunk, kBlockFlushWaves);
+  ProxyBlockFlushKernel<<<1, kBlockFlushWaves * 64, 0, c.stream>>>(
       c.dc, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf), kChunk, c.dErr);
   c.Sync();
-  return c.Verify(name, salt, kChunk, kBlockFlushWaves);
-}
-
-template <typename Coop, bool kPerWave>
-static int RunSelectorCase(Ctx& c, const char* name, uint32_t salt, dim3 grid, dim3 block) {
-  if (!CaseSelected(name)) return 0;
-  const int nUnits = static_cast<int>(grid.x * grid.y * grid.z) *
-                     (kPerWave ? static_cast<int>(block.x * block.y * block.z + 63) / 64 : 1);
-  c.Fresh(c.dc, salt, kChunk, nUnits);
-  ProxySelectorKernel<Coop, kPerWave>
-      <<<grid, block, 0, c.stream>>>(c.dc, c.sendWin, c.recvWin, kChunk, nUnits, c.dErr);
-  c.Sync();
-  return c.Verify(name, salt, kChunk, nUnits);
-}
-
-template <typename Q, typename Coop, int Mode>
-static int RunAsyncCase(Ctx& c, const char* name, uint32_t salt, int nUnits, int blockDim) {
-  if (!CaseSelected(name)) return 0;
-  c.Fresh(c.dc, salt, kChunk, nUnits);
-  ProxyAsyncKernel<Q, Coop, Mode><<<nUnits, blockDim, 0, c.stream>>>(
-      c.dc, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf), kChunk, nUnits, c.dErr);
-  c.Sync();
-  return c.Verify(name, salt, kChunk, nUnits);
-}
-
-// only_*: on a proxy-only DevComm of their own, live for these cases only (its
-// proxy threads would otherwise poll through every other case).
-static int RunProxyOnlyCases(Ctx& c, const ccoDevCommRequirements& reqs) {
-  if (!CaseSelected("only_set_put") && !CaseSelected("only_put_sig")) return 0;
-  ccoDevCommRequirements onlyReqs = reqs;
-  onlyReqs.proxyOnly = 1;
-  ccoDevComm d{};
-  if (ccoDevCommCreate(c.comm, &onlyReqs, &d) != 0) {
-    fprintf(stderr, "[rank %d] proxy-only DevCommCreate failed\n", c.rank);
-    return c.Harvest("only_create", 1);
-  }
-  const bool noQps = d.ibgda.numQpPerPe == 0 && d.ibgda.endpoints == nullptr;
-  if (!noQps) {
-    fprintf(stderr, "[rank %d] proxy-only DevComm has GDA QPs (numQpPerPe %d)\n", c.rank,
-            d.ibgda.numQpPerPe);
-  }
-  int fails = c.Harvest("only_no_qps", !noQps);
-  fails += RunSetCase<SPSCD2HQueue, kSetSlot>(c, "only_set_put", 55, kSpscQueues, &d);
-  fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "only_put_sig", 56, kChunk,
-                                                             kSpscQueues, 64, &d);
-  if (ccoDevCommDestroy(c.comm, &d) != 0) fails += c.Harvest("only_destroy", 1);
-  return fails;
+  return c.Verify("block_flush", 40, kChunk, kBlockFlushWaves);
 }
 
 static int RunHandoffCase(Ctx& c) {
@@ -1457,8 +1163,8 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
   }
   const bool fails = selfPut || c.rank == 0;  // ranks whose DevComm must fail
   int* dRes = nullptr;
-  HIP_CHECK(hipMalloc(&dRes, 4 * sizeof(int)));
-  HIP_CHECK(hipMemset(dRes, 0xff, 4 * sizeof(int)));
+  HIP_CHECK(hipMalloc(&dRes, 3 * sizeof(int)));
+  HIP_CHECK(hipMemset(dRes, 0xff, 3 * sizeof(int)));
   StderrCapture capture;
   if (fails) capture.Start();
   ccoBarrierAll(c.comm);
@@ -1468,7 +1174,7 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
     ProxyFailKernel<<<1, 64, 0, c.stream>>>(d, 1, c.recvWin, c.bufSize, c.sendWin, 4096, dRes);
   }
   HIP_CHECK(hipStreamSynchronize(c.stream));
-  int res[4];
+  int res[3];
   HIP_CHECK(hipMemcpy(res, dRes, sizeof(res), hipMemcpyDeviceToHost));
   HIP_CHECK(hipFree(dRes));
   ccoDevCommError e{};
@@ -1477,7 +1183,7 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
   if (fails) {
     PrintError(c.rank, name, got, e);
     const int wantPeer = selfPut ? c.rank : 1;
-    bad |= res[0] != 2 || res[1] != 2 || res[2] != 1 || res[3] != 2;
+    bad |= res[0] != 2 || res[1] != 2 || res[2] != 1;
     bad |= got != 1 || e.rank != c.rank || e.peer != wantPeer || e.queue != 0;
     if (selfPut) {
       bad |= e.code != CCO_PROXY_ERR_BAD_REQUEST || e.op != ccoProxyOpPut;
@@ -1486,8 +1192,8 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
              e.op != IBV_WR_RDMA_WRITE || e.raddr != c.bufSize || e.len != 4096;
     }
     if (bad) {
-      printf("[rank %d]   %s: flush returned %d then %d, failed() %d, wait %d\n", c.rank, name,
-             res[0], res[1], res[2], res[3]);
+      printf("[rank %d]   %s: flush returned %d then %d, failed() %d\n", c.rank, name, res[0],
+             res[1], res[2]);
     }
   } else if (got != 0) {
     PrintError(c.rank, name, got, e);  // e.g. a responder-side error; not checked
@@ -1566,45 +1272,6 @@ static bool NegativeSelected(const char* name) {
   return list.find(std::string(",") + name + ",") != std::string::npos;
 }
 
-// n6..n8: ccoDevCommCreate with r must fail on every rank (n8 on a single
-// node: succeed); Harvest's barrier checks the comm still works.
-static int RunCreateFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r,
-                             bool wantFail) {
-  ccoDevComm d{};
-  const int rc = ccoDevCommCreate(c.comm, &r, &d);
-  if (rc == 0) {
-    if (wantFail) fprintf(stderr, "[rank %d] %s: DevCommCreate succeeded\n", c.rank, name);
-    if (ccoDevCommDestroy(c.comm, &d) != 0) return c.Harvest(name, 1);
-  } else if (!wantFail) {
-    fprintf(stderr, "[rank %d] %s: DevCommCreate failed\n", c.rank, name);
-  }
-  return c.Harvest(name, (rc != 0) != wantFail);
-}
-
-static int RunProxyOnlyNegativeCases(Ctx& c, const ccoDevCommRequirements& reqs) {
-  int fails = 0;
-  if (NegativeSelected("n6")) {
-    ccoDevCommRequirements r = reqs;
-    r.proxyOnly = c.rank == 0 ? 1 : 0;
-    fails += RunCreateFailCase(c, "n6_only_mismatch", r, true);
-  }
-  if (NegativeSelected("n7")) {
-    ccoDevCommRequirements r = reqs;
-    r.proxyOnly = 1;
-    r.proxySpscQueueCount = 0;
-    r.proxyMpscQueueCount = 0;
-    fails += RunCreateFailCase(c, "n7_only_no_queues", r, true);
-  }
-  if (NegativeSelected("n8")) {
-    ccoDevCommRequirements r = reqs;
-    r.proxyOnly = 1;
-    r.barrierCount = 1;
-    const bool crossNode = c.dc.lsaSize < c.dc.worldSize;
-    fails += RunCreateFailCase(c, "n8_only_barrier", r, crossNode);
-  }
-  return fails;
-}
-
 static int RunSignalCase(Ctx& c) {
   if (!CaseSelected("signal_only")) return 0;
   c.Fresh(c.dc, /*salt=*/0, kChunk, kSpscQueues);
@@ -1646,7 +1313,6 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_FULL;
   reqs.gdaContextCount = 1;
   reqs.gdaSignalCount = c.nSlots;
-  reqs.gdaCounterCount = kMaxUnits;  // one per unit (counter cases)
   reqs.proxySpscQueueCount = kSpscQueues;
   reqs.proxyMpscQueueCount = kMpscQueues;
   reqs.proxyThreadCount = kProxyThreads;
@@ -1691,26 +1357,6 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunSetCase<SPSCD2HQueue, kSetSignal>(c, "set_signal", 35, kSpscQueues);
   fails += RunSetCase<SPSCD2HQueue, kSetWindow>(c, "set_window", 36, kSpscQueues);
   fails += RunSetCase<MPSCD2HQueue, kSetSlot>(c, "mpsc_set_put", 37, kMaxUnits);
-  fails += RunAsyncCase<SPSCD2HQueue, ccoCoopWarp, kAsyncReverse>(c, "async_reverse", 48,
-                                                                  kSpscQueues, 64);
-  fails += RunAsyncCase<SPSCD2HQueue, ccoCoopBlock, kAsyncReverse>(c, "block_async", 49,
-                                                                   kSpscQueues, 256);
-  fails +=
-      RunAsyncCase<MPSCD2HQueue, ccoCoopBlock, kAsyncReverse>(c, "mpsc_async", 50, kMaxUnits, 256);
-  fails +=
-      RunAsyncCase<SPSCD2HQueue, ccoCoopWarp, kAsyncCounter>(c, "counter", 51, kSpscQueues, 64);
-  fails += RunAsyncCase<MPSCD2HQueue, ccoCoopBlock, kAsyncCounter>(c, "mpsc_counter", 52, kMaxUnits,
-                                                                   256);
-  fails += RunAsyncCase<SPSCD2HQueue, ccoCoopWarp, kAsyncForward>(c, "async_forward", 57,
-                                                                  kSpscQueues, 64);
-  fails += RunAsyncCase<MPSCD2HQueue, ccoCoopBlock, kAsyncForward>(c, "mpsc_async_forward", 58,
-                                                                   kMaxUnits, 256);
-  fails += RunAsyncCase<SPSCD2HQueue, ccoCoopWarp, kAsyncCounterWave>(c, "counter_wave", 59,
-                                                                      kSpscQueues, 128);
-  // 2 blocks of 2 wavefronts (32x4), and 2x2 blocks: kSpscQueues units each.
-  fails += RunSelectorCase<ccoCoopWarp, true>(c, "selector_wave", 53, dim3(1, 2), dim3(32, 4));
-  fails += RunSelectorCase<ccoCoopBlock, false>(c, "selector_block", 54, dim3(2, 2), dim3(256));
-  fails += RunProxyOnlyCases(c, reqs);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "put_sig_warp", 1, kChunk,
                                                              kSpscQueues, 64);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutThenSignal>(c, "put_then_sig", 2, kChunk,
@@ -1724,10 +1370,6 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
                                                                     kSpscQueues, 256);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutKernelPayload>(c, "kernel_payload", 11,
                                                                      kChunk, kSpscQueues, 256);
-  fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutCallerFence, ccoProxyFenceCaller>(
-      c, "caller_fence", 27, kChunk, kSpscQueues, 256);
-  fails += RunPutCase<MPSCD2HQueue, ccoCoopWarp, kPutCallerFence, ccoProxyFenceCaller>(
-      c, "mpsc_caller", 28, kChunk, kMaxUnits, 64);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutRepeat>(c, "sq_full", 12, kChunk, 1, 64);
   // 32x4 blocks: wavefront 0 is linear threads 0..63 (rows 0 and 1).
   fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutFlushCount>(c, "block_2d_flush", 38, kChunk,
@@ -1765,8 +1407,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunStressCase(c);
   fails += RunSignalCase(c);
   fails += RunHandoffCase(c);
-  fails += RunBlockFlushCase<false>(c, "block_flush", 40);
-  fails += RunBlockFlushCase<true>(c, "block_flush_async", 41);
+  fails += RunBlockFlushCase(c);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutPieces>(c, "small_spsc", 14, kChunk,
                                                              kSpscQueues, 64, &c.dcSmall);
   // kQpsPerPeer QPs per (thread, peer): each of a thread's 3 queues on its own QP.
@@ -1801,10 +1442,6 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   if (NegativeSelected("n5")) {
     anyNegative = true;
     fails += RunQpsMismatchCase(c, reqs);
-  }
-  if (NegativeSelected("n6") || NegativeSelected("n7") || NegativeSelected("n8")) {
-    anyNegative = true;
-    fails += RunProxyOnlyNegativeCases(c, reqs);
   }
   if (anyNegative) {
     fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "put_sig_after", 26, kChunk,
