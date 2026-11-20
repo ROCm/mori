@@ -67,6 +67,7 @@ from mori.tensor_utils import from_gpu_ptr
 from . import ep_plans as cb
 from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
+from .quant_types import is_gfx125x_arch, resolve_quant_type
 from .internode_regions import (
     asyncll_regions,
     asyncll_seg_layout,
@@ -305,20 +306,32 @@ def _combine_info_cached(fields: tuple) -> dict:
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
-PUSH_QGROUP = {"fp4_blockwise": 32, "fp4_blockwise_fp32": 128, "fp8_blockwise": 32}
+PUSH_QGROUP = {
+    "fp4_blockwise_1x32": 32,
+    "fp4_blockwise_1x128": 128,
+    "fp8_blockwise_1x32": 32,
+}
 # The combine request fields each push quant type turns on.
 _PUSH_REQUEST = {
-    "fp4_blockwise": (("combine_fp4", 1),),
-    "fp4_blockwise_fp32": (("combine_fp4", 1), ("combine_fp4_f32_scale", 1)),
-    "fp8_blockwise": (("combine_fp8", 1),),
+    "fp4_blockwise_1x32": (("combine_fp4", 1),),
+    "fp4_blockwise_1x128": (("combine_fp4", 1), ("combine_fp4_f32_scale", 1)),
+    "fp8_blockwise_1x32": (("combine_fp8", 1),),
 }
+
+
+def _push_quant(name):
+    """The explicit push quant type `name` means; the push combine is gfx125x."""
+    return resolve_quant_type(name, gfx125x=True)
 
 
 def push_wire_nbytes(cfg) -> int:
     """Bytes of one landed row of the push combine (EpCombinePushWireBytes): the
     plan's info["pushWireBytes"], asked of describe(). Reads cfg.hidden_dim and
     cfg.quant_type; the push combine, and so this, is gfx125x only."""
-    fields = (("hidden_dim", int(cfg.hidden_dim)), *_PUSH_REQUEST[cfg.quant_type])
+    fields = (
+        ("hidden_dim", int(cfg.hidden_dim)),
+        *_PUSH_REQUEST[_push_quant(cfg.quant_type)],
+    )
     return _combine_info_cached(tuple(sorted(fields)))["pushWireBytes"]
 
 
@@ -331,7 +344,7 @@ def push_land_rows(cfg) -> int:
         ("world_size", int(cfg.world_size)),
         ("max_tok_per_rank", int(cfg.max_num_inp_token_per_rank)),
         ("num_expert_per_token", int(cfg.num_experts_per_token)),
-        *_PUSH_REQUEST["fp4_blockwise"],
+        *_PUSH_REQUEST["fp4_blockwise_1x32"],
     )
     return _combine_info_cached(tuple(sorted(fields)))["pushLandRows"]
 
@@ -339,7 +352,10 @@ def push_land_rows(cfg) -> int:
 _CARD_COMBINE_ROWS_MAX = 2048
 
 
-_CARD_QUANT_TYPES = ("fp8_blockwise", "fp4_blockwise")
+_CARD_QUANT_TYPES = ("fp8_blockwise_1x32", "fp4_blockwise_1x32")
+# The gfx942/gfx950 scatter combine's wires (combine_scatter_q_group); e2m1 needs gfx950.
+_SCATTER_QUANT_TYPES = ("fp8_blockwise_1x32", "fp8_blockwise_1x128")
+_SCATTER_FP4_QUANT_TYPES = ("fp4_blockwise_1x32", "fp4_blockwise_1x128")
 
 
 def _card_layout(cfg):
@@ -454,7 +470,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._arch = _arch.split(":")[0]
-        self._is1250 = _arch.split(":")[0].startswith("gfx125")
+        self._is1250 = is_gfx125x_arch(_arch)
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
@@ -1159,12 +1175,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             if self._card["pull_blocks"]:
                 disp["card_pull_blocks"] = self._card["pull_blocks"]
         comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
-        if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
-            comb["combine_fp4"] = True
-        if cfg.quant_type == "fp4_blockwise_fp32":
-            comb["combine_fp4_f32_scale"] = True
-        if cfg.quant_type == "fp8_blockwise":
-            comb["combine_fp8"] = True
+        if self._is1250:
+            for field, on in _PUSH_REQUEST.get(cfg.quant_type, ()):
+                comb[field] = bool(on)
+        elif cfg.quant_type != "none":
+            comb["combine_scatter_q_group"] = cfg.quant_group
+            if cfg.quant_element == "fp4":
+                comb["combine_scatter_fp4"] = True
         if self._card is not None and cfg.quant_type in _CARD_QUANT_TYPES:
             comb["card_combine"] = True
         geom = self._ll128_geom
@@ -1242,6 +1259,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         return bad
 
+    @classmethod
+    def _quant_formats(cls, arch):
+        # gfx125x pushes; gfx942/gfx950 scatter an fp8 wire, and gfx950 an e2m1 one too.
+        if is_gfx125x_arch(arch):
+            return _PUSH_QUANT_TYPES
+        if arch.startswith("gfx950"):
+            return _SCATTER_QUANT_TYPES + _SCATTER_FP4_QUANT_TYPES
+        return _SCATTER_QUANT_TYPES
+
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
         if cfg.async_ll:
@@ -1256,26 +1282,24 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if cfg.combine_dtype not in _COMBINE_DTYPES:
             bad.append(f"combine dtype {cfg.combine_dtype} (have bf16, fp32)")
         q = cfg.quant_type
-        push = q in _PUSH_QUANT_TYPES
-        if cfg.is_scatter and not push:
+        refused = self._quant_refusal(cfg, self._arch)
+        bad.extend(refused)
+        if cfg.is_scatter and q == "none":
+            served = "the push" if self._is1250 else "the scatter"
             bad.append(
-                "combine_mode='scatter' (gather only, except the push quant types "
-                f"{_PUSH_QUANT_TYPES})"
+                f"combine_mode='scatter' without a quant type on {self._arch} (gather "
+                f"only, or {served} quant types {self._quant_formats(self._arch)})"
             )
-        if q != "none" and not push:
-            bad.append(f"quant_type={q!r}")
-        if push:
-            if not self._is1250:
-                bad.append(f"quant_type={q!r} (the push combine is gfx125x only)")
+        if q != "none" and not refused:
             if cfg.combine_dtype != torch.bfloat16:
                 bad.append(
                     f"quant_type={q!r} with combine dtype {cfg.combine_dtype} "
                     "(bf16 only)"
                 )
-            elif cfg.hidden_dim % 1024:
+            elif cfg.hidden_dim % (1024 if self._is1250 else 128):
                 bad.append(
                     f"quant_type={q!r} with hidden_dim={cfg.hidden_dim} "
-                    "(needs a multiple of 1024)"
+                    f"(needs a multiple of {1024 if self._is1250 else 128})"
                 )
         if cfg.enable_std_moe:
             bad.append("enable_std_moe")
@@ -2158,7 +2182,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # when the caller already wrote there), so the op must not do it.
             stages_in_kernel=True,
             capabilities=frozenset(
-                {"gather", "scales"} | ({"scatter"} if cfg.is_scatter else set())
+                {"gather", "scales"}
+                | ({"scatter"} if cfg.is_scatter else set())
+                | ({"quant"} if cfg.quant_type != "none" else set())
             ),
         )
 
@@ -2460,7 +2486,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def _wrap_combine(self, plan, ll=False):
-        push = self.cfg.quant_type in _PUSH_QUANT_TYPES
+        push = self._is1250 and self.cfg.quant_type in _PUSH_QUANT_TYPES
         src_ptr = self.arena.local_ptr(
             "ll_recv_to_src_token" if ll else "recv_to_src_token"
         )
@@ -2564,7 +2590,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def push_landing(self):
-        if self.cfg.quant_type not in _PUSH_QUANT_TYPES and not self._push_specs:
+        if not self._is1250 or (
+            self.cfg.quant_type not in _PUSH_QUANT_TYPES and not self._push_specs
+        ):
             raise ValueError(
                 f"no landing rows: quant_type {self.cfg.quant_type!r} is not a push one"
             )

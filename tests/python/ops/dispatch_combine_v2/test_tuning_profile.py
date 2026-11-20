@@ -149,7 +149,7 @@ def test_capped_push_row_without_a_peak_push_row(gfx1250, monkeypatch):
     shape = (4, 4096, 8, None)
     rows = ((None, 64, 24),)
     monkeypatch.setitem(
-        tc._CAPPED_COMBINE_PUSH_TABLE, "fp8_blockwise", {"gfx1250": {shape: rows}}
+        tc._CAPPED_COMBINE_PUSH_TABLE, "fp8_blockwise_1x32", {"gfx1250": {shape: rows}}
     )
     t = tc.lookup(4, 4096, 8, quant_type="fp8_blockwise", profile="capped")
     assert {row[3:] for row in t["schedule"]} == {(64, 24)}

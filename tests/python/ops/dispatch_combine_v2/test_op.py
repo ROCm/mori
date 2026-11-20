@@ -73,6 +73,11 @@ class Dist:
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         return int(t.item())
 
+    def allreduce_max(self, value):
+        t = torch.tensor([value], dtype=torch.float64)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        return float(t.item())
+
     def shutdown(self):
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -91,7 +96,7 @@ _FP8_DT = (
 def _configure():
     """Read the knobs below from the environment (again for every CASES entry)."""
     global HIDDEN, K, EPR, DTYPE, _IS_FP4, _IS_FP8, STDMOE, SCALE_DIM, COMBINE
-    global QUANT, INSCALE, SWEEP, RAGGED, NOSELF
+    global QUANT, INSCALE, SPREAD, TINY, SWEEP, RAGGED, NOSELF
     HIDDEN = int(os.environ.get("HIDDEN", 7168))
     K = int(os.environ.get("TOPK", 8))
     EPR = int(os.environ.get("EPR", 32))
@@ -108,10 +113,18 @@ def _configure():
         os.environ.get("SCALE_DIM", 0)
     )  # >0 = also verify per-token scales forwarding
     COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
-    QUANT = os.environ.get("QUANT", "none")  # none | fp8_blockwise
-    # Scale the input up so per-token/-block amax exceeds the fp8 max -> exercises the
-    # fp8_blockwise per-block scaling branch (randn ~N(0,1) never triggers it).
+    QUANT = os.environ.get("QUANT", "none")  # none | fp{8,4}_blockwise[_1x32|_1x128]
+    # Input magnitude: 200 puts a block's amax past the fp8 max, 0.001 below its
+    # normal range; a quantized wire must keep both within _QUANT_REL_L2.
     INSCALE = float(os.environ.get("INSCALE", 1))
+    # SPREAD=n: each 32-element group times 2^u, u uniform in [-n, n], so a scale
+    # applied to the wrong group shows up as a gross error.
+    SPREAD = int(os.environ.get("SPREAD", 0))
+    # TINY=1: every row's first 128 elements are ~1e-37 with a zero among them, under
+    # a 1x128 scale's normal range, where the scale must be 1. Without that rule
+    # max / amax overflows and the zero becomes 0 * inf; the hardware clamp happens
+    # to turn that NaN into a finite value, so this guards the rule, not a crash.
+    TINY = int(os.environ.get("TINY", 0))
     SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512").split(",")]
     # RAGGED=1: rank r sends ct * (r % 3) // 2 tokens of each SWEEP point -- none on
     # ranks 0 and 3, half on 1, all on 2 -- so one call mixes ranks that send nothing
@@ -123,6 +136,10 @@ def _configure():
 
 
 _configure()
+
+# Relative L2 error bound of a quantized combine, by element; rounding alone is
+# ~2.6% for fp8 e4m3 and ~11% for e2m1.
+_QUANT_REL_L2 = {"fp8": 0.05, "fp4": 0.15}
 
 
 def _window_bytes(npes):
@@ -147,6 +164,13 @@ def _run(d, comm):
         inp = torch.randn(M, HIDDEN, generator=g, dtype=torch.float32)
         if INSCALE != 1.0:
             inp = inp * INSCALE
+        if SPREAD:
+            groups = inp.view(M, HIDDEN // 32, 32)
+            u = torch.randint(-SPREAD, SPREAD + 1, (M, HIDDEN // 32, 1), generator=g)
+            inp = (groups * torch.exp2(u.float())).view(M, HIDDEN)
+        if TINY:
+            inp[:, :128] *= 1e-37
+            inp[:, 0] = 0.0
         inp = inp.to(DTYPE).to(dev)
     if NOSELF:
         idx = torch.randint(
@@ -315,6 +339,7 @@ def _run(d, comm):
                         flush=True,
                     )
                 continue
+            rel = 0.0  # relative L2 error of a quantized combine
             if STDMOE:
                 op.convert_dispatch_output()  # identity GEMM: packed_x = token
                 sync()
@@ -359,17 +384,27 @@ def _run(d, comm):
                     lossy = QUANT != "none" or _IS_FP8
                     atol = 3e-1 if lossy else 2e-2
                     rtol = 1e-1 if lossy else 2e-2
-                    ok = torch.allclose(
+                    # e2m1 is too coarse for an elementwise bound; its L2 bound stands
+                    ok = QUANT.startswith("fp4") or torch.allclose(
                         out.float().cpu(), exp.float(), atol=atol, rtol=rtol
                     )
+                    if QUANT != "none":
+                        # atol=0.3 passes any small-input loss; the L2 error does not
+                        ref = exp.float()
+                        err = (out.float().cpu() - ref).norm()
+                        rel = float(err / ref.norm()) if ref.norm() > 0 else 0.0
+                        ok = ok and rel < _QUANT_REL_L2[QUANT[:3]]
                 ok_w = torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
                 tag = f"OP-{COMBINE}" + (f"-{QUANT}" if QUANT != "none" else "")
             errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
+            quant_err = ""
+            if QUANT != "none":
+                quant_err = f" rel_l2={d.allreduce_max(rel):.4f}"
             if rank == 0:
                 print(
                     f"# {tag} ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
                     f"(hidden={'ok' if ok else 'BAD'} wts={'ok' if ok_w else 'BAD'}; "
-                    f"recv={total_recv})",
+                    f"recv={total_recv}{quant_err})",
                     flush=True,
                 )
 

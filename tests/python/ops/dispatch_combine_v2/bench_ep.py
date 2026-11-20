@@ -62,6 +62,7 @@ import torch.distributed as dist
 
 import mori.cco as cco
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
+from mori.ops.dispatch_combine_v2.quant_types import is_gfx125x, resolve_quant_type
 
 import _data
 import _report
@@ -104,22 +105,33 @@ ASYNC_LL_TRANSPORT = os.environ.get("ASYNC_LL_TRANSPORT", "sdma")
 if COMB_MODE not in ("pull", "push"):
     raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
 _PUSH = COMB_MODE == "push"
-PUSH_QUANT = os.environ.get("PUSH_QUANT") or "fp4_blockwise"
-if PUSH_QUANT not in ("fp4_blockwise", "fp4_blockwise_fp32", "fp8_blockwise"):
-    raise ValueError(
-        f"PUSH_QUANT={PUSH_QUANT!r}: want fp4_blockwise|fp4_blockwise_fp32|fp8_blockwise"
-    )
-_PUSH_FP8 = PUSH_QUANT == "fp8_blockwise"
+# COMB_MODE=push is the quantized combine: gfx125x's push, or the gfx942/gfx950
+# scatter. Only the push has a check here; test_op.py checks the scatter.
+_GFX125X = is_gfx125x()
+PUSH_QUANT = resolve_quant_type(
+    os.environ.get("PUSH_QUANT") or "fp4_blockwise", gfx125x=_GFX125X
+)
+_PUSH_FP8 = PUSH_QUANT.startswith("fp8")
 PUSH_QRULE = os.environ.get("PUSH_QRULE")
 if not PUSH_QRULE:
-    PUSH_QRULE = "blk" if PUSH_QUANT == "fp4_blockwise_fp32" else "mx"
-if PUSH_QRULE not in ("mx", "blk") or (_PUSH_FP8 and PUSH_QRULE != "mx"):
+    PUSH_QRULE = "blk" if PUSH_QUANT.endswith("_1x128") else "mx"
+if PUSH_QRULE not in ("mx", "blk") or (_PUSH_FP8 and _GFX125X and PUSH_QRULE != "mx"):
     raise ValueError(
         f"PUSH_QRULE={PUSH_QRULE!r}: want mx|blk (mx only for {PUSH_QUANT})"
     )
 _PUSH_QGROUP = 32 if PUSH_QRULE == "mx" else 128
-_PUSH_WIRE = ((HIDDEN if _PUSH_FP8 else HIDDEN // 2) + HIDDEN // 32 + 127) // 128 * 128
+_PUSH_WIRE = (
+    (
+        (HIDDEN if _PUSH_FP8 else HIDDEN // 2)
+        + (HIDDEN // 32 if _PUSH_QGROUP == 32 else HIDDEN // 128 * 4)
+        + 127
+    )
+    // 128
+    * 128
+)
 CHECK = int(os.environ.get("CHECK", 1))
+if COMB_MODE == "push" and not _GFX125X:
+    CHECK = 0
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
 PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
 # ROUTE=rand (default): TOPK distinct experts per token, drawn at random.
