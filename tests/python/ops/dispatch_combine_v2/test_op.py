@@ -185,10 +185,23 @@ def _run(d, comm):
         max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
     )
     if int(os.environ.get("TUNED", 0)):
-        from mori.ops.dispatch_combine_v2.tuning_configs import lookup
+        # Each backend tunes its own kernels, so take the table of the one that will
+        # run: a cco row carries no promise about the hip dispatch's geometry, and on
+        # gfx1250 it is not even launchable there (its 32-warp rows predate the hip
+        # dispatch's per-warp LDS slabs -- ROCm/mori#951).
+        from mori.ops.dispatch_combine_v2.dispatch_combine_op import _default_backend
 
         _dt = "fp4" if _IS_FP4 else ("fp8" if _IS_FP8 else "bf16")
-        cfg.schedule = lookup(npes, HIDDEN, K, dtype=_dt)["schedule"]
+        if (os.environ.get("MORI_V2_KERNEL_BACKEND") or _default_backend()) == "hip":
+            from mori.ops.dispatch_combine_v2.hip_tuning_configs import lookup
+
+            cfg.schedule = lookup(
+                npes, HIDDEN, K, dtype=_dt, experts_per_rank=EPR, quant_type=QUANT
+            )["schedule"]
+        else:
+            from mori.ops.dispatch_combine_v2.tuning_configs import lookup
+
+            cfg.schedule = lookup(npes, HIDDEN, K, dtype=_dt)["schedule"]
     with EpDispatchCombineOp(cfg, comm) as op:
         comm.barrier()
 

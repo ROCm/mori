@@ -214,6 +214,22 @@ TEST(Geometry, Dispatch1250xSlabsLeaveRoomForTheStaticLds) {
   }
 }
 
+// ROCm/mori#951: the dtype-blind 16-warp dispatch default asks 458752 B of a 327680 B
+// workgroup at fp32 7168, which the launch accepts and then never schedules.
+TEST(Geometry, Dispatch1250xFp32TakesHalfTheWarps) {
+  EpRequest req;
+  req.hiddenDim = 7168;
+  req.dtype = EpDType::Fp32;
+  const EpCfg fp32 = MakeEpCfg("gfx1250", req, EpKernelKind::Dispatch);
+  EXPECT_EQ(fp32.warpPerBlock, 8);
+  EXPECT_LE(EpDispatch1250xLdsBytes(fp32) + EpDispatch1250xStaticLdsBytes, Ep1250xLdsBytes);
+  // Only the arch with the LDS slabs, and only dispatch.
+  EXPECT_EQ(MakeEpCfg("gfx950", req, EpKernelKind::Dispatch).warpPerBlock, 16);
+  EXPECT_EQ(MakeEpCfg("gfx1250", req, EpKernelKind::Combine).warpPerBlock, 8);
+  req.dtype = EpDType::Bf16;
+  EXPECT_EQ(MakeEpCfg("gfx1250", req, EpKernelKind::Dispatch).warpPerBlock, 16);
+}
+
 TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
   EpCfg ok;
   EXPECT_TRUE(EpCfgIsValid(ok));
