@@ -38,10 +38,13 @@
  *   reduce PCIe traffic
  *
  * Copied from AMDResearch/kiwi d7bb0d1 (include/kiwi -> include/mori/cco/proxy,
- * src/queue -> src/cco/proxy). Local changes: namespace mori::cco::proxy,
- * KIWI_* macros renamed CCO_PROXY_*, only the device-to-host SPSC/MPSC queues
- * and invoke kept, and pushes on non-gfx942/gfx950 targets trap
- * (MORI_CCO_PROXY_PUSH_UNSUPPORTED) instead of failing the build.
+ * src/queue -> src/cco/proxy). Local changes: namespace mori::cco::proxy;
+ * KIWI_* macros renamed CCO_PROXY_*, and the KIWI_QUEUE_VERSION_* macros
+ * dropped; only the device-to-host SPSC/MPSC queues and invoke kept; include
+ * paths and formatting follow mori; and pushes need gfx942/gfx950: other
+ * device targets, gfx90a included, compile a push that traps
+ * (MORI_CCO_PROXY_PUSH_UNSUPPORTED), where upstream accepts any GFX9 target
+ * and fails the build on the rest.
  *
  * Quick Start:
  * @code
