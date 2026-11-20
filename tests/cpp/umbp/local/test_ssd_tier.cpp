@@ -19,16 +19,22 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <thread>
 #include <vector>
 
 #include "umbp/common/aligned_buffer.h"
 #include "umbp/local/tiers/ssd_tier.h"
+#include "umbp/storage/io/storage_io_driver.h"
 
 using namespace mori::umbp;
 
@@ -276,6 +282,54 @@ void test_ssd_batch_read_io_uring() {
   std::cout << "PASSED" << std::endl;
 }
 
+// A failed completion fails only the call it belongs to: the call reaps all of
+// its own requests before it returns, so the next call on the same io_uring
+// driver does not read them as its own.
+void test_io_uring_error_fails_only_its_call() {
+  std::cout << "test_io_uring_error_fails_only_its_call... ";
+  auto driver = CreateStorageIoDriver(UMBPIoBackend::IoUring, 8);
+  if (!driver->Capabilities().native_async) {
+    std::cout << "SKIPPED (io_uring unavailable)" << std::endl;
+    return;
+  }
+  const std::string path = "/tmp/umbp_test_io_uring_error";
+  int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  int read_only = ::open(path.c_str(), O_RDONLY);  // writes through it fail with EBADF
+  int pipe_fds[2];
+  assert(fd >= 0 && read_only >= 0 && ::pipe(pipe_fds) == 0);
+  std::vector<char> data(4096, 'D'), out(4096, 0), piped(4096, 0);
+
+  // Before Linux 5.18 the first write fails while it is prepared and the kernel
+  // stops submitting there, so the second write is still in the SQ ring.
+  std::vector<IoWriteOp> failing = {{read_only, data.data(), data.size(), 0},
+                                    {fd, data.data(), data.size(), 0}};
+  assert(!driver->WriteBatch(failing).ok());
+  assert(driver->WriteBatch({{fd, data.data(), data.size(), 0}}).ok());
+
+  // The pipe read is still in flight when the read past EOF fails the call, so
+  // the call returns only after the writer thread has fed the pipe.
+  std::atomic<bool> fed{false};
+  std::thread writer([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    fed = true;
+    if (::write(pipe_fds[1], "x", 1) != 1) std::abort();
+  });
+  std::vector<IoReadOp> short_read = {{pipe_fds[0], piped.data(), piped.size(), 0},
+                                      {fd, out.data(), out.size(), 8192}};
+  assert(!driver->ReadBatch(short_read).ok());
+  assert(fed);
+  writer.join();
+  assert(driver->ReadBatch({{fd, out.data(), out.size(), 0}}).ok());
+  assert(out == data);
+
+  assert(!driver->WriteAt(read_only, data.data(), data.size(), 0).ok());
+  assert(driver->WriteAt(fd, data.data(), data.size(), 0).ok());
+
+  for (int f : {read_only, fd, pipe_fds[0], pipe_fds[1]}) ::close(f);
+  ::unlink(path.c_str());
+  std::cout << "PASSED" << std::endl;
+}
+
 // A reserved record is invisible until committed; an aborted one mid-log is
 // skipped on reopen without hiding the records after it.
 void test_reserved_records() {
@@ -321,6 +375,7 @@ int main() {
   test_ssd_batch_read();
   test_ssd_batch_read_partial();
   test_ssd_batch_read_io_uring();
+  test_io_uring_error_fails_only_its_call();
   std::cout << "All Segmented SSD Tier tests passed!" << std::endl;
   return 0;
 }

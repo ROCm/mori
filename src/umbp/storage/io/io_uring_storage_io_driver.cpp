@@ -225,9 +225,13 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
         size_t op_idx = static_cast<size_t>(cqe->user_data - 1);
         if (op_idx >= total_sqes)
           return IoStatus::Corruption("io_uring cqe user_data out of range");
-        if (cqe->res < 0) return IoStatus::IoError("io_uring batch write failed", -cqe->res);
+        if (cqe->res < 0) {
+          return FailBatch(IoStatus::IoError("io_uring batch write failed", -cqe->res), cq_h,
+                           inflight);
+        }
         if (static_cast<size_t>(cqe->res) != descs[op_idx].iov.iov_len) {
-          return IoStatus::ShortWrite("io_uring batch write completed partially");
+          return FailBatch(IoStatus::ShortWrite("io_uring batch write completed partially"), cq_h,
+                           inflight);
         }
         ++complete_cnt;
         --inflight;
@@ -324,9 +328,13 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
         size_t op_idx = static_cast<size_t>(cqe->user_data - 1);
         if (op_idx >= total_sqes)
           return IoStatus::Corruption("io_uring cqe user_data out of range");
-        if (cqe->res < 0) return IoStatus::IoError("io_uring batch read failed", -cqe->res);
+        if (cqe->res < 0) {
+          return FailBatch(IoStatus::IoError("io_uring batch read failed", -cqe->res), cq_h,
+                           inflight);
+        }
         if (static_cast<size_t>(cqe->res) != descs[op_idx].iov.iov_len) {
-          return IoStatus::ShortRead("io_uring batch read completed partially");
+          return FailBatch(IoStatus::ShortRead("io_uring batch read completed partially"), cq_h,
+                           inflight);
         }
         ++complete_cnt;
         --inflight;
@@ -358,6 +366,24 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
                                        flags, nullptr, sizeof(sigset_t)));
     if (ret < 0) return IoStatus::IoError("io_uring_enter failed", errno);
     return IoStatus::Ok();
+  }
+
+  // Ends a call whose completion at cq_h failed: consumes it and the call's
+  // other completions, so the next call does not read them as its own. SQEs the
+  // kernel has not taken yet (it stops submitting at an SQE that fails to
+  // prepare) are submitted here, so every request of the call completes.
+  IoStatus FailBatch(IoStatus status, uint32_t cq_h, size_t inflight) {
+    ++cq_h;
+    --inflight;
+    while (true) {
+      const uint32_t cq_t = *cq_tail_;
+      while (inflight > 0 && cq_h != cq_t) {
+        ++cq_h;
+        --inflight;
+      }
+      *cq_head_ = cq_h;
+      if (inflight == 0 || !SubmitAndWait(*sq_tail_ - *sq_head_, 1).ok()) return status;
+    }
   }
 
   IoStatus SubmitRwChunked(uint8_t opcode, int fd, void* base, size_t size, uint64_t offset) {
@@ -429,11 +455,15 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
         if (cqe->user_data == 0) return IoStatus::Corruption("io_uring cqe user_data missing");
         size_t op_idx = static_cast<size_t>(cqe->user_data - 1);
         if (op_idx >= total_ops) return IoStatus::Corruption("io_uring cqe user_data out of range");
-        if (cqe->res < 0) return IoStatus::IoError("io_uring read/write failed", -cqe->res);
+        if (cqe->res < 0) {
+          return FailBatch(IoStatus::IoError("io_uring read/write failed", -cqe->res), cq_h,
+                           inflight);
+        }
         if (static_cast<size_t>(cqe->res) != expected[op_idx]) {
-          return (opcode == IORING_OP_READV)
-                     ? IoStatus::ShortRead("io_uring read completed partially")
-                     : IoStatus::ShortWrite("io_uring write completed partially");
+          return FailBatch((opcode == IORING_OP_READV)
+                               ? IoStatus::ShortRead("io_uring read completed partially")
+                               : IoStatus::ShortWrite("io_uring write completed partially"),
+                           cq_h, inflight);
         }
         ++complete_cnt;
         --inflight;
