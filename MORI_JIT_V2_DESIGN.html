@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI JIT v2 &mdash; MORI development (23e73534) documentation</title>
+  <title>MORI JIT v2 &mdash; MORI development (20294651) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=2afa1373"></script>
+      <script src="_static/documentation_options.js?v=64e7f21a"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -485,8 +485,9 @@ kernel 内还是 host 侧）、<code class="docutils literal notranslate"><span 
 <code class="docutils literal notranslate"><span class="pre">_build_kernels</span></code>、FlyDSL 的 <code class="docutils literal notranslate"><span class="pre">__init__</span></code>）：返回的 callable 已经是父类的具名签名，FlyDSL 的位置参数和
 ctypes plan 的关键字参数各自在 <code class="docutils literal notranslate"><span class="pre">_wrap_*</span></code> 里适配。</p>
 <p><strong>特性面是真包含不是交集</strong>：HIP 后端做 gather combine，dispatch 收 bf16/fp32/fp8/fp4、combine 出
-bf16/fp32（§3.7），其余一概不接：scatter、量化（<code class="docutils literal notranslate"><span class="pre">quant_type</span></code>，与直接传已量化载荷是两回事）、
-StdMoE、per-token scales、routing replay、<code class="docutils literal notranslate"><span class="pre">local_expert_count</span></code>。能力门在<strong>构造期</strong>跑、且在分配 arena
+bf16/fp32（§3.7）；带 <code class="docutils literal notranslate"><span class="pre">quant_type</span></code> 时做量化 scatter combine（gfx942/gfx950 是逐源 token 落地一行、
+本地反量化累加，gfx125x 是 push）。其余一概不接：非量化 scatter、StdMoE、routing replay、
+<code class="docutils literal notranslate"><span class="pre">local_expert_count</span></code>。能力门在<strong>构造期</strong>跑、且在分配 arena
 之前——问它要 scatter 会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
 再失败。</p>
 <p><code class="docutils literal notranslate"><span class="pre">_regions</span></code> 归子类还消掉一个陷阱：FlyDSL 的 <code class="docutils literal notranslate"><span class="pre">off_out_tok</span></code> 对 dispatch 指 <code class="docutils literal notranslate"><span class="pre">disp_out</span></code>、对 combine 指
@@ -516,8 +517,8 @@ dispatch 的 dtype</strong>——它只归约 bf16/fp32 的暂存区，不管前
 <code class="docutils literal notranslate"><span class="pre">KernelConfig</span></code>。
 单机的查表在构造 <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineConfig</span></code> 时完成，<code class="docutils literal notranslate"><span class="pre">resolve_schedule()</span></code> 只把得到的 <code class="docutils literal notranslate"><span class="pre">cfg.schedule</span></code>
 转成 <code class="docutils literal notranslate"><span class="pre">ScheduleEntry</span></code>。只有 <code class="docutils literal notranslate"><span class="pre">cfg.kernel_backend</span></code>、<code class="docutils literal notranslate"><span class="pre">MORI_V2_KERNEL_BACKEND</span></code> 或架构默认值解析为 <code class="docutils literal notranslate"><span class="pre">hip</span></code>
-时才查 HIP 的表：<code class="docutils literal notranslate"><span class="pre">quant_type=&quot;none&quot;</span></code> 时先查 <code class="docutils literal notranslate"><span class="pre">IntraNodeV2</span></code> 表，某相没有规则时回退到 Python 表，再没有
-就用单档默认值；只给 dtype 字符串的调用方（如 aiter）也按它对应的 dtype 查表。否则 cfg 按 FlyDSL 的表
+时才查 HIP 的表：先查 <code class="docutils literal notranslate"><span class="pre">IntraNodeV2</span></code> 表（量化时不用它的 combine 行，gfx125x 上量化时 dispatch 行也不用），
+某相没有规则时回退到 Python 表，再没有就用单档默认值；只给 dtype 字符串的调用方（如 aiter）也按它对应的 dtype 查表。否则 cfg 按 FlyDSL 的表
 解析：在 gfx942/gfx950 上既不设 <code class="docutils literal notranslate"><span class="pre">kernel_backend</span></code> 也不设 <code class="docutils literal notranslate"><span class="pre">MORI_V2_KERNEL_BACKEND</span></code> 就直接实例化
 <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineOpHip</span></code>，HIP 沿用的是 FlyDSL 的几何。单机时只要显式给出 <code class="docutils literal notranslate"><span class="pre">cfg.schedule</span></code> 或任一
 block/warp 字段，整个 op 就不查表，未给的字段取单档默认值（dispatch 64×16、combine 80×4）；跨机忽略
@@ -711,7 +712,7 @@ dispatch 41→3、combine 57→10（<code class="docutils literal notranslate"><
 <code class="docutils literal notranslate"><span class="pre">shmem</span></code> 命名空间只是那层抽象加几个与后端无关的自旋。TDM 那套机器（<code class="docutils literal notranslate"><span class="pre">amd_gfx1250_TDM.h</span></code> builtin、
 <code class="docutils literal notranslate"><span class="pre">_cusplit_*</span></code> 设备全局暂存池）原样保留。范围收到 hip 后端能服务的部分：非量化的 TDM dispatch +
 PULL/QUAD gather combine。</p>
-<p><strong>HIP 后端未实现</strong>（由能力门在构造期拒绝）：scatter combine、<code class="docutils literal notranslate"><span class="pre">quant_type</span></code> 量化、StdMoE、per-token
+<p><strong>HIP 后端未实现</strong>（由能力门在构造期拒绝）：非量化 scatter combine、StdMoE、per-token
 scales 转发、routing replay、<code class="docutils literal notranslate"><span class="pre">local_expert_count</span></code>。这些在 FlyDSL 后端都有。注意 fp8/fp4 <strong>dispatch</strong>
 已经支持（§3.7）——那是搬运已量化的载荷，和让 mori 自己量化的 <code class="docutils literal notranslate"><span class="pre">quant_type</span></code> 是两回事。</p>
 <p><strong>cross-node 也有了</strong>：<code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2/</span></code> 现在是三个 body 头文件——两个 intranode
@@ -798,7 +799,7 @@ kernel</strong>——独立的 JIT 模块、入口符号和缓存 key，不是�
 
   <div role="contentinfo">
     <p>&#169; Copyright 2026, AMD.
-      <span class="lastupdated">Last updated on 2026-11-19.
+      <span class="lastupdated">Last updated on 2026-11-20.
       </span></p>
   </div>
 
