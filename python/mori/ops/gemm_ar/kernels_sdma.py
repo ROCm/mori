@@ -224,8 +224,12 @@ def build_sdma_phases(
     fuse_quantize: bool = False,
     fuse_reduce_push: bool = False,
     publish: str = "writethrough",
+    fp8_wide_reduce: bool = True,
 ):
     """Compile the phases separately, so the fused GEMM can reuse the tail.
+
+    ``fp8_wide_reduce`` (fp8 scatter only) reduces 16 fp8 elements per lane per
+    load instead of 8; bit-exact with the narrow reduce, which ``False`` restores.
 
     Returns ``{"scatter", "drain", "reduce", "gather"}``, each a launcher taking
     ``(dev_comm, win, stream=...)``. ``scatter`` pushes *and* drains; ``drain``
@@ -270,6 +274,7 @@ def build_sdma_phases(
                 fuse_quantize,
                 fuse_reduce_push,
                 publish,
+                fp8_wide_reduce,
             )
         ).encode()
     ).hexdigest()[:16]
@@ -280,6 +285,16 @@ def build_sdma_phases(
         )
     if queues < 1:
         raise ValueError(f"queues must be >= 1, got {queues}")
+    # fp8 scatter: each lane reduces 16 fp8 elements (two output packs) with one
+    # 16-byte load and one scale load per source, instead of 8 elements with an
+    # 8-byte load and a scale load. The receive buffers are uncached, so the
+    # load count is the cost. Same products, same summation order: bit-exact.
+    fp8_wide = (
+        cfg.fp8_scatter
+        and fp8_wide_reduce
+        and cfg.packs_per_rank % 2 == 0
+        and cfg.scatter_scale_n % 16 == 0
+    )
     if cfg.fp8_scatter and (fuse_quantize or fuse_reduce_push):
         # These fused reducers still consume BF16 receive data. FP8 decoding
         # and scale application are implemented in the separate reduce only.
@@ -487,51 +502,86 @@ def build_sdma_phases(
                 for j in range(1, ws)
             ]
         gtid = bid * threads + tid
-        for pk in range(gtid, part, red_stride):
-            i32_off = pk * I32_PER_PACK
-            acc = None
-            for j in range_constexpr(ws):
-                # recv is filled by a *peer*. When the copy engine wrote it the
-                # lines are coherent, but when a peer's CUs stored into it over
-                # xGMI our own L2 is never invalidated, so a cached load here can
-                # return the previous iteration's bytes. SC1 skips L2 for those.
-                if const_expr(cfg.fp8_scatter):
+        if const_expr(fp8_wide):
+            # R1: one 16-byte load and one scale load per source for 16
+            # elements (two output packs), instead of 8 bytes plus a scale per
+            # pack. Same products and the same summation order.
+            for pk2 in range(gtid, part // 2, red_stride):
+                acc2 = [None, None]
+                for j in range_constexpr(ws):
                     raw = fx.Vector(
-                        buffer_load(srcs[j], pk * 2, vec_width=2, dtype=i32_type())
+                        buffer_load(srcs[j], pk2 * 4, vec_width=4, dtype=i32_type())
                     )
                     scale = fx.Float32(
                         buffer_load(
                             scale_srcs[j],
-                            pk * 8 // cfg.scatter_scale_n,
+                            pk2 * 16 // cfg.scatter_scale_n,
                             vec_width=1,
                             dtype=fx.Float32,
                         )
                     )
-                    v = fx.Vector.from_elements(
-                        [x * scale for x in _unpack8_fp8(raw)], fx.Float32
-                    )
-                else:
-                    raw = fx.Vector(
-                        buffer_load(
-                            srcs[j],
-                            i32_off,
-                            vec_width=4,
-                            dtype=i32_type(),
-                            cache_modifier=CM_SC1 if recv_uncached else CM_CACHED,
+                    for h in range_constexpr(2):
+                        v = fx.Vector.from_elements(
+                            [
+                                x * scale
+                                for x in _unpack8_fp8([raw[2 * h], raw[2 * h + 1]])
+                            ],
+                            fx.Float32,
                         )
+                        acc2[h] = v if acc2[h] is None else acc2[h] + v
+                for h in range_constexpr(2):
+                    buffer_store(
+                        acc2[h].to(elem_dtype).bitcast(fx.Int32),
+                        out,
+                        (pk2 * 2 + h) * I32_PER_PACK,
+                        cache_modifier=CM_CACHED,
                     )
-                    v = (
-                        raw.bitcast(fx.Float32)
-                        if elem_dtype is fx.Float32
-                        else raw.bitcast(elem_dtype).to(fx.Float32)
-                    )
-                acc = v if acc is None else acc + v
-            packed = (
-                acc.bitcast(fx.Int32)
-                if elem_dtype is fx.Float32
-                else acc.to(elem_dtype).bitcast(fx.Int32)
-            )
-            buffer_store(packed, out, i32_off, cache_modifier=CM_CACHED)
+        else:
+            for pk in range(gtid, part, red_stride):
+                i32_off = pk * I32_PER_PACK
+                acc = None
+                for j in range_constexpr(ws):
+                    # recv is filled by a *peer*. When the copy engine wrote it the
+                    # lines are coherent, but when a peer's CUs stored into it over
+                    # xGMI our own L2 is never invalidated, so a cached load here can
+                    # return the previous iteration's bytes. SC1 skips L2 for those.
+                    if const_expr(cfg.fp8_scatter):
+                        raw = fx.Vector(
+                            buffer_load(srcs[j], pk * 2, vec_width=2, dtype=i32_type())
+                        )
+                        scale = fx.Float32(
+                            buffer_load(
+                                scale_srcs[j],
+                                pk * 8 // cfg.scatter_scale_n,
+                                vec_width=1,
+                                dtype=fx.Float32,
+                            )
+                        )
+                        v = fx.Vector.from_elements(
+                            [x * scale for x in _unpack8_fp8(raw)], fx.Float32
+                        )
+                    else:
+                        raw = fx.Vector(
+                            buffer_load(
+                                srcs[j],
+                                i32_off,
+                                vec_width=4,
+                                dtype=i32_type(),
+                                cache_modifier=CM_SC1 if recv_uncached else CM_CACHED,
+                            )
+                        )
+                        v = (
+                            raw.bitcast(fx.Float32)
+                            if elem_dtype is fx.Float32
+                            else raw.bitcast(elem_dtype).to(fx.Float32)
+                        )
+                    acc = v if acc is None else acc + v
+                packed = (
+                    acc.bitcast(fx.Int32)
+                    if elem_dtype is fx.Float32
+                    else acc.to(elem_dtype).bitcast(fx.Int32)
+                )
+                buffer_store(packed, out, i32_off, cache_modifier=CM_CACHED)
 
     # --- reduce with the gather's puts fired from inside it -------------------
     #

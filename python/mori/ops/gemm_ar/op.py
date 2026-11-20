@@ -729,6 +729,8 @@ class GemmAllReduceOp:
         max_shapes: int | None = None,
         scatter_dtype: str = "bf16",
         schedule: str = "default",
+        fp8_lds_epilogue: bool = True,
+        fp8_wide_reduce: bool = True,
     ):
         # Cleanup state before anything can raise. The rollback below calls
         # close(), which clears these; initialising them after the try block
@@ -793,6 +795,11 @@ class GemmAllReduceOp:
         self.gather_dtype = gather_dtype
         self.scatter_dtype = scatter_dtype
         self.schedule = schedule
+        #: fp8 scatter only, both bit-exact with the paths they replace: stage
+        #: the GEMM tile in LDS instead of re-reading it from the window before
+        #: quantising, and reduce 16 fp8 elements per lane per load instead of 8.
+        self.fp8_lds_epilogue = fp8_lds_epilogue
+        self.fp8_wide_reduce = fp8_wide_reduce
         #: Only meaningful with fp8. "lsa" pulls each peer's slice over xGMI and
         #: widens it on the way in -- one kernel instead of an SDMA push plus a
         #: dequantise, and it does not read the landed fp8 back out of HBM.
@@ -990,8 +997,14 @@ class GemmAllReduceOp:
                 swap_ab=True,
                 permlane=True,
                 lane_transpose=True,
+                fp8_lds_epilogue=self.fp8_lds_epilogue,
             )
-        parts = build_sdma_phases(cfg, self.rank, queues=self.sdma_queues)
+        parts = build_sdma_phases(
+            cfg,
+            self.rank,
+            queues=self.sdma_queues,
+            fp8_wide_reduce=self.fp8_wide_reduce,
+        )
         # fused_order rather than a literal list: the fp8 wire inserts a
         # quantise and a dequantise around the gather, and a hardcoded
         # drain/reduce/gather would skip them and reduce into zeros.
