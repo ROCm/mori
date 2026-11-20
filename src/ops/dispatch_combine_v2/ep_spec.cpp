@@ -137,6 +137,18 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
 
+  if (req.llDispatch) {
+    if (!isDispatch || arch.rfind("gfx125", 0) == 0 || c.waveSize != 64 || req.ll128) {
+      throw std::runtime_error(
+          "mori v2 ep: llDispatch is the portable wave64 dispatch (gfx942 / gfx950); it is not a "
+          "combine option and not available with ll128 or on gfx125x");
+    }
+    c.llDispatch = true;
+    // The warp count is the role split, so an unpinned one is derived from the payload
+    // rather than taken from the generic dispatch default.
+    if (req.warpPerBlock <= 0) c.warpPerBlock = EpLlDefaultWarps(c);
+  }
+
   if (req.ll128) {
     const bool pushE8m0 = req.combineFp8 || (req.combineFp4 && !req.combineFp4F32Scale);
     const bool bf16 = !req.combineFp4 && !req.combineFp8 &&
@@ -226,9 +238,11 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         " hidden=" + std::to_string(c.hiddenDim) + " topk=" + std::to_string(c.numExpertPerToken) +
         " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
         " blocks=" + std::to_string(c.blockNum) + " aggReserve=" + std::to_string(c.aggReserve) +
+        " llDispatch=" + std::to_string(c.llDispatch) +
         "); token bytes must be 16 B aligned, topk must fit in a wavefront, "
-        "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize), and "
-        "aggReserve needs worldSize <= waveSize and blocks < 4096");
+        "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize), "
+        "aggReserve needs worldSize <= waveSize and blocks < 4096, and llDispatch needs "
+        "worldSize <= waveSize and a warp each for routing (and scales) and for copying");
   }
   return c;
 }
@@ -256,7 +270,10 @@ bool EpArchIs1250() { return mori::jit::v2::ActiveArch().rfind("gfx125", 0) == 0
 std::string EpEntryName(const EpCfg& cfg, const char* kind) {
   std::string s = "mori_ep_";
   s += kind;
-  if (EpArchIs1250()) s += "_tdm";
+  if (EpArchIs1250())
+    s += "_tdm";
+  else if (cfg.llDispatch)
+    s += "_ll";
   s += '_';
   s += EpDTypeTag(cfg.dtype);
   s += "_ws" + std::to_string(cfg.worldSize);
@@ -372,7 +389,8 @@ std::string EpCombineSpec::EntryName(const Cfg& cfg) {
 }
 
 std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
-  return RenderEpSource(cfg, EntryName(cfg), "EpDispatchBody", "EpDispatch1250xBody");
+  return RenderEpSource(cfg, EntryName(cfg), cfg.llDispatch ? "EpDispatchLLBody" : "EpDispatchBody",
+                        "EpDispatch1250xBody");
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {

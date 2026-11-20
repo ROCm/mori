@@ -223,6 +223,7 @@ def _run(d, comm):
         combine_mode=COMBINE,
         quant_type=QUANT,
         max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
+        ll_dispatch=bool(int(os.environ.get("LL_DISPATCH", 0))),
     )
     if int(os.environ.get("TUNED", 0)):
         # Each backend tunes its own kernels, so take the table of the one that will

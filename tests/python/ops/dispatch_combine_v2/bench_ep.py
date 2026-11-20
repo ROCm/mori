@@ -324,6 +324,7 @@ def main():
             combine_mode="scatter" if _SCATTER else "gather",
             async_ll=ASYNC_LL,
             async_ll_transport=ASYNC_LL_TRANSPORT,
+            ll_dispatch=bool(int(os.environ.get("LL_DISPATCH", 0))),
         )
         return EpDispatchCombineOp(cfg, comm)
 
