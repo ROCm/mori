@@ -94,6 +94,11 @@ using VecTypeT = typename detail::VecTypeS<VecBytes>::type;
 template <typename T>
 using AccumFp32T = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
 
+enum MemAddressSpace {
+  EAuto,        // auto-detect the address space of the pointer (flat)
+  EGlobal,      // global address space
+};
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Load/Store                                           */
 /* ---------------------------------------------------------------------------------------------- */
@@ -102,16 +107,16 @@ using AccumFp32T = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2
 
 namespace detail {
 
-template <typename T>
-__forceinline__ __device__ T* global(T* ptr) {
+template <class U, MemAddressSpace AddressSpace, class T>
+__forceinline__ __device__ U* addr_cast(T* ptr) {
   static_assert(!std::is_volatile<T>::value, "T must not be volatile");
-  return (T*)(T __attribute__((address_space(1)))*)reinterpret_cast<uintptr_t>(ptr);
+  return (U*)(U __attribute__((address_space(1)))*)reinterpret_cast<uintptr_t>(ptr);
 }
 }  // namespace detail
 
-template <int VecBytes>
+template <int VecBytes, MemAddressSpace AddressSpace = EAuto>
 __forceinline__ __device__ VecTypeT<VecBytes> load(const void* p) {
-  auto* ptr = static_cast<const VecTypeT<VecBytes>*>(detail::global(p));
+  auto* ptr = detail::addr_cast<const VecTypeT<VecBytes>, AddressSpace>(p);
 #if USE_BUILDIN_LD
   return __builtin_nontemporal_load(ptr);
 #else
@@ -119,9 +124,9 @@ __forceinline__ __device__ VecTypeT<VecBytes> load(const void* p) {
 #endif
 }
 
-template <int VecBytes>
+template <int VecBytes, MemAddressSpace AddressSpace = EAuto>
 __forceinline__ __device__ void store(void* p, VecTypeT<VecBytes> v) {
-  auto* ptr = static_cast<VecTypeT<VecBytes>*>(detail::global(p));
+  auto* ptr = detail::addr_cast<VecTypeT<VecBytes>, AddressSpace>(p);
 #if USE_BUILDIN_ST
   __builtin_nontemporal_store(v, ptr);
 #else
@@ -563,41 +568,51 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
 #pragma unroll AccumNum
   for (int i = 0; i < AccumNum; ++i) {
     scales[i] = (srcScales == nullptr) ? 1.0f : srcScales[i];
-    cached_srcs[i] = srcs[i];
+    cached_srcs[i] = srcs[i] ;
   }
 
-  for (; offset + elemsPerWarp <= nelems; offset += elemsPerWarp) {
-    AccumFp32T<T> acc[Unroll][vecSize];
-#pragma unroll Unroll
-    for (int u = 0; u < Unroll; ++u)
-#pragma unroll vecSize
-      for (int j = 0; j < vecSize; ++j) acc[u][j] = AccumFp32T<T>{0};
+  constexpr int kN = Unroll * AccumNum;
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+  constexpr int LoadDepth = 1;
+#else
+  constexpr int LoadDepth = kN;
+#endif
+  static_assert(LoadDepth > 0, "LoadDepth must be greater than 0");
 
-    DataType vals[Unroll][AccumNum];
-    // Load-first: issue every load before touching the accumulators.
-#pragma unroll Unroll
-    for (int u = 0; u < Unroll; ++u) {
-#pragma unroll AccumNum
-      for (int i = 0; i < AccumNum; ++i) {
+  for (; offset + elemsPerWarp <= nelems; offset += elemsPerWarp) {
+    
+    AccumFp32T<T> acc[Unroll][vecSize];
+#pragma unroll
+    for (int n = 0; n < Unroll * vecSize; ++n) {
+      acc[n / vecSize][n % vecSize] = AccumFp32T<T>{0};
+    }
+
+    DataType vals[LoadDepth];
+    // Load-first: issue LoadDepth loads, then decode them, then reuse the same
+    // slots. vals only has to cover one group because decode consumes it.
+#pragma unroll
+    for (int g = 0; g < kN; g += LoadDepth) {
+#pragma unroll
+      for (int k = g; k < g + LoadDepth && k < kN; ++k) {
+        const int u = k / AccumNum, i = k % AccumNum;
         const size_t ofs = offset + (laneId + u * warpSize) * vecSize;
-        vals[u][i] = cached_srcs[i] != nullptr ? load<VecBytes>(cached_srcs[i] + ofs) : DataType{0};
+        vals[k - g] = cached_srcs[i] != nullptr ? load<VecBytes>(cached_srcs[i] + ofs) : DataType{0};
       }
-    }  // for Unroll
-#pragma unroll Unroll
-    for (int u = 0; u < Unroll; ++u) {
-#pragma unroll AccumNum
-      for (int i = 0; i < AccumNum; ++i) {
+#pragma unroll
+      for (int k = g; k < g + LoadDepth && k < kN; ++k) {
+        const int i = k % AccumNum;
         if (cached_srcs[i] == nullptr) continue;
-        WarpAccumPackedDecode<T, VecBytes>(acc[u], reinterpret_cast<const uint32_t*>(&vals[u][i]),
-                                           scales[i]);
+        WarpAccumPackedDecode<T, VecBytes>(acc[k / AccumNum],
+                     reinterpret_cast<const uint32_t*>(&vals[k - g]), scales[i]);
       }
-    }  // for Unroll
+      if constexpr (LoadDepth < kN) __builtin_amdgcn_sched_barrier(0);
+    } // for g
 
     union {
       DataType outVec[Unroll];
       uint32_t outWord[Unroll][VecBytes / 4];
     };
-#pragma unroll Unroll
+#pragma unroll
     for (int u = 0; u < Unroll; ++u) {
 #pragma unroll
       for (int k = 0; k < VecBytes / 4; ++k) {

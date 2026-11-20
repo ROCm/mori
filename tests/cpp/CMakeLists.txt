@@ -29,6 +29,9 @@ set_source_files_properties(ops/test_warp_accum.cpp PROPERTIES LANGUAGE HIP)
 target_include_directories(test_warp_accum PRIVATE ${CMAKE_SOURCE_DIR}/include
                                                    ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_warp_accum hip::host hip::device)
+# Match the kernel hipcc line (src/ops/CMakeLists.txt) so line tables in the
+# disassembly point at device_primitives.hpp and assert() stays compiled out.
+target_compile_options(test_warp_accum PRIVATE -gline-tables-only -DNDEBUG)
 if(DEFINED GPU_TARGETS)
   set_target_properties(test_warp_accum PROPERTIES HIP_ARCHITECTURES
                                                    "${GPU_TARGETS}")
@@ -37,6 +40,26 @@ if(DEFINED GPU_TARGETS)
   if(GPU_TARGETS STREQUAL "gfx950")
     target_compile_definitions(test_warp_accum
                                PRIVATE HIP_ENABLE_GFX950_OCP_BUILTINS=1)
+  endif()
+endif()
+
+# Two-GPU BlockCopy alignment sweep (P2P via shmem). Needs MPI and two GPUs,
+# so it is not registered with ctest.
+if(BUILD_SHMEM AND WITH_MPI)
+  find_package(MPI REQUIRED)
+  add_executable(test_block_copy ops/test_block_copy.cpp)
+  set_source_files_properties(ops/test_block_copy.cpp PROPERTIES LANGUAGE HIP)
+  target_include_directories(
+    test_block_copy PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}
+                            ${MPI_CXX_INCLUDE_DIRS})
+  target_link_libraries(test_block_copy mori_shmem hip::host hip::device
+                        ${MPI_CXX_LIBRARIES})
+  if(MORI_DEVICE_NIC_DEFINE)
+    target_compile_definitions(test_block_copy PRIVATE ${MORI_DEVICE_NIC_DEFINE})
+  endif()
+  if(DEFINED GPU_TARGETS)
+    set_target_properties(test_block_copy PROPERTIES HIP_ARCHITECTURES
+                                                     "${GPU_TARGETS}")
   endif()
 endif()
 
