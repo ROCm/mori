@@ -429,6 +429,12 @@ void RdmaManager::DeregisterLocalMemory(int devId, const MemoryDesc& desc) {
   }
 }
 
+void RdmaManager::RemoveEndpoints(const SnapshotVector& runtimes) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  for (const auto& rt : runtimes) endpointsById_.erase(rt->id);
+  endpointsEpoch_.fetch_add(1, std::memory_order_release);
+}
+
 void RdmaManager::DeregisterLocalBuffer(int devId, void* buf) {
   std::unique_lock<std::shared_mutex> lock(mu);
   if (devId >= 0 && devId < static_cast<int>(deviceCtxs.size()) && deviceCtxs[devId] != nullptr) {
@@ -922,23 +928,18 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey, SnapshotV
   }
 
   std::unique_lock<std::shared_mutex> lock(mu);
-  // The cut endpoints leave the poll loop's snapshot and the async event handler's view;
-  // the caller destroys them once nothing can still reach them.
-  for (auto it = endpointsById_.begin(); it != endpointsById_.end();) {
-    const EpPair& ep = it->second->ep;
-    bool wasCut = false;
-    for (size_t i = 0; i < victims.size() && !wasCut; ++i) {
-      wasCut = isCut[i] && victims[i].ldevId == ep.ldevId &&
-               victims[i].local.handle.qpn == ep.local.handle.qpn;
+  // Handed to the caller, which destroys them once the peer is unfenced. Until then they
+  // stay, so their QP numbers cannot go to new QPs (see RdmaBackend::FencedRelease).
+  for (const auto& [id, rt] : endpointsById_) {
+    if (released == nullptr) break;
+    for (size_t i = 0; i < victims.size(); ++i) {
+      if (isCut[i] && victims[i].ldevId == rt->ep.ldevId &&
+          victims[i].local.handle.qpn == rt->ep.local.handle.qpn) {
+        released->push_back(rt);
+        break;
+      }
     }
-    if (!wasCut) {
-      ++it;
-      continue;
-    }
-    if (released != nullptr) released->push_back(it->second);
-    it = endpointsById_.erase(it);
   }
-  endpointsEpoch_.fetch_add(1, std::memory_order_release);
   CutConnections& allCut = cutConnections_[remoteKey];
   allCut.localQpns.insert(allCut.localQpns.end(), cut.localQpns.begin(), cut.localQpns.end());
   allCut.peerQpns.insert(allCut.peerQpns.end(), cut.peerQpns.begin(), cut.peerQpns.end());
@@ -1032,6 +1033,12 @@ NotifManager::NotifManager(RdmaManager* rdmaMgr, const RdmaBackendConfig& cfg)
 NotifManager::~NotifManager() { Shutdown(); }
 
 void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) {
+  std::lock_guard<std::mutex> lock(mu);
+  // An unfence can take the endpoint out between its connect and this call: then it is
+  // gone from RdmaManager, or about to be unregistered under this lock, and must not be
+  // registered again.
+  if (rt == nullptr || rdma->GetEndpointRuntime(rt->id) == nullptr) return;
+
   if (config.pollCqMode == PollCqMode::EVENT) {
     epoll_event ev;
     ev.events = EPOLLIN;
@@ -1042,12 +1049,10 @@ void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) 
 
   // Skip notification setup if disabled
   if (!config.enableNotification) {
-    std::lock_guard<std::mutex> lock(mu);
     registeredRuntimes_[rt->id] = rt;
     return;
   }
 
-  std::lock_guard<std::mutex> lock(mu);
   if (notifCtxById_.find(rt->id) != notifCtxById_.end()) return;
 
   registeredRuntimes_[rt->id] = rt;
@@ -2379,24 +2384,21 @@ FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
   // Fence before dropping sessions. The other way round, a CreateSession racing
   // with us could still see the old endpoints, cache a session over them, and leave
   // it pointing at dead QPs once the fence lands.
-  FencedRelease release;
-  FenceResult result = rdma->FenceRemoteEngine(remote, &release.endpoints);
+  // Kept until the peer is unfenced: see FencedRelease.
+  FencedRelease& held = heldUntilUnfence_[remote];
+  FenceResult result = rdma->FenceRemoteEngine(remote, &held.endpoints);
   result.peerKnown = result.peerKnown || server->TryGetRemoteEnginePort(remote).has_value();
   notif->ForgetNotifications(remote);
-  for (const auto& rt : release.endpoints) notif->UnregisterEndpoint(*rt);
 
-  {
-    std::lock_guard<std::mutex> lock(sessionCacheMu);
-    for (auto it = sessionCache.begin(); it != sessionCache.end();) {
-      if (it->first.remoteEngineKey == remote) {
-        release.sessions.push_back(std::move(it->second));
-        it = sessionCache.erase(it);
-      } else {
-        ++it;
-      }
+  std::lock_guard<std::mutex> lock(sessionCacheMu);
+  for (auto it = sessionCache.begin(); it != sessionCache.end();) {
+    if (it->first.remoteEngineKey == remote) {
+      held.sessions.push_back(std::move(it->second));
+      it = sessionCache.erase(it);
+    } else {
+      ++it;
     }
   }
-  ScheduleRelease(std::move(release));
   return result;
 }
 
@@ -2444,6 +2446,15 @@ bool RdmaBackend::UnfenceRemoteEngine(const EngineKey& remote) {
   std::lock_guard<std::mutex> fenceGuard(fenceMu_);
   CutConnections cut;
   if (!rdma->UnfenceRemoteEngine(remote, &cut)) return false;
+  // What the fences cut goes now, after the delay: the peer may reach this engine again,
+  // and its QPs to them were cut.
+  auto held = heldUntilUnfence_.find(remote);
+  if (held != heldUntilUnfence_.end()) {
+    rdma->RemoveEndpoints(held->second.endpoints);
+    for (const auto& rt : held->second.endpoints) notif->UnregisterEndpoint(*rt);
+    ScheduleRelease(std::move(held->second));
+    heldUntilUnfence_.erase(held);
+  }
   // Sessions of ours that raced the fence wait to be replaced; they may try again now.
   ForgetQpReplacementBackoff(remote);
   // The peer's QPs died because of the fence, and it paces their replacement as if its path

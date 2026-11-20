@@ -97,6 +97,9 @@ class RdmaManager {
   application::RdmaMemoryRegion RegisterLocalMemory(int ldevId, const MemoryDesc& desc);
   void DeregisterLocalMemory(int ldevId, const MemoryDesc& desc);
   void DeregisterLocalMemory(const MemoryDesc& desc);
+  // Takes endpoints out of endpointsById_, so the poll loop and the async event handler no
+  // longer see them, ahead of their destruction.
+  void RemoveEndpoints(const SnapshotVector& runtimes);
   // Deregisters a buffer this engine registered for itself on `devId`, under the same lock
   // as user memory, so the two never touch the device's region table at once.
   void DeregisterLocalBuffer(int devId, void* buf);
@@ -147,10 +150,9 @@ class RdmaManager {
   // Takes every connection to `remoteKey` out of service. Each QP is moved to
   // Error so the peer can no longer write through it, then removed from the route
   // table so no new session picks it up, and its in-flight transfers are failed.
-  // The endpoints it cut also leave endpointsById_ and are handed to the caller in
-  // `released`, to be destroyed once nothing can still reach them; until then the QP
-  // objects stay allocated. Registered memory is left untouched, so the peer can
-  // reconnect through the normal handshake.
+  // The endpoints it cut are handed to the caller in `released`, to be destroyed once the
+  // peer is unfenced; until then they stay, QP objects included. Registered memory is
+  // left untouched, so the peer can reconnect through the normal handshake.
   //
   // The peer also stays fenced: ConnectEndpoint refuses it, in either direction,
   // until UnfenceRemoteEngine. Cutting the QPs alone is not enough, because a peer
@@ -557,17 +559,27 @@ class RdmaBackend : public Backend {
   // would let the peer back in while the fence goes on to treat it as fenced.
   std::mutex fenceMu_;
 
-  // What a fence cut, destroyed by a reaper thread once the delay has passed. Nothing new
-  // reaches it: the fence closed each endpoint's ledger, which waits out posts already
-  // under way and refuses the rest, removed it from the poll loop, and took its sessions
-  // out of the cache. The delay covers what is left: a notification send that passed
-  // admission just before the fence, the poll loop's last pass, and a caller still
-  // returning from a session it took before the fence.
+  // What fences of a peer cut: its endpoints and the sessions taken out of the cache.
+  //
+  // Kept while the peer is fenced. Every MORI QP starts at PSN 0, and a destroyed QP's
+  // number goes to the next QP at once, so a QP of the peer that never sent anything
+  // would line up with whichever QP took the number, and its write would land. Kept, the
+  // numbers stay taken.
+  //
+  // Destroyed by a reaper thread once the peer is unfenced and the delay has passed.
+  // Nothing new reaches them by then: the fence closed each endpoint's ledger, which
+  // waits out posts already under way and refuses the rest, and the unfence took them
+  // out of the poll loop. The delay covers what is left: a notification send that passed
+  // admission just before the fence, the poll loop's last pass, a caller still returning
+  // from a session it took before the fence, and a WR of the peer still retrying on its
+  // side of a cut QP.
   struct FencedRelease {
     std::chrono::steady_clock::time_point at;
     RdmaManager::SnapshotVector endpoints;
     std::vector<std::unique_ptr<RdmaBackendSession>> sessions;
   };
+  // Guarded by fenceMu_.
+  std::unordered_map<EngineKey, FencedRelease> heldUntilUnfence_;
   void ScheduleRelease(FencedRelease release);
   void ReleaseLoop();
   std::chrono::milliseconds fenceReleaseDelay_{10000};

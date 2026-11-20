@@ -45,8 +45,11 @@
 //   8. idle producer       its first write after the unfence rebuilds at once
 //   9. notifications       a fence forgets the peer's completed notifications
 //  10. unresponsive peer   unfence returns without waiting for the peer to take the notice
-//  11. repeated fences     what each fence cut is destroyed after the release delay, while
-//                          the engines keep running; a session over it stays dead
+//  11. repeated fences     what each fence cut is destroyed after the unfence and the
+//                          release delay, while the engines keep running; a session over it
+//                          stays dead
+//  12. QP number reuse     while fenced, a peer's QP that never sent anything cannot write
+//                          through a new QP that took the number of one the fence cut
 //
 // Every case runs over host memory and, when a GPU is visible, again over device
 // memory, so the NIC is also shown to stop writing into VRAM.
@@ -566,15 +569,44 @@ void TestRepeatedFencesReleaseWhatTheyCut(Rig& rig) {
           "the producer must write" + at);
     FenceResult fence = rig.receiver->FenceRemoteEngine(kProducer);
     CHECK(fence.Ok() && fence.endpointsFenced >= 1, "fence must cut the producer" + at);
-    // Long enough for what the fence cut to be destroyed under the running engines.
+    CHECK(rig.receiver->UnfenceRemoteEngine(kProducer), "producer must have been fenced" + at);
+    // Long enough for what the fence cut to be destroyed under the running engines, which
+    // starts at the unfence.
     std::this_thread::sleep_for(std::chrono::milliseconds(5 * kReleaseDelayMs));
     CHECK(!sess->Alive(), "a session over a destroyed QP must stay dead" + at);
-    CHECK(rig.receiver->UnfenceRemoteEngine(kProducer), "producer must have been fenced" + at);
-    std::this_thread::sleep_for(std::chrono::milliseconds(kUnfencedNoticeMs));
   }
   dst.Fill(0x00);
   CHECK(WriteEventually(rig.producer.get(), src, dst, kRebuildBudgetMs) && dst.AllEqual(0x71),
         "the producer must write after the last unfence");
+}
+
+void TestFencedPeerCannotWriteThroughAReusedQpNumber(Rig& rig) {
+  // Fresh engines, so the producer's connection is new and never carries a byte: its QP's
+  // next PSN is 0, as every MORI QP's is.
+  std::unique_ptr<IOEngine> producer = CreateEngine("fence_reuse_producer");
+  std::unique_ptr<IOEngine> newcomer = CreateEngine("fence_reuse_newcomer");
+  Link(producer.get(), rig.receiver.get());
+  Link(newcomer.get(), rig.receiver.get());
+  Buffer src(producer.get(), 0xEE);
+  Buffer dst(rig.receiver.get(), 0x00);
+  std::optional<IOEngineSession> sess = producer->CreateSession(src.desc, dst.desc);
+  CHECK(sess.has_value(), "the producer must connect");
+
+  CHECK(rig.receiver->FenceRemoteEngine("fence_reuse_producer").Ok(), "fence must succeed");
+  std::this_thread::sleep_for(std::chrono::milliseconds(5 * kReleaseDelayMs));
+  // Another peer connects without sending: the receiver's new QP also expects PSN 0. Had the
+  // fence's QP been destroyed, the new one could have taken its number.
+  Buffer other(newcomer.get(), 0x11);
+  std::optional<IOEngineSession> otherSess = newcomer->CreateSession(other.desc, dst.desc);
+  CHECK(otherSess.has_value(), "the newcomer must connect");
+
+  // The fenced producer writes over the QP it still takes for live.
+  dst.Fill(0x00);
+  TransferStatus status;
+  sess->Write(0, 0, kBufSize, &status, sess->AllocateTransferUniqueId());
+  WaitOrStop(&status, kStaleWriteTimeoutMs);
+  CHECK(dst.AllEqual(0x00), "a fenced peer's write must not land in the receiver");
+  CHECK(rig.receiver->UnfenceRemoteEngine("fence_reuse_producer"), "the producer was fenced");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -614,6 +646,8 @@ int main() {
       {"10. unfence does not wait for an unresponsive peer",
        TestUnfenceDoesNotWaitForAnUnresponsivePeer},
       {"11. repeated fences release what they cut", TestRepeatedFencesReleaseWhatTheyCut},
+      {"12. a fenced peer cannot write through a reused QP number",
+       TestFencedPeerCannotWriteThroughAReusedQpNumber},
   };
 
   int passed = 0;
