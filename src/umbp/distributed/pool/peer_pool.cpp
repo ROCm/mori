@@ -54,6 +54,13 @@ constexpr std::chrono::milliseconds kEvictRetryIdlePause{20};
 
 // One tier over one backend that never offloads or promotes (pure SSD): no
 // transition to plan, so a resolve can take the policy-free direct path.
+// `bytes` as the medium charges them: whole pages.  Pool rules count and
+// budget in these units so they add up with the medium's own offers.
+uint64_t CapacityBytes(const MediumBackend* backend, uint64_t bytes) {
+  const uint64_t page = backend == nullptr ? 0 : backend->PageSize();
+  return page == 0 ? bytes : (bytes + page - 1) / page * page;
+}
+
 bool TrivialTierGraph(const LogicalTierGraph& graph) {
   if (graph.TierCount() != 1) return false;
   const auto& node = graph.NodeAt(0);
@@ -190,6 +197,17 @@ void PeerPool::ForgetAccessLocked(const std::string& key) {
 bool PeerPool::PromoteOnReadLocked(const std::string& key,
                                    LogicalTierGraph::TierIndex source_tier) {
   const auto& tier = tier_graph_->NodeAt(source_tier);
+  if (rules_.Active()) {
+    // A pool rule, where the key has one, overrides the tier's trigger.
+    switch (rules_.Promote(key)) {
+      case PoolRulePromote::kNever:
+        return false;
+      case PoolRulePromote::kOnRead:
+        return true;
+      case PoolRulePromote::kTier:
+        break;
+    }
+  }
   switch (tier.promote_trigger) {
     case PoolPromoteTrigger::kNever:
       return false;
@@ -230,6 +248,8 @@ size_t PeerPool::EnqueueWatermarkCandidatesLocked(LogicalTierGraph::TierIndex ti
     // member while the full one stays full.
     if (!tier_graph_->MemberAtOrAbove(backend_id, tier.low_watermark)) return;
     if (migrating_keys_.count(key) != 0) return;
+    // A class that is dropped rather than demoted is not offloaded ahead of time either.
+    if (rules_.Active() && !rules_.ShouldDemote(key)) return;
     candidates.push_back({TierTransitionKind::kOffload, key, backend_id, tier_index});
   };
 
@@ -324,6 +344,12 @@ void PeerPool::FinishTransitionLocked(const TransitionJob& job,
   auto placement = placements_.find(job.key);
   if (placement != placements_.end() && placement->second == job.source_backend_id) {
     placement->second = result.target_backend_id;
+    if (rules_.Active()) {
+      auto* target = backends_ == nullptr ? nullptr : backends_->Get(result.target_backend_id);
+      rules_.OnMoved(
+          job.key, result.target_backend_id, target == nullptr ? TierType::UNKNOWN : target->Tier(),
+          job.kind == TierTransitionKind::kPromotion, CapacityBytes(target, result.bytes_moved));
+    }
   }
   if (result.source_draining) {
     draining_sources_[job.key].insert(job.source_backend_id);
@@ -629,8 +655,30 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
       continue;
     }
 
+    // Put decision: a key whose pool rule does not admit its class is not stored.
+    if (rules_.Active() && !rules_.Admit(requests[i].key, requests[i].size)) {
+      out[i].allocation.outcome = AllocateOutcome::kFailed;
+      out[i].declined = true;
+      continue;
+    }
+
     put_orders[i] = policy_->PutOrder(*backends_, requests[i]);
     PreferSourceDevice(requests[i].preferred_device, &put_orders[i]);
+    // A class that is not written to a lower tier is not placed on one when
+    // its entry tier is full either: that put fails instead of overflowing.
+    if (rules_.Active() && put_orders[i].size() > 1 && rules_.EntryTierOnly(requests[i].key)) {
+      const auto* entry = backends_->Get(put_orders[i].front());
+      if (entry != nullptr) {
+        const TierType entry_tier = entry->Tier();
+        put_orders[i].erase(std::remove_if(put_orders[i].begin() + 1, put_orders[i].end(),
+                                           [&](uint32_t id) {
+                                             const auto* candidate = backends_->Get(id);
+                                             return candidate == nullptr ||
+                                                    candidate->Tier() != entry_tier;
+                                           }),
+                            put_orders[i].end());
+      }
+    }
     if (!put_orders[i].empty()) {
       const uint32_t selected = put_orders[i].front();
       pending_keys_[requests[i].key] =
@@ -788,6 +836,12 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
         if (backend_results[i].success) {
           placements_[request.key] = backend_id;
           TouchLocked(request.key);
+          if (rules_.Active()) {
+            auto* stored_on = backends_->Get(backend_id);
+            rules_.OnStored(request.key, backend_id,
+                            stored_on == nullptr ? TierType::UNKNOWN : stored_on->Tier(),
+                            CapacityBytes(stored_on, backend_results[i].bytes_committed));
+          }
         }
       }
       auto pending = pending_keys_.find(request.key);
@@ -902,6 +956,11 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       out[i].resolved = std::move(resolved[i]);
       out[i].resolved.outcome = outcome;
     }
+    if (rules_.Active()) {
+      for (size_t i = 0; i < out.size() && i < keys.size(); ++i) {
+        if (out[i].resolved.found) rules_.OnAccess(keys[i], /*read=*/true);
+      }
+    }
     if (all_found || (batch_busy && busy_discards)) return out;
     // A plain miss is authoritative, while kFailed needs one ownership probe:
     // a backend can still own a key whose descriptor shape it cannot return.
@@ -915,6 +974,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       if (placement == placements_.end() || placement->second != direct_backend_id) continue;
       placements_.erase(placement);
       ForgetAccessLocked(keys[i]);
+      if (rules_.Active()) rules_.OnDropped(keys[i]);
     }
     return out;
   }
@@ -1053,6 +1113,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       // resurrect only its LRU entry from a resolve that started earlier.
       const bool still_placed = metadata_current || placements_.find(keys[i]) != placements_.end();
       if (still_placed) TouchLocked(keys[i]);
+      if (still_placed && rules_.Active()) rules_.OnAccess(keys[i], /*read=*/true);
       if (tier_graph_ != nullptr) {
         ++tier_read_hits_[tier_graph_->NameForBackend(out[i].backend_id)];
       }
@@ -1070,6 +1131,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       // it accumulates there for the life of the process and skews LRU order.
       placements_.erase(keys[i]);
       ForgetAccessLocked(keys[i]);
+      if (rules_.Active()) rules_.OnDropped(keys[i]);
     }
   }
   return out;
@@ -1189,6 +1251,9 @@ size_t PeerPool::BatchTouch(const std::vector<std::string>& keys) {
   // operation_mutex_, as in BatchContains.
   size_t touched = 0;
   for (auto* backend : backends_->All()) touched += backend->Touch(keys);
+  if (rules_.Active()) {
+    for (const auto& key : keys) rules_.OnAccess(key, /*read=*/false);
+  }
   if (track_access_order_) {
     // Watermark offload picks from this order, which a read moves too.  Only
     // placed keys: the access index must not keep ones that are not stored.
@@ -1222,6 +1287,7 @@ void PeerPool::RepairAfterDropLocked(const std::string& key) {
   placements_.erase(key);
   ForgetAccessLocked(key);
   draining_sources_.erase(key);
+  if (rules_.Active()) rules_.OnDropped(key);
 }
 
 std::vector<PoolEvictResult> PeerPool::Evict(const std::vector<std::string>& keys,
@@ -1285,6 +1351,9 @@ std::vector<PoolEvictResult> PeerPool::Evict(const std::vector<PoolEvictRequest>
       demote = placement != placements_.end() && placement->second == source_id &&
                tier_index.has_value() && !tier_graph_->NodeAt(*tier_index).offload_to.empty();
     }
+    // Move decision: the key's pool rule may say its class is dropped, not
+    // written to the next tier (PoolRule::demote, retain_s).
+    if (demote && rules_.Active() && !rules_.ShouldDemote(request.key)) demote = false;
     if (demote) {
       demotions.emplace_back(i, source_id);
     } else {
@@ -1523,6 +1592,10 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
     }
     auto offers = backend->EvictionCandidates(window);
     const bool exhausted = offers.size() < window;
+    // Eviction decision: with weighted pool rules in force the order is idle
+    // time x weight, not the medium's plain recency.  A medium that owns its
+    // order (segments) keeps it.
+    if (!own_order && rules_.Weighted()) rules_.ApplyWeights(backend_id, exhausted, &offers);
     offers.erase(std::remove_if(offers.begin(), offers.end(),
                                 [&](const EvictionOffer& o) { return settled.count(o.key) != 0; }),
                  offers.end());
@@ -1622,6 +1695,7 @@ void PeerPool::ClearLocal() {
   draining_sources_.clear();
   pending_keys_.clear();
   pending_slots_.clear();
+  rules_.ClearKeys();
   last_access_.clear();
   access_order_.clear();
   promote_hit_counts_.clear();

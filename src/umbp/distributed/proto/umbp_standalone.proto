@@ -19,6 +19,10 @@ service UMBPStandalone {
   rpc BatchPrefetch(BatchKeysRequest) returns (CountResponse);
   // IUMBPClient::BatchTouch; a server without it answers UNIMPLEMENTED.
   rpc BatchTouch(BatchKeysRequest) returns (CountResponse);
+  // Pool rules (doc/pool-rules.md); a server without them answers UNIMPLEMENTED.
+  rpc BatchSetKeyClass(KeyClassRequest) returns (CountResponse);
+  rpc SetPoolRules(PoolRulesRequest) returns (BoolResponse);
+  rpc GetPoolRulesState(Empty) returns (PoolRulesStateResponse);
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);
@@ -84,6 +88,22 @@ message KeyRequest {
 
 message BatchKeysRequest {
   repeated string keys = 1;
+}
+
+// One tag per key, or a single tag for all of them.
+message KeyClassRequest {
+  string pool = 1;
+  repeated string keys = 2;
+  repeated uint32 tags = 3;
+}
+
+message PoolRulesRequest {
+  string pool = 1;
+  string table_json = 2;
+}
+
+message PoolRulesStateResponse {
+  string json = 1;
 }
 
 message PutRequest {

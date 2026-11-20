@@ -214,6 +214,9 @@ struct EvictionVictim {
 struct EvictionOffer {
   std::string key;
   uint64_t bytes = 0;
+  // Milliseconds since the key was last used, or -1 when the medium does not
+  // keep that (its order then stands as offered).
+  int64_t idle_ms = -1;
 
   bool operator==(const EvictionOffer& other) const {
     return key == other.key && bytes == other.bytes;

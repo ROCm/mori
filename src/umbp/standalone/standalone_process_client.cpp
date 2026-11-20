@@ -873,6 +873,64 @@ size_t StandaloneProcessClient::BatchTouch(const std::vector<std::string>& keys)
   return status.ok() ? static_cast<size_t>(resp.count()) : 0;
 }
 
+size_t StandaloneProcessClient::BatchSetKeyClass(const std::string& pool,
+                                                 const std::vector<std::string>& keys,
+                                                 const std::vector<uint32_t>& tags) {
+  if (closing_ || keys.empty()) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return 0;
+  grpc::ClientContext ctx;
+  ::umbp::KeyClassRequest req;
+  req.set_pool(pool);
+  for (const auto& key : keys) req.add_keys(key);
+  for (uint32_t tag : tags) req.add_tags(tag);
+  ::umbp::CountResponse resp;
+  // A server built before pool rules answers UNIMPLEMENTED: no key gets a class.
+  const grpc::Status status = stub_->BatchSetKeyClass(&ctx, req, &resp);
+  if (status.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
+    static std::once_flag warned;
+    std::call_once(warned, [this] {
+      MORI_UMBP_WARN(
+          "[StandaloneProcessClient] server {} predates pool rules; key classes are ignored",
+          address_);
+    });
+  }
+  return status.ok() ? static_cast<size_t>(resp.count()) : 0;
+}
+
+bool StandaloneProcessClient::SetPoolRules(const std::string& pool, const std::string& table_json,
+                                           std::string* error) {
+  const auto fail = [error](std::string reason) {
+    if (error != nullptr) *error = std::move(reason);
+    return false;
+  };
+  if (closing_) return fail("the client is closed");
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return fail("the client is closed");
+  grpc::ClientContext ctx;
+  ::umbp::PoolRulesRequest req;
+  req.set_pool(pool);
+  req.set_table_json(table_json);
+  ::umbp::BoolResponse resp;
+  const grpc::Status status = stub_->SetPoolRules(&ctx, req, &resp);
+  if (status.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
+    return fail("the server predates pool rules");
+  }
+  if (!status.ok()) return fail(status.error_message());
+  if (!resp.ok()) return fail(resp.error());
+  return true;
+}
+
+std::string StandaloneProcessClient::GetPoolRulesState() {
+  if (closing_) return {};
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return {};
+  grpc::ClientContext ctx;
+  ::umbp::Empty req;
+  ::umbp::PoolRulesStateResponse resp;
+  return stub_->GetPoolRulesState(&ctx, req, &resp).ok() ? resp.json() : std::string();
+}
+
 bool StandaloneProcessClient::Clear() {
   SimCall call(sim_trace_.get(), "clear", 0, 0);
   if (closing_) return call.Result(true);

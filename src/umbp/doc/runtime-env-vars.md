@@ -178,6 +178,7 @@ operators can find them in one place.
 |---|---|
 | `UMBP_MASTER_ADDRESS` | `host:port` of the master to connect to (e.g. `10.0.0.1:15558`).  **Optional.**  Without it the same client is an embedded deployment: same backends and transfer engine, nothing routed, registered or heartbeated, and a local miss is the final answer.  It is also what decides whether the backend evicts for itself and whether it records heartbeat events at all. |
 | `UMBP_BACKEND_POLICY` | JSON backend/tier policy used by a distributed-backed standalone server. |
+| `UMBP_POOL_RULES` | Path to a JSON file of per-pool rule tables (`{"pools": {"<pool>": {...}}}`) loaded when the storage owner starts; see [`pool-rules.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/pool-rules.md). Unset = no rules. A file that cannot be read or parsed stops the start. Tables can be replaced later with `SetPoolRules`. |
 | `UMBP_MASTER_LISTEN` | `host:port` the master should listen on (when starting it locally). |
 | `UMBP_MASTER_AUTO_START` | `true`/`false`: auto-spawn `umbp_master` on this node before connecting. |
 | `UMBP_MASTER_BIN` | Path to the `umbp_master` binary. The Python `mori.umbp` package auto-fills this from the packaged binary; override to point at a custom build. |
