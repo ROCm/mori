@@ -144,7 +144,7 @@ win = comm.register_window(mem.ptr, mem.size)   # RegisteredWindow: .handle, .lo
 | `gda_signal_count` | # of GDA signal slots (completion signalling) |
 | `gda_counter_count` | # of GDA counter slots |
 | `lsa_barrier_count` | # of intra-node (LSA) barriers |
-| `sdma_queue_count` | # of SDMA queues (0 = default) |
+| `sdma_queue_count` | # of SDMA queues per peer (0 = none; needs `MORI_ENABLE_SDMA=1`) |
 
 ```python
 reqs = CCODevCommRequirements()          # safe defaults

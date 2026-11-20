@@ -335,10 +335,11 @@ class DevCommHandle(CCOResource):
     def sdma_num_queue(self) -> int:
         """SDMA queues per peer this communicator actually connected.
 
-        Not the requested count: cco adopts what was really set up, and that is
-        0 -- with a logged error but no failure -- when the library was built
-        BUILD_CCO_SDMA=OFF, MORI_ENABLE_SDMA is unset, or no peer reports SDMA.
-        Every ccoSdma put on such a communicator moves no bytes.
+        Not the requested count: cco adopts what was really set up. It is 0 when
+        ``sdma_queue_count`` is 0, and also -- with a logged error but no
+        failure -- when the library was built BUILD_CCO_SDMA=OFF,
+        MORI_ENABLE_SDMA is unset, or no peer reports SDMA. Every ccoSdma put on
+        such a communicator moves no bytes.
         """
         self._check_valid()
         return self._dev_comm.sdma_num_queue

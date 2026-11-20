@@ -40,12 +40,12 @@ Runtime:
 | `MORI_CCO_SDMA_DEBUG` | compile-time (`-DMORI_CCO_SDMA_DEBUG`): turns the misuse checks below into traps. Off in release, zero cost |
 
 Queue count is a property of the comm, not the environment: set
-`reqs.sdmaQueueCount` before `ccoDevCommCreate`. `MORI_SDMA_NUM_CHANNELS` is only
-the fallback when it is left at 0. Default 2, hardware cap 8 (clamped with a
-warning above that).
+`reqs.sdmaQueueCount` (queues per peer) before `ccoDevCommCreate`. It is what asks
+for queues; `MORI_ENABLE_SDMA` only permits them, and a count of 0 creates none.
+Hardware cap 8 (clamped with a warning above that).
 
-The count is fixed by the **first** `ccoDevCommCreate` on a comm; later ones with
-a different value warn and keep the original.
+The count is fixed by the **first** `ccoDevCommCreate` on a comm that asks for
+queues; later ones with a different value warn and keep the original.
 
 ## Host setup
 
@@ -57,7 +57,7 @@ ccoWindowRegister(comm, buf, bytes, &win);   // both src and dst
 ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
 reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;   // SDMA needs no GDA
 reqs.gdaContextCount = reqs.gdaSignalCount = reqs.gdaCounterCount = 0;
-reqs.sdmaQueueCount = 8;                            // 0 = env / default 2
+reqs.sdmaQueueCount = 8;                            // 0 = no SDMA queues
 ccoDevComm devComm{};
 ccoDevCommCreate(comm, &reqs, &devComm);
 
