@@ -965,6 +965,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return self._scale_row_bytes()
         return self._disp_infos[0]["scaleStride"]
 
+    def _dispatch_warps(self, cfg, spec):
+        """The warp count a dispatch plan of this schedule row is built with. The LL
+        dispatch's warps are its role split, so unless the caller pinned one the Cfg
+        derives it from the payload (0 asks for that) instead of taking the table's.
+
+        Pinned means the CALLER set it: _resolve_geometry has already filled the field
+        from the tuning table by the time a backend sees the config, so the field being
+        non-None says nothing. _pinned_geometry is the record of what was passed in."""
+        if cfg.ll_dispatch and "warp_num_per_block" not in cfg._pinned_geometry:
+            return 0
+        return spec.warp_per_block
+
     def _describe(self, cfg):
         """(dispatch infos, combine infos): every intranode variant, asked of
         describe(), which compiles nothing. Empty on the internode and AsyncLL
@@ -977,7 +989,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 cb.EpDispatchPlan.describe(
                     **self._variant_request(disp, blocks),
                     block_num=spec.block_num,
-                    warp_per_block=spec.warp_per_block,
+                    warp_per_block=self._dispatch_warps(cfg, spec),
                     call_tok_max=cap,
                 )
                 for spec in self._dispatch_specs
@@ -1158,6 +1170,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             disp["card_combine"] = True
             if self._card["pull_blocks"]:
                 disp["card_pull_blocks"] = self._card["pull_blocks"]
+        if cfg.ll_dispatch:
+            disp["ll_dispatch"] = True
         comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
         if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
             comb["combine_fp4"] = True
@@ -1244,6 +1258,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
+        if cfg.ll_dispatch and (cfg.async_ll or cfg.is_internode or self._is1250):
+            return (
+                "ll_dispatch (the portable wave64 intranode dispatch: gfx942 / gfx950, "
+                "one node, not async_ll)",
+            )
         if cfg.async_ll:
             return self._asyncll_unsupported(cfg)
         if cfg.is_internode:
@@ -2099,7 +2118,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     **self._variant_request(disp_req, blocks),
                     **bound,
                     block_num=spec.block_num,
-                    warp_per_block=spec.warp_per_block,
+                    warp_per_block=self._dispatch_warps(cfg, spec),
                     call_tok_max=cap,
                 )
                 plan.bind(rank=cfg.rank)
