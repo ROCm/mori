@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cco-fusion/candidate/v1",
+  "title": "Frozen candidate manifest",
+  "description": "Written by the implementer when it freezes a candidate; read by the verifier. See .claude/skills/cco-fusion-loop/templates/candidate.example.json.",
+  "type": "object",
+  "required": [
+    "task",
+    "candidate",
+    "commit",
+    "code_objects",
+    "run_command",
+    "baseline_command"
+  ],
+  "properties": {
+    "task": {
+      "type": "string"
+    },
+    "candidate": {
+      "type": "string"
+    },
+    "contract_revision": {
+      "type": [
+        "string",
+        "integer"
+      ]
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "branch": {
+      "type": "string"
+    },
+    "switches": {
+      "type": "object"
+    },
+    "code_objects": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "kernel",
+          "sha256"
+        ],
+        "properties": {
+          "kernel": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "isa": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "build": {
+      "type": "object"
+    },
+    "self_check": {
+      "type": "object"
+    },
+    "prediction": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "design_note": {
+      "type": "string"
+    },
+    "run_command": {
+      "type": "string"
+    },
+    "baseline_command": {
+      "type": "string"
+    }
+  }
+}

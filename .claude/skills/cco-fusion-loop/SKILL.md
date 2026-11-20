@@ -1,0 +1,269 @@
+---
+name: cco-fusion-loop
+description: >-
+  Drive the compute-communication fusion loop for a mori fused GEMM +
+  collective operator (GEMM + AR/RS/AG/A2A, AG or A2A + GEMM, MoE
+  dispatch/combine over cco SDMA or LSA with FlyDSL on gfx950 / MI355X): write
+  the contract, measure the split baseline and the fusion bounds, decide go or
+  no-go, have the cco-sdma-fusion agent design and build candidates, have the
+  cco-fusion-verifier agent verify a frozen candidate, then accept or route
+  back. Use when the user asks to fuse, port, tune or evaluate such an operator
+  for a model or a shape, or asks whether fusing is worth it. The main session
+  runs this loop and does not write kernel code itself.
+---
+
+# cco-fusion-loop
+
+The main session runs this loop. It owns the contract, the records and every decision,
+and it is the only one that talks to the user. It delegates building to the
+`cco-sdma-fusion` agent and acceptance measurements to the `cco-fusion-verifier` agent.
+
+## Roles
+
+| Role | Who | Does | Does not |
+|---|---|---|---|
+| Owner | the user | approves the contract, any change to it, and every outward action | |
+| Orchestrator | the main session, with this skill | contract, bounds, briefs, routing, records, final report | write kernel code; certify a candidate |
+| Implementer | `cco-sdma-fusion` agent | designs, builds, debugs, self-checks, freezes candidates | judge its own candidate; change the contract |
+| Verifier | `cco-fusion-verifier` agent: a fresh context, on a different model from the implementer | checks a frozen candidate on held-out shapes and times it against the baseline | edit code; tune; reuse the implementer's numbers |
+
+Subagents cannot ask the user anything. A subagent that lacks an input returns the
+list of what is missing, and the orchestrator asks the owner.
+
+The two agents pin different models (`opus` for the implementer, `sonnet` for the
+verifier). If you change one, keep them different.
+
+## Before starting
+
+- **Branch.** Work on a branch based on current main; the benchmarks and tests this
+  loop calls live there.
+- **Records.** One directory per task, outside Git:
+  `${CCO_FUSION_RECORDS:-$HOME/.mori-cco-fusion}/<task>/`. Layout in [Records](#records).
+- **Facts.** Numbers come from the `cco-fusion-facts` skill, cited by ID. Anything not
+  there is measured in this task or labelled `inferred`.
+- **FlyDSL skills.** `isa-resource-diff` and the other FlyDSL skills live in the FlyDSL
+  repository. If they are not visible, link them into `~/.claude/skills/`.
+- **GPUs come from the user.** The session runs on a node or in a container that already
+  has the GPUs, or the contract names a launcher prefix (`environment.launcher`). The
+  harness never allocates or reserves nodes; if no GPU environment is available, stop
+  and ask the owner. Never use a GPU another job holds. Multi-GPU jobs and profiling
+  take the whole node. One job per node, a timeout on every run, and about 10 s between
+  8-rank runs (`G950-ENV-05`).
+- **Architecture.** This loop and its facts are for gfx950. On any other architecture,
+  stop and tell the owner; the facts and the ISA rules do not carry over.
+
+## The loop
+
+| Step | Who | Output | Leave when |
+|---|---|---|---|
+| 0. Contract | orchestrator with the owner | `contract.yaml` | the owner approves it |
+| 1. Baseline and bounds | orchestrator; measurements may be delegated to the implementer | `bounds.md` | go or no-go is decided |
+| 2. Design | implementer | `design/<candidate>.md` | predictions and switches are written down |
+| 3. Build, check, diagnose | implementer | development runs, candidate manifest | a candidate is frozen |
+| 4. Verify, then accept or route | verifier, then orchestrator | `verdict.json`, a row in `decisions.md` | accepted, routed back, or stopped |
+| 5. Deliver | orchestrator, implementer | operator, dispatch rule, tests, `report.md` | the owner approves outward actions |
+
+### Step 0. Contract
+
+Copy `benchmark/cco/harness/contract.example.yaml` to `<records>/contract.yaml` and fill
+it in with the owner: workload and shapes, baseline, correctness rule, protocol,
+targets, budget and stop rule, environment. If an item has no value and no default,
+ask the owner; do not guess. The owner approves the contract. Any later change to
+shapes, baseline, correctness rule, targets, budget or protocol needs approval again.
+
+### Step 1. Baseline and bounds
+
+Measure the fastest GEMM, the fastest collective, the split path end to end with its
+in-pipeline phase times, and the GEMM and collective running concurrently
+(`benchmark/cco/harness/run.py` for the end-to-end modes). Compute
+`T_ideal` and `T_real` per bucket (with an `n` sweep), estimate the other levers
+(a narrower wire, another collective, a faster GEMM), and decide go or no-go. Method and
+a worked example: [reference/bounds.md](reference/bounds.md);
+`benchmark/cco/harness/bound.py` computes them from a phase list. Write `bounds.md`.
+
+### Step 2. Design
+
+Brief the implementer with the contract path, `bounds.md`, the fact IDs that apply and
+the records path. It returns one design note per candidate
+([templates/design-note.md](templates/design-note.md)), following
+[reference/design-checklist.md](reference/design-checklist.md), each with a predicted
+time per bucket. Rank the candidates by expected gain and risk and choose the next one.
+
+### Step 3. Build, check, diagnose
+
+The implementer builds the chosen candidate behind switches, passes its own
+correctness gate and ISA check (`benchmark/cco/harness/isa_check.py`), measures the
+variants, decomposes the gap and iterates
+one change at a time ([reference/diagnosis.md](reference/diagnosis.md)). When it
+considers the candidate ready, it freezes it: a commit plus a candidate manifest
+([templates/candidate.example.json](templates/candidate.example.json)). Its numbers are
+development numbers, not acceptance numbers.
+
+### Step 4. Verify, then accept or route
+
+Start a fresh `cco-fusion-verifier` with three paths only: the contract, the candidate
+manifest and the records directory. Do not pass the implementer's conclusions. The
+verifier checks out the frozen commit, checks the code-object hashes, runs the
+correctness gate on held-out shapes it draws itself, measures the candidate and the
+baseline under [reference/measurement-protocol.md](reference/measurement-protocol.md),
+and writes `verdict.json` ([templates/verdict.example.json](templates/verdict.example.json)).
+
+Accept the candidate when all of these hold:
+
+1. Correctness and robustness pass on the frozen build.
+2. In every target bucket it beats the fastest split path, the stream-level overlap and
+   any existing fused implementation (where they exist) by more than the noise band.
+3. `η_real` meets the contract's target, where
+   `η = (T_split - T_fused) / (T_split - T_bound)`, computed for `T_ideal` and `T_real`.
+   `η_ideal` shows what a different structure could still give. Explain any `η` above 1
+   before believing it.
+4. The gain is attributed to the GEMM, the wire format and the overlap separately.
+5. No other bucket regresses; the crossover M between fused and split is recorded as the
+   dispatch rule.
+
+Otherwise route by the finding:
+
+| Finding | Next |
+|---|---|
+| The gap is mostly fusion tax, synchronization or issuing | step 3, same design |
+| The gap is structural: the exposed tail follows from the dependencies, the consumer is in the wrong place, or the transport does not fit | step 2, another design |
+| The measurements contradict the model: more contention than assumed, or the baseline changed | step 1, redo the bounds |
+| `η_real` near 1 but `η_ideal` low | step 2 (a structure that overlaps more) or step 1 (another lever, such as a narrower wire) |
+| A stop rule fired | stop: record the negative result and the crossover |
+
+Every pass through step 4 adds a row to `decisions.md`
+([templates/records.md](templates/records.md)).
+
+### Step 5. Deliver
+
+- The operator API and its per-bucket dispatch rule (fused or split, from the crossover).
+- CI tests: correctness, counter wrap, an assertion that the fused path ran, and one
+  same-process ordering (fused faster than split) in the style of
+  `tests/python/cco/test_gemm_ar_bench.py`. Absolute times are recorded, not asserted.
+- `report.md` ([templates/records.md](templates/records.md)).
+- New measured facts and "measured, no gain" entries in the operator README, and new or
+  corrected facts in `cco-fusion-facts`.
+- Push, pull request and review comments only after the owner approves them.
+
+## Optimization tasks
+
+A contract with `kind: optimize` improves an existing candidate (`start_from`) instead of
+designing new ones. It keeps the structure its `keep` list names and runs until the
+candidate reaches `targets.reference` within `targets.within_pct` at the target buckets,
+measured in the same launch, or a stop rule fires.
+
+| Step | Output | Leave when |
+|---|---|---|
+| 1. Re-baseline and gap ledger | `bounds.md`: the start candidate, the reference and the bound measured in one launch, and the gap between them split by phase (`reference/diagnosis.md`), largest first | every item has a number or is marked unattributed |
+| 2. Hypotheses | `hypotheses.md`: per item of the ledger, the change, its predicted saving and the measurement that would refute it | the next change is chosen |
+| 3. One change per round | the change behind a switch, measured interleaved against the previous candidate and the reference, then frozen | it pays above the noise band, or it is reverted |
+| 4. Verify | as for a new task | |
+| 5. Deliver | as for a new task, with the trajectory: each round's change and saving | |
+
+- The records of `start_from` are inputs: its design notes, its runs and its negative
+  results. Re-measure before relying on its numbers.
+- A round keeps one change; two changes measured together cannot be attributed.
+- `reference_access` says what the session may learn about the reference implementation:
+  `clean` (nothing beyond the facts), `blackbox` (its kernel trace and its phase times,
+  never its source or ISA) or `open` (anything). A case's README says how.
+- `benchmark/cco/harness/loop_state.py` follows these steps for `kind: optimize`. For both
+  kinds it stops the loop after `budget.stop_after_flat_rounds` verdicts in a row without
+  a gain above the noise band at the target bucket.
+
+## Stop rules
+
+Stop and report when any of these holds:
+
+- step 1 says no-go;
+- the contract's number of rounds passes with no gain above the noise band;
+- the budget (rounds or GPU hours) is spent;
+- the remaining gap to `T_real` is below the noise band;
+- a permission, safety or environment problem needs the owner. In an unattended run,
+  write the question to `<records>/<task>/BLOCKED` and end the turn.
+
+Report the best verified result, the negative results with their numbers and retry
+conditions, and the crossover. Do not describe a stopped run as close to the bound
+unless the verifier's numbers show it.
+
+## Records
+
+```text
+<records>/<task>/
+  contract.yaml            approved by the owner
+  bounds.md                step 1
+  design/<candidate>.md    step 2, one per candidate
+  hypotheses.md            optimization tasks: step 2, one change per item of the gap ledger
+  runs/<run-id>/           result.json, timeline, ISA summary, log (development and verification)
+  candidates/<id>.json     frozen candidate manifests
+  verdicts/<id>.json       verifier output
+  decisions.md             one row per pass through step 4
+  report.md                the final table
+  BLOCKED                  unattended runs: the session's question for the owner
+  STOP                     unattended runs: the owner's stop
+  .driver.json             the Stop hook's bookkeeping
+```
+
+## Per-run settings
+
+[settings.example.json](settings.example.json) denies outward actions and commands that
+touch other tenants (GPU resets, `pkill`), and registers the unattended driver's Stop
+hook, which does nothing unless `CCO_FUSION_RECORDS` is set. Load it for a run with
+`claude --settings <path>`; do not merge it into the project-wide settings.
+
+## Unattended runs
+
+To run the loop for hours or days without the owner at the keyboard, point the driver at
+the task and start the session non-interactively:
+
+```bash
+export CCO_FUSION_RECORDS=<records>/<task>     # contract.yaml approved: true
+claude -p "$(cat <kickoff prompt>)" --settings <settings with the Stop hook> \
+    --add-dir "$CCO_FUSION_RECORDS" --permission-mode auto --max-budget-usd <cap> \
+    --output-format stream-json --verbose >"$CCO_FUSION_RECORDS/driver.jsonl" 2>&1
+```
+
+`--add-dir` lets the session write its records when they live outside the checkout;
+without it those writes wait for a permission nobody gives.
+
+- Each time the session would stop, `benchmark/cco/harness/stop_hook.py` asks
+  `benchmark/cco/harness/loop_state.py` where the task stands and, unless it is `done`
+  (`report.md` written), `needs-owner` (`BLOCKED`, or the contract not approved) or
+  `stopped` (`STOP`), sends the session on with the next step. A spent budget sends it
+  to write the report.
+- Brakes: the owner creates `<task>/STOP`; at most `CCO_FUSION_MAX_CONTINUES`
+  continuations per session (100); nothing changed under the task directory across
+  `CCO_FUSION_MAX_FLAT` continuations (3) writes `BLOCKED` and stops; and
+  `--max-budget-usd` caps the spend.
+- When the session needs the owner it writes the question to `BLOCKED` and ends the
+  turn. The owner answers (reserves GPUs, approves, decides), deletes `BLOCKED`, and
+  resumes with `claude -p --resume <session-id> "continue" ...` and the same flags.
+- `python benchmark/cco/harness/loop_state.py <task>` shows the state at any time.
+- `/goal` is the interactive equivalent: `/goal loop_state.py <task> prints a state other
+  than continue; run it at the end of every turn and show its output`. Its evaluator is
+  the small fast model (`ANTHROPIC_DEFAULT_HAIKU_MODEL`), which must be one the provider
+  serves; the Stop hook needs no model.
+- GPUs still come from the owner: a lease that ends or an idle guard that frees the node
+  ends GPU work, and the session writes `BLOCKED`.
+
+## Evaluation cases
+
+`benchmark/cco/harness/cases/` holds tasks that test this loop itself. A case fixes the
+contract, the operator's interface, a harness that times and checks any implementation
+of it, and a clean-room rule: nobody in the session reads the existing implementation,
+the session loads the case's settings, and the case's `audit.py` checks the transcripts
+afterwards for hidden text. The rule overrides the reading lists, citations and tools
+named in this skill, its references and the agents; the case's README says what to use
+instead. Start from the case's README, and pass it to every subagent with its task.
+When the run ends, `benchmark/cco/harness/cases/evaluate.py` records it in the case's
+`results.md`.
+
+## Rules
+
+- Correctness before timing.
+- Every number carries its scope: mori commit, FlyDSL and ROCm versions, node, shape,
+  dtype, protocol.
+- Predict, then measure. A result better than the bound is a bug or a wrong model until
+  shown otherwise.
+- One change per iteration, behind a switch, recorded.
+- The author does not certify; the verifier does not tune.
+- Negative results are recorded with their numbers and retry conditions.

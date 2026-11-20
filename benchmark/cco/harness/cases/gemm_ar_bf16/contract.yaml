@@ -1,0 +1,68 @@
+# Contract for the gemm_ar_bf16 case: re-implement BF16 GEMM + all-reduce from scratch,
+# within 5% of the existing GemmAllReduceOp. Copy to <records>/<task>/contract.yaml for a
+# run; the owner approves it before step 1.
+
+task: gemm_ar_bf16-cleanroom
+owner: <name>
+revision: 1
+approved: false
+
+workload:
+  op: gemm_ar
+  model: a row-parallel BF16 linear layer followed by an all-reduce (wo_b's shape)
+  parallel: {tp: 8}
+  world_size: 8
+  gpu: MI355X (gfx950), one node, xGMI
+  shape: {n: 7168, k: 2048}
+  dtype: {gemm: bf16, wire: bf16}
+  m_sweep: [4096, 8192, 16384]
+  target_buckets: [16384]
+  deployment: graph
+  held_out:
+    m_range: [1, 16384]
+    must_include: [1, an M that is not a multiple of 256]
+
+interface: benchmark/cco/harness/cases/gemm_ar_bf16/interface.py
+
+clean_room:
+  hidden: benchmark/cco/harness/cases/gemm_ar_bf16/hidden_paths.txt
+  settings: benchmark/cco/harness/cases/gemm_ar_bf16/settings.implementer.json
+  audit: benchmark/cco/harness/cases/gemm_ar_bf16/audit.py
+  allowed: >-
+    the cco device API and its skills, the cco-fusion-facts skill, the GEMM building
+    blocks in mori/ops/gemm_ar (_gemm_a8w8_8wave.py, _gemm_a16w16_8wave.py, _compat.py),
+    the sibling operators (gemm_ag, gemm_a2a, ag_gemm, a2a_gemm), FlyDSL and its skills;
+    running the existing op as a black-box baseline
+
+baseline:
+  existing: GemmAllReduceOp(quant="bf16") with its defaults, as op_harness.py --impl existing
+  also_compare: [split path (GEMM then all-reduce), stream-level chunked overlap if built]
+
+correctness:
+  rule: rel_l2 <= tolerance against the fp32 sum over ranks, every rank, every case
+  tolerance: 6.0e-3       # op_harness.py default; the existing op's own rel_l2 is recorded at step 1
+  reference: op_harness.py (operands rebuilt on every rank, fp32 reference computed locally)
+  suite: op_harness.py --mode check (held-out M, repeated calls, graph replay, rank skew, wrap when exposed)
+
+protocol:
+  timing: op_harness.py --mode time, through run.py --arms, interleaved, 3 rounds, --aa
+  calls_per_graph: 1      # as the existing benchmark times this op
+  cache: hot
+  deviations: []
+
+targets:
+  within_existing_pct: 5  # candidate median <= 1.05 x existing median at M=16384, same launch
+  min_gain_pct: 5         # step 1's go/no-go against the split path
+
+budget:
+  rounds: 8
+  gpu_hours: 24
+  stop_after_flat_rounds: 3
+
+environment:
+  image: <tag>
+  rocm: <version>
+  torch: <version>
+  flydsl: <version>
+  mori: <commit>
+  launcher: ""

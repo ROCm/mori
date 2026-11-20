@@ -1,0 +1,79 @@
+# Contract for one cco-fusion-loop task (step 0).
+#
+# Copy to <records>/<task>/contract.yaml and fill it in with the owner. The owner approves
+# it before step 1; any later change bumps `revision` and needs approval again.
+# Field names are a convention, not a fixed schema yet. The values are an example:
+# gemm_ar on DeepSeek-V4.1-Flash wo_b at TP4.
+
+task: gemm_ar-v41flash-wo_b-tp4
+kind: new                  # new: design candidates from step 2 | optimize: improve start_from
+owner: <name>
+revision: 1
+approved: false            # set by the owner, never by an agent
+
+# kind: optimize only. Step 2 becomes the gap ledger and its hypotheses, and every round
+# makes one change to start_from (cco-fusion-loop, "Optimization tasks").
+# start_from:
+#   candidate: <id>                 # the candidate to improve
+#   commit: <40-hex>                # where its code is
+#   impl: <module>:<Class>          # how the harnesses construct it
+#   records: <path>                 # its design notes, runs and decisions: inputs to re-check
+#   measured_us: {16384: <us>}      # its time at the target buckets when the task starts
+# keep:                             # what every round preserves: the structure under study
+#   - <constraint>
+# reference_access: clean           # clean | blackbox | open: what the session may learn of
+#                                   # the reference implementation (the case's README says how)
+
+workload:
+  op: gemm_ar              # gemm_ar | gemm_rs | gemm_ag | ag_gemm | gemm_a2a | a2a_gemm | moe_dispatch | moe_combine
+  model: DeepSeek-V4.1-Flash wo_b
+  parallel: {tp: 4}
+  world_size: 4
+  gpu: MI355X (gfx950), one node, xGMI
+  shape: {n: 5120, k: 2048}
+  dtype: {gemm: mxfp8, scatter: bf16, gather: bf16}
+  m_sweep: [1024, 2048, 4096, 8192, 12288, 16384]   # dense near any expected crossover
+  target_buckets: [8192, 16384]
+  deployment: graph        # graph | eager: how the serving framework launches it
+  held_out:                # the domain the verifier draws its own held-out shapes from
+    m_range: [1024, 16384]
+    must_include: [an M that is not a multiple of 256, both edges of each bucket]
+
+baseline:
+  gemm: fastest of [hipblaslt, aiter, flydsl]          # measured per bucket, not assumed
+  collective: fastest of [mori-sdma, mori-lsa, rccl]
+  also_compare: [stream-level chunked overlap, existing fused implementations]   # where they exist
+
+correctness:
+  rule: bit-exact          # or: rel_l2 <= <bound>, with the reason it is acceptable
+  reference: split path with the same reduction order and wire precision
+
+protocol:
+  reference: .claude/skills/cco-fusion-loop/reference/measurement-protocol.md
+  calls_per_graph: 8
+  replays: 21
+  rounds: 3
+  cache: cold              # cold | hot | both
+  deviations: []           # any departure from the protocol, with the reason
+
+targets:
+  eta_real: 0.8            # attainment against the realistic bound, in each target bucket
+  min_gain_pct: 5          # below this, or below the noise band, step 1 says no-go
+  # reference: existing    # an arm to match or beat in the same launch (optimize tasks)
+  # within_pct: 0          # candidate <= (1 + within_pct/100) x reference at the target buckets
+  # no_regression: [4096]  # other buckets that must not get slower than the reference
+
+budget:
+  rounds: 6
+  gpu_hours: 20
+  stop_after_flat_rounds: 2
+
+environment:
+  image: <tag>
+  rocm: <version>
+  torch: <version>
+  flydsl: <commit or version>
+  mori: <commit>
+  launcher: ""             # optional prefix the user supplies to reach the GPUs, such as a
+                           # container exec or an srun into an allocation the user holds;
+                           # empty means run here. The harness never allocates GPUs.

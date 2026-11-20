@@ -1,0 +1,365 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cco-fusion/result/v1",
+  "title": "run.py result",
+  "description": "One shape of one operator, modes interleaved round by round; written by benchmark/cco/harness/run.py.",
+  "type": "object",
+  "required": [
+    "schema",
+    "op",
+    "arms",
+    "modes",
+    "baseline",
+    "rounds",
+    "aa",
+    "bench",
+    "bench_args",
+    "nproc",
+    "command",
+    "started_at",
+    "status"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cco-fusion/result/v1"
+    },
+    "op": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "modes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "rounds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "aa": {
+      "type": "boolean"
+    },
+    "bench": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "bench_args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nproc": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "launcher": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "env_overrides": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "command": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "timeout_s": {
+      "type": "number"
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "finished_at": {
+      "type": "string"
+    },
+    "preflight": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "skipped"
+      ]
+    },
+    "scope": {
+      "type": "object"
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "validation-failed",
+        "timeout",
+        "incomplete",
+        "refused"
+      ]
+    },
+    "gap_wait_s": {
+      "type": "number"
+    },
+    "duration_s": {
+      "type": "number"
+    },
+    "returncode": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "leftover_pids": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      }
+    },
+    "runs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "round",
+          "mode",
+          "repeat",
+          "time_us",
+          "validated",
+          "record"
+        ],
+        "properties": {
+          "round": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mode": {
+            "type": "string"
+          },
+          "repeat": {
+            "type": "boolean"
+          },
+          "time_us": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "per_rank_us": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "number"
+            }
+          },
+          "critical_rank": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "validated": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "rel_l2": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "record": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "validate": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "rounds",
+          "validated"
+        ],
+        "properties": {
+          "rounds": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "median_us": {
+            "type": "number"
+          },
+          "min_us": {
+            "type": "number"
+          },
+          "max_us": {
+            "type": "number"
+          },
+          "spread_pct": {
+            "type": "number"
+          },
+          "validated": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "diagnostic": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "noise": {
+      "type": "object",
+      "required": [
+        "source",
+        "pct"
+      ],
+      "properties": {
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pct": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "comparisons": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "baseline",
+          "candidate",
+          "speedup",
+          "delta_pct",
+          "outside_noise"
+        ],
+        "properties": {
+          "baseline": {
+            "type": "string"
+          },
+          "candidate": {
+            "type": "string"
+          },
+          "speedup": {
+            "type": "number"
+          },
+          "delta_pct": {
+            "type": "number"
+          },
+          "outside_noise": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "isa": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kernel",
+          "path",
+          "sha256",
+          "isa_check"
+        ],
+        "properties": {
+          "kernel": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "isa_check": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "unreadable"
+            ]
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "baseline": {
+      "type": "string"
+    },
+    "arms": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "bench",
+          "args",
+          "time_field"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "bench": {
+            "type": "string"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "time_field": {
+            "type": "string"
+          },
+          "per_rank_field": {
+            "type": "string"
+          },
+          "sdma": {
+            "type": "boolean"
+          },
+          "validate": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}
