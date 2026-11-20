@@ -19,6 +19,13 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+//
+// Two-GPU BlockCopy alignment sweep over P2P symmetric memory. Requires MPI,
+// shmem, and exactly two PEs. Not registered with ctest (needs two GPUs).
+//
+//   cmake -B build -DBUILD_TESTS=ON -DWITH_MPI=ON
+//   cmake --build build --target test_block_copy
+//   MORI_SHMEM_HEAP_SIZE=6G mpirun -np 2 ./build/tests/cpp/test_block_copy
 
 #include <mpi.h>
 
@@ -40,6 +47,7 @@ constexpr size_t kDefaultCopyBytes = 2ULL << 30;
 constexpr int kGridSize = 4;
 constexpr int kBlockSize = 256;
 constexpr size_t kCopyTileBytes = 1ULL << 20;
+constexpr uint32_t kAlignments[] = {1, 2, 3, 4, 5, 6, 7, 8, 16};
 
 __host__ __device__ uint8_t ExpectedByte(size_t index, int sourcePe) {
   return static_cast<uint8_t>(
@@ -55,10 +63,14 @@ __global__ void InitPatternKernel(uint8_t* buffer, size_t bytes, int sourcePe) {
   }
 }
 
-template <bool Poison>
-__device__ __forceinline__ void BlockCopy8(uint8_t* __restrict__ dst,
-                                           const uint8_t* __restrict__ src, size_t bytes) {
-  constexpr size_t B = 8;
+// Test-local fixed-width copy. This is not mori::core::BlockCopy: every thread
+// issues VecSize-wide load/store with a scalar tail, so the alignment cases
+// below measure that access width rather than the library peel.
+template <int VecSize, MemAddressSpace Space>
+__device__ __forceinline__ void BlockCopy(uint8_t* __restrict__ dst,
+                                          const uint8_t* __restrict__ src, size_t bytes) {
+  constexpr size_t B = VecSize;
+  using DataType = VecTypeT<B>;
   const int threadId = FlatBlockThreadId();
   const int blockSize = FlatBlockSize();
   const size_t bytesPerIteration = static_cast<size_t>(blockSize) * B;
@@ -67,14 +79,8 @@ __device__ __forceinline__ void BlockCopy8(uint8_t* __restrict__ dst,
   const size_t iterations = bytes / bytesPerIteration;
   for (size_t iteration = 0; iteration < iterations; ++iteration) {
     const size_t threadOffset = offset + static_cast<size_t>(threadId) * B;
-    if constexpr (Poison) {
-      const uint64_t value =
-          __builtin_nontemporal_load(reinterpret_cast<const uint64_t*>(src + threadOffset));
-      __builtin_nontemporal_store(value, reinterpret_cast<uint64_t*>(dst + threadOffset));
-    } else {
-      const uint64_t value = load<B>(src + threadOffset);
-      store<B>(dst + threadOffset, value);
-    }
+    const DataType value = load<B, Space>(src + threadOffset);
+    store<B, Space>(dst + threadOffset, value);
     offset += bytesPerIteration;
   }
 
@@ -85,11 +91,10 @@ __device__ __forceinline__ void BlockCopy8(uint8_t* __restrict__ dst,
   }
 }
 
-template <int AccessBytes, bool Poison>
+template <int VecSize, MemAddressSpace Space>
 __global__ void BlockCopyKernel(int myPe, int npes, const SymmMemObjPtr srcMemObj,
                                 const SymmMemObjPtr dstMemObj, size_t srcOffset, size_t dstOffset,
-                                size_t bytes, unsigned expectedMod16, int* configError) {
-  static_assert(AccessBytes == 8 || AccessBytes == 16);
+                                size_t bytes, uint32_t expectedMod16, int* configError) {
   const int targetPe = (myPe + 1) % npes;
 
   const auto* src = srcMemObj->template GetAs<const uint8_t*>() + srcOffset;
@@ -103,25 +108,12 @@ __global__ void BlockCopyKernel(int myPe, int npes, const SymmMemObjPtr srcMemOb
     return;
   }
 
-  if constexpr (Poison) {
-    // Prevent from infering global memory space from argument types
-    // hence force it to emit flat loads and stores.
-    if (npes * bytes == 0xACEBABEFEEDDEADBULL) {
-      dst = reinterpret_cast<uint8_t*>(srcMemObj->peerPtrs);
-      src = reinterpret_cast<const uint8_t*>(srcMemObj->p2pPeerPtrs);
-    }
-  }
-
   const size_t gridStride = static_cast<size_t>(gridDim.x) * kCopyTileBytes;
   for (size_t tileOffset = static_cast<size_t>(blockIdx.x) * kCopyTileBytes; tileOffset < bytes;
        tileOffset += gridStride) {
     const size_t remaining = bytes - tileOffset;
     const size_t tileBytes = remaining < kCopyTileBytes ? remaining : kCopyTileBytes;
-    if constexpr (AccessBytes == 16) {
-      BlockCopy<uint8_t>(dst + tileOffset, src + tileOffset, tileBytes);
-    } else {
-      BlockCopy8<Poison>(dst + tileOffset, src + tileOffset, tileBytes);
-    }
+    BlockCopy<VecSize, Space>(dst + tileOffset, src + tileOffset, tileBytes);
   }
   __threadfence_system();
 }
@@ -135,9 +127,9 @@ __global__ void CheckPatternKernel(const uint8_t* buffer, size_t bytes, int sour
     const uint8_t actual = buffer[index];
     if (actual != expected) {
       if (atomicCAS(mismatch, 0, 1) == 0) {
-        printf("Mismatch at byte %llu: got 0x%02x, expected 0x%02x from PE %d\n",
-               static_cast<unsigned long long>(index), static_cast<unsigned>(actual),
-               static_cast<unsigned>(expected), sourcePe);
+        printf("Mismatch at byte %zu: got 0x%02x, expected 0x%02x from PE %d\n",
+               index, static_cast<uint32_t>(actual),
+               static_cast<uint32_t>(expected), sourcePe);
       }
       return;
     }
@@ -145,30 +137,32 @@ __global__ void CheckPatternKernel(const uint8_t* buffer, size_t bytes, int sour
 }
 
 size_t CopyBytes() {
-  const char* value = std::getenv("MORI_WARPCOPY_TEST_BYTES");
+  const char* value = std::getenv("MORI_BLOCKCOPY_TEST_BYTES");
   if (value == nullptr) return kDefaultCopyBytes;
 
   char* end = nullptr;
-  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  const uint64_t parsed = std::strtoull(value, &end, 10);
   if (end == value || *end != '\0' || parsed == 0) {
-    std::fprintf(stderr, "Invalid MORI_WARPCOPY_TEST_BYTES value: %s\n", value);
+    std::fprintf(stderr, "Invalid MORI_BLOCKCOPY_TEST_BYTES value: %s\n", value);
     std::exit(EXIT_FAILURE);
   }
   return static_cast<size_t>(parsed);
 }
+
+uint32_t AlignmentOffset(uint32_t alignment) { return alignment == 16 ? 0u : alignment; }
 
 struct CaseResult {
   float milliseconds;
   int errors;
 };
 
-template <int AccessBytes, bool Poison = false>
-CaseResult RunCase(const char* name, unsigned offset, size_t bytes, int myPe, int npes,
+template <int VecSize, MemAddressSpace Space>
+CaseResult RunCase(const char* name, uint32_t offset, size_t bytes, int myPe, int npes,
                    uint8_t* srcBase, uint8_t* dstBase, const SymmMemObjPtr srcMemObj,
                    const SymmMemObjPtr dstMemObj, int* deviceError) {
   auto* src = srcBase + offset;
   auto* dst = dstBase + offset;
-  const unsigned expectedMod16 = offset & 0xFU;
+  const uint32_t expectedMod16 = offset & 0xFU;
 
   InitPatternKernel<<<kGridSize, kBlockSize>>>(src, bytes, myPe);
   HIP_RUNTIME_CHECK(hipMemset(dstBase, 0, bytes + 16));
@@ -182,9 +176,9 @@ CaseResult RunCase(const char* name, unsigned offset, size_t bytes, int myPe, in
   HIP_RUNTIME_CHECK(hipEventCreate(&stop));
   HIP_RUNTIME_CHECK(hipEventRecord(start));
   const size_t tileCount = (bytes - 1) / kCopyTileBytes + 1;
-  const unsigned copyGridSize =
-      tileCount < static_cast<size_t>(kGridSize) ? static_cast<unsigned>(tileCount) : kGridSize;
-  BlockCopyKernel<AccessBytes, Poison><<<copyGridSize, kBlockSize>>>(
+  const uint32_t copyGridSize =
+      tileCount < static_cast<size_t>(kGridSize) ? static_cast<uint32_t>(tileCount) : kGridSize;
+  BlockCopyKernel<VecSize, Space><<<copyGridSize, kBlockSize>>>(
       myPe, npes, srcMemObj, dstMemObj, offset, offset, bytes, expectedMod16, deviceError);
   HIP_RUNTIME_CHECK(hipGetLastError());
   HIP_RUNTIME_CHECK(hipEventRecord(stop));
@@ -234,7 +228,7 @@ int main() {
   int deviceCount = 0;
   HIP_RUNTIME_CHECK(hipGetDeviceCount(&deviceCount));
   if (deviceCount < 2) {
-    std::fprintf(stderr, "WarpCopy alignment test requires at least two GPUs\n");
+    std::fprintf(stderr, "BlockCopy alignment test requires at least two GPUs\n");
     MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   }
 
@@ -248,7 +242,7 @@ int main() {
   const int myPe = ShmemMyPe();
   const int npes = ShmemNPes();
   if (npes != 2) {
-    if (myPe == 0) std::fprintf(stderr, "WarpCopy alignment test requires exactly two PEs\n");
+    if (myPe == 0) std::fprintf(stderr, "BlockCopy alignment test requires exactly two PEs\n");
     MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   }
 
@@ -281,30 +275,46 @@ int main() {
     std::fflush(stdout);
   }
 
-  const CaseResult alignedB128 = RunCase<16>("ld/st 16b, 16b align", 0, bytes, myPe, npes, srcBase,
-                                             dstBase, srcMemObj, dstMemObj, deviceError);
-  const CaseResult misalignedB128 =
-      RunCase<16>("ld/st 16b, 8b align", 8, bytes, myPe, npes, srcBase, dstBase, srcMemObj,
-                  dstMemObj, deviceError);
-  const CaseResult misalignedB64 = RunCase<8>("ld/st 8b, 8b align", 8, bytes, myPe, npes, srcBase,
-                                              dstBase, srcMemObj, dstMemObj, deviceError);
-  const CaseResult misalignedB64flat =
-      RunCase<8, true>("flat ld/st 8b, 8b align", 8, bytes, myPe, npes, srcBase, dstBase, srcMemObj,
-                       dstMemObj, deviceError);
-
-  if (myPe == 0 && alignedB128.milliseconds > 0.0f && misalignedB64.milliseconds > 0.0f) {
-    std::printf("Misaligned/aligned 16-byte-op runtime ratio: %.3fx\n",
-                misalignedB128.milliseconds / alignedB128.milliseconds);
-    std::printf("16-byte-op/8-byte-op runtime ratio at 8-byte alignment: %.3fx\n",
-                misalignedB128.milliseconds / misalignedB64.milliseconds);
+  int errors = 0;
+  float aligned16Ms = 0.0f;
+  float align8Ms = 0.0f;
+  float align1Ms = 0.0f;
+  for (uint32_t alignment : kAlignments) {
+    const uint32_t offset = AlignmentOffset(alignment);
+    char name[64];
+    std::snprintf(name, sizeof(name), "BlockCopy, %u-byte align", alignment);
+    const CaseResult result = RunCase<16, EGlobal>(name, offset, bytes, myPe, npes, srcBase, dstBase,
+                                          srcMemObj, dstMemObj, deviceError);
+    errors += result.errors;
+    if (alignment == 16) aligned16Ms = result.milliseconds;
+    if (alignment == 8) align8Ms = result.milliseconds;
+    if (alignment == 1) align1Ms = result.milliseconds;
   }
 
-  const int result =
-      alignedB128.errors + misalignedB128.errors + misalignedB64.errors + misalignedB64flat.errors;
+  const CaseResult misalignedB64 = RunCase<8, EGlobal>("ld/st 8b, 8b align", 8, bytes, myPe, npes, srcBase,
+                                              dstBase, srcMemObj, dstMemObj, deviceError);
+  const CaseResult misalignedB64flat =
+      RunCase<8, EAuto>("flat ld/st 8b, 8b align", 8, bytes, myPe, npes, srcBase, dstBase, srcMemObj,
+                       dstMemObj, deviceError);
+  errors += misalignedB64.errors + misalignedB64flat.errors;
+
+  if (myPe == 0 && aligned16Ms > 0.0f) {
+    if (align8Ms > 0.0f) {
+      std::printf("8-byte/16-byte align BlockCopy runtime ratio: %.3fx\n", align8Ms / aligned16Ms);
+    }
+    if (align1Ms > 0.0f) {
+      std::printf("1-byte/16-byte align BlockCopy runtime ratio: %.3fx\n", align1Ms / aligned16Ms);
+    }
+    if (misalignedB64.milliseconds > 0.0f && align8Ms > 0.0f) {
+      std::printf("16-byte-op/8-byte-op runtime ratio at 8-byte alignment: %.3fx\n",
+                  align8Ms / misalignedB64.milliseconds);
+    }
+  }
+
   HIP_RUNTIME_CHECK(hipFree(deviceError));
   ShmemFree(dstBase);
   ShmemFree(srcBase);
   MPI_Comm_free(&localComm);
   ShmemFinalize();
-  return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  return errors == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
