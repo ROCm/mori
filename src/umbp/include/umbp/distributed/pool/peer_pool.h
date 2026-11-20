@@ -167,6 +167,7 @@ class PeerPool {
     fabric_read_push_ = std::move(push);
   }
   bool SupportsReadPush() const { return fabric_read_push_ != nullptr; }
+  bool ReadPushRdma() const;
   std::vector<bool> ReleaseReadPins(const std::vector<uint64_t>& tokens);
   std::vector<bool> AbandonReadOperations(const std::vector<std::string>& operation_ids);
   uint64_t Generation() const;

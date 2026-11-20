@@ -1579,6 +1579,197 @@ void CaseRdmaTransferBasic() {
               inbound.Message() + "'");
 }
 
+void FillDevicePattern(void* ptr, size_t n, uint8_t seed) {
+  std::vector<uint8_t> host(n);
+  for (size_t i = 0; i < n; ++i) host[i] = static_cast<uint8_t>(i * 31 + i / 251 + seed);
+  HIP_RUNTIME_CHECK(hipMemcpy(ptr, host.data(), n, hipMemcpyHostToDevice));
+}
+
+std::vector<uint8_t> CopyDeviceToHost(const void* ptr, size_t n) {
+  std::vector<uint8_t> host(n);
+  HIP_RUNTIME_CHECK(hipMemcpy(host.data(), ptr, n, hipMemcpyDeviceToHost));
+  return host;
+}
+
+void RequireSucceeded(TransferStatus* status, const std::string& what) {
+  std::string err;
+  Require(WaitTransferDone(status, 10000, &err), what + " timeout: " + err);
+  Require(status->Succeeded(), what + " failed: code=" + std::to_string(status->CodeUint32()) +
+                                   ", msg='" + status->Message() + "'");
+}
+
+void CaseRdmaFailOnReadSwitchRejectsRead() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ScopedEnvVar failRead("MORI_IO_FAIL_ON_RDMA_READ", "1");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_fail_read", true);
+  auto local = RegisterGpuMemory(pair.initiator.get(), 4096, 0);
+  auto remote = RegisterGpuMemory(pair.target.get(), 4096, 0);
+
+  TransferStatus readStatus;
+  pair.initiator->Read(local.desc, 0, remote.desc, 0, 4096, &readStatus,
+                       pair.initiator->AllocateTransferUniqueId());
+  std::string err;
+  Require(WaitTransferDone(&readStatus, 3000, &err), "read status timeout: " + err);
+  Require(readStatus.Failed() &&
+              readStatus.Message().find("MORI_IO_FAIL_ON_RDMA_READ") != std::string::npos,
+          "READ must fail under MORI_IO_FAIL_ON_RDMA_READ=1; code=" +
+              std::to_string(readStatus.CodeUint32()) + ", msg='" + readStatus.Message() + "'");
+
+  TransferStatus writeStatus;
+  pair.initiator->Write(local.desc, 0, remote.desc, 0, 4096, &writeStatus,
+                        pair.initiator->AllocateTransferUniqueId());
+  RequireSucceeded(&writeStatus, "write under MORI_IO_FAIL_ON_RDMA_READ");
+}
+
+void CaseRdmaReadViaWriteBasic() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ScopedEnvVar failRead("MORI_IO_FAIL_ON_RDMA_READ", "1");
+  ScopedEnvVar readViaWrite("MORI_IO_READ_VIA_WRITE", "1");
+  constexpr size_t kBytes = 1024 * 1024;
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_rvw_basic", true);
+  auto local = RegisterGpuMemory(pair.initiator.get(), kBytes, 0);
+  auto remote = RegisterGpuMemory(pair.target.get(), kBytes, 0);
+  FillDevicePattern(remote.ptr, kBytes, 7);
+
+  TransferStatus status;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  // Interior range on both sides, so offsets are carried, not assumed zero.
+  pair.initiator->Read(local.desc, 4096, remote.desc, 8192, kBytes - 16384, &status, uid);
+  RequireSucceeded(&status, "read-via-write");
+
+  auto want = CopyDeviceToHost(remote.ptr, kBytes);
+  auto got = CopyDeviceToHost(local.ptr, kBytes);
+  for (size_t i = 0; i < 4096; ++i) Require(got[i] == 0, "bytes before the range were written");
+  Require(
+      std::equal(got.begin() + 4096, got.begin() + 4096 + (kBytes - 16384), want.begin() + 8192),
+      "read-via-write payload mismatch");
+
+  TransferStatus inbound;
+  std::string err;
+  Require(WaitInboundStatusWithTimeout(pair.target.get(), pair.initiator->GetEngineDesc().key, uid,
+                                       3000, &inbound, &err),
+          "owner must see the read as an inbound transfer: " + err);
+}
+
+void CaseRdmaReadViaWriteSessionBatchSpansMessages() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ScopedEnvVar failRead("MORI_IO_FAIL_ON_RDMA_READ", "1");
+  ScopedEnvVar readViaWrite("MORI_IO_READ_VIA_WRITE", "1");
+  // More entries than one control message carries (16384), reversed on the owner side.
+  constexpr size_t kN = 20000;
+  constexpr size_t kItem = 64;
+  constexpr size_t kBytes = kN * kItem;
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_rvw_batch", true);
+  auto local = RegisterGpuMemory(pair.initiator.get(), kBytes, 0);
+  auto remote = RegisterGpuMemory(pair.target.get(), kBytes, 0);
+  FillDevicePattern(remote.ptr, kBytes, 3);
+
+  auto sess = pair.initiator->CreateSession(local.desc, remote.desc);
+  Require(sess.has_value(), "CreateSession returned no session");
+  SizeVec lo(kN), ro(kN), sz(kN, kItem);
+  for (size_t i = 0; i < kN; ++i) {
+    lo[i] = i * kItem;
+    ro[i] = (kN - 1 - i) * kItem;
+  }
+  TransferStatus status;
+  TransferUniqueId uid = sess->AllocateTransferUniqueId();
+  sess->BatchRead(lo, ro, sz, &status, uid);
+  RequireSucceeded(&status, "session batch read-via-write");
+
+  auto want = CopyDeviceToHost(remote.ptr, kBytes);
+  auto got = CopyDeviceToHost(local.ptr, kBytes);
+  for (size_t i = 0; i < kN; ++i) {
+    Require(std::equal(got.begin() + lo[i], got.begin() + lo[i] + kItem, want.begin() + ro[i]),
+            "batch entry " + std::to_string(i) + " mismatch");
+  }
+  TransferStatus inbound;
+  std::string err;
+  Require(WaitInboundStatusWithTimeout(pair.target.get(), pair.initiator->GetEngineDesc().key, uid,
+                                       3000, &inbound, &err),
+          "owner must see the batch as one inbound transfer: " + err);
+}
+
+void CaseRdmaReadViaWriteBidirectionalConcurrent() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ScopedEnvVar failRead("MORI_IO_FAIL_ON_RDMA_READ", "1");
+  ScopedEnvVar readViaWrite("MORI_IO_READ_VIA_WRITE", "1");
+  constexpr size_t kBytes = 256 * 1024;
+  constexpr int kIters = 64;
+  constexpr int kInFlight = 8;
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_rvw_bidir", true);
+  auto aSrc = RegisterGpuMemory(pair.initiator.get(), kBytes, 0);
+  auto aDst = RegisterGpuMemory(pair.initiator.get(), kBytes, 0);
+  auto bSrc = RegisterGpuMemory(pair.target.get(), kBytes, 0);
+  auto bDst = RegisterGpuMemory(pair.target.get(), kBytes, 0);
+  FillDevicePattern(aSrc.ptr, kBytes, 11);
+  FillDevicePattern(bSrc.ptr, kBytes, 13);
+
+  // Both engines read from each other at once; each side's owner handler must keep
+  // serving while its own reads wait.
+  auto reader = [kBytes](IOEngine* eng, const MemoryDesc& dst, const MemoryDesc& src,
+                         std::string* error) {
+    try {
+      for (int it = 0; it < kIters; it += kInFlight) {
+        std::vector<std::unique_ptr<TransferStatus>> st;
+        for (int k = 0; k < kInFlight; ++k) {
+          st.push_back(std::make_unique<TransferStatus>());
+          const size_t chunk = kBytes / kInFlight;
+          eng->Read(dst, k * chunk, src, k * chunk, chunk, st.back().get(),
+                    eng->AllocateTransferUniqueId());
+        }
+        for (auto& s : st) RequireSucceeded(s.get(), "bidirectional read");
+      }
+    } catch (const std::exception& e) {
+      *error = e.what();
+    }
+  };
+  std::string errA, errB;
+  std::thread ta(reader, pair.initiator.get(), aDst.desc, bSrc.desc, &errA);
+  std::thread tb(reader, pair.target.get(), bDst.desc, aSrc.desc, &errB);
+  ta.join();
+  tb.join();
+  Require(errA.empty(), "initiator->target reads: " + errA);
+  Require(errB.empty(), "target->initiator reads: " + errB);
+  Require(CopyDeviceToHost(aDst.ptr, kBytes) == CopyDeviceToHost(bSrc.ptr, kBytes),
+          "initiator received wrong bytes");
+  Require(CopyDeviceToHost(bDst.ptr, kBytes) == CopyDeviceToHost(aSrc.ptr, kBytes),
+          "target received wrong bytes");
+}
+
+// Many small reads in flight keep every owner serve thread busy, so one serve call
+// finishes while the CQ poller is still completing another one's status.
+void CaseRdmaReadViaWriteManySingleReads() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ScopedEnvVar failRead("MORI_IO_FAIL_ON_RDMA_READ", "1");
+  ScopedEnvVar readViaWrite("MORI_IO_READ_VIA_WRITE", "1");
+  constexpr size_t kItem = 4096;
+  constexpr int kInFlight = 64;
+  constexpr int kRounds = 400;
+  constexpr size_t kBytes = kItem * kInFlight;
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_rvw_many", true);
+  auto local = RegisterGpuMemory(pair.initiator.get(), kBytes, 0);
+  auto remote = RegisterGpuMemory(pair.target.get(), kBytes, 0);
+  FillDevicePattern(remote.ptr, kBytes, 5);
+
+  auto sess = pair.initiator->CreateSession(local.desc, remote.desc);
+  Require(sess.has_value(), "CreateSession returned no session");
+  for (int r = 0; r < kRounds; ++r) {
+    std::vector<std::unique_ptr<TransferStatus>> st;
+    for (int k = 0; k < kInFlight; ++k) {
+      st.push_back(std::make_unique<TransferStatus>());
+      sess->Read(k * kItem, k * kItem, kItem, st.back().get(), sess->AllocateTransferUniqueId());
+    }
+    for (auto& s : st) RequireSucceeded(s.get(), "single read-via-write");
+  }
+  Require(CopyDeviceToHost(local.ptr, kBytes) == CopyDeviceToHost(remote.ptr, kBytes),
+          "single reads returned wrong bytes");
+}
+
 // Writes kXfer bytes from srcBase + offset to dstBase + offset over the dma-buf
 // registration path and checks the payload landed at dstBase + offset, not at
 // dstBase. Both bases point at allocations of at least allocSize bytes.
@@ -2283,6 +2474,12 @@ int main(int argc, char* argv[]) {
       {"rdma_backend_can_handle_rejects_sentinel_port_remote",
        CaseRdmaBackendCanHandleRejectsSentinelPortRemote},
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
+      {"rdma_fail_on_read_switch_rejects_read", CaseRdmaFailOnReadSwitchRejectsRead},
+      {"rdma_read_via_write_basic", CaseRdmaReadViaWriteBasic},
+      {"rdma_read_via_write_session_batch_spans_messages",
+       CaseRdmaReadViaWriteSessionBatchSpansMessages},
+      {"rdma_read_via_write_bidirectional_concurrent", CaseRdmaReadViaWriteBidirectionalConcurrent},
+      {"rdma_read_via_write_many_single_reads", CaseRdmaReadViaWriteManySingleReads},
       {"rdma_dmabuf_interior_range_transfer", CaseRdmaDmabufInteriorRangeTransfer},
       {"rdma_dmabuf_vmm_interior_range_transfer", CaseRdmaDmabufVmmInteriorRangeTransfer},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},

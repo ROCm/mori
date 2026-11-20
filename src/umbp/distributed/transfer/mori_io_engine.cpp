@@ -516,11 +516,13 @@ struct PairKeyHash {
 class MoriIoPlanBuilder final : public TransferPlanBuilder {
  public:
   MoriIoPlanBuilder(const std::string& local_key, uint64_t bounce_size,
-                    const TransferRef& bounce_ref, bool fabric_strict = false)
+                    const TransferRef& bounce_ref, bool fabric_strict = false,
+                    bool forbid_pull = false)
       : local_key_(local_key),
         bounce_size_(bounce_size),
         bounce_ref_(bounce_ref),
-        fabric_strict_(fabric_strict) {}
+        fabric_strict_(fabric_strict),
+        forbid_pull_(forbid_pull) {}
 
   void Add(const TransferItem& item) override {
     if (item.size == 0) return;
@@ -536,6 +538,13 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
       return;
     }
     const TransferDirection dir = dst_remote ? TransferDirection::kPush : TransferDirection::kPull;
+    if (forbid_pull_ && dir == TransferDirection::kPull) {
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true))
+        MORI_UMBP_WARN("[MoriIoEngine] UMBP_FORBID_RDMA_READ: rejecting RDMA READ plan(s)");
+      out_.rejected_tags.push_back(item.tag);
+      return;
+    }
     const TransferRef& local = src_remote ? item.dst : item.src;
     const TransferRef& remote = src_remote ? item.src : item.dst;
     const uint64_t local_off = src_remote ? item.dst_offset : item.src_offset;
@@ -616,6 +625,7 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
   const uint64_t bounce_size_;
   const TransferRef& bounce_ref_;
   const bool fabric_strict_;
+  const bool forbid_pull_;
   TransferPlanSet out_;
   std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> pair_to_plans_;
   std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> bounce_to_plans_;
@@ -628,7 +638,8 @@ std::unique_ptr<TransferPlanBuilder> MoriIoEngine::CreatePlanBuilder(
     size_t /*expected_items*/) const {
   return std::make_unique<MoriIoPlanBuilder>(
       local_engine_key_, bounce_size_, bounce_ref_,
-      transport_config_.mode == UMBPTransferMode::kFabricStrict);
+      transport_config_.mode == UMBPTransferMode::kFabricStrict,
+      transport_config_.forbid_rdma_read);
 }
 
 std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& local_key,

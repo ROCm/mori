@@ -665,6 +665,13 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     return {StatusCode::ERR_INVALID_ARGS,
             "lengths of local offsets, remote offsets or sizes mismatch"};
   }
+  // Test switch that rejects READ posts the way a NIC without RDMA READ would.
+  if (isRead) {
+    const char* v = std::getenv("MORI_IO_FAIL_ON_RDMA_READ");
+    if (v != nullptr && std::string(v) == "1") {
+      return {StatusCode::ERR_RDMA_OP, "RDMA READ posted with MORI_IO_FAIL_ON_RDMA_READ=1"};
+    }
+  }
 
   size_t batchSize = sizes.size();
   if (batchSize == 0) {

@@ -38,6 +38,8 @@ namespace io {
 enum class MessageType : uint8_t {
   RegEndpoint = 0,
   AskMemoryRegion = 1,
+  ReadViaWrite = 2,
+  ReadViaWriteReply = 3,
 };
 
 struct MessageHeader {
@@ -68,6 +70,28 @@ struct MessageBuildConn {
   MSGPACK_DEFINE(key);
 };
 
+// Reader asks the owner of ownerMemId to WRITE [ownerOffsets, sizes) into readerMem.
+struct MessageReadViaWrite {
+  EngineKey readerKey;
+  std::string readerHost;
+  int readerPort{0};
+  MemoryDesc readerMem;
+  MemoryUniqueId ownerMemId{0};
+  SizeVec readerOffsets;
+  SizeVec ownerOffsets;
+  SizeVec sizes;
+  TransferUniqueId id{0};
+  bool notify{false};
+  MSGPACK_DEFINE(readerKey, readerHost, readerPort, readerMem, ownerMemId, readerOffsets,
+                 ownerOffsets, sizes, id, notify);
+};
+
+struct MessageReadViaWriteReply {
+  int code{0};
+  std::string message;
+  MSGPACK_DEFINE(code, message);
+};
+
 inline constexpr size_t kMaxControlMessageBytes = 1 << 20;
 
 class ProtocolError : public std::runtime_error {
@@ -94,6 +118,12 @@ class Protocol {
 
   MessageAskMemoryRegion ReadMessageAskMemoryRegion(size_t len);
   void WriteMessageAskMemoryRegion(const MessageAskMemoryRegion&);
+
+  MessageReadViaWrite ReadMessageReadViaWrite(size_t len);
+  void WriteMessageReadViaWrite(const MessageReadViaWrite&);
+
+  MessageReadViaWriteReply ReadMessageReadViaWriteReply(size_t len);
+  void WriteMessageReadViaWriteReply(const MessageReadViaWriteReply&);
 
  private:
   application::TCPEndpoint ep;

@@ -495,6 +495,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       for (const auto& span : resolve.ranges(i).spans())
         ranges[i].push_back({span.offset(), span.length()});
     FabricReadPushRequest push;
+    const bool rdma_push = pool_ != nullptr && pool_->ReadPushRdma();
     if (request->has_push()) {
       const auto& wire = request->push();
       if (request->require_fabric() || wire.reader_id().empty() ||
@@ -520,11 +521,16 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
             ref.loc = ref.mem.loc;
             ref.size = ref.mem.size;
             ref.device = ref.mem.deviceId;
-            if (ref.mem.engineKey != engine.key || ref.loc != mori::io::MemoryLocationType::GPU ||
-                !range.size || range.destination_offset > ref.size ||
+            // FABRIC destinations are fabric-exported GPU memory; RDMA ones
+            // only need to be registered with the reader's engine.
+            const bool fabric_ok =
+                ref.loc == mori::io::MemoryLocationType::GPU &&
+                !std::all_of(ref.mem.fabricHandle.begin(), ref.mem.fabricHandle.end(),
+                             [](char c) { return c == 0; });
+            if (ref.mem.engineKey != engine.key || !range.size ||
+                range.destination_offset > ref.size ||
                 range.size > ref.size - range.destination_offset ||
-                std::all_of(ref.mem.fabricHandle.begin(), ref.mem.fabricHandle.end(),
-                            [](char c) { return c == 0; }))
+                !(rdma_push ? ref.HasMemoryDesc() : fabric_ok))
               return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid push destination");
             push.ranges[i].push_back(std::move(range));
           }

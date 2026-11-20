@@ -28,6 +28,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -935,6 +936,196 @@ TEST_F(CrossNodeOverlap, PutPageLargerThanStagingPoolFailsBatchCleanly) {
   ASSERT_TRUE(caller->RegisterMemory(ok_src.data(), ok_src.size()));
   EXPECT_TRUE(caller->Put("ptoobig-ok", ok_src.data(), kPageSize));
   caller->DeregisterMemory(ok_src.data());
+}
+
+// ===========================================================================
+// RDMA owner-push: remote gets without RDMA READ (UMBP_RDMA_OWNER_PUSH).
+//
+// kLocal affinity pins every key in the putter's own DRAM, so the reader's get
+// is always remote.  The reader runs with forbid_rdma_read, which rejects any
+// pull at plan time: a get can then only succeed if the owner RDMA-WROTE the
+// bytes into the reader's registered buffer.  The control cases prove the get
+// really is remote and that the guard really blocks READ.
+// ===========================================================================
+class CrossNodeRdmaOwnerPush : public ::testing::Test {
+ protected:
+  static constexpr size_t kPageSize = 4096;
+  static constexpr size_t kObj = 3 * kPageSize;  // multi-page objects
+  static constexpr size_t kN = 6;
+  static constexpr size_t kScratch = 1 << 20;
+
+  void SetUp() override {
+    MasterServerConfig master_cfg;
+    master_cfg.listen_address = "0.0.0.0:0";
+    master_cfg.registry_config.heartbeat_ttl = std::chrono::seconds{1};
+    master_cfg.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(
+        ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable,
+        ConfigurableRoutePutStrategy::NodeAffinity::kLocal);
+    master_ = std::make_unique<MasterServer>(std::move(master_cfg));
+    server_thread_ = std::thread([this] { master_->Run(); });
+    for (int i = 0; i < 50 && master_->GetBoundPort() == 0; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_NE(master_->GetBoundPort(), 0) << "Master failed to start";
+  }
+
+  PoolClient* MakeClient(const std::string& node_id, bool owner_push, bool forbid_read) {
+    PoolClientConfig cfg;
+    cfg.master_config.node_id = node_id;
+    cfg.master_config.node_address = "127.0.0.1";
+    cfg.master_config.master_address = "localhost:" + std::to_string(master_->GetBoundPort());
+    cfg.io_engine.host = "0.0.0.0";
+    cfg.io_engine.port = 0;
+    cfg.io_engine.mode = UMBPTransferMode::kRdma;
+    cfg.io_engine.rdma_owner_push = owner_push;
+    cfg.io_engine.forbid_rdma_read = forbid_read;
+    cfg.auto_peer_service_port = true;
+    cfg.dram_page_size = kPageSize;
+    cfg.dram.buffer_sizes = {kPageSize * 64};
+    cfg.eviction_mode = PeerEvictionMode::kMaster;
+    // Keep remotely fetched keys remote, so a repeat get crosses again.
+    cfg.cache_remote_fetches = false;
+    // Ranged remote gets stage whole objects through a registered arena.
+    scratch_.emplace_back(kScratch);
+    cfg.ranged_get_scratch = {{scratch_.back().data(), kScratch, -1, 1}};
+    scratch_.emplace_back(kScratch);
+    cfg.ranged_put_scratch = {{scratch_.back().data(), kScratch, -1, 1}};
+    auto cli = std::make_unique<PoolClient>(std::move(cfg));
+    EXPECT_TRUE(cli->Init());
+    // DistributedClient registers its arenas the same way.
+    cli->RegisterMemory(scratch_[scratch_.size() - 2].data(), kScratch);
+    cli->RegisterMemory(scratch_.back().data(), kScratch);
+    clients_.push_back(std::move(cli));
+    return clients_.back().get();
+  }
+
+  // Owner puts kN multi-page keys into its own DRAM.
+  void Seed(PoolClient* owner, const std::string& prefix) {
+    keys_.clear();
+    srcs_.assign(kN, {});
+    std::vector<const void*> psrcs(kN);
+    std::vector<size_t> sizes(kN, kObj);
+    for (size_t k = 0; k < kN; ++k) {
+      keys_.push_back(prefix + std::to_string(k));
+      srcs_[k].resize(kObj);
+      for (size_t i = 0; i < kObj; ++i) srcs_[k][i] = static_cast<char>((k * 131 + i * 7) & 0xff);
+      psrcs[k] = srcs_[k].data();
+    }
+    auto put = owner->BatchPut(keys_, psrcs, sizes);
+    ASSERT_EQ(put.size(), kN);
+    for (size_t k = 0; k < kN; ++k) ASSERT_TRUE(put[k]) << "put " << keys_[k];
+    for (const auto& key : keys_) ASSERT_TRUE(WaitForExists(owner, key));
+  }
+
+  // Reader BatchGets every key into one registered buffer.
+  std::vector<bool> ReadAll(PoolClient* reader, std::vector<char>* out) {
+    out->assign(kN * kObj, 0);
+    reader->RegisterMemory(out->data(), out->size());
+    for (const auto& key : keys_) EXPECT_TRUE(WaitForExists(reader, key));
+    std::vector<void*> dsts(kN);
+    std::vector<size_t> sizes(kN, kObj);
+    for (size_t k = 0; k < kN; ++k) dsts[k] = out->data() + k * kObj;
+    auto got = reader->BatchGet(keys_, dsts, sizes);
+    reader->DeregisterMemory(out->data());
+    return got;
+  }
+
+  void TearDown() override {
+    for (auto it = clients_.rbegin(); it != clients_.rend(); ++it) {
+      if (*it) (*it)->Shutdown();
+    }
+    clients_.clear();
+    if (master_) master_->Shutdown();
+    if (server_thread_.joinable()) server_thread_.join();
+    master_.reset();
+  }
+
+  std::unique_ptr<MasterServer> master_;
+  std::thread server_thread_;
+  std::vector<std::unique_ptr<PoolClient>> clients_;
+  std::vector<std::string> keys_;
+  std::vector<std::vector<char>> srcs_;
+  std::deque<std::vector<char>> scratch_;  // stable addresses; outlives clients
+};
+
+TEST_F(CrossNodeRdmaOwnerPush, WholeObjectGetsSucceedWithReadForbidden) {
+  PoolClient* owner = MakeClient("node-owner", /*owner_push=*/true, /*forbid_read=*/false);
+  PoolClient* reader = MakeClient("node-reader", /*owner_push=*/true, /*forbid_read=*/true);
+  Seed(owner, "wp-");
+  std::vector<char> out;
+  for (int round = 0; round < 2; ++round) {
+    auto got = ReadAll(reader, &out);
+    ASSERT_EQ(got.size(), kN);
+    for (size_t k = 0; k < kN; ++k) {
+      ASSERT_TRUE(got[k]) << "round " << round << " key " << keys_[k];
+      EXPECT_EQ(std::memcmp(out.data() + k * kObj, srcs_[k].data(), kObj), 0)
+          << "byte mismatch round " << round << " key " << keys_[k];
+    }
+  }
+}
+
+TEST_F(CrossNodeRdmaOwnerPush, ControlReadForbiddenWithoutPushFails) {
+  // Same placement, push off: the remote get can only pull, and the guard
+  // rejects the pull.  Proves the keys are remote and READ is never posted.
+  PoolClient* owner = MakeClient("node-owner", /*owner_push=*/true, /*forbid_read=*/false);
+  PoolClient* reader = MakeClient("node-reader", /*owner_push=*/false, /*forbid_read=*/true);
+  Seed(owner, "ctl-");
+  std::vector<char> out;
+  auto got = ReadAll(reader, &out);
+  ASSERT_EQ(got.size(), kN);
+  for (size_t k = 0; k < kN; ++k) EXPECT_FALSE(got[k]) << "unexpected success " << keys_[k];
+}
+
+TEST_F(CrossNodeRdmaOwnerPush, OwnerWithoutPushSupportFailsCleanly) {
+  // The owner advertises no read_push, so the reader falls back to pull, which
+  // its guard rejects.  The reader must fail the keys, not hang or crash.
+  PoolClient* owner = MakeClient("node-owner", /*owner_push=*/false, /*forbid_read=*/false);
+  PoolClient* reader = MakeClient("node-reader", /*owner_push=*/true, /*forbid_read=*/true);
+  Seed(owner, "nopush-");
+  std::vector<char> out;
+  auto got = ReadAll(reader, &out);
+  ASSERT_EQ(got.size(), kN);
+  for (size_t k = 0; k < kN; ++k) EXPECT_FALSE(got[k]) << "unexpected success " << keys_[k];
+}
+
+TEST_F(CrossNodeRdmaOwnerPush, RangedGetsSucceedWithReadForbidden) {
+  PoolClient* owner = MakeClient("node-owner", /*owner_push=*/true, /*forbid_read=*/false);
+  PoolClient* reader = MakeClient("node-reader", /*owner_push=*/true, /*forbid_read=*/true);
+  Seed(owner, "rg-");
+  for (const auto& key : keys_) ASSERT_TRUE(WaitForExists(reader, key));
+  // Two disjoint ranges per key, crossing a page boundary.
+  constexpr size_t kA = 1000, kAOff = 3500, kB = 2048, kBOff = 9000;
+  std::vector<char> out(kN * (kA + kB), 0);
+  reader->RegisterMemory(out.data(), out.size());
+  std::vector<std::vector<void*>> dsts(kN);
+  std::vector<std::vector<size_t>> sizes(kN, {kA, kB});
+  std::vector<std::vector<size_t>> offs(kN, {kAOff, kBOff});
+  for (size_t k = 0; k < kN; ++k) {
+    char* base = out.data() + k * (kA + kB);
+    dsts[k] = {base, base + kA};
+  }
+  auto got = reader->BatchGetRanges(keys_, dsts, sizes, offs);
+  reader->DeregisterMemory(out.data());
+  ASSERT_EQ(got.size(), kN);
+  for (size_t k = 0; k < kN; ++k) {
+    ASSERT_TRUE(got[k]) << "key " << keys_[k];
+    const char* base = out.data() + k * (kA + kB);
+    EXPECT_EQ(std::memcmp(base, srcs_[k].data() + kAOff, kA), 0) << "range A " << keys_[k];
+    EXPECT_EQ(std::memcmp(base + kA, srcs_[k].data() + kBOff, kB), 0) << "range B " << keys_[k];
+  }
+}
+
+TEST_F(CrossNodeRdmaOwnerPush, PushWithReadAllowedIsByteExact) {
+  PoolClient* owner = MakeClient("node-owner", /*owner_push=*/true, /*forbid_read=*/false);
+  PoolClient* reader = MakeClient("node-reader", /*owner_push=*/true, /*forbid_read=*/false);
+  Seed(owner, "rd-");
+  std::vector<char> out;
+  auto got = ReadAll(reader, &out);
+  ASSERT_EQ(got.size(), kN);
+  for (size_t k = 0; k < kN; ++k) {
+    ASSERT_TRUE(got[k]) << "key " << keys_[k];
+    EXPECT_EQ(std::memcmp(out.data() + k * kObj, srcs_[k].data(), kObj), 0) << keys_[k];
+  }
 }
 
 }  // namespace

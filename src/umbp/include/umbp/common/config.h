@@ -347,6 +347,12 @@ struct UMBPIoEngineConfig {
   unsigned fabric_pipeline_depth = static_cast<unsigned>(std::max<uint64_t>(
       1, NonnegativeIntegerFromEnvironment("UMBP_FABRIC_PIPELINE_DEPTH", 2, 32)));
   bool fabric_owner_push = NonnegativeIntegerFromEnvironment("UMBP_FABRIC_OWNER_PUSH", 0, 1) != 0;
+  // RDMA-mode remote gets: the owner RDMA-WRITEs into the reader's registered
+  // destination instead of the reader issuing RDMA READ (for NICs/transports,
+  // e.g. ionic MRC, where READ is disabled).
+  bool rdma_owner_push = NonnegativeIntegerFromEnvironment("UMBP_RDMA_OWNER_PUSH", 0, 1) != 0;
+  // Reject every pull at plan time, so a READ is never posted to the NIC.
+  bool forbid_rdma_read = NonnegativeIntegerFromEnvironment("UMBP_FORBID_RDMA_READ", 0, 1) != 0;
   bool fabric_cache_descriptors =
       NonnegativeIntegerFromEnvironment("UMBP_FABRIC_CACHE_DESCRIPTORS", 0, 1) != 0;
   std::string fabric_kernel_path = [] {

@@ -1294,14 +1294,17 @@ bool PoolClient::Init() {
     default_pool_->SetFabricReadStaging(std::move(staging), [this] { QuarantineGpuResources(); });
   }
 
-  if (config_.io_engine.mode == UMBPTransferMode::kFabricStrict &&
-      config_.io_engine.fabric_owner_push && peer_directory_) {
+  const bool fabric_push = config_.io_engine.mode == UMBPTransferMode::kFabricStrict &&
+                           config_.io_engine.fabric_owner_push;
+  const bool rdma_push =
+      config_.io_engine.mode == UMBPTransferMode::kRdma && config_.io_engine.rdma_owner_push;
+  if ((fabric_push || rdma_push) && peer_directory_) {
     default_pool_->SetFabricReadPush(std::make_shared<FabricReadPush>(
         transfer_engine_.get(), peer_directory_, &registry_, config_.fabric_read_staging_device,
         [this](const void* ptr, size_t bytes, int device) {
           return platform_->HostDeviceAddress(ptr, bytes, device);
         },
-        [this] { QuarantineGpuResources(); }));
+        [this] { QuarantineGpuResources(); }, rdma_push));
   }
 
   // Local watermark eviction, for every medium unless a master's rounds own
@@ -5549,9 +5552,11 @@ void PoolClient::NoteRangedInstallFailure(size_t count) {
 bool PoolClient::TryRemoteBatchPush(const std::vector<BatchGetItem>& items, PeerConnection& peer,
                                     const std::shared_ptr<void>& stub_hold,
                                     RemoteGetInFlight* inflight, std::vector<bool>* results) {
-  if (!config_.io_engine.fabric_owner_push || !peer.read_push || !peer.completion_pins ||
-      config_.io_engine.mode != UMBPTransferMode::kFabricStrict)
-    return false;
+  const bool fabric = config_.io_engine.mode == UMBPTransferMode::kFabricStrict &&
+                      config_.io_engine.fabric_owner_push;
+  const bool rdma =
+      config_.io_engine.mode == UMBPTransferMode::kRdma && config_.io_engine.rdma_owner_push;
+  if (!(fabric || rdma) || !peer.read_push || !peer.completion_pins) return false;
   ::umbp::BatchAcquireReadKeysRequest request;
   request.set_operation_id(NewOperationId());
   request.set_expected_owner_incarnation(peer.owner_incarnation);
@@ -5561,30 +5566,66 @@ bool PoolClient::TryRemoteBatchPush(const std::vector<BatchGetItem>& items, Peer
   push->set_reader_id(config_.master_config.node_id);
   const auto engine_desc = peer_directory_->PackedLocalEngineDesc();
   push->set_engine_desc(engine_desc.data(), engine_desc.size());
+  auto usable = [&](const TransferRef& ref) {
+    if (!ref.HasMemoryDesc()) return false;
+    if (rdma) return true;
+    return ref.loc == mori::io::MemoryLocationType::GPU &&
+           !std::all_of(ref.mem.fabricHandle.begin(), ref.mem.fabricHandle.end(),
+                        [](char c) { return c == 0; });
+  };
   for (const auto& item : items) {
-    if (!item.range_dsts || !item.spans || item.route.tier == TierType::HBM ||
-        item.range_dsts->size() != item.spans->size())
+    // FABRIC pushes only direct-range, non-HBM items.  RDMA pushes every
+    // shape the pull path reads: whole object, packed spans, direct ranges,
+    // and pre-resolved medium destinations (locality prefetch).
+    if (fabric && (!item.range_dsts || !item.spans || item.route.tier == TierType::HBM ||
+                   item.range_dsts->size() != item.spans->size()))
+      return false;
+    if (item.range_dsts && (!item.spans || item.range_dsts->size() != item.spans->size()))
       return false;
     request.mutable_resolve()->add_keys(*item.key);
     uint64_t begin = item.size, end = 0;
     auto* key = push->add_keys();
-    for (size_t r = 0; r < item.spans->size(); ++r) {
-      const auto& span = (*item.spans)[r];
-      auto [ref, offset] = UserBufferRef((*item.range_dsts)[r], span.size);
-      if (!ref.HasMemoryDesc() || ref.loc != mori::io::MemoryLocationType::GPU ||
-          std::all_of(ref.mem.fabricHandle.begin(), ref.mem.fabricHandle.end(),
-                      [](char c) { return c == 0; }) ||
-          span.object_offset > item.size || span.size > item.size - span.object_offset)
+    auto add = [&](const TransferRef& ref, uint64_t dst_offset, uint64_t src_offset,
+                   uint64_t length) {
+      if (!usable(ref) || !length || src_offset > item.size || length > item.size - src_offset ||
+          dst_offset > ref.size || length > ref.size - dst_offset)
         return false;
       auto* range = key->add_ranges();
-      range->set_source_offset(span.object_offset);
-      range->set_length(span.size);
-      range->set_destination_offset(offset);
+      range->set_source_offset(src_offset);
+      range->set_length(length);
+      range->set_destination_offset(dst_offset);
       msgpack::sbuffer packed;
       msgpack::pack(packed, ref.mem);
       range->set_destination_desc(packed.data(), packed.size());
-      begin = std::min<uint64_t>(begin, span.object_offset);
-      end = std::max<uint64_t>(end, span.object_offset + span.size);
+      begin = std::min<uint64_t>(begin, src_offset);
+      end = std::max<uint64_t>(end, src_offset + length);
+      return true;
+    };
+    if (item.range_dsts) {
+      for (size_t r = 0; r < item.spans->size(); ++r) {
+        const auto& span = (*item.spans)[r];
+        auto [ref, offset] = UserBufferRef((*item.range_dsts)[r], span.size);
+        if (!add(ref, offset, span.object_offset, span.size)) return false;
+      }
+    } else {
+      TransferRef ref;
+      uint64_t base = 0;
+      if (item.dst_ref != nullptr) {
+        ref = *item.dst_ref;
+        base = item.dst_ref_offset;
+      } else {
+        std::tie(ref, base) = UserBufferRef(item.dst, item.DstBytes());
+      }
+      if (item.Ranged()) {
+        // Packed: spans land back to back at the destination.
+        uint64_t at = base;
+        for (const auto& span : *item.spans) {
+          if (!add(ref, at, span.object_offset, span.size)) return false;
+          at += span.size;
+        }
+      } else if (!add(ref, base, 0, item.size)) {
+        return false;
+      }
     }
     auto* extent = request.mutable_resolve()->add_extents();
     extent->set_offset(begin);
@@ -5648,7 +5689,8 @@ bool PoolClient::TryRemoteBatchPush(const std::vector<BatchGetItem>& items, Peer
     inflight->push_bytes = response.push_submitted_bytes();
     inflight->push_plans = response.push_submitted_plans();
     CountMetric("umbp_client_owner_push_submitted_bytes_total",
-                "Owner acknowledged FABRIC push payload bytes", {}, inflight->push_bytes);
+                "Owner acknowledged push payload bytes (FABRIC or RDMA WRITE)", {},
+                inflight->push_bytes);
     return true;
   } while (std::chrono::steady_clock::now() < deadline);
   for (const auto& item : items) (*results)[item.index] = false;
