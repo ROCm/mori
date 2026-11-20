@@ -303,6 +303,12 @@ set(UMBP_STANDALONE_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.pb.h")
 set(UMBP_STANDALONE_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.cc")
 set(UMBP_STANDALONE_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.h")
 
+set(UMBP_L1_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_l1.proto")
+set(UMBP_L1_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_l1.pb.cc")
+set(UMBP_L1_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_l1.pb.h")
+set(UMBP_L1_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_l1.grpc.pb.cc")
+set(UMBP_L1_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_l1.grpc.pb.h")
+
 set(UMBP_WORKLOAD_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_workload.pb.cc")
 set(UMBP_WORKLOAD_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_workload.pb.h")
 
@@ -373,6 +379,18 @@ add_custom_command(
     ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_PROTO_DIR}/sgl_kv_indexer.proto
   DEPENDS ${UMBP_PROTO_DIR}/sgl_kv_indexer.proto
   COMMENT "Generating SGLang KV Indexer C++ sources"
+  VERBATIM)
+
+add_custom_command(
+  OUTPUT ${UMBP_L1_PROTO_SRCS} ${UMBP_L1_PROTO_HDRS} ${UMBP_L1_GRPC_SRCS}
+         ${UMBP_L1_GRPC_HDRS}
+  COMMAND
+    ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
+    --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_L1_PROTO_FILE}
+  DEPENDS ${UMBP_L1_PROTO_FILE}
+  COMMENT "Generating UMBP L1 pool protobuf/gRPC C++ sources"
   VERBATIM)
 
 # Shared between PoolClient integration and standalone control-plane tools.
@@ -458,6 +476,51 @@ target_link_libraries(
                      ${_PROTOBUF_LIBS} ${_GRPCPP_LIB})
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
+
+# ---------- L1 block pools ---------------------------------------------------
+# UMBP-owned GPU KV memory with its slot table and cross-pool fetch. A library
+# of its own so an engine process can load the client without the rest of the
+# distributed stack (mori_io, the master/peer protos).
+add_library(umbp_l1 STATIC ${UMBP_L1_PROTO_SRCS} ${UMBP_L1_GRPC_SRCS} l1/l1_pool.cpp
+                           l1/l1_service.cpp)
+set_target_properties(umbp_l1 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(
+  umbp_l1 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${UMBP_PROTO_GEN_DIR}
+                 ${_PROTOBUF_INCLUDE_DIR})
+target_include_directories(umbp_l1 BEFORE PUBLIC "${_PROTOBUF_COMPAT_DIR}")
+target_link_libraries(umbp_l1 PUBLIC mori_logging hip::host ${_PROTOBUF_LIBS}
+                                     ${_GRPCPP_LIB})
+target_compile_features(umbp_l1 PUBLIC cxx_std_17)
+target_link_libraries(umbp_common PUBLIC umbp_l1)
+
+option(BUILD_UMBP_L1_PYTHON "Build the mori_umbp_l1 Python client module" OFF)
+if(BUILD_UMBP_L1_PYTHON)
+  find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+  execute_process(
+    COMMAND ${Python_EXECUTABLE} -c "import pybind11; print(pybind11.get_include())"
+    OUTPUT_VARIABLE _UMBP_L1_PYBIND11_INCLUDE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _umbp_l1_pybind11_result)
+  if(NOT _umbp_l1_pybind11_result EQUAL 0)
+    message(FATAL_ERROR "BUILD_UMBP_L1_PYTHON needs pybind11 in ${Python_EXECUTABLE}")
+  endif()
+  execute_process(
+    COMMAND ${Python_EXECUTABLE} -c
+            "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
+    OUTPUT_VARIABLE _UMBP_L1_EXT_SUFFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  add_library(mori_umbp_l1 MODULE l1/pybind_l1.cpp)
+  set_target_properties(
+    mori_umbp_l1
+    PROPERTIES PREFIX ""
+               SUFFIX "${_UMBP_L1_EXT_SUFFIX}"
+               CXX_VISIBILITY_PRESET hidden
+               BUILD_RPATH "${ROCM_PATH}/lib"
+               INSTALL_RPATH "${ROCM_PATH}/lib")
+  target_include_directories(mori_umbp_l1 PRIVATE ${Python_INCLUDE_DIRS}
+                                                  ${_UMBP_L1_PYBIND11_INCLUDE})
+  target_link_libraries(mori_umbp_l1 PRIVATE umbp_l1)
+endif()
 
 # ---------- Optional hipfile GDS transfer engine -----------------------------
 # GdsEngine reads an SSD segment's byte range straight into GPU memory via
