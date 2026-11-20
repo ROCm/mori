@@ -256,6 +256,8 @@ class OfiBackend : public Backend {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
 
+  // No fence yet: reports a peer it has addresses for as not cut off.
+  FenceResult FenceRemoteEngine(const EngineKey& remote) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
   DescBlob GetEngineDescBlob() const override;
