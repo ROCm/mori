@@ -295,6 +295,31 @@ TEST(InMemoryStore, ExpireStaleIsIdempotent) {
   EXPECT_TRUE(store.ExpireStaleClients(kT0 + 10s).empty());
 }
 
+// The reaper dropped the node's block locations. A keepalive or delta on its
+// EXPIRED row gets UNKNOWN, so the client re-registers and full-syncs; a full
+// sync carries every location and revives the row.
+TEST(InMemoryStore, ExpiredRowRevivesOnlyOnFullSync) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "n1", kT0);
+  ASSERT_EQ(Beat(store, "n1", 1, {Add("k1", TierType::HBM, 10)}, kT0).status,
+            HeartbeatResult::APPLIED);
+  ASSERT_EQ(store.ExpireStaleClients(kT0 + 10s).size(), 1u);
+
+  EXPECT_EQ(Beat(store, "n1", 0, {}, kT0 + 40s).status, HeartbeatResult::UNKNOWN);  // keepalive
+  EXPECT_EQ(Beat(store, "n1", 2, {Add("k2", TierType::HBM, 10)}, kT0 + 40s).status,
+            HeartbeatResult::UNKNOWN);
+  EXPECT_FALSE(store.IsClientAlive("n1"));
+  EXPECT_TRUE(store.LookupBlock("k2").empty());
+
+  EXPECT_EQ(store
+                .ApplyHeartbeat("n1", 2, kT0 + 40s, Caps(), {Add("k1", TierType::HBM, 10)},
+                                /*is_full_sync=*/true)
+                .status,
+            HeartbeatResult::APPLIED);
+  EXPECT_TRUE(store.IsClientAlive("n1"));
+  EXPECT_EQ(store.LookupBlock("k1").size(), 1u);
+}
+
 TEST(InMemoryStore, ExpiredRowExcludedFromAliveAccounting) {
   InMemoryMasterMetadataStore store;
   RegisterAlive(store, "n1", kT0);
