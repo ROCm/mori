@@ -6,6 +6,7 @@
 |---|---|
 | [UMBP 使用手册](user-guide.zh-CN.md) | 安装、进程内使用、standalone 共享、DRAM/SSD 配置、指针与范围 API、内存生命周期、性能调优与排查 |
 | [SGLang 对接 demo](sglang-demo.zh-CN.md) | 固定实验版本、Linker 结构、附件准备、服务启动、两次请求、168 请求回放与历史结果 |
+| [455 ATOM L1 sharing 验证报告](atom-l1-sharing-455-report.zh-CN.md) | 单 tray 跨卡实际共享、目的槽修复、正确性与 CPU 开销；独立测试版本的结果记录 |
 | [本机 KV 示例](../../examples/umbp/local_kv_demo.py) | 小容量 DRAM、SSD 和 standalone 指针读写，逐字节校验 |
 | [SGLang 请求示例](../../examples/umbp/sglang_linker_smoke.py) | 检查服务端 Linker 参数，发送两次相同请求并记录 cache metadata |
 
