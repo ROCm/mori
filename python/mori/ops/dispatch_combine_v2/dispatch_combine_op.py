@@ -69,15 +69,22 @@ WAVE = detect_wave_size()
 _BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
 
 
-def _default_backend() -> str:
+def _gfx125x() -> bool:
     try:
         from mori.jit.core import _FASTPATH_ARCH_PREFIX, _target_arch
 
-        gfx125x = _target_arch().startswith(_FASTPATH_ARCH_PREFIX)
+        return _target_arch().startswith(_FASTPATH_ARCH_PREFIX)
     except Exception:
-        gfx125x = False
-    return "hip" if gfx125x else "flydsl"
+        return False
 
+
+def _default_backend() -> str:
+    return "hip" if _gfx125x() else "flydsl"
+
+
+# Warps a gfx125x dispatch block gets for an fp32 payload, mirroring MakeEpCfg's
+# default: its LDS slab is a whole token row, so fp32 takes half of the 16.
+_FP32_WARPS = 8
 
 _FP4_QUANT_TYPES = ("fp4_blockwise", "fp4_blockwise_fp32")
 # The quant types the hip backend runs as its gfx125x push combine: the sender
@@ -529,6 +536,13 @@ class EpDispatchCombineConfig:
             if self.combine_rdma_block_num is None:
                 self.combine_rdma_block_num = 64
             return
+        # The gfx125x dispatch stages a token row a warp in LDS, so an fp32 row takes
+        # twice the slab the 16 of the other dtypes was picked against -- MakeEpCfg
+        # halves its own default the same way. The tables cannot do this themselves:
+        # they are keyed by the transported dtype, which calls fp32 "bf16". Every warp
+        # count below is one we pick, a tuned row or a single-shot default; one the
+        # caller pinned is left alone.
+        fp32_default = _gfx125x() and self.dispatch_dtype == torch.float32
         if not pinned:
             backend = (
                 self.kernel_backend
@@ -570,6 +584,13 @@ class EpDispatchCombineConfig:
             self.warp_num_per_block = t["warp_num_per_block"]
             self.combine_warp_num_per_block = t["combine_warp_num_per_block"]
             self.schedule = t["schedule"]
+            if fp32_default:
+                self.warp_num_per_block = min(self.warp_num_per_block, _FP32_WARPS)
+                if self.schedule:
+                    self.schedule = tuple(
+                        (edge, db, min(dw, _FP32_WARPS), cbn, cw)
+                        for edge, db, dw, cbn, cw in self.schedule
+                    )
         else:
             # explicit geometry: fill any unset field with the single-shot default
             if self.dispatch_block_num is None:
@@ -577,7 +598,8 @@ class EpDispatchCombineConfig:
             if self.combine_block_num is None:
                 self.combine_block_num = 80
             if self.warp_num_per_block is None:
-                self.warp_num_per_block = 16
+                # Unset beside a field that was pinned: still ours to choose.
+                self.warp_num_per_block = _FP32_WARPS if fp32_default else 16
             if self.combine_warp_num_per_block is None:
                 self.combine_warp_num_per_block = 4
 
