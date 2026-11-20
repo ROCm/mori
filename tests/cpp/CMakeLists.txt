@@ -60,6 +60,14 @@ target_include_directories(test_transport_ibverbs PUBLIC ${CMAKE_SOURCE_DIR})
 # reintroduce a link-time dependency on a host without RDMA installed.
 target_link_libraries(test_transport_ibverbs mori_application mori_ibv_shim)
 
+# How the amdgpu driver counts VRAM that a NIC pins (ROCm/mori#721), and the HIP GEM
+# allocator that avoids it. Needs a GPU and an RDMA device; not a ctest. The header
+# comment lists the expected output on each amdgpu driver.
+add_executable(test_kfd_vram_accounting application/test_kfd_vram_accounting.cpp)
+target_include_directories(test_kfd_vram_accounting PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(test_kfd_vram_accounting PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_kfd_vram_accounting mori_application mori_ibv_shim gtest_main)
+
 # Pure host planner: no HIP runtime, IO library, or GPU required.
 add_executable(test_fabric_copy_plan io/test_fabric_copy_plan.cpp
                ${CMAKE_SOURCE_DIR}/src/io/fabric/copy_plan.cpp)

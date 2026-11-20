@@ -34,9 +34,11 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 
+#include "mori/application/memory/hip_gem_allocator.hpp"
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "mori/utils/host_utils.hpp"
@@ -829,6 +831,17 @@ void XgmiBackend::DeregisterRemoteEngine(const EngineDesc& desc) {
 void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
   if (desc.loc != MemoryLocationType::GPU) {
     MORI_IO_TRACE("XGMI: Skipping non-GPU memory registration for id={}", desc.id);
+    return;
+  }
+
+  // HIP has no IPC handle for a HIP GEM allocator buffer (imported memory); it is
+  // reachable through RDMA only.
+  if (application::HipGemLookup(reinterpret_cast<void*>(desc.data), nullptr, false)) {
+    static std::once_flag logged;
+    std::call_once(logged, [&] {
+      MORI_IO_INFO("XGMI: HIP GEM buffers have no IPC handle, leaving memory id={} to RDMA",
+                   desc.id);
+    });
     return;
   }
 
