@@ -27,6 +27,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <shared_mutex>
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
@@ -37,6 +39,8 @@ namespace {
 
 // How long Allocate waits for a slot that is free but pinned by a copy.
 constexpr std::chrono::milliseconds kPinnedWait{2000};
+// How long a fetch into held slots waits for their owner's writes to settle.
+constexpr std::chrono::milliseconds kSettleWait{1000};
 
 std::string HipError(const char* what, hipError_t err) {
   return std::string(what) + " failed: " + hipGetErrorString(err);
@@ -67,15 +71,18 @@ class ScopedDevice {
   bool restore_ = false;
 };
 
-// Every HIP call is made under one lock. Attaches for several devices arrive
-// at once on different RPC threads, and concurrent allocate / zero-fill /
-// synchronize calls from those threads have been seen to park forever inside
-// the runtime. Copies are short, so serializing them costs little for now.
+// Allocation, import and their undoing are made under one exclusive lock.
+// Attaches for several devices arrive at once on different RPC threads, and
+// concurrent allocate / zero-fill / synchronize calls from those threads have
+// been seen to park forever inside the runtime. Copies share that lock, so they
+// never run beside an attach, and otherwise only serialize per destination
+// device: fetches into different pools copy at once, each on its device's own
+// stream, which is all they synchronize.
 class HipMemoryApi final : public MemoryApi {
  public:
   bool Allocate(int device, uint64_t bytes, void** base, ExportedMemory* exported,
                 std::string* error) override {
-    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+    std::unique_lock<std::shared_mutex> hip_lock(hip_mutex_);
     ScopedDevice scope(device);
     if (!scope.ok()) {
       *error = "hipSetDevice(" + std::to_string(device) + ") failed";
@@ -108,7 +115,7 @@ class HipMemoryApi final : public MemoryApi {
   }
 
   void Free(int device, void* base, uint64_t /*bytes*/) override {
-    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+    std::unique_lock<std::shared_mutex> hip_lock(hip_mutex_);
     ScopedDevice scope(device);
     (void)hipFree(base);
   }
@@ -121,7 +128,7 @@ class HipMemoryApi final : public MemoryApi {
       return false;
     }
     std::memcpy(ipc.reserved, handle.data(), sizeof(ipc.reserved));
-    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+    std::unique_lock<std::shared_mutex> hip_lock(hip_mutex_);
     ScopedDevice scope(device);
     if (!scope.ok()) {
       *error = "hipSetDevice(" + std::to_string(device) + ") failed";
@@ -139,14 +146,14 @@ class HipMemoryApi final : public MemoryApi {
   }
 
   void Unimport(int device, void* mapped) override {
-    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+    std::unique_lock<std::shared_mutex> hip_lock(hip_mutex_);
     ScopedDevice scope(device);
     (void)hipIpcCloseMemHandle(mapped);
   }
 
   bool Copy(int dst_device, void* dst, int /*src_device*/, const void* src, uint64_t bytes,
             std::string* error) override {
-    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+    std::unique_lock<std::shared_mutex> hip_lock(hip_mutex_);
     ScopedDevice scope(dst_device);
     if (!scope.ok()) {
       *error = "hipSetDevice(" + std::to_string(dst_device) + ") failed";
@@ -160,10 +167,46 @@ class HipMemoryApi final : public MemoryApi {
     return true;
   }
 
+  // Every fragment on the destination device's own stream, waited for once.
+  // The copy engine, not a kernel: the engine that owns both pools is running
+  // its model on these GPUs, and a gather kernel there takes compute units
+  // from it (measured: the engine's decode slowed more than the copies sped
+  // up).
+  bool CopyBatch(int dst_device, const std::vector<Fragment>& fragments,
+                 std::string* error) override {
+    if (fragments.empty()) return true;
+    std::shared_lock<std::shared_mutex> shared(hip_mutex_);
+    std::lock_guard<std::mutex> device_lock(DeviceMutex(dst_device));
+    ScopedDevice scope(dst_device);
+    if (!scope.ok()) {
+      *error = "hipSetDevice(" + std::to_string(dst_device) + ") failed";
+      return false;
+    }
+    hipStream_t stream = StreamFor(dst_device);
+    if (stream == nullptr) {
+      *error = "no copy stream on device " + std::to_string(dst_device);
+      return false;
+    }
+    for (const Fragment& f : fragments) {
+      const hipError_t err = hipMemcpyAsync(f.dst, f.src, static_cast<size_t>(f.bytes),
+                                            hipMemcpyDeviceToDevice, stream);
+      if (err != hipSuccess) {
+        *error = HipError("hipMemcpyAsync", err);
+        return false;
+      }
+    }
+    const hipError_t err = hipStreamSynchronize(stream);
+    if (err != hipSuccess) {
+      *error = HipError("hipStreamSynchronize", err);
+      return false;
+    }
+    return true;
+  }
+
   // A device-to-device copy is not guaranteed to have landed when hipMemcpy
   // returns, and the caller hands these bytes to another process next.
   bool Synchronize(int device, std::string* error) override {
-    std::lock_guard<std::mutex> hip_lock(hip_mutex_);
+    std::unique_lock<std::shared_mutex> hip_lock(hip_mutex_);
     ScopedDevice scope(device);
     const hipError_t err = scope.ok() ? hipDeviceSynchronize() : hipErrorInvalidDevice;
     if (err != hipSuccess) {
@@ -174,7 +217,26 @@ class HipMemoryApi final : public MemoryApi {
   }
 
  private:
-  std::mutex hip_mutex_;
+  std::mutex& DeviceMutex(int device) {
+    std::lock_guard<std::mutex> lock(table_mutex_);
+    return device_mutex_[device];
+  }
+
+  // The device is current. Created once and kept: a pool's copies all go here.
+  hipStream_t StreamFor(int device) {
+    std::lock_guard<std::mutex> lock(table_mutex_);
+    auto found = streams_.find(device);
+    if (found != streams_.end()) return found->second;
+    hipStream_t stream = nullptr;
+    if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) stream = nullptr;
+    streams_[device] = stream;
+    return stream;
+  }
+
+  std::shared_mutex hip_mutex_;
+  std::mutex table_mutex_;
+  std::map<int, std::mutex> device_mutex_;
+  std::map<int, hipStream_t> streams_;
 };
 
 class HostMemoryApi final : public MemoryApi {
@@ -227,6 +289,14 @@ bool SameLayout(const Layout& a, const Layout& b) {
 }
 
 }  // namespace
+
+bool MemoryApi::CopyBatch(int dst_device, const std::vector<Fragment>& fragments,
+                          std::string* error) {
+  for (const Fragment& f : fragments) {
+    if (!Copy(dst_device, f.dst, f.src_device, f.src, f.bytes, error)) return false;
+  }
+  return fragments.empty() || Synchronize(dst_device, error);
+}
 
 std::shared_ptr<MemoryApi> MakeHipMemoryApi() { return std::make_shared<HipMemoryApi>(); }
 std::shared_ptr<MemoryApi> MakeHostMemoryApi() { return std::make_shared<HostMemoryApi>(); }
@@ -497,6 +567,8 @@ Status PoolManager::Commit(const std::string& pool_id, uint64_t committed) {
   Pool* pool = FindLocked(pool_id);
   if (pool == nullptr) return Status::Error("unknown pool " + pool_id);
   pool->committed = std::max(pool->committed, committed);
+  // A fetch into this pool's held slots may be waiting for them to settle.
+  idle_.notify_all();
   return Status{};
 }
 
@@ -604,6 +676,26 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     result.status = Status::Error("fetch into pool " + pool_id + ": fewer slots than keys");
     return result;
   }
+  if (into) {
+    // A regranted slot may still have its owner's writes in flight. They land
+    // within a forward or two, and the owner's next Commit says so: wait for
+    // that rather than leave the caller to recompute what it asked for. Past
+    // the bound, the check below stops at the first unsettled slot.
+    const auto settle_deadline = std::chrono::steady_clock::now() + kSettleWait;
+    idle_.wait_until(lock, settle_deadline, [&] {
+      pool = FindLocked(pool_id);
+      if (pool == nullptr || !pool->bound) return true;
+      for (size_t i = 0; i < keys.size(); ++i) {
+        const uint32_t dst = options.dst_slots[i];
+        if (dst < pool->slots.size() && !Fillable(*pool, pool->slots[dst])) return false;
+      }
+      return true;
+    });
+    if (pool == nullptr || !pool->bound) {
+      result.status = Status::Error("pool " + pool_id + " was detached");
+      return result;
+    }
+  }
 
   // Plan under the lock: pick a source and a destination for every key, pin
   // the sources, and take the destinations off the free lists -- or, copying
@@ -670,9 +762,10 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   const auto started = std::chrono::steady_clock::now();
   std::vector<bool> copied(steps.size(), false);
   std::string copy_error;
+  std::vector<MemoryApi::Fragment> fragments;
   size_t run_start = 0;
   bool failed = false;
-  while (run_start < steps.size() && !failed) {
+  while (run_start < steps.size()) {
     size_t run_end = run_start + 1;
     while (run_end < steps.size() && steps[run_end].src == steps[run_start].src &&
            steps[run_end].src_slot == steps[run_end - 1].src_slot + 1 &&
@@ -689,29 +782,17 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
           static_cast<char*>(pool->base) + dst_region.offset + uint64_t{first.dst_slot} * unit;
       const void* src = static_cast<const char*>(first.src->base) + src_region.offset +
                         uint64_t{first.src_slot} * unit;
-      if (!api_->Copy(pool->device, dst, first.src->device, src, run_slots * unit, &copy_error)) {
-        failed = true;
-        break;
-      }
+      fragments.push_back(MemoryApi::Fragment{dst, src, run_slots * unit, first.src->device});
       result.copied_bytes += run_slots * unit;
-    }
-    if (!failed) {
-      for (size_t i = run_start; i < run_end; ++i) copied[i] = true;
     }
     run_start = run_end;
   }
-  // Once per device rather than once per copy: nothing is handed to the
-  // requester before this returns.
-  if (!steps.empty()) {
-    std::set<int> devices{pool->device};
-    for (const CopyStep& step : steps) devices.insert(step.src->device);
-    for (int device : devices) {
-      if (!api_->Synchronize(device, &copy_error)) {
-        failed = true;
-        std::fill(copied.begin(), copied.end(), false);
-        break;
-      }
-    }
+  // One batch for the whole call, landed before it returns: nothing is
+  // handed to the requester before then.
+  if (!fragments.empty()) {
+    failed = !api_->CopyBatch(pool->device, fragments, &copy_error);
+    if (failed) result.copied_bytes = 0;
+    std::fill(copied.begin(), copied.end(), !failed);
   }
   result.copy_micros = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                                  std::chrono::steady_clock::now() - started)

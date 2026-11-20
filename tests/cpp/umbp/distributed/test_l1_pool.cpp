@@ -22,11 +22,13 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "umbp/l1/l1_pool.h"
@@ -234,10 +236,10 @@ TEST_F(L1PoolTest, FetchCopiesEveryRegionAndCachesTheSlots) {
   for (size_t i = 0; i < 3; ++i) {
     EXPECT_TRUE(Holds(1, fetched.slots[i], static_cast<uint8_t>(10 + i)));
   }
-  // Consecutive slots on both sides are one copy per region, and the copies
-  // are waited for once per device before the slots are handed over.
+  // Consecutive slots on both sides are one copy per region, all in one batch
+  // waited for once, on the destination, before the slots are handed over.
   EXPECT_EQ(api->copies, 2);
-  EXPECT_EQ(api->synchronizes, 2);
+  EXPECT_EQ(api->synchronizes, 1);
   PoolStats p1 = StatsOf("p1");
   EXPECT_EQ(p1.cached, 3u);
   EXPECT_EQ(p1.held, 0u);
@@ -392,6 +394,27 @@ TEST_F(L1PoolTest, FetchIntoDefersUntilPreviousOwnersWritesComplete) {
   EXPECT_EQ(after.copied_slots, 1u);
   EXPECT_TRUE(Holds(1, dst, 10));
   EXPECT_EQ(StatsOf("p1").held, 1u);
+}
+
+TEST_F(L1PoolTest, FetchIntoWaitsForTheOwnersCommitThenCopiesEverything) {
+  Cache(0, {"a", "b"}, 10);
+  const auto dst = manager->Allocate("p1", 2).slots;
+  ASSERT_EQ(dst.size(), 2u);
+  ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kRelease, dst[1], ""}}, 100).ok);
+  ASSERT_EQ(manager->Allocate("p1", 1).slots, (std::vector<uint32_t>{dst[1]}));
+  FetchOptions options;
+  options.dst_slots = dst;
+  // The owner's device catches up while the fetch waits.
+  std::thread owner([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(manager->Commit("p1", 100).ok);
+  });
+  FetchResult fetched = manager->Fetch("p1", {"a", "b"}, options);
+  owner.join();
+  EXPECT_TRUE(fetched.status.ok);
+  EXPECT_EQ(fetched.slots, dst);
+  EXPECT_EQ(fetched.copied_slots, 2u);
+  EXPECT_TRUE(Holds(1, dst[1], 11));
 }
 
 TEST_F(L1PoolTest, FetchIntoReturnsOnlyTheLeadingSettledDestinations) {

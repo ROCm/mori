@@ -92,6 +92,17 @@ class MemoryApi {
                     std::string* error) = 0;
   // Wait until every copy issued on `device` has landed.
   virtual bool Synchronize(int device, std::string* error) = 0;
+
+  struct Fragment {
+    void* dst;
+    const void* src;
+    uint64_t bytes;
+    int src_device;
+  };
+  // Copy every fragment onto `dst_device` and return once all have landed.
+  // Fragments must not overlap. By default one Copy each, then Synchronize.
+  virtual bool CopyBatch(int dst_device, const std::vector<Fragment>& fragments,
+                         std::string* error);
 };
 
 std::shared_ptr<MemoryApi> MakeHipMemoryApi();
