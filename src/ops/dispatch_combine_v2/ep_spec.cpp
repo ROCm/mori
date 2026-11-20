@@ -75,8 +75,7 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         req.cardCombine) {
       throw std::runtime_error(
           "mori v2 ep: combineScatterQGroup is the gfx942/gfx950 quantized scatter combine: 32 or "
-          "128, "
-          "a bf16 combine, and no push, ll128 or card combine beside it");
+          "128, a bf16 combine, and no push, ll128 or card combine beside it");
     }
     c.combineScatterQGroup = req.combineScatterQGroup;
     if (req.combineScatterFp4 && arch.rfind("gfx950", 0) != 0) {
@@ -86,6 +85,26 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     c.combineScatterFp4 = req.combineScatterFp4;
   } else if (kind == EpKernelKind::Combine && req.combineScatterFp4) {
     throw std::runtime_error("mori v2 ep: combineScatterFp4 needs combineScatterQGroup");
+  }
+
+  if (req.combineScatterPlain) {
+    if (kind != EpKernelKind::Combine || arch.rfind("gfx125", 0) == 0 ||
+        (req.dtype != EpDType::Bf16 && req.dtype != EpDType::Fp32) ||
+        req.combineScatterQGroup != 0 || req.combineFp4 || req.combineFp8 || req.combineBf16Push ||
+        req.ll128 || req.ll128CombineOnly || req.cardCombine) {
+      throw std::runtime_error(
+          "mori v2 ep: combineScatterPlain is the gfx942/gfx950 unquantized scatter combine: a "
+          "bf16 or fp32 combine, no quant group, and no push, ll128 or card combine beside it");
+    }
+    c.combineScatterPlain = true;
+  }
+
+  if (req.replay) {
+    if (kind != EpKernelKind::Dispatch || arch.rfind("gfx125", 0) == 0) {
+      throw std::runtime_error(
+          "mori v2 ep: replay is a dispatch of the portable body; the gfx125x body has none");
+    }
+    c.replay = true;
   }
 
   // Defaults for the bare C++ caller only -- the Python path uses the tuning
@@ -181,6 +200,13 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     throw std::runtime_error(
         "mori v2 ep: combine reduces its input, so it needs an arithmetic dtype; "
         "fp8/fp4 are dispatch-transport only (pair them with a bf16/fp32 combine)");
+  }
+
+  // Only the portable body guards its slot encodes against the recv cap.
+  if (EpRecvCapped(c) && arch.rfind("gfx125", 0) == 0) {
+    throw std::runtime_error(
+        "mori v2 ep: maxRecv below worldSize*maxTokPerRank (token dropping) needs the portable "
+        "body; the gfx125x body does not drop");
   }
 
   if (!EpCfgIsValid(c)) {
@@ -318,8 +344,11 @@ std::string EpCombineInfo(const EpCfg& c) {
   return s + EpRegionInfo(c, EpKernelKind::Combine);
 }
 
-std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
+std::string EpDispatchSpec::EntryName(const Cfg& cfg) {
+  return EpEntryName(cfg, cfg.replay ? "dispatch_replay" : "dispatch");
+}
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
+  if (cfg.combineScatterPlain) return EpEntryName(cfg, "combine_scatter");
   if (cfg.combineScatterQGroup) {
     const bool g32 = cfg.combineScatterQGroup == 32;
     if (cfg.combineScatterFp4) return EpEntryName(cfg, g32 ? "combine_fp4x32" : "combine_fp4x128");
@@ -369,6 +398,122 @@ mori::jit::v2::LaunchGeometry EpCombineSpec::Geometry(const Cfg& cfg) {
   return g;
 }
 
+// ---------------------------------------------------------------------------
+// Local kernels.
+// ---------------------------------------------------------------------------
+EpLocalCfg MakeEpLocalCfg(const std::string& arch, const EpLocalRequest& req, EpLocalKind kind) {
+  EpLocalCfg c;
+  c.worldSize = req.worldSize;
+  c.hiddenDim = req.hiddenDim;
+  c.maxTokPerRank = req.maxTokPerRank;
+  c.numExpertPerRank = req.numExpertPerRank;
+  c.numExpertPerToken = req.numExpertPerToken;
+  c.maxRecv = req.maxRecv;
+  c.dtype = req.dtype;
+  c.blockNum = req.blockNum;
+  c.warpPerBlock = req.warpPerBlock;
+  c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
+  if (kind != EpLocalKind::ExpertCount && c.dtype != EpDType::Bf16) {
+    throw std::runtime_error("mori v2 ep: the StdMoE convert kernels are bf16 only");
+  }
+  if (!EpLocalCfgIsValid(c)) {
+    throw std::runtime_error(
+        "mori v2 ep local: inconsistent config (world=" + std::to_string(c.worldSize) +
+        " hidden=" + std::to_string(c.hiddenDim) + " topk=" + std::to_string(c.numExpertPerToken) +
+        " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
+        " blocks=" + std::to_string(c.blockNum) +
+        "); topk must fit in a wavefront, a block in 1024 threads, the experts in " +
+        std::to_string(EpLocalMaxExperts) + " and a token in whole 16 B");
+  }
+  return c;
+}
+
+std::string EpLocalRequestSchema() {
+  mori::jit::v2::SchemaBuilder sb;
+  const EpLocalRequest def{};
+  VisitFields(def, def,
+              [&](const char* n, const auto& val, const auto&) { EpEmitSchema(sb, n, val); });
+  return sb.Str();
+}
+
+std::string EpLocalInfo(const EpLocalCfg& c) {
+  return Describe(c) + EpKv("recvRows", EpLocalMaxRecv(c)) + EpKv("bucketRows", EpLocalBucket(c));
+}
+
+namespace {
+
+std::string EpLocalEntryName(const EpLocalCfg& c, const char* kind, bool typed) {
+  std::string s = std::string("mori_ep_") + kind + '_';
+  if (typed) s += std::string(EpDTypeTag(c.dtype)) + '_';
+  s += "ws" + std::to_string(c.worldSize);
+  if (typed) s += "_h" + std::to_string(c.hiddenDim);
+  s += "_k" + std::to_string(c.numExpertPerToken) + "_e" + std::to_string(c.numExpertPerRank);
+  s += '_' + std::to_string(c.blockNum) + 'x' + std::to_string(c.warpPerBlock);
+  return s;
+}
+
+std::string RenderEpLocalSource(const EpLocalCfg& c, const std::string& entry, const char* body,
+                                bool typed) {
+  std::string s =
+      "// mori jit v2 — generated, do not edit.\n"
+      "#include \"src/ops/dispatch_combine_v2/ep_local_kernels.hpp\"\n"
+      "using namespace mori::ops::v2;\n"
+      "constexpr EpLocalCfg kCfg = " +
+      Render(c) + ";\n";
+  if (typed) s += std::string("using TokT = ") + EpDTypeName(c.dtype) + ";\n";
+  return s + "extern \"C\" __global__ void __launch_bounds__(EpLocalBlockThreads(kCfg))\n" + entry +
+         "(EpLocalArgs args) { " + body + (typed ? "<kCfg, TokT>" : "<kCfg>") + "(args); }\n";
+}
+
+mori::jit::v2::LaunchGeometry EpLocalGeometry(const EpLocalCfg& c) {
+  mori::jit::v2::LaunchGeometry g;
+  g.gridX = static_cast<unsigned>(c.blockNum);
+  g.blockX = static_cast<unsigned>(EpLocalBlockThreads(c));
+  g.sharedBytes = 0;  // convert-combine's pointer arrays are static LDS
+  return g;
+}
+
+const std::vector<std::string>& EpLocalSourceDeps() {
+  static const std::vector<std::string> deps{"include/mori", "src/ops/dispatch_combine_v2"};
+  return deps;
+}
+
+}  // namespace
+
+std::string EpLocalExpertCountSpec::EntryName(const Cfg& c) {
+  return EpLocalEntryName(c, "local_expert_count", false);
+}
+std::string EpConvertDispatchSpec::EntryName(const Cfg& c) {
+  return EpLocalEntryName(c, "convert_dispatch", true);
+}
+std::string EpConvertCombineSpec::EntryName(const Cfg& c) {
+  return EpLocalEntryName(c, "convert_combine", true);
+}
+
+std::string EpLocalExpertCountSpec::RenderSource(const Cfg& c) {
+  return RenderEpLocalSource(c, EntryName(c), "EpLocalExpertCountBody", false);
+}
+std::string EpConvertDispatchSpec::RenderSource(const Cfg& c) {
+  return RenderEpLocalSource(c, EntryName(c), "EpConvertDispatchBody", true);
+}
+std::string EpConvertCombineSpec::RenderSource(const Cfg& c) {
+  return RenderEpLocalSource(c, EntryName(c), "EpConvertCombineBody", true);
+}
+
+mori::jit::v2::LaunchGeometry EpLocalExpertCountSpec::Geometry(const Cfg& c) {
+  return EpLocalGeometry(c);
+}
+mori::jit::v2::LaunchGeometry EpConvertDispatchSpec::Geometry(const Cfg& c) {
+  return EpLocalGeometry(c);
+}
+mori::jit::v2::LaunchGeometry EpConvertCombineSpec::Geometry(const Cfg& c) {
+  return EpLocalGeometry(c);
+}
+
+const std::vector<std::string>& EpLocalExpertCountSpec::SourceDeps() { return EpLocalSourceDeps(); }
+const std::vector<std::string>& EpConvertDispatchSpec::SourceDeps() { return EpLocalSourceDeps(); }
+const std::vector<std::string>& EpConvertCombineSpec::SourceDeps() { return EpLocalSourceDeps(); }
+
 }  // namespace v2
 }  // namespace ops
 }  // namespace mori
@@ -404,6 +549,26 @@ mori::ops::v2::EpCfg EpCombineFromFields(const mori::jit::v2::FieldBag& f) {
 // cache means constructing the op once at build time, which needs no table here.
 int EpNoPrecompile(const std::string&) { return 0; }
 
+mori::ops::v2::EpLocalCfg EpLocalFromFields(const mori::jit::v2::FieldBag& f,
+                                            mori::ops::v2::EpLocalKind kind) {
+  using namespace mori::ops::v2;
+  EpLocalRequest req;
+  EpApplyFields(
+      req, /*prefix=*/"", [&](const std::string& n) { return f.Has(n.c_str()); },
+      [&](const std::string& n) { return f.Get(n.c_str(), 0); });
+  return MakeEpLocalCfg(mori::jit::v2::GetToolchain().arch, req, kind);
+}
+
+mori::ops::v2::EpLocalCfg EpLocalCountFromFields(const mori::jit::v2::FieldBag& f) {
+  return EpLocalFromFields(f, mori::ops::v2::EpLocalKind::ExpertCount);
+}
+mori::ops::v2::EpLocalCfg EpConvertDispatchFromFields(const mori::jit::v2::FieldBag& f) {
+  return EpLocalFromFields(f, mori::ops::v2::EpLocalKind::ConvertDispatch);
+}
+mori::ops::v2::EpLocalCfg EpConvertCombineFromFields(const mori::jit::v2::FieldBag& f) {
+  return EpLocalFromFields(f, mori::ops::v2::EpLocalKind::ConvertCombine);
+}
+
 }  // namespace
 
 // MORI_EP_ARGS_SCHEMA is generated from MORI_EP_ARGS_FIELDS next to the struct
@@ -415,3 +580,19 @@ MORI_JIT_DEFINE_PLAN(ep_dispatch, mori::ops::v2::EpDispatchSpec, EpDispatchFromF
 MORI_JIT_DEFINE_PLAN(ep_combine, mori::ops::v2::EpCombineSpec, EpCombineFromFields,
                      mori::ops::v2::EpRequestSchema, mori::ops::v2::EpCombineInfo, EpNoPrecompile,
                      mori::ops::v2::EpArgs, MORI_EP_ARGS_SCHEMA)
+
+// The local kernels: one Request and one Args schema, three bodies.
+MORI_JIT_DEFINE_PLAN(ep_local_expert_count, mori::ops::v2::EpLocalExpertCountSpec,
+                     EpLocalCountFromFields, mori::ops::v2::EpLocalRequestSchema,
+                     mori::ops::v2::EpLocalInfo, EpNoPrecompile, mori::ops::v2::EpLocalArgs,
+                     MORI_EP_LOCAL_ARGS_SCHEMA)
+
+MORI_JIT_DEFINE_PLAN(ep_convert_dispatch, mori::ops::v2::EpConvertDispatchSpec,
+                     EpConvertDispatchFromFields, mori::ops::v2::EpLocalRequestSchema,
+                     mori::ops::v2::EpLocalInfo, EpNoPrecompile, mori::ops::v2::EpLocalArgs,
+                     MORI_EP_LOCAL_ARGS_SCHEMA)
+
+MORI_JIT_DEFINE_PLAN(ep_convert_combine, mori::ops::v2::EpConvertCombineSpec,
+                     EpConvertCombineFromFields, mori::ops::v2::EpLocalRequestSchema,
+                     mori::ops::v2::EpLocalInfo, EpNoPrecompile, mori::ops::v2::EpLocalArgs,
+                     MORI_EP_LOCAL_ARGS_SCHEMA)

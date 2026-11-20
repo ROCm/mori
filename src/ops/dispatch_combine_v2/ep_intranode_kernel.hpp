@@ -104,9 +104,9 @@ __device__ __forceinline__ T EpWaitGt(T* addr, T val) {
   return got;
 }
 
-// (pe, localTokId) <-> flat index. The stride must be at least the recv-slot
-// capacity, NOT the per-rank send capacity: the local id being encoded is a slot
-// index handed out by the destination's tokOff counter, which runs to EpMaxRecv.
+// (pe, localTokId) <-> flat index. The stride must be at least every PUBLISHED
+// slot index, NOT the per-rank send capacity; dispatch publishes slots below
+// EpMaxRecv only (a capped config drops the rest), so the capacity is the stride.
 // A smaller stride aliases peer p slot s onto peer p+1 slot s-stride.
 template <EpCfg kCfg>
 __device__ __forceinline__ int EpFlatStride() {
@@ -166,6 +166,46 @@ struct EpMultiWarpIter {
 /* ------------------------------------------------------------------------- */
 /*                                  Dispatch                                  */
 /* ------------------------------------------------------------------------- */
+// One routed slot's weights, expert ids, payload and scale row, sent to its
+// destination slot. The routing pass and the replay pass share it.
+template <EpCfg kCfg, typename T>
+__device__ __forceinline__ void EpPublishSlot(EpArgs args, int laneId, int destPe, int destTokId,
+                                              int srcTokId) {
+  constexpr int kTopk = kCfg.numExpertPerToken;
+  constexpr size_t kHidden = static_cast<size_t>(kCfg.hiddenDim);
+  const unsigned long long win = args.window;
+  if (laneId < kTopk) {
+    if constexpr (kCfg.useWeights) {
+      if (args.weightsBuf) {
+        EpPeer<float>(win, destPe, args.offOutWts)[destTokId * kTopk + laneId] =
+            args.weightsBuf[srcTokId * kTopk + laneId];
+      }
+    }
+    EpPeer<int>(win, destPe, args.offOutIdx)[destTokId * kTopk + laneId] =
+        args.tokenIndices[srcTokId * kTopk + laneId];
+  }
+
+  core::WarpCopy(EpPeer<T>(win, destPe, args.offDispOut) + destTokId * kHidden,
+                 reinterpret_cast<const T*>(args.inpTokenBuf) + srcTokId * kHidden, kHidden);
+  // The scale row follows its token to the same slot. No staging detour like the
+  // gfx1250 body needs: this body already copies straight to the peer per token,
+  // and on these parts a peer vector store is not the slow path TDM exists for.
+  // Laid out at EpScaleStride even here, where the alignment buys nothing:
+  // one layout per consumer, whatever arch produced it.
+  if constexpr (kCfg.scaleBytes > 0) {
+    constexpr int kSrcDw = kCfg.scaleBytes / 4;
+    constexpr int kDstDw = EpScaleStride(kCfg) / 4;
+    if (args.scalesBuf) {
+      unsigned int* dstS =
+          EpPeer<unsigned int>(win, destPe, args.offOutScales) + (size_t)destTokId * kDstDw;
+      core::WarpCopy(
+          dstS, reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)srcTokId * kSrcDw,
+          kSrcDw);
+      for (int e = kSrcDw + laneId; e < kDstDw; e += kCfg.waveSize) dstS[e] = 0u;
+    }
+  }
+}
+
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatchBody(EpArgs args) {
   constexpr int kNpes = kCfg.worldSize;
@@ -189,7 +229,24 @@ __device__ void EpDispatchBody(EpArgs args) {
   if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
 
   // Phase 1: route and send. One warp per (token, top-k slot).
-  if (args.tokenIndices && args.inpTokenBuf) {
+  if constexpr (kCfg.replay) {
+    // Replay: the handle's dest map names every slot, so nothing is claimed.
+    if (args.tokenIndices && args.inpTokenBuf) {
+      for (int i = globalWarpId; i < args.numTokens * kTopk; i += globalWarpNum) {
+        const int flat = args.dispDestTokIdMap[i];
+        const int destPe = EpPeFromFlat<kCfg>(flat);
+        if (flat < 0 || destPe >= kNpes) continue;
+        const int destTokId = EpLocalTokFromFlat<kCfg>(flat);
+        const int srcTokId = i / kTopk;
+        if (laneId == 0) {
+          atomicAdd(args.destPeTokenCounter + destPe, 1);
+          EpPeer<int>(win, destPe, args.offRecvToSrc)[destTokId] =
+              EpSrcTokIndex<kCfg>(myPe, srcTokId);
+        }
+        EpPublishSlot<kCfg, T>(args, laneId, destPe, destTokId, srcTokId);
+      }
+    }
+  } else if (args.tokenIndices && args.inpTokenBuf) {
     for (int i = globalWarpId; i < args.numTokens * kTopk; i += globalWarpNum) {
       const int srcTokId = i / kTopk;
       int destPe;
@@ -228,49 +285,32 @@ __device__ void EpDispatchBody(EpArgs args) {
         // peer's copy of tokOff; SYSTEM scope because it crosses devices.
         destTokId = __hip_atomic_fetch_add(EpPeer<int>(win, destPe, args.offTokOff), 1,
                                            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        atomicAdd(args.destPeTokenCounter + destPe, 1);
-        args.dispDestTokIdMap[i] = EpFlatIndex<kCfg>(destPe, destTokId);
-        // Tell the destination which global source token owns that slot, so
-        // combine can route the reduction back.
-        EpPeer<int>(win, destPe, args.offRecvToSrc)[destTokId] =
-            EpSrcTokIndex<kCfg>(myPe, srcTokId);
+        // Under a recv cap a slot past it is dropped: null in the map, nothing sent.
+        if (!EpRecvCapped(kCfg) || destTokId < EpMaxRecv(kCfg)) {
+          atomicAdd(args.destPeTokenCounter + destPe, 1);
+          args.dispDestTokIdMap[i] = EpFlatIndex<kCfg>(destPe, destTokId);
+          // Tell the destination which global source token owns that slot, so
+          // combine can route the reduction back.
+          EpPeer<int>(win, destPe, args.offRecvToSrc)[destTokId] =
+              EpSrcTokIndex<kCfg>(myPe, srcTokId);
+        } else {
+          args.dispDestTokIdMap[i] = kNullFlat;
+          destTokId = -1;
+        }
       }
       destTokId = __shfl(destTokId, 0);
-
-      if (laneId < kTopk) {
-        if constexpr (kCfg.useWeights) {
-          if (args.weightsBuf) {
-            EpPeer<float>(win, destPe, args.offOutWts)[destTokId * kTopk + laneId] =
-                args.weightsBuf[srcTokId * kTopk + laneId];
-          }
-        }
-        EpPeer<int>(win, destPe, args.offOutIdx)[destTokId * kTopk + laneId] =
-            args.tokenIndices[srcTokId * kTopk + laneId];
+      if constexpr (EpRecvCapped(kCfg)) {
+        if (destTokId < 0) continue;
       }
 
-      core::WarpCopy(EpPeer<T>(win, destPe, args.offDispOut) + destTokId * kHidden,
-                     reinterpret_cast<const T*>(args.inpTokenBuf) + srcTokId * kHidden, kHidden);
-      // The scale row follows its token to the same slot. No staging detour like the
-      // gfx1250 body needs: this body already copies straight to the peer per token,
-      // and on these parts a peer vector store is not the slow path TDM exists for.
-      // Laid out at EpScaleStride even here, where the alignment buys nothing:
-      // one layout per consumer, whatever arch produced it.
-      if constexpr (kCfg.scaleBytes > 0) {
-        constexpr int kSrcDw = kCfg.scaleBytes / 4;
-        constexpr int kDstDw = EpScaleStride(kCfg) / 4;
-        if (args.scalesBuf) {
-          unsigned int* dstS =
-              EpPeer<unsigned int>(win, destPe, args.offOutScales) + (size_t)destTokId * kDstDw;
-          core::WarpCopy(
-              dstS,
-              reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)srcTokId * kSrcDw,
-              kSrcDw);
-          for (int e = kSrcDw + laneId; e < kDstDw; e += kCfg.waveSize) dstS[e] = 0u;
-        }
-      }
+      EpPublishSlot<kCfg, T>(args, laneId, destPe, destTokId, srcTokId);
     }
   }
 
+  // Drain this block's peer stores before it arrives, as FlyDSL does: the signal
+  // fence below covers warp 0's stores only. A drain is enough because the window
+  // is uncached (cco's default); a cached window would need a release per block.
+  __builtin_amdgcn_s_waitcnt(0);
   __syncthreads();
   if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
 
@@ -469,7 +509,7 @@ __device__ void EpCombineBody(EpArgs args) {
 }
 
 /* ------------------------------------------------------------------------- */
-/*                       Scatter combine, fp8 wire                            */
+/*                  Scatter combine, quantized or not                         */
 /* ------------------------------------------------------------------------- */
 // The arch's own e4m3: fnuz on gfx94x, OCP elsewhere.
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
@@ -516,9 +556,6 @@ __device__ __forceinline__ void EpScatterScale(float amax, float& scale, float& 
   }
 }
 
-// Each computing rank quantizes its post-expert rows into the origin rank's landing
-// row (myPe, origin token); after the cross-device barrier the origin rank sums its
-// tokens' rows locally. Weights travel in the row, so the fold reads them there.
 // Eight elements at 1/inv scale into the wire, and back. fp8: 8 bytes; e2m1: 4 bytes,
 // element 2i in the low nibble.
 template <bool kFp4>
@@ -584,27 +621,139 @@ __device__ __forceinline__ void EpScatterAcc(EpScatterWire<kFp4> q, float scale,
   }
 }
 
-template <EpCfg kCfg, typename T>
-__device__ void EpCombineScatterBody(EpArgs args) {
-  static_assert(sizeof(T) == 2, "the scatter combine quantizes bf16 rows");
+// 16 B of T (eight bf16 or four f32) as f32, and back.
+template <typename T>
+__device__ __forceinline__ void EpVecToF32(uint4 v, float (&f)[16 / sizeof(T)]) {
+  if constexpr (sizeof(T) == 2) {
+    EpBf16x8ToF32(v, f);
+  } else {
+    f[0] = __uint_as_float(v.x);
+    f[1] = __uint_as_float(v.y);
+    f[2] = __uint_as_float(v.z);
+    f[3] = __uint_as_float(v.w);
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ uint4 EpF32ToVec(const float (&f)[16 / sizeof(T)]) {
+  if constexpr (sizeof(T) == 2) {
+    unsigned pk[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const unsigned lo = __builtin_bit_cast(unsigned short, T(f[2 * i]));
+      const unsigned hi = __builtin_bit_cast(unsigned short, T(f[2 * i + 1]));
+      pk[i] = lo | (hi << 16);
+    }
+    return make_uint4(pk[0], pk[1], pk[2], pk[3]);
+  } else {
+    return make_uint4(__float_as_uint(f[0]), __float_as_uint(f[1]), __float_as_uint(f[2]),
+                      __float_as_uint(f[3]));
+  }
+}
+
+// What a scatter lane puts in its landing row for kVec elements, and reads back:
+//   Put  stage 1, called by every lane (the quantized codec reduces across a group)
+//   Get  stage 3, one row's share for this lane
+//   Add  stage 3, that share into the f32 sum
+// The quantized codec: bf16 in, fp8 or e2m1 plus a scale per group on the wire.
+template <EpCfg kCfg, typename T, bool kPlain = kCfg.combineScatterPlain>
+struct EpScatterCodec {
+  static_assert(sizeof(T) == 2, "the quantized scatter takes bf16 rows");
 #if !defined(__gfx950__)
   static_assert(!kCfg.combineScatterFp4, "the e2m1 scatter combine is gfx950's");
 #endif
-  constexpr bool kFp4 = kCfg.combineScatterFp4;
-  constexpr float kMax = kFp4 ? kEpScatterFp4Max : kEpScatterFp8Max;
+  static constexpr bool kFp4 = kCfg.combineScatterFp4;
+  static constexpr int kGroup = kCfg.combineScatterQGroup;
+  static constexpr float kMax = kFp4 ? kEpScatterFp4Max : kEpScatterFp8Max;
+  static constexpr int kVec = kEpScatterLaneElems;
+  static constexpr int kLanesPerGroup = kGroup / kVec;
   // Wire bytes an element: one for fp8, half for e2m1 (the shift halves an offset).
-  constexpr int kPayShift = kFp4 ? 1 : 0;
+  static constexpr int kPayShift = kFp4 ? 1 : 0;
+  static constexpr int kPayB = EpScatterPayloadBytes(kCfg);
+  struct Lane {
+    EpScatterWire<kFp4> q;
+    float scale;
+  };
+
+  __device__ static void Put(char* row, int e, uint4 raw, int laneId, bool active) {
+    float f[kVec];
+    EpBf16x8ToF32(raw, f);
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) amax = fmaxf(amax, fabsf(f[i]));
+#pragma unroll
+    for (int off = 1; off < kLanesPerGroup; off <<= 1) amax = fmaxf(amax, __shfl_xor(amax, off));
+    float scale, inv;
+    unsigned e8m0;
+    EpScatterScale<kGroup, kMax>(amax, scale, inv, e8m0);
+    if (!active) return;
+    EpScatterPack<kFp4>(row + (e >> kPayShift), f, inv);
+    if (laneId % kLanesPerGroup == 0) {
+      if constexpr (kGroup == 32) {
+        reinterpret_cast<unsigned char*>(row + kPayB)[e / kGroup] = (unsigned char)e8m0;
+      } else {
+        reinterpret_cast<float*>(row + kPayB)[e / kGroup] = scale;
+      }
+    }
+  }
+
+  __device__ static Lane Get(const char* row, int e) {
+    Lane l;
+    l.q = *reinterpret_cast<const EpScatterWire<kFp4>*>(row + (e >> kPayShift));
+    if constexpr (kGroup == 32) {
+      const unsigned b = reinterpret_cast<const unsigned char*>(row + kPayB)[e / kGroup];
+      l.scale = __uint_as_float(b << 23);
+    } else {
+      l.scale = reinterpret_cast<const float*>(row + kPayB)[e / kGroup];
+    }
+    return l;
+  }
+
+  __device__ static void Add(const Lane& l, float (&acc)[kVec]) {
+    EpScatterAcc<kFp4>(l.q, l.scale, acc);
+  }
+};
+
+// The unquantized codec: the T row as it is (bf16 or fp32), 16 B a lane.
+template <EpCfg kCfg, typename T>
+struct EpScatterCodec<kCfg, T, true> {
+  static constexpr int kVec = 16 / sizeof(T);
+  using Lane = uint4;
+
+  __device__ static void Put(char* row, int e, uint4 raw, int, bool active) {
+    if (active) *reinterpret_cast<uint4*>(row + (size_t)e * sizeof(T)) = raw;
+  }
+
+  __device__ static Lane Get(const char* row, int e) {
+    return *reinterpret_cast<const uint4*>(row + (size_t)e * sizeof(T));
+  }
+
+  __device__ static void Add(const Lane& l, float (&acc)[kVec]) {
+    float f[kVec];
+    EpVecToF32<T>(l, f);
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) acc[i] += f[i];
+  }
+};
+
+// Each computing rank puts its post-expert rows, through the codec, into the origin
+// rank's landing row (myPe, origin token); after the cross-device barrier the origin
+// rank sums its tokens' rows locally in f32, in top-k order as the gather does.
+// Weights travel in the row, so the fold reads them there.
+template <EpCfg kCfg, typename T>
+__device__ void EpCombineScatterBody(EpArgs args) {
+  using Codec = EpScatterCodec<kCfg, T>;
+  constexpr int kVec = Codec::kVec;
   constexpr int kNpes = kCfg.worldSize;
   constexpr int kTopk = kCfg.numExpertPerToken;
   constexpr int kHidden = kCfg.hiddenDim;
   constexpr int kM = kCfg.maxTokPerRank;
-  constexpr int kGroup = kCfg.combineScatterQGroup;
-  constexpr int kLanesPerGroup = kGroup / kEpScatterLaneElems;
-  constexpr int kChunk = kCfg.waveSize * kEpScatterLaneElems;
+  constexpr int kChunk = kCfg.waveSize * kVec;
   constexpr int kSteps = (kHidden + kChunk - 1) / kChunk;
+  constexpr bool kFull = kHidden % kChunk == 0;
   constexpr int kRowB = EpScatterRowBytes(kCfg);
-  constexpr int kScaleB = EpScatterScaleBytes(kCfg);
-  constexpr int kPayB = EpScatterPayloadBytes(kCfg);
+  // the weights follow the payload and its scales
+  constexpr int kWtsOff = EpScatterPayloadBytes(kCfg) + EpScatterScaleBytes(kCfg);
   constexpr size_t kLandOff = EpScatterLandOff(kCfg);
 
   const int myPe = args.rank;
@@ -620,10 +769,9 @@ __device__ void EpCombineScatterBody(EpArgs args) {
   int* const recvToSrc = EpLocal<int>(win, args.offRecvToSrc);
   float* const recvWts = EpLocal<float>(win, args.offOutWts);
 
-  // Stage 1: quantize and push, one warp per (recv slot, 512-element step), kBatch
-  // items a pass with every load issued before the first is used.
+  // Stage 1: one warp per (recv slot, step), kBatch items a pass with every load
+  // issued before the first is used.
   constexpr int kBatch = 2;
-  constexpr bool kFull = kHidden % kChunk == 0;
   const int items = totalRecv * kSteps;
   for (int u0 = globalWarpId; u0 < items; u0 += kBatch * globalWarpNum) {
     int slot[kBatch], origin[kBatch], e[kBatch];
@@ -632,7 +780,7 @@ __device__ void EpCombineScatterBody(EpArgs args) {
     for (int b = 0; b < kBatch; ++b) {
       const int u = min(u0 + b * globalWarpNum, items - 1);
       slot[b] = u / kSteps;
-      e[b] = (u % kSteps) * kChunk + laneId * kEpScatterLaneElems;
+      e[b] = (u % kSteps) * kChunk + laneId * kVec;
       // Written by the senders' dispatch; read at system scope.
       origin[b] =
           __hip_atomic_load(recvToSrc + slot[b], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -643,33 +791,12 @@ __device__ void EpCombineScatterBody(EpArgs args) {
 #pragma unroll
     for (int b = 0; b < kBatch; ++b) {
       if (u0 + b * globalWarpNum >= items) break;
-      const int srcPe = origin[b] / kM;
-      const int srcTok = origin[b] % kM;
-      char* const row = EpPeer<char>(win, srcPe, args.offOutTok) + kLandOff +
-                        ((size_t)myPe * kM + srcTok) * kRowB;
-      float f[8];
-      EpBf16x8ToF32(raw[b], f);
-      float amax = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(f[i]));
-#pragma unroll
-      for (int off = 1; off < kLanesPerGroup; off <<= 1) amax = fmaxf(amax, __shfl_xor(amax, off));
-      float scale, inv;
-      unsigned e8m0;
-      EpScatterScale<kGroup, kMax>(amax, scale, inv, e8m0);
-      if (kFull || e[b] < kHidden) {
-        EpScatterPack<kFp4>(row + (e[b] >> kPayShift), f, inv);
-        if (laneId % kLanesPerGroup == 0) {
-          if constexpr (kGroup == 32) {
-            reinterpret_cast<unsigned char*>(row + kPayB)[e[b] / kGroup] = (unsigned char)e8m0;
-          } else {
-            reinterpret_cast<float*>(row + kPayB)[e[b] / kGroup] = scale;
-          }
-        }
-      }
+      char* const row = EpPeer<char>(win, origin[b] / kM, args.offOutTok) + kLandOff +
+                        ((size_t)myPe * kM + origin[b] % kM) * kRowB;
+      Codec::Put(row, e[b], raw[b], laneId, kFull || e[b] < kHidden);
       if constexpr (kCfg.useWeights) {
         if (e[b] < kChunk && laneId < kTopk) {
-          reinterpret_cast<float*>(row + kPayB + kScaleB)[laneId] =
+          reinterpret_cast<float*>(row + kWtsOff)[laneId] =
               __hip_atomic_load(recvWts + (size_t)slot[b] * kTopk + laneId, __ATOMIC_RELAXED,
                                 __HIP_MEMORY_SCOPE_SYSTEM);
         }
@@ -681,61 +808,42 @@ __device__ void EpCombineScatterBody(EpArgs args) {
 
   if (args.numTokens == 0) return;
 
-  // Stage 3: dequantize and sum each token's landed rows, one warp per (token, step).
+  // Stage 3: sum each token's landed rows, one warp per (token, step); every row's
+  // loads go out before the first is summed.
   const char* const land = EpLocal<char>(win, args.offOutTok) + kLandOff;
   T* const out = reinterpret_cast<T*>(args.outTokenBuf);
   for (int u = globalWarpId; u < args.numTokens * kSteps; u += globalWarpNum) {
     const int tok = u / kSteps;
     const int step = u % kSteps;
-    const int e = step * kChunk + laneId * kEpScatterLaneElems;
+    const int e = step * kChunk + laneId * kVec;
     const bool active = kFull || e < kHidden;
-    // Every row's loads go out before the first is summed.
     int pe[kTopk];
 #pragma unroll
     for (int j = 0; j < kTopk; ++j)
       pe[j] = EpPeFromFlat<kCfg>(args.dispDestTokIdMap[tok * kTopk + j]);
-    EpScatterWire<kFp4> q[kTopk];
-    float scale[kTopk], w[kTopk];
+    typename Codec::Lane q[kTopk];
+    float w[kTopk];
 #pragma unroll
     for (int j = 0; j < kTopk; ++j) {
       // An unrouted slot reads PE 0's row and is dropped below.
       const char* const row = land + ((size_t)(pe[j] < kNpes ? pe[j] : 0) * kM + tok) * kRowB;
       q[j] = {};
-      scale[j] = 0.0f;
       w[j] = 0.0f;
-      if (active) {
-        q[j] = *reinterpret_cast<const EpScatterWire<kFp4>*>(row + (e >> kPayShift));
-        if constexpr (kGroup == 32) {
-          const unsigned b = reinterpret_cast<const unsigned char*>(row + kPayB)[e / kGroup];
-          scale[j] = __uint_as_float(b << 23);
-        } else {
-          scale[j] = reinterpret_cast<const float*>(row + kPayB)[e / kGroup];
-        }
-      }
+      if (active) q[j] = Codec::Get(row, e);
       if constexpr (kCfg.useWeights) {
         if (step == 0 && laneId < kTopk)
-          w[j] = reinterpret_cast<const float*>(row + kPayB + kScaleB)[laneId];
+          w[j] = reinterpret_cast<const float*>(row + kWtsOff)[laneId];
       }
     }
-    float acc[8] = {};
+    float acc[kVec] = {};
     float wacc = 0.0f;
 #pragma unroll
     for (int j = 0; j < kTopk; ++j) {
       if (pe[j] >= kNpes) continue;
-      EpScatterAcc<kFp4>(q[j], scale[j], acc);
+      Codec::Add(q[j], acc);
       wacc += w[j];
     }
-    if (active) {
-      unsigned pk[4];
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const unsigned lo = __builtin_bit_cast(unsigned short, T(acc[2 * i]));
-        const unsigned hi = __builtin_bit_cast(unsigned short, T(acc[2 * i + 1]));
-        pk[i] = lo | (hi << 16);
-      }
-      *reinterpret_cast<uint4*>(out + (size_t)tok * kHidden + e) =
-          make_uint4(pk[0], pk[1], pk[2], pk[3]);
-    }
+    if (active) *reinterpret_cast<uint4*>(out + (size_t)tok * kHidden + e) = EpF32ToVec<T>(acc);
     if constexpr (kCfg.useWeights) {
       if (args.outWeightsBuf && step == 0 && laneId < kTopk)
         args.outWeightsBuf[tok * kTopk + laneId] = wacc;

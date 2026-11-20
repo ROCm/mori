@@ -220,8 +220,8 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
 ```
 
 `MakeEpCfg` 也是拒绝非法组合的地方：`EpCfgIsValid` 不过就抛（token 字节数必须 16B 对齐、
-topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏情况），combine 那条腿上的字节类型
-单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。
+topk 和 worldSize 必须装进一个 wavefront），低于最坏情况的 recv 容量只在 gfx125x 上拒绝（那里的 body
+不丢 token），combine 那条腿上的字节类型单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。
 
 ### 3.6 环境变量
 
@@ -320,9 +320,9 @@ ctypes plan 的关键字参数各自在 `_wrap_*` 里适配。
 
 **特性面是真包含不是交集**：HIP 后端做 gather combine，dispatch 收 bf16/fp32/fp8/fp4、combine 出
 bf16/fp32（§3.7）；带 `quant_type` 时做量化 scatter combine（gfx942/gfx950 是逐源 token 落地一行、
-本地反量化累加，gfx125x 是 push）。其余一概不接：非量化 scatter、StdMoE、routing replay、
-`local_expert_count`。能力门在**构造期**跑、且在分配 arena
-之前——问它要 scatter 会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
+本地反量化累加，gfx125x 是 push）。gfx942/gfx950 上另有非量化 scatter、`max_total_recv_tokens` 截断、routing
+replay、`local_expert_count` 和 bf16 StdMoE。能力门在**构造期**跑、且在分配 arena
+之前——问它要不支持的功能（如 gfx125x 上的非量化 scatter）会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
 再失败。
 
 `_regions` 归子类还消掉一个陷阱：FlyDSL 的 `off_out_tok` 对 dispatch 指 `disp_out`、对 combine 指
@@ -518,8 +518,13 @@ gfx125x 的 TDM body（`ep_intranode_1250x.hpp`）同样是从 v1 机械移植�
 `_cusplit_*` 设备全局暂存池）原样保留。范围收到 hip 后端能服务的部分：非量化的 TDM dispatch +
 PULL/QUAD gather combine。
 
-**HIP 后端未实现**（由能力门在构造期拒绝）：非量化 scatter combine、StdMoE、per-token
-scales 转发、routing replay、`local_expert_count`。这些在 FlyDSL 后端都有。注意 fp8/fp4 **dispatch**
+**HIP 后端未实现**（由能力门在构造期拒绝）：gfx125x 上的非量化 scatter combine、
+`max_total_recv_tokens` 截断、routing replay 和 StdMoE（gfx125x 上的 `local_expert_count` 不在门里拒绝，
+调用时报 `NotImplementedError`）；这些在 FlyDSL 后端都有。
+`local_expert_count` 与 StdMoE 的两个 convert 是三个只读写本 rank 行的本地 kernel
+（`ep_local_kernels.hpp`，`ep_local_expert_count` / `ep_convert_dispatch` / `ep_convert_combine`
+三个 plan，自有的 `EpLocalCfg` / `EpLocalArgs`）；方法和输出 buffer 归父类，后端只在 `KernelSet`
+里交回 callable，能力由 callable 是否存在决定。注意 fp8/fp4 **dispatch**
 已经支持（§3.7）——那是搬运已量化的载荷，和让 mori 自己量化的 `quant_type` 是两回事。
 
 **cross-node 也有了**：`src/ops/dispatch_combine_v2/` 现在是三个 body 头文件——两个 intranode

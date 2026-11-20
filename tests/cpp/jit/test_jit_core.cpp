@@ -247,10 +247,10 @@ TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
   EXPECT_FALSE(EpCfgIsValid(c));
 
   c = ok;
-  // The recv capacity is also the flat-index stride, so an undersized cap does
-  // not merely overrun -- it re-encodes to the next peer.
+  // A cap below the worst case is valid: dispatch drops the slots past it.
   c.maxRecv = ok.worldSize * ok.maxTokPerRank - 1;
-  EXPECT_FALSE(EpCfgIsValid(c));
+  EXPECT_TRUE(EpCfgIsValid(c));
+  EXPECT_TRUE(EpRecvCapped(c));
 
   c = ok;
   c.warpPerBlock = 64;  // 64 * 64 > 1024 threads

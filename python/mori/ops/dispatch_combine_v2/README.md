@@ -11,10 +11,14 @@ backends:
 - **hip** (the default on gfx125x): C++/HIP kernels JIT-compiled by the v2 JIT
   framework. Gather combine in bf16/fp32. With a `quant_type`, a quantized
   combine: a scatter combine on gfx942/gfx950 and the push combine on gfx125x
-  (see "Combine quant types"). On gfx1250 also a bf16 push combine (see "HIP V2
-  configuration interface" below). The dispatch leg also
+  (see "Combine quant types"). On gfx942/gfx950 a `max_total_recv_tokens` below
+  the worst case drops the slots past it, as FlyDSL does, `dispatch(...,
+  routing=handle)` replays a handle's slots, and `combine_mode="scatter"` without
+  a quant type runs an unquantized bf16/fp32 scatter combine. On gfx1250 also a bf16
+  push combine (see "HIP V2 configuration interface" below). The dispatch leg also
   carries fp8 and fp4 (transport only — it moves an already-quantized payload).
-  A dedicated gfx125x TDM body is selected by arch. **The only backend with an
+  A dedicated gfx125x TDM body is selected by arch. On gfx942/gfx950 it also
+  serves `local_expert_count()` and bf16 StdMoE (gather combine). **The only backend with an
   internode path** (bf16/f32/fp8, plus packed fp4 dispatch with bf16/fp32
   combine; no quant/StdMoE/scatter). Works on a machine with no FlyDSL. See
   `docs/MORI_JIT_V2_DESIGN.md`.
@@ -51,7 +55,7 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 |---|---|
 | `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig`, `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
 | `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
-| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
+| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding (gather; scatter and push combines per arch); rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
 | `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here. A gfx125x `EpDispatchPlan` whose caller binds no `staging_base` gets one at its first launch, shared by the unbound plans of its layout, with a `FutureWarning`; instead, allocate `info["stagingBytes"]` bytes once, keep them alive, and `bind(staging_base=buf)` on every dispatch plan (a tensor is checked against that size and held; an int address is taken on trust). Sizes come from the plans: `EpDispatchPlan.describe(**request)` / `EpCombinePlan.describe(...)` return the info a plan would report without compiling it, and `arena_regions(*infos, region_names=...)` turns their `region.<stem>` keys into a `SymmArena` region list; binding checks an arena that has `size()` |
 | `quant_types.py` | the combine quant type names, what each resolves to on this arch, and the format each names (see "Combine quant types") |
 | `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
@@ -105,7 +109,8 @@ is a multiple of 128.
 Plan requests name the format with fields, not these strings: `combine_fp8` and
 `combine_fp4` select the 1x32 push combine, and `combine_fp4_f32_scale` turns
 the fp4 one into 1x128. `combine_scatter_q_group` (32 or 128) selects the
-gfx942/gfx950 scatter combine, and `combine_scatter_fp4` makes its elements e2m1.
+gfx942/gfx950 scatter combine, and `combine_scatter_fp4` makes its elements e2m1;
+`combine_scatter_plain` selects the unquantized one.
 
 ## gfx125x dispatch: slot reservation
 
@@ -397,7 +402,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_tuning_profile.py` | peak and capped profiles: capped keeps every gfx125x lookup within 64 blocks, reuses the peak rows that fit and falls back to the default (with a warning) elsewhere; peak is `lookup()`'s default; precedence of the config field, `MORI_EP_TUNING_PROFILE` and the device default. CPU only |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
-| `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure. Every rank sends the point's token count and passes it as `max_num_inp_token_across_ranks`. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMB_MODE=push\|pull` (default `push`, the fp4 combine: hip backend on gfx125x only), `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR`, `ROUTE=rand\|ring\|noself`, `LATE_US` (rank 0 reaches every timed dispatch that many µs after the others) |
+| `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure (except the scatter combines on gfx942/gfx950, which `test_op.py` checks). Every rank sends the point's token count and passes it as `max_num_inp_token_across_ranks`. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMB_MODE=push\|pull\|scatter` (default `push`: the quantized combine `PUSH_QUANT`, the push on gfx125x and the scatter on gfx942/gfx950; `scatter`: the unquantized scatter), `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR`, `ROUTE=rand\|ring\|noself`, `LATE_US` (rank 0 reaches every timed dispatch that many µs after the others) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
 

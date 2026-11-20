@@ -140,6 +140,34 @@ def _cases():
         "QUANT": "fp8_blockwise_1x32",
         "SPREAD": 6,
     }
+    # the HIP backend's unquantized scatter combine
+    for dt in ("bf16", "f32"):
+        yield f"hip-{dt}-scatter", {
+            "MORI_V2_KERNEL_BACKEND": "hip",
+            "DTYPE": dt,
+            "COMBINE": "scatter",
+        }
+    # a partial last step (hidden 2304), and a recv cap
+    yield "hip-bf16-scatter-h2304", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "HIDDEN": 2304,
+    }
+    yield "hip-bf16-scatter-cap", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "MAXRECV": 1024,
+    }
+    yield "hip-bf16-scatter-scales-ragged", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "SCALE_DIM": 32,
+        "RAGGED": 1,
+        "TOPK": 9,
+    }
     # the HIP backend's quantized scatter combine, every format at the three scales
     for elem in ("fp8", "fp4"):
         for group in (32, 128):
@@ -177,6 +205,23 @@ def _cases():
             "QUANT": f"{elem}_blockwise_1x128",
             "TINY": 1,
         }
+    # recv cap: drops at 512 tokens a rank (demand ~2700 > 1024), none at 128
+    for backend in ("", "hip"):
+        env = {"MORI_V2_KERNEL_BACKEND": backend} if backend else {}
+        pre = f"{backend}-" if backend else ""
+        yield f"{pre}bf16-gather-cap", {
+            **env,
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "MAXRECV": 1024,
+        }
+    yield "hip-bf16-scatter-fp8-1x128-cap", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "QUANT": "fp8_blockwise_1x128",
+        "MAXRECV": 1024,
+    }
     # per-token scale forwarding (v1 uses scale_dim=32), on both combine modes
     yield "bf16-gather-scales", {"DTYPE": "bf16", "COMBINE": "gather", "SCALE_DIM": 32}
     yield "bf16-scatter-scales", {
@@ -189,8 +234,45 @@ def _cases():
         yield f"bf16-gather-topk{k}", {"DTYPE": "bf16", "COMBINE": "gather", "TOPK": k}
     # feature paths
     yield "bf16-gather-tuned", {"DTYPE": "bf16", "COMBINE": "gather", "TUNED": 1}
+    # rows and reverse map read in-stream right after dispatch, before any barrier
+    yield "bf16-gather-fresh", {"DTYPE": "bf16", "COMBINE": "gather", "FRESH": 1}
+    yield "hip-bf16-gather-fresh", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "gather",
+        "FRESH": 1,
+    }
     yield "bf16-gather-replay", {"DTYPE": "bf16", "COMBINE": "gather", "REPLAY": 1}
+    for extra in (
+        {},
+        {"SCALE_DIM": 32},
+        {"TOPK": 9, "RAGGED": 1, "NOSELF": 1},
+        {"MAXRECV": 1024},
+    ):
+        tag = "".join(f"-{k.lower()}" for k in extra)
+        yield f"hip-bf16-gather-replay{tag}", {
+            "MORI_V2_KERNEL_BACKEND": "hip",
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "REPLAY": 1,
+            **extra,
+        }
     yield "bf16-stdmoe", {"DTYPE": "bf16", "COMBINE": "gather", "STDMOE": 1}
+    # The hip backend's gather path; OP-LEC runs in every case. No TUNED here: it
+    # injects FlyDSL's table, and hip resolves its own.
+    hip = {"MORI_V2_KERNEL_BACKEND": "hip", "COMBINE": "gather"}
+    yield "hip-bf16-gather", dict(hip, DTYPE="bf16")
+    yield "hip-bf16-gather-scales-ragged", dict(
+        hip, DTYPE="bf16", SCALE_DIM=32, RAGGED=1, NOSELF=1
+    )
+    yield "hip-bf16-gather-topk9", dict(hip, DTYPE="bf16", TOPK=9)
+    yield "hip-bf16-gather-reroute", dict(hip, DTYPE="bf16", REROUTE=8)
+    yield "hip-bf16-stdmoe", dict(hip, DTYPE="bf16", STDMOE=1)
+    # Few experts a rank: one token often lands on several of them.
+    yield "hip-bf16-stdmoe-epr4-ragged", dict(
+        hip, DTYPE="bf16", STDMOE=1, EPR=4, RAGGED=1, NOSELF=1
+    )
+    yield "hip-bf16-stdmoe-reroute", dict(hip, DTYPE="bf16", STDMOE=1, REROUTE=8)
 
 
 _CASES = dict(_cases())
@@ -215,7 +297,7 @@ def case_output():
         for c in _CASES
         if (_IS_GFX950 or c not in _GFX950_ONLY) and not _refused_quant(c)
     ]
-    rc, out = _run({"CASES": json.dumps([_CASES[c] for c in ids])}, timeout=1800)
+    rc, out = _run({"CASES": json.dumps([_CASES[c] for c in ids])}, timeout=3600)
     parts = {c: ([], False) for c in ids}
     current = None
     for ln in out.splitlines():
@@ -248,9 +330,13 @@ def test_dispatch_combine_v2_intranode(case, case_output):
     _assert_all_pass(0, text)
 
 
-def test_op_lifecycle():
+@pytest.mark.parametrize("backend", ["default", "hip"])
+def test_op_lifecycle(backend):
     """Repeated op build/close on one comm must not leak (see test_op_lifecycle.py)."""
     script = os.path.join(_HERE, "test_op_lifecycle.py")
+    env = os.environ.copy()
+    if backend != "default":
+        env["MORI_V2_KERNEL_BACKEND"] = backend
     cmd = [
         sys.executable,
         "-m",
@@ -262,10 +348,42 @@ def test_op_lifecycle():
     proc = subprocess.run(
         cmd,
         cwd=_HERE,
-        env=os.environ.copy(),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        timeout=300,
+        timeout=600,
     )
     assert "# LIFECYCLE: PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout}"
+
+
+@pytest.mark.skipif(
+    _arch().startswith("gfx125"), reason="HIP local kernels are gfx942/gfx950"
+)
+@pytest.mark.parametrize("knobs", [{"LEC": 1}, {"LEC": 1, "STDMOE": 1}])
+def test_graph_capture_hip_local_kernels(knobs):
+    """local_expert_count and the StdMoE converts inside a captured, replayed step."""
+    script = os.path.join(_HERE, "test_graph_capture.py")
+    env = os.environ.copy()
+    env.update({k: str(v) for k, v in knobs.items()})
+    env["MORI_V2_KERNEL_BACKEND"] = "hip"
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={_NPROC}",
+        script,
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=_HERE,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=900,
+    )
+    assert (
+        "# GRAPH-CAPTURE: PASS" in proc.stdout
+    ), f"rc={proc.returncode}\n{proc.stdout}"
