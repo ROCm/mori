@@ -88,6 +88,9 @@ def _alloc_pair(engine, src_gpu, dst_gpu, num_elements):
         dtype=torch.uint8,
         device=torch.device("cuda", dst_gpu),
     )
+    # XGMI copies run on backend streams that are not ordered after torch's.
+    torch.cuda.synchronize(src_gpu)
+    torch.cuda.synchronize(dst_gpu)
     src_mem = engine.register_torch_tensor(src)
     dst_mem = engine.register_torch_tensor(dst)
     return src, dst, src_mem, dst_mem
@@ -382,6 +385,7 @@ def _mp_discrete_worker(rank, world_size, master_port, result_queue):
                 dtype=torch.uint8,
                 device=torch.device("cuda", gpu_id),
             )
+            torch.cuda.synchronize(gpu_id)
             mem = engine.register_torch_tensor(tensor)
             mem_bytes = mem.pack()
 
@@ -414,6 +418,7 @@ def _mp_discrete_worker(rank, world_size, master_port, result_queue):
                     dtype=torch.uint8,
                     device=torch.device("cuda", gpu_id),
                 )
+                torch.cuda.synchronize(gpu_id)
                 read_mem = engine.register_torch_tensor(read_tensor)
                 sess2 = engine.create_session(read_mem, remote_mem)
                 uid2 = sess2.allocate_transfer_uid()
