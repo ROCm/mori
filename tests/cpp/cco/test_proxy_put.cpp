@@ -36,7 +36,7 @@
 // MORI_CCO_PROXY_TEST_CASES=<list> runs only the listed positive cases, where
 // "atomic_free" stands for kAtomicFreeCases; those run first, for NICs whose
 // atomics into GPU memory fail (the first atomic would fail the shared DevComm).
-// MORI_CCO_PROXY_TEST_NEGATIVE=all (or a list such as "n1,n3") adds n1-n8, each
+// MORI_CCO_PROXY_TEST_NEGATIVE=all (or a list such as "n1,n3") adds n1-n9, each
 // on a DevComm of its own (see their runners); put_sig_after then checks that
 // the first DevComm still works.
 //
@@ -46,6 +46,7 @@
 
 #include <infiniband/verbs.h>
 
+#include <chrono>
 #include <string>
 
 #include "cco_test_harness.hpp"
@@ -1511,6 +1512,31 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
                                                                kSpscQueues, 64);
   }
 
+  // n9: teardown is local and survives the destroy orders below.
+  //  - ccoDevCommGetError on a copy of a destroyed DevComm returns 0.
+  //  - Rank 0 leaves `leaked` (proxy-only) to ccoCommDestroy while rank 1 is
+  //    busy for kBusyPeerSec before destroying its own: rank 0 must not wait
+  //    for it. Then ccoDevCommDestroy(nullptr, &leaked) must return 0.
+  constexpr int kBusyPeerSec = 3;
+  const bool n9 = NegativeSelected("n9");
+  ccoDevComm leaked{};
+  if (n9) {
+    ccoDevComm d{};
+    int bad = ccoDevCommCreate(c.comm, &noGdaReqs, &d) != 0;
+    const ccoDevComm copy = d;
+    if (!bad) bad |= ccoDevCommDestroy(c.comm, &d) != 0;
+    ccoDevCommError e{};
+    if (!bad && ccoDevCommGetError(c.comm, &copy, &e) != 0) {
+      printf("[rank %d]   n9: GetError on a destroyed DevComm's copy did not return 0\n", rank);
+      bad = 1;
+    }
+    fails += c.Harvest("n9_stale_copy", bad);
+    if (ccoDevCommCreate(c.comm, &noGdaReqs, &leaked) != 0) {
+      fprintf(stderr, "[rank %d] n9: DevCommCreate failed\n", rank);
+      fails++;
+    }
+  }
+
   HIP_CHECK(hipStreamDestroy(c.stream));
   HIP_CHECK(hipFree(c.dErr));
   ccoDevCommDestroy(c.comm, &c.dcSplit);
@@ -1525,7 +1551,22 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   ccoMemFree(c.comm, c.flagBuf);
   ccoMemFree(c.comm, c.recvBuf);
   ccoMemFree(c.comm, c.sendBuf);
+  if (n9 && rank != 0) {
+    if (rank == 1) sleep(kBusyPeerSec);  // a busy peer
+    if (ccoDevCommDestroy(c.comm, &leaked) != 0) fails++;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
   ccoCommDestroy(c.comm);
+  const double commDestroySec =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  if (n9 && rank == 0) {
+    // The leaked engine was stopped above; this must skip it, not free it again.
+    const int rc = ccoDevCommDestroy(nullptr, &leaked);
+    const bool bad = commDestroySec >= kBusyPeerSec - 1 || rc != 0;
+    printf("[rank %d]   [%-13s] %s (ccoCommDestroy %.2f s, then DevCommDestroy %d)\n", rank,
+           "n9_teardown", bad ? "FAIL" : "PASS", commDestroySec, rc);
+    fails += bad;
+  }
 
   printf("[rank %d] %s\n", rank, fails == 0 ? "PASSED" : "FAILED");
   return fails == 0 ? 0 : 1;

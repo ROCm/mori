@@ -779,9 +779,9 @@ int ccoCommDestroy(ccoComm* comm) {
 
   // Safety net for DevComms with ccoProxy queues that were never destroyed:
   // their proxy threads would keep polling and posting against the windows,
-  // QPs and bootstrap torn down below. Stop and free them first, as
-  // ccoDevCommDestroy would (collective, like it). The DevComms' other
-  // resources stay leaked, and the DevComms must not be used afterwards.
+  // QPs and bootstrap torn down below. Stop and free them first, locally, as
+  // ccoDevCommDestroy would. The DevComms' other resources stay allocated until
+  // ccoDevCommDestroy(nullptr, &dc), which skips the freed engines.
 #ifdef MORI_CCO_PROXY
   for (void* engine : comm->proxyEngines) {
     MORI_SHMEM_WARN(
@@ -2340,6 +2340,11 @@ int ccoDevCommGetError(ccoComm* comm, const ccoDevComm* devComm, ccoDevCommError
   *err = ccoDevCommError{};
 #ifdef MORI_CCO_PROXY
   if (devComm->proxy.engine != nullptr) {
+    // Only an engine still listed on comm is alive (a destroyed DevComm's copy
+    // points at a freed one); the lock keeps a concurrent destroy from freeing it.
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    const auto& engines = comm->proxyEngines;
+    if (std::find(engines.begin(), engines.end(), devComm->proxy.engine) == engines.end()) return 0;
     return ccoProxyEngineGetError(static_cast<const ccoProxyEngine*>(devComm->proxy.engine), err);
   }
 #endif
@@ -2358,15 +2363,21 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
   ccoDevComm& hostShadow = *devComm;
 
   // ccoProxy first: its threads post against the windows, MRs and QPs freed below.
+  // comm owns the engines: only one still listed on it is alive. With comm ==
+  // nullptr, ccoCommDestroy has already freed them all.
 #ifdef MORI_CCO_PROXY
-  if (hostShadow.proxy.engine) {
-    if (comm) {
+  if (hostShadow.proxy.engine && comm) {
+    bool owned = false;
+    {
       std::lock_guard<std::mutex> lock(comm->allocMutex);
       auto& engines = comm->proxyEngines;
-      engines.erase(std::remove(engines.begin(), engines.end(), hostShadow.proxy.engine),
-                    engines.end());
+      auto it = std::find(engines.begin(), engines.end(), hostShadow.proxy.engine);
+      if (it != engines.end()) {
+        engines.erase(it);
+        owned = true;
+      }
     }
-    ccoProxyEngineDestroy(static_cast<ccoProxyEngine*>(hostShadow.proxy.engine));
+    if (owned) ccoProxyEngineDestroy(static_cast<ccoProxyEngine*>(hostShadow.proxy.engine));
   }
 #endif
   hostShadow.proxy = {};

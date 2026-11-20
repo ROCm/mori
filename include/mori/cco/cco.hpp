@@ -1074,8 +1074,9 @@ int ccoGetUniqueId(ccoUniqueId* uniqueId);
 int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
                   ccoComm** comm);
 // Destroy every DevComm first. A DevComm with ccoProxy queues left alive is
-// warned about and its proxy engine stopped here (collectively, as in
-// ccoDevCommDestroy); its other device resources are leaked.
+// warned about and its proxy engine stopped here; its other device resources
+// stay allocated until ccoDevCommDestroy(nullptr, &devComm), the only call that
+// may still take it.
 int ccoCommDestroy(ccoComm* comm);
 
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──
@@ -1121,8 +1122,11 @@ void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe);
 // outDevComm is a caller-provided host struct filled in place (it holds device
 // pointers but lives on the host). Pass it by value into kernels — it lands in
 // kernel-arg space, no per-access GPU-memory dereference. The device resources
-// it references are released by ccoDevCommDestroy(comm, &devComm), which is
-// collective when the DevComm has ccoProxy queues.
+// it references are released by ccoDevCommDestroy(comm, &devComm), on the
+// struct ccoDevCommCreate filled (not a copy), once. Destroy is local: it never
+// waits for other ranks. With ccoProxy queues, no peer may still push to this
+// rank: end the last kernels with flush(), synchronize, then barrier the ranks
+// (ccoBarrierAll) before destroying; a peer's op still in flight fails.
 int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm);
 int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
 
@@ -1133,7 +1137,7 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
 // waitSignal(..., timeoutCycles) (2 = failed) or poll failed(), and read the
 // cause with ccoDevCommGetError; receivers need their own timeout, since a
 // failed sender sends nothing more. Recovery: agree out of band, then every
-// rank calls ccoDevCommDestroy (collective) and creates the DevComm again.
+// rank calls ccoDevCommDestroy and creates the DevComm again.
 // Other DevComms are unaffected.
 enum ccoDevCommErrorCode {
   CCO_DEVCOMM_OK = 0,

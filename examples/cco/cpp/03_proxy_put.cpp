@@ -202,7 +202,8 @@ int main(int argc, char** argv) {
            bad ? "FAILED" : "verified", bad, count, host[0], host[count - 1]);
   }
 
-  // A failed DevComm is destroyed the same way: collectively, on every rank.
+  // Teardown is local: the barrier above already ensures no peer still pushes
+  // to this rank. A failed DevComm is destroyed the same way.
   HIP_CHECK(hipStreamDestroy(stream));
   HIP_CHECK(hipFree(dStatus));
   CCO_CHECK(ccoDevCommDestroy(comm, &devComm));

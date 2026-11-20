@@ -388,6 +388,7 @@ class ProxyWorker {
   }
 
   void Start(int cpu, const std::atomic<bool>* stop) {
+    stop_ = stop;
     for (int peer = 0; peer < worldSize_; peer++) {
       if (!Qp(peer, 0).active) continue;
       activePeers_.push_back(peer);
@@ -524,12 +525,17 @@ class ProxyWorker {
     if (err_->state.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
       err_->info = e;
       err_->state.store(2, std::memory_order_release);
+      // While destroying, the likely cause is a peer that destroyed first: its
+      // QPs are gone, so our WRs still in flight to it fail.
+      const bool destroying = stop_ != nullptr && stop_->load(std::memory_order_acquire);
       std::fprintf(
           stderr, "%s\n",
-          DescribeError(e,
-                        "DevComm failed: flush() / waitSignal() now trap and abort the process, "
-                        "their timeout overloads return 2; peers are not told. To recover, every "
-                        "rank destroys and recreates the DevComm")
+          DescribeError(e, destroying
+                               ? "while destroying the DevComm: a peer that destroyed first "
+                                 "drops the work requests still in flight to it"
+                               : "DevComm failed: flush() / waitSignal() now trap and abort the "
+                                 "process, their timeout overloads return 2; peers are not told. "
+                                 "To recover, every rank destroys and recreates the DevComm")
               .c_str());
     } else {
       err_->suppressed.fetch_add(1, std::memory_order_relaxed);
@@ -837,11 +843,12 @@ class ProxyWorker {
   int signalCount_;  // user signal slots (gdaSignalCount), the same on every rank
   int id_;
   int rank_;
-  ProxyErrorState* err_;          // the engine's
-  bool failed_{false};            // drain-and-drop
-  OwnedQueue* cur_{nullptr};      // queue whose callbacks are running
-  std::vector<int> activePeers_;  // peers with QPs
-  std::vector<int> activeQps_;    // indices in qps of every active QP
+  ProxyErrorState* err_;                    // the engine's
+  const std::atomic<bool>* stop_{nullptr};  // the engine's; set while destroying
+  bool failed_{false};                      // drain-and-drop
+  OwnedQueue* cur_{nullptr};                // queue whose callbacks are running
+  std::vector<int> activePeers_;            // peers with QPs
+  std::vector<int> activeQps_;              // indices in qps of every active QP
   std::thread thread_;
 };
 
@@ -873,7 +880,6 @@ class ccoProxyEngine {
     for (auto& w : workers) w->Join();
   }
 
-  application::BootstrapNetwork* bootNet{nullptr};
   std::unique_ptr<application::IBVerbsDeviceContext> ibv;
   std::unique_ptr<mori::cco::proxy::invoke::Context<mori::cco::proxy::queue::SPSCD2HQueue>>
       spsc;  // SPSC pool
@@ -904,7 +910,6 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
                                      application::BootstrapNetwork* bootNet,
                                      const ccoProxyEngineConfig& config, ccoProxyContext* out) {
   auto engine = std::make_unique<ccoProxyEngine>();
-  engine->bootNet = bootNet;
   const int worldSize = bootNet->GetWorldSize();
   const int rank = bootNet->GetLocalRank();
   engine->rank = rank;
@@ -1180,14 +1185,6 @@ void ccoProxyEngineDestroy(ccoProxyEngine* engine) noexcept {
                  "[mori cco] ccoProxy rank %d: destroying a failed DevComm (error code %d, %llu "
                  "later errors suppressed)\n",
                  engine->rank, err.code, static_cast<unsigned long long>(err.suppressed));
-  }
-  try {
-    engine->bootNet->Barrier();  // ... and every peer's WRs to our QPs too
-  } catch (const std::exception& e) {
-    std::fprintf(stderr,
-                 "[mori cco] ERROR: ccoProxy rank %d: destroy barrier failed (%s); tearing down "
-                 "locally\n",
-                 engine->rank, e.what());
   }
   delete engine;
 }

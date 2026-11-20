@@ -70,11 +70,12 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
 // HIP-free: safe from any thread while kernels run.
 int ccoProxyEngineGetError(const ccoProxyEngine* engine, ccoDevCommError* err);
 
-// Collective: drains and stops the proxy threads, barriers so no peer still has
-// WRs in flight to our QPs, then releases QPs, queues and device copies. No
-// kernel using the engine may still be running. A failed engine stops without
-// waiting for its outstanding WRs. Never throws: if the barrier fails (a peer
-// died), it reports that on stderr and tears down locally.
+// Local, like the GDA teardown: drains and stops the proxy threads (our WRs
+// complete, or fail after the QP's ACK timeout when the peer is gone), then
+// releases QPs, queues and device copies. Never waits for other ranks. No kernel
+// using the engine may still be running, and no peer should still push to us:
+// their WRs in flight to our destroyed QPs fail. A failed engine stops without
+// waiting for its outstanding WRs. Never throws.
 void ccoProxyEngineDestroy(ccoProxyEngine* engine) noexcept;
 
 }  // namespace cco

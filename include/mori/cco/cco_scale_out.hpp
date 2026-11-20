@@ -1979,7 +1979,7 @@ __device__ inline void ccoGdaBarrier(Coop, ccoGda<PrvdType, Doorbell>&, ccoGdaBa
 // failure; peers are not told, so a receiver needs its own timeout
 // (waitSignal(..., timeoutCycles)). Recovery: detect it (2, failed(), or
 // ccoDevCommGetError), agree out of band, then every rank calls
-// ccoDevCommDestroy (collective) and creates a new DevComm. Not covered: an
+// ccoDevCommDestroy and creates a new DevComm. Not covered: an
 // MPSC push waiting for ring space (only after a corrupted ring).
 //
 // Fences: each put / putValue / signal does a system-scope release fence

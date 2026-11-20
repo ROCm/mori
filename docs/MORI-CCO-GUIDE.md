@@ -562,8 +562,15 @@ With `SignalInc`, `waitSignal(slot, n)` waits for `n` more signals. With
   their own timeout (`waitSignal(..., timeoutCycles)`).
 - Recovery: detect the failure (a 2, `failed()`, or `ccoDevCommGetError`),
   agree on it across ranks out of band, then every rank calls
-  `ccoDevCommDestroy` (collective when the DevComm has proxy queues) and
-  creates a new DevComm. Other DevComms are unaffected.
+  `ccoDevCommDestroy` and creates a new DevComm. Other DevComms are unaffected.
+- Teardown is local, as for GDA: `ccoDevCommDestroy` and `ccoCommDestroy` never
+  wait for other ranks. Before destroying, make sure no peer still pushes to
+  this rank: end the last kernels with `flush()`, synchronize, then
+  `ccoBarrierAll`. An op still in flight to a rank that has destroyed fails on
+  the sender after the QP's ACK timeout (about 0.5 s by default) and is
+  reported as a teardown error. Destroy each DevComm once, on the struct
+  `ccoDevCommCreate` filled; after `ccoCommDestroy`, only
+  `ccoDevCommDestroy(nullptr, &dc)` may still take it.
 
 ### Example
 
