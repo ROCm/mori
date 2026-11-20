@@ -45,6 +45,8 @@
 //   8. idle producer       its first write after the unfence rebuilds at once
 //   9. notifications       a fence forgets the peer's completed notifications
 //  10. unresponsive peer   unfence returns without waiting for the peer to take the notice
+//  11. repeated fences     what each fence cut is destroyed after the release delay, while
+//                          the engines keep running; a session over it stays dead
 //
 // Every case runs over host memory and, when a GPU is visible, again over device
 // memory, so the NIC is also shown to stop writing into VRAM.
@@ -70,6 +72,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -103,6 +106,8 @@ constexpr int kStaleWriteTimeoutMs = 30000;
 constexpr int kRebuildBudgetMs = 15000;
 // Time for the Unfenced notice, one local TCP message, to reach the producer.
 constexpr int kUnfencedNoticeMs = 500;
+// MORI_IO_FENCE_RELEASE_DELAY_MS for this test, so case 11 sees what a fence cut destroyed.
+constexpr int kReleaseDelayMs = 100;
 
 const char* const kProducer = "fence_producer";
 const char* const kReceiver = "fence_receiver";
@@ -540,6 +545,38 @@ void TestUnfenceDoesNotWaitForAnUnresponsivePeer(Rig& rig) {
   CHECK(fence.endpointsFenced == 0, "a peer that never connected has nothing to cut");
 }
 
+void TestRepeatedFencesReleaseWhatTheyCut(Rig& rig) {
+  Buffer src(rig.producer.get(), 0x71);
+  Buffer dst(rig.receiver.get(), 0x00);
+  // A session the receiver holds itself, toward the producer: the fence cuts its QP, and the
+  // release destroys it while the session still refers to it.
+  Buffer own(rig.receiver.get(), 0x72);
+  Buffer theirs(rig.producer.get(), 0x00);
+  std::optional<IOEngineSession> sess = rig.receiver->CreateSession(own.desc, theirs.desc);
+  CHECK(sess.has_value(), "the receiver must get a session toward the producer");
+  TransferStatus status;
+  sess->Write(0, 0, kBufSize, &status, sess->AllocateTransferUniqueId());
+  WaitOrStop(&status, kTransferTimeoutMs);
+  CHECK(status.Succeeded() && theirs.AllEqual(0x72), "the session's write must land");
+
+  for (int cycle = 0; cycle < 5; ++cycle) {
+    const std::string at = " (cycle " + std::to_string(cycle) + ")";
+    dst.Fill(0x00);
+    CHECK(WriteEventually(rig.producer.get(), src, dst, kRebuildBudgetMs) && dst.AllEqual(0x71),
+          "the producer must write" + at);
+    FenceResult fence = rig.receiver->FenceRemoteEngine(kProducer);
+    CHECK(fence.Ok() && fence.endpointsFenced >= 1, "fence must cut the producer" + at);
+    // Long enough for what the fence cut to be destroyed under the running engines.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5 * kReleaseDelayMs));
+    CHECK(!sess->Alive(), "a session over a destroyed QP must stay dead" + at);
+    CHECK(rig.receiver->UnfenceRemoteEngine(kProducer), "producer must have been fenced" + at);
+    std::this_thread::sleep_for(std::chrono::milliseconds(kUnfencedNoticeMs));
+  }
+  dst.Fill(0x00);
+  CHECK(WriteEventually(rig.producer.get(), src, dst, kRebuildBudgetMs) && dst.AllEqual(0x71),
+        "the producer must write after the last unfence");
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                    Main                                     */
 /* -------------------------------------------------------------------------- */
@@ -553,6 +590,7 @@ struct TestCase {
 
 int main() {
   printf("Running fence tests...\n\n");
+  setenv("MORI_IO_FENCE_RELEASE_DELAY_MS", std::to_string(kReleaseDelayMs).c_str(), 1);
 
   if (!RdmaBackend::HasActiveDevices()) {
     printf("SKIP: no active RDMA devices\n");
@@ -575,6 +613,7 @@ int main() {
       {"9. fence forgets the peer's completed notifications", TestFenceForgetsInboundNotifications},
       {"10. unfence does not wait for an unresponsive peer",
        TestUnfenceDoesNotWaitForAnUnresponsivePeer},
+      {"11. repeated fences release what they cut", TestRepeatedFencesReleaseWhatTheyCut},
   };
 
   int passed = 0;

@@ -429,6 +429,13 @@ void RdmaManager::DeregisterLocalMemory(int devId, const MemoryDesc& desc) {
   }
 }
 
+void RdmaManager::DeregisterLocalBuffer(int devId, void* buf) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  if (devId >= 0 && devId < static_cast<int>(deviceCtxs.size()) && deviceCtxs[devId] != nullptr) {
+    deviceCtxs[devId]->DeregisterRdmaMemoryRegion(buf);
+  }
+}
+
 void RdmaManager::DeregisterLocalMemory(const MemoryDesc& desc) {
   std::unique_lock<std::shared_mutex> lock(mu);
   std::vector<MemoryKey> keysToErase;
@@ -620,7 +627,8 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
   return rdmaEp;
 }
 
-bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpoint& ep) noexcept {
+bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpoint& ep,
+                                         bool releaseFailures) noexcept {
   try {
     std::unique_lock<std::shared_mutex> lock(mu);
     if (devId < 0 || devId >= static_cast<int>(deviceCtxs.size()) || deviceCtxs[devId] == nullptr) {
@@ -632,7 +640,12 @@ bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpo
     if (destroyed) {
       Verbs().ForgetAsyncEndpoint(availDevices[devId].first->GetIbvContext(), ep.handle.qpn,
                                   ep.ibvHandle.cq);
-      peerFailures_.ForgetQp(PeerFailureTracker::QpKey{DeviceName(devId), ep.handle.qpn});
+      const PeerFailureTracker::QpKey key{DeviceName(devId), ep.handle.qpn};
+      if (releaseFailures) {
+        peerFailures_.ReleaseQp(key);
+      } else {
+        peerFailures_.ForgetQp(key);
+      }
     }
     return destroyed;
   } catch (const std::exception& e) {
@@ -823,7 +836,7 @@ int RdmaManager::FailInFlightTransfers(const QpErrorEvent& event) {
   return failed;
 }
 
-FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
+FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey, SnapshotVector* released) {
   // The caller runs one fence or unfence at a time (RdmaBackend::fenceMu_): a concurrent
   // fence would find the route table already emptied by this one and report the peer cut
   // off before these QPs are.
@@ -909,6 +922,23 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
   }
 
   std::unique_lock<std::shared_mutex> lock(mu);
+  // The cut endpoints leave the poll loop's snapshot and the async event handler's view;
+  // the caller destroys them once nothing can still reach them.
+  for (auto it = endpointsById_.begin(); it != endpointsById_.end();) {
+    const EpPair& ep = it->second->ep;
+    bool wasCut = false;
+    for (size_t i = 0; i < victims.size() && !wasCut; ++i) {
+      wasCut = isCut[i] && victims[i].ldevId == ep.ldevId &&
+               victims[i].local.handle.qpn == ep.local.handle.qpn;
+    }
+    if (!wasCut) {
+      ++it;
+      continue;
+    }
+    if (released != nullptr) released->push_back(it->second);
+    it = endpointsById_.erase(it);
+  }
+  endpointsEpoch_.fetch_add(1, std::memory_order_release);
   CutConnections& allCut = cutConnections_[remoteKey];
   allCut.localQpns.insert(allCut.localQpns.end(), cut.localQpns.begin(), cut.localQpns.end());
   allCut.peerQpns.insert(allCut.peerQpns.end(), cut.peerQpns.begin(), cut.peerQpns.end());
@@ -1374,6 +1404,24 @@ bool NotifManager::PopInboundTransferStatus(const EngineKey& remote, TransferUni
     }
   }
   return false;
+}
+
+void NotifManager::UnregisterEndpoint(const EndpointRuntime& rt) {
+  std::lock_guard<std::mutex> lock(mu);
+  registeredRuntimes_.erase(rt.id);
+  if (config.pollCqMode == PollCqMode::EVENT && rt.ep.local.ibvHandle.compCh != nullptr) {
+    epoll_ctl(epfd, EPOLL_CTL_DEL, rt.ep.local.ibvHandle.compCh->fd, nullptr);
+  }
+}
+
+void NotifManager::ReleaseEndpoint(const EndpointRuntime& rt) {
+  // Under `mu`, as RegisterEndpoint registers these buffers.
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = notifCtxById_.find(rt.id);
+  if (it == notifCtxById_.end()) return;
+  rdma->DeregisterLocalBuffer(rt.ep.ldevId, it->second.buf);
+  free(it->second.buf);
+  notifCtxById_.erase(it);
 }
 
 void NotifManager::ForgetNotifications(const EngineKey& remote) {
@@ -1968,6 +2016,9 @@ bool RdmaBackendSession::Alive() const {
   // event makes this false, so a slow but reachable peer stays alive.
   if (rdma_ == nullptr) return true;
   for (const auto& ep : eps) {
+    // A closed ledger marks a QP retired for good, by a fence or a fatal event; a QP a
+    // fence destroyed is no longer known by number, which may already be another's.
+    if (ep.ledger && ep.ledger->Closed()) return false;
     if (!rdma_->IsQpAlive(ep.ldevId, ep.local.handle.qpn)) return false;
   }
   return true;
@@ -1976,6 +2027,7 @@ bool RdmaBackendSession::Alive() const {
 bool RdmaBackendSession::NeedsQpReplacement() const {
   if (rdma_ == nullptr) return false;
   for (const auto& ep : eps) {
+    if (ep.ledger && ep.ledger->Closed()) return true;
     if (rdma_->NeedsQpReplacement(ep.ldevId, ep.local.handle.qpn)) return true;
   }
   return false;
@@ -2038,6 +2090,11 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
   });
   server->Start();
 
+  int releaseDelayMs = static_cast<int>(fenceReleaseDelay_.count());
+  env::Override("MORI_IO_FENCE_RELEASE_DELAY_MS", releaseDelayMs,
+                mori::env::detail::ParsePositiveInt);
+  fenceReleaseDelay_ = std::chrono::milliseconds(releaseDelayMs);
+
   if (config.qpPerTransfer == 1 && rdma->HasIonicDevice()) {
     MORI_IO_WARN(
         "ionic NIC detected with qpPerTransfer=1: single-QP ionic performance is prone to SQ "
@@ -2064,6 +2121,13 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
 }
 
 RdmaBackend::~RdmaBackend() {
+  // What is still waiting for its delay goes with the device contexts, all at once.
+  {
+    std::lock_guard<std::mutex> lock(releaseMu_);
+    releaseStop_ = true;
+  }
+  releaseCv_.notify_all();
+  if (releaseThd_.joinable()) releaseThd_.join();
   notif->Shutdown();
   server->Shutdown();
   if (executor.get() != nullptr) {
@@ -2315,20 +2379,61 @@ FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
   // Fence before dropping sessions. The other way round, a CreateSession racing
   // with us could still see the old endpoints, cache a session over them, and leave
   // it pointing at dead QPs once the fence lands.
-  FenceResult result = rdma->FenceRemoteEngine(remote);
+  FencedRelease release;
+  FenceResult result = rdma->FenceRemoteEngine(remote, &release.endpoints);
   result.peerKnown = result.peerKnown || server->TryGetRemoteEnginePort(remote).has_value();
   notif->ForgetNotifications(remote);
+  for (const auto& rt : release.endpoints) notif->UnregisterEndpoint(*rt);
 
-  std::lock_guard<std::mutex> lock(sessionCacheMu);
-  for (auto it = sessionCache.begin(); it != sessionCache.end();) {
-    if (it->first.remoteEngineKey == remote) {
-      retiredSessions.push_back(std::move(it->second));
-      it = sessionCache.erase(it);
-    } else {
-      ++it;
+  {
+    std::lock_guard<std::mutex> lock(sessionCacheMu);
+    for (auto it = sessionCache.begin(); it != sessionCache.end();) {
+      if (it->first.remoteEngineKey == remote) {
+        release.sessions.push_back(std::move(it->second));
+        it = sessionCache.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
+  ScheduleRelease(std::move(release));
   return result;
+}
+
+void RdmaBackend::ScheduleRelease(FencedRelease release) {
+  if (release.endpoints.empty() && release.sessions.empty()) return;
+  release.at = std::chrono::steady_clock::now() + fenceReleaseDelay_;
+  std::lock_guard<std::mutex> lock(releaseMu_);
+  if (releaseStop_) return;
+  releases_.push_back(std::move(release));
+  if (!releaseThd_.joinable()) releaseThd_ = std::thread([this] { ReleaseLoop(); });
+  releaseCv_.notify_one();
+}
+
+void RdmaBackend::ReleaseLoop() {
+  std::unique_lock<std::mutex> lock(releaseMu_);
+  while (!releaseStop_) {
+    if (releases_.empty()) {
+      releaseCv_.wait(lock);
+      continue;
+    }
+    if (releaseCv_.wait_until(lock, releases_.front().at) == std::cv_status::no_timeout) {
+      continue;
+    }
+    FencedRelease release = std::move(releases_.front());
+    releases_.pop_front();
+    lock.unlock();
+    release.sessions.clear();
+    for (const auto& rt : release.endpoints) {
+      // The QP first: its receive queue refers to the notification buffer, which stays
+      // if the QP could not be destroyed.
+      if (rdma->DestroyEndpointNoThrow(rt->ep.ldevId, rt->ep.local, /*releaseFailures=*/true)) {
+        notif->ReleaseEndpoint(*rt);
+      }
+    }
+    MORI_IO_DEBUG("Released {} endpoint(s) cut by a fence", release.endpoints.size());
+    lock.lock();
+  }
 }
 
 bool RdmaBackend::UnfenceRemoteEngine(const EngineKey& remote) {

@@ -37,6 +37,21 @@ void PeerFailureTracker::ForgetQp(const QpKey& qp) {
   qpOwners_.erase(qp);
 }
 
+void PeerFailureTracker::ReleaseQp(const QpKey& qp) {
+  std::lock_guard<std::mutex> lock(mu_);
+  failedQps_.erase(qp);
+  erroredQps_.erase(qp);
+  auto it = qpOwners_.find(qp);
+  if (it == qpOwners_.end()) return;
+  const void* cq = it->second.cqHandle;
+  qpOwners_.erase(it);
+  if (cq == nullptr) return;
+  for (const auto& [other, owner] : qpOwners_) {
+    if (other.deviceName == qp.deviceName && owner.cqHandle == cq) return;
+  }
+  failedCqs_.erase(CqKey{qp.deviceName, cq});
+}
+
 void PeerFailureTracker::Enqueue(PeerFailureEvent event) {
   if (pending_.size() >= kMaxPending) {
     dropped_++;
