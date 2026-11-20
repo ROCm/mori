@@ -54,6 +54,7 @@ def _arch():
 
 
 _IS_GFX950 = _arch().startswith("gfx95")  # fp4 (e2m1) is gfx950-only
+_IS_GFX125X = _arch().startswith("gfx125")
 
 
 def _run(extra_env, timeout=600):
@@ -144,11 +145,37 @@ def _cases():
 _CASES = dict(_cases())
 _GFX950_ONLY = {"fp4-gather"}
 
+# The gfx125x default backend is hip, which serves gather only, in bf16 / fp32, with
+# no std_moe and no routing replay (hip_backend._unsupported), and whose push quant
+# combine folds no weights -- which this test asks for. Those modes are the backend's
+# answer there, not a failure, so they are dropped from the launch as well as skipped:
+# the modes all share one launch, and an unserved one aborts it before the rest run.
+_GFX125X_UNSERVED = {
+    c
+    for c, env in _CASES.items()
+    if _IS_GFX125X
+    and (
+        env.get("COMBINE") == "scatter"
+        or env.get("DTYPE") == "fp8"
+        or env.get("STDMOE")
+        or env.get("REPLAY")
+    )
+}
+_skip_125x = pytest.mark.skip(reason="the gfx125x hip backend does not serve this mode")
+_MARKS = {
+    **{c: _skip_125x for c in _GFX125X_UNSERVED},
+    **{c: _skip_fp4 for c in _GFX950_ONLY},
+}
+
 
 @pytest.fixture(scope="module")
 def case_output():
     """{id: (output, finished)} for every mode this arch runs, from one launch."""
-    ids = [c for c in _CASES if _IS_GFX950 or c not in _GFX950_ONLY]
+    ids = [
+        c
+        for c in _CASES
+        if (_IS_GFX950 or c not in _GFX950_ONLY) and c not in _GFX125X_UNSERVED
+    ]
     rc, out = _run({"CASES": json.dumps([_CASES[c] for c in ids])}, timeout=1800)
     parts = {c: ([], False) for c in ids}
     current = None
@@ -169,7 +196,7 @@ def case_output():
 
 @pytest.mark.parametrize(
     "case",
-    [pytest.param(c, marks=_skip_fp4) if c in _GFX950_ONLY else c for c in _CASES],
+    [pytest.param(c, marks=_MARKS[c]) if c in _MARKS else c for c in _CASES],
 )
 def test_dispatch_combine_v2_intranode(case, case_output):
     rc, out, crashed, parts = case_output
