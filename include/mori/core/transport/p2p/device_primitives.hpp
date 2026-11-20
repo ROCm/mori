@@ -110,7 +110,11 @@ namespace detail {
 template <class U, MemAddressSpace AddressSpace, class T>
 __forceinline__ __device__ U* addr_cast(T* ptr) {
   static_assert(!std::is_volatile<T>::value, "T must not be volatile");
-  return (U*)(U __attribute__((address_space(1)))*)reinterpret_cast<uintptr_t>(ptr);
+  if constexpr (AddressSpace == EGlobal) {
+    return (U*)(U __attribute__((address_space(1)))*)reinterpret_cast<uintptr_t>(ptr);
+  } else {
+    return reinterpret_cast<U *>(ptr);
+  }
 }
 }  // namespace detail
 
