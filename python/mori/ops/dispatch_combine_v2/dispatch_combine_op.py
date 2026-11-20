@@ -247,6 +247,13 @@ class EpDispatchCombineConfig:
     # op's send. With the ops on separate streams, a two-op microbenchmark is
     # slower but DeepSeek-V4 prefill was still faster, so measure that case.
     async_ll_own_sdma_queue: bool = False
+    # Intranode dispatch as a block-per-token pipeline instead of one warp per
+    # (token, top-k slot): a control warp routes the next token while the others load
+    # a slice of the current one once and store it to every destination rank. Ported
+    # from the v1 IntraNodeLL dispatch. gfx942 / gfx950, one node, hip backend; the
+    # combine is unchanged. The warp split is derived from hidden_dim at compile time,
+    # so leave warp_num_per_block None unless you are sweeping it.
+    ll_dispatch: bool = False
     # Receive layout of async_ll over "sdma" on one node: "compact" (default),
     # "segmented" or "auto".
     #

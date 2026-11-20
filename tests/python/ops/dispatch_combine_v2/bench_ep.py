@@ -309,6 +309,7 @@ def main():
             quant_type=PUSH_QUANT if _PUSH else "none",
             async_ll=ASYNC_LL,
             async_ll_transport=ASYNC_LL_TRANSPORT,
+            ll_dispatch=bool(int(os.environ.get("LL_DISPATCH", 0))),
         )
         return EpDispatchCombineOp(cfg, comm)
 
