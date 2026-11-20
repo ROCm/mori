@@ -15,7 +15,7 @@ without telling UMBP what the bytes mean:
 |---|---|---|---|
 | put | `admit` | store the object, or decline the put | `true` |
 | evict | `weight` | the object with the largest *idle time × weight* leaves first; above 1 ages faster, below 1 slower | `1` |
-| move | `demote` | on leaving a tier, write it to the next tier (`true`) or drop it (`false`) | `true` |
+| move | `demote` | on leaving a tier, write it to the next tier (`true`) or drop it (`false`); `false` also keeps a put off the next tier when its own is full | `true` |
 | move | `retain_s` | idle seconds after which it is dropped rather than written to the next tier; `0` = no limit | `0` |
 | get | `promote` | on a read from a lower tier: `"tier"` follows the tier's `promote_trigger`, `"never"` stays, `"on_read"` moves up | `"tier"` |
 
@@ -58,9 +58,11 @@ results = client.batch_put_from_ptr(kv_keys + state_keys, ptrs, sizes)
 ```
 
 A put that the rule declines returns `False` for that key, like any put that
-did not store. A class set for a key that is not stored yet is remembered until
-the put arrives (up to about 260 thousand pending keys; older ones are
-forgotten and those keys are then unclassified).
+did not store. The key keeps its class, so a caller that retries the put
+without declaring the key again is declined again. A class set for a key that
+is not stored yet is remembered until the put arrives (up to about 260
+thousand pending keys; older ones are forgotten and those keys are then
+unclassified).
 
 A key that is already stored changes class immediately and keeps its recency,
 so a caller can re-tag objects as their role changes.
@@ -186,6 +188,9 @@ demoted can take `demote: false` to spare the lower tier's writes.
 - **Move.** When a key leaves a tier that has a lower tier, it is written there
   unless its rule has `demote: false` or it has been idle for `retain_s` or
   longer; then it is dropped. Watermark-triggered offload skips such keys too.
+  A class with `demote: false` is not placed on a lower tier at put time
+  either: when its entry tier has no room the put fails for lack of space
+  instead of overflowing to the next tier.
 - **Get.** A read from a lower tier follows the key's `promote` rule; `"tier"`
   keeps the tier's own `promote_trigger`.
 

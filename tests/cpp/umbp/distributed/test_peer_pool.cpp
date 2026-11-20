@@ -1949,6 +1949,64 @@ TEST(PeerPoolRules, ADeclinedClassIsNotStoredUntilItsRuleChanges) {
   EXPECT_TRUE(pool.BatchResolve({"unclassified"}, false).front().resolved.found);
 }
 
+// Found in a live run: a connector that retries a put that did not store does
+// not declare the key again. The retry must be declined as well, not stored as
+// an unclassified object.
+TEST(PeerPoolRules, ADeclinedKeyStaysDeclinedWhenThePutIsRetried) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10);
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  ASSERT_TRUE(pool.Rules().SetTableJson("state", R"({"rules": {"7": {"admit": false}}})"));
+  ASSERT_EQ(pool.Rules().SetKeyClass("state", {"declined"}, {7}), 1u);
+
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    auto result = pool.BatchAllocate({PutRequest("declined")}).front();
+    EXPECT_TRUE(result.declined) << "attempt " << attempt;
+    EXPECT_EQ(result.allocation.outcome, AllocateOutcome::kFailed) << "attempt " << attempt;
+  }
+  EXPECT_EQ(registry.Get("dram")->OwnedKeyCount(), 0u);
+  const std::string state = pool.Rules().StateJson();
+  EXPECT_EQ(ClassNumber(state, "state", "7", {"declined"}), 3) << state;
+  EXPECT_EQ(ClassNumber(state, "state", "7", {"admitted"}), 0) << state;
+
+  // The declaration is still there when the rule changes: no second declare needed.
+  ASSERT_TRUE(pool.Rules().SetTableJson("state", "{}"));
+  CommitKey(&pool, "declined");
+  EXPECT_EQ(ClassNumber(pool.Rules().StateJson(), "state", "7", {"admitted"}), 1);
+}
+
+// Found in the same run: with the entry tier full, a put used to be placed
+// straight on the next tier, also for a class whose rule keeps it off that tier.
+TEST(PeerPoolRules, AClassWithDemoteOffIsNotPlacedOnTheNextTierWhenItsOwnIsFull) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kHostPage, 2);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kHostPage, 20);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  auto* hot = registry.Get("hot");
+  auto* cold = registry.Get("cold");
+  ASSERT_TRUE(pool.Rules().SetTableJson("state", R"({"rules": {"1": {"demote": false}}})"));
+
+  CommitKey(&pool, "fill0");
+  CommitKey(&pool, "fill1");
+  ASSERT_EQ(hot->OwnedKeyCount(), 2u);
+
+  // An unclassified put overflows to the next tier, as before.
+  CommitKey(&pool, "plain");
+  EXPECT_TRUE(cold->Contains("plain"));
+
+  // A put of the class does not: it fails for lack of space on its own tier.
+  ASSERT_EQ(pool.Rules().SetKeyClass("state", {"kept-off"}, {1}), 1u);
+  auto result = pool.BatchAllocate({PutRequest("kept-off")}).front();
+  EXPECT_EQ(result.allocation.outcome, AllocateOutcome::kFailedNoSpace);
+  EXPECT_FALSE(result.declined);
+  EXPECT_FALSE(cold->Contains("kept-off"));
+  EXPECT_FALSE(hot->Contains("kept-off"));
+}
+
 TEST(PeerPoolRules, AFastAgeingClassLeavesBeforeOlderUnclassifiedKeys) {
   LocalCopyEngine engine;
   BackendRegistry registry;

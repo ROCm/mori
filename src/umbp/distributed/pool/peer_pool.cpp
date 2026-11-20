@@ -664,6 +664,21 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
 
     put_orders[i] = policy_->PutOrder(*backends_, requests[i]);
     PreferSourceDevice(requests[i].preferred_device, &put_orders[i]);
+    // A class that is not written to a lower tier is not placed on one when
+    // its entry tier is full either: that put fails instead of overflowing.
+    if (rules_.Active() && put_orders[i].size() > 1 && rules_.EntryTierOnly(requests[i].key)) {
+      const auto* entry = backends_->Get(put_orders[i].front());
+      if (entry != nullptr) {
+        const TierType entry_tier = entry->Tier();
+        put_orders[i].erase(std::remove_if(put_orders[i].begin() + 1, put_orders[i].end(),
+                                           [&](uint32_t id) {
+                                             const auto* candidate = backends_->Get(id);
+                                             return candidate == nullptr ||
+                                                    candidate->Tier() != entry_tier;
+                                           }),
+                            put_orders[i].end());
+      }
+    }
     if (!put_orders[i].empty()) {
       const uint32_t selected = put_orders[i].front();
       pending_keys_[requests[i].key] =

@@ -375,9 +375,15 @@ bool PoolRules::Admit(const std::string& key, uint64_t bytes) {
   ClassStats& stats = ClassOfLocked(record).stats;
   ++stats.declined;
   stats.declined_bytes += bytes;
-  // A declined key holds nothing; the caller declares it again if it retries.
-  if (!record.stored) keys_.erase(it);
+  // The declaration stays: a caller that retries the put without declaring
+  // again must get the same answer, not an unclassified object.
   return false;
+}
+
+bool PoolRules::EntryTierOnly(const std::string& key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = keys_.find(key);
+  return it != keys_.end() && !RuleOfLocked(it->second).demote;
 }
 
 void PoolRules::OnStored(const std::string& key, uint32_t backend_id, TierType tier,

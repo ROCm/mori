@@ -138,6 +138,9 @@ class PoolRules {
                uint64_t bytes);
   void OnDropped(const std::string& key);
   bool ShouldDemote(const std::string& key);
+  // True for a key whose rule keeps it off lower tiers (`demote: false`): the
+  // put is then not placed on one either when its entry tier is full.
+  bool EntryTierOnly(const std::string& key);
   PoolRulePromote Promote(const std::string& key);
   double Weight(const std::string& key);
 
