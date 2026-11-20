@@ -483,7 +483,7 @@ struct ccoDevCommRequirements {
   int railGdaBarrierCount;
 
   // SDMA.
-  int sdmaQueueCount;  // 0 = anvil default
+  int sdmaQueueCount;  // queues per peer; 0 = none. Needs MORI_ENABLE_SDMA=1
 
   // Hybrid barrier (LSA + GDA-Rail two-stage). Drives BOTH
   // hybridLsaBarrier and hybridRailGdaBarrier with the same N.

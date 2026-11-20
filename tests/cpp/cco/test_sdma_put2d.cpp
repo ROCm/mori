@@ -269,6 +269,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   }
 
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  reqs.sdmaQueueCount = 2;
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
   reqs.gdaContextCount = 0;
   reqs.gdaSignalCount = 0;
