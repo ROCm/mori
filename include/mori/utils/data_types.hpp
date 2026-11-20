@@ -44,6 +44,12 @@ namespace mori {
 #define MORI_FP8_TYPE_OCP_ENABLED
 #endif
 
+#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
+#define MORI_FP4_HW_CVT 1
+#else
+#define MORI_FP4_HW_CVT 0
+#endif
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                               FP4                                              */
 /* ---------------------------------------------------------------------------------------------- */
@@ -108,19 +114,35 @@ __device__ static mori_fp4_storage float_to_fp4_e2m1(const float x) {
   return u.fp4[0];
 }
 
-__device__ static mori_fp4x2_storage float2_to_fp4x2_e2m1(const float2 x) {
-  union {
-    uint32_t ui32;
-    mori_fp4x2_storage fp4x2[4];
-  } u{0};
-#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
-  u.ui32 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(u.ui32, x.x, x.y, 1.0f /* scale */, 0);
+// Byte Sel of w holds two e2m1 values, the low nibble being .x.
+template <int Sel>
+__device__ __forceinline__ float2 fp4x2_to_float2(uint32_t w) {
+  static_assert(Sel >= 0 && Sel < 4);
+#if MORI_FP4_HW_CVT
+  const auto r = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(w, 1.0f /* scale */, Sel);
+  return float2(r[0], r[1]);
 #else
-  u.ui32 |= fcbx::from_float<float, fcbx::Encoding::E2M1, true>(x.y, 0 /*scale*/);
-  u.ui32 <<= 4;
-  u.ui32 |= fcbx::from_float<float, fcbx::Encoding::E2M1, true>(x.x, 0 /*scale*/);
+  const uint32_t b = (w >> (8 * Sel)) & 0xFFu;
+  return float2(fcbx::to_float<float, fcbx::Encoding::E2M1, true>(b & 0xFu, 0),
+                fcbx::to_float<float, fcbx::Encoding::E2M1, true>(b >> 4, 0));
 #endif
-  return u.fp4x2[0];
+}
+
+// Writes x into byte Sel of old; the other bytes are kept.
+template <int Sel>
+__device__ __forceinline__ uint32_t float2_to_fp4x2(uint32_t old, float2 x) {
+  static_assert(Sel >= 0 && Sel < 4);
+#if MORI_FP4_HW_CVT
+  return __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(old, x.x, x.y, 1.0f /* scale */, Sel);
+#else
+  const uint32_t b = (fcbx::from_float<float, fcbx::Encoding::E2M1, true>(x.y, 0 /*scale*/) << 4) |
+                     fcbx::from_float<float, fcbx::Encoding::E2M1, true>(x.x, 0 /*scale*/);
+  return (old & ~(0xFFu << (8 * Sel))) | (b << (8 * Sel));
+#endif
+}
+
+__device__ static mori_fp4x2_storage float2_to_fp4x2_e2m1(const float2 x) {
+  return static_cast<mori_fp4x2_storage>(float2_to_fp4x2<0>(0u, x));
 }
 #endif  // MORI_HAS_OCP_FP
 
@@ -187,16 +209,7 @@ struct mori_fp4x2_e2m1 {
     return u.bf162;
   }
 
-  __device__ operator float2() const {
-#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
-    auto fp32x2 = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(x, 1.0f /* scale */, 0);
-#else
-    using namespace fcbx;
-    auto fp32x2 = __amd_floatx2_storage_t{to_float<float, Encoding::E2M1, true>(x & 0xFu, 0),
-                                          to_float<float, Encoding::E2M1, true>(x >> 4, 0)};
-#endif
-    return float2(fp32x2[0], fp32x2[1]);
-  }
+  __device__ operator float2() const { return fp4x2_to_float2<0>(x); }
 #endif  // MORI_HAS_OCP_FP
 };
 

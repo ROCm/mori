@@ -1049,14 +1049,14 @@ def _bench_dispatch_combine(
     }
     kernel_type_enum = _kernel_type_map[kernel_type_str]
 
-    if quant_type == "fp8_blockwise":
+    if quant_type in ("fp8_blockwise", "fp4_blockwise"):
         if data_type is not torch.bfloat16 or combine_data_type is not torch.bfloat16:
             raise ValueError(
-                "fp8_blockwise quant requires dispatch and combine dtype to be bfloat16, "
+                f"{quant_type} quant requires dispatch and combine dtype to be bfloat16, "
                 f"got dispatch={data_type}, combine={combine_data_type}"
             )
         if zero_copy != 0:
-            raise ValueError("fp8_blockwise quant requires --zero-copy 0")
+            raise ValueError(f"{quant_type} quant requires --zero-copy 0")
 
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -1080,12 +1080,12 @@ def _bench_dispatch_combine(
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
-        # For fp8_blockwise, plumb the kernel-internal scale_dim into the
-        # benchmark so force_scale_active sentinels and report_scale_stats
-        # match the partition the kernel actually quantizes.
+        # Blockwise combine (fp8/fp4) uses the kernel-internal scale_dim;
+        # force_scale_active sentinels and report_scale_stats must match that
+        # partition, not the caller's --scale-dim.
         bench_combine_scale_dim = (
             op._fp8_blockwise_combine_scale_dim
-            if quant_type == "fp8_blockwise"
+            if quant_type in ("fp8_blockwise", "fp4_blockwise")
             else None
         )
         benchmark = EpDispatchCombineBenchmark(
@@ -1504,10 +1504,11 @@ if __name__ == "__main__":
         "--quant-type",
         type=str,
         default="none",
-        choices=["none", "fp8_blockwise"],
+        choices=["none", "fp8_blockwise", "fp4_blockwise"],
         help=(
             "Quantization method used inside Combine. "
-            "'fp8_blockwise' is the BF16<->FP8 blockwise quant path."
+            "'fp8_blockwise' is the BF16<->FP8 blockwise quant path; "
+            "'fp4_blockwise' is the BF16<->FP4 blockwise quant path (gfx950)."
         ),
     )
     # --block-num/--warp-per-block set both phases; the per-phase flags override
@@ -1611,8 +1612,8 @@ if __name__ == "__main__":
         default=32,
         help=(
             "Number of caller-provided dispatch scale values per token "
-            "(default: 32). fp8_blockwise combine ignores this and uses "
-            "MORI_FP8_COMBINE_SCALE_DIM for its internal scale layout."
+            "(default: 32). fp8_blockwise / fp4_blockwise combine ignore this "
+            "and use MORI_FP8_COMBINE_SCALE_DIM for the internal scale layout."
         ),
     )
     parser.add_argument(
@@ -1741,13 +1742,13 @@ if __name__ == "__main__":
     dispatch_dtype = _DATA_TYPE_MAP[args.dtype]
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
 
-    if args.quant_type == "fp8_blockwise":
+    if args.quant_type in ("fp8_blockwise", "fp4_blockwise"):
         if args.dtype != "bf16" or combine_dtype_str != "bf16":
             raise ValueError(
-                "fp8_blockwise quant requires --dtype bf16 and --combine-dtype bf16"
+                f"{args.quant_type} quant requires --dtype bf16 and --combine-dtype bf16"
             )
         if args.zero_copy != 0:
-            raise ValueError("fp8_blockwise quant requires --zero-copy 0")
+            raise ValueError(f"{args.quant_type} quant requires --zero-copy 0")
 
     base_hidden_dim = args.hidden_dim
     dispatch_hidden_dim = (
