@@ -2142,10 +2142,19 @@ RdmaBackend::~RdmaBackend() {
 
 void RdmaBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
   server->RegisterRemoteEngine(rdesc);
+  std::lock_guard<std::mutex> lock(registeredKeysMu_);
+  registeredKeys_.insert(rdesc.key);
 }
 
 void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   server->DeregisterRemoteEngine(rdesc);
+  std::lock_guard<std::mutex> lock(registeredKeysMu_);
+  registeredKeys_.erase(rdesc.key);
+}
+
+bool RdmaBackend::IsRegistered(const EngineKey& remote) const {
+  std::lock_guard<std::mutex> lock(registeredKeysMu_);
+  return registeredKeys_.count(remote) != 0;
 }
 
 void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc); }
@@ -2387,7 +2396,7 @@ FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
   // Kept until the peer is unfenced: see FencedRelease.
   FencedRelease& held = heldUntilUnfence_[remote];
   FenceResult result = rdma->FenceRemoteEngine(remote, &held.endpoints);
-  result.peerKnown = result.peerKnown || server->TryGetRemoteEnginePort(remote).has_value();
+  result.peerKnown = result.peerKnown || IsRegistered(remote);
   notif->ForgetNotifications(remote);
 
   std::lock_guard<std::mutex> lock(sessionCacheMu);

@@ -50,6 +50,7 @@
 //                          stays dead
 //  12. QP number reuse     while fenced, a peer's QP that never sent anything cannot write
 //                          through a new QP that took the number of one the fence cut
+//  13. connect in progress a fence does not wait for a connect to another peer that hangs
 //
 // Every case runs over host memory and, when a GPU is visible, again over device
 // memory, so the NIC is also shown to stop writing into VRAM.
@@ -609,6 +610,52 @@ void TestFencedPeerCannotWriteThroughAReusedQpNumber(Rig& rig) {
   CHECK(rig.receiver->UnfenceRemoteEngine("fence_reuse_producer"), "the producer was fenced");
 }
 
+void TestFenceDoesNotWaitForAConnectInProgress(Rig& rig) {
+  // The receiver connects to a peer whose listener takes no connection; the connect hangs
+  // until the control-plane timeout (5 s), holding the control plane's lock meanwhile.
+  UnresponsivePeer peer;
+  EngineDesc hanging;
+  hanging.key = "fence_hanging_connect";
+  hanging.nodeId = rig.receiver->GetEngineDesc().nodeId;
+  hanging.hostname = rig.receiver->GetEngineDesc().hostname;
+  hanging.host = "127.0.0.1";
+  hanging.port = peer.port;
+  rig.receiver->RegisterRemoteEngine(hanging);
+  // A peer that is registered and never connected: telling it known needs the registration.
+  EngineDesc registered = hanging;
+  registered.key = "fence_registered_only";
+  rig.receiver->RegisterRemoteEngine(registered);
+
+  Buffer src(rig.receiver.get(), 0x31);
+  Buffer theirs(rig.producer.get(), 0x00);
+  MemoryDesc remote = theirs.desc;
+  remote.engineKey = hanging.key;
+  std::thread connecting([&] {
+    try {
+      TransferStatus status;
+      rig.receiver->Write(src.desc, 0, remote, 0, kBufSize, &status,
+                          rig.receiver->AllocateTransferUniqueId());
+      WaitTerminal(&status, kTransferTimeoutMs);
+    } catch (const std::exception&) {
+    }
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  const auto start = std::chrono::steady_clock::now();
+  FenceResult fence = rig.receiver->FenceRemoteEngine(registered.key);
+  const bool wasFenced = rig.receiver->UnfenceRemoteEngine(registered.key);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - start)
+                      .count();
+  connecting.join();
+  rig.receiver->DeregisterRemoteEngine(registered);
+  rig.receiver->DeregisterRemoteEngine(hanging);
+  CHECK(ms < 1000, "a fence and an unfence must not wait for a connect to another peer; took " +
+                       std::to_string(ms) + " ms");
+  CHECK(fence.Ok() && fence.peerKnown && wasFenced,
+        "a registered peer is known, and fencing it ok: " + fence.message);
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                    Main                                     */
 /* -------------------------------------------------------------------------- */
@@ -648,6 +695,8 @@ int main() {
       {"11. repeated fences release what they cut", TestRepeatedFencesReleaseWhatTheyCut},
       {"12. a fenced peer cannot write through a reused QP number",
        TestFencedPeerCannotWriteThroughAReusedQpNumber},
+      {"13. a fence does not wait for a connect in progress",
+       TestFenceDoesNotWaitForAConnectInProgress},
   };
 
   int passed = 0;

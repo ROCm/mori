@@ -556,8 +556,15 @@ class RdmaBackend : public Backend {
   // path that stays down, are replaced at a growing interval. Guarded by connBuildMapMu_.
   std::unordered_map<ConnBuildKey, QpReplacementPacing, ConnBuildKeyHash> qpReplacementPacing_;
   // One fence or unfence at a time, start to end: an unfence between the steps of a fence
-  // would let the peer back in while the fence goes on to treat it as fenced.
+  // would let the peer back in while the fence goes on to treat it as fenced. Nothing taken
+  // under it may wait on the network.
   std::mutex fenceMu_;
+
+  // Keys registered as remote engines, for the fence to tell a known peer. Not the control
+  // plane's table: its lock is held across connects, which a fence must not wait out.
+  bool IsRegistered(const EngineKey& remote) const;
+  mutable std::mutex registeredKeysMu_;
+  std::unordered_set<EngineKey> registeredKeys_;
 
   // What fences of a peer cut: its endpoints and the sessions taken out of the cache.
   //
