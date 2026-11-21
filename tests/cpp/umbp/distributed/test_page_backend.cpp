@@ -1358,4 +1358,29 @@ TEST(PageBackendTouch, DoesNothingUntilTheOrderIsTracked) {
   EXPECT_EQ(backend->Touch({"a"}), 0u);
 }
 
+TEST(PageBackendLease, FencesEvictionWithoutMovingRecency) {
+  auto backend = MakeOrderedBackend(std::chrono::milliseconds{1});
+  PutKey(*backend, "a");
+  PutKey(*backend, "b");
+  PutKey(*backend, "c");
+  backend->Lease({"a", "missing"}, std::chrono::milliseconds{50});
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"b", "c"}));
+  auto evicted = backend->Evict({"a"});
+  ASSERT_EQ(evicted.size(), 1u);
+  EXPECT_EQ(evicted[0].bytes_freed, 0u);
+  // Once the lease runs out "a" is the coldest again, as before the lookup.
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"a", "b", "c"}));
+}
+
+TEST(PageBackendLease, NeverShortensALongerLease) {
+  auto backend = MakeOrderedBackend(std::chrono::milliseconds{200});
+  PutKey(*backend, "a");
+  PutKey(*backend, "b");
+  ASSERT_TRUE(backend->BatchResolve({"a"}, false).front().found);
+  backend->Lease({"a"}, std::chrono::milliseconds{1});
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"b"}));
+}
+
 }  // namespace mori::umbp
