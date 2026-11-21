@@ -431,6 +431,21 @@ bool HbmCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) co
   return IsGpu(src) || IsGpu(dst);
 }
 
+bool HbmCopyEngine::CanHandleSized(const TransferRef& src, const TransferRef& dst,
+                                   uint64_t item_bytes) const {
+  if (!CanHandle(src, dst)) return false;
+  // Opt-in: a large item between a registered host buffer and a registered GPU
+  // buffer belongs to MoriIoEngine's local loopback, which sits behind this
+  // engine in the composite.  An empty item is never yielded: the RDMA planner
+  // drops a zero-size item instead of carrying it, and with a floor of 0 that
+  // would turn today's no-op copy into a tag that never completes.
+  if (yield_registered_host_gpu_pairs_ && item_bytes > 0 && item_bytes >= yield_min_item_bytes_ &&
+      IsGpu(src) != IsGpu(dst) && src.HasMemoryDesc() && dst.HasMemoryDesc()) {
+    return false;
+  }
+  return true;
+}
+
 std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(
     size_t /*expected_items*/) const {
   const size_t piece = HostRegistrationChunkBytes();
