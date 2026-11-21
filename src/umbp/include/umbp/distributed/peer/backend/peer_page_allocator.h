@@ -36,7 +36,7 @@ namespace mori::umbp {
 // (owned by Master on the control plane, or by PageBackend on the peer).
 // Internally holds N BufferState entries (one per physical buffer registered
 // by the Client at RegisterClient time); each BufferState carries an
-// independent `vector<bool>` bitmap.
+// independent bitmap of 64-bit words.
 //
 // Allocation strategy:
 //   1. same-buffer continuous run  (best — single-RDMA-friendly)
@@ -60,7 +60,17 @@ class PageBitmapAllocator : public PagePool {
     uint32_t buffer_index = 0;
     uint64_t page_size = 0;  // bytes; constant after construction
     uint32_t total_pages = 0;
-    std::vector<bool> bitmap;  // true = page is currently allocated
+    // Bit (i % 64) of words[i / 64] is set while page i is allocated.  Bits past
+    // total_pages in the last word stay set, so no search reports them free.
+    //
+    // Words rather than vector<bool>: a search skips a word of allocated (or
+    // free) pages with one bit scan.  The cursor below does not help a search
+    // that fails, and in a full pool that eviction has fragmented, the run
+    // search for a large object fails in buffer after buffer.  On 1,799 GB of
+    // 64 KiB pages in four buffers (27 million pages), Allocate of a 19 MB
+    // object took 3.6-7.7 ms bit by bit and takes 40-75 us by words; a put
+    // batch allocates all of its objects under one hold of PageBackend::mutex_.
+    std::vector<uint64_t> words;
     uint32_t free_count = 0;
     // Next-fit cursor: where the last successful search STOPPED.
     //
@@ -84,6 +94,8 @@ class PageBitmapAllocator : public PagePool {
     // rescan the whole bitmap for every key of a batch, under the owner's lock.
     // Allocating cannot create a run, so this stays true until a free.
     uint32_t no_run_at_least = UINT32_MAX;
+
+    bool allocated(uint32_t page) const { return (words[page / 64] >> (page % 64)) & 1; }
   };
 
   // Construct an allocator from a list of per-buffer byte sizes.
@@ -106,7 +118,8 @@ class PageBitmapAllocator : public PagePool {
       bs.buffer_index = static_cast<uint32_t>(i);
       bs.page_size = page_size;
       bs.total_pages = static_cast<uint32_t>(buffer_sizes[i] / page_size);
-      bs.bitmap.assign(bs.total_pages, false);
+      bs.words.assign((static_cast<size_t>(bs.total_pages) + 63) / 64, 0);
+      if (bs.total_pages % 64 != 0) bs.words.back() = ~uint64_t{0} << (bs.total_pages % 64);
       bs.free_count = bs.total_pages;
       buffers_.push_back(std::move(bs));
     }
@@ -146,8 +159,8 @@ class PageBitmapAllocator : public PagePool {
       if (p.buffer_index >= buffers_.size()) continue;
       auto& buf = buffers_[p.buffer_index];
       if (p.page_index >= buf.total_pages) continue;
-      if (!buf.bitmap[p.page_index]) continue;  // already free — idempotent no-op
-      buf.bitmap[p.page_index] = false;
+      if (!buf.allocated(p.page_index)) continue;  // already free — idempotent no-op
+      buf.words[p.page_index / 64] &= ~(uint64_t{1} << (p.page_index % 64));
       ++buf.free_count;
       buf.no_run_at_least = UINT32_MAX;
     }
@@ -198,7 +211,7 @@ class PageBitmapAllocator : public PagePool {
     pages.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
       const uint32_t index = start ? *start + i : indices[i];
-      buf.bitmap[index] = true;
+      MarkAllocated(buf, index);
       pages.push_back({buf.buffer_index, index});
     }
     buf.free_count -= count;
@@ -226,7 +239,7 @@ class PageBitmapAllocator : public PagePool {
       uint32_t take = std::min<uint32_t>(remaining, buf.free_count);
       auto idxs = CollectFirstNFree(buf, take);
       for (auto idx : idxs) {
-        buf.bitmap[idx] = true;
+        MarkAllocated(buf, idx);
         pages.push_back({buf.buffer_index, idx});
       }
       buf.free_count -= take;
@@ -239,33 +252,92 @@ class PageBitmapAllocator : public PagePool {
     return pages;
   }
 
+  static void MarkAllocated(BufferState& buf, uint32_t page) {
+    buf.words[page / 64] |= uint64_t{1} << (page % 64);
+  }
+
+  // First page in [from, end) that is allocated (or free, for allocated ==
+  // false), or `end` if there is none.  One bit scan per word.
+  static uint32_t NextPage(const BufferState& buf, uint32_t from, uint32_t end, bool allocated) {
+    if (from >= end) return end;
+    size_t word = from / 64;
+    const size_t last = (static_cast<size_t>(end) - 1) / 64;
+    uint64_t bits =
+        (allocated ? buf.words[word] : ~buf.words[word]) & (~uint64_t{0} << (from % 64));
+    while (bits == 0) {
+      if (++word > last) return end;
+      bits = allocated ? buf.words[word] : ~buf.words[word];
+    }
+    return static_cast<uint32_t>(std::min<uint64_t>(word * 64 + __builtin_ctzll(bits), end));
+  }
+
+  // The first run of `n` free pages that starts at or after `from` and ends
+  // by `end`.
+  static std::optional<uint32_t> FindRun(const BufferState& buf, uint32_t n, uint32_t from,
+                                         uint32_t end) {
+    if (n >= kLongRun) return FindLongRun(buf, n, from, end);
+    while (from < end) {
+      const uint32_t first_free = NextPage(buf, from, end, false);
+      if (end - first_free < n) return std::nullopt;
+      const uint32_t next_allocated = NextPage(buf, first_free, end, true);
+      if (next_allocated - first_free >= n) return first_free;
+      from = next_allocated;
+    }
+    return std::nullopt;
+  }
+
+  // Any run of kLongRun or more free pages covers a whole free word, so for
+  // such requests only words equal to zero are worth a look.  This keeps a
+  // failing search cheap in a pool whose free pages are scattered one or two
+  // per word, where stepping from run to run would still visit every one.
+  static constexpr uint32_t kLongRun = 127;
+
+  static std::optional<uint32_t> FindLongRun(const BufferState& buf, uint32_t n, uint32_t from,
+                                             uint32_t end) {
+    const size_t first = from / 64;
+    const size_t last = (static_cast<size_t>(end) - 1) / 64;
+    for (size_t word = first; word <= last; ++word) {
+      if (buf.words[word] != 0) continue;
+      // This is the run's first whole free word, so the word before it (if it
+      // is in range) holds an allocated page; its free top bits join the run.
+      uint64_t run_start = word * 64;
+      if (word > first) run_start -= __builtin_clzll(buf.words[word - 1]);
+      run_start = std::max<uint64_t>(run_start, from);
+      const uint32_t run_end = NextPage(buf, static_cast<uint32_t>(word * 64), end, true);
+      if (run_end - run_start >= n) return static_cast<uint32_t>(run_start);
+      word = run_end / 64;
+    }
+    return std::nullopt;
+  }
+
   // Find a contiguous run of `n` free pages in `buf`.  Returns the starting
-  // page_index on success, nullopt if no such run exists.  O(total_pages).
+  // page_index on success, nullopt if no such run exists.  O(total_pages / 64).
   // Next-fit: start where the last search stopped and wrap once.  A run may
   // straddle the wrap point only if it starts before it, so the second pass
   // scans [0, cursor + n) -- the overlap is what keeps this exhaustive.
   static std::optional<uint32_t> FindContinuousFreeRun(const BufferState& buf, uint32_t n) {
     if (n == 0 || n > buf.total_pages) return std::nullopt;
     const uint32_t start = buf.cursor < buf.total_pages ? buf.cursor : 0;
-    uint32_t run = 0;
-    for (uint32_t i = start; i < buf.total_pages; ++i) {
-      if (!buf.bitmap[i]) {
-        if (++run == n) return i + 1 - n;
-      } else {
-        run = 0;
-      }
-    }
-    run = 0;
+    if (auto run = FindRun(buf, n, start, buf.total_pages)) return run;
     const uint32_t wrap_end = std::min<uint64_t>(static_cast<uint64_t>(start) + n,
                                                  static_cast<uint64_t>(buf.total_pages));
-    for (uint32_t i = 0; i < wrap_end; ++i) {
-      if (!buf.bitmap[i]) {
-        if (++run == n) return i + 1 - n;
-      } else {
-        run = 0;
+    return FindRun(buf, n, 0, wrap_end);
+  }
+
+  // Append the free pages of [from, end) to `out`, low to high, until it holds `n`.
+  static void CollectFree(const BufferState& buf, uint32_t from, uint32_t end, uint32_t n,
+                          std::vector<uint32_t>* out) {
+    if (from >= end) return;
+    const size_t last = (static_cast<size_t>(end) - 1) / 64;
+    for (size_t word = from / 64; word <= last && out->size() < n; ++word) {
+      uint64_t free_bits = ~buf.words[word];
+      if (word == from / 64) free_bits &= ~uint64_t{0} << (from % 64);
+      for (; free_bits != 0 && out->size() < n; free_bits &= free_bits - 1) {
+        const uint64_t page = word * 64 + __builtin_ctzll(free_bits);
+        if (page >= end) return;
+        out->push_back(static_cast<uint32_t>(page));
       }
     }
-    return std::nullopt;
   }
 
   // Collect the first `n` free page indices in `buf` (scanning low to high).
@@ -277,12 +349,8 @@ class PageBitmapAllocator : public PagePool {
     // argument: the wrap pass covers [0, start), so together they visit every
     // page.  free_count >= n is the caller's guarantee that this succeeds.
     const uint32_t start = buf.cursor < buf.total_pages ? buf.cursor : 0;
-    for (uint32_t i = start; i < buf.total_pages && result.size() < n; ++i) {
-      if (!buf.bitmap[i]) result.push_back(i);
-    }
-    for (uint32_t i = 0; i < start && result.size() < n; ++i) {
-      if (!buf.bitmap[i]) result.push_back(i);
-    }
+    CollectFree(buf, start, buf.total_pages, n, &result);
+    CollectFree(buf, 0, start, n, &result);
     return result;
   }
 
