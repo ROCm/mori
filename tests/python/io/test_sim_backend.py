@@ -71,6 +71,7 @@ def sim_env(monkeypatch):
     ):
         monkeypatch.delenv(k, raising=False)
     for backend, profile in PROFILES.items():
+        monkeypatch.delenv(f"MORI_IO_SIM_{backend}_POST_ON_HOST", raising=False)
         for k, v in profile.items():
             monkeypatch.setenv(f"MORI_IO_SIM_{backend}_{k}", str(v))
     return monkeypatch
@@ -330,6 +331,7 @@ def test_catalog_entry_sets_timing(sim_env, tmp_path):
         "latency_us": 50,
         "per_segment_ns": 1000,
         "per_op_us": 30,
+        "post_on_host": 0,
     }
     a, b = make_engine("pf"), make_engine("dc")
     connect(a, b)
@@ -338,6 +340,43 @@ def test_catalog_entry_sets_timing(sim_env, tmp_path):
     rc, ms = timed_wait(a, [st], t0)
     assert rc == StatusCode.SUCCESS
     assert_close_ms(ms, model_ms(64 * MiB, 20, 50, 64, 1000, 30))
+
+
+def test_post_on_host_overlaps_posting_with_the_wire(sim_env, tmp_path):
+    # 16 writes of 16 MiB: 13.4 ms on the wire, 16 x 500 us = 8 ms of posting.
+    n, size, bw, lat, op = 16, 16 * MiB, 20, 50, 500
+    use_catalog(
+        sim_env,
+        tmp_path,
+        entry("rdma", "testnic", bw, lat=lat, op=op, extra="  post_on_host: 1\n"),
+    )
+    sim_env.setenv("MORI_IO_SIM_NIC", "testnic")
+    assert io_sim_profile(BackendType.RDMA)["post_on_host"] == 1
+    a, b = make_engine("pf"), make_engine("dc")
+    connect(a, b)
+    src, dst = gpu_mem(a, 1 << 30), gpu_mem(b, 1 << 30)
+    t0 = time.perf_counter()
+    sts = [write(a, src, dst, [size])[1] for _ in range(n)]
+    post_ms = (time.perf_counter() - t0) * 1e3
+    rc, ms = timed_wait(a, sts, t0)
+    assert rc == StatusCode.SUCCESS
+    # The caller pays the posting; the link carries the bytes meanwhile.
+    assert_close_ms(post_ms, n * op / 1e3)
+    assert_close_ms(ms, model_ms(n * size, bw, lat))
+
+    # The variable turns it off: posting holds the link again and the caller does not wait.
+    sim_env.setenv("MORI_IO_SIM_RDMA_POST_ON_HOST", "0")
+    assert io_sim_profile(BackendType.RDMA)["post_on_host"] == 0
+    a, b = make_engine("pf"), make_engine("dc")
+    connect(a, b)
+    src, dst = gpu_mem(a, 1 << 30), gpu_mem(b, 1 << 30)
+    t0 = time.perf_counter()
+    sts = [write(a, src, dst, [size])[1] for _ in range(n)]
+    post_ms = (time.perf_counter() - t0) * 1e3
+    rc, ms = timed_wait(a, sts, t0)
+    assert rc == StatusCode.SUCCESS
+    assert post_ms < 2
+    assert_close_ms(ms, model_ms(n * size, bw, lat, n, 0, n * op))
 
 
 def test_catalogs_layer_and_variables_win(sim_env, tmp_path):

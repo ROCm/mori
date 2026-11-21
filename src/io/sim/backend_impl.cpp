@@ -66,6 +66,18 @@ std::optional<double> ParsePositiveDouble(const char* raw) {
   return v;
 }
 
+std::optional<bool> ParseBool(const char* raw) {
+  using mori::env::detail::EqualsIgnoreCase;
+  if (EqualsIgnoreCase(raw, "1") || EqualsIgnoreCase(raw, "true") || EqualsIgnoreCase(raw, "on")) {
+    return true;
+  }
+  if (EqualsIgnoreCase(raw, "0") || EqualsIgnoreCase(raw, "false") ||
+      EqualsIgnoreCase(raw, "off")) {
+    return false;
+  }
+  return std::nullopt;
+}
+
 std::optional<BackendType> ParseSimBackendType(const char* raw) {
   using mori::env::detail::EqualsIgnoreCase;
   if (EqualsIgnoreCase(raw, "rdma")) return BackendType::RDMA;
@@ -197,7 +209,7 @@ namespace {
 
 const std::set<std::string> kCatalogKeys = {"backend", "gpu", "nic", "bandwidth_gbps", "latency_us",
                                             "per_segment_ns", "per_op_us", "qp_per_transfer",
-                                            "num_worker_threads",
+                                            "num_worker_threads", "post_on_host",
                                             // Free text.
                                             "hardware", "measured", "notes"};
 
@@ -205,6 +217,7 @@ struct ProfileEntry {
   double gbps, latencyUs, segmentNs, opUs;
   int qpPerTransfer, numWorkerThreads;
   std::string source;
+  bool postOnHost{false};
 };
 
 // XGMI timing belongs to a GPU, RDMA and TCP timing to a NIC.
@@ -245,6 +258,7 @@ void AddToCatalog(Catalog& catalog, const std::vector<yaml::FlatMap>& entries,
                    static_cast<int>(yaml::GetInt(e, "qp_per_transfer", -1, where)),
                    static_cast<int>(yaml::GetInt(e, "num_worker_threads", -1, where)),
                    source};
+    p.postOnHost = yaml::GetInt(e, "post_on_host", 0, where) != 0;
     if (!(p.gbps > 0) || p.latencyUs < 0 || p.segmentNs < 0 || p.opUs < 0) {
       throw std::runtime_error(where + ": bandwidth must be positive and costs non-negative");
     }
@@ -320,11 +334,13 @@ LinkProfile LoadLinkProfile(BackendType type) {
   env::Override((prefix + "_LATENCY_US").c_str(), p.latencyUs, ParseNonNegativeDouble);
   env::Override((prefix + "_SEGMENT_NS").c_str(), p.segmentNs, ParseNonNegativeDouble);
   env::Override((prefix + "_OP_US").c_str(), p.opUs, ParseNonNegativeDouble);
+  env::Override((prefix + "_POST_ON_HOST").c_str(), p.postOnHost, ParseBool);
 
   out.bytesPerNs = p.gbps;
   out.latency = ToNs(p.latencyUs * 1000.0);
   out.perSegment = ToNs(p.segmentNs);
   out.perOp = ToNs(p.opUs * 1000.0);
+  out.postOnHost = p.postOnHost;
   out.measuredQpPerTransfer = p.qpPerTransfer;
   out.measuredNumWorkerThreads = p.numWorkerThreads;
   return out;
@@ -335,7 +351,8 @@ std::map<std::string, double> ProfileValues(BackendType type) {
   return {{"bw_gbps", p.bytesPerNs},
           {"latency_us", p.latency.count() / 1e3},
           {"per_segment_ns", static_cast<double>(p.perSegment.count())},
-          {"per_op_us", p.perOp.count() / 1e3}};
+          {"per_op_us", p.perOp.count() / 1e3},
+          {"post_on_host", p.postOnHost ? 1.0 : 0.0}};
 }
 
 }  // namespace sim
@@ -387,10 +404,11 @@ SimBackend::SimBackend(BackendType type, const EngineDesc& self, const IOEngineC
 
   MORI_IO_INFO(
       "SimBackend({}) created for engine {}: profile {}, bw {} GB/s latency {} ns segment {} ns "
-      "op {} ns time_scale {} notification {} port {}",
+      "op {} ns post_on_host {} time_scale {} notification {} port {}",
       sim::BackendTypeName(type_), self_.key, profile_.source, profile_.bytesPerNs,
-      profile_.latency.count(), profile_.perSegment.count(), profile_.perOp.count(), timeScale_,
-      enableNotification_, ctx_ ? static_cast<int>(ctx_->GetPort()) : -1);
+      profile_.latency.count(), profile_.perSegment.count(), profile_.perOp.count(),
+      profile_.postOnHost, timeScale_, enableNotification_,
+      ctx_ ? static_cast<int>(ctx_->GetPort()) : -1);
   if (!profile_.calibrated) {
     MORI_IO_WARN("SimBackend({}) uses {}", sim::BackendTypeName(type_), profile_.source);
   }
@@ -618,6 +636,34 @@ void SimBackend::Submit(const MemoryDesc& local, const SizeVec& localOffsets,
 
   status->SetCode(StatusCode::IN_PROGRESS);
   auto deadline = ReserveLink(isRead, bytes, sizes.size());
+  if (profile_.postOnHost) {
+    // Posting the work requests is the caller's time on hardware, spent inside batch_write, so it
+    // adds to the caller's own time between calls. Each calling thread accumulates the modeled
+    // post time as a debt and sleeps it off (GIL released by the binding) once it exceeds
+    // kPostSleepMin: exact in aggregate, few syscalls, no spinning that would slow the host's
+    // own threads. The link reserved above carries the bytes meanwhile.
+    constexpr auto kPostSleepMin = std::chrono::microseconds(200);
+    thread_local std::chrono::nanoseconds postDebt{0};
+    thread_local bool slackSet = false;
+    if (!slackSet) {
+      prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+      slackSet = true;
+    }
+    postDebt += ToNs(
+        (static_cast<double>(sizes.size()) * profile_.perSegment.count() + profile_.perOp.count()) /
+        timeScale_);
+    if (postDebt > kPostSleepMin) {
+      auto t0 = std::chrono::steady_clock::now();
+      std::this_thread::sleep_for(postDebt);
+      // Oversleep is credited to the next calls, at most kPostSleepMin.
+      postDebt = std::max(postDebt - std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - t0),
+                          -std::chrono::nanoseconds(kPostSleepMin));
+    }
+    deadline = std::max(deadline, std::chrono::steady_clock::now() +
+                                      std::max(postDebt, std::chrono::nanoseconds(0)) +
+                                      ToNs(profile_.latency.count() / timeScale_));
+  }
   {
     std::lock_guard<std::mutex> lock(timerMu_);
     timerQ_.push(Completion{deadline, timerSeq_++, status, id, std::move(peer)});
@@ -630,10 +676,12 @@ void SimBackend::Submit(const MemoryDesc& local, const SizeVec& localOffsets,
 
 std::chrono::steady_clock::time_point SimBackend::ReserveLink(bool isRead, size_t bytes,
                                                               size_t segments) {
-  auto busy =
-      ToNs((static_cast<double>(bytes) / profile_.bytesPerNs +
-            static_cast<double>(segments) * profile_.perSegment.count() + profile_.perOp.count()) /
-           timeScale_);
+  // postOnHost: the per-segment / per-op costs are paid by the caller (Submit), not the link.
+  const double postNs =
+      profile_.postOnHost
+          ? 0.0
+          : static_cast<double>(segments) * profile_.perSegment.count() + profile_.perOp.count();
+  auto busy = ToNs((static_cast<double>(bytes) / profile_.bytesPerNs + postNs) / timeScale_);
   auto latency = ToNs(profile_.latency.count() / timeScale_);
   std::lock_guard<std::mutex> lock(linkMu_);
   auto& freeAt = isRead ? rxFreeAt_ : txFreeAt_;
