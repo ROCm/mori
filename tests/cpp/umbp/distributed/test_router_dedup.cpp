@@ -182,6 +182,50 @@ TEST(RouterDedup, BatchRoutePutDedupDoesNotConsumeCapacity) {
   EXPECT_EQ(results[1]->tier, TierType::DRAM);
 }
 
+// Ranks putting one key before its ADD lands must all get the first route, or
+// random routing leaves a copy on each node.
+TEST(RouterDedup, InflightKeyKeepsItsFirstRoute) {
+  const auto now = std::chrono::system_clock::now();
+  InMemoryMasterMetadataStore store;
+  Router router(store, nullptr,
+                std::make_unique<ConfigurableRoutePutStrategy>(
+                    ConfigurableRoutePutStrategy::SelectAlgo::kRandom,
+                    ConfigurableRoutePutStrategy::NodeAffinity::kNone, /*rng_seed=*/7));
+  for (const std::string node : {"node-a", "node-b"}) {
+    ASSERT_TRUE(store.RegisterClient(MakeRegistration(node, node + ":1", node + ":peer"), now,
+                                     std::chrono::seconds{30}));
+  }
+  std::vector<std::string> keys;
+  for (int i = 0; i < 64; ++i) keys.push_back("key-" + std::to_string(i));
+  const std::vector<uint64_t> sizes(keys.size(), 4096);
+
+  auto first = router.BatchRoutePut(keys, "requester", sizes, {});
+  std::unordered_set<std::string> used;
+  for (const auto& r : first) used.insert(r->node_id);
+  EXPECT_EQ(used.size(), 2u);  // random spreads the keys, so a re-draw would move some
+
+  auto again = router.BatchRoutePut(keys, "requester", sizes, {});
+  for (size_t i = 0; i < keys.size(); ++i) EXPECT_EQ(again[i]->node_id, first[i]->node_id);
+}
+
+// A writer that failed on the remembered node excludes it; the key moves and
+// later puts follow the new route.
+TEST(RouterDedup, ExcludedInflightRouteIsReplaced) {
+  const auto now = std::chrono::system_clock::now();
+  InMemoryMasterMetadataStore store;
+  Router router(store);
+  for (const std::string node : {"node-a", "node-b"}) {
+    ASSERT_TRUE(store.RegisterClient(MakeRegistration(node, node + ":1", node + ":peer"), now,
+                                     std::chrono::seconds{30}));
+  }
+  auto first = router.RoutePut("key-X", "requester", 4096, {});
+  ASSERT_TRUE(first.has_value());
+  auto moved = router.RoutePut("key-X", "requester", 4096, {first->node_id});
+  ASSERT_TRUE(moved.has_value());
+  EXPECT_NE(moved->node_id, first->node_id);
+  EXPECT_EQ(router.RoutePut("key-X", "requester", 4096, {})->node_id, moved->node_id);
+}
+
 // Projected capacity is batch-local: BatchRoutePut must not write the
 // deductions back to the store's real client capacity.
 TEST(RouterDedup, BatchRoutePutDoesNotWriteBackProjectedCapacity) {
