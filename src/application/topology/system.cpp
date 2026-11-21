@@ -178,28 +178,51 @@ std::vector<std::string> TopoSystem::MatchAllGpusAndNics() {
   int count;
   HIP_RUNTIME_CHECK(hipGetDeviceCount(&count));
 
-  std::vector<std::string> matches;
-  std::unordered_set<std::string> matched;
+  std::vector<std::vector<Candidate>> perGpu(count);
+  std::unordered_set<std::string> nicNames;
+  for (int i = 0; i < count; i++) {
+    perGpu[i] = CollectAndSortCandidates(this, i);
+    for (auto& cand : perGpu[i]) nicNames.insert(cand.nic->name);
+  }
+
+  std::vector<std::string> matches(count);
+  if (nicNames.empty()) return matches;
+
+  // Each NIC serves at most ceil(GPUs / NICs) GPUs. Pairs are assigned closest-first across all
+  // GPUs, so a NIC goes to the GPUs under its own PCIe switch before any farther GPU can take it.
+  const size_t cap = (count + nicNames.size() - 1) / nicNames.size();
+
+  struct Pair {
+    int gpu;
+    size_t rank;
+    const Candidate* cand;
+  };
+  std::vector<Pair> pairs;
+  for (int i = 0; i < count; i++) {
+    for (size_t r = 0; r < perGpu[i].size(); r++) pairs.push_back({i, r, &perGpu[i][r]});
+  }
+  std::stable_sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) {
+    if (a.cand->nic->totalGbps != b.cand->nic->totalGbps)
+      return a.cand->nic->totalGbps > b.cand->nic->totalGbps;
+    if (a.cand->path->Hops() != b.cand->path->Hops())
+      return a.cand->path->Hops() < b.cand->path->Hops();
+    if (a.rank != b.rank) return a.rank < b.rank;
+    return a.gpu < b.gpu;
+  });
+
+  std::unordered_map<std::string, size_t> load;
+  std::vector<bool> assigned(count, false);
+  for (const auto& p : pairs) {
+    if (assigned[p.gpu]) continue;
+    const std::string& name = p.cand->nic->name;
+    if (load[name] >= cap) continue;
+    matches[p.gpu] = name;
+    load[name]++;
+    assigned[p.gpu] = true;
+  }
 
   for (int i = 0; i < count; i++) {
-    std::vector<Candidate> candidates = CollectAndSortCandidates(this, i);
-    if (candidates.empty()) {
-      matches.push_back("");
-      continue;
-    }
-
-    bool found = false;
-    for (auto& cand : candidates) {
-      std::string name = cand.nic->name;
-      if (matched.find(name) == matched.end()) {
-        matches.push_back(name);
-        matched.insert(name);
-        found = true;
-        break;
-      }
-    }
-
-    if (!found) matches.push_back(candidates[i % candidates.size()].nic->name);
+    if (!assigned[i] && !perGpu[i].empty()) matches[i] = perGpu[i][0].nic->name;
   }
 
   return matches;
