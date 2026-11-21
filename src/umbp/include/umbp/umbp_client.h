@@ -149,6 +149,20 @@ class IUMBPClient {
   /// `master` mode), or from an older server.
   virtual size_t BatchTouch(const std::vector<std::string>& /*keys*/) { return 0; }
 
+  /// Associate ``keys`` as an eviction group identified by ``group_id``.
+  ///
+  /// Once linked, evicting any member key from the store triggers eviction of
+  /// all other members in the same group that are still present.  Calling this
+  /// more than once with the same ``group_id`` extends the group (idempotent
+  /// for keys already in it).  A key may belong to at most one group; calling
+  /// with a different ``group_id`` moves it.
+  ///
+  /// Returns false only on a hard transport error; a no-op on an older server.
+  virtual bool LinkGroup(const std::string& /*group_id*/,
+                         const std::vector<std::string>& /*keys*/) {
+    return true;
+  }
+
   // ---- Lifecycle ----
 
   /// Remove all stored entries.  Returns true when the empty state is

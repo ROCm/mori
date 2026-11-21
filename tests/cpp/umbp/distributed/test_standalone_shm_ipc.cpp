@@ -29,6 +29,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -1188,6 +1189,120 @@ TEST(StandaloneShmIpcTest, BatchTouchCountsTheKeysTheServerHolds) {
   server_thread.join();
   unlink(grpc_path.c_str());
   unlink(fd_path.c_str());
+}
+
+// Fills a small server until its watermark eviction stops in the middle of
+// `group`, four keys stored one after another, and reports which of them the
+// server still holds. `link` names them a group through the client first.
+//
+// 16 pages, evicting from 12 or 13 down to 8: the coldest four or five keys
+// are two older ones and the group's first two or three, so a server that
+// evicts key by key keeps the group's last.
+void FillUntilEvictionReachesTheGroup(const std::string& tag, const std::vector<std::string>& group,
+                                      bool link, std::vector<bool>* group_held) {
+  const std::string address =
+      "unix:///tmp/umbp_standalone_group_" + tag + "_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.dram.high_watermark = 0.75;
+  server_cfg.dram.low_watermark = 0.5;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+  auto client = CreateUMBPClient(server_cfg);
+
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  opts.prefault = false;
+  HostBufferHandle handle = allocator.Alloc(4096, opts);
+  ASSERT_TRUE(handle.valid());
+  ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(handle.ptr), handle.mapped_size));
+  std::memset(handle.ptr, 0x5a, 64);
+  const auto put = [&](const std::string& key) {
+    return client->Put(key, reinterpret_cast<uintptr_t>(handle.ptr), 32);
+  };
+
+  ASSERT_TRUE(put("older-0"));
+  ASSERT_TRUE(put("older-1"));
+  for (const auto& key : group) ASSERT_TRUE(put(key));
+  if (link) {
+    EXPECT_TRUE(client->LinkGroup("group", group));
+    EXPECT_TRUE(client->LinkGroup("group", group)) << "linking a second time";
+    EXPECT_TRUE(client->LinkGroup("empty", {}));
+  }
+  // One more than reaches the high watermark, so the round has started
+  // whichever side of "at" or "above" it counts from.
+  std::vector<std::string> fillers;
+  for (int i = 0; i < 7; ++i) fillers.push_back("filler-" + std::to_string(i));
+  for (const auto& key : fillers) ASSERT_TRUE(put(key));
+
+  // A lookup renews what it finds, so the wait asks for every key in the order
+  // they were stored: that leaves the coldest key the coldest, whether the
+  // round runs before the lookup or after it.
+  std::vector<std::string> stored = {"older-0", "older-1"};
+  stored.insert(stored.end(), group.begin(), group.end());
+  stored.insert(stored.end(), fillers.begin(), fillers.end());
+  const auto evicted_any = [&] {
+    const auto held = client->BatchExists(stored);
+    return std::find(held.begin(), held.end(), false) != held.end();
+  };
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!evicted_any() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  EXPECT_EQ(client->BatchExists({"older-0", "older-1"}), std::vector<bool>(2, false))
+      << "the server did not evict its oldest keys";
+  *group_held = client->BatchExists(group);
+  EXPECT_EQ(client->BatchExists(fillers), std::vector<bool>(fillers.size(), true));
+
+  client->DeregisterMemory(reinterpret_cast<uintptr_t>(handle.ptr));
+  client->Close();
+  allocator.Free(handle);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
+TEST(StandaloneShmIpcTest, AGroupLinkedThroughTheClientIsEvictedWhole) {
+  std::vector<bool> held;
+  ASSERT_NO_FATAL_FAILURE(FillUntilEvictionReachesTheGroup(
+      "linked", {"member-0", "member-1", "member-2", "member-3"}, /*link=*/true, &held));
+  EXPECT_EQ(held, std::vector<bool>(4, false));
+}
+
+// What a server does without a group, so the test above cannot pass by the
+// watermark happening to stop on the group's edge.
+TEST(StandaloneShmIpcTest, UnlinkedKeysAreEvictedOneByOne) {
+  std::vector<bool> held;
+  ASSERT_NO_FATAL_FAILURE(FillUntilEvictionReachesTheGroup(
+      "unlinked", {"member-0", "member-1", "member-2", "member-3"}, /*link=*/false, &held));
+  EXPECT_FALSE(held[0]);
+  EXPECT_TRUE(held[3]) << "the watermark stopped past the group: the linked test proves nothing";
+}
+
+// The names an engine's TP ranks store one chunk under are a group without
+// being linked.
+TEST(StandaloneShmIpcTest, RankCopiesOfAChunkAreEvictedWholeWithoutALink) {
+  std::vector<bool> held;
+  ASSERT_NO_FATAL_FAILURE(FillUntilEvictionReachesTheGroup(
+      "ranks", {"ns/w0of4/digest", "ns/w1of4/digest", "ns/w2of4/digest", "ns/w3of4/digest"},
+      /*link=*/false, &held));
+  EXPECT_EQ(held, std::vector<bool>(4, false));
 }
 
 }  // namespace

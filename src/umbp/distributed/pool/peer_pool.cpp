@@ -52,6 +52,56 @@ std::chrono::milliseconds EvictDemotionRetryBudget() {
 // Pause before a lone retry, so waiting out pressure does not spin the worker.
 constexpr std::chrono::milliseconds kEvictRetryIdlePause{20};
 
+// The most rank copies one chunk's name is expanded into.  A key is client
+// input and its world is a loop bound below, so it is capped well above any
+// TP x PP an engine runs.
+constexpr int kMaxPatternGroupWorld = 1024;
+
+// `text` as the number a client writes into a rank segment: decimal digits
+// only, with no sign, space or leading zero, and at most `limit`.  -1 for
+// anything else, so that only the spelling the siblings are rebuilt in below
+// names a group.
+int ParseRankNumber(const std::string& text, int limit) {
+  if (text.empty() || (text.size() > 1 && text[0] == '0')) return -1;
+  int value = 0;
+  for (const char c : text) {
+    if (c < '0' || c > '9') return -1;
+    value = value * 10 + (c - '0');
+    if (value > limit) return -1;
+  }
+  return value;
+}
+
+// Keys written by ATOM's umbp_store follow the convention
+//   {namespace}/w{rank}of{world}/{digest}
+// When any rank's copy is evicted, sibling copies are collected here so the
+// caller can cascade-evict them without an explicit LinkGroup registration.
+bool FindPatternSiblings(const std::string& key, std::unordered_set<std::string>* cascade_out) {
+  auto last_slash = key.rfind('/');
+  if (last_slash == std::string::npos || last_slash == 0) return false;
+  const std::string digest = key.substr(last_slash + 1);
+
+  auto second_slash = key.rfind('/', last_slash - 1);
+  if (second_slash == std::string::npos) return false;
+  const std::string rank_world = key.substr(second_slash + 1, last_slash - second_slash - 1);
+
+  if (rank_world.empty() || rank_world[0] != 'w') return false;
+  auto of_pos = rank_world.find("of");
+  if (of_pos == std::string::npos || of_pos < 2) return false;
+
+  const int rank = ParseRankNumber(rank_world.substr(1, of_pos - 1), kMaxPatternGroupWorld);
+  const int world = ParseRankNumber(rank_world.substr(of_pos + 2), kMaxPatternGroupWorld);
+  if (world <= 1 || rank < 0 || rank >= world) return false;
+
+  const std::string prefix = key.substr(0, second_slash);
+  for (int r = 0; r < world; ++r) {
+    if (r == rank) continue;
+    cascade_out->insert(prefix + "/w" + std::to_string(r) + "of" + std::to_string(world) + "/" +
+                        digest);
+  }
+  return true;
+}
+
 // One tier over one backend that never offloads or promotes (pure SSD): no
 // transition to plan, so a resolve can take the policy-free direct path.
 bool TrivialTierGraph(const LogicalTierGraph& graph) {
@@ -1329,10 +1379,74 @@ std::vector<PoolEvictResult> PeerPool::Evict(const std::vector<PoolEvictRequest>
   operation_lock.lock();
 
   std::unordered_set<std::string> repaired;
+  std::unordered_set<std::string> cascade_evict;
   for (const auto& [index, backend_id] : drops) {
-    if (repaired.insert(requests[index].key).second) RepairAfterDropLocked(requests[index].key);
+    if (repaired.insert(requests[index].key).second) {
+      RepairAfterDropLocked(requests[index].key);
+      // If the key is now fully gone, dissolve its eviction group.  Only for a
+      // copy this call freed: a discard names every backend for a key that is
+      // not stored too, and rank copies cascading from those would name each
+      // other without end.
+      if (out[index].bytes_freed > 0 && placements_.count(requests[index].key) == 0) {
+        ForgetGroupMemberLocked(requests[index].key, &cascade_evict);
+        // Also cascade sibling copies by key-name pattern (umbp_store convention).
+        FindPatternSiblings(requests[index].key, &cascade_evict);
+      }
+    }
+  }
+  operation_lock.unlock();
+  lifecycle_lock.unlock();
+
+  // Cascade: evict all co-members of dissolved groups.  Each cascade call
+  // re-enters Evict, which is safe because we released both locks above.
+  if (!cascade_evict.empty()) {
+    std::vector<std::string> cascade_keys(cascade_evict.begin(), cascade_evict.end());
+    Evict(cascade_keys, mode);
   }
   return out;
+}
+
+// ---- Group eviction ----
+
+void PeerPool::LinkGroup(const std::string& group_id, const std::vector<std::string>& keys) {
+  std::unique_lock<std::mutex> lock(operation_mutex_);
+  for (const auto& key : keys) {
+    auto it = key_to_group_.find(key);
+    if (it != key_to_group_.end()) {
+      if (it->second == group_id) continue;  // already in this group
+      // Remove from old group.
+      auto git = evict_groups_.find(it->second);
+      if (git != evict_groups_.end()) {
+        git->second.erase(key);
+        if (git->second.empty()) evict_groups_.erase(git);
+      }
+    }
+    key_to_group_[key] = group_id;
+    evict_groups_[group_id].insert(key);
+  }
+}
+
+// Called under operation_mutex_.  Removes ``key`` from its group and, if the
+// group had other members, collects them into ``cascade_out`` for eviction and
+// dissolves the group so cascaded evictions do not re-trigger.
+void PeerPool::ForgetGroupMemberLocked(const std::string& key,
+                                       std::unordered_set<std::string>* cascade_out) {
+  auto kit = key_to_group_.find(key);
+  if (kit == key_to_group_.end()) return;
+  const std::string gid = kit->second;
+  key_to_group_.erase(kit);
+
+  auto git = evict_groups_.find(gid);
+  if (git == evict_groups_.end()) return;
+  git->second.erase(key);
+
+  if (cascade_out) {
+    for (const auto& member : git->second) {
+      cascade_out->insert(member);
+      key_to_group_.erase(member);  // prevent re-cascade when member is evicted
+    }
+  }
+  evict_groups_.erase(git);  // group dissolved
 }
 
 // ---- Local watermark eviction: picks when and what, then calls Evict(). ----
