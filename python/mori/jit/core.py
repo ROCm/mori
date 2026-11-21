@@ -25,6 +25,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import functools
 import logging
 import os
@@ -64,36 +66,95 @@ __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 class FileBaton:
     """File-based lock for multi-process build safety.
 
+    The lock is an flock(2) on *lock_path*, so the kernel releases it when the
+    holder exits, including a build killed mid-compile. The lock file is left
+    in place: removing it would let a process that opened the old file and one
+    that creates a new file both hold the lock.
+
     When *wait_for* is provided, waiters that see the target file appear
     will return immediately **without** acquiring the lock, setting
     ``self.skipped = True``.  The caller should check this flag and skip
     the build if it is set.
     """
 
+    _WAIT_NOTICE_S = 30.0
+
     def __init__(self, lock_path: str | Path, wait_for: str | Path | None = None):
         self._lock_path = str(lock_path)
         self._wait_for = str(wait_for) if wait_for else None
+        self._fd: int | None = None
         self.skipped = False
 
+    def _open(self) -> int:
+        # NFS emulates flock with byte-range locks, which need a writable fd, so
+        # the file is made writable for every user of a shared cache.
+        try:
+            fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        except PermissionError:
+            return os.open(self._lock_path, os.O_RDONLY)
+        try:
+            os.fchmod(fd, 0o666)
+        except OSError:
+            pass  # not the owner
+        return fd
+
     def __enter__(self):
-        while True:
-            try:
-                fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.close(fd)
-                return self
-            except FileExistsError:
+        fd = self._open()
+        start = time.monotonic()
+        noticed = False
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self._fd = fd
+                    return self
+                except BlockingIOError:
+                    pass
+                except OSError as e:
+                    # e.g. EBADF: NFS cannot lock the read-only fallback descriptor.
+                    raise OSError(
+                        e.errno,
+                        f"cannot lock {self._lock_path} ({e.strerror}); make it "
+                        "writable by this user or remove it",
+                    ) from e
                 if self._wait_for and os.path.isfile(self._wait_for):
+                    os.close(fd)
                     self.skipped = True
                     return self
+                if not noticed and time.monotonic() - start > self._WAIT_NOTICE_S:
+                    print(
+                        f"[mori-jit] Waiting for another process to finish building "
+                        f"(lock {self._lock_path}) ..."
+                    )
+                    noticed = True
                 time.sleep(0.5)
+        except BaseException:
+            os.close(fd)
+            raise
 
     def __exit__(self, *exc):
-        if self.skipped:
+        if self._fd is None:
             return
         try:
-            os.remove(self._lock_path)
-        except OSError:
-            pass
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
+
+
+@contextlib.contextmanager
+def _atomic_output(path: Path):
+    """Yield a temporary path beside *path*, moved onto *path* only on success.
+
+    Waiters and later processes use *path* as soon as it exists, so a build
+    killed mid-write must not leave a partial file under that name.
+    """
+    tmp = path.with_name(f".{path.stem}.{os.getpid()}.tmp{path.suffix}")
+    try:
+        yield tmp
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _hipcc_device_bc(
@@ -433,7 +494,8 @@ def _build_bitcode(
         output.parent.mkdir(parents=True, exist_ok=True)
         import shutil
 
-        shutil.copy2(stripped_bc, output)
+        with _atomic_output(output) as tmp_out:
+            shutil.copy2(stripped_bc, tmp_out)
 
     print(f"[mori-jit] Cached: {output}")
 
@@ -479,9 +541,9 @@ def _hipcc_genco(
 
     for d in include_dirs:
         cmd.extend(["-I", str(d)])
-    cmd.extend([str(source), "-o", str(output)])
-
-    subprocess.check_call(cmd, stderr=subprocess.STDOUT)
+    with _atomic_output(output) as tmp_out:
+        cmd.extend([str(source), "-o", str(tmp_out)])
+        subprocess.check_call(cmd, stderr=subprocess.STDOUT)
 
 
 _PARALLEL_KERNEL_GROUPS: dict[str, list[str]] = {
