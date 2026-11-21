@@ -602,6 +602,38 @@ __device__ inline static uint32_t warpAggregateBnxtPsn(core::WorkQueueHandle* wq
 // to a postIdx snapshot without reading marks: by contract every post below the
 // snapshot has returned, and only CallerOrdered handles touch such a QP.
 
+// Wait until this wave's stores have completed: enough for coherent targets
+// (agent-scope atomics, the uncached SQ rings), with no L2 write-back.
+__device__ inline static void waitStoresComplete() {
+#if defined(__GFX12__)
+  __asm__ volatile("s_wait_storecnt 0x0" ::: "memory");  // gfx12 has no s_waitcnt
+#else
+  __builtin_amdgcn_s_waitcnt(0);
+#endif
+}
+
+// The fences a post takes after its WQE stores. A PSD WQE ends with a system-scope release
+// store of its flags, which has already written back L2 and waited for this wave's stores, so
+// for PSD only the wait is left: a second write-back costs a round trip per post and orders
+// nothing more. The other providers' WQE stores are plain, so they keep the fence.
+template <core::ProviderType PrvdType>
+__device__ inline static void fenceAfterWqes() {
+  if constexpr (PrvdType == core::ProviderType::PSD) {
+    waitStoresComplete();
+  } else {
+    __threadfence();
+  }
+}
+
+template <core::ProviderType PrvdType>
+__device__ inline static void fenceAfterWqesSystem() {
+  if constexpr (PrvdType == core::ProviderType::PSD) {
+    waitStoresComplete();
+  } else {
+    __threadfence_system();
+  }
+}
+
 __device__ inline static uint64_t readyTag(uint32_t base, uint32_t count) {
   return (static_cast<uint64_t>(base) << 32) | count;
 }
@@ -618,13 +650,14 @@ __device__ inline static void retireReadyTag(core::WorkQueueHandle* wq, uint32_t
 // every post, which measured at ~2 us on MI308X.
 
 // Publish [base, base + count) as written. Called by one lane per post, after
-// every lane's WQE stores: the system fence makes them, and dbrVal, visible to
-// the NIC and to other waves before the tag is.
+// every lane's WQE stores: the fence makes them, and dbrVal, visible to the NIC
+// and to other waves before the tag is.
+template <core::ProviderType PrvdType>
 __device__ inline static void markWqesReady(core::WorkQueueHandle* wq, uint32_t base,
                                             uint32_t count, uint64_t dbrVal) {
   core::WqeReadyMark* mark = &wq->readyMarks[base & (wq->sqWqeNum - 1)];
   __hip_atomic_store(&mark->dbrVal, dbrVal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  __threadfence_system();
+  fenceAfterWqesSystem<PrvdType>();
   __hip_atomic_store(&mark->tag, readyTag(base, count), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
@@ -674,16 +707,6 @@ __device__ inline static bool tryLockDoorbell(core::WorkQueueHandle* wq) {
                                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-// Wait until this wave's stores have completed: enough for coherent targets
-// (agent-scope atomics, the uncached SQ rings), with no L2 write-back.
-__device__ inline static void waitStoresComplete() {
-#if defined(__GFX12__)
-  __asm__ volatile("s_wait_storecnt 0x0" ::: "memory");  // gfx12 has no s_waitcnt
-#else
-  __builtin_amdgcn_s_waitcnt(0);
-#endif
-}
-
 // The next holder must see the dbTouchIdx this one published. That store is a
 // coherent (agent-scope atomic) store, so waiting for it to complete is enough;
 // a release here would also write back L2.
@@ -703,7 +726,7 @@ __device__ inline static void ringAndPublish(core::RdmaEndpointDevice* ep, uint3
   core::WorkQueueHandle* wq = &ep->wqHandle;
   ringDoorbellWalk<PrvdType>(wq, to, dbrVal);
   // The doorbell must land before whoever sees the new dbTouchIdx rings a later one.
-  __threadfence_system();
+  fenceAfterWqesSystem<PrvdType>();
   __hip_atomic_fetch_add(&ep->cqHandle.needConsIdx, to - from, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_AGENT);
   __hip_atomic_store(&wq->dbTouchIdx, to, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -803,13 +826,13 @@ __device__ inline static void submitWqes(core::RdmaEndpointDevice* ep, uint32_t 
   bool rang = false;
   if constexpr (!DeferDoorbell) {
     if (__hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == base) {
-      retireReadyTag(wq, base);  // see "Doorbell coalescing"
-      __threadfence_system();    // our WQEs, before the doorbell
+      retireReadyTag(wq, base);          // see "Doorbell coalescing"
+      fenceAfterWqesSystem<PrvdType>();  // our WQEs, before the doorbell
       ringAndPublish<PrvdType>(ep, base, base + count, dbrVal);
       rang = true;
     }
   }
-  if (!rang) markWqesReady(wq, base, count, dbrVal);
+  if (!rang) markWqesReady<PrvdType>(wq, base, count, dbrVal);
   // Lanes of one wave can post to one QP (thread-scope signal): all of them ring
   // or mark before any spins. Convergent, so -O2 cannot fold this back into an
   // if/else that runs the spin while the ringing lane is masked off.
@@ -942,7 +965,7 @@ __device__ inline static void putImpl(
     uint64_t dbrVal =
         core::PostWrite<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn, localAddr,
                                   localKey, remoteAddr, remoteKey, bytes);
-    __threadfence();
+    fenceAfterWqes<PrvdType>();
     if (isLeader) {
       if (hasSignal) {
         dbrVal = core::PostAtomic<PrvdType, uint64_t>(
@@ -1009,7 +1032,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
     uint64_t dbrVal =
         core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
                                         &value, remoteAddr, remoteKey, sizeof(T));
-    __threadfence();
+    fenceAfterWqes<PrvdType>();
     if (isLeader) {
       if (hasSignal) {
         dbrVal = core::PostAtomic<PrvdType, uint64_t>(

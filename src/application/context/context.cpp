@@ -556,5 +556,20 @@ void Context::ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, i
   }
 }
 
+void Context::DestroyAdditionalEndpoints(const std::vector<RdmaEndpoint>& endpoints,
+                                         int numQpPerPe) {
+  for (size_t idx = 0; idx < endpoints.size(); idx++) {
+    const RdmaEndpoint& ep = endpoints[idx];
+    if (ep.handle.qpn == 0) continue;
+    const int peer = static_cast<int>(idx / numQpPerPe);
+    RdmaDeviceContext* ctx = proxyEnabled ? GetRailContext(peer) : rdmaDeviceContext.get();
+    if (ctx == nullptr || !ctx->SupportsEndpointDestroy()) continue;
+    if (!ctx->DestroyRdmaEndpointNoThrow(ep)) {
+      MORI_APP_WARN("DestroyAdditionalEndpoints: qpn {} for peer {} was not released",
+                    ep.handle.qpn, peer);
+    }
+  }
+}
+
 }  // namespace application
 }  // namespace mori

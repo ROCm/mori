@@ -151,10 +151,8 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
 }
 
 IonicCqContainer::~IonicCqContainer() {
-  int err;
-
-  err = ibv_destroy_cq(cq);
-  assert(err == 0);
+  int err = ibv_destroy_cq(cq);
+  if (err != 0) MORI_APP_ERROR("IONIC CQ destroy failed: {}", err);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -414,7 +412,7 @@ IonicQpContainer::~IonicQpContainer() {
   }
 
   err = ibv_destroy_qp(qp);
-  assert(err == 0);
+  if (err != 0) MORI_APP_ERROR("IONIC QP {} destroy failed: {}", qpn, err);
 }
 
 void* IonicQpContainer::GetSqAddress() { return reinterpret_cast<char*>(ionic_sq_buf); }
@@ -756,14 +754,27 @@ IonicDeviceContext::IonicDeviceContext(RdmaDevice* rdma_device, ibv_context* con
   create_parent_domain(context, in_pd);
 }
 
+bool IonicDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) noexcept {
+  auto qpIt = qpPool.find(ep.handle.qpn);
+  if (qpIt == qpPool.end()) return false;
+  delete qpIt->second;  // before the CQ it completes to
+  qpPool.erase(qpIt);
+  auto cqIt = cqPool.find(ep.handle.qpn);
+  if (cqIt != cqPool.end()) {
+    delete cqIt->second;
+    cqPool.erase(cqIt);
+  }
+  return true;
+}
+
 IonicDeviceContext::~IonicDeviceContext() {
   for (auto& it : qpPool) {
     delete it.second;
   }
   qpPool.clear();
 
-  for (auto& it : cqPool) {
-    delete it.second;
+  if (dmabufRingsEnabled) {
+    for (auto& it : cqPool) delete it.second;
   }
   cqPool.clear();
 
@@ -836,8 +847,9 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   endpoint.atomicIbuf.rkey = qp->atomicIbufMr->rkey;
   endpoint.atomicIbuf.nslots = RoundUpPowOfTwo(config.atomicIbufSlots);
   // One CQ per endpoint, keyed by its QP's qpn: ionic leaves cqn unset (0 for every CQ).
-  // Tracked (and so destroyed at teardown) only with dmabuf rings, to release the ring fd.
-  if (dmabufRingsEnabled) cqPool.insert({qp->qpn, cq});
+  // Tracked so DestroyRdmaEndpointNoThrow can release it; teardown destroys it only with
+  // dmabuf rings, to release the ring fd.
+  cqPool.insert({qp->qpn, cq});
   qpPool.insert({qp->qpn, qp});
 
   MORI_APP_TRACE(

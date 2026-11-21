@@ -182,6 +182,10 @@ class Context {
   void ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, int numQpPerPe,
                                   const std::vector<bool>& peerMask);
 
+  // Release a set from CreateAdditionalEndpoints; stub slots are skipped. A provider that
+  // cannot destroy endpoints early keeps them until the context is torn down. Local only.
+  void DestroyAdditionalEndpoints(const std::vector<RdmaEndpoint>& endpoints, int numQpPerPe);
+
  private:
   void CollectHostNames();
   void InitializeTopologyAndTransports();
