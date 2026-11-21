@@ -40,6 +40,7 @@
 
 #include "infiniband/verbs.h"
 #include "mori/utils/env_utils.hpp"
+#include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace {
@@ -84,10 +85,11 @@ struct GemEntry {
   int renderFd{-1};
   uint32_t handle{0};
   int dmabufFd{-1};
-  int importFd{-1};  // the descriptor handed to hipImportExternalMemory
+  int importFd{-1};
   dev_t dmabufDev{0};
   ino_t dmabufIno{0};
-  hipExternalMemory_t ext{nullptr};
+  hipMemGenericAllocationHandle_t imported{nullptr};
+  bool mapped{false};
   ibv_mr* pin{nullptr};
 };
 
@@ -243,12 +245,11 @@ ibv_mr* PinPage(void* ptr, int dmabufFd) {
 
 void Destroy(void* ptr, GemEntry& e) {
   if (e.pin) ibv_dereg_mr(e.pin);
-  if (ptr) (void)hipFree(ptr);  // unmaps the buffer of the external memory
-  if (e.ext) (void)hipDestroyExternalMemory(e.ext);
-  // HIP (seen with ROCm 7.2.4) leaves the descriptor it was given open after
-  // hipDestroyExternalMemory, which keeps the dma-buf and so the BO alive. Close it,
-  // but only while it still names this BO's dma-buf, in case HIP did close it and the
-  // number has been reused.
+  if (e.mapped) (void)hipMemUnmap(ptr, e.size);
+  if (ptr) (void)hipMemAddressFree(ptr, e.size);
+  if (e.imported) (void)hipMemRelease(e.imported);
+  // Close our import descriptor only if HIP left it open and it still names
+  // this BO; the descriptor number may have been reused if HIP closed it.
   if (e.importFd >= 0) {
     struct stat st{};
     if (fstat(e.importFd, &st) == 0 && st.st_dev == e.dmabufDev && st.st_ino == e.dmabufIno) {
@@ -313,28 +314,47 @@ void* Allocate(size_t size, int device) {
     e.dmabufIno = st.st_ino;
   }
 
-  hipExternalMemoryHandleDesc hd{};
-  hd.type = hipExternalMemoryHandleTypeOpaqueFd;
-  hd.handle.fd = dup(e.dmabufFd);  // HIP's; see Destroy for who closes it
-  hd.size = e.size;
-  hipError_t err = hipImportExternalMemory(&e.ext, &hd);
-  if (err == hipSuccess) e.importFd = hd.handle.fd;
-  if (err != hipSuccess) {
-    close(hd.handle.fd);
-    e.ext = nullptr;
-    MORI_APP_ERROR("HIP GEM allocator: hipImportExternalMemory of {} bytes on device {}: {}",
-                   e.size, device, hipGetErrorString(err));
+  e.importFd = dup(e.dmabufFd);
+  if (e.importFd < 0) {
+    MORI_APP_ERROR("HIP GEM allocator: duplicating dma-buf descriptor: {}", strerror(errno));
     Destroy(nullptr, e);
     return nullptr;
   }
-  hipExternalMemoryBufferDesc bd{};
-  bd.size = e.size;
-  void* ptr = nullptr;
-  err = hipExternalMemoryGetMappedBuffer(&ptr, e.ext, &bd);
+  // ExternalMemory imports can report device 0 in cold nonzero-device
+  // processes. VMM mapping establishes the owning device explicitly.
+  hipError_t err = hipMemImportFromShareableHandleCompat(&e.imported, e.importFd,
+                                                         hipMemHandleTypePosixFileDescriptor);
   if (err != hipSuccess) {
-    MORI_APP_ERROR("HIP GEM allocator: hipExternalMemoryGetMappedBuffer on device {}: {}", device,
+    MORI_APP_ERROR("HIP GEM allocator: VMM import of {} bytes on device {}: {}", e.size, device,
                    hipGetErrorString(err));
     Destroy(nullptr, e);
+    return nullptr;
+  }
+  void* ptr = nullptr;
+  err = hipMemAddressReserve(&ptr, e.size, kAlign, nullptr, 0);
+  if (err == hipSuccess) {
+    err = hipMemMap(ptr, e.size, 0, e.imported, 0);
+    e.mapped = err == hipSuccess;
+  }
+  if (err == hipSuccess) {
+    hipMemAccessDesc access{};
+    access.location.type = hipMemLocationTypeDevice;
+    access.location.id = device;
+    access.flags = hipMemAccessFlagsProtReadWrite;
+    err = hipMemSetAccess(ptr, e.size, &access, 1);
+  }
+  if (err != hipSuccess) {
+    MORI_APP_ERROR("HIP GEM allocator: VMM mapping on device {}: {}", device,
+                   hipGetErrorString(err));
+    Destroy(ptr, e);
+    return nullptr;
+  }
+  hipPointerAttribute_t attributes{};
+  err = hipPointerGetAttributes(&attributes, ptr);
+  if (err != hipSuccess || attributes.device != device) {
+    MORI_APP_ERROR("HIP GEM allocator: expected pointer device {}, got {} (HIP status {})", device,
+                   attributes.device, hipGetErrorString(err));
+    Destroy(ptr, e);
     return nullptr;
   }
 

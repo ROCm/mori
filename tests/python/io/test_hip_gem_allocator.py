@@ -24,7 +24,11 @@
 Both engines run in this process on the same GPU, so the transfer loops back
 through that GPU's NIC; this also works on rail-only fabrics.
 """
+
 import os
+import subprocess
+import sys
+import textwrap
 from contextlib import contextmanager
 
 import pytest
@@ -68,6 +72,48 @@ pytestmark = pytest.mark.skipif(
 
 MiB = 1 << 20
 DEVICE = torch.device("cuda", 0)
+
+
+@pytest.mark.parametrize("device", range(torch.cuda.device_count()))
+def test_cold_worker_pointer_device(device):
+    """HIP, not just MoRI's registry, must identify a cold worker's device."""
+    code = textwrap.dedent("""
+        import ctypes
+        import sys
+        import torch
+        from mori.io import make_hip_gem_mem_pool
+
+        device = int(sys.argv[1])
+        torch.cuda.set_device(device)
+        pool = make_hip_gem_mem_pool(device)
+        with torch.cuda.use_mem_pool(pool):
+            tensor = torch.empty(4 << 20, dtype=torch.uint8, device=f"cuda:{device}")
+        class Attributes(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_int), ("device", ctypes.c_int),
+                        ("device_pointer", ctypes.c_void_p), ("host_pointer", ctypes.c_void_p),
+                        ("managed", ctypes.c_int), ("flags", ctypes.c_uint)]
+        attributes = Attributes()
+        hip = ctypes.CDLL("libamdhip64.so")
+        status = hip.hipPointerGetAttributes(
+            ctypes.byref(attributes), ctypes.c_void_p(tensor.data_ptr()))
+        assert status == 0, status
+        assert attributes.device == device, (attributes.device, device)
+        tensor.fill_(17)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = tensor + 1
+        graph.replay()
+        torch.cuda.synchronize()
+        assert bool((output == 18).all())
+        """)
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(device)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @contextmanager
