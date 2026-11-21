@@ -115,6 +115,11 @@ class PeerFailureTracker {
   // Drops a QP association. Any recorded failure for it is retained, so a
   // pending event stays drainable after the endpoint is gone.
   void ForgetQp(const QpKey& qp);
+  // The QP was destroyed, so its number can name a new QP: drops its association and
+  // its failure records too, and its CQ's once no registered QP uses that CQ, as it was
+  // destroyed with it and its address can name a new CQ. Pending events are copies and
+  // stay drainable.
+  void ReleaseQp(const QpKey& qp);
 
   // Records a failure, or clears one on recovery. Repeats fold into the first.
   void Report(const PeerFailureReport& report);
@@ -126,6 +131,9 @@ class PeerFailureTracker {
 
   // Takes the oldest pending failure. False when none is pending.
   bool Pop(PeerFailureEvent* out);
+  // Drops the pending failures attributed to `remoteEngineKey`, e.g. once that engine was
+  // deregistered. Returns how many.
+  size_t DropPending(const std::string& remoteEngineKey);
 
   // False once this QP, or the port, CQ or device it uses, has been seen to fail.
   bool IsQpAlive(const QpKey& qp) const;

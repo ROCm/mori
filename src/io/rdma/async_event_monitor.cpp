@@ -300,7 +300,12 @@ void RdmaAsyncEventMonitor::MainLoop() noexcept {
   }
 }
 
+#ifdef MORI_IO_FAULT_INJECTION
+std::function<void()> RdmaAsyncEventMonitor::testEventAcked;
+#endif
+
 RdmaAsyncEventMonitor::GetResult RdmaAsyncEventMonitor::ProcessOneEvent(Watch& watch) noexcept {
+  std::lock_guard<std::mutex> hold(eventMu_);
   ibv_async_event event{};
   if (Verbs().GetAsyncEvent(watch.context, &event) != 0) {
     if (errno == EINTR) return GetResult::kEvent;
@@ -339,6 +344,9 @@ RdmaAsyncEventMonitor::GetResult RdmaAsyncEventMonitor::ProcessOneEvent(Watch& w
         break;
     }
   }
+#ifdef MORI_IO_FAULT_INJECTION
+  if (testEventAcked) testEventAcked();
+#endif
   DescribeAndLog(watch, info);
   ReportUncompletableIfNeeded(watch, info);
   ReportTransportEvent(watch, info);

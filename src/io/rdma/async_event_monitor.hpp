@@ -25,7 +25,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -62,6 +64,18 @@ class RdmaAsyncEventMonitor {
 
   RdmaAsyncEventMonitor(const RdmaAsyncEventMonitor&) = delete;
   RdmaAsyncEventMonitor& operator=(const RdmaAsyncEventMonitor&) = delete;
+
+  // Held from fetching an event until both callbacks have returned. A thread destroying
+  // a QP or CQ holds it across the destroy: an event is acknowledged before it is
+  // reported, so without it the report could land after the destroy, on a new QP or CQ
+  // that took the old one's number or address. Must not be taken under RdmaManager::mu
+  // or a PeerFailureTracker lock, which the callbacks take.
+  std::unique_lock<std::mutex> HoldEvents() { return std::unique_lock<std::mutex>(eventMu_); }
+
+#ifdef MORI_IO_FAULT_INJECTION
+  // Runs on the monitor thread between acknowledging an event and reporting it.
+  static std::function<void()> testEventAcked;
+#endif
 
  private:
   struct Watch {
@@ -126,6 +140,7 @@ class RdmaAsyncEventMonitor {
   int epollFd_{-1};
   int wakeFd_{-1};
   std::atomic<bool> stopRequested_{false};
+  std::mutex eventMu_;
   std::thread thread_;
   std::chrono::steady_clock::time_point nextRecheck_{};
 };

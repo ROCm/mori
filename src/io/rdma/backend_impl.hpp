@@ -25,12 +25,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "mori/application/topology/topology.hpp"
@@ -65,6 +68,34 @@ std::vector<int> BuildDesiredQpCounts(int totalQp, int numRanks);
 EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
                                            const std::vector<int>& localDevOrder,
                                            const std::vector<int>& wantPerRank);
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Endpoint resources                                       */
+/* ---------------------------------------------------------------------------------------------- */
+// The verbs objects behind one connected endpoint, shared by its EpPair copies.
+struct EndpointResources {
+  int devId{-1};
+  application::RdmaEndpoint ep{};
+  // NotifManager's receive buffer for notifications on this QP, and its MR.
+  void* notifBuf{nullptr};
+  application::RdmaMemoryRegion notifMr{};
+};
+
+// Holds endpoints whose last EpPair copy is gone until RdmaManager destroys them. A
+// copy can go on any thread and under any lock, so letting go of one only queues it.
+class ReleasedEndpoints {
+ public:
+  void Push(EndpointResources* res);
+  std::vector<std::unique_ptr<EndpointResources>> TakeAll();
+  // The device contexts are being destroyed, and their QPs with them: later pushes are
+  // dropped without touching verbs.
+  void Close();
+
+ private:
+  std::mutex mu_;
+  bool closed_{false};
+  std::vector<std::unique_ptr<EndpointResources>> released_;
+};
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
@@ -107,6 +138,24 @@ class RdmaManager {
                              int weight);
   std::shared_ptr<EndpointRuntime> GetEndpointRuntime(EndpointId id);
   void SnapshotEndpointRuntimes(SnapshotVector& result);
+  // Removes every endpoint to `remote` from the route table and forgets the remote
+  // engine's memory regions, so no new session can reach them. Returns them, along with
+  // those an earlier call could not cut; they are still polled.
+  SnapshotVector DetachRemoteEngine(const EngineKey& remote);
+  // Cuts every endpoint's QP, then fails what is still in flight on the ones it cut with
+  // `message`. All of them reject new submissions, and Alive() reports them dead. A QP
+  // that could not be cut can still complete work, so its transfers are left to their
+  // completions. Returns the endpoints it cut.
+  SnapshotVector RetireEndpoints(const SnapshotVector& runtimes, const std::string& message);
+  // Stops polling endpoints, once nothing posted on them can complete any more.
+  void RemoveEndpoints(const SnapshotVector& runtimes);
+  // Destroys the endpoints no EpPair copy refers to any more.
+  void DestroyReleasedEndpoints();
+  // QPs connected and not destroyed yet, including detached ones a session still holds.
+  size_t NumConnectedEndpoints() const {
+    return connectedEndpoints_.load(std::memory_order_relaxed);
+  }
+  application::RdmaMemoryRegion RegisterNotifBuffer(int devId, void* buf, size_t size);
   // Monotonic generation counter bumped whenever the endpoint set changes.
   // Lets hot pollers skip the locked snapshot rebuild when nothing changed.
   uint64_t EndpointsEpoch() const noexcept {
@@ -126,6 +175,8 @@ class RdmaManager {
   /* -------------------------------- Peer failure -------------------------------- */
   // Takes the oldest recorded failure; polled by an application thread.
   bool PopPeerFailure(PeerFailureEvent* out);
+  // Drops the queued failures of `remote`. Returns how many.
+  size_t DropPeerFailures(const EngineKey& remote);
   // False once a failure covering this QP is observed; a slow QP stays alive.
   bool IsQpAlive(int devId, uint32_t qpNum) const;
   bool NeedsQpReplacement(int devId, uint32_t qpNum) const;
@@ -140,6 +191,9 @@ class RdmaManager {
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
+  // Held across destroying QPs and CQs; see RdmaAsyncEventMonitor::HoldEvents. Empty
+  // when the monitor is off. Taken before mu, never under it.
+  std::unique_lock<std::mutex> HoldAsyncEvents();
 
  private:
   RdmaBackendConfig config;
@@ -154,6 +208,8 @@ class RdmaManager {
   std::atomic<EndpointId> nextEndpointId_{1};
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> endpointsById_;
   std::atomic<uint64_t> endpointsEpoch_{0};
+  std::shared_ptr<ReleasedEndpoints> released_{std::make_shared<ReleasedEndpoints>()};
+  std::atomic<size_t> connectedEndpoints_{0};
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};
@@ -178,6 +234,11 @@ class NotifManager {
   ~NotifManager();
 
   void RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt);
+  // Stops watching endpoints detached from RdmaManager, and returns once the poll loop
+  // holds none of them any more.
+  void UnregisterEndpoints(const RdmaManager::SnapshotVector& runtimes);
+  // Drops the notifications received from `remote`.
+  void ForgetRemoteEngine(const EngineKey& remote);
 
   void RegisterDevice(int devId);
 
@@ -230,16 +291,13 @@ class NotifManager {
   std::atomic<bool> running{false};
   std::thread thd;
   RdmaManager* rdma;
+  // Poll loop iterations so far. An iteration drops every runtime the previous one held,
+  // so once it has moved on by two, none detached before can still be held there.
+  std::atomic<uint64_t> pollRounds_{0};
 
   // Notification context
  private:
-  struct QpNotifContext {
-    application::RdmaMemoryRegion mr;
-    void* buf;
-  };
-
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> registeredRuntimes_;
-  std::unordered_map<EndpointId, QpNotifContext> notifCtxById_;
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
 
   std::unordered_map<TransferStatus*, int> localNotif;
@@ -267,6 +325,16 @@ class ControlPlaneServer {
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
   std::optional<int> TryGetRemoteEnginePort(const EngineKey&) const;
+  // Refuses the connections a remote engine asks for until AllowIncoming, and waits out
+  // the one being accepted, so none is published while that engine is being torn down.
+  // Not to be called on the server thread.
+  void BlockIncoming(const EngineKey&);
+  void AllowIncoming(const EngineKey&);
+#ifdef MORI_IO_FAULT_INJECTION
+  // Tests only: runs on the server thread between connecting the endpoint a remote engine
+  // asked for and publishing it.
+  static std::function<void(const EngineKey&)> testIncomingConnected;
+#endif
 
   // Endpoint management
   void BuildRdmaConn(EngineKey, TopoKeyPair, int nicRank);
@@ -282,6 +350,10 @@ class ControlPlaneServer {
   void Shutdown();
 
  private:
+  // Counts a connection a remote engine asked for while its endpoint is created and
+  // published; refuses it while that engine is blocked.
+  class IncomingConn;
+
   void AcceptRemoteEngineConn();
   void HandleControlPlaneProtocol(int fd);
   void DropConnection(int fd) noexcept;
@@ -302,6 +374,11 @@ class ControlPlaneServer {
   NotifManager* notif{nullptr};
   std::unordered_map<EngineKey, EngineDesc> engines;
   std::unordered_map<MemoryUniqueId, MemoryDesc> mems;
+
+  std::mutex incomingMu_;
+  std::condition_variable incomingDone_;
+  std::unordered_set<EngineKey> incomingBlocked_;
+  std::unordered_map<EngineKey, int> incomingInFlight_;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -373,6 +450,11 @@ class RdmaBackend : public Backend {
                                 TransferStatus* status) override;
   bool PopPeerFailure(PeerFailureEvent* out) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
+  size_t NumConnectedEndpoints() const { return rdma->NumConnectedEndpoints(); }
+#ifdef MORI_IO_FAULT_INJECTION
+  // Tests only: runs between building a session for the engine-level path and caching it.
+  static std::function<void(const EngineKey&)> testSessionBuilt;
+#endif
 
  private:
   // With paceQpReplacement, building QPs in place of failed ones is refused with
@@ -423,7 +505,8 @@ class RdmaBackend : public Backend {
   // Records a replacement of failed QPs to `key` and returns how long the next one waits;
   // with `enforce`, throws QpReplacementBackoff instead while the last one says to wait.
   std::chrono::milliseconds PaceQpReplacement(const ConnBuildKey& key, bool enforce);
-  RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
+  std::shared_ptr<RdmaBackendSession> GetOrCreateSessionCached(const MemoryDesc& local,
+                                                               const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
   std::shared_ptr<std::mutex> GetConnBuildLock(const EngineKey& remoteEngineKey,
                                                const TopoKeyPair& topo);
@@ -435,21 +518,29 @@ class RdmaBackend : public Backend {
   std::unique_ptr<NotifManager> notif{nullptr};
   std::unique_ptr<ControlPlaneServer> server{nullptr};
   std::unique_ptr<Executor> executor{nullptr};
-  // session cache
-  std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
+  // session cache; a caller keeps its session alive while it uses it, even once the
+  // session is replaced or dropped from the cache.
+  std::unordered_map<SessionCacheKey, std::shared_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;
-  // Sessions replaced because one of their QPs failed. GetOrCreateSessionCached hands out
-  // raw pointers that callers use after dropping sessionCacheMu, so these are kept alive.
-  std::vector<std::unique_ptr<RdmaBackendSession>> retiredSessions;
   // After an attempt to replace a failed session failed (the peer may be gone, or the
   // replacement backed off), when to try again. Guarded by sessionCacheMu.
   std::unordered_map<ConnBuildKey, std::chrono::steady_clock::time_point, ConnBuildKeyHash>
       replaceRetryAt;
+  // Deregistrations of each remote engine so far, so a session whose build a
+  // deregistration overtook is not cached. Guarded by sessionCacheMu.
+  std::unordered_map<EngineKey, uint64_t> deregistrations_;
+  uint64_t DeregistrationsLocked(const EngineKey& remoteEngineKey) const;
   std::mutex sessionCacheMu;
+  // Serializes registering and deregistering one remote engine key. Per key, because a
+  // deregistration can wait out a connection build to a dead peer.
+  std::shared_ptr<std::mutex> GetPeerLock(const EngineKey& remoteEngineKey);
+  std::mutex peerLocksMu_;
+  std::unordered_map<EngineKey, std::shared_ptr<std::mutex>> peerLocks_;
   std::mutex connBuildMapMu_;
   std::unordered_map<ConnBuildKey, std::shared_ptr<std::mutex>, ConnBuildKeyHash> connBuildMu_;
-  // Failed QPs stay allocated, so QPs that fail again soon after being replaced, as on a
-  // path that stays down, are replaced at a growing interval. Guarded by connBuildMapMu_.
+  // Failed QPs stay allocated until their remote engine is deregistered, so QPs that fail
+  // again soon after being replaced, as on a path that stays down, are replaced at a
+  // growing interval. Guarded by connBuildMapMu_.
   std::unordered_map<ConnBuildKey, QpReplacementPacing, ConnBuildKeyHash> qpReplacementPacing_;
 };
 

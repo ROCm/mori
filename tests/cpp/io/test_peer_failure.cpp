@@ -342,6 +342,66 @@ void CaseForgetQpKeepsFailure() {
   Require(event.remoteEngineKey == "decode-0", "attribution happens at record time");
 }
 
+// A destroyed QP's number can name a new QP, which must not inherit the old failure;
+// the event already queued for the old one stays drainable.
+void CaseReleaseQpForgetsFailure() {
+  PeerFailureTracker tracker;
+  tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
+  tracker.Report(QpFailure(10));
+  tracker.RegisterQp(Qp(11), "decode-0", kPort1, kCqA);
+  tracker.MarkQpFailed(Qp(11));
+  tracker.ReleaseQp(Qp(10));
+  tracker.ReleaseQp(Qp(11));
+
+  tracker.RegisterQp(Qp(10), "decode-1", kPort1, kCqA);
+  Require(tracker.IsQpAlive(Qp(10)), "a new QP reusing a released number must be alive");
+  Require(!tracker.NeedsQpReplacement(Qp(11)), "a released errored QP must not stay condemned");
+
+  PeerFailureEvent event;
+  Require(tracker.Pop(&event), "the old QP's pending failure must survive ReleaseQp");
+  Require(event.remoteEngineKey == "decode-0", "attribution happens at record time");
+}
+
+// A failed CQ stays failed while a QP on it is left, and is forgotten with the last one:
+// a new CQ allocated at its address must not inherit the failure.
+void CaseReleaseQpForgetsItsCqFailure() {
+  PeerFailureTracker tracker;
+  tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
+  tracker.RegisterQp(Qp(11), "decode-0", kPort1, kCqA);
+  tracker.RegisterQp(Qp(12, "mlx5_1"), "decode-0", kPort1, kCqA);
+  tracker.Report(CqFailure("mlx5_0", kCqA));
+  tracker.Report(CqFailure("mlx5_1", kCqA));
+
+  tracker.ReleaseQp(Qp(10));
+  Require(tracker.NeedsQpReplacement(Qp(11)), "a QP still on the failed CQ must stay condemned");
+  tracker.ReleaseQp(Qp(11));
+  tracker.RegisterQp(Qp(13), "decode-1", kPort1, kCqA);
+  Require(tracker.IsQpAlive(Qp(13)), "a QP on a new CQ at a released CQ's address must be alive");
+  Require(tracker.NeedsQpReplacement(Qp(12, "mlx5_1")),
+          "the same address on another device is another CQ, still failed");
+
+  PeerFailureEvent event;
+  Require(tracker.Pop(&event) && tracker.Pop(&event),
+          "the CQ failures already queued must survive ReleaseQp");
+}
+
+// A deregistered engine's queued failures go; another engine's stay, in order.
+void CaseDropPendingForgetsOneEngine() {
+  PeerFailureTracker tracker;
+  tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
+  tracker.RegisterQp(Qp(11), "decode-1", kPort1, kCqA);
+  tracker.RegisterQp(Qp(12), "decode-0", kPort1, kCqA);
+  tracker.Report(QpFailure(10));
+  tracker.Report(QpFailure(11));
+  tracker.Report(QpFailure(12));
+
+  Require(tracker.DropPending("decode-0") == 2, "both decode-0 failures must be dropped");
+  PeerFailureEvent event;
+  Require(tracker.Pop(&event) && event.remoteEngineKey == "decode-1",
+          "the other engine's failure must stay");
+  Require(!tracker.Pop(&event), "nothing else may be left");
+}
+
 // Events are drained oldest-first so the first cause is seen before its fallout.
 void CaseFifoOrder() {
   PeerFailureTracker tracker;
@@ -444,6 +504,9 @@ int main() {
       {"RepeatFailuresFoldIntoFirst", CaseRepeatFailuresFoldIntoFirst},
       {"LateRegistrationCannotAttribute", CaseLateRegistrationCannotAttribute},
       {"ForgetQpKeepsFailure", CaseForgetQpKeepsFailure},
+      {"ReleaseQpForgetsFailure", CaseReleaseQpForgetsFailure},
+      {"ReleaseQpForgetsItsCqFailure", CaseReleaseQpForgetsItsCqFailure},
+      {"DropPendingForgetsOneEngine", CaseDropPendingForgetsOneEngine},
       {"FifoOrder", CaseFifoOrder},
       {"BoundedQueueDropsNewest", CaseBoundedQueueDropsNewest},
       {"PopNullptrIsSafe", CasePopNullptrIsSafe},
