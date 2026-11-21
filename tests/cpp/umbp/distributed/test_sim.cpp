@@ -34,8 +34,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <limits>
+#include <mutex>
 #include <thread>
 #include <tuple>
 
@@ -77,6 +79,69 @@ class ScopedEnv {
   const char* key_;
   std::optional<std::string> old_;
 };
+
+// Forwards a standalone client's calls to its server. The hook decides whether
+// and when each call is forwarded; `key` is a put's first key.
+class StandaloneProxy final : public ::umbp::UMBPStandalone::Service {
+ public:
+  using Hook = std::function<grpc::Status(const std::string& method, const std::string& key,
+                                          const std::function<grpc::Status()>& forward)>;
+
+  StandaloneProxy(const std::string& address, const std::string& target) {
+    Connect(target);
+    grpc::ServerBuilder builder;
+    builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+    builder.RegisterService(this);
+    server_ = builder.BuildAndStart();
+  }
+  ~StandaloneProxy() override { server_->Shutdown(std::chrono::system_clock::now() + 1s); }
+  // A new channel per server process, so the restarted one is reached at once.
+  void Connect(const std::string& target, Hook hook = {}) {
+    std::lock_guard<std::mutex> lock(mu_);
+    stub_ = ::umbp::UMBPStandalone::NewStub(
+        grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+    hook_ = std::move(hook);
+  }
+
+#define FORWARD(Method, Request, Response, key)                               \
+  grpc::Status Method(grpc::ServerContext*, const ::umbp::Request* request,   \
+                      ::umbp::Response* response) override {                  \
+    return Call(#Method, key, [&](auto& stub, grpc::ClientContext* context) { \
+      return stub.Method(context, *request, response);                        \
+    });                                                                       \
+  }
+  FORWARD(Ping, Empty, PingResponse, "")
+  FORWARD(BatchPut, BatchDataRequest, BatchBoolResponse, request->keys(0))
+  FORWARD(ConfigureKvIndexer, StandaloneKvIndexerConfig, BoolResponse, "")
+  FORWARD(RegisterMemory, RegisterMemoryRequest, BoolResponse, "")
+  FORWARD(DeregisterMemory, DeregisterMemoryRequest, Empty, "")
+#undef FORWARD
+
+ private:
+  template <class Rpc>
+  grpc::Status Call(const char* method, const std::string& key, Rpc rpc) {
+    std::unique_lock<std::mutex> lock(mu_);
+    const auto hook = hook_;
+    const auto stub = stub_;
+    lock.unlock();
+    const std::function<grpc::Status()> forward = [&] {
+      grpc::ClientContext context;
+      return rpc(*stub, &context);
+    };
+    return hook ? hook(method, key, forward) : forward();
+  }
+
+  std::mutex mu_;
+  std::shared_ptr<::umbp::UMBPStandalone::Stub> stub_;
+  Hook hook_;
+  std::unique_ptr<grpc::Server> server_;
+};
+
+// A block hash must keep the same keys, so each key gets its own.
+std::vector<KvBlockMetadata> BlockPerKey(const std::vector<std::string>& keys) {
+  const auto hash = static_cast<int64_t>(std::hash<std::string>{}(keys.front()) >> 1);
+  return {{hash, std::nullopt, 16, {{1, keys}}}};
+}
 
 class SimTest : public ::testing::Test {
  protected:
@@ -773,6 +838,162 @@ TEST_F(SimTest, StandaloneLookupsReportMissesOnceTheLookupTimeoutPasses) {
   close(silent);
   EXPECT_TRUE(in_time);
   EXPECT_TRUE(lookups.get());
+}
+
+// A client with two regions and a KV Indexer configuration, reaching its server
+// through a proxy, so a test can restart the server and steer the restore.
+class SimRestartTest : public SimTest {
+ protected:
+  void SetUp() override {
+    SimTest::SetUp();
+    target_ = "unix:" + dir_ + "/target.sock";
+    server_ = std::make_unique<standalone::StandaloneServer>(Config(), target_);
+    ASSERT_TRUE(server_->Start());
+    auto rank = RankConfig();
+    rank.standalone_process->startup_timeout_ms = 1000;  // also bounds each registration
+    proxy_ = std::make_unique<StandaloneProxy>(rank.standalone_process->address, target_);
+    client_ = CreateUMBPClient(rank);
+    client_->ConfigureKvIndexer({"127.0.0.1:1", "sim-pool", 10, BlockPerKey});
+    ptr_ = Buffer(2 * kPage);
+    ASSERT_TRUE(client_->RegisterMemory(ptr_, kPage));
+    ASSERT_TRUE(client_->RegisterMemory(ptr_ + kPage, kPage));
+  }
+  void TearDown() override {
+    if (proxy_) proxy_->Connect(target_);  // drops the hook and the locals it refers to
+    client_.reset();
+    proxy_.reset();
+    server_.reset();
+    SimTest::TearDown();
+  }
+  void Restart(StandaloneProxy::Hook hook) {
+    server_->Shutdown();
+    server_ = std::make_unique<standalone::StandaloneServer>(Config(), target_);
+    ASSERT_TRUE(server_->Start());
+    proxy_->Connect(target_, std::move(hook));
+  }
+  std::string target_;
+  std::unique_ptr<standalone::StandaloneServer> server_;
+  std::unique_ptr<StandaloneProxy> proxy_;
+  std::unique_ptr<IUMBPClient> client_;
+  uintptr_t ptr_ = 0;
+};
+
+TEST_F(SimRestartTest, ClientRegistersAgainAfterARegionWentUnanswered) {
+  // The second registration gets no answer within the client's timeout. Holding
+  // the first region, the server then knows the client, and a call on the
+  // second fails without client_unknown.
+  std::atomic<int> registrations{0};
+  Restart([&](const std::string& method, const std::string&, const auto& forward) {
+    if (method == "RegisterMemory" && ++registrations == 2) std::this_thread::sleep_for(3s);
+    return forward();
+  });
+  const auto start = Clock::now();
+  EXPECT_FALSE(client_->Put("first", ptr_, kPage));
+  EXPECT_LT(Clock::now() - start, 2s);
+  EXPECT_TRUE(Await([&] { return client_->Put("second", ptr_ + kPage, kPage); }));
+  EXPECT_EQ(registrations.load(), 4);
+}
+
+TEST_F(SimRestartTest, ClientRegistersAgainAfterARestartBetweenTwoRegions) {
+  // The server restarts again once the restore's first region is in, so the
+  // restore seems to succeed while the new process lacks that region.
+  std::atomic<bool> restarted{false};
+  Restart([&](const std::string& method, const std::string&, const auto& forward) {
+    const auto status = forward();
+    if (method == "RegisterMemory" && !restarted.exchange(true)) Restart(nullptr);
+    return status;
+  });
+  EXPECT_FALSE(client_->Put("first", ptr_, kPage));
+  ASSERT_TRUE(restarted);
+  EXPECT_TRUE(Await([&] { return client_->Put("second", ptr_, kPage); }));
+}
+
+TEST_F(SimRestartTest, ClientConfiguresTheKvIndexerAgainAnIntervalAfterThatFailed) {
+  // Holding the regions without the KV Indexer configuration, the server
+  // refuses a metadata put and never answers client_unknown. The failed
+  // attempt outlasts the interval.
+  std::atomic<int> configures{0};
+  std::atomic<Clock::rep> retried_at{0};
+  Restart([&](const std::string& method, const std::string&, const auto& forward) {
+    if (method != "ConfigureKvIndexer") return forward();
+    if (++configures == 1) {
+      std::this_thread::sleep_for(1500ms);
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "slow, then refused");
+    }
+    retried_at = Clock::now().time_since_epoch().count();
+    return forward();
+  });
+  bool stored = true;
+  EXPECT_NO_THROW(stored = client_->Put("first", ptr_, kPage));
+  EXPECT_FALSE(stored);
+  const auto failed = Clock::now();  // just after the client stamps its failure
+  stored = true;
+  EXPECT_NO_THROW(stored = client_->Put("second", ptr_, kPage));
+  EXPECT_FALSE(stored);
+  EXPECT_EQ(configures.load(), 1);
+  stored = false;
+  EXPECT_NO_THROW(stored = Await([&] { return client_->Put("third", ptr_, kPage); }));
+  EXPECT_TRUE(stored);
+  ASSERT_EQ(configures.load(), 2);
+  EXPECT_GE(Clock::time_point(Clock::duration(retried_at.load())) - failed, 900ms);
+}
+
+TEST_F(SimRestartTest, CallMadeDuringARestoreWaitsForIt) {
+  // The restore is held at its KV Indexer configuration while the second call
+  // is made, long enough for that call to reach the server if it did not wait.
+  std::atomic<bool> holding{false}, made{false}, configured{false}, early{false};
+  Restart([&](const std::string& method, const std::string& key, const auto& forward) {
+    if (method == "BatchPut" && key == "second" && !configured) early = true;
+    if (method != "ConfigureKvIndexer") return forward();
+    holding = true;
+    Await([&] { return made.load(); });
+    std::this_thread::sleep_for(200ms);
+    const auto status = forward();
+    configured = true;
+    return status;
+  });
+  auto first = std::async(std::launch::async, [&] { return client_->Put("first", ptr_, kPage); });
+  ASSERT_TRUE(Await([&] { return holding.load(); }));
+  made = true;
+  bool stored = false;
+  EXPECT_NO_THROW(stored = client_->Put("second", ptr_ + kPage, kPage));
+  EXPECT_TRUE(stored);
+  EXPECT_TRUE(first.get());
+  EXPECT_FALSE(early);
+}
+
+TEST_F(SimRestartTest, CallRefusedMidRestoreIsMadeAgainOnceTheRestoreFinished) {
+  // The second call is on the wire before the first learns of the restart. It
+  // reaches the server between the regions and the KV Indexer configuration,
+  // and its refusal gets back only once the restore has finished.
+  enum { kHeld = 1, kRegistered, kRefused, kRestored };
+  std::atomic<int> stage{0}, refusal{-1};
+  auto reach = [&](int s) { return Await([&] { return stage >= s; }); };
+  Restart([&](const std::string& method, const std::string& key, const auto& forward) {
+    if (method == "BatchPut" && key == "second" && stage == 0) {
+      stage = kHeld;
+      reach(kRegistered);
+      const auto status = forward();
+      refusal = static_cast<int>(status.error_code());
+      stage = kRefused;
+      reach(kRestored);
+      return status;
+    }
+    if (method == "ConfigureKvIndexer") reach(kRefused);
+    if (method == "BatchPut" && key == "first" && stage == kRefused) stage = kRestored;
+    const auto status = forward();
+    if (method == "RegisterMemory" && stage == kHeld) stage = kRegistered;
+    return status;
+  });
+  auto second = std::async(std::launch::async, [&] { return client_->Put("second", ptr_, kPage); });
+  ASSERT_TRUE(reach(kHeld));
+  bool stored = false;
+  EXPECT_NO_THROW(stored = client_->Put("first", ptr_, kPage));
+  EXPECT_TRUE(stored);
+  stored = false;
+  EXPECT_NO_THROW(stored = second.get());
+  EXPECT_TRUE(stored);
+  EXPECT_EQ(refusal.load(), static_cast<int>(grpc::StatusCode::INVALID_ARGUMENT));
 }
 
 TEST_F(SimTest, StandaloneRejectsMismatchedModes) {
