@@ -221,7 +221,19 @@ void AddToCatalog(Catalog& catalog, const std::vector<yaml::FlatMap>& entries,
   for (size_t i = 0; i < entries.size(); ++i) {
     const yaml::FlatMap& e = entries[i];
     const std::string where = source + ": entry " + std::to_string(i + 1);
-    yaml::CheckKeys(e, kCatalogKeys, where);
+    // Catalogs are often kept outside mori and gain fields with newer mori versions: an unknown
+    // field is skipped with a warning, so an older mori still runs them. Strict mode makes it an
+    // error, to catch typos.
+    if (mori::env::IsEnvVarEnabled("MORI_IO_SIM_CATALOG_STRICT")) {
+      yaml::CheckKeys(e, kCatalogKeys, where);
+    } else {
+      for (const auto& field : e) {
+        if (kCatalogKeys.count(field.first) == 0) {
+          MORI_IO_WARN("{}: unknown field '{}' ignored (MORI_IO_SIM_CATALOG_STRICT=1 rejects it)",
+                       where, field.first);
+        }
+      }
+    }
     std::string backend = yaml::GetString(e, "backend");
     if (backend != "rdma" && backend != "tcp" && backend != "xgmi") {
       throw std::runtime_error(where + ": backend must be rdma, tcp or xgmi, got '" + backend +
