@@ -241,7 +241,14 @@ bool MoriIoEngine::EnsureRemoteEngine(const std::string& node_id,
     return false;
   }
 
-  if (io_engine_ != nullptr) io_engine_->RegisterRemoteEngine(desc);
+  if (io_engine_ != nullptr) {
+    try {
+      io_engine_->RegisterRemoteEngine(desc);
+    } catch (const std::exception& e) {
+      MORI_UMBP_ERROR("[MoriIoEngine] EnsureRemoteEngine: rejected '{}': {}", node_id, e.what());
+      return false;
+    }
+  }
 
   std::lock_guard<std::mutex> lock(remotes_mutex_);
   auto& remote = remotes_[node_id];
