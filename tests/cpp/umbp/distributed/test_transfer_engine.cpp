@@ -45,6 +45,7 @@
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
+#include "umbp/distributed/transfer/plan_builder.h"
 #include "umbp/distributed/transfer/posix_engine.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 
@@ -293,6 +294,45 @@ TEST(HbmCopyEngine, BuilderSplitsAtHostRegistrationPieces) {
   EXPECT_EQ(std::vector<size_t>({4096, 8192}), planned.plans[0].sizes);
   EXPECT_EQ(std::vector<size_t>({1, 2}), planned.plans[0].tags);
   ExpectPlanContract(items, planned);
+}
+
+// The blocking copy loop merges adjacent segments into one hipMemcpy, but not
+// the two halves the builder cut at a host registration piece: that call is
+// refused ("invalid argument"), and failed every put of a chunk that crossed a
+// piece boundary.
+TEST(HbmCopyEngine, CopyRunsStopAtHostRegistrationPieces) {
+  HbmCopyEngine engine;
+  const uintptr_t piece = HostRegistrationChunkBytes();
+  auto host = TransferRef::HostBytes(reinterpret_cast<void*>(piece - 4096), 65536);
+  std::vector<char> stub(65536);
+  auto gpu = TransferRef::HostBytes(stub.data(), stub.size(), mori::io::MemoryLocationType::GPU, 0);
+  // Host as the source (a get) and as the destination (a put).
+  for (const bool host_is_src : {true, false}) {
+    const std::vector<TransferItem> items{host_is_src ? MakeItem(host, 0, gpu, 0, 12288, 1)
+                                                      : MakeItem(gpu, 0, host, 0, 12288, 1)};
+    const auto planned = engine.Plan(items);
+    ASSERT_EQ(1u, planned.plans.size());
+    const TransferPlan& plan = planned.plans[0];
+    ASSERT_EQ(std::vector<size_t>({4096, 8192}), plan.sizes);
+    size_t bytes = 0;
+    EXPECT_EQ(1u, CoalescedRunEnd(plan, 0, piece, &bytes));
+    EXPECT_EQ(4096u, bytes);
+    EXPECT_EQ(2u, CoalescedRunEnd(plan, 1, piece, &bytes));
+    EXPECT_EQ(8192u, bytes);
+  }
+
+  // Adjacent segments inside one piece still merge.
+  TransferPlan inside;
+  inside.src = TransferRef::HostBytes(reinterpret_cast<void*>(piece + 4096), 65536);
+  inside.dst = gpu;
+  inside.src_offsets = {0, 4096, 16384};
+  inside.dst_offsets = {0, 4096, 8192};
+  inside.sizes = {4096, 4096, 4096};
+  size_t bytes = 0;
+  EXPECT_EQ(2u, CoalescedRunEnd(inside, 0, piece, &bytes));
+  EXPECT_EQ(8192u, bytes);
+  EXPECT_EQ(3u, CoalescedRunEnd(inside, 2, piece, &bytes));
+  EXPECT_EQ(4096u, bytes);
 }
 
 // Gathers submitted from a succession of short-lived threads, the way the
