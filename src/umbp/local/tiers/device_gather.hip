@@ -36,6 +36,11 @@
 namespace mori::umbp {
 namespace {
 
+thread_local DeviceCopyPolicy copy_policy = DeviceCopyPolicy::Default;
+std::atomic<uint64_t> policy_counts[2]{};
+// Resources live until process exit, like descriptor staging.
+thread_local std::unordered_map<int, hipStream_t> copy_streams;
+
 constexpr unsigned kThreadsPerBlock = 256;
 
 // Enough parallelism to keep the link busy on the largest fragment without
@@ -107,8 +112,9 @@ DescriptorStaging* StagingFor(hipStream_t stream, int device_id, size_t count) {
   DeviceGatherFragment* device = nullptr;
   hipError_t status = hipHostMalloc(reinterpret_cast<void**>(&host), bytes, hipHostMallocDefault);
   if (status != hipSuccess) {
-    MORI_UMBP_ERROR("[DeviceGather] hipHostMalloc for {} gather descriptors failed on device {}: {}",
-                    capacity, device_id, hipGetErrorString(status));
+    MORI_UMBP_ERROR(
+        "[DeviceGather] hipHostMalloc for {} gather descriptors failed on device {}: {}", capacity,
+        device_id, hipGetErrorString(status));
     (void)hipGetLastError();
     return nullptr;
   }
@@ -148,8 +154,8 @@ bool DeviceGatherEnabled() {
   return enabled;
 }
 
-bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int device_id,
-                        hipStream_t stream) {
+static bool LaunchGatherKernel(const DeviceGatherFragment* fragments, size_t count, int device_id,
+                               hipStream_t stream) {
   if (count == 0) return true;
 
   size_t max_bytes = 0;
@@ -185,6 +191,34 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
     return false;
   }
   LaunchCounter().fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+ScopedDeviceCopyPolicy::ScopedDeviceCopyPolicy(DeviceCopyPolicy policy) : previous_(copy_policy) {
+  copy_policy = policy;
+}
+ScopedDeviceCopyPolicy::~ScopedDeviceCopyPolicy() { copy_policy = previous_; }
+uint64_t DeviceCopyPolicyCount(DeviceCopyPolicy policy) {
+  return policy_counts[static_cast<int>(policy)].load(std::memory_order_relaxed);
+}
+
+bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int device_id,
+                        hipStream_t caller_stream) {
+  if (copy_policy == DeviceCopyPolicy::Default)
+    return LaunchGatherKernel(fragments, count, device_id, caller_stream);
+  if (!count) return true;
+  auto& stream = copy_streams[device_id];
+  if (!stream) {
+    int least = 0, greatest = 0;
+    if (hipDeviceGetStreamPriorityRange(&least, &greatest) != hipSuccess) return false;
+    if (hipStreamCreateWithPriority(&stream, hipStreamNonBlocking, least) != hipSuccess)
+      return false;
+  }
+  const bool launched = LaunchGatherKernel(fragments, count, device_id, stream);
+  // The API is synchronous; also drain partial launches before fallback.
+  const hipError_t status = hipStreamSynchronize(stream);
+  if (!launched || status != hipSuccess) return false;
+  policy_counts[static_cast<int>(copy_policy)].fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
