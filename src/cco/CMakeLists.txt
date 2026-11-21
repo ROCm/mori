@@ -30,6 +30,41 @@ target_link_options(mori_cco PRIVATE LINKER:--exclude-libs,ALL)
 
 target_link_libraries(mori_cco PUBLIC mori_logging hip::host)
 
+# ccoProxy host engine (proxy/ holds the device-to-host queue it drains). It is
+# HIP because the queue headers are, and builds only for the wave64 targets the
+# queue supports; without one the engine is left out and ccoDevCommCreate
+# rejects proxy queues. MORI_CCO_PROXY tells callers the engine is built in.
+if(BUILD_CCO_PROXY)
+  set(MORI_CCO_PROXY_HIP_ARCHITECTURES)
+  foreach(_arch IN LISTS CMAKE_HIP_ARCHITECTURES)
+    if(_arch MATCHES "^gfx(942|950)(:|$)")
+      list(APPEND MORI_CCO_PROXY_HIP_ARCHITECTURES ${_arch})
+    endif()
+  endforeach()
+  if(NOT MORI_CCO_PROXY_HIP_ARCHITECTURES)
+    message(STATUS "ccoProxy: no gfx942/gfx950 in GPU_TARGETS; host engine not built")
+    set(BUILD_CCO_PROXY OFF PARENT_SCOPE)
+  else()
+    find_package(hsa-runtime64 REQUIRED)
+    set(MORI_CCO_PROXY_SOURCES
+        cco_proxy_engine.hip.cpp proxy/device_to_host_queue.cpp
+        proxy/mpsc_device_to_host_queue.cpp proxy/host_memory.cpp)
+    set_source_files_properties(${MORI_CCO_PROXY_SOURCES} PROPERTIES LANGUAGE HIP)
+    add_library(mori_cco_proxy OBJECT ${MORI_CCO_PROXY_SOURCES})
+    target_include_directories(mori_cco_proxy PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}
+                                                      ${CMAKE_CURRENT_SOURCE_DIR}/proxy)
+    target_compile_definitions(mori_cco_proxy PRIVATE MORI_CCO_PROXY=1)
+    target_link_libraries(mori_cco_proxy PRIVATE mori_logging hip::host
+                                                 hsa-runtime64::hsa-runtime64 mori_application_static)
+    set_target_properties(
+      mori_cco_proxy PROPERTIES HIP_ARCHITECTURES "${MORI_CCO_PROXY_HIP_ARCHITECTURES}"
+                                POSITION_INDEPENDENT_CODE ON HIP_STANDARD 17 CXX_STANDARD 17)
+    target_sources(mori_cco PRIVATE $<TARGET_OBJECTS:mori_cco_proxy>)
+    target_compile_definitions(mori_cco PUBLIC MORI_CCO_PROXY=1)
+    target_link_libraries(mori_cco PRIVATE hsa-runtime64::hsa-runtime64)
+  endif()
+endif()
+
 set_target_properties(
   mori_cco
   PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"

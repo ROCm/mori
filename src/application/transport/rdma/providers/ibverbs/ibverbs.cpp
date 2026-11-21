@@ -124,8 +124,8 @@ std::string DescribeQpTransition(const char* transition, const ibv_qp_attr& attr
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      IBVerbsDeviceContext                                      */
 /* ---------------------------------------------------------------------------------------------- */
-IBVerbsDeviceContext::IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd)
-    : RdmaDeviceContext(rdma_device, inPd) {}
+IBVerbsDeviceContext::IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd, bool ownsPd)
+    : RdmaDeviceContext(rdma_device, inPd, ownsPd) {}
 
 IBVerbsDeviceContext::~IBVerbsDeviceContext() {
   std::lock_guard<std::mutex> lock(poolMu);
@@ -134,6 +134,15 @@ IBVerbsDeviceContext::~IBVerbsDeviceContext() {
   for (auto* compCh : compChPool) {
     if (compCh) ibv_destroy_comp_channel(compCh);
   }
+  while (!proxyRecvBuffers.empty()) FreeProxyRecvBufferLocked(proxyRecvBuffers.begin()->first);
+}
+
+void IBVerbsDeviceContext::FreeProxyRecvBufferLocked(uint32_t qpn) {
+  auto it = proxyRecvBuffers.find(qpn);
+  if (it == proxyRecvBuffers.end()) return;
+  if (it->second.mr != nullptr) ibv_dereg_mr(it->second.mr);
+  free(it->second.info.buf);
+  proxyRecvBuffers.erase(it);
 }
 
 RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
@@ -410,6 +419,11 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   // Allocate recv buffer for SEND_WITH_IMM barrier atomic emulation.
   // The actual ibv_post_recv is done in ProxyThread::Init so that
   // replenishment and consumption live in the same object.
+  if (!proxyRecvBuffersEnabled) return;
+  {
+    std::lock_guard<std::mutex> lock(poolMu);
+    if (proxyRecvBuffers.count(local.qpn) != 0) return;  // reconnect: keep the QP's buffer
+  }
   constexpr int kRecvCount = 512;
   constexpr size_t kRecvBufSz = kRecvCount * 64;
   void* rbuf = nullptr;
@@ -420,15 +434,19 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
         ibv_reg_mr(pd, rbuf, kRecvBufSz, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (rmr) {
       std::lock_guard<std::mutex> lock(poolMu);
-      proxyRecvInfo[local.qpn] = {rbuf, rmr->lkey, static_cast<uint32_t>(kRecvCount)};
+      proxyRecvBuffers[local.qpn] = {{rbuf, rmr->lkey, static_cast<uint32_t>(kRecvCount)}, rmr};
+    } else {
+      free(rbuf);
     }
+  } else {
+    free(rbuf);
   }
 }
 
 IBVerbsDeviceContext::ProxyRecvInfo IBVerbsDeviceContext::GetProxyRecvInfo(uint32_t qpn) const {
   std::lock_guard<std::mutex> lock(poolMu);
-  auto it = proxyRecvInfo.find(qpn);
-  if (it != proxyRecvInfo.end()) return it->second;
+  auto it = proxyRecvBuffers.find(qpn);
+  if (it != proxyRecvBuffers.end()) return it->second.info;
   return {nullptr, 0, 0};
 }
 
@@ -442,6 +460,7 @@ bool IBVerbsDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) no
       int ret = ibv_destroy_qp(qpIt->second);
       if (ret == 0) {
         qpPool.erase(qpIt);
+        FreeProxyRecvBufferLocked(ep.handle.qpn);  // nothing can land in it any more
       } else {
         int err = ret > 0 ? ret : errno;
         if (err == 0) err = EIO;

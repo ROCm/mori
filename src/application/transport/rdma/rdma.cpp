@@ -437,7 +437,8 @@ int MaybeAddRelaxedOrderingFlag(int accessFlag) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        RdmaDeviceContext                                       */
 /* ---------------------------------------------------------------------------------------------- */
-RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(device), pd(inPd) {
+RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd, bool ownsPd)
+    : pd(inPd), device(device), ownsPd(ownsPd) {
   InitializeUdpSportConfiguration();
   preferDmabufReg = env::IsEnvVarEnabled("MORI_ENABLE_DMABUF_REG");
 }
@@ -449,7 +450,7 @@ RdmaDeviceContext::~RdmaDeviceContext() {
   mrPool.clear();
 
   if (srq != nullptr) ibv_destroy_srq(srq);
-  ibv_dealloc_pd(pd);
+  if (ownsPd) ibv_dealloc_pd(pd);
 }
 
 RdmaDevice* RdmaDeviceContext::GetRdmaDevice() { return device; }

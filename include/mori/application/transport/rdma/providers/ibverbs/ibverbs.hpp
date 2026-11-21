@@ -31,7 +31,7 @@ namespace application {
 
 class IBVerbsDeviceContext : public RdmaDeviceContext {
  public:
-  IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd);
+  IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd, bool ownsPd = true);
   ~IBVerbsDeviceContext() override;
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
@@ -45,13 +45,25 @@ class IBVerbsDeviceContext : public RdmaDeviceContext {
     uint32_t count;
   };
   ProxyRecvInfo GetProxyRecvInfo(uint32_t qpn) const;
+  // ConnectEndpoint gives each QP a registered receive buffer for the shmem
+  // proxy's SEND_WITH_IMM emulation (GetProxyRecvInfo) unless this is turned
+  // off, e.g. for QPs that never receive. Applies to later ConnectEndpoint
+  // calls. The buffer is freed with its endpoint or with this context.
+  void SetProxyRecvBuffersEnabled(bool enabled) { proxyRecvBuffersEnabled = enabled; }
 
  private:
+  struct ProxyRecvBuffer {
+    ProxyRecvInfo info;
+    ibv_mr* mr;
+  };
+  void FreeProxyRecvBufferLocked(uint32_t qpn);  // caller holds poolMu
+
   mutable std::mutex poolMu;
   std::unordered_map<void*, ibv_cq*> cqPool;
   std::unordered_map<uint32_t, ibv_qp*> qpPool;
   std::vector<ibv_comp_channel*> compChPool;
-  std::unordered_map<uint32_t, ProxyRecvInfo> proxyRecvInfo;
+  std::unordered_map<uint32_t, ProxyRecvBuffer> proxyRecvBuffers;
+  bool proxyRecvBuffersEnabled{true};
 };
 
 class IBVerbsDevice : public RdmaDevice {

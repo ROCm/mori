@@ -63,7 +63,14 @@ inline const char* SdmaCompToChar(SdmaComp comp) {
 //   kLsa   — intra-node flat-VA load/store (no NIC), requires same-node peer.
 //   kIbgda — cross-node one-sided RDMA via ccoGda<PrvdType>.
 //   kSdma  — intra-node SDMA copy-engine via ccoSdma; selected by MORI_ENABLE_SDMA.
-enum class Transport { kLsa, kIbgda, kSdma };
+//   kProxy — one-sided RDMA via ccoProxy (KIWI queue + host proxy threads);
+//            -t proxy only, needs a BUILD_CCO_PROXY build.
+enum class Transport { kLsa, kIbgda, kSdma, kProxy };
+
+// GDA/proxy signal slot used by the ping-pong latency kernels.
+inline constexpr uint32_t kSlotPing = 0;  // ping-pong: the peer's put/signal landed
+inline constexpr int kBenchSignalCount = 4;
+inline constexpr int kDefaultProxyThreads = 4;
 
 inline constexpr std::size_t kDefaultMinSize = 8;
 inline constexpr std::size_t kDefaultMaxSize = 64ULL * 1024ULL * 1024ULL;
@@ -108,7 +115,28 @@ struct PerfArgs {
   // bytes/iter either way, so the two runs isolate the doorbell cost.
   bool aggregate = false;
   int agg_depth = 1;
+  // Latency only: ping-pong instead of put + local completion. Both PEs run;
+  // reported latency = round trip / 2. -P carries data (put + SignalInc),
+  // -S is signal-only. ibgda and proxy.
+  bool pingpong = false;
+  bool signal_only = false;
+  // proxy: host proxy threads (-Q) and queue kind (-q). SPSC: one queue per
+  // issuing unit (block, or wavefront with -s warp). MPSC: one queue per block,
+  // shared by its wavefronts.
+  int proxy_threads = kDefaultProxyThreads;
+  bool proxy_mpsc = false;
+  // proxy (-K): proxyQpsPerPeer; 0 = the engine default.
+  int proxy_qps_per_peer = 0;
 };
+
+// SPSC proxy queues needed so that every issuing wavefront owns one: per block,
+// its wavefronts with warp or thread scope (a thread-scope wavefront pushes its
+// lanes' puts together), else 1; times blocks.
+inline int ProxyUnitsPerBlock(PutScope scope, int threads_per_block, int warp_size) {
+  return scope == PutScope::kWarp || scope == PutScope::kThread
+             ? (threads_per_block + warp_size - 1) / warp_size
+             : 1;
+}
 
 // Holds MPI + CCO state for the lifetime of a benchmark run. PerfInit registers
 // two windows (send/recv) of max_size and a DevComm matching the transport.
@@ -153,7 +181,10 @@ struct PerfRes {
 
 void PerfResAlloc(PerfRes* res);
 void PerfResFree(PerfRes* res);
-float RunWarmupAndTimed(PerfRes& res, std::size_t warmup, std::size_t iters, LaunchFn launch);
+// pre_timed (optional) runs between the warmup and the timed launch, e.g. a
+// cross-rank barrier when both PEs run kernels that wait on each other.
+float RunWarmupAndTimed(PerfRes& res, std::size_t warmup, std::size_t iters, LaunchFn launch,
+                        const std::function<void()>& pre_timed = nullptr);
 
 int ParseArgs(int argc, char** argv, PerfArgs* out_args);
 void PrintUsage(const char* program);
@@ -193,6 +224,8 @@ inline const char* TransportToChar(Transport t) {
       return "ibgda";
     case Transport::kSdma:
       return "sdma";
+    case Transport::kProxy:
+      return "proxy";
   }
   return "none";
 }

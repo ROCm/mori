@@ -207,6 +207,19 @@ __device__ inline void syncThreads() {
 __device__ inline void threadFenceSystem() { __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, ""); }
 // HIP clock64 (amd_device_functions.h): cycle counter for the barrier timeout.
 __device__ inline long long clock64() { return (long long)__builtin_readcyclecounter(); }
+// Timeout in clock64 cycles. s_memtime can jump ~10^8 cycles either way within a
+// wave (gfx942/gfx950), so `now - start` may underflow; count forward steps only.
+struct TimeoutClock {
+  uint64_t last = 0;
+  uint64_t elapsed = 0;
+  __device__ inline void start() { last = static_cast<uint64_t>(clock64()); }
+  __device__ inline bool expired(uint64_t timeoutCycles) {
+    const uint64_t now = static_cast<uint64_t>(clock64());
+    if (now > last) elapsed += now - last;
+    last = now;
+    return elapsed >= timeoutCycles;
+  }
+};
 }  // namespace impl
 #endif  // defined(__HIPCC__) || defined(__CUDACC__)
 
@@ -233,7 +246,8 @@ enum ccoProviderType {
   CCO_PROVIDER_IBVERBS = 4,
 };
 
-// GDA backend QP allocation strategy.
+// RDMA QP allocation strategy: gdaConnectionType for GDA, proxyConnectionType
+// for ccoProxy.
 enum ccoGdaConnectionType {
   CCO_GDA_CONNECTION_NONE = 0,  // no GDA QPs
   // QPs to every RDMA-capable peer, incl. intra-node. Intra-node QPs are
@@ -242,6 +256,9 @@ enum ccoGdaConnectionType {
   CCO_GDA_CONNECTION_CROSSNODE = 2,  // QPs only to cross-node peers (default)
   CCO_GDA_CONNECTION_RAIL = 3,       // QPs only to same-rail cross-node peers
 };
+
+// proxyConnectionType value that follows gdaConnectionType (the default).
+inline constexpr int CCO_PROXY_CONNECTION_FOLLOW_GDA = -1;
 
 enum ccoTeamMode {
   CCO_TEAM_WORLD = 0,
@@ -375,6 +392,39 @@ struct ccoSdmaContext {
   uint64_t** peerSignalPtrs;  // [lsaSize], peer signalBuf base via IPC
 };
 
+// ccoProxy context (host-proxy RDMA; see cco_scale_out.hpp section 6). Kernels invoke host
+// callbacks (KIWI invoke) with descriptors, keys already resolved (the same
+// window addressing as GDA, offset + iovaBias). A fixed set of host proxy threads polls the
+// queues and posts the RDMA work requests on host-created RC QPs,
+// proxyQpsPerPeer per (proxy thread, peer). Two queue pools: SPSC (one
+// wavefront at a time per queue) and MPSC. Empty when both pools are empty.
+//
+// Each pool is one KIWI invoke context; its device context is opaque here so
+// this header stays free of KIWI headers (cco_scale_out.hpp casts it back).
+struct ccoProxyContext {
+  int numSpscQueues;
+  int numMpscQueues;
+  void* spscContext;  // GPU mori::cco::proxy::invoke::DeviceContext<SPSCD2HQueue>*; null if no SPSC
+                      // queues
+  void* mpscContext;  // GPU mori::cco::proxy::invoke::DeviceContext<MPSCD2HQueue>*; null if no MPSC
+                      // queues
+  // [numSpscQueues + numMpscQueues] (SPSC pool, then MPSC pool) FLUSHes the
+  // proxy has satisfied per queue. Fine-grained device memory, written only by
+  // the proxy, never decreases; bit 63 (ccoProxyFailedBit) = DevComm failed.
+  uint64_t* flushDone;
+  // [numSpscQueues + numMpscQueues] (indexed like flushDone) flush tickets taken
+  // per queue. Device memory, written only by kernels (atomic fetch-add), never
+  // decreases.
+  uint64_t* flushTicket;
+  // Largest single RDMA write: ccoProxyMaxPutBytes capped at the smallest
+  // max_msg_sz of any rank's port. put() splits larger transfers.
+  uint32_t maxPutBytes;
+  // Resolved proxy connection type (ccoGdaConnectionType): the peers with proxy
+  // QPs and the team CCO_TEAM_GDA peers index. NONE when no proxy queues.
+  int32_t connType;
+  void* engine;  // host-only ccoProxyEngine*, opaque to kernels
+};
+
 struct ccoDevComm {
   // World / topology
   int rank;
@@ -398,7 +448,8 @@ struct ccoDevComm {
   ccoWindowDevice* resourceWindow;         // GPU pointer into windowTable (host bookkeeping)
   ccoWindowDevice resourceWindow_inlined;  // inlined snapshot; kernels read from cmem directly
 
-  // IBGDA context (QP + signal + counter); empty when gdaConnType==NONE.
+  // IBGDA context (QP + signal + counter). No QPs when gdaConnType==NONE;
+  // signal/counter slots also exist when proxy.connType != NONE.
   ccoIbgdaContext ibgda;
   // Standalone barriers:
   //   * lsaBarrier            — intra-node, driven by reqs.lsaBarrierCount
@@ -414,10 +465,21 @@ struct ccoDevComm {
   ccoGdaBarrierHandle hybridRailGdaBarrier;
   // SDMA context (signal pool); empty when SDMA not materialized.
   ccoSdmaContext sdma;
+  // ccoProxy context (host-proxy RDMA); empty when no proxy queues are requested.
+  ccoProxyContext proxy;
 };
 typedef ccoDevComm* ccoDevComm_t;
 static_assert(std::is_trivially_copyable<ccoDevComm>::value,
               "ccoDevComm must be trivially copyable for hipMemcpy");
+// Kernels and the JIT bitcode snapshot this layout.
+static_assert(sizeof(ccoProxyContext) == 56 && offsetof(ccoProxyContext, flushDone) == 24 &&
+                  offsetof(ccoProxyContext, flushTicket) == 32 &&
+                  offsetof(ccoProxyContext, maxPutBytes) == 40 &&
+                  offsetof(ccoProxyContext, connType) == 44 &&
+                  offsetof(ccoProxyContext, engine) == 48,
+              "ccoProxyContext layout is ABI");
+static_assert(sizeof(ccoDevComm) == 256 && offsetof(ccoDevComm, proxy) == 200,
+              "ccoDevComm layout is ABI");
 
 // Look up a registered window by a local pointer that lies within it. Backend-
 // agnostic accessor over the window table built into ccoDevComm above.
@@ -488,24 +550,65 @@ struct ccoDevCommRequirements {
   // Hybrid barrier (LSA + GDA-Rail two-stage). Drives BOTH
   // hybridLsaBarrier and hybridRailGdaBarrier with the same N.
   int barrierCount;
+
+  // ccoProxy (host-proxy RDMA; the host engine is built by default for gfx942/gfx950
+  // and MORI_CCO_DISABLE_PROXY=1 turns it off at run time). Separate SPSC and
+  // MPSC queue pools (ccoProxy<> and
+  // ccoProxy<mori::cco::proxy::queue::MPSCD2HQueue> index their own pool),
+  // polled by proxyThreadCount host threads. Proxy QPs go to the peers
+  // of proxyConnectionType; signals use the GDA signal slots (gdaSignalCount).
+  // Every rank must pass the same queue, thread and QP counts, connection type
+  // and gdaSignalCount (checked; creation fails otherwise), and the GPU's VRAM must be
+  // host-mapped (large BAR). Each DevComm with proxy queues starts its own
+  // busy-polling threads, pinned by the same policy (MORI_CCO_PROXY_CPUS or the
+  // GPU-local cores), so several such DevComms oversubscribe the same CPUs;
+  // prefer one per comm. MORI_CCO_PROXY_CPUS applies to the whole process tree:
+  // with several ranks per node, set it per rank.
+  int proxySpscQueueCount;  // 0 = no SPSC pool
+  int proxyMpscQueueCount;  // 0 = no MPSC pool
+  int proxyThreadCount;     // host proxy threads (0 = 4), capped at the total queue count
+  int proxyQueueCapacity;   // ring capacity in 64-byte lines (power of two); 0 = default.
+                            // ccoProxy lane-masked ops (ccoCoopLaneMasked) need up to 2
+                            // lines per active lane (128 for a full wavefront of
+                            // put+signal); smaller rings trap.
+  // RC QPs per (proxy thread, peer); 0 = 4.
+  // Each queue posts on one of its thread's QPs per peer (round robin over the
+  // thread's queues); a thread creates no more than it owns queues. Several QPs
+  // let NICs that serve each QP serially (e.g. ionic) run a thread's queues in
+  // parallel; the default 4 does no harm on mlx5. Same on every rank.
+  int proxyQpsPerPeer;
+  // Peers that get proxy QPs, as a ccoGdaConnectionType resolved like
+  // gdaConnectionType (CROSSNODE on one node, no RDMA or no matching peer ->
+  // NONE; proxy queues then fail creation). CCO_PROXY_CONNECTION_FOLLOW_GDA
+  // (-1, the default) follows gdaConnectionType.
+  // Independent of the GDA QPs: gdaConnectionType NONE + proxyConnectionType
+  // FULL gives a proxy-only DevComm. ccoProxy's CCO_TEAM_GDA peers index this
+  // type's team, as ccoGda's index gdaConnectionType's.
+  int proxyConnectionType;
 };
 
-#define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                   \
-  {                                                                             \
-      sizeof(::mori::cco::ccoDevCommRequirements),                              \
-      ::mori::cco::CCO_API_MAGIC,                                               \
-      ::mori::cco::CCO_API_VERSION,                                             \
-      nullptr,                                   /* resourceRequirementsList */ \
-      ::mori::cco::CCO_GDA_CONNECTION_CROSSNODE, /* gdaConnectionType */        \
-      4,                                         /* gdaContextCount    */       \
-      16,                                        /* gdaSignalCount     */       \
-      16,                                        /* gdaCounterCount    */       \
-      0,                                         /* gdaQueueDepth      */       \
-      -1,                                        /* gdaTrafficClass    */       \
-      0,                                         /* lsaBarrierCount    */       \
-      0,                                         /* railGdaBarrierCount*/       \
-      0,                                         /* sdmaQueueCount     */       \
-      0,                                         /* barrierCount       */       \
+#define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                      \
+  {                                                                                \
+      sizeof(::mori::cco::ccoDevCommRequirements),                                 \
+      ::mori::cco::CCO_API_MAGIC,                                                  \
+      ::mori::cco::CCO_API_VERSION,                                                \
+      nullptr,                                      /* resourceRequirementsList */ \
+      ::mori::cco::CCO_GDA_CONNECTION_CROSSNODE,    /* gdaConnectionType */        \
+      4,                                            /* gdaContextCount    */       \
+      16,                                           /* gdaSignalCount     */       \
+      16,                                           /* gdaCounterCount    */       \
+      0,                                            /* gdaQueueDepth      */       \
+      -1,                                           /* gdaTrafficClass    */       \
+      0,                                            /* lsaBarrierCount    */       \
+      0,                                            /* railGdaBarrierCount*/       \
+      0,                                            /* sdmaQueueCount     */       \
+      0,                                            /* barrierCount       */       \
+      0,                                            /* proxySpscQueueCount*/       \
+      0,                                            /* proxyMpscQueueCount*/       \
+      0,                                            /* proxyThreadCount   */       \
+      0,                                            /* proxyQueueCapacity */       \
+      0,                                            /* proxyQpsPerPeer    */       \
+      ::mori::cco::CCO_PROXY_CONNECTION_FOLLOW_GDA, /* proxyConnectionType*/       \
   }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -551,6 +654,20 @@ struct ccoCoopBlock {
   __device__ int thread_rank() const { return impl::threadIdxX(); }
   __device__ int size() const { return impl::blockDimX(); }
   __device__ void sync() { impl::syncThreads(); }
+};
+
+// ccoProxy's per-lane Coop for put / putValue / signal: all 64 lanes call from
+// converged code and each lane with `active` true issues its own op (see
+// cco_scale_out.hpp section 6), e.g.
+//   proxy.put(peer, dstWin, dstOff, srcWin, srcOff, bytes, ccoGda_NoSignal{},
+//             ccoCoopLaneMasked{i < n});
+// As a group it is a single thread (thread_rank 0, size 1, no-op sync).
+// ccoProxy only: ccoGda rejects it at compile time.
+struct ccoCoopLaneMasked {
+  bool active = true;
+  __device__ int thread_rank() const { return 0; }
+  __device__ int size() const { return 1; }
+  __device__ void sync() {}
 };
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -762,10 +879,8 @@ __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t ti
   const int myRank = this->team.rank;
   int ret = 0;
 
-  uint64_t startCycle;
-  if constexpr (EnableTimeout) {
-    startCycle = (uint64_t)impl::clock64();
-  }
+  impl::TimeoutClock clk;
+  if constexpr (EnableTimeout) clk.start();
 
   for (int i = this->coop.thread_rank(); i < nranks - 1; i += this->coop.size()) {
     int peer = i + ((i >= myRank) ? 1 : 0);
@@ -778,7 +893,7 @@ __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t ti
       if ((got - (uint32_t)(this->epoch + 1)) <= ((uint32_t)-1 >> 1)) break;
 
       if constexpr (EnableTimeout) {
-        if ((uint64_t)impl::clock64() - startCycle >= timeoutCycles) {
+        if (clk.expired(timeoutCycles)) {
           ret = 1;
           goto done;
         }
@@ -917,6 +1032,10 @@ struct ccoComm {
 
   std::vector<ccoWindowHost*> windows;
 
+  // Live ccoProxy engines (ccoProxyEngine*, one per DevComm with proxy queues),
+  // so ccoCommDestroy can stop any whose DevComm was never destroyed.
+  std::vector<void*> proxyEngines;
+
   struct WindowTableEntry {
     uintptr_t base;
     uintptr_t size;
@@ -954,6 +1073,10 @@ struct ccoUniqueId {
 int ccoGetUniqueId(ccoUniqueId* uniqueId);
 int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
                   ccoComm** comm);
+// Destroy every DevComm first. A DevComm with ccoProxy queues left alive is
+// warned about and its proxy engine stopped here; its other device resources
+// stay allocated until ccoDevCommDestroy(nullptr, &devComm), the only call that
+// may still take it.
 int ccoCommDestroy(ccoComm* comm);
 
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──
@@ -999,9 +1122,55 @@ void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe);
 // outDevComm is a caller-provided host struct filled in place (it holds device
 // pointers but lives on the host). Pass it by value into kernels — it lands in
 // kernel-arg space, no per-access GPU-memory dereference. The device resources
-// it references are released by ccoDevCommDestroy(comm, &devComm).
+// it references are released by ccoDevCommDestroy(comm, &devComm), on the
+// struct ccoDevCommCreate filled (not a copy), once. Destroy is local: it never
+// waits for other ranks. With ccoProxy queues, no peer may still push to this
+// rank: end the last kernels with flush(), synchronize, then barrier the ranks
+// (ccoBarrierAll) before destroying; a peer's op still in flight fails.
 int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm);
 int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
+
+// A DevComm fails for good at its first ccoProxy error, seen only by the rank
+// that hit it (peers are not told). ccoProxy calls that trap on it (flush(),
+// waitSignal()) end the process: HIP reports the queue error and aborts. To
+// keep the process, wait with ccoProxy::flush(coop, timeoutCycles) /
+// waitSignal(..., timeoutCycles) (2 = failed) or poll failed(), and read the
+// cause with ccoDevCommGetError; receivers need their own timeout, since a
+// failed sender sends nothing more. Recovery: agree out of band, then every
+// rank calls ccoDevCommDestroy and creates the DevComm again.
+// Other DevComms are unaffected.
+enum ccoDevCommErrorCode {
+  CCO_DEVCOMM_OK = 0,
+  CCO_PROXY_ERR_BAD_REQUEST = 1,  // an op the proxy cannot post (no QP to the peer, bad descriptor)
+  CCO_PROXY_ERR_POST = 2,         // ibv_post_send failed
+  CCO_PROXY_ERR_COMPLETION = 3,   // a work request completed with an error
+  CCO_PROXY_ERR_INTERNAL = 4,     // CQ poll failure, corrupted queue, proxy thread exception
+};
+
+// The first error of a DevComm. Unknown int fields are -1.
+struct ccoDevCommError {
+  int code;            // ccoDevCommErrorCode
+  int rank;            // reporting rank
+  int peer;            // world rank of the failed op's target
+  int queue;           // proxy queue (SPSC pool, then MPSC pool)
+  int op;              // BAD_REQUEST: ccoProxyOp; POST / COMPLETION: ibv_wr_opcode of the WR
+  int wcStatus;        // COMPLETION: ibv_wc_status
+  uint32_t vendorErr;  // COMPLETION: ibv_wc::vendor_err
+  int sysErrno;        // POST / INTERNAL: errno, or 0
+  uint64_t wrId;       // per-QP WR sequence number, or 0
+  uint64_t raddr;      // remote window offset of the failed WR
+  uint32_t rkey;
+  uint32_t len;
+  uint64_t suppressed;  // later errors, not reported
+  char message[160];
+};
+static_assert(std::is_trivially_copyable<ccoDevCommError>::value,
+              "ccoDevCommError is copied out by value");
+
+// 1 = devComm failed (*err filled), 0 = healthy or no ccoProxy queues (*err
+// zeroed), -1 = bad arguments. Local and HIP-free: safe from any thread while
+// kernels run and during stream capture.
+int ccoDevCommGetError(ccoComm* comm, const ccoDevComm* devComm, ccoDevCommError* err);
 
 // Upload a host-side DevComm shadow to device memory so kernels can take a
 // pointer to it (host memory is not GPU-accessible).  Returns a hipMalloc'd

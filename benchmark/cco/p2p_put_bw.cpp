@@ -25,6 +25,12 @@
 //   -t lsa   : intra-node flat-VA store loop (no NIC).
 //   -t sdma  : intra-node copy engine via ccoSdma.
 //   -t ibgda : cross-node one-sided RDMA write via ccoGda<PrvdType>.
+//   -t proxy : one-sided RDMA write via ccoProxy (KIWI queue + -Q host proxy
+//              threads). Same split and completion as ibgda: each unit puts its
+//              slice every iteration, then flushes its queue.
+//              -q spsc: one queue per unit (per wavefront with -s thread);
+//              -q mpsc: one queue per block. Small sizes with -s warp or
+//              -s thread and many blocks give the message rate (Mpps column).
 //
 // lsa/ibgda split the buffer into `nblocks` chunks (one per block); scope sets
 // the per-chunk cooperation granularity (block/warp/thread). sdma splits over
@@ -105,6 +111,61 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   }
   gda.flush(ccoCoopBlock{});
 }
+
+#ifdef MORI_CCO_PROXY
+// Proxy: the ibgda kernel's geometry and completion. A unit puts its slice every
+// iteration, then a flush waits until its puts completed (remote ack) -- the
+// counterpart of ibgda's trailing flush. SPSC: wavefront w of block b owns
+// queue b * wavefronts per block + w, or block b owns queue b with
+// ccoCoopBlock; MPSC: the block's wavefronts share queue b.
+template <typename Q, typename Coop>
+__global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
+                             ccoDevComm devComm, int iter) {
+  Coop coop;
+  const int bid = blockIdx.x;
+  const int nblocks = gridDim.x;
+  const int peer = !devComm.rank;
+  const size_t chunk = len_doubles / static_cast<size_t>(nblocks);
+
+  const int tid = linear_tid();
+  const int unit = tid / coop.size();
+  const int nunits = (blockDim.x * blockDim.y * blockDim.z) / coop.size();
+  const size_t per_unit = chunk / static_cast<size_t>(nunits);
+  const size_t base = static_cast<size_t>(bid) * chunk + static_cast<size_t>(unit) * per_unit;
+  const size_t off_bytes = base * sizeof(double);
+  const size_t bytes = per_unit * sizeof(double);
+
+  constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
+  const int wave = __builtin_amdgcn_wavefrontsize();
+  const int waves = (blockDim.x * blockDim.y * blockDim.z + wave - 1) / wave;
+  const int spscQueue = std::is_same_v<Coop, ccoCoopBlock> ? bid : bid * waves + tid / wave;
+  ccoProxy<Q> proxy{devComm, ccoProxy<Q>::kSpsc ? spscQueue : bid};
+  for (int i = 0; i < iter; i++) {
+    proxy.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), off_bytes,
+              reinterpret_cast<ccoWindow_t>(sendWin), off_bytes, bytes, ccoGda_NoSignal{}, coop);
+  }
+  if constexpr (kLaneMasked) {
+    proxy.flush();  // one flush for the wavefront
+  } else {
+    proxy.flush(coop);
+  }
+}
+
+template <typename Q>
+static void launch_proxy(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,
+                         ccoWindow_t recvWin, size_t len_doubles, ccoDevComm devComm, int count) {
+  if (scope == PutScope::kWarp) {
+    hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopWarp>), grid, block, 0, 0, sendWin, recvWin,
+                       len_doubles, devComm, count);
+  } else if (scope == PutScope::kThread) {
+    hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopLaneMasked>), grid, block, 0, 0, sendWin, recvWin,
+                       len_doubles, devComm, count);
+  } else {
+    hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopBlock>), grid, block, 0, 0, sendWin, recvWin,
+                       len_doubles, devComm, count);
+  }
+}
+#endif  // MORI_CCO_PROXY
 
 // SDMA: the buffer is split over issue units -- a unit is a thread, a wavefront or
 // a whole block, per Coop -- spread across the grid, one queue per unit round
@@ -236,6 +297,18 @@ int main(int argc, char** argv) {
 
   PerfArgs& args = ctx.args;
   const int my_pe = ctx.my_pe;
+  const bool proxy = args.transport == Transport::kProxy;
+  // -s thread: ccoCoopLaneMasked, which issues from whole wavefronts (a KIWI
+  // push is wavefront-collective).
+  if (proxy && (args.put_scope == PutScope::kThreadAgg ||
+                (args.put_scope == PutScope::kThread &&
+                 args.threads_per_block % ctx.device_warp_size != 0))) {
+    if (my_pe == 0) {
+      std::fprintf(stderr, "-t proxy needs -s thread|warp|block (thread: -T whole wavefronts)\n");
+    }
+    PerfFinalize(&ctx);
+    return 1;
+  }
   const bool run_kernels = (my_pe == 0);  // unidirectional: PE 0 issues
 
   const dim3 grid(args.nblocks, 1, 1);
@@ -268,7 +341,19 @@ int main(int argc, char** argv) {
 
     if (run_kernels) {
       const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, [&](int count) {
-        if (args.transport == Transport::kSdma) {
+        if (proxy) {
+#ifdef MORI_CCO_PROXY
+          if (args.proxy_mpsc) {
+            launch_proxy<mori::cco::proxy::queue::MPSCD2HQueue>(args.put_scope, grid, block,
+                                                                ctx.send_win, ctx.recv_win,
+                                                                len_doubles, ctx.devComm, count);
+          } else {
+            launch_proxy<mori::cco::proxy::queue::SPSCD2HQueue>(args.put_scope, grid, block,
+                                                                ctx.send_win, ctx.recv_win,
+                                                                len_doubles, ctx.devComm, count);
+          }
+#endif
+        } else if (args.transport == Transport::kSdma) {
           launch_sdma(args.put_scope, ctx.send_win, ctx.recv_win, len_doubles, ctx.devComm,
                       ctx.peer_lsa_rank, count, ctx.device_warp_size, args.agg_depth,
                       args.aggregate, args.nblocks_explicit ? args.nblocks : 1,

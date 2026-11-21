@@ -25,6 +25,11 @@
 //   -t lsa   : single flat-VA store of the whole buffer + system fence.
 //   -t sdma  : single copy-engine put + completion wait (-C quiet | signal).
 //   -t ibgda : single RDMA write + flush per iteration.
+//   -t proxy : ccoProxy (KIWI queue + host proxy): single put + flush per
+//              iteration, the counterpart of ibgda's put + flush.
+//
+// -P / -S (ibgda, proxy): ping-pong instead -- PE 0 sends put + SignalInc (-P)
+// or a bare signal (-S), PE 1 echoes it back; latency = round trip / 2.
 
 #include <cstdio>
 #include <cstdlib>
@@ -118,6 +123,81 @@ __global__ void sdma_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   }
 }
 
+#ifdef MORI_CCO_PROXY
+// Proxy: one put of the whole buffer + flush (the put completed, remote side
+// acknowledged) per iteration, on SPSC queue 0. Coop is the issue
+// scope (warp / block).
+template <typename Coop>
+__global__ void proxy_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t bytes,
+                              ccoDevComm devComm, int iter) {
+  if (blockIdx.x != 0) return;
+  ccoProxy<> proxy{devComm, 0};
+  const int peer = !devComm.rank;
+  for (int i = 0; i < iter; i++) {
+    proxy.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), 0,
+              reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, ccoGda_NoSignal{}, Coop{});
+    proxy.flush(Coop{});
+  }
+}
+#endif
+
+// Ping-pong: PE 0 sends, PE 1 echoes. A send is put + SignalInc (a bare signal
+// when SignalOnly) into the peer's kSlotPing; each side then waits for
+// (consumes) the other's. Xport is ccoGda<P> or ccoProxy -- same put / signal /
+// waitSignal API -- so both transports run the identical kernel.
+template <typename Xport, typename Coop, bool SignalOnly>
+__global__ void pingpong_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t bytes,
+                             ccoDevComm devComm, int iter) {
+  if (blockIdx.x != 0) return;
+  Xport xport{devComm, 0};
+  Coop coop;
+  const int me = devComm.rank;
+  const int peer = !me;
+  auto send = [&]() {
+    if constexpr (SignalOnly) {
+      xport.signal(peer, ccoGda_SignalInc{kSlotPing}, coop);
+    } else {
+      xport.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), 0,
+                reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, ccoGda_SignalInc{kSlotPing},
+                coop);
+    }
+  };
+  for (int i = 0; i < iter; i++) {
+    if (me == 0) {
+      send();
+      xport.waitSignal(kSlotPing, 1, coop);
+    } else {
+      xport.waitSignal(kSlotPing, 1, coop);
+      send();
+    }
+  }
+}
+
+template <typename Xport, typename Coop>
+static void launch_pingpong_scope(bool signal_only, dim3 block, ccoWindowDevice* sendWin,
+                                  ccoWindowDevice* recvWin, size_t bytes, ccoDevComm devComm,
+                                  int iter) {
+  if (signal_only) {
+    hipLaunchKernelGGL((pingpong_lat<Xport, Coop, true>), dim3(1), block, 0, 0, sendWin, recvWin,
+                       bytes, devComm, iter);
+  } else {
+    hipLaunchKernelGGL((pingpong_lat<Xport, Coop, false>), dim3(1), block, 0, 0, sendWin, recvWin,
+                       bytes, devComm, iter);
+  }
+}
+
+template <typename Xport>
+static void launch_pingpong(PutScope scope, bool signal_only, dim3 block, ccoWindowDevice* sendWin,
+                            ccoWindowDevice* recvWin, size_t bytes, ccoDevComm devComm, int iter) {
+  if (scope == PutScope::kWarp) {
+    launch_pingpong_scope<Xport, ccoCoopWarp>(signal_only, block, sendWin, recvWin, bytes, devComm,
+                                              iter);
+  } else {
+    launch_pingpong_scope<Xport, ccoCoopBlock>(signal_only, block, sendWin, recvWin, bytes, devComm,
+                                               iter);
+  }
+}
+
 template <typename Coop>
 static void launch_sdma_lat_scope(SdmaComp comp, dim3 block, ccoWindowDevice* sendWin,
                                   ccoWindowDevice* recvWin, size_t len_doubles, ccoDevComm devComm,
@@ -161,7 +241,33 @@ int main(int argc, char** argv) {
 
   PerfArgs& args = ctx.args;
   const int my_pe = ctx.my_pe;
-  const bool run_kernels = (my_pe == 0);
+
+  if (args.transport == Transport::kProxy && args.put_scope != PutScope::kWarp &&
+      args.put_scope != PutScope::kBlock) {
+    if (my_pe == 0) std::fprintf(stderr, "-t proxy needs -s warp|block\n");
+    PerfFinalize(&ctx);
+    return 1;
+  }
+  if (args.proxy_mpsc) {
+    if (my_pe == 0) std::fprintf(stderr, "-q mpsc is cco_p2p_put_bw only\n");
+    PerfFinalize(&ctx);
+    return 1;
+  }
+  if (args.pingpong) {
+    const bool rdma = args.transport == Transport::kIbgda || args.transport == Transport::kProxy;
+    const bool scope_ok = args.put_scope == PutScope::kWarp || args.put_scope == PutScope::kBlock;
+    if (!rdma || !scope_ok) {
+      if (my_pe == 0) {
+        std::fprintf(stderr,
+                     "ping-pong (-P / -S, -t proxy) needs -t ibgda|proxy and -s warp|block\n");
+      }
+      PerfFinalize(&ctx);
+      return 1;
+    }
+    if (args.signal_only) args.max_size = args.min_size;  // no payload: one row
+  }
+  // Ping-pong needs both PEs in the kernel; otherwise PE 0 issues alone.
+  const bool run_kernels = (my_pe == 0) || args.pingpong;
 
   // SDMA keeps its historical thread-scope default; -s selects warp/block.
   if (args.transport == Transport::kSdma && !args.put_scope_explicit) {
@@ -195,8 +301,34 @@ int main(int argc, char** argv) {
     }
 
     if (run_kernels) {
-      const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, [&](int count) {
-        if (args.transport == Transport::kSdma) {
+      // Both PEs run kernels that wait on each other: line them up before timing.
+      std::function<void()> pre_timed;
+      if (args.pingpong) pre_timed = [&]() { ccoBarrierAll(ctx.comm); };
+      auto launch = [&](int count) {
+        if (args.pingpong) {
+          const size_t bytes = len_doubles * sizeof(double);
+          if (args.transport == Transport::kProxy) {
+#ifdef MORI_CCO_PROXY
+            launch_pingpong<ccoProxy<>>(args.put_scope, args.signal_only, block, ctx.send_win,
+                                        ctx.recv_win, bytes, ctx.devComm, count);
+#endif
+          } else {
+            CCO_GDA_DISPATCH(launch_pingpong<ccoGda<P>>(args.put_scope, args.signal_only, block,
+                                                        ctx.send_win, ctx.recv_win, bytes,
+                                                        ctx.devComm, count));
+          }
+        } else if (args.transport == Transport::kProxy) {
+#ifdef MORI_CCO_PROXY
+          const size_t bytes = len_doubles * sizeof(double);
+          if (args.put_scope == PutScope::kWarp) {
+            hipLaunchKernelGGL((proxy_put_lat<ccoCoopWarp>), grid, block, 0, 0, ctx.send_win,
+                               ctx.recv_win, bytes, ctx.devComm, count);
+          } else {
+            hipLaunchKernelGGL((proxy_put_lat<ccoCoopBlock>), grid, block, 0, 0, ctx.send_win,
+                               ctx.recv_win, bytes, ctx.devComm, count);
+          }
+#endif
+        } else if (args.transport == Transport::kSdma) {
           launch_sdma_lat(args.put_scope, args.sdma_comp, ctx.send_win, ctx.recv_win, len_doubles,
                           ctx.devComm, ctx.peer_lsa_rank, count, block_threads);
         } else if (args.transport == Transport::kLsa) {
@@ -207,11 +339,13 @@ int main(int argc, char** argv) {
                                               ctx.recv_win, len_doubles, ctx.devComm, count));
         }
         HIP_RUNTIME_CHECK(hipGetLastError());
-      });
+      };
+      const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, launch, pre_timed);
 
+      // Ping-pong times round trips; report the one-way half.
       const double latency_us = (static_cast<double>(ms) * static_cast<double>(kMsToUs)) /
-                                static_cast<double>(args.iters);
-      table.push_back(PerfTableRow{size_bytes, false, latency_us});
+                                static_cast<double>(args.iters) / (args.pingpong ? 2.0 : 1.0);
+      if (my_pe == 0) table.push_back(PerfTableRow{size_bytes, false, latency_us});
     }
 
     ccoBarrierAll(ctx.comm);
@@ -230,9 +364,14 @@ int main(int argc, char** argv) {
     if (args.transport == Transport::kSdma) {
       std::printf("# sdma completion = %s\n", SdmaCompToChar(args.sdma_comp));
     }
-    PrintPerfTable("p2p_put_latency unidirection", TransportToChar(args.transport), print_scope, 1,
-                   print_block, ctx.device_warp_size, args.iters, args.warmup,
-                   PerfTableMetric::kLatencyUs, table);
+    const char* test_name = "p2p_put_latency unidirection";
+    if (args.pingpong) {
+      test_name = args.signal_only ? "p2p_signal_latency pingpong (rtt/2)"
+                                   : "p2p_put_signal_latency pingpong (rtt/2)";
+    }
+    PrintPerfTable(test_name, TransportToChar(args.transport), print_scope, 1, print_block,
+                   ctx.device_warp_size, args.iters, args.warmup, PerfTableMetric::kLatencyUs,
+                   table);
   }
 
   if (run_kernels) {

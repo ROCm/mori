@@ -74,6 +74,8 @@ option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
 option(BUILD_OPS_DEVICE "AOT compile EP kernels to .hsaco(requires hipcc)" OFF)
+option(BUILD_CCO_PROXY
+       "Build the ccoProxy host engine (cco host-proxy RDMA transport; ROCm, gfx942/gfx950)" ON)
 option(BUILD_OPS_KIWI "Build the KIWI EP dispatch/combine kernels (ROCm only)" OFF)
 option(MORI_MULTITHREAD_SUPPORT
        "Enable single-process multi-thread multi-GPU support in mori_shmem" OFF)
@@ -341,6 +343,13 @@ endif()
 
 if(BUILD_SHMEM)
   add_subdirectory(src/shmem)
+endif()
+
+# ccoProxy's host engine needs ROCm and cco; its device API is always part of
+# cco_scale_out.hpp.
+if(BUILD_CCO_PROXY AND NOT (USE_ROCM AND BUILD_CCO))
+  message(STATUS "BUILD_CCO_PROXY: needs USE_ROCM and BUILD_CCO; ccoProxy host engine not built")
+  set(BUILD_CCO_PROXY OFF)
 endif()
 
 if(BUILD_CCO)

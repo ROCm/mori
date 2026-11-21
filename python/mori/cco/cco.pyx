@@ -13,6 +13,7 @@ from .cco cimport (
     CCO_API_MAGIC, CCO_API_VERSION,
     CCO_GDA_CONNECTION_NONE, CCO_GDA_CONNECTION_FULL,
     CCO_GDA_CONNECTION_CROSSNODE, CCO_GDA_CONNECTION_RAIL,
+    CCO_PROXY_CONNECTION_FOLLOW_GDA,
     ccoGetUniqueId, ccoCommCreate, ccoCommDestroy,
     ccoMemAlloc, ccoMemImport, ccoMemFree,
     ccoWindowDeregister, ccoDevCommCreate, ccoDevCommDestroy,
@@ -29,6 +30,8 @@ GDA_CONNECTION_NONE      = CCO_GDA_CONNECTION_NONE
 GDA_CONNECTION_FULL      = CCO_GDA_CONNECTION_FULL
 GDA_CONNECTION_CROSSNODE = CCO_GDA_CONNECTION_CROSSNODE
 GDA_CONNECTION_RAIL      = CCO_GDA_CONNECTION_RAIL
+# proxy_connection_type value that follows gda_connection_type (the default)
+PROXY_CONNECTION_FOLLOW_GDA = CCO_PROXY_CONNECTION_FOLLOW_GDA
 
 
 ###############################################################################
@@ -74,9 +77,11 @@ cdef class Comm:
     """Opaque communicator handle. Owns the underlying ccoComm*."""
 
     def __dealloc__(self):
-        if self._ptr != NULL:
-            ccoCommDestroy(self._ptr)
+        cdef ccoComm* ptr = self._ptr
+        if ptr != NULL:
             self._ptr = NULL
+            with nogil:
+                ccoCommDestroy(ptr)
 
     @property
     def ptr(self):
@@ -110,6 +115,12 @@ cdef class DevCommRequirements:
         self._reqs.railGdaBarrierCount = 0
         self._reqs.sdmaQueueCount = 0
         self._reqs.barrierCount = 0
+        self._reqs.proxySpscQueueCount = 0
+        self._reqs.proxyMpscQueueCount = 0
+        self._reqs.proxyThreadCount = 0
+        self._reqs.proxyQueueCapacity = 0
+        self._reqs.proxyQpsPerPeer = 0
+        self._reqs.proxyConnectionType = CCO_PROXY_CONNECTION_FOLLOW_GDA
 
     @property
     def gda_connection_type(self):
@@ -190,6 +201,61 @@ cdef class DevCommRequirements:
     @barrier_count.setter
     def barrier_count(self, int val):
         self._reqs.barrierCount = val
+
+    @property
+    def proxy_spsc_queue_count(self):
+        """SPSC proxy queues (one wavefront at a time per queue); 0 = none."""
+        return self._reqs.proxySpscQueueCount
+
+    @proxy_spsc_queue_count.setter
+    def proxy_spsc_queue_count(self, int val):
+        self._reqs.proxySpscQueueCount = val
+
+    @property
+    def proxy_mpsc_queue_count(self):
+        """MPSC proxy queues (any number of wavefronts); 0 = none."""
+        return self._reqs.proxyMpscQueueCount
+
+    @proxy_mpsc_queue_count.setter
+    def proxy_mpsc_queue_count(self, int val):
+        self._reqs.proxyMpscQueueCount = val
+
+    @property
+    def proxy_thread_count(self):
+        """Host proxy threads (0 = 4), capped at the total queue count."""
+        return self._reqs.proxyThreadCount
+
+    @proxy_thread_count.setter
+    def proxy_thread_count(self, int val):
+        self._reqs.proxyThreadCount = val
+
+    @property
+    def proxy_queue_capacity(self):
+        """Ring size in 64-byte lines, a power of two (0 = 4096)."""
+        return self._reqs.proxyQueueCapacity
+
+    @proxy_queue_capacity.setter
+    def proxy_queue_capacity(self, int val):
+        self._reqs.proxyQueueCapacity = val
+
+    @property
+    def proxy_qps_per_peer(self):
+        """RC QPs per (proxy thread, peer) (0 = 4)."""
+        return self._reqs.proxyQpsPerPeer
+
+    @proxy_qps_per_peer.setter
+    def proxy_qps_per_peer(self, int val):
+        self._reqs.proxyQpsPerPeer = val
+
+    @property
+    def proxy_connection_type(self):
+        """Proxy QP peer set (a GDA_CONNECTION_* value), or PROXY_CONNECTION_FOLLOW_GDA (-1, the
+        default) to follow gda_connection_type."""
+        return self._reqs.proxyConnectionType
+
+    @proxy_connection_type.setter
+    def proxy_connection_type(self, int val):
+        self._reqs.proxyConnectionType = val
 
 
 ###############################################################################

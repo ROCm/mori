@@ -28,6 +28,7 @@ examples/cco/
 | `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA device APIs |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (includes only `cco_scale_out.hpp`) |
+| `cpp/03_proxy_put.cpp` | c++ | ccoProxy (host-proxy RDMA) put + SignalSet/wait on a proxy-only DevComm, timeouts and `ccoDevCommGetError` |
 
 GDA examples move data over RDMA (cross-node capable). LSA examples are
 intra-node only: cco hands the kernel the peer's load/store-accessible VA and the
@@ -208,6 +209,7 @@ SP=$(python3 -c 'import mori, os; print(os.path.dirname(mori.__file__))')
 export MORI_SOCKET_IFNAME=<iface>
 mpirun --allow-run-as-root -n 2 $SP/examples/cco/cco_lsa_put
 mpirun --allow-run-as-root -n 2 $SP/examples/cco/cco_gda_put
+mpirun --allow-run-as-root -n 2 $SP/examples/cco/cco_proxy_put
 ```
 
 **(b) Build in a local `build/` and run in place** (dev loop):
@@ -216,10 +218,11 @@ mpirun --allow-run-as-root -n 2 $SP/examples/cco/cco_gda_put
 cd <repo>
 pip install pybind11 -q
 cmake -S . -B build -GNinja -DBUILD_EXAMPLES=ON -DGPU_TARGETS=gfx942
-ninja -C build cco_lsa_put cco_gda_put
+ninja -C build cco_lsa_put cco_gda_put cco_proxy_put
 export MORI_SOCKET_IFNAME=<iface>
 mpirun --allow-run-as-root -n 2 ./build/examples/cco_lsa_put     # no LD_LIBRARY_PATH needed
 mpirun --allow-run-as-root -n 2 ./build/examples/cco_gda_put
+mpirun --allow-run-as-root -n 2 ./build/examples/cco_proxy_put  # gfx942 / gfx950 only
 ```
 
 The example binaries carry an `$ORIGIN/../..` rpath (for the installed location)
