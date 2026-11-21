@@ -702,9 +702,14 @@ static ShmemMode ConfigureShmemMode() {
 
 // Initialize bootstrap states from bootstrap network
 static void InitializeBootStates(ShmemStates* states, application::BootstrapNetwork* bootNet) {
+  try {
+    bootNet->Initialize();
+  } catch (...) {
+    delete bootNet;  // we own it; deleting closes what Initialize() opened
+    throw;
+  }
   states->bootStates = new BootStates();
   states->bootStates->bootNet = bootNet;
-  states->bootStates->bootNet->Initialize();
   states->bootStates->rank = states->bootStates->bootNet->GetLocalRank();
   states->bootStates->worldSize = states->bootStates->bootNet->GetWorldSize();
 
