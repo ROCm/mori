@@ -50,8 +50,8 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
   grpc::Status Attach(grpc::ServerContext*, const pb::AttachRequest* request,
                       pb::AttachResponse* response) override {
     ExternalMemory external{request->external_handle(), request->external_offset()};
-    AttachResult result = manager_->Attach(request->pool_id(), request->group(),
-                                           request->device(), request->bytes(), external);
+    AttachResult result = manager_->Attach(request->pool_id(), request->group(), request->device(),
+                                           request->bytes(), external);
     SetStatus(result.status, response);
     response->set_handle_kind(result.memory.kind);
     response->set_handle(result.memory.handle);
