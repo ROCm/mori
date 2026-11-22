@@ -546,6 +546,7 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
   }
   if (status == "UNKNOWN") return HeartbeatResult{HeartbeatResult::UNKNOWN, 0};
   if (status == "SEQ_GAP") return HeartbeatResult{HeartbeatResult::SEQ_GAP, acked};
+  if (status == "DUPLICATE") return HeartbeatResult{HeartbeatResult::DUPLICATE, acked};
 
   // APPLIED. In multi-endpoint mode the control record has advanced (so the node
   // is already marked ALIVE and won't be reaped); now apply the block events on

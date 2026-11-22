@@ -448,6 +448,63 @@ TEST_P(RedisStoreTest, HeartbeatSeqGapAndUnknown) {
   EXPECT_EQ(gap.acked_seq, 0u);
 }
 
+// Same contract as the in-memory store: a delta at or below the cursor is a
+// resend after a lost ack, acked without applying its events again. The
+// split-write layouts advance the cursor before the per-shard block step, so
+// there a resend still asks for a full sync.
+TEST_P(RedisStoreTest, ResentDeltaIsAckedNotReapplied) {
+  const HeartbeatResult::Status want = (GetParam().endpoints > 1 || GetParam().cluster)
+                                           ? HeartbeatResult::SEQ_GAP
+                                           : HeartbeatResult::DUPLICATE;
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_EQ(
+      store_
+          ->ApplyHeartbeat("n1", 1, now_, {}, {{KvEvent::Kind::ADD, "k", TierType::DRAM, 1}}, false)
+          .status,
+      HeartbeatResult::APPLIED);
+  ASSERT_EQ(store_
+                ->ApplyHeartbeat("n1", 2, now_, {},
+                                 {{KvEvent::Kind::REMOVE, "k", TierType::DRAM, 0}}, false)
+                .status,
+            HeartbeatResult::APPLIED);
+
+  // The response covering both was lost, so the node sends them again.
+  auto resent = store_->ApplyHeartbeat("n1", 1, now_ + 10s, {},
+                                       {{KvEvent::Kind::ADD, "k", TierType::DRAM, 1}}, false);
+  EXPECT_EQ(resent.status, want);
+  EXPECT_EQ(resent.acked_seq, 2u);
+  EXPECT_FALSE(store_->BatchExistsBlock({"k"})[0]);  // seq 2 removed it; seq 1 is not replayed
+  resent = store_->ApplyHeartbeat("n1", 2, now_ + 10s, {},
+                                  {{KvEvent::Kind::REMOVE, "k", TierType::DRAM, 0}}, false);
+  EXPECT_EQ(resent.status, want);
+  EXPECT_EQ(resent.acked_seq, 2u);
+
+  // A resend still counts as a heartbeat: a cutoff before it expires nothing.
+  EXPECT_TRUE(store_->ExpireStaleClients(now_ + 5s).empty());
+
+  // A keepalive (seq 0) is not a resend and keeps its answer.
+  EXPECT_EQ(store_->ApplyHeartbeat("n1", 0, now_ + 10s, {}, {}, false).status,
+            HeartbeatResult::SEQ_GAP);
+}
+
+// The reaper dropped an EXPIRED node's locations, so a resend from it is not
+// acked: the node has to resync.
+TEST_P(RedisStoreTest, ResentDeltaFromExpiredNodeIsNotAcked) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_EQ(
+      store_
+          ->ApplyHeartbeat("n1", 1, now_, {}, {{KvEvent::Kind::ADD, "k", TierType::DRAM, 1}}, false)
+          .status,
+      HeartbeatResult::APPLIED);
+  ASSERT_EQ(store_->ExpireStaleClients(now_ + 10s).size(), 1u);
+
+  EXPECT_NE(store_
+                ->ApplyHeartbeat("n1", 1, now_ + 40s, {},
+                                 {{KvEvent::Kind::ADD, "k", TierType::DRAM, 1}}, false)
+                .status,
+            HeartbeatResult::DUPLICATE);
+}
+
 TEST_P(RedisStoreTest, HeartbeatRemoveDropsLocation) {
   ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
   ASSERT_EQ(

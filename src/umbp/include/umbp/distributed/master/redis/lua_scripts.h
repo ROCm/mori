@@ -101,7 +101,9 @@ return 1
 //   (KeySchema::Block), so this script never has to know the shard layout. The
 //   node's reverse-index set stores these full block keys as members.
 //   Returns { status_string, acked_seq_string }
-//   status_string in { "UNKNOWN", "SEQ_GAP", "APPLIED" }.
+//   status_string in { "UNKNOWN", "SEQ_GAP", "DUPLICATE", "APPLIED" }.
+//   DUPLICATE: a delta at or below the cursor from an ALIVE node, i.e. a resend
+//   of a bundle this script already applied in full. Only last_hb is refreshed.
 inline const std::string kApplyHeartbeatLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
@@ -120,6 +122,12 @@ local last = tonumber(redis.call('HGET', nodeKey, 'seq') or '0')
 local aliveSet = tag .. ':nodes:alive'
 local peers = tag .. ':alive_peers'
 local peer = redis.call('HGET', nodeKey, 'peer') or ''
+
+if full == 0 and seq > 0 and seq <= last
+    and tonumber(redis.call('HGET', nodeKey, 'status') or '0') == 1 then
+  redis.call('HSET', nodeKey, 'last_hb', now)
+  return { 'DUPLICATE', tostring(last) }
+end
 
 if full == 0 and seq ~= last + 1 then
   redis.call('HSET', nodeKey, 'last_hb', now, 'status', 1)
@@ -431,7 +439,10 @@ return dead
 //   KEYS[1] = node key
 //   ARGV = [tag, node_id, seq, now_ms, is_full_sync, caps_blob, lcaps_blob]
 //   seq-CAS + record + nodes:alive/alive_peers ONLY (no block work).
-//   Returns { status_string, acked_seq_string } like apply_heartbeat.
+//   Returns { status_string, acked_seq_string } like apply_heartbeat, except
+//   that a resent bundle gets SEQ_GAP, never DUPLICATE: the cursor advances
+//   here before the per-shard block step, so it does not show that the
+//   bundle's events were stored, and the full sync heals a failed block step.
 inline const std::string kApplyHeartbeatControlLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]

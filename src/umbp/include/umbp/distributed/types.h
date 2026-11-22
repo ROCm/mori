@@ -339,11 +339,13 @@ struct ClientRegistration {
 // registry updated, acked_seq advanced to the request's seq. SEQ_GAP = peer's
 // seq is not last_applied_seq + 1; caller responds with a full-sync request and
 // acked_seq echoes the previously applied seq so the peer reships. UNKNOWN = no
-// record for node_id (peer must re-register).
+// record for node_id (peer must re-register). DUPLICATE = the bundle is at or
+// below last_applied_seq, a resend of one already applied; nothing is applied
+// and acked_seq is last_applied_seq, so the peer drops the bundle.
 struct HeartbeatResult {
-  enum Status { APPLIED, SEQ_GAP, UNKNOWN };
+  enum Status { APPLIED, SEQ_GAP, UNKNOWN, DUPLICATE };
   Status status;
-  uint64_t acked_seq;  // meaningful for APPLIED and SEQ_GAP
+  uint64_t acked_seq;  // meaningful for APPLIED, SEQ_GAP and DUPLICATE
 };
 
 // Helpers for logging

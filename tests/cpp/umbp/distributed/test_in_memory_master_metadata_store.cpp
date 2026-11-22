@@ -201,6 +201,52 @@ TEST(InMemoryStore, SeqGapKeepsLivenessNotCapsOrSeq) {
   EXPECT_EQ(rec->tier_capacities.at(TierType::HBM).total_bytes, 1000u);  // caps NOT replaced
 }
 
+// A delta at or below the cursor is a bundle the store already applied, resent
+// because its ack was lost. The cursor is acked so the node drops the bundle,
+// and its events are not applied a second time.
+TEST(InMemoryStore, ResentDeltaIsAckedNotReapplied) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "n1");
+  ASSERT_EQ(Beat(store, "n1", 1, {Add("k1", TierType::HBM, 10)}, kT0).status,
+            HeartbeatResult::APPLIED);
+  ASSERT_EQ(Beat(store, "n1", 2, {Remove("k1", TierType::HBM)}, kT0).status,
+            HeartbeatResult::APPLIED);
+
+  // The response covering both was lost, so the node sends them again.
+  auto resent = Beat(store, "n1", 1, {Add("k1", TierType::HBM, 10)}, kT0 + 10s);
+  EXPECT_EQ(resent.status, HeartbeatResult::DUPLICATE);
+  EXPECT_EQ(resent.acked_seq, 2u);
+  EXPECT_TRUE(store.LookupBlock("k1").empty());  // seq 2 removed it; seq 1 is not replayed
+  resent = Beat(store, "n1", 2, {Remove("k1", TierType::HBM)}, kT0 + 10s);
+  EXPECT_EQ(resent.status, HeartbeatResult::DUPLICATE);
+  EXPECT_EQ(resent.acked_seq, 2u);
+
+  auto rec = store.GetClient("n1");
+  ASSERT_TRUE(rec.has_value());
+  EXPECT_EQ(rec->last_heartbeat, kT0 + 10s);  // a resend still counts as a heartbeat
+  EXPECT_EQ(rec->last_applied_seq, 2u);
+
+  // A keepalive (seq 0) is not a resend and keeps its answer; the bundle after
+  // the cursor applies as usual.
+  EXPECT_EQ(Beat(store, "n1", 0, {}, kT0 + 10s).status, HeartbeatResult::SEQ_GAP);
+  EXPECT_EQ(Beat(store, "n1", 3, {Add("k2", TierType::HBM, 20)}, kT0 + 10s).status,
+            HeartbeatResult::APPLIED);
+  EXPECT_EQ(store.LookupBlock("k2").size(), 1u);
+}
+
+// The reaper dropped an EXPIRED node's locations, so a resend from it is not
+// acked: the node has to resync.
+TEST(InMemoryStore, ResentDeltaFromExpiredNodeIsNotAcked) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "n1");
+  ASSERT_EQ(Beat(store, "n1", 1, {Add("k1", TierType::HBM, 10)}, kT0).status,
+            HeartbeatResult::APPLIED);
+  ASSERT_EQ(store.ExpireStaleClients(kT0 + 10s).size(), 1u);
+
+  EXPECT_NE(Beat(store, "n1", 1, {Add("k1", TierType::HBM, 10)}, kT0 + 40s).status,
+            HeartbeatResult::DUPLICATE);
+}
+
 TEST(InMemoryStore, HeartbeatDeltaAddRemove) {
   InMemoryMasterMetadataStore store;
   RegisterAlive(store, "n1");
@@ -708,18 +754,19 @@ TEST(InMemoryStore, ConcurrentHeartbeatCasExactlyOneApplied) {
   RegisterAlive(store, "n1");
 
   std::atomic<int> applied{0};
-  std::atomic<int> gap{0};
+  std::atomic<int> duplicate{0};
   std::atomic<bool> start{false};
   std::vector<std::thread> threads;
   for (int t = 0; t < 2; ++t) {
     threads.emplace_back([&] {
       while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
-      // Both race to apply seq=1 (last_applied starts at 0).
+      // Both race to apply seq=1 (last_applied starts at 0). The loser finds
+      // the cursor already at 1, the same as a resend.
       auto r = store.ApplyHeartbeat("n1", 1, kT0, Caps(), {}, /*is_full_sync=*/false);
       if (r.status == HeartbeatResult::APPLIED) {
         applied.fetch_add(1);
-      } else if (r.status == HeartbeatResult::SEQ_GAP) {
-        gap.fetch_add(1);
+      } else if (r.status == HeartbeatResult::DUPLICATE) {
+        duplicate.fetch_add(1);
       }
     });
   }
@@ -727,7 +774,7 @@ TEST(InMemoryStore, ConcurrentHeartbeatCasExactlyOneApplied) {
   for (auto& th : threads) th.join();
 
   EXPECT_EQ(applied.load(), 1);
-  EXPECT_EQ(gap.load(), 1);
+  EXPECT_EQ(duplicate.load(), 1);
   EXPECT_EQ(store.GetClient("n1")->last_applied_seq, 1u);
 }
 

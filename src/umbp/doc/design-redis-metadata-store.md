@@ -418,6 +418,10 @@ delta ADD/REMOVE with reverse-index + LRU maintenance.
 local rec = redis.call('HGETALL', KEYS[1])
 if #rec == 0 then return {'UNKNOWN', 0} end
 local last = tonumber(hget(rec,'seq'))
+if is_full_sync == 0 and seq > 0 and seq <= last and hget(rec,'status') == '1' then
+  redis.call('HSET', KEYS[1], 'last_hb', now_ms)
+  return {'DUPLICATE', last}                        -- resend of an applied bundle
+end
 if is_full_sync == 0 and seq ~= last + 1 then
   redis.call('HSET', KEYS[1], 'last_hb', now_ms, 'status', 1)
   redis.call('SADD', prefix..':nodes:alive', node_id)
