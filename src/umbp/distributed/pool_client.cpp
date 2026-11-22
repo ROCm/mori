@@ -1080,9 +1080,10 @@ bool PoolClient::Init() {
   // is consulted at all -- it is worth 30% of a fully-local call.
   MORI_UMBP_INFO(
       "[PoolClient] routing: local_first={} cache_remote_fetches={} ranged_locality_prefetch={} "
-      "remote_single_flight={} (wait {} ms)",
+      "ranged_whole_object_cache={} remote_single_flight={} (wait {} ms)",
       config_.local_first, config_.cache_remote_fetches, config_.ranged_locality_prefetch,
-      config_.remote_single_flight, config_.remote_single_flight_wait_ms);
+      config_.ranged_whole_object_cache, config_.remote_single_flight,
+      config_.remote_single_flight_wait_ms);
 
   if (master_client_) master_client_->SetBackendRegistry(&registry_);
 
@@ -2206,7 +2207,7 @@ bool PoolClient::LocalityPrefetchAdmits(size_t object_size) const {
 
 void PoolClient::MaybeInstallCompleteArenaObject(const std::string& key, const void* arena_slice,
                                                  size_t object_size) {
-  if (!CanInstallLocally()) return;
+  if (!config_.ranged_whole_object_cache || !CanInstallLocally()) return;
   // Synchronous on purpose, and cheap relative to the alternative: the slice is
   // live only until the next sub-batch reuses it, and a local copy of the
   // object beats a second RDMA of the same bytes.  This is also exactly what
@@ -3908,7 +3909,7 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
   // its slots are committed, and on every exit after this point.
   LedEpisodes led;
   ScopeExit finish_led{[this, &led] { FinishRemoteEpisodes(&led); }};
-  if (followers != nullptr && CanInstallLocally()) {
+  if (followers != nullptr && config_.ranged_whole_object_cache && CanInstallLocally()) {
     ClaimRemoteFetches(keys, &units, &unit_ok, &led, followers);
   }
 
@@ -4557,11 +4558,9 @@ std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMed
   std::vector<RangeFetchUnit> leftover;
   leftover.reserve(units.size());
 
-  // Only a unit that is the whole object can go straight into a slot.  No
-  // switch and no size cap: the bytes are crossing the wire either way, so
-  // landing them in a slot instead of the arena costs nothing extra and is what
-  // the pre-ranged code did on every remote ranged read.
-  const bool can_install = CanInstallLocally();
+  // Complete objects can land directly in a slot without extra wire traffic.
+  // Opting out preserves local capacity; those reads use the scratch arena.
+  const bool can_install = config_.ranged_whole_object_cache && CanInstallLocally();
   std::vector<size_t> candidates;
   for (size_t i = 0; i < units.size(); ++i) {
     if (can_install && units[i].holds_whole_object) {

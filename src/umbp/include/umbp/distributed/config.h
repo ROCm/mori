@@ -324,6 +324,9 @@ struct PoolClientConfig {
   // into cache_remote_fetches.
   bool ranged_locality_prefetch = true;
 
+  // See UMBPDistributedConfig::ranged_whole_object_cache.
+  bool ranged_whole_object_cache = true;
+
   // See UMBPDistributedConfig::remote_single_flight.
   bool remote_single_flight = true;
   uint32_t remote_single_flight_wait_ms = 30000;
@@ -428,6 +431,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.admission_max_block_bytes = dc.admission_max_block_bytes;
   pc.prefetch_budget_bytes = dc.prefetch_budget_bytes;
   pc.ranged_locality_prefetch = dc.ranged_locality_prefetch;
+  pc.ranged_whole_object_cache = dc.ranged_whole_object_cache;
   pc.remote_single_flight = dc.remote_single_flight;
   pc.remote_single_flight_wait_ms = dc.remote_single_flight_wait_ms;
   pc.local_first = dc.local_first;
