@@ -42,6 +42,10 @@ build the receive layout from the staged routes (expert-major `rowmap` / `srcmap
 * `--ready-first`: wave 0 of the comm workgroup reads every source's signal level once per round and
   publishes m-tiles to a ready queue in the order they become ready; a worker claims a ticket with
   one atomic and reads the queue. No worker touches a signal.
+* `--tile-opt` (with `--ready-first`): the GEMM1 tile loop hides the next tile's prologue inside the
+  current tile, pipelines the A operand through registers, orders tiles by XCD (one L2 per expert
+  slice) and removes the register spills LLVM makes at `sort_block_m` 128 (`gemm1.py`,
+  `tile_hoist.py`). Same results; -4% (bs 512) to -13% (bs 2048) end to end on V4.1-Flash.
 
 `--no-plan` drops the counting sort: a workgroup reserves its rows of each run with one atomic and
 places them in any order (no histogram, prefix sum or grid rendezvous, no `need`); the tiles then
@@ -69,6 +73,7 @@ MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
 | `--network` | `flash` (default) and `v4_pro` are the measured ones; `glm52` (32 experts per rank) has not been re-run on this version |
 | `--bs` | tokens per rank |
 | `--ready-first` | tile scheduler wave + ready queue |
+| `--tile-opt` | GEMM1 tile-loop changes (needs `--ready-first`) |
 | `--no-plan` | no counting sort; tiles wait for all of a source's chunks |
 | `--fuse-prepare` | prepare inside the GEMM1 kernel |
 | `--chunk-rows`, `--early-chunks`, `--head-rows` | SDMA chunking (default 256 rows, 2 early chunks, no short head chunk) |

@@ -43,6 +43,8 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 from aiter.ops.flydsl.kernels.mega_moe.gemm1 import _LdsF32View, do_tile
@@ -56,6 +58,7 @@ from aiter.ops.flydsl.kernels.mega_moe.gemm_util import (
     SiluQuantEpilogue,
     TileScheduler,
     _load_row_map_subgroup,
+    wait_lds_barrier,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
@@ -69,6 +72,9 @@ from sdma_dispatch import (
     SCH_LDONE,
     SCH_RQ,
     SCH_TAIL,
+    SCH_XHEAD,
+    SCH_XLISTS,
+    SCH_XTAIL,
     Arena,
     layout_lds_words,
     layout_phase,
@@ -77,7 +83,21 @@ from sdma_dispatch import (
     memtime,
     post_rest_chunks,
     sched_lds_words,
+    sched_xcd_base,
+    sched_xcd_cap,
     scheduler_phase,
+)
+from tile_hoist import (
+    HoistATileLoader,
+    do_tile_split,
+    epi_stage_c,
+    sa_pack_issue,
+    sa_pack_rows,
+    sa_pack_store,
+    stage_issue,
+    stage_store,
+    store_quant_remat,
+    tile_main,
 )
 
 #: ``trace``: int64 slots per workgroup, and work items recorded per workgroup (8 + 3 * items).
@@ -87,6 +107,16 @@ TRACE_SLOTS = (
 )
 TRACE_ITEMS = (TRACE_STRIDE - 8) // TRACE_SLOTS
 RF_TILE, RF_NEXT = 0, 1  # ``ready_first``: words of the ``rf`` LDS array
+#: ``hoist_prologue``: words of ``rf``. HA_*: the NEXT tile (ticket, m-tile, its table entries),
+#: written by thread 0, read by all after a barrier. HB_*: the ticket after it, its m-tile and
+#: whether its ready-queue slot was read (thread 0 only).
+HA_T, HA_M, HA_TRB, HA_TIB, HA_EXP, HB_T, HB_M, HB_OK = range(8)
+#: ``xcd_order``: word of ``rf`` = the XCD list this workgroup claims from (thread 0)
+HX_Q = 8
+#: ``xcd_steal`` 2: word of ``rf`` = 1 once thread 0 has seen the whole ready queue published
+HX_F = 9
+#: in the kernel name and closure of a ``hoist_prologue`` build: bump when ``tile_hoist`` changes
+HOIST_VER = 9
 
 
 class WindowAScaleLoader(AScaleLoader):
@@ -150,6 +180,22 @@ class WindowAScaleLoader(AScaleLoader):
             copy_slot(fx.Int32(c) + fx.Int32(self._tx))
 
 
+class PackedWindowAScaleLoader(WindowAScaleLoader):
+    """``sa_pack``: the A scales in LDS as ``tile_hoist.sa_pack_store`` writes them, one 16-byte
+    record per (k-step, lane // 16, lane % 16) holding the packed word of each scale group, so
+    ``load_step`` is one ``ds_read_b128`` instead of 16 ``ds_read_u8`` (same words)."""
+
+    def load_step(self, lds_ascale, kstep_i32):
+        rec = (kstep_i32 * fx.Int32(4) + fx.Int32(self._lane // 16)) * fx.Int32(
+            16
+        ) + fx.Int32(self._lane % 16)
+        ptr = fx.add_offset(lds_ascale.ptr, fx.make_int_tuple(rec * fx.Int32(16)))
+        v = Vec(
+            fx.make_view(fx.recast_iter(fx.Uint8, ptr), fx.make_layout(16, 1)).load()
+        ).bitcast(fx.Int32)
+        return [fx.Int32(v[g]) for g in range(self._n_groups)]
+
+
 # fmt: off
 @functools.cache
 def compile_gemm1_sdma(
@@ -161,6 +207,9 @@ def compile_gemm1_sdma(
     gate_arena: Arena | None = None, gate_rank: int = 0, trace: bool = False,
     fuse_prepare: bool = False, prep_trace: bool = False, prep_split: int = 3,
     prep_unroll: int = 1, ready_first: bool = False, no_plan: bool = False,
+    hoist_prologue: bool = False, kpipe: int = 0, kunroll: int = 1, xcd_order: bool = False,
+    xcd_steal: int = 1, fin_off: bool = False, sa_pack: bool = False, a_dbuf: int = 0,
+    epi_remat: int = 0,
 ):
     # fmt: on
     """Persistent GEMM1, one workgroup per CU, flat (m tile, n tile) work item per step.
@@ -198,6 +247,65 @@ def compile_gemm1_sdma(
     ``no_plan`` (the prepare's): no ``need`` exists, so a tile (or the scheduler) waits for ALL
     of every source's chunks of this call (``expected``).
 
+    ``tile_opt`` (``run_stage1.py --tile-opt``) is the set of switches below that pays at each
+    sort_block_m: all but ``kunroll`` 2 at 128, all but ``sa_pack`` / ``epi_remat`` at 64.
+
+    ``hoist_prologue`` (with ``ready_first``): the next tile's ready-slot read and prologue run inside
+    the current tile (``tile_hoist``), each step issued one window before its result is used (windows:
+    the K loop, the two halves of the epilogue). Thread 0: after the K loop it claims the ticket after
+    next and reads the tail; between the epilogue halves it reads that ticket's ready-queue slot; at the
+    next K-loop start (after its first loads) it reads the next tile's table entries (tile_row_base,
+    tile_input_base, expert). All lanes: after the K loop the next tile's rowmap words; between the
+    epilogue halves A k-step 0 and the A scales, global -> registers; after the epilogue's closing
+    barrier both to LDS (the same bytes and places as ``do_tile``). The next tile then starts with an
+    LDS barrier only. A ready-queue slot not yet published when it is read is read the old way,
+    blocking, after the next K loop. Same LDS.
+
+    ``kpipe`` (with ``hoist_prologue``; 0 = off): 1 = the K loop of ``tile_main`` loads the next A
+    k-step through registers instead of ``buffer_load ... lds`` (``tile_hoist``'s ``KPIPE``).
+
+    ``kunroll`` (with ``kpipe`` 1; 1 = off): 2 = the K loop body is two k-steps with two B register sets
+    that alternate (``tile_hoist``), so no loop-carried B copies. Same arithmetic.
+
+    ``xcd_order`` (with ``hoist_prologue``): XCD-affine tile order. The scheduler also appends each
+    published m-tile's work items to 8 per-XCD lists (n-tile n of expert e to list (e * N + n) mod 8,
+    ``scheduler_phase``), and workgroup ``bid`` (on XCD ``bid % 8``) claims ONE work item at a time
+    from list ``bid & 7``, so slice (e, n) always runs on one XCD and its weights are fetched into
+    that XCD's L2 only. A claim is a ticket ``j * 8 + list``; it resolves when the list's tail passes
+    j (the ready-queue semantics: only published m-tiles are listed). When the whole queue is
+    published and the list is exhausted, thread 0 steals from another list.
+
+    ``xcd_steal`` (with ``xcd_order``): 1 = once the whole queue is published, the next lists in turn
+    (y + 1, y + 2, ...: one round trip each), resolved after the next K loop, in front of that tile's
+    epilogue. 2 = one round trip reads all 8 heads and tails and claims from the list with the most
+    left (``xsteal``); the claim after the K loop also reads the ready-queue tail, so a ticket found
+    dead (the queue published, its list exhausted) is stolen for (or found to be the end) after the
+    epilogue it was read in, not after the next K loop. A ticket still unresolved after the next K
+    loop (rare: the queue was published in between) takes the path of 1. (``xsteal`` at that second
+    place too costs 7 SGPRs, which reschedule the K loop.)
+
+    ``fin_off`` (with ``ready_first``; same results, off = False): the final k-step's A buffer parity
+    is opaque to LLVM (``tile_hoist.tile_main``'s ``FINOFF``), so its A ``ds_read`` addresses are not
+    folded into constants hoisted out of the tile loop (at sort_block_m 128 they spill and are reloaded
+    every tile). With ``hoist_prologue`` in ``tile_main``; without, the ready-first tile loop runs
+    ``tile_hoist.do_tile_split`` (aiter's ``do_tile`` in pieces) with it instead of aiter's ``do_tile``.
+
+    ``sa_pack`` (with ``hoist_prologue``, sort_block_m 128; same results, off = False): the A scales go
+    to LDS packed (``tile_hoist.sa_pack_store``), one 16-byte record per (k-step, lane) holding the
+    packed word of each scale group, so a k-step reads its A scales with one ``ds_read_b128``
+    (``PackedWindowAScaleLoader``) instead of 16 ``ds_read_u8`` with a wait after each pair.
+
+    ``a_dbuf`` (with ``kpipe`` 1; same results, off = 0): 1 = the K loop's A operand is
+    double-buffered in registers: MFMA group g + 1's A ``ds_read`` pair is issued before group g's
+    MFMAs, which are fenced with ``sched_barrier`` (``tile_hoist._pipe_am_dbuf``).
+
+    ``epi_remat`` (with ``hoist_prologue``; same results, off = 0): 1 = the lane constants of the
+    sa-pack writer (with ``sa_pack``: rowmap words, A-scale loads, packed LDS records) and of the store
+    pass come from ``tile_hoist.opaque_lane``, so they are recomputed in the epilogue. Otherwise LLVM
+    hoists them out of the tile loop, spills them, and reloads them each tile: each reload's ``vmcnt``
+    wait also waits for the hoisted loads and the output stores in flight (8 serialised waits in the
+    sa-pack writer).
+
     ``trace`` (with ``gate_arena``): thread 0 of each workgroup writes the clock (100 MHz) to
     ``trace[bid * TRACE_STRIDE + ...]``: ``[0]`` kernel start, ``[1]`` layout done, ``[2]``
     end, ``[3]`` its number of work items, and from ``[8]`` per item ``(gate start, gate
@@ -230,13 +338,51 @@ def compile_gemm1_sdma(
     NWQ = num_cu - 1   # workers: every one owns tokens and quantises (``fuse_prepare``)
     sched_words = 0
     if ready_first:
-        sched_words = sched_lds_words((gate_arena.max_routes + sort_block_m - 1) // sort_block_m)
+        sched_words = sched_lds_words((gate_arena.max_routes + sort_block_m - 1) // sort_block_m,
+                                      xcd_order)
         if sched_words * 4 > n_scale_bytes:
             raise ValueError(
                 f"ready_first: the scheduler's per-tile table ({sched_words} words) does not fit "
                 f"the A-scale LDS ({n_scale_bytes // 4} words) at sort_block_m={sort_block_m}")
         if gate_npes > 8 or gate_epr >= 65536:
             raise ValueError("ready_first: npes <= 8 and fewer than 65536 experts per rank")
+    n_rounds = sort_block_m * (a_k_step_bytes // 16) // total_threads   # A k-step copy rounds
+    if hoist_prologue:
+        if not ready_first:
+            raise ValueError("hoist_prologue needs ready_first")
+        if not (pipe_weights and async_a_copy and mfma_amajor):
+            raise ValueError("hoist_prologue: only pipe_weights + async_a_copy + mfma_amajor")
+        if sort_block_m * (a_k_step_bytes // 16) % total_threads or not 1 <= n_rounds <= 4:
+            raise ValueError("hoist_prologue: the A k-step must be 1..4 whole copy rounds")
+        if max(16, model_dim // 32 // 16) != a_k_step_bytes // 16:
+            raise ValueError("hoist_prologue: the A-scale rounds must be the A copy rounds")
+    if kpipe and not hoist_prologue:
+        raise ValueError("kpipe needs hoist_prologue")
+    if xcd_order and not hoist_prologue:
+        raise ValueError("xcd_order needs hoist_prologue")
+    if xcd_steal not in (1, 2) or (xcd_steal != 1 and not xcd_order):
+        raise ValueError("xcd_steal: 1, or 2 with xcd_order")
+    if fin_off and not ready_first:
+        raise ValueError("fin_off needs ready_first")
+    if sa_pack and not (hoist_prologue and sort_block_m == 128 and num_waves * 64 == 512
+                        and model_dim % 512 == 0 and model_dim <= 8192):
+        raise ValueError("sa_pack: hoist_prologue, sort_block_m 128, 512 threads, model_dim a multiple "
+                         "of 512 up to 8192")
+    if fin_off and not (pipe_weights and async_a_copy and mfma_amajor):
+        raise ValueError("fin_off: only pipe_weights + async_a_copy + mfma_amajor")
+    if xcd_order and n_tiles > 32:
+        raise ValueError("xcd_order: the XCD lists hold up to 4 n-tiles of an m-tile (N <= 32)")
+    if epi_remat not in (0, 1) or (epi_remat and not hoist_prologue):
+        raise ValueError("epi_remat: 0 / 1, with hoist_prologue")
+    if kpipe not in (0, 1):
+        raise ValueError("kpipe: 0 / 1")
+    if a_dbuf not in (0, 1) or (a_dbuf and kpipe != 1):
+        raise ValueError("a_dbuf: 0, or 1 with kpipe 1")
+    if kunroll not in (1, 2) or (kunroll != 1 and kpipe != 1):
+        raise ValueError("kunroll: 1, or 2 with kpipe 1")
+    if trace and ready_first and not (pipe_weights and async_a_copy and mfma_amajor):
+        raise ValueError("a ready_first trace build splits the tile: pipe_weights + async_a_copy "
+                         "+ mfma_amajor only")
     if gate_arena:
         if lds_pool_bytes < layout_lds_words(gate_arena) * 4:
             raise ValueError("the LDS pool is too small to lend the layout its words")
@@ -260,13 +406,27 @@ def compile_gemm1_sdma(
                 f"the LDS pool ({lds_pool_bytes} B) is too small to lend the prepare its "
                 f"{pcfg.lds_bytes} bytes (quant store staging included)")
 
+    ALoader = HoistATileLoader if hoist_prologue else ATileLoader
+    HOIST_KEY = HOIST_VER  # a closure scalar, so the JIT cache key sees a tile_hoist change
+    KPIPE_KEY = kpipe
+    KUNROLL_KEY = kunroll
+    XCD_KEY = int(xcd_order)
+    XS2 = bool(xcd_order and xcd_steal == 2)
+    XSTEAL_KEY = int(XS2)
+    FINOFF_KEY = int(fin_off)
+    SAPACK_KEY = int(sa_pack)
+    ADBUF_KEY = int(a_dbuf)
+    ER_KEY = int(epi_remat)
+    XB = sched_xcd_base(gate_arena) if xcd_order else 0    # words of ``sched``
+    XCAP = sched_xcd_cap(gate_arena) if xcd_order else 0
+    rf_bytes = 48 if xcd_order else 32
     if ready_first:
         @fx.struct
         class SharedStorage:
             pool: fx.Array[fx.Int8, lds_pool_bytes, 16]
             A_scale: fx.Array[fx.Int8, n_scale_bytes, 16]
             # survives ``do_tile`` (which owns the pool): the chosen m-tile and the next ticket
-            rf: fx.Array[fx.Int8, 32, 16]
+            rf: fx.Array[fx.Int8, rf_bytes, 16]
     else:
         @fx.struct
         class SharedStorage:
@@ -276,7 +436,16 @@ def compile_gemm1_sdma(
     # fmt: off
     @flyc.kernel(name=f"stage1_sdma_gemm1_t{sort_block_m}x{tile_n}_rb{row_bytes}_r{expert_offset}_tr{int(trace)}"
                       f"_g{int(bool(gate_npes))}_fp{int(fuse_prepare)}_ps{prep_split}u{prep_unroll}"
-                      f"pt{int(prep_trace)}_rf{int(ready_first)}np{int(no_plan)}_pv{PHASES_VER}",
+                      f"pt{int(prep_trace)}_rf{int(ready_first)}np{int(no_plan)}_pv{PHASES_VER}"
+                      + (f"_hp{HOIST_VER}" if hoist_prologue else "")
+                      + (f"_kp{kpipe}" if kpipe else "")
+                      + (f"_ku{kunroll}" if kunroll != 1 else "")
+                      + ("_xo1" if xcd_order else "")
+                      + ("_xs2" if XS2 else "")
+                      + ("_fo1" if fin_off else "")
+                      + ("_sp1" if sa_pack else "")
+                      + (f"_ad{a_dbuf}" if a_dbuf else "")
+                      + (f"_er{epi_remat}" if epi_remat else ""),
                  known_block_size=[total_threads, 1, 1])
     def kernel(
         out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_w: fx.Tensor, tile_row_base: fx.Tensor,
@@ -293,9 +462,20 @@ def compile_gemm1_sdma(
     ):
     # fmt: on
         _ = GATE_KEY
+        _ = FINOFF_KEY
+        _ = SAPACK_KEY
+        _ = ADBUF_KEY
+        _ = ER_KEY
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        if const_expr(hoist_prologue):
+            _ = HOIST_KEY
+            _ = KPIPE_KEY
+            _ = KUNROLL_KEY
+            _ = XCD_KEY
+            _ = XSTEAL_KEY
         a_buf = lds.pool
         a_scale_lds = lds.A_scale
+        pool_addr = fx.Int64(fx.ptrtoint(lds.pool.ptr))
         c_tile = _LdsF32View(fx.recast_iter(fx.Float32, lds.pool.ptr))
 
         w_rsrc = ptr_buf_tensor(fx.get_iter(w), fx.Int32, unit_elems=4)
@@ -314,7 +494,7 @@ def compile_gemm1_sdma(
 
         sched = TileScheduler(expert_rsrc=expert_rsrc, inter_dim=inter_dim, expert_offset=expert_offset)
         n_wave_base = wave_id * fx.Int32(n_per_wave)
-        a_gather = ATileLoader(
+        a_gather = ALoader(
             row_bytes=row_bytes, sort_block_m=sort_block_m, k_step_bytes=a_k_step_bytes,
             total_threads=total_threads, swizzle=swizzle_a, x_tensor=x, async_copy=async_a_copy,
             indexed_input=True, row_map_rsrc=row_map_rsrc, source_rows=source_rows,
@@ -324,7 +504,7 @@ def compile_gemm1_sdma(
             w_rsrc=w_rsrc, num_acc_n=num_acc_n, model_dim=model_dim, cache_modifier=b_cache_modifier
         )
         b_scale = BScaleLoader(scale_rsrc=sw_rsrc, num_acc_n=num_acc_n, model_dim=model_dim)
-        a_scale = WindowAScaleLoader(
+        a_scale = (PackedWindowAScaleLoader if sa_pack else WindowAScaleLoader)(
             row_bytes=row_bytes, scale_rsrc=sx_rsrc, m_repeat=m_repeat, model_dim=model_dim,
             sort_block_m=sort_block_m, total_threads=total_threads, row_map_rsrc=row_map_rsrc,
         )
@@ -378,17 +558,32 @@ def compile_gemm1_sdma(
 
         def run_tile_rf(m_tile, n_tile, item):
             """``ready_first``: m-tile ``m_tile`` (from the ready queue) is ready, nothing to
-            wait for. The trace records the item's start twice (no gate)."""
+            wait for. The trace build runs the same tile split (``tile_hoist.do_tile_split``):
+            per item ``[0]`` start, ``[1]`` K loop starts, ``[3]`` K loop done, ``[2]`` done."""
             slot0 = (item < fx.Int32(TRACE_ITEMS)).select(fx.Int32(8) + item * fx.Int32(TRACE_SLOTS), fx.Int32(TRACE_STRIDE - TRACE_SLOTS))
             stamp(trace_buf, slot0)
-            stamp(trace_buf, slot0 + fx.Int32(1))
-            stamp_mt(trace_buf, slot0 + fx.Int32(3))
-            do_tile(
-                m_tile, n_wave_base + n_tile * fx.Int32(tile_n), sched.expert_of(m_tile), sched,
-                a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf, a_scale_lds,
-                a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, pipe_weights,
-                mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, True, False,  # indirect, pair_k
-            )
+            if const_expr(trace):
+                do_tile_split(
+                    m_tile, n_wave_base + n_tile * fx.Int32(tile_n), sched.expert_of(m_tile), sched,
+                    a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf, a_scale_lds,
+                    a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, trb_rsrc, tib_rsrc,
+                    trace_buf, bid * fx.Int32(TRACE_STRIDE) + slot0, True, FINOFF_KEY,
+                )
+            elif const_expr(fin_off):
+                # aiter's do_tile in pieces, the final k-step's A offset opaque (no trace stamps)
+                do_tile_split(
+                    m_tile, n_wave_base + n_tile * fx.Int32(tile_n), sched.expert_of(m_tile), sched,
+                    a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf, a_scale_lds,
+                    a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, trb_rsrc, tib_rsrc,
+                    trace_buf, fx.Int32(0), False, 1,
+                )
+            else:
+                do_tile(
+                    m_tile, n_wave_base + n_tile * fx.Int32(tile_n), sched.expert_of(m_tile), sched,
+                    a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf, a_scale_lds,
+                    a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, pipe_weights,
+                    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, True, False,  # indirect, pair_k
+                )
             stamp(trace_buf, slot0 + fx.Int32(2))
             stamp_mt(trace_buf, slot0 + fx.Int32(4))
 
@@ -437,6 +632,54 @@ def compile_gemm1_sdma(
                 stamp(trace_buf, slot0 + fx.Int32(2))
                 stamp_mt(trace_buf, slot0 + fx.Int32(4))
 
+        # ``hoist_prologue``: every call that touches a Python object (loader, epilogue, scheduler)
+        # lives here at kernel scope. FlyDSL carries an object whose method is called inside a
+        # dynamic if / while as that region's state, and a loader or scheduler cannot be an IR value.
+        def hp_rows(tib):
+            return a_gather.rows_raw(tib)
+
+        def hp_sa_rows(tib):
+            # ``sa_pack``: the rowmap words of this lane's A-scale rows (none without it)
+            if const_expr(sa_pack):
+                return sa_pack_rows(a_gather, tib, bool(epi_remat))
+            return []
+
+        def hp_issue(raw, sar):
+            if const_expr(sa_pack):
+                a_regs, _ = stage_issue(a_gather, a_scale, raw, scales=False)
+                return a_regs, sa_pack_issue(a_scale, sar, bool(epi_remat))
+            return stage_issue(a_gather, a_scale, raw)
+
+        def hp_stage_store(sv):
+            if const_expr(sa_pack):
+                a_gather.store(a_buf, sv[0], 0)
+                sa_pack_store(a_scale_lds, sv[1], bool(epi_remat))
+            else:
+                stage_store(a_gather, a_buf, a_scale_lds, sv)
+
+        def hp_expert(m):
+            return fx.Int32(sched.expert_of(m))
+
+        def hp_b_row(e, n_base):
+            return sched.gate_base_row(e) + n_base
+
+        def hp_tile(b_row, r0, r1, r2, r3, slot0, hook):
+            a_gather.set_rows([r0, r1, r2, r3][:n_rounds])
+            return tile_main(
+                b_row, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, a_buf, a_scale_lds,
+                a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, 63, trace_buf,
+                bid * fx.Int32(TRACE_STRIDE) + slot0, trace, hook, kpipe, kunroll, FINOFF_KEY, ADBUF_KEY,
+            )
+
+        def hp_epi_c(acc):
+            return epi_stage_c(epi, acc)
+
+        def hp_store_quant(hm, trb, n_base, ce):
+            if const_expr(epi_remat):
+                store_quant_remat(epi, hm, trb, n_base, ce[0], ce[1], ce[2])
+            else:
+                epi._store_quant_vec8(hm, trb, n_base, ce[0], ce[1], ce[2])
+
         q0 = fx.Int32(0)
         if const_expr(fuse_prepare):
             q0 = prepare_phase(
@@ -446,7 +689,7 @@ def compile_gemm1_sdma(
                 arg_s=fx.Int64(arg_win) + fx.Int64(gate_arena.off_s),
                 arg_dev_comm=arg_dev_comm, arg_win=arg_win_handle, arg_wts=p_wts,
                 arg_trace=p_trace, arg_done=p_done, arg_qdone=p_qdone,
-                L=fx.Int64(fx.ptrtoint(lds.pool.ptr)),
+                L=pool_addr,
             )
             stamp(trace_buf, fx.Int32(4))   # trace: this block's prepare_phase is done
 
@@ -491,6 +734,7 @@ def compile_gemm1_sdma(
                             trace=trace, trace_buf=trace_buf,
                             trace_base=bid * fx.Int32(TRACE_STRIDE),
                             full_wait=no_plan, expected=expected,
+                            xcd_n=n_tiles if xcd_order else 0, xcd_base=XB, xcd_cap=XCAP,
                         )
             else:
                 # the front of the workers IS the layout: it waits for the route flags and does
@@ -505,7 +749,7 @@ def compile_gemm1_sdma(
                 layout_phase(
                     rank=gate_rank, arena=gate_arena, sbm=sort_block_m, max_tok=gate_arena.cap,
                     nb=num_cu - 1, tid=tid, lbid=bid - fx.Int32(1), tpb=total_threads,
-                    L=fx.Int64(fx.ptrtoint(lds.pool.ptr)), win=fx.Int64(arg_win),
+                    L=pool_addr, win=fx.Int64(arg_win),
                     arg_expected=arg_expected, arg_hist=arg_hist, arg_cursor=arg_cursor,
                     arg_bar=arg_lbar, arg_srcmap=arg_srcmap, arg_wts=arg_wts,
                     arg_eids=arg_eids, arg_trb=arg_trb, arg_tib=arg_tib, arg_nv=arg_nv,
@@ -529,55 +773,350 @@ def compile_gemm1_sdma(
                     def claim():
                         return fx.Int32(comm_ops.atomic_add_agent(head_addr, fx.Int32(1)))
 
-                    if tid == fx.Int32(0):
-                        comm_ops.store_i32_lds(rfw(RF_NEXT), claim())
-                    fx.barrier()
-                    tk = fx.Int32(comm_ops.load_i32_lds(rfw(RF_NEXT)))
-                    item = fx.Int32(0)
-                    wacc = fx.Int64(0)
-                    wfirst = fx.Int64(0)
-                    tacc = fx.Int64(0)
-                    while tk < total_work:
-                        q = tk // fx.Int32(n_tiles)
-                        n_tile = tk - q * fx.Int32(n_tiles)
-                        nxt = fx.Int32(0)
+                    if const_expr(not hoist_prologue):
                         if tid == fx.Int32(0):
-                            # ONE lane waits for the scheduler to have published slot q. The
-                            # entry was stored (write-through) before the tail that covers
-                            # it; both are read with system-scope loads.
-                            if const_expr(trace):
-                                tw0 = memrealtime()
-                            tl = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
-                            while tl <= q:
-                                rocdl.s_sleep(1)
-                                tl = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
-                            comm_ops.store_i32_lds(rfw(RF_TILE), fx.Int32(
-                                comm_ops.load_i32_global_system(rq_addr + fx.Int64(q) * fx.Int64(4))))
-                            # the next ticket is claimed now, its latency hidden by the tile
-                            nxt = claim()
-                            if const_expr(trace):
-                                dw = memrealtime() - tw0
-                                wacc = wacc + (item > fx.Int32(0)).select(dw, fx.Int64(0))
-                                wfirst = (item == fx.Int32(0)).select(dw, wfirst)
-                        fx.barrier()
-                        m_tile = fx.Int32(comm_ops.load_i32_lds(rfw(RF_TILE)))
-                        if const_expr(trace):
-                            ta = memrealtime()
-                        run_tile_rf(m_tile, n_tile, item)
-                        if const_expr(trace):
-                            tacc = tacc + (memrealtime() - ta)
-                        if tid == fx.Int32(0):
-                            comm_ops.store_i32_lds(rfw(RF_NEXT), nxt)
+                            comm_ops.store_i32_lds(rfw(RF_NEXT), claim())
                         fx.barrier()
                         tk = fx.Int32(comm_ops.load_i32_lds(rfw(RF_NEXT)))
-                        item = item + fx.Int32(1)
-                    stamp(trace_buf, fx.Int32(2))
-                    stamp_i64(trace_buf, fx.Int32(5), wacc)
-                    stamp_i64(trace_buf, fx.Int32(6), wfirst)
-                    stamp_i64(trace_buf, fx.Int32(7), tacc)
-                    if const_expr(trace):
+                        item = fx.Int32(0)
+                        wacc = fx.Int64(0)
+                        wfirst = fx.Int64(0)
+                        tacc = fx.Int64(0)
+                        while tk < total_work:
+                            q = tk // fx.Int32(n_tiles)
+                            n_tile = tk - q * fx.Int32(n_tiles)
+                            nxt = fx.Int32(0)
+                            if tid == fx.Int32(0):
+                                # ONE lane waits for the scheduler to have published slot q. The
+                                # entry was stored (write-through) before the tail that covers
+                                # it; both are read with system-scope loads.
+                                if const_expr(trace):
+                                    tw0 = memrealtime()
+                                tl = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
+                                while tl <= q:
+                                    rocdl.s_sleep(1)
+                                    tl = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
+                                comm_ops.store_i32_lds(rfw(RF_TILE), fx.Int32(
+                                    comm_ops.load_i32_global_system(rq_addr + fx.Int64(q) * fx.Int64(4))))
+                                # the next ticket is claimed now, its latency hidden by the tile
+                                nxt = claim()
+                                if const_expr(trace):
+                                    dw = memrealtime() - tw0
+                                    wacc = wacc + (item > fx.Int32(0)).select(dw, fx.Int64(0))
+                                    wfirst = (item == fx.Int32(0)).select(dw, wfirst)
+                            fx.barrier()
+                            m_tile = fx.Int32(comm_ops.load_i32_lds(rfw(RF_TILE)))
+                            if const_expr(trace):
+                                ta = memrealtime()
+                            run_tile_rf(m_tile, n_tile, item)
+                            if const_expr(trace):
+                                tacc = tacc + (memrealtime() - ta)
+                            if tid == fx.Int32(0):
+                                comm_ops.store_i32_lds(rfw(RF_NEXT), nxt)
+                            fx.barrier()
+                            tk = fx.Int32(comm_ops.load_i32_lds(rfw(RF_NEXT)))
+                            item = item + fx.Int32(1)
+                        stamp(trace_buf, fx.Int32(2))
+                        stamp_i64(trace_buf, fx.Int32(5), wacc)
+                        stamp_i64(trace_buf, fx.Int32(6), wfirst)
+                        stamp_i64(trace_buf, fx.Int32(7), tacc)
+                        if const_expr(trace):
+                            if tid == fx.Int32(0):
+                                trace_buf[bid * fx.Int32(TRACE_STRIDE) + fx.Int32(3)] = fx.Int64(item)
+                    else:
+                        # ``tile_hoist``: each step of the next tile's front runs one window ahead of its use
+                        # (docstring). Thread 0 keeps the ticket state in ``rf`` (HA_*, HB_*).
+                        def rd(i):
+                            return fx.Int32(comm_ops.load_i32_lds(rfw(i)))
+
+                        def wr(i, v):
+                            comm_ops.store_i32_lds(rfw(i), v)
+
+                        def resolve(t):
+                            """thread 0: ticket ``t``'s m-tile, after waiting for its ready-queue slot
+                            (as the plain loop does); 0 past the last work item."""
+                            m = fx.Int32(0)
+                            if t < total_work:
+                                q = t // fx.Int32(n_tiles)
+                                tl = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
+                                while tl <= q:
+                                    rocdl.s_sleep(1)
+                                    tl = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
+                                m = fx.Int32(comm_ops.load_i32_global_system(rq_addr + fx.Int64(q) * fx.Int64(4)))
+                            return m
+
+                        # ``xcd_order``: the 8 lists' words (``sched_xcd_base``). The offset is 32-bit math on
+                        # a dynamic y, so no ``arg_sched + constant`` pair is hoisted into SGPRs live across
+                        # the K loop (the kp1 kernel is at 95 SGPRs: 3 more pairs spill and change the K loop).
+                        def xhead(y):
+                            return fx.Int64(arg_sched) + fx.Int64((fx.Int32(XB + SCH_XHEAD) + y * fx.Int32(32)) * fx.Int32(4))
+
+                        def xtail(y):
+                            return fx.Int64(arg_sched) + fx.Int64((fx.Int32(XB + SCH_XTAIL) + y * fx.Int32(32)) * fx.Int32(4))
+
+                        def xentry(y, j):
+                            return fx.Int64(arg_sched) + fx.Int64((fx.Int32(XB + SCH_XLISTS) + y * fx.Int32(XCAP) + j) * fx.Int32(4))
+
+                        def xclaim():
+                            """thread 0: a ticket j * 8 + y from list y = ``rf[HX_Q]``"""
+                            y = rd(HX_Q)
+                            return fx.Int32(comm_ops.atomic_add_agent(xhead(y), fx.Int32(1))) * fx.Int32(8) + y
+
+                        def xldm(base, words):
+                            """thread 0 (``xcd_steal`` 2): a monotonic, NOT volatile load of word ``words``
+                            past ``base``: a volatile load is waited for before the next one is issued, these
+                            are in flight together"""
+                            return fx.Int32(fx.generic_load(
+                                comm_ops._to_ptr_global(base + fx.Int64(words * 4)), volatile=False,
+                                memory_order=fx.AtomicOrdering.Monotonic, syncscope=fx.rocdl.SyncScope.OneAs))
+
+                        def xdz(seed):
+                            """thread 0: 0 as a value the compiler must treat as divergent (mbcnt_lo(seed, 0) =
+                            the set bits of ``seed`` below this lane: none for lane 0), so the addresses, loads
+                            and selection built on it stay in VGPRs; ``seed`` (a value of this tile) keeps it
+                            from being hoisted out of the tile loop, live across the K loop."""
+                            return fx.Int32(rocdl.mbcnt_lo(T.i32, fx.Int32(seed).ir_value(), fx.Int32(0).ir_value()))
+
+                        def xbase(seed):
+                            """``sched`` + 4 * the lists' base word, divergent (``xdz``): the loads and the
+                            selection on them stay in VGPRs"""
+                            return fx.Int64(arg_sched) + fx.Int64(fx.Int32(XB * 4) + xdz(seed))
+
+                        def xprobe(y):
+                            """thread 0 (``xcd_steal`` 2, the whole queue published: the tails are final): ONE
+                            round trip reads the 8 heads and tails (one base, immediate offsets) and list y's
+                            tail. Returns key = max over lists i of ((tail - head) << 3 | i), so the list with the
+                            most items left is key & 7 and has one iff key >= 8; and list y's tail. (A max, no
+                            selects: a select chain kept 16 compare masks in SGPR pairs, and they spilled.)"""
+                            base = xbase(y)
+                            hs = [xldm(base, SCH_XHEAD + i * 32) for i in range_constexpr(8)]
+                            ts = [xldm(base, SCH_XTAIL + i * 32) for i in range_constexpr(8)]
+                            ty = xldm(base + fx.Int64(y * fx.Int32(128)), SCH_XTAIL)
+                            key = fx.Int32(0)
+                            for i in range_constexpr(8):
+                                ki = (ts[i] - hs[i]) * fx.Int32(8) + fx.Int32(i)
+                                key = (ki > key).select(ki, key)   # a max (v_max_i32)
+                            return key, ty
+
+                        def xsteal(raw):
+                            """thread 0 (``xcd_steal`` 2, the whole queue published): ticket ``raw`` (j * 8 + y)'s
+                            work item if list y's final tail passes j; else one claimed from the list with the
+                            most left (``xprobe``; the claim and that list's tail in one round trip; probe again
+                            if the claim loses a race), which becomes this workgroup's list (``rf[HX_Q]``);
+                            ``total_work`` when no list has one left (one round trip to learn it)."""
+                            y = raw % fx.Int32(8)
+                            j = raw // fx.Int32(8)
+                            w = total_work
+                            go = fx.Int32(1)
+                            key = fx.Int32(0)
+                            ty = fx.Int32(0)
+                            while go != fx.Int32(0):
+                                key, ty = xprobe(y)
+                                if ty > j:
+                                    w = fx.Int32(comm_ops.load_i32_global_system(xentry(y, j)))
+                                    go = fx.Int32(0)
+                                elif key < fx.Int32(8):
+                                    go = fx.Int32(0)
+                                else:
+                                    b = key & fx.Int32(7)
+                                    jb = fx.Int32(comm_ops.atomic_add_agent(xhead(b), fx.Int32(1)))
+                                    bt = fx.Int32(comm_ops.load_i32_global_system(xtail(b)))
+                                    if jb < bt:
+                                        w = fx.Int32(comm_ops.load_i32_global_system(xentry(b, jb)))
+                                        wr(HX_Q, b)
+                                        go = fx.Int32(0)
+                            return w
+
+                        def xresolve(raw):
+                            """thread 0: ticket ``raw``'s work item (m_tile * N + n), waiting for the list's
+                            tail; ``total_work`` once every list is exhausted. Once the whole ready queue is
+                            published (``fin``: the list tails are final) and list y is exhausted, steal: the
+                            next list (y + 1, y + 2, ...; an atomic and its tail per step, in parallel), and go
+                            on claiming from it (``rf[HX_Q]``); back at this XCD's own list = done. (A scan of
+                            the 8 lists for the fullest costs 10 SGPRs, spills and changes the K loop.)"""
+                            total_q = total_work // fx.Int32(n_tiles)
+                            y = raw % fx.Int32(8)
+                            j = raw // fx.Int32(8)
+                            w = total_work
+                            go = fx.Int32(1)
+                            fin = fx.Int32(0)
+                            if const_expr(XS2):
+                                fin = rd(HX_F)
+                            tl = fx.Int32(comm_ops.load_i32_global_system(xtail(y)))
+                            while go != fx.Int32(0):
+                                if tl > j:
+                                    w = fx.Int32(comm_ops.load_i32_global_system(xentry(y, j)))
+                                    go = fx.Int32(0)
+                                elif fin == fx.Int32(0):
+                                    gt = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
+                                    tl = fx.Int32(comm_ops.load_i32_global_system(xtail(y)))
+                                    if gt >= total_q:
+                                        # tl may predate gt: read it again (issued after gt returned)
+                                        fin = fx.Int32(1)
+                                        tl = fx.Int32(comm_ops.load_i32_global_system(xtail(y)))
+                                        if const_expr(XS2):
+                                            wr(HX_F, fx.Int32(1))
+                                    else:
+                                        rocdl.s_sleep(1)
+                                else:
+                                    y = (y + fx.Int32(1)) & fx.Int32(7)
+                                    if y == (bid & fx.Int32(7)):
+                                        go = fx.Int32(0)
+                                    else:
+                                        j = fx.Int32(comm_ops.atomic_add_agent(xhead(y), fx.Int32(1)))
+                                        tl = fx.Int32(comm_ops.load_i32_global_system(xtail(y)))
+                                        wr(HX_Q, y)
+                            return w
+
+                        def publish(t, m):
+                            """thread 0: ticket ``t`` (m-tile ``m``) is the next tile: HA_* = it and its
+                            table entries."""
+                            wr(HA_T, t)
+                            wr(HA_M, m)
+                            wr(HA_TRB, fx.Int32(trb_rsrc[m]))
+                            wr(HA_TIB, fx.Int32(tib_rsrc[m]))
+                            wr(HA_EXP, hp_expert(m))
+
+                        def take(t):
+                            """thread 0: ticket ``t`` is the next tile (blocking)"""
+                            if const_expr(xcd_order):
+                                w = xresolve(t)
+                                publish(w, (w < total_work).select(w // fx.Int32(n_tiles), fx.Int32(0)))
+                            else:
+                                publish(t, resolve(t))
+
+                        def claim_t():
+                            if const_expr(xcd_order):
+                                return xclaim()
+                            return claim()
+
+                        def hook():
+                            """In ``tile_main``, after the K loop's first loads: the next tile's table
+                            entries, if its ready-queue slot was read in the last epilogue."""
+                            if tid == fx.Int32(0):
+                                if rd(HB_OK) != fx.Int32(0):
+                                    publish(rd(HB_T), rd(HB_M))
+
+                        # first tile: ticket, slot and front blocking, as the plain loop; the ticket after it
+                        # is claimed now and its slot read after the first K loop
                         if tid == fx.Int32(0):
-                            trace_buf[bid * fx.Int32(TRACE_STRIDE) + fx.Int32(3)] = fx.Int64(item)
+                            if const_expr(xcd_order):
+                                wr(HX_Q, bid & fx.Int32(7))
+                            if const_expr(XS2):
+                                wr(HX_F, fx.Int32(0))
+                            take(claim_t())
+                            wr(HB_T, claim_t())
+                            wr(HB_M, fx.Int32(0))
+                            wr(HB_OK, fx.Int32(0))
+                        fx.barrier()
+                        raw = hp_rows(rd(HA_TIB))
+                        hp_stage_store(hp_issue(raw, hp_sa_rows(rd(HA_TIB))))
+                        raw = raw + [fx.Int32(0)] * (4 - n_rounds)
+                        r0 = raw[0]
+                        r1 = raw[1]
+                        r2 = raw[2]
+                        r3 = raw[3]
+                        tk = rd(HA_T)
+                        item = fx.Int32(0)
+                        tacc = fx.Int64(0)
+                        while tk < total_work:
+                            # this tile: its ticket tk, the HA_* words (read before tile_main's first barrier,
+                            # thread 0 rewrites them after it), its rowmap words r0..r3; A k-step 0 and its A
+                            # scales are in LDS (written in the last epilogue)
+                            hm = rd(HA_M)
+                            trb = rd(HA_TRB)
+                            hn = tk - (tk // fx.Int32(n_tiles)) * fx.Int32(n_tiles)
+                            n_base = n_wave_base + hn * fx.Int32(tile_n)
+                            b_row = hp_b_row(rd(HA_EXP), n_base)
+                            slot0 = (item < fx.Int32(TRACE_ITEMS)).select(fx.Int32(8) + item * fx.Int32(TRACE_SLOTS), fx.Int32(TRACE_STRIDE - TRACE_SLOTS))
+                            if const_expr(trace):
+                                # no running tile-time sum here (``tacc``, slot 7 stays 0): its four
+                                # SGPRs, live across the K loop, spilled an SGPR into a VGPR lane and
+                                # re-scheduled the K loop (an A ds_read pair serialised)
+                                stamp(trace_buf, slot0)
+                            acc = hp_tile(b_row, r0, r1, r2, r3, slot0, hook)
+                            # K loop done. Thread 0: the next tile's slot if the hook could not read it
+                            # (blocking, the plain loop's wait); then claim the ticket after next and read
+                            # the tail, both landing during the first epilogue half.
+                            ct = fx.Int32(0)
+                            tl2 = fx.Int32(0)
+                            gt2 = fx.Int32(0)
+                            if tid == fx.Int32(0):
+                                if rd(HB_OK) == fx.Int32(0):
+                                    take(rd(HB_T))
+                                ct = claim_t()
+                                if const_expr(XS2):
+                                    # the ready-queue tail too (not volatile: in flight with the two others)
+                                    gt2 = xldm(fx.Int64(arg_sched) + fx.Int64(xdz(ct)), SCH_TAIL)
+                                if const_expr(xcd_order):
+                                    tl2 = fx.Int32(comm_ops.load_i32_global_system(xtail(rd(HX_Q))))
+                                else:
+                                    tl2 = fx.Int32(comm_ops.load_i32_global_system(tail_addr))
+                            # every wave is past its last A read (``do_tile``'s barrier); HA_* = the next tile
+                            wait_lds_barrier()
+                            tk_n = rd(HA_T)
+                            raw_n = hp_rows(rd(HA_TIB))
+                            sar_n = hp_sa_rows(rd(HA_TIB))
+                            ce = hp_epi_c(acc)
+                            # between the epilogue halves. Thread 0: the slot of the ticket after next if the
+                            # tail already covers it. All: the next tile's A k-step 0 and A scales -> registers.
+                            rqv = fx.Int32(0)
+                            ok = fx.Int32(1)
+                            if tid == fx.Int32(0):
+                                if const_expr(xcd_order):
+                                    # ct = j * 8 + y; a resolved ticket becomes its work item
+                                    if tl2 > ct // fx.Int32(8):
+                                        rqv = fx.Int32(comm_ops.load_i32_global_system(
+                                            xentry(ct % fx.Int32(8), ct // fx.Int32(8))))
+                                    else:
+                                        ok = fx.Int32(0)
+                                else:
+                                    q2 = ct // fx.Int32(n_tiles)
+                                    if ct < total_work:
+                                        if tl2 > q2:
+                                            rqv = fx.Int32(comm_ops.load_i32_global_system(rq_addr + fx.Int64(q2) * fx.Int64(4)))
+                                        else:
+                                            ok = fx.Int32(0)
+                            sv = hp_issue(raw_n, sar_n)
+                            hp_store_quant(hm, trb, n_base, ce)
+                            # after the epilogue's closing barrier (the C tile is read): the next tile's A
+                            # k-step 0 and A scales to LDS; thread 0 keeps the ticket after next for the hook
+                            hp_stage_store(sv)
+                            if tid == fx.Int32(0):
+                                if const_expr(XS2):
+                                    # not resolved and the whole queue published: the ticket's list is (or
+                                    # will be) exhausted, steal now (or learn it is the end), not after the
+                                    # next K loop. Here, after the epilogue, few registers are live.
+                                    if ok == fx.Int32(0):
+                                        if gt2 >= total_work // fx.Int32(n_tiles):
+                                            wr(HX_F, fx.Int32(1))
+                                            rqv = xsteal(ct)
+                                            ok = fx.Int32(1)
+                                    wr(HB_T, (ok != fx.Int32(0)).select(rqv, ct))
+                                    wr(HB_M, (rqv < total_work).select(rqv // fx.Int32(n_tiles), fx.Int32(0)))
+                                elif const_expr(xcd_order):
+                                    # resolved: HB_T = the work item, HB_M = its m-tile; else the raw ticket
+                                    wr(HB_T, (ok != fx.Int32(0)).select(rqv, ct))
+                                    wr(HB_M, rqv // fx.Int32(n_tiles))
+                                else:
+                                    wr(HB_T, ct)
+                                    wr(HB_M, rqv)
+                                wr(HB_OK, ok)
+                            if const_expr(trace):
+                                stamp(trace_buf, slot0 + fx.Int32(2))
+                                stamp_mt(trace_buf, slot0 + fx.Int32(4))
+                            raw_n = raw_n + [fx.Int32(0)] * (4 - n_rounds)
+                            r0 = raw_n[0]
+                            r1 = raw_n[1]
+                            r2 = raw_n[2]
+                            r3 = raw_n[3]
+                            tk = tk_n
+                            item = item + fx.Int32(1)
+                        stamp(trace_buf, fx.Int32(2))
+                        stamp_i64(trace_buf, fx.Int32(7), tacc)
+                        if const_expr(trace):
+                            if tid == fx.Int32(0):
+                                trace_buf[bid * fx.Int32(TRACE_STRIDE) + fx.Int32(3)] = fx.Int64(item)
                 else:
                     for flat in range(bid - fx.Int32(1), total_work, fx.Int32(num_cu - 1)):
                         run_tile(flat)
@@ -647,6 +1186,15 @@ def run_gemm1_sdma(out, window, w, scale_w, tile_row_base, tile_input_base, expe
     if prep is None:
         # no gate, no scheduler: the plain static loop whatever the flags say
         kwargs.pop("ready_first", None)
+        kwargs.pop("hoist_prologue", None)
+        kwargs.pop("kpipe", None)
+        kwargs.pop("kunroll", None)
+        kwargs.pop("xcd_order", None)
+        kwargs.pop("xcd_steal", None)
+        kwargs.pop("fin_off", None)
+        kwargs.pop("sa_pack", None)
+        kwargs.pop("a_dbuf", None)
+        kwargs.pop("epi_remat", None)
     elif kwargs.get("ready_first") and not prep.sched_on:
         raise ValueError("ready_first needs Stage1SdmaPrepare(sched=True) (arm zeroes its counters)")
     fz = dict(fuse or {})

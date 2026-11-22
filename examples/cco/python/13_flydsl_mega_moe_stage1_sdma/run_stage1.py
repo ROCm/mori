@@ -34,7 +34,7 @@ Checks, then times:
 
 Phase 1c: the prepare always owns its tokens, stages the routes first, swizzles the quant
 stores through LDS and splits a token over 3 waves; the gated GEMM1 always builds the layout.
-Switches left: --ready-first, --no-plan, --fuse-prepare, --chunk-rows, --early-chunks,
+Switches left: --ready-first, --tile-opt, --no-plan, --fuse-prepare, --chunk-rows, --early-chunks,
 --head-rows, --sbm, --tile-n.
 
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 run_stage1.py --bs 4096
@@ -597,6 +597,15 @@ def main():
         "instead of gating each tile on the SDMA signals",
     )
     ap.add_argument(
+        "--tile-opt",
+        action="store_true",
+        help="GEMM1 (needs --ready-first; same results): the tile-loop changes that pay at this "
+        "sort_block_m (gemm1.compile_gemm1_sdma): the next tile's prologue hoisted into the current "
+        "tile, A k-step through registers and double-buffered A operand, XCD-affine tile order with "
+        "steal, opaque final-step A offset; at sbm 128 also packed A scales and rematerialised "
+        "epilogue lane constants, at sbm 64 a two-step K-loop body",
+    )
+    ap.add_argument(
         "--no-plan",
         action="store_true",
         help="prepare without the counting sort: a block reserves its rows of each run "
@@ -634,6 +643,8 @@ def main():
     args = ap.parse_args()
     if args.graph_only:
         args.graph = True
+    if args.tile_opt and not args.ready_first:
+        ap.error("--tile-opt needs --ready-first")
 
     rank, world, device = ex11._setup()
     net, moe = ex11._build_moe(args, args.bs, rank, world, device)
@@ -726,6 +737,18 @@ def main():
             return fz
 
         rf_kwargs = dict(ready_first=args.ready_first)
+        if args.tile_opt:
+            rf_kwargs.update(
+                hoist_prologue=True,
+                kpipe=1,
+                a_dbuf=1,
+                xcd_order=True,
+                xcd_steal=2,
+                fin_off=True,
+            )
+            rf_kwargs.update(
+                dict(sa_pack=True, epi_remat=1) if sbm == 128 else dict(kunroll=2)
+            )
 
         def gemm1(gated, trace=None):
             run_gemm1_sdma(
