@@ -238,12 +238,14 @@ void PrintPerfTable(const char* test_name, const char* transport_name, const cha
   const char* tag = (test_name != nullptr && test_name[0] != '\0') ? test_name : "p2p";
 
   // Units the total size is split across (one WQE/message each): block=one per
-  // block, warp=one per wavefront, thread=one per thread. Each message is size/units.
+  // block, warp=one per wavefront, thread / thread_agg / lane=one per thread.
+  // Each message is size/units.
   int units = grid_x;
   if (scope_name != nullptr && std::strcmp(scope_name, "warp") == 0) {
     units = grid_x * (warp_size > 0 ? block_threads / warp_size : 1);
-  } else if (scope_name != nullptr && (std::strcmp(scope_name, "thread") == 0 ||
-                                       std::strcmp(scope_name, "thread_agg") == 0)) {
+  } else if (scope_name != nullptr &&
+             (std::strcmp(scope_name, "thread") == 0 ||
+              std::strcmp(scope_name, "thread_agg") == 0 || std::strcmp(scope_name, "lane") == 0)) {
     units = grid_x * block_threads;
   }
   if (units < 1) units = 1;
