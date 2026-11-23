@@ -183,6 +183,78 @@ TEST_F(L1PoolTest, EvictsCachedContentColdestFirstOnlyAfterVacantRunsOut) {
   EXPECT_EQ(StatsOf("p0").evicted, 1u);
 }
 
+TEST_F(L1PoolTest, KeepCopiesEvictsWhatAnotherPoolAlsoHoldsBeforeTheColdestSlot) {
+  manager->SetEvictionPolicy(/*keep_copies=*/1);
+  Cache(0, {"only", "spare"}, 1);                               // "only" is the colder of the two
+  ASSERT_EQ(manager->Fetch("p1", {"spare"}).slots.size(), 1u);  // p1 holds "spare" as well
+  manager->Allocate("p0", kSlots - 2);
+  // The copy p1 also has goes first, although "only" is colder.
+  EXPECT_EQ(manager->Allocate("p0", 1).evicted_keys, (std::vector<std::string>{"spare"}));
+  // p1's is the last copy of "spare" now, and p1 has nothing else to give up.
+  manager->Allocate("p1", kSlots - 1);
+  EXPECT_EQ(manager->Allocate("p1", 1).evicted_keys, (std::vector<std::string>{"spare"}));
+  // No spare copy left in p0 either: coldest first, as without the policy.
+  EXPECT_EQ(manager->Allocate("p0", 1).evicted_keys, (std::vector<std::string>{"only"}));
+}
+
+TEST_F(L1PoolTest, KeepCopiesReachesASpareCopyBehindARunOfLastCopies) {
+  manager->SetEvictionPolicy(/*keep_copies=*/1);
+  Cache(0, {"a", "b", "c", "spare"}, 1);  // a prefix nobody else holds, then one that p1 copies
+  ASSERT_EQ(manager->Fetch("p1", {"spare"}).slots.size(), 1u);
+  manager->Allocate("p0", kSlots - 4);
+  EXPECT_EQ(manager->Allocate("p0", 1).evicted_keys, (std::vector<std::string>{"spare"}));
+  // With no spare copy left the last copies go, oldest first.
+  EXPECT_EQ(manager->Allocate("p0", 3).evicted_keys, (std::vector<std::string>{"a", "b", "c"}));
+}
+
+TEST_F(L1PoolTest, KeepCopiesTakesALastCopyThatAnotherPoolHasSinceCopied) {
+  manager->SetEvictionPolicy(/*keep_copies=*/1);
+  Cache(0, {"x", "y", "spare"}, 1);
+  ASSERT_EQ(manager->Fetch("p1", {"spare"}).slots.size(), 1u);
+  manager->Allocate("p0", kSlots - 3);
+  // Passes over "x" and "y", the last copies, to take "spare".
+  EXPECT_EQ(manager->Allocate("p0", 1).evicted_keys, (std::vector<std::string>{"spare"}));
+  // p1 copies "y": p0's copy of it is spare now and goes before the older "x".
+  ASSERT_EQ(manager->Fetch("p1", {"y"}).slots.size(), 1u);
+  EXPECT_EQ(manager->Allocate("p0", 1).evicted_keys, (std::vector<std::string>{"y"}));
+  EXPECT_EQ(manager->Allocate("p0", 1).evicted_keys, (std::vector<std::string>{"x"}));
+}
+
+TEST_F(L1PoolTest, KeepTwoCopiesTreatsTheSecondCopyAsWorthKeeping) {
+  manager->SetEvictionPolicy(/*keep_copies=*/2);
+  Cache(0, {"only", "pair"}, 1);
+  ASSERT_EQ(manager->Fetch("p1", {"pair"}).slots.size(), 1u);
+  manager->Allocate("p0", kSlots - 2);
+  // Two pools hold "pair": neither copy is spare, so the coldest slot goes.
+  EXPECT_EQ(manager->Allocate("p0", 1).evicted_keys, (std::vector<std::string>{"only"}));
+}
+
+TEST_F(L1PoolTest, KeepCopiesKeepsTheCopyJustFetchedAndGivesUpTheSourcesCopy) {
+  manager->SetEvictionPolicy(/*keep_copies=*/1);
+  Cache(1, {"own"}, 50);
+  Cache(0, {"k"}, 1);
+  ASSERT_EQ(manager->Fetch("p1", {"k"}).slots.size(), 1u);
+  // p1's copy of "k" was fetched for a request that is about to use it: it is
+  // the one to keep, so p1 gives up its older content instead.
+  manager->Allocate("p1", kSlots - 2);
+  EXPECT_EQ(manager->Allocate("p1", 1).evicted_keys, (std::vector<std::string>{"own"}));
+  // p0's copy is the spare one, however recently p0 released it.
+  manager->Allocate("p0", kSlots - 1);
+  EXPECT_EQ(manager->Allocate("p0", 1).evicted_keys, (std::vector<std::string>{"k"}));
+}
+
+TEST_F(L1PoolTest, KeepCopiesTreatsTheCopyAnEngineLastTookAsTheOneToKeep) {
+  manager->SetEvictionPolicy(/*keep_copies=*/1);
+  const std::vector<uint32_t> source = Cache(0, {"k"}, 1);
+  ASSERT_EQ(manager->Fetch("p1", {"k"}).slots.size(), 1u);
+  // p0 serves the next request from its own copy: that one is the newest again.
+  ASSERT_TRUE(manager->Apply("p0", {Op{OpKind::kHold, source[0], ""}}).ok);
+  ASSERT_TRUE(manager->Apply("p0", {Op{OpKind::kRelease, source[0], ""}}).ok);
+  manager->Allocate("p1", kSlots - 1);
+  EXPECT_EQ(manager->Allocate("p1", 1).evicted_keys, (std::vector<std::string>{"k"}));
+  EXPECT_EQ(StatsOf("p0").cached, 1u);
+}
+
 TEST_F(L1PoolTest, AskingAheadOfNeedDoesNotEvict) {
   Cache(0, {"a", "b"}, 1);
   manager->Allocate("p0", kSlots - 3);  // one vacant slot left

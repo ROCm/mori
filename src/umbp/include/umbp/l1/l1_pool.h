@@ -232,6 +232,17 @@ class PoolManager {
   Status Detach(const std::string& pool_id);
   std::vector<PoolStats> Stats() const;
 
+  // Which cached slot an eviction takes. With `keep_copies` 0 it is the least
+  // recently released one. With `keep_copies` N > 0 it is the least recently
+  // released spare copy: a slot whose key N pools of the group hold a newer
+  // copy of, where the newest copy is the one last published, fetched or
+  // taken by its engine for a request. A copy to keep goes only when the
+  // pool has no spare copy left. Ranks that copy each other's prefixes end
+  // up with several copies of the same content: this drops the old ones
+  // first and keeps the N newest, which are where the conversation is being
+  // served now. Read from UMBP_L1_KEEP_COPIES at construction (default 0).
+  void SetEvictionPolicy(uint32_t keep_copies);
+
  private:
   enum class SlotState : uint8_t { kVacant, kCached, kHeld, kFilling };
 
@@ -246,7 +257,9 @@ class PoolManager {
     uint64_t released = 0;
     bool has_key = false;
     std::string key;
+    // Where a cached slot stands in `Pool::lru`, or in `Pool::kept` when `kept`.
     std::list<uint32_t>::iterator lru_it;
+    bool kept = false;
   };
 
   struct Pool {
@@ -264,11 +277,15 @@ class PoolManager {
     std::vector<Slot> slots;
     std::set<uint32_t> vacant;
     std::list<uint32_t> lru;  // cached slots, coldest first
+    // Cached slots an eviction passed over as last copies (`keep_copies`),
+    // oldest first. Evicted from only when `lru` has nothing to take.
+    std::list<uint32_t> kept;
     std::unordered_map<std::string, uint32_t> index;
     uint32_t held = 0;
     uint32_t busy = 0;       // in-flight copies into or out of this pool
     uint64_t committed = 0;  // how far the owner's device has got
     uint64_t evicted = 0;
+    uint64_t evicted_spare = 0;  // of those, evictions that left another pool holding the key
     uint64_t fetched_in_slots = 0;
     uint64_t fetched_in_bytes = 0;
     uint64_t served_out_slots = 0;
@@ -296,6 +313,16 @@ class PoolManager {
   Pool* FindLocked(const std::string& pool_id);
   // Stop advertising `slot`'s key. The slot keeps its state.
   void UnindexLocked(Pool* pool, uint32_t slot);
+  // Take a cached slot off whichever list it stands in.
+  void UncacheLocked(Pool* pool, uint32_t slot);
+  // Whether evicting `slot` leaves `keep_copies_` newer copies of its key in
+  // the group (or it has no key).
+  bool IsSpareLocked(const Pool* pool, uint32_t slot) const;
+  // `key` gained a holder, its newest: the copy this pushes out of the newest
+  // `keep_copies_` is spare, and the coldest spare copy of its pool.
+  void HolderAddedLocked(Group* group, const std::string& key);
+  // The owner took `slot` for a request: its copy is the newest of its key.
+  void HolderUsedLocked(Pool* pool, uint32_t slot);
   void ResetSlotsLocked(Pool* pool);
   // A free slot for new content, or false. Appends the key it destroyed; with
   // `evicted` null only a vacant slot is taken. `settled_only` is for a taker
@@ -312,6 +339,7 @@ class PoolManager {
   void DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool);
 
   std::shared_ptr<MemoryApi> api_;
+  uint32_t keep_copies_ = 0;
   mutable std::mutex mutex_;
   std::condition_variable idle_;
   std::unordered_map<std::string, std::unique_ptr<Pool>> pools_;
