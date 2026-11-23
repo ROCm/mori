@@ -124,7 +124,7 @@ def _jit_compile(cov: int) -> str | None:
             return str(bc_path)
 
         sdma_define = [f"-DBUILD_CCO_SDMA={1 if sdma_on else 0}"]
-        lock_path = cache_dir / f".{_BC_FILENAME}.lock"
+        lock_path = cache_dir / f".{_BC_FILENAME}.flock"
         with FileBaton(lock_path, wait_for=str(bc_path)) as baton:
             if baton.skipped or bc_path.is_file():
                 return str(bc_path)

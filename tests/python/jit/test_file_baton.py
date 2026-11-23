@@ -26,6 +26,7 @@ import errno
 import multiprocessing as mp
 import os
 import signal
+import socket
 import threading
 import time
 
@@ -62,8 +63,8 @@ def _enter_in_thread(baton):
 
 
 def test_leftover_lock_file_does_not_block(tmp_path):
-    # What a killed build (or the old O_EXCL lock) leaves behind.
-    lock = tmp_path / ".kernel.lock"
+    # What every build leaves behind, a killed one included.
+    lock = tmp_path / ".kernel.flock"
     lock.touch()
     start = time.monotonic()
     with FileBaton(lock) as baton:
@@ -72,7 +73,7 @@ def test_leftover_lock_file_does_not_block(tmp_path):
 
 
 def test_lock_is_released_when_the_holder_is_killed(tmp_path):
-    lock = str(tmp_path / ".kernel.lock")
+    lock = str(tmp_path / ".kernel.flock")
     ready = _CTX.Event()
     holder = _CTX.Process(target=_hold_until_killed, args=(lock, ready))
     holder.start()
@@ -86,7 +87,7 @@ def test_lock_is_released_when_the_holder_is_killed(tmp_path):
 
 
 def test_waiter_blocks_until_the_holder_releases(tmp_path):
-    lock = str(tmp_path / ".kernel.lock")
+    lock = str(tmp_path / ".kernel.flock")
     ready, release = _CTX.Event(), _CTX.Event()
     holder = _CTX.Process(target=_hold, args=(lock, ready, release))
     holder.start()
@@ -106,7 +107,7 @@ def test_waiter_blocks_until_the_holder_releases(tmp_path):
 
 
 def test_waiter_skips_once_the_target_exists(tmp_path):
-    lock = str(tmp_path / ".kernel.lock")
+    lock = str(tmp_path / ".kernel.flock")
     target = tmp_path / "kernel.hsaco"
     ready, release = _CTX.Event(), _CTX.Event()
     holder = _CTX.Process(target=_hold, args=(lock, ready, release))
@@ -132,7 +133,7 @@ def test_lock_error_names_the_lock_file_and_closes_it(tmp_path, monkeypatch):
         raise OSError(errno.EBADF, os.strerror(errno.EBADF))
 
     monkeypatch.setattr(jit_core.fcntl, "flock", flock)
-    lock = tmp_path / ".kernel.lock"
+    lock = tmp_path / ".kernel.flock"
     fds = len(os.listdir("/proc/self/fd"))
     with pytest.raises(OSError, match=str(lock)):
         FileBaton(lock).__enter__()
@@ -156,3 +157,38 @@ def test_output_appears_only_when_complete(tmp_path):
         tmp.write_bytes(b"complete")
     assert out.read_bytes() == b"complete"
     assert list(tmp_path.iterdir()) == [out]
+
+
+def test_waiter_skips_only_once_every_target_exists(tmp_path):
+    # A parallel group: one finished file does not mean the group is done.
+    lock = str(tmp_path / ".group.flock")
+    targets = [tmp_path / "a.hsaco", tmp_path / "b.hsaco"]
+    ready, release = _CTX.Event(), _CTX.Event()
+    holder = _CTX.Process(target=_hold, args=(lock, ready, release))
+    holder.start()
+    try:
+        assert ready.wait(30)
+        baton = FileBaton(lock, wait_for=targets)
+        thread, entered = _enter_in_thread(baton)
+        targets[1].touch()
+        assert not entered.wait(2)
+        targets[0].touch()
+        assert entered.wait(30)
+        assert baton.skipped
+        baton.__exit__(None, None, None)
+        thread.join(5)
+    finally:
+        release.set()
+        holder.join(30)
+
+
+def test_a_lock_named_like_the_old_one_is_refused(tmp_path):
+    # mori's earlier O_EXCL lock waits on a *.lock file while it exists.
+    with pytest.raises(ValueError, match="flock"):
+        FileBaton(tmp_path / ".kernel.lock")
+
+
+def test_temp_output_names_the_host_and_pid(tmp_path):
+    with _atomic_output(tmp_path / "kernel.hsaco") as tmp:
+        assert f".{socket.gethostname()}.{os.getpid()}." in tmp.name
+        tmp.write_bytes(b"x")
