@@ -88,6 +88,25 @@ TEST(RestoreScheduler, RejectsBatchesWithNoBytes) {
   EXPECT_FALSE(TryStripedRestore({plan}, UnexpectedMapping, 4));
 }
 
+// Runs only with no GPU visible, which is what keeps the scheduler from
+// starting; the umbp_restore_scheduler_no_gpu CTest entry hides them. Nothing
+// is submitted, so the endpoint addresses are never dereferenced.
+TEST(RestoreScheduler, DeclinesWhenSchedulerCannotStart) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) == hipSuccess && devices > 0)
+    GTEST_SKIP() << "needs no visible GPU";
+  (void)hipGetLastError();
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  bool restored = true;
+  EXPECT_NO_THROW(restored = TryStripedRestore({HostToDevicePlan()}, UnexpectedMapping, 4));
+  EXPECT_FALSE(restored);
+  // A later restore is declined the same way.
+  restored = true;
+  EXPECT_NO_THROW(restored = TryStripedRestore({HostToDevicePlan()}, UnexpectedMapping, 4));
+  EXPECT_FALSE(restored);
+}
+
 TEST(RestoreScheduler, RestoresHostDataIntoDestinationGpu) {
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";

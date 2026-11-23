@@ -134,6 +134,12 @@ add_test(NAME umbp_tags_real_master
 add_executable(test_umbp_restore_scheduler test_restore_scheduler.cpp)
 target_link_libraries(test_umbp_restore_scheduler PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_restore_scheduler COMMAND test_umbp_restore_scheduler)
+# The scheduler cannot start with every GPU hidden; the restore must be declined.
+add_test(NAME umbp_restore_scheduler_no_gpu
+         COMMAND test_umbp_restore_scheduler
+                 --gtest_filter=RestoreScheduler.DeclinesWhenSchedulerCannotStart)
+set_tests_properties(umbp_restore_scheduler_no_gpu
+                     PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
 
 add_executable(test_umbp_types test_types.cpp)
 target_link_libraries(test_umbp_types PRIVATE umbp_common gtest_main)

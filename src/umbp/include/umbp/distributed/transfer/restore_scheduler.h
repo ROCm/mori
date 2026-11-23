@@ -31,6 +31,9 @@ struct TransferPlan;
 // Split a restore across peer GPUs, all writing to one destination GPU.
 // Completes synchronously. On failure, all submitted chunks are drained before
 // returning false, allowing the caller to safely overwrite via its direct path.
+// A scheduler that cannot start (for example, two GPUs without peer access) is
+// reported the same way, not thrown: this and every later call in the process
+// return false.
 bool TryStripedRestore(const std::vector<TransferPlan>& plans,
                        const std::function<void*(const void*, size_t, int)>& host_device_address,
                        size_t chunk_bytes);

@@ -98,7 +98,8 @@ class RestoreScheduler {
     int previous_device = -1;
     check(hipGetDevice(&previous_device), "hipGetDevice");
     // Require full peer connectivity before starting the scheduler thread.
-    // Initialization errors reach the caller, with no background thread to join.
+    // Initialization errors are thrown to TryStripedRestore, with no background
+    // thread to join.
     try {
       for (int device = 0; device < count; ++device) {
         workers_[device].device = device;
@@ -317,7 +318,21 @@ bool TryStripedRestore(const std::vector<TransferPlan>& plans, const HostMapper&
   if (request->unassigned_bytes == 0) return false;
   // One process-wide scheduler owns all restore streams. Configuration is fixed
   // for the process, like the existing environment-based gather dispatch.
-  static RestoreScheduler scheduler(chunk_bytes);
-  return scheduler.Restore(std::move(request));
+  //
+  // The scheduler cannot start without peer access between every pair of GPUs,
+  // but the caller's direct path needs none. A failed start is therefore kept
+  // as the answer for the process: every restore is declined, and the caller
+  // copies through its direct path instead of seeing an exception.
+  static const std::unique_ptr<RestoreScheduler> scheduler =
+      [chunk_bytes]() -> std::unique_ptr<RestoreScheduler> {
+    try {
+      return std::make_unique<RestoreScheduler>(chunk_bytes);
+    } catch (const std::exception& error) {
+      MORI_UMBP_WARN("[RestoreScheduler] striped restores unavailable, using direct restores: {}",
+                     error.what());
+      return nullptr;
+    }
+  }();
+  return scheduler != nullptr && scheduler->Restore(std::move(request));
 }
 }  // namespace mori::umbp
