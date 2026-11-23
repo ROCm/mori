@@ -197,17 +197,20 @@ def _cases():
 _CASES = dict(_cases())
 _GFX950_ONLY = {"fp4-gather"}
 
-# The gfx125x default backend is hip, which serves gather only, in bf16 / fp32, with
-# no std_moe and no routing replay (hip_backend._unsupported), and whose push quant
-# combine folds no weights -- which this test asks for. Those modes are the backend's
-# answer there, not a failure, so they are dropped from the launch as well as skipped:
-# the modes all share one launch, and an unserved one aborts it before the rest run.
+# The gfx125x default backend is hip, which serves gather and the push quant combine
+# (test_op passes it no weights: it folds none), in bf16 / fp32, with no plain scatter,
+# no std_moe, no routing replay, and a quant hidden dim only in multiples of 1024
+# (hip_backend._unsupported). Those modes are the backend's answer there, not a
+# failure, so they are dropped from the launch as well as skipped: the modes all share
+# one launch, and an unserved one aborts it before the rest run. The quant types the
+# backend does not serve are dropped by _refused_quant below.
 _GFX125X_UNSERVED = {
     c
     for c, env in _CASES.items()
     if _IS_GFX125X
     and (
-        env.get("COMBINE") == "scatter"
+        (env.get("COMBINE") == "scatter" and env.get("QUANT", "none") == "none")
+        or (env.get("QUANT", "none") != "none" and int(env.get("HIDDEN", 7168)) % 1024)
         or env.get("DTYPE") == "fp8"
         or env.get("STDMOE")
         or env.get("REPLAY")

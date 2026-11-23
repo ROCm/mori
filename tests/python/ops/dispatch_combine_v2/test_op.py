@@ -48,6 +48,7 @@ from mori.ops.dispatch_combine_v2 import (  # noqa: E402
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )
+from mori.ops.dispatch_combine_v2.quant_types import is_gfx125x  # noqa: E402
 
 
 class Dist:
@@ -96,7 +97,7 @@ _FP8_DT = (
 def _configure():
     """Read the knobs below from the environment (again for every CASES entry)."""
     global HIDDEN, K, EPR, DTYPE, _IS_FP4, _IS_FP8, STDMOE, SCALE_DIM, COMBINE
-    global QUANT, INSCALE, SPREAD, TINY, SWEEP, RAGGED, NOSELF
+    global QUANT, INSCALE, SPREAD, TINY, SWEEP, RAGGED, NOSELF, NOWTS
     HIDDEN = int(os.environ.get("HIDDEN", 7168))
     K = int(os.environ.get("TOPK", 8))
     EPR = int(os.environ.get("EPR", 32))
@@ -114,6 +115,9 @@ def _configure():
     )  # >0 = also verify per-token scales forwarding
     COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
     QUANT = os.environ.get("QUANT", "none")  # none | fp{8,4}_blockwise[_1x32|_1x128]
+    # The gfx125x push combine folds no weights and refuses them (it says "call
+    # combine with weights=None"), so those runs pass none and skip the weight check.
+    NOWTS = QUANT != "none" and is_gfx125x()
     # Input magnitude: 200 puts a block's amax past the fp8 max, 0.001 below its
     # normal range; a quantized wire must keep both within _QUANT_REL_L2.
     INSCALE = float(os.environ.get("INSCALE", 1))
@@ -375,7 +379,9 @@ def _run(d, comm):
                 # identity expert: recv_x already holds the dispatched tokens.
                 # Weights passed because this test checks the weight fold; an
                 # inference caller passes None and the kernel skips it.
-                out, out_w = op.combine(recv_x, wts[:ct], routing=routing)
+                out, out_w = op.combine(
+                    recv_x, None if NOWTS else wts[:ct], routing=routing
+                )
                 sync()
                 comm.barrier()
                 U = np.array(
@@ -407,7 +413,7 @@ def _run(d, comm):
                         err = (out.float().cpu() - ref).norm()
                         rel = float(err / ref.norm()) if ref.norm() > 0 else 0.0
                         ok = ok and rel < _QUANT_REL_L2[QUANT[:3]]
-                ok_w = torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
+                ok_w = NOWTS or torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
                 tag = f"OP-{COMBINE}" + (f"-{QUANT}" if QUANT != "none" else "")
             errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
             quant_err = ""
@@ -416,7 +422,8 @@ def _run(d, comm):
             if rank == 0:
                 print(
                     f"# {tag} ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
-                    f"(hidden={'ok' if ok else 'BAD'} wts={'ok' if ok_w else 'BAD'}; "
+                    f"(hidden={'ok' if ok else 'BAD'} "
+                    f"wts={'n/a' if NOWTS else ('ok' if ok_w else 'BAD')}; "
                     f"recv={total_recv}{quant_err})",
                     flush=True,
                 )

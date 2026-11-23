@@ -102,14 +102,18 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
                      ? req.callTokMax
                      : 0;
   c.blockNum = 64;
-  // The gfx125x dispatch stages a token row a warp in LDS, so an fp32 row takes twice
-  // the slab of the bf16 one this default was picked for: 16 warps of a 7168 fp32 row
-  // ask 448 KiB of a 320 KiB workgroup. Half the warps for it, as EpLlDefaultWarps
-  // derives llDispatch's from its payload below. This is the default, not a cap: a
-  // geometry the caller pinned is its own, and the plan refuses one that cannot be
-  // scheduled (CheckWorkgroupLds, which has the compiled kernel's own static LDS).
-  const bool is1250 = arch.rfind("gfx125", 0) == 0;
-  c.warpPerBlock = isDispatch ? (is1250 && c.dtype == EpDType::Fp32 ? 8 : 16) : 8;
+  c.warpPerBlock = isDispatch ? 16 : 8;
+  // The gfx125x dispatch stages a token row a warp in LDS, so how many warps fit
+  // depends on the row: 16 warps of a 7168 fp32 row ask 448 KiB of a 320 KiB
+  // workgroup, and bf16 does the same at hidden 10240. Halve the default until the
+  // slabs fit. This is the default, not a cap: a geometry the caller pinned is its
+  // own, and the plan refuses one that cannot be scheduled (CheckWorkgroupLds, which
+  // has the compiled kernel's own static LDS).
+  if (isDispatch && arch.rfind("gfx125", 0) == 0) {
+    while (c.warpPerBlock > 1 && EpDispatch1250xLdsBytes(c) > EpDispatch1250xSlabLdsBytes) {
+      c.warpPerBlock /= 2;
+    }
+  }
 
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
