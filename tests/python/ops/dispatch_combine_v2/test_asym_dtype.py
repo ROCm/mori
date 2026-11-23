@@ -37,6 +37,10 @@ converts dtype: dispatch moves fp8 tokens, the (mock) expert dequants fp8->bf16
 
     torchrun --nnodes=1 --nproc_per_node=4 --tee 3 ... test_asym_dtype.py
     SCALE_DIM=16 DISP=fp4 torchrun ... test_asym_dtype.py
+    COMBINE=scatter QUANT=fp8_blockwise_1x128 MORI_V2_KERNEL_BACKEND=hip torchrun ...
+
+COMBINE / QUANT pick the combine leg (default gather, unquantized). A quantized
+combine is also held to the L2 bound test_op.py uses.
 """
 import os
 import sys
@@ -69,6 +73,11 @@ SWEEP = [int(x) for x in os.environ.get("SWEEP", "8,64,512").split(",")]
 # Bytes per scale row, 0 = off. A real MX wire sends HIDDEN//32; mori pads that
 # to its own stride, so a value that is not 128 B-aligned is the one worth passing.
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))
+COMBINE = os.environ.get("COMBINE", "gather")
+QUANT = os.environ.get("QUANT", "none")
+# Relative L2 bound of a quantized combine (test_op.py's): rounding is ~2.6% for an
+# fp8 wire and ~11% for e2m1.
+_QUANT_REL_L2 = {"fp8": 0.05, "fp4": 0.15}
 
 
 class Dist:
@@ -220,7 +229,8 @@ def main():
             num_experts_per_token=K,
             dispatch_data_type=DISP,  # fp8 or fp4 dispatch
             combine_data_type=torch.bfloat16,  # bf16 combine
-            combine_mode="gather",
+            combine_mode=COMBINE,
+            quant_type=QUANT,
             scale_dim=SCALE_DIM,
             scale_type_size=1 if SCALE_DIM else 0,
         )
@@ -287,9 +297,19 @@ def main():
                 torch.bfloat16
             )
             exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
-            ok_comb = torch.allclose(
+            # e2m1 is too coarse for an elementwise bound; its L2 bound stands
+            ok_comb = QUANT.startswith("fp4") or torch.allclose(
                 out.float().cpu(), exp.float(), atol=3e-1, rtol=1e-1
             )
+            rel = 0.0
+            if QUANT != "none":
+                ref_n = exp.float().norm()
+                rel = (
+                    float((out.float().cpu() - exp.float()).norm() / ref_n)
+                    if ref_n > 0
+                    else 0.0
+                )
+                ok_comb = ok_comb and rel < _QUANT_REL_L2[QUANT[:3]]
             ok_w = torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
             # dtype sanity: dispatch recv is fp8, combine out is bf16
             ok_dt = recv_x.dtype == DISP and out.dtype == torch.bfloat16
@@ -303,9 +323,12 @@ def main():
                     flush=True,
                 )
                 print(
-                    f"# ASYM-COMBINE(bf16) ct={ct}: {'PASS' if errs_comb == 0 else 'FAIL'} "
+                    f"# ASYM-COMBINE(bf16 {COMBINE}"
+                    f"{'' if QUANT == 'none' else ' ' + QUANT}) ct={ct}: "
+                    f"{'PASS' if errs_comb == 0 else 'FAIL'} "
                     f"(hidden={'ok' if ok_comb else 'BAD'} wts={'ok' if ok_w else 'BAD'} "
-                    f"dtype={'ok' if ok_dt else 'BAD'})",
+                    f"dtype={'ok' if ok_dt else 'BAD'}"
+                    f"{'' if QUANT == 'none' else f' rel_l2={rel:.4f}'})",
                     flush=True,
                 )
                 if SCALE_DIM:

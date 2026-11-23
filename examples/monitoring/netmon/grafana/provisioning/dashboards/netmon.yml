@@ -1,0 +1,12 @@
+# netmon dashboards only (kept apart from the UMBP example's provider and folder).
+apiVersion: 1
+
+providers:
+  - name: netmon
+    folder: netmon
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards/netmon
