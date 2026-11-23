@@ -1363,7 +1363,9 @@ TEST(PageBackendLease, FencesEvictionWithoutMovingRecency) {
   PutKey(*backend, "a");
   PutKey(*backend, "b");
   PutKey(*backend, "c");
-  backend->Lease({"a", "missing"}, std::chrono::milliseconds{50});
+  EXPECT_EQ(backend->Lease({"a", "missing", "a"}, std::chrono::milliseconds{50}),
+            (std::vector<bool>{true, false, true}));
+  EXPECT_TRUE(backend->Lease({}, std::chrono::milliseconds{50}).empty());
   EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"b", "c"}));
   auto evicted = backend->Evict({"a"});
   ASSERT_EQ(evicted.size(), 1u);

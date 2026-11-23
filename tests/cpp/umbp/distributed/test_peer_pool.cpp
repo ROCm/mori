@@ -1675,6 +1675,37 @@ TEST(PeerPoolLocalEviction, TouchedKeysOutliveColderOnesInTheOrderGiven) {
   EXPECT_EQ(pool.LocalEvictionStats().keys, 4u);
 }
 
+// Force the legal interleaving between containment and lease acquisition.
+class EvictBeforeLookupLease final : public PageBackend {
+ public:
+  using PageBackend::PageBackend;
+  std::vector<bool> Lease(const std::vector<std::string>& keys,
+                          std::chrono::milliseconds ttl) override {
+    evicted = Evict(keys);
+    return PageBackend::Lease(keys, ttl);
+  }
+  std::vector<EvictResult> evicted;
+};
+
+TEST(PeerPoolLocalEviction, LookupDoesNotReportAnObjectLostBeforeItsLease) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  PageBackend::OwnershipConfig ownership;
+  ownership.buffer_sizes = {10 * kHostPage};
+  auto backend = std::make_unique<EvictBeforeLookupLease>(TierType::DRAM, kHostPage, ownership,
+                                                          kNoExpiry, std::chrono::milliseconds(1));
+  auto* dram = backend.get();
+  ASSERT_TRUE(backend->Init(&engine));
+  ASSERT_TRUE(registry.Register("dram", std::move(backend)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  CommitKey(&pool, "raced");
+  ASSERT_TRUE(dram->Contains("raced"));
+  EXPECT_EQ(pool.BatchContains({"raced", "missing"}), (std::vector<bool>{false, false}));
+  ASSERT_FALSE(dram->evicted.empty());
+  EXPECT_GT(dram->evicted.front().bytes_freed, 0u);
+  EXPECT_FALSE(dram->Contains("raced"));
+}
+
 TEST(PeerPoolLocalEviction, ALookupFencesTheKeysItFindsUntilTheLoad) {
   LocalCopyEngine engine;
   BackendRegistry registry;

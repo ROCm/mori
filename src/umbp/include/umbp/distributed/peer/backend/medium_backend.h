@@ -351,8 +351,17 @@ class MediumBackend : public MetricSource {
   // Keep these keys from eviction until `ttl` from now, leaving their recency
   // alone: a client looked them up and loads some of them next.  A medium that
   // keeps no leases renews their recency instead.
-  virtual void Lease(const std::vector<std::string>& keys, std::chrono::milliseconds /*ttl*/) {
-    Touch(keys);
+  // Return the keys actually found, in input order. Leasing backends must
+  // confirm presence and acquire the lease atomically against eviction.
+  virtual std::vector<bool> Lease(const std::vector<std::string>& keys,
+                                  std::chrono::milliseconds /*ttl*/) {
+    auto found = BatchContains(keys);
+    std::vector<std::string> held;
+    for (size_t i = 0; i < keys.size() && i < found.size(); ++i) {
+      if (found[i]) held.push_back(keys[i]);
+    }
+    Touch(held);
+    return found;
   }
 
   // ---- observability ----

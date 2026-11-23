@@ -1102,7 +1102,6 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
   std::vector<size_t> pending(keys.size());
   std::iota(pending.begin(), pending.end(), 0);
   std::vector<std::string> batch;
-  std::vector<std::string> found;
   std::vector<size_t> still_missing;
   for (uint32_t backend_id : read_order) {
     if (pending.empty()) break;
@@ -1112,18 +1111,15 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
     batch.reserve(pending.size());
     for (size_t i : pending) batch.push_back(keys[i]);
 
-    const auto hits = backend->BatchContains(batch);
+    const auto hits = backend->Lease(batch, LookupLeaseTtl());
     still_missing.clear();
-    found.clear();
     for (size_t j = 0; j < pending.size(); ++j) {
       if (j < hits.size() && hits[j]) {
         out[pending[j]] = true;
-        found.push_back(std::move(batch[j]));
       } else {
         still_missing.push_back(pending[j]);
       }
     }
-    if (!found.empty()) backend->Lease(found, LookupLeaseTtl());
     pending.swap(still_missing);
   }
   return out;
