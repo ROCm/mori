@@ -56,5 +56,14 @@ enum class StatusCode : uint32_t {
 
 enum class PollCqMode : uint32_t { POLLING = 0, EVENT = 1 };
 
+inline constexpr uint32_t kMoriIoProtocolVersion = 1;
+
+enum class AgentMode : uint32_t {
+  NONE = 0,
+  READ = 0x1,
+  WRITE = 0x2,
+  READ_WRITE = 0x3,
+};
+
 }  // namespace io
 }  // namespace mori
