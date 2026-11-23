@@ -59,6 +59,13 @@ __device__ void EpDispatchLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> 
        i += globalWarpNum) {
     index_t srcTokId = i / config.numExpertPerToken;
     index_t destExpert = args.tokenIndices[i];
+    // A negative expert id is the caller's "drop this slot" sentinel (e.g. a padding
+    // row). Test it before dividing: -1 / numExpertPerRank truncates to 0, which would
+    // send the row to PE 0. destExpert is warp-uniform, so the whole warp skips.
+    if (destExpert < 0) {
+      if (laneId == 0) args.dispDestTokIdMap[i] = NullSendBufSlotOffset(config);
+      continue;
+    }
     index_t destPe = destExpert / config.numExpertPerRank;
     index_t destTokId = 0;
 
@@ -72,12 +79,12 @@ __device__ void EpDispatchLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> 
       continue;
     }
 
-    // Deduplicate
+    // Deduplicate against the token's earlier valid experts; a dropped one sends nothing.
     assert(config.numExpertPerToken < warpSize);
     int condition = 0;
     if (laneId < (i % config.numExpertPerToken)) {
-      condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
-                             config.numExpertPerRank);
+      index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+      condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
     }
     if (__any(condition)) {
       // Indicate that this token is already sent to the destination PE by setting an overflow
@@ -149,7 +156,10 @@ __device__ void EpDispatchLowLatencyAsyncSendCopySlotAssign_body(EpDispatchCombi
 
     int i = tokenId * numEpt + expertIdx;
     index_t destExpert = args.tokenIndices[i];
-    index_t destPe = destExpert / config.numExpertPerRank;
+    // A negative expert id is the caller's "drop this slot" sentinel (e.g. a padding
+    // row). -1 / numExpertPerRank truncates to 0, so map it to -1 before dividing: the
+    // guard below then drops it, and no valid expert can dedup against it.
+    index_t destPe = (destExpert < 0) ? -1 : (destExpert / config.numExpertPerRank);
 
     // Deduplicate via shuffle: read previous experts' destPe from registers.
     // All threads loop the same number of iterations to keep __shfl uniform.
@@ -400,9 +410,10 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
       if (laneId < config.numExpertPerToken) {
         index_t id =
             reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes)[laneId];
+        // A received token keeps its dropped (-1) slots in its index row.
         index_t pe = id / config.numExpertPerRank;
-        if (!((pe >= 0) && (pe < config.worldSize))) {
-          assert((pe >= 0) && (pe < config.worldSize));
+        if (!((id < 0) || ((pe >= 0) && (pe < config.worldSize)))) {
+          assert((id < 0) || ((pe >= 0) && (pe < config.worldSize)));
         }
       }
       core::WarpCopy<uint8_t, 1>(

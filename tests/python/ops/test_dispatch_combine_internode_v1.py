@@ -28,6 +28,7 @@ from tests.python.ops.dispatch_combine_test_utils import (
     cross_dtype_skip_reason,
     EpDispatchCombineTestCase,
     assert_worker_results,
+    check_dispatch_rows_routed_here,
     run_ep_dispatch_combine_test,
     run_ep_dispatch_local_expert_count_test,
 )
@@ -361,10 +362,17 @@ def test_blockwise_combine_unsupported_internode(
 
 
 # ---------------------------------------------------------------------------
-# -1 routing sentinel tests (InterNodeV1, default dispatch/combine path)
+# -1 routing sentinel tests (InterNodeV1 and InterNodeV1LL)
 # gpu_per_node=4: 2 nodes × 4 GPUs — exercises RDMA send/recv with sentinels
 # gpu_per_node=8: 1 node × 8 GPUs — XGMI-only paths inside InterNodeV1
 # ---------------------------------------------------------------------------
+
+
+class _SentinelTestCase(EpDispatchCombineTestCase):
+    def check_dispatch_result(self, op, test_data, *args):
+        super().check_dispatch_result(op, test_data, *args)
+        # args[-1] is dispatch_recv_num_token.
+        check_dispatch_rows_routed_here(op, self.config, test_data, args[-1])
 
 
 def _test_dispatch_combine_sentinel(
@@ -396,13 +404,13 @@ def _test_dispatch_combine_sentinel(
     )
     run_ep_dispatch_combine_test(
         config,
-        EpDispatchCombineTestCase,
+        _SentinelTestCase,
         sentinel_pattern=sentinel_pattern,
     )
 
 
 @pytest.mark.parametrize("world_size", (8,))
-@pytest.mark.parametrize("kernel_type", ("internode_v1",))
+@pytest.mark.parametrize("kernel_type", ("internode_v1", "internode_v1_ll"))
 @pytest.mark.parametrize("data_type", (torch.bfloat16,))
 @pytest.mark.parametrize("hidden_dim", (4096,))
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 32))
@@ -411,7 +419,7 @@ def _test_dispatch_combine_sentinel(
 @pytest.mark.parametrize("gpu_per_node", (4, 8))
 @pytest.mark.parametrize(
     "sentinel_pattern",
-    ("every_other", "first_only", 1),
+    ("unrouted_token", "padded_tail", "every_other", "first_only", 1),
 )
 def test_dispatch_combine_minus_one_sentinel(
     torch_dist_process_manager,
@@ -425,7 +433,7 @@ def test_dispatch_combine_minus_one_sentinel(
     gpu_per_node,
     sentinel_pattern,
 ):
-    """InterNodeV1 dispatch + combine must skip -1 routing sentinel entries."""
+    """InterNodeV1(LL) dispatch + combine must skip -1 routing sentinel entries."""
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (
